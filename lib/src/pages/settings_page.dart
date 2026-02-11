@@ -7,6 +7,7 @@ import '../models/settings_provider.dart';
 import '../services/update_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/theme_provider.dart';
+import '../widgets/dir_picker_field.dart';
 import '../widgets/title_drag_area.dart';
 
 // ─────────────────────────────────────────────
@@ -743,50 +744,42 @@ class _DownloadContent extends StatelessWidget {
 // 下载设置子组件
 // ─────────────────────────────────────────────
 
-class _SaveDirPicker extends StatelessWidget {
+class _SaveDirPicker extends StatefulWidget {
   final SettingsProvider settingsProvider;
 
   const _SaveDirPicker({required this.settingsProvider});
 
-  Future<void> _pickDir(BuildContext context) async {
-    final result = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: currentS.selectDefaultSaveDir,
-      initialDirectory: settingsProvider.defaultSaveDir,
-    );
-    if (result != null) {
-      settingsProvider.setDefaultSaveDir(result);
+  @override
+  State<_SaveDirPicker> createState() => _SaveDirPickerState();
+}
+
+class _SaveDirPickerState extends State<_SaveDirPicker> {
+  bool _isPicking = false;
+
+  Future<void> _pickDir() async {
+    if (_isPicking) return;
+    setState(() => _isPicking = true);
+    try {
+      final result = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: currentS.selectDefaultSaveDir,
+        lockParentWindow: true,
+        initialDirectory: widget.settingsProvider.defaultSaveDir,
+      );
+      if (result != null && mounted) {
+        widget.settingsProvider.setDefaultSaveDir(result);
+      }
+    } finally {
+      if (mounted) setState(() => _isPicking = false);
     }
   }
 
   @override
   Widget build(BuildContext context) {
-    final c = AppColors.of(context);
-    return Row(
-      children: [
-        Expanded(
-          child: Container(
-            height: 36,
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            decoration: BoxDecoration(
-              color: c.bg,
-              borderRadius: BorderRadius.circular(6),
-              border: Border.all(color: c.border, width: 1),
-            ),
-            alignment: Alignment.centerLeft,
-            child: Text(
-              settingsProvider.defaultSaveDir,
-              style: TextStyle(fontSize: 13, color: c.textPrimary),
-              overflow: TextOverflow.ellipsis,
-            ),
-          ),
-        ),
-        const SizedBox(width: 8),
-        ShadButton.outline(
-          size: ShadButtonSize.sm,
-          onPressed: () => _pickDir(context),
-          child: Text(currentS.browse),
-        ),
-      ],
+    return DirPickerField(
+      path: widget.settingsProvider.defaultSaveDir,
+      placeholder: currentS.selectDefaultSaveDir,
+      enabled: !_isPicking,
+      onTap: _pickDir,
     );
   }
 }

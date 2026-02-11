@@ -19,6 +19,7 @@ import '../i18n/locale_provider.dart';
 import '../models/download_controller.dart';
 import '../models/settings_provider.dart';
 import '../theme/app_colors.dart';
+import 'dir_picker_field.dart';
 
 void showNewDownloadDialog(
   BuildContext context,
@@ -66,6 +67,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
 
   /// 已选择的 .torrent 文件路径列表
   final List<String> _torrentFilePaths = [];
+
+  /// 防止重复打开文件选择器
+  bool _isPicking = false;
 
   @override
   void initState() {
@@ -136,20 +140,27 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   }
 
   Future<void> _pickTorrentFiles() async {
-    final result = await FilePicker.platform.pickFiles(
-      dialogTitle: currentS.selectTorrentFile,
-      type: FileType.custom,
-      allowedExtensions: ['torrent'],
-      allowMultiple: true,
-    );
-    if (result != null && result.files.isNotEmpty) {
-      setState(() {
-        for (final file in result.files) {
-          if (file.path != null && !_torrentFilePaths.contains(file.path)) {
-            _torrentFilePaths.add(file.path!);
+    if (_isPicking) return;
+    setState(() => _isPicking = true);
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        dialogTitle: currentS.selectTorrentFile,
+        type: FileType.custom,
+        allowedExtensions: ['torrent'],
+        allowMultiple: true,
+        lockParentWindow: true,
+      );
+      if (result != null && result.files.isNotEmpty && mounted) {
+        setState(() {
+          for (final file in result.files) {
+            if (file.path != null && !_torrentFilePaths.contains(file.path)) {
+              _torrentFilePaths.add(file.path!);
+            }
           }
-        }
-      });
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _isPicking = false);
     }
   }
 
@@ -160,14 +171,21 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   }
 
   Future<void> _pickSaveDir() async {
-    final result = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: currentS.selectSaveDir,
-      initialDirectory: _saveDirController.text.trim().isNotEmpty
-          ? _saveDirController.text.trim()
-          : null,
-    );
-    if (result != null) {
-      _saveDirController.text = result;
+    if (_isPicking) return;
+    setState(() => _isPicking = true);
+    try {
+      final result = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: currentS.selectSaveDir,
+        lockParentWindow: true,
+        initialDirectory: _saveDirController.text.trim().isNotEmpty
+            ? _saveDirController.text.trim()
+            : null,
+      );
+      if (result != null && mounted) {
+        _saveDirController.text = result;
+      }
+    } finally {
+      if (mounted) setState(() => _isPicking = false);
     }
   }
 
@@ -338,6 +356,7 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                 children: [
                   ShadButton.outline(
                     size: ShadButtonSize.sm,
+                    enabled: !_isPicking,
                     onPressed: _pickTorrentFiles,
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
@@ -446,6 +465,7 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                 alignment: Alignment.centerLeft,
                 child: ShadButton.ghost(
                   size: ShadButtonSize.sm,
+                  enabled: !_isPicking,
                   onPressed: _pickTorrentFiles,
                   child: Row(
                     mainAxisSize: MainAxisSize.min,
@@ -473,23 +493,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                     children: [
                       _SectionLabel(text: s.saveDir, c: c),
                       const SizedBox(height: 6),
-                      GestureDetector(
+                      DirPickerField(
+                        path: _saveDirController.text,
+                        placeholder: s.selectSaveDir,
+                        enabled: !_isPicking,
                         onTap: _pickSaveDir,
-                        child: AbsorbPointer(
-                          child: ShadInput(
-                            controller: _saveDirController,
-                            placeholder: Text(s.selectSaveDir),
-                            readOnly: true,
-                            trailing: Padding(
-                              padding: const EdgeInsets.only(right: 4),
-                              child: Icon(
-                                LucideIcons.folderOpen,
-                                size: 14,
-                                color: c.textMuted,
-                              ),
-                            ),
-                          ),
-                        ),
                       ),
                     ],
                   ),

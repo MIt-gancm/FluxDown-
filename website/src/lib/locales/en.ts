@@ -156,6 +156,47 @@ const en = {
   "fb.submitError": "Failed to submit. Please try again.",
   "fb.rateLimited": "Too many submissions. Please wait a moment.",
 
+  // Feedback Page (tabs)
+  "fbPage.tabList": "Feedback Board",
+  "fbPage.tabSubmit": "Submit Feedback",
+
+  // Feedback List
+  "fbList.badge": "Feedback Board",
+  "fbList.title": "Community ",
+  "fbList.titleHighlight": "feedback",
+  "fbList.subtitle": "Track the progress of feature requests, bug reports, and suggestions from the community.",
+  "fbList.state.all": "All",
+  "fbList.state.open": "Open",
+  "fbList.state.closed": "Closed",
+  "fbList.labelFilter.all": "All Types",
+  "fbList.labelFilter.enhancement": "Feature",
+  "fbList.labelFilter.bug": "Bug",
+  "fbList.labelFilter.feedback": "Other",
+  "fbList.label.enhancement": "Feature",
+  "fbList.label.bug": "Bug",
+  "fbList.label.feedback": "Feedback",
+  "fbList.showing": "{count} items",
+  "fbList.loading": "Loading...",
+  "fbList.error": "Failed to load feedback list. Please try again later.",
+  "fbList.empty": "No feedback found.",
+  "fbList.prev": "Prev",
+  "fbList.next": "Next",
+
+  // Issue Detail
+  "issueDetail.open": "Open",
+  "issueDetail.completed": "Completed",
+  "issueDetail.notPlanned": "Not Planned",
+  "issueDetail.duplicate": "Duplicate",
+  "issueDetail.replies": "replies",
+  "issueDetail.commentsTitle": "{count} Replies",
+  "issueDetail.noComments": "No replies yet.",
+  "issueDetail.notFound": "Issue not found.",
+  "issueDetail.error": "Failed to load issue details.",
+  "issueDetail.meta.typeLabel": "Type:",
+  "issueDetail.meta.type.feature": "Feature Request",
+  "issueDetail.meta.type.bug": "Bug Report",
+  "issueDetail.meta.type.other": "Feedback",
+
   // 404
   "notFound.title": "Page not found",
   "notFound.desc": "The page you're looking for doesn't exist or has been moved.",

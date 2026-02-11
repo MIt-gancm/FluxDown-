@@ -16,6 +16,7 @@ import 'package:shadcn_ui/shadcn_ui.dart';
 import '../bindings/bindings.dart';
 import '../i18n/locale_provider.dart';
 import '../theme/app_colors.dart';
+import 'dir_picker_field.dart';
 
 /// 浏览器扩展下载请求的快速确认对话框。
 ///
@@ -82,6 +83,9 @@ class _QuickDownloadDialogContentState
   /// 解析出的有效 URL 数量（实时计算）
   int _urlCount = 0;
 
+  /// 防止重复打开文件选择器
+  bool _isPicking = false;
+
   @override
   void initState() {
     super.initState();
@@ -136,14 +140,21 @@ class _QuickDownloadDialogContentState
   }
 
   Future<void> _pickSaveDir() async {
-    final result = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: currentS.selectSaveDir,
-      initialDirectory: _saveDirController.text.trim().isNotEmpty
-          ? _saveDirController.text.trim()
-          : null,
-    );
-    if (result != null) {
-      _saveDirController.text = result;
+    if (_isPicking) return;
+    setState(() => _isPicking = true);
+    try {
+      final result = await FilePicker.platform.getDirectoryPath(
+        dialogTitle: currentS.selectSaveDir,
+        lockParentWindow: true,
+        initialDirectory: _saveDirController.text.trim().isNotEmpty
+            ? _saveDirController.text.trim()
+            : null,
+      );
+      if (result != null && mounted) {
+        _saveDirController.text = result;
+      }
+    } finally {
+      if (mounted) setState(() => _isPicking = false);
     }
   }
 
@@ -332,23 +343,11 @@ class _QuickDownloadDialogContentState
                     children: [
                       _SectionLabel(text: s.saveDir, c: c),
                       const SizedBox(height: 6),
-                      GestureDetector(
+                      DirPickerField(
+                        path: _saveDirController.text,
+                        placeholder: s.selectSaveDir,
+                        enabled: !_isPicking,
                         onTap: _pickSaveDir,
-                        child: AbsorbPointer(
-                          child: ShadInput(
-                            controller: _saveDirController,
-                            placeholder: Text(s.selectSaveDir),
-                            readOnly: true,
-                            trailing: Padding(
-                              padding: const EdgeInsets.only(right: 4),
-                              child: Icon(
-                                LucideIcons.folderOpen,
-                                size: 14,
-                                color: c.textMuted,
-                              ),
-                            ),
-                          ),
-                        ),
                       ),
                     ],
                   ),

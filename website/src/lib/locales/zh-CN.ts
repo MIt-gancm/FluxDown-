@@ -174,6 +174,48 @@ const zhCN: Messages = {
   "fb.rateLimited":
     "\u63d0\u4ea4\u592a\u9891\u7e41\uff0c\u8bf7\u7a0d\u7b49\u7247\u523b\u3002",
 
+  // Feedback Page (tabs)
+  "fbPage.tabList": "\u53cd\u9988\u770b\u677f",
+  "fbPage.tabSubmit": "\u63d0\u4ea4\u53cd\u9988",
+
+  // Feedback List
+  "fbList.badge": "\u53cd\u9988\u770b\u677f",
+  "fbList.title": "\u793e\u533a",
+  "fbList.titleHighlight": "\u53cd\u9988",
+  "fbList.subtitle": "\u8ffd\u8e2a\u529f\u80fd\u5efa\u8bae\u3001Bug \u62a5\u544a\u548c\u793e\u533a\u5efa\u8bae\u7684\u5904\u7406\u8fdb\u5ea6\u3002",
+  "fbList.state.all": "\u5168\u90e8",
+  "fbList.state.open": "\u5f85\u5904\u7406",
+  "fbList.state.closed": "\u5df2\u5173\u95ed",
+  "fbList.labelFilter.all": "\u5168\u90e8\u7c7b\u578b",
+  "fbList.labelFilter.enhancement": "\u529f\u80fd",
+  "fbList.labelFilter.bug": "Bug",
+  "fbList.labelFilter.feedback": "\u5176\u4ed6",
+  "fbList.label.enhancement": "\u529f\u80fd\u5efa\u8bae",
+  "fbList.label.bug": "Bug",
+  "fbList.label.feedback": "\u53cd\u9988",
+  "fbList.showing": "\u5171 {count} \u6761",
+  "fbList.loading": "\u52a0\u8f7d\u4e2d...",
+  "fbList.error": "\u52a0\u8f7d\u53cd\u9988\u5217\u8868\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002",
+  "fbList.empty": "\u6682\u65e0\u53cd\u9988\u3002",
+  "fbList.prev": "\u4e0a\u4e00\u9875",
+  "fbList.next": "\u4e0b\u4e00\u9875",
+
+  // Issue Detail
+  "issueDetail.open": "\u5f85\u5904\u7406",
+  "issueDetail.completed": "\u5df2\u5b8c\u6210",
+  "issueDetail.notPlanned": "\u4e0d\u91c7\u7eb3",
+  "issueDetail.duplicate": "\u91cd\u590d\u9879",
+  "issueDetail.replies": "\u6761\u56de\u590d",
+  "issueDetail.commentsTitle": "{count} \u6761\u56de\u590d",
+  "issueDetail.noComments": "\u6682\u65e0\u56de\u590d\u3002",
+  "issueDetail.notFound": "\u672a\u627e\u5230\u8be5\u53cd\u9988\u3002",
+  "issueDetail.error": "\u52a0\u8f7d\u53cd\u9988\u8be6\u60c5\u5931\u8d25\u3002",
+  "issueDetail.viewOnGithub": "\u5728 GitHub \u4e0a\u67e5\u770b",
+  "issueDetail.meta.typeLabel": "\u7c7b\u578b\uff1a",
+  "issueDetail.meta.type.feature": "\u529f\u80fd\u5efa\u8bae",
+  "issueDetail.meta.type.bug": "Bug \u62a5\u544a",
+  "issueDetail.meta.type.other": "\u53cd\u9988",
+
   // 404
   "notFound.title": "页面未找到",
   "notFound.desc": "你访问的页面不存在或已被移动。",
