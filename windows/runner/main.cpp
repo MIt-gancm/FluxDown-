@@ -1,11 +1,28 @@
 #include <flutter/dart_project.h>
 #include <flutter/flutter_view_controller.h>
 #include <windows.h>
+#include <dbghelp.h>
 
+#include <iostream>
+#include <sstream>
 #include <string>
 
 #include "flutter_window.h"
 #include "utils.h"
+
+#pragma comment(lib, "dbghelp.lib")
+
+static LONG WINAPI FluxDownCrashHandler(EXCEPTION_POINTERS* ep) {
+  std::ostringstream oss;
+  oss << "[CRASH_HANDLER] Unhandled exception! Code=0x"
+      << std::hex << ep->ExceptionRecord->ExceptionCode
+      << ", Address=0x" << ep->ExceptionRecord->ExceptionAddress
+      << std::dec << "\n";
+  OutputDebugStringA(oss.str().c_str());
+  std::cerr << oss.str();
+  std::cerr.flush();
+  return EXCEPTION_CONTINUE_SEARCH;
+}
 
 // Unique mutex name for single-instance enforcement.
 static const wchar_t kMutexName[] = L"Global\\FluxDown_SingleInstance_Mutex";
@@ -54,6 +71,8 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   // Collect command-line arguments early (needed for both paths).
   std::vector<std::string> command_line_arguments = GetCommandLineArguments();
 
+  ::SetUnhandledExceptionFilter(FluxDownCrashHandler);
+
   // --- Single-instance check ---
   // Try to create a named mutex. If it already exists, another instance
   // is running -- forward our args to it and exit.
@@ -90,6 +109,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   while (::GetMessage(&msg, nullptr, 0, 0)) {
     ::TranslateMessage(&msg);
     ::DispatchMessage(&msg);
+  }
+
+  {
+    std::ostringstream oss;
+    oss << "[MAIN] Message loop exited normally, WM_QUIT received. msg.wParam="
+        << msg.wParam << "\n";
+    OutputDebugStringA(oss.str().c_str());
+    std::cerr << oss.str();
+    std::cerr.flush();
   }
 
   ::CoUninitialize();

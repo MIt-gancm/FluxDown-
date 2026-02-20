@@ -2,6 +2,8 @@
 
 #include <dwmapi.h>
 #include <flutter_windows.h>
+#include <iostream>
+#include <sstream>
 
 #include "resource.h"
 
@@ -218,13 +220,22 @@ Win32Window::MessageHandler(HWND hwnd,
                             WPARAM const wparam,
                             LPARAM const lparam) noexcept {
   switch (message) {
-    case WM_DESTROY:
+    case WM_DESTROY: {
+      std::ostringstream oss;
+      oss << "[RUNNER_WIN32] WM_DESTROY received, hwnd=" << hwnd
+          << ", quit_on_close_=" << quit_on_close_ << std::endl;
+      OutputDebugStringA(oss.str().c_str());
+      std::cerr << oss.str();
       window_handle_ = nullptr;
       Destroy();
       if (quit_on_close_) {
+        std::string msg = "[RUNNER_WIN32] >>> PostQuitMessage(0) called from runner WM_DESTROY <<<\n";
+        OutputDebugStringA(msg.c_str());
+        std::cerr << msg;
         PostQuitMessage(0);
       }
       return 0;
+    }
 
     case WM_DPICHANGED: {
       auto newRectSize = reinterpret_cast<RECT*>(lparam);
