@@ -1,9 +1,11 @@
-//! Auto-update module: version check via website API proxy, download installer,
-//! and launch Inno Setup silent install.
+//! Auto-update module: version check via website API proxy, download update
+//! package, and launch installation (Inno Setup for installer builds, or
+//! bat-script extraction for portable builds).
 //!
 //! All requests go through the website API (`/api/release`, `/api/download/:fn`)
 //! so that GITHUB_TOKEN stays server-side — the client never touches GitHub directly.
 
+use std::path::Path;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -19,9 +21,9 @@ use crate::signals::{UpdateCheckResult, UpdateDownloadProgress};
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Base URL of the website API that proxies GitHub Release info.
-/// Change this to your actual deployment domain.
 const UPDATE_API_BASE: &str = "https://fluxdown.zerx.dev";
+
+const PORTABLE_MARKER: &str = "portable";
 
 // ---------------------------------------------------------------------------
 // Error
@@ -55,8 +57,9 @@ struct ReleaseInfo {
 #[derive(Deserialize)]
 struct ReleaseAssets {
     setup: Option<AssetInfo>,
-    #[allow(dead_code)]
     portable: Option<AssetInfo>,
+    setup_arm64: Option<AssetInfo>,
+    portable_arm64: Option<AssetInfo>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +68,32 @@ struct AssetInfo {
     name: String,
     size: i64,
     download_url: String,
+}
+
+// ---------------------------------------------------------------------------
+// Environment detection
+// ---------------------------------------------------------------------------
+
+fn is_portable() -> bool {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        return dir.join(PORTABLE_MARKER).exists();
+    }
+    false
+}
+
+fn is_arm64() -> bool {
+    std::env::consts::ARCH == "aarch64"
+}
+
+fn select_asset(assets: &ReleaseAssets) -> Option<&AssetInfo> {
+    match (is_portable(), is_arm64()) {
+        (true, true) => assets.portable_arm64.as_ref(),
+        (true, false) => assets.portable.as_ref(),
+        (false, true) => assets.setup_arm64.as_ref(),
+        (false, false) => assets.setup.as_ref(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,9 +169,8 @@ async fn check_inner(current_version: &str) -> Result<(), UpdateError> {
     let release: ReleaseInfo = resp.json().await?;
     let has_update = is_newer(&release.version, current_version).unwrap_or(false);
 
-    let (download_url, file_size) = match &release.assets.setup {
+    let (download_url, file_size) = match select_asset(&release.assets) {
         Some(asset) => {
-            // download_url from API is relative like "/api/download/FluxDown-xxx.exe"
             let full_url = if asset.download_url.starts_with('/') {
                 format!("{UPDATE_API_BASE}{}", asset.download_url)
             } else {
@@ -202,9 +230,13 @@ async fn download_inner(url: &str, version: &str) -> Result<(), UpdateError> {
     }
 
     let total_bytes = resp.content_length().unwrap_or(0) as i64;
-    let file_name = format!("FluxDown-{version}-windows-setup.exe");
+    let file_name = url
+        .rsplit('/')
+        .next()
+        .filter(|n| !n.is_empty())
+        .unwrap_or("FluxDown-update");
     let temp_dir = std::env::temp_dir();
-    let file_path = temp_dir.join(&file_name);
+    let file_path = temp_dir.join(file_name);
 
     let mut file = tokio::fs::File::create(&file_path).await?;
     let mut stream = resp.bytes_stream();
@@ -266,21 +298,19 @@ async fn download_inner(url: &str, version: &str) -> Result<(), UpdateError> {
     Ok(())
 }
 
-/// Launch the Inno Setup installer with silent flags and exit the current process.
 pub fn install(installer_path: &str) -> Result<(), UpdateError> {
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW = 0x08000000
-        std::process::Command::new(installer_path)
-            .args(["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
-            .creation_flags(0x08000000)
-            .spawn()
-            .map_err(UpdateError::Io)?;
+        let path = Path::new(installer_path);
+        let is_zip = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
 
-        // Give installer a moment to start, then exit
-        std::thread::sleep(Duration::from_millis(500));
-        std::process::exit(0);
+        if is_zip {
+            install_portable(installer_path)
+        } else {
+            install_setup(installer_path)
+        }
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -290,4 +320,73 @@ pub fn install(installer_path: &str) -> Result<(), UpdateError> {
             "Auto-update install is only supported on Windows".to_string(),
         ))
     }
+}
+
+#[cfg(target_os = "windows")]
+fn install_setup(installer_path: &str) -> Result<(), UpdateError> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    std::process::Command::new(installer_path)
+        .args(["/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(UpdateError::Io)?;
+
+    std::thread::sleep(Duration::from_millis(500));
+    std::process::exit(0);
+}
+
+/// Portable upgrade: write a bat script that waits for the app to close,
+/// extracts the zip over the app directory via PowerShell, then restarts.
+#[cfg(target_os = "windows")]
+fn install_portable(zip_path: &str) -> Result<(), UpdateError> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let exe = std::env::current_exe().map_err(UpdateError::Io)?;
+    let app_dir = exe
+        .parent()
+        .ok_or_else(|| UpdateError::Other("cannot determine app directory".to_string()))?;
+    let exe_name = exe
+        .file_name()
+        .ok_or_else(|| UpdateError::Other("cannot determine exe name".to_string()))?
+        .to_string_lossy();
+
+    let script = format!(
+        r#"@echo off
+chcp 65001 >nul 2>&1
+set "ZIP={zip}"
+set "DIR={dir}"
+set "EXE={exe}"
+:loop
+timeout /t 1 /nobreak >nul
+tasklist /fi "imagename eq %EXE%" 2>nul | find /i "%EXE%" >nul && goto loop
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "$tmp = Join-Path $env:TEMP ('fluxdown_upd_' + (Get-Random));" ^
+  "Expand-Archive -LiteralPath '%ZIP%' -DestinationPath $tmp -Force;" ^
+  "$items = @(Get-ChildItem $tmp);" ^
+  "if ($items.Count -eq 1 -and $items[0].PSIsContainer) {{ $src = $items[0].FullName }} else {{ $src = $tmp }};" ^
+  "Copy-Item -Path (Join-Path $src '*') -Destination '%DIR%' -Recurse -Force;" ^
+  "Remove-Item $tmp -Recurse -Force"
+del "%ZIP%" 2>nul
+start "" "%DIR%\%EXE%"
+(goto) 2>nul & del "%~f0"
+"#,
+        zip = zip_path,
+        dir = app_dir.to_string_lossy(),
+        exe = exe_name,
+    );
+
+    let script_path = std::env::temp_dir().join("fluxdown_update.bat");
+    std::fs::write(&script_path, &script).map_err(UpdateError::Io)?;
+
+    std::process::Command::new("cmd")
+        .args(["/c", &script_path.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(UpdateError::Io)?;
+
+    std::thread::sleep(Duration::from_millis(500));
+    std::process::exit(0);
 }
