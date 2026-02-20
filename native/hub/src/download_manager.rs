@@ -781,7 +781,37 @@ impl DownloadManager {
 
     pub async fn resume_task(&mut self, task_id: &str) {
         if self.active_tokens.contains_key(task_id) {
-            return; // already running
+            // A task can be in active_tokens but already terminal in the DB:
+            // this happens when the download task has finished (status=3/4
+            // written to DB) but the done_tx hasn't been consumed by the
+            // actor loop yet.  If we silently return here, the user's retry
+            // request is dropped and the task stays stuck in error state.
+            //
+            // Detect this race: if DB status is terminal (completed=3 or
+            // error=4), force-remove the stale entry so the resume proceeds.
+            // The stale done_tx will be harmlessly ignored because the new
+            // spawn increments the generation counter, making the old
+            // generation mismatch in on_task_done.
+            let is_terminal = self
+                .db
+                .load_task_by_id(task_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t.status == 3 || t.status == 4)
+                .unwrap_or(false);
+            if !is_terminal {
+                return; // truly still active — do not interrupt
+            }
+            rinf::debug_print!(
+                "[manager] resume_task {}: stale active_tokens entry (terminal in DB) — force-removing",
+                task_id
+            );
+            self.active_tokens.remove(task_id);
+            self.active_handles.remove(task_id);
+            self.bt_task_ids.remove(task_id);
+            self.hls_quality_senders.remove(task_id);
+            // Do NOT drain_queue here — we are about to occupy the freed slot.
         }
 
         // Also check if already in the pending queue.
@@ -789,12 +819,9 @@ impl DownloadManager {
             return;
         }
 
-        // BT tasks bypass the HTTP/FTP concurrency queue.
-        let is_bt = self.db.load_task_by_id(task_id).await
-            .ok()
-            .flatten()
-            .map(|t| is_bt_url(&t.url))
-            .unwrap_or(false);
+        // Load task once and reuse for both the is_bt check and the queue entry.
+        let task_row = self.db.load_task_by_id(task_id).await.ok().flatten();
+        let is_bt = task_row.as_ref().map(|t| is_bt_url(&t.url)).unwrap_or(false);
 
         if is_bt || self.has_capacity() {
             self.do_resume_task(task_id).await;
@@ -808,8 +835,7 @@ impl DownloadManager {
                 self.active_tokens.len(),
                 self.max_concurrent
             );
-            // Load task info for the queue entry.
-            if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
+            if let Some(t) = task_row {
                 self.pending_queue.push_back(QueuedTask {
                     task_id: task_id.to_string(),
                     url: t.url,
