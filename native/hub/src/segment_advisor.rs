@@ -33,12 +33,12 @@ const MIN_BYTES_PER_SEGMENT: i64 = 2 * 1024 * 1024; // 2 MB
 const SINGLE_SEGMENT_THRESHOLD: i64 = 4 * 1024 * 1024; // 4 MB
 
 /// How many bytes to download during the bandwidth probe.
-/// 512 KB is enough to exit TCP slow-start on most connections and gives
-/// a reasonable speed sample without wasting time.
-const PROBE_BYTES: u64 = 512 * 1024; // 512 KB
+/// 128 KB 已足以退出 TCP 慢启动（典型 RTT 30-100ms，慢启动 ~5 RTTs 约 50KB），
+/// 同时将探测耗时从 ~1.7s（512KB/300KB/s）降低至 ~400ms，显著改善批量任务启动体验。
+const PROBE_BYTES: u64 = 128 * 1024; // 128 KB
 
 /// Maximum wall-clock time for the bandwidth probe.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Bandwidth thresholds (bytes/sec) for segment scaling.
 /// - Below LOW  → few segments (connection is the bottleneck, not parallelism)

@@ -195,7 +195,7 @@ pub async fn run(db_dir: PathBuf) {
             Some(signal) = create_recv.recv() => {
                 let msg = signal.message;
                 manager
-                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id)
+                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id, msg.checksum)
                     .await;
                 // 立即推送 AllTasks，确保 Dart 端在收到 TaskProgress 之前
                 // 已通过 AllTasks 获得正确的 queue_id，防止新任务被错误归入默认队列。
@@ -204,12 +204,12 @@ pub async fn run(db_dir: PathBuf) {
             Some(signal) = batch_create_recv.recv() => {
                 let msg = signal.message;
                 rinf::debug_print!(
-                    "[actor] batch create: {} URLs, save_dir={}, segments={}",
-                    msg.urls.len(), msg.save_dir, msg.segments,
+                    "[actor] batch create: {} entries, save_dir={}, segments={}",
+                    msg.entries.len(), msg.save_dir, msg.segments,
                 );
-                for url in msg.urls {
+                for entry in msg.entries {
                     manager
-                        .create_task(url, msg.save_dir.clone(), String::new(), msg.segments, String::new(), Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone())
+                        .create_task(entry.url, msg.save_dir.clone(), entry.file_name, msg.segments, String::new(), Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone(), entry.checksum)
                         .await;
                 }
                 // 批量创建完成后统一推送一次 AllTasks，同步 queue_id 到 Dart。
@@ -350,7 +350,7 @@ pub async fn run(db_dir: PathBuf) {
                     msg.cookies.len()
                 );
                 manager
-                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id)
+                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id, String::new())
                     .await;
                 // 推送 AllTasks 确保 Dart 端获得正确 queue_id。
                 manager.load_and_send_all_tasks().await;
@@ -359,12 +359,12 @@ pub async fn run(db_dir: PathBuf) {
             Some(signal) = create_queue_recv.recv() => {
                 let msg = signal.message;
                 rinf::debug_print!("[actor] CreateQueue: name={}", msg.name);
-                manager.create_queue(msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments).await;
+                manager.create_queue(msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
             }
             Some(signal) = update_queue_recv.recv() => {
                 let msg = signal.message;
                 rinf::debug_print!("[actor] UpdateQueue: id={}", msg.queue_id);
-                manager.update_queue(msg.queue_id, msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments).await;
+                manager.update_queue(msg.queue_id, msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
             }
             Some(signal) = delete_queue_recv.recv() => {
                 let msg = signal.message;

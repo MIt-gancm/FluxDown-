@@ -128,8 +128,8 @@ class _QuickDownloadDialogContentState
   }
 
   void _onUrlChanged() {
-    final urls = _parseUrls(_urlController.text);
-    final count = urls.length;
+    final entries = _parseEntries(_urlController.text);
+    final count = entries.length;
     if (count != _urlCount) {
       setState(() {
         _urlCount = count;
@@ -137,24 +137,54 @@ class _QuickDownloadDialogContentState
     }
   }
 
-  /// 从文本中解析所有有效的 URL（http/https/ftp/magnet）
-  static List<String> _parseUrls(String text) {
+  /// 解析 aria2 风格的下载条目（URL + 可选 out=/checksum= 选项行）
+  static List<_QuickEntry> _parseEntries(String text) {
     final lines = text.split('\n');
-    final urls = <String>[];
+    final entries = <_QuickEntry>[];
+    _QuickEntry? current;
     final urlPattern = RegExp(r'^(https?|ftp)://\S+', caseSensitive: false);
+
     for (final line in lines) {
+      // 选项行
+      if (line.startsWith(' ') || line.startsWith('\t')) {
+        if (current == null) continue;
+        final trimmed = line.trim();
+        if (trimmed.startsWith('out=')) {
+          current = _QuickEntry(
+            current.url,
+            fileName: trimmed.substring(4),
+            checksum: current.checksum,
+          );
+        } else if (trimmed.startsWith('checksum=')) {
+          current = _QuickEntry(
+            current.url,
+            fileName: current.fileName,
+            checksum: trimmed.substring(9),
+          );
+        }
+        continue;
+      }
+
       final trimmed = line.trim();
       if (trimmed.isEmpty) continue;
+      if (trimmed.startsWith('#')) continue;
+
+      if (current != null) {
+        entries.add(current);
+        current = null;
+      }
+
       if (trimmed.toLowerCase().startsWith('magnet:?')) {
-        urls.add(trimmed);
+        current = _QuickEntry(trimmed);
       } else {
         final match = urlPattern.firstMatch(trimmed);
         if (match != null) {
-          urls.add(match.group(0)!);
+          current = _QuickEntry(match.group(0)!);
         }
       }
     }
-    return urls;
+    if (current != null) entries.add(current);
+    return entries;
   }
 
   @override
@@ -194,8 +224,8 @@ class _QuickDownloadDialogContentState
     final saveDir = _saveDirController.text.trim();
     if (saveDir.isEmpty) return;
 
-    final urls = _parseUrls(_urlController.text);
-    if (urls.isEmpty) return;
+    final entries = _parseEntries(_urlController.text);
+    if (entries.isEmpty) return;
 
     final proxyUrl = _proxyUrlController.text.trim();
     final userAgent = _userAgentController.text.trim();
@@ -210,13 +240,15 @@ class _QuickDownloadDialogContentState
       _ => 0,
     };
 
-    if (urls.length == 1) {
+    if (entries.length == 1) {
       // 单条 — 使用 ConfirmExternalDownload，支持重命名和 cookies
+      final entry = entries.first;
       final rename = _renameController.text.trim();
+      final fileName = rename.isNotEmpty ? rename : entry.fileName;
       ConfirmExternalDownload(
-        url: urls.first,
+        url: entry.url,
         saveDir: saveDir,
-        fileName: rename,
+        fileName: fileName,
         segments: segments,
         cookies: widget.cookies,
         proxyUrl: proxyUrl,
@@ -224,9 +256,13 @@ class _QuickDownloadDialogContentState
         queueId: _selectedQueueId,
       ).sendSignalToRust();
     } else {
-      // 多条 — 使用 BatchCreateTask
+      // 多条 — 使用 BatchCreateTask（携带每条的 fileName/checksum）
       BatchCreateTask(
-        urls: urls,
+        entries: entries
+            .map(
+              (e) => UrlEntry(url: e.url, fileName: e.fileName, checksum: e.checksum),
+            )
+            .toList(),
         saveDir: saveDir,
         segments: segments,
         proxyUrl: proxyUrl,
@@ -629,6 +665,14 @@ class _QuickDownloadDialogContentState
       ],
     );
   }
+}
+
+/// 解析后的单条下载入口（URL + 可选 out= 文件名 + 可选 checksum=）
+class _QuickEntry {
+  final String url;
+  final String fileName;
+  final String checksum;
+  const _QuickEntry(this.url, {this.fileName = '', this.checksum = ''});
 }
 
 /// 信息标签（文件大小 / MIME 类型）

@@ -20,6 +20,9 @@ class DownloadQueue {
   /// 每任务默认线程数（HTTP 分段连接数），0 = 自动（全局 segment_advisor）
   final int defaultSegments;
 
+  /// 此队列任务使用的默认 User-Agent，空字符串 = 继承全局 UA
+  final String defaultUserAgent;
+
   const DownloadQueue({
     required this.queueId,
     required this.name,
@@ -28,6 +31,7 @@ class DownloadQueue {
     required this.defaultSaveDir,
     required this.position,
     this.defaultSegments = 0,
+    this.defaultUserAgent = '',
   });
 
   factory DownloadQueue.fromQueueInfo(QueueInfo info) {
@@ -39,6 +43,7 @@ class DownloadQueue {
       defaultSaveDir: info.defaultSaveDir,
       position: info.position,
       defaultSegments: info.defaultSegments,
+      defaultUserAgent: info.defaultUserAgent,
     );
   }
 
@@ -50,6 +55,7 @@ class DownloadQueue {
     String? defaultSaveDir,
     int? position,
     int? defaultSegments,
+    String? defaultUserAgent,
   }) {
     return DownloadQueue(
       queueId: queueId ?? this.queueId,
@@ -59,6 +65,7 @@ class DownloadQueue {
       defaultSaveDir: defaultSaveDir ?? this.defaultSaveDir,
       position: position ?? this.position,
       defaultSegments: defaultSegments ?? this.defaultSegments,
+      defaultUserAgent: defaultUserAgent ?? this.defaultUserAgent,
     );
   }
 }

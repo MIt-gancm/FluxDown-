@@ -223,13 +223,14 @@ class _SidebarState extends State<Sidebar> {
         nameCtrl: nameCtrl,
         s: s,
         c: c,
-        onConfirm: (name, speedLimit, maxConcurrent, saveDir, defaultSegments) {
+        onConfirm: (name, speedLimit, maxConcurrent, saveDir, defaultSegments, defaultUserAgent) {
           ctrl.createQueue(
             name: name,
             speedLimitKbps: speedLimit,
             maxConcurrent: maxConcurrent,
             defaultSaveDir: saveDir,
             defaultSegments: defaultSegments,
+            defaultUserAgent: defaultUserAgent,
           );
         },
       ),
@@ -253,7 +254,8 @@ class _SidebarState extends State<Sidebar> {
         initialMaxConcurrent: queue.maxConcurrent,
         initialSaveDir: queue.defaultSaveDir,
         initialDefaultSegments: queue.defaultSegments,
-        onConfirm: (name, speedLimit, maxConcurrent, saveDir, defaultSegments) {
+        initialUserAgent: queue.defaultUserAgent,
+        onConfirm: (name, speedLimit, maxConcurrent, saveDir, defaultSegments, defaultUserAgent) {
           ctrl.updateQueue(
             queueId: queue.queueId,
             name: name,
@@ -261,6 +263,7 @@ class _SidebarState extends State<Sidebar> {
             maxConcurrent: maxConcurrent,
             defaultSaveDir: saveDir,
             defaultSegments: defaultSegments,
+            defaultUserAgent: defaultUserAgent,
           );
         },
       ),
@@ -740,6 +743,32 @@ class _QueueActionIconState extends State<_QueueActionIcon> {
   }
 }
 
+// ─────────────────────────────────────────────
+// 队列对话框 UA 预设（与设置页保持同步）
+// ─────────────────────────────────────────────
+
+/// key '' = 继承全局；其余 key 对应具体 UA 字符串
+const _kQueueUaPresets = {
+  '': '', // 继承全局设置
+  'chrome': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+  'firefox': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) '
+      'Gecko/20100101 Firefox/147.0',
+  'edge': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.3800.70',
+  'safari': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+      'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3.1 Safari/605.1.15',
+  'netdisk': 'netdisk',
+};
+
+/// 根据 UA 字符串反推预设 key
+String _detectQueueUaPreset(String ua) {
+  for (final entry in _kQueueUaPresets.entries) {
+    if (entry.value == ua) return entry.key;
+  }
+  return ua.isEmpty ? '' : 'custom';
+}
+
 /// 新建/编辑队列对话框
 class _QueueDialog extends StatefulWidget {
   final String title;
@@ -750,7 +779,8 @@ class _QueueDialog extends StatefulWidget {
   final int initialMaxConcurrent;
   final String initialSaveDir;
   final int initialDefaultSegments;
-  final void Function(String name, int speedLimit, int maxConcurrent, String saveDir, int defaultSegments) onConfirm;
+  final String initialUserAgent;
+  final void Function(String name, int speedLimit, int maxConcurrent, String saveDir, int defaultSegments, String defaultUserAgent) onConfirm;
 
   const _QueueDialog({
     required this.title,
@@ -761,6 +791,7 @@ class _QueueDialog extends StatefulWidget {
     this.initialMaxConcurrent = 0,
     this.initialSaveDir = '',
     this.initialDefaultSegments = 0,
+    this.initialUserAgent = '',
     required this.onConfirm,
   });
 
@@ -772,7 +803,9 @@ class _QueueDialogState extends State<_QueueDialog> {
   late final TextEditingController _speedCtrl;
   late final TextEditingController _concurrentCtrl;
   late final TextEditingController _saveDirCtrl;
+  late final TextEditingController _uaCtrl;
   late String _selectedSegments;
+  late String _selectedUaPreset;
 
   static const _segmentOptions = ['0', '4', '8', '16', '32', '64'];
 
@@ -786,9 +819,11 @@ class _QueueDialogState extends State<_QueueDialog> {
       text: widget.initialMaxConcurrent > 0 ? widget.initialMaxConcurrent.toString() : '',
     );
     _saveDirCtrl = TextEditingController(text: widget.initialSaveDir);
+    _uaCtrl = TextEditingController(text: widget.initialUserAgent);
     _selectedSegments = widget.initialDefaultSegments > 0
         ? widget.initialDefaultSegments.toString()
         : '0';
+    _selectedUaPreset = _detectQueueUaPreset(widget.initialUserAgent);
   }
 
   @override
@@ -796,7 +831,23 @@ class _QueueDialogState extends State<_QueueDialog> {
     _speedCtrl.dispose();
     _concurrentCtrl.dispose();
     _saveDirCtrl.dispose();
+    _uaCtrl.dispose();
     super.dispose();
+  }
+
+  void _onUaPresetChanged(String? preset) {
+    if (preset == null) return;
+    setState(() => _selectedUaPreset = preset);
+    if (preset != 'custom') {
+      _uaCtrl.text = _kQueueUaPresets[preset] ?? '';
+    }
+  }
+
+  void _onUaTextChanged(String value) {
+    final detected = _detectQueueUaPreset(value);
+    if (detected != _selectedUaPreset) {
+      setState(() => _selectedUaPreset = detected);
+    }
   }
 
   void _confirm() {
@@ -809,8 +860,9 @@ class _QueueDialogState extends State<_QueueDialog> {
         (int.tryParse(_concurrentCtrl.text.trim()) ?? 0).clamp(0, 100);
     final saveDir = _saveDirCtrl.text.trim();
     final defaultSegments = int.tryParse(_selectedSegments) ?? 0;
+    final defaultUserAgent = _uaCtrl.text.trim();
     Navigator.of(context).pop();
-    widget.onConfirm(name, speedLimit, maxConcurrent, saveDir, defaultSegments);
+    widget.onConfirm(name, speedLimit, maxConcurrent, saveDir, defaultSegments, defaultUserAgent);
   }
 
   @override
@@ -848,6 +900,7 @@ class _QueueDialogState extends State<_QueueDialog> {
             ),
             const SizedBox(height: 12),
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Expanded(
                   child: Column(
@@ -884,27 +937,78 @@ class _QueueDialogState extends State<_QueueDialog> {
                     ],
                   ),
                 ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        s.queueDefaultSegments,
+                        style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: c.textSecondary),
+                      ),
+                      const SizedBox(height: 6),
+                      SizedBox(
+                        width: double.infinity,
+                        child: ShadSelect<String>(
+                          initialValue: _selectedSegments,
+                          onChanged: (v) {
+                            if (v != null) setState(() => _selectedSegments = v);
+                          },
+                          options: _segmentOptions.map((opt) => ShadOption(
+                            value: opt,
+                            child: Text(opt == '0' ? s.queueDefaultSegmentsHint : opt),
+                          )).toList(),
+                          selectedOptionBuilder: (ctx, v) => Text(v == '0' ? s.queueDefaultSegmentsHint : v),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
               ],
             ),
             const SizedBox(height: 12),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+            Text(
+              s.queueDefaultUserAgent,
+              style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: c.textSecondary),
+            ),
+            const SizedBox(height: 6),
+            Row(
               children: [
-                Text(
-                  s.queueDefaultSegments,
-                  style: TextStyle(fontSize: 11.5, fontWeight: FontWeight.w500, color: c.textSecondary),
+                SizedBox(
+                  width: 130,
+                  child: ShadSelect<String>(
+                    initialValue: _selectedUaPreset,
+                    options: [
+                      ShadOption(value: '', child: Text(s.queueUaInheritGlobal)),
+                      ShadOption(value: 'chrome', child: Text(s.userAgentPresetChrome)),
+                      ShadOption(value: 'firefox', child: Text(s.userAgentPresetFirefox)),
+                      ShadOption(value: 'edge', child: Text(s.userAgentPresetEdge)),
+                      ShadOption(value: 'safari', child: Text(s.userAgentPresetSafari)),
+                      ShadOption(value: 'netdisk', child: Text(s.userAgentPresetNetdisk)),
+                      ShadOption(value: 'custom', child: Text(s.userAgentPresetCustom)),
+                    ],
+                    selectedOptionBuilder: (ctx, v) {
+                      final label = switch (v) {
+                        'chrome' => 'Chrome',
+                        'firefox' => 'Firefox',
+                        'edge' => 'Edge',
+                        'safari' => 'Safari',
+                        'netdisk' => 'netdisk',
+                        'custom' => s.userAgentPresetCustom,
+                        _ => s.queueUaInheritGlobal,
+                      };
+                      return Text(label, overflow: TextOverflow.ellipsis, maxLines: 1);
+                    },
+                    onChanged: _onUaPresetChanged,
+                  ),
                 ),
-                const SizedBox(height: 6),
-                ShadSelect<String>(
-                  initialValue: _selectedSegments,
-                  onChanged: (v) {
-                    if (v != null) setState(() => _selectedSegments = v);
-                  },
-                  options: _segmentOptions.map((opt) => ShadOption(
-                    value: opt,
-                    child: Text(opt == '0' ? s.queueDefaultSegmentsHint : opt),
-                  )).toList(),
-                  selectedOptionBuilder: (ctx, v) => Text(v == '0' ? s.queueDefaultSegmentsHint : v),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: ShadInput(
+                    controller: _uaCtrl,
+                    placeholder: Text(s.queueUaHint),
+                    onChanged: _onUaTextChanged,
+                  ),
                 ),
               ],
             ),

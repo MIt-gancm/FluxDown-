@@ -26,12 +26,29 @@ pub struct CreateTask {
     /// Named queue ID to assign this task to. Empty = default queue.
     #[serde(default)]
     pub queue_id: String,
+    /// Checksum spec for integrity verification after download.
+    /// Format: "algo=hexhash", e.g. "sha-256=abc123..." or "md5=d41d8c...".
+    /// Empty = skip verification.
+    #[serde(default)]
+    pub checksum: String,
+}
+
+/// Single entry in a batch download (URL + optional filename + optional checksum)
+#[derive(Serialize, Deserialize, SignalPiece)]
+pub struct UrlEntry {
+    pub url: String,
+    /// Custom file name. Empty = auto-detect from server response.
+    pub file_name: String,
+    /// Checksum spec for integrity verification after download.
+    /// Format: "algo=hexhash", e.g. "sha-256=abc123..." or "md5=d41d8c...".
+    /// Empty = skip verification.
+    pub checksum: String,
 }
 
 /// Batch create multiple download tasks at once
 #[derive(Deserialize, DartSignal)]
 pub struct BatchCreateTask {
-    pub urls: Vec<String>, // list of URLs (http/https/ftp/magnet)
+    pub entries: Vec<UrlEntry>, // list of download entries (URL + optional name/checksum)
     pub save_dir: String,
     pub segments: i32, // 0 = auto, shared across all tasks
     /// Per-task proxy URL override (shared for all tasks in batch).
@@ -178,6 +195,9 @@ pub struct TaskInfo {
     /// Named queue ID (empty = default queue).
     #[serde(default)]
     pub queue_id: String,
+    /// Checksum spec for integrity verification (empty = skip).
+    #[serde(default)]
+    pub checksum: String,
 }
 
 /// Notification that a dynamic segment split occurred (IDM-style coordinator).
@@ -390,6 +410,9 @@ pub struct CreateQueue {
     /// Default segment count for new tasks in this queue. 0 = auto (global advisor).
     #[serde(default)]
     pub default_segments: i32,
+    /// Default user-agent for tasks in this queue. Empty = inherit global UA.
+    #[serde(default)]
+    pub default_user_agent: String,
 }
 
 /// Update an existing queue's settings (Dart → Rust)
@@ -403,6 +426,9 @@ pub struct UpdateQueue {
     /// Default segment count for new tasks in this queue. 0 = auto (global advisor).
     #[serde(default)]
     pub default_segments: i32,
+    /// Default user-agent for tasks in this queue. Empty = inherit global UA.
+    #[serde(default)]
+    pub default_user_agent: String,
 }
 
 /// Delete a named queue (Dart → Rust). Tasks move to the default queue.
@@ -444,4 +470,7 @@ pub struct QueueInfo {
     pub position: i32,
     /// Default segment count for new tasks. 0 = auto (global segment advisor).
     pub default_segments: i32,
+    /// Default user-agent for tasks in this queue. Empty = inherit global UA.
+    #[serde(default)]
+    pub default_user_agent: String,
 }

@@ -127,6 +127,9 @@ struct QueuedTask {
     user_agent: String,
     /// Named queue ID this task belongs to. Empty = default queue.
     queue_id: String,
+    /// Checksum spec for post-download integrity verification.
+    /// Format: "algo=hexhash". Empty = skip verification.
+    checksum: String,
 }
 
 pub struct DownloadManager {
@@ -185,6 +188,10 @@ pub struct DownloadManager {
     queue_limiters: HashMap<String, SpeedLimiter>,
     /// Maps active task_id → queue_id for per-queue concurrency counting.
     active_task_queue: HashMap<String, String>,
+    /// 是否已完成启动时的 reset_incomplete_tasks_to_paused 矫正。
+    /// 该矫正仅需在第一次 load_and_send_all_tasks 时执行一次，
+    /// 后续由 create_task / batch_create 触发时不得重复重置。
+    startup_reset_done: bool,
 }
 
 impl DownloadManager {
@@ -227,6 +234,7 @@ impl DownloadManager {
             queues: HashMap::new(),
             queue_limiters: HashMap::new(),
             active_task_queue: HashMap::new(),
+            startup_reset_done: false,
         })
     }
 
@@ -485,7 +493,7 @@ impl DownloadManager {
                 i += 1;
                 continue;
             }
-            let queued = self.pending_queue.remove(i).expect("index checked above");
+            let Some(queued) = self.pending_queue.remove(i) else { break };
             if queued.is_resume {
                 self.do_resume_task(&queued.task_id).await;
             } else {
@@ -542,11 +550,15 @@ impl DownloadManager {
         }
     }
 
-    pub async fn load_and_send_all_tasks(&self) {
-        // 启动时将残留的 downloading/pending 状态矫正为 paused
-        // 因为重启后没有活跃的下载线程
-        if let Err(e) = self.db.reset_incomplete_tasks_to_paused().await {
-            rinf::debug_print!("reset_incomplete_tasks_to_paused error: {}", e);
+    pub async fn load_and_send_all_tasks(&mut self) {
+        // 启动时将残留的 downloading/pending 状态矫正为 paused（仅首次执行）
+        // 后续由 create_task / batch_create 触发时不重复重置，避免将刚插入的
+        // pending 任务误改为 paused 导致前端显示"已暂停"
+        if !self.startup_reset_done {
+            self.startup_reset_done = true;
+            if let Err(e) = self.db.reset_incomplete_tasks_to_paused().await {
+                rinf::debug_print!("reset_incomplete_tasks_to_paused error: {}", e);
+            }
         }
 
         let tasks = match self.db.load_all_tasks().await {
@@ -609,6 +621,7 @@ impl DownloadManager {
         proxy_url: String,
         user_agent: String,
         queue_id: String,
+        checksum: String,
     ) {
         let task_id = Uuid::new_v4().to_string();
         // When segments <= 0 ("auto"), store 0 in DB and let the downloader
@@ -626,7 +639,7 @@ impl DownloadManager {
 
         if let Err(e) = self
             .db
-            .insert_task(&task_id, &db_url, &file_name, &save_dir, seg, 0, &proxy_url, &queue_id)
+            .insert_task(&task_id, &db_url, &file_name, &save_dir, seg, 0, &proxy_url, &queue_id, &checksum)
             .await
         {
             rinf::debug_print!("insert_task error: {}", e);
@@ -668,6 +681,7 @@ impl DownloadManager {
             proxy_url,
             user_agent,
             queue_id,
+            checksum,
         };
         if is_bt || (self.has_capacity() && self.has_queue_capacity(&queued.queue_id)) {
             self.do_start_task(queued).await;
@@ -725,6 +739,7 @@ impl DownloadManager {
             proxy_url,
             user_agent,
             queue_id,
+            checksum,
         } = queued;
 
         // Three-tier segment count priority:
@@ -829,12 +844,24 @@ impl DownloadManager {
             // Resolve proxy and UA: per-task values override global config.
             // `.resolve()` expands System mode into a concrete Manual config
             // so that FTP downloader (which reads host/port directly) works.
-            let resolved_ua = if user_agent.is_empty() {
-                self.global_user_agent.as_str()
-            } else {
+            //
+            // Three-tier UA resolution (highest → lowest priority):
+            //   1. Per-task explicit UA — set when creating/confirming the task
+            //   2. Per-queue default UA — inherited from queue when task UA is empty
+            //   3. Global UA — final fallback when both task and queue UA are empty
+            let queue_ua = self
+                .queues
+                .get(&queue_id)
+                .map(|q| q.default_user_agent.as_str())
+                .unwrap_or("");
+            let resolved_ua = if !user_agent.is_empty() {
                 user_agent.as_str()
+            } else if !queue_ua.is_empty() {
+                queue_ua
+            } else {
+                self.global_user_agent.as_str()
             };
-            let needs_rebuild = !proxy_url.is_empty() || !user_agent.is_empty();
+            let needs_rebuild = !proxy_url.is_empty() || !user_agent.is_empty() || !queue_ua.is_empty();
             let (task_client, task_proxy) = if needs_rebuild {
                 let pc = if proxy_url.is_empty() {
                     self.proxy_config.resolve()
@@ -879,6 +906,7 @@ impl DownloadManager {
                 cookies,
                 proxy_config: task_proxy,
                 hls_quality_rx,
+                checksum,
             };
 
             tokio::spawn(async move {
@@ -1048,6 +1076,7 @@ impl DownloadManager {
                     proxy_url: t.proxy_url,
                     user_agent: String::new(), // use global UA on resume
                     queue_id: t.queue_id,
+                    checksum: t.checksum, // loaded from DB for integrity verification
                 });
             }
         }
@@ -1241,6 +1270,7 @@ impl DownloadManager {
                 cookies: String::new(),
                 proxy_config: task_proxy,
                 hls_quality_rx,
+                checksum: task.checksum,
             };
 
             tokio::spawn(async move {
@@ -1467,6 +1497,7 @@ impl DownloadManager {
         max_concurrent: i32,
         default_save_dir: String,
         default_segments: i32,
+        default_user_agent: String,
     ) {
         let id = Uuid::new_v4().to_string();
         let position = match self.db.queue_count().await {
@@ -1478,7 +1509,7 @@ impl DownloadManager {
         };
         if let Err(e) = self
             .db
-            .insert_queue(&id, &name, speed_limit_kbps, max_concurrent, &default_save_dir, position, default_segments)
+            .insert_queue(&id, &name, speed_limit_kbps, max_concurrent, &default_save_dir, position, default_segments, &default_user_agent)
             .await
         {
             rinf::debug_print!("[manager] insert_queue error: {}", e);
@@ -1493,12 +1524,14 @@ impl DownloadManager {
             default_save_dir,
             position,
             default_segments,
+            default_user_agent,
         });
         rinf::debug_print!("[manager] created queue: id={}, name={}", id, name);
         self.send_all_queues().await;
     }
 
     /// Update an existing queue and broadcast the updated list.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_queue(
         &mut self,
         queue_id: String,
@@ -1507,10 +1540,11 @@ impl DownloadManager {
         max_concurrent: i32,
         default_save_dir: String,
         default_segments: i32,
+        default_user_agent: String,
     ) {
         if let Err(e) = self
             .db
-            .update_queue(&queue_id, &name, speed_limit_kbps, max_concurrent, &default_save_dir, default_segments)
+            .update_queue(&queue_id, &name, speed_limit_kbps, max_concurrent, &default_save_dir, default_segments, &default_user_agent)
             .await
         {
             rinf::debug_print!("[manager] update_queue error: {}", e);
@@ -1523,6 +1557,7 @@ impl DownloadManager {
             q.max_concurrent = max_concurrent;
             q.default_save_dir = default_save_dir;
             q.default_segments = default_segments;
+            q.default_user_agent = default_user_agent;
         }
         // If a per-queue limiter already exists, update its limit in place.
         if let Some(limiter) = self.queue_limiters.get(&queue_id) {

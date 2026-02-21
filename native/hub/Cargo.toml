@@ -39,6 +39,10 @@ aes = "0.8"
 cbc = "0.1"
 dash-mpd = { version = "0.19", default-features = false }
 ts2mp4 = "0.3"
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

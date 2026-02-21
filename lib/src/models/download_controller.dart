@@ -41,6 +41,11 @@ class DownloadController extends ChangeNotifier {
   /// 在 _onAllTasks 刷新时清空（Rust 端不再包含该任务即可安全移除）。
   final Set<String> _deletedTaskIds = {};
 
+  /// 用户主动暂停的任务 ID 集合（乐观暂停）。
+  /// 守卫：阻止 _onAllTasks 从 DB 覆盖 UI 暂停状态，以及阻止积压的 downloading
+  /// 信号将 UI 改回下载中。只在 resumeTask / deleteTask 时移除。
+  final Set<String> _optimisticPausedIds = {};
+
   /// 下载完成回调 — 当任务状态从非 completed 变为 completed 时触发
   void Function(DownloadTask task)? onTaskCompleted;
 
@@ -360,6 +365,7 @@ class DownloadController extends ChangeNotifier {
       'deleteCheckedTasks: ${ids.length} tasks, deleteFiles=$deleteFiles',
     );
     for (final id in ids) {
+      _optimisticPausedIds.remove(id);
       final action = deleteFiles ? 3 : 4;
       ControlTask(taskId: id, action: action).sendSignalToRust();
       _deletedTaskIds.add(id);
@@ -420,6 +426,7 @@ class DownloadController extends ChangeNotifier {
     String proxyUrl = '',
     String userAgent = '',
     String queueId = '',
+    String checksum = '',
   }) {
     logInfo(
       _tag,
@@ -435,6 +442,7 @@ class DownloadController extends ChangeNotifier {
       proxyUrl: proxyUrl,
       userAgent: userAgent,
       queueId: queueId,
+      checksum: checksum,
     ).sendSignalToRust();
     // 分析埋点
     final protocol = (torrentFileBytes != null && torrentFileBytes.isNotEmpty)
@@ -489,6 +497,7 @@ class DownloadController extends ChangeNotifier {
         proxyUrl: proxyUrl,
         userAgent: '',
         queueId: '',
+        checksum: '',
       ).sendSignalToRust();
       AnalyticsService.instance.trackDownloadCreated('bt');
     } catch (e) {
@@ -498,7 +507,7 @@ class DownloadController extends ChangeNotifier {
 
   /// 批量创建下载任务（多个 URL 共享同一保存目录和线程数）
   void batchCreateTask({
-    required List<String> urls,
+    required List<UrlEntry> entries,
     required String saveDir,
     int segments = 0,
     String proxyUrl = '',
@@ -507,24 +516,25 @@ class DownloadController extends ChangeNotifier {
   }) {
     logInfo(
       _tag,
-      'batchCreateTask: ${urls.length} urls, dir=$saveDir, seg=$segments, queue=$queueId',
+      'batchCreateTask: ${entries.length} entries, dir=$saveDir, seg=$segments, queue=$queueId',
     );
     BatchCreateTask(
-      urls: urls,
+      entries: entries,
       saveDir: saveDir,
       segments: segments,
       proxyUrl: proxyUrl,
       userAgent: userAgent,
       queueId: queueId,
     ).sendSignalToRust();
-    for (final url in urls) {
-      final protocol = url.toLowerCase().startsWith('ftp') ? 'ftp' : 'http';
+    for (final entry in entries) {
+      final protocol = entry.url.toLowerCase().startsWith('ftp') ? 'ftp' : 'http';
       AnalyticsService.instance.trackDownloadCreated(protocol);
     }
   }
 
   void pauseTask(String taskId) {
     logInfo(_tag, 'pauseTask: $taskId');
+    _optimisticPausedIds.add(taskId);
     // 乐观更新：立即切换到 paused 状态，防止用户快速重复点击
     final idx = _tasks.indexWhere((t) => t.id == taskId);
     if (idx >= 0) {
@@ -543,6 +553,7 @@ class DownloadController extends ChangeNotifier {
 
   void resumeTask(String taskId) {
     logInfo(_tag, 'resumeTask: $taskId');
+    _optimisticPausedIds.remove(taskId);
     // 立即切换到 resuming 状态，让 UI 即时响应
     final idx = _tasks.indexWhere((t) => t.id == taskId);
     if (idx >= 0) {
@@ -560,6 +571,7 @@ class DownloadController extends ChangeNotifier {
   /// 删除任务。[deleteFiles] 为 true 时同时删除磁盘上的已下载文件。
   void deleteTask(String taskId, {bool deleteFiles = true}) {
     logInfo(_tag, 'deleteTask: $taskId, deleteFiles=$deleteFiles');
+    _optimisticPausedIds.remove(taskId);
     final action = deleteFiles ? 3 : 4;
     ControlTask(taskId: taskId, action: action).sendSignalToRust();
     _deletedTaskIds.add(taskId);
@@ -606,10 +618,11 @@ class DownloadController extends ChangeNotifier {
     int maxConcurrent = 0,
     String defaultSaveDir = '',
     int defaultSegments = 0,
+    String defaultUserAgent = '',
   }) {
     logInfo(
       _tag,
-      'createQueue: name=$name, speedLimit=$speedLimitKbps, maxConcurrent=$maxConcurrent, defaultSegments=$defaultSegments',
+      'createQueue: name=$name, speedLimit=$speedLimitKbps, maxConcurrent=$maxConcurrent, defaultSegments=$defaultSegments, ua=${defaultUserAgent.isEmpty ? "(global)" : defaultUserAgent.substring(0, defaultUserAgent.length.clamp(0, 20))}',
     );
     CreateQueue(
       name: name,
@@ -617,6 +630,7 @@ class DownloadController extends ChangeNotifier {
       maxConcurrent: maxConcurrent,
       defaultSaveDir: defaultSaveDir,
       defaultSegments: defaultSegments,
+      defaultUserAgent: defaultUserAgent,
     ).sendSignalToRust();
   }
 
@@ -627,8 +641,9 @@ class DownloadController extends ChangeNotifier {
     int maxConcurrent = 0,
     String defaultSaveDir = '',
     int defaultSegments = 0,
+    String defaultUserAgent = '',
   }) {
-    logInfo(_tag, 'updateQueue: id=$queueId, name=$name, defaultSegments=$defaultSegments');
+    logInfo(_tag, 'updateQueue: id=$queueId, name=$name, defaultSegments=$defaultSegments, ua=${defaultUserAgent.isEmpty ? "(global)" : defaultUserAgent.substring(0, defaultUserAgent.length.clamp(0, 20))}');
     UpdateQueue(
       queueId: queueId,
       name: name,
@@ -636,6 +651,7 @@ class DownloadController extends ChangeNotifier {
       maxConcurrent: maxConcurrent,
       defaultSaveDir: defaultSaveDir,
       defaultSegments: defaultSegments,
+      defaultUserAgent: defaultUserAgent,
     ).sendSignalToRust();
   }
 
@@ -711,7 +727,15 @@ class DownloadController extends ChangeNotifier {
     _deletedTaskIds.clear(); // 全量刷新后旧的删除标记不再需要
     _tasks.clear();
     for (final info in incoming) {
-      _tasks.add(DownloadTask.fromTaskInfo(info));
+      var task = DownloadTask.fromTaskInfo(info);
+      // 若用户已乐观暂停该任务，DB 的旧状态（downloading/resuming 等）不得覆盖 UI。
+      // 避免 AllTasks 到达时 DB 尚未写入 paused，导致任务被还原成下载中，
+      // 随后守卫又因 old=downloading != paused 而失效。
+      if (_optimisticPausedIds.contains(info.taskId) &&
+          task.status != TaskStatus.paused) {
+        task = task.copyWith(status: TaskStatus.paused, speed: 0);
+      }
+      _tasks.add(task);
     }
     _safeNotifyListeners();
   }
@@ -726,10 +750,12 @@ class DownloadController extends ChangeNotifier {
     if (idx >= 0) {
       final oldStatus = _tasks[idx].status;
       // 防止 Rust progress_reporter channel 中积压的 status=1 更新覆盖已
-      // 乐观设置的 paused 状态。pause_task 直接调用 send_signal_to_dart() 发
-      // 送 status=2，但 channel 里仍有 status=1 消息在排队，需丢弃。
-      // resume 时 Dart 端先设置 resuming，不会命中此条件。
-      if (oldStatus == TaskStatus.paused && newStatus == TaskStatus.downloading) {
+      // 乐观设置的 paused 状态。仅对用户主动暂停的任务生效（_optimisticPausedIds），
+      // 避免 AllTasks 从 DB 加载的历史 paused 状态也触发此守卫，导致任务永远
+      // 卡在「暂停」显示。
+      if (_optimisticPausedIds.contains(p.taskId) &&
+          oldStatus == TaskStatus.paused &&
+          newStatus == TaskStatus.downloading) {
         return;
       }
       _tasks[idx] = _tasks[idx].applyProgress(p);

@@ -28,6 +28,8 @@ pub enum DownloadError {
     Db(#[from] crate::db::DbError),
     #[error("cancelled")]
     Cancelled,
+    #[error("checksum mismatch: {0}")]
+    ChecksumMismatch(String),
     #[error("{0}")]
     Other(String),
 }
@@ -89,6 +91,10 @@ pub struct DownloadParams {
     /// options to Dart via signal and awaits the chosen variant index on this
     /// channel.  `None` for non-HLS downloads (HTTP/FTP/BT).
     pub hls_quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
+    /// Checksum spec for post-download integrity verification.
+    /// Format: "algo=hexhash", e.g. "sha-256=abc123..." or "md5=d41d8c...".
+    /// Empty = skip verification.
+    pub checksum: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -727,12 +733,19 @@ pub async fn run_download(params: DownloadParams) {
         }
         Err(e) => {
             let msg = e.to_string();
+            // checksum 失败时所有字节均已下载完毕（只是校验未通过），需特殊处理进度。
+            let is_checksum_fail = matches!(e, DownloadError::ChecksumMismatch(_));
             rinf::debug_print!("[download] task {} error: {}", task_id_log, msg);
             let _ = params.db.update_task_status(&params.task_id, 4, &msg).await;
 
             // Preserve actual progress from DB so the UI doesn't jump back to 0%.
             let (dl, total) = match params.db.load_task_by_id(&params.task_id).await {
-                Ok(Some(t)) => (t.downloaded_bytes, t.total_bytes),
+                Ok(Some(t)) => {
+                    // checksum 失败 → 字节已全部下载，进度应显示 100%。
+                    // 其他错误 → 保留 DB 中实际已下载量，防止 UI 回跳至 0%。
+                    let dl = if is_checksum_fail { t.total_bytes } else { t.downloaded_bytes };
+                    (dl, t.total_bytes)
+                }
                 other => {
                     rinf::debug_print!(
                         "[download] task {} warning: failed to read progress from DB: {:?}",
@@ -756,6 +769,104 @@ pub async fn run_download(params: DownloadParams) {
                 .await;
         }
     }
+}
+
+/// Verify that a file at `path` matches the checksum in `spec`.
+///
+/// `spec` format: `"algo=hexhash"`, e.g. `"sha-256=abc123..."` or `"md5=d41d8c..."`.
+/// Supported algorithms: `sha-256`/`sha256`, `sha-512`/`sha512`, `sha-1`/`sha1`, `md5`.
+/// Returns `Ok(())` if the digest matches, or `Err(DownloadError::ChecksumMismatch)` if not.
+async fn verify_checksum(path: &Path, spec: &str) -> Result<(), DownloadError> {
+    let sep = spec.find('=').ok_or_else(|| {
+        DownloadError::Other(format!("invalid checksum format (expected algo=hash): {}", spec))
+    })?;
+    let algo_raw = spec[..sep].trim().to_lowercase();
+    let expected_hex = spec[sep + 1..].trim().to_lowercase();
+
+    // Normalize algorithm aliases to a canonical key.
+    let algo = match algo_raw.as_str() {
+        "sha-256" | "sha256" => "sha256",
+        "sha-512" | "sha512" => "sha512",
+        "sha-1" | "sha1" => "sha1",
+        "md5" => "md5",
+        other => {
+            return Err(DownloadError::Other(format!(
+                "unsupported checksum algorithm: {}",
+                other
+            )));
+        }
+    };
+
+    let path_owned = path.to_path_buf();
+    let algo_owned = algo.to_string();
+
+    let actual_hex =
+        tokio::task::spawn_blocking(move || -> Result<String, DownloadError> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path_owned)?;
+            let mut buf = vec![0u8; 1024 * 1024]; // 1 MiB read buffer
+            match algo_owned.as_str() {
+                "sha256" => {
+                    use sha2::Digest;
+                    let mut h = sha2::Sha256::new();
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        h.update(&buf[..n]);
+                    }
+                    Ok(hex::encode(h.finalize()))
+                }
+                "sha512" => {
+                    use sha2::Digest;
+                    let mut h = sha2::Sha512::new();
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        h.update(&buf[..n]);
+                    }
+                    Ok(hex::encode(h.finalize()))
+                }
+                "sha1" => {
+                    use sha1::Digest;
+                    let mut h = sha1::Sha1::new();
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        h.update(&buf[..n]);
+                    }
+                    Ok(hex::encode(h.finalize()))
+                }
+                "md5" => {
+                    use md5::Digest;
+                    let mut h = md5::Md5::new();
+                    loop {
+                        let n = file.read(&mut buf)?;
+                        if n == 0 {
+                            break;
+                        }
+                        h.update(&buf[..n]);
+                    }
+                    Ok(hex::encode(h.finalize()))
+                }
+                _ => Err(DownloadError::Other("unreachable algo branch".to_string())),
+            }
+        })
+        .await
+        .map_err(|e| DownloadError::Other(format!("checksum thread panicked: {}", e)))??;
+
+    if actual_hex != expected_hex {
+        return Err(DownloadError::ChecksumMismatch(format!(
+            "expected {}, got {}",
+            expected_hex, actual_hex
+        )));
+    }
+    Ok(())
 }
 
 /// Run the segment advisor to dynamically compute optimal segment count.
@@ -1010,6 +1121,16 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             }
         }
     };
+
+    // Checksum verification — runs after size integrity check, before rename.
+    if !p.checksum.is_empty() {
+        rinf::debug_print!(
+            "[download] task {} verifying checksum: {}",
+            p.task_id, p.checksum
+        );
+        verify_checksum(&temp_path, &p.checksum).await?;
+        rinf::debug_print!("[download] task {} checksum ok", p.task_id);
+    }
 
     // All data verified — rename temp file to final destination.
     // This is the atomic moment the file "appears" as complete.

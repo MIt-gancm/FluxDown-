@@ -16,6 +16,7 @@ import 'package:flutter/material.dart'
 import 'package:flutter/widgets.dart';
 import 'package:flutter/services.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
+import '../bindings/bindings.dart';
 import '../i18n/locale_provider.dart';
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
@@ -94,11 +95,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   }
 
   void _onUrlChanged() {
-    final urls = _parseUrls(_urlController.text);
-    final count = urls.length;
+    final entries = _parseEntries(_urlController.text);
+    final count = entries.length;
     final allMagnet =
-        urls.isNotEmpty &&
-        urls.every((u) => u.toLowerCase().startsWith('magnet:'));
+        entries.isNotEmpty &&
+        entries.every((e) => e.url.toLowerCase().startsWith('magnet:'));
     if (count != _urlCount || allMagnet != _allMagnet) {
       setState(() {
         _urlCount = count;
@@ -107,52 +108,105 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     }
   }
 
-  /// 从文本中解析所有有效的 URL（http/https/ftp/magnet）
+  /// 将 [_ParsedEntry] 转换回 aria2 风格文本（含 out= / checksum= 选项行）。
+  static String _entryToText(_ParsedEntry e) {
+    final buf = StringBuffer()..write(e.url);
+    if (e.fileName.isNotEmpty) buf.write('\n  out=${e.fileName}');
+    if (e.checksum.isNotEmpty) buf.write('\n  checksum=${e.checksum}');
+    return buf.toString();
+  }
+
+  /// 从文本解析 aria2 风格的下载条目列表。
   ///
-  /// [loose] 为 true 时从行内任意位置提取，适合 TXT 文件导入场景；
+  /// 支持格式：
+  /// ```
+  /// https://example.com/file.zip
+  ///   out=myname.zip
+  ///   checksum=sha-256=abc123...
+  ///
+  /// # 注释行（忽略）
+  /// https://example.com/plain.zip
+  /// ```
+  ///
+  /// [loose] 为 true 时从行内任意位置提取 URL，适合 TXT 文件导入；
   /// 默认严格模式要求 URL 位于行首，适合手动输入。
-  static List<String> _parseUrls(String text, {bool loose = false}) {
+  static List<_ParsedEntry> _parseEntries(String text, {bool loose = false}) {
     final lines = text.split('\n');
-    final urls = <String>[];
+    final entries = <_ParsedEntry>[];
+    _ParsedEntry? current;
     final pattern = RegExp(r'(https?|ftp)://\S+', caseSensitive: false);
     final strictPattern = RegExp(r'^(https?|ftp)://\S+', caseSensitive: false);
+
     for (final line in lines) {
+      // 选项行：原始行以空格或 Tab 开头
+      if (line.startsWith(' ') || line.startsWith('\t')) {
+        if (current == null) continue;
+        final trimmed = line.trim();
+        if (trimmed.startsWith('out=')) {
+          current = _ParsedEntry(
+            current.url,
+            fileName: trimmed.substring(4),
+            checksum: current.checksum,
+          );
+        } else if (trimmed.startsWith('checksum=')) {
+          current = _ParsedEntry(
+            current.url,
+            fileName: current.fileName,
+            checksum: trimmed.substring(9),
+          );
+        }
+        continue;
+      }
+
       final trimmed = line.trim();
       if (trimmed.isEmpty) continue;
+      if (trimmed.startsWith('#')) continue; // 注释行
+
+      // 新 URL 行：先把上一个入队
+      if (current != null) {
+        entries.add(current);
+        current = null;
+      }
+
       final lower = trimmed.toLowerCase();
       final magnetIdx = lower.indexOf('magnet:?');
       if (magnetIdx != -1) {
-        urls.add(trimmed.substring(magnetIdx));
+        current = _ParsedEntry(trimmed.substring(magnetIdx));
       } else if (loose) {
-        for (final match in pattern.allMatches(trimmed)) {
+        // loose 模式取行内第一个 URL 并设为 current，使后续选项行（out=/checksum=）
+        // 能正常附着。直接 add 会跳过 current，导致 TXT 导入时选项全部丢失。
+        final match = pattern.firstMatch(trimmed);
+        if (match != null) {
           final url = _trimUrlTail(match.group(0)!);
-          if (url.isNotEmpty) urls.add(url);
+          if (url.isNotEmpty) current = _ParsedEntry(url);
         }
       } else {
         final match = strictPattern.firstMatch(trimmed);
         if (match != null) {
-          urls.add(match.group(0)!);
+          current = _ParsedEntry(match.group(0)!);
         }
       }
     }
-    return urls;
+    if (current != null) entries.add(current);
+    return entries;
   }
 
   /// 去掉 URL 末尾常见标点（TXT 文本中 URL 后可能跟随句号/逗号等）
   static String _trimUrlTail(String url) =>
       url.replaceAll(RegExp(r'[.,;:!?()\[\]{}]+$'), '');
 
-  /// 读取剪切板内容，自动填入所有识别到的 URL
+  /// 读取剪切板内容，自动填入所有识别到的条目（支持 aria2 格式）
   Future<void> _pasteUrlFromClipboard() async {
     try {
       final data = await Clipboard.getData(Clipboard.kTextPlain);
       if (data == null || data.text == null) return;
       final text = data.text!.trim();
 
-      final urls = _parseUrls(text);
-      if (urls.isEmpty) return;
+      final entries = _parseEntries(text);
+      if (entries.isEmpty) return;
 
-      _urlController.text = urls.join('\n');
+      // 直接保留原始文本（含 aria2 选项行）
+      _urlController.text = text;
     } catch (_) {
       // 剪切板访问失败时静默忽略
     }
@@ -215,12 +269,12 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       );
       if (result == null || result.files.isEmpty || !mounted) return;
 
-      final extracted = <String>[];
+      final imported = <_ParsedEntry>[];
       for (final file in result.files) {
         if (file.path == null) continue;
         try {
           final content = await File(file.path!).readAsString();
-          extracted.addAll(_parseUrls(content, loose: true));
+          imported.addAll(_parseEntries(content, loose: true));
         } catch (_) {
           // 单文件读取失败时跳过，继续处理其他文件
         }
@@ -228,20 +282,22 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
 
       if (!mounted) return;
 
-      if (extracted.isEmpty) {
+      if (imported.isEmpty) {
         ShadSonner.of(context).show(
           ShadToast(title: Text(currentS.importTxtNoUrls)),
         );
         return;
       }
 
-      // 追加到已有内容，去重
-      final existing = _parseUrls(_urlController.text);
-      final merged = {...existing, ...extracted};
-      _urlController.text = merged.join('\n');
+      // 追加到已有内容，按 URL 去重，保留 fileName / checksum
+      final existing = _parseEntries(_urlController.text);
+      final existingUrls = existing.map((e) => e.url).toSet();
+      final toAdd = imported.where((e) => !existingUrls.contains(e.url));
+      final merged = [...existing, ...toAdd];
+      _urlController.text = merged.map(_entryToText).join('\n');
 
       ShadSonner.of(context).show(
-        ShadToast(title: Text(currentS.importTxtFound(extracted.length))),
+        ShadToast(title: Text(currentS.importTxtFound(imported.length))),
       );
     } finally {
       if (mounted) setState(() => _isPicking = false);
@@ -290,8 +346,8 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       return;
     }
 
-    final urls = _parseUrls(_urlController.text);
-    if (urls.isEmpty) return;
+    final entries = _parseEntries(_urlController.text);
+    if (entries.isEmpty) return;
 
     final segments = switch (selectedThreads) {
       'auto' => 0,
@@ -303,22 +359,30 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       _ => 0,
     };
 
-    if (urls.length == 1) {
+    if (entries.length == 1) {
       // 单条 — 使用 CreateTask，支持重命名
+      final entry = entries.first;
+      // 重命名字段优先；其次使用 out= 中的文件名
       final rename = _renameController.text.trim();
+      final fileName = rename.isNotEmpty ? rename : entry.fileName;
       widget.controller.createTask(
-        url: urls.first,
+        url: entry.url,
         saveDir: saveDir,
-        fileName: rename,
+        fileName: fileName,
         segments: segments,
         proxyUrl: proxyUrl,
         userAgent: userAgent,
         queueId: _selectedQueueId,
+        checksum: entry.checksum,
       );
     } else {
-      // 多条 — 使用 BatchCreateTask
+      // 多条 — 使用 BatchCreateTask（携带每条的 fileName/checksum）
       widget.controller.batchCreateTask(
-        urls: urls,
+        entries: entries
+            .map(
+              (e) => UrlEntry(url: e.url, fileName: e.fileName, checksum: e.checksum),
+            )
+            .toList(),
         saveDir: saveDir,
         segments: segments,
         proxyUrl: proxyUrl,
@@ -854,6 +918,19 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       ],
     );
   }
+}
+
+/// 解析后的下载条目：URL + 可选文件名 + 可选 checksum
+class _ParsedEntry {
+  final String url;
+
+  /// 来自 `out=` 选项的文件名，空字符串表示自动识别
+  final String fileName;
+
+  /// 来自 `checksum=` 选项的校验值，格式 "algo=hexhash"，空字符串跳过校验
+  final String checksum;
+
+  const _ParsedEntry(this.url, {this.fileName = '', this.checksum = ''});
 }
 
 class _SectionLabel extends StatelessWidget {
