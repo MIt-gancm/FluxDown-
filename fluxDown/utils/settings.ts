@@ -204,12 +204,18 @@ export function shouldIntercept(
 }
 
 /**
- * 通过扩展名匹配（检查 URL 路径和 filename）
+ * 通过扩展名匹配（检查 filename 和 URL 三策略）
+ *
+ * 策略顺序：
+ * 1. filename — Content-Disposition 给的文件名最准确，优先检查
+ * 2. URL pathname 末尾 — 覆盖 /path/file.pdf 场景
+ * 3. URL 查询参数值  — 覆盖 /download?file=report.pdf 场景
+ * 4. URL pathname 任意段 — 覆盖 /file.pdf/download 场景
  */
 function matchByExtension(url: string, filename: string | undefined, extensions: string[]): boolean {
   if (extensions.length === 0) return false;
 
-  // 从 filename 提取扩展名（优先，因为 Content-Disposition 给的文件名更准确）
+  // 策略 1: filename（Content-Disposition 给的文件名，最准确）
   if (filename) {
     const lowerFilename = filename.toLowerCase();
     if (extensions.some((ext) => lowerFilename.endsWith(ext))) {
@@ -217,12 +223,29 @@ function matchByExtension(url: string, filename: string | undefined, extensions:
     }
   }
 
-  // 从 URL 路径提取扩展名
   try {
-    const urlPath = new URL(url).pathname.toLowerCase();
-    // 去掉查询参数干扰，只看路径部分
-    if (extensions.some((ext) => urlPath.endsWith(ext))) {
+    const u = new URL(url);
+    const pathname = u.pathname.toLowerCase();
+
+    // 策略 2: pathname 末尾（最常见场景）
+    if (extensions.some((ext) => pathname.endsWith(ext))) {
       return true;
+    }
+
+    // 策略 3: 查询参数值中的扩展名（如 ?file=report.pdf&type=doc）
+    for (const val of u.searchParams.values()) {
+      const valLower = val.toLowerCase();
+      if (extensions.some((ext) => valLower.endsWith(ext))) {
+        return true;
+      }
+    }
+
+    // 策略 4: pathname 任意段（如 /file.pdf/download）
+    const segments = pathname.split('/');
+    for (const seg of segments) {
+      if (seg && extensions.some((ext) => seg.endsWith(ext))) {
+        return true;
+      }
     }
   } catch {
     // ignore

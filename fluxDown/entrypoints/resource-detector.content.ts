@@ -122,6 +122,27 @@ export default defineContentScript({
       document.removeEventListener('mousedown', handleAltMousedown, true);
     });
 
+    // ===== 6. 磁力链接点击拦截 =====
+    // 用户直接点击 <a href="magnet:..."> 时，阻止浏览器弹出 OS 应用选择框，
+    // 改由 FluxDown 接管。使用捕获阶段，早于页面自身的 click 处理器执行。
+    const handleMagnetClick = (e: MouseEvent) => {
+      const link = (e.target as Element).closest('a[href]') as HTMLAnchorElement | null;
+      if (!link) return;
+      const href = link.href;
+      if (!href || !href.toLowerCase().startsWith('magnet:')) return;
+      e.preventDefault();
+      e.stopPropagation();
+      browser.runtime.sendMessage({
+        action: 'downloadResource',
+        url: href,
+        filename: parseMagnetDisplayName(href),
+      }).catch(() => {});
+    };
+    document.addEventListener('click', handleMagnetClick, true);
+    ctx.onInvalidated(() => {
+      document.removeEventListener('click', handleMagnetClick, true);
+    });
+
     // ===== 扫描函数 =====
 
     function scanPageResources(): ResourceMessagePayload[] {

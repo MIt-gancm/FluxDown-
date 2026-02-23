@@ -1048,6 +1048,8 @@ export default defineBackground(() => {
       case 'downloadResource': {
         const url = message.url as string;
         if (!url) return { success: false, message: 'No URL' };
+        const dlSettings = await getCachedSettings();
+        if (!dlSettings.enabled) return { success: false, message: 'Extension disabled' };
         await sendToFluxDown(
           url,
           message.referrer,
