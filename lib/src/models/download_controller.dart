@@ -79,6 +79,10 @@ class DownloadController extends ChangeNotifier {
   /// 用于 boost 取消时精确清理守卫条目，避免遗漏或误删。
   final Set<String> _boostAutoPausedIds = {};
 
+  /// 延迟恢复队列：resumeAll 时超出并发限制的任务 ID 在此排队，
+  /// 当活跃任务完成/出错时由 _resumeNextDeferred() 逐个发送到 Rust。
+  final List<String> _deferredResumeQueue = [];
+
   StreamSubscription<RustSignalPack<TaskProgress>>? _progressSub;
   StreamSubscription<RustSignalPack<AllTasks>>? _allTasksSub;
   StreamSubscription<RustSignalPack<SegmentProgress>>? _segmentSub;
@@ -418,6 +422,7 @@ class DownloadController extends ChangeNotifier {
     final idSet = ids.toSet();
     _optimisticPausedIds.removeAll(idSet);
     _boostAutoPausedIds.removeAll(idSet);
+    _deferredResumeQueue.removeWhere((id) => idSet.contains(id));
     _deletedTaskIds.addAll(idSet);
     _tasks.removeWhere((t) => idSet.contains(t.id));
     if (_selectedTaskId != null && idSet.contains(_selectedTaskId)) {
@@ -639,6 +644,7 @@ class DownloadController extends ChangeNotifier {
     logInfo(_tag, 'deleteTask: $taskId, deleteFiles=$deleteFiles');
     _optimisticPausedIds.remove(taskId);
     _boostAutoPausedIds.remove(taskId);
+    _deferredResumeQueue.remove(taskId);
     final action = deleteFiles ? 3 : 4;
     ControlTask(taskId: taskId, action: action).sendSignalToRust();
     _deletedTaskIds.add(taskId);
@@ -785,6 +791,7 @@ class DownloadController extends ChangeNotifier {
   /// 批量暂停所有活跃任务（单次 IPC）
   void pauseAll() {
     logInfo(_tag, 'pauseAll');
+    _deferredResumeQueue.clear();
     final toPause = <String>[];
     for (int i = 0; i < _tasks.length; i++) {
       final t = _tasks[i];
@@ -809,44 +816,83 @@ class DownloadController extends ChangeNotifier {
     _safeNotifyListeners();
   }
 
-  /// 批量恢复所有暂停/错误任务（单次 IPC + 限制乐观状态数）
+  /// 批量恢复所有暂停/错误任务（延迟恢复队列方案）。
+  ///
+  /// 仅向 Rust 发送前 maxConcurrent 个任务的 resume 指令，其余放入
+  /// _deferredResumeQueue 排队。当活跃任务完成/出错时，
+  /// _resumeNextDeferred() 会从队列中取出下一个任务发送 resume。
+  /// 这从根本上避免了 Rust 为所有任务发送 downloading 信号导致的
+  /// UI「全部启动」假象。
   void resumeAll() {
     logInfo(_tag, 'resumeAll');
-    final toResume = <String>[];
+    _deferredResumeQueue.clear();
+
+    final candidates = <String>[];
     for (final t in _tasks) {
       if (t.status == TaskStatus.paused || t.status == TaskStatus.error) {
-        toResume.add(t.id);
+        candidates.add(t.id);
       }
     }
-    if (toResume.isEmpty) return;
+    if (candidates.isEmpty) return;
 
-    // 单次 IPC
-    BatchControlTask(taskIds: toResume, action: 1).sendSignalToRust();
-
-    // 仅将前 N 个标记为 resuming（N = 设置页面的并发限制 - 当前已活跃数），其余保持原状。
-    // 这样避免用户看到"全部启动"的假象。Rust 回传的真实状态会修正这些值。
     final maxConcurrent =
         SettingsProvider.globalInstance?.maxConcurrentTasks ?? 5;
-    // 减去当前已活跃的任务数（downloading + preparing + resuming），
-    // 避免乐观 UI 标记超出实际可用并发槽位的任务
     final currentActive = _tasks.where((t) =>
         t.status == TaskStatus.downloading ||
         t.status == TaskStatus.preparing ||
         t.status == TaskStatus.resuming).length;
-    final maxOptimistic = (maxConcurrent - currentActive).clamp(0, maxConcurrent);
-    int optimisticCount = 0;
+    final slotsAvailable = (maxConcurrent - currentActive).clamp(0, maxConcurrent);
+
+    // 分割：前 slotsAvailable 个立即发送，其余进入延迟队列
+    final immediate = candidates.take(slotsAvailable).toList();
+    final deferred = candidates.skip(slotsAvailable).toList();
+    _deferredResumeQueue.addAll(deferred);
+
+    // 仅对立即恢复的任务发送 IPC
+    if (immediate.isNotEmpty) {
+      BatchControlTask(taskIds: immediate, action: 1).sendSignalToRust();
+    }
+
+    // 乐观 UI 更新
     for (int i = 0; i < _tasks.length; i++) {
       final t = _tasks[i];
-      if (t.status == TaskStatus.paused || t.status == TaskStatus.error) {
+      if (t.status != TaskStatus.paused && t.status != TaskStatus.error) continue;
+      _boostAutoPausedIds.remove(t.id);
+      if (immediate.contains(t.id)) {
         _optimisticPausedIds.remove(t.id);
-        _boostAutoPausedIds.remove(t.id);
-        if (optimisticCount < maxOptimistic) {
-          _tasks[i] = t.copyWith(status: TaskStatus.resuming);
-          optimisticCount++;
-        }
+        _tasks[i] = t.copyWith(status: TaskStatus.resuming);
+      } else if (_deferredResumeQueue.contains(t.id)) {
+        // 延迟队列中的任务：立即显示为「等待中」，但不发送 resume 到 Rust。
+        // 保留守卫：pauseAll 发出后 Rust 仍可能有残余 downloading 信号延迟到达，
+        // 守卫会在 _onProgress 中拦截这些信号，防止任务提前变成「下载中」。
+        // _resumeNextDeferred() 调用时才移除守卫。
+        _tasks[i] = t.copyWith(status: TaskStatus.pending);
       }
     }
     _safeNotifyListeners();
+  }
+
+  /// 从延迟恢复队列中取出下一个任务并发送 resume。
+  /// 当活跃任务完成/出错释放槽位时调用。
+  void _resumeNextDeferred() {
+    while (_deferredResumeQueue.isNotEmpty) {
+      final nextId = _deferredResumeQueue.removeAt(0);
+      final idx = _tasks.indexWhere((t) => t.id == nextId);
+      // 跳过已删除、已完成或已在下载的任务
+      if (idx < 0) continue;
+      final t = _tasks[idx];
+      if (t.status != TaskStatus.paused &&
+          t.status != TaskStatus.error &&
+          t.status != TaskStatus.pending) {
+        continue;
+      }
+      // 发送单个 resume
+      _optimisticPausedIds.remove(nextId);
+      _tasks[idx] = t.copyWith(status: TaskStatus.resuming);
+      ControlTask(taskId: nextId, action: 1).sendSignalToRust();
+      _safeNotifyListeners();
+      return;
+    }
   }
 
   /// 默认下载目录
@@ -952,20 +998,19 @@ class DownloadController extends ChangeNotifier {
     final idx = _tasks.indexWhere((t) => t.id == p.taskId);
     if (idx >= 0) {
       final oldStatus = _tasks[idx].status;
-      // 防止 Rust progress_reporter channel 中积压的 status=1/5 更新覆盖已
-      // 乐观设置的 paused 状态。仅对用户主动暂停的任务生效（_optimisticPausedIds），
-      // 避免 AllTasks 从 DB 加载的历史 paused 状态也触发此守卫，导致任务永远
-      // 卡在「暂停」显示。
-      //
-      // 同时阻挡 preparing（status=5）：pauseAll 发出 pause 信号后，
-      // drain_queue 可能短暂将队列任务提升为活跃（发出 status=5），
-      // 随后该任务的 pause 信号到达 Rust 再次暂停并发出 status=2。
-      // 在此窗口期阻挡 status=5，防止 UI 从 paused 闪烁到 preparing 再回 paused。
+      // 守卫逻辑：防止 Rust 积压/提前到达的信号覆盖乐观 UI 状态。
+      // 对在 _optimisticPausedIds 中且当前 UI 为 paused 或 pending（延迟队列）的任务生效。
       if (_optimisticPausedIds.contains(p.taskId) &&
-          oldStatus == TaskStatus.paused &&
-          (newStatus == TaskStatus.downloading ||
-              newStatus == TaskStatus.preparing)) {
-        return;
+          (oldStatus == TaskStatus.paused ||
+              oldStatus == TaskStatus.pending)) {
+        if (newStatus == TaskStatus.downloading ||
+            newStatus == TaskStatus.preparing ||
+            newStatus == TaskStatus.pending) {
+          // 该任务仍在守卫中（未被 resumeAll 立即恢复），拦截所有活跃状态信号。
+          // 延迟恢复队列会在合适时机移除守卫并发送 resume。
+          return;
+        }
+        // paused/pending → paused / error / completed 等其他状态：不干预，直接放行。
       }
       _tasks[idx] = _tasks[idx].applyProgress(p);
       // 任务离开 downloading 状态时清空 recentSplits，避免内存泄漏
@@ -981,6 +1026,8 @@ class DownloadController extends ChangeNotifier {
         onTaskCompleted?.call(_tasks[idx]);
         final proto = _inferProtocol(_tasks[idx].url);
         AnalyticsService.instance.trackDownloadCompleted(proto, p.totalBytes);
+        // 释放槽位，从延迟队列恢复下一个任务
+        _resumeNextDeferred();
       }
       // 检测下载失败：从非 error 状态变为 error
       if (oldStatus != TaskStatus.error && newStatus == TaskStatus.error) {
@@ -988,6 +1035,8 @@ class DownloadController extends ChangeNotifier {
           _inferProtocol(_tasks[idx].url),
           _classifyError(p.errorMessage),
         );
+        // 释放槽位，从延迟队列恢复下一个任务
+        _resumeNextDeferred();
       }
     } else {
       // 新任务（刚刚创建的）

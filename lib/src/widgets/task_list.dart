@@ -124,19 +124,21 @@ class TaskList extends StatelessWidget {
             SliverList(
               delegate: SliverChildBuilderDelegate((context, index) {
                 final task = group.tasks[index];
-                return TaskListItem(
-                  task: task,
-                  isSelected: task.id == controller.selectedTaskId,
-                  onTap: () => onTaskTap?.call(task.id),
-                  onPause: () => controller.pauseTask(task.id),
-                  onResume: () => controller.resumeTask(task.id),
-                  onDelete: ({required bool deleteFiles}) =>
-                      controller.deleteTask(task.id, deleteFiles: deleteFiles),
-                  isPriority: controller.priorityTaskId == task.id,
-                  onBoost: () => controller.setPriorityTask(task.id),
-                  isManageMode: isManage,
-                  isChecked: controller.checkedTaskIds.contains(task.id),
-                  onToggleChecked: () => controller.toggleTaskChecked(task.id),
+                return RepaintBoundary(
+                  child: TaskListItem(
+                    task: task,
+                    isSelected: task.id == controller.selectedTaskId,
+                    onTap: () => onTaskTap?.call(task.id),
+                    onPause: () => controller.pauseTask(task.id),
+                    onResume: () => controller.resumeTask(task.id),
+                    onDelete: ({required bool deleteFiles}) =>
+                        controller.deleteTask(task.id, deleteFiles: deleteFiles),
+                    isPriority: controller.priorityTaskId == task.id,
+                    onBoost: () => controller.setPriorityTask(task.id),
+                    isManageMode: isManage,
+                    isChecked: controller.checkedTaskIds.contains(task.id),
+                    onToggleChecked: () => controller.toggleTaskChecked(task.id),
+                  ),
                 );
               }, childCount: group.tasks.length),
             ),

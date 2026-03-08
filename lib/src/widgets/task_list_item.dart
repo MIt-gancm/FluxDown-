@@ -338,16 +338,17 @@ class _IndeterminateBarState extends State<_IndeterminateBar>
   Widget build(BuildContext context) {
     return AnimatedBuilder(
       animation: _curve,
-      builder: (context, _) {
+      child: Container(
+        decoration: BoxDecoration(
+          color: widget.color,
+          borderRadius: BorderRadius.circular(1.5),
+        ),
+      ),
+      builder: (context, child) {
         return FractionallySizedBox(
           alignment: Alignment(-1.0 + 2.0 * _curve.value, 0),
           widthFactor: 0.3,
-          child: Container(
-            decoration: BoxDecoration(
-              color: widget.color,
-              borderRadius: BorderRadius.circular(1.5),
-            ),
-          ),
+          child: child,
         );
       },
     );

@@ -12,6 +12,7 @@ Options:
     --size   N     Bytes per file (default: 4096)
     --port   N     TCP port to listen on (default: 18080)
     --host   ADDR  Bind address (default: 127.0.0.1)
+    --speed  N     Throttle download to N bytes/sec per connection (default: 0 = unlimited)
 
 Endpoints:
     GET /file-{n}.bin     Download the n-th file (0-indexed)
@@ -19,8 +20,8 @@ Endpoints:
     GET /status           JSON: {"count": N, "size": N}
 
 Example:
-    # Serve 5000 × 4 KB files:
-    python3 scripts/test_file_server.py --count 5000 --size 4096
+    # Serve 5000 × 4 KB files at 512 B/s (stays "in progress" for testing):
+    python3 scripts/test_file_server.py --count 5000 --size 4096 --speed 512
 
     # From another terminal — download URLs list:
     curl http://localhost:18080/list | head -5
@@ -34,6 +35,7 @@ import http.server
 import json
 import re
 import sys
+import time
 import threading
 from typing import Optional
 
@@ -45,6 +47,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     file_count: int = 0
     file_size: int = 0
     port: int = 0
+    speed_bps: int = 0  # 0 = unlimited
 
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]  # ignore query string
@@ -55,7 +58,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             idx = int(m.group(1))
             if 0 <= idx < self.file_count:
                 data = bytes([idx % 256]) * self.file_size
-                self._send(200, "application/octet-stream", data)
+                self._send(200, "application/octet-stream", data, throttle=True)
             else:
                 self._send_error(404, f"file index {idx} out of range [0, {self.file_count})")
             return
@@ -80,13 +83,29 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         self._send_error(404, f"unknown path: {path}")
 
-    def _send(self, code: int, content_type: str, body: bytes) -> None:
+    def _send(self, code: int, content_type: str, body: bytes, throttle: bool = False) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Accept-Ranges", "bytes")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            if throttle and self.speed_bps > 0:
+                chunk = max(256, self.speed_bps // 10)  # send in ~100ms chunks
+                offset = 0
+                while offset < len(body):
+                    t0 = time.monotonic()
+                    self.wfile.write(body[offset:offset + chunk])
+                    self.wfile.flush()
+                    offset += chunk
+                    elapsed = time.monotonic() - t0
+                    expected = chunk / self.speed_bps
+                    if expected > elapsed:
+                        time.sleep(expected - elapsed)
+            else:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client disconnected mid-transfer — normal for download managers
 
     def _send_error(self, code: int, msg: str) -> None:
         body = msg.encode()
@@ -97,7 +116,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def make_handler(count: int, size: int, port: int) -> type:
+def make_handler(count: int, size: int, port: int, speed: int = 0) -> type:
     """Return a handler class with injected configuration."""
 
     class Handler(_Handler):
@@ -105,6 +124,7 @@ def make_handler(count: int, size: int, port: int) -> type:
         file_size = size
 
     Handler.port = port
+    Handler.speed_bps = speed
     return Handler
 
 
@@ -120,9 +140,12 @@ def main() -> None:
                         help="TCP port (default: 18080)")
     parser.add_argument("--host", default="127.0.0.1", metavar="ADDR",
                         help="bind address (default: 127.0.0.1)")
+    parser.add_argument("--speed", type=int, default=0, metavar="N",
+                        help="throttle to N bytes/sec per connection (default: 0 = unlimited). "
+                             "Example: 51200 = 50 KB/s, 1048576 = 1 MB/s")
     args = parser.parse_args()
 
-    handler = make_handler(args.count, args.size, args.port)
+    handler = make_handler(args.count, args.size, args.port, args.speed)
 
     # Allow rapid restart without TIME_WAIT delay.
     http.server.HTTPServer.allow_reuse_address = True
@@ -137,6 +160,7 @@ def main() -> None:
         f"  Base  : http://{args.host}:{args.port}/file-{{n}}.bin  (n=0..{args.count-1})\n"
         f"  List  : http://{args.host}:{args.port}/list\n"
         f"  Status: http://{args.host}:{args.port}/status\n"
+        f"  Speed : {f'{args.speed:,} B/s ({args.speed/1024:.1f} KB/s)' if args.speed else 'unlimited'}\n"
         f"Press Ctrl+C to stop.",
         flush=True,
     )

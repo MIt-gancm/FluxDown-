@@ -46,40 +46,44 @@ class DetailPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
-    return ListenableBuilder(
-      listenable: controller,
-      builder: (context, _) {
-        final task = controller.selectedTask;
-        return Container(
-          color: c.surface1,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              _buildHeader(c),
-              if (task == null)
-                Expanded(child: _buildNoSelection(c))
-              else ...[
-                Expanded(
-                  child: SingleChildScrollView(
-                    padding: const EdgeInsets.all(16),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        _buildFileInfo(c, task),
-                        const SizedBox(height: 20),
-                        _buildProgress(c, task),
-                        const SizedBox(height: 20),
-                        _buildInfoTable(c, task),
-                      ],
+    return Container(
+      color: c.surface1,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _buildHeader(c),
+          Expanded(
+            child: ListenableBuilder(
+              listenable: controller,
+              builder: (context, _) {
+                final task = controller.selectedTask;
+                if (task == null) return _buildNoSelection(c);
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Expanded(
+                      child: SingleChildScrollView(
+                        padding: const EdgeInsets.all(16),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            _buildFileInfo(c, task),
+                            const SizedBox(height: 20),
+                            _buildProgress(c, task),
+                            const SizedBox(height: 20),
+                            _buildInfoTable(c, task),
+                          ],
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-                _buildActions(c, task),
-              ],
-            ],
+                    _buildActions(c, task),
+                  ],
+                );
+              },
+            ),
           ),
-        );
-      },
+        ],
+      ),
     );
   }
 
