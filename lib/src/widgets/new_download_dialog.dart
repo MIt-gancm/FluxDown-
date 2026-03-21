@@ -1,6 +1,7 @@
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import '../services/file_picker_service.dart';
 import 'package:flutter/material.dart'
     show
         AdaptiveTextSelectionToolbar,
@@ -252,12 +253,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     if (_isPicking) return;
     setState(() => _isPicking = true);
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final result = await FilePickerService.pickFiles(
         dialogTitle: currentS.selectTorrentFile,
         type: FileType.custom,
         allowedExtensions: ['torrent'],
         allowMultiple: true,
-        lockParentWindow: true,
       );
       if (result != null && result.files.isNotEmpty && mounted) {
         setState(() {
@@ -268,6 +268,8 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
           }
         });
       }
+    } on FilePickerException catch (e) {
+      if (mounted) _showPickerError(e);
     } finally {
       if (mounted) setState(() => _isPicking = false);
     }
@@ -284,12 +286,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     if (_isPicking) return;
     setState(() => _isPicking = true);
     try {
-      final result = await FilePicker.platform.pickFiles(
+      final result = await FilePickerService.pickFiles(
         dialogTitle: currentS.importTxtFile,
         type: FileType.custom,
         allowedExtensions: ['txt', 'text'],
         allowMultiple: true,
-        lockParentWindow: true,
       );
       if (result == null || result.files.isEmpty || !mounted) return;
 
@@ -307,9 +308,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       if (!mounted) return;
 
       if (imported.isEmpty) {
-        ShadSonner.of(context).show(
-          ShadToast(title: Text(currentS.importTxtNoUrls)),
-        );
+        ShadSonner.of(
+          context,
+        ).show(ShadToast(title: Text(currentS.importTxtNoUrls)));
         return;
       }
 
@@ -320,9 +321,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       final merged = [...existing, ...toAdd];
       _urlController.text = merged.map(_entryToText).join('\n');
 
-      ShadSonner.of(context).show(
-        ShadToast(title: Text(currentS.importTxtFound(imported.length))),
-      );
+      ShadSonner.of(
+        context,
+      ).show(ShadToast(title: Text(currentS.importTxtFound(imported.length))));
+    } on FilePickerException catch (e) {
+      if (mounted) _showPickerError(e);
     } finally {
       if (mounted) setState(() => _isPicking = false);
     }
@@ -332,9 +335,8 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     if (_isPicking) return;
     setState(() => _isPicking = true);
     try {
-      final result = await FilePicker.platform.getDirectoryPath(
+      final result = await FilePickerService.pickDirectory(
         dialogTitle: currentS.selectSaveDir,
-        lockParentWindow: true,
         initialDirectory: _saveDirController.text.trim().isNotEmpty
             ? _saveDirController.text.trim()
             : null,
@@ -342,9 +344,23 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       if (result != null && mounted) {
         _saveDirController.text = result;
       }
+    } on FilePickerException catch (e) {
+      if (mounted) _showPickerError(e);
     } finally {
       if (mounted) setState(() => _isPicking = false);
     }
+  }
+
+  void _showPickerError(FilePickerException e) {
+    final s = currentS;
+    final message = switch (e.reason) {
+      FilePickerFailReason.timeout => s.filePickerErrorTimeout,
+      FilePickerFailReason.noDialogTool => s.filePickerErrorNoTool,
+      FilePickerFailReason.comInitFailed => s.filePickerErrorNative,
+      FilePickerFailReason.nativeDialogFailed => s.filePickerErrorNative,
+      FilePickerFailReason.unknown => s.filePickerErrorGeneric,
+    };
+    ShadSonner.of(context).show(ShadToast.destructive(title: Text(message)));
   }
 
   bool get _isBatch => _urlCount > 1;
@@ -404,7 +420,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       widget.controller.batchCreateTask(
         entries: entries
             .map(
-              (e) => UrlEntry(url: e.url, fileName: e.fileName, checksum: e.checksum),
+              (e) => UrlEntry(
+                url: e.url,
+                fileName: e.fileName,
+                checksum: e.checksum,
+              ),
             )
             .toList(),
         saveDir: saveDir,
@@ -674,7 +694,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                     child: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(LucideIcons.fileText, size: 13, color: c.textMuted),
+                        Icon(
+                          LucideIcons.fileText,
+                          size: 13,
+                          color: c.textMuted,
+                        ),
                         const SizedBox(width: 6),
                         Text(
                           s.importTxtFile,
@@ -872,13 +896,13 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                         const presets = {
                           'chrome':
                               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                                  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                              '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
                           'firefox':
                               'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) '
-                                  'Gecko/20100101 Firefox/133.0',
+                              'Gecko/20100101 Firefox/133.0',
                           'edge':
                               'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                                  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+                              '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
                           'netdisk': 'netdisk',
                         };
                         if (preset != 'custom') {
@@ -938,7 +962,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
           selectedOptionBuilder: (context, value) {
             if (value.isEmpty) return Text(s.defaultQueue);
             final q = queues.where((q) => q.queueId == value).firstOrNull;
-            return Text(q?.name ?? s.defaultQueue, overflow: TextOverflow.ellipsis, maxLines: 1);
+            return Text(
+              q?.name ?? s.defaultQueue,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+            );
           },
           onChanged: (v) {
             if (v != null) {

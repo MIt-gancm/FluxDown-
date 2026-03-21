@@ -137,7 +137,10 @@ Future<void> main(List<String> args) async {
       ]);
       if (regResult.exitCode == 0) {
         needsReEnable = true;
-        logInfo('main', 'found legacy/installer autostart entry, migrating to --silentStart');
+        logInfo(
+          'main',
+          'found legacy/installer autostart entry, migrating to --silentStart',
+        );
       }
     }
     if (needsReEnable) {

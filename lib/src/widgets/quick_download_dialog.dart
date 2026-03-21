@@ -1,4 +1,4 @@
-import 'package:file_picker/file_picker.dart';
+import '../services/file_picker_service.dart';
 import 'package:flutter/material.dart'
     show
         AdaptiveTextSelectionToolbar,
@@ -231,9 +231,8 @@ class _QuickDownloadDialogContentState
     if (_isPicking) return;
     setState(() => _isPicking = true);
     try {
-      final result = await FilePicker.platform.getDirectoryPath(
+      final result = await FilePickerService.pickDirectory(
         dialogTitle: currentS.selectSaveDir,
-        lockParentWindow: true,
         initialDirectory: _saveDirController.text.trim().isNotEmpty
             ? _saveDirController.text.trim()
             : null,
@@ -241,9 +240,23 @@ class _QuickDownloadDialogContentState
       if (result != null && mounted) {
         _saveDirController.text = result;
       }
+    } on FilePickerException catch (e) {
+      if (mounted) _showPickerError(e);
     } finally {
       if (mounted) setState(() => _isPicking = false);
     }
+  }
+
+  void _showPickerError(FilePickerException e) {
+    final s = currentS;
+    final message = switch (e.reason) {
+      FilePickerFailReason.timeout => s.filePickerErrorTimeout,
+      FilePickerFailReason.noDialogTool => s.filePickerErrorNoTool,
+      FilePickerFailReason.comInitFailed => s.filePickerErrorNative,
+      FilePickerFailReason.nativeDialogFailed => s.filePickerErrorNative,
+      FilePickerFailReason.unknown => s.filePickerErrorGeneric,
+    };
+    ShadSonner.of(context).show(ShadToast.destructive(title: Text(message)));
   }
 
   bool get _isBatch => _urlCount > 1;
@@ -290,7 +303,11 @@ class _QuickDownloadDialogContentState
       BatchCreateTask(
         entries: entries
             .map(
-              (e) => UrlEntry(url: e.url, fileName: e.fileName, checksum: e.checksum),
+              (e) => UrlEntry(
+                url: e.url,
+                fileName: e.fileName,
+                checksum: e.checksum,
+              ),
             )
             .toList(),
         saveDir: saveDir,

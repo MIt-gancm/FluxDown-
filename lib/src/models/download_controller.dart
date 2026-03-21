@@ -222,14 +222,13 @@ class DownloadController extends ChangeNotifier {
 
     // "全部" 和 "下载中" Tab：活跃+排队任务组置顶，历史任务按时间分组
     if (_statusTab == StatusTab.all || _statusTab == StatusTab.downloading) {
-      final activeTasks =
-          tasks.where((t) => t.status.isActiveOrQueued).toList()
-            ..sort(_compareActiveTasks);
-      final historicalTasks =
-          tasks.where((t) => !t.status.isActiveOrQueued).toList();
+      final activeTasks = tasks.where((t) => t.status.isActiveOrQueued).toList()
+        ..sort(_compareActiveTasks);
+      final historicalTasks = tasks
+          .where((t) => !t.status.isActiveOrQueued)
+          .toList();
       return [
-        if (activeTasks.isNotEmpty)
-          TaskGroup(group: null, tasks: activeTasks),
+        if (activeTasks.isNotEmpty) TaskGroup(group: null, tasks: activeTasks),
         ..._buildTimeGroups(historicalTasks),
       ];
     }
@@ -316,21 +315,21 @@ class DownloadController extends ChangeNotifier {
     final base = _queueFiltered;
     return switch (tab) {
       StatusTab.all => base.length,
-      StatusTab.downloading => base
-          .where(
-            (t) =>
-                t.status == TaskStatus.downloading ||
-                t.status == TaskStatus.pending ||
-                t.status == TaskStatus.preparing ||
-                t.status == TaskStatus.resuming,
-          )
-          .length,
+      StatusTab.downloading =>
+        base
+            .where(
+              (t) =>
+                  t.status == TaskStatus.downloading ||
+                  t.status == TaskStatus.pending ||
+                  t.status == TaskStatus.preparing ||
+                  t.status == TaskStatus.resuming,
+            )
+            .length,
       StatusTab.completed =>
         base.where((t) => t.status == TaskStatus.completed).length,
       StatusTab.paused =>
         base.where((t) => t.status == TaskStatus.paused).length,
-      StatusTab.error =>
-        base.where((t) => t.status == TaskStatus.error).length,
+      StatusTab.error => base.where((t) => t.status == TaskStatus.error).length,
     };
   }
 
@@ -597,7 +596,9 @@ class DownloadController extends ChangeNotifier {
       queueId: queueId,
     ).sendSignalToRust();
     for (final entry in entries) {
-      final protocol = entry.url.toLowerCase().startsWith('ftp') ? 'ftp' : 'http';
+      final protocol = entry.url.toLowerCase().startsWith('ftp')
+          ? 'ftp'
+          : 'http';
       AnalyticsService.instance.trackDownloadCreated(protocol);
     }
   }
@@ -716,7 +717,10 @@ class DownloadController extends ChangeNotifier {
     int defaultSegments = 0,
     String defaultUserAgent = '',
   }) {
-    logInfo(_tag, 'updateQueue: id=$queueId, name=$name, defaultSegments=$defaultSegments, ua=${defaultUserAgent.isEmpty ? "(global)" : defaultUserAgent.substring(0, defaultUserAgent.length.clamp(0, 20))}');
+    logInfo(
+      _tag,
+      'updateQueue: id=$queueId, name=$name, defaultSegments=$defaultSegments, ua=${defaultUserAgent.isEmpty ? "(global)" : defaultUserAgent.substring(0, defaultUserAgent.length.clamp(0, 20))}',
+    );
     UpdateQueue(
       queueId: queueId,
       name: name,
@@ -837,11 +841,18 @@ class DownloadController extends ChangeNotifier {
 
     final maxConcurrent =
         SettingsProvider.globalInstance?.maxConcurrentTasks ?? 5;
-    final currentActive = _tasks.where((t) =>
-        t.status == TaskStatus.downloading ||
-        t.status == TaskStatus.preparing ||
-        t.status == TaskStatus.resuming).length;
-    final slotsAvailable = (maxConcurrent - currentActive).clamp(0, maxConcurrent);
+    final currentActive = _tasks
+        .where(
+          (t) =>
+              t.status == TaskStatus.downloading ||
+              t.status == TaskStatus.preparing ||
+              t.status == TaskStatus.resuming,
+        )
+        .length;
+    final slotsAvailable = (maxConcurrent - currentActive).clamp(
+      0,
+      maxConcurrent,
+    );
 
     // 分割：前 slotsAvailable 个立即发送，其余进入延迟队列
     final immediate = candidates.take(slotsAvailable).toList();
@@ -856,7 +867,8 @@ class DownloadController extends ChangeNotifier {
     // 乐观 UI 更新
     for (int i = 0; i < _tasks.length; i++) {
       final t = _tasks[i];
-      if (t.status != TaskStatus.paused && t.status != TaskStatus.error) continue;
+      if (t.status != TaskStatus.paused && t.status != TaskStatus.error)
+        continue;
       _boostAutoPausedIds.remove(t.id);
       if (immediate.contains(t.id)) {
         _optimisticPausedIds.remove(t.id);
@@ -916,11 +928,13 @@ class DownloadController extends ChangeNotifier {
     _segmentSub = SegmentProgress.rustSignalStream.listen(_onSegmentProgress);
     _splitSub = SegmentSplitEvent.rustSignalStream.listen(_onSplitEvent);
     _metaProbedSub = TaskMetaProbed.rustSignalStream.listen(_onTaskMetaProbed);
-    _queuePosSub =
-        QueuePositionsUpdate.rustSignalStream.listen(_onQueuePositionsUpdate);
+    _queuePosSub = QueuePositionsUpdate.rustSignalStream.listen(
+      _onQueuePositionsUpdate,
+    );
     _allQueuesSub = AllQueues.rustSignalStream.listen(_onAllQueues);
-    _prioritySub =
-        PriorityTaskChanged.rustSignalStream.listen(_onPriorityTaskChanged);
+    _prioritySub = PriorityTaskChanged.rustSignalStream.listen(
+      _onPriorityTaskChanged,
+    );
   }
 
   void _onAllTasks(RustSignalPack<AllTasks> pack) {
@@ -987,7 +1001,10 @@ class DownloadController extends ChangeNotifier {
         }
         // 上万级删除时每次确认都重绘开销过大：按 ~1% 步长节流，完成时强制刷新。
         // step = max(1, total / 100)，保证最多触发 ~100 次重建，与批次大小无关。
-        final step = (_batchDeleteTotal / 100).ceil().clamp(1, _batchDeleteTotal);
+        final step = (_batchDeleteTotal / 100).ceil().clamp(
+          1,
+          _batchDeleteTotal,
+        );
         if (isDone || _batchDeleteDone % step == 0) {
           _safeNotifyListeners();
         }
@@ -1001,8 +1018,7 @@ class DownloadController extends ChangeNotifier {
       // 守卫逻辑：防止 Rust 积压/提前到达的信号覆盖乐观 UI 状态。
       // 对在 _optimisticPausedIds 中且当前 UI 为 paused 或 pending（延迟队列）的任务生效。
       if (_optimisticPausedIds.contains(p.taskId) &&
-          (oldStatus == TaskStatus.paused ||
-              oldStatus == TaskStatus.pending)) {
+          (oldStatus == TaskStatus.paused || oldStatus == TaskStatus.pending)) {
         if (newStatus == TaskStatus.downloading ||
             newStatus == TaskStatus.preparing ||
             newStatus == TaskStatus.pending) {
@@ -1158,9 +1174,7 @@ class DownloadController extends ChangeNotifier {
     if (_disposed) return;
     final incoming = pack.message.queues;
     logInfo(_tag, '_onAllQueues: ${incoming.length} queues');
-    _queues = incoming
-        .map(DownloadQueue.fromQueueInfo)
-        .toList()
+    _queues = incoming.map(DownloadQueue.fromQueueInfo).toList()
       ..sort((a, b) => a.position.compareTo(b.position));
     // 如果当前筛选的队列已被删除，取消筛选
     if (_queueFilter != null &&

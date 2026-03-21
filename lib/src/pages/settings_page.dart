@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import '../services/file_picker_service.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter/material.dart';
 import 'package:rinf/rinf.dart';
@@ -942,17 +943,32 @@ class _SaveDirPickerState extends State<_SaveDirPicker> {
     if (_isPicking) return;
     setState(() => _isPicking = true);
     try {
-      final result = await FilePicker.platform.getDirectoryPath(
+      final result = await FilePickerService.pickDirectory(
         dialogTitle: currentS.selectDefaultSaveDir,
-        lockParentWindow: true,
-        initialDirectory: widget.settingsProvider.defaultSaveDir,
+        initialDirectory: widget.settingsProvider.defaultSaveDir.isNotEmpty
+            ? widget.settingsProvider.defaultSaveDir
+            : null,
       );
       if (result != null && mounted) {
         widget.settingsProvider.setDefaultSaveDir(result);
       }
+    } on FilePickerException catch (e) {
+      if (mounted) _showPickerError(e);
     } finally {
       if (mounted) setState(() => _isPicking = false);
     }
+  }
+
+  void _showPickerError(FilePickerException e) {
+    final s = currentS;
+    final message = switch (e.reason) {
+      FilePickerFailReason.timeout => s.filePickerErrorTimeout,
+      FilePickerFailReason.noDialogTool => s.filePickerErrorNoTool,
+      FilePickerFailReason.comInitFailed => s.filePickerErrorNative,
+      FilePickerFailReason.nativeDialogFailed => s.filePickerErrorNative,
+      FilePickerFailReason.unknown => s.filePickerErrorGeneric,
+    };
+    ShadSonner.of(context).show(ShadToast.destructive(title: Text(message)));
   }
 
   @override

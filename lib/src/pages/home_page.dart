@@ -202,8 +202,7 @@ class _HomePageState extends State<HomePage> {
       showBatchDeleteDialog(
         context,
         count: _controller.checkedCount,
-        onDeleteTask: () =>
-            _controller.deleteCheckedTasks(deleteFiles: false),
+        onDeleteTask: () => _controller.deleteCheckedTasks(deleteFiles: false),
         onDeleteTaskAndFile: () =>
             _controller.deleteCheckedTasks(deleteFiles: true),
       );
@@ -369,8 +368,7 @@ class _HomePageState extends State<HomePage> {
                             final c = AppColors.of(context);
                             return _BoostBanner(
                               fileName: tasks[idx].fileName,
-                              autoPausedCount:
-                                  _controller.boostAutoPausedCount,
+                              autoPausedCount: _controller.boostAutoPausedCount,
                               onCancel: _controller.cancelBoost,
                               s: s,
                               c: c,

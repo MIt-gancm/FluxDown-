@@ -581,6 +581,25 @@ class S {
     '端口范围无效（1024-65535，起始 ≤ 结束）',
     'Invalid port range (1024-65535, start ≤ end)',
   );
+
+  // ─────────────────────────────────────────────
+  // File picker 错误
+  // ─────────────────────────────────────────────
+
+  String get filePickerErrorTimeout => _t(
+    '目录选择超时，请重试。\n如果文件选择窗口在后台打开，请先关闭它再重试。',
+    'Directory picker timed out, please try again.\nIf a file picker window opened in the background, close it first.',
+  );
+  String get filePickerErrorNoTool => _t(
+    '未找到系统文件选择工具（kdialog / zenity）\n请安装后重试：sudo pacman -S kdialog 或 sudo apt install zenity',
+    'No system file picker found (kdialog / zenity).\nInstall one and retry: sudo pacman -S kdialog or sudo apt install zenity',
+  );
+  String get filePickerErrorNative => _t(
+    '无法打开文件选择对话框，请重试。',
+    'Failed to open file picker dialog, please try again.',
+  );
+  String get filePickerErrorGeneric =>
+      _t('打开文件选择器失败，请重试。', 'Failed to open file picker, please try again.');
   String get btSettingsRestartHint => _t(
     '部分设置需要重启 BT 引擎后生效',
     'Some settings require BT engine restart to take effect',
