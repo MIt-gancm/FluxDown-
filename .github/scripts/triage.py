@@ -204,18 +204,16 @@ if result.get("module") not in MODULE_IDS:
     result["module"] = "Flutter UI"
 
 # 防御：Claude 返回的 duplicate_of 必须在已知候选列表中
-if result.get("duplicate_of") and int(result["duplicate_of"]) not in valid_numbers:
-    print(
-        "[warn] Claude returned unknown duplicate #"
-        + str(result["duplicate_of"])
-        + ", ignoring"
-    )
+dup_of_raw = result.get("duplicate_of")
+if dup_of_raw is not None and int(dup_of_raw) not in valid_numbers:
+    print("[warn] Claude returned unknown duplicate #" + str(dup_of_raw) + ", ignoring")
     result["duplicate_of"] = None
 
 
 # ── 4a. 重复 issue 处理 ──────────────────────────────────────────────────────
-if result.get("duplicate_of"):
-    dup_num = int(result["duplicate_of"])
+dup_of_raw = result.get("duplicate_of")
+if dup_of_raw is not None:
+    dup_num = int(dup_of_raw)
     print("[triage] Duplicate of #" + str(dup_num))
 
     # 加 duplicate 标签
