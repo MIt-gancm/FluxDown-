@@ -20,10 +20,47 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Search similar issues
+        id: search
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Extract keywords from title: strip emoji/brackets/punctuation, take first 4 words
+          KEYWORDS=$(echo "${{ github.event.issue.title }}" \
+            | sed 's/[[:punct:]]//g; s/[✨🐛💡🔧📦⚡]//g' \
+            | tr ' ' '\n' \
+            | grep -v -iE '^\s*$|^(Website|Feedback|the|a|an|is|in|of|for|to|with|and|or|版本|功能|建议|希望|加入|支持)$' \
+            | head -4 \
+            | tr '\n' ' ' \
+            | xargs)
+
+          echo "Keywords: $KEYWORDS"
+
+          # Search issues (gh search queries both title and body by default)
+          if [ -n "$KEYWORDS" ]; then
+            gh search issues \
+              --repo ${{ github.repository }} \
+              --label user-feedback \
+              --state open \
+              --json number,title,body \
+              --limit 10 \
+              "$KEYWORDS" > /tmp/candidates.json 2>/dev/null || echo "[]" > /tmp/candidates.json
+          else
+            echo "[]" > /tmp/candidates.json
+          fi
+
+          # Exclude the current issue from candidates
+          CURRENT="${{ github.event.issue.number }}"
+          jq --argjson cur "$CURRENT" '[.[] | select(.number != $cur)]' /tmp/candidates.json > /tmp/filtered.json
+
+          echo "Candidates found: $(jq length /tmp/filtered.json)"
+          echo "candidates=$(jq -c . /tmp/filtered.json)" >> $GITHUB_OUTPUT
+
       - name: Triage with Claude
         uses: anthropics/claude-code-action@v1
         env:
           PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          CANDIDATES: ${{ steps.search.outputs.candidates }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           claude_args: "--allowedTools Bash"
@@ -32,40 +69,50 @@ jobs:
 
             New issue #${{ github.event.issue.number }}: "${{ github.event.issue.title }}"
 
-            === STEP 1: DUPLICATE CHECK ===
-            Run this to get existing open user-feedback issues:
-              gh issue list --repo ${{ github.repository }} --label user-feedback --state open --limit 100 --json number,title
+            === STEP 1: CHECK [keep-open] MARKER ===
+            Run: gh issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json body -q .body
 
-            Is this new issue describing the EXACT same problem or feature request as any existing one?
-            Be conservative: similar topics are NOT duplicates (e.g. two different BT issues are not duplicates unless they describe the same specific problem).
+            If the issue body contains the text `[keep-open]`, set keep_open=true (will affect close behavior later).
 
-            === STEP 2A: IF DUPLICATE ===
-            - Add label:   gh issue edit ${{ github.event.issue.number }} --repo ${{ github.repository }} --add-label duplicate
-            - Comment (in Chinese, referencing the original issue number):
-                           gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body "..."
-            - Close:       gh issue close ${{ github.event.issue.number }} --repo ${{ github.repository }} --reason "not planned"
+            === STEP 2: DUPLICATE CHECK ===
+            Pre-filtered similar issues (searched by keyword, title+body indexed):
+            $CANDIDATES
 
-            === STEP 2B: IF NOT DUPLICATE — Add to Project Board ===
+            If the candidates list is empty, skip to STEP 3B.
+
+            For each candidate, compare BOTH title AND body against the new issue.
+            Be conservative: only mark as duplicate if they describe the EXACT same specific problem or request.
+            Similar topics are NOT duplicates (e.g. two different download bugs are not the same unless the root cause is identical).
+
+            === STEP 3A: IF DUPLICATE ===
+            - Add label:
+                gh issue edit ${{ github.event.issue.number }} --repo ${{ github.repository }} --add-label duplicate
+            - Comment in Chinese referencing the original:
+                gh issue comment ${{ github.event.issue.number }} --repo ${{ github.repository }} --body "..."
+            - Close ONLY IF keep_open=false:
+                gh issue close ${{ github.event.issue.number }} --repo ${{ github.repository }} --reason "not planned"
+              If keep_open=true: skip closing, mention in the comment that [keep-open] was detected so the issue stays open.
+
+            === STEP 3B: IF NOT DUPLICATE — Add to Project Board ===
             Use PROJECT_TOKEN env var for all GraphQL project operations.
 
-            First, query project fields to get IDs:
-              gh api graphql --header "Authorization: Bearer $PROJECT_TOKEN" -f query='
-                { user(login:"zerx-lab") { projectV2(number:4) {
-                    id
-                    fields(first:20) { nodes {
-                      ... on ProjectV2SingleSelectField { id name options { id name } }
-                    }}
-                }}}'
+            1. Query project fields:
+                gh api graphql --header "Authorization: Bearer $PROJECT_TOKEN" -f query='
+                  { user(login:"zerx-lab") { projectV2(number:4) {
+                      id
+                      fields(first:20) { nodes {
+                        ... on ProjectV2SingleSelectField { id name options { id name } }
+                      }}
+                  }}}'
 
-            Then:
-            1. Add issue to project (use addProjectV2ItemById mutation with issue node_id: ${{ github.event.issue.node_id }})
-            2. Set Status = "Todo"
-            3. Classify and set Priority:
+            2. Add issue to project (addProjectV2ItemById, node_id: ${{ github.event.issue.node_id }})
+            3. Set Status = "Todo"
+            4. Set Priority:
                - P0 Critical: crash / data loss / app won't start / download corrupted
                - P1 High: major feature broken, many users affected
                - P2 Medium: normal bug or feature request
                - P3 Low: minor UX, cosmetic, niche
-            4. Classify and set Module (pick the most relevant one):
+            5. Set Module (most relevant):
                - Rust Engine: download speed, segmentation, HTTP core, resume, speed limiter
                - Flutter UI: UI layout, theme, dialog, buttons, font, window
                - Extension: Chrome/Firefox/Edge extension, NMH, download interception
@@ -74,3 +121,6 @@ jobs:
                - FTP: FTP protocol
                - Website: official site, feedback page, changelog
                - Infra: installer, startup, auto-update, env/dependency issues
+
+            6. Post a comment in Chinese confirming triage, and include this tip:
+               > 💡 提示：如果你的 issue 即使被判定为重复项也希望保持开启状态，可以在 issue 正文中加入 `[keep-open]` 标识。
