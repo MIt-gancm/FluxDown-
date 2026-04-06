@@ -1321,7 +1321,20 @@ impl DownloadManager {
             if self.priority_task_id.as_deref() == Some(task_id) {
                 self.clear_priority().await;
             }
-            self.maybe_release_bt_session().await;
+            // NOTE: do NOT call maybe_release_bt_session() here.
+            //
+            // pause_task() removes the task from active_tasks and cancels the
+            // CancellationToken, but the spawned BT task (bt_download_inner)
+            // may still be running on the shared BT runtime for up to ~500 ms
+            // (one poll-sleep interval) before it detects cancellation and exits.
+            //
+            // If we call maybe_release_bt_session() now, it sees no BT tasks in
+            // active_tasks and shuts down the runtime immediately — which aborts
+            // bt_download_inner mid-flight and causes run_bt_download to return a
+            // JoinError.  That JoinError propagates as DownloadError::Other (or
+            // Cancelled if our guard fires), and the spawned wrapper still sends
+            // done_tx → on_task_done → maybe_release_bt_session, so the session
+            // is released safely once the task has actually stopped.
         }
     }
 
@@ -1548,11 +1561,17 @@ impl DownloadManager {
             // cached handle so that add_torrent runs full re-verification.
             if existing.is_some() && !task.file_name.is_empty() {
                 let output_path = PathBuf::from(&task.save_dir).join(&task.file_name);
-                if !output_path.exists() {
+                // Also check the task-scoped staging directory: a paused
+                // download that hasn't finished yet will have its data in
+                // save_dir/.bt_stage_<task_id>/ rather than at the final path.
+                let stage_path = bt_downloader::bt_stage_dir(&task.save_dir, task_id);
+                let output_present = output_path.exists() || stage_path.exists();
+                if !output_present {
                     log_info!(
-                        "[manager] BT task {} output missing ({}), discarding cached handle for re-verify",
+                        "[manager] BT task {} output missing ({} and {}), discarding cached handle for re-verify",
                         task_id,
-                        output_path.display()
+                        output_path.display(),
+                        stage_path.display(),
                     );
                     // Delete the stale torrent from the session so add_torrent
                     // can re-add it fresh with proper piece verification.
@@ -1833,6 +1852,21 @@ impl DownloadManager {
                         let _ = tokio::fs::remove_file(&path).await;
                     }
                 }
+
+                // Always remove the task-scoped staging directory regardless
+                // of delete_files: if the download never finished, the staging
+                // dir contains partial data that should be cleaned up when the
+                // task is deleted.  If it already finished and was moved to the
+                // final path, the staging dir should be empty (or already gone).
+                let stage_dir = bt_downloader::bt_stage_dir(&t.save_dir, task_id);
+                if stage_dir.exists() {
+                    log_info!(
+                        "[manager] delete_task {}: removing staging dir {}",
+                        task_id,
+                        stage_dir.display()
+                    );
+                    let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+                }
             } else {
                 // HTTP / FTP / HLS / DASH: always clean up the in-progress temp file
                 let temp_path =
@@ -2036,6 +2070,16 @@ impl DownloadManager {
                             } else {
                                 let _ = tokio::fs::remove_file(&path).await;
                             }
+                        }
+                        // Always clean up the task-scoped staging directory.
+                        // If the download was in progress, partial data lives
+                        // here.  If it finished and was moved, the dir is empty.
+                        let stage_dir = bt_downloader::bt_stage_dir(
+                            path.parent().and_then(|p| p.to_str()).unwrap_or(""),
+                            &tid_owned,
+                        );
+                        if stage_dir.exists() {
+                            let _ = tokio::fs::remove_dir_all(&stage_dir).await;
                         }
                         // Signal completion
                         let _ = ptx

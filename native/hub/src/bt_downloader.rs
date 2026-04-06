@@ -19,7 +19,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -767,9 +767,25 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
     match result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e),
-        Err(join_err) => Err(DownloadError::Other(format!(
-            "BT task panicked: {join_err}"
-        ))),
+        // JoinError has two causes:
+        //   1. The spawned task panicked → treat as error (existing behaviour).
+        //   2. The BT runtime was shut down (e.g. maybe_release_bt_session called
+        //      while this task was still winding down after pause_task cancelled it).
+        //      In that case cancelled is already true, so treat it as Cancelled to
+        //      prevent the task from being marked as failed/error in the DB.
+        Err(join_err) => {
+            if cancelled.load(Ordering::SeqCst) {
+                log_info!(
+                    "[BT] task={} JoinError while cancelled (runtime shutdown during pause) — treating as Cancelled",
+                    short_id(&task_id)
+                );
+                Err(DownloadError::Cancelled)
+            } else {
+                Err(DownloadError::Other(format!(
+                    "BT task panicked: {join_err}"
+                )))
+            }
+        }
     }
 }
 
@@ -798,6 +814,94 @@ const STATUS_DOWNLOADING: i32 = 1;
 const STATUS_PAUSED: i32 = 2;
 const STATUS_COMPLETED: i32 = 3;
 const STATUS_ERROR: i32 = 4;
+
+// ---------------------------------------------------------------------------
+// BT staging directory helpers
+// ---------------------------------------------------------------------------
+
+/// Prefix used for per-task staging directories inside `save_dir`.
+/// Each BT task downloads into `save_dir/.bt_stage_<task_id>/` so that
+/// concurrent tasks with identical torrent names never collide on disk.
+/// The directory is removed after the file/folder is moved to its final
+/// location (or on task deletion).
+const BT_STAGE_PREFIX: &str = ".bt_stage_";
+
+/// Build the staging directory path for a BT task.
+///
+/// `save_dir/.bt_stage_<task_id>/`
+pub fn bt_stage_dir(save_dir: &str, task_id: &str) -> PathBuf {
+    PathBuf::from(save_dir).join(format!("{}{}", BT_STAGE_PREFIX, task_id))
+}
+
+/// Deduplicate a file or directory name inside `dir`.
+///
+/// If `dir/name` does not exist, returns `name` unchanged.
+/// Otherwise appends ` (1)`, ` (2)`, … until a free slot is found.
+/// Mirrors the logic in `downloader::dedup_filename` but runs synchronously
+/// (called from the BT runtime thread after downloading is complete).
+fn dedup_name_in_dir(dir: &Path, name: &str) -> String {
+    let candidate = dir.join(name);
+    if !candidate.exists() {
+        return name.to_string();
+    }
+
+    // Scan directory once to avoid per-candidate filesystem round-trips.
+    let existing: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(dir)
+        .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    let ext = Path::new(name).extension().and_then(|s| s.to_str());
+
+    for i in 1..=9999u32 {
+        let new_name = match ext {
+            Some(e) => format!("{} ({}).{}", stem, i, e),
+            None => format!("{} ({})", stem, i),
+        };
+        if !existing.contains(std::ffi::OsStr::new(&new_name)) {
+            return new_name;
+        }
+    }
+    name.to_string()
+}
+
+/// Move a file or directory from `src` to `dst`.
+///
+/// Tries `std::fs::rename` first (atomic, same filesystem).  If that fails
+/// (e.g. cross-device), falls back to a recursive copy + remove.
+fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    // Fast path: atomic rename (works when src and dst are on the same fs).
+    if std::fs::rename(src, dst).is_ok() {
+        return Ok(());
+    }
+
+    // Slow path: copy then remove.
+    if src.is_dir() {
+        copy_dir_all(src, dst)?;
+        std::fs::remove_dir_all(src)
+    } else {
+        std::fs::copy(src, dst)?;
+        std::fs::remove_file(src)
+    }
+}
+
+/// Recursively copy a directory tree from `src` to `dst`.
+fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_all(&entry.path(), &dst.join(entry.file_name()))?;
+        } else {
+            std::fs::copy(entry.path(), dst.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
 const STATUS_PREPARING: i32 = 5;
 
 /// Number of virtual segments for single-file BT progress visualization.
@@ -1084,9 +1188,15 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         // so we can go straight to the progress loop.
         h
     } else {
+        // Use a task-scoped staging directory so that concurrent BT tasks
+        // with identical torrent names never collide on disk.
+        // librqbit will write to  save_dir/.bt_stage_<task_id>/<resolved_name>
+        // and we move the result to the final deduplicated path after download.
+        let stage_dir = bt_stage_dir(&save_dir, &task_id);
+        let stage_dir_str = stage_dir.to_string_lossy().into_owned();
         let add_opts = AddTorrentOptions {
             overwrite: true,
-            output_folder: Some(save_dir.clone()),
+            output_folder: Some(stage_dir_str),
             ..Default::default()
         };
 
@@ -1227,7 +1337,9 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
 
     // Extract file layout info and piece count from torrent metadata.
     // These are immutable after metadata resolution, so we cache them once.
-    let (file_offsets, total_pieces) = handle
+    // Also capture the first file's relative_filename so we know exactly
+    // what path librqbit will create inside the staging directory.
+    let (file_offsets, total_pieces, first_relative_filename) = handle
         .with_metadata(|meta| {
             let offsets: Vec<(u64, u64)> = meta
                 .file_infos
@@ -1235,15 +1347,40 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 .map(|fi| (fi.offset_in_torrent, fi.len))
                 .collect();
             let pieces = meta.lengths.total_pieces();
-            (offsets, pieces)
+            // For single-file torrents the relative_filename is just the
+            // file name.  For multi-file torrents it is `name/file.ext`,
+            // so the top-level entry is the torrent name directory.
+            let first_name = meta
+                .file_infos
+                .first()
+                .map(|fi| fi.relative_filename.clone())
+                .unwrap_or_default();
+            (offsets, pieces, first_name)
         })
-        .unwrap_or_else(|_| (Vec::new(), 0));
+        .unwrap_or_else(|_| (Vec::new(), 0, PathBuf::new()));
+
+    // The top-level component of the first file's relative path is the
+    // name of the file or directory that librqbit creates directly inside
+    // the output_folder (i.e. the staging directory).
+    let top_level_name = first_relative_filename
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str())
+        .unwrap_or(&resolved_name)
+        .to_string();
+    // Prefer the metadata-derived top_level_name; fall back to resolved_name.
+    let staging_item_name = if top_level_name.is_empty() {
+        resolved_name.clone()
+    } else {
+        top_level_name
+    };
 
     log_info!(
-        "[BT] task={} files={}, total_pieces={}",
+        "[BT] task={} files={}, total_pieces={}, staging_item={}",
         short_id(&task_id),
         file_offsets.len(),
-        total_pieces
+        total_pieces,
+        &staging_item_name,
     );
 
     let _ = db
@@ -1318,8 +1455,34 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         let progress =
             compute_bt_display_progress(checked_progress, fetched, total, stats.finished);
 
-        // Check for error — keep the handle cached so user can retry.
+        // Check for error — but ONLY when the torrent is not in Paused state.
+        //
+        // Race window: pause_task() calls entry.token.cancel() then session.pause().
+        // Between those two calls the progress loop may wake up, see cancelled=false
+        // (the AtomicBool watcher fires on the next await), and read stats while
+        // librqbit is transitioning through its internal states.  During that
+        // transition stats.state can transiently be Error before settling on Paused,
+        // which would cause us to report STATUS_ERROR and write status=4 to the DB
+        // even though the user only asked to pause.
+        //
+        // Guarding on `!cancelled` is sufficient for the common case, but the
+        // watcher task fires asynchronously so there is still a narrow window where
+        // cancelled=false while the session is already shutting down.  The additional
+        // `stats.state != Paused` guard eliminates that window: a torrent that
+        // librqbit has already placed in the Paused state cannot be in error.
+        let is_paused_state = matches!(stats.state, librqbit::TorrentStatsState::Paused);
         if let Some(ref err) = stats.error {
+            // If we are already cancelled (pause/cancel in progress), or the
+            // torrent state is Paused, do not treat this as a hard error —
+            // exit cleanly as Cancelled so the manager keeps status=2.
+            if cancelled.load(Ordering::SeqCst) || is_paused_state {
+                log_info!(
+                    "[BT] task={} stats.error='{}' ignored — task is being paused/cancelled",
+                    short_id(&task_id),
+                    err
+                );
+                return Err(DownloadError::Cancelled);
+            }
             let msg = format!("BT error: {err}");
             log_info!("[BT] task={} error: {}", short_id(&task_id), &msg);
             let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
@@ -1346,7 +1509,8 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             let _ = db.update_task_progress(&task_id, final_total).await;
             let _ = db.update_task_total_bytes(&task_id, final_total).await;
 
-            // Build fully-completed segments
+            // Build fully-completed segments — used in the single STATUS_COMPLETED
+            // signal sent after the staging-dir move is resolved.
             let finished_segs = build_bt_segments(
                 final_total,
                 final_total,
@@ -1355,6 +1519,114 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 total_pieces,
                 total_pieces as u64,
             );
+
+            // Download complete.
+            //
+            // Move the downloaded file/directory from the staging directory
+            // into save_dir with a deduplicated name, then update the DB so
+            // that the UI and delete logic see the correct final path.
+            //
+            // Staging layout:  save_dir/.bt_stage_<task_id>/<staging_item_name>
+            // Final layout:    save_dir/<final_name>
+            //
+            // We send the single STATUS_COMPLETED signal AFTER the move so
+            // that the file_name field already reflects the true disk name.
+            let save_path = PathBuf::from(&save_dir);
+            let stage_dir = bt_stage_dir(&save_dir, &task_id);
+            let stage_item = stage_dir.join(&staging_item_name);
+
+            // Determine the final file name: attempt the staging-dir move
+            // when the staged item is present; otherwise fall back to
+            // resolved_name (e.g. resumed download that was already moved).
+            let completed_name = if stage_item.exists() {
+                let final_name = dedup_name_in_dir(&save_path, &staging_item_name);
+                let final_path = save_path.join(&final_name);
+
+                log_info!(
+                    "[BT] task={} moving '{}' → '{}' (staging_item={})",
+                    short_id(&task_id),
+                    stage_item.display(),
+                    final_path.display(),
+                    &staging_item_name,
+                );
+
+                match move_path(&stage_item, &final_path) {
+                    Ok(()) => {
+                        // Remove now-empty staging directory (best-effort).
+                        let _ = std::fs::remove_dir_all(&stage_dir);
+
+                        if final_name != resolved_name {
+                            log_info!(
+                                "[BT] task={} file_name updated '{}' → '{}' (dedup)",
+                                short_id(&task_id),
+                                &resolved_name,
+                                &final_name,
+                            );
+                        }
+                        // Persist the true final name before signalling Dart.
+                        let _ = db
+                            .update_task_file_info(&task_id, &final_name, final_total)
+                            .await;
+                        final_name
+                    }
+                    Err(e) => {
+                        log_info!(
+                            "[BT] task={} failed to move staging item to final path: {}",
+                            short_id(&task_id),
+                            e,
+                        );
+                        // Fall through — the file is still in the staging dir.
+                        // resolved_name is the best we can report; the staging
+                        // directory remains for manual recovery.
+                        resolved_name.clone()
+                    }
+                }
+            } else if stage_dir.exists() {
+                // Staging dir exists but the expected item is missing —
+                // the torrent might be multi-file with a different top-level
+                // name.  Move the entire staging dir contents best-effort.
+                log_info!(
+                    "[BT] task={} staging item '{}' not found in '{}'; moving whole staging dir",
+                    short_id(&task_id),
+                    &staging_item_name,
+                    stage_dir.display(),
+                );
+                let mut first_child_name = resolved_name.clone();
+                if let Ok(entries) = std::fs::read_dir(&stage_dir) {
+                    for entry in entries.filter_map(|e| e.ok()) {
+                        let child_name = entry.file_name();
+                        let child_name_str = child_name.to_string_lossy();
+                        // Skip hidden files (e.g. .DS_Store, other temp files).
+                        if child_name_str.starts_with('.') {
+                            continue;
+                        }
+                        let final_child_name = dedup_name_in_dir(&save_path, &child_name_str);
+                        let dst = save_path.join(&final_child_name);
+                        if move_path(&entry.path(), &dst).is_ok() {
+                            first_child_name = final_child_name;
+                        } else {
+                            log_info!(
+                                "[BT] task={} failed to move child '{}' from staging dir",
+                                short_id(&task_id),
+                                child_name_str,
+                            );
+                        }
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&stage_dir);
+                let _ = db
+                    .update_task_file_info(&task_id, &first_child_name, final_total)
+                    .await;
+                first_child_name
+            } else {
+                // No staging dir at all — resumed download that was already
+                // moved in a previous session, or existing_handle path where
+                // output_folder == save_dir.  The DB file_name is already
+                // correct; just return resolved_name for the signal.
+                resolved_name.clone()
+            };
+
+            // Send the single STATUS_COMPLETED signal with the true file name.
             let _ = progress_tx
                 .send(ProgressUpdate {
                     task_id: task_id.clone(),
@@ -1362,13 +1634,13 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     total_bytes: final_total,
                     status: STATUS_COMPLETED,
                     error_message: String::new(),
-                    file_name: resolved_name.clone(),
+                    file_name: completed_name,
                     segment_details: Some(finished_segs),
                 })
                 .await;
 
-            // Download complete.  Retain the handle in the cache (do NOT
-            // call take_handle) and pause the torrent so it stops seeding.
+            // Retain the handle in the cache (do NOT call take_handle) and
+            // pause the torrent so it stops seeding.
             //
             // Keeping the handle alive means that a future
             // delete_task(delete_files=true) call can reach
@@ -1412,10 +1684,26 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 .map(|l| (l.upload_speed.mbps * 1024.0 * 1024.0) as i64)
                 .unwrap_or(0);
 
+            // If the torrent has entered Paused state while we are still in
+            // the progress loop, it means pause_task() already called
+            // session.pause() and the handle is now frozen.  The loop is
+            // about to exit on the next cancelled-flag check (the watcher
+            // task fires asynchronously), but we must not send STATUS_ERROR
+            // or STATUS_PREPARING for a genuinely paused torrent.
+            // Exit early and let the manager's explicit status=2 signal
+            // (sent in pause_task) be the last word on the UI state.
+            if is_paused_state {
+                log_info!(
+                    "[BT] task={} stats.state=Paused while in progress loop — exiting early (pause in progress)",
+                    short_id(&task_id)
+                );
+                return Err(DownloadError::Cancelled);
+            }
+
             let status_code = match stats.state {
                 librqbit::TorrentStatsState::Live => STATUS_DOWNLOADING,
                 librqbit::TorrentStatsState::Initializing => STATUS_PREPARING,
-                librqbit::TorrentStatsState::Paused => STATUS_PREPARING, // transitional
+                librqbit::TorrentStatsState::Paused => STATUS_PREPARING, // unreachable after guard above
                 librqbit::TorrentStatsState::Error => STATUS_ERROR,
             };
 
