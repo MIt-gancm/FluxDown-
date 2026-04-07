@@ -98,6 +98,14 @@ pub struct BatchControlTask {
 #[derive(Deserialize, DartSignal)]
 pub struct RequestAllTasks {}
 
+/// Reveal a file in the native file manager and select it.
+/// Windows: explorer.exe /select,"path" via raw_arg (bypasses argument escaping).
+/// macOS/Linux: handled on the Dart side; this signal is Windows-only.
+#[derive(Deserialize, DartSignal)]
+pub struct RevealFile {
+    pub path: String,
+}
+
 // ========== Rust → Dart signals ==========
 
 /// Task progress update — sent periodically during download

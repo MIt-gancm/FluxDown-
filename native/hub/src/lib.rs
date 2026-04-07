@@ -14,6 +14,7 @@ mod native_messaging;
 mod nmh_registry;
 mod protocol_registry;
 mod proxy_config;
+mod reveal_file;
 mod segment_advisor;
 mod segment_coordinator;
 mod signals;

@@ -18,8 +18,8 @@ use crate::signals::{
     DeleteQueue, DetectSystemProxy, DownloadUpdate, ExternalDownloadRequest, FileAssociationStatus,
     InstallUpdate, MoveTaskToQueue, ProbeTorrentMeta, ProxyTestResult, RequestAllQueues,
     RequestAllTasks, RequestConfig, SaveConfig, SelectBtFiles, SelectHlsQuality,
-    SetFileAssociation, SetPriorityTask, SetUrlProtocol, SystemProxyInfo, TestProxyConnection,
-    UpdateCheckResult, UpdateQueue, UrlProtocolStatus,
+    RevealFile, SetFileAssociation, SetPriorityTask, SetUrlProtocol, SystemProxyInfo,
+    TestProxyConnection, UpdateCheckResult, UpdateQueue, UrlProtocolStatus,
 };
 use crate::updater;
 
@@ -223,6 +223,7 @@ pub async fn run(db_dir: PathBuf) {
     let set_priority_recv = SetPriorityTask::get_dart_signal_receiver();
     let select_bt_files_recv = SelectBtFiles::get_dart_signal_receiver();
     let probe_torrent_meta_recv = ProbeTorrentMeta::get_dart_signal_receiver();
+    let reveal_file_recv = RevealFile::get_dart_signal_receiver();
 
     // Spawn the Native Messaging listener (reads from stdin in a blocking thread).
     // When the browser extension sends a download request, it arrives on this channel.
@@ -690,6 +691,13 @@ pub async fn run(db_dir: PathBuf) {
                     msg.selected_indices,
                 );
                 manager.deliver_bt_file_selection(&msg.task_id, msg.selected_indices).await;
+            }
+            // --- Reveal file in native file manager ---
+            Some(signal) = reveal_file_recv.recv() => {
+                let path = signal.message.path;
+                tokio::task::spawn_blocking(move || {
+                    crate::reveal_file::reveal(&path);
+                });
             }
             // --- Torrent meta probe (for new-download dialog preview) ---
             Some(signal) = probe_torrent_meta_recv.recv() => {
