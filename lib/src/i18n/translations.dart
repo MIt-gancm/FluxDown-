@@ -608,6 +608,32 @@ class S {
     'UA,user agent,browser,netdisk,baidu',
   ).split(',')..addAll(['ua', 'user-agent', 'netdisk']);
 
+  // 文件管理器自定义命令
+  String get fileManagerSection => _t('文件管理器', 'File Manager');
+  String get revealFileCmdLabel =>
+      _t('"在文件夹中显示"命令', '"Show in Folder" command');
+  String get revealFileCmdDesc => _t(
+    '用于定位下载文件的第三方命令模板。占位符 {path} = 文件路径，{dir} = 父目录。留空则使用平台默认（Windows 资源管理器 / Finder / Nautilus 等）。',
+    'Custom command to reveal a downloaded file. Placeholders: {path} = file path, {dir} = parent dir. Leave empty to use the platform default (Explorer / Finder / Nautilus, etc.).',
+  );
+  String get revealFileCmdPlaceholder => _t(
+    '例如：nautilus --select {path}',
+    'e.g. nautilus --select {path}',
+  );
+  String get openDirCmdLabel => _t('"打开目录"命令', '"Open Folder" command');
+  String get openDirCmdDesc => _t(
+    '用于打开目录的第三方命令模板。占位符 {dir} = 目录路径。留空则使用平台默认。',
+    'Custom command to open a folder. Placeholder: {dir} = folder path. Leave empty to use the platform default.',
+  );
+  String get openDirCmdPlaceholder => _t(
+    '例如："C:\\TC\\TOTALCMD64.EXE" /O /T /L={dir}',
+    r'e.g. "C:\TC\TOTALCMD64.EXE" /O /T /L={dir}',
+  );
+  List<String> get searchKeywordsFileManager => _t(
+    '文件管理器,资源管理器,Explorer,Finder,Nautilus,Total Commander,文件夹',
+    'file manager,explorer,finder,nautilus,total commander,folder',
+  ).split(',')..addAll(['fm', 'reveal', 'open folder']);
+
   // Per-task proxy (新建下载对话框)
   String get taskProxy => _t('任务代理', 'Task Proxy');
   String get taskProxyDesc => _t(

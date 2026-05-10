@@ -46,6 +46,8 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # 用于解码扩展端通过 NM 协议传来的 raw POST body（base64 编码）
 base64 = "0.22"
+# 用于在 URL/Content-Disposition 文件名解码失败时回退到 GBK（中文老站点常用）
+encoding_rs = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

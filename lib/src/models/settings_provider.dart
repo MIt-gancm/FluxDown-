@@ -68,6 +68,11 @@ class SettingsProvider extends ChangeNotifier {
   // 默认队列设置
   String _defaultQueueId = ''; // 空字符串 = 默认队列
 
+  // 文件管理器自定义命令模板（空 = 用平台默认行为）
+  // {path} = 完整文件路径；{dir} = 目录路径；占位符在 Rust 端做 shell 转义
+  String _revealFileCmd = '';
+  String _openDirCmd = '';
+
   /// 配置是否已从 Rust 端加载完成
   bool _loaded = false;
 
@@ -158,6 +163,10 @@ class SettingsProvider extends ChangeNotifier {
 
   // 默认队列 Getter
   String get defaultQueueId => _defaultQueueId;
+
+  // 文件管理器命令 Getters
+  String get revealFileCmd => _revealFileCmd;
+  String get openDirCmd => _openDirCmd;
 
   // ---------------------------------------------------------------------------
   // Setters — 修改值 + 通知 Rust 持久化
@@ -429,6 +438,21 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('default_queue_id', value);
   }
 
+  // 文件管理器命令 Setters
+  void setRevealFileCmd(String value) {
+    if (_revealFileCmd == value) return;
+    _revealFileCmd = value;
+    notifyListeners();
+    _saveToRust('reveal_file_cmd', value);
+  }
+
+  void setOpenDirCmd(String value) {
+    if (_openDirCmd == value) return;
+    _openDirCmd = value;
+    notifyListeners();
+    _saveToRust('open_dir_cmd', value);
+  }
+
   // 文件关联操作
 
   /// 标记已弹窗提示过文件关联（持久化到 Rust SQLite）
@@ -575,6 +599,10 @@ class SettingsProvider extends ChangeNotifier {
           _globalUserAgent = entry.value;
         case 'default_queue_id':
           _defaultQueueId = entry.value;
+        case 'reveal_file_cmd':
+          _revealFileCmd = entry.value;
+        case 'open_dir_cmd':
+          _openDirCmd = entry.value;
         case 'show_sidebar_status':
           _showSidebarStatus = entry.value != 'false';
         case 'show_sidebar_queues':

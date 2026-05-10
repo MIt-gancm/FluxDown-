@@ -1398,6 +1398,7 @@ dependencies = [
  "cbc",
  "chrono",
  "dash-mpd",
+ "encoding_rs",
  "futures-util",
  "hex 0.4.3",
  "http",

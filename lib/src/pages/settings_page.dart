@@ -1471,6 +1471,26 @@ class _DownloadContent extends StatelessWidget {
               vertical: true,
               child: _UserAgentEditor(settingsProvider: settingsProvider),
             ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: s.revealFileCmdLabel,
+              description: s.revealFileCmdDesc,
+              vertical: true,
+              child: _FileManagerCmdInput(
+                settingsProvider: settingsProvider,
+                kind: _FileManagerCmdKind.revealFile,
+              ),
+            ),
+            const SizedBox(height: 10),
+            _SettingCard(
+              label: s.openDirCmdLabel,
+              description: s.openDirCmdDesc,
+              vertical: true,
+              child: _FileManagerCmdInput(
+                settingsProvider: settingsProvider,
+                kind: _FileManagerCmdKind.openDir,
+              ),
+            ),
             if (queues.isNotEmpty) ...[
               const SizedBox(height: 10),
               _SettingCard(
@@ -1926,6 +1946,85 @@ class _UserAgentEditorState extends State<_UserAgentEditor> {
           ),
         ),
       ],
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// 文件管理器自定义命令输入
+// ─────────────────────────────────────────────
+
+enum _FileManagerCmdKind { revealFile, openDir }
+
+/// 让用户填写第三方文件管理器的命令模板。
+/// 提交时机：失焦或回车（与 UA 编辑器一致），避免每次按键写盘。
+class _FileManagerCmdInput extends StatefulWidget {
+  final SettingsProvider settingsProvider;
+  final _FileManagerCmdKind kind;
+
+  const _FileManagerCmdInput({
+    required this.settingsProvider,
+    required this.kind,
+  });
+
+  @override
+  State<_FileManagerCmdInput> createState() => _FileManagerCmdInputState();
+}
+
+class _FileManagerCmdInputState extends State<_FileManagerCmdInput> {
+  late TextEditingController _controller;
+  late FocusNode _focusNode;
+
+  String get _currentValue => widget.kind == _FileManagerCmdKind.revealFile
+      ? widget.settingsProvider.revealFileCmd
+      : widget.settingsProvider.openDirCmd;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: _currentValue);
+    _focusNode = FocusNode();
+    _focusNode.addListener(() {
+      // 失焦时持久化（与 UA 编辑器交互一致）
+      if (!_focusNode.hasFocus) _commit();
+    });
+  }
+
+  @override
+  void didUpdateWidget(_FileManagerCmdInput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (_currentValue != _controller.text) {
+      _controller.text = _currentValue;
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    _focusNode.dispose();
+    super.dispose();
+  }
+
+  void _commit() {
+    final v = _controller.text;
+    if (widget.kind == _FileManagerCmdKind.revealFile) {
+      widget.settingsProvider.setRevealFileCmd(v);
+    } else {
+      widget.settingsProvider.setOpenDirCmd(v);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final placeholder = widget.kind == _FileManagerCmdKind.revealFile
+        ? s.revealFileCmdPlaceholder
+        : s.openDirCmdPlaceholder;
+    return ShadInput(
+      controller: _controller,
+      focusNode: _focusNode,
+      placeholder: Text(placeholder),
+      onSubmitted: (_) => _commit(),
     );
   }
 }

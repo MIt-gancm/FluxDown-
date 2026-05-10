@@ -130,12 +130,13 @@ fn urlencoding_decode(input: &str) -> String {
     let mut i = 0;
 
     // Flush accumulated percent-encoded bytes as UTF-8 into `out`.
+    // 优先 UTF-8，失败时回退到 GBK（应对老旧中文资源库 magnet 中
+    // 的 GBK 编码 dn=），双失败才使用 replacement char。
     let flush = |buf: &mut Vec<u8>, out: &mut String| {
         if !buf.is_empty() {
-            match std::str::from_utf8(buf) {
-                Ok(s) => out.push_str(s),
+            match crate::downloader::decode_bytes_utf8_or_gbk(buf) {
+                Ok(s) => out.push_str(&s),
                 Err(_) => {
-                    // Fallback: replace invalid UTF-8 with replacement char
                     out.push(char::REPLACEMENT_CHARACTER);
                 }
             }
@@ -1265,9 +1266,7 @@ fn compute_completion_layout(
     })();
 
     // Container move: only when all selected AND a real top-level dir exists.
-    if all_selected
-        && let Some(top) = shared_top_dir.as_deref()
-    {
+    if all_selected && let Some(top) = shared_top_dir.as_deref() {
         let desired = if custom_name.is_empty() {
             top
         } else {

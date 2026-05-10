@@ -717,8 +717,23 @@ pub async fn run(db_dir: PathBuf) {
             // --- Reveal file in native file manager ---
             Some(signal) = reveal_file_recv.recv() => {
                 let path = signal.message.path;
+                // 从 DB 读用户自定义 FM 命令模板（空字符串 = 用平台默认）。
+                // 在 spawn_blocking 之前异步读取，避免阻塞 actor 主循环；
+                // get_config 失败按空模板处理，让平台默认兜底。
+                let file_tpl = db
+                    .get_config("reveal_file_cmd")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let dir_tpl = db
+                    .get_config("open_dir_cmd")
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
                 tokio::task::spawn_blocking(move || {
-                    crate::reveal_file::reveal(&path);
+                    crate::reveal_file::reveal(&path, &file_tpl, &dir_tpl);
                 });
             }
             // --- Torrent meta probe (for new-download dialog preview) ---

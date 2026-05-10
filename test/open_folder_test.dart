@@ -1,9 +1,6 @@
 import 'dart:io';
 
-import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
-
-import '../lib/src/services/open_folder.dart';
 
 // =============================================================================
 // FilePickerService._validateDirectory is private, so we test it indirectly
@@ -167,39 +164,7 @@ void main() {
     });
   });
 
-  // ---------------------------------------------------------------------------
-  // Platform guard: ShellExecuteW FFI must NOT be reachable on non-Windows
-  // ---------------------------------------------------------------------------
-  group('platform safety', () {
-    test('openFolder does not crash on current platform', () async {
-      // url_launcher 需要 ServicesBinding 来发送 platform channel 消息。
-      TestWidgetsFlutterBinding.ensureInitialized();
-
-      // 在测试环境中 url_launcher 走 MethodChannel，没有真正的平台实现。
-      // 注册一个假的 handler 让调用不抛异常（macOS/Linux 分支会走到这里）。
-      const channel = MethodChannel('plugins.flutter.io/url_launcher');
-      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-          .setMockMethodCallHandler(channel, (MethodCall call) async {
-        if (call.method == 'launch' || call.method == 'launchUrl') {
-          return true;
-        }
-        return null;
-      });
-
-      final tmp = await Directory.systemTemp.createTemp('platform_test_');
-      try {
-        // 不会验证 Finder/Explorer 是否真的打开了，
-        // 但能验证不会 crash、不会抛异常、FFI 不会在非 Windows 平台被触发。
-        await expectLater(
-          openFolder(tmp.path),
-          completes,
-        );
-      } finally {
-        await tmp.delete(recursive: true);
-        // 清理 mock
-        TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
-            .setMockMethodCallHandler(channel, null);
-      }
-    });
-  });
+  // openFolder 自身已下沉到 Rust（reveal_file.rs），Dart 仅 sendSignalToRust，
+  // 无平台分支可测；上面 resolveOpenFolderDir 的逻辑现在由 Rust 端 fs::metadata
+  // 重新实现，但保留这些 Dart 测试作为旧逻辑的回归基线。
 }

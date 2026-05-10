@@ -115,7 +115,9 @@ fn url_decode(s: &str) -> String {
         result.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+    // 优先 UTF-8，失败时回退到 GBK（老旧中文 FTP 服务器常用），
+    // 双失败才返回原始字符串。
+    crate::downloader::decode_bytes_utf8_or_gbk(&result).unwrap_or_else(|_| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,9 +1526,17 @@ mod tests {
 
     #[test]
     fn url_decode_invalid_utf8_falls_back_to_original() {
-        // 0xFF 0xFE is not valid UTF-8; should fall back to original string
+        // 0xFF 0xFE 既不是合法 UTF-8（0xFF 是保留字节）也不是合法 GBK
+        // （0xFF 不在 GBK 首字节范围）——两种解码都失败时应返回原始字符串。
         let result = url_decode("%FF%FE");
         assert_eq!(result, "%FF%FE"); // fallback to original
+    }
+
+    #[test]
+    fn url_decode_gbk_chinese_path() {
+        // GBK 编码的 “文件.txt”。UTF-8 解码必然失败，必须回退 GBK。
+        let result = url_decode("/pub/%CE%C4%BC%FE.txt");
+        assert_eq!(result, "/pub/文件.txt");
     }
 
     #[test]

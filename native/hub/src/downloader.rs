@@ -324,9 +324,7 @@ impl RequestSpec {
                     }
                     Some(RequestBodyDecoded::Form(pairs))
                 }
-                NmBody::Urlencoded { raw } => {
-                    Some(RequestBodyDecoded::Urlencoded(raw.clone()))
-                }
+                NmBody::Urlencoded { raw } => Some(RequestBodyDecoded::Urlencoded(raw.clone())),
                 NmBody::Raw {
                     bytes_b64,
                     content_type,
@@ -370,8 +368,7 @@ pub fn build_request(
     method: reqwest::Method,
     spec: &RequestSpec,
 ) -> reqwest::RequestBuilder {
-    let attaches_body =
-        method != reqwest::Method::GET && method != reqwest::Method::HEAD;
+    let attaches_body = method != reqwest::Method::GET && method != reqwest::Method::HEAD;
     let mut req = client.request(method, url);
 
     if !spec.cookies.is_empty() {
@@ -1263,6 +1260,11 @@ fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Opt
         if let Some(name) = trimmed.strip_prefix("filename*=") {
             // Format: charset'language'percent-encoded-name
             // e.g. UTF-8''My%20File.pdf
+            //
+            // 注：按 RFC 5987 charset 字段明确指定编码，严格实现
+            // 应该读取该字段。目前以 urlencoding_decode 的
+            // "UTF-8 优先，GBK fallback" 表现足够应对老旧中文服务器
+            // （它们通常话不对题，声明 UTF-8 但发 GBK）。
             let name = name.trim();
             if let Some(encoded) = name.split('\'').nth(2)
                 && let Ok(decoded) = urlencoding_decode(encoded)
@@ -1352,7 +1354,44 @@ fn urlencoding_decode(s: &str) -> Result<String, String> {
         result.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8(result).map_err(|e| e.to_string())
+    decode_bytes_utf8_or_gbk(&result)
+}
+
+/// 将一组字节解码为字符串，优先 UTF-8，失败时回退到 GBK。
+///
+/// HTML5 规范要求 URL percent-encoding 使用 UTF-8，但大量老旧中文站点
+/// （包括一些 CDN/云存储）仍使用 GBK 编码，如 `%CE%C4%BC%FE.txt`
+/// 对应 GBK 的 "文件.txt"。若不做回退则 UTF-8 解码必然失败，最终
+/// 用户看到 `%CE%C4%BC%FE.txt` 这种看似乱码的文件名。
+///
+/// # 已知局限
+///
+/// GBK 的字节空间很宽松（0x81-0xFE × 0x40-0xFE），其他二字节编码
+/// 的字节序列（如 Big5、Shift-JIS）也可能被 GBK “成功”解码为错误的中文。
+/// 权衡上这个误判仅在罕见场景下发生（现代 Big5/Latin 站点几乎不会
+/// 在 URL 中使用非 UTF-8 percent-encoding），而 GBK 中文乱码是老旧中文
+/// 站点的高频问题。
+///
+/// # 返回值
+///
+/// 返回 Err 仅当两种编码都无法解码时（极罕见，需要出现 GBK 不允许的
+/// 字节组合，如 0x81 0x7F）。
+pub(crate) fn decode_bytes_utf8_or_gbk(bytes: &[u8]) -> Result<String, String> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Ok(s.to_string()),
+        Err(_) => {
+            // 使用 decode_without_bom_handling_and_without_replacement：
+            // 遇到非法字节时返回 None，不插入 U+FFFD。
+            // 这样可以准确区分 “GBK 中合法但含替换字符” 和 “GBK 解码失败”。
+            match encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(bytes) {
+                Some(decoded) => Ok(decoded.into_owned()),
+                None => Err(format!(
+                    "bytes are neither valid UTF-8 nor valid GBK ({} bytes)",
+                    bytes.len()
+                )),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1801,9 +1840,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             // the original method is GET-like. POST + Range is undefined and
             // unsafe; force single-stream so the assumed supports_range can
             // never trip multi-segment for non-GET requests.
-            supports_range: p.hint_file_size > 0
-                && p.segment_count != 1
-                && p.spec.is_get_like(),
+            supports_range: p.hint_file_size > 0 && p.segment_count != 1 && p.spec.is_get_like(),
             content_type: String::new(),
             // Hint mode skips the probe, so no ETag/Last-Modified available.
             etag: String::new(),
@@ -1813,8 +1850,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
         }
     } else {
         log_info!("[download] task {} resolving file info...", p.task_id);
-        let info =
-            resolve_file_info(client, &p.url, &p.spec).await?;
+        let info = resolve_file_info(client, &p.url, &p.spec).await?;
         log_info!(
             "[download] task {} resolved: name={}, size={}, range={}",
             p.task_id,
@@ -2345,7 +2381,12 @@ async fn download_single(
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let mime = ct_raw.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+        let mime = ct_raw
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if (mime == "text/html" || mime == "application/xhtml+xml")
             && !filename_looks_like_html(expected_filename)
         {
@@ -2676,6 +2717,30 @@ mod tests {
         assert_eq!(name.as_deref(), Some("下载.exe"));
     }
 
+    #[test]
+    fn extract_from_url_gbk_chinese_filename() {
+        // 老旧中文站点用 GBK 编码中文：“文件” 的 GBK = CE C4 BC FE
+        // UTF-8 解码会失败，必须回退到 GBK 才能得到可读文件名。
+        let name = extract_from_url("http://example.com/%CE%C4%BC%FE.txt");
+        assert_eq!(
+            name.as_deref(),
+            Some("文件.txt"),
+            "GBK percent-encoded 中文 URL 应能被正确解码而不是保留原始 %XX"
+        );
+    }
+
+    #[test]
+    fn extract_from_content_disposition_gbk_filename() {
+        // 中文云存储 OBS/S3 类服务器可能返回 GBK 编码的 filename=
+        let headers = make_headers_with_cd("attachment; filename=\"%CE%C4%BC%FE.txt\"");
+        let name = extract_from_content_disposition(&headers);
+        assert_eq!(
+            name.as_deref(),
+            Some("文件.txt"),
+            "GBK percent-encoded Content-Disposition 应能被正确解码"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // urlencoding_decode
     // -----------------------------------------------------------------------
@@ -2698,9 +2763,40 @@ mod tests {
 
     #[test]
     fn urlencoding_decode_invalid_utf8_returns_error() {
-        // 0x80 alone is not valid UTF-8
-        let result = urlencoding_decode("%80");
-        assert!(result.is_err(), "invalid UTF-8 should return Err");
+        // 0x81 0x7F 既不是合法 UTF-8（0x81 不能作为首字节）
+        // 也不是合法 GBK（尾字节不能是 0x7F）——两种都失败时应返回 Err。
+        let result = urlencoding_decode("%81%7F");
+        assert!(
+            result.is_err(),
+            "既非合法 UTF-8 又非合法 GBK 的字节应返回 Err，got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn urlencoding_decode_invalid_utf8_falls_back_to_gbk() {
+        // 0x80 不是合法 UTF-8 首字节，但是合法 GBK（€ 符号）
+        // 不应报错，应返回 GBK 解码后的字符。
+        let result = urlencoding_decode("%80").unwrap_or_default();
+        assert_eq!(result, "€", "GBK 0x80 应解码为 €");
+    }
+
+    // ——— 已知局限（文档性测试，默认 ignore）———
+    //
+    // GBK fallback 存在 false-positive：非 UTF-8 且非 GBK 的编码（如 Big5、
+    // ISO-8859-1）也可能被 GBK “成功”解码为错误的中文。考虑到：
+    //   1. 现代 Big5/Latin 站点几乎不会在 URL 中使用非 UTF-8 percent-encoding
+    //   2. 本修复主要目标是 “老旧中文站点的 GBK URL” 高频场景
+    //   3. 我们接受该权衡，后续可考虑加入 chardet/Big5 预检测
+
+    #[test]
+    #[ignore = "记录 GBK fallback false-positive 行为，不是回归报警"]
+    fn urlencoding_decode_big5_chinese_filename_misdecoded_as_gbk() {
+        // Big5 编码的 “中文” = A4 A4 A4 E5
+        // UTF-8 失败 → GBK 成功但解码为 “いゅ”（错误的日文假名）
+        let result = urlencoding_decode("%A4%A4%A4%E5").unwrap_or_default();
+        eprintln!("big5 bytes decoded as GBK: {:?}", result);
+        assert_ne!(result, "中文", "已知局限：不会还原 Big5");
     }
 
     #[test]
@@ -3429,14 +3525,8 @@ mod tests {
     #[test]
     fn request_spec_from_nm_parses_post_with_form_body() {
         let mut fields = std::collections::HashMap::new();
-        fields.insert(
-            "autodl".to_string(),
-            vec!["2".to_string()],
-        );
-        fields.insert(
-            "updates".to_string(),
-            vec!["1".to_string()],
-        );
+        fields.insert("autodl".to_string(), vec!["2".to_string()]);
+        fields.insert("updates".to_string(), vec!["1".to_string()]);
         let nm_req = crate::native_messaging::DownloadRequest {
             url: "https://uupdump.net/get.php".to_string(),
             filename: String::new(),
@@ -3522,7 +3612,9 @@ mod tests {
             body: Some(super::RequestBodyDecoded::Urlencoded("k=v".to_string())),
         };
         let req = super::build_request(&client, "https://example.com", reqwest::Method::GET, &spec);
-        let built = req.build().expect("build_request must produce a valid request");
+        let built = req
+            .build()
+            .expect("build_request must produce a valid request");
         assert_eq!(built.method(), reqwest::Method::GET);
         // GET 请求 body 应为 None
         assert!(
@@ -3550,7 +3642,9 @@ mod tests {
             reqwest::Method::POST,
             &spec,
         );
-        let built = req.build().expect("build_request must produce a valid request");
+        let built = req
+            .build()
+            .expect("build_request must produce a valid request");
         assert_eq!(built.method(), reqwest::Method::POST);
         // form() 设置 Content-Type 为 application/x-www-form-urlencoded
         assert_eq!(
