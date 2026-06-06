@@ -553,11 +553,12 @@ class DownloadController extends ChangeNotifier {
     String userAgent = '',
     String queueId = '',
     String checksum = '',
+    Map<String, String> extraHeaders = const {},
     List<int> selectedFileIndices = const [],
   }) {
     logInfo(
       _tag,
-      'createTask: url=$url, dir=$saveDir, file=$fileName, seg=$segments, cookies_len=${cookies.length}, torrent_bytes=${torrentFileBytes?.length ?? 0}, queue=$queueId, selected_files=${selectedFileIndices.length}',
+      'createTask: url=$url, dir=$saveDir, file=$fileName, seg=$segments, cookies_len=${cookies.length}, torrent_bytes=${torrentFileBytes?.length ?? 0}, queue=$queueId, headers=${extraHeaders.length}, selected_files=${selectedFileIndices.length}',
     );
     CreateTask(
       url: url,
@@ -570,6 +571,7 @@ class DownloadController extends ChangeNotifier {
       userAgent: userAgent,
       queueId: queueId,
       checksum: checksum,
+      extraHeaders: extraHeaders,
       selectedFileIndices: selectedFileIndices,
     ).sendSignalToRust();
     // 分析埋点
@@ -608,6 +610,7 @@ class DownloadController extends ChangeNotifier {
       userAgent: userAgent,
       queueId: queueId,
       checksum: '',
+      extraHeaders: const {},
       selectedFileIndices: selectedFileIndices,
     ).sendSignalToRust();
     AnalyticsService.instance.trackDownloadCreated('bt');
@@ -671,6 +674,7 @@ class DownloadController extends ChangeNotifier {
         userAgent: userAgent,
         queueId: queueId,
         checksum: '',
+        extraHeaders: const {},
         selectedFileIndices: selectedFileIndices,
       ).sendSignalToRust();
       AnalyticsService.instance.trackDownloadCreated('bt');

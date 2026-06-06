@@ -31,6 +31,11 @@ pub struct CreateTask {
     /// Empty = skip verification.
     #[serde(default)]
     pub checksum: String,
+    /// Custom HTTP request headers (key/value) for this task.
+    /// Cookie is handled separately via `cookies`; do not mix the two.
+    /// Empty = no extra headers.
+    #[serde(default)]
+    pub extra_headers: std::collections::HashMap<String, String>,
     /// Pre-selected file indices for BT downloads (from the new-download dialog).
     /// When non-empty, Phase 3.5 will use these instead of waiting for a
     /// second file-selection dialog.

@@ -70,6 +70,19 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   final _renameController = TextEditingController();
   final _proxyUrlController = TextEditingController();
   final _userAgentController = TextEditingController();
+
+  /// 任务 Cookie（#256）。Cookie 是独立入口，不并入 extra_headers。
+  final _cookieController = TextEditingController();
+
+  /// 哈希校验值（#247/#248）；与 [_selectedHashAlgo] 拼成 "algo=hexhash"。
+  final _checksumController = TextEditingController();
+
+  /// 选中的哈希算法（与后端 verify_checksum 支持的算法名一致）。
+  String _selectedHashAlgo = 'sha-256';
+
+  /// 自定义请求头列表（#347），每项含一对 key/value 输入控制器。
+  final List<_HeaderRow> _headerRows = [];
+
   String? selectedThreads;
   String _selectedUaPreset = 'custom';
 
@@ -371,6 +384,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     _renameController.dispose();
     _proxyUrlController.dispose();
     _userAgentController.dispose();
+    _cookieController.dispose();
+    _checksumController.dispose();
+    for (final row in _headerRows) {
+      row.dispose();
+    }
     super.dispose();
   }
 
@@ -773,12 +791,44 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     }
   }
 
+  /// 收集高级选项里的 Cookie（#256）。
+  String get _cookie => _cookieController.text.trim();
+
+  /// 把哈希算法 + 哈希值拼成 aria2 风格的 "algo=hexhash"（#247/#248）。
+  /// 哈希值为空时返回空串（跳过校验）。
+  String get _checksumSpec {
+    final hash = _checksumController.text.trim();
+    if (hash.isEmpty) return '';
+    return '$_selectedHashAlgo=$hash';
+  }
+
+  /// 解析最终生效的 checksum：高级选项手填的优先，否则回退到 URL 文本里
+  /// 解析出的 aria2 `checksum=` 选项（[entryChecksum]）。
+  String _resolveChecksum(String entryChecksum) {
+    final spec = _checksumSpec;
+    return spec.isNotEmpty ? spec : entryChecksum;
+  }
+
+  /// 把自定义请求头行整理成 Map（#347）。
+  /// 仅保留 key 非空的行；同名 key 后者覆盖前者。
+  Map<String, String> get _extraHeaders {
+    final map = <String, String>{};
+    for (final row in _headerRows) {
+      final key = row.keyController.text.trim();
+      if (key.isEmpty) continue;
+      map[key] = row.valueController.text.trim();
+    }
+    return map;
+  }
+
   Future<void> _startDownloadInner() async {
     final saveDir = _saveDirController.text.trim();
     if (saveDir.isEmpty) return;
 
     final proxyUrl = _proxyUrlController.text.trim();
     final userAgent = _userAgentController.text.trim();
+    final cookie = _cookie;
+    final extraHeaders = _extraHeaders;
 
     // Handle .torrent file downloads
     if (_hasTorrentFiles) {
@@ -832,10 +882,12 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
         saveDir: saveDir,
         fileName: fileName,
         segments: segments,
+        cookies: cookie,
         proxyUrl: proxyUrl,
         userAgent: userAgent,
         queueId: _selectedQueueId,
-        checksum: entry.checksum,
+        checksum: _resolveChecksum(entry.checksum),
+        extraHeaders: extraHeaders,
       );
       setState(() {
         _btWaitPhase = 'probing';
@@ -855,13 +907,16 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
         saveDir: saveDir,
         fileName: fileName,
         segments: segments,
+        cookies: cookie,
         proxyUrl: proxyUrl,
         userAgent: userAgent,
         queueId: _selectedQueueId,
-        checksum: entry.checksum,
+        checksum: _resolveChecksum(entry.checksum),
+        extraHeaders: extraHeaders,
       );
     } else {
-      // 多条 — 使用 BatchCreateTask（携带每条的 fileName/checksum）
+      // 多条 — 使用 BatchCreateTask（携带每条的 fileName/checksum）。
+      // 批量信号无 extra_headers 字段，自定义请求头仅对单条任务生效。
       widget.controller.batchCreateTask(
         entries: entries
             .map(
@@ -877,6 +932,7 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
         proxyUrl: proxyUrl,
         userAgent: userAgent,
         queueId: _selectedQueueId,
+        cookies: cookie,
       );
     }
 
@@ -1363,6 +1419,123 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                   ),
                 ],
               ),
+              // Cookie（#256）
+              const SizedBox(height: 10),
+              _SectionLabel(text: s.taskCookie, c: c),
+              const SizedBox(height: 4),
+              Text(
+                s.taskCookieDesc,
+                style: TextStyle(fontSize: 11, color: c.textMuted),
+              ),
+              const SizedBox(height: 6),
+              ShadInput(
+                controller: _cookieController,
+                placeholder: Text(s.taskCookiePlaceholder),
+                maxLines: 2,
+              ),
+              // 哈希校验（#247/#248）
+              const SizedBox(height: 10),
+              _SectionLabel(text: s.taskChecksum, c: c),
+              const SizedBox(height: 4),
+              Text(
+                s.taskChecksumDesc,
+                style: TextStyle(fontSize: 11, color: c.textMuted),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  SizedBox(
+                    width: 110,
+                    child: ShadSelect<String>(
+                      initialValue: _selectedHashAlgo,
+                      options: const [
+                        ShadOption(value: 'md5', child: Text('md5')),
+                        ShadOption(value: 'sha-1', child: Text('sha-1')),
+                        ShadOption(value: 'sha-256', child: Text('sha-256')),
+                        ShadOption(value: 'sha-512', child: Text('sha-512')),
+                      ],
+                      selectedOptionBuilder: (context, value) => Text(
+                        value,
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                      ),
+                      onChanged: (algo) {
+                        if (algo == null) return;
+                        setState(() => _selectedHashAlgo = algo);
+                      },
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ShadInput(
+                      controller: _checksumController,
+                      placeholder: Text(s.taskChecksumPlaceholder),
+                    ),
+                  ),
+                ],
+              ),
+              // 自定义请求头（#347）
+              const SizedBox(height: 10),
+              _SectionLabel(text: s.taskHeaders, c: c),
+              const SizedBox(height: 4),
+              Text(
+                s.taskHeadersDesc,
+                style: TextStyle(fontSize: 11, color: c.textMuted),
+              ),
+              const SizedBox(height: 6),
+              for (int hi = 0; hi < _headerRows.length; hi++) ...[
+                if (hi > 0) const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      flex: 2,
+                      child: ShadInput(
+                        controller: _headerRows[hi].keyController,
+                        placeholder: Text(s.taskHeadersKeyPlaceholder),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Expanded(
+                      flex: 3,
+                      child: ShadInput(
+                        controller: _headerRows[hi].valueController,
+                        placeholder: Text(s.taskHeadersValuePlaceholder),
+                      ),
+                    ),
+                    const SizedBox(width: 4),
+                    GestureDetector(
+                      onTap: () => setState(() {
+                        _headerRows.removeAt(hi).dispose();
+                      }),
+                      child: Icon(
+                        LucideIcons.x,
+                        size: 16,
+                        color: c.textMuted,
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              const SizedBox(height: 6),
+              Align(
+                alignment: Alignment.centerLeft,
+                child: ShadButton.ghost(
+                  size: ShadButtonSize.sm,
+                  onPressed: () =>
+                      setState(() => _headerRows.add(_HeaderRow())),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(LucideIcons.plus, size: 13, color: c.accent),
+                      const SizedBox(width: 6),
+                      Text(
+                        s.taskHeadersAdd,
+                        style: TextStyle(fontSize: 12, color: c.accent),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
             ],
           ],
         ),
@@ -1524,6 +1697,17 @@ class _ParsedEntry {
   final String checksum;
 
   const _ParsedEntry(this.url, {this.fileName = '', this.checksum = ''});
+}
+
+/// 自定义请求头的一行输入：持有 key / value 两个文本控制器（#347）。
+class _HeaderRow {
+  final TextEditingController keyController = TextEditingController();
+  final TextEditingController valueController = TextEditingController();
+
+  void dispose() {
+    keyController.dispose();
+    valueController.dispose();
+  }
 }
 
 class _SectionLabel extends StatelessWidget {

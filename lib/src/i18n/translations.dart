@@ -673,6 +673,34 @@ class S {
         'Leave empty to use global proxy settings',
   );
 
+  // 任务 Cookie（新建下载对话框高级选项）
+  String get taskCookie => _t('Cookie', 'Cookie');
+  String get taskCookieDesc => _t(
+    '用于需要登录认证的下载（留空则不发送）',
+    'Used for downloads requiring login (empty = none)',
+  );
+  String get taskCookiePlaceholder =>
+      _t('例如 name=value; name2=value2', 'e.g. name=value; name2=value2');
+
+  // 任务哈希校验（新建下载对话框高级选项，#247/#248）
+  String get taskChecksum => _t('哈希校验', 'Hash Verification');
+  String get taskChecksumDesc => _t(
+    '下载完成后校验文件完整性（留空则跳过）',
+    'Verify file integrity after download (empty = skip)',
+  );
+  String get taskChecksumPlaceholder =>
+      _t('粘贴哈希值', 'Paste the hash value');
+
+  // 任务自定义请求头（新建下载对话框高级选项，#347）
+  String get taskHeaders => _t('自定义请求头', 'Custom Headers');
+  String get taskHeadersDesc => _t(
+    '为此任务附加额外的 HTTP 请求头（Cookie 请用上方独立入口）',
+    'Add extra HTTP headers for this task (use the Cookie field above for cookies)',
+  );
+  String get taskHeadersKeyPlaceholder => _t('请求头名称', 'Header name');
+  String get taskHeadersValuePlaceholder => _t('值', 'Value');
+  String get taskHeadersAdd => _t('添加请求头', 'Add header');
+
   // ─────────────────────────────────────────────
   // Settings — 本地下载服务
   // ─────────────────────────────────────────────

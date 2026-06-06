@@ -283,7 +283,7 @@ pub async fn run(db_dir: PathBuf) {
             Some(signal) = create_recv.recv() => {
                 let msg = signal.message;
                 manager
-                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, String::new(), 0, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id, msg.checksum, HashMap::new(), msg.selected_file_indices, None, None)
+                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, String::new(), 0, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id, msg.checksum, msg.extra_headers, msg.selected_file_indices, None, None)
                     .await;
                 // 立即推送 AllTasks，确保 Dart 端在收到 TaskProgress 之前
                 // 已通过 AllTasks 获得正确的 queue_id，防止新任务被错误归入默认队列。
