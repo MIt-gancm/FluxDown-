@@ -129,6 +129,9 @@ fn is_retriable_error(msg: &str) -> bool {
         || lower.contains("error decoding response body")
         // Content-Encoding on Range response — retry will use single-stream mode
         || lower.contains("content-encoding")
+        // BT 完成前逐 piece 校验失败（BUG-BT-PHANTOM-PIECES）：重试会重新
+        // add_torrent，触发 librqbit 全量校验并只补齐损坏的 piece。
+        || lower.contains("piece verification failed")
 }
 
 /// Determine if a URL uses the FTP protocol (case-insensitive).
@@ -2354,17 +2357,28 @@ impl DownloadManager {
                 // Also check the task-scoped staging directory: a paused
                 // download that hasn't finished yet will have its data in
                 // save_dir/.bt_stage_<task_id>/ rather than at the final path.
+                //
+                // The staging check requires actual data, not mere existence:
+                // if the user (or an external tool) deleted the staged FILE
+                // while the empty directory survived, the cached handle's
+                // in-memory piece bitfield would claim pieces that are gone
+                // from disk — librqbit would re-create the file sparse, never
+                // re-download those pieces, and "complete" a file with
+                // zero-filled holes (BUG-BT-PHANTOM-PIECES).
                 let stage_path = bt_downloader::bt_stage_dir(&task.save_dir, task_id);
-                let output_present = output_path.exists() || stage_path.exists();
+                let output_present =
+                    output_path.exists() || bt_downloader::stage_dir_has_real_data(&stage_path);
                 if !output_present {
                     log_info!(
-                        "[manager] BT task {} output missing ({} and {}), discarding cached handle for re-verify",
+                        "[manager] BT task {} output missing/empty ({} and {}), discarding cached handle for re-verify",
                         task_id,
                         output_path.display(),
                         stage_path.display(),
                     );
                     // Delete the stale torrent from the session so add_torrent
                     // can re-add it fresh with proper piece verification.
+                    // session.delete also drops the {hash}.bitv fastresume
+                    // file, so the re-add cannot restore phantom pieces.
                     bt_ref.delete_task(task_id, false).await;
                     existing = None;
                 }
@@ -3945,6 +3959,15 @@ mod tests {
             !is_retriable_error(CANCELLED_ERROR_MESSAGE),
             "cancelled tasks must never be treated as retriable network errors"
         );
+    }
+
+    /// BUG-BT-PHANTOM-PIECES：完成前 piece 校验失败必须可自动重试——重试
+    /// 路径会重新 add_torrent 并触发 librqbit 全量校验,只补齐损坏 piece。
+    #[test]
+    fn bt_piece_verification_failure_is_retriable() {
+        assert!(is_retriable_error(
+            "BT piece verification failed: 36 bad piece(s) — data will be re-checked and re-downloaded"
+        ));
     }
 
     /// #379 回归：磁力元数据解析超时的错误消息不能命中

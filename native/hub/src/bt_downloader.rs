@@ -102,6 +102,25 @@ impl TorrentSource {
             TorrentSource::TorrentFileBytes(_) => "torrent-file://local",
         }
     }
+
+    /// Lowercase hex info-hash of this source, if derivable.
+    ///
+    /// Magnet links carry it in `xt=urn:btih:`; .torrent bytes are parsed
+    /// (bencode) to compute it.  Used to address the `{hash}.bitv` fastresume
+    /// file before the torrent is added to the session.
+    pub fn info_hash_hex(&self) -> Option<String> {
+        match self {
+            TorrentSource::Magnet(url) => librqbit::Magnet::parse(url)
+                .ok()?
+                .as_id20()
+                .map(|id| id.as_string()),
+            TorrentSource::TorrentFileBytes(bytes) => {
+                librqbit::torrent_from_bytes::<librqbit::ByteBufOwned>(bytes)
+                    .ok()
+                    .map(|t| t.info_hash.as_string())
+            }
+        }
+    }
 }
 
 /// Extract the `dn=` (display name) parameter from a magnet URI, if present.
@@ -414,6 +433,10 @@ pub struct SharedBtSession {
     /// It is the BT analogue of the HTTP path's `reserved_temp_paths`.  The
     /// lock is only contended in the rare simultaneous-completion case.
     completion_move_lock: Mutex<()>,
+    /// Folder holding librqbit persistence files (session.json, `{hash}.bitv`,
+    /// `{hash}.torrent`).  Kept so that `clear_stale_fastresume` can remove a
+    /// `.bitv` whose staging data no longer exists (BUG-BT-PHANTOM-PIECES).
+    persistence_folder: PathBuf,
 }
 
 impl SharedBtSession {
@@ -518,7 +541,7 @@ impl SharedBtSession {
                     // Enable persistence so that session.json and per-torrent
                     // .bitv (piece bitfield) files are written to disk.
                     persistence: Some(SessionPersistenceConfig::Json {
-                        folder: Some(persistence_folder),
+                        folder: Some(persistence_folder.clone()),
                     }),
                     // Fast-resume: persist piece completion state so that
                     // paused/restarted torrents can skip re-verification.
@@ -558,13 +581,7 @@ impl SharedBtSession {
                         continue;
                     }
                     let path = entry.path();
-                    let has_real_data = std::fs::read_dir(&path)
-                        .map(|rd| {
-                            rd.filter_map(|e| e.ok())
-                                .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
-                        })
-                        .unwrap_or(false);
-                    if !has_real_data {
+                    if !stage_dir_has_real_data(&path) {
                         log_info!(
                             "[BT] startup: removing empty/stub staging dir {}",
                             path.display()
@@ -595,7 +612,42 @@ impl SharedBtSession {
             file_selection_map: Mutex::new(HashMap::new()),
             torrent_ids: Mutex::new(HashMap::new()),
             completion_move_lock: Mutex::new(()),
+            persistence_folder,
         })
+    }
+
+    /// Remove the `{info_hash}.bitv` fast-resume bitfield for a torrent.
+    ///
+    /// Called when the staging directory holds no real data while a `.bitv`
+    /// may still claim completed pieces (BUG-BT-PHANTOM-PIECES).  librqbit's
+    /// own fastresume validation cannot be relied on to catch the mismatch:
+    /// it samples only a few pieces AND treats a SHA1 mismatch as success —
+    /// `validate_fastresume` rejects on `check_piece(..).is_err()` (I/O error)
+    /// only, while a hash mismatch returns `Ok(false)` (librqbit 8.1.1
+    /// initializing.rs:148 / file_ops.rs:238, still present upstream).  On
+    /// Windows `pread_exact` additionally ignores short reads (`seek_read`
+    /// result unused), so even an empty staging file passes validation.
+    /// Pieces falsely restored that way are never re-downloaded and the
+    /// "finished" file ends up with zero-filled holes.
+    ///
+    /// The `{hash}.torrent` metadata cache is intentionally kept — it is
+    /// content-addressed and always valid.
+    pub fn clear_stale_fastresume(&self, info_hash_hex: &str) {
+        let path = self
+            .persistence_folder
+            .join(format!("{info_hash_hex}.bitv"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => log_info!(
+                "[BT] removed stale fastresume bitfield {} (staging has no data)",
+                path.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => log_info!(
+                "[BT] failed to remove stale fastresume {}: {} — completion verification will catch any phantom pieces",
+                path.display(),
+                e
+            ),
+        }
     }
 
     /// Update the global download speed limit at runtime.
@@ -964,13 +1016,7 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
                 if !stage.exists() {
                     return;
                 }
-                let has_real_data = std::fs::read_dir(&stage)
-                    .map(|rd| {
-                        rd.filter_map(|e| e.ok())
-                            .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
-                    })
-                    .unwrap_or(false);
-                if !has_real_data {
+                if !stage_dir_has_real_data(&stage) {
                     log_info!(
                         "[BT] task={} cleaning up empty staging dir after error/cancel",
                         short_id(&tid)
@@ -1061,6 +1107,43 @@ pub const BT_STAGE_PREFIX: &str = ".bt_stage_";
 /// `save_dir/.bt_stage_<task_id>/`
 pub fn bt_stage_dir(save_dir: &str, task_id: &str) -> PathBuf {
     PathBuf::from(save_dir).join(format!("{}{}", BT_STAGE_PREFIX, task_id))
+}
+
+/// Returns `true` if `dir` contains at least one regular file with `len > 0`,
+/// searching **recursively** (multi-file torrents nest their payload inside a
+/// `<torrent name>/` subdirectory, which a top-level-only scan reports as a
+/// zero-length entry on Windows).
+///
+/// Fail-safe semantics: any I/O error other than "directory does not exist"
+/// is treated as "has data".  Every caller uses a `false` result to justify
+/// destroying state (deleting the staging dir, discarding a cached torrent
+/// handle, removing a `.bitv`), so an unreadable directory must never be
+/// mistaken for an empty one.
+pub fn stage_dir_has_real_data(dir: &Path) -> bool {
+    fn scan(dir: &Path, depth: u32) -> std::io::Result<bool> {
+        // Bail out of absurd nesting conservatively ("has data").
+        if depth > 16 {
+            return Ok(true);
+        }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            // DirEntry::metadata does not traverse symlinks.
+            let md = entry.metadata()?;
+            if md.is_dir() {
+                if scan(&entry.path(), depth + 1)? {
+                    return Ok(true);
+                }
+            } else if md.len() > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    match std::fs::metadata(dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(_) => scan(dir, 0).unwrap_or(true),
+    }
 }
 
 /// Mark a path as hidden on Windows using `SetFileAttributesW`.
@@ -1811,6 +1894,240 @@ fn compute_bt_display_progress(
     progress
 }
 
+// ---------------------------------------------------------------------------
+// Completion-time piece verification (BUG-BT-PHANTOM-PIECES)
+//
+// librqbit's `finished` flag only means "every selected piece is marked have
+// in the chunk tracker".  Have-bits restored from a `{hash}.bitv` fastresume
+// file are accepted by a *sampling* validation that, on top of checking only
+// ~2% of claimed pieces, treats a SHA1 mismatch as success (it rejects on
+// `check_piece(..).is_err()` — I/O errors — while a mismatch is `Ok(false)`;
+// librqbit 8.1.1 initializing.rs:148, unchanged upstream).  On Windows,
+// short reads are additionally silently ignored (`seek_read` result unused
+// in `pread_exact`).  So if staging data is lost while a task is paused, the
+// re-added torrent can reach `finished` with pieces that are zeros on disk.
+//
+// These helpers re-hash every required piece of the staging directory
+// against the torrent's SHA1 piece table before the file is moved to its
+// final destination — the last line of defence regardless of why the
+// bitfield and the data disagree.
+// ---------------------------------------------------------------------------
+
+/// One torrent file as seen by the piece verifier.
+struct VerifyFileSpec {
+    /// Absolute on-disk path (`None` for BEP-47 padding files, whose bytes
+    /// are virtual zeros and are never stored).
+    path: Option<PathBuf>,
+    /// Length in bytes inside the torrent's piece space.
+    len: u64,
+    /// Whether the file is part of the user's selection.  A piece is
+    /// *required* (and therefore verified) iff it overlaps at least one
+    /// selected file — the same rule librqbit's chunk tracker uses to compute
+    /// `finished`, so verification can never demand pieces the engine does
+    /// not promise (which would loop forever in the repair path).
+    selected: bool,
+}
+
+/// Outcome of a full piece re-hash of the staging directory.
+struct VerifyOutcome {
+    /// Indices of required pieces that are provably wrong: SHA1 mismatch or
+    /// unreadable/short data.
+    bad: Vec<u32>,
+    /// Number of required pieces hashed and found correct.
+    checked: u64,
+    /// Pieces not verified because no selected file overlaps them.
+    skipped: u64,
+}
+
+/// Walk all pieces of the torrent layout `files` (in torrent order) and
+/// SHA1-check every required piece.  `expected_hash_matches(piece, digest)`
+/// compares against the torrent's piece table (`None` = piece index unknown,
+/// treated as bad — the metadata and layout must agree).
+fn verify_pieces_core(
+    piece_length: u32,
+    files: &[VerifyFileSpec],
+    mut expected_hash_matches: impl FnMut(u32, [u8; 20]) -> Option<bool>,
+) -> VerifyOutcome {
+    use sha1::Digest;
+
+    let piece_length = piece_length.max(1) as u64;
+    let total: u64 = files.iter().map(|f| f.len).sum();
+    let total_pieces = total.div_ceil(piece_length);
+
+    let mut handles: Vec<Option<std::fs::File>> = Vec::new();
+    handles.resize_with(files.len(), || None);
+    let mut open_failed = vec![false; files.len()];
+
+    let mut outcome = VerifyOutcome {
+        bad: Vec::new(),
+        checked: 0,
+        skipped: 0,
+    };
+    let mut buf = vec![0u8; 256 * 1024];
+    // Reused span buffer: (file index, offset in file, span length).
+    let mut spans: Vec<(usize, u64, u64)> = Vec::new();
+
+    // Sequential cursor over the concatenated file space.
+    let mut file_idx = 0usize;
+    let mut file_pos = 0u64;
+
+    for piece_idx in 0..total_pieces {
+        let piece_len = piece_length.min(total - piece_idx * piece_length);
+
+        // Collect this piece's spans, advancing the cursor.
+        spans.clear();
+        let mut required = false;
+        let mut remaining = piece_len;
+        while remaining > 0 {
+            while file_idx < files.len() && file_pos >= files[file_idx].len {
+                file_idx += 1;
+                file_pos = 0;
+            }
+            let Some(f) = files.get(file_idx) else {
+                break; // layout shorter than piece space — cannot happen
+            };
+            let span = (f.len - file_pos).min(remaining);
+            spans.push((file_idx, file_pos, span));
+            required |= f.selected;
+            remaining -= span;
+            file_pos += span;
+        }
+
+        if !required {
+            outcome.skipped += 1;
+            continue;
+        }
+
+        let mut hasher = sha1::Sha1::new();
+        let mut readable = true;
+        for &(fi, offset, span) in &spans {
+            let file = &files[fi];
+            let ok = match &file.path {
+                // Padding file — virtual zeros.
+                None => {
+                    buf.fill(0);
+                    let mut left = span;
+                    while left > 0 {
+                        let chunk = left.min(buf.len() as u64) as usize;
+                        hasher.update(&buf[..chunk]);
+                        left -= chunk as u64;
+                    }
+                    true
+                }
+                Some(path) => hash_file_span(
+                    &mut handles[fi],
+                    &mut open_failed[fi],
+                    path,
+                    offset,
+                    span,
+                    &mut buf,
+                    &mut hasher,
+                )
+                .is_ok(),
+            };
+            if !ok {
+                readable = false;
+                break;
+            }
+        }
+
+        if !readable {
+            outcome.bad.push(piece_idx as u32);
+            continue;
+        }
+        let digest: [u8; 20] = hasher.finalize().into();
+        if expected_hash_matches(piece_idx as u32, digest) == Some(true) {
+            outcome.checked += 1;
+        } else {
+            outcome.bad.push(piece_idx as u32);
+        }
+    }
+
+    outcome
+}
+
+/// Feed `len` bytes of `path` starting at `offset` into `hasher`.
+/// The file handle is opened lazily and cached across spans; a failed open is
+/// remembered so later spans fail fast instead of retrying the syscall.
+fn hash_file_span(
+    handle: &mut Option<std::fs::File>,
+    open_failed: &mut bool,
+    path: &Path,
+    offset: u64,
+    len: u64,
+    buf: &mut [u8],
+    hasher: &mut sha1::Sha1,
+) -> std::io::Result<()> {
+    use sha1::Digest;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if *open_failed {
+        return Err(std::io::ErrorKind::NotFound.into());
+    }
+    if handle.is_none() {
+        match std::fs::File::open(path) {
+            Ok(f) => *handle = Some(f),
+            Err(e) => {
+                *open_failed = true;
+                return Err(e);
+            }
+        }
+    }
+    let Some(f) = handle.as_mut() else {
+        return Err(std::io::ErrorKind::NotFound.into());
+    };
+    f.seek(SeekFrom::Start(offset))?;
+    let mut remaining = len;
+    while remaining > 0 {
+        let chunk = remaining.min(buf.len() as u64) as usize;
+        // read_exact (unlike librqbit's Windows pread_exact) genuinely fails
+        // on EOF/short reads, so a truncated staging file is detected.
+        f.read_exact(&mut buf[..chunk])?;
+        hasher.update(&buf[..chunk]);
+        remaining -= chunk as u64;
+    }
+    Ok(())
+}
+
+/// Re-hash the staged data of `handle` against its torrent metadata on a
+/// blocking thread.  `true_selection` are the selected file indices
+/// (negative values or an empty list mean "all files").
+async fn verify_staged_pieces(
+    handle: BtHandle,
+    stage_dir: PathBuf,
+    true_selection: Vec<i32>,
+) -> Result<VerifyOutcome, String> {
+    tokio::task::spawn_blocking(move || {
+        let select_all = true_selection.is_empty() || true_selection.iter().any(|&i| i < 0);
+        let selected: HashSet<usize> = true_selection.iter().map(|&i| i as usize).collect();
+        handle
+            .with_metadata(|meta| {
+                let files: Vec<VerifyFileSpec> = meta
+                    .file_infos
+                    .iter()
+                    .enumerate()
+                    .map(|(i, fi)| VerifyFileSpec {
+                        path: if fi.attrs.padding {
+                            None
+                        } else {
+                            Some(stage_dir.join(&fi.relative_filename))
+                        },
+                        len: fi.len,
+                        selected: select_all || selected.contains(&i),
+                    })
+                    .collect();
+                verify_pieces_core(
+                    meta.lengths.default_piece_length(),
+                    &files,
+                    |idx, digest| meta.info.compare_hash(idx, digest),
+                )
+            })
+            .map_err(|e| format!("metadata unavailable: {e}"))
+    })
+    .await
+    .map_err(|e| format!("verification task failed: {e}"))?
+}
+
 async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     let BtInnerParams {
         task_id,
@@ -1885,6 +2202,19 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             );
         } else {
             set_hidden(&stage_dir);
+        }
+        // BUG-BT-PHANTOM-PIECES guard: if the staging dir holds no real data
+        // (fresh task, or partial data lost while paused — e.g. the dir was
+        // deleted externally), a leftover `{hash}.bitv` from an earlier run
+        // still claims completed pieces.  librqbit would accept it (its
+        // sampling validation ignores hash mismatches — see
+        // `clear_stale_fastresume`) and never re-download those pieces,
+        // producing a "finished" file with zero-filled holes.  Delete the
+        // bitfield up front so the re-add does a genuine initial check.
+        if !stage_dir_has_real_data(&stage_dir)
+            && let Some(hash) = torrent_source.info_hash_hex()
+        {
+            shared_bt.clear_stale_fastresume(&hash);
         }
         let stage_dir_str = stage_dir.to_string_lossy().into_owned();
         let add_opts = AddTorrentOptions {
@@ -2617,6 +2947,82 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             let save_path = PathBuf::from(&save_dir);
             let stage_dir = bt_stage_dir(&save_dir, &task_id);
 
+            // BUG-BT-PHANTOM-PIECES: `stats.finished` can lie when have-bits
+            // were restored from a stale `{hash}.bitv` whose staging data no
+            // longer exists (librqbit's sampling validation ignores SHA1
+            // mismatches — see the doc on `verify_pieces_core`).  Re-hash
+            // every required piece before moving the file out of staging.
+            // On failure: drop the torrent from the session (delete_files =
+            // false keeps the good pieces on disk; the persistence store
+            // also removes the lying .bitv), then fail with a retriable
+            // error — the auto-retry re-adds the torrent, librqbit performs
+            // a genuine full check, and only the bad pieces are downloaded
+            // again.
+            if stage_dir.exists() {
+                log_info!(
+                    "[BT] task={} verifying {} pieces before completing...",
+                    short_id(&task_id),
+                    total_pieces
+                );
+                let verify_started = Instant::now();
+                match verify_staged_pieces(
+                    handle.clone(),
+                    stage_dir.clone(),
+                    true_selection.clone(),
+                )
+                .await
+                {
+                    Ok(outcome) if outcome.bad.is_empty() => {
+                        log_info!(
+                            "[BT] task={} piece verification passed ({} hashed, {} skipped) in {:.1}s",
+                            short_id(&task_id),
+                            outcome.checked,
+                            outcome.skipped,
+                            verify_started.elapsed().as_secs_f64()
+                        );
+                    }
+                    Ok(outcome) => {
+                        let preview: Vec<u32> = outcome.bad.iter().take(16).copied().collect();
+                        log_info!(
+                            "[BT] task={} piece verification FAILED: {}/{} pieces bad (first: {:?}) in {:.1}s — clearing fastresume state, bad pieces will be re-downloaded",
+                            short_id(&task_id),
+                            outcome.bad.len(),
+                            total_pieces,
+                            preview,
+                            verify_started.elapsed().as_secs_f64()
+                        );
+                        let _ = shared_bt.delete_task(&task_id, false).await;
+                        let msg = format!(
+                            "BT piece verification failed: {} bad piece(s) — data will be re-checked and re-downloaded",
+                            outcome.bad.len()
+                        );
+                        let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
+                        let _ = progress_tx
+                            .send(ProgressUpdate {
+                                task_id: task_id.clone(),
+                                downloaded_bytes: progress,
+                                total_bytes: total,
+                                status: STATUS_ERROR,
+                                error_message: msg.clone(),
+                                file_name: String::new(),
+                                segment_details: None,
+                            })
+                            .await;
+                        return Err(DownloadError::Other(msg));
+                    }
+                    Err(e) => {
+                        // Internal verification error (e.g. metadata gone) —
+                        // don't block completion on it; behave as before this
+                        // guard existed.
+                        log_info!(
+                            "[BT] task={} piece verification skipped: {}",
+                            short_id(&task_id),
+                            e
+                        );
+                    }
+                }
+            }
+
             let (completed_name, all_moves_succeeded) = if !stage_dir.exists() {
                 // No staging dir at all — resumed download that was already
                 // moved in a previous session, or existing_handle path where
@@ -3342,5 +3748,245 @@ mod tests {
         // Non-existent folder — must not panic either.
         super::clear_stale_session_state(&dir.join("does_not_exist"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // stage_dir_has_real_data — recursive, fail-safe (BUG-BT-PHANTOM-PIECES).
+    // -------------------------------------------------------------------------
+
+    fn unique_test_dir(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "fluxdown_bt_stage_test_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn stage_dir_has_real_data_basic_cases() {
+        // Missing directory → no data (the only "safe to act" negative).
+        assert!(!super::stage_dir_has_real_data(&unique_test_dir("missing")));
+
+        // Empty directory → no data.
+        let empty = unique_test_dir("empty");
+        let _ = std::fs::create_dir_all(&empty);
+        assert!(!super::stage_dir_has_real_data(&empty));
+
+        // Only zero-byte files → no data.
+        let zero = unique_test_dir("zero");
+        let _ = std::fs::create_dir_all(&zero);
+        let _ = std::fs::write(zero.join("stub.bin"), b"");
+        assert!(!super::stage_dir_has_real_data(&zero));
+
+        // Top-level non-empty file → data.
+        let flat = unique_test_dir("flat");
+        let _ = std::fs::create_dir_all(&flat);
+        let _ = std::fs::write(flat.join("file.iso"), b"x");
+        assert!(super::stage_dir_has_real_data(&flat));
+
+        for d in [empty, zero, flat] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
+
+    /// Multi-file torrents stage their payload under `<torrent name>/…`; a
+    /// top-level-only scan sees just a directory entry (len 0 on Windows) and
+    /// would wrongly classify partially-downloaded data as deletable.
+    #[test]
+    fn stage_dir_has_real_data_finds_nested_files() {
+        let dir = unique_test_dir("nested");
+        let nested = dir.join("Torrent Name").join("sub");
+        let _ = std::fs::create_dir_all(&nested);
+        let _ = std::fs::write(nested.join("part.mkv"), b"data");
+        assert!(super::stage_dir_has_real_data(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------------
+    // verify_pieces_core — completion-time piece re-hash
+    // (BUG-BT-PHANTOM-PIECES regression).
+    // -------------------------------------------------------------------------
+
+    fn sha1_of(data: &[u8]) -> [u8; 20] {
+        use sha1::Digest;
+        let mut h = sha1::Sha1::new();
+        h.update(data);
+        h.finalize().into()
+    }
+
+    /// Layout: one selected 2.5-piece file (piece_length = 4).
+    /// All pieces intact → no bad pieces.
+    #[test]
+    fn verify_pieces_core_accepts_valid_data() {
+        let dir = unique_test_dir("verify_ok");
+        let _ = std::fs::create_dir_all(&dir);
+        let content = b"0123456789"; // 10 bytes → pieces "0123","4567","89"
+        let path = dir.join("data.bin");
+        let _ = std::fs::write(&path, content);
+        let hashes = [sha1_of(b"0123"), sha1_of(b"4567"), sha1_of(b"89")];
+
+        let files = [super::VerifyFileSpec {
+            path: Some(path),
+            len: content.len() as u64,
+            selected: true,
+        }];
+        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
+            hashes.get(idx as usize).map(|h| *h == digest)
+        });
+        assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
+        assert_eq!(outcome.checked, 3);
+        assert_eq!(outcome.skipped, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A zero-filled hole in the middle of otherwise-valid data must be
+    /// reported as exactly that bad piece — the incident scenario where a
+    /// stale .bitv claimed pieces whose staging data had been lost.
+    #[test]
+    fn verify_pieces_core_detects_zero_filled_pieces() {
+        let dir = unique_test_dir("verify_zero");
+        let _ = std::fs::create_dir_all(&dir);
+        let good = b"0123456789";
+        // Piece 1 ("4567") zeroed out on disk.
+        let on_disk = b"0123\0\0\0\089";
+        let path = dir.join("data.bin");
+        let _ = std::fs::write(&path, on_disk);
+        let hashes = [sha1_of(b"0123"), sha1_of(b"4567"), sha1_of(b"89")];
+
+        let files = [super::VerifyFileSpec {
+            path: Some(path),
+            len: good.len() as u64,
+            selected: true,
+        }];
+        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
+            hashes.get(idx as usize).map(|h| *h == digest)
+        });
+        assert_eq!(outcome.bad, vec![1]);
+        assert_eq!(outcome.checked, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A missing or truncated selected file makes its pieces provably bad
+    /// (read failure), unlike librqbit's Windows pread_exact which silently
+    /// succeeds past EOF.
+    #[test]
+    fn verify_pieces_core_flags_missing_and_truncated_files() {
+        let dir = unique_test_dir("verify_missing");
+        let _ = std::fs::create_dir_all(&dir);
+
+        // Missing file entirely.
+        let files = [super::VerifyFileSpec {
+            path: Some(dir.join("nonexistent.bin")),
+            len: 10,
+            selected: true,
+        }];
+        let outcome = super::verify_pieces_core(4, &files, |_, _| Some(true));
+        assert_eq!(outcome.bad, vec![0, 1, 2]);
+
+        // Truncated file: only 5 of 10 bytes on disk → pieces 1 and 2
+        // unreadable; piece 0 readable (hash check decides it).
+        let path = dir.join("short.bin");
+        let _ = std::fs::write(&path, b"01234");
+        let files = [super::VerifyFileSpec {
+            path: Some(path),
+            len: 10,
+            selected: true,
+        }];
+        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
+            Some(idx == 0 && digest == sha1_of(b"0123"))
+        });
+        assert_eq!(outcome.bad, vec![1, 2]);
+        assert_eq!(outcome.checked, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pieces that overlap no selected file are skipped, while a piece
+    /// straddling the selected/unselected boundary is still required —
+    /// matching librqbit's chunk-tracker selection rule so the repair loop
+    /// never demands pieces the engine does not promise.
+    #[test]
+    fn verify_pieces_core_skips_unselected_only_pieces() {
+        let dir = unique_test_dir("verify_sel");
+        let _ = std::fs::create_dir_all(&dir);
+        let sel = dir.join("selected.bin");
+        let unsel = dir.join("unselected.bin");
+        // piece_length 4: file A = 6 bytes (pieces 0, 1), file B = 6 bytes
+        // (pieces 1, 2).  Piece 1 straddles both; piece 2 is B-only.
+        let _ = std::fs::write(&sel, b"AAAAAA");
+        let _ = std::fs::write(&unsel, b"BBBBBB");
+        let hashes = [sha1_of(b"AAAA"), sha1_of(b"AABB"), sha1_of(b"BBBB")];
+
+        let files = [
+            super::VerifyFileSpec {
+                path: Some(sel),
+                len: 6,
+                selected: true,
+            },
+            super::VerifyFileSpec {
+                path: Some(unsel),
+                len: 6,
+                selected: false,
+            },
+        ];
+        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
+            hashes.get(idx as usize).map(|h| *h == digest)
+        });
+        assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
+        assert_eq!(outcome.checked, 2, "pieces 0 and 1 are required");
+        assert_eq!(outcome.skipped, 1, "piece 2 overlaps no selected file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// BEP-47 padding files contribute virtual zero bytes without any disk I/O.
+    #[test]
+    fn verify_pieces_core_hashes_padding_as_zeros() {
+        let dir = unique_test_dir("verify_pad");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("data.bin");
+        let _ = std::fs::write(&path, b"XY");
+        // Layout: 2-byte real file + 2-byte padding → one piece "XY\0\0".
+        let hashes = [sha1_of(b"XY\0\0")];
+
+        let files = [
+            super::VerifyFileSpec {
+                path: Some(path),
+                len: 2,
+                selected: true,
+            },
+            super::VerifyFileSpec {
+                path: None,
+                len: 2,
+                selected: false,
+            },
+        ];
+        let outcome = super::verify_pieces_core(4, &files, |idx, digest| {
+            hashes.get(idx as usize).map(|h| *h == digest)
+        });
+        assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
+        assert_eq!(outcome.checked, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// info_hash_hex derives the hash from magnet URLs (used to address the
+    /// {hash}.bitv fastresume file before add_torrent).
+    #[test]
+    fn torrent_source_info_hash_from_magnet() {
+        let src = super::TorrentSource::Magnet(
+            "magnet:?xt=urn:btih:d5146f69f1bb6b9d95c8270769ebca7f82c2936a&dn=x".to_string(),
+        );
+        assert_eq!(
+            src.info_hash_hex().as_deref(),
+            Some("d5146f69f1bb6b9d95c8270769ebca7f82c2936a")
+        );
+        let bad = super::TorrentSource::Magnet("magnet:?dn=nohash".to_string());
+        assert_eq!(bad.info_hash_hex(), None);
     }
 }
