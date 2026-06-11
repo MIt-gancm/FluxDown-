@@ -273,7 +273,9 @@ jobs:
             --artifacts-dir build/extension/firefox-listed/
 
       # Step 2: 将 manifest 版本改为 X.Y.Z.1，unlisted 签名产出 GitHub Release 用 XPI
+      # AMO 服务端有时返回 500，continue-on-error 避免阻断整个 Release
       - name: Sign Firefox extension for GitHub Release (unlisted, vX.Y.Z.1)
+        continue-on-error: true
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           mkdir -p build/extension
@@ -398,7 +400,7 @@ jobs:
         with:
           name: browser-extension-firefox
           path: build/extension/FluxDown-*-firefox.xpi
-          if-no-files-found: error
+          if-no-files-found: warn
 
   # ── 并行 Job 3: 构建 Linux AppImage + tar.gz（x64）──
   build-linux:
