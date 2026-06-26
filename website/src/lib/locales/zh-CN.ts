@@ -629,6 +629,7 @@ const zhCN: Messages = {
   "sponsor.ctaHint": "微信安全支付 · 扫描二维码完成付款",
   "sponsor.pay.cta": "赞助",
   "sponsor.pay.customPlaceholder": "自定义金额",
+  "sponsor.pay.wechatBadge": "微信支付",
   "sponsor.pay.scanTitle": "扫码支付",
   "sponsor.pay.scanHint": "打开微信扫描下方二维码",
   "sponsor.pay.waiting": "等待支付中…",

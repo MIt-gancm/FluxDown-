@@ -677,6 +677,7 @@ const en = {
   "sponsor.ctaHint": "Secure WeChat Pay · scan the QR code to complete payment",
   "sponsor.pay.cta": "Sponsor",
   "sponsor.pay.customPlaceholder": "Custom amount",
+  "sponsor.pay.wechatBadge": "WeChat Pay",
   "sponsor.pay.scanTitle": "Scan to pay",
   "sponsor.pay.scanHint": "Open WeChat and scan the QR code below",
   "sponsor.pay.waiting": "Waiting for payment…",

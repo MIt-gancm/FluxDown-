@@ -18,6 +18,19 @@ interface SponsorSectionProps {
 // Preset amounts in yuan.
 const PRESET_AMOUNTS = [5, 15, 30, 66, 128];
 
+// WeChat Pay center logo for the QR code: white WeChat glyph on a
+// brand-green rounded tile, inlined as an SVG data URI so it needs no asset.
+const WECHAT_PAY_LOGO =
+  "data:image/svg+xml;utf8," +
+  encodeURIComponent(
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48">' +
+      '<rect width="48" height="48" rx="12" fill="#07C160"/>' +
+      '<g fill="#ffffff" transform="translate(8 12)">' +
+      '<path d="M11.6 0C5.2 0 0 4.4 0 9.9c0 3 1.6 5.7 4.2 7.6L3.1 21l3.9-2c1.3.3 2.6.5 4 .5h.6a8.4 8.4 0 0 1-.4-2.6c0-4.9 4.7-8.9 10.5-9h.6C21.2 3 16.9 0 11.6 0zM7.9 7.6a1.4 1.4 0 1 1 0-2.9 1.4 1.4 0 0 1 0 2.9zm7.4 0a1.4 1.4 0 1 1 0-2.9 1.4 1.4 0 0 1 0 2.9z"/>' +
+      '<path d="M32 17.5c0-4.3-4.2-7.8-9.4-7.8s-9.4 3.5-9.4 7.8 4.2 7.8 9.4 7.8c1.1 0 2.1-.2 3.1-.5l3.1 1.7-.9-2.8c2.5-1.5 4-3.7 4-6.2zm-12.4-1.3a1.15 1.15 0 1 1 0-2.3 1.15 1.15 0 0 1 0 2.3zm6.2 0a1.15 1.15 0 1 1 0-2.3 1.15 1.15 0 0 1 0 2.3z"/>' +
+      "</g></svg>",
+  );
+
 type PayState =
   | { phase: "idle" }
   | { phase: "creating" }
@@ -285,6 +298,19 @@ export default function SponsorSection({
 
               {pay.phase === "pending" && (
                 <>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-1 mb-3 rounded-full bg-[#07C160]/10 border border-[#07C160]/30">
+                    <svg
+                      viewBox="0 0 24 24"
+                      className="w-3.5 h-3.5"
+                      fill="#07C160"
+                      aria-hidden="true"
+                    >
+                      <path d="M8.7 3C4.5 3 1 5.9 1 9.5c0 2 1.1 3.8 2.9 5l-.7 2.2 2.6-1.3c.9.2 1.8.4 2.7.4h.5a5.6 5.6 0 0 1-.3-1.8c0-3.3 3.2-6 7.1-6h.5C16.3 4.9 12.9 3 8.7 3zM6.2 8.1a.95.95 0 1 1 0-1.9.95.95 0 0 1 0 1.9zm5 0a.95.95 0 1 1 0-1.9.95.95 0 0 1 0 1.9zM23 14.4c0-2.9-2.9-5.3-6.5-5.3s-6.5 2.4-6.5 5.3 2.9 5.3 6.5 5.3c.8 0 1.5-.1 2.2-.3l2.1 1.1-.6-1.8c1.7-1 2.8-2.5 2.8-4.3zm-8.6-.9a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6zm4.3 0a.8.8 0 1 1 0-1.6.8.8 0 0 1 0 1.6z" />
+                    </svg>
+                    <span className="text-[11px] font-semibold text-[#07C160]">
+                      {t("sponsor.pay.wechatBadge")}
+                    </span>
+                  </div>
                   <h3 className="text-base font-semibold text-dark-text mb-1">
                     {t("sponsor.pay.scanTitle")}
                   </h3>
@@ -292,7 +318,17 @@ export default function SponsorSection({
                     {t("sponsor.pay.scanHint")}
                   </p>
                   <div className="inline-flex p-4 rounded-xl bg-white mb-5">
-                    <QRCodeSVG value={pay.codeUrl} size={200} level="M" />
+                    <QRCodeSVG
+                      value={pay.codeUrl}
+                      size={200}
+                      level="H"
+                      imageSettings={{
+                        src: WECHAT_PAY_LOGO,
+                        height: 40,
+                        width: 40,
+                        excavate: true,
+                      }}
+                    />
                   </div>
                   <div className="flex items-center justify-center gap-2 text-xs text-dark-text-secondary">
                     <Loader2 className="w-3.5 h-3.5 animate-spin" />
