@@ -25,14 +25,13 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
-use rinf::RustSignal;
-
 use crate::downloader::{
     DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, ProgressUpdate, TEMP_EXT, dedup_filename,
     extract_from_url,
 };
 use crate::logger::log_info;
-use crate::signals::{HlsQualityOption, HlsQualityOptions};
+use crate::model::HlsQualityOption;
+use crate::selection::SelectionOutcome;
 
 // ---------------------------------------------------------------------------
 // Same-origin check for cookie safety
@@ -341,7 +340,10 @@ pub async fn parse_m3u8(
                     Some(br) => {
                         let offset = match br.offset {
                             Some(o) => o,
-                            None => byterange_next_offset.get(&resolved_uri).copied().unwrap_or(0),
+                            None => byterange_next_offset
+                                .get(&resolved_uri)
+                                .copied()
+                                .unwrap_or(0),
                         };
                         let next = offset.checked_add(br.length).ok_or_else(|| {
                             DownloadError::Other(format!(
@@ -542,7 +544,7 @@ fn decrypt_segment(
 
     // 非块对齐:源省略了 PKCS7 填充。用 NoPadding 解密对齐前缀,丢弃尾部
     // 不足一块的残余字节(它们无法构成完整密文块)。
-    if data.len() % AES_BLOCK_SIZE != 0 {
+    if !data.len().is_multiple_of(AES_BLOCK_SIZE) {
         let aligned = (data.len() / AES_BLOCK_SIZE) * AES_BLOCK_SIZE;
         if aligned == 0 {
             return Err(DownloadError::Other(format!(
@@ -569,14 +571,12 @@ fn decrypt_segment(
     let decryptor = Aes128CbcDec::new_from_slices(&key_array, iv)
         .map_err(|e| DownloadError::Other(format!("AES init error: {}", e)))?;
 
-    let decrypted = decryptor
-        .decrypt_padded_mut::<Pkcs7>(data)
-        .map_err(|e| {
-            DownloadError::Other(format!(
-                "decrypt_segment: segment {} PKCS7 decrypt error (likely wrong key/IV): {}",
-                seg_idx, e
-            ))
-        })?;
+    let decrypted = decryptor.decrypt_padded_mut::<Pkcs7>(data).map_err(|e| {
+        DownloadError::Other(format!(
+            "decrypt_segment: segment {} PKCS7 decrypt error (likely wrong key/IV): {}",
+            seg_idx, e
+        ))
+    })?;
 
     Ok(decrypted.to_vec())
 }
@@ -585,10 +585,9 @@ fn decrypt_segment(
 // Entry point
 // ---------------------------------------------------------------------------
 
-pub async fn run_hls_download(mut params: DownloadParams) {
+pub async fn run_hls_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
-    let quality_rx = params.hls_quality_rx.take();
-    let result = run_hls_download_inner(&params, quality_rx).await;
+    let result = run_hls_download_inner(&params).await;
 
     match result {
         Ok(total) => {
@@ -657,7 +656,7 @@ const QUALITY_SELECTION_TIMEOUT_SECS: u64 = 60;
 async fn select_variant(
     task_id: &str,
     variants: &[HlsVariant],
-    quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
+    selector: &dyn crate::selection::HostSelection,
     cancel_token: &tokio_util::sync::CancellationToken,
 ) -> Result<String, DownloadError> {
     let auto_select_best = || -> Result<String, DownloadError> {
@@ -674,91 +673,80 @@ async fn select_variant(
         Ok(best.uri.clone())
     };
 
-    if let Some(rx) = quality_rx {
-        // Skip dialog when there is only one variant — no point asking.
-        if variants.len() <= 1 {
-            log_info!(
-                "[hls-download] task {} only {} variant(s), skipping quality dialog",
-                task_id,
-                variants.len()
-            );
-            return auto_select_best();
-        }
-
-        let options: Vec<HlsQualityOption> = variants
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let (w, h) = v.resolution.unwrap_or((0, 0));
-                HlsQualityOption {
-                    index: i as i32,
-                    bandwidth: v.bandwidth as i64,
-                    width: w as i64,
-                    height: h as i64,
-                }
-            })
-            .collect();
-
-        HlsQualityOptions {
-            task_id: task_id.to_string(),
-            options,
-        }
-        .send_signal_to_dart();
-
+    // Skip the selector entirely when there is only one variant — no point asking.
+    if variants.len() <= 1 {
         log_info!(
-            "[hls-download] task {} sent {} quality options to Dart, waiting for selection (timeout={}s)",
+            "[hls-download] task {} only {} variant(s), skipping quality dialog",
             task_id,
-            variants.len(),
-            QUALITY_SELECTION_TIMEOUT_SECS
+            variants.len()
         );
+        return auto_select_best();
+    }
 
-        let timeout_duration = std::time::Duration::from_secs(QUALITY_SELECTION_TIMEOUT_SECS);
+    let options: Vec<HlsQualityOption> = variants
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let (w, h) = v.resolution.unwrap_or((0, 0));
+            HlsQualityOption {
+                index: i as i32,
+                bandwidth: v.bandwidth as i64,
+                width: w as i64,
+                height: h as i64,
+            }
+        })
+        .collect();
 
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                Err(DownloadError::Cancelled)
-            }
-            result = tokio::time::timeout(timeout_duration, rx) => {
-                match result {
-                    Ok(Ok(idx)) => {
-                        let variant = variants.get(idx as usize).ok_or_else(|| {
-                            DownloadError::Other(format!(
-                                "invalid HLS quality index: {} (have {} variants)",
-                                idx,
-                                variants.len()
-                            ))
-                        })?;
-                        log_info!(
-                            "[hls-download] task {} user selected variant {}: bandwidth={}, resolution={:?}",
-                            task_id,
-                            idx,
-                            variant.bandwidth,
-                            variant.resolution
-                        );
-                        Ok(variant.uri.clone())
-                    }
-                    Ok(Err(_)) => {
-                        // Channel closed (sender dropped) — auto-select best.
-                        log_info!(
-                            "[hls-download] task {} quality channel closed, auto-selecting best",
-                            task_id
-                        );
-                        auto_select_best()
-                    }
-                    Err(_) => {
-                        // Timeout — auto-select best.
-                        log_info!(
-                            "[hls-download] task {} quality selection timed out ({}s), auto-selecting best",
-                            task_id,
-                            QUALITY_SELECTION_TIMEOUT_SECS
-                        );
-                        auto_select_best()
-                    }
-                }
-            }
+    log_info!(
+        "[hls-download] task {} requesting quality selection ({} variants) via HostSelection (timeout={}s)",
+        task_id,
+        variants.len(),
+        QUALITY_SELECTION_TIMEOUT_SECS
+    );
+
+    let timeout_duration = std::time::Duration::from_secs(QUALITY_SELECTION_TIMEOUT_SECS);
+
+    tokio::select! {
+        _ = cancel_token.cancelled() => {
+            Err(DownloadError::Cancelled)
         }
-    } else {
-        auto_select_best()
+        outcome = selector.select_hls_quality(task_id, &options, timeout_duration) => {
+            let idx = match &outcome {
+                SelectionOutcome::UserChose(idx) => {
+                    log_info!(
+                        "[hls-download] task {} user selected variant {}",
+                        task_id, idx
+                    );
+                    *idx
+                }
+                SelectionOutcome::TimedOutDefaulted(idx) => {
+                    log_info!(
+                        "[hls-download] task {} quality selection timed out ({}s), defaulting to variant {}",
+                        task_id, QUALITY_SELECTION_TIMEOUT_SECS, idx
+                    );
+                    *idx
+                }
+                SelectionOutcome::NoSelectorConfigured(idx) => {
+                    log_info!(
+                        "[hls-download] task {} no selector configured, defaulting to variant {}",
+                        task_id, idx
+                    );
+                    *idx
+                }
+            };
+            let variant = variants.get(idx as usize).ok_or_else(|| {
+                DownloadError::Other(format!(
+                    "invalid HLS quality index: {} (have {} variants)",
+                    idx,
+                    variants.len()
+                ))
+            })?;
+            log_info!(
+                "[hls-download] task {} using variant: bandwidth={}, resolution={:?}",
+                task_id, variant.bandwidth, variant.resolution
+            );
+            Ok(variant.uri.clone())
+        }
     }
 }
 
@@ -766,10 +754,7 @@ async fn select_variant(
 // Core logic
 // ---------------------------------------------------------------------------
 
-async fn run_hls_download_inner(
-    p: &DownloadParams,
-    quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
-) -> Result<i64, DownloadError> {
+async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
     log_info!("[hls-download] task {} starting, url={}", p.task_id, p.url);
 
     // Transition to status=5 (preparing)
@@ -800,7 +785,7 @@ async fn run_hls_download_inner(
     let (segments, media_sequence, media_playlist_url) = match content {
         M3u8Content::Master { variants } => {
             let selected_uri =
-                select_variant(&p.task_id, &variants, quality_rx, &p.cancel_token).await?;
+                select_variant(&p.task_id, &variants, p.selector.as_ref(), &p.cancel_token).await?;
 
             if p.cancel_token.is_cancelled() {
                 return Err(DownloadError::Cancelled);
@@ -1689,14 +1674,14 @@ async fn download_segment_once(
     // 结束,只写入部分字节;不校验会把截断分段静默 append 进输出造成缺帧/花屏,
     // 而任务被标记完成。对 ranged 请求,收到字节数也据此对齐到本子区间长度
     // (而非整文件)。返回 Err 触发上层 download_segment_with_retry 重试。
-    if let Some(expected) = declared_len {
-        if buf.len() as u64 != expected {
-            return Err(DownloadError::Other(format!(
-                "HLS segment truncated: got {} bytes, expected {}",
-                buf.len(),
-                expected
-            )));
-        }
+    if let Some(expected) = declared_len
+        && buf.len() as u64 != expected
+    {
+        return Err(DownloadError::Other(format!(
+            "HLS segment truncated: got {} bytes, expected {}",
+            buf.len(),
+            expected
+        )));
     }
 
     Ok(buf)

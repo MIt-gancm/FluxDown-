@@ -4,8 +4,7 @@ use std::sync::Arc;
 
 use futures_util::FutureExt;
 use reqwest::Client;
-use rinf::RustSignal;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -14,15 +13,14 @@ use crate::bt_downloader::{self, BtConfig, BtDownloadParams, SharedBtSession, To
 use crate::dash_downloader;
 use crate::db::Db;
 use crate::downloader::{self, DownloadParams, ProgressUpdate, SegmentProgressInfo};
+use crate::events::{EngineEvent, EventSink};
 use crate::ftp_downloader;
 use crate::hls_downloader;
 use crate::logger::log_info;
+use crate::model::{QueueInfo, QueuePosition, SegmentDetail, TaskInfo};
 use crate::proxy_config::ProxyConfig;
 use crate::segment_coordinator::is_single_conn_domain;
-use crate::signals::{
-    AllQueues, AllTasks, PriorityTaskChanged, QueueInfo, QueuePosition, QueuePositionsUpdate,
-    SegmentDetail, SegmentProgress, TaskInfo, TaskMetaProbed, TaskProgress,
-};
+use crate::selection::HostSelection;
 use crate::speed_limiter::SpeedLimiter;
 
 /// Extract a human-readable message from a panic payload.
@@ -163,12 +161,12 @@ fn is_bt_url(url: &str) -> bool {
 ///   2. absolute path    → `PathBuf::join` silently replaces `save_dir` entirely
 ///   3. `..` component    → path traversal that escapes `save_dir`
 ///   4. `.` (CurDir)      → `save_dir.join(".")` normalises back to `save_dir`,
-///                          so `name == "."` would target the save directory
-///                          itself (e.g. the user's Downloads folder).  Without
-///                          this guard the BT delete path could `remove_dir_all`
-///                          the entire save directory.
+///      so `name == "."` would target the save directory
+///      itself (e.g. the user's Downloads folder).  Without
+///      this guard the BT delete path could `remove_dir_all`
+///      the entire save directory.
 ///   5. Windows `Prefix`  → drive-relative names like `C:foo` would replace the
-///                          `save_dir` drive component.
+///      `save_dir` drive component.
 fn is_safe_file_name(name: &str) -> bool {
     use std::path::Component;
     if name.is_empty() {
@@ -196,6 +194,7 @@ fn is_safe_file_name(name: &str) -> bool {
 /// 行为与历史单任务 deferred 兜底保持一致：
 ///   - BT：删除最终路径（文件或目录）+ task-scoped staging 目录；
 ///   - 其它协议：删除 `.fdownloading` 临时文件 + 最终文件。
+///
 /// 所有删除均为 best-effort，缺失路径静默忽略。
 async fn deferred_file_cleanup(
     save_dir: String,
@@ -384,7 +383,7 @@ struct QueuedTask {
     /// 配合 `body` 字段一起重建 form-POST 等触发的下载请求事务。
     method: Option<String>,
     /// 浏览器扩展捕获的原始请求体（仅非 GET 时有意义）。
-    body: Option<crate::native_messaging::RequestBody>,
+    body: Option<downloader::CapturedRequestBody>,
 }
 
 /// All state associated with a single actively-running download task.
@@ -404,9 +403,6 @@ struct ActiveTaskEntry {
     /// `true` when this is a BitTorrent download (magnet / .torrent).
     /// Used to exclude BT tasks from the HTTP/FTP concurrency counter.
     is_bt: bool,
-    /// Oneshot sender for HLS/DASH quality selection.  `None` for all other
-    /// protocols; consumed by `send_hls_quality_selection`.
-    hls_quality_tx: Option<oneshot::Sender<i32>>,
     /// Named queue this task belongs to (empty string = default queue).
     /// Used for per-queue concurrency counting.
     queue_id: String,
@@ -422,7 +418,6 @@ pub struct DownloadManager {
     ///   • active_tokens   (CancellationToken + generation)
     ///   • active_handles  (JoinHandle)
     ///   • bt_task_ids     (HashSet membership flag)
-    ///   • hls_quality_senders (oneshot::Sender)
     ///   • active_task_queue   (queue_id string)
     active_tasks: HashMap<String, ActiveTaskEntry>,
     /// Monotonically increasing counter to distinguish different spawns of
@@ -502,6 +497,10 @@ pub struct DownloadManager {
     ///
     /// 由于整个 manager 运行在 `tokio::current_thread` 上，此字段无需加锁。
     reserved_temp_paths: HashSet<std::path::PathBuf>,
+    /// 引擎事件接收端(进度/队列变化/分段拆分等)——由宿主注入。
+    sink: Arc<dyn EventSink>,
+    /// 需要宿主介入决策的选择接口(HLS 画质/BT 文件选择)——由宿主注入。
+    selector: Arc<dyn HostSelection>,
 }
 
 /// Configuration parameters for [`DownloadManager::new`].
@@ -517,7 +516,12 @@ pub struct DownloadManagerConfig {
     pub user_agent: String,
 }
 impl DownloadManager {
-    pub fn new(db: Db, config: DownloadManagerConfig) -> Result<Self, downloader::DownloadError> {
+    pub fn new(
+        db: Db,
+        config: DownloadManagerConfig,
+        sink: Arc<dyn EventSink>,
+        selector: Arc<dyn HostSelection>,
+    ) -> Result<Self, downloader::DownloadError> {
         let DownloadManagerConfig {
             max_concurrent,
             speed_limit_bps,
@@ -563,6 +567,8 @@ impl DownloadManager {
             retry_tx,
             retry_rx: Some(retry_rx),
             reserved_temp_paths: HashSet::new(),
+            sink,
+            selector,
         })
     }
 
@@ -763,7 +769,7 @@ impl DownloadManager {
                     let _ = self.db.update_task_status(tid, 2, "").await;
 
                     if let Ok(Some(t)) = self.db.load_task_by_id(tid).await {
-                        TaskProgress {
+                        self.sink.emit(EngineEvent::TaskProgress {
                             task_id: tid.clone(),
                             status: 2,
                             downloaded_bytes: t.downloaded_bytes,
@@ -773,8 +779,7 @@ impl DownloadManager {
                             save_dir: t.save_dir.clone(),
                             url: t.url.clone(),
                             error_message: String::new(),
-                        }
-                        .send_signal_to_dart();
+                        });
 
                         self.send_segments_from_db(tid, t.total_bytes).await;
                     }
@@ -831,7 +836,8 @@ impl DownloadManager {
                 position: (i + 1) as i32,
             })
             .collect();
-        QueuePositionsUpdate { positions }.send_signal_to_dart();
+        self.sink
+            .emit(EngineEvent::QueuePositionsChanged(positions));
     }
 
     /// Load all named queues from the database into the in-memory cache.
@@ -1130,29 +1136,6 @@ impl DownloadManager {
         }
     }
 
-    /// Forward a quality selection from Dart to the waiting HLS download task.
-    pub fn send_hls_quality_selection(&mut self, task_id: &str, selected_index: i32) {
-        if let Some(entry) = self.active_tasks.get_mut(task_id)
-            && let Some(tx) = entry.hls_quality_tx.take()
-        {
-            let _ = tx.send(selected_index);
-            return;
-        }
-        {
-            log_info!(
-                "[manager] no pending HLS quality selection for task {}",
-                task_id
-            );
-        }
-    }
-
-    /// Forward user's BT file selection to the waiting download task.
-    pub async fn deliver_bt_file_selection(&self, task_id: &str, indices: Vec<i32>) {
-        if let Some(bt) = self.bt_session.as_ref() {
-            bt.deliver_file_selection(task_id, indices).await;
-        }
-    }
-
     pub async fn load_and_send_all_tasks(&mut self) {
         // 启动时将残留的 downloading/pending 状态矫正为 paused（仅首次执行）
         // 后续由 create_task / batch_create 触发时不重复重置，避免将刚插入的
@@ -1383,7 +1366,7 @@ impl DownloadManager {
             .map(|t| (t.task_id.clone(), t.total_bytes))
             .collect();
 
-        AllTasks { tasks }.send_signal_to_dart();
+        self.sink.emit(EngineEvent::TasksSnapshot(tasks));
 
         // Send persisted segment data for each task so the UI can display
         // download distribution immediately after app restart.
@@ -1392,14 +1375,14 @@ impl DownloadManager {
         }
     }
 
-    /// Load segment records from DB and send a `SegmentProgress` signal to Dart.
+    /// Load segment records from DB and emit a `SegmentProgress` event.
     /// Used when pausing and on app startup to restore the download distribution
     /// visualization without requiring an active download.
     async fn send_segments_from_db(&self, task_id: &str, total_bytes: i64) {
         if let Ok(db_segs) = self.db.load_segments(task_id).await
             && !db_segs.is_empty()
         {
-            SegmentProgress {
+            self.sink.emit(EngineEvent::SegmentProgress {
                 task_id: task_id.to_string(),
                 total_bytes,
                 segment_count: db_segs.len() as i32,
@@ -1412,8 +1395,7 @@ impl DownloadManager {
                         downloaded_bytes: s.downloaded_bytes,
                     })
                     .collect(),
-            }
-            .send_signal_to_dart();
+            });
         }
     }
 
@@ -1435,7 +1417,7 @@ impl DownloadManager {
         extra_headers: std::collections::HashMap<String, String>,
         selected_file_indices: Vec<i32>,
         method: Option<String>,
-        body: Option<crate::native_messaging::RequestBody>,
+        body: Option<downloader::CapturedRequestBody>,
     ) {
         let task_id = Uuid::new_v4().to_string();
         // When segments <= 0 ("auto"), store 0 in DB and let the downloader
@@ -1472,7 +1454,7 @@ impl DownloadManager {
             log_info!("save_torrent_file_bytes error: {}", e);
         }
 
-        TaskProgress {
+        self.sink.emit(EngineEvent::TaskProgress {
             task_id: task_id.clone(),
             status: 0,
             downloaded_bytes: 0,
@@ -1482,8 +1464,7 @@ impl DownloadManager {
             save_dir: save_dir.clone(),
             url: db_url.clone(),
             error_message: String::new(),
-        }
-        .send_signal_to_dart();
+        });
 
         // BT tasks bypass the HTTP/FTP concurrency queue — they are managed
         // by the shared librqbit session with its own concurrency controls.
@@ -1528,18 +1509,13 @@ impl DownloadManager {
             // F020：用任务的鉴权上下文（cookies/referrer/extra_headers）构造
             // probe 的 RequestSpec，使背景 HEAD probe 与真正下载请求一致，
             // 避免鉴权站点把缺鉴权的裸 HEAD 重定向到登录页污染 DB 文件名。
-            let probe_spec =
-                downloader::RequestSpec::from_nm(&crate::native_messaging::DownloadRequest {
-                    url: queued.url.clone(),
-                    filename: queued.file_name.clone(),
-                    referrer: queued.referrer.clone(),
-                    cookies: queued.cookies.clone(),
-                    headers: Some(queued.extra_headers.clone()),
-                    file_size: None,
-                    mime_type: None,
-                    method: queued.method.clone(),
-                    body: queued.body.clone(),
-                });
+            let probe_spec = downloader::RequestSpec::from_captured(
+                queued.method.as_deref(),
+                queued.cookies.clone(),
+                queued.referrer.clone(),
+                queued.extra_headers.clone(),
+                queued.body.clone(),
+            );
             self.pending_queue.push_back(queued);
             // 广播最新队列位置
             self.broadcast_queue_positions();
@@ -1550,6 +1526,7 @@ impl DownloadManager {
             // host/port，未解析的 System 代理 host/port 为空会被静默降级直连。实际
             // 下载路径(do_start_task/do_resume_task)均调 .resolve()，后台探测须对齐。
             let probe_proxy = self.proxy_config.resolve();
+            let probe_sink = self.sink.clone();
             tokio::spawn(async move {
                 let (name, size) = crate::meta_prober::probe_task_meta(
                     &probe_url,
@@ -1563,12 +1540,11 @@ impl DownloadManager {
                     if !name.is_empty() {
                         let _ = probe_db.update_task_file_name(&probe_tid, &name).await;
                     }
-                    TaskMetaProbed {
+                    probe_sink.emit(EngineEvent::TaskMetaProbed {
                         task_id: probe_tid,
                         file_name: name,
                         total_bytes: size,
-                    }
-                    .send_signal_to_dart();
+                    });
                 }
             });
         }
@@ -1650,7 +1626,6 @@ impl DownloadManager {
                 generation: spawn_gen,
                 handle: None,
                 is_bt: use_bt,
-                hls_quality_tx: None, // filled below for HLS/DASH
                 queue_id: queue_id.clone(),
             },
         );
@@ -1745,6 +1720,7 @@ impl DownloadManager {
                 pre_selected_indices: selected_file_indices,
                 skip_file_selection: false,
                 custom_name,
+                selector: self.selector.clone(),
             };
 
             tokio::spawn(async move {
@@ -1806,17 +1782,6 @@ impl DownloadManager {
             } else {
                 (self.client.clone(), self.proxy_config.resolve())
             };
-
-            let hls_quality_rx = if use_hls || use_dash {
-                let (tx, rx) = oneshot::channel();
-                if let Some(entry) = self.active_tasks.get_mut(&task_id) {
-                    entry.hls_quality_tx = Some(tx);
-                }
-                Some(rx)
-            } else {
-                None
-            };
-
             // ---------------------------------------------------------------
             // 文件名最终决策：manager 是文件名的唯一决策者
             //
@@ -1863,18 +1828,13 @@ impl DownloadManager {
                 // F020：probe 携带任务的鉴权上下文（cookies/referrer/extra_headers），
                 // 与下方真正下载用的 `spec` 同源，避免鉴权站点把缺鉴权的裸 HEAD
                 // 重定向到登录页、用错误页的 Content-Disposition 污染文件名。
-                let probe_spec =
-                    downloader::RequestSpec::from_nm(&crate::native_messaging::DownloadRequest {
-                        url: url.clone(),
-                        filename: file_name.clone(),
-                        referrer: referrer.clone(),
-                        cookies: cookies.clone(),
-                        headers: Some(extra_headers.clone()),
-                        file_size: None,
-                        mime_type: None,
-                        method: method.clone(),
-                        body: body.clone(),
-                    });
+                let probe_spec = downloader::RequestSpec::from_captured(
+                    method.as_deref(),
+                    cookies.clone(),
+                    referrer.clone(),
+                    extra_headers.clone(),
+                    body.clone(),
+                );
                 let (probed_name, _probed_size) = crate::meta_prober::probe_task_meta(
                     &url,
                     &file_name,
@@ -1886,12 +1846,11 @@ impl DownloadManager {
                 if !probed_name.is_empty() {
                     file_name = probed_name;
                     let _ = self.db.update_task_file_name(&task_id, &file_name).await;
-                    TaskMetaProbed {
+                    self.sink.emit(EngineEvent::TaskMetaProbed {
                         task_id: task_id.clone(),
                         file_name: file_name.clone(),
                         total_bytes: 0,
-                    }
-                    .send_signal_to_dart();
+                    });
                 }
             }
 
@@ -1961,18 +1920,13 @@ impl DownloadManager {
             // 构造完整 HTTP 请求事务规格——method/body 来自浏览器扩展，
             // 用于在 form-POST 等非 GET 触发的下载场景中一比一重建原始请求。
             // 参见 downloader.rs 中 RequestSpec / build_request 的设计动机。
-            let spec =
-                downloader::RequestSpec::from_nm(&crate::native_messaging::DownloadRequest {
-                    url: url.clone(),
-                    filename: file_name.clone(),
-                    referrer: referrer.clone(),
-                    cookies: cookies.clone(),
-                    headers: Some(extra_headers.clone()),
-                    file_size: None,
-                    mime_type: None,
-                    method: method.clone(),
-                    body: body.clone(),
-                });
+            let spec = downloader::RequestSpec::from_captured(
+                method.as_deref(),
+                cookies.clone(),
+                referrer.clone(),
+                extra_headers.clone(),
+                body.clone(),
+            );
 
             let params = DownloadParams {
                 task_id: task_id.clone(),
@@ -1990,7 +1944,8 @@ impl DownloadManager {
                 referrer,
                 hint_file_size,
                 proxy_config: task_proxy,
-                hls_quality_rx,
+                sink: self.sink.clone(),
+                selector: self.selector.clone(),
                 checksum,
                 extra_headers,
                 spec,
@@ -2042,7 +1997,7 @@ impl DownloadManager {
             self.broadcast_queue_positions();
             let _ = self.db.update_task_status(task_id, 2, "").await;
             if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
-                TaskProgress {
+                self.sink.emit(EngineEvent::TaskProgress {
                     task_id: task_id.to_string(),
                     status: 2,
                     downloaded_bytes: t.downloaded_bytes,
@@ -2052,8 +2007,7 @@ impl DownloadManager {
                     save_dir: t.save_dir.clone(),
                     url: t.url.clone(),
                     error_message: String::new(),
-                }
-                .send_signal_to_dart();
+                });
             }
             return;
         }
@@ -2073,7 +2027,7 @@ impl DownloadManager {
             let _ = self.db.update_task_status(task_id, 2, "").await;
 
             if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
-                TaskProgress {
+                self.sink.emit(EngineEvent::TaskProgress {
                     task_id: task_id.to_string(),
                     status: 2,
                     downloaded_bytes: t.downloaded_bytes,
@@ -2083,8 +2037,7 @@ impl DownloadManager {
                     save_dir: t.save_dir.clone(),
                     url: t.url.clone(),
                     error_message: String::new(),
-                }
-                .send_signal_to_dart();
+                });
 
                 // Send persisted segment data so the UI retains the download
                 // distribution visualization after pausing.
@@ -2193,7 +2146,7 @@ impl DownloadManager {
                 // Notify Dart: task is now queued (pending), not actively resuming.
                 // Without this signal, the UI keeps all tasks stuck in "resuming" status
                 // even though only max_concurrent are actually downloading.
-                TaskProgress {
+                self.sink.emit(EngineEvent::TaskProgress {
                     task_id: task_id.to_string(),
                     status: 0, // pending/queued
                     downloaded_bytes: t.downloaded_bytes,
@@ -2203,8 +2156,7 @@ impl DownloadManager {
                     save_dir: t.save_dir.clone(),
                     url: t.url.clone(),
                     error_message: String::new(),
-                }
-                .send_signal_to_dart();
+                });
                 self.pending_queue.push_back(QueuedTask {
                     task_id: task_id.to_string(),
                     url: t.url,
@@ -2294,7 +2246,6 @@ impl DownloadManager {
                 generation: spawn_gen,
                 handle: None,
                 is_bt: use_bt,
-                hls_quality_tx: None,
                 queue_id: task.queue_id.clone(),
             },
         );
@@ -2466,6 +2417,7 @@ impl DownloadManager {
                 pre_selected_indices,
                 skip_file_selection,
                 custom_name,
+                selector: self.selector.clone(),
             };
 
             tokio::spawn(async move {
@@ -2508,16 +2460,6 @@ impl DownloadManager {
                 (self.client.clone(), self.proxy_config.resolve())
             };
 
-            let hls_quality_rx = if use_hls || use_dash {
-                let (tx, rx) = oneshot::channel();
-                if let Some(entry) = self.active_tasks.get_mut(task_id) {
-                    entry.hls_quality_tx = Some(tx);
-                }
-                Some(rx)
-            } else {
-                None
-            };
-
             let params = DownloadParams {
                 task_id: tid.clone(),
                 url: task.url,
@@ -2534,7 +2476,8 @@ impl DownloadManager {
                 referrer: String::new(), // referrer not persisted; not needed for resume
                 hint_file_size: 0,       // no hint on resume; use probe to get current size
                 proxy_config: task_proxy,
-                hls_quality_rx,
+                sink: self.sink.clone(),
+                selector: self.selector.clone(),
                 checksum: task.checksum,
                 extra_headers: std::collections::HashMap::new(), // 恢复任务无额外请求头
                 // 恢复任务无浏览器请求上下文 → GET 重发（既往行为，本次重构不改变）。
@@ -2621,7 +2564,7 @@ impl DownloadManager {
             _ => Default::default(),
         };
 
-        TaskProgress {
+        self.sink.emit(EngineEvent::TaskProgress {
             task_id: task_id.to_string(),
             status: 4,
             downloaded_bytes: 0,
@@ -2631,8 +2574,7 @@ impl DownloadManager {
             save_dir,
             url,
             error_message: CANCELLED_ERROR_MESSAGE.to_string(),
-        }
-        .send_signal_to_dart();
+        });
 
         // A slot freed up — try to start queued tasks.
         self.drain_queue().await;
@@ -3110,13 +3052,12 @@ impl DownloadManager {
                 // for handle (if any) then signal immediately.
                 cleanup_futs.push(tokio::spawn(async move {
                     // 超时后 abort，与其它清理路径一致（F011）。
-                    if let Some(mut h) = maybe_handle {
-                        if tokio::time::timeout(std::time::Duration::from_secs(10), &mut h)
+                    if let Some(mut h) = maybe_handle
+                        && tokio::time::timeout(std::time::Duration::from_secs(10), &mut h)
                             .await
                             .is_err()
-                        {
-                            h.abort();
-                        }
+                    {
+                        h.abort();
                     }
                     let _ = ptx
                         .send(ProgressUpdate {
@@ -3226,7 +3167,7 @@ impl DownloadManager {
                 self.max_concurrent,
                 queue_id
             );
-            TaskProgress {
+            self.sink.emit(EngineEvent::TaskProgress {
                 task_id: task_id.to_string(),
                 status: 0,
                 downloaded_bytes: task_row.downloaded_bytes,
@@ -3236,8 +3177,7 @@ impl DownloadManager {
                 save_dir: task_row.save_dir.clone(),
                 url: task_row.url.clone(),
                 error_message: String::new(),
-            }
-            .send_signal_to_dart();
+            });
             self.pending_queue.push_back(QueuedTask {
                 task_id: task_id.to_string(),
                 url: task_row.url,
@@ -3304,7 +3244,7 @@ impl DownloadManager {
     /// Broadcast the current list of named queues to Dart.
     pub async fn send_all_queues(&self) {
         match self.db.load_all_queues().await {
-            Ok(queues) => AllQueues { queues }.send_signal_to_dart(),
+            Ok(queues) => self.sink.emit(EngineEvent::QueuesChanged(queues)),
             Err(e) => log_info!("[manager] load_all_queues error: {}", e),
         }
     }
@@ -3565,11 +3505,10 @@ impl DownloadManager {
             self.auto_paused_ids.len()
         );
 
-        PriorityTaskChanged {
+        self.sink.emit(EngineEvent::PriorityTaskChanged {
             priority_task_id: task_id,
             auto_paused_count: self.auto_paused_ids.len() as i32,
-        }
-        .send_signal_to_dart();
+        });
     }
 
     /// Cancel boost mode and resume all auto-paused tasks.
@@ -3602,11 +3541,10 @@ impl DownloadManager {
         // 此次广播确保 Dart 在收到 PriorityTaskChanged 时已知道哪些任务在队列中
         // （queuePosition > 0），使 pauseAll 能正确识别并暂停它们。
         self.broadcast_queue_positions();
-        PriorityTaskChanged {
+        self.sink.emit(EngineEvent::PriorityTaskChanged {
             priority_task_id: String::new(),
             auto_paused_count: 0,
-        }
-        .send_signal_to_dart();
+        });
     }
 }
 
@@ -3632,7 +3570,11 @@ const SPEED_DECAY_FACTOR: f64 = 0.5;
 /// flooding the signal channel when many segments report simultaneously.
 const MIN_DART_INTERVAL_MS: u128 = 500;
 
-pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
+pub async fn progress_reporter(
+    mut rx: mpsc::Receiver<ProgressUpdate>,
+    db: Db,
+    sink: Arc<dyn EventSink>,
+) {
     let mut states: HashMap<String, TaskSpeedState> = HashMap::new();
     // Track last time we sent a signal to Dart per task (rate limiting).
     let mut last_dart_send: HashMap<String, std::time::Instant> = HashMap::new();
@@ -3764,7 +3706,7 @@ pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
             // Terminal states (completed / error / paused) should report zero
             // speed so the UI doesn't show a stale EMA value.
             let report_speed = if is_terminal { 0 } else { smoothed_speed };
-            TaskProgress {
+            sink.emit(EngineEvent::TaskProgress {
                 task_id: update.task_id.clone(),
                 status: update.status,
                 downloaded_bytes: update.downloaded_bytes,
@@ -3774,8 +3716,7 @@ pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
                 save_dir: String::new(),
                 url: String::new(),
                 error_message: update.error_message.clone(),
-            }
-            .send_signal_to_dart();
+            });
 
             // Send segment-level progress for IDM-style visualization.
             // Use the cached snapshot (updated on every incoming update)
@@ -3813,13 +3754,12 @@ pub async fn progress_reporter(mut rx: mpsc::Receiver<ProgressUpdate>, db: Db) {
                 // this branch fires up to twice per second per task and the
                 // resulting "sending SegmentProgress" lines carry no
                 // diagnostic value while dominating the log volume.
-                SegmentProgress {
+                sink.emit(EngineEvent::SegmentProgress {
                     task_id: update.task_id.clone(),
                     total_bytes: update.total_bytes,
                     segment_count: segs.len() as i32,
                     segments: final_segs,
-                }
-                .send_signal_to_dart();
+                });
                 state.logged_missing_segments = false;
             } else if !state.logged_missing_segments {
                 // Genuine anomaly (segment panel will stay empty), but it

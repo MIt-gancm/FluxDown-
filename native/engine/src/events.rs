@@ -1,0 +1,124 @@
+//! 引擎向宿主(hub/CLI/Server/...)上报的事件,以及事件接收端 trait。
+//!
+//! 每个 [`EngineEvent`] 变体的字段与 `hub::signals` 中对应的现有信号结构体
+//! 逐字段 1:1 展开(不改名、不改类型、不增删字段),字段顺序以
+//! `hub/src/signals/mod.rs` 当前定义为准。`hub` 侧的 `RinfEventSink` 实现
+//! 把每个变体 match 回具体信号类型并调用 `.send_signal_to_dart()`。
+
+use crate::model::{QueueInfo, QueuePosition, SegmentDetail, TaskInfo};
+
+/// 引擎运行期间产生的、宿主需要感知的事件。
+///
+/// `#[non_exhaustive]`:未来新增变体不算破坏性变更,强制所有 match 都带
+/// `_ => {}` 兜底分支。
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum EngineEvent {
+    /// 任务进度更新,下载过程中周期性发送。对应 `hub::signals::TaskProgress`。
+    TaskProgress {
+        task_id: String,
+        /// 0=pending, 1=downloading, 2=paused, 3=completed, 4=error, 5=preparing
+        status: i32,
+        downloaded_bytes: i64,
+        total_bytes: i64,
+        /// 字节/秒
+        speed: i64,
+        file_name: String,
+        save_dir: String,
+        url: String,
+        /// 无错误时为空
+        error_message: String,
+    },
+
+    /// 响应"请求全部任务" — 全部持久化任务快照。对应 `hub::signals::AllTasks`。
+    TasksSnapshot(Vec<TaskInfo>),
+
+    /// 分段级进度,用于下载可视化(IDM 风格)。对应 `hub::signals::SegmentProgress`。
+    SegmentProgress {
+        task_id: String,
+        total_bytes: i64,
+        /// 分段数量(1 = 单线程下载)
+        segment_count: i32,
+        segments: Vec<SegmentDetail>,
+    },
+
+    /// 队列任务探测到元数据。对应 `hub::signals::TaskMetaProbed`。
+    TaskMetaProbed {
+        task_id: String,
+        /// 空 = 无法探测
+        file_name: String,
+        /// 0 = 未知
+        total_bytes: i64,
+    },
+
+    /// 队列位置批量更新 — 每次队列变化时广播。对应 `hub::signals::QueuePositionsUpdate`。
+    QueuePositionsChanged(Vec<QueuePosition>),
+
+    /// 全部命名队列 — 启动时与任意队列变化后发送。对应 `hub::signals::AllQueues`。
+    QueuesChanged(Vec<QueueInfo>),
+
+    /// Boost 模式的优先下载任务发生变化。对应 `hub::signals::PriorityTaskChanged`。
+    PriorityTaskChanged {
+        /// 当前优先任务 ID。空字符串 = Boost 模式未激活。
+        priority_task_id: String,
+        /// 为释放带宽而被自动暂停的任务数量。
+        auto_paused_count: i32,
+    },
+
+    /// 动态分段拆分发生通知(IDM 风格协调器),实时发送以便 UI 播放拆分动画。
+    /// 对应 `hub::signals::SegmentSplitEvent`。
+    SegmentSplit {
+        task_id: String,
+        /// 被缩小的父分段索引。
+        parent_index: i32,
+        /// 拆分后父分段的新 end_byte。
+        parent_new_end: i64,
+        /// 新建子分段的索引。
+        child_index: i32,
+        /// 新子分段的起始字节(= 拆分点)。
+        child_start: i64,
+        /// 新子分段的结束字节(= 父分段原 end)。
+        child_end: i64,
+        /// 是否为主动拆分(true)还是抢救式/按需拆分(false)。
+        is_proactive: bool,
+        /// 拆分后的当前分段总数。
+        total_segments: i32,
+    },
+}
+
+/// 引擎事件的接收端,由宿主实现并注入 [`crate::Engine`]。
+///
+/// # 契约(实现者必须遵守)
+///
+/// `emit` 是**同步**方法,fire-and-forget 语义 —— 依据是现有全部
+/// `.send_signal_to_dart()` 调用点均为无 `.await` 的同步调用惯例,做成
+/// async trait 会强迫所有调用点新增 `.await` 却无对应行为收益。
+///
+/// 实现**不得**执行阻塞操作或长时间持锁;任何异步/耗时工作必须由实现
+/// 自行 `spawn`,不得让调用方等待 —— 因为 `hub` 侧的调用方运行在单线程
+/// `current_thread` runtime 上,`emit` 内部阻塞会 stall 整个 runtime 上的
+/// 所有任务。
+pub trait EventSink: Send + Sync {
+    /// 上报一个引擎事件。必须立即返回,不得阻塞或长时间持锁(见 trait 文档)。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use fluxdown_engine::events::{EngineEvent, EventSink};
+    ///
+    /// struct PrintSink;
+    /// impl EventSink for PrintSink {
+    ///     fn emit(&self, event: EngineEvent) {
+    ///         println!("{event:?}");
+    ///     }
+    /// }
+    ///
+    /// let sink = PrintSink;
+    /// sink.emit(EngineEvent::TaskMetaProbed {
+    ///     task_id: "abc".to_string(),
+    ///     file_name: "video.mp4".to_string(),
+    ///     total_bytes: 1024,
+    /// });
+    /// ```
+    fn emit(&self, event: EngineEvent);
+}

@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
+use crate::events::EventSink;
 use crate::logger::log_info;
 use crate::speed_limiter::SpeedLimiter;
 
@@ -124,6 +125,8 @@ pub struct DownloadParams {
     pub cancel_token: CancellationToken,
     /// Global speed limiter — shared across all concurrent downloads.
     pub speed_limiter: SpeedLimiter,
+    /// 引擎事件接收端(进度/分段拆分等)——由宿主注入。
+    pub sink: std::sync::Arc<dyn EventSink>,
     /// Browser cookies for authenticated downloads (e.g. GitHub private repos).
     /// Format: "name1=val1; name2=val2"
     ///
@@ -142,10 +145,9 @@ pub struct DownloadParams {
     /// Proxy configuration — used by FTP downloader for SOCKS/HTTP CONNECT tunneling.
     /// HTTP downloads use the proxy via the `client` field (already configured).
     pub proxy_config: crate::proxy_config::ProxyConfig,
-    /// HLS quality selection: when set, the HLS downloader sends quality
-    /// options to Dart via signal and awaits the chosen variant index on this
-    /// channel.  `None` for non-HLS downloads (HTTP/FTP/BT).
-    pub hls_quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
+    /// HLS/DASH 画质选择:需要宿主介入决策时通过此 trait 发起等待。
+    /// 非 HLS/DASH 下载(HTTP/FTP/BT)也必须提供(可用 `NoopSelection`)。
+    pub selector: std::sync::Arc<dyn crate::selection::HostSelection>,
     /// Checksum spec for post-download integrity verification.
     /// Format: "algo=hexhash", e.g. "sha-256=abc123..." or "md5=d41d8c...".
     /// Empty = skip verification.
@@ -276,9 +278,28 @@ pub struct RequestSpec {
     pub body: Option<RequestBodyDecoded>,
 }
 
+/// 浏览器扩展/Native Messaging 捕获的原始请求体——引擎侧的传输无关表示。
+/// `hub` 侧从 `native_messaging::RequestBody`(wire 格式,字段名受 NM 协议
+/// 约束)转换为此类型后再调用 [`RequestSpec::from_captured`],使得
+/// `downloader`/`download_manager` 不直接依赖 `native_messaging`。
+#[derive(Debug, Clone)]
+pub enum CapturedRequestBody {
+    FormData {
+        fields: std::collections::HashMap<String, Vec<String>>,
+    },
+    Urlencoded {
+        raw: String,
+    },
+    /// `bytes_b64`：base64 编码的原始字节(XHR/fetch 直接发送 ArrayBuffer 场景)。
+    Raw {
+        bytes_b64: String,
+        content_type: Option<String>,
+    },
+}
+
 impl RequestSpec {
     /// 默认 GET、无 cookies/headers/body——用于 download_manager 内部的"裸"
-    /// HTTP 请求场景（如 BT/HLS 元数据获取，无浏览器会话上下文）。
+    /// HTTP 请求场景(如 BT/HLS 元数据获取,无浏览器会话上下文)。
     pub fn empty_get() -> Self {
         Self {
             method: reqwest::Method::GET,
@@ -290,62 +311,64 @@ impl RequestSpec {
     }
 
     /// GET / HEAD 请求——可以多段下载、可以做 HEAD probe。
-    /// 其他 method（POST/PUT/PATCH/DELETE/...）一律强制单流，跳过 HEAD probe。
+    /// 其他 method(POST/PUT/PATCH/DELETE/...)一律强制单流,跳过 HEAD probe。
     pub fn is_get_like(&self) -> bool {
         self.method == reqwest::Method::GET || self.method == reqwest::Method::HEAD
     }
 
-    /// 从 NM 协议消息构造。
+    /// 从浏览器扩展/Native Messaging 捕获的原始字段构造。
     ///
-    /// `method` 解析失败（非法字符串）时回退为 GET 并记录日志，确保单一坏请求
+    /// `method` 解析失败(非法字符串)时回退为 GET 并记录日志,确保单一坏请求
     /// 不会让整个下载链路崩溃。
-    /// `body` 解码失败（base64 错误等）时回退为 None。
-    pub fn from_nm(req: &crate::native_messaging::DownloadRequest) -> Self {
+    /// `body` 解码失败(base64 错误等)时回退为 None。
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_captured(
+        method: Option<&str>,
+        cookies: String,
+        referrer: String,
+        extra_headers: std::collections::HashMap<String, String>,
+        body: Option<CapturedRequestBody>,
+    ) -> Self {
         use base64::Engine;
 
-        let method = req
-            .method
-            .as_deref()
+        let method = method
             .and_then(|s| {
                 let upper = s.trim().to_ascii_uppercase();
                 reqwest::Method::from_bytes(upper.as_bytes()).ok()
             })
             .unwrap_or(reqwest::Method::GET);
 
-        let body = req.body.as_ref().and_then(|b| {
-            use crate::native_messaging::RequestBody as NmBody;
-            match b {
-                NmBody::FormData { fields } => {
-                    let mut pairs: Vec<(String, String)> = Vec::new();
-                    for (k, vs) in fields {
-                        for v in vs {
-                            pairs.push((k.clone(), v.clone()));
-                        }
+        let body = body.and_then(|b| match b {
+            CapturedRequestBody::FormData { fields } => {
+                let mut pairs: Vec<(String, String)> = Vec::new();
+                for (k, vs) in fields {
+                    for v in vs {
+                        pairs.push((k.clone(), v.clone()));
                     }
-                    Some(RequestBodyDecoded::Form(pairs))
                 }
-                NmBody::Urlencoded { raw } => Some(RequestBodyDecoded::Urlencoded(raw.clone())),
-                NmBody::Raw {
-                    bytes_b64,
-                    content_type,
-                } => match base64::engine::general_purpose::STANDARD.decode(bytes_b64) {
-                    Ok(bytes) => Some(RequestBodyDecoded::Raw {
-                        bytes,
-                        content_type: content_type.clone(),
-                    }),
-                    Err(e) => {
-                        log_info!("[request-spec] failed to base64-decode raw body: {}", e);
-                        None
-                    }
-                },
+                Some(RequestBodyDecoded::Form(pairs))
             }
+            CapturedRequestBody::Urlencoded { raw } => Some(RequestBodyDecoded::Urlencoded(raw)),
+            CapturedRequestBody::Raw {
+                bytes_b64,
+                content_type,
+            } => match base64::engine::general_purpose::STANDARD.decode(&bytes_b64) {
+                Ok(bytes) => Some(RequestBodyDecoded::Raw {
+                    bytes,
+                    content_type,
+                }),
+                Err(e) => {
+                    log_info!("[request-spec] failed to base64-decode raw body: {}", e);
+                    None
+                }
+            },
         });
 
         Self {
             method,
-            cookies: req.cookies.clone(),
-            referrer: req.referrer.clone(),
-            extra_headers: req.headers.clone().unwrap_or_default(),
+            cookies,
+            referrer,
+            extra_headers,
             body,
         }
     }
@@ -379,29 +402,27 @@ pub fn build_request(
     }
     req = apply_extra_headers(req, &spec.extra_headers);
 
-    if attaches_body {
-        if let Some(body) = &spec.body {
-            match body {
-                RequestBodyDecoded::Form(pairs) => {
-                    req = req.form(pairs);
+    if attaches_body && let Some(body) = &spec.body {
+        match body {
+            RequestBodyDecoded::Form(pairs) => {
+                req = req.form(pairs);
+            }
+            RequestBodyDecoded::Urlencoded(raw) => {
+                req = req
+                    .header(
+                        reqwest::header::CONTENT_TYPE,
+                        "application/x-www-form-urlencoded",
+                    )
+                    .body(raw.clone());
+            }
+            RequestBodyDecoded::Raw {
+                bytes,
+                content_type,
+            } => {
+                if let Some(ct) = content_type {
+                    req = req.header(reqwest::header::CONTENT_TYPE, ct);
                 }
-                RequestBodyDecoded::Urlencoded(raw) => {
-                    req = req
-                        .header(
-                            reqwest::header::CONTENT_TYPE,
-                            "application/x-www-form-urlencoded",
-                        )
-                        .body(raw.clone());
-                }
-                RequestBodyDecoded::Raw {
-                    bytes,
-                    content_type,
-                } => {
-                    if let Some(ct) = content_type {
-                        req = req.header(reqwest::header::CONTENT_TYPE, ct);
-                    }
-                    req = req.body(bytes.clone());
-                }
+                req = req.body(bytes.clone());
             }
         }
     }
@@ -2122,7 +2143,10 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
     //     新尾部"静默拼接（BUG-HTTP-SINGLE-RESUME-SPLICE）。仅靠本次 probe 值无法
     //     检出：续传 probe 看到的已是新版本，validator 自洽却与磁盘旧数据不符。
     let (resume_etag, resume_last_modified) = if p.is_resume {
-        let (oe, olm) = p.db.get_task_validator(&p.task_id).await.unwrap_or_default();
+        let (oe, olm) =
+            p.db.get_task_validator(&p.task_id)
+                .await
+                .unwrap_or_default();
         if oe.is_empty() && olm.is_empty() {
             // 旧任务（升级前创建、无存档）或首次下载时服务器未提供 validator →
             // 退回本次 probe 值（退化为旧行为，不会更糟）。
@@ -2135,10 +2159,9 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             // 失败仅记日志（不阻断下载）：若存储失败，将来续传会 get 到空值并
             // 回退到"用续传时重新 probe 的 validator"——退化为旧行为，可能无法检出
             // 跨会话文件变化（单流续传拼接的残余风险）。记日志使该退化可观测。
-            if let Err(e) = p
-                .db
-                .set_task_validator(&p.task_id, &info.etag, &info.last_modified)
-                .await
+            if let Err(e) =
+                p.db.set_task_validator(&p.task_id, &info.etag, &info.last_modified)
+                    .await
             {
                 log_info!(
                     "[download] task {} 警告：持久化 resume validator 失败：{:?}（续传一致性校验可能退化）",
@@ -2265,6 +2288,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
             &p.cancel_token,
             &p.speed_limiter,
             &p.spec,
+            p.sink.as_ref(),
             &resume_etag,
             &resume_last_modified,
         )
@@ -2778,9 +2802,8 @@ async fn download_single(
     // resp 为 200 全量压缩流）；此处 encoding 守卫确保万一上方逻辑未覆盖某种
     // 边界（如重发后服务器仍返回 206+encoding）也绝不会把压缩字节范围当作可
     // append 的续传数据，避免静默损坏。
-    let actual_resume = want_resume
-        && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-        && encoding.is_none();
+    let actual_resume =
+        want_resume && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT && encoding.is_none();
 
     if want_resume && !actual_resume {
         log_info!(
@@ -2939,6 +2962,7 @@ async fn download_multi_segment(
     cancel_token: &CancellationToken,
     speed_limiter: &SpeedLimiter,
     spec: &RequestSpec,
+    sink: &dyn EventSink,
     etag: &str,
     last_modified: &str,
 ) -> Result<(), DownloadError> {
@@ -2971,6 +2995,7 @@ async fn download_multi_segment(
         cancel_token,
         speed_limiter,
         spec,
+        sink,
         etag,
         last_modified,
     )
@@ -3935,101 +3960,6 @@ mod tests {
             body: None,
         };
         assert!(!spec.is_get_like());
-    }
-
-    #[test]
-    fn request_spec_from_nm_defaults_to_get_when_method_missing() {
-        let nm_req = crate::native_messaging::DownloadRequest {
-            url: "https://example.com/file.zip".to_string(),
-            filename: String::new(),
-            referrer: String::new(),
-            cookies: String::new(),
-            headers: None,
-            file_size: None,
-            mime_type: None,
-            method: None,
-            body: None,
-        };
-        let spec = super::RequestSpec::from_nm(&nm_req);
-        assert_eq!(spec.method, reqwest::Method::GET);
-    }
-
-    #[test]
-    fn request_spec_from_nm_parses_post_with_form_body() {
-        let mut fields = std::collections::HashMap::new();
-        fields.insert("autodl".to_string(), vec!["2".to_string()]);
-        fields.insert("updates".to_string(), vec!["1".to_string()]);
-        let nm_req = crate::native_messaging::DownloadRequest {
-            url: "https://uupdump.net/get.php".to_string(),
-            filename: String::new(),
-            referrer: String::new(),
-            cookies: String::new(),
-            headers: None,
-            file_size: None,
-            mime_type: None,
-            method: Some("POST".to_string()),
-            body: Some(crate::native_messaging::RequestBody::FormData { fields }),
-        };
-        let spec = super::RequestSpec::from_nm(&nm_req);
-        assert_eq!(spec.method, reqwest::Method::POST);
-        assert!(!spec.is_get_like());
-        match &spec.body {
-            Some(super::RequestBodyDecoded::Form(pairs)) => {
-                assert_eq!(pairs.len(), 2);
-                assert!(pairs.iter().any(|(k, v)| k == "autodl" && v == "2"));
-                assert!(pairs.iter().any(|(k, v)| k == "updates" && v == "1"));
-            }
-            other => panic!("expected Form body, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn request_spec_from_nm_decodes_raw_body_base64() {
-        use base64::Engine;
-        let raw = b"hello world";
-        let b64 = base64::engine::general_purpose::STANDARD.encode(raw);
-        let nm_req = crate::native_messaging::DownloadRequest {
-            url: "https://example.com".to_string(),
-            filename: String::new(),
-            referrer: String::new(),
-            cookies: String::new(),
-            headers: None,
-            file_size: None,
-            mime_type: None,
-            method: Some("PUT".to_string()),
-            body: Some(crate::native_messaging::RequestBody::Raw {
-                bytes_b64: b64,
-                content_type: Some("application/octet-stream".to_string()),
-            }),
-        };
-        let spec = super::RequestSpec::from_nm(&nm_req);
-        match &spec.body {
-            Some(super::RequestBodyDecoded::Raw {
-                bytes,
-                content_type,
-            }) => {
-                assert_eq!(bytes, raw);
-                assert_eq!(content_type.as_deref(), Some("application/octet-stream"));
-            }
-            other => panic!("expected Raw body, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn request_spec_from_nm_invalid_method_falls_back_to_get() {
-        let nm_req = crate::native_messaging::DownloadRequest {
-            url: "https://example.com".to_string(),
-            filename: String::new(),
-            referrer: String::new(),
-            cookies: String::new(),
-            headers: None,
-            file_size: None,
-            mime_type: None,
-            method: Some("BAD METHOD".to_string()), // 含空格的非法 method
-            body: None,
-        };
-        let spec = super::RequestSpec::from_nm(&nm_req);
-        assert_eq!(spec.method, reqwest::Method::GET);
     }
 
     #[test]

@@ -280,7 +280,13 @@ async fn write_response(stream: &mut TcpStream, status: u16, status_text: &str, 
 }
 
 /// 写一个 `{"success":bool,"message":...}` 形态的响应。
-async fn write_result(stream: &mut TcpStream, status: u16, status_text: &str, success: bool, message: &str) {
+async fn write_result(
+    stream: &mut TcpStream,
+    status: u16,
+    status_text: &str,
+    success: bool,
+    message: &str,
+) {
     let body = json!({ "success": success, "message": message }).to_string();
     write_response(stream, status, status_text, &body).await;
 }
@@ -303,7 +309,10 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// 校验 token（若服务端配置了 token）。
@@ -344,7 +353,7 @@ async fn handle_connection(
 ) {
     let req = match tokio::time::timeout(HEADER_TIMEOUT, read_request(&mut stream)).await {
         Ok(Ok(Some(req))) => req,
-        Ok(Ok(None)) => return,        // 连接干净关闭
+        Ok(Ok(None)) => return, // 连接干净关闭
         Ok(Err(e)) => {
             log_info!("[http-takeover] read error: {}", e);
             write_result(&mut stream, 400, "Bad Request", false, "malformed request").await;
@@ -436,7 +445,14 @@ async fn handle_download(
         Ok(()) => write_result(stream, 200, "OK", true, "download accepted").await,
         Err(_) => {
             // actor 已退出（应用关闭中）。
-            write_result(stream, 503, "Service Unavailable", false, "app shutting down").await;
+            write_result(
+                stream,
+                503,
+                "Service Unavailable",
+                false,
+                "app shutting down",
+            )
+            .await;
         }
     }
 }
@@ -669,8 +685,11 @@ async fn dispatch_method(
         "system.listMethods" => rpc_ok(
             id,
             json!([
-                "aria2.addUri", "aria2.getVersion", "aria2.getGlobalStat",
-                "system.multicall", "system.listMethods"
+                "aria2.addUri",
+                "aria2.getVersion",
+                "aria2.getGlobalStat",
+                "system.multicall",
+                "system.listMethods"
             ]),
         ),
         other => rpc_err(id, -32601, &format!("Method not found: {other}")),
@@ -680,7 +699,11 @@ async fn dispatch_method(
 /// 实现 `system.multicall`：`params = [ [ {methodName, params}, ... ] ]`。
 /// 每个子调用的成功结果按 aria2 约定包裹成单元素数组。
 async fn system_multicall(id: &Value, params: &Value, tx: &mpsc::Sender<DownloadRequest>) -> Value {
-    let calls = match params.as_array().and_then(|a| a.first()).and_then(|v| v.as_array()) {
+    let calls = match params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_array())
+    {
         Some(c) => c,
         None => return rpc_err(id, -32602, "system.multicall expects an array of calls"),
     };
@@ -734,10 +757,10 @@ fn aria2_add_uri_to_download_request(params: &Value) -> Result<DownloadRequest, 
 
     // 跳过可能存在的 "token:xxx" 前缀参数。
     let mut idx = 0;
-    if let Some(first) = arr.first().and_then(|v| v.as_str()) {
-        if first.starts_with("token:") {
-            idx = 1;
-        }
+    if let Some(first) = arr.first().and_then(|v| v.as_str())
+        && first.starts_with("token:")
+    {
+        idx = 1;
     }
 
     let uris = arr
@@ -910,7 +933,10 @@ mod tests {
         assert_eq!(dl.filename, "file.zip");
         assert_eq!(dl.cookies, "a=b");
         assert_eq!(dl.file_size, Some(1024));
-        assert_eq!(dl.headers.unwrap().get("Authorization").unwrap(), "Bearer x");
+        assert_eq!(
+            dl.headers.unwrap().get("Authorization").unwrap(),
+            "Bearer x"
+        );
     }
 
     #[test]
@@ -952,10 +978,7 @@ mod tests {
 
     #[test]
     fn aria2_add_uri_strips_token_param() {
-        let params = serde_json::json!([
-            "token:mysecret",
-            ["https://example.com/file.zip"]
-        ]);
+        let params = serde_json::json!(["token:mysecret", ["https://example.com/file.zip"]]);
         let dl = aria2_add_uri_to_download_request(&params).unwrap();
         assert_eq!(dl.url, "https://example.com/file.zip");
     }
@@ -998,7 +1021,11 @@ mod tests {
             port: 17800,
             token: String::new(),
         };
-        assert!(jsonrpc_token_ok(&Value::Array(vec![]), &HashMap::new(), &open));
+        assert!(jsonrpc_token_ok(
+            &Value::Array(vec![]),
+            &HashMap::new(),
+            &open
+        ));
         // params[0] = "token:S"
         let params = serde_json::json!(["token:S", ["https://x/f.zip"]]);
         assert!(jsonrpc_token_ok(&params, &HashMap::new(), &cfg));
@@ -1089,7 +1116,11 @@ mod tests {
     #[tokio::test]
     async fn integration_ping() {
         let (addr, _rx) = start_test_server("").await;
-        let resp = raw_request(&addr, "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n").await;
+        let resp = raw_request(
+            &addr,
+            "GET /ping HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(resp.contains("200 OK"), "resp={resp}");
         assert!(resp.contains("\"pong\""));
         assert!(resp.contains("FluxDown"));
@@ -1173,7 +1204,11 @@ mod tests {
         // 只要请求体是合法 JSON-RPC 即正常处理（与真实 aria2 行为一致）。
         let (addr, mut rx) = start_test_server("").await;
         let body = r#"{"jsonrpc":"2.0","id":"1","method":"aria2.addUri","params":["token:",["https://a.com/v.mp4"],{"out":"v.mp4"}]}"#;
-        let req = post("/jsonrpc", "Content-Type: text/plain;charset=UTF-8\r\n", body);
+        let req = post(
+            "/jsonrpc",
+            "Content-Type: text/plain;charset=UTF-8\r\n",
+            body,
+        );
         let resp = raw_request(&addr, &req).await;
         assert!(resp.contains("200 OK"), "resp={resp}");
         assert!(resp.contains("\"result\""), "resp={resp}");
@@ -1185,7 +1220,11 @@ mod tests {
     async fn integration_jsonrpc_rejects_non_json_body() {
         // 准入门槛仍在：非 JSON 请求体应被拒绝（-32700 解析错误）。
         let (addr, _rx) = start_test_server("").await;
-        let req = post("/jsonrpc", "Content-Type: text/plain\r\n", "not json at all");
+        let req = post(
+            "/jsonrpc",
+            "Content-Type: text/plain\r\n",
+            "not json at all",
+        );
         let resp = raw_request(&addr, &req).await;
         assert!(resp.contains("\"error\""), "resp={resp}");
         assert!(resp.contains("-32700"), "resp={resp}");
@@ -1210,7 +1249,11 @@ mod tests {
     #[tokio::test]
     async fn integration_unknown_path_404() {
         let (addr, _rx) = start_test_server("").await;
-        let resp = raw_request(&addr, "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+        let resp = raw_request(
+            &addr,
+            "GET /nope HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+        )
+        .await;
         assert!(resp.contains("404 Not Found"), "resp={resp}");
     }
 }

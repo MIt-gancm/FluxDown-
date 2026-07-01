@@ -174,7 +174,8 @@ async fn probe_http_meta(
     // spec.method（即便任务是 POST 触发，probe 也只发 HEAD，与原行为一致；
     // build_request 对 GET/HEAD 不会附加 body）。
     let request = crate::downloader::build_request(client, url, reqwest::Method::HEAD, spec);
-    let result = tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), request.send()).await;
+    let result =
+        tokio::time::timeout(Duration::from_secs(PROBE_TIMEOUT_SECS), request.send()).await;
 
     match result {
         Ok(Ok(response)) => {
@@ -187,7 +188,12 @@ async fn probe_http_meta(
                 .get(reqwest::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(|ct| {
-                    let mime = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                    let mime = ct
+                        .split(';')
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_ascii_lowercase();
                     mime == "text/html" || mime == "application/xhtml+xml"
                 })
                 .unwrap_or(false);

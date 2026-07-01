@@ -214,9 +214,7 @@ fn ftp_connect_sync_with_proxy(
                 port,
                 Duration::from_secs(30),
             )
-            .map_err(|e| {
-                suppaftp::FtpError::ConnectionError(std::io::Error::other(e.to_string()))
-            })
+            .map_err(|e| suppaftp::FtpError::ConnectionError(std::io::Error::other(e.to_string())))
         });
 
         ftp
@@ -1101,7 +1099,10 @@ async fn ftp_download_single(
                 // 防止服务器 421 断开后 finalize_retr_stream 无限阻塞。
                 // 设超时失败时记日志（与数据连接 set_read_timeout 一致），否则
                 // 控制连接无超时仍可能挂起，且静默无诊断线索。
-                if let Err(e) = ftp.get_ref().set_read_timeout(Some(FTP_CONTROL_READ_TIMEOUT)) {
+                if let Err(e) = ftp
+                    .get_ref()
+                    .set_read_timeout(Some(FTP_CONTROL_READ_TIMEOUT))
+                {
                     log_info!("[ftp] 控制连接 set_read_timeout 失败: {}", e);
                 }
                 let _ = ftp.finalize_retr_stream(data_stream);
@@ -1648,7 +1649,10 @@ async fn ftp_do_segment(
                 // 防止服务器 421 断开后 finalize_retr_stream 无限阻塞。
                 // 设超时失败时记日志（与数据连接 set_read_timeout 一致），否则
                 // 控制连接无超时仍可能挂起，且静默无诊断线索。
-                if let Err(e) = ftp.get_ref().set_read_timeout(Some(FTP_CONTROL_READ_TIMEOUT)) {
+                if let Err(e) = ftp
+                    .get_ref()
+                    .set_read_timeout(Some(FTP_CONTROL_READ_TIMEOUT))
+                {
                     log_info!("[ftp] 控制连接 set_read_timeout 失败: {}", e);
                 }
                 let _ = ftp.finalize_retr_stream(data_stream);
@@ -1809,8 +1813,8 @@ async fn ftp_do_segment(
 #[cfg(test)]
 mod tests {
     use super::{
-        FTP_DATA_READ_TIMEOUT, PROBE_MAX_RETRIES, PROBE_RETRY_BASE_DELAY, hex_nibble, parse_ftp_url,
-        url_decode,
+        FTP_DATA_READ_TIMEOUT, PROBE_MAX_RETRIES, PROBE_RETRY_BASE_DELAY, hex_nibble,
+        parse_ftp_url, url_decode,
     };
     use crate::downloader::sanitize_filename;
     use crate::speed_limiter::SpeedLimiter;

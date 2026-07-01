@@ -5,14 +5,13 @@ use reqwest::Client;
 use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-use rinf::RustSignal;
-
 use crate::downloader::{
     DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, ProgressUpdate, TEMP_EXT,
     extract_from_url,
 };
 use crate::logger::log_info;
-use crate::signals::{HlsQualityOption, HlsQualityOptions};
+use crate::model::HlsQualityOption;
+use crate::selection::SelectionOutcome;
 
 fn is_same_origin(base_url: &str, target_url: &str) -> bool {
     let base = match url::Url::parse(base_url) {
@@ -73,10 +72,9 @@ struct SegmentDownloadContext<'a> {
     extra_headers: &'a std::collections::HashMap<String, String>,
 }
 
-pub async fn run_dash_download(mut params: DownloadParams) {
+pub async fn run_dash_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
-    let quality_rx = params.hls_quality_rx.take();
-    let result = run_dash_download_inner(&params, quality_rx).await;
+    let result = run_dash_download_inner(&params).await;
 
     match result {
         Ok(total) => {
@@ -216,10 +214,7 @@ async fn mux_audio_video(
     Ok(())
 }
 
-async fn run_dash_download_inner(
-    p: &DownloadParams,
-    quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
-) -> Result<i64, DownloadError> {
+async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
     log_info!("[dash-download] task {} starting, url={}", p.task_id, p.url);
 
     let _ = p.db.update_task_status(&p.task_id, 5, "").await;
@@ -276,7 +271,7 @@ async fn run_dash_download_inner(
         &p.task_id,
         representations,
         best_video,
-        quality_rx,
+        p.selector.as_ref(),
         &p.cancel_token,
     )
     .await?;
@@ -523,7 +518,7 @@ async fn select_representation(
     task_id: &str,
     representations: &[dash_mpd::Representation],
     adaptation: &dash_mpd::AdaptationSet,
-    quality_rx: Option<tokio::sync::oneshot::Receiver<i32>>,
+    selector: &dyn crate::selection::HostSelection,
     cancel_token: &tokio_util::sync::CancellationToken,
 ) -> Result<usize, DownloadError> {
     let auto_select_best = || -> Result<usize, DownloadError> {
@@ -541,87 +536,76 @@ async fn select_representation(
         Ok(best)
     };
 
-    if let Some(rx) = quality_rx {
-        if representations.len() <= 1 {
-            log_info!(
-                "[dash-download] task {} only {} representation(s), skipping quality dialog",
-                task_id,
-                representations.len()
-            );
-            return auto_select_best();
-        }
-
-        let options: Vec<HlsQualityOption> = representations
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let width = r.width.or(adaptation.width).unwrap_or(0) as i64;
-                let height = r.height.or(adaptation.height).unwrap_or(0) as i64;
-                HlsQualityOption {
-                    index: i as i32,
-                    bandwidth: r.bandwidth.unwrap_or(0) as i64,
-                    width,
-                    height,
-                }
-            })
-            .collect();
-
-        HlsQualityOptions {
-            task_id: task_id.to_string(),
-            options,
-        }
-        .send_signal_to_dart();
-
+    if representations.len() <= 1 {
         log_info!(
-            "[dash-download] task {} sent {} quality options to Dart, waiting for selection (timeout={}s)",
+            "[dash-download] task {} only {} representation(s), skipping quality dialog",
             task_id,
-            representations.len(),
-            QUALITY_SELECTION_TIMEOUT_SECS
+            representations.len()
         );
+        return auto_select_best();
+    }
 
-        let timeout_duration = std::time::Duration::from_secs(QUALITY_SELECTION_TIMEOUT_SECS);
+    let options: Vec<HlsQualityOption> = representations
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let width = r.width.or(adaptation.width).unwrap_or(0) as i64;
+            let height = r.height.or(adaptation.height).unwrap_or(0) as i64;
+            HlsQualityOption {
+                index: i as i32,
+                bandwidth: r.bandwidth.unwrap_or(0) as i64,
+                width,
+                height,
+            }
+        })
+        .collect();
 
-        tokio::select! {
-            _ = cancel_token.cancelled() => {
-                Err(DownloadError::Cancelled)
-            }
-            result = tokio::time::timeout(timeout_duration, rx) => {
-                match result {
-                    Ok(Ok(idx)) => {
-                        let _ = representations.get(idx as usize).ok_or_else(|| {
-                            DownloadError::Other(format!(
-                                "invalid DASH quality index: {} (have {} representations)",
-                                idx,
-                                representations.len()
-                            ))
-                        })?;
-                        log_info!(
-                            "[dash-download] task {} user selected representation {}",
-                            task_id,
-                            idx
-                        );
-                        Ok(idx as usize)
-                    }
-                    Ok(Err(_)) => {
-                        log_info!(
-                            "[dash-download] task {} quality channel closed, auto-selecting best",
-                            task_id
-                        );
-                        auto_select_best()
-                    }
-                    Err(_) => {
-                        log_info!(
-                            "[dash-download] task {} quality selection timed out ({}s), auto-selecting best",
-                            task_id,
-                            QUALITY_SELECTION_TIMEOUT_SECS
-                        );
-                        auto_select_best()
-                    }
-                }
-            }
+    log_info!(
+        "[dash-download] task {} requesting quality selection ({} representations) via HostSelection (timeout={}s)",
+        task_id,
+        representations.len(),
+        QUALITY_SELECTION_TIMEOUT_SECS
+    );
+
+    let timeout_duration = std::time::Duration::from_secs(QUALITY_SELECTION_TIMEOUT_SECS);
+
+    tokio::select! {
+        _ = cancel_token.cancelled() => {
+            Err(DownloadError::Cancelled)
         }
-    } else {
-        auto_select_best()
+        outcome = selector.select_hls_quality(task_id, &options, timeout_duration) => {
+            let idx = match &outcome {
+                SelectionOutcome::UserChose(idx) => {
+                    log_info!(
+                        "[dash-download] task {} user selected representation {}",
+                        task_id, idx
+                    );
+                    *idx
+                }
+                SelectionOutcome::TimedOutDefaulted(idx) => {
+                    log_info!(
+                        "[dash-download] task {} quality selection timed out ({}s), defaulting to representation {}",
+                        task_id, QUALITY_SELECTION_TIMEOUT_SECS, idx
+                    );
+                    *idx
+                }
+                SelectionOutcome::NoSelectorConfigured(idx) => {
+                    log_info!(
+                        "[dash-download] task {} no selector configured, defaulting to representation {}",
+                        task_id, idx
+                    );
+                    *idx
+                }
+            };
+            let _ = representations.get(idx as usize).ok_or_else(|| {
+                DownloadError::Other(format!(
+                    "invalid DASH quality index: {} (have {} representations)",
+                    idx,
+                    representations.len()
+                ))
+            })?;
+            Ok(idx as usize)
+        }
     }
 }
 
@@ -935,13 +919,19 @@ fn build_from_template(
         // @initialization 属性给出 URL，不附带 range
         let resolved = resolve_url_template(attr_url, &repr_id, bandwidth, None, None);
         let full_url = join_base(base, &resolved)?;
-        Some(DashSegment { url: full_url, range: None })
+        Some(DashSegment {
+            url: full_url,
+            range: None,
+        })
     } else if let Some(elem) = template.Initialization.as_ref() {
         // <Initialization> 子元素：sourceURL 与 range 来自同一元素，可配对使用
         if let Some(src_url) = elem.sourceURL.as_deref() {
             let resolved = resolve_url_template(src_url, &repr_id, bandwidth, None, None);
             let full_url = join_base(base, &resolved)?;
-            Some(DashSegment { url: full_url, range: elem.range.clone() })
+            Some(DashSegment {
+                url: full_url,
+                range: elem.range.clone(),
+            })
         } else {
             None
         }
@@ -1111,8 +1101,7 @@ fn build_from_template(
             )));
         }
         let pto = template.presentationTimeOffset.unwrap_or(0);
-        let mut number = start_number;
-        for n in 0..seg_count_usize {
+        for (number, n) in (start_number..).zip(0..seg_count_usize) {
             // $Time$ 按每段独立计算（而非累加），消除小数 duration 的逐段漂移：
             //   time = presentationTimeOffset + round((n - 0) * duration)
             // n 从 0 开始，number 从 startNumber 开始（BUG-DASH-DURATION-TRUNCATION）。
@@ -1128,7 +1117,6 @@ fn build_from_template(
                 url: join_base(base, &url)?,
                 range: None,
             });
-            number += 1;
         }
     } else {
         return Err(DownloadError::Other(
@@ -1254,9 +1242,10 @@ async fn download_track_inner(
             Ok(b) => b,
             Err(e) => {
                 // 使用单调写入，同上原因（BUG-DASH-RESUME-FULL-REDOWNLOAD）。
-                let _ =
-                    p.db.update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
-                        .await;
+                let _ = p
+                    .db
+                    .update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
+                    .await;
                 return Err(e);
             }
         };
@@ -1296,16 +1285,14 @@ async fn download_track_inner(
         let _ = tokio::fs::remove_file(dest_path).await;
     }
 
-    tokio::fs::rename(temp_path, dest_path)
-        .await
-        .map_err(|e| {
-            DownloadError::Other(format!(
-                "failed to rename {} -> {}: {}",
-                temp_path.display(),
-                dest_path.display(),
-                e
-            ))
-        })?;
+    tokio::fs::rename(temp_path, dest_path).await.map_err(|e| {
+        DownloadError::Other(format!(
+            "failed to rename {} -> {}: {}",
+            temp_path.display(),
+            dest_path.display(),
+            e
+        ))
+    })?;
 
     Ok(total_track)
 }
@@ -1589,7 +1576,6 @@ mod tests {
         // 第一个 S: floor((30-0)/10) = 3 段; 第二个 S: 1 段 → 共 4 段。
         assert_eq!(segs.len(), 4, "floor count for explicit next_t boundary");
     }
-
 
     #[test]
     fn test_is_dash_url() {

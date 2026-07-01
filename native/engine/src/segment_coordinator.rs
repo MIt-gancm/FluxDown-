@@ -41,12 +41,10 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use rinf::RustSignal;
-
 use crate::db::Db;
 use crate::downloader::{DownloadError, ProgressUpdate, SegmentProgressInfo, is_server_rejection};
+use crate::events::{EngineEvent, EventSink};
 use crate::logger::log_info;
-use crate::signals::SegmentSplitEvent;
 use crate::speed_limiter::SpeedLimiter;
 
 // ---------------------------------------------------------------------------
@@ -309,6 +307,7 @@ pub async fn run_coordinated_download(
     cancel_token: &CancellationToken,
     speed_limiter: &SpeedLimiter,
     spec: &crate::downloader::RequestSpec,
+    sink: &dyn EventSink,
     etag: &str,
     last_modified: &str,
 ) -> Result<(), DownloadError> {
@@ -846,10 +845,10 @@ pub async fn run_coordinated_download(
                                 new_seg_idx, next.split_parent,
                             ).await;
 
-                            // Notify Dart about the split event (if this came from a split).
+                            // Notify host about the split event (if this came from a split).
                             if let Some(parent_idx) = next.split_parent {
                                 send_split_event(
-                                    task_id, parent_idx, new_seg_idx,
+                                    sink, task_id, parent_idx, new_seg_idx,
                                     &segments, false,
                                 );
                             }
@@ -1003,7 +1002,7 @@ pub async fn run_coordinated_download(
                         ).await;
                         if let Some(parent_idx) = next.split_parent {
                             send_split_event(
-                                task_id, parent_idx, new_seg_idx,
+                                sink, task_id, parent_idx, new_seg_idx,
                                 &segments, true,
                             );
                         }
@@ -1497,8 +1496,10 @@ fn rebuild_seg_states(
     let mut new_states = build_seg_state_vec(segments);
     if let Ok(mut states) = seg_states.lock() {
         // 快照现有各段 worker 维护的 downloaded_bytes（index → bytes）。
-        let existing: HashMap<i32, i64> =
-            states.iter().map(|s| (s.index, s.downloaded_bytes)).collect();
+        let existing: HashMap<i32, i64> = states
+            .iter()
+            .map(|s| (s.index, s.downloaded_bytes))
+            .collect();
         // 仅恢复快照中已存在的段；split 新生子段不在其中，保持来自 map 的值。
         for s in &mut new_states {
             if let Some(&dl) = existing.get(&s.index) {
@@ -1624,8 +1625,9 @@ async fn persist_segment_change(
 // Helper: send split event to Dart
 // ---------------------------------------------------------------------------
 
-/// Send a `SegmentSplitEvent` signal to Dart so the UI can animate the split.
+/// Emit an `EngineEvent::SegmentSplit` so the host can animate the split.
 fn send_split_event(
+    sink: &dyn EventSink,
     task_id: &str,
     parent_idx: i32,
     child_idx: i32,
@@ -1639,7 +1641,7 @@ fn send_split_event(
         return;
     };
 
-    SegmentSplitEvent {
+    sink.emit(EngineEvent::SegmentSplit {
         task_id: task_id.to_string(),
         parent_index: parent_idx,
         parent_new_end: parent.end_byte,
@@ -1648,8 +1650,7 @@ fn send_split_event(
         child_end: child.end_byte,
         is_proactive,
         total_segments: segments.len() as i32,
-    }
-    .send_signal_to_dart();
+    });
 
     log_info!(
         "[coordinator] split event sent: parent={} new_end={}, child={} [{}, {}], proactive={}, total={}",
@@ -1941,9 +1942,7 @@ async fn do_segment(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let version_changed = validator_sent
-            && ((!expected_etag.is_empty()
-                && !resp_etag.is_empty()
-                && resp_etag != expected_etag)
+            && ((!expected_etag.is_empty() && !resp_etag.is_empty() && resp_etag != expected_etag)
                 || (!expected_last_modified.is_empty()
                     && !resp_lm.is_empty()
                     && resp_lm != expected_last_modified));

@@ -8,6 +8,7 @@
 /// 模板占位符：
 /// - `{path}` — 完整文件路径（仅 reveal-file 场景有意义）
 /// - `{dir}`  — 目录路径（文件 → 父目录，目录 → 自身）
+///
 /// 占位符在替换时会做平台 shell 转义，用户无需在模板中再加引号。
 ///
 /// 平台默认行为（无模板时）：
@@ -45,7 +46,9 @@ pub fn reveal(path: &str, file_tpl: &str, dir_tpl: &str) {
         if run_template(tpl, path, &dir) {
             return;
         }
-        crate::logger::log_info!("[reveal] custom template failed, falling back to platform default");
+        crate::logger::log_info!(
+            "[reveal] custom template failed, falling back to platform default"
+        );
     }
 
     // 平台默认
@@ -89,7 +92,11 @@ fn run_template(tpl: &str, path: &str, dir: &str) -> bool {
 
     #[cfg(not(target_os = "windows"))]
     {
-        match std::process::Command::new("sh").arg("-c").arg(&cmdline).spawn() {
+        match std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmdline)
+            .spawn()
+        {
             Ok(_) => true,
             Err(e) => {
                 crate::logger::log_info!("[reveal] sh -c spawn failed: {e}");

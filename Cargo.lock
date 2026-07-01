@@ -1000,6 +1000,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxdown_engine"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-compression",
+ "async-trait",
+ "base64",
+ "bytes",
+ "cbc",
+ "chrono",
+ "dash-mpd",
+ "encoding_rs",
+ "futures-util",
+ "hex 0.4.3",
+ "http",
+ "libc",
+ "librqbit",
+ "m3u8-rs",
+ "md-5",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "suppaftp",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "ts2mp4",
+ "url",
+ "uuid",
+ "windows-sys 0.59.0",
+ "winreg",
+ "zip",
+]
+
+[[package]]
 name = "fluxdown_nmh"
 version = "0.1.0"
 dependencies = [
@@ -1399,6 +1438,7 @@ dependencies = [
  "chrono",
  "dash-mpd",
  "encoding_rs",
+ "fluxdown_engine",
  "futures-util",
  "hex 0.4.3",
  "http",

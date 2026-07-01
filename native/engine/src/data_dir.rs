@@ -17,7 +17,7 @@
 //! This is consistent with the existing check in `updater.rs` and the Dart-side
 //! `_isPortableMode()` in `windows_toast_helper.dart`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Marker file name — a zero-byte file placed next to the exe by the portable
 /// ZIP distribution.  Matches `updater::PORTABLE_MARKER` and the Dart-side
@@ -25,13 +25,46 @@ use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 const PORTABLE_MARKER: &str = "portable";
 
+/// Errors that can occur while resolving the application data directory.
+#[derive(Debug, thiserror::Error)]
+pub enum DataDirError {
+    /// Failed to create the resolved directory (or one of its ancestors).
+    #[error("failed to create data directory {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
 /// Resolve the application data directory (for DB, logs, NMH manifests, etc.).
 ///
+/// `explicit` overrides auto-detection when set (e.g. a CLI `--data-dir` flag
+/// or a Server per-tenant directory); pass `None` to fall back to the
+/// platform-specific auto-detection below (portable marker / `LOCALAPPDATA` /
+/// XDG / macOS Application Support).
+///
 /// The returned path is guaranteed to exist (created if necessary).
-pub fn resolve_data_dir() -> PathBuf {
-    let dir = resolve_data_dir_inner();
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_engine::data_dir::resolve_data_dir;
+///
+/// // Auto-detect the platform data directory.
+/// let dir = resolve_data_dir(None).expect("data dir should be creatable");
+/// assert!(dir.is_absolute() || dir.as_os_str() == ".");
+/// ```
+pub fn resolve_data_dir(explicit: Option<&Path>) -> Result<PathBuf, DataDirError> {
+    let dir = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => resolve_data_dir_inner(),
+    };
+    std::fs::create_dir_all(&dir).map_err(|source| DataDirError::CreateDir {
+        path: dir.clone(),
+        source,
+    })?;
+    Ok(dir)
 }
 
 fn resolve_data_dir_inner() -> PathBuf {

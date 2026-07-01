@@ -31,9 +31,10 @@ flutter build windows                # 构建 Windows 发行版
 # 测试
 flutter test                         # 全部 Dart 测试
 flutter test test/widget_test.dart   # 运行单个 Dart 测试文件
-cargo test -p hub                    # 运行全部 Rust 单元测试
-cargo test -p hub -- segment_advisor # 运行特定 Rust 测试模块
-cargo test -p hub -- test_name       # 运行单个 Rust 测试函数
+cargo test -p fluxdown_engine        # 运行下载引擎全部单元测试（native/engine，下载协议/分段/DB 等核心逻辑）
+cargo test -p hub                    # 运行 hub 适配层全部单元测试（native/hub，Rinf FFI/信号桥接）
+cargo test -p fluxdown_engine -- segment_advisor # 运行特定 Rust 测试模块
+cargo test -p fluxdown_engine -- test_name       # 运行单个 Rust 测试函数
 
 # 依赖
 flutter pub get                      # Dart 依赖安装
@@ -94,13 +95,14 @@ x_down/
 │       │   └── theme_provider.dart    # 主题切换+持久化（SharedPreferences）
 │       ├── widgets/                   # UI 组件（见下方详细清单）
 │       └── bindings/                  # ⚠️ 自动生成 — 勿手动编辑
-├── native/hub/                        # Rust 下载引擎 crate（edition 2024）
+├── native/engine/                     # `fluxdown_engine` crate（edition 2024，零 FFI 依赖）
 │   └── src/
-│       ├── lib.rs                     # 入口（tokio current_thread runtime）
-│       ├── signals/mod.rs             # 信号结构体定义（DartSignal/RustSignal/SignalPiece）
-│       ├── actors/download_actor.rs   # 核心事件循环（tokio::select!）
-│       ├── download_manager.rs        # 并发管理/任务生命周期/进度报告
-│       ├── downloader.rs              # HTTP/HTTPS 下载引擎（分片/断点续传）
+│       ├── lib.rs                     # `Engine` facade（唯一构造入口）+ `EngineConfig`/`EngineError`/`NoopSink`/`NoopSelection`
+│       ├── events.rs                  # `EngineEvent`（进度/分段拆分/队列变化等）+ `EventSink` trait
+│       ├── selection.rs               # `SelectionOutcome`/`HostSelection` trait（HLS 画质/BT 文件选择）
+│       ├── model.rs                   # 引擎领域类型（TaskInfo/QueueInfo/SegmentDetail/BtFileEntry/…，不带 rinf derive）
+│       ├── download_manager.rs        # 并发管理/任务生命周期/进度报告（`progress_reporter`）
+│       ├── downloader.rs              # HTTP/HTTPS 下载引擎（分片/断点续传/`RequestSpec`/`build_request`）
 │       ├── ftp_downloader.rs          # FTP 下载引擎（suppaftp 同步 API）
 │       ├── bt_downloader.rs           # BitTorrent 引擎（librqbit）
 │       ├── hls_downloader.rs          # HLS 下载引擎（M3U8/多码率/AES解密）
@@ -108,14 +110,29 @@ x_down/
 │       ├── segment_coordinator.rs     # 动态分段协调（主动拆分/抢救慢速分段）
 │       ├── meta_prober.rs             # 文件元数据探测（HEAD/Range:0-0）
 │       ├── proxy_config.rs            # 代理配置（无/系统/手动，读 Windows 注册表）
+│       ├── db.rs                      # SQLite 数据层（tasks/task_segments/config/queues）
+│       ├── data_dir.rs                # 数据目录解析（`resolve_data_dir(Option<&Path>)`）
+│       ├── logger.rs                  # 全局文件日志（`log_info!`/`log_error!`，`#[macro_export]`）
+│       ├── speed_limiter.rs           # Token bucket 全局速度限制器
+│       ├── segment_advisor.rs         # 动态分段计算（文件大小+CPU+带宽）
+│       └── tracker_subscription.rs    # BT tracker 订阅列表抓取/去重
+│   ├── examples/headless_download.rs  # CLI 式同进程直接调用证明（不依赖 hub/rinf）
+│   └── tests/                         # realtest.rs / corruption_test.rs（迁移自 hub，确定性/真实网络回归）
+├── native/hub/                        # Rinf FFI 适配层 crate（`hub`，edition 2024，crate 名不可改）
+│   └── src/
+│       ├── lib.rs                     # 入口（tokio current_thread runtime）
+│       ├── signals/mod.rs             # 信号结构体定义（DartSignal/RustSignal/SignalPiece，不可动——Dart 绑定契约）
+│       ├── actors/download_actor.rs   # 核心事件循环（tokio::select!），构造 `fluxdown_engine::Engine` 并转发调用
+│       ├── rinf_sink.rs               # `EventSink` 实现：`EngineEvent` → 具体 `RustSignal` 发送
+│       ├── rinf_selection.rs          # `HostSelection` 实现：HLS/BT 选择请求 → `RustSignal` + oneshot 等待表
+│       ├── signal_bridge.rs           # `engine::model::*` ↔ `signals::*` 的 `From` 转换
 │       ├── protocol_registry.rs       # fluxdown:// 自定义协议注册（Windows）
 │       ├── file_association.rs        # .torrent 文件关联注册（Windows）
 │       ├── native_messaging.rs        # Windows: Named Pipe `\\.\pipe\fluxdown`；Linux: Unix socket 服务端
+│       ├── http_takeover.rs           # 本地 HTTP 接管服务（Tampermonkey userscripts）
 │       ├── nmh_registry.rs            # NMH 清单注册（Linux: 写入 Chrome/Firefox NMH JSON）
-│       ├── updater.rs                 # 自动更新器（GitHub Releases API）
-│       ├── db.rs                      # SQLite 数据层（tasks/task_segments/config/queues）
-│       ├── speed_limiter.rs           # Token bucket 全局速度限制器
-│       └── segment_advisor.rs         # 动态分段计算（文件大小+CPU+带宽）
+│       ├── reveal_file.rs             # 在文件管理器中定位文件/打开目录
+│       └── updater.rs                 # 自动更新器（GitHub Releases API）
 ├── native/nmh/                        # Native Messaging Host（Linux/macOS 平台）
 │   └── src/main.rs                    # 独立二进制：stdin/stdout ↔ Unix socket 桥接 + 启动 app
 ├── fluxDown/                          # WXT 浏览器扩展（Chrome MV3, TypeScript）
@@ -140,18 +157,27 @@ x_down/
 ## 架构概览
 
 ```
-[Dart UI (shadcn_ui)] ←Rinf FFI→ [download_actor (tokio::select! 事件循环)]
-                                          │
-                          ┌───────────────┼──────────────────┐
-                    [DownloadManager]    [Db]          [native_messaging]
-                     │    │    │    │  (SQLite)    Windows: Named Pipe
-              [HTTP] [FTP] [BT] [HLS]              Linux: Unix socket
-                     │                                      ↑
-            [SpeedLimiter] + [segment_advisor]       [fluxdown_nmh 进程]
-                        + [segment_coordinator]      (stdin/stdout NMH)
-                                                            ↑
-                                                    [WXT 浏览器扩展]
+[Dart UI (shadcn_ui)] ←Rinf FFI→ [download_actor (tokio::select! 事件循环, hub crate)]
+                                          │ 构造 fluxdown_engine::Engine
+                          ┌───────────────┼──────────────────────────┐
+                    [RinfEventSink]  [RinfHostSelection]      [native_messaging]
+                   (EventSink impl) (HostSelection impl)  Windows: Named Pipe
+                          │                │                Linux: Unix socket
+                          └───────┬────────┘                       ↑
+                          [fluxdown_engine::Engine]           [fluxdown_nmh 进程]
+                     │        │        │        │             (stdin/stdout NMH)
+              [DownloadManager]      [Db]                            ↑
+                     │              (SQLite)                  [WXT 浏览器扩展]
+              ┌──────┼──────┬───────┐
+           [HTTP] [FTP]   [BT]    [HLS/DASH]
+                     │
+            [SpeedLimiter] + [segment_advisor]
+                        + [segment_coordinator]
 ```
+
+**crate 边界**: `fluxdown_engine`（`native/engine`）零 rinf/Dart 依赖，通过 `EventSink`/`HostSelection`
+两个 trait 与宿主解耦；`hub`（`native/hub`）是 Rinf FFI 适配层，只做信号收发与类型转换
+（`rinf_sink.rs`/`rinf_selection.rs`/`signal_bridge.rs`），不含下载协议逻辑。
 
 **状态管理**: ChangeNotifier + ListenableBuilder（无 Provider/Riverpod/Bloc）
 **并发模型**: 每个下载 spawn 独立 tokio task，CancellationToken 控制生命周期
@@ -270,6 +296,10 @@ CREATE TABLE queues (
 
 ## Rust 核心模块详解
 
+> 以下模块均已迁移到 `native/engine`（`fluxdown_engine` crate）。`native/hub/src/logger.rs`
+> 是转发 `pub use fluxdown_engine::logger::*;` 的 shim，保留 `crate::logger::*` 路径供
+> hub 内 App-shell 专属文件（`native_messaging.rs`/`http_takeover.rs`/`updater.rs`/…）零改动继续使用。
+
 ### segment_advisor.rs — 动态分段计算
 - 文件 < 1MB → 1线程；1-10MB → 4；10-100MB → 8；100MB-1GB → 16；> 1GB → 32
 - CPU 核心数上限：`num_cpus::get() * 2`
@@ -278,7 +308,8 @@ CREATE TABLE queues (
 - **主动拆分（Proactive）**: 检测慢速分段 → 拆分为两段加速
 - **抢救拆分（Reactive）**: 分段卡住 → 拆分并行
 - 拆分原子性：子分段插入 + 父分段缩小，单事务提交
-- 通过 `SegmentSplitEvent` 信号触发 Dart 端拆分动画
+- 通过 `EventSink::emit(EngineEvent::SegmentSplit{..})` 上报，hub 的 `RinfEventSink` 转发为
+  `SegmentSplitEvent` 信号触发 Dart 端拆分动画
 
 ### speed_limiter.rs — Token Bucket 限速
 - 参数：`rate`（字节/秒）、`burst`（=rate，突发缓冲）
@@ -290,6 +321,7 @@ CREATE TABLE queues (
 - 速度平滑（EMA，α=0.3）
 - WAL Checkpoint（所有任务空闲时执行）
 - 队列管理（全局默认队列 + 命名队列独立配置）
+- 通过 `Arc<dyn EventSink>`/`Arc<dyn HostSelection>` 与宿主解耦（由 `Engine::new` 注入）
 
 ### proxy_config.rs — 代理配置
 - 模式：`None` / `System`（Windows 注册表）/ `Manual`
@@ -300,11 +332,11 @@ CREATE TABLE queues (
 - HEAD 请求 → GET Range:0-0 降级 → 文件名解析（URL / Content-Disposition）
 - 检测 Accept-Ranges 支持
 
-### logger.rs — 全局文件日志
+### logger.rs（`native/engine/src/logger.rs`）— 全局文件日志
 - 与 Dart 端 `LogService` 写入同一目录、同一文件（`fluxdown_YYYY-MM-DD.log`）
 - 启动时自动清理 7 天前的日志文件
-- 提供 `log_info!` / `log_error!` 宏，用法同 `format!()`
-- 使用前需在文件顶部 `use crate::logger::log_info;`
+- 提供 `#[macro_export]` 的 `log_info!` / `log_error!` 宏（`$crate` 前缀保证跨 crate 调用正确解析），用法同 `format!()`
+- hub 侧使用前需在文件顶部 `use crate::logger::log_info;`（经 `native/hub/src/logger.rs` shim 转发）
 
 ## 浏览器扩展（fluxDown/）
 
@@ -559,9 +591,11 @@ final fileCount = LogService.instance.logFileCount;
 3. 使用 shadcn_ui 组件，颜色通过 `AppColors.of(context)` 获取
 
 ### Rust 模块开发
+- 下载协议/引擎逻辑（HTTP/FTP/BT/HLS/DASH/分段协调/DB/…）新模块加入 `native/engine`（`fluxdown_engine` crate），在 `native/engine/src/lib.rs` 中声明 `pub mod xxx;`
 - 参考 `downloader.rs`（HTTP）和 `ftp_downloader.rs`（FTP）的对称设计模式
-- 新模块在 `lib.rs` 中声明 `mod xxx;`
-- DB 操作统一通过 `db.rs` 的 `Db` 结构体，所有 rusqlite 调用在 `spawn_blocking` 中
+- 需要上报事件给宿主 → 用 `EventSink::emit`（不要引入新的 rinf/Dart 依赖）；需要宿主介入决策（如弹窗选择）→ 用 `HostSelection`
+- DB 操作统一通过 `native/engine/src/db.rs` 的 `Db` 结构体，所有 rusqlite 调用在 `spawn_blocking` 中
+- App-shell 专属逻辑（文件关联/协议注册/NMH/更新器/…）留在 `native/hub`，在 `native/hub/src/lib.rs` 中声明 `mod xxx;`
 
 ### 发布新版本
 1. 运行 `python scripts/release_tag.py v0.x.x --push --github-release --update-changelog`

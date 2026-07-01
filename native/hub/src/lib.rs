@@ -1,33 +1,16 @@
 mod actors;
-mod bt_downloader;
-mod dash_downloader;
-mod data_dir;
-mod db;
-mod download_manager;
-mod downloader;
 mod file_association;
-mod ftp_downloader;
-mod hls_downloader;
 mod http_takeover;
 mod logger;
-mod meta_prober;
 mod native_messaging;
 mod nmh_registry;
 mod protocol_registry;
-mod proxy_config;
 mod reveal_file;
-mod segment_advisor;
-mod segment_coordinator;
+pub mod rinf_selection;
+mod rinf_sink;
+mod signal_bridge;
 mod signals;
-mod speed_limiter;
-mod tracker_subscription;
 mod updater;
-
-#[cfg(test)]
-mod corruption_test;
-
-#[cfg(test)]
-mod realtest;
 
 use actors::create_actors;
 use rinf::{dart_shutdown, write_interface};

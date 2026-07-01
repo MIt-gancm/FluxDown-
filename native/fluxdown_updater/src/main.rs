@@ -967,7 +967,11 @@ fn write_failure_marker(install_dir: &Path, message: &str) {
     // Fallback: temp directory (always writable).
     let fallback = std::env::temp_dir().join(MARKER_NAME);
     if fs::write(&fallback, &body).is_ok() {
-        log_msg(&format!("wrote failure marker (temp): {}", fallback.display())).ok();
+        log_msg(&format!(
+            "wrote failure marker (temp): {}",
+            fallback.display()
+        ))
+        .ok();
     } else {
         log_msg("failed to write failure marker anywhere").ok();
     }

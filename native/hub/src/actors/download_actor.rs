@@ -1,17 +1,23 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::db::Db;
+use fluxdown_engine::download_manager::{self, TaskDone};
+use fluxdown_engine::events::EventSink;
+use fluxdown_engine::proxy_config::ProxyConfig;
+use fluxdown_engine::selection::HostSelection;
+use fluxdown_engine::{Engine, EngineConfig};
 use rinf::{DartSignal, RustSignal};
 use tokio::sync::mpsc;
 
-use crate::bt_downloader::{self, BtConfig};
-use crate::db::Db;
-use crate::download_manager::{self, DownloadManager, DownloadManagerConfig, TaskDone};
 use crate::file_association;
 use crate::logger::log_info;
 use crate::native_messaging::{self};
 use crate::protocol_registry;
-use crate::proxy_config::ProxyConfig;
+use crate::rinf_selection::RinfHostSelection;
+use crate::rinf_sink::RinfEventSink;
 use crate::signals::{
     BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
     ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask, CreateQueue, CreateTask,
@@ -22,7 +28,6 @@ use crate::signals::{
     SystemProxyInfo, TestProxyConnection, TrackerSubscriptionResult, UpdateCheckResult,
     UpdateFailureMarker, UpdateQueue, UpdateTrackerSubscription, UrlProtocolStatus,
 };
-use crate::tracker_subscription;
 use crate::updater;
 
 /// Compute default save directory (platform-dependent).
@@ -80,14 +85,17 @@ fn bt_config_from_map(cfg: &HashMap<String, String>) -> BtConfig {
 /// Spawn a background task that fetches all tracker subscription sources,
 /// persists the deduped result to the config table, then reports the outcome
 /// back to the actor loop (which updates the BtConfig and notifies Dart).
-fn spawn_tracker_sub_refresh(db: Db, tx: mpsc::Sender<tracker_subscription::FetchOutcome>) {
+fn spawn_tracker_sub_refresh(
+    db: Db,
+    tx: mpsc::Sender<fluxdown_engine::tracker_subscription::FetchOutcome>,
+) {
     tokio::spawn(async move {
         let cfg = db.get_all_config().await.unwrap_or_default();
         let urls = cfg
             .get("bt_tracker_sub_urls")
             .cloned()
-            .unwrap_or_else(tracker_subscription::default_subscription_urls);
-        let outcome = tracker_subscription::fetch_subscriptions(&urls).await;
+            .unwrap_or_else(fluxdown_engine::tracker_subscription::default_subscription_urls);
+        let outcome = fluxdown_engine::tracker_subscription::fetch_subscriptions(&urls).await;
         if outcome.is_success() {
             let now = chrono::Utc::now().timestamp();
             if let Err(e) = db
@@ -110,22 +118,18 @@ fn spawn_tracker_sub_refresh(db: Db, tx: mpsc::Sender<tracker_subscription::Fetc
 /// Read initial config values from DB to pass to DownloadManager.
 async fn load_initial_config(db: &Db) -> (usize, u64, String, BtConfig, ProxyConfig, String, i32) {
     let config = db.get_all_config().await.unwrap_or_default();
-
     let max_concurrent = config
         .get("max_concurrent_tasks")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(5);
-
     let speed_limit_bytes = config
         .get("speed_limit_bytes")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-
     let save_dir = config
         .get("default_save_dir")
         .cloned()
         .unwrap_or_else(default_save_dir);
-
     let bt_config = bt_config_from_map(&config);
 
     let proxy_config = ProxyConfig::from_config_map(&config);
@@ -180,7 +184,7 @@ pub async fn run(db_dir: PathBuf) {
 
     // Populate default tracker list on first launch (when DB value is empty).
     if bt_config.custom_trackers.trim().is_empty() {
-        let defaults = bt_downloader::default_tracker_list();
+        let defaults = fluxdown_engine::bt_downloader::default_tracker_list();
         if let Err(e) = db.set_config("bt_custom_trackers", &defaults).await {
             log_info!("[actor] failed to save default trackers: {}", e);
         }
@@ -195,9 +199,15 @@ pub async fn run(db_dir: PathBuf) {
     );
 
     let app_data_dir = db_dir.to_string_lossy().into_owned();
-    let mut manager = match DownloadManager::new(
-        db.clone(),
-        DownloadManagerConfig {
+
+    // 引擎事件接收端与选择接口:分别桥接到 hub 的 RustSignal 发送与
+    // oneshot 等待表。`sink` 同时供 `Engine::new` 与 `progress_reporter`
+    // 使用(后者独立取走 progress_rx,不经由 manager 内部的 sink 字段)。
+    let sink: Arc<dyn EventSink> = Arc::new(RinfEventSink);
+    let selector: Arc<dyn HostSelection> = Arc::new(RinfHostSelection::new());
+
+    let mut engine = match Engine::new(
+        EngineConfig {
             max_concurrent,
             speed_limit_bps,
             default_save_dir: save_dir,
@@ -205,19 +215,26 @@ pub async fn run(db_dir: PathBuf) {
             bt_config,
             proxy_config,
             user_agent,
+            // db_dir 已由 `actors::create_actors` 通过
+            // `fluxdown_engine::data_dir::resolve_data_dir(None)` 解析,
+            // 此处显式传入,使 `Engine::new` 内部的解析成为等价的直通,
+            // 保持与 `Db::open(&db_dir)`(上面已单独执行一次)完全一致的路径。
+            data_dir_override: Some(db_dir.clone()),
         },
+        sink.clone(),
+        selector.clone(),
     ) {
-        Ok(m) => m,
+        Ok(e) => e,
         Err(e) => {
-            log_info!("Failed to create download manager: {}", e);
+            log_info!("Failed to create engine: {}", e);
             return;
         }
     };
 
-    manager.set_default_segments(default_segments);
+    engine.manager.set_default_segments(default_segments);
 
     // Apply persisted log size cap (MB) to the global logger.
-    if let Ok(Some(v)) = db.get_config("log_max_size_mb").await
+    if let Ok(Some(v)) = engine.db.get_config("log_max_size_mb").await
         && let Ok(mb) = v.parse::<u64>()
     {
         crate::logger::set_max_total_bytes(mb * 1024 * 1024);
@@ -226,31 +243,35 @@ pub async fn run(db_dir: PathBuf) {
     // Apply persisted auto-retry config (key-value `config` table). Absent or
     // unparsable values fall back to the manager's built-in defaults.
     {
-        let cfg = db.get_all_config().await.unwrap_or_default();
+        let cfg = engine.db.get_all_config().await.unwrap_or_default();
         if let Some(v) = cfg
             .get("max_auto_retries")
             .and_then(|s| s.parse::<i32>().ok())
         {
-            manager.set_max_auto_retries(v);
+            engine.manager.set_max_auto_retries(v);
         }
         if let Some(v) = cfg
             .get("auto_retry_delay_secs")
             .and_then(|s| s.parse::<u64>().ok())
         {
-            manager.set_auto_retry_delay_secs(v);
+            engine.manager.set_auto_retry_delay_secs(v);
         }
     }
 
-    if let Some(rx) = manager.take_progress_rx() {
-        tokio::spawn(download_manager::progress_reporter(rx, db.clone()));
+    if let Some(rx) = engine.manager.take_progress_rx() {
+        tokio::spawn(download_manager::progress_reporter(
+            rx,
+            engine.db.clone(),
+            sink.clone(),
+        ));
     }
 
     // Load named queue settings into the in-memory cache so that
     // per-queue speed limits and concurrency limits take effect immediately.
-    manager.load_queues().await;
+    engine.manager.load_queues().await;
 
     // Channel for spawned tasks to notify completion (for active_tokens cleanup)
-    let mut done_rx: mpsc::Receiver<TaskDone> = match manager.take_done_rx() {
+    let mut done_rx: mpsc::Receiver<TaskDone> = match engine.manager.take_done_rx() {
         Some(rx) => rx,
         None => {
             // Should never happen — take_done_rx returns Some on first call
@@ -260,7 +281,7 @@ pub async fn run(db_dir: PathBuf) {
     };
 
     // Channel for delayed auto-retry of failed tasks (stall / network errors).
-    let mut retry_rx: mpsc::Receiver<String> = match manager.take_retry_rx() {
+    let mut retry_rx: mpsc::Receiver<String> = match engine.manager.take_retry_rx() {
         Some(rx) => rx,
         None => {
             let (_tx, rx) = mpsc::channel(1);
@@ -301,11 +322,11 @@ pub async fn run(db_dir: PathBuf) {
     // Tracker 订阅刷新通道：后台 fetch 任务完成后把结果送回 actor 循环，
     // 由循环更新 BtConfig、失效 BT 会话并通知 Dart。
     let (tracker_sub_tx, mut tracker_sub_rx) =
-        mpsc::channel::<tracker_subscription::FetchOutcome>(4);
+        mpsc::channel::<fluxdown_engine::tracker_subscription::FetchOutcome>(4);
 
     // 启动时自动刷新：订阅启用且缓存超过 24 小时未更新。
     {
-        let cfg = db.get_all_config().await.unwrap_or_default();
+        let cfg = engine.db.get_all_config().await.unwrap_or_default();
         let sub_enabled = cfg
             .get("bt_tracker_sub_enabled")
             .map(|v| v == "true")
@@ -316,13 +337,14 @@ pub async fn run(db_dir: PathBuf) {
             .unwrap_or(0);
         let now = chrono::Utc::now().timestamp();
         if sub_enabled
-            && now.saturating_sub(updated_at) > tracker_subscription::REFRESH_INTERVAL_SECS
+            && now.saturating_sub(updated_at)
+                > fluxdown_engine::tracker_subscription::REFRESH_INTERVAL_SECS
         {
             log_info!(
                 "[actor] tracker subscription stale (updated_at={}), auto-refreshing",
                 updated_at
             );
-            spawn_tracker_sub_refresh(db.clone(), tracker_sub_tx.clone());
+            spawn_tracker_sub_refresh(engine.db.clone(), tracker_sub_tx.clone());
         }
     }
 
@@ -341,7 +363,7 @@ pub async fn run(db_dir: PathBuf) {
     // (changes require an app restart — see the SaveConfig handler below).
     {
         let http_cfg = crate::http_takeover::HttpTakeoverConfig::from_config_map(
-            &db.get_all_config().await.unwrap_or_default(),
+            &engine.db.get_all_config().await.unwrap_or_default(),
         );
         crate::http_takeover::spawn_http_takeover_server(ext_dl_tx.clone(), http_cfg);
     }
@@ -383,12 +405,12 @@ pub async fn run(db_dir: PathBuf) {
         tokio::select! {
             Some(signal) = create_recv.recv() => {
                 let msg = signal.message;
-                manager
+                engine.manager
                     .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, String::new(), 0, msg.torrent_file_bytes, msg.proxy_url, msg.user_agent, msg.queue_id, msg.checksum, msg.extra_headers, msg.selected_file_indices, None, None)
                     .await;
                 // 立即推送 AllTasks，确保 Dart 端在收到 TaskProgress 之前
                 // 已通过 AllTasks 获得正确的 queue_id，防止新任务被错误归入默认队列。
-                manager.load_and_send_all_tasks().await;
+                engine.manager.load_and_send_all_tasks().await;
             }
             Some(signal) = batch_create_recv.recv() => {
                 let msg = signal.message;
@@ -397,21 +419,21 @@ pub async fn run(db_dir: PathBuf) {
                     msg.entries.len(), msg.save_dir, msg.segments,
                 );
                 for entry in msg.entries {
-                    manager
+                    engine.manager
                         .create_task(entry.url, msg.save_dir.clone(), entry.file_name, msg.segments, msg.cookies.clone(), msg.referrer.clone(), 0, Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone(), entry.checksum, HashMap::new(), Vec::new(), None, None)
                         .await;
                 }
                 // 批量创建完成后统一推送一次 AllTasks，同步 queue_id 到 Dart。
-                manager.load_and_send_all_tasks().await;
+                engine.manager.load_and_send_all_tasks().await;
             }
             Some(signal) = control_recv.recv() => {
                 let msg = signal.message;
                 match msg.action {
-                    0 => manager.pause_task(&msg.task_id).await,
-                    1 => manager.resume_task(&msg.task_id).await,
-                    2 => manager.cancel_task(&msg.task_id).await,
-                    3 => manager.delete_task(&msg.task_id, true).await,   // delete record + files
-                    4 => manager.delete_task(&msg.task_id, false).await,  // delete record only
+                    0 => engine.manager.pause_task(&msg.task_id).await,
+                    1 => engine.manager.resume_task(&msg.task_id).await,
+                    2 => engine.manager.cancel_task(&msg.task_id).await,
+                    3 => engine.manager.delete_task(&msg.task_id, true).await,   // delete record + files
+                    4 => engine.manager.delete_task(&msg.task_id, false).await,  // delete record only
                     _ => {}
                 }
             }
@@ -422,22 +444,22 @@ pub async fn run(db_dir: PathBuf) {
                     msg.task_ids.len(), msg.action,
                 );
                 match msg.action {
-                    0 => manager.batch_pause(&msg.task_ids).await,
-                    1 => manager.batch_resume(&msg.task_ids).await,
-                    3 => manager.delete_tasks_batch(&msg.task_ids, true).await,
-                    4 => manager.delete_tasks_batch(&msg.task_ids, false).await,
+                    0 => engine.manager.batch_pause(&msg.task_ids).await,
+                    1 => engine.manager.batch_resume(&msg.task_ids).await,
+                    3 => engine.manager.delete_tasks_batch(&msg.task_ids, true).await,
+                    4 => engine.manager.delete_tasks_batch(&msg.task_ids, false).await,
                     _ => {}
                 }
             }
             Some(_) = all_recv.recv() => {
-                manager.load_and_send_all_tasks().await;
+                engine.manager.load_and_send_all_tasks().await;
                 // Also send queue list so Dart sidebar can show named queues.
-                manager.send_all_queues().await;
+                engine.manager.send_all_queues().await;
             }
             Some(signal) = config_save_recv.recv() => {
                 let msg = signal.message;
                 // Persist to DB first.
-                if let Err(e) = db.set_config(&msg.key, &msg.value).await {
+                if let Err(e) = engine.db.set_config(&msg.key, &msg.value).await {
                     log_info!("Failed to save config: {}", e);
                 }
                 // Notify DownloadManager for runtime-effective settings.
@@ -445,13 +467,13 @@ pub async fn run(db_dir: PathBuf) {
                     "max_concurrent_tasks" => {
                         if let Ok(v) = msg.value.parse::<usize>() {
                             log_info!("[actor] updating max_concurrent to {}", v);
-                            manager.set_max_concurrent(v).await;
+                            engine.manager.set_max_concurrent(v).await;
                         }
                     }
                     "speed_limit_bytes" => {
                         if let Ok(v) = msg.value.parse::<u64>() {
                             log_info!("[actor] updating speed_limit to {} B/s", v);
-                            manager.set_speed_limit(v);
+                            engine.manager.set_speed_limit(v);
                         }
                     }
                     "log_max_size_mb" => {
@@ -462,7 +484,7 @@ pub async fn run(db_dir: PathBuf) {
                     }
                     "default_save_dir" => {
                         log_info!("[actor] updating default_save_dir to {}", msg.value);
-                        manager.set_default_save_dir(msg.value);
+                        engine.manager.set_default_save_dir(msg.value);
                     }
                     // BT config keys — update in-memory BtConfig and invalidate
                     // the current session so the next BT download picks up changes.
@@ -471,16 +493,16 @@ pub async fn run(db_dir: PathBuf) {
                     | "bt_tracker_sub_enabled" | "bt_tracker_sub_urls" => {
                         log_info!("[actor] BT config changed: {}={}", msg.key, msg.value);
                         // Reload the full BT config from DB to stay consistent.
-                        let all_cfg = db.get_all_config().await.unwrap_or_default();
-                        manager.set_bt_config(bt_config_from_map(&all_cfg));
+                        let all_cfg = engine.db.get_all_config().await.unwrap_or_default();
+                        engine.manager.set_bt_config(bt_config_from_map(&all_cfg));
                         // Invalidate (destroy) the current BT session so it is
                         // re-created with the new config on next BT download.
-                        manager.invalidate_bt_session().await;
+                        engine.manager.invalidate_bt_session().await;
                         // 订阅地址变化 / 重新启用订阅 → 后台立即刷新一次。
                         if msg.key == "bt_tracker_sub_urls"
                             || (msg.key == "bt_tracker_sub_enabled" && msg.value == "true")
                         {
-                            spawn_tracker_sub_refresh(db.clone(), tracker_sub_tx.clone());
+                            spawn_tracker_sub_refresh(engine.db.clone(), tracker_sub_tx.clone());
                         }
                     }
                     // Proxy config keys — reload full proxy config from DB
@@ -488,34 +510,34 @@ pub async fn run(db_dir: PathBuf) {
                     "proxy_mode" | "proxy_type" | "proxy_host" | "proxy_port"
                     | "proxy_username" | "proxy_password" | "proxy_no_list" => {
                         log_info!("[actor] proxy config changed: {}={}", msg.key, msg.value);
-                        let all_cfg = db.get_all_config().await.unwrap_or_default();
+                        let all_cfg = engine.db.get_all_config().await.unwrap_or_default();
                         let new_proxy = ProxyConfig::from_config_map(&all_cfg);
-                        if let Err(e) = manager.set_proxy_config(new_proxy) {
+                        if let Err(e) = engine.manager.set_proxy_config(new_proxy) {
                             log_info!("[actor] failed to apply proxy config: {}", e);
                         }
                     }
                     "global_user_agent" => {
                         log_info!("[actor] user_agent changed: {}", msg.value);
-                        if let Err(e) = manager.set_user_agent(msg.value) {
+                        if let Err(e) = engine.manager.set_user_agent(msg.value) {
                             log_info!("[actor] failed to apply user_agent: {}", e);
                         }
                     }
                     "default_segments" => {
                         if let Ok(v) = msg.value.parse::<i32>() {
                             log_info!("[actor] updating default_segments to {}", v);
-                            manager.set_default_segments(v);
+                            engine.manager.set_default_segments(v);
                         }
                     }
                     "max_auto_retries" => {
                         if let Ok(v) = msg.value.parse::<i32>() {
                             log_info!("[actor] updating max_auto_retries to {}", v);
-                            manager.set_max_auto_retries(v);
+                            engine.manager.set_max_auto_retries(v);
                         }
                     }
                     "auto_retry_delay_secs" => {
                         if let Ok(v) = msg.value.parse::<u64>() {
                             log_info!("[actor] updating auto_retry_delay_secs to {}", v);
-                            manager.set_auto_retry_delay_secs(v);
+                            engine.manager.set_auto_retry_delay_secs(v);
                         }
                     }
                     // 本地 HTTP 接管服务的启停/端口/token 在启动时绑定，
@@ -530,7 +552,7 @@ pub async fn run(db_dir: PathBuf) {
                 }
             }
             Some(_) = config_req_recv.recv() => {
-                match db.get_all_config().await {
+                match engine.db.get_all_config().await {
                     Ok(map) => {
                         let entries: Vec<ConfigEntry> = map
                             .into_iter()
@@ -589,7 +611,7 @@ pub async fn run(db_dir: PathBuf) {
                 let ctx = ext_request_cache.remove(&msg.url).unwrap_or_default();
                 let extra_headers = ctx.headers;
                 let method = ctx.method;
-                let body = ctx.body;
+                let body = ctx.body.map(nm_body_to_captured);
                 log_info!(
                     "[actor] user confirmed external download: url={}, cookies_len={}, extra_headers={}, method={:?}, has_body={}",
                     msg.url,
@@ -598,48 +620,48 @@ pub async fn run(db_dir: PathBuf) {
                     method,
                     body.is_some(),
                 );
-                manager
+                engine.manager
                     .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, msg.referrer, msg.hint_file_size, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id, String::new(), extra_headers, Vec::new(), method, body)
                     .await;
                 // 推送 AllTasks 确保 Dart 端获得正确 queue_id。
-                manager.load_and_send_all_tasks().await;
+                engine.manager.load_and_send_all_tasks().await;
             }
             // --- Named queue management ---
             Some(signal) = create_queue_recv.recv() => {
                 let msg = signal.message;
                 log_info!("[actor] CreateQueue: name={}", msg.name);
-                manager.create_queue(msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
+                engine.manager.create_queue(msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
             }
             Some(signal) = update_queue_recv.recv() => {
                 let msg = signal.message;
                 log_info!("[actor] UpdateQueue: id={}", msg.queue_id);
-                manager.update_queue(msg.queue_id, msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
+                engine.manager.update_queue(msg.queue_id, msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
             }
             Some(signal) = delete_queue_recv.recv() => {
                 let msg = signal.message;
                 log_info!("[actor] DeleteQueue: id={}", msg.queue_id);
-                manager.delete_queue(msg.queue_id).await;
+                engine.manager.delete_queue(msg.queue_id).await;
             }
             Some(signal) = move_task_queue_recv.recv() => {
                 let msg = signal.message;
                 log_info!("[actor] MoveTaskToQueue: task={}, queue={}", msg.task_id, msg.queue_id);
-                manager.move_task_to_queue(msg.task_id, msg.queue_id).await;
+                engine.manager.move_task_to_queue(msg.task_id, msg.queue_id).await;
             }
             Some(_) = all_queues_recv.recv() => {
-                manager.send_all_queues().await;
+                engine.manager.send_all_queues().await;
             }
             Some(done) = done_rx.recv() => {
-                manager.on_task_done(&done).await;
+                engine.manager.on_task_done(&done).await;
             }
             // --- Auto-retry for stalled/failed tasks ---
             Some(task_id) = retry_rx.recv() => {
                 // 安全检查：仅在任务仍处于 error 状态时才自动恢复。
                 // 如果用户已手动暂停、恢复或删除了该任务，跳过重试。
-                if manager.is_task_in_error(&task_id).await {
+                if engine.manager.is_task_in_error(&task_id).await {
                     log_info!("[actor] auto-retry: resuming task {}", task_id);
                     // 使用 resume_task_auto 而非 resume_task：不重置自动重试计数，
                     // 使 on_task_done 中的累积计数能正确递增并最终触发重试上限。
-                    manager.resume_task_auto(&task_id).await;
+                    engine.manager.resume_task_auto(&task_id).await;
                 } else {
                     log_info!("[actor] auto-retry: skipping task {} (no longer in error state)", task_id);
                 }
@@ -767,7 +789,7 @@ pub async fn run(db_dir: PathBuf) {
             // --- System proxy detection ---
             Some(_) = detect_sys_proxy_recv.recv() => {
                 tokio::task::spawn_blocking(|| {
-                    match crate::proxy_config::detect_system_proxy() {
+                    match fluxdown_engine::proxy_config::detect_system_proxy() {
                         Ok(Some(cfg)) => {
                             SystemProxyInfo {
                                 detected: true,
@@ -807,13 +829,13 @@ pub async fn run(db_dir: PathBuf) {
                     msg.task_id,
                     msg.selected_index,
                 );
-                manager.send_hls_quality_selection(&msg.task_id, msg.selected_index);
+                engine.selector.provide_hls_selection(&msg.task_id, msg.selected_index);
             }
             // --- Priority (Boost) download ---
             Some(signal) = set_priority_recv.recv() => {
                 let task_id = signal.message.task_id;
                 log_info!("[actor] SetPriorityTask: task_id={}", task_id);
-                manager.set_priority_task(task_id).await;
+                engine.manager.set_priority_task(task_id).await;
             }
             // --- Proxy connectivity test ---
             Some(signal) = test_proxy_recv.recv() => {
@@ -822,31 +844,31 @@ pub async fn run(db_dir: PathBuf) {
                     "[actor] proxy test: type={}, host={}, port={}",
                     msg.proxy_type, msg.proxy_host, msg.proxy_port,
                 );
-                tokio::spawn(async move {
-                    let result = crate::proxy_config::test_proxy_connection(
-                        &msg.proxy_type,
-                        &msg.proxy_host,
-                        &msg.proxy_port,
-                        &msg.proxy_username,
-                        &msg.proxy_password,
-                    ).await;
-                    match result {
-                        Ok(latency_ms) => {
-                            ProxyTestResult {
-                                success: true,
-                                latency_ms,
-                                error_message: String::new(),
-                            }.send_signal_to_dart();
-                        }
-                        Err(e) => {
-                            ProxyTestResult {
-                                success: false,
-                                latency_ms: 0,
-                                error_message: e.to_string(),
-                            }.send_signal_to_dart();
-                        }
+                // `Engine::test_proxy_connection` 内部就是纯 async I/O(reqwest),
+                // 本身从不阻塞 current_thread runtime,无需外部 tokio::spawn 隔离。
+                let result = engine.test_proxy_connection(
+                    &msg.proxy_type,
+                    &msg.proxy_host,
+                    &msg.proxy_port,
+                    &msg.proxy_username,
+                    &msg.proxy_password,
+                ).await;
+                match result {
+                    Ok(latency_ms) => {
+                        ProxyTestResult {
+                            success: true,
+                            latency_ms,
+                            error_message: String::new(),
+                        }.send_signal_to_dart();
                     }
-                });
+                    Err(e) => {
+                        ProxyTestResult {
+                            success: false,
+                            latency_ms: 0,
+                            error_message: e.to_string(),
+                        }.send_signal_to_dart();
+                    }
+                }
             }
             // --- BT file selection ---
             Some(signal) = select_bt_files_recv.recv() => {
@@ -856,7 +878,7 @@ pub async fn run(db_dir: PathBuf) {
                     msg.task_id,
                     msg.selected_indices,
                 );
-                manager.deliver_bt_file_selection(&msg.task_id, msg.selected_indices).await;
+                engine.selector.provide_bt_selection(&msg.task_id, msg.selected_indices);
             }
             // --- Reveal file in native file manager ---
             Some(signal) = reveal_file_recv.recv() => {
@@ -864,13 +886,13 @@ pub async fn run(db_dir: PathBuf) {
                 // 从 DB 读用户自定义 FM 命令模板（空字符串 = 用平台默认）。
                 // 在 spawn_blocking 之前异步读取，避免阻塞 actor 主循环；
                 // get_config 失败按空模板处理，让平台默认兜底。
-                let file_tpl = db
+                let file_tpl = engine.db
                     .get_config("reveal_file_cmd")
                     .await
                     .ok()
                     .flatten()
                     .unwrap_or_default();
-                let dir_tpl = db
+                let dir_tpl = engine.db
                     .get_config("open_dir_cmd")
                     .await
                     .ok()
@@ -888,27 +910,24 @@ pub async fn run(db_dir: PathBuf) {
                     msg.probe_id,
                     msg.torrent_bytes.len(),
                 );
-                // Pure local parse — run in a blocking thread to avoid
-                // blocking the current_thread runtime.
-                let probe_id = msg.probe_id;
-                let bytes = msg.torrent_bytes;
-                tokio::task::spawn_blocking(move || {
-                    bt_downloader::probe_torrent_meta(probe_id, bytes);
-                });
+                // `Engine::probe_torrent_meta` 内部 spawn_blocking,不阻塞
+                // current_thread runtime;纯本地解析(无网络),延迟可忽略。
+                let result = engine.probe_torrent_meta(msg.probe_id, msg.torrent_bytes).await;
+                crate::signals::TorrentMetaResult::from(result).send_signal_to_dart();
             }
             // --- Manual tracker subscription refresh (Settings page button) ---
             Some(_) = update_tracker_sub_recv.recv() => {
                 log_info!("[actor] manual tracker subscription refresh requested");
-                spawn_tracker_sub_refresh(db.clone(), tracker_sub_tx.clone());
+                spawn_tracker_sub_refresh(engine.db.clone(), tracker_sub_tx.clone());
             }
             // --- Tracker subscription refresh finished ---
             Some(outcome) = tracker_sub_rx.recv() => {
-                let all_cfg = db.get_all_config().await.unwrap_or_default();
+                let all_cfg = engine.db.get_all_config().await.unwrap_or_default();
                 if outcome.is_success() {
                     // 缓存已由后台任务写入 DB；重载 BtConfig 并失效会话，
                     // 使下一个 BT 任务用上最新的合并 tracker 列表。
-                    manager.set_bt_config(bt_config_from_map(&all_cfg));
-                    manager.invalidate_bt_session().await;
+                    engine.manager.set_bt_config(bt_config_from_map(&all_cfg));
+                    engine.manager.invalidate_bt_session().await;
                 }
                 let updated_at = all_cfg
                     .get("bt_tracker_sub_updated_at")
@@ -925,5 +944,25 @@ pub async fn run(db_dir: PathBuf) {
                 .send_signal_to_dart();
             }
         }
+    }
+}
+
+/// 把浏览器扩展/Native Messaging 的 wire-format `RequestBody` 转换为引擎侧
+/// 传输无关的 `CapturedRequestBody`——两者字段形状一致，仅类型来源不同
+/// (native_messaging 是 hub 的 NM 协议 DTO，engine 侧不感知 NM)。
+fn nm_body_to_captured(
+    body: crate::native_messaging::RequestBody,
+) -> fluxdown_engine::downloader::CapturedRequestBody {
+    use fluxdown_engine::downloader::CapturedRequestBody as Captured;
+    match body {
+        native_messaging::RequestBody::FormData { fields } => Captured::FormData { fields },
+        native_messaging::RequestBody::Urlencoded { raw } => Captured::Urlencoded { raw },
+        native_messaging::RequestBody::Raw {
+            bytes_b64,
+            content_type,
+        } => Captured::Raw {
+            bytes_b64,
+            content_type,
+        },
     }
 }

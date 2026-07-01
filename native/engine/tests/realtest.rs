@@ -13,25 +13,27 @@
 //!
 //! 默认 `#[ignore]`（绑定端口 + 略慢），需显式 `--ignored` 运行。
 
-#![cfg(test)]
-
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use fluxdown_engine::db::Db;
+use fluxdown_engine::downloader::{ProgressUpdate, RequestSpec, build_client, resolve_file_info};
+use fluxdown_engine::events::{EngineEvent, EventSink};
+use fluxdown_engine::proxy_config::ProxyConfig;
+use fluxdown_engine::segment_coordinator::run_coordinated_download;
+use fluxdown_engine::speed_limiter::SpeedLimiter;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::db::Db;
-use crate::downloader::{
-    ProgressUpdate, RequestSpec, build_client, resolve_file_info,
-};
-use crate::proxy_config::ProxyConfig;
-use crate::segment_coordinator::run_coordinated_download;
-use crate::speed_limiter::SpeedLimiter;
+/// 测试专用 no-op sink——仅关心下载产物字节是否正确。
+struct NoopTestSink;
+impl EventSink for NoopTestSink {
+    fn emit(&self, _event: EngineEvent) {}
+}
 
 // ===========================================================================
 // 测试用本地 HTTP/1.1 服务器
@@ -114,6 +116,10 @@ impl ServerState {
 /// 运行中的测试服务器句柄；drop 时停掉 accept 循环。
 struct TestServer {
     addr: std::net::SocketAddr,
+    /// 保持 `Arc<ServerState>` 存活并与 accept 循环共享所有权；测试用例
+    /// 通过各自持有的 `Arc<ServerState>` clone 修改对抗行为标志,不经过
+    /// 这个字段读取,但它是 `state` 生命周期与 `TestServer` 绑定的必要持有点。
+    #[allow(dead_code)]
     state: Arc<ServerState>,
     accept_task: tokio::task::JoinHandle<()>,
 }
@@ -257,7 +263,10 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
     let total = body.len() as i64;
 
     if std::env::var("RT_TRACE").is_ok() {
-        eprintln!("[srv] {} {} range={:?} total={}", req.method, req.path, req.range, total);
+        eprintln!(
+            "[srv] {} {} range={:?} total={}",
+            req.method, req.path, req.range, total
+        );
     }
 
     let is_head = req.method.eq_ignore_ascii_case("HEAD");
@@ -307,7 +316,9 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
             Some(g) => g.as_ref().clone(),
             None => body.as_ref().clone(),
         };
-        let cl = st.fake_full_content_length.unwrap_or(send_body.len() as i64);
+        let cl = st
+            .fake_full_content_length
+            .unwrap_or(send_body.len() as i64);
         let mut h = String::new();
         h.push_str("HTTP/1.1 200 OK\r\n");
         if !st.omit_content_length_full {
@@ -372,7 +383,10 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
     let mut h = String::new();
     h.push_str("HTTP/1.1 206 Partial Content\r\n");
     h.push_str(&format!("Content-Length: {}\r\n", len));
-    h.push_str(&format!("Content-Range: bytes {}-{}/{}\r\n", start, end, total));
+    h.push_str(&format!(
+        "Content-Range: bytes {}-{}/{}\r\n",
+        start, end, total
+    ));
     h.push_str("Accept-Ranges: bytes\r\n");
     if st.emit_validators_on_range {
         h.push_str(&format!("ETag: \"{}\"\r\n", etag));
@@ -395,7 +409,12 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
 
     write_all(&mut stream, &chunk).await?;
     if std::env::var("RT_TRACE").is_ok() {
-        eprintln!("[srv] sent 206 {}-{} ({} bytes), closing", start, end, chunk.len());
+        eprintln!(
+            "[srv] sent 206 {}-{} ({} bytes), closing",
+            start,
+            end,
+            chunk.len()
+        );
     }
     let _ = stream.shutdown().await;
 
@@ -468,11 +487,7 @@ fn test_client() -> reqwest::Client {
 }
 
 fn unique_dir(tag: &str) -> std::path::PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "fluxdown_realtest_{}_{}",
-        tag,
-        std::process::id()
-    ));
+    let d = std::env::temp_dir().join(format!("fluxdown_realtest_{}_{}", tag, std::process::id()));
     std::fs::create_dir_all(&d).expect("create work dir");
     d
 }
@@ -491,7 +506,10 @@ async fn run_coord(
     segments: i32,
     etag: &str,
     cancel: &CancellationToken,
-) -> (Result<(), crate::downloader::DownloadError>, std::path::PathBuf) {
+) -> (
+    Result<(), fluxdown_engine::downloader::DownloadError>,
+    std::path::PathBuf,
+) {
     let dest = work_dir.join(format!("{task_id}.bin"));
     let client = test_client();
     let db = Db::open(work_dir).expect("Db::open");
@@ -513,6 +531,7 @@ async fn run_coord(
     let (tx, rx) = mpsc::channel::<ProgressUpdate>(256);
     let dh = drain(rx);
     let spec = RequestSpec::empty_get();
+    let sink = NoopTestSink;
 
     let res = run_coordinated_download(
         task_id,
@@ -526,6 +545,7 @@ async fn run_coord(
         cancel,
         &speed_limiter,
         &spec,
+        &sink,
         etag,
         "",
     )
@@ -635,7 +655,11 @@ async fn multi_segment_correctness_matrix() {
             println!("  - {f}");
         }
     }
-    assert!(failures.is_empty(), "多段下载出现 {} 处损坏/错误", failures.len());
+    assert!(
+        failures.is_empty(),
+        "多段下载出现 {} 处损坏/错误",
+        failures.len()
+    );
 }
 
 /// 隔离复现：2 字节单段下载是否稳定 hang。
@@ -655,14 +679,30 @@ async fn repro_small_single_segment() {
         eprintln!("[repro] START size={size} segs=1");
         let run = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_coord(&work_dir, &format!("r{size}"), &url, size as i64, 1, "", &cancel),
+            run_coord(
+                &work_dir,
+                &format!("r{size}"),
+                &url,
+                size as i64,
+                1,
+                "",
+                &cancel,
+            ),
         )
         .await;
         match run {
             Err(_) => eprintln!("[repro] size={size} segs=1: ❌ HANG"),
             Ok((Ok(()), dest)) => {
                 let got = sha256_file(&dest).await;
-                eprintln!("[repro] size={size} segs=1: {} (sha {})", if got == expected { "✅ OK" } else { "❌ CORRUPT" }, &got[..8]);
+                eprintln!(
+                    "[repro] size={size} segs=1: {} (sha {})",
+                    if got == expected {
+                        "✅ OK"
+                    } else {
+                        "❌ CORRUPT"
+                    },
+                    &got[..8]
+                );
             }
             Ok((Err(e), _)) => eprintln!("[repro] size={size} segs=1: ERR {e}"),
         }
@@ -710,7 +750,10 @@ async fn coordinator_handles_degenerate_segment_count() {
             }
             Ok((Ok(()), dest)) => {
                 let got = sha256_file(&dest).await;
-                let got_size = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
+                let got_size = tokio::fs::metadata(&dest)
+                    .await
+                    .map(|m| m.len())
+                    .unwrap_or(0);
                 if got != expected {
                     corruptions.push(format!(
                         "size={size} segs={segs}: 报告成功但 SHA 损坏 (size={got_size})"
@@ -730,11 +773,19 @@ async fn coordinator_handles_degenerate_segment_count() {
     if hangs.is_empty() && corruptions.is_empty() {
         println!("✅ 无 hang、无静默损坏");
     } else {
-        for h in &hangs { println!("  ❌ {h}"); }
-        for c in &corruptions { println!("  ❌ {c}"); }
+        for h in &hangs {
+            println!("  ❌ {h}");
+        }
+        for c in &corruptions {
+            println!("  ❌ {c}");
+        }
     }
     assert!(hangs.is_empty(), "退化段数导致 hang：{:?}", hangs);
-    assert!(corruptions.is_empty(), "退化段数导致静默损坏：{:?}", corruptions);
+    assert!(
+        corruptions.is_empty(),
+        "退化段数导致静默损坏：{:?}",
+        corruptions
+    );
 }
 
 // ===========================================================================
@@ -762,17 +813,25 @@ async fn resume_after_cancel_is_byte_exact() {
     let client = test_client();
     let db = Db::open(&work_dir).expect("db");
     db.insert_task(
-        task_id, &url,
+        task_id,
+        &url,
         &dest.file_name().unwrap().to_string_lossy(),
         &work_dir.to_string_lossy(),
-        8, size as i64, "", "", "",
-    ).await.unwrap();
+        8,
+        size as i64,
+        "",
+        "",
+        "",
+    )
+    .await
+    .unwrap();
 
     // ---- 第一程：启动后短暂运行即 cancel ----
     let speed_limiter = SpeedLimiter::new(0);
     let (tx, rx) = mpsc::channel::<ProgressUpdate>(256);
     let dh = drain(rx);
     let spec = RequestSpec::empty_get();
+    let sink = NoopTestSink;
     let cancel = CancellationToken::new();
     let cancel2 = cancel.clone();
     // 在收到一定进度后取消（这里用定时器近似“中途”）
@@ -782,27 +841,59 @@ async fn resume_after_cancel_is_byte_exact() {
     });
 
     let first = run_coordinated_download(
-        task_id, &url, &dest, size as i64, 8,
-        &client, &db, &tx, &cancel, &speed_limiter, &spec, "", "",
-    ).await;
+        task_id,
+        &url,
+        &dest,
+        size as i64,
+        8,
+        &client,
+        &db,
+        &tx,
+        &cancel,
+        &speed_limiter,
+        &spec,
+        &sink,
+        "",
+        "",
+    )
+    .await;
     drop(tx);
     let _ = dh.await;
     let _ = canceller.await;
     println!("第一程结果: {:?}", first.as_ref().map(|_| "ok"));
 
-    let partial_len = tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0);
+    let partial_len = tokio::fs::metadata(&dest)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
     let segs_in_db = db.load_segments(task_id).await.unwrap();
     let dl_in_db: i64 = segs_in_db.iter().map(|s| s.downloaded_bytes).sum();
-    println!("中断后：磁盘 {partial_len} 字节，DB 记录已下载 {dl_in_db} 字节，段数 {}", segs_in_db.len());
+    println!(
+        "中断后：磁盘 {partial_len} 字节，DB 记录已下载 {dl_in_db} 字节，段数 {}",
+        segs_in_db.len()
+    );
 
     // ---- 第二程：续传到完成 ----
     let (tx2, rx2) = mpsc::channel::<ProgressUpdate>(256);
     let dh2 = drain(rx2);
     let cancel_done = CancellationToken::new();
     let second = run_coordinated_download(
-        task_id, &url, &dest, size as i64, 8,
-        &client, &db, &tx2, &cancel_done, &speed_limiter, &spec, "", "",
-    ).await;
+        task_id,
+        &url,
+        &dest,
+        size as i64,
+        8,
+        &client,
+        &db,
+        &tx2,
+        &cancel_done,
+        &speed_limiter,
+        &spec,
+        &sink,
+        "",
+        "",
+    )
+    .await;
     drop(tx2);
     let _ = dh2.await;
     second.expect("续传应成功");
@@ -872,7 +963,10 @@ async fn probe_detects_range_support_and_size() {
         let info = resolve_file_info(&client, &server.url("/file"), &RequestSpec::empty_get())
             .await
             .expect("probe");
-        println!("支持range: total={} supports_range={}", info.total_bytes, info.supports_range);
+        println!(
+            "支持range: total={} supports_range={}",
+            info.total_bytes, info.supports_range
+        );
         assert_eq!(info.total_bytes, size as i64);
         assert!(info.supports_range, "应检测到 range 支持");
         drop(server);
@@ -888,7 +982,10 @@ async fn probe_detects_range_support_and_size() {
         let info = resolve_file_info(&client, &server.url("/file"), &RequestSpec::empty_get())
             .await
             .expect("probe2");
-        println!("不支持range: total={} supports_range={}", info.total_bytes, info.supports_range);
+        println!(
+            "不支持range: total={} supports_range={}",
+            info.total_bytes, info.supports_range
+        );
         assert_eq!(info.total_bytes, size as i64);
         assert!(!info.supports_range, "应检测到不支持 range");
         drop(server);
@@ -923,9 +1020,22 @@ async fn file_changed_midway_must_not_silently_corrupt() {
 
     // 用 v1 的 etag 启动（模拟 probe 时看到的是 v1）
     let cancel = CancellationToken::new();
-    let (res, dest) = run_coord(&work_dir, "swap-task", &url, size as i64, 8, "\"etag-v1\"", &cancel).await;
+    let (res, dest) = run_coord(
+        &work_dir,
+        "swap-task",
+        &url,
+        size as i64,
+        8,
+        "\"etag-v1\"",
+        &cancel,
+    )
+    .await;
 
-    let got_sha = if dest.exists() { sha256_file(&dest).await } else { "<no file>".into() };
+    let got_sha = if dest.exists() {
+        sha256_file(&dest).await
+    } else {
+        "<no file>".into()
+    };
     println!("结果: {:?}", res.as_ref().map(|_| "ok"));
     println!("  最终 SHA: {got_sha}");
     println!("  v1 SHA  : {sha_v1}");
@@ -972,7 +1082,7 @@ async fn run_full(
     checksum: &str,
     cancel: &CancellationToken,
 ) -> (i32, std::path::PathBuf) {
-    use crate::downloader::{DownloadParams, run_download};
+    use fluxdown_engine::downloader::{DownloadParams, run_download};
 
     let client = test_client();
     let speed_limiter = SpeedLimiter::new(0);
@@ -1003,7 +1113,8 @@ async fn run_full(
         referrer: String::new(),
         hint_file_size,
         proxy_config: ProxyConfig::default(),
-        hls_quality_rx: None,
+        sink: std::sync::Arc::new(NoopTestSink),
+        selector: std::sync::Arc::new(fluxdown_engine::NoopSelection),
         checksum: checksum.to_string(),
         extra_headers: std::collections::HashMap::new(),
         spec: RequestSpec::empty_get(),
@@ -1015,10 +1126,28 @@ async fn run_full(
     (status, work_dir.join(file_name))
 }
 
-async fn insert_simple_task(db: &Db, work_dir: &Path, task_id: &str, url: &str, name: &str, segs: i32, total: i64) {
-    db.insert_task(task_id, url, name, &work_dir.to_string_lossy(), segs, total, "", "", "")
-        .await
-        .expect("insert_task");
+async fn insert_simple_task(
+    db: &Db,
+    work_dir: &Path,
+    task_id: &str,
+    url: &str,
+    name: &str,
+    segs: i32,
+    total: i64,
+) {
+    db.insert_task(
+        task_id,
+        url,
+        name,
+        &work_dir.to_string_lossy(),
+        segs,
+        total,
+        "",
+        "",
+        "",
+    )
+    .await
+    .expect("insert_task");
 }
 
 // ---------------------------------------------------------------------------
@@ -1037,9 +1166,9 @@ async fn gzip_single_stream_should_succeed() {
     eprintln!("[gzip] plain={} gz={}", plain.len(), gz.len());
 
     let mut s = ServerState::new(Arc::new(plain.clone()), "etg");
-    s.support_range = false;              // 强制单流
+    s.support_range = false; // 强制单流
     s.advertise_accept_ranges = false;
-    s.gzip_body = Some(Arc::new(gz));     // 全量 GET 返回 gzip 体
+    s.gzip_body = Some(Arc::new(gz)); // 全量 GET 返回 gzip 体
     let st = Arc::new(s);
     let server = start_server(st).await;
     let url = server.url("/file");
@@ -1047,12 +1176,26 @@ async fn gzip_single_stream_should_succeed() {
     let db = Db::open(&work_dir).expect("db");
     insert_simple_task(&db, &work_dir, "gz", &url, "out.bin", 0, 0).await;
     let cancel = CancellationToken::new();
-    let (status, dest) = run_full(&work_dir, &db, "gz", &url, "out.bin", 0, 0, false, "", &cancel).await;
+    let (status, dest) = run_full(
+        &work_dir, &db, "gz", &url, "out.bin", 0, 0, false, "", &cancel,
+    )
+    .await;
 
-    let got = if dest.exists() { sha256_file(&dest).await } else { "<missing>".into() };
-    eprintln!("[gzip] status={status} dest_exists={} sha={}", dest.exists(), got);
+    let got = if dest.exists() {
+        sha256_file(&dest).await
+    } else {
+        "<missing>".into()
+    };
+    eprintln!(
+        "[gzip] status={status} dest_exists={} sha={}",
+        dest.exists(),
+        got
+    );
     // 正确行为：解压后写盘的明文应被接受为完成，且内容正确。
-    assert_eq!(status, 3, "gzip 单流下载应成功（解压后正确文件不该被完整性校验拒绝）");
+    assert_eq!(
+        status, 3,
+        "gzip 单流下载应成功（解压后正确文件不该被完整性校验拒绝）"
+    );
     assert_eq!(got, expected, "解压内容应与原始明文一致");
     drop(server);
 }
@@ -1082,10 +1225,16 @@ async fn layered_content_encoding_must_error_not_corrupt() {
     let db = Db::open(&work_dir).expect("db");
     insert_simple_task(&db, &work_dir, "ly", &url, "out.bin", 0, 0).await;
     let cancel = CancellationToken::new();
-    let (status, dest) = run_full(&work_dir, &db, "ly", &url, "out.bin", 0, 0, false, "", &cancel).await;
+    let (status, dest) = run_full(
+        &work_dir, &db, "ly", &url, "out.bin", 0, 0, false, "", &cancel,
+    )
+    .await;
     eprintln!("[layered] status={status} dest_exists={}", dest.exists());
     // 正确行为：无法完整解码的多层压缩必须报错（status=4），绝不静默落盘残留压缩字节。
-    assert_eq!(status, 4, "❌ 多层 Content-Encoding 被静默接受——只解一层、内层压缩字节当成功落盘");
+    assert_eq!(
+        status, 4,
+        "❌ 多层 Content-Encoding 被静默接受——只解一层、内层压缩字节当成功落盘"
+    );
     drop(server);
 }
 
@@ -1103,10 +1252,10 @@ async fn no_content_length_truncation_must_not_be_accepted() {
     let truncated_at = 123_456usize;
 
     let mut s = ServerState::new(Arc::new(full.clone()), "etn");
-    s.support_range = false;                  // 单流
+    s.support_range = false; // 单流
     s.advertise_accept_ranges = false;
-    s.omit_content_length_full = true;        // 下载响应不发 Content-Length
-    s.close_full_after = Some(truncated_at);  // 只发前 123456 字节就关闭
+    s.omit_content_length_full = true; // 下载响应不发 Content-Length
+    s.close_full_after = Some(truncated_at); // 只发前 123456 字节就关闭
     let st = Arc::new(s);
     let server = start_server(st).await;
     let url = server.url("/file");
@@ -1116,14 +1265,34 @@ async fn no_content_length_truncation_must_not_be_accepted() {
     // 收到 K<N 字节。可信大小 + 截断 + 无 CL → 必须判失败而非把截断文件当完成。
     insert_simple_task(&db, &work_dir, "nc", &url, "out.bin", 0, 0).await;
     let cancel = CancellationToken::new();
-    let (status, dest) = run_full(&work_dir, &db, "nc", &url, "out.bin", 0, 0, false, "", &cancel).await;
+    let (status, dest) = run_full(
+        &work_dir, &db, "nc", &url, "out.bin", 0, 0, false, "", &cancel,
+    )
+    .await;
 
-    let dlen = if dest.exists() { tokio::fs::metadata(&dest).await.map(|m| m.len()).unwrap_or(0) } else { 0 };
-    eprintln!("[nocl] status={status} dest_exists={} len={} (期望完整 {})", dest.exists(), dlen, full.len());
+    let dlen = if dest.exists() {
+        tokio::fs::metadata(&dest)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    eprintln!(
+        "[nocl] status={status} dest_exists={} len={} (期望完整 {})",
+        dest.exists(),
+        dlen,
+        full.len()
+    );
     // 正确行为：已知完整大小却只收到部分字节且无 CL 兜底 → 必须判失败，绝不能把截断文件当完成。
     if status == 3 {
-        assert_eq!(dlen as usize, full.len(),
-            "❌ 截断文件（{}/{}）被当作成功完成——静默数据丢失", dlen, full.len());
+        assert_eq!(
+            dlen as usize,
+            full.len(),
+            "❌ 截断文件（{}/{}）被当作成功完成——静默数据丢失",
+            dlen,
+            full.len()
+        );
     }
     drop(server);
 }
@@ -1146,8 +1315,8 @@ async fn single_stream_resume_must_not_splice_changed_file() {
     let cut = 150_000usize;
 
     let mut s = ServerState::new(build_a.clone(), "vA");
-    s.support_range = true;              // 支持 range（续传发 Range）
-    s.close_full_after = Some(cut);      // 第一程：全量 GET 发到 cut 就断（留下部分文件）
+    s.support_range = true; // 支持 range（续传发 Range）
+    s.close_full_after = Some(cut); // 第一程：全量 GET 发到 cut 就断（留下部分文件）
     let st = Arc::new(s);
     let server = start_server(st.clone()).await;
     let url = server.url("/file");
@@ -1157,30 +1326,52 @@ async fn single_stream_resume_must_not_splice_changed_file() {
 
     // 第一程：segment_count=1 强制单流；hint=0 走 probe（probe 看到支持 range）
     let cancel = CancellationToken::new();
-    let (st1, dest) = run_full(&work_dir, &db, "sp", &url, "out.bin", 1, 0, false, "", &cancel).await;
+    let (st1, dest) = run_full(
+        &work_dir, &db, "sp", &url, "out.bin", 1, 0, false, "", &cancel,
+    )
+    .await;
     let partial = if dest.with_extension("bin.fdownloading").exists() {
-        tokio::fs::metadata(dest.with_extension("bin.fdownloading")).await.map(|m| m.len()).unwrap_or(0)
-    } else { 0 };
-    eprintln!("[splice] 第一程 status={st1} 部分文件? dest_exists={} partial_temp={}", dest.exists(), partial);
+        tokio::fs::metadata(dest.with_extension("bin.fdownloading"))
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    eprintln!(
+        "[splice] 第一程 status={st1} 部分文件? dest_exists={} partial_temp={}",
+        dest.exists(),
+        partial
+    );
 
     // 服务器切换到 build B（新版本，新 etag），并恢复完整传输（关闭提前断流）
     {
         *st.body.lock().await = build_b.clone();
         *st.etag.lock().await = "vB".to_string();
-        st.disable_close_full.store(true, std::sync::atomic::Ordering::SeqCst);
+        st.disable_close_full
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     // 第二程：is_resume=true 续传
     let cancel2 = CancellationToken::new();
-    let (st2, _dest2) = run_full(&work_dir, &db, "sp", &url, "out.bin", 1, 0, true, "", &cancel2).await;
-    let got = if dest.exists() { sha256_file(&dest).await } else { "<missing>".into() };
+    let (st2, _dest2) = run_full(
+        &work_dir, &db, "sp", &url, "out.bin", 1, 0, true, "", &cancel2,
+    )
+    .await;
+    let got = if dest.exists() {
+        sha256_file(&dest).await
+    } else {
+        "<missing>".into()
+    };
     eprintln!("[splice] 第二程 status={st2} sha={got}\n  A={sha_a}\n  B={sha_b}");
 
     // 正确行为：续传检测到文件变化（If-Range），应整文件按 B 重下或报错；
     // 绝不能产出 A 前缀 + B 尾部 的拼接（既非 A 也非 B）。
     if st2 == 3 {
-        assert!(got == sha_b || got == sha_a,
-            "❌ 单流续传把变化的文件静默拼接：最终 SHA 既非 A 也非 B");
+        assert!(
+            got == sha_b || got == sha_a,
+            "❌ 单流续传把变化的文件静默拼接：最终 SHA 既非 A 也非 B"
+        );
     }
     drop(server);
 }
@@ -1211,12 +1402,21 @@ async fn multiseg_etag_stripped_must_not_silently_splice() {
     // 多段：传入 probe 看到的 etag（带引号），但 206 不回 etag → do_segment 的校验被短路
     let cancel = CancellationToken::new();
     let (res, dest) = run_coord(&work_dir, "xv", &url, size as i64, 8, "\"etag-1\"", &cancel).await;
-    let got = if dest.exists() { sha256_file(&dest).await } else { "<missing>".into() };
-    eprintln!("[xver] result={:?} sha={got}\n  v1={sha1}\n  v2={sha2}", res.as_ref().map(|_| "ok"));
+    let got = if dest.exists() {
+        sha256_file(&dest).await
+    } else {
+        "<missing>".into()
+    };
+    eprintln!(
+        "[xver] result={:?} sha={got}\n  v1={sha1}\n  v2={sha2}",
+        res.as_ref().map(|_| "ok")
+    );
 
     if res.is_ok() {
-        assert!(got == sha1 || got == sha2,
-            "❌ 多段下载在 CDN 剥离 etag 且文件变化时静默拼接：最终 SHA 既非 v1 也非 v2");
+        assert!(
+            got == sha1 || got == sha2,
+            "❌ 多段下载在 CDN 剥离 etag 且文件变化时静默拼接：最终 SHA 既非 v1 也非 v2"
+        );
     }
     drop(server);
 }

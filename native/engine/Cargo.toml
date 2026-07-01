@@ -1,0 +1,53 @@
+[package]
+name = "fluxdown_engine"
+version = "0.1.0"
+edition = "2024"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+wildcard_imports = "deny"
+
+[dependencies]
+aes = "0.8"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate", "zstd"] }
+async-trait = "0.1.87"
+base64 = "0.22"
+bytes = "1"
+cbc = "0.1"
+chrono = { version = "0.4.43", default-features = false, features = ["clock", "std"] }
+dash-mpd = { version = "0.19", default-features = false }
+encoding_rs = "0.8"
+futures-util = "0.3"
+hex = "0.4"
+m3u8-rs = "6"
+md-5 = "0.10"
+rusqlite = { version = "0.34", features = ["bundled"] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+suppaftp = { version = "6", default-features = false }
+thiserror = "2.0"
+tokio = { version = "1.45.0", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "fs", "net", "io-util", "process"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tracing = "0.1"
+ts2mp4 = "0.3"
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+
+[target."cfg(windows)".dependencies]
+librqbit = { version = "8", default-features = false, features = ["default-tls"] }
+reqwest = { version = "0.12", features = ["stream", "native-tls", "cookies", "json", "socks"] }
+# 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+winreg = "0.55"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[target."cfg(not(windows))".dependencies]
+libc = "0.2"
+librqbit = { version = "8", default-features = false, features = ["rust-tls"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls-native-roots", "cookies", "json", "socks"] }
+
+[dev-dependencies]
+http = "1.4.0"

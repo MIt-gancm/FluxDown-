@@ -17,7 +17,6 @@
 //! - `add_torrent` blocks while resolving magnet metadata from DHT/peers, so
 //!   we report "preparing" status to Dart while we wait.
 
-use rinf::RustSignal;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
@@ -45,6 +44,8 @@ use tokio_util::sync::CancellationToken;
 use crate::db::Db;
 use crate::downloader::{DownloadError, ProgressUpdate, SegmentProgressInfo};
 use crate::logger::log_info;
+use crate::model::{BtFileEntry, TorrentMetaResult};
+use crate::selection::{HostSelection, SelectionOutcome};
 
 // ---------------------------------------------------------------------------
 // Public helpers
@@ -413,9 +414,6 @@ pub struct SharedBtSession {
     /// keeps the listening port bound.  Creating a new session while the old
     /// port is still in use causes the next BT task to fail immediately.
     inflight_adds: AtomicUsize,
-    /// Stores user's file selection for BT tasks awaiting the dialog.
-    /// Key: task_id, Value: selected file indices.
-    file_selection_map: Mutex<HashMap<String, Vec<i32>>>,
     /// Maps librqbit torrent ID → our task_id.
     /// Used to detect when the same torrent is added by multiple tasks.
     torrent_ids: Mutex<HashMap<usize, String>>,
@@ -609,7 +607,6 @@ impl SharedBtSession {
             handles: Mutex::new(HashMap::new()),
             pending_deletes: Mutex::new(HashMap::new()),
             inflight_adds: AtomicUsize::new(0),
-            file_selection_map: Mutex::new(HashMap::new()),
             torrent_ids: Mutex::new(HashMap::new()),
             completion_move_lock: Mutex::new(()),
             persistence_folder,
@@ -802,18 +799,6 @@ impl SharedBtSession {
         self.pending_deletes.lock().await.remove(task_id)
     }
 
-    /// Called by the actor when the user submits their BT file selection.
-    pub async fn deliver_file_selection(&self, task_id: &str, indices: Vec<i32>) {
-        let mut map = self.file_selection_map.lock().await;
-        map.insert(task_id.to_string(), indices);
-    }
-
-    /// Poll for a pending file selection. Returns Some if available and removes the entry.
-    pub async fn take_file_selection(&self, task_id: &str) -> Option<Vec<i32>> {
-        let mut map = self.file_selection_map.lock().await;
-        map.remove(task_id)
-    }
-
     /// Record that a librqbit torrent_id is now managed by the given task_id.
     pub async fn register_torrent_id(&self, torrent_id: usize, task_id: &str) {
         self.torrent_ids
@@ -908,6 +893,8 @@ pub struct BtDownloadParams {
     /// Stored in a separate DB column (`bt_custom_name`) so that Phase 1/3
     /// engine callbacks never overwrite it.
     pub custom_name: String,
+    /// 需要宿主介入决策的文件选择接口(HostSelection)。
+    pub selector: Arc<dyn HostSelection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -992,6 +979,7 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
         pre_selected_indices: params.pre_selected_indices,
         skip_file_selection: params.skip_file_selection,
         custom_name: params.custom_name,
+        selector: params.selector,
     };
     let result = bt_runtime
         .spawn(async move { bt_download_inner(inner_params).await })
@@ -1080,6 +1068,8 @@ struct BtInnerParams {
     skip_file_selection: bool,
     /// User-specified rename target, forwarded from BtDownloadParams.
     custom_name: String,
+    /// 需要宿主介入决策的文件选择接口(HostSelection)。
+    selector: Arc<dyn HostSelection>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2142,6 +2132,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         pre_selected_indices,
         skip_file_selection,
         custom_name,
+        selector,
     } = p;
 
     // Record whether this is a resume of an existing handle *before*
@@ -2571,7 +2562,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         // and must not be shown to the user.  We keep the true meta index
         // (idx from enumerate) so that the indices forwarded to
         // update_only_files always refer to the correct meta.file_infos slot.
-        let bt_files = handle
+        let bt_files: Vec<BtFileEntry> = handle
             .with_metadata(|meta| {
                 meta.file_infos
                     .iter()
@@ -2590,7 +2581,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                                 .unwrap_or("")
                                 .starts_with(".pad")
                     })
-                    .map(|(idx, fi)| crate::signals::BtFileEntry {
+                    .map(|(idx, fi)| BtFileEntry {
                         index: idx as i32,
                         path: fi.relative_filename.to_string_lossy().into_owned(),
                         size: fi.len as i64,
@@ -2599,34 +2590,43 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             })
             .unwrap_or_default();
 
-        crate::signals::BtFilesInfo {
-            task_id: task_id.clone(),
-            total_bytes,
-            files: bt_files,
-        }
-        .send_signal_to_dart();
-
         log_info!(
-            "[BT] task={} BtFilesInfo sent ({} files), waiting for user selection...",
+            "[BT] task={} requesting file selection ({} files) via HostSelection...",
             short_id(&task_id),
             file_count
         );
 
-        // Poll until the user responds or the task is cancelled.
-        loop {
-            if cancelled.load(Ordering::SeqCst) {
-                return Err(DownloadError::Cancelled);
-            }
-            if let Some(indices) = shared_bt.take_file_selection(&task_id).await {
+        // `timeout: None` 保留现状"无限等待"语义——由 HostSelection 的具体
+        // 实现(桌面 GUI 场景为 `RinfHostSelection`)决定是否在内部包一个
+        // 较长但有限的超时,engine 侧不臆断产品行为。
+        let outcome = selector.select_bt_files(&task_id, &bt_files, None).await;
+        match &outcome {
+            SelectionOutcome::UserChose(indices) => {
                 log_info!(
                     "[BT] task={} file selection received: {:?}",
                     short_id(&task_id),
-                    &indices
+                    indices
                 );
-                break indices;
             }
-            tokio::time::sleep(Duration::from_millis(150)).await;
+            SelectionOutcome::TimedOutDefaulted(indices) => {
+                log_info!(
+                    "[BT] task={} file selection timed out, defaulting to {:?}",
+                    short_id(&task_id),
+                    indices
+                );
+            }
+            SelectionOutcome::NoSelectorConfigured(indices) => {
+                log_info!(
+                    "[BT] task={} no selector configured, defaulting to {:?}",
+                    short_id(&task_id),
+                    indices
+                );
+            }
         }
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(DownloadError::Cancelled);
+        }
+        outcome.into_inner()
     };
 
     // Persist the confirmed selection to DB immediately so that future
@@ -3382,19 +3382,19 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
 ///
 /// This is used by the new-download dialog to preview torrent contents
 /// before the user confirms the download.  It is purely local (no network).
-pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) {
+pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) -> TorrentMetaResult {
     // librqbit re-exports librqbit_core::torrent_metainfo::* at the crate root,
     // so torrent_from_bytes_ext and ByteBuf are both accessible via librqbit::.
     use librqbit::{ByteBuf, torrent_from_bytes_ext};
 
-    let result: Result<crate::signals::TorrentMetaResult, String> = (|| {
+    let result: Result<TorrentMetaResult, String> = (|| {
         // ByteBuf<'_> borrows torrent_bytes; the parsed value must not outlive it.
         let parsed = torrent_from_bytes_ext::<ByteBuf<'_>>(&torrent_bytes)
             .map_err(|e| format!("torrent parse error: {e}"))?;
         let info = &parsed.meta.info;
 
         // Build file list. For single-file torrents this yields one entry.
-        let mut files: Vec<crate::signals::BtFileEntry> = Vec::new();
+        let mut files: Vec<BtFileEntry> = Vec::new();
         let mut total_bytes: i64 = 0;
         for (idx, fd) in info
             .iter_file_details()
@@ -3412,7 +3412,7 @@ pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) {
                 .unwrap_or_else(|_| format!("file_{idx}"));
             let size = fd.len as i64;
             total_bytes += size;
-            files.push(crate::signals::BtFileEntry {
+            files.push(BtFileEntry {
                 index: idx as i32,
                 path,
                 size,
@@ -3426,7 +3426,7 @@ pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) {
             .unwrap_or("Unknown")
             .to_owned();
 
-        Ok(crate::signals::TorrentMetaResult {
+        Ok(TorrentMetaResult {
             probe_id: probe_id.clone(),
             name,
             total_bytes,
@@ -3435,11 +3435,11 @@ pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) {
         })
     })();
 
-    let signal = match result {
+    match result {
         Ok(r) => r,
         Err(e) => {
             log_info!("[BT] probe_torrent_meta error: {}", e);
-            crate::signals::TorrentMetaResult {
+            TorrentMetaResult {
                 probe_id,
                 name: String::new(),
                 total_bytes: 0,
@@ -3447,8 +3447,7 @@ pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) {
                 error: e,
             }
         }
-    };
-    signal.send_signal_to_dart();
+    }
 }
 
 #[cfg(test)]
