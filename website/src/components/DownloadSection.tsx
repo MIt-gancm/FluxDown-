@@ -13,8 +13,9 @@ import {
   AlertTriangle,
   Globe,
   Smartphone,
+  Copy,
 } from "lucide-react";
-import { SiApple, SiLinux } from "@icons-pack/react-simple-icons";
+import { SiApple, SiLinux, SiDocker } from "@icons-pack/react-simple-icons";
 import { LampEffect } from "@/components/ui/lamp-effect";
 import { useLocale } from "@/lib/i18n";
 
@@ -24,6 +25,29 @@ const techStack = [
   { name: "Tokio", color: "text-brand-cyan" },
   { name: "SQLite", color: "text-success" },
 ];
+
+const DOCKER_IMAGE = "ghcr.io/zerx-lab/fluxdown-server:latest";
+
+const DOCKER_RUN_CMD = `docker run -d --name fluxdown-server \\
+  -p 17800:17800 \\
+  -v fluxdown-data:/data \\
+  -v ./downloads:/root/Downloads \\
+  --restart unless-stopped \\
+  ${DOCKER_IMAGE}`;
+
+const DOCKER_COMPOSE_YML = `services:
+  fluxdown-server:
+    image: ${DOCKER_IMAGE}
+    container_name: fluxdown-server
+    restart: unless-stopped
+    ports:
+      - "17800:17800"
+    volumes:
+      - fluxdown-data:/data
+      - ./downloads:/root/Downloads
+
+volumes:
+  fluxdown-data:`;
 
 /* Windows logo — not available in Simple Icons (trademark), use inline SVG */
 function WindowsLogo({ className }: { className?: string }) {
@@ -74,6 +98,21 @@ export default function DownloadSection() {
   const [loading, setLoading] = useState(true);
   const [showPortable, setShowPortable] = useState<string | null>(null);
   const [selectedArch, setSelectedArch] = useState<Record<string, string>>({});
+  const [showDocker, setShowDocker] = useState(false);
+  const [dockerTab, setDockerTab] = useState<"run" | "compose">("run");
+  const [dockerCopied, setDockerCopied] = useState(false);
+
+  const handleDockerCopy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(
+        dockerTab === "run" ? DOCKER_RUN_CMD : DOCKER_COMPOSE_YML,
+      );
+      setDockerCopied(true);
+      setTimeout(() => setDockerCopied(false), 2000);
+    } catch {
+      /* clipboard unavailable — ignore */
+    }
+  }, [dockerTab]);
 
   useEffect(() => {
     fetch("/api/release")
@@ -253,6 +292,17 @@ export default function DownloadSection() {
       ],
     },
     {
+      key: "docker",
+      name: t("dl.docker"),
+      icon: SiDocker,
+      arch: t("dl.dockerArch"),
+      available: true,
+      primary: false,
+      badge: t("dl.availableNow"),
+      setup: null,
+      portable: null,
+    },
+    {
       key: "web",
       name: t("dl.web"),
       icon: Globe,
@@ -396,7 +446,7 @@ export default function DownloadSection() {
                   )}
 
                   {/* 版本号 */}
-                  {p.available && release && (
+                  {p.available && release && p.key !== "docker" && (
                     <p className="text-[10px] text-dark-text-muted mt-1">
                       {t("dl.version", { version: release.version })}
                       {effectiveSetup && (
@@ -414,7 +464,21 @@ export default function DownloadSection() {
                     </p>
                   )}
 
-                  {p.available ? (
+                  {p.key === "docker" ? (
+                    <div className="mt-4 flex flex-col gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setShowDocker((v) => !v)}
+                        className="inline-flex items-center justify-center gap-2 w-full rounded-lg bg-brand-blue px-5 py-2.5 text-xs font-semibold text-white hover:bg-brand-blue/90 transition-colors shadow-lg shadow-brand-blue/20"
+                      >
+                        <SiDocker className="w-3.5 h-3.5" color="currentColor" />
+                        {t("dl.dockerDeploy")}
+                        <ChevronDown
+                          className={`w-3.5 h-3.5 transition-transform ${showDocker ? "rotate-180" : ""}`}
+                        />
+                      </button>
+                    </div>
+                  ) : p.available ? (
                     <div className="mt-4 flex flex-col gap-2">
                       {/* 主下载按钮（安装包） */}
                       {loading ? (
@@ -620,6 +684,77 @@ export default function DownloadSection() {
               );
             })}
           </motion.div>
+
+          {/* Docker 部署面板（点击 Docker 卡片展开） */}
+          <AnimatePresence>
+            {showDocker && (
+              <motion.div
+                initial={{ opacity: 0, height: 0 }}
+                animate={{ opacity: 1, height: "auto" }}
+                exit={{ opacity: 0, height: 0 }}
+                transition={{ duration: 0.25 }}
+                className="max-w-4xl mx-auto -mt-10 mb-16 overflow-hidden"
+              >
+                <div className="rounded-xl border border-dark-border/60 bg-dark-surface1 p-5">
+                  <div className="flex items-center justify-between gap-2 mb-3">
+                    {/* Tab 切换 */}
+                    <div className="flex items-center gap-1 rounded-lg bg-dark-surface2 p-1">
+                      {(
+                        [
+                          { key: "run", label: "docker run" },
+                          { key: "compose", label: "docker-compose.yml" },
+                        ] as const
+                      ).map((tab) => (
+                        <button
+                          key={tab.key}
+                          type="button"
+                          onClick={() => setDockerTab(tab.key)}
+                          className={`px-3 py-1 rounded-md text-[11px] font-semibold font-mono transition-colors ${
+                            dockerTab === tab.key
+                              ? "bg-brand-blue/20 text-brand-blue"
+                              : "text-dark-text-muted hover:text-dark-text-secondary"
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+                    {/* 复制按钮 */}
+                    <button
+                      type="button"
+                      onClick={handleDockerCopy}
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-dark-border px-3 py-1.5 text-[11px] font-medium text-dark-text-secondary hover:bg-dark-surface3 transition-colors"
+                    >
+                      {dockerCopied ? (
+                        <>
+                          <Check className="w-3 h-3 text-success" />
+                          {t("dl.dockerCopied")}
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3 h-3" />
+                          {t("dl.dockerCopy")}
+                        </>
+                      )}
+                    </button>
+                  </div>
+                  <pre className="rounded-lg bg-dark-bg border border-dark-border/60 p-4 text-xs leading-relaxed text-dark-text-secondary overflow-x-auto font-mono">
+                    <code>
+                      {dockerTab === "run" ? DOCKER_RUN_CMD : DOCKER_COMPOSE_YML}
+                    </code>
+                  </pre>
+                  {dockerTab === "compose" && (
+                    <pre className="mt-2 rounded-lg bg-dark-bg border border-dark-border/60 p-4 text-xs leading-relaxed text-dark-text-secondary overflow-x-auto font-mono">
+                      <code>docker compose up -d</code>
+                    </pre>
+                  )}
+                  <p className="mt-3 text-[11px] text-dark-text-muted">
+                    {t("dl.dockerHint")}
+                  </p>
+                </div>
+              </motion.div>
+            )}
+          </AnimatePresence>
 
           {/* Browser Extension */}
           <motion.div

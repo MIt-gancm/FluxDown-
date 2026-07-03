@@ -102,6 +102,13 @@ x_down/
 │       │   ├── app_colors.dart        # 主题感知色板（AppColors.of(context)）
 │       │   └── theme_provider.dart    # 主题切换+持久化（SharedPreferences）
 │       ├── widgets/                   # UI 组件（见下方详细清单）
+│       ├── mobile/                    # 移动端（Android/iOS）UI 层，复用 models/i18n/theme/bindings
+│       │   ├── mobile_app.dart        # 移动端根组件（无桌面服务；保留 HLS/BT 选择服务）
+│       │   ├── mobile_shell.dart      # 双屏壳（任务列表/设置）+ 悬浮玻璃 Dock
+│       │   ├── mobile_ui.dart         # 设计 Token/玻璃弹层/Chip/进度条/分段格子映射纯函数
+│       │   ├── screens/               # mobile_tasks_screen（顶栏+Tab+卡片+FAB）/ mobile_settings_screen
+│       │   ├── pages/                 # mobile_task_detail_page（分段可视化+速度曲线+操作）
+│       │   └── sheets/                # 筛选 / 新建下载 / 任务动作 三个底部弹层
 │       └── bindings/                  # ⚠️ 自动生成 — 勿手动编辑
 ├── native/engine/                     # `fluxdown_engine` crate（edition 2024，零 FFI 依赖）
 │   └── src/
@@ -507,6 +514,15 @@ NMH 注册：
 - `/announcements` — 公告页面
 - `/privacy` — 隐私政策
 - `/terms` — 服务条款
+- `/docs/{en,zh}/...` — 产品文档（Content Collections,全量预渲染,bento 索引页 + 三栏正文页）
+
+### 文档系统（/docs)
+- **内容源**: `website/src/content/docs/{en,zh}/**/*.md`(纯 Markdown,禁 MDX/HTML);schema 见 `src/content.config.ts`(title 必填,section/order/sourceHash 可选)
+- **路由**: `/docs/{lang}/{slug}/` 全部 `prerender = true`;`/docs/` 唯一 SSR 页,按 cookie(`fluxdown-locale`,仅用户主动切换语言时由 `saveLocale()` 写入)或 Accept-Language 302
+- **回退机制**: zh 缺译仍生成 zh URL,渲染 en 内容 + 未翻译横幅 + `noindex`,不参与 hreflang/sitemap(判定单源 `src/lib/docs-fallback.ts`,页面与 astro.config sitemap filter 共享)
+- **译文过期**: zh frontmatter `sourceHash` = en 正文 sha256 前 12 位(`npm run docs:hash <zh文件>` 自动写入;`--check-all` 全量检查);不匹配时页面显示过期横幅
+- **社区贡献**: 每页"编辑此页"深链 GitHub 网页编辑器(自动 Fork→PR);页脚反馈表单 → `POST /api/feedback`(type=docs);CI `.github/workflows/website-ci.yml`(build + `docs:lint` 安全检查:拒 javascript:/data: 链接与外链图片);PR 模板 `.github/PULL_REQUEST_TEMPLATE/docs.md`
+- **代码高亮**: Shiki 双主题(github-light/dark,`defaultColor:false`),global.css 中锚定 `html.light` 的桥接 CSS 决定实际配色
 
 ### API 路由（/api/）
 - `POST /api/feedback` — 提交反馈

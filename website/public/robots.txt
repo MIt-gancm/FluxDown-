@@ -2,4 +2,4 @@ User-agent: *
 Allow: /
 Disallow: /api/
 
-Sitemap: https://fluxdown.app/sitemap-index.xml
+Sitemap: https://fluxdown.zerx.dev/sitemap-index.xml

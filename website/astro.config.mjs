@@ -5,12 +5,30 @@ import react from "@astrojs/react";
 import sitemap from "@astrojs/sitemap";
 import tailwindcss from "@tailwindcss/vite";
 import node from "@astrojs/node";
+import { getFallbackPathnames } from "./src/lib/docs-fallback.ts";
+
+// 文档回退页(en 有 zh 缺):noindex,不进 sitemap(设计决策 D4,单一判定源 docs-fallback.ts)
+const docsFallbackPathnames = getFallbackPathnames();
 
 // https://astro.com/docs/en/guides/environment-variables/
 export default defineConfig({
   site: "https://fluxdown.zerx.dev",
   adapter: node({ mode: "standalone" }),
-  integrations: [react(), sitemap()],
+  integrations: [
+    react(),
+    sitemap({
+      filter: (page) => !docsFallbackPathnames.has(new URL(page).pathname.replace(/\/$/, "")),
+    }),
+  ],
+
+  markdown: {
+    shikiConfig: {
+      // 双主题输出 --shiki-light/--shiki-dark CSS 变量,
+      // 由 global.css 中锚定 html.light 的桥接规则决定实际展示(站内主题机制,非 prefers-color-scheme)
+      themes: { light: "github-light", dark: "github-dark" },
+      defaultColor: false,
+    },
+  },
 
   // 关闭 CSRF 保护，允许前端 fetch 调用 API 端点
   security: {
@@ -142,6 +160,17 @@ export default defineConfig({
         optional: true,
       }),
       CF_R2_PUBLIC_URL: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+
+      // ── 可选：中国大陆 GitHub 下载加速镜像列表（逗号分隔，覆盖内置默认值）──
+      // 例: https://gh-proxy.com,https://ghproxy.net
+      // 注意：入选前核查 Google Safe Browsing 状态（ghfast.top 曾被拉黑，
+      // Chrome 弹全屏警告）；"地址发布页"如 ghproxy.link 不是代理，不可填
+      // 镜像不可用时下载路由自动按顺序降级，最终回退 R2 / GitHub 直连
+      DOWNLOAD_MIRRORS: envField.string({
         context: "server",
         access: "secret",
         optional: true,

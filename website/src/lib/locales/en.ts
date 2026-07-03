@@ -148,6 +148,7 @@ const en = {
   "nav.sponsor": "Sponsor",
   "nav.faq": "FAQ",
   "nav.apiDocs": "API Reference",
+  "nav.docs": "Docs",
   "nav.github": "GitHub Repository",
 
   // Theme Builder
@@ -319,6 +320,13 @@ const en = {
   "dl.web": "Web",
   "dl.webArch": "Browser-based",
   "dl.mobile": "Mobile",
+  "dl.docker": "Docker",
+  "dl.dockerArch": "Self-hosted Web UI",
+  "dl.dockerDeploy": "Deploy with Docker",
+  "dl.dockerHint":
+    "Then open http://localhost:17800 — the admin token is printed to the logs on first start (visible only once).",
+  "dl.dockerCopy": "Copy",
+  "dl.dockerCopied": "Copied!",
   "dl.availableNow": "Available Now",
   "dl.comingSoon": "Coming Soon",
   "dl.downloadBtn": "Download",

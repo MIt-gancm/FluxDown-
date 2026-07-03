@@ -52,6 +52,11 @@ export function saveLocale(locale: Locale): void {
   } catch {
     // localStorage 不可用
   }
+  try {
+    document.cookie = `${STORAGE_KEY}=${locale}; Path=/; Max-Age=31536000; SameSite=Lax; Secure`;
+  } catch {
+    // document.cookie 不可用（极端隐私模式）
+  }
 }
 
 /** 获取翻译消息 */

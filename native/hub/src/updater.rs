@@ -26,8 +26,12 @@
 //!   • %VAR% expansion surprises and cmd.exe quoting pitfalls in batch files
 //!   • Shell injection and escaping edge-cases in POSIX shell scripts
 //!
-//! All HTTP requests go through the website API (`/api/release`, `/api/download/:fn`)
-//! so that GITHUB_TOKEN stays server-side — the client never touches GitHub directly.
+//! All HTTP requests go through the website API (`/api/release`, `/api/download/:fn`).
+//! The download endpoint geo-routes by client IP (Cloudflare `CF-IPCountry`):
+//! mainland-China users get a 302 to a GitHub accelerator mirror (fallback R2),
+//! everyone else goes straight to the GitHub release CDN. Mirrors and the CDN
+//! both support Range requests, so the multi-segment download below works
+//! transparently through the redirect.
 
 #[cfg(target_os = "windows")]
 use std::path::Path;

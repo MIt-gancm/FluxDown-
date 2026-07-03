@@ -246,6 +246,21 @@ const icons = {
       <polyline points="8 6 2 12 8 18" />
     </svg>
   ),
+  docs: (
+    <svg
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20" />
+      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" />
+    </svg>
+  ),
 };
 
 export function FloatingNavbar({ className }: { className?: string }) {
@@ -276,6 +291,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
         icon: icons.theme,
       },
       { name: t("nav.changelog"), link: "/changelog", icon: icons.changelog },
+      { name: t("nav.docs"), link: `/docs/${locale}/`, icon: icons.docs },
       { name: t("nav.faq"), link: "/faq", icon: icons.faq },
       { name: t("nav.apiDocs"), link: "/api-docs", icon: icons.api },
     ],

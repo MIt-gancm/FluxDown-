@@ -6,10 +6,11 @@
  *
  * 请求体:
  * {
- *   type: "feature" | "bug" | "other",
+ *   type: "feature" | "bug" | "other" | "docs",
  *   title: string,
  *   description: string,
  *   contact?: string     // 可选的联系方式（邮箱等）
+ *   pagePath?: string    // 可选，docs 反馈关联的页面路径（需以 /docs/ 开头且 ≤200 字符，校验失败则静默忽略）
  * }
  *
  * 防滥用:
@@ -55,12 +56,14 @@ const TYPE_LABELS: Record<string, string> = {
   feature: "enhancement",
   bug: "bug",
   other: "feedback",
+  docs: "docs",
 };
 
 const TYPE_EMOJI: Record<string, string> = {
   feature: "\u2728", // ✨
   bug: "\uD83D\uDC1B", // 🐛
   other: "\uD83D\uDCAC", // 💬
+  docs: "\uD83D\uDCD6", // 📖
 };
 
 // ---------- Handler ----------
@@ -91,6 +94,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     title?: string;
     description?: string;
     contact?: string;
+    pagePath?: string;
   };
 
   try {
@@ -102,7 +106,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     });
   }
 
-  const { type, title, description, contact } = body;
+  const { type, title, description, contact, pagePath } = body;
 
   // 验证必填字段
   if (!type || !title || !description) {
@@ -115,10 +119,10 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
   }
 
   // 验证 type 取值
-  if (!["feature", "bug", "other"].includes(type)) {
+  if (!["feature", "bug", "other", "docs"].includes(type)) {
     return new Response(
       JSON.stringify({
-        error: "Invalid type. Must be: feature, bug, or other",
+        error: "Invalid type. Must be: feature, bug, other, or docs",
       }),
       { status: 400, headers: { "Content-Type": "application/json" } },
     );
@@ -139,6 +143,15 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     );
   }
 
+  // 可选字段：pagePath（docs 反馈关联的页面路径）。校验失败静默忽略而非 400，
+  // 因为它只是补充上下文，不应阻塞用户提交反馈本身。
+  const safePagePath =
+    typeof pagePath === "string" &&
+    pagePath.startsWith("/docs/") &&
+    pagePath.length <= 200
+      ? pagePath
+      : undefined;
+
   // 构造 Issue 内容
   const emoji = TYPE_EMOJI[type] || "\uD83D\uDCAC";
   const label = TYPE_LABELS[type] || "feedback";
@@ -152,6 +165,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     "---",
     "",
     `**Type:** ${type}`,
+    safePagePath ? `**页面**: ${safePagePath}` : null,
     contact ? `**Contact:** ${contact}` : null,
     `**Source:** Website feedback form`,
     `**Submitted:** ${new Date().toISOString()}`,

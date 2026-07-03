@@ -6,7 +6,9 @@
     "dev": "astro dev",
     "build": "astro build",
     "preview": "astro preview",
-    "astro": "astro"
+    "astro": "astro",
+    "docs:hash": "node scripts/docs-hash.mjs",
+    "docs:lint": "node scripts/docs-lint.mjs"
   },
   "dependencies": {
     "@astrojs/node": "^9.2.1",

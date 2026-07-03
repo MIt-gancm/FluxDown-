@@ -5,20 +5,32 @@ interface Props {
   title?: string;
   description?: string;
   canonicalUrl?: string;
+  lang?: string;
+  ogLocale?: string;
+  alternates?: { lang: string; href: string }[];
+  noindex?: boolean;
 }
 
-const SITE_URL = "https://fluxdown.app";
+const SITE_URL = "https://fluxdown.zerx.dev";
 const {
   title = "FluxDown - Modern Multi-Protocol Download Manager",
   description = "A blazing fast, multi-protocol download manager with browser extension. Powered by Rust engine with HTTP/HTTPS/FTP support, intelligent segmentation, and speed optimization.",
   canonicalUrl = Astro.url.pathname === "/" ? SITE_URL : `${SITE_URL}${Astro.url.pathname}`,
+  lang = "en",
+  ogLocale = "en_US",
+  alternates,
+  noindex = false,
 } = Astro.props;
+
+// lang 是否由调用方显式传入(区分默认值与显式指定,决定是否输出 data-fixed-lang)
+const isLangExplicit = Astro.props.lang !== undefined;
+const ogLocaleAlternate = ogLocale === "zh_CN" ? "en_US" : "zh_CN";
 
 const ogImageUrl = `${SITE_URL}/logo.png`;
 ---
 
 <!doctype html>
-<html lang="en" class="fluxdown-loading">
+<html lang={lang} class="fluxdown-loading" data-fixed-lang={isLangExplicit ? true : undefined}>
   <head>
     <meta charset="utf-8" />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
@@ -29,11 +41,22 @@ const ogImageUrl = `${SITE_URL}/logo.png`;
     <meta name="theme-color" content="#0a0a0b" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#F8F9FA" media="(prefers-color-scheme: light)" />
     <link rel="canonical" href={canonicalUrl} />
+    {noindex && <meta name="robots" content="noindex" />}
 
     <!-- Hreflang: i18n SEO -->
-    <link rel="alternate" hreflang="en" href={canonicalUrl} />
-    <link rel="alternate" hreflang="zh-Hans" href={canonicalUrl} />
-    <link rel="alternate" hreflang="x-default" href={canonicalUrl} />
+    {
+      alternates === undefined ? (
+        <>
+          <link rel="alternate" hreflang="en" href={canonicalUrl} />
+          <link rel="alternate" hreflang="zh-Hans" href={canonicalUrl} />
+          <link rel="alternate" hreflang="x-default" href={canonicalUrl} />
+        </>
+      ) : (
+        alternates.map((a) => (
+          <link rel="alternate" hreflang={a.lang} href={a.href} />
+        ))
+      )
+    }
 
     <!-- Open Graph -->
     <meta property="og:title" content={title} />
@@ -45,8 +68,8 @@ const ogImageUrl = `${SITE_URL}/logo.png`;
     <meta property="og:image:width" content="512" />
     <meta property="og:image:height" content="512" />
     <meta property="og:image:alt" content="FluxDown Logo" />
-    <meta property="og:locale" content="en_US" />
-    <meta property="og:locale:alternate" content="zh_CN" />
+    <meta property="og:locale" content={ogLocale} />
+    <meta property="og:locale:alternate" content={ogLocaleAlternate} />
 
     <!-- Twitter Cards -->
     <meta name="twitter:card" content="summary_large_image" />
@@ -124,17 +147,20 @@ const ogImageUrl = `${SITE_URL}/logo.png`;
         }
 
         // 2. Locale: apply saved locale to html lang attribute
-        var savedLocale = null;
-        try { savedLocale = localStorage.getItem('fluxdown-locale'); } catch(e) {}
-        if (savedLocale === 'zh') {
-          html.lang = 'zh-CN';
-        } else if (savedLocale === 'en') {
-          html.lang = 'en';
-        } else {
-          var langs = navigator.languages || [navigator.language];
-          for (var i = 0; i < langs.length; i++) {
-            if (langs[i].startsWith('zh')) { html.lang = 'zh-CN'; break; }
-            if (langs[i].startsWith('en')) { html.lang = 'en'; break; }
+        // (显式固定语言的页面,如 docs,不参与该逻辑,避免覆盖服务端渲染的 lang)
+        if (!html.hasAttribute('data-fixed-lang')) {
+          var savedLocale = null;
+          try { savedLocale = localStorage.getItem('fluxdown-locale'); } catch(e) {}
+          if (savedLocale === 'zh') {
+            html.lang = 'zh-CN';
+          } else if (savedLocale === 'en') {
+            html.lang = 'en';
+          } else {
+            var langs = navigator.languages || [navigator.language];
+            for (var i = 0; i < langs.length; i++) {
+              if (langs[i].startsWith('zh')) { html.lang = 'zh-CN'; break; }
+              if (langs[i].startsWith('en')) { html.lang = 'en'; break; }
+            }
           }
         }
 
