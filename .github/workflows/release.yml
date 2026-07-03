@@ -10,9 +10,68 @@ permissions:
   actions: write # 允许在 release job 末尾删除旧 artifact（避免 500MB 配额耗尽）
 
 jobs:
+  # ── 前置 Job: 检测上一个版本 tag → 当前 tag 之间哪些组件目录有变更 ──
+  # 规则：
+  #   fluxDown/**            → 浏览器扩展（extension）
+  #   website/**             → 官网（website）
+  #   docs/**、*.md          → 纯文档，不触发任何构建
+  #   其余任何路径            → 桌面客户端（app）
+  # 找不到上一个 v* tag（首个版本）时全部视为有变更。
+  changes:
+    name: Detect Changed Components
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.detect.outputs.app }}
+      extension: ${{ steps.detect.outputs.extension }}
+      website: ${{ steps.detect.outputs.website }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Detect changes since previous version tag
+        id: detect
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          # 只匹配 v0.1.2 形式的版本 tag（glob 从头锚定，
+          # 自动忽略 release 流程创建的 extension-v* / website-v* 组件 tag）
+          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
+
+          APP=false; EXTENSION=false; WEBSITE=false
+          if [ -z "$PREV" ]; then
+            echo "No previous version tag found — building everything"
+            APP=true; EXTENSION=true; WEBSITE=true
+          else
+            echo "Diff range: ${PREV}..${TAG}"
+            CHANGED=$(git diff --name-only "${PREV}" "${TAG}")
+            echo "── Changed files ──"
+            echo "$CHANGED"
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                fluxDown/*) EXTENSION=true ;;
+                website/*)  WEBSITE=true ;;
+                docs/*|*.md) ;;
+                *)          APP=true ;;
+              esac
+            done <<< "$CHANGED"
+          fi
+
+          {
+            echo "app=$APP"
+            echo "extension=$EXTENSION"
+            echo "website=$WEBSITE"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Components changed in ${PREV:-<none>}..${TAG}: app=$APP extension=$EXTENSION website=$WEBSITE"
+
   # ── 并行 Job 1: 构建 Windows 安装包（x64 + ARM64）──
   build-windows:
     name: Build Windows (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -175,6 +234,8 @@ jobs:
   build-extension:
     name: Build Browser Extension
     runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.extension == 'true'
 
     steps:
       - name: Checkout repository
@@ -420,6 +481,8 @@ jobs:
   build-linux:
     name: Build Linux (x64)
     runs-on: ubuntu-22.04
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
 
     steps:
       - name: Checkout repository
@@ -710,6 +773,8 @@ jobs:
   # ── 并行 Job 4: 构建 macOS DMG + tar.gz（Intel x64 + Apple Silicon arm64）──
   build-macos:
     name: Build macOS (${{ matrix.arch }})
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -853,11 +918,55 @@ jobs:
           path: build/installer/FluxDown-*-macos-${{ matrix.arch }}.tar.gz
           if-no-files-found: error
 
-  # ── 最终 Job: 等待所有构建完成后统一发布 Release ──
-  release:
-    name: Create GitHub Release
+  # ── 并行 Job 5: 构建官网（website/ 有变更时）──
+  build-website:
+    name: Build Website
     runs-on: ubuntu-latest
-    needs: [build-windows, build-extension, build-linux, build-macos]
+    needs: changes
+    if: needs.changes.outputs.website == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # website/ 无 package-lock.json，不能用 npm ci
+      - name: Install dependencies
+        run: npm install
+        working-directory: website
+
+      - name: Build website
+        run: npm run build
+        working-directory: website
+
+      # 打包 Node standalone 构建产物（dist/ 含 server + client）
+      - name: Package website dist
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          mkdir -p build/website
+          tar -czf "build/website/FluxDown-website-${VERSION}.tar.gz" -C website dist
+          ls -la build/website/
+
+      - name: Upload website artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: website-dist
+          path: build/website/FluxDown-website-*.tar.gz
+          if-no-files-found: error
+
+  # ── Release Job 1: 桌面客户端（使用推送的 v* tag，保持 GitHub latest release 语义）──
+  release-app:
+    name: Release Desktop App
+    runs-on: ubuntu-latest
+    needs: [build-windows, build-linux, build-macos]
 
     steps:
       - name: Checkout repository
@@ -889,18 +998,11 @@ jobs:
           echo "── Release notes ──"
           cat RELEASE_NOTES.md
 
-      # ── 下载所有构建产物 ──
+      # ── 下载桌面客户端构建产物 ──
       - name: Download all Windows artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: windows-*
-          path: release-assets/
-          merge-multiple: true
-
-      - name: Download browser extensions
-        uses: actions/download-artifact@v4
-        with:
-          pattern: browser-extension-*
           path: release-assets/
           merge-multiple: true
 
@@ -921,7 +1023,7 @@ jobs:
       - name: List release assets
         run: ls -la release-assets/
 
-      # ── 创建 Release 并上传所有文件 ──
+      # ── 创建客户端 Release 并上传所有文件 ──
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -929,13 +1031,134 @@ jobs:
           body_path: RELEASE_NOTES.md
           generate_release_notes: false
           draft: false
+          make_latest: "true"
 
-      # ── 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
-      # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB
-      # Release 资产已独立存储在 GitHub Release，artifact 只是 CI 中间产物可安全清理
-      # 此 step 在 release 创建成功后执行，失败不阻断流程（continue-on-error）
+  # ── Release Job 2: 浏览器扩展（独立 tag extension-v*，不抢占 latest）──
+  release-extension:
+    name: Release Browser Extension
+    runs-on: ubuntu-latest
+    needs: build-extension
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # 只收集 fluxDown/ 目录相关的 commit 作为扩展 release notes
+      - name: Generate release notes with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --latest --strip header --include-path "fluxDown/**"
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Finalize release notes
+        shell: bash
+        run: |
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Browser Extension Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
+          fi
+          echo "── Release notes ──"
+          cat RELEASE_NOTES.md
+
+      - name: Download browser extensions
+        uses: actions/download-artifact@v4
+        with:
+          pattern: browser-extension-*
+          path: release-assets/
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la release-assets/
+
+      # make_latest=false：避免组件 release 成为 GitHub /releases/latest，
+      # 否则会打破客户端自动更新和官网下载页的最新版本判断
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: extension-v${{ steps.version.outputs.VERSION }}
+          name: FluxDown Extension v${{ steps.version.outputs.VERSION }}
+          files: release-assets/*
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
+          draft: false
+          make_latest: "false"
+
+  # ── Release Job 3: 官网（独立 tag website-v*，不抢占 latest）──
+  release-website:
+    name: Release Website
+    runs-on: ubuntu-latest
+    needs: build-website
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      # 只收集 website/ 目录相关的 commit 作为官网 release notes
+      - name: Generate release notes with git-cliff
+        uses: orhun/git-cliff-action@v4
+        with:
+          args: --latest --strip header --include-path "website/**"
+        env:
+          OUTPUT: RELEASE_NOTES.md
+          GITHUB_REPO: ${{ github.repository }}
+
+      - name: Finalize release notes
+        shell: bash
+        run: |
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Website Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
+          fi
+          echo "── Release notes ──"
+          cat RELEASE_NOTES.md
+
+      - name: Download website artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: website-dist
+          path: release-assets/
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la release-assets/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: website-v${{ steps.version.outputs.VERSION }}
+          name: FluxDown Website v${{ steps.version.outputs.VERSION }}
+          files: release-assets/*
+          body_path: RELEASE_NOTES.md
+          generate_release_notes: false
+          draft: false
+          make_latest: "false"
+
+  # ── 最终 Job: 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
+  # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB
+  # Release 资产已独立存储在 GitHub Release，artifact 只是 CI 中间产物可安全清理
+  # always()：无论哪些组件 release 被跳过/失败都执行清理，失败不阻断（continue-on-error）
+  cleanup-artifacts:
+    name: Cleanup CI Artifacts
+    runs-on: ubuntu-latest
+    needs: [release-app, release-extension, release-website]
+    if: ${{ always() && !cancelled() }}
+
+    steps:
       - name: Cleanup GitHub Actions artifacts (keep current tag only)
-        if: always() && success()
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

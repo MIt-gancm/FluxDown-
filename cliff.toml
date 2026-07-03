@@ -60,8 +60,8 @@ commit_parsers = [
 ]
 # 不过滤未被 commit_parsers 匹配的 commit
 filter_commits = false
-# 匹配版本 tag 的 glob 模式
-tag_pattern = "v[0-9].*"
+# 匹配版本 tag 的正则（^ 锚定：排除 release 流程创建的 extension-v* / website-v* 组件 tag）
+tag_pattern = "^v[0-9].*"
 # 跳过的 tag 正则（空 = 不跳过）
 skip_tags = ""
 # 忽略的 tag 正则（空 = 不忽略）

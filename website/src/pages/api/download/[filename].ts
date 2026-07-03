@@ -53,12 +53,15 @@ async function fetchReleaseByTag(tag: string): Promise<GitHubRelease | null> {
 }
 
 /**
- * 获取最新正式 release（非 draft、非 prerelease）。
- * 拉取前几页后取第一个符合条件的即可，无需全量拉取。
+ * 获取包含指定 asset 的最新正式 release（非 draft、非 prerelease）。
+ * Release 已按组件拆分（v* / extension-v* / website-v*），列表首个 release
+ * 不一定包含请求的文件，须按 asset 名定位。
  */
-async function fetchLatestRelease(): Promise<GitHubRelease | null> {
+async function fetchLatestReleaseWithAsset(
+  filename: string,
+): Promise<GitHubRelease | null> {
   const res = await fetch(
-    `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=10`,
+    `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30`,
     { headers: GITHUB_HEADERS },
   );
 
@@ -67,7 +70,14 @@ async function fetchLatestRelease(): Promise<GitHubRelease | null> {
   }
 
   const releases: GitHubRelease[] = await res.json();
-  return releases.find((r) => !r.draft && !r.prerelease) ?? null;
+  return (
+    releases.find(
+      (r) =>
+        !r.draft &&
+        !r.prerelease &&
+        r.assets.some((a) => a.name === filename),
+    ) ?? null
+  );
 }
 
 /**
@@ -154,10 +164,12 @@ export const GET: APIRoute = async ({ params, url }) => {
         );
       }
     } else {
-      release = await fetchLatestRelease();
+      release = await fetchLatestReleaseWithAsset(filename);
       if (!release) {
         return new Response(
-          JSON.stringify({ error: "No published release found" }),
+          JSON.stringify({
+            error: `No published release contains asset "${filename}"`,
+          }),
           { status: 404, headers: { "Content-Type": "application/json" } },
         );
       }

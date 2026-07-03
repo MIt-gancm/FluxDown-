@@ -164,8 +164,10 @@ async function getCachedReleases(since: string): Promise<FilteredRelease[]> {
   if (!allCache || Date.now() - allCache.timestamp > CACHE_TTL) {
     const raw = await fetchAllGitHubReleases();
 
+    // 只保留 v* 客户端 release；extension-v* / website-v* 组件 release
+    // 不属于 App 更新日志（且其 tag 无法按 semver 解析）
     const filtered = raw
-      .filter((r) => !r.draft && !r.prerelease)
+      .filter((r) => !r.draft && !r.prerelease && /^v\d/.test(r.tag_name))
       .sort(
         (a, b) =>
           new Date(b.published_at).getTime() -

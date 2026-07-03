@@ -321,8 +321,19 @@ export const GET: APIRoute = async () => {
     }
 
     const releases = allReleases;
+    const published = releases.filter((r) => !r.draft && !r.prerelease);
 
-    const latest = releases.find((r) => !r.draft && !r.prerelease);
+    // 桌面客户端 release：Release 已按组件拆分（v* / extension-v* / website-v*），
+    // 以「v 开头的 tag 且包含 Windows 安装包」为准挑选最新客户端 release，
+    // 同时兼容旧的合并 release 与脚本预创建的空 release
+    const latest = published.find(
+      (r) =>
+        /^v\d/.test(r.tag_name) &&
+        r.assets.some(
+          (a) =>
+            a.name.endsWith("-setup.exe") || a.name.endsWith("-portable.zip"),
+        ),
+    );
 
     if (!latest) {
       return new Response(
@@ -332,6 +343,17 @@ export const GET: APIRoute = async () => {
     }
 
     const version = latest.tag_name.replace(/^v/, "");
+
+    // 浏览器扩展 release：优先最新的独立 extension-v* release，
+    // 旧版本扩展资产与客户端合并在同一个 release 中，同样能被匹配到
+    const extensionRelease = published.find((r) =>
+      r.assets.some(
+        (a) =>
+          a.name.endsWith("-chrome.zip") ||
+          a.name.endsWith("-extension.zip") ||
+          a.name.endsWith("-firefox.xpi"),
+      ),
+    );
 
     // 匹配资产文件（兼容旧命名：-windows-setup.exe / 新命名：-windows-x64-setup.exe）
     const setupAsset = latest.assets.find(
@@ -351,11 +373,11 @@ export const GET: APIRoute = async () => {
     const portableArm64Asset = latest.assets.find((a) =>
       a.name.endsWith("-windows-arm64-portable.zip"),
     );
-    const extensionAsset = latest.assets.find(
+    const extensionAsset = extensionRelease?.assets.find(
       (a) =>
         a.name.endsWith("-chrome.zip") || a.name.endsWith("-extension.zip"),
     );
-    const firefoxExtensionAsset = latest.assets.find((a) =>
+    const firefoxExtensionAsset = extensionRelease?.assets.find((a) =>
       a.name.endsWith("-firefox.xpi"),
     );
     // macOS 资产
@@ -385,13 +407,16 @@ export const GET: APIRoute = async () => {
       a.name.endsWith("-linux-x64.tar.gz"),
     );
 
-    const formatAsset = (asset: GitHubAsset | undefined) => {
+    const formatAsset = (asset: GitHubAsset | undefined, tag?: string) => {
       if (!asset) return null;
       return {
         name: asset.name,
         size: asset.size,
-        // 使用我们自己的代理下载端点，避免前端直接访问 GitHub
-        download_url: `/api/download/${asset.name}`,
+        // 使用我们自己的代理下载端点，避免前端直接访问 GitHub；
+        // 资产不在最新客户端 release 中时（如独立扩展 release）带 tag 定位
+        download_url: tag
+          ? `/api/download/${asset.name}?tag=${encodeURIComponent(tag)}`
+          : `/api/download/${asset.name}`,
       };
     };
 
@@ -422,8 +447,11 @@ export const GET: APIRoute = async () => {
         portable: formatAsset(portableAsset),
         setup_arm64: formatAsset(setupArm64Asset),
         portable_arm64: formatAsset(portableArm64Asset),
-        extension: formatAsset(extensionAsset),
-        firefox_extension: formatAsset(firefoxExtensionAsset),
+        extension: formatAsset(extensionAsset, extensionRelease?.tag_name),
+        firefox_extension: formatAsset(
+          firefoxExtensionAsset,
+          extensionRelease?.tag_name,
+        ),
         macos_dmg_arm64: formatAsset(macosDmgArm64Asset),
         macos_dmg_x64: formatAsset(macosDmgX64Asset),
         macos_tarball_arm64: formatAsset(macosTarballArm64Asset),
