@@ -22,7 +22,12 @@
  *     portable: { name, size, download_url },
  *     extension: { name, size, download_url },        // Chrome zip
  *     firefox_extension: { name, size, download_url }, // Firefox XPI
- *   }
+ *   },
+ *   server: {
+ *     version: "0.1.51",
+ *     tag: "server-v0.1.51",
+ *     assets: { windows_x64, windows_arm64, linux_x64, linux_arm64, macos_x64, macos_arm64 }
+ *   } | null   // FluxDown Server（headless Web 版），无对应 release 时为 null
  * }
  */
 
@@ -357,6 +362,13 @@ export const GET: APIRoute = async () => {
       ),
     );
 
+    // FluxDown Server release：独立 server-v* release（headless Web 服务器）
+    const serverRelease = published.find(
+      (r) =>
+        /^server-v\d+\.\d+\.\d+$/.test(r.tag_name) &&
+        r.assets.some((a) => a.name.startsWith("FluxDown-Server-")),
+    );
+
     // 匹配资产文件（兼容旧命名：-windows-setup.exe / 新命名：-windows-x64-setup.exe）
     const setupAsset = latest.assets.find(
       (a) =>
@@ -408,6 +420,18 @@ export const GET: APIRoute = async () => {
     const linuxTarballAsset = latest.assets.find((a) =>
       a.name.endsWith("-linux-x64.tar.gz"),
     );
+    // FluxDown Server 资产（独立 server-v* release，命名：FluxDown-Server-<ver>-<os>-<arch>.<ext>）
+    const findServerAsset = (suffix: string) =>
+      serverRelease?.assets.find(
+        (a) =>
+          a.name.startsWith("FluxDown-Server-") && a.name.endsWith(suffix),
+      );
+    const serverWindowsX64Asset = findServerAsset("-windows-x64.zip");
+    const serverWindowsArm64Asset = findServerAsset("-windows-arm64.zip");
+    const serverLinuxX64Asset = findServerAsset("-linux-x64.tar.gz");
+    const serverLinuxArm64Asset = findServerAsset("-linux-arm64.tar.gz");
+    const serverMacosX64Asset = findServerAsset("-macos-x64.tar.gz");
+    const serverMacosArm64Asset = findServerAsset("-macos-arm64.tar.gz");
 
     const formatAsset = (asset: GitHubAsset | undefined, tag?: string) => {
       if (!asset) return null;
@@ -463,6 +487,38 @@ export const GET: APIRoute = async () => {
         linux_arch: formatAsset(linuxArchAsset),
         linux_tarball: formatAsset(linuxTarballAsset),
       },
+      server: serverRelease
+        ? {
+            version: serverRelease.tag_name.replace(/^server-v/, ""),
+            tag: serverRelease.tag_name,
+            assets: {
+              windows_x64: formatAsset(
+                serverWindowsX64Asset,
+                serverRelease.tag_name,
+              ),
+              windows_arm64: formatAsset(
+                serverWindowsArm64Asset,
+                serverRelease.tag_name,
+              ),
+              linux_x64: formatAsset(
+                serverLinuxX64Asset,
+                serverRelease.tag_name,
+              ),
+              linux_arm64: formatAsset(
+                serverLinuxArm64Asset,
+                serverRelease.tag_name,
+              ),
+              macos_x64: formatAsset(
+                serverMacosX64Asset,
+                serverRelease.tag_name,
+              ),
+              macos_arm64: formatAsset(
+                serverMacosArm64Asset,
+                serverRelease.tag_name,
+              ),
+            },
+          }
+        : null,
     };
 
     // 更新缓存

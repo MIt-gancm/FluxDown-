@@ -85,6 +85,19 @@ interface ReleaseInfo {
     linux_arch: ReleaseAsset | null;
     linux_tarball: ReleaseAsset | null;
   };
+  /** FluxDown Server（headless Web 版）独立 release，无发布时为 null */
+  server: {
+    version: string;
+    tag: string;
+    assets: {
+      windows_x64: ReleaseAsset | null;
+      windows_arm64: ReleaseAsset | null;
+      linux_x64: ReleaseAsset | null;
+      linux_arm64: ReleaseAsset | null;
+      macos_x64: ReleaseAsset | null;
+      macos_arm64: ReleaseAsset | null;
+    };
+  } | null;
 }
 
 function formatSize(bytes: number): string {
@@ -93,7 +106,7 @@ function formatSize(bytes: number): string {
 }
 
 export default function DownloadSection() {
-  const { t } = useLocale();
+  const { t, locale } = useLocale();
   const [release, setRelease] = useState<ReleaseInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [showPortable, setShowPortable] = useState<string | null>(null);
@@ -174,6 +187,16 @@ export default function DownloadSection() {
     release?.assets.linux_arch ||
     release?.assets.linux_tarball
   );
+  const serverAssets = release?.server?.assets;
+  const hasServerAssets = !!(
+    serverAssets &&
+    (serverAssets.windows_x64 ||
+      serverAssets.windows_arm64 ||
+      serverAssets.linux_x64 ||
+      serverAssets.linux_arm64 ||
+      serverAssets.macos_x64 ||
+      serverAssets.macos_arm64)
+  );
 
   const platforms: {
     key: string;
@@ -183,6 +206,8 @@ export default function DownloadSection() {
     available: boolean;
     primary: boolean;
     badge: string;
+    /** 平台独立版本号（如 FluxDown Server），缺省时用桌面客户端版本 */
+    version?: string;
     setup: ReleaseAsset | null;
     portable: ReleaseAsset | null;
     setupLabel?: string;
@@ -307,11 +332,35 @@ export default function DownloadSection() {
       name: t("dl.web"),
       icon: Globe,
       arch: t("dl.webArch"),
-      available: false,
+      available: hasServerAssets,
       primary: false,
-      badge: t("dl.comingSoon"),
-      setup: null,
+      badge: hasServerAssets ? t("dl.availableNow") : t("dl.comingSoon"),
+      version: release?.server?.version,
+      setup: serverAssets?.windows_x64 ?? null,
+      setupLabel: "Windows x64",
       portable: null,
+      packages: [
+        {
+          label: "Windows ARM64 (zip)",
+          asset: serverAssets?.windows_arm64 ?? null,
+        },
+        {
+          label: "Linux x64 (tar.gz)",
+          asset: serverAssets?.linux_x64 ?? null,
+        },
+        {
+          label: "Linux ARM64 (tar.gz)",
+          asset: serverAssets?.linux_arm64 ?? null,
+        },
+        {
+          label: "macOS Apple Silicon (tar.gz)",
+          asset: serverAssets?.macos_arm64 ?? null,
+        },
+        {
+          label: "macOS Intel (tar.gz)",
+          asset: serverAssets?.macos_x64 ?? null,
+        },
+      ],
     },
     {
       key: "mobile",
@@ -448,7 +497,9 @@ export default function DownloadSection() {
                   {/* 版本号 */}
                   {p.available && release && p.key !== "docker" && (
                     <p className="text-[10px] text-dark-text-muted mt-1">
-                      {t("dl.version", { version: release.version })}
+                      {t("dl.version", {
+                        version: p.version ?? release.version,
+                      })}
                       {effectiveSetup && (
                         <span className="ml-1.5">
                           ({formatSize(effectiveSetup.size)})
@@ -582,6 +633,16 @@ export default function DownloadSection() {
                           <span className="text-amber-600 underline underline-offset-2 font-semibold">
                             {t("dl.macosWarningLink")}
                           </span>
+                        </a>
+                      )}
+
+                      {/* Web 版（FluxDown Server）部署指南 */}
+                      {p.key === "web" && (
+                        <a
+                          href={`/docs/${locale}/headless-server/setup/`}
+                          className="inline-flex items-center justify-center gap-1 mt-1 text-[10px] text-dark-text-muted hover:text-brand-blue underline underline-offset-2 transition-colors"
+                        >
+                          {t("dl.webGuide")}
                         </a>
                       )}
                     </div>
