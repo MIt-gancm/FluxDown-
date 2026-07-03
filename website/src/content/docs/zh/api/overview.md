@@ -3,6 +3,7 @@ title: API 总览
 description: FluxDown 的 HTTP API——四组路由、鉴权方式,以及它与 headless 服务器的关系。
 section: api
 order: 1
+sourceHash: "2de9321e528c"
 ---
 
 FluxDown 内置一套小型 HTTP API,供浏览器扩展、油猴脚本、aria2 客户端与自动化工具使用,存在于两个地方:

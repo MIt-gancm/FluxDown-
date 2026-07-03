@@ -3,6 +3,7 @@ title: Web 界面
 description: 用服务器自带的浏览器界面登录并管理下载。
 section: headless-server
 order: 2
+sourceHash: "326b42c89ecc"
 ---
 
 服务器跑起来后(见[服务器部署](/docs/zh/headless-server/setup/)),在浏览器里打开它的地址即可,例如 `http://<host>:17800/`。它的任务管理体验与桌面客户端一致,只是为远程、多会话场景做了适配。

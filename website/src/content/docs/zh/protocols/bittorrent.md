@@ -3,6 +3,7 @@ title: BitTorrent
 description: 内置 magnet 与 .torrent 下载,支持 DHT、UPnP、内置 Tracker 与文件选择。
 section: protocols
 order: 2
+sourceHash: "c3d897e30020"
 ---
 
 FluxDown 内置了 BitTorrent 引擎(基于 librqbit)——不需要另外装一个 BT 客户端。它同时支持 magnet 链接与 `.torrent` 文件,默认开启 DHT 和 UPnP,自带一份精选的公共 Tracker 列表,多文件种子还能在下载开始前逐个选择文件。
@@ -22,13 +23,7 @@ FluxDown 内置了 BitTorrent 引擎(基于 librqbit)——不需要另外装一
 
 ## DHT、UPnP 与监听端口
 
-*设置 → BitTorrent* 里可以调整节点发现与连通性相关的选项:
-
-| 设置项 | 默认值 | 作用 |
-|---|---|---|
-| 启用 DHT | 开 | 分布式哈希表——不依赖 Tracker 也能发现对等节点。 |
-| 启用 UPnP 端口映射 | 开 | 自动配置路由器端口转发,提高连接性。 |
-| 监听端口范围 | 6881–6891 | 用于接收 BT 连接的端口范围。 |
+节点发现开箱即用:**DHT**(无 Tracker 也能发现对等节点)与 **UPnP 端口映射**(自动配置路由器端口转发)由引擎始终开启,无需配置。*设置 → BitTorrent* 中唯一的连通性选项是用于接收 BT 连接的**监听端口范围**(默认 **6881–6891**)。
 
 所有 BitTorrent 任务共用同一个底层会话——一张 DHT 路由表、一组 Tracker 连接、一个监听端口——而不是每个任务各开一份,这样即便同时跑多个种子,资源占用也能保持较低。
 
@@ -49,8 +44,6 @@ FluxDown 内置 **25 个公共 Tracker**,经过精选以获得较好的全球覆
 
 | 设置项 | 位置 |
 |---|---|
-| 启用 DHT | 设置 → BitTorrent |
-| 启用 UPnP 端口映射 | 设置 → BitTorrent |
 | 监听端口范围 | 设置 → BitTorrent |
 | Tracker 列表 | 设置 → BitTorrent |
 | Tracker 订阅 | 设置 → BitTorrent |

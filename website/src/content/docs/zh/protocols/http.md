@@ -3,6 +3,7 @@ title: HTTP / HTTPS
 description: 多线程分段 HTTP/HTTPS 下载,支持运行时动态拆分、断点续传与文件校验。
 section: protocols
 order: 1
+sourceHash: "3ad1a819a9d4"
 ---
 
 HTTP 和 HTTPS 是 FluxDown 的默认协议——只要不是 magnet 链接、`.torrent` 文件或 `.m3u8`/`.mpd` 流媒体地址,都会走这条路径下载。引擎会把大文件拆到多个连接并行下载,下载过程中动态调整连接数,并在暂停、崩溃或重启后从断点精确续传。

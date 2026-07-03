@@ -3,6 +3,7 @@ title: 服务器部署
 description: 从源码构建并运行 headless FluxDown 服务器,了解全部环境变量并安全地对外暴露。
 section: headless-server
 order: 1
+sourceHash: "0a2ec102ed41"
 ---
 
 `fluxdown_server` 是 FluxDown 下载引擎的 headless 版本:没有 Flutter 界面,也没有 Rinf/FFI 层。它把同一套 Rust 引擎(HTTP/HTTPS、FTP、BitTorrent、HLS、DASH)通过 HTTP、WebSocket 和一个内置的 Web 界面暴露出来,因此你可以把它跑在 NAS、家庭服务器或 VPS 上,在浏览器里远程管理下载。

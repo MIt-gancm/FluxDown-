@@ -22,13 +22,7 @@ Multi-file torrents show a checklist of every file inside, with size, before the
 
 ## DHT, UPnP and listening port
 
-*Settings → BitTorrent* exposes the peer-discovery and connectivity options:
-
-| Setting | Default | Purpose |
-|---|---|---|
-| Enable DHT | On | Distributed Hash Table — finds peers without needing a tracker at all. |
-| Enable UPnP Port Mapping | On | Auto-configures router port forwarding for better connectivity. |
-| Listen Port Range | 6881–6891 | Port range used for incoming BT connections. |
+Peer discovery works out of the box: **DHT** (trackerless peer discovery) and **UPnP port mapping** (automatic router port forwarding) are always enabled by the engine — there's nothing to configure. The only connectivity option exposed in *Settings → BitTorrent* is the **Listen Port Range** used for incoming BT connections (default **6881–6891**).
 
 All BitTorrent tasks share one underlying session — one DHT routing table, one set of tracker connections, one listening port — rather than each task opening its own, which keeps resource usage low even with several torrents running at once.
 
@@ -49,8 +43,6 @@ Torrent downloads resume using BitTorrent's own piece-based verification: closin
 
 | Setting | Location |
 |---|---|
-| Enable DHT | Settings → BitTorrent |
-| Enable UPnP Port Mapping | Settings → BitTorrent |
 | Listen Port Range | Settings → BitTorrent |
 | Tracker List | Settings → BitTorrent |
 | Tracker Subscription | Settings → BitTorrent |

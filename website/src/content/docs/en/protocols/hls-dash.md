@@ -27,7 +27,7 @@ For your privacy, cookies are only forwarded to segment and key requests that sh
 
 ## Segment download & merging
 
-Segments download with bounded concurrency (by default up to 8 in parallel, capped at 16, tunable via *Settings → Download → Default Threads* — the same knob used for HTTP downloads) and are decrypted as they arrive, but always written to the output file strictly in playlist order, so the final file is identical to what a plain sequential download would produce. A segment that fails to download is retried up to 3 times with exponential backoff (2s, 4s, 8s) before the whole task fails.
+Segments download with bounded concurrency (by default up to 8 in parallel, capped at 16, tunable via *Settings → Download → Default Threads* — the same knob used for HTTP downloads) and are decrypted as they arrive, but always written to the output file strictly in playlist order, so the final file is identical to what a plain sequential download would produce. A segment that fails to download is retried up to 3 times with exponential backoff (2s, then 4s) before the whole task fails.
 
 ## DASH support
 

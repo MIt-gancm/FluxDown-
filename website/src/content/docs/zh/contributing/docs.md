@@ -3,7 +3,7 @@ title: 参与文档贡献
 description: 如何改进这份文档。
 section: contributing
 order: 1
-sourceHash: c64c6afeacfc
+sourceHash: "c64c6afeacfc"
 ---
 
 本文档托管在公开仓库 [zerx-lab/fluxdown](https://github.com/zerx-lab/fluxdown),每一页都有**编辑此页**入口。
