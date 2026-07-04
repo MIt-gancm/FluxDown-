@@ -96,6 +96,29 @@ async function renderPngFrom(src: string, size: number): Promise<Buffer> {
     .toBuffer();
 }
 
+/**
+ * 生成 macOS 应用图标 — 内容占画布约 80%，四周留透明边距。
+ *
+ * macOS Big Sur+ 图标规范要求 artwork 占据画布约 80%（1024 画布内 ~824px），
+ * 四周留透明边距；系统不会自动缩放（不同于 iOS 的圆角遮罩），铺满画布会显得比其他 app 大。
+ */
+async function renderMacAppIcon(size: number): Promise<Buffer> {
+  // 内容占比 ~80%，其余为透明边距
+  const content = Math.round(size * 0.8);
+  const logo = await renderPngFrom(SVG_SRC, content);
+  return sharp({
+    create: {
+      width: size,
+      height: size,
+      channels: 4,
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    },
+  })
+    .composite([{ input: logo, gravity: "center" }])
+    .png({ compressionLevel: 9 })
+    .toBuffer();
+}
+
 /** 生成灰度（disabled）版本的 PNG Buffer */
 async function renderDisabledPng(size: number): Promise<Buffer> {
   const src = await renderPng(size);
@@ -405,7 +428,7 @@ async function main() {
   {
     const macSizes = [16, 32, 64, 128, 256, 512, 1024];
     for (const size of macSizes) {
-      const buf = await getCachedPng(size);
+      const buf = await renderMacAppIcon(size);
       await saveFile(
         `macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_${size}.png`,
         buf,
