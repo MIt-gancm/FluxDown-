@@ -21,14 +21,6 @@ Future<void> showMobileTaskActionSheet(
       final c = AppColors.of(ctx);
       final boosted = controller.priorityTaskId == task.id;
 
-      final (IconData toggleIcon, String toggleLabel) = switch (task.status) {
-        TaskStatus.downloading ||
-        TaskStatus.preparing ||
-        TaskStatus.resuming => (LucideIcons.pause, s.pause),
-        TaskStatus.error => (LucideIcons.rotateCcw, s.mobileRetry),
-        _ => (LucideIcons.play, s.resume),
-      };
-
       Widget item({
         required IconData icon,
         required String label,
@@ -58,79 +50,122 @@ Future<void> showMobileTaskActionSheet(
         );
       }
 
-      return MobileSheetContainer(
-        title: task.fileName,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (task.status != TaskStatus.completed)
-              item(
-                icon: toggleIcon,
-                label: toggleLabel,
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  _toggleTask(controller, task);
-                },
-              ),
-            if (task.status != TaskStatus.completed)
-              item(
-                icon: LucideIcons.zap,
-                label: boosted ? s.cancelBoost : s.mobileBoostAction,
-                onTap: () {
-                  Navigator.of(ctx).pop();
-                  controller.setPriorityTask(boosted ? '' : task.id);
-                  showMobileToast(
-                    context,
-                    boosted ? s.mobileBoostOff : s.mobileBoostOn,
-                  );
-                },
-              ),
-            item(
-              icon: LucideIcons.copy,
-              label: s.copyUrl,
+      Widget divider() => Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Container(height: 1, color: c.border),
+      );
+
+      // 暂停 ⇄ 继续 / 重试：仅非终态任务展示
+      final (IconData toggleIcon, String toggleLabel) = switch (task.status) {
+        TaskStatus.downloading ||
+        TaskStatus.preparing ||
+        TaskStatus.resuming => (LucideIcons.pause, s.pause),
+        TaskStatus.error => (LucideIcons.rotateCcw, s.mobileRetry),
+        _ => (LucideIcons.play, s.resume),
+      };
+
+      final toggleItem = task.status != TaskStatus.completed
+          ? item(
+              icon: toggleIcon,
+              label: toggleLabel,
               onTap: () {
                 Navigator.of(ctx).pop();
-                Clipboard.setData(ClipboardData(text: task.url));
-                showMobileToast(context, s.urlCopied);
+                _toggleTask(controller, task);
               },
-            ),
-            item(
+            )
+          : null;
+
+      // Boost 与移动到队列对已完成任务无意义
+      final boostItem = task.status != TaskStatus.completed
+          ? item(
+              icon: LucideIcons.zap,
+              label: boosted ? s.cancelBoost : s.mobileBoostAction,
+              onTap: () {
+                Navigator.of(ctx).pop();
+                controller.setPriorityTask(boosted ? '' : task.id);
+                showMobileToast(
+                  context,
+                  boosted ? s.mobileBoostOff : s.mobileBoostOn,
+                );
+              },
+            )
+          : null;
+
+      final queueItem = task.status != TaskStatus.completed
+          ? item(
               icon: LucideIcons.layers,
               label: s.mobileMoveToQueue,
               onTap: () {
                 Navigator.of(ctx).pop();
                 _showMoveToQueueSheet(context, controller, task);
               },
-            ),
-            item(
-              icon: LucideIcons.trash2,
-              label: s.deleteTask,
-              danger: true,
-              onTap: () {
-                Navigator.of(ctx).pop();
-                confirmMobileDeleteTask(
-                  context,
-                  controller,
-                  task,
-                  deleteFiles: false,
-                );
-              },
-            ),
-            item(
-              icon: LucideIcons.trash2,
-              label: s.deleteTaskAndFile,
-              danger: true,
-              onTap: () {
-                Navigator.of(ctx).pop();
-                confirmMobileDeleteTask(
-                  context,
-                  controller,
-                  task,
-                  deleteFiles: true,
-                );
-              },
-            ),
-          ],
+            )
+          : null;
+
+      final copyItem = item(
+        icon: LucideIcons.copy,
+        label: s.copyUrl,
+        onTap: () {
+          Navigator.of(ctx).pop();
+          Clipboard.setData(ClipboardData(text: task.url));
+          showMobileToast(context, s.urlCopied);
+        },
+      );
+
+      // 分组：控制操作 / 常规操作 / 危险操作，缺失分组自动折叠分隔线
+      final controlGroup = <Widget>[
+        ?toggleItem,
+        ?boostItem,
+      ];
+      final normalGroup = <Widget>[
+        copyItem,
+        ?queueItem,
+      ];
+      final dangerGroup = <Widget>[
+        item(
+          icon: LucideIcons.trash2,
+          label: s.deleteTask,
+          danger: true,
+          onTap: () {
+            Navigator.of(ctx).pop();
+            confirmMobileDeleteTask(
+              context,
+              controller,
+              task,
+              deleteFiles: false,
+            );
+          },
+        ),
+        item(
+          icon: LucideIcons.trash2,
+          label: s.deleteTaskAndFile,
+          danger: true,
+          onTap: () {
+            Navigator.of(ctx).pop();
+            confirmMobileDeleteTask(
+              context,
+              controller,
+              task,
+              deleteFiles: true,
+            );
+          },
+        ),
+      ];
+
+      final groups = [controlGroup, normalGroup, dangerGroup]
+          .where((g) => g.isNotEmpty)
+          .toList();
+      final children = <Widget>[];
+      for (var i = 0; i < groups.length; i++) {
+        if (i > 0) children.add(divider());
+        children.addAll(groups[i]);
+      }
+
+      return MobileSheetContainer(
+        title: task.fileName,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: children,
         ),
       );
     },
