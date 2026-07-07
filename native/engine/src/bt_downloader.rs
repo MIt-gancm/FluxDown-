@@ -1109,6 +1109,25 @@ pub fn bt_stage_dir(save_dir: &str, task_id: &str) -> PathBuf {
     PathBuf::from(save_dir).join(format!("{}{}", BT_STAGE_PREFIX, task_id))
 }
 
+fn landed_residue_path(
+    save_path: &Path,
+    current_file_name: &str,
+    child_name: &std::ffi::OsStr,
+) -> Option<PathBuf> {
+    let child_path = PathBuf::from(child_name);
+    let flat = save_path.join(&child_path);
+    if flat.exists() {
+        return Some(flat);
+    }
+
+    let container_child = save_path.join(current_file_name).join(&child_path);
+    if container_child.exists() {
+        return Some(container_child);
+    }
+
+    None
+}
+
 /// Returns `true` if `dir` contains at least one regular file with `len > 0`,
 /// searching **recursively** (multi-file torrents nest their payload inside a
 /// `<torrent name>/` subdirectory, which a top-level-only scan reports as a
@@ -1273,8 +1292,11 @@ pub fn rescue_stranded_staging_files(
         // ------------------------------------------------------------------
         // Fast path: an entry whose name exactly matches current_file_name
         // (= resolved_name written to DB in Phase 3 / Phase 3.5).
-        // This is the normal case: single-file torrent or a multi-file
-        // torrent whose top-level directory name equals the torrent name.
+        // Fires mainly for single-file torrents. Multi-file torrents stage each
+        // file at its own relative path (the torrent-name container exists only
+        // in save_dir, created by the completion move), so they normally take the
+        // fallback path below — an entry matches here only when the torrent has
+        // an inner directory named like its root.
         // Mirrors the `stage_item.exists()` branch in bt_download_inner.
         // ------------------------------------------------------------------
         let preferred = entries
@@ -1347,12 +1369,17 @@ pub fn rescue_stranded_staging_files(
             let child_name_str = child_name.to_string_lossy();
             // I-5 防御(同 fast path):save_dir 已有同名产物 ⟹ 本条目是
             // "copy 成功 remove 被阻塞"的残留副本,丢弃而非 dedup 成 `(1)`
-            // 覆写 DB 指针。
-            if save_path.join(child_name_str.as_ref()).exists() {
+            // 覆写 DB 指针。全选多文件的新布局会落到
+            // save_dir/<current_file_name>/<child>,因此也必须识别 container
+            // 子路径,否则重启 rescue 会把残留搬到 save_dir 根目录。
+            if let Some(landed) =
+                landed_residue_path(save_path, current_file_name.as_str(), &child_name)
+            {
                 log_info!(
-                    "[BT] rescue: task={} child '{}' already present in save_dir; dropping residue",
+                    "[BT] rescue: task={} child '{}' already present at '{}'; dropping residue",
                     &task_id[..task_id.len().min(8)],
-                    child_name_str
+                    child_name_str,
+                    landed.display()
                 );
                 continue;
             }
@@ -1471,25 +1498,59 @@ fn dedup_name_in_dir(dir: &Path, name: &str, avoid: &HashSet<String>) -> String 
     }
 }
 
+struct CompletionLayoutInput<'a> {
+    save_dir: &'a Path,
+    stage_dir: &'a Path,
+    selected_files: &'a [CompletionFileSpec],
+    all_selected: bool,
+    is_multi_file_torrent: bool,
+    custom_name: &'a str,
+    torrent_root_name: &'a str,
+    reuse_top: Option<&'a str>,
+    claimed: &'a HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletionFileSpec {
+    relative_path: PathBuf,
+    len: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompletionMove {
+    src: PathBuf,
+    dst: PathBuf,
+    expected_len: u64,
+}
+
+struct CompletionLayout {
+    moves: Vec<CompletionMove>,
+    top_level_name: String,
+    task_owned_container: bool,
+}
+
 /// Compute the layout for moving downloaded files from staging to save_dir.
 ///
-/// Returns `(moves, top_level_name)`:
+/// Returns a [`CompletionLayout`]:
 /// - `moves`: ordered list of `(src_in_stage, dst_in_save)` pairs to apply
 /// - `top_level_name`: the entry that ends up directly under `save_dir`
 ///   (used as the DB `file_name` for "open file location" UX)
+/// - `task_owned_container`: whether all `dst`s live under a final top-level
+///   directory owned by this task's completion sentinel.  Retry may safely
+///   merge/replace children only in this mode.
 ///
 /// Layout decisions:
-/// - **All-selected with shared top-level dir** → container move (move the
-///   whole top-level dir from staging to save_dir, optionally renamed).
-/// - **All-selected, flat torrent** → per-file flat move (each non-padding
-///   file lands directly under save_dir).
+/// - **All-selected multi-file torrent** → preserve rqbit's default
+///   `save_dir/<torrent name>/...` layout even though FluxDown downloads into
+///   a task-scoped staging dir.  The torrent root is always the outer final
+///   container; selected relative paths remain the content paths inside it.
 /// - **Single file (partial or otherwise)** → single-file flat move (basename
 ///   only, no container, optional `custom_name` rename).
 /// - **Partial selection of multiple files** → per-file flat move; basenames
 ///   are deduped against save_dir AND against in-batch siblings.  `custom_name`
 ///   does not apply (no obvious "container" to rename).
 ///
-/// The reason completion is driven by `selected_paths` (and never by reading
+/// The reason completion is driven by selected metadata paths (and never by reading
 /// staging dir contents) is that BT pieces span file boundaries, so librqbit
 /// inevitably writes piece-overlap byproducts for non-selected files (see
 /// `librqbit/file_ops.rs::write_chunk` — only BEP-47 padding files are
@@ -1510,25 +1571,29 @@ fn dedup_name_in_dir(dir: &Path, name: &str, avoid: &HashSet<String>) -> String 
 ///   数据丢失(跨任务哨兵劫持),故一律 fresh dedup 换名:最坏遗留一个
 ///   垃圾半成品孤儿,绝不覆盖可能属于他人的文件。
 ///
-/// flat 多文件分支的逐名 dedup 撞名为 v0 既有行为。
+/// partial-selection flat 多文件分支的逐名 dedup 撞名为 v0 既有行为。
 ///
 /// `claimed`:其他任务经完成哨兵声明(但可能尚未落盘)的顶层名集合
 /// (小写折叠,同 save_dir)。所有 fresh dedup 都会避开这些名字,使
 /// 并发同名任务无法抢走一个已声明、正在重试中的名字。
-fn compute_completion_layout(
-    save_dir: &Path,
-    stage_dir: &Path,
-    selected_paths: &[PathBuf],
-    all_selected: bool,
-    custom_name: &str,
-    reuse_top: Option<&str>,
-    claimed: &HashSet<String>,
-) -> Option<(Vec<(PathBuf, PathBuf)>, String)> {
-    if selected_paths.is_empty() {
+fn compute_completion_layout(input: CompletionLayoutInput<'_>) -> Option<CompletionLayout> {
+    let CompletionLayoutInput {
+        save_dir,
+        stage_dir,
+        selected_files,
+        all_selected,
+        is_multi_file_torrent,
+        custom_name,
+        torrent_root_name,
+        reuse_top,
+        claimed,
+    } = input;
+
+    if selected_files.is_empty() {
         return None;
     }
 
-    // 路径穿越防护:`selected_paths` 源自 torrent 元数据(file_infos[i].
+    // 路径穿越防护:selected paths 源自 torrent 元数据(file_infos[i].
     // relative_filename),恶意种子可塞入 `..` / 绝对路径 / 盘符前缀,使
     // `stage_dir.join(rel)` 逃出 staging 目录(读到任意位置文件)或破坏 dst 归属。
     // 任一选中路径不安全即整体拒绝(返回 None → 调用方标 STATUS_ERROR),决不
@@ -1542,7 +1607,11 @@ fn compute_completion_layout(
         }
         rel.components().all(|c| matches!(c, Component::Normal(_)))
     };
-    if let Some(bad) = selected_paths.iter().find(|p| !path_is_safe(p)) {
+    if let Some(bad) = selected_files
+        .iter()
+        .map(|f| &f.relative_path)
+        .find(|p| !path_is_safe(p))
+    {
         log_info!(
             "[BT] completion: rejecting unsafe selected path '{}' (path traversal guard)",
             bad.display(),
@@ -1550,46 +1619,44 @@ fn compute_completion_layout(
         return None;
     }
 
-    // Detect a real shared top-level directory (every path has > 1 component
-    // AND first component is identical across all selected files).
-    let shared_top_dir: Option<String> = (|| -> Option<String> {
-        let first = selected_paths
-            .first()?
-            .components()
-            .next()
-            .and_then(|c| c.as_os_str().to_str())?
-            .to_string();
-        for p in selected_paths {
-            if p.components().count() < 2 {
-                return None;
-            }
-            let head = p.components().next()?.as_os_str().to_str()?;
-            if head != first {
-                return None;
-            }
-        }
-        Some(first)
-    })();
+    let torrent_root = crate::downloader::sanitize_filename(torrent_root_name);
+    let desired_container = if custom_name.is_empty() {
+        torrent_root.as_str()
+    } else {
+        custom_name
+    };
 
-    // Container move: only when all selected AND a real top-level dir exists.
-    if all_selected && let Some(top) = shared_top_dir.as_deref() {
-        let desired = if custom_name.is_empty() {
-            top
-        } else {
-            custom_name
-        };
+    // Rqbit's default CLI/session behavior places all-selected multi-file
+    // torrents under `<torrent name>/`. FluxDown overrides rqbit's
+    // output_folder with a hidden staging dir, so we recreate that outer root
+    // here and preserve every torrent-relative path below it. If a valid
+    // torrent happens to contain an inner directory with the same name as the
+    // torrent root, that inner component must remain (`Root/Root/file`).
+    if all_selected && is_multi_file_torrent {
         let final_top = match reuse_top {
             Some(n) if !save_dir.join(n).exists() || save_dir.join(n).is_dir() => n.to_string(),
-            _ => dedup_name_in_dir(save_dir, desired, claimed),
+            _ => dedup_name_in_dir(save_dir, desired_container, claimed),
         };
-        let src = stage_dir.join(top);
-        let dst = save_dir.join(&final_top);
-        return Some((vec![(src, dst)], final_top));
+        let dst_root = save_dir.join(&final_top);
+        let moves = selected_files
+            .iter()
+            .map(|file| CompletionMove {
+                src: stage_dir.join(&file.relative_path),
+                dst: dst_root.join(&file.relative_path),
+                expected_len: file.len,
+            })
+            .collect();
+        return Some(CompletionLayout {
+            moves,
+            top_level_name: final_top,
+            task_owned_container: true,
+        });
     }
 
     // Single-file flat move (single selected file regardless of all_selected).
-    if selected_paths.len() == 1 {
-        let rel = &selected_paths[0];
+    if selected_files.len() == 1 {
+        let file = &selected_files[0];
+        let rel = &file.relative_path;
         let basename = rel
             .file_name()
             .and_then(|n| n.to_str())
@@ -1608,7 +1675,15 @@ fn compute_completion_layout(
         };
         let src = stage_dir.join(rel);
         let dst = save_dir.join(&final_name);
-        return Some((vec![(src, dst)], final_name));
+        return Some(CompletionLayout {
+            moves: vec![CompletionMove {
+                src,
+                dst,
+                expected_len: file.len,
+            }],
+            top_level_name: final_name,
+            task_owned_container: false,
+        });
     }
 
     // Per-file flat move: covers all-selected flat torrent + partial multi.
@@ -1617,9 +1692,10 @@ fn compute_completion_layout(
     // `taken` 存小写折叠名:批内两个仅大小写不同的 basename(种子内合法)
     // 在 Windows 上是同一 dst,精确比较会漏判并互相覆盖。
     let mut taken: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut moves: Vec<(PathBuf, PathBuf)> = Vec::with_capacity(selected_paths.len());
+    let mut moves: Vec<CompletionMove> = Vec::with_capacity(selected_files.len());
     let mut top_level: Option<String> = None;
-    for (idx, rel) in selected_paths.iter().enumerate() {
+    for (idx, file) in selected_files.iter().enumerate() {
+        let rel = &file.relative_path;
         let basename = rel
             .file_name()
             .and_then(|n| n.to_str())
@@ -1679,10 +1755,18 @@ fn compute_completion_layout(
         if top_level.is_none() {
             top_level = Some(candidate.clone());
         }
-        moves.push((src, dst));
+        moves.push(CompletionMove {
+            src,
+            dst,
+            expected_len: file.len,
+        });
     }
 
-    Some((moves, top_level.unwrap_or_else(|| "download".to_string())))
+    Some(CompletionLayout {
+        moves,
+        top_level_name: top_level.unwrap_or_else(|| "download".to_string()),
+        task_owned_container: false,
+    })
 }
 
 /// Move a file or directory from `src` to `dst` — 零拷贝优先的三级降级链。
@@ -1699,13 +1783,17 @@ fn compute_completion_layout(
 /// 3. copy + remove 兜底:仅剩真正跨卷(EXDEV)等场景,逐文件发生于
 ///    [`move_file`] 内,中途失败清理半成品 dst、保留 src 可重试。
 fn move_path(src: &Path, dst: &Path) -> std::io::Result<()> {
+    move_path_with_file_replace(src, dst, false)
+}
+
+fn move_path_with_file_replace(src: &Path, dst: &Path, replace_file: bool) -> std::io::Result<()> {
     if !src.is_dir() {
         let mut budget = RETRY_SLEEP_BUDGET;
         // 顶层文件 move 一律 noreplace(见 move_file doc):dedup 在完成锁内
         // 保证 dst 空闲,此刻 dst 已被占只能是锁外写者(HTTP finalize/外部
         // 程序)在 dedup 与 move 的间隙抢得——占位声明使本次 move 失败重试
         // 换名,决不 REPLACE 覆盖对方产物。
-        return move_file(src, dst, &mut budget, false);
+        return move_file(src, dst, &mut budget, replace_file);
     }
     // 防御(实测:Windows `rename(dir, existing_file)` 会静默吞掉该文件):
     // dst 已存在且不是目录 → 不走目录 rename 快路径,直接报错让上层处理
@@ -1830,6 +1918,81 @@ fn move_dir_recursive(src: &Path, dst: &Path, budget: &mut u32) -> std::io::Resu
         None => Ok(()),
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompletionMoveOutcome {
+    Moved,
+    PriorSuccess,
+    MissingSource,
+}
+
+fn remove_completion_src_residue(src: &Path) {
+    if src.is_dir() {
+        let _ = std::fs::remove_dir_all(src);
+    } else {
+        let _ = std::fs::remove_file(src);
+    }
+}
+
+fn path_has_expected_file_len(path: &Path, expected_len: u64) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() == expected_len)
+        .unwrap_or(false)
+}
+
+fn move_completion_item(
+    src: &Path,
+    dst: &Path,
+    expected_len: u64,
+    retrying_completion: bool,
+    task_owned_container: bool,
+    dst_verified: bool,
+) -> std::io::Result<CompletionMoveOutcome> {
+    if !src.exists() {
+        return if retrying_completion
+            && dst_verified
+            && dst.exists()
+            && path_has_expected_file_len(dst, expected_len)
+        {
+            Ok(CompletionMoveOutcome::PriorSuccess)
+        } else {
+            Ok(CompletionMoveOutcome::MissingSource)
+        };
+    }
+
+    if retrying_completion
+        && task_owned_container
+        && dst_verified
+        && dst.exists()
+        && path_has_expected_file_len(dst, expected_len)
+    {
+        remove_completion_src_residue(src);
+        return Ok(CompletionMoveOutcome::PriorSuccess);
+    }
+
+    if !path_has_expected_file_len(src, expected_len) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "staged source length mismatch: expected {} bytes",
+                expected_len
+            ),
+        ));
+    }
+
+    if let Some(parent) = dst.parent()
+        && !parent.exists()
+    {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if retrying_completion && task_owned_container && dst.exists() {
+        move_path_with_file_replace(src, dst, true)?;
+    } else {
+        move_path(src, dst)?;
+    }
+    Ok(CompletionMoveOutcome::Moved)
+}
+
 const STATUS_PREPARING: i32 = 5;
 
 /// Number of virtual segments for single-file BT progress visualization.
@@ -2310,6 +2473,26 @@ fn hash_file_span(
     Ok(())
 }
 
+fn resolve_completion_verify_path(
+    staged_path: PathBuf,
+    completion_moves: &[CompletionMove],
+    allow_dst_fallback: bool,
+) -> PathBuf {
+    if !allow_dst_fallback || staged_path.exists() {
+        return staged_path;
+    }
+    if allow_dst_fallback
+        && let Some(dst) = completion_moves
+            .iter()
+            .find(|m| m.src == staged_path)
+            .map(|m| &m.dst)
+            .filter(|dst| dst.exists())
+    {
+        return dst.clone();
+    }
+    staged_path
+}
+
 /// Re-hash the staged data of `handle` against its torrent metadata on a
 /// blocking thread.  `true_selection` are the selected file indices
 /// (negative values or an empty list mean "all files").
@@ -2317,6 +2500,8 @@ async fn verify_staged_pieces(
     handle: BtHandle,
     stage_dir: PathBuf,
     true_selection: Vec<i32>,
+    completion_moves: Vec<CompletionMove>,
+    allow_dst_fallback: bool,
 ) -> Result<VerifyOutcome, String> {
     tokio::task::spawn_blocking(move || {
         let select_all = true_selection.is_empty() || true_selection.iter().any(|&i| i < 0);
@@ -2331,7 +2516,12 @@ async fn verify_staged_pieces(
                         path: if fi.attrs.padding {
                             None
                         } else {
-                            Some(stage_dir.join(&fi.relative_filename))
+                            let staged_path = stage_dir.join(&fi.relative_filename);
+                            Some(resolve_completion_verify_path(
+                                staged_path,
+                                &completion_moves,
+                                allow_dst_fallback,
+                            ))
                         },
                         len: fi.len,
                         selected: select_all || selected.contains(&i),
@@ -2409,8 +2599,12 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     } else {
         // Use a task-scoped staging directory so that concurrent BT tasks
         // with identical torrent names never collide on disk.
-        // librqbit will write to  save_dir/.bt_stage_<task_id>/<resolved_name>
-        // and we move the result to the final deduplicated path after download.
+        // Because output_folder is set explicitly (sub_folder = None), librqbit
+        // writes each file flat at  save_dir/.bt_stage_<task_id>/<relative_path>
+        // — it does NOT prepend the torrent-name folder (that default applies
+        // only when output_folder is None; see librqbit session.rs). The
+        // torrent-name container is recreated by compute_completion_layout when
+        // moving the result to its final deduplicated path after download.
         let stage_dir = bt_stage_dir(&save_dir, &task_id);
         // Create the staging directory now (before librqbit does) so we can
         // immediately mark it hidden.  librqbit uses `overwrite: true` and
@@ -2941,7 +3135,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     }
 
     // -----------------------------------------------------------------------
-    // Snapshot the relative paths of selected non-padding files.
+    // Snapshot the relative paths and expected lengths of selected non-padding files.
     //
     // This is the SOLE source of truth for the completion-time move:
     //   - Path R (had_existing_handle): `selected_indices` is a (0..file_count)
@@ -2959,29 +3153,37 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     } else {
         selected_indices.clone()
     };
-    let (selected_paths, non_padding_count): (Vec<PathBuf>, usize) = handle
+    let (selected_files, non_padding_count, is_multi_file_torrent): (
+        Vec<CompletionFileSpec>,
+        usize,
+        bool,
+    ) = handle
         .with_metadata(|meta| {
             let total_non_padding = meta
                 .file_infos
                 .iter()
                 .filter(|fi| !fi.attrs.padding)
                 .count();
-            let paths: Vec<PathBuf> = true_selection
+            let files: Vec<CompletionFileSpec> = true_selection
                 .iter()
                 .filter_map(|&i| meta.file_infos.get(i as usize))
                 .filter(|fi| !fi.attrs.padding)
-                .map(|fi| fi.relative_filename.clone())
+                .map(|fi| CompletionFileSpec {
+                    relative_path: fi.relative_filename.clone(),
+                    len: fi.len,
+                })
                 .collect();
-            (paths, total_non_padding)
+            (files, total_non_padding, meta.info.files.is_some())
         })
         .unwrap_or_default();
-    let all_selected = !selected_paths.is_empty() && selected_paths.len() == non_padding_count;
+    let all_selected = !selected_files.is_empty() && selected_files.len() == non_padding_count;
     log_info!(
-        "[BT] task={} completion plan: {} selected file(s), all_selected={}, non_padding_total={}",
+        "[BT] task={} completion plan: {} selected file(s), all_selected={}, non_padding_total={}, multi_file_meta={}",
         short_id(&task_id),
-        selected_paths.len(),
+        selected_files.len(),
         all_selected,
-        non_padding_count
+        non_padding_count,
+        is_multi_file_torrent
     );
 
     // Recompute total_bytes based on selected files only for accurate progress display.
@@ -3169,90 +3371,14 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             // Download complete.
             //
             // Move the user-selected files from the staging directory into
-            // save_dir.  The move is driven by `selected_paths` (a snapshot
-            // of `meta.file_infos[i].relative_filename` for selected indices,
+            // save_dir.  The move is driven by `selected_files` (a snapshot
+            // of `meta.file_infos[i].relative_filename` + len for selected indices,
             // taken right after the user confirmed the file selection).
             //
             // We send the single STATUS_COMPLETED signal AFTER the move so
             // that the file_name field already reflects the true disk name.
             let save_path = PathBuf::from(&save_dir);
             let stage_dir = bt_stage_dir(&save_dir, &task_id);
-
-            // BUG-BT-PHANTOM-PIECES: `stats.finished` can lie when have-bits
-            // were restored from a stale `{hash}.bitv` whose staging data no
-            // longer exists (librqbit's sampling validation ignores SHA1
-            // mismatches — see the doc on `verify_pieces_core`).  Re-hash
-            // every required piece before moving the file out of staging.
-            // On failure: drop the torrent from the session (delete_files =
-            // false keeps the good pieces on disk; the persistence store
-            // also removes the lying .bitv), then fail with a retriable
-            // error — the auto-retry re-adds the torrent, librqbit performs
-            // a genuine full check, and only the bad pieces are downloaded
-            // again.
-            if stage_dir.exists() {
-                log_info!(
-                    "[BT] task={} verifying {} pieces before completing...",
-                    short_id(&task_id),
-                    total_pieces
-                );
-                let verify_started = Instant::now();
-                match verify_staged_pieces(
-                    handle.clone(),
-                    stage_dir.clone(),
-                    true_selection.clone(),
-                )
-                .await
-                {
-                    Ok(outcome) if outcome.bad.is_empty() => {
-                        log_info!(
-                            "[BT] task={} piece verification passed ({} hashed, {} skipped) in {:.1}s",
-                            short_id(&task_id),
-                            outcome.checked,
-                            outcome.skipped,
-                            verify_started.elapsed().as_secs_f64()
-                        );
-                    }
-                    Ok(outcome) => {
-                        let preview: Vec<u32> = outcome.bad.iter().take(16).copied().collect();
-                        log_info!(
-                            "[BT] task={} piece verification FAILED: {}/{} pieces bad (first: {:?}) in {:.1}s — clearing fastresume state, bad pieces will be re-downloaded",
-                            short_id(&task_id),
-                            outcome.bad.len(),
-                            total_pieces,
-                            preview,
-                            verify_started.elapsed().as_secs_f64()
-                        );
-                        let _ = shared_bt.delete_task(&task_id, false).await;
-                        let msg = format!(
-                            "BT piece verification failed: {} bad piece(s) — data will be re-checked and re-downloaded",
-                            outcome.bad.len()
-                        );
-                        let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
-                        let _ = progress_tx
-                            .send(ProgressUpdate {
-                                task_id: task_id.clone(),
-                                downloaded_bytes: progress,
-                                total_bytes: total,
-                                status: STATUS_ERROR,
-                                error_message: msg.clone(),
-                                file_name: String::new(),
-                                segment_details: None,
-                            })
-                            .await;
-                        return Err(DownloadError::Other(msg));
-                    }
-                    Err(e) => {
-                        // Internal verification error (e.g. metadata gone) —
-                        // don't block completion on it; behave as before this
-                        // guard existed.
-                        log_info!(
-                            "[BT] task={} piece verification skipped: {}",
-                            short_id(&task_id),
-                            e
-                        );
-                    }
-                }
-            }
 
             let (completed_name, all_moves_succeeded) = if !stage_dir.exists() {
                 // No staging dir at all — resumed download that was already
@@ -3261,53 +3387,67 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 // correct; just return resolved_name for the signal.
                 (resolved_name.clone(), true)
             } else {
-                // Serialize the dedup-name + move sequence against other BT
-                // task completions sharing this session's save_dir.  Without
-                // this, two same-named torrents finishing simultaneously would
-                // both dedup to the same name and the second rename would
-                // overwrite the first task's file (see F050).  The guard is
-                // held until the end of this block, covering the whole move loop.
-                let _move_guard = shared_bt.lock_completion_move().await;
-                // 完成幂等哨兵:首次尝试把 dedup 选定的顶层名记入 config,
-                // 部分失败重试时复用同名让降级链 merge 进同一 dst,防 fresh
-                // dedup 撞名把数据分裂到 `Name (1)/`(BUG-BT-COMPLETION-SPLIT)。
-                // 锁内读写,与并发同名任务的完成序列全局串行化,无 TOCTOU。
                 let sentinel_key = format!("bt_completion_top_{}", task_id);
-                let reuse_top: Option<String> = db.get_config(&sentinel_key).await.ok().flatten();
-                // Claim-aware dedup:采集**其他**任务的活跃哨兵名(同
-                // save_dir,小写折叠)。这些名字已被声明但可能尚未在磁盘留下
-                // 足迹(对方首次 move 零足迹失败、等待重试中),fresh dedup 若
-                // 占用它们,对方重试复用哨兵时会 merge 进/覆盖本任务产物
-                // (跨任务哨兵劫持)。锁内读取,与哨兵写入全局串行,无 TOCTOU。
-                let claimed: HashSet<String> = {
-                    let mut set = HashSet::new();
-                    if let Ok(rows) = db.list_config_with_prefix("bt_completion_top_").await {
-                        for (key, value) in rows {
-                            let Some(tid) = key.strip_prefix("bt_completion_top_") else {
-                                continue;
-                            };
-                            if tid == task_id {
-                                continue;
-                            }
-                            if let Ok(Some(t)) = db.load_task_by_id(tid).await
-                                && t.save_dir == save_dir
-                            {
-                                set.insert(value.to_lowercase());
+                let planned_completion = {
+                    // Serialize dedup-name + sentinel declaration against other
+                    // BT task completions sharing this session's save_dir. The
+                    // expensive piece verification runs after this guard drops;
+                    // the persisted sentinel is the claim that makes concurrent
+                    // fresh dedup avoid this top-level name.
+                    let _move_guard = shared_bt.lock_completion_move().await;
+                    // 完成幂等哨兵:首次尝试把 dedup 选定的顶层名记入 config,
+                    // 部分失败重试时复用同名让降级链 merge 进同一 dst,防 fresh
+                    // dedup 撞名把数据分裂到 `Name (1)/`(BUG-BT-COMPLETION-SPLIT)。
+                    // 锁内读写,与并发同名任务的完成序列全局串行化,无 TOCTOU。
+                    let reuse_top: Option<String> =
+                        db.get_config(&sentinel_key).await.ok().flatten();
+                    // Claim-aware dedup:采集**其他**任务的活跃哨兵名(同
+                    // save_dir,小写折叠)。这些名字已被声明但可能尚未在磁盘留下
+                    // 足迹(对方首次 move 零足迹失败、等待重试中),fresh dedup 若
+                    // 占用它们,对方重试复用哨兵时会 merge 进/覆盖本任务产物
+                    // (跨任务哨兵劫持)。锁内读取,与哨兵写入全局串行,无 TOCTOU。
+                    let retrying_completion = reuse_top.is_some();
+                    let claimed: HashSet<String> = {
+                        let mut set = HashSet::new();
+                        if let Ok(rows) = db.list_config_with_prefix("bt_completion_top_").await {
+                            for (key, value) in rows {
+                                let Some(tid) = key.strip_prefix("bt_completion_top_") else {
+                                    continue;
+                                };
+                                if tid == task_id {
+                                    continue;
+                                }
+                                if let Ok(Some(t)) = db.load_task_by_id(tid).await
+                                    && t.save_dir == save_dir
+                                {
+                                    set.insert(value.to_lowercase());
+                                }
                             }
                         }
+                        set
+                    };
+                    let layout = compute_completion_layout(CompletionLayoutInput {
+                        save_dir: &save_path,
+                        stage_dir: &stage_dir,
+                        selected_files: &selected_files,
+                        all_selected,
+                        is_multi_file_torrent,
+                        custom_name: &custom_name,
+                        torrent_root_name: &resolved_name,
+                        reuse_top: reuse_top.as_deref(),
+                        claimed: &claimed,
+                    });
+                    match layout {
+                        None => None,
+                        Some(layout) => {
+                            if reuse_top.as_deref() != Some(layout.top_level_name.as_str()) {
+                                let _ = db.set_config(&sentinel_key, &layout.top_level_name).await;
+                            }
+                            Some((layout, retrying_completion))
+                        }
                     }
-                    set
                 };
-                let layout = compute_completion_layout(
-                    &save_path,
-                    &stage_dir,
-                    &selected_paths,
-                    all_selected,
-                    &custom_name,
-                    reuse_top.as_deref(),
-                    &claimed,
-                );
-                match layout {
+                match planned_completion {
                     None => {
                         // Empty selection — should not happen in practice.
                         log_info!(
@@ -3317,52 +3457,151 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                         );
                         (resolved_name.clone(), false)
                     }
-                    Some((moves, top_level_name)) => {
-                        let total = moves.len();
-                        // 落哨兵(在 move 循环之前):即使 move 全部失败,重试
-                        // 也会复用同一顶层名。仅在值变化时写,避免重复 IO。
-                        if reuse_top.as_deref() != Some(top_level_name.as_str()) {
-                            let _ = db.set_config(&sentinel_key, &top_level_name).await;
-                        }
+                    Some((layout, retrying_completion)) => {
+                        let move_count = layout.moves.len();
+                        let dst_fallback_candidates: HashSet<PathBuf> = if retrying_completion {
+                            layout
+                                .moves
+                                .iter()
+                                .filter(|m| !m.src.exists() && m.dst.exists())
+                                .map(|m| m.dst.clone())
+                                .collect()
+                        } else {
+                            HashSet::new()
+                        };
+                        // BUG-BT-PHANTOM-PIECES: `stats.finished` can lie when
+                        // have-bits were restored from a stale `{hash}.bitv`
+                        // whose data no longer exists. Re-hash every required
+                        // piece before moving. On a completion retry, some
+                        // selected files may already have been moved to `dst`
+                        // (or copied there while `src` could not be removed);
+                        // verify those final files before counting them as a
+                        // prior successful move.
+                        log_info!(
+                            "[BT] task={} verifying {} pieces before completing...",
+                            short_id(&task_id),
+                            total_pieces
+                        );
+                        let verify_started = Instant::now();
+                        let verified_existing_dsts = match verify_staged_pieces(
+                            handle.clone(),
+                            stage_dir.clone(),
+                            true_selection.clone(),
+                            layout.moves.clone(),
+                            retrying_completion,
+                        )
+                        .await
+                        {
+                            Ok(outcome) if outcome.bad.is_empty() => {
+                                log_info!(
+                                    "[BT] task={} piece verification passed ({} hashed, {} skipped) in {:.1}s",
+                                    short_id(&task_id),
+                                    outcome.checked,
+                                    outcome.skipped,
+                                    verify_started.elapsed().as_secs_f64()
+                                );
+                                dst_fallback_candidates
+                            }
+                            Ok(outcome) => {
+                                let preview: Vec<u32> =
+                                    outcome.bad.iter().take(16).copied().collect();
+                                log_info!(
+                                    "[BT] task={} piece verification FAILED: {}/{} pieces bad (first: {:?}) in {:.1}s — clearing fastresume state, bad pieces will be re-downloaded",
+                                    short_id(&task_id),
+                                    outcome.bad.len(),
+                                    total_pieces,
+                                    preview,
+                                    verify_started.elapsed().as_secs_f64()
+                                );
+                                let _ = shared_bt.delete_task(&task_id, false).await;
+                                let msg = format!(
+                                    "BT piece verification failed: {} bad piece(s) — data will be re-checked and re-downloaded",
+                                    outcome.bad.len()
+                                );
+                                let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
+                                let _ = progress_tx
+                                    .send(ProgressUpdate {
+                                        task_id: task_id.clone(),
+                                        downloaded_bytes: progress,
+                                        total_bytes: total,
+                                        status: STATUS_ERROR,
+                                        error_message: msg.clone(),
+                                        file_name: String::new(),
+                                        segment_details: None,
+                                    })
+                                    .await;
+                                return Err(DownloadError::Other(msg));
+                            }
+                            Err(e) => {
+                                // Internal verification error (e.g. metadata gone)
+                                // should not block completion; preserve the previous
+                                // best-effort behavior.
+                                log_info!(
+                                    "[BT] task={} piece verification skipped: {}",
+                                    short_id(&task_id),
+                                    e
+                                );
+                                HashSet::new()
+                            }
+                        };
+                        // Reacquire the completion lock for the actual move/update
+                        // phase. The sentinel written above remains the claim while
+                        // hashing ran without blocking unrelated BT completions.
+                        let _move_guard = shared_bt.lock_completion_move().await;
+                        let CompletionLayout {
+                            moves,
+                            top_level_name,
+                            task_owned_container,
+                        } = layout;
                         // 完成移动是阻塞的 std::fs rename / 跨设备递归复制。bt-runtime
                         // 是 multi_thread（worker_threads = cpu_cores.clamp(2,8)），在其
                         // async worker 上直接阻塞会占用一个 worker，跨设备多 GB 复制时
                         // 拖慢其他 BT 任务的进度轮询/暂停响应。把整段移动循环搬进
                         // spawn_blocking（卸载到专用阻塞线程）,再 .await 句柄;`_move_guard`
-                        // 仍在外层持有,跨越此 await,保留 completion_move_lock 的序列化语义
+                        // 仍在外层持有,跨越此 await,保留 move/update phase 的序列化语义
                         // (BUG-BT-COMPLETION-MOVE-BLOCKING)。
                         let tid_for_move = task_id.clone();
                         let move_result = tokio::task::spawn_blocking(move || {
                             let mut succeeded = 0usize;
-                            for (src, dst) in &moves {
-                                if !src.exists() {
-                                    log_info!(
-                                        "[BT] task={} completion: expected staged file missing '{}'",
-                                        short_id(&tid_for_move),
-                                        src.display(),
-                                    );
-                                    continue;
-                                }
-                                log_info!(
-                                    "[BT] task={} moving '{}' → '{}'",
-                                    short_id(&tid_for_move),
-                                    src.display(),
-                                    dst.display(),
-                                );
-                                if let Some(parent) = dst.parent()
-                                    && !parent.exists()
-                                {
-                                    let _ = std::fs::create_dir_all(parent);
-                                }
-                                match move_path(src, dst) {
-                                    Ok(()) => {
+                            for item in &moves {
+                                let dst_verified = verified_existing_dsts.contains(&item.dst);
+                                match move_completion_item(
+                                    &item.src,
+                                    &item.dst,
+                                    item.expected_len,
+                                    retrying_completion,
+                                    task_owned_container,
+                                    dst_verified,
+                                ) {
+                                    Ok(CompletionMoveOutcome::Moved) => {
+                                        log_info!(
+                                            "[BT] task={} moved '{}' → '{}'",
+                                            short_id(&tid_for_move),
+                                            item.src.display(),
+                                            item.dst.display(),
+                                        );
                                         succeeded += 1;
+                                    }
+                                    Ok(CompletionMoveOutcome::PriorSuccess) => {
+                                        log_info!(
+                                            "[BT] task={} completion: verified dst already exists '{}'; treating as prior successful move",
+                                            short_id(&tid_for_move),
+                                            item.dst.display(),
+                                        );
+                                        succeeded += 1;
+                                    }
+                                    Ok(CompletionMoveOutcome::MissingSource) => {
+                                        log_info!(
+                                            "[BT] task={} completion: expected staged file missing '{}'",
+                                            short_id(&tid_for_move),
+                                            item.src.display(),
+                                        );
                                     }
                                     Err(e) => {
                                         log_info!(
                                             "[BT] task={} move failed: {} ({})",
                                             short_id(&tid_for_move),
-                                            src.display(),
+                                            item.src.display(),
                                             e
                                         );
                                     }
@@ -3385,12 +3624,12 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                                 0
                             }
                         };
-                        let all_ok = total > 0 && succeeded == total;
+                        let all_ok = move_count > 0 && succeeded == move_count;
                         if all_ok {
                             log_info!(
                                 "[BT] task={} all {} selected file(s) moved; top_level='{}'",
                                 short_id(&task_id),
-                                total,
+                                move_count,
                                 &top_level_name,
                             );
                         } else {
@@ -3398,7 +3637,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                                 "[BT] task={} completion: {}/{} files moved — leaving staging dir for recovery",
                                 short_id(&task_id),
                                 succeeded,
-                                total,
+                                move_count,
                             );
                         }
                         // Persist the resolved top-level name so that the UI
@@ -3727,6 +3966,26 @@ mod tests {
     use super::compute_bt_display_progress;
     use std::collections::{HashMap, HashSet};
 
+    fn completion_files(paths: &[&str]) -> Vec<super::CompletionFileSpec> {
+        paths
+            .iter()
+            .map(|path| super::CompletionFileSpec {
+                relative_path: std::path::PathBuf::from(path),
+                len: 1,
+            })
+            .collect()
+    }
+
+    fn completion_files_with_len(paths: &[(&str, u64)]) -> Vec<super::CompletionFileSpec> {
+        paths
+            .iter()
+            .map(|(path, len)| super::CompletionFileSpec {
+                relative_path: std::path::PathBuf::from(path),
+                len: *len,
+            })
+            .collect()
+    }
+
     // -------------------------------------------------------------------------
     // urlencoding_decode — literal multi-byte UTF-8 must not be mangled (F052).
     // -------------------------------------------------------------------------
@@ -3833,7 +4092,6 @@ mod tests {
 
     #[test]
     fn completion_layout_dedup_uses_numeric_suffix() {
-        use std::path::PathBuf;
         // Two selected files with the same basename in different sub-dirs:
         // their flat destinations collide and must be deduped as
         // "file.txt" + "file (1).txt", not "_file.txt".
@@ -3848,34 +4106,34 @@ mod tests {
         let stage = tmp.join(".stage");
         let _ = std::fs::create_dir_all(&stage);
 
-        let selected = vec![
-            PathBuf::from("dirA/file.txt"),
-            PathBuf::from("dirB/file.txt"),
-        ];
-        let layout = super::compute_completion_layout(
-            &tmp,
-            &stage,
-            &selected,
-            false,
-            "",
-            None,
-            &HashSet::new(),
-        );
+        let selected = completion_files(&["dirA/file.txt", "dirB/file.txt"]);
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &tmp,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: false,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: None,
+            claimed: &claims,
+        });
         let _ = std::fs::remove_dir_all(&tmp);
 
         // Avoid `.unwrap()`/`.expect()` (denied by clippy) — match explicitly.
         let moves = match layout {
-            Some((moves, _top)) => moves,
+            Some(layout) => layout.moves,
             None => panic!("layout should be Some"),
         };
         assert_eq!(moves.len(), 2);
         let dst0 = moves[0]
-            .1
+            .dst
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
         let dst1 = moves[1]
-            .1
+            .dst
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
@@ -3883,6 +4141,187 @@ mod tests {
         assert_eq!(dst1, "file (1).txt");
         // No underscore-prefixed name should ever be produced.
         assert!(!dst1.starts_with('_'), "must not stack underscore prefixes");
+    }
+
+    #[test]
+    fn completion_layout_all_selected_flat_multi_file_uses_torrent_root() {
+        let save = unique_test_dir("flat_multi_root");
+        let stage = save.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+        let selected = completion_files(&["movie.mkv", "subs/en.srt"]);
+
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Movie Pack",
+            reuse_top: None,
+            claimed: &claims,
+        });
+        let layout = match layout {
+            Some(v) => v,
+            None => panic!("layout should be Some"),
+        };
+        let moves = layout.moves;
+        let top = layout.top_level_name;
+
+        assert_eq!(top, "Movie Pack");
+        assert_eq!(moves.len(), 2);
+        assert_eq!(moves[0].src, stage.join("movie.mkv"));
+        assert_eq!(moves[0].dst, save.join("Movie Pack").join("movie.mkv"));
+        assert_eq!(moves[1].src, stage.join("subs").join("en.srt"));
+        assert_eq!(
+            moves[1].dst,
+            save.join("Movie Pack").join("subs").join("en.srt")
+        );
+
+        let _ = std::fs::remove_dir_all(&save);
+    }
+
+    #[test]
+    fn completion_layout_all_selected_common_subdir_stays_under_torrent_root() {
+        let save = unique_test_dir("common_subdir_root");
+        let stage = save.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+        let selected = completion_files(&["Disc 1/a.bin", "Disc 1/b.bin"]);
+
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Movie Pack",
+            reuse_top: None,
+            claimed: &claims,
+        });
+        let layout = match layout {
+            Some(v) => v,
+            None => panic!("layout should be Some"),
+        };
+        let moves = layout.moves;
+        let top = layout.top_level_name;
+
+        assert_eq!(top, "Movie Pack");
+        assert_eq!(moves.len(), 2);
+        assert_eq!(moves[0].src, stage.join("Disc 1").join("a.bin"));
+        assert_eq!(
+            moves[0].dst,
+            save.join("Movie Pack").join("Disc 1").join("a.bin")
+        );
+        assert_eq!(
+            moves[1].dst,
+            save.join("Movie Pack").join("Disc 1").join("b.bin")
+        );
+
+        let _ = std::fs::remove_dir_all(&save);
+    }
+
+    #[test]
+    fn completion_layout_keeps_inner_dir_named_like_torrent_root() {
+        let save = unique_test_dir("same_named_inner_root");
+        let stage = save.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+        let selected = completion_files(&["Torrent/a.bin", "Torrent/b.bin"]);
+
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: None,
+            claimed: &claims,
+        });
+        let layout = match layout {
+            Some(v) => v,
+            None => panic!("layout should be Some"),
+        };
+        let moves = layout.moves;
+        let top = layout.top_level_name;
+
+        assert_eq!(top, "Torrent");
+        assert_eq!(
+            moves[0].dst,
+            save.join("Torrent").join("Torrent").join("a.bin")
+        );
+        assert_eq!(
+            moves[1].dst,
+            save.join("Torrent").join("Torrent").join("b.bin")
+        );
+
+        let _ = std::fs::remove_dir_all(&save);
+    }
+
+    #[test]
+    fn completion_layout_all_selected_flat_multi_file_sanitizes_torrent_root() {
+        let save = unique_test_dir("flat_multi_root_sanitize");
+        let stage = save.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+        let selected = completion_files(&["a.bin", "b.bin"]);
+
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Bad/Name:01",
+            reuse_top: None,
+            claimed: &claims,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
+            None => panic!("layout should be Some"),
+        };
+
+        assert_eq!(top, "Bad_Name_01");
+        let _ = std::fs::remove_dir_all(&save);
+    }
+
+    #[test]
+    fn completion_layout_multi_file_metainfo_with_one_real_file_keeps_torrent_root() {
+        let save = unique_test_dir("multi_meta_one_real_file");
+        let stage = save.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+        let selected = completion_files_with_len(&[("data.bin", 42)]);
+
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: None,
+            claimed: &claims,
+        });
+        let layout = match layout {
+            Some(v) => v,
+            None => panic!("layout should be Some"),
+        };
+
+        assert_eq!(layout.top_level_name, "Torrent");
+        assert_eq!(layout.moves.len(), 1);
+        assert_eq!(layout.moves[0].src, stage.join("data.bin"));
+        assert_eq!(layout.moves[0].dst, save.join("Torrent").join("data.bin"));
+        assert_eq!(layout.moves[0].expected_len, 42);
+        assert!(layout.task_owned_container);
+
+        let _ = std::fs::remove_dir_all(&save);
     }
 
     #[test]
@@ -4119,6 +4558,140 @@ mod tests {
         assert!(outcome.bad.is_empty(), "bad: {:?}", outcome.bad);
         assert_eq!(outcome.checked, 3);
         assert_eq!(outcome.skipped, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_verify_path_falls_back_to_existing_dst_on_retry() {
+        let dir = unique_test_dir("verify_retry_dst");
+        let stage = dir.join(".stage");
+        let save = dir.join("Torrent");
+        let _ = std::fs::create_dir_all(&stage);
+        let _ = std::fs::create_dir_all(&save);
+        let src = stage.join("a.bin");
+        let dst = save.join("a.bin");
+        let _ = std::fs::write(&src, b"staging residue");
+        let _ = std::fs::write(&dst, b"already moved");
+
+        let completion_move = super::CompletionMove {
+            src: src.clone(),
+            dst: dst.clone(),
+            expected_len: 13,
+        };
+        let resolved =
+            super::resolve_completion_verify_path(src.clone(), &[completion_move.clone()], true);
+        assert_eq!(resolved, src);
+
+        let _ = std::fs::remove_file(&src);
+        let resolved =
+            super::resolve_completion_verify_path(src.clone(), &[completion_move.clone()], true);
+        assert_eq!(resolved, dst);
+
+        let no_retry =
+            super::resolve_completion_verify_path(src.clone(), &[completion_move], false);
+        assert_eq!(no_retry, stage.join("a.bin"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_move_retry_overwrites_unverified_dst_from_staged_src() {
+        let dir = unique_test_dir("retry_stale_dst_from_src");
+        let stage = dir.join(".stage");
+        let save = dir.join("Torrent");
+        let _ = std::fs::create_dir_all(&stage);
+        let _ = std::fs::create_dir_all(&save);
+        let src = stage.join("a.bin");
+        let dst = save.join("a.bin");
+        let _ = std::fs::write(&src, b"fresh complete payload");
+        let _ = std::fs::write(&dst, b"stale");
+
+        let outcome = super::move_completion_item(
+            &src,
+            &dst,
+            b"fresh complete payload".len() as u64,
+            true,
+            true,
+            false,
+        );
+        match outcome {
+            Ok(super::CompletionMoveOutcome::Moved) => {}
+            other => panic!("unexpected completion move outcome: {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read(&dst).unwrap_or_default(),
+            b"fresh complete payload"
+        );
+        assert!(!src.exists(), "staged src should be moved out");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_move_retry_accepts_verified_dst_when_src_residue_remains() {
+        let dir = unique_test_dir("retry_src_dst_residue");
+        let stage = dir.join(".stage");
+        let save = dir.join("Torrent");
+        let _ = std::fs::create_dir_all(&stage);
+        let _ = std::fs::create_dir_all(&save);
+        let src = stage.join("a.bin");
+        let dst = save.join("a.bin");
+        let _ = std::fs::write(&src, b"payload");
+        let _ = std::fs::write(&dst, b"payload");
+
+        let outcome =
+            super::move_completion_item(&src, &dst, b"payload".len() as u64, true, true, true);
+        match outcome {
+            Ok(super::CompletionMoveOutcome::PriorSuccess) => {}
+            other => panic!("unexpected completion move outcome: {other:?}"),
+        }
+        assert_eq!(std::fs::read(&dst).unwrap_or_default(), b"payload");
+        assert!(
+            !src.exists(),
+            "verified prior success should clean staging residue when possible"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_move_retry_rejects_verified_dst_with_wrong_length() {
+        let dir = unique_test_dir("retry_dst_wrong_len");
+        let stage = dir.join(".stage");
+        let save = dir.join("Torrent");
+        let _ = std::fs::create_dir_all(&stage);
+        let _ = std::fs::create_dir_all(&save);
+        let src = stage.join("a.bin");
+        let dst = save.join("a.bin");
+        let _ = std::fs::write(&dst, b"payload plus trailing bytes");
+
+        let outcome =
+            super::move_completion_item(&src, &dst, b"payload".len() as u64, true, true, true);
+        match outcome {
+            Ok(super::CompletionMoveOutcome::MissingSource) => {}
+            other => panic!("oversized dst must not be accepted: {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completion_move_retry_accepts_verified_zero_length_dst() {
+        let dir = unique_test_dir("retry_dst_zero_len");
+        let stage = dir.join(".stage");
+        let save = dir.join("Torrent");
+        let _ = std::fs::create_dir_all(&stage);
+        let _ = std::fs::create_dir_all(&save);
+        let src = stage.join("empty.bin");
+        let dst = save.join("empty.bin");
+        let _ = std::fs::write(&dst, b"");
+
+        let outcome = super::move_completion_item(&src, &dst, 0, true, true, true);
+        match outcome {
+            Ok(super::CompletionMoveOutcome::PriorSuccess) => {}
+            other => panic!("zero-length dst with exact length should be accepted: {other:?}"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4564,34 +5137,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&save);
     }
 
+    #[test]
+    fn rescue_drops_fallback_residue_when_container_child_already_landed() {
+        let save = unique_test_dir("rescue_container_child_residue");
+        let task_id = "container-residue-01";
+        let product = save.join("Movie Pack");
+        let _ = std::fs::create_dir_all(&product);
+        let _ = std::fs::write(product.join("movie.mkv"), b"complete-movie");
+
+        let stage = super::bt_stage_dir(&save.to_string_lossy(), task_id);
+        let _ = std::fs::create_dir_all(&stage);
+        let _ = std::fs::write(stage.join("movie.mkv"), b"complete-movie");
+
+        let input = vec![(
+            task_id.to_string(),
+            save.to_string_lossy().into_owned(),
+            "Movie Pack".to_string(),
+        )];
+        let updates = super::rescue_stranded_staging_files(&input, &HashMap::new());
+
+        assert!(
+            updates.is_empty(),
+            "container child residue must not repoint DB file_name"
+        );
+        assert!(
+            !save.join("movie.mkv").exists(),
+            "container child residue must not be moved into save_dir root"
+        );
+        assert_eq!(
+            std::fs::read(product.join("movie.mkv")).unwrap_or_default(),
+            b"complete-movie"
+        );
+        assert!(!stage.exists(), "staging residue should be dropped");
+        let _ = std::fs::remove_dir_all(&save);
+    }
+
     /// 哨兵复用:reuse_top 指向 save_dir 内已存在的**目录**(上次部分移动
     /// 的自身产物)时,container 分支复用同名(merge 继续)而不 dedup 成
     /// `Torrent (1)`;被外部占用为**文件**时放弃哨兵退回 fresh dedup
     /// (防御 Windows rename(dir,file) 静默吞文件)。
     #[test]
     fn completion_layout_reuses_sentinel_top() {
-        use std::path::PathBuf;
         let save = unique_test_dir("sentinel");
         let stage = save.join(".stage");
         let _ = std::fs::create_dir_all(&stage);
-        let selected = vec![
-            PathBuf::from("Torrent/a.bin"),
-            PathBuf::from("Torrent/sub/b.bin"),
-        ];
+        let selected = completion_files(&["Torrent/a.bin", "Torrent/sub/b.bin"]);
+        let claims = HashSet::new();
 
         // Case 1: dst 是目录(自身上次产物)→ 复用。
         let _ = std::fs::create_dir_all(save.join("Torrent"));
-        let layout = super::compute_completion_layout(
-            &save,
-            &stage,
-            &selected,
-            true,
-            "",
-            Some("Torrent"),
-            &HashSet::new(),
-        );
-        let (_, top) = match layout {
-            Some(v) => v,
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: Some("Torrent"),
+            claimed: &claims,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
             None => panic!("layout should be Some"),
         };
         assert_eq!(top, "Torrent", "existing dir must be reused, not deduped");
@@ -4599,17 +5206,19 @@ mod tests {
         // Case 2: dst 被外部占用为文件 → 放弃哨兵,fresh dedup。
         let _ = std::fs::remove_dir_all(save.join("Torrent"));
         let _ = std::fs::write(save.join("Torrent"), b"unrelated user file");
-        let layout = super::compute_completion_layout(
-            &save,
-            &stage,
-            &selected,
-            true,
-            "",
-            Some("Torrent"),
-            &HashSet::new(),
-        );
-        let (_, top) = match layout {
-            Some(v) => v,
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: Some("Torrent"),
+            claimed: &claims,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
             None => panic!("layout should be Some"),
         };
         assert_ne!(
@@ -4618,17 +5227,19 @@ mod tests {
         );
 
         // Case 3: 无哨兵 → 既有 dedup 行为(名字避开已存在文件)。
-        let layout = super::compute_completion_layout(
-            &save,
-            &stage,
-            &selected,
-            true,
-            "",
-            None,
-            &HashSet::new(),
-        );
-        let (_, top) = match layout {
-            Some(v) => v,
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: true,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: None,
+            claimed: &claims,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
             None => panic!("layout should be Some"),
         };
         assert_eq!(top, "Torrent (1)");
@@ -4816,25 +5427,27 @@ mod tests {
 
     #[test]
     fn completion_layout_single_file_sentinel_rejects_occupied_dst() {
-        use std::path::PathBuf;
         let save = unique_test_dir("single_sentinel_occupied");
         let stage = save.join(".stage");
         let _ = std::fs::create_dir_all(&save);
         // 模拟另一同名任务已在 save_dir 落地同名产物。
         let _ = std::fs::write(save.join("movie.mkv"), b"someone else's file");
-        let selected = vec![PathBuf::from("movie.mkv")];
+        let selected = completion_files(&["movie.mkv"]);
+        let claims = HashSet::new();
 
-        let layout = super::compute_completion_layout(
-            &save,
-            &stage,
-            &selected,
-            false,
-            "",
-            Some("movie.mkv"),
-            &HashSet::new(),
-        );
-        let (_, top) = match layout {
-            Some(v) => v,
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: false,
+            is_multi_file_torrent: false,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: Some("movie.mkv"),
+            claimed: &claims,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
             None => panic!("layout should be Some"),
         };
         assert_ne!(
@@ -4847,23 +5460,25 @@ mod tests {
 
     #[test]
     fn completion_layout_single_file_sentinel_reused_when_absent() {
-        use std::path::PathBuf;
         let save = unique_test_dir("single_sentinel_absent");
         let stage = save.join(".stage");
         let _ = std::fs::create_dir_all(&save);
-        let selected = vec![PathBuf::from("movie.mkv")];
+        let selected = completion_files(&["movie.mkv"]);
+        let claims = HashSet::new();
 
-        let layout = super::compute_completion_layout(
-            &save,
-            &stage,
-            &selected,
-            false,
-            "",
-            Some("movie.mkv"),
-            &HashSet::new(),
-        );
-        let (_, top) = match layout {
-            Some(v) => v,
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: false,
+            is_multi_file_torrent: false,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: Some("movie.mkv"),
+            claimed: &claims,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
             None => panic!("layout should be Some"),
         };
         assert_eq!(
@@ -4875,18 +5490,26 @@ mod tests {
 
     #[test]
     fn completion_layout_single_file_claimed_set_avoids_name() {
-        use std::path::PathBuf;
         let save = unique_test_dir("single_claimed");
         let stage = save.join(".stage");
         let _ = std::fs::create_dir_all(&save);
-        let selected = vec![PathBuf::from("movie.mkv")];
+        let selected = completion_files(&["movie.mkv"]);
         let mut claimed = HashSet::new();
         claimed.insert("movie.mkv".to_string());
 
-        let layout =
-            super::compute_completion_layout(&save, &stage, &selected, false, "", None, &claimed);
-        let (_, top) = match layout {
-            Some(v) => v,
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: false,
+            is_multi_file_torrent: false,
+            custom_name: "",
+            torrent_root_name: "Torrent",
+            reuse_top: None,
+            claimed: &claimed,
+        });
+        let top = match layout {
+            Some(v) => v.top_level_name,
             None => panic!("layout should be Some"),
         };
         assert_eq!(
