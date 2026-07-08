@@ -173,7 +173,7 @@ export default defineConfig({
       }),
 
       // ── 可选：中国大陆 GitHub 下载加速镜像列表（逗号分隔，覆盖内置默认值）──
-      // 例: https://gh-proxy.com,https://ghproxy.net
+      // 例: https://gh.ddlc.top（默认，WJQSERVER-STUDIO/ghproxy 公共实例）
       // 注意：入选前核查 Google Safe Browsing 状态（ghfast.top 曾被拉黑，
       // Chrome 弹全屏警告）；"地址发布页"如 ghproxy.link 不是代理，不可填
       // 镜像不可用时下载路由自动按顺序降级，最终回退 R2 / GitHub 直连

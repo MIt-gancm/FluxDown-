@@ -51,20 +51,20 @@ const GITHUB_HEADERS: Record<string, string> = {
 
 /**
  * 中国大陆常用的 GitHub 下载加速镜像（前缀完整 GitHub URL 使用）。
- * 均为社区公益服务，可用性随时间变化，且可能被 Google Safe Browsing 拉黑
- * （如 ghfast.top，Chrome 会弹全屏"危险网站"警告）——入选前须人工核查
+ * 默认使用 WJQSERVER-STUDIO/ghproxy（基于 Go 的高性能代理项目，2026 年
+ * 仍活跃维护）提供的公共实例 gh.ddlc.top——遵守 `<镜像>/<完整GitHub直链>`
+ * 前缀契约，实测 Release 资产可正常代理（200 + content-length 一致）。
+ * 可用性随时间变化，且可能被 Google Safe Browsing 拉黑（Chrome 会弹全屏
+ * "危险网站"警告）——入选前须人工核查
  * https://transparencyreport.google.com/safe-browsing/search?url=<域名>。
  * 按顺序健康检查、自动降级，也可通过 DOWNLOAD_MIRRORS 环境变量
  * （逗号分隔）覆盖，无需改代码。
  *
- * 注意 ghproxy.link 之类"最新地址发布页"不是代理本体，前缀 URL 只会
- * 落到 HTML 公告页——健康检查校验 content-length 恰好防住这类假镜像。
+ * 注意 github.akams.cn / ghproxy.link 之类靠页面 JS 生成节点或"地址发布页"
+ * 的站点不是前缀代理本体，前缀 URL 会落到 404 / HTML 公告页——健康检查
+ * 校验 content-length 恰好防住这类不兼容镜像。
  */
-const DEFAULT_MIRRORS = [
-  "https://gh-proxy.com",
-  "https://ghproxy.net",
-  "https://gh-proxy.org",
-];
+const DEFAULT_MIRRORS = ["https://gh.ddlc.top"];
 
 function mirrorList(): string[] {
   const raw = DOWNLOAD_MIRRORS?.trim();
