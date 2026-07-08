@@ -70,6 +70,8 @@ struct SegmentDownloadContext<'a> {
     task_id: &'a str,
     /// 浏览器扩展捕获的额外 HTTP 请求头
     extra_headers: &'a std::collections::HashMap<String, String>,
+    /// 浏览器扩展捕获的页面 Referer（B站等 CDN 强制要求，缺失即 403）
+    referrer: &'a str,
 }
 
 pub async fn run_dash_download(params: DownloadParams) {
@@ -1367,6 +1369,7 @@ async fn download_track_inner(
         cancel_token: &p.cancel_token,
         task_id: &p.task_id,
         extra_headers: &p.extra_headers,
+        referrer: &p.referrer,
     };
 
     let segment_iter = init_seg.iter().chain(media_segs.iter());
@@ -1513,6 +1516,11 @@ async fn download_segment_streaming(
     }
     if !safe_cookies.is_empty() {
         req = req.header("Cookie", safe_cookies);
+    }
+    // B站等 CDN 对 .m4s 分段强制要求 Referer（缺失即 403）。放在
+    // apply_extra_headers 之前：扩展捕获的真实请求头若含 referer 会覆盖此默认值。
+    if !ctx.referrer.is_empty() {
+        req = req.header(reqwest::header::REFERER, ctx.referrer);
     }
     // 应用浏览器扩展捕获的额外请求头
     req = crate::downloader::apply_extra_headers(req, ctx.extra_headers);
