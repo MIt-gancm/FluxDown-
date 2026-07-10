@@ -95,8 +95,13 @@ export function scanForMediaUrls(root: unknown, baseUrl: string): string[] {
 
     if (typeof value === "string") {
       if (value.length > MAX_STRING_LEN) return;
-      // 廉价预筛：不含路径分隔 / 扩展点的字符串不可能是 URL
-      if (!value.includes("/") && !value.includes(".")) return;
+      // 廉价预筛 + 假阳性闸门：不含路径分隔符的字符串一律跳过。
+      // 裸文件名（如 JSON API 里的 "name":"App-1.0.apk"）虽能被 new URL
+      // 相对解析成 baseUrl 同目录下的地址，但该地址从未被页面引用过，纯属
+      // 捏造（官网 /api/release 的 assets[].name 曾被解析成不存在的
+      // /api/<file> 并 404）。合法的 JSON 内嵌媒体引用要么是绝对 URL、
+      // 要么带路径段（"/live/i.m3u8"、"hls/x.mpd"），必含 "/"。
+      if (!value.includes("/")) return;
       try {
         const abs = new URL(value, baseUrl).href;
         if (isHttpUrl(abs) && isMediaUrl(abs)) found.add(abs);

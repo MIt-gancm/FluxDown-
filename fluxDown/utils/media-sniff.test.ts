@@ -134,6 +134,21 @@ describe("scanForMediaUrls", () => {
     expect(result).toEqual(["https://h/live/i.m3u8"]);
   });
 
+  test("drops bare filenames (no path separator) instead of fabricating sibling URLs", () => {
+    // 官网 /api/release 的 assets[].name 是裸文件名；旧实现把它相对解析成
+    // https://fluxdown.zerx.dev/api/<file>（不存在，404）并污染资源面板。
+    const result = scanForMediaUrls(
+      { name: "FluxDown-0.1.57-android-universal.apk" },
+      "https://fluxdown.zerx.dev/api/release",
+    );
+    expect(result).toEqual([]);
+  });
+
+  test("keeps directory-relative references that contain a path segment", () => {
+    const result = scanForMediaUrls({ u: "hls/i.m3u8" }, "https://h/p/");
+    expect(result).toEqual(["https://h/p/hls/i.m3u8"]);
+  });
+
   test("collects non-manifest media URLs too (e.g. .mp4)", () => {
     const result = scanForMediaUrls({ v: "https://x/a.mp4" }, "https://p/");
     expect(result).toEqual(["https://x/a.mp4"]);
