@@ -10,6 +10,10 @@
 //! popup-facing runtime messages built on top of these):
 //!   - `{"action":"ping","msg_id":N}`     → `{"success":true,"message":"pong","msg_id":N}`
 //!   - `{"action":"download","msg_id":N, ...}` → `{"success":true,"message":"download accepted","msg_id":N}`
+//!   - `{"action":"batch_download","msg_id":N,"items":[DownloadRequest, ...]}`
+//!     → `{"success":true,"message":"batch accepted (N items)","msg_id":N}`
+//!     (多选批量：一条消息携带全部条目，保留 per-item cookies/headers/fileSize；
+//!     扩展端按 1MB 帧上限分块，旧版 App 回 "unknown action" 时扩展回退逐条发送)
 //!   - `{"action":"tasks","msg_id":N}` → `{"success":true,"msg_id":N,"tasks":[TaskBrief, ...]}`
 //!     (every non-completed task + the 10 most recently completed, newest first)
 //!   - `{"action":"task_op","msg_id":N,"op":"pause"|"resume"|"remove","taskId":"..."}`
@@ -96,6 +100,35 @@ impl PipeResponse {
 #[serde(rename_all = "camelCase")]
 struct TaskIdPayload {
     task_id: String,
+}
+
+/// `{"items":[DownloadRequest, ...]}` payload for `batch_download`.
+#[derive(Debug, Deserialize)]
+struct BatchDownloadPayload {
+    items: Vec<DownloadRequest>,
+}
+
+/// 单条 `batch_download` 消息允许的最大条目数。1MB 帧长本身把典型批量限制在
+/// 数百条量级；此上限防御恶意/异常构造的巨批（actor 事件循环逐条 await 建任务，
+/// 无界批会长时间独占循环，推迟暂停/进度等其它事件处理）。
+const MAX_BATCH_ITEMS: usize = 1000;
+
+/// Parse and validate a `batch_download` payload. Rejects an empty `items`
+/// list — an empty batch is always a caller bug and answering "accepted"
+/// would silently swallow it — and over-cap batches (see [`MAX_BATCH_ITEMS`]).
+fn parse_batch_download(payload: serde_json::Value) -> Result<Vec<DownloadRequest>, String> {
+    let batch: BatchDownloadPayload = serde_json::from_value(payload).map_err(|e| e.to_string())?;
+    if batch.items.is_empty() {
+        return Err("empty items".to_string());
+    }
+    if batch.items.len() > MAX_BATCH_ITEMS {
+        return Err(format!(
+            "too many items: {} > {}",
+            batch.items.len(),
+            MAX_BATCH_ITEMS
+        ));
+    }
+    Ok(batch.items)
 }
 
 /// `{"op":"pause"|"resume"|"remove","taskId":"..."}` payload for `task_op`.
@@ -285,15 +318,12 @@ async fn handle_reveal_file(
 /// only the framed I/O differs.
 async fn dispatch_action(
     msg: PipeMessage,
-    dl_tx: &mpsc::Sender<DownloadRequest>,
+    dl_tx: &mpsc::Sender<Vec<DownloadRequest>>,
     api_host: &Arc<dyn ApiHost>,
     log_tag: &str,
 ) -> PipeResponse {
     match msg.action.as_str() {
-        "ping" => {
-            log_info!("[{}] ping (msg_id={})", log_tag, msg.msg_id);
-            PipeResponse::ok(msg.msg_id, "pong")
-        }
+        "ping" => PipeResponse::ok(msg.msg_id, "pong"),
         "download" => match serde_json::from_value::<DownloadRequest>(msg.payload) {
             Ok(download_req) => {
                 log_info!(
@@ -302,7 +332,7 @@ async fn dispatch_action(
                     msg.msg_id,
                     download_req.url
                 );
-                let _ = dl_tx.send(download_req).await;
+                let _ = dl_tx.send(vec![download_req]).await;
                 PipeResponse::ok(msg.msg_id, "download accepted")
             }
             Err(e) => {
@@ -315,10 +345,29 @@ async fn dispatch_action(
                 PipeResponse::err(msg.msg_id, format!("invalid download payload: {}", e))
             }
         },
-        "tasks" => {
-            log_info!("[{}] tasks (msg_id={})", log_tag, msg.msg_id);
-            handle_tasks(msg.msg_id, api_host).await
-        }
+        "batch_download" => match parse_batch_download(msg.payload) {
+            Ok(items) => {
+                log_info!(
+                    "[{}] batch download request (msg_id={}): {} items",
+                    log_tag,
+                    msg.msg_id,
+                    items.len()
+                );
+                let count = items.len();
+                let _ = dl_tx.send(items).await;
+                PipeResponse::ok(msg.msg_id, format!("batch accepted ({} items)", count))
+            }
+            Err(e) => {
+                log_info!(
+                    "[{}] batch download parse error (msg_id={}): {}",
+                    log_tag,
+                    msg.msg_id,
+                    e
+                );
+                PipeResponse::err(msg.msg_id, format!("invalid batch_download payload: {}", e))
+            }
+        },
+        "tasks" => handle_tasks(msg.msg_id, api_host).await,
         "task_op" => {
             log_info!("[{}] task_op (msg_id={})", log_tag, msg.msg_id);
             handle_task_op(msg.msg_id, msg.payload, api_host).await
@@ -394,7 +443,7 @@ mod server {
     /// Handle a single pipe client connection.
     async fn handle_pipe_client(
         mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
-        tx: mpsc::Sender<DownloadRequest>,
+        tx: mpsc::Sender<Vec<DownloadRequest>>,
         api_host: Arc<dyn ApiHost>,
     ) {
         loop {
@@ -546,7 +595,7 @@ mod server {
     /// The receiving end of `tx` is owned by `download_actor` and shared with
     /// the local HTTP takeover server so both transports converge on one
     /// channel.
-    pub fn spawn_listener_with(tx: mpsc::Sender<DownloadRequest>, api_host: Arc<dyn ApiHost>) {
+    pub fn spawn_listener_with(tx: mpsc::Sender<Vec<DownloadRequest>>, api_host: Arc<dyn ApiHost>) {
         tokio::spawn(async move {
             log_info!("[nmh-pipe] starting Named Pipe server at {}", PIPE_NAME);
 
@@ -734,7 +783,7 @@ mod server {
 
     async fn handle_client(
         mut stream: tokio::net::UnixStream,
-        tx: mpsc::Sender<DownloadRequest>,
+        tx: mpsc::Sender<Vec<DownloadRequest>>,
         api_host: Arc<dyn ApiHost>,
     ) {
         loop {
@@ -770,7 +819,7 @@ mod server {
         }
     }
 
-    pub fn spawn_listener_with(tx: mpsc::Sender<DownloadRequest>, api_host: Arc<dyn ApiHost>) {
+    pub fn spawn_listener_with(tx: mpsc::Sender<Vec<DownloadRequest>>, api_host: Arc<dyn ApiHost>) {
         let sock_path = socket_path();
 
         tokio::spawn(async move {
@@ -823,23 +872,10 @@ mod server {
 /// actions (task panel queries/controls), sharing the same instance the
 /// local HTTP API server uses.
 pub fn spawn_native_messaging_listener_with(
-    tx: mpsc::Sender<DownloadRequest>,
+    tx: mpsc::Sender<Vec<DownloadRequest>>,
     api_host: Arc<dyn ApiHost>,
 ) {
     server::spawn_listener_with(tx, api_host);
-}
-
-/// Spawn the Native Messaging listener and return a fresh receiver.
-///
-/// Convenience wrapper for callers that don't need to share the channel.
-/// Ping requests are handled internally (immediate pong response).
-#[allow(dead_code)]
-pub fn spawn_native_messaging_listener(
-    api_host: Arc<dyn ApiHost>,
-) -> mpsc::Receiver<DownloadRequest> {
-    let (tx, rx) = mpsc::channel::<DownloadRequest>(64);
-    server::spawn_listener_with(tx, api_host);
-    rx
 }
 
 // wire 类型（DownloadRequest/RequestBody）的反序列化测试随类型迁移至
@@ -849,6 +885,34 @@ pub fn spawn_native_messaging_listener(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_batch_download_accepts_items_with_per_item_auth() {
+        let payload = serde_json::json!({
+            "items": [
+                {"url": "https://a.example/f1.zip", "cookies": "sid=1", "fileSize": 42},
+                {"url": "https://b.example/f2.zip", "filename": "renamed.zip"},
+            ]
+        });
+        let items = parse_batch_download(payload).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].url, "https://a.example/f1.zip");
+        assert_eq!(items[0].cookies, "sid=1");
+        assert_eq!(items[0].file_size, Some(42));
+        assert_eq!(items[1].filename, "renamed.zip");
+    }
+
+    #[test]
+    fn parse_batch_download_rejects_empty_items() {
+        let payload = serde_json::json!({ "items": [] });
+        assert!(parse_batch_download(payload).is_err());
+    }
+
+    #[test]
+    fn parse_batch_download_rejects_missing_items() {
+        let payload = serde_json::json!({ "msg_extra": true });
+        assert!(parse_batch_download(payload).is_err());
+    }
 
     fn dto(task_id: &str, status: i32, created_at: &str) -> TaskDto {
         TaskDto {
@@ -888,7 +952,9 @@ mod tests {
         let ids: Vec<&str> = briefs.iter().map(|t| t.task_id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["t14", "t13", "t12", "t11", "t10", "t9", "t8", "t7", "t6", "t5"]
+            vec![
+                "t14", "t13", "t12", "t11", "t10", "t9", "t8", "t7", "t6", "t5"
+            ]
         );
     }
 

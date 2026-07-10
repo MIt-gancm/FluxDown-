@@ -821,6 +821,10 @@ class S {
     '用于需要登录认证的下载（留空则不发送）',
     'Used for downloads requiring login (empty = none)',
   );
+  String get taskCookieBatchDesc => _t(
+    '批量下载：留空 = 各条目使用自己捕获的 Cookie；填写 = 覆盖整批',
+    'Batch: empty = each item keeps its own captured cookies; filled = overrides all',
+  );
   String get taskCookiePlaceholder =>
       _t('例如 name=value; name2=value2', 'e.g. name=value; name2=value2');
 

@@ -759,7 +759,10 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
             QuickSectionLabel(text: s.taskCookie, c: c),
             const SizedBox(height: 4),
             Text(
-              s.taskCookieDesc,
+              // 批量模式下空 Cookie 框语义不同(留空 = 保留各条目自己捕获的
+              // Cookie,由 Rust 侧按 URL 缓存恢复;填写 = 批级覆盖),动态提示
+              // 消除歧义。单条模式:留空 = 不发送(用户清空预填即生效)。
+              _urlCount > 1 ? s.taskCookieBatchDesc : s.taskCookieDesc,
               style: TextStyle(fontSize: 11, color: c.textMuted),
             ),
             const SizedBox(height: 6),

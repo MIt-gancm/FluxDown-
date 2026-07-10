@@ -2817,9 +2817,13 @@ export default defineBackground(() => {
       }
 
       // --- Content Script UI: 批量下载多个资源 ---
-      // 将所有选中资源的 URL 合并为一个请求发送给桌面应用，
-      // 由 Flutter 端的快速下载对话框按换行符拆分后批量创建任务。
-      // 不应循环发送多次请求，而是一次性添加全部。
+      // 本地通道（NMH）：单条 batch_download 消息携带全部条目一次性发给桌面
+      // 应用（见 nmhSendBatchDownloadRequest）；超大批量按 ~700KB 分块顺序
+      // 发送，避免撞上 NMH/hub 双向强制的单帧 1MB 上限。per-item 的
+      // cookies/headers/fileSize 等认证元数据随消息一并送达，由 Rust 侧按
+      // URL 缓存，在用户于快速下载对话框确认后逐条恢复；旧版不识别
+      // batch_download action 的桌面应用会自动回退为逐条 download 循环。
+      // 远程通道（fluxdown_server）：单次 POST /download/batch 发送全部条目。
       case "batchDownload": {
         const items = message.items as Array<{
           url: string;

@@ -466,6 +466,7 @@ CLI 独立二进制可能解析到不同目录、不共享），下载任务对 
 消息协议（4字节 LE 长度前缀 + JSON）：
 - `{"action":"ping","msg_id":N}` → `{"success":true,"message":"pong","msg_id":N}`
 - `{"action":"download","msg_id":N,...}` → `{"success":true,"message":"download accepted","msg_id":N}`
+- `{"action":"batch_download","msg_id":N,"items":[...]}` → `{"success":true,"message":"batch accepted (N items)","msg_id":N}`（多选批量：一条消息携带全部条目，item 字段与 download 一致；per-item 的 cookies/headers/method/body/referrer/fileSize 由 App 侧按 URL 缓存、确认后逐条恢复——批量创建时 cookies 取「信号值优先、空回退缓存」，referrer 反向取「缓存优先」（批量表单无 referrer 输入框，缓存的 per-item 值更准）。扩展按 700KB 字节 + 1000 条双上限分块防 1MB 帧上限与 App 端 MAX_BATCH_ITEMS=1000 硬上限（超限回 `"invalid batch_download payload: too many items: N > 1000"`）；旧版 App 回 "unknown action" 时扩展自动回退逐条 download；已有分块送达后的失败按部分成功语义结束，绝不触发全量重发/远程改投（防跨通道重复建任务））
 - `{"action":"warmup","msg_id":N}` → `{"success":true,"message":"warmed","msg_id":N}`（NMH 本地应答不转发：确保 App 已拉起+管道已连接；扩展在下载流程入口 fire-and-forget 发送，让 App 冷启动与 cookie 收集并行）
 
 NMH 连接策略：ping 只探测不拉起 App;其余 action 未连接时 auto-launch App 并以固定 50ms 间隔轮询管道(上限 10s);写失败(App 重启后陈旧管道)进程内重连+重发一次(写失败=内核未收帧,重发安全;读失败不重发,防重复任务)。

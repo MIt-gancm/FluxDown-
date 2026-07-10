@@ -89,6 +89,11 @@ export interface ApiResponse {
   tasks?: TaskBrief[];
 }
 
+/**
+ * 批量下载条目——nmhSendBatchDownloadRequest 的入参形状，字段名与单条
+ * DownloadRequest 完全一致，经 toBatchWireItem 精简后随 batch_download
+ * action 一次性发出（含 method/body：与单条协议同构，App 侧按 URL 缓存恢复）。
+ */
 export interface BatchDownloadItem {
   url: string;
   filename?: string;
@@ -261,21 +266,31 @@ async function sendWithRetry(
 
   disconnectPort();
 
-  // "port disconnected" 特殊处理：NMH 进程可能在将消息转发给 App 后才断开，
-  // 此时消息已送达但响应丢失。重连后先 ping：如果 App 在线，说明消息
-  // 大概率已送达，直接返回成功，避免重复发送导致 App 创建重复任务。
-  if (result.message === "port disconnected" && action !== "ping") {
+  // 「消息可能已送达但响应丢失」的失败类先 ping 探活，App 在线即判定已送达、
+  // 不重发——盲重发会让 App 重复建任务（批量场景下放大为整块重复）：
+  //   • "port disconnected"：NMH 可能在转发给 App 后才断开；
+  //   • "timeout"：postMessage 已成功（消息已进内核缓冲），NMH 大概率已转发，
+  //     只是 App 处理慢（批量建任务/冷启动）或响应丢失；
+  //   • "app_not_running"：NMH 对「管道读失败」（写已成功 = 消息已送达 App）
+  //     与「压根没连上」回的是同一文案，无法区分——按已送达保守处理，与
+  //     NMH 层「读失败不重发,防重复任务」的架构不变式一致。
+  // "postMessage failed" 不在此列：消息未进内核，重发安全。
+  const maybeDelivered =
+    result.message === "port disconnected" ||
+    result.message === "timeout" ||
+    result.message === "app_not_running";
+  if (maybeDelivered && action !== "ping") {
     const pingResult = await sendMessage("ping", {}, timeoutMs);
     if (pingResult.success) {
       console.log(
-        "[FluxDown NMH] App alive after port disconnect — message likely delivered, skipping retry",
+        `[FluxDown NMH] App alive after "${result.message}" — message likely delivered, skipping retry`,
       );
       return {
         success: true,
-        message: "delivered (reconnected after disconnect)",
+        message: "delivered (reconnected after transient failure)",
       };
     }
-    // ping 也失败，断开后重试发送原消息
+    // ping 也失败（App 确实不在）→ 消息未被处理，重发安全
     disconnectPort();
   }
 
@@ -292,17 +307,79 @@ export async function nmhSendDownloadRequest(
   return sendWithRetry("download", request as Record<string, any>);
 }
 
-export async function nmhSendBatchDownloadRequest(
+// NMH/hub 两端对单帧强制 1MB 上限；留给 action/msg_id 等帧头开销及安全冗余，
+// 单块 items 序列化后不超过该字节数（典型批量数十条会落在一块内）。
+const BATCH_CHUNK_BYTES_LIMIT = 700 * 1024;
+
+// 与 hub 端 parse_batch_download 的 MAX_BATCH_ITEMS=1000 硬上限对齐：700KB
+// 理论上能塞下数千条短 URL 条目，若单块条目数越过 App 端上限，会收到
+// "too many items" 错误——它既不含 "unknown action"（不触发 legacy 回退）
+// 也不在 NMH 不可达文案集合里（不触发远程 fallback），整批直接失败。
+// 故分块必须同时满足字节与条目数两个上限。
+const BATCH_CHUNK_ITEMS_LIMIT = 1000;
+
+/**
+ * 把 BatchDownloadItem 映射为 batch_download wire 条目：字段名与单条 download
+ * action 完全一致，undefined/空值字段省略以压缩帧体积。
+ */
+function toBatchWireItem(item: BatchDownloadItem): Record<string, any> {
+  const wire: Record<string, any> = { url: item.url };
+  if (item.filename) wire.filename = item.filename;
+  if (item.referrer) wire.referrer = item.referrer;
+  if (item.cookies) wire.cookies = item.cookies;
+  if (item.headers && Object.keys(item.headers).length > 0) {
+    wire.headers = item.headers;
+  }
+  if (item.fileSize != null) wire.fileSize = item.fileSize;
+  if (item.mimeType) wire.mimeType = item.mimeType;
+  if (item.method) wire.method = item.method;
+  if (item.body) wire.body = item.body;
+  return wire;
+}
+
+/** 按 UTF-8 字节数（而非字符数）估算 JSON 序列化体积——文件名等字段常含中文。 */
+function jsonByteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length;
+}
+
+/**
+ * 贪心切块：单块同时满足 ≤ BATCH_CHUNK_BYTES_LIMIT 字节与
+ * ≤ BATCH_CHUNK_ITEMS_LIMIT 条（与 App 端 MAX_BATCH_ITEMS 对齐）。单个条目
+ * 本身超过字节阈值时（理论上极罕见）仍独占一块发送，交由 App/hub 端把关。
+ */
+function chunkBatchWireItems(
+  wireItems: Record<string, any>[],
+): Record<string, any>[][] {
+  const chunks: Record<string, any>[][] = [];
+  let current: Record<string, any>[] = [];
+  let currentBytes = 0;
+
+  for (const wireItem of wireItems) {
+    const itemBytes = jsonByteLength(wireItem);
+    if (
+      current.length > 0 &&
+      (currentBytes + itemBytes > BATCH_CHUNK_BYTES_LIMIT ||
+        current.length >= BATCH_CHUNK_ITEMS_LIMIT)
+    ) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    current.push(wireItem);
+    currentBytes += itemBytes;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+/**
+ * Legacy 回退路径：旧版桌面 App 不识别 batch_download action 时，退化为逐条
+ * 发送单个 download 请求（新协议引入前的原始实现，聚合语义原样保留）。
+ * 仅由 nmhSendBatchDownloadRequest 在探测到 "unknown action" 响应时整批调用。
+ */
+async function nmhSendBatchDownloadLegacy(
   items: BatchDownloadItem[],
 ): Promise<ApiResponse> {
-  if (items.length === 0) {
-    return { success: false, message: "No items" };
-  }
-
-  // Send each item as an individual download request to preserve per-item
-  // cookies, headers, referrer, fileSize, and mimeType.  The Rust NMH
-  // protocol only supports single-item DownloadRequest — batching by
-  // newline-joining URLs discards all per-item auth metadata.
   const results = await Promise.allSettled(
     items.map((item) =>
       nmhSendDownloadRequest({
@@ -313,6 +390,8 @@ export async function nmhSendBatchDownloadRequest(
         headers: item.headers,
         fileSize: item.fileSize,
         mimeType: item.mimeType,
+        method: item.method,
+        body: item.body,
       }),
     ),
   );
@@ -344,6 +423,56 @@ export async function nmhSendBatchDownloadRequest(
         ? `${succeeded}/${results.length} items sent (${failed} failed)`
         : `${succeeded} items sent`,
   };
+}
+
+/**
+ * 批量下载：单条 batch_download NMH 消息携带全部条目，取代逐条循环发送。
+ * per-item 的 cookies/headers/referrer/fileSize/mimeType 随消息一并送达，
+ * 由 Rust 侧按 URL 缓存、在用户于快速下载对话框确认后逐条恢复——不再需要
+ * 为每个 URL 单独打一次 NMH 往返（旧实现的性能/时序问题的根因）。
+ *
+ * 分块：NMH 与 hub 两端都对单帧强制 1MB 上限，因此按条目 JSON 字节数贪心
+ * 切块（见 chunkBatchWireItems），单块 ≤ 700KB；典型批量（数十条）落在
+ * 一块内。多块时按顺序 sendWithRetry：首块唤起 App 小窗，后续块携带同一
+ * 批次的剩余条目，由 App 侧 append 到已打开的窗口，不重复弹窗。
+ *
+ * Legacy 回退：若某块的失败响应 message 含 "unknown action"，说明连接的是
+ * 不认识 batch_download action 的旧版 App——整批切换到
+ * nmhSendBatchDownloadLegacy 的逐条 download 循环（保留旧实现原样，包括
+ * 其 "x/y items sent (z failed)" 部分成功聚合语义）。其余失败（端口不可达、
+ * 超时等）按现有语义直接返回该块的失败 ApiResponse，不做逐条回退——是否
+ * 改投远程通道由上层 download-dispatch 决定。
+ */
+export async function nmhSendBatchDownloadRequest(
+  items: BatchDownloadItem[],
+): Promise<ApiResponse> {
+  if (items.length === 0) {
+    return { success: false, message: "No items" };
+  }
+
+  const chunks = chunkBatchWireItems(items.map(toBatchWireItem));
+
+  let sentChunks = 0;
+  for (const chunk of chunks) {
+    const result = await sendWithRetry("batch_download", { items: chunk });
+    if (!result.success) {
+      // 部分成功守卫优先于一切回退：已有分块送达后,无论何种失败都不能
+      // 触发「全量重发」类兜底(legacy 逐条 / 远程改投都会重复已建任务)。
+      if (sentChunks > 0) {
+        return {
+          success: false,
+          message: `partial batch: ${sentChunks}/${chunks.length} chunks sent, then: ${result.message}`,
+        };
+      }
+      if (result.message?.includes("unknown action")) {
+        return nmhSendBatchDownloadLegacy(items);
+      }
+      return result;
+    }
+    sentChunks += 1;
+  }
+
+  return { success: true, message: `${items.length} items sent` };
 }
 
 // ──────────────────────────────────────────────────────────────

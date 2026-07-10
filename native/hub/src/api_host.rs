@@ -89,7 +89,7 @@ pub enum ApiCommand {
 pub struct HubApiHost {
     db: Db,
     cmd_tx: mpsc::Sender<ApiCommand>,
-    ext_tx: mpsc::Sender<DownloadRequest>,
+    ext_tx: mpsc::Sender<Vec<DownloadRequest>>,
     /// 实时速率表,与注入 `RinfEventSink` 的是同一个 `Arc`。
     live_speeds: LiveSpeedMap,
     /// 任务生命周期事件广播源,与注入 `RinfEventSink` 的是同一个 `Sender`;
@@ -105,7 +105,7 @@ impl HubApiHost {
     pub fn new(
         db: Db,
         cmd_tx: mpsc::Sender<ApiCommand>,
-        ext_tx: mpsc::Sender<DownloadRequest>,
+        ext_tx: mpsc::Sender<Vec<DownloadRequest>>,
         live_speeds: LiveSpeedMap,
         task_events_tx: broadcast::Sender<TaskEvent>,
     ) -> Self {
@@ -214,7 +214,7 @@ impl ApiHost for HubApiHost {
 
     async fn submit_external(&self, req: DownloadRequest) -> Result<(), ApiError> {
         self.ext_tx
-            .send(req)
+            .send(vec![req])
             .await
             .map_err(|_| ApiError::Unavailable)
     }

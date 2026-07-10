@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -366,7 +366,9 @@ pub async fn run(db_dir: PathBuf) {
     };
 
     engine.manager.set_default_segments(default_segments);
-    engine.manager.set_auto_max_connections(auto_max_connections);
+    engine
+        .manager
+        .set_auto_max_connections(auto_max_connections);
 
     // Apply persisted log size cap (MB) to the global logger.
     if let Ok(Some(v)) = engine.db.get_config("log_max_size_mb").await
@@ -557,9 +559,12 @@ pub async fn run(db_dir: PathBuf) {
     // Shared channel for external download requests. Both the Native Messaging
     // listener (browser extension via the NMH relay) and the local API server's
     // takeover / aria2-compat endpoints (Tampermonkey userscripts) push
-    // `DownloadRequest`s into this channel; the `native_msg_rx` select! branch
+    // `Vec<DownloadRequest>`s into this channel (NMH `batch_download` carries a
+    // whole multi-select batch in one message; every single-item transport wraps
+    // its request in a one-element Vec); the `native_msg_rx` select! branch
     // below handles both transports with identical logic.
-    let (ext_dl_tx, mut native_msg_rx) = mpsc::channel::<fluxdown_api::types::DownloadRequest>(64);
+    let (ext_dl_tx, mut native_msg_rx) =
+        mpsc::channel::<Vec<fluxdown_api::types::DownloadRequest>>(64);
 
     // 本机 API 服务器（127.0.0.1）：探活 / 脚本接管 / aria2 兼容 / 管理 API。
     // 写操作经 api_cmd_rx 回到本事件循环串行执行；local_server_* 配置变更时
@@ -615,15 +620,25 @@ pub async fn run(db_dir: PathBuf) {
         }
     });
 
-    // 缓存浏览器扩展捕获的请求事务上下文（headers + method + body），
-    // 以 URL 为 key，在用户确认下载时一并消耗——下游用此一比一重建浏览器请求。
+    // 缓存浏览器扩展捕获的请求事务上下文（headers/method/body + per-item
+    // cookies/referrer/fileSize），以 URL 为 key，在用户确认下载时一并消耗——
+    // 下游用此一比一重建浏览器请求。批量请求的 per-item 认证元数据只存在
+    // 这里（确认信号是批级共享字段），按 URL 恢复精度。
     #[derive(Default, Clone)]
     struct ExtRequestCtx {
         headers: HashMap<String, String>,
         method: Option<String>,
         body: Option<fluxdown_api::types::RequestBody>,
+        cookies: String,
+        referrer: String,
+        /// 文件大小提示：>0 已知大小、-1 已确认可下载但大小未知（跳过 probe）、
+        /// 0 未知（正常 probe）。语义与 `DownloadRequest::file_size` 一致。
+        file_size: i64,
     }
     let mut ext_request_cache: HashMap<String, ExtRequestCtx> = HashMap::new();
+    // 缓存插入序（FIFO 淘汰用）：确认消费不回收队列条目（懒清理），
+    // 淘汰/压实逻辑见 native_msg_rx 分支。
+    let mut ext_cache_order: VecDeque<String> = VecDeque::new();
 
     loop {
         tokio::select! {
@@ -643,8 +658,23 @@ pub async fn run(db_dir: PathBuf) {
                     msg.entries.len(), msg.save_dir, msg.segments,
                 );
                 for entry in msg.entries {
+                    // 按 URL 消耗缓存的请求事务上下文，恢复 per-item 精度。
+                    // 与单条确认分支的优先级方向【有意不同】：
+                    //   • cookies：信号值优先（批量表单有共享 cookies 输入框，
+                    //     用户手填 = 批级覆盖）、空则回退缓存的 per-item 值——
+                    //     批量信号的 cookies 为空通常意味着"各条目 cookies 不一致
+                    //     故未预填"，不是用户清空（对比单条路径：预填后清空 =
+                    //     明确意图，故单条不回退）。
+                    //   • referrer：缓存优先——批量表单【没有】referrer 输入框，
+                    //     msg.referrer 只是首条请求的共享值，per-item 缓存更准。
+                    //   • fileSize/method/body：仅存在于缓存。
+                    let ctx = ext_request_cache.remove(&entry.url).unwrap_or_default();
+                    let extra_headers = merge_ext_headers(ctx.headers, &msg.extra_headers);
+                    let cookies = if msg.cookies.is_empty() { ctx.cookies } else { msg.cookies.clone() };
+                    let referrer = if ctx.referrer.is_empty() { msg.referrer.clone() } else { ctx.referrer };
+                    let body = ctx.body.map(nm_body_to_captured);
                     engine.manager
-                        .create_task(entry.url, msg.save_dir.clone(), entry.file_name, msg.segments, msg.cookies.clone(), msg.referrer.clone(), 0, Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone(), entry.checksum, msg.extra_headers.clone(), Vec::new(), None, None, if entry.audio_url.is_empty() { None } else { Some(entry.audio_url) })
+                        .create_task(entry.url, msg.save_dir.clone(), entry.file_name, msg.segments, cookies, referrer, ctx.file_size, Vec::new(), msg.proxy_url.clone(), msg.user_agent.clone(), msg.queue_id.clone(), entry.checksum, extra_headers, Vec::new(), ctx.method, body, if entry.audio_url.is_empty() { None } else { Some(entry.audio_url) })
                         .await;
                 }
                 // 批量创建完成后统一推送一次 AllTasks，同步 queue_id 到 Dart。
@@ -748,69 +778,102 @@ pub async fn run(db_dir: PathBuf) {
                 .await;
             }
             // --- Native Messaging: browser extension download requests ---
-            Some(req) = native_msg_rx.recv() => {
+            // 单条请求包成 1 元素 Vec；NMH `batch_download` 一条消息携带整批。
+            Some(mut reqs) = native_msg_rx.recv() => {
                 log_info!(
-                    "[actor] external download request from browser: url={}, cookies_len={}, headers={:?}",
-                    req.url,
-                    req.cookies.len(),
-                    req.headers.as_ref().map(|h| h.keys().collect::<Vec<_>>()),
+                    "[actor] external download request from browser: {} item(s), first_url={}",
+                    reqs.len(),
+                    reqs.first().map(|r| r.url.as_str()).unwrap_or(""),
                 );
-                // 缓存请求事务上下文（headers/method/body）——任一字段非空即缓存。
-                let has_headers =
-                    req.headers.as_ref().is_some_and(|h| !h.is_empty());
-                if has_headers || req.method.is_some() || req.body.is_some() {
-                    // 长会话防累积：超阈值整表清空（与原行为一致）。
-                    const MAX_REQ_CTX_CACHE: usize = 200;
-                    if ext_request_cache.len() >= MAX_REQ_CTX_CACHE {
-                        ext_request_cache.clear();
+                // 缓存每条的请求事务上下文（headers/method/body/cookies/referrer/
+                // fileSize）——任一字段有意义即缓存。长会话防累积：FIFO 淘汰
+                // 最旧插入（缓存插入条件放宽后几乎每条请求都会入表，旧的
+                // 「超阈值整表清空」会把并存的未确认弹窗全部降级；按插入序
+                // 淘汰只影响最旧的少数条目）。
+                const MAX_REQ_CTX_CACHE: usize = 200;
+                for req in &reqs {
+                    let has_headers =
+                        req.headers.as_ref().is_some_and(|h| !h.is_empty());
+                    let file_size = req.file_size.unwrap_or(0);
+                    if has_headers || req.method.is_some() || req.body.is_some()
+                        || !req.cookies.is_empty() || !req.referrer.is_empty()
+                        || file_size != 0
+                    {
+                        ext_request_cache.insert(
+                            req.url.clone(),
+                            ExtRequestCtx {
+                                headers: req.headers.clone().unwrap_or_default(),
+                                method: req.method.clone(),
+                                body: req.body.clone(),
+                                cookies: req.cookies.clone(),
+                                referrer: req.referrer.clone(),
+                                file_size,
+                            },
+                        );
+                        ext_cache_order.push_back(req.url.clone());
+                        // 懒淘汰：队头 key 可能已被确认消费（remove），跳过即可。
+                        while ext_request_cache.len() > MAX_REQ_CTX_CACHE {
+                            match ext_cache_order.pop_front() {
+                                Some(old) => {
+                                    ext_request_cache.remove(&old);
+                                }
+                                None => break,
+                            }
+                        }
                     }
-                    ext_request_cache.insert(
-                        req.url.clone(),
-                        ExtRequestCtx {
-                            headers: req.headers.clone().unwrap_or_default(),
-                            method: req.method.clone(),
-                            body: req.body.clone(),
-                        },
-                    );
+                }
+                // 队列防膨胀：确认消费不回收队列条目，陈旧 key 堆积过多时压实。
+                if ext_cache_order.len() > MAX_REQ_CTX_CACHE * 4 {
+                    ext_cache_order.retain(|k| ext_request_cache.contains_key(k));
                 }
                 // Forward to Dart UI so it can pop the quick-download dialog.
-                ExternalDownloadRequest {
-                    url: req.url,
-                    filename: req.filename,
-                    save_dir: req.save_dir,
-                    referrer: req.referrer,
-                    file_size: req.file_size.unwrap_or(0),
-                    mime_type: req.mime_type.unwrap_or_default(),
-                    cookies: req.cookies,
-                    audio_url: req.audio_url.unwrap_or_default(),
+                if reqs.len() == 1 {
+                    if let Some(req) = reqs.pop() {
+                        ExternalDownloadRequest {
+                            url: req.url,
+                            filename: req.filename,
+                            save_dir: req.save_dir,
+                            referrer: req.referrer,
+                            file_size: req.file_size.unwrap_or(0),
+                            mime_type: req.mime_type.unwrap_or_default(),
+                            cookies: req.cookies,
+                            audio_url: req.audio_url.unwrap_or_default(),
+                        }
+                        .send_signal_to_dart();
+                    }
+                } else if !reqs.is_empty() {
+                    synthesize_batch_request(&reqs).send_signal_to_dart();
                 }
-                .send_signal_to_dart();
             }
             // --- Dart confirmed an external download request ---
             Some(signal) = confirm_ext_recv.recv() => {
                 let msg = signal.message;
-                // 取出缓存的请求事务上下文（headers + method + body）。
-                // 命中即用、未命中按默认值（GET、无 body）继续——后者保留向后兼容
-                // 旧版扩展（不发 method/body）的下载路径。
+                // 取出缓存的请求事务上下文（headers/method/body + per-item
+                // cookies/referrer/fileSize）。命中即用、未命中按默认值（GET、
+                // 无 body）继续——后者保留向后兼容旧版扩展的下载路径。
                 let ctx = ext_request_cache.remove(&msg.url).unwrap_or_default();
                 // 浏览器捕获的请求头打底，用户手填的同名（忽略大小写）覆盖。
-                let mut extra_headers = ctx.headers;
-                for (k, v) in msg.extra_headers.clone() {
-                    extra_headers.retain(|ek, _| !ek.eq_ignore_ascii_case(&k));
-                    extra_headers.insert(k, v);
-                }
+                let extra_headers = merge_ext_headers(ctx.headers, &msg.extra_headers);
+                // cookies/referrer 用信号值【直用、不回退缓存】：单条确认路径的
+                // 信号本就携带 per-item 值（Dart round-trip 预填表单），字段为空
+                // = 用户在表单里主动清空，必须尊重该意图（与改动前语义一致）。
+                // hint_file_size 例外：表单不可编辑该值，0 只可能是"信号未携带"
+                // （批量弹窗缩减为单条确认的路径），回退缓存恢复 per-item 精度。
+                let cookies = msg.cookies;
+                let referrer = msg.referrer;
+                let hint_file_size = if msg.hint_file_size == 0 { ctx.file_size } else { msg.hint_file_size };
                 let method = ctx.method;
                 let body = ctx.body.map(nm_body_to_captured);
                 log_info!(
                     "[actor] user confirmed external download: url={}, cookies_len={}, extra_headers={}, method={:?}, has_body={}",
                     msg.url,
-                    msg.cookies.len(),
+                    cookies.len(),
                     extra_headers.len(),
                     method,
                     body.is_some(),
                 );
                 engine.manager
-                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, msg.cookies, msg.referrer, msg.hint_file_size, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id, String::new(), extra_headers, Vec::new(), method, body, if msg.audio_url.is_empty() { None } else { Some(msg.audio_url) })
+                    .create_task(msg.url, msg.save_dir, msg.file_name, msg.segments, cookies, referrer, hint_file_size, Vec::new(), msg.proxy_url, msg.user_agent, msg.queue_id, String::new(), extra_headers, Vec::new(), method, body, if msg.audio_url.is_empty() { None } else { Some(msg.audio_url) })
                     .await;
                 // 推送 AllTasks 确保 Dart 端获得正确 queue_id。
                 engine.manager.load_and_send_all_tasks().await;
@@ -1447,6 +1510,83 @@ async fn task_ids_by_status(db: &Db, statuses: &[i32]) -> Vec<String> {
     }
 }
 
+/// 合并请求头：浏览器捕获的头（`base`）打底，用户手填的同名头（忽略
+/// 大小写）覆盖。外部下载确认与批量创建两条路径共用同一合并语义。
+fn merge_ext_headers(
+    base: HashMap<String, String>,
+    overrides: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut merged = base;
+    for (k, v) in overrides {
+        merged.retain(|ek, _| !ek.eq_ignore_ascii_case(k));
+        merged.insert(k.clone(), v.clone());
+    }
+    merged
+}
+
+/// 把一批（≥2 条）外部下载请求合成为一条多行文本的快速下载信号。
+///
+/// 文本为 aria2 风格：每条一行 URL，自定义文件名以缩进 `out=` 选项行跟随
+/// （快速下载表单的 `parseQuickDownloadEntries` 原生支持该格式）。per-item
+/// cookies/headers/fileSize 不进信号——调用方已按 URL 存入请求上下文缓存，
+/// 用户确认后恢复；信号级 cookies 仅在全批一致时携带（作为表单预填值），
+/// 不一致则留空、避免以偏概全。referrer/save_dir 取首个非空值。
+fn synthesize_batch_request(
+    reqs: &[fluxdown_api::types::DownloadRequest],
+) -> ExternalDownloadRequest {
+    // 控制字符防注入：filename 来自服务器 Content-Disposition（percent-decode
+    // 后 %0A/%0D 会还原成字面 \n/\r），url/filename 若不剥离控制字符，恶意
+    // 服务器可向合成的多行文本注入伪造下载条目（换行 = 新条目分隔符，
+    // Dart 端 parseQuickDownloadEntries 按行解析）。控制字符替换为空格。
+    fn strip_ctl(s: &str) -> std::borrow::Cow<'_, str> {
+        if s.chars().any(char::is_control) {
+            std::borrow::Cow::Owned(
+                s.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
+    }
+    let mut text = String::new();
+    for req in reqs {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&strip_ctl(&req.url));
+        if !req.filename.is_empty() {
+            text.push_str("\n  out=");
+            text.push_str(&strip_ctl(&req.filename));
+        }
+    }
+    let cookies = if reqs.windows(2).all(|w| w[0].cookies == w[1].cookies) {
+        reqs.first().map(|r| r.cookies.clone()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let referrer = reqs
+        .iter()
+        .find(|r| !r.referrer.is_empty())
+        .map(|r| r.referrer.clone())
+        .unwrap_or_default();
+    let save_dir = reqs
+        .iter()
+        .find(|r| !r.save_dir.is_empty())
+        .map(|r| r.save_dir.clone())
+        .unwrap_or_default();
+    ExternalDownloadRequest {
+        url: text,
+        filename: String::new(),
+        save_dir,
+        referrer,
+        file_size: 0,
+        mime_type: String::new(),
+        cookies,
+        audio_url: String::new(),
+    }
+}
+
 /// 把浏览器扩展/Native Messaging 的 wire-format `RequestBody` 转换为引擎侧
 /// 传输无关的 `CapturedRequestBody`——两者字段形状一致，仅类型来源不同
 /// (fluxdown_api 是对外 wire 契约，engine 侧不感知传输层)。
@@ -1465,5 +1605,70 @@ fn nm_body_to_captured(
             bytes_b64,
             content_type,
         },
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn req(url: &str) -> fluxdown_api::types::DownloadRequest {
+        serde_json::from_value(serde_json::json!({ "url": url })).unwrap()
+    }
+
+    #[test]
+    fn synthesize_batch_joins_urls_with_out_lines() {
+        let mut a = req("https://a.example/f1.zip");
+        a.filename = "renamed.zip".to_string();
+        let b = req("https://b.example/f2.zip");
+        let signal = synthesize_batch_request(&[a, b]);
+        assert_eq!(
+            signal.url,
+            "https://a.example/f1.zip\n  out=renamed.zip\nhttps://b.example/f2.zip"
+        );
+        assert!(signal.filename.is_empty());
+        assert_eq!(signal.file_size, 0);
+    }
+
+    #[test]
+    fn synthesize_batch_strips_control_chars_blocking_entry_injection() {
+        // 恶意服务器经 Content-Disposition filename*=UTF-8''...%0A... 携带换行，
+        // 企图向合成多行文本注入一条伪造下载条目。控制字符必须被扁平化，
+        // 使 payload 保持在同一 out= 行内、不产生新条目行。
+        let mut a = req("https://a.example/f1.zip");
+        a.filename = "合法.pdf\nhttps://evil.example/payload.exe\n  out=无害.pdf".to_string();
+        let b = req("https://b.example/f2.zip");
+        let signal = synthesize_batch_request(&[a, b]);
+        assert_eq!(
+            signal.url,
+            "https://a.example/f1.zip\n  out=合法.pdf https://evil.example/payload.exe   out=无害.pdf\nhttps://b.example/f2.zip",
+            "控制字符应被替换为空格,注入内容保持在同一 out= 行内"
+        );
+        // 不变量:合成文本的行数 = 每条请求(URL 行 + 可选 out= 行),注入不增行。
+        assert_eq!(signal.url.lines().count(), 3);
+    }
+
+    #[test]
+    fn synthesize_batch_shares_cookies_only_on_consensus() {
+        let mut a = req("https://a.example/1");
+        a.cookies = "sid=1".to_string();
+        let mut b = req("https://b.example/2");
+        b.cookies = "sid=1".to_string();
+        assert_eq!(synthesize_batch_request(&[a.clone(), b]).cookies, "sid=1");
+        let mut c = req("https://c.example/3");
+        c.cookies = "sid=2".to_string();
+        assert!(synthesize_batch_request(&[a, c]).cookies.is_empty());
+    }
+
+    #[test]
+    fn synthesize_batch_takes_first_nonempty_referrer_and_save_dir() {
+        let a = req("https://a.example/1");
+        let mut b = req("https://b.example/2");
+        b.referrer = "https://page.example/".to_string();
+        b.save_dir = "D:/dl".to_string();
+        let signal = synthesize_batch_request(&[a, b]);
+        assert_eq!(signal.referrer, "https://page.example/");
+        assert_eq!(signal.save_dir, "D:/dl");
     }
 }
