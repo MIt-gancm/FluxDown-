@@ -4137,20 +4137,11 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                 Expanded(
                   child: ShadSelect<String>(
                     initialValue: sp.proxyType,
-                    // 选项描述的是【代理端点自身】的协议，与 SOCKS4/5 同一维度：
-                    // 混合端口（Clash 7897）是明文 HTTP，选 HTTPS 会对代理本身
-                    // 发起 TLS 握手而失败（issue #183），故标签写明区别。
-                    options: [
-                      ShadOption(
-                        value: 'http',
-                        child: Text(s.proxyTypeHttpLabel),
-                      ),
-                      ShadOption(
-                        value: 'https',
-                        child: Text(s.proxyTypeHttpsLabel),
-                      ),
-                      const ShadOption(value: 'socks4', child: Text('SOCKS4')),
-                      const ShadOption(value: 'socks5', child: Text('SOCKS5')),
+                    options: const [
+                      ShadOption(value: 'http', child: Text('HTTP')),
+                      ShadOption(value: 'https', child: Text('HTTPS')),
+                      ShadOption(value: 'socks4', child: Text('SOCKS4')),
+                      ShadOption(value: 'socks5', child: Text('SOCKS5')),
                     ],
                     selectedOptionBuilder: (context, value) =>
                         Text(value.toUpperCase()),
@@ -4160,14 +4151,6 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                   ),
                 ),
               ],
-            ),
-            const SizedBox(height: 6),
-            Padding(
-              padding: const EdgeInsets.only(left: 80),
-              child: Text(
-                s.proxyTypeDesc,
-                style: TextStyle(fontSize: 11, color: c.textSecondary),
-              ),
             ),
             const SizedBox(height: 10),
             // 地址 + 端口

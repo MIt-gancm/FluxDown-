@@ -436,11 +436,9 @@ class MobileSettingsScreen extends StatelessWidget {
       context,
       title: s.proxyType,
       current: settings.proxyType,
-      // 与桌面端一致：标签写明这一维度是【代理端点自身】的协议，
-      // 避免把混合端口（Clash 7897）误选成 HTTPS（issue #183）。
-      options: [
-        ('http', s.proxyTypeHttpLabel),
-        ('https', s.proxyTypeHttpsLabel),
+      options: const [
+        ('http', 'HTTP'),
+        ('https', 'HTTPS'),
         ('socks4', 'SOCKS4'),
         ('socks5', 'SOCKS5'),
       ],

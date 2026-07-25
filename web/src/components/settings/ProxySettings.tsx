@@ -1,22 +1,16 @@
 // 代理：服务器出站代理（config 表）+ 连通性测试（/api/v1/proxy/test）。
 import { useState } from 'react'
 import { api } from '../../lib/api'
-import type { I18nKey } from '../../lib/i18n'
 import { translateBackendMessage, useI18n } from '../../lib/i18n'
 import type { ConfigMap } from '../../lib/types'
 import { SetRow, SetSelect, TextFieldRow } from './controls'
 
-// 选项描述的是【代理端点自身】的协议，与 SOCKS4/5 同一维度：混合端口
-// （Clash 7897）是明文 HTTP，选 HTTPS 会对代理本身发起 TLS 握手而失败
-// （issue #183），故标签写明区别。
-function proxyTypeOptions(t: (key: I18nKey) => string) {
-  return [
-    { value: 'http', label: t('set.proxy.typeHttp') },
-    { value: 'https', label: t('set.proxy.typeHttps') },
-    { value: 'socks4', label: 'SOCKS4' },
-    { value: 'socks5', label: 'SOCKS5' },
-  ]
-}
+const PROXY_TYPE_OPTIONS = [
+  { value: 'http', label: 'HTTP' },
+  { value: 'https', label: 'HTTPS' },
+  { value: 'socks4', label: 'SOCKS4' },
+  { value: 'socks5', label: 'SOCKS5' },
+]
 
 type TestState = { status: 'idle' | 'pending' | 'ok' | 'err'; detail?: string }
 
@@ -82,12 +76,8 @@ export function ProxySettings({
         </SetRow>
         {mode === 'manual' ? (
           <>
-            <SetRow title={t('set.proxy.type')} desc={t('set.proxy.typeDesc')}>
-              <SetSelect
-                value={type}
-                onValueChange={(v) => mutate({ proxy_type: v })}
-                options={proxyTypeOptions(t)}
-              />
+            <SetRow title={t('set.proxy.type')} desc="HTTP / HTTPS / SOCKS4 / SOCKS5">
+              <SetSelect value={type} onValueChange={(v) => mutate({ proxy_type: v })} options={PROXY_TYPE_OPTIONS} />
             </SetRow>
             <TextFieldRow title={t('set.proxy.host')} value={host} placeholder="127.0.0.1" onCommit={(v) => mutate({ proxy_host: v })} />
             <TextFieldRow title={t('set.proxy.port')} value={port} placeholder="1080" onCommit={(v) => mutate({ proxy_port: v })} />

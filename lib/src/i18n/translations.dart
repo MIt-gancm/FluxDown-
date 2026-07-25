@@ -723,9 +723,6 @@ class S {
   String get proxyModeManual => _r('proxyModeManual');
   String get proxyModeManualDesc => _r('proxyModeManualDesc');
   String get proxyType => _r('proxyType');
-  String get proxyTypeHttpLabel => _r('proxyTypeHttpLabel');
-  String get proxyTypeHttpsLabel => _r('proxyTypeHttpsLabel');
-  String get proxyTypeDesc => _r('proxyTypeDesc');
   String get proxyHost => _r('proxyHost');
   String get proxyHostPlaceholder => _r('proxyHostPlaceholder');
   String get proxyPort => _r('proxyPort');
