@@ -4137,11 +4137,20 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                 Expanded(
                   child: ShadSelect<String>(
                     initialValue: sp.proxyType,
-                    options: const [
-                      ShadOption(value: 'http', child: Text('HTTP')),
-                      ShadOption(value: 'https', child: Text('HTTPS')),
-                      ShadOption(value: 'socks4', child: Text('SOCKS4')),
-                      ShadOption(value: 'socks5', child: Text('SOCKS5')),
+                    // 选项描述的是【代理端点自身】的协议，与 SOCKS4/5 同一维度：
+                    // 混合端口（Clash 7897）是明文 HTTP，选 HTTPS 会对代理本身
+                    // 发起 TLS 握手而失败（issue #183），故标签写明区别。
+                    options: [
+                      ShadOption(
+                        value: 'http',
+                        child: Text(s.proxyTypeHttpLabel),
+                      ),
+                      ShadOption(
+                        value: 'https',
+                        child: Text(s.proxyTypeHttpsLabel),
+                      ),
+                      const ShadOption(value: 'socks4', child: Text('SOCKS4')),
+                      const ShadOption(value: 'socks5', child: Text('SOCKS5')),
                     ],
                     selectedOptionBuilder: (context, value) =>
                         Text(value.toUpperCase()),
@@ -4151,6 +4160,14 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                   ),
                 ),
               ],
+            ),
+            const SizedBox(height: 6),
+            Padding(
+              padding: const EdgeInsets.only(left: 80),
+              child: Text(
+                s.proxyTypeDesc,
+                style: TextStyle(fontSize: 11, color: c.textSecondary),
+              ),
             ),
             const SizedBox(height: 10),
             // 地址 + 端口
@@ -4303,13 +4320,18 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                     child: Text(
                       _testResult!
                           ? s.proxyTestSuccess(_testLatencyMs)
-                          : s.proxyTestFailed(_testError),
+                          : s.proxyTestFailed(
+                              s.translateProxyTestError(_testError),
+                            ),
                       style: TextStyle(
                         fontSize: 11.5,
                         color: _testResult!
                             ? const Color(0xFF22C55E)
                             : const Color(0xFFEF4444),
                       ),
+                      // 失败提示可能是多句可执行建议（如 issue #183 的类型选错），
+                      // 单行省略会把关键的「改选 HTTP」截掉。
+                      maxLines: _testResult! ? 1 : 4,
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),

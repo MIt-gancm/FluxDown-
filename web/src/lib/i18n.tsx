@@ -43,6 +43,9 @@ const BACKEND_KEYS: Record<string, I18nKey> = {
   'file not found on disk': 'backend.fileNotFoundOnDisk',
   'failed to persist task': 'backend.failedToPersistTask',
   'demo mode: only the designated demo file can be downloaded': 'backend.demoModeFileOnly',
+  // 见 native/engine/src/proxy_config.rs 的 PROXY_TLS_ENDPOINT_HINT。
+  'the proxy endpoint did not accept a TLS handshake; if this is a mixed HTTP/SOCKS port (Clash, V2Ray) or a plain HTTP proxy, select the HTTP type instead of HTTPS':
+    'backend.proxyTlsEndpointHint',
   'managed install not supported on this platform': 'backend.componentUnsupported',
   'downloaded ffmpeg failed to run; this system may use musl libc (e.g. Alpine/OpenWrt) which cannot run the official glibc build — install ffmpeg via your system package manager and set a manual path':
     'backend.componentMuslVerify',
