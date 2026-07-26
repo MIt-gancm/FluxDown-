@@ -28,7 +28,7 @@
 //!
 //! All HTTP requests go through the website API (`/api/release`, `/api/download/:fn`).
 //! Desktop auto-update lets `/api/download` do geo-routing: mainland-China clients
-//! are 302'd to the self-hosted CN mirror (mirror.fluxdown.com — latest release
+//! are 302'd to the self-hosted CN mirror (mirror.qwld.cn — latest release
 //! served locally at full speed, pruned older versions fall back to the GitHub
 //! release CDN), everyone else goes straight to GitHub. Both the mirror and the
 //! GitHub CDN honor Range requests, so the multi-segment download below works
@@ -479,7 +479,7 @@ async fn check_inner(current_version: &str, channel: &str) -> Result<(), UpdateE
                 asset.download_url.clone()
             };
             // 桌面自动更新经 /api/download 地域路由：大陆用户走国内镜像
-            // (mirror.fluxdown.com，命中最新版满速、旧版回落 GitHub CDN)，海外直连 GitHub CDN。
+            // (mirror.qwld.cn，命中最新版满速、旧版回落 GitHub CDN)，海外直连 GitHub CDN。
             // 镜像与 GitHub CDN 均支持 Range，多段分段下载透过 302 重定向正常工作。
             (full_url, asset.size)
         }
