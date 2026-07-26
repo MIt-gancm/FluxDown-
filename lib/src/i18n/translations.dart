@@ -743,6 +743,18 @@ class S {
   String proxyTestSuccess(int ms) => _r('proxyTestSuccess', {'ms': ms});
   String proxyTestFailed(String error) =>
       _r('proxyTestFailed', {'error': error});
+  String get proxyTestTlsEndpointHint => _r('proxyTestTlsEndpointHint');
+
+  /// 后端 wire message 保持稳定英文契约，展示层按当前语言映射；
+  /// 未识别的消息原样返回。见 `proxy_config::PROXY_TLS_ENDPOINT_HINT`。
+  String translateProxyTestError(String message) {
+    const tlsEndpointHint =
+        'the proxy endpoint did not accept a TLS handshake; '
+        'if this is a mixed HTTP/SOCKS port (Clash, V2Ray) or a plain HTTP proxy, '
+        'select the HTTP type instead of HTTPS';
+    if (message.trim() == tlsEndpointHint) return proxyTestTlsEndpointHint;
+    return message;
+  }
 
   // User-Agent 设置
   String get userAgent => _r('userAgent');
