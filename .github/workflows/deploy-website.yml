@@ -1,6 +1,6 @@
 name: Deploy Website
 
-# 仅当 main 分支上 website/ 目录有变更时触发，
+# 仅当 develop 分支（开发分支）上 website/ 目录有变更时触发，
 # 通过 SSH 登录服务器执行 deploy.sh 重建并重启容器。
 on:
   push:

@@ -15,7 +15,8 @@ All pull requests require a signed CLA before they can be merged.
 
 ## 开发流程 / Development Workflow
 
-1. Fork 本仓库并从 `main` 创建分支。
+1. Fork 本仓库并从 `develop` 创建分支，PR 也提交到 `develop`（`develop` 是开发分支；`main` 是稳定分支，只由维护者从 `develop` 合并前进，请勿直接对其提 PR）。
+   Fork the repository and branch off `develop`, then target `develop` with your PR (`develop` is the development branch; `main` is the stable branch that maintainers advance from `develop` — do not open PRs against it).
 2. 遵循仓库根目录 `AGENTS.md` 中的代码风格与规范（Rust: `cargo fmt --check && cargo clippy -- -D warnings`；Dart: `flutter analyze`）。
 3. 提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/)（Release Notes 由 git-cliff 自动生成）。
 4. 提交 PR 前确保相关 crate 的测试通过（例如 `cargo test -p fluxdown_engine`）。
@@ -31,8 +32,8 @@ The FluxDown documentation site (<https://fluxdown.zerx.dev/docs/>) is maintaine
 
 ### 快速编辑 / Quick Edit
 
-每篇文档页面都有"编辑此页"链接，点击后直接跳转到 GitHub 网页编辑器（无写权限时会自动引导 Fork），改完直接提交 PR 即可，不需要本地克隆仓库。
-Every documentation page has an "Edit this page" link that opens the GitHub web editor directly (auto-forks if you lack write access) — edit and submit a PR, no local clone required.
+每篇文档页面都有"编辑此页"链接，点击后直接跳转到 GitHub 网页编辑器（指向 `develop` 分支，无写权限时会自动引导 Fork），改完直接提交 PR 即可，不需要本地克隆仓库。
+Every documentation page has an "Edit this page" link that opens the GitHub web editor on the `develop` branch (auto-forks if you lack write access) — edit and submit a PR, no local clone required.
 
 ### 目录结构 / Directory Layout
 
