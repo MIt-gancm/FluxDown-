@@ -314,9 +314,14 @@ class _PopupShellState extends State<_PopupShell> {
 
   /// 表单提交入口：单条 http(s) 链接先经主引擎探测多文件清单
   /// （门控与 new_download_dialog 一致），其余路径零差异走普通提交。
+  ///
+  /// 已选目标设备时**不**预解析：下发的语义是把原始链接交给那台设备处理，
+  /// 本机抢先解析清单只会把任务建到本机、静默吞掉下发意图。
   void _submit(QuickDownloadFormResult result) {
     final entries = parseQuickDownloadEntries(result.urlText);
-    if (entries.length == 1 && isManifestPreviewableUrl(entries.first.url)) {
+    if (result.targetDeviceId.trim().isEmpty &&
+        entries.length == 1 &&
+        isManifestPreviewableUrl(entries.first.url)) {
       _beginPreview(result);
       return;
     }
@@ -526,6 +531,7 @@ class _PopupShellState extends State<_PopupShell> {
                     defaultQueueId: widget.payload.defaultQueueId,
                     initialCookies: widget.payload.cookies,
                     host: _PopupFormHost(widget.payload),
+                    localDevices: widget.payload.localDevices,
                     controller: widget.formController,
                     resolving: _pendingPreview != null,
                     onCancelResolve: _cancelResolve,

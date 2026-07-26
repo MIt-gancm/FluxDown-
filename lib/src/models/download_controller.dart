@@ -2066,10 +2066,11 @@ String _statusBucketLabel(TaskStatus st) {
     TaskStatus.completed => s.statusCompleted,
     TaskStatus.preparing => s.statusDownloading,
     TaskStatus.resuming => s.statusDownloading,
+    TaskStatus.canceled => s.statusCanceled,
   };
 }
 
-/// 「状态」：固定顺序 [下载中,排队,暂停,失败,完成]，仅保留有成员的桶
+/// 「状态」：固定顺序 [下载中,排队,暂停,失败,已取消,完成]，仅保留有成员的桶
 /// （design-proto-spec §2 `by=status`；preparing/resuming 视觉上并入
 /// 下载中桶，与列表行/网格卡的状态色映射一致）。
 List<ListSection> bucketEntitiesByStatus(List<ListEntity> entities) {
@@ -2078,6 +2079,7 @@ List<ListSection> bucketEntitiesByStatus(List<ListEntity> entities) {
     TaskStatus.pending,
     TaskStatus.paused,
     TaskStatus.error,
+    TaskStatus.canceled,
     TaskStatus.completed,
   ];
   final buckets = <TaskStatus, List<ListEntity>>{};
@@ -2195,6 +2197,7 @@ int compareEntitiesSmart(ListEntity a, ListEntity b) {
     TaskStatus.paused => 3,
     TaskStatus.error => 4,
     TaskStatus.completed => 5,
+    TaskStatus.canceled => 6,
   };
   final diff = tier(a.statusBucket) - tier(b.statusBucket);
   if (diff != 0) return diff;

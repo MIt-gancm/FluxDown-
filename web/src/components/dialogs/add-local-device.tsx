@@ -283,6 +283,10 @@ export function AddLocalDeviceDialog() {
                 </div>
                 <p className="mt-2 text-center text-[12px] text-text3">{t('link.sasPeerName', { name: beginResult?.peerName || '' })}</p>
                 {stepError && <p className="mt-2 text-center text-[11.5px] text-danger">{stepError}</p>}
+                {/* 对端现在也要人工核对 SAS 并点确认，请求会一直挂到对方决策（上限 60 秒）。 */}
+                {finishMut.isPending && (
+                  <p className="mt-2 text-center text-[11.5px] text-text3">{t('link.waitingPeer')}</p>
+                )}
               </div>
               <footer className="dlg-foot">
                 <button type="button" className="btn ghost" disabled={finishMut.isPending} onClick={() => finishMut.mutate(false)}>

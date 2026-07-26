@@ -232,9 +232,10 @@ class SettingsProvider extends ChangeNotifier {
   /// 设备协同区显示覆盖（null=自动 / true=强制显示 / false=强制隐藏）。
   bool? get showSidebarDeviceOverride => _showSidebarDevice;
 
-  /// 设备协同区最终是否显示：override 优先，未设置时跟随是否有远程设备。
-  bool showSidebarDeviceEffective(bool hasRemoteDevices) =>
-      _showSidebarDevice ?? hasRemoteDevices;
+  /// 设备协同区最终是否显示：override 优先，未设置时跟随是否存在任意
+  /// 设备（云端远程设备或本地配对设备）。
+  bool showSidebarDeviceEffective(bool hasAnyDevice) =>
+      _showSidebarDevice ?? hasAnyDevice;
 
   // 标题栏工具按钮 Getters
   bool get showTitlebarPauseAll => _showTitlebarPauseAll;

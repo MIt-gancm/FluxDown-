@@ -613,6 +613,7 @@ Color _sparklineColor(TaskStatus status, AppColors c) => switch (status) {
   TaskStatus.paused => AppColors.amber,
   TaskStatus.pending => c.surface3,
   TaskStatus.downloading || TaskStatus.preparing || TaskStatus.resuming => c.accent,
+  TaskStatus.canceled => c.textMuted,
 };
 
 /// 组概览动作行：全部暂停/恢复 + 重试失败项（有失败时，与主按钮等宽）

@@ -14,9 +14,9 @@ use async_trait::async_trait;
 
 use crate::types::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
-    LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmRequest,
-    LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo, MarketEntryDto, PluginDto, QueueDto,
-    ResolvePreviewRequest, ResolvePreviewResponse, TaskDto,
+    LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
+    LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
+    MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse, TaskDto,
 };
 
 /// 404 fallback 响应的 message —— 请求命中了未注册的路由（例如管理 API 分组
@@ -261,17 +261,37 @@ pub trait ApiHost: Send + Sync {
     }
 
     /// 处理入站配对 `hello`（无 token 鉴权，由一次性配对码守卫）。
+    ///
+    /// `source`：发起方的真实客户端地址（HTTP 层从 `ConnectInfo` 提取，取不到传
+    /// `None`）；透传给引擎侧节流器做按来源分桶计数，而非全局计数——避免一个
+    /// 恶意源的失败尝试连坐封锁同网段内所有正常用户的配对。局域网直连场景不
+    /// 解析 `X-Forwarded-For`（本功能设计上不支持反代部署）。
     async fn link_pair_hello(
         &self,
         req: LinkPairHelloRequest,
+        source: Option<std::net::IpAddr>,
     ) -> Result<LinkPairHelloResponse, ApiError> {
-        let _ = req;
+        let _ = (req, source);
         Err(link_unsupported())
     }
 
     /// 处理入站配对 `confirm`（SAS 核对后确认/拒绝）。
-    async fn link_pair_confirm(&self, req: LinkPairConfirmRequest) -> Result<(), ApiError> {
+    ///
+    /// 返回 [`LinkPairConfirmOutcome`]：本机用户拒绝、核验超时都是**协议正常终局**，
+    /// 必须以 2xx + `paired=false` + 判别串回给发起方，而不是压成 4xx——否则发起方
+    /// 只能看到「会话过期」，无法告诉用户「对方拒绝了配对」。
+    async fn link_pair_confirm(
+        &self,
+        req: LinkPairConfirmRequest,
+    ) -> Result<LinkPairConfirmOutcome, ApiError> {
         let _ = req;
+        Err(link_unsupported())
+    }
+
+    /// 批准/拒绝一次入站配对核验（本机作为响应方收到 `IncomingPairing` 通知后，
+    /// 由用户在 UI 上核对 SAS 做出的决策）。
+    async fn link_approve_incoming(&self, session_id: &str, accept: bool) -> Result<(), ApiError> {
+        let _ = (session_id, accept);
         Err(link_unsupported())
     }
 
@@ -284,6 +304,11 @@ pub trait ApiHost: Send + Sync {
 
     /// 生成一次性配对码（供 headless 设备经 web/CLI 出示）。默认不支持。
     async fn link_generate_code(&self) -> Result<LinkCodeResponse, ApiError> {
+        Err(link_unsupported())
+    }
+
+    /// 停止 mDNS 广播（撤销「可被发现」状态）。
+    async fn link_stop_advertising(&self) -> Result<(), ApiError> {
         Err(link_unsupported())
     }
 
@@ -364,7 +389,7 @@ fn groups_unsupported() -> ApiError {
 }
 
 /// 未支持设备互联的宿主（如纯 aria2 客户端 / mobile）的统一错误。
-fn link_unsupported() -> ApiError {
+pub fn link_unsupported() -> ApiError {
     ApiError::Internal("device link not supported by this host".to_string())
 }
 

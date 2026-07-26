@@ -1479,8 +1479,8 @@ pub struct GroupInfo {
 // ========== 本地设备互联（device link）信号 ==========
 
 /// Dart → Rust：设备互联命令（单信号 + `action` 判别，避免逼近 select! 64 分支上限）。
-/// action 取值：generateCode / startDiscovery / stopDiscovery / probe / beginPairing /
-/// confirmPairing / listDevices / removeDevice。
+/// action 取值：generateCode / stopAdvertising / startDiscovery / stopDiscovery / probe /
+/// beginPairing / confirmPairing / approveIncoming / listDevices / removeDevice / dispatch。
 #[derive(Deserialize, DartSignal)]
 pub struct LinkCommand {
     pub action: String,
@@ -1496,6 +1496,18 @@ pub struct LinkCommand {
     pub accept: bool,
     #[serde(default)]
     pub fingerprint: String,
+    /// `approveIncoming`：要批准/拒绝的入站配对会话 id。
+    #[serde(default)]
+    pub session_id: String,
+    /// `dispatch`：下发给已配对设备的下载链接。
+    #[serde(default)]
+    pub url: String,
+    /// `dispatch`：目标设备上的保存目录（空 = 用对端默认）。
+    #[serde(default)]
+    pub save_dir: String,
+    /// `dispatch`：目标设备上的文件名（空 = 由对端推断）。
+    #[serde(default)]
+    pub file_name: String,
 }
 
 /// 已发现设备（未配对）——`LinkEvent.discovered` 的负载。
@@ -1521,15 +1533,25 @@ pub struct LinkDevicePiece {
 }
 
 /// Rust → Dart：设备互联事件（单信号 + `kind` 判别）。
-/// kind 取值：identity / code / discovered / pairingChallenge / paired / unpaired /
-/// devices / error。
+/// kind 取值：code / discovered / pairingChallenge / incomingPairing / paired /
+/// pairingRejected / unpaired / devices / dispatched / error。
 #[derive(Serialize, RustSignal)]
 pub struct LinkEvent {
     pub kind: String,
+    /// `error`：出错的**来源 action**（与 [`LinkCommand::action`] 同名；空串 =
+    /// 子系统级错误，不归属任何一条命令）。
+    ///
+    /// error 是全子系统共用的单一通道：发现失败、配对失败、任务下发失败都走它。
+    /// 没有来源标识时 Dart 侧只能无差别地清空所有状态——一次下发失败会顺手把
+    /// 正在核对的 SAS 挑战摧毁掉。有了本字段，UI 才能把错误只投递给发起它的
+    /// 那条流程。
+    #[serde(default)]
+    pub action: String,
     #[serde(default)]
     pub message: String,
     #[serde(default)]
     pub code: String,
+    /// `code`：配对码剩余有效秒数，供 UI 做过期倒计时。
     #[serde(default)]
     pub ttl_seconds: i64,
     #[serde(default)]
@@ -1540,6 +1562,15 @@ pub struct LinkEvent {
     pub fingerprint: String,
     #[serde(default)]
     pub name: String,
+    /// `incomingPairing`：待本机用户核验的入站配对会话 id（回传 approveIncoming）。
+    #[serde(default)]
+    pub session_id: String,
+    /// `incomingPairing`：对端平台标识（展示用）。
+    #[serde(default)]
+    pub platform: String,
+    /// `dispatched`：对端返回的远程任务 id。
+    #[serde(default)]
+    pub task_id: String,
     pub discovered: Option<LinkDiscoveredPiece>,
     #[serde(default)]
     pub devices: Vec<LinkDevicePiece>,

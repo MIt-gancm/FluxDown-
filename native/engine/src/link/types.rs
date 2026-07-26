@@ -81,7 +81,12 @@ pub struct PeerCandidate {
 pub struct PeerRecord {
     /// 设备 ID = 对端 Ed25519 公钥指纹（hex(sha256(pub))，64 hex）。主键。
     pub fingerprint: String,
-    /// 对端 Ed25519 身份公钥（32 字节），用于后续连接的身份重校验（TOFU 固定）。
+    /// 对端 Ed25519 身份公钥（32 字节）：配对握手时用于验证双方签名（见
+    /// `pairing` 模块）。TOFU 身份复核**实际发生在**
+    /// [`crate::link::transport::DirectTransport::connect`]：每次拨号都会
+    /// 比对 `/ping` 响应体的 `linkFingerprint` 与本记录的 `fingerprint`
+    /// （本字段的派生值），而非直接重放本字段——地址被 DHCP 回收复用或被
+    /// 篡改指向攻击者时，指纹不符即拒绝连接。
     pub identity_pub: Vec<u8>,
     /// 设备展示名。
     pub name: String,

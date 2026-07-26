@@ -18,6 +18,7 @@ import 'src/pages/home_page.dart';
 import 'src/mobile/mobile_app.dart';
 import 'src/services/external_download_service.dart';
 import 'src/services/popup_window_service.dart';
+import 'src/services/quick_download_submitter.dart';
 import 'src/popup/popup_app.dart';
 import 'src/services/floating_ball/floating_ball_service.dart';
 import 'src/services/floating_ball/wayland_degradation_service.dart';
@@ -390,6 +391,10 @@ class _FluxDownAppState extends State<FluxDownApp>
       themeProvider: themeProvider,
       navigatorKey: _navigatorKey,
     );
+
+    // 快速下载提交器的 toast 反馈通道 — 本地/云端设备下发是异步的，
+    // 独立小窗场景下下发完成时弹窗多半已关闭，结果提示必须走主窗口。
+    initQuickDownloadSubmitter(navigatorKey: _navigatorKey);
 
     // 初始化 HLS 画质选择服务 — 监听 Rust 端的画质选项信号
     HlsQualityService.init(navigatorKey: _navigatorKey);

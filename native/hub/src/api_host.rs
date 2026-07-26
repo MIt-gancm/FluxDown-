@@ -39,8 +39,8 @@ use std::time::Duration;
 #[cfg(hub_link)]
 use fluxdown_api::types::{
     LinkAuth, LinkCodeResponse, LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse,
-    LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
-    LinkTaskRequest,
+    LinkPairConfirmOutcome, LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse,
+    LinkPingInfo, LinkTaskRequest,
 };
 #[cfg(hub_plugins)]
 use fluxdown_api::types::{MarketEntryDto, PluginDto};
@@ -584,8 +584,9 @@ impl ApiHost for HubApiHost {
     async fn link_pair_hello(
         &self,
         req: LinkPairHelloRequest,
+        source: Option<std::net::IpAddr>,
     ) -> Result<LinkPairHelloResponse, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let wire = WireHello {
             code: req.code,
             initiator_eph_pub: req.initiator_eph_pub,
@@ -596,7 +597,7 @@ impl ApiHost for HubApiHost {
             app_version: link_opt_str(req.app_version),
             initiator_addrs: req.initiator_addrs,
         };
-        let resp = link.pair_hello_wire(wire).map_err(map_link_err)?;
+        let resp = link.pair_hello_wire(wire, source).map_err(map_link_err)?;
         Ok(LinkPairHelloResponse {
             session_id: resp.session_id,
             responder_eph_pub: resp.responder_eph_pub,
@@ -610,30 +611,45 @@ impl ApiHost for HubApiHost {
     }
 
     #[cfg(hub_link)]
-    async fn link_pair_confirm(&self, req: LinkPairConfirmRequest) -> Result<(), ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
-        link.pair_confirm(&req.session_id, req.confirm)
+    async fn link_pair_confirm(
+        &self,
+        req: LinkPairConfirmRequest,
+    ) -> Result<LinkPairConfirmOutcome, ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        let outcome = link
+            .pair_confirm(&req.session_id, req.confirm)
             .await
             .map_err(map_link_err)?;
-        Ok(())
+        Ok(map_confirm_outcome(outcome))
+    }
+
+    #[cfg(hub_link)]
+    async fn link_approve_incoming(&self, session_id: &str, accept: bool) -> Result<(), ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        link.approve_incoming(session_id, accept)
+            .map_err(map_link_err)
     }
 
     #[cfg(hub_link)]
     async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<String, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
-        link.authorize(
-            "POST",
-            "/api/v1/link/tasks",
-            &auth.device,
-            auth.ts,
-            &auth.nonce,
-            &body,
-            &auth.tag,
-        )
-        .await
-        .map_err(map_link_err)?;
-        let req: LinkTaskRequest =
-            serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        let authorized = link
+            .authorize(
+                "POST",
+                "/api/v1/link/tasks",
+                &auth.device,
+                auth.ts,
+                &auth.nonce,
+                &body,
+                &auth.tag,
+                &auth.enc,
+            )
+            .await
+            .map_err(map_link_err)?;
+        // 鉴权返回的是**已解密**的明文 body，不再用调用方手里的原始（密文）
+        // 字节反序列化——那份原始字节现在是密文，直接解析会失败或得到垃圾。
+        let req: LinkTaskRequest = serde_json::from_slice(&authorized.body)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let ctreq: CreateTaskRequest = serde_json::from_value(serde_json::json!({
             "url": req.url,
             "saveDir": req.save_dir,
@@ -645,7 +661,7 @@ impl ApiHost for HubApiHost {
 
     #[cfg(hub_link)]
     async fn link_generate_code(&self) -> Result<LinkCodeResponse, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         Ok(LinkCodeResponse {
             code: link.generate_code(),
             ttl_seconds: 120,
@@ -653,8 +669,15 @@ impl ApiHost for HubApiHost {
     }
 
     #[cfg(hub_link)]
+    async fn link_stop_advertising(&self) -> Result<(), ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        link.stop_advertising();
+        Ok(())
+    }
+
+    #[cfg(hub_link)]
     async fn link_discovery(&self, start: bool) -> Result<(), ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         if start {
             link.start_discovery().map_err(map_link_err)
         } else {
@@ -665,7 +688,7 @@ impl ApiHost for HubApiHost {
 
     #[cfg(hub_link)]
     async fn link_discovered(&self) -> Result<Vec<LinkDiscoveredPeer>, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         Ok(link
             .discovered_peers()
             .into_iter()
@@ -675,7 +698,7 @@ impl ApiHost for HubApiHost {
 
     #[cfg(hub_link)]
     async fn link_probe(&self, host: &str, port: u16) -> Result<LinkDiscoveredPeer, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         link.probe(host, port)
             .await
             .map(link_discovered_dto)
@@ -689,7 +712,7 @@ impl ApiHost for HubApiHost {
         port: u16,
         code: &str,
     ) -> Result<LinkPairBeginResponse, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let result = link
             .begin_pairing(host, port, code)
             .await
@@ -708,7 +731,7 @@ impl ApiHost for HubApiHost {
         token: &str,
         accept: bool,
     ) -> Result<Option<LinkDeviceInfo>, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let Some(record) = link
             .confirm_pairing(token, accept)
             .await
@@ -732,7 +755,7 @@ impl ApiHost for HubApiHost {
     /// 响应。
     #[cfg(hub_link)]
     async fn link_devices(&self) -> Result<Vec<LinkDeviceInfo>, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let records = link.list_devices().await.map_err(map_link_err)?;
         let probe =
             futures_util::future::join_all(records.iter().map(|r| link.is_online(&r.fingerprint)));
@@ -755,7 +778,7 @@ impl ApiHost for HubApiHost {
 
     #[cfg(hub_link)]
     async fn link_remove_device(&self, fingerprint: &str) -> Result<bool, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         link.remove_device(fingerprint).await.map_err(map_link_err)
     }
 
@@ -767,7 +790,7 @@ impl ApiHost for HubApiHost {
         save_dir: Option<&str>,
         file_name: Option<&str>,
     ) -> Result<String, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         link.dispatch(fingerprint, url, save_dir, file_name)
             .await
             .map_err(map_link_err)
@@ -820,6 +843,21 @@ fn link_opt_str(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// 引擎 [`PairConfirmOutcome`] → API [`LinkPairConfirmOutcome`]。两者字段一致但分属
+/// 两个 crate（`fluxdown_api` 不依赖引擎的可选 link 模块），这里做一次显式搬运。
+#[cfg(hub_link)]
+fn map_confirm_outcome(
+    outcome: fluxdown_engine::link::PairConfirmOutcome,
+) -> LinkPairConfirmOutcome {
+    use fluxdown_engine::link::PairConfirmOutcome as E;
+    match outcome {
+        E::Paired => LinkPairConfirmOutcome::Paired,
+        E::Declined => LinkPairConfirmOutcome::Declined,
+        E::Rejected => LinkPairConfirmOutcome::Rejected,
+        E::TimedOut => LinkPairConfirmOutcome::TimedOut,
+    }
+}
+
 /// [`LinkError`] → [`ApiError`] 映射（决定 HTTP 状态码）。
 #[cfg(hub_link)]
 fn map_link_err(e: LinkError) -> ApiError {
@@ -829,8 +867,25 @@ fn map_link_err(e: LinkError) -> ApiError {
         | LinkError::BadSignature
         | LinkError::BadPayload(_)
         | LinkError::SelfPairing
-        | LinkError::SessionExpired => ApiError::BadRequest(e.to_string()),
-        LinkError::Unreachable => ApiError::Unavailable,
+        | LinkError::SessionExpired
+        | LinkError::Throttled
+        | LinkError::RejectedByPeer
+        | LinkError::PairingTimeout
+        | LinkError::IdentityMismatch(_) => ApiError::BadRequest(e.to_string()),
+        LinkError::Unreachable | LinkError::Unavailable => ApiError::Unavailable,
         other => ApiError::Internal(other.to_string()),
     }
+}
+
+/// `self.link` 为 `None`（本宿主未启用/未初始化设备互联）时的统一错误。
+///
+/// 复用 [`fluxdown_api::service::link_unsupported`] 的稳定契约 message
+/// （`"device link not supported by this host"`）——不能改用
+/// `ApiError::Unavailable`（固定文案 `"app shutting down"`，语义是宿主
+/// 正在关闭/命令通道已断，牛头不对马嘴）。Web 侧 `isLinkUnsupportedError()`
+/// 靠逐字比对这条 message 识别「宿主不支持设备互联」并展示专用提示，
+/// 文案用错就等于把这条 UX 分支废掉。
+#[cfg(hub_link)]
+fn link_disabled() -> ApiError {
+    fluxdown_api::service::link_unsupported()
 }

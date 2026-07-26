@@ -537,7 +537,8 @@ class TaskHoverActionCluster extends StatelessWidget {
           TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
         );
       case TaskStatus.completed:
-        break;
+      case TaskStatus.canceled:
+        break; // 两者均为终态，无操作按钮（canceled 是只读远程镜像）
     }
     buttons.add(
       TaskActionButton(
@@ -733,7 +734,8 @@ void showTaskContextMenu(
         ),
       );
     case TaskStatus.completed:
-      break;
+    case TaskStatus.canceled:
+      break; // 两者均为终态，不提供暂停/继续菜单项
   }
 
   // --- 忽略插件重试（逃生舱：插件解析失败任务专属）---

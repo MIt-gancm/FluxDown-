@@ -109,6 +109,8 @@ class _TaskListState extends State<TaskList> {
         if (task.fileMissing) return;
         final filePath = task.filePath;
         openFile(filePath);
+      case TaskStatus.canceled:
+        break; // 已取消的远程任务镜像没有本地文件，双击无动作
     }
   }
 

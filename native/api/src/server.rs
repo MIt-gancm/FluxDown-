@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, Query, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
@@ -40,9 +40,9 @@ use crate::takeover::parse_batch;
 use crate::types::{
     CreateGroupRequest, CreateGroupResponse, CreateTaskRequest, CreatedTask, DownloadRequest,
     LinkAuth, LinkDeviceTaskRequest, LinkDevicesResponse, LinkDiscoveredResponse,
-    LinkDiscoveryRequest, LinkOkResponse, LinkPairBeginRequest, LinkPairConfirmRequest,
-    LinkPairFinishRequest, LinkPairFinishResponse, LinkPairHelloRequest, LinkProbeRequest,
-    ResolvePreviewRequest,
+    LinkDiscoveryRequest, LinkOkResponse, LinkPairApproveRequest, LinkPairBeginRequest,
+    LinkPairConfirmRequest, LinkPairFinishRequest, LinkPairFinishResponse, LinkPairHelloRequest,
+    LinkProbeRequest, ResolvePreviewRequest,
 };
 
 /// 请求体大小上限：4 MB（足够容纳批量 URL 列表）。
@@ -202,9 +202,12 @@ pub(crate) async fn serve_on(
         host,
         config: Arc::new(config),
     });
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await;
+    let served = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(cancel.cancelled_owned())
+    .await;
     if let Err(e) = served {
         log_info!("[api-server] serve error: {}", e);
     } else {
@@ -284,12 +287,16 @@ fn register_core(state: AppState) -> Router<AppState> {
             )
             .route(routes::API_MARKET, get(api_market_list))
             .route(routes::API_MARKET_INSTALL, post(api_market_install))
-            .route(routes::API_LINK_CODE, post(api_link_generate_code))
+            .route(
+                routes::API_LINK_CODE,
+                post(api_link_generate_code).delete(api_link_stop_advertising),
+            )
             .route(routes::API_LINK_DISCOVERY, post(api_link_discovery))
             .route(routes::API_LINK_DISCOVERED, get(api_link_discovered))
             .route(routes::API_LINK_PROBE, post(api_link_probe))
             .route(routes::API_LINK_PAIR_BEGIN, post(api_link_pair_begin))
             .route(routes::API_LINK_PAIR_FINISH, post(api_link_pair_finish))
+            .route(routes::API_LINK_PAIR_APPROVE, post(api_link_pair_approve))
             .route(routes::API_LINK_DEVICES, get(api_link_devices))
             .route(
                 routes::API_LINK_DEVICE,
@@ -408,7 +415,19 @@ pub(crate) async fn ping(State(state): State<AppState>) -> Response {
 // ---------------------------------------------------------------------------
 
 /// 处理配对 `hello`（发起方 → 本机）。
-pub(crate) async fn api_link_pair_hello(State(state): State<AppState>, body: Bytes) -> Response {
+#[utoipa::path(post, path = "/api/v1/link/pair/hello", tag = "link",
+    description = "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。",
+    request_body = LinkPairHelloRequest,
+    responses(
+        (status = 200, description = "响应方临时公钥 + SAS 材料", body = crate::types::LinkPairHelloResponse),
+        (status = 400, description = "配对码错误/过期/已用，或载荷非法", body = crate::types::ResultMessage),
+    )
+)]
+pub(crate) async fn api_link_pair_hello(
+    State(state): State<AppState>,
+    parts: axum::http::request::Parts,
+    body: Bytes,
+) -> Response {
     let req: LinkPairHelloRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
@@ -419,13 +438,33 @@ pub(crate) async fn api_link_pair_hello(State(state): State<AppState>, body: Byt
             );
         }
     };
-    match state.host.link_pair_hello(req).await {
+    // 从请求扩展里**可选地**取 `ConnectInfo` 而不是把它写成提取器：裸 `ConnectInfo`
+    // 在某个 serve 站点没挂 `into_make_service_with_connect_info` 时会直接拒绝请求，
+    // 把「忘配置」放大成「配对功能整体不可用」；而 axum 0.8 的 `Option<ConnectInfo<_>>`
+    // 并不满足 `OptionalFromRequestParts`，无法直接写成可选提取器。拿不到就传 None，
+    // 引擎侧节流器落 "unknown" 分桶，不阻断主流程。
+    //
+    // 取的是 TCP 层真实对端地址，不解析 `X-Forwarded-For`——本功能面向局域网直连，
+    // 反代场景不在设计内，仓库里也没有解析 XFF 的既有惯例，引入反而给伪造来源留后门。
+    let source = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip());
+    match state.host.link_pair_hello(req, source).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => e.into_response(),
     }
 }
 
 /// 处理配对 `confirm`（SAS 核对后确认/拒绝）。
+#[utoipa::path(post, path = "/api/v1/link/pair/confirm", tag = "link",
+    description = "配对第二步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立的 sessionId 守卫）。**无 token 鉴权**。",
+    request_body = LinkPairConfirmRequest,
+    responses(
+        (status = 200, description = "`{success,paired,reason}`"),
+        (status = 400, description = "会话不存在/已过期，或载荷非法", body = crate::types::ResultMessage),
+    )
+)]
 pub(crate) async fn api_link_pair_confirm(State(state): State<AppState>, body: Bytes) -> Response {
     let req: LinkPairConfirmRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -438,12 +477,26 @@ pub(crate) async fn api_link_pair_confirm(State(state): State<AppState>, body: B
         }
     };
     match state.host.link_pair_confirm(req).await {
-        Ok(()) => result_response(StatusCode::OK, true, "ok"),
+        Ok(outcome) => Json(json!({
+            "success": true,
+            "paired": outcome.paired(),
+            "reason": outcome.reason(),
+        }))
+        .into_response(),
         Err(e) => e.into_response(),
     }
 }
 
 /// 已配对设备下发下载任务：从 `X-FluxLink-*` 头取鉴权凭据 → 校验 → 建任务。
+#[utoipa::path(post, path = "/api/v1/link/tasks", tag = "link",
+    description = "数据面：已配对设备下发下载任务。**无 management token**，鉴权靠 `X-FluxLink-Device`/`X-FluxLink-Ts`/`X-FluxLink-Nonce`/`X-FluxLink-Auth` 头做每对设备独立密钥的 HMAC 校验。\n\n\
+请求体是对明文 JSON 任务描述做 AEAD 加密后的**二进制密文**（`Content-Type: application/octet-stream`），非普通 JSON；宿主校验鉴权头后解密再反序列化。",
+    responses(
+        (status = 200, description = "创建成功", body = crate::types::CreatedTask),
+        (status = 400, description = "载荷非法（含解密失败）", body = crate::types::ResultMessage),
+        (status = 401, description = "缺少/无效链路鉴权头", body = crate::types::ResultMessage),
+    )
+)]
 pub(crate) async fn api_link_create_task(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -455,6 +508,7 @@ pub(crate) async fn api_link_create_task(
         ts: h("x-fluxlink-ts").parse::<i64>().unwrap_or(0),
         nonce: h("x-fluxlink-nonce").to_string(),
         tag: h("x-fluxlink-auth").to_string(),
+        enc: h("x-fluxlink-enc").to_string(),
     };
     if auth.device.is_empty() || auth.tag.is_empty() {
         return result_response(StatusCode::UNAUTHORIZED, false, "missing link auth headers");
@@ -468,6 +522,14 @@ pub(crate) async fn api_link_create_task(
 }
 
 /// 生成一次性配对码（**需 management token**）。供 web/CLI 让 headless 设备出示。
+#[utoipa::path(post, path = "/api/v1/link/code", tag = "link",
+    description = "生成一次性配对码，供发起方在 pair/hello 出示。**需 management token**。",
+    responses(
+        (status = 200, description = "配对码 + 有效期", body = crate::types::LinkCodeResponse),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_generate_code(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -481,12 +543,45 @@ pub(crate) async fn api_link_generate_code(
     }
 }
 
+/// 停止 mDNS 广播（撤销「可被发现」状态）；配对码本身若未过期仍可用
+/// （手动地址/已知连接仍能核对），只是不再出现在局域网 mDNS 扫描里。
+#[utoipa::path(delete, path = "/api/v1/link/code", tag = "link",
+    description = "停止 mDNS 广播（撤销「可被发现」状态）；配对码本身未过期仍可用，只是不再出现在局域网扫描里。**需 management token**。",
+    responses(
+        (status = 200, description = "已停止", body = crate::types::LinkOkResponse),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_link_stop_advertising(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    match state.host.link_stop_advertising().await {
+        Ok(()) => Json(LinkOkResponse { ok: true }).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 本地互联管理面（/api/v1/link/*，强制 token；供 web/PC 一致驱动 LinkManager，
 // 契约见 docs/link_mgmt_contract.md）
 // ---------------------------------------------------------------------------
 
 /// 本地设备发现开关：`start` 幂等且清空发现快照；`stop` 停止 mDNS 浏览。
+#[utoipa::path(post, path = "/api/v1/link/discovery", tag = "link",
+    description = "本地设备发现开关：`start` 幂等且清空发现快照，`stop` 停止 mDNS 浏览。**需 management token**。",
+    request_body = LinkDiscoveryRequest,
+    responses(
+        (status = 200, description = "已切换", body = crate::types::LinkOkResponse),
+        (status = 400, description = "action 非法", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_discovery(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -523,6 +618,14 @@ pub(crate) async fn api_link_discovery(
 }
 
 /// 当前发现快照（发起方侧 UI 轮询）。
+#[utoipa::path(get, path = "/api/v1/link/discovered", tag = "link",
+    description = "当前发现快照（发起方侧 UI 轮询）。**需 management token**。",
+    responses(
+        (status = 200, description = "发现到的对端列表", body = crate::types::LinkDiscoveredResponse),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_discovered(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -537,6 +640,17 @@ pub(crate) async fn api_link_discovered(
 }
 
 /// 手动地址探测（mDNS 失效兜底）；结果不入发现快照。
+#[utoipa::path(post, path = "/api/v1/link/probe", tag = "link",
+    description = "手动地址探测（mDNS 失效兜底）；结果不入发现快照，直接返回给调用方。**需 management token**。",
+    request_body = LinkProbeRequest,
+    responses(
+        (status = 200, description = "探测到的对端信息", body = crate::types::LinkDiscoveredPeer),
+        (status = 400, description = "载荷非法", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+        (status = 503, description = "对端不可达", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_probe(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -563,6 +677,17 @@ pub(crate) async fn api_link_probe(
 
 /// 发起配对：向 `host:port` 发送 `hello`（带配对码），返回待确认令牌 + SAS +
 /// 对端信息，供 UI 展示 SAS 核对后调 [`api_link_pair_finish`]。
+#[utoipa::path(post, path = "/api/v1/link/pair/begin", tag = "link",
+    description = "发起配对：向 `host:port` 发送 hello（带配对码），返回待确认令牌 + SAS，供 UI 展示核对后调用 pair/finish。**需 management token**。",
+    request_body = LinkPairBeginRequest,
+    responses(
+        (status = 200, description = "待确认令牌 + SAS + 对端信息", body = crate::types::LinkPairBeginResponse),
+        (status = 400, description = "配对码错误，或载荷非法", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+        (status = 503, description = "对端不可达，或本机待确认配对已达上限", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_pair_begin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -592,6 +717,16 @@ pub(crate) async fn api_link_pair_begin(
 }
 
 /// SAS 核对后确认/拒绝配对（管理面版本，区别于响应方内部 `pair/confirm`）。
+#[utoipa::path(post, path = "/api/v1/link/pair/finish", tag = "link",
+    description = "SAS 核对后确认/拒绝配对（管理面视角，区别于响应方内部 `pair/confirm`）。**需 management token**。",
+    request_body = LinkPairFinishRequest,
+    responses(
+        (status = 200, description = "`paired=false` 表示对端拒绝，此时 device 省略", body = crate::types::LinkPairFinishResponse),
+        (status = 400, description = "令牌不存在/已过期，或载荷非法", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_pair_finish(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -620,7 +755,55 @@ pub(crate) async fn api_link_pair_finish(
     }
 }
 
+/// 批准/拒绝一次入站配对核验（响应本机收到的 `IncomingPairing` 通知；区别于
+/// 发起方视角、核对 SAS 后调用的 [`api_link_pair_finish`]）。
+#[utoipa::path(post, path = "/api/v1/link/pair/approve", tag = "link",
+    description = "批准/拒绝一次入站配对核验（响应本机收到的 `IncomingPairing` 通知；区别于发起方视角、核对 SAS 后调用的 pair/finish）。**需 management token**。",
+    request_body = LinkPairApproveRequest,
+    responses(
+        (status = 200, description = "已处理", body = crate::types::LinkOkResponse),
+        (status = 400, description = "会话不存在/已过期，或载荷非法", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_link_pair_approve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    let req: LinkPairApproveRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid pair approve payload: {e}"),
+            );
+        }
+    };
+    match state
+        .host
+        .link_approve_incoming(&req.session_id, req.accept)
+        .await
+    {
+        Ok(()) => Json(LinkOkResponse { ok: true }).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// 已配对设备列表（含并发在线探测）。
+#[utoipa::path(get, path = "/api/v1/link/devices", tag = "link",
+    description = "已配对设备列表（含并发在线探测）。**需 management token**。",
+    responses(
+        (status = 200, description = "设备列表", body = crate::types::LinkDevicesResponse),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_devices(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -635,6 +818,16 @@ pub(crate) async fn api_link_devices(
 }
 
 /// 解除配对（删除设备）。
+#[utoipa::path(delete, path = "/api/v1/link/devices/{fingerprint}", tag = "link",
+    description = "解除配对（删除设备记录及双方链路密钥）。**需 management token**。",
+    params(("fingerprint" = String, Path, description = "设备指纹")),
+    responses(
+        (status = 200, description = "已解除", body = crate::types::LinkOkResponse),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+        (status = 404, description = "设备不存在", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_remove_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -652,6 +845,17 @@ pub(crate) async fn api_link_remove_device(
 
 /// 下发下载任务给已配对设备（管理面，token 鉴权；区别于数据面链路 HMAC 鉴权的
 /// `POST /api/v1/link/tasks`）。
+#[utoipa::path(post, path = "/api/v1/link/devices/{fingerprint}/tasks", tag = "link",
+    description = "下发下载任务给已配对设备（管理面，token 鉴权；区别于数据面链路 HMAC 鉴权的 `POST /api/v1/link/tasks`）。**需 management token**。",
+    params(("fingerprint" = String, Path, description = "目标设备指纹")),
+    request_body = LinkDeviceTaskRequest,
+    responses(
+        (status = 200, description = "创建成功", body = crate::types::CreatedTask),
+        (status = 400, description = "载荷非法", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效，或目标设备不存在/未配对", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
 pub(crate) async fn api_link_device_tasks(
     State(state): State<AppState>,
     headers: HeaderMap,

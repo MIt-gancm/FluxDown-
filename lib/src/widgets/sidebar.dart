@@ -19,6 +19,7 @@ import 'category_edit_dialog.dart';
 import 'context_menu.dart';
 import 'queue_manager_dialog.dart';
 import '../services/cloud/cloud_auth_service.dart';
+import '../services/link/local_pairing_service.dart';
 import 'add_device_dialog.dart';
 
 class Sidebar extends StatefulWidget {
@@ -102,6 +103,7 @@ class _SidebarState extends State<Sidebar> {
                 widget.controller,
                 widget.settingsProvider,
                 CloudAuthService.instance,
+                LocalPairingService.instance,
               ]),
               builder: (context, _) {
                 final ctrl = widget.controller;
@@ -122,7 +124,8 @@ class _SidebarState extends State<Sidebar> {
                       if (sp.showSidebarCategory)
                         _buildCategorySection(ctrl, s, c),
                       if (sp.showSidebarDeviceEffective(
-                        CloudAuthService.instance.hasRemoteDevices,
+                        CloudAuthService.instance.hasRemoteDevices ||
+                            LocalPairingService.instance.hasLocalDevices,
                       )) ...[
                         _buildDeviceSection(ctrl, s, c),
                         const SizedBox(height: 6),
@@ -479,7 +482,7 @@ class _SidebarState extends State<Sidebar> {
   }
 
   // ─────────────────────────────────────────────
-  // 设备区块（可折叠，多设备协同渐进披露；无远程设备且未强制开启时整区不渲染）
+  // 设备区块（可折叠，多设备协同渐进披露；无远程设备也无本地配对设备且未强制开启时整区不渲染）
   // ─────────────────────────────────────────────
 
   /// 设备类型徽标：桌面(monitor)/移动(smartphone)/未知或服务器(server)。
@@ -492,6 +495,9 @@ class _SidebarState extends State<Sidebar> {
   Widget _buildDeviceSection(DownloadController ctrl, S s, AppColors c) {
     final deviceFilter = ctrl.deviceFilter;
     final remoteDevices = CloudAuthService.instance.remoteDevices;
+    // 本地配对设备（局域网直连，免账号）。移动端 supported 恒为 false，
+    // localDevices 恒为空列表，天然不需要额外的平台判断。
+    final localDevices = LocalPairingService.instance.localDevices;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -536,14 +542,26 @@ class _SidebarState extends State<Sidebar> {
               isOnline: device.isOnline,
               onTap: () => ctrl.setDeviceFilter(device.deviceId),
             ),
+          for (final device in localDevices)
+            _LocalDeviceStatusRow(
+              // 局域网直连设备用不同图标（antenna）与云账户设备
+              // （monitor/smartphone/server）区分，无需额外文案标签。
+              icon: LucideIcons.antenna,
+              label: device.name,
+              online: device.online,
+              statusLabel: device.online ? s.deviceOnline : s.deviceOffline,
+            ),
           // 「＋ 添加设备」：直接弹出添加设备弹窗（未登录默认本地配对页），
           // 无需先进入设置页；设置页内的入口用于隐藏该侧栏项后的管理编辑。
-          _NavItem(
-            icon: LucideIcons.plus,
-            label: s.addDeviceEntry,
-            isSelected: false,
-            onTap: () => showAddDeviceDialog(context),
-          ),
+          // 移动端不支持本地互联——本地配对是免账号添加设备的唯一路径
+          // （云账户设备登录后自动出现，无需手动添加），故整体隐藏该入口。
+          if (LocalPairingService.instance.supported)
+            _NavItem(
+              icon: LucideIcons.plus,
+              label: s.addDeviceEntry,
+              isSelected: false,
+              onTap: () => showAddDeviceDialog(context),
+            ),
         ],
       ],
     );
@@ -842,6 +860,63 @@ class _NavItemState extends State<_NavItem> {
             ],
           ),
         ),
+      ),
+    );
+  }
+}
+
+/// 局域网直连设备的只读状态行：仅展示“设备名 + 在线/离线”，不接选中态、
+/// 悬浮态、计数徽标。
+///
+/// 局域网下发（LinkManager.dispatch）是 fire-and-forget，对端任务状态没有
+/// 任何数据回流通道（不同于云端设备走 SSE 全量拉取 + 增量事件），
+/// [DownloadController.countForDevice]/[DownloadController.setDeviceFilter]
+/// 两个 API 都只读 DownloadController 内部的云端任务快照，对局域网指纹
+/// 永远是 0/空——做成可点击的筛选项只会呈现“点了没反应”的空壳。改成纯
+/// 展示行后，本文件里触发 setDeviceFilter 的调用点不会再出现局域网
+/// 指纹，pruneDeviceFilter（只按云端 remoteDevices 名册校验）也就不会再
+/// 把局域网指纹误判成“已失效的远程设备”回收——它本来就不会被选中。
+/// 行高/内边距/字号与 [_NavItem] 保持一致，在同一设备区块内视觉协调；
+/// 无悬浮/选中态，不涉及颜色过渡，天然不触发 no-lerp-from-transparent。
+class _LocalDeviceStatusRow extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final bool online;
+  final String statusLabel;
+
+  const _LocalDeviceStatusRow({
+    required this.icon,
+    required this.label,
+    required this.online,
+    required this.statusLabel,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return Container(
+      height: 32,
+      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: c.textSecondary),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              label,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 12.5, color: c.textSecondary),
+            ),
+          ),
+          Text(
+            statusLabel,
+            style: TextStyle(
+              fontSize: 11,
+              color: online ? c.statusSuccess : c.textMuted,
+            ),
+          ),
+        ],
       ),
     );
   }

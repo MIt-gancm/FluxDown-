@@ -264,6 +264,10 @@ class _FileHeaderCard extends StatelessWidget {
         c.statusError.withValues(alpha: 0.14),
         c.statusError,
       ),
+      TaskStatus.canceled => (
+        c.textMuted.withValues(alpha: 0.14),
+        c.textMuted,
+      ),
     };
 
     return GestureDetector(
@@ -377,6 +381,7 @@ class _ProgressCard extends StatelessWidget {
       TaskStatus.paused => c.statusWarning,
       TaskStatus.error => c.statusError,
       TaskStatus.completed => c.statusSuccess,
+      TaskStatus.canceled => c.textMuted,
       _ => c.accent,
     };
 

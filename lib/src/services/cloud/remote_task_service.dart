@@ -4,8 +4,9 @@
 //   查看端：SSE 接收 task.progress（批量增量）/ task.status / presence，增量更新
 //           本地 [_remoteTasks] 快照，~300ms 合并后注入 DownloadController，驱动
 //           设备区混排 + 进度回流 UI（绝不逐事件重建列表）。
-//   接收端：SSE 收到 task.dispatch（目标为本机）→ 经 DownloadController 建本地任务
-//           执行，回 reportTaskStatus(accepted)；task.command（目标本机）→ 暂停/
+//   接收端：SSE 收到 task.dispatch（目标为本机）或重连全量拉取时发现离线
+//           期间积压的同类记录 → 经 DownloadController 建本地任务执行，回
+//           reportTaskStatus(accepted)；task.command（目标本机）→ 暂停/
 //           恢复/取消对应本地任务。
 //   执行端：Timer 1s 采样「由下发产生的本地任务」→ 批量 reportProgress（仅活跃）+
 //           状态转换即时 reportTaskStatus。节流批量是性能关键（对标迅雷云中转，
@@ -40,6 +41,13 @@ const _kRetryDelays = [
   Duration(seconds: 60),
 ];
 
+/// 单条 rid 重建绑定连续失败的尝试次数上限：超过即放弃（退回“丢绑定”的
+/// 旧行为），避免真正匹配不到本地任务的 rid（比如用户手动删了落地任务，
+/// 但服务端仍是非终态）永远留在 _pendingRebind 里，让 DownloadController
+/// 每次 notifyListeners（下载中每秒多次）都触发一次 O(pendingRebind ×
+/// localTasks) 全表扫描。
+const _kMaxRebindAttempts = 20;
+
 /// 跨设备任务协同服务单例。home_page 在 providers 就绪后调 [attach] 一次。
 class RemoteTaskService extends ChangeNotifier {
   RemoteTaskService._();
@@ -52,11 +60,25 @@ class RemoteTaskService extends ChangeNotifier {
   /// 只读快照，供设置页/调试查看（侧栏走 DownloadController 混排，不直接读这里）。
   Map<String, RemoteTask> get remoteTasks => Map.unmodifiable(_remoteTasks);
 
-  /// 执行端映射：本地 taskId → remoteTaskId（下发任务落地本机后建立）。
+  /// 执行端映射：本地 taskId → remoteTaskId（下发任务落地本机后建立）。重启/
+  /// 重登后此表在内存里是空的，靠 [_pendingRebind] + [_rebindPendingLocalTasks]
+  /// 从服务端全量快照回填，不引入任何本地持久化。
   final Map<String, String> _localToRemote = {};
 
-  /// 执行端待关联：下发任务 url → remoteTaskId（等本地引擎建出同 url 任务再绑定）。
-  final Map<String, String> _awaitingLocal = {};
+  /// 执行端待关联：下发任务 url → 待领取的 remoteTaskId 队列（FIFO）。
+  /// createTask 是 rinf 单向信号（fire-and-forget，见 _acceptDispatch 旁注：
+  /// 拿不到新任务 id），只能按 url 回找——同 url 可并发下发多条（重试失败
+  /// 任务、多设备各下发一次同 URL），故用队列而非单值，_onControllerChanged
+  /// 按本地任务出现顺序 FIFO 领取，避免后一次下发覆盖前一次的绑定。
+  final Map<String, List<String>> _awaitingLocal = {};
+
+  /// 执行端待重建绑定：本机为 toDevice 且非终态、但尚未匹配到本地任务的
+  /// remoteTaskId 集合。每次 [_pullAll] 全量拉取后重算，见 [_refreshPendingRebind]。
+  final Set<String> _pendingRebind = {};
+
+  /// 重建绑定尝试失败次数：rid → 已尝试次数，仅用于 [_kMaxRebindAttempts]
+  /// 放弃判断，随 [_pendingRebind] 增删同步维护。
+  final Map<String, int> _pendingRebindAttempts = {};
 
   /// 执行端已上报的最近状态：remoteTaskId → wire 状态（去重，仅转换才上报）。
   final Map<String, String> _lastStatus = {};
@@ -85,14 +107,28 @@ class RemoteTaskService extends ChangeNotifier {
       _authAttached = true;
       CloudAuthService.instance.addListener(_onAuthChanged);
     }
-    final ctrl = DownloadController.globalInstance;
-    if (ctrl != null && !_controllerAttached) {
-      _controllerAttached = true;
-      ctrl.addListener(_onControllerChanged);
-    }
+    _tryAttachController();
     if (CloudAuthService.instance.isLoggedIn) {
       await start();
     }
+  }
+
+  /// 补挂 DownloadController 监听，幂等（已挂过直接跳过）。home_page 只调用
+  /// 一次 [attach]，此时 ctrl 可能尚未就绪（providers 初始化顺序竞态）；
+  /// 不静默失败——记一条 WARN，并保证下次真正跑到这里（[start] 每次登录/
+  /// 重登都会先调用它）时能补挂上，不需要额外的重试定时器。
+  void _tryAttachController() {
+    if (_controllerAttached) return;
+    final ctrl = DownloadController.globalInstance;
+    if (ctrl == null) {
+      LogService.instance.log(
+        _tag,
+        'WARN: attach: DownloadController.globalInstance not ready yet, will retry on next start()',
+      );
+      return;
+    }
+    _controllerAttached = true;
+    ctrl.addListener(_onControllerChanged);
   }
 
   void _onAuthChanged() {
@@ -107,6 +143,7 @@ class RemoteTaskService extends ChangeNotifier {
 
   Future<void> start() async {
     if (_running || !CloudAuthService.instance.isLoggedIn) return;
+    _tryAttachController();
     _running = true;
     _stopped = false;
     _retryAttempt = 0;
@@ -129,6 +166,8 @@ class RemoteTaskService extends ChangeNotifier {
     _remoteTasks.clear();
     _localToRemote.clear();
     _awaitingLocal.clear();
+    _pendingRebind.clear();
+    _pendingRebindAttempts.clear();
     _lastStatus.clear();
     DownloadController.globalInstance?.updateRemoteTasks(const []);
     notifyListeners();
@@ -162,8 +201,26 @@ class RemoteTaskService extends ChangeNotifier {
     _remoteTasks
       ..clear()
       ..addEntries(list.map((r) => MapEntry(r.id, r)));
+    _acceptOfflineDispatches();
+    _refreshPendingRebind();
     _pushToController();
     notifyListeners();
+  }
+
+  /// 离线/断连期间收到的下发：SSE 未连接时 task.dispatch 事件根本不会
+  /// 触发 [_acceptDispatch]（那只在 [_onEvent] 里响应实时事件），全量
+  /// 快照里就会遗留 status==pending 且 toDevice==本机的记录——放任不管，
+  /// 这类任务既不会被执行（没有事件重放），又会被 [_pushToController]
+  /// 的“本机目标”过滤规则挡在展示层之外，用户完全看不到、也等不到它
+  /// 开始下载。这里补一次接受，让离线期间的下发重连后自动开始，与设备
+  /// 一直在线时语义一致；[_acceptDispatch] 内部的幂等保证同时覆盖这里
+  /// 和 SSE 实时路径，不会重复接受同一条下发。
+  void _acceptOfflineDispatches() {
+    for (final r in _remoteTasks.values) {
+      if (r.toDevice == _deviceId && r.status == RemoteTaskStatus.pending) {
+        _acceptDispatch(r);
+      }
+    }
   }
 
   // ── SSE 事件流（仿 ConfigSyncService._connectSse）─────────────────────
@@ -321,7 +378,17 @@ class RemoteTaskService extends ChangeNotifier {
   }
 
   void _pushToController() {
-    final list = _remoteTasks.values.map(_asDownloadTask).toList();
+    // 只把目标为"其他设备"的远程任务交给展示层：toDevice==本机的下发任务
+    // 在 _acceptDispatch 后已经落地成一条真实本地任务（ctrl.localTasks 里
+    // 有）——SSE 实时路径和 _pullAll 里对离线期间下发的补接（见
+    // _acceptOfflineDispatches）都会先走 _acceptDispatch 再到这里，这个
+    // 前提对两条路径同时成立，不会有"目标本机但既未接受也不可见"的记录。
+    // _remoteTasks 全量保留（上报逻辑需要），这里过滤避免执行端"全部任务"
+    // 视图里同一条下发任务显示两份（真实本地任务 + 远程镜像）。
+    final list = _remoteTasks.values
+        .where((r) => r.toDevice != _deviceId)
+        .map(_asDownloadTask)
+        .toList();
     DownloadController.globalInstance?.updateRemoteTasks(list);
   }
 
@@ -334,16 +401,45 @@ class RemoteTaskService extends ChangeNotifier {
 
   // ── 接收端：把下发任务落到本地引擎执行 ───────────────────────────────
 
+  /// 幂等：同一 rid 只会被真正接受一次（[_isAlreadyAccepted] 挡重复调用）。
+  /// 调用方有两处——[_onEvent] 的 task.dispatch 分支（设备在线时的实时
+  /// 路径）和 [_acceptOfflineDispatches]（重连补发离线期间的下发）——
+  /// 网络抖动可能让同一条 rid 被触发多次（比如上一次 accepted 状态上报
+  /// 还没落到服务端、又发生一次重连），不加这道防线会对同一条下发重复
+  /// createTask，在本机长出两个真实任务。
   void _acceptDispatch(RemoteTask r) {
+    if (_isAlreadyAccepted(r.id)) return;
     final ctrl = DownloadController.globalInstance;
     if (ctrl == null) return;
-    final saveDir = (r.saveDir != null && r.saveDir!.isNotEmpty)
-        ? r.saveDir!
-        : (SettingsProvider.globalInstance?.effectiveDefaultSaveDir ?? '');
-    ctrl.createTask(url: r.url, saveDir: saveDir, fileName: r.fileName);
-    _awaitingLocal[r.url] = r.id;
+    ctrl.createTask(
+      url: r.url,
+      saveDir: _effectiveSaveDir(r),
+      fileName: r.fileName,
+    );
+    // createTask 是 rinf 单向信号（fire-and-forget），Dart 侧拿不到新任务的
+    // 同步 id（调查过 download_controller.dart：签名是 void，id 由 Rust 异步
+    // 生成后才经 AllTasks 信号回流），只能追加进 url 对应的待关联队列，靠
+    // _onControllerChanged 按本地任务出现顺序 FIFO 领取——同 url 并发下发
+    // 多条时不会互相覆盖绑定。
+    _awaitingLocal.putIfAbsent(r.url, () => []).add(r.id);
     unawaited(_safeReportStatus(r.id, 'accepted'));
   }
+
+  /// [rid] 是否已经在本次运行时里被接受过（进了待关联队列或已绑定），供
+  /// [_acceptDispatch] 判断是否需要跳过——纯内存态，重启后自然清零，与
+  /// 类头注释里“不引入本地持久化”的设计一致。
+  bool _isAlreadyAccepted(String rid) =>
+      _localToRemote.containsValue(rid) ||
+      _awaitingLocal.values.any((queue) => queue.contains(rid));
+
+  /// 下发任务的落地保存目录：远程指定则用远程值，否则退回本机默认目录。
+  /// [_rebindPendingLocalTasks] 回找匹配时要用同一套推导，否则重启后重建
+  /// 绑定的 saveDir 比对会失真（本地任务落地时实际写的是这个值，不是原始
+  /// r.saveDir）。
+  String _effectiveSaveDir(RemoteTask r) =>
+      (r.saveDir != null && r.saveDir!.isNotEmpty)
+          ? r.saveDir!
+          : (SettingsProvider.globalInstance?.effectiveDefaultSaveDir ?? '');
 
   void _applyCommand(Map<String, dynamic> json) {
     final rid = json['taskId'] as String? ?? json['id'] as String?;
@@ -371,17 +467,124 @@ class RemoteTaskService extends ChangeNotifier {
   // ── 执行端：关联本地任务 + 1s 批量上报进度/状态 ──────────────────────
 
   void _onControllerChanged() {
-    if (_awaitingLocal.isEmpty) return;
+    if (_awaitingLocal.isEmpty && _pendingRebind.isEmpty) return;
     final ctrl = DownloadController.globalInstance;
     if (ctrl == null) return;
-    for (final t in ctrl.localTasks) {
-      if (_localToRemote.containsKey(t.id)) continue;
-      final rid = _awaitingLocal[t.url];
-      if (rid != null) {
+    // 先领取本次会话内刚下发、待和本地新任务配对的队列（FIFO，见
+    // _awaitingLocal 字段注释）；同 url 多条时按本地任务出现顺序依次认领，
+    // 不会互相覆盖绑定。
+    if (_awaitingLocal.isNotEmpty) {
+      for (final t in ctrl.localTasks) {
+        if (_localToRemote.containsKey(t.id)) continue;
+        final queue = _awaitingLocal[t.url];
+        if (queue == null || queue.isEmpty) continue;
+        final rid = queue.removeAt(0);
         _localToRemote[t.id] = rid;
-        _awaitingLocal.remove(t.url);
+        if (queue.isEmpty) _awaitingLocal.remove(t.url);
       }
     }
+    // 再尝试消化重启/重登后遗留的待重建绑定（见 _refreshPendingRebind）。
+    if (_pendingRebind.isNotEmpty) _rebindPendingLocalTasks();
+  }
+
+  /// 计算「本机待重建绑定」集合：toDevice==本机、已被接受但尚未绑定的远程
+  /// 任务（accepted/downloading/paused，即非终态里排除 pending）。pending
+  /// 特意排除——它意味着"还没被接受"，本机根本没有对应的本地任务，重新
+  /// 接受是 [_acceptOfflineDispatches]/[_onEvent] 的 task.dispatch 分支的
+  /// 职责，不是这里；混进来会和 _awaitingLocal 抢同一个 rid，制造重复
+  /// 绑定。
+  /// [_localToRemote]/[_awaitingLocal] 都是纯内存态，重启/重登后为空——不
+  /// 引入持久化存储，靠每次全量拉取后用"服务端快照 + 本地任务表回找"重建，
+  /// 已绑定的排除在外，不会打扰仍然有效的既有绑定（覆盖初次启动与断线
+  /// 重连两种场景，见 [_pullAll]）。
+  void _refreshPendingRebind() {
+    final bound = _localToRemote.values.toSet();
+    _pendingRebind
+      ..clear()
+      ..addAll(
+        _remoteTasks.values
+            .where(
+              (r) =>
+                  r.toDevice == _deviceId &&
+                  r.status != RemoteTaskStatus.pending &&
+                  !r.status.isTerminal &&
+                  !bound.contains(r.id),
+            )
+            .map((r) => r.id),
+      );
+    // 与 _pendingRebind 同步剪掉不再待重建的 rid 的尝试计数（已绑定/已
+    // 终态/服务端已不再返回），避免这张计数表跟着历史 rid 无限增长。
+    _pendingRebindAttempts.removeWhere(
+      (rid, _) => !_pendingRebind.contains(rid),
+    );
+    if (_pendingRebind.isNotEmpty) _rebindPendingLocalTasks();
+  }
+
+  /// 用服务端全量记录回找本地任务表重建 [_localToRemote]：按 url 匹配，
+  /// 同 url 有多个候选时叠加 fileName/saveDir 精确匹配收窄；一个本地任务
+  /// 只绑定一次（已被占用的候选排除，避免多条同 url 远程任务抢同一条本地
+  /// 任务）。候选必须至少命中 fileName 或 saveDir 其中一项（score>=1）才
+  /// 会被采用——score==0 只代表 url 相同，常见于用户自己新建了一条同链接
+  /// /资源包的本地下载，与下发完全无关；误绑会双向出事：[_applyCommand]
+  /// 把发起端的暂停/取消打到用户自己的任务上，[_reportTick] 把用户自己
+  /// 任务的进度当成远程任务上报。都不命中就宁可不绑（退化为"丢绑定"，
+  /// 比误绑安全）。ctrl.localTasks 此刻可能还没加载完（引擎任务表尚未从
+  /// Rust 拉回），匹配不到的 rid 留在 [_pendingRebind] 里，等
+  /// [_onControllerChanged] 下次触发（本地任务表变化）再试；每次落空计入
+  /// [_pendingRebindAttempts]，达到 [_kMaxRebindAttempts] 后放弃（同样退化
+  /// 为丢绑定），避免真正匹配不到本地任务的 rid（比如用户手动删了落地
+  /// 任务）永远占着 [_pendingRebind]，让每次 notifyListeners 都白付一遍
+  /// O(pendingRebind × localTasks) 扫描。
+  void _rebindPendingLocalTasks() {
+    if (_pendingRebind.isEmpty) return;
+    final ctrl = DownloadController.globalInstance;
+    if (ctrl == null || ctrl.localTasks.isEmpty) return;
+    final claimed = _localToRemote.keys.toSet();
+    final resolved = <String>[];
+    final gaveUp = <String>[];
+    for (final rid in _pendingRebind) {
+      final r = _remoteTasks[rid];
+      if (r == null) {
+        // 快照里已经没有这条记录，没有数据可比对，直接放弃。
+        gaveUp.add(rid);
+        continue;
+      }
+      final saveDir = _effectiveSaveDir(r);
+      DownloadTask? best;
+      // 起点设为 0（而非 -1）：score==0 的候选严格不会替换 best，见上方
+      // 类注释里的最低分阀值说明。
+      var bestScore = 0;
+      for (final t in ctrl.localTasks) {
+        if (claimed.contains(t.id) || t.url != r.url) continue;
+        final score =
+            (t.fileName == r.fileName ? 1 : 0) + (t.saveDir == saveDir ? 1 : 0);
+        if (score > bestScore) {
+          best = t;
+          bestScore = score;
+        }
+      }
+      if (best != null) {
+        _localToRemote[best.id] = rid;
+        claimed.add(best.id);
+        resolved.add(rid);
+        continue;
+      }
+      final attempts = (_pendingRebindAttempts[rid] ?? 0) + 1;
+      if (attempts >= _kMaxRebindAttempts) {
+        gaveUp.add(rid);
+      } else {
+        _pendingRebindAttempts[rid] = attempts;
+      }
+    }
+    for (final rid in resolved) {
+      _pendingRebindAttempts.remove(rid);
+    }
+    for (final rid in gaveUp) {
+      _pendingRebindAttempts.remove(rid);
+    }
+    _pendingRebind
+      ..removeAll(resolved)
+      ..removeAll(gaveUp);
   }
 
   void _reportTick() {
@@ -475,7 +678,8 @@ class RemoteTaskService extends ChangeNotifier {
     RemoteTaskStatus.paused => TaskStatus.paused,
     RemoteTaskStatus.completed => TaskStatus.completed,
     RemoteTaskStatus.failed => TaskStatus.error,
-    RemoteTaskStatus.canceled => TaskStatus.error,
+    // 对端设备主动取消：直接映射到 TaskStatus.canceled，与失败区分开来。
+    RemoteTaskStatus.canceled => TaskStatus.canceled,
     _ => TaskStatus.pending,
   };
 

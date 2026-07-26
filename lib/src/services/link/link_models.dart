@@ -100,3 +100,26 @@ class PairingChallenge {
     peerFingerprint: event.fingerprint,
   );
 }
+
+/// 入站配对请求（本机作为被添加方）：对端已通过一次性码发起 hello，等待本机
+/// 用户核对 [sas] 与对端屏幕上显示的一致后批准。由 `LinkEvent{kind:"incomingPairing"}` 派生。
+class IncomingPairing {
+  final String sessionId;
+  final String sas;
+  final String peerName;
+  final String peerPlatform;
+
+  const IncomingPairing({
+    required this.sessionId,
+    required this.sas,
+    required this.peerName,
+    required this.peerPlatform,
+  });
+
+  factory IncomingPairing.fromEvent(LinkEvent event) => IncomingPairing(
+    sessionId: event.sessionId,
+    sas: event.sas,
+    peerName: event.name,
+    peerPlatform: event.platform,
+  );
+}

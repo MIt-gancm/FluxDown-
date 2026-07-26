@@ -5,7 +5,9 @@
 //   本弹窗仅作场景化入口 + 名册一览，不重建设置页的设备管理。
 // - 本地配对：不登录账号，在同一局域网内直接配对（mDNS 发现 + 一次性配对码 +
 //   SAS 核对），走 Rust 端 LinkManager；当前仅「网络可达直连」，未来可插拔
-//   iroh/中继打洞（见 services/link/link_transport.dart）。
+//   iroh/中继打洞（见 Rust 侧 native/engine/src/link/transport.rs）。
+
+import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
@@ -322,7 +324,7 @@ class _CloudDeviceRow extends StatelessWidget {
 // 本地配对 Tab
 // ─────────────────────────────────────────────────────────────────────────
 
-class _LocalTab extends StatelessWidget {
+class _LocalTab extends StatefulWidget {
   final TextEditingController codeCtrl;
   final TextEditingController hostCtrl;
   final TextEditingController portCtrl;
@@ -337,12 +339,50 @@ class _LocalTab extends StatelessWidget {
     required this.onToggleManual,
   });
 
+  @override
+  State<_LocalTab> createState() => _LocalTabState();
+}
+
+/// 「未发现设备」文案曾是永远渲染不到的死分支——`discovering` 在停留本
+/// Tab 期间恒为 true。改为本地 8 秒计时：超时且仍无设备才展示该文案 +
+/// 「重新搜索」按钮；发现到设备则计时作废。
+class _LocalTabState extends State<_LocalTab> {
+  static const _searchTimeout = Duration(seconds: 8);
+
+  Timer? _searchTimeoutTimer;
+  bool _searchTimedOut = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _armSearchTimeout();
+  }
+
+  @override
+  void dispose() {
+    _searchTimeoutTimer?.cancel();
+    super.dispose();
+  }
+
+  void _armSearchTimeout() {
+    _searchTimeoutTimer?.cancel();
+    _searchTimedOut = false;
+    _searchTimeoutTimer = Timer(_searchTimeout, () {
+      if (mounted) setState(() => _searchTimedOut = true);
+    });
+  }
+
+  void _retryScan() {
+    LocalPairingService.instance.startDiscovery();
+    setState(() => _armSearchTimeout());
+  }
+
   void _connect(BuildContext context, String host, int port) {
     final s = LocaleScope.of(context);
-    final code = codeCtrl.text.trim();
+    final code = widget.codeCtrl.text.trim();
     if (code.length < 6) {
       FluxSonner.of(context).show(ShadToast.destructive(
-        title: Text(s.localPairingCodeHint),
+        title: Text(s.localPairingCodeIncomplete),
       ));
       return;
     }
@@ -363,6 +403,11 @@ class _LocalTab extends StatelessWidget {
           return _SasView(challenge: challenge);
         }
         final peers = svc.discoveredPeers;
+        // 已发现设备：计时作废，避免稍后触发一次多余的 setState。
+        if (peers.isNotEmpty) {
+          _searchTimeoutTimer?.cancel();
+          _searchTimeoutTimer = null;
+        }
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           mainAxisSize: MainAxisSize.min,
@@ -393,12 +438,26 @@ class _LocalTab extends StatelessWidget {
                   ? Padding(
                       padding: const EdgeInsets.symmetric(vertical: 22),
                       child: Center(
-                        child: Text(
-                          svc.discovering
-                              ? s.localPairingDiscovering
-                              : s.localPairingNoDevices,
-                          style: TextStyle(fontSize: 12, color: c.textMuted),
-                        ),
+                        child: _searchTimedOut
+                            ? Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    s.localPairingNoDevices,
+                                    style: TextStyle(fontSize: 12, color: c.textMuted),
+                                  ),
+                                  const SizedBox(height: 8),
+                                  ShadButton.outline(
+                                    size: ShadButtonSize.sm,
+                                    onPressed: _retryScan,
+                                    child: Text(s.localPairingRetryScan),
+                                  ),
+                                ],
+                              )
+                            : Text(
+                                s.localPairingDiscovering,
+                                style: TextStyle(fontSize: 12, color: c.textMuted),
+                              ),
                       ),
                     )
                   : SingleChildScrollView(
@@ -432,7 +491,7 @@ class _LocalTab extends StatelessWidget {
             ),
             const SizedBox(height: 6),
             ShadInput(
-              controller: codeCtrl,
+              controller: widget.codeCtrl,
               placeholder: Text(s.localPairingCodePlaceholder),
               keyboardType: TextInputType.number,
               maxLength: 6,
@@ -446,11 +505,11 @@ class _LocalTab extends StatelessWidget {
             // 高级：手动输入地址。
             GestureDetector(
               behavior: HitTestBehavior.opaque,
-              onTap: onToggleManual,
+              onTap: widget.onToggleManual,
               child: Row(
                 children: [
                   Icon(
-                    manual ? LucideIcons.chevronDown : LucideIcons.chevronRight,
+                    widget.manual ? LucideIcons.chevronDown : LucideIcons.chevronRight,
                     size: 14,
                     color: c.accent,
                   ),
@@ -462,21 +521,21 @@ class _LocalTab extends StatelessWidget {
                 ],
               ),
             ),
-            if (manual) ...[
+            if (widget.manual) ...[
               const SizedBox(height: 8),
               Row(
                 children: [
                   Expanded(
                     flex: 3,
                     child: ShadInput(
-                      controller: hostCtrl,
+                      controller: widget.hostCtrl,
                       placeholder: const Text('192.168.1.5'),
                     ),
                   ),
                   const SizedBox(width: 8),
                   Expanded(
                     child: ShadInput(
-                      controller: portCtrl,
+                      controller: widget.portCtrl,
                       placeholder: const Text('17800'),
                       keyboardType: TextInputType.number,
                     ),
@@ -489,9 +548,20 @@ class _LocalTab extends StatelessWidget {
                 child: ShadButton(
                   size: ShadButtonSize.sm,
                   onPressed: () {
-                    final host = hostCtrl.text.trim();
-                    final port = int.tryParse(portCtrl.text.trim()) ?? 17800;
-                    if (host.isEmpty) return;
+                    final host = widget.hostCtrl.text.trim();
+                    if (host.isEmpty) {
+                      FluxSonner.of(context).show(ShadToast.destructive(
+                        title: Text(s.localPairingHostRequired),
+                      ));
+                      return;
+                    }
+                    final port = int.tryParse(widget.portCtrl.text.trim());
+                    if (port == null || port < 1 || port > 65535) {
+                      FluxSonner.of(context).show(ShadToast.destructive(
+                        title: Text(s.localPairingPortInvalid),
+                      ));
+                      return;
+                    }
                     _connect(context, host, port);
                   },
                   child: Text(s.localPairingConnect),
@@ -558,16 +628,61 @@ class _PeerRow extends StatelessWidget {
 }
 
 /// SAS 核对视图：双端应显示相同数字，用户核对一致后确认。
-class _SasView extends StatelessWidget {
+class _SasView extends StatefulWidget {
   final PairingChallenge challenge;
   const _SasView({required this.challenge});
+
+  @override
+  State<_SasView> createState() => _SasViewState();
+}
+
+class _SasViewState extends State<_SasView> {
+  /// 是否已点「确认配对」、正在等待对端用户人工核验（后端最长等待
+  /// 60s）。此前点击后立即弹「已配对」toast 是乐观得离谱——本机点确认只是
+  /// 「我方核对通过」，配对是否真的成立要等对端也核验通过，网络失败/对端
+  /// 拒绝/超时都可能发生；真正是否成功只能等 pendingChallenge 转空后看
+  /// lastError 是否为空来判断。
+  bool _waitingPeer = false;
+
+  @override
+  void initState() {
+    super.initState();
+    LocalPairingService.instance.addListener(_onServiceChanged);
+  }
+
+  @override
+  void dispose() {
+    LocalPairingService.instance.removeListener(_onServiceChanged);
+    super.dispose();
+  }
+
+  /// 挑战态清空代表本轮配对流程终结——成功/失败殊途同归都会清空
+  /// pendingChallenge，仅在等待态且无错误时才是真正配对成功，才弹 toast。
+  void _onServiceChanged() {
+    if (!mounted || !_waitingPeer) return;
+    final svc = LocalPairingService.instance;
+    if (svc.pendingChallenge != null) return;
+    _waitingPeer = false;
+    if (svc.lastError == null) {
+      FluxSonner.of(context).show(ShadToast(
+        title: Text(LocaleScope.of(context).localPairingPaired(widget.challenge.peerName)),
+      ));
+    }
+  }
+
+  void _confirm() {
+    setState(() => _waitingPeer = true);
+    LocalPairingService.instance.confirmPairing(true);
+  }
+
+  void _reject() => LocalPairingService.instance.confirmPairing(false);
 
   @override
   Widget build(BuildContext context) {
     final s = LocaleScope.of(context);
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
-    final spaced = challenge.sas.split('').join('  ');
+    final spaced = widget.challenge.sas.split('').join('  ');
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       mainAxisSize: MainAxisSize.min,
@@ -578,7 +693,7 @@ class _SasView extends StatelessWidget {
         ),
         const SizedBox(height: 4),
         Text(
-          challenge.peerName,
+          widget.challenge.peerName,
           style: TextStyle(fontSize: 12, color: c.textMuted),
         ),
         const SizedBox(height: 14),
@@ -605,25 +720,36 @@ class _SasView extends StatelessWidget {
           s.localPairingSasHint,
           style: TextStyle(fontSize: 11.5, height: 1.5, color: c.textMuted),
         ),
+        if (_waitingPeer) ...[
+          const SizedBox(height: 8),
+          Text(
+            s.localPairingWaitingPeer,
+            style: TextStyle(fontSize: 11.5, color: c.statusWarning),
+          ),
+        ],
         const SizedBox(height: 14),
         Row(
           children: [
             Expanded(
               child: ShadButton.outline(
-                onPressed: () => LocalPairingService.instance.confirmPairing(false),
-                child: Text(s.cancel),
+                onPressed: _waitingPeer ? null : _reject,
+                child: Text(s.localPairingReject),
               ),
             ),
             const SizedBox(width: 10),
             Expanded(
               child: ShadButton(
-                onPressed: () {
-                  LocalPairingService.instance.confirmPairing(true);
-                  FluxSonner.of(context).show(ShadToast(
-                    title: Text(s.localPairingPaired(challenge.peerName)),
-                  ));
-                },
-                child: Text(s.localPairingConfirm),
+                onPressed: _waitingPeer ? null : _confirm,
+                child: _waitingPeer
+                    ? const SizedBox(
+                        width: 14,
+                        height: 14,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: Color(0xFFFFFFFF),
+                        ),
+                      )
+                    : Text(s.localPairingConfirm),
               ),
             ),
           ],

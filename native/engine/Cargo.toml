@@ -15,6 +15,7 @@ async-trait = "0.1.87"
 base64 = "0.22"
 bytes = "1"
 cbc = "0.1"
+chacha20poly1305 = { version = "0.10", optional = true }
 chrono = { version = "0.4.43", default-features = false, features = ["clock", "std"] }
 dash-mpd = { version = "0.19", default-features = false }
 ed25519-dalek = { version = "3.0.0", optional = true }
@@ -73,4 +74,4 @@ components = ["dep:zip"]
 # 本地设备互联（P2P 局域网配对 + mDNS 发现 + 直连传输）。desktop hub 与 headless
 # server 开启；mobile（Android/iOS）关闭——mDNS 在移动端需原生 NsdManager/Bonjour
 # 权限，且本地配对定位为桌面/NAS 场景。关闭时下载主链路零变化（link 模块整体 cfg 门控）。
-link = ["dep:mdns-sd", "dep:ed25519-dalek", "dep:x25519-dalek", "dep:hkdf", "dep:hmac"]
+link = ["dep:mdns-sd", "dep:ed25519-dalek", "dep:x25519-dalek", "dep:hkdf", "dep:hmac", "dep:chacha20poly1305"]

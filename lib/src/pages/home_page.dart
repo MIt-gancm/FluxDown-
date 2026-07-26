@@ -34,6 +34,7 @@ import '../widgets/detail_panel.dart';
 import '../widgets/group_detail_panel.dart';
 import '../widgets/status_bar.dart';
 import '../widgets/new_download_dialog.dart';
+import '../widgets/incoming_pairing_dialog.dart';
 import '../widgets/task_list_item.dart';
 import '../widgets/title_drag_area.dart';
 import 'settings_page.dart';
@@ -90,6 +91,9 @@ class _HomePageState extends State<HomePage> {
   // 主内容区最小宽度，保证 HeaderBar 不溢出
   static const double _mainMinWidth = 400;
 
+  /// 本地设备互联：入站配对核验弹窗是否正在显示，避免同一会话重复弹出。
+  bool _incomingPairingDialogOpen = false;
+
   @override
   void initState() {
     super.initState();
@@ -134,7 +138,13 @@ class _HomePageState extends State<HomePage> {
     // FluxCloud CDN 众包遥测上报：常开，登录即上报一次 + 30min 周期，失败静默保留。
     unawaited(CdnReportService.instance.attach());
     // 本地设备互联（局域网配对，免账号）：与账号体系无关，启动即接线监听。
-    unawaited(LocalPairingService.instance.attach());
+    // 移动端不支持局域网直连（native/hub/build.rs 在 android/ios 上不编译
+    // hub_link，LocalPairingService.supported 恒为 false），显式跳过更
+    // 清晰——虽然 attach() 内部对 supported==false 也会 early return。
+    if (LocalPairingService.instance.supported) {
+      unawaited(LocalPairingService.instance.attach());
+      LocalPairingService.instance.addListener(_onLocalPairingChanged);
+    }
     // 首次启动 .torrent 文件关联提示（仅 Windows）
     if (Platform.isWindows) {
       _settingsProvider.addListener(_onSettingsLoadedForAssocPrompt);
@@ -173,6 +183,23 @@ class _HomePageState extends State<HomePage> {
         duration: const Duration(seconds: 3),
       ),
     );
+  }
+
+  /// 本机作为被添加方收到配对请求（`incomingPairing` 非空）时弹出核验框
+  /// （SAS + 60s 倒计时 + 接受/拒绝，见 incoming_pairing_dialog.dart）；
+  /// 弹窗自身监听同一服务、会话失效时自动关闭，这里只负责按需打开且防重入。
+  void _onLocalPairingChanged() {
+    if (!mounted || _incomingPairingDialogOpen) return;
+    if (LocalPairingService.instance.incomingPairing == null) return;
+    _incomingPairingDialogOpen = true;
+    showIncomingPairingDialog(context).then((_) {
+      _incomingPairingDialogOpen = false;
+      // 弹窗展示期间到达的新入站请求会覆盖服务层的 incomingPairing，但
+      // notifyListeners 早于本 .then 回调触发时被上面的重入门拦掉，弹窗
+      // 关闭后再无人触发新弹窗——并发第二个入站配对会被静默吞掉（两台设备
+      // 都失败且无提示）。这里补一次主动检查，把期间积压的新会话接上。
+      _onLocalPairingChanged();
+    });
   }
 
   /// 同步失败态弹 toast；同一条错误文案去重，避免退避重试期间反复弹出。
@@ -218,6 +245,7 @@ class _HomePageState extends State<HomePage> {
     _settingsProvider.removeListener(_onSettingsLoadedForAssocPrompt);
     ConfigSyncService.instance.removeListener(_onConfigSyncChanged);
     ConfigSyncService.instance.onRemoteApplied = null;
+    LocalPairingService.instance.removeListener(_onLocalPairingChanged);
     _pluginProvider.removeListener(_onPluginProviderChanged);
     _pluginProvider.dispose();
     _controller.removeListener(_onControllerChanged);
@@ -575,7 +603,8 @@ class _HomePageState extends State<HomePage> {
       case TaskStatus.error:
         _controller.resumeTask(id);
       case TaskStatus.completed:
-        break;
+      case TaskStatus.canceled:
+        break; // 两者均为终态，不响应暂停/继续
     }
   }
 

@@ -9,6 +9,8 @@
 ///   （主窗口直接发信号，小窗经原生通道中继回主引擎）。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart'
     show
         AdaptiveTextSelectionToolbar,
@@ -31,6 +33,7 @@ import '../i18n/locale_provider.dart';
 import '../models/download_queue.dart';
 import '../models/ua_presets.dart';
 import '../services/file_picker_service.dart';
+import '../services/link/local_pairing_service.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'context_menu.dart';
@@ -196,7 +199,9 @@ class QuickDownloadFormResult {
   /// 「稍后下载」提交 — 建任务但不启动（透传为 startPaused）。
   final bool startLater;
 
-  /// 目标设备 ID（'' = 本机哨兵值，非空 = 远程设备，走云下发）。
+  /// 目标设备 ID（'' = 本机哨兵值；非空时可能是云账户设备 ID 或本地配对
+  /// 设备指纹——两者共用同一字段，落地时由 [submitQuickDownload] 按指纹
+  /// 是否命中 [LocalPairingService] 名册分流，表单侧不关心差异）。
   final String targetDeviceId;
 
   const QuickDownloadFormResult({
@@ -280,6 +285,16 @@ class QuickDownloadForm extends StatefulWidget {
   /// 可选外部控制器（独立小窗 append 模式用；主窗口对话框不传）。
   final QuickDownloadFormController? controller;
 
+  /// 本地配对设备名册（局域网直连，免账号）。
+  ///
+  /// null = 主窗口宿主：表单内部直读 [LocalPairingService] 单例（已
+  /// attach，名册随 Rust 信号实时更新）；非 null = 独立小窗宿主：小窗
+  /// isolate 不接线 rinf 信号，[LocalPairingService.instance.localDevices]
+  /// 恒为空，名册须由主引擎在创建小窗时序列化进载荷随环境数据一起下发
+  /// （见 popup_payload.dart/popup_window_service.dart），此参数就是该
+  /// 载荷侧的注入口——两种宿主之后共用同一套渲染/选中逻辑。
+  final List<QuickDeviceOption>? localDevices;
+
   /// 清单预解析等待态：动作区换为「取消 + spinner 禁用主按钮」，表单主体
   /// 保持可见但不可重复提交。由外壳驱动（表单自身不发信号、不做探测）。
   final bool resolving;
@@ -299,6 +314,7 @@ class QuickDownloadForm extends StatefulWidget {
     required this.onSubmit,
     required this.onCancel,
     this.controller,
+    this.localDevices,
     this.resolving = false,
     this.onCancelResolve,
   });
@@ -325,6 +341,7 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
 
   /// 选中的目标设备 ID（'' = 本机）
   String _selectedTargetDevice = '';
+
   String? selectedThreads;
   String _selectedUaPreset = 'default';
 
@@ -532,6 +549,24 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
     );
   }
 
+  /// 本地配对设备名册渲染源：popup 宿主经 [QuickDownloadForm.localDevices]
+  /// 参数注入（非 null 即生效，即使当前恰好是空列表）；主窗口宿主该参数
+  /// 恒为 null，直读 [LocalPairingService] 单例并投影成与载荷同构的
+  /// [QuickDeviceOption]——两种宿主之后走同一套渲染/选中代码。
+  List<QuickDeviceOption> get _localDeviceOptions {
+    final provided = widget.localDevices;
+    if (provided != null) return provided;
+    return [
+      for (final d in LocalPairingService.instance.localDevices)
+        QuickDeviceOption(
+          deviceId: d.fingerprint,
+          name: d.name,
+          platform: d.platform,
+          isOnline: d.online,
+        ),
+    ];
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
@@ -625,7 +660,9 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
             ),
           ),
           const SizedBox(height: 14),
-          if (widget.host.devices.isNotEmpty) ...[
+          if (widget.host.devices.isNotEmpty ||
+              (LocalPairingService.instance.supported &&
+                  _localDeviceOptions.isNotEmpty)) ...[
             QuickSectionLabel(text: s.downloadTo, c: c),
             const SizedBox(height: 6),
             ShadSelect<String>(
@@ -643,15 +680,31 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
                       maxLines: 1,
                     ),
                   ),
+                for (final d in _localDeviceOptions)
+                  ShadOption(
+                    value: d.deviceId,
+                    child: Text(
+                      d.isOnline
+                          ? '${d.name} (${s.deviceLocalTag})'
+                          : '${d.name} (${s.deviceLocalTag} · ${s.deviceOffline})',
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                    ),
+                  ),
               ],
               selectedOptionBuilder: (context, value) {
-                final name = value.isEmpty
-                    ? s.thisDevice
-                    : widget.host.devices
-                          .where((d) => d.deviceId == value)
-                          .firstOrNull
-                          ?.name ??
-                      value;
+                String name;
+                if (value.isEmpty) {
+                  name = s.thisDevice;
+                } else {
+                  final cloudDevice = widget.host.devices
+                      .where((d) => d.deviceId == value)
+                      .firstOrNull;
+                  final localDevice = _localDeviceOptions
+                      .where((d) => d.deviceId == value)
+                      .firstOrNull;
+                  name = cloudDevice?.name ?? localDevice?.name ?? value;
+                }
                 return Text(
                   name,
                   overflow: TextOverflow.ellipsis,

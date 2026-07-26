@@ -69,6 +69,22 @@ void main() {
               defaultSegments: 0,
             ),
           ],
+          devices: [
+            QuickDeviceOption(
+              deviceId: 'cloud-dev-1',
+              name: '云设备',
+              platform: 'windows',
+              isOnline: true,
+            ),
+          ],
+          localDevices: [
+            QuickDeviceOption(
+              deviceId: 'AA:BB:CC:DD',
+              name: '局域网设备',
+              platform: 'linux',
+              isOnline: false,
+            ),
+          ],
         );
 
         final decoded = QuickPopupPayload.fromJsonString(
@@ -110,6 +126,30 @@ void main() {
             reason: 'queues[$i].defaultSegments',
           );
         }
+
+        expect(decoded.devices.length, original.devices.length);
+        expect(decoded.devices.first.deviceId, original.devices.first.deviceId);
+        expect(decoded.devices.first.name, original.devices.first.name);
+        expect(decoded.devices.first.platform, original.devices.first.platform);
+        expect(decoded.devices.first.isOnline, original.devices.first.isOnline);
+
+        expect(decoded.localDevices.length, original.localDevices.length);
+        expect(
+          decoded.localDevices.first.deviceId,
+          original.localDevices.first.deviceId,
+        );
+        expect(
+          decoded.localDevices.first.name,
+          original.localDevices.first.name,
+        );
+        expect(
+          decoded.localDevices.first.platform,
+          original.localDevices.first.platform,
+        );
+        expect(
+          decoded.localDevices.first.isOnline,
+          original.localDevices.first.isOnline,
+        );
       },
     );
 

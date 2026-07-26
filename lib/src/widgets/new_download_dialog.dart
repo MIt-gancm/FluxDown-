@@ -35,6 +35,8 @@ import '../services/bt_file_selection_service.dart';
 import '../services/resolve_preview_client.dart';
 import '../services/cloud/cloud_auth_service.dart';
 import '../services/cloud/cloud_client.dart';
+import '../services/link/link_models.dart';
+import '../services/link/local_pairing_service.dart';
 
 import 'bt_file_selection_shared.dart' show formatBtFileSize;
 import 'bt_file_selection_view.dart';
@@ -99,9 +101,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   /// 选中的队列 ID（空字符串 = 默认队列）
   String _selectedQueueId = '';
 
-  /// 下载到（目标设备）：null/空 = 本机；非空 = 远程 deviceId。渐进披露 —
-  /// 仅当 CloudAuthService.instance.hasRemoteDevices 时才在 UI 呈现选择行，
-  /// 无远程设备时该字段恒为 null，本机下载路径零改动。
+  /// 下载到（目标设备）：null/空 = 本机；非空 = 远程 deviceId 或本地配对
+  /// 设备指纹。渐进披露 — 仅当存在远程设备或本地配对设备时才在 UI 呈现
+  /// 选择行，两者都没有时该字段恒为 null，本机下载路径零改动。
   String? _selectedDeviceId;
 
   /// 用户是否手动修改过线程数（用于判断切换队列时是否需要自动更新）
@@ -225,8 +227,25 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     _selectedQueueId = initialQueue;
     // "下载到"记忆上次选择的目标设备；空 = 本机（渐进披露：无远程设备时
     // 该值不会在 UI 中出现选择入口，_selectedDeviceId 也不影响提交路径）。
+    // 记忆值可能是云端 deviceId，也可能是局域网指纹（同一个偏好字段承载
+    // 两种命名空间），必须校验目标仍在其中一份名册里才能回填——否则典型
+    // 场景是用户解除了那台局域网设备的配对且未登录云账号：下方
+    // hasRemoteDevices/hasLocalDevices 都为 false，设备选择行整行不渲染，
+    // 但 _selectedDeviceId 仍指向一个失效指纹，提交时照样会走
+    // _dispatchEntriesToDevice 下发分支、本地名册查不到再回退云端下发，
+    // 变成每次新建下载都必然失败，且界面上没有入口能改回本机。找不到就
+    // 当作本机（null），不留死选择。
     final lastTargetDevice = widget.settingsProvider.lastTargetDevice;
-    _selectedDeviceId = lastTargetDevice.isEmpty ? null : lastTargetDevice;
+    final knownRemote = CloudAuthService.instance.remoteDevices.any(
+      (d) => d.deviceId == lastTargetDevice,
+    );
+    final knownLocal = LocalPairingService.instance.localDevices.any(
+      (d) => d.fingerprint == lastTargetDevice,
+    );
+    _selectedDeviceId =
+        (lastTargetDevice.isNotEmpty && (knownRemote || knownLocal))
+        ? lastTargetDevice
+        : null;
     // 优先沿用上次用户选择的线程数，其次根据队列/全局设置初始化
     final lastThreads = widget.settingsProvider.lastDialogThreads;
     selectedThreads = lastThreads.isNotEmpty
@@ -1097,16 +1116,24 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     if (mounted) Navigator.of(context).pop();
   }
 
-  /// 把解析出的下载条目下发给远程设备（走 FluxCloud dispatch API），不经
-  /// 本地引擎/rinf 信号。单条 URL 单次下发；多条批量逐条下发（契约 v1
-  /// §3.2：多 URL 批量场景允许逐条 dispatch）。成功后记忆本次目标设备
-  /// 并复用对话框既有 toast/关闭流程；失败展示 s.dispatchFailed 且保持
-  /// 对话框打开，方便用户重试或切回本机。
+  /// 把解析出的下载条目下发给远程设备。本地配对设备（局域网直连，免账号）
+  /// 走 [LocalPairingService.dispatchTask]；云账户设备走 FluxCloud dispatch
+  /// API（不经本地引擎/rinf 信号）。单条 URL 单次下发；多条批量逐条下发
+  /// （契约 v1 §3.2：多 URL 批量场景允许逐条 dispatch），任一条失败即中止
+  /// 并展示 s.dispatchFailed。成功后记忆本次目标设备并复用对话框既有
+  /// toast/关闭流程；失败保持对话框打开，方便用户重试或切回本机。
   Future<void> _dispatchEntriesToDevice(
     String deviceId,
     List<_ParsedEntry> entries,
     String saveDir,
   ) async {
+    final localDevice = LocalPairingService.instance.localDevices
+        .where((d) => d.fingerprint == deviceId)
+        .firstOrNull;
+    if (localDevice != null) {
+      await _dispatchEntriesToLocalDevice(localDevice, entries, saveDir);
+      return;
+    }
     final rename = _renameController.text.trim();
     try {
       for (final entry in entries) {
@@ -1131,6 +1158,43 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       FluxSonner.of(
         context,
       ).show(ShadToast(title: Text(currentS.dispatchedToDevice(deviceName))));
+      Navigator.of(context).pop();
+    } catch (_) {
+      if (!mounted) return;
+      FluxSonner.of(
+        context,
+      ).show(ShadToast.destructive(title: Text(currentS.dispatchFailed)));
+    }
+  }
+
+  /// 把解析出的下载条目下发给本地配对设备（局域网直连，走 Rust 端
+  /// LinkManager，不经云 API）。[LocalPairingService.dispatchTask] 内部按
+  /// fingerprint 归属结果、直接返回 Future，这里直接 await，复用与云端
+  /// 分支相同的 toast/关闭流程，UI 行为对用户零差异。
+  Future<void> _dispatchEntriesToLocalDevice(
+    LocalDevice device,
+    List<_ParsedEntry> entries,
+    String saveDir,
+  ) async {
+    final rename = _renameController.text.trim();
+    final svc = LocalPairingService.instance;
+    try {
+      for (final entry in entries) {
+        final fileName = entries.length == 1 && rename.isNotEmpty
+            ? rename
+            : entry.fileName;
+        await svc.dispatchTask(
+          fingerprint: device.fingerprint,
+          url: entry.url,
+          saveDir: saveDir,
+          fileName: fileName,
+        );
+      }
+      widget.settingsProvider.setLastTargetDevice(device.fingerprint);
+      if (!mounted) return;
+      FluxSonner.of(
+        context,
+      ).show(ShadToast(title: Text(currentS.dispatchedToDevice(device.name))));
       Navigator.of(context).pop();
     } catch (_) {
       if (!mounted) return;
@@ -1517,9 +1581,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                     ],
                   ),
                   const SizedBox(height: 8),
-                  // "下载到"目标设备 — 渐进披露：仅存在远程设备时才出现，
-                  // 无远程设备时界面零变化（契约 v1 §3.2/§6.2）。
-                  if (CloudAuthService.instance.hasRemoteDevices) ...[
+                  // "下载到"目标设备 — 渐进披露：存在云账户远程设备或已配对本地
+                  // 设备时才出现，都没有时界面零变化（契约 v1 §3.2/§6.2 语义扩展到本地）。
+                  if (CloudAuthService.instance.hasRemoteDevices ||
+                      (LocalPairingService.instance.supported &&
+                          LocalPairingService.instance.hasLocalDevices)) ...[
                     _SectionLabel(text: s.downloadTo, c: c),
                     const SizedBox(height: 6),
                     ShadSelect<String>(
@@ -1552,14 +1618,58 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                               ],
                             ),
                           ),
+                        for (final device
+                            in LocalPairingService.instance.localDevices)
+                          ShadOption(
+                            value: device.fingerprint,
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Text(
+                                  device.name,
+                                  style: device.online
+                                      ? null
+                                      : TextStyle(color: c.textMuted),
+                                ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  s.deviceLocalTag,
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    color: c.textMuted,
+                                  ),
+                                ),
+                                if (!device.online) ...[
+                                  const SizedBox(width: 6),
+                                  Text(
+                                    s.deviceOffline,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: c.textMuted,
+                                    ),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          ),
                       ],
                       selectedOptionBuilder: (context, value) {
                         if (value.isEmpty) return Text(s.thisDevice);
-                        final device = CloudAuthService.instance.remoteDevices
+                        final cloudDevice = CloudAuthService.instance.remoteDevices
                             .where((d) => d.deviceId == value)
                             .firstOrNull;
+                        if (cloudDevice != null) {
+                          return Text(
+                            cloudDevice.name,
+                            overflow: TextOverflow.ellipsis,
+                            maxLines: 1,
+                          );
+                        }
+                        final localDevice = LocalPairingService.instance.localDevices
+                            .where((d) => d.fingerprint == value)
+                            .firstOrNull;
                         return Text(
-                          device?.name ?? value,
+                          localDevice?.name ?? value,
                           overflow: TextOverflow.ellipsis,
                           maxLines: 1,
                         );

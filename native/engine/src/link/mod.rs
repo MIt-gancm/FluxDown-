@@ -22,7 +22,10 @@ pub mod types;
 
 pub use error::{LinkError, LinkResult};
 pub use identity::LinkIdentity;
-pub use manager::{BeginPairingResult, LinkEngineEvent, LinkManager, WireHello, WireHelloResponse};
+pub use manager::{
+    BeginPairingResult, LinkEngineEvent, LinkManager, PairConfirmOutcome, WireHello,
+    WireHelloResponse,
+};
 pub use pairing::{HelloRequest, HelloResponse, PairingInitiator, PairingResponder, SelfInfo};
 pub use store::LinkStore;
 pub use transport::{DirectTransport, PeerConn, Transport, TransportStack};

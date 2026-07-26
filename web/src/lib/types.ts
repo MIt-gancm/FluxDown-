@@ -224,6 +224,8 @@ export type WsServerMsg =
   | { type: 'pluginHookActivity'; taskId: string; pluginId: string; running: boolean }
   | { type: 'componentProgress'; component: string; downloadedBytes: number; totalBytes: number }
   | { type: 'componentResult'; component: string; ok: boolean; message: string }
+  | { type: 'linkIncomingPairing'; sessionId: string; sas: string; name: string; platform: string }
+  | { type: 'linkDevicesChanged' }
   | { type: 'pong' }
 
 export interface TaskProgressMsg {

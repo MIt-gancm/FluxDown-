@@ -73,6 +73,21 @@ export const resolveVariantRequestStore = new Store<{
   options: ResolveVariantOption[]
 } | null>(null)
 export const btRequestStore = new Store<{ taskId: string; files: BtFileEntry[] } | null>(null)
+/**
+ * 待本机用户核验的入站配对请求（本机作为**被添加方**）。由 WS `linkIncomingPairing`
+ * 驱动，对话框消费/超时后置 null（同 hlsRequestStore / btRequestStore 范式）。
+ *
+ * 发起方的 `POST /link/pair/confirm` 会阻塞等待本机决策，对端上限 60 秒——超时未决
+ * 对端收到 PairingTimeout，本机对话框自行关闭即可，无需回传。
+ */
+export const incomingPairingStore = new Store<{
+  sessionId: string
+  sas: string
+  name: string
+  platform: string
+  /** 到达时间戳，用于对话框倒计时（60s 决策窗口）。 */
+  at: number
+} | null>(null)
 /** 组件（ffmpeg）安装/下载进度，按 component 名索引。 */
 export const componentProgressStore = new Store<
   Record<string, { downloadedBytes: number; totalBytes: number }>
@@ -284,6 +299,22 @@ function dispatch(msg: WsServerMsg) {
       break
     case 'btSelectionRequest':
       btRequestStore.set({ taskId: msg.taskId, files: msg.files })
+      break
+    case 'linkIncomingPairing':
+      incomingPairingStore.set({
+        sessionId: msg.sessionId,
+        sas: msg.sas,
+        name: msg.name,
+        platform: msg.platform,
+        at: Date.now(),
+      })
+      break
+    case 'linkDevicesChanged':
+      // 名册落库晚于 approve 的 HTTP 响应：`approve_incoming` 只写本地决策就返回，
+      // 真正的 upsert 发生在被唤醒的 pair_confirm 任务里。所以不能在 approve 的
+      // onSuccess 里抢跑 refetch（那会读到还没有新设备的旧快照且永不自愈），
+      // 必须由引擎落库后广播的本消息驱动。
+      void queryClientRef?.invalidateQueries({ queryKey: ['link', 'devices'] })
       break
     case 'pluginsChanged':
       void queryClientRef?.invalidateQueries({ queryKey: ['plugins'] })

@@ -71,6 +71,7 @@ class S {
   String get statusError => _r('statusError');
   String get statusPreparing => _r('statusPreparing');
   String get statusResuming => _r('statusResuming');
+  String get statusCanceled => _r('statusCanceled');
   String get statusFileMissing => _r('statusFileMissing');
   String get pluginProcessing => _r('pluginProcessing');
 
@@ -78,6 +79,7 @@ class S {
   // 任务副标题
   // ─────────────────────────────────────────────
   String get subtitlePaused => _r('subtitlePaused');
+  String get subtitleCanceled => _r('subtitleCanceled');
   String get subtitleError => _r('subtitleError');
   String get subtitlePending => _r('subtitlePending');
   String get subtitlePreparing => _r('subtitlePreparing');
@@ -716,6 +718,7 @@ class S {
   String get addDeviceEntry => _r('addDeviceEntry');
   String get deviceOnline => _r('deviceOnline');
   String get deviceOffline => _r('deviceOffline');
+  String get deviceLocalTag => _r('deviceLocalTag');
   String get showSidebarDevice => _r('showSidebarDevice');
   String get showSidebarDeviceDesc => _r('showSidebarDeviceDesc');
   String get downloadTo => _r('downloadTo');
@@ -737,24 +740,40 @@ class S {
   String get localPairingHint => _r('localPairingHint');
   String get localPairingDiscovering => _r('localPairingDiscovering');
   String get localPairingNoDevices => _r('localPairingNoDevices');
+  String get localPairingRetryScan => _r('localPairingRetryScan');
   String get localPairingCodeLabel => _r('localPairingCodeLabel');
   String get localPairingCodePlaceholder => _r('localPairingCodePlaceholder');
   String get localPairingCodeHint => _r('localPairingCodeHint');
+  String get localPairingCodeIncomplete =>
+      _r('localPairingCodeIncomplete');
   String get localPairingConnect => _r('localPairingConnect');
   String get localPairingManualAddress => _r('localPairingManualAddress');
+  String get localPairingHostRequired => _r('localPairingHostRequired');
+  String get localPairingPortInvalid => _r('localPairingPortInvalid');
   String get localPairingSasTitle => _r('localPairingSasTitle');
   String get localPairingSasHint => _r('localPairingSasHint');
   String get localPairingConfirm => _r('localPairingConfirm');
+  String get localPairingReject => _r('localPairingReject');
+  String get localPairingWaitingPeer => _r('localPairingWaitingPeer');
   String localPairingPaired(String device) =>
       _r('localPairingPaired', {'device': device});
   String get localPairingFailed => _r('localPairingFailed');
   String get localPairingOnline => _r('localPairingOnline');
   String get localPairingOffline => _r('localPairingOffline');
   String get localGenerateCode => _r('localGenerateCode');
-  String localMyCode(String code) => _r('localMyCode', {'code': code});
   String addDeviceAccountSynced(String account) =>
       _r('addDeviceAccountSynced', {'account': account});
   String get addDeviceAccountFooter => _r('addDeviceAccountFooter');
+
+  // 入站配对核验（本机作为被添加方时的核验 UI，见 incoming_pairing_dialog.dart）
+  String get incomingPairingTitle => _r('incomingPairingTitle');
+  String get incomingPairingHint => _r('incomingPairingHint');
+  String incomingPairingFrom(String device) =>
+      _r('incomingPairingFrom', {'device': device});
+  String incomingPairingCountdown(int seconds) =>
+      _r('incomingPairingCountdown', {'seconds': seconds});
+  String get incomingPairingAccept => _r('incomingPairingAccept');
+  String get incomingPairingReject => _r('incomingPairingReject');
 
   // 本地设备管理（未登录也可用，免账号）
   String get localDevicesSectionTitle => _r('localDevicesSectionTitle');
@@ -765,7 +784,14 @@ class S {
   String get localDeviceAddressLabel => _r('localDeviceAddressLabel');
   String get localDeviceAddressHint => _r('localDeviceAddressHint');
   String get localDeviceUnpair => _r('localDeviceUnpair');
+  String get localDeviceUnpairConfirmTitle =>
+      _r('localDeviceUnpairConfirmTitle');
+  String get localDeviceUnpairConfirmDesc =>
+      _r('localDeviceUnpairConfirmDesc');
   String get localDeviceCodeCopied => _r('localDeviceCodeCopied');
+  String localDeviceCodeRemaining(int seconds) =>
+      _r('localDeviceCodeRemaining', {'seconds': seconds});
+  String get localDeviceCodeExpired => _r('localDeviceCodeExpired');
   String get apiServiceLanEnable => _r('apiServiceLanEnable');
   String get apiServiceLanEnableDesc => _r('apiServiceLanEnableDesc');
 

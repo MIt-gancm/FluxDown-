@@ -57,6 +57,10 @@ class QuickPopupPayload {
   /// 设备名册（云账户已登录且有远程设备时非空；渐进披露判定源）。
   final List<QuickDeviceOption> devices;
 
+  /// 本地配对设备名册（局域网直连，免账号；与 [devices] 独立维护，两者
+  /// 分别对应设备选择器里的云账户分组与本地直连分组）。
+  final List<QuickDeviceOption> localDevices;
+
   const QuickPopupPayload({
     required this.requestId,
     required this.url,
@@ -72,6 +76,7 @@ class QuickPopupPayload {
     required this.defaultQueueId,
     required this.queues,
     this.devices = const [],
+    this.localDevices = const [],
   });
 
   String toJsonString() => jsonEncode({
@@ -98,15 +103,8 @@ class QuickPopupPayload {
             'defaultSegments': q.defaultSegments,
           },
       ],
-      'devices': [
-        for (final d in devices)
-          {
-            'deviceId': d.deviceId,
-            'name': d.name,
-            'platform': d.platform,
-            'isOnline': d.isOnline,
-          },
-      ],
+      'devices': _deviceOptionsToJson(devices),
+      'localDevices': _deviceOptionsToJson(localDevices),
     },
   });
 
@@ -135,18 +133,34 @@ class QuickPopupPayload {
             defaultSegments: (q['defaultSegments'] as num?)?.toInt() ?? 0,
           ),
       ],
-      devices: [
-        for (final d in (env['devices'] as List? ?? const []))
-          QuickDeviceOption(
-            deviceId: (d as Map<String, dynamic>)['deviceId'] as String? ?? '',
-            name: d['name'] as String? ?? '',
-            platform: d['platform'] as String?,
-            isOnline: d['isOnline'] as bool? ?? false,
-          ),
-      ],
+      devices: _deviceOptionsFromJson(env['devices']),
+      localDevices: _deviceOptionsFromJson(env['localDevices']),
     );
   }
 }
+
+/// [QuickDeviceOption] 列表 ↔ JSON 数组的双向投影。[QuickPopupPayload.devices]
+/// （云账户）与 [QuickPopupPayload.localDevices]（本地配对）结构相同，
+/// 共用本编解码逻辑。
+List<Map<String, dynamic>> _deviceOptionsToJson(List<QuickDeviceOption> list) => [
+  for (final d in list)
+    {
+      'deviceId': d.deviceId,
+      'name': d.name,
+      'platform': d.platform,
+      'isOnline': d.isOnline,
+    },
+];
+
+List<QuickDeviceOption> _deviceOptionsFromJson(dynamic raw) => [
+  for (final d in (raw as List? ?? const []))
+    QuickDeviceOption(
+      deviceId: (d as Map<String, dynamic>)['deviceId'] as String? ?? '',
+      name: d['name'] as String? ?? '',
+      platform: d['platform'] as String?,
+      isOnline: d['isOnline'] as bool? ?? false,
+    ),
+];
 
 /// 弹窗引擎 → 主引擎的提交结果。
 class QuickPopupResult {

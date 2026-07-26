@@ -147,6 +147,9 @@ Color taskStatusColor(TaskStatus status, AppColors c, {bool fileMissing = false}
       return AppColors.amber;
     case TaskStatus.error:
       return AppColors.red;
+    case TaskStatus.canceled:
+      // 已取消：中性弱化色，非错误——只可能是其他设备取消的远程任务镜像
+      return c.textMuted;
   }
 }
 
@@ -159,6 +162,7 @@ IconData taskStatusIcon(TaskStatus status) => switch (status) {
   TaskStatus.paused => LucideIcons.pause,
   TaskStatus.error => LucideIcons.alertCircle,
   TaskStatus.completed => LucideIcons.check,
+  TaskStatus.canceled => LucideIcons.ban,
 };
 
 // =============================================================================

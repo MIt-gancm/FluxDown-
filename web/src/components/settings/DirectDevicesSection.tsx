@@ -97,13 +97,26 @@ function PairingCodeGroup() {
     onSuccess: (res) => setExpiresAt(Date.now() + res.ttlSeconds * 1000),
   })
 
+  // 倒计时 + 到期收尾：配对码过期后必须停掉 mDNS 广播，否则本机指纹/设备名会一直
+  // 广播到进程退出（引擎侧 generate_code 会隐式开启广播，此前没有任何路径关得掉）。
   useEffect(() => {
     if (!expiresAt) return
-    const tick = () => setRemaining(Math.max(0, Math.round((expiresAt - Date.now()) / 1000)))
+    let stopped = false
+    const tick = () => {
+      const left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000))
+      setRemaining(left)
+      if (left === 0 && !stopped) {
+        stopped = true
+        void linkApi.stopAdvertising().catch(() => {})
+      }
+    }
     tick()
     const id = window.setInterval(tick, 1000)
     return () => window.clearInterval(id)
   }, [expiresAt])
+
+  // 离开设置页（组件卸载）时也停掉广播——用户已经不在配对界面上了。
+  useEffect(() => () => void linkApi.stopAdvertising().catch(() => {}), [])
 
   const code = codeMut.data?.code ?? ''
 

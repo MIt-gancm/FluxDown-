@@ -292,9 +292,6 @@ enum RemoteTaskStatus {
 
   String get wire => name;
 
-  bool get isActive =>
-      this == accepted || this == downloading || this == pending;
-
   bool get isTerminal =>
       this == completed || this == failed || this == canceled;
 }

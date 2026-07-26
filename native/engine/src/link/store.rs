@@ -63,6 +63,22 @@ impl LinkStore {
         self.db.link_touch_device(fingerprint, at).await?;
         Ok(())
     }
+
+    /// 刷新一台已配对设备的候选端点：mDNS 重新发现命中已配对指纹时调用，修复
+    /// 设备 DHCP 换 IP 后旧候选永久失效、只能重新走完整配对才能恢复连接的问题。
+    /// 返回是否命中已配对设备（刷新前一刻被解除配对不算错误，返回 `false`）。
+    pub async fn update_candidates(
+        &self,
+        fingerprint: &str,
+        candidates: &[PeerCandidate],
+    ) -> LinkResult<bool> {
+        let candidates_json =
+            serde_json::to_string(candidates).unwrap_or_else(|_| "[]".to_string());
+        Ok(self
+            .db
+            .link_update_candidates(fingerprint, &candidates_json)
+            .await?)
+    }
 }
 
 /// 把持久化行映射为强类型 [`PeerRecord`]。`candidates` JSON 解析失败退化为空列表

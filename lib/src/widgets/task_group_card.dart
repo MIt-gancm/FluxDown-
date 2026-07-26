@@ -31,6 +31,7 @@ String groupStatusLabel(TaskStatus status, S s) => switch (status) {
   TaskStatus.paused => s.statusPaused,
   TaskStatus.completed => s.statusCompleted,
   TaskStatus.error => s.statusError,
+  TaskStatus.canceled => s.statusCanceled,
 };
 
 /// 剩余时间格式化（`DownloadTask.etaText` 的组级等价物：组没有单一
@@ -197,6 +198,7 @@ Color _sparkBarColor(TaskStatus status, AppColors c) => switch (status) {
   TaskStatus.pending => c.surface3,
   TaskStatus.downloading || TaskStatus.preparing || TaskStatus.resuming =>
     c.accent,
+  TaskStatus.canceled => c.textMuted,
 };
 
 class _GroupSparkline extends StatelessWidget {
@@ -1001,6 +1003,8 @@ class _MemberActionCluster extends StatelessWidget {
         TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
       TaskStatus.completed =>
         TaskActionButton(icon: LucideIcons.externalLink, onTap: onOpenFile),
+      // 已取消：只读远程镜像，「打开文件」不适用，留出等宽占位避免布局跳动
+      TaskStatus.canceled => const SizedBox(width: 28, height: 28),
     };
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 4),

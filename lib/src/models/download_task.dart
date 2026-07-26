@@ -7,6 +7,8 @@ import '../i18n/locale_provider.dart';
 /// 任务状态 — 与 Rust 端状态码对应
 /// 0=pending, 1=downloading, 2=paused, 3=completed, 4=error, 5=preparing
 /// resuming 为纯 Dart 端状态，点击继续后立即切换，Rust 返回 status=1 后自动过渡到 downloading
+/// canceled 同样是纯 Dart 端状态——只由云端远程任务镜像（RemoteTaskStatus.
+/// canceled）产生，本地下载引擎不会、也不应该产生它，故不出现在上面的状态码表里。
 enum TaskStatus {
   pending,
   downloading,
@@ -15,6 +17,8 @@ enum TaskStatus {
   error,
   resuming,
   preparing,
+  // 加在末尾：避免影响任何隐含依赖枚举 index 的对应关系。
+  canceled,
 }
 
 /// 文件类型分类 — 由扩展名推断
@@ -147,6 +151,8 @@ enum FileCategory {
   }
 }
 
+// 无 canceled 分支：Rust 侧没有对应状态码，canceled 只由
+// RemoteTaskService._mapStatus 从远程任务镜像直接构造，不经过本函数。
 TaskStatus taskStatusFromInt(int value) {
   return switch (value) {
     0 => TaskStatus.pending,
@@ -612,6 +618,8 @@ class DownloadTask {
         return '$proto · ${s.subtitlePending}$queueStr';
       case TaskStatus.preparing:
         return '$proto · ${s.subtitlePreparing}';
+      case TaskStatus.canceled:
+        return '$proto · $sizeText · ${s.subtitleCanceled}';
       case TaskStatus.resuming:
         return '$proto · $sizeText · ${s.subtitleResuming}';
     }
@@ -641,6 +649,7 @@ class DownloadTask {
       TaskStatus.error => s.statusError,
       TaskStatus.preparing => s.statusPreparing,
       TaskStatus.resuming => s.statusResuming,
+      TaskStatus.canceled => s.statusCanceled,
     };
   }
 

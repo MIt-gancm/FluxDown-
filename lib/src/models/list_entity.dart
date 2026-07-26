@@ -329,6 +329,9 @@ class GroupMemberCounts {
           pause++;
         case TaskStatus.error:
           fail++;
+        case TaskStatus.canceled:
+          // 已取消：纯远程任务镜像展示态，非本机失败，不计入任何计数桶
+          break;
       }
     }
     return GroupMemberCounts(

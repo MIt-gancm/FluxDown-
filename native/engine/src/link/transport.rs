@@ -73,24 +73,64 @@ impl Transport for DirectTransport {
     }
 
     async fn connect(&self, peer: &PeerRecord) -> Result<PeerConn, LinkError> {
-        let addr = peer.direct_address().ok_or(LinkError::Unreachable)?;
-        let base_url = format!("http://{addr}");
-        // 直连以 /ping 探活判定可达；失败即视为该传输不可达，交由 stack 落下一策略。
-        let ping = format!("{base_url}/ping");
-        let resp = self
-            .client
-            .get(&ping)
-            .timeout(self.probe_timeout)
-            .send()
-            .await
-            .map_err(|_| LinkError::Unreachable)?;
-        if !resp.status().is_success() {
-            return Err(LinkError::Unreachable);
+        // 依次尝试全部 Direct 候选而非只试第一个：候选列表现在可能同时
+        // 保留 mDNS 新发现的地址（未探测、纯启发式排序，见
+        // `crate::link::discovery::pick_best_v4` 文档）与配对时验证过的
+        // 旧地址——只试首个会让一次误选直接判死本该可达的设备。任一候选
+        // 连通即返回；全部候选都失败才 `Unreachable`。
+        for candidate in peer
+            .candidates
+            .iter()
+            .filter(|c| c.kind == TransportKind::Direct)
+        {
+            let addr = candidate.address.as_str();
+            let base_url = format!("http://{addr}");
+            // 直连以 /ping 探活判定可达；失败即视为该候选不可达，试下一个。
+            let ping = format!("{base_url}/ping");
+            let Ok(resp) = self
+                .client
+                .get(&ping)
+                .timeout(self.probe_timeout)
+                .send()
+                .await
+            else {
+                continue;
+            };
+            if !resp.status().is_success() {
+                continue;
+            }
+            // TOFU 身份复核（`PeerRecord::identity_pub` 文档承诺的「后续
+            // 连接重校验」在此落地）：地址可能因 DHCP 回收复用、或被中间
+            // 人篡改指向别的设备，`/ping` 200 响应不代表就是配对时那台
+            // ——必须比对指纹。JSON 解析失败视同该候选不可达（换一个候选
+            // 或许能解决）；解析成功但指纹不符是明确的身份冒充信号，必须
+            // 立即上抛终止整条尝试链，不能继续试其它候选——否则攻击者能
+            // 靠混入一个抢答的候选，把本该立即中止的身份冒充错误悄悄
+            // 降级成一次普通的「不可达，换个候选」。
+            let Ok(body) = resp.json::<serde_json::Value>().await else {
+                continue;
+            };
+            verify_ping_identity(&body, &peer.fingerprint, addr)?;
+            return Ok(PeerConn {
+                base_url,
+                kind: TransportKind::Direct,
+            });
         }
-        Ok(PeerConn {
-            base_url,
-            kind: TransportKind::Direct,
-        })
+        Err(LinkError::Unreachable)
+    }
+}
+
+/// 从 `/ping` 响应体校验对端身份指纹——[`DirectTransport::connect`] 的 TOFU
+/// 复核核心逻辑，抽成纯函数便于单测（无需起真实 HTTP 服务器即可覆盖比对
+/// 分支）。指纹一致才算通过；缺字段或不一致一律视为身份不符。
+fn verify_ping_identity(
+    body: &serde_json::Value,
+    expect_fp: &str,
+    addr: &str,
+) -> Result<(), LinkError> {
+    match body.get("linkFingerprint").and_then(|v| v.as_str()) {
+        Some(fp) if fp == expect_fp => Ok(()),
+        _ => Err(LinkError::IdentityMismatch(addr.to_string())),
     }
 }
 
@@ -199,5 +239,29 @@ mod tests {
         }]);
         let err = t.connect(&peer).await.unwrap_err();
         assert!(matches!(err, LinkError::Unreachable));
+    }
+
+    #[test]
+    fn verify_ping_identity_accepts_matching_fingerprint() {
+        let body = serde_json::json!({ "linkFingerprint": "abc123" });
+        assert!(verify_ping_identity(&body, "abc123", "10.0.0.1:1").is_ok());
+    }
+
+    #[test]
+    fn verify_ping_identity_rejects_mismatched_fingerprint() {
+        // 地址被 DHCP 回收复用/篡改指向了另一台设备：指纹对不上，必须拒绝
+        // 而不是静默连接——否则任务会被下发给冒充者。
+        let body = serde_json::json!({ "linkFingerprint": "someone-else" });
+        let err = verify_ping_identity(&body, "abc123", "10.0.0.1:1").unwrap_err();
+        assert!(matches!(err, LinkError::IdentityMismatch(addr) if addr == "10.0.0.1:1"));
+    }
+
+    #[test]
+    fn verify_ping_identity_rejects_missing_fingerprint_field() {
+        // 对端没有开启 link（`/ping` 不带 linkFingerprint）：同样不能当作
+        // 身份匹配处理。
+        let body = serde_json::json!({ "success": true });
+        let err = verify_ping_identity(&body, "abc123", "10.0.0.1:1").unwrap_err();
+        assert!(matches!(err, LinkError::IdentityMismatch(_)));
     }
 }

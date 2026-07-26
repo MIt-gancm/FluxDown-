@@ -15,6 +15,7 @@ mod routes_ext;
 mod wire;
 mod ws_hub;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::Router;
@@ -33,6 +34,7 @@ use crate::actor::{ActorCmd, bt_config_from_map, refresh_tracker_sub, run_actor}
 use crate::config::{ServerConfig, default_save_dir, ensure_server_config};
 use crate::host::ServerApiHost;
 use crate::routes_ext::{ServerState, extra_router};
+use crate::wire::WsServerMsg;
 use crate::ws_hub::{EngineEventSink, WsHostSelection, WsHub};
 
 /// 服务器版本。发布流水线在编译期经 `FLUXDOWN_SERVER_VERSION` 注入 git tag
@@ -244,21 +246,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "[server] device link ready, fingerprint={}",
                     mgr.fingerprint()
                 );
-                // 事件仅记日志（headless 无交互 UI；配对成功/错误可在日志追踪）。
+                // 转发到 WS 广播中枢：`Error` 仅记日志（headless 无交互 UI，日志
+                // 已够追踪）；`IncomingPairing` 必须广播给已鉴权 WS 客户端，否则
+                // Web 前端永远等不到核验弹框（管理员批准/拒绝走管理面
+                // `POST /api/v1/link/pair/approve`）；`Paired`/`Unpaired` 广播一条
+                // 空载荷 `linkDevicesChanged` 通知——配对落库发生在被唤醒的后台
+                // 任务里，早于 approve 请求的 HTTP 响应，Web 若只在 onSuccess 里
+                // refetch 名册会读到还没写入新设备的陈旧快照且永远无法自愈。
+                let ws_hub = hub.clone();
                 tokio::spawn(async move {
                     while let Some(ev) = link_rx.recv().await {
                         match ev {
+                            fluxdown_engine::link::LinkEngineEvent::Discovered(_) => {}
                             fluxdown_engine::link::LinkEngineEvent::Paired(r) => {
                                 log_info!(
                                     "[server] paired device: {} ({})",
                                     r.name,
                                     r.short_fingerprint()
                                 );
+                                ws_hub.broadcast(&WsServerMsg::LinkDevicesChanged {});
+                            }
+                            fluxdown_engine::link::LinkEngineEvent::Unpaired(_) => {
+                                ws_hub.broadcast(&WsServerMsg::LinkDevicesChanged {});
                             }
                             fluxdown_engine::link::LinkEngineEvent::Error(m) => {
                                 log_info!("[server] link error: {}", m);
                             }
-                            _ => {}
+                            fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
+                                session_id,
+                                sas,
+                                peer_name,
+                                peer_platform,
+                            } => {
+                                ws_hub.broadcast(&WsServerMsg::LinkIncomingPairing {
+                                    session_id,
+                                    sas,
+                                    name: peer_name,
+                                    platform: peer_platform.unwrap_or_default(),
+                                });
+                            }
                         }
                     }
                 });
@@ -366,11 +392,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("  Web UI:    http://{}/", server_cfg.bind);
     eprintln!("  API docs:  http://{}/api/v1/docs", server_cfg.bind);
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            log_info!("[server] ctrl-c received, shutting down");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        log_info!("[server] ctrl-c received, shutting down");
+    })
+    .await?;
     Ok(())
 }

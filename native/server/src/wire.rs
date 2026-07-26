@@ -275,6 +275,22 @@ pub enum WsServerMsg {
         ok: bool,
         message: String,
     },
+    /// 入站配对请求待本机用户核验（本机作为响应方收到远端 hello+配对码后，
+    /// 等待管理员核对 SAS 并调用管理面 `POST /api/v1/link/pair/approve`）。
+    /// 字段名与桌面端 rinf `LinkEvent{kind:"incomingPairing"}` 信号保持一致。
+    LinkIncomingPairing {
+        session_id: String,
+        sas: String,
+        name: String,
+        platform: String,
+    },
+    /// 已配对设备名册发生变化（新增/移除），前端据此 invalidate 名册查询。
+    /// 空载荷：名册本身走 REST 拉取，这里只做「该刷新了」的通知——配对落库
+    /// （`PairingResponder::handle_confirm` 里的 `store.upsert`）发生在被
+    /// 唤醒的后台任务中，早于 `pair/approve` 请求的 HTTP 响应返回；Web 若
+    /// 只在 approve 的 onSuccess 里 refetch 名册会读到还没写入新设备的
+    /// 陈旧快照，且没有其它机制能纠正它，靠这条消息触发前端重新拉取。
+    LinkDevicesChanged {},
 }
 
 // ---------------------------------------------------------------------------

@@ -54,6 +54,20 @@ use utoipa::{Modify, OpenApi};
         crate::server::api_ignore_plugin_retry,
         crate::server::api_market_list,
         crate::server::api_market_install,
+        crate::server::api_link_pair_hello,
+        crate::server::api_link_pair_confirm,
+        crate::server::api_link_create_task,
+        crate::server::api_link_generate_code,
+        crate::server::api_link_stop_advertising,
+        crate::server::api_link_discovery,
+        crate::server::api_link_discovered,
+        crate::server::api_link_probe,
+        crate::server::api_link_pair_begin,
+        crate::server::api_link_pair_finish,
+        crate::server::api_link_pair_approve,
+        crate::server::api_link_devices,
+        crate::server::api_link_remove_device,
+        crate::server::api_link_device_tasks,
     ),
     tags(
         (name = "system", description = "探活与基础信息"),
@@ -63,6 +77,7 @@ use utoipa::{Modify, OpenApi};
         (name = "management", description = "管理 API（强制 token）"),
         (name = "groups", description = "任务组与前置预解析（多文件任务组；强制 token）"),
         (name = "plugins", description = "插件系统（安装/启停/设置/卸载；强制 token）"),
+        (name = "link", description = "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"),
     ),
     modifiers(&SecurityAddon)
 )]
@@ -143,6 +158,19 @@ mod tests {
             routes::API_TASK_IGNORE_PLUGIN_RETRY,
             routes::API_MARKET,
             routes::API_MARKET_INSTALL,
+            routes::API_LINK_PAIR_HELLO,
+            routes::API_LINK_PAIR_CONFIRM,
+            routes::API_LINK_TASKS,
+            routes::API_LINK_CODE,
+            routes::API_LINK_DISCOVERY,
+            routes::API_LINK_DISCOVERED,
+            routes::API_LINK_PROBE,
+            routes::API_LINK_PAIR_BEGIN,
+            routes::API_LINK_PAIR_FINISH,
+            routes::API_LINK_PAIR_APPROVE,
+            routes::API_LINK_DEVICES,
+            routes::API_LINK_DEVICE,
+            routes::API_LINK_DEVICE_TASKS,
         ];
         for path in expected {
             assert!(

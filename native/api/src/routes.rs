@@ -100,6 +100,10 @@ pub const API_LINK_PROBE: &str = "/api/v1/link/probe";
 pub const API_LINK_PAIR_BEGIN: &str = "/api/v1/link/pair/begin";
 /// SAS 核对后确认/拒绝配对（POST `{"token","accept"}`，**需 management token**）。
 pub const API_LINK_PAIR_FINISH: &str = "/api/v1/link/pair/finish";
+/// 批准/拒绝一次入站配对核验（POST `{"sessionId","accept"}`，**需 management
+/// token**；响应本机收到的 `IncomingPairing` 通知，区别于发起方视角的
+/// [`API_LINK_PAIR_FINISH`]）。
+pub const API_LINK_PAIR_APPROVE: &str = "/api/v1/link/pair/approve";
 /// 已配对设备列表（GET，**需 management token**；含并发在线探测）。
 pub const API_LINK_DEVICES: &str = "/api/v1/link/devices";
 /// 单个已配对设备（DELETE 解除配对，**需 management token**；不存在 404）。

@@ -128,4 +128,16 @@ export const linkApi = {
 
   /** POST /api/v1/link/code：生成一次性配对码（本机作为"被配对"一方出示）。 */
   generateCode: () => apiFetch<LinkCodeResponse>('/api/v1/link/code', { method: 'POST' }),
+
+  /** DELETE /api/v1/link/code：停止 mDNS 广播（不再让本机被局域网发现）。配对码过期或
+   *  用户关闭配对界面时调用——否则本机指纹/设备名会一直广播到进程退出。 */
+  stopAdvertising: () => apiFetch<{ ok: boolean }>('/api/v1/link/code', { method: 'DELETE' }),
+
+  /** POST /api/v1/link/pair/approve：本机作为**被添加方**核对 SAS 后批准/拒绝入站配对。
+   *  发起方的 pair/confirm 请求会阻塞等待本次决策（对端上限 60 秒）。 */
+  approveIncoming: (sessionId: string, accept: boolean) =>
+    apiFetch<{ ok: boolean }>('/api/v1/link/pair/approve', {
+      method: 'POST',
+      body: JSON.stringify({ sessionId, accept }),
+    }),
 }

@@ -2555,6 +2555,25 @@ impl Db {
             .await?;
         Ok(())
     }
+
+    /// 刷新一台已配对设备的候选端点（mDNS 重新发现命中已配对指纹时调用，
+    /// 修复设备 DHCP 换 IP 后旧候选失效的问题）。**不**顺带刷新
+    /// `last_seen_at`——mDNS 广播只证明「对端在广播」，不证明「本机刚和它
+    /// 说上话」，与 [`Self::link_touch_device`]「拨通了才算在线」的语义
+    /// 冲突（否则设备开着但从未真正连接过也会被判定为「最近活跃」）。
+    /// 返回是否命中已配对设备。
+    pub async fn link_update_candidates(
+        &self,
+        fingerprint: &str,
+        candidates_json: &str,
+    ) -> Result<bool, DbError> {
+        let r = sqlx::query("UPDATE link_devices SET candidates = $1 WHERE fingerprint = $2")
+            .bind(candidates_json)
+            .bind(fingerprint)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
 }
 
 pub struct SegmentInfo {

@@ -1,5 +1,5 @@
 // 跨设备任务协同数据模型单测 —— 防守进度回流的核心不变式：
-//   1. RemoteTaskStatus 线格映射与往返、活跃/终态分类；
+//   1. RemoteTaskStatus 线格映射与往返、终态分类；
 //   2. RemoteTask.fromJson 全字段解析 + 缺省容错；
 //   3. RemoteTask.copyWith 增量更新绝不丢失标识/URL/目录/归属（SSE 高频进度路径）；
 //   4. CloudDevice 在线态/当前设备标志解析（服务端下发，缺省 false）；
@@ -34,11 +34,7 @@ void main() {
       }
     });
 
-    test('isActive / isTerminal classification', () {
-      expect(RemoteTaskStatus.downloading.isActive, isTrue);
-      expect(RemoteTaskStatus.pending.isActive, isTrue);
-      expect(RemoteTaskStatus.accepted.isActive, isTrue);
-      expect(RemoteTaskStatus.completed.isActive, isFalse);
+    test('isTerminal classification', () {
       expect(RemoteTaskStatus.completed.isTerminal, isTrue);
       expect(RemoteTaskStatus.failed.isTerminal, isTrue);
       expect(RemoteTaskStatus.canceled.isTerminal, isTrue);

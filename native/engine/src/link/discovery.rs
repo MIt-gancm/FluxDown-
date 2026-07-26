@@ -7,8 +7,17 @@
 //! **扩展点**：发现方式是可替换策略；未来可加其他发现源（如账户名册回填、二维码
 //! 带地址），只要往 [`DiscoveredPeer`] 汇流即可，配对/传输层无感。mDNS 广播/浏览
 //! 各自独立运行在 mdns-sd 自建线程上（不阻塞宿主的 async runtime）。
+//!
+//! # 隐私权衡（可发现性的固有取舍，非编码缺陷）
+//! 广播的 TXT 记录明文携带 `fp`（长期身份指纹）/`name`（设备名）/`plat`/
+//! `ver`（平台/版本）：局域网内任何主机都能被动监听或主动查询
+//! `_fluxdown._tcp.local.` 枚举出这些信息，完全不需要任何配对码。这是
+//! 「让本机可被发现」这一功能自身的代价，仅凭这些信息也拼不出配对所需的
+//! 临时密钥/共享密钥，无法完成配对。缓解手段：只在确实需要被添加时才开启
+//! 广播，配对完成或暂不需要被发现时调用 `LinkManager::stop_advertising`
+//! 停止广播，缩短暴露窗口。
 
-use std::net::{IpAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::time::Duration;
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -101,9 +110,11 @@ impl Drop for MdnsBrowser {
     }
 }
 
-/// 把解析出的 mDNS 服务映射为 [`DiscoveredPeer`]（取首个 IPv4 地址）。
+/// 把解析出的 mDNS 服务映射为 [`DiscoveredPeer`]（IPv4 地址经 `pick_best_v4`
+/// 按可达性优先级挑选，而非不加区分地取第一个）。
 fn resolved_to_peer(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
-    let addr = info.get_addresses_v4().into_iter().next()?;
+    let candidates: Vec<Ipv4Addr> = info.get_addresses_v4().into_iter().collect();
+    let addr = pick_best_v4(&candidates)?;
     let fingerprint = info
         .get_property_val_str(TXT_FINGERPRINT)
         .filter(|s| !s.is_empty())
@@ -130,6 +141,51 @@ fn resolved_to_peer(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
         app_version,
         kind: DiscoveryKind::Mdns,
     })
+}
+
+/// 从候选 IPv4 地址中选出「最可能可达」的一个。
+///
+/// 广播端用 `enable_addr_auto()` 会把本机所有网卡地址都塞进服务记录；若对端
+/// 同时开着 Docker/WSL/VPN 等虚拟网卡，不加区分地取第一个很可能选中一个从
+/// 浏览方根本连不通的地址，表现为「发现到了但怎么都连不上」。
+///
+/// 排除：回环 `127.0.0.0/8`、link-local `169.254.0.0/16`、Docker 默认桥接
+/// 网段 `172.17.0.0/16`（几乎总是不可达的容器内部地址）。
+/// 优先级（数字越小越优先）：`192.168.0.0/16` 家庭/办公网常见网段 >
+/// `10.0.0.0/8` 路由器下发/企业网常见网段 > 其余 `172.16.0.0/12` 私网 >
+/// 其他（含公网）地址。都不命中优先私网段时，回退到第一个未被排除的地址
+/// （`Iterator::min_by_key` 对并列最小值保留原始顺序中的第一个）；全部被
+/// 排除则返回 `None`。
+///
+/// **启发式，可能选错**：这只是「多个网段里挑一个最可能通」的经验排序，
+/// 从未实际探测任何一个候选地址的可达性（不发包、不比对指纹）。调用方
+/// ——尤其是刷新**已配对设备**回连候选的路径（见
+/// `crate::link::manager::LinkManager::start_discovery`）——必须把这里
+/// 选出的地址当作「值得优先一试」而非「确认可达」，保留原有候选作为
+/// 回退，不能直接覆盖掉配对时验证过的旧地址。
+#[must_use]
+fn pick_best_v4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
+    fn is_excluded(ip: &Ipv4Addr) -> bool {
+        let o = ip.octets();
+        ip.is_loopback() || ip.is_link_local() || (o[0] == 172 && o[1] == 17)
+    }
+    fn priority(ip: &Ipv4Addr) -> u8 {
+        let o = ip.octets();
+        if o[0] == 192 && o[1] == 168 {
+            0
+        } else if o[0] == 10 {
+            1
+        } else if o[0] == 172 && (16..=31).contains(&o[1]) {
+            2
+        } else {
+            3
+        }
+    }
+    addrs
+        .iter()
+        .filter(|ip| !is_excluded(ip))
+        .min_by_key(|ip| priority(ip))
+        .copied()
 }
 
 /// 手动地址探测：GET `http://host:port/ping`，解析设备身份/名称/平台/版本。
@@ -209,5 +265,42 @@ mod tests {
     #[test]
     fn local_addr_towards_garbage_is_empty() {
         assert!(local_direct_addrs("not-an-ip", 17800).is_empty());
+    }
+
+    #[test]
+    fn pick_best_v4_prefers_192_168_then_10_then_other_private() {
+        // 全量四个地址：优先命中 192.168/16。
+        let all = [
+            Ipv4Addr::new(172, 20, 0, 5),
+            Ipv4Addr::new(203, 0, 113, 9), // 公网地址，优先级最低
+            Ipv4Addr::new(10, 0, 0, 5),
+            Ipv4Addr::new(192, 168, 1, 5),
+        ];
+        assert_eq!(pick_best_v4(&all), Some(Ipv4Addr::new(192, 168, 1, 5)));
+        // 去掉 192.168 后应退而求其次选中 10/8。
+        assert_eq!(pick_best_v4(&all[..3]), Some(Ipv4Addr::new(10, 0, 0, 5)));
+    }
+
+    #[test]
+    fn pick_best_v4_excludes_loopback_link_local_and_docker_bridge() {
+        // 三个排除项之外仅剩一个公网地址，必须回退到它而不是径直选第一个
+        // （第一个是被排除的回环地址）。
+        let addrs = [
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+            Ipv4Addr::new(172, 17, 0, 2),
+            Ipv4Addr::new(203, 0, 113, 9),
+        ];
+        assert_eq!(pick_best_v4(&addrs), Some(Ipv4Addr::new(203, 0, 113, 9)));
+    }
+
+    #[test]
+    fn pick_best_v4_all_excluded_returns_none() {
+        let addrs = [
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 1, 1),
+            Ipv4Addr::new(172, 17, 0, 2),
+        ];
+        assert!(pick_best_v4(&addrs).is_none());
     }
 }

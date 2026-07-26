@@ -1100,6 +1100,49 @@ pub struct LinkPairConfirmRequest {
     pub confirm: bool,
 }
 
+/// 响应方处理一次入站配对 `confirm` 的终局（HTTP 层用于渲染 `paired` + `reason`）。
+///
+/// 与引擎 `link::manager::PairConfirmOutcome` 一一对应，但独立定义：`fluxdown_api`
+/// 不依赖引擎的 link 模块（后者是可选 feature，移动端整块不编译）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkPairConfirmOutcome {
+    /// 本机用户批准，发起方已入册。
+    Paired,
+    /// 发起方自己传了 `confirm=false`。
+    Declined,
+    /// 本机用户核对 SAS 后拒绝。
+    Rejected,
+    /// 等待本机用户核验超时（60s 决策窗口耗尽）。
+    TimedOut,
+}
+
+impl LinkPairConfirmOutcome {
+    /// 是否真的完成了配对。
+    #[must_use]
+    pub fn paired(self) -> bool {
+        matches!(self, Self::Paired)
+    }
+
+    /// 透出给发起方的稳定判别串；`Paired`/`Declined` 无需额外理由。
+    #[must_use]
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Self::Rejected => Some("rejected"),
+            Self::TimedOut => Some("timeout"),
+            Self::Paired | Self::Declined => None,
+        }
+    }
+}
+
+/// 批准/拒绝一次入站配对核验（管理面版本；`session_id` 对应
+/// `LinkEvent{kind:"incomingPairing"}` / WS `linkIncomingPairing` 携带的会话 id）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairApproveRequest {
+    pub session_id: String,
+    pub accept: bool,
+}
+
 /// 已配对设备下发下载任务的请求体（鉴权走 `X-FluxLink-*` 头，非 body）。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -1120,8 +1163,12 @@ pub struct LinkAuth {
     pub ts: i64,
     /// 一次性随机串。
     pub nonce: String,
-    /// HMAC-SHA256 标签（hex）。
+    /// HMAC-SHA256 标签（hex，覆盖密文摘要，encrypt-then-MAC）。
     pub tag: String,
+    /// `X-FluxLink-Enc` 头原始值：数据面 body 加密方案版本号。当前唯一
+    /// 合法值是 `"v1"`（ChaCha20-Poly1305）；缺失或其他值一律鉴权失败——
+    /// 双端同版本发布，不兼容明文旧客户端，不留降级回退路径。
+    pub enc: String,
 }
 
 /// 生成配对码的响应（`POST /api/v1/link/code`）。

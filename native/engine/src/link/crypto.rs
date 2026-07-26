@@ -1,10 +1,15 @@
-//! 设备互联加密原语：指纹、SAS 短认证串、链路密钥派生、数据面 HMAC 鉴权。
+//! 设备互联加密原语：指纹、SAS 短认证串、链路密钥派生、数据面 HMAC 鉴权 +
+//! AEAD 加密。
 //!
 //! 全部基于已在引擎中的 `sha2 0.10`（digest 0.10）+ `hkdf 0.12` + `hmac 0.12`，
-//! 三者 digest 版本一致，避免类型 trait bound 冲突。
+//! 三者 digest 版本一致，避免类型 trait bound 冲突；数据面 body 加密另加
+//! `chacha20poly1305 0.10`（RustCrypto 同族，与前三者独立但风格一致）。
 
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
 use hmac::{Mac, SimpleHmac};
+use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 /// SAS 短认证串位数（6 位数字，双端肉眼核对）。
@@ -83,6 +88,86 @@ pub fn derive_link_key(z: &[u8]) -> Vec<u8> {
         return z.to_vec();
     }
     okm.to_vec()
+}
+
+/// 从每对设备独立的 `link_secret` 派生数据面 AEAD 加密密钥。
+///
+/// **域分隔**：HKDF salt/info 标签与 [`derive_sas`]（`"fluxdown-link-sas-v1"`）、
+/// [`derive_link_key`]（`"fluxdown-link-key-salt-v1"`/`"fluxdown-link-key-v1"`）
+/// 均不同——AEAD 加密密钥绝不能等于 HMAC 鉴权用的 `link_secret` 本身或与
+/// SAS 相关，否则一把密钥材料挪作多用途，任一用途的密码学分析结果都可能
+/// 波及其余用途。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_engine::link::crypto::derive_link_aead_key;
+/// let k = derive_link_aead_key(&[6u8; 32]);
+/// assert_eq!(k.len(), 32);
+/// ```
+#[must_use]
+pub fn derive_link_aead_key(link_secret: &[u8]) -> [u8; 32] {
+    let hk = Hkdf::<Sha256>::new(Some(b"fluxdown-link-aead-salt-v1"), link_secret);
+    let mut okm = [0u8; 32];
+    // 长度固定 32 字节 << 255*32，expand 不会失败；仍显式处理错误分支
+    // （clippy 禁 unwrap/expect）。
+    if hk.expand(b"fluxdown-link-aead-v1", &mut okm).is_err() {
+        return [0u8; 32];
+    }
+    okm
+}
+
+/// 加密数据面请求体（ChaCha20-Poly1305）：随机 12 字节 nonce，返回
+/// `nonce(12B) || ciphertext_with_tag`。
+///
+/// 每次调用生成独立随机 nonce——同一密钥绝不复用 nonce，否则 ChaCha20-
+/// Poly1305 的机密性与完整性均被破坏。数据面请求量级远低于随机数生日
+/// 碰撞有意义的阈值（2^32 条消息级别），随机 nonce 足够安全，不需要跨
+/// 请求持久化计数器的额外状态同步复杂度。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_engine::link::crypto::{open_link_body, seal_link_body};
+/// let key = [1u8; 32];
+/// let sealed = seal_link_body(&key, b"hello");
+/// assert_eq!(open_link_body(&key, &sealed).as_deref(), Some(b"hello".as_slice()));
+/// ```
+#[must_use]
+pub fn seal_link_body(key: &[u8; 32], plaintext: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let mut nonce_bytes = [0u8; 12];
+    rand::rng().fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let mut sealed = Vec::with_capacity(12 + plaintext.len() + 16);
+    sealed.extend_from_slice(&nonce_bytes);
+    // 对本用法（有界大小的下载任务 JSON，远小于 ChaCha20 计数器上限）加密
+    // 实践中不会失败；仍显式处理错误分支（clippy 禁 unwrap/expect）——
+    // 失败时只返回裸 nonce（无密文/tag），对端 `open_link_body` 因长度
+    // 不足直接拒绝，不会误用无效密文。
+    if let Ok(ciphertext) = cipher.encrypt(nonce, plaintext) {
+        sealed.extend_from_slice(&ciphertext);
+    }
+    sealed
+}
+
+/// 解密数据面请求体：拆出前 12 字节 nonce，解密其余部分。长度不足（不足以
+/// 容纳 nonce + 至少一个认证 tag）或解密失败（tag 不匹配/密钥不对）均返回
+/// `None`，调用方一律按鉴权失败处理，不区分具体原因——避免向攻击者泄露
+/// 「是长度错还是密钥/篡改错」这类旁路信息。
+///
+/// # Examples
+///
+/// 见 [`seal_link_body`] 的往返示例。
+#[must_use]
+pub fn open_link_body(key: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
+    if sealed.len() < 12 + 16 {
+        return None;
+    }
+    let (nonce_bytes, ciphertext) = sealed.split_at(12);
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = Nonce::from_slice(nonce_bytes);
+    cipher.decrypt(nonce, ciphertext).ok()
 }
 
 /// 数据面链路鉴权标签：`HMAC-SHA256(link_secret, method\npath\nts\nnonce\nSHA256(body))` 的 hex。
@@ -263,5 +348,58 @@ mod tests {
         let fp = fingerprint(&[0xabu8; 32]);
         assert_eq!(fp.len(), 64);
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn seal_open_roundtrip() {
+        let key = [9u8; 32];
+        let plaintext = br#"{"url":"http://x/f","saveDir":"","fileName":""}"#;
+        let sealed = seal_link_body(&key, plaintext);
+        // nonce(12) + 明文 + tag(16) 的开销下限。
+        assert_eq!(sealed.len(), plaintext.len() + 12 + 16);
+        let opened = open_link_body(&key, &sealed).expect("decrypt should succeed");
+        assert_eq!(opened, plaintext);
+        // 每次调用随机 nonce：同一明文两次密封结果不同。
+        let sealed2 = seal_link_body(&key, plaintext);
+        assert_ne!(sealed, sealed2);
+    }
+
+    #[test]
+    fn open_rejects_tampered_ciphertext() {
+        let key = [9u8; 32];
+        let plaintext = b"hello link";
+        let mut sealed = seal_link_body(&key, plaintext);
+        // 翻转密文最后一字节（落在 Poly1305 tag 内）。
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0xFF;
+        assert!(open_link_body(&key, &sealed).is_none());
+    }
+
+    #[test]
+    fn open_rejects_wrong_key() {
+        let key = [9u8; 32];
+        let other = [8u8; 32];
+        let plaintext = b"hello link";
+        let sealed = seal_link_body(&key, plaintext);
+        assert!(open_link_body(&other, &sealed).is_none());
+        // 长度不足（只剩 nonce、没有 tag）也必须拒绝。
+        assert!(open_link_body(&key, &sealed[..12]).is_none());
+    }
+
+    #[test]
+    fn aead_key_differs_from_sas_and_link_key() {
+        // 用同一份 32 字节输入喂给三个派生函数：只要 HKDF salt/info 标签不同，
+        // 输出就必然不同。纯回归测试——防止未来有人手滑复制了已有标签，导致
+        // AEAD 密钥能被 SAS / 握手期链路密钥反推，破坏域分隔。
+        let secret = [77u8; 32];
+        let pub_a = [1u8; 32];
+        let pub_b = [2u8; 32];
+
+        let aead_key = derive_link_aead_key(&secret);
+        let link_key = derive_link_key(&secret);
+        let sas = derive_sas(&secret, &pub_a, &pub_b);
+
+        assert_ne!(aead_key.as_slice(), link_key.as_slice());
+        assert_ne!(aead_key.as_slice(), sas.as_bytes());
     }
 }

@@ -722,6 +722,13 @@ pub async fn run(db_dir: PathBuf) {
             }
             Err(e) => {
                 log_info!("[link] init failed: {e}");
+                // 初始化失败不能静默丢弃：`link_dispatch` 在 `lm=None` 时会对每条
+                // 命令都报错反馈，但那要等用户点击配对相关按钮才触发；这里主动
+                // 推一次 `LinkEvent{kind:"error"}`，即使 Dart 侧此时可能尚未订阅
+                // 信号也无妨（最坏情况等价于「从未初始化」，不会比现状更差）。
+                let mut ev = link_event_base("error");
+                ev.message = format!("本地设备互联不可用：{e}");
+                ev.send_signal_to_dart();
                 None
             }
         }
@@ -869,6 +876,15 @@ pub async fn run(db_dir: PathBuf) {
             Box::new(move |cmd: LinkCommand| {
                 if let Some(link) = lm.clone() {
                     tokio::spawn(handle_link_command(cmd, link));
+                } else {
+                    // 子系统未就绪：不能静默丢弃命令，否则用户点任何配对按钮都
+                    // 零反馈，与「功能不存在」无法区分（见 init 失败分支同款诉求）。
+                    let mut ev = link_event_base("error");
+                    // lm==None 时其实知道是哪条命令失败的（cmd 就在手上），标上 action
+                    // 而非留空——留空会被 Dart 当成子系统级错误，摧毁掉不相关的 UI 状态。
+                    ev.action = cmd.action;
+                    ev.message = "本地设备互联不可用".to_string();
+                    ev.send_signal_to_dart();
                 }
             })
         }
@@ -2684,6 +2700,232 @@ fn nm_body_to_captured(
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// 本地设备互联（device link）—— LinkCommand 处理 + LinkEvent 发射（桌面）
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(hub_link)]
+fn link_event_base(kind: &str) -> crate::signals::LinkEvent {
+    crate::signals::LinkEvent {
+        kind: kind.to_string(),
+        action: String::new(),
+        message: String::new(),
+        code: String::new(),
+        ttl_seconds: 0,
+        token: String::new(),
+        sas: String::new(),
+        fingerprint: String::new(),
+        name: String::new(),
+        session_id: String::new(),
+        platform: String::new(),
+        task_id: String::new(),
+        discovered: None,
+        devices: Vec::new(),
+    }
+}
+
+/// 空串 → `None`（`LinkCommand` 的可选字段在 Dart 侧用空串表达“未填”，
+/// dispatch 转发前归一成 `Option<&str>`）。
+#[cfg(hub_link)]
+fn opt(s: &str) -> Option<&str> {
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// 汇总本机名册（含并发在线探测）并以 `LinkEvent{kind:"devices"}` 推给 Dart。
+#[cfg(hub_link)]
+async fn emit_link_devices(link: &fluxdown_engine::link::LinkManager) {
+    use rinf::RustSignal;
+    let records = link.list_devices().await.unwrap_or_default();
+    // 整体超时兜底：单次探测虽有自限时（DirectTransport 3s），但那是**当前唯一**
+    // 传输的实现细节。未来新增 iroh/relay 传输若不严守自身超时，桌面主界面「刷新
+    // 设备列表」就会无限期挂起且毫无兜底。这里与 HTTP 管理面 `ApiHost::link_devices`
+    // 保持同一层 5s 保险：超时即整体按离线渲染，宁可显示不准也不能卡死 UI。
+    let probe =
+        futures_util::future::join_all(records.iter().map(|r| link.is_online(&r.fingerprint)));
+    let online: Vec<bool> = tokio::time::timeout(std::time::Duration::from_secs(5), probe)
+        .await
+        .unwrap_or_else(|_| vec![false; records.len()]);
+    let devices = records
+        .iter()
+        .zip(online)
+        .map(|(r, on)| crate::signals::LinkDevicePiece {
+            fingerprint: r.fingerprint.clone(),
+            name: r.name.clone(),
+            platform: r.platform.clone().unwrap_or_default(),
+            online: on,
+            last_seen_at: r.last_seen_at,
+        })
+        .collect();
+    let mut ev = link_event_base("devices");
+    ev.devices = devices;
+    ev.send_signal_to_dart();
+}
+
+/// 把引擎侧 [`LinkEngineEvent`](fluxdown_engine::link::LinkEngineEvent) 转成
+/// Dart 信号（发现/配对成功/解除配对/错误）。
+#[cfg(hub_link)]
+fn emit_link_engine_event(ev: fluxdown_engine::link::LinkEngineEvent) {
+    use fluxdown_engine::link::{DiscoveryKind, LinkEngineEvent as E};
+    use rinf::RustSignal;
+    match ev {
+        E::Discovered(p) => {
+            let mut e = link_event_base("discovered");
+            e.discovered = Some(crate::signals::LinkDiscoveredPiece {
+                fingerprint: p.fingerprint.unwrap_or_default(),
+                name: p.name,
+                platform: p.platform.unwrap_or_default(),
+                host: p.host,
+                port: p.port as i32,
+                app_version: p.app_version.unwrap_or_default(),
+                source: match p.kind {
+                    DiscoveryKind::Mdns => "mdns",
+                    DiscoveryKind::Manual => "manual",
+                }
+                .to_string(),
+            });
+            e.send_signal_to_dart();
+        }
+        E::Paired(r) => {
+            let mut e = link_event_base("paired");
+            e.fingerprint = r.fingerprint;
+            e.name = r.name;
+            e.send_signal_to_dart();
+        }
+        E::Unpaired(fp) => {
+            let mut e = link_event_base("unpaired");
+            e.fingerprint = fp;
+            e.send_signal_to_dart();
+        }
+        E::Error(m) => {
+            let mut e = link_event_base("error");
+            e.message = m;
+            e.send_signal_to_dart();
+        }
+        E::IncomingPairing {
+            session_id,
+            sas,
+            peer_name,
+            peer_platform,
+        } => {
+            let mut e = link_event_base("incomingPairing");
+            e.session_id = session_id;
+            e.sas = sas;
+            e.name = peer_name;
+            e.platform = peer_platform.unwrap_or_default();
+            e.send_signal_to_dart();
+        }
+    }
+}
+
+/// 处理来自 Dart 的 [`LinkCommand`](crate::signals::LinkCommand)（off-actor 执行）。
+#[cfg(hub_link)]
+async fn handle_link_command(
+    msg: crate::signals::LinkCommand,
+    link: Arc<fluxdown_engine::link::LinkManager>,
+) {
+    use rinf::RustSignal;
+    let emit_err = |m: String| {
+        let mut ev = link_event_base("error");
+        ev.action = msg.action.clone();
+        ev.message = m;
+        ev.send_signal_to_dart();
+    };
+    match msg.action.as_str() {
+        "generateCode" => {
+            let mut e = link_event_base("code");
+            e.code = link.generate_code();
+            // 配对码有效期耦合 engine 侧 `pairing.rs` 的私有常量 `CODE_TTL`
+            // （120s，未 `pub` 导出），这里手写字面量，两侧改动需同步。
+            e.ttl_seconds = 120;
+            e.send_signal_to_dart();
+        }
+        "startDiscovery" => {
+            if let Err(e) = link.start_discovery() {
+                emit_err(e.to_string());
+            }
+        }
+        "stopDiscovery" => link.stop_discovery(),
+        "probe" => match link.probe(&msg.host, msg.port as u16).await {
+            Ok(p) => emit_link_engine_event(fluxdown_engine::link::LinkEngineEvent::Discovered(p)),
+            Err(e) => emit_err(e.to_string()),
+        },
+        "beginPairing" => {
+            match link
+                .begin_pairing(&msg.host, msg.port as u16, &msg.code)
+                .await
+            {
+                Ok(r) => {
+                    let mut e = link_event_base("pairingChallenge");
+                    e.token = r.token;
+                    e.sas = r.sas;
+                    e.name = r.peer_name;
+                    e.fingerprint = r.peer_fingerprint;
+                    e.send_signal_to_dart();
+                }
+                Err(e) => emit_err(e.to_string()),
+            }
+        }
+        "confirmPairing" => match link.confirm_pairing(&msg.token, msg.accept).await {
+            Ok(_) => emit_link_devices(&link).await,
+            Err(e) => emit_err(e.to_string()),
+        },
+        "listDevices" => emit_link_devices(&link).await,
+        "removeDevice" => {
+            if let Err(e) = link.remove_device(&msg.fingerprint).await {
+                emit_err(e.to_string());
+            }
+            emit_link_devices(&link).await;
+        }
+        "approveIncoming" => {
+            match link.approve_incoming(&msg.session_id, msg.accept) {
+                Ok(()) => {
+                    // 批准不用额外发事件：`pair_confirm` 落库成功后引擎会自己
+                    // 广播 `Paired`；拒绝没有后续事件，这里主动关掉本机的核验
+                    // 弹窗。
+                    if !msg.accept {
+                        // 带上 session_id：UI 侧同一时刻可能已经换成了另一个入站
+                        // 会话（旧会话被新 hello 顶掉），不带标识的通知会把刚接手
+                        // 的新会话一并清空。
+                        let mut ev = link_event_base("pairingRejected");
+                        ev.session_id = msg.session_id.clone();
+                        ev.send_signal_to_dart();
+                    }
+                }
+                Err(e) => emit_err(e.to_string()),
+            }
+        }
+        "stopAdvertising" => link.stop_advertising(),
+        "dispatch" => {
+            let result = link
+                .dispatch(
+                    &msg.fingerprint,
+                    &msg.url,
+                    opt(&msg.save_dir),
+                    opt(&msg.file_name),
+                )
+                .await;
+            match result {
+                Ok(task_id) => {
+                    let mut e = link_event_base("dispatched");
+                    e.task_id = task_id;
+                    e.fingerprint = msg.fingerprint.clone();
+                    e.send_signal_to_dart();
+                }
+                Err(e) => {
+                    // dispatch 失败要带 fingerprint（对应目标设备），与成功事件
+                    // 对称，否则 Dart 无法把这条失败归属到具体某次下发。
+                    let mut ev = link_event_base("error");
+                    ev.action = msg.action.clone();
+                    ev.fingerprint = msg.fingerprint.clone();
+                    ev.message = e.to_string();
+                    ev.send_signal_to_dart();
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -2746,152 +2988,5 @@ mod tests {
         let signal = synthesize_batch_request(&[a, b]);
         assert_eq!(signal.referrer, "https://page.example/");
         assert_eq!(signal.save_dir, "D:/dl");
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────
-// 本地设备互联（device link）—— LinkCommand 处理 + LinkEvent 发射（桌面）
-// ─────────────────────────────────────────────────────────────────────────
-
-#[cfg(hub_link)]
-fn link_event_base(kind: &str) -> crate::signals::LinkEvent {
-    crate::signals::LinkEvent {
-        kind: kind.to_string(),
-        message: String::new(),
-        code: String::new(),
-        ttl_seconds: 0,
-        token: String::new(),
-        sas: String::new(),
-        fingerprint: String::new(),
-        name: String::new(),
-        discovered: None,
-        devices: Vec::new(),
-    }
-}
-
-/// 汇总本机名册（含并发在线探测）并以 `LinkEvent{kind:"devices"}` 推给 Dart。
-#[cfg(hub_link)]
-async fn emit_link_devices(link: &fluxdown_engine::link::LinkManager) {
-    use rinf::RustSignal;
-    let records = link.list_devices().await.unwrap_or_default();
-    let online: Vec<bool> =
-        futures_util::future::join_all(records.iter().map(|r| link.is_online(&r.fingerprint)))
-            .await;
-    let devices = records
-        .iter()
-        .zip(online)
-        .map(|(r, on)| crate::signals::LinkDevicePiece {
-            fingerprint: r.fingerprint.clone(),
-            name: r.name.clone(),
-            platform: r.platform.clone().unwrap_or_default(),
-            online: on,
-            last_seen_at: r.last_seen_at,
-        })
-        .collect();
-    let mut ev = link_event_base("devices");
-    ev.devices = devices;
-    ev.send_signal_to_dart();
-}
-
-/// 把引擎侧 [`LinkEngineEvent`](fluxdown_engine::link::LinkEngineEvent) 转成
-/// Dart 信号（发现/配对成功/解除配对/错误）。
-#[cfg(hub_link)]
-fn emit_link_engine_event(ev: fluxdown_engine::link::LinkEngineEvent) {
-    use fluxdown_engine::link::{DiscoveryKind, LinkEngineEvent as E};
-    use rinf::RustSignal;
-    match ev {
-        E::Discovered(p) => {
-            let mut e = link_event_base("discovered");
-            e.discovered = Some(crate::signals::LinkDiscoveredPiece {
-                fingerprint: p.fingerprint.unwrap_or_default(),
-                name: p.name,
-                platform: p.platform.unwrap_or_default(),
-                host: p.host,
-                port: p.port as i32,
-                app_version: p.app_version.unwrap_or_default(),
-                source: match p.kind {
-                    DiscoveryKind::Mdns => "mdns",
-                    DiscoveryKind::Manual => "manual",
-                }
-                .to_string(),
-            });
-            e.send_signal_to_dart();
-        }
-        E::Paired(r) => {
-            let mut e = link_event_base("paired");
-            e.fingerprint = r.fingerprint;
-            e.name = r.name;
-            e.send_signal_to_dart();
-        }
-        E::Unpaired(fp) => {
-            let mut e = link_event_base("unpaired");
-            e.fingerprint = fp;
-            e.send_signal_to_dart();
-        }
-        E::Error(m) => {
-            let mut e = link_event_base("error");
-            e.message = m;
-            e.send_signal_to_dart();
-        }
-    }
-}
-
-/// 处理来自 Dart 的 [`LinkCommand`](crate::signals::LinkCommand)（off-actor 执行）。
-#[cfg(hub_link)]
-async fn handle_link_command(
-    msg: crate::signals::LinkCommand,
-    link: Arc<fluxdown_engine::link::LinkManager>,
-) {
-    use rinf::RustSignal;
-    let emit_err = |m: String| {
-        let mut ev = link_event_base("error");
-        ev.message = m;
-        ev.send_signal_to_dart();
-    };
-    match msg.action.as_str() {
-        "generateCode" => {
-            let mut e = link_event_base("code");
-            e.code = link.generate_code();
-            e.ttl_seconds = 120;
-            e.send_signal_to_dart();
-        }
-        "startDiscovery" => {
-            if let Err(e) = link.start_discovery() {
-                emit_err(e.to_string());
-            }
-        }
-        "stopDiscovery" => link.stop_discovery(),
-        "probe" => match link.probe(&msg.host, msg.port as u16).await {
-            Ok(p) => emit_link_engine_event(fluxdown_engine::link::LinkEngineEvent::Discovered(p)),
-            Err(e) => emit_err(e.to_string()),
-        },
-        "beginPairing" => {
-            match link
-                .begin_pairing(&msg.host, msg.port as u16, &msg.code)
-                .await
-            {
-                Ok(r) => {
-                    let mut e = link_event_base("pairingChallenge");
-                    e.token = r.token;
-                    e.sas = r.sas;
-                    e.name = r.peer_name;
-                    e.fingerprint = r.peer_fingerprint;
-                    e.send_signal_to_dart();
-                }
-                Err(e) => emit_err(e.to_string()),
-            }
-        }
-        "confirmPairing" => match link.confirm_pairing(&msg.token, msg.accept).await {
-            Ok(_) => emit_link_devices(&link).await,
-            Err(e) => emit_err(e.to_string()),
-        },
-        "listDevices" => emit_link_devices(&link).await,
-        "removeDevice" => {
-            if let Err(e) = link.remove_device(&msg.fingerprint).await {
-                emit_err(e.to_string());
-            }
-            emit_link_devices(&link).await;
-        }
-        _ => {}
     }
 }

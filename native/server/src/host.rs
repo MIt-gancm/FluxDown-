@@ -20,9 +20,10 @@ use async_trait::async_trait;
 use fluxdown_api::service::{ApiError, ApiHost, LiveSpeed, TaskEvent};
 use fluxdown_api::types::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
-    LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmRequest,
-    LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo, LinkTaskRequest, MarketEntryDto,
-    PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse, TaskDto,
+    LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
+    LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
+    LinkTaskRequest, MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest,
+    ResolvePreviewResponse, TaskDto,
 };
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec};
@@ -559,8 +560,9 @@ impl ApiHost for ServerApiHost {
     async fn link_pair_hello(
         &self,
         req: LinkPairHelloRequest,
+        source: Option<std::net::IpAddr>,
     ) -> Result<LinkPairHelloResponse, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let wire = WireHello {
             code: req.code,
             initiator_eph_pub: req.initiator_eph_pub,
@@ -571,7 +573,7 @@ impl ApiHost for ServerApiHost {
             app_version: opt_str(req.app_version),
             initiator_addrs: req.initiator_addrs,
         };
-        let resp = link.pair_hello_wire(wire).map_err(map_link_err)?;
+        let resp = link.pair_hello_wire(wire, source).map_err(map_link_err)?;
         Ok(LinkPairHelloResponse {
             session_id: resp.session_id,
             responder_eph_pub: resp.responder_eph_pub,
@@ -584,30 +586,43 @@ impl ApiHost for ServerApiHost {
         })
     }
 
-    async fn link_pair_confirm(&self, req: LinkPairConfirmRequest) -> Result<(), ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
-        link.pair_confirm(&req.session_id, req.confirm)
+    async fn link_pair_confirm(
+        &self,
+        req: LinkPairConfirmRequest,
+    ) -> Result<LinkPairConfirmOutcome, ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        let outcome = link
+            .pair_confirm(&req.session_id, req.confirm)
             .await
             .map_err(map_link_err)?;
-        Ok(())
+        Ok(map_confirm_outcome(outcome))
+    }
+
+    async fn link_approve_incoming(&self, session_id: &str, accept: bool) -> Result<(), ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        link.approve_incoming(session_id, accept)
+            .map_err(map_link_err)
     }
 
     async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<String, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
-        // 用收到的原始字节校验（HMAC 覆盖 body 摘要），再反序列化。
-        link.authorize(
-            "POST",
-            "/api/v1/link/tasks",
-            &auth.device,
-            auth.ts,
-            &auth.nonce,
-            &body,
-            &auth.tag,
-        )
-        .await
-        .map_err(map_link_err)?;
-        let req: LinkTaskRequest =
-            serde_json::from_slice(&body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        // 鉴权通过后拿到**已解密**的明文 body：调用方手里的原始字节现在是
+        // 密文，不能再用它反序列化（HMAC 覆盖的也是密文摘要）。
+        let authorized = link
+            .authorize(
+                "POST",
+                "/api/v1/link/tasks",
+                &auth.device,
+                auth.ts,
+                &auth.nonce,
+                &body,
+                &auth.tag,
+                &auth.enc,
+            )
+            .await
+            .map_err(map_link_err)?;
+        let req: LinkTaskRequest = serde_json::from_slice(&authorized.body)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         let ctreq: CreateTaskRequest = serde_json::from_value(serde_json::json!({
             "url": req.url,
             "saveDir": req.save_dir,
@@ -618,15 +633,21 @@ impl ApiHost for ServerApiHost {
     }
 
     async fn link_generate_code(&self) -> Result<LinkCodeResponse, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         Ok(LinkCodeResponse {
             code: link.generate_code(),
             ttl_seconds: 120,
         })
     }
 
+    async fn link_stop_advertising(&self) -> Result<(), ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        link.stop_advertising();
+        Ok(())
+    }
+
     async fn link_discovery(&self, start: bool) -> Result<(), ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         if start {
             link.start_discovery().map_err(map_link_err)
         } else {
@@ -636,7 +657,7 @@ impl ApiHost for ServerApiHost {
     }
 
     async fn link_discovered(&self) -> Result<Vec<LinkDiscoveredPeer>, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         Ok(link
             .discovered_peers()
             .into_iter()
@@ -645,7 +666,7 @@ impl ApiHost for ServerApiHost {
     }
 
     async fn link_probe(&self, host: &str, port: u16) -> Result<LinkDiscoveredPeer, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         link.probe(host, port)
             .await
             .map(link_discovered_dto)
@@ -658,7 +679,7 @@ impl ApiHost for ServerApiHost {
         port: u16,
         code: &str,
     ) -> Result<LinkPairBeginResponse, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let result = link
             .begin_pairing(host, port, code)
             .await
@@ -676,7 +697,7 @@ impl ApiHost for ServerApiHost {
         token: &str,
         accept: bool,
     ) -> Result<Option<LinkDeviceInfo>, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let Some(record) = link
             .confirm_pairing(token, accept)
             .await
@@ -699,7 +720,7 @@ impl ApiHost for ServerApiHost {
     /// `emit_link_devices` 的并发思路），整体限时兜底——个别设备长时间不可达
     /// 不应拖慢整批响应。
     async fn link_devices(&self) -> Result<Vec<LinkDeviceInfo>, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let records = link.list_devices().await.map_err(map_link_err)?;
         let probe =
             futures_util::future::join_all(records.iter().map(|r| link.is_online(&r.fingerprint)));
@@ -721,7 +742,7 @@ impl ApiHost for ServerApiHost {
     }
 
     async fn link_remove_device(&self, fingerprint: &str) -> Result<bool, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         link.remove_device(fingerprint).await.map_err(map_link_err)
     }
 
@@ -732,7 +753,7 @@ impl ApiHost for ServerApiHost {
         save_dir: Option<&str>,
         file_name: Option<&str>,
     ) -> Result<String, ApiError> {
-        let link = self.link.as_ref().ok_or(ApiError::Unauthorized)?;
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
         link.dispatch(fingerprint, url, save_dir, file_name)
             .await
             .map_err(map_link_err)
@@ -761,6 +782,20 @@ fn opt_str(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// 引擎 [`PairConfirmOutcome`] → API [`LinkPairConfirmOutcome`]。两者字段一致但分属
+/// 两个 crate（`fluxdown_api` 不依赖引擎的可选 link 模块），这里做一次显式搬运。
+fn map_confirm_outcome(
+    outcome: fluxdown_engine::link::PairConfirmOutcome,
+) -> LinkPairConfirmOutcome {
+    use fluxdown_engine::link::PairConfirmOutcome as E;
+    match outcome {
+        E::Paired => LinkPairConfirmOutcome::Paired,
+        E::Declined => LinkPairConfirmOutcome::Declined,
+        E::Rejected => LinkPairConfirmOutcome::Rejected,
+        E::TimedOut => LinkPairConfirmOutcome::TimedOut,
+    }
+}
+
 /// [`LinkError`] → [`ApiError`] 映射（决定 HTTP 状态码）。
 fn map_link_err(e: LinkError) -> ApiError {
     match e {
@@ -769,10 +804,26 @@ fn map_link_err(e: LinkError) -> ApiError {
         | LinkError::BadSignature
         | LinkError::BadPayload(_)
         | LinkError::SelfPairing
-        | LinkError::SessionExpired => ApiError::BadRequest(e.to_string()),
-        LinkError::Unreachable => ApiError::Unavailable,
+        | LinkError::SessionExpired
+        | LinkError::Throttled
+        | LinkError::RejectedByPeer
+        | LinkError::PairingTimeout
+        | LinkError::IdentityMismatch(_) => ApiError::BadRequest(e.to_string()),
+        LinkError::Unreachable | LinkError::Unavailable => ApiError::Unavailable,
         other => ApiError::Internal(other.to_string()),
     }
+}
+
+/// `self.link` 为 `None`（本宿主未启用/未初始化设备互联）时的统一错误。
+///
+/// 复用 [`fluxdown_api::service::link_unsupported`] 的稳定契约 message
+/// （`"device link not supported by this host"`）——不能改用
+/// `ApiError::Unavailable`（固定文案 `"app shutting down"`，语义是宿主
+/// 正在关闭/命令通道已断，牛头不对马嘴）。Web 侧 `isLinkUnsupportedError()`
+/// 靠逐字比对这条 message 识别「宿主不支持设备互联」并展示专用提示，
+/// 文案用错就等于把这条 UX 分支废掉。
+fn link_disabled() -> ApiError {
+    fluxdown_api::service::link_unsupported()
 }
 
 /// 把插件清单条目转换为 REST 预解析响应 DTO（`server` 侧 wire↔engine
@@ -1051,7 +1102,7 @@ mod tests {
 
         // 响应方（被添加设备）+ 真实 HTTP 服务器。
         let db_r = mem_db("resp").await;
-        let (tx_r, _rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
+        let (tx_r, rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
         let responder = LinkManager::load(db_r.clone(), info("NAS"), 17800, tx_r)
             .await
             .expect("responder link");
@@ -1076,7 +1127,11 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let app = fluxdown_api::server::api_router(host, cfg);
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
         });
 
         // 发起方（添加设备）。
@@ -1085,6 +1140,22 @@ mod tests {
         let initiator = LinkManager::load(db_i, info("Laptop"), 0, tx_i)
             .await
             .expect("initiator link");
+
+        // 配对现在是**双边确认**：响应方收到 hello 后会广播 IncomingPairing，其本机
+        // 用户必须核对 SAS 再批准，发起方的 confirm 请求在此期间挂起。测试里用一个
+        // 后台任务扮演「核对无误后点了确认的用户」。
+        let approver = responder.clone();
+        tokio::spawn(async move {
+            let mut rx = rx_r;
+            while let Some(ev) = rx.recv().await {
+                if let fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
+                    session_id, ..
+                } = ev
+                {
+                    let _ = approver.approve_incoming(&session_id, true);
+                }
+            }
+        });
 
         // begin（发 hello）→ confirm（发 confirm），全程真实 HTTP。
         let begin = initiator
@@ -1166,7 +1237,11 @@ mod tests {
             let addr = listener.local_addr().expect("addr");
             let app = fluxdown_api::server::api_router(host, cfg);
             tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                let _ = axum::serve(
+                    listener,
+                    app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await;
             });
             addr
         }
@@ -1174,11 +1249,25 @@ mod tests {
         // 响应方：真实 HTTP 服务器，承载既有数据面端点（pair/hello、pair/confirm，
         // 无 token 鉴权）——发起方管理面 handler 内部会向它发真实 HTTP 请求。
         let db_r = mem_db("resp").await;
-        let (tx_r, _rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
+        let (tx_r, rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
         let responder = LinkManager::load(db_r.clone(), info("NAS"), 17800, tx_r)
             .await
             .expect("responder link");
         let code = responder.generate_code();
+        // 双边确认：后台任务扮演响应方「核对 SAS 后点了确认」的用户，否则发起方的
+        // finish 会一直挂到 60s 决策窗口耗尽并拿到 PairingTimeout。
+        let approver = responder.clone();
+        tokio::spawn(async move {
+            let mut rx = rx_r;
+            while let Some(ev) = rx.recv().await {
+                if let fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
+                    session_id, ..
+                } = ev
+                {
+                    let _ = approver.approve_incoming(&session_id, true);
+                }
+            }
+        });
         let addr_r = spawn_management(responder, db_r, "resp-token").await;
 
         // 发起方：本测试实际驱动的对象——经其新管理面路由完成 begin/finish/
@@ -1281,5 +1370,115 @@ mod tests {
             .await
             .expect("delete missing request");
         assert_eq!(del_missing.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// 端到端：响应方本机用户**拒绝**配对时，发起方必须拿到明确的
+    /// [`LinkError::RejectedByPeer`]，而不是含糊的「会话过期」，且两端都不入册。
+    ///
+    /// 这条曾经真的错过：响应方把用户拒绝当成服务端错误回 400，发起方见非 2xx 一律
+    /// 压成 `SessionExpired`，用户看到的是「会话过期」——会让人以为是网络抖动而反复
+    /// 重试一个对方明确拒绝过的配对。拒绝是协议的**正常终局**，必须以 2xx +
+    /// `paired=false` + `reason` 表达。
+    #[tokio::test]
+    async fn link_pairing_rejected_by_responder_over_http() {
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+
+        async fn mem_db(tag: &str) -> Db {
+            let url = format!(
+                "sqlite:file:linkreject_{tag}_{}?mode=memory&cache=shared",
+                uuid::Uuid::new_v4().simple()
+            );
+            Db::connect(&url).await.expect("mem db")
+        }
+        fn info(name: &str) -> fluxdown_engine::link::SelfInfo {
+            fluxdown_engine::link::SelfInfo {
+                name: name.to_string(),
+                platform: Some("linux".to_string()),
+                app_version: None,
+            }
+        }
+
+        let db_r = mem_db("resp").await;
+        let (tx_r, rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
+        let responder = LinkManager::load(db_r.clone(), info("NAS"), 17800, tx_r)
+            .await
+            .expect("responder link");
+        let code = responder.generate_code();
+
+        // 后台任务扮演「核对 SAS 发现不一致、点了拒绝」的响应方用户。
+        let rejecter = responder.clone();
+        tokio::spawn(async move {
+            let mut rx = rx_r;
+            while let Some(ev) = rx.recv().await {
+                if let fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
+                    session_id, ..
+                } = ev
+                {
+                    let _ = rejecter.approve_incoming(&session_id, false);
+                }
+            }
+        });
+
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let host: Arc<dyn ApiHost> = Arc::new(ServerApiHost::new(
+            db_r,
+            cmd_tx,
+            Arc::new(WsHub::new(4)),
+            None,
+            None,
+            None,
+            std::env::temp_dir(),
+            Some(responder.clone()),
+        ));
+        let cfg = fluxdown_api::server::ApiServerConfig::from_config_map(
+            &std::collections::HashMap::new(),
+            "test",
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let app = fluxdown_api::server::api_router(host, cfg);
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await;
+        });
+
+        let db_i = mem_db("init").await;
+        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
+        let initiator = LinkManager::load(db_i, info("Laptop"), 0, tx_i)
+            .await
+            .expect("initiator link");
+
+        let begin = initiator
+            .begin_pairing("127.0.0.1", addr.port(), &code)
+            .await
+            .expect("begin pairing");
+        let err = initiator
+            .confirm_pairing(&begin.token, true)
+            .await
+            .expect_err("responder rejected, confirm must fail");
+        assert!(
+            matches!(err, fluxdown_engine::link::LinkError::RejectedByPeer),
+            "期望 RejectedByPeer，实际 {err:?}"
+        );
+
+        // 拒绝后两端都不该留下任何配对痕迹。
+        assert!(
+            initiator
+                .list_devices()
+                .await
+                .expect("init devices")
+                .is_empty()
+        );
+        assert!(
+            responder
+                .list_devices()
+                .await
+                .expect("resp devices")
+                .is_empty()
+        );
     }
 }

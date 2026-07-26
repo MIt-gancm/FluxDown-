@@ -1968,7 +1968,8 @@ class DetailFooterPrimaryButton extends StatelessWidget {
       case TaskStatus.error:
         return _filled(c, onResume, Text(s.resume, style: _kLabelStyle));
       case TaskStatus.completed:
-        return const SizedBox.shrink();
+      case TaskStatus.canceled:
+        return const SizedBox.shrink(); // 两者均为终态，无主操作按钮
     }
   }
 

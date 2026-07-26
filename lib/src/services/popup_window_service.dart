@@ -31,6 +31,7 @@ import '../popup/popup_payload.dart';
 import '../theme/theme_provider.dart';
 import '../widgets/quick_download_form.dart';
 import 'cloud/cloud_auth_service.dart';
+import 'link/local_pairing_service.dart';
 import 'log_service.dart';
 import 'quick_download_submitter.dart';
 import 'resolve_preview_client.dart';
@@ -157,6 +158,7 @@ class PopupWindowService {
 
     final queues = DownloadController.globalInstance?.queues ?? const [];
     final devices = CloudAuthService.instance.remoteDevices;
+    final localDevices = LocalPairingService.instance.localDevices;
     final payload = QuickPopupPayload(
       requestId: ++_seq,
       url: req.url,
@@ -185,6 +187,19 @@ class PopupWindowService {
             name: d.name,
             platform: d.platform,
             isOnline: d.isOnline,
+          ),
+      ],
+      // 本地配对设备（局域网直连，免账号）：popup isolate 不接线 rinf
+      // 信号，LocalPairingService.instance.localDevices 在那里恒为空
+      // （见 quick_download_form.dart 的 _localDeviceOptions 注释），
+      // 名册必须在这里序列化进载荷，与云端设备名册同一种方式下发。
+      localDevices: [
+        for (final d in localDevices)
+          QuickDeviceOption(
+            deviceId: d.fingerprint,
+            name: d.name,
+            platform: d.platform,
+            isOnline: d.online,
           ),
       ],
     );
@@ -529,7 +544,11 @@ class PopupWindowService {
       );
     }
     final entries = parseQuickDownloadEntries(form.urlText);
+    // 已选目标设备时不预解析：下发 = 把原始链接交给那台设备处理，本机抢先解析
+    // 清单只会把任务建到本机、静默吞掉下发意图（门控与 quick_download_dialog、
+    // popup_app 的提交入口保持一致）。
     if (pending.audioUrl.isNotEmpty ||
+        form.targetDeviceId.trim().isNotEmpty ||
         entries.length != 1 ||
         !isManifestPreviewableUrl(entries.first.url)) {
       _finishSubmit(form, pending);

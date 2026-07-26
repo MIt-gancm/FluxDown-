@@ -2044,7 +2044,8 @@ class _GeneralContent extends StatelessWidget {
                   description: s.showSidebarDeviceDesc,
                   child: ShadSwitch(
                     value: settingsProvider.showSidebarDeviceEffective(
-                      CloudAuthService.instance.hasRemoteDevices,
+                      CloudAuthService.instance.hasRemoteDevices ||
+                          LocalPairingService.instance.hasLocalDevices,
                     ),
                     onChanged: (v) => settingsProvider.setShowSidebarDevice(v),
                   ),
@@ -9466,7 +9467,8 @@ class _AccountContentState extends State<_AccountContent> {
                 // 未登录：暴露免账号「本地设备」区（本机配对码 + 已配对名册 +
                 // 添加设备入口）。登录用户经上方「设备协同」卡片的添加设备弹窗
                 // 也能用本地配对页，故此处仅未登录时补齐入口。
-                if (!loggedIn || user == null) ...[
+                if (LocalPairingService.instance.supported &&
+                    (!loggedIn || user == null)) ...[
                   const SizedBox(height: 20),
                   _LocalDeviceSection(
                     settingsProvider: widget.settingsProvider,
@@ -10321,6 +10323,20 @@ class _LocalDeviceSection extends StatefulWidget {
 class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
   List<String> _localIps = const [];
 
+  /// 配对码倒计时用的 1s ticker：配对码有 TTL（i18n 文案承诺"2 分钟内有
+  /// 效"），过期后需要置灰码并提示重新生成，而不是原样常驻显示一个已失
+  /// 效的码。倒计时数值本身由 build() 用 codeExpiresAt 实时计算，ticker
+  /// 只负责每秒触发一次重建。
+  Timer? _codeTicker;
+
+  /// 过期瞬间缓存的码文本，供过期后置灰展示——上面的 ticker 检测到码过期
+  /// 时会调 [LocalPairingService.stopAdvertising]，此时码确已过期，该方法
+  /// 才会顺带清空 generatedCode/codeExpiresAt（stopAdvertising 只在码已
+  /// 过期时才清本地展示态，见其文档）；但产品要求过期时是"码置灰 + 提示
+  /// 重新生成"而不是直接消失变回未生成的初始态，所以在调 stopAdvertising
+  /// 前本地留一份快照。生成新码时经 [_generateCode] 清空。
+  String? _expiredCodeSnapshot;
+
   @override
   void initState() {
     super.initState();
@@ -10328,6 +10344,35 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
     unawaited(LocalPairingService.instance.attach());
     LocalPairingService.instance.refreshDevices();
     unawaited(_loadLocalIps());
+    _codeTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final svc = LocalPairingService.instance;
+      if (svc.codeExpired && svc.generatedCode != null) {
+        _expiredCodeSnapshot = svc.generatedCode;
+        svc.stopAdvertising();
+      }
+      setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _codeTicker?.cancel();
+    // 只在配对码已经过期时才停广播：码还在有效期内说明用户可能正准备去
+    // 另一台设备输入码完成配对（生成完码切到另一台设备是最自然的流程），
+    // 此时停广播会让本机从对端「发现」列表消失，用户拿着一个「2 分钟内
+    // 有效」的码却搜不到设备。stopAdvertising 本身不撤销码（见其文档），
+    // 码过期后再停广播只是清理 mDNS 资源，不影响配对结果。
+    if (LocalPairingService.instance.codeExpired) {
+      LocalPairingService.instance.stopAdvertising();
+    }
+    super.dispose();
+  }
+
+  /// 生成配对码前清空过期快照，避免上一轮过期展示污染新一轮倒计时。
+  void _generateCode(LocalPairingService svc) {
+    setState(() => _expiredCodeSnapshot = null);
+    svc.generateCode();
   }
 
   /// 探测本机非回环 IPv4，用于「本机地址」展示（供对端在同网络/组网内连接）。
@@ -10353,6 +10398,14 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
     FluxSonner.of(context).show(
       ShadToast(title: Text(LocaleScope.of(context).localDeviceCodeCopied)),
     );
+  }
+
+  /// 配对码剩余有效秒数（!codeExpired 分支才会用到，此时 codeExpiresAt
+  /// 理论上不为 null；为 null 时保守返回 0）。
+  int _remainingSeconds(LocalPairingService svc) {
+    final expiresAt = svc.codeExpiresAt;
+    if (expiresAt == null) return 0;
+    return expiresAt.difference(DateTime.now()).inSeconds.clamp(0, 999999);
   }
 
   @override
@@ -10415,25 +10468,10 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
                     style: TextStyle(fontSize: 11.5, color: c.textMuted),
                   ),
                   const SizedBox(height: 12),
-                  if (code == null || code.isEmpty)
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: ShadButton.outline(
-                        size: ShadButtonSize.sm,
-                        onPressed: svc.generateCode,
-                        child: Text(s.localGenerateCode),
-                      ),
-                    )
-                  else
+                  if (code != null && code.isNotEmpty) ...[
                     Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 14,
-                        vertical: 12,
-                      ),
-                      decoration: BoxDecoration(
-                        color: c.surface2,
-                        borderRadius: m.brInput,
-                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(color: c.surface2, borderRadius: m.brInput),
                       child: Row(
                         children: [
                           Expanded(
@@ -10444,9 +10482,7 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
                                 fontWeight: FontWeight.w700,
                                 letterSpacing: 2,
                                 color: c.textPrimary,
-                                fontFeatures: const [
-                                  FontFeature.tabularFigures(),
-                                ],
+                                fontFeatures: const [FontFeature.tabularFigures()],
                               ),
                             ),
                           ),
@@ -10456,6 +10492,49 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
                             child: const Icon(LucideIcons.copy, size: 14),
                           ),
                         ],
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      s.localDeviceCodeRemaining(_remainingSeconds(svc)),
+                      style: TextStyle(fontSize: 11, color: c.textMuted),
+                    ),
+                  ] else if (_expiredCodeSnapshot != null) ...[
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                      decoration: BoxDecoration(color: c.surface2, borderRadius: m.brInput),
+                      child: Text(
+                        _expiredCodeSnapshot!.split('').join('  '),
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 2,
+                          color: c.textMuted,
+                          fontFeatures: const [FontFeature.tabularFigures()],
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    Text(
+                      s.localDeviceCodeExpired,
+                      style: TextStyle(fontSize: 11.5, color: c.statusError),
+                    ),
+                    const SizedBox(height: 8),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: ShadButton.outline(
+                        size: ShadButtonSize.sm,
+                        onPressed: () => _generateCode(svc),
+                        child: Text(s.localGenerateCode),
+                      ),
+                    ),
+                  ] else
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: ShadButton.outline(
+                        size: ShadButtonSize.sm,
+                        onPressed: () => _generateCode(svc),
+                        child: Text(s.localGenerateCode),
                       ),
                     ),
                   const SizedBox(height: 12),
@@ -10584,8 +10663,7 @@ class _LocalDeviceRow extends StatelessWidget {
           ),
           ShadButton.ghost(
             size: ShadButtonSize.sm,
-            onPressed: () =>
-                LocalPairingService.instance.removeDevice(device.fingerprint),
+            onPressed: () => _confirmUnpair(context),
             child: Text(
               s.localDeviceUnpair,
               style: TextStyle(fontSize: 12, color: c.statusError),
@@ -10593,6 +10671,44 @@ class _LocalDeviceRow extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+
+  Future<void> _confirmUnpair(BuildContext context) async {
+    final confirmed = await showShadDialog<bool>(
+      context: context,
+      builder: (_) => _LocalDeviceUnpairDialog(device: device),
+    );
+    if (confirmed == true) {
+      LocalPairingService.instance.removeDevice(device.fingerprint);
+    }
+  }
+}
+
+/// 本地设备解除配对二次确认。removeDevice 是纯本地命令（不经网络往返，
+/// 不会像云端 _DeleteDeviceDialog 那样失败），故不需要那套 busy/error
+/// 状态：确认后直接关闭弹窗返回 true，由调用方发送解除命令。
+class _LocalDeviceUnpairDialog extends StatelessWidget {
+  final LocalDevice device;
+  const _LocalDeviceUnpairDialog({required this.device});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    return ShadDialog(
+      title: Text(s.localDeviceUnpairConfirmTitle),
+      description: Text(s.localDeviceUnpairConfirmDesc),
+      constraints: const BoxConstraints(maxWidth: 380),
+      actions: [
+        ShadButton.outline(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: Text(s.cancel),
+        ),
+        ShadButton.destructive(
+          onPressed: () => Navigator.of(context).pop(true),
+          child: Text(s.confirm),
+        ),
+      ],
     );
   }
 }
