@@ -19,6 +19,18 @@
 
 #define WM_MYMESSAGE (WM_USER + 1)
 
+// Fixed notification-area icon id.  MUST be stable across process launches:
+// Windows keys the user's "show/hide in notification area" preference on
+// (exe path, uID).  A random/uninitialised uID makes the preference
+// unrestorable, so the icon silently drops into the overflow flyout.
+#define TRAY_ICON_UID 1
+
+// Timer used to retry NIM_ADD when the shell is not ready yet (boot,
+// restart right after an update).
+#define TRAY_ADD_RETRY_TIMER 0x5452
+#define TRAY_ADD_RETRY_INTERVAL_MS 1000
+#define TRAY_ADD_RETRY_MAX 10
+
 namespace {
 
 const flutter::EncodableValue* ValueOrNull(const flutter::EncodableMap& map,
@@ -46,10 +58,18 @@ class TrayManagerPlugin : public flutter::Plugin {
   std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> g_converter;
 
   flutter::PluginRegistrarWindows* registrar;
-  NOTIFYICONDATA nid;
-  NOTIFYICONIDENTIFIER niif;
-  HMENU hMenu;
+  // Zero-initialised: uID / szTip / guidItem must not be indeterminate.
+  NOTIFYICONDATA nid{};
+  NOTIFYICONIDENTIFIER niif{};
+  HMENU hMenu = nullptr;
   bool tray_icon_setted = false;
+
+  // Broadcast sent by the shell after explorer.exe restarts; every tray owner
+  // must re-add its icon or it is gone until the process restarts.
+  UINT taskbar_created_msg = 0;
+  // Last icon path handed to SetIcon, so the icon can be rebuilt on demand.
+  std::wstring icon_path;
+  int add_retry_left = 0;
 
   // The ID of the WindowProc delegate registration.
   int window_proc_id = -1;
@@ -62,6 +82,10 @@ class TrayManagerPlugin : public flutter::Plugin {
                                                              WPARAM wparam,
                                                              LPARAM lparam);
   HWND TrayManagerPlugin::GetMainWindow();
+  HICON TrayManagerPlugin::LoadIconFromPath(const std::wstring& path);
+  bool TrayManagerPlugin::AddIcon(bool reset_retry);
+  void TrayManagerPlugin::ScheduleAddRetry();
+  void TrayManagerPlugin::CancelAddRetry();
   void TrayManagerPlugin::Destroy(
       const flutter::MethodCall<flutter::EncodableValue>& method_call,
       std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result);
@@ -105,6 +129,8 @@ void TrayManagerPlugin::RegisterWithRegistrar(
 
 TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
     : registrar(registrar) {
+  // Registered once per process; the returned id is global to the session.
+  taskbar_created_msg = ::RegisterWindowMessage(L"TaskbarCreated");
   window_proc_id = registrar->RegisterTopLevelWindowProcDelegate(
       [this](HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam) {
         return HandleWindowProc(hwnd, message, wparam, lparam);
@@ -113,6 +139,49 @@ TrayManagerPlugin::TrayManagerPlugin(flutter::PluginRegistrarWindows* registrar)
 
 TrayManagerPlugin::~TrayManagerPlugin() {
   registrar->UnregisterTopLevelWindowProcDelegate(window_proc_id);
+}
+
+HICON TrayManagerPlugin::LoadIconFromPath(const std::wstring& path) {
+  if (path.empty()) {
+    return nullptr;
+  }
+  return static_cast<HICON>(::LoadImage(
+      nullptr, path.c_str(), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+      GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
+}
+
+void TrayManagerPlugin::CancelAddRetry() {
+  if (add_retry_left > 0) {
+    ::KillTimer(GetMainWindow(), TRAY_ADD_RETRY_TIMER);
+  }
+  add_retry_left = 0;
+}
+
+void TrayManagerPlugin::ScheduleAddRetry() {
+  if (add_retry_left <= 0) {
+    return;
+  }
+  ::SetTimer(GetMainWindow(), TRAY_ADD_RETRY_TIMER,
+             TRAY_ADD_RETRY_INTERVAL_MS, nullptr);
+}
+
+// Adds the icon to the notification area.  Shell_NotifyIcon fails while the
+// shell is still starting up, so failures are retried on a timer instead of
+// leaving the app permanently trayless.
+bool TrayManagerPlugin::AddIcon(bool reset_retry) {
+  if (reset_retry) {
+    CancelAddRetry();
+    add_retry_left = TRAY_ADD_RETRY_MAX;
+  }
+  nid.hWnd = GetMainWindow();
+  if (!Shell_NotifyIcon(NIM_ADD, &nid)) {
+    tray_icon_setted = false;
+    ScheduleAddRetry();
+    return false;
+  }
+  CancelAddRetry();
+  tray_icon_setted = true;
+  return true;
 }
 
 void TrayManagerPlugin::_CreateMenu(HMENU menu, flutter::EncodableMap args) {
@@ -170,10 +239,39 @@ std::optional<LRESULT> TrayManagerPlugin::HandleWindowProc(HWND hWnd,
                                                            WPARAM wParam,
                                                            LPARAM lParam) {
   std::optional<LRESULT> result;
+  // Explorer restarted (crash, shell refresh, some Windows updates): the
+  // shell dropped every tray icon, re-add ours.  Never consume the message —
+  // other plugins listen for it too.
+  if (taskbar_created_msg != 0 && message == taskbar_created_msg) {
+    if (!icon_path.empty()) {
+      HICON fresh = LoadIconFromPath(icon_path);
+      if (fresh != nullptr) {
+        HICON old = nid.hIcon;
+        nid.hIcon = fresh;
+        if (old != nullptr) {
+          DestroyIcon(old);
+        }
+      }
+      tray_icon_setted = false;
+      AddIcon(true);
+    }
+    return result;
+  }
+  if (message == WM_TIMER && wParam == TRAY_ADD_RETRY_TIMER) {
+    ::KillTimer(hWnd, TRAY_ADD_RETRY_TIMER);
+    if (add_retry_left > 0) {
+      add_retry_left--;
+      AddIcon(false);
+    }
+    return result;
+  }
   if (message == WM_DESTROY) {
+    CancelAddRetry();
     if (tray_icon_setted) {
       Shell_NotifyIcon(NIM_DELETE, &nid);
       DestroyIcon(nid.hIcon);
+      nid.hIcon = nullptr;
+      tray_icon_setted = false;
     }
   } else if (message == WM_COMMAND) {
     flutter::EncodableMap eventData = flutter::EncodableMap();
@@ -208,8 +306,13 @@ HWND TrayManagerPlugin::GetMainWindow() {
 void TrayManagerPlugin::Destroy(
     const flutter::MethodCall<flutter::EncodableValue>& method_call,
     std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+  CancelAddRetry();
   Shell_NotifyIcon(NIM_DELETE, &nid);
-  DestroyIcon(nid.hIcon);
+  if (nid.hIcon != nullptr) {
+    DestroyIcon(nid.hIcon);
+    nid.hIcon = nullptr;
+  }
+  icon_path.clear();
   tray_icon_setted = false;
 
   result->Success(flutter::EncodableValue(true));
@@ -225,31 +328,52 @@ void TrayManagerPlugin::SetIcon(
       std::get<std::string>(args.at(flutter::EncodableValue("iconPath")));
 
   std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> converter;
+  std::wstring path = converter.from_bytes(iconPath);
 
-  HICON hIcon = static_cast<HICON>(
-      LoadImage(nullptr, (LPCWSTR)(converter.from_bytes(iconPath).c_str()),
-                IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
-                GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE));
+  HICON hIcon = LoadIconFromPath(path);
+  if (hIcon == nullptr) {
+    // The .ico can be missing or locked (e.g. mid-update, AV scan).  Keep the
+    // current icon and surface the failure instead of blanking the tray.
+    result->Error("load_icon_failed",
+                  "LoadImage failed for icon path: " + iconPath);
+    return;
+  }
+
+  icon_path = path;
+  HICON old_icon = nid.hIcon;
 
   if (tray_icon_setted) {
     nid.hIcon = hIcon;
-    Shell_NotifyIcon(NIM_MODIFY, &nid);
+    nid.uFlags |= NIF_ICON;
+    if (!Shell_NotifyIcon(NIM_MODIFY, &nid)) {
+      // The shell no longer knows this icon (missed TaskbarCreated, shell
+      // restart during suspend, ...).  Re-add rather than silently vanish.
+      tray_icon_setted = false;
+      AddIcon(true);
+    }
   } else {
     nid.cbSize = sizeof(NOTIFYICONDATA);
     nid.hWnd = GetMainWindow();
+    nid.uID = TRAY_ICON_UID;
     nid.uCallbackMessage = WM_MYMESSAGE;
     nid.hIcon = hIcon;
     nid.uFlags = NIF_MESSAGE | NIF_ICON;
-    Shell_NotifyIcon(NIM_ADD, &nid);
-    hMenu = CreatePopupMenu();
+    AddIcon(true);
+    if (hMenu == nullptr) {
+      hMenu = CreatePopupMenu();
+    }
+  }
+
+  if (old_icon != nullptr && old_icon != hIcon) {
+    // Without this every theme switch leaks a HICON; exhausting the GDI
+    // handle quota makes LoadImage start returning null.
+    DestroyIcon(old_icon);
   }
 
   niif.cbSize = sizeof(NOTIFYICONIDENTIFIER);
   niif.hWnd = nid.hWnd;
   niif.uID = nid.uID;
   niif.guidItem = GUID_NULL;
-
-  tray_icon_setted = true;
 
   result->Success(flutter::EncodableValue(true));
 }
