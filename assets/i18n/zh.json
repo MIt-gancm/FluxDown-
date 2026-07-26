@@ -722,6 +722,7 @@
     "proxyTesting": "测试中...",
     "proxyTestSuccess": "连接成功，延迟 {ms} ms",
     "proxyTestFailed": "连接失败: {error}",
+    "proxyTestTlsEndpointHint": "代理端点未接受 TLS 握手。如果这是混合 HTTP/SOCKS 端口（Clash、V2Ray）或普通 HTTP 代理，请把类型改选为 HTTP 而不是 HTTPS。",
     "userAgent": "用户代理 (User-Agent)",
     "userAgentDesc": "下载请求时使用的浏览器标识",
     "userAgentPlaceholder": "留空使用默认标识 FluxDown/版本号",

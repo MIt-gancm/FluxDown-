@@ -722,6 +722,7 @@
     "proxyTesting": "Testing...",
     "proxyTestSuccess": "Connected, latency {ms} ms",
     "proxyTestFailed": "Connection failed: {error}",
+    "proxyTestTlsEndpointHint": "The proxy endpoint did not accept a TLS handshake. If this is a mixed HTTP/SOCKS port (Clash, V2Ray) or a plain HTTP proxy, select the HTTP type instead of HTTPS.",
     "userAgent": "User-Agent",
     "userAgentDesc": "Browser identity used in download requests.",
     "userAgentPlaceholder": "Leave empty for default identity FluxDown/<version>",

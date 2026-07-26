@@ -538,6 +538,7 @@
     "backend.fileNotFoundOnDisk": "file not found on disk",
     "backend.failedToPersistTask": "failed to persist task",
     "backend.demoModeFileOnly": "demo mode: only the designated demo file can be downloaded",
+    "backend.proxyTlsEndpointHint": "The proxy endpoint did not accept a TLS handshake. If this is a mixed HTTP/SOCKS port (Clash, V2Ray) or a plain HTTP proxy, select the HTTP type instead of HTTPS.",
     "set.plugins": "Plugins",
     "set.plugins.desc": "Manage installed plugins: enable or disable, configure per-plugin settings, install from a zip archive or a local dev directory",
     "plugins.installZip": "Install from zip",

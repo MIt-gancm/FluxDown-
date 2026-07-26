@@ -538,6 +538,7 @@
     "backend.fileNotFoundOnDisk": "磁盘上找不到该文件",
     "backend.failedToPersistTask": "任务持久化失败",
     "backend.demoModeFileOnly": "演示模式：仅允许下载指定的演示文件",
+    "backend.proxyTlsEndpointHint": "代理端点未接受 TLS 握手。如果这是混合 HTTP/SOCKS 端口（Clash、V2Ray）或普通 HTTP 代理，请把类型改选为 HTTP 而不是 HTTPS。",
     "set.plugins": "插件",
     "set.plugins.desc": "管理已安装插件：启用/禁用、按插件配置设置项，支持从 zip 压缩包安装或引用本地开发目录",
     "plugins.installZip": "从 zip 安装",

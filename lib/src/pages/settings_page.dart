@@ -4442,13 +4442,18 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                     child: Text(
                       _testResult!
                           ? s.proxyTestSuccess(_testLatencyMs)
-                          : s.proxyTestFailed(_testError),
+                          : s.proxyTestFailed(
+                              s.translateProxyTestError(_testError),
+                            ),
                       style: TextStyle(
                         fontSize: 11.5,
                         color: _testResult!
                             ? const Color(0xFF22C55E)
                             : const Color(0xFFEF4444),
                       ),
+                      // 失败提示可能是多句可执行建议（如 issue #183 的类型选错），
+                      // 单行省略会把关键的「改选 HTTP」截掉。
+                      maxLines: _testResult! ? 1 : 4,
                       overflow: TextOverflow.ellipsis,
                     ),
                   ),

@@ -48,6 +48,22 @@ impl ProxyMode {
 }
 
 /// Supported proxy protocol types.
+///
+/// Every variant names the **proxy endpoint's own transport**, never the
+/// destination protocol — the same axis `Socks4`/`Socks5` sit on, matching the
+/// single-select control in the settings UI:
+///
+/// - [`Self::Http`] — plaintext endpoint. Reaching an HTTPS destination through
+///   it uses `CONNECT` tunnelling, so this is the correct choice for mixed
+///   HTTP/SOCKS ports such as Clash's 7897 or a plain Squid.
+/// - [`Self::Https`] — the endpoint itself is wrapped in TLS, so the client
+///   performs a TLS handshake *with the proxy* before issuing `CONNECT`. Only a
+///   proxy explicitly configured to serve TLS accepts this.
+///
+/// Configuration sources whose protocol keys instead describe the destination
+/// (the Windows `ProxyServer` registry value, aria2's `--https-proxy`) must map
+/// those keys onto the transport axis before constructing a `ProxyType`; see
+/// [`parse_windows_proxy_server`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyType {
     Http,
@@ -354,6 +370,13 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
 /// Handles both formats:
 /// - Simple: `host:port` → (Http, host, port)
 /// - Multi-protocol: `http=host:port;https=host:port;socks=host:port` → prefer https > socks > http
+///
+/// Note the scheme asymmetry with our own [`ProxyType`]: in this registry value
+/// the `https=` key names the **destination** protocol whose traffic the proxy
+/// handles, not the proxy endpoint's own transport. Such an endpoint speaks
+/// plaintext HTTP `CONNECT`, so it maps to [`ProxyType::Http`] — mapping it to
+/// [`ProxyType::Https`] would make reqwest attempt a TLS handshake *with the
+/// proxy*, which these endpoints do not accept (issue #183).
 #[allow(dead_code)] // only called from #[cfg(windows)] detect_system_proxy; kept for cross-platform test coverage
 pub fn parse_windows_proxy_server(server: &str) -> (ProxyType, String, u16) {
     // Check if it's multi-protocol format (contains '=')
@@ -365,7 +388,8 @@ pub fn parse_windows_proxy_server(server: &str) -> (ProxyType, String, u16) {
             return (ProxyType::Socks5, host.clone(), *port);
         }
         if let Some((host, port)) = entries.get("https") {
-            return (ProxyType::Https, host.clone(), *port);
+            // `https=` describes the destination, so the transport stays HTTP.
+            return (ProxyType::Http, host.clone(), *port);
         }
         if let Some((host, port)) = entries.get("http") {
             return (ProxyType::Http, host.clone(), *port);
@@ -1039,6 +1063,40 @@ const CONNECTIVITY_CHECK_URLS: &[&str] = &[
     "http://connectivitycheck.gstatic.com/generate_204", // Google
 ];
 
+/// Stable English wire message for "HTTPS selected, but the endpoint is not a
+/// TLS proxy". The display layer maps it per locale (see `translateBackendMessage`).
+pub const PROXY_TLS_ENDPOINT_HINT: &str = concat!(
+    "the proxy endpoint did not accept a TLS handshake; ",
+    "if this is a mixed HTTP/SOCKS port (Clash, V2Ray) or a plain HTTP proxy, ",
+    "select the HTTP type instead of HTTPS",
+);
+
+/// Recognise a failed TLS handshake *with the proxy itself*.
+///
+/// Only meaningful for [`ProxyType::Https`], where the client must complete TLS
+/// with the endpoint before it can issue `CONNECT`. Pointing that type at a
+/// plaintext endpoint yields a transport-level TLS error rather than an HTTP
+/// status, because the endpoint answers the ClientHello with plain bytes, a
+/// `400`-ish response, or an immediate close (issue #183).
+fn is_proxy_tls_handshake_failure(proxy_type: &ProxyType, error: &str) -> bool {
+    if *proxy_type != ProxyType::Https {
+        return false;
+    }
+    let lower = error.to_ascii_lowercase();
+    // Covers native-tls (desktop) and rustls (server) phrasings alike.
+    [
+        "tls",
+        "ssl",
+        "handshake",
+        "certificate",
+        "corrupt message",
+        "unexpected eof",
+        "invalid or unsupported protocol version",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// Test proxy connectivity by sending HTTP requests through the proxy.
 ///
 /// Tries multiple connectivity check endpoints (Microsoft, Cloudflare, Google)
@@ -1112,9 +1170,25 @@ pub async fn test_proxy_connection(
             }
             Err(e) => {
                 log_info!("[proxy-test] {} → error: {}", url, e);
-                last_err = format!("{}: {}", url, e);
+                // Chained sources carry the actual TLS error; `{}` alone would
+                // only show reqwest's generic "error sending request" wrapper.
+                let mut detail = e.to_string();
+                let mut source = std::error::Error::source(&e);
+                while let Some(inner) = source {
+                    detail.push_str(": ");
+                    detail.push_str(&inner.to_string());
+                    source = inner.source();
+                }
+                last_err = format!("{}: {}", url, detail);
             }
         }
+    }
+
+    // A TLS failure against the endpoint itself means the type selector is
+    // wrong, not that the proxy is down — say so instead of surfacing a raw
+    // handshake error the user cannot act on.
+    if is_proxy_tls_handshake_failure(&config.proxy_type, &last_err) {
+        return Err(DownloadError::Other(PROXY_TLS_ENDPOINT_HINT.to_string()));
     }
 
     Err(DownloadError::Other(format!(
@@ -1130,9 +1204,9 @@ pub async fn test_proxy_connection(
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyConfig, ProxyMode, ProxyType, base64_encode, parse_connect_status_line,
-        parse_host_port, parse_multi_protocol_proxy, parse_windows_proxy_server, percent_decode,
-        percent_encode_userinfo,
+        ProxyConfig, ProxyMode, ProxyType, base64_encode, is_proxy_tls_handshake_failure,
+        parse_connect_status_line, parse_host_port, parse_multi_protocol_proxy,
+        parse_windows_proxy_server, percent_decode, percent_encode_userinfo,
     };
     use std::collections::HashMap;
 
@@ -1456,12 +1530,69 @@ mod tests {
         assert_eq!(port, 1080);
     }
 
+    /// Issue #183: the registry's `https=` entry is still selected by priority,
+    /// but its transport is plaintext HTTP `CONNECT` — emitting
+    /// [`ProxyType::Https`] here would make reqwest attempt TLS with the proxy.
     #[test]
     fn parse_windows_proxy_multi_prefers_https_over_http() {
         let (ty, host, port) = parse_windows_proxy_server("http=a:80;https=b:443");
-        assert_eq!(ty, ProxyType::Https);
+        assert_eq!(ty, ProxyType::Http);
         assert_eq!(host, "b");
         assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn parse_windows_proxy_https_entry_builds_plaintext_transport_url() {
+        let (proxy_type, host, port) = parse_windows_proxy_server("https=127.0.0.1:7897");
+        let config = ProxyConfig {
+            mode: ProxyMode::Manual,
+            proxy_type,
+            host,
+            port,
+            ..ProxyConfig::default()
+        };
+        assert_eq!(
+            config.to_proxy_url().as_deref(),
+            Some("http://127.0.0.1:7897")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Proxy-endpoint TLS failure detection (issue #183)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tls_handshake_failure_detected_for_https_type() {
+        assert!(is_proxy_tls_handshake_failure(
+            &ProxyType::Https,
+            "error sending request: tls handshake eof",
+        ));
+        assert!(is_proxy_tls_handshake_failure(
+            &ProxyType::Https,
+            "received corrupt message of type Handshake",
+        ));
+    }
+
+    /// A plaintext type never performs TLS with the endpoint, so an unrelated
+    /// certificate error from the *destination* must not be relabelled.
+    #[test]
+    fn tls_handshake_failure_not_reported_for_plaintext_types() {
+        assert!(!is_proxy_tls_handshake_failure(
+            &ProxyType::Http,
+            "error sending request: tls handshake eof",
+        ));
+        assert!(!is_proxy_tls_handshake_failure(
+            &ProxyType::Socks5,
+            "certificate verify failed",
+        ));
+    }
+
+    #[test]
+    fn non_tls_errors_are_left_alone() {
+        assert!(!is_proxy_tls_handshake_failure(
+            &ProxyType::Https,
+            "connection refused",
+        ));
     }
 
     #[test]
