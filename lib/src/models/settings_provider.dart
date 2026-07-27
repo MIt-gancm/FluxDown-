@@ -15,6 +15,9 @@ class SettingsProvider extends ChangeNotifier {
   /// 全局单例引用，供 WindowListener 等无 context 场景读取设置
   static SettingsProvider? globalInstance;
 
+  /// ed2k 协议 scheme 名（与 Rust `protocol_registry::ED2K.scheme` 对齐）。
+  static const String _ed2kScheme = 'ed2k';
+
   String _defaultSaveDir = _platformDefaultSaveDir();
   int _defaultSegments = 0; // 0 = 自动（由 Rust segment_advisor 动态计算）
   int _autoMaxConnections = 16; // 自动模式下智能调度的最大连接数上限
@@ -49,6 +52,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _showSidebarStatus = true; // 显示状态区块
   bool _showSidebarQueues = true; // 显示队列区块
   bool _showSidebarCategory = true; // 显示分类区块
+  bool _showSidebarRss = true; // 显示 RSS 订阅区块
 
   // 侧边栏设备协同区显示（三态渐进披露）：
   // null=自动（有远程设备才显示）/ true=强制显示 / false=强制隐藏
@@ -63,6 +67,7 @@ class SettingsProvider extends ChangeNotifier {
   // 侧边栏折叠状态（持久化）
   bool _sidebarQueuesExpanded = true; // 队列区块展开
   bool _sidebarCategoryExpanded = false; // 分类区块展开（默认折叠）
+  bool _sidebarRssExpanded = true; // RSS 区块展开
   bool _sidebarDeviceExpanded = true; // 设备区块展开
 
   // 自定义分类
@@ -75,6 +80,12 @@ class SettingsProvider extends ChangeNotifier {
   // Linux .deb installs the system-wide MIME registration is root-owned and
   // cannot be removed, so the live query alone can never report false.
   bool _torrentAssocUserDisabled = false;
+  // ed2k:// 链接关联（系统协议处理器；与 .torrent 文件关联同族但独立开关）。
+  bool _ed2kProtocolAssociated = false;
+  // 同 _torrentAssocUserDisabled：Linux 上只有 FluxDown 声明
+  // x-scheme-handler/ed2k 时，撤销用户级覆盖后 xdg-mime 仍会解析回 FluxDown，
+  // 光靠实时查询永远回不到 false。
+  bool _ed2kAssocUserDisabled = false;
 
   // 代理设置
   String _proxyMode = 'none'; // none / system / manual
@@ -159,6 +170,7 @@ class SettingsProvider extends ChangeNotifier {
 
   StreamSubscription<RustSignalPack<ConfigLoaded>>? _configSub;
   StreamSubscription<RustSignalPack<FileAssociationStatus>>? _fileAssocSub;
+  StreamSubscription<RustSignalPack<UrlProtocolStatus>>? _urlProtocolSub;
   StreamSubscription<RustSignalPack<TrackerSubscriptionResult>>? _trackerSubSub;
   StreamSubscription<RustSignalPack<Ed2kServerSubscriptionResult>>? _ed2kSubSub;
 
@@ -179,6 +191,7 @@ class SettingsProvider extends ChangeNotifier {
     _proxyDebounceTimer?.cancel();
     _configSub?.cancel();
     _fileAssocSub?.cancel();
+    _urlProtocolSub?.cancel();
     _trackerSubSub?.cancel();
     _ed2kSubSub?.cancel();
     if (globalInstance == this) {
@@ -228,6 +241,7 @@ class SettingsProvider extends ChangeNotifier {
   bool get showSidebarStatus => _showSidebarStatus;
   bool get showSidebarQueues => _showSidebarQueues;
   bool get showSidebarCategory => _showSidebarCategory;
+  bool get showSidebarRss => _showSidebarRss;
 
   /// 设备协同区显示覆盖（null=自动 / true=强制显示 / false=强制隐藏）。
   bool? get showSidebarDeviceOverride => _showSidebarDevice;
@@ -245,6 +259,7 @@ class SettingsProvider extends ChangeNotifier {
 
   bool get sidebarQueuesExpanded => _sidebarQueuesExpanded;
   bool get sidebarCategoryExpanded => _sidebarCategoryExpanded;
+  bool get sidebarRssExpanded => _sidebarRssExpanded;
   bool get sidebarDeviceExpanded => _sidebarDeviceExpanded;
 
   // 自定义分类 Getter
@@ -307,6 +322,7 @@ class SettingsProvider extends ChangeNotifier {
   // 文件关联 Getters
   bool get torrentAssocPrompted => _torrentAssocPrompted;
   bool get torrentAssociated => _torrentAssociated;
+  bool get ed2kProtocolAssociated => _ed2kProtocolAssociated;
 
   // 代理设置 Getters
   String get proxyMode => _proxyMode;
@@ -641,6 +657,13 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('show_sidebar_category', value.toString());
   }
 
+  void setShowSidebarRss(bool value) {
+    if (_showSidebarRss == value) return;
+    _showSidebarRss = value;
+    notifyListeners();
+    _saveToRust('show_sidebar_rss', value.toString());
+  }
+
   /// 设置设备协同区显示覆盖（true=强制显示 / false=强制隐藏，右键隐藏与设置开关共用）。
   void setShowSidebarDevice(bool value) {
     if (_showSidebarDevice == value) return;
@@ -684,6 +707,13 @@ class SettingsProvider extends ChangeNotifier {
     _sidebarQueuesExpanded = value;
     notifyListeners();
     _saveToRust('sidebar_queues_expanded', value.toString());
+  }
+
+  void setSidebarRssExpanded(bool value) {
+    if (_sidebarRssExpanded == value) return;
+    _sidebarRssExpanded = value;
+    notifyListeners();
+    _saveToRust('sidebar_rss_expanded', value.toString());
   }
 
   void setSidebarDeviceExpanded(bool value) {
@@ -1104,6 +1134,24 @@ class SettingsProvider extends ChangeNotifier {
     SetFileAssociation(enable: enable).sendSignalToRust();
   }
 
+  /// 请求 Rust 检查当前 ed2k:// 协议关联状态。
+  void checkEd2kProtocolAssociation() {
+    const CheckUrlProtocol(scheme: _ed2kScheme).sendSignalToRust();
+  }
+
+  /// 设置或取消 ed2k:// 链接关联（乐观更新 UI，Rust 回传真实状态后校正）。
+  ///
+  /// 与 [setFileAssociation] 同构：关闭时记录持久化的 opt-out，避免实时状态
+  /// 把用户的 OFF 又顶回 ON。
+  void setEd2kProtocolAssociation(bool enable) {
+    logInfo('Settings', 'setEd2kProtocolAssociation: enable=$enable');
+    _ed2kProtocolAssociated = enable;
+    _ed2kAssocUserDisabled = !enable;
+    notifyListeners();
+    _saveToRust('ed2k_assoc_user_disabled', (!enable).toString());
+    SetUrlProtocol(scheme: _ed2kScheme, enable: enable).sendSignalToRust();
+  }
+
   /// 设置开机自启动，返回是否成功。
   /// 操作后通过 [launchAtStartup.isEnabled] 验证注册表实际状态，
   /// 若与预期不符则回滚 UI 状态。
@@ -1163,6 +1211,9 @@ class SettingsProvider extends ChangeNotifier {
     if (_enableFileAssoc) {
       _fileAssocSub = FileAssociationStatus.rustSignalStream.listen(
         _onFileAssocStatus,
+      );
+      _urlProtocolSub = UrlProtocolStatus.rustSignalStream.listen(
+        _onUrlProtocolStatus,
       );
     }
   }
@@ -1225,6 +1276,28 @@ class SettingsProvider extends ChangeNotifier {
     );
     if (_torrentAssociated != effective) {
       _torrentAssociated = effective;
+      notifyListeners();
+    }
+  }
+
+  void _onUrlProtocolStatus(RustSignalPack<UrlProtocolStatus> pack) {
+    // 单条信号服务所有 scheme（fluxdown:// 的启动自注册也走同一路），
+    // 只消费 ed2k。
+    if (pack.message.scheme != _ed2kScheme) return;
+    handleEd2kProtocolStatus(pack.message.isRegistered);
+  }
+
+  /// Applies a live `ed2k://` handler status reported by Rust.
+  /// Exposed for tests; production code receives it via the signal stream.
+  @visibleForTesting
+  void handleEd2kProtocolStatus(bool registered) {
+    final effective = registered && !_ed2kAssocUserDisabled;
+    logInfo(
+      'Settings',
+      'ed2k protocol status: $registered (effective: $effective)',
+    );
+    if (_ed2kProtocolAssociated != effective) {
+      _ed2kProtocolAssociated = effective;
       notifyListeners();
     }
   }
@@ -1331,6 +1404,8 @@ class SettingsProvider extends ChangeNotifier {
           _torrentAssocPrompted = entry.value == 'true';
         case 'torrent_assoc_user_disabled':
           _torrentAssocUserDisabled = entry.value == 'true';
+        case 'ed2k_assoc_user_disabled':
+          _ed2kAssocUserDisabled = entry.value == 'true';
         case 'notify_on_complete':
           _notifyOnComplete = entry.value != 'false'; // 默认 true
         case 'silent_download_enabled':
@@ -1411,6 +1486,8 @@ class SettingsProvider extends ChangeNotifier {
           _showSidebarQueues = entry.value != 'false';
         case 'show_sidebar_category':
           _showSidebarCategory = entry.value != 'false';
+        case 'show_sidebar_rss':
+          _showSidebarRss = entry.value != 'false';
         case 'show_sidebar_device':
           _showSidebarDevice = entry.value == 'true'
               ? true
@@ -1429,6 +1506,8 @@ class SettingsProvider extends ChangeNotifier {
           _sidebarQueuesExpanded = entry.value != 'false';
         case 'sidebar_category_expanded':
           _sidebarCategoryExpanded = entry.value == 'true';
+        case 'sidebar_rss_expanded':
+          _sidebarRssExpanded = entry.value != 'false';
         case 'sidebar_device_expanded':
           _sidebarDeviceExpanded = entry.value != 'false';
         case 'custom_categories':
@@ -1478,9 +1557,10 @@ class SettingsProvider extends ChangeNotifier {
         _persistCategories();
       }
     }
-    // 配置加载后，立即查询文件关联的实际状态（仅启用了文件关联功能的实例）
+    // 配置加载后，立即查询文件/协议关联的实际状态（仅启用了该功能的实例）
     if (_enableFileAssoc) {
       checkFileAssociation();
+      checkEd2kProtocolAssociation();
     }
   }
 

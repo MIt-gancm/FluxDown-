@@ -76,6 +76,19 @@ pub const API_GROUP_PAUSE: &str = "/api/v1/groups/{id}/pause";
 /// 恢复组内成员（PUT）。
 pub const API_GROUP_CONTINUE: &str = "/api/v1/groups/{id}/continue";
 
+/// RSS 订阅集合（GET 列表 / POST 新建）。
+pub const API_RSS: &str = "/api/v1/rss";
+/// 单个 RSS 订阅（PUT 更新 / DELETE 删除）。
+pub const API_RSS_SOURCE: &str = "/api/v1/rss/{id}";
+/// 立即抓取一个订阅（POST）。
+pub const API_RSS_REFRESH: &str = "/api/v1/rss/{id}/refresh";
+/// 一个订阅的条目流（GET）。
+pub const API_RSS_ITEMS: &str = "/api/v1/rss/{id}/items";
+/// 对条目执行手动操作（POST，guid 在请求体里——真实 guid 常是整条 URL）。
+pub const API_RSS_ITEM_ACTION: &str = "/api/v1/rss/{id}/items/action";
+/// 只读验证一个 feed 地址（POST，新建订阅向导）。
+pub const API_RSS_VALIDATE: &str = "/api/v1/rss/validate";
+
 /// P2P 设备互联：发起配对握手（POST，无 token 鉴权，由一次性配对码守卫）。
 pub const API_LINK_PAIR_HELLO: &str = "/api/v1/link/pair/hello";
 /// P2P 设备互联：确认/拒绝配对（POST，无 token 鉴权，由会话 + SAS 守卫）。
@@ -146,6 +159,30 @@ pub fn group_pause_path(group_id: &str) -> String {
 #[must_use]
 pub fn group_continue_path(group_id: &str) -> String {
     format!("{API_GROUPS}/{group_id}/continue")
+}
+
+/// 生成单个 RSS 订阅路径（客户端用）。
+#[must_use]
+pub fn rss_source_path(source_id: &str) -> String {
+    format!("{API_RSS}/{source_id}")
+}
+
+/// 生成立即抓取订阅路径（客户端用）。
+#[must_use]
+pub fn rss_refresh_path(source_id: &str) -> String {
+    format!("{API_RSS}/{source_id}/refresh")
+}
+
+/// 生成订阅条目流路径（客户端用）。
+#[must_use]
+pub fn rss_items_path(source_id: &str) -> String {
+    format!("{API_RSS}/{source_id}/items")
+}
+
+/// 生成条目手动操作路径（客户端用；guid 走请求体，不进路径）。
+#[must_use]
+pub fn rss_item_action_path(source_id: &str) -> String {
+    format!("{API_RSS}/{source_id}/items/action")
 }
 
 /// 生成单个已配对设备路径（客户端用）。

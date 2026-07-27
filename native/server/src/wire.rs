@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use fluxdown_api::types::{GroupDto, QueueDto, TaskDto};
+use fluxdown_api::types::{GroupDto, QueueDto, RssItemDto, RssSourceDto, TaskDto};
 use fluxdown_engine::components::{FfmpegStatus, FfmpegVersions, YtdlpStatus, YtdlpVersions};
 use fluxdown_engine::model::{
     BtFileEntry, CdnNodeInfo, HlsQualityOption, QueuePosition, ResolveVariantOption, SegmentDetail,
@@ -263,6 +263,26 @@ pub enum WsServerMsg {
     /// 任务组列表变化（组建/删除/改名/回收后）；组进度仍由前端按
     /// `groupId` 对 `taskProgress` SUM 聚合，本消息不含进度字段。
     GroupsChanged { groups: Vec<GroupDto> },
+    /// RSS 订阅列表变化（增删改 / 抓取状态 / 未读计数）；订阅数量少，直接
+    /// 全量推，客户端整表替换。
+    RssSourcesChanged { sources: Vec<RssSourceDto> },
+    /// 某订阅的条目流快照（新→旧）。只在该源确有变化时下发——定时轮询抓到
+    /// 0 条新条目时引擎静默，不打扰 UI。`notifyTitles` 是本轮自动建任务的
+    /// 条目标题，客户端据此弹**一条**合批通知（无自动下载时为空数组）。
+    RssItemsChanged {
+        source_id: String,
+        items: Vec<RssItemDto>,
+        notify_titles: Vec<String>,
+    },
+    /// 新建订阅向导的 feed 验证结果。`error` 非空即验证失败——这是诊断
+    /// 信息而非传输错误，客户端照常展示。
+    RssFeedValidated {
+        request_id: String,
+        url: String,
+        feed_title: String,
+        items: Vec<RssItemDto>,
+        error: String,
+    },
     /// 组件安装/下载进度（`component` 固定 `"ffmpeg"`；`totalBytes=0` 表示未知）。
     ComponentProgress {
         component: String,
@@ -720,6 +740,8 @@ mod tests {
             completed_at: String::new(),
             referrer: String::new(),
             group_id: String::new(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
             queue_order: 0,
         }
     }

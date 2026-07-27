@@ -1,0 +1,495 @@
+import 'package:flutter/material.dart';
+import 'package:shadcn_ui/shadcn_ui.dart';
+
+import '../bindings/bindings.dart';
+import '../i18n/locale_provider.dart';
+import '../models/download_task.dart';
+import '../models/rss_filter.dart';
+import '../models/rss_provider.dart';
+import '../theme/app_colors.dart';
+import '../theme/app_metrics.dart';
+
+/// RSS 条目流：选中侧边栏某个订阅时占据主区（替换任务列表）。
+///
+/// 复用任务列表的视觉语言（同样的行高/分隔线/hover 反馈/tabular 数字），
+/// 让用户不必学第二套列表——设计文档 P3「复用三栏骨架，不建独立空间」。
+class RssItemList extends StatefulWidget {
+  final RssProvider provider;
+
+  /// 点击「已下载」chip 时跳转到对应任务。
+  final void Function(String taskId) onOpenTask;
+
+  /// 打开该订阅的管理对话框（错误态的「检查配置」入口）。
+  final void Function(String sourceId) onManage;
+
+  const RssItemList({
+    super.key,
+    required this.provider,
+    required this.onOpenTask,
+    required this.onManage,
+  });
+
+  @override
+  State<RssItemList> createState() => _RssItemListState();
+}
+
+class _RssItemListState extends State<RssItemList> {
+  final _searchCtrl = TextEditingController();
+  String _query = '';
+
+  @override
+  void dispose() {
+    _searchCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: widget.provider,
+      builder: (context, _) {
+        final s = LocaleScope.of(context);
+        final c = AppColors.of(context);
+        final source = widget.provider.selectedSource;
+        if (source == null) return const SizedBox.shrink();
+        final items = widget.provider.selectedItems;
+        final visible = _query.isEmpty
+            ? items
+            : items
+                  .where((i) => i.title.toLowerCase().contains(_query))
+                  .toList(growable: false);
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _buildHeader(s, c, source),
+            _buildToolbar(s, c, source),
+            Expanded(
+              child: items.isEmpty
+                  ? _buildEmpty(s, c)
+                  : visible.isEmpty
+                  ? _buildNoMatch(s, c)
+                  : ListView.builder(
+                      padding: EdgeInsets.zero,
+                      itemCount: visible.length,
+                      itemBuilder: (context, index) {
+                        final item = visible[index];
+                        return RepaintBoundary(
+                          child: _RssItemRow(
+                            key: ValueKey('${item.sourceId}/${item.guid}'),
+                            item: item,
+                            onDownload: () => widget.provider.downloadItem(
+                              item.sourceId,
+                              item.guid,
+                            ),
+                            onIgnore: () => widget.provider.ignoreItem(
+                              item.sourceId,
+                              item.guid,
+                            ),
+                            onOpenTask: () => widget.onOpenTask(item.taskId),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ─────────────────────────────────────────────
+  // 订阅头（健康度内联：抓取节奏 / 上次结果 / 自动下载去向）
+  // ─────────────────────────────────────────────
+
+  Widget _buildHeader(S s, AppColors c, RssSourceEntry source) {
+    final m = AppMetrics.of(context);
+    final unhealthy = source.lastError.isNotEmpty;
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      decoration: BoxDecoration(
+        border: Border(bottom: BorderSide(color: c.border)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 30,
+            height: 30,
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: unhealthy ? m.soft(AppColors.red) : c.surface2,
+              borderRadius: m.brMd,
+            ),
+            child: Icon(
+              LucideIcons.rss,
+              size: 15,
+              color: unhealthy ? AppColors.red : c.textSecondary,
+            ),
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  rssDisplayName(source),
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: c.textPrimary,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _statusLine(s, source),
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: unhealthy ? AppColors.red : c.textMuted,
+                  ),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ],
+            ),
+          ),
+          if (unhealthy) ...[
+            const SizedBox(width: 10),
+            ShadButton.outline(
+              size: ShadButtonSize.sm,
+              onPressed: () => widget.onManage(source.sourceId),
+              child: Text(s.rssCheckConfig),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 一行说清「多久抓一次 / 上次怎么样 / 抓到了往哪放」——qBittorrent 至今
+  /// 没有的可视化（qB#20305 / AutoBangumi#701）。
+  String _statusLine(S s, RssSourceEntry source) {
+    final parts = <String>[s.rssEveryMinutes(source.intervalMinutes)];
+    if (source.lastError.isNotEmpty) {
+      parts.add(s.rssFailedTimes(source.failCount));
+      parts.add(source.lastError);
+    } else if (source.lastSuccessAt > 0) {
+      parts.add(s.rssLastFetch(_relativeTime(s, source.lastSuccessAt)));
+    } else {
+      parts.add(s.rssNeverFetched);
+    }
+    parts.add(source.autoDownload ? s.rssAutoDownloadOn : s.rssCollectMode);
+    return parts.join(' · ');
+  }
+
+  String _relativeTime(S s, int unixSeconds) {
+    final delta = DateTime.now().millisecondsSinceEpoch ~/ 1000 - unixSeconds;
+    if (delta < 60) return s.rssJustNow;
+    if (delta < 3600) return s.rssMinutesAgo(delta ~/ 60);
+    if (delta < 86400) return s.rssHoursAgo(delta ~/ 3600);
+    return s.rssDaysAgo(delta ~/ 86400);
+  }
+
+  // ─────────────────────────────────────────────
+  // 工具条
+  // ─────────────────────────────────────────────
+
+  Widget _buildToolbar(S s, AppColors c, RssSourceEntry source) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+      decoration: BoxDecoration(
+        border: Border(bottom: BorderSide(color: c.border)),
+      ),
+      child: Row(
+        children: [
+          ShadButton.ghost(
+            size: ShadButtonSize.sm,
+            onPressed: () => widget.provider.markAllRead(source.sourceId),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(LucideIcons.checkCheck, size: 13, color: c.textSecondary),
+                const SizedBox(width: 6),
+                Text(s.rssMarkAllRead),
+              ],
+            ),
+          ),
+          const SizedBox(width: 4),
+          _RefreshButton(
+            busy: widget.provider.isRefreshing(source.sourceId),
+            onPressed: () => widget.provider.refresh(source.sourceId),
+          ),
+          const Spacer(),
+          SizedBox(
+            width: 200,
+            child: ShadInput(
+              controller: _searchCtrl,
+              placeholder: Text(s.rssSearchHint),
+              onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ─────────────────────────────────────────────
+  // 空态（给引导，不给空白——2026 桌面工具类趋势）
+  // ─────────────────────────────────────────────
+
+  Widget _buildEmpty(S s, AppColors c) => Center(
+    child: Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 48),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(LucideIcons.rss, size: 40, color: c.textDisabled),
+          const SizedBox(height: 14),
+          Text(
+            s.rssEmptyTitle,
+            style: TextStyle(fontSize: 13.5, color: c.textSecondary),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            s.rssEmptyDesc,
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 11.5, color: c.textMuted, height: 1.6),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Widget _buildNoMatch(S s, AppColors c) => Center(
+    child: Text(
+      s.rssNoMatch(_query),
+      style: TextStyle(fontSize: 12.5, color: c.textMuted),
+    ),
+  );
+}
+
+/// 一条 RSS 条目行。状态 chip 决定行尾可用操作（P4：条目状态可见 + 可覆盖）。
+class _RssItemRow extends StatefulWidget {
+  final RssItemEntry item;
+  final VoidCallback onDownload;
+  final VoidCallback onIgnore;
+  final VoidCallback onOpenTask;
+
+  const _RssItemRow({
+    super.key,
+    required this.item,
+    required this.onDownload,
+    required this.onIgnore,
+    required this.onOpenTask,
+  });
+
+  @override
+  State<_RssItemRow> createState() => _RssItemRowState();
+}
+
+class _RssItemRowState extends State<_RssItemRow> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    final item = widget.item;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 9),
+        decoration: BoxDecoration(
+          // 即时切色（不做动画）：从 Colors.transparent 做 lerp 会闪黑，
+          // 见仓库规则 `.omp/rules/no-lerp-from-transparent.md`。
+          color: _isHovered ? c.hoverBg : c.hoverBg.withValues(alpha: 0),
+          border: Border(bottom: BorderSide(color: c.border)),
+        ),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    item.title,
+                    style: TextStyle(fontSize: 12.5, color: c.textPrimary),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                  const SizedBox(height: 3),
+                  Row(
+                    children: [
+                      if (item.pubDate > 0) ...[
+                        Text(
+                          _formatDate(item.pubDate),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: c.textMuted,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                        const SizedBox(width: 10),
+                      ],
+                      if (item.enclosureLength > 0)
+                        Text(
+                          DownloadTask.formatBytes(item.enclosureLength),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: c.textMuted,
+                            fontFeatures: const [FontFeature.tabularFigures()],
+                          ),
+                        ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            // 状态列定宽右对齐：chip 文案长度随状态变化（「新」vs「规则未命中 ·
+            // 命中排除词」），不定宽会让相邻行的 chip 与操作按钮左右错位。
+            SizedBox(
+              width: 210,
+              child: Align(
+                alignment: Alignment.centerRight,
+                child: _StatusChip(item: item, onOpenTask: widget.onOpenTask),
+              ),
+            ),
+            const SizedBox(width: 10),
+            SizedBox(
+              width: 160,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: _isHovered ? _actions(s) : const <Widget>[],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  List<Widget> _actions(S s) {
+    final status = widget.item.status;
+    // 已下载的条目也给操作入口：任务可能被删了、下崩了，或者只是想再来一遍。
+    final label = switch (status) {
+      RssItemStatusCode.isNew => s.rssActionDownload,
+      RssItemStatusCode.downloaded => s.rssActionRedownload,
+      _ => s.rssActionDownloadAnyway,
+    };
+    return [
+      ShadButton.ghost(
+        size: ShadButtonSize.sm,
+        onPressed: widget.onDownload,
+        child: Text(label),
+      ),
+      if (status == RssItemStatusCode.isNew) ...[
+        const SizedBox(width: 4),
+        ShadButton.ghost(
+          size: ShadButtonSize.sm,
+          onPressed: widget.onIgnore,
+          child: Text(s.rssActionIgnore),
+        ),
+      ],
+    ];
+  }
+
+  String _formatDate(int unixSeconds) {
+    final d = DateTime.fromMillisecondsSinceEpoch(unixSeconds * 1000);
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '${two(d.month)}-${two(d.day)} ${two(d.hour)}:${two(d.minute)}';
+  }
+}
+
+/// 状态 chip。「已下载」可点击跳转到任务，其余只做说明。
+class _StatusChip extends StatelessWidget {
+  final RssItemEntry item;
+  final VoidCallback onOpenTask;
+
+  const _StatusChip({required this.item, required this.onOpenTask});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+    final s = LocaleScope.of(context);
+    final (label, color, clickable) = switch (item.status) {
+      RssItemStatusCode.isNew => (s.rssStatusNew, c.accent, false),
+      RssItemStatusCode.downloaded => (
+        s.rssStatusDownloaded,
+        AppColors.green,
+        true,
+      ),
+      RssItemStatusCode.ignored => (s.rssStatusIgnored, c.textMuted, false),
+      RssItemStatusCode.duplicateEpisode => (
+        s.rssStatusDuplicate,
+        AppColors.amber,
+        false,
+      ),
+      RssItemStatusCode.seedSkipped => (s.rssStatusHistory, c.textMuted, false),
+      _ => (s.rssStatusFiltered, c.textMuted, false),
+    };
+    final reason = rssReasonLabel(s, item.reason);
+    final text = reason.isEmpty ? label : '$label · $reason';
+    final chip = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+      decoration: BoxDecoration(color: m.soft(color), borderRadius: m.brSm),
+      child: Text(text, style: TextStyle(fontSize: 11, color: color)),
+    );
+    if (!clickable || item.taskId.isEmpty) return chip;
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(onTap: onOpenTask, child: chip),
+    );
+  }
+}
+
+/// 稳定原因码 → 本地化文案。引擎只产出码，文案全在这里。
+String rssReasonLabel(S s, String code) => switch (code) {
+  RssReasonCode.notIncluded => s.rssReasonNotIncluded,
+  RssReasonCode.excluded => s.rssReasonExcluded,
+  RssReasonCode.tooSmall => s.rssReasonTooSmall,
+  RssReasonCode.tooLarge => s.rssReasonTooLarge,
+  RssReasonCode.dupEpisode => s.rssReasonDupEpisode,
+  _ => '',
+};
+
+/// 「立即抓取」按钮。抓取是 off-actor 的、常要好几秒，没有进行中反馈用户会
+/// 反复点或以为没生效——所以 busy 时换成 spinner 并禁用（`onPressed: null`
+/// 同时给出 shadcn 的禁用视觉）。
+class _RefreshButton extends StatelessWidget {
+  final bool busy;
+  final VoidCallback onPressed;
+
+  const _RefreshButton({required this.busy, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    return ShadButton.ghost(
+      size: ShadButtonSize.sm,
+      onPressed: busy ? null : onPressed,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 13,
+            height: 13,
+            child: busy
+                ? CircularProgressIndicator(strokeWidth: 1.6, color: c.accent)
+                : Icon(
+                    LucideIcons.refreshCw,
+                    size: 13,
+                    color: c.textSecondary,
+                  ),
+          ),
+          const SizedBox(width: 6),
+          Text(busy ? s.rssRefreshing : s.rssRefreshNow),
+        ],
+      ),
+    );
+  }
+}

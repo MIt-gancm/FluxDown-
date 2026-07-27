@@ -27,6 +27,33 @@ pub fn status_name(status: i32) -> &'static str {
     }
 }
 
+/// RSS 条目状态码 → 人类可读名（与 `RssItemDto.status` 对齐）。
+///
+/// 与 [`status_name`] 分开：两者共用 `i32` wire 编码但语义完全不同，
+/// 合并映射只会让 `1` 同时意味着「downloading」和「已下载」。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_cli::format::rss_item_status_name;
+///
+/// assert_eq!(rss_item_status_name(0), "new");
+/// assert_eq!(rss_item_status_name(4), "dup");
+/// assert_eq!(rss_item_status_name(99), "unknown");
+/// ```
+#[must_use]
+pub fn rss_item_status_name(status: i32) -> &'static str {
+    match status {
+        0 => "new",
+        1 => "downloaded",
+        2 => "ignored",
+        3 => "filtered",
+        4 => "dup",
+        5 => "seeded",
+        _ => "unknown",
+    }
+}
+
 /// 字节数 → 人类可读字符串（1024 进制，两位小数）。
 ///
 /// # Examples
@@ -137,4 +164,40 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     let kept: String = s.chars().take(max - 1).collect();
     format!("{kept}…")
+}
+
+/// Unix 秒 → UTC `YYYY-MM-DD HH:MM`；`<= 0`（未知）返回 `-`。
+///
+/// 固定用 UTC 而非本地时区：CLI 无日期库依赖，且脚本比对需要稳定输出。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_cli::format::human_time;
+///
+/// assert_eq!(human_time(0), "-");
+/// assert_eq!(human_time(86_399), "1970-01-01 23:59");
+/// assert_eq!(human_time(1_700_000_000), "2023-11-14 22:13");
+/// ```
+#[must_use]
+pub fn human_time(unix_secs: i64) -> String {
+    if unix_secs <= 0 {
+        return "-".to_string();
+    }
+    let days = unix_secs.div_euclid(86_400);
+    let secs_of_day = unix_secs.rem_euclid(86_400);
+    // civil_from_days（Howard Hinnant）：以 3 月 1 日为年首消除闰日分支，
+    // 全程整数运算，避免为一列表格引入日期库依赖。
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
 }

@@ -31,7 +31,8 @@ use async_trait::async_trait;
 use fluxdown_api::service::{ApiError, ApiHost, LiveSpeed, TaskEvent};
 use fluxdown_api::types::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, QueueDto,
-    ResolvePreviewRequest, ResolvePreviewResponse, TaskDto,
+    ResolvePreviewRequest, ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto,
+    RssValidateRequest, RssValidateResponse, TaskDto,
 };
 #[cfg(hub_link)]
 use std::time::Duration;
@@ -138,6 +139,46 @@ pub enum ApiCommand {
         user_agent: String,
         extra_headers: HashMap<String, String>,
         ack: oneshot::Sender<ResolvePreviewOutcome>,
+    },
+    /// 新建 RSS 订阅，回执新订阅 ID；`None` = feed 地址为空（引擎判定非法）。
+    /// `source` 装箱理由同 [`ApiCommand::CreateTask`]：`RssSourceInfo` 携带
+    /// 十余个过滤/命名字段，远大于其余变体（clippy::large_enum_variant）。
+    RssCreate {
+        source: Box<fluxdown_engine::rss::model::RssSourceInfo>,
+        ack: oneshot::Sender<Option<String>>,
+    },
+    /// 更新订阅可编辑字段；`false` = 订阅不存在（映射 404）。装箱理由同上。
+    RssUpdate {
+        source: Box<fluxdown_engine::rss::model::RssSourceInfo>,
+        ack: oneshot::Sender<bool>,
+    },
+    /// 删除订阅（级联条目）；`false` = 订阅不存在。
+    RssDelete {
+        source_id: String,
+        ack: oneshot::Sender<bool>,
+    },
+    /// 立即抓取一个订阅（异步派发）；`false` = 订阅不存在或已在抓取中。
+    RssRefresh {
+        source_id: String,
+        ack: oneshot::Sender<bool>,
+    },
+    /// 条目手动操作：`action` ∈ `download` / `ignore` / `readAll`（wire 字符串
+    /// 直传，语义分发在 actor 侧，避免宿主层与引擎层各维护一份枚举）。
+    RssItemAction {
+        source_id: String,
+        guid: String,
+        action: String,
+        ack: oneshot::Sender<()>,
+    },
+    /// 新建向导的 feed 只读验证：actor 只负责取 future，网络等待 off-actor
+    /// 完成后再回执（理由同 [`ApiCommand::ResolvePreview`]）。`RssValidateOutcome`
+    /// 携带整段条目预览，装箱避免撑大 oneshot 与本枚举。
+    RssValidate {
+        url: String,
+        cookies: String,
+        user_agent: String,
+        proxy_url: String,
+        ack: oneshot::Sender<Box<fluxdown_engine::rss::RssValidateOutcome>>,
     },
 }
 
@@ -568,6 +609,119 @@ impl ApiHost for HubApiHost {
             ack,
         })
         .await
+    }
+
+    // -- RSS 订阅（docs/rss-subscription-design.md）--
+
+    /// 列出全部订阅：直查 `Db`（与 `list_tasks`/`list_queues` 同款读写分离），
+    /// `unread_count` 由 SQL 侧派生，不需要 actor 往返。
+    async fn list_rss_sources(&self) -> Result<Vec<RssSourceDto>, ApiError> {
+        self.db
+            .load_all_rss_sources()
+            .await
+            .map(|sources| sources.into_iter().map(Into::into).collect())
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    async fn create_rss_source(&self, req: RssSourceDto) -> Result<String, ApiError> {
+        self.send_cmd(|ack| ApiCommand::RssCreate {
+            source: Box::new(req.into()),
+            ack,
+        })
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("invalid feed url".to_string()))
+    }
+
+    /// 路径参数是订阅身份的唯一来源：body 里的 `sourceId` 一律以它覆盖，
+    /// 避免「改 A 的地址却写进 B」。
+    async fn update_rss_source(&self, source_id: &str, req: RssSourceDto) -> Result<(), ApiError> {
+        let mut source: fluxdown_engine::rss::model::RssSourceInfo = req.into();
+        source.source_id = source_id.to_string();
+        match self
+            .send_cmd(|ack| ApiCommand::RssUpdate {
+                source: Box::new(source),
+                ack,
+            })
+            .await?
+        {
+            true => Ok(()),
+            false => Err(ApiError::NotFound),
+        }
+    }
+
+    /// 存在性由引擎回执的 `false` 表达（订阅表全量驻留内存，无需先查 DB
+    /// 再下命令的两段式竞态）。
+    async fn delete_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
+        match self
+            .send_cmd(|ack| ApiCommand::RssDelete {
+                source_id: source_id.to_string(),
+                ack,
+            })
+            .await?
+        {
+            true => Ok(()),
+            false => Err(ApiError::NotFound),
+        }
+    }
+
+    async fn refresh_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
+        match self
+            .send_cmd(|ack| ApiCommand::RssRefresh {
+                source_id: source_id.to_string(),
+                ack,
+            })
+            .await?
+        {
+            true => Ok(()),
+            false => Err(ApiError::NotFound),
+        }
+    }
+
+    /// 条目流直查 `Db`，条数上限与引擎广播路径同用 `MAX_ITEMS_PER_SOURCE`，
+    /// 保证 REST 拉取与 WS 推送看到的是同一个窗口。
+    async fn list_rss_items(&self, source_id: &str) -> Result<Vec<RssItemDto>, ApiError> {
+        self.db
+            .load_rss_items(source_id, fluxdown_engine::rss::MAX_ITEMS_PER_SOURCE)
+            .await
+            .map(|items| items.into_iter().map(Into::into).collect())
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    async fn rss_item_action(
+        &self,
+        source_id: &str,
+        req: RssItemActionRequest,
+    ) -> Result<(), ApiError> {
+        self.send_cmd(|ack| ApiCommand::RssItemAction {
+            source_id: source_id.to_string(),
+            guid: req.guid,
+            action: req.action,
+            ack,
+        })
+        .await
+    }
+
+    /// 抓取失败不是 HTTP 错误——失败原因随 200 进 `error` 字段（新建向导要
+    /// 把原因直接显示在对话框里，而不是吞成一个 5xx）。
+    async fn validate_rss_feed(
+        &self,
+        req: RssValidateRequest,
+    ) -> Result<RssValidateResponse, ApiError> {
+        let outcome = self
+            .send_cmd(|ack| ApiCommand::RssValidate {
+                url: req.url,
+                cookies: req.cookies,
+                user_agent: req.user_agent,
+                proxy_url: req.proxy_url,
+                ack,
+            })
+            .await?;
+        Ok(RssValidateResponse {
+            url: outcome.url,
+            feed_title: outcome.feed_title,
+            items: outcome.items.into_iter().map(Into::into).collect(),
+            error: outcome.error,
+        })
     }
 
     #[cfg(hub_link)]

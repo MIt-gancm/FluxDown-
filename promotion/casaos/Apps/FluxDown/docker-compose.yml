@@ -5,7 +5,7 @@ name: fluxdown
 services:
   fluxdown-server:
     # 规则：禁止使用 latest，须钉具体版本。发布新版时同步更新此处与 x-casaos.version。
-    image: ghcr.io/zerx-lab/fluxdown-server:0.1.54
+    image: ghcr.io/zerx-lab/fluxdown-server:0.2.3
     container_name: fluxdown-server
     restart: unless-stopped
     ports:
@@ -63,9 +63,10 @@ x-casaos:
   category: Downloader
   architectures:
     - amd64
+    - arm64
   # --- Version ---
-  version: "0.1.54"
-  update_at: "2026-07-04"
+  version: "0.2.3"
+  update_at: "2026-07-27"
   release_notes:
     en_US: See https://github.com/zerx-lab/FluxDown/releases
     zh_CN: 见 https://github.com/zerx-lab/FluxDown/releases

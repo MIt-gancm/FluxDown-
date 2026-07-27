@@ -14,6 +14,8 @@ import type {
   GroupDto,
   QueueDto,
   ResolveVariantOption,
+  RssItemDto,
+  RssSourceDto,
   SegmentProgressMsg,
   SegmentSplitMsg,
   TaskCdnEventMsg,
@@ -316,6 +318,22 @@ function dispatch(msg: WsServerMsg) {
       // 必须由引擎落库后广播的本消息驱动。
       void queryClientRef?.invalidateQueries({ queryKey: ['link', 'devices'] })
       break
+    case 'rssSourcesChanged': {
+      // 引擎全量推（含派生的 unreadCount），客户端整表替换——与 queuesChanged 同范式。
+      const sources = msg.sources
+      queryClientRef?.setQueryData<RssSourceDto[]>(['rss'], sources)
+      // 「立即抓取」的完成判据：引擎在成功/失败两条路径上都会回写 lastFetchAt 再广播。
+      // 动态 import 打破与 hooks/useRss 的静态循环依赖（它反向依赖本模块的 Store，
+      // 同 confirm.ts 的处理）。
+      void import('../hooks/useRss').then(({ settleRssFetch }) => settleRssFetch(sources))
+      break
+    }
+    case 'rssItemsChanged': {
+      const sourceId = msg.sourceId
+      queryClientRef?.setQueryData<RssItemDto[]>(['rss-items', sourceId], msg.items)
+      void import('../hooks/useRss').then(({ settleRssFetchOne }) => settleRssFetchOne(sourceId))
+      break
+    }
     case 'pluginsChanged':
       void queryClientRef?.invalidateQueries({ queryKey: ['plugins'] })
       break

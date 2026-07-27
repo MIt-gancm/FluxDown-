@@ -136,7 +136,7 @@ Future<void> showMobileTaskActionSheet(
         label: s.copyUrl,
         onTap: () {
           Navigator.of(ctx).pop();
-          Clipboard.setData(ClipboardData(text: task.url));
+          Clipboard.setData(ClipboardData(text: task.shareUrl));
           showMobileToast(context, s.urlCopied);
         },
       );

@@ -835,7 +835,7 @@ class _Actions extends StatelessWidget {
                 icon: LucideIcons.copy,
                 filled: false,
                 onTap: () {
-                  Clipboard.setData(ClipboardData(text: task.url));
+                  Clipboard.setData(ClipboardData(text: task.shareUrl));
                   showMobileToast(context, s.urlCopied);
                 },
               ),

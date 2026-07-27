@@ -9,6 +9,7 @@
 use crate::model::{
     GroupInfo, ManifestItemInfo, QueueInfo, QueuePosition, SegmentDetail, TaskInfo,
 };
+use crate::rss::model::{RssItemInfo, RssSourceInfo};
 
 /// 引擎运行期间产生的、宿主需要感知的事件。
 ///
@@ -180,6 +181,37 @@ pub enum EngineEvent {
         cap: i32,
         /// `pool`：上限是否为自动档推导（文件大小阶梯）。
         auto_cap: bool,
+    },
+
+    /// 全部 RSS 订阅快照——增删改 / 抓取完成 / 条目状态变化后发送（含派生的
+    /// 未读计数，侧边栏 badge 与订阅列表同批更新）。
+    /// hub → `AllRssSources` 信号；server → WS `rssSourcesChanged`。
+    RssSourcesChanged(Vec<RssSourceInfo>),
+
+    /// 某订阅的条目流快照——**只在该源确有变化或客户端显式请求时**发送
+    /// （定时 tick 抓到 0 条新条目时静默，不打扰 UI）。
+    /// hub → `RssItemsSnapshot` 信号；server → WS `rssItemsChanged`。
+    RssItemsChanged {
+        source_id: String,
+        /// 该源的条目流（新→旧，上限 `rss::MAX_ITEMS_PER_SOURCE`）。
+        items: Vec<RssItemInfo>,
+        /// 本轮自动创建任务的条目标题；订阅关闭通知或本轮无自动下载时为空。
+        /// 宿主据此弹一条**合批**通知（AutoBangumi #64），引擎不做通知。
+        notify_titles: Vec<String>,
+    },
+
+    /// 新建订阅向导的 feed 验证结果（只读，不落库不建任务）。
+    /// hub → `RssValidateResult` 信号；server → WS `rssFeedValidated`。
+    RssFeedValidated {
+        /// 与请求一一对应，用于把结果配回发起的对话框。
+        request_id: String,
+        url: String,
+        /// feed 标题（供回填订阅名）。
+        feed_title: String,
+        /// 最近条目预览（`source_id` 为空的瞬态条目）。
+        items: Vec<RssItemInfo>,
+        /// 无错误时为空。
+        error: String,
     },
 }
 

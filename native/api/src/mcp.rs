@@ -1,7 +1,8 @@
 //! MCP（Model Context Protocol）兼容端点（`POST /mcp`）。
 //!
 //! 让 AI 客户端（Claude Desktop / Cursor / Cline 等）把 FluxDown 当作 MCP
-//! server：以自然语言驱动「新建下载 / 查询任务 / 暂停恢复 / 删除 / 列队列」。
+//! server：以自然语言驱动「新建下载 / 查询任务 / 暂停恢复 / 删除 / 列队列 /
+//! 管理 RSS 订阅」。
 //!
 //! # 传输层
 //!
@@ -27,7 +28,7 @@
 use serde_json::{Value, json};
 
 use crate::service::ApiHost;
-use crate::types::CreateTaskRequest;
+use crate::types::{CreateTaskRequest, RssSourceDto};
 
 /// 服务端声明支持的 MCP 协议版本（初始化时若客户端未指定则回退到此值）。
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -95,91 +96,121 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "download_add",
-            "description": "新建一个下载任务。支持 HTTP/HTTPS/FTP/磁力链接/BitTorrent。返回新任务 ID。",
+            "description": "Create a download task from an HTTP/HTTPS or FTP URL, a magnet link, or a .torrent URL. Only `url` is required; every other field overrides a global default for this task alone. Returns `{ taskId }` — pass it to download_get, download_pause, download_resume or download_remove.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url": str_prop("要下载的 URL、磁力链接或 torrent 地址（必填）。"),
-                    "fileName": str_prop("保存的文件名（空 = 从 URL/Content-Disposition 推断）。"),
-                    "saveDir": str_prop("保存目录绝对路径（空 = 全局默认目录）。"),
-                    "segments": { "type": "integer", "description": "分段线程数（0 = 按文件大小自动决定）。" },
-                    "proxyUrl": str_prop("单任务代理 URL（空 = 全局代理）。"),
-                    "cookies": str_prop("Cookie 字符串。"),
-                    "referrer": str_prop("Referer 头。"),
-                    "userAgent": str_prop("User-Agent（空 = 全局 UA）。"),
-                    "queueId": str_prop("命名队列 ID（空 = 默认队列）。"),
-                    "checksum": str_prop("校验和，格式 algo=hexhash（空 = 跳过校验）。")
+                    "url": str_prop("Source to download: an HTTP/HTTPS or FTP URL, a magnet link, or the URL of a .torrent file. Required."),
+                    "fileName": str_prop("Name to save the file as. Empty = infer it from the URL or the Content-Disposition header."),
+                    "saveDir": str_prop("Absolute path of the destination directory. Empty = the global default download directory."),
+                    "segments": { "type": "integer", "description": "Number of parallel connections used to fetch the file. 0 = pick a count automatically from the file size." },
+                    "proxyUrl": str_prop("Proxy for this task only, e.g. `http://host:port` or `socks5://host:port`. Empty = the global proxy setting."),
+                    "cookies": str_prop("Cookie header to send, in `name=value; name2=value2` form. Use for links behind a login."),
+                    "referrer": str_prop("Referer header to send. Required by sites that block hotlinking."),
+                    "userAgent": str_prop("User-Agent header to send. Empty = the global user agent."),
+                    "queueId": str_prop("Named queue to place the task in; see queue_list. Empty = the default queue."),
+                    "checksum": str_prop("Expected checksum in `algo=hexhash` form, e.g. `sha256=ab12...`. Empty = skip verification.")
                 },
                 "required": ["url"]
             }
         },
         {
             "name": "download_list",
-            "description": "列出下载任务，可按状态过滤。返回任务数组（含进度、速度、状态等）。",
+            "description": "List download tasks with their progress, speed, size and status. Returns `{ tasks, count }`. Call this first to discover task IDs before using any per-task tool.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "status": {
                         "type": "string",
                         "enum": ["all", "pending", "downloading", "paused", "completed", "error", "preparing"],
-                        "description": "按状态过滤（省略或 all = 全部）。"
+                        "description": "Return only tasks in this state. Omit it, or pass `all`, to return every task."
                     }
                 }
             }
         },
         {
             "name": "download_get",
-            "description": "按任务 ID 查询单个任务的详细信息。",
+            "description": "Look up a single download task by ID and return its full detail as `{ task }`. Fails if no task has that ID.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "taskId": str_prop("任务 ID（必填）。") },
+                "properties": { "taskId": str_prop("ID of the task, as returned by download_add or download_list. Required.") },
                 "required": ["taskId"]
             }
         },
         {
             "name": "download_pause",
-            "description": "暂停指定任务。",
+            "description": "Pause one running or queued download. Partial data is kept on disk so the task can be resumed later. Returns `{ paused: taskId }`.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "taskId": str_prop("任务 ID（必填）。") },
+                "properties": { "taskId": str_prop("ID of the task to pause, as returned by download_add or download_list. Required.") },
                 "required": ["taskId"]
             }
         },
         {
             "name": "download_resume",
-            "description": "恢复指定的已暂停任务。",
+            "description": "Resume one paused download, continuing from the bytes already fetched. Returns `{ resumed: taskId }`.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "taskId": str_prop("任务 ID（必填）。") },
+                "properties": { "taskId": str_prop("ID of the paused task to resume, as returned by download_list. Required.") },
                 "required": ["taskId"]
             }
         },
         {
             "name": "download_pause_all",
-            "description": "暂停全部活跃任务（pending / downloading / preparing）。",
+            "description": "Pause every task that is pending, preparing or downloading, in one call. Tasks that are already paused, completed or failed are left alone. Takes no arguments; returns `{ pausedAll: true }`.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "download_resume_all",
-            "description": "恢复全部已暂停任务。",
+            "description": "Resume every paused task in one call. Takes no arguments; returns `{ resumedAll: true }`.",
             "inputSchema": { "type": "object", "properties": {} }
         },
         {
             "name": "download_remove",
-            "description": "删除指定任务，可选同时删除已下载的磁盘文件。",
+            "description": "Remove one task from the list, optionally deleting the data already written to disk. Returns `{ removed: taskId, deletedFiles }`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "taskId": str_prop("任务 ID（必填）。"),
-                    "deleteFiles": { "type": "boolean", "description": "是否同时删除磁盘文件（默认 false）。" }
+                    "taskId": str_prop("ID of the task to remove, as returned by download_list. Required."),
+                    "deleteFiles": { "type": "boolean", "description": "Also delete the downloaded file(s) from disk. Defaults to false, which drops the task but keeps the data." }
                 },
                 "required": ["taskId"]
             }
         },
         {
             "name": "queue_list",
-            "description": "列出全部命名队列及其配置（并发数、限速、默认目录等）。",
+            "description": "List the named download queues and their settings — concurrency limit, speed limit and default directory. Takes no arguments; returns `{ queues }`. Use a queue's ID as the `queueId` of download_add or rss_add.",
             "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "rss_list",
+            "description": "List the RSS subscriptions with their configuration and runtime state — unread count, last fetch time and last failure reason. Takes no arguments; returns `{ sources }`.",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "rss_add",
+            "description": "Subscribe to an RSS feed and start polling it on a schedule. Only `url` is required; omitted options fall back to engine defaults. Returns `{ sourceId }`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": str_prop("Address of the RSS feed to poll. Required."),
+                    "name": str_prop("Display name for the subscription. Empty = backfilled from the feed title."),
+                    "queueId": str_prop("Named queue for tasks created from this feed; see queue_list. Empty = the default queue."),
+                    "saveDir": str_prop("Absolute destination directory for tasks created from this feed. Empty = the queue's directory, falling back to the global default."),
+                    "intervalMinutes": { "type": "integer", "description": "Minutes between feed fetches. 0 = the engine default of 30." },
+                    "autoDownload": { "type": "boolean", "description": "Automatically create a download task for each new item that matches the feed's rules. Defaults to true; false only collects items for manual picking." }
+                },
+                "required": ["url"]
+            }
+        },
+        {
+            "name": "rss_remove",
+            "description": "Delete an RSS subscription along with the items it collected. Download tasks already created from it are kept. Returns `{ removed: sourceId }`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "sourceId": str_prop("ID of the subscription to delete, as returned by rss_list or rss_add. Required.") },
+                "required": ["sourceId"]
+            }
         }
     ])
 }
@@ -263,6 +294,31 @@ async fn call_tool(name: &str, args: &Value, host: &dyn ApiHost) -> Result<Value
             let queues = host.list_queues().await.map_err(|e| e.to_string())?;
             Ok(json!({ "queues": queues }))
         }
+        "rss_list" => {
+            let sources = host.list_rss_sources().await.map_err(|e| e.to_string())?;
+            Ok(json!({ "sources": sources }))
+        }
+        "rss_add" => {
+            // args 与 RssSourceDto 同为 camelCase，直接反序列化；未给的字段走
+            // serde 默认值，再由引擎归一（间隔 0 → 30 分钟等）。
+            let req: RssSourceDto = serde_json::from_value(args.clone())
+                .map_err(|e| format!("invalid arguments: {e}"))?;
+            if req.url.trim().is_empty() {
+                return Err("url is required".to_string());
+            }
+            let source_id = host
+                .create_rss_source(req)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "sourceId": source_id }))
+        }
+        "rss_remove" => {
+            let source_id = require_source_id(args)?;
+            host.delete_rss_source(source_id)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(json!({ "removed": source_id }))
+        }
         other => Err(format!("unknown tool: {other}")),
     }
 }
@@ -272,6 +328,14 @@ fn require_task_id(args: &Value) -> Result<&str, String> {
     match args.get("taskId").and_then(|v| v.as_str()) {
         Some(id) if !id.is_empty() => Ok(id),
         _ => Err("taskId is required".to_string()),
+    }
+}
+
+/// 从 `arguments` 取出非空 `sourceId`。
+fn require_source_id(args: &Value) -> Result<&str, String> {
+    match args.get("sourceId").and_then(|v| v.as_str()) {
+        Some(id) if !id.is_empty() => Ok(id),
+        _ => Err("sourceId is required".to_string()),
     }
 }
 
@@ -321,6 +385,7 @@ mod tests {
     #[derive(Default)]
     struct FakeHost {
         tasks: Vec<TaskDto>,
+        rss_sources: Vec<RssSourceDto>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -349,8 +414,21 @@ mod tests {
             completed_at: String::new(),
             referrer: String::new(),
             group_id: String::new(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
             queue_order: 0,
         }
+    }
+
+    /// 只给必填 `url` 与两个可读字段，其余走 serde 默认值——与真实客户端的
+    /// 最小载荷一致。
+    fn sample_rss_source(id: &str) -> RssSourceDto {
+        serde_json::from_value(json!({
+            "sourceId": id,
+            "url": "https://example.com/feed.xml",
+            "name": "示例订阅",
+        }))
+        .unwrap()
     }
 
     #[async_trait]
@@ -387,6 +465,17 @@ mod tests {
         }
         async fn list_queues(&self) -> Result<Vec<QueueDto>, ApiError> {
             Ok(vec![])
+        }
+        async fn list_rss_sources(&self) -> Result<Vec<RssSourceDto>, ApiError> {
+            Ok(self.rss_sources.clone())
+        }
+        async fn create_rss_source(&self, req: RssSourceDto) -> Result<String, ApiError> {
+            self.record(&format!("rss_create:{}:{}", req.url, req.interval_minutes));
+            Ok("new-source-id".to_string())
+        }
+        async fn delete_rss_source(&self, id: &str) -> Result<(), ApiError> {
+            self.record(&format!("rss_delete:{id}"));
+            Ok(())
         }
         async fn submit_external(&self, _req: DownloadRequest) -> Result<(), ApiError> {
             Ok(())
@@ -437,13 +526,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_nine_tools() {
+    async fn tools_list_returns_every_tool() {
         let host = FakeHost::default();
         let resp = call(&host, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .await
             .unwrap();
         let tools = resp["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 12);
         assert!(tools.iter().any(|t| t["name"] == "download_add"));
         // 每个工具都必须带 inputSchema。
         assert!(tools.iter().all(|t| t["inputSchema"].is_object()));
@@ -495,6 +584,7 @@ mod tests {
                 sample_task("b", 2),
                 sample_task("c", 1),
             ],
+            rss_sources: vec![],
             calls: Mutex::new(vec![]),
         };
         let resp = call(
@@ -518,6 +608,62 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(host.calls.lock().unwrap()[0], "delete:t1:true");
+    }
+
+    #[tokio::test]
+    async fn rss_tools_dispatch_to_host_with_camel_case_arguments() {
+        let host = FakeHost {
+            rss_sources: vec![sample_rss_source("s1")],
+            ..Default::default()
+        };
+
+        let listed = call(
+            &host,
+            r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"rss_list","arguments":{}}}"#,
+        )
+        .await
+        .unwrap();
+        let text = listed["result"]["content"][0]["text"].as_str().unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["sources"][0]["sourceId"], "s1");
+
+        let added = call(
+            &host,
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"rss_add","arguments":{"url":"https://example.com/feed.xml","intervalMinutes":15,"autoDownload":false}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(added["result"]["isError"], false);
+        assert!(
+            added["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("new-source-id")
+        );
+
+        call(
+            &host,
+            r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"rss_remove","arguments":{"sourceId":"s1"}}}"#,
+        )
+        .await
+        .unwrap();
+
+        // 缺 url 在派发层就被拦下，不打到宿主。
+        let bad = call(
+            &host,
+            r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"rss_add","arguments":{}}}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(bad["result"]["isError"], true);
+
+        assert_eq!(
+            *host.calls.lock().unwrap(),
+            [
+                "rss_create:https://example.com/feed.xml:15",
+                "rss_delete:s1"
+            ]
+        );
     }
 
     #[tokio::test]

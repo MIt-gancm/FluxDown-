@@ -688,6 +688,8 @@ class S {
   String get hideFloatingBall => _r('hideFloatingBall');
   String get torrentFileAssociation => _r('torrentFileAssociation');
   String get torrentFileAssociationDesc => _r('torrentFileAssociationDesc');
+  String get ed2kLinkAssociation => _r('ed2kLinkAssociation');
+  String get ed2kLinkAssociationDesc => _r('ed2kLinkAssociationDesc');
   String get torrentAssocDialogTitle => _r('torrentAssocDialogTitle');
   String get torrentAssocDialogDesc => _r('torrentAssocDialogDesc');
   String get notifyOnComplete => _r('notifyOnComplete');
@@ -1276,6 +1278,9 @@ class S {
   List<String> get searchKeywordsFileAssoc =>
       _r('searchKeywordsFileAssoc').split(',')
         ..addAll(['torrent', 'association', 'file']);
+  List<String> get searchKeywordsEd2kAssoc =>
+      _r('searchKeywordsEd2kAssoc').split(',')
+        ..addAll(['ed2k', 'emule', 'protocol', 'association']);
   List<String> get searchKeywordsNotifyOnComplete =>
       _r('searchKeywordsNotifyOnComplete').split(',')
         ..addAll(['notification', 'complete', 'toast']);
@@ -1715,4 +1720,105 @@ class S {
       _r('groupDetailSubtitle', {'status': status});
   String get groupDetailNoMembers => _r('groupDetailNoMembers');
   String get groupMemberOfLabel => _r('groupMemberOfLabel');
+
+  // ─────────────────────────────────────────────
+  // RSS 订阅
+  // ─────────────────────────────────────────────
+  String get sidebarRss => _r('sidebarRss');
+  String get showSidebarRss => _r('showSidebarRss');
+  String get showSidebarRssDesc => _r('showSidebarRssDesc');
+  String get rssSidebarEmptyHint => _r('rssSidebarEmptyHint');
+  String get rssAddSource => _r('rssAddSource');
+  String get rssManageTitle => _r('rssManageTitle');
+  String get rssDeleteSource => _r('rssDeleteSource');
+  String rssDeleteConfirmDesc(String name) =>
+      _r('rssDeleteConfirmDesc', {'name': name});
+  String get rssRefreshNow => _r('rssRefreshNow');
+  String get rssRefreshing => _r('rssRefreshing');
+  String get rssCheckConfig => _r('rssCheckConfig');
+  String get rssMarkAllRead => _r('rssMarkAllRead');
+  String get rssSearchHint => _r('rssSearchHint');
+  String get rssEmptyTitle => _r('rssEmptyTitle');
+  String get rssEmptyDesc => _r('rssEmptyDesc');
+  String rssNoMatch(String query) => _r('rssNoMatch', {'query': query});
+  String rssEveryMinutes(int n) => _r('rssEveryMinutes', {'n': n});
+  String rssEveryHours(int n) => _r('rssEveryHours', {'n': n});
+  String get rssNeverFetched => _r('rssNeverFetched');
+  String rssLastFetch(String when) => _r('rssLastFetch', {'when': when});
+  String rssFailedTimes(int n) => _r('rssFailedTimes', {'n': n});
+  String get rssAutoDownloadOn => _r('rssAutoDownloadOn');
+  String get rssCollectMode => _r('rssCollectMode');
+  String get rssJustNow => _r('rssJustNow');
+  String rssMinutesAgo(int n) => _r('rssMinutesAgo', {'n': n});
+  String rssHoursAgo(int n) => _r('rssHoursAgo', {'n': n});
+  String rssDaysAgo(int n) => _r('rssDaysAgo', {'n': n});
+  String get rssStatusNew => _r('rssStatusNew');
+  String get rssStatusDownloaded => _r('rssStatusDownloaded');
+  String get rssStatusIgnored => _r('rssStatusIgnored');
+  String get rssStatusFiltered => _r('rssStatusFiltered');
+  String get rssStatusDuplicate => _r('rssStatusDuplicate');
+  String get rssStatusHistory => _r('rssStatusHistory');
+  String get rssActionDownload => _r('rssActionDownload');
+  String get rssActionDownloadAnyway => _r('rssActionDownloadAnyway');
+  String get rssActionRedownload => _r('rssActionRedownload');
+  String get rssActionIgnore => _r('rssActionIgnore');
+  String get rssReasonNotIncluded => _r('rssReasonNotIncluded');
+  String get rssReasonExcluded => _r('rssReasonExcluded');
+  String get rssReasonTooSmall => _r('rssReasonTooSmall');
+  String get rssReasonTooLarge => _r('rssReasonTooLarge');
+  String get rssReasonDupEpisode => _r('rssReasonDupEpisode');
+  String get rssTabBasic => _r('rssTabBasic');
+  String get rssTabFilter => _r('rssTabFilter');
+  String get rssTabAdvanced => _r('rssTabAdvanced');
+  String get rssNameLabel => _r('rssNameLabel');
+  String get rssNameHint => _r('rssNameHint');
+  String get rssIntervalLabel => _r('rssIntervalLabel');
+  String get rssUrlLabel => _r('rssUrlLabel');
+  String get rssUrlHint => _r('rssUrlHint');
+  String get rssQueueLabel => _r('rssQueueLabel');
+  String get rssSaveDirLabel => _r('rssSaveDirLabel');
+  String get rssSaveDirHint => _r('rssSaveDirHint');
+  String get rssEnabledLabel => _r('rssEnabledLabel');
+  String get rssEnabledDesc => _r('rssEnabledDesc');
+  String get rssAutoDownloadLabel => _r('rssAutoDownloadLabel');
+  String get rssAutoDownloadDesc => _r('rssAutoDownloadDesc');
+  String get rssStartPausedLabel => _r('rssStartPausedLabel');
+  String get rssStartPausedDesc => _r('rssStartPausedDesc');
+  String get rssIncludeLabel => _r('rssIncludeLabel');
+  String get rssIncludeHint => _r('rssIncludeHint');
+  String get rssExcludeLabel => _r('rssExcludeLabel');
+  String get rssExcludeHint => _r('rssExcludeHint');
+  String get rssSizeMinLabel => _r('rssSizeMinLabel');
+  String get rssSizeMaxLabel => _r('rssSizeMaxLabel');
+  String get rssUseRegexLabel => _r('rssUseRegexLabel');
+  String get rssUseRegexDesc => _r('rssUseRegexDesc');
+  String get rssSmartEpisodeLabel => _r('rssSmartEpisodeLabel');
+  String get rssSmartEpisodeDesc => _r('rssSmartEpisodeDesc');
+  String rssPreviewHeader(int n) => _r('rssPreviewHeader', {'n': n});
+  String rssPreviewSummary(int hit, int miss) =>
+      _r('rssPreviewSummary', {'hit': hit, 'miss': miss});
+  String get rssPreviewEmpty => _r('rssPreviewEmpty');
+  String get rssPreviewWillDownload => _r('rssPreviewWillDownload');
+  String get rssPreviewFiltered => _r('rssPreviewFiltered');
+  String get rssCookiesLabel => _r('rssCookiesLabel');
+  String get rssCookiesHint => _r('rssCookiesHint');
+  String get rssUserAgentLabel => _r('rssUserAgentLabel');
+  String get rssInheritGlobalHint => _r('rssInheritGlobalHint');
+  String get rssProxyLabel => _r('rssProxyLabel');
+  String get rssMaxPerFetchLabel => _r('rssMaxPerFetchLabel');
+  String get rssSendRefererLabel => _r('rssSendRefererLabel');
+  String get rssSendRefererDesc => _r('rssSendRefererDesc');
+  String get rssNotifyLabel => _r('rssNotifyLabel');
+  String get rssNotifyDesc => _r('rssNotifyDesc');
+  String get rssWizardStep1 => _r('rssWizardStep1');
+  String get rssWizardStep2 => _r('rssWizardStep2');
+  String get rssWizardValidate => _r('rssWizardValidate');
+  String get rssWizardValidating => _r('rssWizardValidating');
+  String get rssWizardSubscribe => _r('rssWizardSubscribe');
+  String get rssWizardUrlNote => _r('rssWizardUrlNote');
+  String get rssWizardSeedNote => _r('rssWizardSeedNote');
+  String rssWizardFeedSummary(int n) => _r('rssWizardFeedSummary', {'n': n});
+  String rssAutoDownloadedToast(int n) =>
+      _r('rssAutoDownloadedToast', {'n': n});
+  String get rssSourceLabel => _r('rssSourceLabel');
 }

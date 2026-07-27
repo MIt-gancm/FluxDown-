@@ -25,6 +25,10 @@ export interface TaskDto {
   completedAt?: string
   /** 浏览器扩展捕获的来源页 URL（空 = 无） */
   referrer?: string
+  /** 展示用的真实来源链接（空/缺省 = 用 `url`）。RSS 建的 .torrent 任务其 `url` 是
+   *  引擎内部哨兵 `torrent-file://local`（种子字节在库里），对用户没有意义；
+   *  「复制链接」一类展示点一律走 lib/format.ts 的 taskShareUrl()。 */
+  originUrl?: string
   /** 所属任务组 ID（空 = 不属于任何组）；旧服务端可能缺省 */
   groupId?: string
   /** 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）；旧服务端可能缺省 */
@@ -136,6 +140,114 @@ export interface QueueDto {
   scheduleDays: number
 }
 
+// ---- RSS 订阅 ----
+
+/**
+ * 订阅源（`GET /api/v1/rss`）。字段与 native/api `RssSourceDto` 一一对应；
+ * `lastFetchAt` 起的 7 个字段是引擎维护的运行态，提交时会被忽略。
+ */
+export interface RssSourceDto {
+  sourceId: string
+  url: string
+  /** 空 = 用 feed 标题回填。 */
+  name: string
+  enabled: boolean
+  /** false = 收集模式：只收集条目供手动挑选。 */
+  autoDownload: boolean
+  /** 自动创建的任务以 paused 落库。 */
+  startPaused: boolean
+  /** 空 = 内置主队列。 */
+  queueId: string
+  /** 空 = 队列目录 → 全局目录。 */
+  saveDir: string
+  /** 抓取间隔（分钟）；0 = 引擎默认 30。 */
+  intervalMinutes: number
+  /** 包含关键词（`|` = 或，空格 = 且；空 = 不过滤）。 */
+  includePattern: string
+  excludePattern: string
+  useRegex: boolean
+  smartEpisode: boolean
+  /** 体积下限（字节，0 = 不限）。 */
+  sizeMinBytes: number
+  /** 体积上限（字节，0 = 不限）。 */
+  sizeMaxBytes: number
+  sendReferer: boolean
+  notifyOnDownload: boolean
+  /** 每轮最多新建任务数（1..=100）；0 = 引擎默认 20。 */
+  maxPerFetch: number
+  cookies: string
+  userAgent: string
+  proxyUrl: string
+  /** 只读：上次发起抓取的 Unix 秒（0 = 从未）。 */
+  lastFetchAt: number
+  /** 只读：上次成功抓取的 Unix 秒（0 = 从未）。 */
+  lastSuccessAt: number
+  /** 只读：上次失败原因（空 = 健康）。 */
+  lastError: string
+  /** 只读：连续失败次数（驱动指数退避）。 */
+  failCount: number
+  /** 只读：首轮抓取是否已完成。 */
+  seeded: boolean
+  position: number
+  /** 只读：未处理条目数（侧边栏 badge）。 */
+  unreadCount: number
+}
+
+/** 条目状态码：0=新 1=已下载 2=已忽略 3=规则未命中 4=重复剧集 5=首轮历史条目 */
+export type RssItemStatus = 0 | 1 | 2 | 3 | 4 | 5
+
+/** 订阅流中的一个条目（`GET /api/v1/rss/{id}/items`）。 */
+export interface RssItemDto {
+  sourceId: string
+  /** 去重主键。 */
+  guid: string
+  title: string
+  link: string
+  /** enclosure 直链（空 = 回退 `link`）。 */
+  enclosureUrl: string
+  /** enclosure 声明大小（字节，0 = 未知）。 */
+  enclosureLength: number
+  /** 发布时间（Unix 秒，0 = 未知）。 */
+  pubDate: number
+  fetchedAt: number
+  status: RssItemStatus
+  /** `status === 1` 时回链的任务 ID。 */
+  taskId: string
+  /** 智能剧集归一键（空 = 未识别）。 */
+  episodeKey: string
+  /** 稳定原因码（`not_included`/`excluded`/`too_small`/`too_large`/`dup_episode`/
+   *  `seed_skipped`；空 = 无）。**展示前必须经 i18n 映射**，见 lib/rss-filter.ts。 */
+  reason: string
+}
+
+/** 条目手动操作（`POST /api/v1/rss/{id}/items/action`）。guid 走请求体而非路径段：
+ *  真实 feed 的 guid 常常就是一整条 URL，塞进路径会被反代规范化后静默改写。 */
+export interface RssItemActionRequest {
+  /** `action === 'readAll'` 时忽略。 */
+  guid: string
+  action: 'download' | 'ignore' | 'readAll'
+}
+
+/** 新建向导的 feed 验证请求（`POST /api/v1/rss/validate`，只读、不落库）。 */
+export interface RssValidateRequest {
+  url: string
+  cookies?: string
+  userAgent?: string
+  proxyUrl?: string
+}
+
+/** feed 验证结果。`error` 非空即验证失败——HTTP 仍是 200，失败原因本身就是有效载荷。 */
+export interface RssValidateResponse {
+  url: string
+  feedTitle: string
+  items: RssItemDto[]
+  error: string
+}
+
+export interface CreatedRssSource {
+  sourceId: string
+}
+
 export interface CreateTaskRequest {
   url: string
   fileName?: string
@@ -226,6 +338,8 @@ export type WsServerMsg =
   | { type: 'componentResult'; component: string; ok: boolean; message: string }
   | { type: 'linkIncomingPairing'; sessionId: string; sas: string; name: string; platform: string }
   | { type: 'linkDevicesChanged' }
+  | { type: 'rssSourcesChanged'; sources: RssSourceDto[] }
+  | { type: 'rssItemsChanged'; sourceId: string; items: RssItemDto[]; notifyTitles: string[] }
   | { type: 'pong' }
 
 export interface TaskProgressMsg {

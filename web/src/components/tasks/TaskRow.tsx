@@ -6,7 +6,7 @@ import type { LucideIcon } from 'lucide-react'
 import { api, taskFileUrl } from '../../lib/api'
 import { CopyButton } from '../CopyButton'
 import { cn } from '../../lib/cn'
-import { fileType, fmtBytes, fmtEta, fmtSpeed, fmtTime, protoLabel, queueDisplayName, type FileType as FT } from '../../lib/format'
+import { fileType, fmtBytes, fmtEta, fmtSpeed, fmtTime, protoLabel, queueDisplayName, taskShareUrl, type FileType as FT } from '../../lib/format'
 import { translateBackendMessage, useI18n } from '../../lib/i18n'
 import { extractSiteLabel } from '../../lib/site'
 import { priorityStore, useStore, useTaskPluginActivity } from '../../lib/ws'
@@ -295,7 +295,7 @@ export function TaskRow({
               <Download size={15} />
             </button>
           )}
-          <CopyButton value={t.url} title={tr('task.copyUrl')} className="task-act hover-act" />
+          <CopyButton value={taskShareUrl(t)} title={tr('task.copyUrl')} className="task-act hover-act" />
           <TaskActionButton
             t={t}
             onPause={() => pauseMut.mutate()}

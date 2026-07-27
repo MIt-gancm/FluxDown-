@@ -160,3 +160,13 @@ export function queueDisplayName(q: { queueId: string; name: string }): string {
   if (q.queueId === 'later') return t('sidebar.queueLater')
   return q.name
 }
+
+/** 「复制链接」应当使用的地址：有真实来源就用它，否则回退 `url`——所有对外暴露
+ *  任务链接的地方（复制/分享/导出/重建）的单一事实源，与桌面端
+ *  `DownloadTask.shareUrl` 同语义。
+ *
+ *  存在的理由：.torrent 任务的 `url` 是引擎内部哨兵 `torrent-file://local`
+ *  （种子字节落在库里），直接复制出去粘到任何工具里都没用。 */
+export function taskShareUrl(t: { originUrl?: string; url: string }): string {
+  return t.originUrl || t.url
+}

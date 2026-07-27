@@ -18,6 +18,8 @@ use fluxdown_engine::download_manager::{
 };
 use fluxdown_engine::log_info;
 use fluxdown_engine::proxy_config::ProxyConfig;
+use fluxdown_engine::rss::RssValidateOutcome;
+use fluxdown_engine::rss::model::RssSourceInfo;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
 
@@ -164,6 +166,45 @@ pub enum ActorCmd {
         extra_headers: HashMap<String, String>,
         ack: oneshot::Sender<ResolvePreviewOutcome>,
     },
+    /// 新建 RSS 订阅，回执新订阅 ID；`None` = url 为空被引擎拒绝。
+    /// `source` 装箱理由同 [`ActorCmd::CreateTask`]：`RssSourceInfo` 二十余
+    /// 个字段，远大于其余变体。
+    RssCreate {
+        source: Box<RssSourceInfo>,
+        ack: oneshot::Sender<Option<String>>,
+    },
+    /// 更新订阅的用户可编辑字段；`false` = 订阅不存在。
+    RssUpdate {
+        source: Box<RssSourceInfo>,
+        ack: oneshot::Sender<bool>,
+    },
+    /// 删除订阅（级联条目，已建任务保留）；`false` = 订阅不存在。
+    RssDelete {
+        source_id: String,
+        ack: oneshot::Sender<bool>,
+    },
+    /// 立即抓取一个订阅；`false` = 订阅不存在或已在抓取中。
+    RssRefresh {
+        source_id: String,
+        ack: oneshot::Sender<bool>,
+    },
+    /// 条目手动操作：`download`（绕过规则强制下载）/ `ignore` / `readAll`。
+    RssItemAction {
+        source_id: String,
+        guid: String,
+        action: String,
+        ack: oneshot::Sender<()>,
+    },
+    /// feed 只读验证（新建订阅向导）：与 [`ActorCmd::ResolvePreview`] 同款
+    /// off-actor 范式，网络抓取绝不在 actor 内 await。回执装箱——
+    /// `RssValidateOutcome` 带整份条目预览。
+    RssValidate {
+        url: String,
+        cookies: String,
+        user_agent: String,
+        proxy_url: String,
+        ack: oneshot::Sender<Box<RssValidateOutcome>>,
+    },
 }
 
 /// actor 主循环。持有 `Engine` 直至进程退出。
@@ -192,6 +233,17 @@ pub async fn run_actor(
     let mut queue_schedule_tick = tokio::time::interval(Duration::from_secs(20));
     queue_schedule_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    // RSS 轮询节拍：与 `queue_schedule_tick` 同款——宿主只提供节拍，到期
+    // 判定与抓取派发都在引擎内，`tick_rss_sources` 立即返回不阻塞。
+    let mut rss_poll_tick = tokio::time::interval(Duration::from_secs(60));
+    rss_poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    // RSS off-actor 回流通道：抓取/验证在 `RssManager` 自己 spawn 的任务里
+    // 完成，结果经这里回到 actor 串行落库建任务。`take_event_rx` 只可能在
+    // 此处首取（返回 `Some`），但仍用 `Option` + 惰性分支避免对不变式做无
+    // 凭据的假设（与 hub `download_actor.rs` 同款）。
+    let mut rss_rx = engine.manager.rss.take_event_rx();
+
     loop {
         tokio::select! {
             Some(cmd) = cmd_rx.recv() => {
@@ -218,6 +270,17 @@ pub async fn run_actor(
             }
             _ = queue_schedule_tick.tick() => {
                 engine.manager.tick_queue_schedules().await;
+            }
+            _ = rss_poll_tick.tick() => {
+                engine.manager.tick_rss_sources();
+            }
+            Some(ev) = async {
+                match rss_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                engine.manager.on_rss_event(ev).await;
             }
             else => {
                 log_info!("[server-actor] all channels closed, exiting");
@@ -488,6 +551,54 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                     error: "resolve preview worker dropped".to_string(),
                 });
                 let _ = ack.send(outcome);
+            });
+        }
+        ActorCmd::RssCreate { source, ack } => {
+            let source_id = engine.manager.rss.create_source(*source).await;
+            let _ = ack.send(source_id);
+        }
+        ActorCmd::RssUpdate { source, ack } => {
+            let ok = engine.manager.rss.update_source(*source).await;
+            let _ = ack.send(ok);
+        }
+        ActorCmd::RssDelete { source_id, ack } => {
+            let ok = engine.manager.rss.delete_source(&source_id).await;
+            let _ = ack.send(ok);
+        }
+        ActorCmd::RssRefresh { source_id, ack } => {
+            // 同步派发：抓取本身在 off-actor worker 里跑，结果经 `rss_rx` 回流。
+            let ok = engine.manager.refresh_rss_source(&source_id);
+            let _ = ack.send(ok);
+        }
+        ActorCmd::RssItemAction {
+            source_id,
+            guid,
+            action,
+            ack,
+        } => {
+            match action.as_str() {
+                "download" => engine.manager.download_rss_item(&source_id, &guid).await,
+                "ignore" => engine.manager.rss.ignore_item(&source_id, &guid).await,
+                "readAll" => engine.manager.rss.mark_all_read(&source_id).await,
+                // wire 契约只有上面三种；未知值当无操作，不报错也不落库。
+                _ => {}
+            }
+            let _ = ack.send(());
+        }
+        ActorCmd::RssValidate {
+            url,
+            cookies,
+            user_agent,
+            proxy_url,
+            ack,
+        } => {
+            // 与 `ResolvePreview` 同款：future 必须在 actor 之外 await，
+            // 一次 feed 抓取足以冻结整个事件循环。
+            let fut = engine
+                .manager
+                .rss_validate_future(url, cookies, user_agent, proxy_url);
+            tokio::spawn(async move {
+                let _ = ack.send(Box::new(fut.await));
             });
         }
     }

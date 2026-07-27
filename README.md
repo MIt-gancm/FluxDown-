@@ -44,7 +44,7 @@
 | **Speed Control** | Token-bucket global rate limiting — download in the background without killing your browsing |
 | **Resume Anywhere** | Every byte tracked in SQLite with WAL; power loss never costs you progress |
 | **Browser Integration** | Three-layer download interception, streaming media sniffing, Alt+Click bypass, right-click send |
-| **MCP Server** | Built-in Model Context Protocol endpoint (Streamable HTTP) with 9 tools — AI agents can add, monitor and control downloads |
+| **MCP Server** | Built-in Model Context Protocol endpoint (Streamable HTTP) with 12 tools — AI agents can add, monitor and control downloads |
 | **Beautiful Interface** | shadcn-style widgets, IDM-style segment visualization, named queues, system tray |
 | **Clean & Private** | Zero ads, zero telemetry lock-in, zero accounts — your data never leaves your machine |
 
@@ -90,7 +90,7 @@ FluxDown ships a built-in **MCP server** so AI agents (Claude Desktop, Cursor, C
 - **Auth**: Bearer token (`Authorization: Bearer <token>` or `X-FluxDown-Token`), shared with the management API
 - **Enable**: Settings → API Service → toggle *MCP endpoint* (a token is generated automatically); the headless server enables it by default
 
-### Tools (9)
+### Tools (12)
 
 | Tool | Description |
 |---|---|
@@ -101,6 +101,9 @@ FluxDown ships a built-in **MCP server** so AI agents (Claude Desktop, Cursor, C
 | `download_pause_all` / `download_resume_all` | Pause / resume all tasks |
 | `download_remove` | Remove a task, optionally deleting downloaded files |
 | `queue_list` | List named queues and their configuration |
+| `rss_list` | List RSS subscriptions with their configuration and runtime state |
+| `rss_add` | Subscribe to an RSS feed and start polling it on a schedule |
+| `rss_remove` | Delete an RSS subscription and the items it collected |
 
 ### Client configuration
 

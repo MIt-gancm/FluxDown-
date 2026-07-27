@@ -618,6 +618,12 @@ pub struct NewTaskSpec {
     pub extra_headers: std::collections::HashMap<String, String>,
     /// BT 文件预选（空 = 全部文件）。
     pub selected_file_indices: Vec<i32>,
+    /// 无人值守创建：BT 任务直接按「全部文件」落库，**不弹文件选择框**。
+    ///
+    /// RSS 订阅这类自动化入口必须置 true——半夜抓到 5 集就弹 5 次对话框是
+    /// 不可接受的，而且用户点「取消」后条目已被标记「已下载」，状态就撒谎了。
+    /// 手动新建下载保持 false，用户仍然自己挑文件。
+    pub unattended_bt_selection: bool,
     /// 自定义 HTTP method（None = GET）。
     pub method: Option<String>,
     /// 捕获的请求体（POST 接管）。
@@ -1137,6 +1143,9 @@ pub struct DownloadManager {
     sink: Arc<dyn EventSink>,
     /// 需要宿主介入决策的选择接口(HLS 画质/BT 文件选择)——由宿主注入。
     selector: Arc<dyn HostSelection>,
+    /// RSS 订阅子系统（轮询调度 + 条目状态机）。任务创建仍收敛在
+    /// [`DownloadManager::create_task`]，`RssManager` 只产出建任务指令。
+    pub rss: crate::rss::RssManager,
     /// 插件管理器（Arc 共享）。`None` 直到 `install_plugin_manager` 注入。
     /// 仅 `plugins` feature 下存在；feature 关时无此字段、下载主链路零变化。
     #[cfg(feature = "plugins")]
@@ -1199,6 +1208,9 @@ impl DownloadManager {
         let (plugin_retry_tx, plugin_retry_rx) = mpsc::unbounded_channel();
         let limiter = SpeedLimiter::new(speed_limit_bps);
         limiter.spawn_refill_task();
+        // RSS 子系统与 manager 共享同一个 DB 池与事件出口（两者都只是句柄
+        // 克隆，不额外开连接）。
+        let (rss_db, rss_sink) = (db.clone(), sink.clone());
         Ok(Self {
             db,
             client,
@@ -1240,6 +1252,7 @@ impl DownloadManager {
             reserved_temp_paths: HashSet::new(),
             sink,
             selector,
+            rss: crate::rss::RssManager::new(rss_db, rss_sink),
             #[cfg(feature = "plugins")]
             plugin_manager: None,
             #[cfg(feature = "plugins")]
@@ -3127,6 +3140,7 @@ impl DownloadManager {
             ignore_tls_errors,
             extra_headers,
             selected_file_indices,
+            unattended_bt_selection,
             method,
             body,
             audio_url,
@@ -3194,6 +3208,16 @@ impl DownloadManager {
         {
             log_info!("insert_task error: {}", e);
             return None;
+        }
+
+        // `url` 被换成 `torrent-file://local` 哨兵时,把真实来源链接留一份供
+        // 右键「复制下载链接」用。仅限带 scheme 的网络地址——本地 .torrent
+        // 文件建的任务 `url` 是磁盘路径,复制出去对别人没用。
+        if db_url != url
+            && (url.starts_with("http://") || url.starts_with("https://"))
+            && let Err(e) = self.db.set_task_origin_url(&task_id, &url).await
+        {
+            log_info!("set_task_origin_url error: {}", e);
         }
 
         // 持久化浏览器请求上下文（cookies/referrer/extra_headers），resume 时
@@ -3290,6 +3314,14 @@ impl DownloadManager {
         // BT tasks bypass the HTTP/FTP concurrency queue — they are managed
         // by the shared librqbit session with its own concurrency controls.
         let is_bt = is_magnet(&url) || !torrent_file_bytes.is_empty();
+
+        // 无人值守入口（RSS）：**在任务启动之前**把「已确认全部文件」落库，
+        // 于是 `do_start_task` 从 DB 读到 `Some([])` 直接跳过选择框。复用既有
+        // 三态语义（None=未确认 / Some([])=全选 / Some([..])=子集），不新增
+        // 第二套「要不要弹框」的判定。
+        if unattended_bt_selection && is_bt {
+            let _ = self.db.save_bt_selected_files(&task_id, &[], true).await;
+        }
 
         if start_paused {
             // 稍后下载：不启动、不排队。后台 probe 让 UI 尽快拿到文件名/
@@ -3715,6 +3747,22 @@ impl DownloadManager {
                 let _ = self.db.save_bt_custom_name(&task_id, &custom_name).await;
             }
 
+            // 首启也要尊重**已持久化**的文件选择，而不是无脑弹框：无人值守
+            // 入口（RSS）在 `create_task` 里已经把「全部文件」写进 DB，读到
+            // `Some([])` 就该直接跳过对话框。此前这里硬编码 `false`，与
+            // `do_resume_task` 的三态读取行为分叉，导致 RSS 每建一个 BT 任务
+            // 都弹一次选择框（且用户点「取消」后条目仍被标记「已下载」）。
+            let (bt_pre_selected, bt_skip_selection) = match self
+                .db
+                .load_bt_selected_files(&task_id)
+                .await
+                .unwrap_or(None)
+            {
+                None => (Vec::new(), false),
+                Some(indices) if indices.is_empty() => (Vec::new(), true),
+                Some(indices) => (indices, false),
+            };
+
             let bt_params = BtDownloadParams {
                 task_id: task_id.clone(),
                 torrent_source,
@@ -3726,8 +3774,12 @@ impl DownloadManager {
                 bt_runtime: bt_ref.runtime_handle(),
                 shared_bt: bt_ref.clone(),
                 existing_handle: None,
-                pre_selected_indices: selected_file_indices,
-                skip_file_selection: false,
+                pre_selected_indices: if bt_pre_selected.is_empty() {
+                    selected_file_indices
+                } else {
+                    bt_pre_selected
+                },
+                skip_file_selection: bt_skip_selection,
                 custom_name,
                 selector: self.selector.clone(),
             };
@@ -6037,6 +6089,218 @@ impl DownloadManager {
             } else {
                 self.stop_queue(queue_id).await;
             }
+        }
+    }
+
+    /// RSS 轮询节拍：派发全部到期订阅的 off-actor 抓取。
+    ///
+    /// 与 [`Self::tick_queue_schedules`] 同款——宿主只提供节拍，判定与派发
+    /// 全在引擎内；抓取本身不在 actor 上跑，本方法立即返回。
+    pub fn tick_rss_sources(&mut self) {
+        let now = crate::rss::unix_now();
+        let (proxy, ua) = (self.proxy_config.clone(), self.global_user_agent.clone());
+        self.rss.tick(now, &proxy, &ua);
+    }
+
+    /// 立即抓取一个订阅（「立即刷新」）。返回是否真的派发（已在抓取中或
+    /// 订阅不存在时为 `false`）。
+    pub fn refresh_rss_source(&mut self, source_id: &str) -> bool {
+        let (proxy, ua) = (self.proxy_config.clone(), self.global_user_agent.clone());
+        self.rss.refresh_now(source_id, &proxy, &ua)
+    }
+
+    /// 只读验证一个 feed 地址（新建订阅向导）。结果经 RSS 回流通道返回。
+    pub fn validate_rss_feed(
+        &self,
+        request_id: String,
+        url: String,
+        cookies: String,
+        user_agent: String,
+        proxy_url: String,
+    ) {
+        let (proxy, ua) = (self.proxy_config.clone(), self.global_user_agent.clone());
+        self.rss
+            .validate(request_id, url, cookies, user_agent, proxy_url, &proxy, &ua);
+    }
+
+    /// 只读验证的**请求-应答**变体（REST `POST /api/v1/rss/validate`、CLI）。
+    ///
+    /// 返回一个可在 actor 之外 `await` 的 future——调用方拿到它后立刻
+    /// [`tokio::spawn`] 并等 oneshot，actor 本身不会被网络 IO 阻塞
+    /// （与 `spawn_resolve_preview` 的先例同款）。
+    pub fn rss_validate_future(
+        &self,
+        url: String,
+        cookies: String,
+        user_agent: String,
+        proxy_url: String,
+    ) -> impl std::future::Future<Output = crate::rss::RssValidateOutcome> + Send + use<> {
+        let (proxy, ua) = (self.proxy_config.clone(), self.global_user_agent.clone());
+        self.rss.validate_future(
+            String::new(),
+            url,
+            cookies,
+            user_agent,
+            proxy_url,
+            &proxy,
+            &ua,
+        )
+    }
+
+    /// RSS off-actor 回流的唯一入口（宿主 actor 的 `rss_rx` 分支调用）。
+    ///
+    /// 抓取结果先经 `RssManager` 完成去重/过滤/落库，再把「应下载」的条目
+    /// 逐条走 [`Self::create_task`]——任务创建的唯一收敛点不因 RSS 而分叉。
+    pub async fn on_rss_event(&mut self, event: crate::rss::RssEvent) {
+        let outcome = match event {
+            crate::rss::RssEvent::Validated(v) => {
+                self.rss.emit_validated(*v);
+                return;
+            }
+            crate::rss::RssEvent::TorrentReady(t) => {
+                self.on_rss_torrent_ready(*t).await;
+                return;
+            }
+            crate::rss::RssEvent::Fetched(f) => *f,
+        };
+        let source_id = outcome.source_id.clone();
+        let plans = self.rss.apply_fetch(outcome).await;
+        if plans.is_empty() {
+            return;
+        }
+        let notified = self.create_rss_tasks(plans).await;
+        if !notified.is_empty() {
+            // 条目状态刚被改写为「已下载」，重播一次条目流让 UI 立即反映，
+            // 并把合批通知标题挂在同一条事件上（宿主弹一条通知，不是 N 条）。
+            self.rss.broadcast_items(&source_id, notified).await;
+            self.rss.broadcast_sources().await;
+        }
+    }
+
+    /// `.torrent` 字节到手 → 建**真正的 BT 任务**（见
+    /// [`crate::rss::RssDownloadPlan::is_torrent_file`]）。
+    ///
+    /// 抓取失败时**不**退化成「把 .torrent 当普通文件下下来」——那正是要修的
+    /// 老毛病；条目留在 `New`，下一轮抓取自然重试（临时网络抖动自愈）。
+    async fn on_rss_torrent_ready(&mut self, outcome: crate::rss::RssTorrentOutcome) {
+        let plan = *outcome.plan;
+        if !outcome.error.is_empty() {
+            log_info!(
+                "[rss] torrent fetch failed, item stays pending for next round: {} ({})",
+                plan.title,
+                outcome.error
+            );
+            return;
+        }
+        let spec = NewTaskSpec {
+            // BT 任务的 url 由 create_task 换成 `torrent-file://local` 哨兵，
+            // 真正的内容走 torrent_file_bytes 持久化。
+            url: plan.url.clone(),
+            save_dir: self.resolve_rss_save_dir(&plan.save_dir, &plan.queue_id),
+            torrent_file_bytes: outcome.bytes,
+            proxy_url: plan.proxy_url.clone(),
+            user_agent: plan.user_agent.clone(),
+            queue_id: plan.queue_id.clone(),
+            start_paused: plan.start_paused,
+            unattended_bt_selection: true,
+            ..Default::default()
+        };
+        let notify = plan.notify;
+        let title = plan.title.clone();
+        let source_id = plan.source_id.clone();
+        if self.finish_rss_task(&plan, spec).await.is_none() {
+            return;
+        }
+        self.rss
+            .broadcast_items(&source_id, if notify { vec![title] } else { Vec::new() })
+            .await;
+        self.rss.broadcast_sources().await;
+    }
+
+    /// 手动下载一个 RSS 条目（「仍要下载」/「补下」，绕过规则与剧集去重）。
+    pub async fn download_rss_item(&mut self, source_id: &str, guid: &str) {
+        let Some(plan) = self.rss.manual_download(source_id, guid).await else {
+            return;
+        };
+        self.create_rss_tasks(vec![*plan]).await;
+        self.rss.broadcast_items(source_id, Vec::new()).await;
+        self.rss.broadcast_sources().await;
+    }
+
+    /// 按建任务指令批量创建任务，返回需要进通知的条目标题。
+    ///
+    /// `.torrent` 条目在这里**不直接建任务**：先 off-actor 抓种子字节，等
+    /// `TorrentReady` 回流再建，因此不计入本次返回的通知标题（通知随第二段
+    /// 单独发出）。
+    async fn create_rss_tasks(&mut self, plans: Vec<crate::rss::RssDownloadPlan>) -> Vec<String> {
+        let mut notify_titles = Vec::new();
+        let (proxy, ua) = (self.proxy_config.clone(), self.global_user_agent.clone());
+        for plan in plans {
+            if plan.is_torrent_file() {
+                self.rss.spawn_torrent_fetch(Box::new(plan), &proxy, &ua);
+                continue;
+            }
+            let spec = NewTaskSpec {
+                url: plan.url.clone(),
+                save_dir: self.resolve_rss_save_dir(&plan.save_dir, &plan.queue_id),
+                cookies: plan.cookies.clone(),
+                referrer: plan.referrer.clone(),
+                proxy_url: plan.proxy_url.clone(),
+                user_agent: plan.user_agent.clone(),
+                queue_id: plan.queue_id.clone(),
+                start_paused: plan.start_paused,
+                unattended_bt_selection: true,
+                ..Default::default()
+            };
+            let notify = plan.notify;
+            let title = plan.title.clone();
+            if self.finish_rss_task(&plan, spec).await.is_some() && notify {
+                notify_titles.push(title);
+            }
+        }
+        notify_titles
+    }
+
+    /// 建任务 + 打溯源指针 + 回写条目状态（两条建任务路径的共同收尾）。
+    async fn finish_rss_task(
+        &mut self,
+        plan: &crate::rss::RssDownloadPlan,
+        spec: NewTaskSpec,
+    ) -> Option<String> {
+        let task_id = self.create_task(spec).await?;
+        if let Err(e) = self.db.set_task_rss_source(&task_id, &plan.source_id).await {
+            log_info!("[rss] set_task_rss_source error: {}", e);
+        }
+        self.rss
+            .mark_downloaded(&plan.source_id, &plan.guid, &task_id)
+            .await;
+        // 补一次全量任务快照：`create_task` 只发单条 `TaskProgress`，而该事件
+        // **不带 queue_id**——客户端「按进度新建任务」只能拿到一个 queue_id 为
+        // 空的条目，于是新任务不属于任何队列、队列视图里根本看不见，得手动
+        // 停/启队列触发全量刷新才归位。Dart 自己发起的创建不受影响（它本来
+        // 就知道队列），RSS 是引擎自发的，必须由引擎把归属补上。
+        self.load_and_send_all_tasks().await;
+        Some(task_id)
+    }
+
+    /// 保存目录兜底链：订阅目录 → 队列默认目录 → 全局默认目录（§3.1）。
+    fn resolve_rss_save_dir(&self, source_dir: &str, queue_id: &str) -> String {
+        if !source_dir.is_empty() {
+            return source_dir.to_string();
+        }
+        let queue_dir = self
+            .queues
+            .get(if queue_id.is_empty() {
+                MAIN_QUEUE_ID
+            } else {
+                queue_id
+            })
+            .map(|q| q.default_save_dir.as_str())
+            .unwrap_or("");
+        if queue_dir.is_empty() {
+            self.default_save_dir.clone()
+        } else {
+            queue_dir.to_string()
         }
     }
 

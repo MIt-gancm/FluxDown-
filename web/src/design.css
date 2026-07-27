@@ -387,13 +387,20 @@ svg { display: block; }
 .side-item.active em { color: var(--accent); }
 .queue-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: var(--text3); }
 .queue-dot.on { background: var(--success); box-shadow: 0 0 0 2px rgba(34,197,94,.18); }
-.queue-row { position: relative; }
+/* 队列 / RSS 行：标题与悬浮操作**共享**同一行宽度，绝不重叠。
+   早期版本把 .queue-actions 绝对定位浮在行上，队列名短时看不出问题，但 RSS
+   订阅名（"Mikan · 我的番组" 之类）一长，删除按钮就压在文字上。这里改为让
+   操作区参与 flex 布局：未悬浮时宽度压成 0 并裁掉，悬浮时占真实宽度，标题
+   靠 flex:1 + min-width:0 自动省略号收尾——不需要为按钮个数硬编码保留宽度。 */
+.queue-row { position: relative; display: flex; align-items: center; }
+.queue-row > .side-item { flex: 1; min-width: 0; }
 .queue-row .queue-actions {
-  display: none; align-items: center; gap: 2px;
-  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  display: flex; align-items: center; gap: 2px;
+  width: 0; overflow: hidden;
 }
-.queue-row:hover .queue-actions { display: flex; }
-.queue-row:hover .side-item em { opacity: 0; }
+.queue-row .queue-actions > * { flex-shrink: 0; }
+.queue-row:hover .queue-actions { width: auto; overflow: visible; }
+.queue-row:hover .side-item em { display: none; }
 
 .day-chip {
   width: 30px; height: 26px; border-radius: 6px;
@@ -1333,6 +1340,106 @@ svg { display: block; }
 }
 .wtoast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+/* ---------- RSS 订阅（侧边栏区块 + 条目流 + 规则预览） ---------- */
+
+/* 抓取失败的订阅：圆点转警告色，与队列的运行/停止圆点共用几何。 */
+.queue-dot.warn { background: var(--warning); box-shadow: 0 0 0 2px rgba(245,158,11,.2); }
+/* 抓取中的订阅行常驻显示操作簇（默认只在 hover 显示）：一轮抓取要好几秒，鼠标
+   一移开 spinner 就没了等于没有反馈。同时隐去未读数，让 hover 前后行内几何一致，
+   整行不会因为鼠标进出而左右抖。 */
+.queue-row.rss-busy .queue-actions { width: auto; overflow: visible; }
+.queue-row.rss-busy .side-item em { display: none; }
+
+.rss-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+
+.rss-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 12px 14px; background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.rss-head-icon {
+  width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+  background: var(--accent-weak); color: var(--accent);
+  display: grid; place-items: center;
+}
+.rss-head-icon.err { background: rgba(239,68,68,.1); color: var(--danger); }
+.rss-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.rss-head-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.rss-head-name b { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rss-head-meta { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text3); flex-wrap: wrap; }
+.rss-head-meta .sep { opacity: .5; }
+.rss-head-meta .err { color: var(--danger); }
+
+.rss-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-bottom: 1px solid var(--border);
+}
+.rss-search { width: 240px; height: 30px; margin-left: auto; }
+
+.rss-row {
+  display: flex; align-items: center; gap: 12px;
+  min-height: 56px; padding: 8px 12px; margin-bottom: 4px;
+  border-radius: 10px; border: 1px solid transparent;
+  transition: background .12s;
+}
+.rss-row:hover { background: var(--hover); }
+.rss-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.rss-row-name b { font-size: 13px; font-weight: 500; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rss-row-meta { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text3); font-variant-numeric: tabular-nums; }
+.rss-row-meta .sep { opacity: .5; }
+/* 状态与操作各占一列定宽、右对齐：不同状态的 chip 文案长短不一，若让它们参与
+   自动布局，相邻行的 chip 与按钮就会左右错位。列内溢出交给省略号。 */
+/* 宽度按最长一档定：状态列容得下「已下载 · 查看任务」/「Downloaded · open task」，
+   操作列容得下并排的「下载 + 忽略」/「Download + Ignore」。 */
+.rss-row-status { display: flex; align-items: center; justify-content: flex-end; flex-shrink: 0; width: 176px; overflow: hidden; }
+.rss-row-ops { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-shrink: 0; width: 152px; }
+
+.rss-chip {
+  flex-shrink: 0; max-width: 100%; font-size: 11px; font-weight: 500; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  padding: 3px 9px; border-radius: 999px;
+  background: var(--surface2); color: var(--text2);
+}
+.rss-chip.new { background: var(--accent-weak); color: var(--accent); }
+.rss-chip.done { background: rgba(34,197,94,.12); color: var(--success); }
+.rss-chip.dup { background: rgba(245,158,11,.14); color: var(--warning); }
+.rss-chip.clickable:hover { filter: brightness(1.08); text-decoration: underline; }
+
+.rss-empty {
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  padding: 70px 24px; text-align: center; color: var(--text3);
+}
+.rss-empty svg { color: var(--text3); opacity: .6; }
+.rss-empty b { font-size: 13.5px; color: var(--text2); }
+.rss-empty span { font-size: 12px; max-width: 420px; line-height: 1.6; }
+
+/* 规则预览：管理对话框「过滤规则」Tab 下半屏，输入即重算。 */
+.rss-preview { margin-top: 14px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }
+.rss-preview-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 7px 10px; font-size: 11.5px; color: var(--text3);
+  background: var(--surface2); border-bottom: 1px solid var(--border);
+}
+.rss-preview-head .ok { color: var(--success); font-weight: 600; }
+.rss-preview-list { max-height: 220px; overflow-y: auto; }
+.rss-preview-list::-webkit-scrollbar { width: 5px; }
+.rss-preview-list::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; }
+.rss-preview-row {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px; font-size: 11.5px;
+  border-bottom: 1px solid var(--border);
+}
+.rss-preview-row:last-child { border-bottom: none; }
+.rss-preview-row.miss { opacity: .62; }
+.rss-preview-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rss-preview-why { flex-shrink: 0; color: var(--text3); }
+.rss-mark {
+  flex-shrink: 0; font-size: 10px; font-weight: 600;
+  padding: 1.5px 6px; border-radius: 5px;
+}
+.rss-mark.y { background: rgba(34,197,94,.14); color: var(--success); }
+.rss-mark.n { background: var(--surface2); color: var(--text3); }
+
 /* ============================================================
    移动端适配（≤820px）
    目标：小屏可读、布局不乱——不追求与移动端客户端一致。
@@ -1379,6 +1486,14 @@ svg { display: block; }
   .task-scroll { padding: 8px 8px 12px; }
   .task-row { gap: 9px; padding: 8px 9px; }
   .trow-pct { width: 38px; font-size: 11.5px; }
+  /* 条目流：工具条换行、操作簇下沉到标题下方，窄屏不横向溢出 */
+  .rss-bar { flex-wrap: wrap; row-gap: 8px; }
+  .rss-search { width: 100%; margin-left: 0; }
+  .rss-row { flex-wrap: wrap; row-gap: 6px; padding: 8px 9px; }
+  .rss-row-main { flex-basis: 100%; }
+  /* 窄屏一行放不下三列：标题独占一行，状态与操作退回自适应宽度贴右 */
+  .rss-row-status { width: auto; }
+  .rss-row-ops { width: auto; margin-left: auto; }
   .statusbar { gap: 12px; padding: 0 10px; overflow: hidden; white-space: nowrap; }
   .statusbar .sb-item:last-child { display: none; }
   .sb-scope, .sb-view-state { display: none; }

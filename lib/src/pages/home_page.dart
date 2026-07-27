@@ -11,6 +11,7 @@ import '../models/download_controller.dart';
 import '../models/download_task.dart';
 import '../models/list_entity.dart';
 import '../models/plugin_provider.dart';
+import '../models/rss_provider.dart';
 import '../models/settings_provider.dart';
 import '../models/view_prefs.dart';
 import '../services/external_download_service.dart';
@@ -30,6 +31,8 @@ import '../widgets/sidebar.dart';
 import '../widgets/header_bar.dart';
 import '../widgets/task_tab_bar.dart';
 import '../widgets/task_list.dart';
+import '../widgets/rss_item_list.dart';
+import '../widgets/rss_manager_dialog.dart';
 import '../widgets/detail_panel.dart';
 import '../widgets/group_detail_panel.dart';
 import '../widgets/status_bar.dart';
@@ -62,6 +65,7 @@ class _HomePageState extends State<HomePage> {
   final _controller = DownloadController();
   final _settingsProvider = SettingsProvider();
   final _pluginProvider = PluginProvider();
+  final _rssProvider = RssProvider();
   final _headerBarKey = GlobalKey<HeaderBarState>();
   /// 任务列表视图系统偏好 store（全局 + 按状态页签覆盖层，contract-dart.md）。
   final _viewPrefsStore = ViewPrefsStore();
@@ -103,6 +107,9 @@ class _HomePageState extends State<HomePage> {
     // 请求插件列表 + 订阅熔断器自动禁用通知（弹 toast）
     _pluginProvider.requestPlugins();
     _pluginProvider.addListener(_onPluginProviderChanged);
+    // 拉取 RSS 订阅列表 + 订阅「自动下载了新条目」通知（弹一条合批通知）
+    _rssProvider.requestSources();
+    _rssProvider.addListener(_onRssProviderChanged);
     // 监听下载完成事件 → 发送系统通知
     _controller.onTaskCompleted = _handleTaskCompleted;
     // 监听「修改线程数」结果 → toast 提示
@@ -167,6 +174,34 @@ class _HomePageState extends State<HomePage> {
     FluxSonner.of(context).show(
       ShadToast.destructive(
         title: Text(currentS.pluginAutoDisabledToast(name)),
+        duration: const Duration(seconds: 4),
+      ),
+    );
+  }
+
+  /// RSS 自动创建了新任务时弹**一条**合批提示（AutoBangumi #64 的高票诉求）。
+  ///
+  /// 用 seq 去重而不是比对内容：同一批标题可能在多次 notifyListeners 里重复出现
+  /// （provider 的任何变化都会触发），只有 seq 前进才代表「又下了一批」。
+  int _lastRssNotifySeq = -1;
+  void _onRssProviderChanged() {
+    if (!mounted) return;
+    final seq = _rssProvider.notifySeq;
+    if (seq == _lastRssNotifySeq) return;
+    final first = _lastRssNotifySeq < 0;
+    _lastRssNotifySeq = seq;
+    // 首次回调只对齐基线，不为启动前积累的历史结果补弹通知。
+    if (first) return;
+    final titles = _rssProvider.lastNotifyTitles;
+    if (titles.isEmpty) return;
+    FluxSonner.of(context).show(
+      ShadToast(
+        title: Text(currentS.rssAutoDownloadedToast(titles.length)),
+        description: Text(
+          titles.first,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+        ),
         duration: const Duration(seconds: 4),
       ),
     );
@@ -248,6 +283,8 @@ class _HomePageState extends State<HomePage> {
     LocalPairingService.instance.removeListener(_onLocalPairingChanged);
     _pluginProvider.removeListener(_onPluginProviderChanged);
     _pluginProvider.dispose();
+    _rssProvider.removeListener(_onRssProviderChanged);
+    _rssProvider.dispose();
     _controller.removeListener(_onControllerChanged);
     _controller.onTaskCompleted = null;
     _controller.onSegmentsUpdateResult = null;
@@ -302,6 +339,7 @@ class _HomePageState extends State<HomePage> {
     final visible =
         _settingsProvider.showSidebarStatus ||
         _settingsProvider.showSidebarQueues ||
+        _settingsProvider.showSidebarRss ||
         _settingsProvider.showSidebarCategory;
     if (_sidebarVisible != visible) {
       setState(() => _sidebarVisible = visible);
@@ -636,6 +674,18 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// 从 RSS 条目流的「已下载」chip 跳到对应任务（P5 溯源的正向跳转）。
+  ///
+  /// 先退出条目流再选中任务：条目流与任务列表共用主区，不退出的话选中了也
+  /// 看不见。同时把状态页签切回「全部」，否则任务可能被当前页签筛掉。
+  void _revealTaskFromRss(String taskId) {
+    if (taskId.isEmpty) return;
+    _rssProvider.select('');
+    _controller.setStatusTab(StatusTab.all);
+    _controller.selectTask(taskId);
+    setState(() => _isDetailOpen = true);
+  }
+
   void _closeDetail() {
     _controller.selectTask(null);
     _controller.selectGroup(null);
@@ -670,6 +720,7 @@ class _HomePageState extends State<HomePage> {
         return DetailPanel(
           controller: _controller,
           onClose: _closeDetail,
+          rssProvider: _rssProvider,
           isBottom: isBottom,
           onTogglePosition: _toggleDetailPosition,
         );
@@ -709,6 +760,7 @@ class _HomePageState extends State<HomePage> {
           child: Sidebar(
             controller: _controller,
             settingsProvider: _settingsProvider,
+            rssProvider: _rssProvider,
           ),
         ),
       ],
@@ -779,15 +831,34 @@ class _HomePageState extends State<HomePage> {
           ),
           Expanded(
             flex: _isDetailOpen ? 1 : 2,
-            child: TaskList(
-              controller: _controller,
-              viewPrefsStore: _viewPrefsStore,
-              onTaskTap: _toggleDetail,
-              onGroupTap: _toggleDetailGroup,
-              onNewDownload: () => showNewDownloadDialog(
-                context,
-                _controller,
-                _settingsProvider,
+            // 主区二选一：选中 RSS 订阅时显示条目流，否则显示任务列表。
+            // 复用同一块空间而不是开「第四空间」，用户零学习成本；这也正是
+            // qBittorrent 独立 RSS Tab 的反面（那边「这条下没下」要来回切页）。
+            child: ListenableBuilder(
+              listenable: _rssProvider,
+              builder: (context, taskList) {
+                if (_rssProvider.selectedSourceId.isEmpty) return taskList!;
+                return RssItemList(
+                  provider: _rssProvider,
+                  onOpenTask: _revealTaskFromRss,
+                  onManage: (sourceId) => showRssManagerDialog(
+                    context,
+                    _rssProvider,
+                    _controller,
+                    sourceId,
+                  ),
+                );
+              },
+              child: TaskList(
+                controller: _controller,
+                viewPrefsStore: _viewPrefsStore,
+                onTaskTap: _toggleDetail,
+                onGroupTap: _toggleDetailGroup,
+                onNewDownload: () => showNewDownloadDialog(
+                  context,
+                  _controller,
+                  _settingsProvider,
+                ),
               ),
             ),
           ),

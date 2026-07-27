@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.zerx-lab/fluxdown",
   "title": "FluxDown",
-  "description": "Control the FluxDown download manager: add, list, pause, resume, remove downloads and queues.",
+  "description": "Control the FluxDown download manager: add, list, pause, resume and remove downloads, browse named queues, and manage RSS subscriptions.",
   "websiteUrl": "https://fluxdown.zerx.dev",
   "repository": {
     "url": "https://github.com/zerx-lab/FluxDown",
@@ -35,7 +35,10 @@
         "download_pause_all",
         "download_resume_all",
         "download_remove",
-        "queue_list"
+        "queue_list",
+        "rss_list",
+        "rss_add",
+        "rss_remove"
       ]
     }
   }

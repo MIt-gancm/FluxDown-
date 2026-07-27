@@ -177,7 +177,7 @@ FluxDown/
 **双后端**：URL scheme 选后端（`sqlite:`/`postgres:`）；两份 DDL 常量（`SQLITE_SCHEMA`/`POSTGRES_SCHEMA`，仅 `BLOB→BYTEA` 与字节列 `BIGINT` 不同）；运行时 SQL 统一 `$N` 占位符；`add_column_if_missing` 幂等迁移（新库建表即全列，旧桌面库经 ALTER 升级）。SQLite 侧 WAL + 外键 + busy_timeout=5000。
 
 **当前表（列以 db.rs 为准，此处仅索引）**：
-- `tasks`(id PK, url, file_name, save_dir, status, total/downloaded_bytes, segments, created_at, error_message, proxy_url, queue_id, checksum, ignore_tls_errors, bt_selected_files, bt_custom_name, orig_etag, orig_last_modified, audio_url, file_missing, `range_verified`（配额端点续传验证）, queue_order；迁移列：cookies, referrer, extra_headers, resolver_plugin_id, segments_epoch, completed_at, group_id, resolver_item)
+- `tasks`(id PK, url, file_name, save_dir, status, total/downloaded_bytes, segments, created_at, error_message, proxy_url, queue_id, checksum, ignore_tls_errors, bt_selected_files, bt_custom_name, orig_etag, orig_last_modified, audio_url, file_missing, `range_verified`（配额端点续传验证）, queue_order；迁移列：cookies, referrer, extra_headers, resolver_plugin_id, segments_epoch, completed_at, group_id, resolver_item, rss_source_id（RSS 溯源，空=非 RSS 来源）, `origin_url`（展示用真实来源；`.torrent` 任务的 `url` 是 `torrent-file://local` 哨兵，「复制链接」类 UI **一律**读它并空则回退 `url`——Dart `DownloadTask.shareUrl` / web `taskShareUrl()`）)
 - `task_segments`(复合 PK task_id+segment_index；旧库遗留 id AUTOINCREMENT 不再读)
 - `task_groups`(id PK, name, source_url, save_dir, created_at)
 - `config`(key PK, value)——**所有设置键**都存这里
@@ -186,6 +186,8 @@ FluxDown/
 - `ed2k_blocks`(复合 PK task_id+block_index, state, downloaded_bytes, retry_count)
 - `ed2k_hashset`(task_id PK, hashes BLOB)
 - `task_artifacts`(复合 PK task_id+file_name；追踪 sidecar/产物文件供清理)
+- `rss_sources`(id PK, url, name, enabled, auto_download, start_paused, queue_id, save_dir, interval_minutes, include/exclude_pattern, use_regex, smart_episode, size_min/max_bytes, send_referer, notify_on_download, max_per_fetch, cookies, user_agent, proxy_url, last_fetch_at, last_success_at, last_error, fail_count, `seeded`（首轮是否已完成）, position)
+- `rss_items`(复合 PK source_id+guid, title, link, enclosure_url/length, pub_date, fetched_at, status 0..5, task_id 回链, episode_key, reason 原因码；`ON DELETE CASCADE` 于 rss_sources)
 
 **内置队列**: `main`（主）/`later`（稍后下载），播种于 `Engine::new`，不可删/改名；存量 `queue_id=''` 迁入 `main`。
 
@@ -205,6 +207,17 @@ FluxDown/
 | **ED2K（仅下载）** | `ed2k::link::is_ed2k_url` | `ed2k::run_ed2k_download` | `ed2k/`（mod,link,proto,hash,server,peer,client,server_subscription,upnp,kad/） |
 
 - BT 任务绕过 pending 队列，且**不计入** http/ftp 并发计数（`max_concurrent`）。
+- **BT 判定只认 `magnet:` 与 `torrent-file://` 哨兵**（`is_bt_url`）。HTTP 的
+  `.torrent` **直链不会走 BT**——会被当普通文件下回来一个种子文件。要让直链
+  变成真下载，必须先把字节抓下来再以 `NewTaskSpec::torrent_file_bytes` 建任务
+  （RSS 订阅就是这么做的，见 `rss/` 的两段式）。
+- **DHT 持久化是纯缓存，`SharedBtSession::new` 对它三级兜底**：带 `dht.json`
+  起 → 失败则删掉它重试 → 再失败则关 DHT 起（tracker + PEX 仍可用）。起因是
+  一份钉着 `addr: 0.0.0.0:58686` 的 `dht.json` 撞上 Windows 动态端口排除区间
+  （`netsh interface ipv4 show excludedportrange protocol=udp`；`netstat` 看不到
+  占用但 bind 返回 `WSAEACCES` 10013），导致**所有** BT 任务永久 status=4 而
+  用户无从自救。**anyhow 错误一律用 `{e:#}` 打印**——`{e}` 只输出最外层
+  context，会把这类根因整个吞掉。
 - **ED2K**：eDonkey2000 纯 leech。源发现 = 服务器 `GETSOURCES`（手动 `ed2k_server_list` + 订阅 `server.met` 缓存）+ Kad DHT 兜底 + UPnP-IGD 争 HighID + LowID 回调中继。逐块 MD4 + hashset 自校验（违规拉黑 peer）；分块 MD4 root hash（PART_SIZE=9.28MB，幻影尾处理）。进程级共享 `Ed2kClient` 持久服务器会话。
 
 ### 引擎子系统（一句话职责）
@@ -220,6 +233,9 @@ FluxDown/
 - `data_dir.rs`：数据目录解析（Windows 便携 `<exe>/portable_data` via `portable` 标记 vs 安装 `%LOCALAPPDATA%`；Linux XDG；macOS App Support；Android files dir）+ 旧版迁移。**Dart 侧 `services/platform_utils.dart` 的 KNOWN_ITEMS 必须与此同步。**
 - `logger.rs`：全局文件日志宏 `log_info!`/`log_error!`（`#[macro_export]`，`$crate` 前缀跨 crate 安全；每文件顶显式 `use`）。与 Dart `LogService` 写同一文件。
 - `model.rs`/`events.rs`/`selection.rs`：领域类型 / `EngineEvent`（`#[non_exhaustive]`）+ `EventSink` / `HostSelection`。
+- `rss/`（`model`/`parser`/`filter`/`mod`）：RSS 订阅自动下载。`RssManager` 挂在 `DownloadManager.rss` 上；宿主只提供 60s 节拍（`tick_rss_sources()`）与回流 drain（`on_rss_event()`），抓取 off-actor，建任务仍收敛到 `create_task`。三层去重：guid → 单轮上限（超额留 `New` 下轮从旧到新续派）→ 智能剧集去重（识别失败即放行）。失败指数退避封顶 6h，**不自动停用订阅**。`filter.rs` 是纯函数单测主战场，**Dart/TS 各有一份逐条对齐的镜像**（`lib/src/models/rss_filter.dart`、`web/src/lib/rss-filter.ts`）供规则预览用——改任一侧必须同步三处。
+
+  **「无人值守」是 RSS 的核心不变式**——订阅可能半夜抓到 5 集,任何需要用户点一下才能继续的东西都是 bug:① BT 条目建任务时 `NewTaskSpec.unattended_bt_selection=true`,**在启动前**把「已确认全部文件」落库(`save_bt_selected_files(id, &[], true)`),否则 `do_start_task` 会走 `HostSelection` 弹 5 次文件选择框,而用户点「取消」后条目已被标记「已下载」,状态就撒谎了;② `create_task` 内部自发建任务不经过 Dart 的建任务路径,**必须显式补发** `load_and_send_all_tasks()`——`TaskProgress` 信号不带 `queue_id`,不补发的话新任务在 UI 里不属于任何队列;③ 手动「重新下载」对**任何**状态(含已下载)都放行,挡住重下没有任何好处,只会逼用户去别处找种子。
 
 ### 受管组件子系统（`components/`，`components` feature）
 外部二进制 **ffmpeg + yt-dlp** 的按需安装器/解析器（**不打包**，合规边界——用户在设置「组件」页触发下载）。解析优先级 `manual`（config path）→ `managed`（`<data_dir>/bin/`）→ `system` PATH，wire 为 `ComponentSource{Manual,Managed,System,None}`。ffmpeg = BtbN 静态归档（取单文件，macOS 不支持受管）；yt-dlp = 单平台二进制（全平台）。版本列表经官方镜像 `fluxdown.zerx.dev/api/components` + GitHub 兜底。**被两处消费**：插件 `flux.ffmpeg`/`flux.ytdlp` 能力面 + 设置「组件」UI。
@@ -254,8 +270,8 @@ FluxDown/
 | 探活 | `GET /ping` | 总开关 | 无 |
 | 脚本接管 | `POST /download`、`/download/batch` | `local_server_takeover_enabled`（默认开） | `X-FluxDown-Client` 头 + 可选 token |
 | aria2 兼容 | `POST /jsonrpc`（36 方法）+ `GET /jsonrpc`（WS 升级，`jsonrpc_ws.rs`：RPC + `onDownloadXxx` 通知推送） | `local_server_jsonrpc_enabled`（默认开） | 可选 token（`X-FluxDown-Token` 或 `params[0]="token:xxx"`） |
-| 管理 API | `/api/v1/*`（info、tasks CRUD+pause/continue[all]、queues、resolve/preview、groups CRUD+pause/continue、plugins list/install/install-dev/enabled/settings/uninstall + ignore-plugin-retry、market list/install） | `local_server_api_enabled`（桌面默认**关**；server 强制开） | **强制** token（Bearer 或 `X-FluxDown-Token`） |
-| MCP | `POST /mcp`（Streamable HTTP 无状态子集，协议 2025-06-18；9 工具：download_add/list/get/pause/resume/pause_all/resume_all/remove + queue_list） | `local_server_mcp_enabled`（桌面默认关；server 默认开） | 同管理 API token |
+| 管理 API | `/api/v1/*`（info、tasks CRUD+pause/continue[all]、queues、resolve/preview、groups CRUD+pause/continue、plugins list/install/install-dev/enabled/settings/uninstall + ignore-plugin-retry、market list/install、**rss** CRUD+refresh+items+items/action+validate） | `local_server_api_enabled`（桌面默认**关**；server 强制开） | **强制** token（Bearer 或 `X-FluxDown-Token`） |
+| MCP | `POST /mcp`（Streamable HTTP 无状态子集，协议 2025-06-18；12 工具：download_add/list/get/pause/resume/pause_all/resume_all/remove + queue_list + rss_list/rss_add/rss_remove） | `local_server_mcp_enabled`（桌面默认关；server 默认开） | 同管理 API token |
 | OpenAPI | `GET /api/v1/openapi.json`（utoipa 3.1，含漂移守卫测试） | 随管理 API | 无 |
 
 - **`ApiHost` trait**（`service.rs`）：必需方法（list/get/create/delete/pause/continue task、pause/continue all、list_queues、submit_external）+ 可默认降级方法（config/plugins/market/groups/resolve_preview/subscribe_task_events/…）。`UNKNOWN_ENDPOINT_MESSAGE` 区分未注册路由 404 与资源 404。
@@ -269,6 +285,9 @@ FluxDown/
 
 ### `native/hub`（桌面/移动 App，唯一 rinf）
 `lib.rs`（`write_interface!`、current_thread runtime）；`signals/mod.rs`（信号定义——Dart 绑定契约，不可动）；`actors/download_actor.rs`（核心事件循环，**必须** drain resolve_rx/plugin_retry_rx）；`api_host.rs`（`HubApiHost`：读直查 Db，写经 command+oneshot 进 actor）；`rinf_sink.rs`（`EventSink`→Dart 信号）；`rinf_selection.rs`（`HostSelection`：HLS 60s 超时默认最高码率）；`signal_bridge.rs`（`From` 转换）；`native_messaging.rs`（Windows Named Pipe `\\.\pipe\fluxdown` / Unix socket）；`nmh_registry.rs`（写 NMH 清单）；`file_association.rs`（.torrent 关联）；`protocol_registry.rs`（`fluxdown://`）；`reveal_file.rs`；`updater.rs`（版本检查 + 多段并发下载 + 委托 `fluxdown_updater` helper）；`compat_flags.rs`（**新**：Windows 清除 PCA 误设的 RUNASADMIN AppCompatFlags，修 CreateProcess 740）；`logger.rs`（转发 engine 的 shim）。
+
+> ⚠️ **`download_actor.rs` 的主 `tokio::select!` 已占满 tokio 的 64 分支硬上限**（`tokio/src/macros/select.rs` 的 `count_field!` 最后一格是 `_63`），再加一条就是编译错误 `up to 64 branches supported`。
+> **新增任何 Dart 信号 / 定时节拍 / 回流通道都不许往主循环加分支**，一律并进既有的「辅助信号合并转发」：两个后台 `tokio::spawn` 泵（任务组 5 信号 / RSS 8 信号 + 60s 节拍 + 引擎回流）把消息合流进同一条 `aux_tx`，主循环只有一条 `Some(aux) = aux_rx.recv()`。照 `enum AuxSignal { Group(..), Rss(..) }` 加变体即可。
 
 ### `native/server`（headless，`fluxdown_server`）——见 §11
 
@@ -397,8 +416,9 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 避免混淆——**已实现** vs **仅设计**：
 - **已实现**：多文件任务组（`multi-file-task-group-design.md`）、插件系统 + 去中心化市场（`fluxdown-plugin-marketplace-plan.md` 等）。
 - **部分实现（仅客户端）**：多设备协作 / FluxCloud 配置同步（`multi-device-collab-design.md`）——`lib/src/services/cloud/` + `web/src/lib/cloud/` 已落地，对接**外部 L2 relay**；**本地 headless server 无任何 cloud/sync 路由**；打洞/E2E 仍设计阶段。
-- **仅设计（无引擎/服务器代码）**：webhook 任务事件通知（`webhook-notification-design.md`）、RSS 订阅（`rss-subscription-design.md`，issue #97）。
-- **命名歧义警告**：引擎里的 "subscription" 指 **BT tracker 列表 / ED2K server.met 订阅**（`tracker_subscription.rs` / `ed2k/server_subscription.rs`，**已实现**），与设计中的 RSS feed 订阅无关；"webhook" 指官网 GitHub 接收器，与任务事件 webhook 无关。
+- **仅设计（无引擎/服务器代码）**：webhook 任务事件通知（`webhook-notification-design.md`）。
+- **已实现（全端）**：RSS 订阅自动下载（`rss-subscription-design.md`，issue #97）——引擎 `native/engine/src/rss/`、REST `/api/v1/rss/*`、WS `rssSourcesChanged`/`rssItemsChanged`、hub 信号、桌面 UI（侧边栏区块 + 条目流 + 三 Tab 对话框 + 两步向导）、web SPA 同构、CLI `fluxdown rss`、MCP `rss_list`/`rss_add`/`rss_remove`。
+- **命名歧义警告**：引擎里的 `tracker_subscription.rs` / `ed2k/server_subscription.rs` 指 **BT tracker 列表 / ED2K server.met 订阅**，与 `rss/` 的 feed 订阅是两回事；"webhook" 指官网 GitHub 接收器，与任务事件 webhook 无关。
 
 ---
 
@@ -409,7 +429,8 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 | **新增下载协议** | 加 `is_X_url` 谓词 + `run_X_download`（照 `ed2k` 模板）；在 `download_manager` 的 `do_start_task` **与** `do_resume_task` if/else 各加一臂；新表加进 `SQLITE_SCHEMA`+`POSTGRES_SCHEMA`+迁移 |
 | **新增受管组件** | `components/` 下照 `ffmpeg.rs`/`ytdlp.rs` 加模块（resolve 优先级 + Status + install under cfg）；加 config 键；在 `plugin/dependencies.rs` 映射 |
 | **新增插件工具面** | `runtime.rs` 加 Spec/Outcome/Availability（禁 rquickjs 类型）；`HostContext` 加门；`bridge.rs` 实现（semaphore + 牢笼）；`manifest` 加 permission |
-| **新增 Dart↔Rust 信号** | `hub/src/signals/mod.rs` 定义（`DartSignal`/`RustSignal`/`SignalPiece`）→ `rinf gen` → `download_actor` 加 `select!` 分支 → Dart 端 `XxxSignal.rustSignalStream` 监听 |
+| **新增 Dart↔Rust 信号** | `hub/src/signals/mod.rs` 定义（`DartSignal`/`RustSignal`/`SignalPiece`）→ `rinf gen` → **并进 `download_actor` 的 `AuxSignal` 合并泵**（主 `select!` 已满 64 分支硬上限，绝不能加新分支，见 §10）→ Dart 端 `XxxSignal.rustSignalStream` 监听 |
+| **新增 RSS 过滤规则** | `engine/src/rss/filter.rs` 改判定 + 补单测 → **同步** `lib/src/models/rss_filter.dart` 与 `web/src/lib/rss-filter.ts` 两份镜像（预览与实际下载不一致会直接摧毁功能可信度）→ 三 Tab 对话框加控件 + i18n |
 | **新增 HTTP 能力** | 扩 `ApiHost`（带默认 impl 保持现有宿主可编译）+ `api/server.rs` handler + `routes.rs` 常量；两宿主（hub `api_host.rs` / server `host.rs`）按需 override；跑 `gen_openapi` 重生成 |
 | **新增 aria2 方法** | `aria2.rs` `METHOD_NAMES` + `jsonrpc.rs` dispatch | 
 | **新增 MCP 工具** | `mcp.rs` tool_definitions + call_tool |
@@ -420,6 +441,7 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 | **新增发布组件** | `changes` job 加路径→输出映射 + 一对 `build-*`/`release-*` job（各自组件 tag） |
 | **新增文档页** | `content/docs/{en,zh}/<section>/<page>.md`（section 加进 `content.config` 枚举，zh 跑 `docs:hash`） |
 | **新增自更新平台策略** | `fluxdown_updater` Action + `hub/updater.rs` |
+| **新增 UI 文案** | 只补 **en + zh 基线对**：App `assets/i18n/{en,zh}.json` + `lib/src/i18n/translations.dart` 加 getter；web `web/src/lib/locales/{en,zh}.json`；官网 `website/src/lib/locales/{en,zh-CN}.json`；扩展 `fluxDown/utils/locales/{zh-CN,en}.ts`（`MessageKey` 由 zh-CN 推导）。**社区语言（`ja.json` 等）不碰**——Weblate 维护，运行时键级回退英文 |
 
 ---
 
@@ -434,6 +456,7 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 ### Dart/Flutter
 - SDK `^3.10.8`，lint `flutter_lints ^6.0.0`。UI **全程 shadcn_ui ^0.52.1**，禁原生 Material/Cupertino。根用 `ShadApp`，主题 `ShadTheme.of` / `AppColors.of` / `AppMetrics.of`，对话框 `showShadDialog`，图标 `LucideIcons`，字体 MiSans。
 - 状态：ChangeNotifier + ListenableBuilder，`_safeNotifyListeners()`。模型不可变 + `copyWith()`。文件名 snake_case.dart。
+- **i18n**：面向用户的字符串一律 `S.of(locale).xxx`（`_r('key')` 查 `assets/i18n/*.json`，`{name}` 占位），禁止硬编码文案；键必须同时进 `en.json` 与 `zh.json`。快捷键/单位/品牌名/语言自称除外。
 
 ### 强制规则（务必遵守）
 - **禁止新增 dependency**，需要时先说明理由等确认；**禁止直接编辑 `Cargo.toml` 做版本管理**，用 cargo。

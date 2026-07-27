@@ -933,6 +933,8 @@ mod tests {
             completed_at: String::new(),
             referrer: String::new(),
             group_id: String::new(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
             queue_order: 0,
         }
     }

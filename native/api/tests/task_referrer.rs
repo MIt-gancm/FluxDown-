@@ -27,6 +27,8 @@ fn task_dto_json_carries_referrer() {
         queue_order: 0,
         referrer: "https://example.com/page".to_string(),
         group_id: String::new(),
+        rss_source_id: String::new(),
+        origin_url: String::new(),
     };
     let dto = TaskDto::from(info);
     assert_eq!(dto.referrer, "https://example.com/page");

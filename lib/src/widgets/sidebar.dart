@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 import 'package:window_manager/window_manager.dart';
+import '../bindings/bindings.dart';
 import '../models/custom_category.dart';
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
@@ -18,6 +19,9 @@ import '../theme/app_metrics.dart';
 import 'category_edit_dialog.dart';
 import 'context_menu.dart';
 import 'queue_manager_dialog.dart';
+import 'rss_manager_dialog.dart';
+import 'rss_wizard_dialog.dart';
+import '../models/rss_provider.dart';
 import '../services/cloud/cloud_auth_service.dart';
 import '../services/link/local_pairing_service.dart';
 import 'add_device_dialog.dart';
@@ -25,10 +29,12 @@ import 'add_device_dialog.dart';
 class Sidebar extends StatefulWidget {
   final DownloadController controller;
   final SettingsProvider settingsProvider;
+  final RssProvider rssProvider;
   const Sidebar({
     super.key,
     required this.controller,
     required this.settingsProvider,
+    required this.rssProvider,
   });
 
   @override
@@ -102,6 +108,7 @@ class _SidebarState extends State<Sidebar> {
               listenable: Listenable.merge([
                 widget.controller,
                 widget.settingsProvider,
+                widget.rssProvider,
                 CloudAuthService.instance,
                 LocalPairingService.instance,
               ]),
@@ -119,6 +126,10 @@ class _SidebarState extends State<Sidebar> {
                       ],
                       if (sp.showSidebarQueues) ...[
                         _buildQueuesSection(ctrl, s, c),
+                        const SizedBox(height: 6),
+                      ],
+                      if (sp.showSidebarRss) ...[
+                        _buildRssSection(ctrl, s, c),
                         const SizedBox(height: 6),
                       ],
                       if (sp.showSidebarCategory)
@@ -267,7 +278,7 @@ class _SidebarState extends State<Sidebar> {
             isSelected: selectedStatus == tab,
             showActivityDot:
                 tab == StatusTab.downloading && ctrl.downloadingCount > 0,
-            onTap: () => ctrl.setStatusTab(tab),
+            onTap: () => _selectTaskView(() => ctrl.setStatusTab(tab)),
           ),
       ],
     );
@@ -313,7 +324,7 @@ class _SidebarState extends State<Sidebar> {
               label: s.ungroupedTasks,
               count: ctrl.countForQueue(''),
               isSelected: queueFilter == '',
-              onTap: () => ctrl.setQueueFilter(''),
+              onTap: () => _selectTaskView(() => ctrl.setQueueFilter('')),
             ),
           // 命名队列（内置 main/later 在前，自定义随后，按 position 排序）
           for (final queue in queues)
@@ -322,7 +333,8 @@ class _SidebarState extends State<Sidebar> {
               count: ctrl.countForQueue(queue.queueId),
               isSelected: queueFilter == queue.queueId,
               c: c,
-              onTap: () => ctrl.setQueueFilter(queue.queueId),
+              onTap: () =>
+                  _selectTaskView(() => ctrl.setQueueFilter(queue.queueId)),
               onToggleRun: () => queue.isRunning
                   ? ctrl.stopQueue(queue.queueId)
                   : ctrl.startQueue(queue.queueId),
@@ -334,6 +346,106 @@ class _SidebarState extends State<Sidebar> {
             ),
         ],
       ],
+    );
+  }
+
+  /// 切回任务列表视图：收回 RSS 选中态后再应用任务侧的筛选。
+  ///
+  /// RSS 条目流与任务列表共用主区，所以每个「选任务视图」的入口都要顺手把
+  /// RSS 选中态清掉——否则点了状态/队列/分类，主区却还停在条目流上。
+  void _selectTaskView(VoidCallback apply) {
+    widget.rssProvider.select('');
+    apply();
+  }
+
+  // ─────────────────────────────────────────────
+  // RSS 订阅区块（与队列区块同构：可折叠 + 新建按钮 + 悬浮操作）
+  // ─────────────────────────────────────────────
+
+  Widget _buildRssSection(DownloadController ctrl, S s, AppColors c) {
+    final rss = widget.rssProvider;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        GestureDetector(
+          onSecondaryTapUp: (d) => _showSectionContextMenu(
+            context,
+            d.globalPosition,
+            s,
+            onHide: () => widget.settingsProvider.setShowSidebarRss(false),
+          ),
+          child: _CollapsibleSectionHeader(
+            title: s.sidebarRss,
+            expanded: widget.settingsProvider.sidebarRssExpanded,
+            c: c,
+            onToggle: () => widget.settingsProvider.setSidebarRssExpanded(
+              !widget.settingsProvider.sidebarRssExpanded,
+            ),
+            trailing: _QueueAddButton(
+              c: c,
+              onTap: () => showRssWizardDialog(context, rss, ctrl),
+            ),
+          ),
+        ),
+        if (widget.settingsProvider.sidebarRssExpanded) ...[
+          const SizedBox(height: 4),
+          if (rss.sources.isEmpty)
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 2, 16, 6),
+              child: Text(
+                s.rssSidebarEmptyHint,
+                style: TextStyle(fontSize: 11, color: c.textMuted, height: 1.4),
+              ),
+            ),
+          for (final source in rss.sources)
+            _RssNavItem(
+              source: source,
+              isSelected: rss.selectedSourceId == source.sourceId,
+              c: c,
+              onTap: () => rss.select(source.sourceId),
+              isRefreshing: rss.isRefreshing(source.sourceId),
+              onRefresh: () => rss.refresh(source.sourceId),
+              onManage: () =>
+                  showRssManagerDialog(context, rss, ctrl, source.sourceId),
+              onDelete: () =>
+                  _showDeleteRssDialog(context, rss, s, c, source),
+            ),
+        ],
+      ],
+    );
+  }
+
+  /// 删除订阅确认。文案必须点明「已创建的下载任务不会被删」——这是用户
+  /// 最担心的事，不说清楚没人敢点。
+  void _showDeleteRssDialog(
+    BuildContext context,
+    RssProvider rss,
+    S s,
+    AppColors c,
+    RssSourceEntry source,
+  ) {
+    showShadDialog(
+      context: context,
+      barrierColor: c.dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (ctx) => ShadDialog.alert(
+        title: Text(s.rssDeleteSource),
+        description: Text(s.rssDeleteConfirmDesc(rssDisplayName(source))),
+        actions: [
+          ShadButton.outline(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(s.cancel),
+          ),
+          ShadButton.destructive(
+            onPressed: () {
+              rss.remove(source.sourceId);
+              Navigator.of(ctx).pop();
+            },
+            child: Text(s.rssDeleteSource),
+          ),
+        ],
+      ),
     );
   }
 
@@ -470,9 +582,11 @@ class _SidebarState extends State<Sidebar> {
                     : cat.name,
                 count: ctrl.countForUnifiedCategory(cat, visibleCategories),
                 isSelected: customFilter?.id == cat.id,
-                onTap: () => ctrl.setCustomCategoryFilter(
-                  cat,
-                  allVisible: visibleCategories,
+                onTap: () => _selectTaskView(
+                  () => ctrl.setCustomCategoryFilter(
+                    cat,
+                    allVisible: visibleCategories,
+                  ),
                 ),
               ),
             ),
@@ -523,7 +637,7 @@ class _SidebarState extends State<Sidebar> {
             icon: LucideIcons.globe,
             label: s.allDevices,
             isSelected: deviceFilter == null,
-            onTap: () => ctrl.setDeviceFilter(null),
+            onTap: () => _selectTaskView(() => ctrl.setDeviceFilter(null)),
           ),
           _NavItem(
             icon: LucideIcons.monitor,
@@ -531,7 +645,7 @@ class _SidebarState extends State<Sidebar> {
             count: ctrl.countForDevice(''),
             isSelected: deviceFilter == '',
             isOnline: true,
-            onTap: () => ctrl.setDeviceFilter(''),
+            onTap: () => _selectTaskView(() => ctrl.setDeviceFilter('')),
           ),
           for (final device in remoteDevices)
             _NavItem(
@@ -540,7 +654,8 @@ class _SidebarState extends State<Sidebar> {
               count: ctrl.countForDevice(device.deviceId),
               isSelected: deviceFilter == device.deviceId,
               isOnline: device.isOnline,
-              onTap: () => ctrl.setDeviceFilter(device.deviceId),
+              onTap: () =>
+                  _selectTaskView(() => ctrl.setDeviceFilter(device.deviceId)),
             ),
           for (final device in localDevices)
             _LocalDeviceStatusRow(
@@ -1186,6 +1301,199 @@ class _QueueActionIconState extends State<_QueueActionIcon> {
           child: Icon(widget.icon, size: 11, color: color),
         ),
       ),
+    );
+  }
+}
+
+/// RSS 订阅导航项：健康度圆点 + 未读 badge + 悬浮操作（刷新/管理/删除）。
+///
+/// 健康度**内联**在节点上（而不是藏进对话框）是 qBittorrent 至今没做的事
+/// （qB#20305）：feed 悄悄停止工作时，用户扫一眼侧边栏就该看得出来。
+class _RssNavItem extends StatefulWidget {
+  final RssSourceEntry source;
+  final bool isSelected;
+  final AppColors c;
+  final VoidCallback onTap;
+  final VoidCallback onRefresh;
+  final VoidCallback onManage;
+  final VoidCallback onDelete;
+
+  /// 该订阅是否正在抓取中（抓取 off-actor，常要几秒）。
+  final bool isRefreshing;
+
+  const _RssNavItem({
+    required this.source,
+    required this.isSelected,
+    required this.c,
+    required this.onTap,
+    required this.isRefreshing,
+    required this.onRefresh,
+    required this.onManage,
+    required this.onDelete,
+  });
+
+  @override
+  State<_RssNavItem> createState() => _RssNavItemState();
+}
+
+class _RssNavItemState extends State<_RssNavItem> {
+  bool _isHovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.c;
+    final m = AppMetrics.of(context);
+    final source = widget.source;
+    final selected = widget.isSelected;
+    final unhealthy = source.lastError.isNotEmpty;
+    final label = rssDisplayName(source);
+    final textColor = selected
+        ? c.accent
+        : unhealthy
+        ? AppColors.red
+        : source.enabled
+        ? c.textSecondary
+        : c.textMuted;
+
+    return MouseRegion(
+      onEnter: (_) => setState(() => _isHovered = true),
+      onExit: (_) => setState(() => _isHovered = false),
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        onTap: widget.onTap,
+        onSecondaryTapUp: (d) => _showContextMenu(context, d.globalPosition),
+        child: Tooltip(
+          message: unhealthy ? '$label\n${source.lastError}' : label,
+          waitDuration: const Duration(milliseconds: 600),
+          child: Container(
+            height: 32,
+            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 1),
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            decoration: BoxDecoration(
+              color: selected
+                  ? c.accentBg
+                  : _isHovered
+                  ? c.hoverBg
+                  : c.hoverBg.withValues(alpha: 0),
+              borderRadius: m.brMd,
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  unhealthy ? LucideIcons.circleAlert : LucideIcons.rss,
+                  size: 14,
+                  color: unhealthy ? AppColors.red : textColor,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    label,
+                    style: TextStyle(
+                      fontSize: 12.5,
+                      color: textColor,
+                      fontWeight: selected
+                          ? FontWeight.w500
+                          : FontWeight.normal,
+                    ),
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                // 抓取中的 spinner 未悬浮时也要看得见——抓取要好几秒，鼠标
+                // 一移开就没反馈的话，用户依然分不清「在跑」还是「没生效」。
+                if (_isHovered) ...[
+                  if (widget.isRefreshing)
+                    _rssSpinner(c)
+                  else
+                    _QueueActionIcon(
+                      icon: LucideIcons.refreshCw,
+                      c: c,
+                      onTap: widget.onRefresh,
+                    ),
+                  const SizedBox(width: 2),
+                  _QueueActionIcon(
+                    icon: LucideIcons.slidersHorizontal,
+                    c: c,
+                    onTap: widget.onManage,
+                  ),
+                  const SizedBox(width: 2),
+                  _QueueActionIcon(
+                    icon: LucideIcons.trash2,
+                    c: c,
+                    onTap: widget.onDelete,
+                    isDestructive: true,
+                  ),
+                ] else if (widget.isRefreshing)
+                  _rssSpinner(c)
+                else if (source.unreadCount > 0)
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1,
+                    ),
+                    decoration: BoxDecoration(
+                      color: m.soft(c.accent),
+                      borderRadius: m.brSm,
+                    ),
+                    child: Text(
+                      source.unreadCount.toString(),
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        color: c.accent,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  )
+                else if (!source.enabled)
+                  Icon(LucideIcons.pause, size: 10, color: c.textMuted),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 与 [_QueueActionIcon] 等宽的 spinner——占位一致，抓取开始/结束时整行
+  /// 不会左右抖动。
+  Widget _rssSpinner(AppColors c) => SizedBox(
+    width: 18,
+    height: 18,
+    child: Center(
+      child: SizedBox(
+        width: 11,
+        height: 11,
+        child: CircularProgressIndicator(strokeWidth: 1.4, color: c.accent),
+      ),
+    ),
+  );
+
+  void _showContextMenu(BuildContext context, Offset position) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    showContextMenu(
+      context,
+      position,
+      items: [
+        ContextMenuItem(
+          icon: LucideIcons.refreshCw,
+          label: s.rssRefreshNow,
+          color: c.textSecondary,
+          action: widget.onRefresh,
+        ),
+        ContextMenuItem(
+          icon: LucideIcons.slidersHorizontal,
+          label: s.rssManageTitle,
+          color: c.textSecondary,
+          action: widget.onManage,
+        ),
+        ContextMenuItem(
+          icon: LucideIcons.trash2,
+          label: s.rssDeleteSource,
+          color: AppColors.red,
+          action: widget.onDelete,
+        ),
+      ],
+      dividerAfterIndices: const {1},
     );
   }
 }

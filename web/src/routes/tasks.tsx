@@ -10,12 +10,14 @@ import { GlobalDialogs } from '../components/dialogs'
 import { DetailPanel } from '../components/tasks/DetailPanel'
 import { GroupDetailPanel } from '../components/tasks/GroupDetailPanel'
 import { ManageBar } from '../components/tasks/ManageBar'
+import { RssItemList } from '../components/tasks/RssItemList'
 import { Sidebar } from '../components/tasks/Sidebar'
 import { StatusBar } from '../components/tasks/StatusBar'
 import { StatusTabs } from '../components/tasks/StatusTabs'
 import { TaskList } from '../components/tasks/TaskList'
 import { TasksUiProvider, useTasksUi } from '../components/tasks/context'
 import { TopBar } from '../components/tasks/TopBar'
+import { useRssSourcesQuery } from '../hooks/useRss'
 import { api } from '../lib/api'
 import { connectWs } from '../lib/ws'
 
@@ -102,19 +104,35 @@ export function TasksScreen() {
         <Sidebar />
         <ColResizer cssVar="--sidebar-w" conf={SIDEBAR_W} />
         <SideBackdrop />
-        <div className="center">
-          <TopBar />
-          <ManageBar />
-          <StatusTabs />
-          <TaskList />
-          <StatusBar />
-        </div>
+        <CenterPane />
         <ColResizer cssVar="--detail-w" conf={DETAIL_W} invert className="dresize" />
         <DetailPanel />
         <GroupDetailPanel />
       </section>
       <GlobalDialogs />
     </TasksUiProvider>
+  )
+}
+
+/** 中央主区：默认任务列表；侧边栏选中某 RSS 订阅时整块换成条目流（两者互斥）。 */
+function CenterPane() {
+  const { rssFilter } = useTasksUi()
+  const { data: sources = [] } = useRssSourcesQuery()
+  const source = rssFilter ? sources.find((s) => s.sourceId === rssFilter) : undefined
+  return (
+    <div className="center">
+      <TopBar />
+      {source ? (
+        <RssItemList source={source} />
+      ) : (
+        <>
+          <ManageBar />
+          <StatusTabs />
+          <TaskList />
+          <StatusBar />
+        </>
+      )}
+    </div>
   )
 }
 

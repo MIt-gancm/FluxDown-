@@ -67,6 +67,14 @@ pub struct TaskInfo {
     /// `resolver_item`（二段解析标识）不进本结构，走专用 getter
     /// [`crate::db::Db::get_task_resolver_item`]（与 `resolver_plugin_id` 惯例一致）。
     pub group_id: String,
+    /// 由哪条 RSS 订阅自动创建（空 = 非 RSS 来源）。任务详情「来源」行据此
+    /// 反查订阅（设计文档 P5 / qB#19276）。
+    pub rss_source_id: String,
+    /// 展示用的原始来源链接（空 = 用 `url`)。`.torrent` 文件任务的 `url` 是
+    /// `torrent-file://local` 哨兵(真正的内容在 `torrent_files` 表),对用户
+    /// 毫无意义;RSS 自动建任务时把 enclosure 直链存在这里,右键「复制下载
+    /// 链接」才有东西可复制。
+    pub origin_url: String,
 }
 
 /// 命名队列元数据。字段对应 `hub::signals::QueueInfo`。

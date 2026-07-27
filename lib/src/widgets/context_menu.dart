@@ -53,6 +53,12 @@ void showContextMenu(
   // 省略号兜底）。不用 clamp(menuWidth, 320)——调用方传 >320 会因下限>上限抛错。
   final fitted = maxLabel + 59 + 8;
   if (fitted > menuWidth) menuWidth = fitted > 320.0 ? 320.0 : fitted;
+  // 分隔线只在两个菜单项之间有意义。调用方常按 items.length 相对计算索引
+  // （如 items.length-3），条件项缺席时会指向末项甚至越界，渲染出悬空分隔线
+  // （例如「全部文件」右键只剩一项却仍有下划线）。在此统一过滤。
+  final dividers = dividerAfterIndices
+      .where((i) => i >= 0 && i < items.length - 1)
+      .toSet();
   final overlay = Overlay.of(context);
   final c = AppColors.of(context);
 
@@ -61,7 +67,7 @@ void showContextMenu(
 
   final menuHeight =
       items.length * itemHeight +
-      dividerAfterIndices.length * dividerHeight +
+      dividers.length * dividerHeight +
       8; // vertical padding
 
   final screenSize = MediaQuery.of(context).size;
@@ -84,7 +90,7 @@ void showContextMenu(
       itemHeight: itemHeight,
       colors: c,
       items: items,
-      dividerAfterIndices: dividerAfterIndices,
+      dividerAfterIndices: dividers,
       onDismiss: () => entry.remove(),
     ),
   );

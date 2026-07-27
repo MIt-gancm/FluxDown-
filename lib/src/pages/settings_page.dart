@@ -219,6 +219,13 @@ List<SettingsSearchItem> get settingsSearchItems {
     ),
     SettingsSearchItem(
       category: SettingsCategory.general,
+      label: s.ed2kLinkAssociation,
+      description: s.ed2kLinkAssociationDesc,
+      keywords: s.searchKeywordsEd2kAssoc,
+      icon: LucideIcons.link,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.general,
       label: s.notifyOnComplete,
       description: s.notifyOnCompleteDesc,
       keywords: s.searchKeywordsNotifyOnComplete,
@@ -1984,6 +1991,15 @@ class _GeneralContent extends StatelessWidget {
                   ),
                 ),
                 _SettingRow(
+                  label: s.ed2kLinkAssociation,
+                  description: s.ed2kLinkAssociationDesc,
+                  child: ShadSwitch(
+                    value: settingsProvider.ed2kProtocolAssociated,
+                    onChanged: (v) =>
+                        settingsProvider.setEd2kProtocolAssociation(v),
+                  ),
+                ),
+                _SettingRow(
                   label: s.notifyOnComplete,
                   description: s.notifyOnCompleteDesc,
                   child: ShadSwitch(
@@ -2028,6 +2044,14 @@ class _GeneralContent extends StatelessWidget {
                   child: ShadSwitch(
                     value: settingsProvider.showSidebarQueues,
                     onChanged: (v) => settingsProvider.setShowSidebarQueues(v),
+                  ),
+                ),
+                _SettingRow(
+                  label: s.showSidebarRss,
+                  description: s.showSidebarRssDesc,
+                  child: ShadSwitch(
+                    value: settingsProvider.showSidebarRss,
+                    onChanged: (v) => settingsProvider.setShowSidebarRss(v),
                   ),
                 ),
                 _SettingRow(

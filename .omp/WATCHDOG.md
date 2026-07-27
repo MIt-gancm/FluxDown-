@@ -14,7 +14,7 @@
 ## Concern（转向提醒）
 - 改 signals/mod.rs 未见 `rinf gen`；改 native/api 未重新生成 openapi.json
 - 同步阻塞调用未包 `spawn_blocking`
-- translations.dart 只改单语；新增依赖未见用户确认
+- 翻译只改单语（en/zh 基线必须成对补齐；ja 等社区语言不检查，也不该由 AI 补）；UI 里硬编码中文文案未走 i18n 查表；新增依赖未见用户确认
 - 绕过已有 trait/error/日志宏平行造轮子
 
 ## Nit（旁注）

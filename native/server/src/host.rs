@@ -23,12 +23,15 @@ use fluxdown_api::types::{
     LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
     LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
     LinkTaskRequest, MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest,
-    ResolvePreviewResponse, TaskDto,
+    ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest,
+    RssValidateResponse, TaskDto,
 };
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec};
 use fluxdown_engine::link::{DiscoveredPeer, DiscoveryKind, LinkError, LinkManager, WireHello};
 use fluxdown_engine::plugin::{MarketClient, PluginManager};
+use fluxdown_engine::rss::MAX_ITEMS_PER_SOURCE;
+use fluxdown_engine::rss::model::RssSourceInfo;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use crate::actor::ActorCmd;
@@ -546,6 +549,111 @@ impl ApiHost for ServerApiHost {
             ack,
         })
         .await
+    }
+
+    /// 列出全部 RSS 订阅：直查 `Db`（`unread_count` 由该查询派生，与
+    /// `list_tasks`/`list_groups` 同款读写分离）。
+    async fn list_rss_sources(&self) -> Result<Vec<RssSourceDto>, ApiError> {
+        self.db
+            .load_all_rss_sources()
+            .await
+            .map(|sources| sources.into_iter().map(RssSourceDto::from).collect())
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    /// 新建订阅。UUID 与 `interval_minutes`/`max_per_fetch` 的归一都在引擎
+    /// 内完成；拿不到 ID 只有一种可能——url 为空。
+    async fn create_rss_source(&self, req: RssSourceDto) -> Result<String, ApiError> {
+        self.send_cmd(|ack| ActorCmd::RssCreate {
+            source: Box::new(req.into()),
+            ack,
+        })
+        .await?
+        .ok_or_else(|| ApiError::BadRequest("invalid feed url".to_string()))
+    }
+
+    /// 更新订阅配置。路径段是权威 ID——请求体里的 `sourceId` 一律被它覆盖，
+    /// 否则一次笔误就能拿 A 的 URL 覆写 B 的订阅。
+    async fn update_rss_source(&self, source_id: &str, req: RssSourceDto) -> Result<(), ApiError> {
+        let mut source = RssSourceInfo::from(req);
+        source.source_id = source_id.to_string();
+        let ok = self
+            .send_cmd(|ack| ActorCmd::RssUpdate {
+                source: Box::new(source),
+                ack,
+            })
+            .await?;
+        if ok { Ok(()) } else { Err(ApiError::NotFound) }
+    }
+
+    async fn delete_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
+        let ok = self
+            .send_cmd(|ack| ActorCmd::RssDelete {
+                source_id: source_id.to_string(),
+                ack,
+            })
+            .await?;
+        if ok { Ok(()) } else { Err(ApiError::NotFound) }
+    }
+
+    /// 立即抓取：只做派发，结果经 WS `rssSourcesChanged`/`rssItemsChanged`
+    /// 回流。引擎回 `false` 有两种情形——订阅不存在，或上一轮抓取仍在跑；
+    /// 两者都归 404（「这次刷新没被受理」，客户端行为一致：重试即可）。
+    async fn refresh_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
+        let ok = self
+            .send_cmd(|ack| ActorCmd::RssRefresh {
+                source_id: source_id.to_string(),
+                ack,
+            })
+            .await?;
+        if ok { Ok(()) } else { Err(ApiError::NotFound) }
+    }
+
+    /// 一个订阅的条目流：直查 `Db`，上限复用引擎的淘汰阈值
+    /// [`MAX_ITEMS_PER_SOURCE`]——查得到的正好就是留得住的。
+    async fn list_rss_items(&self, source_id: &str) -> Result<Vec<RssItemDto>, ApiError> {
+        self.db
+            .load_rss_items(source_id, MAX_ITEMS_PER_SOURCE)
+            .await
+            .map(|items| items.into_iter().map(RssItemDto::from).collect())
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    async fn rss_item_action(
+        &self,
+        source_id: &str,
+        req: RssItemActionRequest,
+    ) -> Result<(), ApiError> {
+        self.send_cmd(|ack| ActorCmd::RssItemAction {
+            source_id: source_id.to_string(),
+            guid: req.guid,
+            action: req.action,
+            ack,
+        })
+        .await
+    }
+
+    /// 验证 feed（新建订阅向导）。抓取失败**不是** HTTP 错误：原因进
+    /// `error` 字段照常 200 —— 这是一次诊断调用，失败本身就是有效载荷。
+    async fn validate_rss_feed(
+        &self,
+        req: RssValidateRequest,
+    ) -> Result<RssValidateResponse, ApiError> {
+        let outcome = *self
+            .send_cmd(|ack| ActorCmd::RssValidate {
+                url: req.url,
+                cookies: req.cookies,
+                user_agent: req.user_agent,
+                proxy_url: req.proxy_url,
+                ack,
+            })
+            .await?;
+        Ok(RssValidateResponse {
+            url: outcome.url,
+            feed_title: outcome.feed_title,
+            items: outcome.items.into_iter().map(RssItemDto::from).collect(),
+            error: outcome.error,
+        })
     }
 
     async fn link_ping_info(&self) -> Option<LinkPingInfo> {

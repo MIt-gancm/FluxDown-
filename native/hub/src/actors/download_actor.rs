@@ -27,22 +27,24 @@ use crate::rinf_selection::RinfHostSelection;
 use crate::rinf_sink::RinfEventSink;
 use crate::signals::{
     BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
-    ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask, CreateQueue, CreateTask,
-    CreateTaskGroup, DeleteQueue, DetectSystemProxy, DownloadUpdate, Ed2kServerSubscriptionResult,
-    ExternalDownloadRequest, FfmpegInstallProgress, FfmpegInstallResult, FfmpegStatusReport,
-    FfmpegVersionList, FileAssociationStatus, GroupControl, IgnorePluginRetry, InstallFfmpeg,
-    InstallMarketPlugin, InstallPlugin, InstallUpdate, InstallYtdlp, MoveTaskToQueue, OpenFile,
-    ProbeTorrentMeta, ProxyTestResult, RenameGroup, ReorderQueueTasks, RequestAllGroups,
-    RequestAllQueues, RequestAllTasks, RequestConfig, RequestFfmpegStatus, RequestFfmpegVersions,
-    RequestMarketIndex, RequestPlugins, RequestUpdateFailureMarker, RequestYtdlpStatus,
-    RequestYtdlpVersions, RescanFiles, ResolvePreviewRequest, RevealFile, SaveConfig,
-    SavePluginSettings, SelectBtFiles, SelectHlsQuality, SelectResolveVariant, SetFileAssociation,
-    SetPluginEnabled, SetPriorityTask, SetQueueSchedule, SetUrlProtocol, StartQueue, StopQueue,
-    SystemProxyInfo, TaskSegmentsUpdated, TestProxyConnection, TrackerSubscriptionResult,
-    UninstallFfmpeg, UninstallPlugin, UninstallYtdlp, UpdateCheckResult,
-    UpdateEd2kServerSubscription, UpdateFailureMarker, UpdateQueue, UpdateTaskSegments,
-    UpdateTrackerSubscription, UrlProtocolStatus, YtdlpInstallProgress, YtdlpInstallResult,
-    YtdlpStatusReport, YtdlpVersionList,
+    ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask, CreateQueue, CreateRssSource,
+    CreateTask, CreateTaskGroup, DeleteQueue, DeleteRssSource, DetectSystemProxy, DownloadUpdate,
+    Ed2kServerSubscriptionResult, ExternalDownloadRequest, FfmpegInstallProgress,
+    FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList, FileAssociationStatus,
+    GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin, InstallPlugin,
+    InstallUpdate, InstallYtdlp, MoveTaskToQueue, OpenFile, ProbeTorrentMeta, ProxyTestResult,
+    RefreshRssSource, RenameGroup, ReorderQueueTasks, RequestAllGroups, RequestAllQueues,
+    RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
+    RequestFfmpegVersions, RequestMarketIndex, RequestPlugins, RequestRssItems,
+    RequestUpdateFailureMarker, RequestYtdlpStatus, RequestYtdlpVersions, RescanFiles,
+    ResolvePreviewRequest, RevealFile, SaveConfig, SavePluginSettings, SelectBtFiles,
+    SelectHlsQuality, SelectResolveVariant, SetFileAssociation, SetPluginEnabled, SetPriorityTask,
+    SetQueueSchedule, SetRssItemAction, SetUrlProtocol, StartQueue, StopQueue, SystemProxyInfo,
+    TaskSegmentsUpdated, TestProxyConnection, TrackerSubscriptionResult, UninstallFfmpeg,
+    UninstallPlugin, UninstallYtdlp, UpdateCheckResult, UpdateEd2kServerSubscription,
+    UpdateFailureMarker, UpdateQueue, UpdateRssSource, UpdateTaskSegments,
+    UpdateTrackerSubscription, UrlProtocolStatus, ValidateRssFeed, YtdlpInstallProgress,
+    YtdlpInstallResult, YtdlpStatusReport, YtdlpVersionList,
 };
 // 插件「分支体专用」信号（仅在 hub_plugins 分支体内构造）：mobile 不引入。
 use crate::signals::LinkCommand;
@@ -768,9 +770,12 @@ pub async fn run(db_dir: PathBuf) {
     };
 
     // Auto-register fluxdown:// URL protocol on startup (idempotent).
+    // Windows-only: Linux ships the handler in the .desktop MimeType and macOS
+    // in CFBundleURLTypes, so no runtime write is needed (or wanted) there.
+    #[cfg(target_os = "windows")]
     tokio::task::spawn_blocking(|| {
-        if !protocol_registry::is_registered() {
-            if let Err(e) = protocol_registry::register() {
+        if !protocol_registry::is_registered(protocol_registry::FLUXDOWN) {
+            if let Err(e) = protocol_registry::register(protocol_registry::FLUXDOWN) {
                 log_info!("[actor] auto-register fluxdown:// protocol failed: {}", e);
             }
         } else {
@@ -821,12 +826,19 @@ pub async fn run(db_dir: PathBuf) {
     let mut queue_schedule_tick = tokio::time::interval(std::time::Duration::from_secs(20));
     queue_schedule_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // ===== 任务组 / 清单预解析信号合并转发 =====
-    // 主 select! 已逼近 64 分支上限，5 个新增信号不各占一条分支，走单
-    // mpsc 合并（仿 tracker_sub/ed2k_sub 的「后台 spawn → 结果回流 mpsc →
-    // 主循环单分支」范式，529-608）：独立 tokio task 内 `tokio::select!`
-    // 循环 recv 5 个 DartSignal receiver，逐个转发进 `group_tx`；主循环只
-    // 增一条 `Some(g) = group_rx.recv()` 分支。
+    // ===== 辅助信号合并转发（任务组 / RSS 订阅） =====
+    // 主 `select!` 已顶到 tokio 的 **64 分支硬上限**（`select.rs` 的
+    // `count_field!` 最后一格是 `_63`），再加一条就是编译错误。因此任务组的
+    // 5 个信号、RSS 的 8 个信号、RSS 的轮询节拍与 off-actor 抓取回流，全部
+    // 由两个后台泵合流进**同一条** `aux_tx`，主循环只有一条
+    // `Some(aux) = aux_rx.recv()` 分支。
+    //
+    // 范式来源同 tracker_sub/ed2k_sub 的「后台 spawn → 结果回流 mpsc → 主循
+    // 环单分支」。节拍进泵是安全的：`Tick` 只是叫醒 actor 去跑
+    // `tick_rss_sources()`（纯判定 + 派发，不阻塞），真正的网络 IO 仍在引擎
+    // 自己 spawn 的任务里。
+    //
+    // **新增任何 Dart 信号都必须走这里**，不要往主 `select!` 加分支。
     enum GroupSignal {
         Preview(ResolvePreviewRequest),
         Create(CreateTaskGroup),
@@ -834,7 +846,26 @@ pub async fn run(db_dir: PathBuf) {
         Rename(RenameGroup),
         RequestAll(RequestAllGroups),
     }
-    let (group_tx, mut group_rx) = mpsc::unbounded_channel::<GroupSignal>();
+    enum RssSignal {
+        Create(CreateRssSource),
+        Update(UpdateRssSource),
+        Delete(DeleteRssSource),
+        Refresh(RefreshRssSource),
+        Validate(ValidateRssFeed),
+        RequestItems(RequestRssItems),
+        RequestAll(RequestAllRssSources),
+        ItemAction(SetRssItemAction),
+        /// 轮询节拍（60s）。
+        Tick,
+        /// off-actor 抓取/验证回流。
+        Engine(Box<fluxdown_engine::rss::RssEvent>),
+    }
+    enum AuxSignal {
+        Group(GroupSignal),
+        Rss(RssSignal),
+    }
+    let (aux_tx, mut aux_rx) = mpsc::unbounded_channel::<AuxSignal>();
+    let group_tx = aux_tx.clone();
     {
         let preview_recv = ResolvePreviewRequest::get_dart_signal_receiver();
         let create_group_recv = CreateTaskGroup::get_dart_signal_receiver();
@@ -845,21 +876,64 @@ pub async fn run(db_dir: PathBuf) {
             loop {
                 tokio::select! {
                     Some(signal) = preview_recv.recv() => {
-                        if group_tx.send(GroupSignal::Preview(signal.message)).is_err() { break; }
+                        if group_tx.send(AuxSignal::Group(GroupSignal::Preview(signal.message))).is_err() { break; }
                     }
                     Some(signal) = create_group_recv.recv() => {
-                        if group_tx.send(GroupSignal::Create(signal.message)).is_err() { break; }
+                        if group_tx.send(AuxSignal::Group(GroupSignal::Create(signal.message))).is_err() { break; }
                     }
                     Some(signal) = group_control_recv.recv() => {
-                        if group_tx.send(GroupSignal::Control(signal.message)).is_err() { break; }
+                        if group_tx.send(AuxSignal::Group(GroupSignal::Control(signal.message))).is_err() { break; }
                     }
                     Some(signal) = rename_group_recv.recv() => {
-                        if group_tx.send(GroupSignal::Rename(signal.message)).is_err() { break; }
+                        if group_tx.send(AuxSignal::Group(GroupSignal::Rename(signal.message))).is_err() { break; }
                     }
                     Some(signal) = request_all_groups_recv.recv() => {
-                        if group_tx.send(GroupSignal::RequestAll(signal.message)).is_err() { break; }
+                        if group_tx.send(AuxSignal::Group(GroupSignal::RequestAll(signal.message))).is_err() { break; }
                     }
                     else => break,
+                }
+            }
+        });
+    }
+
+    let rss_tx = aux_tx;
+    {
+        let create_rss_recv = CreateRssSource::get_dart_signal_receiver();
+        let update_rss_recv = UpdateRssSource::get_dart_signal_receiver();
+        let delete_rss_recv = DeleteRssSource::get_dart_signal_receiver();
+        let refresh_rss_recv = RefreshRssSource::get_dart_signal_receiver();
+        let validate_rss_recv = ValidateRssFeed::get_dart_signal_receiver();
+        let request_rss_items_recv = RequestRssItems::get_dart_signal_receiver();
+        let request_rss_sources_recv = RequestAllRssSources::get_dart_signal_receiver();
+        let rss_item_action_recv = SetRssItemAction::get_dart_signal_receiver();
+        let mut engine_rss_rx = engine.manager.rss.take_event_rx();
+        let mut rss_poll_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+        rss_poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tokio::spawn(async move {
+            loop {
+                // `engine_rss_rx` 只可能是 `Some`（`take_event_rx` 在此处首取），
+                // 但用 `Option` + 惰性分支避免对不变式做无凭据的假设。
+                let engine_next = async {
+                    match engine_rss_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                let sent = tokio::select! {
+                    _ = rss_poll_tick.tick() => rss_tx.send(AuxSignal::Rss(RssSignal::Tick)),
+                    Some(ev) = engine_next => rss_tx.send(AuxSignal::Rss(RssSignal::Engine(Box::new(ev)))),
+                    Some(s) = create_rss_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::Create(s.message))),
+                    Some(s) = update_rss_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::Update(s.message))),
+                    Some(s) = delete_rss_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::Delete(s.message))),
+                    Some(s) = refresh_rss_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::Refresh(s.message))),
+                    Some(s) = validate_rss_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::Validate(s.message))),
+                    Some(s) = request_rss_items_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::RequestItems(s.message))),
+                    Some(s) = request_rss_sources_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::RequestAll(s.message))),
+                    Some(s) = rss_item_action_recv.recv() => rss_tx.send(AuxSignal::Rss(RssSignal::ItemAction(s.message))),
+                    else => break,
+                };
+                if sent.is_err() {
+                    break; // actor 已退出
                 }
             }
         });
@@ -1043,8 +1117,11 @@ pub async fn run(db_dir: PathBuf) {
                 // Also send queue list so Dart sidebar can show named queues.
                 engine.manager.send_all_queues().await;
             }
-            Some(group_signal) = group_rx.recv() => {
-                match group_signal {
+            // 见上方「辅助信号合并转发」：两个后台泵合流到这一条分支，
+            // 主 select! 因此停在 64 分支上限之内。
+            Some(aux) = aux_rx.recv() => {
+                match aux {
+                AuxSignal::Group(group_signal) => match group_signal {
                     GroupSignal::Preview(msg) => {
                         engine.manager
                             .begin_resolve_preview(
@@ -1113,6 +1190,44 @@ pub async fn run(db_dir: PathBuf) {
                     GroupSignal::RequestAll(_) => {
                         engine.manager.send_all_groups().await;
                     }
+                },
+                AuxSignal::Rss(rss_signal) => match rss_signal {
+                    RssSignal::Tick => engine.manager.tick_rss_sources(),
+                    RssSignal::Engine(ev) => engine.manager.on_rss_event(*ev).await,
+                    RssSignal::Create(msg) => {
+                        engine.manager.rss.create_source(msg.source.into()).await;
+                    }
+                    RssSignal::Update(msg) => {
+                        engine.manager.rss.update_source(msg.source.into()).await;
+                    }
+                    RssSignal::Delete(msg) => {
+                        engine.manager.rss.delete_source(&msg.source_id).await;
+                    }
+                    RssSignal::Refresh(msg) => {
+                        engine.manager.refresh_rss_source(&msg.source_id);
+                    }
+                    RssSignal::Validate(msg) => {
+                        engine.manager.validate_rss_feed(
+                            msg.request_id,
+                            msg.url,
+                            msg.cookies,
+                            msg.user_agent,
+                            msg.proxy_url,
+                        );
+                    }
+                    RssSignal::RequestItems(msg) => {
+                        engine.manager.rss.broadcast_items(&msg.source_id, Vec::new()).await;
+                    }
+                    RssSignal::RequestAll(_) => {
+                        engine.manager.rss.broadcast_sources().await;
+                    }
+                    RssSignal::ItemAction(msg) => match msg.action {
+                        0 => engine.manager.download_rss_item(&msg.source_id, &msg.guid).await,
+                        1 => engine.manager.rss.ignore_item(&msg.source_id, &msg.guid).await,
+                        2 => engine.manager.rss.mark_all_read(&msg.source_id).await,
+                        _ => {}
+                    },
+                },
                 }
             }
             Some(_) = rescan_recv.recv() => {
@@ -1451,29 +1566,41 @@ pub async fn run(db_dir: PathBuf) {
                     .send_signal_to_dart();
                 });
             }
-            // --- URL protocol signals ---
+            // --- URL protocol signals (fluxdown:// deep links, ed2k:// links) ---
             Some(signal) = set_url_proto_recv.recv() => {
+                let scheme = signal.message.scheme;
                 let enable = signal.message.enable;
                 tokio::task::spawn_blocking(move || {
-                    log_info!("[actor] set_url_protocol enable={}", enable);
+                    let Some(proto) = protocol_registry::from_name(&scheme) else {
+                        log_info!("[actor] set_url_protocol: unknown scheme {}", scheme);
+                        return;
+                    };
+                    log_info!("[actor] set_url_protocol scheme={} enable={}", scheme, enable);
                     let result = if enable {
-                        protocol_registry::register()
+                        protocol_registry::register(proto)
                     } else {
-                        protocol_registry::unregister()
+                        protocol_registry::unregister(proto)
                     };
                     if let Err(e) = result {
                         log_info!("[actor] url protocol error: {}", e);
                     }
                     UrlProtocolStatus {
-                        is_registered: protocol_registry::is_registered(),
+                        scheme,
+                        is_registered: protocol_registry::is_registered(proto),
                     }
                     .send_signal_to_dart();
                 });
             }
-            Some(_) = check_url_proto_recv.recv() => {
-                tokio::task::spawn_blocking(|| {
+            Some(signal) = check_url_proto_recv.recv() => {
+                let scheme = signal.message.scheme;
+                tokio::task::spawn_blocking(move || {
+                    let Some(proto) = protocol_registry::from_name(&scheme) else {
+                        log_info!("[actor] check_url_protocol: unknown scheme {}", scheme);
+                        return;
+                    };
                     UrlProtocolStatus {
-                        is_registered: protocol_registry::is_registered(),
+                        scheme,
+                        is_registered: protocol_registry::is_registered(proto),
                     }
                     .send_signal_to_dart();
                 });
@@ -2397,6 +2524,55 @@ async fn handle_api_command(
                     error: "resolve preview worker dropped".to_string(),
                 });
                 let _ = ack.send(outcome);
+            });
+        }
+        ApiCommand::RssCreate { source, ack } => {
+            let source_id = engine.manager.rss.create_source(*source).await;
+            let _ = ack.send(source_id);
+        }
+        ApiCommand::RssUpdate { source, ack } => {
+            let ok = engine.manager.rss.update_source(*source).await;
+            let _ = ack.send(ok);
+        }
+        ApiCommand::RssDelete { source_id, ack } => {
+            let ok = engine.manager.rss.delete_source(&source_id).await;
+            let _ = ack.send(ok);
+        }
+        ApiCommand::RssRefresh { source_id, ack } => {
+            // 同步派发：抓取本身在 off-actor worker 里跑，结果经 `rss_rx` 回流。
+            let ok = engine.manager.refresh_rss_source(&source_id);
+            let _ = ack.send(ok);
+        }
+        ApiCommand::RssItemAction {
+            source_id,
+            guid,
+            action,
+            ack,
+        } => {
+            // wire 字符串在此收敛为引擎调用；未知动作静默忽略（回执照发，
+            // 语义与「操作无效果」一致，不把它升格成 HTTP 错误）。
+            match action.as_str() {
+                "download" => engine.manager.download_rss_item(&source_id, &guid).await,
+                "ignore" => engine.manager.rss.ignore_item(&source_id, &guid).await,
+                "readAll" => engine.manager.rss.mark_all_read(&source_id).await,
+                other => log_info!("[actor] api rss item action: unknown action {}", other),
+            }
+            let _ = ack.send(());
+        }
+        ApiCommand::RssValidate {
+            url,
+            cookies,
+            user_agent,
+            proxy_url,
+            ack,
+        } => {
+            // 同 `ResolvePreview`：actor 是 current_thread，在这里 await 网络
+            // 抓取会冻住整个 App 的事件循环——只取 future，等待挪到 spawn 里。
+            let fut = engine
+                .manager
+                .rss_validate_future(url, cookies, user_agent, proxy_url);
+            tokio::spawn(async move {
+                let _ = ack.send(Box::new(fut.await));
             });
         }
     }

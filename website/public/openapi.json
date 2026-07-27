@@ -363,6 +363,735 @@
         ]
       }
     },
+    "/api/v1/link/code": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "生成一次性配对码（**需 management token**）。供 web/CLI 让 headless 设备出示。",
+        "description": "生成一次性配对码，供发起方在 pair/hello 出示。**需 management token**。",
+        "operationId": "api_link_generate_code",
+        "responses": {
+          "200": {
+            "description": "配对码 + 有效期",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkCodeResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "link"
+        ],
+        "summary": "停止 mDNS 广播（撤销「可被发现」状态）；配对码本身若未过期仍可用\n（手动地址/已知连接仍能核对），只是不再出现在局域网 mDNS 扫描里。",
+        "description": "停止 mDNS 广播（撤销「可被发现」状态）；配对码本身未过期仍可用，只是不再出现在局域网扫描里。**需 management token**。",
+        "operationId": "api_link_stop_advertising",
+        "responses": {
+          "200": {
+            "description": "已停止",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkOkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/devices": {
+      "get": {
+        "tags": [
+          "link"
+        ],
+        "summary": "已配对设备列表（含并发在线探测）。",
+        "description": "已配对设备列表（含并发在线探测）。**需 management token**。",
+        "operationId": "api_link_devices",
+        "responses": {
+          "200": {
+            "description": "设备列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkDevicesResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/devices/{fingerprint}": {
+      "delete": {
+        "tags": [
+          "link"
+        ],
+        "summary": "解除配对（删除设备）。",
+        "description": "解除配对（删除设备记录及双方链路密钥）。**需 management token**。",
+        "operationId": "api_link_remove_device",
+        "parameters": [
+          {
+            "name": "fingerprint",
+            "in": "path",
+            "description": "设备指纹",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "已解除",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkOkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "设备不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/devices/{fingerprint}/tasks": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "下发下载任务给已配对设备（管理面，token 鉴权；区别于数据面链路 HMAC 鉴权的\n`POST /api/v1/link/tasks`）。",
+        "description": "下发下载任务给已配对设备（管理面，token 鉴权；区别于数据面链路 HMAC 鉴权的 `POST /api/v1/link/tasks`）。**需 management token**。",
+        "operationId": "api_link_device_tasks",
+        "parameters": [
+          {
+            "name": "fingerprint",
+            "in": "path",
+            "description": "目标设备指纹",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkDeviceTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedTask"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效，或目标设备不存在/未配对",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/discovered": {
+      "get": {
+        "tags": [
+          "link"
+        ],
+        "summary": "当前发现快照（发起方侧 UI 轮询）。",
+        "description": "当前发现快照（发起方侧 UI 轮询）。**需 management token**。",
+        "operationId": "api_link_discovered",
+        "responses": {
+          "200": {
+            "description": "发现到的对端列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkDiscoveredResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/discovery": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "本地设备发现开关：`start` 幂等且清空发现快照；`stop` 停止 mDNS 浏览。",
+        "description": "本地设备发现开关：`start` 幂等且清空发现快照，`stop` 停止 mDNS 浏览。**需 management token**。",
+        "operationId": "api_link_discovery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkDiscoveryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已切换",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "action 非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/pair/approve": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "批准/拒绝一次入站配对核验（响应本机收到的 `IncomingPairing` 通知；区别于\n发起方视角、核对 SAS 后调用的 [`api_link_pair_finish`]）。",
+        "description": "批准/拒绝一次入站配对核验（响应本机收到的 `IncomingPairing` 通知；区别于发起方视角、核对 SAS 后调用的 pair/finish）。**需 management token**。",
+        "operationId": "api_link_pair_approve",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkPairApproveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已处理",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkOkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "会话不存在/已过期，或载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/pair/begin": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "发起配对：向 `host:port` 发送 `hello`（带配对码），返回待确认令牌 + SAS +\n对端信息，供 UI 展示 SAS 核对后调 [`api_link_pair_finish`]。",
+        "description": "发起配对：向 `host:port` 发送 hello（带配对码），返回待确认令牌 + SAS，供 UI 展示核对后调用 pair/finish。**需 management token**。",
+        "operationId": "api_link_pair_begin",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkPairBeginRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "待确认令牌 + SAS + 对端信息",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkPairBeginResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "配对码错误，或载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "对端不可达，或本机待确认配对已达上限",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/pair/confirm": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "处理配对 `confirm`（SAS 核对后确认/拒绝）。",
+        "description": "配对第二步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立的 sessionId 守卫）。**无 token 鉴权**。",
+        "operationId": "api_link_pair_confirm",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkPairConfirmRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`{success,paired,reason}`"
+          },
+          "400": {
+            "description": "会话不存在/已过期，或载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/link/pair/finish": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "SAS 核对后确认/拒绝配对（管理面版本，区别于响应方内部 `pair/confirm`）。",
+        "description": "SAS 核对后确认/拒绝配对（管理面视角，区别于响应方内部 `pair/confirm`）。**需 management token**。",
+        "operationId": "api_link_pair_finish",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkPairFinishRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "`paired=false` 表示对端拒绝，此时 device 省略",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkPairFinishResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "令牌不存在/已过期，或载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/pair/hello": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "处理配对 `hello`（发起方 → 本机）。",
+        "description": "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。",
+        "operationId": "api_link_pair_hello",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkPairHelloRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "响应方临时公钥 + SAS 材料",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkPairHelloResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "配对码错误/过期/已用，或载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/link/probe": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "手动地址探测（mDNS 失效兜底）；结果不入发现快照。",
+        "description": "手动地址探测（mDNS 失效兜底）；结果不入发现快照，直接返回给调用方。**需 management token**。",
+        "operationId": "api_link_probe",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkProbeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "探测到的对端信息",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkDiscoveredPeer"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "对端不可达",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/link/tasks": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "已配对设备下发下载任务：从 `X-FluxLink-*` 头取鉴权凭据 → 校验 → 建任务。",
+        "description": "数据面：已配对设备下发下载任务。**无 management token**，鉴权靠 `X-FluxLink-Device`/`X-FluxLink-Ts`/`X-FluxLink-Nonce`/`X-FluxLink-Auth` 头做每对设备独立密钥的 HMAC 校验。\n\n请求体是对明文 JSON 任务描述做 AEAD 加密后的**二进制密文**（`Content-Type: application/octet-stream`），非普通 JSON；宿主校验鉴权头后解密再反序列化。",
+        "operationId": "api_link_create_task",
+        "responses": {
+          "200": {
+            "description": "创建成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedTask"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "载荷非法（含解密失败）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "缺少/无效链路鉴权头",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/market": {
       "get": {
         "tags": [
@@ -866,6 +1595,498 @@
           },
           "401": {
             "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/rss": {
+      "get": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "列出全部 RSS 订阅。",
+        "operationId": "api_list_rss_sources",
+        "responses": {
+          "200": {
+            "description": "订阅列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RssSourceDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "新建 RSS 订阅，返回新订阅 ID。`url` 为空 → 400。",
+        "operationId": "api_create_rss_source",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RssSourceDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "创建成功，`{sourceId}`"
+          },
+          "400": {
+            "description": "载荷非法或缺少 url",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/rss/validate": {
+      "post": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "只读验证一个 feed 地址（新建订阅向导）。抓取失败**不是** HTTP 错误：\n这是一次诊断调用，失败原因本身就是有效载荷，仍回 200 + `error` 非空。",
+        "operationId": "api_validate_rss_feed",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RssValidateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "验证结果（`error` 非空 = 抓取失败）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RssValidateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "载荷非法或缺少 url",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/rss/{id}": {
+      "put": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "更新订阅配置。运行态字段（`lastFetchAt`/`failCount` 等）写入被忽略。",
+        "operationId": "api_update_rss_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "订阅 ID（UUID）",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RssSourceDto"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已更新",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "订阅不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "删除订阅（级联删条目）。已建下载任务保留——用户要的是不再抓新条目，\n不是撤销已下载的东西。",
+        "operationId": "api_delete_rss_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "订阅 ID（UUID）",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "已删除",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "订阅不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/rss/{id}/items": {
+      "get": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "一个订阅的条目流（新→旧）。",
+        "operationId": "api_list_rss_items",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "订阅 ID（UUID）",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "条目列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RssItemDto"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "订阅不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/rss/{id}/items/action": {
+      "post": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "对条目执行手动操作（下载 / 忽略 / 全部标记已读）。guid 在请求体里，\n不进路径段——真实 feed 的 guid 常常是一整条 URL。",
+        "operationId": "api_rss_item_action",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "订阅 ID（UUID）",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RssItemActionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已执行",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "载荷非法或 action 未知",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "订阅或条目不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
+    "/api/v1/rss/{id}/refresh": {
+      "post": {
+        "tags": [
+          "rss"
+        ],
+        "summary": "立即抓取一个订阅。抓取异步派发，本端点只表示「已受理」，结果走\n`rssSourcesChanged` / `rssItemsChanged` 事件。",
+        "operationId": "api_refresh_rss_source",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "订阅 ID（UUID）",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "已派发抓取",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "订阅不存在",
             "content": {
               "application/json": {
                 "schema": {
@@ -1935,6 +3156,409 @@
           }
         }
       },
+      "LinkCodeResponse": {
+        "type": "object",
+        "description": "生成配对码的响应（`POST /api/v1/link/code`）。",
+        "required": [
+          "code",
+          "ttlSeconds"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "6 位一次性配对码。"
+          },
+          "ttlSeconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "有效秒数。"
+          }
+        }
+      },
+      "LinkDeviceInfo": {
+        "type": "object",
+        "description": "一台**已配对**设备的对外视图（`GET /api/v1/link/devices` 元素）。严禁透出\n`link_secret`/`identity_pub` 等敏感字段（对应引擎 `link::PeerRecord`）。",
+        "required": [
+          "fingerprint",
+          "name",
+          "online",
+          "pairedAt",
+          "lastSeenAt"
+        ],
+        "properties": {
+          "fingerprint": {
+            "type": "string"
+          },
+          "lastSeenAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "online": {
+            "type": "boolean",
+            "description": "并发探测得到的在线状态（见 `ApiHost::link_devices` 实现）。"
+          },
+          "pairedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "platform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
+      "LinkDeviceTaskRequest": {
+        "type": "object",
+        "description": "已配对设备下发下载任务请求体（管理面，token 鉴权；区别于数据面链路 HMAC\n鉴权的 [`LinkTaskRequest`]，字段语义一致）。",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "fileName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "saveDir": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "LinkDevicesResponse": {
+        "type": "object",
+        "description": "已配对设备列表响应（`GET /api/v1/link/devices`）。",
+        "required": [
+          "devices"
+        ],
+        "properties": {
+          "devices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LinkDeviceInfo"
+            }
+          }
+        }
+      },
+      "LinkDiscoveredPeer": {
+        "type": "object",
+        "description": "一台被发现、尚未配对的设备（`GET /api/v1/link/discovered` 元素 /\n`POST /api/v1/link/probe` 响应）。对应引擎 `link::DiscoveredPeer`（宿主层\n转换，`kind` → `source` 小写字符串 `\"mdns\"`/`\"manual\"`）。",
+        "required": [
+          "name",
+          "host",
+          "port",
+          "source"
+        ],
+        "properties": {
+          "appVersion": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "对端指纹（经 `/ping` TOFU 获得；mDNS 未探测到时为 `None`）。"
+          },
+          "host": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "source": {
+            "type": "string",
+            "description": "发现途径：`\"mdns\"` | `\"manual\"`。"
+          }
+        }
+      },
+      "LinkDiscoveredResponse": {
+        "type": "object",
+        "description": "发现快照响应（`GET /api/v1/link/discovered`）。",
+        "required": [
+          "peers"
+        ],
+        "properties": {
+          "peers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LinkDiscoveredPeer"
+            }
+          }
+        }
+      },
+      "LinkDiscoveryRequest": {
+        "type": "object",
+        "description": "本地设备发现开关请求体（`POST /api/v1/link/discovery`）。",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "`\"start\"` | `\"stop\"`。"
+          }
+        }
+      },
+      "LinkOkResponse": {
+        "type": "object",
+        "description": "通用 `{\"ok\":true}` 应答（发现开关 / 解除配对）。与 [`ResultMessage`] 的\n`{\"success\",\"message\"}` 形态不同——契约就此路由指定的字面 wire 形状。",
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LinkPairApproveRequest": {
+        "type": "object",
+        "description": "批准/拒绝一次入站配对核验（管理面版本；`session_id` 对应\n`LinkEvent{kind:\"incomingPairing\"}` / WS `linkIncomingPairing` 携带的会话 id）。",
+        "required": [
+          "sessionId",
+          "accept"
+        ],
+        "properties": {
+          "accept": {
+            "type": "boolean"
+          },
+          "sessionId": {
+            "type": "string"
+          }
+        }
+      },
+      "LinkPairBeginRequest": {
+        "type": "object",
+        "description": "发起配对请求体（`POST /api/v1/link/pair/begin`）。",
+        "required": [
+          "host",
+          "port",
+          "code"
+        ],
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "LinkPairBeginResponse": {
+        "type": "object",
+        "description": "发起配对成功后的待确认结果（`POST /api/v1/link/pair/begin` 响应）。",
+        "required": [
+          "token",
+          "sas",
+          "peerName",
+          "peerFingerprint"
+        ],
+        "properties": {
+          "peerFingerprint": {
+            "type": "string"
+          },
+          "peerName": {
+            "type": "string"
+          },
+          "sas": {
+            "type": "string",
+            "description": "供双方肉眼核对的短认证串。"
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "LinkPairConfirmRequest": {
+        "type": "object",
+        "description": "配对 `confirm` 请求：SAS 核对后确认/拒绝。",
+        "required": [
+          "sessionId",
+          "confirm"
+        ],
+        "properties": {
+          "confirm": {
+            "type": "boolean"
+          },
+          "sessionId": {
+            "type": "string"
+          }
+        }
+      },
+      "LinkPairFinishRequest": {
+        "type": "object",
+        "description": "SAS 核对后确认/拒绝配对请求体（`POST /api/v1/link/pair/finish`）。",
+        "required": [
+          "token",
+          "accept"
+        ],
+        "properties": {
+          "accept": {
+            "type": "boolean"
+          },
+          "token": {
+            "type": "string"
+          }
+        }
+      },
+      "LinkPairFinishResponse": {
+        "type": "object",
+        "description": "配对完成结果（`POST /api/v1/link/pair/finish` 响应）。`accept=false` 或\n对端拒绝时 `paired=false`，`device` 省略。",
+        "required": [
+          "paired"
+        ],
+        "properties": {
+          "device": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/LinkDeviceInfo"
+              }
+            ]
+          },
+          "paired": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LinkPairHelloRequest": {
+        "type": "object",
+        "description": "配对 `hello` 请求（发起方 → 响应方）。全部密钥/签名字段为 base64。",
+        "required": [
+          "code",
+          "initiatorEphPub",
+          "initiatorIdPub",
+          "initiatorSig",
+          "name"
+        ],
+        "properties": {
+          "appVersion": {
+            "type": "string",
+            "description": "发起方客户端版本。"
+          },
+          "code": {
+            "type": "string",
+            "description": "一次性配对码（响应方 UI 展示、用户手输）。"
+          },
+          "initiatorAddrs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "发起方自报可达候选地址（`ip:port`），供响应方存为回连候选。"
+          },
+          "initiatorEphPub": {
+            "type": "string",
+            "description": "发起方临时 X25519 公钥（base64）。"
+          },
+          "initiatorIdPub": {
+            "type": "string",
+            "description": "发起方 Ed25519 身份公钥（base64）。"
+          },
+          "initiatorSig": {
+            "type": "string",
+            "description": "发起方对握手转录的 Ed25519 签名（base64）。"
+          },
+          "name": {
+            "type": "string",
+            "description": "发起方展示名。"
+          },
+          "platform": {
+            "type": "string",
+            "description": "发起方平台。"
+          }
+        }
+      },
+      "LinkPairHelloResponse": {
+        "type": "object",
+        "description": "配对 `hello` 回复（响应方 → 发起方）。",
+        "required": [
+          "sessionId",
+          "responderEphPub",
+          "responderIdPub",
+          "responderSig",
+          "name",
+          "sas"
+        ],
+        "properties": {
+          "appVersion": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "responderEphPub": {
+            "type": "string"
+          },
+          "responderIdPub": {
+            "type": "string"
+          },
+          "responderSig": {
+            "type": "string"
+          },
+          "sas": {
+            "type": "string",
+            "description": "供响应方本地展示的 SAS（应与发起方计算一致）。"
+          },
+          "sessionId": {
+            "type": "string"
+          }
+        }
+      },
+      "LinkProbeRequest": {
+        "type": "object",
+        "description": "手动地址探测请求体（`POST /api/v1/link/probe`）。",
+        "required": [
+          "host",
+          "port"
+        ],
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "MarketEntryDto": {
         "type": "object",
         "description": "市场索引条目视图（去中心化插件市场浏览/安装）。",
@@ -2347,6 +3971,260 @@
           }
         }
       },
+      "RssItemActionRequest": {
+        "type": "object",
+        "description": "对条目执行手动操作（`POST /api/v1/rss/{id}/items/action`）。\n\nguid 走请求体而不是路径段：真实 feed 的 guid 常常就是一整条 URL，\n塞进路径要双重编码，且被反向代理规范化后会静默改写。",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "`download`（绕过规则强制下载）/ `ignore` / `readAll`（全部标记已读）。"
+          },
+          "guid": {
+            "type": "string",
+            "description": "`action = \"readAll\"` 时忽略。"
+          }
+        }
+      },
+      "RssItemDto": {
+        "type": "object",
+        "description": "订阅流中的一个条目（`GET /api/v1/rss/{id}/items`）。",
+        "required": [
+          "sourceId",
+          "guid",
+          "title",
+          "link",
+          "enclosureUrl",
+          "enclosureLength",
+          "pubDate",
+          "fetchedAt",
+          "status",
+          "taskId",
+          "episodeKey",
+          "reason"
+        ],
+        "properties": {
+          "enclosureLength": {
+            "type": "integer",
+            "format": "int64",
+            "description": "enclosure 声明大小（字节，0 = 未知）。"
+          },
+          "enclosureUrl": {
+            "type": "string",
+            "description": "enclosure 直链（空 = 回退 `link`）。"
+          },
+          "episodeKey": {
+            "type": "string",
+            "description": "智能剧集归一键（空 = 未识别）。"
+          },
+          "fetchedAt": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "guid": {
+            "type": "string",
+            "description": "去重主键。"
+          },
+          "link": {
+            "type": "string"
+          },
+          "pubDate": {
+            "type": "integer",
+            "format": "int64",
+            "description": "发布时间（Unix 秒，0 = 未知）。"
+          },
+          "reason": {
+            "type": "string",
+            "description": "稳定原因码（`excluded`/`too_large`/`dup_episode`/`seed_skipped`/…；\n空 = 无）。**客户端负责本地化**。"
+          },
+          "sourceId": {
+            "type": "string"
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "0=新 1=已下载 2=已忽略 3=规则未命中 4=重复剧集 5=首轮历史条目。"
+          },
+          "taskId": {
+            "type": "string",
+            "description": "`status == 1` 时回链的任务 ID。"
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "RssSourceDto": {
+        "type": "object",
+        "description": "一个 RSS 订阅（`GET/POST /api/v1/rss`、`PUT /api/v1/rss/{id}`）。\n\n写请求复用同一结构：全字段 `#[serde(default)]`，客户端只需给关心的字段；\n运行态字段（`lastFetchAt`/`lastError`/`failCount`/`seeded`/`unreadCount`）\n只读，写入时被引擎忽略。\n\n# Examples\n\n```\nuse fluxdown_api::types::RssSourceDto;\n\nlet req: RssSourceDto =\n    serde_json::from_str(r#\"{\"url\":\"https://mikanani.me/RSS/MyBangumi?token=x\"}\"#).unwrap();\nassert_eq!(req.interval_minutes, 0); // 0 → 引擎归一为默认 30 分钟\nassert!(req.source_id.is_empty());\n```",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "autoDownload": {
+            "type": "boolean",
+            "description": "false = 收集模式（只收集条目供手动挑选）。"
+          },
+          "cookies": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "excludePattern": {
+            "type": "string"
+          },
+          "failCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "只读：连续失败次数（驱动指数退避）。"
+          },
+          "includePattern": {
+            "type": "string",
+            "description": "包含关键词（`|` = 或，空格 = 且；空 = 不过滤）。"
+          },
+          "intervalMinutes": {
+            "type": "integer",
+            "format": "int32",
+            "description": "抓取间隔（分钟）；0 = 引擎默认 30。"
+          },
+          "lastError": {
+            "type": "string",
+            "description": "只读：上次失败原因（空 = 健康）。"
+          },
+          "lastFetchAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "只读：上次发起抓取的 Unix 秒（0 = 从未）。"
+          },
+          "lastSuccessAt": {
+            "type": "integer",
+            "format": "int64",
+            "description": "只读：上次成功抓取的 Unix 秒（0 = 从未）。"
+          },
+          "maxPerFetch": {
+            "type": "integer",
+            "format": "int32",
+            "description": "每轮最多新建任务数（1..=100）；0 = 引擎默认 20。"
+          },
+          "name": {
+            "type": "string",
+            "description": "空 = 用 feed 标题回填。"
+          },
+          "notifyOnDownload": {
+            "type": "boolean"
+          },
+          "position": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "proxyUrl": {
+            "type": "string"
+          },
+          "queueId": {
+            "type": "string",
+            "description": "空 = 内置主队列。"
+          },
+          "saveDir": {
+            "type": "string",
+            "description": "空 = 队列目录 → 全局目录。"
+          },
+          "seeded": {
+            "type": "boolean",
+            "description": "只读：首轮抓取是否已完成。"
+          },
+          "sendReferer": {
+            "type": "boolean"
+          },
+          "sizeMaxBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "体积上限（字节，0 = 不限）。"
+          },
+          "sizeMinBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "体积下限（字节，0 = 不限）。"
+          },
+          "smartEpisode": {
+            "type": "boolean"
+          },
+          "sourceId": {
+            "type": "string"
+          },
+          "startPaused": {
+            "type": "boolean",
+            "description": "自动创建的任务以 paused 落库。"
+          },
+          "unreadCount": {
+            "type": "integer",
+            "format": "int32",
+            "description": "只读：未处理条目数（侧边栏 badge）。"
+          },
+          "url": {
+            "type": "string"
+          },
+          "useRegex": {
+            "type": "boolean"
+          },
+          "userAgent": {
+            "type": "string"
+          }
+        }
+      },
+      "RssValidateRequest": {
+        "type": "object",
+        "description": "验证一个 feed 地址（`POST /api/v1/rss/validate`，只读、不落库）。",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "cookies": {
+            "type": "string"
+          },
+          "proxyUrl": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          },
+          "userAgent": {
+            "type": "string"
+          }
+        }
+      },
+      "RssValidateResponse": {
+        "type": "object",
+        "description": "feed 验证结果。`error` 非空即验证失败（HTTP 状态仍是 200——这是一次\n**诊断**调用，失败原因本身就是有效载荷）。",
+        "required": [
+          "url",
+          "feedTitle",
+          "items",
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "无错误时为空。"
+          },
+          "feedTitle": {
+            "type": "string",
+            "description": "feed 标题（供回填订阅名）。"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RssItemDto"
+            },
+            "description": "最近条目预览。"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
       "SetPluginEnabledRequest": {
         "type": "object",
         "description": "设置插件启用状态请求体。",
@@ -2455,7 +4333,7 @@
       },
       "TaskDto": {
         "type": "object",
-        "description": "任务信息（`GET /api/v1/tasks`、`GET /api/v1/tasks/{id}` 响应）。\n\n# Examples\n\n```\nuse fluxdown_api::types::TaskDto;\nuse fluxdown_engine::model::TaskInfo;\n\nlet info = TaskInfo {\n    task_id: \"t1\".to_string(),\n    url: \"https://example.com/f.zip\".to_string(),\n    file_name: \"f.zip\".to_string(),\n    save_dir: \"/tmp\".to_string(),\n    status: 1,\n    downloaded_bytes: 10,\n    total_bytes: 100,\n    error_message: String::new(),\n    created_at: \"1700000000\".to_string(),\n    proxy_url: String::new(),\n    queue_id: String::new(),\n    checksum: String::new(),\n    ignore_tls_errors: false,\n    file_missing: false,\n    completed_at: String::new(),\n    segments: 0,\n    queue_order: 0,\n    referrer: String::new(),\n    group_id: String::new(),\n};\nlet dto = TaskDto::from(info);\nassert_eq!(dto.task_id, \"t1\");\nlet json = serde_json::to_string(&dto).unwrap();\nassert!(json.contains(\"\\\"taskId\\\":\\\"t1\\\"\"));\n```",
+        "description": "任务信息（`GET /api/v1/tasks`、`GET /api/v1/tasks/{id}` 响应）。\n\n# Examples\n\n```\nuse fluxdown_api::types::TaskDto;\nuse fluxdown_engine::model::TaskInfo;\n\nlet info = TaskInfo {\n    task_id: \"t1\".to_string(),\n    url: \"https://example.com/f.zip\".to_string(),\n    file_name: \"f.zip\".to_string(),\n    save_dir: \"/tmp\".to_string(),\n    status: 1,\n    downloaded_bytes: 10,\n    total_bytes: 100,\n    error_message: String::new(),\n    created_at: \"1700000000\".to_string(),\n    proxy_url: String::new(),\n    queue_id: String::new(),\n    checksum: String::new(),\n    ignore_tls_errors: false,\n    file_missing: false,\n    completed_at: String::new(),\n    segments: 0,\n    queue_order: 0,\n    referrer: String::new(),\n    group_id: String::new(),\n    rss_source_id: String::new(),\n    origin_url: String::new(),\n};\nlet dto = TaskDto::from(info);\nassert_eq!(dto.task_id, \"t1\");\nlet json = serde_json::to_string(&dto).unwrap();\nassert!(json.contains(\"\\\"taskId\\\":\\\"t1\\\"\"));\n```",
         "required": [
           "taskId",
           "url",
@@ -2505,6 +4383,10 @@
             "type": "boolean",
             "description": "是否显式忽略 HTTPS 证书错误。默认 false（严格验证）。"
           },
+          "originUrl": {
+            "type": "string",
+            "description": "展示用原始来源链接（空 = 用 `url`）。`.torrent` 任务的 `url` 是\n`torrent-file://local` 哨兵，客户端「复制链接」应优先取本字段。"
+          },
           "proxyUrl": {
             "type": "string",
             "description": "单任务代理 URL（空 = 使用全局代理）。"
@@ -2521,6 +4403,10 @@
           "referrer": {
             "type": "string",
             "description": "Source page URL captured by the browser extension (empty = none)."
+          },
+          "rssSourceId": {
+            "type": "string",
+            "description": "由哪条 RSS 订阅自动创建（空 = 非 RSS 来源）。P5 任务溯源。"
           },
           "saveDir": {
             "type": "string"
@@ -2583,6 +4469,14 @@
     {
       "name": "plugins",
       "description": "插件系统（安装/启停/设置/卸载；强制 token）"
+    },
+    {
+      "name": "rss",
+      "description": "RSS 订阅自动下载（订阅 CRUD / 条目流 / 手动操作 / feed 验证；强制 token）"
+    },
+    {
+      "name": "link",
+      "description": "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"
     }
   ]
 }

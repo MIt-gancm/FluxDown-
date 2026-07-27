@@ -3,6 +3,8 @@ mod api_host;
 mod compat_flags;
 mod file_association;
 mod logger;
+#[cfg(target_os = "macos")]
+mod macos_cf;
 mod native_messaging;
 mod nmh_registry;
 mod protocol_registry;

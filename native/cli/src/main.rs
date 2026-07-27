@@ -4,11 +4,13 @@ use std::process::ExitCode as ProcExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
-use fluxdown_api::types::CreateTaskRequest;
+use fluxdown_api::types::{CreateTaskRequest, RssSourceDto};
 use fluxdown_cli::client::{ApiClient, ClientError};
 use fluxdown_cli::config::{CliConfig, ConfigError};
 use fluxdown_cli::exit::ExitCode;
-use fluxdown_cli::format::{human_bytes, percent, status_name, truncate};
+use fluxdown_cli::format::{
+    human_bytes, human_time, percent, rss_item_status_name, status_name, truncate,
+};
 
 mod local;
 
@@ -69,6 +71,8 @@ enum Command {
     ResumeAll,
     /// 列出命名队列。
     Queue,
+    /// 管理 RSS 订阅（自动追番/自动下载）。
+    Rss(RssArgs),
     /// 轮询显示任务进度直至完成/出错。
     Watch(WatchArgs),
     /// 读写持久化 CLI 配置（类似 `go env -w`：一次设置长期生效）。
@@ -142,6 +146,66 @@ struct WatchArgs {
     /// 刷新间隔（秒）。
     #[arg(long, default_value_t = 1)]
     interval: u64,
+}
+
+#[derive(Debug, Args)]
+struct RssArgs {
+    #[command(subcommand)]
+    action: RssCmd,
+}
+
+#[derive(Debug, Subcommand)]
+enum RssCmd {
+    /// 列出全部订阅。
+    #[command(visible_alias = "ls")]
+    List,
+    /// 新增订阅。
+    Add(Box<RssAddArgs>),
+    /// 删除订阅（连带其条目记录）。
+    Rm {
+        /// 订阅 ID。
+        id: String,
+    },
+    /// 立即抓取一次订阅（不等待下一个周期）。
+    Refresh {
+        /// 订阅 ID。
+        id: String,
+    },
+    /// 列出订阅的条目流。
+    Items {
+        /// 订阅 ID。
+        id: String,
+    },
+}
+
+#[derive(Debug, Args)]
+struct RssAddArgs {
+    // 字段名避开 `url`：全局 `--url` 已占用该 arg id，同名会被 clap 合并成
+    // 同一个参数，导致订阅地址把服务基址覆盖掉。
+    /// feed 地址（RSS/Atom）。
+    #[arg(value_name = "URL")]
+    feed_url: String,
+    /// 订阅名（省略 = 用 feed 标题回填）。
+    #[arg(long)]
+    name: Option<String>,
+    /// 队列 ID（省略 = 默认队列）。
+    #[arg(long)]
+    queue: Option<String>,
+    /// 保存目录（省略 = 队列目录 → 全局目录）。
+    #[arg(short = 'd', long = "dir")]
+    dir: Option<String>,
+    /// 抓取间隔（分钟，省略 = 服务端默认 30）。
+    #[arg(long)]
+    interval: Option<i32>,
+    /// 收集模式：只收集条目供手动挑选，不自动建任务。
+    #[arg(long = "no-auto")]
+    no_auto: bool,
+    /// 包含关键词（`|` = 或，空格 = 且；省略 = 不过滤）。
+    #[arg(long)]
+    include: Option<String>,
+    /// 排除关键词。
+    #[arg(long)]
+    exclude: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -292,6 +356,7 @@ async fn run(cli: Cli) -> i32 {
         Command::PauseAll => cmd_simple(client.pause_all().await, "paused all tasks"),
         Command::ResumeAll => cmd_simple(client.resume_all().await, "resumed all tasks"),
         Command::Queue => cmd_queue(&client, json).await,
+        Command::Rss(a) => cmd_rss(&client, a.action, json).await,
         Command::Watch(a) => cmd_watch(&client, a).await,
         // Config 已在上方提前返回，此处不可达。
         Command::Config(_) => unreachable!("config handled before client construction"),
@@ -596,6 +661,157 @@ async fn cmd_queue(client: &ApiClient, json: bool) -> Result<(), ClientError> {
             limit,
             concur,
             schedule
+        );
+    }
+    Ok(())
+}
+
+/// 处理 `rss` 子命令组：全部经 REST 打服务端（无 `--local` 变体——订阅是
+/// 常驻轮询语义，脱离运行中的服务没有意义）。
+async fn cmd_rss(client: &ApiClient, action: RssCmd, json: bool) -> Result<(), ClientError> {
+    match action {
+        RssCmd::List => cmd_rss_list(client, json).await,
+        RssCmd::Add(a) => cmd_rss_add(client, *a, json).await,
+        RssCmd::Rm { id } => cmd_simple(
+            client.delete_rss_source(&id).await,
+            &format!("removed {id}"),
+        ),
+        RssCmd::Refresh { id } => cmd_simple(
+            client.refresh_rss_source(&id).await,
+            &format!("refreshing {id}"),
+        ),
+        RssCmd::Items { id } => cmd_rss_items(client, &id, json).await,
+    }
+}
+
+async fn cmd_rss_list(client: &ApiClient, json: bool) -> Result<(), ClientError> {
+    let sources = client.list_rss_sources().await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&sources).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if sources.is_empty() {
+        println!("(no rss sources)");
+        return Ok(());
+    }
+    println!(
+        "{:<16}  {:<32}  {:>6}  {:>6}  STATE",
+        "ID", "NAME", "EVERY", "UNREAD"
+    );
+    for s in &sources {
+        // interval 0 是「未指定」，服务端会归一为引擎默认值——这里同样展开，
+        // 免得表格里出现一列 `0m` 让人以为是「不抓取」。
+        let minutes = if s.interval_minutes > 0 {
+            s.interval_minutes
+        } else {
+            fluxdown_engine::rss::model::DEFAULT_INTERVAL_MINUTES
+        };
+        println!(
+            "{:<16}  {:<32}  {:>6}  {:>6}  {}",
+            truncate(&s.source_id, 16),
+            truncate(if s.name.is_empty() { &s.url } else { &s.name }, 32),
+            format!("{minutes}m"),
+            s.unread_count,
+            rss_source_state(s),
+        );
+    }
+    Ok(())
+}
+
+/// 订阅状态列。STATE 放最后一列，因为报错态带 ANSI 转义，参与 `{:<n}`
+/// 对齐会把不可见字节算进宽度、把整张表撑歪。
+fn rss_source_state(s: &RssSourceDto) -> String {
+    if !s.enabled {
+        return "disabled".to_string();
+    }
+    if !s.last_error.is_empty() {
+        // 抓取失败标红：一屏几十条订阅时，红色是唯一能一眼扫到的信号。
+        return format!(
+            "\x1b[31merror ({}x): {}\x1b[0m",
+            s.fail_count,
+            truncate(&s.last_error, 48)
+        );
+    }
+    if s.auto_download {
+        "auto".to_string()
+    } else {
+        "collect".to_string()
+    }
+}
+
+async fn cmd_rss_add(client: &ApiClient, a: RssAddArgs, json: bool) -> Result<(), ClientError> {
+    let req = RssSourceDto {
+        source_id: String::new(),
+        url: a.feed_url,
+        name: a.name.unwrap_or_default(),
+        enabled: true,
+        auto_download: !a.no_auto,
+        start_paused: false,
+        queue_id: a.queue.unwrap_or_default(),
+        save_dir: a.dir.unwrap_or_default(),
+        // 负数按「未指定」处理，交服务端归一为默认间隔。
+        interval_minutes: a.interval.unwrap_or(0).max(0),
+        include_pattern: a.include.unwrap_or_default(),
+        exclude_pattern: a.exclude.unwrap_or_default(),
+        use_regex: false,
+        smart_episode: false,
+        size_min_bytes: 0,
+        size_max_bytes: 0,
+        send_referer: true,
+        notify_on_download: true,
+        max_per_fetch: 0,
+        cookies: String::new(),
+        user_agent: String::new(),
+        proxy_url: String::new(),
+        // 以下为只读运行态字段，服务端忽略写入值。
+        last_fetch_at: 0,
+        last_success_at: 0,
+        last_error: String::new(),
+        fail_count: 0,
+        seeded: false,
+        position: 0,
+        unread_count: 0,
+    };
+    let id = client.create_rss_source(&req).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "sourceId": id }))
+                .unwrap_or_default()
+        );
+    } else {
+        println!("added {id}");
+    }
+    Ok(())
+}
+
+async fn cmd_rss_items(client: &ApiClient, id: &str, json: bool) -> Result<(), ClientError> {
+    let items = client.list_rss_items(id).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&items).unwrap_or_default()
+        );
+        return Ok(());
+    }
+    if items.is_empty() {
+        println!("(no items)");
+        return Ok(());
+    }
+    println!(
+        "{:<10}  {:<52}  {:>11}  PUBLISHED",
+        "STATUS", "TITLE", "SIZE"
+    );
+    for i in &items {
+        println!(
+            "{:<10}  {:<52}  {:>11}  {}",
+            rss_item_status_name(i.status),
+            truncate(&i.title, 52),
+            human_bytes(i.enclosure_length),
+            human_time(i.pub_date),
         );
     }
     Ok(())

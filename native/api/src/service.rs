@@ -16,7 +16,9 @@ use crate::types::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
     LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
     LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
-    MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse, TaskDto,
+    MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse,
+    RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse,
+    TaskDto,
 };
 
 /// 404 fallback 响应的 message —— 请求命中了未注册的路由（例如管理 API 分组
@@ -252,6 +254,63 @@ pub trait ApiHost: Send + Sync {
         Err(groups_unsupported())
     }
 
+    // -- RSS 订阅（默认降级：不支持的宿主返回空表 / 报错）--
+
+    /// 列出全部 RSS 订阅（含派生的未读计数）。默认空表。
+    async fn list_rss_sources(&self) -> Result<Vec<RssSourceDto>, ApiError> {
+        Ok(Vec::new())
+    }
+
+    /// 新建订阅，返回新订阅 ID。`req.source_id` 忽略。
+    async fn create_rss_source(&self, req: RssSourceDto) -> Result<String, ApiError> {
+        let _ = req;
+        Err(rss_unsupported())
+    }
+
+    /// 更新订阅配置。运行态字段忽略。订阅不存在 → [`ApiError::NotFound`]。
+    async fn update_rss_source(&self, source_id: &str, req: RssSourceDto) -> Result<(), ApiError> {
+        let _ = (source_id, req);
+        Err(rss_unsupported())
+    }
+
+    /// 删除订阅（级联条目；已创建的下载任务保留）。
+    async fn delete_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
+        let _ = source_id;
+        Err(rss_unsupported())
+    }
+
+    /// 立即抓取一个订阅（异步派发，立即返回）。
+    async fn refresh_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
+        let _ = source_id;
+        Err(rss_unsupported())
+    }
+
+    /// 一个订阅的条目流（新→旧）。
+    async fn list_rss_items(&self, source_id: &str) -> Result<Vec<RssItemDto>, ApiError> {
+        let _ = source_id;
+        Err(rss_unsupported())
+    }
+
+    /// 对条目执行手动操作（下载/忽略/全部标记已读）。
+    async fn rss_item_action(
+        &self,
+        source_id: &str,
+        req: RssItemActionRequest,
+    ) -> Result<(), ApiError> {
+        let _ = (source_id, req);
+        Err(rss_unsupported())
+    }
+
+    /// 只读验证一个 feed 地址（新建订阅向导）。抓取失败不是 HTTP 错误——
+    /// 失败原因进 [`RssValidateResponse::error`]。
+    async fn validate_rss_feed(
+        &self,
+        req: RssValidateRequest,
+    ) -> Result<RssValidateResponse, ApiError> {
+        let _ = req;
+        Err(rss_unsupported())
+    }
+
     // -- P2P 设备互联（默认降级：不支持的宿主报错 / ping 信息返回 None）--
 
     /// `/ping` 透出的本机设备互联身份（无鉴权）。默认 `None`（不支持 link 的宿主
@@ -386,6 +445,11 @@ fn plugins_unsupported() -> ApiError {
 /// 未支持任务组的宿主的统一错误。
 fn groups_unsupported() -> ApiError {
     ApiError::Internal("task groups not supported by this host".to_string())
+}
+
+/// 未支持 RSS 订阅的宿主的统一错误。
+fn rss_unsupported() -> ApiError {
+    ApiError::Internal("rss subscriptions not supported by this host".to_string())
 }
 
 /// 未支持设备互联的宿主（如纯 aria2 客户端 / mobile）的统一错误。

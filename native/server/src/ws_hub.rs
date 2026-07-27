@@ -350,6 +350,36 @@ impl EventSink for EngineEventSink {
             EngineEvent::GroupsChanged(groups) => WsServerMsg::GroupsChanged {
                 groups: groups.into_iter().map(Into::into).collect(),
             },
+            // RSS 订阅表全量推（增删改 / 抓取状态 / 未读 badge）。
+            EngineEvent::RssSourcesChanged(sources) => WsServerMsg::RssSourcesChanged {
+                sources: sources.into_iter().map(Into::into).collect(),
+            },
+            // 条目流快照 + 本轮自动建任务的标题；后者由客户端弹一条合批
+            // 通知（headless 无桌面通知通道，通知责任落在 Web 前端）。
+            EngineEvent::RssItemsChanged {
+                source_id,
+                items,
+                notify_titles,
+            } => WsServerMsg::RssItemsChanged {
+                source_id,
+                items: items.into_iter().map(Into::into).collect(),
+                notify_titles,
+            },
+            // 信号路径的 feed 验证结果（`DownloadManager::validate_rss_feed`）。
+            // REST `POST /api/v1/rss/validate` 走的是请求-应答路径，不经这里。
+            EngineEvent::RssFeedValidated {
+                request_id,
+                url,
+                feed_title,
+                items,
+                error,
+            } => WsServerMsg::RssFeedValidated {
+                request_id,
+                url,
+                feed_title,
+                items: items.into_iter().map(Into::into).collect(),
+                error,
+            },
             // `#[non_exhaustive]`：未来新增变体默认丢弃并记录日志。
             other => {
                 log_info!("[ws-hub] unhandled engine event: {:?}", other);
@@ -674,6 +704,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_event_sink_maps_rss_sources_changed_to_camel_case_json() {
+        use fluxdown_engine::rss::model::RssSourceInfo;
+
+        let hub = Arc::new(WsHub::new(16));
+        let mut rx = hub.events.subscribe();
+        let sink = EngineEventSink(Arc::clone(&hub));
+
+        sink.emit(EngineEvent::RssSourcesChanged(vec![RssSourceInfo {
+            source_id: "s1".into(),
+            url: "https://mikanani.me/RSS/MyBangumi?token=x".into(),
+            name: "追番".into(),
+            interval_minutes: 30,
+            unread_count: 3,
+            ..Default::default()
+        }]));
+
+        let json = rx.recv().await.expect("broadcast recv");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["type"], "rssSourcesChanged");
+        assert_eq!(v["sources"][0]["sourceId"], "s1");
+        assert_eq!(v["sources"][0]["intervalMinutes"], 30);
+        assert_eq!(v["sources"][0]["unreadCount"], 3);
+    }
+
+    #[tokio::test]
+    async fn engine_event_sink_maps_rss_items_changed_to_camel_case_json() {
+        use fluxdown_engine::rss::model::{RssItemInfo, RssItemStatus};
+
+        let hub = Arc::new(WsHub::new(16));
+        let mut rx = hub.events.subscribe();
+        let sink = EngineEventSink(Arc::clone(&hub));
+
+        sink.emit(EngineEvent::RssItemsChanged {
+            source_id: "s1".into(),
+            items: vec![RssItemInfo {
+                source_id: "s1".into(),
+                guid: "https://example.com/ep01".into(),
+                title: "[Sub] Show - 01".into(),
+                enclosure_url: "magnet:?xt=urn:btih:abc".into(),
+                enclosure_length: 1024,
+                status: RssItemStatus::Downloaded,
+                task_id: "t1".into(),
+                ..Default::default()
+            }],
+            notify_titles: vec!["[Sub] Show - 01".into()],
+        });
+
+        let json = rx.recv().await.expect("broadcast recv");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(v["type"], "rssItemsChanged");
+        assert_eq!(v["sourceId"], "s1");
+        assert_eq!(v["items"][0]["enclosureUrl"], "magnet:?xt=urn:btih:abc");
+        assert_eq!(v["items"][0]["enclosureLength"], 1024);
+        assert_eq!(v["items"][0]["taskId"], "t1");
+        // `status` 是稳定线上契约的数字码（1 = 已下载），不是引擎枚举名。
+        assert_eq!(v["items"][0]["status"], 1);
+        assert_eq!(v["notifyTitles"][0], "[Sub] Show - 01");
+    }
+
+    #[tokio::test]
     async fn ws_host_selection_bt_files_answered_before_timeout_returns_user_chose() {
         let hub = Arc::new(WsHub::new(16));
         let selector = Arc::new(WsHostSelection(Arc::clone(&hub)));
@@ -873,6 +963,8 @@ mod tests {
             queue_order: 0,
             referrer: String::new(),
             group_id: String::new(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
         }]));
 
         let snap = hub.live_speeds_snapshot();
@@ -901,6 +993,8 @@ mod tests {
             queue_order: 0,
             referrer: String::new(),
             group_id: String::new(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
         }
     }
 

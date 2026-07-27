@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use sqlx::any::{AnyPoolOptions, AnyRow};
@@ -6,6 +6,7 @@ use sqlx::{AssertSqlSafe, Row};
 use thiserror::Error;
 
 use crate::model::{GroupInfo, MAIN_QUEUE_ID, QueueInfo, TaskInfo};
+use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
 
 #[derive(Error, Debug)]
 pub enum DbError {
@@ -143,6 +144,53 @@ CREATE TABLE IF NOT EXISTS link_devices (
     paired_at INTEGER NOT NULL DEFAULT 0,
     last_seen_at INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS rss_sources (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    auto_download INTEGER NOT NULL DEFAULT 1,
+    start_paused INTEGER NOT NULL DEFAULT 0,
+    queue_id TEXT NOT NULL DEFAULT '',
+    save_dir TEXT NOT NULL DEFAULT '',
+    interval_minutes INTEGER NOT NULL DEFAULT 30,
+    include_pattern TEXT NOT NULL DEFAULT '',
+    exclude_pattern TEXT NOT NULL DEFAULT '',
+    use_regex INTEGER NOT NULL DEFAULT 0,
+    smart_episode INTEGER NOT NULL DEFAULT 0,
+    size_min_bytes INTEGER NOT NULL DEFAULT 0,
+    size_max_bytes INTEGER NOT NULL DEFAULT 0,
+    send_referer INTEGER NOT NULL DEFAULT 1,
+    notify_on_download INTEGER NOT NULL DEFAULT 1,
+    max_per_fetch INTEGER NOT NULL DEFAULT 20,
+    cookies TEXT NOT NULL DEFAULT '',
+    user_agent TEXT NOT NULL DEFAULT '',
+    proxy_url TEXT NOT NULL DEFAULT '',
+    last_fetch_at INTEGER NOT NULL DEFAULT 0,
+    last_success_at INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    seeded INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS rss_items (
+    source_id TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    link TEXT NOT NULL DEFAULT '',
+    enclosure_url TEXT NOT NULL DEFAULT '',
+    enclosure_length INTEGER NOT NULL DEFAULT 0,
+    pub_date INTEGER NOT NULL DEFAULT 0,
+    fetched_at INTEGER NOT NULL DEFAULT 0,
+    status INTEGER NOT NULL DEFAULT 0,
+    task_id TEXT NOT NULL DEFAULT '',
+    episode_key TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_id, guid),
+    FOREIGN KEY (source_id) REFERENCES rss_sources(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rss_items_source ON rss_items(source_id, pub_date);
+CREATE INDEX IF NOT EXISTS idx_rss_items_episode ON rss_items(source_id, episode_key);
 ";
 
 /// 建表 DDL（PostgreSQL 方言）。
@@ -247,6 +295,53 @@ CREATE TABLE IF NOT EXISTS link_devices (
     paired_at BIGINT NOT NULL DEFAULT 0,
     last_seen_at BIGINT NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS rss_sources (
+    id TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1,
+    auto_download INTEGER NOT NULL DEFAULT 1,
+    start_paused INTEGER NOT NULL DEFAULT 0,
+    queue_id TEXT NOT NULL DEFAULT '',
+    save_dir TEXT NOT NULL DEFAULT '',
+    interval_minutes INTEGER NOT NULL DEFAULT 30,
+    include_pattern TEXT NOT NULL DEFAULT '',
+    exclude_pattern TEXT NOT NULL DEFAULT '',
+    use_regex INTEGER NOT NULL DEFAULT 0,
+    smart_episode INTEGER NOT NULL DEFAULT 0,
+    size_min_bytes BIGINT NOT NULL DEFAULT 0,
+    size_max_bytes BIGINT NOT NULL DEFAULT 0,
+    send_referer INTEGER NOT NULL DEFAULT 1,
+    notify_on_download INTEGER NOT NULL DEFAULT 1,
+    max_per_fetch INTEGER NOT NULL DEFAULT 20,
+    cookies TEXT NOT NULL DEFAULT '',
+    user_agent TEXT NOT NULL DEFAULT '',
+    proxy_url TEXT NOT NULL DEFAULT '',
+    last_fetch_at BIGINT NOT NULL DEFAULT 0,
+    last_success_at BIGINT NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    fail_count INTEGER NOT NULL DEFAULT 0,
+    seeded INTEGER NOT NULL DEFAULT 0,
+    position INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS rss_items (
+    source_id TEXT NOT NULL,
+    guid TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    link TEXT NOT NULL DEFAULT '',
+    enclosure_url TEXT NOT NULL DEFAULT '',
+    enclosure_length BIGINT NOT NULL DEFAULT 0,
+    pub_date BIGINT NOT NULL DEFAULT 0,
+    fetched_at BIGINT NOT NULL DEFAULT 0,
+    status INTEGER NOT NULL DEFAULT 0,
+    task_id TEXT NOT NULL DEFAULT '',
+    episode_key TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_id, guid),
+    FOREIGN KEY (source_id) REFERENCES rss_sources(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_rss_items_source ON rss_items(source_id, pub_date);
+CREATE INDEX IF NOT EXISTS idx_rss_items_episode ON rss_items(source_id, episode_key);
 ";
 
 /// SQLite 连接级 PRAGMA（在 `after_connect` 钩子中对每个新连接执行）。
@@ -293,10 +388,12 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
         queue_order: row.try_get("queue_order").unwrap_or(0),
         referrer: row.try_get("referrer").unwrap_or_default(),
         group_id: row.try_get("group_id").unwrap_or_default(),
+        rss_source_id: row.try_get("rss_source_id").unwrap_or_default(),
+        origin_url: row.try_get("origin_url").unwrap_or_default(),
     })
 }
 
-const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, referrer, group_id";
+const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, referrer, group_id, rss_source_id, origin_url";
 
 /// 把 `AnyRow` 映射为 [`GroupInfo`]。
 fn group_from_row(row: &AnyRow) -> Result<GroupInfo, sqlx::Error> {
@@ -473,6 +570,16 @@ impl Db {
         self.add_column_if_missing("tasks", "group_id", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing("tasks", "resolver_item", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        // RSS 订阅溯源：任务由哪条订阅自动创建（空 = 非 RSS 来源）。
+        // 反向回链在 `rss_items.task_id`，两侧都有是为了任一侧单独查询都
+        // 不必扫另一张表（任务详情「来源」行 / 条目流「已下载」跳转）。
+        self.add_column_if_missing("tasks", "rss_source_id", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        // 展示用原始来源链接。`.torrent` 文件任务的 `url` 是本地哨兵,
+        // 右键「复制下载链接」拿到的是 `torrent-file://local` 这种噪音;
+        // 有真实来源(RSS enclosure 直链)时写这里。空 = 回退 `url`。
+        self.add_column_if_missing("tasks", "origin_url", "TEXT NOT NULL DEFAULT ''")
             .await?;
         Ok(())
     }
@@ -2574,6 +2681,421 @@ impl Db {
             .await?;
         Ok(r.rows_affected() > 0)
     }
+
+    // -----------------------------------------------------------------------
+    // RSS subscription CRUD（`rss_sources` / `rss_items`）
+    // -----------------------------------------------------------------------
+
+    /// 插入一条订阅。`source.source_id` 由调用方生成（UUID）。
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # async fn run() -> Result<(), fluxdown_engine::db::DbError> {
+    /// use fluxdown_engine::db::Db;
+    /// use fluxdown_engine::rss::model::RssSourceInfo;
+    ///
+    /// let db = Db::connect("sqlite::memory:").await?;
+    /// db.insert_rss_source(&RssSourceInfo {
+    ///     source_id: "s1".to_string(),
+    ///     url: "https://mikanani.me/RSS/MyBangumi?token=x".to_string(),
+    ///     ..Default::default()
+    /// })
+    /// .await?;
+    /// assert_eq!(db.load_all_rss_sources().await?.len(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn insert_rss_source(&self, source: &RssSourceInfo) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO rss_sources (id, url, name, enabled, auto_download, start_paused, queue_id, save_dir, \
+             interval_minutes, include_pattern, exclude_pattern, use_regex, smart_episode, size_min_bytes, \
+             size_max_bytes, send_referer, notify_on_download, max_per_fetch, cookies, user_agent, proxy_url, \
+             last_fetch_at, last_success_at, last_error, fail_count, seeded, position) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, \
+             $21, $22, $23, $24, $25, $26, $27)",
+        )
+        .bind(&source.source_id)
+        .bind(&source.url)
+        .bind(&source.name)
+        .bind(i32::from(source.enabled))
+        .bind(i32::from(source.auto_download))
+        .bind(i32::from(source.start_paused))
+        .bind(&source.queue_id)
+        .bind(&source.save_dir)
+        .bind(source.interval_minutes)
+        .bind(&source.include_pattern)
+        .bind(&source.exclude_pattern)
+        .bind(i32::from(source.use_regex))
+        .bind(i32::from(source.smart_episode))
+        .bind(source.size_min_bytes)
+        .bind(source.size_max_bytes)
+        .bind(i32::from(source.send_referer))
+        .bind(i32::from(source.notify_on_download))
+        .bind(source.max_per_fetch)
+        .bind(&source.cookies)
+        .bind(&source.user_agent)
+        .bind(&source.proxy_url)
+        .bind(source.last_fetch_at)
+        .bind(source.last_success_at)
+        .bind(&source.last_error)
+        .bind(source.fail_count)
+        .bind(i32::from(source.seeded))
+        .bind(source.position)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 更新订阅的**用户可编辑字段**（运行态 `last_*`/`fail_count`/`seeded`
+    /// 不在此列，由 [`Self::set_rss_source_runtime`] 单独维护——否则一次
+    /// UI 保存会把正在进行的退避账本抹掉）。
+    pub async fn update_rss_source(&self, source: &RssSourceInfo) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE rss_sources SET url = $1, name = $2, enabled = $3, auto_download = $4, start_paused = $5, \
+             queue_id = $6, save_dir = $7, interval_minutes = $8, include_pattern = $9, exclude_pattern = $10, \
+             use_regex = $11, smart_episode = $12, size_min_bytes = $13, size_max_bytes = $14, send_referer = $15, \
+             notify_on_download = $16, max_per_fetch = $17, cookies = $18, user_agent = $19, proxy_url = $20 \
+             WHERE id = $21",
+        )
+        .bind(&source.url)
+        .bind(&source.name)
+        .bind(i32::from(source.enabled))
+        .bind(i32::from(source.auto_download))
+        .bind(i32::from(source.start_paused))
+        .bind(&source.queue_id)
+        .bind(&source.save_dir)
+        .bind(source.interval_minutes)
+        .bind(&source.include_pattern)
+        .bind(&source.exclude_pattern)
+        .bind(i32::from(source.use_regex))
+        .bind(i32::from(source.smart_episode))
+        .bind(source.size_min_bytes)
+        .bind(source.size_max_bytes)
+        .bind(i32::from(source.send_referer))
+        .bind(i32::from(source.notify_on_download))
+        .bind(source.max_per_fetch)
+        .bind(&source.cookies)
+        .bind(&source.user_agent)
+        .bind(&source.proxy_url)
+        .bind(&source.source_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 抓取结束后回写运行态（成功/失败共用一条 UPDATE，避免两次写）。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set_rss_source_runtime(
+        &self,
+        id: &str,
+        last_fetch_at: i64,
+        last_success_at: i64,
+        last_error: &str,
+        fail_count: i32,
+        seeded: bool,
+        name: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE rss_sources SET last_fetch_at = $1, last_success_at = $2, last_error = $3, \
+             fail_count = $4, seeded = $5, name = $6 WHERE id = $7",
+        )
+        .bind(last_fetch_at)
+        .bind(last_success_at)
+        .bind(last_error)
+        .bind(fail_count)
+        .bind(i32::from(seeded))
+        .bind(name)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 删除订阅及其全部条目。**已创建的下载任务不删**（§2.2），只把任务上的
+    /// 溯源指针清空，避免详情面板指向一条不存在的订阅。
+    pub async fn delete_rss_source(&self, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("UPDATE tasks SET rss_source_id = '' WHERE rss_source_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM rss_items WHERE source_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM rss_sources WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 载入全部订阅（按 `position` 排序），顺带算出侧边栏 badge 用的未读
+    /// 计数（`unread_count`）——与配置同批返回，避免 UI 两段式闪烁。
+    pub async fn load_all_rss_sources(&self) -> Result<Vec<RssSourceInfo>, DbError> {
+        let rows = sqlx::query(
+            "SELECT s.id, s.url, s.name, s.enabled, s.auto_download, s.start_paused, s.queue_id, s.save_dir, \
+             s.interval_minutes, s.include_pattern, s.exclude_pattern, s.use_regex, s.smart_episode, \
+             s.size_min_bytes, s.size_max_bytes, s.send_referer, s.notify_on_download, s.max_per_fetch, \
+             s.cookies, s.user_agent, s.proxy_url, s.last_fetch_at, s.last_success_at, s.last_error, \
+             s.fail_count, s.seeded, s.position, \
+             CAST((SELECT COUNT(*) FROM rss_items i WHERE i.source_id = s.id AND i.status = 0) AS BIGINT) AS unread \
+             FROM rss_sources s ORDER BY s.position ASC, s.id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut sources = Vec::with_capacity(rows.len());
+        for row in &rows {
+            sources.push(RssSourceInfo {
+                source_id: row.try_get("id")?,
+                url: row.try_get("url")?,
+                name: row.try_get("name")?,
+                enabled: row.try_get::<i32, _>("enabled").unwrap_or(1) != 0,
+                auto_download: row.try_get::<i32, _>("auto_download").unwrap_or(1) != 0,
+                start_paused: row.try_get::<i32, _>("start_paused").unwrap_or(0) != 0,
+                queue_id: row.try_get("queue_id").unwrap_or_default(),
+                save_dir: row.try_get("save_dir").unwrap_or_default(),
+                interval_minutes: row.try_get("interval_minutes").unwrap_or(30),
+                include_pattern: row.try_get("include_pattern").unwrap_or_default(),
+                exclude_pattern: row.try_get("exclude_pattern").unwrap_or_default(),
+                use_regex: row.try_get::<i32, _>("use_regex").unwrap_or(0) != 0,
+                smart_episode: row.try_get::<i32, _>("smart_episode").unwrap_or(0) != 0,
+                size_min_bytes: row.try_get("size_min_bytes").unwrap_or(0),
+                size_max_bytes: row.try_get("size_max_bytes").unwrap_or(0),
+                send_referer: row.try_get::<i32, _>("send_referer").unwrap_or(1) != 0,
+                notify_on_download: row.try_get::<i32, _>("notify_on_download").unwrap_or(1) != 0,
+                max_per_fetch: row.try_get("max_per_fetch").unwrap_or(20),
+                cookies: row.try_get("cookies").unwrap_or_default(),
+                user_agent: row.try_get("user_agent").unwrap_or_default(),
+                proxy_url: row.try_get("proxy_url").unwrap_or_default(),
+                last_fetch_at: row.try_get("last_fetch_at").unwrap_or(0),
+                last_success_at: row.try_get("last_success_at").unwrap_or(0),
+                last_error: row.try_get("last_error").unwrap_or_default(),
+                fail_count: row.try_get("fail_count").unwrap_or(0),
+                seeded: row.try_get::<i32, _>("seeded").unwrap_or(0) != 0,
+                position: row.try_get("position").unwrap_or(0),
+                unread_count: row.try_get::<i64, _>("unread").unwrap_or(0) as i32,
+            });
+        }
+        Ok(sources)
+    }
+
+    /// 新订阅的排序位（现有最大值 +1）。
+    pub async fn next_rss_position(&self) -> Result<i32, DbError> {
+        let next: i64 = sqlx::query_scalar(
+            "SELECT CAST(COALESCE(MAX(position), -1) + 1 AS BIGINT) FROM rss_sources",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(next as i32)
+    }
+
+    /// 一个订阅中**待派发**的条目：`status = New`，按发布时间**从旧到新**取
+    /// 前 `limit` 条。
+    ///
+    /// 从旧到新是刻意的：单轮上限（`max_per_fetch`）把超额条目留在 New 状态
+    /// 等下一轮，若按新→旧取，积压的老条目会被后来的新条目永久插队饿死。
+    pub async fn rss_dispatchable_items(
+        &self,
+        source_id: &str,
+        limit: i32,
+    ) -> Result<Vec<RssItemInfo>, DbError> {
+        let rows = sqlx::query(
+            "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
+             status, task_id, episode_key, reason FROM rss_items WHERE source_id = $1 AND status = 0 \
+             ORDER BY pub_date ASC, fetched_at ASC, guid ASC LIMIT $2",
+        )
+        .bind(source_id)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(rss_item_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    /// 一个订阅的条目流（新→旧，最多 `limit` 条）。
+    pub async fn load_rss_items(
+        &self,
+        source_id: &str,
+        limit: i32,
+    ) -> Result<Vec<RssItemInfo>, DbError> {
+        let rows = sqlx::query(
+            "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
+             status, task_id, episode_key, reason FROM rss_items WHERE source_id = $1 \
+             ORDER BY pub_date DESC, fetched_at DESC, guid ASC LIMIT $2",
+        )
+        .bind(source_id)
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(rss_item_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    /// 单条目（手动下载/忽略前的存在性检查）。
+    pub async fn rss_item(
+        &self,
+        source_id: &str,
+        guid: &str,
+    ) -> Result<Option<RssItemInfo>, DbError> {
+        let items = sqlx::query(
+            "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
+             status, task_id, episode_key, reason FROM rss_items WHERE source_id = $1 AND guid = $2",
+        )
+        .bind(source_id)
+        .bind(guid)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = items else { return Ok(None) };
+        Ok(Some(rss_item_from_row(&row)?))
+    }
+
+    /// 该源已入库的全部 guid（去重判定的第一层）。
+    pub async fn rss_known_guids(&self, source_id: &str) -> Result<HashSet<String>, DbError> {
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT guid FROM rss_items WHERE source_id = $1")
+                .bind(source_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 该源**已被占用**的剧集键（智能剧集去重的第二层）。
+    ///
+    /// 占键的只有 `New`（已通过规则、等待派发）与 `Downloaded`（已建任务）
+    /// 两态：被判重的输家、被过滤的、被手动忽略的都不占——否则一次误判会
+    /// 永久锁死这一集，而用户手动「忽略」某个字幕组版本后也该允许别的版本
+    /// 补位。
+    pub async fn rss_taken_episode_keys(
+        &self,
+        source_id: &str,
+    ) -> Result<HashSet<String>, DbError> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT episode_key FROM rss_items WHERE source_id = $1 AND episode_key <> '' AND status IN (0, 1)",
+        )
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().collect())
+    }
+
+    /// 批量落库新条目（已存在的 guid 原样保留——同 guid 内容变化不重下，
+    /// guid 即身份，§2.2）。返回实际插入的行数。
+    pub async fn insert_rss_items(&self, items: &[RssItemInfo]) -> Result<u64, DbError> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut inserted = 0u64;
+        for item in items {
+            let r = sqlx::query(
+                "INSERT INTO rss_items (source_id, guid, title, link, enclosure_url, enclosure_length, \
+                 pub_date, fetched_at, status, task_id, episode_key, reason) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                 ON CONFLICT (source_id, guid) DO NOTHING",
+            )
+            .bind(&item.source_id)
+            .bind(&item.guid)
+            .bind(&item.title)
+            .bind(&item.link)
+            .bind(&item.enclosure_url)
+            .bind(item.enclosure_length)
+            .bind(item.pub_date)
+            .bind(item.fetched_at)
+            .bind(item.status.as_i32())
+            .bind(&item.task_id)
+            .bind(&item.episode_key)
+            .bind(&item.reason)
+            .execute(&mut *tx)
+            .await?;
+            inserted += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// 改写单条目的处置结果。
+    pub async fn set_rss_item_status(
+        &self,
+        source_id: &str,
+        guid: &str,
+        status: RssItemStatus,
+        reason: &str,
+        task_id: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE rss_items SET status = $1, reason = $2, task_id = $3 WHERE source_id = $4 AND guid = $5",
+        )
+        .bind(status.as_i32())
+        .bind(reason)
+        .bind(task_id)
+        .bind(source_id)
+        .bind(guid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 把该源全部「新」条目标记为已忽略（工具条「全部标记已读」）。
+    /// 返回受影响行数。
+    pub async fn mark_all_rss_items_read(&self, source_id: &str) -> Result<u64, DbError> {
+        let r = sqlx::query("UPDATE rss_items SET status = $1 WHERE source_id = $2 AND status = 0")
+            .bind(RssItemStatus::Ignored.as_i32())
+            .bind(source_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 条目保留策略：每源只留最近 `keep` 条，超量的**非已下载**条目按发布/
+    /// 抓取时间淘汰最旧的（已下载条目是任务溯源的锚，永不淘汰）。
+    pub async fn prune_rss_items(&self, source_id: &str, keep: i32) -> Result<u64, DbError> {
+        let r = sqlx::query(
+            "DELETE FROM rss_items WHERE source_id = $1 AND status <> 1 AND guid NOT IN ( \
+             SELECT guid FROM rss_items WHERE source_id = $1 \
+             ORDER BY pub_date DESC, fetched_at DESC, guid ASC LIMIT $2)",
+        )
+        .bind(source_id)
+        .bind(keep.max(1))
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// 打上任务的 RSS 溯源指针。
+    pub async fn set_task_rss_source(&self, task_id: &str, source_id: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET rss_source_id = $1 WHERE id = $2")
+            .bind(source_id)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 读任务的 RSS 溯源指针（空 = 非 RSS 来源）。
+    pub async fn task_rss_source(&self, task_id: &str) -> Result<String, DbError> {
+        let v: Option<String> = sqlx::query_scalar("SELECT rss_source_id FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(v.unwrap_or_default())
+    }
+
+    /// 写入展示用的原始来源链接（`url` 被换成本地哨兵时的补偿）。
+    pub async fn set_task_origin_url(&self, task_id: &str, origin: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET origin_url = $1 WHERE id = $2")
+            .bind(origin)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 pub struct SegmentInfo {
@@ -2606,6 +3128,24 @@ fn link_device_from_row(row: &AnyRow) -> Result<LinkDeviceRow, sqlx::Error> {
         candidates_json: row.try_get("candidates")?,
         paired_at: row.try_get("paired_at")?,
         last_seen_at: row.try_get("last_seen_at")?,
+    })
+}
+
+/// 把 `AnyRow` 映射为 [`RssItemInfo`]（三处条目查询共用，列清单必须一致）。
+fn rss_item_from_row(row: &AnyRow) -> Result<RssItemInfo, sqlx::Error> {
+    Ok(RssItemInfo {
+        source_id: row.try_get("source_id")?,
+        guid: row.try_get("guid")?,
+        title: row.try_get("title").unwrap_or_default(),
+        link: row.try_get("link").unwrap_or_default(),
+        enclosure_url: row.try_get("enclosure_url").unwrap_or_default(),
+        enclosure_length: row.try_get("enclosure_length").unwrap_or(0),
+        pub_date: row.try_get("pub_date").unwrap_or(0),
+        fetched_at: row.try_get("fetched_at").unwrap_or(0),
+        status: RssItemStatus::from_i32(row.try_get("status").unwrap_or(0)),
+        task_id: row.try_get("task_id").unwrap_or_default(),
+        episode_key: row.try_get("episode_key").unwrap_or_default(),
+        reason: row.try_get("reason").unwrap_or_default(),
     })
 }
 

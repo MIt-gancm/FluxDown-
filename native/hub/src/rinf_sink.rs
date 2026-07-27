@@ -324,6 +324,40 @@ impl EventSink for RinfEventSink {
                 }
                 .send_signal_to_dart();
             }
+            EngineEvent::RssSourcesChanged(sources) => {
+                signals::AllRssSources {
+                    sources: sources.into_iter().map(Into::into).collect(),
+                }
+                .send_signal_to_dart();
+            }
+            EngineEvent::RssItemsChanged {
+                source_id,
+                items,
+                notify_titles,
+            } => {
+                signals::RssItemsSnapshot {
+                    source_id,
+                    items: items.into_iter().map(Into::into).collect(),
+                    notify_titles,
+                }
+                .send_signal_to_dart();
+            }
+            EngineEvent::RssFeedValidated {
+                request_id,
+                url,
+                feed_title,
+                items,
+                error,
+            } => {
+                signals::RssValidateResult {
+                    request_id,
+                    url,
+                    feed_title,
+                    items: items.into_iter().map(Into::into).collect(),
+                    error,
+                }
+                .send_signal_to_dart();
+            }
             // `#[non_exhaustive]`：未来新增变体默认丢弃并记录日志，而非编译失败。
             _ => {
                 crate::logger::log_info!(

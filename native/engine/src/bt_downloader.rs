@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
 use crate::downloader::{DownloadError, ProgressUpdate, SegmentProgressInfo};
-use crate::logger::log_info;
+use crate::logger::{log_error, log_info};
 use crate::model::{BtFileEntry, TorrentMetaResult};
 use crate::selection::{HostSelection, SelectionOutcome};
 
@@ -514,61 +514,112 @@ impl SharedBtSession {
 
         let save_dir = default_save_dir.to_owned();
         let save_dir_for_cleanup = save_dir.clone();
-        let session = rt
-            .block_on(async {
-                let opts = SessionOptions {
-                    disable_dht: !enable_dht,
-                    disable_dht_persistence: !enable_dht,
-                    // Pin the DHT routing-table file inside our app-private data
-                    // directory. librqbit's default resolves a system config/cache
-                    // dir (via `directories`), which FAILS on Android (no XDG dirs)
-                    // and surfaces as "BT session init failed: error initializing
-                    // persistent DHT". Providing an explicit path makes it work on
-                    // every platform and keeps DHT state next to session.json.
-                    dht_config: Some(librqbit::dht::PersistentDhtConfig {
-                        config_filename: Some(persistence_folder.join("dht.json")),
-                        ..Default::default()
-                    }),
-                    listen_port_range: Some(port_start..port_end.saturating_add(1)),
-                    enable_upnp_port_forwarding: enable_upnp,
-                    trackers,
-                    ratelimits: librqbit::limits::LimitsConfig {
-                        download_bps,
-                        upload_bps: None,
-                    },
-                    // Optimised peer connection parameters.
-                    peer_opts: Some(PeerConnectionOptions {
-                        // Slightly shorter connect timeout — drop unresponsive
-                        // peers faster so we can try others sooner.
-                        connect_timeout: Some(Duration::from_secs(10)),
-                        // Generous read/write timeout to avoid dropping slow
-                        // but otherwise healthy peers.
-                        read_write_timeout: Some(Duration::from_secs(20)),
-                        ..Default::default()
-                    }),
-                    // Enable persistence so that session.json and per-torrent
-                    // .bitv (piece bitfield) files are written to disk.
-                    persistence: Some(SessionPersistenceConfig::Json {
-                        folder: Some(persistence_folder.clone()),
-                    }),
-                    // Fast-resume: persist piece completion state so that
-                    // paused/restarted torrents can skip re-verification.
-                    // Requires `persistence` to be set to take effect.
-                    fastresume: true,
-                    // Buffer writes in memory before flushing to disk.  Reduces
-                    // I/O contention from many small pieces.  64 MiB is enough
-                    // for high-speed connections while keeping RSS reasonable
-                    // (was 128 — saved ~64 MB of potential RSS).
-                    defer_writes_up_to: Some(64),
-                    // Limit concurrent torrent initialisation to 3 to prevent
-                    // DHT/tracker storms when many BT tasks start at once.
-                    concurrent_init_limit: Some(3),
-                    ..Default::default()
-                };
+        let dht_config_path = persistence_folder.join("dht.json");
+        let build_opts = |dht: bool| SessionOptions {
+            disable_dht: !dht,
+            disable_dht_persistence: !dht,
+            // Pin the DHT routing-table file inside our app-private data
+            // directory. librqbit's default resolves a system config/cache
+            // dir (via `directories`), which FAILS on Android (no XDG dirs)
+            // and surfaces as "BT session init failed: error initializing
+            // persistent DHT". Providing an explicit path makes it work on
+            // every platform and keeps DHT state next to session.json.
+            dht_config: Some(librqbit::dht::PersistentDhtConfig {
+                config_filename: Some(dht_config_path.clone()),
+                ..Default::default()
+            }),
+            listen_port_range: Some(port_start..port_end.saturating_add(1)),
+            enable_upnp_port_forwarding: enable_upnp,
+            trackers: trackers.clone(),
+            ratelimits: librqbit::limits::LimitsConfig {
+                download_bps,
+                upload_bps: None,
+            },
+            // Optimised peer connection parameters.
+            peer_opts: Some(PeerConnectionOptions {
+                // Slightly shorter connect timeout — drop unresponsive
+                // peers faster so we can try others sooner.
+                connect_timeout: Some(Duration::from_secs(10)),
+                // Generous read/write timeout to avoid dropping slow
+                // but otherwise healthy peers.
+                read_write_timeout: Some(Duration::from_secs(20)),
+                ..Default::default()
+            }),
+            // Enable persistence so that session.json and per-torrent
+            // .bitv (piece bitfield) files are written to disk.
+            persistence: Some(SessionPersistenceConfig::Json {
+                folder: Some(persistence_folder.clone()),
+            }),
+            // Fast-resume: persist piece completion state so that
+            // paused/restarted torrents can skip re-verification.
+            // Requires `persistence` to be set to take effect.
+            fastresume: true,
+            // Buffer writes in memory before flushing to disk.  Reduces
+            // I/O contention from many small pieces.  64 MiB is enough
+            // for high-speed connections while keeping RSS reasonable
+            // (was 128 — saved ~64 MB of potential RSS).
+            defer_writes_up_to: Some(64),
+            // Limit concurrent torrent initialisation to 3 to prevent
+            // DHT/tracker storms when many BT tasks start at once.
+            concurrent_init_limit: Some(3),
+            ..Default::default()
+        };
 
-                Session::new_with_opts(save_dir.into(), opts).await
-            })
-            .map_err(|e| DownloadError::Other(format!("BT session init failed: {e}")))?;
+        // 降级阶梯：DHT 状态是**纯缓存**，绝不该让它把整个 BT 子系统锁死。
+        //
+        // 现场事故：一份 7 月写下的 `dht.json`（里面钉着 `addr: 0.0.0.0:58686`）
+        // 让 `Session::new_with_opts` 每次都返回 "error initializing persistent
+        // DHT"，于是**所有** BT 任务——包括 RSS 订阅自动建出来的——全部 status=4，
+        // 用户只看到「点了下载但任务没启动」，且自己永远修不好（没人会想到去删
+        // 一个 AppData 深处的 json）。
+        //
+        // 三级兜底，每级都留日志：
+        //   1. 带持久化 DHT 正常启动；
+        //   2. 失败 → 删掉 `dht.json` 重试一次（路由表会在几秒内重新引导）；
+        //   3. 仍失败 → 彻底关掉 DHT 启动（tracker + PEX 依然可用）。
+        // 只有第 3 级也失败才真的报错——那时问题必然不在 DHT。
+        //
+        // 错误一律用 `{e:#}` 而非 `{e}`：anyhow 的 `Display` 只打最外层 context，
+        // 真正的根因（bind 失败/权限/解析）会被静默吞掉，正是这次排查最大的阻碍。
+        let session = match rt.block_on(Session::new_with_opts(
+            save_dir.clone().into(),
+            build_opts(enable_dht),
+        )) {
+            Ok(s) => s,
+            Err(first) if enable_dht => {
+                log_error!(
+                    "[BT] session init failed with persisted DHT: {first:#} — dropping {} and retrying",
+                    dht_config_path.display()
+                );
+                let _ = std::fs::remove_file(&dht_config_path);
+                match rt.block_on(Session::new_with_opts(
+                    save_dir.clone().into(),
+                    build_opts(true),
+                )) {
+                    Ok(s) => {
+                        log_info!("[BT] session init recovered after resetting DHT state");
+                        s
+                    }
+                    Err(second) => {
+                        log_error!(
+                            "[BT] session init still failing with a fresh DHT: {second:#} — falling back to DHT-off (trackers + PEX only)"
+                        );
+                        rt.block_on(Session::new_with_opts(
+                            save_dir.clone().into(),
+                            build_opts(false),
+                        ))
+                        .map_err(|e| {
+                            DownloadError::Other(format!("BT session init failed: {e:#}"))
+                        })?
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(DownloadError::Other(format!(
+                    "BT session init failed: {e:#}"
+                )));
+            }
+        };
 
         // Scan save_dir for leftover staging dirs from earlier in this app
         // session (e.g. a cancelled add whose `cleanup_stage` was skipped).

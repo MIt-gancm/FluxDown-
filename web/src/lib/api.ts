@@ -12,6 +12,7 @@ import type {
   CreateGroupResponse,
   CreateQueueRequest,
   CreateTaskRequest,
+  CreatedRssSource,
   CreatedTask,
   FsListResponse,
   GroupDto,
@@ -28,6 +29,11 @@ import type {
   ResolvePreviewResponse,
   QueueOrderRequest,
   QueueScheduleRequest,
+  RssItemActionRequest,
+  RssItemDto,
+  RssSourceDto,
+  RssValidateRequest,
+  RssValidateResponse,
   StatsResponse,
   TaskDto,
   TokenResponse,
@@ -135,6 +141,21 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ taskIds } satisfies QueueOrderRequest),
     }),
+
+  // RSS 订阅：条目流单独走 ['rss-items', sourceId] 缓存（WS rssItemsChanged 直接整表替换）。
+  listRssSources: () => apiFetch<RssSourceDto[]>('/api/v1/rss'),
+  createRssSource: (req: RssSourceDto) =>
+    apiFetch<CreatedRssSource>('/api/v1/rss', { method: 'POST', body: JSON.stringify(req) }),
+  updateRssSource: (id: string, req: RssSourceDto) =>
+    apiFetch<unknown>(`/api/v1/rss/${id}`, { method: 'PUT', body: JSON.stringify(req) }),
+  deleteRssSource: (id: string) => apiFetch<unknown>(`/api/v1/rss/${id}`, { method: 'DELETE' }),
+  refreshRssSource: (id: string) => apiFetch<unknown>(`/api/v1/rss/${id}/refresh`, { method: 'POST' }),
+  listRssItems: (id: string) => apiFetch<RssItemDto[]>(`/api/v1/rss/${id}/items`),
+  rssItemAction: (id: string, req: RssItemActionRequest) =>
+    apiFetch<unknown>(`/api/v1/rss/${id}/items/action`, { method: 'POST', body: JSON.stringify(req) }),
+  // 抓取失败不是 HTTP 错误：仍返回 200，失败原因在 error 字段（这是一次诊断调用）。
+  validateRssFeed: (req: RssValidateRequest) =>
+    apiFetch<RssValidateResponse>('/api/v1/rss/validate', { method: 'POST', body: JSON.stringify(req) }),
 
   getConfig: () => apiFetch<ConfigMap>('/api/v1/config'),
   putConfig: (entries: ConfigMap) =>

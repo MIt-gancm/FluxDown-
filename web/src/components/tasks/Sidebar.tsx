@@ -5,7 +5,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import * as Dialog from '@radix-ui/react-dialog'
-import { Archive, ArrowUpCircle, FileText, Image as ImageIcon, LayoutGrid, List, LogOut, Film, Monitor, Music, MessageCircle, File as FileIcon, Package2, Pause, Play, Plus, Smartphone, Trash2, X } from 'lucide-react'
+import { Archive, ArrowUpCircle, FileText, Image as ImageIcon, LayoutGrid, List, Loader2, LogOut, Film, Monitor, Music, MessageCircle, File as FileIcon, Package2, Pause, Play, Plus, RefreshCw, Radio, Smartphone, Trash2, X } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { api } from '../../lib/api'
 import { cloudApi } from '../../lib/cloud/client'
@@ -14,13 +14,23 @@ import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
 import { linkApi } from '../../lib/link'
 import { clearCredentials, getBase } from '../../lib/auth'
 import { cn } from '../../lib/cn'
-import { fileType, fmtSpeed, queueDisplayName, typeLabel, TYPE_ORDER, type FileType as FT } from '../../lib/format'
+import { fileType, fmtSpeed, fmtTime, queueDisplayName, typeLabel, TYPE_ORDER, type FileType as FT } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
 import { connStore, disconnectWs, useGlobalSpeed, useStore } from '../../lib/ws'
 import { useUpdateCheck } from '../../lib/update'
 import { confirmDialog } from '../../lib/confirm'
+import { sourceDisplayName } from '../../lib/rss-filter'
+import type { RssSourceDto } from '../../lib/types'
+import {
+  beginRssFetch,
+  useDeleteRssSourceMutation,
+  useRefreshRssSourceMutation,
+  useRssFetching,
+  useRssSourcesQuery,
+} from '../../hooks/useRss'
 import { useTasksUi } from './context'
 import { QueueManagerDialog } from './queue-manager-dialog'
+import { RssCreateDialog, RssManagerDialog } from './rss-manager-dialog'
 import { useViewTasks } from './useViewTasks'
 
 const TYPE_ICONS: Record<'all' | FT, LucideIcon> = {
@@ -38,13 +48,14 @@ export function Sidebar() {
   const { t } = useI18n()
   const tasks = useViewTasks()
   const { data: queues = [] } = useQuery({ queryKey: ['queues'], queryFn: api.listQueues })
-  const { typeFilter, setTypeFilter, queueFilter, setQueueFilter, deviceFilter, setDeviceFilter, sidebarOpen, setSidebarOpen } = useTasksUi()
+  const { typeFilter, setTypeFilter, queueFilter, setQueueFilter, deviceFilter, setDeviceFilter, setRssFilter, sidebarOpen, setSidebarOpen } = useTasksUi()
   const speed = useGlobalSpeed()
   const conn = useStore(connStore)
   const update = useUpdateCheck()
   const qc = useQueryClient()
   const navigate = useNavigate()
   const [logoutOpen, setLogoutOpen] = useState(false)
+  const [rssCreateOpen, setRssCreateOpen] = useState(false)
   const session = useCloudSession()
   const showDeviceOverride = useShowDeviceSync()
   const myDeviceId = cloudDeviceId()
@@ -93,6 +104,7 @@ export function Sidebar() {
     mutationFn: (id: string) => api.stopQueue(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['queues'] }),
   })
+  const { data: rssSources = [] } = useRssSourcesQuery()
 
   function addQueue() {
     const name = window.prompt(t('sidebar.newQueuePrompt'))
@@ -142,7 +154,7 @@ export function Sidebar() {
             const Icon = TYPE_ICONS[k]
             const count = k === 'all' ? tasks.length : tasks.filter((t) => fileType(t.fileName, t.url) === k).length
             return (
-              <button key={k} type="button" className={cn('side-item', typeFilter === k && 'active')} onClick={() => { setTypeFilter(k); setSidebarOpen(false) }}>
+              <button key={k} type="button" className={cn('side-item', typeFilter === k && 'active')} onClick={() => { setTypeFilter(k); setRssFilter(null); setSidebarOpen(false) }}>
                 <Icon size={15} />
                 <span>{typeLabel(k)}</span>
                 <em>{count || ''}</em>
@@ -153,7 +165,7 @@ export function Sidebar() {
 
         {showDeviceSection && (
           <>
-            <p className="side-label">设备</p>
+            <p className="side-label">{t('sidebar.devices')}</p>
             <nav className="side-nav">
               <button
                 type="button"
@@ -161,7 +173,7 @@ export function Sidebar() {
                 onClick={() => { setDeviceFilter(null); setSidebarOpen(false) }}
               >
                 <Monitor size={15} />
-                <span>全部设备</span>
+                <span>{t('sidebar.allDevices')}</span>
               </button>
               <button
                 type="button"
@@ -169,7 +181,7 @@ export function Sidebar() {
                 onClick={() => { setDeviceFilter(myDeviceId); setSidebarOpen(false) }}
               >
                 <Monitor size={15} />
-                <i className="queue-dot on" title="在线" />
+                <i className="queue-dot on" title={t('link.online')} />
                 <span>{t('cloud.deviceCurrent')}</span>
                 <em>{tasks.length || ''}</em>
               </button>
@@ -184,7 +196,7 @@ export function Sidebar() {
                     onClick={() => { setDeviceFilter(d.deviceId); setSidebarOpen(false) }}
                   >
                     <Icon size={15} />
-                    <i className={cn('queue-dot', d.isOnline && 'on')} title={d.isOnline ? '在线' : '离线'} />
+                    <i className={cn('queue-dot', d.isOnline && 'on')} title={d.isOnline ? t('link.online') : t('link.offline')} />
                     <span>{d.name || '-'}</span>
                     <em>{count || ''}</em>
                   </button>
@@ -228,7 +240,7 @@ export function Sidebar() {
                 <button
                   type="button"
                   className={cn('side-item', queueFilter === q.queueId && 'active')}
-                  onClick={() => { setQueueFilter((f) => (f === q.queueId ? 'all' : q.queueId)); setSidebarOpen(false) }}
+                  onClick={() => { setQueueFilter((f) => (f === q.queueId ? 'all' : q.queueId)); setRssFilter(null); setSidebarOpen(false) }}
                 >
                   <List size={15} />
                   <i
@@ -270,6 +282,18 @@ export function Sidebar() {
               </div>
             )
           })}
+        </nav>
+
+        <p className="side-label row">
+          {t('sidebar.rss')}
+          <button type="button" className="side-add" title={t('rss.newSource')} onClick={() => setRssCreateOpen(true)}>
+            <Plus size={13} />
+          </button>
+        </p>
+        <nav className="side-nav">
+          {rssSources.map((s) => (
+            <RssSourceRow key={s.sourceId} source={s} />
+          ))}
         </nav>
       </div>
 
@@ -330,6 +354,68 @@ export function Sidebar() {
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>
+
+      <RssCreateDialog open={rssCreateOpen} onOpenChange={setRssCreateOpen} />
     </aside>
+  )
+}
+
+/** 单条 RSS 订阅行。抽成组件是因为「抓取中」状态是**每源**的，只有独立组件才能
+ *  各自订阅 useRssFetching。 */
+function RssSourceRow({ source: s }: { source: RssSourceDto }) {
+  const { t } = useI18n()
+  const { rssFilter, setRssFilter, setSidebarOpen } = useTasksUi()
+  const refreshRss = useRefreshRssSourceMutation()
+  const deleteRss = useDeleteRssSourceMutation()
+  const fetching = useRssFetching(s.sourceId) || refreshRss.isPending
+  const displayName = sourceDisplayName(s)
+  // 错误态优先于启用态：连续失败的订阅用警告色圆点顶出来，tooltip 给出
+  // 失败原因 + 上次成功时间（否则用户只会看到「计数不涨」而不知为何）。
+  const errTip = s.lastError
+    ? `${s.lastError}\n${s.lastSuccessAt > 0 ? t('rss.lastSuccessAt', { time: fmtTime(s.lastSuccessAt) }) : t('rss.neverFetched')}`
+    : ''
+
+  return (
+    <div className={cn('queue-row', fetching && 'rss-busy')}>
+      <button
+        type="button"
+        className={cn('side-item', rssFilter === s.sourceId && 'active')}
+        onClick={() => { setRssFilter((f) => (f === s.sourceId ? null : s.sourceId)); setSidebarOpen(false) }}
+      >
+        <Radio size={15} />
+        <i
+          className={cn('queue-dot', s.lastError ? 'warn' : s.enabled && 'on')}
+          title={errTip || (s.enabled ? t('rss.stateEnabled') : t('rss.stateDisabled'))}
+        />
+        <span title={errTip || displayName}>{displayName}</span>
+        <em>{s.unreadCount || ''}</em>
+      </button>
+      <div className="queue-actions">
+        <button
+          type="button"
+          className="icon-btn sm"
+          title={fetching ? t('rss.refreshing') : t('rss.refreshNow')}
+          disabled={fetching}
+          onClick={(e) => { e.stopPropagation(); beginRssFetch(s.sourceId, s.lastFetchAt); refreshRss.mutate(s.sourceId) }}
+        >
+          {fetching ? <Loader2 size={13} className="animate-spin" /> : <RefreshCw size={13} />}
+        </button>
+        <RssManagerDialog source={s} />
+        <button
+          type="button"
+          className="icon-btn sm"
+          title={t('rss.deleteSource')}
+          onClick={async (e) => {
+            e.stopPropagation()
+            if (await confirmDialog({ title: t('rss.deleteSource'), message: t('rss.deleteSourceMsg', { name: displayName }), danger: true })) {
+              if (rssFilter === s.sourceId) setRssFilter(null)
+              deleteRss.mutate(s.sourceId)
+            }
+          }}
+        >
+          <Trash2 size={13} />
+        </button>
+      </div>
+    </div>
   )
 }

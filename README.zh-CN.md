@@ -44,7 +44,7 @@
 | **速度控制** | Token bucket 全局限速 —— 后台下载不影响正常上网 |
 | **随处续传** | 每个字节都记录在 SQLite（WAL 模式），断电也不丢进度 |
 | **浏览器集成** | 三层下载拦截、流媒体资源嗅探、Alt+Click 绕过、右键发送 |
-| **MCP 服务器** | 内置 Model Context Protocol 端点（Streamable HTTP），9 个工具 —— AI 智能体可新建、监控、控制下载 |
+| **MCP 服务器** | 内置 Model Context Protocol 端点（Streamable HTTP），12 个工具 —— AI 智能体可新建、监控、控制下载 |
 | **精美界面** | shadcn 风格组件、IDM 式分段可视化、命名队列、系统托盘 |
 | **干净纯粹** | 零广告、零追踪、无账号 —— 数据完全留在本地 |
 
@@ -90,7 +90,7 @@ FluxDown 内置 **MCP 服务器**，AI 智能体（Claude Desktop、Cursor、Cli
 - **鉴权**：Bearer token（`Authorization: Bearer <token>` 或 `X-FluxDown-Token`），与管理 API 共用
 - **开启方式**：设置 → API 服务 → 打开 *MCP 端点*（自动生成 token）；headless 服务器默认开启
 
-### 工具（9 个）
+### 工具（12 个）
 
 | 工具 | 说明 |
 |---|---|
@@ -101,6 +101,9 @@ FluxDown 内置 **MCP 服务器**，AI 智能体（Claude Desktop、Cursor、Cli
 | `download_pause_all` / `download_resume_all` | 暂停 / 恢复全部任务 |
 | `download_remove` | 删除任务，可选同时删除磁盘文件 |
 | `queue_list` | 列出命名队列及其配置 |
+| `rss_list` | 列出 RSS 订阅及其配置与运行态 |
+| `rss_add` | 新增 RSS 订阅并开始定期抓取 |
+| `rss_remove` | 删除 RSS 订阅及其已收集条目 |
 
 ### 客户端配置
 

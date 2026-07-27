@@ -334,6 +334,12 @@ pub struct TaskInfo {
     /// 所属任务组 ID（空 = 不属于任何组）。
     #[serde(default)]
     pub group_id: String,
+    /// 由哪条 RSS 订阅自动创建（空 = 非 RSS 来源），任务详情「来源」行用。
+    #[serde(default)]
+    pub rss_source_id: String,
+    /// 展示用原始来源链接（空 = 用 `url`）。`.torrent` 任务的 `url` 是本地哨兵。
+    #[serde(default)]
+    pub origin_url: String,
 }
 
 /// 文件跟踪：一批已完成任务的「文件已丢失」标志变化（Rust → Dart）。
@@ -606,20 +612,27 @@ pub struct FileAssociationStatus {
 
 // ========== URL protocol signals ==========
 
-/// Set or remove `fluxdown://` URL protocol registration (Dart → Rust).
+/// Set or remove a URL scheme registration (Dart → Rust).
+///
+/// `scheme` is a bare scheme token (`"fluxdown"` / `"ed2k"`) resolved against
+/// `protocol_registry::from_name`; unknown values are ignored.
 /// `enable = true` → register, `enable = false` → unregister.
 #[derive(Deserialize, DartSignal)]
 pub struct SetUrlProtocol {
+    pub scheme: String,
     pub enable: bool,
 }
 
-/// Check current `fluxdown://` URL protocol registration status (Dart → Rust).
+/// Check the current registration status of a URL scheme (Dart → Rust).
 #[derive(Deserialize, DartSignal)]
-pub struct CheckUrlProtocol {}
+pub struct CheckUrlProtocol {
+    pub scheme: String,
+}
 
-/// Report `fluxdown://` URL protocol registration status back to Dart (Rust → Dart).
+/// Report a URL scheme's registration status back to Dart (Rust → Dart).
 #[derive(Serialize, RustSignal)]
 pub struct UrlProtocolStatus {
+    pub scheme: String,
     pub is_registered: bool,
 }
 
@@ -1574,4 +1587,209 @@ pub struct LinkEvent {
     pub discovered: Option<LinkDiscoveredPiece>,
     #[serde(default)]
     pub devices: Vec<LinkDevicePiece>,
+}
+
+// ========== RSS subscription signals ==========
+
+/// 一个 RSS 订阅的完整配置 + 运行态（Dart ↔ Rust 双向共用）。
+///
+/// 创建/更新两条信号共享这一个 piece，而不是各自平铺 20+ 个字段——新增一个
+/// 订阅选项只需改这里一处（`engine::rss::model::RssSourceInfo` 与它逐字段
+/// 对应，转换在 `signal_bridge`）。
+#[derive(Serialize, Deserialize, SignalPiece)]
+pub struct RssSourceEntry {
+    /// UUID；创建时留空由引擎生成。
+    #[serde(default)]
+    pub source_id: String,
+    pub url: String,
+    /// 显示名（空 = 用 feed 标题回填）。
+    #[serde(default)]
+    pub name: String,
+    /// 停用 = 保留配置与历史但不再抓取。
+    #[serde(default)]
+    pub enabled: bool,
+    /// false = 收集模式（只收集条目供手动挑选）。
+    #[serde(default)]
+    pub auto_download: bool,
+    /// 自动创建的任务以 paused 落库（「稍后下载」语义）。
+    #[serde(default)]
+    pub start_paused: bool,
+    /// 目标队列（空 = 主队列）。
+    #[serde(default)]
+    pub queue_id: String,
+    /// 保存目录（空 = 队列目录 → 全局目录）。
+    #[serde(default)]
+    pub save_dir: String,
+    /// 抓取间隔（分钟）。
+    #[serde(default)]
+    pub interval_minutes: i32,
+    /// 包含关键词（`|` = 或，空格 = 且；空 = 不过滤）。
+    #[serde(default)]
+    pub include_pattern: String,
+    /// 排除关键词。
+    #[serde(default)]
+    pub exclude_pattern: String,
+    #[serde(default)]
+    pub use_regex: bool,
+    #[serde(default)]
+    pub smart_episode: bool,
+    /// 体积下限（字节，0 = 不限）。
+    #[serde(default)]
+    pub size_min_bytes: i64,
+    /// 体积上限（字节，0 = 不限）。
+    #[serde(default)]
+    pub size_max_bytes: i64,
+    #[serde(default)]
+    pub send_referer: bool,
+    #[serde(default)]
+    pub notify_on_download: bool,
+    /// 每轮最多新建任务数（1..=100）。
+    #[serde(default)]
+    pub max_per_fetch: i32,
+    #[serde(default)]
+    pub cookies: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub proxy_url: String,
+    /// 上次发起抓取的 Unix 秒（0 = 从未）。只读。
+    #[serde(default)]
+    pub last_fetch_at: i64,
+    /// 上次成功抓取的 Unix 秒（0 = 从未）。只读。
+    #[serde(default)]
+    pub last_success_at: i64,
+    /// 上次失败原因（空 = 健康）。只读。
+    #[serde(default)]
+    pub last_error: String,
+    /// 连续失败次数（驱动退避与侧边栏警告点）。只读。
+    #[serde(default)]
+    pub fail_count: i32,
+    /// 首轮抓取是否已完成。只读。
+    #[serde(default)]
+    pub seeded: bool,
+    #[serde(default)]
+    pub position: i32,
+    /// 未处理条目数（侧边栏 badge）。只读派生值。
+    #[serde(default)]
+    pub unread_count: i32,
+}
+
+/// 订阅流中的一个条目（Rust → Dart）。
+#[derive(Serialize, Deserialize, SignalPiece)]
+pub struct RssItemEntry {
+    pub source_id: String,
+    pub guid: String,
+    pub title: String,
+    #[serde(default)]
+    pub link: String,
+    #[serde(default)]
+    pub enclosure_url: String,
+    /// enclosure 声明大小（字节，0 = 未知）。
+    #[serde(default)]
+    pub enclosure_length: i64,
+    /// 发布时间（Unix 秒，0 = 未知）。
+    #[serde(default)]
+    pub pub_date: i64,
+    #[serde(default)]
+    pub fetched_at: i64,
+    /// 0=新 1=已下载 2=已忽略 3=规则未命中 4=重复剧集 5=首轮历史条目。
+    #[serde(default)]
+    pub status: i32,
+    /// `status == 1` 时回链的任务 ID。
+    #[serde(default)]
+    pub task_id: String,
+    /// 智能剧集归一键（空 = 未识别）。
+    #[serde(default)]
+    pub episode_key: String,
+    /// 稳定原因码（`excluded`/`too_large`/`dup_episode`/…；空 = 无）。
+    /// **Dart 侧负责本地化**，引擎不产出自然语言。
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// 新建订阅（Dart → Rust）。`source.source_id` 忽略。
+#[derive(Deserialize, DartSignal)]
+pub struct CreateRssSource {
+    pub source: RssSourceEntry,
+}
+
+/// 更新订阅配置（Dart → Rust）。运行态字段忽略。
+#[derive(Deserialize, DartSignal)]
+pub struct UpdateRssSource {
+    pub source: RssSourceEntry,
+}
+
+/// 删除订阅（Dart → Rust）。级联删条目，已创建的下载任务保留。
+#[derive(Deserialize, DartSignal)]
+pub struct DeleteRssSource {
+    pub source_id: String,
+}
+
+/// 立即抓取一个订阅（Dart → Rust）。
+#[derive(Deserialize, DartSignal)]
+pub struct RefreshRssSource {
+    pub source_id: String,
+}
+
+/// 验证一个 feed 地址（Dart → Rust，新建向导第一步）。
+#[derive(Deserialize, DartSignal)]
+pub struct ValidateRssFeed {
+    /// 由 Dart 生成，用于把 [`RssValidateResult`] 配回发起的对话框。
+    pub request_id: String,
+    pub url: String,
+    #[serde(default)]
+    pub cookies: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub proxy_url: String,
+}
+
+/// 请求某订阅的条目流（Dart → Rust）。
+#[derive(Deserialize, DartSignal)]
+pub struct RequestRssItems {
+    pub source_id: String,
+}
+
+/// 请求全部订阅（Dart → Rust，启动时发送）。
+#[derive(Deserialize, DartSignal)]
+pub struct RequestAllRssSources {}
+
+/// 对一个条目执行手动操作（Dart → Rust）。
+#[derive(Deserialize, DartSignal)]
+pub struct SetRssItemAction {
+    pub source_id: String,
+    /// `action = 2`（全部标记已读）时忽略。
+    #[serde(default)]
+    pub guid: String,
+    /// 0 = 下载（绕过规则与剧集去重）、1 = 忽略、2 = 全部标记已读。
+    pub action: i32,
+}
+
+/// 全部 RSS 订阅（Rust → Dart）——启动时与任意变化后发送。
+#[derive(Serialize, RustSignal)]
+pub struct AllRssSources {
+    pub sources: Vec<RssSourceEntry>,
+}
+
+/// 某订阅的条目流快照（Rust → Dart）。
+#[derive(Serialize, RustSignal)]
+pub struct RssItemsSnapshot {
+    pub source_id: String,
+    pub items: Vec<RssItemEntry>,
+    /// 本轮自动创建任务的条目标题；非空时 Dart 弹**一条**合批通知。
+    pub notify_titles: Vec<String>,
+}
+
+/// feed 验证结果（Rust → Dart）。
+#[derive(Serialize, RustSignal)]
+pub struct RssValidateResult {
+    pub request_id: String,
+    pub url: String,
+    /// feed 标题（供回填订阅名）。
+    pub feed_title: String,
+    /// 最近条目预览。
+    pub items: Vec<RssItemEntry>,
+    /// 无错误时为空。
+    pub error: String,
 }

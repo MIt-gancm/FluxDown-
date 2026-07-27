@@ -363,6 +363,8 @@ fn sample_task(id: &str, status: i32) -> TaskDto {
         completed_at: String::new(),
         referrer: String::new(),
         group_id: String::new(),
+        rss_source_id: String::new(),
+        origin_url: String::new(),
         queue_order: 0,
     }
 }
@@ -1595,6 +1597,67 @@ async fn groups_endpoints_require_token() {
         .send(&request("POST", routes::API_RESOLVE_PREVIEW, &[], ""))
         .await;
     assert_eq!(resp.status, 401);
+}
+
+// ---------------------------------------------------------------------------
+// RSS 订阅（/api/v1/rss*）
+// ---------------------------------------------------------------------------
+
+/// 关键回归点：静态段 `/rss/validate` 不能被参数路由 `/rss/{id}` 误吞——
+/// 后者只挂了 PUT/DELETE，被误吞时 POST 会回 405 而不是进 handler。
+///
+/// MockHost 未实现 RSS，走 [`ApiHost`] 默认降级（list 回空表、其余回 500），
+/// 所以这里只断言「请求路由到了哪个 handler」，不断言业务结果。
+#[tokio::test]
+async fn rss_validate_static_route_not_swallowed_by_id_route() {
+    let server = TestServer::start(MockHost::new(), |c| {
+        c.token = "T".to_string();
+        c.management_enabled = true;
+    })
+    .await;
+    let json_headers: &[(&str, &str)] = &[
+        ("X-FluxDown-Token", "T"),
+        ("Content-Type", "application/json"),
+    ];
+
+    let list = server
+        .send(&request(
+            "GET",
+            routes::API_RSS,
+            &[("X-FluxDown-Token", "T")],
+            "",
+        ))
+        .await;
+    assert_eq!(list.status, 200);
+    assert_eq!(list.json(), json!([]));
+
+    let validate = server
+        .send(&request(
+            "POST",
+            routes::API_RSS_VALIDATE,
+            json_headers,
+            r#"{"url":"https://example.com/feed.xml"}"#,
+        ))
+        .await;
+    assert_eq!(
+        validate.status, 500,
+        "应进 validate handler（宿主未实现 → 500）；405 说明被 /rss/{{id}} 吞了"
+    );
+
+    // 空 url 在 handler 里就被拦下，不会打到宿主。
+    let empty_url = server
+        .send(&request(
+            "POST",
+            routes::API_RSS_VALIDATE,
+            json_headers,
+            r#"{"url":"   "}"#,
+        ))
+        .await;
+    assert_eq!(empty_url.status, 400);
+
+    // 管理 API 门禁对 RSS 一视同仁。
+    let no_token = server.send(&request("GET", routes::API_RSS, &[], "")).await;
+    assert_eq!(no_token.status, 401);
 }
 
 // ---------------------------------------------------------------------------

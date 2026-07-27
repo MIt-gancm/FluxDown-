@@ -335,6 +335,18 @@ class DownloadTask {
   /// `applyProgress`/`_onProgress` 「new task from progress」分支）。
   final String groupId;
 
+  /// 由哪条 RSS 订阅自动创建（'' = 非 RSS 来源）。任务详情「来源」行据此显示
+  /// 订阅 chip 并支持点回条目流（设计文档 P5 / qB#19276）。
+  final String rssSourceId;
+
+  /// 展示用原始来源链接（'' = 用 [url]）。`.torrent` 文件任务的 [url] 是
+  /// `torrent-file://local` 哨兵，复制出去毫无意义；RSS 自动建的任务在这里
+  /// 存 enclosure 直链。读取一律走 [shareUrl]，不要直接用本字段。
+  final String originUrl;
+
+  /// 「复制链接 / 分享」应当使用的地址：有真实来源就用它，否则回退 [url]。
+  String get shareUrl => originUrl.isNotEmpty ? originUrl : url;
+
   /// 归属设备标识（'' = 本机；非空 = 远程设备 deviceId）。跨设备任务混排 + 设备筛选用。
   final String deviceId;
 
@@ -368,6 +380,8 @@ class DownloadTask {
     this.ignoreTlsErrors = false,
     this.referrer = '',
     this.groupId = '',
+    this.rssSourceId = '',
+    this.originUrl = '',
     this.checksum = '',
     this.proxyUrl = '',
     this.deviceId = '',
@@ -400,6 +414,8 @@ class DownloadTask {
       ignoreTlsErrors: info.ignoreTlsErrors,
       referrer: info.referrer,
       groupId: info.groupId,
+      rssSourceId: info.rssSourceId,
+      originUrl: info.originUrl,
       checksum: info.checksum,
       proxyUrl: info.proxyUrl,
       createdAt: seconds > 0
@@ -435,6 +451,8 @@ class DownloadTask {
     bool? ignoreTlsErrors,
     String? referrer,
     String? groupId,
+    String? rssSourceId,
+    String? originUrl,
     String? checksum,
     String? proxyUrl,
     DateTime? createdAt,
@@ -463,6 +481,8 @@ class DownloadTask {
       ignoreTlsErrors: ignoreTlsErrors ?? this.ignoreTlsErrors,
       referrer: referrer ?? this.referrer,
       groupId: groupId ?? this.groupId,
+      rssSourceId: rssSourceId ?? this.rssSourceId,
+      originUrl: originUrl ?? this.originUrl,
       checksum: checksum ?? this.checksum,
       proxyUrl: proxyUrl ?? this.proxyUrl,
       createdAt: createdAt ?? this.createdAt,

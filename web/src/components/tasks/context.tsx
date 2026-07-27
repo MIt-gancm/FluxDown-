@@ -18,6 +18,9 @@ interface TasksUiState {
   /** 设备筛选：null=全部设备；本机=cloudDeviceId()；远程设备=其 deviceId（见 Sidebar 设备区）。 */
   deviceFilter: string | null
   setDeviceFilter: Dispatch<SetStateAction<string | null>>
+  /** 选中的 RSS 订阅 id：非 null 时条目流接管中央主区（与任务列表互斥）。 */
+  rssFilter: string | null
+  setRssFilter: Dispatch<SetStateAction<string | null>>
   statusTab: StatusTab
   setStatusTab: Dispatch<SetStateAction<StatusTab>>
   search: string
@@ -57,6 +60,7 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
   const [typeFilter, setTypeFilter] = useState<'all' | FileType>('all')
   const [queueFilter, setQueueFilter] = useState('all')
   const [deviceFilter, setDeviceFilterState] = useState<string | null>(() => localStorage.getItem(DEVICE_FILTER_KEY))
+  const [rssFilter, setRssFilter] = useState<string | null>(null)
   const [statusTab, setStatusTab] = useState<StatusTab>('all')
   const [search, setSearch] = useState('')
   const [manageMode, setManageModeState] = useState(false)
@@ -153,6 +157,8 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
         setQueueFilter,
         deviceFilter,
         setDeviceFilter,
+        rssFilter,
+        setRssFilter,
         statusTab,
         setStatusTab,
         search,

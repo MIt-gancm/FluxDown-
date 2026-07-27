@@ -162,6 +162,8 @@ pub struct DownloadRequest {
 ///     queue_order: 0,
 ///     referrer: String::new(),
 ///     group_id: String::new(),
+///     rss_source_id: String::new(),
+///     origin_url: String::new(),
 /// };
 /// let dto = TaskDto::from(info);
 /// assert_eq!(dto.task_id, "t1");
@@ -204,6 +206,13 @@ pub struct TaskDto {
     /// 所属任务组 ID（空 = 不属于任何组）。
     #[serde(default)]
     pub group_id: String,
+    /// 由哪条 RSS 订阅自动创建（空 = 非 RSS 来源）。P5 任务溯源。
+    #[serde(default)]
+    pub rss_source_id: String,
+    /// 展示用原始来源链接（空 = 用 `url`）。`.torrent` 任务的 `url` 是
+    /// `torrent-file://local` 哨兵，客户端「复制链接」应优先取本字段。
+    #[serde(default)]
+    pub origin_url: String,
     /// 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）。
     #[serde(default)]
     pub queue_order: i32,
@@ -229,6 +238,8 @@ impl From<fluxdown_engine::model::TaskInfo> for TaskDto {
             completed_at: t.completed_at,
             referrer: t.referrer,
             group_id: t.group_id,
+            rss_source_id: t.rss_source_id,
+            origin_url: t.origin_url,
             queue_order: t.queue_order,
         }
     }
@@ -979,6 +990,8 @@ mod tests {
             completed_at: String::new(),
             referrer: String::new(),
             group_id: "g1".to_string(),
+            rss_source_id: String::new(),
+            origin_url: String::new(),
             queue_order: 7,
         };
         let v = serde_json::to_value(&dto).unwrap();
@@ -1304,4 +1317,256 @@ pub struct LinkDeviceTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LinkOkResponse {
     pub ok: bool,
+}
+
+/// 一个 RSS 订阅（`GET/POST /api/v1/rss`、`PUT /api/v1/rss/{id}`）。
+///
+/// 写请求复用同一结构：全字段 `#[serde(default)]`，客户端只需给关心的字段；
+/// 运行态字段（`lastFetchAt`/`lastError`/`failCount`/`seeded`/`unreadCount`）
+/// 只读，写入时被引擎忽略。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_api::types::RssSourceDto;
+///
+/// let req: RssSourceDto =
+///     serde_json::from_str(r#"{"url":"https://mikanani.me/RSS/MyBangumi?token=x"}"#).unwrap();
+/// assert_eq!(req.interval_minutes, 0); // 0 → 引擎归一为默认 30 分钟
+/// assert!(req.source_id.is_empty());
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RssSourceDto {
+    #[serde(default)]
+    pub source_id: String,
+    pub url: String,
+    /// 空 = 用 feed 标题回填。
+    #[serde(default)]
+    pub name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// false = 收集模式（只收集条目供手动挑选）。
+    #[serde(default = "default_true")]
+    pub auto_download: bool,
+    /// 自动创建的任务以 paused 落库。
+    #[serde(default)]
+    pub start_paused: bool,
+    /// 空 = 内置主队列。
+    #[serde(default)]
+    pub queue_id: String,
+    /// 空 = 队列目录 → 全局目录。
+    #[serde(default)]
+    pub save_dir: String,
+    /// 抓取间隔（分钟）；0 = 引擎默认 30。
+    #[serde(default)]
+    pub interval_minutes: i32,
+    /// 包含关键词（`|` = 或，空格 = 且；空 = 不过滤）。
+    #[serde(default)]
+    pub include_pattern: String,
+    #[serde(default)]
+    pub exclude_pattern: String,
+    #[serde(default)]
+    pub use_regex: bool,
+    #[serde(default)]
+    pub smart_episode: bool,
+    /// 体积下限（字节，0 = 不限）。
+    #[serde(default)]
+    pub size_min_bytes: i64,
+    /// 体积上限（字节，0 = 不限）。
+    #[serde(default)]
+    pub size_max_bytes: i64,
+    #[serde(default = "default_true")]
+    pub send_referer: bool,
+    #[serde(default = "default_true")]
+    pub notify_on_download: bool,
+    /// 每轮最多新建任务数（1..=100）；0 = 引擎默认 20。
+    #[serde(default)]
+    pub max_per_fetch: i32,
+    #[serde(default)]
+    pub cookies: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub proxy_url: String,
+    /// 只读：上次发起抓取的 Unix 秒（0 = 从未）。
+    #[serde(default)]
+    pub last_fetch_at: i64,
+    /// 只读：上次成功抓取的 Unix 秒（0 = 从未）。
+    #[serde(default)]
+    pub last_success_at: i64,
+    /// 只读：上次失败原因（空 = 健康）。
+    #[serde(default)]
+    pub last_error: String,
+    /// 只读：连续失败次数（驱动指数退避）。
+    #[serde(default)]
+    pub fail_count: i32,
+    /// 只读：首轮抓取是否已完成。
+    #[serde(default)]
+    pub seeded: bool,
+    #[serde(default)]
+    pub position: i32,
+    /// 只读：未处理条目数（侧边栏 badge）。
+    #[serde(default)]
+    pub unread_count: i32,
+}
+
+impl From<fluxdown_engine::rss::model::RssSourceInfo> for RssSourceDto {
+    fn from(s: fluxdown_engine::rss::model::RssSourceInfo) -> Self {
+        Self {
+            source_id: s.source_id,
+            url: s.url,
+            name: s.name,
+            enabled: s.enabled,
+            auto_download: s.auto_download,
+            start_paused: s.start_paused,
+            queue_id: s.queue_id,
+            save_dir: s.save_dir,
+            interval_minutes: s.interval_minutes,
+            include_pattern: s.include_pattern,
+            exclude_pattern: s.exclude_pattern,
+            use_regex: s.use_regex,
+            smart_episode: s.smart_episode,
+            size_min_bytes: s.size_min_bytes,
+            size_max_bytes: s.size_max_bytes,
+            send_referer: s.send_referer,
+            notify_on_download: s.notify_on_download,
+            max_per_fetch: s.max_per_fetch,
+            cookies: s.cookies,
+            user_agent: s.user_agent,
+            proxy_url: s.proxy_url,
+            last_fetch_at: s.last_fetch_at,
+            last_success_at: s.last_success_at,
+            last_error: s.last_error,
+            fail_count: s.fail_count,
+            seeded: s.seeded,
+            position: s.position,
+            unread_count: s.unread_count,
+        }
+    }
+}
+
+/// 写方向：只搬用户可编辑字段，运行态取默认值（引擎自行维护）。
+impl From<RssSourceDto> for fluxdown_engine::rss::model::RssSourceInfo {
+    fn from(s: RssSourceDto) -> Self {
+        Self {
+            source_id: s.source_id,
+            url: s.url,
+            name: s.name,
+            enabled: s.enabled,
+            auto_download: s.auto_download,
+            start_paused: s.start_paused,
+            queue_id: s.queue_id,
+            save_dir: s.save_dir,
+            interval_minutes: if s.interval_minutes > 0 {
+                s.interval_minutes
+            } else {
+                fluxdown_engine::rss::model::DEFAULT_INTERVAL_MINUTES
+            },
+            include_pattern: s.include_pattern,
+            exclude_pattern: s.exclude_pattern,
+            use_regex: s.use_regex,
+            smart_episode: s.smart_episode,
+            size_min_bytes: s.size_min_bytes,
+            size_max_bytes: s.size_max_bytes,
+            send_referer: s.send_referer,
+            notify_on_download: s.notify_on_download,
+            max_per_fetch: if s.max_per_fetch > 0 {
+                s.max_per_fetch
+            } else {
+                fluxdown_engine::rss::model::DEFAULT_MAX_PER_FETCH
+            },
+            cookies: s.cookies,
+            user_agent: s.user_agent,
+            proxy_url: s.proxy_url,
+            ..Default::default()
+        }
+    }
+}
+
+/// 订阅流中的一个条目（`GET /api/v1/rss/{id}/items`）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RssItemDto {
+    pub source_id: String,
+    /// 去重主键。
+    pub guid: String,
+    pub title: String,
+    pub link: String,
+    /// enclosure 直链（空 = 回退 `link`）。
+    pub enclosure_url: String,
+    /// enclosure 声明大小（字节，0 = 未知）。
+    pub enclosure_length: i64,
+    /// 发布时间（Unix 秒，0 = 未知）。
+    pub pub_date: i64,
+    pub fetched_at: i64,
+    /// 0=新 1=已下载 2=已忽略 3=规则未命中 4=重复剧集 5=首轮历史条目。
+    pub status: i32,
+    /// `status == 1` 时回链的任务 ID。
+    pub task_id: String,
+    /// 智能剧集归一键（空 = 未识别）。
+    pub episode_key: String,
+    /// 稳定原因码（`excluded`/`too_large`/`dup_episode`/`seed_skipped`/…；
+    /// 空 = 无）。**客户端负责本地化**。
+    pub reason: String,
+}
+
+impl From<fluxdown_engine::rss::model::RssItemInfo> for RssItemDto {
+    fn from(i: fluxdown_engine::rss::model::RssItemInfo) -> Self {
+        Self {
+            source_id: i.source_id,
+            guid: i.guid,
+            title: i.title,
+            link: i.link,
+            enclosure_url: i.enclosure_url,
+            enclosure_length: i.enclosure_length,
+            pub_date: i.pub_date,
+            fetched_at: i.fetched_at,
+            status: i.status.as_i32(),
+            task_id: i.task_id,
+            episode_key: i.episode_key,
+            reason: i.reason,
+        }
+    }
+}
+
+/// 对条目执行手动操作（`POST /api/v1/rss/{id}/items/action`）。
+///
+/// guid 走请求体而不是路径段：真实 feed 的 guid 常常就是一整条 URL，
+/// 塞进路径要双重编码，且被反向代理规范化后会静默改写。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RssItemActionRequest {
+    /// `action = "readAll"` 时忽略。
+    #[serde(default)]
+    pub guid: String,
+    /// `download`（绕过规则强制下载）/ `ignore` / `readAll`（全部标记已读）。
+    pub action: String,
+}
+
+/// 验证一个 feed 地址（`POST /api/v1/rss/validate`，只读、不落库）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RssValidateRequest {
+    pub url: String,
+    #[serde(default)]
+    pub cookies: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub proxy_url: String,
+}
+
+/// feed 验证结果。`error` 非空即验证失败（HTTP 状态仍是 200——这是一次
+/// **诊断**调用，失败原因本身就是有效载荷）。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RssValidateResponse {
+    pub url: String,
+    /// feed 标题（供回填订阅名）。
+    pub feed_title: String,
+    /// 最近条目预览。
+    pub items: Vec<RssItemDto>,
+    /// 无错误时为空。
+    pub error: String,
 }

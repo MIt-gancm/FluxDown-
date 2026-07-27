@@ -42,7 +42,8 @@ use crate::types::{
     LinkAuth, LinkDeviceTaskRequest, LinkDevicesResponse, LinkDiscoveredResponse,
     LinkDiscoveryRequest, LinkOkResponse, LinkPairApproveRequest, LinkPairBeginRequest,
     LinkPairConfirmRequest, LinkPairFinishRequest, LinkPairFinishResponse, LinkPairHelloRequest,
-    LinkProbeRequest, ResolvePreviewRequest,
+    LinkProbeRequest, ResolvePreviewRequest, RssItemActionRequest, RssSourceDto,
+    RssValidateRequest,
 };
 
 /// 请求体大小上限：4 MB（足够容纳批量 URL 列表）。
@@ -269,6 +270,20 @@ fn register_core(state: AppState) -> Router<AppState> {
             .route(routes::API_GROUP, axum::routing::delete(api_delete_group))
             .route(routes::API_GROUP_PAUSE, put(api_group_pause))
             .route(routes::API_GROUP_CONTINUE, put(api_group_continue))
+            // 注意：静态段 `/rss/validate` 与参数段 `/rss/{id}` 并存，
+            // 与 `/tasks/pause` 同理靠 axum(matchit) 静态优先消歧，无冲突。
+            .route(
+                routes::API_RSS,
+                get(api_list_rss_sources).post(api_create_rss_source),
+            )
+            .route(
+                routes::API_RSS_SOURCE,
+                put(api_update_rss_source).delete(api_delete_rss_source),
+            )
+            .route(routes::API_RSS_REFRESH, post(api_refresh_rss_source))
+            .route(routes::API_RSS_ITEMS, get(api_list_rss_items))
+            .route(routes::API_RSS_ITEM_ACTION, post(api_rss_item_action))
+            .route(routes::API_RSS_VALIDATE, post(api_validate_rss_feed))
             .route(routes::API_PLUGINS, get(api_list_plugins))
             .route(routes::API_PLUGINS_INSTALL, post(api_install_plugin))
             .route(
@@ -1450,6 +1465,243 @@ pub(crate) async fn api_group_continue(
         return *resp;
     }
     ack(state.host.group_continue(&id).await)
+}
+
+// ---------------------------------------------------------------------------
+// RSS 订阅（/api/v1/rss*，全强制 token）
+// ---------------------------------------------------------------------------
+
+/// 列出全部 RSS 订阅。
+#[utoipa::path(get, path = "/api/v1/rss", tag = "rss",
+    responses(
+        (status = 200, description = "订阅列表", body = Vec<crate::types::RssSourceDto>),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_list_rss_sources(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    match state.host.list_rss_sources().await {
+        Ok(sources) => Json(sources).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// 新建 RSS 订阅，返回新订阅 ID。`url` 为空 → 400。
+#[utoipa::path(post, path = "/api/v1/rss", tag = "rss",
+    request_body = RssSourceDto,
+    responses(
+        (status = 200, description = "创建成功，`{sourceId}`"),
+        (status = 400, description = "载荷非法或缺少 url", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_create_rss_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    let req: RssSourceDto = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid rss source payload: {e}"),
+            );
+        }
+    };
+    if req.url.trim().is_empty() {
+        return result_response(StatusCode::BAD_REQUEST, false, "url is required");
+    }
+    match state.host.create_rss_source(req).await {
+        Ok(source_id) => Json(json!({ "sourceId": source_id })).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// 更新订阅配置。运行态字段（`lastFetchAt`/`failCount` 等）写入被忽略。
+#[utoipa::path(put, path = "/api/v1/rss/{id}", tag = "rss",
+    params(("id" = String, Path, description = "订阅 ID（UUID）")),
+    request_body = RssSourceDto,
+    responses(
+        (status = 200, description = "已更新", body = crate::types::ResultMessage),
+        (status = 400, description = "载荷非法", body = crate::types::ResultMessage),
+        (status = 404, description = "订阅不存在", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_update_rss_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    let req: RssSourceDto = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid rss source payload: {e}"),
+            );
+        }
+    };
+    ack(state.host.update_rss_source(&id, req).await)
+}
+
+/// 删除订阅（级联删条目）。已建下载任务保留——用户要的是不再抓新条目，
+/// 不是撤销已下载的东西。
+#[utoipa::path(delete, path = "/api/v1/rss/{id}", tag = "rss",
+    params(("id" = String, Path, description = "订阅 ID（UUID）")),
+    responses(
+        (status = 200, description = "已删除", body = crate::types::ResultMessage),
+        (status = 404, description = "订阅不存在", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_delete_rss_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    ack(state.host.delete_rss_source(&id).await)
+}
+
+/// 立即抓取一个订阅。抓取异步派发，本端点只表示「已受理」，结果走
+/// `rssSourcesChanged` / `rssItemsChanged` 事件。
+#[utoipa::path(post, path = "/api/v1/rss/{id}/refresh", tag = "rss",
+    params(("id" = String, Path, description = "订阅 ID（UUID）")),
+    responses(
+        (status = 200, description = "已派发抓取", body = crate::types::ResultMessage),
+        (status = 404, description = "订阅不存在", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_refresh_rss_source(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    ack(state.host.refresh_rss_source(&id).await)
+}
+
+/// 一个订阅的条目流（新→旧）。
+#[utoipa::path(get, path = "/api/v1/rss/{id}/items", tag = "rss",
+    params(("id" = String, Path, description = "订阅 ID（UUID）")),
+    responses(
+        (status = 200, description = "条目列表", body = Vec<crate::types::RssItemDto>),
+        (status = 404, description = "订阅不存在", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_list_rss_items(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    match state.host.list_rss_items(&id).await {
+        Ok(items) => Json(items).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// 对条目执行手动操作（下载 / 忽略 / 全部标记已读）。guid 在请求体里，
+/// 不进路径段——真实 feed 的 guid 常常是一整条 URL。
+#[utoipa::path(post, path = "/api/v1/rss/{id}/items/action", tag = "rss",
+    params(("id" = String, Path, description = "订阅 ID（UUID）")),
+    request_body = RssItemActionRequest,
+    responses(
+        (status = 200, description = "已执行", body = crate::types::ResultMessage),
+        (status = 400, description = "载荷非法或 action 未知", body = crate::types::ResultMessage),
+        (status = 404, description = "订阅或条目不存在", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_rss_item_action(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    let req: RssItemActionRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid rss item action payload: {e}"),
+            );
+        }
+    };
+    ack(state.host.rss_item_action(&id, req).await)
+}
+
+/// 只读验证一个 feed 地址（新建订阅向导）。抓取失败**不是** HTTP 错误：
+/// 这是一次诊断调用，失败原因本身就是有效载荷，仍回 200 + `error` 非空。
+#[utoipa::path(post, path = "/api/v1/rss/validate", tag = "rss",
+    request_body = RssValidateRequest,
+    responses(
+        (status = 200, description = "验证结果（`error` 非空 = 抓取失败）", body = crate::types::RssValidateResponse),
+        (status = 400, description = "载荷非法或缺少 url", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_validate_rss_feed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    let req: RssValidateRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid rss validate payload: {e}"),
+            );
+        }
+    };
+    if req.url.trim().is_empty() {
+        return result_response(StatusCode::BAD_REQUEST, false, "url is required");
+    }
+    match state.host.validate_rss_feed(req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -814,7 +814,7 @@ void showTaskContextMenu(
       label: s.copyUrl,
       color: c.textPrimary,
       action: () {
-        Clipboard.setData(ClipboardData(text: task.url));
+        Clipboard.setData(ClipboardData(text: task.shareUrl));
         FluxSonner.of(context).show(
           ShadToast(
             title: Text(s.urlCopied),

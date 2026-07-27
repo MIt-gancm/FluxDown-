@@ -37,13 +37,16 @@ export function AppearanceSettings() {
         <SetRow title={t('set.appearance.themeMode')}>
           <SetSelect value={mode} onValueChange={(v) => setMode(v as ThemeMode)} options={MODE_OPTIONS} />
         </SetRow>
-        <SetRow title={t('set.appearance.accent')} desc={t('set.appearance.accentNames')}>
+        <SetRow
+          title={t('set.appearance.accent')}
+          desc={ACCENT_PRESETS.map((p) => t(p.nameKey)).join(' / ')}
+        >
           <div className="color-dots">
             {ACCENT_PRESETS.map((p, i) => (
               <button
-                key={p.name}
+                key={p.nameKey}
                 type="button"
-                aria-label={p.name}
+                aria-label={t(p.nameKey)}
                 className={cn('color-dot', i === accent && 'active')}
                 style={{ background: p.light }}
                 onClick={() => setAccent(i)}

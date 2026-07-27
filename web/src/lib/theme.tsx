@@ -4,13 +4,13 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 
 export type ThemeMode = 'light' | 'dark' | 'system'
 
-/** 预设强调色（对齐桌面端色彩方案的常用项）。 */
+/** 预设强调色（对齐桌面端色彩方案的常用项）；名称走 i18n，不在此写死文案。 */
 export const ACCENT_PRESETS = [
-  { name: '默认蓝', light: '#2e6bf6', dark: '#4d82f8' },
-  { name: '绿', light: '#16a34a', dark: '#22c55e' },
-  { name: '紫', light: '#7c3aed', dark: '#8b5cf6' },
-  { name: '橙', light: '#ea580c', dark: '#f97316' },
-  { name: '玫红', light: '#e11d48', dark: '#f43f5e' },
+  { nameKey: 'set.appearance.accentBlue', light: '#2e6bf6', dark: '#4d82f8' },
+  { nameKey: 'set.appearance.accentGreen', light: '#16a34a', dark: '#22c55e' },
+  { nameKey: 'set.appearance.accentPurple', light: '#7c3aed', dark: '#8b5cf6' },
+  { nameKey: 'set.appearance.accentOrange', light: '#ea580c', dark: '#f97316' },
+  { nameKey: 'set.appearance.accentRose', light: '#e11d48', dark: '#f43f5e' },
 ] as const
 
 const MODE_KEY = 'fluxdown.theme'

@@ -21,7 +21,7 @@ import type { RemoteTask, RemoteTaskStatus } from '../../lib/cloud/types'
 import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
 import { cn } from '../../lib/cn'
 import { fmtBytes, fmtSpeed } from '../../lib/format'
-import { useI18n } from '../../lib/i18n'
+import { useI18n, type I18nKey } from '../../lib/i18n'
 import { bucketEntities, compareSectionEntities, orderSections, type SectionEntity } from '../../lib/list-sections'
 import { compressPathChain, dirKey, flattenGroupMembers, groupDisplayName } from '../../lib/task-group'
 import { useViewPrefs } from '../../lib/view-prefs'
@@ -58,15 +58,15 @@ const GRID_GAP = 10
 const GRID_ROW_SIZE = GRID_CARD_HEIGHT + GRID_GAP
 const GRID_CARD_MIN_WIDTH = 210
 
-/** 跨设备任务状态 → 展示文案（mdc §1.1 状态机）。 */
-const REMOTE_STATUS_LABEL: Record<RemoteTaskStatus, string> = {
-  pending: '等待中',
-  accepted: '已接受',
-  downloading: '下载中',
-  paused: '已暂停',
-  completed: '已完成',
-  failed: '失败',
-  canceled: '已取消',
+/** 跨设备任务状态 → 文案键（mdc §1.1 状态机）。 */
+const REMOTE_STATUS_KEY: Record<RemoteTaskStatus, I18nKey> = {
+  pending: 'remote.status.pending',
+  accepted: 'remote.status.accepted',
+  downloading: 'remote.status.downloading',
+  paused: 'remote.status.paused',
+  completed: 'remote.status.completed',
+  failed: 'remote.status.failed',
+  canceled: 'remote.status.canceled',
 }
 
 export function TaskList() {
@@ -256,7 +256,7 @@ export function TaskList() {
                         <b>{item.task.fileName || item.task.url}</b>
                       </div>
                       <div className="trow-meta">
-                        <span>{REMOTE_STATUS_LABEL[item.task.status] ?? item.task.status}</span>
+                        <span>{REMOTE_STATUS_KEY[item.task.status] ? t(REMOTE_STATUS_KEY[item.task.status]) : item.task.status}</span>
                         {item.task.status === 'downloading' && (
                           <>
                             <span>

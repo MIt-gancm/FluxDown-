@@ -25,6 +25,8 @@ void main() {
     queueOrder: 0,
     referrer: 'https://example.com/page',
     groupId: '',
+    rssSourceId: '',
+    originUrl: '',
   );
 
   test('fromTaskInfo maps referrer', () {
@@ -77,6 +79,8 @@ void main() {
       queueOrder: 0,
       referrer: '',
       groupId: '',
+      rssSourceId: '',
+      originUrl: '',
     );
     final task = DownloadTask.fromTaskInfo(info);
     expect(task.checksum, 'sha256=deadbeef');
@@ -100,5 +104,24 @@ void main() {
     final unchanged = task.copyWith(status: TaskStatus.paused);
     expect(unchanged.checksum, 'md5=abc');
     expect(unchanged.proxyUrl, 'http://proxy:8080');
+  });
+
+  // RSS 自动建的 BT 任务 url 是 `torrent-file://local` 哨兵，右键「复制下载
+  // 链接」必须给出真实来源，否则用户复制到的是一段无法交给任何工具的噪音。
+  test('shareUrl prefers originUrl over the torrent-file sentinel', () {
+    final sentinel = DownloadTask.fromTaskInfo(makeInfo()).copyWith(
+      url: 'torrent-file://local',
+      originUrl: 'https://mikanani.me/Download/ep01.torrent',
+    );
+    expect(sentinel.shareUrl, 'https://mikanani.me/Download/ep01.torrent');
+
+    // 没有原始来源（手动拖入的本地 .torrent）时回退 url，不能返回空串。
+    final plain = DownloadTask.fromTaskInfo(makeInfo());
+    expect(plain.originUrl, '');
+    expect(plain.shareUrl, 'https://example.com/f.zip');
+
+    // copyWith 不得在改别的字段时把它抹掉。
+    expect(sentinel.copyWith(status: TaskStatus.paused).shareUrl,
+        'https://mikanani.me/Download/ep01.torrent');
   });
 }

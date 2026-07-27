@@ -6,6 +6,7 @@
 //! 内容是搬移字段而非新写业务逻辑。
 
 use fluxdown_engine::model;
+use fluxdown_engine::rss::model as rss_model;
 
 use crate::signals;
 
@@ -31,6 +32,8 @@ impl From<model::TaskInfo> for signals::TaskInfo {
             queue_order: t.queue_order,
             referrer: t.referrer,
             group_id: t.group_id,
+            rss_source_id: t.rss_source_id,
+            origin_url: t.origin_url,
         }
     }
 }
@@ -164,6 +167,92 @@ impl From<model::ManifestItemInfo> for signals::ManifestItemDto {
             path: i.path,
             size: i.size,
             variants: i.variants.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<rss_model::RssSourceInfo> for signals::RssSourceEntry {
+    fn from(s: rss_model::RssSourceInfo) -> Self {
+        Self {
+            source_id: s.source_id,
+            url: s.url,
+            name: s.name,
+            enabled: s.enabled,
+            auto_download: s.auto_download,
+            start_paused: s.start_paused,
+            queue_id: s.queue_id,
+            save_dir: s.save_dir,
+            interval_minutes: s.interval_minutes,
+            include_pattern: s.include_pattern,
+            exclude_pattern: s.exclude_pattern,
+            use_regex: s.use_regex,
+            smart_episode: s.smart_episode,
+            size_min_bytes: s.size_min_bytes,
+            size_max_bytes: s.size_max_bytes,
+            send_referer: s.send_referer,
+            notify_on_download: s.notify_on_download,
+            max_per_fetch: s.max_per_fetch,
+            cookies: s.cookies,
+            user_agent: s.user_agent,
+            proxy_url: s.proxy_url,
+            last_fetch_at: s.last_fetch_at,
+            last_success_at: s.last_success_at,
+            last_error: s.last_error,
+            fail_count: s.fail_count,
+            seeded: s.seeded,
+            position: s.position,
+            unread_count: s.unread_count,
+        }
+    }
+}
+
+/// Dart → 引擎方向：只搬**用户可编辑**字段，运行态（`last_*`/`fail_count`/
+/// `seeded`/`position`/`unread_count`）一律取默认值——由引擎自己维护，绝不
+/// 让一次 UI 保存把退避账本或首轮标记覆盖掉。
+impl From<signals::RssSourceEntry> for rss_model::RssSourceInfo {
+    fn from(s: signals::RssSourceEntry) -> Self {
+        Self {
+            source_id: s.source_id,
+            url: s.url,
+            name: s.name,
+            enabled: s.enabled,
+            auto_download: s.auto_download,
+            start_paused: s.start_paused,
+            queue_id: s.queue_id,
+            save_dir: s.save_dir,
+            interval_minutes: s.interval_minutes,
+            include_pattern: s.include_pattern,
+            exclude_pattern: s.exclude_pattern,
+            use_regex: s.use_regex,
+            smart_episode: s.smart_episode,
+            size_min_bytes: s.size_min_bytes,
+            size_max_bytes: s.size_max_bytes,
+            send_referer: s.send_referer,
+            notify_on_download: s.notify_on_download,
+            max_per_fetch: s.max_per_fetch,
+            cookies: s.cookies,
+            user_agent: s.user_agent,
+            proxy_url: s.proxy_url,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<rss_model::RssItemInfo> for signals::RssItemEntry {
+    fn from(i: rss_model::RssItemInfo) -> Self {
+        Self {
+            source_id: i.source_id,
+            guid: i.guid,
+            title: i.title,
+            link: i.link,
+            enclosure_url: i.enclosure_url,
+            enclosure_length: i.enclosure_length,
+            pub_date: i.pub_date,
+            fetched_at: i.fetched_at,
+            status: i.status.as_i32(),
+            task_id: i.task_id,
+            episode_key: i.episode_key,
+            reason: i.reason,
         }
     }
 }

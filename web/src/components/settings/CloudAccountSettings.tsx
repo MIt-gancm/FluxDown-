@@ -744,7 +744,7 @@ function DeviceListSection() {
         {t('cloud.devicesDesc')}
       </p>
       <div className="set-group">
-        <SetRow title="在侧边栏显示设备同步" desc="开启后即使仅本机也在侧边栏展示设备区，便于提前熟悉多设备协同入口">
+        <SetRow title={t('cloud.showDeviceSync')} desc={t('cloud.showDeviceSyncDesc')}>
           <SetSwitch checked={showDeviceSync} onCheckedChange={setShowDeviceSync} />
         </SetRow>
         {isLoading ? (
@@ -883,7 +883,7 @@ function DeviceItem({
             </div>
             <div className="min-w-0 flex-1 text-left">
               <div className="flex items-center gap-2">
-                <i className={cn('queue-dot', device.isOnline && 'on')} title={device.isOnline ? '在线' : '离线'} />
+                <i className={cn('queue-dot', device.isOnline && 'on')} title={device.isOnline ? t('link.online') : t('link.offline')} />
                 <b className="truncate text-[13px] font-medium">{device.name || '-'}</b>
                 {isCurrent ? (
                   <span className="flex-shrink-0 rounded-full bg-accent-weak px-1.5 py-0.5 text-[9.5px] font-semibold text-accent">

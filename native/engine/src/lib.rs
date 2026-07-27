@@ -28,6 +28,8 @@ pub mod model;
 pub mod plugin;
 mod proc;
 pub mod proxy_config;
+/// RSS 订阅自动下载（feed 轮询 → 规则过滤 → 建任务）。
+pub mod rss;
 pub mod segment_advisor;
 pub mod segment_coordinator;
 pub mod selection;
@@ -254,6 +256,9 @@ impl Engine {
         {
             manager.set_cdn_cloud_max_nodes(n);
         }
+        // 装载 RSS 订阅到内存镜像——放在 Engine::new 而非交给宿主，保证任何
+        // 宿主（hub/server/CLI --local）都不必记得这一步就能让轮询生效。
+        manager.rss.load().await;
         Ok(Self {
             db,
             manager,

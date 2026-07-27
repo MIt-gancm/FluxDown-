@@ -103,12 +103,9 @@ Future<void> main(List<String> args) async {
       .where((a) => a.toLowerCase().endsWith('.torrent'))
       .toList();
 
-  // 提取启动参数中的 fluxdown:// 协议 URL（Windows 注册表协议处理器：
-  // 浏览器扩展协议模式 / 网页 <a href="fluxdown://..."> 唤起本 exe）。
-  final protocolRequests = args
-      .map(_parseFluxdownProtocolArg)
-      .nonNulls
-      .toList();
+  // 提取启动参数中的协议 URL（系统协议处理器：浏览器扩展协议模式 /
+  // 网页 <a href="fluxdown://..."> / ed2k:// 电驴链接唤起本 exe）。
+  final protocolRequests = args.map(_parseProtocolArg).nonNulls.toList();
 
   logInfo(
     'main',
@@ -297,11 +294,19 @@ String _decodeFilePath(String arg) {
   return arg;
 }
 
-/// 解析 fluxdown:// 协议启动参数。
-/// 格式：`fluxdown://download?url=<encoded-url>&filename=<name>`。
-/// 非协议参数、host 不是 download、或缺少有效 url 参数时返回 null（忽略）。
-({String url, String filename})? _parseFluxdownProtocolArg(String arg) {
-  if (!arg.toLowerCase().startsWith('fluxdown://')) return null;
+/// 解析协议启动参数（系统协议处理器唤起本 exe 时经启动参数传入）。
+///
+/// 两种形态：
+/// - `fluxdown://download?url=<encoded-url>&filename=<name>`——自有深链，
+///   拆出内层真实 URL；host 不是 download 或缺 url 参数时忽略。
+/// - `ed2k://|file|<name>|<size>|<hash>|/`——电驴链接本身就是下载地址，
+///   原样透传（`|` 不是合法 URI 字符，不能过 [Uri.tryParse]）。
+({String url, String filename})? _parseProtocolArg(String arg) {
+  final lower = arg.toLowerCase();
+  if (lower.startsWith('ed2k://')) {
+    return (url: arg.trim(), filename: '');
+  }
+  if (!lower.startsWith('fluxdown://')) return null;
   final uri = Uri.tryParse(arg);
   if (uri == null || uri.host.toLowerCase() != 'download') {
     logInfo('main', 'ignoring malformed fluxdown:// arg: $arg');
@@ -728,15 +733,15 @@ class _FluxDownAppState extends State<FluxDownApp>
     }
   }
 
-  /// 分发启动参数中的 fluxdown:// 协议请求（幂等：配置加载监听器与超时
-  /// 兜底可能双触发 _handleInitialTorrentFiles）。
+  /// 分发启动参数中的协议请求（fluxdown:// / ed2k://；幂等：配置加载监听器
+  /// 与超时兜底可能双触发 _handleInitialTorrentFiles）。
   bool _protocolRequestsDispatched = false;
 
   void _dispatchInitialProtocolRequests() {
     if (_protocolRequestsDispatched) return;
     _protocolRequestsDispatched = true;
     for (final req in widget.initialProtocolRequests) {
-      logInfo('FluxDownApp', 'dispatching fluxdown:// arg: ${req.url}');
+      logInfo('FluxDownApp', 'dispatching protocol arg: ${req.url}');
       ExternalDownloadService.handleLocalRequest(
         url: req.url,
         filename: req.filename,
@@ -745,7 +750,8 @@ class _FluxDownAppState extends State<FluxDownApp>
   }
 
   /// Called when a second instance sends its command-line args via WM_COPYDATA.
-  /// Extracts .torrent file paths / fluxdown:// protocol URLs, dispatches
+  /// Extracts .torrent file paths / protocol URLs (fluxdown:// deep links,
+  /// ed2k:// links), dispatches
   /// them, then brings the window to the foreground.
   Future<dynamic> _handleSecondInstance(MethodCall call) async {
     if (call.method == 'onSecondInstance') {
@@ -756,14 +762,11 @@ class _FluxDownAppState extends State<FluxDownApp>
       await windowManager.show();
       await windowManager.focus();
 
-      // fluxdown:// 协议 URL（浏览器扩展协议模式 / 网页链接唤起时，
+      // 协议 URL（浏览器扩展协议模式 / 网页链接 / ed2k 链接唤起时，
       // 系统启动第二实例，参数经 WM_COPYDATA 转发到本主实例）。
-      final protocolRequests = args
-          .map(_parseFluxdownProtocolArg)
-          .nonNulls
-          .toList();
+      final protocolRequests = args.map(_parseProtocolArg).nonNulls.toList();
       for (final req in protocolRequests) {
-        logInfo('FluxDownApp', 'second-instance fluxdown:// arg: ${req.url}');
+        logInfo('FluxDownApp', 'second-instance protocol arg: ${req.url}');
         ExternalDownloadService.handleLocalRequest(
           url: req.url,
           filename: req.filename,

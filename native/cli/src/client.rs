@@ -9,8 +9,11 @@ use std::time::Duration;
 use fluxdown_api::auth::TOKEN_HEADER;
 use fluxdown_api::routes;
 use fluxdown_api::service::UNKNOWN_ENDPOINT_MESSAGE;
-use fluxdown_api::types::{ApiInfo, CreateTaskRequest, CreatedTask, QueueDto, TaskDto};
+use fluxdown_api::types::{
+    ApiInfo, CreateTaskRequest, CreatedTask, QueueDto, RssItemDto, RssSourceDto, TaskDto,
+};
 use reqwest::{Client, Method, StatusCode};
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::exit::ExitCode;
@@ -56,6 +59,18 @@ impl std::error::Error for ClientError {}
 struct ServerError {
     message: Option<String>,
 }
+
+/// `POST /api/v1/rss` 的应答体。服务端沿用 `CreatedTask`/`CreateGroupResponse`
+/// 的 `{"<资源>Id"}` 惯例，这里只取 id，无需引入完整 DTO。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreatedRssSource {
+    source_id: String,
+}
+
+/// 无请求体时传给 [`ApiClient::send_json`] 的占位值：`body` 已泛型化，
+/// 裸 `None` 推断不出类型。
+const NO_BODY: Option<&()> = None;
 
 /// FluxDown 管理 API 客户端。
 pub struct ApiClient {
@@ -150,11 +165,14 @@ impl ApiClient {
     }
 
     /// 发送请求并将成功响应反序列化为 `T`。
-    async fn send_json<T: DeserializeOwned>(
+    ///
+    /// `body` 泛型化以承载任意 wire 请求体（`?Sized` 允许直接传 `&str` 等）；
+    /// 无请求体时传 [`NO_BODY`]。
+    async fn send_json<T: DeserializeOwned, B: Serialize + ?Sized>(
         &self,
         method: Method,
         path: &str,
-        body: Option<&CreateTaskRequest>,
+        body: Option<&B>,
     ) -> Result<T, ClientError> {
         let mut req = self
             .http
@@ -208,7 +226,7 @@ impl ApiClient {
 
     /// `GET /api/v1/info`。
     pub async fn info(&self) -> Result<ApiInfo, ClientError> {
-        self.send_json(Method::GET, routes::API_INFO, None).await
+        self.send_json(Method::GET, routes::API_INFO, NO_BODY).await
     }
 
     /// `GET /api/v1/tasks?status=N`（`status` 为 `None` 时列出全部）。
@@ -217,12 +235,12 @@ impl ApiClient {
             Some(s) => format!("{}?status={s}", routes::API_TASKS),
             None => routes::API_TASKS.to_string(),
         };
-        self.send_json(Method::GET, &path, None).await
+        self.send_json(Method::GET, &path, NO_BODY).await
     }
 
     /// `GET /api/v1/tasks/{id}`。
     pub async fn get_task(&self, id: &str) -> Result<TaskDto, ClientError> {
-        self.send_json(Method::GET, &routes::task_path(id), None)
+        self.send_json(Method::GET, &routes::task_path(id), NO_BODY)
             .await
     }
 
@@ -263,6 +281,38 @@ impl ApiClient {
 
     /// `GET /api/v1/queues`。
     pub async fn list_queues(&self) -> Result<Vec<QueueDto>, ClientError> {
-        self.send_json(Method::GET, routes::API_QUEUES, None).await
+        self.send_json(Method::GET, routes::API_QUEUES, NO_BODY)
+            .await
+    }
+
+    /// `GET /api/v1/rss`。
+    pub async fn list_rss_sources(&self) -> Result<Vec<RssSourceDto>, ClientError> {
+        self.send_json(Method::GET, routes::API_RSS, NO_BODY).await
+    }
+
+    /// `POST /api/v1/rss`，返回新订阅 id。
+    pub async fn create_rss_source(&self, req: &RssSourceDto) -> Result<String, ClientError> {
+        let created: CreatedRssSource = self
+            .send_json(Method::POST, routes::API_RSS, Some(req))
+            .await?;
+        Ok(created.source_id)
+    }
+
+    /// `DELETE /api/v1/rss/{id}`。
+    pub async fn delete_rss_source(&self, id: &str) -> Result<(), ClientError> {
+        self.send_unit(Method::DELETE, &routes::rss_source_path(id))
+            .await
+    }
+
+    /// `POST /api/v1/rss/{id}/refresh`。
+    pub async fn refresh_rss_source(&self, id: &str) -> Result<(), ClientError> {
+        self.send_unit(Method::POST, &routes::rss_refresh_path(id))
+            .await
+    }
+
+    /// `GET /api/v1/rss/{id}/items`。
+    pub async fn list_rss_items(&self, id: &str) -> Result<Vec<RssItemDto>, ClientError> {
+        self.send_json(Method::GET, &routes::rss_items_path(id), NO_BODY)
+            .await
     }
 }

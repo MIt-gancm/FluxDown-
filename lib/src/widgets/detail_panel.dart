@@ -10,6 +10,7 @@ import '../bindings/bindings.dart';
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
 import '../models/download_task.dart';
+import '../models/rss_provider.dart';
 import '../i18n/locale_provider.dart';
 import '../services/open_folder.dart';
 import '../theme/app_colors.dart';
@@ -25,6 +26,9 @@ class DetailPanel extends StatefulWidget {
   final DownloadController controller;
   final VoidCallback onClose;
 
+  /// RSS 订阅状态——用于「来源」行反查订阅名并跳回条目流。
+  final RssProvider rssProvider;
+
   /// 当前是否为底部布局（决定切换按钮图标方向）
   final bool isBottom;
 
@@ -35,6 +39,7 @@ class DetailPanel extends StatefulWidget {
     super.key,
     required this.controller,
     required this.onClose,
+    required this.rssProvider,
     this.isBottom = true,
     this.onTogglePosition,
   });
@@ -424,6 +429,9 @@ class _DetailPanelState extends State<DetailPanel> {
     if (task.groupId.isNotEmpty &&
         widget.controller.groupById(task.groupId) != null) {
       widgets.add(_buildGroupLinkRow(c, task.groupId));
+    }
+    if (task.rssSourceId.isNotEmpty) {
+      widgets.add(_buildRssSourceRow(c, task.rssSourceId));
     }
     widgets.add(_buildInfoRow(s.infoPath, task.saveDir, c));
     widgets.add(_buildUrlRow(c, task.url));
@@ -869,7 +877,7 @@ class _DetailPanelState extends State<DetailPanel> {
                 child: DetailFooterActionButton(
                   icon: LucideIcons.link,
                   label: s.detailActionCopyLink,
-                  onPressed: () => _copyLinkWithToast(task.url),
+                  onPressed: () => _copyLinkWithToast(task.shareUrl),
                 ),
               ),
             ],
@@ -1092,6 +1100,71 @@ class _DetailPanelState extends State<DetailPanel> {
                 ],
               ),
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 「来源订阅」链接行——RSS 自动创建的任务专属，点击跳回该订阅的条目流
+  /// （P5 任务溯源 / qB#19276：十年悬而未决的高票诉求）。
+  ///
+  /// 订阅可能已被删除（引擎删订阅时会清空任务上的指针，但推送到达前仍可能
+  /// 短暂对不上）——此时退化为纯文本展示 ID，不给死链接。
+  Widget _buildRssSourceRow(AppColors c, String sourceId) {
+    final s = currentS;
+    RssSourceEntry? source;
+    for (final entry in widget.rssProvider.sources) {
+      if (entry.sourceId == sourceId) {
+        source = entry;
+        break;
+      }
+    }
+    final name = source == null ? sourceId : rssDisplayName(source);
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 60,
+            child: Text(
+              s.rssSourceLabel,
+              style: TextStyle(fontSize: 11, color: c.textMuted),
+            ),
+          ),
+          Expanded(
+            child: source == null
+                ? Text(
+                    name,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: c.textSecondary),
+                  )
+                : GestureDetector(
+                    onTap: () => widget.rssProvider.select(sourceId),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(LucideIcons.rss, size: 11, color: c.accent),
+                        const SizedBox(width: 4),
+                        Flexible(
+                          child: Text(
+                            name,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(fontSize: 11, color: c.accent),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        Icon(
+                          LucideIcons.chevronRight,
+                          size: 11,
+                          color: c.accent,
+                        ),
+                      ],
+                    ),
+                  ),
           ),
         ],
       ),

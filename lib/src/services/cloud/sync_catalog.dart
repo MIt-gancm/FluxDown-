@@ -12,7 +12,7 @@
 // - 端口类：bt/ed2k 监听端口、local_server_*（含 token）—— 端口/凭据是本机网络
 //   身份，跨设备同步会互相冲突或泄露本机管理令牌。
 // - 每机行为：close_to_tray、start_minimized_to_tray、auto_startup、
-//   analytics_enabled、log_max_size_mb、ui_scale、悬浮球坐标、torrent 关联 ——
+//   analytics_enabled、log_max_size_mb、ui_scale、悬浮球坐标、torrent/ed2k 关联 ——
 //   这些描述"这台机器"的行为/尺寸/系统集成状态，不是用户偏好。
 // - 代理全部字段 —— 隐私：value 可被管理员在后台查看，代理地址/账号密码不得上云。
 // - 导入主题正文（FluxThemeTokens JSON）—— 体积超出单条 8192 字节限额且高频
@@ -259,7 +259,7 @@ List<SyncEntry> buildSyncCatalog({
     settings.setFloatingBallActiveOnly,
   ),
 
-  // ── ui（7，均 bool）──
+  // ── ui（8，均 bool）──
   _bool(
     'ui.show_sidebar_status',
     () => settings.showSidebarStatus,
@@ -274,6 +274,11 @@ List<SyncEntry> buildSyncCatalog({
     'ui.show_sidebar_category',
     () => settings.showSidebarCategory,
     settings.setShowSidebarCategory,
+  ),
+  _bool(
+    'ui.show_sidebar_rss',
+    () => settings.showSidebarRss,
+    settings.setShowSidebarRss,
   ),
   _bool(
     'ui.show_titlebar_pause_all',
