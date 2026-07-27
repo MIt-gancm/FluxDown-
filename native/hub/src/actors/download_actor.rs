@@ -1195,7 +1195,7 @@ pub async fn run(db_dir: PathBuf) {
                     RssSignal::Tick => engine.manager.tick_rss_sources(),
                     RssSignal::Engine(ev) => engine.manager.on_rss_event(*ev).await,
                     RssSignal::Create(msg) => {
-                        engine.manager.rss.create_source(msg.source.into()).await;
+                        engine.manager.create_rss_source(msg.source.into()).await;
                     }
                     RssSignal::Update(msg) => {
                         engine.manager.rss.update_source(msg.source.into()).await;
@@ -2527,7 +2527,7 @@ async fn handle_api_command(
             });
         }
         ApiCommand::RssCreate { source, ack } => {
-            let source_id = engine.manager.rss.create_source(*source).await;
+            let source_id = engine.manager.create_rss_source(*source).await;
             let _ = ack.send(source_id);
         }
         ApiCommand::RssUpdate { source, ack } => {

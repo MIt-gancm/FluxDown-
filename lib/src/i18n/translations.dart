@@ -1738,6 +1738,8 @@ class S {
   String get rssCheckConfig => _r('rssCheckConfig');
   String get rssMarkAllRead => _r('rssMarkAllRead');
   String get rssSearchHint => _r('rssSearchHint');
+  String get rssSortNewest => _r('rssSortNewest');
+  String get rssSortOldest => _r('rssSortOldest');
   String get rssEmptyTitle => _r('rssEmptyTitle');
   String get rssEmptyDesc => _r('rssEmptyDesc');
   String rssNoMatch(String query) => _r('rssNoMatch', {'query': query});
@@ -1759,7 +1761,7 @@ class S {
   String get rssStatusDuplicate => _r('rssStatusDuplicate');
   String get rssStatusHistory => _r('rssStatusHistory');
   String get rssActionDownload => _r('rssActionDownload');
-  String get rssActionDownloadAnyway => _r('rssActionDownloadAnyway');
+  String get rssActionPreparing => _r('rssActionPreparing');
   String get rssActionRedownload => _r('rssActionRedownload');
   String get rssActionIgnore => _r('rssActionIgnore');
   String get rssReasonNotIncluded => _r('rssReasonNotIncluded');

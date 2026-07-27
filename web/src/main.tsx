@@ -6,6 +6,7 @@ import './index.css'
 import { router } from './router'
 import { ConfirmDialog } from './components/dialogs/confirm-dialog'
 import { ThemeProvider } from './lib/theme'
+import { ToastHost } from './lib/toast'
 import { I18nProvider } from './lib/i18n'
 import { connectWs } from './lib/ws'
 import { isAuthenticated, saveCredentials } from './lib/auth'
@@ -51,6 +52,7 @@ createRoot(document.getElementById('root')!).render(
         <ThemeProvider>
           <RouterProvider router={router} />
           <ConfirmDialog />
+          <ToastHost />
         </ThemeProvider>
       </I18nProvider>
     </QueryClientProvider>

@@ -34,6 +34,23 @@ export function fmtTime(unixSecs: string | number): string {
   return new Date(n * 1000).toLocaleString(getLocale() === 'zh' ? 'zh-CN' : 'en-US', { hour12: false })
 }
 
+/** Unix 秒 → 紧凑发布时间 `MM-DD HH:mm`（对齐桌面 rss_item_list 的条目时间）。
+ *  列表里逐行重复的时间戳不需要年份与秒：省下的横向空间全部让给标题。
+ *  非法/缺失时间返回空串，由调用方决定是否整块隐去。 */
+export function fmtShortTime(unixSecs: number): string {
+  if (!Number.isFinite(unixSecs) || unixSecs <= 0) return ''
+  const d = new Date(unixSecs * 1000)
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
+}
+
+/** Unix 秒 → 相对时间（"3 分钟前"）。订阅头的「上次抓取」用它：绝对时间戳
+ *  回答不了用户真正在问的「这条订阅还活着吗」。30 天以上退回本地日期。 */
+export function fmtRelativeUnix(unixSecs: number): string {
+  if (!Number.isFinite(unixSecs) || unixSecs <= 0) return '—'
+  return fmtRelativeTime(new Date(unixSecs * 1000).toISOString())
+}
+
 /** ISO 时间字符串 → 相对时间（"3 分钟前"）；30 天以上回退本地日期，非法输入返回 '—'。
  *  用于 FluxCloud 设备列表的 lastSeenAt 等 ISO8601 时间戳（不同于 fmtTime 的 unix 秒）。 */
 export function fmtRelativeTime(iso: string): string {

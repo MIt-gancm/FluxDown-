@@ -12,7 +12,9 @@ import '../models/view_prefs.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'context_menu.dart';
+import 'file_type_icon.dart';
 import '../models/download_controller.dart';
+import 'overflow_tooltip_text.dart';
 import '../services/open_folder.dart';
 import 'queue_manager_dialog.dart';
 import 'task_columns.dart';
@@ -250,24 +252,10 @@ class _TaskListItemState extends State<TaskListItem> {
     final canDragOut =
         task.status == TaskStatus.completed && !task.fileMissing;
     final iconSize = _iconSize;
-    Widget icon = Container(
-      width: iconSize,
-      height: iconSize,
-      decoration: BoxDecoration(
-        color: c.surface2,
-        borderRadius: compact ? m.brSm : m.brMd,
-      ),
-      child: Center(
-        child: Text(
-          task.fileExtension,
-          style: TextStyle(
-            fontSize: compact ? 8.5 : 10,
-            fontWeight: FontWeight.w600,
-            color: c.textSecondary,
-            fontFeatures: const [FontFeature.tabularFigures()],
-          ),
-        ),
-      ),
+    Widget icon = FileTypeIconTile(
+      ext: task.fileExtension,
+      size: iconSize,
+      borderRadius: compact ? m.brSm : m.brMd,
     );
     // 插件（onDone 钩子）仍在处理该已完成任务：文件图标外圈旋转扫光边框，
     // 纯旁路指示，不改变状态列布局。
@@ -323,10 +311,8 @@ class _TaskListItemState extends State<TaskListItem> {
               Row(
                 children: [
                   Flexible(
-                    child: Text(
+                    child: OverflowTooltipText(
                       task.fileName,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
                       style: TextStyle(fontSize: 13, color: c.textPrimary),
                     ),
                   ),

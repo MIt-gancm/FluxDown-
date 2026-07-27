@@ -8,7 +8,7 @@ import { fmtBytes, fmtSpeed } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
 import { useViewPrefs } from '../../lib/view-prefs'
 import { useGlobalSpeed } from '../../lib/ws'
-import { useConfigQuery } from '../settings/useConfig'
+import { useConfigQuery } from '../../lib/config'
 import { useTasksUi } from './context'
 import { useViewTasks } from './useViewTasks'
 

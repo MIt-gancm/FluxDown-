@@ -37,6 +37,10 @@ class _RssItemListState extends State<RssItemList> {
   final _searchCtrl = TextEditingController();
   String _query = '';
 
+  /// 条目排序方向。默认新→旧：引擎回来的快照本来就是这个顺序（DB
+  /// `ORDER BY pub_date DESC`），追番看的永远是最新一集。
+  bool _oldestFirst = false;
+
   @override
   void dispose() {
     _searchCtrl.dispose();
@@ -53,16 +57,12 @@ class _RssItemListState extends State<RssItemList> {
         final source = widget.provider.selectedSource;
         if (source == null) return const SizedBox.shrink();
         final items = widget.provider.selectedItems;
-        final visible = _query.isEmpty
-            ? items
-            : items
-                  .where((i) => i.title.toLowerCase().contains(_query))
-                  .toList(growable: false);
+        final visible = _visibleItems(items);
+        // 底色由主区统一给（HomePage._buildContentArea = surface1）。
         return Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             _buildHeader(s, c, source),
-            _buildToolbar(s, c, source),
             Expanded(
               child: items.isEmpty
                   ? _buildEmpty(s, c)
@@ -77,6 +77,10 @@ class _RssItemListState extends State<RssItemList> {
                           child: _RssItemRow(
                             key: ValueKey('${item.sourceId}/${item.guid}'),
                             item: item,
+                            busy: widget.provider.isItemDownloading(
+                              item.sourceId,
+                              item.guid,
+                            ),
                             onDownload: () => widget.provider.downloadItem(
                               item.sourceId,
                               item.guid,
@@ -97,15 +101,44 @@ class _RssItemListState extends State<RssItemList> {
     );
   }
 
+  /// 过滤 + 排序后的条目。
+  ///
+  /// 排序按 `pubDate` 走，并用**原始下标**做 tie-break：`List.sort` 不保证
+  /// 稳定，而同一集不同字幕组的 `pubDate` 常常一模一样（Mikan 同秒发布），
+  /// 不钉死次序的话每次 setState 行都会乱跳。缺发布时间（`pubDate == 0`）的
+  /// 条目一律沉底，不让它们污染时间轴两端。
+  List<RssItemEntry> _visibleItems(List<RssItemEntry> items) {
+    final filtered = _query.isEmpty
+        ? items
+        : items
+              .where((i) => i.title.toLowerCase().contains(_query))
+              .toList(growable: false);
+    final indexed = [
+      for (var i = 0; i < filtered.length; i++) (i, filtered[i]),
+    ];
+    indexed.sort((a, b) {
+      final (ai, ax) = a;
+      final (bi, bx) = b;
+      if ((ax.pubDate == 0) != (bx.pubDate == 0)) return ax.pubDate == 0 ? 1 : -1;
+      final byDate = _oldestFirst
+          ? ax.pubDate.compareTo(bx.pubDate)
+          : bx.pubDate.compareTo(ax.pubDate);
+      return byDate != 0 ? byDate : ai.compareTo(bi);
+    });
+    return [for (final (_, item) in indexed) item];
+  }
+
   // ─────────────────────────────────────────────
-  // 订阅头（健康度内联：抓取节奏 / 上次结果 / 自动下载去向）
+  // 订阅头：左边身份与健康度（抓取节奏 / 上次结果 / 自动下载去向），
+  // 右边这条订阅的动作与筛选。合并成一行而不是再叠一条工具条——标题右侧
+  // 本来就是大片空白，多一条 37px 的横带只是把列表往下推。
   // ─────────────────────────────────────────────
 
   Widget _buildHeader(S s, AppColors c, RssSourceEntry source) {
     final m = AppMetrics.of(context);
     final unhealthy = source.lastError.isNotEmpty;
     return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
       decoration: BoxDecoration(
         border: Border(bottom: BorderSide(color: c.border)),
       ),
@@ -152,14 +185,50 @@ class _RssItemListState extends State<RssItemList> {
               ],
             ),
           ),
+          const SizedBox(width: 12),
           if (unhealthy) ...[
-            const SizedBox(width: 10),
             ShadButton.outline(
               size: ShadButtonSize.sm,
               onPressed: () => widget.onManage(source.sourceId),
               child: Text(s.rssCheckConfig),
             ),
+            const SizedBox(width: 8),
           ],
+          // 排序：图标即当前方向（箭头朝下 = 新在上），点一下翻转。
+          _IconAction(
+            icon: _oldestFirst
+                ? LucideIcons.arrowUpNarrowWide
+                : LucideIcons.arrowDownWideNarrow,
+            tooltip: _oldestFirst ? s.rssSortOldest : s.rssSortNewest,
+            onPressed: () => setState(() => _oldestFirst = !_oldestFirst),
+          ),
+          const SizedBox(width: 2),
+          _IconAction(
+            icon: LucideIcons.checkCheck,
+            tooltip: s.rssMarkAllRead,
+            onPressed: () => widget.provider.markAllRead(source.sourceId),
+          ),
+          const SizedBox(width: 2),
+          _RefreshButton(
+            busy: widget.provider.isRefreshing(source.sourceId),
+            onPressed: () => widget.provider.refresh(source.sourceId),
+          ),
+          const SizedBox(width: 10),
+          // 搜索贴最右、与下方条目右缘对齐：它筛的是这条列表，不是全局。
+          SizedBox(
+            width: 190,
+            child: ShadInput(
+              controller: _searchCtrl,
+              placeholder: Text(s.rssSearchHint),
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              style: const TextStyle(fontSize: 12.5),
+              leading: Padding(
+                padding: const EdgeInsets.only(left: 2),
+                child: Icon(LucideIcons.search, size: 13, color: c.textMuted),
+              ),
+              onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
+            ),
+          ),
         ],
       ),
     );
@@ -187,49 +256,6 @@ class _RssItemListState extends State<RssItemList> {
     if (delta < 3600) return s.rssMinutesAgo(delta ~/ 60);
     if (delta < 86400) return s.rssHoursAgo(delta ~/ 3600);
     return s.rssDaysAgo(delta ~/ 86400);
-  }
-
-  // ─────────────────────────────────────────────
-  // 工具条
-  // ─────────────────────────────────────────────
-
-  Widget _buildToolbar(S s, AppColors c, RssSourceEntry source) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-      decoration: BoxDecoration(
-        border: Border(bottom: BorderSide(color: c.border)),
-      ),
-      child: Row(
-        children: [
-          ShadButton.ghost(
-            size: ShadButtonSize.sm,
-            onPressed: () => widget.provider.markAllRead(source.sourceId),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Icon(LucideIcons.checkCheck, size: 13, color: c.textSecondary),
-                const SizedBox(width: 6),
-                Text(s.rssMarkAllRead),
-              ],
-            ),
-          ),
-          const SizedBox(width: 4),
-          _RefreshButton(
-            busy: widget.provider.isRefreshing(source.sourceId),
-            onPressed: () => widget.provider.refresh(source.sourceId),
-          ),
-          const Spacer(),
-          SizedBox(
-            width: 200,
-            child: ShadInput(
-              controller: _searchCtrl,
-              placeholder: Text(s.rssSearchHint),
-              onChanged: (v) => setState(() => _query = v.trim().toLowerCase()),
-            ),
-          ),
-        ],
-      ),
-    );
   }
 
   // ─────────────────────────────────────────────
@@ -270,6 +296,9 @@ class _RssItemListState extends State<RssItemList> {
 /// 一条 RSS 条目行。状态 chip 决定行尾可用操作（P4：条目状态可见 + 可覆盖）。
 class _RssItemRow extends StatefulWidget {
   final RssItemEntry item;
+
+  /// 引擎正在为这条条目抓种子 / 建任务。
+  final bool busy;
   final VoidCallback onDownload;
   final VoidCallback onIgnore;
   final VoidCallback onOpenTask;
@@ -277,6 +306,7 @@ class _RssItemRow extends StatefulWidget {
   const _RssItemRow({
     super.key,
     required this.item,
+    required this.busy,
     required this.onDownload,
     required this.onIgnore,
     required this.onOpenTask,
@@ -362,7 +392,11 @@ class _RssItemRowState extends State<_RssItemRow> {
               width: 160,
               child: Row(
                 mainAxisAlignment: MainAxisAlignment.end,
-                children: _isHovered ? _actions(s) : const <Widget>[],
+                // 「准备中」必须脱离 hover 显示：点完把鼠标移开是常态，
+                // 按钮跟着消失等于把刚给出的反馈又抽走。
+                children: (_isHovered || widget.busy)
+                    ? _actions(s, c)
+                    : const <Widget>[],
               ),
             ),
           ],
@@ -371,13 +405,41 @@ class _RssItemRowState extends State<_RssItemRow> {
     );
   }
 
-  List<Widget> _actions(S s) {
+  List<Widget> _actions(S s, AppColors c) {
     final status = widget.item.status;
+    if (widget.busy) {
+      // 只留一个禁用态按钮：这一行正在被引擎处理，此刻「忽略」既没意义也
+      // 容易误点。
+      return [
+        ShadButton.ghost(
+          size: ShadButtonSize.sm,
+          onPressed: null,
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.6,
+                  color: c.accent,
+                ),
+              ),
+              const SizedBox(width: 6),
+              Text(s.rssActionPreparing),
+            ],
+          ),
+        ),
+      ];
+    }
     // 已下载的条目也给操作入口：任务可能被删了、下崩了，或者只是想再来一遍。
+    //
+    // 被规则拦下的条目按钮同样只写「下载」：状态 chip 已经把原因说清楚了
+    // （「规则未命中 · 命中排除词」），按钮再来一句「仍要下载」是在替用户
+    // 犹豫——他都点开这一行了，动作就是下载。
     final label = switch (status) {
-      RssItemStatusCode.isNew => s.rssActionDownload,
       RssItemStatusCode.downloaded => s.rssActionRedownload,
-      _ => s.rssActionDownloadAnyway,
+      _ => s.rssActionDownload,
     };
     return [
       ShadButton.ghost(
@@ -456,9 +518,43 @@ String rssReasonLabel(S s, String code) => switch (code) {
   _ => '',
 };
 
+/// 订阅头右侧的图标动作。
+///
+/// 文字按钮在标题行里太占宽（两个就吃掉 200px，把搜索框挤到标题上），换成
+/// 图标 + 500ms 悬浮提示：日常操作靠肌肉记忆，第一次用靠 tooltip 兜底。
+class _IconAction extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onPressed;
+
+  const _IconAction({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return ShadTooltip(
+      waitDuration: const Duration(milliseconds: 500),
+      // 无入场动画：淡入+位移的 200ms 只是把「已经等了 500ms」再拖长一截，
+      // 提示要么不出现，要么立刻在那儿（同 task_list.dart 的管理入口 tooltip）。
+      effects: const [],
+      builder: (_) => Text(tooltip),
+      child: ShadIconButton.ghost(
+        width: 28,
+        height: 28,
+        onPressed: onPressed,
+        icon: Icon(icon, size: 15, color: c.textSecondary),
+      ),
+    );
+  }
+}
+
 /// 「立即抓取」按钮。抓取是 off-actor 的、常要好几秒，没有进行中反馈用户会
 /// 反复点或以为没生效——所以 busy 时换成 spinner 并禁用（`onPressed: null`
-/// 同时给出 shadcn 的禁用视觉）。
+/// 同时给出 shadcn 的禁用视觉），tooltip 也跟着改成「抓取中」。
 class _RefreshButton extends StatelessWidget {
   final bool busy;
   final VoidCallback onPressed;
@@ -469,26 +565,24 @@ class _RefreshButton extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final s = LocaleScope.of(context);
-    return ShadButton.ghost(
-      size: ShadButtonSize.sm,
-      onPressed: busy ? null : onPressed,
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          SizedBox(
-            width: 13,
-            height: 13,
-            child: busy
-                ? CircularProgressIndicator(strokeWidth: 1.6, color: c.accent)
-                : Icon(
-                    LucideIcons.refreshCw,
-                    size: 13,
-                    color: c.textSecondary,
-                  ),
-          ),
-          const SizedBox(width: 6),
-          Text(busy ? s.rssRefreshing : s.rssRefreshNow),
-        ],
+    return ShadTooltip(
+      waitDuration: const Duration(milliseconds: 500),
+      effects: const [],
+      builder: (_) => Text(busy ? s.rssRefreshing : s.rssRefreshNow),
+      child: ShadIconButton.ghost(
+        width: 28,
+        height: 28,
+        onPressed: busy ? null : onPressed,
+        icon: busy
+            ? SizedBox(
+                width: 14,
+                height: 14,
+                child: CircularProgressIndicator(
+                  strokeWidth: 1.6,
+                  color: c.accent,
+                ),
+              )
+            : Icon(LucideIcons.refreshCw, size: 15, color: c.textSecondary),
       ),
     );
   }

@@ -19,6 +19,8 @@ import '../models/view_prefs.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'context_menu.dart';
+import 'file_type_icon.dart';
+import 'overflow_tooltip_text.dart';
 import 'flux_sonner.dart';
 import 'task_columns.dart';
 import 'task_list_item.dart';
@@ -878,21 +880,12 @@ class _GroupMemberRowState extends State<GroupMemberRow> {
                 padding: EdgeInsets.fromLTRB(30, 6, 16, 6),
                 child: Row(
                   children: [
-                    Container(
-                      width: iconSize,
-                      height: iconSize,
-                      margin: const EdgeInsets.only(left: 16, right: 10),
-                      decoration: BoxDecoration(color: c.surface2, borderRadius: m.brSm),
-                      child: Center(
-                        child: Text(
-                          task.fileExtension,
-                          style: TextStyle(
-                            fontSize: compact ? 8 : 9,
-                            fontWeight: FontWeight.w600,
-                            color: c.textSecondary,
-                            fontFeatures: const [FontFeature.tabularFigures()],
-                          ),
-                        ),
+                    Padding(
+                      padding: const EdgeInsets.only(left: 16, right: 10),
+                      child: FileTypeIconTile(
+                        ext: task.fileExtension,
+                        size: iconSize,
+                        borderRadius: m.brSm,
                       ),
                     ),
                     Expanded(
@@ -900,11 +893,13 @@ class _GroupMemberRowState extends State<GroupMemberRow> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
-                          Text(
+                          OverflowTooltipText(
                             task.fileName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(fontSize: 12.5, height: 1.2, color: c.textPrimary),
+                            style: TextStyle(
+                              fontSize: 12.5,
+                              height: 1.2,
+                              color: c.textPrimary,
+                            ),
                           ),
                           if (!compact) ...[
                             const SizedBox(height: 2),

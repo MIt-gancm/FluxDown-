@@ -17,6 +17,7 @@ import 'package:shadcn_ui/shadcn_ui.dart';
 
 import '../../theme/app_colors.dart';
 import '../../theme/flux_theme_tokens.dart';
+import '../../widgets/file_type_icon.dart';
 import '../native_overlay/offscreen_rasterizer.dart';
 
 // =============================================================================
@@ -252,15 +253,10 @@ class _ToastCard extends StatelessWidget {
                         ),
                       ),
                       child: Center(
-                        child: Text(
-                          spec.fileExt.toLowerCase(),
-                          style: TextStyle(
-                            fontFamily: 'MiSans',
-                            fontSize: 10,
-                            fontWeight: FontWeight.w600,
-                            color: c.accent,
-                            letterSpacing: 0.3,
-                          ),
+                        child: Icon(
+                          fileTypeIcon(spec.fileExt),
+                          size: 19,
+                          color: fileTypeColor(spec.fileExt, c),
                         ),
                       ),
                     ),

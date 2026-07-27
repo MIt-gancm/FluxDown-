@@ -49,13 +49,46 @@ class _SidebarState extends State<Sidebar> {
       unawaited(CloudAuthService.instance.refreshDevices());
     }
     CloudAuthService.instance.addListener(_onDeviceRosterChanged);
+    widget.controller.addListener(_scheduleFilterSync);
+    widget.settingsProvider.addListener(_scheduleFilterSync);
+    _scheduleFilterSync();
   }
 
   @override
   void dispose() {
     CloudAuthService.instance.removeListener(_onDeviceRosterChanged);
+    widget.controller.removeListener(_scheduleFilterSync);
+    widget.settingsProvider.removeListener(_scheduleFilterSync);
     super.dispose();
   }
+
+  /// 队列 / 分类的默认激活项与分区可见性对齐。
+  ///
+  /// 触发源有三个（队列装载完、分区显隐变化、分类增删），全部收敛到
+  /// [DownloadController.syncSidebarFilters]（幂等）。排到帧末执行：这些
+  /// 回调可能发生在 build 期间，绝不在 build 内 notify。
+  bool _syncScheduled = false;
+  void _scheduleFilterSync() {
+    if (_syncScheduled) return;
+    _syncScheduled = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _syncScheduled = false;
+      if (!mounted) return;
+      widget.controller.syncSidebarFilters(
+        queuesVisible: widget.settingsProvider.showSidebarQueues,
+        defaultQueueId: widget.settingsProvider.defaultQueueId,
+        categoryVisible: widget.settingsProvider.showSidebarCategory,
+        visibleCategories: widget.settingsProvider.visibleCategories,
+      );
+    });
+  }
+
+  /// RSS 条目流是否正占着主区。
+  ///
+  /// RSS 项与其余分区不是同一类东西：状态 / 队列 / 分类 / 设备互相叠加成
+  /// 一组任务筛选，RSS 却是整页切换。所以选中订阅时，任务侧的高亮必须全部
+  /// 熄灭——否则侧边栏在同时宣称「你在全部任务」和「你在这条订阅」。
+  bool get _rssActive => widget.rssProvider.selectedSourceId.isNotEmpty;
 
   /// 设备名册（远程设备增删/在线态）变化时，清理已失效的设备筛选。
   /// 绝不在 build 内 notify —— 排到帧末执行。
@@ -256,7 +289,9 @@ class _SidebarState extends State<Sidebar> {
   // ─────────────────────────────────────────────
 
   Widget _buildStatusSection(DownloadController ctrl, S s, AppColors c) {
-    final selectedStatus = ctrl.statusTab;
+    // RSS 条目流占着主区时，任务侧的三个分区都不是「当前所在位置」——
+    // 它们只是回到任务列表的入口，此刻高亮任何一项都是在指向看不见的东西。
+    final selectedStatus = _rssActive ? null : ctrl.statusTab;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -290,7 +325,7 @@ class _SidebarState extends State<Sidebar> {
 
   Widget _buildQueuesSection(DownloadController ctrl, S s, AppColors c) {
     final queues = ctrl.queues;
-    final queueFilter = ctrl.queueFilter;
+    final queueFilter = _rssActive ? null : ctrl.queueFilter;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -542,7 +577,7 @@ class _SidebarState extends State<Sidebar> {
       };
 
   Widget _buildCategorySection(DownloadController ctrl, S s, AppColors c) {
-    final customFilter = ctrl.customCategoryFilter;
+    final customFilter = _rssActive ? null : ctrl.customCategoryFilter;
     final visibleCategories = widget.settingsProvider.visibleCategories;
 
     return Column(
@@ -636,14 +671,14 @@ class _SidebarState extends State<Sidebar> {
           _NavItem(
             icon: LucideIcons.globe,
             label: s.allDevices,
-            isSelected: deviceFilter == null,
+            isSelected: !_rssActive && deviceFilter == null,
             onTap: () => _selectTaskView(() => ctrl.setDeviceFilter(null)),
           ),
           _NavItem(
             icon: LucideIcons.monitor,
             label: s.thisDevice,
             count: ctrl.countForDevice(''),
-            isSelected: deviceFilter == '',
+            isSelected: !_rssActive && deviceFilter == '',
             isOnline: true,
             onTap: () => _selectTaskView(() => ctrl.setDeviceFilter('')),
           ),
@@ -652,7 +687,7 @@ class _SidebarState extends State<Sidebar> {
               icon: _deviceTypeIcon(device.platform),
               label: device.name,
               count: ctrl.countForDevice(device.deviceId),
-              isSelected: deviceFilter == device.deviceId,
+              isSelected: !_rssActive && deviceFilter == device.deviceId,
               isOnline: device.isOnline,
               onTap: () =>
                   _selectTaskView(() => ctrl.setDeviceFilter(device.deviceId)),

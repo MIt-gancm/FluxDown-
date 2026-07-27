@@ -32,6 +32,8 @@ md-5 = "0.10"
 md4 = "0.10"
 mdns-sd = { version = "0.20.2", optional = true }
 rand = "0.9"
+# 与 feed-rs 同版本：feed 扩展命名空间（Mikan `<torrent><pubDate>`）的二次扫描。
+quick-xml = { version = "0.41", features = ["encoding"] }
 regex = "1"
 rquickjs = { version = "0.12.1", features = ["full-async", "parallel"], optional = true }
 serde = { version = "1.0.219", features = ["derive"] }

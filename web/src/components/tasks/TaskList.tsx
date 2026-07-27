@@ -6,16 +6,17 @@
 // 视图偏好（形态/密度/分组/排序/显示开关/列）见 lib/view-prefs.ts，按状态页签独立记忆。
 //
 // 组聚合：groupId 非空但组列表查不到（孤儿成员）与无 groupId 的任务一律按普通任务平铺
-// 兜底。状态/类型/队列筛选 + 显示已完成开关作用于成员；搜索词命中组名时整组（含全部
+// 兜底。状态/分类/队列筛选 + 显示已完成开关作用于成员；搜索词命中组名时整组（含全部
 // 成员）可见，命中成员文件名时组行+命中成员可见（组行仅在有可见成员时出现，计数按可见
 // 成员）。组行本身不参与既有多选批量。
-// 对齐 design/web/app.js renderList() + lib/src/models/download_controller.dart buildListSections()。
 
-import { useEffect, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ChevronDown, ChevronRight, Download, Folder } from 'lucide-react'
 import { api } from '../../lib/api'
+import { parseCategories, visibleCategories } from '../../lib/categories'
+import { CATEGORIES_KEY, useConfigQuery } from '../../lib/config'
 import { cloudDeviceId } from '../../lib/cloud/session'
 import type { RemoteTask, RemoteTaskStatus } from '../../lib/cloud/types'
 import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
@@ -73,7 +74,7 @@ export function TaskList() {
   const { t } = useI18n()
   const {
     statusTab,
-    typeFilter,
+    categoryFilter,
     queueFilter,
     deviceFilter,
     search,
@@ -85,11 +86,13 @@ export function TaskList() {
     clearScrollTarget,
     collapsedDirs,
     toggleDirCollapsed,
+    clearSelection,
   } = useTasksUi()
   const prefs = useViewPrefs(statusTab)
   const tasks = useViewTasks()
   const { data: queues = [] } = useQuery({ queryKey: ['queues'], queryFn: api.listQueues })
   const { data: groups = [] } = useQuery({ queryKey: ['groups'], queryFn: api.listGroups })
+  const { data: config } = useConfigQuery()
   const { remoteTasks } = useRemoteTasks()
   const isRemoteDeviceFilter = deviceFilter !== null && deviceFilter !== cloudDeviceId()
   const remoteTasksForDevice = isRemoteDeviceFilter ? remoteTasks.filter((rt) => rt.toDevice === deviceFilter) : []
@@ -114,7 +117,8 @@ export function TaskList() {
 
   const groupsById = new Map(groups.map((g) => [g.groupId, g]))
   const groupNameByGroupId = new Map(groups.map((g) => [g.groupId, groupDisplayName(g).toLowerCase()]))
-  const filteredByDims = filterTasks(tasks, { statusTab, typeFilter, queueFilter, search, groupNameByGroupId })
+  const categories = visibleCategories(parseCategories(config?.[CATEGORIES_KEY]))
+  const filteredByDims = filterTasks(tasks, { statusTab, categoryFilter, categories, queueFilter, search, groupNameByGroupId })
   const filtered = prefs.showCompleted ? filteredByDims : filteredByDims.filter((task) => task.status !== 3)
 
   // 按 groupId 聚合：仅存在于 groups 列表中的组才聚合为活卡片。
@@ -213,8 +217,15 @@ export function TaskList() {
     clearScrollTarget()
   }, [scrollTarget])
 
+  // 点空白退出选中。虚拟列表在行与滚动容器之间还夹着「撑高层 + 每项绝对定位包裹层」，
+  // 用 e.target === e.currentTarget 会把落在这两层上的点击漏判成点在行上；改为向上寻找
+  // 可选中元素，找不到就一律视为空白，行/卡片自身的点击照常冒泡到 selectTask 不受影响。
+  function onScrollAreaClick(e: MouseEvent<HTMLDivElement>) {
+    if (!(e.target as HTMLElement).closest('.task-row, .grow, .gcard, .group-head, .gdir-row')) clearSelection()
+  }
+
   return (
-    <div className={cn('task-scroll', manageMode && 'manage', isGrid && 'grid-form')} ref={parentRef}>
+    <div className={cn('task-scroll', manageMode && 'manage', isGrid && 'grid-form')} ref={parentRef} onClick={onScrollAreaClick}>
       {flat.length === 0 ? (
         <p className="empty-tip">{t('list.empty')}</p>
       ) : (

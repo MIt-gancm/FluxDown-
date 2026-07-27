@@ -8,7 +8,7 @@
 // 全程若命中"宿主不支持"错误（见 lib/link.ts isLinkUnsupportedError），退化为一条提示，
 // 不展示发现列表/表单，避免用户对着一个永远不会有结果的空列表干等。
 
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronRight, Monitor, Plus, Smartphone, X } from 'lucide-react'
@@ -24,7 +24,8 @@ function peerKey(peer: { host: string; port: number }): string {
   return `${peer.host}:${peer.port}`
 }
 
-export function AddLocalDeviceDialog() {
+/** `trigger`：自定义触发元素（侧边栏用一条 `.side-item`）；省略时用设置页那颗描边按钮。 */
+export function AddLocalDeviceDialog({ trigger }: { trigger?: ReactNode } = {}) {
   const { t } = useI18n()
   const qc = useQueryClient()
   const [open, setOpen] = useState(false)
@@ -147,10 +148,12 @@ export function AddLocalDeviceDialog() {
   return (
     <Dialog.Root open={open} onOpenChange={(o) => (o ? setOpen(true) : close())}>
       <Dialog.Trigger asChild>
-        <button type="button" className="btn ghost">
-          <Plus size={14} />
-          {t('link.addDevice')}
-        </button>
+        {trigger ?? (
+          <button type="button" className="btn ghost">
+            <Plus size={14} />
+            {t('link.addDevice')}
+          </button>
+        )}
       </Dialog.Trigger>
       <Dialog.Portal>
         <Dialog.Overlay className="wbackdrop show" />

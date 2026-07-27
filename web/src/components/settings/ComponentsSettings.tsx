@@ -25,7 +25,7 @@ import {
   useYtdlpStatusQuery,
   useYtdlpVersionsQuery,
 } from '../../hooks/useComponents'
-import { useConfigMutation, useConfigQuery } from './useConfig'
+import { useConfigMutation, useConfigQuery } from '../../lib/config'
 import { SetRow, SetSelect, TextFieldRow } from './controls'
 
 type ComponentName = 'ffmpeg' | 'ytdlp'

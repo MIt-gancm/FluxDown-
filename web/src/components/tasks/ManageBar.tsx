@@ -3,6 +3,8 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../../lib/api'
+import { parseCategories, visibleCategories } from '../../lib/categories'
+import { CATEGORIES_KEY, useConfigQuery } from '../../lib/config'
 import { confirmDialog } from '../../lib/confirm'
 import { useI18n } from '../../lib/i18n'
 import { groupDisplayName } from '../../lib/task-group'
@@ -12,9 +14,10 @@ import { useViewTasks } from './useViewTasks'
 
 export function ManageBar() {
   const { t } = useI18n()
-  const { manageMode, setManageMode, selected, setSelected, statusTab, typeFilter, queueFilter, search } = useTasksUi()
+  const { manageMode, setManageMode, selected, setSelected, statusTab, categoryFilter, queueFilter, search } = useTasksUi()
   const tasks = useViewTasks()
   const { data: groups = [] } = useQuery({ queryKey: ['groups'], queryFn: api.listGroups })
+  const { data: config } = useConfigQuery()
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['tasks'] })
 
@@ -37,7 +40,8 @@ export function ManageBar() {
   if (!manageMode) return null
 
   const groupNameByGroupId = new Map(groups.map((g) => [g.groupId, groupDisplayName(g).toLowerCase()]))
-  const visible = filterTasks(tasks, { statusTab, typeFilter, queueFilter, search, groupNameByGroupId })
+  const categories = visibleCategories(parseCategories(config?.[CATEGORIES_KEY]))
+  const visible = filterTasks(tasks, { statusTab, categoryFilter, categories, queueFilter, search, groupNameByGroupId })
   const allSelected = visible.length > 0 && visible.every((t) => selected.has(t.taskId))
 
   function toggleAll(checked: boolean) {

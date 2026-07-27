@@ -17,6 +17,7 @@ import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import '../theme/segment_palette.dart';
 import 'edit_threads_dialog.dart';
+import 'file_type_icon.dart';
 import 'task_columns.dart';
 
 /// 插件系统失败任务的错误消息前缀（引擎/hub/server 固定格式，逃生舱按钮据此判断）。
@@ -195,21 +196,10 @@ class _DetailPanelState extends State<DetailPanel> {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Container(
-          width: 40,
-          height: 40,
-          decoration: BoxDecoration(color: c.surface2, borderRadius: m.brCard),
-          child: Center(
-            child: Text(
-              task.fileExtension,
-              style: TextStyle(
-                fontSize: 11,
-                fontWeight: FontWeight.w600,
-                color: c.textSecondary,
-                fontFeatures: const [FontFeature.tabularFigures()],
-              ),
-            ),
-          ),
+        FileTypeIconTile(
+          ext: task.fileExtension,
+          size: 40,
+          borderRadius: m.brCard,
         ),
         const SizedBox(width: 12),
         Expanded(

@@ -7,8 +7,13 @@
 //! **解析永不 panic**：所有失败路径都收敛成 `Err(String)`，由调用方落进
 //! `rss_sources.last_error`（引擎禁 `unwrap`/`expect` 的红线本就兜底）。
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, TimeZone};
 use feed_rs::model::Entry;
 use feed_rs::parser as feed_parser;
+use quick_xml::Reader;
+use quick_xml::events::Event;
 use sha2::{Digest, Sha256};
 
 /// 单次抓取解析出的 feed。
@@ -119,7 +124,8 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
         .parse(bytes)
         .map_err(|e| format!("failed to parse feed: {e}"))?;
 
-    let items = feed.entries.iter().map(map_entry).collect();
+    let mut items: Vec<ParsedItem> = feed.entries.iter().map(map_entry).collect();
+    fill_missing_pub_dates(&mut items, bytes);
     Ok(ParsedFeed {
         title: feed.title.map(|t| t.content).unwrap_or_default(),
         link: feed
@@ -171,6 +177,159 @@ fn map_entry(entry: &Entry) -> ParsedItem {
     }
 }
 
+/// 标准字段没给发布时间时，从条目的扩展命名空间里补一次。
+///
+/// 起因是 Mikan：它的 `<item>` **没有**标准 `<pubDate>`，时间只藏在自定义命名
+/// 空间的 `<torrent xmlns="https://mikanani.me/0.1/"><pubDate>` 里；而 feed-rs
+/// 2.x 不再暴露通用扩展节点（`Entry` 只有 media/dc 等已建模字段），于是整条订阅
+/// 每一行都显示不出时间，条目流也只能退化成按入库顺序排。
+///
+/// 做法是对原始字节再走一遍极轻的 pull 解析：按 `<item>`/`<entry>` 分段，收集段
+/// 内任意深度、任意前缀的 `guid`/`link`/`id` 作为键，取第一个能解析的
+/// `pubDate`/`published`/`updated` 作为值，只回填 `pub_date == 0` 的条目。
+/// feed 本来就已完整解析过一次，这里不做任何结构校验——扫不到就维持 0。
+fn fill_missing_pub_dates(items: &mut [ParsedItem], bytes: &[u8]) {
+    if !items.iter().any(|i| i.pub_date == 0) {
+        return;
+    }
+    let dates = scan_extension_pub_dates(bytes);
+    if dates.is_empty() {
+        return;
+    }
+    for item in items.iter_mut().filter(|i| i.pub_date == 0) {
+        item.pub_date = dates
+            .get(&item.guid)
+            .or_else(|| dates.get(&item.link))
+            .or_else(|| dates.get(&item.enclosure_url))
+            .copied()
+            .unwrap_or(0);
+    }
+}
+
+/// 条目标识（guid / link / enclosure 直链原文）→ Unix 秒。
+fn scan_extension_pub_dates(bytes: &[u8]) -> HashMap<String, i64> {
+    /// 当前正在累积的文本归属。
+    #[derive(PartialEq, Eq)]
+    enum Slot {
+        None,
+        Key,
+        Date,
+    }
+
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut out: HashMap<String, i64> = HashMap::new();
+    let mut in_item = false;
+    let mut slot = Slot::None;
+    let mut keys: Vec<String> = Vec::new();
+    let mut date = 0i64;
+
+    // 解析出错即停：feed-rs 已经成功解析过一遍，这里只是补充信息，
+    // 任何异常都不该让整轮抓取失败。
+    while let Ok(event) = reader.read_event_into(&mut buf) {
+        match event {
+            Event::Eof => break,
+            Event::Start(e) => {
+                slot = match e.local_name().as_ref() {
+                    b"item" | b"entry" => {
+                        in_item = true;
+                        keys.clear();
+                        date = 0;
+                        Slot::None
+                    }
+                    b"guid" | b"link" | b"id" if in_item => Slot::Key,
+                    b"pubDate" | b"pubdate" | b"published" | b"updated" if in_item => Slot::Date,
+                    _ => Slot::None,
+                };
+            }
+            Event::Text(t) => {
+                if let Ok(text) = t.decode() {
+                    match slot {
+                        Slot::Key => push_key(&mut keys, text.as_ref()),
+                        // 日期只认第一个能解析出来的：Mikan 的 `<torrent>` 里
+                        // `<link>` 与 `<pubDate>` 并列，别被后续兄弟节点覆盖。
+                        Slot::Date if date == 0 => date = parse_loose_datetime(text.as_ref()),
+                        _ => {}
+                    }
+                }
+            }
+            Event::CData(t) => {
+                if slot == Slot::Key
+                    && let Ok(text) = t.decode()
+                {
+                    push_key(&mut keys, text.as_ref());
+                }
+            }
+            Event::End(e) => {
+                if matches!(e.local_name().as_ref(), b"item" | b"entry") {
+                    if date > 0 {
+                        for k in keys.drain(..) {
+                            out.insert(k, date);
+                        }
+                    }
+                    in_item = false;
+                }
+                slot = Slot::None;
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+/// 收一个条目标识（空串不进表，否则会把不同条目串到一起）。
+fn push_key(keys: &mut Vec<String>, text: &str) {
+    let key = text.trim();
+    if !key.is_empty() {
+        keys.push(key.to_string());
+    }
+}
+
+/// 宽松解析发布时间 → Unix 秒（0 = 解析不出来）。
+///
+/// RFC 2822 / RFC 3339 之外还要吃「不带时区的本地时间」，Mikan 的
+/// `2025-06-22T01:30:54.145714` 就是这种。这类值按**机器本地时区**解释：站点
+/// 与读者通常同区，比一律当 UTC 少 8 小时的显示错更接近事实。
+fn parse_loose_datetime(raw: &str) -> i64 {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return 0;
+    }
+    if let Ok(d) = DateTime::parse_from_rfc2822(raw) {
+        return d.timestamp();
+    }
+    if let Ok(d) = DateTime::parse_from_rfc3339(raw) {
+        return d.timestamp();
+    }
+    for fmt in [
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M",
+        "%Y-%m-%d %H:%M",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(raw, fmt) {
+            return local_timestamp(naive);
+        }
+    }
+    if let Ok(day) = NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        && let Some(naive) = day.and_hms_opt(0, 0, 0)
+    {
+        return local_timestamp(naive);
+    }
+    0
+}
+
+/// 本地时区解释一个无时区时间；夏令时折叠时取较早的那个解。
+fn local_timestamp(naive: NaiveDateTime) -> i64 {
+    Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .map(|d| d.timestamp())
+        .unwrap_or(0)
+}
+
 /// 取 enclosure 直链与大小。
 ///
 /// 两种来源都要覆盖：
@@ -211,7 +370,7 @@ fn sha256_hex(input: &str) -> String {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{MAX_FEED_BYTES, parse_feed};
+    use super::{MAX_FEED_BYTES, parse_feed, parse_loose_datetime};
 
     /// Mikan Project 的真实 feed 形状（issue #97 样例的最小复刻）。
     const MIKAN: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -260,6 +419,21 @@ mod tests {
         assert_eq!(first.link, "https://mikanani.me/Home/Episode/a1b2c3");
 
         assert!(feed.items[1].pub_date > 0, "pubDate must be parsed");
+    }
+
+    /// Mikan 的 item 没有标准 `<pubDate>`，时间只在 `<torrent>` 扩展里；不补
+    /// 这一手整条订阅就一行时间都显示不出来（也没法按发布时间排序）。
+    #[test]
+    fn fills_pub_date_from_mikan_torrent_extension() {
+        let feed = parse_feed(MIKAN.as_bytes()).unwrap();
+        let expected = chrono::NaiveDate::from_ymd_opt(2026, 7, 27)
+            .and_then(|d| d.and_hms_opt(5, 31, 0))
+            .and_then(|naive| {
+                chrono::TimeZone::from_local_datetime(&chrono::Local, &naive).earliest()
+            })
+            .unwrap()
+            .timestamp();
+        assert_eq!(feed.items[0].pub_date, expected);
     }
 
     #[test]
@@ -333,5 +507,22 @@ mod tests {
         assert!(parse_feed(b"<html><body>login required</body></html>").is_err());
         assert!(parse_feed(b"\xff\xfe\x00garbage").is_err());
         assert!(parse_feed(&vec![b'x'; MAX_FEED_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn loose_datetime_covers_the_shapes_feeds_actually_emit() {
+        // RFC 2822（RSS 2.0 标准写法）与 RFC 3339 都带时区，结果是绝对时刻。
+        assert_eq!(
+            parse_loose_datetime("Fri, 10 Jul 2026 18:33:00 GMT"),
+            1_783_708_380
+        );
+        assert_eq!(parse_loose_datetime("2026-07-10T18:33:00Z"), 1_783_708_380);
+        // Mikan 的小数秒无时区形式：只要求能解析出来（值随本地时区而定）。
+        assert!(parse_loose_datetime("2025-06-22T01:30:54.145714") > 0);
+        assert!(parse_loose_datetime("2025-06-22") > 0);
+        // 解析不出来一律 0，绝不 panic、绝不瞎猜。
+        assert_eq!(parse_loose_datetime(""), 0);
+        assert_eq!(parse_loose_datetime("  "), 0);
+        assert_eq!(parse_loose_datetime("昨天"), 0);
     }
 }

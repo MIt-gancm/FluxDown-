@@ -179,6 +179,12 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// 主区当前被 RSS 条目流占据（而非任务列表）。
+  ///
+  /// 任务侧的批量管理（全选/批删/管理栏）在这个视图下全部无意义——RSS 行不是
+  /// 任务行，弹出管理栏只会遮住订阅头并让「已选 N 项」指向看不见的东西。
+  bool get _isRssView => _rssProvider.selectedSourceId.isNotEmpty;
+
   /// RSS 自动创建了新任务时弹**一条**合批提示（AutoBangumi #64 的高票诉求）。
   ///
   /// 用 seq 去重而不是比对内容：同一批标题可能在多次 notifyListeners 里重复出现
@@ -186,6 +192,17 @@ class _HomePageState extends State<HomePage> {
   int _lastRssNotifySeq = -1;
   void _onRssProviderChanged() {
     if (!mounted) return;
+    // 切到 RSS 订阅时收起任务侧的残留 UI：管理栏（可能在任务列表里按过
+    // Ctrl+A）与详情面板——面板讲的是某个下载任务，条目流里没有它的上下文，
+    // 留着只是占掉半屏并让人以为这条订阅跟那个任务有关。
+    if (_isRssView) {
+      if (_controller.isManageMode) _controller.exitManageMode();
+      if (_isDetailOpen) {
+        _controller.selectTask(null);
+        _controller.selectGroup(null);
+        setState(() => _isDetailOpen = false);
+      }
+    }
     final seq = _rssProvider.notifySeq;
     if (seq == _lastRssNotifySeq) return;
     final first = _lastRssNotifySeq < 0;
@@ -319,7 +336,7 @@ class _HomePageState extends State<HomePage> {
       _headerBarKey.currentState?.focusSearch();
     };
     AppMenuCallbacks.selectAll = () {
-      if (!mounted || _showSettings) return;
+      if (!mounted || _showSettings || _isRssView) return;
       if (!_controller.isManageMode) _controller.enterManageMode();
       _controller.selectAllFiltered();
     };
@@ -456,8 +473,8 @@ class _HomePageState extends State<HomePage> {
       return true;
     }
 
-    // Cmd/Ctrl+A → 全选当前筛选列表（自动进入管理模式）
-    if (isMod && event.logicalKey == LogicalKeyboardKey.keyA) {
+    // Cmd/Ctrl+A → 全选当前筛选列表（自动进入管理模式）。RSS 视图下不适用。
+    if (isMod && event.logicalKey == LogicalKeyboardKey.keyA && !_isRssView) {
       if (!_controller.isManageMode) {
         _controller.enterManageMode();
       }
@@ -478,7 +495,10 @@ class _HomePageState extends State<HomePage> {
         (Platform.isMacOS &&
             isMod &&
             event.logicalKey == LogicalKeyboardKey.backspace);
-    if (isDelete && _controller.isManageMode && _controller.checkedCount > 0) {
+    if (isDelete &&
+        !_isRssView &&
+        _controller.isManageMode &&
+        _controller.checkedCount > 0) {
       if (!mounted) return false;
       showBatchDeleteDialog(
         context,
@@ -799,9 +819,19 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 构建内容区（任务列表在上、详情面板在下）
+  ///
+  /// 主区整体坐在 `surface1` 而不是 `background`：内容用「纸」的白、容器用
+  /// 灰，是这套主题既定的层级语言（侧边栏、详情面板同样是 surface1），任务
+  /// 列表与 RSS 条目流都属于内容。顺带修掉两件事：
+  /// 1. 米灰底上 `elementHover` 只差一档灰（亮色 #F1F3F5 vs #F8F9FA），
+  ///    行悬浮几乎看不出反馈；
+  /// 2. 两块列表原本各自染色，切换 RSS 与任务列表时底色会跳。
+  ///
+  /// 与侧边栏的分界由外层 `DecorationPosition.foreground` 的左边框保证，
+  /// 两边同为 surface1 也不会糊在一起。
   Widget _buildContentArea(AppColors c, double totalHeight) {
     return ColoredBox(
-      color: c.bg,
+      color: c.surface1,
       child: Column(
         children: [
           const SizedBox(height: 40),

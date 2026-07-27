@@ -3,7 +3,7 @@
 
 import { createContext, useContext, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react'
 import { dirKey } from '../../lib/task-group'
-import type { FileType } from '../../lib/format'
+import { ALL_CATEGORY } from '../../lib/categories'
 import type { StatusTab } from './filters'
 
 export type DetailTab = 'general' | 'segments' | 'queue' | 'log' | 'advanced'
@@ -11,8 +11,9 @@ export type DetailTab = 'general' | 'segments' | 'queue' | 'log' | 'advanced'
 const DEVICE_FILTER_KEY = 'fluxdown.tasks.deviceFilter'
 
 interface TasksUiState {
-  typeFilter: 'all' | FileType
-  setTypeFilter: Dispatch<SetStateAction<'all' | FileType>>
+  /** 分类筛选：`ALL_CATEGORY` = 不筛选，其余为分类 id（见 lib/categories.ts）。 */
+  categoryFilter: string
+  setCategoryFilter: Dispatch<SetStateAction<string>>
   queueFilter: string
   setQueueFilter: Dispatch<SetStateAction<string>>
   /** 设备筛选：null=全部设备；本机=cloudDeviceId()；远程设备=其 deviceId（见 Sidebar 设备区）。 */
@@ -44,6 +45,8 @@ interface TasksUiState {
   groupDetailOpen: boolean
   selectGroup: (id: string) => void
   closeGroupDetail: () => void
+  /** 清空任务/任务组选中并收起两个详情面板——列表空白处点击等「退出选中」入口共用。 */
+  clearSelection: () => void
   currentTaskId: string | null
   detailOpen: boolean
   sidebarOpen: boolean
@@ -57,7 +60,7 @@ interface TasksUiState {
 const Ctx = createContext<TasksUiState | null>(null)
 
 export function TasksUiProvider({ children }: { children: ReactNode }) {
-  const [typeFilter, setTypeFilter] = useState<'all' | FileType>('all')
+  const [categoryFilter, setCategoryFilter] = useState<string>(ALL_CATEGORY)
   const [queueFilter, setQueueFilter] = useState('all')
   const [deviceFilter, setDeviceFilterState] = useState<string | null>(() => localStorage.getItem(DEVICE_FILTER_KEY))
   const [rssFilter, setRssFilter] = useState<string | null>(null)
@@ -108,8 +111,11 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
     setCurrentTaskId(null)
     setDetailOpen(false)
   }
+  // 面板关闭即选中结束：留着 currentTaskId/selectedGroupId 会让列表行挂着一圈
+  // 无法解释的选中态（面板已经不在了），用户只能靠再点一次同一行才消得掉。
   function closeGroupDetail() {
     setGroupDetailOpen(false)
+    setSelectedGroupId(null)
   }
   function toggleGroupExpand(id: string) {
     setExpandedGroups((prev) => {
@@ -146,13 +152,20 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
   }
   function closeDetail() {
     setDetailOpen(false)
+    setCurrentTaskId(null)
+  }
+  function clearSelection() {
+    setCurrentTaskId(null)
+    setDetailOpen(false)
+    setSelectedGroupId(null)
+    setGroupDetailOpen(false)
   }
 
   return (
     <Ctx.Provider
       value={{
-        typeFilter,
-        setTypeFilter,
+        categoryFilter,
+        setCategoryFilter,
         queueFilter,
         setQueueFilter,
         deviceFilter,
@@ -180,6 +193,7 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
         groupDetailOpen,
         selectGroup,
         closeGroupDetail,
+        clearSelection,
         currentTaskId,
         detailOpen,
         sidebarOpen,

@@ -3020,6 +3020,37 @@ impl Db {
         Ok(inserted)
     }
 
+    /// 回填历史条目缺失的发布时间。
+    ///
+    /// 已知 guid 在抓取阶段就被整条跳过（guid 即身份，内容变化不重下），所以
+    /// 解析器新补上的扩展 `pubDate`（Mikan `<torrent>`）到不了 `INSERT`。这里
+    /// 专门只补 `pub_date = 0` 的行：非零值一律尊重，绝不覆盖。
+    pub async fn backfill_rss_pub_dates(
+        &self,
+        source_id: &str,
+        items: &[(String, i64)],
+    ) -> Result<u64, DbError> {
+        if items.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut updated = 0u64;
+        for (guid, pub_date) in items {
+            let r = sqlx::query(
+                "UPDATE rss_items SET pub_date = $1 \
+                 WHERE source_id = $2 AND guid = $3 AND pub_date = 0",
+            )
+            .bind(*pub_date)
+            .bind(source_id)
+            .bind(guid)
+            .execute(&mut *tx)
+            .await?;
+            updated += r.rows_affected();
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     /// 改写单条目的处置结果。
     pub async fn set_rss_item_status(
         &self,

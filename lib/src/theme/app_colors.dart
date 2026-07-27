@@ -75,6 +75,13 @@ class AppColors {
   static const amber = Color(0xFFF59E0B);
   static const red = Color(0xFFEF4444);
 
+  // ── File category（静态常量 — 文件类型着色）──
+  // 色值沿用 manifest 原型规格（manifest.js `MF_EXT_TYPE` + styles.css `.mf-ftile.t-*`）：
+  // 只有 video / audio 需要专属色，image→green、archive→amber、document→accent、
+  // program/other→中性，均复用既有 token，不新增主题字段（不动 schemaVersion）。
+  static const categoryVideo = Color(0xFFA855F7);
+  static const categoryAudio = Color(0xFF06B6D4);
+
   // ── Segment Palette ──
   List<Color> get segmentPalette => _tokens.segmentPalette;
 }

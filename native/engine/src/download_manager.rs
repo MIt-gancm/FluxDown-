@@ -6102,6 +6102,24 @@ impl DownloadManager {
         self.rss.tick(now, &proxy, &ua);
     }
 
+    /// 新建订阅并**立刻抓一次**，返回新订阅 ID（`url` 为空时 `None`）。
+    ///
+    /// 光靠 `last_fetch_at = 0` 等下一次 tick 不够：节拍是分钟级的，用户点完
+    /// 「订阅」看到的是一条空列表，只能自己再按一次「立即抓取」。订阅这个动作
+    /// 本身就是「我要这个源的内容」，抓取必须同步跟上。
+    ///
+    /// 所有入口（Dart 信号 / REST / MCP / CLI）都应走这里而不是
+    /// `rss.create_source`——后者只落库，代理与 UA 也不在 `RssManager` 手上。
+    pub async fn create_rss_source(
+        &mut self,
+        source: crate::rss::model::RssSourceInfo,
+    ) -> Option<String> {
+        let id = self.rss.create_source(source).await?;
+        let (proxy, ua) = (self.proxy_config.clone(), self.global_user_agent.clone());
+        self.rss.refresh_now(&id, &proxy, &ua);
+        Some(id)
+    }
+
     /// 立即抓取一个订阅（「立即刷新」）。返回是否真的派发（已在抓取中或
     /// 订阅不存在时为 `false`）。
     pub fn refresh_rss_source(&mut self, source_id: &str) -> bool {

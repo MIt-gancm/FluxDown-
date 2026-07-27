@@ -6,7 +6,6 @@ import 'package:shadcn_ui/shadcn_ui.dart';
 import 'package:window_manager/window_manager.dart';
 import '../../main.dart';
 import '../models/download_controller.dart';
-import '../models/download_task.dart';
 import '../models/settings_provider.dart';
 import '../pages/settings_page.dart';
 import '../services/log_service.dart';
@@ -14,6 +13,7 @@ import '../i18n/locale_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'context_menu.dart';
+import 'file_type_icon.dart';
 import 'title_drag_area.dart';
 
 // ─────────────────────────────────────────────
@@ -150,7 +150,7 @@ class HeaderBarState extends State<HeaderBar> {
             type: SearchResultType.task,
             title: task.fileName,
             subtitle: '${task.statusText} · ${task.sizeText}',
-            icon: _iconForCategory(task.fileCategory),
+            icon: fileTypeIcon(task.fileExtension),
             taskId: task.id,
           ),
         );
@@ -199,18 +199,6 @@ class HeaderBarState extends State<HeaderBar> {
     }
 
     return results;
-  }
-
-  IconData _iconForCategory(FileCategory category) {
-    return switch (category) {
-      FileCategory.video => LucideIcons.film,
-      FileCategory.audio => LucideIcons.music,
-      FileCategory.document => LucideIcons.fileText,
-      FileCategory.image => LucideIcons.image,
-      FileCategory.program => LucideIcons.package2,
-      FileCategory.archive => LucideIcons.archive,
-      _ => LucideIcons.file,
-    };
   }
 
   void _showOverlay() {

@@ -35,6 +35,12 @@ class RssProvider extends ChangeNotifier {
   /// 完成判据（引擎在成功与失败两条路径上都会回写它并广播）。
   final Map<String, int> _refreshingSince = {};
 
+  /// 正在建任务的条目 → 派发那一刻的 [_itemStamp]（`'sourceId\0guid'` 为键）。
+  ///
+  /// 与 [_refreshingSince] 同构：完成判据是引擎把结果写回了这条条目，指纹
+  /// 一变就解除。
+  final Map<String, String> _downloadingItems = {};
+
   bool _disposed = false;
 
   StreamSubscription<RustSignalPack<AllRssSources>>? _sourcesSub;
@@ -125,6 +131,16 @@ class RssProvider extends ChangeNotifier {
   void _onItems(RustSignalPack<RssItemsSnapshot> pack) {
     final msg = pack.message;
     _items[msg.sourceId] = msg.items;
+    // 手动下载的完成判据：引擎真的动过这条条目（状态或任务回链变了）。
+    if (_downloadingItems.isNotEmpty) {
+      for (final item in msg.items) {
+        final key = _itemKey(msg.sourceId, item.guid);
+        final before = _downloadingItems[key];
+        if (before != null && before != _itemStamp(item)) {
+          _downloadingItems.remove(key);
+        }
+      }
+    }
     // 条目流刷新同样意味着那一轮抓取已经结束（同秒二次刷新时 lastFetchAt
     // 可能不变，这里做第二重解除）。
     _refreshingSince.remove(msg.sourceId);
@@ -246,10 +262,41 @@ class RssProvider extends ChangeNotifier {
   }
 
   /// 手动下载一个条目（绕过规则与剧集去重）。
+  ///
+  /// 派发后进入「准备中」，直到引擎把结果写回条目为止——手动下载不是一次
+  /// 本地状态翻转：引擎要去抓 `.torrent`（Mikan 这类站点常要好几秒）、解析、
+  /// 再建任务。期间没有任何反馈，用户只会反复点同一行。
   void downloadItem(String sourceId, String guid) {
+    final key = _itemKey(sourceId, guid);
+    if (_downloadingItems.containsKey(key)) return;
+    final current = (_items[sourceId] ?? const <RssItemEntry>[])
+        .where((i) => i.guid == guid)
+        .firstOrNull;
+    _downloadingItems[key] = current == null ? '' : _itemStamp(current);
     SetRssItemAction(sourceId: sourceId, guid: guid, action: 0)
         .sendSignalToRust();
+    _safeNotifyListeners();
+    // 兜底解除：种子抓取失败时条目会原样留在 New（引擎刻意不把 .torrent 当
+    // 普通文件下下来），没有任何状态变化可等——不能让这一行永远转圈。
+    Timer(const Duration(seconds: 45), () => _clearDownloading(key));
   }
+
+  /// 该条目是否正在建任务（供按钮显示 spinner / 禁用）。
+  bool isItemDownloading(String sourceId, String guid) =>
+      _downloadingItems.containsKey(_itemKey(sourceId, guid));
+
+  void _clearDownloading(String key) {
+    if (_downloadingItems.remove(key) != null) _safeNotifyListeners();
+  }
+
+  static String _itemKey(String sourceId, String guid) =>
+      '$sourceId\u0000$guid';
+
+  /// 「这条条目有没有被引擎动过」的指纹。
+  ///
+  /// 重新下载时 `status` 仍是 `downloaded` 不变，但 `taskId` 会换成新任务，
+  /// 所以两者都要看。
+  static String _itemStamp(RssItemEntry i) => '${i.status}/${i.taskId}';
 
   /// 忽略一个条目。
   void ignoreItem(String sourceId, String guid) {

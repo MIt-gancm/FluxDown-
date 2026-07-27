@@ -1,26 +1,42 @@
-// 侧边栏（220px）：品牌 + 全局速度、文件类型导航、队列导航、连接徽标、反馈入口。
-// 对齐 design/web/index.html .sidebar 结构与 app.js renderSideNavs()。
+// 侧边栏（220px）：品牌 + 全局速度、分类 / 设备 / 队列 / RSS 四个可折叠区块、连接徽标、反馈入口。
+//
+// 四个区块的显隐与折叠状态存在引擎 config 表里（见 lib/config.ts 的键表），与桌面客户端
+// 是同一份数据：在任一端右键区块标题「隐藏此区块」，另一端下次读配置也随之隐藏。四个全隐
+// 时整条侧边栏收起（见 routes/tasks.tsx），此时只剩设置页能把它们请回来。
 
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
+import * as ContextMenu from '@radix-ui/react-context-menu'
 import * as Dialog from '@radix-ui/react-dialog'
-import { Archive, ArrowUpCircle, FileText, Image as ImageIcon, LayoutGrid, List, Loader2, LogOut, Film, Monitor, Music, MessageCircle, File as FileIcon, Package2, Pause, Play, Plus, RefreshCw, Radio, Smartphone, Trash2, X } from 'lucide-react'
-import type { LucideIcon } from 'lucide-react'
+import { ArrowUpCircle, ChevronDown, EyeOff, Globe, List, Loader2, LogOut, Monitor, MessageCircle, Pause, Play, Plus, RefreshCw, Radio, Smartphone, Trash2, X } from 'lucide-react'
+import type { ReactNode } from 'react'
+import { AddLocalDeviceDialog } from '../dialogs/add-local-device'
 import { api } from '../../lib/api'
+import { categoryIcon, categoryIdOf, categoryLabel, parseCategories, visibleCategories, ALL_CATEGORY } from '../../lib/categories'
 import { cloudApi } from '../../lib/cloud/client'
-import { cloudDeviceId, useCloudSession, useShowDeviceSync } from '../../lib/cloud/session'
+import { cloudDeviceId, useCloudSession } from '../../lib/cloud/session'
 import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
 import { linkApi } from '../../lib/link'
 import { clearCredentials, getBase } from '../../lib/auth'
 import { cn } from '../../lib/cn'
-import { fileType, fmtSpeed, fmtTime, queueDisplayName, typeLabel, TYPE_ORDER, type FileType as FT } from '../../lib/format'
+import {
+  boolEntry,
+  CATEGORIES_KEY,
+  EXPANDED_KEY,
+  readBool,
+  readTriBool,
+  SECTION_KEY,
+  useConfigMutation,
+  useConfigQuery,
+} from '../../lib/config'
+import { fmtSpeed, fmtTime, queueDisplayName } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
 import { connStore, disconnectWs, useGlobalSpeed, useStore } from '../../lib/ws'
 import { useUpdateCheck } from '../../lib/update'
 import { confirmDialog } from '../../lib/confirm'
 import { sourceDisplayName } from '../../lib/rss-filter'
-import type { RssSourceDto } from '../../lib/types'
+import type { ConfigMap, RssSourceDto } from '../../lib/types'
 import {
   beginRssFetch,
   useDeleteRssSourceMutation,
@@ -28,27 +44,17 @@ import {
   useRssFetching,
   useRssSourcesQuery,
 } from '../../hooks/useRss'
+import { ColResizer, SIDEBAR_W } from './ColResizer'
 import { useTasksUi } from './context'
 import { QueueManagerDialog } from './queue-manager-dialog'
 import { RssCreateDialog, RssManagerDialog } from './rss-manager-dialog'
 import { useViewTasks } from './useViewTasks'
 
-const TYPE_ICONS: Record<'all' | FT, LucideIcon> = {
-  all: LayoutGrid,
-  video: Film,
-  audio: Music,
-  document: FileText,
-  image: ImageIcon,
-  program: Package2,
-  archive: Archive,
-  other: FileIcon,
-}
-
 export function Sidebar() {
   const { t } = useI18n()
   const tasks = useViewTasks()
   const { data: queues = [] } = useQuery({ queryKey: ['queues'], queryFn: api.listQueues })
-  const { typeFilter, setTypeFilter, queueFilter, setQueueFilter, deviceFilter, setDeviceFilter, setRssFilter, sidebarOpen, setSidebarOpen } = useTasksUi()
+  const { categoryFilter, setCategoryFilter, queueFilter, setQueueFilter, deviceFilter, setDeviceFilter, rssFilter, setRssFilter, sidebarOpen, setSidebarOpen } = useTasksUi()
   const speed = useGlobalSpeed()
   const conn = useStore(connStore)
   const update = useUpdateCheck()
@@ -57,8 +63,9 @@ export function Sidebar() {
   const [logoutOpen, setLogoutOpen] = useState(false)
   const [rssCreateOpen, setRssCreateOpen] = useState(false)
   const session = useCloudSession()
-  const showDeviceOverride = useShowDeviceSync()
   const myDeviceId = cloudDeviceId()
+  const { data: config } = useConfigQuery()
+  const configMut = useConfigMutation()
   const { data: cloudDevices = [] } = useQuery({
     queryKey: ['cloud', 'devices'],
     queryFn: () => cloudApi.devices().then((r) => r.devices),
@@ -67,11 +74,8 @@ export function Sidebar() {
   })
   const remoteDevices = cloudDevices.filter((d) => d.deviceId !== myDeviceId)
   const { remoteTasks } = useRemoteTasks()
-  // 渐进披露：已登录 + 至少一台远程设备才显示设备区；设置页「显示设备同步」开关可强制显示
-  // （即使仅本机，便于提前熟悉入口，见 mdc §4「或本地开关」）。
-  const showDeviceSection = session.status === 'authenticated' && (remoteDevices.length > 0 || showDeviceOverride)
   // 本地设备(link)小节：仅展示已配对设备（在线圆点），不参与 deviceFilter 任务过滤——
-  // 本地设备的任务运行在对端，本端看不到其进度，点击没有意义（见契约 web 侧说明）。
+  // 本地设备的任务运行在对端，本端看不到其进度，点击没有意义。
   const { data: linkDevices = [] } = useQuery({
     queryKey: ['link', 'devices'],
     queryFn: () => linkApi.devices().then((r) => r.devices),
@@ -79,6 +83,29 @@ export function Sidebar() {
     retry: false,
   })
   const showLinkSection = linkDevices.length > 0
+
+  // 区块显隐。设备区是三态：未设置 = 有别的设备才显示（渐进披露），显式 true/false 则强制。
+  //
+  // 它**不要求登录云账户**：本机始终是一台设备，局域网直连配对也不经账号；
+  // 云端登录只决定「远程设备」这一小节有没有内容。把整区挂在登录状态上，会让
+  // 打开开关的用户对着空白发懵。
+  const showCategory = readBool(config, SECTION_KEY.category)
+  const showQueues = readBool(config, SECTION_KEY.queues)
+  const showRss = readBool(config, SECTION_KEY.rss)
+  const hasAnyDevice = remoteDevices.length > 0 || showLinkSection
+  const showDeviceSection = readTriBool(config, SECTION_KEY.device) ?? hasAnyDevice
+
+  // 写配置先本地落一帧再发请求：折叠箭头等交互的反馈必须是即时的，等一轮往返
+  // 才动会像点了没反应。服务端回执后 invalidate 会用权威值覆盖这一帧。
+  function writeConfig(entries: ConfigMap) {
+    qc.setQueryData<ConfigMap>(['config'], (prev) => ({ ...(prev ?? {}), ...entries }))
+    configMut.mutate(entries)
+  }
+  const expanded = (k: keyof typeof EXPANDED_KEY) => readBool(config, EXPANDED_KEY[k])
+  const toggleExpanded = (k: keyof typeof EXPANDED_KEY) => writeConfig(boolEntry(EXPANDED_KEY[k], !expanded(k)))
+  const hideSection = (k: keyof typeof SECTION_KEY) => writeConfig(boolEntry(SECTION_KEY[k], false))
+
+  const categories = visibleCategories(parseCategories(config?.[CATEGORIES_KEY]))
 
   function logout() {
     setLogoutOpen(false)
@@ -129,7 +156,12 @@ export function Sidebar() {
         ? t('sidebar.connecting')
         : t('sidebar.disconnected')
 
+  // 四个区块全隐时整条侧边栏（含拖拽把手）不渲染：留一条只剩品牌与连接徽标的
+  // 空栏白占 220px。设置页的「界面区块」是把它们请回来的唯一入口。
+  if (!showCategory && !showQueues && !showRss && !showDeviceSection) return null
+
   return (
+    <>
     <aside className={cn('sidebar', sidebarOpen && 'open')}>
       <div className="side-brand">
         <span className="side-logo">
@@ -147,154 +179,211 @@ export function Sidebar() {
         </div>
       </div>
 
+      {/* RSS 条目流占着主区时，任务侧的三个区块都不是「当前所在位置」——它们只是
+          回到任务列表的入口，此刻高亮任何一项都是在指向看不见的东西。 */}
       <div className="side-scroll">
-        <p className="side-label">{t('sidebar.fileTypes')}</p>
-        <nav className="side-nav">
-          {TYPE_ORDER.map((k) => {
-            const Icon = TYPE_ICONS[k]
-            const count = k === 'all' ? tasks.length : tasks.filter((t) => fileType(t.fileName, t.url) === k).length
-            return (
-              <button key={k} type="button" className={cn('side-item', typeFilter === k && 'active')} onClick={() => { setTypeFilter(k); setRssFilter(null); setSidebarOpen(false) }}>
-                <Icon size={15} />
-                <span>{typeLabel(k)}</span>
-                <em>{count || ''}</em>
-              </button>
-            )
-          })}
-        </nav>
-
-        {showDeviceSection && (
+        {showCategory && (
           <>
-            <p className="side-label">{t('sidebar.devices')}</p>
-            <nav className="side-nav">
-              <button
-                type="button"
-                className={cn('side-item', deviceFilter === null && 'active')}
-                onClick={() => { setDeviceFilter(null); setSidebarOpen(false) }}
-              >
-                <Monitor size={15} />
-                <span>{t('sidebar.allDevices')}</span>
-              </button>
-              <button
-                type="button"
-                className={cn('side-item', deviceFilter === myDeviceId && 'active')}
-                onClick={() => { setDeviceFilter(myDeviceId); setSidebarOpen(false) }}
-              >
-                <Monitor size={15} />
-                <i className="queue-dot on" title={t('link.online')} />
-                <span>{t('cloud.deviceCurrent')}</span>
-                <em>{tasks.length || ''}</em>
-              </button>
-              {remoteDevices.map((d) => {
-                const Icon = d.platform === 'android' || d.platform === 'ios' ? Smartphone : Monitor
-                const count = remoteTasks.filter((rt) => rt.toDevice === d.deviceId).length
-                return (
-                  <button
-                    key={d.id}
-                    type="button"
-                    className={cn('side-item', deviceFilter === d.deviceId && 'active')}
-                    onClick={() => { setDeviceFilter(d.deviceId); setSidebarOpen(false) }}
-                  >
-                    <Icon size={15} />
-                    <i className={cn('queue-dot', d.isOnline && 'on')} title={d.isOnline ? t('link.online') : t('link.offline')} />
-                    <span>{d.name || '-'}</span>
-                    <em>{count || ''}</em>
-                  </button>
-                )
-              })}
-            </nav>
-          </>
-        )}
-
-        {showLinkSection && (
-          <>
-            <p className="side-label">{t('sidebar.directDevices')}</p>
-            <nav className="side-nav">
-              {linkDevices.map((d) => {
-                const Icon = d.platform === 'android' || d.platform === 'ios' ? Smartphone : Monitor
-                return (
-                  <div key={d.fingerprint} className="side-item">
-                    <Icon size={15} />
-                    <i className={cn('queue-dot', d.online && 'on')} title={d.online ? t('link.online') : t('link.offline')} />
-                    <span>{d.name || '-'}</span>
-                  </div>
-                )
-              })}
-            </nav>
-          </>
-        )}
-
-        <p className="side-label row">
-          {t('sidebar.queues')}
-          <button type="button" className="side-add" title={t('sidebar.newQueue')} onClick={addQueue}>
-            <Plus size={13} />
-          </button>
-        </p>
-        <nav className="side-nav">
-          {queues.map((q) => {
-            const count = tasks.filter((t) => t.queueId === q.queueId).length
-            const builtin = q.queueId === 'main' || q.queueId === 'later'
-            const displayName = queueDisplayName(q)
-            return (
-              <div key={q.queueId} className="queue-row">
-                <button
-                  type="button"
-                  className={cn('side-item', queueFilter === q.queueId && 'active')}
-                  onClick={() => { setQueueFilter((f) => (f === q.queueId ? 'all' : q.queueId)); setRssFilter(null); setSidebarOpen(false) }}
-                >
-                  <List size={15} />
-                  <i
-                    className={cn('queue-dot', q.isRunning && 'on')}
-                    title={q.isRunning ? t('sidebar.queueRunning') : t('sidebar.queueStopped')}
-                  />
-                  <span>{displayName}</span>
-                  <em>{count || ''}</em>
-                </button>
-                <div className="queue-actions">
-                  <button
-                    type="button"
-                    className="icon-btn sm"
-                    title={q.isRunning ? t('sidebar.stopQueue') : t('sidebar.startQueue')}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      if (q.isRunning) stopQueue.mutate(q.queueId)
-                      else startQueue.mutate(q.queueId)
-                    }}
-                  >
-                    {q.isRunning ? <Pause size={13} /> : <Play size={13} />}
-                  </button>
-                  <QueueManagerDialog queue={q} queueName={displayName} />
-                  {!builtin && (
+            <SectionLabel
+              title={t('sidebar.fileTypes')}
+              expanded={expanded('category')}
+              onToggle={() => toggleExpanded('category')}
+              onHide={() => hideSection('category')}
+            />
+            {expanded('category') && (
+              <nav className="side-nav">
+                {categories.map((c) => {
+                  const Icon = categoryIcon(c)
+                  const count =
+                    c.builtinType === 'all'
+                      ? tasks.length
+                      : tasks.filter((task) => categoryIdOf(task, categories) === c.id).length
+                  const active = c.builtinType === 'all' ? categoryFilter === ALL_CATEGORY : categoryFilter === c.id
+                  return (
                     <button
+                      key={c.id}
                       type="button"
-                      className="icon-btn sm"
-                      title={t('sidebar.deleteQueue')}
-                      onClick={async (e) => {
-                        e.stopPropagation()
-                        if (await confirmDialog({ title: t('sidebar.deleteQueue'), message: t('sidebar.deleteQueueMsg', { name: displayName }), danger: true }))
-                          deleteQueue.mutate(q.queueId)
+                      className={cn('side-item', !rssFilter && active && 'active')}
+                      onClick={() => {
+                        setCategoryFilter(c.builtinType === 'all' ? ALL_CATEGORY : c.id)
+                        setRssFilter(null)
+                        setSidebarOpen(false)
                       }}
                     >
-                      <Trash2 size={13} />
+                      <Icon size={15} />
+                      <span>{categoryLabel(c)}</span>
+                      <em>{count || ''}</em>
                     </button>
-                  )}
-                </div>
-              </div>
-            )
-          })}
-        </nav>
+                  )
+                })}
+              </nav>
+            )}
+          </>
+        )}
+        {showQueues && (
+          <>
+            <SectionLabel
+              title={t('sidebar.queues')}
+              expanded={expanded('queues')}
+              onToggle={() => toggleExpanded('queues')}
+              onHide={() => hideSection('queues')}
+              onAdd={addQueue}
+              addTitle={t('sidebar.newQueue')}
+            />
+            {expanded('queues') && (
+              <nav className="side-nav">
+                {queues.map((q) => {
+                  const count = tasks.filter((t) => t.queueId === q.queueId).length
+                  const builtin = q.queueId === 'main' || q.queueId === 'later'
+                  const displayName = queueDisplayName(q)
+                  return (
+                    <div key={q.queueId} className="queue-row">
+                      <button
+                        type="button"
+                        className={cn('side-item', !rssFilter && queueFilter === q.queueId && 'active')}
+                        onClick={() => { setQueueFilter((f) => (f === q.queueId ? 'all' : q.queueId)); setRssFilter(null); setSidebarOpen(false) }}
+                      >
+                        <List size={15} />
+                        <i
+                          className={cn('queue-dot', q.isRunning && 'on')}
+                          title={q.isRunning ? t('sidebar.queueRunning') : t('sidebar.queueStopped')}
+                        />
+                        <span>{displayName}</span>
+                        <em>{count || ''}</em>
+                      </button>
+                      <div className="queue-actions">
+                        <button
+                          type="button"
+                          className="icon-btn sm"
+                          title={q.isRunning ? t('sidebar.stopQueue') : t('sidebar.startQueue')}
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            if (q.isRunning) stopQueue.mutate(q.queueId)
+                            else startQueue.mutate(q.queueId)
+                          }}
+                        >
+                          {q.isRunning ? <Pause size={13} /> : <Play size={13} />}
+                        </button>
+                        <QueueManagerDialog queue={q} queueName={displayName} />
+                        {!builtin && (
+                          <button
+                            type="button"
+                            className="icon-btn sm"
+                            title={t('sidebar.deleteQueue')}
+                            onClick={async (e) => {
+                              e.stopPropagation()
+                              if (await confirmDialog({ title: t('sidebar.deleteQueue'), message: t('sidebar.deleteQueueMsg', { name: displayName }), danger: true }))
+                                deleteQueue.mutate(q.queueId)
+                            }}
+                          >
+                            <Trash2 size={13} />
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </nav>
+            )}
+          </>
+        )}
 
-        <p className="side-label row">
-          {t('sidebar.rss')}
-          <button type="button" className="side-add" title={t('rss.newSource')} onClick={() => setRssCreateOpen(true)}>
-            <Plus size={13} />
-          </button>
-        </p>
-        <nav className="side-nav">
-          {rssSources.map((s) => (
-            <RssSourceRow key={s.sourceId} source={s} />
-          ))}
-        </nav>
+        {showRss && (
+          <>
+            <SectionLabel
+              title={t('sidebar.rss')}
+              expanded={expanded('rss')}
+              onToggle={() => toggleExpanded('rss')}
+              onHide={() => hideSection('rss')}
+              onAdd={() => setRssCreateOpen(true)}
+              addTitle={t('rss.newSource')}
+            />
+            {expanded('rss') && (
+              <nav className="side-nav">
+                {rssSources.map((s) => (
+                  <RssSourceRow key={s.sourceId} source={s} />
+                ))}
+              </nav>
+            )}
+          </>
+        )}
+
+        {/* 设备区固定排在最末：它是「去哪台机器下载」的切换器，不是内容导航，
+            混在分类/队列中间会打断从上到下「筛什么 → 看什么」的阅读顺序。 */}
+        {showDeviceSection && (
+          <>
+            <SectionLabel
+              title={t('sidebar.devices')}
+              expanded={expanded('device')}
+              onToggle={() => toggleExpanded('device')}
+              onHide={() => hideSection('device')}
+            />
+            {expanded('device') && (
+              <nav className="side-nav">
+                <button
+                  type="button"
+                  className={cn('side-item', !rssFilter && deviceFilter === null && 'active')}
+                  onClick={() => { setDeviceFilter(null); setRssFilter(null); setSidebarOpen(false) }}
+                >
+                  <Globe size={15} />
+                  <span>{t('sidebar.allDevices')}</span>
+                </button>
+                <button
+                  type="button"
+                  className={cn('side-item', !rssFilter && deviceFilter === myDeviceId && 'active')}
+                  onClick={() => { setDeviceFilter(myDeviceId); setRssFilter(null); setSidebarOpen(false) }}
+                >
+                  <Monitor size={15} />
+                  <i className="queue-dot on" title={t('link.online')} />
+                  <span>{t('cloud.deviceCurrent')}</span>
+                  <em>{tasks.length || ''}</em>
+                </button>
+                {remoteDevices.map((d) => {
+                  const Icon = d.platform === 'android' || d.platform === 'ios' ? Smartphone : Monitor
+                  const count = remoteTasks.filter((rt) => rt.toDevice === d.deviceId).length
+                  return (
+                    <button
+                      key={d.id}
+                      type="button"
+                      className={cn('side-item', !rssFilter && deviceFilter === d.deviceId && 'active')}
+                      onClick={() => { setDeviceFilter(d.deviceId); setRssFilter(null); setSidebarOpen(false) }}
+                    >
+                      <Icon size={15} />
+                      <i className={cn('queue-dot', d.isOnline && 'on')} title={d.isOnline ? t('link.online') : t('link.offline')} />
+                      <span>{d.name || '-'}</span>
+                      <em>{count || ''}</em>
+                    </button>
+                  )
+                })}
+                {showLinkSection && (
+                  <>
+                    <p className="side-sublabel">{t('sidebar.directDevices')}</p>
+                    {linkDevices.map((d) => {
+                      const Icon = d.platform === 'android' || d.platform === 'ios' ? Smartphone : Monitor
+                      return (
+                        <div key={d.fingerprint} className="side-item">
+                          <Icon size={15} />
+                          <i className={cn('queue-dot', d.online && 'on')} title={d.online ? t('link.online') : t('link.offline')} />
+                          <span>{d.name || '-'}</span>
+                        </div>
+                      )
+                    })}
+                  </>
+                )}
+                {/* 配对入口常驻：局域网直连不经账号，没有它这一区在「只有本机」时
+                    就是一条死路——用户看得到设备概念却没有添加设备的地方。 */}
+                <AddLocalDeviceDialog
+                  trigger={
+                    <button type="button" className="side-item">
+                      <Plus size={15} />
+                      <span>{t('link.addDevice')}</span>
+                    </button>
+                  }
+                />
+              </nav>
+            )}
+          </>
+        )}
       </div>
 
       <div className="side-bottom">
@@ -357,6 +446,54 @@ export function Sidebar() {
 
       <RssCreateDialog open={rssCreateOpen} onOpenChange={setRssCreateOpen} />
     </aside>
+    <ColResizer cssVar="--sidebar-w" conf={SIDEBAR_W} />
+    </>
+  )
+}
+
+/** 区块标题：折叠箭头 + 标题（整体可点折叠）+ 可选的「新建」按钮；右键给出隐藏入口。
+ *  隐藏做成右键而不是常驻按钮——它是低频的一次性布置动作，常驻只会在每个标题右边
+ *  多挂一个几乎不点的图标。 */
+function SectionLabel({
+  title,
+  expanded,
+  onToggle,
+  onHide,
+  onAdd,
+  addTitle,
+}: {
+  title: ReactNode
+  expanded: boolean
+  onToggle: () => void
+  onHide: () => void
+  onAdd?: () => void
+  addTitle?: string
+}) {
+  const { t } = useI18n()
+  return (
+    <ContextMenu.Root>
+      <ContextMenu.Trigger asChild>
+        <p className="side-label row">
+          <button type="button" className="side-label-toggle" onClick={onToggle}>
+            <ChevronDown size={12} className={cn('side-chevron', !expanded && 'collapsed')} />
+            {title}
+          </button>
+          {onAdd && (
+            <button type="button" className="side-add" title={addTitle} onClick={onAdd}>
+              <Plus size={13} />
+            </button>
+          )}
+        </p>
+      </ContextMenu.Trigger>
+      <ContextMenu.Portal>
+        <ContextMenu.Content className="ctxmenu show">
+          <ContextMenu.Item className="ctx-item" onSelect={onHide}>
+            <EyeOff size={14} />
+            {t('sidebar.hideSection')}
+          </ContextMenu.Item>
+        </ContextMenu.Content>
+      </ContextMenu.Portal>
+    </ContextMenu.Root>
   )
 }
 

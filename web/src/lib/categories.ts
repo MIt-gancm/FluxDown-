@@ -1,0 +1,241 @@
+// 文件分类：侧边栏「分类」区块的数据源与匹配规则。
+//
+// 分类列表存在引擎 config 表的 `custom_categories` 键里（JSON 数组），桌面端可以
+// 增删改、排序、隐藏其中任意一项。本模块只解析与消费这份数据——用户在桌面端建的
+// 「设计稿」「字幕」之类分类，刷新后就出现在 Web 侧边栏并能正常筛选。
+//
+// 键不存在时（全新安装、或用户从未动过分类）回落到与引擎同一套内置分类，行为与
+// 没有这个功能时完全一致。
+
+import {
+  Archive,
+  Bookmark,
+  Box,
+  Code,
+  Cpu,
+  Database,
+  Disc,
+  File,
+  FileText,
+  Film,
+  Folders,
+  Gamepad2,
+  Globe,
+  HardDrive,
+  Image,
+  Library,
+  Music,
+  Package2,
+  Pen,
+  Printer,
+  Smartphone,
+  Subtitles,
+  Type,
+  Zap,
+} from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
+import { t, type I18nKey } from './i18n'
+
+/** 内置分类的类型标签；`null` = 用户自定义分类。 */
+export type BuiltinType = 'all' | 'video' | 'audio' | 'document' | 'image' | 'program' | 'archive' | 'other'
+
+export interface Category {
+  id: string
+  /** 内置分类此字段是占位英文名，展示一律走 [categoryLabel]。 */
+  name: string
+  icon: string
+  matchMode: 'extension' | 'regex'
+  /** 不含点号、已小写。 */
+  extensions: string[]
+  regexPattern: string
+  position: number
+  visible: boolean
+  isBuiltin: boolean
+  builtinType: BuiltinType | null
+}
+
+const ICONS: Record<string, LucideIcon> = {
+  folders: Folders,
+  film: Film,
+  music: Music,
+  fileText: FileText,
+  image: Image,
+  archive: Archive,
+  file: File,
+  code: Code,
+  database: Database,
+  gamepad: Gamepad2,
+  globe: Globe,
+  bookmark: Bookmark,
+  box: Box,
+  cpu: Cpu,
+  disc: Disc,
+  font: Type,
+  hardDrive: HardDrive,
+  library: Library,
+  package2: Package2,
+  pen: Pen,
+  printer: Printer,
+  smartphone: Smartphone,
+  subtitles: Subtitles,
+  type: Type,
+  zap: Zap,
+}
+
+const BUILTIN_LABEL: Record<BuiltinType, I18nKey> = {
+  all: 'type.all',
+  video: 'type.video',
+  audio: 'type.audio',
+  document: 'type.document',
+  image: 'type.image',
+  program: 'type.program',
+  archive: 'type.archive',
+  other: 'type.other',
+}
+
+/** 内置分类的扩展名表与引擎保持一致；用户改过之后以 config 里的为准。 */
+const BUILTIN: Category[] = [
+  builtin('_all', 'all', 'folders', 0, []),
+  builtin('_video', 'video', 'film', 1, [
+    'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'ts',
+    'm4v', 'rmvb', 'rm', '3gp', 'vob', 'mpg', 'mpeg',
+  ]),
+  builtin('_audio', 'audio', 'music', 2, [
+    'mp3', 'flac', 'wav', 'aac', 'ogg', 'wma', 'm4a', 'opus', 'ape', 'aiff',
+  ]),
+  builtin('_document', 'document', 'fileText', 3, [
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt',
+    'csv', 'rtf', 'epub', 'mobi', 'md', 'odt', 'ods', 'odp',
+  ]),
+  builtin('_image', 'image', 'image', 4, [
+    'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'ico',
+    'tiff', 'tif', 'psd', 'raw', 'heic', 'avif',
+  ]),
+  builtin('_program', 'program', 'package2', 5, [
+    'exe', 'msi', 'msix', 'appx', 'apk', 'dmg', 'pkg', 'deb',
+    'rpm', 'appimage', 'snap', 'flatpak',
+  ]),
+  builtin('_archive', 'archive', 'archive', 6, [
+    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst',
+    'iso', 'cab', 'lz', 'lzma',
+  ]),
+  builtin('_other', 'other', 'file', 100, []),
+]
+
+function builtin(id: string, type: BuiltinType, icon: string, position: number, extensions: string[]): Category {
+  return {
+    id,
+    name: type,
+    icon,
+    matchMode: 'extension',
+    extensions,
+    regexPattern: '',
+    position,
+    visible: true,
+    isBuiltin: true,
+    builtinType: type,
+  }
+}
+
+/** 解析 config 里的分类列表。空串/非法 JSON/空数组一律回落内置表——分类是导航骨架，
+ *  宁可显示默认的八项，也不能让侧边栏整块空掉。 */
+export function parseCategories(raw: string | undefined): Category[] {
+  if (!raw) return BUILTIN
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return BUILTIN
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0) return BUILTIN
+  const out: Category[] = []
+  for (const item of parsed) {
+    if (typeof item !== 'object' || item === null) continue
+    const o = item as Record<string, unknown>
+    const id = typeof o.id === 'string' ? o.id : ''
+    if (!id) continue
+    out.push({
+      id,
+      name: typeof o.name === 'string' ? o.name : '',
+      icon: typeof o.icon === 'string' ? o.icon : 'file',
+      matchMode: o.matchMode === 'regex' ? 'regex' : 'extension',
+      extensions: Array.isArray(o.extensions)
+        ? o.extensions.map((e) => String(e).toLowerCase())
+        : [],
+      regexPattern: typeof o.regexPattern === 'string' ? o.regexPattern : '',
+      position: typeof o.position === 'number' ? o.position : 0,
+      visible: o.visible !== false,
+      isBuiltin: o.isBuiltin === true,
+      builtinType: typeof o.builtinType === 'string' ? (o.builtinType as BuiltinType) : null,
+    })
+  }
+  return out.length > 0 ? out : BUILTIN
+}
+
+/** 可见分类，按 position 排序。 */
+export function visibleCategories(all: Category[]): Category[] {
+  return all.filter((c) => c.visible).sort((a, b) => a.position - b.position)
+}
+
+export function categoryLabel(c: Category): string {
+  return c.isBuiltin && c.builtinType ? t(BUILTIN_LABEL[c.builtinType]) : c.name
+}
+
+export function categoryIcon(c: Category): LucideIcon {
+  return ICONS[c.icon] ?? File
+}
+
+/** 从任务的文件名/链接取出用于匹配的名字。文件名尚未确定（解析中）时退到 URL 末段。 */
+function effectiveName(fileName: string, url: string): string {
+  return fileName || url.split('?')[0].split('/').pop() || ''
+}
+
+function matchesCategory(c: Category, name: string): boolean {
+  if (c.builtinType === 'all' || c.builtinType === 'other') return false
+  if (c.matchMode === 'regex') {
+    if (!c.regexPattern) return false
+    try {
+      return new RegExp(c.regexPattern, 'iu').test(name)
+    } catch {
+      // 正则写错时一律不命中，而不是抛异常打断整张列表的渲染。
+      return false
+    }
+  }
+  const dot = name.lastIndexOf('.')
+  if (dot < 0) return false
+  return c.extensions.includes(name.slice(dot + 1).toLowerCase())
+}
+
+/**
+ * 任务归属的分类 id。按 position 顺序先命中先归属；一个都不命中就落到 `other`。
+ *
+ * 磁力链与 m3u8 直播流在文件名落定前没有扩展名可判，若只看扩展名它们会全部堆进
+ * 「其他」——按链接形态直接判成视频。
+ */
+export function categoryIdOf(task: { fileName: string; url: string }, cats: Category[]): string {
+  const normals = cats.filter((c) => c.builtinType !== 'all' && c.builtinType !== 'other')
+  const name = effectiveName(task.fileName, task.url)
+  const hasExt = name.lastIndexOf('.') > 0
+  if (!hasExt && /^magnet:|\.m3u8(\?|$)/.test(task.url)) {
+    const video = normals.find((c) => c.builtinType === 'video')
+    if (video) return video.id
+  }
+  for (const c of normals) {
+    if (matchesCategory(c, name)) return c.id
+  }
+  return cats.find((c) => c.builtinType === 'other')?.id ?? ''
+}
+
+/** 分类筛选是否放行该任务。`ALL_CATEGORY` 表示不筛选。 */
+export const ALL_CATEGORY = 'all'
+
+export function passesCategory(
+  task: { fileName: string; url: string },
+  filter: string,
+  cats: Category[],
+): boolean {
+  if (filter === ALL_CATEGORY) return true
+  const target = cats.find((c) => c.id === filter)
+  if (!target || target.builtinType === 'all') return true
+  return categoryIdOf(task, cats) === target.id
+}

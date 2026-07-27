@@ -15,29 +15,13 @@ import '../models/manifest_selection.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'bt_file_selection_shared.dart' show BtCheckbox;
+import 'file_type_icon.dart';
 
 /// 行高恒 34px（design §4.10：1000+ 项虚拟化后 DOM 仅 ~25 行）。
 const double kManifestRowHeight = 34;
 const double _kCountColWidth = 72;
 const double _kSizeColWidth = 74;
 const double _kEnterColWidth = 16;
-
-/// 文件类型 → 色块 tile 配色（对齐 manifest.js `MF_EXT_TYPE` + styles.css
-/// `.mf-ftile.t-*`）。program/other/all 没有专属色板，回退中性色（与原型
-/// `.mf-ftile` 基础样式一致）。
-(Color bg, Color fg) _fileTileColors(FileCategory category, AppColors c) {
-  return switch (category) {
-    FileCategory.video => (const Color(0x24A855F7), const Color(0xFFA855F7)),
-    FileCategory.audio => (const Color(0x2406B6D4), const Color(0xFF06B6D4)),
-    FileCategory.document => (c.accentBg, c.accent),
-    FileCategory.image => (const Color(0x2422C55E), AppColors.green),
-    FileCategory.archive => (const Color(0x24F59E0B), AppColors.amber),
-    FileCategory.program || FileCategory.other || FileCategory.all => (
-      c.surface2,
-      c.textSecondary,
-    ),
-  };
-}
 
 /// 虚拟化文件列表：外部传入当前层（或搜索态）已算好的行流（[manifestRowsAt]
 /// 输出），本组件只负责渲染 + 交互回调，不持有导航/选择/筛选状态。
@@ -336,7 +320,7 @@ class _ManifestFileRowWidget extends StatelessWidget {
     final s = LocaleScope.of(context);
     final item = row.item;
     final category = manifestItemCategory(item);
-    final (tileBg, tileFg) = _fileTileColors(category, c);
+    final (tileBg, tileFg) = fileCategoryTileColors(category, c);
     final ext = manifestExtensionLabel(item.name);
 
     Widget nameWidget = Text.rich(

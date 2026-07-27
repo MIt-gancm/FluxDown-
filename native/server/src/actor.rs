@@ -554,7 +554,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
             });
         }
         ActorCmd::RssCreate { source, ack } => {
-            let source_id = engine.manager.rss.create_source(*source).await;
+            let source_id = engine.manager.create_rss_source(*source).await;
             let _ = ack.send(source_id);
         }
         ActorCmd::RssUpdate { source, ack } => {

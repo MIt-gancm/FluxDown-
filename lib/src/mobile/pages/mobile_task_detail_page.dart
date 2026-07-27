@@ -11,6 +11,7 @@ import '../../services/open_folder.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_metrics.dart';
 import '../mobile_ui.dart';
+import '../../widgets/file_type_icon.dart';
 import '../sheets/mobile_task_action_sheet.dart';
 
 /// 任务详情（全屏推入页）：进度 + 分段可视化 + 速度曲线 + 任务信息 + 操作
@@ -288,9 +289,9 @@ class _FileHeaderCard extends StatelessWidget {
                 border: Border.all(color: c.border),
               ),
               child: Icon(
-                mobileCategoryIcon(task.fileCategory),
+                fileTypeIcon(task.fileExtension),
                 size: 24,
-                color: c.textSecondary,
+                color: fileTypeColor(task.fileExtension, c),
               ),
             ),
             const SizedBox(width: 14),

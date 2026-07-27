@@ -416,7 +416,7 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 避免混淆——**已实现** vs **仅设计**：
 - **已实现**：多文件任务组（`multi-file-task-group-design.md`）、插件系统 + 去中心化市场（`fluxdown-plugin-marketplace-plan.md` 等）。
 - **部分实现（仅客户端）**：多设备协作 / FluxCloud 配置同步（`multi-device-collab-design.md`）——`lib/src/services/cloud/` + `web/src/lib/cloud/` 已落地，对接**外部 L2 relay**；**本地 headless server 无任何 cloud/sync 路由**；打洞/E2E 仍设计阶段。
-- **仅设计（无引擎/服务器代码）**：webhook 任务事件通知（`webhook-notification-design.md`）。
+- **仅设计（无引擎/服务器代码）**：webhook 任务事件通知（`webhook-notification-design.md`）、浏览器扩展嗅探规则市场（`sniff-rule-market-design.md`——云端锚定 FluxCloud，扩展侧 `sniff-engine.ts` + FluxCloud `sniff_packs` 表均未落地；文档含三轮对抗评审记录与逐条打折清单）。
 - **已实现（全端）**：RSS 订阅自动下载（`rss-subscription-design.md`，issue #97）——引擎 `native/engine/src/rss/`、REST `/api/v1/rss/*`、WS `rssSourcesChanged`/`rssItemsChanged`、hub 信号、桌面 UI（侧边栏区块 + 条目流 + 三 Tab 对话框 + 两步向导）、web SPA 同构、CLI `fluxdown rss`、MCP `rss_list`/`rss_add`/`rss_remove`。
 - **命名歧义警告**：引擎里的 `tracker_subscription.rs` / `ed2k/server_subscription.rs` 指 **BT tracker 列表 / ED2K server.met 订阅**，与 `rss/` 的 feed 订阅是两回事；"webhook" 指官网 GitHub 接收器，与任务事件 webhook 无关。
 

@@ -53,20 +53,6 @@ List<double> mobileSegmentCellFills(DownloadTask task, int cells) {
   return fills;
 }
 
-/// 文件分类 → Lucide 图标
-IconData mobileCategoryIcon(FileCategory category) {
-  return switch (category) {
-    FileCategory.video => LucideIcons.film,
-    FileCategory.audio => LucideIcons.music,
-    FileCategory.document => LucideIcons.fileText,
-    FileCategory.image => LucideIcons.image,
-    FileCategory.program => LucideIcons.package2,
-    FileCategory.archive => LucideIcons.archive,
-    FileCategory.all => LucideIcons.layoutGrid,
-    FileCategory.other => LucideIcons.file,
-  };
-}
-
 /// 轻量 Toast（复用 ShadSonner）
 void showMobileToast(BuildContext context, String message) {
   FluxSonner.of(context).show(

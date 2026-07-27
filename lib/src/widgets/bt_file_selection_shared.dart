@@ -4,6 +4,7 @@ import 'package:shadcn_ui/shadcn_ui.dart';
 import '../i18n/locale_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
+import 'file_type_icon.dart';
 
 String formatBtFileSize(int bytes) {
   if (bytes <= 0) return '0 B';
@@ -19,60 +20,15 @@ String formatBtFileSize(int bytes) {
   return '$bytes B';
 }
 
+/// BT 内文件路径 → 图标。
+///
+/// 从路径尾部解析扩展名后委托 [fileTypeIcon]，与任务列表/详情面板共用同一套
+/// 符号；不自建映射表，避免同一扩展名在两处长相不同。
 IconData btFileIcon(String path) {
-  final lower = path.toLowerCase();
-  if (lower.endsWith('.mp4') ||
-      lower.endsWith('.mkv') ||
-      lower.endsWith('.avi') ||
-      lower.endsWith('.mov') ||
-      lower.endsWith('.wmv') ||
-      lower.endsWith('.flv') ||
-      lower.endsWith('.webm') ||
-      lower.endsWith('.m4v') ||
-      lower.endsWith('.ts') ||
-      lower.endsWith('.m2ts')) {
-    return LucideIcons.film;
-  }
-  if (lower.endsWith('.mp3') ||
-      lower.endsWith('.flac') ||
-      lower.endsWith('.aac') ||
-      lower.endsWith('.ogg') ||
-      lower.endsWith('.wav') ||
-      lower.endsWith('.m4a') ||
-      lower.endsWith('.opus')) {
-    return LucideIcons.music;
-  }
-  if (lower.endsWith('.jpg') ||
-      lower.endsWith('.jpeg') ||
-      lower.endsWith('.png') ||
-      lower.endsWith('.gif') ||
-      lower.endsWith('.bmp') ||
-      lower.endsWith('.webp') ||
-      lower.endsWith('.svg') ||
-      lower.endsWith('.tiff')) {
-    return LucideIcons.image;
-  }
-  if (lower.endsWith('.zip') ||
-      lower.endsWith('.rar') ||
-      lower.endsWith('.7z') ||
-      lower.endsWith('.tar') ||
-      lower.endsWith('.gz') ||
-      lower.endsWith('.bz2') ||
-      lower.endsWith('.xz')) {
-    return LucideIcons.package2;
-  }
-  if (lower.endsWith('.pdf') ||
-      lower.endsWith('.doc') ||
-      lower.endsWith('.docx') ||
-      lower.endsWith('.xls') ||
-      lower.endsWith('.xlsx') ||
-      lower.endsWith('.ppt') ||
-      lower.endsWith('.pptx') ||
-      lower.endsWith('.txt') ||
-      lower.endsWith('.md')) {
-    return LucideIcons.fileText;
-  }
-  return LucideIcons.file;
+  final dot = path.lastIndexOf('.');
+  final sep = path.lastIndexOf(RegExp(r'[/\\]'));
+  if (dot <= sep || dot == path.length - 1) return LucideIcons.file;
+  return fileTypeIcon(path.substring(dot + 1));
 }
 
 Set<int> toggleBtFileSelection(

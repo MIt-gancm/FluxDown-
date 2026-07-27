@@ -1400,6 +1400,7 @@ dependencies = [
  "md-5 0.10.6",
  "md4",
  "mdns-sd",
+ "quick-xml 0.41.0",
  "rand 0.9.2",
  "regex",
  "reqwest",

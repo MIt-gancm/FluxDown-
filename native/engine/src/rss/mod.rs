@@ -629,6 +629,27 @@ impl RssManager {
             rows.push(row);
         }
 
+        // 已知条目不再入库，但解析器可能这一版才补上它们的发布时间（Mikan 的
+        // `<torrent><pubDate>`）——单独回填一次，历史行不必等被 prune 掉才有时间。
+        let backfill: Vec<(String, i64)> = outcome
+            .feed
+            .items
+            .iter()
+            .filter(|p| p.pub_date > 0 && known.contains(&p.guid))
+            .map(|p| (p.guid.clone(), p.pub_date))
+            .collect();
+        let mut backfilled = 0u64;
+        if !backfill.is_empty() {
+            match self
+                .db
+                .backfill_rss_pub_dates(&source.source_id, &backfill)
+                .await
+            {
+                Ok(n) => backfilled = n,
+                Err(e) => log_error!("[rss] backfill pub_date failed: {}", e),
+            }
+        }
+
         let fresh = rows.len();
         if let Err(e) = self.db.insert_rss_items(&rows).await {
             log_error!("[rss] persist items failed: {}", e);
@@ -675,7 +696,7 @@ impl RssManager {
                 ""
             }
         );
-        if fresh > 0 || !plans.is_empty() {
+        if fresh > 0 || backfilled > 0 || !plans.is_empty() {
             self.broadcast_items(&source.source_id, Vec::new()).await;
         }
         self.broadcast_sources().await;

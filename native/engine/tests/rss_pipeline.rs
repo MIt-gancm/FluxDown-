@@ -320,6 +320,46 @@ async fn rss_pipeline_seeds_then_downloads_only_matching_new_items() {
     let _ = tokio::fs::remove_dir_all(&work).await;
 }
 
+/// 订阅这个动作本身就是「我要这个源的内容」：点完「订阅」必须立刻有条目，
+/// 而不是等下一次分钟级 tick，更不该逼用户自己再按一次「立即抓取」。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subscribing_fetches_immediately_without_waiting_for_a_tick() {
+    let work = std::env::temp_dir().join(format!("fluxdown-rss-now-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let (port, feed_hits) = spawn_feed_server(|host| vec![FEED_ROUND1.replace("HOST", host)]);
+    let mut engine = make_engine(&work).await;
+    let mut rss_rx = engine.manager.rss.take_event_rx().expect("rss receiver");
+
+    let source_id = engine
+        .manager
+        .create_rss_source(RssSourceInfo {
+            url: format!("http://127.0.0.1:{port}/feed.xml"),
+            start_paused: true,
+            // 30 分钟：如果抓取只靠 due 判定，这条订阅这辈子都等不到本测试结束。
+            interval_minutes: 30,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe");
+
+    // 注意：全程**没有** tick_rss_sources()。
+    drain_one_rss_event(&mut engine, &mut rss_rx).await;
+
+    assert_eq!(feed_hits.load(Ordering::SeqCst), 1, "subscribe → fetch once");
+    let items = engine
+        .db
+        .load_rss_items(&source_id, 100)
+        .await
+        .expect("items");
+    assert_eq!(items.len(), 2, "首轮历史条目应当已经在库里");
+    assert!(
+        engine.manager.rss.source(&source_id).expect("source").seeded,
+        "首轮抓完即播种完成"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&work).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rss_fetch_failure_is_recorded_and_backs_off_without_disabling() {
     let work = std::env::temp_dir().join(format!("fluxdown-rss-err-{}", uniq()));

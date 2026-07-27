@@ -11,6 +11,8 @@ import '../services/open_folder.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'context_menu.dart';
+import 'file_type_icon.dart';
+import 'overflow_tooltip_text.dart';
 import 'edit_threads_dialog.dart';
 import 'flux_sonner.dart';
 import 'view_options_panel.dart';
@@ -207,52 +209,45 @@ class _TaskListState extends State<TaskList> {
 
   @override
   Widget build(BuildContext context) {
-    final c = AppColors.of(context);
     return ListenableBuilder(
       listenable: Listenable.merge([widget.controller, widget.viewPrefsStore]),
       builder: (context, _) {
         final prefs = _prefs;
         final sections = widget.controller.buildListSections(prefs);
         final isEmpty = sections.every((s) => s.entities.isEmpty);
-        return ColoredBox(
-          color: c.bg,
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final listWidth = constraints.maxWidth;
-              widget.controller.listContentWidth = listWidth;
-              return Column(
-                children: [
-                  // 表头条两种形态都渲染：列表 = 管理+列名+显示选项按钮；
-                  // 网格 = 管理+显示选项按钮（无列语义，不渲染列名）——
-                  // 「显示选项」入口已从 titlebar 移到此处（用户决策），
-                  // 网格形态必须保留可达入口。
-                  _buildHeader(context, prefs, listWidth),
-                  Expanded(
-                    child: Stack(
-                      children: [
-                        isEmpty
-                            ? _buildEmpty(context)
-                            : prefs.form == ViewForm.list
-                            ? _buildListBody(context, prefs, sections, listWidth)
-                            : _buildGridBody(
-                                context,
-                                prefs,
-                                sections,
-                                listWidth,
-                              ),
-                        if (_showScrollToTop)
-                          Positioned(
-                            right: 16,
-                            bottom: 16,
-                            child: _ScrollToTopButton(onTap: _scrollToTop),
-                          ),
-                      ],
-                    ),
+        // 底色由主区统一给（HomePage._buildContentArea = surface1），
+        // 这里不再自带一层 —— 两块列表各染各的会让切换 RSS 时底色跳。
+        return LayoutBuilder(
+          builder: (context, constraints) {
+            final listWidth = constraints.maxWidth;
+            widget.controller.listContentWidth = listWidth;
+            return Column(
+              children: [
+                // 表头条两种形态都渲染：列表 = 管理+列名+显示选项按钮；
+                // 网格 = 管理+显示选项按钮（无列语义，不渲染列名）——
+                // 「显示选项」入口已从 titlebar 移到此处（用户决策），
+                // 网格形态必须保留可达入口。
+                _buildHeader(context, prefs, listWidth),
+                Expanded(
+                  child: Stack(
+                    children: [
+                      isEmpty
+                          ? _buildEmpty(context)
+                          : prefs.form == ViewForm.list
+                          ? _buildListBody(context, prefs, sections, listWidth)
+                          : _buildGridBody(context, prefs, sections, listWidth),
+                      if (_showScrollToTop)
+                        Positioned(
+                          right: 16,
+                          bottom: 16,
+                          child: _ScrollToTopButton(onTap: _scrollToTop),
+                        ),
+                    ],
                   ),
-                ],
-              );
-            },
-          ),
+                ),
+              ],
+            );
+          },
         );
       },
     );
@@ -1323,26 +1318,10 @@ class _TaskGridCardState extends State<_TaskGridCard> {
                 children: [
                   Row(
                     children: [
-                      Container(
-                        width: 36,
-                        height: 36,
-                        decoration: BoxDecoration(
-                          color: c.surface2,
-                          borderRadius: m.brIconTile,
-                        ),
-                        child: Center(
-                          child: Text(
-                            task.fileExtension,
-                            style: TextStyle(
-                              fontSize: 10,
-                              fontWeight: FontWeight.w600,
-                              color: c.textSecondary,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                            ),
-                          ),
-                        ),
+                      FileTypeIconTile(
+                        ext: task.fileExtension,
+                        size: 36,
+                        borderRadius: m.brIconTile,
                       ),
                       const Spacer(),
                       Icon(taskStatusIcon(task.status), size: 13, color: color),
@@ -1351,23 +1330,18 @@ class _TaskGridCardState extends State<_TaskGridCard> {
                   const SizedBox(height: 8),
                   SizedBox(
                     height: 34,
-                    child: ShadTooltip(
-                      waitDuration: const Duration(milliseconds: 500),
-                      builder: (_) => Text(task.fileName),
-                      child: Text(
-                        task.fileName,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          fontSize: 12.5,
-                          // 显式行高 1.36：两行恰为 12.5×1.36×2 = 34px，
-                          // 与定高盒子严丝合缝——MiSans 默认行高下两行 ≈35px
-                          // 会被拦腰裁切（用户截图的半字截断）；行高收纳后
-                          // maxLines+ellipsis 正常生效，超长名悬浮看全称。
-                          height: 1.36,
-                          fontWeight: FontWeight.w500,
-                          color: isDone ? c.textSecondary : c.textPrimary,
-                        ),
+                    child: OverflowTooltipText(
+                      task.fileName,
+                      maxLines: 2,
+                      style: TextStyle(
+                        fontSize: 12.5,
+                        // 显式行高 1.36：两行恰为 12.5×1.36×2 = 34px，
+                        // 与定高盒子严丝合缝——MiSans 默认行高下两行 ≈35px
+                        // 会被拦腰裁切（用户截图的半字截断）；行高收纳后
+                        // maxLines+ellipsis 正常生效，超长名悬浮看全称。
+                        height: 1.36,
+                        fontWeight: FontWeight.w500,
+                        color: isDone ? c.textSecondary : c.textPrimary,
                       ),
                     ),
                   ),

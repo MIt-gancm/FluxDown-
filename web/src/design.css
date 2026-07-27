@@ -27,54 +27,76 @@ svg { display: block; }
 .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flex1 { flex: 1; }
 
-/* ---------------- Web App 主题 ---------------- */
+/* ---------------- Web App 主题 ----------------
+   取值来自桌面端 `lib/src/theme/flux_theme_tokens.dart` 的 defaultLight /
+   defaultDark，一一对应（web 名 ← Dart 名）：
+     --bg ← background      --surface ← surface1   --surface2 ← surface2
+     --surface3 ← surface3  --border ← border      --hover ← elementHover
+     --text ← textPrimary   --text2 ← textSecondary --text3 ← textMuted
+     --accent ← accent(默认 #3B82F6)  --accent-weak ← accentBackground
+     --success/--danger/--warning ← AppColors.green/red/amber（两套主题同值）
+   两端同源才谈得上「同一个产品」——早期两边各调各的，蓝色差 13 个色相、
+   暗色底差三档灰，同一台机器上并排开就是两个应用。改这里前先改 Dart 侧。
+
+   `--hover` 用不透明灰而非半透明黑：桌面 elementHover 是实色，且列表底色
+   已统一为 --surface，半透明叠加只会得到一个近似值。 */
 
 :root {
-  --bg: #f4f5f7;
+  --bg: #f8f9fa;
   --surface: #ffffff;
-  --surface2: #eef0f3;
-  --border: #e3e5e9;
-  --text: #18181b;
-  --text2: #6b6f76;
-  --text3: #9ca1a8;
-  --hover: rgba(24,24,27,.045);
-  --accent: #2e6bf6;
-  --accent-weak: rgba(46,107,246,.1);
-  --success: #16a34a;
+  --surface2: #f1f3f5;
+  --surface3: #e9ecef;
+  --border: #e4e4e7;
+  --text: #09090b;
+  --text2: #71717a;
+  --text3: #a1a1aa;
+  --hover: #f1f3f5;
+  --accent: #3b82f6;
+  --accent-weak: rgba(59,130,246,.10);
+  --success: #22c55e;
   --danger: #ef4444;
   --warning: #f59e0b;
-  --track: #e6e8ec;
+  --track: #e9ecef;
   --shadow: 0 12px 32px rgba(15,18,25,.14);
   background: var(--bg); color: var(--text);
   font-size: 13px;
   transition: background .25s, color .25s;
 }
 .dark {
-  --bg: #131316;
-  --surface: #1b1b1f;
-  --surface2: #232327;
-  --border: #2a2a30;
-  --text: #ececef;
-  --text2: #9d9da6;
-  --text3: #6d6d76;
-  --hover: rgba(255,255,255,.055);
-  --accent: #4d82f8;
-  --accent-weak: rgba(77,130,248,.14);
+  --bg: #1c1c1e;
+  --surface: #2c2c2e;
+  --surface2: #3a3a3c;
+  --surface3: #48484a;
+  --border: #48484a;
+  --text: #f5f5f7;
+  --text2: #a1a1a6;
+  --text3: #8e8e93;
+  --hover: #424245;
+  --accent: #3b82f6;
+  --accent-weak: rgba(59,130,246,.18);
   --success: #22c55e;
-  --danger: #f87171;
-  --warning: #fbbf24;
-  --track: #2c2c33;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --track: #48484a;
   --shadow: 0 12px 32px rgba(0,0,0,.5);
 }
 
 .wscreen { position: absolute; inset: 0; display: none; }
 .wscreen.active { display: flex; }
 
-/* ---------------- 通用控件 ---------------- */
+/* ---------------- 通用控件 ----------------
+   几何对齐桌面 shadcn 主题（`lib/src/theme/app_theme.dart::_buttonSizes` +
+   `radius: radiusMd`）：regular 32 / sm 28 / lg 36，圆角一律 6，水平内边距
+   12（sm 10）。图标按钮同 shadcn 的 icon size = 正方形 32。
+
+   变体命名与桌面的对应关系（历史遗留，别按字面读）：
+     .primary → ShadButton（实心强调）
+     .ghost   → ShadButton.outline（**有描边**，对话框取消/次要动作用它）
+     .plain   → ShadButton.ghost（无描边，只有 hover 底色；列表行内动作用它） */
 
 .btn {
   display: inline-flex; align-items: center; gap: 7px;
-  height: 34px; padding: 0 15px; border-radius: 8px;
+  height: 32px; padding: 0 12px; border-radius: 6px;
   font-size: 13px; font-weight: 500;
   transition: all .15s;
 }
@@ -83,23 +105,25 @@ svg { display: block; }
 .btn.primary:hover { filter: brightness(1.08); }
 .btn.ghost { border: 1px solid var(--border); background: var(--surface); color: var(--text); }
 .btn.ghost:hover { background: var(--hover); }
+.btn.plain { background: transparent; color: var(--text); }
+.btn.plain:hover { background: var(--hover); }
 .btn.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
 .btn.danger:hover { background: rgba(239,68,68,.08); }
 .btn.danger.solid { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn.danger.solid:hover { background: var(--danger); border-color: var(--danger); filter: brightness(1.06); }
-.btn.sm { height: 28px; padding: 0 11px; font-size: 12px; border-radius: 7px; }
-.btn.block { width: 100%; justify-content: center; height: 38px; }
+.btn.sm { height: 28px; padding: 0 10px; font-size: 12px; border-radius: 6px; }
+.btn.block { width: 100%; justify-content: center; height: 36px; }
 .btn:disabled, .btn.disabled { opacity: .5; cursor: not-allowed; }
 
 .icon-btn {
-  width: 34px; height: 34px; border-radius: 8px;
+  width: 32px; height: 32px; border-radius: 6px;
   display: grid; place-items: center; color: var(--text2);
   transition: all .15s;
 }
 .icon-btn:hover { background: var(--hover); color: var(--text); }
-.icon-btn svg { width: 17px; height: 17px; }
-.icon-btn.sm { width: 26px; height: 26px; }
-.icon-btn.sm svg { width: 14px; height: 14px; }
+.icon-btn svg { width: 16px; height: 16px; }
+.icon-btn.sm { width: 28px; height: 28px; }
+.icon-btn.sm svg { width: 15px; height: 15px; }
 .icon-btn.active { background: var(--accent-weak); color: var(--accent); }
 .icon-btn.accent { color: var(--accent); }
 .icon-btn.accent:hover { background: var(--accent-weak); color: var(--accent); }
@@ -203,8 +227,8 @@ svg { display: block; }
   color: var(--text2); margin: 12px 0 6px;
 }
 .text-input {
-  width: 100%; height: 34px; padding: 0 11px;
-  border-radius: 8px; border: 1px solid var(--border);
+  width: 100%; height: 32px; padding: 0 11px;
+  border-radius: 6px; border: 1px solid var(--border);
   background: var(--surface); color: var(--text);
   font-size: 13px; outline: none;
   transition: border-color .15s, box-shadow .15s;
@@ -214,7 +238,7 @@ svg { display: block; }
 
 .select {
   display: flex; align-items: center; justify-content: space-between; gap: 6px;
-  height: 34px; padding: 0 11px; border-radius: 8px;
+  height: 32px; padding: 0 11px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--surface);
   font-size: 13px; cursor: pointer; color: var(--text);
   transition: border-color .15s, box-shadow .15s, background .15s;
@@ -371,6 +395,19 @@ svg { display: block; }
 .side-add { width: 20px; height: 20px; border-radius: 6px; display: grid; place-items: center; color: var(--text3); }
 .side-add:hover { background: var(--hover); color: var(--text); }
 .side-add svg { width: 13px; height: 13px; }
+/* 区块标题整体可点折叠。必须显式 flex：全局 `svg { display: block }` 会把箭头
+   挤成独立一行，标题跟着掉到第二行。 */
+.side-label-toggle {
+  flex: 1; min-width: 0;
+  display: flex; align-items: center; gap: 5px;
+  font: inherit; color: inherit; letter-spacing: inherit; text-transform: inherit;
+  text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.side-label-toggle:hover { color: var(--text2); }
+.side-chevron { flex-shrink: 0; opacity: .7; transition: transform .15s; }
+.side-chevron.collapsed { transform: rotate(-90deg); }
+/* 区块内的次级小标题（设备区里的「局域网设备」等），比区块标题弱一档。 */
+.side-sublabel { padding: 8px 8px 3px; font-size: 10.5px; color: var(--text3); }
 
 .side-nav { display: flex; flex-direction: column; gap: 1px; }
 .side-item {
@@ -459,7 +496,12 @@ svg { display: block; }
 
 /* ---------- 中央列 ---------- */
 
-.center { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+/* 主区整体坐在 --surface（白）而不是 --bg（灰），对齐桌面
+   `home_page.dart::_buildContentArea`：内容用「纸」的白、容器用灰是这套主题
+   既定的层级语言（侧边栏、详情面板同样是 surface）。顺带修掉两件事：
+   1. 灰底上 --hover（#f1f3f5）几乎与底色同色，行悬浮看不出反馈；
+   2. 任务列表与 RSS 条目流原本一个灰底一个白头，切换时底色会跳。 */
+.center { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--surface); }
 
 .topbar {
   display: flex; align-items: center; gap: 10px;
@@ -468,8 +510,8 @@ svg { display: block; }
 }
 .search {
   display: flex; align-items: center; gap: 8px;
-  width: 300px; height: 34px; padding: 0 11px;
-  border-radius: 8px; border: 1px solid var(--border);
+  width: 300px; height: 32px; padding: 0 11px;
+  border-radius: 6px; border: 1px solid var(--border);
   background: var(--bg); color: var(--text3);
   transition: border-color .15s, box-shadow .15s;
 }
@@ -549,10 +591,20 @@ svg { display: block; }
   height: 64px; padding: 8px 12px; margin-bottom: 4px;
   border-radius: 10px; border: 1px solid transparent;
   background: var(--surface); cursor: pointer;
-  transition: border-color .12s, background .12s;
+  transition: border-color .12s, background .12s, box-shadow .12s;
 }
 .task-row:hover { background: var(--hover); }
-.task-row.selected { border-color: var(--accent); background: var(--accent-weak); }
+/* 选中态用「左侧 3px 导轨 + 淡底」而不是满圈强调色描边：
+   1) 紧凑档行底边贴着 2px 进度条（完成时整条变绿），满圈描边会和它挤成一圈杂色；
+   2) 密集列表里竖直导轨在左对齐基线上一眼可辨，满圈描边反而与相邻行的边界混淆；
+   3) 描边保持 1px transparent 占位，选中/取消选中不会引起 1px 布局跳动。
+   行级此前没有任何 inset 阴影语义（inset 左导轨只在 .gcard.is-err-card 上表示错误），
+   所以这里占用 box-shadow 不会与既有状态表达冲突。 */
+.task-row.selected {
+  border-color: transparent;
+  background: var(--accent-weak);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
 /* 紧凑档任务行：44px 单行化，与紧凑组行等高（DESIGN §4.4）。副标题不删——
    meta 移到行右侧（信息不减 P4）；进度条移到行底边缘 2px（原型 .trow-edge 语义，
    行加 overflow:hidden 让条随卡片圆角裁切）。 */
@@ -643,7 +695,9 @@ svg { display: block; }
   transition: transform .15s, box-shadow .15s, border-color .15s, background .12s;
 }
 .gcard:hover { transform: translateY(-1px); box-shadow: 0 6px 20px rgba(0,0,0,.10); }
-.gcard.selected { border-color: var(--accent); background: var(--accent-weak); }
+/* 网格卡自带完整边界，不需要左导轨——但强调色描边压到 45% 透明度，
+   避免整屏卡片里选中项像被荧光笔圈过一样刺眼。 */
+.gcard.selected { border-color: color-mix(in srgb, var(--accent) 45%, transparent); background: var(--accent-weak); }
 .gcard.is-err-card { box-shadow: inset 3px 0 0 var(--danger); }
 .gcard.is-done-card .gcard-name { color: var(--text2); font-weight: 400; }
 
@@ -1328,17 +1382,31 @@ svg { display: block; }
 .ctx-item.danger svg { color: var(--danger); }
 .ctx-sep { height: 1px; background: var(--border); margin: 5px 8px; }
 
-/* Toast */
-.wtoast {
-  position: absolute; left: 50%; bottom: 48px; z-index: 45;
-  transform: translateX(-50%) translateY(12px);
-  background: var(--text); color: var(--bg);
-  font-size: 12.5px; padding: 9px 16px; border-radius: 999px;
-  box-shadow: var(--shadow);
-  opacity: 0; pointer-events: none; transition: all .22s;
-  max-width: 80%; text-align: center;
+/* Toast（宿主见 lib/toast.tsx） */
+/* 通知栈：底部居中纵向堆叠，容器整体不吃鼠标——只有气泡本身可点关闭，
+   否则一条 3 秒的提示会在屏幕底部挖出一块看不见的死区。
+   z-index 压在 .wbackdrop(30)/.dialog(31) 之下：对话框开着时通知不该盖上去
+   抢走焦点，但仍高于常规内容层。 */
+.wtoast-host {
+  position: fixed; left: 0; right: 0; bottom: 56px; z-index: 29;
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  pointer-events: none;
 }
-.wtoast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.wtoast {
+  pointer-events: auto;
+  max-width: 420px; padding: 9px 14px; border-radius: 8px;
+  font-size: 12.5px; text-align: left;
+  background: var(--text); color: var(--bg);
+  box-shadow: var(--shadow);
+  /* RSS 条目标题动辄一整行发布组信息，必须截断而不是把气泡撑破。 */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  animation: wtoastIn .16s ease;
+}
+.wtoast.err { background: var(--danger); color: #fff; }
+/* 只动位移与整体 opacity：让背景色从 transparent 插值会在中途露出灰调脏边。 */
+@keyframes wtoastIn {
+  from { opacity: 0; transform: translateY(8px); }
+}
 
 /* ---------- RSS 订阅（侧边栏区块 + 条目流 + 规则预览） ---------- */
 
@@ -1352,57 +1420,79 @@ svg { display: block; }
 
 .rss-pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
+/* 订阅头与工具条合并成一行（对齐桌面 rss_item_list.dart::_buildHeader）：
+   标题右侧本来就是大片空白，再叠一条 37px 的横带只是把列表整体往下推。
+   两个文字按钮换成图标 + title 提示——「全部标记已读」「立即抓取」并排就吃掉
+   200px，把搜索框挤到标题头上。 */
 .rss-head {
-  display: flex; align-items: center; gap: 12px;
-  padding: 12px 14px; background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  display: flex; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid var(--border);
 }
+/* 图标底色用中性 surface2 而不是 accent-weak：强调色留给「可点/选中」，
+   订阅头图标只是身份标识，蓝底会让人以为它能点。异常态才染红。 */
 .rss-head-icon {
-  width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
-  background: var(--accent-weak); color: var(--accent);
+  width: 30px; height: 30px; border-radius: 6px; flex-shrink: 0; margin-right: 10px;
+  background: var(--surface2); color: var(--text2);
   display: grid; place-items: center;
 }
-.rss-head-icon.err { background: rgba(239,68,68,.1); color: var(--danger); }
-.rss-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.rss-head-icon.err { background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); }
+.rss-head-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .rss-head-name { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.rss-head-name b { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rss-head-meta { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text3); flex-wrap: wrap; }
-.rss-head-meta .sep { opacity: .5; }
-.rss-head-meta .err { color: var(--danger); }
-
-.rss-bar {
-  display: flex; align-items: center; gap: 8px;
-  padding: 8px 14px; border-bottom: 1px solid var(--border);
+.rss-head-name b { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rss-head-meta {
+  display: flex; align-items: center; gap: 5px;
+  font-size: 11px; color: var(--text3);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.rss-search { width: 240px; height: 30px; margin-left: auto; }
+.rss-head-meta.err { color: var(--danger); }
+.rss-head-meta .sep { opacity: .5; }
+.rss-head-acts { display: flex; align-items: center; gap: 2px; flex-shrink: 0; margin-left: 12px; }
+/* 搜索贴最右、与下方条目右缘对齐：它筛的是这条列表，不是全局。 */
+.rss-search { width: 190px; height: 28px; flex-shrink: 0; margin-left: 10px; }
+.rss-search input { font-size: 12.5px; }
+
+/* 条目行是**平铺行**（整宽 + 下分隔线），不是卡片：追番一屏要看十几条，
+   圆角 + 4px 间隙的卡片只塞得下 8 行；而且卡片语义已经被任务行占了，
+   条目不是任务。 */
+.rss-scroll { flex: 1; overflow-y: auto; }
+.rss-scroll::-webkit-scrollbar { width: 6px; }
+.rss-scroll::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; }
 
 .rss-row {
-  display: flex; align-items: center; gap: 12px;
-  min-height: 56px; padding: 8px 12px; margin-bottom: 4px;
-  border-radius: 10px; border: 1px solid transparent;
+  display: flex; align-items: center;
+  padding: 9px 16px; border-bottom: 1px solid var(--border);
   transition: background .12s;
 }
 .rss-row:hover { background: var(--hover); }
 .rss-row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.rss-row-name b { font-size: 13px; font-weight: 500; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.rss-row-meta { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text3); font-variant-numeric: tabular-nums; }
-.rss-row-meta .sep { opacity: .5; }
+.rss-row-name b { font-size: 12.5px; font-weight: 400; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rss-row-meta { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--text3); font-variant-numeric: tabular-nums; }
 /* 状态与操作各占一列定宽、右对齐：不同状态的 chip 文案长短不一，若让它们参与
-   自动布局，相邻行的 chip 与按钮就会左右错位。列内溢出交给省略号。 */
-/* 宽度按最长一档定：状态列容得下「已下载 · 查看任务」/「Downloaded · open task」，
-   操作列容得下并排的「下载 + 忽略」/「Download + Ignore」。 */
-.rss-row-status { display: flex; align-items: center; justify-content: flex-end; flex-shrink: 0; width: 176px; overflow: hidden; }
-.rss-row-ops { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-shrink: 0; width: 152px; }
-
-.rss-chip {
-  flex-shrink: 0; max-width: 100%; font-size: 11px; font-weight: 500; white-space: nowrap;
-  overflow: hidden; text-overflow: ellipsis;
-  padding: 3px 9px; border-radius: 999px;
-  background: var(--surface2); color: var(--text2);
+   自动布局，相邻行的 chip 与按钮就会左右错位。列内溢出交给省略号。
+   宽度按最长一档定：状态列容得下「规则已过滤 · 命中排除关键词」，操作列容得下
+   并排的「下载 + 忽略」/「Download + Ignore」。 */
+.rss-row-status { display: flex; align-items: center; justify-content: flex-end; flex-shrink: 0; width: 210px; margin-left: 12px; overflow: hidden; }
+.rss-row-ops {
+  display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+  flex-shrink: 0; width: 160px; min-height: 28px; margin-left: 10px;
+  visibility: hidden;
 }
-.rss-chip.new { background: var(--accent-weak); color: var(--accent); }
-.rss-chip.done { background: rgba(34,197,94,.12); color: var(--success); }
-.rss-chip.dup { background: rgba(245,158,11,.14); color: var(--warning); }
+/* 渐进披露：动作只在悬浮时出现。`visibility` 而非 `display`，行高与列宽不随
+   鼠标进出跳动。`.busy` 让「准备中」脱离 hover——点完把鼠标移开是常态，
+   按钮跟着消失等于把刚给出的反馈又抽走。 */
+.rss-row:hover .rss-row-ops, .rss-row-ops.busy { visibility: visible; }
+
+/* chip 用 4px 直角而非胶囊：对齐桌面 `_StatusChip`（brSm + soft(color) 10%）。
+   底色一律由 token 派生，换主题/换强调色时不会留下写死的旧蓝旧绿。 */
+.rss-chip {
+  flex-shrink: 0; max-width: 100%; font-size: 11px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+  padding: 3px 8px; border-radius: 4px;
+  background: color-mix(in srgb, var(--text3) 10%, transparent); color: var(--text3);
+}
+.rss-chip.new { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); }
+.rss-chip.done { background: color-mix(in srgb, var(--success) 10%, transparent); color: var(--success); }
+.rss-chip.dup { background: color-mix(in srgb, var(--warning) 10%, transparent); color: var(--warning); }
 .rss-chip.clickable:hover { filter: brightness(1.08); text-decoration: underline; }
 
 .rss-empty {
@@ -1486,14 +1576,15 @@ svg { display: block; }
   .task-scroll { padding: 8px 8px 12px; }
   .task-row { gap: 9px; padding: 8px 9px; }
   .trow-pct { width: 38px; font-size: 11.5px; }
-  /* 条目流：工具条换行、操作簇下沉到标题下方，窄屏不横向溢出 */
-  .rss-bar { flex-wrap: wrap; row-gap: 8px; }
+  /* 条目流：订阅头换行（搜索框下沉成整行），行内三列坍成两行 */
+  .rss-head { flex-wrap: wrap; row-gap: 8px; padding: 10px 12px; }
   .rss-search { width: 100%; margin-left: 0; }
-  .rss-row { flex-wrap: wrap; row-gap: 6px; padding: 8px 9px; }
+  .rss-row { flex-wrap: wrap; row-gap: 6px; padding: 8px 12px; }
   .rss-row-main { flex-basis: 100%; }
-  /* 窄屏一行放不下三列：标题独占一行，状态与操作退回自适应宽度贴右 */
-  .rss-row-status { width: auto; }
-  .rss-row-ops { width: auto; margin-left: auto; }
+  /* 窄屏一行放不下三列：标题独占一行，状态与操作退回自适应宽度贴右。
+     触屏没有 hover，动作常驻。 */
+  .rss-row-status { width: auto; margin-left: 0; }
+  .rss-row-ops { width: auto; margin-left: auto; visibility: visible; }
   .statusbar { gap: 12px; padding: 0 10px; overflow: hidden; white-space: nowrap; }
   .statusbar .sb-item:last-child { display: none; }
   .sb-scope, .sb-view-state { display: none; }

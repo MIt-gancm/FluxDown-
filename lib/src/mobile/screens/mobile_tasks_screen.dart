@@ -8,6 +8,7 @@ import '../../models/settings_provider.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_metrics.dart';
 import '../mobile_ui.dart';
+import '../../widgets/file_type_icon.dart';
 import '../../services/kv_store.dart';
 import '../pages/mobile_task_detail_page.dart';
 import '../sheets/mobile_filter_sheet.dart';
@@ -435,9 +436,9 @@ class _MobileTaskCard extends StatelessWidget {
                 border: Border.all(color: c.border),
               ),
               child: Icon(
-                mobileCategoryIcon(task.fileCategory),
+                fileTypeIcon(task.fileExtension),
                 size: 20,
-                color: c.textSecondary,
+                color: fileTypeColor(task.fileExtension, c),
               ),
             ),
             const SizedBox(width: 12),

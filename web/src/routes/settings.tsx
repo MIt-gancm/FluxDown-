@@ -16,7 +16,7 @@ import { ExtensionsSettings } from '../components/settings/ExtensionsSettings'
 import { GeneralSettings } from '../components/settings/GeneralSettings'
 import { ProxySettings } from '../components/settings/ProxySettings'
 import { SecuritySettings } from '../components/settings/SecuritySettings'
-import { useConfigMutation, useConfigQuery } from '../components/settings/useConfig'
+import { useConfigMutation, useConfigQuery } from '../lib/config'
 
 type Category = 'general' | 'account' | 'appearance' | 'download' | 'bt' | 'proxy' | 'security' | 'extensions' | 'about'
 

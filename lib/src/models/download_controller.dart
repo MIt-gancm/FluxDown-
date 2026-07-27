@@ -986,14 +986,71 @@ class DownloadController extends ChangeNotifier {
     _safeNotifyListeners();
   }
 
-  /// 设置队列筛选。传入相同 ID 则切换回「不过滤」。
+  /// 设置队列筛选。
+  ///
+  /// **不做「再点一次取消」**：侧边栏每个分区恒有一个激活项（见
+  /// [syncSidebarFilters]），能取消到「没有任何高亮」只会让人以为筛选仍在
+  /// 生效却找不到它在哪。想看别的队列就点别的队列。
   void setQueueFilter(String? queueId) {
-    if (_queueFilter == queueId) {
-      _queueFilter = null;
-    } else {
-      _queueFilter = queueId;
-    }
+    if (_queueFilter == queueId) return;
+    _queueFilter = queueId;
     _safeNotifyListeners();
+  }
+
+  /// 让队列 / 分类筛选与「侧边栏当前显示了哪些分区」保持一致。
+  ///
+  /// 两条规则，都是为了消灭「看不见的筛选器」与「什么都没高亮」这两种误解：
+  /// - **分区可见** → 该维度恒有一个激活项（队列取设置里的默认队列，分类取
+  ///   内置「全部文件」）。没有激活项时用户会以为列表没被筛过。
+  /// - **分区隐藏** → 该维度必须回到不过滤。留一个没有 UI 的筛选器在后台，
+  ///   用户会看到任务凭空消失且无处可点。
+  ///
+  /// 幂等：无变化时不通知，可以安全地在每帧末尾调用。
+  void syncSidebarFilters({
+    required bool queuesVisible,
+    required String defaultQueueId,
+    required bool categoryVisible,
+    required List<CustomCategory> visibleCategories,
+  }) {
+    var changed = false;
+
+    if (queuesVisible) {
+      // 队列尚未装载时什么都不做——等它到了这个方法会被再调一次。
+      if (_queueFilter == null && _queues.isNotEmpty) {
+        final preferred = _queues.any((q) => q.queueId == defaultQueueId)
+            ? defaultQueueId
+            : kMainQueueId;
+        if (_queues.any((q) => q.queueId == preferred)) {
+          _queueFilter = preferred;
+          changed = true;
+        }
+      }
+    } else if (_queueFilter != null) {
+      _queueFilter = null;
+      changed = true;
+    }
+
+    if (categoryVisible) {
+      if (_customCategoryFilter == null && visibleCategories.isNotEmpty) {
+        final all = visibleCategories
+            .where((c) => c.builtinType == 'all')
+            .firstOrNull;
+        if (all != null) {
+          _customCategoryFilter = all;
+          _categoryFilter = FileCategory.all;
+          _visibleNormalCategories = visibleCategories
+              .where((c) => c.builtinType != 'all' && c.builtinType != 'other')
+              .toList();
+          changed = true;
+        }
+      }
+    } else if (_customCategoryFilter != null) {
+      _customCategoryFilter = null;
+      _categoryFilter = FileCategory.all;
+      changed = true;
+    }
+
+    if (changed) _safeNotifyListeners();
   }
 
   /// 设置设备筛选。传入相同值则切回「全部设备」。null=全部，''=本机，非空=远程设备。

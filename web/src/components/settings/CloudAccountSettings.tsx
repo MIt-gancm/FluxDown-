@@ -8,14 +8,14 @@ import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '../../lib/cn'
 import { CLOUD_BASE_URL_EDITABLE, cloudApi, getCloudBaseUrl, isCloudBaseUrlCustom, resetCloudBaseUrl, setCloudBaseUrl } from '../../lib/cloud/client'
 import { suggest } from '../../lib/cloud/nickname'
-import { applyCloudSession, clearCloudSession, cloudDeviceId, getCloudRefreshToken, setShowDeviceSync, useCloudSession, useShowDeviceSync } from '../../lib/cloud/session'
+import { applyCloudSession, clearCloudSession, cloudDeviceId, getCloudRefreshToken, useCloudSession } from '../../lib/cloud/session'
 import { CloudApiError, type CloudDevice } from '../../lib/cloud/types'
 import { confirmDialog } from '../../lib/confirm'
 import { fmtIsoTime, fmtRelativeTime } from '../../lib/format'
 import type { I18nKey } from '../../lib/i18n'
 import { useI18n } from '../../lib/i18n'
 import { DirectDevicesSection } from './DirectDevicesSection'
-import { SetRow, SetSwitch, TextInput } from './controls'
+import { SetRow, TextInput } from './controls'
 
 const DEVICES_QUERY_KEY = ['cloud', 'devices']
 
@@ -706,7 +706,6 @@ const DEVICE_INLINE_LIMIT = 5
 
 function DeviceListSection() {
   const { t } = useI18n()
-  const showDeviceSync = useShowDeviceSync()
   const currentId = cloudDeviceId()
   const { data, isLoading, isError, refetch } = useQuery({
     queryKey: DEVICES_QUERY_KEY,
@@ -744,9 +743,6 @@ function DeviceListSection() {
         {t('cloud.devicesDesc')}
       </p>
       <div className="set-group">
-        <SetRow title={t('cloud.showDeviceSync')} desc={t('cloud.showDeviceSyncDesc')}>
-          <SetSwitch checked={showDeviceSync} onCheckedChange={setShowDeviceSync} />
-        </SetRow>
         {isLoading ? (
           <p className="p-4 text-[12px] text-text3">{t('common.loading')}</p>
         ) : isError ? (
