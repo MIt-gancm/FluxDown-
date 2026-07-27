@@ -61,7 +61,7 @@
 已在 `README.md` / `README.zh-CN.md` 完成：
 
 1. MCP 徽章换成 Glama 官方 score 徽章（对齐 punkpeye 条目）
-2. 为 9 个已合并渠道回挂 featured 徽章（Awesome Rust / MCP / Windows / Free Apps、Android FOSS、Open Source Android Apps、Portainer、Unraid CA、Chinese Indie Dev）
+2. 渠道 featured 徽章回挂时去掉 `Awesome MCP`（与上方 Glama 重复）；其余已合并渠道保留
 3. 在有维护者互动的 PR 下回复致谢：`offa/android-foss#704`、`lissy93/portainer-templates#123`、`1c7/chinese-independent-developer#1204`
 
 其余已合并但无维护者评论的 PR（awesome-rust / awesome-windows / free-apps / unRAID / open-source-android-apps / punkpeye 已回过）不再刷评论。
