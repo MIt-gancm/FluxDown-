@@ -1698,82 +1698,14 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
-      # 用 git-cliff 从 Conventional Commits 生成本版本的更新内容
-      # （--latest 仅包含上一个 tag 到当前 tag 之间的 commit，
-      #   --strip header 去掉 changelog 文件头，只保留版本区块）
-      - name: Generate release notes with git-cliff
-        uses: orhun/git-cliff-action@v4
+      # AI 撰写面向用户的双语 release notes（素材 = git-cliff + commit 正文 + 变更统计）
+      # 实现见 .github/actions/release-notes/action.yml
+      - name: Generate release notes
+        uses: ./.github/actions/release-notes
         with:
-          args: --latest --strip header
-        env:
-          OUTPUT: RELEASE_NOTES.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # 兜底：若区间内没有符合规范的 commit（git-cliff 输出为空），
-      # 使用默认标题避免空 release body；同时备份原始 notes 供翻译失败时回退
-      - name: Finalize release notes
-        id: finalize
-        shell: bash
-        run: |
-          TAG_NAME="${GITHUB_REF#refs/tags/}"
-          HAS_NOTES=true
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "Release $TAG_NAME" > RELEASE_NOTES.md
-            HAS_NOTES=false
-          fi
-          cp RELEASE_NOTES.md RELEASE_NOTES.orig.md
-          echo "has_notes=$HAS_NOTES" >> "$GITHUB_OUTPUT"
-          echo "── Release notes (git-cliff) ──"
-          cat RELEASE_NOTES.md
-
-      # ── 将混合语言的 cliff 输出翻译为中英双语 ──
-      # 官网 changelog 页按站点语言取对应区块（<!-- fluxdown:lang:zh/en --> 标记），
-      # GitHub Release 页则两段依次展示。失败不阻塞发布（下一步回退原始 notes）。
-      # 注意：直接调用 Claude Code CLI 而非 claude-code-action —— 该 action 的事件白名单
-      # 不含 push，tag 推送触发时会立即报 "Unsupported event type: push"。
-      - name: Translate release notes (bilingual)
-        if: steps.finalize.outputs.has_notes == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          TRANSLATE_PROMPT: |
-            RELEASE_NOTES.md 是 git-cliff 从 Conventional Commits 生成的更新日志，条目语言混杂（部分中文、部分英文）。
-            请将其改写为中英双语版本，并覆盖写回 RELEASE_NOTES.md。
-
-            输出文件格式（严格遵守，无代码块围栏、无任何额外说明文字）：
-
-            <!-- fluxdown:lang:zh -->
-            （完整中文版）
-
-            <!-- fluxdown:lang:en -->
-            （完整英文版）
-
-            规则：
-            - 两个区块的结构与原文件一一对应：保留 "## [x.y.z] - 日期" 版本标题、"### <emoji> 分组" 标题、"- *(scope)* 描述" 条目格式与条目顺序，emoji 原样保留
-            - 中文区块：分组标题与所有条目描述均为中文（如 "### 🚀 新功能"、"### 🐛 问题修复"）
-            - 英文区块：分组标题与所有条目描述均为英文（如 "### 🚀 Features"、"### 🐛 Bug Fixes"）
-            - *(scope)* 括号内的 scope 名、反引号内的代码、issue/PR 编号（#123）、专有名词（HLS、DASH、aria2、Rinf、BT tracker 等）原样保留，不翻译
-            - 只修改 RELEASE_NOTES.md，不改动其他任何文件
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude -p "$TRANSLATE_PROMPT" --allowedTools "Read,Write,Edit"
-
-      # 校验翻译结果：缺少双语标记则回退到原始 git-cliff 输出
-      - name: Validate translated notes
-        if: steps.finalize.outputs.has_notes == 'true'
-        shell: bash
-        run: |
-          if grep -q '<!-- fluxdown:lang:zh -->' RELEASE_NOTES.md \
-            && grep -q '<!-- fluxdown:lang:en -->' RELEASE_NOTES.md; then
-            echo "Bilingual translation OK"
-          else
-            echo "::warning::Translated notes missing language markers — falling back to original git-cliff output"
-            cp RELEASE_NOTES.orig.md RELEASE_NOTES.md
-          fi
-          rm -f RELEASE_NOTES.orig.md
-          echo "── Final release notes ──"
-          cat RELEASE_NOTES.md
+          component: 桌面客户端（Windows / macOS / Linux）
+          fallback-title: Release ${{ github.ref_name }}
+          claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # ── 下载桌面客户端构建产物 ──
       - name: Download all Windows artifacts
@@ -1833,74 +1765,13 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      # 只收集 fluxDown/ 目录相关的 commit 作为扩展 release notes
-      - name: Generate release notes with git-cliff
-        uses: orhun/git-cliff-action@v4
+      - name: Generate release notes
+        uses: ./.github/actions/release-notes
         with:
-          args: --latest --strip header --include-path "fluxDown/**"
-        env:
-          OUTPUT: RELEASE_NOTES.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # 兜底 + 备份原始 notes 供翻译失败时回退
-      - name: Finalize release notes
-        id: finalize
-        shell: bash
-        run: |
-          HAS_NOTES=true
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "Browser Extension Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
-            HAS_NOTES=false
-          fi
-          cp RELEASE_NOTES.md RELEASE_NOTES.orig.md
-          echo "has_notes=$HAS_NOTES" >> "$GITHUB_OUTPUT"
-          echo "── Release notes (git-cliff) ──"
-          cat RELEASE_NOTES.md
-
-      # ── 将混合语言的 cliff 输出翻译为中英双语（与 release-app 同一套规则，直接调用 CLI）──
-      - name: Translate release notes (bilingual)
-        if: steps.finalize.outputs.has_notes == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          TRANSLATE_PROMPT: |
-            RELEASE_NOTES.md 是 git-cliff 从 Conventional Commits 生成的更新日志，条目语言混杂（部分中文、部分英文）。
-            请将其改写为中英双语版本，并覆盖写回 RELEASE_NOTES.md。
-
-            输出文件格式（严格遵守，无代码块围栏、无任何额外说明文字）：
-
-            <!-- fluxdown:lang:zh -->
-            （完整中文版）
-
-            <!-- fluxdown:lang:en -->
-            （完整英文版）
-
-            规则：
-            - 两个区块的结构与原文件一一对应：保留 "## [x.y.z] - 日期" 版本标题、"### <emoji> 分组" 标题、"- *(scope)* 描述" 条目格式与条目顺序，emoji 原样保留
-            - 中文区块：分组标题与所有条目描述均为中文（如 "### 🚀 新功能"、"### 🐛 问题修复"）
-            - 英文区块：分组标题与所有条目描述均为英文（如 "### 🚀 Features"、"### 🐛 Bug Fixes"）
-            - *(scope)* 括号内的 scope 名、反引号内的代码、issue/PR 编号（#123）、专有名词（HLS、DASH、aria2、Content-Disposition 等）原样保留，不翻译
-            - 只修改 RELEASE_NOTES.md，不改动其他任何文件
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude -p "$TRANSLATE_PROMPT" --allowedTools "Read,Write,Edit"
-
-      # 校验翻译结果：缺少双语标记则回退到原始 git-cliff 输出
-      - name: Validate translated notes
-        if: steps.finalize.outputs.has_notes == 'true'
-        shell: bash
-        run: |
-          if grep -q '<!-- fluxdown:lang:zh -->' RELEASE_NOTES.md \
-            && grep -q '<!-- fluxdown:lang:en -->' RELEASE_NOTES.md; then
-            echo "Bilingual translation OK"
-          else
-            echo "::warning::Translated notes missing language markers — falling back to original git-cliff output"
-            cp RELEASE_NOTES.orig.md RELEASE_NOTES.md
-          fi
-          rm -f RELEASE_NOTES.orig.md
-          echo "── Final release notes ──"
-          cat RELEASE_NOTES.md
+          component: 浏览器扩展（Chrome / Firefox / Edge）
+          fallback-title: Browser Extension Release v${{ steps.version.outputs.VERSION }}
+          paths: fluxDown/**
+          claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       - name: Download browser extensions
         uses: actions/download-artifact@v4
@@ -1942,74 +1813,13 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      # 只收集服务器相关目录的 commit 作为 release notes
-      - name: Generate release notes with git-cliff
-        uses: orhun/git-cliff-action@v4
+      - name: Generate release notes
+        uses: ./.github/actions/release-notes
         with:
-          args: --latest --strip header --include-path "native/server/**" --include-path "web/**" --include-path "native/engine/**" --include-path "docker/**"
-        env:
-          OUTPUT: RELEASE_NOTES.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # 兜底 + 备份原始 notes 供翻译失败时回退
-      - name: Finalize release notes
-        id: finalize
-        shell: bash
-        run: |
-          HAS_NOTES=true
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "FluxDown Server Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
-            HAS_NOTES=false
-          fi
-          cp RELEASE_NOTES.md RELEASE_NOTES.orig.md
-          echo "has_notes=$HAS_NOTES" >> "$GITHUB_OUTPUT"
-          echo "── Release notes (git-cliff) ──"
-          cat RELEASE_NOTES.md
-
-      # ── 将混合语言的 cliff 输出翻译为中英双语（与 release-app 同一套规则，直接调用 CLI）──
-      - name: Translate release notes (bilingual)
-        if: steps.finalize.outputs.has_notes == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          TRANSLATE_PROMPT: |
-            RELEASE_NOTES.md 是 git-cliff 从 Conventional Commits 生成的更新日志，条目语言混杂（部分中文、部分英文）。
-            请将其改写为中英双语版本，并覆盖写回 RELEASE_NOTES.md。
-
-            输出文件格式（严格遵守，无代码块围栏、无任何额外说明文字）：
-
-            <!-- fluxdown:lang:zh -->
-            （完整中文版）
-
-            <!-- fluxdown:lang:en -->
-            （完整英文版）
-
-            规则：
-            - 两个区块的结构与原文件一一对应：保留 "## [x.y.z] - 日期" 版本标题、"### <emoji> 分组" 标题、"- *(scope)* 描述" 条目格式与条目顺序，emoji 原样保留
-            - 中文区块：分组标题与所有条目描述均为中文（如 "### 🚀 新功能"、"### 🐛 问题修复"）
-            - 英文区块：分组标题与所有条目描述均为英文（如 "### 🚀 Features"、"### 🐛 Bug Fixes"）
-            - *(scope)* 括号内的 scope 名、反引号内的代码、issue/PR 编号（#123）、专有名词（HLS、DASH、aria2、Docker、WebSocket 等）原样保留，不翻译
-            - 只修改 RELEASE_NOTES.md，不改动其他任何文件
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude -p "$TRANSLATE_PROMPT" --allowedTools "Read,Write,Edit"
-
-      # 校验翻译结果：缺少双语标记则回退到原始 git-cliff 输出
-      - name: Validate translated notes
-        if: steps.finalize.outputs.has_notes == 'true'
-        shell: bash
-        run: |
-          if grep -q '<!-- fluxdown:lang:zh -->' RELEASE_NOTES.md \
-            && grep -q '<!-- fluxdown:lang:en -->' RELEASE_NOTES.md; then
-            echo "Bilingual translation OK"
-          else
-            echo "::warning::Translated notes missing language markers — falling back to original git-cliff output"
-            cp RELEASE_NOTES.orig.md RELEASE_NOTES.md
-          fi
-          rm -f RELEASE_NOTES.orig.md
-          echo "── Final release notes ──"
-          cat RELEASE_NOTES.md
+          component: Headless 服务器（含 Web 控制台）
+          fallback-title: Server Release v${{ steps.version.outputs.VERSION }}
+          paths: native/server/** web/** native/engine/** docker/**
+          claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # 附加下载方式说明（直接下载二进制 + Docker）
       - name: Append download & Docker usage to release notes
@@ -2094,74 +1904,13 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      # 只收集 CLI 相关目录的 commit 作为 release notes
-      - name: Generate release notes with git-cliff
-        uses: orhun/git-cliff-action@v4
+      - name: Generate release notes
+        uses: ./.github/actions/release-notes
         with:
-          args: --latest --strip header --include-path "native/cli/**" --include-path "native/api/**" --include-path "native/engine/**"
-        env:
-          OUTPUT: RELEASE_NOTES.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # 兜底 + 备份原始 notes 供翻译失败时回退
-      - name: Finalize release notes
-        id: finalize
-        shell: bash
-        run: |
-          HAS_NOTES=true
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "FluxDown CLI Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
-            HAS_NOTES=false
-          fi
-          cp RELEASE_NOTES.md RELEASE_NOTES.orig.md
-          echo "has_notes=$HAS_NOTES" >> "$GITHUB_OUTPUT"
-          echo "── Release notes (git-cliff) ──"
-          cat RELEASE_NOTES.md
-
-      # ── 将混合语言的 cliff 输出翻译为中英双语（与 release-app 同一套规则，直接调用 CLI）──
-      - name: Translate release notes (bilingual)
-        if: steps.finalize.outputs.has_notes == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          TRANSLATE_PROMPT: |
-            RELEASE_NOTES.md 是 git-cliff 从 Conventional Commits 生成的更新日志，条目语言混杂（部分中文、部分英文）。
-            请将其改写为中英双语版本，并覆盖写回 RELEASE_NOTES.md。
-
-            输出文件格式（严格遵守，无代码块围栏、无任何额外说明文字）：
-
-            <!-- fluxdown:lang:zh -->
-            （完整中文版）
-
-            <!-- fluxdown:lang:en -->
-            （完整英文版）
-
-            规则：
-            - 两个区块的结构与原文件一一对应：保留 "## [x.y.z] - 日期" 版本标题、"### <emoji> 分组" 标题、"- *(scope)* 描述" 条目格式与条目顺序，emoji 原样保留
-            - 中文区块：分组标题与所有条目描述均为中文（如 "### 🚀 新功能"、"### 🐛 问题修复"）
-            - 英文区块：分组标题与所有条目描述均为英文（如 "### 🚀 Features"、"### 🐛 Bug Fixes"）
-            - *(scope)* 括号内的 scope 名、反引号内的代码、issue/PR 编号（#123）、专有名词（HLS、DASH、aria2、Docker、WebSocket 等）原样保留，不翻译
-            - 只修改 RELEASE_NOTES.md，不改动其他任何文件
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude -p "$TRANSLATE_PROMPT" --allowedTools "Read,Write,Edit"
-
-      # 校验翻译结果：缺少双语标记则回退到原始 git-cliff 输出
-      - name: Validate translated notes
-        if: steps.finalize.outputs.has_notes == 'true'
-        shell: bash
-        run: |
-          if grep -q '<!-- fluxdown:lang:zh -->' RELEASE_NOTES.md \
-            && grep -q '<!-- fluxdown:lang:en -->' RELEASE_NOTES.md; then
-            echo "Bilingual translation OK"
-          else
-            echo "::warning::Translated notes missing language markers — falling back to original git-cliff output"
-            cp RELEASE_NOTES.orig.md RELEASE_NOTES.md
-          fi
-          rm -f RELEASE_NOTES.orig.md
-          echo "── Final release notes ──"
-          cat RELEASE_NOTES.md
+          component: 命令行工具 CLI
+          fallback-title: CLI Release v${{ steps.version.outputs.VERSION }}
+          paths: native/cli/** native/api/** native/engine/**
+          claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # 附加下载 & 安装说明
       - name: Append download & install usage to release notes
@@ -2244,74 +1993,13 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
 
-      # 只收集移动端相关目录的 commit 作为 release notes
-      - name: Generate release notes with git-cliff
-        uses: orhun/git-cliff-action@v4
+      - name: Generate release notes
+        uses: ./.github/actions/release-notes
         with:
-          args: --latest --strip header --include-path "native/engine/**" --include-path "android/**" --include-path "lib/src/mobile/**"
-        env:
-          OUTPUT: RELEASE_NOTES.md
-          GITHUB_REPO: ${{ github.repository }}
-
-      # 兜底 + 备份原始 notes 供翻译失败时回退
-      - name: Finalize release notes
-        id: finalize
-        shell: bash
-        run: |
-          HAS_NOTES=true
-          if [ ! -s RELEASE_NOTES.md ]; then
-            echo "Mobile Release v${{ steps.version.outputs.VERSION }}" > RELEASE_NOTES.md
-            HAS_NOTES=false
-          fi
-          cp RELEASE_NOTES.md RELEASE_NOTES.orig.md
-          echo "has_notes=$HAS_NOTES" >> "$GITHUB_OUTPUT"
-          echo "── Release notes (git-cliff) ──"
-          cat RELEASE_NOTES.md
-
-      # ── 将混合语言的 cliff 输出翻译为中英双语（与 release-app 同一套规则，直接调用 CLI）──
-      - name: Translate release notes (bilingual)
-        if: steps.finalize.outputs.has_notes == 'true'
-        continue-on-error: true
-        shell: bash
-        env:
-          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          TRANSLATE_PROMPT: |
-            RELEASE_NOTES.md 是 git-cliff 从 Conventional Commits 生成的更新日志，条目语言混杂（部分中文、部分英文）。
-            请将其改写为中英双语版本，并覆盖写回 RELEASE_NOTES.md。
-
-            输出文件格式（严格遵守，无代码块围栏、无任何额外说明文字）：
-
-            <!-- fluxdown:lang:zh -->
-            （完整中文版）
-
-            <!-- fluxdown:lang:en -->
-            （完整英文版）
-
-            规则：
-            - 两个区块的结构与原文件一一对应：保留 "## [x.y.z] - 日期" 版本标题、"### <emoji> 分组" 标题、"- *(scope)* 描述" 条目格式与条目顺序，emoji 原样保留
-            - 中文区块：分组标题与所有条目描述均为中文（如 "### 🚀 新功能"、"### 🐛 问题修复"）
-            - 英文区块：分组标题与所有条目描述均为英文（如 "### 🚀 Features"、"### 🐛 Bug Fixes"）
-            - *(scope)* 括号内的 scope 名、反引号内的代码、issue/PR 编号（#123）、专有名词（HLS、DASH、aria2、Rinf、BT tracker 等）原样保留，不翻译
-            - 只修改 RELEASE_NOTES.md，不改动其他任何文件
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          claude -p "$TRANSLATE_PROMPT" --allowedTools "Read,Write,Edit"
-
-      # 校验翻译结果：缺少双语标记则回退到原始 git-cliff 输出
-      - name: Validate translated notes
-        if: steps.finalize.outputs.has_notes == 'true'
-        shell: bash
-        run: |
-          if grep -q '<!-- fluxdown:lang:zh -->' RELEASE_NOTES.md \
-            && grep -q '<!-- fluxdown:lang:en -->' RELEASE_NOTES.md; then
-            echo "Bilingual translation OK"
-          else
-            echo "::warning::Translated notes missing language markers — falling back to original git-cliff output"
-            cp RELEASE_NOTES.orig.md RELEASE_NOTES.md
-          fi
-          rm -f RELEASE_NOTES.orig.md
-          echo "── Final release notes ──"
-          cat RELEASE_NOTES.md
+          component: Android 移动端
+          fallback-title: Mobile Release v${{ steps.version.outputs.VERSION }}
+          paths: native/engine/** android/** lib/src/mobile/**
+          claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       - name: Download Android APK artifacts
         uses: actions/download-artifact@v4
