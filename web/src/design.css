@@ -1499,9 +1499,14 @@ svg { display: block; }
   display: flex; flex-direction: column; align-items: center; gap: 8px;
   padding: 70px 24px; text-align: center; color: var(--text3);
 }
-.rss-empty svg { color: var(--text3); opacity: .6; }
+.rss-empty > svg { color: var(--text3); opacity: .6; }
 .rss-empty b { font-size: 13.5px; color: var(--text2); }
 .rss-empty span { font-size: 12px; max-width: 420px; line-height: 1.6; }
+/* 抓取失败态：图标与标题染警示色，并给出「重试 / 检查配置」两个出口——
+   一条抓不动的订阅如果只显示空白，用户既不知道出了什么事也无处可去。 */
+.rss-empty.err > svg { color: var(--danger); opacity: 1; }
+.rss-empty.err b { color: var(--danger); }
+.rss-empty-acts { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 
 /* 规则预览：管理对话框「过滤规则」Tab 下半屏，输入即重算。 */
 .rss-preview { margin-top: 14px; border: 1px solid var(--border); border-radius: 9px; overflow: hidden; }

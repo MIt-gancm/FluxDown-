@@ -9,7 +9,7 @@
 // reason 是稳定原因码，一律经 lib/rss-filter.ts 的 reasonText() 映射为人读文案。
 
 import { useState } from 'react'
-import { ArrowDownWideNarrow, ArrowUpNarrowWide, RefreshCw, CheckCheck, Loader2, Radio, Search } from 'lucide-react'
+import { ArrowDownWideNarrow, ArrowUpNarrowWide, CircleAlert, RefreshCw, CheckCheck, Loader2, Radio, Search, Settings2 } from 'lucide-react'
 import { ApiError } from '../../lib/api'
 import { cn } from '../../lib/cn'
 import { fmtBytes, fmtRelativeUnix, fmtShortTime } from '../../lib/format'
@@ -25,6 +25,7 @@ import {
   useRssItemsQuery,
 } from '../../hooks/useRss'
 import { useTasksUi } from './context'
+import { RssManagerDialog } from './rss-manager-dialog'
 
 /** 状态 → chip 配色（对齐任务行的 done/err/pause 语义色）。 */
 const CHIP_CLASS: Record<number, string> = {
@@ -119,11 +120,13 @@ export function RssItemList({ source }: { source: RssSourceDto }) {
             <span>{intervalText(source.intervalMinutes || 30, t)}</span>
             <span className="sep">·</span>
             <span>
-              {unhealthy
-                ? t('rss.lastErrorAt', { error: source.lastError, count: source.failCount })
-                : source.lastSuccessAt > 0
-                  ? t('rss.lastSuccessAt', { time: fmtRelativeUnix(source.lastSuccessAt) })
-                  : t('rss.neverFetched')}
+              {fetching
+                ? t('rss.refreshing')
+                : unhealthy
+                  ? t('rss.lastErrorAt', { error: source.lastError, count: source.failCount })
+                  : source.lastSuccessAt > 0
+                    ? t('rss.lastSuccessAt', { time: fmtRelativeUnix(source.lastSuccessAt) })
+                    : t('rss.neverFetched')}
             </span>
             <span className="sep">·</span>
             <span>{source.autoDownload ? t('rss.modeAuto') : t('rss.modeCollect')}</span>
@@ -188,10 +191,33 @@ export function RssItemList({ source }: { source: RssSourceDto }) {
 
       <div className="rss-scroll">
         {items.length === 0 ? (
-          <div className="rss-empty">
-            <Radio size={30} />
-            <b>{isPending ? t('common.loading') : t('rss.emptyTitle')}</b>
-            <span>{t('rss.emptyHint')}</span>
+          // 空列表有三种截然不同的处境，用同一段文案糊过去等于什么都没说：
+          // 正在抓（等着就行）／抓失败了（要动手改配置）／抓成功但源里没东西。
+          <div className={cn('rss-empty', unhealthy && !fetching && 'err')}>
+            {fetching ? <Loader2 size={30} className="animate-spin" /> : unhealthy ? <CircleAlert size={30} /> : <Radio size={30} />}
+            <b>{fetching ? t('rss.emptyFetching') : unhealthy ? t('rss.stateError') : isPending ? t('common.loading') : t('rss.emptyTitle')}</b>
+            <span>{fetching ? t('rss.emptyFetchingHint') : unhealthy ? t('rss.emptyErrorHint') : t('rss.emptyHint')}</span>
+            {unhealthy && !fetching && (
+              <div className="rss-empty-acts">
+                <button
+                  type="button"
+                  className="btn ghost sm"
+                  onClick={() => { beginRssFetch(source.sourceId, source.lastFetchAt); refresh.mutate(source.sourceId) }}
+                >
+                  <RefreshCw size={13} />
+                  {t('common.retry')}
+                </button>
+                <RssManagerDialog
+                  source={source}
+                  trigger={
+                    <button type="button" className="btn ghost sm">
+                      <Settings2 size={13} />
+                      {t('rss.checkConfig')}
+                    </button>
+                  }
+                />
+              </div>
+            )}
           </div>
         ) : visible.length === 0 ? (
           <p className="empty-tip">{t('rss.noMatch', { query: search.trim() })}</p>

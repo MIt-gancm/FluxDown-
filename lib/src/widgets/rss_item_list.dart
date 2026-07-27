@@ -65,7 +65,7 @@ class _RssItemListState extends State<RssItemList> {
             _buildHeader(s, c, source),
             Expanded(
               child: items.isEmpty
-                  ? _buildEmpty(s, c)
+                  ? _buildEmpty(s, c, source)
                   : visible.isEmpty
                   ? _buildNoMatch(s, c)
                   : ListView.builder(
@@ -234,11 +234,15 @@ class _RssItemListState extends State<RssItemList> {
     );
   }
 
-  /// 一行说清「多久抓一次 / 上次怎么样 / 抓到了往哪放」——qBittorrent 至今
-  /// 没有的可视化（qB#20305 / AutoBangumi#701）。
+  /// 一行说清「多久抓一次 / 现在或上次怎么样 / 抓到了往哪放」——订阅的健康度
+  /// 不该藏在设置里，它就是用户判断「这条还活着吗」的唯一依据。
   String _statusLine(S s, RssSourceEntry source) {
     final parts = <String>[s.rssEveryMinutes(source.intervalMinutes)];
-    if (source.lastError.isNotEmpty) {
+    if (widget.provider.isRefreshing(source.sourceId)) {
+      // 抓取中优先于历史结果：这一行回答的是「现在怎么样」，此刻正在跑就该
+      // 这么说，而不是停在上一轮的时间戳或「尚未抓取」上。
+      parts.add(s.rssRefreshing);
+    } else if (source.lastError.isNotEmpty) {
       parts.add(s.rssFailedTimes(source.failCount));
       parts.add(source.lastError);
     } else if (source.lastSuccessAt > 0) {
@@ -259,31 +263,98 @@ class _RssItemListState extends State<RssItemList> {
   }
 
   // ─────────────────────────────────────────────
-  // 空态（给引导，不给空白——2026 桌面工具类趋势）
+  // 空态：给引导，不给空白
   // ─────────────────────────────────────────────
 
-  Widget _buildEmpty(S s, AppColors c) => Center(
-    child: Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 48),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(LucideIcons.rss, size: 40, color: c.textDisabled),
-          const SizedBox(height: 14),
-          Text(
-            s.rssEmptyTitle,
-            style: TextStyle(fontSize: 13.5, color: c.textSecondary),
-          ),
-          const SizedBox(height: 6),
-          Text(
-            s.rssEmptyDesc,
-            textAlign: TextAlign.center,
-            style: TextStyle(fontSize: 11.5, color: c.textMuted, height: 1.6),
-          ),
-        ],
+  /// 空列表有三种截然不同的处境，用同一段文案糊过去等于什么都没说：
+  /// 正在抓（等着就行）／抓失败了（要动手改配置）／抓成功但源里没东西。
+  /// 新建订阅后引擎会立刻抓一轮，此时进来看到的必须是转圈而不是空白。
+  Widget _buildEmpty(S s, AppColors c, RssSourceEntry source) {
+    final fetching = widget.provider.isRefreshing(source.sourceId);
+    final failed = !fetching && source.lastError.isNotEmpty;
+    final title = fetching
+        ? s.rssEmptyFetching
+        : failed
+        ? s.rssEmptyError
+        : s.rssEmptyTitle;
+    final desc = fetching
+        ? s.rssEmptyFetchingHint
+        : failed
+        ? s.rssEmptyErrorHint
+        : s.rssEmptyDesc;
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 48),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (fetching)
+              SizedBox(
+                width: 26,
+                height: 26,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.2,
+                  color: c.accent,
+                ),
+              )
+            else
+              Icon(
+                failed ? LucideIcons.circleAlert : LucideIcons.rss,
+                size: 40,
+                color: failed ? AppColors.red : c.textDisabled,
+              ),
+            const SizedBox(height: 14),
+            Text(
+              title,
+              style: TextStyle(
+                fontSize: 13.5,
+                color: failed ? AppColors.red : c.textSecondary,
+              ),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              desc,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 11.5, color: c.textMuted, height: 1.6),
+            ),
+            if (failed) ...[
+              const SizedBox(height: 16),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ShadButton.outline(
+                    size: ShadButtonSize.sm,
+                    onPressed: () => widget.provider.refresh(source.sourceId),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(LucideIcons.refreshCw, size: 13),
+                        const SizedBox(width: 6),
+                        Text(s.rssEmptyRetry),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ShadButton.outline(
+                    size: ShadButtonSize.sm,
+                    onPressed: () => widget.onManage(source.sourceId),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const Icon(LucideIcons.settings2, size: 13),
+                        const SizedBox(width: 6),
+                        Text(s.rssCheckConfig),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ],
+          ],
+        ),
       ),
-    ),
-  );
+    );
+  }
 
   Widget _buildNoMatch(S s, AppColors c) => Center(
     child: Text(

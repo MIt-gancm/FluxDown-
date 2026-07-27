@@ -220,6 +220,7 @@ export function Sidebar() {
             )}
           </>
         )}
+
         {showQueues && (
           <>
             <SectionLabel

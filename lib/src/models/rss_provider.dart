@@ -41,6 +41,18 @@ class RssProvider extends ChangeNotifier {
   /// 一变就解除。
   final Map<String, String> _downloadingItems = {};
 
+  /// 刚提交、等着在下一份订阅快照里认领的 feed 地址（空 = 无待认领）。
+  ///
+  /// [CreateRssSource] 是单向信号，新订阅的 id 只会随 [AllRssSources] 回流。
+  /// 引擎建完订阅**立刻就抓了一轮**，但 UI 这边此刻既不知道 id 也就无从表达
+  /// 「在抓」——用户点完「订阅」进去看到的是一条名字还是主机名、写着「尚未
+  /// 抓取」的空列表，分不清是在跑、卡住了还是已经失败。先把 URL 记下来，
+  /// 快照一到就按 URL 认领，同步点亮抓取态并选中它。
+  String _pendingCreateUrl = '';
+
+  /// 我方主动 [RequestRssItems] 的待回执账本。
+  final _selfItemsRequests = PendingRequestLedger();
+
   bool _disposed = false;
 
   StreamSubscription<RustSignalPack<AllRssSources>>? _sourcesSub;
@@ -118,14 +130,39 @@ class RssProvider extends ChangeNotifier {
         !_sources.any((s) => s.sourceId == _selectedSourceId)) {
       _selectedSourceId = '';
     }
-    // `lastFetchAt` 前进 = 那一轮抓取已落地（成功与失败都会回写）；订阅整个
-    // 消失也一并解除，否则删订阅会留下一个永远转圈的幽灵。
-    _refreshingSince.removeWhere((id, since) {
-      final current = _sources.where((s) => s.sourceId == id).firstOrNull;
-      return current == null || current.lastFetchAt != since;
-    });
+    _refreshingSince.removeWhere(
+      (id, since) => rssFetchSettled(
+        _sources.where((s) => s.sourceId == id).firstOrNull,
+        since,
+      ),
+    );
+    _claimPendingCreate();
     logInfo('Rss', 'sources: ${_sources.length}');
     _safeNotifyListeners();
+  }
+
+  /// 认领刚创建的订阅：选中它、拉条目流，并在首轮抓取尚未落地时点亮抓取态。
+  ///
+  /// 判「还没落地」看的是**有没有结果**（成功时间与错误都空），而不是
+  /// `lastFetchAt == 0`：引擎在派发那一刻就乐观地把 `lastFetchAt` 置成了当前
+  /// 时间（防止 due 判定把失败源变成每 tick 重试的死循环），拿它当判据会漏掉
+  /// 「已派发、结果未回」这一整段——恰恰是要显示转圈的那一段。
+  void _claimPendingCreate() {
+    if (_pendingCreateUrl.isEmpty) return;
+    final created = _sources
+        .where((s) => s.url == _pendingCreateUrl)
+        .firstOrNull;
+    if (created == null) return;
+    _pendingCreateUrl = '';
+    _selectedSourceId = created.sourceId;
+    _requestItemsTracked(created.sourceId);
+    if (rssFirstFetchPending(created)) {
+      _refreshingSince[created.sourceId] = created.lastFetchAt;
+      Timer(
+        const Duration(seconds: 45),
+        () => _clearRefreshing(created.sourceId),
+      );
+    }
   }
 
   void _onItems(RustSignalPack<RssItemsSnapshot> pack) {
@@ -141,9 +178,13 @@ class RssProvider extends ChangeNotifier {
         }
       }
     }
-    // 条目流刷新同样意味着那一轮抓取已经结束（同秒二次刷新时 lastFetchAt
-    // 可能不变，这里做第二重解除）。
-    _refreshingSince.remove(msg.sourceId);
+    // 只有**抓取落地后的广播**才意味着这一轮结束；我们自己 RequestRssItems 的
+    // 回执什么都不意味着，它会在毫秒内返回，正好赶在首轮抓取之前，不区分就会
+    // 立刻把刚点亮的「抓取中」熄掉，用户看到的仍是一片空列表。
+    if (!_selfItemsRequests.consume(msg.sourceId)) {
+      // 同秒二次刷新时 lastFetchAt 可能不变，这里是第二重解除。
+      _refreshingSince.remove(msg.sourceId);
+    }
     if (msg.notifyTitles.isNotEmpty) {
       _lastNotifyTitles = msg.notifyTitles;
       _notifySeq++;
@@ -182,7 +223,7 @@ class RssProvider extends ChangeNotifier {
     if (_selectedSourceId == sourceId) return;
     _selectedSourceId = sourceId;
     if (sourceId.isNotEmpty) {
-      RequestRssItems(sourceId: sourceId).sendSignalToRust();
+      _requestItemsTracked(sourceId);
     }
     _safeNotifyListeners();
   }
@@ -190,6 +231,12 @@ class RssProvider extends ChangeNotifier {
   /// 主动重新拉取某订阅的条目流（管理对话框打开时用来喂预览区）。
   void requestItems(String sourceId) {
     if (sourceId.isEmpty) return;
+    _requestItemsTracked(sourceId);
+  }
+
+  /// 发一次条目流请求并记账，供 [_onItems] 把回执与抓取广播区分开。
+  void _requestItemsTracked(String sourceId) {
+    _selfItemsRequests.record(sourceId);
     RequestRssItems(sourceId: sourceId).sendSignalToRust();
   }
 
@@ -203,7 +250,14 @@ class RssProvider extends ChangeNotifier {
 
   void create(RssSourceEntry source) {
     logInfo('Rss', 'create: ${source.url}');
+    final url = source.url;
+    _pendingCreateUrl = url;
     CreateRssSource(source: source).sendSignalToRust();
+    // 认领窗口有上限：URL 非法等原因导致引擎压根没建成时，这条待认领记录不能
+    // 一直挂着——否则日后（哪怕是另一端）出现同 URL 的订阅会被它误认领。
+    Timer(const Duration(seconds: 20), () {
+      if (_pendingCreateUrl == url) _pendingCreateUrl = '';
+    });
   }
 
   void update(RssSourceEntry source) {
@@ -309,6 +363,54 @@ class RssProvider extends ChangeNotifier {
     SetRssItemAction(sourceId: sourceId, guid: '', action: 2)
         .sendSignalToRust();
   }
+}
+
+/// 「我方主动请求」的待回执账本。
+///
+/// 条目快照有两种来路：抓取落地后的广播（= 这一轮结束）与我们自己
+/// [RequestRssItems] 的回执（什么都不代表）。两者在信号层长得一模一样，只能
+/// 靠这本账区分——不区分就会被毫秒级返回的回执把刚点亮的「抓取中」熄掉。
+class PendingRequestLedger {
+  final Map<String, int> _counts = {};
+
+  void record(String key) {
+    _counts.update(key, (n) => n + 1, ifAbsent: () => 1);
+  }
+
+  /// 抵消一笔自请求；账上有才返回 true（此时这份快照不代表抓取结束）。
+  bool consume(String key) {
+    final pending = _counts[key];
+    if (pending == null) return false;
+    if (pending <= 1) {
+      _counts.remove(key);
+    } else {
+      _counts[key] = pending - 1;
+    }
+    return true;
+  }
+}
+
+/// 这条订阅是否「首轮已派发、结果还没回」。
+///
+/// 判据是**有没有结果**（成功时间与错误都空），不能看 `lastFetchAt`：引擎在
+/// 派发那一刻就乐观地把它置成当前时间（防止 due 判定把失败源变成每 tick 重试
+/// 的死循环），拿它当判据会漏掉「已派发、结果未回」这一整段——恰恰是该显示
+/// 转圈的那一段。
+bool rssFirstFetchPending(RssSourceEntry source) =>
+    source.lastSuccessAt == 0 && source.lastError.isEmpty;
+
+/// 这一轮抓取是否已经结束——供从每份订阅快照里回收「抓取中」标记。
+///
+/// [current] 为 null（订阅被删）一律结束，否则常规判据是 `lastFetchAt` 相对
+/// 发起时的 [since] 前进过（成功与失败两条路径都会回写它）。
+///
+/// 唯一的例外是首轮（`since == 0`）：引擎在派发那一刻就乐观地把 `lastFetchAt`
+/// 推到了当前时间，只比对它会在结果回来之前就把转圈熄掉，所以首轮改看「有没有
+/// 结果」。
+bool rssFetchSettled(RssSourceEntry? current, int since) {
+  if (current == null) return true;
+  if (since == 0 && rssFirstFetchPending(current)) return false;
+  return current.lastFetchAt != since;
 }
 
 /// 订阅的展示名：`name` 为空时回退到 **feed 主机名**（而不是整条 URL）。

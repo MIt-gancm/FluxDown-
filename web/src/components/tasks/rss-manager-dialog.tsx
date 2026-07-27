@@ -7,7 +7,7 @@
 // 三 Tab 经「确定」一次提交（新建 → createRssSource，管理 → updateRssSource）。
 // 表单值在 open 边沿由整体重挂载（key）从订阅当前快照初始化。
 
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, CircleAlert, Loader2, Settings2, X } from 'lucide-react'
@@ -21,11 +21,13 @@ import { SelectField } from '../dialogs/select-field'
 import { FsPicker } from '../dialogs/fs-picker'
 import { SetSwitch } from '../settings/controls'
 import {
+  beginRssFetch,
   useCreateRssSourceMutation,
   useRssItemsQuery,
   useUpdateRssSourceMutation,
   useValidateRssFeedMutation,
 } from '../../hooks/useRss'
+import { useTasksUi } from './context'
 
 /** 抓取间隔下拉：分钟数 + 文案键（`{n}` 由渲染处代入）。 */
 const INTERVAL_OPTIONS: { minutes: number; key: I18nKey; n: number }[] = [
@@ -122,16 +124,19 @@ function formOf(s: RssSourceDto): RssForm {
   }
 }
 
-/** 管理既有订阅：与队列对话框一致，自带 hover 操作簇里的齿轮触发器。 */
-export function RssManagerDialog({ source }: { source: RssSourceDto }) {
+/** 管理既有订阅。`trigger` 省略时用侧边栏 hover 操作簇里的齿轮按钮；条目流的
+ *  「检查配置」入口传自己的按钮进来复用同一份表单。 */
+export function RssManagerDialog({ source, trigger }: { source: RssSourceDto; trigger?: ReactNode }) {
   const { t } = useI18n()
   const [open, setOpen] = useState(false)
   return (
     <Dialog.Root open={open} onOpenChange={setOpen}>
       <Dialog.Trigger asChild>
-        <button type="button" className="icon-btn sm" title={t('rss.manage')} onClick={(e) => e.stopPropagation()}>
-          <Settings2 size={13} />
-        </button>
+        {trigger ?? (
+          <button type="button" className="icon-btn sm" title={t('rss.manage')} onClick={(e) => e.stopPropagation()}>
+            <Settings2 size={13} />
+          </button>
+        )}
       </Dialog.Trigger>
       <RssDialogContent key={String(open)} source={source} open={open} setOpen={setOpen} />
     </Dialog.Root>
@@ -166,6 +171,7 @@ function RssDialogContent({
   // 条目流只在对话框打开时才拉：本组件为每条订阅常驻挂载（Portal 才是按需的），
   // 否则侧边栏有几条订阅就会在首屏打出几个 items 请求。
   const { data: cachedItems = [] } = useRssItemsQuery(open ? (source?.sourceId ?? '') : '')
+  const { setRssFilter } = useTasksUi()
   const create = useCreateRssSourceMutation()
   const update = useUpdateRssSourceMutation()
   const validate = useValidateRssFeedMutation()
@@ -210,8 +216,16 @@ function RssDialogContent({
       return
     }
     const dto = buildDto()
-    if (source) await update.mutateAsync({ sourceId: source.sourceId, req: dto })
-    else await create.mutateAsync(dto)
+    if (source) {
+      await update.mutateAsync({ sourceId: source.sourceId, req: dto })
+    } else {
+      // 引擎建完订阅会立刻抓一轮。这里同步把它标成「抓取中」并切到它的条目流：
+      // 否则用户看到的是一条名字还是主机名、写着「尚未抓取」的空列表，既分不清
+      // 是在跑还是已经失败，也不知道该等还是该去检查配置。
+      const { sourceId } = await create.mutateAsync(dto)
+      beginRssFetch(sourceId, 0)
+      setRssFilter(sourceId)
+    }
     setOpen(false)
   }
 

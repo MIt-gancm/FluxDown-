@@ -1742,6 +1742,11 @@ class S {
   String get rssSortOldest => _r('rssSortOldest');
   String get rssEmptyTitle => _r('rssEmptyTitle');
   String get rssEmptyDesc => _r('rssEmptyDesc');
+  String get rssEmptyFetching => _r('rssEmptyFetching');
+  String get rssEmptyFetchingHint => _r('rssEmptyFetchingHint');
+  String get rssEmptyError => _r('rssEmptyError');
+  String get rssEmptyErrorHint => _r('rssEmptyErrorHint');
+  String get rssEmptyRetry => _r('rssEmptyRetry');
   String rssNoMatch(String query) => _r('rssNoMatch', {'query': query});
   String rssEveryMinutes(int n) => _r('rssEveryMinutes', {'n': n});
   String rssEveryHours(int n) => _r('rssEveryHours', {'n': n});
