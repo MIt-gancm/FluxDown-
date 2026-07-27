@@ -25,36 +25,51 @@
 
 ## 提交记录（2026-07-27）
 
-一轮共 **23 项**：19 个 PR + 4 个 issue，其中 `pcqpcq/open-source-android-apps#448` 已合并，其余 open。
+一轮共 **23 项**：19 个 PR + 4 个 issue。截至 2026-07-28 复查：**9 合并 + 1 issue 已完成 + 14 仍 open**。
 
 | 渠道 | 编号 | 状态 |
 |---|---|---|
-| pcqpcq/open-source-android-apps | [#448](https://github.com/pcqpcq/open-source-android-apps/pull/448) | ✅ 已合并 |
-| rust-unofficial/awesome-rust | [#2672](https://github.com/rust-unofficial/awesome-rust/pull/2672) | open |
+| pcqpcq/open-source-android-apps | [#448](https://github.com/pcqpcq/open-source-android-apps/pull/448) | ✅ 已合并（07-27） |
+| rust-unofficial/awesome-rust | [#2672](https://github.com/rust-unofficial/awesome-rust/pull/2672) | ✅ 已合并（07-27） |
 | TaKO8Ki/awesome-alternatives-in-rust | [#148](https://github.com/TaKO8Ki/awesome-alternatives-in-rust/pull/148) | open |
 | Solido/awesome-flutter | [#1055](https://github.com/Solido/awesome-flutter/pull/1055) | open（只改 source.md） |
 | fluttergems/awesome-open-source-flutter-apps | [issue #777](https://github.com/fluttergems/awesome-open-source-flutter-apps/issues/777) | open（Step 1，等分类答复后补 PR） |
 | jaywcjlove/awesome-mac | [#2419](https://github.com/jaywcjlove/awesome-mac/pull/2419) | open（EN/zh/ja/ko 四文件） |
-| offa/android-foss | [#704](https://github.com/offa/android-foss/pull/704) | open |
+| offa/android-foss | [#704](https://github.com/offa/android-foss/pull/704) | ✅ 已合并（07-27） |
 | iCHAIT/awesome-macOS | [#950](https://github.com/iCHAIT/awesome-macOS/pull/950) | open |
-| thechampagne/awesome-windows | [#38](https://github.com/thechampagne/awesome-windows/pull/38) | open |
+| thechampagne/awesome-windows | [#38](https://github.com/thechampagne/awesome-windows/pull/38) | ✅ 已合并（07-27） |
 | 0PandaDEV/awesome-windows | [#236](https://github.com/0PandaDEV/awesome-windows/pull/236) | open |
 | awesome-soft/awesome-windows | [#8](https://github.com/awesome-soft/awesome-windows/pull/8) | open |
 | DimitrisPa/Awesome-Linux-Software | [#1](https://github.com/DimitrisPa/Awesome-Linux-Software/pull/1) | open |
 | themeselection/best-chrome-extensions | [#57](https://github.com/themeselection/best-chrome-extensions/pull/57) | open |
 | AwesomeHomelab/awesome-homelab | [#107](https://github.com/AwesomeHomelab/awesome-homelab/pull/107) | open |
-| lissy93/portainer-templates | [#123](https://github.com/lissy93/portainer-templates/pull/123) | open（蜜罐已忽略，未贴 gif） |
-| selfhosters/unRAID-CA-templates | [#686](https://github.com/selfhosters/unRAID-CA-templates/pull/686) | open |
+| lissy93/portainer-templates | [#123](https://github.com/lissy93/portainer-templates/pull/123) | ✅ 已合并（07-27） |
+| selfhosters/unRAID-CA-templates | [#686](https://github.com/selfhosters/unRAID-CA-templates/pull/686) | ✅ 已合并（07-27） |
 | TensorBlock/awesome-mcp-servers | [#1420](https://github.com/TensorBlock/awesome-mcp-servers/pull/1420) | open |
 | punkpeye/awesome-mcp-servers | [#9304](https://github.com/punkpeye/awesome-mcp-servers/pull/9304) | ✅ 2026-07-13 已合并 |
-| 1c7/chinese-independent-developer | [#1204](https://github.com/1c7/chinese-independent-developer/pull/1204) | open |
-| Axorax/awesome-free-apps | [#213](https://github.com/Axorax/awesome-free-apps/pull/213) | open |
+| 1c7/chinese-independent-developer | [#1204](https://github.com/1c7/chinese-independent-developer/pull/1204) | ✅ 已合并（07-27） |
+| Axorax/awesome-free-apps | [#213](https://github.com/Axorax/awesome-free-apps/pull/213) | ✅ 已合并（07-27） |
 | DangJin/awesome-social-media-downloader | [#10](https://github.com/DangJin/awesome-social-media-downloader/pull/10) | open |
 | 521xueweihan/HelloGitHub | [issue #3491](https://github.com/521xueweihan/HelloGitHub/issues/3491) | open |
 | ruanyf/weekly | [issue #10901](https://github.com/ruanyf/weekly/issues/10901) | open |
-| fmhy/edit | [issue #5890](https://github.com/fmhy/edit/issues/5890) | open |
+| fmhy/edit | [issue #5890](https://github.com/fmhy/edit/issues/5890) | ✅ closed/completed（07-27） |
 
 同步落地的仓库改动：新增 `glama.json`；`native/api/src/mcp.rs` 12 个工具及参数描述改写为英文（`cargo check -p fluxdown_api` 通过）；README/README.zh-CN/`promotion/mcp/server.json` 的「9 个工具」订正为 12 并补全 rss_* 三工具。
+
+### 合并后回挂（2026-07-28）
+
+已在 `README.md` / `README.zh-CN.md` 完成：
+
+1. MCP 徽章换成 Glama 官方 score 徽章（对齐 punkpeye 条目）
+2. 为 9 个已合并渠道回挂 featured 徽章（Awesome Rust / MCP / Windows / Free Apps、Android FOSS、Open Source Android Apps、Portainer、Unraid CA、Chinese Indie Dev）
+3. 在有维护者互动的 PR 下回复致谢：`offa/android-foss#704`、`lissy93/portainer-templates#123`、`1c7/chinese-independent-developer#1204`
+
+其余已合并但无维护者评论的 PR（awesome-rust / awesome-windows / free-apps / unRAID / open-source-android-apps / punkpeye 已回过）不再刷评论。
+
+**仍待项目侧后续**：
+
+- `offa/android-foss#704`：上架 F-Droid / IzzyOnDroid 后补商店徽章 follow-up PR
+- Unraid CA 网页提交：`https://ca.unraid.net/submit`（模板仓库已合，但 CA 目录另需填表）
 
 ### 未提交及原因
 
