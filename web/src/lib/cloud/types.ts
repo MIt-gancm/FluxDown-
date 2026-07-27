@@ -111,11 +111,10 @@ export interface CdnEcsSubnetEntry {
   subnet: string
 }
 
-/** GET /cdn/config 响应：CDN 多节点聚合下载云端配置快照（P1 §四 + P2 §五契约）。 */
+/** GET /cdn/config 响应：CDN 多节点聚合下载云端配置快照（P1 §四 + P2 §五契约）。
+ *  云端只下发先验，不做套餐门控——聚合开关与节点数上限均为客户端本地设置。 */
 export interface CdnConfig {
   revision: number
-  enabled: boolean
-  max_nodes: number
   resolvers: CdnResolverEntry[]
   ecs_subnets: CdnEcsSubnetEntry[]
 }

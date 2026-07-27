@@ -665,11 +665,6 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
                     engine.manager.set_cdn_max_nodes(v.clamp(0, 8));
                 }
             }
-            "cdn_cloud_max_nodes" => {
-                if let Some(v) = all.get(key).and_then(|v| v.parse::<i32>().ok()) {
-                    engine.manager.set_cdn_cloud_max_nodes(v.clamp(0, 8));
-                }
-            }
             "cdn_resolver_endpoints" => {
                 if let Some(v) = all.get(key) {
                     engine.manager.set_cdn_resolver_endpoints(v);

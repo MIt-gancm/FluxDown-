@@ -56,9 +56,6 @@ pub struct CdnTaskInput {
     /// 钉定节点数上限（SYS 兜底节点不计入）。**0 = 自动**：按文件大小与
     /// 并发连接数在 [`finish_pool`] 里经 [`auto_max_nodes`] 推导。
     pub max_nodes: usize,
-    /// 云端下发的节点数上限（P1 config 拉取落 `cdn_cloud_max_nodes`；
-    /// 0 = 云端未下发）。有效上限 = min(本地设置/自动值, 云端值)。
-    pub cloud_max_nodes: usize,
     /// 任务解析后的有效 UA（任务 > 队列 > 全局），pinned client 与任务
     /// client 保持一致。
     pub user_agent: String,
@@ -266,17 +263,12 @@ pub async fn finish_pool(
             return NodePool::single(task_client.clone());
         }
     };
-    // 有效节点上限：本地设置（0 = 自动阶梯）与云端下发上限取更低。
+    // 有效节点上限：本地设置（0 = 自动阶梯）。云端不下发上限——节点数纯属本地设置。
     let auto = input.max_nodes == 0;
-    let local_cap = if auto {
+    let cap = if auto {
         auto_max_nodes(total_bytes, segment_cap)
     } else {
         input.max_nodes.min(MAX_NODES_LIMIT)
-    };
-    let cap = if input.cloud_max_nodes > 0 {
-        local_cap.min(input.cloud_max_nodes)
-    } else {
-        local_cap
     };
     outcome.alive.truncate(cap.max(2));
     if outcome.alive.len() < 2 {

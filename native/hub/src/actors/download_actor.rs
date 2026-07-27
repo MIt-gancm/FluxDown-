@@ -2694,13 +2694,6 @@ async fn apply_config_key(
                 engine.manager.set_cdn_max_nodes(v);
             }
         }
-        "cdn_cloud_max_nodes" => {
-            if let Ok(v) = value.parse::<i32>() {
-                let v = v.clamp(0, 8);
-                log_info!("[actor] updating cdn_cloud_max_nodes to {}", v);
-                engine.manager.set_cdn_cloud_max_nodes(v);
-            }
-        }
         "cdn_resolver_endpoints" => {
             log_info!("[actor] updating cdn_resolver_endpoints");
             engine.manager.set_cdn_resolver_endpoints(value);

@@ -1080,9 +1080,6 @@ pub struct DownloadManager {
     /// **0 = 自动**：按文件大小与并发连接数推导，默认值；SYS 兜底节点
     /// 不计入）。
     cdn_max_nodes: i32,
-    /// 云端下发的节点数上限（config `cdn_cloud_max_nodes`，由 Dart 云拉取
-    /// 服务落库注入；0 = 云端未下发）。有效上限 = min(本地/自动, 云端)。
-    cdn_cloud_max_nodes: i32,
     /// In-memory cache of named queue settings (queue_id → QueueInfo).
     /// Kept in sync with the DB on every queue CRUD operation.
     queues: HashMap<String, QueueInfo>,
@@ -1235,7 +1232,6 @@ impl DownloadManager {
             use_server_time: false,
             cdn_multi_enabled: false,
             cdn_max_nodes: 0, // 0 = 自动档
-            cdn_cloud_max_nodes: 0,
             queues: HashMap::new(),
             queue_limiters: HashMap::new(),
             schedule_fired: HashMap::new(),
@@ -2095,12 +2091,6 @@ impl DownloadManager {
     /// 越界配置。
     pub fn set_cdn_max_nodes(&mut self, v: i32) {
         self.cdn_max_nodes = v.clamp(0, crate::cdn::MAX_NODES_LIMIT as i32);
-    }
-
-    /// Update the cloud-issued Multi-CDN node cap (config `cdn_cloud_max_nodes`).
-    /// 0 = 无云端上限。
-    pub fn set_cdn_cloud_max_nodes(&mut self, v: i32) {
-        self.cdn_cloud_max_nodes = v.clamp(0, crate::cdn::MAX_NODES_LIMIT as i32);
     }
 
     /// Update the cloud-issued DoH resolver endpoint list (config
@@ -3470,9 +3460,6 @@ impl DownloadManager {
                 && task_proxy.mode == ProxyMode::None,
             max_nodes: self
                 .cdn_max_nodes
-                .clamp(0, crate::cdn::MAX_NODES_LIMIT as i32) as usize,
-            cloud_max_nodes: self
-                .cdn_cloud_max_nodes
                 .clamp(0, crate::cdn::MAX_NODES_LIMIT as i32) as usize,
             user_agent: user_agent.to_string(),
         }

@@ -69,23 +69,15 @@ async function fetchCdnConfig(): Promise<void> {
 }
 
 /** 写入宿主引擎 config 表（PUT /api/v1/config live-apply），键集合与桌面
- *  SaveConfig 完全相同；enabled=false 回退内置 baseline / 全部禁用。 */
+ *  SaveConfig 完全相同。云端只下发先验，不含节点数上限——聚合开关与
+ *  cdn_max_nodes 全由本地设置决定。 */
 function applyCdnConfig(config: CdnConfig): Promise<unknown> {
-  if (config.enabled) {
-    return api.putConfig({
-      // 对象形式 `[{"url":...,"ecs":bool}]`：保留云端下发的 ECS 标志（引擎兼容旧纯字符串数组）。
-      cdn_resolver_endpoints: JSON.stringify(config.resolvers.map((r) => ({ url: r.url, ecs: r.ecs }))),
-      cdn_cloud_max_nodes: String(Math.min(8, Math.max(0, config.max_nodes))),
-      cdn_ecs_subnets: JSON.stringify(config.ecs_subnets.map((s) => s.subnet)),
-      // hints 与聚合下载同源，走当前生效的云服务地址（引擎侧仅接受 https，开发期 http 自然禁用）。
-      cdn_hints_base: getCloudBaseUrl(),
-    })
-  }
   return api.putConfig({
-    cdn_resolver_endpoints: '[]',
-    cdn_cloud_max_nodes: '0',
-    cdn_ecs_subnets: '[]',
-    cdn_hints_base: '',
+    // 对象形式 `[{"url":...,"ecs":bool}]`：保留云端下发的 ECS 标志（引擎兼容旧纯字符串数组）。
+    cdn_resolver_endpoints: JSON.stringify(config.resolvers.map((r) => ({ url: r.url, ecs: r.ecs }))),
+    cdn_ecs_subnets: JSON.stringify(config.ecs_subnets.map((s) => s.subnet)),
+    // hints 与聚合下载同源，走当前生效的云服务地址（引擎侧仅接受 https，开发期 http 自然禁用）。
+    cdn_hints_base: getCloudBaseUrl(),
   })
 }
 

@@ -249,13 +249,6 @@ impl Engine {
             pm.load_all().await;
             manager.install_plugin_manager(pm);
         }
-        // 云端下发的 CDN 节点上限（Dart 云拉取服务写 config 表；未下发/离线
-        // = 0 不生效）。开关与本地上限由宿主经既有 config 注入链路设置。
-        if let Ok(Some(v)) = db.get_config("cdn_cloud_max_nodes").await
-            && let Ok(n) = v.trim().parse::<i32>()
-        {
-            manager.set_cdn_cloud_max_nodes(n);
-        }
         // 装载 RSS 订阅到内存镜像——放在 Engine::new 而非交给宿主，保证任何
         // 宿主（hub/server/CLI --local）都不必记得这一步就能让轮询生效。
         manager.rss.load().await;

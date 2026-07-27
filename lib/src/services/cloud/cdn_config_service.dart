@@ -123,8 +123,8 @@ class CdnConfigService {
       _apply(config);
       logInfo(
         _tag,
-        'cdn config applied: revision=${config.revision} enabled=${config.enabled} '
-        'maxNodes=${config.maxNodes} resolvers=${config.resolvers.length}',
+        'cdn config applied: revision=${config.revision} '
+        'resolvers=${config.resolvers.length}',
       );
     } catch (e, stack) {
       // 失败静默：保留本地已落库的旧值，不向上抛出、不弹 UI 提示。
@@ -133,31 +133,19 @@ class CdnConfigService {
   }
 
   /// 写入引擎 config 表：走 [SaveConfig] 信号，Rust 侧 apply_config_key 分发
-  /// 给 `set_cdn_resolver_endpoints` / `set_cdn_cloud_max_nodes` /
-  /// `set_cdn_ecs_subnets` / `set_cdn_hints_base`（P2 §五扩展）。
+  /// 给 `set_cdn_resolver_endpoints` / `set_cdn_ecs_subnets` /
+  /// `set_cdn_hints_base`（P2 §五扩展）。云端只下发先验，不含节点数上限——
+  /// 聚合开关与 `cdn_max_nodes` 全由本地设置决定。
   void _apply(CdnConfig config) {
-    if (config.enabled) {
-      // 对象形式 `[{"url":...,"ecs":bool}]`：保留云端下发的 ECS 标志——引擎
-      // 对纯字符串数组（旧格式）与对象数组均兼容，向后兼容。
-      final endpoints = jsonEncode(
-        config.resolvers.map((r) => {'url': r.url, 'ecs': r.ecs}).toList(),
-      );
-      SaveConfig(key: 'cdn_resolver_endpoints', value: endpoints).sendSignalToRust();
-      SaveConfig(
-        key: 'cdn_cloud_max_nodes',
-        value: config.maxNodes.clamp(0, 8).toString(),
-      ).sendSignalToRust();
-      final ecsSubnets = jsonEncode(config.ecsSubnets.map((s) => s.subnet).toList());
-      SaveConfig(key: 'cdn_ecs_subnets', value: ecsSubnets).sendSignalToRust();
-      // hints 与聚合下载同源，走 CloudClient 当前生效的服务地址。
-      SaveConfig(key: 'cdn_hints_base', value: CloudApiConfig.baseUrl).sendSignalToRust();
-    } else {
-      // 套餐未开通聚合能力：回退内置 resolver baseline，云端上限归零
-      // （不再对本地/自动上限设限）；ECS 先验与 hints 查询一并禁用。
-      SaveConfig(key: 'cdn_resolver_endpoints', value: '[]').sendSignalToRust();
-      SaveConfig(key: 'cdn_cloud_max_nodes', value: '0').sendSignalToRust();
-      SaveConfig(key: 'cdn_ecs_subnets', value: '[]').sendSignalToRust();
-      SaveConfig(key: 'cdn_hints_base', value: '').sendSignalToRust();
-    }
+    // 对象形式 `[{"url":...,"ecs":bool}]`：保留云端下发的 ECS 标志——引擎
+    // 对纯字符串数组（旧格式）与对象数组均兼容，向后兼容。
+    final endpoints = jsonEncode(
+      config.resolvers.map((r) => {'url': r.url, 'ecs': r.ecs}).toList(),
+    );
+    SaveConfig(key: 'cdn_resolver_endpoints', value: endpoints).sendSignalToRust();
+    final ecsSubnets = jsonEncode(config.ecsSubnets.map((s) => s.subnet).toList());
+    SaveConfig(key: 'cdn_ecs_subnets', value: ecsSubnets).sendSignalToRust();
+    // hints 与聚合下载同源，走 CloudClient 当前生效的服务地址。
+    SaveConfig(key: 'cdn_hints_base', value: CloudApiConfig.baseUrl).sendSignalToRust();
   }
 }

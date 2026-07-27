@@ -431,18 +431,15 @@ class CdnEcsSubnetEntry {
 /// GET /cdn/config 响应（P1 §四 + P2 §五契约）：CDN 多节点聚合下载云端配置快照。
 /// 字段名为服务端约定的 snake_case（直接对应 FluxDown 引擎 config 表键，
 /// 与本文件其余模型的 camelCase 约定不同——见契约「客户端行为」节）。
+/// 云端只下发先验，不做套餐门控：是否启用聚合、并发节点数上限均为客户端本地设置。
 /// [policy] 暂不解析（引擎侧聚合超时预算等仍走本地默认值）。
 class CdnConfig {
   final int revision;
-  final bool enabled;
-  final int maxNodes;
   final List<CdnResolverEntry> resolvers;
   final List<CdnEcsSubnetEntry> ecsSubnets;
 
   const CdnConfig({
     required this.revision,
-    required this.enabled,
-    required this.maxNodes,
     required this.resolvers,
     required this.ecsSubnets,
   });
@@ -452,8 +449,6 @@ class CdnConfig {
     final ecsSubnetsJson = json['ecs_subnets'] as List<dynamic>? ?? const [];
     return CdnConfig(
       revision: (json['revision'] as num?)?.toInt() ?? 0,
-      enabled: json['enabled'] as bool? ?? false,
-      maxNodes: (json['max_nodes'] as num?)?.toInt() ?? 0,
       resolvers: resolversJson
           .map((e) => CdnResolverEntry.fromJson(e as Map<String, dynamic>))
           .toList(),
