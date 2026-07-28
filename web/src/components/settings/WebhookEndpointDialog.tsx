@@ -303,7 +303,7 @@ export function WebhookEndpointDialog({
                       type="button"
                       onClick={() => setPresetId(p.id)}
                       className={cn(
-                        'flex w-[84px] flex-col items-center gap-1.5 rounded-lg border py-2 transition-colors',
+                        'flex w-[82px] flex-col items-center gap-1.5 rounded-lg border py-2 transition-colors',
                         p.id === presetId
                           ? 'border-accent bg-accent-weak text-text'
                           : 'border-line bg-surface2 text-text2 hover:bg-hover',
@@ -359,7 +359,7 @@ export function WebhookEndpointDialog({
                             setEvents((prev) => (on ? prev.filter((x) => x !== ev) : [...prev, ev]))
                           }
                           className={cn(
-                            'rounded-full border px-3 py-0.5 text-[11.5px] transition-colors',
+                            'rounded-full border px-[11px] py-1 text-[11.5px] transition-colors',
                             on
                               ? 'border-accent bg-accent text-white'
                               : 'border-line bg-surface2 text-text2 hover:bg-hover',
@@ -451,9 +451,12 @@ export function WebhookEndpointDialog({
                     <div>
                       <FieldLabel>{t('set.notify.template')}</FieldLabel>
                       <textarea
-                        className="text-input mt-1.5 w-full font-mono text-[11.5px]"
-                        rows={4}
+                        // `area` 把高度交还给 rows —— 不带它会吃到 `.text-input`
+                        // 的固定行高，四行模板挤成一行。
+                        className="text-input area mt-1.5 w-full font-mono text-[11.5px]"
+                        rows={3}
                         spellCheck={false}
+                        placeholder={t('set.notify.templatePlaceholder')}
                         value={template}
                         onChange={(e) => setTemplate(e.target.value)}
                       />
@@ -463,7 +466,7 @@ export function WebhookEndpointDialog({
                           <button
                             key={v}
                             type="button"
-                            className="rounded border border-line px-1.5 font-mono text-[10px] text-text3 hover:text-text"
+                            className="rounded-md border border-line px-1.5 py-px font-mono text-[10px] text-text3 hover:text-text"
                             onClick={() => setTemplate((prev) => prev + v)}
                           >
                             {v}
@@ -537,11 +540,11 @@ export function WebhookEndpointDialog({
               {test.status === 'err' ? <span className="text-[12px] text-danger">{test.detail}</span> : null}
               <span className="flex-1" />
               <Dialog.Close asChild>
-                <button type="button" className="btn ghost">
+                <button type="button" className="btn plain sm">
                   {t('common.cancel')}
                 </button>
               </Dialog.Close>
-              <button type="button" className="btn primary" disabled={!canSave} onClick={() => onSave(draft())}>
+              <button type="button" className="btn primary sm" disabled={!canSave} onClick={() => onSave(draft())}>
                 {t('set.notify.save')}
               </button>
             </footer>

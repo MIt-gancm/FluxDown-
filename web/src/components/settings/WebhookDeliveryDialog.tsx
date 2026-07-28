@@ -204,7 +204,7 @@ export function WebhookDeliveryDialog({
               )}
             </div>
             <footer className="dlg-foot" style={{ justifyContent: 'flex-start' }}>
-              <button type="button" className="btn ghost" onClick={() => void clear()}>
+              <button type="button" className="btn plain sm" onClick={() => void clear()}>
                 {t('set.notify.logClear')}
               </button>
               {/* 「模拟一次投递」光看按钮不知道会发生什么，旁边一句话说清楚。 */}
@@ -218,7 +218,7 @@ export function WebhookDeliveryDialog({
               </span>
               <button
                 type="button"
-                className="btn ghost"
+                className="btn ghost sm"
                 disabled={busy}
                 onClick={() => void simulate()}
               >

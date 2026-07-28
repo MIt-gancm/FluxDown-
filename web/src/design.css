@@ -21,9 +21,22 @@ body {
      仅输入框与内容展示区（.selectable）保留文本选择。 */
   user-select: none; -webkit-user-select: none;
 }
-button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
-input, textarea { font-family: inherit; user-select: text; -webkit-user-select: text; }
-svg { display: block; }
+/* 裸元素 reset 必须放进 `base` 层。
+ *
+ * 本文件是**无层**引入的（`@import './design.css'`），而无层 CSS 在层叠里
+ * 压过所有带层规则 —— Tailwind 的工具类全在 `utilities` 层。于是
+ * `button { background: none; color: inherit }` 会把按钮上的 `bg-accent` /
+ * `text-danger` 之类**全部吃掉**，写了也不生效（webhook 事件芯片的选中态
+ * 就是这么消失的）。
+ *
+ * 放进 `base` 后：工具类 > 本文件的组件类（`.btn` 等，仍无层）> 这里的
+ * reset，正是期望的次序。
+ */
+@layer base {
+  button { font-family: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+  input, textarea { font-family: inherit; user-select: text; -webkit-user-select: text; }
+  svg { display: block; }
+}
 .ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .flex1 { flex: 1; }
 

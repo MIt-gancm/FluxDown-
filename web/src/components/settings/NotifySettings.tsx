@@ -266,7 +266,9 @@ function EndpointRow({
         <button type="button" className="btn ghost sm" onClick={onEdit}>
           {t('set.notify.edit')}
         </button>
-        <button type="button" className="btn ghost sm text-danger" onClick={onDelete}>
+        {/* 与桌面端一致：四个行内操作都是中性色，删除的危险信号交给二次确认弹窗。
+            （`.btn.ghost` 自带 color，写 `text-danger` 也压不过它。） */}
+        <button type="button" className="btn ghost sm" onClick={onDelete}>
           {t('set.notify.delete')}
         </button>
       </div>

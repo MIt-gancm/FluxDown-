@@ -972,5 +972,6 @@
   "set.notify.logFilterAll": "全部目标",
   "set.notify.logFilterLabel": "推送目标",
   "set.notify.logPending": "投递中…",
-  "set.notify.simulateNoTarget": "没有目标订阅「完成」事件，这次没有发出任何请求。"
+  "set.notify.simulateNoTarget": "没有目标订阅「完成」事件，这次没有发出任何请求。",
+  "set.notify.templatePlaceholder": "{\"text\":\" {task.fileName} 下载完成，共 {task.totalBytesHuman}\"}"
 }

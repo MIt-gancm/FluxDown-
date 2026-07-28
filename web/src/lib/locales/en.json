@@ -972,5 +972,6 @@
   "set.notify.logFilterAll": "All endpoints",
   "set.notify.logFilterLabel": "Endpoint",
   "set.notify.logPending": "Delivering…",
-  "set.notify.simulateNoTarget": "No target subscribes to task.completed — nothing was sent."
+  "set.notify.simulateNoTarget": "No target subscribes to task.completed — nothing was sent.",
+  "set.notify.templatePlaceholder": "{\"text\":\" {task.fileName} finished · {task.totalBytesHuman}\"}"
 }
