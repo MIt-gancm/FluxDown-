@@ -213,6 +213,19 @@ pub enum EngineEvent {
         /// 无错误时为空。
         error: String,
     },
+
+    /// 投递日志新增记录——**推给宿主，让打开着的日志面板活着更新**。
+    ///
+    /// 拉快照（`Engine::webhook_deliveries`）只在打开面板那一刻发生；任务真
+    /// 完成时的投递、以及「模拟一次下载完成」按钮，都发生在那之后。没有这
+    /// 条推送，面板就只能停在打开时的样子（按钮看着像没反应）。
+    ///
+    /// 载荷是**最新一小段（≤100 条，新→旧）而不是整仓**：日志落盘后能攒到
+    /// `webhook::MAX_DELIVERY_LOG` 条，整仓一份实测 0.94MB，每 500ms 推一次
+    /// 撑不住。宿主按 `deliveryId` 合并进自己那份列表，完整历史走「打开面板
+    /// 时拉一次」。dispatcher 侧已按 500ms 节流 + 尾随补发。
+    /// hub → `WebhookDeliveriesDelta` 信号；server → WS `webhookDeliveriesChanged`。
+    WebhookDeliveriesChanged(Vec<crate::webhook::WebhookDelivery>),
 }
 
 /// 引擎事件的接收端,由宿主实现并注入 [`crate::Engine`]。

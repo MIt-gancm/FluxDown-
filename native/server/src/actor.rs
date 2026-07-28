@@ -205,6 +205,25 @@ pub enum ActorCmd {
         proxy_url: String,
         ack: oneshot::Sender<Box<RssValidateOutcome>>,
     },
+    /// 投递日志快照（内存环形缓冲，只能问引擎要，DB 里没有）。
+    WebhookDeliveries {
+        ack: oneshot::Sender<Vec<fluxdown_engine::webhook::WebhookDelivery>>,
+    },
+    /// 清空投递日志。
+    WebhookClear {
+        ack: oneshot::Sender<()>,
+    },
+    /// 「模拟一次 task.completed」，按已保存端点的订阅规则投递。
+    /// 回执是投出去的端点数：0 = 没有端点订阅该事件，前端该直说。
+    WebhookSimulate {
+        ack: oneshot::Sender<usize>,
+    },
+    /// 草稿端点单次测试投递。与 [`ActorCmd::RssValidate`] 同款 off-actor
+    /// 范式：actor 只交出 dispatcher 句柄，10s 网络往返在 spawn 里等。
+    WebhookTest {
+        endpoint_json: String,
+        ack: oneshot::Sender<Box<fluxdown_engine::webhook::WebhookDelivery>>,
+    },
 }
 
 /// actor 主循环。持有 `Engine` 直至进程退出。
@@ -601,6 +620,25 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                 let _ = ack.send(Box::new(fut.await));
             });
         }
+        ActorCmd::WebhookDeliveries { ack } => {
+            let _ = ack.send(engine.webhook_deliveries());
+        }
+        ActorCmd::WebhookClear { ack } => {
+            engine.clear_webhook_deliveries().await;
+            let _ = ack.send(());
+        }
+        ActorCmd::WebhookSimulate { ack } => {
+            let _ = ack.send(engine.simulate_webhook_event());
+        }
+        ActorCmd::WebhookTest { endpoint_json, ack } => {
+            // 与 `RssValidate` 同款：10s 网络往返绝不在 actor 内 await。
+            let dispatcher = engine.manager.webhook();
+            tokio::spawn(async move {
+                let spec: fluxdown_engine::webhook::EndpointSpec =
+                    serde_json::from_str(&endpoint_json).unwrap_or_default();
+                let _ = ack.send(Box::new(dispatcher.test_endpoint(spec).await));
+            });
+        }
     }
 }
 
@@ -691,6 +729,11 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
             "use_server_time" => {
                 if let Some(v) = all.get(key) {
                     engine.manager.set_use_server_time(v == "true");
+                }
+            }
+            k if k == fluxdown_engine::webhook::CONFIG_KEY_ENDPOINTS => {
+                if let Some(v) = all.get(key) {
+                    engine.manager.set_webhook_endpoints(v);
                 }
             }
             "domain_conn_caps" => {

@@ -27,23 +27,24 @@ use crate::rinf_selection::RinfHostSelection;
 use crate::rinf_sink::RinfEventSink;
 use crate::signals::{
     BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
-    ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask, CreateQueue, CreateRssSource,
-    CreateTask, CreateTaskGroup, DeleteQueue, DeleteRssSource, DetectSystemProxy, DownloadUpdate,
-    Ed2kServerSubscriptionResult, ExternalDownloadRequest, FfmpegInstallProgress,
-    FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList, FileAssociationStatus,
-    GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin, InstallPlugin,
-    InstallUpdate, InstallYtdlp, MoveTaskToQueue, OpenFile, ProbeTorrentMeta, ProxyTestResult,
-    RefreshRssSource, RenameGroup, ReorderQueueTasks, RequestAllGroups, RequestAllQueues,
-    RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
+    ClearWebhookDeliveries, ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask,
+    CreateQueue, CreateRssSource, CreateTask, CreateTaskGroup, DeleteQueue, DeleteRssSource,
+    DetectSystemProxy, DownloadUpdate, Ed2kServerSubscriptionResult, ExternalDownloadRequest,
+    FfmpegInstallProgress, FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList,
+    FileAssociationStatus, GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin,
+    InstallPlugin, InstallUpdate, InstallYtdlp, MoveTaskToQueue, OpenFile, ProbeTorrentMeta,
+    ProxyTestResult, RefreshRssSource, RenameGroup, ReorderQueueTasks, RequestAllGroups,
+    RequestAllQueues, RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
     RequestFfmpegVersions, RequestMarketIndex, RequestPlugins, RequestRssItems,
-    RequestUpdateFailureMarker, RequestYtdlpStatus, RequestYtdlpVersions, RescanFiles,
-    ResolvePreviewRequest, RevealFile, SaveConfig, SavePluginSettings, SelectBtFiles,
+    RequestUpdateFailureMarker, RequestWebhookDeliveries, RequestYtdlpStatus, RequestYtdlpVersions,
+    RescanFiles, ResolvePreviewRequest, RevealFile, SaveConfig, SavePluginSettings, SelectBtFiles,
     SelectHlsQuality, SelectResolveVariant, SetFileAssociation, SetPluginEnabled, SetPriorityTask,
-    SetQueueSchedule, SetRssItemAction, SetUrlProtocol, StartQueue, StopQueue, SystemProxyInfo,
-    TaskSegmentsUpdated, TestProxyConnection, TrackerSubscriptionResult, UninstallFfmpeg,
-    UninstallPlugin, UninstallYtdlp, UpdateCheckResult, UpdateEd2kServerSubscription,
-    UpdateFailureMarker, UpdateQueue, UpdateRssSource, UpdateTaskSegments,
-    UpdateTrackerSubscription, UrlProtocolStatus, ValidateRssFeed, YtdlpInstallProgress,
+    SetQueueSchedule, SetRssItemAction, SetUrlProtocol, SimulateWebhookEvent, StartQueue,
+    StopQueue, SystemProxyInfo, TaskSegmentsUpdated, TestProxyConnection, TestWebhookEndpoint,
+    TrackerSubscriptionResult, UninstallFfmpeg, UninstallPlugin, UninstallYtdlp, UpdateCheckResult,
+    UpdateEd2kServerSubscription, UpdateFailureMarker, UpdateQueue, UpdateRssSource,
+    UpdateTaskSegments, UpdateTrackerSubscription, UrlProtocolStatus, ValidateRssFeed,
+    WebhookDeliveries, WebhookPresets, WebhookSimulateAck, WebhookTestResult, YtdlpInstallProgress,
     YtdlpInstallResult, YtdlpStatusReport, YtdlpVersionList,
 };
 // 插件「分支体专用」信号（仅在 hub_plugins 分支体内构造）：mobile 不引入。
@@ -860,9 +861,16 @@ pub async fn run(db_dir: PathBuf) {
         /// off-actor 抓取/验证回流。
         Engine(Box<fluxdown_engine::rss::RssEvent>),
     }
+    enum WebhookSignal {
+        RequestDeliveries(RequestWebhookDeliveries),
+        ClearDeliveries(ClearWebhookDeliveries),
+        Simulate(SimulateWebhookEvent),
+        Test(TestWebhookEndpoint),
+    }
     enum AuxSignal {
         Group(GroupSignal),
         Rss(RssSignal),
+        Webhook(WebhookSignal),
     }
     let (aux_tx, mut aux_rx) = mpsc::unbounded_channel::<AuxSignal>();
     let group_tx = aux_tx.clone();
@@ -891,6 +899,28 @@ pub async fn run(db_dir: PathBuf) {
                         if group_tx.send(AuxSignal::Group(GroupSignal::RequestAll(signal.message))).is_err() { break; }
                     }
                     else => break,
+                }
+            }
+        });
+    }
+
+    let webhook_tx = aux_tx.clone();
+    {
+        let request_deliveries_recv = RequestWebhookDeliveries::get_dart_signal_receiver();
+        let clear_deliveries_recv = ClearWebhookDeliveries::get_dart_signal_receiver();
+        let simulate_recv = SimulateWebhookEvent::get_dart_signal_receiver();
+        let test_endpoint_recv = TestWebhookEndpoint::get_dart_signal_receiver();
+        tokio::spawn(async move {
+            loop {
+                let sent = tokio::select! {
+                    Some(s) = request_deliveries_recv.recv() => webhook_tx.send(AuxSignal::Webhook(WebhookSignal::RequestDeliveries(s.message))),
+                    Some(s) = clear_deliveries_recv.recv() => webhook_tx.send(AuxSignal::Webhook(WebhookSignal::ClearDeliveries(s.message))),
+                    Some(s) = simulate_recv.recv() => webhook_tx.send(AuxSignal::Webhook(WebhookSignal::Simulate(s.message))),
+                    Some(s) = test_endpoint_recv.recv() => webhook_tx.send(AuxSignal::Webhook(WebhookSignal::Test(s.message))),
+                    else => break,
+                };
+                if sent.is_err() {
+                    break; // actor 已退出
                 }
             }
         });
@@ -1227,6 +1257,57 @@ pub async fn run(db_dir: PathBuf) {
                         2 => engine.manager.rss.mark_all_read(&msg.source_id).await,
                         _ => {}
                     },
+                },
+                AuxSignal::Webhook(webhook_signal) => match webhook_signal {
+                    WebhookSignal::RequestDeliveries(_) => {
+                        send_webhook_snapshot(&engine);
+                    }
+                    WebhookSignal::ClearDeliveries(_) => {
+                        engine.clear_webhook_deliveries().await;
+                        send_webhook_snapshot(&engine);
+                    }
+                    WebhookSignal::Simulate(_) => {
+                        // 回执带上投出去的端点数：UI 据此收掉转圈，0 就直说
+                        // 「没有目标订阅这个事件」。
+                        WebhookSimulateAck {
+                            dispatched: engine.simulate_webhook_event() as i32,
+                        }
+                        .send_signal_to_dart();
+                    }
+                    WebhookSignal::Test(msg) => {
+                        // 网络往返最长 10s——绝不在 actor 上 await，否则整个
+                        // 下载循环停摆。派生任务里跑，结果自己发回 Dart。
+                        let dispatcher = engine.manager.webhook();
+                        tokio::spawn(async move {
+                            let request_id = msg.request_id;
+                            let spec: fluxdown_engine::webhook::EndpointSpec =
+                                match serde_json::from_str(&msg.endpoint_json) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        WebhookTestResult {
+                                            request_id,
+                                            success: false,
+                                            status_code: 0,
+                                            latency_ms: 0,
+                                            error_message: e.to_string(),
+                                        }
+                                        .send_signal_to_dart();
+                                        return;
+                                    }
+                                };
+                            let record = dispatcher.test_endpoint(spec).await;
+                            WebhookTestResult {
+                                request_id,
+                                success: record.success,
+                                status_code: record.status_code,
+                                latency_ms: record.latency_ms,
+                                error_message: record.error.clone(),
+                            }
+                            .send_signal_to_dart();
+                            // 日志刷新不用管：`test_endpoint` 的记录进环形缓冲时，
+                            // dispatcher 自己会把快照推给 sink。
+                        });
+                    }
                 },
                 }
             }
@@ -2578,6 +2659,32 @@ async fn handle_api_command(
     }
 }
 
+/// 下发投递日志 + 预设目录（打开通知设置页 / 清空日志后）。
+///
+/// 预设目录与投递日志成对下发：UI 的「实时载荷预览」要拿引擎的默认模板才能
+/// 算出真实载荷，客户端不复制模板内容（避免预览与实际投递不一致）。
+fn send_webhook_snapshot(engine: &Engine) {
+    WebhookDeliveries {
+        entries: engine
+            .webhook_deliveries()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+    }
+    .send_signal_to_dart();
+    WebhookPresets {
+        presets: fluxdown_engine::webhook::preset_catalog()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        variables: fluxdown_engine::webhook::TEMPLATE_VARIABLES
+            .iter()
+            .map(|v| (*v).to_string())
+            .collect(),
+    }
+    .send_signal_to_dart();
+}
+
 /// 把单个已持久化的配置键 live-apply 到运行中的引擎。是 Dart `SaveConfig`
 /// 信号分支与管理 API `ApiCommand::ApplyConfig` 命令分支共用的核心逻辑
 /// （单键粒度，行为与原内联 match 完全一致）；`local_server_*` 键触发本机
@@ -2669,6 +2776,10 @@ async fn apply_config_key(
             if let Err(e) = engine.manager.set_user_agent(value.to_string()) {
                 log_info!("[actor] failed to apply user_agent: {}", e);
             }
+        }
+        // Webhook 端点表：内存镜像热重载，改完立刻生效（设置页即改即存）。
+        fluxdown_engine::webhook::CONFIG_KEY_ENDPOINTS => {
+            engine.manager.set_webhook_endpoints(value);
         }
         "default_segments" => {
             if let Ok(v) = value.parse::<i32>() {

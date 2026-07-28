@@ -1793,3 +1793,105 @@ pub struct RssValidateResult {
     /// 无错误时为空。
     pub error: String,
 }
+
+// ========== Webhook 通知信号 ==========
+
+/// 单条投递记录（[`WebhookDeliveries`] 的元素）。
+#[derive(Serialize, Deserialize, SignalPiece)]
+pub struct WebhookDeliveryEntry {
+    pub delivery_id: String,
+    /// Unix 毫秒。
+    pub timestamp_ms: i64,
+    /// 事件 wire 名（`task.completed` 等）。
+    pub event: String,
+    pub endpoint_id: String,
+    pub endpoint_name: String,
+    pub url: String,
+    /// 请求头摘录，每行 `K: V`；鉴权类值已掩码。
+    pub request_headers: String,
+    pub request_body: String,
+    /// HTTP 状态码；0 = 未拿到响应。
+    pub status_code: i32,
+    pub response_body: String,
+    pub latency_ms: i64,
+    pub attempts: i32,
+    pub success: bool,
+    pub error: String,
+}
+
+/// 服务预设元数据（[`WebhookPresets`] 的元素）——UI 预设网格与实时载荷
+/// 预览的单一事实源，客户端只做占位符替换，不复制模板内容。
+#[derive(Serialize, Deserialize, SignalPiece)]
+pub struct WebhookPresetEntry {
+    pub id: String,
+    pub label: String,
+    pub url_placeholder: String,
+    pub default_template: String,
+    pub content_type: String,
+}
+
+/// 请求投递日志 + 预设目录（Dart → Rust，打开通知设置页时发送）。
+#[derive(Deserialize, DartSignal)]
+pub struct RequestWebhookDeliveries {}
+
+/// 清空投递日志（Dart → Rust）。
+#[derive(Deserialize, DartSignal)]
+pub struct ClearWebhookDeliveries {}
+
+/// 「模拟一次 task.completed」（Dart → Rust）——按已保存端点的订阅规则
+/// 走完整投递路径，配完端点无需真实下载即可端到端验证。
+#[derive(Deserialize, DartSignal)]
+pub struct SimulateWebhookEvent {}
+
+/// 对草稿端点发一次测试投递（Dart → Rust）。端点无需先保存。
+#[derive(Deserialize, DartSignal)]
+pub struct TestWebhookEndpoint {
+    /// 由 Dart 生成，用于把 [`WebhookTestResult`] 配回发起的对话框。
+    pub request_id: String,
+    /// 端点 JSON（与 `webhook.endpoints` 数组元素同 schema）。
+    pub endpoint_json: String,
+}
+
+/// 投递日志快照（Rust → Dart），新的在前。
+#[derive(Serialize, RustSignal)]
+pub struct WebhookDeliveries {
+    pub entries: Vec<WebhookDeliveryEntry>,
+}
+
+/// 投递日志**增量**（Rust → Dart），新的在前，最多 100 条。
+///
+/// 与 [`WebhookDeliveries`] 的区别是语义：那个是整仓快照，客户端整表替换；
+/// 这个是「又多了几条」，客户端按 `deliveryId` 合并。日志落盘后能攒到上千
+/// 条，每次变化都推整仓撑不住。
+#[derive(Serialize, RustSignal)]
+pub struct WebhookDeliveriesDelta {
+    pub entries: Vec<WebhookDeliveryEntry>,
+}
+
+/// 「模拟一次下载完成」的受理回执（Rust → Rust→Dart）。
+///
+/// UI 靠它给按钮的转圈一个确定的收尾：`dispatched == 0` 说明没有端点订阅
+/// `task.completed`，该立刻告诉用户，而不是干等一条永远不会到的投递记录。
+#[derive(Serialize, RustSignal)]
+pub struct WebhookSimulateAck {
+    /// 投出去的端点数。
+    pub dispatched: i32,
+}
+
+/// 服务预设目录（Rust → Dart），随投递日志一并下发。
+#[derive(Serialize, RustSignal)]
+pub struct WebhookPresets {
+    pub presets: Vec<WebhookPresetEntry>,
+    /// 可用占位符清单（`{task.fileName}` 等），供「点击插入变量」。
+    pub variables: Vec<String>,
+}
+
+/// 测试投递结果（Rust → Dart）。
+#[derive(Serialize, RustSignal)]
+pub struct WebhookTestResult {
+    pub request_id: String,
+    pub success: bool,
+    pub status_code: i32,
+    pub latency_ms: i64,
+    pub error_message: String,
+}

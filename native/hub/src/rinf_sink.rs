@@ -358,6 +358,13 @@ impl EventSink for RinfEventSink {
                 }
                 .send_signal_to_dart();
             }
+            EngineEvent::WebhookDeliveriesChanged(entries) => {
+                // 增量，不是整仓：Dart 侧按 deliveryId 合并。
+                signals::WebhookDeliveriesDelta {
+                    entries: entries.into_iter().map(Into::into).collect(),
+                }
+                .send_signal_to_dart();
+            }
             // `#[non_exhaustive]`：未来新增变体默认丢弃并记录日志，而非编译失败。
             _ => {
                 crate::logger::log_info!(

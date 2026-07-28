@@ -1,7 +1,7 @@
 // #screen-settings —— 左侧分类导航 + 右侧设置正文。
 import { useNavigate } from '@tanstack/react-router'
 import type { LucideIcon } from 'lucide-react'
-import { ArrowLeft, Cloud, Download, Globe, Info, Lock, Monitor, Palette, Puzzle, Shield } from 'lucide-react'
+import { ArrowLeft, BellRing, Cloud, Download, Globe, Info, Lock, Monitor, Palette, Puzzle, Shield } from 'lucide-react'
 import { useState } from 'react'
 import { cn } from '../lib/cn'
 import { useI18n } from '../lib/i18n'
@@ -14,11 +14,12 @@ import { CloudAccountSettings } from '../components/settings/CloudAccountSetting
 import { DownloadSettings } from '../components/settings/DownloadSettings'
 import { ExtensionsSettings } from '../components/settings/ExtensionsSettings'
 import { GeneralSettings } from '../components/settings/GeneralSettings'
+import { NotifySettings } from '../components/settings/NotifySettings'
 import { ProxySettings } from '../components/settings/ProxySettings'
 import { SecuritySettings } from '../components/settings/SecuritySettings'
 import { useConfigMutation, useConfigQuery } from '../lib/config'
 
-type Category = 'general' | 'account' | 'appearance' | 'download' | 'bt' | 'proxy' | 'security' | 'extensions' | 'about'
+type Category = 'general' | 'account' | 'appearance' | 'download' | 'bt' | 'proxy' | 'security' | 'notify' | 'extensions' | 'about'
 
 const NAV: { key: Category; labelKey: I18nKey; icon: LucideIcon }[] = [
   { key: 'general', labelKey: 'set.general', icon: Monitor },
@@ -28,6 +29,7 @@ const NAV: { key: Category; labelKey: I18nKey; icon: LucideIcon }[] = [
   { key: 'bt', labelKey: 'set.bt', icon: Globe },
   { key: 'proxy', labelKey: 'set.proxy', icon: Shield },
   { key: 'security', labelKey: 'set.security', icon: Lock },
+  { key: 'notify', labelKey: 'set.notify', icon: BellRing },
   { key: 'extensions', labelKey: 'set.extensions', icon: Puzzle },
   { key: 'about', labelKey: 'set.about', icon: Info },
 ]
@@ -77,6 +79,8 @@ export function SettingsScreen() {
         return <ProxySettings config={config} mutate={mutate} />
       case 'security':
         return <SecuritySettings config={config} mutate={mutate} />
+      case 'notify':
+        return <NotifySettings config={config} mutate={mutate} />
       default:
         return null
     }

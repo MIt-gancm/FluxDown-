@@ -380,6 +380,12 @@ impl EventSink for EngineEventSink {
                 items: items.into_iter().map(Into::into).collect(),
                 error,
             },
+            // 投递日志变化 → 前端 invalidate 日志查询（面板开着就活着更新）。
+            EngineEvent::WebhookDeliveriesChanged(entries) => {
+                WsServerMsg::WebhookDeliveriesChanged {
+                    deliveries: entries.into_iter().map(Into::into).collect(),
+                }
+            }
             // `#[non_exhaustive]`：未来新增变体默认丢弃并记录日志。
             other => {
                 log_info!("[ws-hub] unhandled engine event: {:?}", other);

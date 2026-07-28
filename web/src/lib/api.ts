@@ -39,6 +39,10 @@ import type {
   TaskDto,
   TokenResponse,
   TrackerSubRefreshResponse,
+  WebhookDeliveriesResponse,
+  WebhookEndpoint,
+  WebhookSimulateResponse,
+  WebhookTestResponse,
 } from './types'
 
 export class ApiError extends Error {
@@ -198,6 +202,19 @@ export const api = {
     apiFetch<TokenResponse>('/api/v1/token/regenerate', { method: 'POST' }),
   stats: () => apiFetch<StatsResponse>('/api/v1/stats'),
   logs: () => apiFetch<LogsResponse>('/api/v1/logs'),
+
+  // Webhook 任务事件推送（端点表本身是 config 键 `webhook.endpoints`，
+  // 这里只有引擎内存里查不到的东西：投递日志 / 预设目录 / 测试投递）。
+  webhookDeliveries: () => apiFetch<WebhookDeliveriesResponse>('/api/v1/webhooks/deliveries'),
+  clearWebhookDeliveries: () =>
+    apiFetch<unknown>('/api/v1/webhooks/deliveries', { method: 'DELETE' }),
+  simulateWebhook: () =>
+    apiFetch<WebhookSimulateResponse>('/api/v1/webhooks/simulate', { method: 'POST' }),
+  testWebhook: (endpoint: WebhookEndpoint) =>
+    apiFetch<WebhookTestResponse>('/api/v1/webhooks/test', {
+      method: 'POST',
+      body: JSON.stringify(endpoint),
+    }),
 
   listPlugins: () => apiFetch<PluginDto[]>('/api/v1/plugins'),
   installPlugin: (zip: File | Blob | ArrayBuffer) =>

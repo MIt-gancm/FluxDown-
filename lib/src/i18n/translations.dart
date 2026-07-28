@@ -1828,4 +1828,102 @@ class S {
   String rssAutoDownloadedToast(int n) =>
       _r('rssAutoDownloadedToast', {'n': n});
   String get rssSourceLabel => _r('rssSourceLabel');
+
+  // ─────────────────────────────────────────────
+  // 通知 / Webhook（免费自托管推送）
+  // ─────────────────────────────────────────────
+  String get settingsCatNotify => _r('settingsCatNotify');
+  String get settingsCatNotifyDesc => _r('settingsCatNotifyDesc');
+  String get notifyGroupSystem => _r('notifyGroupSystem');
+  String get notifyGroupWebhook => _r('notifyGroupWebhook');
+  String get webhookAddEndpoint => _r('webhookAddEndpoint');
+  String get webhookDeliveryLog => _r('webhookDeliveryLog');
+  String get webhookEmptyTitle => _r('webhookEmptyTitle');
+  String get webhookEmptyDesc => _r('webhookEmptyDesc');
+  String get webhookSemantics => _r('webhookSemantics');
+  String get webhookRowTest => _r('webhookRowTest');
+  String get webhookRowLogs => _r('webhookRowLogs');
+  String get webhookRowEdit => _r('webhookRowEdit');
+  String get webhookRowDelete => _r('webhookRowDelete');
+  String get webhookRowDeleteConfirm => _r('webhookRowDeleteConfirm');
+  String get webhookHealthDisabled => _r('webhookHealthDisabled');
+  String get webhookHealthNone => _r('webhookHealthNone');
+  String webhookHealthOk(String time) => _r('webhookHealthOk', {'time': time});
+  String webhookHealthFail(String detail) =>
+      _r('webhookHealthFail', {'detail': detail});
+  String webhookAttempts(int n) => _r('webhookAttempts', {'n': n});
+  String get webhookDialogAddTitle => _r('webhookDialogAddTitle');
+  String get webhookDialogEditTitle => _r('webhookDialogEditTitle');
+  String get webhookDialogDesc => _r('webhookDialogDesc');
+  String get webhookFieldPreset => _r('webhookFieldPreset');
+  String get webhookFieldName => _r('webhookFieldName');
+  String get webhookFieldUrl => _r('webhookFieldUrl');
+  String get webhookUrlHint => _r('webhookUrlHint');
+  String get webhookUrlHintNtfy => _r('webhookUrlHintNtfy');
+  String get webhookUrlWarnHttp => _r('webhookUrlWarnHttp');
+  String get webhookUrlInvalid => _r('webhookUrlInvalid');
+  String get webhookFieldEvents => _r('webhookFieldEvents');
+  String get webhookEventsHint => _r('webhookEventsHint');
+  String get webhookEventsEmpty => _r('webhookEventsEmpty');
+  String get webhookFieldQueue => _r('webhookFieldQueue');
+  String get webhookQueueAll => _r('webhookQueueAll');
+  String get webhookAdvanced => _r('webhookAdvanced');
+  String get webhookFieldHeaders => _r('webhookFieldHeaders');
+  String get webhookAddHeader => _r('webhookAddHeader');
+  String get webhookHeaderName => _r('webhookHeaderName');
+  String get webhookHeaderValue => _r('webhookHeaderValue');
+  String get webhookFieldTemplate => _r('webhookFieldTemplate');
+  String get webhookTemplateHint => _r('webhookTemplateHint');
+  String get webhookTemplatePlaceholder => _r('webhookTemplatePlaceholder');
+  String get webhookFieldSign => _r('webhookFieldSign');
+  String get webhookSignDesc => _r('webhookSignDesc');
+  String get webhookRegenerate => _r('webhookRegenerate');
+  String get webhookCopy => _r('webhookCopy');
+  String get webhookCopied => _r('webhookCopied');
+  String get webhookFieldAllowHttp => _r('webhookFieldAllowHttp');
+  String get webhookAllowHttpDesc => _r('webhookAllowHttpDesc');
+  String get webhookFieldUseProxy => _r('webhookFieldUseProxy');
+  String get webhookUseProxyDesc => _r('webhookUseProxyDesc');
+  String get webhookPreviewTitle => _r('webhookPreviewTitle');
+  String get webhookPreviewMeta => _r('webhookPreviewMeta');
+  String get webhookSendTest => _r('webhookSendTest');
+  String get webhookTesting => _r('webhookTesting');
+  String webhookTestOk(String status, int ms) =>
+      _r('webhookTestOk', {'status': status, 'ms': ms});
+  String webhookTestFail(String error) =>
+      _r('webhookTestFail', {'error': error});
+  String get webhookSaveEndpoint => _r('webhookSaveEndpoint');
+  String get webhookNameRequired => _r('webhookNameRequired');
+  String get webhookEventCreated => _r('webhookEventCreated');
+  String get webhookEventStarted => _r('webhookEventStarted');
+  String get webhookEventCompleted => _r('webhookEventCompleted');
+  String get webhookEventFailed => _r('webhookEventFailed');
+  String get webhookEventPaused => _r('webhookEventPaused');
+  String get webhookEventQueueDrained => _r('webhookEventQueueDrained');
+  String get webhookLogSubtitle => _r('webhookLogSubtitle');
+  String get webhookLogEmpty => _r('webhookLogEmpty');
+  String get webhookLogSimulate => _r('webhookLogSimulate');
+  String get webhookLogSimulateHint => _r('webhookLogSimulateHint');
+  String get webhookLogPending => _r('webhookLogPending');
+  String get webhookSimulateNoTarget => _r('webhookSimulateNoTarget');
+  String get webhookLogClear => _r('webhookLogClear');
+  String get webhookLogResponse => _r('webhookLogResponse');
+  String get webhookLogHint4xx => _r('webhookLogHint4xx');
+  String get webhookLogFilterAll => _r('webhookLogFilterAll');
+  String get webhookLogFilterLabel => _r('webhookLogFilterLabel');
+  List<String> get searchKeywordsWebhook =>
+      _r('searchKeywordsWebhook').split(',');
+  List<String> get searchKeywordsWebhookLog =>
+      _r('searchKeywordsWebhookLog').split(',');
+
+  /// 事件 wire 名 → 本地化短标签（芯片 / 日志 badge 共用）。
+  String webhookEventLabel(String wire) => switch (wire) {
+    'task.created' => webhookEventCreated,
+    'task.started' => webhookEventStarted,
+    'task.completed' => webhookEventCompleted,
+    'task.failed' => webhookEventFailed,
+    'task.paused' => webhookEventPaused,
+    'queue.drained' => webhookEventQueueDrained,
+    _ => wire,
+  };
 }

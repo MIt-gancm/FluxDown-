@@ -9,6 +9,7 @@ import 'package:rinf/rinf.dart';
 import '../bindings/bindings.dart';
 import '../services/log_service.dart';
 import 'custom_category.dart';
+import 'webhook_endpoint.dart';
 
 /// 下载引擎相关配置（持久化在 Rust SQLite 中）
 class SettingsProvider extends ChangeNotifier {
@@ -40,6 +41,9 @@ class SettingsProvider extends ChangeNotifier {
   bool _keepAwakeWhileDownloading = false; // 默认不阻止睡眠/息屏
   bool _analyticsEnabled = true; // 匿名使用统计（每日活跃）；首装事件不受此开关控制
   int _logMaxSizeMb = 10; // 日志总大小上限（MB），超出自动清理
+
+  /// Webhook 端点表（config 键 `webhook.endpoints`，JSON 数组）。
+  List<WebhookEndpoint> _webhookEndpoints = const [];
 
   // 悬浮球设置
   bool _floatingBallEnabled = false; // 默认关闭（与 closeToTray 保守默认一致）
@@ -229,6 +233,9 @@ class SettingsProvider extends ChangeNotifier {
   bool get keepAwakeWhileDownloading => _keepAwakeWhileDownloading;
   bool get analyticsEnabled => _analyticsEnabled;
   int get logMaxSizeMb => _logMaxSizeMb;
+
+  /// Webhook 端点表（免费自托管推送）。
+  List<WebhookEndpoint> get webhookEndpoints => _webhookEndpoints;
 
   // 悬浮球 Getters
   bool get floatingBallEnabled => _floatingBallEnabled;
@@ -602,6 +609,32 @@ class SettingsProvider extends ChangeNotifier {
     _notifyOnComplete = value;
     notifyListeners();
     _saveToRust('notify_on_complete', value.toString());
+  }
+
+  /// 覆盖整张端点表并落库。引擎侧 `apply_config_key` 命中
+  /// `webhook.endpoints` 后热重载内存镜像，无需重启。
+  void setWebhookEndpoints(List<WebhookEndpoint> endpoints) {
+    _webhookEndpoints = List.unmodifiable(endpoints);
+    notifyListeners();
+    _saveToRust('webhook.endpoints', WebhookEndpoint.encodeList(endpoints));
+  }
+
+  /// 新增或按 id 覆盖一个端点。
+  void upsertWebhookEndpoint(WebhookEndpoint endpoint) {
+    final next = List<WebhookEndpoint>.from(_webhookEndpoints);
+    final index = next.indexWhere((e) => e.id == endpoint.id);
+    if (index >= 0) {
+      next[index] = endpoint;
+    } else {
+      next.add(endpoint);
+    }
+    setWebhookEndpoints(next);
+  }
+
+  void removeWebhookEndpoint(String id) {
+    setWebhookEndpoints(
+      _webhookEndpoints.where((e) => e.id != id).toList(growable: false),
+    );
   }
 
   void setSilentDownloadEnabled(bool value) {
@@ -1408,6 +1441,8 @@ class SettingsProvider extends ChangeNotifier {
           _ed2kAssocUserDisabled = entry.value == 'true';
         case 'notify_on_complete':
           _notifyOnComplete = entry.value != 'false'; // 默认 true
+        case 'webhook.endpoints':
+          _webhookEndpoints = WebhookEndpoint.decodeList(entry.value);
         case 'silent_download_enabled':
           _silentDownloadEnabled = entry.value == 'true'; // 默认 false
         case 'use_server_time':

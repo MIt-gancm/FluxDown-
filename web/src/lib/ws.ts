@@ -21,6 +21,7 @@ import type {
   TaskCdnEventMsg,
   TaskDto,
   TaskProgressMsg,
+  WebhookDeliveriesResponse,
   WsClientMsg,
   WsServerMsg,
 } from './types'
@@ -334,6 +335,20 @@ function dispatch(msg: WsServerMsg) {
       void import('../hooks/useRss').then(({ settleRssFetchOne }) => settleRssFetchOne(sourceId))
       break
     }
+    case 'webhookDeliveriesChanged':
+      // 增量（最新 ≤100 条，新→旧），不是整仓 —— 落盘后本地可能已经攒了
+      // 上千条，整表替换会把用户正在翻的旧记录抹掉。按 deliveryId 合并。
+      // 就地改而不 invalidate：预设目录与占位符清单在同一份响应里，重拉一
+      // 遍纯属浪费。没有缓存时不管，面板打开时自会拉。
+      queryClientRef?.setQueryData<WebhookDeliveriesResponse>(['webhookDeliveries'], (old) => {
+        if (!old) return old
+        const fresh = new Set(msg.deliveries.map((d) => d.deliveryId))
+        return {
+          ...old,
+          deliveries: [...msg.deliveries, ...old.deliveries.filter((d) => !fresh.has(d.deliveryId))],
+        }
+      })
+      break
     case 'pluginsChanged':
       void queryClientRef?.invalidateQueries({ queryKey: ['plugins'] })
       break

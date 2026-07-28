@@ -23,6 +23,8 @@ import '../models/components_provider.dart';
 import '../models/plugin_provider.dart';
 import '../models/settings_provider.dart';
 import '../models/ua_presets.dart';
+import '../models/webhook_endpoint.dart';
+import '../models/webhook_provider.dart';
 import '../services/app_icon_service.dart';
 import '../services/cloud/cloud_auth_service.dart';
 import '../services/cloud/cloud_client.dart';
@@ -43,6 +45,9 @@ import '../widgets/add_device_dialog.dart';
 import '../widgets/dir_picker_field.dart';
 import '../widgets/number_selector.dart';
 import '../widgets/plugin_list_view.dart';
+import '../widgets/webhook_delivery_panel.dart';
+import '../widgets/webhook_endpoint_dialog.dart';
+import '../widgets/webhook_endpoint_list.dart';
 import '../widgets/thread_selector.dart';
 import '../widgets/title_drag_area.dart';
 
@@ -59,6 +64,7 @@ enum SettingsCategory {
   ed2k(icon: LucideIcons.share2),
   proxy(icon: LucideIcons.globe),
   apiService(icon: LucideIcons.server),
+  notify(icon: LucideIcons.bellRing),
   extensions(icon: LucideIcons.puzzle),
   about(icon: LucideIcons.info);
 
@@ -79,6 +85,7 @@ extension SettingsCategoryI18n on SettingsCategory {
       SettingsCategory.ed2k => s.settingsCatEd2k,
       SettingsCategory.proxy => s.settingsCatProxy,
       SettingsCategory.apiService => s.settingsCatApiService,
+      SettingsCategory.notify => s.settingsCatNotify,
       SettingsCategory.extensions => s.settingsCatExtensions,
       SettingsCategory.about => s.settingsCatAbout,
     };
@@ -95,6 +102,7 @@ extension SettingsCategoryI18n on SettingsCategory {
       SettingsCategory.ed2k => s.settingsCatEd2kDesc,
       SettingsCategory.proxy => s.settingsCatProxyDesc,
       SettingsCategory.apiService => s.settingsCatApiServiceDesc,
+      SettingsCategory.notify => s.settingsCatNotifyDesc,
       SettingsCategory.extensions => s.settingsCatExtensionsDesc,
       SettingsCategory.about => s.settingsCatAboutDesc,
     };
@@ -225,11 +233,26 @@ List<SettingsSearchItem> get settingsSearchItems {
       icon: LucideIcons.link,
     ),
     SettingsSearchItem(
-      category: SettingsCategory.general,
+      // 「下载完成通知」随分类迁移到「通知」——搜索定位不断链。
+      category: SettingsCategory.notify,
       label: s.notifyOnComplete,
       description: s.notifyOnCompleteDesc,
       keywords: s.searchKeywordsNotifyOnComplete,
       icon: LucideIcons.bellRing,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.notify,
+      label: s.notifyGroupWebhook,
+      description: s.webhookEmptyDesc,
+      keywords: s.searchKeywordsWebhook,
+      icon: LucideIcons.webhook,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.notify,
+      label: s.webhookDeliveryLog,
+      description: s.webhookLogSubtitle,
+      keywords: s.searchKeywordsWebhookLog,
+      icon: LucideIcons.scrollText,
     ),
     SettingsSearchItem(
       category: SettingsCategory.general,
@@ -1282,6 +1305,10 @@ class _SettingsContentState extends State<_SettingsContent> {
       SettingsCategory.apiService => _ApiServiceContent(
         settingsProvider: settingsProvider,
       ),
+      SettingsCategory.notify => _NotifyContent(
+        settingsProvider: settingsProvider,
+        downloadController: widget.downloadController,
+      ),
       SettingsCategory.extensions => tabId == _kTabComponents
           ? Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1997,14 +2024,6 @@ class _GeneralContent extends StatelessWidget {
                     value: settingsProvider.ed2kProtocolAssociated,
                     onChanged: (v) =>
                         settingsProvider.setEd2kProtocolAssociation(v),
-                  ),
-                ),
-                _SettingRow(
-                  label: s.notifyOnComplete,
-                  description: s.notifyOnCompleteDesc,
-                  child: ShadSwitch(
-                    value: settingsProvider.notifyOnComplete,
-                    onChanged: (v) => settingsProvider.setNotifyOnComplete(v),
                   ),
                 ),
                 _SettingRow(
@@ -5077,6 +5096,224 @@ class _ApiServiceContentState extends State<_ApiServiceContent> {
           ],
         );
       },
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// 通知（系统通知 + Webhook 推送）
+// ─────────────────────────────────────────────
+
+class _NotifyContent extends StatefulWidget {
+  final SettingsProvider settingsProvider;
+  final DownloadController? downloadController;
+
+  const _NotifyContent({required this.settingsProvider, this.downloadController});
+
+  @override
+  State<_NotifyContent> createState() => _NotifyContentState();
+}
+
+class _NotifyContentState extends State<_NotifyContent> {
+  /// 页面局部 Provider：投递日志/预设目录只在这一页用得到，没必要挂到 App 根。
+  late final WebhookProvider _webhook = WebhookProvider();
+
+  /// 处于「再点一次就删」窗口的端点 id；[_confirmTimer] 到点自动还原。
+  String _pendingDeleteId = '';
+  Timer? _confirmTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _webhook.refresh();
+  }
+
+  @override
+  void dispose() {
+    _confirmTimer?.cancel();
+    _webhook.dispose();
+    super.dispose();
+  }
+
+  /// 打开推送记录抽屉；先拉一次最新快照（引擎内存态，UI 无法自己推断）。
+  /// 端点表一并传进去：记录里只有 ID，展示名和筛选下拉都要靠它。
+  void _openLog(String endpointId) {
+    _webhook.refresh();
+    showWebhookDeliveryPanel(
+      context: context,
+      webhook: _webhook,
+      endpoints: widget.settingsProvider.webhookEndpoints,
+      endpointId: endpointId,
+    );
+  }
+
+  Future<void> _openDialog({WebhookEndpoint? initial}) async {
+    final saved = await showWebhookEndpointDialog(
+      context: context,
+      webhook: _webhook,
+      queues: widget.downloadController?.queues ?? const [],
+      initial: initial,
+    );
+    if (saved == null || !mounted) return;
+    widget.settingsProvider.upsertWebhookEndpoint(saved);
+  }
+
+  /// 原地二次确认：首次点击进入 2s 确认窗口，超时自动还原——低成本防错，
+  /// 不弹对话框打断心流。
+  void _armOrDelete(WebhookEndpoint endpoint) {
+    if (_pendingDeleteId == endpoint.id) {
+      _confirmTimer?.cancel();
+      setState(() => _pendingDeleteId = '');
+      widget.settingsProvider.removeWebhookEndpoint(endpoint.id);
+      return;
+    }
+    _confirmTimer?.cancel();
+    setState(() => _pendingDeleteId = endpoint.id);
+    _confirmTimer = Timer(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _pendingDeleteId = '');
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return ListenableBuilder(
+      listenable: Listenable.merge([widget.settingsProvider, _webhook]),
+      builder: (context, _) {
+        final s = LocaleScope.of(context);
+        final c = AppColors.of(context);
+        final sp = widget.settingsProvider;
+        final endpoints = sp.webhookEndpoints;
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _SettingsGroup(
+              title: s.notifyGroupSystem,
+              children: [
+                _SettingRow(
+                  label: s.notifyOnComplete,
+                  description: s.notifyOnCompleteDesc,
+                  child: ShadSwitch(
+                    value: sp.notifyOnComplete,
+                    onChanged: (v) => sp.setNotifyOnComplete(v),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 20),
+            _buildWebhookHeader(s, c),
+            const SizedBox(height: 8),
+            if (endpoints.isEmpty)
+              _buildEmptyCard(s, c)
+            else
+              WebhookEndpointList(
+                endpoints: endpoints,
+                webhook: _webhook,
+                pendingDeleteId: _pendingDeleteId,
+                onToggle: (e, v) =>
+                    sp.upsertWebhookEndpoint(e.copyWith(enabled: v)),
+                onTest: (e) {
+                  // 行内「测试」直接打日志抽屉：结果一条条落在日志里，
+                  // 比一个转瞬即逝的 toast 有用得多。
+                  _webhook.testEndpoint(e);
+                  _openLog(e.id);
+                },
+                onLogs: (e) => _openLog(e.id),
+                onEdit: (e) => _openDialog(initial: e),
+                onDelete: _armOrDelete,
+              ),
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Text(
+                s.webhookSemantics,
+                style: TextStyle(fontSize: 10.5, height: 1.6, color: c.textMuted),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _buildWebhookHeader(S s, AppColors c) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: Row(
+        children: [
+          Expanded(
+            child: _HighlightRegion(
+              label: s.notifyGroupWebhook,
+              description: s.webhookEmptyDesc,
+              child: Text(
+                s.notifyGroupWebhook,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: FontWeight.w600,
+                  color: c.textSecondary,
+                ),
+              ),
+            ),
+          ),
+          ShadButton.ghost(
+            size: ShadButtonSize.sm,
+            onPressed: () => _openLog(''),
+            child: Text(s.webhookDeliveryLog),
+          ),
+          const SizedBox(width: 6),
+          ShadButton(
+            size: ShadButtonSize.sm,
+            onPressed: () => _openDialog(),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(LucideIcons.plus, size: 13),
+                const SizedBox(width: 4),
+                Text(s.webhookAddEndpoint),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 空态不是空白：说明 + 主按钮，identity 建立在第一次接触时。
+  Widget _buildEmptyCard(S s, AppColors c) {
+    final m = AppMetrics.of(context);
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 18),
+      decoration: BoxDecoration(
+        color: c.surface1,
+        borderRadius: m.brDialog,
+        border: Border.all(color: m.borderMedium(c.border), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            s.webhookEmptyTitle,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: FontWeight.w500,
+              color: c.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            s.webhookEmptyDesc,
+            style: TextStyle(fontSize: 11.5, height: 1.6, color: c.textMuted),
+          ),
+          const SizedBox(height: 14),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ShadButton(
+              size: ShadButtonSize.sm,
+              onPressed: () => _openDialog(),
+              child: Text(s.webhookAddEndpoint),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

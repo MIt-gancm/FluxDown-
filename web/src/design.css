@@ -236,6 +236,16 @@ svg { display: block; }
 .text-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
 .text-input.area { height: auto; padding: 9px 11px; resize: none; line-height: 1.5; font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
 
+/* 配置面（webhook 端点对话框 / 推送记录）的紧凑密度：一屏里挤着预设网格、
+   名称/URL、事件 chips、队列过滤、高级区，字段多而单个字段不重要，默认
+   32px 行高在这里显得笨重。只缩尺寸，不动配色。与桌面端
+   `lib/src/widgets/webhook_field_theme.dart` 同一档。 */
+.fields-compact .text-input,
+.fields-compact .select,
+.fields-compact select.select { height: 28px; padding: 0 10px; font-size: 12.5px; }
+.fields-compact .text-input.area { height: auto; padding: 7px 10px; }
+.fields-compact .field-label { margin: 10px 0 5px; font-size: 11.5px; }
+
 .select {
   display: flex; align-items: center; justify-content: space-between; gap: 6px;
   height: 32px; padding: 0 11px; border-radius: 6px;
@@ -1174,10 +1184,20 @@ svg { display: block; }
 .dlg-body::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; }
 .dlg-body .field-label:first-child { margin-top: 0; }
 .dlg-sub { font-size: 12px; color: var(--text3); margin-bottom: 12px; }
+/* 常规用法是把 .dlg-sub 放进 .dlg-body（自带 18px 内边距）。少数对话框的
+   body 要自己排版（双栏 / 自定义滚动），描述只能直接挂在 .dialog 下——
+   那样就没人给它内边距，文字会贴着卡片左边缘。这里补上。 */
+.dialog > .dlg-sub { padding: 0 18px; }
 .dlg-foot {
   display: flex; align-items: center; justify-content: flex-end; gap: 9px;
   padding: 12px 18px 16px; border-top: 1px solid var(--border);
 }
+
+/* 细滚动条：给内容区（代码预览 / 自定义滚动列）用，替掉系统那条又宽又丑的。 */
+.thin-scroll { scrollbar-width: thin; scrollbar-color: var(--track) transparent; }
+.thin-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
+.thin-scroll::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; }
+.thin-scroll::-webkit-scrollbar-track { background: transparent; }
 
 /* 确认 / 提示对话框（命令式，见 components/dialogs/confirm-dialog.tsx） */
 .confirm-dlg { width: 400px; }

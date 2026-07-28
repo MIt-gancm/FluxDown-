@@ -25,7 +25,7 @@ flate2 = "1"
 futures-util = "0.3"
 hex = "0.4"
 hkdf = { version = "0.12", optional = true }
-hmac = { version = "0.12", optional = true }
+hmac = "0.12"
 igd-next = { version = "0.17.1", features = ["aio_tokio"] }
 m3u8-rs = "6"
 md-5 = "0.10"
@@ -78,4 +78,4 @@ components = ["dep:zip"]
 # 本地设备互联（P2P 局域网配对 + mDNS 发现 + 直连传输）。desktop hub 与 headless
 # server 开启；mobile（Android/iOS）关闭——mDNS 在移动端需原生 NsdManager/Bonjour
 # 权限，且本地配对定位为桌面/NAS 场景。关闭时下载主链路零变化（link 模块整体 cfg 门控）。
-link = ["dep:mdns-sd", "dep:ed25519-dalek", "dep:x25519-dalek", "dep:hkdf", "dep:hmac", "dep:chacha20poly1305"]
+link = ["dep:mdns-sd", "dep:ed25519-dalek", "dep:x25519-dalek", "dep:hkdf", "dep:chacha20poly1305"]

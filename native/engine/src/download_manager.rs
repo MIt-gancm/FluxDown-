@@ -1143,6 +1143,14 @@ pub struct DownloadManager {
     /// RSS 订阅子系统（轮询调度 + 条目状态机）。任务创建仍收敛在
     /// [`DownloadManager::create_task`]，`RssManager` 只产出建任务指令。
     pub rss: crate::rss::RssManager,
+    /// 任务事件 Webhook 推送（免费自托管）。`emit` 同步返回、网络 IO 自 spawn，
+    /// 因此可以直接在生命周期点位上调用，不影响 actor。
+    webhook: Arc<crate::webhook::WebhookDispatcher>,
+    /// 上一次判定时仍有活跃/待启动任务的队列（`queue.drained` 边沿触发用）。
+    occupied_queues: HashSet<String>,
+    /// 已排程自动重试、尚未回流的任务 → 其队列 ID。判定队列是否清空时视为
+    /// 仍占用，否则重试间隙会误报一次 `queue.drained`。
+    retry_scheduled: HashMap<String, String>,
     /// 插件管理器（Arc 共享）。`None` 直到 `install_plugin_manager` 注入。
     /// 仅 `plugins` feature 下存在；feature 关时无此字段、下载主链路零变化。
     #[cfg(feature = "plugins")]
@@ -1208,6 +1216,10 @@ impl DownloadManager {
         // RSS 子系统与 manager 共享同一个 DB 池与事件出口（两者都只是句柄
         // 克隆，不额外开连接）。
         let (rss_db, rss_sink) = (db.clone(), sink.clone());
+        let webhook = Arc::new(crate::webhook::WebhookDispatcher::new(&proxy_config));
+        // 投递日志变化要能推给宿主，打开着的日志面板才会活着更新
+        // （「模拟一次下载完成」按钮全靠这条推送给出反馈）。
+        webhook.set_sink(sink.clone());
         Ok(Self {
             db,
             client,
@@ -1249,6 +1261,9 @@ impl DownloadManager {
             sink,
             selector,
             rss: crate::rss::RssManager::new(rss_db, rss_sink),
+            webhook,
+            occupied_queues: HashSet::new(),
+            retry_scheduled: HashMap::new(),
             #[cfg(feature = "plugins")]
             plugin_manager: None,
             #[cfg(feature = "plugins")]
@@ -2161,6 +2176,8 @@ impl DownloadManager {
         let new_client = downloader::build_client(&config, &self.global_user_agent)?;
         self.client = new_client;
         self.proxy_config = config;
+        // 仅 `useProxy` 端点用得上，但出口变了就得跟着重建。
+        self.webhook.set_proxy_config(&self.proxy_config);
         // 网络出口变化：域名连接上限是对【旧出口】的服务器策略观察，
         // 换代理后不再可信，清空重学（内存 + 持久化）。
         crate::segment_coordinator::clear_domain_conn_caps(&self.db);
@@ -2207,8 +2224,9 @@ impl DownloadManager {
 
         // 活跃任务：先暂停当前 spawn（取消 + 落 paused），改配置后再恢复，
         // 让新 worker_cap 立即生效。全程在 current_thread actor 内串行，无竞态。
+        // 静默暂停——这是实现细节，用户看到的是「改了线程数」，不是「暂停了」。
         if was_active {
-            self.pause_task(task_id).await;
+            self.pause_task_silent(task_id).await;
         }
         self.db.update_task_segments(task_id, seg).await?;
         log_info!(
@@ -2240,6 +2258,111 @@ impl DownloadManager {
         self.client = new_client;
         self.global_user_agent = ua;
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Webhook 任务事件推送（免费自托管）
+    // -----------------------------------------------------------------------
+
+    /// 共享的 webhook 分发器句柄（宿主经 [`crate::Engine`] 的门面方法读取
+    /// 投递日志 / 发测试）。
+    pub fn webhook(&self) -> Arc<crate::webhook::WebhookDispatcher> {
+        self.webhook.clone()
+    }
+
+    /// 从 config 表装载端点列表（`Engine::new` 调用一次）。
+    pub async fn load_webhook_endpoints(&self) {
+        let json = self
+            .db
+            .get_config(crate::webhook::CONFIG_KEY_ENDPOINTS)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.webhook.reload_endpoints(&json);
+    }
+
+    /// 端点表热重载（宿主 `SaveConfig`/`ApplyConfig` 命中
+    /// `webhook.endpoints` 时调用；解析失败保留旧表）。
+    pub fn set_webhook_endpoints(&self, json: &str) {
+        self.webhook.reload_endpoints(json);
+    }
+
+    /// 组装一条任务事件的 webhook 载荷。队列名取内存镜像，无需查库。
+    fn webhook_task_event(
+        &self,
+        kind: crate::webhook::WebhookEventKind,
+        task: crate::webhook::WebhookTask,
+        queue_id: &str,
+    ) -> crate::webhook::WebhookEvent {
+        crate::webhook::WebhookEvent::task(
+            kind,
+            task,
+            queue_id.to_string(),
+            self.queue_display_name(queue_id),
+        )
+    }
+
+    /// 由 [`TaskInfo`] 直接构造事件（终态/暂停点位上任务行已在手）。
+    /// `url` 取真实来源：`.torrent` 任务的 `url` 是 `torrent-file://local`
+    /// 哨兵，推给用户毫无意义。
+    fn webhook_event_from_task(
+        &self,
+        kind: crate::webhook::WebhookEventKind,
+        task: &TaskInfo,
+    ) -> crate::webhook::WebhookEvent {
+        self.webhook_task_event(
+            kind,
+            crate::webhook::WebhookTask {
+                id: task.task_id.clone(),
+                file_name: task.file_name.clone(),
+                url: if task.origin_url.is_empty() {
+                    task.url.clone()
+                } else {
+                    task.origin_url.clone()
+                },
+                save_dir: task.save_dir.clone(),
+                total_bytes: task.total_bytes,
+                status: task.status,
+                error_message: task.error_message.clone(),
+            },
+            &task.queue_id,
+        )
+    }
+
+    fn queue_display_name(&self, queue_id: &str) -> String {
+        self.queues
+            .get(queue_id)
+            .map(|q| q.name.clone())
+            .unwrap_or_else(|| queue_id.to_string())
+    }
+
+    /// 重算每个队列的占用情况，对**由占用转为空**的队列发一条 `queue.drained`。
+    ///
+    /// 必须在任务**进入**（`enqueue_persisted_task` / `resume_task_inner`）与
+    /// **离开**（`on_task_done` / `pause_task` / `delete_task`）活跃·待启动集合
+    /// 的每个汇合点调用：进入侧只登记占用（不触发），离开侧才可能触发——
+    /// 两侧配合构成边沿触发，同一次空闲不会重复通知。已排程自动重试的任务
+    /// 视为仍占用，否则退避间隙会误报一次清空。
+    fn sync_queue_occupancy(&mut self) {
+        let mut occupied: HashSet<String> = self
+            .active_tasks
+            .values()
+            .map(|e| e.queue_id.clone())
+            .collect();
+        occupied.extend(self.pending_queue.iter().map(|q| q.queue_id.clone()));
+        occupied.extend(self.retry_scheduled.values().cloned());
+        let drained: Vec<String> = self
+            .occupied_queues
+            .difference(&occupied)
+            .cloned()
+            .collect();
+        self.occupied_queues = occupied;
+        for queue_id in drained {
+            let name = self.queue_display_name(&queue_id);
+            self.webhook
+                .emit(crate::webhook::WebhookEvent::queue_drained(queue_id, name));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2571,6 +2694,8 @@ impl DownloadManager {
         // 仅在 generation 匹配（确实是这一轮 spawn 失败）时触发，防止 stale 信号误触发。
         let max_retries = self.max_auto_retries;
         if generation_matched && let Ok(Some(task)) = self.db.load_task_by_id(task_id).await {
+            // 本轮是否又排了一次自动重试——决定 `task.failed` 该不该发。
+            let mut retry_pending = false;
             // max == 0：用户关闭了自动重试，直接跳过（不分配计数）。
             if max_retries != 0 && task.status == 4 && is_retriable_error(&task.error_message) {
                 let count = self
@@ -2615,6 +2740,10 @@ impl DownloadManager {
                         tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
                         let _ = tx.send(tid).await;
                     });
+                    retry_pending = true;
+                    // 退避期间该任务仍算占用队列，防止误报 `queue.drained`。
+                    self.retry_scheduled
+                        .insert(task_id.to_string(), task.queue_id.clone());
                 } else {
                     log_info!(
                         "[manager] auto-retry exhausted for task {} ({} attempts), staying in error",
@@ -2669,7 +2798,24 @@ impl DownloadManager {
                     .await;
                 }
             }
+
+            // Webhook 语义生命周期事件——与插件通知平面同点位。`task.failed`
+            // 只在自动重试**彻底放弃**后发出（重试期间保持静默），否则一次
+            // 网络抖动会给用户连发四条失败通知。
+            let webhook_kind = if task.status == 3 {
+                Some(crate::webhook::WebhookEventKind::TaskCompleted)
+            } else if task.status == 4 && !retry_pending {
+                Some(crate::webhook::WebhookEventKind::TaskFailed)
+            } else {
+                None
+            };
+            if let Some(kind) = webhook_kind {
+                let event = self.webhook_event_from_task(kind, &task);
+                self.webhook.emit(event);
+            }
         }
+
+        self.sync_queue_occupancy();
 
         self.maybe_wal_checkpoint().await;
         self.maybe_release_bt_session().await;
@@ -3260,6 +3406,23 @@ impl DownloadManager {
             });
         }
 
+        // Webhook：task.created（落库成功后，早于任何早退分支；`url` 用真实
+        // 来源而非 torrent-file:// 哨兵）。
+        let created_event = self.webhook_task_event(
+            crate::webhook::WebhookEventKind::TaskCreated,
+            crate::webhook::WebhookTask {
+                id: task_id.clone(),
+                file_name: file_name.clone(),
+                url: url.clone(),
+                save_dir: save_dir.clone(),
+                total_bytes: hint_file_size,
+                status: initial_status,
+                error_message: String::new(),
+            },
+            &queue_id,
+        );
+        self.webhook.emit(created_event);
+
         // 插件惰性解析：命中 resolver 则打标（仅存 ID）；协议判定/probe 推迟到实际
         // 下载前的 off-actor resolve，此处不跑 JS。原始 url 参与匹配（非 db_url）。
         let resolver_plugin_id = self.plugin_match_resolver(&url).await;
@@ -3424,6 +3587,8 @@ impl DownloadManager {
                 );
             }
         }
+        // 队列重新有活儿了——登记占用，下次清空时才会触发 `queue.drained`。
+        self.sync_queue_occupancy();
     }
 
     /// 任务有效 UA 的解析优先级：任务 > 队列 > 全局。任务 client 与多 CDN
@@ -3631,6 +3796,24 @@ impl DownloadManager {
             })
             .await;
         }
+
+        // Webhook：task.started（与 onStart 同点位，`do_start_task` 只走首次
+        // 启动，resume 由 `do_resume_task` 承接，因此语义就是「首次进入
+        // downloading」）。
+        let started_event = self.webhook_task_event(
+            crate::webhook::WebhookEventKind::TaskStarted,
+            crate::webhook::WebhookTask {
+                id: task_id.clone(),
+                file_name: file_name.clone(),
+                url: url.clone(),
+                save_dir: save_dir.clone(),
+                total_bytes: hint_file_size,
+                status: 1,
+                error_message: String::new(),
+            },
+            &queue_id,
+        );
+        self.webhook.emit(started_event);
 
         self.generation += 1;
         let spawn_gen = self.generation;
@@ -4033,8 +4216,23 @@ impl DownloadManager {
     #[cfg(not(feature = "plugins"))]
     fn clear_pending_resolve(&mut self, _task_id: &str) {}
 
+    /// 用户显式暂停**单个**任务。会发 `task.paused` webhook。
+    ///
+    /// 批量路径（`batch_pause` / 队列停用 / Boost 让位 / 改线程数的暂停-恢复）
+    /// 必须走 [`Self::pause_task_silent`]——设计明确要求全局暂停不触发通知，
+    /// 否则千级批量任务会给用户连发一屏推送。
     pub async fn pause_task(&mut self, task_id: &str) {
+        self.pause_task_inner(task_id, true).await;
+    }
+
+    /// 内部/批量暂停：行为与 [`Self::pause_task`] 完全一致，只是不发 webhook。
+    async fn pause_task_silent(&mut self, task_id: &str) {
+        self.pause_task_inner(task_id, false).await;
+    }
+
+    async fn pause_task_inner(&mut self, task_id: &str, notify: bool) {
         self.clear_pending_resolve(task_id);
+        self.retry_scheduled.remove(task_id);
         // Remove from pending queue if queued (not yet started).
         if let Some(pos) = self.pending_queue.iter().position(|q| q.task_id == task_id) {
             self.pending_queue.remove(pos);
@@ -4055,6 +4253,10 @@ impl DownloadManager {
                     upload_speed_bps: 0,
                 });
             }
+            if notify {
+                self.emit_paused_webhook(task_id).await;
+            }
+            self.sync_queue_occupancy();
             return;
         }
 
@@ -4113,6 +4315,19 @@ impl DownloadManager {
             // done_tx → on_task_done → maybe_release_bt_session, so the session
             // is released safely once the task has actually stopped.
         }
+        if notify {
+            self.emit_paused_webhook(task_id).await;
+        }
+        self.sync_queue_occupancy();
+    }
+
+    /// 读回任务行并发一条 `task.paused`。
+    async fn emit_paused_webhook(&self, task_id: &str) {
+        if let Ok(Some(task)) = self.db.load_task_by_id(task_id).await {
+            let event =
+                self.webhook_event_from_task(crate::webhook::WebhookEventKind::TaskPaused, &task);
+            self.webhook.emit(event);
+        }
     }
 
     pub async fn resume_task(&mut self, task_id: &str) {
@@ -4129,6 +4344,8 @@ impl DownloadManager {
     }
 
     async fn resume_task_inner(&mut self, task_id: &str) {
+        // 排程中的自动重试已落地（或被手动恢复抢先），解除队列占用标记。
+        self.retry_scheduled.remove(task_id);
         if self.active_tasks.contains_key(task_id) {
             // A task can be in active_tokens but already terminal in the DB:
             // this happens when the download task has finished (status=3/4
@@ -4243,6 +4460,8 @@ impl DownloadManager {
                 self.broadcast_queue_positions();
             }
         }
+        // 恢复即重新占用队列——不登记的话下次清空不会触发 `queue.drained`。
+        self.sync_queue_occupancy();
     }
 
     /// Internal: actually spawn the resume (no concurrency check).
@@ -4819,6 +5038,7 @@ impl DownloadManager {
     /// attempt to remove files.  A 5-second timeout prevents indefinite hangs.
     pub async fn delete_task(&mut self, task_id: &str, delete_files: bool) {
         self.auto_retry_counts.remove(task_id);
+        self.retry_scheduled.remove(task_id);
         self.clear_pending_resolve(task_id);
 
         // Remove from pending queue if queued.
@@ -5031,6 +5251,7 @@ impl DownloadManager {
         }
         // A slot freed up — try to start queued tasks.
         self.drain_queue().await;
+        self.sync_queue_occupancy();
         self.maybe_wal_checkpoint().await;
         self.maybe_release_bt_session().await;
     }
@@ -5369,6 +5590,7 @@ impl DownloadManager {
         // 7. Cleanup boost state.
         for tid in task_ids {
             self.auto_paused_ids.remove(tid.as_str());
+            self.retry_scheduled.remove(tid.as_str());
             if self.priority_task_id.as_deref() == Some(tid.as_str()) {
                 self.clear_priority().await;
             }
@@ -5376,6 +5598,7 @@ impl DownloadManager {
 
         // 8. drain_queue + wal_checkpoint only once at the end.
         self.drain_queue().await;
+        self.sync_queue_occupancy();
         self.maybe_wal_checkpoint().await;
         self.maybe_release_bt_session().await;
     }
@@ -5506,8 +5729,9 @@ impl DownloadManager {
     /// - 排队中的任务：批量摘除 + 单次批量落库 paused，不逐任务发事件；
     ///   先摘排队再暂停活跃——顺序反了会让 pause 触发的 drain_queue 把
     ///   仍在排队的任务顶进刚释放的槽位；
-    /// - 活跃任务：仍逐个走 [`Self::pause_task`]（取消令牌/BT 会话/Boost
-    ///   守卫/分段快照），数量受并发上限约束；
+    /// - 活跃任务：仍逐个走 [`Self::pause_task_silent`]（取消令牌/BT 会话/Boost
+    ///   守卫/分段快照），数量受并发上限约束；批量语义不发 `task.paused`
+    ///   webhook——那是通知风暴的定义；
     /// - 尾部一次 [`EngineEvent::QueuePositionsChanged`] + 一次
     ///   [`EngineEvent::TasksSnapshot`] 取代逐任务广播。
     pub async fn batch_pause(&mut self, task_ids: &[String]) {
@@ -5538,7 +5762,7 @@ impl DownloadManager {
             .cloned()
             .collect();
         for tid in &active {
-            self.pause_task(tid).await;
+            self.pause_task_silent(tid).await;
         }
         if queued.is_empty() && active.is_empty() {
             return; // 全员本就非活跃非排队：保持既往完全无操作、无广播。
@@ -6366,7 +6590,7 @@ impl DownloadManager {
 
         // Step 2: Auto-pause all currently active tasks (except the target itself,
         // which may already be downloading).
-        // Note: each pause_task() call invokes drain_queue(), which could promote a
+        // Note: each pause invokes drain_queue(), which could promote a
         // queued task to active.  We collect active IDs first, then pause them.
         let active_ids: Vec<String> = self
             .active_tasks
@@ -6376,7 +6600,7 @@ impl DownloadManager {
             .collect();
         for id in active_ids {
             self.auto_paused_ids.insert(id.clone());
-            self.pause_task(&id).await;
+            self.pause_task_silent(&id).await;
         }
 
         // Step 3: Pause all remaining tasks in the pending queue (excluding the target).
@@ -6388,7 +6612,7 @@ impl DownloadManager {
             .collect();
         for id in queued_ids {
             self.auto_paused_ids.insert(id.clone());
-            self.pause_task(&id).await;
+            self.pause_task_silent(&id).await;
         }
 
         // Step 4: Mop up — drain_queue() calls in step 2/3 may have promoted additional
@@ -6401,7 +6625,7 @@ impl DownloadManager {
             .collect();
         for id in stray_active {
             self.auto_paused_ids.insert(id.clone());
-            self.pause_task(&id).await;
+            self.pause_task_silent(&id).await;
         }
 
         self.priority_task_id = Some(task_id.clone());

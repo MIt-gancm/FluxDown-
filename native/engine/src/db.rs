@@ -191,6 +191,23 @@ CREATE TABLE IF NOT EXISTS rss_items (
 );
 CREATE INDEX IF NOT EXISTS idx_rss_items_source ON rss_items(source_id, pub_date);
 CREATE INDEX IF NOT EXISTS idx_rss_items_episode ON rss_items(source_id, episode_key);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    timestamp_ms INTEGER NOT NULL DEFAULT 0,
+    event TEXT NOT NULL DEFAULT '',
+    endpoint_id TEXT NOT NULL DEFAULT '',
+    endpoint_name TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    request_headers TEXT NOT NULL DEFAULT '',
+    request_body TEXT NOT NULL DEFAULT '',
+    status_code INTEGER NOT NULL DEFAULT 0,
+    response_body TEXT NOT NULL DEFAULT '',
+    latency_ms INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_ts ON webhook_deliveries(timestamp_ms);
 ";
 
 /// 建表 DDL（PostgreSQL 方言）。
@@ -342,6 +359,23 @@ CREATE TABLE IF NOT EXISTS rss_items (
 );
 CREATE INDEX IF NOT EXISTS idx_rss_items_source ON rss_items(source_id, pub_date);
 CREATE INDEX IF NOT EXISTS idx_rss_items_episode ON rss_items(source_id, episode_key);
+CREATE TABLE IF NOT EXISTS webhook_deliveries (
+    delivery_id TEXT PRIMARY KEY,
+    timestamp_ms BIGINT NOT NULL DEFAULT 0,
+    event TEXT NOT NULL DEFAULT '',
+    endpoint_id TEXT NOT NULL DEFAULT '',
+    endpoint_name TEXT NOT NULL DEFAULT '',
+    url TEXT NOT NULL DEFAULT '',
+    request_headers TEXT NOT NULL DEFAULT '',
+    request_body TEXT NOT NULL DEFAULT '',
+    status_code INTEGER NOT NULL DEFAULT 0,
+    response_body TEXT NOT NULL DEFAULT '',
+    latency_ms BIGINT NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    success INTEGER NOT NULL DEFAULT 0,
+    error TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_ts ON webhook_deliveries(timestamp_ms);
 ";
 
 /// SQLite 连接级 PRAGMA（在 `after_connect` 钩子中对每个新连接执行）。
@@ -3127,6 +3161,134 @@ impl Db {
             .await?;
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Webhook 投递日志
+    //
+    // 落库而不是只留内存环：用户配完端点常常隔天才回来看「昨晚那批到底发出
+    // 去没有」，重启清零等于这个面板在最需要它的时候是空的。
+    // -----------------------------------------------------------------------
+
+    /// 投递日志（新→旧，最多 `limit` 条）。
+    pub async fn load_webhook_deliveries(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<WebhookDeliveryRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT delivery_id, timestamp_ms, event, endpoint_id, endpoint_name, url, \
+             request_headers, request_body, status_code, response_body, latency_ms, \
+             attempts, success, error FROM webhook_deliveries \
+             ORDER BY timestamp_ms DESC, delivery_id DESC LIMIT $1",
+        )
+        .bind(limit.max(1))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(webhook_delivery_from_row)
+            .collect::<Result<_, _>>()
+            .map_err(Into::into)
+    }
+
+    /// 落一条投递记录，并把总量裁到 `keep` 条（超出的按时间从旧到新删）。
+    ///
+    /// 裁剪和插入放在同一个事务里：中途崩了要么两者都在、要么都不在，不会
+    /// 留下一个「删了旧的但新的没进来」的空窗。
+    pub async fn insert_webhook_delivery(
+        &self,
+        d: &WebhookDeliveryRow,
+        keep: i64,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (delivery_id, timestamp_ms, event, endpoint_id, \
+             endpoint_name, url, request_headers, request_body, status_code, response_body, \
+             latency_ms, attempts, success, error) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+             ON CONFLICT (delivery_id) DO NOTHING",
+        )
+        .bind(&d.delivery_id)
+        .bind(d.timestamp_ms)
+        .bind(&d.event)
+        .bind(&d.endpoint_id)
+        .bind(&d.endpoint_name)
+        .bind(&d.url)
+        .bind(&d.request_headers)
+        .bind(&d.request_body)
+        .bind(d.status_code)
+        .bind(&d.response_body)
+        .bind(d.latency_ms)
+        .bind(d.attempts)
+        .bind(i32::from(d.success))
+        .bind(&d.error)
+        .execute(&mut *tx)
+        .await?;
+        // `LIMIT -1` 是 SQLite 的「无上限」写法，pg 不认，那边用 `LIMIT ALL`。
+        let prune = match self.backend {
+            Backend::Sqlite => {
+                "DELETE FROM webhook_deliveries WHERE delivery_id IN ( \
+                   SELECT delivery_id FROM webhook_deliveries \
+                   ORDER BY timestamp_ms DESC, delivery_id DESC LIMIT -1 OFFSET $1)"
+            }
+            Backend::Postgres => {
+                "DELETE FROM webhook_deliveries WHERE delivery_id IN ( \
+                   SELECT delivery_id FROM webhook_deliveries \
+                   ORDER BY timestamp_ms DESC, delivery_id DESC LIMIT ALL OFFSET $1)"
+            }
+        };
+        sqlx::query(prune)
+            .bind(keep.max(1))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// 清空投递日志（用户显式点「清空」时才会发生）。
+    pub async fn clear_webhook_deliveries(&self) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM webhook_deliveries")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+}
+
+/// 一条已落库的投递记录。字段与 `webhook::WebhookDelivery` 一一对应；
+/// db 层不依赖 webhook 模块的类型，转换在 `webhook.rs` 里做。
+#[derive(Debug, Clone, Default)]
+pub struct WebhookDeliveryRow {
+    pub delivery_id: String,
+    pub timestamp_ms: i64,
+    pub event: String,
+    pub endpoint_id: String,
+    pub endpoint_name: String,
+    pub url: String,
+    pub request_headers: String,
+    pub request_body: String,
+    pub status_code: i32,
+    pub response_body: String,
+    pub latency_ms: i64,
+    pub attempts: i32,
+    pub success: bool,
+    pub error: String,
+}
+
+fn webhook_delivery_from_row(row: &AnyRow) -> Result<WebhookDeliveryRow, sqlx::Error> {
+    Ok(WebhookDeliveryRow {
+        delivery_id: row.try_get("delivery_id")?,
+        timestamp_ms: row.try_get("timestamp_ms")?,
+        event: row.try_get("event")?,
+        endpoint_id: row.try_get("endpoint_id")?,
+        endpoint_name: row.try_get("endpoint_name")?,
+        url: row.try_get("url")?,
+        request_headers: row.try_get("request_headers")?,
+        request_body: row.try_get("request_body")?,
+        status_code: row.try_get("status_code")?,
+        response_body: row.try_get("response_body")?,
+        latency_ms: row.try_get("latency_ms")?,
+        attempts: row.try_get("attempts")?,
+        success: row.try_get::<i32, _>("success")? != 0,
+        error: row.try_get("error")?,
+    })
 }
 
 pub struct SegmentInfo {

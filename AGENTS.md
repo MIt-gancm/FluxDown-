@@ -417,9 +417,10 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 避免混淆——**已实现** vs **仅设计**：
 - **已实现**：多文件任务组（`multi-file-task-group-design.md`）、插件系统 + 去中心化市场（`fluxdown-plugin-marketplace-plan.md` 等）。
 - **部分实现（仅客户端）**：多设备协作 / FluxCloud 配置同步（`multi-device-collab-design.md`）——`lib/src/services/cloud/` + `web/src/lib/cloud/` 已落地，对接**外部 L2 relay**；**本地 headless server 无任何 cloud/sync 路由**；打洞/E2E 仍设计阶段。
-- **仅设计（无引擎/服务器代码）**：webhook 任务事件通知（`webhook-notification-design.md`）、浏览器扩展嗅探规则市场（`sniff-rule-market-design.md`——云端锚定 FluxCloud，扩展侧 `sniff-engine.ts` + FluxCloud `sniff_packs` 表均未落地；文档含三轮对抗评审记录与逐条打折清单）。
+- **仅设计（无引擎/服务器代码）**：浏览器扩展嗅探规则市场（`sniff-rule-market-design.md`——云端锚定 FluxCloud，扩展侧 `sniff-engine.ts` + FluxCloud `sniff_packs` 表均未落地；文档含三轮对抗评审记录与逐条打折清单）。
 - **已实现（全端）**：RSS 订阅自动下载（`rss-subscription-design.md`，issue #97）——引擎 `native/engine/src/rss/`、REST `/api/v1/rss/*`、WS `rssSourcesChanged`/`rssItemsChanged`、hub 信号、桌面 UI（侧边栏区块 + 条目流 + 三 Tab 对话框 + 两步向导）、web SPA 同构、CLI `fluxdown rss`、MCP `rss_list`/`rss_add`/`rss_remove`。
-- **命名歧义警告**：引擎里的 `tracker_subscription.rs` / `ed2k/server_subscription.rs` 指 **BT tracker 列表 / ED2K server.met 订阅**，与 `rss/` 的 feed 订阅是两回事；"webhook" 指官网 GitHub 接收器，与任务事件 webhook 无关。
+- **已实现（免费层，全宿主）**：webhook 任务事件通知（`webhook-notification-design.md`）——引擎 `native/engine/src/webhook.rs`（6 事件 × 8 预设 + 占位符模板 + HMAC 签名 + 环形投递日志）、REST `/api/v1/webhooks/{deliveries,test,simulate}`、hub 信号、桌面「通知」设置分类、web SPA 同构。端点表就是 config 键 `webhook.endpoints`，桌面 / headless / CLI `--local` 共享。**付费托管 Relay（设计 §6）未实现**，客户端无任何 relay 代码。
+- **命名歧义警告**：引擎里的 `tracker_subscription.rs` / `ed2k/server_subscription.rs` 指 **BT tracker 列表 / ED2K server.met 订阅**，与 `rss/` 的 feed 订阅是两回事；官网 `api/webhooks/github` 是 GitHub 接收器，与 `engine/src/webhook.rs` 的任务事件推送无关。
 
 ---
 
@@ -436,6 +437,8 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 | **新增 aria2 方法** | `aria2.rs` `METHOD_NAMES` + `jsonrpc.rs` dispatch | 
 | **新增 MCP 工具** | `mcp.rs` tool_definitions + call_tool |
 | **新增引擎事件** | `events.rs` `EngineEvent` 变体 + `EventSink`；`rinf_sink`/`ws_hub` 各接线一处 |
+| **新增 webhook 事件** | `engine/src/webhook.rs` 的 `WebhookEventKind` 加变体（`wire()`/`title()` 同步）+ 在 `download_manager` 对应生命周期点位 `self.webhook.emit(...)`；UI 侧事件芯片自动跟随 `WebhookEvents.all`（Dart）/ `WEBHOOK_EVENTS`（TS），**三处 wire 名必须逐字一致** |
+| **新增 webhook 服务预设** | 只改 `engine/src/webhook.rs`：`Preset` 加变体 + `wire`/`label`/`content_type`/`escape`/`default_template`/`url_placeholder` 六个 match 各补一臂。模板由引擎下发，UI 零改动（只有品牌字标 `WebhookPresetMark`/`PRESET_MARKS` 想美化时才加） |
 | **新增引擎设置** | `settings_provider.dart` 加字段+setter(`_saveToRust`)+load switch case；要跨设备同步则 `sync_catalog.dart` 加 `SyncEntry`（否则默认设备本地） |
 | **新增主题预设/度量** | `flux_theme_tokens.dart` 加 `BuiltinThemeId`+工厂+`builtinThemes` 项 / `flux_metric_tokens.dart` 加 clamped 字段 + `app_metrics.dart` 暴露 |
 | **新增 NAS/分发目标** | `packaging/<target>/build_*.sh` 复用（server 二进制 + `web/` + `FLUXDOWN_*`）布局 → 接入 release.yml `build-server-nas-packages` |

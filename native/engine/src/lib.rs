@@ -35,6 +35,8 @@ pub mod segment_coordinator;
 pub mod selection;
 pub mod speed_limiter;
 pub mod tracker_subscription;
+/// 任务事件 Webhook 推送（免费自托管，BYOE）。
+pub mod webhook;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -252,6 +254,11 @@ impl Engine {
         // 装载 RSS 订阅到内存镜像——放在 Engine::new 而非交给宿主，保证任何
         // 宿主（hub/server/CLI --local）都不必记得这一步就能让轮询生效。
         manager.rss.load().await;
+        // 同理装载 webhook 端点表：桌面 / headless / CLI --local 共享 config
+        // 表，任何宿主都无需额外接线即可获得任务事件推送。
+        manager.load_webhook_endpoints().await;
+        // 回灌投递日志：面板在重启后仍能看到「昨晚那批到底发出去没有」。
+        manager.webhook().attach_db(db.clone()).await;
         Ok(Self {
             db,
             manager,
@@ -307,6 +314,36 @@ impl Engine {
             files: Vec::new(),
             error: format!("probe task panicked: {e}"),
         })
+    }
+
+    /// 投递日志快照（新的在前，上限 [`webhook::MAX_DELIVERY_LOG`]）。
+    ///
+    /// 日志的读路径是 [`webhook::WebhookDispatcher`] 的内存环形缓冲（启动时
+    /// 从 `webhook_deliveries` 表回灌），宿主必须经此读取：hub 走信号对，
+    /// server 走 REST。
+    pub fn webhook_deliveries(&self) -> Vec<webhook::WebhookDelivery> {
+        self.manager.webhook().deliveries()
+    }
+
+    /// 清空投递日志（内存 + 落盘）。
+    pub async fn clear_webhook_deliveries(&self) {
+        self.manager.webhook().clear_deliveries().await;
+    }
+
+    /// 对**草稿**端点单发一次样例事件（不重试，用户在等内联反馈）。
+    /// 端点无需先保存——「发送测试」在保存前就要能用。
+    pub async fn test_webhook_endpoint(
+        &self,
+        spec: webhook::EndpointSpec,
+    ) -> webhook::WebhookDelivery {
+        self.manager.webhook().test_endpoint(spec).await
+    }
+
+    /// 「模拟一次 task.completed」：按已保存端点的订阅规则走完整投递路径。
+    ///
+    /// 返回投出去的端点数；0 = 没有端点订阅该事件（UI 该直说，别转圈）。
+    pub fn simulate_webhook_event(&self) -> usize {
+        self.manager.webhook().emit_sample()
     }
 }
 

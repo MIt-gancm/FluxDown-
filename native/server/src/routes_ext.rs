@@ -49,7 +49,8 @@ use crate::wire::{
     FsListResponse, InstallFfmpegRequest, LogFileDto, LogsResponse, MoveQueueRequest,
     ProxyTestRequest, ProxyTestResponse, QueueScheduleRequest, ReorderQueueRequest, SetupRequest,
     SetupStatusResponse, StatsResponse, TokenResponse, TrackerSubRefreshResponse,
-    UpdateQueueRequest, WsClientMsg, WsServerMsg,
+    UpdateQueueRequest, WebhookDeliveriesResponse, WebhookSimulateResponse, WebhookTestRequest,
+    WebhookTestResponse, WsClientMsg, WsServerMsg,
 };
 use crate::ws_hub::WsHub;
 
@@ -151,6 +152,12 @@ pub fn extra_router(state: ServerState) -> Router {
             paths::COMPONENT_YTDLP_UNINSTALL,
             post(component_ytdlp_uninstall),
         )
+        .route(
+            paths::WEBHOOK_DELIVERIES,
+            get(webhook_deliveries).delete(webhook_clear),
+        )
+        .route(paths::WEBHOOK_TEST, post(webhook_test))
+        .route(paths::WEBHOOK_SIMULATE, post(webhook_simulate))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     let open = Router::new()
@@ -195,6 +202,9 @@ pub mod paths {
     pub const OPENAPI: &str = "/api/v1/openapi.json";
     pub const DOCS: &str = "/api/v1/docs";
     pub const BT_TRACKER_SUB_REFRESH: &str = "/api/v1/bt/tracker-sub/refresh";
+    pub const WEBHOOK_DELIVERIES: &str = "/api/v1/webhooks/deliveries";
+    pub const WEBHOOK_TEST: &str = "/api/v1/webhooks/test";
+    pub const WEBHOOK_SIMULATE: &str = "/api/v1/webhooks/simulate";
     pub const SETUP_STATUS: &str = "/api/v1/setup/status";
     pub const SETUP: &str = "/api/v1/setup";
 }
@@ -869,6 +879,83 @@ async fn proxy_test(
     }
 }
 
+/// 投递日志（内存环形缓冲 100 条，新的在前）+ 服务预设目录 + 变量清单。
+///
+/// 端点 CRUD 走 `/api/v1/config` 的 `webhook.endpoints` 键——端点表就是一条
+/// 配置，不值得再开一套 REST 资源。
+#[utoipa::path(get, path = "/api/v1/webhooks/deliveries", tag = "server",
+    responses((status = 200, body = WebhookDeliveriesResponse)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn webhook_deliveries(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    let deliveries = state
+        .send_cmd(|ack| ActorCmd::WebhookDeliveries { ack })
+        .await?;
+    Ok(axum::Json(WebhookDeliveriesResponse {
+        deliveries: deliveries.into_iter().map(Into::into).collect(),
+        presets: fluxdown_engine::webhook::preset_catalog()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
+        variables: fluxdown_engine::webhook::TEMPLATE_VARIABLES
+            .iter()
+            .map(|v| (*v).to_string())
+            .collect(),
+    })
+    .into_response())
+}
+
+/// 清空投递日志。
+#[utoipa::path(delete, path = "/api/v1/webhooks/deliveries", tag = "server",
+    responses((status = 200, description = "已清空")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn webhook_clear(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    state.send_cmd(|ack| ActorCmd::WebhookClear { ack }).await?;
+    Ok(ok_response())
+}
+
+/// 「模拟一次 task.completed」——配完端点无需真实下载即可端到端验证。
+#[utoipa::path(post, path = "/api/v1/webhooks/simulate", tag = "server",
+    responses((status = 200, body = WebhookSimulateResponse, description = "已按订阅规则派发")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn webhook_simulate(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    let dispatched = state
+        .send_cmd(|ack| ActorCmd::WebhookSimulate { ack })
+        .await?;
+    Ok(axum::Json(WebhookSimulateResponse {
+        dispatched: dispatched as i32,
+    })
+    .into_response())
+}
+
+/// 对**草稿**端点单发一次样例事件（不重试，用户在等内联反馈）。
+///
+/// 传输失败也返回 200——「测试失败」是正常业务结果，不是 HTTP 错误；
+/// `success=false` + `error` 才是给用户看的东西。
+#[utoipa::path(post, path = "/api/v1/webhooks/test", tag = "server",
+    request_body = WebhookTestRequest,
+    responses((status = 200, body = WebhookTestResponse)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn webhook_test(
+    State(state): State<ServerState>,
+    axum::Json(req): axum::Json<WebhookTestRequest>,
+) -> Result<Response, ApiError> {
+    let endpoint_json = req.endpoint.to_string();
+    let record = state
+        .send_cmd(|ack| ActorCmd::WebhookTest { endpoint_json, ack })
+        .await?;
+    Ok(axum::Json(WebhookTestResponse {
+        success: record.success,
+        status_code: record.status_code,
+        latency_ms: record.latency_ms,
+        error: record.error.clone(),
+    })
+    .into_response())
+}
+
 /// 重新生成管理访问密钥并持久化。**立即生效**：旧密钥同一时刻失效，调用方
 /// 需用返回的新密钥重新鉴权（Web 端会就地更新本地凭据）。
 #[utoipa::path(post, path = "/api/v1/token/regenerate", tag = "server",
@@ -1223,6 +1310,10 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         component_ytdlp_versions,
         component_ytdlp_install,
         component_ytdlp_uninstall,
+        webhook_deliveries,
+        webhook_clear,
+        webhook_simulate,
+        webhook_test,
     ),
     components(schemas(
         crate::wire::WsServerMsg,
@@ -1251,6 +1342,12 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         crate::wire::ComponentVersions,
         crate::wire::InstallFfmpegRequest,
         crate::wire::TrackerSubRefreshResponse,
+        crate::wire::WebhookDeliveryDto,
+        crate::wire::WebhookPresetDto,
+        crate::wire::WebhookDeliveriesResponse,
+        crate::wire::WebhookTestRequest,
+        crate::wire::WebhookTestResponse,
+        crate::wire::WebhookSimulateResponse,
     )),
     tags((name = "server", description = "headless 服务器扩展端点"))
 )]

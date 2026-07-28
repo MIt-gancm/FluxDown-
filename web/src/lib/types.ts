@@ -340,6 +340,7 @@ export type WsServerMsg =
   | { type: 'linkDevicesChanged' }
   | { type: 'rssSourcesChanged'; sources: RssSourceDto[] }
   | { type: 'rssItemsChanged'; sourceId: string; items: RssItemDto[]; notifyTitles: string[] }
+  | { type: 'webhookDeliveriesChanged'; deliveries: WebhookDelivery[] }
   | { type: 'pong' }
 
 export interface TaskProgressMsg {
@@ -602,3 +603,89 @@ export interface MarketEntry {
   /** manifest 声明的能力权限（如 ["ffmpeg"]），旧索引可能缺省。 */
   permissions?: string[]
 }
+
+// ── Webhook 任务事件推送（免费自托管 BYOE）──────────────────────────
+
+/** 端点配置。**schema 与 Rust `webhook::EndpointSpec`、Dart `WebhookEndpoint`
+ *  三方一致**——整表以 JSON 数组存进 config 键 `webhook.endpoints`。 */
+export interface WebhookEndpoint {
+  id: string
+  name: string
+  /** ntfy/gotify/bark/serverchan/telegram/discord/slack/custom；未知值按 custom 处理。 */
+  preset: string
+  url: string
+  enabled: boolean
+  /** 订阅的事件 wire 名；空数组 = 不推送任何事件。 */
+  events: string[]
+  /** 队列过滤：空 = 全部队列。 */
+  queueId: string
+  headers: Record<string, string>
+  /** 空 = 用预设默认模板。 */
+  bodyTemplate: string
+  /** 非空 = 开启 HMAC-SHA256 签名。 */
+  signSecret: string
+  allowHttp: boolean
+  useProxy: boolean
+}
+
+/** 一条投递记录（内存环形缓冲 100 条，不落盘）。 */
+export interface WebhookDelivery {
+  deliveryId: string
+  timestampMs: number
+  event: string
+  endpointId: string
+  endpointName: string
+  url: string
+  /** 每行 `K: V`；鉴权类值已掩码。 */
+  requestHeaders: string
+  requestBody: string
+  /** 0 = 未拿到响应（网络错误/超时）。 */
+  statusCode: number
+  responseBody: string
+  latencyMs: number
+  attempts: number
+  success: boolean
+  error: string
+}
+
+/** 服务预设元数据（引擎是模板的单一事实源）。 */
+export interface WebhookPreset {
+  id: string
+  label: string
+  urlPlaceholder: string
+  /** 空 = custom，走 schemaVersion 信封。 */
+  defaultTemplate: string
+  contentType: string
+}
+
+export interface WebhookDeliveriesResponse {
+  deliveries: WebhookDelivery[]
+  presets: WebhookPreset[]
+  /** 可用占位符清单（`{task.fileName}` 等）。 */
+  variables: string[]
+}
+
+export interface WebhookTestResponse {
+  success: boolean
+  statusCode: number
+  latencyMs: number
+  error: string
+}
+
+export interface WebhookSimulateResponse {
+  /** 按订阅规则投出去的端点数。0 = 没有目标订阅 `task.completed`。 */
+  dispatched: number
+}
+
+/** v1 事件集（wire 名即契约）。 */
+export const WEBHOOK_EVENTS = [
+  'task.created',
+  'task.started',
+  'task.completed',
+  'task.failed',
+  'task.paused',
+  'queue.drained',
+] as const
+
+/** 新端点默认订阅：完成 + 失败覆盖 80% 场景。 */
+export const WEBHOOK_DEFAULT_EVENTS = ['task.completed', 'task.failed']

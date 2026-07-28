@@ -12,6 +12,7 @@ use fluxdown_engine::components::{FfmpegStatus, FfmpegVersions, YtdlpStatus, Ytd
 use fluxdown_engine::model::{
     BtFileEntry, CdnNodeInfo, HlsQualityOption, QueuePosition, ResolveVariantOption, SegmentDetail,
 };
+use fluxdown_engine::webhook::{PresetInfo, WebhookDelivery};
 
 // ---------------------------------------------------------------------------
 // WS 服务端 → 客户端
@@ -311,6 +312,10 @@ pub enum WsServerMsg {
     /// 只在 approve 的 onSuccess 里 refetch 名册会读到还没写入新设备的
     /// 陈旧快照，且没有其它机制能纠正它，靠这条消息触发前端重新拉取。
     LinkDevicesChanged {},
+    /// 投递日志快照（新→旧，最多 100 条）。任务真完成时的投递、以及
+    /// 「模拟一次下载完成」都发生在前端拉过快照之后——没有这条推送，打开着
+    /// 的日志面板就停在打开时的样子。引擎侧已按 500ms 节流。
+    WebhookDeliveriesChanged { deliveries: Vec<WebhookDeliveryDto> },
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +629,122 @@ pub struct InstallFfmpegRequest {
     /// 钉住的版本号；`None` = 安装/更新到最新稳定版。
     #[serde(default)]
     pub version: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Webhook 任务事件推送（免费自托管）
+// ---------------------------------------------------------------------------
+
+/// 一条投递记录（`GET /api/v1/webhooks/deliveries` 列表项）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookDeliveryDto {
+    pub delivery_id: String,
+    /// Unix 毫秒。
+    pub timestamp_ms: i64,
+    /// 事件 wire 名（`task.completed` 等）。
+    pub event: String,
+    pub endpoint_id: String,
+    pub endpoint_name: String,
+    pub url: String,
+    /// 请求头摘录，每行 `K: V`；鉴权类值已掩码。
+    pub request_headers: String,
+    pub request_body: String,
+    /// HTTP 状态码；0 = 未拿到响应。
+    pub status_code: i32,
+    pub response_body: String,
+    pub latency_ms: i64,
+    pub attempts: i32,
+    pub success: bool,
+    pub error: String,
+}
+
+impl From<WebhookDelivery> for WebhookDeliveryDto {
+    fn from(d: WebhookDelivery) -> Self {
+        Self {
+            delivery_id: d.delivery_id,
+            timestamp_ms: d.timestamp_ms,
+            event: d.event,
+            endpoint_id: d.endpoint_id,
+            endpoint_name: d.endpoint_name,
+            url: d.url,
+            request_headers: d.request_headers,
+            request_body: d.request_body,
+            status_code: d.status_code,
+            response_body: d.response_body,
+            latency_ms: d.latency_ms,
+            attempts: d.attempts,
+            success: d.success,
+            error: d.error,
+        }
+    }
+}
+
+/// 服务预设元数据（`GET /api/v1/webhooks/deliveries` 一并返回）——Web 端
+/// 「实时载荷预览」的模板来源，客户端只做占位符替换，不复制模板内容。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookPresetDto {
+    pub id: String,
+    pub label: String,
+    pub url_placeholder: String,
+    pub default_template: String,
+    pub content_type: String,
+}
+
+impl From<PresetInfo> for WebhookPresetDto {
+    fn from(p: PresetInfo) -> Self {
+        Self {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            url_placeholder: p.url_placeholder.to_string(),
+            default_template: p.default_template.to_string(),
+            content_type: p.content_type.to_string(),
+        }
+    }
+}
+
+/// 投递日志 + 预设目录（`GET /api/v1/webhooks/deliveries`）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookDeliveriesResponse {
+    /// 新的在前，最多 100 条（内存环形缓冲，不落盘）。
+    pub deliveries: Vec<WebhookDeliveryDto>,
+    pub presets: Vec<WebhookPresetDto>,
+    /// 可用占位符清单（`{task.fileName}` 等）。
+    pub variables: Vec<String>,
+}
+
+/// 测试投递请求（`POST /api/v1/webhooks/test`）。
+///
+/// 直接内嵌端点草稿（**无需先保存**），schema 同 `webhook.endpoints` 数组元素。
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookTestRequest {
+    #[serde(flatten)]
+    #[schema(value_type = Object)]
+    pub endpoint: serde_json::Value,
+}
+
+/// 测试投递结果。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookTestResponse {
+    pub success: bool,
+    /// HTTP 状态码；0 = 未拿到响应。
+    pub status_code: i32,
+    pub latency_ms: i64,
+    /// 成功时为空。
+    pub error: String,
+}
+
+/// `POST /api/v1/webhooks/simulate` 的回执。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WebhookSimulateResponse {
+    /// 按订阅规则投出去的端点数。0 = 没有端点订阅 `task.completed`，
+    /// 前端该直说而不是干等投递记录。
+    pub dispatched: i32,
 }
 
 #[cfg(test)]

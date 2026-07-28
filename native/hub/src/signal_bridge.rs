@@ -7,6 +7,7 @@
 
 use fluxdown_engine::model;
 use fluxdown_engine::rss::model as rss_model;
+use fluxdown_engine::webhook;
 
 use crate::signals;
 
@@ -253,6 +254,39 @@ impl From<rss_model::RssItemInfo> for signals::RssItemEntry {
             task_id: i.task_id,
             episode_key: i.episode_key,
             reason: i.reason,
+        }
+    }
+}
+
+impl From<webhook::WebhookDelivery> for signals::WebhookDeliveryEntry {
+    fn from(d: webhook::WebhookDelivery) -> Self {
+        Self {
+            delivery_id: d.delivery_id,
+            timestamp_ms: d.timestamp_ms,
+            event: d.event,
+            endpoint_id: d.endpoint_id,
+            endpoint_name: d.endpoint_name,
+            url: d.url,
+            request_headers: d.request_headers,
+            request_body: d.request_body,
+            status_code: d.status_code,
+            response_body: d.response_body,
+            latency_ms: d.latency_ms,
+            attempts: d.attempts,
+            success: d.success,
+            error: d.error,
+        }
+    }
+}
+
+impl From<webhook::PresetInfo> for signals::WebhookPresetEntry {
+    fn from(p: webhook::PresetInfo) -> Self {
+        Self {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            url_placeholder: p.url_placeholder.to_string(),
+            default_template: p.default_template.to_string(),
+            content_type: p.content_type.to_string(),
         }
     }
 }
