@@ -644,6 +644,7 @@ async fn run_coord(
         "",
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
+        false,
     )
     .await;
     drop(tx);
@@ -1021,6 +1022,7 @@ async fn resume_after_cancel_is_byte_exact() {
         "",
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
+        false,
     )
     .await;
     drop(tx);
@@ -1061,6 +1063,7 @@ async fn resume_after_cancel_is_byte_exact() {
         "",
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         1,
+        false,
     )
     .await;
     drop(tx2);
@@ -2867,6 +2870,7 @@ async fn transient_200_on_resume_is_absorbed_byte_exact() {
         "",
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
+        false,
     )
     .await;
     drop(tx);

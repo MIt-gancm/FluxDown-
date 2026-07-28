@@ -673,6 +673,7 @@ async fn download_track_coordinated(
         "",
         scope,
         p.spawn_gen,
+        false, // DASH 轨：段数由轨长顾问决定，不走 hint 解封
     )
     .await;
 

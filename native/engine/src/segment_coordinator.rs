@@ -445,6 +445,34 @@ const RAMP_INITIAL_WORKERS: usize = 2;
 /// ramp 评估窗口间隔（秒）：每窗口测一次总吞吐，决定扩容/冻结。
 const RAMP_TICK_SECS: u64 = 2;
 
+/// open-ended 首响应即时放队后的最短完整评估窗（毫秒）。
+/// 短于此时长的 tick 只做槽位对账 + 按额度补队，跳过吞吐采样/评估/shrink/
+/// 扩容，且不推进 `ramp_last_*` 窗口边界——保证下个整窗测速干净。
+const RAMP_MIN_EVAL_WINDOW_MS: u128 = 500;
+
+/// 软冻结冷却：Freeze 后等待此数量的完整 ramp tick（× [`RAMP_TICK_SECS`]）
+/// 再发起 +1 试探。15 × 2s ≈ 30s，足以让瞬时噪声谷过去，又不会把一次
+/// 误冻结钉死到任务结束。
+const RAMP_SOFT_PROBE_COOLDOWN_TICKS: u32 = 15;
+
+/// 单次 Soft 生命周期内最多 +1 试探次数。两次失败即升 Hard——持续无增益
+/// 说明当前规模已是甜点，再探只会空烧连接建立开销。
+const RAMP_SOFT_PROBE_MAX_ATTEMPTS: u32 = 2;
+
+/// 整任务累计软试探次数上限（跨多次进 Soft）。6 次 × 平均冷却覆盖约数分钟
+/// 量级的再探预算；超额后 Freeze 直接进 Hard，防止长任务反复软解冻抖动。
+const RAMP_SOFT_PROBE_TASK_BUDGET: u32 = 6;
+
+/// hint 解封天花板：在无负面域名 cap、且存在正面 hint 时，允许把 `worker_cap`
+/// 抬到 `hint × 2`（下一档探索空间），但仍受此平台上限与 [`MAX_SEGMENTS`] 钳制。
+/// 移动端连接/电量更敏感，上限减半；桌面端与 `MAX_SEGMENTS` 对齐。
+/// 证据门槛：仅当调用方显式允许（用户 Auto 默认档）且无未过期负面 cap 时生效；
+/// ramp 的 IMPROVE/Collapse/reject 反馈闭环全额保留，解封只放宽天花板不跳过评估。
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const HINT_UNCAP_MAX: usize = 32;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+const HINT_UNCAP_MAX: usize = 64;
+
 /// Range 能力裁决（`range_verdict: AtomicU8` 的取值）。
 /// hint 模式（probe 被跳过、Range 从未验证）从 UNKNOWN 起步：首连接发不带
 /// Range 的 plain GET，从首响应（206 或 `Accept-Ranges: bytes`）学习；裁决前
@@ -496,6 +524,21 @@ enum RampVerdict {
     Freeze,
     /// 崩塌（< 扩容前 × [`RAMP_COLLAPSE_FACTOR`]），回滚到扩容前规模。
     Collapse,
+}
+
+/// ramp 冻结状态：Active 允许正常倍增扩容；Soft 冷却后可 +1 试探；Hard 永久停扩。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreezeState {
+    /// 未冻结，可走正常倍增扩容路径。
+    Active,
+    /// 扩容无增益后的软冻结：冷却 `cooldown` 个完整 tick 后可发起有限次 +1 试探。
+    Soft {
+        ticks_waited: u32,
+        cooldown: u32,
+        attempts: u32,
+    },
+    /// 硬冻结：reject / conn_sensitive / Collapse / 试探预算耗尽——本任务不再扩容。
+    Hard,
 }
 
 /// 三档判定本体。边界语义：吞吐前后同为 0（服务器停滞）落入 Freeze——
@@ -567,6 +610,122 @@ fn initial_allowed_workers(worker_cap: usize, hint: Option<i32>) -> usize {
         _ => RAMP_INITIAL_WORKERS,
     };
     worker_cap.min(base).max(1)
+}
+
+/// hint 解封天花板：在允许解封、无未过期负面 cap、且存在正面 hint 时，
+/// 把 `base_cap` 抬到 `hint × 2`（已证实规模的下一档探索空间），并钳在
+/// [`HINT_UNCAP_MAX`] 与 [`MAX_SEGMENTS`] 内。
+///
+/// - `allow == false`（用户显式段数 / 非默认 auto_max）→ 原样返回 `base_cap`。
+/// - 负面记录存在时绝不放宽（含 `cap == Some(1)` 的单连接域名）。
+/// - ramp 的 IMPROVE / Collapse / reject 反馈闭环全额保留；本函数只抬天花板。
+fn hint_uncap_ceiling(
+    allow: bool,
+    negative_cap: Option<i32>,
+    hint: Option<i32>,
+    base_cap: usize,
+) -> usize {
+    if !allow || negative_cap.is_some() {
+        return base_cap;
+    }
+    let Some(h) = hint else {
+        return base_cap;
+    };
+    if h <= 0 {
+        return base_cap;
+    }
+    let target = (h as usize)
+        .saturating_mul(2)
+        .min(HINT_UNCAP_MAX)
+        .min(MAX_SEGMENTS as usize);
+    if target > base_cap { target } else { base_cap }
+}
+
+/// 软冻结 +1 试探是否就绪（完整 tick 守卫，不含 awaiting 消费）。
+/// 尾部 / 串行 / 连接敏感 / 拒绝 / 额度未用满 / 已到顶 / 任务试探预算耗尽
+/// 任一成立即否——结构上保证 tail 短路试探。
+#[allow(clippy::too_many_arguments)]
+fn soft_probe_ready(
+    freeze: FreezeState,
+    tail: bool,
+    range_ok: bool,
+    serial_mode: bool,
+    conn_sensitive: bool,
+    reject_strikes: u32,
+    alive: usize,
+    allowed: usize,
+    worker_cap: usize,
+    task_probes_used: u32,
+) -> bool {
+    let FreezeState::Soft {
+        ticks_waited,
+        cooldown,
+        attempts,
+    } = freeze
+    else {
+        return false;
+    };
+    ticks_waited >= cooldown
+        && attempts < RAMP_SOFT_PROBE_MAX_ATTEMPTS
+        && !tail
+        && range_ok
+        && !serial_mode
+        && !conn_sensitive
+        && reject_strikes == 0
+        && alive >= allowed
+        && allowed < worker_cap
+        && task_probes_used < RAMP_SOFT_PROBE_TASK_BUDGET
+}
+
+/// 试探窗评估转移：返回 `(下一冻结态, 是否回滚到 pre_grow)`。
+///
+/// **红线**：本函数不含任何域名缓存写入分支——试探窗的 Freeze/Collapse
+/// 均不记 `record_domain_conn_cap`；写缓存只存在于非试探 Collapse 臂。
+fn soft_probe_eval_transition(
+    verdict: RampVerdict,
+    attempts: u32,
+    cooldown: u32,
+) -> (FreezeState, bool) {
+    match verdict {
+        RampVerdict::Improved => (FreezeState::Active, false),
+        RampVerdict::Freeze => {
+            let next_attempts = attempts.saturating_add(1);
+            if next_attempts >= RAMP_SOFT_PROBE_MAX_ATTEMPTS {
+                (FreezeState::Hard, true)
+            } else {
+                (
+                    FreezeState::Soft {
+                        ticks_waited: 0,
+                        cooldown: cooldown.saturating_mul(2),
+                        attempts: next_attempts,
+                    },
+                    true,
+                )
+            }
+        }
+        // 试探窗崩塌 ≠ 真 Collapse：回滚 + Hard，绝不写域名缓存。
+        RampVerdict::Collapse => (FreezeState::Hard, true),
+    }
+}
+
+/// 正常扩容路径收到 Freeze 裁决后的下一状态。
+/// 任务软试探预算已耗尽时直接 Hard，否则进入初始 Soft 冷却。
+fn freeze_verdict_next_state(task_probes_used: u32) -> FreezeState {
+    if task_probes_used >= RAMP_SOFT_PROBE_TASK_BUDGET {
+        FreezeState::Hard
+    } else {
+        FreezeState::Soft {
+            ticks_waited: 0,
+            cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            attempts: 0,
+        }
+    }
+}
+
+/// 任务尾正面学习规模：取「被接受过的规模」与「受益过的规模」之较小者，
+/// 防止 Freeze 不回滚场景下跨任务棘轮抬升 hint。
+fn beneficial_hint_scale(proven_scale: usize, beneficial_scale: usize) -> usize {
+    proven_scale.min(beneficial_scale)
 }
 
 /// 尾部微拆分阈值：当正常拆分（`dynamic_min_split_bytes` 计算的阈值）失败时，
@@ -750,6 +909,101 @@ impl FileSyncGate {
             }
         }
     }
+
+    /// 覆盖式 fdatasync：返回的已完成 fdatasync 起始时刻 `S` **必须 ≥ `snap_t`**，
+    /// 从而覆盖 `snap_t` 前完成的全部写入（其字节在调用前已落入 OS 页缓存）。
+    ///
+    /// # 正确性契约
+    ///
+    /// 调用方须先 `file.flush()` 把自己的 BufWriter 落入页缓存，再记下快照时刻
+    /// `snap_t`，然后调用本方法。返回的 `S` 满足 `S >= snap_t`，故凡在 `snap_t`
+    /// 之前完成的写入均已被该次（或之后的）fdatasync 持久化——调用方据此才可把
+    /// 对应偏移写入 DB，维持 "DB 偏移 <= 已持久化字节" 不变式（BUG-COORD-FSYNC）。
+    ///
+    /// # 与 [`Self::sync_if_stale`] 的差异
+    ///
+    /// 本方法**无视** [`MIN_SYNC_GAP`]：只要 `last_completed_start` 尚不存在或
+    /// `< snap_t`，就必须亲自执行一次新的 fdatasync（或等待在途完成后重判）。
+    /// 周期落库路径继续用 `sync_if_stale` 合并刷写；段完成等需要强一致覆盖的
+    /// 路径用本方法。
+    ///
+    /// 并发完成者天然合并到同一次覆盖 fsync：若已有在途 sync，等待其结束后
+    /// 重判；若其 `last_completed_start >= snap_t` 则直接复用，无需再刷。
+    async fn sync_covering(
+        &self,
+        file: &tokio::fs::File,
+        snap_t: Instant,
+    ) -> std::io::Result<Instant> {
+        loop {
+            // 决策阶段：持锁判断，绝不跨 .await 持锁。
+            let do_sync = {
+                let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                match st.last_completed_start {
+                    // 已有覆盖 snap_t 的完成 fsync → 直接复用。
+                    Some(s) if s >= snap_t => return Ok(s),
+                    // 尚未覆盖，但已有一次在进行 → 等待其完成后重判。
+                    _ if st.syncing => false,
+                    // 尚未覆盖且无在途 → 无视 MIN_SYNC_GAP，由本调用执行。
+                    _ => {
+                        st.syncing = true;
+                        true
+                    }
+                }
+            };
+
+            if do_sync {
+                // my_start 记于 fdatasync 之前：它是"覆盖判据"的时刻锚点。
+                // 调用契约保证 snap_t 取于本方法之前，故 my_start >= snap_t。
+                let my_start = Instant::now();
+                let res = file.sync_data().await;
+                {
+                    let mut st = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    st.syncing = false;
+                    if res.is_ok() {
+                        st.last_completed_start = Some(my_start);
+                    }
+                }
+                self.notify.notify_waiters();
+                res?;
+                return Ok(my_start);
+            }
+
+            // 等待在途 fsync 完成后重判。带 50ms 兜底以规避 notify TOCTOU
+            // （与 sync_if_stale / speed_limiter 相同处理）。
+            tokio::select! {
+                biased;
+                () = self.notify.notified() => {}
+                () = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+    }
+}
+
+/// 抽干 worker 侧 durable 进度表，对照 coordinator 权威 `segments` 过滤后供批量落库。
+///
+/// - 未知 `seg_index` 或已 `Completed` 的条目丢弃（完成写由 worker 覆盖 fsync 后立即落库，
+///   不走批量通道；Completed 后 dual-write 无意义且可能用旧水位回退）。
+/// - 值钳制到 `seg.size()`，防止拆分收窄后的越界水位。
+fn take_durable_progress_rows(
+    durable_progress: &StdMutex<HashMap<i32, i64>>,
+    segments: &BTreeMap<i32, LiveSegment>,
+) -> Vec<(i32, i64, i64)> {
+    let pending = {
+        let mut guard = durable_progress.lock().unwrap_or_else(|e| e.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    let mut rows = Vec::with_capacity(pending.len());
+    for (idx, bytes) in pending {
+        let Some(seg) = segments.get(&idx) else {
+            continue;
+        };
+        if seg.state == SegState::Completed {
+            continue;
+        }
+        // (segment_index, downloaded_bytes, start_byte)——start_byte 供批量 WHERE 守卫。
+        rows.push((idx, bytes.min(seg.size()).max(0), seg.start_byte));
+    }
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +1072,9 @@ enum WorkerEvent {
     /// 必须立即把 Pending 段吸收进开放式首段（不能等 ramp tick——LAN 上首段
     /// 预算可能在 2s 内跑完，Done 后就没有活流可吸收了）。
     RangeVerdict { supports_range: bool },
+    /// open-ended 首段首响应通过校验，机队可立即释放，不必等下一个 ramp tick。
+    /// 仅在 `assignment.open_ended` 且本 worker 尚未发过时发送一次。
+    OpenEndedEstablished,
 }
 
 /// Sent by the coordinator to a worker to assign work.
@@ -930,12 +1187,13 @@ struct WorkerSpawnCtx {
     total_downloaded: Arc<AtomicI64>,
     seg_states: Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     db: Db,
-    progress_tx: mpsc::Sender<ProgressUpdate>,
     speed_limiter: SpeedLimiter,
     spec: crate::downloader::RequestSpec,
     etag: String,
     last_modified: String,
     sync_gate: FileSyncGate,
+    /// worker 周期 durable 进度（seg_index → 段内已 fsync 覆盖字节）；coordinator 批量落库。
+    durable_progress: Arc<StdMutex<HashMap<i32, i64>>>,
     scope: ReportScope,
     spawn_gen: i64,
 }
@@ -965,12 +1223,12 @@ impl WorkerSpawnCtx {
             self.total_downloaded.clone(),
             self.seg_states.clone(),
             self.db.clone(),
-            self.progress_tx.clone(),
             self.speed_limiter.clone(),
             self.spec.clone(),
             self.etag.clone(),
             self.last_modified.clone(),
             self.sync_gate.clone(),
+            self.durable_progress.clone(),
             self.scope,
             self.spawn_gen,
         );
@@ -1016,6 +1274,10 @@ pub async fn run_coordinated_download(
     last_modified: &str,
     scope: ReportScope,
     spawn_gen: i64,
+    // 是否允许 hint 解封抬高 worker_cap：仅 Auto 默认档（segment_count<=0 且
+    // auto_max_connections 等于引擎默认值）为 true；用户显式段数或自定义上限
+    // 时 false，尊重其设定的天花板。
+    allow_hint_uncap: bool,
 ) -> Result<i64, DownloadError> {
     // ----- 0. Defensive checks ------------------------------------------------
     if total_bytes <= 0 {
@@ -1338,7 +1600,9 @@ pub async fn run_coordinated_download(
         .filter(|s| s.state == SegState::Pending)
         .count();
 
-    // 本任务的连接数硬上限：规划段数 ∧ MAX_SEGMENTS ∧ 域名学习缓存。
+    // 本任务的连接数硬上限：规划段数 ∧ MAX_SEGMENTS ∧ 域名学习缓存；
+    // 无负面 cap 且允许 hint 解封时，可再抬到 hint×2（见 hint_uncap_ceiling）。
+    let start_hint: Option<usize> = domain_conn_hint(url).map(|h| h as usize);
     let worker_cap = {
         let mut cap = initial_segment_count.clamp(1, MAX_SEGMENTS) as usize;
         if let Some(domain_cap) = domain_conn_cap(url) {
@@ -1352,6 +1616,22 @@ pub async fn run_coordinated_download(
                 );
                 cap = dc;
             }
+        }
+        let before_uncap = cap;
+        cap = hint_uncap_ceiling(
+            allow_hint_uncap,
+            domain_conn_cap(url),
+            domain_conn_hint(url),
+            cap,
+        );
+        if cap > before_uncap {
+            log_info!(
+                "[adaptive] task {} hint 解封：cap {} -> {}（hint={:?}）",
+                task_id,
+                before_uncap,
+                cap,
+                domain_conn_hint(url)
+            );
         }
         cap
     };
@@ -1367,6 +1647,9 @@ pub async fn run_coordinated_download(
             worker_cap
         );
     }
+    // 受益过的规模：起步额度作为下界；Improved 时抬到当时 allowed，
+    // shrink/Collapse 回滚后 min 收敛。任务尾学习取 proven ∩ beneficial。
+    let mut beneficial_scale: usize = allowed_workers;
     // 只为 Pending 段开 worker；resume 时多数段可能已完成。
     // 存在开放式首段候选（从字节 0 起的零进度 Pending 段，判据与下方
     // pending_assignments 的 open_ended 完全一致）时，初始只启动它一个：
@@ -1382,6 +1665,10 @@ pub async fn run_coordinated_download(
     } else {
         pending_count.min(allowed_workers)
     };
+    // worker 周期 durable 进度汇聚表：各段仅在 fsync 覆盖推进时写入，
+    // coordinator 每 DB_SAVE_INTERVAL_SECS 抽干后一次事务批量落库。
+    let durable_progress: Arc<StdMutex<HashMap<i32, i64>>> =
+        Arc::new(StdMutex::new(HashMap::new()));
 
     // fdatasync 合并闸：多段共享，把各 worker 每 3s 的整盘 fsync 合并为全局约每
     // MIN_SYNC_GAP 一次（fdatasync 本就刷整个 inode，per-fd 重复毫无意义）。
@@ -1458,12 +1745,12 @@ pub async fn run_coordinated_download(
         range_verdict: range_verdict.clone(),
         seg_states: seg_states.clone(),
         db: db.clone(),
-        progress_tx: progress_tx.clone(),
         speed_limiter: speed_limiter.clone(),
         spec: spec.clone(),
         etag: etag.to_string(),
         last_modified: last_modified.to_string(),
         sync_gate: sync_gate.clone(),
+        durable_progress: durable_progress.clone(),
         scope,
         spawn_gen,
     };
@@ -1529,14 +1816,18 @@ pub async fn run_coordinated_download(
     proactive_interval.tick().await; // consume the immediate first tick
 
     // ---- 渐进/自适应连接调度状态 ----
-    // ramp_frozen：停止继续扩容（扩容无吞吐增益，或出现过拒绝信号）。
-    let mut ramp_frozen = false;
+    // freeze：Active 可倍增扩容；Soft 冷却后 +1 试探；Hard 永久停扩。
+    let mut freeze = FreezeState::Active;
     // 分级降级计数：第 1 次拒绝 → 乘性减半（保留存活连接）；第 2 次 → 串行模式。
     let mut reject_strikes: u32 = 0;
     // 上个 ramp tick 刚扩容，本 tick 用窗口吞吐评估扩容效果。
     let mut awaiting_ramp_eval = false;
+    // 当前 awaiting 是否为软冻结 +1 试探窗（非倍增）。试探失败不写域名缓存。
+    let mut probe_window = false;
+    // 整任务累计软试探次数（受 RAMP_SOFT_PROBE_TASK_BUDGET 约束）。
+    let mut soft_probe_task_used: u32 = 0;
     let mut pre_grow_throughput = 0.0_f64;
-    // 扩容前的连接额度：评估判定崩塌时回滚到此规模。
+    // 扩容前的连接额度：评估判定崩塌/试探失败时回滚到此规模。
     let mut pre_grow_workers = allowed_workers;
     // 任务内观察到的峰值窗口吞吐（持续劣化收缩的参照基准）。
     let mut peak_throughput = 0.0_f64;
@@ -1551,6 +1842,16 @@ pub async fn run_coordinated_download(
     let mut ramp_last_time = Instant::now();
     let mut ramp_interval = tokio::time::interval(Duration::from_secs(RAMP_TICK_SECS));
     ramp_interval.tick().await; // consume the immediate first tick
+
+    // UI 进度快照：coordinator 单点每 UI_REPORT_INTERVAL_MS 汇总 seg_states，
+    // 取代各 worker 内 200ms 分散上报（字段语义与原 worker 发送一致）。
+    let mut ui_interval =
+        tokio::time::interval(Duration::from_millis(UI_REPORT_INTERVAL_MS as u64));
+    ui_interval.tick().await; // consume the immediate first tick
+
+    // 段进度批量落库：抽干 durable_progress，一次事务写入（与 worker 周期对齐）。
+    let mut db_flush_interval = tokio::time::interval(Duration::from_secs(DB_SAVE_INTERVAL_SECS));
+    db_flush_interval.tick().await; // consume the immediate first tick
 
     loop {
         tokio::select! {
@@ -2022,8 +2323,9 @@ pub async fn run_coordinated_download(
                             // 保留所有存活连接（超额部分完成当前段后自然退休）；
                             // 再次拒绝（或本就只有 <=2 条连接）才降到串行模式。
                             reject_strikes += 1;
-                            ramp_frozen = true;
+                            freeze = FreezeState::Hard;
                             awaiting_ramp_eval = false;
+                            probe_window = false;
                             let reason = if transient_range {
                                 "transient-200"
                             } else {
@@ -2191,7 +2493,7 @@ pub async fn run_coordinated_download(
                                  保持首段 plain GET 单流下完",
                                 task_id
                             );
-                            ramp_frozen = true;
+                            freeze = FreezeState::Hard;
                             conn_sensitive.store(true, Ordering::Relaxed);
                             reconnect_hostile.store(true, Ordering::Relaxed);
                             absorb_pending_into_open_stream(
@@ -2204,6 +2506,12 @@ pub async fn run_coordinated_download(
                             )
                             .await;
                         }
+                    }
+
+                    Some(WorkerEvent::OpenEndedEstablished) => {
+                        // open-ended 首响应已通过校验：立即触发一次 ramp pass
+                        // 放出机队，不必干等下一个 2s tick。
+                        ramp_interval.reset_immediately();
                     }
 
                     None => {
@@ -2284,20 +2592,11 @@ pub async fn run_coordinated_download(
 
             // --- Adaptive ramp timer -------------------------------------
             // 渐进启动 + 自适应扩容：每个窗口测一次总吞吐；上次扩容有净收益且
-            // 无拒绝/连接敏感信号时倍增连接额度，否则冻结在当前规模；随后按
-            // 额度补充 worker（优先领 Pending 段，否则拆分最大 Active 段）。
+            // 无拒绝/连接敏感信号时倍增连接额度，否则软/硬冻结；随后按额度
+            // 补充 worker（优先领 Pending 段，否则拆分最大 Active 段）。
             _ = ramp_interval.tick() => {
-                // 1. 测量本窗口总吞吐（独立采样窗口，与 min_split 采样解耦）。
                 let now = Instant::now();
                 let bytes = total_downloaded.load(Ordering::Relaxed);
-                let elapsed = now.duration_since(ramp_last_time).as_secs_f64();
-                let throughput = if elapsed > 0.0 {
-                    (bytes - ramp_last_bytes).max(0) as f64 / elapsed
-                } else {
-                    0.0
-                };
-                ramp_last_bytes = bytes;
-                ramp_last_time = now;
 
                 // 槽位对账：worker task 可能未经事件通道即消亡（panic 展开、
                 // Done 派工时 send 失败但槽位仍为 Some 的历史缝隙）。以
@@ -2309,6 +2608,79 @@ pub async fn run_coordinated_download(
                     }
                 }
                 let mut alive = worker_assign_txs.iter().filter(|t| t.is_some()).count();
+
+                // 短窗口守卫（open-ended 即时放队后常见）：只做对账 + 按当前
+                // 额度补队，跳过吞吐采样/评估/shrink/扩容，且不推进 ramp_last_*
+                // ——保证下个整窗测速干净。awaiting 顺延到下个整窗消费。
+                let dt_ms = now.duration_since(ramp_last_time).as_millis();
+                if dt_ms < RAMP_MIN_EVAL_WINDOW_MS {
+                    let range_ok =
+                        range_verdict.load(Ordering::Relaxed) == RANGE_VERDICT_SUPPORTED;
+                    if !serial_mode && !all_done(&segments) && range_ok {
+                        while alive < allowed_workers {
+                            sync_downloaded_from_shared(&mut segments, &seg_states);
+                            let Some(next) = find_next_work(
+                                &mut segments,
+                                &mut next_index,
+                                effective_total_bytes,
+                                current_min_split,
+                            ) else {
+                                break;
+                            };
+                            let new_seg_idx = next.assignment.seg_index;
+                            persist_segment_change(
+                                db, task_id, &segments,
+                                new_seg_idx, next.split_parent,
+                            ).await;
+                            if let Some(parent_idx) = next.split_parent {
+                                send_split_event(
+                                    sink, task_id, parent_idx, new_seg_idx,
+                                    &segments, false, scope,
+                                );
+                            }
+                            rebuild_seg_states(&segments, &seg_states);
+                            let worker_id = worker_assign_txs.len();
+                            let (assign_tx, handle) = ctx.spawn(worker_id);
+                            if assign_tx.try_send(next.assignment).is_err() {
+                                if let Some(seg) = segments.get_mut(&new_seg_idx) {
+                                    seg.state = SegState::Pending;
+                                }
+                                break;
+                            }
+                            worker_assign_txs.push(Some(assign_tx));
+                            worker_handles.push(Some(handle));
+                            alive += 1;
+                        }
+                    }
+                    if alive == 0 && !all_done(&segments) {
+                        log_info!(
+                            "[coordinator] task {} 所有 worker 已退出但任务未完成，退出事件循环",
+                            task_id
+                        );
+                        break;
+                    }
+                    continue;
+                }
+
+                // 1. 测量本窗口总吞吐（独立采样窗口，与 min_split 采样解耦）。
+                let elapsed = now.duration_since(ramp_last_time).as_secs_f64();
+                let throughput = if elapsed > 0.0 {
+                    (bytes - ramp_last_bytes).max(0) as f64 / elapsed
+                } else {
+                    0.0
+                };
+                ramp_last_bytes = bytes;
+                ramp_last_time = now;
+
+                // Soft 冷却计时：仅完整 tick 累加（短窗口不进此路径）。
+                if !awaiting_ramp_eval
+                    && let FreezeState::Soft {
+                        ref mut ticks_waited,
+                        ..
+                    } = freeze
+                {
+                    *ticks_waited = ticks_waited.saturating_add(1);
+                }
 
                 // 正面学习采样：本窗口以 alive 条连接产生了真实吞吐且全程无
                 // 拒绝/降级/连接敏感信号 → 该规模已被服务器实际接受。
@@ -2335,50 +2707,105 @@ pub async fn run_coordinated_download(
                     let mut shrunk_this_tick = false;
                     if tail {
                         // 丢弃待评估的扩容：清 awaiting_ramp_eval 使下方 collapse
-                        // 评估短路（不回滚、不写域名缓存、不置 ramp_frozen）。
+                        // 评估短路（不回滚、不写域名缓存、不改 freeze）。
                         awaiting_ramp_eval = false;
+                        probe_window = false;
                     }
-                    // 2. 评估上一次扩容的效果：
-                    //    - 崩塌（跌破扩容前 × RAMP_COLLAPSE_FACTOR）→ 回滚到
-                    //      扩容前规模并学习域名连接上限——服务器在按连接惩罚，
-                    //      停留在被惩罚的规模等于全程慢速。
-                    //    - 无增益（未达扩容前 × RAMP_IMPROVE_FACTOR）→ 冻结在
-                    //      当前规模（已找到并发甜点，继续加只有风控风险）。
+                    // 2. 评估上一次扩容/试探的效果。
                     if awaiting_ramp_eval {
                         awaiting_ramp_eval = false;
-                        match ramp_verdict(pre_grow_throughput, throughput) {
-                            RampVerdict::Improved => {}
-                            RampVerdict::Collapse => {
-                                ramp_frozen = true;
+                        let was_probe = probe_window;
+                        probe_window = false;
+                        let verdict = ramp_verdict(pre_grow_throughput, throughput);
+                        if was_probe {
+                            // 试探窗：Improved → 恢复 Active；Freeze/Collapse → 回滚
+                            // 且**绝不写域名缓存**（试探崩塌 ≠ 真 Collapse）。
+                            let attempts = match freeze {
+                                FreezeState::Soft { attempts, .. } => attempts,
+                                _ => 0,
+                            };
+                            let cooldown = match freeze {
+                                FreezeState::Soft { cooldown, .. } => cooldown,
+                                _ => RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+                            };
+                            let (next, rollback) =
+                                soft_probe_eval_transition(verdict, attempts, cooldown);
+                            freeze = next;
+                            if rollback {
                                 let old = allowed_workers;
                                 allowed_workers = pre_grow_workers.max(1);
-                                // 多余 worker 完成当前段后经 Done 派工的额度检查
-                                // 自然退休；进行中的连接与已下数据零丢弃。
-                                record_domain_conn_cap_persist(
-                                    url,
-                                    allowed_workers as i32,
-                                    db,
-                                );
+                                beneficial_scale = beneficial_scale.min(allowed_workers);
                                 log_info!(
-                                    "[adaptive] task {} ramp collapse rollback: {} -> {} \
-                                     conns, throughput {:.0} -> {:.0} B/s（回滚并记入域名上限）",
+                                    "[adaptive] task {} 软试探回滚：{} -> {}（verdict={:?}）",
                                     task_id,
                                     old,
                                     allowed_workers,
-                                    pre_grow_throughput,
-                                    throughput
+                                    verdict
+                                );
+                            } else {
+                                // Improved：恢复正常倍增，受益规模同步到当前额度。
+                                beneficial_scale = allowed_workers;
+                                log_info!(
+                                    "[adaptive] task {} 软试探成功：{} conns，恢复倍增扩容",
+                                    task_id,
+                                    allowed_workers
                                 );
                             }
-                            RampVerdict::Freeze => {
-                                ramp_frozen = true;
-                                log_info!(
-                                    "[adaptive] task {} ramp freeze at {} conns: throughput \
-                                     {:.0} -> {:.0} B/s (no gain)",
-                                    task_id,
-                                    allowed_workers,
-                                    pre_grow_throughput,
-                                    throughput
-                                );
+                        } else {
+                            match verdict {
+                                RampVerdict::Improved => {
+                                    beneficial_scale = allowed_workers;
+                                }
+                                RampVerdict::Collapse => {
+                                    freeze = FreezeState::Hard;
+                                    let old = allowed_workers;
+                                    allowed_workers = pre_grow_workers.max(1);
+                                    beneficial_scale = beneficial_scale.min(allowed_workers);
+                                    // 多余 worker 完成当前段后经 Done 派工的额度检查
+                                    // 自然退休；进行中的连接与已下数据零丢弃。
+                                    record_domain_conn_cap_persist(
+                                        url,
+                                        allowed_workers as i32,
+                                        db,
+                                    );
+                                    log_info!(
+                                        "[adaptive] task {} ramp collapse rollback: {} -> {} \
+                                         conns, throughput {:.0} -> {:.0} B/s（回滚并记入域名上限）",
+                                        task_id,
+                                        old,
+                                        allowed_workers,
+                                        pre_grow_throughput,
+                                        throughput
+                                    );
+                                }
+                                RampVerdict::Freeze => {
+                                    // 探索期：起步 hint 已被越过时回滚到扩容前规模
+                                    // （多余 worker 自然退休），不写域名缓存。
+                                    // fresh ramp（无 hint 或未越过 hint）停在扩容后规模。
+                                    if start_hint.is_some_and(|h| pre_grow_workers >= h) {
+                                        let old = allowed_workers;
+                                        allowed_workers = pre_grow_workers.max(1);
+                                        beneficial_scale =
+                                            beneficial_scale.min(allowed_workers);
+                                        log_info!(
+                                            "[adaptive] task {} ramp freeze 回滚：{} -> {} \
+                                             （pre_grow≥start_hint，不写域名缓存）",
+                                            task_id,
+                                            old,
+                                            allowed_workers
+                                        );
+                                    }
+                                    freeze = freeze_verdict_next_state(soft_probe_task_used);
+                                    log_info!(
+                                        "[adaptive] task {} ramp freeze at {} conns: throughput \
+                                         {:.0} -> {:.0} B/s (no gain, state={:?})",
+                                        task_id,
+                                        allowed_workers,
+                                        pre_grow_throughput,
+                                        throughput,
+                                        freeze
+                                    );
+                                }
                             }
                         }
                     }
@@ -2394,6 +2821,7 @@ pub async fn run_coordinated_download(
                     //     峰值随时间衰减：启动瞬间的突发窗口（页缓存/链路 burst）
                     //     不该永久钉死参照系。每 tick 乘 RAMP_PEAK_DECAY，惩罚
                     //     检测只需 2 个窗口（4s），衰减对灵敏度无感。
+                    let freeze_for_shrink = !matches!(freeze, FreezeState::Active);
                     peak_throughput *= RAMP_PEAK_DECAY;
                     if throughput > peak_throughput {
                         peak_throughput = throughput;
@@ -2405,7 +2833,7 @@ pub async fn run_coordinated_download(
                             allowed_workers,
                             worker_cap,
                             alive,
-                            ramp_frozen,
+                            freeze_for_shrink,
                             awaiting_ramp_eval,
                         )
                     {
@@ -2414,7 +2842,12 @@ pub async fn run_coordinated_download(
                             shrink_strikes = 0;
                             let old = allowed_workers;
                             allowed_workers = (allowed_workers / 2).max(1);
+                            beneficial_scale = beneficial_scale.min(allowed_workers);
                             shrunk_this_tick = true;
+                            // Soft 期间触发 shrink → 升级 Hard（服务器在劣化，停止试探）。
+                            if matches!(freeze, FreezeState::Soft { .. }) {
+                                freeze = FreezeState::Hard;
+                            }
                             log_info!(
                                 "[adaptive] task {} sustained degradation shrink: {} -> {} \
                                  conns, throughput {:.0} B/s < peak {:.0} × {:.2}",
@@ -2431,11 +2864,8 @@ pub async fn run_coordinated_download(
                     }
 
                     // 3.+4. 补充与扩容（顺序敏感）：先把存活数补齐到当前额度，
-                    //    再用【补齐后】的存活数判定扩容，扩容成功后立刻补充新增
-                    //    额度——旧实现先判扩容后补充，启动期 alive < allowed 恒使
-                    //    扩容门失败，每次翻倍白等一个完整评估窗（实测 2s）。扩容
-                    //    每 tick 至多一次，评估节奏（awaiting_ramp_eval）、尾部
-                    //    冻结与收缩语义不变。
+                    //    再用【补齐后】的存活数判定扩容/软试探，扩容成功后立刻
+                    //    补充新增额度。扩容每 tick 至多一次。
                     let mut expanded_this_tick = false;
                     loop {
                         // 按额度补充 worker：与 Done 派工同一逻辑（Pending 优先，
@@ -2476,24 +2906,57 @@ pub async fn run_coordinated_download(
                             alive += 1;
                         }
 
-                        // 扩容决策：未冻结、无连接敏感信号、补充后额度已用满、
-                        // 未达上限、本 tick 未收缩、未扩容过、非尾部。
-                        if expanded_this_tick
-                            || tail
-                            || !should_expand(
-                                ramp_frozen,
-                                conn_sensitive.load(Ordering::Relaxed),
-                                alive,
-                                allowed_workers,
-                                worker_cap,
-                                shrunk_this_tick,
-                            )
-                        {
+                        if expanded_this_tick || tail || shrunk_this_tick {
+                            break;
+                        }
+
+                        // 软冻结 +1 试探（评估/shrink 之后、正常倍增之前）。
+                        if soft_probe_ready(
+                            freeze,
+                            tail,
+                            range_ok,
+                            serial_mode,
+                            conn_sensitive.load(Ordering::Relaxed),
+                            reject_strikes,
+                            alive,
+                            allowed_workers,
+                            worker_cap,
+                            soft_probe_task_used,
+                        ) {
+                            pre_grow_throughput = throughput;
+                            pre_grow_workers = allowed_workers;
+                            awaiting_ramp_eval = true;
+                            probe_window = true;
+                            soft_probe_task_used =
+                                soft_probe_task_used.saturating_add(1);
+                            let old = allowed_workers;
+                            allowed_workers = (allowed_workers + 1).min(worker_cap);
+                            expanded_this_tick = true;
+                            log_info!(
+                                "[adaptive] task {} 软解冻试探：{} -> {}",
+                                task_id,
+                                old,
+                                allowed_workers
+                            );
+                            continue;
+                        }
+
+                        // 正常倍增扩容：仅 Active 时 should_expand 的 frozen=false。
+                        let expand_frozen = !matches!(freeze, FreezeState::Active);
+                        if !should_expand(
+                            expand_frozen,
+                            conn_sensitive.load(Ordering::Relaxed),
+                            alive,
+                            allowed_workers,
+                            worker_cap,
+                            shrunk_this_tick,
+                        ) {
                             break;
                         }
                         pre_grow_throughput = throughput;
                         pre_grow_workers = allowed_workers;
                         awaiting_ramp_eval = true;
+                        probe_window = false;
                         let old = allowed_workers;
                         allowed_workers = (allowed_workers * 2).min(worker_cap);
                         expanded_this_tick = true;
@@ -2522,6 +2985,53 @@ pub async fn run_coordinated_download(
                 }
             }
 
+            // --- UI progress snapshot ------------------------------------
+            // 单点汇总：字段与原 worker 内 200ms 上报完全一致（status=1、
+            // downloaded_bytes = total_downloaded + scope.base、total_bytes 取
+            // total_override 或 planned_total、segment_details 经 map_snapshot）。
+            _ = ui_interval.tick() => {
+                let current_total = total_downloaded.load(Ordering::Relaxed);
+                let snapshot = seg_states
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let report_total = if scope.total_override > 0 {
+                    scope.total_override
+                } else {
+                    planned_total.load(Ordering::Relaxed)
+                };
+                let _ = progress_tx
+                    .send(ProgressUpdate {
+                        task_id: task_id.to_string(),
+                        downloaded_bytes: current_total + scope.base,
+                        total_bytes: report_total,
+                        status: 1,
+                        error_message: String::new(),
+                        file_name: String::new(),
+                        segment_details: Some(scope.map_snapshot(snapshot)),
+                        ..Default::default()
+                    })
+                    .await;
+            }
+
+            // --- Durable segment progress batch flush --------------------
+            // 抽干 worker 侧 durable 水位，过滤 Completed/未知段后一次事务批量写。
+            // 完成写仍由 worker 覆盖 fsync 后立即落库，不经本通道。
+            _ = db_flush_interval.tick() => {
+                let rows = take_durable_progress_rows(&durable_progress, &segments);
+                if !rows.is_empty()
+                    && let Err(e) = db
+                        .update_segments_progress_batch(task_id, spawn_gen, &rows)
+                        .await
+                {
+                    log_info!(
+                        "[coordinator] task {} durable batch flush failed (non-fatal): {}",
+                        task_id,
+                        e
+                    );
+                }
+            }
+
         }
     }
 
@@ -2529,6 +3039,22 @@ pub async fn run_coordinated_download(
     for handle in &mut worker_handles {
         if let Some(h) = handle.take() {
             let _ = h.await;
+        }
+    }
+
+    // 抽干剩余 durable 水位（循环退出后 interval 不再 tick）。
+    {
+        let rows = take_durable_progress_rows(&durable_progress, &segments);
+        if !rows.is_empty()
+            && let Err(e) = db
+                .update_segments_progress_batch(task_id, spawn_gen, &rows)
+                .await
+        {
+            log_info!(
+                "[coordinator] task {} final durable batch failed (non-fatal): {}",
+                task_id,
+                e
+            );
         }
     }
 
@@ -2573,15 +3099,17 @@ pub async fn run_coordinated_download(
     }
 
     // ----- 9. 正面域名学习 --------------------------------------------------
-    // 任务全程无拒绝/降级/连接敏感信号且以多连接规模真实运行过 → 把实测
-    // 规模记为同域名起步提示（取更高合并，24h TTL）。出现过任何拒绝信号的
-    // 路径绝不记录——那些观察已由负面 cap 面接管。
-    if proven_scale > RAMP_INITIAL_WORKERS
+    // 任务全程无拒绝/降级/连接敏感信号且以多连接规模真实运行过 → 把
+    // proven ∩ beneficial（受益过的规模，而非仅被接受过的规模）记为同域名
+    // 起步提示。Freeze 不回滚场景下 proven 可能棘轮抬升，beneficial 钳制之。
+    // 出现过任何拒绝信号的路径绝不记录——那些观察已由负面 cap 面接管。
+    let hint_scale = beneficial_hint_scale(proven_scale, beneficial_scale);
+    if hint_scale > RAMP_INITIAL_WORKERS
         && reject_strikes == 0
         && !serial_mode
         && !conn_sensitive.load(Ordering::Relaxed)
     {
-        record_domain_conn_hint_persist(url, proven_scale as i32, db);
+        record_domain_conn_hint_persist(url, hint_scale as i32, db);
     }
 
     Ok(effective_total_bytes)
@@ -3441,12 +3969,12 @@ fn spawn_worker(
     total_downloaded: Arc<AtomicI64>,
     seg_states: Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     db: Db,
-    progress_tx: mpsc::Sender<ProgressUpdate>,
     speed_limiter: SpeedLimiter,
     spec: crate::downloader::RequestSpec,
     etag: String,
     last_modified: String,
     sync_gate: FileSyncGate,
+    durable_progress: Arc<StdMutex<HashMap<i32, i64>>>,
     scope: ReportScope,
     spawn_gen: i64,
 ) -> tokio::task::JoinHandle<()> {
@@ -3491,13 +4019,13 @@ fn spawn_worker(
                 size_is_estimate,
                 &first_validators,
                 &db,
-                &progress_tx,
                 &seg_states,
                 &speed_limiter,
                 &spec,
                 &etag,
                 &last_modified,
                 &sync_gate,
+                &durable_progress,
                 scope,
                 spawn_gen,
             )
@@ -3622,17 +4150,19 @@ async fn do_segment_with_retry(
     size_is_estimate: bool,
     first_validators: &StdMutex<Option<(String, String)>>,
     db: &Db,
-    progress_tx: &mpsc::Sender<ProgressUpdate>,
     seg_states: &Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     speed_limiter: &SpeedLimiter,
     spec: &crate::downloader::RequestSpec,
     expected_etag: &str,
     expected_last_modified: &str,
     sync_gate: &FileSyncGate,
+    durable_progress: &StdMutex<HashMap<i32, i64>>,
     scope: ReportScope,
     spawn_gen: i64,
 ) -> Result<i64, DownloadError> {
     let mut attempts = 0u32;
+    // open-ended 首响应 Established 事件 latch：整段重试生命周期内只发一次。
+    let mut open_ended_established_sent = false;
 
     loop {
         match do_segment(
@@ -3649,6 +4179,7 @@ async fn do_segment_with_retry(
             cancel,
             conn_sensitive,
             reconnect_hostile,
+            &mut open_ended_established_sent,
             range_verdict,
             event_tx,
             total_downloaded,
@@ -3656,13 +4187,13 @@ async fn do_segment_with_retry(
             size_is_estimate,
             first_validators,
             db,
-            progress_tx,
             seg_states,
             speed_limiter,
             spec,
             expected_etag,
             expected_last_modified,
             sync_gate,
+            durable_progress,
             scope,
             spawn_gen,
         )
@@ -3784,6 +4315,8 @@ async fn do_segment(
     cancel: &CancellationToken,
     conn_sensitive: &AtomicBool,
     reconnect_hostile: &AtomicBool,
+    // open-ended 首响应 Established 事件 latch（由 with_retry 持有，重试不重发）。
+    open_ended_established_sent: &mut bool,
     // Range 能力裁决（RANGE_VERDICT_*）：仍为 UNKNOWN 时由本函数依据首响应
     // 裁决（206 或 `Accept-Ranges: bytes` → SUPPORTED，否则 UNSUPPORTED），
     // 并经 `event_tx` 通知 coordinator（吸收/放行 ramp）。
@@ -3799,13 +4332,13 @@ async fn do_segment(
     // check_cross_segment_validators。
     first_validators: &StdMutex<Option<(String, String)>>,
     db: &Db,
-    progress_tx: &mpsc::Sender<ProgressUpdate>,
     seg_states: &Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     speed_limiter: &SpeedLimiter,
     spec: &crate::downloader::RequestSpec,
     expected_etag: &str,
     expected_last_modified: &str,
     sync_gate: &FileSyncGate,
+    durable_progress: &StdMutex<HashMap<i32, i64>>,
     scope: ReportScope,
     spawn_gen: i64,
 ) -> Result<i64, DownloadError> {
@@ -4188,6 +4721,14 @@ async fn do_segment(
     // 所有下载器内部不再变更文件名，避免与 manager 的 reserved_temp_paths
     // 协调断裂导致并发冲突（参见 PR #296 自我冲突回归 bug）。
 
+    // open-ended 首响应已通过全部校验、即将读 body：通知 coordinator 立即
+    // 放队（不必等下一个 ramp tick）。latch 保证重试路径不重发。
+    // hint 模式 RangeVerdict 已在上方先发，保证 coordinator 先处理裁决。
+    if open_ended && !*open_ended_established_sent {
+        *open_ended_established_sent = true;
+        let _ = event_tx.send(WorkerEvent::OpenEndedEstablished).await;
+    }
+
     let mut stream = resp.bytes_stream();
 
     let file = OpenOptions::new().write(true).open(dest).await?;
@@ -4198,7 +4739,6 @@ async fn do_segment(
         .await?;
 
     let mut seg_downloaded = actual_start - seg_start;
-    let mut last_report = Instant::now();
     let mut last_db_save = Instant::now();
     // durable_offset：仅记录【已被 fdatasync 覆盖】的偏移，供周期落库使用，以维持
     // BUG-COORD-FSYNC 不变式（"DB 偏移 <= 已持久化字节"）。异常退出/段完成路径不
@@ -4317,44 +4857,15 @@ async fn do_segment(
                         // exclusively owned by the coordinator.
                         update_seg_state(seg_states, seg_idx, seg_downloaded);
 
-                        // If we truncated the chunk, we hit the boundary.
+                        // 边界截断：仅 flush 页缓存，DB 满段写统一走循环后完成路径
+                        // （覆盖式 fdatasync → update_segment_progress_bounded），
+                        // 避免「环内先写 DB、fsync 在 break 后」违反 BUG-COORD-FSYNC。
                         if write_len < bytes.len() {
                             boundary_reached = true;
                             file.flush().await?;
-                            let _ = db
-                                .update_segment_progress_bounded(
-                                    task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
-                                )
-                                .await;
                             break;
                         }
 
-                        // --- Progress report to Dart ---
-                        if last_report.elapsed().as_millis() >= UI_REPORT_INTERVAL_MS {
-                            let current_total = total_downloaded.load(Ordering::Relaxed);
-                            let snapshot = seg_states
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .clone();
-                            let report_total = if scope.total_override > 0 {
-                                scope.total_override
-                            } else {
-                                planned_total.load(Ordering::Relaxed)
-                            };
-                            let _ = progress_tx
-                                .send(ProgressUpdate {
-                                    task_id: task_id.to_string(),
-                                    downloaded_bytes: current_total + scope.base,
-                                    total_bytes: report_total,
-                                    status: 1,
-                                    error_message: String::new(),
-                                    file_name: String::new(),
-                                    segment_details: Some(scope.map_snapshot(snapshot)),
-                                    ..Default::default()
-                                })
-                                .await;
-                            last_report = Instant::now();
-                        }
 
                         // --- DB persistence (periodic) ---
                         // 落库前必须保证偏移已 fdatasync 落盘：DB 记录的偏移是 resume
@@ -4372,6 +4883,7 @@ async fn do_segment(
                             let snap = seg_downloaded;
                             let snap_t = Instant::now();
                             let synced_start = sync_gate.sync_if_stale(file.get_ref()).await?;
+                            let prev_durable = durable_offset;
                             if synced_start >= snap_t {
                                 // fsync 起始于本快照之后 → snap 全部已持久化。
                                 durable_offset = snap;
@@ -4386,11 +4898,13 @@ async fn do_segment(
                                 }
                                 pending_snap = Some((snap, snap_t));
                             }
-                            let _ = db
-                                .update_segment_progress_bounded(
-                                    task_id, seg_idx, durable_offset, seg_start, spawn_gen,
-                                )
-                                .await;
+                            // 仅在 durable 水位推进时写入汇聚表；coordinator 批量落库。
+                            if durable_offset != prev_durable {
+                                durable_progress
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .insert(seg_idx, durable_offset);
+                            }
                             last_db_save = Instant::now();
                         }
                     }
@@ -4411,13 +4925,14 @@ async fn do_segment(
         }
     }
 
-    file.flush().await?;
-    // 段写入完成后、落库标记 Completed 前做 fdatasync，确保数据真正落盘。
+    // 段完成态落库前必须有覆盖式 fdatasync（BUG-COORD-FSYNC）：
     // coordinator 把 Completed 段视为永久完成、resume 时绝不重取——若此处不
-    // 持久化，崩溃/掉电后会留下 "DB 完成但磁盘为 0" 的空洞且通过完整性检查
-    // （BUG-COORD-FSYNC）。放在下方 fadvise(DONTNEED) 之前，使已落盘的干净页
-    // 可被安全丢弃。同时覆盖紧随其后的截断分支落库（2164 行附近）。
-    file.get_ref().sync_data().await?;
+    // 持久化，崩溃/掉电后会留下 "DB 完成但磁盘为 0" 的空洞且通过完整性检查。
+    // 合并闸把尾部多段同时完成的 fsync 风暴收敛为少数几次整盘刷。
+    // 放在下方 fadvise(DONTNEED) 之前，使已落盘的干净页可被安全丢弃。
+    file.flush().await?;
+    let snap_t = Instant::now();
+    sync_gate.sync_covering(file.get_ref(), snap_t).await?;
 
     // --- Truncation / short-read detection ---------------------------------
     // 若循环并非因抵达段边界而退出（boundary_reached == false），且未被取消，
@@ -4523,13 +5038,15 @@ fn update_seg_state(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        FileSyncGate, LiveSegment, MAX_SEGMENTS, MIN_SPLIT_BYTES, MIN_SYNC_GAP, RampVerdict,
-        SegState, TAIL_MIN_SPLIT_BYTES, all_done, build_seg_state_vec,
-        check_cross_segment_validators, conn_cap_cache, domain_conn_hint, dynamic_min_split_bytes,
-        extract_host, find_next_pending_only, find_next_work, initial_allowed_workers,
+        FileSyncGate, FreezeState, HINT_UNCAP_MAX, LiveSegment, MAX_SEGMENTS, MIN_SPLIT_BYTES,
+        MIN_SYNC_GAP, RAMP_SOFT_PROBE_COOLDOWN_TICKS, RAMP_SOFT_PROBE_MAX_ATTEMPTS,
+        RAMP_SOFT_PROBE_TASK_BUDGET, RampVerdict, SegState, TAIL_MIN_SPLIT_BYTES, all_done,
+        beneficial_hint_scale, build_seg_state_vec, check_cross_segment_validators, conn_cap_cache,
+        domain_conn_hint, dynamic_min_split_bytes, extract_host, find_next_pending_only,
+        find_next_work, freeze_verdict_next_state, hint_uncap_ceiling, initial_allowed_workers,
         is_single_conn_domain, is_tail, ramp_verdict, rebuild_seg_states, record_domain_conn_cap,
-        record_domain_conn_hint, should_expand, should_shrink, try_proactive_split,
-        try_split_largest, validate_coverage,
+        record_domain_conn_hint, should_expand, should_shrink, soft_probe_eval_transition,
+        soft_probe_ready, try_proactive_split, try_split_largest, validate_coverage,
     };
     use crate::downloader::{DownloadError, SegmentProgressInfo, is_server_rejection};
     use std::collections::BTreeMap;
@@ -5980,5 +6497,268 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // FileSyncGate::sync_covering（覆盖式 fdatasync）
+    // -----------------------------------------------------------------------
+
+    /// 返回值恒 ≥ snap_t：多次调用、穿插写入后仍成立。
+    #[tokio::test]
+    async fn sync_covering_returns_start_ge_snap_t() {
+        use tokio::io::AsyncWriteExt;
+        let (path, mut file) = open_sync_gate_test_file().await;
+        let gate = FileSyncGate::new();
+
+        for i in 0..3u8 {
+            file.write_all(&[i]).await.expect("write");
+            file.flush().await.expect("flush");
+            let snap_t = std::time::Instant::now();
+            let s = gate
+                .sync_covering(&file, snap_t)
+                .await
+                .expect("sync_covering");
+            assert!(
+                s >= snap_t,
+                "覆盖式 fsync 起始时刻必须 ≥ snap_t；s={s:?} snap_t={snap_t:?}"
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 新鲜覆盖复用：T0 sync 后以 snap_t < T0 调用返回同一 T0。
+    #[tokio::test]
+    async fn sync_covering_reuses_completed_start_when_fresh() {
+        let (path, file) = open_sync_gate_test_file().await;
+        let gate = FileSyncGate::new();
+
+        let before = std::time::Instant::now();
+        let t0 = gate
+            .sync_covering(&file, before)
+            .await
+            .expect("first covering sync");
+
+        // snap_t 取在 T0 之前 → 已有覆盖，必须复用 T0，不触发新 fsync。
+        let s = gate
+            .sync_covering(&file, before)
+            .await
+            .expect("reuse covering sync");
+        assert_eq!(
+            s, t0,
+            "snap_t ≤ last_completed_start 时必须复用同一起始时刻"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 过期强制：snap_t > last S 时必产生新 S ≥ snap_t（不受 MIN_SYNC_GAP 阻挡）。
+    #[tokio::test]
+    async fn sync_covering_forces_new_sync_ignoring_min_gap() {
+        let (path, file) = open_sync_gate_test_file().await;
+        let gate = FileSyncGate::new();
+
+        let before = std::time::Instant::now();
+        let s1 = gate
+            .sync_covering(&file, before)
+            .await
+            .expect("first covering sync");
+
+        // 仍在 MIN_SYNC_GAP 内；sync_if_stale 会复用，但 covering 必须以更新的
+        // snap_t 强制推进。
+        let snap_t = std::time::Instant::now();
+        assert!(snap_t > s1, "测试前提：snap_t 必须严格晚于 s1");
+        let s2 = gate
+            .sync_covering(&file, snap_t)
+            .await
+            .expect("forced covering sync");
+        assert!(
+            s2 >= snap_t && s2 > s1,
+            "snap_t > last S 时必须无视 MIN_SYNC_GAP 产生新的覆盖 fsync；\
+             s1={s1:?} s2={s2:?} snap_t={snap_t:?}"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // -----------------------------------------------------------------------
+    // hint_uncap_ceiling（hint 解封天花板）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hint_uncap_ceiling_table() {
+        // allow=false → base
+        assert_eq!(hint_uncap_ceiling(false, None, Some(16), 16), 16);
+        // 负面 cap 存在 → base（含单连接）
+        assert_eq!(hint_uncap_ceiling(true, Some(1), Some(16), 16), 16);
+        assert_eq!(hint_uncap_ceiling(true, Some(8), Some(16), 16), 16);
+        // hint None → base
+        assert_eq!(hint_uncap_ceiling(true, None, None, 16), 16);
+        // hint=16, base=16 → 32
+        assert_eq!(hint_uncap_ceiling(true, None, Some(16), 16), 32);
+        // hint=40, base=16 → ×2=80 被 HINT_UNCAP_MAX 钳
+        assert_eq!(
+            hint_uncap_ceiling(true, None, Some(40), 16),
+            HINT_UNCAP_MAX.min(MAX_SEGMENTS as usize)
+        );
+        // hint=4, base=16 → ×2=8 < base → 保持 16
+        assert_eq!(hint_uncap_ceiling(true, None, Some(4), 16), 16);
+    }
+
+    // -----------------------------------------------------------------------
+    // 软冻结试探就绪 / 转移（结构上无域名缓存写入分支）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn soft_probe_ready_guards() {
+        let soft = FreezeState::Soft {
+            ticks_waited: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            attempts: 0,
+        };
+        // 健康路径就绪
+        assert!(soft_probe_ready(
+            soft, false, true, false, false, 0, 8, 8, 16, 0
+        ));
+        // tail 短路
+        assert!(!soft_probe_ready(
+            soft, true, true, false, false, 0, 8, 8, 16, 0
+        ));
+        // Active 不试探
+        assert!(!soft_probe_ready(
+            FreezeState::Active,
+            false,
+            true,
+            false,
+            false,
+            0,
+            8,
+            8,
+            16,
+            0
+        ));
+        // Hard 不试探
+        assert!(!soft_probe_ready(
+            FreezeState::Hard,
+            false,
+            true,
+            false,
+            false,
+            0,
+            8,
+            8,
+            16,
+            0
+        ));
+        // 冷却未到
+        let cooling = FreezeState::Soft {
+            ticks_waited: 3,
+            cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            attempts: 0,
+        };
+        assert!(!soft_probe_ready(
+            cooling, false, true, false, false, 0, 8, 8, 16, 0
+        ));
+        // 任务预算耗尽
+        assert!(!soft_probe_ready(
+            soft,
+            false,
+            true,
+            false,
+            false,
+            0,
+            8,
+            8,
+            16,
+            RAMP_SOFT_PROBE_TASK_BUDGET
+        ));
+        // attempts 已达上限
+        let exhausted = FreezeState::Soft {
+            ticks_waited: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            attempts: RAMP_SOFT_PROBE_MAX_ATTEMPTS,
+        };
+        assert!(!soft_probe_ready(
+            exhausted, false, true, false, false, 0, 8, 8, 16, 0
+        ));
+    }
+
+    /// 噪声谷：一次 Freeze → 冷却后 +1 Improved → 恢复 Active。
+    /// 转移函数不含写缓存分支——试探失败零域名缓存写入由结构保证。
+    #[test]
+    fn soft_probe_noise_valley_recovers() {
+        let (s1, rb1) =
+            soft_probe_eval_transition(RampVerdict::Freeze, 0, RAMP_SOFT_PROBE_COOLDOWN_TICKS);
+        assert!(rb1);
+        assert_eq!(
+            s1,
+            FreezeState::Soft {
+                ticks_waited: 0,
+                cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS * 2,
+                attempts: 1,
+            }
+        );
+        let (s2, rb2) = soft_probe_eval_transition(
+            RampVerdict::Improved,
+            1,
+            RAMP_SOFT_PROBE_COOLDOWN_TICKS * 2,
+        );
+        assert!(!rb2);
+        assert_eq!(s2, FreezeState::Active);
+    }
+
+    /// 持续劣化：两次试探 Freeze → Hard。
+    #[test]
+    fn soft_probe_two_failures_go_hard() {
+        let (s1, _) =
+            soft_probe_eval_transition(RampVerdict::Freeze, 0, RAMP_SOFT_PROBE_COOLDOWN_TICKS);
+        match s1 {
+            FreezeState::Soft {
+                attempts, cooldown, ..
+            } => {
+                let (s2, rb2) = soft_probe_eval_transition(RampVerdict::Freeze, attempts, cooldown);
+                assert!(rb2);
+                assert_eq!(s2, FreezeState::Hard);
+            }
+            other => panic!("expected Soft after first freeze, got {other:?}"),
+        }
+    }
+
+    /// 试探窗 Collapse → Hard（不写域名缓存，转移函数无副作用）。
+    #[test]
+    fn soft_probe_collapse_goes_hard_no_cache() {
+        let (s, rb) =
+            soft_probe_eval_transition(RampVerdict::Collapse, 0, RAMP_SOFT_PROBE_COOLDOWN_TICKS);
+        assert!(rb);
+        assert_eq!(s, FreezeState::Hard);
+    }
+
+    /// 任务软试探预算耗尽后 Freeze verdict 直接 Hard。
+    #[test]
+    fn freeze_verdict_budget_exhausted_hard() {
+        assert_eq!(
+            freeze_verdict_next_state(RAMP_SOFT_PROBE_TASK_BUDGET),
+            FreezeState::Hard
+        );
+        assert_eq!(
+            freeze_verdict_next_state(0),
+            FreezeState::Soft {
+                ticks_waited: 0,
+                cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+                attempts: 0,
+            }
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // beneficial_hint_scale
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn beneficial_hint_scale_min_convergence() {
+        assert_eq!(beneficial_hint_scale(16, 8), 8);
+        assert_eq!(beneficial_hint_scale(8, 16), 8);
+        assert_eq!(beneficial_hint_scale(12, 12), 12);
+        assert_eq!(beneficial_hint_scale(0, 8), 0);
     }
 }

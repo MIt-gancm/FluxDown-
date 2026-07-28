@@ -2801,6 +2801,9 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         .await;
         // summary 事件需要在多段下载结束后读取节点贡献统计。
         let nodes_for_summary = nodes.clone();
+        // hint 解封仅 Auto 默认档：用户显式段数或自定义 auto_max 时尊重其天花板。
+        let allow_hint_uncap = p.segment_count <= 0
+            && p.auto_max_connections == crate::download_manager::DEFAULT_AUTO_MAX_CONNECTIONS;
         let ms_outcome = download_multi_segment(
             &p.task_id,
             &p.url,
@@ -2818,6 +2821,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             &resume_etag,
             &resume_last_modified,
             p.spawn_gen,
+            allow_hint_uncap,
         )
         .await;
 
@@ -3738,6 +3742,7 @@ async fn download_multi_segment(
     etag: &str,
     last_modified: &str,
     spawn_gen: i64,
+    allow_hint_uncap: bool,
 ) -> Result<i64, DownloadError> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -3774,6 +3779,7 @@ async fn download_multi_segment(
         last_modified,
         crate::segment_coordinator::ReportScope::whole_task(),
         spawn_gen,
+        allow_hint_uncap,
     )
     .await
 }

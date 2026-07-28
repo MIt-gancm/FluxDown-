@@ -345,7 +345,11 @@ async fn subscribing_fetches_immediately_without_waiting_for_a_tick() {
     // 注意：全程**没有** tick_rss_sources()。
     drain_one_rss_event(&mut engine, &mut rss_rx).await;
 
-    assert_eq!(feed_hits.load(Ordering::SeqCst), 1, "subscribe → fetch once");
+    assert_eq!(
+        feed_hits.load(Ordering::SeqCst),
+        1,
+        "subscribe → fetch once"
+    );
     let items = engine
         .db
         .load_rss_items(&source_id, 100)
@@ -353,7 +357,12 @@ async fn subscribing_fetches_immediately_without_waiting_for_a_tick() {
         .expect("items");
     assert_eq!(items.len(), 2, "首轮历史条目应当已经在库里");
     assert!(
-        engine.manager.rss.source(&source_id).expect("source").seeded,
+        engine
+            .manager
+            .rss
+            .source(&source_id)
+            .expect("source")
+            .seeded,
         "首轮抓完即播种完成"
     );
 

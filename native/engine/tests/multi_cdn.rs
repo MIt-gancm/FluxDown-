@@ -259,6 +259,7 @@ async fn run_with_pool(
         "",
         ReportScope::whole_task(),
         0,
+        false,
     )
     .await;
     drop(tx);

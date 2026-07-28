@@ -91,7 +91,7 @@ const DEFAULT_MAX_TASK_AUTO_RETRIES: i32 = 3;
 /// 语义：advisor 推荐值经此裁剪——`effective = min(advisor, cap)`。
 /// 默认 16 而非 advisor 的绝对上限 64：避免对连接敏感的服务器/CDN 上来就
 /// 32/64 并发触发风控；需要更高并发的用户可在设置中显式调大。
-const DEFAULT_AUTO_MAX_CONNECTIONS: i32 = 16;
+pub(crate) const DEFAULT_AUTO_MAX_CONNECTIONS: i32 = 16;
 
 /// 自动重试基础延迟（秒）的默认值。实际延迟 = base × attempt，即 5s / 10s / 15s 递增。
 ///

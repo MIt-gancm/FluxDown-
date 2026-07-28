@@ -1463,6 +1463,43 @@ impl Db {
         Ok(())
     }
 
+    /// 批量段进度写入（单事务）：每行复用 [`Self::update_segment_progress_bounded`]
+    /// 的 WHERE 守卫语义（epoch 存在性 + `start_byte` 匹配 + 段长钳制）。
+    ///
+    /// `rows` 为 `(segment_index, downloaded_bytes, start_byte)`；空切片为 no-op。
+    /// coordinator 周期/退出抽干 durable 水位时调用；完成写仍走单行 bounded。
+    pub(crate) async fn update_segments_progress_batch(
+        &self,
+        task_id: &str,
+        epoch: i64,
+        rows: &[(i32, i64, i64)],
+    ) -> Result<(), DbError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for (seg_idx, dl_bytes, start_byte) in rows {
+            sqlx::query(
+                "UPDATE task_segments SET downloaded_bytes = CASE
+                     WHEN $1 > end_byte - start_byte + 1 THEN end_byte - start_byte + 1
+                     WHEN downloaded_bytes > $1 THEN downloaded_bytes
+                     ELSE $1 END
+                 WHERE task_id = $2 AND segment_index = $3 AND start_byte = $4
+                   AND EXISTS (SELECT 1 FROM tasks WHERE id = $5 AND segments_epoch = $6)",
+            )
+            .bind(*dl_bytes)
+            .bind(task_id)
+            .bind(*seg_idx)
+            .bind(*start_byte)
+            .bind(task_id)
+            .bind(epoch)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Flush final downloaded_bytes for all segments in a single transaction.
     /// Used by the coordinator after download completes to ensure DB reflects
     /// the authoritative in-memory state (capped to segment size, no overshoot).
@@ -4864,6 +4901,63 @@ mod tests {
         assert_eq!(
             segs[1].downloaded_bytes, 0,
             "start_byte-mismatched write must affect zero rows"
+        );
+
+        close_test_db(&db, dir).await;
+    }
+
+    /// 批量段进度：多行一次事务写回；epoch 不匹配 0 生效；空批 no-op。
+    #[tokio::test]
+    async fn update_segments_progress_batch_writes_and_guards_epoch() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "batch1").await;
+        db.insert_segments("batch1", &[(0, 0, 999), (1, 1000, 1999), (2, 2000, 2999)])
+            .await
+            .expect("insert segments");
+        db.set_segments_epoch("batch1", 3).await.expect("set epoch");
+
+        // 空批：no-op，不报错。
+        db.update_segments_progress_batch("batch1", 3, &[])
+            .await
+            .expect("empty batch");
+
+        // 当前 epoch 批量写：生效且段长钳制。
+        db.update_segments_progress_batch(
+            "batch1",
+            3,
+            &[(0, 500, 0), (1, 5000, 1000), (2, 100, 2000)],
+        )
+        .await
+        .expect("batch write");
+        let segs = db.load_segments("batch1").await.expect("load");
+        assert_eq!(segs[0].downloaded_bytes, 500);
+        assert_eq!(
+            segs[1].downloaded_bytes, 1000,
+            "must clamp to segment span (1000)"
+        );
+        assert_eq!(segs[2].downloaded_bytes, 100);
+
+        // 旧 epoch：0 行生效，水位保持。
+        db.update_segments_progress_batch("batch1", 1, &[(0, 900, 0)])
+            .await
+            .expect("stale epoch batch");
+        let segs = db.load_segments("batch1").await.expect("load after stale");
+        assert_eq!(
+            segs[0].downloaded_bytes, 500,
+            "stale-epoch batch must affect zero rows"
+        );
+
+        // start_byte 错位：0 行生效。
+        db.update_segments_progress_batch("batch1", 3, &[(1, 200, 999)])
+            .await
+            .expect("mismatched start batch");
+        let segs = db
+            .load_segments("batch1")
+            .await
+            .expect("load after mismatch");
+        assert_eq!(
+            segs[1].downloaded_bytes, 1000,
+            "start_byte-mismatched batch row must affect zero rows"
         );
 
         close_test_db(&db, dir).await;
