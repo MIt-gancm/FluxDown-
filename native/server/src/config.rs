@@ -1,4 +1,4 @@
-//! 服务器启动配置（环境变量）与首次运行初始化（token 生成）。
+//! 服务器启动配置（环境变量）与首次运行初始化（访问密钥）。
 //!
 //! | 环境变量 | 含义 | 默认 |
 //! |---|---|---|
@@ -6,9 +6,15 @@
 //! | `FLUXDOWN_DATABASE_URL` | 数据库连接 URL（`sqlite:`/`postgres:`） | 数据目录下 SQLite |
 //! | `FLUXDOWN_BIND` | HTTP 监听地址 | `0.0.0.0:17800` |
 //! | `FLUXDOWN_WEBROOT` | SPA 静态资源目录 | 二进制同级 `./web` |
+//! | `FLUXDOWN_TOKEN` | 预置管理访问密钥（仅在库中尚未设置时采纳） | 未设置（走 Web 向导） |
 //! | `FLUXDOWN_DEMO` | 演示模式：仅允许下载内置本地演示文件 | 未设置（关闭） |
 //! | `FLUXDOWN_DEMO_URL` | 演示模式：仅允许下载该 URL（覆盖内置） | 未设置（关闭） |
 //! | `FLUXDOWN_LANG` | Web UI 默认语言（`en`/`zh`），设置页保存过语言后以保存值为准 | 未设置（回退浏览器语言） |
+//!
+//! **访问密钥不再自动生成**：NAS（群晖/QNAP/Unraid）用户看不到容器 stderr，
+//! 一次性打印的密钥等于把人锁在门外。库中无密钥时服务器进入「待设置」状态
+//! （管理 API 全线 403），由 Web 首次运行向导 `POST /api/v1/setup` 落定；
+//! 无人值守部署用 `FLUXDOWN_TOKEN` 预置。
 
 use std::path::PathBuf;
 
@@ -146,10 +152,57 @@ pub fn default_save_dir() -> String {
     ".".to_string()
 }
 
-/// 首次运行初始化：强制开启管理 API；token 为空则生成并持久化。
+/// 访问密钥最短长度。
+pub const ACCESS_KEY_MIN_LEN: usize = 8;
+/// 访问密钥最长长度：既防误粘整段文本，也保证能原样塞进 HTTP 头。
+pub const ACCESS_KEY_MAX_LEN: usize = 128;
+
+/// 校验用户设定的访问密钥（管理 token）。
 ///
-/// 返回生效的管理 token。新生成的 token 会打印到 stderr（headless 部署
-/// 唯一一次可见的机会）。
+/// 规则与 Web 端 `web/src/lib/token-policy.ts` **逐条对齐**——两侧不一致会让
+/// 前端放行、后端拒收，首次运行向导直接卡死。返回的 `Err` 是稳定英文 wire
+/// 契约，Web 端经 `translateBackendMessage` 本地化。
+///
+/// 单测见本文件 `access_key_tests`（bin crate 不跑 doctest，故不写 Examples）。
+pub fn validate_access_key(key: &str) -> Result<(), &'static str> {
+    if !key.chars().all(|c| c.is_ascii_graphic()) {
+        return Err("access key must not contain spaces or non-ASCII characters");
+    }
+    if key.len() < ACCESS_KEY_MIN_LEN {
+        return Err("access key must be at least 8 characters");
+    }
+    if key.len() > ACCESS_KEY_MAX_LEN {
+        return Err("access key must be at most 128 characters");
+    }
+    if !key.bytes().any(|b| b.is_ascii_alphabetic()) || !key.bytes().any(|b| b.is_ascii_digit()) {
+        return Err("access key must contain both letters and digits");
+    }
+    Ok(())
+}
+
+/// 生成一个满足 [`validate_access_key`] 的随机访问密钥（`fxd_` + 32 位十六进制）。
+///
+/// 循环重试的唯一目的是兜住「32 位十六进制恰好全是数字」这种小概率取值——
+/// 概率约 1e-7，但一旦命中就会生成一个自己都校验不过的密钥。
+#[must_use]
+pub fn generate_access_key() -> String {
+    loop {
+        let key = format!("fxd_{}", uuid::Uuid::new_v4().simple());
+        if validate_access_key(&key).is_ok() {
+            return key;
+        }
+    }
+}
+
+/// 首次运行初始化：强制开启管理 API；返回生效的管理 token（**可能为空**）。
+///
+/// 空 token = 尚未完成首次设置。此时管理 API 全线 403（见
+/// [`fluxdown_api::auth::check_management_auth`]），Web 界面会进入
+/// 「设置访问密钥」向导（`POST /api/v1/setup`）。
+///
+/// 不再自动生成 token 并打印到 stderr：NAS（群晖/QNAP/Unraid）用户拿不到
+/// 容器/套件的 stderr，一次性打印的密钥等于永久锁在门外。无人值守部署
+/// （docker-compose / k8s / CI）可用 `FLUXDOWN_TOKEN` 预置密钥跳过向导。
 pub async fn ensure_server_config(db: &Db) -> Result<String, fluxdown_engine::db::DbError> {
     // headless 服务器的存在意义就是远程管理——管理 API 恒开。
     db.set_config("local_server_api_enabled", "true").await?;
@@ -166,15 +219,39 @@ pub async fn ensure_server_config(db: &Db) -> Result<String, fluxdown_engine::db
     if !token.is_empty() {
         return Ok(token);
     }
-    let token = format!("fxd_{}", uuid::Uuid::new_v4().simple());
-    db.set_config("local_server_token", &token).await?;
-    log_info!("[server] generated management token: {}", token);
+
+    let Some(preset) = std::env::var("FLUXDOWN_TOKEN")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    else {
+        return Ok(String::new());
+    };
+    if let Err(why) = validate_access_key(&preset) {
+        log_info!("[server] FLUXDOWN_TOKEN rejected: {}", why);
+        eprintln!("FLUXDOWN_TOKEN 不符合密钥要求（{why}），已忽略；请在 Web 界面完成首次设置。");
+        return Ok(String::new());
+    }
+    db.set_config("local_server_token", &preset).await?;
+    log_info!("[server] management token adopted from FLUXDOWN_TOKEN");
+    Ok(preset)
+}
+
+/// 首次运行横幅：引导用户去 Web 界面设定访问密钥。
+///
+/// `bind` 形如 `0.0.0.0:17800`；通配地址对用户无意义，替换成 `<服务器 IP>`。
+pub fn print_setup_banner(bind: &str) {
+    let port = bind.rsplit(':').next().unwrap_or("17800");
     eprintln!("==============================================================");
-    eprintln!("  FluxDown Server 首次运行，已生成管理 token：");
-    eprintln!("    {token}");
-    eprintln!("  用它登录 Web 界面 / 调用管理 API（Authorization: Bearer）。");
+    eprintln!("  FluxDown Server: first run — no access key is set yet.");
+    eprintln!("  Open the Web UI and create one:");
+    eprintln!("    http://<server-ip>:{port}/");
+    eprintln!("  Requirements: 8+ characters, letters and digits.");
+    eprintln!("  Unattended deploys can preset it via FLUXDOWN_TOKEN.");
+    eprintln!("  ---");
+    eprintln!("  首次运行：尚未设置访问密钥。请打开上面的 Web 界面自行设置");
+    eprintln!("  （至少 8 位，必须同时包含字母和数字）。");
     eprintln!("==============================================================");
-    Ok(token)
 }
 
 #[cfg(test)]
@@ -254,5 +331,60 @@ mod builtin_tests {
         for v in ["0", "false", "off", "", "  "] {
             assert!(!flag_truthy(v), "{v:?} should be falsy");
         }
+    }
+}
+
+#[cfg(test)]
+mod access_key_tests {
+    use super::{ACCESS_KEY_MAX_LEN, generate_access_key, validate_access_key};
+
+    #[test]
+    fn accepts_mixed_alphanumeric_of_min_length() {
+        for v in ["flux2026", "fxd_1a2b3c4d", "Aa1!@#$%^&*()"] {
+            assert!(validate_access_key(v).is_ok(), "{v:?} should pass");
+        }
+    }
+
+    #[test]
+    fn rejects_too_short_or_too_long() {
+        assert_eq!(
+            validate_access_key("abc123"),
+            Err("access key must be at least 8 characters")
+        );
+        assert_eq!(
+            validate_access_key(""),
+            Err("access key must be at least 8 characters")
+        );
+        let long = format!("a1{}", "x".repeat(ACCESS_KEY_MAX_LEN));
+        assert_eq!(
+            validate_access_key(&long),
+            Err("access key must be at most 128 characters")
+        );
+    }
+
+    #[test]
+    fn rejects_letters_only_or_digits_only() {
+        let want = Err("access key must contain both letters and digits");
+        assert_eq!(validate_access_key("allletters"), want);
+        assert_eq!(validate_access_key("1234567890"), want);
+        // 纯符号同样缺字母和数字。
+        assert_eq!(validate_access_key("!@#$%^&*"), want);
+    }
+
+    #[test]
+    fn rejects_whitespace_and_non_ascii() {
+        let want = Err("access key must not contain spaces or non-ASCII characters");
+        // 空白会在 HTTP 头/命令行里被静默吞掉，落库前就挡住。
+        assert_eq!(validate_access_key("flux 2026"), want);
+        assert_eq!(validate_access_key(" flux2026"), want);
+        assert_eq!(validate_access_key("flux2026\n"), want);
+        assert_eq!(validate_access_key("密钥12345678"), want);
+    }
+
+    #[test]
+    fn generated_key_satisfies_policy() {
+        let key = generate_access_key();
+        assert!(key.starts_with("fxd_"));
+        assert_eq!(validate_access_key(&key), Ok(()));
     }
 }

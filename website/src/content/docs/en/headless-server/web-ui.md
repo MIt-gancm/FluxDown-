@@ -9,7 +9,7 @@ Once the server is running (see [Server Setup](/docs/en/headless-server/setup/))
 
 ## Signing in
 
-The login screen asks for a **server address** (pre-filled with the current origin — leave it as-is unless you're pointing at a different host) and an **access token**. Get the token from the server's first-run console output or from **Settings → Security & Access** (see [Server Setup](/docs/en/headless-server/setup/)).
+The login screen asks for a **server address** (pre-filled with the current origin — leave it as-is unless you're pointing at a different host) and an **access token**. On first run — when the server has not set a key yet — the page becomes an initialization wizard: set and confirm an access key (you can also generate one at random). Once a key exists, you get the normal sign-in form. The token is the key you chose during initialization, or the one shown under **Settings → Security & Access** (see [Server Setup](/docs/en/headless-server/setup/)).
 
 Checking **"Remember this device"** stores the token in `localStorage` (persists across browser restarts); leaving it unchecked stores it in `sessionStorage` (cleared when the tab closes). Nothing is ever sent anywhere except to the server itself.
 

@@ -434,7 +434,7 @@
     "dl.archLabel": "CPU 架构",
     "dl.downloadNow": "立即下载",
     "dl.dockerDeploy": "Docker 一键部署",
-    "dl.dockerHint": "启动后访问 http://localhost:17800，管理 token 在首次启动日志中打印（仅显示一次）。",
+    "dl.dockerHint": "启动后访问 http://localhost:17800，首次打开会引导你自行设置访问密钥（至少 8 位，含字母和数字）。",
     "dl.dockerCopy": "复制",
     "dl.dockerCopied": "已复制！",
     "dl.scoopTitle": "使用 Scoop 安装",

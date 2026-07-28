@@ -618,7 +618,7 @@ async fn download_with_client_header_submits_without_token() {
 
 #[tokio::test]
 async fn download_wrong_token_returns_401() {
-    let server = TestServer::start(MockHost::new(), |c| c.token = "S3CRET".to_string()).await;
+    let server = TestServer::start(MockHost::new(), |c| c.token.set("S3CRET")).await;
     let body = json!({"url": "https://example.com/x.zip"}).to_string();
     let resp = server
         .send(&request(
@@ -693,7 +693,7 @@ async fn jsonrpc_add_uri_creates_task_and_returns_gid() {
 
 #[tokio::test]
 async fn jsonrpc_token_param_prefix_authenticates() {
-    let server = TestServer::start(MockHost::new(), |c| c.token = "S".to_string()).await;
+    let server = TestServer::start(MockHost::new(), |c| c.token.set("S")).await;
     let body = json!({
         "jsonrpc": "2.0", "id": "1", "method": "aria2.addUri",
         "params": ["token:S", ["https://a.com/f.zip"]]
@@ -708,7 +708,7 @@ async fn jsonrpc_token_param_prefix_authenticates() {
 
 #[tokio::test]
 async fn jsonrpc_wrong_token_param_returns_unauthorized() {
-    let server = TestServer::start(MockHost::new(), |c| c.token = "S".to_string()).await;
+    let server = TestServer::start(MockHost::new(), |c| c.token.set("S")).await;
     let body = json!({
         "jsonrpc": "2.0", "id": "1", "method": "aria2.addUri",
         "params": ["token:WRONG", ["https://a.com/f.zip"]]
@@ -922,7 +922,7 @@ async fn jsonrpc_pause_and_remove_use_resolved_task_id_not_gid_prefix() {
 
 #[tokio::test]
 async fn jsonrpc_list_methods_returns_all_36_without_token() {
-    let server = TestServer::start(MockHost::new(), |c| c.token = "S".to_string()).await;
+    let server = TestServer::start(MockHost::new(), |c| c.token.set("S")).await;
     let body = json!({"jsonrpc": "2.0", "id": 1, "method": "system.listMethods", "params": []})
         .to_string();
     // 不带任何 token —— 换成需要鉴权的方法本应 401/code:1，但 listMethods 例外。
@@ -997,7 +997,7 @@ async fn ws_bidirectional_rpc_matches_http_behavior() {
 
 #[tokio::test]
 async fn ws_text_frame_auth_only_trusts_params_token_not_any_header() {
-    let server = TestServer::start(MockHost::new(), |c| c.token = "S3CRET".to_string()).await;
+    let server = TestServer::start(MockHost::new(), |c| c.token.set("S3CRET")).await;
     let mut ws = server.ws_connect().await;
 
     // 无 token：WS 没有逐帧自定义头可依赖，header_token_ok 恒 false。
@@ -1150,7 +1150,7 @@ async fn management_api_returns_403_when_token_unset() {
 #[tokio::test]
 async fn management_api_accepts_bearer_or_x_fluxdown_token_header() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "M-TOKEN".to_string();
+        c.token.set("M-TOKEN");
         c.management_enabled = true;
     })
     .await;
@@ -1190,7 +1190,7 @@ async fn management_api_accepts_bearer_or_x_fluxdown_token_header() {
 async fn list_tasks_returns_camel_case_json_from_host() {
     let host = MockHost::new().with_tasks(vec![sample_task("t1", 1), sample_task("t2", 3)]);
     let server = TestServer::start(host, |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1219,7 +1219,7 @@ async fn list_tasks_filters_by_status_query() {
         sample_task("t3", 1),
     ]);
     let server = TestServer::start(host, |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1244,7 +1244,7 @@ async fn list_tasks_filters_by_status_query() {
 #[tokio::test]
 async fn create_task_returns_task_id_from_host() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1268,7 +1268,7 @@ async fn create_task_returns_task_id_from_host() {
 #[tokio::test]
 async fn create_task_empty_url_returns_400() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1288,7 +1288,7 @@ async fn create_task_empty_url_returns_400() {
 #[tokio::test]
 async fn get_task_not_found_returns_404() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1307,7 +1307,7 @@ async fn get_task_not_found_returns_404() {
 async fn delete_task_passes_delete_files_flag_to_host() {
     let host = MockHost::new().with_tasks(vec![sample_task("t1", 1)]);
     let server = TestServer::start(host, |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1326,7 +1326,7 @@ async fn delete_task_passes_delete_files_flag_to_host() {
 #[tokio::test]
 async fn pause_continue_single_task_by_id() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1355,7 +1355,7 @@ async fn pause_continue_single_task_by_id() {
 #[tokio::test]
 async fn pause_continue_all_static_route_not_swallowed_by_id_route() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1393,7 +1393,7 @@ async fn pause_continue_all_static_route_not_swallowed_by_id_route() {
 async fn list_groups_returns_camel_case_json_from_host() {
     let host = MockHost::new().with_groups(vec![sample_group("g1"), sample_group("g2")]);
     let server = TestServer::start(host, |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1416,7 +1416,7 @@ async fn list_groups_returns_camel_case_json_from_host() {
 #[tokio::test]
 async fn create_group_returns_group_id_and_forwards_items() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1448,7 +1448,7 @@ async fn create_group_returns_group_id_and_forwards_items() {
 #[tokio::test]
 async fn create_group_empty_items_returns_400() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1469,7 +1469,7 @@ async fn create_group_empty_items_returns_400() {
 async fn group_pause_continue_and_delete_by_id() {
     let host = MockHost::new().with_groups(vec![sample_group("g1")]);
     let server = TestServer::start(host, |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1508,7 +1508,7 @@ async fn group_pause_continue_and_delete_by_id() {
 #[tokio::test]
 async fn group_action_on_unknown_id_returns_404() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1541,7 +1541,7 @@ async fn resolve_preview_forwards_request_and_returns_host_response() {
         items: vec![],
     });
     let server = TestServer::start(host, |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1565,7 +1565,7 @@ async fn resolve_preview_forwards_request_and_returns_host_response() {
 #[tokio::test]
 async fn resolve_preview_empty_url_returns_400() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1585,7 +1585,7 @@ async fn resolve_preview_empty_url_returns_400() {
 #[tokio::test]
 async fn groups_endpoints_require_token() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1611,7 +1611,7 @@ async fn groups_endpoints_require_token() {
 #[tokio::test]
 async fn rss_validate_static_route_not_swallowed_by_id_route() {
     let server = TestServer::start(MockHost::new(), |c| {
-        c.token = "T".to_string();
+        c.token.set("T");
         c.management_enabled = true;
     })
     .await;
@@ -1720,7 +1720,7 @@ async fn options_preflight_returns_204_without_cors_header() {
 async fn openapi_spec_served_without_token_when_management_enabled() {
     let server = TestServer::start(MockHost::default(), |c| {
         c.management_enabled = true;
-        c.token = "secret".to_string();
+        c.token.set("secret");
     })
     .await;
     let resp = server

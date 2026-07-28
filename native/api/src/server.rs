@@ -30,7 +30,7 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use crate::auth::{check_management_auth, check_takeover_auth, header_token_ok};
+use crate::auth::{TokenCell, check_management_auth, check_takeover_auth, header_token_ok};
 use crate::jsonrpc::handle_jsonrpc;
 use crate::jsonrpc_ws::run_session;
 use crate::mcp::handle_mcp;
@@ -76,7 +76,8 @@ pub struct ApiServerConfig {
     /// 监听端口（`local_server_port`，默认 17800）。
     pub port: u16,
     /// 鉴权 token（`local_server_token`，空 = 接管/aria2 不鉴权，管理 API 拒绝）。
-    pub token: String,
+    /// 见 [`TokenCell`]：headless 首次运行设置 / 重新生成会原地改写它，无需重启。
+    pub token: TokenCell,
     /// 脚本接管子开关（`local_server_takeover_enabled`，默认 true）。
     pub takeover_enabled: bool,
     /// aria2 兼容子开关（`local_server_jsonrpc_enabled`，默认 true）。
@@ -107,7 +108,11 @@ impl ApiServerConfig {
                 .get("local_server_port")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(17800),
-            token: map.get("local_server_token").cloned().unwrap_or_default(),
+            token: TokenCell::new(
+                map.get("local_server_token")
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            ),
             takeover_enabled: flag("local_server_takeover_enabled", true),
             jsonrpc_enabled: flag("local_server_jsonrpc_enabled", true),
             management_enabled: flag("local_server_api_enabled", false),
@@ -926,7 +931,7 @@ pub(crate) async fn takeover_download(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, msg)) = check_takeover_auth(&headers, &state.config.token) {
+    if let Err((code, msg)) = check_takeover_auth(&headers, &state.config.token.get()) {
         return result_response(status_from(code), false, msg);
     }
     let dl: DownloadRequest = match serde_json::from_slice(&body) {
@@ -956,7 +961,7 @@ pub(crate) async fn takeover_download_batch(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, msg)) = check_takeover_auth(&headers, &state.config.token) {
+    if let Err((code, msg)) = check_takeover_auth(&headers, &state.config.token.get()) {
         return result_response(status_from(code), false, msg);
     }
     match parse_batch(&body) {
@@ -998,8 +1003,9 @@ pub(crate) async fn jsonrpc(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let token_ok = header_token_ok(&headers, &state.config.token);
-    let resp = handle_jsonrpc(state.host.as_ref(), &state.config.token, token_ok, &body).await;
+    let token = state.config.token.get();
+    let token_ok = header_token_ok(&headers, &token);
+    let resp = handle_jsonrpc(state.host.as_ref(), &token, token_ok, &body).await;
     ([(header::CACHE_CONTROL, "no-store")], Json(resp)).into_response()
 }
 
@@ -1011,7 +1017,8 @@ pub(crate) async fn jsonrpc(
 pub(crate) async fn jsonrpc_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| async move {
         let events = state.host.subscribe_task_events();
-        run_session(socket, state.host.as_ref(), &state.config.token, events).await;
+        let token = state.config.token.get();
+        run_session(socket, state.host.as_ref(), &token, events).await;
     })
 }
 
@@ -1036,7 +1043,7 @@ pub(crate) async fn mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if let Err((code, msg)) = check_management_auth(&headers, &state.config.token) {
+    if let Err((code, msg)) = check_management_auth(&headers, &state.config.token.get()) {
         return result_response(status_from(code), false, msg);
     }
     match handle_mcp(state.host.as_ref(), &state.config.app_version, &body).await {
@@ -1052,7 +1059,7 @@ pub(crate) async fn mcp(
 /// 管理 API 统一鉴权入口。`Err` 装箱：`Response` 体积大，避免撑大每个
 /// handler 的返回路径（clippy::result_large_err）。
 fn guard(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    check_management_auth(headers, &state.config.token)
+    check_management_auth(headers, &state.config.token.get())
         .map_err(|(code, msg)| Box::new(result_response(status_from(code), false, msg)))
 }
 
@@ -2005,7 +2012,7 @@ mod tests {
 
         assert!(!cfg.enabled);
         assert_eq!(cfg.port, 9999);
-        assert_eq!(cfg.token, "secret");
+        assert_eq!(&*cfg.token.get(), "secret");
         assert!(!cfg.takeover_enabled);
         assert!(!cfg.jsonrpc_enabled);
         assert!(cfg.management_enabled);

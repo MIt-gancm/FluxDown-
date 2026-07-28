@@ -479,6 +479,14 @@ export interface TokenResponse {
   note: string
 }
 
+/** 首次运行状态（`GET /api/v1/setup/status`，无鉴权）。 */
+export interface SetupStatus {
+  /** true = 服务器尚未设置访问密钥，应展示首次运行向导而非登录框。 */
+  setupRequired: boolean
+  /** 服务器侧要求的最短长度（与 token-policy.ts 常量同源，用于校对）。 */
+  minLength: number
+}
+
 export interface LogFileDto {
   name: string
   size: number

@@ -73,6 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => Db::open(&data_dir).await?,
     };
     boot_db.init_default_config(&default_save_dir()).await?;
+    // 空串 = 尚未设置访问密钥，服务器进入「待设置」状态（见下方横幅）。
     let token = ensure_server_config(&boot_db).await?;
 
     // FLUXDOWN_LANG 是部署级默认语言：不写库，仅作设置页未保存过语言时的
@@ -346,8 +347,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 路由：核心（fluxdown_api 复用）+ 扩展（本 crate）+ SPA 静态托管。
     let api_cfg = ApiServerConfig::from_config_map(&all_cfg, SERVER_VERSION);
+    // 访问密钥由 cell 持有：首次运行向导 / 设置页 / regenerate 改写后，核心路由
+    // 与扩展路由同一刻看到新值，无需重启进程（NAS 用户没有「重启容器」这一步）。
+    let token_cell = fluxdown_api::auth::TokenCell::new(token.as_str());
     let api_cfg = ApiServerConfig {
-        token: token.clone(),
+        token: token_cell.clone(),
         management_enabled: true,
         ..api_cfg
     };
@@ -370,7 +374,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cmd_tx,
         hub,
         selector: selector_handle,
-        token,
+        token: token_cell,
         version: SERVER_VERSION.to_string(),
         demo_url: server_cfg.demo_url.clone(),
         data_dir: engine_data_dir,
@@ -391,6 +395,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("FluxDown Server listening on http://{}", server_cfg.bind);
     eprintln!("  Web UI:    http://{}/", server_cfg.bind);
     eprintln!("  API docs:  http://{}/api/v1/docs", server_cfg.bind);
+    if token.is_empty() {
+        crate::config::print_setup_banner(&server_cfg.bind);
+    }
 
     axum::serve(
         listener,

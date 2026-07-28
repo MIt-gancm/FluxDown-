@@ -350,6 +350,26 @@ svg { display: block; }
 .remember input:checked + i { background: var(--accent); border-color: var(--accent); }
 .remember input:checked + i::after { content: ""; width: 8px; height: 5px; border-left: 2px solid #fff; border-bottom: 2px solid #fff; transform: rotate(-45deg) translateY(-1px); }
 .login-hint { font-size: 11.5px; color: var(--text3); line-height: 1.6; margin-top: 14px; text-align: center; }
+
+/* 首次运行向导的密钥输入。
+   不能沿用设置页的 .token-box（自带底色卡片 + 内缩输入框）：那套外观塞进登录卡
+   后，与紧邻的「确认访问密钥」普通 .text-input 高度/边框/内边距全都对不齐。
+   这里让两个字段共用 .text-input 本体，只把三个图标按钮浮在输入框右侧内缘。 */
+.key-input { font-family: "Cascadia Code", Consolas, monospace; font-size: 12px; }
+.key-field { position: relative; }
+.key-field .text-input { padding-right: 82px; }
+.key-field-actions {
+  position: absolute; inset: 0 5px 0 auto;
+  display: flex; align-items: center; gap: 2px;
+}
+.key-field-actions button {
+  color: var(--text3); width: 23px; height: 23px; border-radius: 6px;
+  display: grid; place-items: center;
+}
+.key-field-actions button:hover { background: var(--hover); color: var(--text); }
+.key-field-actions button svg { width: 13px; height: 13px; }
+.key-field-actions button.copied,
+.key-field-actions button.copied:hover { color: var(--success); }
 .login-feats { position: relative; display: flex; gap: 26px; }
 .login-feats span { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: var(--text3); text-align: center; }
 .login-feats b { font-size: 12.5px; color: var(--text2); }

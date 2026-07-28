@@ -434,7 +434,7 @@
   "dl.archLabel": "CPU Architecture",
   "dl.downloadNow": "Download Now",
   "dl.dockerDeploy": "Deploy with Docker",
-  "dl.dockerHint": "Then open http://localhost:17800 — the admin token is printed to the logs on first start (visible only once).",
+  "dl.dockerHint": "Then open http://localhost:17800 — on first launch you create your own access key (8+ characters, letters and digits).",
   "dl.dockerCopy": "Copy",
   "dl.dockerCopied": "Copied!",
   "dl.scoopTitle": "Install via Scoop",

@@ -3,7 +3,7 @@ title: 服务器部署
 description: 从源码构建并运行 headless FluxDown 服务器,了解全部环境变量并安全地对外暴露。
 section: headless-server
 order: 1
-sourceHash: "b52b359e77df"
+sourceHash: "702c32325512"
 ---
 
 `fluxdown_server` 是 FluxDown 下载引擎的 headless 版本:没有 Flutter 界面,也没有 Rinf/FFI 层。它把同一套 Rust 引擎(HTTP/HTTPS、FTP、BitTorrent、HLS、DASH)通过 HTTP、WebSocket 和一个内置的 Web 界面暴露出来,因此你可以把它跑在 NAS、家庭服务器或 VPS 上,在浏览器里远程管理下载。
@@ -37,7 +37,7 @@ bun run build      # 输出到 web/dist
 
 用下文的 `FLUXDOWN_WEBROOT` 把服务器指向这个输出目录。跳过这一步服务器依然能正常响应 API/WebSocket 请求,但浏览器打开它什么都看不到(没有可回退的 `index.html`)。
 
-<!-- TODO(screenshot): 终端里 `cargo run -p fluxdown_server` 首次运行打印 token 横幅的截图 -->
+<!-- TODO(screenshot): 浏览器里首次运行「初始化 FluxDown Server」向导的截图 -->
 
 ## 环境变量
 
@@ -49,6 +49,7 @@ bun run build      # 输出到 web/dist
 | `FLUXDOWN_DATA_DIR` | 平台自动探测(见下表) | 数据库文件与日志所在目录。 |
 | `FLUXDOWN_DATABASE_URL` | 未设置——使用数据目录下的 SQLite 文件 | 显式连接串:`sqlite:/path/to/file.db` 或 `postgres://user:pass@host/db`。 |
 | `FLUXDOWN_WEBROOT` | 可执行文件同级的 `./web` | Web 界面静态文件(`bun run build` 产物)所在目录;SPA 路由回退到 `index.html`。 |
+| `FLUXDOWN_TOKEN` | 未设置——走 Web 首次运行向导 | 可选的预置管理访问密钥。仅当库中尚未设置密钥时采纳(会 trim 首尾空白;须满足下文密钥规则,否则忽略并打警告)。用于 docker-compose / k8s / CI 等无人值守部署跳过向导。 |
 | `FLUXDOWN_DEMO` | 未设置(关闭) | 真值(`1`/`true`/`yes`/`on`)开启演示模式:仅允许下载内置生成的 64 MiB 演示文件,适合公开演示。 |
 | `FLUXDOWN_DEMO_URL` | 未设置(关闭) | 用指定 URL 覆盖演示模式的内置生成文件,仅该 URL 可下载。 |
 | `FLUXDOWN_LANG` | 未设置(回退浏览器语言) | Web 界面默认语言(`en`/`zh`,接受 `zh-CN` 等区域变体)。纯回退值:任何用户在设置页保存过语言后,以保存值为服务器侧默认(实时生效,跨重启保留);在浏览器里显式选过语言的用户始终以本人选择为准。 |
@@ -71,35 +72,62 @@ FLUXDOWN_WEBROOT=/srv/fluxdown/web/dist \
 ./fluxdown-server
 ```
 
-## 首次运行与获取访问令牌
+## 首次运行:在 Web 界面设置访问密钥
 
-headless 服务器的管理 API 恒开(与桌面客户端默认关闭、需手动开启不同)。首次启动时,若尚未存有 token,服务器会生成一个并持久化到数据库,同时**只打印这一次**到 stderr:
+headless 服务器的管理 API 恒开(与桌面客户端默认关闭、需手动开启不同)。首次启动时,若库中尚未存有访问密钥,服务器进入**待设置**状态:所有管理端点(`/api/v1/*`、`/mcp`)返回 403,Web SPA 仍可访问,以便你在浏览器里完成初始化。
+
+stderr 会打印中英双语引导横幅(不会生成密钥):
 
 ```
 ==============================================================
-  FluxDown Server 首次运行,已生成管理 token:
-    fxd_1a2b3c4d5e6f7890a1b2c3d4e5f67890
-  用它登录 Web 界面 / 调用管理 API(Authorization: Bearer)。
+  FluxDown Server: first run — no access key is set yet.
+  Open the Web UI and create one:
+    http://<server-ip>:17800/
+  Requirements: 8+ characters, letters and digits.
+  Unattended deploys can preset it via FLUXDOWN_TOKEN.
+  ---
+  首次运行：尚未设置访问密钥。请打开上面的 Web 界面自行设置
+  （至少 8 位，必须同时包含字母和数字）。
 ==============================================================
 ```
 
-务必立即保存这个 token——只有生成它的那次运行会打印出来。用它来:
+打开该地址。登录页会变成**初始化 FluxDown Server**向导(不是普通登录框):填写访问密钥并确认,可点按钮随机生成(`fxd_` + 24 位),可勾选「记住此设备」,保存后立即登录进主界面——无需重启服务器。
+
+密钥规则(前后端一致):
+
+- 仅 ASCII 可见字符(无空格、无非 ASCII)
+- 长度 8–128
+- 必须同时包含字母和数字
+
+保存后密钥写入服务器自己数据库的 `config` 表,只要数据库文件(或 PostgreSQL 数据库)还在,重启后依然有效。用它来:
 
 - 登录 Web 界面(见[Web 界面](/docs/zh/headless-server/web-ui/))。
 - 用 `Authorization: Bearer <token>` 鉴权管理 API 调用(见 [API 总览](/docs/zh/api/overview/))。
 
-token 存储在服务器自己数据库的 `config` 表里,只要数据库文件(或 PostgreSQL 数据库)还在,重启后依然有效。
+这一流程取代了旧的「服务器生成 token 并只打印一次到 stderr」做法——因为 NAS(群晖、QNAP、Unraid 等)用户往往看不到容器/套件的 stderr,一次性打印的密钥等于把人锁在门外。
 
-### 重置令牌
+### 无人值守部署
 
-如果 token 丢失或怀疑已泄露,可以在 Web 界面(**设置 → 安全与访问 → 访问令牌 → 重新生成**)重置,或者用当前 token 鉴权后直接调用管理 API:
+若要跳过向导(docker-compose、Kubernetes、CI),用 `FLUXDOWN_TOKEN` 预置密钥。仅当库中还没有密钥时才会采纳:
+
+```bash
+FLUXDOWN_TOKEN='your-strong-key-here' ./fluxdown-server
+```
+
+### 安全提示
+
+初始化窗口是「谁先访问谁落定」的一次性窗口。在把服务器暴露到不可信网络之前,应先完成初始化,或用 `FLUXDOWN_TOKEN` 预置。
+
+### 重置访问密钥
+
+如果密钥丢失或怀疑已泄露,可以在 Web 界面(**设置 → 安全与访问**)修改,或者用当前密钥鉴权后直接调用管理 API:
 
 ```bash
 curl -X POST http://<host>:17800/api/v1/token/regenerate \
   -H "Authorization: Bearer <当前token>"
 ```
 
-响应里的新 token 会附带说明:**必须重启服务器进程后才生效**——运行中的进程在此之前仍沿用内存里的旧 token。
+新密钥**立即生效**——旧密钥同刻失效,无需重启服务器。headless 服务器不允许清空访问密钥:通过 `PUT /api/v1/config` 写入 `local_server_token: ""` 会返回 400。
 
 ## 数据库:SQLite 默认,PostgreSQL 可选
 
@@ -116,8 +144,8 @@ cargo run -p fluxdown_server
 
 `FLUXDOWN_BIND` 默认是 `0.0.0.0:17800`——监听所有网络接口,这与桌面客户端本机 API 硬编码只绑 `127.0.0.1` 不同。这是 headless 场景的刻意设计,但意味着**网络边界的安全由你负责**:
 
-- 管理 token 是互联网与"完全远程控制你的服务器"(创建/删除下载、通过目录选择器浏览服务器文件系统、取回任意已完成文件)之间唯一的屏障。把它当 root 密码对待:不要分享、不要打进日志,一旦怀疑泄露就重新生成。
-- 如果服务器需要在可信局域网之外访问,把它放在反向代理(nginx、Caddy、Traefik)之后终结 TLS,只对外暴露 HTTPS。Web 界面登录时 token 会出现在请求体/查询字符串里,明文 HTTP 下会被网络路径上的任何人看到。
+- 管理访问密钥是互联网与"完全远程控制你的服务器"(创建/删除下载、通过目录选择器浏览服务器文件系统、取回任意已完成文件)之间唯一的屏障。把它当 root 密码对待:不要分享、不要打进日志,一旦怀疑泄露就重新生成。
+- 如果服务器需要在可信局域网之外访问,把它放在反向代理(nginx、Caddy、Traefik)之后终结 TLS,只对外暴露 HTTPS。Web 界面登录时密钥会出现在请求体/查询字符串里,明文 HTTP 下会被网络路径上的任何人看到。
 - WebSocket 端点(`/api/v1/ws`)需要代理转发 `Upgrade`/`Connection` 头。最简 nginx 片段:
 
   ```nginx
@@ -164,8 +192,10 @@ WantedBy=multi-user.target
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now fluxdown-server
-sudo journalctl -u fluxdown-server -f   # 观察首次运行打印的 token 横幅
+sudo journalctl -u fluxdown-server -f   # 观察首次运行的引导横幅
 ```
+
+随后在浏览器打开 `http://<host>:17800/` 完成「初始化 FluxDown Server」向导(无人值守部署可在 unit 里预置 `FLUXDOWN_TOKEN`)。
 
 ## 下一步
 

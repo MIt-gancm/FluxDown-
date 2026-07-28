@@ -14,8 +14,9 @@
     Supports HTTP/HTTPS/FTP/BitTorrent/HLS with intelligent segmentation, resume,
     speed control, a browser extension, aria2-compatible JSON-RPC and an MCP endpoint.
     A free alternative to Internet Download Manager and aria2.
-    NOTE: first launch prints a one-time admin token in the container log
-    (grep -i token). The management API and MCP endpoint require this token.
+    NOTE: on first launch, open the Web UI and create your own access key
+    (8+ characters, letters and digits). The Web UI, management API and MCP
+    endpoint all require it; unattended installs can preset FLUXDOWN_TOKEN.
   </Overview>
   <Category>Downloaders: Network:Web</Category>
   <WebUI>http://[IP]:[PORT:17800]/</WebUI>
@@ -61,7 +62,7 @@
     </Variable>
   </Environment>
   <Config Name="WebUI Port" Target="17800" Default="17800" Mode="tcp" Description="FluxDown Web UI / REST API / WebSocket" Type="Port" Display="always" Required="true" Mask="false">17800</Config>
-  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/fluxdown/data" Mode="rw" Description="Database, logs and admin token" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/fluxdown/data</Config>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/fluxdown/data" Mode="rw" Description="Database, logs and access key" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/fluxdown/data</Config>
   <Config Name="Downloads" Target="/root/Downloads" Default="/mnt/user/downloads" Mode="rw" Description="Default download directory" Type="Path" Display="always" Required="true" Mask="false">/mnt/user/downloads</Config>
   <Config Name="TZ" Target="TZ" Default="Etc/UTC" Mode="" Description="Timezone" Type="Variable" Display="advanced" Required="false" Mask="false">Etc/UTC</Config>
 </Container>

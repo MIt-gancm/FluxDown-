@@ -34,6 +34,7 @@ import type {
   RssSourceDto,
   RssValidateRequest,
   RssValidateResponse,
+  SetupStatus,
   StatsResponse,
   TaskDto,
   TokenResponse,
@@ -90,6 +91,32 @@ export const api = {
     })
     if (!res.ok) throw new ApiError(res.status, res.status === 401 ? t('login.invalidToken') : res.statusText)
     return (await res.json()) as ApiInfo
+  },
+
+  // 首次运行状态（无鉴权）：服务器是否还没设置访问密钥。
+  setupStatus: async (base?: string): Promise<SetupStatus> => {
+    const res = await fetch(`${base ?? getBase()}/api/v1/setup/status`)
+    if (!res.ok) throw new ApiError(res.status, res.statusText)
+    return (await res.json()) as SetupStatus
+  },
+
+  // 首次运行：落定访问密钥（无鉴权，仅在未设置时可用；已设置返回 409）。
+  completeSetup: async (base: string, token: string): Promise<void> => {
+    const res = await fetch(`${base}/api/v1/setup`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token }),
+    })
+    if (!res.ok) {
+      let message = res.statusText
+      try {
+        const body = (await res.json()) as { message?: string }
+        if (body.message) message = body.message
+      } catch {
+        /* 非 JSON 错误体，用 statusText */
+      }
+      throw new ApiError(res.status, translateBackendMessage(message))
+    }
   },
 
   info: () => apiFetch<ApiInfo>('/api/v1/info'),

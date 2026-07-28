@@ -1,6 +1,6 @@
 // 安全与访问：local_server_* 配置组 + 令牌管理 + WS 会话状态。
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { Eye, EyeOff, RefreshCw } from 'lucide-react'
 import { api } from '../../lib/api'
 import { CopyButton } from '../CopyButton'
@@ -8,6 +8,8 @@ import { useI18n } from '../../lib/i18n'
 import type { ConfigMap } from '../../lib/types'
 import { connStore, useStore } from '../../lib/ws'
 import { alertDialog } from '../../lib/confirm'
+import { updateStoredToken } from '../../lib/auth'
+import { randomAccessKey, validateAccessKey } from '../../lib/token-policy'
 import { SetRow, SetSwitch, TextInput } from './controls'
 
 export function SecuritySettings({
@@ -25,20 +27,32 @@ export function SecuritySettings({
   const mcp = (config.local_server_mcp_enabled ?? 'true') === 'true'
   const origin = window.location.origin
   const conn = useStore(connStore)
+  const qc = useQueryClient()
   const { data: stats } = useQuery({ queryKey: ['stats'], queryFn: api.stats, refetchInterval: 5000 })
 
-  function saveToken(next: string) {
+  // 密钥在服务器端**立即生效**：本地凭证必须等落库成功后再改，否则请求失败
+  // 却把本地 token 换掉，用户会被自己踢出去。这里不走通用 `mutate`（fire-and-
+  // forget，拿不到成败），直接调 API 后失效 config 查询。
+  async function saveToken(next: string) {
     const v = next.trim()
     if (v === token) return
-    mutate({ local_server_token: v })
-    void alertDialog({ message: t('set.sec.tokenSaved') })
+    const issue = validateAccessKey(v)
+    if (issue) {
+      void alertDialog({ message: t(`setup.rule.${issue}`) })
+      return
+    }
+    try {
+      await api.putConfig({ local_server_token: v })
+      updateStoredToken(v)
+      await qc.invalidateQueries({ queryKey: ['config'] })
+      void alertDialog({ message: t('set.sec.tokenSaved') })
+    } catch (e) {
+      void alertDialog({ message: e instanceof Error ? e.message : t('set.sec.tokenSaveFailed') })
+    }
   }
 
   function randomToken() {
-    const bytes = new Uint8Array(16)
-    crypto.getRandomValues(bytes)
-    const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
-    saveToken(`fxd_${hex}`)
+    void saveToken(randomAccessKey())
   }
 
   return (
@@ -48,7 +62,12 @@ export function SecuritySettings({
       <div className="set-group">
         <SetRow title={t('set.sec.token')} desc={t('set.sec.tokenDesc')}>
           <div className="token-box">
-            <TextInput value={token} onCommit={saveToken} password={!showToken} placeholder={t('set.sec.tokenPlaceholder')} />
+            <TextInput
+              value={token}
+              onCommit={(v) => void saveToken(v)}
+              password={!showToken}
+              placeholder={t('set.sec.tokenPlaceholder')}
+            />
             <button
               type="button"
               title={showToken ? t('set.sec.hideToken') : t('set.sec.showToken')}

@@ -10,7 +10,7 @@
 # 发布构建注入版本号（/ping、/api/v1/stats、OpenAPI 显示；缺省退回 crate 版本）：
 #   docker build -f docker/server.Dockerfile --build-arg FLUXDOWN_SERVER_VERSION=1.2.3 .
 #
-# 运行（首次启动 stderr 会打印管理 token，务必保存）：
+# 运行（首次打开 Web 界面时自行设置访问密钥；也可用 -e FLUXDOWN_TOKEN=... 预置）：
 #   docker run -d -p 17800:17800 -v fluxdown-data:/data fluxdown-server
 
 # ── Stage 1: Web 前端（Vite SPA，bun 锁文件；产物架构无关，跑在构建机架构）──

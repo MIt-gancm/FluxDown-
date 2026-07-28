@@ -37,6 +37,13 @@ const BACKEND_KEYS: Record<string, I18nKey> = {
   'invalid or missing token': 'backend.invalidOrMissingToken',
   'missing X-FluxDown-Client header': 'backend.missingClientHeader',
   'management API requires a token; set one in Settings > API Service': 'backend.managementApiRequiresToken',
+  // 首次运行 / 密钥策略（Rust: native/server/src/config.rs::validate_access_key）
+  'setup already completed': 'backend.setupAlreadyCompleted',
+  'the headless server requires an access key; it cannot be cleared': 'backend.accessKeyRequired',
+  'access key must be at least 8 characters': 'setup.rule.tooShort',
+  'access key must be at most 128 characters': 'setup.rule.tooLong',
+  'access key must contain both letters and digits': 'setup.rule.needsMix',
+  'access key must not contain spaces or non-ASCII characters': 'setup.rule.badChars',
   'queue name is required': 'backend.queueNameRequired',
   'url is required': 'backend.urlRequired',
   'task is not completed': 'backend.taskNotCompleted',

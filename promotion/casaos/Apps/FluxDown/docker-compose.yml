@@ -51,12 +51,14 @@ x-casaos:
   tips:
     before_install:
       en_US: >-
-        First launch generates an admin token printed once in the container log:
-        `docker logs fluxdown-server 2>&1 | grep -i token`. The management API and
-        MCP endpoint require this token.
+        On first launch, open the Web UI at port 17800 and create your own access
+        key (8+ characters, letters and digits). It is required by the Web UI, the
+        management API and the MCP endpoint. Unattended installs can preset it with
+        the FLUXDOWN_TOKEN environment variable.
       zh_CN: >-
-        首次启动会在容器日志打印一次性管理 token：
-        `docker logs fluxdown-server 2>&1 | grep -i token`。管理 API 与 MCP 端点需要此 token。
+        首次启动后打开 17800 端口的 Web 界面，自行设置访问密钥（至少 8 位，
+        必须同时包含字母和数字）。Web 界面、管理 API 与 MCP 端点都需要它；
+        无人值守安装可用 FLUXDOWN_TOKEN 环境变量预置。
   # --- Metadata ---
   author: zerx-lab
   developer: zerx-lab

@@ -1,31 +1,93 @@
 // #screen-login —— 服务器地址 + 令牌登录卡片，对齐 design/web/index.html。
+//
+// 首次运行分叉：挂载时无鉴权探一次 `GET /api/v1/setup/status`。服务器尚未设置
+// 访问密钥时，同一张卡片改渲染「设置访问密钥」向导（密钥不再由服务器自动生成
+// 打到 stderr——NAS 用户根本看不到容器日志）。设置成功即用新密钥直接登录。
 import { useNavigate } from '@tanstack/react-router'
-import { type FormEvent, useState } from 'react'
+import { type FormEvent, useEffect, useState } from 'react'
+import { Eye, EyeOff, RefreshCw } from 'lucide-react'
 import { api, ApiError } from '../lib/api'
 import { saveCredentials } from '../lib/auth'
 import { translateBackendMessage, useI18n } from '../lib/i18n'
+import { randomAccessKey, validateAccessKey } from '../lib/token-policy'
+import { CopyButton } from '../components/CopyButton'
+
+/** 卡片形态：`probing` = 还没问出服务器状态，先不闪任何表单。 */
+type Mode = 'probing' | 'login' | 'setup'
 
 export function LoginScreen() {
   const { t } = useI18n()
   const navigate = useNavigate()
+  const [mode, setMode] = useState<Mode>('probing')
   const [base, setBase] = useState(() => window.location.origin)
   const [token, setToken] = useState('')
+  const [confirm, setConfirm] = useState('')
+  const [showKey, setShowKey] = useState(false)
   const [remember, setRemember] = useState(true)
   const [error, setError] = useState('')
   const [pending, setPending] = useState(false)
 
-  async function handleSubmit(e: FormEvent) {
+  // 只探同源服务器：地址栏里的 base 是给「连别的主机」用的，而首次设置向导
+  // 只对「你正打开的这台」有意义。探测失败一律退回登录框。
+  useEffect(() => {
+    let alive = true
+    api
+      .setupStatus('')
+      .then((s) => {
+        if (alive) setMode(s.setupRequired ? 'setup' : 'login')
+      })
+      .catch(() => {
+        if (alive) setMode('login')
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  function effectiveBase(): string {
+    const trimmed = base.trim()
+    return trimmed === window.location.origin ? '' : trimmed
+  }
+
+  async function handleLogin(e: FormEvent) {
     e.preventDefault()
     setError('')
     setPending(true)
     try {
-      const trimmed = base.trim()
-      const effectiveBase = trimmed === window.location.origin ? '' : trimmed
-      await api.probe(effectiveBase, token)
-      saveCredentials(effectiveBase, token, remember)
+      const target = effectiveBase()
+      await api.probe(target, token)
+      saveCredentials(target, token, remember)
       navigate({ to: '/' })
     } catch (err) {
       setError(err instanceof ApiError ? translateBackendMessage(err.message) : t('login.connectFailed'))
+    } finally {
+      setPending(false)
+    }
+  }
+
+  async function handleSetup(e: FormEvent) {
+    e.preventDefault()
+    const issue = validateAccessKey(token)
+    if (issue) {
+      setError(t(`setup.rule.${issue}`))
+      return
+    }
+    if (token !== confirm) {
+      setError(t('setup.mismatch'))
+      return
+    }
+    setError('')
+    setPending(true)
+    try {
+      // 向导只服务同源服务器，密钥落定后立即生效，无需重启即可用它登录。
+      await api.completeSetup('', token)
+      await api.probe('', token)
+      saveCredentials('', token, remember)
+      navigate({ to: '/' })
+    } catch (err) {
+      setError(err instanceof ApiError ? translateBackendMessage(err.message) : t('login.connectFailed'))
+      // 409 = 别人抢先设过了；把卡片切回登录框，别让用户对着废表单重试。
+      if (err instanceof ApiError && err.status === 409) setMode('login')
     } finally {
       setPending(false)
     }
@@ -44,44 +106,116 @@ export function LoginScreen() {
             />
           </svg>
         </span>
-        <h2>{t('login.title')}</h2>
-        <p className="login-sub">{t('login.subtitle')}</p>
-        <form className="contents" onSubmit={handleSubmit}>
-          <label className="field-label" htmlFor="login-base">
-            {t('login.serverAddress')}
-          </label>
-          <input
-            id="login-base"
-            className="text-input"
-            type="text"
-            spellCheck={false}
-            required
-            value={base}
-            onChange={(e) => setBase(e.target.value)}
-          />
-          <label className="field-label" htmlFor="login-token">
-            {t('login.token')}
-          </label>
-          <input
-            id="login-token"
-            className="text-input"
-            type="password"
-            spellCheck={false}
-            required
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-          />
-          <label className="remember">
-            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
-            <i />
-            {t('login.remember')}
-          </label>
-          {error ? <p className="mt-[-6px] mb-3 text-[12px] text-danger">{error}</p> : null}
-          <button className="btn primary block" type="submit" disabled={pending}>
-            {pending ? t('login.connecting') : t('login.connect')}
-          </button>
-        </form>
-        <p className="login-hint">{t('login.hint')}</p>
+        <h2>{mode === 'setup' ? t('setup.title') : t('login.title')}</h2>
+        <p className="login-sub">{mode === 'setup' ? t('setup.subtitle') : t('login.subtitle')}</p>
+
+        {mode === 'probing' ? (
+          <p className="login-hint">{t('login.connecting')}</p>
+        ) : mode === 'setup' ? (
+          <>
+            <form className="contents" onSubmit={handleSetup}>
+              <label className="field-label" htmlFor="setup-key">
+                {t('setup.key')}
+              </label>
+              <div className="key-field">
+                <input
+                  id="setup-key"
+                  className="text-input key-input"
+                  type={showKey ? 'text' : 'password'}
+                  spellCheck={false}
+                  autoComplete="new-password"
+                  required
+                  value={token}
+                  onChange={(e) => setToken(e.target.value)}
+                />
+                <div className="key-field-actions">
+                  <button
+                    type="button"
+                    title={showKey ? t('set.sec.hideToken') : t('set.sec.showToken')}
+                    onClick={() => setShowKey((s) => !s)}
+                  >
+                    {showKey ? <EyeOff /> : <Eye />}
+                  </button>
+                  <CopyButton value={token} title={t('set.sec.copyToken')} />
+                  <button
+                    type="button"
+                    title={t('setup.generate')}
+                    onClick={() => {
+                      const next = randomAccessKey()
+                      setToken(next)
+                      setConfirm(next)
+                      setShowKey(true)
+                    }}
+                  >
+                    <RefreshCw />
+                  </button>
+                </div>
+              </div>
+              <label className="field-label" htmlFor="setup-confirm">
+                {t('setup.confirm')}
+              </label>
+              <input
+                id="setup-confirm"
+                className="text-input key-input"
+                type={showKey ? 'text' : 'password'}
+                spellCheck={false}
+                autoComplete="new-password"
+                required
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+              />
+              <label className="remember">
+                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+                <i />
+                {t('login.remember')}
+              </label>
+              {error ? <p className="mt-[-6px] mb-3 text-[12px] text-danger">{error}</p> : null}
+              <button className="btn primary block" type="submit" disabled={pending}>
+                {pending ? t('setup.saving') : t('setup.submit')}
+              </button>
+            </form>
+            <p className="login-hint">{t('setup.hint')}</p>
+          </>
+        ) : (
+          <>
+            <form className="contents" onSubmit={handleLogin}>
+              <label className="field-label" htmlFor="login-base">
+                {t('login.serverAddress')}
+              </label>
+              <input
+                id="login-base"
+                className="text-input"
+                type="text"
+                spellCheck={false}
+                required
+                value={base}
+                onChange={(e) => setBase(e.target.value)}
+              />
+              <label className="field-label" htmlFor="login-token">
+                {t('login.token')}
+              </label>
+              <input
+                id="login-token"
+                className="text-input"
+                type="password"
+                spellCheck={false}
+                required
+                value={token}
+                onChange={(e) => setToken(e.target.value)}
+              />
+              <label className="remember">
+                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+                <i />
+                {t('login.remember')}
+              </label>
+              {error ? <p className="mt-[-6px] mb-3 text-[12px] text-danger">{error}</p> : null}
+              <button className="btn primary block" type="submit" disabled={pending}>
+                {pending ? t('login.connecting') : t('login.connect')}
+              </button>
+            </form>
+            <p className="login-hint">{t('login.hint')}</p>
+          </>
+        )}
       </div>
       <div className="login-feats">
         <span>

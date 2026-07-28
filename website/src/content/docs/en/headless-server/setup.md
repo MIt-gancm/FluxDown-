@@ -36,7 +36,7 @@ bun run build      # outputs to web/dist
 
 Point the server at that output directory with `FLUXDOWN_WEBROOT` (see below). If you skip this step, the server still runs and answers API/WebSocket requests, but visiting it in a browser serves nothing (no `index.html` to fall back to).
 
-<!-- TODO(screenshot): terminal showing `cargo run -p fluxdown_server` output with the first-run token banner -->
+<!-- TODO(screenshot): browser showing the first-run “Initialize FluxDown Server” wizard -->
 
 ## Environment variables
 
@@ -48,6 +48,7 @@ All configuration is read once at startup from environment variables. There is n
 | `FLUXDOWN_DATA_DIR` | Platform auto-detected (see below) | Directory holding the database file and logs. |
 | `FLUXDOWN_DATABASE_URL` | unset — uses a SQLite file inside the data dir | Explicit connection string: `sqlite:/path/to/file.db` or `postgres://user:pass@host/db`. |
 | `FLUXDOWN_WEBROOT` | `./web` next to the executable | Directory the Web UI static files (`bun run build` output) are served from; SPA routes fall back to `index.html`. |
+| `FLUXDOWN_TOKEN` | unset — first-run Web setup wizard | Optional pre-set management access key. Applied only when the database has no key yet (value is trimmed; must satisfy the key rules below, otherwise ignored with a warning). Use for unattended docker-compose / k8s / CI deploys that skip the wizard. |
 | `FLUXDOWN_DEMO` | unset (off) | Truthy value (`1`/`true`/`yes`/`on`) turns on demo mode: only a built-in, generated 64 MiB file can be downloaded. Useful for public demos. |
 | `FLUXDOWN_DEMO_URL` | unset (off) | Overrides demo mode's allowed URL with a specific one instead of the built-in generated file. |
 | `FLUXDOWN_LANG` | unset (falls back to browser language) | Default Web UI language (`en`/`zh`; regional variants like `zh-CN` accepted). Pure fallback: once any user saves a language in Settings, the saved value becomes the server-side default (applies live, survives restarts); users who explicitly picked a language in their browser always keep their own choice. |
@@ -70,35 +71,62 @@ FLUXDOWN_WEBROOT=/srv/fluxdown/web/dist \
 ./fluxdown-server
 ```
 
-## First run and the access token
+## First run: set the access key in the Web UI
 
-The management API is always enabled on the headless server (unlike the desktop app, where it is opt-in). On first boot, if no token is stored yet, the server generates one, persists it to the database, and prints it once to **stderr**:
+The management API is always enabled on the headless server (unlike the desktop app, where it is opt-in). On first boot, if no access key is stored yet, the server enters a **pending setup** state: every management endpoint (`/api/v1/*`, `/mcp`) returns 403, while the Web SPA remains reachable so you can finish initialization in the browser.
+
+stderr prints a bilingual guidance banner (not a generated secret):
 
 ```
 ==============================================================
-  FluxDown Server 首次运行，已生成管理 token：
-    fxd_1a2b3c4d5e6f7890a1b2c3d4e5f67890
-  用它登录 Web 界面 / 调用管理 API（Authorization: Bearer）。
+  FluxDown Server: first run — no access key is set yet.
+  Open the Web UI and create one:
+    http://<server-ip>:17800/
+  Requirements: 8+ characters, letters and digits.
+  Unattended deploys can preset it via FLUXDOWN_TOKEN.
+  ---
+  首次运行：尚未设置访问密钥。请打开上面的 Web 界面自行设置
+  （至少 8 位，必须同时包含字母和数字）。
 ==============================================================
 ```
 
-Capture that token immediately — it is only printed on the run that generates it. Use it to:
+Open that URL. The login page becomes an **Initialize FluxDown Server** wizard (not a normal sign-in form): enter an access key, confirm it, optionally click the button to random-generate one (`fxd_` + 24 characters), optionally check “Remember this device”, then save. You are signed into the main UI immediately — no server restart.
+
+Key rules (enforced the same way in the Web UI and the API):
+
+- ASCII printable characters only (no spaces, no non-ASCII)
+- Length 8–128
+- Must contain both letters and digits
+
+Once saved, the key lives in the `config` table of the server's own database and survives restarts as long as the database file (or PostgreSQL database) persists. Use it to:
 
 - Sign in to the Web UI (see [Web UI](/docs/en/headless-server/web-ui/)).
 - Authenticate management API calls with `Authorization: Bearer <token>` (see [API Overview](/docs/en/api/overview/)).
 
-The token is stored in the `config` table of the server's own database, so it survives restarts as long as the database file (or PostgreSQL database) persists.
+This flow replaced the old “generate a token and print it once to stderr” approach because NAS users (Synology, QNAP, Unraid, and similar) often cannot see container or package stderr — a one-shot printed secret effectively locked them out.
 
-### Resetting the token
+### Unattended deploys
 
-If you lose the token or suspect it leaked, regenerate it from the Web UI (**Settings → Security & Access → Access Token → regenerate**) or by calling the management API itself while authenticated with the current token:
+To skip the wizard (docker-compose, Kubernetes, CI), preset the key with `FLUXDOWN_TOKEN`. It is adopted only when the database still has no key:
+
+```bash
+FLUXDOWN_TOKEN='your-strong-key-here' ./fluxdown-server
+```
+
+### Security note
+
+The setup window is first-come, first-served: whoever reaches the wizard first sets the key. Finish initialization (or preset `FLUXDOWN_TOKEN`) before exposing the server on an untrusted network.
+
+### Resetting the access key
+
+If you lose the key or suspect it leaked, change it from the Web UI (**Settings → Security & Access**) or by calling the management API while authenticated with the current key:
 
 ```bash
 curl -X POST http://<host>:17800/api/v1/token/regenerate \
   -H "Authorization: Bearer <current-token>"
 ```
 
-The response includes the new token and a note that it only takes effect **after the server process restarts** — the running process keeps using the old token in memory until then.
+The new key takes effect **immediately** — the old one is invalidated at the same moment. No server restart is required. On the headless server the access key cannot be cleared: writing `local_server_token: ""` via `PUT /api/v1/config` returns 400.
 
 ## Database: SQLite and PostgreSQL
 
@@ -115,8 +143,8 @@ The connection string's scheme (`sqlite:` vs `postgres:`) selects the backend; b
 
 `FLUXDOWN_BIND` defaults to `0.0.0.0:17800` — reachable on every network interface, unlike the desktop app's local API which is hardcoded to loopback only. That is intentional for headless use, but it means **you** are responsible for the network boundary:
 
-- The management token is the only thing standing between the internet and full remote control of your server (create/delete downloads, browse the server's filesystem via the directory picker, stream any completed file back). Treat it like a root password: don't share it, don't log it, rotate it if it may have leaked.
-- If the server is reachable beyond a trusted LAN, put it behind a reverse proxy (nginx, Caddy, Traefik) terminating TLS, and only expose HTTPS. The Web UI's login screen sends the token in a request body/query string; on plain HTTP that is visible to anyone on the network path.
+- The management access key is the only thing standing between the internet and full remote control of your server (create/delete downloads, browse the server's filesystem via the directory picker, stream any completed file back). Treat it like a root password: don't share it, don't log it, rotate it if it may have leaked.
+- If the server is reachable beyond a trusted LAN, put it behind a reverse proxy (nginx, Caddy, Traefik) terminating TLS, and only expose HTTPS. The Web UI's login screen sends the key in a request body/query string; on plain HTTP that is visible to anyone on the network path.
 - The WebSocket endpoint (`/api/v1/ws`) needs `Upgrade`/`Connection` headers forwarded by the proxy. A minimal nginx snippet:
 
   ```nginx
@@ -163,8 +191,10 @@ Install `fluxdown-server` (the release binary) and the built `web/dist` contents
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now fluxdown-server
-sudo journalctl -u fluxdown-server -f   # watch for the first-run token banner
+sudo journalctl -u fluxdown-server -f   # watch for the first-run setup guidance banner
 ```
+
+Then open `http://<host>:17800/` in a browser and complete the Initialize FluxDown Server wizard (or preset `FLUXDOWN_TOKEN` in the unit file for unattended setup).
 
 ## Next steps
 

@@ -3,10 +3,10 @@ title: Docker 与 NAS
 description: 用预编译 Docker 镜像运行 headless FluxDown 服务器，支持 Docker Compose、CasaOS/ZimaOS、Unraid 与群晖 DSM 原生套件。
 section: headless-server
 order: 2
-sourceHash: "70c9e997263a"
+sourceHash: "7a29bd5ed557"
 ---
 
-运行 headless 服务器最快的方式是使用预编译 Docker 镜像——无需 Cargo 构建，也无需单独构建 Web 界面。镜像内置了服务器二进制和 Web 界面，全部通过一个端口（`17800`）暴露，并把数据库、日志和访问 token 持久化到卷。
+运行 headless 服务器最快的方式是使用预编译 Docker 镜像——无需 Cargo 构建，也无需单独构建 Web 界面。镜像内置了服务器二进制和 Web 界面，全部通过一个端口（`17800`）暴露，并把数据库、日志和访问密钥持久化到卷。
 
 镜像：`ghcr.io/zerx-lab/fluxdown-server`（标签：具体版本如 `0.1.54`，或 `latest`）。
 
@@ -24,16 +24,23 @@ docker run -d \
   ghcr.io/zerx-lab/fluxdown-server:latest
 ```
 
-- `/data` 存放数据库、日志和生成的管理 token——请放在持久化卷上。
+- `/data` 存放数据库、日志和访问密钥——请放在持久化卷上。
 - `/root/Downloads` 是容器内的默认下载目录（`HOME=/root`）；绑定到你希望写入文件的宿主机路径。
 
-管理 token 在首次启动时生成一次并打印到容器日志。抓取它：
+首次访问 `http://<host>:17800/` 时，Web 界面会进入初始化向导，由你自行设置访问密钥（至少 8 位，须同时包含字母和数字）。用该密钥登录 Web 界面，以及为管理 API 和 MCP 端点鉴权（`Authorization: Bearer <token>`）。
+
+在 docker-compose 或其它编排场景中，可用 `FLUXDOWN_TOKEN` 预置密钥并跳过向导。仅在实例尚未设置过密钥时生效：
 
 ```bash
-docker logs fluxdown-server 2>&1 | grep -i token
+docker run -d \
+  --name fluxdown-server \
+  --restart unless-stopped \
+  -p 17800:17800 \
+  -e FLUXDOWN_TOKEN=your-secure-key-here \
+  -v fluxdown-data:/data \
+  -v /path/to/downloads:/root/Downloads \
+  ghcr.io/zerx-lab/fluxdown-server:latest
 ```
-
-用它登录 Web 界面，以及为管理 API 和 MCP 端点鉴权（`Authorization: Bearer <token>`）。
 
 ## Docker Compose
 
@@ -49,6 +56,7 @@ services:
       - fluxdown-data:/data
       - ./downloads:/root/Downloads
     # environment:
+    #   FLUXDOWN_TOKEN: your-secure-key-here   # 可选：预置访问密钥，跳过初始化向导
     #   FLUXDOWN_LANG: zh
     #   FLUXDOWN_DATABASE_URL: postgres://user:pass@host:5432/fluxdown
 
@@ -58,7 +66,6 @@ volumes:
 
 ```bash
 docker compose up -d
-docker compose logs fluxdown-server 2>&1 | grep -i token
 ```
 
 [服务器部署](/docs/zh/headless-server/setup/)中的全部环境变量在此同样适用——最常用的是 `FLUXDOWN_LANG`（Web 界面默认语言，`en`/`zh`）和 `FLUXDOWN_DATABASE_URL`（指向外部 PostgreSQL 而非内置 SQLite）。
@@ -98,29 +105,23 @@ Unraid Community Applications 模板见 [zerx-lab/unraid-templates](https://gith
 2. **套件中心 → 手动安装**，选择 `.spk`，按向导完成。
 3. 启动套件后，在套件中心点**打开**——直达端口 `17800` 的 Web 界面（`http://<NAS-IP>:17800`）。
 
-### 首次运行令牌
+### 首次运行访问密钥
 
-管理 token 只在首次启动时打印一次，落在套件日志里。通过 SSH 获取：
-
-```bash
-sudo grep -i token /var/packages/FluxDown/var/fluxdown-server.log
-```
-
-用它登录 Web 界面。token 持久化在套件自己的数据库里，重启与升级后依然有效。
+首次打开 Web 界面（`http://<NAS-IP>:17800`）时，初始化向导会要求你自行设置访问密钥（至少 8 位，须同时包含字母和数字）。密钥持久化在套件自己的数据库里，重启与升级后依然有效。之后可在**设置 → 安全与访问**查看或更换。
 
 ### 权限与数据位置
 
 - **DSM 7** 上服务以专属低权限套件用户运行（DSM 7 平台强制要求——套件不允许再以 root 运行）；**DSM 6** 上以 root 运行。
-- 数据库、日志与 token 位于 `/var/packages/FluxDown/var`；下载默认也落在该目录。
+- 数据库、日志与访问密钥位于 `/var/packages/FluxDown/var`；下载默认也落在该目录。
 - DSM 7 上要下载到共享文件夹，需先给套件用户授权：**控制面板 → 共享文件夹 → 编辑 → 权限**，把用户下拉切到**系统内部用户**，给 **FluxDown** 读写权限。DSM 6 以 root 运行，无需授权。
 
 ### 升级与卸载
 
-升级即手动安装更新版本的 `.spk` 覆盖安装——`var` 里的数据库、token 与设置全部保留。在套件中心卸载会停止服务并移除套件。
+升级即手动安装更新版本的 `.spk` 覆盖安装——`var` 里的数据库、访问密钥与设置全部保留。在套件中心卸载会停止服务并移除套件。
 
 ## 安全地对外暴露
 
-镜像在容器内绑定 `0.0.0.0:17800`，映射到宿主机。与任何 headless 部署一样，管理 token 是守护完整远程控制权的唯一屏障——在把它暴露到可信局域网之外前，请先阅读[反向代理与 TLS 指引](/docs/zh/headless-server/setup/)。
+镜像在容器内绑定 `0.0.0.0:17800`，映射到宿主机。与任何 headless 部署一样，访问密钥是守护完整远程控制权的唯一屏障——在把它暴露到可信局域网之外前，请先阅读[反向代理与 TLS 指引](/docs/zh/headless-server/setup/)。
 
 ## 下一步
 

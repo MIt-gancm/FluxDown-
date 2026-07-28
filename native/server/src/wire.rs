@@ -500,8 +500,26 @@ pub struct LogsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct TokenResponse {
     pub token: String,
-    /// 生效说明（新 token 需重启服务器后生效）。
+    /// 生效说明（新 token 立即生效，旧 token 同时失效）。
     pub note: String,
+}
+
+/// 首次运行状态（`GET /api/v1/setup/status`，**无鉴权**）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupStatusResponse {
+    /// `true` = 尚未设置访问密钥，Web 端应展示首次运行向导。
+    pub setup_required: bool,
+    /// 访问密钥最短长度（前端提示与校验用，避免两端各写一份常量）。
+    pub min_length: i64,
+}
+
+/// 首次运行设置访问密钥请求（`POST /api/v1/setup`，**无鉴权**）。
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SetupRequest {
+    /// 用户设定的访问密钥；规则见 `config::validate_access_key`。
+    pub token: String,
 }
 
 // ---------------------------------------------------------------------------

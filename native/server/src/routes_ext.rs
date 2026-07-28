@@ -1,5 +1,5 @@
 //! 扩展路由：WS 实时推送 / 配置读写 / 队列 CRUD / 文件取回 / 目录列举 /
-//! 代理测试 / token 管理 / 运行状态 / 合并版 OpenAPI + Scalar 文档。
+//! 代理测试 / 首次运行设置 / token 管理 / 运行状态 / 合并版 OpenAPI + Scalar 文档。
 //!
 //! 鉴权模型：
 //! - 常规扩展端点 → `route_layer` 统一套用管理 token 门禁
@@ -7,6 +7,10 @@
 //! - `GET /api/v1/ws`、`GET /api/v1/tasks/{id}/file` → 浏览器无法设自定义
 //!   header，改用 `?token=` 查询参数在 handler 内常量时间比较。
 //! - `openapi.json` / `docs` → 无鉴权（纯接口描述，不含数据）。
+//! - `setup/status`、`setup` → **无鉴权**，且仅在服务器尚未设置访问密钥时可写。
+//!   这不是缺口：无密钥时管理 API 本就全线 403，服务器对任何人都不可用；
+//!   首次设置是「谁先到谁落定」的一次性窗口（与所有 NAS 应用的初装向导同构），
+//!   落定后 `setup` 立刻转为 409。部署方若在意抢注，用 `FLUXDOWN_TOKEN` 预置。
 
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
@@ -21,7 +25,7 @@ use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
-use fluxdown_api::auth::{check_management_auth, constant_time_eq};
+use fluxdown_api::auth::{TokenCell, check_management_auth, constant_time_eq};
 use fluxdown_api::service::ApiError;
 use fluxdown_api::types::{QueueDto, TaskDto};
 use fluxdown_engine::components::{
@@ -39,12 +43,13 @@ use tokio_util::io::ReaderStream;
 use utoipa::OpenApi;
 
 use crate::actor::ActorCmd;
-use crate::config::default_save_dir;
+use crate::config::{ACCESS_KEY_MIN_LEN, default_save_dir, validate_access_key};
 use crate::wire::{
     ComponentFfmpegStatus, ComponentVersions, ComponentYtdlpStatus, CreateQueueRequest, FsEntry,
     FsListResponse, InstallFfmpegRequest, LogFileDto, LogsResponse, MoveQueueRequest,
-    ProxyTestRequest, ProxyTestResponse, QueueScheduleRequest, ReorderQueueRequest, StatsResponse,
-    TokenResponse, TrackerSubRefreshResponse, UpdateQueueRequest, WsClientMsg, WsServerMsg,
+    ProxyTestRequest, ProxyTestResponse, QueueScheduleRequest, ReorderQueueRequest, SetupRequest,
+    SetupStatusResponse, StatsResponse, TokenResponse, TrackerSubRefreshResponse,
+    UpdateQueueRequest, WsClientMsg, WsServerMsg,
 };
 use crate::ws_hub::WsHub;
 
@@ -55,8 +60,9 @@ pub struct ServerState {
     pub cmd_tx: mpsc::Sender<ActorCmd>,
     pub hub: Arc<WsHub>,
     pub selector: Arc<dyn HostSelection>,
-    /// 管理 token（启动时读定；`token/regenerate` 后重启生效）。
-    pub token: String,
+    /// 管理访问密钥。热更新（首次运行向导 / 重新生成 / 设置页改写）后立即生效，
+    /// 与 `fluxdown_api` 核心路由共享同一个 cell。
+    pub token: TokenCell,
     pub version: String,
     /// 演示模式：`Some(url)` 时仅允许下载该 URL（`FLUXDOWN_DEMO_URL`）。
     pub demo_url: Option<String>,
@@ -151,6 +157,8 @@ pub fn extra_router(state: ServerState) -> Router {
         .route(paths::WS, get(ws_handler))
         .route(paths::TASK_FILE, get(task_file))
         .route(paths::LOGS_EXPORT, get(logs_export))
+        .route(paths::SETUP_STATUS, get(setup_status))
+        .route(paths::SETUP, post(setup_complete))
         .route(paths::OPENAPI, get(openapi_spec))
         .route(paths::DOCS, get(scalar_docs));
 
@@ -187,6 +195,8 @@ pub mod paths {
     pub const OPENAPI: &str = "/api/v1/openapi.json";
     pub const DOCS: &str = "/api/v1/docs";
     pub const BT_TRACKER_SUB_REFRESH: &str = "/api/v1/bt/tracker-sub/refresh";
+    pub const SETUP_STATUS: &str = "/api/v1/setup/status";
+    pub const SETUP: &str = "/api/v1/setup";
 }
 
 /// 统一 JSON 错误体（与 `fluxdown_api` 的 `ResultMessage` 形态一致）。
@@ -204,7 +214,7 @@ async fn require_auth(
     req: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if let Err((code, msg)) = check_management_auth(req.headers(), &state.token) {
+    if let Err((code, msg)) = check_management_auth(req.headers(), &state.token.get()) {
         return error_response(
             StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED),
             msg,
@@ -234,7 +244,8 @@ async fn ws_handler(
     Query(q): Query<TokenQuery>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let authorized = !state.token.is_empty() && constant_time_eq(&q.token, &state.token);
+    let token = state.token.get();
+    let authorized = !token.is_empty() && constant_time_eq(&q.token, &token);
     ws.on_upgrade(move |socket| handle_socket(socket, state, authorized))
 }
 
@@ -340,7 +351,12 @@ async fn get_config(State(state): State<ServerState>) -> Result<Response, ApiErr
     Ok(axum::Json(map).into_response())
 }
 
-/// 批量写入配置键值并 live-apply 到引擎（`local_server_*` 键重启生效）。
+/// 批量写入配置键值并 live-apply 到引擎。
+///
+/// `local_server_token` 是特例：headless 服务器不允许把它清空（清空 = 管理 API
+/// 全线 403，等于把自己锁在门外且只能改数据库自救），且改动**立即生效**——
+/// 落库前先过 [`validate_access_key`]，落库后同步写 [`ServerState::token`]。
+/// 其余 `local_server_*` 键仍是重启生效。
 #[utoipa::path(put, path = "/api/v1/config", tag = "server",
     request_body = HashMap<String, String>,
     responses((status = 200, description = "已持久化并应用")),
@@ -348,8 +364,20 @@ async fn get_config(State(state): State<ServerState>) -> Result<Response, ApiErr
 )]
 async fn put_config(
     State(state): State<ServerState>,
-    axum::Json(entries): axum::Json<HashMap<String, String>>,
+    axum::Json(mut entries): axum::Json<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    if let Some(next) = entries.get_mut("local_server_token") {
+        // 先归一化再校验并落库：库里存了带空白的值、内存 cell 存去空白的值，
+        // 会在下次重启时神不知鬼不觉地换掉密钥。
+        let trimmed = next.trim().to_string();
+        if trimmed.is_empty() {
+            return Err(ApiError::BadRequest(
+                "the headless server requires an access key; it cannot be cleared".into(),
+            ));
+        }
+        validate_access_key(&trimmed).map_err(|msg| ApiError::BadRequest(msg.to_string()))?;
+        *next = trimmed;
+    }
     let keys: Vec<String> = entries.keys().cloned().collect();
     for (key, value) in &entries {
         state
@@ -357,6 +385,10 @@ async fn put_config(
             .set_config(key, value)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))?;
+    }
+    if let Some(next) = entries.get("local_server_token") {
+        state.token.set(next.as_str());
+        log_info!("[server] management token updated from settings (effective immediately)");
     }
     state
         .send_cmd(|ack| ActorCmd::ApplyConfig { keys, ack })
@@ -619,7 +651,8 @@ async fn task_file(
     Path(id): Path<String>,
     Query(q): Query<TokenQuery>,
 ) -> Response {
-    if state.token.is_empty() || !constant_time_eq(&q.token, &state.token) {
+    let token = state.token.get();
+    if token.is_empty() || !constant_time_eq(&q.token, &token) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid or missing token");
     }
     let task = match state.db.load_task_by_id(&id).await {
@@ -721,7 +754,8 @@ async fn logs_info() -> Result<Response, ApiError> {
     )
 )]
 async fn logs_export(State(state): State<ServerState>, Query(q): Query<TokenQuery>) -> Response {
-    if state.token.is_empty() || !constant_time_eq(&q.token, &state.token) {
+    let token = state.token.get();
+    if token.is_empty() || !constant_time_eq(&q.token, &token) {
         return error_response(StatusCode::UNAUTHORIZED, "invalid or missing token");
     }
     let bytes = match fluxdown_engine::logger::export_logs_zip() {
@@ -835,23 +869,75 @@ async fn proxy_test(
     }
 }
 
-/// 重新生成管理 token 并持久化。**重启服务器后生效**（当前会话沿用旧 token）。
+/// 重新生成管理访问密钥并持久化。**立即生效**：旧密钥同一时刻失效，调用方
+/// 需用返回的新密钥重新鉴权（Web 端会就地更新本地凭据）。
 #[utoipa::path(post, path = "/api/v1/token/regenerate", tag = "server",
     responses((status = 200, body = TokenResponse)),
     security(("bearer_token" = []), ("api_key" = []))
 )]
 async fn token_regenerate(State(state): State<ServerState>) -> Result<Response, ApiError> {
-    let token = format!("fxd_{}", uuid::Uuid::new_v4().simple());
+    let token = crate::config::generate_access_key();
     state
         .db
         .set_config("local_server_token", &token)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.token.set(token.as_str());
+    log_info!("[server] management token regenerated (effective immediately)");
     Ok(axum::Json(TokenResponse {
         token,
-        note: "restart the server for the new token to take effect".into(),
+        note: "the new token takes effect immediately; the previous one is now invalid".into(),
     })
     .into_response())
+}
+
+/// 首次运行状态：是否还需要设置访问密钥。**无鉴权**——密钥未设定时管理 API
+/// 全线 403，Web 端必须能在登录前问到这一位才知道该显示向导还是登录框。
+#[utoipa::path(get, path = "/api/v1/setup/status", tag = "server",
+    responses((status = 200, body = SetupStatusResponse))
+)]
+async fn setup_status(State(state): State<ServerState>) -> Response {
+    axum::Json(SetupStatusResponse {
+        setup_required: state.token.is_empty(),
+        min_length: ACCESS_KEY_MIN_LEN as i64,
+    })
+    .into_response()
+}
+
+/// 首次运行：落定用户自设的访问密钥。**无鉴权，且仅在尚未设置时可用**——
+/// 一旦设过就返回 409，改密钥必须走已鉴权的设置页 / `token/regenerate`。
+#[utoipa::path(post, path = "/api/v1/setup", tag = "server",
+    request_body = SetupRequest,
+    responses(
+        (status = 200, description = "已设置，可立即用该密钥登录"),
+        (status = 400, description = "密钥不符合要求"),
+        (status = 409, description = "已完成首次设置"),
+    )
+)]
+async fn setup_complete(
+    State(state): State<ServerState>,
+    axum::Json(req): axum::Json<SetupRequest>,
+) -> Result<Response, ApiError> {
+    // 已设过密钥 → 关闭窗口。改密钥必须走已鉴权路径，避免任何人重置服务器。
+    if !state.token.is_empty() {
+        return Ok(error_response(
+            StatusCode::CONFLICT,
+            "setup already completed",
+        ));
+    }
+    let token = req.token.trim();
+    validate_access_key(token).map_err(|msg| ApiError::BadRequest(msg.to_string()))?;
+    state
+        .db
+        .set_config("local_server_token", token)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    state.token.set(token);
+    log_info!("[server] first-run access key set via web setup");
+    Ok(
+        axum::Json(serde_json::json!({ "success": true, "message": "setup completed" }))
+            .into_response(),
+    )
 }
 
 /// 服务器运行状态（磁盘剩余 / WS 连接数 / 版本 / 演示模式）。
@@ -1123,6 +1209,8 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         fs_list,
         proxy_test,
         token_regenerate,
+        setup_status,
+        setup_complete,
         stats,
         logs_info,
         logs_export,
@@ -1150,6 +1238,8 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         crate::wire::ReorderQueueRequest,
         crate::wire::ProxyTestRequest,
         crate::wire::ProxyTestResponse,
+        crate::wire::SetupStatusResponse,
+        crate::wire::SetupRequest,
         crate::wire::FsEntry,
         crate::wire::FsListResponse,
         crate::wire::StatsResponse,
