@@ -67,7 +67,7 @@ cd fluxDown && npm run dev            # 扩展开发（Chrome）；dev:firefox /
 # ── OpenAPI / 图标 / 发布 ──
 cargo run -p fluxdown_api --example gen_openapi > website/public/openapi.json   # 改 API 后重生成
 bun scripts/gen_icons.ts              # 改 assets/logo/fluxdown_logo.svg 后全平台图标一键生成
-git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水线（见 §17；稳定版从 main，预览 -rc.N 从 develop）
+git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水线（见 §17；稳定版从 stable，预览 -rc.N 从 main）
 ```
 
 ---
@@ -402,7 +402,7 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 
 ## 17. 发布与 CI（`.github/workflows/release.yml`）
 
-**组件变更检测**流水线，`v*` tag 触发。`changes` job diff `PREV..TAG` 映射路径→输出（`app`/`extension`/`server`/`mobile`/`cli`），首个 tag 全量构建。**分支守卫**：稳定 `vX.Y.Z` 必须是 `origin/main` 祖先；预览 `vX.Y.Z-rc.N` 必须在 `origin/develop`；否则整条失败。
+**组件变更检测**流水线，`v*` tag 触发。`changes` job diff `PREV..TAG` 映射路径→输出（`app`/`extension`/`server`/`mobile`/`cli`），首个 tag 全量构建。**分支守卫**：稳定 `vX.Y.Z` 必须是 `origin/stable` 祖先；预览 `vX.Y.Z-rc.N` 必须在 `origin/main`；否则整条失败。
 
 路径→组件映射（要点）：`fluxDown/*`→extension；`web|native/server|docker|packaging/*`→server；`native/cli/*`→cli；`native/api/*`→server+cli；`native/engine/*`→app+server+mobile+cli；`android|lib/src/mobile/*`→mobile；`lib/*`→app+mobile；`website/*`/`docs/*`/`*.md`→不构建。
 
@@ -468,5 +468,5 @@ Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+D
 - **命中以下任一项前先读 `rust-router` skill**：新增/改 public API/trait/error 类型、unsafe/FFI/性能关键路径、新增 crate/调 workspace、写 doc comment。仅改名/格式/加日志可跳过。
 
 ### 分支模型与发布
-- `develop` = 开发分支（超集），`main` = 稳定分支（子集）。日常一律在 `develop`；`main` 只经合并/cherry-pick `develop` 前进；hotfix 直进 `main` 必须同回合同步回 `develop`。**一致性判定 `git log main --not develop` 恒为空**。
-- 稳定 tag `vX.Y.Z` 只从 `main`；预览 `vX.Y.Z-rc.N` 只从 `develop`。
+- `main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）。日常一律在 `main`；`stable` 只经合并/cherry-pick `main` 前进；hotfix 直进 `stable` 必须同回合同步回 `main`。**一致性判定 `git log stable --not main` 恒为空**。
+- 稳定 tag `vX.Y.Z` 只从 `stable`；预览 `vX.Y.Z-rc.N` 只从 `main`。

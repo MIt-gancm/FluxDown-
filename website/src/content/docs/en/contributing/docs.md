@@ -9,8 +9,8 @@ These docs live in the public [zerx-lab/fluxdown](https://github.com/zerx-lab/fl
 
 ## How it works
 
-1. Click *Edit this page* — GitHub will fork the repo for you (the editor opens on the `develop` branch).
-2. Edit the Markdown and open a pull request **against `develop`** — that is the development branch; `main` only tracks stable releases.
+1. Click *Edit this page* — GitHub will fork the repo for you (the editor opens on the `main` branch).
+2. Edit the Markdown and open a pull request **against `main`** — that is the development branch; `stable` only tracks stable releases.
 3. A maintainer reviews and merges it.
 
 Prefer not to use Git? Use the feedback form at the bottom of any page.

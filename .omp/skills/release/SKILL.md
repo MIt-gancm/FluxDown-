@@ -38,14 +38,14 @@ gh release list --limit 20
 
 | 渠道 | tag | 打自分支 | GitHub prerelease | make_latest | 打包范围 |
 |---|---|---|---|---|---|
-| 稳定版 | `vX.Y.Z` | `main` | false | true | 客户端 / web / 移动 / NAS / 扩展 全部 |
-| 预览版 | `vX.Y.Z-rc.N` | `develop` | true | false | 客户端 / web / 移动 / NAS，**不含浏览器扩展** |
+| 稳定版 | `vX.Y.Z` | `stable` | false | true | 客户端 / web / 移动 / NAS / 扩展 全部 |
+| 预览版 | `vX.Y.Z-rc.N` | `main` | true | false | 客户端 / web / 移动 / NAS，**不含浏览器扩展** |
 
 - 组件线（`server-v*` / `cli-v*` / `mobile-v*` / `extension-v*`）由同一次 `v*` push 按目录 diff 自动派生，`make_latest:false`。预览 push 同步给组件打 `-rc.N` 并标 prerelease。
 - **扩展发布后无法改版本号**，故 `-rc` tag 跳过 `build-extension`/`release-extension`。
 - 判据全在 `.github/workflows/release.yml`：`prerelease/make_latest = contains(github.ref_name, '-')`；Flutter `--build-name` 用剥后缀的 `CLEAN_VERSION`，`APP_VERSION` 保留完整版号。
-- **分支模型**：`develop` = 开发分支（超集），`main` = 稳定分支（子集）；`main` 只经合并/cherry-pick `develop` 前进。稳定发布前 `git log main --not develop` 必须为空。
-- **CI 分支守卫**（`changes` job 首步）：tag 提交必须在对应分支上——`vX.Y.Z` ∈ `origin/main`、`vX.Y.Z-rc.N` ∈ `origin/develop`，否则整条流水线立即失败（`git merge-base --is-ancestor` 判定）。
+- **分支模型**：`main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）；`stable` 只经合并/cherry-pick `main` 前进。稳定发布前 `git log stable --not main` 必须为空。
+- **CI 分支守卫**（`changes` job 首步）：tag 提交必须在对应分支上——`vX.Y.Z` ∈ `origin/stable`、`vX.Y.Z-rc.N` ∈ `origin/main`，否则整条流水线立即失败（`git merge-base --is-ancestor` 判定）。
 
 ## 3. 发布前校验（保证版本可用）
 
@@ -57,24 +57,24 @@ printf '%s\n' "$V" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$' && echo 
 git rev-parse -q --verify "refs/tags/$V" >/dev/null && echo "已存在，换号" || echo "可用"
 # 3) 单调递增：新版须高于最新同类（对照下面输出）
 git tag -l 'v[0-9]*' --sort=-v:refname | head -3
-# 4) 工作树干净、停在目标分支的目标提交（稳定=main，预览=develop）
+# 4) 工作树干净、停在目标分支的目标提交（稳定=stable，预览=main）
 git status --porcelain    # 须为空
 git branch --show-current && git log -1 --oneline
-# 4b) 稳定发布额外：main 不得含 develop 没有的提交
-git log main --not develop --oneline    # 须为空
+# 4b) 稳定发布额外：stable 不得含 main 没有的提交
+git log stable --not main --oneline    # 须为空
 # 5) 可选：本地预览 release notes（需装 git-cliff；未装则跳过，CI 仍会生成，无规范 commit 时用默认标题）
 command -v git-cliff >/dev/null && git cliff --latest --strip header | head -40
 ```
 
-版本"可用"的硬条件：格式合法 · tag 不重复 · 高于同渠道最新 · 停在正确分支且工作树干净 · 稳定版 `main --not develop` 为空。构建绿由调用者在发布前自行保证。
+版本"可用"的硬条件：格式合法 · tag 不重复 · 高于同渠道最新 · 停在正确分支且工作树干净 · 稳定版 `stable --not main` 为空。构建绿由调用者在发布前自行保证。
 预览版额外确认：后缀是 `-rc.N` 且 N 递增（预览用户按 SemVer 收 `rc.1 < rc.2 < … < 转正 X.Y.Z`）。
 
 ## 4. 发布（不可逆，仅用户明确要求时）
 
 ```bash
 # ⚠️ 推送后立即触发全平台构建与 GitHub Release，无法撤回。
-# 先切到正确分支：稳定版 main，预览版 develop（CI 守卫会拒绝打错分支的 tag）。
-git checkout main        # 预览版改为: git checkout develop
+# 先切到正确分支：稳定版 stable，预览版 main（CI 守卫会拒绝打错分支的 tag）。
+git checkout stable      # 预览版改为: git checkout main
 git tag -a "$V" -m "$V"
 git push origin "$V"
 # 观察流水线

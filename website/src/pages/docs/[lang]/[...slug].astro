@@ -89,11 +89,11 @@ const next = idx >= 0 && idx < flat.length - 1 ? (flat[idx + 1] ?? null) : null;
 const REPO = "https://github.com/zerx-lab/fluxdown";
 const srcLang = fallback ? "en" : lang;
 const filePath = `website/src/content/docs/${srcLang}/${slugPath}.md`;
-const editUrl = `${REPO}/edit/develop/${filePath}`;
-const historyUrl = `${REPO}/commits/develop/${filePath}`;
+const editUrl = `${REPO}/edit/main/${filePath}`;
+const historyUrl = `${REPO}/commits/main/${filePath}`;
 // GitHub /new?filename= 会忽略 URL 路径末级目录(isaacs#1527),目录必须拼进 filename
 const translateUrl = fallback
-  ? `${REPO}/new/develop/website/src/content/docs/zh?filename=${encodeURIComponent(`${slugPath}.md`)}`
+  ? `${REPO}/new/main/website/src/content/docs/zh?filename=${encodeURIComponent(`${slugPath}.md`)}`
   : undefined;
 
 const pagePath = `/docs/${lang}/${slugPath}/`;

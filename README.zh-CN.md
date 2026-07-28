@@ -160,8 +160,8 @@ flowchart TD
 **前置要求**：[Flutter SDK](https://docs.flutter.dev/get-started/install) · [Rust 工具链](https://www.rust-lang.org/tools/install) · [Rinf CLI](https://rinf.cunarist.org)
 
 ```shell
-# 克隆开发分支（develop = 日常开发，main = 稳定版本）
-git clone -b develop https://github.com/zerx-lab/FluxDown.git
+# 克隆开发分支（main = 日常开发，stable = 稳定版本）
+git clone -b main https://github.com/zerx-lab/FluxDown.git
 cd FluxDown
 
 # 检查环境
@@ -214,7 +214,7 @@ cargo test -p hub                    # FFI 适配层测试
 - **Bug 反馈 / 功能建议** —— [GitHub Issues](https://github.com/zerx-lab/FluxDown/issues) 或应用内反馈对话框
 - **QQ 群** —— [832143651](https://fluxdown.zerx.dev/qq-group)
 
-欢迎提交 Pull Request！请从 `develop` 拉分支并把 PR 提到 `develop` —— `develop` 是开发分支，`main` 只承载稳定版本（由维护者从 `develop` 合并前进）。提交前请确保通过：
+欢迎提交 Pull Request！请从 `main` 拉分支并把 PR 提到 `main` —— `main` 是开发分支，`stable` 只承载稳定版本（由维护者从 `main` 合并前进）。提交前请确保通过：
 
 ```shell
 cargo fmt --check && cargo clippy -- -D warnings   # Rust
