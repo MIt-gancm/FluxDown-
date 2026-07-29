@@ -6,6 +6,7 @@ import { ChevronRight, Copy, Download, Link2, ListOrdered, Pause, Play, RotateCc
 import type { ReactNode } from 'react'
 import { taskFileUrl } from '../../lib/api'
 import { confirmDialog } from '../../lib/confirm'
+import { copyText } from '../../lib/copy'
 import { queueDisplayName, taskShareUrl } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
 import type { QueueDto } from '../../lib/types'
@@ -75,11 +76,11 @@ export function TaskContextMenu({
               {tr('task.saveToLocal')}
             </ContextMenu.Item>
           )}
-          <ContextMenu.Item className="ctx-item" onSelect={() => void navigator.clipboard.writeText(taskShareUrl(t))}>
+          <ContextMenu.Item className="ctx-item" onSelect={() => copyText(taskShareUrl(t))}>
             <Copy size={14} />
             {tr('task.copyUrl')}
           </ContextMenu.Item>
-          <ContextMenu.Item className="ctx-item" onSelect={() => void navigator.clipboard.writeText(`${t.saveDir}/${t.fileName}`)}>
+          <ContextMenu.Item className="ctx-item" onSelect={() => copyText(`${t.saveDir}/${t.fileName}`)}>
             <Link2 size={14} />
             {tr('task.copyPath')}
           </ContextMenu.Item>

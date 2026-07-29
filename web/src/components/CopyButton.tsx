@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Check, Copy } from 'lucide-react'
 import { cn } from '../lib/cn'
+import { copyText } from '../lib/copy'
 import { useI18n } from '../lib/i18n'
 
 export function CopyButton({ value, title, className }: { value: string; title?: string; className?: string }) {
@@ -20,7 +21,7 @@ export function CopyButton({ value, title, className }: { value: string; title?:
       title={copied ? t('common.copied') : (title ?? t('common.copy'))}
       onClick={(e) => {
         e.stopPropagation()
-        void navigator.clipboard.writeText(value)
+        copyText(value)
         setCopied(true)
         window.clearTimeout(timer.current)
         timer.current = window.setTimeout(() => setCopied(false), 1500)

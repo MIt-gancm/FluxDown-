@@ -11,6 +11,7 @@ import { suggest } from '../../lib/cloud/nickname'
 import { applyCloudSession, clearCloudSession, cloudDeviceId, getCloudRefreshToken, useCloudSession } from '../../lib/cloud/session'
 import { CloudApiError, type CloudDevice } from '../../lib/cloud/types'
 import { confirmDialog } from '../../lib/confirm'
+import { copyText } from '../../lib/copy'
 import { fmtIsoTime, fmtRelativeTime } from '../../lib/format'
 import type { I18nKey } from '../../lib/i18n'
 import { useI18n } from '../../lib/i18n'
@@ -671,7 +672,7 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
 }
 
 /** Origin ID 徽标：胶囊 pill（accent 弱底、圆角、tabular-nums），点击复制纯数字
- *  （clipboard API 不可用/被拒时静默降级，不阻断其它交互）。null（pending 用户）兜底
+ *  （copyText 内部自带非安全上下文回退，失败静默）。null（pending 用户）兜底
  *  显示 #— 且不可点。颜色走 design.css .origin-badge（unlayered，显式声明背景/颜色
  *  才压得过下方全局 button 重置，Tailwind 工具类在这个元素上不生效，同 .link-btn 注释）。 */
 function OriginIdBadge({ originId }: { originId: number | null }) {
@@ -680,20 +681,16 @@ function OriginIdBadge({ originId }: { originId: number | null }) {
   const timer = useRef<number | undefined>(undefined)
   useEffect(() => () => window.clearTimeout(timer.current), [])
 
-  async function copy() {
+  function copy() {
     if (originId == null) return
-    try {
-      await navigator.clipboard.writeText(String(originId))
-      setCopied(true)
-      window.clearTimeout(timer.current)
-      timer.current = window.setTimeout(() => setCopied(false), 1500)
-    } catch {
-      // 剪贴板 API 不可用（非安全上下文 / 权限被拒等），静默降级，不阻断其它交互
-    }
+    copyText(String(originId))
+    setCopied(true)
+    window.clearTimeout(timer.current)
+    timer.current = window.setTimeout(() => setCopied(false), 1500)
   }
 
   return (
-    <button type="button" className="origin-badge flex-shrink-0" disabled={originId == null} onClick={() => void copy()} title={t('cloud.originId')}>
+    <button type="button" className="origin-badge flex-shrink-0" disabled={originId == null} onClick={copy} title={t('cloud.originId')}>
       <span>#{originId == null ? '—' : originId}</span>
       {originId != null ? copied ? <Check size={11} /> : <Copy size={11} /> : null}
     </button>

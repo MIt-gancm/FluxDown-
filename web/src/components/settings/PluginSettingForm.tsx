@@ -5,6 +5,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { Check, ClipboardCopy, Settings2, X } from 'lucide-react'
+import { copyText } from '../../lib/copy'
 import type { I18nKey } from '../../lib/i18n'
 import { useI18n } from '../../lib/i18n'
 import type { PluginDto, SettingFieldDto } from '../../lib/types'
@@ -224,7 +225,7 @@ function HelperScriptButton({ field }: { field: SettingFieldDto }) {
         type="button"
         className="btn ghost sm"
         onClick={() => {
-          void navigator.clipboard.writeText(field.helperScript ?? '')
+          copyText(field.helperScript ?? '')
           setCopied(true)
           window.clearTimeout(timer.current)
           timer.current = window.setTimeout(() => setCopied(false), 2500)

@@ -75,8 +75,8 @@ export function clearCloudSession() {
 export const CLOUD_DEVICE_PLATFORM = 'web'
 
 /** RFC 4122 UUID v4 via crypto.getRandomValues() —— 不同于 crypto.randomUUID()，
- *  getRandomValues() 无 Secure Context 限制，NAS/Docker 面板经明文 HTTP（非
- *  localhost）访问时 randomUUID 缺失会直接抛错（见 issue #204），此处规避。 */
+ *  getRandomValues() 无 Secure Context 限制：NAS/Docker 面板经明文 HTTP（非
+ *  localhost）访问时 randomUUID 整个缺失，直接调用会抛 TypeError，此处规避。 */
 function randomUuidV4(): string {
   const bytes = new Uint8Array(16)
   crypto.getRandomValues(bytes)

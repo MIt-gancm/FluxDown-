@@ -8,6 +8,7 @@ import * as ContextMenu from '@radix-ui/react-context-menu'
 import { Copy, Pause, Play, Trash2 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { confirmDialog } from '../../lib/confirm'
+import { copyText } from '../../lib/copy'
 import { useI18n } from '../../lib/i18n'
 import { groupDisplayName } from '../../lib/task-group'
 import type { GroupDto } from '../../lib/types'
@@ -45,7 +46,7 @@ export function GroupContextMenu({
               {t('group.resumeAll')}
             </ContextMenu.Item>
           )}
-          <ContextMenu.Item className="ctx-item" onSelect={() => void navigator.clipboard.writeText(group.sourceUrl)}>
+          <ContextMenu.Item className="ctx-item" onSelect={() => copyText(group.sourceUrl)}>
             <Copy size={14} />
             {t('group.copySourceLink')}
           </ContextMenu.Item>
