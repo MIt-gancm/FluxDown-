@@ -9091,6 +9091,9 @@ class _AboutContent extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
+            // Browser extension card
+            _ExtensionCard(colors: c),
+            const SizedBox(height: 10),
             // Log export card
             _LogExportCard(colors: c, settingsProvider: settingsProvider),
             const SizedBox(height: 10),
@@ -9415,6 +9418,81 @@ class _AboutContent extends StatelessWidget {
     final dt = DateTime.tryParse(isoDate);
     if (dt == null) return isoDate;
     return '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+  }
+}
+
+// ─────────────────────────────────────────────
+// 浏览器扩展卡片
+// ─────────────────────────────────────────────
+
+class _ExtensionCard extends StatelessWidget {
+  final AppColors colors;
+  const _ExtensionCard({required this.colors});
+
+  static const _chromeStoreUrl =
+      'https://chromewebstore.google.com/detail/fluxdown/meleenglfggcmcajknpeeeiobnpfmahc';
+  static const _firefoxStoreUrl =
+      'https://addons.mozilla.org/firefox/addon/fluxdown/';
+  static const _edgeStoreUrl =
+      'https://microsoftedge.microsoft.com/addons/detail/fluxdown/nglkkjbogjghekbhhcnccnpfedjbdhhd';
+  static const _offlinePackagesUrl = 'https://fluxdown.zerx.dev/#download';
+
+  @override
+  Widget build(BuildContext context) {
+    final c = colors;
+    final s = LocaleScope.of(context);
+    return _SettingCard(
+      label: s.extensionCardTitle,
+      description: s.extensionCardDesc,
+      vertical: true,
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          _linkButton(
+            label: s.extensionChromeStore,
+            url: _chromeStoreUrl,
+            colors: c,
+          ),
+          _linkButton(
+            label: s.extensionFirefoxStore,
+            url: _firefoxStoreUrl,
+            colors: c,
+          ),
+          _linkButton(
+            label: s.extensionEdgeStore,
+            url: _edgeStoreUrl,
+            colors: c,
+          ),
+          _linkButton(
+            label: s.extensionOfflinePackages,
+            url: _offlinePackagesUrl,
+            colors: c,
+            icon: LucideIcons.download,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _linkButton({
+    required String label,
+    required String url,
+    required AppColors colors,
+    IconData icon = LucideIcons.puzzle,
+  }) {
+    return ShadButton.outline(
+      size: ShadButtonSize.sm,
+      onPressed: () => launchUrl(Uri.parse(url)),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 13, color: colors.textSecondary),
+          const SizedBox(width: 6),
+          Text(label),
+        ],
+      ),
+    );
   }
 }
 

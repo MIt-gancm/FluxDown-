@@ -1177,6 +1177,12 @@ class S {
   );
   String get donateThanks => _r('donateThanks');
   String get donateButton => _r('donateButton');
+  String get extensionCardTitle => _r('extensionCardTitle');
+  String get extensionCardDesc => _r('extensionCardDesc');
+  String get extensionChromeStore => _r('extensionChromeStore');
+  String get extensionFirefoxStore => _r('extensionFirefoxStore');
+  String get extensionEdgeStore => _r('extensionEdgeStore');
+  String get extensionOfflinePackages => _r('extensionOfflinePackages');
   String get upToDate => _r('upToDate');
   String newVersionFound(String v) => _r('newVersionFound', {'v': v});
   String get updateNow => _r('updateNow');
