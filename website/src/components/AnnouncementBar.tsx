@@ -6,6 +6,9 @@ import type { Announcement } from "@/lib/announcements";
 
 const STORAGE_KEY = "fluxdown-dismissed-announcements";
 
+/** 浮层延迟入场，避免与首屏内容争夺注意力 */
+const APPEAR_DELAY_MS = 1800;
+
 function getDismissed(): string[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
@@ -23,6 +26,10 @@ function setDismissed(ids: string[]) {
   }
 }
 
+/**
+ * 公告浮动卡片（历史原因文件名叫 Bar）：右上角（导航下方）延迟滑入，
+ * 不遮挡内容、可关闭并记住。右下角被 CommunityFloat 占用。
+ */
 export default function AnnouncementBar() {
   const { t } = useLocale();
   const [visible, setVisible] = useState(false);
@@ -33,10 +40,10 @@ export default function AnnouncementBar() {
     const active = ANNOUNCEMENTS.filter(
       (a) => a.active && !dismissed.includes(a.id),
     ).sort((a, b) => b.date.localeCompare(a.date))[0];
-    if (active) {
-      setCurrent(active);
-      setVisible(true);
-    }
+    if (!active) return;
+    setCurrent(active);
+    const timer = setTimeout(() => setVisible(true), APPEAR_DELAY_MS);
+    return () => clearTimeout(timer);
   }, []);
 
   const handleDismiss = useCallback(() => {
@@ -50,53 +57,63 @@ export default function AnnouncementBar() {
     <AnimatePresence>
       {visible && current && (
         <motion.div
-          initial={{ height: 0, opacity: 0 }}
-          animate={{ height: "auto", opacity: 1 }}
-          exit={{ height: 0, opacity: 0 }}
-          transition={{ duration: 0.3, ease: [0.22, 1, 0.36, 1] }}
-          className="sticky top-0 z-[60] overflow-hidden"
+          initial={{ opacity: 0, x: 32, scale: 0.97 }}
+          animate={{ opacity: 1, x: 0, scale: 1 }}
+          exit={{ opacity: 0, x: 24, scale: 0.97 }}
+          transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
+          className="fixed top-20 right-4 left-4 sm:left-auto sm:right-6 sm:max-w-[360px] z-[60]"
+          role="status"
         >
-          <div className="relative flex items-center justify-center gap-3 bg-gradient-to-r from-brand-blue/15 via-brand-sky/10 to-brand-cyan/15 border-b border-brand-blue/20 px-4 py-2.5">
-            <div className="absolute inset-0 bg-dark-bg/60 backdrop-blur-sm -z-10" />
+          <div className="relative rounded-xl border border-dark-border bg-dark-bg/95 backdrop-blur-xl shadow-xl shadow-black/20 p-4">
+            <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-brand-sky/50 to-transparent" />
 
-            <span className="relative flex h-2 w-2 shrink-0">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-brand-sky opacity-75" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-brand-sky" />
-            </span>
+            <div className="flex items-start gap-3">
+              <span className="relative flex h-2 w-2 shrink-0 mt-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-brand-sky opacity-75" />
+                <span className="relative inline-flex h-2 w-2 rounded-full bg-brand-sky" />
+              </span>
 
-            <p className="text-xs sm:text-sm text-dark-text-secondary text-center leading-relaxed">
-              {current.link ? (
+              <p className="text-[13px] text-dark-text-secondary leading-relaxed pr-5">
+                {t(current.messageKey)}
+              </p>
+
+              <button
+                onClick={handleDismiss}
+                className="absolute top-3 right-3 flex items-center justify-center w-6 h-6 rounded-full hover:bg-dark-surface3/50 transition-colors cursor-pointer"
+                aria-label={t("announcement.close")}
+              >
+                <svg
+                  width="13"
+                  height="13"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  className="text-dark-text-muted"
+                >
+                  <line x1="18" y1="6" x2="6" y2="18" />
+                  <line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            </div>
+
+            {current.link && (
+              <div className="mt-3 flex justify-end">
                 <a
                   href={current.link}
-                  className="hover:text-dark-text transition-colors underline underline-offset-2 decoration-brand-sky/40 hover:decoration-brand-sky"
+                  onClick={handleDismiss}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-brand-sky to-brand-cyan px-3.5 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition-opacity"
                 >
-                  {t(current.messageKey)}
+                  {t("announcement.cta")}
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M5 12h14" />
+                    <path d="m12 5 7 7-7 7" />
+                  </svg>
                 </a>
-              ) : (
-                <span>{t(current.messageKey)}</span>
-              )}
-            </p>
-
-            <button
-              onClick={handleDismiss}
-              className="shrink-0 flex items-center justify-center w-6 h-6 rounded-full hover:bg-dark-surface3/50 transition-colors cursor-pointer"
-              aria-label={t("announcement.close")}
-            >
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                className="text-dark-text-muted"
-              >
-                <line x1="18" y1="6" x2="6" y2="18" />
-                <line x1="6" y1="6" x2="18" y2="18" />
-              </svg>
-            </button>
+              </div>
+            )}
           </div>
         </motion.div>
       )}

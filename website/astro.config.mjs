@@ -119,6 +119,20 @@ export default defineConfig({
         optional: true,
       }),
 
+      // ── 可选：GitHub OAuth 登录（定价页投票/讨论需真实 GitHub 用户）──
+      // OAuth App 在 https://github.com/settings/developers 创建，
+      // 回调 URL 必须是 `<站点根>/api/auth/github/callback`（生产/本地各建一个 App）
+      GITHUB_OAUTH_CLIENT_ID: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      GITHUB_OAUTH_CLIENT_SECRET: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+
       // ── 可选：国内下载镜像（githubProxy 服务）根地址 ──
       // /api/download 对 CN 地域请求 302 到 `${MIRROR_BASE_URL}/releases/<tag>/<file>`，
       // 镜像不可达或未持有资产时自动回退 GitHub 直连。

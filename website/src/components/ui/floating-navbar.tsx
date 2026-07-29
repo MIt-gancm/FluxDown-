@@ -307,6 +307,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
   const directLinks: { name: string; link: string; external?: boolean }[] = [
     { name: t("nav.features"), link: "/#features" },
     { name: t("nav.download"), link: "/#download" },
+    { name: t("nav.pricing"), link: "/pricing" },
     { name: t("nav.demo"), link: DEMO_URL, external: true },
   ];
 

@@ -12,12 +12,18 @@ export interface Announcement {
 
 export const ANNOUNCEMENTS: Announcement[] = [
   {
+    id: "pricing-vote-open",
+    messageKey: "announcement.6",
+    link: "/pricing",
+    date: "2026-07-29",
+    active: true,
+  },
+  {
     id: "security-warning-fake-site",
     messageKey: "announcement.5",
-    link: "https://www.fluxdown.com",
+    link: "/security-alert",
     date: "2026-06-25",
-    active: true,
-    popup: true,
+    active: false,
   },
   {
     id: "logo-vote-active",

@@ -84,6 +84,7 @@ export default function Footer() {
                 { href: "/#download", label: t("footer.download") },
                 { href: "/changelog/", label: t("footer.changelog") },
                 { href: "/theme-builder/", label: t("footer.themeBuilder") },
+                { href: "/pricing/", label: t("footer.pricing") },
               ].map(({ href, label }) => (
                 <li key={href}>
                   <a
