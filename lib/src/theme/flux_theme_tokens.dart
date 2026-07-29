@@ -245,8 +245,10 @@ class FluxThemeTokens {
       accentHover: hover,
       accentBackground: accent.withValues(alpha: 0.10),
       accentForeground: fg,
-      // Input
-      inputBackground: const Color(0xFFFFFFFF),
+      // Input——字段用比面板深一档的浅灰填充（对话框/卡片是纯白，字段若
+      // 同为白就只剩一圈细边框，层次感尽失）。经 app_theme 接入 ShadTheme
+      // 的 input/select decoration，全局生效。
+      inputBackground: const Color(0xFFF2F4F7),
       inputBorder: const Color(0xFFE4E4E7),
       inputFocusBorder: accent,
       inputFocusBackground: const Color(0xFFFFFFFF),
@@ -383,7 +385,7 @@ class FluxThemeTokens {
       accentHover: hover,
       accentBackground: accent.withValues(alpha: 0.10),
       accentForeground: _foregroundFor(accent),
-      inputBackground: const Color(0xFFFFFFFF),
+      inputBackground: const Color(0xFFF9F5EA),
       inputBorder: const Color(0xFFE7E5E4),
       inputFocusBorder: accent,
       inputFocusBackground: const Color(0xFFFFFFFF),

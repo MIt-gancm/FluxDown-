@@ -363,6 +363,8 @@ class HeaderBarState extends State<HeaderBar> {
                         ),
                         style: const TextStyle(fontSize: 13),
                         decoration: const ShadDecoration(
+                          // 标题栏搜索框自带容器底色，覆盖主题字段填充保持透明。
+                          color: Color(0x00000000),
                           border: ShadBorder.none,
                           focusedBorder: ShadBorder.none,
                           secondaryFocusedBorder: ShadBorder.none,

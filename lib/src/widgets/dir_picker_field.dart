@@ -36,11 +36,13 @@ class DirPickerField extends StatelessWidget {
       child: MouseRegion(
         cursor: enabled ? SystemMouseCursors.click : SystemMouseCursors.basic,
         child: Container(
-          height: 36,
+          // 与全局 input/select 字段同一套视觉：32 高（对齐按钮 buttonHeightMd）、
+          // inputBg 填充、inputBorder 边框、radiusInput 圆角。
+          height: 32,
           decoration: BoxDecoration(
-            color: c.surface1,
-            borderRadius: m.brMd,
-            border: Border.all(color: c.border, width: 1),
+            color: c.inputBg,
+            borderRadius: m.brInput,
+            border: Border.all(color: c.inputBorder, width: 1),
           ),
           child: Row(
             children: [

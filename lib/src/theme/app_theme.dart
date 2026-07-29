@@ -30,6 +30,52 @@ ShadButtonSizesTheme _buttonSizes(FluxThemeTokens tokens) {
   );
 }
 
+/// input / select 统一字段内边距。默认 12/8 偏高（字段 ≈36px，比按钮
+/// 32px 高一头）；收到 10/6 后字段 ≈32px，与 buttonHeightMd 对齐。
+const _fieldPadding = EdgeInsets.symmetric(horizontal: 10, vertical: 6);
+
+/// input / select 的统一字段装饰。
+///
+/// 关键：把此前从未接入 ShadTheme 的 `inputBackground` token 落到字段
+/// 填充上——浅色主题下字段与面板同为纯白、仅剩一圈细边框的「贴纸感」
+/// 即源于此缺口。边框走 `inputBorder`/`radiusInput` token；焦点环仍由
+/// shadcn 全局 decoration 主题提供，此处不覆盖。
+ShadDecoration _fieldDecoration(FluxThemeTokens tokens) {
+  return ShadDecoration(
+    color: tokens.inputBackground,
+    border: ShadBorder.all(
+      radius: BorderRadius.circular(tokens.metric.radiusInput),
+      color: tokens.inputBorder,
+      width: 1,
+    ),
+  );
+}
+
+/// select 下拉主题：字段装饰/内边距与 input 一致；`effects: []` 让选项
+/// 列表点击即现——默认 150ms 渐显+缩放在高频操作里只显得迟钝。
+ShadSelectTheme _selectTheme(FluxThemeTokens tokens) {
+  return ShadSelectTheme(
+    padding: _fieldPadding,
+    effects: const [],
+    decoration: _fieldDecoration(tokens),
+  );
+}
+
+/// input 主题：光标色 + 紧凑内边距 + 字段装饰。
+///
+/// 字号 13：默认 muted 14px 是字段虚高的另一半来源（14×1.4+12+2 ≈ 37px）；
+/// 13px 后整字段 ≈32px，与按钮同高。仅覆盖 fontSize，字族/字色仍随主题。
+ShadInputTheme _inputTheme(FluxThemeTokens tokens) {
+  const fieldTextStyle = TextStyle(fontSize: 13);
+  return ShadInputTheme(
+    cursorColor: tokens.accent,
+    padding: _fieldPadding,
+    style: fieldTextStyle,
+    placeholderStyle: fieldTextStyle,
+    decoration: _fieldDecoration(tokens),
+  );
+}
+
 // ═══════════════════════════════════════════════════════════
 //  从 FluxThemeTokens 构建 ShadThemeData
 // ═══════════════════════════════════════════════════════════
@@ -80,7 +126,8 @@ ShadThemeData buildThemeFromTokens(FluxThemeTokens tokens) {
         thumbColor: tokens.switchThumb,
         uncheckedTrackColor: tokens.switchTrack,
       ),
-      inputTheme: ShadInputTheme(cursorColor: tokens.accent),
+      inputTheme: _inputTheme(tokens),
+      selectTheme: _selectTheme(tokens),
       primaryDialogTheme: ShadDialogTheme(
         animateIn: _dialogAnimateIn,
         animateOut: _dialogAnimateOut,
@@ -123,6 +170,8 @@ ShadThemeData buildThemeFromTokens(FluxThemeTokens tokens) {
       outlineButtonTheme: ShadButtonTheme(
         hoverBackgroundColor: tokens.elementHover,
       ),
+      inputTheme: _inputTheme(tokens),
+      selectTheme: _selectTheme(tokens),
       primaryDialogTheme: const ShadDialogTheme(
         animateIn: _dialogAnimateIn,
         animateOut: _dialogAnimateOut,
