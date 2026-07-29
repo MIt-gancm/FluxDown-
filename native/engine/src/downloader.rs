@@ -3264,11 +3264,27 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         // 里的旧时间已不属于磁盘上的字节。多段路径无此偏差——validator 失配即
         // 整体作废并回退单流（同样拿到锁存值），仍走多段完成的只能是原版本文件，
         // probe/DB 值即正确值。
-        let last_modified = single_result
+        //
+        // hint 模式（浏览器扩展 takeover，probe 被跳过）下 `resume_last_modified`
+        // 恒为空串——do_segment 已把首个响应的 validator 落到 DB（见
+        // segment_coordinator::check_cross_segment_validators 调用点），这里回读
+        // 补上，否则大文件（走多段）的 use_server_time 会静默退化为本地完成时间
+        // （此前只有单流下载受益）。
+        let latched = single_result
             .as_ref()
             .and_then(|r| r.latched_last_modified.as_deref())
-            .unwrap_or(&resume_last_modified);
-        apply_server_mtime(&final_dest, last_modified, &p.task_id).await;
+            .map(str::to_string);
+        let last_modified = match latched {
+            Some(lm) => lm,
+            None if !resume_last_modified.is_empty() => resume_last_modified.clone(),
+            None => p
+                .db
+                .get_task_validator(&p.task_id)
+                .await
+                .map(|(_, lm)| lm)
+                .unwrap_or_default(),
+        };
+        apply_server_mtime(&final_dest, &last_modified, &p.task_id).await;
     }
 
     Ok((actual_total, finalize_renamed))

@@ -4624,6 +4624,23 @@ async fn do_segment(
                  got etag=\"{resp_etag}\" lm=\"{resp_lm}\")"
             )));
         }
+
+        // hint 模式无 probe 基线：`tasks.orig_etag`/`orig_last_modified` 仍是空串。
+        // use_server_time 完成时靠 apply_server_mtime 读它落地文件 mtime,但多段路径
+        // 没有单流那样"直接锁存实际响应"的出口(见 run_download_inner 的
+        // single_result.latched_last_modified)——浏览器扩展 takeover 的大文件走多段,
+        // 永远拿不到服务器时间(use_server_time 静默失效,BUG-HINT-MULTISEG-NO-MTIME)。
+        // 这里把已通过跨段一致性校验的 validator 落库,供 run_download_inner 完成后
+        // 回读;每段都会重复写入同一份值,幂等无害。
+        if (!resp_etag.is_empty() || !resp_lm.is_empty())
+            && let Err(e) = db.set_task_validator(task_id, resp_etag, resp_lm).await
+        {
+            log_info!(
+                "[coordinator] task {} 持久化 hint 模式 validator 失败:{}(use_server_time 可能回退本地时间)",
+                task_id,
+                e
+            );
+        }
     }
 
     // --- 服务器自报真实总大小 > 规划总大小 → 规划偏小，继续会静默截断 -------------
