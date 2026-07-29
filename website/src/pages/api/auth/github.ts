@@ -1,6 +1,7 @@
 import type { APIRoute } from "astro";
 import {
   STATE_COOKIE,
+  oauthCallbackUrl,
   oauthConfigured,
   oauthClientId,
   randomState,
@@ -10,7 +11,7 @@ import {
 export const prerender = false;
 
 /** GET /api/auth/github?returnTo=/pricing — 跳转 GitHub 授权页（无 scope，仅公开身份） */
-export const GET: APIRoute = async ({ url, cookies, redirect }) => {
+export const GET: APIRoute = async ({ url, site, cookies, redirect }) => {
   if (!oauthConfigured()) {
     return new Response("GitHub OAuth not configured", { status: 500 });
   }
@@ -28,7 +29,7 @@ export const GET: APIRoute = async ({ url, cookies, redirect }) => {
 
   const params = new URLSearchParams({
     client_id: oauthClientId(),
-    redirect_uri: `${url.origin}/api/auth/github/callback`,
+    redirect_uri: oauthCallbackUrl(url, site),
     state,
   });
 

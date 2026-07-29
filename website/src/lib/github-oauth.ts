@@ -34,6 +34,16 @@ export function oauthClientSecret(): string {
   return GITHUB_OAUTH_CLIENT_SECRET ?? "";
 }
 
+/**
+ * OAuth 回调地址。生产环境 node standalone 跑在反向代理后面，
+ * `url.origin` 会解析成 localhost，必须以 astro.config 的 `site` 为准；
+ * 本地开发（另建指向 127.0.0.1 的 OAuth App）才用请求 origin。
+ */
+export function oauthCallbackUrl(url: URL, site: URL | undefined): string {
+  const origin = import.meta.env.PROD && site ? site.origin : url.origin;
+  return `${origin}/api/auth/github/callback`;
+}
+
 export function randomState(): string {
   return randomBytes(16).toString("hex");
 }
