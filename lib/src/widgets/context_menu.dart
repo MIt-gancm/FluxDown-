@@ -70,9 +70,21 @@ void showContextMenu(
       dividers.length * dividerHeight +
       8; // vertical padding
 
+  // globalPosition 来自原始指针事件的设备全局坐标，未经界面缩放
+  // （uiScale，见 UiScaleWidget）逆变换；Overlay 的 Positioned 坐标系是
+  // 该缩放下的逻辑坐标系（与本函数下方 MediaQuery.size 一致，main.dart
+  // 通过 MediaQuery.copyWith(size: mq.size/scale) 同步缩小）。直接把
+  // globalPosition 当 Positioned.left/top 用，uiScale≠1.0 时菜单会按
+  // (scale-1) 比例整体偏离鼠标（issue #193）。经 Overlay 自身 RenderBox
+  // 做一次 globalToLocal 修正——scale==1.0（无变换）时是恒等映射，不影响
+  // 现有行为。
+  final overlayBox = overlay.context.findRenderObject() as RenderBox?;
+  final localPosition = overlayBox == null
+      ? globalPosition
+      : overlayBox.globalToLocal(globalPosition);
   final screenSize = MediaQuery.of(context).size;
-  double left = globalPosition.dx;
-  double top = globalPosition.dy;
+  double left = localPosition.dx;
+  double top = localPosition.dy;
 
   if (left + menuWidth > screenSize.width) {
     left = screenSize.width - menuWidth - 4;
