@@ -21,7 +21,7 @@ use crate::logger::log_info;
 use crate::model::{
     MAIN_QUEUE_ID, QueueInfo, QueuePosition, SegmentDetail, TaskInfo, is_builtin_queue,
 };
-use crate::proxy_config::ProxyConfig;
+use crate::proxy_config::{ProxyConfig, ProxyMode};
 use crate::segment_coordinator::is_single_conn_domain;
 use crate::selection::HostSelection;
 use crate::speed_limiter::SpeedLimiter;
@@ -1122,6 +1122,14 @@ pub struct DownloadManager {
     retry_tx: mpsc::Sender<String>,
     /// 延迟重试通道接收端（仅取一次，交给 actor loop）。
     retry_rx: Option<mpsc::Receiver<String>>,
+    /// `ProxyMode::Auto` 的 host 级路由决策缓存（内存态，重启清零——
+    /// 网络环境易变，持久化过期决策比重探更伤）。与 coordinator 侧
+    /// 采样状态机共享同一份表（[`crate::auto_proxy::DecisionCache`]）。
+    auto_proxy_cache: crate::auto_proxy::DecisionCache,
+    /// 直连连接类失败后已写入代理租约、等待自动重试的任务集合。
+    /// resume 时消费一次，把该任务的路由标签定为 `proxy:failover`
+    /// （区别于普通缓存采纳的 `proxy:cached`，可追溯性）。
+    auto_failover_pending: HashSet<String>,
     /// 当前正在下载（或排队准备启动）的任务已预订的临时文件路径集合。
     ///
     /// 用于解决 `dedup_filename` 的 TOCTOU 竞态：多个并发任务同时调用
@@ -1257,6 +1265,8 @@ impl DownloadManager {
             auto_retry_delay_secs: DEFAULT_AUTO_RETRY_BASE_DELAY_SECS,
             retry_tx,
             retry_rx: Some(retry_rx),
+            auto_proxy_cache: crate::auto_proxy::DecisionCache::new(),
+            auto_failover_pending: HashSet::new(),
             reserved_temp_paths: HashSet::new(),
             sink,
             selector,
@@ -2181,6 +2191,10 @@ impl DownloadManager {
         // 网络出口变化：域名连接上限是对【旧出口】的服务器策略观察，
         // 换代理后不再可信，清空重学（内存 + 持久化）。
         crate::segment_coordinator::clear_domain_conn_caps(&self.db);
+        // ProxyMode::Auto 的 host 决策同理：旧决策针对旧候选代理/旧出口，
+        // 全部作废（failover 标记一并清除，避免过期标签误导可追溯性）。
+        self.auto_proxy_cache.clear();
+        self.auto_failover_pending.clear();
         Ok(())
     }
 
@@ -2744,6 +2758,30 @@ impl DownloadManager {
                     // 退避期间该任务仍算占用队列，防止误报 `queue.drained`。
                     self.retry_scheduled
                         .insert(task_id.to_string(), task.queue_id.clone());
+                    // ProxyMode::Auto failover 支路：直连的连接类失败（被墙/
+                    // 链路劣化）且候选代理存在 → 给该 host 写代理租约，让即将
+                    // 到来的自动重试直接以代理起飞；auto_failover_pending 使
+                    // resume 把路由记为 proxy:failover（可追溯）。仅在该 host
+                    // 无任何缓存决策时介入：已判代理说明失败发生在代理链路上
+                    // （再 failover 是死循环），Cooldown/NoSwitch 是新鲜的反证。
+                    if self.proxy_config.mode == ProxyMode::Auto
+                        && task.proxy_url.is_empty()
+                        && !is_bt_url(&task.url)
+                        && !crate::ed2k::link::is_ed2k_url(&task.url)
+                        && crate::auto_proxy::is_connect_class_error(&task.error_message)
+                        && crate::auto_proxy::resolve_candidate(&self.proxy_config).is_some()
+                        && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
+                        && self.auto_proxy_cache.lookup(&host).is_none()
+                    {
+                        log_info!(
+                            "[manager] auto-proxy failover: task {} host {} 直连连接失败，重试将经代理",
+                            task_id,
+                            host
+                        );
+                        self.auto_proxy_cache
+                            .set(&host, crate::auto_proxy::Decision::Proxy);
+                        self.auto_failover_pending.insert(task_id.to_string());
+                    }
                 } else {
                     log_info!(
                         "[manager] auto-retry exhausted for task {} ({} attempts), staying in error",
@@ -3488,8 +3526,13 @@ impl DownloadManager {
                     extra_headers.clone(),
                     body.clone(),
                 );
-                let (probe_client, probe_proxy) =
-                    self.task_http_context(&proxy_url, &user_agent, &queue_id, ignore_tls_errors);
+                let (probe_client, probe_proxy, _) = self.task_http_context(
+                    &db_url,
+                    &proxy_url,
+                    &user_agent,
+                    &queue_id,
+                    ignore_tls_errors,
+                );
                 self.spawn_meta_probe(
                     task_id,
                     db_url,
@@ -3564,7 +3607,8 @@ impl DownloadManager {
                 queued.extra_headers.clone(),
                 queued.body.clone(),
             );
-            let (probe_client, probe_proxy) = self.task_http_context(
+            let (probe_client, probe_proxy, _) = self.task_http_context(
+                &queued.url,
                 &queued.proxy_url,
                 &queued.user_agent,
                 &queued.queue_id,
@@ -3630,38 +3674,109 @@ impl DownloadManager {
         }
     }
 
+    /// `ProxyMode::Auto` 的启动期路由决策（每任务一次）：
+    /// - 非 Auto 模式 → `None`（沿用既有代理解析路径）；
+    /// - Auto 且无候选代理 / URL 无 host → 直连，无切换上下文（零开销短路）；
+    /// - Auto 且缓存判该 host 走代理 → 有效代理 = 候选，路由 `proxy:cached`；
+    /// - Auto 且直连起飞 → 有效代理 = 直连（保留多 CDN 聚合资格），路由
+    ///   `direct`，并在任务未忽略 TLS 时携带热切换上下文供 coordinator
+    ///   采样/切换（忽略 TLS 的任务与 CDN 聚合同理排除在采样之外）。
+    fn auto_route_decision(
+        &self,
+        url: &str,
+        user_agent: &str,
+        ignore_tls_errors: bool,
+    ) -> Option<(
+        ProxyConfig,
+        &'static str,
+        Option<Arc<crate::auto_proxy::AutoProxyCtx>>,
+    )> {
+        use crate::auto_proxy::{self, Decision};
+        if self.proxy_config.mode != ProxyMode::Auto {
+            return None;
+        }
+        let Some(candidate) = auto_proxy::resolve_candidate(&self.proxy_config) else {
+            return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
+        };
+        let Some(host) = crate::segment_coordinator::extract_host(url) else {
+            return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
+        };
+        if self.auto_proxy_cache.lookup(&host) == Some(Decision::Proxy) {
+            return Some((candidate, auto_proxy::route::PROXY_CACHED, None));
+        }
+        let ctx = (!ignore_tls_errors).then(|| {
+            Arc::new(crate::auto_proxy::AutoProxyCtx {
+                candidate,
+                cache: self.auto_proxy_cache.clone(),
+                host,
+                user_agent: user_agent.to_string(),
+            })
+        });
+        Some((ProxyConfig::default(), auto_proxy::route::DIRECT, ctx))
+    }
+
     /// 为当前任务解析代理/UA/TLS 策略并构建一致的 HTTP 上下文。
+    ///
+    /// 返回三元组的第三项是 `ProxyMode::Auto` 的启动期决策产物
+    /// `(路由标签, 热切换上下文)`——非 Auto 模式恒为 `("", None)`，
+    /// meta-probe 等只关心 client 的调用方可直接忽略。
     fn task_http_context(
         &self,
+        url: &str,
         proxy_url: &str,
         user_agent: &str,
         queue_id: &str,
         ignore_tls_errors: bool,
-    ) -> (Client, ProxyConfig) {
+    ) -> (
+        Client,
+        ProxyConfig,
+        (&'static str, Option<Arc<crate::auto_proxy::AutoProxyCtx>>),
+    ) {
         let queue_ua = self
             .queues
             .get(queue_id)
             .map(|q| q.default_user_agent.as_str())
             .unwrap_or("");
         let resolved_ua = self.resolved_task_ua(user_agent, queue_id);
+        // ProxyMode::Auto 启动期决策（per-task 代理优先级更高，非空时跳过）。
+        let auto = if proxy_url.is_empty() {
+            self.auto_route_decision(url, resolved_ua, ignore_tls_errors)
+        } else {
+            None
+        };
+        let (auto_override, auto_outcome) = match auto {
+            Some((proxy, route, ctx)) => (Some(proxy), (route, ctx)),
+            None => (None, ("", None)),
+        };
+        // Auto 判走代理时必须构建专属 client（全局 client 在 Auto 下恒直连）。
+        let auto_needs_proxy_client =
+            matches!(&auto_override, Some(p) if p.mode != ProxyMode::None);
         let needs_dedicated_client = !proxy_url.is_empty()
             || !user_agent.is_empty()
             || !queue_ua.is_empty()
-            || ignore_tls_errors;
+            || ignore_tls_errors
+            || auto_needs_proxy_client;
         if !needs_dedicated_client {
-            return (self.client.clone(), self.proxy_config.resolve());
+            let proxy = auto_override.unwrap_or_else(|| self.proxy_config.resolve());
+            return (self.client.clone(), proxy, auto_outcome);
         }
 
-        let proxy = if proxy_url.is_empty() {
-            self.proxy_config.resolve()
+        let proxy = if !proxy_url.is_empty() {
+            // `.resolve()`：把 system:// 哨兵（System 模式）现场具体化为
+            // Manual/直连，使 FTP 直读 host/port 与 CDN 门槛判定一致生效。
+            ProxyConfig::from_proxy_url(proxy_url).resolve()
+        } else if let Some(p) = auto_override {
+            p
         } else {
-            ProxyConfig::from_proxy_url(proxy_url)
+            self.proxy_config.resolve()
         };
         match downloader::build_client_with_tls_policy(&proxy, resolved_ua, ignore_tls_errors) {
-            Ok(client) => (client, proxy),
+            Ok(client) => (client, proxy, auto_outcome),
             Err(e) => {
                 log_info!("[manager] failed to build per-task client: {}", e);
-                (self.client.clone(), self.proxy_config.resolve())
+                // 构建失败降级为全局直连 client——不再对路由做任何声明
+                // （空标签），避免「标签说代理、实际走直连」的可追溯性谎言。
+                (self.client.clone(), self.proxy_config.resolve(), ("", None))
             }
         }
     }
@@ -3974,8 +4089,26 @@ impl DownloadManager {
                     .await;
             })
         } else {
-            let (task_client, task_proxy) =
-                self.task_http_context(&proxy_url, &user_agent, &queue_id, ignore_tls_errors);
+            let (task_client, task_proxy, (auto_route, auto_ctx)) =
+                self.task_http_context(&url, &proxy_url, &user_agent, &queue_id, ignore_tls_errors);
+            // ProxyMode::Auto 可追溯性：启动基线路由落库（非 Auto 写空串清除
+            // 旧标签），非空时广播给客户端原位刷新详情面板「链路」行。
+            // 手动重启一个曾排定 failover 重试的任务时消费其标记。
+            let auto_route =
+                if self.auto_failover_pending.remove(&task_id) && auto_route.starts_with("proxy") {
+                    crate::auto_proxy::route::PROXY_FAILOVER
+                } else {
+                    auto_route
+                };
+            if let Err(e) = self.db.set_task_auto_route(&task_id, auto_route).await {
+                log_info!("[manager] task {} auto_route 落库失败: {}", task_id, e);
+            }
+            if !auto_route.is_empty() {
+                self.sink.emit(EngineEvent::TaskRouteChanged {
+                    task_id: task_id.clone(),
+                    route: auto_route.to_string(),
+                });
+            }
             // ---------------------------------------------------------------
             // 文件名最终决策：manager 是文件名的唯一决策者
             //
@@ -4162,6 +4295,7 @@ impl DownloadManager {
                 spawn_gen: spawn_gen as i64,
                 ffmpeg_path: crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await,
                 cdn,
+                auto_proxy: auto_ctx,
             };
 
             tokio::spawn(async move {
@@ -4831,14 +4965,45 @@ impl DownloadManager {
         } else {
             // Resolve proxy and UA for resume: use global UA (cookies not
             // persisted in DB, so only proxy_url is available from task row).
+            //
+            // ProxyMode::Auto：与 start 路径同一决策器（缓存判代理 → 以代理
+            // 起飞；否则直连 + 热切换上下文）。failover 重试在此消费标记，
+            // 把路由标签定为 proxy:failover（可追溯性）。
+            let was_failover = self.auto_failover_pending.remove(&tid);
+            let auto = if task.proxy_url.is_empty() {
+                self.auto_route_decision(&task.url, &self.global_user_agent, task.ignore_tls_errors)
+            } else {
+                None
+            };
+            let (auto_override, (auto_route, auto_ctx)) = match auto {
+                Some((proxy, route, ctx)) => (Some(proxy), (route, ctx)),
+                None => (None, ("", None)),
+            };
+            let auto_route = if was_failover && auto_route.starts_with("proxy") {
+                crate::auto_proxy::route::PROXY_FAILOVER
+            } else {
+                auto_route
+            };
+            if let Err(e) = self.db.set_task_auto_route(&tid, auto_route).await {
+                log_info!("[manager] task {} auto_route 落库失败: {}", tid, e);
+            }
+            if !auto_route.is_empty() {
+                self.sink.emit(EngineEvent::TaskRouteChanged {
+                    task_id: tid.clone(),
+                    route: auto_route.to_string(),
+                });
+            }
             let needs_rebuild = !task.proxy_url.is_empty()
                 || !self.global_user_agent.is_empty()
-                || task.ignore_tls_errors;
+                || task.ignore_tls_errors
+                || matches!(&auto_override, Some(p) if p.mode != ProxyMode::None);
             let (task_client, task_proxy) = if needs_rebuild {
-                let pc = if task.proxy_url.is_empty() {
-                    self.proxy_config.resolve()
+                let pc = if !task.proxy_url.is_empty() {
+                    ProxyConfig::from_proxy_url(&task.proxy_url).resolve()
+                } else if let Some(p) = auto_override {
+                    p
                 } else {
-                    ProxyConfig::from_proxy_url(&task.proxy_url)
+                    self.proxy_config.resolve()
                 };
                 match downloader::build_client_with_tls_policy(
                     &pc,
@@ -4852,7 +5017,8 @@ impl DownloadManager {
                     }
                 }
             } else {
-                (self.client.clone(), self.proxy_config.resolve())
+                let pc = auto_override.unwrap_or_else(|| self.proxy_config.resolve());
+                (self.client.clone(), pc)
             };
             // Range 未验证的 hint 任务（tasks.range_verified==0：源自浏览器扩展
             // hint、从未拿到过 206/Accept-Ranges 证据）：resume 以 DB 里的
@@ -4927,6 +5093,7 @@ impl DownloadManager {
                 spawn_gen: spawn_gen as i64,
                 ffmpeg_path: crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await,
                 cdn,
+                auto_proxy: auto_ctx,
             };
 
             tokio::spawn(async move {
@@ -4975,6 +5142,7 @@ impl DownloadManager {
         // 清除自动重试计数，与 delete_task / resume_task 对齐。取消是用户的
         // 明确意图，必须从自动重试状态中移除，使后续 create/resume 干净起步。
         self.auto_retry_counts.remove(task_id);
+        self.auto_failover_pending.remove(task_id);
         self.clear_pending_resolve(task_id);
 
         // Remove from pending queue if queued.
@@ -5038,6 +5206,7 @@ impl DownloadManager {
     /// attempt to remove files.  A 5-second timeout prevents indefinite hangs.
     pub async fn delete_task(&mut self, task_id: &str, delete_files: bool) {
         self.auto_retry_counts.remove(task_id);
+        self.auto_failover_pending.remove(task_id);
         self.retry_scheduled.remove(task_id);
         self.clear_pending_resolve(task_id);
 

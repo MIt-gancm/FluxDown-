@@ -29,9 +29,10 @@ export function DownloadSettings({
   const proxyMode = config.proxy_mode ?? 'none'
 
   /** 开启多 CDN 并发时与代理互斥（对齐桌面端 _onCdnMultiChanged）：代理已启用则
-   *  弹确认框——确认「关闭代理并开启」一次写入两个键，取消则不改任何状态。 */
+   *  弹确认框——确认「关闭代理并开启」一次写入两个键，取消则不改任何状态。
+   *  Auto 模式视同可用：CDN 聚合对直连任务仍然生效，不触发互斥。 */
   async function onCdnMultiChange(v: boolean) {
-    if (!v || proxyMode === 'none') {
+    if (!v || proxyMode === 'none' || proxyMode === 'auto') {
       mutate({ cdn_multi_enabled: v ? '1' : '0' })
       return
     }

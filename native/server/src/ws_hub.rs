@@ -273,6 +273,9 @@ impl EventSink for EngineEventSink {
             EngineEvent::TaskQueueChanged { task_id, queue_id } => {
                 WsServerMsg::TaskQueueChanged { task_id, queue_id }
             }
+            EngineEvent::TaskRouteChanged { task_id, route } => {
+                WsServerMsg::TaskRouteChanged { task_id, route }
+            }
             EngineEvent::PriorityTaskChanged {
                 priority_task_id,
                 auto_paused_count,
@@ -971,6 +974,7 @@ mod tests {
             group_id: String::new(),
             rss_source_id: String::new(),
             origin_url: String::new(),
+            auto_route: String::new(),
         }]));
 
         let snap = hub.live_speeds_snapshot();
@@ -1001,6 +1005,7 @@ mod tests {
             group_id: String::new(),
             rss_source_id: String::new(),
             origin_url: String::new(),
+            auto_route: String::new(),
         }
     }
 

@@ -167,6 +167,7 @@ class MobileSettingsScreen extends StatelessWidget {
                           value: switch (settings.proxyMode) {
                             'system' => s.proxyModeSystem,
                             'manual' => s.proxyModeManual,
+                            'auto' => s.proxyModeAuto,
                             _ => s.proxyModeNone,
                           },
                           onTap: () => _selectProxyMode(context),
@@ -411,6 +412,7 @@ class MobileSettingsScreen extends StatelessWidget {
         ('none', s.proxyModeNone),
         ('system', s.proxyModeSystem),
         ('manual', s.proxyModeManual),
+        ('auto', s.proxyModeAuto),
       ],
       onSelect: settings.setProxyMode,
     );

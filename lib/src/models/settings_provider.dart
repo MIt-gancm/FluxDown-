@@ -92,7 +92,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _ed2kAssocUserDisabled = false;
 
   // 代理设置
-  String _proxyMode = 'none'; // none / system / manual
+  String _proxyMode = 'none'; // none / system / manual / auto
   String _proxyType = 'http'; // http / https / socks4 / socks5
   String _proxyHost = '';
   String _proxyPort = '';

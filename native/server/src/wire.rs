@@ -222,6 +222,9 @@ pub enum WsServerMsg {
     QueuesChanged { queues: Vec<QueueDto> },
     /// 单任务队列归属变化（move_task_to_queue 定向广播）。
     TaskQueueChanged { task_id: String, queue_id: String },
+    /// `ProxyMode::Auto` 任务的链路决策落定/变更（详情面板「链路」行）。
+    /// `route` wire 标签同 `TaskDto.autoRoute`；恒非空。
+    TaskRouteChanged { task_id: String, route: String },
     /// 队列内位置批量更新。
     QueuePositionsChanged { positions: Vec<QueuePositionDto> },
     /// Boost 优先任务变化。
@@ -881,6 +884,7 @@ mod tests {
             group_id: String::new(),
             rss_source_id: String::new(),
             origin_url: String::new(),
+            auto_route: String::new(),
             queue_order: 0,
         }
     }

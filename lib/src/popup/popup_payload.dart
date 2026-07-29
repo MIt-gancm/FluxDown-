@@ -61,6 +61,16 @@ class QuickPopupPayload {
   /// 分别对应设备选择器里的云账户分组与本地直连分组）。
   final List<QuickDeviceOption> localDevices;
 
+  /// 是否检测到系统代理（主引擎 SystemProxyStatusService 缓存值；popup
+  /// isolate 零 Rust 初始化，禁用规则数据只能随载荷注入）。
+  final bool systemProxyDetected;
+
+  /// 检测到的系统代理摘要，如 'http://127.0.0.1:7890'（'' = 未检测到）。
+  final String systemProxySummary;
+
+  /// 全局手动代理 URL（'' = 未配置）。
+  final String manualProxyUrl;
+
   const QuickPopupPayload({
     required this.requestId,
     required this.url,
@@ -77,6 +87,9 @@ class QuickPopupPayload {
     required this.queues,
     this.devices = const [],
     this.localDevices = const [],
+    this.systemProxyDetected = false,
+    this.systemProxySummary = '',
+    this.manualProxyUrl = '',
   });
 
   String toJsonString() => jsonEncode({
@@ -105,6 +118,9 @@ class QuickPopupPayload {
       ],
       'devices': _deviceOptionsToJson(devices),
       'localDevices': _deviceOptionsToJson(localDevices),
+      'systemProxyDetected': systemProxyDetected,
+      'systemProxySummary': systemProxySummary,
+      'manualProxyUrl': manualProxyUrl,
     },
   });
 
@@ -135,6 +151,9 @@ class QuickPopupPayload {
       ],
       devices: _deviceOptionsFromJson(env['devices']),
       localDevices: _deviceOptionsFromJson(env['localDevices']),
+      systemProxyDetected: env['systemProxyDetected'] as bool? ?? false,
+      systemProxySummary: env['systemProxySummary'] as String? ?? '',
+      manualProxyUrl: env['manualProxyUrl'] as String? ?? '',
     );
   }
 }

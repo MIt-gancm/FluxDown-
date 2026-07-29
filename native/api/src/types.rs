@@ -164,6 +164,7 @@ pub struct DownloadRequest {
 ///     group_id: String::new(),
 ///     rss_source_id: String::new(),
 ///     origin_url: String::new(),
+///     auto_route: String::new(),
 /// };
 /// let dto = TaskDto::from(info);
 /// assert_eq!(dto.task_id, "t1");
@@ -213,6 +214,11 @@ pub struct TaskDto {
     /// `torrent-file://local` 哨兵，客户端「复制链接」应优先取本字段。
     #[serde(default)]
     pub origin_url: String,
+    /// `ProxyMode::Auto` 的任务级最终链路（可追溯性）：`direct` /
+    /// `direct:sampled` / `direct:pinned` / `proxy:cached` /
+    /// `proxy:sampled` / `proxy:failover`；空 = 非 Auto 模式。
+    #[serde(default)]
+    pub auto_route: String,
     /// 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）。
     #[serde(default)]
     pub queue_order: i32,
@@ -240,6 +246,7 @@ impl From<fluxdown_engine::model::TaskInfo> for TaskDto {
             group_id: t.group_id,
             rss_source_id: t.rss_source_id,
             origin_url: t.origin_url,
+            auto_route: t.auto_route,
             queue_order: t.queue_order,
         }
     }
@@ -992,6 +999,7 @@ mod tests {
             group_id: "g1".to_string(),
             rss_source_id: String::new(),
             origin_url: String::new(),
+            auto_route: String::new(),
             queue_order: 7,
         };
         let v = serde_json::to_value(&dto).unwrap();

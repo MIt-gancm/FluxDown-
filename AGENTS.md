@@ -177,7 +177,7 @@ FluxDown/
 **双后端**：URL scheme 选后端（`sqlite:`/`postgres:`）；两份 DDL 常量（`SQLITE_SCHEMA`/`POSTGRES_SCHEMA`，仅 `BLOB→BYTEA` 与字节列 `BIGINT` 不同）；运行时 SQL 统一 `$N` 占位符；`add_column_if_missing` 幂等迁移（新库建表即全列，旧桌面库经 ALTER 升级）。SQLite 侧 WAL + 外键 + busy_timeout=5000。
 
 **当前表（列以 db.rs 为准，此处仅索引）**：
-- `tasks`(id PK, url, file_name, save_dir, status, total/downloaded_bytes, segments, created_at, error_message, proxy_url, queue_id, checksum, ignore_tls_errors, bt_selected_files, bt_custom_name, orig_etag, orig_last_modified, audio_url, file_missing, `range_verified`（配额端点续传验证）, queue_order；迁移列：cookies, referrer, extra_headers, resolver_plugin_id, segments_epoch, completed_at, group_id, resolver_item, rss_source_id（RSS 溯源，空=非 RSS 来源）, `origin_url`（展示用真实来源；`.torrent` 任务的 `url` 是 `torrent-file://local` 哨兵，「复制链接」类 UI **一律**读它并空则回退 `url`——Dart `DownloadTask.shareUrl` / web `taskShareUrl()`）)
+- `tasks`(id PK, url, file_name, save_dir, status, total/downloaded_bytes, segments, created_at, error_message, proxy_url, queue_id, checksum, ignore_tls_errors, bt_selected_files, bt_custom_name, orig_etag, orig_last_modified, audio_url, file_missing, `range_verified`（配额端点续传验证）, queue_order；迁移列：cookies, referrer, extra_headers, resolver_plugin_id, segments_epoch, completed_at, group_id, resolver_item, rss_source_id（RSS 溯源，空=非 RSS 来源）, `origin_url`（展示用真实来源；`.torrent` 任务的 `url` 是 `torrent-file://local` 哨兵，「复制链接」类 UI **一律**读它并空则回退 `url`——Dart `DownloadTask.shareUrl` / web `taskShareUrl()`）, `auto_route`（`ProxyMode::Auto` 的任务级最终链路，wire 标签见 `auto_proxy::route`；空=非 Auto））
 - `task_segments`(复合 PK task_id+segment_index；旧库遗留 id AUTOINCREMENT 不再读)
 - `task_groups`(id PK, name, source_url, save_dir, created_at)
 - `config`(key PK, value)——**所有设置键**都存这里
@@ -227,7 +227,8 @@ FluxDown/
 - `segment_coordinator.rs`（~5300 行）：IDM 式动态分段（按需分配、对半拆最大在传分段救慢速、连接复用、per-domain 连接策略学习——负面上限 + 正面起步提示双观察面、`fallocate` 预分配）。
 - `speed_limiter.rs`：全局 token bucket（Arc 可克隆，limit==0=不限）。
 - `meta_prober.rs`：队列任务后台探测文件名/大小（8s；HTTP HEAD / FTP SIZE / magnet dn= / torrent 跳过）。
-- `proxy_config.rs`：无/系统（Windows 注册表）/手动；HTTP/HTTPS/SOCKS4/5；`test_proxy_connection` 测延迟。
+- `proxy_config.rs`：无/系统（Windows 注册表）/手动/**自动**（`ProxyMode::Auto`）；HTTP/HTTPS/SOCKS4/5；`test_proxy_connection` 测延迟。
+- `auto_proxy.rs`：`ProxyMode::Auto` 决策机器——任务直连启动（保留 CDN 聚合资格），慢任务经候选代理（系统代理，回退手动字段）采 256KB 样，单连接吞吐 ≥2× 才经 `NodePool::switch_to_client` 分段边界热切换；host 级决策缓存（内存态 TTL，不落库）；采样 validator 不一致 = 禁切换（完整性优先）；直连连接类失败 → 自动重试转代理（failover）。任务级最终链路落 `tasks.auto_route` + `EngineEvent::TaskRouteChanged`（wire 标签见 `auto_proxy::route`），双端详情面板「链路」行可追溯。
 - `disk_space.rs`：跨平台余量查询（HLS remux/DASH mux ENOSPC 预检）。
 - `proc.rs`：`no_console_window` —— **每个 console 子进程 spawn 都必须包裹**（ffmpeg/ffprobe/yt-dlp/tar/探版），防 Windows 闪窗。
 - `data_dir.rs`：数据目录解析（Windows 便携 `<exe>/portable_data` via `portable` 标记 vs 安装 `%LOCALAPPDATA%`；Linux XDG；macOS App Support；Android files dir）+ 旧版迁移。**Dart 侧 `services/platform_utils.dart` 的 KNOWN_ITEMS 必须与此同步。**

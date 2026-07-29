@@ -75,6 +75,12 @@ pub enum EngineEvent {
     /// hub → `TaskQueueChanged` 信号；server → WS `taskQueueChanged`。
     TaskQueueChanged { task_id: String, queue_id: String },
 
+    /// `ProxyMode::Auto` 任务的链路决策落定/变更——启动基线（direct /
+    /// proxy:cached）与运行中热切换（proxy:sampled 等）都会发送，客户端据此
+    /// 原位刷新详情面板「链路」行。wire 标签见 `crate::auto_proxy::route`。
+    /// hub → `TaskRouteChanged` 信号；server → WS `taskRouteChanged`。
+    TaskRouteChanged { task_id: String, route: String },
+
     /// Boost 模式的优先下载任务发生变化。对应 `hub::signals::PriorityTaskChanged`。
     PriorityTaskChanged {
         /// 当前优先任务 ID。空字符串 = Boost 模式未激活。

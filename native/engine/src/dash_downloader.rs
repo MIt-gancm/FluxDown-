@@ -674,6 +674,9 @@ async fn download_track_coordinated(
         scope,
         p.spawn_gen,
         false, // DASH 轨：段数由轨长顾问决定，不走 hint 解封
+        // DASH 轨对不做 Auto 热切换（v1 边界：轨对是短分段串行流，切换收益
+        // 低且与 mux 时序纠缠）；启动期缓存决策/failover 已覆盖代理选择。
+        None,
     )
     .await;
 

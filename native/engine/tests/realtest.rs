@@ -645,6 +645,7 @@ async fn run_coord(
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
         false,
+        None,
     )
     .await;
     drop(tx);
@@ -1023,6 +1024,7 @@ async fn resume_after_cancel_is_byte_exact() {
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
         false,
+        None,
     )
     .await;
     drop(tx);
@@ -1064,6 +1066,7 @@ async fn resume_after_cancel_is_byte_exact() {
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         1,
         false,
+        None,
     )
     .await;
     drop(tx2);
@@ -1271,6 +1274,7 @@ async fn run_full(
 
     let params = DownloadParams {
         spawn_gen: 1,
+        auto_proxy: None,
         auto_max_connections: 0, // 测试不裁剪 advisor
         task_id: task_id.to_string(),
         url: url.to_string(),
@@ -1357,6 +1361,7 @@ async fn run_full_server_time(
 
     let params = DownloadParams {
         spawn_gen: 1,
+        auto_proxy: None,
         auto_max_connections: 0,
         task_id: task_id.to_string(),
         url: url.to_string(),
@@ -1499,6 +1504,7 @@ async fn use_server_time_uses_new_last_modified_after_version_change() {
     });
     let params = DownloadParams {
         spawn_gen: 1,
+        auto_proxy: None,
         auto_max_connections: 0,
         task_id: "mt-swap".to_string(),
         url,
@@ -2483,6 +2489,7 @@ async fn resume_of_unverified_hint_task_stays_plain_get() {
     let cancel = CancellationToken::new();
     let params = DownloadParams {
         spawn_gen: 1,
+        auto_proxy: None,
         auto_max_connections: 16,
         task_id: "rp".to_string(),
         url,
@@ -2716,6 +2723,7 @@ async fn manual_real_url_hint_download() {
     let cancel = CancellationToken::new();
     let params = DownloadParams {
         spawn_gen: 1,
+        auto_proxy: None,
         auto_max_connections: 16, // 与桌面 App 默认 user_cap 一致
         task_id: "manual".to_string(),
         url,
@@ -2871,6 +2879,7 @@ async fn transient_200_on_resume_is_absorbed_byte_exact() {
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
         false,
+        None,
     )
     .await;
     drop(tx);

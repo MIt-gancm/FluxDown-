@@ -1017,6 +1017,11 @@ class _HomePageState extends State<HomePage> {
                   controller: _controller,
                   settingsProvider: _settingsProvider,
                   viewPrefsStore: _viewPrefsStore,
+                  onOpenProxySettings: () => setState(() {
+                    _initialSettingsCategory = SettingsCategory.proxy;
+                    _initialSettingsHighlight = null;
+                    _showSettings = true;
+                  }),
                 ),
               ],
             ),

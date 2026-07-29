@@ -38,7 +38,7 @@ export function ProxySettings({
   async function onModeChange(v: string) {
     const cdnMultiEnabled = (config.cdn_multi_enabled ?? '0') === '1'
     if (v === mode) return
-    if (v === 'none' || !cdnMultiEnabled) {
+    if (v === 'none' || v === 'auto' || !cdnMultiEnabled) {
       mutate({ proxy_mode: v })
       return
     }
@@ -52,6 +52,7 @@ export function ProxySettings({
 
   const PROXY_MODE_OPTIONS = [
     { value: 'none', label: t('set.proxy.none') },
+    { value: 'auto', label: t('set.proxy.auto') },
     { value: 'system', label: t('set.proxy.system') },
     { value: 'manual', label: t('set.proxy.manual') },
   ]
@@ -92,6 +93,7 @@ export function ProxySettings({
         <SetRow title={t('set.proxy.mode')}>
           <SetSelect value={mode} onValueChange={(v) => void onModeChange(v)} options={PROXY_MODE_OPTIONS} />
         </SetRow>
+        {mode === 'auto' ? <p className="set-note">{t('set.proxy.autoDesc')}</p> : null}
         {mode === 'manual' ? (
           <>
             <SetRow title={t('set.proxy.type')} desc="HTTP / HTTPS / SOCKS4 / SOCKS5">

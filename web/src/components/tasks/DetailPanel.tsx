@@ -367,12 +367,28 @@ function LogTab({ t }: { t: ViewTask }) {
   )
 }
 
+/** Auto 代理路由标签 → i18n key（未知值原样显示）。 */
+const ROUTE_LABEL_KEYS: Record<string, import('../../lib/i18n').I18nKey> = {
+  direct: 'detail.route.direct',
+  'direct:sampled': 'detail.route.directSampled',
+  'direct:pinned': 'detail.route.directPinned',
+  'proxy:cached': 'detail.route.proxyCached',
+  'proxy:sampled': 'detail.route.proxySampled',
+  'proxy:failover': 'detail.route.proxyFailover',
+}
+
 function AdvancedTab({ t }: { t: ViewTask }) {
   const { t: tr } = useI18n()
   return (
     <>
       <DField label={tr('detail.checksum')} value={t.checksum || tr('detail.checksumNotSet')} />
       <DField label={tr('detail.proxy')} value={t.proxyUrl || tr('detail.proxyNotSet')} />
+      {t.autoRoute ? (
+        <DField
+          label={tr('detail.route')}
+          value={ROUTE_LABEL_KEYS[t.autoRoute] ? tr(ROUTE_LABEL_KEYS[t.autoRoute]) : t.autoRoute}
+        />
+      ) : null}
       <DField label={tr('detail.url')} value={t.url} copy />
       <DField label={tr('detail.savePath')} value={t.saveDir} />
       <p className="seg-note">{tr('detail.checksumFooterNote')}</p>

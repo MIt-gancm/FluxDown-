@@ -204,6 +204,7 @@ async fn run_one_real_download(
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
         false,
+        None,
     )
     .await;
 

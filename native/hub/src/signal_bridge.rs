@@ -35,6 +35,7 @@ impl From<model::TaskInfo> for signals::TaskInfo {
             group_id: t.group_id,
             rss_source_id: t.rss_source_id,
             origin_url: t.origin_url,
+            auto_route: t.auto_route,
         }
     }
 }

@@ -4,6 +4,8 @@
 //! 与 [`selection::HostSelection`] 两个 trait 与宿主(hub/CLI/Web+Server/Phone)
 //! 解耦,不绑定具体的 FFI/信号/传输协议。
 
+/// `ProxyMode::Auto`：直连优先、慢则采样、快则热切换的自动代理决策。
+pub mod auto_proxy;
 pub mod bt_downloader;
 pub mod cdn;
 pub mod components;

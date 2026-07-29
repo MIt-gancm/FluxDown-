@@ -283,6 +283,11 @@ function dispatch(msg: WsServerMsg) {
         old?.map((t) => (t.taskId === msg.taskId ? { ...t, queueId: msg.queueId } : t)),
       )
       break
+    case 'taskRouteChanged':
+      queryClientRef?.setQueryData<TaskDto[]>(['tasks'], (old) =>
+        old?.map((t) => (t.taskId === msg.taskId ? { ...t, autoRoute: msg.route } : t)),
+      )
+      break
     case 'queuePositionsChanged': {
       // 回写 queueOrder，驱动队列管理对话框「任务」Tab 的顺序实时重排。
       const pos = new Map(msg.positions.map((p) => [p.taskId, p.position]))

@@ -75,6 +75,11 @@ pub struct TaskInfo {
     /// 毫无意义;RSS 自动建任务时把 enclosure 直链存在这里,右键「复制下载
     /// 链接」才有东西可复制。
     pub origin_url: String,
+    /// `ProxyMode::Auto` 的任务级最终链路（可追溯性）。wire 标签见
+    /// [`crate::auto_proxy::route`]：`direct` / `direct:sampled` /
+    /// `direct:pinned` / `proxy:cached` / `proxy:sampled` / `proxy:failover`；
+    /// 空 = 非 Auto 模式或任务从未启动。
+    pub auto_route: String,
 }
 
 /// 命名队列元数据。字段对应 `hub::signals::QueueInfo`。

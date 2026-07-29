@@ -177,6 +177,7 @@ fn make_params(
 ) -> DownloadParams {
     DownloadParams {
         spawn_gen,
+        auto_proxy: None,
         task_id: "tpr".to_string(),
         url: format!("{base}/video"),
         save_dir: work_dir.to_string_lossy().to_string(),

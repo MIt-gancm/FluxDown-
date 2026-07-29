@@ -11,6 +11,7 @@ import '../models/download_controller.dart';
 import '../models/download_queue.dart';
 import '../models/download_task.dart';
 import '../models/rss_provider.dart';
+import '../models/task_proxy_choice.dart';
 import '../i18n/locale_provider.dart';
 import '../services/open_folder.dart';
 import '../theme/app_colors.dart';
@@ -1625,9 +1626,17 @@ class _DetailPanelState extends State<DetailPanel> {
           ),
           _buildInfoRow(
             s.taskProxy,
-            task.proxyUrl.isEmpty ? s.detailFollowGlobal : task.proxyUrl,
+            switch (task.proxyUrl) {
+              '' => s.detailFollowGlobal,
+              kProxyDirectSentinel => s.taskProxyRouteDirect,
+              kProxySystemSentinel => s.taskProxyChoiceSystem,
+              final url => url,
+            },
             c,
           ),
+          // Auto 代理模式下引擎选择的链路（空 = 非 Auto 模式，不显示）
+          if (task.autoRoute.isNotEmpty)
+            _buildInfoRow(s.taskRoute, s.taskRouteLabel(task.autoRoute), c),
           _buildThreadsConfigRow(c, task),
         ],
       ),

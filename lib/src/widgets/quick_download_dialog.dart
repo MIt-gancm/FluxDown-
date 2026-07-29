@@ -9,6 +9,7 @@ import '../services/cloud/cloud_auth_service.dart';
 import '../services/file_picker_service.dart';
 import '../services/quick_download_submitter.dart';
 import '../services/resolve_preview_client.dart';
+import '../services/system_proxy_status.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import 'manifest_select_dialog.dart';
@@ -104,8 +105,23 @@ class _QuickDownloadDialogShellState extends State<_QuickDownloadDialogShell> {
   /// 当前等待中的预解析；非 null 时表单动作区进入 loading 态。
   ResolvePreviewHandle? _previewHandle;
 
+  void _onProxyStatusChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    // 打开对话框即触发系统代理检测（在途去重）；结果经 listener 驱动
+    // 任务代理选择器的禁用态实时更新。
+    SystemProxyStatusService.instance
+      ..addListener(_onProxyStatusChanged)
+      ..refresh();
+  }
+
   @override
   void dispose() {
+    SystemProxyStatusService.instance.removeListener(_onProxyStatusChanged);
     _previewHandle?.cancel();
     _previewHandle = null;
     super.dispose();
@@ -237,6 +253,12 @@ class _QuickDownloadDialogShellState extends State<_QuickDownloadDialogShell> {
           initialCookies: widget.cookies,
           initialAudioUrl: widget.audioUrl,
           host: const _MainWindowFormHost(),
+          systemProxyDetected: SystemProxyStatusService.instance.detected,
+          systemProxySummary: SystemProxyStatusService.instance.summary,
+          manualProxyUrl: SettingsProvider.globalInstance == null
+              ? ''
+              : (manualProxyUrlFromSettings(SettingsProvider.globalInstance!) ??
+                    ''),
           resolving: _previewHandle != null,
           onCancelResolve: _cancelResolve,
           onSubmit: _onSubmit,

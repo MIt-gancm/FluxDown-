@@ -134,7 +134,7 @@ fn prune_stale_faces(entry: &mut ConnPolicyEntry, now: u64) -> bool {
 }
 
 /// 提取 URL 的 host 部分（含端口），用于域名级缓存的 key。
-fn extract_host(url: &str) -> Option<String> {
+pub(crate) fn extract_host(url: &str) -> Option<String> {
     url::Url::parse(url).ok().and_then(|u| {
         u.host_str().map(|h| {
             if let Some(port) = u.port() {
@@ -1278,6 +1278,9 @@ pub async fn run_coordinated_download(
     // auto_max_connections 等于引擎默认值）为 true；用户显式段数或自定义上限
     // 时 false，尊重其设定的天花板。
     allow_hint_uncap: bool,
+    // `ProxyMode::Auto` 直连起飞任务的热切换上下文（None = 非 Auto/无候选/
+    // 已按缓存走代理——三者皆无运行中切换，本函数零行为变化）。
+    auto_proxy: Option<Arc<crate::auto_proxy::AutoProxyCtx>>,
 ) -> Result<i64, DownloadError> {
     // ----- 0. Defensive checks ------------------------------------------------
     if total_bytes <= 0 {
@@ -1842,6 +1845,11 @@ pub async fn run_coordinated_download(
     let mut ramp_last_time = Instant::now();
     let mut ramp_interval = tokio::time::interval(Duration::from_secs(RAMP_TICK_SECS));
     ramp_interval.tick().await; // consume the immediate first tick
+
+    // ---- ProxyMode::Auto 热切换状态机（None 时零开销）----
+    // 由下方 ramp tick 驱动：守卫命中才 off-loop 采样，采样证明代理显著
+    // 更快时经 NodePool::switch_to_client 在分段边界切换（见 auto_proxy 模块文档）。
+    let mut auto_switch = auto_proxy.map(crate::auto_proxy::AutoSwitchState::new);
 
     // UI 进度快照：coordinator 单点每 UI_REPORT_INTERVAL_MS 汇总 seg_states，
     // 取代各 worker 内 200ms 分散上报（字段语义与原 worker 发送一致）。
@@ -2680,6 +2688,24 @@ pub async fn run_coordinated_download(
                     } = freeze
                 {
                     *ticks_waited = ticks_waited.saturating_add(1);
+                }
+
+                // ---- ProxyMode::Auto：慢任务的代理采样/热切换钩子 ----
+                // 观察值全部取自本 tick 现成状态，零新增统计；状态机内部
+                // off-loop 采样，本调用只做守卫判定/结果落地，不阻塞事件循环。
+                if let Some(state) = auto_switch.as_mut() {
+                    let obs = crate::auto_proxy::TickObs {
+                        throughput_bps: throughput,
+                        alive,
+                        remaining_bytes: effective_total_bytes.saturating_sub(bytes),
+                        limiter_active: speed_limiter.limit() > 0,
+                        conn_sensitive: conn_sensitive.load(Ordering::Relaxed),
+                    };
+                    state
+                        .on_ramp_tick(
+                            obs, &nodes, db, sink, task_id, url, spec, etag, last_modified,
+                        )
+                        .await;
                 }
 
                 // 正面学习采样：本窗口以 alive 条连接产生了真实吞吐且全程无

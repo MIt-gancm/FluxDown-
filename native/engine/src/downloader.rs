@@ -265,6 +265,11 @@ pub struct DownloadParams {
     /// 见 [`crate::cdn::CdnTaskInput`]）。`enabled == false`（默认）时多段
     /// 路径构造单节点池，行为与现状逐字节一致。
     pub cdn: crate::cdn::CdnTaskInput,
+    /// `ProxyMode::Auto` 直连起飞任务的热切换上下文（候选代理 + host 决策
+    /// 缓存），由 manager 构造（见 [`crate::auto_proxy::AutoProxyCtx`]）。
+    /// `None` = 非 Auto 模式 / 无候选代理 / 已按缓存决策走代理启动——
+    /// 三者都不存在「运行中切换」这回事，多段路径零行为变化。
+    pub auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
 }
 
 /// 将浏览器扩展捕获的额外 HTTP 头应用到请求构建器上。
@@ -1003,6 +1008,11 @@ fn build_client_inner(
                 log_info!("[build_client] manual proxy: incomplete config, using direct");
                 builder = builder.no_proxy();
             }
+        }
+        ProxyMode::Auto => {
+            // Auto 的全局/兜底 client 恒为直连：具体代理只会由 auto_proxy
+            // 决策路径以 Manual 配置显式构建（见 crate::auto_proxy 模块文档）。
+            builder = builder.no_proxy();
         }
     }
 
@@ -2822,6 +2832,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             &resume_last_modified,
             p.spawn_gen,
             allow_hint_uncap,
+            p.auto_proxy.clone(),
         )
         .await;
 
@@ -3277,12 +3288,12 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         let last_modified = match latched {
             Some(lm) => lm,
             None if !resume_last_modified.is_empty() => resume_last_modified.clone(),
-            None => p
-                .db
-                .get_task_validator(&p.task_id)
-                .await
-                .map(|(_, lm)| lm)
-                .unwrap_or_default(),
+            None => {
+                p.db.get_task_validator(&p.task_id)
+                    .await
+                    .map(|(_, lm)| lm)
+                    .unwrap_or_default()
+            }
         };
         apply_server_mtime(&final_dest, &last_modified, &p.task_id).await;
     }
@@ -3759,6 +3770,7 @@ async fn download_multi_segment(
     last_modified: &str,
     spawn_gen: i64,
     allow_hint_uncap: bool,
+    auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
 ) -> Result<i64, DownloadError> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent).await?;
@@ -3796,6 +3808,7 @@ async fn download_multi_segment(
         crate::segment_coordinator::ReportScope::whole_task(),
         spawn_gen,
         allow_hint_uncap,
+        auto_proxy,
     )
     .await
 }

@@ -939,6 +939,8 @@ class _SettingsSidebarState extends State<_SettingsSidebar> {
                 ),
                 style: const TextStyle(fontSize: 12),
                 decoration: const ShadDecoration(
+                  // 内嵌搜索框自带容器底色，覆盖主题字段填充保持透明。
+                  color: Color(0x00000000),
                   border: ShadBorder.none,
                   focusedBorder: ShadBorder.none,
                 ),
@@ -3018,7 +3020,8 @@ class _DownloadContent extends StatelessWidget {
   /// 选择「关闭代理并开启」或取消，避免开了却无效的误解。
   void _onCdnMultiChanged(BuildContext context, S s, bool value) {
     final mode = settingsProvider.proxyMode;
-    if (!value || mode == 'none') {
+    // auto 模式下 CDN 聚合对直连任务仍可用，视同不冲突。
+    if (!value || mode == 'none' || mode == 'auto') {
       settingsProvider.setCdnMultiEnabled(value);
       return;
     }
@@ -4115,7 +4118,8 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
   void _selectProxyMode(BuildContext context, S s, String mode) {
     final sp = widget.settingsProvider;
     if (sp.proxyMode == mode) return;
-    if (!sp.cdnMultiEnabled) {
+    // auto 模式下直连任务仍保留多 CDN 加速，与 CDN 聚合不互斥，直接应用。
+    if (!sp.cdnMultiEnabled || mode == 'auto') {
       _applyProxyMode(mode);
       return;
     }
@@ -4214,8 +4218,41 @@ class _ProxySettingsCardState extends State<_ProxySettingsCard> {
                   onTap: () => _selectProxyMode(context, s, 'manual'),
                 ),
               ),
+              Expanded(
+                child: _ProxyModeOption(
+                  icon: LucideIcons.sparkles,
+                  label: s.proxyModeAuto,
+                  selected: sp.proxyMode == 'auto',
+                  colors: c,
+                  onTap: () => _selectProxyMode(context, s, 'auto'),
+                ),
+              ),
             ],
           ),
+          // 自动模式说明（默认直连零额外流量；直连慢且代理明显更快时按站点切换；
+          // 直连任务保留多 CDN 加速）
+          if (sp.proxyMode == 'auto') ...[
+            const SizedBox(height: 16),
+            Divider(height: 1, color: m.borderFaint(c.border)),
+            const SizedBox(height: 14),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(LucideIcons.info, size: 14, color: c.textMuted),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    s.proxyModeAutoDesc,
+                    style: TextStyle(
+                      fontSize: 12,
+                      height: 1.5,
+                      color: c.textMuted,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
           // 系统代理只读展示
           if (sp.proxyMode == 'system') ...[
             const SizedBox(height: 16),

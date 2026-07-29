@@ -27,6 +27,7 @@ void main() {
     groupId: '',
     rssSourceId: '',
     originUrl: '',
+    autoRoute: '',
   );
 
   test('fromTaskInfo maps referrer', () {
@@ -81,6 +82,7 @@ void main() {
       groupId: '',
       rssSourceId: '',
       originUrl: '',
+      autoRoute: '',
     );
     final task = DownloadTask.fromTaskInfo(info);
     expect(task.checksum, 'sha256=deadbeef');

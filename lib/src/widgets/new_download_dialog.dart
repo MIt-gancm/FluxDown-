@@ -25,9 +25,12 @@ import '../i18n/locale_provider.dart';
 
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
+import '../models/task_proxy_choice.dart';
 import '../models/settings_provider.dart';
+import '../services/system_proxy_status.dart';
 import 'context_menu.dart';
 import 'split_action_button.dart';
+import 'task_proxy_selector.dart';
 import '../models/ua_presets.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
@@ -81,6 +84,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   final _saveDirController = TextEditingController();
   final _renameController = TextEditingController();
   final _proxyUrlController = TextEditingController();
+
+  /// 任务代理选择项（自定义 URL 仍走 [_proxyUrlController]）。
+  TaskProxyChoice _proxyChoice = TaskProxyChoice.followGlobal;
   final _userAgentController = TextEditingController();
 
   /// 任务 Cookie（#256）。Cookie 是独立入口，不并入 extra_headers。
@@ -214,6 +220,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   @override
   void initState() {
     super.initState();
+    // 打开对话框即触发系统代理检测（在途去重）；结果经 listener 驱动
+    // 任务代理选择器的禁用态实时更新。
+    SystemProxyStatusService.instance
+      ..addListener(_onProxyStatusChanged)
+      ..refresh();
     _saveDirController.text = widget.settingsProvider.effectiveDefaultSaveDir;
     _urlController.addListener(_onUrlChanged);
     _pasteUrlFromClipboard();
@@ -461,6 +472,7 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
 
   @override
   void dispose() {
+    SystemProxyStatusService.instance.removeListener(_onProxyStatusChanged);
     // selecting 阶段：已拿到 task_id，直接发 [-1] 让 Rust 暂停任务
     if (_btWaitPhase == 'selecting' && _btPendingTaskId != null) {
       SelectBtFiles(
@@ -918,6 +930,14 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     return map;
   }
 
+  void _onProxyStatusChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// 全局手动代理 URL（'' = 未配置）——选择器禁用规则与 wire 值共用。
+  String get _manualProxyUrl =>
+      manualProxyUrlFromSettings(widget.settingsProvider) ?? '';
+
   Future<void> _startDownloadInner(bool later, String? queueOverride) async {
     final saveDir = _saveDirController.text.trim();
     if (saveDir.isEmpty) return;
@@ -927,7 +947,11 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     // （设置的默认下载队列 / 打开对话框时侧栏正筛选的队列）。
     final queueId = queueOverride ?? (later ? kLaterQueueId : _selectedQueueId);
 
-    final proxyUrl = _proxyUrlController.text.trim();
+    final proxyUrl = proxyUrlFromChoice(
+      _proxyChoice,
+      _manualProxyUrl,
+      _proxyUrlController.text,
+    );
     final userAgent = _userAgentController.text.trim();
     final cookie = _cookie;
     final extraHeaders = _extraHeaders;
@@ -1795,9 +1819,15 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                     style: TextStyle(fontSize: 11, color: c.textMuted),
                   ),
                   const SizedBox(height: 6),
-                  ShadInput(
-                    controller: _proxyUrlController,
-                    placeholder: Text(s.taskProxyPlaceholder),
+                  TaskProxySelector(
+                    value: _proxyChoice,
+                    onChanged: (v) => setState(() => _proxyChoice = v),
+                    systemProxyDetected:
+                        SystemProxyStatusService.instance.detected,
+                    systemProxySummary:
+                        SystemProxyStatusService.instance.summary,
+                    manualProxyUrl: _manualProxyUrl,
+                    customController: _proxyUrlController,
                   ),
                   const SizedBox(height: 12),
                   Row(

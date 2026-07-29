@@ -353,6 +353,10 @@ class DownloadTask {
   /// 是否为远程设备上执行的任务（经 FluxCloud 回流的只读视图，非本地引擎任务）。
   final bool isRemote;
 
+  /// Auto 代理模式下引擎选择的链路标签（wire 值如 `direct` / `proxy:failover`；
+  /// 空 = 非 Auto 模式，详情面板不显示该行）。
+  final String autoRoute;
+
   // ── 站点分桶键（惰性缓存；见 view_prefs/list_entity 站点分组维度）──
   String? _siteKeyCache;
   String? _siteLabelCache;
@@ -386,6 +390,7 @@ class DownloadTask {
     this.proxyUrl = '',
     this.deviceId = '',
     this.isRemote = false,
+    this.autoRoute = '',
     this.completedAt,
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.now();
@@ -418,6 +423,7 @@ class DownloadTask {
       originUrl: info.originUrl,
       checksum: info.checksum,
       proxyUrl: info.proxyUrl,
+      autoRoute: info.autoRoute,
       createdAt: seconds > 0
           ? DateTime.fromMillisecondsSinceEpoch(seconds * 1000)
           : DateTime.now(),
@@ -455,6 +461,7 @@ class DownloadTask {
     String? originUrl,
     String? checksum,
     String? proxyUrl,
+    String? autoRoute,
     DateTime? createdAt,
     DateTime? completedAt,
   }) {
@@ -485,6 +492,7 @@ class DownloadTask {
       originUrl: originUrl ?? this.originUrl,
       checksum: checksum ?? this.checksum,
       proxyUrl: proxyUrl ?? this.proxyUrl,
+      autoRoute: autoRoute ?? this.autoRoute,
       createdAt: createdAt ?? this.createdAt,
       completedAt: clearCompletedAt ? null : (completedAt ?? this.completedAt),
     );

@@ -211,6 +211,9 @@ impl EventSink for RinfEventSink {
             EngineEvent::TaskQueueChanged { task_id, queue_id } => {
                 signals::TaskQueueChanged { task_id, queue_id }.send_signal_to_dart();
             }
+            EngineEvent::TaskRouteChanged { task_id, route } => {
+                signals::TaskRouteChanged { task_id, route }.send_signal_to_dart();
+            }
             EngineEvent::PriorityTaskChanged {
                 priority_task_id,
                 auto_paused_count,

@@ -251,6 +251,32 @@ impl NodePool {
             .unwrap_or(0)
     }
 
+    /// `ProxyMode::Auto` 热切换：把服务节点原子替换为 `client`（代理链路）。
+    ///
+    /// 语义：踢除全部钉定节点（代理路由按主机名走，与钉 IP 直连互斥）并
+    /// 替换 SYS 槽位的常驻 client。新租约自 [`Self::lease`] 起只会拿到代理
+    /// client；在途租约在旧 client 上跑完当前段后自然收敛——分段边界即
+    /// 切换边界，已下字节零丢弃。
+    ///
+    /// 刻意**不走**失败踢除路径：不发 `kick` 事件（这不是节点故障），并把
+    /// `no_aggregate_recorded` 置位，避免聚合熔断把「主动切换」误记成
+    /// 「该 host 不适合聚合」的 24h 持久化熔断标记。
+    pub fn switch_to_client(&self, client: Client) {
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        inner.no_aggregate_recorded = true;
+        for slot in &mut inner.slots {
+            if slot.ip.is_some() {
+                slot.kicked = true;
+            }
+        }
+        if let Some(sys) = inner.slots.first_mut() {
+            sys.client = Some(client);
+        }
+    }
+
     /// 永不阻塞、永不失败地租借一个节点。
     ///
     /// 钉定 client 懒建失败（极罕见的 builder 错误）→ 该节点按踢除处理并
@@ -692,6 +718,26 @@ mod tests {
             assert!(!l.is_pinned());
             held.push(l);
         }
+    }
+
+    #[test]
+    fn switch_to_client_retires_pinned_and_serves_new_client() {
+        let pool = test_pool(&[ip(2), ip(3)]);
+        assert_eq!(pool.alive_pinned(), 2);
+        // 在途租约不受影响地持有旧 client（切换只影响后续 lease）。
+        let (old_lease, _held) = pinned_lease(&pool);
+        pool.switch_to_client(reqwest::Client::new());
+        // 钉定节点全部退役，此后任意并发度的租约都只落 SYS（代理 client）。
+        assert_eq!(pool.alive_pinned(), 0);
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let l = pool.lease();
+            assert!(!l.is_pinned(), "切换后新租约不得再命中钉定节点");
+            held.push(l);
+        }
+        // 主动切换不得走熔断记录路径（kick 是节点故障语义，切换不是）。
+        assert!(pool.inner.lock().unwrap().no_aggregate_recorded);
+        drop(old_lease);
     }
 
     #[test]

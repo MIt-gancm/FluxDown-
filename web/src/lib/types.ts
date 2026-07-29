@@ -33,6 +33,9 @@ export interface TaskDto {
   groupId?: string
   /** 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）；旧服务端可能缺省 */
   queueOrder?: number
+  /** Auto 代理模式的路由标签（direct / direct:sampled / direct:pinned / proxy:cached /
+   *  proxy:sampled / proxy:failover；空 = 非 Auto 模式）；旧服务端可能缺省 */
+  autoRoute?: string
 }
 
 /** 任务组行（多文件下载的纯逻辑聚合壳）。 */
@@ -326,6 +329,7 @@ export type WsServerMsg =
   | { type: 'queuesChanged'; queues: QueueDto[] }
   | { type: 'groupsChanged'; groups: GroupDto[] }
   | { type: 'taskQueueChanged'; taskId: string; queueId: string }
+  | { type: 'taskRouteChanged'; taskId: string; route: string }
   | { type: 'queuePositionsChanged'; positions: { taskId: string; position: number }[] }
   | { type: 'priorityTaskChanged'; priorityTaskId: string; autoPausedCount: number }
   | { type: 'hlsSelectionRequest'; taskId: string; options: HlsQualityOption[] }

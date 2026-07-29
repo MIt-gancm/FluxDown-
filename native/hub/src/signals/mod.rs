@@ -340,6 +340,20 @@ pub struct TaskInfo {
     /// 展示用原始来源链接（空 = 用 `url`）。`.torrent` 任务的 `url` 是本地哨兵。
     #[serde(default)]
     pub origin_url: String,
+    /// `ProxyMode::Auto` 的任务级最终链路（空 = 非 Auto 模式）。wire 标签：
+    /// `direct` / `direct:sampled` / `direct:pinned` / `proxy:cached` /
+    /// `proxy:sampled` / `proxy:failover`。
+    #[serde(default)]
+    pub auto_route: String,
+}
+
+/// `ProxyMode::Auto` 任务的链路决策落定/变更（Rust → Dart）。启动基线与
+/// 运行中热切换都会发送，Dart 侧按 task_id 原位更新详情面板「链路」行。
+#[derive(Serialize, RustSignal)]
+pub struct TaskRouteChanged {
+    pub task_id: String,
+    /// wire 标签同 `TaskInfo.auto_route`；恒非空。
+    pub route: String,
 }
 
 /// 文件跟踪：一批已完成任务的「文件已丢失」标志变化（Rust → Dart）。

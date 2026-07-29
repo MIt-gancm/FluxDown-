@@ -109,6 +109,7 @@ async fn track_pair_reports_midway_progress_with_real_total() {
 
     let params = DownloadParams {
         spawn_gen: 1,
+        auto_proxy: None,
         task_id: "tp".to_string(),
         url: format!("{base}/video"),
         save_dir: work_dir.to_string_lossy().to_string(),

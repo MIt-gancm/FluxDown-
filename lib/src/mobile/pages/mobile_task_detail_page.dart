@@ -779,6 +779,10 @@ class _InfoCard extends StatelessWidget {
           row(s.infoPath, task.saveDir),
           _divider(c),
           row(s.mobileProtocol, task.protocolLabel),
+          if (task.autoRoute.isNotEmpty) ...[
+            _divider(c),
+            row(s.taskRoute, s.taskRouteLabel(task.autoRoute)),
+          ],
           _divider(c),
           row(s.mobileCreatedAt, createdText),
           if (task.errorMessage.isNotEmpty) ...[

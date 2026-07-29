@@ -958,6 +958,38 @@ class S {
   String get proxyModeSystemDesc => _r('proxyModeSystemDesc');
   String get proxyModeManual => _r('proxyModeManual');
   String get proxyModeManualDesc => _r('proxyModeManualDesc');
+  String get proxyModeAuto => _r('proxyModeAuto');
+  String get proxyModeAutoDesc => _r('proxyModeAutoDesc');
+  String get taskRoute => _r('taskRoute');
+  String get taskRouteDirect => _r('taskRouteDirect');
+  String get taskRouteDirectSampled => _r('taskRouteDirectSampled');
+  String get taskRouteDirectPinned => _r('taskRouteDirectPinned');
+  String get taskRouteProxyCached => _r('taskRouteProxyCached');
+  String get taskRouteProxySampled => _r('taskRouteProxySampled');
+  String get taskRouteProxyFailover => _r('taskRouteProxyFailover');
+
+  // 任务级代理选择(footer 快切 / 新建下载对话框)
+  String get taskProxyChoiceFollow => _r('taskProxyChoiceFollow');
+  String get taskProxyChoiceDirect => _r('taskProxyChoiceDirect');
+  String get taskProxyChoiceSystem => _r('taskProxyChoiceSystem');
+  String get taskProxyChoiceGlobalManual => _r('taskProxyChoiceGlobalManual');
+  String get taskProxyChoiceCustom => _r('taskProxyChoiceCustom');
+  String get taskProxyRouteDirect => _r('taskProxyRouteDirect');
+  String get proxyNotConfigured => _r('proxyNotConfigured');
+  String get proxySystemNotDetected => _r('proxySystemNotDetected');
+  String get statusBarProxyLabel => _r('statusBarProxyLabel');
+  String get proxyConfigureInSettings => _r('proxyConfigureInSettings');
+
+  /// Auto 代理链路 wire 标签 → 本地化文案；未知值原样返回。
+  String taskRouteLabel(String route) => switch (route) {
+    'direct' => taskRouteDirect,
+    'direct:sampled' => taskRouteDirectSampled,
+    'direct:pinned' => taskRouteDirectPinned,
+    'proxy:cached' => taskRouteProxyCached,
+    'proxy:sampled' => taskRouteProxySampled,
+    'proxy:failover' => taskRouteProxyFailover,
+    _ => route,
+  };
   String get proxyType => _r('proxyType');
   String get proxyHost => _r('proxyHost');
   String get proxyHostPlaceholder => _r('proxyHostPlaceholder');

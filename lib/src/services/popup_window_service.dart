@@ -35,6 +35,7 @@ import 'link/local_pairing_service.dart';
 import 'log_service.dart';
 import 'quick_download_submitter.dart';
 import 'resolve_preview_client.dart';
+import 'system_proxy_status.dart';
 
 const _tag = 'PopupWinSvc';
 
@@ -159,6 +160,10 @@ class PopupWindowService {
     final queues = DownloadController.globalInstance?.queues ?? const [];
     final devices = CloudAuthService.instance.remoteDevices;
     final localDevices = LocalPairingService.instance.localDevices;
+    // 系统代理检测：show 前触发一次刷新（在途去重），但不等待结果——
+    // 载荷用缓存值填充；popup isolate 零 Rust 初始化，检测态只能在
+    // 这里随载荷注入（迟到的检测结果本轮不追投，下次 show 生效）。
+    final proxyStatus = SystemProxyStatusService.instance..refresh();
     final payload = QuickPopupPayload(
       requestId: ++_seq,
       url: req.url,
@@ -202,6 +207,9 @@ class PopupWindowService {
             isOnline: d.online,
           ),
       ],
+      systemProxyDetected: proxyStatus.detected,
+      systemProxySummary: proxyStatus.summary,
+      manualProxyUrl: manualProxyUrlFromSettings(settings) ?? '',
     );
 
     _showing = true;

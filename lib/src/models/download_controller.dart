@@ -149,6 +149,7 @@ class DownloadController extends ChangeNotifier {
   StreamSubscription<RustSignalPack<PriorityTaskChanged>>? _prioritySub;
   StreamSubscription<RustSignalPack<FileMissingChanged>>? _fileMissingSub;
   StreamSubscription<RustSignalPack<TaskQueueChanged>>? _taskQueueChangedSub;
+  StreamSubscription<RustSignalPack<TaskRouteChanged>>? _taskRouteChangedSub;
   StreamSubscription<RustSignalPack<PluginHookActivityEvent>>? _pluginHookSub;
   StreamSubscription<RustSignalPack<TaskSegmentsUpdated>>? _segmentsUpdatedSub;
   StreamSubscription<RustSignalPack<AllGroups>>? _allGroupsSub;
@@ -181,6 +182,7 @@ class DownloadController extends ChangeNotifier {
     _prioritySub?.cancel();
     _fileMissingSub?.cancel();
     _taskQueueChangedSub?.cancel();
+    _taskRouteChangedSub?.cancel();
     _pluginHookSub?.cancel();
     _segmentsUpdatedSub?.cancel();
     _allGroupsSub?.cancel();
@@ -1379,6 +1381,9 @@ class DownloadController extends ChangeNotifier {
     _taskQueueChangedSub = TaskQueueChanged.rustSignalStream.listen(
       _onTaskQueueChanged,
     );
+    _taskRouteChangedSub = TaskRouteChanged.rustSignalStream.listen(
+      _onTaskRouteChanged,
+    );
     _pluginHookSub = PluginHookActivityEvent.rustSignalStream.listen(
       _onPluginHookActivity,
     );
@@ -1479,6 +1484,19 @@ class DownloadController extends ChangeNotifier {
     final idx = _tasks.indexWhere((t) => t.id == m.taskId);
     if (idx >= 0 && _tasks[idx].queueId != m.queueId) {
       _tasks[idx] = _tasks[idx].copyWith(queueId: m.queueId);
+      _safeNotifyListeners();
+    }
+  }
+
+  /// Auto 代理链路变化：引擎按站点采样/切换后定向广播。只 copyWith 单个
+  /// 字段、不重建整表，沿用 _deletedTaskIds 守卫（同 _onTaskQueueChanged）。
+  void _onTaskRouteChanged(RustSignalPack<TaskRouteChanged> pack) {
+    if (_disposed) return;
+    final m = pack.message;
+    if (_deletedTaskIds.contains(m.taskId)) return;
+    final idx = _tasks.indexWhere((t) => t.id == m.taskId);
+    if (idx >= 0 && _tasks[idx].autoRoute != m.route) {
+      _tasks[idx] = _tasks[idx].copyWith(autoRoute: m.route);
       _safeNotifyListeners();
     }
   }

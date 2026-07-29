@@ -31,6 +31,7 @@ import 'flux_sonner.dart';
 
 import '../i18n/locale_provider.dart';
 import '../models/download_queue.dart';
+import '../models/task_proxy_choice.dart';
 import '../models/ua_presets.dart';
 import '../services/file_picker_service.dart';
 import '../services/link/local_pairing_service.dart';
@@ -39,6 +40,7 @@ import '../theme/app_metrics.dart';
 import 'context_menu.dart';
 import 'dir_picker_field.dart';
 import 'split_action_button.dart';
+import 'task_proxy_selector.dart';
 import 'thread_selector.dart';
 
 /// 解析后的单条下载入口（URL + 可选 out= 文件名 + 可选 checksum=）
@@ -295,6 +297,18 @@ class QuickDownloadForm extends StatefulWidget {
   /// 载荷侧的注入口——两种宿主之后共用同一套渲染/选中逻辑。
   final List<QuickDeviceOption>? localDevices;
 
+  /// 是否检测到系统代理（任务代理选择器禁用规则数据源）。
+  ///
+  /// 主窗口宿主从 SystemProxyStatusService 注入；popup 宿主从
+  /// QuickPopupPayload 注入——表单自身不 import 任何 bindings 依赖。
+  final bool systemProxyDetected;
+
+  /// 检测到的系统代理摘要（'' = 未检测到）。
+  final String systemProxySummary;
+
+  /// 全局手动代理 URL（'' = 未配置）。
+  final String manualProxyUrl;
+
   /// 清单预解析等待态：动作区换为「取消 + spinner 禁用主按钮」，表单主体
   /// 保持可见但不可重复提交。由外壳驱动（表单自身不发信号、不做探测）。
   final bool resolving;
@@ -315,6 +329,9 @@ class QuickDownloadForm extends StatefulWidget {
     required this.onCancel,
     this.controller,
     this.localDevices,
+    this.systemProxyDetected = false,
+    this.systemProxySummary = '',
+    this.manualProxyUrl = '',
     this.resolving = false,
     this.onCancelResolve,
   });
@@ -329,6 +346,9 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
   final _saveDirController = TextEditingController();
   final _renameController = TextEditingController();
   final _proxyUrlController = TextEditingController();
+
+  /// 任务代理选择项（自定义 URL 仍走 [_proxyUrlController]）。
+  TaskProxyChoice _proxyChoice = TaskProxyChoice.followGlobal;
   final _userAgentController = TextEditingController();
   final _cookieController = TextEditingController();
   final _checksumController = TextEditingController();
@@ -534,7 +554,11 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
         saveDir: saveDir,
         rename: _renameController.text.trim(),
         segments: segments,
-        proxyUrl: _proxyUrlController.text.trim(),
+        proxyUrl: proxyUrlFromChoice(
+          _proxyChoice,
+          widget.manualProxyUrl,
+          _proxyUrlController.text,
+        ),
         userAgent: _userAgentController.text.trim(),
         queueId: queueId,
         startLater: startLater,
@@ -824,9 +848,13 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
               style: TextStyle(fontSize: 11, color: c.textMuted),
             ),
             const SizedBox(height: 6),
-            ShadInput(
-              controller: _proxyUrlController,
-              placeholder: Text(s.taskProxyPlaceholder),
+            TaskProxySelector(
+              value: _proxyChoice,
+              onChanged: (v) => setState(() => _proxyChoice = v),
+              systemProxyDetected: widget.systemProxyDetected,
+              systemProxySummary: widget.systemProxySummary,
+              manualProxyUrl: widget.manualProxyUrl,
+              customController: _proxyUrlController,
             ),
             const SizedBox(height: 12),
             Row(

@@ -424,10 +424,11 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
         group_id: row.try_get("group_id").unwrap_or_default(),
         rss_source_id: row.try_get("rss_source_id").unwrap_or_default(),
         origin_url: row.try_get("origin_url").unwrap_or_default(),
+        auto_route: row.try_get("auto_route").unwrap_or_default(),
     })
 }
 
-const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, referrer, group_id, rss_source_id, origin_url";
+const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, referrer, group_id, rss_source_id, origin_url, auto_route";
 
 /// 把 `AnyRow` 映射为 [`GroupInfo`]。
 fn group_from_row(row: &AnyRow) -> Result<GroupInfo, sqlx::Error> {
@@ -614,6 +615,13 @@ impl Db {
         // 右键「复制下载链接」拿到的是 `torrent-file://local` 这种噪音;
         // 有真实来源(RSS enclosure 直链)时写这里。空 = 回退 `url`。
         self.add_column_if_missing("tasks", "origin_url", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        // ProxyMode::Auto 的任务级最终链路（可追溯性）：wire 标签见
+        // `auto_proxy::route`（direct / direct:sampled / direct:pinned /
+        // proxy:cached / proxy:sampled / proxy:failover）。空 = 非 Auto 模式
+        // 或任务从未启动。每次任务启动时由 manager 重写，运行中热切换由
+        // coordinator 侧状态机更新。
+        self.add_column_if_missing("tasks", "auto_route", "TEXT NOT NULL DEFAULT ''")
             .await?;
         Ok(())
     }
@@ -3193,6 +3201,18 @@ impl Db {
     pub async fn set_task_origin_url(&self, task_id: &str, origin: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE tasks SET origin_url = $1 WHERE id = $2")
             .bind(origin)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 写入 `ProxyMode::Auto` 的任务级最终链路标签（wire 值见
+    /// `auto_proxy::route`；空 = 非 Auto 模式）。任务启动时由 manager
+    /// 重写基线，运行中热切换/采样定论由 coordinator 状态机更新。
+    pub async fn set_task_auto_route(&self, task_id: &str, route: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET auto_route = $1 WHERE id = $2")
+            .bind(route)
             .bind(task_id)
             .execute(&self.pool)
             .await?;

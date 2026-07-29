@@ -9,6 +9,7 @@ import '../i18n/locale_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import '../services/shutdown_service.dart';
+import '../services/system_proxy_status.dart';
 import 'feedback_dialog.dart';
 
 // 预设限速值（label 显示用，kbs 为 KB/s）
@@ -38,11 +39,14 @@ class StatusBar extends StatefulWidget {
   final SettingsProvider settingsProvider;
   final ViewPrefsStore viewPrefsStore;
 
+  final VoidCallback? onOpenProxySettings;
+
   const StatusBar({
     super.key,
     required this.controller,
     required this.settingsProvider,
     required this.viewPrefsStore,
+    this.onOpenProxySettings,
   });
 
   @override
@@ -54,6 +58,7 @@ class _StatusBarState extends State<StatusBar> {
   final _customController = TextEditingController();
   final _shutdownPopoverController = ShadPopoverController();
   final _shutdownMinutesController = TextEditingController();
+  final _proxyPopoverController = ShadPopoverController();
 
   /// 上次已写入 settings 的字节数，用于防循环更新
   int _lastKnownBytes = -1;
@@ -79,6 +84,7 @@ class _StatusBarState extends State<StatusBar> {
     _popoverController.dispose();
     _customController.dispose();
     _shutdownPopoverController.dispose();
+    _proxyPopoverController.dispose();
     _shutdownMinutesController.dispose();
     super.dispose();
   }
@@ -324,6 +330,17 @@ class _StatusBarState extends State<StatusBar> {
               const SizedBox(width: 12),
               Container(width: 1, height: 12, color: c.border),
               const SizedBox(width: 12),
+              // 代理模式 Popover 触发器
+              _ProxyModeTrigger(
+                popoverController: _proxyPopoverController,
+                settingsProvider: widget.settingsProvider,
+                onOpenProxySettings: widget.onOpenProxySettings,
+                s: s,
+                c: c,
+              ),
+              const SizedBox(width: 12),
+              Container(width: 1, height: 12, color: c.border),
+              const SizedBox(width: 12),
               // 反馈按钮
               GestureDetector(
                 onTap: () => showFeedbackDialog(context),
@@ -390,6 +407,7 @@ class _SpeedLimitTrigger extends StatelessWidget {
 
     return ShadPopover(
       controller: popoverController,
+      effects: const [],
       // 弹出在触发器上方，右对齐（状态栏位于屏幕底部）
       anchor: const ShadAnchorAuto(
         offset: Offset(0, -8),
@@ -624,6 +642,7 @@ class _ShutdownTrigger extends StatelessWidget {
 
     return ShadPopover(
       controller: popoverController,
+      effects: const [],
       anchor: const ShadAnchorAuto(
         offset: Offset(0, -8),
         followerAnchor: Alignment.bottomRight,
@@ -863,6 +882,319 @@ class _ShutdownPopoverContent extends StatelessWidget {
             ),
           ),
         ],
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// 代理模式快切 — 触发器 Widget：图标 + 当前模式短标签，点击展开/收起 Popover
+// =============================================================================
+
+class _ProxyModeTrigger extends StatelessWidget {
+  final ShadPopoverController popoverController;
+  final SettingsProvider settingsProvider;
+  final VoidCallback? onOpenProxySettings;
+  final S s;
+  final AppColors c;
+
+  const _ProxyModeTrigger({
+    required this.popoverController,
+    required this.settingsProvider,
+    required this.onOpenProxySettings,
+    required this.s,
+    required this.c,
+  });
+
+  String _modeLabel(String mode) => switch (mode) {
+    'system' => s.proxyModeSystem,
+    'manual' => s.proxyModeManual,
+    'auto' => s.proxyModeAuto,
+    _ => s.proxyModeNone,
+  };
+
+  @override
+  Widget build(BuildContext context) {
+    return ShadPopover(
+      controller: popoverController,
+      // FluxDown 弹出层无进出场动画(rule: shad-overlay-no-animation)。
+      effects: const [],
+      // 弹出在触发器上方，右对齐（状态栏位于屏幕底部）
+      anchor: const ShadAnchorAuto(
+        offset: Offset(0, -8),
+        followerAnchor: Alignment.bottomRight,
+        targetAnchor: Alignment.topRight,
+      ),
+      padding: EdgeInsets.zero,
+      // 监听设置与系统代理检测状态 —— 模式切换、检测结果到达时刷新
+      popover: (ctx) => ListenableBuilder(
+        listenable: Listenable.merge([
+          settingsProvider,
+          SystemProxyStatusService.instance,
+        ]),
+        builder: (ctx2, _) => _ProxyModeContent(
+          settingsProvider: settingsProvider,
+          popoverController: popoverController,
+          onOpenProxySettings: onOpenProxySettings,
+          s: s,
+          c: c,
+        ),
+      ),
+      child: MouseRegion(
+        cursor: SystemMouseCursors.click,
+        child: GestureDetector(
+          onTap: () {
+            // 打开弹层时触发系统代理检测（在途去重由服务保证）
+            if (!popoverController.isOpen) {
+              SystemProxyStatusService.instance.refresh();
+            }
+            popoverController.toggle();
+          },
+          // 模式变化仅经 settingsProvider 通知，触发器需自行监听刷新标签
+          child: ListenableBuilder(
+            listenable: settingsProvider,
+            builder: (ctx2, _) {
+              final mode = settingsProvider.proxyMode;
+              final active = mode != 'none';
+              final triggerColor = active ? c.accent : c.textMuted;
+              return Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(LucideIcons.globe, size: 11, color: triggerColor),
+                  const SizedBox(width: 4),
+                  Text(
+                    _modeLabel(mode),
+                    style: TextStyle(fontSize: 10.5, color: triggerColor),
+                  ),
+                  const SizedBox(width: 2),
+                  Icon(LucideIcons.chevronUp, size: 9, color: triggerColor),
+                ],
+              );
+            },
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// =============================================================================
+// 代理模式快切 — Popover 内容：四个模式选项 + 跳转设置入口
+// =============================================================================
+
+class _ProxyModeContent extends StatelessWidget {
+  final SettingsProvider settingsProvider;
+  final ShadPopoverController popoverController;
+  final VoidCallback? onOpenProxySettings;
+  final S s;
+  final AppColors c;
+
+  const _ProxyModeContent({
+    required this.settingsProvider,
+    required this.popoverController,
+    required this.onOpenProxySettings,
+    required this.s,
+    required this.c,
+  });
+
+  void _select(String mode) {
+    settingsProvider.setProxyMode(mode);
+    popoverController.hide();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final svc = SystemProxyStatusService.instance;
+    final manualUrl = manualProxyUrlFromSettings(settingsProvider);
+    final manualAvailable = manualUrl != null;
+    final systemAvailable = svc.detected;
+    final current = settingsProvider.proxyMode;
+
+    // 系统代理副文本：检测中 / 已检测到的摘要 / 未检测到
+    final String systemSubtitle;
+    if (svc.detecting) {
+      systemSubtitle = s.proxySystemDetecting;
+    } else if (systemAvailable) {
+      systemSubtitle = svc.summary;
+    } else {
+      systemSubtitle = s.proxySystemNotDetected;
+    }
+
+    return SizedBox(
+      width: 240,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 6),
+            child: Text(
+              s.statusBarProxyLabel,
+              style: TextStyle(
+                fontSize: 12.5,
+                fontWeight: FontWeight.w600,
+                color: c.textPrimary,
+              ),
+            ),
+          ),
+          _ProxyModeOption(
+            label: s.proxyModeNone,
+            selected: current == 'none',
+            enabled: true,
+            onTap: () => _select('none'),
+            c: c,
+          ),
+          _ProxyModeOption(
+            label: s.proxyModeSystem,
+            subtitle: systemSubtitle,
+            selected: current == 'system',
+            enabled: systemAvailable,
+            onTap: () => _select('system'),
+            c: c,
+          ),
+          _ProxyModeOption(
+            label: s.proxyModeManual,
+            subtitle: manualUrl ?? s.proxyNotConfigured,
+            selected: current == 'manual',
+            enabled: manualAvailable,
+            onTap: () => _select('manual'),
+            c: c,
+          ),
+          _ProxyModeOption(
+            label: s.proxyModeAuto,
+            subtitle: (systemAvailable || manualAvailable)
+                ? null
+                : s.proxyNotConfigured,
+            selected: current == 'auto',
+            enabled: systemAvailable || manualAvailable,
+            onTap: () => _select('auto'),
+            c: c,
+          ),
+          if (onOpenProxySettings != null) ...[
+            const SizedBox(height: 4),
+            Divider(color: c.border, height: 1),
+            const SizedBox(height: 4),
+            _ProxyModeOption(
+              label: s.proxyConfigureInSettings,
+              selected: false,
+              enabled: true,
+              muted: true,
+              onTap: () {
+                popoverController.hide();
+                onOpenProxySettings!();
+              },
+              c: c,
+            ),
+          ],
+          const SizedBox(height: 4),
+        ],
+      ),
+    );
+  }
+}
+
+// 单个模式选项行：文字左缘与标题对齐；选中以「底色 + 行尾对勾」表达
+// （字重字色不跳变，与侧栏选中行同语言）；hover 给 surface2 反馈；
+// 禁用整体单级降透明。副文本恒 textMuted 小一号。
+class _ProxyModeOption extends StatefulWidget {
+  final String label;
+  final String? subtitle;
+  final bool selected;
+  final bool enabled;
+  final bool muted;
+  final VoidCallback onTap;
+  final AppColors c;
+
+  const _ProxyModeOption({
+    required this.label,
+    this.subtitle,
+    required this.selected,
+    required this.enabled,
+    this.muted = false,
+    required this.onTap,
+    required this.c,
+  });
+
+  @override
+  State<_ProxyModeOption> createState() => _ProxyModeOptionState();
+}
+
+class _ProxyModeOptionState extends State<_ProxyModeOption> {
+  bool _hovered = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.c;
+    final m = AppMetrics.of(context);
+    final subtitle = widget.subtitle;
+
+    // 悬浮/选中是即时状态切换：普通 Container 直接切色，不加动画——
+    // AnimatedContainer 从透明黑(0x00000000)插值到浅色会经过半透明灰
+    // 中间帧，表现为悬浮时深浅两色闪烁(rule: no-lerp-from-transparent)。
+    final row = Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: widget.selected
+            ? c.selectedBg
+            : (_hovered && widget.enabled)
+            ? c.surface2
+            : null,
+        borderRadius: m.brSm,
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  widget.label,
+                  style: TextStyle(
+                    fontSize: 12,
+                    height: 1.3,
+                    color: widget.muted ? c.textSecondary : c.textPrimary,
+                  ),
+                ),
+                if (subtitle != null && subtitle.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        height: 1.3,
+                        color: c.textMuted,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          if (widget.selected) ...[
+            const SizedBox(width: 8),
+            Icon(LucideIcons.check, size: 12, color: c.accent),
+          ],
+        ],
+      ),
+    );
+
+    return Padding(
+      // 外层 4 + 内层 8 = 12，文字左缘与弹层标题对齐。
+      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
+      child: MouseRegion(
+        cursor: widget.enabled
+            ? SystemMouseCursors.click
+            : SystemMouseCursors.basic,
+        onEnter: (_) => setState(() => _hovered = true),
+        onExit: (_) => setState(() => _hovered = false),
+        child: GestureDetector(
+          onTap: widget.enabled ? widget.onTap : null,
+          behavior: HitTestBehavior.opaque,
+          child: Opacity(opacity: widget.enabled ? 1.0 : 0.45, child: row),
+        ),
       ),
     );
   }

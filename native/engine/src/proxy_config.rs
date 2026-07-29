@@ -24,6 +24,13 @@ pub enum ProxyMode {
     System,
     /// User-specified proxy address.
     Manual,
+    /// 自动决策：任务直连启动，运行中确认慢且候选代理（系统代理，
+    /// 缺省回退手动字段）经采样证明显著更快时才按 host 热切换。
+    /// 决策粒度是**任务级**（见 [`crate::auto_proxy`]）；本模式值本身
+    /// 绝不直接进 client 构建——[`ProxyConfig::resolve`] 与
+    /// `build_client_inner` 都把它折算为直连，具体代理由 auto_proxy
+    /// 的决策路径显式给出 Manual 配置。
+    Auto,
 }
 
 impl ProxyMode {
@@ -34,6 +41,7 @@ impl ProxyMode {
         match s {
             "system" => Self::System,
             "manual" => Self::Manual,
+            "auto" => Self::Auto,
             _ => Self::None,
         }
     }
@@ -43,6 +51,7 @@ impl ProxyMode {
             Self::None => "none",
             Self::System => "system",
             Self::Manual => "manual",
+            Self::Auto => "auto",
         }
     }
 }
@@ -196,6 +205,9 @@ impl ProxyConfig {
                 // System proxy is resolved at call time via detect_system_proxy()
                 None
             }
+            // Auto 的具体代理由 auto_proxy 决策路径以 Manual 配置给出，
+            // 原始 Auto 配置本身没有可直接使用的代理 URL。
+            ProxyMode::Auto => None,
             ProxyMode::Manual => {
                 if self.host.is_empty() || self.port == 0 {
                     return None;
@@ -242,6 +254,10 @@ impl ProxyConfig {
                     }
                 }
             }
+            // Auto：调用点未经决策路径时的安全折算 = 直连（FTP/RSS 等
+            // 非 HTTP-coordinator 路径拿到的 Auto 就是直连语义）。具体
+            // 代理只能由 auto_proxy 的缓存/采样决策显式给出。
+            ProxyMode::Auto => Self::default(),
             _ => self.clone(),
         }
     }
@@ -252,12 +268,30 @@ impl ProxyConfig {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// 单任务代理字段（`tasks.proxy_url`）的哨兵值：**强制直连**。
+    /// 与空串（跟随全局）语义不同——全局配了代理时本任务仍然直连，
+    /// 且不参与 `ProxyMode::Auto` 的采样/切换（用户显式选择压过一切）。
+    pub const DIRECT_SENTINEL: &'static str = "direct://";
+
+    /// 单任务代理字段的哨兵值：**跟随系统代理**。每次启动/恢复时经
+    /// [`Self::resolve`] 现场解析（注册表/环境变量），系统代理未配置时
+    /// 安全回退直连——引用语义，系统代理地址变了任务自动跟随。
+    pub const SYSTEM_SENTINEL: &'static str = "system://";
+
     /// Parse a proxy URL string like `socks5://user:pass@host:port` into a ProxyConfig.
     ///
     /// Used for per-task proxy override where the user provides a single URL.
+    /// 两个哨兵值见 [`Self::DIRECT_SENTINEL`]（→ 直连）与
+    /// [`Self::SYSTEM_SENTINEL`]（→ `System` 模式，调用方应随后 `resolve()`）。
     pub fn from_proxy_url(url: &str) -> Self {
-        if url.is_empty() {
+        if url.is_empty() || url == Self::DIRECT_SENTINEL {
             return Self::default();
+        }
+        if url == Self::SYSTEM_SENTINEL {
+            return Self {
+                mode: ProxyMode::System,
+                ..Self::default()
+            };
         }
 
         // Extract scheme
@@ -1219,6 +1253,7 @@ mod tests {
         assert_eq!(ProxyMode::parse_str("none"), ProxyMode::None);
         assert_eq!(ProxyMode::parse_str("system"), ProxyMode::System);
         assert_eq!(ProxyMode::parse_str("manual"), ProxyMode::Manual);
+        assert_eq!(ProxyMode::parse_str("auto"), ProxyMode::Auto);
         assert_eq!(ProxyMode::parse_str("unknown"), ProxyMode::None);
         assert_eq!(ProxyMode::parse_str(""), ProxyMode::None);
     }
@@ -1228,6 +1263,7 @@ mod tests {
         assert_eq!(ProxyMode::None.as_str(), "none");
         assert_eq!(ProxyMode::System.as_str(), "system");
         assert_eq!(ProxyMode::Manual.as_str(), "manual");
+        assert_eq!(ProxyMode::Auto.as_str(), "auto");
     }
 
     // -----------------------------------------------------------------------
@@ -1395,6 +1431,25 @@ mod tests {
     fn from_proxy_url_empty() {
         let c = ProxyConfig::from_proxy_url("");
         assert_eq!(c.mode, ProxyMode::None);
+    }
+
+    #[test]
+    fn from_proxy_url_direct_sentinel_forces_plain_connection() {
+        let c = ProxyConfig::from_proxy_url(ProxyConfig::DIRECT_SENTINEL);
+        assert_eq!(c.mode, ProxyMode::None);
+        assert!(c.host.is_empty());
+        // resolve() 幂等：直连保持直连。
+        assert_eq!(c.resolve().mode, ProxyMode::None);
+    }
+
+    #[test]
+    fn from_proxy_url_system_sentinel_resolves_like_system_mode() {
+        let c = ProxyConfig::from_proxy_url(ProxyConfig::SYSTEM_SENTINEL);
+        assert_eq!(c.mode, ProxyMode::System);
+        // resolve() 具体化：检测到 → Manual（真实地址），未检测到 → 直连；
+        // 绝不把 System 原样漏给 FTP/CDN 门槛。
+        let r = c.resolve();
+        assert_ne!(r.mode, ProxyMode::System);
     }
 
     #[test]
