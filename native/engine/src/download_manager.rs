@@ -3539,13 +3539,40 @@ impl DownloadManager {
             }
         }
 
-        let tasks = match self.db.load_all_tasks().await {
+        let mut tasks = match self.db.load_all_tasks().await {
             Ok(t) => t,
             Err(e) => {
                 log_info!("load_all_tasks error: {}", e);
                 Vec::new()
             }
         };
+
+        // 启动清扫：重复种子占位任务的删除发生在 on_task_done（标记写库
+        // 之后）——若进程在两者之间被杀，会残留一条裸标记文案的 error 行。
+        // 标记行本就注定删除，这里补删（仅首次执行）。
+        if is_first_run {
+            let orphans: Vec<String> = tasks
+                .iter()
+                .filter(|t| {
+                    t.status == 4
+                        && t.error_message
+                            .starts_with(bt_downloader::DUPLICATE_TORRENT_MSG_PREFIX)
+                })
+                .map(|t| t.task_id.clone())
+                .collect();
+            if !orphans.is_empty() {
+                for tid in &orphans {
+                    log_info!(
+                        "[manager] startup: removing orphan duplicate-torrent placeholder {}",
+                        tid
+                    );
+                    if let Err(e) = self.db.delete_task(tid).await {
+                        log_info!("[manager] startup duplicate cleanup {}: {}", tid, e);
+                    }
+                }
+                tasks.retain(|t| !orphans.contains(&t.task_id));
+            }
+        }
 
         // On the very first call (app startup), scan all known save directories
         // for orphaned BT staging directories left behind by a previous session
@@ -5997,11 +6024,22 @@ impl DownloadManager {
                     let handle_found = bt.delete_task(task_id, delete_files).await;
                     if !handle_found {
                         // Handle not in map: the task is still in the
-                        // add_torrent phase (e.g. magnet DHT resolution).
+                        // add_torrent phase (e.g. magnet DHT resolution)
+                        // or a reseed's local-data check is in flight.
                         // Register a pending delete so the detached
-                        // add_torrent closure cleans up the librqbit session
-                        // entry (and files) once metadata resolves.
+                        // add_torrent closure / reseed closure cleans up the
+                        // librqbit session entry (and files) once it resolves.
                         bt.register_pending_delete(task_id, delete_files).await;
+                        // 二次检查：上面 miss 与 pending 写入之间存在 await
+                        // 窗口，句柄可能恰好在此期间落位（且对方闭包的
+                        // pending 检查已经跑完拿了个空）——此时 pending 将
+                        // 永远无人消费，幽灵条目留在会话里继续做种/占位。
+                        // 消费掉自己刚写的 pending，走正常删除。
+                        if bt.cached_handle(task_id).await.is_some()
+                            && let Some(df) = bt.take_pending_delete(task_id).await
+                        {
+                            let _ = bt.delete_task(task_id, df).await;
+                        }
                     }
                 } else {
                     // BT 会话未创建（本次启动未跑过 BT 任务）：按路径直接
@@ -6248,6 +6286,14 @@ impl DownloadManager {
                             let found = bt.delete_task(&tid_owned, delete_files).await;
                             if !found {
                                 bt.register_pending_delete(&tid_owned, delete_files).await;
+                                // 二次检查（同单任务删除路径）：miss 与
+                                // pending 写入之间句柄可能落位，消费自己的
+                                // pending 走正常删除，防幽灵做种条目。
+                                if bt.cached_handle(&tid_owned).await.is_some()
+                                    && let Some(df) = bt.take_pending_delete(&tid_owned).await
+                                {
+                                    let _ = bt.delete_task(&tid_owned, df).await;
+                                }
                             }
                         } else {
                             // 无 BT 会话：按路径直接删 parts 边车。
@@ -6735,6 +6781,21 @@ impl DownloadManager {
                 .await
             {
                 Ok(handle) => {
+                    // 校验窗口期删除的消费点：readd 期间（本地数据校验可长达
+                    // 分钟级）用户删除任务时句柄尚未入 map，manager 只能写
+                    // pending delete——此处必须消费，否则任务行已删、种子却
+                    // 注册做种成幽灵条目（占做种位、阻止 BT 会话释放）。
+                    // 句柄已在 readd 内 store：pending 若写得更晚，由 manager
+                    // 删除路径的「二次检查」兜底消费，两侧合并闭合竞态窗口。
+                    if let Some(del_files) = bt.take_pending_delete(&task_id).await {
+                        log_info!(
+                            "[manager] reseed {}: pending delete applied after local-data check (delete_files={})",
+                            task_id,
+                            del_files
+                        );
+                        let _ = bt.delete_task(&task_id, del_files).await;
+                        return;
+                    }
                     let seed_time_base = db.get_task_seeding_time(&task_id).await.unwrap_or(0);
                     let registration = bt
                         .register_seeder(
@@ -6792,6 +6853,9 @@ impl DownloadManager {
                 }
                 Err(msg) => {
                     log_info!("[manager] reseed {}: {}", task_id, msg);
+                    // 校验窗口期若有删除请求，torrent 已在 readd 失败路径中
+                    // 移出会话——只需清掉挂起的 pending 条目（防残留）。
+                    let _ = bt.take_pending_delete(&task_id).await;
                     // 回退停止态：状态码保留原停止原因，说明换成失败原因。
                     let _ = db
                         .update_task_seeding_status(&task_id, stopped_status, &msg)
