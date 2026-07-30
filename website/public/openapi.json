@@ -2605,6 +2605,96 @@
         ]
       }
     },
+    "/api/v1/tasks/{id}/rename": {
+      "post": {
+        "tags": [
+          "management"
+        ],
+        "summary": "重命名任务文件。",
+        "operationId": "api_rename_task",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "任务 ID（UUID）",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RenameTaskRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "已重命名",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "文件名非法（message 为错误码 `invalid-name`）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "token 无效",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "任务不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "业务拒绝（message 为错误码 `task-active` / `bt-unsupported` / `target-exists`）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "tokenHeader": []
+          }
+        ]
+      }
+    },
     "/download": {
       "post": {
         "tags": [
@@ -3827,6 +3917,19 @@
             "type": "integer",
             "format": "int64",
             "description": "队列上传限速（KB/s），0 = 不限速。"
+          }
+        }
+      },
+      "RenameTaskRequest": {
+        "type": "object",
+        "description": "重命名任务文件请求体。",
+        "required": [
+          "fileName"
+        ],
+        "properties": {
+          "fileName": {
+            "type": "string",
+            "description": "新文件名（不含路径分隔符；引擎侧校验非法字符与状态）。"
           }
         }
       },

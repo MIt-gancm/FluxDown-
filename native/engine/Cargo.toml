@@ -10,6 +10,8 @@ wildcard_imports = "deny"
 
 [dependencies]
 aes = "0.8"
+# librqbit 的 TorrentStorage trait 以 anyhow::Result 为方法签名，实现方必须直接依赖（bt_partfile）。
+anyhow = "1.0.104"
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "deflate", "zstd"] }
 async-trait = "0.1.87"
 base64 = "0.22"

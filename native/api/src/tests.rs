@@ -48,6 +48,9 @@ struct MockHostInner {
     deleted: Vec<(String, bool)>,
     paused_ids: Vec<String>,
     continued_ids: Vec<String>,
+    renamed: Vec<(String, String)>,
+    /// 一次性：下一次 `rename_task` 返回该错误（模拟引擎错误码透传）。
+    rename_error: Option<ApiError>,
     pause_all_calls: u32,
     continue_all_calls: u32,
     config: HashMap<String, String>,
@@ -119,6 +122,11 @@ impl MockHost {
         self
     }
 
+    fn with_rename_error(mut self, err: ApiError) -> Self {
+        self.inner.get_mut().unwrap().rename_error = Some(err);
+        self
+    }
+
     /// 模拟宿主未接线任务事件源：`subscribe_task_events()` 恒返回 `None`。
     fn without_task_events(mut self) -> Self {
         self.events = None;
@@ -147,6 +155,10 @@ impl MockHost {
 
     fn continued_ids(&self) -> Vec<String> {
         self.inner.lock().unwrap().continued_ids.clone()
+    }
+
+    fn renamed(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().renamed.clone()
     }
 
     fn pause_all_calls(&self) -> u32 {
@@ -238,6 +250,17 @@ impl ApiHost for MockHost {
             .unwrap()
             .continued_ids
             .push(task_id.to_string());
+        Ok(())
+    }
+
+    async fn rename_task(&self, task_id: &str, file_name: &str) -> Result<(), ApiError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.rename_error.take() {
+            return Err(e);
+        }
+        inner
+            .renamed
+            .push((task_id.to_string(), file_name.to_string()));
         Ok(())
     }
 
@@ -1393,6 +1416,106 @@ async fn pause_continue_all_static_route_not_swallowed_by_id_route() {
     // `/tasks/{id}` 误吞成 pause_task("pause")/continue_task("continue")。
     assert!(server.host.paused_ids().is_empty());
     assert!(server.host.continued_ids().is_empty());
+}
+
+#[tokio::test]
+async fn rename_task_forwards_camel_case_body_to_host() {
+    let server = TestServer::start(MockHost::new(), |c| {
+        c.token.set("T");
+        c.management_enabled = true;
+    })
+    .await;
+    let body = json!({"fileName": "renamed.bin"}).to_string();
+    let resp = server
+        .send(&request(
+            "POST",
+            &routes::task_rename_path("t1"),
+            &[("X-FluxDown-Token", "T")],
+            &body,
+        ))
+        .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        server.host.renamed(),
+        vec![("t1".to_string(), "renamed.bin".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn rename_task_maps_engine_error_codes_to_status_and_passes_message_through() {
+    // 错误码字符串必须原样出现在响应 `message` 里（web 端据此做 i18n 映射）；
+    // HTTP 状态按 ApiError 惯例：400/404/409。
+    let cases = [
+        (
+            ApiError::BadRequest("invalid-name".to_string()),
+            400,
+            "invalid-name",
+        ),
+        (ApiError::NotFound, 404, "not found"),
+        (
+            ApiError::Conflict("task-active".to_string()),
+            409,
+            "task-active",
+        ),
+        (
+            ApiError::Conflict("bt-unsupported".to_string()),
+            409,
+            "bt-unsupported",
+        ),
+        (
+            ApiError::Conflict("target-exists".to_string()),
+            409,
+            "target-exists",
+        ),
+    ];
+    for (err, status, message) in cases {
+        let server = TestServer::start(MockHost::new().with_rename_error(err), |c| {
+            c.token.set("T");
+            c.management_enabled = true;
+        })
+        .await;
+        let body = json!({"fileName": "renamed.bin"}).to_string();
+        let resp = server
+            .send(&request(
+                "POST",
+                &routes::task_rename_path("t1"),
+                &[("X-FluxDown-Token", "T")],
+                &body,
+            ))
+            .await;
+        assert_eq!(resp.status, status, "message={message}");
+        assert_eq!(resp.json()["message"], message);
+        assert!(server.host.renamed().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn rename_task_without_token_returns_401_and_bad_payload_returns_400() {
+    let server = TestServer::start(MockHost::new(), |c| {
+        c.token.set("T");
+        c.management_enabled = true;
+    })
+    .await;
+    let body = json!({"fileName": "renamed.bin"}).to_string();
+    let resp = server
+        .send(&request(
+            "POST",
+            &routes::task_rename_path("t1"),
+            &[],
+            &body,
+        ))
+        .await;
+    assert_eq!(resp.status, 401);
+    let bad = server
+        .send(&request(
+            "POST",
+            &routes::task_rename_path("t1"),
+            &[("X-FluxDown-Token", "T")],
+            "{}",
+        ))
+        .await;
+    assert_eq!(bad.status, 400);
+    assert!(server.host.renamed().is_empty());
 }
 
 // ---------------------------------------------------------------------------

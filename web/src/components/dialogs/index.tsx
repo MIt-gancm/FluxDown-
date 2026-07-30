@@ -7,6 +7,7 @@ import { HlsQualityDialog } from './hls-quality'
 import { IncomingPairingDialog } from './incoming-pairing'
 import { ManifestSelectDialog } from './manifest-select'
 import { NewDownloadDialog } from './new-download'
+import { RenameTaskDialog } from './rename-task'
 import { ResolveVariantDialog } from './resolve-variant'
 
 export function GlobalDialogs() {
@@ -18,6 +19,7 @@ export function GlobalDialogs() {
       <ResolveVariantDialog />
       <BtFilesDialog />
       <IncomingPairingDialog />
+      <RenameTaskDialog />
     </>
   )
 }

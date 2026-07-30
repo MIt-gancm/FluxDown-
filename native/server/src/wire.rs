@@ -260,6 +260,13 @@ pub enum WsServerMsg {
     Pong {},
     /// 插件因熔断（连续超时/过载）被自动禁用（`reason` 固定 `"CircuitBreaker"`）。
     PluginAutoDisabled { identity: String, reason: String },
+    /// BT 重复添加：新任务的 info-hash 已被 `existingTaskId` 持有，占位任务
+    /// （`taskId`）已被引擎删除。客户端据此提示用户；`existingName` 可能为空。
+    DuplicateTorrent {
+        task_id: String,
+        existing_task_id: String,
+        existing_name: String,
+    },
     /// 插件 onDone 钩子执行中（`running=true` 开始/`false` 结束）；同一任务可
     /// 有多个插件并发钩子，客户端按 `(taskId, pluginId)` 集合跟踪，用于在
     /// 已完成任务旁显示“插件处理中…”指示器。事件可能因 fire-and-forget 丢失

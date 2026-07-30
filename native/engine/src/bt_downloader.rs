@@ -821,6 +821,11 @@ impl SharedBtSession {
         self.handles.lock().await.get(task_id).cloned()
     }
 
+    /// 本任务的 parts 边车路径（与 librqbit 会话数据同目录）。
+    pub fn parts_sidecar_path(&self, task_id: &str) -> PathBuf {
+        self.persistence_folder.join(format!("{task_id}.parts"))
+    }
+
     /// Register a completed torrent as a seeder.
     ///
     /// `uploaded_at_completion` is the total uploaded bytes observed when the
@@ -871,6 +876,13 @@ impl SharedBtSession {
     /// 并返回；数据缺失/重命名不匹配时把 torrent 从会话移除（保留磁盘
     /// 文件），**绝不**让它进入下载态。成功返回的句柄处于暂停态，由调用
     /// 方决定解除暂停（活跃做种）或保持暂停（排队做种）。
+    ///
+    /// `parts_factory`（完成时写下的 parts 边车，见 `bt_partfile`）存在时
+    /// 注入为该 torrent 的自定义 storage：选中文件按边车映射的最终路径
+    /// 打开（绝不创建新文件），未选文件路由到边车 blob——磁盘上不会
+    /// 出现未选文件的 0 字节占位，边界 piece 校验/上传均为真实字节，
+    /// 扁平化/重命名后的布局也能通过校验。为 `None` 时回退 librqbit
+    /// 默认 FilesystemStorage（老任务/边车损坏）。
     pub async fn readd_for_seeding(
         &self,
         task_id: &str,
@@ -878,6 +890,7 @@ impl SharedBtSession {
         output_folder: String,
         only_files: Option<Vec<usize>>,
         upload_limit_bps: u64,
+        parts_factory: Option<crate::bt_partfile::PartsSeedStorageFactory>,
     ) -> Result<BtHandle, String> {
         let add_input = match source {
             TorrentSource::Magnet(ref url) => AddTorrent::from_url(url),
@@ -891,6 +904,7 @@ impl SharedBtSession {
             only_files,
             paused: true,
             ratelimits: task_ratelimits(upload_limit_bps),
+            storage_factory: parts_factory.map(|f| f.into_boxed()),
             ..Default::default()
         };
         let response = self
@@ -934,6 +948,10 @@ impl SharedBtSession {
             ));
         }
         self.store_handle(task_id, handle.clone()).await;
+        // 归属登记：与正常下载 add 路径对齐。缺了它，重复添加同一种子时
+        // 去重守卫查不到占用者（报 "task=unknown"），删除流程的
+        // torrent_id → task_id 反查也会落空。
+        self.register_torrent_id(handle.id(), task_id).await;
         log_info!(
             "[BT] task={} re-added from disk for seeding",
             short_id(task_id)
@@ -987,6 +1005,9 @@ impl SharedBtSession {
         // Ensure the task is also removed from the seeding manager so completed
         // torrents do not keep being evaluated after deletion.
         let _ = self.unregister_seeder(task_id).await;
+        // parts 边车随任务删除（handle 是否在册都要删；session.delete 的
+        // remove_files 只处理数据文件，不认识边车）。
+        crate::bt_partfile::remove_sidecar(&self.parts_sidecar_path(task_id));
         if let Some(handle) = handle {
             let torrent_id = handle.id();
             // Clean up the torrent_id → task_id mapping.
@@ -2226,6 +2247,21 @@ const STATUS_PREPARING: i32 = 5;
 /// Number of virtual segments for single-file BT progress visualization.
 const BT_VIRTUAL_SEGMENTS: i32 = 16;
 
+/// 重复种子占位任务的 DB 错误标记前缀，后接占用任务的完整 task_id。
+/// download_manager 的 `on_task_done` 据此识别：删除占位任务行（不进
+/// 自动重试 / 插件 onError / task.failed webhook），并发
+/// `EngineEvent::DuplicateTorrentDetected` 供宿主提示用户。
+pub const DUPLICATE_TORRENT_MSG_PREFIX: &str = "duplicate torrent: already managed by task ";
+
+/// 按重复种子拒绝本任务：只写 DB 标记（status=4 + 前缀消息），**不**发
+/// STATUS_ERROR 进度信号——该占位行不该以「失败」示人，manager 识别标记
+/// 后会删除它并通知 UI。返回错误供调用方 `return Err(...)`。
+async fn mark_duplicate_torrent(db: &Db, task_id: &str, owner_task_id: &str) -> DownloadError {
+    let msg = format!("{DUPLICATE_TORRENT_MSG_PREFIX}{owner_task_id}");
+    let _ = db.update_task_status(task_id, STATUS_ERROR, &msg).await;
+    DownloadError::Other(msg)
+}
+
 /// Minimum interval between verbose `[BT]` progress log lines per task.
 /// Progress is still reported to the UI every poll cycle; only the log
 /// file output is throttled to keep logs compact and useful.
@@ -2988,18 +3024,50 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         } else {
             set_hidden(&stage_dir);
         }
-        // BUG-BT-PHANTOM-PIECES guard: if the staging dir holds no real data
-        // (fresh task, or partial data lost while paused — e.g. the dir was
-        // deleted externally), a leftover `{hash}.bitv` from an earlier run
-        // still claims completed pieces.  librqbit would accept it (its
-        // sampling validation ignores hash mismatches — see
-        // `clear_stale_fastresume`) and never re-download those pieces,
-        // producing a "finished" file with zero-filled holes.  Delete the
-        // bitfield up front so the re-add does a genuine initial check.
-        if !stage_dir_has_real_data(&stage_dir)
-            && let Some(hash) = torrent_source.info_hash_hex()
-        {
-            shared_bt.clear_stale_fastresume(&hash);
+        if let Some(hash) = torrent_source.info_hash_hex() {
+            // 重复种子前置判定：同 info-hash 已被会话内**其他**任务持有
+            // （下载或做种）时，无需等 add_torrent 解析元数据后返回
+            // AlreadyManaged，此处直接拒绝——磁力链接自带 info-hash，判定
+            // 零等待。占位任务行不以「失败」示人：只落重复标记，manager
+            // 在 on_task_done 识别后删除本行并发 DuplicateTorrentDetected
+            // 事件（宿主弹提示指向已有任务）。owner == 本任务时不算重复
+            //（会话残留自身条目的恢复场景），照常走 add 拿回句柄。
+            let dup_torrent_id = shared_bt.session.with_torrents(|iter| {
+                for (tid, t) in iter {
+                    if t.info_hash().as_string() == hash {
+                        return Some(tid);
+                    }
+                }
+                None
+            });
+            if let Some(tid) = dup_torrent_id {
+                let owner = shared_bt.task_for_torrent(tid).await;
+                if owner.as_deref() != Some(task_id.as_str()) {
+                    let owner = owner.unwrap_or_else(|| "unknown".to_string());
+                    log_info!(
+                        "[BT] task={} torrent already managed by task={} (id={}), rejecting duplicate before add",
+                        short_id(&task_id),
+                        short_id(&owner),
+                        tid
+                    );
+                    // 预建的 staging 目录是空壳，直接清掉。
+                    let _ = std::fs::remove_dir_all(&stage_dir);
+                    return Err(mark_duplicate_torrent(&db, &task_id, &owner).await);
+                }
+            }
+            // BUG-BT-PHANTOM-PIECES guard: if the staging dir holds no real
+            // data (fresh task, or partial data lost while paused — e.g. the
+            // dir was deleted externally), a leftover `{hash}.bitv` from an
+            // earlier run still claims completed pieces.  librqbit would
+            // accept it (its sampling validation ignores hash mismatches —
+            // see `clear_stale_fastresume`) and never re-download those
+            // pieces, producing a "finished" file with zero-filled holes.
+            // Delete the bitfield up front so the re-add does a genuine
+            // initial check.  同 hash 活在会话里的情形已在上方拒绝/放行，
+            // 走到这里 `.bitv` 若存在必是陈旧残留。
+            if !stage_dir_has_real_data(&stage_dir) {
+                shared_bt.clear_stale_fastresume(&hash);
+            }
         }
         let stage_dir_str = stage_dir.to_string_lossy().into_owned();
         // A known subset must be baked into add options here; a post-add update
@@ -3198,38 +3266,34 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                             shared_bt.register_torrent_id(_id, &task_id).await;
                             handle
                         }
-                        AddTorrentResponse::AlreadyManaged(_id, _handle) => {
+                        AddTorrentResponse::AlreadyManaged(_id, handle) => {
+                            // 竞态兜底：add 前的同 hash 探测未命中，但 add
+                            // 期间（磁力元数据解析窗口）另一任务抢先添加了
+                            // 同一种子。与 add 前探测同一套处理；owner ==
+                            // 本任务则是会话残留自身条目的恢复场景，直接
+                            // 拿回句柄继续。
                             let owner = shared_bt
                                 .task_for_torrent(_id)
                                 .await
                                 .unwrap_or_else(|| "unknown".to_string());
-                            log_info!(
-                                "[BT] task={} torrent already managed by task={} (id={}), rejecting duplicate",
-                                short_id(&task_id),
-                                short_id(&owner),
-                                _id
-                            );
-                            // Clean up the pre-created staging dir (it's empty/useless).
-                            let _ = std::fs::remove_dir_all(&stage_dir);
-
-                            let msg = format!(
-                                "This torrent is already being downloaded by another task ({})",
-                                short_id(&owner)
-                            );
-                            let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
-                            let _ = progress_tx
-                                .send(ProgressUpdate {
-                                    task_id: task_id.clone(),
-                                    downloaded_bytes: 0,
-                                    total_bytes: 0,
-                                    status: STATUS_ERROR,
-                                    error_message: msg.clone(),
-                                    file_name: String::new(),
-                                    segment_details: None,
-                                    ..Default::default()
-                                })
-                                .await;
-                            return Err(DownloadError::Other(msg));
+                            if owner == task_id {
+                                log_info!(
+                                    "[BT] task={} reclaiming own session entry (id={})",
+                                    short_id(&task_id),
+                                    _id
+                                );
+                                handle
+                            } else {
+                                log_info!(
+                                    "[BT] task={} torrent already managed by task={} (id={}), rejecting duplicate",
+                                    short_id(&task_id),
+                                    short_id(&owner),
+                                    _id
+                                );
+                                // Clean up the pre-created staging dir (it's empty/useless).
+                                let _ = std::fs::remove_dir_all(&stage_dir);
+                                return Err(mark_duplicate_torrent(&db, &task_id, &owner).await);
+                            }
                         }
                         AddTorrentResponse::ListOnly(_) => {
                             return Err(DownloadError::Other(
@@ -4096,6 +4160,89 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                                 HashSet::new()
                             }
                         };
+                        // parts 边车：记录「选中 file_id → 最终磁盘路径」映射，
+                        // 并从 staging 副产物提取跨文件边界 piece 中未选文件的
+                        // 字节（上面的整体重哈希刚验证过这些字节）。重启续种
+                        // re-add 依赖它：不再按 torrent 内部布局在 save_dir 重建
+                        // 未选文件的 0 字节占位，且边界 piece 校验/上传拿到真实
+                        // 数据；扁平化/去重/重命名后的路径也能对上。写失败仅
+                        // 记日志——续种回退到无边车的旧行为，不阻塞完成。
+                        {
+                            let selected_ids: Vec<usize> = handle
+                                .with_metadata(|meta| {
+                                    true_selection
+                                        .iter()
+                                        .filter_map(|&i| {
+                                            let idx = usize::try_from(i).ok()?;
+                                            let fi = meta.file_infos.get(idx)?;
+                                            (!fi.attrs.padding).then_some(idx)
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            if selected_ids.len() == layout.moves.len() {
+                                let files_meta = handle.with_metadata(|meta| {
+                                    (
+                                        meta.lengths.default_piece_length(),
+                                        meta.lengths.total_length(),
+                                        meta.file_infos
+                                            .iter()
+                                            .map(|fi| crate::bt_partfile::PartsFileMeta {
+                                                relative_path: fi.relative_filename.clone(),
+                                                len: fi.len,
+                                                offset_in_torrent: fi.offset_in_torrent,
+                                                piece_range: fi.piece_range.clone(),
+                                                padding: fi.attrs.padding,
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )
+                                });
+                                if let Ok((piece_length, total_length, files)) = files_meta {
+                                    let req = crate::bt_partfile::SidecarWriteRequest {
+                                        sidecar_path: shared_bt.parts_sidecar_path(&task_id),
+                                        info_hash_hex: handle.info_hash().as_string(),
+                                        piece_length,
+                                        total_length,
+                                        files,
+                                        selected: selected_ids
+                                            .iter()
+                                            .copied()
+                                            .zip(layout.moves.iter().map(|m| m.dst.clone()))
+                                            .collect(),
+                                        save_dir: save_path.clone(),
+                                        stage_dir: stage_dir.clone(),
+                                    };
+                                    let result = tokio::task::spawn_blocking(move || {
+                                        crate::bt_partfile::write_sidecar(&req)
+                                    })
+                                    .await;
+                                    match result {
+                                        Ok(Ok(n)) => log_info!(
+                                            "[BT] task={} parts sidecar written ({} boundary segment(s))",
+                                            short_id(&task_id),
+                                            n
+                                        ),
+                                        Ok(Err(e)) => log_info!(
+                                            "[BT] task={} parts sidecar write failed: {} — reseed will fall back",
+                                            short_id(&task_id),
+                                            e
+                                        ),
+                                        Err(e) => log_info!(
+                                            "[BT] task={} parts sidecar write panicked: {}",
+                                            short_id(&task_id),
+                                            e
+                                        ),
+                                    }
+                                }
+                            } else {
+                                log_info!(
+                                    "[BT] task={} parts sidecar skipped: selection/move count mismatch ({} vs {})",
+                                    short_id(&task_id),
+                                    selected_ids.len(),
+                                    layout.moves.len()
+                                );
+                            }
+                        }
                         // Reacquire the completion lock for the actual move/update
                         // phase. The sentinel written above remains the claim while
                         // hashing ran without blocking unrelated BT completions.

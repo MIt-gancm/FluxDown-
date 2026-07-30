@@ -203,6 +203,24 @@ impl ApiHost for ServerApiHost {
         .await
     }
 
+    /// 重命名任务文件：经 actor 串行化到引擎，引擎错误码按 HTTP 语义映射
+    /// （`not-found`→404、`invalid-name`→400、其余业务拒绝→409），除
+    /// `not-found` 外错误码字符串原样透传给客户端做 i18n 映射。
+    async fn rename_task(&self, task_id: &str, file_name: &str) -> Result<(), ApiError> {
+        self.send_cmd(|ack| ActorCmd::RenameTask {
+            task_id: task_id.to_string(),
+            file_name: file_name.to_string(),
+            ack,
+        })
+        .await?
+        .map_err(|e| match e.as_str() {
+            "not-found" => ApiError::NotFound,
+            "invalid-name" => ApiError::BadRequest(e),
+            "task-active" | "bt-unsupported" | "target-exists" => ApiError::Conflict(e),
+            _ => ApiError::Internal(e),
+        })
+    }
+
     async fn pause_all(&self) -> Result<(), ApiError> {
         self.send_cmd(|ack| ActorCmd::PauseAll { ack }).await
     }

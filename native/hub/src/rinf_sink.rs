@@ -276,6 +276,18 @@ impl EventSink for RinfEventSink {
             EngineEvent::PluginAutoDisabled { identity, reason } => {
                 signals::PluginAutoDisabledNotice { identity, reason }.send_signal_to_dart();
             }
+            EngineEvent::DuplicateTorrentDetected {
+                task_id,
+                existing_task_id,
+                existing_name,
+            } => {
+                signals::DuplicateTorrentNotice {
+                    task_id,
+                    existing_task_id,
+                    existing_name,
+                }
+                .send_signal_to_dart();
+            }
             EngineEvent::PluginHookActivity {
                 task_id,
                 plugin_id,

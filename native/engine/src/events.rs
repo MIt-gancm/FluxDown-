@@ -133,6 +133,19 @@ pub enum EngineEvent {
         reason: String,
     },
 
+    /// BT 重复添加检测：新任务的 info-hash 已被另一任务持有（下载或做种），
+    /// 引擎已删除新建的占位任务行（不产生失败任务）。宿主据此提示用户并
+    /// 可跳转已有任务（hub → `DuplicateTorrentNotice` 信号；server → WS
+    /// `duplicateTorrent`）。
+    DuplicateTorrentDetected {
+        /// 被删除的占位任务 id。
+        task_id: String,
+        /// 持有该种子的已有任务 id（极端情况下为 `"unknown"`）。
+        existing_task_id: String,
+        /// 已有任务的显示名（可能为空，例如其元数据尚未解析）。
+        existing_name: String,
+    },
+
     /// 插件钩子活动指示：带产物的任务级钩子（onDone，可能含长时 ffmpeg 转码）
     /// 开始（`running=true`）/结束（`running=false`）。**纯旁路 UI 提示，不影响
     /// 任务状态机**（通知平面 fire-and-forget 契约不变）；宿主 UI 应自设看门狗

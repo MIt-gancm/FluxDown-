@@ -45,6 +45,14 @@ pub enum ActorCmd {
         task_id: String,
         ack: oneshot::Sender<()>,
     },
+    /// 重命名任务文件。错误为引擎稳定错误码字符串（`invalid-name` /
+    /// `task-active` / `bt-unsupported` / `not-found` / `target-exists`）
+    /// 或 IO/DB 原文。
+    RenameTask {
+        task_id: String,
+        file_name: String,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
     DeleteTask {
         task_id: String,
         delete_files: bool,
@@ -403,6 +411,13 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
         ActorCmd::ContinueTask { task_id, ack } => {
             engine.manager.resume_task(&task_id).await;
             let _ = ack.send(());
+        }
+        ActorCmd::RenameTask {
+            task_id,
+            file_name,
+            ack,
+        } => {
+            let _ = ack.send(engine.manager.rename_task(&task_id, &file_name).await);
         }
         ActorCmd::SetTaskSeedLimits {
             task_id,

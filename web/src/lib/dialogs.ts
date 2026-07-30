@@ -30,3 +30,15 @@ export const manifestSelectStore = new Store<ManifestSelectPayload | null>(null)
 export function openManifestSelect(payload: ManifestSelectPayload) {
   manifestSelectStore.set(payload)
 }
+
+/** 重命名任务弹窗的触发载荷（消费后置 null）。 */
+export interface RenameTaskPayload {
+  taskId: string
+  fileName: string
+}
+
+export const renameTaskStore = new Store<RenameTaskPayload | null>(null)
+
+export function openRenameTask(payload: RenameTaskPayload) {
+  renameTaskStore.set(payload)
+}

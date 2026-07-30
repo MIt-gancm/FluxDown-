@@ -36,6 +36,8 @@ pub const API_TASK: &str = "/api/v1/tasks/{id}";
 pub const API_TASK_PAUSE: &str = "/api/v1/tasks/{id}/pause";
 /// 恢复单任务（PUT）。
 pub const API_TASK_CONTINUE: &str = "/api/v1/tasks/{id}/continue";
+/// 重命名任务文件（POST，body `{"fileName"}`）。
+pub const API_TASK_RENAME: &str = "/api/v1/tasks/{id}/rename";
 /// 暂停全部（PUT）。
 pub const API_TASKS_PAUSE: &str = "/api/v1/tasks/pause";
 /// 恢复全部（PUT）。
@@ -141,6 +143,12 @@ pub fn task_pause_path(task_id: &str) -> String {
 #[must_use]
 pub fn task_continue_path(task_id: &str) -> String {
     format!("{API_TASKS}/{task_id}/continue")
+}
+
+/// 生成重命名任务文件路径（客户端用）。
+#[must_use]
+pub fn task_rename_path(task_id: &str) -> String {
+    format!("{API_TASKS}/{task_id}/rename")
 }
 
 /// 生成单任务组路径（客户端用）。

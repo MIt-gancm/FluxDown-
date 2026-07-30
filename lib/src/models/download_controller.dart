@@ -2135,6 +2135,15 @@ class DownloadController extends ChangeNotifier {
     _safeNotifyListeners();
   }
 
+  /// 重命名任务落盘文件名（不做乐观更新：引擎成功后广播 AllTasks，
+  /// 结果经 RenameTaskResult 回传，由调用方 UI 监听展示）。
+  void renameTask(String taskId, String newName) {
+    final trimmed = newName.trim();
+    if (trimmed.isEmpty) return;
+    logInfo(_tag, 'renameTask: $taskId -> $trimmed');
+    RenameTask(taskId: taskId, fileName: trimmed).sendSignalToRust();
+  }
+
   void _onPriorityTaskChanged(RustSignalPack<PriorityTaskChanged> pack) {
     if (_disposed) return;
     final p = pack.message;

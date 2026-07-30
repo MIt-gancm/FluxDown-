@@ -347,6 +347,16 @@ impl EventSink for EngineEventSink {
             EngineEvent::PluginAutoDisabled { identity, reason } => {
                 WsServerMsg::PluginAutoDisabled { identity, reason }
             }
+            // BT 重复添加：占位任务已被引擎删除，提示并指向已有任务。
+            EngineEvent::DuplicateTorrentDetected {
+                task_id,
+                existing_task_id,
+                existing_name,
+            } => WsServerMsg::DuplicateTorrent {
+                task_id,
+                existing_task_id,
+                existing_name,
+            },
             // 插件 onDone 钩子活动状态（running=true/false），驱动“插件处理
             // 中…”指示器；可能并发/丢失，客户端自带看门狗兜底。
             EngineEvent::PluginHookActivity {

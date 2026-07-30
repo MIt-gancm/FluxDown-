@@ -1189,10 +1189,7 @@ mod tests {
             &(512 * 1024).to_string()
         );
         let echoed = build_global_option(&changes);
-        assert_eq!(
-            echoed["max-overall-upload-limit"],
-            (512 * 1024).to_string()
-        );
+        assert_eq!(echoed["max-overall-upload-limit"], (512 * 1024).to_string());
         // 未配置时回显 aria2 出厂默认 "0"（不限）。
         let empty = build_global_option(&HashMap::new());
         assert_eq!(empty["max-overall-upload-limit"], "0");

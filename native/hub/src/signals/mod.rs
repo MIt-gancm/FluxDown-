@@ -1099,6 +1099,16 @@ pub struct PluginAutoDisabledNotice {
     pub reason: String,
 }
 
+/// BT 重复添加：新任务的 info-hash 已被 `existing_task_id` 持有（下载或
+/// 做种），引擎已删除占位任务行（Rust → Dart）。UI 弹提示并可定位已有
+/// 任务；`existing_name` 可能为空（对方元数据未解析）。
+#[derive(Serialize, RustSignal)]
+pub struct DuplicateTorrentNotice {
+    pub task_id: String,
+    pub existing_task_id: String,
+    pub existing_name: String,
+}
+
 /// A plugin's onDone hook started/finished running for a task, purely
 /// informational — does not affect task status (Rust → Dart). Same
 /// `(task_id, plugin_id)` pair may fire multiple times; Dart should track
@@ -1556,6 +1566,24 @@ pub struct GroupControl {
 pub struct RenameGroup {
     pub group_id: String,
     pub name: String,
+}
+
+/// Dart 请求重命名单个任务的落盘文件名。结果经 [`RenameTaskResult`] 回传，
+/// 成功后引擎会广播 [`AllTasks`]。
+#[derive(Deserialize, DartSignal)]
+pub struct RenameTask {
+    pub task_id: String,
+    pub file_name: String,
+}
+
+/// 任务重命名结果（Rust → Dart）。`error` 为稳定错误码
+/// （invalid-name / task-active / bt-unsupported / not-found / target-exists）
+/// 或引擎原文；`ok` 为 true 时 `error` 为空串。
+#[derive(Serialize, RustSignal)]
+pub struct RenameTaskResult {
+    pub task_id: String,
+    pub ok: bool,
+    pub error: String,
 }
 
 /// Dart 请求全量任务组快照（结果经 [`AllGroups`] 回传）。

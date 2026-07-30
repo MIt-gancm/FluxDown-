@@ -69,7 +69,7 @@ fn corrupt_negative_preselection_never_downloads_none() {
 fn build_add_options_bakes_known_subset_into_only_files() {
     let strategy = decide_bt_selection_strategy(false, &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
 
-    let opts = build_add_torrent_options(&strategy, "stage".to_string());
+    let opts = build_add_torrent_options(&strategy, "stage".to_string(), 0);
 
     assert_eq!(opts.only_files, Some(vec![0, 1, 2, 3, 4, 5, 6, 7, 8]));
     assert_eq!(opts.output_folder.as_deref(), Some("stage"));
@@ -78,9 +78,9 @@ fn build_add_options_bakes_known_subset_into_only_files() {
 // All / PostAdd must leave only_files unset so librqbit fetches every file.
 #[test]
 fn build_add_options_leaves_only_files_unset_when_not_preselected() {
-    let all = build_add_torrent_options(&BtSelectionStrategy::All, "stage".to_string());
+    let all = build_add_torrent_options(&BtSelectionStrategy::All, "stage".to_string(), 0);
     assert_eq!(all.only_files, None);
 
-    let post = build_add_torrent_options(&BtSelectionStrategy::PostAdd, "stage".to_string());
+    let post = build_add_torrent_options(&BtSelectionStrategy::PostAdd, "stage".to_string(), 0);
     assert_eq!(post.only_files, None);
 }

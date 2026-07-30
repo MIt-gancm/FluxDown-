@@ -283,6 +283,16 @@ class S {
   String get copyUrl => _r('copyUrl');
   String get urlCopied => _r('urlCopied');
   String get errorCopied => _r('errorCopied');
+  String get renameTask => _r('renameTask');
+  String get renameTaskTitle => _r('renameTaskTitle');
+  String get renameTaskPlaceholder => _r('renameTaskPlaceholder');
+  String get renameTaskSuccess => _r('renameTaskSuccess');
+  String get renameTaskTimeout => _r('renameTaskTimeout');
+  String get renameErrInvalidName => _r('renameErrInvalidName');
+  String get renameErrTaskActive => _r('renameErrTaskActive');
+  String get renameErrBtUnsupported => _r('renameErrBtUnsupported');
+  String get renameErrNotFound => _r('renameErrNotFound');
+  String get renameErrTargetExists => _r('renameErrTargetExists');
 
   // ─────────────────────────────────────────────
   // 删除确认对话框
@@ -1663,6 +1673,9 @@ class S {
   String get taskIgnorePluginRetryMsg => _r('taskIgnorePluginRetryMsg');
   String pluginAutoDisabledToast(String name) =>
       _r('pluginAutoDisabledToast', {'name': name});
+  String duplicateTorrentToast(String name) =>
+      _r('duplicateTorrentToast', {'name': name});
+  String get duplicateTorrentToastUnnamed => _r('duplicateTorrentToastUnnamed');
 
   // ─────────────────────────────────────────────
   // 组件管理（v1 仅 ffmpeg）

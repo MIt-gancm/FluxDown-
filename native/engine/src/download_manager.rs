@@ -3048,9 +3048,7 @@ impl DownloadManager {
     fn effective_task_upload_bps(&self, task: &TaskInfo) -> u64 {
         effective_upload_bps(
             task.seed_upload_limit_bps,
-            self.queues
-                .get(&task.queue_id)
-                .map(|q| q.upload_limit_kbps),
+            self.queues.get(&task.queue_id).map(|q| q.upload_limit_kbps),
         )
     }
 
@@ -3153,6 +3151,48 @@ impl DownloadManager {
         // 仅在 generation 匹配（确实是这一轮 spawn 失败）时触发，防止 stale 信号误触发。
         let max_retries = self.max_auto_retries;
         if generation_matched && let Ok(Some(task)) = self.db.load_task_by_id(task_id).await {
+            // 重复种子占位任务：引擎在 add 前 / AlreadyManaged 兜底时打了
+            // DB 标记（见 bt_downloader::mark_duplicate_torrent）。不算失败
+            // ——删除占位行（不进自动重试 / 插件 onError / task.failed
+            // webhook），发 DuplicateTorrentDetected 事件由宿主提示用户并
+            // 指向已有任务。
+            if task.status == 4
+                && let Some(owner_id) = task
+                    .error_message
+                    .strip_prefix(bt_downloader::DUPLICATE_TORRENT_MSG_PREFIX)
+            {
+                let owner_id = owner_id.to_string();
+                let existing_name = match self.db.load_task_by_id(&owner_id).await {
+                    Ok(Some(t)) => t.file_name,
+                    _ => String::new(),
+                };
+                log_info!(
+                    "[manager] duplicate torrent: removing placeholder task {} (existing task {})",
+                    task_id,
+                    owner_id
+                );
+                self.auto_retry_counts.remove(task_id);
+                self.retry_scheduled.remove(task_id);
+                self.auto_failover_pending.remove(task_id);
+                if let Err(e) = self.db.delete_task(task_id).await {
+                    log_info!(
+                        "[manager] duplicate cleanup {}: DB delete error: {}",
+                        task_id,
+                        e
+                    );
+                }
+                self.sink.emit(EngineEvent::DuplicateTorrentDetected {
+                    task_id: task_id.to_string(),
+                    existing_task_id: owner_id,
+                    existing_name,
+                });
+                self.load_and_send_all_tasks().await;
+                self.broadcast_queue_positions();
+                self.sync_queue_occupancy();
+                self.maybe_wal_checkpoint().await;
+                self.maybe_release_bt_session().await;
+                return;
+            }
             // 本轮是否又排了一次自动重试——决定 `task.failed` 该不该发。
             let mut retry_pending = false;
             // max == 0：用户关闭了自动重试，直接跳过（不分配计数）。
@@ -5963,6 +6003,13 @@ impl DownloadManager {
                         // entry (and files) once metadata resolves.
                         bt.register_pending_delete(task_id, delete_files).await;
                     }
+                } else {
+                    // BT 会话未创建（本次启动未跑过 BT 任务）：按路径直接
+                    // 删 parts 边车（有会话时由 bt.delete_task 一并清理）。
+                    crate::bt_partfile::remove_sidecar(&crate::bt_partfile::sidecar_path(
+                        &self.app_data_dir,
+                        task_id,
+                    ));
                 }
                 // Fallback filesystem cleanup: covers the cross-session case
                 // where the app restarted after completion (handle not in
@@ -6178,6 +6225,7 @@ impl DownloadManager {
                     // 供 handle 超时后的延迟二次清理使用（F010）。
                     let file_name_owned = t.file_name.clone();
                     let url_owned = t.url.clone();
+                    let app_data_dir = self.app_data_dir.clone();
                     cleanup_futs.push(tokio::spawn(async move {
                         // Wait for this task's download handle (10s per-task timeout).
                         // 超时后 abort 外层 future，加速纯 async 任务释放连接/句柄，
@@ -6201,6 +6249,12 @@ impl DownloadManager {
                             if !found {
                                 bt.register_pending_delete(&tid_owned, delete_files).await;
                             }
+                        } else {
+                            // 无 BT 会话：按路径直接删 parts 边车。
+                            crate::bt_partfile::remove_sidecar(&crate::bt_partfile::sidecar_path(
+                                &app_data_dir,
+                                &tid_owned,
+                            ));
                         }
                         // BT file cleanup (final path, i.e. save_dir/file_name).
                         // Only attempted when file_name is non-empty and safe;
@@ -6624,10 +6678,28 @@ impl DownloadManager {
             ),
             _ => None,
         };
-        // 完成时数据已从 staging 搬到 save_dir：多文件种子在
-        // save_dir/<file_name>/ 下保留 torrent 相对布局，以该目录为
-        // output_folder；单文件直接落在 save_dir。重命名过的单文件与
-        // torrent 内部名不匹配，会在完整性校验处失败并附原因提示。
+        // parts 边车（完成时写下）：优先用它做种——选中文件按记录的最终
+        // 路径打开、未选文件路由到边车 blob，不在 save_dir 重建任何占位
+        // 文件，扁平化/重命名布局也能通过校验。缺失/损坏时回退默认
+        // storage（下面的 output_folder 推断仅在回退路径生效）。
+        let parts_factory = match crate::bt_partfile::load_seed_factory(
+            &crate::bt_partfile::sidecar_path(&self.app_data_dir, &task_id),
+            std::path::Path::new(&task.save_dir),
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                log_info!(
+                    "[manager] reseed {}: parts sidecar unusable ({}) — falling back to default storage",
+                    task_id,
+                    e
+                );
+                None
+            }
+        };
+        // 回退路径（无边车）：完成时数据已从 staging 搬到 save_dir——多
+        // 文件种子在 save_dir/<file_name>/ 下保留 torrent 相对布局，以该
+        // 目录为 output_folder；单文件直接落在 save_dir。重命名过的单文件
+        // 与 torrent 内部名不匹配，会在完整性校验处失败并附原因提示。
         let root = std::path::Path::new(&task.save_dir).join(&task.file_name);
         let output_folder = if root.is_dir() {
             root.to_string_lossy().into_owned()
@@ -6652,7 +6724,14 @@ impl DownloadManager {
         let upload_limit_bps = self.effective_task_upload_bps(task);
         bt.clone().runtime_handle().spawn(async move {
             match bt
-                .readd_for_seeding(&task_id, source, output_folder, only_files, upload_limit_bps)
+                .readd_for_seeding(
+                    &task_id,
+                    source,
+                    output_folder,
+                    only_files,
+                    upload_limit_bps,
+                    parts_factory,
+                )
                 .await
             {
                 Ok(handle) => {
@@ -7202,6 +7281,106 @@ impl DownloadManager {
             return;
         }
         self.send_all_groups().await;
+    }
+
+    /// 用户显式重命名任务文件。返回稳定错误码（供前端映射 i18n）：
+    /// `invalid-name` / `task-active` / `bt-unsupported` / `not-found` /
+    /// `target-exists`，磁盘 rename 失败返回原始 IO 错误文本。
+    ///
+    /// 约束与行为：
+    /// - 仅接受非活跃任务（活跃任务的写入路径持有旧名句柄，重命名会与
+    ///   finalize/分段写竞争）；actor 单线程串行化保证本方法执行期间不会
+    ///   有新的 start/resume 插入。
+    /// - BT 任务不支持：其落盘名由 `bt_custom_name`/metadata 驱动，且可能是
+    ///   目录（librqbit 持句柄期间目录 rename 必败），语义与单文件重命名不同。
+    /// - 磁盘上同时迁移：最终文件、`.fdownloading` 临时文件（暂停任务续传
+    ///   路径按 `save_dir/file_name + TEMP_EXT` 重建，改名后无缝续传）、
+    ///   DASH 音轨 sidecar 及其临时文件。均不存在时仅改 DB（未开始/文件丢失）。
+    /// - 目标名已被磁盘占用即拒绝，绝不覆盖既有文件。
+    pub async fn rename_task(&mut self, task_id: &str, new_name: &str) -> Result<(), String> {
+        let new_name = new_name.trim();
+        if !is_safe_file_name(new_name) {
+            return Err("invalid-name".to_string());
+        }
+        if self.active_tasks.contains_key(task_id) {
+            return Err("task-active".to_string());
+        }
+        let t = match self.db.load_task_by_id(task_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => return Err("not-found".to_string()),
+            Err(e) => return Err(format!("db: {e}")),
+        };
+        // status 1/5 而不在 active_tasks 属异常残留，同样拒绝。
+        if t.status == 1 || t.status == 5 {
+            return Err("task-active".to_string());
+        }
+        if is_bt_url(&t.url) {
+            return Err("bt-unsupported".to_string());
+        }
+        if t.file_name == new_name {
+            return Ok(());
+        }
+        let dir = PathBuf::from(&t.save_dir);
+        let old_path = dir.join(&t.file_name);
+        let new_path = dir.join(new_name);
+        let old_temp = PathBuf::from(format!("{}{}", old_path.display(), downloader::TEMP_EXT));
+        let new_temp = PathBuf::from(format!("{}{}", new_path.display(), downloader::TEMP_EXT));
+        // 目标占用检查（最终名与临时名任一被占即拒）。大小写不敏感文件系统上
+        // 仅大小写不同的改名是合法的自我重命名，不视为占用冲突。
+        let case_only = t.file_name.to_lowercase() == new_name.to_lowercase();
+        if !case_only && (new_path.exists() || new_temp.exists()) {
+            return Err("target-exists".to_string());
+        }
+        // 旧名非法（历史脏数据）时跳过磁盘操作，仅改 DB。
+        if is_safe_file_name(&t.file_name) {
+            if old_path.exists()
+                && let Err(e) = tokio::fs::rename(&old_path, &new_path).await
+            {
+                return Err(format!("rename: {e}"));
+            }
+            if old_temp.exists()
+                && let Err(e) = tokio::fs::rename(&old_temp, &new_temp).await
+            {
+                // 最终文件已迁移成功而临时文件失败：回滚最终文件，保持
+                // 「名字对 = 数据对」的一致视图。
+                let _ = tokio::fs::rename(&new_path, &old_path).await;
+                return Err(format!("rename: {e}"));
+            }
+            // DASH 音轨 sidecar（轨对任务视频轨 URL 非 .mpd，也可能持有）。
+            let has_audio_sidecar = dash_downloader::is_dash_url(&t.url)
+                || self
+                    .db
+                    .load_audio_url(task_id)
+                    .await
+                    .unwrap_or_default()
+                    .is_some();
+            if has_audio_sidecar {
+                let old_audio = dash_downloader::build_audio_path(&old_path);
+                let new_audio = dash_downloader::build_audio_path(&new_path);
+                if old_audio.exists() {
+                    let _ = tokio::fs::rename(&old_audio, &new_audio).await;
+                }
+                let old_audio_temp =
+                    PathBuf::from(format!("{}{}", old_audio.display(), downloader::TEMP_EXT));
+                let new_audio_temp =
+                    PathBuf::from(format!("{}{}", new_audio.display(), downloader::TEMP_EXT));
+                if old_audio_temp.exists() {
+                    let _ = tokio::fs::rename(&old_audio_temp, &new_audio_temp).await;
+                }
+            }
+        }
+        if let Err(e) = self.db.set_task_file_name(task_id, new_name).await {
+            log_info!("[manager] rename_task {} db error: {}", task_id, e);
+            return Err(format!("db: {e}"));
+        }
+        log_info!(
+            "[manager] rename_task {}: '{}' -> '{}'",
+            task_id,
+            t.file_name,
+            new_name
+        );
+        self.load_and_send_all_tasks().await;
+        Ok(())
     }
 
     /// Move a task to a different queue and broadcast the updated queue list.
@@ -8800,6 +8979,165 @@ mod tests {
             let t = db.load_task_by_id(id).await.expect("load").expect("task");
             assert_eq!(t.status, 2, "排队任务必须批量持久化为 paused");
         }
+    }
+
+    /// 重命名核心契约：最终文件与 `.fdownloading` 临时文件随 DB `file_name`
+    /// 一并迁移；成功后广播一次任务快照。
+    #[tokio::test]
+    async fn rename_task_moves_files_and_updates_db() {
+        let dir = unique_filetrack_test_dir("rename_ok");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        std::fs::write(dir.join("old.bin"), b"data").expect("write final");
+        std::fs::write(
+            dir.join(format!("old2.bin{}", downloader::TEMP_EXT)),
+            b"partial",
+        )
+        .expect("write temp");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "r-done", &save_dir, "old.bin", 3).await;
+        insert_task_at_status(&db, "r-paused", &save_dir, "old2.bin", 2).await;
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: save_dir.clone(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+
+        // 完成任务：最终文件迁移。
+        mgr.rename_task("r-done", "new.bin").await.expect("rename");
+        assert!(!dir.join("old.bin").exists(), "old final must be gone");
+        assert!(dir.join("new.bin").exists(), "new final must exist");
+        let t = db
+            .load_task_by_id("r-done")
+            .await
+            .expect("load")
+            .expect("task");
+        assert_eq!(t.file_name, "new.bin");
+        assert!(
+            sink.events()
+                .iter()
+                .any(|e| matches!(e, EngineEvent::TasksSnapshot(_))),
+            "successful rename must broadcast a tasks snapshot"
+        );
+
+        // 暂停任务：`.fdownloading` 临时文件迁移，续传路径按新名重建。
+        mgr.rename_task("r-paused", "new2.bin")
+            .await
+            .expect("rename paused");
+        assert!(
+            dir.join(format!("new2.bin{}", downloader::TEMP_EXT))
+                .exists(),
+            "temp file must follow the rename"
+        );
+        let t = db
+            .load_task_by_id("r-paused")
+            .await
+            .expect("load")
+            .expect("task");
+        assert_eq!(t.file_name, "new2.bin");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 重命名拒绝面：目标名被占、活跃任务、BT 任务、非法名——全部返回
+    /// 稳定错误码且不落任何 DB/磁盘变更。
+    #[tokio::test]
+    async fn rename_task_rejects_conflict_active_bt_and_invalid() {
+        let dir = unique_filetrack_test_dir("rename_reject");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        std::fs::write(dir.join("a.bin"), b"a").expect("write a");
+        std::fs::write(dir.join("taken.bin"), b"x").expect("write taken");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "r1", &save_dir, "a.bin", 3).await;
+        db.insert_task(
+            "r-bt",
+            "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+            "bt-name",
+            &save_dir,
+            1,
+            0,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert bt task");
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: save_dir.clone(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+
+        assert_eq!(
+            mgr.rename_task("r1", "taken.bin").await,
+            Err("target-exists".to_string())
+        );
+        assert_eq!(
+            mgr.rename_task("r1", "../escape.bin").await,
+            Err("invalid-name".to_string())
+        );
+        assert_eq!(
+            mgr.rename_task("r-bt", "renamed").await,
+            Err("bt-unsupported".to_string())
+        );
+        assert_eq!(
+            mgr.rename_task("ghost", "x.bin").await,
+            Err("not-found".to_string())
+        );
+        mgr.active_tasks.insert(
+            "r1".to_string(),
+            ActiveTaskEntry {
+                token: CancellationToken::new(),
+                generation: 0,
+                handle: None,
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+        assert_eq!(
+            mgr.rename_task("r1", "b.bin").await,
+            Err("task-active".to_string())
+        );
+        // 全部被拒：原文件原名保持不变。
+        assert!(dir.join("a.bin").exists());
+        let t = db.load_task_by_id("r1").await.expect("load").expect("task");
+        assert_eq!(t.file_name, "a.bin");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// FluxDown #11 核心契约：completed 任务的目标文件消失后 `file_missing`

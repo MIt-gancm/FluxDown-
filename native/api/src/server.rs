@@ -266,6 +266,7 @@ fn register_core(state: AppState) -> Router<AppState> {
             .route(routes::API_TASK, get(api_get_task).delete(api_delete_task))
             .route(routes::API_TASK_PAUSE, put(api_pause_task))
             .route(routes::API_TASK_CONTINUE, put(api_continue_task))
+            .route(routes::API_TASK_RENAME, post(api_rename_task))
             .route(routes::API_QUEUES, get(api_list_queues))
             .route(routes::API_RESOLVE_PREVIEW, post(api_resolve_preview))
             .route(
@@ -392,6 +393,7 @@ impl IntoResponse for ApiError {
         let status = match &self {
             ApiError::NotFound => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Conflict(_) => StatusCode::CONFLICT,
             ApiError::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -1250,6 +1252,41 @@ pub(crate) async fn api_continue_task(
         return *resp;
     }
     ack(state.host.continue_task(&id).await)
+}
+
+/// 重命名任务文件。
+#[utoipa::path(post, path = "/api/v1/tasks/{id}/rename", tag = "management",
+    params(("id" = String, Path, description = "任务 ID（UUID）")),
+    request_body = crate::types::RenameTaskRequest,
+    responses(
+        (status = 200, description = "已重命名", body = crate::types::ResultMessage),
+        (status = 400, description = "文件名非法（message 为错误码 `invalid-name`）", body = crate::types::ResultMessage),
+        (status = 404, description = "任务不存在", body = crate::types::ResultMessage),
+        (status = 409, description = "业务拒绝（message 为错误码 `task-active` / `bt-unsupported` / `target-exists`）", body = crate::types::ResultMessage),
+        (status = 401, description = "token 无效", body = crate::types::ResultMessage),
+    ),
+    security(("bearerAuth" = []), ("tokenHeader" = []))
+)]
+pub(crate) async fn api_rename_task(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = guard(&state, &headers) {
+        return *resp;
+    }
+    let req: crate::types::RenameTaskRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid payload: {e}"),
+            );
+        }
+    };
+    ack(state.host.rename_task(&id, &req.file_name).await)
 }
 
 /// 暂停全部活跃任务（pending / downloading / preparing）。

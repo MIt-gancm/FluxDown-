@@ -141,6 +141,13 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ queueId }),
     }),
+  // 重命名任务文件（错误码经 body.message 原样透传：invalid-name/task-active/
+  // bt-unsupported/target-exists/not-found 或引擎原文，由弹窗侧映射文案）
+  renameTask: (id: string, fileName: string) =>
+    apiFetch<unknown>(`/api/v1/tasks/${id}/rename`, {
+      method: 'POST',
+      body: JSON.stringify({ fileName }),
+    }),
 
   // 任务组与前置预解析（多文件下载）
   resolvePreview: (req: ResolvePreviewRequest) =>

@@ -562,6 +562,14 @@ pub struct InstallPluginDevRequest {
     pub dir_path: String,
 }
 
+/// 重命名任务文件请求体。
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RenameTaskRequest {
+    /// 新文件名（不含路径分隔符；引擎侧校验非法字符与状态）。
+    pub file_name: String,
+}
+
 /// 设置插件启用状态请求体。
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetPluginEnabledRequest {

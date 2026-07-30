@@ -822,6 +822,19 @@ void showTaskContextMenu(
       action: () => _openFolder(folderPath),
     ),
   );
+  // --- 重命名（非 BT 且非下载中/准备中）---
+  if (!task.isBt &&
+      task.status != TaskStatus.downloading &&
+      task.status != TaskStatus.preparing) {
+    items.add(
+      ContextMenuItem(
+        icon: LucideIcons.pencil,
+        label: s.renameTask,
+        color: c.textPrimary,
+        action: () => showRenameTaskDialog(context, task: task),
+      ),
+    );
+  }
   dividers.add(items.length - 1); // 文件操作组后加分隔线
 
   // --- 复制下载地址 ---
@@ -933,6 +946,149 @@ void showIgnorePluginRetryDialog(BuildContext context, {required String taskId})
 Future<void> _openFile(String filePath) => openFile(filePath);
 
 Future<void> _openFolder(String filePath) => openFolder(filePath);
+
+// =============================================================================
+// 任务重命名对话框
+// =============================================================================
+
+/// 右键菜单「重命名」入口：弹对话框改任务落盘文件名。
+/// 结果经 RenameTaskResult 回传（10s 超时），toast 展示成功/错误。
+void showRenameTaskDialog(BuildContext context, {required DownloadTask task}) {
+  if (!context.mounted) return;
+  final c = AppColors.of(context);
+  showShadDialog(
+    context: context,
+    barrierColor: c.dialogBarrier,
+    animateIn: const [],
+    animateOut: const [],
+    builder: (ctx) => _RenameTaskDialogContent(task: task),
+  );
+}
+
+/// 引擎稳定错误码 → 本地化文案；未知码原样展示。
+String _renameErrorText(S s, String code) {
+  switch (code) {
+    case 'invalid-name':
+      return s.renameErrInvalidName;
+    case 'task-active':
+      return s.renameErrTaskActive;
+    case 'bt-unsupported':
+      return s.renameErrBtUnsupported;
+    case 'not-found':
+      return s.renameErrNotFound;
+    case 'target-exists':
+      return s.renameErrTargetExists;
+    default:
+      return code;
+  }
+}
+
+class _RenameTaskDialogContent extends StatefulWidget {
+  final DownloadTask task;
+
+  const _RenameTaskDialogContent({required this.task});
+
+  @override
+  State<_RenameTaskDialogContent> createState() =>
+      _RenameTaskDialogContentState();
+}
+
+class _RenameTaskDialogContentState extends State<_RenameTaskDialogContent> {
+  late final TextEditingController _nameCtrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _nameCtrl = TextEditingController(text: widget.task.fileName)
+      ..selection = TextSelection(
+        baseOffset: 0,
+        extentOffset: widget.task.fileName.length,
+      );
+  }
+
+  @override
+  void dispose() {
+    _nameCtrl.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    final s = LocaleScope.of(context);
+    final newName = _nameCtrl.text.trim();
+    if (newName.isEmpty) return;
+    final taskId = widget.task.id;
+    // sonner 挂在 App 根部，捕获后 pop 对话框仍可安全展示 toast。
+    final sonner = FluxSonner.of(context);
+    Navigator.of(context).pop();
+    if (newName == widget.task.fileName) return;
+
+    // 先订阅再发信号，避免结果早于监听到达。
+    final resultFuture = RenameTaskResult.rustSignalStream
+        .map((pack) => pack.message)
+        .firstWhere((msg) => msg.taskId == taskId)
+        .timeout(const Duration(seconds: 10));
+    DownloadController.globalInstance?.renameTask(taskId, newName);
+
+    resultFuture.then((msg) {
+      sonner.show(
+        ShadToast(
+          title: Text(
+            msg.ok ? s.renameTaskSuccess : _renameErrorText(s, msg.error),
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }).catchError((Object _) {
+      sonner.show(
+        ShadToast(
+          title: Text(s.renameTaskTimeout),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    return ShadDialog(
+      title: Text(
+        s.renameTaskTitle,
+        style: TextStyle(
+          fontSize: 16,
+          fontWeight: FontWeight.w600,
+          color: c.textPrimary,
+        ),
+      ),
+      actions: [
+        ShadButton.outline(
+          onPressed: () => Navigator.of(context).pop(),
+          child: Text(
+            s.cancel,
+            style: TextStyle(fontSize: 13, color: c.textPrimary),
+          ),
+        ),
+        ShadButton(
+          onPressed: _submit,
+          child: Text(
+            s.renameTask,
+            style: const TextStyle(fontSize: 13),
+          ),
+        ),
+      ],
+      child: Padding(
+        padding: const EdgeInsets.only(top: 12),
+        child: ShadInput(
+          controller: _nameCtrl,
+          autofocus: true,
+          placeholder: Text(s.renameTaskPlaceholder),
+          onSubmitted: (_) => _submit(),
+        ),
+      ),
+    );
+  }
+}
 
 // =============================================================================
 // 单任务删除确认对话框（原有，保留兼容性）

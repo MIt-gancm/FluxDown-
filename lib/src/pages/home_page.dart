@@ -4,6 +4,8 @@ import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
+import 'package:rinf/rinf.dart';
+import '../bindings/bindings.dart' show DuplicateTorrentNotice;
 import '../widgets/flux_sonner.dart';
 import '../../main.dart';
 import '../i18n/locale_provider.dart';
@@ -107,6 +109,10 @@ class _HomePageState extends State<HomePage> {
     // 请求插件列表 + 订阅熔断器自动禁用通知（弹 toast）
     _pluginProvider.requestPlugins();
     _pluginProvider.addListener(_onPluginProviderChanged);
+    // BT 重复添加通知：引擎已删除占位任务行，弹提示指向已有任务。
+    _dupTorrentSub = DuplicateTorrentNotice.rustSignalStream.listen(
+      _onDuplicateTorrent,
+    );
     // 拉取 RSS 订阅列表 + 订阅「自动下载了新条目」通知（弹一条合批通知）
     _rssProvider.requestSources();
     _rssProvider.addListener(_onRssProviderChanged);
@@ -176,6 +182,19 @@ class _HomePageState extends State<HomePage> {
         title: Text(currentS.pluginAutoDisabledToast(name)),
         duration: const Duration(seconds: 4),
       ),
+    );
+  }
+
+  /// BT 重复添加（同 info-hash 已被其他任务下载/做种）→ 提示已有任务。
+  StreamSubscription<RustSignalPack<DuplicateTorrentNotice>>? _dupTorrentSub;
+  void _onDuplicateTorrent(RustSignalPack<DuplicateTorrentNotice> pack) {
+    if (!mounted) return;
+    final name = pack.message.existingName;
+    final text = name.isEmpty
+        ? currentS.duplicateTorrentToastUnnamed
+        : currentS.duplicateTorrentToast(name);
+    FluxSonner.of(context).show(
+      ShadToast(title: Text(text), duration: const Duration(seconds: 4)),
     );
   }
 
@@ -299,6 +318,7 @@ class _HomePageState extends State<HomePage> {
     ConfigSyncService.instance.onRemoteApplied = null;
     LocalPairingService.instance.removeListener(_onLocalPairingChanged);
     _pluginProvider.removeListener(_onPluginProviderChanged);
+    _dupTorrentSub?.cancel();
     _pluginProvider.dispose();
     _rssProvider.removeListener(_onRssProviderChanged);
     _rssProvider.dispose();

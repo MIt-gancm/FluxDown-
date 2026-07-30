@@ -49,6 +49,10 @@ pub enum ApiError {
     /// 宿主正在关闭（命令通道已断）→ 503。
     #[error("app shutting down")]
     Unavailable,
+    /// 业务状态冲突（如重命名活跃任务）→ 409。消息为稳定错误码字符串，
+    /// 原样透传给客户端做 i18n 映射。
+    #[error("{0}")]
+    Conflict(String),
     /// 鉴权失败（链路 HMAC 不符 / 设备未配对 / 时间戳过期）→ 401。
     #[error("unauthorized")]
     Unauthorized,
@@ -78,6 +82,20 @@ pub trait ApiHost: Send + Sync {
 
     /// 恢复单个任务。
     async fn continue_task(&self, task_id: &str) -> Result<(), ApiError>;
+
+    /// 重命名任务文件（磁盘文件 + DB `file_name`，仅限非活跃的普通任务）。
+    ///
+    /// 错误消息为稳定错误码字符串（`invalid-name` / `task-active` /
+    /// `bt-unsupported` / `not-found` / `target-exists`），宿主实现须按
+    /// 状态映射：`not-found` → [`ApiError::NotFound`]、`invalid-name` →
+    /// [`ApiError::BadRequest`]、其余业务拒绝 → [`ApiError::Conflict`]，
+    /// 且除 `not-found` 外错误码字符串原样保留。默认实现返回不支持错误。
+    async fn rename_task(&self, task_id: &str, file_name: &str) -> Result<(), ApiError> {
+        let _ = (task_id, file_name);
+        Err(ApiError::Internal(
+            "task rename not supported by this host".to_string(),
+        ))
+    }
 
     /// 暂停全部活跃任务。
     async fn pause_all(&self) -> Result<(), ApiError>;

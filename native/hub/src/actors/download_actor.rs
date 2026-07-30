@@ -33,19 +33,20 @@ use crate::signals::{
     FfmpegInstallProgress, FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList,
     FileAssociationStatus, GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin,
     InstallPlugin, InstallUpdate, InstallYtdlp, MoveTaskToQueue, OpenFile, ProbeTorrentMeta,
-    ProxyTestResult, RefreshRssSource, RenameGroup, ReorderQueueTasks, RequestAllGroups,
-    RequestAllQueues, RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
-    RequestFfmpegVersions, RequestMarketIndex, RequestPlugins, RequestRssItems,
-    RequestUpdateFailureMarker, RequestWebhookDeliveries, RequestYtdlpStatus, RequestYtdlpVersions,
-    RescanFiles, ResolvePreviewRequest, RevealFile, SaveConfig, SavePluginSettings, SelectBtFiles,
-    SelectHlsQuality, SelectResolveVariant, SetFileAssociation, SetPluginEnabled, SetPriorityTask,
-    SetQueueSchedule, SetRssItemAction, SetTaskSeedLimits, SetUrlProtocol, SimulateWebhookEvent,
-    StartQueue, StopQueue, SystemProxyInfo, TaskSegmentsUpdated, TestProxyConnection,
-    TestWebhookEndpoint, TrackerSubscriptionResult, UninstallFfmpeg, UninstallPlugin,
-    UninstallYtdlp, UpdateCheckResult, UpdateEd2kServerSubscription, UpdateFailureMarker,
-    UpdateQueue, UpdateRssSource, UpdateTaskSegments, UpdateTrackerSubscription, UrlProtocolStatus,
-    ValidateRssFeed, WebhookDeliveries, WebhookPresets, WebhookSimulateAck, WebhookTestResult,
-    YtdlpInstallProgress, YtdlpInstallResult, YtdlpStatusReport, YtdlpVersionList,
+    ProxyTestResult, RefreshRssSource, RenameGroup, RenameTask, RenameTaskResult,
+    ReorderQueueTasks, RequestAllGroups, RequestAllQueues, RequestAllRssSources, RequestAllTasks,
+    RequestConfig, RequestFfmpegStatus, RequestFfmpegVersions, RequestMarketIndex, RequestPlugins,
+    RequestRssItems, RequestUpdateFailureMarker, RequestWebhookDeliveries, RequestYtdlpStatus,
+    RequestYtdlpVersions, RescanFiles, ResolvePreviewRequest, RevealFile, SaveConfig,
+    SavePluginSettings, SelectBtFiles, SelectHlsQuality, SelectResolveVariant, SetFileAssociation,
+    SetPluginEnabled, SetPriorityTask, SetQueueSchedule, SetRssItemAction, SetTaskSeedLimits,
+    SetUrlProtocol, SimulateWebhookEvent, StartQueue, StopQueue, SystemProxyInfo,
+    TaskSegmentsUpdated, TestProxyConnection, TestWebhookEndpoint, TrackerSubscriptionResult,
+    UninstallFfmpeg, UninstallPlugin, UninstallYtdlp, UpdateCheckResult,
+    UpdateEd2kServerSubscription, UpdateFailureMarker, UpdateQueue, UpdateRssSource,
+    UpdateTaskSegments, UpdateTrackerSubscription, UrlProtocolStatus, ValidateRssFeed,
+    WebhookDeliveries, WebhookPresets, WebhookSimulateAck, WebhookTestResult, YtdlpInstallProgress,
+    YtdlpInstallResult, YtdlpStatusReport, YtdlpVersionList,
 };
 // 插件「分支体专用」信号（仅在 hub_plugins 分支体内构造）：mobile 不引入。
 use crate::signals::LinkCommand;
@@ -935,6 +936,7 @@ pub async fn run(db_dir: PathBuf) {
         Create(CreateTaskGroup),
         Control(GroupControl),
         Rename(RenameGroup),
+        RenameTask(RenameTask),
         RequestAll(RequestAllGroups),
     }
     enum RssSignal {
@@ -973,6 +975,7 @@ pub async fn run(db_dir: PathBuf) {
         let create_group_recv = CreateTaskGroup::get_dart_signal_receiver();
         let group_control_recv = GroupControl::get_dart_signal_receiver();
         let rename_group_recv = RenameGroup::get_dart_signal_receiver();
+        let rename_task_recv = RenameTask::get_dart_signal_receiver();
         let request_all_groups_recv = RequestAllGroups::get_dart_signal_receiver();
         let seed_limits_recv = SetTaskSeedLimits::get_dart_signal_receiver();
         tokio::spawn(async move {
@@ -989,6 +992,9 @@ pub async fn run(db_dir: PathBuf) {
                     }
                     Some(signal) = rename_group_recv.recv() => {
                         if group_tx.send(AuxSignal::Group(GroupSignal::Rename(signal.message))).is_err() { break; }
+                    }
+                    Some(signal) = rename_task_recv.recv() => {
+                        if group_tx.send(AuxSignal::Group(GroupSignal::RenameTask(signal.message))).is_err() { break; }
                     }
                     Some(signal) = request_all_groups_recv.recv() => {
                         if group_tx.send(AuxSignal::Group(GroupSignal::RequestAll(signal.message))).is_err() { break; }
@@ -1319,6 +1325,15 @@ pub async fn run(db_dir: PathBuf) {
                     },
                     GroupSignal::Rename(msg) => {
                         engine.manager.rename_group(&msg.group_id, &msg.name).await;
+                    }
+                    GroupSignal::RenameTask(msg) => {
+                        let result = engine.manager.rename_task(&msg.task_id, &msg.file_name).await;
+                        RenameTaskResult {
+                            task_id: msg.task_id,
+                            ok: result.is_ok(),
+                            error: result.err().unwrap_or_default(),
+                        }
+                        .send_signal_to_dart();
                     }
                     GroupSignal::RequestAll(_) => {
                         engine.manager.send_all_groups().await;

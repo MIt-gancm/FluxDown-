@@ -2,10 +2,11 @@
 // 对齐 design/web/app.js ctxItems()。
 
 import * as ContextMenu from '@radix-ui/react-context-menu'
-import { ChevronRight, Copy, Download, Link2, ListOrdered, Pause, Play, RotateCcw, Trash2, Zap } from 'lucide-react'
+import { ChevronRight, Copy, Download, Link2, ListOrdered, Pause, Pencil, Play, RotateCcw, Trash2, Zap } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { taskFileUrl } from '../../lib/api'
 import { confirmDialog } from '../../lib/confirm'
+import { openRenameTask } from '../../lib/dialogs'
 import { copyText } from '../../lib/copy'
 import { queueDisplayName, taskShareUrl } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
@@ -34,6 +35,10 @@ export function TaskContextMenu({
   children: ReactNode
 }) {
   const { t: tr } = useI18n()
+  // BT 任务（磁力/种子）不支持重命名（多文件语义）；下载中/准备中亦不可改名，
+  // 与引擎 rename_task 的 bt-unsupported / task-active 拒绝条件对齐。
+  const isBt = t.url.startsWith('magnet:') || t.url.startsWith('torrent-file://') || t.url.endsWith('.torrent')
+  const canRename = !isBt && t.status !== 1 && t.status !== 5
   return (
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild onContextMenu={onSelect}>
@@ -84,6 +89,12 @@ export function TaskContextMenu({
             <Link2 size={14} />
             {tr('task.copyPath')}
           </ContextMenu.Item>
+          {canRename && (
+            <ContextMenu.Item className="ctx-item" onSelect={() => openRenameTask({ taskId: t.taskId, fileName: t.fileName })}>
+              <Pencil size={14} />
+              {tr('task.rename')}
+            </ContextMenu.Item>
+          )}
           {queues.filter((q) => q.queueId !== t.queueId).length > 0 && (
             <ContextMenu.Sub>
               <ContextMenu.SubTrigger className="ctx-item">

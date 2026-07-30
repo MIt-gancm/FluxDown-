@@ -713,12 +713,8 @@ impl Db {
         .await?;
         // 队列级上传限速（KB/s；0 = 不限）。BT add/re-add 时与任务级
         // 覆盖一起折算成 librqbit 上传上限，见 download_manager。
-        self.add_column_if_missing(
-            "queues",
-            "upload_limit_kbps",
-            "BIGINT NOT NULL DEFAULT 0",
-        )
-        .await?;
+        self.add_column_if_missing("queues", "upload_limit_kbps", "BIGINT NOT NULL DEFAULT 0")
+            .await?;
         Ok(())
     }
 
@@ -1319,6 +1315,17 @@ impl Db {
         .bind(task_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// 无条件改写任务文件名（用户显式重命名）。与 [`Self::update_task_file_name`]
+    /// 不同：后者仅在名为空时补写（探测路径），本方法用于用户重命名，直接覆盖。
+    pub async fn set_task_file_name(&self, task_id: &str, file_name: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET file_name = $1 WHERE id = $2")
+            .bind(file_name)
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -337,6 +337,7 @@ export type WsServerMsg =
   | { type: 'resolveVariantRequest'; taskId: string; defaultIndex: number; options: ResolveVariantOption[] }
   | { type: 'pluginsChanged' }
   | { type: 'pluginAutoDisabled'; identity: string; reason: string }
+  | { type: 'duplicateTorrent'; taskId: string; existingTaskId: string; existingName: string }
   | { type: 'pluginHookActivity'; taskId: string; pluginId: string; running: boolean }
   | { type: 'componentProgress'; component: string; downloadedBytes: number; totalBytes: number }
   | { type: 'componentResult'; component: string; ok: boolean; message: string }
