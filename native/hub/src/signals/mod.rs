@@ -121,6 +121,18 @@ pub struct UpdateTaskSegments {
     pub segments: i32,
 }
 
+/// 设置任务级做种限制覆盖（Dart → Rust）。哨兵语义每字段独立：
+/// -2 = 跟随全局设置，-1 = 不限制，>=0 = 自定义（比率为千分比，
+/// 1500 = 1.5；0 视同不限制）。热生效，无需重建 BT 会话。
+#[derive(Deserialize, DartSignal)]
+pub struct SetTaskSeedLimits {
+    pub task_id: String,
+    pub ratio_limit_milli: i64,
+    pub post_ratio_limit_milli: i64,
+    pub seed_time_limit_minutes: i64,
+    pub inactive_time_limit_minutes: i64,
+}
+
 /// 分段数修改结果（Rust → Dart）。`ok = false` 表示任务正在下载/准备中/
 /// 已完成而被拒绝，Dart 侧据此提示用户先暂停。
 #[derive(Serialize, RustSignal)]
@@ -171,6 +183,20 @@ pub struct TaskProgress {
     pub save_dir: String,
     pub url: String,
     pub error_message: String, // empty if no error
+    /// 实时上传速率（字节/秒）。仅 BT 任务非零，其余协议恒 0。
+    #[serde(default)]
+    pub upload_speed_bps: i64,
+    /// 已上传字节数（BT 做种）。仅 BT 任务有意义，默认 0。
+    #[serde(default)]
+    pub uploaded_bytes: i64,
+    /// Seeding status: 0=none, 1=active seeding, 2=ratio reached,
+    /// 3=time reached, 4=user stopped, 5=task deleted, 6=session released,
+    /// 7=inactive time reached, 8=queued for a seeding slot.
+    #[serde(default)]
+    pub seeding_status: i32,
+    /// BT 做种状态的辅助说明（如停止原因）。无错误/未做种时为空。
+    #[serde(default)]
+    pub seeding_message: String,
 }
 
 /// Response to RequestAllTasks — all persisted tasks
@@ -328,6 +354,35 @@ pub struct TaskInfo {
     /// 队列内启动顺序（越小越先启动）。0 = 未显式排序（按创建时间）。
     #[serde(default)]
     pub queue_order: i32,
+    /// Cumulative uploaded bytes for BT tasks (0 for other protocols).
+    #[serde(default)]
+    pub uploaded_bytes: i64,
+    /// Uploaded bytes observed when the download completed (post-completion
+    /// ratio baseline, 0 for non-BT tasks).
+    #[serde(default)]
+    pub uploaded_at_completion: i64,
+    /// Seeding status: 0=none, 1=active seeding, 2=ratio reached,
+    /// 3=time reached, 4=user stopped, 5=task deleted, 6=session released,
+    /// 7=inactive time reached, 8=queued for a seeding slot.
+    #[serde(default)]
+    pub seeding_status: i32,
+    /// Reason/description when seeding stopped (e.g. "ratio 1.5 reached").
+    #[serde(default)]
+    pub seeding_message: String,
+    /// 任务级总分享率上限（千分比：1500 = 1.5）。-2 = 跟随全局，
+    /// -1 = 不限制，>=0 = 自定义（0 视同不限制）。字段恒由引擎侧
+    /// `TaskInfo` 填充，`default` 仅为反序列化兜底。
+    #[serde(default)]
+    pub seed_ratio_limit_milli: i64,
+    /// 任务级做种后分享率上限（千分比）。哨兵语义同上。
+    #[serde(default)]
+    pub seed_post_ratio_limit_milli: i64,
+    /// 任务级做种时长上限（分钟）。哨兵语义同上。
+    #[serde(default)]
+    pub seed_time_limit_minutes: i64,
+    /// 任务级不活跃做种时长上限（分钟）。哨兵语义同上。
+    #[serde(default)]
+    pub seed_inactive_time_limit_minutes: i64,
     /// Source page URL captured by the browser extension (empty = none).
     #[serde(default)]
     pub referrer: String,

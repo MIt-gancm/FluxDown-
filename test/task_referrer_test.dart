@@ -23,6 +23,14 @@ void main() {
     completedAt: '',
     segments: 0,
     queueOrder: 0,
+    uploadedBytes: 0,
+    uploadedAtCompletion: 0,
+    seedingStatus: 0,
+    seedingMessage: '',
+    seedRatioLimitMilli: -2,
+    seedPostRatioLimitMilli: -2,
+    seedTimeLimitMinutes: -2,
+    seedInactiveTimeLimitMinutes: -2,
     referrer: 'https://example.com/page',
     groupId: '',
     rssSourceId: '',
@@ -48,6 +56,10 @@ void main() {
         saveDir: '/tmp',
         url: 'https://example.com/f.zip',
         errorMessage: '',
+        uploadSpeedBps: 0,
+        uploadedBytes: 0,
+        seedingStatus: 0,
+        seedingMessage: '',
       ),
     );
     expect(updated.referrer, 'https://example.com/page');
@@ -83,6 +95,14 @@ void main() {
       rssSourceId: '',
       originUrl: '',
       autoRoute: '',
+      uploadedBytes: 0,
+      uploadedAtCompletion: 0,
+      seedingStatus: 0,
+      seedingMessage: '',
+      seedRatioLimitMilli: -2,
+      seedPostRatioLimitMilli: -2,
+      seedTimeLimitMinutes: -2,
+      seedInactiveTimeLimitMinutes: -2,
     );
     final task = DownloadTask.fromTaskInfo(info);
     expect(task.checksum, 'sha256=deadbeef');

@@ -186,12 +186,17 @@ impl EventSink for EngineEventSink {
                 url,
                 error_message,
                 upload_speed_bps,
+                uploaded_bytes,
+                seeding_status,
+                seeding_message,
+                ..
             } => {
-                // 实时速率缓存：仅 downloading(1)/preparing(5) 保留非零值，
-                // 到达终态（paused/completed/error）立即清除，避免 aria2
-                // tellStatus 的 downloadSpeed 字段返回陈旧速率。
+                // 实时速率缓存：downloading(1)/preparing(5) 或做种中
+                // （seeding_status==1，此时任务 status 已是 completed）保留
+                // 非零值；停止做种（2-7）或到达其余终态（paused/error）立即
+                // 清除，避免 aria2 tellStatus 返回陈旧速率。
                 let mut speeds = lock_or_recover(&self.0.live_speeds);
-                if matches!(status, 1 | 5) {
+                if matches!(status, 1 | 5) || seeding_status == 1 {
                     speeds.insert(
                         task_id.clone(),
                         LiveSpeed {
@@ -222,6 +227,9 @@ impl EventSink for EngineEventSink {
                     save_dir,
                     url,
                     error_message,
+                    uploaded_bytes,
+                    seeding_status,
+                    seeding_message,
                 }
             }
             EngineEvent::TasksSnapshot(tasks) => {
@@ -560,6 +568,9 @@ mod tests {
             url: "http://x".into(),
             error_message: String::new(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
 
         let json = rx.recv().await.expect("broadcast recv");
@@ -592,6 +603,9 @@ mod tests {
             url: "magnet:?xt=urn:btih:abc".into(),
             error_message: String::new(),
             upload_speed_bps: 777,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
 
         let speeds = hub.live_speeds_snapshot();
@@ -907,6 +921,9 @@ mod tests {
             url: "http://x".into(),
             error_message: String::new(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
         let snap = hub.live_speeds_snapshot();
         assert_eq!(snap.get("t1").map(|s| s.download_bps), Some(4096));
@@ -922,10 +939,63 @@ mod tests {
             url: "http://x".into(),
             error_message: String::new(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
         assert!(
             !hub.live_speeds_snapshot().contains_key("t1"),
             "terminal status must clear the live-speed entry"
+        );
+    }
+
+    /// 做种中的完成任务（status=3 且 seeding_status=1）必须保留 live-speed
+    /// 条目并持续刷新上传速率，停止做种（seeding_status=2-7）时再清除——
+    /// 否则 aria2 tellStatus 在做种阶段读不到 uploadSpeed。
+    #[tokio::test]
+    async fn engine_event_sink_keeps_live_speed_while_seeding_and_clears_when_seeding_stops() {
+        let hub = Arc::new(WsHub::new(16));
+        let sink = EngineEventSink(Arc::clone(&hub));
+
+        sink.emit(EngineEvent::TaskProgress {
+            task_id: "bt1".into(),
+            status: 3, // completed
+            downloaded_bytes: 200,
+            total_bytes: 200,
+            speed: 0,
+            file_name: "a.bin".into(),
+            save_dir: "/tmp".into(),
+            url: "magnet:?xt=x".into(),
+            error_message: String::new(),
+            upload_speed_bps: 2048,
+            uploaded_bytes: 512,
+            seeding_status: 1, // seeding
+            seeding_message: String::new(),
+        });
+        assert_eq!(
+            hub.live_speeds_snapshot().get("bt1").map(|s| s.upload_bps),
+            Some(2048),
+            "seeding task must keep its live-speed entry after completion"
+        );
+
+        sink.emit(EngineEvent::TaskProgress {
+            task_id: "bt1".into(),
+            status: 3, // completed
+            downloaded_bytes: 200,
+            total_bytes: 200,
+            speed: 0,
+            file_name: "a.bin".into(),
+            save_dir: "/tmp".into(),
+            url: "magnet:?xt=x".into(),
+            error_message: String::new(),
+            upload_speed_bps: 0,
+            uploaded_bytes: 4096,
+            seeding_status: 3, // stopped: limit reached
+            seeding_message: "ratio limit reached".into(),
+        });
+        assert!(
+            !hub.live_speeds_snapshot().contains_key("bt1"),
+            "stopping seeding must clear the live-speed entry"
         );
     }
 
@@ -946,6 +1016,9 @@ mod tests {
                 url: "http://x".into(),
                 error_message: String::new(),
                 upload_speed_bps: 0,
+                uploaded_bytes: 0,
+                seeding_status: 0,
+                seeding_message: String::new(),
             });
         }
         assert_eq!(hub.live_speeds_snapshot().len(), 2);
@@ -970,6 +1043,14 @@ mod tests {
             completed_at: String::new(),
             segments: 0,
             queue_order: 0,
+            uploaded_bytes: 0,
+            uploaded_at_completion: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
+            seed_ratio_limit_milli: -2,
+            seed_post_ratio_limit_milli: -2,
+            seed_time_limit_minutes: -2,
+            seed_inactive_time_limit_minutes: -2,
             referrer: String::new(),
             group_id: String::new(),
             rss_source_id: String::new(),
@@ -1001,6 +1082,14 @@ mod tests {
             completed_at: String::new(),
             segments: 0,
             queue_order: 0,
+            uploaded_bytes: 0,
+            uploaded_at_completion: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
+            seed_ratio_limit_milli: -2,
+            seed_post_ratio_limit_milli: -2,
+            seed_time_limit_minutes: -2,
+            seed_inactive_time_limit_minutes: -2,
             referrer: String::new(),
             group_id: String::new(),
             rss_source_id: String::new(),
@@ -1175,6 +1264,9 @@ mod tests {
                 url: "http://x".into(),
                 error_message: String::new(),
                 upload_speed_bps: 0,
+                uploaded_bytes: 0,
+                seeding_status: 0,
+                seeding_message: String::new(),
             }
         }
 
@@ -1217,6 +1309,9 @@ mod tests {
             url: "http://x".into(),
             error_message: String::new(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
         assert_eq!(
             rx.recv().await.expect("start event").kind,
@@ -1236,6 +1331,9 @@ mod tests {
             url: String::new(),
             error_message: "deleted".into(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
         assert!(
             matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
@@ -1270,6 +1368,9 @@ mod tests {
             url: "http://x".into(),
             error_message: String::new(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
         assert_eq!(
             rx.recv().await.expect("start event").kind,
@@ -1287,6 +1388,9 @@ mod tests {
             url: "http://x".into(),
             error_message: String::new(),
             upload_speed_bps: 0,
+            uploaded_bytes: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
         });
         assert_eq!(
             rx.recv().await.expect("complete event").kind,

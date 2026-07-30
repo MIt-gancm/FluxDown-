@@ -523,8 +523,18 @@ class TaskHoverActionCluster extends StatelessWidget {
           TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
         );
       case TaskStatus.completed:
+        // 做种中可暂停；做种停止后可重新开始做种。
+        if (task.isSeeding) {
+          buttons.add(
+            TaskActionButton(icon: LucideIcons.pause, primary: true, onTap: onPause),
+          );
+        } else if (task.isSeedingStopped) {
+          buttons.add(
+            TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
+          );
+        }
       case TaskStatus.canceled:
-        break; // 两者均为终态，无操作按钮（canceled 是只读远程镜像）
+        break; // 终态，无操作按钮（canceled 是只读远程镜像）
     }
     buttons.add(
       TaskActionButton(
@@ -616,6 +626,7 @@ class _TaskActionButtonState extends State<TaskActionButton> {
       ),
     );
   }
+
 }
 
 // =============================================================================
@@ -720,8 +731,28 @@ void showTaskContextMenu(
         ),
       );
     case TaskStatus.completed:
+      // 已完成但正在做种的 BT 任务也可以暂停；做种停止后可重新开始。
+      if (task.isSeeding) {
+        items.add(
+          ContextMenuItem(
+            icon: LucideIcons.pause,
+            label: s.pause,
+            color: c.textPrimary,
+            action: onPause,
+          ),
+        );
+      } else if (task.isSeedingStopped) {
+        items.add(
+          ContextMenuItem(
+            icon: LucideIcons.play,
+            label: s.seedingResume,
+            color: c.textPrimary,
+            action: onResume,
+          ),
+        );
+      }
     case TaskStatus.canceled:
-      break; // 两者均为终态，不提供暂停/继续菜单项
+      break; // 终态，不提供暂停/继续菜单项
   }
 
   // --- 忽略插件重试（逃生舱：插件解析失败任务专属）---

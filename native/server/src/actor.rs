@@ -125,6 +125,16 @@ pub enum ActorCmd {
         task_id: String,
         ack: oneshot::Sender<()>,
     },
+    /// 设置单任务做种限制覆盖（-2 = 跟随全局，-1 = 不限制，>=0 = 自定义，
+    /// 0 视同不限制；分享率为千分比）。
+    SetTaskSeedLimits {
+        task_id: String,
+        ratio_limit_milli: i64,
+        post_ratio_limit_milli: i64,
+        seed_time_limit_minutes: i64,
+        inactive_time_limit_minutes: i64,
+        ack: oneshot::Sender<()>,
+    },
     TestProxy {
         proxy_type: String,
         host: String,
@@ -251,6 +261,11 @@ pub async fn run_actor(
     // 触发），此处只提供节拍。
     let mut queue_schedule_tick = tokio::time::interval(Duration::from_secs(20));
     queue_schedule_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    // Seeding evaluation timer: check ratio/time limits and stop seeders
+    // that have exceeded the configured thresholds at the shared interval.
+    let mut seeding_interval =
+        tokio::time::interval(fluxdown_engine::bt_seeding::SEEDING_EVAL_INTERVAL);
+    seeding_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     // RSS 轮询节拍：与 `queue_schedule_tick` 同款——宿主只提供节拍，到期
     // 判定与抓取派发都在引擎内，`tick_rss_sources` 立即返回不阻塞。
@@ -300,6 +315,10 @@ pub async fn run_actor(
                 }
             } => {
                 engine.manager.on_rss_event(ev).await;
+            }
+            // --- Seeding evaluation timer ---
+            _ = seeding_interval.tick() => {
+                engine.manager.tick_seeding_evaluation().await;
             }
             else => {
                 log_info!("[server-actor] all channels closed, exiting");
@@ -379,6 +398,26 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
         }
         ActorCmd::ContinueTask { task_id, ack } => {
             engine.manager.resume_task(&task_id).await;
+            let _ = ack.send(());
+        }
+        ActorCmd::SetTaskSeedLimits {
+            task_id,
+            ratio_limit_milli,
+            post_ratio_limit_milli,
+            seed_time_limit_minutes,
+            inactive_time_limit_minutes,
+            ack,
+        } => {
+            engine
+                .manager
+                .set_task_seed_limits(
+                    &task_id,
+                    ratio_limit_milli,
+                    post_ratio_limit_milli,
+                    seed_time_limit_minutes,
+                    inactive_time_limit_minutes,
+                )
+                .await;
             let _ = ack.send(());
         }
         ActorCmd::DeleteTask {
@@ -781,9 +820,22 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
                 if !bt_applied =>
             {
                 bt_applied = true;
-                log_info!("[server-actor] BT config changed, invalidating session");
+                log_info!("[server-actor] BT session config changed, invalidating session");
                 engine.manager.set_bt_config(bt_config_from_map(&all));
                 engine.manager.invalidate_bt_session().await;
+            }
+            "bt_seed_ratio_limit"
+            | "bt_seed_post_ratio_limit"
+            | "bt_seed_time_limit_minutes"
+            | "bt_seed_inactive_time_limit_minutes"
+            | "bt_seed_limit_operator"
+            | "bt_seed_then_action"
+            | "bt_seed_max_active"
+                if !bt_applied =>
+            {
+                bt_applied = true;
+                log_info!("[server-actor] BT seeding config changed, live-applied");
+                engine.manager.set_bt_config(bt_config_from_map(&all));
             }
             // 服务器自身配置（token/端口/子开关）重启生效；其余键无运行时动作。
             _ => {}
@@ -836,6 +888,40 @@ pub fn bt_config_from_map(cfg: &HashMap<String, String>) -> BtConfig {
         } else {
             String::new()
         },
+        seed_ratio_limit: cfg
+            .get("bt_seed_ratio_limit")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0),
+        seed_post_ratio_limit: cfg
+            .get("bt_seed_post_ratio_limit")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0),
+        seed_time_limit_minutes: cfg
+            .get("bt_seed_time_limit_minutes")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+        seed_inactive_time_limit_minutes: cfg
+            .get("bt_seed_inactive_time_limit_minutes")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+        seed_limit_operator: cfg
+            .get("bt_seed_limit_operator")
+            .map(|v| {
+                if v.eq_ignore_ascii_case("and") {
+                    fluxdown_engine::bt_seeding::SeedingLimitOperator::And
+                } else {
+                    fluxdown_engine::bt_seeding::SeedingLimitOperator::Or
+                }
+            })
+            .unwrap_or(fluxdown_engine::bt_seeding::SeedingLimitOperator::Or),
+        seed_then_action: cfg
+            .get("bt_seed_then_action")
+            .cloned()
+            .unwrap_or_else(|| "stop".to_string()),
+        seed_max_active: cfg
+            .get("bt_seed_max_active")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0),
     }
 }
 
@@ -955,6 +1041,29 @@ mod tests {
 
         assert!(!bt.enable_dht);
         assert!(!bt.enable_upnp);
+    }
+
+    #[test]
+    fn bt_config_from_map_defaults_all_seeding_limits_to_disabled() {
+        // 缺省（键不存在）时所有做种限制均为“不限制”：0 值在求值端表示
+        // 该维度不参与判定，任务完成后无限做种。
+        let bt = bt_config_from_map(&HashMap::new());
+
+        assert_eq!(bt.seed_ratio_limit, 0.0);
+        assert_eq!(bt.seed_post_ratio_limit, 0.0);
+        assert_eq!(bt.seed_time_limit_minutes, 0);
+        assert_eq!(bt.seed_inactive_time_limit_minutes, 0);
+        assert_eq!(bt.seed_max_active, 0);
+    }
+
+    #[test]
+    fn bt_config_from_map_parses_seed_max_active_and_falls_back_to_zero_on_garbage() {
+        let bt = bt_config_from_map(&cfg_map(&[("bt_seed_max_active", "3")]));
+        assert_eq!(bt.seed_max_active, 3);
+
+        // 非法值等同缺省：0 = 不限制同时做种数。
+        let bt = bt_config_from_map(&cfg_map(&[("bt_seed_max_active", "-1")]));
+        assert_eq!(bt.seed_max_active, 0);
     }
 
     #[test]

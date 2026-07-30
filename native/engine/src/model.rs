@@ -61,6 +61,25 @@ pub struct TaskInfo {
     /// 队列内启动顺序（越小越先启动）。0 = 未显式排序，按 `created_at`
     /// 先来先启动；>0 为显式顺序（`reorder_queue_tasks` 或建任务时追加）。
     pub queue_order: i32,
+    /// 已上传字节数（BT 做种）。仅对 BT 任务有意义，默认 0。
+    pub uploaded_bytes: i64,
+    /// 下载完成时已上传字节数（BT 做种后分享率基准）。仅对 BT 任务有意义，默认 0。
+    pub uploaded_at_completion: i64,
+    /// Seeding status: 0=none, 1=active seeding, 2=ratio reached,
+    /// 3=time reached, 4=user stopped, 5=task deleted, 6=session released,
+    /// 7=inactive time reached, 8=queued for a seeding slot.
+    pub seeding_status: i32,
+    /// BT 做种状态的辅助说明（如错误信息）。
+    pub seeding_message: String,
+    /// 任务级总分享率上限（千分比：1500 = 1.5）。-2 = 跟随全局，
+    /// -1 = 不限制，>=0 = 自定义（0 视同不限制）。
+    pub seed_ratio_limit_milli: i64,
+    /// 任务级做种后分享率上限（千分比）。哨兵语义同上。
+    pub seed_post_ratio_limit_milli: i64,
+    /// 任务级做种时长上限（分钟）。哨兵语义同上。
+    pub seed_time_limit_minutes: i64,
+    /// 任务级不活跃做种时长上限（分钟）。哨兵语义同上。
+    pub seed_inactive_time_limit_minutes: i64,
     /// Source page URL captured by the browser extension (empty = none).
     pub referrer: String,
     /// 所属任务组 ID（空 = 不属于任何组）。多文件任务组裂变/建组时写入；

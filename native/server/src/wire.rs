@@ -176,6 +176,12 @@ pub enum WsServerMsg {
         save_dir: String,
         url: String,
         error_message: String,
+        /// BT 做种累计上传字节数（非 BT 任务恒 0）。
+        uploaded_bytes: i64,
+        /// 0=none, 1=做种中, 2-7=停止原因, 8=排队做种（等待槽位）
+        seeding_status: i32,
+        /// 做种停止原因的人类可读描述（无则为空）。
+        seeding_message: String,
     },
     /// 全部任务快照（连接建立时 + 引擎主动广播）。
     TasksSnapshot { tasks: Vec<TaskDto> },
@@ -347,6 +353,15 @@ pub enum WsClientMsg {
     SelectVariant {
         task_id: String,
         selected_index: i32,
+    },
+    /// 设置单任务做种限制覆盖（qBittorrent 三态语义：-2 = 跟随全局，
+    /// -1 = 不限制，>=0 = 自定义，0 视同不限制；分享率为千分比）。
+    SetTaskSeedLimits {
+        task_id: String,
+        ratio_limit_milli: i64,
+        post_ratio_limit_milli: i64,
+        seed_time_limit_minutes: i64,
+        inactive_time_limit_minutes: i64,
     },
     /// RTT 测量，服务端回 `pong`。
     Ping {},
@@ -767,11 +782,16 @@ mod tests {
             save_dir: "/tmp".into(),
             url: "http://x".into(),
             error_message: String::new(),
+            uploaded_bytes: 42,
+            seeding_status: 1,
+            seeding_message: String::new(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"taskProgress\""));
         assert!(json.contains("\"taskId\":\"t1\""));
         assert!(json.contains("\"downloadedBytes\":10"));
+        assert!(json.contains("\"uploadedBytes\":42"));
+        assert!(json.contains("\"seedingStatus\":1"));
     }
 
     #[test]
@@ -819,6 +839,30 @@ mod tests {
             } => {
                 assert_eq!(task_id, "t4");
                 assert_eq!(selected_index, 1);
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ws_client_msg_set_task_seed_limits_roundtrip() {
+        let msg: WsClientMsg = serde_json::from_str(
+            r#"{"type":"setTaskSeedLimits","taskId":"t5","ratioLimitMilli":1500,"postRatioLimitMilli":-1,"seedTimeLimitMinutes":-2,"inactiveTimeLimitMinutes":30}"#,
+        )
+        .unwrap();
+        match msg {
+            WsClientMsg::SetTaskSeedLimits {
+                task_id,
+                ratio_limit_milli,
+                post_ratio_limit_milli,
+                seed_time_limit_minutes,
+                inactive_time_limit_minutes,
+            } => {
+                assert_eq!(task_id, "t5");
+                assert_eq!(ratio_limit_milli, 1500);
+                assert_eq!(post_ratio_limit_milli, -1);
+                assert_eq!(seed_time_limit_minutes, -2);
+                assert_eq!(inactive_time_limit_minutes, 30);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -886,6 +930,14 @@ mod tests {
             origin_url: String::new(),
             auto_route: String::new(),
             queue_order: 0,
+            uploaded_bytes: 0,
+            uploaded_at_completion: 0,
+            seeding_status: 0,
+            seeding_message: String::new(),
+            seed_ratio_limit_milli: -2,
+            seed_post_ratio_limit_milli: -2,
+            seed_time_limit_minutes: -2,
+            seed_inactive_time_limit_minutes: -2,
         }
     }
 
