@@ -10,6 +10,11 @@
 //!   Firefox: `HKCU\Software\Mozilla\NativeMessagingHosts\com.fluxdown.nmh`
 //!
 //! Each key's default value points to a JSON manifest file that describes the NMH.
+//!
+//! These keys and the two manifest JSON files (written next to the NMH exe)
+//! sit outside the Windows installer's [Registry]/[Files] tracking, so
+//! `installer/windows/setup.iss` removes them explicitly on uninstall
+//! (`CurUninstallStepChanged` + `[UninstallDelete]`) — keep both in sync.
 
 #[cfg(target_os = "windows")]
 mod inner {

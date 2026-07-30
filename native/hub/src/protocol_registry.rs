@@ -15,6 +15,11 @@
 //!
 //! macOS — Launch Services (`LSSetDefaultHandlerForURLScheme`); the scheme must
 //! be declared in `CFBundleURLTypes` (`macos/Runner/Info.plist`).
+//!
+//! `register`/`unregister` above run outside the Windows installer's
+//! tracking (written directly via winreg at runtime), so
+//! `installer/windows/setup.iss` removes any leftover `fluxdown`/`ed2k`
+//! Windows registry keys explicitly on uninstall — keep both in sync.
 
 /// A URL scheme this app can claim as the system default handler for.
 #[derive(Clone, Copy)]

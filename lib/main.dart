@@ -189,6 +189,8 @@ Future<void> main(List<String> args) async {
 
   // 初始化开机启动支持（注册时附带 --silentStart 参数，开机自启免打扰）
   // Windows 下路径加引号，防止含空格的安装路径（如 C:\Program Files\...）被 CreateProcess 截断解析失败。
+  // 该 Run 值（HKCU\...\CurrentVersion\Run 的 "FluxDown"）为运行时写入，
+  // 卸载时由 installer/windows/setup.iss 的 RemoveAutostartRunValue 清理——改动值名/格式需同步。
   launchAtStartup.setup(
     appName: 'FluxDown',
     appPath: Platform.isWindows

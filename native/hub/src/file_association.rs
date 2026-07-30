@@ -9,6 +9,11 @@
 //! ```
 //!
 //! All operations target `HKEY_CURRENT_USER` — no admin elevation required.
+//!
+//! When toggled from settings, these keys are written directly via winreg at
+//! runtime and sit outside the Windows installer's [Registry] tracking, so
+//! `installer/windows/setup.iss` removes any FluxDown-owned leftovers
+//! explicitly on uninstall (`RemoveTorrentAssociation`) — keep both in sync.
 
 #[cfg(target_os = "windows")]
 mod inner {
