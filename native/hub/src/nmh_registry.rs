@@ -533,8 +533,9 @@ mod inner {
     ///
     /// Returns multiple paths: standard location, Flatpak sandboxed variants,
     /// and Firefox-fork browsers (LibreWolf, Waterfox).
-    /// Registration writes to all paths; needs_update requires every path's
-    /// manifest to exist and match (self-heals external deletion on restart).
+    /// Registration writes to every dir whose browser profile root exists;
+    /// needs_update requires each such dir's manifest to exist and match
+    /// (self-heals external deletion and browsers installed later, #159).
     fn firefox_nmh_dirs() -> Vec<PathBuf> {
         let Some(home) = home_dir() else {
             return vec![];
@@ -675,6 +676,15 @@ mod inner {
         Ok(path)
     }
 
+    /// Proxy for "browser is installed": the NMH dir's parent is the browser's
+    /// profile/config root (e.g. `~/.config/microsoft-edge`, `~/.mozilla`),
+    /// which only exists once the browser has run at least once. Same heuristic
+    /// as Bitwarden desktop. Scopes register()/needs_update() to browsers actually
+    /// present instead of spraying manifests into never-used dirs (#159).
+    fn browser_installed(nmh_dir: &Path) -> bool {
+        nmh_dir.parent().is_some_and(|p| p.is_dir())
+    }
+
     pub fn needs_update() -> bool {
         let Ok(nmh_exe) = find_nmh_exe() else {
             return true;
@@ -698,24 +708,30 @@ mod inner {
 
         let wrapper_str = wp.to_string_lossy().into_owned();
 
-        // At least one Chromium dir must have a manifest pointing to the wrapper
-        // AND containing the Edge origin (content versioning: rewrite manifests
-        // predating Edge support so upgraded users get the Edge allowed_origins).
-        let chromium_ok = chromium_nmh_dirs().iter().any(|dir| {
-            let path = dir.join(MANIFEST_FILENAME_CHROMIUM);
-            std::fs::read_to_string(path)
-                .map(|c| c.contains(&wrapper_str) && c.contains(EDGE_EXTENSION_ID))
-                .unwrap_or(false)
-        });
+        // Per-installed-browser check (#159): every Chromium browser whose
+        // profile root exists must have a manifest pointing at the wrapper AND
+        // containing the Edge origin (content versioning: rewrite manifests
+        // predating Edge support). A single missing/stale manifest — e.g. a
+        // browser installed after FluxDown first registered — must trigger
+        // re-register; the old `.any()` let one healthy browser mask the rest.
+        let chromium_ok = chromium_nmh_dirs()
+            .iter()
+            .filter(|dir| browser_installed(dir))
+            .all(|dir| {
+                std::fs::read_to_string(dir.join(MANIFEST_FILENAME_CHROMIUM))
+                    .map(|c| c.contains(&wrapper_str) && c.contains(EDGE_EXTENSION_ID))
+                    .unwrap_or(false)
+            });
 
-        // Firefox 清单缺失也要重注册（自愈外部删除）；register() 对所有目录
-        // 无条件写入，未安装 Firefox 时写入同样无害幂等。
-        let firefox_ok = firefox_nmh_dirs().iter().all(|dir| {
-            let path = dir.join(MANIFEST_FILENAME_FIREFOX);
-            std::fs::read_to_string(path)
-                .map(|c| c.contains(&wrapper_str))
-                .unwrap_or(false)
-        });
+        // Firefox 同规则：装了才要求清单有效（自愈外部删除 / 后装浏览器）。
+        let firefox_ok = firefox_nmh_dirs()
+            .iter()
+            .filter(|dir| browser_installed(dir))
+            .all(|dir| {
+                std::fs::read_to_string(dir.join(MANIFEST_FILENAME_FIREFOX))
+                    .map(|c| c.contains(&wrapper_str))
+                    .unwrap_or(false)
+            });
 
         !(chromium_ok && firefox_ok)
     }
@@ -728,6 +744,11 @@ mod inner {
         log_info!("[nmh_registry] NMH wrapper script: {}", wrapper.display());
 
         for dir in chromium_nmh_dirs() {
+            if !browser_installed(&dir) {
+                // 未安装（profile 根不存在）的浏览器不写清单，
+                // 避免凭空创建其 profile / Flatpak / Snap 目录（#159）。
+                continue;
+            }
             match write_chromium_manifest(&wrapper, &dir) {
                 Ok(path) => {
                     log_info!("[nmh_registry] Chromium manifest: {}", path.display());
@@ -743,6 +764,9 @@ mod inner {
         }
 
         for dir in firefox_nmh_dirs() {
+            if !browser_installed(&dir) {
+                continue;
+            }
             match write_firefox_manifest(&wrapper, &dir) {
                 Ok(path) => {
                     log_info!("[nmh_registry] Firefox manifest: {}", path.display());
@@ -1028,6 +1052,26 @@ mod inner {
         Ok(path)
     }
 
+    /// Proxy for "browser is installed": the NMH dir's parent is the browser's
+    /// profile/user-data root (e.g. `~/Library/Application Support/Microsoft Edge`),
+    /// which only exists once the browser has run at least once. Same heuristic
+    /// as Bitwarden desktop. Scopes register()/needs_update() to browsers actually
+    /// present instead of spraying manifests into never-used dirs (#159).
+    fn browser_installed(nmh_dir: &Path) -> bool {
+        nmh_dir.parent().is_some_and(|p| p.is_dir())
+    }
+
+    /// Firefox reads NMH manifests from `…/Mozilla/NativeMessagingHosts`, but its
+    /// actual profile root is `…/Application Support/Firefox` — the `Mozilla` dir
+    /// is not guaranteed to exist on a machine with Firefox installed. Treat
+    /// either directory as evidence of an install.
+    fn firefox_installed() -> bool {
+        home_dir().is_some_and(|h| {
+            let lib = h.join("Library").join("Application Support");
+            lib.join("Firefox").is_dir() || lib.join("Mozilla").is_dir()
+        })
+    }
+
     pub fn needs_update() -> bool {
         let Ok(nmh_exe) = find_nmh_exe() else {
             return true;
@@ -1067,26 +1111,30 @@ mod inner {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // At least one Chromium dir must have a manifest pointing to the wrapper
-        // AND containing the Edge origin (content versioning: rewrite manifests
-        // predating Edge support so upgraded users get the Edge allowed_origins).
-        let chromium_ok = chromium_nmh_dirs().iter().any(|dir| {
-            let path = dir.join(MANIFEST_FILENAME);
-            std::fs::read_to_string(path)
-                .map(|c| c.contains(&wrapper_str) && c.contains(EDGE_EXTENSION_ID))
-                .unwrap_or(false)
-        });
-
-        // Firefox 清单缺失也要重注册（自愈外部删除）；register() 无条件写入，
-        // 未安装 Firefox 时写入同样无害幂等。
-        let firefox_ok = firefox_nmh_dir()
-            .map(|dir| {
-                let path = dir.join(MANIFEST_FILENAME);
-                std::fs::read_to_string(path)
-                    .map(|c| c.contains(&wrapper_str))
+        // Per-installed-browser check (#159): every Chromium browser whose
+        // profile root exists must have a manifest pointing at the wrapper AND
+        // containing the Edge origin (content versioning: rewrite manifests
+        // predating Edge support). A single missing/stale manifest — e.g. Edge
+        // installed after FluxDown first registered — must trigger re-register;
+        // the old `.any()` let one healthy browser mask all the others.
+        let chromium_ok = chromium_nmh_dirs()
+            .iter()
+            .filter(|dir| browser_installed(dir))
+            .all(|dir| {
+                std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
+                    .map(|c| c.contains(&wrapper_str) && c.contains(EDGE_EXTENSION_ID))
                     .unwrap_or(false)
-            })
-            .unwrap_or(true);
+            });
+
+        // Firefox 同规则：装了才要求清单有效（自愈外部删除 / 后装浏览器）。
+        let firefox_ok = !firefox_installed()
+            || firefox_nmh_dir()
+                .map(|dir| {
+                    std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
+                        .map(|c| c.contains(&wrapper_str))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(true);
 
         !(chromium_ok && firefox_ok)
     }
@@ -1099,6 +1147,11 @@ mod inner {
         log_info!("[nmh_registry] NMH wrapper script: {}", wrapper.display());
 
         for dir in chromium_nmh_dirs() {
+            if !browser_installed(&dir) {
+                // 未安装（profile 根不存在）的浏览器不写清单，
+                // 避免凭空创建其 profile 目录（#159 修复建议）。
+                continue;
+            }
             match write_chromium_manifest(&wrapper, &dir) {
                 Ok(path) => {
                     log_info!("[nmh_registry] Chromium manifest: {}", path.display());
@@ -1113,7 +1166,9 @@ mod inner {
             }
         }
 
-        if let Some(dir) = firefox_nmh_dir() {
+        if firefox_installed()
+            && let Some(dir) = firefox_nmh_dir()
+        {
             match write_firefox_manifest(&wrapper, &dir) {
                 Ok(path) => {
                     log_info!("[nmh_registry] Firefox manifest: {}", path.display());
