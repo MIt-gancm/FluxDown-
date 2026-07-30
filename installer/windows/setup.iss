@@ -210,8 +210,8 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     { Chrome/Edge/Firefox Native Messaging Host registrations written at
-      runtime by native/hub/src/nmh_registry.rs. Never declared in
-      [Registry] (the app writes them directly via winreg on every startup),
+      runtime by native/hub/src/nmh_registry.rs. Never declared in the
+      Registry section (the app writes them directly via winreg on every startup),
       so the standard uninstall never removes them. `com.fluxdown.nmh` is
       FluxDown-specific, safe to remove unconditionally. }
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Google\Chrome\NativeMessagingHosts\com.fluxdown.nmh');
