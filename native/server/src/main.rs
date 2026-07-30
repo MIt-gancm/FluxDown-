@@ -91,6 +91,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .get("speed_limit_bytes")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
+    // 全局 BT 上传限速（B/s，0 = 不限）：只管 BT 上传（下载期上传 + 做种），
+    // 与 speed_limit_bytes（下载）解耦。
+    let upload_limit_bps = all_cfg
+        .get("upload_limit_bytes")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     let save_dir = {
         let dir = all_cfg.get("default_save_dir").cloned().unwrap_or_default();
         if dir.trim().is_empty() {
@@ -116,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EngineConfig {
             max_concurrent,
             speed_limit_bps,
+            upload_limit_bps,
             default_save_dir: save_dir.clone(),
             app_data_dir: data_dir.to_string_lossy().into_owned(),
             bt_config: bt_config_from_map(&all_cfg),

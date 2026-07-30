@@ -523,6 +523,12 @@ const GLOBAL_OPTION_MAPPINGS: &[GlobalOptionMapping] = &[
         default_native: "0",
     },
     GlobalOptionMapping {
+        aria2_key: "max-overall-upload-limit",
+        config_key: "upload_limit_bytes",
+        to_native: to_native_bytes,
+        default_native: "0",
+    },
+    GlobalOptionMapping {
         aria2_key: "split",
         config_key: "default_segments",
         to_native: to_native_int,
@@ -550,7 +556,6 @@ const STATIC_GLOBAL_OPTION_DEFAULTS: &[(&str, &str)] = &[
     ("continue", "false"),
     ("max-download-limit", "0"),
     ("max-upload-limit", "0"),
-    ("max-overall-upload-limit", "0"),
     ("timeout", "60"),
     ("connect-timeout", "60"),
     ("retry-wait", "0"),
@@ -790,6 +795,7 @@ mod tests {
             uploaded_at_completion: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
             seed_ratio_limit_milli: -2,
             seed_post_ratio_limit_milli: -2,
             seed_time_limit_minutes: -2,
@@ -1137,6 +1143,7 @@ mod tests {
             "dir": "/data",
             "max-concurrent-downloads": "3",
             "max-overall-download-limit": "10M",
+            "max-overall-upload-limit": "2M",
             "split": "16",
             "user-agent": "UA/9",
             "remote-time": "true",
@@ -1149,10 +1156,14 @@ mod tests {
             changes.get("speed_limit_bytes").unwrap(),
             &(10 * 1024 * 1024).to_string()
         );
+        assert_eq!(
+            changes.get("upload_limit_bytes").unwrap(),
+            &(2 * 1024 * 1024).to_string()
+        );
         assert_eq!(changes.get("default_segments").unwrap(), "16");
         assert_eq!(changes.get("global_user_agent").unwrap(), "UA/9");
         assert_eq!(changes.get("use_server_time").unwrap(), "true");
-        assert_eq!(changes.len(), 6);
+        assert_eq!(changes.len(), 7);
     }
 
     #[test]
@@ -1166,6 +1177,25 @@ mod tests {
     fn map_change_global_options_errors_on_invalid_unit_number() {
         let options = json!({ "max-overall-download-limit": "not-a-number" });
         assert!(map_change_global_options(options.as_object().unwrap()).is_err());
+    }
+
+    #[test]
+    fn upload_limit_mapping_roundtrips_through_get_global_option() {
+        // changeGlobalOption 写入 → getGlobalOption 按同一映射回显。
+        let options = json!({ "max-overall-upload-limit": "512K" });
+        let changes = map_change_global_options(options.as_object().unwrap()).unwrap();
+        assert_eq!(
+            changes.get("upload_limit_bytes").unwrap(),
+            &(512 * 1024).to_string()
+        );
+        let echoed = build_global_option(&changes);
+        assert_eq!(
+            echoed["max-overall-upload-limit"],
+            (512 * 1024).to_string()
+        );
+        // 未配置时回显 aria2 出厂默认 "0"（不限）。
+        let empty = build_global_option(&HashMap::new());
+        assert_eq!(empty["max-overall-upload-limit"], "0");
     }
 
     #[test]

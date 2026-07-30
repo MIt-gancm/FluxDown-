@@ -146,6 +146,20 @@ class MobileSettingsScreen extends StatelessWidget {
                           ),
                         ),
                         _Row(
+                          label: s.uploadLimit,
+                          value: settings.uploadLimitBytes == 0
+                              ? s.statusSpeedLimitOff
+                              : '${DownloadTask.formatBytes(settings.uploadLimitBytes)}/s',
+                          onTap: () => _selectUploadLimit(context),
+                        ),
+                        _Row(
+                          label: s.btAutoReseed,
+                          trailing: ShadSwitch(
+                            value: settings.btAutoReseed,
+                            onChanged: settings.setBtAutoReseed,
+                          ),
+                        ),
+                        _Row(
                           label: s.btListenPort,
                           value:
                               '${settings.btPortStart} – ${settings.btPortEnd}',
@@ -399,6 +413,26 @@ class MobileSettingsScreen extends StatelessWidget {
         (20 * mb, '20 MB/s'),
       ],
       onSelect: settings.setSpeedLimitBytes,
+    );
+  }
+
+  void _selectUploadLimit(BuildContext context) {
+    final s = LocaleScope.of(context);
+    const mb = 1024 * 1024;
+    _showSelectSheet<int>(
+      context,
+      title: s.uploadLimit,
+      current: settings.uploadLimitBytes,
+      options: [
+        (0, s.statusSpeedLimitOff),
+        (128 * 1024, '128 KB/s'),
+        (512 * 1024, '512 KB/s'),
+        (mb, '1 MB/s'),
+        (2 * mb, '2 MB/s'),
+        (5 * mb, '5 MB/s'),
+        (10 * mb, '10 MB/s'),
+      ],
+      onSelect: settings.setUploadLimitBytes,
     );
   }
 

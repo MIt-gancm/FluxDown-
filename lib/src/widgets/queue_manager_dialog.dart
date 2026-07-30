@@ -110,6 +110,7 @@ class _QueueManagerDialogState extends State<QueueManagerDialog> {
   // ── 设置 ──
   late final TextEditingController _nameCtrl;
   late final TextEditingController _speedCtrl;
+  late final TextEditingController _uploadCtrl;
   late final TextEditingController _concurrentCtrl;
   late final TextEditingController _saveDirCtrl;
   late final TextEditingController _uaCtrl;
@@ -146,6 +147,9 @@ class _QueueManagerDialogState extends State<QueueManagerDialog> {
     _speedCtrl = TextEditingController(
       text: q.speedLimitKbps > 0 ? q.speedLimitKbps.toString() : '',
     );
+    _uploadCtrl = TextEditingController(
+      text: q.uploadLimitKbps > 0 ? q.uploadLimitKbps.toString() : '',
+    );
     _concurrentCtrl = TextEditingController(
       text: q.maxConcurrent > 0 ? q.maxConcurrent.toString() : '',
     );
@@ -166,6 +170,7 @@ class _QueueManagerDialogState extends State<QueueManagerDialog> {
   void dispose() {
     _nameCtrl.dispose();
     _speedCtrl.dispose();
+    _uploadCtrl.dispose();
     _concurrentCtrl.dispose();
     _saveDirCtrl.dispose();
     _uaCtrl.dispose();
@@ -219,6 +224,10 @@ class _QueueManagerDialogState extends State<QueueManagerDialog> {
       0,
       1 << 30,
     );
+    final uploadLimit = (int.tryParse(_uploadCtrl.text.trim()) ?? 0).clamp(
+      0,
+      1 << 30,
+    );
     final maxConcurrent = (int.tryParse(_concurrentCtrl.text.trim()) ?? 0)
         .clamp(0, 100);
     widget.controller.updateQueue(
@@ -226,6 +235,7 @@ class _QueueManagerDialogState extends State<QueueManagerDialog> {
       // 内置队列名称固定（引擎侧同样拒绝改名），提交存量名即可。
       name: q.isBuiltin ? q.name : name,
       speedLimitKbps: speedLimit,
+      uploadLimitKbps: uploadLimit,
       maxConcurrent: maxConcurrent,
       defaultSaveDir: _saveDirCtrl.text.trim(),
       defaultSegments: int.tryParse(_selectedSegments) ?? 0,
@@ -419,6 +429,48 @@ class _QueueManagerDialogState extends State<QueueManagerDialog> {
               ),
             ),
             const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      _fieldLabel(s.queueUploadLimit, c),
+                      const SizedBox(width: 4),
+                      ShadTooltip(
+                        waitDuration: const Duration(milliseconds: 200),
+                        effects: const [],
+                        builder: (_) => Text(
+                          s.queueUploadLimitDesc,
+                          style: const TextStyle(fontSize: 12, height: 1.5),
+                        ),
+                        child: ShadGestureDetector(
+                          cursor: SystemMouseCursors.help,
+                          onTap: () {},
+                          child: Icon(
+                            LucideIcons.circleHelp,
+                            size: 13,
+                            color: c.textMuted,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  ShadInput(
+                    controller: _uploadCtrl,
+                    placeholder: Text(s.queueSpeedLimitHint),
+                    keyboardType: TextInputType.number,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,

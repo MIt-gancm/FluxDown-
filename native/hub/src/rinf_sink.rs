@@ -124,6 +124,7 @@ impl EventSink for RinfEventSink {
                 uploaded_bytes,
                 seeding_status,
                 seeding_message,
+                seeding_time_secs,
                 file_name,
                 save_dir,
                 url,
@@ -168,6 +169,7 @@ impl EventSink for RinfEventSink {
                     uploaded_bytes,
                     seeding_status,
                     seeding_message,
+                    seeding_time_secs,
                 }
                 .send_signal_to_dart();
             }

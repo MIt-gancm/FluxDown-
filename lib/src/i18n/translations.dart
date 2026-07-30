@@ -109,6 +109,8 @@ class S {
   String get queueNameHint => _r('queueNameHint');
   String get queueSpeedLimit => _r('queueSpeedLimit');
   String get queueSpeedLimitHint => _r('queueSpeedLimitHint');
+  String get queueUploadLimit => _r('queueUploadLimit');
+  String get queueUploadLimitDesc => _r('queueUploadLimitDesc');
   String get queueMaxConcurrent => _r('queueMaxConcurrent');
   String get queueMaxConcurrentHint => _r('queueMaxConcurrentHint');
   String get queueDefaultSegments => _r('queueDefaultSegments');
@@ -935,6 +937,9 @@ class S {
   String get speedLimit => _r('speedLimit');
   String get speedLimitDesc => _r('speedLimitDesc');
   String get speedLimitUnit => _r('speedLimitUnit');
+  String get uploadLimit => _r('uploadLimit');
+  String get uploadLimitDesc => _r('uploadLimitDesc');
+  String get speedUnitKbps => _r('speedUnitKbps');
   String nThreads(int n) => _r('nThreads', {'n': n});
   String nTasks(int n) => _r('nTasks', {'n': n});
 
@@ -1164,6 +1169,10 @@ class S {
   String get btSeedLimitsModeGlobal => _r('btSeedLimitsModeGlobal');
   String get btSeedLimitsModeUnlimited => _r('btSeedLimitsModeUnlimited');
   String get btSeedLimitsModeCustom => _r('btSeedLimitsModeCustom');
+  String get btAutoReseed => _r('btAutoReseed');
+  String get btAutoReseedDesc => _r('btAutoReseedDesc');
+  String get btSeedUploadLimit => _r('btSeedUploadLimit');
+  String get btSeedUploadLimitHint => _r('btSeedUploadLimitHint');
   String get timeUnitMinutes => _r('timeUnitMinutes');
   String get timeUnitHours => _r('timeUnitHours');
   String get timeUnitDays => _r('timeUnitDays');
@@ -1188,6 +1197,8 @@ class S {
   String get seedingStatusDeleted => _r('seedingStatusDeleted');
   String get seedingStatusSessionReleased => _r('seedingStatusSessionReleased');
   String get uploadedTotal => _r('uploadedTotal');
+  String seedingSummaryActive(int n) => _r('seedingSummaryActive', {'n': n});
+  String seedingSummaryQueued(int n) => _r('seedingSummaryQueued', {'n': n});
 
   // ─────────────────────────────────────────────
   // eD2K 服务器设置

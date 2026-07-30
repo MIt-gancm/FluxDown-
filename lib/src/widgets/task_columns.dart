@@ -1,8 +1,8 @@
 // 任务列表视图系统 — 列注册表（表头 + 行共用的单一事实源）。
 //
 // 行为规格依据：design-proto-spec.md §4（`COLUMNS`/`COL_ORDER`/`colBudget`/
-// `tryToggleCol`/`effectiveCols`）。宽度/默认开关/canonical 顺序完全对齐
-// 现状硬编码列（进度150/速度90/剩余时间80/状态60），保证默认视图零感知。
+// `tryToggleCol`/`effectiveCols`）。宽度/默认开关/canonical 顺序对齐现状硬编码列
+// （进度150/速度90/剩余时间80），状态列 60→80：容纳图标 + 英文 "Completed" 不省略。
 
 import 'package:flutter/material.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
@@ -380,7 +380,7 @@ final Map<TaskColumnId, TaskColumnDef> kTaskColumns = {
   ),
   TaskColumnId.status: TaskColumnDef(
     id: TaskColumnId.status,
-    width: 60,
+    width: 80,
     label: (s) => s.colStatus,
     cellBuilder: (context, task) {
       final c = AppColors.of(context);

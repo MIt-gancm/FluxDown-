@@ -164,10 +164,12 @@ pub struct DownloadRequest {
 ///     uploaded_at_completion: 0,
 ///     seeding_status: 0,
 ///     seeding_message: String::new(),
+///     seeding_time_secs: 0,
 ///     seed_ratio_limit_milli: -2,
 ///     seed_post_ratio_limit_milli: -2,
 ///     seed_time_limit_minutes: -2,
 ///     seed_inactive_time_limit_minutes: -2,
+///     seed_upload_limit_bps: 0,
 ///     referrer: String::new(),
 ///     group_id: String::new(),
 ///     rss_source_id: String::new(),
@@ -243,6 +245,9 @@ pub struct TaskDto {
     /// 做种状态辅助说明（如停止原因，空 = 无）。
     #[serde(default)]
     pub seeding_message: String,
+    /// 累计做种秒数（活跃做种期间累加；排队/暂停不计，非 BT 任务恒 0）。
+    #[serde(default)]
+    pub seeding_time_secs: i64,
     /// 任务级总分享率上限（千分比，1500 = 1.5）。哨兵：-2 = 跟随全局，
     /// -1 = 不限制，>=0 = 自定义（0 视同不限制）。
     #[serde(default = "default_seed_limit_inherit")]
@@ -286,6 +291,7 @@ impl From<fluxdown_engine::model::TaskInfo> for TaskDto {
             uploaded_at_completion: t.uploaded_at_completion,
             seeding_status: t.seeding_status,
             seeding_message: t.seeding_message,
+            seeding_time_secs: t.seeding_time_secs,
             seed_ratio_limit_milli: t.seed_ratio_limit_milli,
             seed_post_ratio_limit_milli: t.seed_post_ratio_limit_milli,
             seed_time_limit_minutes: t.seed_time_limit_minutes,
@@ -306,6 +312,7 @@ impl From<fluxdown_engine::model::TaskInfo> for TaskDto {
 ///     queue_id: "q1".to_string(),
 ///     name: "工作".to_string(),
 ///     speed_limit_kbps: 0,
+///     upload_limit_kbps: 0,
 ///     max_concurrent: 3,
 ///     default_save_dir: String::new(),
 ///     position: 0,
@@ -327,6 +334,9 @@ pub struct QueueDto {
     pub name: String,
     /// 队列限速（KB/s），0 = 不限速。
     pub speed_limit_kbps: i64,
+    /// 队列上传限速（KB/s），0 = 不限速。
+    #[serde(default)]
+    pub upload_limit_kbps: i64,
     /// 队列并发上限，0 = 跟随全局。
     pub max_concurrent: i32,
     pub default_save_dir: String,
@@ -356,6 +366,7 @@ impl From<fluxdown_engine::model::QueueInfo> for QueueDto {
             queue_id: q.queue_id,
             name: q.name,
             speed_limit_kbps: q.speed_limit_kbps,
+            upload_limit_kbps: q.upload_limit_kbps,
             max_concurrent: q.max_concurrent,
             default_save_dir: q.default_save_dir,
             position: q.position,
@@ -1052,6 +1063,7 @@ mod tests {
             uploaded_at_completion: 7,
             seeding_status: 1,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
             seed_ratio_limit_milli: -2,
             seed_post_ratio_limit_milli: -2,
             seed_time_limit_minutes: -2,
@@ -1084,6 +1096,7 @@ mod tests {
             queue_id: "q1".to_string(),
             name: "工作".to_string(),
             speed_limit_kbps: 512,
+            upload_limit_kbps: 128,
             max_concurrent: 3,
             default_save_dir: "/tmp".to_string(),
             position: 0,
@@ -1099,6 +1112,7 @@ mod tests {
         assert_eq!(v["queueId"], "q1");
         assert_eq!(v["name"], "工作");
         assert_eq!(v["speedLimitKbps"], 512);
+        assert_eq!(v["uploadLimitKbps"], 128);
         assert_eq!(v["maxConcurrent"], 3);
         assert_eq!(v["defaultSaveDir"], "/tmp");
         assert_eq!(v["position"], 0);

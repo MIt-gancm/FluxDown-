@@ -1081,6 +1081,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
 
         let ev = rx.recv().await.expect("task event");

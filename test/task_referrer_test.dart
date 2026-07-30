@@ -27,10 +27,12 @@ void main() {
     uploadedAtCompletion: 0,
     seedingStatus: 0,
     seedingMessage: '',
+    seedingTimeSecs: 0,
     seedRatioLimitMilli: -2,
     seedPostRatioLimitMilli: -2,
     seedTimeLimitMinutes: -2,
     seedInactiveTimeLimitMinutes: -2,
+    seedUploadLimitBps: 0,
     referrer: 'https://example.com/page',
     groupId: '',
     rssSourceId: '',
@@ -60,6 +62,7 @@ void main() {
         uploadedBytes: 0,
         seedingStatus: 0,
         seedingMessage: '',
+        seedingTimeSecs: 0,
       ),
     );
     expect(updated.referrer, 'https://example.com/page');
@@ -99,10 +102,12 @@ void main() {
       uploadedAtCompletion: 0,
       seedingStatus: 0,
       seedingMessage: '',
+      seedingTimeSecs: 0,
       seedRatioLimitMilli: -2,
       seedPostRatioLimitMilli: -2,
       seedTimeLimitMinutes: -2,
       seedInactiveTimeLimitMinutes: -2,
+      seedUploadLimitBps: 0,
     );
     final task = DownloadTask.fromTaskInfo(info);
     expect(task.checksum, 'sha256=deadbeef');

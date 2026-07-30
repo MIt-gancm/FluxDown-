@@ -61,6 +61,7 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
     let cfg = EngineConfig {
         max_concurrent: 4,
         speed_limit_bps: 0,
+        upload_limit_bps: 0,
         default_save_dir: save_dir.clone(),
         app_data_dir: data_dir.to_string_lossy().into_owned(),
         bt_config: BtConfig::default(),

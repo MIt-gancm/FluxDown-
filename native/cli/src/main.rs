@@ -621,12 +621,17 @@ async fn cmd_queue(client: &ApiClient, json: bool) -> Result<(), ClientError> {
         return Ok(());
     }
     println!(
-        "{:<16}  {:<20}  {:>8}  {:>10}  {:>8}  {:<11}",
-        "ID", "NAME", "STATE", "LIMIT/s", "CONCUR", "SCHEDULE"
+        "{:<16}  {:<20}  {:>8}  {:>10}  {:>10}  {:>8}  {:<11}",
+        "ID", "NAME", "STATE", "DL/s", "UL/s", "CONCUR", "SCHEDULE"
     );
     for q in &queues {
         let limit = if q.speed_limit_kbps > 0 {
             human_bytes(q.speed_limit_kbps * 1024)
+        } else {
+            "∞".to_string()
+        };
+        let up_limit = if q.upload_limit_kbps > 0 {
+            human_bytes(q.upload_limit_kbps * 1024)
         } else {
             "∞".to_string()
         };
@@ -654,11 +659,12 @@ async fn cmd_queue(client: &ApiClient, json: bool) -> Result<(), ClientError> {
             "-".to_string()
         };
         println!(
-            "{:<16}  {:<20}  {:>8}  {:>10}  {:>8}  {:<11}",
+            "{:<16}  {:<20}  {:>8}  {:>10}  {:>10}  {:>8}  {:<11}",
             truncate(&q.queue_id, 16),
             truncate(&q.name, 20),
             state,
             limit,
+            up_limit,
             concur,
             schedule
         );

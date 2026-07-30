@@ -329,6 +329,7 @@ async fn handle_socket(mut socket: WebSocket, state: ServerState, authorized: bo
                         post_ratio_limit_milli,
                         seed_time_limit_minutes,
                         inactive_time_limit_minutes,
+                        upload_limit_bps,
                     }) => {
                         // fire-and-forget：actor 掉线（send 失败）与回执一并忽略。
                         let _ = state
@@ -338,6 +339,7 @@ async fn handle_socket(mut socket: WebSocket, state: ServerState, authorized: bo
                                 post_ratio_limit_milli,
                                 seed_time_limit_minutes,
                                 inactive_time_limit_minutes,
+                                upload_limit_bps,
                                 ack,
                             })
                             .await;
@@ -485,6 +487,7 @@ async fn create_queue(
         .send_cmd(|ack| ActorCmd::CreateQueue {
             name: req.name,
             speed_limit_kbps: req.speed_limit_kbps,
+            upload_limit_kbps: req.upload_limit_kbps,
             max_concurrent: req.max_concurrent,
             default_save_dir: req.default_save_dir,
             default_segments: req.default_segments,
@@ -512,6 +515,7 @@ async fn update_queue(
             queue_id: id,
             name: req.name,
             speed_limit_kbps: req.speed_limit_kbps,
+            upload_limit_kbps: req.upload_limit_kbps,
             max_concurrent: req.max_concurrent,
             default_save_dir: req.default_save_dir,
             default_segments: req.default_segments,

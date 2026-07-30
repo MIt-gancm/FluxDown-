@@ -21,6 +21,9 @@ class DownloadQueue {
   /// 速度限制（KB/s），0 = 不限制
   final int speedLimitKbps;
 
+  /// 上传限速（KB/s），仅作用于 BT 上传；0 = 不限制
+  final int uploadLimitKbps;
+
   /// 同时下载任务数，0 = 使用全局设置
   final int maxConcurrent;
 
@@ -59,6 +62,7 @@ class DownloadQueue {
     required this.defaultSaveDir,
     required this.position,
     this.defaultSegments = 0,
+    this.uploadLimitKbps = 0,
     this.defaultUserAgent = '',
     this.isRunning = true,
     this.scheduleEnabled = false,
@@ -75,6 +79,7 @@ class DownloadQueue {
       queueId: info.queueId,
       name: info.name,
       speedLimitKbps: info.speedLimitKbps,
+      uploadLimitKbps: info.uploadLimitKbps,
       maxConcurrent: info.maxConcurrent,
       defaultSaveDir: info.defaultSaveDir,
       position: info.position,
@@ -92,6 +97,7 @@ class DownloadQueue {
     String? queueId,
     String? name,
     int? speedLimitKbps,
+    int? uploadLimitKbps,
     int? maxConcurrent,
     String? defaultSaveDir,
     int? position,
@@ -107,6 +113,7 @@ class DownloadQueue {
       queueId: queueId ?? this.queueId,
       name: name ?? this.name,
       speedLimitKbps: speedLimitKbps ?? this.speedLimitKbps,
+      uploadLimitKbps: uploadLimitKbps ?? this.uploadLimitKbps,
       maxConcurrent: maxConcurrent ?? this.maxConcurrent,
       defaultSaveDir: defaultSaveDir ?? this.defaultSaveDir,
       position: position ?? this.position,

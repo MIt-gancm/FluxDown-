@@ -243,6 +243,7 @@ async fn run_scenario(
     let config = EngineConfig {
         max_concurrent: 5,
         speed_limit_bps: 0,
+        upload_limit_bps: 0,
         default_save_dir: work_dir.to_string_lossy().to_string(),
         app_data_dir: work_dir.to_string_lossy().to_string(),
         bt_config: BtConfig::default(),
@@ -443,6 +444,7 @@ async fn run_change_segments(
     let config = EngineConfig {
         max_concurrent: 5,
         speed_limit_bps: 0,
+        upload_limit_bps: 0,
         default_save_dir: work_dir.to_string_lossy().to_string(),
         app_data_dir: work_dir.to_string_lossy().to_string(),
         bt_config: BtConfig::default(),

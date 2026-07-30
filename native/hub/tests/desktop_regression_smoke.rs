@@ -399,6 +399,7 @@ async fn desktop_regression_smoke() {
         EngineConfig {
             max_concurrent: 4,
             speed_limit_bps: 0,
+            upload_limit_bps: 0,
             default_save_dir: save_dir.clone(),
             app_data_dir: save_dir.clone(),
             bt_config: BtConfig::default(),

@@ -131,6 +131,11 @@ pub struct SetTaskSeedLimits {
     pub post_ratio_limit_milli: i64,
     pub seed_time_limit_minutes: i64,
     pub inactive_time_limit_minutes: i64,
+    /// 任务级做种上传限速（B/s）。0 = 无单任务限制，>0 = 自定义。
+    /// 在下一次 torrent add 时烘焙生效（恢复下载 / 重启续种 / 重新挂载），
+    /// 已 live 的句柄不热改。
+    #[serde(default)]
+    pub upload_limit_bps: i64,
 }
 
 /// 分段数修改结果（Rust → Dart）。`ok = false` 表示任务正在下载/准备中/
@@ -197,6 +202,9 @@ pub struct TaskProgress {
     /// BT 做种状态的辅助说明（如停止原因）。无错误/未做种时为空。
     #[serde(default)]
     pub seeding_message: String,
+    /// 累计做种秒数（发帧时刻；排队/暂停不计）。仅 BT 任务有意义。
+    #[serde(default)]
+    pub seeding_time_secs: i64,
 }
 
 /// Response to RequestAllTasks — all persisted tasks
@@ -369,6 +377,9 @@ pub struct TaskInfo {
     /// Reason/description when seeding stopped (e.g. "ratio 1.5 reached").
     #[serde(default)]
     pub seeding_message: String,
+    /// 累计做种秒数（活跃做种期间累加；排队/暂停不计）。
+    #[serde(default)]
+    pub seeding_time_secs: i64,
     /// 任务级总分享率上限（千分比：1500 = 1.5）。-2 = 跟随全局，
     /// -1 = 不限制，>=0 = 自定义（0 视同不限制）。字段恒由引擎侧
     /// `TaskInfo` 填充，`default` 仅为反序列化兜底。
@@ -383,6 +394,10 @@ pub struct TaskInfo {
     /// 任务级不活跃做种时长上限（分钟）。哨兵语义同上。
     #[serde(default)]
     pub seed_inactive_time_limit_minutes: i64,
+    /// 任务级做种上传限速（B/s，0 = 无单任务限制）。add 时烘焙生效，
+    /// live 句柄不热改。
+    #[serde(default)]
+    pub seed_upload_limit_bps: i64,
     /// Source page URL captured by the browser extension (empty = none).
     #[serde(default)]
     pub referrer: String,
@@ -736,6 +751,9 @@ pub struct CreateQueue {
     pub name: String,
     /// Speed limit in KB/s for this queue. 0 = no limit.
     pub speed_limit_kbps: i64,
+    /// Upload speed limit in KB/s for this queue. 0 = no limit.
+    #[serde(default)]
+    pub upload_limit_kbps: i64,
     /// Max simultaneous tasks for this queue. 0 = use global setting.
     pub max_concurrent: i32,
     /// Default save directory for tasks in this queue. Empty = use global default.
@@ -754,6 +772,8 @@ pub struct UpdateQueue {
     pub queue_id: String,
     pub name: String,
     pub speed_limit_kbps: i64,
+    #[serde(default)]
+    pub upload_limit_kbps: i64,
     pub max_concurrent: i32,
     pub default_save_dir: String,
     /// Default segment count for new tasks in this queue. 0 = auto (global advisor).
@@ -856,6 +876,9 @@ pub struct QueueInfo {
     pub name: String,
     /// Speed limit in KB/s. 0 = no limit.
     pub speed_limit_kbps: i64,
+    /// Upload speed limit in KB/s. 0 = no limit.
+    #[serde(default)]
+    pub upload_limit_kbps: i64,
     /// Max simultaneous tasks in this queue. 0 = use global setting.
     pub max_concurrent: i32,
     /// Default save directory. Empty = use global default.

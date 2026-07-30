@@ -497,13 +497,7 @@ class _DetailPanelState extends State<DetailPanel> {
         );
       }
       if (task.isSeeding) {
-        widgets.add(
-          _buildInfoRow(
-            s.seedTime,
-            _formatDuration(task.seedingDuration),
-            c,
-          ),
-        );
+        widgets.add(_LiveSeedTimeRow(task: task, c: c));
       }
       if (task.seedingStatus != SeedingStatus.none) {
         widgets.add(_buildInfoRow(s.seedingStatus, task.seedingStatusText, c));
@@ -606,7 +600,13 @@ class _DetailPanelState extends State<DetailPanel> {
 
         // 分段进度条
         if (hasSegs)
-          _buildSegmentedBar(c, m, segs!, task.totalBytes)
+          _buildSegmentedBar(
+            c,
+            m,
+            segs!,
+            task.totalBytes,
+            monochrome: task.isBt,
+          )
         else
           _buildSimpleBar(c, m, pctValue),
         const SizedBox(height: 8),
@@ -615,17 +615,20 @@ class _DetailPanelState extends State<DetailPanel> {
         // IDM 网格可视化
         if (hasSegs) ...[
           const SizedBox(height: 16),
-          _buildSegmentGrid(c, m, segs!, task.totalBytes),
+          _buildSegmentGrid(c, m, segs!, task.totalBytes,
+              monochrome: task.isBt),
         ],
 
-        // 分片图例 — 分片过多时（如 BT 多文件）隐藏避免溢出
-        if (hasSegs && segs!.length > 1 && segs.length <= 32) ...[
+        // 分片图例 — 分片过多时（如 BT 多文件）隐藏避免溢出；BT 的分片是
+        // piece 映射而非下载线程，图例无线程归属含义，整体不显示
+        if (!task.isBt && hasSegs && segs!.length > 1 && segs.length <= 32) ...[
           const SizedBox(height: 12),
           _buildSegmentLegend(c, m, segs),
         ],
 
-        // segs-sum 行：分段数 · 活跃数 · 动态拆分状态（+ 最近拆分详情）
-        if (hasSegs) ...[
+        // segs-sum 行：分段数 · 活跃数 · 动态拆分状态（+ 最近拆分详情）；
+        // BT 无动态拆分/线程语义，不显示
+        if (hasSegs && !task.isBt) ...[
           const SizedBox(height: 12),
           _buildSegsSummary(c, segs!, task),
         ],
@@ -693,13 +696,15 @@ class _DetailPanelState extends State<DetailPanel> {
     );
   }
 
-  /// 分段进度条 — 每个分片按字节范围比例占位，内部按下载量填充
+  /// 分段进度条 — 每个分片按字节范围比例占位，内部按下载量填充；
+  /// [monochrome]（BT）时统一用主题色表达 piece 完成度，不区分分片归属
   Widget _buildSegmentedBar(
     AppColors c,
     AppMetrics m,
     List<SegmentData> segs,
-    int totalBytes,
-  ) {
+    int totalBytes, {
+    required bool monochrome,
+  }) {
     return ClipRRect(
       borderRadius: m.brSm,
       child: SizedBox(
@@ -711,19 +716,22 @@ class _DetailPanelState extends State<DetailPanel> {
             totalBytes: totalBytes,
             emptyColor: c.surface3,
             palette: SegmentPalette.of(c),
+            accent: c.accent,
+            monochrome: monochrome,
           ),
         ),
       ),
     );
   }
 
-  /// IDM 风格网格可视化
+  /// IDM 风格网格可视化；[monochrome] 语义同 [_buildSegmentedBar]
   Widget _buildSegmentGrid(
     AppColors c,
     AppMetrics m,
     List<SegmentData> segs,
-    int totalBytes,
-  ) {
+    int totalBytes, {
+    required bool monochrome,
+  }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -770,6 +778,8 @@ class _DetailPanelState extends State<DetailPanel> {
                         ? m.alphaMuted
                         : m.alphaActive,
                     palette: SegmentPalette.of(c),
+                    accent: c.accent,
+                    monochrome: monochrome,
                   ),
                 ),
               );
@@ -1118,14 +1128,18 @@ class _DetailPanelState extends State<DetailPanel> {
       task.seedTimeLimitMinutes,
       task.seedInactiveTimeLimitMinutes,
     ];
-    final String summary;
+    final String base;
     if (values.every((v) => v == -2)) {
-      summary = s.btSeedLimitsModeGlobal;
+      base = s.btSeedLimitsModeGlobal;
     } else if (values.every((v) => v == -1)) {
-      summary = s.btSeedLimitsModeUnlimited;
+      base = s.btSeedLimitsModeUnlimited;
     } else {
-      summary = s.btSeedLimitsModeCustom;
+      base = s.btSeedLimitsModeCustom;
     }
+    // 单任务上传限速独立于三态模式，>0 时追加展示。
+    final summary = task.seedUploadLimitBps > 0
+        ? '$base · ↑ ${DownloadTask.formatBytes(task.seedUploadLimitBps)}/s'
+        : base;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
@@ -1887,12 +1901,16 @@ class _SegmentBarPainter extends CustomPainter {
   final int totalBytes;
   final Color emptyColor;
   final List<Color> palette;
+  final Color accent;
+  final bool monochrome;
 
   _SegmentBarPainter({
     required this.segments,
     required this.totalBytes,
     required this.emptyColor,
     required this.palette,
+    required this.accent,
+    required this.monochrome,
   });
 
   @override
@@ -1918,7 +1936,10 @@ class _SegmentBarPainter extends CustomPainter {
         final rect = Rect.fromLTWH(xStart, 0, fillWidth, size.height);
         canvas.drawRect(
           rect,
-          Paint()..color = SegmentPalette.colorFor(palette, seg.index),
+          Paint()
+            ..color = monochrome
+                ? accent
+                : SegmentPalette.colorFor(palette, seg.index),
         );
       }
     }
@@ -1929,7 +1950,9 @@ class _SegmentBarPainter extends CustomPainter {
       !identical(segments, old.segments) ||
       totalBytes != old.totalBytes ||
       emptyColor != old.emptyColor ||
-      !identical(palette, old.palette);
+      !identical(palette, old.palette) ||
+      accent != old.accent ||
+      monochrome != old.monochrome;
 }
 
 // =============================================================================
@@ -1946,6 +1969,8 @@ class _SegmentGridPainter extends CustomPainter {
   final Color emptyColor;
   final double unfilledAlpha;
   final List<Color> palette;
+  final Color accent;
+  final bool monochrome;
 
   _SegmentGridPainter({
     required this.segments,
@@ -1957,6 +1982,8 @@ class _SegmentGridPainter extends CustomPainter {
     required this.emptyColor,
     required this.unfilledAlpha,
     required this.palette,
+    required this.accent,
+    required this.monochrome,
   });
 
   @override
@@ -2001,17 +2028,21 @@ class _SegmentGridPainter extends CustomPainter {
       if (isDownloaded) {
         canvas.drawRRect(
           rect,
-          Paint()..color = SegmentPalette.colorFor(palette, owner.index),
+          Paint()
+            ..color = monochrome
+                ? accent
+                : SegmentPalette.colorFor(palette, owner.index),
         );
       } else {
-        // 未下载：分片色半透明
+        // 未下载：分片色（monochrome 时主题色）半透明
         canvas.drawRRect(
           rect,
           Paint()
-            ..color = SegmentPalette.colorFor(
-              palette,
-              owner.index,
-            ).withValues(alpha: unfilledAlpha),
+            ..color =
+                (monochrome
+                        ? accent
+                        : SegmentPalette.colorFor(palette, owner.index))
+                    .withValues(alpha: unfilledAlpha),
         );
       }
     }
@@ -2027,7 +2058,93 @@ class _SegmentGridPainter extends CustomPainter {
       cellGap != old.cellGap ||
       emptyColor != old.emptyColor ||
       unfilledAlpha != old.unfilledAlpha ||
-      !identical(palette, old.palette);
+      !identical(palette, old.palette) ||
+      accent != old.accent ||
+      monochrome != old.monochrome;
+}
+
+// =============================================================================
+// 「做种时间」实时行
+// =============================================================================
+
+/// 做种信息区的「做种时间」行。活跃做种（seeding，非排队）时以 1s 定时器
+/// 局部重建本行显示 [DownloadTask.liveSeedingTime]，避免整个详情面板刷新；
+/// 排队/停止态无插值需求，定时器保持关闭。布局与 `_buildInfoRow` 一致。
+class _LiveSeedTimeRow extends StatefulWidget {
+  final DownloadTask task;
+  final AppColors c;
+
+  const _LiveSeedTimeRow({required this.task, required this.c});
+
+  @override
+  State<_LiveSeedTimeRow> createState() => _LiveSeedTimeRowState();
+}
+
+class _LiveSeedTimeRowState extends State<_LiveSeedTimeRow> {
+  Timer? _ticker;
+
+  bool get _active =>
+      widget.task.isSeeding &&
+      widget.task.seedingStatus == SeedingStatus.seeding;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncTicker();
+  }
+
+  @override
+  void didUpdateWidget(covariant _LiveSeedTimeRow oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _syncTicker();
+  }
+
+  void _syncTicker() {
+    if (_active) {
+      _ticker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+        if (mounted) setState(() {});
+      });
+    } else {
+      _ticker?.cancel();
+      _ticker = null;
+    }
+  }
+
+  @override
+  void dispose() {
+    _ticker?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = widget.c;
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 60,
+            child: Text(
+              currentS.seedTime,
+              style: TextStyle(fontSize: 11, color: c.textMuted),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              _DetailPanelState._formatDuration(widget.task.liveSeedingTime),
+              style: TextStyle(
+                fontSize: 11,
+                color: c.textSecondary,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }
 
 // =============================================================================
@@ -2236,10 +2353,12 @@ class _SeedLimitsDialogState extends State<_SeedLimitsDialog> {
   late bool _postRatioEnabled;
   late bool _timeEnabled;
   late bool _inactiveEnabled;
+  bool _uploadEnabled = false;
   late final TextEditingController _ratioCtrl;
   late final TextEditingController _postRatioCtrl;
   late final TextEditingController _timeCtrl;
   late final TextEditingController _inactiveCtrl;
+  late final TextEditingController _uploadCtrl;
 
   @override
   void initState() {
@@ -2275,6 +2394,10 @@ class _SeedLimitsDialogState extends State<_SeedLimitsDialog> {
     _inactiveCtrl = TextEditingController(
       text: '${_inactiveEnabled ? t.seedInactiveTimeLimitMinutes : 30}',
     );
+    _uploadEnabled = t.seedUploadLimitBps > 0;
+    _uploadCtrl = TextEditingController(
+      text: '${(_uploadEnabled ? t.seedUploadLimitBps : 512 * 1024) ~/ 1024}',
+    );
   }
 
   @override
@@ -2283,6 +2406,7 @@ class _SeedLimitsDialogState extends State<_SeedLimitsDialog> {
     _postRatioCtrl.dispose();
     _timeCtrl.dispose();
     _inactiveCtrl.dispose();
+    _uploadCtrl.dispose();
     super.dispose();
   }
 
@@ -2325,12 +2449,14 @@ class _SeedLimitsDialogState extends State<_SeedLimitsDialog> {
         time = _timeEnabled ? _minutes(_timeCtrl) : _unlimited;
         inactive = _inactiveEnabled ? _minutes(_inactiveCtrl) : _unlimited;
     }
+    final uploadBps = _uploadEnabled ? _minutes(_uploadCtrl) * 1024 : 0;
     widget.controller.setTaskSeedLimits(
       widget.task.id,
       ratioMilli: ratio,
       postRatioMilli: postRatio,
       timeMinutes: time,
       inactiveMinutes: inactive,
+      uploadLimitBps: uploadBps,
     );
     Navigator.of(context).pop();
   }
@@ -2463,6 +2589,21 @@ class _SeedLimitsDialogState extends State<_SeedLimitsDialog> {
                 unit: s.timeUnitMinutes,
               ),
             ],
+            const SizedBox(height: 12),
+            _buildLimitRow(
+              c: c,
+              enabled: _uploadEnabled,
+              onChanged: (v) => setState(() => _uploadEnabled = v),
+              label: s.btSeedUploadLimit,
+              controller: _uploadCtrl,
+              decimal: false,
+              unit: s.speedUnitKbps,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              s.btSeedUploadLimitHint,
+              style: TextStyle(fontSize: 11, color: c.textMuted),
+            ),
           ],
         ),
       ),

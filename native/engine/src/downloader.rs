@@ -172,6 +172,8 @@ pub struct ProgressUpdate {
     pub seeding_status: i32,
     /// BT 做种状态的辅助说明（如停止原因）。无错误/未做种时为空。
     pub seeding_message: String,
+    /// 累计做种秒数（发帧时刻；排队/暂停不计）。仅 BT 做种帧非零。
+    pub seeding_time_secs: i64,
 }
 
 /// Snapshot of a single segment's progress, sent from downloader to progress_reporter.

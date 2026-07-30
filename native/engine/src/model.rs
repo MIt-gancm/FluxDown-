@@ -71,6 +71,8 @@ pub struct TaskInfo {
     pub seeding_status: i32,
     /// BT 做种状态的辅助说明（如错误信息）。
     pub seeding_message: String,
+    /// 累计做种秒数（活跃做种期间累加；排队/暂停不计）。
+    pub seeding_time_secs: i64,
     /// 任务级总分享率上限（千分比：1500 = 1.5）。-2 = 跟随全局，
     /// -1 = 不限制，>=0 = 自定义（0 视同不限制）。
     pub seed_ratio_limit_milli: i64,
@@ -80,6 +82,10 @@ pub struct TaskInfo {
     pub seed_time_limit_minutes: i64,
     /// 任务级不活跃做种时长上限（分钟）。哨兵语义同上。
     pub seed_inactive_time_limit_minutes: i64,
+    /// 任务级做种上传限速（B/s）。0 = 无单任务限制，>0 = 自定义。
+    /// 在 torrent 加入 librqbit 会话时烘焙生效（下载开始 / 重启续种 /
+    /// 句柄丢失后重新挂载）；已 live 的句柄不热改。
+    pub seed_upload_limit_bps: i64,
     /// Source page URL captured by the browser extension (empty = none).
     pub referrer: String,
     /// 所属任务组 ID（空 = 不属于任何组）。多文件任务组裂变/建组时写入；
@@ -108,6 +114,8 @@ pub struct QueueInfo {
     pub name: String,
     /// 速度限制,KB/s。0 = 无限制。
     pub speed_limit_kbps: i64,
+    /// 上传速度限制,KB/s。0 = 无限制（BT add/re-add 时折算生效）。
+    pub upload_limit_kbps: i64,
     /// 该队列内最大并发任务数。0 = 使用全局设置。
     pub max_concurrent: i32,
     /// 默认保存目录。空 = 使用全局默认值。

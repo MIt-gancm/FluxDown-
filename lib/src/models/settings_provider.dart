@@ -27,6 +27,7 @@ class SettingsProvider extends ChangeNotifier {
   int _connPolicyCount = 0; // 已学习的域名连接上限记录数（未过期）
   int _maxConcurrentTasks = 5;
   int _speedLimitBytes = 0; // 0 = 无限制
+  int _uploadLimitBytes = 0; // 全局上传限速（B/s，仅 BT 上传含做种；0 = 无限制）
   int _maxAutoRetries = 3; // -1 = 无限, 0 = 关闭, 1..10 = 次数
   int _autoRetryDelaySecs = 5; // 失败重试间隔（秒）
   bool _autoResumeOnStart = false;
@@ -127,6 +128,7 @@ class SettingsProvider extends ChangeNotifier {
   String _btSeedThenAction =
       'stop'; // 满足条件后动作：'stop' / 'delete' / 'delete_files'
   int _btSeedMaxActive = 0; // 最大同时活动做种任务数（0=不限制，超出的完成任务排队等待）
+  bool _btAutoReseed = true; // 启动时自动继续做种（非用户手动停止的已完成任务）
 
   // 临时缓存：开关关闭时保留上次输入的数值，再次打开时恢复。
   double _btSeedRatioLimitCached = 1.0;
@@ -242,6 +244,7 @@ class SettingsProvider extends ChangeNotifier {
   int get connPolicyCount => _connPolicyCount;
   int get maxConcurrentTasks => _maxConcurrentTasks;
   int get speedLimitBytes => _speedLimitBytes;
+  int get uploadLimitBytes => _uploadLimitBytes;
   int get maxAutoRetries => _maxAutoRetries;
   int get autoRetryDelaySecs => _autoRetryDelaySecs;
   bool get autoResumeOnStart => _autoResumeOnStart;
@@ -384,6 +387,7 @@ class SettingsProvider extends ChangeNotifier {
   String get btSeedConditionsOperator => _btSeedConditionsOperator;
   String get btSeedThenAction => _btSeedThenAction;
   int get btSeedMaxActive => _btSeedMaxActive;
+  bool get btAutoReseed => _btAutoReseed;
 
   // BT Tracker 订阅 Getters
   bool get btTrackerSubEnabled => _btTrackerSubEnabled;
@@ -553,6 +557,13 @@ class SettingsProvider extends ChangeNotifier {
     _speedLimitBytes = value;
     notifyListeners();
     _saveToRust('speed_limit_bytes', value.toString());
+  }
+
+  void setUploadLimitBytes(int value) {
+    if (_uploadLimitBytes == value) return;
+    _uploadLimitBytes = value;
+    notifyListeners();
+    _saveToRust('upload_limit_bytes', value.toString());
   }
 
   void setMaxAutoRetries(int value) {
@@ -1127,6 +1138,13 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('bt_seed_max_active', clamped.toString());
   }
 
+  void setBtAutoReseed(bool value) {
+    if (_btAutoReseed == value) return;
+    _btAutoReseed = value;
+    notifyListeners();
+    _saveToRust('bt_auto_reseed', value ? '1' : '0');
+  }
+
   // 云同步应用做种限制：与引擎 kv 同一编码（value > 0 = 启用并取该值，
   // 0 = 关闭）。关闭时保留内存数值与缓存，用户再次手动开启可恢复。
 
@@ -1653,6 +1671,8 @@ class SettingsProvider extends ChangeNotifier {
           _maxConcurrentTasks = int.tryParse(entry.value) ?? 5;
         case 'speed_limit_bytes':
           _speedLimitBytes = int.tryParse(entry.value) ?? 0;
+        case 'upload_limit_bytes':
+          _uploadLimitBytes = int.tryParse(entry.value) ?? 0;
         case 'max_auto_retries':
           _maxAutoRetries = int.tryParse(entry.value) ?? 3;
         case 'auto_retry_delay_secs':
@@ -1727,6 +1747,8 @@ class SettingsProvider extends ChangeNotifier {
               : 'stop';
         case 'bt_seed_max_active':
           _btSeedMaxActive = int.tryParse(entry.value) ?? 0;
+        case 'bt_auto_reseed':
+          _btAutoReseed = entry.value != '0';
         case 'bt_tracker_sub_enabled':
           _btTrackerSubEnabled = entry.value == 'true';
         case 'bt_tracker_sub_urls':

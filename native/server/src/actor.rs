@@ -70,6 +70,7 @@ pub enum ActorCmd {
     CreateQueue {
         name: String,
         speed_limit_kbps: i64,
+        upload_limit_kbps: i64,
         max_concurrent: i32,
         default_save_dir: String,
         default_segments: i32,
@@ -80,6 +81,7 @@ pub enum ActorCmd {
         queue_id: String,
         name: String,
         speed_limit_kbps: i64,
+        upload_limit_kbps: i64,
         max_concurrent: i32,
         default_save_dir: String,
         default_segments: i32,
@@ -126,13 +128,15 @@ pub enum ActorCmd {
         ack: oneshot::Sender<()>,
     },
     /// 设置单任务做种限制覆盖（-2 = 跟随全局，-1 = 不限制，>=0 = 自定义，
-    /// 0 视同不限制；分享率为千分比）。
+    /// 0 视同不限制；分享率为千分比）。`upload_limit_bps` 为任务级做种
+    /// 上传限速（B/s，0 = 不限），在下一次 torrent add 时烘焙生效。
     SetTaskSeedLimits {
         task_id: String,
         ratio_limit_milli: i64,
         post_ratio_limit_milli: i64,
         seed_time_limit_minutes: i64,
         inactive_time_limit_minutes: i64,
+        upload_limit_bps: i64,
         ack: oneshot::Sender<()>,
     },
     TestProxy {
@@ -406,6 +410,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
             post_ratio_limit_milli,
             seed_time_limit_minutes,
             inactive_time_limit_minutes,
+            upload_limit_bps,
             ack,
         } => {
             engine
@@ -416,6 +421,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                     post_ratio_limit_milli,
                     seed_time_limit_minutes,
                     inactive_time_limit_minutes,
+                    upload_limit_bps,
                 )
                 .await;
             let _ = ack.send(());
@@ -456,6 +462,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
         ActorCmd::CreateQueue {
             name,
             speed_limit_kbps,
+            upload_limit_kbps,
             max_concurrent,
             default_save_dir,
             default_segments,
@@ -467,6 +474,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                 .create_queue(
                     name,
                     speed_limit_kbps,
+                    upload_limit_kbps,
                     max_concurrent,
                     default_save_dir,
                     default_segments,
@@ -479,6 +487,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
             queue_id,
             name,
             speed_limit_kbps,
+            upload_limit_kbps,
             max_concurrent,
             default_save_dir,
             default_segments,
@@ -491,6 +500,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                     queue_id,
                     name,
                     speed_limit_kbps,
+                    upload_limit_kbps,
                     max_concurrent,
                     default_save_dir,
                     default_segments,
@@ -712,6 +722,12 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
                 if let Some(v) = all.get(key).and_then(|v| v.parse::<u64>().ok()) {
                     log_info!("[server-actor] speed_limit -> {} B/s", v);
                     engine.manager.set_speed_limit(v);
+                }
+            }
+            "upload_limit_bytes" => {
+                if let Some(v) = all.get(key).and_then(|v| v.parse::<u64>().ok()) {
+                    log_info!("[server-actor] upload_limit -> {} B/s", v);
+                    engine.manager.set_upload_speed_limit(v);
                 }
             }
             "default_save_dir" => {

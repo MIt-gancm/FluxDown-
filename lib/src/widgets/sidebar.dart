@@ -509,6 +509,7 @@ class _SidebarState extends State<Sidebar> {
             (
               name,
               speedLimit,
+              uploadLimit,
               maxConcurrent,
               saveDir,
               defaultSegments,
@@ -517,6 +518,7 @@ class _SidebarState extends State<Sidebar> {
               ctrl.createQueue(
                 name: name,
                 speedLimitKbps: speedLimit,
+                uploadLimitKbps: uploadLimit,
                 maxConcurrent: maxConcurrent,
                 defaultSaveDir: saveDir,
                 defaultSegments: defaultSegments,
@@ -1555,6 +1557,7 @@ class _QueueDialog extends StatefulWidget {
   final void Function(
     String name,
     int speedLimit,
+    int uploadLimit,
     int maxConcurrent,
     String saveDir,
     int defaultSegments,
@@ -1576,6 +1579,7 @@ class _QueueDialog extends StatefulWidget {
 
 class _QueueDialogState extends State<_QueueDialog> {
   late final TextEditingController _speedCtrl;
+  late final TextEditingController _uploadCtrl;
   late final TextEditingController _concurrentCtrl;
   late final TextEditingController _saveDirCtrl;
   late final TextEditingController _uaCtrl;
@@ -1588,6 +1592,7 @@ class _QueueDialogState extends State<_QueueDialog> {
   void initState() {
     super.initState();
     _speedCtrl = TextEditingController();
+    _uploadCtrl = TextEditingController();
     _concurrentCtrl = TextEditingController();
     _saveDirCtrl = TextEditingController();
     _uaCtrl = TextEditingController();
@@ -1598,6 +1603,7 @@ class _QueueDialogState extends State<_QueueDialog> {
   @override
   void dispose() {
     _speedCtrl.dispose();
+    _uploadCtrl.dispose();
     _concurrentCtrl.dispose();
     _saveDirCtrl.dispose();
     _uaCtrl.dispose();
@@ -1627,6 +1633,10 @@ class _QueueDialogState extends State<_QueueDialog> {
       0,
       1 << 30,
     );
+    final uploadLimit = (int.tryParse(_uploadCtrl.text.trim()) ?? 0).clamp(
+      0,
+      1 << 30,
+    );
     final maxConcurrent = (int.tryParse(_concurrentCtrl.text.trim()) ?? 0)
         .clamp(0, 100);
     final saveDir = _saveDirCtrl.text.trim();
@@ -1636,6 +1646,7 @@ class _QueueDialogState extends State<_QueueDialog> {
     widget.onConfirm(
       name,
       speedLimit,
+      uploadLimit,
       maxConcurrent,
       saveDir,
       defaultSegments,
@@ -1703,6 +1714,55 @@ class _QueueDialogState extends State<_QueueDialog> {
                   ),
                 ),
                 const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Text(
+                            s.queueUploadLimit,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w500,
+                              color: c.textSecondary,
+                            ),
+                          ),
+                          const SizedBox(width: 4),
+                          ShadTooltip(
+                            waitDuration: const Duration(milliseconds: 200),
+                            effects: const [],
+                            builder: (_) => Text(
+                              s.queueUploadLimitDesc,
+                              style: const TextStyle(fontSize: 12, height: 1.5),
+                            ),
+                            child: ShadGestureDetector(
+                              cursor: SystemMouseCursors.help,
+                              onTap: () {},
+                              child: Icon(
+                                LucideIcons.circleHelp,
+                                size: 13,
+                                color: c.textMuted,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 6),
+                      ShadInput(
+                        controller: _uploadCtrl,
+                        placeholder: Text(s.queueSpeedLimitHint),
+                        keyboardType: TextInputType.number,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,

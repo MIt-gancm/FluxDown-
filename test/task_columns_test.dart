@@ -39,16 +39,16 @@ void main() {
       expect(kTaskColumns[TaskColumnId.queue]!.width, 88);
       expect(kTaskColumns[TaskColumnId.speed]!.width, 90);
       expect(kTaskColumns[TaskColumnId.eta]!.width, 80);
-      expect(kTaskColumns[TaskColumnId.status]!.width, 60);
+      expect(kTaskColumns[TaskColumnId.status]!.width, 80);
     });
   });
 
   group('columnWidthBudget', () {
-    test('default column set (progress+speed+eta+status = 150+90+80+60=380) '
+    test('default column set (progress+speed+eta+status = 150+90+80+80=400) '
         'fits comfortably within a typical list width', () {
-      // 现状硬编码列宽总和（升级零感知的锚点）。
+      // 现状硬编码列宽总和（升级零感知的锚点）；状态列 60→80 见列注册表注释。
       final defaultWidth = columnsTotalWidth(ViewPrefs.defaultColumns);
-      expect(defaultWidth, 150 + 90 + 80 + 60);
+      expect(defaultWidth, 150 + 90 + 80 + 80);
       expect(columnWidthBudget(800), 800 - 168);
       expect(defaultWidth, lessThan(columnWidthBudget(800)));
     });

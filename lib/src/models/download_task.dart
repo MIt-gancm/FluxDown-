@@ -377,12 +377,16 @@ class DownloadTask {
   /// 做种状态/停止原因的辅助说明。
   final String seedingMessage;
 
+  /// 累计做种秒数（引擎权威值，来自 DB tasks.seeding_time_secs；排队/暂停
+  /// 不计入）。下载期 ProgressUpdate 帧恒为 0，仅在做种/排队帧上被采纳。
+  final int seedingTimeSecs;
+
+  /// [seedingTimeSecs] 的采样时刻。活跃做种时 [liveSeedingTime] 以此为锚点
+  /// 叠加本地流逝时间做秒级插值；null = 尚未从引擎取得过做种时长。
+  final DateTime? seedingTimeAnchor;
+
   /// 实时上传速率（字节/秒）。仅 BT 做种时非零。
   final int uploadSpeedBps;
-
-  /// 进入做种状态的本地时间，用于 UI 估算做种时长。持久化后无法恢复，重启后
-  /// 会从新的做种信号重新计算。
-  final DateTime? seedingStartedAt;
 
   /// 所属任务组 ID（空字符串 = 不属于任何组）。TaskProgress 信号不携带
   /// group_id（先到时暂空——组归属不像队列存在「归属未知」占位哨兵需求，
@@ -425,6 +429,10 @@ class DownloadTask {
   /// 无活动做种时长限制覆盖（分钟，哨兵语义同 [seedRatioLimitMilli]）。
   final int seedInactiveTimeLimitMinutes;
 
+  /// 任务级做种上传限速（B/s；0 = 无单任务限制）。add/重新挂载时烘焙进
+  /// 引擎，live 句柄不可热改。
+  final int seedUploadLimitBps;
+
   // ── 站点分桶键（惰性缓存；见 view_prefs/list_entity 站点分组维度）──
   String? _siteKeyCache;
   String? _siteLabelCache;
@@ -464,12 +472,14 @@ class DownloadTask {
     this.uploadedAtCompletion = 0,
     this.seedingStatus = SeedingStatus.none,
     this.seedingMessage = '',
+    this.seedingTimeSecs = 0,
+    this.seedingTimeAnchor,
     this.uploadSpeedBps = 0,
-    this.seedingStartedAt,
     this.seedRatioLimitMilli = -2,
     this.seedPostRatioLimitMilli = -2,
     this.seedTimeLimitMinutes = -2,
     this.seedInactiveTimeLimitMinutes = -2,
+    this.seedUploadLimitBps = 0,
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.now();
 
@@ -500,6 +510,8 @@ class DownloadTask {
       uploadedAtCompletion: info.uploadedAtCompletion,
       seedingStatus: seedingStatusFromInt(info.seedingStatus),
       seedingMessage: info.seedingMessage,
+      seedingTimeSecs: info.seedingTimeSecs,
+      seedingTimeAnchor: DateTime.now(),
       groupId: info.groupId,
       rssSourceId: info.rssSourceId,
       originUrl: info.originUrl,
@@ -510,6 +522,7 @@ class DownloadTask {
       seedPostRatioLimitMilli: info.seedPostRatioLimitMilli,
       seedTimeLimitMinutes: info.seedTimeLimitMinutes,
       seedInactiveTimeLimitMinutes: info.seedInactiveTimeLimitMinutes,
+      seedUploadLimitBps: info.seedUploadLimitBps,
       createdAt: seconds > 0
           ? DateTime.fromMillisecondsSinceEpoch(seconds * 1000)
           : DateTime.now(),
@@ -546,8 +559,9 @@ class DownloadTask {
     int? uploadedAtCompletion,
     SeedingStatus? seedingStatus,
     String? seedingMessage,
+    int? seedingTimeSecs,
+    DateTime? seedingTimeAnchor,
     int? uploadSpeedBps,
-    DateTime? seedingStartedAt,
     String? groupId,
     String? rssSourceId,
     String? originUrl,
@@ -558,6 +572,7 @@ class DownloadTask {
     int? seedPostRatioLimitMilli,
     int? seedTimeLimitMinutes,
     int? seedInactiveTimeLimitMinutes,
+    int? seedUploadLimitBps,
     DateTime? createdAt,
     DateTime? completedAt,
   }) {
@@ -587,8 +602,9 @@ class DownloadTask {
       uploadedAtCompletion: uploadedAtCompletion ?? this.uploadedAtCompletion,
       seedingStatus: seedingStatus ?? this.seedingStatus,
       seedingMessage: seedingMessage ?? this.seedingMessage,
+      seedingTimeSecs: seedingTimeSecs ?? this.seedingTimeSecs,
+      seedingTimeAnchor: seedingTimeAnchor ?? this.seedingTimeAnchor,
       uploadSpeedBps: uploadSpeedBps ?? this.uploadSpeedBps,
-      seedingStartedAt: seedingStartedAt ?? this.seedingStartedAt,
       groupId: groupId ?? this.groupId,
       rssSourceId: rssSourceId ?? this.rssSourceId,
       originUrl: originUrl ?? this.originUrl,
@@ -601,6 +617,7 @@ class DownloadTask {
       seedTimeLimitMinutes: seedTimeLimitMinutes ?? this.seedTimeLimitMinutes,
       seedInactiveTimeLimitMinutes:
           seedInactiveTimeLimitMinutes ?? this.seedInactiveTimeLimitMinutes,
+      seedUploadLimitBps: seedUploadLimitBps ?? this.seedUploadLimitBps,
       createdAt: createdAt ?? this.createdAt,
       completedAt: clearCompletedAt ? null : (completedAt ?? this.completedAt),
     );
@@ -609,8 +626,6 @@ class DownloadTask {
   /// 根据 TaskProgress 信号增量更新
   DownloadTask applyProgress(TaskProgress p) {
     final newStatus = taskStatusFromInt(p.status);
-    final isNowSeeding =
-        newStatus == TaskStatus.completed && p.seedingStatus == 1;
     // Rust 端已通过固定窗口采样 + 单层 EMA 充分平滑，Dart 直接使用。
     // 非下载状态强制归零，防止残留值；BT 任务的上传速度始终透传，供列表同时展示。
     final int displaySpeed = newStatus == TaskStatus.downloading ? p.speed : 0;
@@ -632,10 +647,11 @@ class DownloadTask {
         newStatus == TaskStatus.preparing ||
         newStatus == TaskStatus.resuming;
     final newSeedingStatus = seedingStatusFromInt(p.seedingStatus);
-    // 首次进入做种状态时记录本地开始时间，用于估算做种时长。
-    final newSeedingStartedAt = isNowSeeding && seedingStatus != SeedingStatus.seeding
-        ? DateTime.now()
-        : seedingStartedAt;
+    // 帧携带的累计做种秒数：仅在做种/排队帧上采纳（下载期帧恒为 0，
+    // 直接采纳会把已累计值清零），采纳时刷新采样锚点供实时插值。
+    final adoptSeedingTime =
+        newSeedingStatus == SeedingStatus.seeding ||
+        newSeedingStatus == SeedingStatus.queued;
 
     return copyWith(
       status: newStatus,
@@ -646,7 +662,8 @@ class DownloadTask {
       uploadedBytes: p.uploadedBytes,
       seedingStatus: newSeedingStatus,
       seedingMessage: p.seedingMessage,
-      seedingStartedAt: newSeedingStartedAt,
+      seedingTimeSecs: adoptSeedingTime ? p.seedingTimeSecs : null,
+      seedingTimeAnchor: adoptSeedingTime ? DateTime.now() : null,
       fileName: nameFromProgress,
       saveDir: p.saveDir.isNotEmpty ? p.saveDir : null,
       errorMessage: p.errorMessage,
@@ -767,11 +784,17 @@ class DownloadTask {
   /// 当前任务是否为 BT 任务
   bool get isBt => protocolLabel == 'BT';
 
-  /// 做种时长。尚未进入做种或无法估算时返回 `Duration.zero`。
-  Duration get seedingDuration =>
-      isSeeding && seedingStartedAt != null
-          ? DateTime.now().difference(seedingStartedAt!)
-          : Duration.zero;
+  /// 实时做种时长：以引擎累计秒数为基底，活跃做种（非排队）时叠加自采样
+  /// 锚点以来的本地流逝时间；排队/停止态只显示累计值。
+  Duration get liveSeedingTime {
+    final base = Duration(seconds: seedingTimeSecs);
+    if (isSeeding &&
+        seedingStatus == SeedingStatus.seeding &&
+        seedingTimeAnchor != null) {
+      return base + DateTime.now().difference(seedingTimeAnchor!);
+    }
+    return base;
+  }
 
   /// 协议类型标识
   String get protocolLabel {

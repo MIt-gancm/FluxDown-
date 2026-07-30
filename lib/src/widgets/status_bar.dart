@@ -56,6 +56,7 @@ class StatusBar extends StatefulWidget {
 class _StatusBarState extends State<StatusBar> {
   final _popoverController = ShadPopoverController();
   final _customController = TextEditingController();
+  final _uploadCustomController = TextEditingController();
   final _shutdownPopoverController = ShadPopoverController();
   final _shutdownMinutesController = TextEditingController();
   final _proxyPopoverController = ShadPopoverController();
@@ -63,12 +64,18 @@ class _StatusBarState extends State<StatusBar> {
   /// 上次已写入 settings 的字节数，用于防循环更新
   int _lastKnownBytes = -1;
 
+  /// 上次已写入 settings 的上传限速字节数，用于防循环更新
+  int _lastKnownUploadBytes = -1;
+
   @override
   void initState() {
     super.initState();
     final bytes = widget.settingsProvider.speedLimitBytes;
     _lastKnownBytes = bytes;
     _customController.text = _kbsText(bytes);
+    final uploadBytes = widget.settingsProvider.uploadLimitBytes;
+    _lastKnownUploadBytes = uploadBytes;
+    _uploadCustomController.text = _kbsText(uploadBytes);
     _shutdownMinutesController.text =
         ShutdownService.instance.delayMinutes.toString();
     widget.settingsProvider.addListener(_onSettingsChanged);
@@ -83,6 +90,7 @@ class _StatusBarState extends State<StatusBar> {
     widget.settingsProvider.removeListener(_onSettingsChanged);
     _popoverController.dispose();
     _customController.dispose();
+    _uploadCustomController.dispose();
     _shutdownPopoverController.dispose();
     _proxyPopoverController.dispose();
     _shutdownMinutesController.dispose();
@@ -97,21 +105,33 @@ class _StatusBarState extends State<StatusBar> {
 
   /// 设置页（外部）修改限速时同步输入框
   void _onSettingsChanged() {
+    var changed = false;
     final newBytes = widget.settingsProvider.speedLimitBytes;
-    if (newBytes == _lastKnownBytes) return;
-    _lastKnownBytes = newBytes;
-    _customController.text = _kbsText(newBytes);
-    if (mounted) setState(() {});
+    if (newBytes != _lastKnownBytes) {
+      _lastKnownBytes = newBytes;
+      _customController.text = _kbsText(newBytes);
+      changed = true;
+    }
+    final newUploadBytes = widget.settingsProvider.uploadLimitBytes;
+    if (newUploadBytes != _lastKnownUploadBytes) {
+      _lastKnownUploadBytes = newUploadBytes;
+      _uploadCustomController.text = _kbsText(newUploadBytes);
+      changed = true;
+    }
+    if (changed && mounted) setState(() {});
   }
 
   /// Popover 关闭时，若已开启限速，则将自定义输入框的当前值写入设置
   void _onPopoverChanged() {
     if (!_popoverController.isOpen) {
       _applyCustomInput();
+      _applyUploadCustomInput();
     }
   }
 
   bool get _isLimited => widget.settingsProvider.speedLimitBytes > 0;
+
+  bool get _isUploadLimited => widget.settingsProvider.uploadLimitBytes > 0;
 
   /// 切换开关
   void _toggleLimit(bool on) {
@@ -145,6 +165,42 @@ class _StatusBarState extends State<StatusBar> {
       if (bytes != _lastKnownBytes) {
         _lastKnownBytes = bytes;
         widget.settingsProvider.setSpeedLimitBytes(bytes);
+      }
+    }
+  }
+
+  /// 切换上传限速开关（全局 BT 上传，与设置页同源）
+  void _toggleUploadLimit(bool on) {
+    if (on) {
+      final kbs = int.tryParse(_uploadCustomController.text.trim()) ?? 0;
+      final effectiveKbs = kbs > 0 ? kbs : 512;
+      if (kbs <= 0) _uploadCustomController.text = '512';
+      final bytes = effectiveKbs * 1024;
+      _lastKnownUploadBytes = bytes;
+      widget.settingsProvider.setUploadLimitBytes(bytes);
+    } else {
+      _lastKnownUploadBytes = 0;
+      widget.settingsProvider.setUploadLimitBytes(0);
+    }
+  }
+
+  /// 点击上传预设：直接启用并应用该速率
+  void _applyUploadPreset(int kbs) {
+    _uploadCustomController.text = kbs.toString();
+    final bytes = kbs * 1024;
+    _lastKnownUploadBytes = bytes;
+    widget.settingsProvider.setUploadLimitBytes(bytes);
+  }
+
+  /// 上传自定义输入框的值写入设置（仅上传限速已开启时有效）
+  void _applyUploadCustomInput() {
+    if (!_isUploadLimited) return;
+    final kbs = int.tryParse(_uploadCustomController.text.trim()) ?? 0;
+    if (kbs > 0) {
+      final bytes = kbs * 1024;
+      if (bytes != _lastKnownUploadBytes) {
+        _lastKnownUploadBytes = bytes;
+        widget.settingsProvider.setUploadLimitBytes(bytes);
       }
     }
   }
@@ -211,6 +267,8 @@ class _StatusBarState extends State<StatusBar> {
         final dlSpeed = DownloadTask.formatBytes(
           widget.controller.totalDownloadSpeed,
         );
+        final upSpeedBps = widget.controller.totalUploadSpeed;
+        final ulSpeed = DownloadTask.formatBytes(upSpeedBps);
         final active = widget.controller.activeCount;
         final paused = widget.controller.pausedCount;
         final total = widget.controller.tasks.length;
@@ -272,6 +330,28 @@ class _StatusBarState extends State<StatusBar> {
                   ),
                 ],
               ),
+              // 实时上传速度（有做种任务或 BT 上行流量时显示）
+              if (widget.controller.seedingCount > 0 || upSpeedBps > 0) ...[
+                const SizedBox(width: 12),
+                Row(
+                  children: [
+                    const Icon(
+                      LucideIcons.arrowUp,
+                      size: 10,
+                      color: AppColors.green,
+                    ),
+                    const SizedBox(width: 4),
+                    Text(
+                      '$ulSpeed/s',
+                      style: TextStyle(
+                        fontSize: 10.5,
+                        color: c.textMuted,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ],
+                ),
+              ],
               const SizedBox(width: 20),
               Text(
                 s.statusSummary(active, paused, total),
@@ -305,11 +385,17 @@ class _StatusBarState extends State<StatusBar> {
                 popoverController: _popoverController,
                 settingsProvider: widget.settingsProvider,
                 customController: _customController,
+                uploadCustomController: _uploadCustomController,
                 isLimited: _isLimited,
                 limitBytes: widget.settingsProvider.speedLimitBytes,
+                isUploadLimited: _isUploadLimited,
+                uploadLimitBytes: widget.settingsProvider.uploadLimitBytes,
                 onToggle: _toggleLimit,
                 onApplyPreset: _applyPreset,
                 onApplyCustom: _applyCustomInput,
+                onToggleUpload: _toggleUploadLimit,
+                onApplyUploadPreset: _applyUploadPreset,
+                onApplyUploadCustom: _applyUploadCustomInput,
                 s: s,
                 c: c,
               ),
@@ -378,11 +464,17 @@ class _SpeedLimitTrigger extends StatelessWidget {
   final ShadPopoverController popoverController;
   final SettingsProvider settingsProvider;
   final TextEditingController customController;
+  final TextEditingController uploadCustomController;
   final bool isLimited;
   final int limitBytes;
+  final bool isUploadLimited;
+  final int uploadLimitBytes;
   final ValueChanged<bool> onToggle;
   final ValueChanged<int> onApplyPreset;
   final VoidCallback onApplyCustom;
+  final ValueChanged<bool> onToggleUpload;
+  final ValueChanged<int> onApplyUploadPreset;
+  final VoidCallback onApplyUploadCustom;
   final S s;
   final AppColors c;
 
@@ -390,29 +482,47 @@ class _SpeedLimitTrigger extends StatelessWidget {
     required this.popoverController,
     required this.settingsProvider,
     required this.customController,
+    required this.uploadCustomController,
     required this.isLimited,
     required this.limitBytes,
+    required this.isUploadLimited,
+    required this.uploadLimitBytes,
     required this.onToggle,
     required this.onApplyPreset,
     required this.onApplyCustom,
+    required this.onToggleUpload,
+    required this.onApplyUploadPreset,
+    required this.onApplyUploadCustom,
     required this.s,
     required this.c,
   });
 
   @override
   Widget build(BuildContext context) {
-    final triggerColor = isLimited ? c.accent : c.textMuted;
-    final triggerText =
-        isLimited ? _formatSpeed(limitBytes) : s.statusSpeedLimitOff;
+    final triggerColor = isLimited || isUploadLimited ? c.accent : c.textMuted;
+    // 收起态文案：仅下载限速时维持原样；有上传限速时以 ↓/↑ 前缀区分两向。
+    final String triggerText;
+    if (isLimited && isUploadLimited) {
+      triggerText =
+          '↓${_formatSpeed(limitBytes)} · ↑${_formatSpeed(uploadLimitBytes)}';
+    } else if (isUploadLimited) {
+      triggerText = '↑${_formatSpeed(uploadLimitBytes)}';
+    } else if (isLimited) {
+      triggerText = _formatSpeed(limitBytes);
+    } else {
+      triggerText = s.statusSpeedLimitOff;
+    }
 
     return ShadPopover(
       controller: popoverController,
       effects: const [],
-      // 弹出在触发器上方，右对齐（状态栏位于屏幕底部）
-      anchor: const ShadAnchorAuto(
+      // 弹出在触发器上方，右对齐（状态栏位于屏幕底部）。
+      // 用手动 ShadAnchor 精确锚定：ShadAnchorAuto 底层按目标点水平居中，
+      // 右对齐配置会整体向右偏移一个弹层宽度。
+      anchor: const ShadAnchor(
+        childAlignment: Alignment.bottomRight,
+        overlayAlignment: Alignment.topRight,
         offset: Offset(0, -8),
-        followerAnchor: Alignment.bottomRight,
-        targetAnchor: Alignment.topRight,
       ),
       padding: EdgeInsets.zero,
       // 使用 ListenableBuilder 确保 Popover 内容在设置变更后自动刷新
@@ -420,11 +530,17 @@ class _SpeedLimitTrigger extends StatelessWidget {
         listenable: settingsProvider,
         builder: (ctx2, _) => _SpeedLimitPopoverContent(
           customController: customController,
+          uploadCustomController: uploadCustomController,
           isLimited: settingsProvider.speedLimitBytes > 0,
           limitBytes: settingsProvider.speedLimitBytes,
+          isUploadLimited: settingsProvider.uploadLimitBytes > 0,
+          uploadLimitBytes: settingsProvider.uploadLimitBytes,
           onToggle: onToggle,
           onApplyPreset: onApplyPreset,
           onApplyCustom: onApplyCustom,
+          onToggleUpload: onToggleUpload,
+          onApplyUploadPreset: onApplyUploadPreset,
+          onApplyUploadCustom: onApplyUploadCustom,
           s: s,
           c: c,
         ),
@@ -462,21 +578,33 @@ class _SpeedLimitTrigger extends StatelessWidget {
 
 class _SpeedLimitPopoverContent extends StatelessWidget {
   final TextEditingController customController;
+  final TextEditingController uploadCustomController;
   final bool isLimited;
   final int limitBytes;
+  final bool isUploadLimited;
+  final int uploadLimitBytes;
   final ValueChanged<bool> onToggle;
   final ValueChanged<int> onApplyPreset;
   final VoidCallback onApplyCustom;
+  final ValueChanged<bool> onToggleUpload;
+  final ValueChanged<int> onApplyUploadPreset;
+  final VoidCallback onApplyUploadCustom;
   final S s;
   final AppColors c;
 
   const _SpeedLimitPopoverContent({
     required this.customController,
+    required this.uploadCustomController,
     required this.isLimited,
     required this.limitBytes,
+    required this.isUploadLimited,
+    required this.uploadLimitBytes,
     required this.onToggle,
     required this.onApplyPreset,
     required this.onApplyCustom,
+    required this.onToggleUpload,
+    required this.onApplyUploadPreset,
+    required this.onApplyUploadCustom,
     required this.s,
     required this.c,
   });
@@ -490,111 +618,155 @@ class _SpeedLimitPopoverContent extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
         children: [
-          // 标题行 + 开关
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 12, 8, 10),
-            child: Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    s.speedLimitTitle,
-                    style: TextStyle(
-                      fontSize: 12.5,
-                      fontWeight: FontWeight.w600,
-                      color: c.textPrimary,
-                    ),
-                  ),
-                ),
-                ShadSwitch(
-                  value: isLimited,
-                  onChanged: onToggle,
-                  width: 34,
-                  height: 18,
-                  margin: 2,
-                ),
-              ],
-            ),
+          // ── 下载限速 ──
+          _limitSection(
+            m: m,
+            title: s.speedLimitTitle,
+            sectionLimited: isLimited,
+            sectionBytes: limitBytes,
+            controller: customController,
+            onSectionToggle: onToggle,
+            onSectionPreset: onApplyPreset,
+            onSectionCustom: onApplyCustom,
           ),
-          // 预设速率 chips
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
-            child: Wrap(
-              spacing: 5,
-              runSpacing: 5,
-              children: _kPresets.map((preset) {
-                final isSelected = isLimited && limitBytes == preset.kbs * 1024;
-                return MouseRegion(
-                  cursor: SystemMouseCursors.click,
-                  child: GestureDetector(
-                    onTap: () => onApplyPreset(preset.kbs),
-                    child: AnimatedContainer(
-                      duration: const Duration(milliseconds: 120),
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 4,
-                      ),
-                      decoration: BoxDecoration(
-                        color: isSelected ? c.accent : c.surface2,
-                        borderRadius: m.brSm,
-                        border: Border.all(
-                          color: isSelected ? c.accent : c.border,
-                          width: 0.5,
-                        ),
-                      ),
-                      child: Text(
-                        preset.label,
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: isSelected
-                              ? const Color(0xFFFFFFFF)
-                              : c.textSecondary,
-                          fontFeatures: const [FontFeature.tabularFigures()],
-                        ),
-                      ),
-                    ),
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
-          // 分割线
           Divider(color: c.border, height: 1),
-          // 自定义输入
-          Padding(
-            padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  s.speedLimitCustom,
-                  style: TextStyle(fontSize: 11, color: c.textMuted),
-                ),
-                const SizedBox(height: 6),
-                Row(
-                  children: [
-                    Expanded(
-                      child: ShadInput(
-                        controller: customController,
-                        keyboardType: TextInputType.number,
-                        inputFormatters: [
-                          FilteringTextInputFormatter.digitsOnly,
-                        ],
-                        placeholder: Text(s.statusSpeedLimitHint),
-                        onSubmitted: (_) => onApplyCustom(),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    Text(
-                      s.statusSpeedLimitKbs,
-                      style: TextStyle(fontSize: 12, color: c.textMuted),
-                    ),
-                  ],
-                ),
-              ],
-            ),
+          // ── 上传限速（全局 BT 上传，与设置页同源）──
+          _limitSection(
+            m: m,
+            title: s.uploadLimit,
+            sectionLimited: isUploadLimited,
+            sectionBytes: uploadLimitBytes,
+            controller: uploadCustomController,
+            onSectionToggle: onToggleUpload,
+            onSectionPreset: onApplyUploadPreset,
+            onSectionCustom: onApplyUploadCustom,
           ),
         ],
       ),
+    );
+  }
+
+  /// 单个限速区块：标题行 + 开关、预设 chips、分割线、自定义输入。
+  /// 下载/上传两区结构完全一致，仅数据源与回调不同。
+  Widget _limitSection({
+    required AppMetrics m,
+    required String title,
+    required bool sectionLimited,
+    required int sectionBytes,
+    required TextEditingController controller,
+    required ValueChanged<bool> onSectionToggle,
+    required ValueChanged<int> onSectionPreset,
+    required VoidCallback onSectionCustom,
+  }) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        // 标题行 + 开关
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 12, 8, 10),
+          child: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: c.textPrimary,
+                  ),
+                ),
+              ),
+              ShadSwitch(
+                value: sectionLimited,
+                onChanged: onSectionToggle,
+                width: 34,
+                height: 18,
+                margin: 2,
+              ),
+            ],
+          ),
+        ),
+        // 预设速率 chips
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 0, 12, 10),
+          child: Wrap(
+            spacing: 5,
+            runSpacing: 5,
+            children: _kPresets.map((preset) {
+              final isSelected =
+                  sectionLimited && sectionBytes == preset.kbs * 1024;
+              return MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  onTap: () => onSectionPreset(preset.kbs),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 120),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    decoration: BoxDecoration(
+                      color: isSelected ? c.accent : c.surface2,
+                      borderRadius: m.brSm,
+                      border: Border.all(
+                        color: isSelected ? c.accent : c.border,
+                        width: 0.5,
+                      ),
+                    ),
+                    child: Text(
+                      preset.label,
+                      style: TextStyle(
+                        fontSize: 11,
+                        color: isSelected
+                            ? const Color(0xFFFFFFFF)
+                            : c.textSecondary,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }).toList(),
+          ),
+        ),
+        // 分割线
+        Divider(color: c.border, height: 1),
+        // 自定义输入
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                s.speedLimitCustom,
+                style: TextStyle(fontSize: 11, color: c.textMuted),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: ShadInput(
+                      controller: controller,
+                      keyboardType: TextInputType.number,
+                      inputFormatters: [
+                        FilteringTextInputFormatter.digitsOnly,
+                      ],
+                      placeholder: Text(s.statusSpeedLimitHint),
+                      onSubmitted: (_) => onSectionCustom(),
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    s.statusSpeedLimitKbs,
+                    style: TextStyle(fontSize: 12, color: c.textMuted),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }
@@ -643,10 +815,11 @@ class _ShutdownTrigger extends StatelessWidget {
     return ShadPopover(
       controller: popoverController,
       effects: const [],
-      anchor: const ShadAnchorAuto(
+      // 弹出在触发器上方，右对齐（同限速 Popover，手动锚避免 Auto 右偏）
+      anchor: const ShadAnchor(
+        childAlignment: Alignment.bottomRight,
+        overlayAlignment: Alignment.topRight,
         offset: Offset(0, -8),
-        followerAnchor: Alignment.bottomRight,
-        targetAnchor: Alignment.topRight,
       ),
       padding: EdgeInsets.zero,
       // 监听服务与控制器 —— 倒计时秒数刷新、活跃任务数变化时开关可用性刷新
@@ -919,11 +1092,11 @@ class _ProxyModeTrigger extends StatelessWidget {
       controller: popoverController,
       // FluxDown 弹出层无进出场动画(rule: shad-overlay-no-animation)。
       effects: const [],
-      // 弹出在触发器上方，右对齐（状态栏位于屏幕底部）
-      anchor: const ShadAnchorAuto(
+      // 弹出在触发器上方，右对齐（同限速 Popover，手动锚避免 Auto 右偏）
+      anchor: const ShadAnchor(
+        childAlignment: Alignment.bottomRight,
+        overlayAlignment: Alignment.topRight,
         offset: Offset(0, -8),
-        followerAnchor: Alignment.bottomRight,
-        targetAnchor: Alignment.topRight,
       ),
       padding: EdgeInsets.zero,
       // 监听设置与系统代理检测状态 —— 模式切换、检测结果到达时刷新

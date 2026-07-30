@@ -708,6 +708,17 @@ class DownloadController extends ChangeNotifier {
     return sum;
   }
 
+  /// 全局上传速度（BT 下载中的上行流量 + 做种上传）
+  int get totalUploadSpeed {
+    int sum = 0;
+    for (final t in _tasks) {
+      if (t.status == TaskStatus.downloading || t.isSeeding) {
+        sum += t.uploadSpeedBps;
+      }
+    }
+    return sum;
+  }
+
   // ---------------------------------------------------------------------------
   // Actions — 发送信号到 Rust
   // ---------------------------------------------------------------------------
@@ -1115,6 +1126,7 @@ class DownloadController extends ChangeNotifier {
   void createQueue({
     required String name,
     int speedLimitKbps = 0,
+    int uploadLimitKbps = 0,
     int maxConcurrent = 0,
     String defaultSaveDir = '',
     int defaultSegments = 0,
@@ -1127,6 +1139,7 @@ class DownloadController extends ChangeNotifier {
     CreateQueue(
       name: name,
       speedLimitKbps: speedLimitKbps,
+      uploadLimitKbps: uploadLimitKbps,
       maxConcurrent: maxConcurrent,
       defaultSaveDir: defaultSaveDir,
       defaultSegments: defaultSegments,
@@ -1138,6 +1151,7 @@ class DownloadController extends ChangeNotifier {
     required String queueId,
     required String name,
     int speedLimitKbps = 0,
+    int uploadLimitKbps = 0,
     int maxConcurrent = 0,
     String defaultSaveDir = '',
     int defaultSegments = 0,
@@ -1151,6 +1165,7 @@ class DownloadController extends ChangeNotifier {
       queueId: queueId,
       name: name,
       speedLimitKbps: speedLimitKbps,
+      uploadLimitKbps: uploadLimitKbps,
       maxConcurrent: maxConcurrent,
       defaultSaveDir: defaultSaveDir,
       defaultSegments: defaultSegments,
@@ -1490,11 +1505,13 @@ class DownloadController extends ChangeNotifier {
     required int postRatioMilli,
     required int timeMinutes,
     required int inactiveMinutes,
+    required int uploadLimitBps,
   }) {
     logInfo(
       _tag,
       'setTaskSeedLimits: task=$taskId, ratio=$ratioMilli, '
-      'postRatio=$postRatioMilli, time=$timeMinutes, inactive=$inactiveMinutes',
+      'postRatio=$postRatioMilli, time=$timeMinutes, inactive=$inactiveMinutes, '
+      'uploadBps=$uploadLimitBps',
     );
     final idx = _tasks.indexWhere((t) => t.id == taskId);
     if (idx >= 0) {
@@ -1503,6 +1520,7 @@ class DownloadController extends ChangeNotifier {
         seedPostRatioLimitMilli: postRatioMilli,
         seedTimeLimitMinutes: timeMinutes,
         seedInactiveTimeLimitMinutes: inactiveMinutes,
+        seedUploadLimitBps: uploadLimitBps,
       );
       _safeNotifyListeners();
     }
@@ -1512,6 +1530,7 @@ class DownloadController extends ChangeNotifier {
       postRatioLimitMilli: postRatioMilli,
       seedTimeLimitMinutes: timeMinutes,
       inactiveTimeLimitMinutes: inactiveMinutes,
+      uploadLimitBps: uploadLimitBps,
     ).sendSignalToRust();
   }
 

@@ -273,6 +273,7 @@ async fn load_initial_config(
 ) -> (
     usize,
     u64,
+    u64,
     String,
     BtConfig,
     ProxyConfig,
@@ -289,6 +290,12 @@ async fn load_initial_config(
         .unwrap_or(5);
     let speed_limit_bytes = config
         .get("speed_limit_bytes")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    // 全局 BT 上传限速（B/s，0 = 不限）。与 speed_limit_bytes 解耦：
+    // 后者只管下载，本键管 BT 上传（下载期上传 + 做种）。
+    let upload_limit_bytes = config
+        .get("upload_limit_bytes")
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let save_dir = config
@@ -323,6 +330,7 @@ async fn load_initial_config(
     (
         max_concurrent,
         speed_limit_bytes,
+        upload_limit_bytes,
         save_dir,
         bt_config,
         proxy_config,
@@ -352,6 +360,7 @@ pub async fn run(db_dir: PathBuf) {
     let (
         max_concurrent,
         speed_limit_bps,
+        upload_limit_bps,
         save_dir,
         mut bt_config,
         proxy_config,
@@ -421,6 +430,7 @@ pub async fn run(db_dir: PathBuf) {
         EngineConfig {
             max_concurrent,
             speed_limit_bps,
+            upload_limit_bps,
             default_save_dir: save_dir,
             app_data_dir,
             bt_config,
@@ -1414,6 +1424,7 @@ pub async fn run(db_dir: PathBuf) {
                             msg.post_ratio_limit_milli,
                             msg.seed_time_limit_minutes,
                             msg.inactive_time_limit_minutes,
+                            msg.upload_limit_bps,
                         )
                         .await;
                 }
@@ -1594,12 +1605,12 @@ pub async fn run(db_dir: PathBuf) {
             Some(signal) = create_queue_recv.recv() => {
                 let msg = signal.message;
                 log_info!("[actor] CreateQueue: name={}", msg.name);
-                engine.manager.create_queue(msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
+                engine.manager.create_queue(msg.name, msg.speed_limit_kbps, msg.upload_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
             }
             Some(signal) = update_queue_recv.recv() => {
                 let msg = signal.message;
                 log_info!("[actor] UpdateQueue: id={}", msg.queue_id);
-                engine.manager.update_queue(msg.queue_id, msg.name, msg.speed_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
+                engine.manager.update_queue(msg.queue_id, msg.name, msg.speed_limit_kbps, msg.upload_limit_kbps, msg.max_concurrent, msg.default_save_dir, msg.default_segments, msg.default_user_agent).await;
             }
             Some(signal) = delete_queue_recv.recv() => {
                 let msg = signal.message;
@@ -2793,6 +2804,12 @@ async fn apply_config_key(
             if let Ok(v) = value.parse::<u64>() {
                 log_info!("[actor] updating speed_limit to {} B/s", v);
                 engine.manager.set_speed_limit(v);
+            }
+        }
+        "upload_limit_bytes" => {
+            if let Ok(v) = value.parse::<u64>() {
+                log_info!("[actor] updating upload_limit to {} B/s", v);
+                engine.manager.set_upload_speed_limit(v);
             }
         }
         "log_max_size_mb" => {

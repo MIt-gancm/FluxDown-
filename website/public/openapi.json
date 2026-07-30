@@ -3760,7 +3760,7 @@
       },
       "QueueDto": {
         "type": "object",
-        "description": "命名队列信息（`GET /api/v1/queues` 响应）。\n\n# Examples\n\n```\nuse fluxdown_api::types::QueueDto;\nuse fluxdown_engine::model::QueueInfo;\n\nlet q = QueueInfo {\n    queue_id: \"q1\".to_string(),\n    name: \"工作\".to_string(),\n    speed_limit_kbps: 0,\n    max_concurrent: 3,\n    default_save_dir: String::new(),\n    position: 0,\n    default_segments: 0,\n    default_user_agent: String::new(),\n    is_running: true,\n    schedule_enabled: false,\n    schedule_start: String::new(),\n    schedule_stop: String::new(),\n    schedule_days: 127,\n};\nlet dto = QueueDto::from(q);\nassert_eq!(dto.queue_id, \"q1\");\n```",
+        "description": "命名队列信息（`GET /api/v1/queues` 响应）。\n\n# Examples\n\n```\nuse fluxdown_api::types::QueueDto;\nuse fluxdown_engine::model::QueueInfo;\n\nlet q = QueueInfo {\n    queue_id: \"q1\".to_string(),\n    name: \"工作\".to_string(),\n    speed_limit_kbps: 0,\n    upload_limit_kbps: 0,\n    max_concurrent: 3,\n    default_save_dir: String::new(),\n    position: 0,\n    default_segments: 0,\n    default_user_agent: String::new(),\n    is_running: true,\n    schedule_enabled: false,\n    schedule_start: String::new(),\n    schedule_stop: String::new(),\n    schedule_days: 127,\n};\nlet dto = QueueDto::from(q);\nassert_eq!(dto.queue_id, \"q1\");\n```",
         "required": [
           "queueId",
           "name",
@@ -3822,6 +3822,11 @@
             "type": "integer",
             "format": "int64",
             "description": "队列限速（KB/s），0 = 不限速。"
+          },
+          "uploadLimitKbps": {
+            "type": "integer",
+            "format": "int64",
+            "description": "队列上传限速（KB/s），0 = 不限速。"
           }
         }
       },
@@ -4333,7 +4338,7 @@
       },
       "TaskDto": {
         "type": "object",
-        "description": "任务信息（`GET /api/v1/tasks`、`GET /api/v1/tasks/{id}` 响应）。\n\n# Examples\n\n```\nuse fluxdown_api::types::TaskDto;\nuse fluxdown_engine::model::TaskInfo;\n\nlet info = TaskInfo {\n    task_id: \"t1\".to_string(),\n    url: \"https://example.com/f.zip\".to_string(),\n    file_name: \"f.zip\".to_string(),\n    save_dir: \"/tmp\".to_string(),\n    status: 1,\n    downloaded_bytes: 10,\n    total_bytes: 100,\n    error_message: String::new(),\n    created_at: \"1700000000\".to_string(),\n    proxy_url: String::new(),\n    queue_id: String::new(),\n    checksum: String::new(),\n    ignore_tls_errors: false,\n    file_missing: false,\n    completed_at: String::new(),\n    segments: 0,\n    queue_order: 0,\n    uploaded_bytes: 0,\n    uploaded_at_completion: 0,\n    seeding_status: 0,\n    seeding_message: String::new(),\n    seed_ratio_limit_milli: -2,\n    seed_post_ratio_limit_milli: -2,\n    seed_time_limit_minutes: -2,\n    seed_inactive_time_limit_minutes: -2,\n    referrer: String::new(),\n    group_id: String::new(),\n    rss_source_id: String::new(),\n    origin_url: String::new(),\n    auto_route: String::new(),\n};\nlet dto = TaskDto::from(info);\nassert_eq!(dto.task_id, \"t1\");\nlet json = serde_json::to_string(&dto).unwrap();\nassert!(json.contains(\"\\\"taskId\\\":\\\"t1\\\"\"));\n```",
+        "description": "任务信息（`GET /api/v1/tasks`、`GET /api/v1/tasks/{id}` 响应）。\n\n# Examples\n\n```\nuse fluxdown_api::types::TaskDto;\nuse fluxdown_engine::model::TaskInfo;\n\nlet info = TaskInfo {\n    task_id: \"t1\".to_string(),\n    url: \"https://example.com/f.zip\".to_string(),\n    file_name: \"f.zip\".to_string(),\n    save_dir: \"/tmp\".to_string(),\n    status: 1,\n    downloaded_bytes: 10,\n    total_bytes: 100,\n    error_message: String::new(),\n    created_at: \"1700000000\".to_string(),\n    proxy_url: String::new(),\n    queue_id: String::new(),\n    checksum: String::new(),\n    ignore_tls_errors: false,\n    file_missing: false,\n    completed_at: String::new(),\n    segments: 0,\n    queue_order: 0,\n    uploaded_bytes: 0,\n    uploaded_at_completion: 0,\n    seeding_status: 0,\n    seeding_message: String::new(),\n    seeding_time_secs: 0,\n    seed_ratio_limit_milli: -2,\n    seed_post_ratio_limit_milli: -2,\n    seed_time_limit_minutes: -2,\n    seed_inactive_time_limit_minutes: -2,\n    seed_upload_limit_bps: 0,\n    referrer: String::new(),\n    group_id: String::new(),\n    rss_source_id: String::new(),\n    origin_url: String::new(),\n    auto_route: String::new(),\n};\nlet dto = TaskDto::from(info);\nassert_eq!(dto.task_id, \"t1\");\nlet json = serde_json::to_string(&dto).unwrap();\nassert!(json.contains(\"\\\"taskId\\\":\\\"t1\\\"\"));\n```",
         "required": [
           "taskId",
           "url",
@@ -4443,6 +4448,11 @@
             "type": "integer",
             "format": "int32",
             "description": "BT 做种状态：0=无, 1=做种中, 2=达分享率, 3=达时长, 4=用户停止,\n5=任务删除, 6=会话释放, 7=不活跃停止, 8=排队等待做种槽。"
+          },
+          "seedingTimeSecs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "累计做种秒数（活跃做种期间累加；排队/暂停不计，非 BT 任务恒 0）。"
           },
           "status": {
             "type": "integer",

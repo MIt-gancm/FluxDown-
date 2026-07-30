@@ -3189,6 +3189,12 @@ class _DownloadContent extends StatelessWidget {
                   vertical: true,
                   child: _SpeedLimitInput(settingsProvider: settingsProvider),
                 ),
+                _SettingRow(
+                  label: s.uploadLimit,
+                  description: s.uploadLimitDesc,
+                  vertical: true,
+                  child: _UploadLimitInput(settingsProvider: settingsProvider),
+                ),
               ],
             ),
             _SettingsGroup(
@@ -3301,6 +3307,22 @@ class _BtBasicContent extends StatelessWidget {
         return Column(
           children: [
             _SettingCard(
+              label: LocaleScope.of(context).btEnableDht,
+              description: LocaleScope.of(context).btEnableDhtDesc,
+              child: ShadSwitch(
+                value: settingsProvider.btEnableDht,
+                onChanged: settingsProvider.setBtEnableDht,
+              ),
+            ),
+            _SettingCard(
+              label: LocaleScope.of(context).btEnableUpnp,
+              description: LocaleScope.of(context).btEnableUpnpDesc,
+              child: ShadSwitch(
+                value: settingsProvider.btEnableUpnp,
+                onChanged: settingsProvider.setBtEnableUpnp,
+              ),
+            ),
+            _SettingCard(
               label: LocaleScope.of(context).btListenPort,
               description: LocaleScope.of(context).btListenPortDesc,
               vertical: true,
@@ -3392,10 +3414,23 @@ class _BtSeedingContent extends StatelessWidget {
               ),
             ),
             _SettingCard(
-              label: LocaleScope.of(context).btSeedingTitle,
-              description: LocaleScope.of(context).btSeedingTitle,
-              vertical: true,
-              child: _BtSeedingEditor(settingsProvider: settingsProvider),
+              label: LocaleScope.of(context).btAutoReseed,
+              description: LocaleScope.of(context).btAutoReseedDesc,
+              child: ShadSwitch(
+                value: settingsProvider.btAutoReseed,
+                onChanged: settingsProvider.setBtAutoReseed,
+              ),
+            ),
+            // 做种限制编辑器实高≈7行：显式权重让前两张小卡合入左列，
+            // 避免右列一家独大、左列空置。
+            _WeightedSection(
+              weight: 7,
+              child: _SettingCard(
+                label: LocaleScope.of(context).btSeedingTitle,
+                description: LocaleScope.of(context).btSeedingTitle,
+                vertical: true,
+                child: _BtSeedingEditor(settingsProvider: settingsProvider),
+              ),
             ),
           ],
         );
@@ -4107,6 +4142,71 @@ class _SpeedLimitInputState extends State<_SpeedLimitInput> {
   void _onSubmit(String value) {
     final kbps = int.tryParse(value) ?? 0;
     widget.settingsProvider.setSpeedLimitBytes(kbps * 1024);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    return Row(
+      children: [
+        SizedBox(
+          width: 120,
+          child: ShadInput(
+            controller: _controller,
+            placeholder: const Text('0'),
+            onSubmitted: _onSubmit,
+            onChanged: _onSubmit,
+          ),
+        ),
+        const SizedBox(width: 8),
+        Text(
+          currentS.speedLimitUnit,
+          style: TextStyle(fontSize: 12, color: c.textMuted),
+        ),
+      ],
+    );
+  }
+}
+
+/// 全局上传限速输入（仅作用于 BT 上传，含做种；KB/s 输入，0 = 不限）。
+class _UploadLimitInput extends StatefulWidget {
+  final SettingsProvider settingsProvider;
+
+  const _UploadLimitInput({required this.settingsProvider});
+
+  @override
+  State<_UploadLimitInput> createState() => _UploadLimitInputState();
+}
+
+class _UploadLimitInputState extends State<_UploadLimitInput> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    final kbps = widget.settingsProvider.uploadLimitBytes ~/ 1024;
+    _controller = TextEditingController(text: kbps == 0 ? '0' : '$kbps');
+  }
+
+  @override
+  void didUpdateWidget(_UploadLimitInput oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    final kbps = widget.settingsProvider.uploadLimitBytes ~/ 1024;
+    final current = int.tryParse(_controller.text) ?? 0;
+    if (kbps != current) {
+      _controller.text = kbps == 0 ? '0' : '$kbps';
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onSubmit(String value) {
+    final kbps = int.tryParse(value) ?? 0;
+    widget.settingsProvider.setUploadLimitBytes(kbps * 1024);
   }
 
   @override

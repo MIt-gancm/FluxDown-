@@ -67,6 +67,7 @@ use selection::{HostSelection, SelectionOutcome};
 /// let config = EngineConfig {
 ///     max_concurrent: 5,
 ///     speed_limit_bps: 0,
+///     upload_limit_bps: 0,
 ///     default_save_dir: "/tmp/downloads".to_string(),
 ///     app_data_dir: "/tmp/fluxdown".to_string(),
 ///     bt_config: BtConfig::default(),
@@ -80,6 +81,9 @@ use selection::{HostSelection, SelectionOutcome};
 pub struct EngineConfig {
     pub max_concurrent: usize,
     pub speed_limit_bps: u64,
+    /// 全局 BT 上传限速（B/s，0 = 不限）。与 `speed_limit_bps` 解耦：
+    /// 后者只管下载，本字段管 BT 上传（下载期上传 + 做种）。
+    pub upload_limit_bps: u64,
     pub default_save_dir: String,
     pub app_data_dir: String,
     pub bt_config: BtConfig,
@@ -128,6 +132,7 @@ pub enum EngineError {
 /// let config = EngineConfig {
 ///     max_concurrent: 5,
 ///     speed_limit_bps: 0,
+///     upload_limit_bps: 0,
 ///     default_save_dir: "/tmp/downloads".to_string(),
 ///     app_data_dir: "/tmp/fluxdown".to_string(),
 ///     bt_config: BtConfig::default(),
@@ -206,6 +211,7 @@ impl Engine {
             DownloadManagerConfig {
                 max_concurrent: config.max_concurrent,
                 speed_limit_bps: config.speed_limit_bps,
+                upload_limit_bps: config.upload_limit_bps,
                 default_save_dir: config.default_save_dir,
                 app_data_dir: config.app_data_dir,
                 data_dir: data_dir.clone(),

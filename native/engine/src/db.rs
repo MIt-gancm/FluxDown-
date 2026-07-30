@@ -81,7 +81,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     seed_ratio_limit_milli INTEGER NOT NULL DEFAULT -2,
     seed_post_ratio_limit_milli INTEGER NOT NULL DEFAULT -2,
     seed_time_limit_minutes INTEGER NOT NULL DEFAULT -2,
-    seed_inactive_time_limit_minutes INTEGER NOT NULL DEFAULT -2
+    seed_inactive_time_limit_minutes INTEGER NOT NULL DEFAULT -2,
+    seed_upload_limit_bps INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS task_segments (
     task_id TEXT NOT NULL,
@@ -105,6 +106,7 @@ CREATE TABLE IF NOT EXISTS queues (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     speed_limit_kbps INTEGER NOT NULL DEFAULT 0,
+    upload_limit_kbps INTEGER NOT NULL DEFAULT 0,
     max_concurrent INTEGER NOT NULL DEFAULT 0,
     default_save_dir TEXT NOT NULL DEFAULT '',
     position INTEGER NOT NULL DEFAULT 0,
@@ -259,7 +261,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     seed_ratio_limit_milli INTEGER NOT NULL DEFAULT -2,
     seed_post_ratio_limit_milli INTEGER NOT NULL DEFAULT -2,
     seed_time_limit_minutes INTEGER NOT NULL DEFAULT -2,
-    seed_inactive_time_limit_minutes INTEGER NOT NULL DEFAULT -2
+    seed_inactive_time_limit_minutes INTEGER NOT NULL DEFAULT -2,
+    seed_upload_limit_bps BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS task_segments (
     task_id TEXT NOT NULL,
@@ -283,6 +286,7 @@ CREATE TABLE IF NOT EXISTS queues (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     speed_limit_kbps BIGINT NOT NULL DEFAULT 0,
+    upload_limit_kbps BIGINT NOT NULL DEFAULT 0,
     max_concurrent INTEGER NOT NULL DEFAULT 0,
     default_save_dir TEXT NOT NULL DEFAULT '',
     position INTEGER NOT NULL DEFAULT 0,
@@ -444,12 +448,14 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
         uploaded_at_completion: row.try_get("uploaded_at_completion").unwrap_or_default(),
         seeding_status: row.try_get("seeding_status").unwrap_or_default(),
         seeding_message: row.try_get("seeding_message").unwrap_or_default(),
+        seeding_time_secs: row.try_get("seeding_time_secs").unwrap_or_default(),
         seed_ratio_limit_milli: row.try_get("seed_ratio_limit_milli").unwrap_or(-2),
         seed_post_ratio_limit_milli: row.try_get("seed_post_ratio_limit_milli").unwrap_or(-2),
         seed_time_limit_minutes: row.try_get("seed_time_limit_minutes").unwrap_or(-2),
         seed_inactive_time_limit_minutes: row
             .try_get("seed_inactive_time_limit_minutes")
             .unwrap_or(-2),
+        seed_upload_limit_bps: row.try_get("seed_upload_limit_bps").unwrap_or(0),
         referrer: row.try_get("referrer").unwrap_or_default(),
         group_id: row.try_get("group_id").unwrap_or_default(),
         rss_source_id: row.try_get("rss_source_id").unwrap_or_default(),
@@ -458,7 +464,7 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
     })
 }
 
-const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, referrer, group_id, rss_source_id, origin_url, auto_route";
+const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, referrer, group_id, rss_source_id, origin_url, auto_route";
 
 /// 把 `AnyRow` 映射为 [`GroupInfo`]。
 fn group_from_row(row: &AnyRow) -> Result<GroupInfo, sqlx::Error> {
@@ -695,6 +701,22 @@ impl Db {
             "tasks",
             "seed_inactive_time_limit_minutes",
             "INTEGER NOT NULL DEFAULT -2",
+        )
+        .await?;
+        // 任务级做种上传限速（B/s；0 = 无单任务限制）。add 时烘焙进
+        // librqbit AddTorrentOptions，live 句柄不热改。
+        self.add_column_if_missing(
+            "tasks",
+            "seed_upload_limit_bps",
+            "BIGINT NOT NULL DEFAULT 0",
+        )
+        .await?;
+        // 队列级上传限速（KB/s；0 = 不限）。BT add/re-add 时与任务级
+        // 覆盖一起折算成 librqbit 上传上限，见 download_manager。
+        self.add_column_if_missing(
+            "queues",
+            "upload_limit_kbps",
+            "BIGINT NOT NULL DEFAULT 0",
         )
         .await?;
         Ok(())
@@ -1105,7 +1127,8 @@ impl Db {
     }
 
     /// 写入任务级做种限制覆盖（哨兵：-2 跟随全局、-1 不限、>=0 自定义；
-    /// 比率为千分比）。小于 -2 的入参钳到 -2。
+    /// 比率为千分比）。小于 -2 的入参钳到 -2。`upload_limit_bps` 为
+    /// 任务级做种上传限速（B/s），0 = 无限制，负值钳到 0。
     pub async fn set_task_seed_limits(
         &self,
         task_id: &str,
@@ -1113,15 +1136,18 @@ impl Db {
         post_ratio_limit_milli: i64,
         seed_time_limit_minutes: i64,
         inactive_time_limit_minutes: i64,
+        upload_limit_bps: i64,
     ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE tasks SET seed_ratio_limit_milli = $1, seed_post_ratio_limit_milli = $2, \
-             seed_time_limit_minutes = $3, seed_inactive_time_limit_minutes = $4 WHERE id = $5",
+             seed_time_limit_minutes = $3, seed_inactive_time_limit_minutes = $4, \
+             seed_upload_limit_bps = $5 WHERE id = $6",
         )
         .bind(ratio_limit_milli.max(-2))
         .bind(post_ratio_limit_milli.max(-2))
         .bind(seed_time_limit_minutes.max(-2))
         .bind(inactive_time_limit_minutes.max(-2))
+        .bind(upload_limit_bps.max(0))
         .bind(task_id)
         .execute(&self.pool)
         .await?;
@@ -1873,6 +1899,12 @@ impl Db {
             ("cdn_max_nodes", "0"),
             ("max_concurrent_tasks", "5"),
             ("speed_limit_bytes", "0"),
+            // 全局 BT 上传限速（B/s）："0" = 不限。与 speed_limit_bytes
+            // 解耦：后者只管下载，本键管 BT 上传（下载期上传 + 做种）。
+            ("upload_limit_bytes", "0"),
+            // 启动自动续种："1" = 上次退出时仍在做种/排队的已完成任务，
+            // 重启后自动重新挂载做种；"0" = 保持停止态。
+            ("bt_auto_reseed", "1"),
             // 自动重试：-1=无限，0=关闭，1..10=次数。延迟（秒）固定基值×已重试次数。
             ("max_auto_retries", "3"),
             ("auto_retry_delay_secs", "5"),
@@ -2373,6 +2405,7 @@ impl Db {
         id: &str,
         name: &str,
         speed_limit_kbps: i64,
+        upload_limit_kbps: i64,
         max_concurrent: i32,
         default_save_dir: &str,
         position: i32,
@@ -2380,12 +2413,13 @@ impl Db {
         default_user_agent: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO queues (id, name, speed_limit_kbps, max_concurrent, default_save_dir, position, default_segments, default_user_agent)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO queues (id, name, speed_limit_kbps, upload_limit_kbps, max_concurrent, default_save_dir, position, default_segments, default_user_agent)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(id)
         .bind(name)
         .bind(speed_limit_kbps)
+        .bind(upload_limit_kbps)
         .bind(max_concurrent)
         .bind(default_save_dir)
         .bind(position)
@@ -2403,17 +2437,19 @@ impl Db {
         id: &str,
         name: &str,
         speed_limit_kbps: i64,
+        upload_limit_kbps: i64,
         max_concurrent: i32,
         default_save_dir: &str,
         default_segments: i32,
         default_user_agent: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE queues SET name = $1, speed_limit_kbps = $2, max_concurrent = $3, \
-             default_save_dir = $4, default_segments = $5, default_user_agent = $6 WHERE id = $7",
+            "UPDATE queues SET name = $1, speed_limit_kbps = $2, upload_limit_kbps = $3, max_concurrent = $4, \
+             default_save_dir = $5, default_segments = $6, default_user_agent = $7 WHERE id = $8",
         )
         .bind(name)
         .bind(speed_limit_kbps)
+        .bind(upload_limit_kbps)
         .bind(max_concurrent)
         .bind(default_save_dir)
         .bind(default_segments)
@@ -2444,7 +2480,7 @@ impl Db {
     /// Load all named queues ordered by position.
     pub async fn load_all_queues(&self) -> Result<Vec<QueueInfo>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, name, speed_limit_kbps, max_concurrent, default_save_dir, position, default_segments, default_user_agent, is_running, schedule_enabled, schedule_start, schedule_stop, schedule_days
+            "SELECT id, name, speed_limit_kbps, upload_limit_kbps, max_concurrent, default_save_dir, position, default_segments, default_user_agent, is_running, schedule_enabled, schedule_start, schedule_stop, schedule_days
              FROM queues ORDER BY position ASC",
         )
         .fetch_all(&self.pool)
@@ -2455,6 +2491,8 @@ impl Db {
                 queue_id: row.try_get("id")?,
                 name: row.try_get("name")?,
                 speed_limit_kbps: row.try_get("speed_limit_kbps")?,
+                // 迁移新增列：旧库缺列时回退 0（不限）。
+                upload_limit_kbps: row.try_get("upload_limit_kbps").unwrap_or(0),
                 max_concurrent: row.try_get("max_concurrent")?,
                 default_save_dir: row.try_get("default_save_dir")?,
                 position: row.try_get("position")?,
@@ -3729,6 +3767,45 @@ mod tests {
             .expect("load renamed")
             .expect("exists");
         assert_eq!(renamed.name, "新名字");
+
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn seed_upload_limit_column_roundtrip() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "t-seed").await;
+        // 新库/迁移库默认 0（无单任务限制）。
+        let task = db
+            .load_task_by_id("t-seed")
+            .await
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(task.seed_upload_limit_bps, 0);
+
+        db.set_task_seed_limits("t-seed", 1500, -1, -2, 30, 256_000)
+            .await
+            .expect("set seed limits");
+        let task = db
+            .load_task_by_id("t-seed")
+            .await
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(task.seed_ratio_limit_milli, 1500);
+        assert_eq!(task.seed_inactive_time_limit_minutes, 30);
+        assert_eq!(task.seed_upload_limit_bps, 256_000);
+
+        // 负值钳到 0（无限制）；比率哨兵钳到 -2。
+        db.set_task_seed_limits("t-seed", -9, -2, -2, -2, -5)
+            .await
+            .expect("set seed limits");
+        let task = db
+            .load_task_by_id("t-seed")
+            .await
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(task.seed_ratio_limit_milli, -2);
+        assert_eq!(task.seed_upload_limit_bps, 0);
 
         close_test_db(&db, dir).await;
     }
@@ -5220,7 +5297,7 @@ mod tests {
         let (db, dir) = open_test_db().await;
         // 播种前的存量数据：queue_id='' 任务 + 一个自定义队列（position 0）。
         insert_task(&db, "legacy").await;
-        db.insert_queue("custom", "我的队列", 0, 0, "", 0, 0, "")
+        db.insert_queue("custom", "我的队列", 0, 0, 0, "", 0, 0, "")
             .await
             .expect("insert custom queue");
 
@@ -5251,6 +5328,39 @@ mod tests {
                 .as_deref(),
             Some(MAIN_QUEUE_ID)
         );
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn queue_upload_limit_column_roundtrip() {
+        let (db, dir) = open_test_db().await;
+        // 建队列时写入两级限速；新库/迁移库缺省 0（不限）。
+        db.insert_queue("q-up", "上传限速", 100, 512, 0, "", 0, 0, "")
+            .await
+            .expect("insert queue");
+        let q = db
+            .load_all_queues()
+            .await
+            .expect("load queues")
+            .into_iter()
+            .find(|q| q.queue_id == "q-up")
+            .expect("queue exists");
+        assert_eq!(q.speed_limit_kbps, 100);
+        assert_eq!(q.upload_limit_kbps, 512);
+
+        // 更新路径独立持久化上传限速；0 回落为「不限」。
+        db.update_queue("q-up", "上传限速", 100, 0, 0, "", 0, "")
+            .await
+            .expect("update queue");
+        let q = db
+            .load_all_queues()
+            .await
+            .expect("load queues")
+            .into_iter()
+            .find(|q| q.queue_id == "q-up")
+            .expect("queue exists");
+        assert_eq!(q.upload_limit_kbps, 0, "0 persists as unlimited");
+
         close_test_db(&db, dir).await;
     }
 
@@ -5361,7 +5471,7 @@ mod tests {
         assert_eq!(x.queue_id, "q3");
         assert_eq!(x.queue_order, 1, "first task in the target queue");
 
-        db.insert_queue("q2", "Q2", 0, 0, "", 9, 0, "")
+        db.insert_queue("q2", "Q2", 0, 0, 0, "", 9, 0, "")
             .await
             .expect("queue row");
         db.delete_queue("q2").await.expect("delete");

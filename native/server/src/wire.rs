@@ -182,6 +182,8 @@ pub enum WsServerMsg {
         seeding_status: i32,
         /// 做种停止原因的人类可读描述（无则为空）。
         seeding_message: String,
+        /// 累计做种秒数（发帧时刻；排队/暂停不计，非 BT 任务恒 0）。
+        seeding_time_secs: i64,
     },
     /// 全部任务快照（连接建立时 + 引擎主动广播）。
     TasksSnapshot { tasks: Vec<TaskDto> },
@@ -356,12 +358,16 @@ pub enum WsClientMsg {
     },
     /// 设置单任务做种限制覆盖（qBittorrent 三态语义：-2 = 跟随全局，
     /// -1 = 不限制，>=0 = 自定义，0 视同不限制；分享率为千分比）。
+    /// `upload_limit_bps` 为任务级做种上传限速（B/s，0 = 不限），在
+    /// 下一次 torrent add 时烘焙生效。
     SetTaskSeedLimits {
         task_id: String,
         ratio_limit_milli: i64,
         post_ratio_limit_milli: i64,
         seed_time_limit_minutes: i64,
         inactive_time_limit_minutes: i64,
+        #[serde(default)]
+        upload_limit_bps: i64,
     },
     /// RTT 测量，服务端回 `pong`。
     Ping {},
@@ -417,6 +423,8 @@ pub struct CreateQueueRequest {
     pub name: String,
     #[serde(default)]
     pub speed_limit_kbps: i64,
+    #[serde(default)]
+    pub upload_limit_kbps: i64,
     #[serde(default)]
     pub max_concurrent: i32,
     #[serde(default)]
@@ -785,6 +793,7 @@ mod tests {
             uploaded_bytes: 42,
             seeding_status: 1,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"taskProgress\""));
@@ -857,12 +866,15 @@ mod tests {
                 post_ratio_limit_milli,
                 seed_time_limit_minutes,
                 inactive_time_limit_minutes,
+                upload_limit_bps,
             } => {
                 assert_eq!(task_id, "t5");
                 assert_eq!(ratio_limit_milli, 1500);
                 assert_eq!(post_ratio_limit_milli, -1);
                 assert_eq!(seed_time_limit_minutes, -2);
                 assert_eq!(inactive_time_limit_minutes, 30);
+                // 旧客户端不带 uploadLimitBps → serde default 0。
+                assert_eq!(upload_limit_bps, 0);
             }
             other => panic!("unexpected variant: {other:?}"),
         }
@@ -934,6 +946,7 @@ mod tests {
             uploaded_at_completion: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
             seed_ratio_limit_milli: -2,
             seed_post_ratio_limit_milli: -2,
             seed_time_limit_minutes: -2,
@@ -946,6 +959,7 @@ mod tests {
             queue_id: id.to_string(),
             name: "工作队列".into(),
             speed_limit_kbps: 512,
+            upload_limit_kbps: 128,
             max_concurrent: 3,
             default_save_dir: "/downloads/work".into(),
             position: 1,

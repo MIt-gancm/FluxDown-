@@ -44,6 +44,8 @@ pub enum EngineEvent {
         seeding_status: i32,
         /// BT 做种状态的辅助说明（如停止原因）。无错误/未做种时为空。
         seeding_message: String,
+        /// 累计做种秒数（发帧时刻；排队/暂停不计）。仅 BT 任务有意义。
+        seeding_time_secs: i64,
     },
 
     /// BT 任务数据下载完成(piece 全部下完),但校验与 staging→save_dir

@@ -16,6 +16,7 @@ import 'overflow_tooltip_text.dart';
 import 'edit_threads_dialog.dart';
 import 'flux_sonner.dart';
 import 'view_options_panel.dart';
+import 'seeding_summary_bar.dart';
 import 'task_columns.dart';
 import 'task_group_card.dart';
 import 'task_list_item.dart';
@@ -228,6 +229,9 @@ class _TaskListState extends State<TaskList> {
                 // 「显示选项」入口已从 titlebar 移到此处（用户决策），
                 // 网格形态必须保留可达入口。
                 _buildHeader(context, prefs, listWidth),
+                // 做种筛选下的总览汇总条：做种数/排队数/总上传速度/累计上传量。
+                if (widget.controller.statusTab == StatusTab.seeding)
+                  SeedingSummaryBar(controller: widget.controller),
                 Expanded(
                   child: Stack(
                     children: [

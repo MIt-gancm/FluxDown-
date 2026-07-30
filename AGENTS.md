@@ -182,7 +182,7 @@ FluxDown/
 - `task_groups`(id PK, name, source_url, save_dir, created_at)
 - `config`(key PK, value)——**所有设置键**都存这里
 - `torrent_files`(task_id PK, file_bytes BLOB)
-- `queues`(id PK, name, speed_limit_kbps, max_concurrent, default_save_dir, position, default_segments, default_user_agent, is_running, schedule_enabled/start/stop, schedule_days 位掩码)
+- `queues`(id PK, name, speed_limit_kbps, upload_limit_kbps, max_concurrent, default_save_dir, position, default_segments, default_user_agent, is_running, schedule_enabled/start/stop, schedule_days 位掩码)
 - `ed2k_blocks`(复合 PK task_id+block_index, state, downloaded_bytes, retry_count)
 - `ed2k_hashset`(task_id PK, hashes BLOB)
 - `task_artifacts`(复合 PK task_id+file_name；追踪 sidecar/产物文件供清理)

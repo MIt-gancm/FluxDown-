@@ -422,6 +422,7 @@ mod tests {
             uploaded_at_completion: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
             seed_ratio_limit_milli: -2,
             seed_post_ratio_limit_milli: -2,
             seed_time_limit_minutes: -2,

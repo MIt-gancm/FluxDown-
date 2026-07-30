@@ -189,6 +189,7 @@ impl EventSink for EngineEventSink {
                 uploaded_bytes,
                 seeding_status,
                 seeding_message,
+                seeding_time_secs,
                 ..
             } => {
                 // 实时速率缓存：downloading(1)/preparing(5) 或做种中
@@ -230,6 +231,7 @@ impl EventSink for EngineEventSink {
                     uploaded_bytes,
                     seeding_status,
                     seeding_message,
+                    seeding_time_secs,
                 }
             }
             EngineEvent::TasksSnapshot(tasks) => {
@@ -571,6 +573,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
 
         let json = rx.recv().await.expect("broadcast recv");
@@ -606,6 +609,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
 
         let speeds = hub.live_speeds_snapshot();
@@ -683,6 +687,7 @@ mod tests {
             queue_id: "q1".into(),
             name: "work".into(),
             speed_limit_kbps: 256,
+            upload_limit_kbps: 64,
             max_concurrent: 2,
             default_save_dir: "/downloads/work".into(),
             position: 0,
@@ -924,6 +929,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         let snap = hub.live_speeds_snapshot();
         assert_eq!(snap.get("t1").map(|s| s.download_bps), Some(4096));
@@ -942,6 +948,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         assert!(
             !hub.live_speeds_snapshot().contains_key("t1"),
@@ -971,6 +978,7 @@ mod tests {
             uploaded_bytes: 512,
             seeding_status: 1, // seeding
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         assert_eq!(
             hub.live_speeds_snapshot().get("bt1").map(|s| s.upload_bps),
@@ -992,6 +1000,7 @@ mod tests {
             uploaded_bytes: 4096,
             seeding_status: 3, // stopped: limit reached
             seeding_message: "ratio limit reached".into(),
+            seeding_time_secs: 0,
         });
         assert!(
             !hub.live_speeds_snapshot().contains_key("bt1"),
@@ -1019,6 +1028,7 @@ mod tests {
                 uploaded_bytes: 0,
                 seeding_status: 0,
                 seeding_message: String::new(),
+                seeding_time_secs: 0,
             });
         }
         assert_eq!(hub.live_speeds_snapshot().len(), 2);
@@ -1047,10 +1057,12 @@ mod tests {
             uploaded_at_completion: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
             seed_ratio_limit_milli: -2,
             seed_post_ratio_limit_milli: -2,
             seed_time_limit_minutes: -2,
             seed_inactive_time_limit_minutes: -2,
+            seed_upload_limit_bps: 0,
             referrer: String::new(),
             group_id: String::new(),
             rss_source_id: String::new(),
@@ -1086,10 +1098,12 @@ mod tests {
             uploaded_at_completion: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
             seed_ratio_limit_milli: -2,
             seed_post_ratio_limit_milli: -2,
             seed_time_limit_minutes: -2,
             seed_inactive_time_limit_minutes: -2,
+            seed_upload_limit_bps: 0,
             referrer: String::new(),
             group_id: String::new(),
             rss_source_id: String::new(),
@@ -1267,6 +1281,7 @@ mod tests {
                 uploaded_bytes: 0,
                 seeding_status: 0,
                 seeding_message: String::new(),
+                seeding_time_secs: 0,
             }
         }
 
@@ -1312,6 +1327,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         assert_eq!(
             rx.recv().await.expect("start event").kind,
@@ -1334,6 +1350,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         assert!(
             matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty)),
@@ -1371,6 +1388,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         assert_eq!(
             rx.recv().await.expect("start event").kind,
@@ -1391,6 +1409,7 @@ mod tests {
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
+            seeding_time_secs: 0,
         });
         assert_eq!(
             rx.recv().await.expect("complete event").kind,

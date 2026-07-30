@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
@@ -482,6 +482,7 @@ impl SharedBtSession {
         default_save_dir: &str,
         app_data_dir: &str,
         speed_limit_bps: u64,
+        upload_limit_bps: u64,
         bt_config: &BtConfig,
     ) -> Result<Self, DownloadError> {
         // Scale worker threads with CPU cores.  BT workload is mostly I/O-bound
@@ -517,7 +518,7 @@ impl SharedBtSession {
         let total_tracker_count = trackers.len();
 
         let download_bps = NonZeroU32::new(speed_limit_bps.min(u32::MAX as u64) as u32);
-        let upload_bps = NonZeroU32::new(speed_limit_bps.min(u32::MAX as u64) as u32);
+        let upload_bps = NonZeroU32::new(upload_limit_bps.min(u32::MAX as u64) as u32);
 
         // Persistence folder: store session.json + {hash}.bitv + {hash}.torrent
         // in the app data directory (next to flux_down.db), NOT in the user's
@@ -679,13 +680,14 @@ impl SharedBtSession {
         }
 
         log_info!(
-            "[BT] shared session created (DHT={}, UPnP={}, ports={}-{}, {} trackers, speed_limit={} B/s, worker_threads={}, persistence=on)",
+            "[BT] shared session created (DHT={}, UPnP={}, ports={}-{}, {} trackers, speed_limit={} B/s, upload_limit={} B/s, worker_threads={}, persistence=on)",
             enable_dht,
             enable_upnp,
             port_start,
             port_end,
             total_tracker_count,
             speed_limit_bps,
+            upload_limit_bps,
             worker_threads
         );
 
@@ -859,6 +861,84 @@ impl SharedBtSession {
     /// Returns `true` if any completed torrent is seeding or queued to seed.
     pub async fn has_seeders(&self) -> bool {
         self.seeding.total_count().await > 0
+    }
+
+    /// 从磁盘已有数据重新挂载一个已完成的 torrent 用于做种（应用重启后
+    /// 句柄丢失时的恢复路径）。
+    ///
+    /// 以 `paused: true` 添加——librqbit 仍会执行初始文件校验（Initializing
+    /// → Paused），随后仅当全部选中数据完整（`stats.finished`）才缓存句柄
+    /// 并返回；数据缺失/重命名不匹配时把 torrent 从会话移除（保留磁盘
+    /// 文件），**绝不**让它进入下载态。成功返回的句柄处于暂停态，由调用
+    /// 方决定解除暂停（活跃做种）或保持暂停（排队做种）。
+    pub async fn readd_for_seeding(
+        &self,
+        task_id: &str,
+        source: TorrentSource,
+        output_folder: String,
+        only_files: Option<Vec<usize>>,
+        upload_limit_bps: u64,
+    ) -> Result<BtHandle, String> {
+        let add_input = match source {
+            TorrentSource::Magnet(ref url) => AddTorrent::from_url(url),
+            TorrentSource::TorrentFileBytes(ref bytes) => {
+                AddTorrent::from_bytes(Bytes::from(bytes.clone()))
+            }
+        };
+        let opts = AddTorrentOptions {
+            overwrite: true,
+            output_folder: Some(output_folder),
+            only_files,
+            paused: true,
+            ratelimits: task_ratelimits(upload_limit_bps),
+            ..Default::default()
+        };
+        let response = self
+            .session
+            .add_torrent(add_input, Some(opts))
+            .await
+            .map_err(|e| format!("add torrent failed: {e:#}"))?;
+        let handle = match response {
+            AddTorrentResponse::Added(_, handle)
+            | AddTorrentResponse::AlreadyManaged(_, handle) => handle,
+            AddTorrentResponse::ListOnly(_) => {
+                return Err("unexpected list-only response".to_string());
+            }
+        };
+        // 等初始校验完成。超时按失败处理（校验仍在后台继续，用户可稍后
+        // 重试「继续做种」）。
+        match tokio::time::timeout(
+            Duration::from_secs(15 * 60),
+            handle.wait_until_initialized(),
+        )
+        .await
+        {
+            Err(_) => return Err("local data check timed out".to_string()),
+            Ok(Err(e)) => return Err(format!("local data check failed: {e:#}")),
+            Ok(Ok(())) => {}
+        }
+        let stats = handle.stats();
+        if !stats.finished {
+            // 数据不完整（被移动/重命名/删除）：移除会话条目、保留磁盘
+            // 文件，避免任何形式的重新下载。
+            if let Err(e) = self.session.delete(handle.id().into(), false).await {
+                log_info!(
+                    "[BT] task={} reseed cleanup failed: {}",
+                    short_id(task_id),
+                    e
+                );
+            }
+            return Err(format!(
+                "local data incomplete ({} / {} bytes)",
+                stats.progress_bytes, stats.total_bytes
+            ));
+        }
+        self.store_handle(task_id, handle.clone()).await;
+        log_info!(
+            "[BT] task={} re-added from disk for seeding",
+            short_id(task_id)
+        );
+        Ok(handle)
     }
 
     /// Gracefully shut down the BT session and runtime.
@@ -1046,6 +1126,9 @@ pub struct BtDownloadParams {
     pub custom_name: String,
     /// 需要宿主介入决策的文件选择接口(HostSelection)。
     pub selector: Arc<dyn HostSelection>,
+    /// 任务级做种上传限速（B/s，0 = 无限制）。add 时烘焙进
+    /// `AddTorrentOptions.ratelimits`，live 句柄不热改。
+    pub upload_limit_bps: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1132,6 +1215,7 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
         skip_file_selection: params.skip_file_selection,
         custom_name: params.custom_name,
         selector: params.selector,
+        upload_limit_bps: params.upload_limit_bps,
     };
     let result = bt_runtime
         .spawn(async move { bt_download_inner(inner_params).await })
@@ -1222,6 +1306,8 @@ struct BtInnerParams {
     custom_name: String,
     /// 需要宿主介入决策的文件选择接口(HostSelection)。
     selector: Arc<dyn HostSelection>,
+    /// 任务级做种上传限速（B/s，0 = 无限制），forwarded from BtDownloadParams。
+    upload_limit_bps: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -2706,12 +2792,24 @@ impl BtSelectionStrategy {
 pub fn build_add_torrent_options(
     strategy: &BtSelectionStrategy,
     output_folder: String,
+    upload_limit_bps: u64,
 ) -> AddTorrentOptions {
     AddTorrentOptions {
         overwrite: true,
         output_folder: Some(output_folder),
         only_files: strategy.only_files_for_add(),
+        ratelimits: task_ratelimits(upload_limit_bps),
         ..Default::default()
+    }
+}
+
+/// 任务级限速 → librqbit torrent 级 [`librqbit::limits::LimitsConfig`]。
+/// 只在 add 时烘焙一次（librqbit 8.1.1 无 per-torrent 热更 API）；与会话级
+/// 限速两层叠加。`0` = 无任务级上传限制，下载侧恒不设任务级限制。
+pub fn task_ratelimits(upload_limit_bps: u64) -> librqbit::limits::LimitsConfig {
+    librqbit::limits::LimitsConfig {
+        upload_bps: NonZeroU32::new(upload_limit_bps.min(u32::MAX as u64) as u32),
+        download_bps: None,
     }
 }
 
@@ -2820,6 +2918,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         skip_file_selection,
         custom_name,
         selector,
+        upload_limit_bps,
     } = p;
 
     // Record whether this is a resume of an existing handle *before*
@@ -2912,7 +3011,8 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 subset.len()
             );
         }
-        let add_opts = build_add_torrent_options(&selection_strategy, stage_dir_str);
+        let add_opts =
+            build_add_torrent_options(&selection_strategy, stage_dir_str, upload_limit_bps);
 
         log_info!(
             "[BT] task={} adding torrent to shared session (metadata resolution may take a while)...",
@@ -3234,6 +3334,18 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     //    Poll until the user confirms or the task is cancelled.
     // -----------------------------------------------------------------------
 
+    // ---- 对话框期间暂停(防「全部文件」抢跑)----------------------------
+    // 交互式选择是 post-add 应用的,而 add 后 librqbit 立即按「全部文件」
+    // 开始下载:用户浏览大种子文件列表的几分钟里,未选文件的数据白下
+    // (带宽 + staging 磁盘)。Path B 弹框前把 torrent 暂停,选择应用后恢复。
+    // Initializing 窗口会拒绝 pause(仅 Live 可暂停),放到后台短退避重试,
+    // 不阻塞对话框弹出;始终失败则退回旧行为(边选边下)。
+    // 状态机:0=尝试中, 1=已暂停, 2=结束(需恢复), 3=结束(保持暂停,用户取消)。
+    const DIALOG_PAUSE_TRYING: u8 = 0;
+    const DIALOG_PAUSE_PAUSED: u8 = 1;
+    const DIALOG_PAUSE_DONE_RESUME: u8 = 2;
+    const DIALOG_PAUSE_DONE_KEEP: u8 = 3;
+    let dialog_pause_state = Arc::new(AtomicU8::new(DIALOG_PAUSE_TRYING));
     let selected_indices: Vec<i32> = if had_existing_handle {
         // Path R — in-memory handle reused, librqbit state intact.
         log_info!(
@@ -3292,6 +3404,46 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+
+        {
+            let state = dialog_pause_state.clone();
+            let session = session.clone();
+            let handle = handle.clone();
+            let tid = task_id.clone();
+            let cancelled = cancelled.clone();
+            tokio::spawn(async move {
+                for _ in 0..20u8 {
+                    if state.load(Ordering::SeqCst) != DIALOG_PAUSE_TRYING
+                        || cancelled.load(Ordering::SeqCst)
+                    {
+                        return;
+                    }
+                    if session.pause(&handle).await.is_ok() {
+                        // 主流程已越过选择阶段(CAS 失败)则按其意图回滚/保留,
+                        // 绝不把任务卡在意外的暂停态。
+                        match state.compare_exchange(
+                            DIALOG_PAUSE_TRYING,
+                            DIALOG_PAUSE_PAUSED,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        ) {
+                            Ok(_) => {
+                                log_info!(
+                                    "[BT] task={} paused during file-selection dialog",
+                                    short_id(&tid)
+                                );
+                            }
+                            Err(DIALOG_PAUSE_DONE_RESUME) => {
+                                let _ = session.unpause(&handle).await;
+                            }
+                            Err(_) => {}
+                        }
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            });
+        }
 
         log_info!(
             "[BT] task={} requesting file selection ({} files) via HostSelection...",
@@ -3364,6 +3516,11 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
     // file selection dialog.  Pause the task (status=2) so the user can
     // resume it later and pick files again, rather than leaving it in an
     // ambiguous state or marking it as error.
+    // 用户取消(-1)会走暂停归宿:叫停对话框暂停尝试并**保持**暂停态
+    // (下面的 pause_task 与 spawn 侧已成功的 pause 目标一致)。
+    if selected_indices.first().copied() == Some(-1) {
+        dialog_pause_state.store(DIALOG_PAUSE_DONE_KEEP, Ordering::SeqCst);
+    }
     if selected_indices.first().copied() == Some(-1) {
         log_info!(
             "[BT] task={} file selection cancelled by user → pausing",
@@ -3464,6 +3621,25 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                         .await;
                     return Err(DownloadError::Other(msg));
                 }
+            }
+        }
+    }
+
+    // 结束对话框暂停:已暂停则恢复下载;仍在尝试中则叫停(spawn 侧 CAS
+    // 失败会按 DONE_RESUME 自行回滚)。用户取消路径在上面已 return。
+    if dialog_pause_state.swap(DIALOG_PAUSE_DONE_RESUME, Ordering::SeqCst) == DIALOG_PAUSE_PAUSED {
+        match session.unpause(&handle).await {
+            Ok(()) => {
+                log_info!(
+                    "[BT] task={} resumed after file selection",
+                    short_id(&task_id)
+                );
+            }
+            Err(e) => {
+                log_info!(
+                    "[BT] task={} unpause after file selection failed: {e:#} — continuing",
+                    short_id(&task_id)
+                );
             }
         }
     }
@@ -4151,6 +4327,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     uploaded_bytes: completed_uploaded_bytes,
                     seeding_status,
                     seeding_message: seeding_message.to_string(),
+                    seeding_time_secs: seed_time_base,
                 })
                 .await;
 

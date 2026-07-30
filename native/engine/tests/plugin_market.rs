@@ -49,6 +49,7 @@ async fn make_engine(work: &std::path::Path) -> Engine {
     let cfg = EngineConfig {
         max_concurrent: 4,
         speed_limit_bps: 0,
+        upload_limit_bps: 0,
         default_save_dir: work.to_string_lossy().into_owned(),
         app_data_dir: work.to_string_lossy().into_owned(),
         bt_config: BtConfig::default(),
