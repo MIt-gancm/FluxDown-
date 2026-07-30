@@ -129,6 +129,7 @@ class SettingsProvider extends ChangeNotifier {
       'stop'; // 满足条件后动作：'stop' / 'delete' / 'delete_files'
   int _btSeedMaxActive = 0; // 最大同时活动做种任务数（0=不限制，超出的完成任务排队等待）
   bool _btAutoReseed = true; // 启动时自动继续做种（非用户手动停止的已完成任务）
+  bool _btSeedEnabled = true; // 完成后自动做种（关闭则 BT 任务完成即停止做种）
 
   // 临时缓存：开关关闭时保留上次输入的数值，再次打开时恢复。
   double _btSeedRatioLimitCached = 1.0;
@@ -388,6 +389,7 @@ class SettingsProvider extends ChangeNotifier {
   String get btSeedThenAction => _btSeedThenAction;
   int get btSeedMaxActive => _btSeedMaxActive;
   bool get btAutoReseed => _btAutoReseed;
+  bool get btSeedEnabled => _btSeedEnabled;
 
   // BT Tracker 订阅 Getters
   bool get btTrackerSubEnabled => _btTrackerSubEnabled;
@@ -1145,6 +1147,13 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('bt_auto_reseed', value ? '1' : '0');
   }
 
+  void setBtSeedEnabled(bool value) {
+    if (_btSeedEnabled == value) return;
+    _btSeedEnabled = value;
+    notifyListeners();
+    _saveToRust('bt_seed_enabled', value ? '1' : '0');
+  }
+
   // 云同步应用做种限制：与引擎 kv 同一编码（value > 0 = 启用并取该值，
   // 0 = 关闭）。关闭时保留内存数值与缓存，用户再次手动开启可恢复。
 
@@ -1749,6 +1758,8 @@ class SettingsProvider extends ChangeNotifier {
           _btSeedMaxActive = int.tryParse(entry.value) ?? 0;
         case 'bt_auto_reseed':
           _btAutoReseed = entry.value != '0';
+        case 'bt_seed_enabled':
+          _btSeedEnabled = entry.value != '0';
         case 'bt_tracker_sub_enabled':
           _btTrackerSubEnabled = entry.value == 'true';
         case 'bt_tracker_sub_urls':

@@ -1226,6 +1226,8 @@
     "btSeedLimitsModeCustom": "Custom",
     "btAutoReseed": "Auto-resume seeding on startup",
     "btAutoReseedDesc": "Automatically continue seeding completed tasks after restart, unless seeding was stopped manually",
+    "btSeedEnabled": "Seed after download completes",
+    "btSeedEnabledDesc": "Automatically start seeding when a BT task finishes downloading. Turn off to stop seeding immediately upon completion",
     "btSeedUploadLimit": "Upload speed limit",
     "btSeedUploadLimitHint": "Upload limit takes effect the next time the task starts or seeding is remounted",
     "seedingSummaryActive": "{n} seeding",

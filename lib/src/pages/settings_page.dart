@@ -3407,6 +3407,14 @@ class _BtSeedingContent extends StatelessWidget {
         return _AdaptiveSections(
           sections: [
             _SettingCard(
+              label: LocaleScope.of(context).btSeedEnabled,
+              description: LocaleScope.of(context).btSeedEnabledDesc,
+              child: ShadSwitch(
+                value: settingsProvider.btSeedEnabled,
+                onChanged: settingsProvider.setBtSeedEnabled,
+              ),
+            ),
+            _SettingCard(
               label: LocaleScope.of(context).btSeedMaxActive,
               description: LocaleScope.of(context).btSeedMaxActiveDesc,
               child: _BtSeedMaxActiveSelector(

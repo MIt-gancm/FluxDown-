@@ -1226,6 +1226,8 @@
     "btSeedLimitsModeCustom": "自定义",
     "btAutoReseed": "启动时自动继续做种",
     "btAutoReseedDesc": "重启后自动为已完成任务继续做种（手动停止做种的任务除外）",
+    "btSeedEnabled": "任务完成后自动做种",
+    "btSeedEnabledDesc": "BT 任务下载完成后自动开始做种；关闭后任务完成即停止做种",
     "btSeedUploadLimit": "上传限速",
     "btSeedUploadLimitHint": "上传限速将在任务下次开始或重新挂载做种时生效",
     "seedingSummaryActive": "{n} 个做种中",

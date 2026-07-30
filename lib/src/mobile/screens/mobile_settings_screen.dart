@@ -153,6 +153,13 @@ class MobileSettingsScreen extends StatelessWidget {
                           onTap: () => _selectUploadLimit(context),
                         ),
                         _Row(
+                          label: s.btSeedEnabled,
+                          trailing: ShadSwitch(
+                            value: settings.btSeedEnabled,
+                            onChanged: settings.setBtSeedEnabled,
+                          ),
+                        ),
+                        _Row(
                           label: s.btAutoReseed,
                           trailing: ShadSwitch(
                             value: settings.btAutoReseed,

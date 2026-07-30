@@ -1181,6 +1181,8 @@ class S {
   String get btSeedLimitsModeCustom => _r('btSeedLimitsModeCustom');
   String get btAutoReseed => _r('btAutoReseed');
   String get btAutoReseedDesc => _r('btAutoReseedDesc');
+  String get btSeedEnabled => _r('btSeedEnabled');
+  String get btSeedEnabledDesc => _r('btSeedEnabledDesc');
   String get btSeedUploadLimit => _r('btSeedUploadLimit');
   String get btSeedUploadLimitHint => _r('btSeedUploadLimitHint');
   String get timeUnitMinutes => _r('timeUnitMinutes');
