@@ -660,6 +660,9 @@ class _PopupFormHost implements QuickDownloadFormHost {
   String get lastDialogThreads => payload.lastDialogThreads;
 
   @override
+  String get siteAuthCredentials => payload.siteAuthCredentials;
+
+  @override
   Future<String?> pickDirectory({
     required String dialogTitle,
     String? initialDirectory,

@@ -20,6 +20,7 @@ import { queueDisplayName } from '../../lib/format'
 import { newDownloadOpenStore, openManifestSelect } from '../../lib/dialogs'
 import { useI18n } from '../../lib/i18n'
 import { manifestIsPreviewableUrl } from '../../lib/manifest-selection'
+import { parseSiteAuthStore, siteKeyFromUrl } from '../../lib/site-auth'
 import { UA_PRESETS } from '../../lib/ua-presets'
 import { useStore } from '../../lib/ws'
 import { FsPicker } from './fs-picker'
@@ -101,6 +102,10 @@ export function NewDownloadDialog() {
   const [lineErrors, setLineErrors] = useState<Record<number, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const headerRowSeq = useRef(0)
+  // HTTP 认证自动回填：authAutofill 记录最近一次自动写入的值（区分自动/手动），
+  // authDirty 在用户手动编辑用户名/密码后置位，此后不再覆盖用户输入。
+  const authAutofill = useRef<{ user: string; pass: string } | null>(null)
+  const authDirty = useRef(false)
   const { t } = useI18n()
   const segmentOptions = [
     { value: '0', label: t('newDl.segmentsAuto') },
@@ -156,6 +161,8 @@ export function NewDownloadDialog() {
     if (open) {
       setForm(emptyForm())
       setLineErrors({})
+      authAutofill.current = null
+      authDirty.current = false
     }
   }, [open])
 
@@ -185,6 +192,34 @@ export function NewDownloadDialog() {
     [form.urls],
   )
   const isSingle = urlLines.length <= 1
+
+  // 站点凭据自动回填：单条 http/https URL 且认证区可见时，按站点键查已保存凭据回填
+  // 用户名/密码；仅当字段为空或仍是上次自动值时才回填/更新，切到无凭据站点则清空。
+  // 手动改过（authDirty）后完全放手。回填不拨动「为此网站保存」开关。
+  const siteAuthStore = useMemo(() => parseSiteAuthStore(config?.site_auth_credentials), [config])
+  const singleUrl = urlLines.length === 1 ? urlLines[0] : ''
+  useEffect(() => {
+    if (!open) return
+    setForm((f) => {
+      if (!f.advOpen || authDirty.current) return f
+      const auto = authAutofill.current
+      const userIsAuto = f.httpUser === '' || (auto != null && f.httpUser === auto.user)
+      const passIsAuto = f.httpPassword === '' || (auto != null && f.httpPassword === auto.pass)
+      if (!userIsAuto || !passIsAuto) return f
+      const key = singleUrl ? siteKeyFromUrl(singleUrl) : null
+      const cred = key ? siteAuthStore[key] : undefined
+      if (cred) {
+        authAutofill.current = { user: cred.user, pass: cred.pass }
+        if (f.httpUser === cred.user && f.httpPassword === cred.pass) return f
+        return { ...f, httpUser: cred.user, httpPassword: cred.pass }
+      }
+      if (auto != null && (f.httpUser !== '' || f.httpPassword !== '')) {
+        authAutofill.current = null
+        return { ...f, httpUser: '', httpPassword: '' }
+      }
+      return f
+    })
+  }, [open, singleUrl, siteAuthStore, form.advOpen])
 
   function set<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((f) => ({ ...f, [key]: value }))
@@ -441,7 +476,10 @@ export function NewDownloadDialog() {
                     placeholder={t('newDl.httpAuthUser')}
                     aria-label={t('newDl.httpAuthUser')}
                     value={form.httpUser}
-                    onChange={(e) => set('httpUser', e.target.value)}
+                    onChange={(e) => {
+                      authDirty.current = true
+                      set('httpUser', e.target.value)
+                    }}
                   />
                   <input
                     className="text-input"
@@ -450,7 +488,10 @@ export function NewDownloadDialog() {
                     placeholder={t('newDl.httpAuthPassword')}
                     aria-label={t('newDl.httpAuthPassword')}
                     value={form.httpPassword}
-                    onChange={(e) => set('httpPassword', e.target.value)}
+                    onChange={(e) => {
+                      authDirty.current = true
+                      set('httpPassword', e.target.value)
+                    }}
                   />
                 </div>
                 <label className="mcheck mt-2">

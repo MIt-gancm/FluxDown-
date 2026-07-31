@@ -15,23 +15,6 @@ const PROXY_TYPE_OPTIONS = [
 
 type TestState = { status: 'idle' | 'pending' | 'ok' | 'err'; detail?: string }
 
-/** config 键 site_auth_credentials 的 JSON 形态：站点键（host[:port]）→ 明文凭据。 */
-interface SiteAuthEntry {
-  user: string
-  pass: string
-}
-
-function parseSiteAuth(raw: string | undefined): Record<string, SiteAuthEntry> {
-  if (!raw) return {}
-  try {
-    const v: unknown = JSON.parse(raw)
-    if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, SiteAuthEntry>
-  } catch {
-    // 损坏的 JSON 按空处理，仅影响展示，不主动覆写。
-  }
-  return {}
-}
-
 export function ProxySettings({
   config,
   mutate,
@@ -47,8 +30,6 @@ export function ProxySettings({
   const username = config.proxy_username ?? ''
   const password = config.proxy_password ?? ''
   const noList = config.proxy_no_list ?? ''
-  const siteAuth = parseSiteAuth(config.site_auth_credentials)
-  const siteAuthSites = Object.keys(siteAuth).sort()
 
   const [testState, setTestState] = useState<TestState>({ status: 'idle' })
 
@@ -156,29 +137,6 @@ export function ProxySettings({
             </SetRow>
           </>
         ) : null}
-      </div>
-      <h2 className="set-title mt-6">{t('set.siteAuth')}</h2>
-      <p className="set-desc">{t('set.siteAuth.desc')}</p>
-      <div className="set-group">
-        {siteAuthSites.length === 0 ? (
-          <p className="set-note">{t('set.siteAuth.empty')}</p>
-        ) : (
-          siteAuthSites.map((site) => (
-            <SetRow key={site} title={site} desc={siteAuth[site]?.user ?? ''}>
-              <button
-                type="button"
-                className="btn ghost sm"
-                onClick={() => {
-                  const next = { ...siteAuth }
-                  delete next[site]
-                  mutate({ site_auth_credentials: JSON.stringify(next) })
-                }}
-              >
-                {t('common.delete')}
-              </button>
-            </SetRow>
-          ))
-        )}
       </div>
     </>
   )

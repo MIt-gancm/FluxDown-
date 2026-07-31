@@ -27,6 +27,7 @@ import '../models/download_controller.dart';
 import '../models/download_queue.dart';
 import '../models/task_proxy_choice.dart';
 import '../models/settings_provider.dart';
+import '../models/site_auth_store.dart';
 import '../services/system_proxy_status.dart';
 import 'context_menu.dart';
 import 'split_action_button.dart';
@@ -108,6 +109,16 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
 
   /// 是否把本次凭据按站点保存到本地（引擎侧明文存 config）。
   bool _saveSiteAuth = false;
+
+  /// 当前认证两框内容是否来自站点凭据自动回填（是则 URL 切换时可被
+  /// 更新/清空；用户手动编辑后置 false 并锁死 [_httpAuthDirty]）。
+  bool _httpAuthAutofilled = false;
+
+  /// 用户手动编辑过认证输入 → 本次对话框内不再自动覆盖。
+  bool _httpAuthDirty = false;
+
+  /// 正在程序化写入认证两框（区分自动回填与用户手动输入的监听护栏）。
+  bool _applyingAuthAutofill = false;
 
   /// 自定义请求头列表（#347），每项含一对 key/value 输入控制器。
   final List<_HeaderRow> _headerRows = [];
@@ -238,6 +249,8 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       ..refresh();
     _saveDirController.text = widget.settingsProvider.effectiveDefaultSaveDir;
     _urlController.addListener(_onUrlChanged);
+    _httpAuthUserController.addListener(_onHttpAuthEdited);
+    _httpAuthPasswordController.addListener(_onHttpAuthEdited);
     _pasteUrlFromClipboard();
     // 优先使用侧边栏队列筛选，否则使用设置中的默认队列；'' 已不是有效
     // 归属（引擎会兜底重映射到主队列），选择器直接落到主队列。
@@ -365,11 +378,63 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
         _allMagnet = allMagnet;
       });
     }
+    // 站点凭据自动回填：URL 变化时按站点键查已保存凭据表
+    _maybeAutofillSiteAuth(
+      entries.length == 1 && !_hasTorrentFiles ? entries.first.url : null,
+    );
     // 自动从 URL 提取文件名并匹配分类保存目录
     if (entries.isNotEmpty &&
         !entries.first.url.toLowerCase().startsWith('magnet:')) {
       final fileName = _extractFilenameFromUrl(entries.first.url);
       _tryAutoApplySaveDir(fileName);
+    }
+  }
+
+  /// 认证输入变化监听 — 程序化写入（自动回填/清空）经
+  /// [_applyingAuthAutofill] 护栏跳过；其余视为用户手动编辑，此后
+  /// 本对话框内不再自动覆盖两框内容。
+  void _onHttpAuthEdited() {
+    if (_applyingAuthAutofill) return;
+    _httpAuthDirty = true;
+    _httpAuthAutofilled = false;
+  }
+
+  /// 按当前（单条）URL 的站点键查凭据表并回填/更新/清空认证两框。
+  ///
+  /// [url] 为 null = 非单条 http(s) 路径（批量/种子等）：仅当两框仍是
+  /// 自动值时清空。用户手动编辑过（[_httpAuthDirty]）则一律不动；
+  /// 「为此网站保存」开关不被拨动。
+  void _maybeAutofillSiteAuth(String? url) {
+    if (_httpAuthDirty) return;
+    final key = url == null ? null : siteKeyFromUrl(url);
+    final cred = key == null
+        ? null
+        : parseSiteAuthStore(widget.settingsProvider.siteAuthCredentials)[key];
+    _applyingAuthAutofill = true;
+    try {
+      if (cred != null) {
+        // 仅当字段为空或此前就是自动回填值时才覆盖（防御浏览器捕获
+        // 等外部预填：非空且非自动 → 视为脏，不动）。
+        final canWrite =
+            _httpAuthAutofilled ||
+            (_httpAuthUserController.text.isEmpty &&
+                _httpAuthPasswordController.text.isEmpty);
+        if (!canWrite) return;
+        if (_httpAuthUserController.text != cred.user) {
+          _httpAuthUserController.text = cred.user;
+        }
+        if (_httpAuthPasswordController.text != cred.pass) {
+          _httpAuthPasswordController.text = cred.pass;
+        }
+        _httpAuthAutofilled = true;
+      } else if (_httpAuthAutofilled) {
+        // URL 切到无凭据站点且两框仍是自动值 → 清空
+        _httpAuthUserController.clear();
+        _httpAuthPasswordController.clear();
+        _httpAuthAutofilled = false;
+      }
+    } finally {
+      _applyingAuthAutofill = false;
     }
   }
 
@@ -516,8 +581,12 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     _userAgentController.dispose();
     _cookieController.dispose();
     _checksumController.dispose();
-    _httpAuthUserController.dispose();
-    _httpAuthPasswordController.dispose();
+    _httpAuthUserController
+      ..removeListener(_onHttpAuthEdited)
+      ..dispose();
+    _httpAuthPasswordController
+      ..removeListener(_onHttpAuthEdited)
+      ..dispose();
     for (final row in _headerRows) {
       row.dispose();
     }

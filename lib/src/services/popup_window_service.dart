@@ -210,6 +210,7 @@ class PopupWindowService {
       systemProxyDetected: proxyStatus.detected,
       systemProxySummary: proxyStatus.summary,
       manualProxyUrl: manualProxyUrlFromSettings(settings) ?? '',
+      siteAuthCredentials: settings.siteAuthCredentials,
     );
 
     _showing = true;

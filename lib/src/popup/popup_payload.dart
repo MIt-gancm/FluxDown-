@@ -71,6 +71,11 @@ class QuickPopupPayload {
   /// 全局手动代理 URL（'' = 未配置）。
   final String manualProxyUrl;
 
+  /// 站点凭据表 JSON（config 键 `site_auth_credentials` 原文；'' = 无）。
+  /// popup isolate 零 Rust 初始化，读不到 config，表内 HTTP 认证自动
+  /// 回填的数据只能随载荷注入；旧载荷缺失时按空表兜底。
+  final String siteAuthCredentials;
+
   const QuickPopupPayload({
     required this.requestId,
     required this.url,
@@ -90,6 +95,7 @@ class QuickPopupPayload {
     this.systemProxyDetected = false,
     this.systemProxySummary = '',
     this.manualProxyUrl = '',
+    this.siteAuthCredentials = '',
   });
 
   String toJsonString() => jsonEncode({
@@ -121,6 +127,7 @@ class QuickPopupPayload {
       'systemProxyDetected': systemProxyDetected,
       'systemProxySummary': systemProxySummary,
       'manualProxyUrl': manualProxyUrl,
+      'siteAuthCredentials': siteAuthCredentials,
     },
   });
 
@@ -154,6 +161,7 @@ class QuickPopupPayload {
       systemProxyDetected: env['systemProxyDetected'] as bool? ?? false,
       systemProxySummary: env['systemProxySummary'] as String? ?? '',
       manualProxyUrl: env['manualProxyUrl'] as String? ?? '',
+      siteAuthCredentials: env['siteAuthCredentials'] as String? ?? '',
     );
   }
 }

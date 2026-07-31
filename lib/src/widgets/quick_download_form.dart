@@ -31,6 +31,7 @@ import 'flux_sonner.dart';
 
 import '../i18n/locale_provider.dart';
 import '../models/download_queue.dart';
+import '../models/site_auth_store.dart';
 import '../models/task_proxy_choice.dart';
 import '../models/ua_presets.dart';
 import '../services/file_picker_service.dart';
@@ -252,6 +253,11 @@ abstract class QuickDownloadFormHost {
   /// 上次新建下载选择的线程数（'' = 未记录，'auto' = 自动，数字串 = 固定）
   String get lastDialogThreads;
 
+  /// 站点凭据表 JSON（config 键 `site_auth_credentials` 原文；'' = 无）。
+  /// 主窗口宿主读 SettingsProvider，独立小窗宿主读载荷字段——表单据此
+  /// 在 URL 命中已保存站点时自动回填 HTTP 认证两框。
+  String get siteAuthCredentials;
+
   /// 弹出目录选择对话框。取消返回 null，失败抛 [FilePickerException]。
   Future<String?> pickDirectory({
     required String dialogTitle,
@@ -377,6 +383,16 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
   /// 是否把本次凭据按站点保存到本地（引擎侧明文存 config）。
   bool _saveSiteAuth = false;
 
+  /// 当前认证两框内容是否来自站点凭据自动回填（是则 URL 切换时可被
+  /// 更新/清空；用户手动编辑后置 false 并锁死 [_httpAuthDirty]）。
+  bool _httpAuthAutofilled = false;
+
+  /// 用户手动编辑过认证输入（或初始即有预填值）→ 不再自动覆盖。
+  bool _httpAuthDirty = false;
+
+  /// 正在程序化写入认证两框（区分自动回填与用户手动输入的监听护栏）。
+  bool _applyingAuthAutofill = false;
+
   /// 自定义请求头行列表（与主窗口新建下载对话框同款交互）。
   final List<QuickHeaderRow> _headerRows = [];
 
@@ -436,6 +452,14 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
     }
     _cookieController.text = widget.initialCookies;
     _urlController.addListener(_onUrlChanged);
+    // 若认证框初始即有预填值（如未来浏览器捕获凭据预填路径）→ 视为
+    // 脏，站点凭据自动回填不覆盖。护栏须在挂监听前判定。
+    if (_httpAuthUserController.text.isNotEmpty ||
+        _httpAuthPasswordController.text.isNotEmpty) {
+      _httpAuthDirty = true;
+    }
+    _httpAuthUserController.addListener(_onHttpAuthEdited);
+    _httpAuthPasswordController.addListener(_onHttpAuthEdited);
     // 优先沿用上次用户选择的线程数，其次根据队列/全局设置初始化
     final lastThreads = widget.host.lastDialogThreads;
     selectedThreads = lastThreads.isNotEmpty
@@ -487,6 +511,55 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
         _urlCount = count;
       });
     }
+    // 站点凭据自动回填：URL 变化时按站点键查已保存凭据表
+    _maybeAutofillSiteAuth(entries.length == 1 ? entries.first.url : null);
+  }
+
+  /// 认证输入变化监听 — 程序化写入（自动回填/清空）经
+  /// [_applyingAuthAutofill] 护栏跳过；其余视为用户手动编辑，此后
+  /// 本表单内不再自动覆盖两框内容。
+  void _onHttpAuthEdited() {
+    if (_applyingAuthAutofill) return;
+    _httpAuthDirty = true;
+    _httpAuthAutofilled = false;
+  }
+
+  /// 按当前（单条）URL 的站点键查凭据表并回填/更新/清空认证两框。
+  ///
+  /// [url] 为 null = 非单条 http(s) 路径（批量等）：仅当两框仍是自动值
+  /// 时清空。用户手动编辑过（[_httpAuthDirty]）则一律不动；
+  /// 「为此网站保存」开关不被拨动。
+  void _maybeAutofillSiteAuth(String? url) {
+    if (_httpAuthDirty) return;
+    final key = url == null ? null : siteKeyFromUrl(url);
+    final cred = key == null
+        ? null
+        : parseSiteAuthStore(widget.host.siteAuthCredentials)[key];
+    _applyingAuthAutofill = true;
+    try {
+      if (cred != null) {
+        // 仅当字段为空或此前就是自动回填值时才覆盖。
+        final canWrite =
+            _httpAuthAutofilled ||
+            (_httpAuthUserController.text.isEmpty &&
+                _httpAuthPasswordController.text.isEmpty);
+        if (!canWrite) return;
+        if (_httpAuthUserController.text != cred.user) {
+          _httpAuthUserController.text = cred.user;
+        }
+        if (_httpAuthPasswordController.text != cred.pass) {
+          _httpAuthPasswordController.text = cred.pass;
+        }
+        _httpAuthAutofilled = true;
+      } else if (_httpAuthAutofilled) {
+        // URL 切到无凭据站点且两框仍是自动值 → 清空
+        _httpAuthUserController.clear();
+        _httpAuthPasswordController.clear();
+        _httpAuthAutofilled = false;
+      }
+    } finally {
+      _applyingAuthAutofill = false;
+    }
   }
 
   @override
@@ -503,8 +576,12 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
       row.dispose();
     }
     _checksumController.dispose();
-    _httpAuthUserController.dispose();
-    _httpAuthPasswordController.dispose();
+    _httpAuthUserController
+      ..removeListener(_onHttpAuthEdited)
+      ..dispose();
+    _httpAuthPasswordController
+      ..removeListener(_onHttpAuthEdited)
+      ..dispose();
     _renameController.dispose();
     _proxyUrlController.dispose();
     _userAgentController.dispose();

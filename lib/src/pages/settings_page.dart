@@ -23,6 +23,7 @@ import '../models/download_queue.dart';
 import '../models/components_provider.dart';
 import '../models/plugin_provider.dart';
 import '../models/settings_provider.dart';
+import '../models/site_auth_store.dart';
 import '../models/ua_presets.dart';
 import '../models/webhook_endpoint.dart';
 import '../models/webhook_provider.dart';
@@ -3374,27 +3375,68 @@ class _DefaultQueueSelector extends StatelessWidget {
 // ─────────────────────────────────────────────
 
 /// 列出引擎按站点保存的 HTTP Basic 凭据（站点 + 用户名，不显示密码），
-/// 每行可删除；删除后整体 JSON 写回 config。空态显示提示文案。
-class _SiteAuthCredentialList extends StatelessWidget {
+/// 每行可编辑/删除，另提供手动新增入口；改动后整体 JSON 写回 config。
+/// 空态显示提示文案（保留添加入口）。
+///
+/// 规模化：凭据可达数百条——顶部提供模糊搜索（站点/用户名）与计数，
+/// 列表超过 [_inlineRowLimit] 行时改为定高容器内 `ListView.builder`
+/// 惰性构建，既不撑高设置页也不全量 build 行 widget。
+class _SiteAuthCredentialList extends StatefulWidget {
   final SettingsProvider settingsProvider;
 
   const _SiteAuthCredentialList({required this.settingsProvider});
 
-  /// 解析 config JSON 为 站点 → 用户名（密码不进 UI 状态）。
-  static Map<String, String> _parse(String raw) {
-    if (raw.trim().isEmpty) return const {};
-    try {
-      final map = jsonDecode(raw);
-      if (map is! Map<String, dynamic>) return const {};
-      return {
-        for (final e in map.entries)
-          if (e.value is Map<String, dynamic>)
-            e.key: ((e.value as Map<String, dynamic>)['user'] as String?) ?? '',
+  /// 超过此行数改用定高滚动容器（少量凭据时保持平铺，不占满固定高度）。
+  static const int _inlineRowLimit = 8;
+
+  /// 滚动容器高度（逻辑像素），与账号设备管理弹窗的列表高度一致。
+  static const double _scrollHeight = 360;
+
+  @override
+  State<_SiteAuthCredentialList> createState() =>
+      _SiteAuthCredentialListState();
+
+  /// 站点输入归一化：含 `://` 时按 URL 解析取 host[:非默认端口]，
+  /// 否则原样 trim + 小写。解析失败返回 null。
+  static String? _normalizeSite(String input) {
+    final raw = input.trim();
+    if (raw.isEmpty) return null;
+    if (raw.contains('://')) {
+      final uri = Uri.tryParse(raw);
+      if (uri == null || uri.host.isEmpty) return null;
+      final host = uri.host.toLowerCase();
+      final defaultPort = switch (uri.scheme.toLowerCase()) {
+        'https' => 443,
+        'http' => 80,
+        _ => -1,
       };
-    } catch (_) {
-      return const {};
+      if (uri.hasPort && uri.port != defaultPort) return '$host:${uri.port}';
+      return host;
     }
+    return raw.toLowerCase();
   }
+}
+
+class _SiteAuthCredentialListState extends State<_SiteAuthCredentialList> {
+  final _searchController = TextEditingController();
+
+  SettingsProvider get settingsProvider => widget.settingsProvider;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchController.addListener(_onQueryChanged);
+  }
+
+  @override
+  void dispose() {
+    _searchController
+      ..removeListener(_onQueryChanged)
+      ..dispose();
+    super.dispose();
+  }
+
+  void _onQueryChanged() => setState(() {});
 
   void _delete(String site) {
     try {
@@ -3407,67 +3449,390 @@ class _SiteAuthCredentialList extends StatelessWidget {
     }
   }
 
+  /// 写回单条凭据（新增与编辑同语义：同键覆盖）。
+  void _save(String site, String user, String pass) {
+    final raw = settingsProvider.siteAuthCredentials;
+    Map<String, dynamic> map;
+    if (raw.trim().isEmpty) {
+      map = <String, dynamic>{};
+    } else {
+      try {
+        final decoded = jsonDecode(raw);
+        if (decoded is! Map<String, dynamic>) return;
+        map = decoded;
+      } catch (_) {
+        // JSON 损坏时不写回，避免把不可解析内容替换成空表
+        return;
+      }
+    }
+    map[site] = {'user': user, 'pass': pass};
+    settingsProvider.setSiteAuthCredentials(jsonEncode(map));
+  }
+
+  Future<void> _openDialog(
+    BuildContext context, {
+    String? site,
+    String initialUser = '',
+    String initialPass = '',
+  }) async {
+    final result = await showShadDialog<(String, String, String)>(
+      context: context,
+      barrierColor: AppColors.of(context).dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (_) => _SiteAuthCredentialDialog(
+        site: site,
+        initialUser: initialUser,
+        initialPass: initialPass,
+      ),
+    );
+    if (result != null) _save(result.$1, result.$2, result.$3);
+  }
+
+  Widget _buildAddButton(BuildContext context, S s, AppColors c) {
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: ShadButton.ghost(
+        size: ShadButtonSize.sm,
+        onPressed: () => _openDialog(context),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(LucideIcons.plus, size: 13, color: c.textSecondary),
+            const SizedBox(width: 4),
+            Text(s.settingsSiteAuthAdd),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 单行凭据（站点 + 用户名 + 编辑/删除）。列表两种形态共用，
+  /// 避免平铺分支与滚动分支各写一遍。
+  Widget _buildRow(
+    BuildContext context,
+    S s,
+    AppColors c,
+    MapEntry<String, ({String user, String pass})> e,
+  ) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      child: Row(
+        children: [
+          Icon(LucideIcons.globe, size: 14, color: c.textMuted),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              e.key,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              style: TextStyle(fontSize: 12.5, color: c.textPrimary),
+            ),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              e.value.user,
+              overflow: TextOverflow.ellipsis,
+              maxLines: 1,
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+          ),
+          const SizedBox(width: 8),
+          ShadTooltip(
+            effects: const [],
+            builder: (_) => Text(s.settingsSiteAuthEdit),
+            child: ShadButton.ghost(
+              size: ShadButtonSize.sm,
+              onPressed: () => _openDialog(
+                context,
+                site: e.key,
+                initialUser: e.value.user,
+                initialPass: e.value.pass,
+              ),
+              child: Icon(
+                LucideIcons.pencil,
+                size: 14,
+                color: c.textSecondary,
+              ),
+            ),
+          ),
+          ShadTooltip(
+            effects: const [],
+            builder: (_) => Text(s.settingsSiteAuthDelete),
+            child: ShadButton.ghost(
+              size: ShadButtonSize.sm,
+              onPressed: () => _delete(e.key),
+              child: Icon(LucideIcons.trash2, size: 14, color: c.statusError),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 搜索框 + 计数。仅在存在凭据时显示（空态只留提示与添加入口）。
+  Widget _buildSearchBar(S s, AppColors c, int matched, int total) {
+    final query = _searchController.text.trim();
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+      child: Row(
+        children: [
+          Expanded(
+            child: ShadInput(
+              controller: _searchController,
+              placeholder: Text(
+                s.settingsSiteAuthSearchHint,
+                style: const TextStyle(fontSize: 12),
+              ),
+              // 与设置页顶部搜索框同款紧凑度：30px 行高 + 12px 字号。
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              constraints: const BoxConstraints(minHeight: 30, maxHeight: 30),
+              gap: 6,
+              style: const TextStyle(fontSize: 12),
+              leading: Icon(LucideIcons.search, size: 13, color: c.textMuted),
+              trailing: query.isEmpty
+                  ? null
+                  : MouseRegion(
+                      cursor: SystemMouseCursors.click,
+                      child: GestureDetector(
+                        onTap: _searchController.clear,
+                        child: Icon(
+                          LucideIcons.x,
+                          size: 12,
+                          color: c.textMuted,
+                        ),
+                      ),
+                    ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            query.isEmpty
+                ? s.settingsSiteAuthCount(total)
+                : s.settingsSiteAuthCountFiltered(matched, total),
+            style: TextStyle(fontSize: 11.5, color: c.textMuted),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
     final s = LocaleScope.of(context);
-    final sites = _parse(settingsProvider.siteAuthCredentials);
-    if (sites.isEmpty) {
+    final store = parseSiteAuthStore(settingsProvider.siteAuthCredentials);
+    if (store.isEmpty) {
       return Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
-        child: Text(
-          s.settingsSiteAuthEmpty,
-          style: TextStyle(fontSize: 12, color: c.textMuted),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 6),
+              child: Text(
+                s.settingsSiteAuthEmpty,
+                style: TextStyle(fontSize: 12, color: c.textMuted),
+              ),
+            ),
+            _buildAddButton(context, s, c),
+          ],
         ),
       );
     }
-    final entries = sites.entries.toList()
-      ..sort((a, b) => a.key.compareTo(b.key));
+    final entries = filterSiteAuth(store, _searchController.text);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        for (final e in entries)
+        _buildSearchBar(s, c, entries.length, store.length),
+        if (entries.isEmpty)
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
-            child: Row(
-              children: [
-                Icon(LucideIcons.globe, size: 14, color: c.textMuted),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    e.key,
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                    style: TextStyle(fontSize: 12.5, color: c.textPrimary),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    e.value,
-                    overflow: TextOverflow.ellipsis,
-                    maxLines: 1,
-                    style: TextStyle(fontSize: 12, color: c.textMuted),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                ShadTooltip(
-                  effects: const [],
-                  builder: (_) => Text(s.settingsSiteAuthDelete),
-                  child: ShadButton.ghost(
-                    size: ShadButtonSize.sm,
-                    onPressed: () => _delete(e.key),
-                    child: Icon(
-                      LucideIcons.trash2,
-                      size: 14,
-                      color: c.statusError,
-                    ),
-                  ),
-                ),
-              ],
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 6),
+            child: Text(
+              s.settingsSiteAuthNoMatch,
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+          )
+        else if (entries.length <= _SiteAuthCredentialList._inlineRowLimit)
+          for (final e in entries) _buildRow(context, s, c, e)
+        else
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Container(
+              height: _SiteAuthCredentialList._scrollHeight,
+              clipBehavior: Clip.antiAlias,
+              decoration: BoxDecoration(
+                borderRadius: m.brInput,
+                border: Border.all(color: m.borderFade(c.border), width: 1),
+              ),
+              // 惰性构建：数百条凭据只 build 视口内的行。
+              child: ListView.builder(
+                padding: const EdgeInsets.symmetric(vertical: 4),
+                itemCount: entries.length,
+                itemBuilder: (context, i) =>
+                    _buildRow(context, s, c, entries[i]),
+              ),
             ),
           ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 8),
+          child: _buildAddButton(context, s, c),
+        ),
       ],
+    );
+  }
+}
+
+/// 站点凭据编辑/新增对话框。`site == null` 为新增模式（站点可输入），
+/// 否则站点只读展示。保存时 pop 出 (站点, 用户名, 密码)。
+class _SiteAuthCredentialDialog extends StatefulWidget {
+  final String? site;
+  final String initialUser;
+  final String initialPass;
+
+  const _SiteAuthCredentialDialog({
+    this.site,
+    this.initialUser = '',
+    this.initialPass = '',
+  });
+
+  @override
+  State<_SiteAuthCredentialDialog> createState() =>
+      _SiteAuthCredentialDialogState();
+}
+
+class _SiteAuthCredentialDialogState extends State<_SiteAuthCredentialDialog> {
+  late final TextEditingController _siteController = TextEditingController();
+  late final TextEditingController _userController = TextEditingController(
+    text: widget.initialUser,
+  );
+  late final TextEditingController _passController = TextEditingController(
+    text: widget.initialPass,
+  );
+
+  /// 密码输入框明文显示切换。
+  bool _showPassword = false;
+
+  @override
+  void dispose() {
+    _siteController.dispose();
+    _userController.dispose();
+    _passController.dispose();
+    super.dispose();
+  }
+
+  /// 归一化后的站点键；新增模式解析失败/为空时为 null（禁用保存）。
+  String? get _resolvedSite =>
+      widget.site ?? _SiteAuthCredentialList._normalizeSite(_siteController.text);
+
+  bool get _canSave =>
+      _resolvedSite != null && _userController.text.trim().isNotEmpty;
+
+  void _submit() {
+    final site = _resolvedSite;
+    final user = _userController.text.trim();
+    if (site == null || user.isEmpty) return;
+    Navigator.of(context).pop((site, user, _passController.text));
+  }
+
+  Widget _fieldLabel(String text, AppColors c) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Text(
+        text,
+        style: TextStyle(fontSize: 11.5, color: c.textSecondary),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final isAdd = widget.site == null;
+    return ShadDialog(
+      title: Text(isAdd ? s.settingsSiteAuthAdd : s.settingsSiteAuthEdit),
+      constraints: const BoxConstraints(maxWidth: 380),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          _fieldLabel(s.settingsSiteAuthSite, c),
+          if (isAdd)
+            ShadInput(
+              controller: _siteController,
+              autofocus: true,
+              placeholder: Text(s.settingsSiteAuthSitePlaceholder),
+              onChanged: (_) => setState(() {}),
+            )
+          else
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                children: [
+                  Icon(LucideIcons.globe, size: 14, color: c.textMuted),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      widget.site!,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                      style: TextStyle(fontSize: 12.5, color: c.textPrimary),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          const SizedBox(height: 10),
+          _fieldLabel(s.taskHttpAuthUser, c),
+          ShadInput(
+            controller: _userController,
+            autofocus: !isAdd,
+            onChanged: (_) => setState(() {}),
+            onSubmitted: (_) => _submit(),
+          ),
+          const SizedBox(height: 10),
+          _fieldLabel(s.taskHttpAuthPassword, c),
+          ShadInput(
+            controller: _passController,
+            obscureText: !_showPassword,
+            onSubmitted: (_) => _submit(),
+            trailing: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => setState(() => _showPassword = !_showPassword),
+                child: Icon(
+                  _showPassword ? LucideIcons.eyeOff : LucideIcons.eye,
+                  size: 14,
+                  color: c.textMuted,
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: ShadButton.outline(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text(s.cancel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ShadButton(
+                  enabled: _canSave,
+                  onPressed: _submit,
+                  child: Text(s.settingsSiteAuthSave),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }

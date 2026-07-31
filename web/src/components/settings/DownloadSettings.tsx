@@ -6,6 +6,7 @@ import type { ConfigMap } from '../../lib/types'
 import { FsPicker } from '../dialogs/fs-picker'
 import { UA_PRESETS } from '../../lib/ua-presets'
 import { NumberFieldRow, SetRow, SetSelect, SetSwitch, TextInput } from './controls'
+import { SiteAuthCredentials } from './SiteAuthCredentials'
 
 const KB = 1024
 
@@ -157,6 +158,7 @@ export function DownloadSettings({
           />
         )}
       </div>
+      <SiteAuthCredentials config={config} mutate={mutate} />
     </>
   )
 }

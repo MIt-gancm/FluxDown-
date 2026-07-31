@@ -34,6 +34,9 @@ class _FakeHost implements QuickDownloadFormHost {
   String get lastDialogThreads => '';
 
   @override
+  String get siteAuthCredentials => '';
+
+  @override
   Future<String?> pickDirectory({
     required String dialogTitle,
     String? initialDirectory,

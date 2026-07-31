@@ -1127,6 +1127,17 @@ class S {
   String get settingsSiteAuthDesc => _r('settingsSiteAuthDesc');
   String get settingsSiteAuthEmpty => _r('settingsSiteAuthEmpty');
   String get settingsSiteAuthDelete => _r('settingsSiteAuthDelete');
+  String get settingsSiteAuthEdit => _r('settingsSiteAuthEdit');
+  String get settingsSiteAuthAdd => _r('settingsSiteAuthAdd');
+  String get settingsSiteAuthSite => _r('settingsSiteAuthSite');
+  String get settingsSiteAuthSitePlaceholder =>
+      _r('settingsSiteAuthSitePlaceholder');
+  String get settingsSiteAuthSave => _r('settingsSiteAuthSave');
+  String get settingsSiteAuthSearchHint => _r('settingsSiteAuthSearchHint');
+  String get settingsSiteAuthNoMatch => _r('settingsSiteAuthNoMatch');
+  String settingsSiteAuthCount(int n) => _r('settingsSiteAuthCount', {'n': n});
+  String settingsSiteAuthCountFiltered(int m, int n) =>
+      _r('settingsSiteAuthCountFiltered', {'m': m, 'n': n});
 
   // ─────────────────────────────────────────────
   // Settings — API 服务

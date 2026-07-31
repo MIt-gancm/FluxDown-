@@ -303,6 +303,10 @@ class _MainWindowFormHost implements QuickDownloadFormHost {
       SettingsProvider.globalInstance?.lastDialogThreads ?? '';
 
   @override
+  String get siteAuthCredentials =>
+      SettingsProvider.globalInstance?.siteAuthCredentials ?? '';
+
+  @override
   Future<String?> pickDirectory({
     required String dialogTitle,
     String? initialDirectory,
