@@ -27,6 +27,7 @@
   "statusCompleted": "已完成",
   "statusError": "失败",
   "statusPreparing": "准备中",
+  "statusVerifying": "校验文件中",
   "statusResuming": "恢复中",
   "statusCanceled": "已取消",
   "statusFileMissing": "文件已删除",

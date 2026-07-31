@@ -3452,6 +3452,22 @@ impl DownloadManager {
             log_info!("[manager] deferring BT session release — seeders active");
             return;
         }
+        // Keep the session alive while any incomplete torrent sits paused with
+        // a cached handle.  拆会话连带丢句柄缓存与 swarm/tracker/DHT 状态，
+        // 恢复就要付「重建会话 + add_torrent + fastresume 采样校验 + peer
+        // 冷启动」的全额成本（数据越大越久）；保留会话则恢复只是
+        // unpause（Paused→Live，零校验、秒级）。空闲代价仅为 DHT 心跳与
+        // 停车的 runtime 线程；已完成任务不计入本判定（做种由上面的
+        // has_seeders 保活，做种关闭的完成任务不钉住会话），因此全部
+        // BT 任务终态化后会话仍会按既有路径释放。
+        if let Some(ref bt) = self.bt_session
+            && bt.has_paused_incomplete().await
+        {
+            log_info!(
+                "[manager] deferring BT session release — paused BT task(s) hold resume state"
+            );
+            return;
+        }
         // BT tasks bypass the pending queue, so this guard is purely
         // defensive in case the invariant changes in the future.
         if self.pending_queue.iter().any(|q| is_bt_url(&q.url)) {
@@ -3469,7 +3485,7 @@ impl DownloadManager {
             );
             return;
         }
-        log_info!("[manager] all BT tasks finished/paused — releasing BT session");
+        log_info!("[manager] no BT task holds live or resume state — releasing BT session");
         // Shut down on a background thread (same pattern as Drop) to avoid
         // blocking the actor loop while the librqbit runtime winds down.
         if let Some(bt) = self.bt_session.take() {

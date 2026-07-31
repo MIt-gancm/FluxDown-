@@ -563,6 +563,15 @@ class _MetaLine extends StatelessWidget {
           ),
         );
       case TaskStatus.preparing:
+        // BT 初检阶段（totalBytes>0）statusText 已切为「校验文件中」，
+        // 补上实际校验百分比；totalBytes==0 仅显示「准备中」。
+        spans.add(TextSpan(text: task.statusText));
+        if (task.totalBytes > 0) {
+          sep();
+          spans.add(
+            TextSpan(text: '${(task.progress * 100).toStringAsFixed(0)}%'),
+          );
+        }
       case TaskStatus.resuming:
         spans.add(TextSpan(text: task.statusText));
       case TaskStatus.canceled:

@@ -90,7 +90,9 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
             : t.status === 2
               ? tr('status.paused')
               : t.status === 5
-                ? tr('status.preparingEllipsis')
+                ? t.totalBytes > 0
+                  ? `${tr('status.verifyingFiles')} ${pct}%`
+                  : tr('status.preparingEllipsis')
                 : tr('status.pending')}
         </span>
         <span>{fmtBytes(t.totalBytes)}</span>

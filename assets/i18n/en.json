@@ -27,6 +27,7 @@
   "statusCompleted": "Completed",
   "statusError": "Error",
   "statusPreparing": "Preparing",
+  "statusVerifying": "Verifying files",
   "statusResuming": "Resuming",
   "statusCanceled": "Canceled",
   "statusFileMissing": "File deleted",

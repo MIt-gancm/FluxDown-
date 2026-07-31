@@ -871,6 +871,12 @@ class DownloadTask {
         if (totalBytes > 0) return '$proto · $sizeText$queueStr';
         return '$proto · ${s.subtitlePending}$queueStr';
       case TaskStatus.preparing:
+        // BT 初检（librqbit checking）阶段引擎持续上报 downloaded/total，
+        // totalBytes>0 即处于校验文件阶段，展示实际校验百分比；
+        // totalBytes==0（磁力元数据解析等）维持「准备中」。
+        if (totalBytes > 0) {
+          return '$proto · ${s.statusVerifying} · ${(progress * 100).toStringAsFixed(0)}%';
+        }
         return '$proto · ${s.subtitlePreparing}';
       case TaskStatus.canceled:
         return '$proto · $sizeText · ${s.subtitleCanceled}';
@@ -906,7 +912,8 @@ class DownloadTask {
       TaskStatus.paused => s.statusPaused,
       TaskStatus.completed => s.statusCompleted,
       TaskStatus.error => s.statusError,
-      TaskStatus.preparing => s.statusPreparing,
+      TaskStatus.preparing =>
+        totalBytes > 0 ? s.statusVerifying : s.statusPreparing,
       TaskStatus.resuming => s.statusResuming,
       TaskStatus.canceled => s.statusCanceled,
     };

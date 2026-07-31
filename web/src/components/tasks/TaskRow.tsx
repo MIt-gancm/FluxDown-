@@ -54,7 +54,18 @@ function TaskMeta({ t }: { t: ViewTask }) {
       </>
     )
   }
-  if (t.status === 5) return <span>{tr('status.preparingEllipsis')}</span>
+  if (t.status === 5) {
+    // BT 初检（librqbit checking）：preparing 且已知总大小 → 显示校验进度；总大小未知（磁力解析等）维持「准备中」。
+    if (t.totalBytes > 0) {
+      const pct = Math.round((t.downloadedBytes / t.totalBytes) * 100)
+      return (
+        <span>
+          {tr('status.verifyingFiles')} {pct}%
+        </span>
+      )
+    }
+    return <span>{tr('status.preparingEllipsis')}</span>
+  }
   if (t.status === 2) {
     return (
       <>

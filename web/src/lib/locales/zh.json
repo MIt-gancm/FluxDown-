@@ -60,6 +60,7 @@
   "status.error": "错误",
   "status.preparing": "正在准备",
   "status.preparingEllipsis": "正在准备…",
+  "status.verifyingFiles": "校验文件中",
   "status.downloadFailed": "下载出错",
   "status.eta": "剩余 {eta}",
   "status.pluginProcessing": "插件处理中…",

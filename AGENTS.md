@@ -218,6 +218,14 @@ FluxDown/
   占用但 bind 返回 `WSAEACCES` 10013），导致**所有** BT 任务永久 status=4 而
   用户无从自救。**anyhow 错误一律用 `{e:#}` 打印**——`{e}` 只输出最外层
   context，会把这类根因整个吞掉。
+- **BT 会话保活与完成校验**：`maybe_release_bt_session` 在存在「已暂停的未完成
+  torrent（句柄在册）」时**不拆**共享会话——resume 走 `unpause`（Paused→Live
+  零校验秒恢复）；全部 BT 任务终态化（完成/删除且无做种）才释放。暂停撞上
+  librqbit 初检（只能从 Live 暂停）时经世代号「延迟暂停」兜底，防幽灵下载。
+  Windows 上 staging 文件经 `bt_sparse` 打 FSCTL_SET_SPARSE（免整体簇预留 +
+  免 VDL 零填充写放大）。完成期全量重哈希只在 fastresume 污点时执行（add 时
+  存在既有 `.bitv` / 经缓存句柄跨暂停恢复 / 完成重试）；无污点任务的 have-bits
+  全部有磁盘依据（全量初检读盘 / Live 写盘后读回校验），完成即时。
 - **ED2K**：eDonkey2000 纯 leech。源发现 = 服务器 `GETSOURCES`（手动 `ed2k_server_list` + 订阅 `server.met` 缓存）+ Kad DHT 兜底 + UPnP-IGD 争 HighID + LowID 回调中继。逐块 MD4 + hashset 自校验（违规拉黑 peer）；分块 MD4 root hash（PART_SIZE=9.28MB，幻影尾处理）。进程级共享 `Ed2kClient` 持久服务器会话。
 
 ### 引擎子系统（一句话职责）

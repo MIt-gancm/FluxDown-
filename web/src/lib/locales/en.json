@@ -60,6 +60,7 @@
   "status.error": "Error",
   "status.preparing": "Preparing",
   "status.preparingEllipsis": "Preparing…",
+  "status.verifyingFiles": "Verifying files",
   "status.downloadFailed": "Download error",
   "status.eta": "ETA {eta}",
   "status.pluginProcessing": "Plugin processing…",

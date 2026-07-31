@@ -457,6 +457,17 @@ pub struct SharedBtSession {
     completion_move_lock: Mutex<()>,
     /// Tracks completed torrents that are kept alive for seeding.
     seeding: Arc<SeedingManager>,
+    /// task_id → pause 世代号。pause / resume / delete 各自增一次；「延迟
+    /// 暂停」等待者触发前校验世代未变，防止用户已 resume 后仍把 torrent
+    /// 暂停回去。`Arc` 使等待者能脱离 `&self` 存活于 BT runtime 上。
+    pause_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    /// 本次 add 时存在既有 `{hash}.bitv`、或经缓存句柄跨暂停恢复过的任务。
+    /// 这类任务的 have-bits 可能来自采样式 fastresume 校验（对哈希不匹配
+    /// 宽容）或暂停期间磁盘被外部改动后的内存位图，完成期必须全量重哈希
+    /// （BUG-BT-PHANTOM-PIECES 防线）；不在集合内的任务，其 have-bits 全部
+    /// 来自「全量初检读盘」或「Live 下载的写盘后读回校验」，完成期重哈希
+    /// 是纯冗余，可以跳过。
+    fastresume_tainted: Mutex<HashSet<String>>,
     /// Folder holding librqbit persistence files (session.json, `{hash}.bitv`,
     /// `{hash}.torrent`).  Kept so that `clear_stale_fastresume` can remove a
     /// `.bitv` whose staging data no longer exists (BUG-BT-PHANTOM-PIECES).
@@ -700,6 +711,8 @@ impl SharedBtSession {
             torrent_ids: Mutex::new(HashMap::new()),
             completion_move_lock: Mutex::new(()),
             seeding: Arc::new(SeedingManager::new()),
+            pause_epochs: Arc::new(Mutex::new(HashMap::new())),
+            fastresume_tainted: Mutex::new(HashSet::new()),
             persistence_folder,
         })
     }
@@ -721,9 +734,7 @@ impl SharedBtSession {
     /// The `{hash}.torrent` metadata cache is intentionally kept — it is
     /// content-addressed and always valid.
     pub fn clear_stale_fastresume(&self, info_hash_hex: &str) {
-        let path = self
-            .persistence_folder
-            .join(format!("{info_hash_hex}.bitv"));
+        let path = self.bitv_path(info_hash_hex);
         match std::fs::remove_file(&path) {
             Ok(()) => log_info!(
                 "[BT] removed stale fastresume bitfield {} (staging has no data)",
@@ -736,6 +747,27 @@ impl SharedBtSession {
                 e
             ),
         }
+    }
+
+    /// `{info_hash}.bitv` fast-resume 位图在持久化目录中的路径。
+    pub fn bitv_path(&self, info_hash_hex: &str) -> PathBuf {
+        self.persistence_folder
+            .join(format!("{info_hash_hex}.bitv"))
+    }
+
+    /// 记录该任务的 have-bits 可能未经全量读盘验证（add 时存在既有
+    /// `.bitv`，或经缓存句柄跨暂停恢复——暂停期间磁盘可能被外部改动而
+    /// 内存位图不知情）。完成期据此保留全量重哈希。
+    pub async fn mark_fastresume_tainted(&self, task_id: &str) {
+        self.fastresume_tainted
+            .lock()
+            .await
+            .insert(task_id.to_string());
+    }
+
+    /// 完成期是否必须全量重哈希（见 [`Self::mark_fastresume_tainted`]）。
+    pub async fn is_fastresume_tainted(&self, task_id: &str) -> bool {
+        self.fastresume_tainted.lock().await.contains(task_id)
     }
 
     /// Update the global download speed limit at runtime.
@@ -778,42 +810,134 @@ impl SharedBtSession {
     }
 
     /// Pause a BT torrent by task_id.  The handle stays cached so that
-    /// `resume_handle` can unpause it without re-adding.
+    /// `resume_task` can unpause it without re-adding.
+    ///
+    /// librqbit 只能从 Live 态暂停；Initializing（初检中）时 `session.pause`
+    /// 返回错误。此时安排一个「延迟暂停」：等初检结束，若期间世代号未变
+    /// （没有新的 resume/pause/delete）再补执行暂停。否则暂停一个正在初检
+    /// 的任务会留下幽灵 torrent——UI 已显示暂停，librqbit 里却继续
+    /// 初检 → 转 Live → 后台持续下载。
     pub async fn pause_task(&self, task_id: &str) -> Result<(), DownloadError> {
         // Clone the Arc handle and release the lock immediately so that
         // the async session.pause() call doesn't block other handle ops.
         let handle = self.handles.lock().await.get(task_id).cloned();
         if let Some(handle) = handle {
-            // If already paused or initializing, ignore silently.
-            if !handle.is_paused() {
-                self.session
-                    .pause(&handle)
-                    .await
-                    .map_err(|e| DownloadError::Other(format!("BT pause failed: {e}")))?;
+            let epoch = self.bump_pause_epoch(task_id).await;
+            if !handle.is_paused()
+                && let Err(e) = self.session.pause(&handle).await
+            {
+                if matches!(
+                    handle.stats().state,
+                    librqbit::TorrentStatsState::Initializing
+                ) {
+                    log_info!(
+                        "[BT] task={} pause requested during init — deferring until check completes",
+                        short_id(task_id)
+                    );
+                    self.spawn_deferred_pause(task_id.to_string(), handle, epoch);
+                    return Ok(());
+                }
+                return Err(DownloadError::Other(format!("BT pause failed: {e}")));
             }
             log_info!("[BT] task={} paused via session API", short_id(task_id));
         }
         Ok(())
     }
 
+    /// 自增并返回该任务的 pause 世代号（见 `pause_epochs` 字段文档）。
+    async fn bump_pause_epoch(&self, task_id: &str) -> u64 {
+        let mut map = self.pause_epochs.lock().await;
+        let e = map.entry(task_id.to_string()).or_insert(0);
+        *e += 1;
+        *e
+    }
+
+    /// 在 BT runtime 上等待初检结束后补执行暂停。触发前持世代锁校验：
+    /// 世代号已变（用户 resume / 再次 pause / 删除）则本次作废；锁跨越
+    /// `session.pause` 调用，与 `resume_task` 的世代自增互相串行，保证
+    /// 「等待者暂停」与「用户恢复」不会交错出与用户意图相反的终态。
+    fn spawn_deferred_pause(&self, task_id: String, handle: BtHandle, epoch: u64) {
+        let epochs = Arc::clone(&self.pause_epochs);
+        let session = self.session.clone();
+        self.runtime.handle().spawn(async move {
+            if handle.wait_until_initialized().await.is_err() {
+                // 初检失败进 Error 态：无可暂停；之后 resume 会走
+                // Error → 全量重检的恢复路径。
+                return;
+            }
+            let guard = epochs.lock().await;
+            if guard.get(&task_id).copied() != Some(epoch) {
+                return;
+            }
+            if !handle.is_paused() {
+                match session.pause(&handle).await {
+                    Ok(()) => log_info!(
+                        "[BT] task={} deferred pause applied after init",
+                        short_id(&task_id)
+                    ),
+                    Err(e) => log_info!(
+                        "[BT] task={} deferred pause failed: {e:#}",
+                        short_id(&task_id)
+                    ),
+                }
+            }
+        });
+    }
+
     /// Resume a previously paused BT torrent.  Returns the handle if
-    /// successful, or `None` if no cached handle exists (caller should
-    /// fall back to `add_torrent`).
+    /// successful, or `None` if no cached handle exists **or the cached
+    /// torrent cannot be revived in place** (caller falls back to a full
+    /// `add_torrent` re-add).
+    ///
+    /// Error 态的缓存句柄同样经 `unpause` 复活：librqbit 的 start 会从
+    /// Error 重建 Initializing（previously_errored：跳过 `.bitv`、全量读盘
+    /// 重检）再转 Live——数据保留，只付一次校验。复活失败（如 storage
+    /// 重建失败）时把 torrent 从会话摘除（保留磁盘文件）并返回 `None`，
+    /// 让调用方走完整 re-add 路径自愈。
     pub async fn resume_task(&self, task_id: &str) -> Result<Option<BtHandle>, DownloadError> {
         // Clone the Arc handle and release the lock immediately.
         let handle = self.handles.lock().await.get(task_id).cloned();
         if let Some(handle) = handle {
-            if handle.is_paused() {
-                self.session
-                    .unpause(&handle)
-                    .await
-                    .map_err(|e| DownloadError::Other(format!("BT unpause failed: {e}")))?;
+            // 作废可能在途的延迟暂停（pause 发起于初检期、尚未落地）。
+            self.bump_pause_epoch(task_id).await;
+            let in_error = matches!(handle.stats().state, librqbit::TorrentStatsState::Error);
+            if handle.is_paused() || in_error {
+                if let Err(e) = self.session.unpause(&handle).await {
+                    log_info!(
+                        "[BT] task={} unpause failed: {e:#} — evicting cached torrent for re-add",
+                        short_id(task_id)
+                    );
+                    let _ = self.delete_task(task_id, false).await;
+                    return Ok(None);
+                }
+                // 跨暂停窗口恢复：暂停期间磁盘可能被外部改动而内存位图
+                // 不知情，完成期保留全量重哈希兜底。
+                self.mark_fastresume_tainted(task_id).await;
                 log_info!("[BT] task={} resumed via session API", short_id(task_id));
             }
             Ok(Some(handle))
         } else {
             Ok(None)
         }
+    }
+
+    /// 是否存在「已暂停（或初检中带延迟暂停）的未完成 torrent」。
+    ///
+    /// download_manager 用它决定 BT 会话保活：拆会话连带丢句柄缓存，恢复
+    /// 就得重走 add_torrent + fastresume 采样校验 + peer swarm 冷启动；保留
+    /// 会话则恢复只是 unpause（Paused→Live，零校验、秒级）。已完成的
+    /// torrent 不计入——做种由 `has_seeders` 单独保活，做种关闭的完成任务
+    /// 不应钉住会话。
+    pub async fn has_paused_incomplete(&self) -> bool {
+        let handles: Vec<BtHandle> = self.handles.lock().await.values().cloned().collect();
+        handles.iter().any(|h| {
+            let s = h.stats();
+            !s.finished
+                && matches!(
+                    s.state,
+                    librqbit::TorrentStatsState::Paused | librqbit::TorrentStatsState::Initializing
+                )
+        })
     }
 
     /// Get the cached torrent handle without changing its pause state.
@@ -1005,6 +1129,10 @@ impl SharedBtSession {
         // Ensure the task is also removed from the seeding manager so completed
         // torrents do not keep being evaluated after deletion.
         let _ = self.unregister_seeder(task_id).await;
+        // 世代号与 fastresume 污点随任务删除：torrent 离开会话后这两份
+        // 状态即失效，下次 re-add 会重新计算。同时作废在途的延迟暂停。
+        self.pause_epochs.lock().await.remove(task_id);
+        self.fastresume_tainted.lock().await.remove(task_id);
         // parts 边车随任务删除（handle 是否在册都要删；session.delete 的
         // remove_files 只处理数据文件，不认识边车）。
         crate::bt_partfile::remove_sidecar(&self.parts_sidecar_path(task_id));
@@ -2852,13 +2980,23 @@ pub fn build_add_torrent_options(
     output_folder: String,
     upload_limit_bps: u64,
 ) -> AddTorrentOptions {
-    AddTorrentOptions {
+    let mut opts = AddTorrentOptions {
         overwrite: true,
         output_folder: Some(output_folder),
         only_files: strategy.only_files_for_add(),
         ratelimits: task_ratelimits(upload_limit_bps),
         ..Default::default()
+    };
+    // NTFS 上 staging 文件走 sparse 存储：set_len 不再一次性预留全部簇，
+    // 随机偏移 piece 写入没有 VDL 零填充（见 `bt_sparse` 模块文档）。
+    // 其他平台 set_len 天然稀疏，保持 librqbit 默认存储。
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(folder) = opts.output_folder.clone() {
+            opts.storage_factory = Some(crate::bt_sparse::sparse_fs_factory(PathBuf::from(folder)));
+        }
     }
+    opts
 }
 
 /// 任务级限速 → librqbit torrent 级 [`librqbit::limits::LimitsConfig`]。
@@ -3090,6 +3228,17 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             if !stage_dir_has_real_data(&stage_dir) {
                 shared_bt.clear_stale_fastresume(&hash);
             }
+            // 走到这里 `.bitv` 仍存在 ⇒ 本次 add 的 have-bits 可能经采样式
+            // fastresume 校验恢复（对哈希不匹配宽容）——完成期保留全量
+            // 重哈希。反之（无位图）librqbit 只能全量初检 + Live 逐片
+            // 写盘读回校验，have-bits 全部有磁盘依据。
+            if shared_bt.bitv_path(&hash).exists() {
+                shared_bt.mark_fastresume_tainted(&task_id).await;
+            }
+        } else {
+            // info-hash 未知（异常 magnet / 损坏种子字节）：无从判断是否
+            // 存在既有位图，保守按「可能恢复」处理。
+            shared_bt.mark_fastresume_tainted(&task_id).await;
         }
         let stage_dir_str = stage_dir.to_string_lossy().into_owned();
         // A known subset must be baked into add options here; a post-add update
@@ -4146,81 +4295,103 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                         // (or copied there while `src` could not be removed);
                         // verify those final files before counting them as a
                         // prior successful move.
-                        log_info!(
-                            "[BT] task={} verifying {} pieces before completing...",
-                            short_id(&task_id),
-                            total_pieces
-                        );
-                        let verify_started = Instant::now();
-                        let verified_existing_dsts = match verify_staged_pieces(
-                            handle.clone(),
-                            stage_dir.clone(),
-                            true_selection.clone(),
-                            layout.moves.clone(),
-                            retrying_completion,
-                        )
-                        .await
-                        {
-                            Ok(outcome) if outcome.bad.is_empty() => {
-                                log_info!(
-                                    "[BT] task={} piece verification passed ({} hashed, {} skipped) in {:.1}s",
-                                    short_id(&task_id),
-                                    outcome.checked,
-                                    outcome.skipped,
-                                    verify_started.elapsed().as_secs_f64()
-                                );
-                                dst_fallback_candidates
-                            }
-                            Ok(outcome) => {
-                                let preview: Vec<u32> =
-                                    outcome.bad.iter().take(16).copied().collect();
-                                log_info!(
-                                    "[BT] task={} piece verification FAILED: {}/{} pieces bad (first: {:?}) in {:.1}s — clearing fastresume state, bad pieces will be re-downloaded",
-                                    short_id(&task_id),
-                                    outcome.bad.len(),
-                                    total_pieces,
-                                    preview,
-                                    verify_started.elapsed().as_secs_f64()
-                                );
-                                let _ = shared_bt.delete_task(&task_id, false).await;
-                                let msg = format!(
-                                    "BT piece verification failed: {} bad piece(s) — data will be re-checked and re-downloaded",
-                                    outcome.bad.len()
-                                );
-                                let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
-                                let _ = progress_tx
-                                    .send(ProgressUpdate {
-                                        task_id: task_id.clone(),
-                                        downloaded_bytes: progress,
-                                        total_bytes: total,
-                                        status: STATUS_ERROR,
-                                        error_message: msg.clone(),
-                                        file_name: String::new(),
-                                        segment_details: None,
-                                        ..Default::default()
-                                    })
-                                    .await;
-                                return Err(DownloadError::Other(msg));
-                            }
-                            Err(e) => {
-                                // Internal verification error (e.g. metadata gone)
-                                // should not block completion; preserve the previous
-                                // best-effort behavior.
-                                log_info!(
-                                    "[BT] task={} piece verification skipped: {}",
-                                    short_id(&task_id),
-                                    e
-                                );
-                                HashSet::new()
+                        //
+                        // 全量重哈希只在 have-bits 缺乏磁盘依据时才必要：
+                        // add 时存在既有位图（采样校验对哈希不匹配宽容）、
+                        // 或经缓存句柄跨暂停恢复（暂停期磁盘可能被外部改动
+                        // 而内存位图不知情）、或完成重试（需要验证既有 dst
+                        // 才能算 PriorSuccess）。首次完成且无上述污点时，
+                        // 每个 have 位都来自「全量初检读盘」或「Live 下载的
+                        // 写盘后读回 SHA1 校验」，重哈希是纯冗余——大种子
+                        // 因此省下分钟级的完成尾巴。
+                        let full_verify_needed =
+                            retrying_completion || shared_bt.is_fastresume_tainted(&task_id).await;
+                        let verified_existing_dsts = if !full_verify_needed {
+                            log_info!(
+                                "[BT] task={} skipping completion re-hash — every piece was disk-verified in this session",
+                                short_id(&task_id)
+                            );
+                            HashSet::new()
+                        } else {
+                            log_info!(
+                                "[BT] task={} verifying {} pieces before completing...",
+                                short_id(&task_id),
+                                total_pieces
+                            );
+                            let verify_started = Instant::now();
+                            match verify_staged_pieces(
+                                handle.clone(),
+                                stage_dir.clone(),
+                                true_selection.clone(),
+                                layout.moves.clone(),
+                                retrying_completion,
+                            )
+                            .await
+                            {
+                                Ok(outcome) if outcome.bad.is_empty() => {
+                                    log_info!(
+                                        "[BT] task={} piece verification passed ({} hashed, {} skipped) in {:.1}s",
+                                        short_id(&task_id),
+                                        outcome.checked,
+                                        outcome.skipped,
+                                        verify_started.elapsed().as_secs_f64()
+                                    );
+                                    dst_fallback_candidates
+                                }
+                                Ok(outcome) => {
+                                    let preview: Vec<u32> =
+                                        outcome.bad.iter().take(16).copied().collect();
+                                    log_info!(
+                                        "[BT] task={} piece verification FAILED: {}/{} pieces bad (first: {:?}) in {:.1}s — clearing fastresume state, bad pieces will be re-downloaded",
+                                        short_id(&task_id),
+                                        outcome.bad.len(),
+                                        total_pieces,
+                                        preview,
+                                        verify_started.elapsed().as_secs_f64()
+                                    );
+                                    let _ = shared_bt.delete_task(&task_id, false).await;
+                                    let msg = format!(
+                                        "BT piece verification failed: {} bad piece(s) — data will be re-checked and re-downloaded",
+                                        outcome.bad.len()
+                                    );
+                                    let _ =
+                                        db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
+                                    let _ = progress_tx
+                                        .send(ProgressUpdate {
+                                            task_id: task_id.clone(),
+                                            downloaded_bytes: progress,
+                                            total_bytes: total,
+                                            status: STATUS_ERROR,
+                                            error_message: msg.clone(),
+                                            file_name: String::new(),
+                                            segment_details: None,
+                                            ..Default::default()
+                                        })
+                                        .await;
+                                    return Err(DownloadError::Other(msg));
+                                }
+                                Err(e) => {
+                                    // Internal verification error (e.g. metadata gone)
+                                    // should not block completion; preserve the previous
+                                    // best-effort behavior.
+                                    log_info!(
+                                        "[BT] task={} piece verification skipped: {}",
+                                        short_id(&task_id),
+                                        e
+                                    );
+                                    HashSet::new()
+                                }
                             }
                         };
                         // parts 边车：记录「选中 file_id → 最终磁盘路径」映射，
                         // 并从 staging 副产物提取跨文件边界 piece 中未选文件的
-                        // 字节（上面的整体重哈希刚验证过这些字节）。重启续种
-                        // re-add 依赖它：不再按 torrent 内部布局在 save_dir 重建
-                        // 未选文件的 0 字节占位，且边界 piece 校验/上传拿到真实
-                        // 数据；扁平化/去重/重命名后的路径也能对上。写失败仅
-                        // 记日志——续种回退到无边车的旧行为，不阻塞完成。
+                        // 字节（这些字节属于已 have 的边界 piece：要么刚被上面
+                        // 的全量重哈希验证过，要么在 Live 下载时经写盘后读回
+                        // 校验）。重启续种 re-add 依赖它：不再按 torrent 内部
+                        // 布局在 save_dir 重建未选文件的 0 字节占位，且边界
+                        // piece 校验/上传拿到真实数据；扁平化/去重/重命名后的
+                        // 路径也能对上。写失败仅记日志——续种回退到无边车的
+                        // 旧行为，不阻塞完成。
                         {
                             let selected_ids: Vec<usize> = handle
                                 .with_metadata(|meta| {

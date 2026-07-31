@@ -158,7 +158,7 @@ function GeneralTab({ t, queues, groups }: { t: ViewTask; queues: QueueDto[]; gr
         <div className="d-progress-num">
           <b>{pct}%</b>
           <span>
-            {statusText(t.status)}
+            {t.status === 5 && t.totalBytes > 0 ? tr('status.verifyingFiles') : statusText(t.status)}
             {t.status === 1 ? ` · ${tr('detail.remaining', { eta: fmtEta(t.totalBytes - t.downloadedBytes, t.speed) })}` : ''}
           </span>
         </div>

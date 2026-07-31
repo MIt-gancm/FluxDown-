@@ -10,6 +10,9 @@ pub mod bt_downloader;
 /// BT 部分选择做种的 parts 边车（选中文件路径映射 + 跨文件边界字节）。
 pub mod bt_partfile;
 pub mod bt_seeding;
+/// BT staging 文件的 NTFS sparse 存储包装（免预留簇 / 免 VDL 零填充）。
+#[cfg(target_os = "windows")]
+pub mod bt_sparse;
 pub mod cdn;
 pub mod components;
 pub mod dash_downloader;
