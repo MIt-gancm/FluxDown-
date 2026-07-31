@@ -631,6 +631,8 @@
   "set.download.uaCustomPlaceholder": "Custom User-Agent",
   "set.download.serverTime": "Use server file time",
   "set.download.serverTimeDesc": "Set completed files' modified time to the server-provided Last-Modified instead of the completion time",
+  "set.download.silentSkipSelection": "Skip selection dialogs",
+  "set.download.silentSkipSelectionDesc": "Tasks submitted via the browser extension or takeover start right away with defaults (all files / best quality) instead of waiting for a selection in the web UI",
   "set.download.fileExists": "When file exists",
   "set.download.fileExistsDesc": "Automatically rename duplicate files by appending a number, or overwrite the existing file",
   "set.download.fileExistsRename": "Auto rename",

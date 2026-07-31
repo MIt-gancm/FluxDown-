@@ -35,6 +35,10 @@ pub enum ActorCmd {
         req: Box<CreateTaskRequest>,
         /// 文件大小提示（aria2/接管入口透传；REST 创建为 0）。
         hint_file_size: i64,
+        /// 无人值守创建（接管入口 + config `silent_skip_selection` 开启时
+        /// true）：跳过 BT 文件/HLS·DASH 画质/插件变体的 WS 选择往返，直接
+        /// 按默认开始。REST/aria2 创建恒 false（Web 弹窗仍有人在场）。
+        unattended: bool,
         ack: oneshot::Sender<Result<String, ApiError>>,
     },
     PauseTask {
@@ -345,6 +349,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
         ActorCmd::CreateTask {
             req,
             hint_file_size,
+            unattended,
             ack,
         } => {
             let req = *req;
@@ -397,6 +402,7 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                     http_user: req.http_user,
                     http_password: req.http_password,
                     save_site_auth: req.save_site_auth,
+                    unattended_selection: unattended,
                     ..Default::default()
                 })
                 .await;

@@ -662,6 +662,7 @@ async fn select_variant(
     variants: &[HlsVariant],
     selector: &dyn crate::selection::HostSelection,
     cancel_token: &tokio_util::sync::CancellationToken,
+    unattended: bool,
 ) -> Result<String, DownloadError> {
     let auto_select_best = || -> Result<String, DownloadError> {
         let best = variants
@@ -677,12 +678,16 @@ async fn select_variant(
         Ok(best.uri.clone())
     };
 
-    // Skip the selector entirely when there is only one variant — no point asking.
-    if variants.len() <= 1 {
+    // Skip the selector entirely when there is only one variant — no point
+    // asking — or when the task was created unattended (RSS / silent takeover):
+    // popping a dialog nobody is around to answer just delays the download by
+    // the selection timeout.
+    if variants.len() <= 1 || unattended {
         log_info!(
-            "[hls-download] task {} only {} variant(s), skipping quality dialog",
+            "[hls-download] task {} skipping quality dialog ({} variant(s), unattended={})",
             task_id,
-            variants.len()
+            variants.len(),
+            unattended
         );
         return auto_select_best();
     }
@@ -789,8 +794,14 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // 行为不变。
     let (segments, media_sequence, media_playlist_url) = match content {
         M3u8Content::Master { variants } => {
-            let selected_uri =
-                select_variant(&p.task_id, &variants, p.selector.as_ref(), &p.cancel_token).await?;
+            let selected_uri = select_variant(
+                &p.task_id,
+                &variants,
+                p.selector.as_ref(),
+                &p.cancel_token,
+                p.unattended,
+            )
+            .await?;
 
             if p.cancel_token.is_cancelled() {
                 return Err(DownloadError::Cancelled);

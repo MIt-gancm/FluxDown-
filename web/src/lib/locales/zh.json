@@ -631,6 +631,8 @@
   "set.download.uaCustomPlaceholder": "自定义 User-Agent",
   "set.download.serverTime": "使用服务器文件时间",
   "set.download.serverTimeDesc": "下载完成后将文件修改时间设为服务器提供的 Last-Modified，而非下载完成时间",
+  "set.download.silentSkipSelection": "跳过二次选择弹窗",
+  "set.download.silentSkipSelectionDesc": "通过浏览器扩展/脚本接管提交的任务不再等待网页端选择（BT 文件/画质），直接按默认（全部文件 / 最高画质）开始下载",
   "set.download.fileExists": "文件已存在时",
   "set.download.fileExistsDesc": "重名文件自动追加序号重命名，或直接覆盖旧文件",
   "set.download.fileExistsRename": "自动重命名",

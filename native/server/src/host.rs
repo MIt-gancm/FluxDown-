@@ -170,6 +170,7 @@ impl ApiHost for ServerApiHost {
         self.send_cmd(|ack| ActorCmd::CreateTask {
             req: Box::new(req),
             hint_file_size: 0,
+            unattended: false,
             ack,
         })
         .await?
@@ -257,6 +258,17 @@ impl ApiHost for ServerApiHost {
             demo_guard(self.demo_url.as_deref(), url)?;
         }
         let single = urls.len() == 1;
+        // 「免打扰跳过二次选择」：接管入口（浏览器扩展远程投递/脚本）没有
+        // 人在场，config 开启时创建的任务跳过 BT 文件/HLS·DASH 画质/插件
+        // 变体的 WS 选择往返（不必白等 60s 兜底超时）。现读 DB，改动即生效。
+        let unattended = self
+            .db
+            .get_config("silent_skip_selection")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v == "true")
+            .unwrap_or(false);
         for url in urls {
             let create = CreateTaskRequest {
                 url: url.to_string(),
@@ -291,6 +303,7 @@ impl ApiHost for ServerApiHost {
                 } else {
                     0
                 },
+                unattended,
                 ack,
             })
             .await??;

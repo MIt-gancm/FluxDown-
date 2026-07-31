@@ -114,6 +114,11 @@ pub struct BatchCreateTask {
     /// 稍后下载：true = 批次内任务全部建为 paused，不启动。
     #[serde(default)]
     pub start_paused: bool,
+    /// 无人值守创建（免打扰下载 + 「跳过二次选择」子开关）：批次内任务
+    /// 跳过 BT 文件/HLS·DASH 画质/插件变体选择弹窗，直接按默认开始。
+    /// 手动新建/快速下载路径恒 false。
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 /// Control an existing task (pause/resume/cancel/delete)
@@ -318,6 +323,11 @@ pub struct ConfirmExternalDownload {
     /// 为此网站保存凭据。
     #[serde(default)]
     pub save_site_auth: bool,
+    /// 无人值守创建（免打扰下载 + 「跳过二次选择」子开关）：跳过 BT 文件/
+    /// HLS·DASH 画质/插件变体选择弹窗，直接按默认开始。用户点确认框的
+    /// 路径恒 false（人在场，弹窗有意义）。
+    #[serde(default)]
+    pub unattended: bool,
 }
 
 // ========== Config signals ==========

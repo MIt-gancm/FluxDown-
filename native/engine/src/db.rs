@@ -659,6 +659,12 @@ impl Db {
         // coordinator 侧状态机更新。
         self.add_column_if_missing("tasks", "auto_route", "TEXT NOT NULL DEFAULT ''")
             .await?;
+        // 无人值守创建标记（外部接管/RSS 等自动化入口 + 「免打扰跳过二次选择」
+        // 开启时置 1）：start/resume 读它决定 HLS/DASH 画质与插件变体选择是否
+        // 跳过 HostSelection 弹窗、直接取默认值。BT 文件选择不读此列——建任务
+        // 时已按「全部文件」写 bt_selected_files（既有三态语义，见 create_task）。
+        self.add_column_if_missing("tasks", "unattended", "INTEGER NOT NULL DEFAULT 0")
+            .await?;
         // BT 做种：上传量累计 / 完成时基线 / 做种状态机 / 起始时间
         // （见 bt_seeding.rs）。旧库缺列时所有做种写库与 TASK_COLUMNS
         // 查询都会直接报 "no such column"，必须幂等补齐。
@@ -2784,6 +2790,26 @@ impl Db {
         Ok(row
             .map(|r| r.try_get::<String, _>("resolver_item").unwrap_or_default())
             .unwrap_or_default())
+    }
+
+    /// 标记任务为无人值守创建（只置 1，不提供回退——任务级创建时决策）。
+    pub async fn set_task_unattended(&self, task_id: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE tasks SET unattended = 1 WHERE id = $1")
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// 任务是否为无人值守创建（读不到/任务不存在按 false 兜底）。
+    pub async fn is_task_unattended(&self, task_id: &str) -> Result<bool, DbError> {
+        let row = sqlx::query("SELECT unattended FROM tasks WHERE id = $1")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row
+            .map(|r| r.try_get::<i32, _>("unattended").unwrap_or(0) != 0)
+            .unwrap_or(false))
     }
 
     /// 组内成员任务 ID，按启动顺序排列（`queue_order` → `created_at`）。

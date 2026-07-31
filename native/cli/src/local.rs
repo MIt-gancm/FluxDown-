@@ -101,6 +101,9 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
                 user_agent: args.user_agent.clone().unwrap_or_default(),
                 queue_id: args.queue.clone().unwrap_or_default(),
                 checksum: args.checksum.clone().unwrap_or_default(),
+                http_user: args.http_user.clone().unwrap_or_default(),
+                http_password: args.http_passwd.clone().unwrap_or_default(),
+                save_site_auth: args.save_auth,
                 ..Default::default()
             })
             .await;

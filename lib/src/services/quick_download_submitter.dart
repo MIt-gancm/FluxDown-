@@ -173,6 +173,8 @@ void submitQuickDownload({
         httpUser: result.httpUser,
         httpPassword: result.httpPassword,
         saveSiteAuth: result.saveSiteAuth,
+        // 用户在场确认路径：保留二次选择弹窗
+        unattended: false,
       ).sendSignalToRust();
     } else {
       // 单条带校验 — ConfirmExternalDownload 信号无 checksum 字段，
@@ -197,6 +199,8 @@ void submitQuickDownload({
         cookies: result.cookies,
         referrer: referrer,
         extraHeaders: result.extraHeaders,
+        // 用户在场确认路径：保留二次选择弹窗
+        unattended: false,
       ).sendSignalToRust();
     }
   } else {
@@ -222,6 +226,8 @@ void submitQuickDownload({
       cookies: result.cookies,
       referrer: referrer,
       extraHeaders: result.extraHeaders,
+      // 用户在场确认路径：保留二次选择弹窗
+      unattended: false,
     ).sendSignalToRust();
   }
 }

@@ -431,6 +431,38 @@ export function NewDownloadDialog() {
                 {t('newDl.advanced')}
               </button>
               <div className={cn('adv-panel', form.advOpen && 'open')}>
+                <label className="field-label">{t('newDl.httpAuth')}</label>
+                <div className="grid2">
+                  <input
+                    className="text-input"
+                    type="text"
+                    spellCheck={false}
+                    autoComplete="off"
+                    placeholder={t('newDl.httpAuthUser')}
+                    aria-label={t('newDl.httpAuthUser')}
+                    value={form.httpUser}
+                    onChange={(e) => set('httpUser', e.target.value)}
+                  />
+                  <input
+                    className="text-input"
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder={t('newDl.httpAuthPassword')}
+                    aria-label={t('newDl.httpAuthPassword')}
+                    value={form.httpPassword}
+                    onChange={(e) => set('httpPassword', e.target.value)}
+                  />
+                </div>
+                <label className="mcheck mt-2">
+                  <input
+                    type="checkbox"
+                    checked={form.saveSiteAuth}
+                    onChange={(e) => set('saveSiteAuth', e.target.checked)}
+                  />
+                  <i />
+                  {t('newDl.httpAuthSave')}
+                </label>
+                <p className="mt-1 text-xs text-text3">{t('newDl.httpAuthHint')}</p>
                 <label className="field-label" htmlFor="nd-cookies">
                   {t('newDl.cookies')}
                 </label>
@@ -499,38 +531,6 @@ export function NewDownloadDialog() {
                   value={form.checksum}
                   onChange={(e) => set('checksum', e.target.value)}
                 />
-                <label className="field-label">{t('newDl.httpAuth')}</label>
-                <div className="grid2">
-                  <input
-                    className="text-input"
-                    type="text"
-                    spellCheck={false}
-                    autoComplete="off"
-                    placeholder={t('newDl.httpAuthUser')}
-                    aria-label={t('newDl.httpAuthUser')}
-                    value={form.httpUser}
-                    onChange={(e) => set('httpUser', e.target.value)}
-                  />
-                  <input
-                    className="text-input"
-                    type="password"
-                    autoComplete="new-password"
-                    placeholder={t('newDl.httpAuthPassword')}
-                    aria-label={t('newDl.httpAuthPassword')}
-                    value={form.httpPassword}
-                    onChange={(e) => set('httpPassword', e.target.value)}
-                  />
-                </div>
-                <label className="mcheck mt-2">
-                  <input
-                    type="checkbox"
-                    checked={form.saveSiteAuth}
-                    onChange={(e) => set('saveSiteAuth', e.target.checked)}
-                  />
-                  <i />
-                  {t('newDl.httpAuthSave')}
-                </label>
-                <p className="mt-1 text-xs text-text3">{t('newDl.httpAuthHint')}</p>
               </div>
               {Object.keys(lineErrors).length > 0 && (
                 <div className="mt-3 flex flex-col gap-1">

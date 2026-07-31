@@ -915,6 +915,8 @@ class DownloadController extends ChangeNotifier {
       ignoreTlsErrors: ignoreTlsErrors,
       extraHeaders: extraHeaders,
       startPaused: startPaused,
+      // 手动新建路径（用户在场）：保留二次选择弹窗
+      unattended: false,
     ).sendSignalToRust();
   }
 

@@ -2121,12 +2121,14 @@ impl DownloadManager {
                 generation: spawn_gen,
             },
         );
+        let unattended = self.db.is_task_unattended(task_id).await.unwrap_or(false);
         self.spawn_resolve_worker(
             task_id.to_string(),
             identity,
             req,
             ResolveKind::Resume,
             spawn_gen,
+            unattended,
         );
     }
 
@@ -5153,6 +5155,9 @@ impl DownloadManager {
                 &task_proxy,
                 self.resolved_task_ua(&user_agent, &queue_id),
             );
+            // 无人值守标记只被 HLS/DASH 画质选择消费，其余协议不多查一次库。
+            let task_unattended = (use_hls || use_dash)
+                && self.db.is_task_unattended(&task_id).await.unwrap_or(false);
             let params = DownloadParams {
                 task_id: task_id.clone(),
                 url,
@@ -5188,6 +5193,7 @@ impl DownloadManager {
                 ffmpeg_path: crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await,
                 cdn,
                 auto_proxy: auto_ctx,
+                unattended: task_unattended,
             };
 
             tokio::spawn(async move {
@@ -6029,6 +6035,9 @@ impl DownloadManager {
             // 多 CDN 聚合输入（resume：UA 只有全局值可用，与上方 client 构建一致）。
             let cdn =
                 self.cdn_task_input(task.ignore_tls_errors, &task_proxy, &self.global_user_agent);
+            // 无人值守标记只被 HLS/DASH 画质选择消费，其余协议不多查一次库。
+            let task_unattended =
+                (use_hls || use_dash) && self.db.is_task_unattended(&tid).await.unwrap_or(false);
             let params = DownloadParams {
                 task_id: tid.clone(),
                 url: task.url,
@@ -6068,6 +6077,7 @@ impl DownloadManager {
                 ffmpeg_path: crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await,
                 cdn,
                 auto_proxy: auto_ctx,
+                unattended: task_unattended,
             };
 
             tokio::spawn(async move {

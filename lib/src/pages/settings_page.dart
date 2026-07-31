@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
@@ -347,6 +348,13 @@ List<SettingsSearchItem> get settingsSearchItems {
       description: s.silentDownloadDesc,
       keywords: s.searchKeywordsSilentDownload,
       icon: LucideIcons.bellOff,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.download,
+      label: s.silentSkipSelection,
+      description: s.silentSkipSelectionDesc,
+      keywords: s.searchKeywordsSilentSkipSelection,
+      icon: LucideIcons.listChecks,
     ),
     SettingsSearchItem(
       category: SettingsCategory.download,
@@ -3141,6 +3149,17 @@ class _DownloadContent extends StatelessWidget {
                         settingsProvider.setSilentDownloadEnabled(v),
                   ),
                 ),
+                // 免打扰子开关：仅父开关开启时显示（沿用页内集合 if 条件行模式）
+                if (settingsProvider.silentDownloadEnabled)
+                  _SettingRow(
+                    label: s.silentSkipSelection,
+                    description: s.silentSkipSelectionDesc,
+                    child: ShadSwitch(
+                      value: settingsProvider.silentSkipSelection,
+                      onChanged: (v) =>
+                          settingsProvider.setSilentSkipSelection(v),
+                    ),
+                  ),
                 _SettingRow(
                   label: s.useServerTime,
                   description: s.useServerTimeDesc,
@@ -3289,6 +3308,13 @@ class _DownloadContent extends StatelessWidget {
                 ),
               ],
             ),
+            _SettingsGroup(
+              title: s.settingsSiteAuthTitle,
+              subtitle: s.settingsSiteAuthDesc,
+              children: [
+                _SiteAuthCredentialList(settingsProvider: settingsProvider),
+              ],
+            ),
           ],
         );
       },
@@ -3339,6 +3365,109 @@ class _DefaultQueueSelector extends StatelessWidget {
       onChanged: (v) {
         if (v != null) settingsProvider.setDefaultQueueId(v);
       },
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// 已保存的网站凭据（HTTP Basic，设备本地）
+// ─────────────────────────────────────────────
+
+/// 列出引擎按站点保存的 HTTP Basic 凭据（站点 + 用户名，不显示密码），
+/// 每行可删除；删除后整体 JSON 写回 config。空态显示提示文案。
+class _SiteAuthCredentialList extends StatelessWidget {
+  final SettingsProvider settingsProvider;
+
+  const _SiteAuthCredentialList({required this.settingsProvider});
+
+  /// 解析 config JSON 为 站点 → 用户名（密码不进 UI 状态）。
+  static Map<String, String> _parse(String raw) {
+    if (raw.trim().isEmpty) return const {};
+    try {
+      final map = jsonDecode(raw);
+      if (map is! Map<String, dynamic>) return const {};
+      return {
+        for (final e in map.entries)
+          if (e.value is Map<String, dynamic>)
+            e.key: ((e.value as Map<String, dynamic>)['user'] as String?) ?? '',
+      };
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  void _delete(String site) {
+    try {
+      final map = jsonDecode(settingsProvider.siteAuthCredentials);
+      if (map is! Map<String, dynamic>) return;
+      map.remove(site);
+      settingsProvider.setSiteAuthCredentials(jsonEncode(map));
+    } catch (_) {
+      // JSON 损坏时不写回，避免把不可解析内容替换成空表
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final s = LocaleScope.of(context);
+    final sites = _parse(settingsProvider.siteAuthCredentials);
+    if (sites.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+        child: Text(
+          s.settingsSiteAuthEmpty,
+          style: TextStyle(fontSize: 12, color: c.textMuted),
+        ),
+      );
+    }
+    final entries = sites.entries.toList()
+      ..sort((a, b) => a.key.compareTo(b.key));
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final e in entries)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            child: Row(
+              children: [
+                Icon(LucideIcons.globe, size: 14, color: c.textMuted),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    e.key,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: TextStyle(fontSize: 12.5, color: c.textPrimary),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    e.value,
+                    overflow: TextOverflow.ellipsis,
+                    maxLines: 1,
+                    style: TextStyle(fontSize: 12, color: c.textMuted),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                ShadTooltip(
+                  effects: const [],
+                  builder: (_) => Text(s.settingsSiteAuthDelete),
+                  child: ShadButton.ghost(
+                    size: ShadButtonSize.sm,
+                    onPressed: () => _delete(e.key),
+                    child: Icon(
+                      LucideIcons.trash2,
+                      size: 14,
+                      color: c.statusError,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+      ],
     );
   }
 }

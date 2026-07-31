@@ -160,6 +160,8 @@ class ExternalDownloadService {
         httpUser: '',
         httpPassword: '',
         saveSiteAuth: false,
+        // 分支已被 silentDownloadEnabled 门控，unattended 直接取子开关值
+        unattended: trackSettings.silentSkipSelection,
       ).sendSignalToRust();
       return;
     }
@@ -211,6 +213,8 @@ class ExternalDownloadService {
             httpUser: '',
             httpPassword: '',
             saveSiteAuth: false,
+            // 分支已被 silentDownloadEnabled 门控，unattended 直接取子开关值
+            unattended: silentSettings.silentSkipSelection,
           ).sendSignalToRust();
         } else {
           BatchCreateTask(
@@ -234,6 +238,8 @@ class ExternalDownloadService {
             referrer: req.referrer,
             extraHeaders: const {},
             startPaused: false,
+            // 分支已被 silentDownloadEnabled 门控，unattended 直接取子开关值
+            unattended: silentSettings.silentSkipSelection,
           ).sendSignalToRust();
         }
         return;

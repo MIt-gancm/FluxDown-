@@ -713,6 +713,8 @@ class S {
   String get notifyOnCompleteDesc => _r('notifyOnCompleteDesc');
   String get silentDownload => _r('silentDownload');
   String get silentDownloadDesc => _r('silentDownloadDesc');
+  String get silentSkipSelection => _r('silentSkipSelection');
+  String get silentSkipSelectionDesc => _r('silentSkipSelectionDesc');
   String get useServerTime => _r('useServerTime');
   String get useServerTimeDesc => _r('useServerTimeDesc');
   String get fileExistsBehavior => _r('fileExistsBehavior');
@@ -1113,6 +1115,19 @@ class S {
   String get taskHeadersValuePlaceholder => _r('taskHeadersValuePlaceholder');
   String get taskHeadersAdd => _r('taskHeadersAdd');
 
+  // 任务 HTTP Basic 认证（新建下载/快速下载高级选项）
+  String get taskHttpAuth => _r('taskHttpAuth');
+  String get taskHttpAuthDesc => _r('taskHttpAuthDesc');
+  String get taskHttpAuthUser => _r('taskHttpAuthUser');
+  String get taskHttpAuthPassword => _r('taskHttpAuthPassword');
+  String get taskHttpAuthSaveForSite => _r('taskHttpAuthSaveForSite');
+
+  // 设置 — 已保存的网站凭据（设备本地）
+  String get settingsSiteAuthTitle => _r('settingsSiteAuthTitle');
+  String get settingsSiteAuthDesc => _r('settingsSiteAuthDesc');
+  String get settingsSiteAuthEmpty => _r('settingsSiteAuthEmpty');
+  String get settingsSiteAuthDelete => _r('settingsSiteAuthDelete');
+
   // ─────────────────────────────────────────────
   // Settings — API 服务
   // ─────────────────────────────────────────────
@@ -1422,6 +1437,9 @@ class S {
   List<String> get searchKeywordsSilentDownload =>
       _r('searchKeywordsSilentDownload').split(',')
         ..addAll(['silent', 'confirm', 'dialog']);
+  List<String> get searchKeywordsSilentSkipSelection =>
+      _r('searchKeywordsSilentSkipSelection').split(',')
+        ..addAll(['skip', 'selection', 'dialog']);
   List<String> get searchKeywordsUseServerTime =>
       _r('searchKeywordsUseServerTime').split(',')
         ..addAll(['time', 'timestamp', 'mtime', 'last-modified']);

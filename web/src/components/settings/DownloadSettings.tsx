@@ -25,6 +25,7 @@ export function DownloadSettings({
   const uploadKB = Math.floor(Number(config.upload_limit_bytes ?? '0') / KB)
   const ua = config.global_user_agent ?? ''
   const useServerTime = (config.use_server_time ?? 'false') === 'true'
+  const silentSkipSelection = (config.silent_skip_selection ?? 'false') === 'true'
   const cdnMultiEnabled = (config.cdn_multi_enabled ?? '0') === '1'
   const cdnMaxNodes = Number(config.cdn_max_nodes ?? '0')
   const proxyMode = config.proxy_mode ?? 'none'
@@ -118,6 +119,17 @@ export function DownloadSettings({
           <SetSwitch
             checked={useServerTime}
             onCheckedChange={(v) => mutate({ use_server_time: String(v) })}
+          />
+        </SetRow>
+        {/* headless 无确认弹框：接管入口（扩展远程投递/脚本）创建的任务开启后
+            跳过 BT 文件/画质的 WS 选择往返，直接按默认开始下载 */}
+        <SetRow
+          title={t('set.download.silentSkipSelection')}
+          desc={t('set.download.silentSkipSelectionDesc')}
+        >
+          <SetSwitch
+            checked={silentSkipSelection}
+            onCheckedChange={(v) => mutate({ silent_skip_selection: String(v) })}
           />
         </SetRow>
         <SetRow title={t('set.download.fileExists')} desc={t('set.download.fileExistsDesc')}>

@@ -41,6 +41,7 @@ class SettingsProvider extends ChangeNotifier {
   String _updateChannel = 'stable'; // 更新渠道：stable 稳定版 / frontier 预览版（含预发布）
   bool _notifyOnComplete = true; // 默认任务完成时弹出通知
   bool _silentDownloadEnabled = false; // 免打扰下载：外部请求不弹确认框直接下载
+  bool _silentSkipSelection = false; // 免打扰子开关：跳过 BT/HLS/变体二次选择弹窗
   bool _useServerTime = false; // 完成文件的修改时间采用服务器 Last-Modified
   bool _keepAwakeWhileDownloading = false; // 默认不阻止睡眠/息屏
   bool _analyticsEnabled = true; // 匿名使用统计（每日活跃）；首装事件不受此开关控制
@@ -273,6 +274,7 @@ class SettingsProvider extends ChangeNotifier {
   String get updateChannel => _updateChannel;
   bool get notifyOnComplete => _notifyOnComplete;
   bool get silentDownloadEnabled => _silentDownloadEnabled;
+  bool get silentSkipSelection => _silentSkipSelection;
   bool get useServerTime => _useServerTime;
   bool get keepAwakeWhileDownloading => _keepAwakeWhileDownloading;
   bool get analyticsEnabled => _analyticsEnabled;
@@ -715,6 +717,13 @@ class SettingsProvider extends ChangeNotifier {
     _silentDownloadEnabled = value;
     notifyListeners();
     _saveToRust('silent_download_enabled', value.toString());
+  }
+
+  void setSilentSkipSelection(bool value) {
+    if (_silentSkipSelection == value) return;
+    _silentSkipSelection = value;
+    notifyListeners();
+    _saveToRust('silent_skip_selection', value.toString());
   }
 
   void setUseServerTime(bool value) {
@@ -1879,6 +1888,8 @@ class SettingsProvider extends ChangeNotifier {
           _webhookEndpoints = WebhookEndpoint.decodeList(entry.value);
         case 'silent_download_enabled':
           _silentDownloadEnabled = entry.value == 'true'; // 默认 false
+        case 'silent_skip_selection':
+          _silentSkipSelection = entry.value == 'true'; // 默认 false
         case 'use_server_time':
           _useServerTime = entry.value == 'true'; // 默认 false
         case 'keep_awake_while_downloading':

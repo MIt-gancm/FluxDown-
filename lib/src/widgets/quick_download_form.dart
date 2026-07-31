@@ -849,6 +849,67 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
             ),
           ),
           if (_showAdvanced) ...[
+            if (!_isBatch) ...[
+              // HTTP Basic 认证 — 仅单条路径生效（批量传空）
+              const SizedBox(height: 10),
+              QuickSectionLabel(text: s.taskHttpAuth, c: c),
+              const SizedBox(height: 4),
+              Text(
+                s.taskHttpAuthDesc,
+                style: TextStyle(fontSize: 11, color: c.textMuted),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: ShadInput(
+                      controller: _httpAuthUserController,
+                      placeholder: Text(s.taskHttpAuthUser),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ShadInput(
+                      controller: _httpAuthPasswordController,
+                      placeholder: Text(s.taskHttpAuthPassword),
+                      obscureText: !_showHttpAuthPassword,
+                      trailing: MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          onTap: () => setState(
+                            () => _showHttpAuthPassword =
+                                !_showHttpAuthPassword,
+                          ),
+                          child: Icon(
+                            _showHttpAuthPassword
+                                ? LucideIcons.eyeOff
+                                : LucideIcons.eye,
+                            size: 14,
+                            color: c.textMuted,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      s.taskHttpAuthSaveForSite,
+                      style: TextStyle(fontSize: 12, color: c.textPrimary),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  ShadSwitch(
+                    value: _saveSiteAuth,
+                    onChanged: (v) => setState(() => _saveSiteAuth = v),
+                  ),
+                ],
+              ),
+            ],
             const SizedBox(height: 10),
             Row(
               children: [
@@ -1052,65 +1113,6 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
                       controller: _checksumController,
                       placeholder: Text(s.taskChecksumPlaceholder),
                     ),
-                  ),
-                ],
-              ),
-              // HTTP Basic 认证 — 仅单条路径生效（批量传空）
-              const SizedBox(height: 10),
-              QuickSectionLabel(text: s.taskHttpAuth, c: c),
-              const SizedBox(height: 4),
-              Text(
-                s.taskHttpAuthDesc,
-                style: TextStyle(fontSize: 11, color: c.textMuted),
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: ShadInput(
-                      controller: _httpAuthUserController,
-                      placeholder: Text(s.taskHttpAuthUser),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: ShadInput(
-                      controller: _httpAuthPasswordController,
-                      placeholder: Text(s.taskHttpAuthPassword),
-                      obscureText: !_showHttpAuthPassword,
-                      trailing: MouseRegion(
-                        cursor: SystemMouseCursors.click,
-                        child: GestureDetector(
-                          onTap: () => setState(
-                            () => _showHttpAuthPassword =
-                                !_showHttpAuthPassword,
-                          ),
-                          child: Icon(
-                            _showHttpAuthPassword
-                                ? LucideIcons.eyeOff
-                                : LucideIcons.eye,
-                            size: 14,
-                            color: c.textMuted,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 6),
-              Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      s.taskHttpAuthSaveForSite,
-                      style: TextStyle(fontSize: 12, color: c.textPrimary),
-                    ),
-                  ),
-                  const SizedBox(width: 12),
-                  ShadSwitch(
-                    value: _saveSiteAuth,
-                    onChanged: (v) => setState(() => _saveSiteAuth = v),
                   ),
                 ],
               ),

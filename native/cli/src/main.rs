@@ -113,6 +113,16 @@ struct AddArgs {
     /// Checksum 校验，格式 `algo=hexhash`。
     #[arg(long)]
     checksum: Option<String>,
+    /// HTTP Basic 认证用户名（aria2 `--http-user` 同义）。
+    #[arg(long = "http-user")]
+    http_user: Option<String>,
+    /// HTTP Basic 认证密码（aria2 `--http-passwd` 同义）。
+    #[arg(long = "http-passwd")]
+    http_passwd: Option<String>,
+    /// 为此网站保存认证凭据（需同时给出 `--http-user`），后续同站点
+    /// 任务未显式提供凭据时自动套用。
+    #[arg(long = "save-auth")]
+    save_auth: bool,
     /// 稍后下载：创建任务但不开始（aria2 `pause` 语义，进入所属队列
     /// 等待「启动队列」或手动恢复）。与 `--local` 互斥。
     #[arg(long)]
@@ -511,6 +521,9 @@ async fn cmd_add(client: &ApiClient, a: AddArgs, json: bool) -> Result<(), Clien
             body: None,
             audio_url: None,
             start_paused: a.pause,
+            http_user: a.http_user.clone().unwrap_or_default(),
+            http_password: a.http_passwd.clone().unwrap_or_default(),
+            save_site_auth: a.save_auth,
         };
         match client.create_task(&req).await {
             Ok(res) => created.push(res.task_id),

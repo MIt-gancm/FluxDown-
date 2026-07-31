@@ -1221,6 +1221,7 @@ pub async fn run(db_dir: PathBuf) {
                             body,
                             audio_url: if entry.audio_url.is_empty() { None } else { Some(entry.audio_url) },
                             start_paused: msg.start_paused,
+                            unattended_selection: msg.unattended,
                             ..Default::default()
                         })
                         .await;
@@ -1653,6 +1654,7 @@ pub async fn run(db_dir: PathBuf) {
                         http_user: msg.http_user,
                         http_password: msg.http_password,
                         save_site_auth: msg.save_site_auth,
+                        unattended_selection: msg.unattended,
                         ..Default::default()
                     })
                     .await;

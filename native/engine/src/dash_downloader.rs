@@ -323,6 +323,7 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         best_video,
         p.selector.as_ref(),
         &p.cancel_token,
+        p.unattended,
     )
     .await?;
     let repr = representations
@@ -1043,6 +1044,7 @@ async fn select_representation(
     adaptation: &dash_mpd::AdaptationSet,
     selector: &dyn crate::selection::HostSelection,
     cancel_token: &tokio_util::sync::CancellationToken,
+    unattended: bool,
 ) -> Result<usize, DownloadError> {
     let auto_select_best = || -> Result<usize, DownloadError> {
         let best = representations
@@ -1059,11 +1061,14 @@ async fn select_representation(
         Ok(best)
     };
 
-    if representations.len() <= 1 {
+    // 单一码率不必问；无人值守任务（RSS/免打扰接管）也不弹——没人会来点
+    // 弹窗，白等一个选择超时。两者都直接取最高码率（与超时默认值一致）。
+    if representations.len() <= 1 || unattended {
         log_info!(
-            "[dash-download] task {} only {} representation(s), skipping quality dialog",
+            "[dash-download] task {} skipping quality dialog ({} representation(s), unattended={})",
             task_id,
-            representations.len()
+            representations.len(),
+            unattended
         );
         return auto_select_best();
     }

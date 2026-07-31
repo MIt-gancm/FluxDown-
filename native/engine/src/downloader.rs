@@ -286,6 +286,10 @@ pub struct DownloadParams {
     /// `None` = 非 Auto 模式 / 无候选代理 / 已按缓存决策走代理启动——
     /// 三者都不存在「运行中切换」这回事，多段路径零行为变化。
     pub auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
+    /// 无人值守任务（`tasks.unattended`，RSS/免打扰接管创建）：HLS/DASH
+    /// 画质选择跳过 `HostSelection` 弹窗，直接取最高码率（与超时默认值
+    /// 一致）。仅 HLS/DASH 路径读取；BT 文件选择在创建时已落库，不经此。
+    pub unattended: bool,
 }
 
 /// 将浏览器扩展捕获的额外 HTTP 头应用到请求构建器上。
