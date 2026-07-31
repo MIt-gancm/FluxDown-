@@ -87,4 +87,4 @@ gh run watch
 - **预览版**：仅 `/api/release?channel=frontier` 与客户端"更新渠道 = 预览版"可见；预览资产经 `/api/download/<name>?tag=<rc-tag>` 下载。
 - **客户端更新判定**：`native/hub/src/updater.rs` 的 SemVer 比较器（含预发布精度）；渠道存于配置 `update_channel`（桌面/移动）、`web_update_channel`（web SPA）。
 
-细节见根 `AGENTS.md`「发布新版本」与 `.github/workflows/release.yml`。
+细节见根 `AGENTS.md`「git · 分支 · 发布」、`.omp/knowledge/ops.md`「发布与 CI」与 `.github/workflows/release.yml`。

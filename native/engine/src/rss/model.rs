@@ -5,7 +5,7 @@
 
 /// 条目在订阅流中的状态。
 ///
-/// wire 表示为 `i32`（与任务状态码同惯例，见 `AGENTS.md` §6），转换经
+/// wire 表示为 `i32`（与任务状态码同惯例，见 `.omp/knowledge/engine.md`），转换经
 /// [`RssItemStatus::as_i32`] / [`RssItemStatus::from_i32`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RssItemStatus {
