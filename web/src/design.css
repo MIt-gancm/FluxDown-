@@ -1234,6 +1234,7 @@ body {
   background: var(--accent-weak); margin-bottom: 16px;
 }
 .set-note b { color: var(--accent); }
+
 /* 卡片内的说明块（代理 auto 模式说明、站点凭据空态等）：与上一行、卡片内壁都留出
    间距，而不是贴边顶着上一行。 */
 .set-group > .set-note { margin: 12px 14px 14px; }
