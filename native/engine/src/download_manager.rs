@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use futures_util::FutureExt;
 use reqwest::Client;
@@ -389,17 +389,17 @@ async fn delete_task_artifact_files(db: &crate::db::Db, task_id: &str, save_dir:
     }
 }
 
-/// Synchronous version of `dedup_filename` for use in the manager's
-/// synchronous section (before `tokio::spawn`).
+/// `dedup_filename` 的同步版本，供任务启动序幕的预订临界区使用
+/// （`finalize_start_file_name`，持 `reserved_temp_paths` 锁期间调用）。
 ///
 /// Checks both the on-disk state and the `reserved` in-flight set so that
 /// the chosen name does not collide with files already being downloaded by
 /// sibling tasks in the same batch.
 ///
-/// Unlike the async version, this uses `std::path::Path::exists()` for the
-/// fast-path disk check — acceptable here because we are on the
-/// `current_thread` runtime in a synchronous (non-`.await`) section and the
-/// result only needs to be "good enough" at the moment of reservation.
+/// 与 async 版不同，磁盘快速探测走同步 `Path::exists()`：调用点已在互斥
+/// 临界区内（跨 `.await` 持锁不可行），且结果只需在预订那一刻成立即可。
+/// 阻塞代价有界——仅 Phase 2（确有冲突）才 `read_dir` 扫一次目录，此间
+/// 其余任务的序幕会在锁上短暂排队。
 /// `allow_overwrite`（config `file_exists_behavior` == "overwrite"）：为
 /// true 时,磁盘上**仅最终文件**存在不算冲突——保留原名,完成时由
 /// finalize 覆盖旧文件;`.fdownloading` 临时文件(在途下载)与 `reserved`
@@ -473,15 +473,151 @@ fn dedup_filename_sync(
     }
 }
 
+/// 取出文件名预订集合的互斥锁；锁中毒时恢复内层数据继续（集合仅存
+/// 路径，无跨条目不变式，中毒后继续使用是安全的）。
+fn lock_reserved(
+    set: &Mutex<HashSet<std::path::PathBuf>>,
+) -> std::sync::MutexGuard<'_, HashSet<std::path::PathBuf>> {
+    set.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// spawned task 启动序幕：文件名最终决策。manager 仍是唯一决策链——本函数
+/// 是 `do_start_task` 派生任务的第一步，下载器自身不变更文件名；决策执行
+/// 从 actor 内联挪到各任务自己的序幕，probe 的网络往返不再阻塞 actor
+/// （期间暂停/删除等信号照常处理，创建任务后的 AllTasks 快照即刻送达）。
+///
+/// 流程：
+///   1. 名称未知 → 先复读 DB（任务在 pending 队列等待期间，背景 probe
+///      可能已把文件名写库；复用可避免对一次性 CDN URL 重复 probe 消耗 token）
+///   2. 仍未知 → await probe（携带任务鉴权上下文，与真正下载同源，避免
+///      鉴权站点把缺鉴权的裸 HEAD 重定向到登录页、用错误页的
+///      Content-Disposition 污染文件名）；取消令牌可中断等待——下载器随后
+///      会在自己的取消检查点走正常终态路径，此处不重复终态处理
+///   3. HLS 归一化为 .ts / DASH 空名兜底为 .mp4（与各下载器最终落盘名
+///      一致，否则不同前缀名会在下载器内塌缩为同一路径，绕过 dedup
+///      导致两个任务静默覆盖同一文件）
+///   4. 临界区（锁内无 `.await`）：dedup → 预订 insert。共享互斥锁把各
+///      任务序幕与删除路径的释放串行化，等价于旧 actor 同步段的原子性；
+///      每任务 dedup 恰好一次，预订集合此刻只含兄弟任务，无自我冲突
+///   5. dedup 改名时落库（预订已在锁内完成，兄弟任务经预订集合感知冲突，
+///      不依赖 DB 中的名字）
+///
+/// 返回预订的临时路径，经 `TaskDone.reserved_temp_path` 在 `on_task_done`
+/// 释放。`None` = 名称最终仍未知（probe 失败），下载器内部按响应头/URL
+/// 兜底命名，但不参与 dedup 协调（极端情况，正常路径不会到此）。
+async fn finalize_start_file_name(
+    params: &mut DownloadParams,
+    reserved: &Mutex<HashSet<std::path::PathBuf>>,
+) -> Option<std::path::PathBuf> {
+    // Step 1: DB 复读。
+    if params.file_name.is_empty()
+        && let Ok(Some(t)) = params.db.load_task_by_id(&params.task_id).await
+        && !t.file_name.is_empty()
+    {
+        params.file_name = t.file_name;
+    }
+
+    // Step 2: probe（名称仍未知时）。
+    if params.file_name.is_empty() {
+        let (probed_name, _probed_size) = tokio::select! {
+            _ = params.cancel_token.cancelled() => (String::new(), 0),
+            r = crate::meta_prober::probe_task_meta(
+                &params.url,
+                &params.file_name,
+                &params.client,
+                &params.proxy_config,
+                &params.spec,
+            ) => r,
+        };
+        if !probed_name.is_empty() {
+            params.file_name = probed_name;
+            let _ = params
+                .db
+                .update_task_file_name(&params.task_id, &params.file_name)
+                .await;
+            params.sink.emit(EngineEvent::TaskMetaProbed {
+                task_id: params.task_id.clone(),
+                file_name: params.file_name.clone(),
+                total_bytes: 0,
+            });
+        }
+    }
+
+    // Step 3: HLS 归一化为 .ts。force_ts_extension 幂等；HLS 下载器内仍保留
+    // 幂等的 force_ts 作为兜底/续传安全网。即使 probe 后仍空名，也用 URL
+    // 末段兜底出与 HLS 下载器空名分支一致的名称，使空名 HLS 任务同样纳入
+    // dedup + 预订协调——否则两个同源、均探测不到名的并发 HLS 任务会各自
+    // 塌缩为同一 .ts 并互相 truncate/交错写入而损坏内容。
+    if hls_downloader::is_hls_url(&params.url) {
+        let base = if params.file_name.is_empty() {
+            downloader::extract_from_url(&params.url).unwrap_or_else(|| "download.ts".to_string())
+        } else {
+            params.file_name.clone()
+        };
+        let ts_name = hls_downloader::force_ts_extension(&base);
+        if ts_name != params.file_name {
+            params.file_name = ts_name;
+            let _ = params
+                .db
+                .update_task_file_name(&params.task_id, &params.file_name)
+                .await;
+        }
+    }
+
+    // DASH：probe 后仍空名时，用 URL 末段兜底为 .mp4（与 DASH 下载器空名
+    // 分支一致），使空名 DASH 任务也纳入 dedup + 预订协调；非空名 DASH
+    // 下载器原样使用（不强制扩展名），故此处仅处理空名，不改非空名。
+    if params.file_name.is_empty() && dash_downloader::is_dash_url(&params.url) {
+        let url_name =
+            downloader::extract_from_url(&params.url).unwrap_or_else(|| "download.mpd".to_string());
+        params.file_name = match url_name.rfind('.') {
+            Some(pos) => format!("{}.mp4", &url_name[..pos]),
+            None => format!("{}.mp4", url_name),
+        };
+        let _ = params
+            .db
+            .update_task_file_name(&params.task_id, &params.file_name)
+            .await;
+    }
+
+    // Step 4: dedup + 预订（临界区，锁内无 .await）。
+    if params.file_name.is_empty() {
+        return None;
+    }
+    let save_path = std::path::PathBuf::from(&params.save_dir);
+    let (deduped, temp) = {
+        let mut guard = lock_reserved(reserved);
+        let deduped = dedup_filename_sync(
+            &save_path,
+            &params.file_name,
+            &guard,
+            params.allow_overwrite,
+        );
+        let temp = save_path.join(format!("{}{}", deduped, downloader::TEMP_EXT));
+        guard.insert(temp.clone());
+        (deduped, temp)
+    };
+    // Step 5: dedup 改名落库。
+    if deduped != params.file_name {
+        params.file_name = deduped;
+        let _ = params
+            .db
+            .update_task_file_name(&params.task_id, &params.file_name)
+            .await;
+    }
+    Some(temp)
+}
+
 /// Notification sent from a spawned download task when it finishes.
 pub struct TaskDone {
     pub task_id: String,
     /// Generation counter — must match `active_tokens` entry to allow cleanup.
     /// Prevents a stale TaskDone from an old spawn removing a newer token.
     pub generation: u64,
-    /// 本次任务在 `do_start_task` 中预订的临时文件路径（`.fdownloading`）。
-    /// `on_task_done` 收到后从 `reserved_temp_paths` 中移除，释放预订。
-    /// BT 任务、file_name 为空（probe 后确定）的任务此字段为 `None`。
+    /// 本次任务在启动序幕（`finalize_start_file_name`）中预订的临时文件
+    /// 路径（`.fdownloading`）。`on_task_done` 收到后从 `reserved_temp_paths`
+    /// 中移除，释放预订。BT 任务与名称最终仍未知（probe 失败）的任务为 `None`。
     pub reserved_temp_path: Option<std::path::PathBuf>,
 }
 
@@ -1194,14 +1330,15 @@ pub struct DownloadManager {
     /// `dedup_filename` 时，都可能看到磁盘上同名文件不存在，进而选出相同
     /// 文件名并相互覆盖对方的 `.fdownloading` 临时文件，导致文件内容丢失。
     ///
-    /// 修复策略：在 `do_start_task` 的同步段（`spawn` 之前）将该任务的
-    /// 临时文件路径（`save_dir/file_name.fdownloading`）原子性地插入此集合，
-    /// 并在 `on_task_done` / `cancel_task` / `delete_task` 时移除。
-    /// `dedup_filename` 接收此集合的快照，在检查文件名冲突时同时排除
-    /// 已被其他 in-flight 任务预订的路径，彻底消除批量下载中的文件名竞态。
+    /// 修复策略：任务启动序幕（`finalize_start_file_name`，spawned task 内）
+    /// 在互斥临界区里完成「dedup → 预订 insert」，并在 `on_task_done` /
+    /// 删除路径移除。`dedup_filename_sync` 在锁内消费此集合，检查文件名
+    /// 冲突时同时排除已被其他 in-flight 任务预订的路径，彻底消除批量
+    /// 下载中的文件名竞态。
     ///
-    /// 由于整个 manager 运行在 `tokio::current_thread` 上，此字段无需加锁。
-    reserved_temp_paths: HashSet<std::path::PathBuf>,
+    /// 共享互斥：actor（删除路径的主动释放）与各下载任务（启动序幕的
+    /// dedup+预订）都会触碰，锁内只做同步操作，绝无 `.await`。
+    reserved_temp_paths: Arc<Mutex<HashSet<std::path::PathBuf>>>,
     /// 引擎事件接收端(进度/队列变化/分段拆分等)——由宿主注入。
     sink: Arc<dyn EventSink>,
     /// 需要宿主介入决策的选择接口(HLS 画质/BT 文件选择)——由宿主注入。
@@ -1329,7 +1466,7 @@ impl DownloadManager {
             retry_rx: Some(retry_rx),
             auto_proxy_cache: crate::auto_proxy::DecisionCache::new(),
             auto_failover_pending: HashSet::new(),
-            reserved_temp_paths: HashSet::new(),
+            reserved_temp_paths: Arc::new(Mutex::new(HashSet::new())),
             sink,
             selector,
             rss: crate::rss::RssManager::new(rss_db, rss_sink),
@@ -3176,7 +3313,7 @@ impl DownloadManager {
         // or cancel) so the slot is freed for the next task that picks the
         // same filename.
         if let Some(ref path) = done.reserved_temp_path {
-            self.reserved_temp_paths.remove(path);
+            lock_reserved(&self.reserved_temp_paths).remove(path);
         }
 
         if generation_matched {
@@ -4264,6 +4401,13 @@ impl DownloadManager {
                 seeding_message: String::new(),
                 seeding_time_secs: 0,
             });
+            // 归属定向广播：TaskProgress 不携带 queue_id，客户端以「归属待定」
+            // 哨兵入列，会被队列筛选视图隐藏；此事件让新任务归属即刻收敛，
+            // 不依赖尾随 AllTasks 快照的到达时序。
+            self.sink.emit(EngineEvent::TaskQueueChanged {
+                task_id: task_id.clone(),
+                queue_id: queue_id.clone(),
+            });
         }
 
         // Webhook：task.created（落库成功后，早于任何早退分支；`url` 用真实
@@ -4717,7 +4861,7 @@ impl DownloadManager {
             task_id,
             url,
             save_dir,
-            mut file_name,
+            file_name,
             segments,
             is_resume: _,
             cookies,
@@ -4999,143 +5143,13 @@ impl DownloadManager {
                 });
             }
             // ---------------------------------------------------------------
-            // 文件名最终决策：manager 是文件名的唯一决策者
-            //
-            // 流程:
-            //   1. 若 file_name 为空 → await probe 拿 Content-Disposition / URL 文件名
-            //      （probe 是 async，但发生在"同步预订段"之前；同时只允许 file_name
-            //       为空的任务 await，已知 file_name 的任务直接进同步段，互不干扰）
-            //   2. 同步段（无 .await）：
-            //      - dedup_filename_sync(磁盘 + 兄弟任务的 reserved_temp_paths)
-            //      - reserved_temp_paths.insert(自己的 temp 路径)
-            //      - 持久化最终 file_name 到 DB
-            //
-            // 与旧设计的本质区别：
-            //   - 旧设计：manager 同步段做一次 dedup 并插入 reserved，spawned task
-            //     再做一次 dedup 并把 reserved 快照（含自己）传进去。后者会把"自己
-            //     已预订"误判为"已被占用"，触发回归 bug（PR #296 自我冲突）。
-            //   - 新设计：spawned task 不再 dedup，DownloadParams 不再携带
-            //     reserved_filenames_snapshot；下载器内部不再变更文件名。
-            //
-            // Reservation 在 `on_task_done` 中通过 TaskDone.reserved_temp_path 释放。
+            // 文件名最终决策在 spawned task 序幕执行（finalize_start_file_name）：
+            // probe（网络 IO）→ HLS/DASH 归一 → dedup → 预订 → 落库全程
+            // off-actor，本函数 spawn 后立即返回——创建任务后的 AllTasks
+            // 快照不再被 probe 的网络往返压后，probe 期间其余信号照常处理。
+            // dedup+预订经共享互斥锁串行化，原子性等价于旧 actor 同步段；
+            // 预订仍经 TaskDone.reserved_temp_path 在 on_task_done 释放。
             // ---------------------------------------------------------------
-            let save_path = std::path::PathBuf::from(&save_dir);
-
-            // Step 1: 若名称未知，先 probe（async；不在同步预订段内）。
-            // BT 不走此分支，FTP/HLS/DASH/HTTP 共用此 probe 接口。
-            // probe 失败则保持 file_name 为空——下载器内部仍有兜底（URL 解析），
-            // 但此时无法做 manager 级 dedup，dedup_filename_sync 会返回原名。
-            if file_name.is_empty() {
-                // Step 1a: 先从 DB 读一次——任务在 pending_queue 等待期间，
-                // create_task 中 spawn 的背景 probe 可能已经把文件名写进 DB。
-                // 直接复用，避免对一次性 CDN URL 重复 probe 消耗 token。
-                if let Ok(Some(t)) = self.db.load_task_by_id(&task_id).await
-                    && !t.file_name.is_empty()
-                {
-                    file_name = t.file_name;
-                }
-            }
-
-            if file_name.is_empty() {
-                // Step 1b: DB 中也没有名字（未排队，或背景 probe 未完成/失败）
-                // → 在此 await 一次 probe。注意此 .await 在同步预订段之前，
-                // 不会破坏 dedup+insert 的原子性。
-                //
-                // F020：probe 携带任务的鉴权上下文（cookies/referrer/extra_headers），
-                // 与下方真正下载用的 `spec` 同源，避免鉴权站点把缺鉴权的裸 HEAD
-                // 重定向到登录页、用错误页的 Content-Disposition 污染文件名。
-                let probe_spec = downloader::RequestSpec::from_captured(
-                    method.as_deref(),
-                    cookies.clone(),
-                    referrer.clone(),
-                    extra_headers.clone(),
-                    body.clone(),
-                );
-                let (probed_name, _probed_size) = crate::meta_prober::probe_task_meta(
-                    &url,
-                    &file_name,
-                    &task_client,
-                    &task_proxy,
-                    &probe_spec,
-                )
-                .await;
-                if !probed_name.is_empty() {
-                    file_name = probed_name;
-                    let _ = self.db.update_task_file_name(&task_id, &file_name).await;
-                    self.sink.emit(EngineEvent::TaskMetaProbed {
-                        task_id: task_id.clone(),
-                        file_name: file_name.clone(),
-                        total_bytes: 0,
-                    });
-                }
-            }
-
-            // HLS：在 dedup + 预订之前把名称归一化为 .ts，使 manager 级 dedup 和
-            // reserved_temp_paths 预订都基于 HLS 下载器最终的落盘名。否则不同前缀名
-            // （clip.m3u8 / clip.mp4）会在 HLS 下载器内 force_ts 后塌缩为同一 clip.ts，
-            // 绕过 manager dedup，导致两个任务静默覆盖同一文件。force_ts_extension
-            // 幂等；HLS 下载器内仍保留幂等的 force_ts 作为兜底/续传安全网。
-            //
-            // 即使 probe 后 file_name 仍为空，也用 URL 末段兜底出与 HLS 下载器空名
-            // 分支一致的名称（extract_from_url + force_ts），使空名 HLS 任务也纳入
-            // dedup + 预订协调——否则两个同源、均探测不到名的并发 HLS 任务会各自
-            // 塌缩为同一 .ts 并互相 truncate/交错写入而损坏内容。
-            if hls_downloader::is_hls_url(&url) {
-                let base = if file_name.is_empty() {
-                    downloader::extract_from_url(&url).unwrap_or_else(|| "download.ts".to_string())
-                } else {
-                    file_name.clone()
-                };
-                let ts_name = hls_downloader::force_ts_extension(&base);
-                if ts_name != file_name {
-                    file_name = ts_name;
-                    let _ = self.db.update_task_file_name(&task_id, &file_name).await;
-                }
-            }
-
-            // DASH：probe 后仍空名时,用 URL 末段兜底为 .mp4(与 DASH 下载器空名分支
-            // 一致),使空名 DASH 任务也纳入 dedup + 预订协调,避免两个同源、均探测不到
-            // 名的并发 DASH 任务塌缩到同一 .mp4 路径互相覆盖。非空名 DASH 下载器原样
-            // 使用 p.file_name(不强制扩展名),故此处仅处理空名,不改非空名。
-            if file_name.is_empty() && dash_downloader::is_dash_url(&url) {
-                let url_name = downloader::extract_from_url(&url)
-                    .unwrap_or_else(|| "download.mpd".to_string());
-                file_name = match url_name.rfind('.') {
-                    Some(pos) => format!("{}.mp4", &url_name[..pos]),
-                    None => format!("{}.mp4", url_name),
-                };
-                let _ = self.db.update_task_file_name(&task_id, &file_name).await;
-            }
-
-            // Step 2: dedup + insert reserved。
-            // dedup_filename_sync 本身是同步的；仅当 dedup 改名时有一次
-            // update_task_file_name 落库 .await（须在 insert 前完成，否则 spawned
-            // task 可能用到旧名）。do_start_task 持有 &mut self 且运行于
-            // current_thread runtime，同一时刻只有一个实例执行，故
-            // dedup→落库→insert 之间不会与兄弟任务的预订交错，无竞态。
-            // 此时 self.reserved_temp_paths 中只有兄弟任务的预订，不包含自己，
-            // 因此不会出现"自我冲突"。
-            let reserved_temp_path: Option<std::path::PathBuf> = if !file_name.is_empty() {
-                let deduped = dedup_filename_sync(
-                    &save_path,
-                    &file_name,
-                    &self.reserved_temp_paths,
-                    self.file_exists_overwrite,
-                );
-                if deduped != file_name {
-                    file_name = deduped.clone();
-                    // dedup 改名后立即落库（spawned task 不再修改文件名）
-                    let _ = self.db.update_task_file_name(&task_id, &file_name).await;
-                }
-                let temp = save_path.join(format!("{}{}", deduped, downloader::TEMP_EXT));
-                self.reserved_temp_paths.insert(temp.clone());
-                Some(temp)
-            } else {
-                // 兜底：file_name 仍为空（probe 失败）。下载器内部会从响应头
-                // / URL 兜底解析名称，但不做 dedup（无法与 reserved 协调）。
-                // 这是极端情况，正常路径不会到此。
-                None
-            };
 
             // 构造完整 HTTP 请求事务规格——method/body 来自浏览器扩展，
             // 用于在 form-POST 等非 GET 触发的下载场景中一比一重建原始请求。
@@ -5196,7 +5210,10 @@ impl DownloadManager {
                 unattended: task_unattended,
             };
 
+            let reserved_set = Arc::clone(&self.reserved_temp_paths);
             tokio::spawn(async move {
+                let mut params = params;
+                let reserved_temp_path = finalize_start_file_name(&mut params, &reserved_set).await;
                 let result = if use_ftp {
                     std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
                         .catch_unwind()
@@ -6277,7 +6294,7 @@ impl DownloadManager {
                     t.file_name,
                     downloader::TEMP_EXT
                 ));
-                self.reserved_temp_paths.remove(&reserved);
+                lock_reserved(&self.reserved_temp_paths).remove(&reserved);
             }
             let path = PathBuf::from(&t.save_dir).join(&t.file_name);
 
@@ -6634,7 +6651,7 @@ impl DownloadManager {
                         t.file_name,
                         downloader::TEMP_EXT
                     ));
-                    self.reserved_temp_paths.remove(&reserved);
+                    lock_reserved(&self.reserved_temp_paths).remove(&reserved);
                     // 与单任务 delete_task 一致：移除自动重试计数（同样因 abort 超时
                     // 时 on_task_done 不执行而需在 &mut self 上下文主动清理）。task_id
                     // 是一次性 UUID 不会复用，故仅为内存一致性，无功能影响。
@@ -9372,6 +9389,76 @@ mod tests {
             let t = db.load_task_by_id(id).await.expect("load").expect("task");
             assert_eq!(t.status, 2, "排队任务必须批量持久化为 paused");
         }
+    }
+
+    /// 建任务事件契约：`create_task` 在 `TaskProgress` 之后立即定向广播
+    /// `TaskQueueChanged`。`TaskProgress` 不携带 queue_id，客户端以「归属
+    /// 待定」哨兵入列并被队列筛选视图隐藏；归属事件必须先于任何耗时操作
+    /// （probe/启动）送达，新任务才能即刻出现在筛选后的列表里。
+    #[tokio::test]
+    async fn create_task_emits_queue_attribution_after_progress() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db,
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: "/tmp".to_string(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        // 占满唯一并发槽：新任务走排队分支，不触发真实下载。
+        mgr.active_tasks.insert(
+            "occupier".to_string(),
+            ActiveTaskEntry {
+                token: CancellationToken::new(),
+                generation: 0,
+                handle: None,
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        let id = mgr
+            .create_task(NewTaskSpec {
+                url: "http://example.com/file.bin".to_string(),
+                save_dir: "/tmp".to_string(),
+                file_name: "file.bin".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create task");
+
+        let events = sink.events();
+        let progress_idx = events
+            .iter()
+            .position(|e| matches!(e, EngineEvent::TaskProgress { task_id, .. } if *task_id == id))
+            .expect("create_task 必须广播 TaskProgress");
+        let queue_idx = events
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    EngineEvent::TaskQueueChanged { task_id, queue_id }
+                        if *task_id == id && *queue_id == MAIN_QUEUE_ID
+                )
+            })
+            .expect("create_task 必须定向广播 TaskQueueChanged(main)");
+        assert!(
+            progress_idx < queue_idx,
+            "归属事件必须紧随 TaskProgress 之后（先入列再收敛归属）"
+        );
     }
 
     /// 重命名核心契约：最终文件与 `.fdownloading` 临时文件随 DB `file_name`
