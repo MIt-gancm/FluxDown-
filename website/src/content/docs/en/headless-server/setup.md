@@ -5,7 +5,7 @@ section: headless-server
 order: 1
 ---
 
-`fluxdown_server` is a headless build of the FluxDown download engine: no Flutter UI, no Rinf/FFI layer. It exposes the same Rust engine (HTTP/HTTPS, FTP, BitTorrent, HLS, DASH) over HTTP, WebSocket, and a bundled Web UI, so you can run it on a NAS, a home server, or a VPS and manage downloads remotely from a browser.
+`fluxdown_server` is a headless build of the FluxDown download engine: no Flutter UI, no Rinf/FFI layer. It exposes the same Rust engine (HTTP/HTTPS, FTP, BitTorrent, HLS, DASH) over HTTP, WebSocket, and a Web UI baked into the executable, so you can run it on a NAS, a home server, or a VPS and manage downloads remotely from a browser. Releases ship a **single self-contained binary** — no companion `web/` folder to copy around.
 
 For most deployments the prebuilt Docker image is the easiest path — see [Docker & NAS](/docs/en/headless-server/docker/). This page covers building and running from the workspace source with Cargo, plus configuration that applies to both.
 
@@ -22,19 +22,27 @@ cargo build --release -p fluxdown_server
 # binary at target/release/fluxdown-server (fluxdown-server.exe on Windows)
 ```
 
-The process is self-contained: it opens its own SQLite (or PostgreSQL) database, runs the download engine, and serves the Web UI — no separate database server or reverse proxy is required to get started.
+The process is self-contained: it opens its own SQLite (or PostgreSQL) database, runs the download engine, and serves the Web UI from bytes embedded in the executable — no separate database server, static file directory, or reverse proxy is required to get started.
 
 ## Building the web front end
 
-The Web UI is a separate SPA in `web/` (React 19 + TanStack, built with [Bun](https://bun.sh)). The server only serves static files — it does not build them for you.
+Only needed when you build the server yourself — official release binaries and Docker images already contain the UI.
+
+The Web UI is a separate SPA in `web/` (React 19 + TanStack, built with [Bun](https://bun.sh)). Its build output is embedded into the server binary **at compile time**, so it must exist *before* you build the server:
 
 ```bash
 cd web
 bun install
 bun run build      # outputs to web/dist
+
+cd ..
+cargo build --release -p fluxdown_server   # embeds web/dist into the binary
 ```
 
-Point the server at that output directory with `FLUXDOWN_WEBROOT` (see below). If you skip this step, the server still runs and answers API/WebSocket requests, but visiting it in a browser serves nothing (no `index.html` to fall back to).
+Rebuild the server after every front-end change — the running binary keeps serving the bytes it was compiled with. Two compile-time knobs:
+
+- `FLUXDOWN_EMBED_WEBROOT` — embed a different directory instead of `web/dist` (used by CI, which builds the SPA in a separate job).
+- If the directory is missing or empty, the build still succeeds with a warning; the server then answers browser requests with a `503` page explaining how to fix it, while the REST API and WebSocket keep working normally.
 
 <!-- TODO(screenshot): browser showing the first-run “Initialize FluxDown Server” wizard -->
 
@@ -47,7 +55,7 @@ All configuration is read once at startup from environment variables. There is n
 | `FLUXDOWN_BIND` | `0.0.0.0:17800` | TCP address the HTTP/WebSocket server listens on. |
 | `FLUXDOWN_DATA_DIR` | Platform auto-detected (see below) | Directory holding the database file and logs. |
 | `FLUXDOWN_DATABASE_URL` | unset — uses a SQLite file inside the data dir | Explicit connection string: `sqlite:/path/to/file.db` or `postgres://user:pass@host/db`. |
-| `FLUXDOWN_WEBROOT` | `./web` next to the executable | Directory the Web UI static files (`bun run build` output) are served from; SPA routes fall back to `index.html`. |
+| `FLUXDOWN_WEBROOT` | unset — serves the embedded Web UI | Optional override: serve the SPA from this directory instead of the embedded copy (custom front end, or a hot-swapped `bun run build` output). There is **no** implicit `./web` lookup next to the executable. |
 | `FLUXDOWN_TOKEN` | unset — first-run Web setup wizard | Optional pre-set management access key. Applied only when the database has no key yet (value is trimmed; must satisfy the key rules below, otherwise ignored with a warning). Use for unattended docker-compose / k8s / CI deploys that skip the wizard. |
 | `FLUXDOWN_DEMO` | unset (off) | Truthy value (`1`/`true`/`yes`/`on`) turns on demo mode: only a built-in, generated 64 MiB file can be downloaded. Useful for public demos. |
 | `FLUXDOWN_DEMO_URL` | unset (off) | Overrides demo mode's allowed URL with a specific one instead of the built-in generated file. |
@@ -67,7 +75,6 @@ For a headless deployment you almost always want to set `FLUXDOWN_DATA_DIR` expl
 ```bash
 FLUXDOWN_BIND=0.0.0.0:8080 \
 FLUXDOWN_DATA_DIR=/srv/fluxdown/data \
-FLUXDOWN_WEBROOT=/srv/fluxdown/web/dist \
 ./fluxdown-server
 ```
 
@@ -176,7 +183,6 @@ Group=fluxdown
 WorkingDirectory=/opt/fluxdown
 Environment=FLUXDOWN_BIND=0.0.0.0:17800
 Environment=FLUXDOWN_DATA_DIR=/var/lib/fluxdown
-Environment=FLUXDOWN_WEBROOT=/opt/fluxdown/web
 ExecStart=/opt/fluxdown/fluxdown-server
 Restart=on-failure
 RestartSec=5
@@ -186,7 +192,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-Install `fluxdown-server` (the release binary) and the built `web/dist` contents (renamed to `web/`) under `/opt/fluxdown`, create the `fluxdown` system user and `/var/lib/fluxdown`, then:
+Drop the `fluxdown-server` release binary into `/opt/fluxdown` (it carries the Web UI inside it — nothing else to install), create the `fluxdown` system user and `/var/lib/fluxdown`, then:
 
 ```bash
 sudo systemctl daemon-reload

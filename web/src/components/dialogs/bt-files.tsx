@@ -42,7 +42,12 @@ export function BtFilesDialog() {
     if (selectAllRef.current) selectAllRef.current.indeterminate = selected.size > 0 && !allSelected
   }, [selected, allSelected])
 
+  // 取消（含 X / ESC / 点遮罩，全部汇聚到 onOpenChange）必须回传哨兵 [-1]：
+  // 引擎按 -1 暂停任务并留空 DB 选择（下次恢复重新弹框），与桌面端一致。
+  // 只关弹窗不回传的话，服务端 select_bt_files 会等满 60s 超时后按
+  // TimedOutDefaulted(空) 处理 —— 变成"点了取消，一分钟后全量下载"。
   function cancel() {
+    if (request) sendWs({ type: 'btSelection', taskId: request.taskId, selectedIndices: [-1] })
     btRequestStore.set(null)
   }
 

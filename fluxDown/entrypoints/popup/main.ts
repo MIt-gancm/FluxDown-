@@ -40,7 +40,7 @@ const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)
 const statusBadge = $('#statusBadge')!;
 const statusText = statusBadge.querySelector('.status-text')!;
 const enableToggle = $<HTMLInputElement>('#enableToggle');
-const enableHint = $('#enableHint')!;
+const enableToggleLabel = $('#enableToggleLabel')!;
 const protocolToggle = $<HTMLInputElement>('#protocolToggle');
 const protocolHint = $('#protocolHint')!;
 const dotVisibleToggle = $<HTMLInputElement>('#dotVisibleToggle');
@@ -50,6 +50,10 @@ const notifyLocalToggle = $<HTMLInputElement>('#notifyLocalToggle');
 const notifyRemoteToggle = $<HTMLInputElement>('#notifyRemoteToggle');
 const remoteModeSelect = $<HTMLSelectElement>('#remoteModeSelect');
 const remoteModeHint = $('#remoteModeHint')!;
+
+// 排除当前站点（完整排除列表在设置页）
+const excludeCurrentToggle = $<HTMLInputElement>('#excludeCurrentToggle');
+const excludeCurrentHint = $('#excludeCurrentHint')!;
 const openSettingsBtn = $<HTMLButtonElement>('#openSettingsBtn');
 const themeBtn = $<HTMLButtonElement>('#themeBtn');
 const langBtn = $<HTMLButtonElement>('#langBtn');
@@ -1086,6 +1090,49 @@ resBatchBtn.addEventListener('click', async () => {
   }
 });
 
+// ===== 排除当前站点 =====
+// 只回答"当前站点是否被排除"这一个问题，并允许一键切换；完整排除列表
+// （手输 / 删除 / 其他域名）仍在设置页 #rules 面板，避免弹窗塞进第二份列表 UI。
+
+let excludeDomains: string[] = [];
+let currentHostname = '';
+
+function renderExcludeCurrent(): void {
+  const known = currentHostname !== '';
+  excludeCurrentToggle.disabled = !known;
+  excludeCurrentToggle.checked =
+    known && excludeDomains.includes(currentHostname);
+  excludeCurrentHint.textContent = known
+    ? currentHostname
+    : t('domain.cannotGetDomain');
+}
+
+/** 活跃 tab 的域名；扩展页/chrome:// 等非 http(s) 页面视为无当前站点。 */
+async function resolveCurrentHostname(): Promise<void> {
+  try {
+    const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
+    const url = tab?.url ?? '';
+    currentHostname = /^https?:/i.test(url) ? new URL(url).hostname : '';
+  } catch {
+    currentHostname = '';
+  }
+  renderExcludeCurrent();
+}
+
+excludeCurrentToggle.addEventListener('change', async () => {
+  const domain = currentHostname;
+  if (!domain) return;
+  const exclude = excludeCurrentToggle.checked;
+  excludeDomains = exclude
+    ? [...excludeDomains, domain]
+    : excludeDomains.filter((d) => d !== domain);
+  await saveSettings({ excludeDomains });
+  renderExcludeCurrent();
+  showToast(
+    exclude ? t('domain.excluded', { domain }) : t('domain.removed', { domain }),
+  );
+});
+
 // ===== 初始化 =====
 // 性能关键路径：popup 弹出到首次完整渲染。
 // 1. 所有 storage 读取合并为一轮并行（i18n / 主题+悬浮球+统计 / 设置）；
@@ -1117,8 +1164,13 @@ async function init() {
   sniffToggle.checked = settings.resourceSniffing !== false;
   magnetToggle.checked = settings.interceptMagnet !== false;
 
+  // 排除当前站点：列表随设置同步落地，当前站点域名异步补齐（tabs.query 不阻塞渲染）
+  excludeDomains = settings.excludeDomains ?? [];
+  renderExcludeCurrent();
+  void resolveCurrentHostname();
+
   // 任务发送通知开关 + 远程投递模式（与 options 页同一 settings 源，双入口镜像）
-  notifyLocalToggle.checked = settings.notifyLocalTask !== false;
+  notifyLocalToggle.checked = settings.notifyLocalTask === true;
   notifyRemoteToggle.checked = settings.notifyRemoteTask !== false;
   remoteModeSelect.value = settings.remoteMode || 'off';
   updateRemoteModeGate(settings.remoteVerified === true);
@@ -1138,8 +1190,13 @@ async function init() {
   void refreshResources().catch(() => {});
 }
 
+/** 头部总开关没有文字位，状态收进 tooltip：「下载拦截 · 已开启」 */
 function updateEnableHint(enabled: boolean) {
-  enableHint.textContent = enabled ? t('switch.enabled') : t('switch.disabled');
+  const label = `${t('switch.label')} · ${
+    enabled ? t('switch.enabled') : t('switch.disabled')
+  }`;
+  enableToggleLabel.title = label;
+  enableToggleLabel.setAttribute('aria-label', label);
 }
 
 function updateProtocolHint(enabled: boolean) {
@@ -1192,6 +1249,7 @@ async function toggleLang() {
   updateLangButton();
   updateEnableHint(enableToggle.checked);
   refreshRemoteModeHint();
+  renderExcludeCurrent();
   // applyI18nToDOM 会把 startAppBtn 的 .btn-label 重置为默认文案，
   // loading 态需要重新套用翻译后的"启动中…"。
   if (appStarting) setStartAppLoading(true);

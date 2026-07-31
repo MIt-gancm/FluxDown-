@@ -16,7 +16,6 @@ is_running() {
 start_server() {
 	mkdir -p "$VAR_DIR"
 	FLUXDOWN_DATA_DIR="$VAR_DIR" \
-	FLUXDOWN_WEBROOT="$TARGET_DIR/web" \
 	FLUXDOWN_BIND="0.0.0.0:17800" \
 		"$TARGET_DIR/bin/fluxdown-server" >> "$LOG_FILE" 2>&1 &
 	echo $! > "$PID_FILE"

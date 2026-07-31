@@ -98,7 +98,8 @@ export function SiteAuthCredentials({
   const filtered = filterSiteAuth(siteAuth, query)
 
   return (
-    <>
+    // 标题 + 卡片同段：宽屏分列时整块留在一列，标题不会被甩到列底的空白里。
+    <section className="set-section">
       <h2 className="set-title mt-6">{t('set.siteAuth')}</h2>
       <p className="set-desc">{t('set.siteAuth.desc')}</p>
       <div className="set-group">
@@ -178,6 +179,6 @@ export function SiteAuthCredentials({
         </div>
         {authEditor && authEditor.site === null ? authEditorForm : null}
       </div>
-    </>
+    </section>
   )
 }

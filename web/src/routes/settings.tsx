@@ -1,7 +1,7 @@
 // #screen-settings —— 左侧分类导航 + 右侧设置正文。
 import { useNavigate } from '@tanstack/react-router'
 import type { LucideIcon } from 'lucide-react'
-import { ArrowLeft, BellRing, Cloud, Download, Globe, Info, Lock, Monitor, Palette, Puzzle, Shield } from 'lucide-react'
+import { ArrowLeft, BellRing, Cloud, Download, Globe, Info, Lock, Monitor, Palette, Puzzle, Share2, Shield } from 'lucide-react'
 import { useState } from 'react'
 import { cn } from '../lib/cn'
 import { useI18n } from '../lib/i18n'
@@ -12,6 +12,7 @@ import { AppearanceSettings } from '../components/settings/AppearanceSettings'
 import { BitTorrentSettings } from '../components/settings/BitTorrentSettings'
 import { CloudAccountSettings } from '../components/settings/CloudAccountSettings'
 import { DownloadSettings } from '../components/settings/DownloadSettings'
+import { Ed2kSettings } from '../components/settings/Ed2kSettings'
 import { ExtensionsSettings } from '../components/settings/ExtensionsSettings'
 import { GeneralSettings } from '../components/settings/GeneralSettings'
 import { NotifySettings } from '../components/settings/NotifySettings'
@@ -19,7 +20,18 @@ import { ProxySettings } from '../components/settings/ProxySettings'
 import { SecuritySettings } from '../components/settings/SecuritySettings'
 import { useConfigMutation, useConfigQuery } from '../lib/config'
 
-type Category = 'general' | 'account' | 'appearance' | 'download' | 'bt' | 'proxy' | 'security' | 'notify' | 'extensions' | 'about'
+type Category =
+  | 'general'
+  | 'account'
+  | 'appearance'
+  | 'download'
+  | 'bt'
+  | 'ed2k'
+  | 'proxy'
+  | 'security'
+  | 'notify'
+  | 'extensions'
+  | 'about'
 
 const NAV: { key: Category; labelKey: I18nKey; icon: LucideIcon }[] = [
   { key: 'general', labelKey: 'set.general', icon: Monitor },
@@ -27,6 +39,7 @@ const NAV: { key: Category; labelKey: I18nKey; icon: LucideIcon }[] = [
   { key: 'appearance', labelKey: 'set.appearance', icon: Palette },
   { key: 'download', labelKey: 'set.download', icon: Download },
   { key: 'bt', labelKey: 'set.bt', icon: Globe },
+  { key: 'ed2k', labelKey: 'set.ed2k', icon: Share2 },
   { key: 'proxy', labelKey: 'set.proxy', icon: Shield },
   { key: 'security', labelKey: 'set.security', icon: Lock },
   { key: 'notify', labelKey: 'set.notify', icon: BellRing },
@@ -75,6 +88,8 @@ export function SettingsScreen() {
         return <DownloadSettings config={config} mutate={mutate} />
       case 'bt':
         return <BitTorrentSettings config={config} mutate={mutate} />
+      case 'ed2k':
+        return <Ed2kSettings config={config} mutate={mutate} />
       case 'proxy':
         return <ProxySettings config={config} mutate={mutate} />
       case 'security':
@@ -103,7 +118,11 @@ export function SettingsScreen() {
           ))}
         </nav>
       </aside>
-      <div className="settings-body">{renderBody()}</div>
+      {/* 滚动容器（.settings-body）与多列容器（.settings-cols）分开：多列容器高度必须自适应，
+          否则列会按滚动容器的固定高度横向溢出。 */}
+      <div className="settings-body">
+        <div className="settings-cols">{renderBody()}</div>
+      </div>
     </section>
   )
 }

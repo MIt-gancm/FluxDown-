@@ -59,6 +59,8 @@ interface FormState {
   saveDir: string
   saveDirTouched: boolean
   queueId: string
+  /** 队列是否被用户改过；未改过时跟随 config 的 `default_queue_id`。 */
+  queueIdTouched: boolean
   userAgent: string
   cookies: string
   headers: HeaderRow[]
@@ -82,6 +84,7 @@ function emptyForm(saveDir = ''): FormState {
     saveDir,
     saveDirTouched: false,
     queueId: '',
+    queueIdTouched: false,
     userAgent: '',
     cookies: '',
     headers: [],
@@ -175,13 +178,27 @@ export function NewDownloadDialog() {
     }
   }, [open, demoMode, demoUrl])
 
+  // 生效的默认保存目录：开启「跟随上次保存位置」且已有记录时用 last_save_dir，
+  // 否则用 default_save_dir（对齐桌面 SettingsProvider.effectiveDefaultSaveDir）。
+  const rememberLastSaveDir = (config?.remember_last_save_dir ?? 'false') === 'true'
+  const lastSaveDir = config?.last_save_dir ?? ''
+  const effectiveSaveDir =
+    rememberLastSaveDir && lastSaveDir !== '' ? lastSaveDir : (config?.default_save_dir ?? '')
+
   // 保存目录默认值来自服务器配置；一旦用户手动改过就不再被配置覆盖。
   useEffect(() => {
-    const dir = config?.default_save_dir
-    if (open && !form.saveDirTouched && dir) {
-      setForm((f) => ({ ...f, saveDir: dir }))
+    if (open && !form.saveDirTouched && effectiveSaveDir) {
+      setForm((f) => ({ ...f, saveDir: effectiveSaveDir }))
     }
-  }, [open, config, form.saveDirTouched])
+  }, [open, effectiveSaveDir, form.saveDirTouched])
+
+  // 默认队列同理：未手动改过时跟随 config 的 default_queue_id（空 = 主队列）。
+  useEffect(() => {
+    const queueId = config?.default_queue_id
+    if (open && !form.queueIdTouched && queueId) {
+      setForm((f) => ({ ...f, queueId }))
+    }
+  }, [open, config, form.queueIdTouched])
 
   const urlLines = useMemo(
     () =>
@@ -246,6 +263,15 @@ export function NewDownloadDialog() {
   async function handleSubmit(startPaused = false) {
     if (urlLines.length === 0 || submitting) return
     setSubmitting(true)
+    // 「跟随上次保存位置」开启时记录本次实际使用的目录，供下次新建回填
+    // （对齐桌面 SettingsProvider.recordLastSaveDir；开关关闭时完全不写）。
+    const usedSaveDir = form.saveDir.trim()
+    if (rememberLastSaveDir && usedSaveDir !== '' && usedSaveDir !== lastSaveDir) {
+      void api
+        .putConfig({ last_save_dir: usedSaveDir })
+        .then(() => queryClient.invalidateQueries({ queryKey: ['config'] }))
+        .catch((err: unknown) => console.warn('[last_save_dir] persist failed', err))
+    }
     const headerEntries: Record<string, string> = {}
     for (const h of form.headers) {
       const name = h.name.trim()
@@ -445,7 +471,7 @@ export function NewDownloadDialog() {
                   <label className="field-label">{t('newDl.queue')}</label>
                   <SelectField
                     value={form.queueId}
-                    onChange={(v) => set('queueId', v)}
+                    onChange={(v) => setForm((f) => ({ ...f, queueId: v, queueIdTouched: true }))}
                     options={[
                       { value: '', label: t('newDl.defaultQueue') },
                       ...(queues ?? []).map((q) => ({

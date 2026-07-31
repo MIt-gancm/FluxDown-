@@ -14,6 +14,7 @@ import type {
   CreateTaskRequest,
   CreatedRssSource,
   CreatedTask,
+  Ed2kServerSubRefreshResponse,
   FsListResponse,
   GroupDto,
   InstallFfmpegRequest,
@@ -201,6 +202,8 @@ export const api = {
 
   refreshTrackerSub: () =>
     apiFetch<TrackerSubRefreshResponse>('/api/v1/bt/tracker-sub/refresh', { method: 'POST' }),
+  refreshEd2kServerSub: () =>
+    apiFetch<Ed2kServerSubRefreshResponse>('/api/v1/ed2k/server-sub/refresh', { method: 'POST' }),
   fsList: (path: string) =>
     apiFetch<FsListResponse>(`/api/v1/fs/list?path=${encodeURIComponent(path)}`),
   proxyTest: (req: ProxyTestRequest) =>

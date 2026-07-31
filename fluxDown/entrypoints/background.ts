@@ -2317,7 +2317,7 @@ export default defineBackground(() => {
 
     if (newlyCompleted.length > 0) {
       const settings = await loadSettings();
-      if (settings.notifyLocalTask !== false) {
+      if (settings.notifyLocalTask === true) {
         for (const task of newlyCompleted) {
           notifyTaskCompleted(task);
         }
@@ -2633,7 +2633,7 @@ export default defineBackground(() => {
     const settings = await loadSettings();
     return channel === "remote"
       ? settings.notifyRemoteTask !== false
-      : settings.notifyLocalTask !== false;
+      : settings.notifyLocalTask === true;
   }
 
   /**

@@ -33,7 +33,11 @@ export function ResolveVariantDialog() {
     setSelected(request.defaultIndex)
   }, [request])
 
+  // 取消（含 X / ESC / 点遮罩）回传 -1：引擎 collapse_resolve_variants 按
+  // chosen < 0 取消任务，与桌面 resolve_variant_dialog.dart 一致。只关弹窗
+  // 会让服务端等满 60s 后按 defaultIndex 继续下载 —— 与"取消"语义相反。
   function cancel() {
+    if (request) sendWs({ type: 'selectVariant', taskId: request.taskId, selectedIndex: -1 })
     resolveVariantRequestStore.set(null)
   }
 

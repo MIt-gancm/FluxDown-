@@ -21,7 +21,6 @@ start() {
 	fi
 	mkdir -p "$QPKG_ROOT/data"
 	FLUXDOWN_DATA_DIR="$QPKG_ROOT/data" \
-	FLUXDOWN_WEBROOT="$QPKG_ROOT/web" \
 	FLUXDOWN_BIND="0.0.0.0:17800" \
 		"$QPKG_ROOT/fluxdown-server" >> "$QPKG_ROOT/data/server.log" 2>&1 &
 	echo $! > "$PIDFILE"

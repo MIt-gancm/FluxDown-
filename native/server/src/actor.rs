@@ -731,9 +731,11 @@ fn decode_torrent_b64(torrent_b64: Option<&str>) -> Result<Vec<u8>, String> {
 /// 键 → setter 映射；`local_server_*` 是服务器自身配置，重启生效，跳过）。
 async fn apply_config(engine: &mut Engine, keys: &[String]) {
     let all = engine.db.get_all_config().await.unwrap_or_default();
-    // 代理/BT 全组重载各执行至多一次。
+    // 代理/BT 全组重载各执行至多一次；ED2K 后台刷新同批至多触发一次。
     let mut proxy_applied = false;
     let mut bt_applied = false;
+    let mut ed2k_sub_refreshed = false;
+    let mut ed2k_nodes_refreshed = false;
     for key in keys {
         match key.as_str() {
             "max_concurrent_tasks" => {
@@ -882,6 +884,36 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
                 log_info!("[server-actor] BT seeding config changed, live-applied");
                 engine.manager.set_bt_config(bt_config_from_map(&all));
             }
+            // ED2K 服务器订阅键：地址变化 / 重新启用 → 后台立即刷新一次。
+            // 服务器列表在每次下载 find-sources 时现读，无需失效任何会话。
+            k @ ("ed2k_server_sub_urls" | "ed2k_server_sub_enabled") => {
+                let trigger =
+                    k == "ed2k_server_sub_urls" || all.get(key).is_some_and(|v| v == "true");
+                if trigger && !ed2k_sub_refreshed {
+                    ed2k_sub_refreshed = true;
+                    log_info!("[server-actor] ED2K server sub config changed, refreshing");
+                    let db = engine.db.clone();
+                    tokio::spawn(async move {
+                        refresh_ed2k_server_sub(&db).await;
+                    });
+                }
+            }
+            // Kad nodes.dat：URL 变化 / Kad 重新启用 → 后台立即刷新一次。
+            k @ ("ed2k_nodes_dat_url" | "ed2k_enable_kad") => {
+                let trigger =
+                    k == "ed2k_nodes_dat_url" || all.get(key).is_some_and(|v| v == "true");
+                if trigger && !ed2k_nodes_refreshed {
+                    ed2k_nodes_refreshed = true;
+                    log_info!("[server-actor] ED2K Kad config changed, refreshing nodes.dat");
+                    spawn_ed2k_nodes_dat_refresh(engine.db.clone());
+                }
+            }
+            "log_max_size_mb" => {
+                if let Some(mb) = all.get(key).and_then(|v| v.parse::<u64>().ok()) {
+                    log_info!("[server-actor] log_max_size_mb -> {}", mb);
+                    fluxdown_engine::logger::set_max_total_bytes(mb * 1024 * 1024);
+                }
+            }
             // 服务器自身配置（token/端口/子开关）重启生效；其余键无运行时动作。
             _ => {}
         }
@@ -1019,6 +1051,147 @@ pub async fn refresh_tracker_sub(
     outcome
 }
 
+/// Kad nodes.dat 刷新间隔（秒）：24 小时（镜像桌面 `ED2K_NODES_DAT_REFRESH_SECS`）。
+pub const ED2K_NODES_DAT_REFRESH_SECS: i64 = 24 * 60 * 60;
+
+/// 启动时 ED2K 服务器订阅的处置方案（由 [`ed2k_server_sub_startup_plan`] 求出）。
+///
+/// 判定只此一处：`main` 启动块直接消费本结构，不重复内联条件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ed2kSubStartupPlan {
+    /// 缓存格式版本落后 → 先清空 `ed2k_server_sub_cache`（旧版缓存全为死主机）。
+    /// 与订阅开关无关：过期格式的缓存任何情况下都不该再被读到。
+    pub invalidate_cache: bool,
+    /// 需要后台拉取一次订阅（订阅启用，且版本落后或缓存超过刷新周期）。
+    pub refresh: bool,
+    /// 库中读到的缓存格式版本（缺省/非法 = 0），供日志使用。
+    pub cache_version: i64,
+    /// 库中读到的缓存更新时间（Unix 秒，缺省/非法 = 0），供日志使用。
+    pub updated_at: i64,
+}
+
+/// 依据配置快照与当前 Unix 秒判断启动时是否需要刷新 ED2K 服务器订阅。
+///
+/// 纯函数（无 IO），语义对齐桌面 `download_actor` 的启动自刷新块。
+#[must_use]
+pub fn ed2k_server_sub_startup_plan(cfg: &HashMap<String, String>, now: i64) -> Ed2kSubStartupPlan {
+    let sub_enabled = cfg
+        .get("ed2k_server_sub_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(true);
+    let updated_at = cfg
+        .get("ed2k_server_sub_updated_at")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let cache_version = cfg
+        .get("ed2k_server_sub_cache_version")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let version_stale =
+        cache_version < fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION;
+    let stale_by_age = now.saturating_sub(updated_at)
+        > fluxdown_engine::ed2k::server_subscription::REFRESH_INTERVAL_SECS;
+    Ed2kSubStartupPlan {
+        invalidate_cache: version_stale,
+        refresh: sub_enabled && (version_stale || stale_by_age),
+        cache_version,
+        updated_at,
+    }
+}
+
+/// 拉取全部 ED2K `server.met` 订阅源、去重后写回 `ed2k_server_sub_cache` /
+/// `ed2k_server_sub_updated_at` / `ed2k_server_sub_cache_version` 配置。
+/// 返回抓取结果供 HTTP 层回执。
+///
+/// 与 BT Tracker 不同：ED2K 服务器列表在每次下载的 find-sources 步骤现读，
+/// 没有需要失效的共享会话，因此不经 actor（不发 `ApplyConfig`）。
+/// 全部源失败时不改动缓存，保留上次成功的列表。
+pub async fn refresh_ed2k_server_sub(
+    db: &Db,
+) -> fluxdown_engine::ed2k::server_subscription::ServerFetchOutcome {
+    let cfg = db.get_all_config().await.unwrap_or_default();
+    let urls = cfg
+        .get("ed2k_server_sub_urls")
+        .cloned()
+        .unwrap_or_else(fluxdown_engine::ed2k::server_subscription::default_server_met_urls);
+    let outcome =
+        fluxdown_engine::ed2k::server_subscription::fetch_server_subscriptions(&urls).await;
+    if outcome.is_success() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if let Err(e) = db
+            .set_config("ed2k_server_sub_cache", &outcome.servers.join(","))
+            .await
+        {
+            log_info!("[server-actor] failed to save ed2k server sub cache: {}", e);
+        }
+        if let Err(e) = db
+            .set_config("ed2k_server_sub_updated_at", &now.to_string())
+            .await
+        {
+            log_info!(
+                "[server-actor] failed to save ed2k server sub timestamp: {}",
+                e
+            );
+        }
+        if let Err(e) = db
+            .set_config(
+                "ed2k_server_sub_cache_version",
+                &fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION.to_string(),
+            )
+            .await
+        {
+            log_info!(
+                "[server-actor] failed to save ed2k server sub cache version: {}",
+                e
+            );
+        }
+    }
+    outcome
+}
+
+/// 后台下载配置的 `nodes.dat` 并 base64 缓存进 config 表供 Kad 引导。
+///
+/// 纯二进制块、无前端可见状态，故无回执通道：失败只记日志并容忍
+/// （Kad 保持不活跃直到下一次刷新）。URL 为空直接返回。
+pub fn spawn_ed2k_nodes_dat_refresh(db: Db) {
+    tokio::spawn(async move {
+        let cfg = db.get_all_config().await.unwrap_or_default();
+        let url = cfg.get("ed2k_nodes_dat_url").cloned().unwrap_or_default();
+        if url.is_empty() {
+            return;
+        }
+        match fluxdown_engine::ed2k::kad::fetch_nodes_dat(&url).await {
+            Ok(bytes) => {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if let Err(e) = db.set_config("ed2k_nodes_dat_cache", &encoded).await {
+                    log_info!("[server-actor] failed to save ed2k nodes.dat cache: {}", e);
+                }
+                if let Err(e) = db
+                    .set_config("ed2k_nodes_dat_updated_at", &now.to_string())
+                    .await
+                {
+                    log_info!(
+                        "[server-actor] failed to save ed2k nodes.dat timestamp: {}",
+                        e
+                    );
+                }
+                log_info!(
+                    "[server-actor] ed2k nodes.dat refreshed ({} bytes)",
+                    bytes.len()
+                );
+            }
+            Err(e) => log_info!("[server-actor] ed2k nodes.dat refresh failed: {}", e),
+        }
+    });
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1134,5 +1307,51 @@ mod tests {
             err.contains("invalid torrent_b64"),
             "error message should explain the cause: {err}"
         );
+    }
+
+    #[test]
+    fn ed2k_server_sub_startup_plan_covers_version_staleness_freshness_and_opt_out() {
+        const CUR: i64 = fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION;
+        const INTERVAL: i64 = fluxdown_engine::ed2k::server_subscription::REFRESH_INTERVAL_SECS;
+        let now = 1_800_000_000_i64;
+
+        // 缓存格式版本落后：即使时间戳刚刚更新过，也必须清空缓存并重取
+        // （旧格式解析器写入的 ip:port 字节序被反转，全为死主机）。
+        let plan = ed2k_server_sub_startup_plan(
+            &cfg_map(&[
+                ("ed2k_server_sub_enabled", "true"),
+                ("ed2k_server_sub_updated_at", &now.to_string()),
+                ("ed2k_server_sub_cache_version", &(CUR - 1).to_string()),
+            ]),
+            now,
+        );
+        assert!(plan.invalidate_cache, "落后版本的缓存必须清空");
+        assert!(plan.refresh, "落后版本必须无视时间戳强制重取");
+
+        // 版本一致且缓存新鲜：不刷新、不清缓存。
+        let plan = ed2k_server_sub_startup_plan(
+            &cfg_map(&[
+                ("ed2k_server_sub_enabled", "true"),
+                (
+                    "ed2k_server_sub_updated_at",
+                    &(now - INTERVAL / 2).to_string(),
+                ),
+                ("ed2k_server_sub_cache_version", &CUR.to_string()),
+            ]),
+            now,
+        );
+        assert!(!plan.invalidate_cache);
+        assert!(!plan.refresh, "未超过刷新周期不应发起网络请求");
+
+        // 订阅关闭：即使缓存早已过期也不刷新（用户显式关掉了订阅）。
+        let plan = ed2k_server_sub_startup_plan(
+            &cfg_map(&[
+                ("ed2k_server_sub_enabled", "false"),
+                ("ed2k_server_sub_updated_at", "0"),
+                ("ed2k_server_sub_cache_version", &CUR.to_string()),
+            ]),
+            now,
+        );
+        assert!(!plan.refresh, "订阅关闭时不得发起启动刷新");
     }
 }

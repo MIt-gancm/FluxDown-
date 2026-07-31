@@ -485,6 +485,16 @@ export interface TrackerSubRefreshResponse {
   error: string
 }
 
+/** eD2K 服务器订阅刷新结果（`POST /api/v1/ed2k/server-sub/refresh`）。 */
+export interface Ed2kServerSubRefreshResponse {
+  success: boolean
+  serverCount: number
+  okSources: number
+  totalSources: number
+  updatedAt: number
+  error: string
+}
+
 export interface CreateQueueRequest {
   name: string
   speedLimitKbps?: number

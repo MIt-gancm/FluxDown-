@@ -48,7 +48,8 @@ export default defineContentScript({
       const next = changes.settings.newValue as
         | { interceptMagnet?: boolean }
         | undefined;
-      if (next) magnetEnabled = next.interceptMagnet !== false;
+      if (!next) return;
+      magnetEnabled = next.interceptMagnet !== false;
     };
     browser.storage.onChanged.addListener(handleSettingsChanged);
     ctx.onInvalidated(() =>
@@ -183,10 +184,7 @@ export default defineContentScript({
       );
     });
 
-    // ===== 5. Alt+Click 绕过已移除 =====
-    // 改用 Chrome commands 快捷键（Alt+Shift+D）切换拦截开关，见 background.ts
-
-    // ===== 6. 一次性 CDN 下载 URL 预抢占 =====
+    // ===== 5. 一次性 CDN 下载 URL 预抢占 =====
     // 监听 Main World 脚本检测到的"AJAX 生成一次性 CDN URL"事件，
     // 立刻转发给 background，在浏览器发起 CDN GET 之前通知 FluxDown。
     const handlePreemptEvent = (event: Event) => {
@@ -211,7 +209,7 @@ export default defineContentScript({
       ),
     );
 
-    // ===== 7. 磁力链接点击拦截 =====
+    // ===== 6. 磁力链接点击拦截 =====
     // 用户直接点击 <a href="magnet:..."> 时，阻止浏览器弹出 OS 应用选择框，
     // 改由 FluxDown 接管。使用捕获阶段，早于页面自身的 click 处理器执行。
     // interceptMagnet 关闭时放行，交还系统默认磁力处理程序（如 qBittorrent）。

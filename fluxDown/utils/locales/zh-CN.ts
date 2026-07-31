@@ -15,7 +15,7 @@ const zhCN = {
 
   // Stats
   "stats.title": "今日统计",
-  "stats.sent": "已接管",
+  "stats.sent": "已下载",
   "stats.failed": "失败",
   "stats.reset": "重置统计",
   "stats.resetDone": "统计已重置",
@@ -30,9 +30,8 @@ const zhCN = {
   "settings.minFileSize": "最小文件大小",
   "settings.sizeNoLimit": "不限",
   "settings.interceptMagnet": "接管磁力链接",
-  "settings.interceptMagnetHint":
-    "点击 magnet: 链接时由 FluxDown 接管下载；关闭后交给系统默认磁力处理程序（如 qBittorrent）",
-  "settings.altClickHint": "按 Alt+Shift+D 快捷键可快速切换下载拦截开关",
+  "settings.interceptMagnetHint": "关闭后交给系统默认磁力程序（如 qBittorrent）",
+  "settings.altClickHint": "Alt+Shift+D 切换拦截",
   "settings.dotVisible": "悬浮球",
 
   // Remote download source
@@ -119,6 +118,7 @@ const zhCN = {
   "domain.exists": "{domain} 已在排除列表中",
   "domain.excluded": "已排除 {domain}",
   "domain.cannotGetDomain": "无法获取当前页面域名",
+  "domain.excludeCurrent": "排除当前站点",
 
   // Notifications
   "notify.batchNoLinks": "未找到链接",
@@ -142,7 +142,7 @@ const zhCN = {
   // Resource sniffer & panel
   "sniffer.title": "资源嗅探",
   "sniffer.resourceSniffing": "资源嗅探",
-  "sniffer.resourceSniffingHint": "自动检测网页中的可下载资源（关闭可减少重资源页面的性能开销，更改后刷新页面生效）",
+  "sniffer.resourceSniffingHint": "检测网页中的可下载资源，关闭即隐藏页面内下载按钮（重新开启需刷新）",
   "sniffer.showFloatingButton": "视频浮动按钮",
   "sniffer.showFloatingButtonHint": "在视频元素上显示快速下载按钮",
   "sniffer.showResourcePanel": "资源面板",
@@ -236,7 +236,7 @@ const zhCN = {
   "popup.quickDownload.failed": "发送失败",
 
   // Options 迁移项补充说明
-  "options.general.statsDesc": "重置弹出窗口中显示的已接管/失败计数",
+  "options.general.statsDesc": "重置弹出窗口中显示的已下载/失败计数",
   "options.rules.minFileSizeDesc": "小于该大小的文件不会被拦截",
   "options.rules.domainDesc": "这些域名下的下载将不会被拦截",
 
@@ -244,7 +244,7 @@ const zhCN = {
   "options.protocol.label": "FluxDown 自定义协议",
   "options.protocol.enabled": "已启用，经 fluxdown:// 唤起应用",
   "options.protocol.disabled": "关闭（默认）",
-  "options.protocol.desc": "拦截下载时经 fluxdown:// 协议唤起 FluxDown 应用，Android 与桌面客户端均支持。Android 上这是唯一可用通道；桌面端本机通道功能更全（可携带 Cookie 等认证信息），建议仅在本机通道不可用时开启。协议模式不携带认证信息，音视频分轨下载会回退浏览器。",
+  "options.protocol.desc": "经 fluxdown:// 协议唤起应用下载，Windows / macOS / Linux / Android 均支持。本机通道功能更全，建议仅在其不可用时开启",
 
   // 任务完成通知（任务面板）
   "notify.taskCompletedTitle": "下载完成",

@@ -30,6 +30,13 @@
           <span class="status-dot"></span>
           <span class="status-text" data-i18n="header.checking">Checking...</span>
         </div>
+        <!-- 下载拦截总开关：常驻头部，任务/资源/设置任一页都能一键切换 -->
+        <div class="header-switch">
+          <label class="toggle" id="enableToggleLabel">
+            <input type="checkbox" id="enableToggle" checked>
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
     </header>
 
@@ -70,19 +77,9 @@
       </section>
     </div>
 
-    <!-- ===== Pane: Settings (intercept + floating ball toggles) ===== -->
+    <!-- ===== Pane: Settings（拦截总开关已上移到头部）===== -->
     <div class="tab-pane hidden" id="paneSettings">
       <section class="section switch-section">
-        <div class="row">
-          <div class="switch-info">
-            <span class="label" data-i18n="switch.label">Download Intercept</span>
-            <span class="hint" id="enableHint" data-i18n="switch.enabled">Enabled</span>
-          </div>
-          <label class="toggle">
-            <input type="checkbox" id="enableToggle" checked>
-            <span class="slider"></span>
-          </label>
-        </div>
         <div class="row">
           <div class="switch-info">
             <span class="label" data-i18n="settings.dotVisible">Floating Ball</span>
@@ -103,6 +100,18 @@
         </div>
         <div class="mode-hint" data-i18n="sniffer.resourceSniffingHint">Auto-detect downloadable resources on web pages</div>
         <div class="mode-hint" data-i18n="settings.altClickHint">Press Alt+Shift+D to quickly toggle download interception</div>
+
+        <!-- 排除当前站点：完整排除列表在设置页 #rules 面板 -->
+        <div class="row">
+          <div class="switch-info">
+            <span class="label" data-i18n="domain.excludeCurrent">Exclude Current Site</span>
+            <span class="hint" id="excludeCurrentHint"></span>
+          </div>
+          <label class="toggle">
+            <input type="checkbox" id="excludeCurrentToggle">
+            <span class="slider"></span>
+          </label>
+        </div>
         <div class="row">
           <div class="switch-info">
             <span class="label" data-i18n="settings.interceptMagnet">Take Over Magnet Links</span>
@@ -129,7 +138,7 @@
             <span class="label" data-i18n="options.general.notifyLocalTitle">Local Task Notifications</span>
           </div>
           <label class="toggle">
-            <input type="checkbox" id="notifyLocalToggle" checked>
+            <input type="checkbox" id="notifyLocalToggle">
             <span class="slider"></span>
           </label>
         </div>

@@ -12,7 +12,7 @@ export function ExtensionsSettings() {
   const [tab, setTab] = useState<ExtensionTab>('plugins')
 
   return (
-    <div className="max-w-[640px]">
+    <div className="set-panel">
       <h2 className="set-title">{t('set.extensions')}</h2>
       <p className="set-desc">{t('set.extensions.desc')}</p>
 

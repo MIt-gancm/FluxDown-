@@ -12,6 +12,7 @@ mod config;
 mod demo;
 mod host;
 mod routes_ext;
+mod web_assets;
 mod wire;
 mod ws_hub;
 
@@ -30,7 +31,10 @@ use fluxdown_engine::{Engine, EngineConfig};
 use tokio::sync::mpsc;
 use tower_http::services::{ServeDir, ServeFile};
 
-use crate::actor::{ActorCmd, bt_config_from_map, refresh_tracker_sub, run_actor};
+use crate::actor::{
+    ActorCmd, ED2K_NODES_DAT_REFRESH_SECS, bt_config_from_map, ed2k_server_sub_startup_plan,
+    refresh_ed2k_server_sub, refresh_tracker_sub, run_actor, spawn_ed2k_nodes_dat_refresh,
+};
 use crate::config::{ServerConfig, default_save_dir, ensure_server_config};
 use crate::host::ServerApiHost;
 use crate::routes_ext::{ServerState, extra_router};
@@ -83,6 +87,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let all_cfg = boot_db.get_all_config().await.unwrap_or_default();
+    // 已持久化的日志体积上限（MB）立即应用到全局 logger（镜像桌面启动流程）。
+    if let Some(mb) = all_cfg
+        .get("log_max_size_mb")
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        fluxdown_engine::logger::set_max_total_bytes(mb * 1024 * 1024);
+    }
     let max_concurrent = all_cfg
         .get("max_concurrent_tasks")
         .and_then(|v| v.parse::<usize>().ok())
@@ -356,6 +367,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ED2K 服务器订阅启动自动刷新：缓存格式版本落后（旧缓存 IP 字节序被反转，
+    // 全为死主机）或超过刷新周期未更新时，后台拉取一次（不阻塞 serve）。
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let plan = ed2k_server_sub_startup_plan(&all_cfg, now);
+        if plan.invalidate_cache {
+            log_info!(
+                "[server] ed2k server sub cache version {} < {}, invalidating (byte-order fix)",
+                plan.cache_version,
+                fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION
+            );
+            let _ = db_handle.set_config("ed2k_server_sub_cache", "").await;
+        }
+        if plan.refresh {
+            log_info!(
+                "[server] ed2k server subscription stale (updated_at={}, version_stale={}), auto-refreshing",
+                plan.updated_at,
+                plan.invalidate_cache
+            );
+            let db = db_handle.clone();
+            tokio::spawn(async move {
+                refresh_ed2k_server_sub(&db).await;
+            });
+        }
+    }
+
+    // Kad nodes.dat 启动自动刷新：启用 Kad 且缓存超过 24 小时未更新（或为空）。
+    {
+        let kad_enabled = all_cfg
+            .get("ed2k_enable_kad")
+            .map(|v| v == "true")
+            .unwrap_or(true);
+        let updated_at = all_cfg
+            .get("ed2k_nodes_dat_updated_at")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if kad_enabled && now.saturating_sub(updated_at) > ED2K_NODES_DAT_REFRESH_SECS {
+            log_info!(
+                "[server] ed2k nodes.dat stale (updated_at={}), auto-refreshing",
+                updated_at
+            );
+            spawn_ed2k_nodes_dat_refresh(db_handle.clone());
+        }
+    }
+
     // 路由：核心（fluxdown_api 复用）+ 扩展（本 crate）+ SPA 静态托管。
     let api_cfg = ApiServerConfig::from_config_map(&all_cfg, SERVER_VERSION);
     // 访问密钥由 cell 持有：首次运行向导 / 设置页 / regenerate 改写后，核心路由
@@ -392,14 +455,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ffmpeg_installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ytdlp_installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
-    let spa = ServeDir::new(&server_cfg.webroot)
-        .fallback(ServeFile::new(server_cfg.webroot.join("index.html")));
     let mut app: Router = api_router(host, api_cfg).merge(extra_router(state));
     if server_cfg.demo_url.is_some() {
         // 内置演示下载源（无鉴权，生成字节流）；仅演示模式挂载。
         app = app.merge(demo::demo_router());
     }
-    let app = app.fallback_service(spa);
+    // SPA：常态用二进制内嵌产物（单文件分发）；`FLUXDOWN_WEBROOT` 显式指定时
+    // 改从磁盘目录托管（自定义前端 / 本地调试）。
+    let app = match &server_cfg.webroot {
+        Some(dir) => {
+            log_info!("[server] serving web ui from {}", dir.display());
+            app.fallback_service(
+                ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html"))),
+            )
+        }
+        None => {
+            let (files, bytes) = web_assets::stats();
+            if web_assets::is_embedded() {
+                log_info!(
+                    "[server] serving embedded web ui ({files} files, {} KiB)",
+                    bytes / 1024
+                );
+            } else {
+                log_info!("[server] web ui not embedded in this build");
+                eprintln!(
+                    "警告：本构建未嵌入 Web 界面（web/dist 缺失）。API 正常，浏览器打开会看到提示页；\n\
+                     可先在 web/ 执行 `bun run build` 重新编译，或设置 FLUXDOWN_WEBROOT 指向已构建目录。"
+                );
+            }
+            app.fallback(web_assets::handler)
+        }
+    };
 
     let listener = tokio::net::TcpListener::bind(&server_cfg.bind).await?;
     log_info!("[server] listening on {}", server_cfg.bind);

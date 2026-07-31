@@ -1274,7 +1274,8 @@ jobs:
   #   macos   → arm64 runner 原生编译 + 交叉编译 x64（Apple SDK 双架构开箱即用）
   # 不提供 x86(32位)：macOS/Win11 已无 32 位，Linux i686 无实际需求；
   # 如需 armv7（老 NAS/树莓派 32 位）可后续用 cross-rs 追加 matrix 项。
-  # 打包布局：fluxdown-server(.exe) + web/（二进制默认从同级 ./web 提供 SPA，见 config.rs）
+  # 打包布局：单文件 fluxdown-server(.exe)——Web SPA 由 native/server/build.rs
+  # 在编译期经 FLUXDOWN_EMBED_WEBROOT 嵌进二进制，产物不再附带 web/ 目录。
   build-server-binaries:
     name: Build Server (${{ matrix.platform }})
     needs: [changes, build-web]
@@ -1333,18 +1334,21 @@ jobs:
           restore-keys: |
             server-${{ matrix.platform }}-
 
-      # FLUXDOWN_SERVER_VERSION：编译期注入 tag 版本号（/ping、stats、OpenAPI 显示）
-      - name: Build server binary
-        env:
-          FLUXDOWN_SERVER_VERSION: ${{ steps.version.outputs.VERSION }}
-          FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
-        run: cargo build --release --locked -p fluxdown_server --target ${{ matrix.target }}
-
+      # 前端产物必须在 cargo build 之前就位：build.rs 按 FLUXDOWN_EMBED_WEBROOT
+      # 把 web/dist 全量 include_bytes! 进二进制（单文件分发）。
       - name: Download webroot artifact
         uses: actions/download-artifact@v4
         with:
           name: server-webroot
           path: webroot
+
+      # FLUXDOWN_SERVER_VERSION：编译期注入 tag 版本号（/ping、stats、OpenAPI 显示）
+      - name: Build server binary
+        env:
+          FLUXDOWN_SERVER_VERSION: ${{ steps.version.outputs.VERSION }}
+          FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
+          FLUXDOWN_EMBED_WEBROOT: ${{ github.workspace }}/webroot
+        run: cargo build --release --locked -p fluxdown_server --target ${{ matrix.target }}
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
@@ -1354,7 +1358,6 @@ jobs:
           PKG="fluxdown-server-${VERSION}-${{ matrix.platform }}"
           mkdir -p "build/server/${PKG}" release-assets
           cp "target/${{ matrix.target }}/release/fluxdown-server" "build/server/${PKG}/"
-          cp -r webroot "build/server/${PKG}/web"
           tar -C build/server -czf "release-assets/FluxDown-Server-${VERSION}-${{ matrix.platform }}.tar.gz" "${PKG}"
           ls -la release-assets/
 
@@ -1402,7 +1405,6 @@ jobs:
           $Pkg = "fluxdown-server-$Version-${{ matrix.platform }}"
           New-Item -ItemType Directory -Force -Path "build\server\$Pkg", "release-assets" | Out-Null
           Copy-Item "target\${{ matrix.target }}\release\fluxdown-server.exe" "build\server\$Pkg\"
-          Copy-Item -Recurse "webroot" "build\server\$Pkg\web"
           Compress-Archive -Path "build\server\$Pkg" -DestinationPath "release-assets\FluxDown-Server-$Version-${{ matrix.platform }}.zip"
           Get-ChildItem release-assets
 
@@ -1440,7 +1442,7 @@ jobs:
           path: tarballs/
           merge-multiple: true
 
-      - name: Extract binaries and webroot
+      - name: Extract server binaries
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           mkdir -p extracted
@@ -1464,8 +1466,8 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$X64/fluxdown-server" "$X64/web" x86_64 release-assets
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$A64/fluxdown-server" "$A64/web" \
+          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$X64/fluxdown-server" x86_64 release-assets
+          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$A64/fluxdown-server" \
             aarch64_generic,aarch64_cortex-a53,aarch64_cortex-a72,aarch64_cortex-a76 release-assets
           ./packaging/openwrt/build_ipk.sh luci "$VERSION" release-assets
 
@@ -1474,9 +1476,9 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
-          ./packaging/qnap/build_qpkg.sh "$VERSION" x86_64 "$X64/fluxdown-server" "$X64/web" \
+          ./packaging/qnap/build_qpkg.sh "$VERSION" x86_64 "$X64/fluxdown-server" \
             "release-assets/FluxDown-Server-${VERSION}-qnap-x64.qpkg"
-          ./packaging/qnap/build_qpkg.sh "$VERSION" arm_64 "$A64/fluxdown-server" "$A64/web" \
+          ./packaging/qnap/build_qpkg.sh "$VERSION" arm_64 "$A64/fluxdown-server" \
             "release-assets/FluxDown-Server-${VERSION}-qnap-arm64.qpkg"
 
       - name: Build Synology spk
@@ -1485,9 +1487,9 @@ jobs:
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
           for dsm in dsm7 dsm6; do
-            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" x86_64 "$X64/fluxdown-server" "$X64/web" \
+            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" x86_64 "$X64/fluxdown-server" \
               "release-assets/FluxDown-Server-${VERSION}-synology-${dsm}-x64.spk"
-            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" armv8 "$A64/fluxdown-server" "$A64/web" \
+            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" armv8 "$A64/fluxdown-server" \
               "release-assets/FluxDown-Server-${VERSION}-synology-${dsm}-arm64.spk"
           done
 
@@ -1818,7 +1820,7 @@ jobs:
         with:
           component: Headless 服务器（含 Web 控制台）
           fallback-title: Server Release v${{ steps.version.outputs.VERSION }}
-          paths: native/server/** web/** native/engine/** docker/**
+          paths: native/server/** web/** native/engine/** native/api/** docker/** packaging/**
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # 附加下载方式说明（直接下载二进制 + Docker）
@@ -1842,9 +1844,10 @@ jobs:
           | 群晖 NAS（DSM 7 / DSM 6，x86_64 / ARM64） | \`FluxDown-Server-${VERSION}-synology-{dsm7,dsm6}-{x64,arm64}.spk\` |
 
           解压后直接运行 \`fluxdown-server\`（Windows 为 \`fluxdown-server.exe\`），浏览器访问 \`http://127.0.0.1:17800\`。
-          首次启动会在终端打印管理 token，务必保存。文件校验见 \`SHA256SUMS.txt\`。
+          **单文件分发**：Web 控制台已编译进二进制，包内只有可执行文件本身，无需附带任何静态资源目录。
+          首次启动请在浏览器里完成「初始化 FluxDown Server」向导设置访问密钥（无人值守部署可用 \`FLUXDOWN_TOKEN\` 预置）。文件校验见 \`SHA256SUMS.txt\`。
 
-          **OpenWrt**：\`opkg install fluxdown-server_*.ipk luci-app-fluxdown_*.ipk\`，LuCI「服务 → FluxDown」页管理，Web 界面在 \`http://路由器IP:17800\`。二进制含完整 Web UI（约 20MB+），需 overlay 空间充足的软路由设备。
+          **OpenWrt**：\`opkg install fluxdown-server_*.ipk luci-app-fluxdown_*.ipk\`，LuCI「服务 → FluxDown」页管理，Web 界面在 \`http://路由器IP:17800\`。二进制含完整 Web UI（约 30MB），需 overlay 空间充足的软路由设备。
           **QNAP**：App Center → 手动安装 \`.qpkg\`（需在设置中允许安装未经验证的应用），装完点应用图标直达 Web 界面。
           **群晖**：套件中心 → 手动安装 \`.spk\`（需在「设置 → 信任来源」允许任何发行者）。DSM 7.x 装 \`dsm7\` 包（以套件专属用户运行），DSM 6.x 装 \`dsm6\` 包；Intel/AMD 机型选 x64，ARM 机型（rtd1296/rtd1619b 等）选 arm64。装完在套件中心点「打开」直达 Web 界面（端口 17800）。
 
@@ -1856,7 +1859,7 @@ jobs:
             ghcr.io/${{ github.repository_owner }}/fluxdown-server:${VERSION}
           \`\`\`
 
-          Compose 部署见仓库 \`docker/docker-compose.yml\`。首次启动会在容器日志打印管理 token。
+          Compose 部署见仓库 \`docker/docker-compose.yml\`。首次打开 Web 界面时按向导设置访问密钥，或用 \`-e FLUXDOWN_TOKEN=...\` 预置。
           EOF
 
       - name: Download server artifacts

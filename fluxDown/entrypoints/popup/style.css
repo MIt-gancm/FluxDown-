@@ -167,6 +167,14 @@ body {
   gap: 8px;
 }
 
+/* 头部常驻的下载拦截总开关：与状态徽标之间用竖线分隔 */
+.header-switch {
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+  border-left: 1px solid var(--border);
+}
+
 /* ===== Icon Button ===== */
 .icon-btn {
   display: flex;

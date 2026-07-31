@@ -18,6 +18,7 @@ import type { DashManifest } from '@/utils/dash-manifest';
 import { detectTrackKind } from '@/utils/track-detector';
 import type { MessageKey } from '@/utils/locales/zh-CN';
 import { initI18n, setLocale, t } from '@/utils/i18n';
+import { loadSettings } from '@/utils/settings';
 import './style.css';
 
 /* ===== 常量 ===== */
@@ -127,10 +128,38 @@ export default defineContentScript({
         applyThemeFromStorage();
       },
     });
-    ui.mount();
+    /* ========== 资源嗅探开关 ==========
+     * 关掉嗅探后 background 不再上报资源，页面里的悬浮球 / 资源面板 /
+     * 视频浮动下载按钮也必须一起消失——否则用户明明关了却仍看到注入 UI。
+     * 开关改动即时生效（挂载 / 卸载 shadow root），不需要刷新页面。 */
+    let sniffEnabled = true;
+    try {
+      sniffEnabled = (await loadSettings()).resourceSniffing !== false;
+    } catch {
+      // 设置读取失败按开启处理
+    }
+    if (sniffEnabled) ui.mount();
+
+    browser.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'sync' || !changes.settings) return;
+      const next = changes.settings.newValue as
+        | { resourceSniffing?: boolean }
+        | undefined;
+      const enabled = next?.resourceSniffing !== false;
+      if (enabled === sniffEnabled) return;
+      sniffEnabled = enabled;
+      if (enabled) {
+        ui.mount();
+      } else {
+        hideFloat();
+        panelOpen = false;
+        ui.remove();
+      }
+    });
 
     /* ========== 消息监听 ========== */
     browser.runtime.onMessage.addListener((msg) => {
+      if (!sniffEnabled) return;
       if (msg.action === 'resourcesUpdated' && Array.isArray(msg.resources)) {
         resources = msg.resources;
         render();
@@ -163,16 +192,18 @@ export default defineContentScript({
       }
     });
 
-    try {
-      const resp = await browser.runtime.sendMessage({ action: 'getResources' });
-      if (resp?.resources?.length > 0) {
-        resources = resp.resources;
-        render();
-      }
-      if (resp?.dashManifest) {
-        dashManifest = resp.dashManifest;
-      }
-    } catch { /* */ }
+    if (sniffEnabled) {
+      try {
+        const resp = await browser.runtime.sendMessage({ action: 'getResources' });
+        if (resp?.resources?.length > 0) {
+          resources = resp.resources;
+          render();
+        }
+        if (resp?.dashManifest) {
+          dashManifest = resp.dashManifest;
+        }
+      } catch { /* */ }
+    }
 
     /* ========== 预览弹层：Esc 关闭 ========== */
     document.addEventListener('keydown', (e) => {
@@ -492,6 +523,7 @@ export default defineContentScript({
      * ================================================================ */
 
     function togglePanel(): void {
+      if (!sniffEnabled) return;
       panelOpen = !panelOpen;
       if (panelOpen) {
         const dotY = parseInt(dotEl.style.top) || Math.round(window.innerHeight * 0.4);
@@ -793,7 +825,7 @@ export default defineContentScript({
     }
 
     function showFloat(video: HTMLVideoElement): void {
-      if (!floatBtnEl) return;
+      if (!sniffEnabled || !floatBtnEl) return;
       const rect = video.getBoundingClientRect();
       if (rect.width < 120 || rect.height < 80) return;
 

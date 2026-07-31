@@ -520,7 +520,7 @@ async function init() {
   await renderVerifyState();
 
   // 任务发送通知开关
-  notifyLocalToggle.checked = settings.notifyLocalTask !== false;
+  notifyLocalToggle.checked = settings.notifyLocalTask === true;
   notifyRemoteToggle.checked = settings.notifyRemoteTask !== false;
 
   // fluxdown:// 自定义协议开关

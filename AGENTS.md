@@ -131,6 +131,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - `download_actor.rs` 主 `tokio::select!` **已占满 tokio 64 分支硬上限**，再加一条即编译错误。新增任何 Dart 信号 / 定时节拍 / 回流通道**都不许往主循环加分支**——并进既有 `AuxSignal` 合并泵（两个后台 spawn 把消息合流进单条 `aux_tx`，主循环只有一条 `aux_rx.recv()`）。
 - rquickjs（`engine/Cargo.toml`）：禁止叠加 `rust-alloc`/`allocator`（会让 `set_memory_limit` 静默失效）；必带 `parallel`（`AsyncRuntime`/`AsyncContext` 的 Send/Sync 依赖它）。
 - `profile.release` **不**设 `panic="abort"`——`download_manager` 靠 `catch_unwind` 恢复 task panic。
+- **`fluxdown_server` 的 Web UI 是编译期内嵌的**：`native/server/build.rs` 把 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`）整棵目录递归全量 `include_bytes!` 进二进制（不按扩展名筛选，新增文件/新建子目录下次编译自动进包）。改了前端**必须先 `cd web && bun run build` 再重编服务器**才能看到；产物是单二进制，不再有同级 `web/` 目录，`FLUXDOWN_WEBROOT` 降级为可选的磁盘覆盖。构建时目录缺失只 warning + 运行期 503 提示页，不会让编译失败。
 
 **运行期不变式**
 - 两个宿主 actor **都必须** drain `resolve_rx`（off-actor 插件解析回流）与 `plugin_retry_rx`，否则命中 resolver 的下载永久挂起。

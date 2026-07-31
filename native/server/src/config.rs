@@ -5,7 +5,7 @@
 //! | `FLUXDOWN_DATA_DIR` | 数据目录（DB/日志） | 平台自动探测 |
 //! | `FLUXDOWN_DATABASE_URL` | 数据库连接 URL（`sqlite:`/`postgres:`） | 数据目录下 SQLite |
 //! | `FLUXDOWN_BIND` | HTTP 监听地址 | `0.0.0.0:17800` |
-//! | `FLUXDOWN_WEBROOT` | SPA 静态资源目录 | 二进制同级 `./web` |
+//! | `FLUXDOWN_WEBROOT` | 覆盖内嵌 Web UI，改从该磁盘目录托管 SPA | 未设置（用二进制内嵌的前端） |
 //! | `FLUXDOWN_TOKEN` | 预置管理访问密钥（仅在库中尚未设置时采纳） | 未设置（走 Web 向导） |
 //! | `FLUXDOWN_DEMO` | 演示模式：仅允许下载内置本地演示文件 | 未设置（关闭） |
 //! | `FLUXDOWN_DEMO_URL` | 演示模式：仅允许下载该 URL（覆盖内置） | 未设置（关闭） |
@@ -26,7 +26,11 @@ pub struct ServerConfig {
     pub bind: String,
     pub data_dir_override: Option<PathBuf>,
     pub database_url: Option<String>,
-    pub webroot: PathBuf,
+    /// SPA 托管目录覆盖。`None` = 用二进制内嵌的 Web UI（常态）；`Some` 仅在
+    /// 显式设置 `FLUXDOWN_WEBROOT` 时出现，用于自定义/调试前端。
+    /// **不做「二进制同级 ./web」的隐式探测**——旧版本残留的 web/ 目录会让
+    /// 升级后的服务器配上过期 SPA，静默出现前后端契约不匹配。
+    pub webroot: Option<PathBuf>,
     /// 演示模式：`Some(url)` 时新任务仅允许下载该 URL（见 `host::demo_guard`）。
     pub demo_url: Option<String>,
     /// Web UI 默认语言（`en`/`zh`）。纯回退值，不写库：`/ping` 的 `language`
@@ -45,7 +49,7 @@ impl ServerConfig {
             .filter(|s| !s.trim().is_empty());
         let webroot = std::env::var_os("FLUXDOWN_WEBROOT")
             .map(PathBuf::from)
-            .unwrap_or_else(default_webroot);
+            .filter(|p| !p.as_os_str().is_empty());
         let demo_url = std::env::var("FLUXDOWN_DEMO_URL")
             .ok()
             .as_deref()
@@ -125,14 +129,6 @@ fn flag_truthy(v: &str) -> bool {
 fn builtin_demo_url(bind: &str) -> String {
     let port = bind.rsplit(':').next().unwrap_or("17800");
     format!("http://127.0.0.1:{port}{}", crate::demo::DEMO_FILE_PATH)
-}
-
-/// 默认 SPA 目录：二进制同级 `./web`（取不到 exe 路径时退回 CWD 下 `web`）。
-fn default_webroot() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("web")))
-        .unwrap_or_else(|| PathBuf::from("web"))
 }
 
 /// 平台默认下载目录（复制自 `download_actor.rs` 的私有 helper）。

@@ -52,6 +52,8 @@ export interface Category {
   visible: boolean
   isBuiltin: boolean
   builtinType: BuiltinType | null
+  /** 分类专属保存目录，空串 = 用全局默认目录。 */
+  saveDir: string
 }
 
 const ICONS: Record<string, LucideIcon> = {
@@ -134,6 +136,7 @@ function builtin(id: string, type: BuiltinType, icon: string, position: number, 
     visible: true,
     isBuiltin: true,
     builtinType: type,
+    saveDir: '',
   }
 }
 
@@ -167,6 +170,7 @@ export function parseCategories(raw: string | undefined): Category[] {
       visible: o.visible !== false,
       isBuiltin: o.isBuiltin === true,
       builtinType: typeof o.builtinType === 'string' ? (o.builtinType as BuiltinType) : null,
+      saveDir: typeof o.saveDir === 'string' ? o.saveDir : '',
     })
   }
   return out.length > 0 ? out : BUILTIN
@@ -183,6 +187,11 @@ export function categoryLabel(c: Category): string {
 
 export function categoryIcon(c: Category): LucideIcon {
   return ICONS[c.icon] ?? File
+}
+
+/** 按图标标识取组件（设置页图标选择器用）；未知标识退到通用文件图标。 */
+export function categoryIconByKey(key: string): LucideIcon {
+  return ICONS[key] ?? File
 }
 
 /** 从任务的文件名/链接取出用于匹配的名字。文件名尚未确定（解析中）时退到 URL 末段。 */
@@ -238,4 +247,83 @@ export function passesCategory(
   const target = cats.find((c) => c.id === filter)
   if (!target || target.builtinType === 'all') return true
   return categoryIdOf(task, cats) === target.id
+}
+
+// ---------------------------------------------------------------------------
+// 分类编辑（设置页「自定义分类」）
+// ---------------------------------------------------------------------------
+//
+// 序列化格式与桌面端 `CustomCategory.toJson()` 逐字段一致（同一行 DB，两端互读）：
+// id / name / icon / matchMode / extensions / regexPattern / position / visible /
+// isBuiltin / builtinType / saveDir。字段名或取值一旦偏离，桌面端读到的分类就会
+// 退化成默认值。
+
+/** 图标选择器的候选集，顺序与桌面 `CategoryIcon` 枚举一致。 */
+export const CATEGORY_ICON_KEYS: string[] = Object.keys(ICONS)
+
+/** 内置分类的出厂快照（深拷贝，调用方可安全改写）。 */
+export function defaultCategories(): Category[] {
+  return BUILTIN.map((c) => ({ ...c, extensions: [...c.extensions] }))
+}
+
+/** 某个内置类型的出厂配置；未知类型返回 undefined。 */
+export function defaultCategoryOf(type: BuiltinType): Category | undefined {
+  const found = BUILTIN.find((c) => c.builtinType === type)
+  return found ? { ...found, extensions: [...found.extensions] } : undefined
+}
+
+/** 写回 config 的 JSON。字段顺序对齐桌面 `toJson()`，便于两端 diff。 */
+export function serializeCategories(cats: Category[]): string {
+  return JSON.stringify(
+    cats.map((c) => ({
+      id: c.id,
+      name: c.name,
+      icon: c.icon,
+      matchMode: c.matchMode,
+      extensions: c.extensions,
+      regexPattern: c.regexPattern,
+      position: c.position,
+      visible: c.visible,
+      isBuiltin: c.isBuiltin,
+      builtinType: c.builtinType,
+      saveDir: c.saveDir,
+    })),
+  )
+}
+
+/** 新建分类的 id：与桌面同构（微秒时间戳的 36 进制），跨端不会撞键。 */
+export function newCategoryId(): string {
+  return (Date.now() * 1000).toString(36)
+}
+
+/** 扩展名输入归一化：逗号（含全角）/空白分隔，去点号、转小写、丢空项。 */
+export function parseExtensionsInput(raw: string): string[] {
+  return raw
+    .split(/[,，\s]+/)
+    .map((e) => e.trim().replaceAll('.', '').toLowerCase())
+    .filter((e) => e !== '')
+}
+
+/** 扩展名回填输入框的展示形式（与桌面 `extensions.join(', ')` 一致）。 */
+export function formatExtensionsInput(extensions: string[]): string {
+  return extensions.join(', ')
+}
+
+export function isValidRegex(pattern: string): boolean {
+  try {
+    new RegExp(pattern)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** 'all' 与 'other' 没有显式匹配规则（全匹配 / 兜底），编辑时隐藏规则区。 */
+export function isSpecialBuiltin(c: Category | null): boolean {
+  return c?.isBuiltin === true && (c.builtinType === 'all' || c.builtinType === 'other')
+}
+
+/** 重排后按数组下标重写 position，保证排序稳定（对齐桌面 reorderCustomCategories）。 */
+export function repositionCategories(cats: Category[]): Category[] {
+  return cats.map((c, i) => ({ ...c, position: i }))
 }

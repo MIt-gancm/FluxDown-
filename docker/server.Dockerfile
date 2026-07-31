@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# FluxDown headless 服务器镜像：Web SPA（web/）+ fluxdown-server（native/server）。
+# FluxDown headless 服务器镜像：单二进制 fluxdown-server（Web SPA 编译期内嵌）。
 # 多架构：linux/amd64 + linux/arm64。编译阶段固定跑在构建机原生架构
 # （--platform=$BUILDPLATFORM）并按 TARGETARCH 交叉编译，避免 QEMU 模拟下的
 # Rust 全量编译（数小时级）；仅最终运行时层按目标架构拉取。
@@ -41,6 +41,10 @@ RUN case "$TARGETARCH" in \
     esac
 COPY Cargo.toml Cargo.lock ./
 COPY native/ native/
+# Web SPA 在编译期由 native/server/build.rs 嵌入二进制（单文件分发，运行时层
+# 不再有 web/ 目录，也无需 FLUXDOWN_WEBROOT）。
+COPY --from=web /src/web/dist /webroot
+ENV FLUXDOWN_EMBED_WEBROOT=/webroot
 # 编译期版本注入（空值 = 未注入，二进制退回 crate 版本）
 ARG FLUXDOWN_SERVER_VERSION
 ENV FLUXDOWN_SERVER_VERSION=$FLUXDOWN_SERVER_VERSION
@@ -60,10 +64,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=server /usr/local/bin/fluxdown-server /app/fluxdown-server
-COPY --from=web /src/web/dist /app/web
 # FLUXDOWN_BIND / FLUXDOWN_DATABASE_URL / FLUXDOWN_DEMO / FLUXDOWN_LANG 等见 native/server/src/config.rs
 ENV FLUXDOWN_BIND=0.0.0.0:17800 \
-    FLUXDOWN_WEBROOT=/app/web \
     FLUXDOWN_DATA_DIR=/data
 VOLUME /data
 EXPOSE 17800

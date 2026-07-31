@@ -61,9 +61,11 @@ SharedPreferences 门面，**便携模式**（`portable` 标记）写 `<exe>/por
 
 ## Web SPA（`web/`）
 
-React 19 + Vite 8 + TanStack（Router/Query/Table/Virtual/Form）+ Tailwind v4 + Radix + bun + oxlint + react-compiler。由 `fluxdown_server` 从 `FLUXDOWN_WEBROOT` 托管（SPA fallback→index.html）。路由：`/login`、`/`（TasksScreen）、`/settings`（token 门禁，401→清凭据→/login）。`src/lib`：`api.ts`（typed REST）、`ws.ts`（可重连 WS live store）、`cloud/`（L2 云同步 client）、`i18n`、`task-group`、`manifest-selection`、`view-prefs`、`theme`、`format`。
+React 19 + Vite 8 + TanStack（Router/Query/Table/Virtual/Form）+ Tailwind v4 + Radix + bun + oxlint + react-compiler。`bun run build` → `web/dist`，由 `fluxdown_server` **编译期内嵌**进二进制托管（SPA fallback→index.html；`FLUXDOWN_WEBROOT` 可覆盖成磁盘目录，见 hosts-and-api.md）——改了前端要重编服务器才生效。路由：`/login`、`/`（TasksScreen）、`/settings`（token 门禁，401→清凭据→/login）。`src/lib`：`api.ts`（typed REST）、`ws.ts`（可重连 WS live store）、`cloud/`（L2 云同步 client）、`i18n`、`task-group`、`manifest-selection`、`view-prefs`、`theme`、`format`。
 
 **双端信息架构对齐（硬约束）**：同一功能在 web 与桌面 App 的**归属位置必须一致，基准 = 桌面**——设置项跟随桌面 `settings_page.dart` 的分类（web 设置分区组件与桌面侧边栏分类一一对应：GeneralSettings↔通用、DownloadSettings↔下载、ProxySettings↔代理…），对话框字段的分区/排序跟随桌面对应对话框。给双端并行开发（含 subagent 派发）写任务时，**归属分类/排序必须写成一份共享契约**（明确"桌面 X 分类 + web 对应分区组件"），禁止两份各自措辞留给执行者解读。交付前自查：桌面截图里该功能在哪个菜单，web 就必须在哪个菜单。
+
+**设置页布局**（`web/src/routes/settings.tsx` + `design.css` 的「设置」段）：左导航分类 = general/account/appearance/download/bt/**ed2k**/proxy/security/notify/extensions/about（与桌面侧边栏同序）。正文结构 `.settings-body`（滚动容器，高度确定）→ `.settings-cols`（**多列容器，高度必须自适应**——两者不能合并，否则 `column-count` 会按视口高度分列并横向溢出）。≥1200px 两列、≥1900px 三列的瀑布式排布：`.set-group` / `.set-section`（小标题+卡片+同组脚注的整体，`break-inside: avoid`）是列内元素，其余直接子元素（分区标题/说明/宽面板）`column-span: all` 整行铺满，超宽卡片显式加 `.set-wide`。异步卡片的 loading 态要与加载完成后**行数、title/desc 一致**（见 `ComponentsSettings`），否则首屏到货会重新均衡列高造成抖动。
 
 ---
 

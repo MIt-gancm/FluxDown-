@@ -3,10 +3,10 @@ title: 服务器部署
 description: 从源码构建并运行 headless FluxDown 服务器,了解全部环境变量并安全地对外暴露。
 section: headless-server
 order: 1
-sourceHash: "702c32325512"
+sourceHash: "5c2760a15f68"
 ---
 
-`fluxdown_server` 是 FluxDown 下载引擎的 headless 版本:没有 Flutter 界面,也没有 Rinf/FFI 层。它把同一套 Rust 引擎(HTTP/HTTPS、FTP、BitTorrent、HLS、DASH)通过 HTTP、WebSocket 和一个内置的 Web 界面暴露出来,因此你可以把它跑在 NAS、家庭服务器或 VPS 上,在浏览器里远程管理下载。
+`fluxdown_server` 是 FluxDown 下载引擎的 headless 版本:没有 Flutter 界面,也没有 Rinf/FFI 层。它把同一套 Rust 引擎(HTTP/HTTPS、FTP、BitTorrent、HLS、DASH)通过 HTTP、WebSocket 和一个编译进可执行文件的 Web 界面暴露出来,因此你可以把它跑在 NAS、家庭服务器或 VPS 上,在浏览器里远程管理下载。发行版就是**一个自包含的单二进制**,不用再附带 `web/` 目录。
 
 多数部署场景下，预编译 Docker 镜像是最省事的方式——见 [Docker 与 NAS](/docs/zh/headless-server/docker/)。本页介绍从工作区源码用 Cargo 构建并运行，以及对两种方式都适用的配置。
 
@@ -23,19 +23,27 @@ cargo build --release -p fluxdown_server
 # 产物路径:target/release/fluxdown-server(Windows 下为 fluxdown-server.exe)
 ```
 
-进程本身是自包含的:它会打开自己的 SQLite(或 PostgreSQL)数据库、运行下载引擎并托管 Web 界面——不需要额外的数据库服务或反向代理就能跑起来。
+进程本身是自包含的:它会打开自己的 SQLite(或 PostgreSQL)数据库、运行下载引擎,并直接从可执行文件内嵌的字节托管 Web 界面——不需要额外的数据库服务、静态文件目录或反向代理就能跑起来。
 
 ## 构建 Web 前端
 
-Web 界面是 `web/` 目录下独立的 SPA(React 19 + TanStack,用 [Bun](https://bun.sh) 构建)。服务器只负责托管静态文件,不会替你构建它。
+只有自己编译服务器时才需要这一步——官方发行二进制与 Docker 镜像已经内含界面。
+
+Web 界面是 `web/` 目录下独立的 SPA(React 19 + TanStack,用 [Bun](https://bun.sh) 构建)。它的构建产物在**编译期**被嵌入服务器二进制,所以必须在编译服务器**之前**就存在:
 
 ```bash
 cd web
 bun install
 bun run build      # 输出到 web/dist
+
+cd ..
+cargo build --release -p fluxdown_server   # 把 web/dist 嵌进二进制
 ```
 
-用下文的 `FLUXDOWN_WEBROOT` 把服务器指向这个输出目录。跳过这一步服务器依然能正常响应 API/WebSocket 请求,但浏览器打开它什么都看不到(没有可回退的 `index.html`)。
+前端每次改动后都要重新编译服务器——正在运行的二进制永远只提供它编译时那份字节。两个编译期开关:
+
+- `FLUXDOWN_EMBED_WEBROOT`——嵌入其它目录而不是 `web/dist`(CI 就用它,因为 SPA 在单独的 job 里构建)。
+- 目录缺失或为空不会让编译失败,只打一条 warning;此时服务器对浏览器请求返回 `503` 说明页,REST API 与 WebSocket 照常工作。
 
 <!-- TODO(screenshot): 浏览器里首次运行「初始化 FluxDown Server」向导的截图 -->
 
@@ -48,7 +56,7 @@ bun run build      # 输出到 web/dist
 | `FLUXDOWN_BIND` | `0.0.0.0:17800` | HTTP/WebSocket 服务监听的 TCP 地址。 |
 | `FLUXDOWN_DATA_DIR` | 平台自动探测(见下表) | 数据库文件与日志所在目录。 |
 | `FLUXDOWN_DATABASE_URL` | 未设置——使用数据目录下的 SQLite 文件 | 显式连接串:`sqlite:/path/to/file.db` 或 `postgres://user:pass@host/db`。 |
-| `FLUXDOWN_WEBROOT` | 可执行文件同级的 `./web` | Web 界面静态文件(`bun run build` 产物)所在目录;SPA 路由回退到 `index.html`。 |
+| `FLUXDOWN_WEBROOT` | 未设置——托管内嵌的 Web 界面 | 可选覆盖:改从该目录托管 SPA,而不用内嵌那份(自定义前端,或热替换 `bun run build` 产物)。**不再**隐式探测可执行文件同级的 `./web`。 |
 | `FLUXDOWN_TOKEN` | 未设置——走 Web 首次运行向导 | 可选的预置管理访问密钥。仅当库中尚未设置密钥时采纳(会 trim 首尾空白;须满足下文密钥规则,否则忽略并打警告)。用于 docker-compose / k8s / CI 等无人值守部署跳过向导。 |
 | `FLUXDOWN_DEMO` | 未设置(关闭) | 真值(`1`/`true`/`yes`/`on`)开启演示模式:仅允许下载内置生成的 64 MiB 演示文件,适合公开演示。 |
 | `FLUXDOWN_DEMO_URL` | 未设置(关闭) | 用指定 URL 覆盖演示模式的内置生成文件,仅该 URL 可下载。 |
@@ -68,7 +76,6 @@ headless 部署几乎总是应该显式设置 `FLUXDOWN_DATA_DIR` 为一个固�
 ```bash
 FLUXDOWN_BIND=0.0.0.0:8080 \
 FLUXDOWN_DATA_DIR=/srv/fluxdown/data \
-FLUXDOWN_WEBROOT=/srv/fluxdown/web/dist \
 ./fluxdown-server
 ```
 
@@ -177,7 +184,6 @@ Group=fluxdown
 WorkingDirectory=/opt/fluxdown
 Environment=FLUXDOWN_BIND=0.0.0.0:17800
 Environment=FLUXDOWN_DATA_DIR=/var/lib/fluxdown
-Environment=FLUXDOWN_WEBROOT=/opt/fluxdown/web
 ExecStart=/opt/fluxdown/fluxdown-server
 Restart=on-failure
 RestartSec=5
@@ -187,7 +193,7 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-把 `fluxdown-server`(release 二进制)与构建好的 `web/dist` 内容(重命名为 `web/`)放到 `/opt/fluxdown` 下,创建 `fluxdown` 系统用户与 `/var/lib/fluxdown` 目录,然后:
+把 `fluxdown-server`(release 二进制)放到 `/opt/fluxdown` 下(Web 界面就在它里面,没有别的文件要装),创建 `fluxdown` 系统用户与 `/var/lib/fluxdown` 目录,然后:
 
 ```bash
 sudo systemctl daemon-reload

@@ -45,12 +45,12 @@ use utoipa::OpenApi;
 use crate::actor::ActorCmd;
 use crate::config::{ACCESS_KEY_MIN_LEN, default_save_dir, validate_access_key};
 use crate::wire::{
-    ComponentFfmpegStatus, ComponentVersions, ComponentYtdlpStatus, CreateQueueRequest, FsEntry,
-    FsListResponse, InstallFfmpegRequest, LogFileDto, LogsResponse, MoveQueueRequest,
-    ProxyTestRequest, ProxyTestResponse, QueueScheduleRequest, ReorderQueueRequest, SetupRequest,
-    SetupStatusResponse, StatsResponse, TokenResponse, TrackerSubRefreshResponse,
-    UpdateQueueRequest, WebhookDeliveriesResponse, WebhookSimulateResponse, WebhookTestRequest,
-    WebhookTestResponse, WsClientMsg, WsServerMsg,
+    ComponentFfmpegStatus, ComponentVersions, ComponentYtdlpStatus, CreateQueueRequest,
+    Ed2kServerSubRefreshResponse, FsEntry, FsListResponse, InstallFfmpegRequest, LogFileDto,
+    LogsResponse, MoveQueueRequest, ProxyTestRequest, ProxyTestResponse, QueueScheduleRequest,
+    ReorderQueueRequest, SetupRequest, SetupStatusResponse, StatsResponse, TokenResponse,
+    TrackerSubRefreshResponse, UpdateQueueRequest, WebhookDeliveriesResponse,
+    WebhookSimulateResponse, WebhookTestRequest, WebhookTestResponse, WsClientMsg, WsServerMsg,
 };
 use crate::ws_hub::WsHub;
 
@@ -126,6 +126,10 @@ pub fn extra_router(state: ServerState) -> Router {
         .route(paths::STATS, get(stats))
         .route(paths::LOGS, get(logs_info))
         .route(paths::BT_TRACKER_SUB_REFRESH, post(bt_tracker_sub_refresh))
+        .route(
+            paths::ED2K_SERVER_SUB_REFRESH,
+            post(ed2k_server_sub_refresh),
+        )
         .route(paths::COMPONENT_FFMPEG, get(component_ffmpeg_status))
         .route(
             paths::COMPONENT_FFMPEG_VERSIONS,
@@ -202,6 +206,7 @@ pub mod paths {
     pub const OPENAPI: &str = "/api/v1/openapi.json";
     pub const DOCS: &str = "/api/v1/docs";
     pub const BT_TRACKER_SUB_REFRESH: &str = "/api/v1/bt/tracker-sub/refresh";
+    pub const ED2K_SERVER_SUB_REFRESH: &str = "/api/v1/ed2k/server-sub/refresh";
     pub const WEBHOOK_DELIVERIES: &str = "/api/v1/webhooks/deliveries";
     pub const WEBHOOK_TEST: &str = "/api/v1/webhooks/test";
     pub const WEBHOOK_SIMULATE: &str = "/api/v1/webhooks/simulate";
@@ -458,6 +463,33 @@ async fn bt_tracker_sub_refresh(State(state): State<ServerState>) -> Result<Resp
     let resp = TrackerSubRefreshResponse {
         success: outcome.is_success(),
         tracker_count: outcome.trackers.len() as i64,
+        ok_sources: outcome.ok_sources as i64,
+        total_sources: outcome.total_sources as i64,
+        updated_at,
+        error: outcome.error,
+    };
+    Ok(axum::Json(resp).into_response())
+}
+
+/// 立即刷新 ED2K 服务器订阅：同步拉取全部订阅源、去重、写回缓存，回执抓取
+/// 结果。服务器列表在每次下载 find-sources 时现读，无需失效任何会话。
+#[utoipa::path(post, path = "/api/v1/ed2k/server-sub/refresh", tag = "server",
+    responses((status = 200, description = "刷新完成", body = Ed2kServerSubRefreshResponse)),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn ed2k_server_sub_refresh(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    let outcome = crate::actor::refresh_ed2k_server_sub(&state.db).await;
+    let updated_at = state
+        .db
+        .get_config("ed2k_server_sub_updated_at")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let resp = Ed2kServerSubRefreshResponse {
+        success: outcome.is_success(),
+        server_count: outcome.servers.len() as i64,
         ok_sources: outcome.ok_sources as i64,
         total_sources: outcome.total_sources as i64,
         updated_at,
@@ -1325,6 +1357,7 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         logs_info,
         logs_export,
         bt_tracker_sub_refresh,
+        ed2k_server_sub_refresh,
         component_ffmpeg_status,
         component_ffmpeg_versions,
         component_ffmpeg_install,
@@ -1365,6 +1398,7 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         crate::wire::ComponentVersions,
         crate::wire::InstallFfmpegRequest,
         crate::wire::TrackerSubRefreshResponse,
+        crate::wire::Ed2kServerSubRefreshResponse,
         crate::wire::WebhookDeliveryDto,
         crate::wire::WebhookPresetDto,
         crate::wire::WebhookDeliveriesResponse,

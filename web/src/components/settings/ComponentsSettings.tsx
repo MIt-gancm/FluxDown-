@@ -137,8 +137,10 @@ function ComponentCard({
       </SetRow>
     )
   } else if (versionsQuery.isLoading) {
+    // 与加载完成后的行同 title + desc：卡片高度不变，宽屏分列时不会因为
+    // 版本列表到货而重新均衡列高（首屏抖动）。
     versionsBody = (
-      <SetRow title={t('components.install')}>
+      <SetRow title={t('components.install')} desc={installDesc}>
         <span className="set-value">{t('common.loading')}</span>
       </SetRow>
     )
@@ -195,7 +197,9 @@ function ComponentCard({
   }
 
   return (
-    <>
+    // 整个组件块（标题 + 状态卡 + 安装卡）是一列内的整体，宽屏多列时不拆开，
+    // 避免「状态卡很高、安装卡很矮」在另一列留下大片空白。
+    <section className="set-section">
       <h3 className="set-title" style={{ fontSize: 13, marginTop: 0 }}>
         {binName}
       </h3>
@@ -203,9 +207,23 @@ function ComponentCard({
 
       <div className="set-group">
         {statusLoading || configLoading ? (
-          <SetRow title={t('components.status')}>
-            <span className="set-value">{t('common.loading')}</span>
-          </SetRow>
+          // 骨架与加载完成后的行数一致（状态 / 生效路径 / 版本 / 系统 PATH），
+          // 卡片高度不跳变，宽屏分列时首屏不抖。
+          <>
+            <SetRow title={t('components.status')}>
+              <span className="set-value">{t('common.loading')}</span>
+            </SetRow>
+            <PathRow title={t('components.effectivePath')} value="" empty={t('common.loading')} />
+            <SetRow title={t('components.version')}>
+              <span className="set-value">{t('common.loading')}</span>
+            </SetRow>
+            <PathRow
+              title={t('components.systemPath')}
+              desc={t('components.systemPathDesc', { bin: binName })}
+              value=""
+              empty={t('common.loading')}
+            />
+          </>
         ) : statusError || !status ? (
           <SetRow title={t('components.status')}>
             <span className="set-value text-danger">{t('set.loadFailed')}</span>
@@ -277,7 +295,7 @@ function ComponentCard({
           </SetRow>
         ) : null}
       </div>
-    </>
+    </section>
   )
 }
 
@@ -295,7 +313,7 @@ export function ComponentsSettings() {
   const uninstallYtdlpMut = useUninstallYtdlpMutation()
 
   return (
-    <div className="max-w-[640px]">
+    <div className="set-panel">
       <p className="set-desc">{t('set.components.desc')}</p>
 
       <ComponentCard

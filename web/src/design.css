@@ -1131,8 +1131,37 @@ body {
 .settings-body::-webkit-scrollbar { width: 6px; }
 .settings-body::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; }
 
+/* 自带内部结构的设置面板（云账户 / 扩展）：窄屏与普通分区一样是 640px 单列，
+   宽屏下和 .settings-cols 用同一套多列规则。 */
+.set-panel { max-width: 640px; }
+
+/* 宽屏多列（瀑布式）：卡片（.set-group）与「小标题 + 卡片」段（.set-section）按列高
+   自动均衡填充，不留行对齐产生的空白；分区标题/说明/宽卡片（分类列表等）用
+   column-span: all 整行铺满并在其后重新起一段。窄屏（<1200px）规则完全不生效，
+   保持原来的单列流式布局。
+   注意：多列容器必须是高度自适应的 .settings-cols，不能是有确定高度的滚动容器
+   .settings-body —— 后者会让内容按视口高度分列并横向溢出。 */
+@media (min-width: 1200px) {
+  .settings-cols, .set-panel { column-count: 2; column-gap: 24px; }
+  .settings-cols > *, .set-panel > * { column-span: all; }
+  .settings-cols > .set-group, .set-panel > .set-group,
+  .settings-cols > .set-section, .set-panel > .set-section {
+    column-span: none; break-inside: avoid; max-width: none;
+  }
+  /* 行内元素很宽的卡片（分类列表等）显式退回整行铺满。 */
+  .settings-cols > .set-wide, .set-panel > .set-wide { column-span: all; }
+  .set-panel { max-width: none; }
+}
+
+@media (min-width: 1900px) {
+  .settings-cols, .set-panel { column-count: 3; }
+}
+
 .set-title { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
 .set-desc { font-size: 12px; color: var(--text3); margin-bottom: 18px; }
+
+/* 「小标题 + 卡片」作为一个不可拆分的段参与分列（标题不会被单独甩到上一行）。 */
+.set-section { min-width: 0; }
 
 .set-group {
   background: var(--surface); border: 1px solid var(--border);
@@ -1205,6 +1234,9 @@ body {
   background: var(--accent-weak); margin-bottom: 16px;
 }
 .set-note b { color: var(--accent); }
+/* 卡片内的说明块（代理 auto 模式说明、站点凭据空态等）：与上一行、卡片内壁都留出
+   间距，而不是贴边顶着上一行。 */
+.set-group > .set-note { margin: 12px 14px 14px; }
 
 /* ============================================================
    遮罩 / 对话框 / 右键菜单 / Toast

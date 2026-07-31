@@ -58,7 +58,7 @@ export function PluginsSettings() {
   const installError = installMut.error ?? installDevMut.error
 
   return (
-    <div className="max-w-[640px]">
+    <div className="set-panel">
       <p className="set-desc">{t('set.plugins.desc')}</p>
 
       <div className="set-group">

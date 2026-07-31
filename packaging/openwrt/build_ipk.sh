@@ -3,7 +3,7 @@
 # ipk = tar.gz(debian-binary + control.tar.gz + data.tar.gz)，OpenWrt opkg 标准外层格式。
 #
 # 用法：
-#   build_ipk.sh server <version> <binary> <webroot_dir> <arch,arch,...> <out_dir>
+#   build_ipk.sh server <version> <binary> <arch,arch,...> <out_dir>
 #   build_ipk.sh luci   <version> <out_dir>
 #
 # server 子命令对同一份载荷按 arch 列表出多个 ipk（aarch64 子架构 opkg 严格校验，
@@ -27,9 +27,9 @@ make_ipk() {
 }
 
 build_server() {
-	VERSION=$1 BIN=$2 WEBROOT=$3 ARCHES=$4 OUTDIR=$5
+	# 二进制自带 Web UI（编译期内嵌），载荷里没有 webroot 目录。
+	VERSION=$1 BIN=$2 ARCHES=$3 OUTDIR=$4
 	[ -f "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
-	[ -d "$WEBROOT" ] || { echo "webroot not found: $WEBROOT" >&2; exit 1; }
 	mkdir -p "$OUTDIR"
 
 	work=$(mktemp -d)
@@ -37,10 +37,9 @@ build_server() {
 
 	# ── data 载荷（各 arch 共用） ──
 	data="$work/data"
-	mkdir -p "$data/usr/bin" "$data/usr/share/fluxdown" "$data/etc/init.d" "$data/etc/config"
+	mkdir -p "$data/usr/bin" "$data/etc/init.d" "$data/etc/config"
 	cp "$BIN" "$data/usr/bin/fluxdown-server"
 	chmod 755 "$data/usr/bin/fluxdown-server"
-	cp -r "$WEBROOT" "$data/usr/share/fluxdown/web"
 	cp "$SCRIPT_DIR/files/fluxdown.init" "$data/etc/init.d/fluxdown"
 	chmod 755 "$data/etc/init.d/fluxdown"
 	cp "$SCRIPT_DIR/files/fluxdown.config" "$data/etc/config/fluxdown"
@@ -135,8 +134,8 @@ build_luci() {
 cmd=${1:-}
 case "$cmd" in
 	server)
-		[ $# -eq 6 ] || { echo "usage: $0 server <version> <binary> <webroot> <arches> <outdir>" >&2; exit 2; }
-		build_server "$2" "$3" "$4" "$5" "$6"
+		[ $# -eq 5 ] || { echo "usage: $0 server <version> <binary> <arches> <outdir>" >&2; exit 2; }
+		build_server "$2" "$3" "$4" "$5"
 		;;
 	luci)
 		[ $# -eq 3 ] || { echo "usage: $0 luci <version> <outdir>" >&2; exit 2; }

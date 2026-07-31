@@ -336,21 +336,26 @@ export function BitTorrentSettings({
     <>
       <h2 className="set-title">{t('set.bt')}</h2>
       <p className="set-desc">{t('set.bt.desc')}</p>
-      <div className="set-group">
-        <SetRow title={t('set.bt.dht')} desc={t('set.bt.dhtDesc')}>
-          <SetSwitch checked={dht} onCheckedChange={(v) => mutate({ bt_enable_dht: String(v) })} />
-        </SetRow>
-        <SetRow title={t('set.bt.upnp')} desc={t('set.bt.upnpDesc')}>
-          <SetSwitch checked={upnp} onCheckedChange={(v) => mutate({ bt_enable_upnp: String(v) })} />
-        </SetRow>
-        <SetRow title={t('set.bt.ports')} desc={t('set.bt.portsDesc')}>
-          <div className="flex items-center gap-2">
-            <NumberInput value={portStart} min={1} className="short" onCommit={(n) => mutate({ bt_port_start: String(n) })} />
-            <span className="text-text3">–</span>
-            <NumberInput value={portEnd} min={1} className="short" onCommit={(n) => mutate({ bt_port_end: String(n) })} />
-          </div>
-        </SetRow>
-      </div>
+      {/* 常规：DHT / UPnP / 端口。重启提示只针对这一组，与卡片同段，
+          宽屏分列时不会被甩到别的列底部。 */}
+      <section className="set-section">
+        <div className="set-group">
+          <SetRow title={t('set.bt.dht')} desc={t('set.bt.dhtDesc')}>
+            <SetSwitch checked={dht} onCheckedChange={(v) => mutate({ bt_enable_dht: String(v) })} />
+          </SetRow>
+          <SetRow title={t('set.bt.upnp')} desc={t('set.bt.upnpDesc')}>
+            <SetSwitch checked={upnp} onCheckedChange={(v) => mutate({ bt_enable_upnp: String(v) })} />
+          </SetRow>
+          <SetRow title={t('set.bt.ports')} desc={t('set.bt.portsDesc')}>
+            <div className="flex items-center gap-2">
+              <NumberInput value={portStart} min={1} className="short" onCommit={(n) => mutate({ bt_port_start: String(n) })} />
+              <span className="text-text3">–</span>
+              <NumberInput value={portEnd} min={1} className="short" onCommit={(n) => mutate({ bt_port_end: String(n) })} />
+            </div>
+          </SetRow>
+        </div>
+        <p className="set-note">{t('set.bt.restartNote')}</p>
+      </section>
 
       {/* Tracker 列表 */}
       <div className="set-group">
@@ -435,8 +440,6 @@ export function BitTorrentSettings({
       </div>
 
       <SeedingSettings config={config} mutate={mutate} />
-
-      <p className="set-note">{t('set.bt.restartNote')}</p>
     </>
   )
 }

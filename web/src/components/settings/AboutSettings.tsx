@@ -12,6 +12,9 @@ import { disconnectWs } from '../../lib/ws'
 import { CopyButton } from '../CopyButton'
 import { SetRow, SetSelect } from './controls'
 
+/** 日志总大小上限可选项（MB），与桌面端一致；缺省 10 MB。 */
+const LOG_MAX_SIZE_OPTIONS = [5, 10, 20, 50, 100]
+
 export function AboutSettings({
   config,
   mutate,
@@ -28,6 +31,7 @@ export function AboutSettings({
   const totalSize = logs?.files.reduce((sum, f) => sum + f.size, 0) ?? 0
   const update = useUpdateCheck()
   const channel = config?.web_update_channel === 'frontier' ? 'frontier' : 'stable'
+  const logMaxSizeMb = Number(config?.log_max_size_mb ?? '10') || 10
 
   function logout() {
     clearCredentials()
@@ -94,17 +98,29 @@ export function AboutSettings({
             </button>
           )}
         </SetRow>
-      </div>
-      <div className="set-group">
-        <SetRow title={t('set.about.logout')} desc={t('set.about.logoutDesc')}>
-          <button type="button" className="btn danger sm" onClick={logout}>
-            {t('set.about.logout')}
-          </button>
+        <SetRow title={t('set.about.logMaxSize')} desc={t('set.about.logMaxSizeDesc')}>
+          <SetSelect
+            value={String(logMaxSizeMb)}
+            onValueChange={(v) => mutate({ log_max_size_mb: v })}
+            options={LOG_MAX_SIZE_OPTIONS.map((mb) => ({ value: String(mb), label: `${mb} MB` }))}
+            placeholder={`${logMaxSizeMb} MB`}
+            width={160}
+          />
         </SetRow>
       </div>
-      <p className="set-desc" style={{ marginTop: 14 }}>
-        {t('set.about.tagline')}
-      </p>
+      {/* 退出登录卡与页尾语同段：宽屏分列时页尾语跟在卡片下面，不会孤零零悬在空白里。 */}
+      <section className="set-section">
+        <div className="set-group">
+          <SetRow title={t('set.about.logout')} desc={t('set.about.logoutDesc')}>
+            <button type="button" className="btn danger sm" onClick={logout}>
+              {t('set.about.logout')}
+            </button>
+          </SetRow>
+        </div>
+        <p className="set-desc" style={{ marginTop: 14 }}>
+          {t('set.about.tagline')}
+        </p>
+      </section>
     </>
   )
 }

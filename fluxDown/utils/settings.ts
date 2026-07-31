@@ -205,8 +205,8 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   excludeDomains: [],
   interceptMagnet: true,
 
-  // 任务发送通知
-  notifyLocalTask: true,
+  // 任务发送通知（本地默认关闭，按需开启；远程默认开启）
+  notifyLocalTask: false,
   notifyRemoteTask: true,
 
   // 资源嗅探 & 页面内 UI

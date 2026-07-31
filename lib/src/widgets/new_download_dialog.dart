@@ -209,6 +209,10 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   /// 下次收到 BtFilesInfo 时立刻发 [-1] 让 Rust 暂停任务。
   bool _btCancelPending = false;
 
+  /// 提交磁力任务前的任务 id 快照 —— probing 阶段引擎只回 URL 相同的新任务，
+  /// 靠"不在快照里"把刚创建的那条与历史同磁力任务区分开。
+  Set<String> _btPreExistingTaskIds = const {};
+
   // ── manifest 预解析状态（单条 http(s) 链接可能是多文件清单）───────────────
   // 提交单条 http(s) 非磁力/种子/ed2k 链接时先探测是否为多文件清单（发送/
   // 90s 超时/取消/迟到丢弃逻辑收敛在 ResolvePreviewClient，独立小窗与快速
@@ -339,6 +343,34 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       _btFiles = msg.files;
       _btSelectedIndices = msg.files.map((f) => f.index.toInt()).toSet();
     });
+  }
+
+  /// probing 阶段关闭/取消对话框：直接把刚创建的任务暂停。
+  ///
+  /// 磁力元数据可能长时间（引擎侧 300s 才超时）解析不出来，此时 Rust 永远
+  /// 不会发 BtFilesInfo，只靠 [_btCancelPending] 等信号到达再发 [-1] 会让
+  /// 任务一直卡在"准备中"。引擎的 pause 路径显式覆盖"元数据解析期间暂停"
+  /// （drop 掉 detached add_torrent 并落 paused），与 [-1] 的语义一致。
+  void _abortProbingTask() {
+    _btCancelPending = true;
+    final taskId = _resolveProbingTaskId();
+    if (taskId == null) {
+      // 任务记录还没从进度信号回流：保留 Service 回调，等 BtFilesInfo 到达
+      // 时由 _onBtFilesInfoReceived 发 [-1] 兜底。
+      return;
+    }
+    widget.controller.pauseTask(taskId);
+    BtFileSelectionService.registerPendingHandler(null);
+  }
+
+  /// 按提交的磁力 URL 反查本次创建的任务 id（排除提交前已存在的同 URL 任务）。
+  String? _resolveProbingTaskId() {
+    final url = _btSubmittedUrl;
+    if (url == null || url.isEmpty) return null;
+    for (final t in widget.controller.tasks.reversed) {
+      if (t.url == url && !_btPreExistingTaskIds.contains(t.id)) return t.id;
+    }
+    return null;
   }
 
   void _onTorrentMetaResult(RustSignalPack<TorrentMetaResult> pack) {
@@ -557,12 +589,13 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       ).sendSignalToRust();
       BtFileSelectionService.registerPendingHandler(null);
     } else if (_btWaitPhase == 'probing') {
-      // probing 阶段：task_id 尚未知，标记取消，让回调在收到信号时发 [-1]
-      // _onBtFilesInfoReceived 检查 _btCancelPending，即使 mounted=false 也能拦截
-      _btCancelPending = true;
-      // 不清除 Service 回调——让信号路由过来，回调发 [-1] 后 Rust 暂停任务
-    } else {
-      // 普通关闭（含 error 阶段），清除任何残留的 Service 回调
+      // probing 阶段：直接暂停刚创建的任务，别让它卡在"准备中"等 300s 超时。
+      // 反查不到任务时 _abortProbingTask 保留 Service 回调走 [-1] 兜底。
+      _abortProbingTask();
+    } else if (!_btCancelPending) {
+      // 普通关闭（含 error 阶段），清除任何残留的 Service 回调。
+      // _btCancelPending 为真说明 probing 取消时已按需处理过回调（可能刻意
+      // 保留兜底），这里不能再清。
       BtFileSelectionService.registerPendingHandler(null);
     }
     _metaSub?.cancel();
@@ -1147,6 +1180,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
         !later &&
         entries.first.url.toLowerCase().startsWith('magnet:')) {
       final entry = entries.first;
+      // 快照现有任务 id：probing 阶段取消时靠它把本次创建的任务从历史同磁力
+      // 任务里挑出来（见 _resolveProbingTaskId）。
+      _btPreExistingTaskIds = widget.controller.tasks.map((t) => t.id).toSet();
       // 先注册回调，再发 CreateTask 信号，保证信号到达时回调已就位（无竞态）
       BtFileSelectionService.registerPendingHandler(_onBtFilesInfoReceived);
       final rename = _renameController.text.trim();
@@ -1339,10 +1375,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
       _btPendingTaskId = null;
       _btWaitPhase = null;
     } else {
-      // probing 阶段：task_id 尚未知，标记取消
-      // 当 BtFilesInfo 信号到达时，_onBtFilesInfoReceived 检查
-      // _btCancelPending 并立刻发 [-1] 暂停任务
-      _btCancelPending = true;
+      // probing 阶段：task_id 未知，按 URL 反查刚创建的任务并暂停；反查不到
+      // 才退回"等 BtFilesInfo 到达发 [-1]"的兜底（见 _abortProbingTask）。
+      _abortProbingTask();
       _btWaitPhase = null; // 退出等待状态，UI 恢复正常
     }
     if (mounted) Navigator.of(context).pop();

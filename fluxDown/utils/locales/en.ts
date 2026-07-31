@@ -17,7 +17,7 @@ const en: Record<MessageKey, string> = {
 
   // Stats
   "stats.title": "Today's Stats",
-  "stats.sent": "Intercepted",
+  "stats.sent": "Downloaded",
   "stats.failed": "Failed",
   "stats.reset": "Reset Stats",
   "stats.resetDone": "Stats reset",
@@ -33,9 +33,8 @@ const en: Record<MessageKey, string> = {
   "settings.sizeNoLimit": "No limit",
   "settings.interceptMagnet": "Take Over Magnet Links",
   "settings.interceptMagnetHint":
-    "Handle magnet link clicks with FluxDown; when off, they go to the system default handler (e.g. qBittorrent)",
-  "settings.altClickHint":
-    "Press Alt+Shift+D to quickly toggle download interception",
+    "When off, magnet links go to the system default handler (e.g. qBittorrent)",
+  "settings.altClickHint": "Alt+Shift+D toggles interception",
   "settings.dotVisible": "Floating Ball",
 
   // Remote download source
@@ -128,6 +127,7 @@ const en: Record<MessageKey, string> = {
   "domain.exists": "{domain} already in exclusion list",
   "domain.excluded": "Excluded {domain}",
   "domain.cannotGetDomain": "Cannot get current page domain",
+  "domain.excludeCurrent": "Exclude Current Site",
 
   // Notifications
   "notify.batchNoLinks": "No Links Found",
@@ -154,7 +154,7 @@ const en: Record<MessageKey, string> = {
   "sniffer.title": "Resource Sniffer",
   "sniffer.resourceSniffing": "Resource Sniffing",
   "sniffer.resourceSniffingHint":
-    "Auto-detect downloadable resources on web pages (turn off to reduce overhead on heavy pages; reload pages to apply)",
+    "Detect downloadable resources; turning it off hides in-page buttons (reload after re-enabling)",
   "sniffer.showFloatingButton": "Video Float Button",
   "sniffer.showFloatingButtonHint":
     "Show quick download button on video elements",
@@ -250,7 +250,7 @@ const en: Record<MessageKey, string> = {
   "popup.quickDownload.failed": "Send failed",
 
   // Options migration extras
-  "options.general.statsDesc": "Reset the intercepted/failed counters shown in the popup",
+  "options.general.statsDesc": "Reset the downloaded/failed counters shown in the popup",
   "options.rules.minFileSizeDesc": "Files smaller than this are not intercepted",
   "options.rules.domainDesc": "Downloads from these domains are never intercepted",
 
@@ -258,7 +258,7 @@ const en: Record<MessageKey, string> = {
   "options.protocol.label": "FluxDown Protocol",
   "options.protocol.enabled": "On — launch app via fluxdown://",
   "options.protocol.disabled": "Off (default)",
-  "options.protocol.desc": "Launch the FluxDown app via the fluxdown:// protocol when intercepting downloads — supported on Android and desktop. On Android this is the only available channel; on desktop the native channel is more capable (it carries cookies and auth headers), so keep this off unless the native channel is unavailable. Protocol mode carries no credentials, and paired video+audio downloads fall back to the browser.",
+  "options.protocol.desc": "Launch the app via the fluxdown:// protocol — supported on Windows, macOS, Linux and Android. The native channel is more capable, so enable this only when it is unavailable",
 
   // Task completion notification (task panel)
   "notify.taskCompletedTitle": "Download Complete",
