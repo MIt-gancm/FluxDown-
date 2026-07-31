@@ -1,9 +1,10 @@
 // FluxCloud 客户端 —— 轻量 JSON HTTP 封装（同 feedback_service.dart 用法：
 // dart:io HttpClient，不引入 http 包），严格实现契约 v1 全部客户端接口。
 //
-// 401 自动刷新：devices/me 等需要 Bearer 的接口若返回 401，自动用 refreshToken
-// 刷新一次并重放原请求；刷新也失败（refreshToken 过期/被吊销）则触发
-// [onSessionExpired]，由 CloudAuthService 清空本地会话。本文件只负责传输层
+// 401 自动刷新：devices/me 等需要 Bearer 的接口若返回 401，经单飞刷新用
+// refreshToken 换新令牌并重放原请求；刷新被服务端明确拒绝（refreshToken
+// 过期/被吊销）则触发 [onSessionExpired]，由 CloudAuthService 清空本地会话。
+// 本文件只负责传输层
 // 机制，不持久化任何令牌 —— 令牌的读取/持久化由 CloudAuthService 通过
 // [accessToken]/[refreshToken] 字段与 [onTokenRefreshed] 回调完成同步。
 
@@ -72,6 +73,9 @@ class CloudClient {
 
   /// 刷新也失败（refreshToken 过期/被吊销）时回调，供上层清空本地会话。
   void Function()? onSessionExpired;
+
+  /// 在途的单飞刷新任务；并发 401 共享同一次轮换（见 [_refreshSingleFlight]）。
+  Future<void>? _refreshInFlight;
 
   HttpClient? _http;
 
@@ -514,30 +518,74 @@ class CloudClient {
   int _ttlSeconds(Map<String, dynamic> json) =>
       (json['ttlSeconds'] as num?)?.toInt() ?? 0;
 
-  /// 需要 Bearer 认证的调用统一包装：命中 401 时尝试用 refreshToken 刷新一次
-  /// 并重放原请求；无 refreshToken 或刷新本身失败，则清会话并把原 401 抛出去。
+  /// 需要 Bearer 认证的调用统一包装：命中 401 时经单飞刷新换新令牌后重放
+  /// 一次；刷新失败则把原始 401 抛出去（会话是否清除由 [_doRefresh] 按
+  /// 失败性质决定）。
   Future<T> _authed<T>(Future<T> Function() call) async {
+    final usedToken = accessToken;
     try {
       return await call();
     } on CloudApiException catch (e) {
       if (e.status != 401) rethrow;
-      final rt = refreshToken;
-      if (rt == null || rt.isEmpty) {
-        onSessionExpired?.call();
-        rethrow;
-      }
       try {
-        final auth = await refresh(rt);
-        accessToken = auth.accessToken;
-        refreshToken = auth.refreshToken;
-        onTokenRefreshed?.call(auth);
+        await _refreshSingleFlight(staleAccessToken: usedToken);
       } catch (_) {
-        onSessionExpired?.call();
         // rethrow 只会重抛这个 catch 自己捕获的刷新失败异常；这里要的是原始 401，
         // 显式 throw e（闭包捕获外层 catch 绑定的异常）。
         throw e;
       }
       return await call();
+    }
+  }
+
+  /// 单飞 token 刷新：同一时刻只允许一次 /auth/refresh 在途，并发 401 共享结果。
+  ///
+  /// 背景：refreshToken 是轮换制——刷新成功即作废旧 RT。冷启动时 access token
+  /// 已过期，ConfigSync / RemoteTask / CdnConfig / CdnReport 多路并发首拉会
+  /// 同时收到 401；若各自拿同一个旧 RT 竞争刷新，只有先到的成功，其余被
+  /// 服务端拒绝，进而把「正常的并发刷新竞态」误判成「会话过期」清空本地
+  /// 登录（用户表现为「应用内更新/重启后掉登录」，issue #228）。
+  ///
+  /// [staleAccessToken] 是调用方发起原请求时所持的 access token：与当前值
+  /// 不同说明并发刷新已完成，直接返回用新令牌重放即可。
+  Future<void> _refreshSingleFlight({required String? staleAccessToken}) async {
+    if (accessToken != null && accessToken != staleAccessToken) return;
+    final inflight = _refreshInFlight;
+    if (inflight != null) return inflight;
+    final rt = refreshToken;
+    if (rt == null || rt.isEmpty) {
+      onSessionExpired?.call();
+      throw const CloudApiException(
+        code: 'no_refresh_token',
+        message: '无可用 refreshToken',
+        status: 401,
+      );
+    }
+    final task = _doRefresh(rt);
+    _refreshInFlight = task;
+    try {
+      await task;
+    } finally {
+      _refreshInFlight = null;
+    }
+  }
+
+  /// 执行一次令牌轮换并同步内存令牌 + 上层持久化。
+  ///
+  /// 只有服务端明确拒绝（401/403：refreshToken 过期、被吊销或复用检测命中）
+  /// 才触发 [onSessionExpired] 清会话；网络错误（status 0）与 5xx 属暂时性
+  /// 故障，保留本地会话交由调用方退避重试——离线启动不应把用户登出。
+  Future<void> _doRefresh(String rt) async {
+    try {
+      final auth = await refresh(rt);
+      accessToken = auth.accessToken;
+      refreshToken = auth.refreshToken;
+      onTokenRefreshed?.call(auth);
+    } on CloudApiException catch (e) {
+      if (e.status == 401 || e.status == 403) {
+        onSessionExpired?.call();
+      }
+      rethrow;
     }
   }
 
