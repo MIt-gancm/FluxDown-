@@ -26,16 +26,34 @@ export default defineContentScript({
   runAt: "document_idle",
 
   async main(ctx) {
-    // ===== 0. 资源嗅探开关 =====
-    // 关闭后跳过 DOM 扫描 / MutationObserver / Main World fetch 拦截注入，
+    // ===== 0. 资源嗅探 / 磁力接管开关 =====
+    // 嗅探关闭后跳过 DOM 扫描 / MutationObserver / Main World fetch 拦截注入，
     // 消除重资源页面（如 B 站首页）的嗅探性能开销；更改后新加载的页面生效。
-    // 磁力链接点击接管不属于嗅探，始终保留。
+    // 磁力链接点击接管不属于嗅探，由独立开关 interceptMagnet 控制，
+    // 且监听设置变更即时生效（用户关掉后点磁力链接应立即交还系统处理程序）。
     let sniffingEnabled = true;
+    let magnetEnabled = true;
     try {
-      sniffingEnabled = (await loadSettings()).resourceSniffing !== false;
+      const settings = await loadSettings();
+      sniffingEnabled = settings.resourceSniffing !== false;
+      magnetEnabled = settings.interceptMagnet !== false;
     } catch {
       // 设置读取失败时按默认开启处理
     }
+    const handleSettingsChanged = (
+      changes: Record<string, { newValue?: unknown }>,
+      area: string,
+    ) => {
+      if (area !== "sync" || !changes.settings) return;
+      const next = changes.settings.newValue as
+        | { interceptMagnet?: boolean }
+        | undefined;
+      if (next) magnetEnabled = next.interceptMagnet !== false;
+    };
+    browser.storage.onChanged.addListener(handleSettingsChanged);
+    ctx.onInvalidated(() =>
+      browser.storage.onChanged.removeListener(handleSettingsChanged),
+    );
 
     /** 已报告的 URL 集合（防止重复上报） */
     const reportedUrls = new Set<string>();
@@ -196,7 +214,9 @@ export default defineContentScript({
     // ===== 7. 磁力链接点击拦截 =====
     // 用户直接点击 <a href="magnet:..."> 时，阻止浏览器弹出 OS 应用选择框，
     // 改由 FluxDown 接管。使用捕获阶段，早于页面自身的 click 处理器执行。
+    // interceptMagnet 关闭时放行，交还系统默认磁力处理程序（如 qBittorrent）。
     const handleMagnetClick = (e: MouseEvent) => {
+      if (!magnetEnabled) return;
       const target = e.target;
       if (!(target instanceof Element)) return;
       const link = target.closest("a[href]") as HTMLAnchorElement | null;

@@ -210,6 +210,19 @@
 
         <div class="opt-row">
           <div class="opt-row-info">
+            <div class="opt-row-title" data-i18n="settings.interceptMagnet">Take Over Magnet Links</div>
+            <div class="opt-row-desc" data-i18n="settings.interceptMagnetHint">Handle magnet link clicks with FluxDown; when off, they go to the system default handler (e.g. qBittorrent)</div>
+          </div>
+          <div class="opt-row-control opt-row-control-inline">
+            <label class="toggle">
+              <input type="checkbox" id="magnetToggle" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <div class="opt-row">
+          <div class="opt-row-info">
             <div class="opt-row-title" data-i18n="settings.minFileSize">Min File Size</div>
             <div class="opt-row-desc" data-i18n="options.rules.minFileSizeDesc">Files smaller than this are not intercepted.</div>
           </div>

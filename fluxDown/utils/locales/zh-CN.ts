@@ -29,6 +29,9 @@ const zhCN = {
   "settings.hintAll": "拦截所有下载（除排除域名外）",
   "settings.minFileSize": "最小文件大小",
   "settings.sizeNoLimit": "不限",
+  "settings.interceptMagnet": "接管磁力链接",
+  "settings.interceptMagnetHint":
+    "点击 magnet: 链接时由 FluxDown 接管下载；关闭后交给系统默认磁力处理程序（如 qBittorrent）",
   "settings.altClickHint": "按 Alt+Shift+D 快捷键可快速切换下载拦截开关",
   "settings.dotVisible": "悬浮球",
 

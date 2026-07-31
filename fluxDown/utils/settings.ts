@@ -33,6 +33,13 @@ export interface FluxDownSettings {
   customExtensions: string[];
   /** 排除的域名列表 */
   excludeDomains: string[];
+  /**
+   * 是否接管页面内 magnet: 链接点击（阻止浏览器交给系统默认磁力
+   * 处理程序，改由 FluxDown 下载）。关闭后点击磁力链接走系统默认
+   * 处理程序（如 qBittorrent）；资源面板仍会展示探测到的磁力资源，
+   * 供手动选择用 FluxDown 下载。默认开启。
+   */
+  interceptMagnet: boolean;
 
   // === 任务发送通知 ===
 
@@ -196,6 +203,7 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   ],
   customExtensions: [],
   excludeDomains: [],
+  interceptMagnet: true,
 
   // 任务发送通知
   notifyLocalTask: true,

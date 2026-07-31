@@ -31,6 +31,9 @@ const en: Record<MessageKey, string> = {
   "settings.hintAll": "Intercept all downloads (except excluded domains)",
   "settings.minFileSize": "Min File Size",
   "settings.sizeNoLimit": "No limit",
+  "settings.interceptMagnet": "Take Over Magnet Links",
+  "settings.interceptMagnetHint":
+    "Handle magnet link clicks with FluxDown; when off, they go to the system default handler (e.g. qBittorrent)",
   "settings.altClickHint":
     "Press Alt+Shift+D to quickly toggle download interception",
   "settings.dotVisible": "Floating Ball",

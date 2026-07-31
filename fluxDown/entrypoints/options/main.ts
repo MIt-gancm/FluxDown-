@@ -72,6 +72,7 @@ const remoteModeDesc = $('#remoteModeDesc')!;
 const interceptModeSelect = $<HTMLSelectElement>('#interceptModeSelect');
 const modeHint = $('#modeHint')!;
 const minSizeSelect = $<HTMLSelectElement>('#minSizeSelect');
+const magnetToggle = $<HTMLInputElement>('#magnetToggle');
 
 // 排除域名管理
 const domainInput = $<HTMLInputElement>('#domainInput');
@@ -174,6 +175,11 @@ interceptModeSelect.addEventListener('change', async () => {
 
 minSizeSelect.addEventListener('change', async () => {
   await saveSettings({ minFileSize: parseInt(minSizeSelect.value, 10) });
+});
+
+// ===== 磁力链接接管开关（关闭后点击 magnet: 交还系统默认处理程序）=====
+magnetToggle.addEventListener('change', async () => {
+  await saveSettings({ interceptMagnet: magnetToggle.checked });
 });
 
 // ===== 远程配置 =====
@@ -527,6 +533,9 @@ async function init() {
   interceptModeSelect.value = settings.interceptMode || 'smart';
   updateModeHint(settings.interceptMode || 'smart');
   minSizeSelect.value = String(settings.minFileSize);
+
+  // 磁力链接接管开关
+  magnetToggle.checked = settings.interceptMagnet !== false;
 
   // 排除域名
   renderDomainList(settings.excludeDomains || []);

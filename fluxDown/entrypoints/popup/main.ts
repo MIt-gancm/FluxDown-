@@ -45,6 +45,7 @@ const protocolToggle = $<HTMLInputElement>('#protocolToggle');
 const protocolHint = $('#protocolHint')!;
 const dotVisibleToggle = $<HTMLInputElement>('#dotVisibleToggle');
 const sniffToggle = $<HTMLInputElement>('#sniffToggle');
+const magnetToggle = $<HTMLInputElement>('#magnetToggle');
 const notifyLocalToggle = $<HTMLInputElement>('#notifyLocalToggle');
 const notifyRemoteToggle = $<HTMLInputElement>('#notifyRemoteToggle');
 const remoteModeSelect = $<HTMLSelectElement>('#remoteModeSelect');
@@ -1114,6 +1115,7 @@ async function init() {
   updateProtocolHint(settings.enableFluxdownProtocol === true);
   dotVisibleToggle.checked = localState?.['fluxdown_dot_visible'] !== false;
   sniffToggle.checked = settings.resourceSniffing !== false;
+  magnetToggle.checked = settings.interceptMagnet !== false;
 
   // 任务发送通知开关 + 远程投递模式（与 options 页同一 settings 源，双入口镜像）
   notifyLocalToggle.checked = settings.notifyLocalTask !== false;
@@ -1216,6 +1218,11 @@ dotVisibleToggle.addEventListener('change', async () => {
 // 资源嗅探开关（更改后新加载的页面生效；background 侧即时生效）
 sniffToggle.addEventListener('change', async () => {
   await saveSettings({ resourceSniffing: sniffToggle.checked });
+});
+
+// 磁力链接接管开关（已打开页面即时生效，交还系统默认处理程序）
+magnetToggle.addEventListener('change', async () => {
+  await saveSettings({ interceptMagnet: magnetToggle.checked });
 });
 
 // fluxdown:// 自定义协议开关
