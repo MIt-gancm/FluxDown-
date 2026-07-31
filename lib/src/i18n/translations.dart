@@ -705,6 +705,8 @@ class S {
   String get torrentFileAssociationDesc => _r('torrentFileAssociationDesc');
   String get ed2kLinkAssociation => _r('ed2kLinkAssociation');
   String get ed2kLinkAssociationDesc => _r('ed2kLinkAssociationDesc');
+  String get magnetLinkAssociation => _r('magnetLinkAssociation');
+  String get magnetLinkAssociationDesc => _r('magnetLinkAssociationDesc');
   String get torrentAssocDialogTitle => _r('torrentAssocDialogTitle');
   String get torrentAssocDialogDesc => _r('torrentAssocDialogDesc');
   String get notifyOnComplete => _r('notifyOnComplete');
@@ -1411,6 +1413,9 @@ class S {
   List<String> get searchKeywordsEd2kAssoc =>
       _r('searchKeywordsEd2kAssoc').split(',')
         ..addAll(['ed2k', 'emule', 'protocol', 'association']);
+  List<String> get searchKeywordsMagnetAssoc =>
+      _r('searchKeywordsMagnetAssoc').split(',')
+        ..addAll(['magnet', 'protocol', 'association']);
   List<String> get searchKeywordsNotifyOnComplete =>
       _r('searchKeywordsNotifyOnComplete').split(',')
         ..addAll(['notification', 'complete', 'toast']);

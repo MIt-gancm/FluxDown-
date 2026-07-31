@@ -73,6 +73,16 @@
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 		</dict>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>BitTorrent Magnet URL</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>magnet</string>
+			</array>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+		</dict>
 	</array>
 	<key>UTImportedTypeDeclarations</key>
 	<array>

@@ -18,8 +18,8 @@
 //!
 //! `register`/`unregister` above run outside the Windows installer's
 //! tracking (written directly via winreg at runtime), so
-//! `installer/windows/setup.iss` removes any leftover `fluxdown`/`ed2k`
-//! Windows registry keys explicitly on uninstall — keep both in sync.
+//! `installer/windows/setup.iss` removes any leftover `fluxdown`/`ed2k`/
+//! `magnet` Windows registry keys explicitly on uninstall — keep both in sync.
 
 /// A URL scheme this app can claim as the system default handler for.
 #[derive(Clone, Copy)]
@@ -47,6 +47,16 @@ pub const ED2K: UrlScheme = UrlScheme {
     desc: "URL:ed2k Protocol",
 };
 
+/// BitTorrent magnet links (`magnet:?xt=urn:btih:…`). Default-on but
+/// non-preemptive: startup auto-registration (Windows, see `download_actor`)
+/// skips the scheme when another client (qBittorrent, …) already claims it;
+/// only the explicit settings toggle takes it over. Linux/macOS candidate
+/// declarations live in the packaged `.desktop` / `Info.plist`.
+pub const MAGNET: UrlScheme = UrlScheme {
+    scheme: "magnet",
+    desc: "URL:Magnet Link",
+};
+
 /// Resolve a wire scheme name (as sent by Dart) to a known [`UrlScheme`].
 ///
 /// Returns `None` for anything not in the allow-list above: the registration
@@ -56,6 +66,7 @@ pub fn from_name(name: &str) -> Option<UrlScheme> {
     match name {
         "fluxdown" => Some(FLUXDOWN),
         "ed2k" => Some(ED2K),
+        "magnet" => Some(MAGNET),
         _ => None,
     }
 }
@@ -66,7 +77,7 @@ mod inner {
     use crate::logger::log_info;
     use std::io;
     use winreg::RegKey;
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ, KEY_WRITE};
 
     /// Get the canonical path of the current running executable.
     ///
@@ -173,6 +184,60 @@ mod inner {
                 .to_ascii_lowercase()
         };
         norm(a) == norm(b)
+    }
+
+    /// Whether `proto` appears to be actively claimed by another application.
+    ///
+    /// Used by startup auto-registration to stay non-preemptive on contended
+    /// schemes (`magnet://`): FluxDown never silently steals a handler that a
+    /// competing client (qBittorrent, …) or the user has already established.
+    /// The explicit settings toggle bypasses this check — `register()` always
+    /// writes.
+    ///
+    /// Signals checked, mirroring Windows' own resolution order:
+    /// 1. `UserChoice` pin (`HKCU\…\Shell\Associations\UrlAssociations\<scheme>`)
+    ///    — a per-user default explicitly chosen in Windows Settings / the
+    ///    "open with" prompt. FluxDown never creates one for itself, so its
+    ///    presence (while we are not the registered handler) means someone
+    ///    else won the scheme.
+    /// 2. A foreign exe in `HKCU\Software\Classes\<scheme>\shell\open\command`.
+    /// 3. A foreign exe in `HKLM\Software\Classes\<scheme>\shell\open\command`
+    ///    — machine-wide direct registrations. A bare HKLM class marker
+    ///    without a command (qBittorrent's capability-style declaration, often
+    ///    orphaned by its uninstaller) is deliberately NOT treated as a claim:
+    ///    it cannot open links by itself, only feed the "choose an app" list.
+    pub fn is_claimed_by_other(proto: UrlScheme) -> bool {
+        if is_registered(proto) {
+            return false;
+        }
+        let scheme = proto.scheme;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+
+        // 1. UserChoice pin.
+        let user_choice_path = format!(
+            "Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations\\{scheme}\\UserChoice"
+        );
+        if hkcu
+            .open_subkey_with_flags(user_choice_path, KEY_READ)
+            .ok()
+            .is_some_and(|k| k.get_value::<String, _>("ProgId").is_ok())
+        {
+            return true;
+        }
+
+        // 2./3. Direct scheme command pointing at a foreign exe. `current_exe`
+        // failing to resolve is treated as foreign — better to skip
+        // auto-registration than to overwrite an unidentified handler.
+        let current_exe = exe_path().ok();
+        let foreign_command = |hive: &RegKey| -> bool {
+            match read_command_exe(hive, scheme) {
+                Some(exe) => !current_exe
+                    .as_deref()
+                    .is_some_and(|cur| paths_equivalent(&exe, cur)),
+                None => false,
+            }
+        };
+        foreign_command(&hkcu) || foreign_command(&RegKey::predef(HKEY_LOCAL_MACHINE))
     }
 
     /// Register `proto` as handled by this executable.
@@ -439,6 +504,8 @@ mod inner {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub use inner::is_claimed_by_other;
 pub use inner::{is_registered, register, unregister};
 
 #[cfg(all(test, target_os = "windows"))]
@@ -488,9 +555,60 @@ mod tests {
     fn from_name_only_resolves_known_schemes() {
         assert_eq!(from_name("ed2k").unwrap().scheme, "ed2k");
         assert_eq!(from_name("fluxdown").unwrap().scheme, "fluxdown");
+        assert_eq!(from_name("magnet").unwrap().scheme, "magnet");
         // Anything else must never reach the registry writers.
         assert!(from_name("file").is_none());
         assert!(from_name("ED2K").is_none());
         assert!(from_name("").is_none());
+    }
+
+    /// A second scratch scheme so this test cannot race
+    /// `registry_roundtrip_is_observable_and_reversible` (tests run in
+    /// parallel within the binary).
+    const SCRATCH_CLAIM: UrlScheme = UrlScheme {
+        scheme: "fluxdown-selftest-claim",
+        desc: "URL:FluxDown Selftest Claim Protocol",
+    };
+
+    fn purge(scheme: &str) {
+        let classes = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags("Software\\Classes", KEY_WRITE)
+            .unwrap();
+        let _ = classes.delete_subkey_all(scheme);
+    }
+
+    /// Non-preemptive startup contract: a scheme registered by another exe is
+    /// reported as claimed (so auto-register skips it) but never as ours,
+    /// while our own registration is ours and not "claimed by other".
+    #[test]
+    fn foreign_registration_is_claimed_but_not_ours() {
+        purge(SCRATCH_CLAIM.scheme);
+        assert!(!is_claimed_by_other(SCRATCH_CLAIM), "unclaimed scheme");
+
+        // Simulate a competing client's registration pointing at another exe.
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let scheme = SCRATCH_CLAIM.scheme;
+        let (key, _) = hkcu
+            .create_subkey(format!("Software\\Classes\\{scheme}"))
+            .unwrap();
+        key.set_value("URL Protocol", &"").unwrap();
+        let (cmd, _) = hkcu
+            .create_subkey(format!("Software\\Classes\\{scheme}\\shell\\open\\command"))
+            .unwrap();
+        cmd.set_value("", &"\"C:\\nonexistent\\other-client.exe\" \"%1\"")
+            .unwrap();
+
+        assert!(!is_registered(SCRATCH_CLAIM), "foreign handler is not ours");
+        assert!(
+            is_claimed_by_other(SCRATCH_CLAIM),
+            "foreign handler must block auto-registration"
+        );
+
+        // Explicit takeover (the settings toggle path) overwrites it.
+        register(SCRATCH_CLAIM).unwrap();
+        assert!(is_registered(SCRATCH_CLAIM));
+        assert!(!is_claimed_by_other(SCRATCH_CLAIM));
+
+        purge(SCRATCH_CLAIM.scheme);
     }
 }

@@ -19,6 +19,9 @@ class SettingsProvider extends ChangeNotifier {
   /// ed2k 协议 scheme 名（与 Rust `protocol_registry::ED2K.scheme` 对齐）。
   static const String _ed2kScheme = 'ed2k';
 
+  /// magnet 协议 scheme 名（与 Rust `protocol_registry::MAGNET.scheme` 对齐）。
+  static const String _magnetScheme = 'magnet';
+
   String _defaultSaveDir = _platformDefaultSaveDir();
   int _defaultSegments = 0; // 0 = 自动（由 Rust segment_advisor 动态计算）
   int _autoMaxConnections = 16; // 自动模式下智能调度的最大连接数上限
@@ -91,6 +94,12 @@ class SettingsProvider extends ChangeNotifier {
   // x-scheme-handler/ed2k 时，撤销用户级覆盖后 xdg-mime 仍会解析回 FluxDown，
   // 光靠实时查询永远回不到 false。
   bool _ed2kAssocUserDisabled = false;
+  // magnet: 链接关联（系统协议处理器）。默认开启：Rust 启动时非抢占式
+  // 自动注册（检测到其他客户端占有 magnet 时不抢，只有此开关手动打开才接管）。
+  bool _magnetProtocolAssociated = false;
+  // 同 _ed2kAssocUserDisabled：持久化用户手动关闭，防实时查询顶回 ON，
+  // 也是 Rust 启动自动注册的否决条件（magnet_assoc_user_disabled）。
+  bool _magnetAssocUserDisabled = false;
 
   // 代理设置
   String _proxyMode = 'none'; // none / system / manual / auto
@@ -100,6 +109,11 @@ class SettingsProvider extends ChangeNotifier {
   String _proxyUsername = '';
   String _proxyPassword = '';
   String _proxyNoList = ''; // 逗号分隔的排除列表
+
+  /// 已保存的站点 HTTP Basic 凭据（JSON：{"host[:port]":{"user","pass"}}）。
+  /// 设备本地敏感数据，不进云同步目录；由引擎在建任务时写入/套用，
+  /// 设置页只做列出与删除。
+  String _siteAuthCredentials = '';
 
   // 代理防抖支持
   Timer? _proxyDebounceTimer;
@@ -360,6 +374,7 @@ class SettingsProvider extends ChangeNotifier {
   bool get torrentAssocPrompted => _torrentAssocPrompted;
   bool get torrentAssociated => _torrentAssociated;
   bool get ed2kProtocolAssociated => _ed2kProtocolAssociated;
+  bool get magnetProtocolAssociated => _magnetProtocolAssociated;
 
   // 代理设置 Getters
   String get proxyMode => _proxyMode;
@@ -369,6 +384,7 @@ class SettingsProvider extends ChangeNotifier {
   String get proxyUsername => _proxyUsername;
   String get proxyPassword => _proxyPassword;
   String get proxyNoList => _proxyNoList;
+  String get siteAuthCredentials => _siteAuthCredentials;
 
   // BT 设置 Getters
   bool get btEnableDht => _btEnableDht;
@@ -947,6 +963,14 @@ class SettingsProvider extends ChangeNotifier {
     _saveProxyConfig('proxy_no_list', value);
   }
 
+  /// 覆写已保存的站点凭据 JSON（设置页删除某站点后整体写回）。
+  void setSiteAuthCredentials(String value) {
+    if (_siteAuthCredentials == value) return;
+    _siteAuthCredentials = value;
+    notifyListeners();
+    _saveToRust('site_auth_credentials', value);
+  }
+
   // BT 设置 Setters
 
   void setBtEnableDht(bool value) {
@@ -1499,6 +1523,26 @@ class SettingsProvider extends ChangeNotifier {
     SetUrlProtocol(scheme: _ed2kScheme, enable: enable).sendSignalToRust();
   }
 
+  /// 请求 Rust 检查当前 magnet: 协议关联状态。
+  void checkMagnetProtocolAssociation() {
+    const CheckUrlProtocol(scheme: _magnetScheme).sendSignalToRust();
+  }
+
+  /// 设置或取消 magnet: 链接关联（乐观更新 UI，Rust 回传真实状态后校正）。
+  ///
+  /// 与 [setEd2kProtocolAssociation] 同构。打开是显式接管：即使其他客户端
+  /// （qBittorrent 等）已注册 magnet，Rust 侧 register 也会覆盖为 FluxDown；
+  /// 关闭只删除 FluxDown 自己的注册（其他客户端的注册自动恢复生效），
+  /// 并持久化 opt-out 阻止下次启动自动注册。
+  void setMagnetProtocolAssociation(bool enable) {
+    logInfo('Settings', 'setMagnetProtocolAssociation: enable=$enable');
+    _magnetProtocolAssociated = enable;
+    _magnetAssocUserDisabled = !enable;
+    notifyListeners();
+    _saveToRust('magnet_assoc_user_disabled', (!enable).toString());
+    SetUrlProtocol(scheme: _magnetScheme, enable: enable).sendSignalToRust();
+  }
+
   /// 设置开机自启动，返回是否成功。
   /// 操作后通过 [launchAtStartup.isEnabled] 验证注册表实际状态，
   /// 若与预期不符则回滚 UI 状态。
@@ -1629,9 +1673,13 @@ class SettingsProvider extends ChangeNotifier {
 
   void _onUrlProtocolStatus(RustSignalPack<UrlProtocolStatus> pack) {
     // 单条信号服务所有 scheme（fluxdown:// 的启动自注册也走同一路），
-    // 只消费 ed2k。
-    if (pack.message.scheme != _ed2kScheme) return;
-    handleEd2kProtocolStatus(pack.message.isRegistered);
+    // 只消费 ed2k / magnet。
+    switch (pack.message.scheme) {
+      case _ed2kScheme:
+        handleEd2kProtocolStatus(pack.message.isRegistered);
+      case _magnetScheme:
+        handleMagnetProtocolStatus(pack.message.isRegistered);
+    }
   }
 
   /// Applies a live `ed2k://` handler status reported by Rust.
@@ -1645,6 +1693,21 @@ class SettingsProvider extends ChangeNotifier {
     );
     if (_ed2kProtocolAssociated != effective) {
       _ed2kProtocolAssociated = effective;
+      notifyListeners();
+    }
+  }
+
+  /// Applies a live `magnet:` handler status reported by Rust.
+  /// Exposed for tests; production code receives it via the signal stream.
+  @visibleForTesting
+  void handleMagnetProtocolStatus(bool registered) {
+    final effective = registered && !_magnetAssocUserDisabled;
+    logInfo(
+      'Settings',
+      'magnet protocol status: $registered (effective: $effective)',
+    );
+    if (_magnetProtocolAssociated != effective) {
+      _magnetProtocolAssociated = effective;
       notifyListeners();
     }
   }
@@ -1808,6 +1871,8 @@ class SettingsProvider extends ChangeNotifier {
           _torrentAssocUserDisabled = entry.value == 'true';
         case 'ed2k_assoc_user_disabled':
           _ed2kAssocUserDisabled = entry.value == 'true';
+        case 'magnet_assoc_user_disabled':
+          _magnetAssocUserDisabled = entry.value == 'true';
         case 'notify_on_complete':
           _notifyOnComplete = entry.value != 'false'; // 默认 true
         case 'webhook.endpoints':
@@ -1851,6 +1916,8 @@ class SettingsProvider extends ChangeNotifier {
           _proxyPassword = entry.value;
         case 'proxy_no_list' when !_pendingProxyKeys.contains('proxy_no_list'):
           _proxyNoList = entry.value;
+        case 'site_auth_credentials':
+          _siteAuthCredentials = entry.value;
         case 'local_server_enabled':
           _localServerEnabled = entry.value == 'true';
         case 'local_server_port':
@@ -1967,6 +2034,7 @@ class SettingsProvider extends ChangeNotifier {
     if (_enableFileAssoc) {
       checkFileAssociation();
       checkEd2kProtocolAssociation();
+      checkMagnetProtocolAssociation();
     }
   }
 

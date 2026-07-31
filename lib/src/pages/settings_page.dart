@@ -235,6 +235,13 @@ List<SettingsSearchItem> get settingsSearchItems {
       icon: LucideIcons.link,
     ),
     SettingsSearchItem(
+      category: SettingsCategory.general,
+      label: s.magnetLinkAssociation,
+      description: s.magnetLinkAssociationDesc,
+      keywords: s.searchKeywordsMagnetAssoc,
+      icon: LucideIcons.magnet,
+    ),
+    SettingsSearchItem(
       // 「下载完成通知」随分类迁移到「通知」——搜索定位不断链。
       category: SettingsCategory.notify,
       label: s.notifyOnComplete,
@@ -2049,6 +2056,15 @@ class _GeneralContent extends StatelessWidget {
                     value: settingsProvider.ed2kProtocolAssociated,
                     onChanged: (v) =>
                         settingsProvider.setEd2kProtocolAssociation(v),
+                  ),
+                ),
+                _SettingRow(
+                  label: s.magnetLinkAssociation,
+                  description: s.magnetLinkAssociationDesc,
+                  child: ShadSwitch(
+                    value: settingsProvider.magnetProtocolAssociated,
+                    onChanged: (v) =>
+                        settingsProvider.setMagnetProtocolAssociation(v),
                   ),
                 ),
                 _SettingRow(

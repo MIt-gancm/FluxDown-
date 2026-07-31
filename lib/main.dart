@@ -298,14 +298,16 @@ String _decodeFilePath(String arg) {
 
 /// 解析协议启动参数（系统协议处理器唤起本 exe 时经启动参数传入）。
 ///
-/// 两种形态：
+/// 三种形态：
 /// - `fluxdown://download?url=<encoded-url>&filename=<name>`——自有深链，
 ///   拆出内层真实 URL；host 不是 download 或缺 url 参数时忽略。
 /// - `ed2k://|file|<name>|<size>|<hash>|/`——电驴链接本身就是下载地址，
 ///   原样透传（`|` 不是合法 URI 字符，不能过 [Uri.tryParse]）。
+/// - `magnet:?xt=urn:btih:…`——磁力链接本身就是下载地址，原样透传
+///   （系统 magnet 协议处理器唤起，见 protocol_registry::MAGNET）。
 ({String url, String filename})? _parseProtocolArg(String arg) {
   final lower = arg.toLowerCase();
-  if (lower.startsWith('ed2k://')) {
+  if (lower.startsWith('ed2k://') || lower.startsWith('magnet:')) {
     return (url: arg.trim(), filename: '');
   }
   if (!lower.startsWith('fluxdown://')) return null;

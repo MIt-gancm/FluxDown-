@@ -135,7 +135,7 @@ begin
   Result := Copy(Command, FirstQuote + 1, SecondQuote - 1);
 end;
 
-{ Remove a URL scheme handler (fluxdown:// / ed2k://) registered at runtime by
+{ Remove a URL scheme handler (fluxdown:// / ed2k:// / magnet:) registered at runtime by
   native/hub/src/protocol_registry.rs. These keys live under
   HKCU\Software\Classes\<scheme> and are never declared in [Registry] — the
   standard uninstall never removes them, and Windows tries to relaunch the
@@ -218,9 +218,10 @@ begin
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Microsoft\Edge\NativeMessagingHosts\com.fluxdown.nmh');
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Mozilla\NativeMessagingHosts\com.fluxdown.nmh');
 
-    { fluxdown:// / ed2k:// URL protocol handlers — same gap as above. }
+    { fluxdown:// / ed2k:// / magnet: URL protocol handlers — same gap as above. }
     RemoveProtocolHandler('fluxdown');
     RemoveProtocolHandler('ed2k');
+    RemoveProtocolHandler('magnet');
 
     { .torrent association + autostart Run value — runtime-written variants
       of the [Registry] task entries, invisible to the uninstall log. }

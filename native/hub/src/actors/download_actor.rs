@@ -865,19 +865,52 @@ pub async fn run(db_dir: PathBuf) {
         spawn_api_server(api_host.clone(), cfg)
     };
 
-    // Auto-register fluxdown:// URL protocol on startup (idempotent).
-    // Windows-only: Linux ships the handler in the .desktop MimeType and macOS
+    // Auto-register URL protocols on startup (idempotent).
+    // Windows-only: Linux ships the handlers in the .desktop MimeType and macOS
     // in CFBundleURLTypes, so no runtime write is needed (or wanted) there.
+    //
+    // magnet: is default-on but NON-PREEMPTIVE — skipped when the user turned
+    // the settings toggle off (`magnet_assoc_user_disabled`) or when another
+    // client (qBittorrent, …) already claims the scheme. Only the explicit
+    // settings toggle takes a contended scheme over.
     #[cfg(target_os = "windows")]
-    tokio::task::spawn_blocking(|| {
-        if !protocol_registry::is_registered(protocol_registry::FLUXDOWN) {
-            if let Err(e) = protocol_registry::register(protocol_registry::FLUXDOWN) {
-                log_info!("[actor] auto-register fluxdown:// protocol failed: {}", e);
+    {
+        let magnet_disabled = engine
+            .db
+            .get_all_config()
+            .await
+            .unwrap_or_default()
+            .get("magnet_assoc_user_disabled")
+            .is_some_and(|v| v == "true");
+        tokio::task::spawn_blocking(move || {
+            if !protocol_registry::is_registered(protocol_registry::FLUXDOWN) {
+                if let Err(e) = protocol_registry::register(protocol_registry::FLUXDOWN) {
+                    log_info!("[actor] auto-register fluxdown:// protocol failed: {}", e);
+                }
+            } else {
+                log_info!("[actor] fluxdown:// protocol already registered");
             }
-        } else {
-            log_info!("[actor] fluxdown:// protocol already registered");
-        }
-    });
+
+            if magnet_disabled {
+                log_info!("[actor] magnet: auto-register skipped (user disabled)");
+            } else if protocol_registry::is_registered(protocol_registry::MAGNET) {
+                log_info!("[actor] magnet: protocol already registered");
+            } else if protocol_registry::is_claimed_by_other(protocol_registry::MAGNET) {
+                log_info!("[actor] magnet: auto-register skipped (claimed by another client)");
+            } else if let Err(e) = protocol_registry::register(protocol_registry::MAGNET) {
+                log_info!("[actor] auto-register magnet: protocol failed: {}", e);
+            }
+            // Push the settled state to Dart: the settings page's own
+            // CheckUrlProtocol query races this blocking task on first
+            // launch, so without this push the toggle can show OFF until
+            // the next restart.
+            UrlProtocolStatus {
+                scheme: "magnet".to_string(),
+                is_registered: protocol_registry::is_registered(protocol_registry::MAGNET),
+            }
+            .send_signal_to_dart();
+        });
+    }
 
     // Self-heal a spurious RUNASADMIN compatibility flag on our own exe (idempotent).
     // PCA/installer-detection may have flagged an older build lacking the asInvoker
