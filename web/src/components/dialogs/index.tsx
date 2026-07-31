@@ -9,6 +9,7 @@ import { ManifestSelectDialog } from './manifest-select'
 import { NewDownloadDialog } from './new-download'
 import { RenameTaskDialog } from './rename-task'
 import { ResolveVariantDialog } from './resolve-variant'
+import { SeedLimitsDialog } from './seed-limits'
 
 export function GlobalDialogs() {
   return (
@@ -20,6 +21,7 @@ export function GlobalDialogs() {
       <BtFilesDialog />
       <IncomingPairingDialog />
       <RenameTaskDialog />
+      <SeedLimitsDialog />
     </>
   )
 }

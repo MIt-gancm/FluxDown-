@@ -10,6 +10,7 @@ import { ArrowDown, Check, Layers, Loader2, Pause, Play, TriangleAlert } from 'l
 import { api } from '../../lib/api'
 import { cn } from '../../lib/cn'
 import { fileType, fmtBytes, fmtSpeed, protoLabel } from '../../lib/format'
+import { isSeeding, seedRatio } from '../../lib/seeding'
 import { translateBackendMessage, useI18n } from '../../lib/i18n'
 import { computeGroupAggregate, groupDisplayName, isActiveStatus } from '../../lib/task-group'
 import type { GroupDto, QueueDto } from '../../lib/types'
@@ -40,7 +41,7 @@ function StatusIcon({ status }: { status: ViewTask['status'] }) {
 /** 单任务网格卡 1×（design-proto `.gcard`）。 */
 export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTask; queues: QueueDto[]; protocolBadges: boolean }) {
   const { t: tr } = useI18n()
-  const { selectTask, currentTaskId, selected, setSelected } = useTasksUi()
+  const { selectTask, closeDetail, currentTaskId, detailOpen, selected, setSelected } = useTasksUi()
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['tasks'] })
 
@@ -65,8 +66,14 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
     })
   }
 
-  const meta =
-    t.status === 1 ? (
+  const meta = isSeeding(t) ? (
+    <>
+      <span className="active">↑ {t.uploadSpeed > 0 ? fmtSpeed(t.uploadSpeed) : '—'}</span>
+      <span>
+        {tr((t.seedingStatus ?? 0) === 8 ? 'status.seedingQueued' : 'status.seeding')} · {tr('detail.seedRatio')} {seedRatio(t).toFixed(2)}
+      </span>
+    </>
+  ) : t.status === 1 ? (
       <>
         <span className="active">{fmtSpeed(t.speed)}</span>
         <span>
@@ -94,7 +101,6 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
     <TaskContextMenu
       task={t}
       queues={queues}
-      onSelect={() => selectTask(t.taskId)}
       onPause={() => pauseMut.mutate()}
       onContinue={() => continueMut.mutate()}
       onBoost={() => boostMut.mutate()}
@@ -103,7 +109,8 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
     >
       <div
         className={cn('gcard', t.status === 3 && 'is-done-card', t.status === 4 && 'is-err-card', currentTaskId === t.taskId && 'selected')}
-        onClick={() => selectTask(t.taskId)}
+        // 左键单击打开详情；再次点击已选中的卡 = 关闭（右键只弹菜单）。
+        onClick={() => (currentTaskId === t.taskId && detailOpen ? closeDetail() : selectTask(t.taskId))}
       >
         <label className="mcheck gcard-check" onClick={(e) => e.stopPropagation()}>
           <input type="checkbox" checked={selected.has(t.taskId)} onChange={(e) => toggleSelected(e.target.checked)} />
@@ -139,7 +146,7 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
 /** 任务组网格卡 2× 跨列（design-proto `.gcard.group`；完成组同形态，仅状态呈现完成 v1.3）。 */
 export function GroupGridCard({ group, members }: { group: GroupDto; members: ViewTask[] }) {
   const { t } = useI18n()
-  const { selectGroup, selectedGroupId } = useTasksUi()
+  const { selectGroup, closeGroupDetail, selectedGroupId, groupDetailOpen } = useTasksUi()
   const qc = useQueryClient()
   const invalidateTasks = () => qc.invalidateQueries({ queryKey: ['tasks'] })
   const pauseMut = useMutation({ mutationFn: () => api.pauseGroup(group.groupId), onSuccess: invalidateTasks })
@@ -179,7 +186,7 @@ export function GroupGridCard({ group, members }: { group: GroupDto; members: Vi
     >
       <div
         className={cn('gcard group', done && 'is-done-card', selectedGroupId === group.groupId && 'selected')}
-        onClick={() => selectGroup(group.groupId)}
+        onClick={() => (selectedGroupId === group.groupId && groupDetailOpen ? closeGroupDetail() : selectGroup(group.groupId))}
       >
         <div className="gcard-top">
           <span className="gicon">

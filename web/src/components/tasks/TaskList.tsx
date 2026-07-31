@@ -28,6 +28,7 @@ import { compressPathChain, dirKey, flattenGroupMembers, groupDisplayName } from
 import { useViewPrefs } from '../../lib/view-prefs'
 import type { GroupDto } from '../../lib/types'
 import { GroupRow } from './GroupRow'
+import { SeedingSummaryBar } from './SeedingSummaryBar'
 import { GroupGridCard, TaskGridCard } from './GridCard'
 import { TaskRow } from './TaskRow'
 import { filterTasks } from './filters'
@@ -220,12 +221,15 @@ export function TaskList() {
   // 点空白退出选中。虚拟列表在行与滚动容器之间还夹着「撑高层 + 每项绝对定位包裹层」，
   // 用 e.target === e.currentTarget 会把落在这两层上的点击漏判成点在行上；改为向上寻找
   // 可选中元素，找不到就一律视为空白，行/卡片自身的点击照常冒泡到 selectTask 不受影响。
+  // .ctxmenu：右键菜单经 Radix Portal 渲染在 body 下，但 React 合成事件沿组件树冒泡，
+  // 菜单项点击会到达这里且 DOM target 不在任何行内——不加会被误判成空白点击关掉详情面板。
   function onScrollAreaClick(e: MouseEvent<HTMLDivElement>) {
-    if (!(e.target as HTMLElement).closest('.task-row, .grow, .gcard, .group-head, .gdir-row')) clearSelection()
+    if (!(e.target as HTMLElement).closest('.task-row, .grow, .gcard, .group-head, .gdir-row, .ctxmenu')) clearSelection()
   }
 
   return (
     <div className={cn('task-scroll', manageMode && 'manage', isGrid && 'grid-form')} ref={parentRef} onClick={onScrollAreaClick}>
+      {statusTab === 'seeding' && <SeedingSummaryBar />}
       {flat.length === 0 ? (
         <p className="empty-tip">{t('list.empty')}</p>
       ) : (

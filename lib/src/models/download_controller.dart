@@ -1470,11 +1470,33 @@ class DownloadController extends ChangeNotifier {
       (id) => !incomingIds.contains(id) && !_pendingDeleteIds.contains(id),
     );
 
+    // AllTasks 快照来自 DB，不含会话内存事件（分段拆分/CDN/链路）；重建前
+    // 按 ID 留存旧实例的会话字段，否则任何一次 AllTasks 推送（如新建任务）
+    // 都会抹掉其他任务日志 Tab 的记录。
+    final prevById = {for (final t in _tasks) t.id: t};
     _tasks.clear();
     for (final info in incoming) {
       // 跳过仍在删除中的任务，防止 AllTasks 把它们重新插回列表（僵尸复活）。
       if (_deletedTaskIds.contains(info.taskId)) continue;
       var task = DownloadTask.fromTaskInfo(info);
+      final prev = prevById[info.taskId];
+      if (prev != null) {
+        task = task.copyWith(
+          recentSplits: prev.recentSplits,
+          cdnEvents: prev.cdnEvents,
+          routeEvents: prev.routeEvents,
+        );
+      }
+      // 消费早于任务到达的链路事件缓冲（引擎启动基线可能先于本快照广播）。
+      final pendingRoutes = _pendingRouteEvents.remove(info.taskId);
+      if (pendingRoutes != null) {
+        final events = List<RouteEventData>.from(task.routeEvents);
+        var changed = false;
+        for (final e in pendingRoutes) {
+          changed = _appendRouteEvent(events, e.route) || changed;
+        }
+        if (changed) task = task.copyWith(routeEvents: events);
+      }
       // 若用户已乐观暂停该任务，DB 的旧活跃状态（downloading/resuming/pending 等）
       // 不得覆盖 UI。completed 等非活跃状态不在此列（例如做种暂停应保持 completed）。
       if (_optimisticPausedIds.contains(info.taskId) &&
@@ -1483,6 +1505,8 @@ class DownloadController extends ChangeNotifier {
       }
       _tasks.add(task);
     }
+    // 清理已不存在任务的缓冲（删除/清空场景防泄漏）。
+    _pendingRouteEvents.removeWhere((id, _) => !incomingIds.contains(id));
     _safeNotifyListeners();
   }
 
@@ -1579,17 +1603,53 @@ class DownloadController extends ChangeNotifier {
     }
   }
 
+  /// 每任务保留的链路定论事件上限（环形缓冲，同 _maxCdnEvents 语义）。
+  static const _maxRouteEvents = 8;
+
+  /// 早于任务出现的链路事件缓冲：引擎在 do_start_task 内广播
+  /// TaskRouteChanged，可能先于首条 TaskProgress/AllTasks 到达（新建任务
+  /// 时序），此时任务尚不在 _tasks，直接丢弃会漏掉启动基线记录。
+  /// 在任务两条创建路径（_onProgress 新任务 / _onAllTasks）消费。
+  final Map<String, List<RouteEventData>> _pendingRouteEvents = {};
+
+  /// 把 [route] 追加进 [events]（连续重复去重 + 封顶），返回是否有变化。
+  static bool _appendRouteEvent(List<RouteEventData> events, String route) {
+    if (route.isEmpty) return false;
+    if (events.isNotEmpty && events.last.route == route) return false;
+    events.add(RouteEventData(route: route));
+    if (events.length > _maxRouteEvents) {
+      events.removeRange(0, events.length - _maxRouteEvents);
+    }
+    return true;
+  }
+
   /// Auto 代理链路变化：引擎按站点采样/切换后定向广播。只 copyWith 单个
   /// 字段、不重建整表，沿用 _deletedTaskIds 守卫（同 _onTaskQueueChanged）。
+  /// 每次定论（含启动基线 direct）都追加进 routeEvents 供日志 Tab 展示——
+  /// Auto 任务必有一条最终链路记录。事件去重对照本会话最后一条记录而非
+  /// autoRoute 字段（DB 里的旧值会吞掉本会话首条）。
   void _onTaskRouteChanged(RustSignalPack<TaskRouteChanged> pack) {
     if (_disposed) return;
     final m = pack.message;
     if (_deletedTaskIds.contains(m.taskId)) return;
     final idx = _tasks.indexWhere((t) => t.id == m.taskId);
-    if (idx >= 0 && _tasks[idx].autoRoute != m.route) {
-      _tasks[idx] = _tasks[idx].copyWith(autoRoute: m.route);
-      _safeNotifyListeners();
+    if (idx < 0) {
+      // 任务尚未进列表（创建时序）：缓冲，待创建路径消费。
+      _appendRouteEvent(
+        _pendingRouteEvents.putIfAbsent(m.taskId, () => []),
+        m.route,
+      );
+      return;
     }
+    var task = _tasks[idx];
+    final fieldChanged = task.autoRoute != m.route;
+    final events = List<RouteEventData>.from(task.routeEvents);
+    final logged = _appendRouteEvent(events, m.route);
+    if (!fieldChanged && !logged) return;
+    if (fieldChanged) task = task.copyWith(autoRoute: m.route);
+    if (logged) task = task.copyWith(routeEvents: events);
+    _tasks[idx] = task;
+    _safeNotifyListeners();
   }
 
   /// 插件钩子活动指示：`running=true` 加入 `(taskId, pluginId)` 并设/重置
@@ -1731,7 +1791,7 @@ class DownloadController extends ChangeNotifier {
     } else {
       // 新任务（刚刚创建的）
       logInfo(_tag, 'new task from progress: ${p.taskId} status=$newStatus');
-      final task = DownloadTask(
+      var task = DownloadTask(
         id: p.taskId,
         url: p.url,
         fileName: p.fileName.isEmpty ? currentS.unknownFile : p.fileName,
@@ -1745,6 +1805,15 @@ class DownloadController extends ChangeNotifier {
         // 紧随其后的 AllTasks 快照会带来真实归属。
         queueId: kQueueAttributionPending,
       );
+      // 消费早于任务到达的链路事件缓冲（引擎在 do_start_task 内广播启动
+      // 基线，常先于首条 TaskProgress 抵达）。
+      final pendingRoutes = _pendingRouteEvents.remove(p.taskId);
+      if (pendingRoutes != null && pendingRoutes.isNotEmpty) {
+        task = task.copyWith(
+          routeEvents: pendingRoutes,
+          autoRoute: pendingRoutes.last.route,
+        );
+      }
       _tasks.insert(0, task);
       // 新任务直接以 completed 状态出现（如瞬间完成的小文件）
       if (newStatus == TaskStatus.completed) {

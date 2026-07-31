@@ -51,7 +51,8 @@ export function useStore<T>(store: Store<T>): T {
 
 // ---------------- store 实例 ----------------
 
-export type TaskLive = Omit<TaskProgressMsg, 'taskId'>
+/** live 帧 + 本地到达时刻（做种时长锚点插值用）。 */
+export type TaskLive = Omit<TaskProgressMsg, 'taskId'> & { at: number }
 
 export const liveStore = new Store<Record<string, TaskLive>>({})
 export const segmentStore = new Store<Record<string, SegmentProgressMsg>>({})
@@ -63,6 +64,10 @@ export const connStore = new Store<{
 }>({ status: 'disconnected', rttMs: null })
 /** 最近一次多 CDN 节点级活动事件（任务详情日志用），带到达时间戳（同 splitStore 范式）。 */
 export const cdnEventStore = new Store<(TaskCdnEventMsg & { at: number }) | null>(null)
+/** 最近一次 Auto 代理链路定论事件（任务详情日志用），带到达时间戳（同 splitStore 范式）。 */
+export const routeEventStore = new Store<{ taskId: string; route: string; at: number } | null>(
+  null,
+)
 export const priorityStore = new Store<{ priorityTaskId: string; autoPausedCount: number }>({
   priorityTaskId: '',
   autoPausedCount: 0,
@@ -219,7 +224,7 @@ function dispatch(msg: WsServerMsg) {
   switch (msg.type) {
     case 'taskProgress': {
       const { taskId, ...live } = msg
-      liveStore.set((prev) => ({ ...prev, [taskId]: live }))
+      liveStore.set((prev) => ({ ...prev, [taskId]: { ...live, at: Date.now() } }))
       if (qc) {
         const tasks = qc.getQueryData<TaskDto[]>(['tasks'])
         if (!tasks || !tasks.some((t) => t.taskId === taskId)) {
@@ -237,6 +242,14 @@ function dispatch(msg: WsServerMsg) {
                     totalBytes: live.totalBytes || t.totalBytes,
                     fileName: live.fileName || t.fileName,
                     errorMessage: live.errorMessage,
+                    uploadedBytes: live.uploadedBytes ?? t.uploadedBytes,
+                    seedingStatus: live.seedingStatus ?? t.seedingStatus,
+                    seedingMessage: live.seedingMessage ?? t.seedingMessage,
+                    // 仅做种/排队帧携带权威做种时长；下载期帧恒 0，采纳会清零累计。
+                    seedingTimeSecs:
+                      live.seedingStatus === 1 || live.seedingStatus === 8
+                        ? (live.seedingTimeSecs ?? t.seedingTimeSecs)
+                        : t.seedingTimeSecs,
                   }
                 : t,
             ),
@@ -287,6 +300,7 @@ function dispatch(msg: WsServerMsg) {
       queryClientRef?.setQueryData<TaskDto[]>(['tasks'], (old) =>
         old?.map((t) => (t.taskId === msg.taskId ? { ...t, autoRoute: msg.route } : t)),
       )
+      routeEventStore.set({ taskId: msg.taskId, route: msg.route, at: Date.now() })
       break
     case 'queuePositionsChanged': {
       // 回写 queueOrder，驱动队列管理对话框「任务」Tab 的顺序实时重排。

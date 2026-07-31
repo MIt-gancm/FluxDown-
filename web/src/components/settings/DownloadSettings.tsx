@@ -1,4 +1,4 @@
-// 下载：默认保存目录 / 全局限速 / 全局 User-Agent / 多 CDN 并发（服务器 config 表）。
+// 下载：默认保存目录 / 下载·上传限速 / 全局 User-Agent / 多 CDN 并发（服务器 config 表）。
 import { useState } from 'react'
 import { confirmDialog } from '../../lib/confirm'
 import { useI18n } from '../../lib/i18n'
@@ -7,7 +7,7 @@ import { FsPicker } from '../dialogs/fs-picker'
 import { UA_PRESETS } from '../../lib/ua-presets'
 import { NumberFieldRow, SetRow, SetSelect, SetSwitch, TextInput } from './controls'
 
-const MB = 1024 * 1024
+const KB = 1024
 
 const CUSTOM = '__custom__'
 
@@ -20,8 +20,9 @@ export function DownloadSettings({
 }) {
   const { t } = useI18n()
   const saveDir = config.default_save_dir ?? ''
-  const speedBytes = Number(config.speed_limit_bytes ?? '0')
-  const speedMB = speedBytes > 0 ? speedBytes / MB : 0
+  // 与桌面端一致：KB/s 整数展示，引擎按 B/s 存储。
+  const speedKB = Math.floor(Number(config.speed_limit_bytes ?? '0') / KB)
+  const uploadKB = Math.floor(Number(config.upload_limit_bytes ?? '0') / KB)
   const ua = config.global_user_agent ?? ''
   const useServerTime = (config.use_server_time ?? 'false') === 'true'
   const cdnMultiEnabled = (config.cdn_multi_enabled ?? '0') === '1'
@@ -76,9 +77,16 @@ export function DownloadSettings({
         <NumberFieldRow
           title={t('set.download.speedLimit')}
           desc={t('set.download.speedLimitDesc')}
-          value={speedMB}
+          value={speedKB}
           min={0}
-          onCommit={(n) => mutate({ speed_limit_bytes: String(Math.max(0, Math.round(n * MB))) })}
+          onCommit={(n) => mutate({ speed_limit_bytes: String(Math.max(0, Math.round(n)) * KB) })}
+        />
+        <NumberFieldRow
+          title={t('set.download.uploadLimit')}
+          desc={t('set.download.uploadLimitDesc')}
+          value={uploadKB}
+          min={0}
+          onCommit={(n) => mutate({ upload_limit_bytes: String(Math.max(0, Math.round(n)) * KB) })}
         />
         <SetRow title={t('set.download.ua')} desc={t('set.download.uaDesc')}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0 }}>

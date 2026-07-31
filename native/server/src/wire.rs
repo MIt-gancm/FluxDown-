@@ -172,6 +172,8 @@ pub enum WsServerMsg {
         total_bytes: i64,
         /// 字节/秒。
         speed: i64,
+        /// BT 上传速率（字节/秒；非 BT 任务恒 0）。
+        upload_speed: i64,
         file_name: String,
         save_dir: String,
         url: String,
@@ -795,6 +797,7 @@ mod tests {
             speed: 5,
             file_name: "f.bin".into(),
             save_dir: "/tmp".into(),
+            upload_speed: 7,
             url: "http://x".into(),
             error_message: String::new(),
             uploaded_bytes: 42,
@@ -807,6 +810,7 @@ mod tests {
         assert!(json.contains("\"taskId\":\"t1\""));
         assert!(json.contains("\"downloadedBytes\":10"));
         assert!(json.contains("\"uploadedBytes\":42"));
+        assert!(json.contains("\"uploadSpeed\":7"));
         assert!(json.contains("\"seedingStatus\":1"));
     }
 

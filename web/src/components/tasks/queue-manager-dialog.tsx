@@ -42,6 +42,7 @@ export function QueueManagerDialog({ queue, queueName }: { queue: QueueDto; queu
   // ── 设置 ──
   const [name, setName] = useState(queue.name)
   const [speed, setSpeed] = useState('')
+  const [upload, setUpload] = useState('')
   const [concurrent, setConcurrent] = useState('')
   const [segments, setSegments] = useState('0')
   const [saveDir, setSaveDir] = useState('')
@@ -60,6 +61,7 @@ export function QueueManagerDialog({ queue, queueName }: { queue: QueueDto; queu
     setTab(0)
     setName(queue.name)
     setSpeed(queue.speedLimitKbps > 0 ? String(queue.speedLimitKbps) : '')
+    setUpload(queue.uploadLimitKbps > 0 ? String(queue.uploadLimitKbps) : '')
     setConcurrent(queue.maxConcurrent > 0 ? String(queue.maxConcurrent) : '')
     setSegments(queue.defaultSegments > 0 ? String(queue.defaultSegments) : '0')
     setSaveDir(queue.defaultSaveDir)
@@ -82,6 +84,7 @@ export function QueueManagerDialog({ queue, queueName }: { queue: QueueDto; queu
         // 内置队列名称固定（引擎侧同样拒绝改名），提交存量名即可。
         name: builtin ? queue.name : name.trim(),
         speedLimitKbps: Math.max(0, Number(speed.trim()) || 0),
+        uploadLimitKbps: Math.max(0, Number(upload.trim()) || 0),
         maxConcurrent: Math.min(100, Math.max(0, Number(concurrent.trim()) || 0)),
         defaultSaveDir: saveDir.trim(),
         defaultSegments: Number(segments) || 0,
@@ -209,6 +212,17 @@ export function QueueManagerDialog({ queue, queueName }: { queue: QueueDto; queu
                         value={speed}
                         placeholder={t('queue.speedLimitHint')}
                         onChange={(e) => setSpeed(e.target.value)}
+                      />
+                    </div>
+                    <div>
+                      <label className="field-label" htmlFor="qm-upload" title={t('queue.uploadLimitHint')}>{t('queue.uploadLimit')}</label>
+                      <input
+                        id="qm-upload"
+                        className="text-input"
+                        inputMode="numeric"
+                        value={upload}
+                        placeholder={t('queue.speedLimitHint')}
+                        onChange={(e) => setUpload(e.target.value)}
                       />
                     </div>
                     <div>

@@ -4348,14 +4348,18 @@ impl DownloadManager {
         if self.proxy_config.mode != ProxyMode::Auto {
             return None;
         }
-        let Some(candidate) = auto_proxy::resolve_candidate(&self.proxy_config) else {
+        let Some((candidate, source)) = auto_proxy::resolve_candidate(&self.proxy_config) else {
             return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
         };
         let Some(host) = crate::segment_coordinator::extract_host(url) else {
             return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
         };
         if self.auto_proxy_cache.lookup(&host) == Some(Decision::Proxy) {
-            return Some((candidate, auto_proxy::route::PROXY_CACHED, None));
+            return Some((
+                candidate,
+                auto_proxy::route::with_source(auto_proxy::route::PROXY_CACHED, source),
+                None,
+            ));
         }
         let ctx = (!ignore_tls_errors).then(|| {
             Arc::new(crate::auto_proxy::AutoProxyCtx {
@@ -4363,6 +4367,7 @@ impl DownloadManager {
                 cache: self.auto_proxy_cache.clone(),
                 host,
                 user_agent: user_agent.to_string(),
+                source,
             })
         });
         Some((ProxyConfig::default(), auto_proxy::route::DIRECT, ctx))
@@ -4765,12 +4770,11 @@ impl DownloadManager {
             // ProxyMode::Auto 可追溯性：启动基线路由落库（非 Auto 写空串清除
             // 旧标签），非空时广播给客户端原位刷新详情面板「链路」行。
             // 手动重启一个曾排定 failover 重试的任务时消费其标记。
-            let auto_route =
-                if self.auto_failover_pending.remove(&task_id) && auto_route.starts_with("proxy") {
-                    crate::auto_proxy::route::PROXY_FAILOVER
-                } else {
-                    auto_route
-                };
+            let auto_route = if self.auto_failover_pending.remove(&task_id) {
+                crate::auto_proxy::route::to_failover(auto_route)
+            } else {
+                auto_route
+            };
             if let Err(e) = self.db.set_task_auto_route(&task_id, auto_route).await {
                 log_info!("[manager] task {} auto_route 落库失败: {}", task_id, e);
             }
@@ -5731,8 +5735,8 @@ impl DownloadManager {
                 Some((proxy, route, ctx)) => (Some(proxy), (route, ctx)),
                 None => (None, ("", None)),
             };
-            let auto_route = if was_failover && auto_route.starts_with("proxy") {
-                crate::auto_proxy::route::PROXY_FAILOVER
+            let auto_route = if was_failover {
+                crate::auto_proxy::route::to_failover(auto_route)
             } else {
                 auto_route
             };

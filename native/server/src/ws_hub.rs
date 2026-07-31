@@ -224,6 +224,7 @@ impl EventSink for EngineEventSink {
                     downloaded_bytes,
                     total_bytes,
                     speed,
+                    upload_speed: upload_speed_bps,
                     file_name,
                     save_dir,
                     url,
@@ -579,7 +580,7 @@ mod tests {
             save_dir: "/tmp".into(),
             url: "http://x".into(),
             error_message: String::new(),
-            upload_speed_bps: 0,
+            upload_speed_bps: 33,
             uploaded_bytes: 0,
             seeding_status: 0,
             seeding_message: String::new(),
@@ -593,6 +594,7 @@ mod tests {
         assert_eq!(v["downloadedBytes"], 50);
         assert_eq!(v["totalBytes"], 200);
         assert_eq!(v["speed"], 1024);
+        assert_eq!(v["uploadSpeed"], 33);
         assert_eq!(v["fileName"], "a.bin");
     }
 

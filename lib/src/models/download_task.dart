@@ -298,6 +298,20 @@ class CdnEventData {
   }) : receivedAt = receivedAt ?? DateTime.now();
 }
 
+/// Auto 代理链路定论事件（来自 Rust `TaskRouteChanged` 信号，本次会话
+/// 内存记录，不持久化）。供详情面板日志 Tab 展示；基线 `direct` 不记录。
+class RouteEventData {
+  /// wire 标签（direct:sampled / direct:pinned / proxy:cached /
+  /// proxy:sampled / proxy:failover），文案经 `S.taskRouteLabel` 本地化。
+  final String route;
+
+  /// 事件接收时刻（本地时间），供日志 Tab 展示时间戳。
+  final DateTime receivedAt;
+
+  RouteEventData({required this.route, DateTime? receivedAt})
+    : receivedAt = receivedAt ?? DateTime.now();
+}
+
 class DownloadTask {
   final String id;
   final String url;
@@ -324,6 +338,9 @@ class DownloadTask {
   /// 多 CDN 节点级事件（本次会话记录，任务完成后仍保留供日志查看；
   /// controller 侧封顶条数防无界增长）。
   final List<CdnEventData> cdnEvents;
+
+  /// Auto 代理链路定论事件（本次会话记录，任务完成后仍保留供日志查看）。
+  final List<RouteEventData> routeEvents;
 
   /// 在 pending_queue 中的排队位置（1-based）。-1 = 不在队列中。
   final int queuePosition;
@@ -451,6 +468,7 @@ class DownloadTask {
     this.segments,
     this.recentSplits = const [],
     this.cdnEvents = const [],
+    this.routeEvents = const [],
     this.queuePosition = -1,
     this.queueId = '',
     this.queueOrder = 0,
@@ -547,6 +565,7 @@ class DownloadTask {
     List<SegmentData>? segments,
     List<SplitEventData>? recentSplits,
     List<CdnEventData>? cdnEvents,
+    List<RouteEventData>? routeEvents,
     int? queuePosition,
     String? queueId,
     int? queueOrder,
@@ -590,6 +609,7 @@ class DownloadTask {
       segments: segments ?? this.segments,
       recentSplits: recentSplits ?? this.recentSplits,
       cdnEvents: cdnEvents ?? this.cdnEvents,
+      routeEvents: routeEvents ?? this.routeEvents,
       queuePosition: queuePosition ?? this.queuePosition,
       queueId: queueId ?? this.queueId,
       queueOrder: queueOrder ?? this.queueOrder,

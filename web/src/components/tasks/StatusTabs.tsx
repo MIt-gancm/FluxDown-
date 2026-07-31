@@ -14,6 +14,7 @@ const TABS: { id: StatusTab; labelKey: I18nKey }[] = [
   { id: 'completed', labelKey: 'tabs.completed' },
   { id: 'paused', labelKey: 'tabs.paused' },
   { id: 'error', labelKey: 'tabs.error' },
+  { id: 'seeding', labelKey: 'tabs.seeding' },
 ]
 
 export function StatusTabs() {

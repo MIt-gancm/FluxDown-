@@ -3,7 +3,7 @@
 
 import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Ban, Download, ListOrdered, Trash2, X, Zap } from 'lucide-react'
+import { Ban, Download, ListOrdered, Pencil, Trash2, X, Zap } from 'lucide-react'
 import { api, taskFileUrl } from '../../lib/api'
 import { CopyButton } from '../CopyButton'
 import { cn } from '../../lib/cn'
@@ -11,9 +11,11 @@ import { fmtBytes, fmtDuration, fmtEta, fmtSpeed, fmtTime, protoLabel, queueDisp
 import { t as i18nT, translateBackendMessage, useI18n } from '../../lib/i18n'
 import { segmentStore, splitStore, useStore } from '../../lib/ws'
 import { confirmDialog } from '../../lib/confirm'
+import { openSeedLimits } from '../../lib/dialogs'
+import { fmtSeedDuration, isSeeding, liveSeedingTimeSecs, postSeedRatio, seedRatio, seedingStatusKey } from '../../lib/seeding'
 import { groupDisplayName } from '../../lib/task-group'
 import type { GroupDto, QueueDto, SegmentDetail, TaskStatus } from '../../lib/types'
-import { eventLogStore } from './eventLog'
+import { eventLogStore, routeLabel } from './eventLog'
 import { useTasksUi, type DetailTab } from './context'
 import { useViewTasks, type ViewTask } from './useViewTasks'
 
@@ -146,6 +148,9 @@ function GeneralTab({ t, queues, groups }: { t: ViewTask; queues: QueueDto[]; gr
   const taskQueue = queues.find((q) => q.queueId === t.queueId)
   const queueName = taskQueue ? queueDisplayName(taskQueue) : tr('detail.defaultQueue')
   const memberGroup = t.groupId ? groups.find((g) => g.groupId === t.groupId) : undefined
+  // BT 判定与 TaskContextMenu isBt 对齐（magnet / torrent-file:// / .torrent）。
+  const isBt = t.url.startsWith('magnet:') || t.url.startsWith('torrent-file://') || t.url.endsWith('.torrent')
+  const seeding = isSeeding(t)
 
   return (
     <>
@@ -196,6 +201,17 @@ function GeneralTab({ t, queues, groups }: { t: ViewTask; queues: QueueDto[]; gr
           <DField label={tr('detail.duration')} value={fmtDuration(t.createdAt, t.completedAt)} />
         </>
       ) : null}
+      {isBt ? (
+        <>
+          <DField label={tr('seeding.uploadedTotal')} value={(t.uploadedBytes ?? 0) > 0 ? fmtBytes(t.uploadedBytes!) : '—'} />
+          {seeding && t.uploadSpeed > 0 ? <DField label={tr('detail.speed')} value={`↑ ${fmtSpeed(t.uploadSpeed)}`} /> : null}
+          <DField label={tr('detail.seedRatio')} value={seedRatio(t).toFixed(2)} />
+          {(t.uploadedAtCompletion ?? 0) > 0 ? <DField label={tr('detail.seedRatioAfter')} value={postSeedRatio(t).toFixed(2)} /> : null}
+          {seeding ? <LiveSeedTimeField t={t} label={tr('detail.seedTime')} /> : null}
+          {(t.seedingStatus ?? 0) !== 0 ? <DField label={tr('seeding.statusLabel')} value={tr(seedingStatusKey(t.seedingStatus!))} /> : null}
+          {t.status === 3 || seeding ? <SeedLimitsField t={t} /> : null}
+        </>
+      ) : null}
       {t.status === 4 && t.errorMessage ? (
         <DField label={tr('detail.error')} value={translateBackendMessage(t.errorMessage)} copy />
       ) : null}
@@ -235,6 +251,68 @@ function GeneralTab({ t, queues, groups }: { t: ViewTask; queues: QueueDto[]; gr
         </button>
       </div>
     </>
+  )
+}
+
+/** 做种时长行：仅活跃做种(seedingStatus==1)时 1s 计时器局部重渲染做锚点插值；
+ *  排队/停止只显示引擎累计秒（对齐桌面 _LiveSeedTimeRow）。
+ *  锚点兜底：REST 快照没有帧到达时刻（页面刚打开、引擎做种帧间隔 5s），活跃做种
+ *  且尚无 live 锚点时以组件挂载时刻起算，保证时长秒级走字；帧到达后自动纠偏。 */
+function LiveSeedTimeField({ t, label }: { t: ViewTask; label: string }) {
+  const active = (t.seedingStatus ?? 0) === 1
+  const [mountAt] = useState(() => Date.now())
+  // now 必须是显式 state：react-compiler 按 deps 记忆化渲染输出,藏在
+  // liveSeedingTimeSecs 默认参数里的 Date.now() 不会触发重算。
+  const [now, setNow] = useState(() => Date.now())
+  useEffect(() => {
+    if (!active) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [active])
+  const anchor = t.seedingTimeAt ?? (active ? mountAt : undefined)
+  return <DField label={label} value={fmtSeedDuration(liveSeedingTimeSecs(t, anchor, now))} />
+}
+
+/** 做种限制三态摘要行（全 -2=跟随全局 / 全 -1=不限制 / 否则自定义，可选拼上传限速）
+ *  + 铅笔按钮打开限制对话框。 */
+function SeedLimitsField({ t }: { t: ViewTask }) {
+  const { t: tr } = useI18n()
+  const ratio = t.seedRatioLimitMilli ?? -2
+  const post = t.seedPostRatioLimitMilli ?? -2
+  const time = t.seedTimeLimitMinutes ?? -2
+  const inactive = t.seedInactiveTimeLimitMinutes ?? -2
+  const values = [ratio, post, time, inactive]
+  const base = values.every((v) => v === -2)
+    ? tr('detail.seedLimitsGlobal')
+    : values.every((v) => v === -1)
+      ? tr('detail.seedLimitsUnlimited')
+      : tr('detail.seedLimitsCustom')
+  const upload = t.seedUploadLimitBps ?? 0
+  const summary = upload > 0 ? `${base} · ↑ ${fmtSpeed(upload)}` : base
+  return (
+    <div className="d-field">
+      <span>{tr('detail.seedLimits')}</span>
+      <div className="copy-row">
+        <p>{summary}</p>
+        <button
+          type="button"
+          className="icon-btn sm"
+          aria-label={tr('detail.seedLimits')}
+          onClick={() =>
+            openSeedLimits({
+              taskId: t.taskId,
+              ratioLimitMilli: ratio,
+              postRatioLimitMilli: post,
+              seedTimeLimitMinutes: time,
+              inactiveTimeLimitMinutes: inactive,
+              uploadLimitBps: upload,
+            })
+          }
+        >
+          <Pencil size={14} />
+        </button>
+      </div>
+    </div>
   )
 }
 
@@ -367,15 +445,6 @@ function LogTab({ t }: { t: ViewTask }) {
   )
 }
 
-/** Auto 代理路由标签 → i18n key（未知值原样显示）。 */
-const ROUTE_LABEL_KEYS: Record<string, import('../../lib/i18n').I18nKey> = {
-  direct: 'detail.route.direct',
-  'direct:sampled': 'detail.route.directSampled',
-  'direct:pinned': 'detail.route.directPinned',
-  'proxy:cached': 'detail.route.proxyCached',
-  'proxy:sampled': 'detail.route.proxySampled',
-  'proxy:failover': 'detail.route.proxyFailover',
-}
 
 function AdvancedTab({ t }: { t: ViewTask }) {
   const { t: tr } = useI18n()
@@ -383,12 +452,7 @@ function AdvancedTab({ t }: { t: ViewTask }) {
     <>
       <DField label={tr('detail.checksum')} value={t.checksum || tr('detail.checksumNotSet')} />
       <DField label={tr('detail.proxy')} value={t.proxyUrl || tr('detail.proxyNotSet')} />
-      {t.autoRoute ? (
-        <DField
-          label={tr('detail.route')}
-          value={ROUTE_LABEL_KEYS[t.autoRoute] ? tr(ROUTE_LABEL_KEYS[t.autoRoute]) : t.autoRoute}
-        />
-      ) : null}
+      {t.autoRoute ? <DField label={tr('detail.route')} value={routeLabel(t.autoRoute)} /> : null}
       <DField label={tr('detail.url')} value={t.url} copy />
       <DField label={tr('detail.savePath')} value={t.saveDir} />
       <p className="seg-note">{tr('detail.checksumFooterNote')}</p>

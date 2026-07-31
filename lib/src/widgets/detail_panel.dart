@@ -1603,6 +1603,17 @@ class _DetailPanelState extends State<DetailPanel> {
         _buildLogRow(c, _formatDateTime(evt.receivedAt), text),
       ));
     }
+    for (final evt in task.routeEvents) {
+      timeline.add((
+        evt.receivedAt,
+        seq++,
+        _buildLogRow(
+          c,
+          _formatDateTime(evt.receivedAt),
+          s.detailLogRoute(s.taskRouteLabel(evt.route)),
+        ),
+      ));
+    }
     timeline.sort((a, b) {
       final byTime = a.$1.compareTo(b.$1);
       return byTime != 0 ? byTime : a.$2.compareTo(b.$2);

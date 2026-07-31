@@ -11,12 +11,12 @@ import { copyText } from '../../lib/copy'
 import { queueDisplayName, taskShareUrl } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
 import type { QueueDto } from '../../lib/types'
+import { isSeeding, isSeedingStopped } from '../../lib/seeding'
 import type { ViewTask } from './useViewTasks'
 
 export function TaskContextMenu({
   task: t,
   queues,
-  onSelect,
   onPause,
   onContinue,
   onBoost,
@@ -26,7 +26,6 @@ export function TaskContextMenu({
 }: {
   task: ViewTask
   queues: QueueDto[]
-  onSelect: () => void
   onPause: () => void
   onContinue: () => void
   onBoost: () => void
@@ -41,7 +40,8 @@ export function TaskContextMenu({
   const canRename = !isBt && t.status !== 1 && t.status !== 5
   return (
     <ContextMenu.Root>
-      <ContextMenu.Trigger asChild onContextMenu={onSelect}>
+      {/* 右键只弹菜单，不选中/不打开详情面板（对齐需求：仅左键单击打开）。 */}
+      <ContextMenu.Trigger asChild>
         {children}
       </ContextMenu.Trigger>
       <ContextMenu.Portal>
@@ -68,6 +68,19 @@ export function TaskContextMenu({
             <ContextMenu.Item className="ctx-item" onSelect={onBoost}>
               <Zap size={14} />
               {tr('task.boost')}
+            </ContextMenu.Item>
+          )}
+          {/* 做种中 → 暂停（停止做种）；停止态 → 继续做种（复用 pause/continue API，对齐桌面 §3）。 */}
+          {isSeeding(t) && (
+            <ContextMenu.Item className="ctx-item" onSelect={onPause}>
+              <Pause size={14} />
+              {tr('task.pause')}
+            </ContextMenu.Item>
+          )}
+          {isSeedingStopped(t) && (
+            <ContextMenu.Item className="ctx-item" onSelect={onContinue}>
+              <Play size={14} />
+              {tr('task.resumeSeeding')}
             </ContextMenu.Item>
           )}
           {t.status === 3 && (

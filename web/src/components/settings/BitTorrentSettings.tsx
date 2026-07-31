@@ -1,11 +1,11 @@
 // BitTorrent：librqbit 引擎参数（服务器 config 表）。
 import { useQueryClient } from '@tanstack/react-query'
 import { RefreshCw, RotateCcw } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState, type ReactNode } from 'react'
 import { api } from '../../lib/api'
 import { translateBackendMessage, useI18n } from '../../lib/i18n'
 import type { ConfigMap } from '../../lib/types'
-import { NumberInput, SetRow, SetSwitch } from './controls'
+import { NumberInput, SetRow, SetSelect, SetSwitch } from './controls'
 
 // 「重置为默认」用的自定义 Tracker 列表（与桌面 settings_page.dart `_kDefaultTrackers` 同步）。
 const DEFAULT_TRACKERS = [
@@ -50,6 +50,201 @@ function formatUpdatedAt(unixSecs: number): string {
   const d = new Date(unixSecs * 1000)
   const p = (n: number) => String(n).padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
+// ── 做种（对齐桌面端 BT 设置「做种」Tab，键全部热读，改动即时生效）──
+
+const UNIT_FACTOR: Record<string, number> = { days: 1440, hours: 60, minutes: 1 }
+
+function unitFactor(unit: string): number {
+  return UNIT_FACTOR[unit] ?? 1
+}
+
+/** 条件行：开关 + 说明 + 数值（可选时间单位）。禁用时写 0，启用时恢复本会话缓存值或默认值。 */
+function SeedConditionRow({
+  enabled,
+  label,
+  onToggle,
+  children,
+}: {
+  enabled: boolean
+  label: string
+  onToggle: (v: boolean) => void
+  children: ReactNode
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <SetSwitch checked={enabled} onCheckedChange={onToggle} />
+      <span className="flex-1 text-[12px] text-text3">{label}</span>
+      {children}
+    </div>
+  )
+}
+
+function SeedingSettings({
+  config,
+  mutate,
+}: {
+  config: ConfigMap
+  mutate: (entries: ConfigMap) => void
+}) {
+  const { t } = useI18n()
+  const seedEnabled = (config.bt_seed_enabled ?? '1') !== '0'
+  const autoReseed = (config.bt_auto_reseed ?? '1') !== '0'
+  const maxActive = Number(config.bt_seed_max_active ?? '0')
+
+  // 与桌面 SettingsProvider 同一编码：值 > 0 = 条件启用；0 = 禁用。
+  const ratio = Number(config.bt_seed_ratio_limit ?? '0')
+  const postRatio = Number(config.bt_seed_post_ratio_limit ?? '0')
+  const timeMinutes = Number(config.bt_seed_time_limit_minutes ?? '0')
+  const inactiveMinutes = Number(config.bt_seed_inactive_time_limit_minutes ?? '0')
+  const timeUnit = config.bt_seed_time_limit_unit ?? 'minutes'
+  const inactiveUnit = config.bt_seed_inactive_time_limit_unit ?? 'minutes'
+  const operator = config.bt_seed_limit_operator === 'and' ? 'and' : 'or'
+  const thenAction = ['delete', 'delete_files'].includes(config.bt_seed_then_action ?? '')
+    ? (config.bt_seed_then_action as string)
+    : 'stop'
+
+  // 本会话内记住关闭前的值，重新启用时恢复（与桌面 *_Cached 语义一致）；默认值同桌面。
+  const ratioCache = useRef(1.0)
+  const postRatioCache = useRef(1.0)
+  const timeCache = useRef(72 * 60)
+  const inactiveCache = useRef(30)
+  if (ratio > 0) ratioCache.current = ratio
+  if (postRatio > 0) postRatioCache.current = postRatio
+  if (timeMinutes > 0) timeCache.current = timeMinutes
+  if (inactiveMinutes > 0) inactiveCache.current = inactiveMinutes
+
+  const unitOptions = [
+    { value: 'minutes', label: t('set.bt.timeUnitMinutes') },
+    { value: 'hours', label: t('set.bt.timeUnitHours') },
+    { value: 'days', label: t('set.bt.timeUnitDays') },
+  ]
+
+  return (
+    <>
+      <div className="set-group">
+        <SetRow title={t('set.bt.seedEnabled')} desc={t('set.bt.seedEnabledDesc')}>
+          <SetSwitch checked={seedEnabled} onCheckedChange={(v) => mutate({ bt_seed_enabled: v ? '1' : '0' })} />
+        </SetRow>
+        <SetRow title={t('set.bt.seedMaxActive')} desc={t('set.bt.seedMaxActiveDesc')}>
+          <NumberInput
+            value={maxActive}
+            min={0}
+            max={999}
+            className="short"
+            onCommit={(n) => mutate({ bt_seed_max_active: String(Math.min(999, Math.max(0, Math.round(n)))) })}
+          />
+        </SetRow>
+        <SetRow title={t('set.bt.autoReseed')} desc={t('set.bt.autoReseedDesc')}>
+          <SetSwitch checked={autoReseed} onCheckedChange={(v) => mutate({ bt_auto_reseed: v ? '1' : '0' })} />
+        </SetRow>
+      </div>
+
+      <div className="set-group">
+        <div className="set-row stack">
+          <div className="set-info">
+            <b>{t('set.bt.seedingTitle')}</b>
+          </div>
+          <SeedConditionRow
+            enabled={ratio > 0}
+            label={t('set.bt.seedRatioLimit')}
+            onToggle={(v) => mutate({ bt_seed_ratio_limit: v ? String(ratioCache.current) : '0' })}
+          >
+            <NumberInput
+              value={ratio > 0 ? ratio : ratioCache.current}
+              min={0}
+              className="short"
+              onCommit={(n) => {
+                if (n > 0) mutate({ bt_seed_ratio_limit: String(n) })
+              }}
+            />
+          </SeedConditionRow>
+          <SeedConditionRow
+            enabled={postRatio > 0}
+            label={t('set.bt.seedPostRatioLimit')}
+            onToggle={(v) => mutate({ bt_seed_post_ratio_limit: v ? String(postRatioCache.current) : '0' })}
+          >
+            <NumberInput
+              value={postRatio > 0 ? postRatio : postRatioCache.current}
+              min={0}
+              className="short"
+              onCommit={(n) => {
+                if (n > 0) mutate({ bt_seed_post_ratio_limit: String(n) })
+              }}
+            />
+          </SeedConditionRow>
+          <SeedConditionRow
+            enabled={timeMinutes > 0}
+            label={t('set.bt.seedTimeLimit')}
+            onToggle={(v) => mutate({ bt_seed_time_limit_minutes: v ? String(timeCache.current) : '0' })}
+          >
+            <NumberInput
+              value={Math.floor((timeMinutes > 0 ? timeMinutes : timeCache.current) / unitFactor(timeUnit))}
+              min={0}
+              className="short"
+              onCommit={(n) => {
+                const minutes = Math.round(n) * unitFactor(timeUnit)
+                if (minutes > 0) mutate({ bt_seed_time_limit_minutes: String(minutes) })
+              }}
+            />
+            <SetSelect
+              width={92}
+              value={timeUnit}
+              onValueChange={(v) => mutate({ bt_seed_time_limit_unit: v })}
+              options={unitOptions}
+            />
+          </SeedConditionRow>
+          <SeedConditionRow
+            enabled={inactiveMinutes > 0}
+            label={t('set.bt.seedInactiveTimeLimit')}
+            onToggle={(v) => mutate({ bt_seed_inactive_time_limit_minutes: v ? String(inactiveCache.current) : '0' })}
+          >
+            <NumberInput
+              value={Math.floor((inactiveMinutes > 0 ? inactiveMinutes : inactiveCache.current) / unitFactor(inactiveUnit))}
+              min={0}
+              className="short"
+              onCommit={(n) => {
+                const minutes = Math.round(n) * unitFactor(inactiveUnit)
+                if (minutes > 0) mutate({ bt_seed_inactive_time_limit_minutes: String(minutes) })
+              }}
+            />
+            <SetSelect
+              width={92}
+              value={inactiveUnit}
+              onValueChange={(v) => mutate({ bt_seed_inactive_time_limit_unit: v })}
+              options={unitOptions}
+            />
+          </SeedConditionRow>
+          <div className="flex items-center gap-2">
+            <span className="flex-1 text-[12px] text-text3">{t('set.bt.seedConditionsOperator')}</span>
+            <SetSelect
+              width={140}
+              value={operator}
+              onValueChange={(v) => mutate({ bt_seed_limit_operator: v })}
+              options={[
+                { value: 'or', label: t('set.bt.seedOperatorOr') },
+                { value: 'and', label: t('set.bt.seedOperatorAnd') },
+              ]}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="flex-1 text-[12px] text-text3">{t('set.bt.seedThenAction')}</span>
+            <SetSelect
+              width={140}
+              value={thenAction}
+              onValueChange={(v) => mutate({ bt_seed_then_action: v })}
+              options={[
+                { value: 'stop', label: t('set.bt.seedStopSeeding') },
+                { value: 'delete', label: t('set.bt.seedDeleteTask') },
+                { value: 'delete_files', label: t('set.bt.seedDeleteTaskAndFiles') },
+              ]}
+            />
+          </div>
+        </div>
+      </div>
+    </>
+  )
 }
 
 /** 展开式多行编辑器：本地草稿态 + 显式「确定 / 取消」，避免失焦静默提交让用户无从判断是否保存。 */
@@ -238,6 +433,8 @@ export function BitTorrentSettings({
           ) : null}
         </div>
       </div>
+
+      <SeedingSettings config={config} mutate={mutate} />
 
       <p className="set-note">{t('set.bt.restartNote')}</p>
     </>

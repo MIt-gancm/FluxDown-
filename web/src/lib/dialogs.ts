@@ -42,3 +42,19 @@ export const renameTaskStore = new Store<RenameTaskPayload | null>(null)
 export function openRenameTask(payload: RenameTaskPayload) {
   renameTaskStore.set(payload)
 }
+
+/** 做种限制对话框的触发载荷：当前任务的哨兵编码原值（-2/-1/>=0，见 types.ts TaskDto）。 */
+export interface SeedLimitsPayload {
+  taskId: string
+  ratioLimitMilli: number
+  postRatioLimitMilli: number
+  seedTimeLimitMinutes: number
+  inactiveTimeLimitMinutes: number
+  uploadLimitBps: number
+}
+
+export const seedLimitsStore = new Store<SeedLimitsPayload | null>(null)
+
+export function openSeedLimits(payload: SeedLimitsPayload) {
+  seedLimitsStore.set(payload)
+}

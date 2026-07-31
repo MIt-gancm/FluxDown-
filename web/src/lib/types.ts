@@ -34,8 +34,28 @@ export interface TaskDto {
   /** 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）；旧服务端可能缺省 */
   queueOrder?: number
   /** Auto 代理模式的路由标签（direct / direct:sampled / direct:pinned / proxy:cached /
-   *  proxy:sampled / proxy:failover；空 = 非 Auto 模式）；旧服务端可能缺省 */
+   *  proxy:sampled / proxy:failover；代理类标签带 `:system`/`:manual` 来源后缀；
+   *  空 = 非 Auto 模式）；旧服务端可能缺省 */
   autoRoute?: string
+  /** BT 做种累计上传字节数（非 BT 恒 0）；旧服务端可能缺省 */
+  uploadedBytes?: number
+  /** 下载完成瞬间的累计上传基准（做种后分享率分子基线）；旧服务端可能缺省 */
+  uploadedAtCompletion?: number
+  /** 0=none, 1=做种中, 2=分享率达标, 3=时长达标, 4=手动停止, 5=已删除,
+   *  6=会话释放, 7=不活跃达标, 8=排队做种；旧服务端可能缺省 */
+  seedingStatus?: number
+  /** 做种停止原因的人类可读描述（空 = 无） */
+  seedingMessage?: string
+  /** 引擎权威累计做种秒数（排队/暂停不计） */
+  seedingTimeSecs?: number
+  /** 任务级做种限制哨兵：-2=跟随全局，-1=不限制，>=0=自定义（分享率千分比，0 视同不限制） */
+  seedRatioLimitMilli?: number
+  seedPostRatioLimitMilli?: number
+  /** 同上，单位分钟 */
+  seedTimeLimitMinutes?: number
+  seedInactiveTimeLimitMinutes?: number
+  /** 任务级做种上传限速（B/s，0 = 不限），下次 torrent 挂载时生效 */
+  seedUploadLimitBps?: number
 }
 
 /** 任务组行（多文件下载的纯逻辑聚合壳）。 */
@@ -126,6 +146,8 @@ export interface QueueDto {
   queueId: string
   name: string
   speedLimitKbps: number
+  /** 队列级 BT 上传限速 KB/s，0 = 不限制；已激活任务下次启动时生效。 */
+  uploadLimitKbps: number
   maxConcurrent: number
   defaultSaveDir: string
   position: number
@@ -358,6 +380,15 @@ export interface TaskProgressMsg {
   saveDir: string
   url: string
   errorMessage: string
+  /** BT 做种上传速率 B/s（server >= 本版新增；旧服务端缺省） */
+  uploadSpeed?: number
+  /** BT 做种累计上传字节数 */
+  uploadedBytes?: number
+  /** 做种状态码（语义同 TaskDto.seedingStatus） */
+  seedingStatus?: number
+  seedingMessage?: string
+  /** 发帧时刻的累计做种秒数 */
+  seedingTimeSecs?: number
 }
 
 export interface SegmentProgressMsg {
@@ -413,6 +444,16 @@ export type WsClientMsg =
   | { type: 'hlsSelection'; taskId: string; selectedIndex: number }
   | { type: 'btSelection'; taskId: string; selectedIndices: number[] }
   | { type: 'selectVariant'; taskId: string; selectedIndex: number }
+  /** 任务级做种限制（哨兵 -2/-1/>=0；分享率千分比、时长分钟；uploadLimitBps 0=不限） */
+  | {
+      type: 'setTaskSeedLimits'
+      taskId: string
+      ratioLimitMilli: number
+      postRatioLimitMilli: number
+      seedTimeLimitMinutes: number
+      inactiveTimeLimitMinutes: number
+      uploadLimitBps: number
+    }
   | { type: 'ping' }
 
 // ---- 扩展 REST ----
@@ -441,6 +482,7 @@ export interface TrackerSubRefreshResponse {
 export interface CreateQueueRequest {
   name: string
   speedLimitKbps?: number
+  uploadLimitKbps?: number
   maxConcurrent?: number
   defaultSaveDir?: string
   defaultSegments?: number

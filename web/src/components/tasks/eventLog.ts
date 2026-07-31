@@ -5,7 +5,7 @@
 
 import { t } from '../../lib/i18n'
 import { fmtBytes } from '../../lib/format'
-import { cdnEventStore, liveStore, splitStore, Store } from '../../lib/ws'
+import { cdnEventStore, liveStore, routeEventStore, splitStore, Store } from '../../lib/ws'
 import type { TaskCdnEventMsg, TaskStatus } from '../../lib/types'
 
 export interface LogEntry {
@@ -155,4 +155,43 @@ cdnEventStore.subscribe(() => {
   }
   lastLeasesEntry.delete(e.taskId)
   push(e.taskId, message)
+})
+
+/** Auto 代理路由 wire 标签 → i18n key（详情面板「链路」行与日志条目共用；
+ *  未知值原样显示，向前兼容）。 */
+const ROUTE_LABEL_KEYS: Record<string, import('../../lib/i18n').I18nKey> = {
+  direct: 'detail.route.direct',
+  'direct:sampled': 'detail.route.directSampled',
+  'direct:pinned': 'detail.route.directPinned',
+  'proxy:cached': 'detail.route.proxyCached',
+  'proxy:sampled': 'detail.route.proxySampled',
+  'proxy:failover': 'detail.route.proxyFailover',
+}
+
+/** wire 标签 → 本地化链路文案；代理类标签的 `:system`/`:manual` 来源后缀
+ *  解析为「· 系统代理 / · 手动代理」（与桌面 taskRouteLabel 逐条对齐）。 */
+export function routeLabel(route: string): string {
+  let base = route
+  let via: string | null = null
+  if (route.endsWith(':system')) {
+    base = route.slice(0, -7)
+    via = t('detail.route.viaSystem')
+  } else if (route.endsWith(':manual')) {
+    base = route.slice(0, -7)
+    via = t('detail.route.viaManual')
+  }
+  const key = ROUTE_LABEL_KEYS[base]
+  const label = key ? t(key) : route
+  return via ? `${label} · ${via}` : label
+}
+
+/** 每任务本会话最后记录的链路标签：连续重复去重（引擎每次任务启动都会
+ *  重播基线，含 direct——Auto 任务必有一条最终链路记录，重复不刷屏）。 */
+const lastRouteLogged = new Map<string, string>()
+
+routeEventStore.subscribe(() => {
+  const e = routeEventStore.get()
+  if (!e || !e.route || lastRouteLogged.get(e.taskId) === e.route) return
+  lastRouteLogged.set(e.taskId, e.route)
+  push(e.taskId, t('event.routeDecided', { label: routeLabel(e.route) }))
 })

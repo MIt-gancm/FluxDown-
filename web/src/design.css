@@ -924,14 +924,56 @@ body {
   height: 32px; padding: 0 14px;
   background: var(--surface); border-top: 1px solid var(--border);
   font-size: 11.5px; color: var(--text3); font-variant-numeric: tabular-nums;
+  /* 窄宽度策略：不换行、按重要度隐藏低优先项。footer 有效宽度取决于侧栏/详情
+     面板占位而非视口，媒体查询失真——以自身为容器做容器查询。 */
+  flex-wrap: nowrap; overflow: hidden;
+  container-type: inline-size; container-name: statusbar;
 }
-.sb-item { display: flex; align-items: center; gap: 6px; }
+.sb-item { display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap; }
 .sb-item svg { width: 13px; height: 13px; }
 .sb-item.accent { color: var(--accent); font-weight: 600; }
 .sb-item b { font-weight: 600; color: var(--text2); }
 .sb-item.accent b { color: var(--accent); }
 .sb-scope, .sb-view-state { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.sb-scope { flex-shrink: 1; }
+/* 磁盘项：目录路径可能很长，限宽省略；作用域/版本/摘要/磁盘按重要度依次隐藏 */
+.sb-disk .sb-ellip { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@container statusbar (max-width: 1240px) { .sb-scope { display: none; } }
+@container statusbar (max-width: 1020px) { .sb-ver { display: none; } .sb-disk .sb-ellip { max-width: 170px; } }
+@container statusbar (max-width: 840px) { .sb-sum { display: none; } .sb-disk { display: none; } }
+@container statusbar (max-width: 620px) { .sb-scope, .sb-sum, .sb-ver, .sb-disk { display: none; } }
+/* 极窄（侧栏+详情面板同时占位）：只留速度与快捷 chips，状态文字隐去保留圆点 */
+@container statusbar (max-width: 400px) { .sb-status-label { display: none; } .statusbar { gap: 10px; } }
 .sb-view-state { font-style: italic; }
+
+/* 状态栏快捷设置 chip（限速 / 代理模式）：与 sb-item 同形态的可点击触发器 */
+.sbq-chip {
+  background: none; border: 0; padding: 0; font: inherit; color: inherit;
+  cursor: pointer; white-space: nowrap;
+}
+.sbq-chip:hover { color: var(--text2); }
+.sbq-chip.accent:hover { color: var(--accent); }
+/* 弹层内选项行（代理模式）：与 ctx-item 同语言，选中底色 + 行尾对勾 */
+.sbq-option {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 9px; margin: 1px 0; border-radius: 7px;
+  font-size: 12.5px; color: var(--text2); cursor: pointer; outline: none;
+}
+.sbq-option:hover, .sbq-option[data-highlighted] { background: var(--surface2); }
+.sbq-option.active { background: var(--surface2); }
+.sbq-option.muted { color: var(--text3); }
+/* 迷你开关（限速弹层区块标题行） */
+.sbq-switch {
+  width: 30px; height: 16px; border-radius: 999px; border: 0; padding: 2px;
+  background: var(--track); cursor: pointer; display: inline-flex; align-items: center;
+  transition: background .12s ease;
+}
+.sbq-switch i {
+  width: 12px; height: 12px; border-radius: 50%; background: #fff;
+  transition: transform .12s ease; display: block;
+}
+.sbq-switch.on { background: var(--accent); }
+.sbq-switch.on i { transform: translateX(14px); }
 
 /* ---------- 详情面板 ---------- */
 

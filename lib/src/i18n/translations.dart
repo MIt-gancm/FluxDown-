@@ -370,6 +370,7 @@ class S {
   String get detailSplitProactive => _r('detailSplitProactive');
   String get detailSplitReactive => _r('detailSplitReactive');
   String get detailLogCompleted => _r('detailLogCompleted');
+  String detailLogRoute(String label) => _r('detailLogRoute', {'label': label});
   String detailLogFailed(String message) =>
       _r('detailLogFailed', {'message': message});
   String detailLogCdnPool(String host, int n) =>
@@ -987,6 +988,8 @@ class S {
   String get taskRouteProxyCached => _r('taskRouteProxyCached');
   String get taskRouteProxySampled => _r('taskRouteProxySampled');
   String get taskRouteProxyFailover => _r('taskRouteProxyFailover');
+  String get taskRouteViaSystem => _r('taskRouteViaSystem');
+  String get taskRouteViaManual => _r('taskRouteViaManual');
 
   // 任务级代理选择(footer 快切 / 新建下载对话框)
   String get taskProxyChoiceFollow => _r('taskProxyChoiceFollow');
@@ -1000,16 +1003,29 @@ class S {
   String get statusBarProxyLabel => _r('statusBarProxyLabel');
   String get proxyConfigureInSettings => _r('proxyConfigureInSettings');
 
-  /// Auto 代理链路 wire 标签 → 本地化文案；未知值原样返回。
-  String taskRouteLabel(String route) => switch (route) {
-    'direct' => taskRouteDirect,
-    'direct:sampled' => taskRouteDirectSampled,
-    'direct:pinned' => taskRouteDirectPinned,
-    'proxy:cached' => taskRouteProxyCached,
-    'proxy:sampled' => taskRouteProxySampled,
-    'proxy:failover' => taskRouteProxyFailover,
-    _ => route,
-  };
+  /// Auto 代理链路 wire 标签 → 本地化文案；代理类标签的 `:system`/`:manual`
+  /// 来源后缀解析为「· 系统代理 / · 手动代理」，未知值原样返回。
+  String taskRouteLabel(String route) {
+    var base = route;
+    String? via;
+    if (route.endsWith(':system')) {
+      base = route.substring(0, route.length - 7);
+      via = taskRouteViaSystem;
+    } else if (route.endsWith(':manual')) {
+      base = route.substring(0, route.length - 7);
+      via = taskRouteViaManual;
+    }
+    final label = switch (base) {
+      'direct' => taskRouteDirect,
+      'direct:sampled' => taskRouteDirectSampled,
+      'direct:pinned' => taskRouteDirectPinned,
+      'proxy:cached' => taskRouteProxyCached,
+      'proxy:sampled' => taskRouteProxySampled,
+      'proxy:failover' => taskRouteProxyFailover,
+      _ => route,
+    };
+    return via == null ? label : '$label · $via';
+  }
   String get proxyType => _r('proxyType');
   String get proxyHost => _r('proxyHost');
   String get proxyHostPlaceholder => _r('proxyHostPlaceholder');

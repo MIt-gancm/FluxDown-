@@ -78,7 +78,7 @@ export function GroupCountsLine({ counts, eta, onJumpToFail }: { counts: GroupMe
 
 export function GroupRow({ group, members, density = 'comfortable' }: { group: GroupDto; members: ViewTask[]; density?: ViewDensity }) {
   const { t } = useI18n()
-  const { expandedGroups, toggleGroupExpand, jumpToGroupMember, selectGroup, selectedGroupId } = useTasksUi()
+  const { expandedGroups, toggleGroupExpand, jumpToGroupMember, selectGroup, closeGroupDetail, selectedGroupId, groupDetailOpen } = useTasksUi()
   const qc = useQueryClient()
   const invalidateTasks = () => qc.invalidateQueries({ queryKey: ['tasks'] })
   const pauseMut = useMutation({ mutationFn: () => api.pauseGroup(group.groupId), onSuccess: invalidateTasks })
@@ -112,7 +112,7 @@ export function GroupRow({ group, members, density = 'comfortable' }: { group: G
     >
       <div
         className={cn('grow', density === 'compact' && 'compact', done && 'done', selectedGroupId === group.groupId && 'selected')}
-        onClick={() => selectGroup(group.groupId)}
+        onClick={() => (selectedGroupId === group.groupId && groupDetailOpen ? closeGroupDetail() : selectGroup(group.groupId))}
       >
         <span
           className="grow-chevron"

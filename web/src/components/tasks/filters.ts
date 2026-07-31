@@ -3,25 +3,29 @@
 // （渲染任务列表用）会同时叠加 tab + 分类 + 队列 + 搜索四个维度。
 
 import { passesCategory, type Category } from '../../lib/categories'
+import { isSeeding } from '../../lib/seeding'
 import type { TaskStatus } from '../../lib/types'
 import type { ViewTask } from './useViewTasks'
 
-export type StatusTab = 'all' | 'downloading' | 'completed' | 'paused' | 'error'
+export type StatusTab = 'all' | 'downloading' | 'completed' | 'paused' | 'error' | 'seeding'
 
 /** 下载中 Tab 归并 pending(0) / downloading(1) / preparing(5)；其余 Tab 各对应单一状态码。 */
-const TAB_STATUSES: Record<Exclude<StatusTab, 'all'>, readonly TaskStatus[]> = {
+const TAB_STATUSES: Record<Exclude<StatusTab, 'all' | 'seeding'>, readonly TaskStatus[]> = {
   downloading: [0, 1, 5],
   completed: [3],
   paused: [2],
   error: [4],
 }
 
-export function matchesStatusTab(tab: StatusTab, status: TaskStatus): boolean {
-  return tab === 'all' || TAB_STATUSES[tab].includes(status)
+/** 做种 Tab 看 (status, seedingStatus) 组合，需要整个任务对象。 */
+export function matchesStatusTabTask(tab: StatusTab, t: ViewTask): boolean {
+  if (tab === 'all') return true
+  if (tab === 'seeding') return isSeeding(t)
+  return TAB_STATUSES[tab].includes(t.status)
 }
 
 export function countByStatusTab(tasks: ViewTask[], tab: StatusTab): number {
-  return tab === 'all' ? tasks.length : tasks.filter((t) => matchesStatusTab(tab, t.status)).length
+  return tab === 'all' ? tasks.length : tasks.filter((t) => matchesStatusTabTask(tab, t)).length
 }
 
 export interface TaskFilters {
@@ -41,7 +45,7 @@ export interface TaskFilters {
 export function filterTasks(tasks: ViewTask[], f: TaskFilters): ViewTask[] {
   const q = f.search.trim().toLowerCase()
   return tasks.filter((t) => {
-    if (!matchesStatusTab(f.statusTab, t.status)) return false
+    if (!matchesStatusTabTask(f.statusTab, t)) return false
     if (!passesCategory(t, f.categoryFilter, f.categories)) return false
     if (f.queueFilter !== 'all' && t.queueId !== f.queueFilter) return false
     if (q) {

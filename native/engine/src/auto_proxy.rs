@@ -76,7 +76,13 @@ const NO_SWITCH_TTL: Duration = Duration::from_secs(1800);
 // ---------------------------------------------------------------------------
 
 /// `tasks.auto_route` 的 wire 标签。空串 = 非 Auto 模式（或任务尚未启动过）。
+///
+/// 代理类标签带候选来源后缀 `:system`（系统代理检测）/ `:manual`（手动
+/// 字段回退），UI 通用解析后缀展示「最终用的是谁」；无后缀的裸标签是
+/// 旧库存量值，语义不变。
 pub mod route {
+    use super::CandidateSource;
+
     /// Auto 直连（默认路径，未采样或守卫未命中）。
     pub const DIRECT: &str = "direct";
     /// 采样过，直连胜（代理无优势/采样失败）。
@@ -89,6 +95,49 @@ pub mod route {
     pub const PROXY_CACHED: &str = "proxy:cached";
     /// 直连失败后经代理自动重试（failover）。
     pub const PROXY_FAILOVER: &str = "proxy:failover";
+    /// 带来源后缀的代理标签（base × {system,manual}，全部静态）。
+    pub const PROXY_SAMPLED_SYSTEM: &str = "proxy:sampled:system";
+    pub const PROXY_SAMPLED_MANUAL: &str = "proxy:sampled:manual";
+    pub const PROXY_CACHED_SYSTEM: &str = "proxy:cached:system";
+    pub const PROXY_CACHED_MANUAL: &str = "proxy:cached:manual";
+    pub const PROXY_FAILOVER_SYSTEM: &str = "proxy:failover:system";
+    pub const PROXY_FAILOVER_MANUAL: &str = "proxy:failover:manual";
+
+    /// 代理基础标签 + 候选来源 → 带后缀标签（非代理基础标签原样返回）。
+    pub fn with_source(base: &'static str, source: CandidateSource) -> &'static str {
+        match (base, source) {
+            (PROXY_SAMPLED, CandidateSource::System) => PROXY_SAMPLED_SYSTEM,
+            (PROXY_SAMPLED, CandidateSource::ManualFields) => PROXY_SAMPLED_MANUAL,
+            (PROXY_CACHED, CandidateSource::System) => PROXY_CACHED_SYSTEM,
+            (PROXY_CACHED, CandidateSource::ManualFields) => PROXY_CACHED_MANUAL,
+            (PROXY_FAILOVER, CandidateSource::System) => PROXY_FAILOVER_SYSTEM,
+            (PROXY_FAILOVER, CandidateSource::ManualFields) => PROXY_FAILOVER_MANUAL,
+            _ => base,
+        }
+    }
+
+    /// 任意代理标签 → failover 变体（保留来源后缀；非代理标签原样返回）。
+    pub fn to_failover(label: &'static str) -> &'static str {
+        if !label.starts_with("proxy") {
+            return label;
+        }
+        if label.ends_with(":system") {
+            PROXY_FAILOVER_SYSTEM
+        } else if label.ends_with(":manual") {
+            PROXY_FAILOVER_MANUAL
+        } else {
+            PROXY_FAILOVER
+        }
+    }
+}
+
+/// Auto 候选代理的来源（决定 wire 标签后缀，供 UI 展示「最终用的是谁」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateSource {
+    /// 系统代理检测命中（Windows 注册表等）。
+    System,
+    /// 无系统代理，回退用户已填的手动地址字段。
+    ManualFields,
 }
 
 // ---------------------------------------------------------------------------
@@ -162,19 +211,20 @@ impl DecisionCache {
 
 /// 解析 Auto 模式的候选代理：优先系统代理，无系统代理时回退用户已填的
 /// 手动地址字段。两者皆无 → `None`（Auto 完全等价直连，零开销短路）。
+/// 附带候选来源，决定 wire 标签后缀。
 ///
 /// 仅对 `mode == Auto` 的配置有意义；其余模式恒返回 `None`。
-pub fn resolve_candidate(config: &ProxyConfig) -> Option<ProxyConfig> {
+pub fn resolve_candidate(config: &ProxyConfig) -> Option<(ProxyConfig, CandidateSource)> {
     if config.mode != ProxyMode::Auto {
         return None;
     }
     if let Ok(Some(sys)) = detect_system_proxy() {
-        return Some(sys);
+        return Some((sys, CandidateSource::System));
     }
     if !config.host.is_empty() && config.port != 0 {
         let mut manual = config.clone();
         manual.mode = ProxyMode::Manual;
-        return Some(manual);
+        return Some((manual, CandidateSource::ManualFields));
     }
     None
 }
@@ -195,6 +245,8 @@ pub struct AutoProxyCtx {
     /// 任务解析后的有效 UA（任务 > 队列 > 全局），切换 client 与采样
     /// client 与任务 client 保持一致。
     pub user_agent: String,
+    /// 候选代理来源（决定切换后 wire 标签的 `:system`/`:manual` 后缀）。
+    pub source: CandidateSource,
 }
 
 // ---------------------------------------------------------------------------
@@ -497,15 +549,17 @@ impl AutoSwitchState {
     }
 
     /// 构建代理 client 并原子替换 NodePool 的服务节点。失败降级为冷却
-    /// （保持直连，任务不受影响）。
+    /// （保持直连，任务不受影响）。`base` 是不带来源后缀的代理基础标签，
+    /// 此处按候选来源补 `:system`/`:manual` 后缀。
     async fn apply_switch(
         &mut self,
         nodes: &Arc<NodePool>,
         db: &Db,
         sink: &dyn EventSink,
         task_id: &str,
-        label: &str,
+        base: &'static str,
     ) {
+        let label = route::with_source(base, self.ctx.source);
         match crate::downloader::build_client_with_tls_policy(
             &self.ctx.candidate,
             &self.ctx.user_agent,
@@ -528,6 +582,12 @@ impl AutoSwitchState {
 
     /// 路由落库 + 事件广播（详情面板可追溯的唯一事实源）。
     async fn publish(&self, db: &Db, sink: &dyn EventSink, task_id: &str, label: &str) {
+        log_info!(
+            "[auto-proxy] task {} host {} 链路定论: {}",
+            task_id,
+            self.ctx.host,
+            label
+        );
         if let Err(e) = db.set_task_auto_route(task_id, label).await {
             log_error!("[auto-proxy] task {} 路由落库失败: {e:#}", task_id);
         }
@@ -596,6 +656,7 @@ mod tests {
             cache: cache.clone(),
             host: "example.com".to_string(),
             user_agent: String::new(),
+            source: CandidateSource::ManualFields,
         }));
         state.backdate(MIN_RUNTIME + Duration::from_secs(5));
         state
@@ -659,14 +720,18 @@ mod tests {
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(task.auto_route, route::PROXY_CACHED, "路由必须落库");
+        assert_eq!(
+            task.auto_route,
+            route::PROXY_CACHED_MANUAL,
+            "路由必须落库（带候选来源后缀）"
+        );
         {
             let events = sink.0.lock().unwrap();
             assert!(
                 matches!(
                     events.as_slice(),
                     [EngineEvent::TaskRouteChanged { task_id, route }]
-                        if task_id == "t-auto" && route == route::PROXY_CACHED
+                        if task_id == "t-auto" && route == route::PROXY_CACHED_MANUAL
                 ),
                 "必须恰好广播一条 TaskRouteChanged"
             );
@@ -866,18 +931,45 @@ mod tests {
         // 系统代理则返回系统代理——两者皆为合法 Some，此处只断言不为空
         // 且模式已具体化（绝不把 Auto 原样漏出去）。
         let cfg = auto_config("127.0.0.1", 7890);
-        let resolved = resolve_candidate(&cfg).expect("有手动字段应有候选");
+        let (resolved, source) = resolve_candidate(&cfg).expect("有手动字段应有候选");
         assert_eq!(resolved.mode, ProxyMode::Manual);
+        // 非 Windows 恒为手动字段回退；Windows 命中系统代理时是 System。
+        assert!(matches!(
+            source,
+            CandidateSource::ManualFields | CandidateSource::System
+        ));
     }
 
     #[test]
     fn resolve_candidate_empty_fields_may_yield_none() {
         let cfg = auto_config("", 0);
         // 无手动字段时取决于系统代理；但绝不能返回 Auto 模式的原始配置。
-        if let Some(resolved) = resolve_candidate(&cfg) {
+        if let Some((resolved, _source)) = resolve_candidate(&cfg) {
             assert_eq!(resolved.mode, ProxyMode::Manual);
             assert!(!resolved.host.is_empty());
         }
+    }
+
+    // ---- 路由标签组合 --------------------------------------------------------
+
+    #[test]
+    fn route_source_suffix_composition() {
+        use route::*;
+        assert_eq!(
+            with_source(PROXY_SAMPLED, CandidateSource::System),
+            PROXY_SAMPLED_SYSTEM
+        );
+        assert_eq!(
+            with_source(PROXY_CACHED, CandidateSource::ManualFields),
+            PROXY_CACHED_MANUAL
+        );
+        // 非代理基础标签不带后缀。
+        assert_eq!(with_source(DIRECT, CandidateSource::System), DIRECT);
+        // failover 变体保留来源后缀；裸标签（旧库存量）不造假来源。
+        assert_eq!(to_failover(PROXY_CACHED_SYSTEM), PROXY_FAILOVER_SYSTEM);
+        assert_eq!(to_failover(PROXY_SAMPLED_MANUAL), PROXY_FAILOVER_MANUAL);
+        assert_eq!(to_failover(PROXY_CACHED), PROXY_FAILOVER);
+        assert_eq!(to_failover(DIRECT), DIRECT);
     }
 
     // ---- failover 错误分类 ---------------------------------------------------

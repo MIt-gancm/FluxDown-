@@ -9,6 +9,7 @@ import { cn } from '../../lib/cn'
 import { fileType, fmtBytes, fmtEta, fmtSpeed, fmtTime, protoLabel, queueDisplayName, taskShareUrl, type FileType as FT } from '../../lib/format'
 import { translateBackendMessage, useI18n } from '../../lib/i18n'
 import { extractSiteLabel } from '../../lib/site'
+import { isSeeding, isSeedingStopped, seedRatio, seedingStatusKey } from '../../lib/seeding'
 import { priorityStore, useStore, useTaskPluginActivity } from '../../lib/ws'
 import type { QueueDto } from '../../lib/types'
 import type { TaskColumnId, ViewDensity } from '../../lib/view-prefs'
@@ -65,12 +66,37 @@ function TaskMeta({ t }: { t: ViewTask }) {
       </>
     )
   }
+  if (isSeeding(t)) {
+    return (
+      <>
+        <span className="ok">{tr((t.seedingStatus ?? 0) === 8 ? 'status.seedingQueued' : 'status.seeding')}</span>
+        {sep}
+        <span>{fmtBytes(t.totalBytes)}</span>
+        {t.uploadSpeed > 0 && (
+          <>
+            {sep}
+            <span className="speed">↑ {fmtSpeed(t.uploadSpeed)}</span>
+          </>
+        )}
+        {sep}
+        <span>
+          {tr('detail.seedRatio')} {seedRatio(t).toFixed(2)}
+        </span>
+      </>
+    )
+  }
   if (t.status === 3) {
     return (
       <>
         <span className="ok">{tr('status.completed')}</span>
         {sep}
         <span>{fmtBytes(t.totalBytes)}</span>
+        {isSeedingStopped(t) && t.seedingMessage && (
+          <>
+            {sep}
+            <span>{tr(seedingStatusKey(t.seedingStatus ?? 0))}</span>
+          </>
+        )}
         {pluginActive && (
           <>
             {sep}
@@ -167,6 +193,36 @@ export function TaskActionButton({
         )}
       </>
     )
+  // 做种中（活跃/排队）→ 暂停（停止做种）；因限制/手动/会话释放停止 → 继续做种。
+  // 均复用 pause/continue API（无独立做种端点），对齐桌面 §3。
+  if (isSeeding(t))
+    return (
+      <button
+        type="button"
+        className="task-act"
+        title={tr('task.pause')}
+        onClick={(e) => {
+          e.stopPropagation()
+          onPause()
+        }}
+      >
+        <Pause size={15} />
+      </button>
+    )
+  if (isSeedingStopped(t))
+    return (
+      <button
+        type="button"
+        className="task-act"
+        title={tr('task.resumeSeeding')}
+        onClick={(e) => {
+          e.stopPropagation()
+          onContinue()
+        }}
+      >
+        <Play size={15} />
+      </button>
+    )
   return (
     <span className="task-act done">
       <Check size={15} />
@@ -214,7 +270,7 @@ export function TaskRow({
   columns?: Set<TaskColumnId>
 }) {
   const { t: tr } = useI18n()
-  const { selectTask, currentTaskId, selected, setSelected } = useTasksUi()
+  const { selectTask, closeDetail, currentTaskId, detailOpen, selected, setSelected } = useTasksUi()
   const priority = useStore(priorityStore)
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['tasks'] })
@@ -244,14 +300,17 @@ export function TaskRow({
     <TaskContextMenu
       task={t}
       queues={queues}
-      onSelect={() => selectTask(t.taskId)}
       onPause={() => pauseMut.mutate()}
       onContinue={() => continueMut.mutate()}
       onBoost={() => boostMut.mutate()}
       onDelete={(deleteFiles) => deleteMut.mutate(deleteFiles)}
       onMove={(queueId) => moveMut.mutate(queueId)}
     >
-      <div className={cn('task-row', density === 'compact' && 'compact', currentTaskId === t.taskId && 'selected')} onClick={() => selectTask(t.taskId)}>
+      <div
+        className={cn('task-row', density === 'compact' && 'compact', currentTaskId === t.taskId && 'selected')}
+        // 左键单击打开详情；再次点击已选中的行 = 关闭（右键不经这里，不影响面板）。
+        onClick={() => (currentTaskId === t.taskId && detailOpen ? closeDetail() : selectTask(t.taskId))}
+      >
         <label className="mcheck trow-check" onClick={(e) => e.stopPropagation()}>
           <input type="checkbox" checked={selected.has(t.taskId)} onChange={(e) => toggleSelected(e.target.checked)} />
           <i />
