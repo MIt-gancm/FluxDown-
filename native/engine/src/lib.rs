@@ -33,6 +33,8 @@ pub mod model;
 pub mod plugin;
 mod proc;
 pub mod proxy_config;
+/// `ProxyMode::Auto` 路由决策的跨重启先验（host 级采样结论持久化）。
+pub mod route_health;
 /// RSS 订阅自动下载（feed 轮询 → 规则过滤 → 建任务）。
 pub mod rss;
 pub mod segment_advisor;
@@ -186,6 +188,8 @@ impl Engine {
         segment_coordinator::load_domain_conn_caps(&db).await;
         // 读回持久化的 CDN 节点健康度（多节点聚合的跨任务先验，同上范式）。
         cdn::health::load_cdn_health(&db).await;
+        // 读回持久化的 Auto 代理路由先验（换网/过期/旧版本在加载时丢弃）。
+        route_health::load(&db).await;
         // 读回云端下发的 resolver 端点清单（空/非法 → 内置 baseline）。
         cdn::resolver::load_endpoints_from_config(&db).await;
         // 读回云端下发的 ECS 探测子网与 hints base（P2；空 = 各自禁用）。

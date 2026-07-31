@@ -9,11 +9,18 @@
 //! 代理单连接吞吐 ≥ 2× 直连单连接均速才热切换（[`NodePool`] 换 SYS
 //! client，新分段自然走代理，已下字节零丢弃）。
 //!
-//! # 决策缓存
+//! # 决策缓存（两层，风险不对称）
 //!
-//! 决策以 host 为 key 缓存在内存（[`DecisionCache`]），**不落库**——网络
-//! 环境易变，持久化过期决策比重探更伤；重启清零回到直连是特性。
-//! 同 host 批量任务只探测一次：胜者写租约，后续任务启动即采纳。
+//! 决策以 host 为 key 缓存在内存（[`DecisionCache`]），租约制——网络环境
+//! 易变，重启清零回到直连是特性。同 host 批量任务只探测一次：胜者写租约，
+//! 后续任务启动即采纳。跨重启另有 [`crate::route_health`] 持久化先验，
+//! 三态消费（见 `RouteHint`）：Cooldown/NoSwitch 落盘（过期无害，指数
+//! 退避抑制重复采样）；Proxy 胜绩单日仅作加速信号（缩短 [`MIN_RUNTIME`]
+//! 等待期，直连起飞保留多 CDN 聚合资格），≥2 个「不同天」确认且 72h 内
+//! 有实证胜出的 host 直接以代理起飞（AdoptProxy，**显式让出 CDN 聚合
+//! 资格**换零慢速窗口）。「持久化代理决策 + 代理失效」的锁死由两道
+//! 自愈闭环杜绝：反向 failover（连接类失败作废先验）+ 72h 实证重验
+//! （降档直连重比）。
 //!
 //! # 完整性防线（前置，不做事后回退）
 //!
@@ -45,6 +52,12 @@ use crate::proxy_config::{ProxyConfig, ProxyMode, detect_system_proxy};
 
 /// 任务须运行满该时长才允许采样——排除 coordinator 爬升期的假慢。
 const MIN_RUNTIME: Duration = Duration::from_secs(10);
+
+/// 持久化先验记录该 host 有代理胜绩时的采样等待期（加速重评估；起飞
+/// 路由不变）。下限须跨过 coordinator 至少 3 个完整 ramp tick（2s/tick，
+/// 起步 2 连接逐档爬升）——再短会把爬升期的假慢当证据，系统性偏置
+/// AdoptProxy 的确认计分。
+const FAST_REEVAL_MIN_RUNTIME: Duration = Duration::from_secs(6);
 
 /// 「慢」的绝对阈值（字节/秒）。总吞吐低于它才考虑采样。
 const SLOW_BPS: f64 = 512.0 * 1024.0;
@@ -247,6 +260,9 @@ pub struct AutoProxyCtx {
     pub user_agent: String,
     /// 候选代理来源（决定切换后 wire 标签的 `:system`/`:manual` 后缀）。
     pub source: CandidateSource,
+    /// 持久化先验有该 host 的代理胜绩——缩短采样等待期（见
+    /// [`FAST_REEVAL_MIN_RUNTIME`]）。
+    pub fast_reeval: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -312,27 +328,58 @@ async fn probe_proxy(
         let validators_ok = (task_etag.is_empty() || task_etag == probe_etag)
             && (task_last_modified.is_empty() || task_last_modified == probe_lm);
         // 读满 256KB 或流结束（服务器无视 Range 回 200 时只取前 256KB 即断开）。
+        // 记录首个 body 块的落地时刻与长度：吞吐从它起算（见
+        // [`probe_transfer_bps`]）。
         let mut received: u64 = 0;
+        let mut first_chunk: Option<(Instant, u64)> = None;
         let mut resp = resp;
         while received < PROBE_RANGE_BYTES {
             match resp.chunk().await? {
-                Some(bytes) => received += bytes.len() as u64,
+                Some(bytes) => {
+                    if first_chunk.is_none() {
+                        first_chunk = Some((Instant::now(), bytes.len() as u64));
+                    }
+                    received += bytes.len() as u64;
+                }
                 None => break,
             }
         }
-        Ok::<(u64, bool), crate::downloader::DownloadError>((received, validators_ok))
+        Ok::<(u64, Option<(Instant, u64)>, bool), crate::downloader::DownloadError>((
+            received,
+            first_chunk,
+            validators_ok,
+        ))
     };
     match tokio::time::timeout(PROBE_TIMEOUT, run).await {
-        Ok(Ok((received, validators_ok))) => {
-            let elapsed = started.elapsed().as_secs_f64().max(0.001);
+        Ok(Ok((received, first_chunk, validators_ok))) => {
+            let total_secs = started.elapsed().as_secs_f64().max(0.001);
+            let (body_secs, first_len) = first_chunk
+                .map(|(at, len)| (at.elapsed().as_secs_f64(), len))
+                .unwrap_or((0.0, 0));
             ProbeOutcome {
-                bps: received as f64 / elapsed,
+                bps: probe_transfer_bps(received, first_len, body_secs, total_secs),
                 validators_ok,
-                detail: format!("{received}B/{elapsed:.2}s"),
+                detail: format!("{received}B/{total_secs:.2}s(body {body_secs:.2}s)"),
             }
         }
         Ok(Err(e)) => fail(format!("{e}")),
         Err(_) => fail(format!("timeout {}s", PROBE_TIMEOUT.as_secs())),
+    }
+}
+
+/// 采样吞吐的纯计算：**从首个 body 块落地起算**——连接/TLS/CONNECT 握手
+/// 与 TTFB 是延迟指标，混进吞吐会把高 RTT 代理的真实传输速率低估数倍
+/// （256KB 在 150ms RTT 链路上握手就吃掉 ~0.5s；RFC 6349 的 TCP 吞吐
+/// 测试同样要求剔除建连阶段）。这也使采样与直连基线（ramp 窗口的纯
+/// 传输均速，无握手成分）在同一量纲上比较。首块的字节与耗时一并剔除
+/// （其传输时间不可观测）；退化情形（整包单块到齐/时钟异常）回退全程
+/// 均速——只会低估不会高估，方向保守（宁不切不误切）。
+fn probe_transfer_bps(received: u64, first_chunk_len: u64, body_secs: f64, total_secs: f64) -> f64 {
+    let tail_bytes = received.saturating_sub(first_chunk_len);
+    if tail_bytes > 0 && body_secs > 0.0 {
+        tail_bytes as f64 / body_secs
+    } else {
+        received as f64 / total_secs.max(0.001)
     }
 }
 
@@ -341,9 +388,12 @@ async fn probe_proxy(
 // ---------------------------------------------------------------------------
 
 /// 采样守卫：全部满足才允许发起采样。
-/// `runtime` = 任务本次 spawn 已运行时长；`throughput_bps` = 最近窗口总
-/// 吞吐；`alive` = 活跃连接数；`remaining` = 剩余字节。
+/// `min_runtime` = 本任务的采样等待期（先验加速时缩短）；`runtime` =
+/// 任务本次 spawn 已运行时长；`throughput_bps` = 最近窗口总吞吐；
+/// `alive` = 活跃连接数；`remaining` = 剩余字节。
+#[allow(clippy::too_many_arguments)]
 fn should_probe(
+    min_runtime: Duration,
     runtime: Duration,
     throughput_bps: f64,
     alive: usize,
@@ -351,7 +401,7 @@ fn should_probe(
     limiter_active: bool,
     conn_sensitive: bool,
 ) -> bool {
-    runtime >= MIN_RUNTIME
+    runtime >= min_runtime
         && alive > 0
         && throughput_bps < SLOW_BPS
         && remaining_bytes >= MIN_REMAINING_BYTES
@@ -438,7 +488,13 @@ impl AutoSwitchState {
         match &self.phase {
             Phase::Done => {}
             Phase::Idle => {
+                let min_runtime = if self.ctx.fast_reeval {
+                    FAST_REEVAL_MIN_RUNTIME
+                } else {
+                    MIN_RUNTIME
+                };
                 if !should_probe(
+                    min_runtime,
                     self.started.elapsed(),
                     obs.throughput_bps,
                     obs.alive,
@@ -517,6 +573,7 @@ impl AutoSwitchState {
                         self.ctx.host
                     );
                     self.ctx.cache.set(&self.ctx.host, Decision::NoSwitch);
+                    crate::route_health::record_no_switch(&self.ctx.host, db);
                     self.publish(db, sink, task_id, route::DIRECT_PINNED).await;
                     self.phase = Phase::Done;
                 } else if proxy_wins(outcome.bps, baseline) {
@@ -529,8 +586,15 @@ impl AutoSwitchState {
                         outcome.detail
                     );
                     self.ctx.cache.set(&self.ctx.host, Decision::Proxy);
-                    self.apply_switch(nodes, db, sink, task_id, route::PROXY_SAMPLED)
-                        .await;
+                    // 持久化胜绩只在切换实际生效后记——client 构建失败的
+                    // 候选代理不配留下先验（apply_switch 失败臂已降内存
+                    // 冷却）。
+                    if self
+                        .apply_switch(nodes, db, sink, task_id, route::PROXY_SAMPLED)
+                        .await
+                    {
+                        crate::route_health::record_proxy_win(&self.ctx.host, outcome.bps, db);
+                    }
                 } else {
                     log_info!(
                         "[auto-proxy] task {} host {} 代理无优势（{:.0} vs 基线 {:.0} B/s/conn，{}），保持直连",
@@ -541,6 +605,7 @@ impl AutoSwitchState {
                         outcome.detail
                     );
                     self.ctx.cache.set(&self.ctx.host, Decision::Cooldown);
+                    crate::route_health::record_cooldown(&self.ctx.host, db);
                     self.publish(db, sink, task_id, route::DIRECT_SAMPLED).await;
                     self.phase = Phase::Done;
                 }
@@ -550,7 +615,7 @@ impl AutoSwitchState {
 
     /// 构建代理 client 并原子替换 NodePool 的服务节点。失败降级为冷却
     /// （保持直连，任务不受影响）。`base` 是不带来源后缀的代理基础标签，
-    /// 此处按候选来源补 `:system`/`:manual` 后缀。
+    /// 此处按候选来源补 `:system`/`:manual` 后缀。返回切换是否实际生效。
     async fn apply_switch(
         &mut self,
         nodes: &Arc<NodePool>,
@@ -558,9 +623,9 @@ impl AutoSwitchState {
         sink: &dyn EventSink,
         task_id: &str,
         base: &'static str,
-    ) {
+    ) -> bool {
         let label = route::with_source(base, self.ctx.source);
-        match crate::downloader::build_client_with_tls_policy(
+        let switched = match crate::downloader::build_client_with_tls_policy(
             &self.ctx.candidate,
             &self.ctx.user_agent,
             false,
@@ -568,6 +633,7 @@ impl AutoSwitchState {
             Ok(client) => {
                 nodes.switch_to_client(client);
                 self.publish(db, sink, task_id, label).await;
+                true
             }
             Err(e) => {
                 log_error!(
@@ -575,9 +641,11 @@ impl AutoSwitchState {
                     task_id
                 );
                 self.ctx.cache.set(&self.ctx.host, Decision::Cooldown);
+                false
             }
-        }
+        };
         self.phase = Phase::Done;
+        switched
     }
 
     /// 路由落库 + 事件广播（详情面板可追溯的唯一事实源）。
@@ -657,6 +725,7 @@ mod tests {
             host: "example.com".to_string(),
             user_agent: String::new(),
             source: CandidateSource::ManualFields,
+            fast_reeval: false,
         }));
         state.backdate(MIN_RUNTIME + Duration::from_secs(5));
         state
@@ -895,7 +964,7 @@ mod tests {
                 false,
             );
             f(&mut args);
-            should_probe(args.0, args.1, args.2, args.3, args.4, args.5)
+            should_probe(MIN_RUNTIME, args.0, args.1, args.2, args.3, args.4, args.5)
         };
         assert!(ok(&|_| {}), "全守卫满足应放行");
         assert!(!ok(&|a| a.0 = Duration::from_secs(5)), "运行不足 10s 拒绝");
@@ -904,6 +973,48 @@ mod tests {
         assert!(!ok(&|a| a.3 = 1024 * 1024), "剩余过小拒绝");
         assert!(!ok(&|a| a.4 = true), "限速激活拒绝");
         assert!(!ok(&|a| a.5 = true), "连接敏感态拒绝");
+    }
+
+    #[test]
+    fn fast_reeval_shortens_probe_wait() {
+        let probe = |min: Duration, runtime_secs: u64| {
+            should_probe(
+                min,
+                Duration::from_secs(runtime_secs),
+                100.0 * 1024.0,
+                4,
+                64 * 1024 * 1024,
+                false,
+                false,
+            )
+        };
+        assert!(!probe(MIN_RUNTIME, 7), "常规等待期 7s 不放行");
+        assert!(probe(FAST_REEVAL_MIN_RUNTIME, 7), "先验加速后 7s 放行");
+        assert!(
+            !probe(FAST_REEVAL_MIN_RUNTIME, 5),
+            "加速下限跨 3 个 ramp tick"
+        );
+    }
+
+    #[test]
+    fn probe_bps_excludes_handshake_latency() {
+        // 256KB 经高 RTT 代理：全程 1.2s（含 0.5s 握手+TTFB），body 阶段
+        // 0.7s。旧算法 218KB/s；剔除握手后按尾部 240KB/0.7s ≈ 351KB/s——
+        // 千兆/百兆用户测得一致的「握手税」不再压低传输速率。
+        let total = 256.0 * 1024.0;
+        let first = 16u64 * 1024;
+        let bps = probe_transfer_bps(total as u64, first, 0.7, 1.2);
+        let expect = (total - first as f64) / 0.7;
+        assert!((bps - expect).abs() < 1.0, "尾部字节 ÷ body 耗时");
+        assert!(bps > total / 1.2, "必须高于含握手的全程均速");
+        // 退化：整包单块到齐（tail=0）→ 回退全程均速，保守不高估。
+        let one_shot = probe_transfer_bps(first, first, 0.0, 1.2);
+        assert!((one_shot - first as f64 / 1.2).abs() < 1.0);
+        // 退化：body 时钟异常为 0 → 同样回退。
+        let degen = probe_transfer_bps(256 * 1024, 16 * 1024, 0.0, 2.0);
+        assert!((degen - 256.0 * 1024.0 / 2.0).abs() < 1.0);
+        // 空响应不除零。
+        assert_eq!(probe_transfer_bps(0, 0, 0.0, 0.0), 0.0);
     }
 
     #[test]

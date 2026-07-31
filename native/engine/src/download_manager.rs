@@ -2272,9 +2272,11 @@ impl DownloadManager {
         // 换代理后不再可信，清空重学（内存 + 持久化）。
         crate::segment_coordinator::clear_domain_conn_caps(&self.db);
         // ProxyMode::Auto 的 host 决策同理：旧决策针对旧候选代理/旧出口，
-        // 全部作废（failover 标记一并清除，避免过期标签误导可追溯性）。
+        // 全部作废（内存租约 + 持久化先验 + failover 标记，避免过期标签
+        // 误导可追溯性；指纹只覆盖系统代理，手动字段变更必须在此清）。
         self.auto_proxy_cache.clear();
         self.auto_failover_pending.clear();
+        crate::route_health::clear_all(&self.db);
         Ok(())
     }
 
@@ -3221,6 +3223,34 @@ impl DownloadManager {
                 self.maybe_release_bt_session().await;
                 return;
             }
+            // ProxyMode::Auto 反向 failover（**独立于自动重试配额**——作废
+            // 坏先验与是否还要重试互不相干，否则 max_auto_retries=0 时
+            // AdoptProxy 误判会锁死到 7 天 TTL）：任务本轮经代理起飞/切换
+            // （auto_route 以 proxy 开头）且以连接类错误失败 → 代理链路
+            // 本身坏了。作废该 host 的持久化先验，并写一段内存冷却挡住
+            // 紧随其后的重采样（短请求能通、长传输会断的不稳定代理会让
+            // 256KB 采样再次「胜出」形成抖动环）；重试/新任务回直连起飞。
+            if task.status == 4
+                && self.proxy_config.mode == ProxyMode::Auto
+                && task.proxy_url.is_empty()
+                && task.auto_route.starts_with("proxy")
+                && !is_bt_url(&task.url)
+                && !crate::ed2k::link::is_ed2k_url(&task.url)
+                && crate::auto_proxy::is_connect_class_error(&task.error_message)
+                // 整机断网时所有代理路由任务都会报连接类错误，与代理无关
+                // ——有默认路由才认定「代理死了」，否则保留先验等网络恢复。
+                && crate::route_health::network_reachable()
+                && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
+            {
+                log_info!(
+                    "[manager] auto-proxy 反向 failover: task {} host {} 代理链路连接失败，作废先验并冷却，回直连",
+                    task_id,
+                    host
+                );
+                self.auto_proxy_cache
+                    .set(&host, crate::auto_proxy::Decision::Cooldown);
+                crate::route_health::clear_proxy_prior(&host, &self.db);
+            }
             // 本轮是否又排了一次自动重试——决定 `task.failed` 该不该发。
             let mut retry_pending = false;
             // max == 0：用户关闭了自动重试，直接跳过（不分配计数）。
@@ -3271,20 +3301,27 @@ impl DownloadManager {
                     // 退避期间该任务仍算占用队列，防止误报 `queue.drained`。
                     self.retry_scheduled
                         .insert(task_id.to_string(), task.queue_id.clone());
-                    // ProxyMode::Auto failover 支路：直连的连接类失败（被墙/
-                    // 链路劣化）且候选代理存在 → 给该 host 写代理租约，让即将
-                    // 到来的自动重试直接以代理起飞；auto_failover_pending 使
-                    // resume 把路由记为 proxy:failover（可追溯）。仅在该 host
-                    // 无任何缓存决策时介入：已判代理说明失败发生在代理链路上
-                    // （再 failover 是死循环），Cooldown/NoSwitch 是新鲜的反证。
+                    // ProxyMode::Auto 正向 failover 支路：直连的连接类失败
+                    // （被墙/链路劣化）且候选代理存在 → 给该 host 写代理
+                    // 租约，让即将到来的自动重试直接以代理起飞；
+                    // auto_failover_pending 使 resume 把路由记为
+                    // proxy:failover（可追溯）。仅在该 host 无任何缓存决策
+                    // 时介入：代理链路的失败由上方反向支路处理（其写入的
+                    // Cooldown 也天然挡住本支路），Cooldown/NoSwitch 是
+                    // 新鲜的反证。
                     if self.proxy_config.mode == ProxyMode::Auto
                         && task.proxy_url.is_empty()
+                        && !task.auto_route.starts_with("proxy")
                         && !is_bt_url(&task.url)
                         && !crate::ed2k::link::is_ed2k_url(&task.url)
                         && crate::auto_proxy::is_connect_class_error(&task.error_message)
                         && crate::auto_proxy::resolve_candidate(&self.proxy_config).is_some()
                         && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
                         && self.auto_proxy_cache.lookup(&host).is_none()
+                        // 持久化 NoSwitch（validator 不一致）跨重启延续到
+                        // failover 门禁：已知会命中不同 edge 的代理绝不许
+                        // 被推上带局部进度的续传。
+                        && !crate::route_health::no_switch_active(&host)
                     {
                         log_info!(
                             "[manager] auto-proxy failover: task {} host {} 直连连接失败，重试将经代理",
@@ -3305,6 +3342,16 @@ impl DownloadManager {
             } else if task.status == 3 {
                 // 任务成功完成，清除重试计数
                 self.auto_retry_counts.remove(task_id);
+                // 路由先验被动续期：经代理路由（采样切换/缓存采纳/failover）
+                // 完成的任务证明该 host 的代理链路仍然可用——真实传输即
+                // 观测，零探测成本。
+                if self.proxy_config.mode == ProxyMode::Auto
+                    && task.proxy_url.is_empty()
+                    && task.auto_route.starts_with("proxy")
+                    && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
+                {
+                    crate::route_health::touch_proxy_route(&host, &self.db);
+                }
             }
 
             // 通知平面：onDone / onError（fire-and-forget）。onError 内脚本可经
@@ -4334,11 +4381,18 @@ impl DownloadManager {
     /// - Auto 且直连起飞 → 有效代理 = 直连（保留多 CDN 聚合资格），路由
     ///   `direct`，并在任务未忽略 TLS 时携带热切换上下文供 coordinator
     ///   采样/切换（忽略 TLS 的任务与 CDN 聚合同理排除在采样之外）。
+    ///
+    /// `has_partial`：任务已有局部数据（resume 且 downloaded>0）。此时
+    /// AdoptProxy 降档为 FastReeval——host 级先验担保不了逐文件的
+    /// validator 一致性，直接换代理起飞可能命中不同 CDN edge 触发
+    /// If-Range 失配 200 全量、静默清空几十 GB 进度；降档后切代理重新
+    /// 经由带 `validators_ok` 守卫的采样路径发生。
     fn auto_route_decision(
         &self,
         url: &str,
         user_agent: &str,
         ignore_tls_errors: bool,
+        has_partial: bool,
     ) -> Option<(
         ProxyConfig,
         &'static str,
@@ -4361,6 +4415,30 @@ impl DownloadManager {
                 None,
             ));
         }
+        // 持久化先验（内存缓存 miss 后的跨重启延续）：近期无优势/validator
+        // 不一致 → 跳过采样机器（零开销直连）；多天确认的代理胜绩 → 直接
+        // 代理起飞（零慢速窗口，误判由反向 failover 自愈）；单日胜绩 →
+        // 直连起飞但缩短采样等待期。
+        let hint = crate::route_health::startup_hint(&host);
+        match hint {
+            Some(crate::route_health::RouteHint::SuppressProbe) => {
+                return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
+            }
+            Some(crate::route_health::RouteHint::AdoptProxy) if !has_partial => {
+                return Some((
+                    candidate,
+                    auto_proxy::route::with_source(auto_proxy::route::PROXY_CACHED, source),
+                    None,
+                ));
+            }
+            _ => {}
+        }
+        // AdoptProxy 带局部数据时降档：同样享受缩短的采样等待期。
+        let fast_reeval = matches!(
+            hint,
+            Some(crate::route_health::RouteHint::FastReeval)
+                | Some(crate::route_health::RouteHint::AdoptProxy)
+        );
         let ctx = (!ignore_tls_errors).then(|| {
             Arc::new(crate::auto_proxy::AutoProxyCtx {
                 candidate,
@@ -4368,6 +4446,7 @@ impl DownloadManager {
                 host,
                 user_agent: user_agent.to_string(),
                 source,
+                fast_reeval,
             })
         });
         Some((ProxyConfig::default(), auto_proxy::route::DIRECT, ctx))
@@ -4398,7 +4477,9 @@ impl DownloadManager {
         let resolved_ua = self.resolved_task_ua(user_agent, queue_id);
         // ProxyMode::Auto 启动期决策（per-task 代理优先级更高，非空时跳过）。
         let auto = if proxy_url.is_empty() {
-            self.auto_route_decision(url, resolved_ua, ignore_tls_errors)
+            // do_start_task 只走首次启动（resume 由 do_resume_task 承接），
+            // meta-probe 不写路由——两类调用方均无局部数据。
+            self.auto_route_decision(url, resolved_ua, ignore_tls_errors, false)
         } else {
             None
         };
@@ -5727,7 +5808,12 @@ impl DownloadManager {
             // 把路由标签定为 proxy:failover（可追溯性）。
             let was_failover = self.auto_failover_pending.remove(&tid);
             let auto = if task.proxy_url.is_empty() {
-                self.auto_route_decision(&task.url, &self.global_user_agent, task.ignore_tls_errors)
+                self.auto_route_decision(
+                    &task.url,
+                    &self.global_user_agent,
+                    task.ignore_tls_errors,
+                    task.downloaded_bytes > 0,
+                )
             } else {
                 None
             };
