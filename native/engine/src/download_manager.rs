@@ -655,12 +655,16 @@ pub struct NewTaskSpec {
     pub extra_headers: std::collections::HashMap<String, String>,
     /// BT 文件预选（空 = 全部文件）。
     pub selected_file_indices: Vec<i32>,
-    /// 无人值守创建：BT 任务直接按「全部文件」落库，**不弹文件选择框**。
+    /// 无人值守创建：跳过一切需要用户介入的二次选择——BT 任务直接按
+    /// 「全部文件」落库（**不弹文件选择框**），HLS/DASH 画质与插件 resolve
+    /// 变体在 start/resume 时静默取默认值（持久化于 `tasks.unattended`）。
     ///
     /// RSS 订阅这类自动化入口必须置 true——半夜抓到 5 集就弹 5 次对话框是
     /// 不可接受的，而且用户点「取消」后条目已被标记「已下载」，状态就撒谎了。
-    /// 手动新建下载保持 false，用户仍然自己挑文件。
-    pub unattended_bt_selection: bool,
+    /// 外部接管入口（浏览器扩展/脚本/aria2 免打扰路径）由宿主按
+    /// 「免打扰跳过二次选择」设置（config `silent_skip_selection`）决定。
+    /// 手动新建下载保持 false，用户仍然自己挑文件/画质。
+    pub unattended_selection: bool,
     /// 自定义 HTTP method（None = GET）。
     pub method: Option<String>,
     /// 捕获的请求体（POST 接管）。
@@ -677,6 +681,15 @@ pub struct NewTaskSpec {
     /// 未命中 resolver 插件 → fail-closed，任务直接 status=4（不发起下载
     /// `source_url`，绝不把网页 HTML 当直链保存）。
     pub resolver_item: String,
+    /// HTTP Basic 认证用户名（空 = 未提供；非空时引擎生成
+    /// `Authorization: Basic` 头注入 extra_headers，覆盖同名捕获头）。
+    pub http_user: String,
+    /// HTTP Basic 认证密码（仅 `http_user` 非空时有意义，允许为空串）。
+    pub http_password: String,
+    /// 为此网站保存凭据：true 且 `http_user` 非空时按站点键存入
+    /// config（[`crate::site_auth::SITE_AUTH_CONFIG_KEY`]），后续同站点
+    /// 建任务未显式提供凭据时自动套用。
+    pub save_site_auth: bool,
 }
 
 /// [`DownloadManager::create_task_group`] 的单个组成员条目（清单条目的引擎侧
@@ -1536,6 +1549,7 @@ impl DownloadManager {
         req: crate::plugin::ResolveRequest,
         kind: ResolveKind,
         generation: u64,
+        unattended: bool,
     ) {
         use futures_util::FutureExt;
         let Some(pm) = self.plugin_manager.clone() else {
@@ -1562,13 +1576,14 @@ impl DownloadManager {
             // 多变体收敛：在 off-actor worker 内 await 用户选择（不阻塞 actor），
             // 收敛为单一直链后再回流。stale 场景由 on_resolve_ready 世代守卫兜底。
             // 返回 true = 用户点关闭/取消 → 回流标记 cancelled，actor 取消任务。
-            // 二段解析（resolver_item 非空）绝不弹选择框：静默取默认变体
-            // （引擎自动裂变场景不为 N 个子任务弹 N 个选择框，A1 契约）。
+            // 二段解析（resolver_item 非空）与无人值守任务（tasks.unattended，
+            // RSS/免打扰接管）绝不弹选择框：静默取默认变体（引擎自动裂变场景
+            // 不为 N 个子任务弹 N 个选择框，A1 契约）。
             let mut cancelled = false;
             if let Ok(Some(res)) = &mut result
                 && !res.variants.is_empty()
             {
-                if second_stage {
+                if second_stage || unattended {
                     collapse_resolve_variants_silent(res);
                 } else {
                     cancelled = collapse_resolve_variants(&task_id, res, selector.as_ref()).await;
@@ -2041,7 +2056,15 @@ impl DownloadManager {
                 generation: spawn_gen,
             },
         );
-        self.spawn_resolve_worker(task_id, identity, req, ResolveKind::Start, spawn_gen);
+        let unattended = self.db.is_task_unattended(&task_id).await.unwrap_or(false);
+        self.spawn_resolve_worker(
+            task_id,
+            identity,
+            req,
+            ResolveKind::Start,
+            spawn_gen,
+            unattended,
+        );
     }
 
     /// do_resume_task 体首守卫调用：对称占位（防 resumeAll 并发双 resolve）+ spawn。
@@ -4000,6 +4023,76 @@ impl DownloadManager {
             .unwrap_or(0)
     }
 
+    /// HTTP Basic 认证注入（见 [`crate::site_auth`]）。
+    ///
+    /// - `http_user` 非空：生成 `Authorization: Basic` 覆盖 extra_headers 中
+    ///   既有同名头；`save` 为 true 且 URL 属 http(s) 时按站点键落库。
+    /// - `http_user` 为空：extra_headers 无 Authorization 且站点凭据库命中
+    ///   该 URL 的站点键时自动注入。
+    ///
+    /// 凭据库读写失败仅记日志，不阻断建任务。
+    async fn apply_site_auth(
+        &self,
+        url: &str,
+        extra_headers: &mut std::collections::HashMap<String, String>,
+        http_user: &str,
+        http_password: &str,
+        save: bool,
+    ) {
+        use crate::site_auth;
+        if !http_user.is_empty() {
+            site_auth::inject_basic_auth(extra_headers, http_user, http_password);
+            if save && let Some(key) = site_auth::site_key(url) {
+                let json = self
+                    .db
+                    .get_config(site_auth::SITE_AUTH_CONFIG_KEY)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                let mut store = site_auth::parse_store(&json);
+                store.insert(
+                    key,
+                    site_auth::SiteCredential {
+                        user: http_user.to_string(),
+                        pass: http_password.to_string(),
+                    },
+                );
+                if let Err(e) = self
+                    .db
+                    .set_config(
+                        site_auth::SITE_AUTH_CONFIG_KEY,
+                        &site_auth::serialize_store(&store),
+                    )
+                    .await
+                {
+                    log_info!("[site-auth] save credential error: {}", e);
+                }
+            }
+            return;
+        }
+        if site_auth::has_authorization(extra_headers) {
+            return;
+        }
+        let Some(key) = site_auth::site_key(url) else {
+            return;
+        };
+        let json = self
+            .db
+            .get_config(site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        if json.is_empty() {
+            return;
+        }
+        if let Some(cred) = site_auth::parse_store(&json).get(&key) {
+            site_auth::inject_basic_auth(extra_headers, &cred.user, &cred.pass);
+            log_info!("[site-auth] applied saved credential for {}", key);
+        }
+    }
+
     /// 创建下载任务，返回新任务 ID（插入失败时 `None`）。
     ///
     /// `spec.start_paused` = 稍后下载：任务以 paused(2) 落库，不占并发、
@@ -4020,16 +4113,31 @@ impl DownloadManager {
             queue_id,
             checksum,
             ignore_tls_errors,
-            extra_headers,
+            mut extra_headers,
             selected_file_indices,
-            unattended_bt_selection,
+            unattended_selection,
             method,
             body,
             audio_url,
             start_paused,
             group_id,
             resolver_item,
+            http_user,
+            http_password,
+            save_site_auth,
         } = spec;
+        // HTTP Basic 认证：显式凭据 → 生成 Authorization 头
+        // （覆盖捕获到的同名头）并按需保存到站点凭据库；未显式提供且头中
+        // 无 Authorization → 自动套用该站点已保存的凭据。注入发生在请求
+        // 上下文持久化之前，resume / probe 全链路自动携带。
+        self.apply_site_auth(
+            &url,
+            &mut extra_headers,
+            &http_user,
+            &http_password,
+            save_site_auth,
+        )
+        .await;
         // 任务必属队列：未指定时归入内置主队列（'' 不再是有效归属，统一
         // 覆盖旧客户端信号 / aria2 / REST / CLI 等所有创建入口）。
         let queue_id = if queue_id.is_empty() {
@@ -4222,12 +4330,19 @@ impl DownloadManager {
         // by the shared librqbit session with its own concurrency controls.
         let is_bt = is_magnet(&url) || !torrent_file_bytes.is_empty();
 
-        // 无人值守入口（RSS）：**在任务启动之前**把「已确认全部文件」落库，
-        // 于是 `do_start_task` 从 DB 读到 `Some([])` 直接跳过选择框。复用既有
-        // 三态语义（None=未确认 / Some([])=全选 / Some([..])=子集），不新增
-        // 第二套「要不要弹框」的判定。
-        if unattended_bt_selection && is_bt {
-            let _ = self.db.save_bt_selected_files(&task_id, &[], true).await;
+        // 无人值守入口（RSS / 外部接管免打扰路径）：
+        // - BT：**在任务启动之前**把「已确认全部文件」落库，于是 `do_start_task`
+        //   从 DB 读到 `Some([])` 直接跳过选择框。复用既有三态语义
+        //   （None=未确认 / Some([])=全选 / Some([..])=子集），不新增第二套
+        //   「要不要弹框」的判定。
+        // - 其余二次选择（HLS/DASH 画质、插件 resolve 变体）发生在 start/resume
+        //   时，落 `tasks.unattended` 供届时读取——惰性 resolve 每次 start 重跑，
+        //   不持久化就会在重启后的 resume 再弹一次。
+        if unattended_selection {
+            let _ = self.db.set_task_unattended(&task_id).await;
+            if is_bt {
+                let _ = self.db.save_bt_selected_files(&task_id, &[], true).await;
+            }
         }
 
         if start_paused {
@@ -7915,7 +8030,7 @@ impl DownloadManager {
             user_agent: plan.user_agent.clone(),
             queue_id: plan.queue_id.clone(),
             start_paused: plan.start_paused,
-            unattended_bt_selection: true,
+            unattended_selection: true,
             ..Default::default()
         };
         let notify = plan.notify;
@@ -7962,7 +8077,7 @@ impl DownloadManager {
                 user_agent: plan.user_agent.clone(),
                 queue_id: plan.queue_id.clone(),
                 start_paused: plan.start_paused,
-                unattended_bt_selection: true,
+                unattended_selection: true,
                 ..Default::default()
             };
             let notify = plan.notify;

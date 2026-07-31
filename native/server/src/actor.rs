@@ -394,6 +394,9 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
                     body: req.body.map(Into::into),
                     audio_url: req.audio_url,
                     start_paused: req.start_paused,
+                    http_user: req.http_user,
+                    http_password: req.http_password,
+                    save_site_auth: req.save_site_auth,
                     ..Default::default()
                 })
                 .await;

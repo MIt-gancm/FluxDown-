@@ -43,6 +43,8 @@ pub mod rss;
 pub mod segment_advisor;
 pub mod segment_coordinator;
 pub mod selection;
+/// 站点 HTTP Basic 认证凭据（per-host 保存 + 建任务时自动套用）。
+pub mod site_auth;
 pub mod speed_limiter;
 pub mod tracker_subscription;
 /// 任务事件 Webhook 推送（免费自托管，BYOE）。

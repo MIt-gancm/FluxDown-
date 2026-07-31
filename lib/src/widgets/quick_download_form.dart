@@ -198,6 +198,16 @@ class QuickDownloadFormResult {
   /// 单条经 ConfirmExternalDownload、批量经 BatchCreateTask 透传。
   final Map<String, String> extraHeaders;
 
+  /// HTTP Basic 认证用户名（仅单条非批量时有意义；空 = 不带，引擎回退
+  /// 已保存的站点凭据）。
+  final String httpUser;
+
+  /// HTTP Basic 认证密码（配合 [httpUser] 使用）。
+  final String httpPassword;
+
+  /// 是否把本次凭据按站点保存到本地（引擎侧明文存 config）。
+  final bool saveSiteAuth;
+
   /// 「稍后下载」提交 — 建任务但不启动（透传为 startPaused）。
   final bool startLater;
 
@@ -222,6 +232,9 @@ class QuickDownloadFormResult {
     this.extraHeaders = const {},
     this.startLater = false,
     this.targetDeviceId = '',
+    this.httpUser = '',
+    this.httpPassword = '',
+    this.saveSiteAuth = false,
   });
 }
 
@@ -353,6 +366,17 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
   final _cookieController = TextEditingController();
   final _checksumController = TextEditingController();
 
+  /// HTTP Basic 认证（仅单条非批量路径生效；留空 = 引擎自动套用已为该
+  /// 站点保存的凭据）。
+  final _httpAuthUserController = TextEditingController();
+  final _httpAuthPasswordController = TextEditingController();
+
+  /// 密码输入框明文显示切换。
+  bool _showHttpAuthPassword = false;
+
+  /// 是否把本次凭据按站点保存到本地（引擎侧明文存 config）。
+  bool _saveSiteAuth = false;
+
   /// 自定义请求头行列表（与主窗口新建下载对话框同款交互）。
   final List<QuickHeaderRow> _headerRows = [];
 
@@ -479,6 +503,8 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
       row.dispose();
     }
     _checksumController.dispose();
+    _httpAuthUserController.dispose();
+    _httpAuthPasswordController.dispose();
     _renameController.dispose();
     _proxyUrlController.dispose();
     _userAgentController.dispose();
@@ -569,6 +595,9 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
         audioUrl: widget.initialAudioUrl,
         extraHeaders: extraHeaders,
         targetDeviceId: _selectedTargetDevice,
+        httpUser: _isBatch ? '' : _httpAuthUserController.text.trim(),
+        httpPassword: _isBatch ? '' : _httpAuthPasswordController.text,
+        saveSiteAuth: _isBatch ? false : _saveSiteAuth,
       ),
     );
   }
@@ -1023,6 +1052,65 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
                       controller: _checksumController,
                       placeholder: Text(s.taskChecksumPlaceholder),
                     ),
+                  ),
+                ],
+              ),
+              // HTTP Basic 认证 — 仅单条路径生效（批量传空）
+              const SizedBox(height: 10),
+              QuickSectionLabel(text: s.taskHttpAuth, c: c),
+              const SizedBox(height: 4),
+              Text(
+                s.taskHttpAuthDesc,
+                style: TextStyle(fontSize: 11, color: c.textMuted),
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: ShadInput(
+                      controller: _httpAuthUserController,
+                      placeholder: Text(s.taskHttpAuthUser),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: ShadInput(
+                      controller: _httpAuthPasswordController,
+                      placeholder: Text(s.taskHttpAuthPassword),
+                      obscureText: !_showHttpAuthPassword,
+                      trailing: MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          onTap: () => setState(
+                            () => _showHttpAuthPassword =
+                                !_showHttpAuthPassword,
+                          ),
+                          child: Icon(
+                            _showHttpAuthPassword
+                                ? LucideIcons.eyeOff
+                                : LucideIcons.eye,
+                            size: 14,
+                            color: c.textMuted,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      s.taskHttpAuthSaveForSite,
+                      style: TextStyle(fontSize: 12, color: c.textPrimary),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  ShadSwitch(
+                    value: _saveSiteAuth,
+                    onChanged: (v) => setState(() => _saveSiteAuth = v),
                   ),
                 ],
               ),

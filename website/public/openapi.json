@@ -3019,6 +3019,14 @@
               "type": "string"
             }
           },
+          "httpPassword": {
+            "type": "string",
+            "description": "HTTP Basic 认证密码（仅 `httpUser` 非空时有意义，允许为空串）。"
+          },
+          "httpUser": {
+            "type": "string",
+            "description": "HTTP Basic 认证用户名。非空时引擎生成 `Authorization: Basic` 头\n注入请求（覆盖 `headers` 中的同名头）。空 = 未提供，若该站点有\n已保存凭据则自动套用。"
+          },
           "ignoreTlsErrors": {
             "type": "boolean",
             "description": "忽略 HTTPS 证书错误。缺省 false（严格验证）。"
@@ -3044,6 +3052,10 @@
           "saveDir": {
             "type": "string",
             "description": "空 = 使用全局默认保存目录。"
+          },
+          "saveSiteAuth": {
+            "type": "boolean",
+            "description": "为此网站保存凭据：true 且 `httpUser` 非空时按站点（host[:port]）\n持久化，供后续同站点任务自动套用。"
           },
           "segments": {
             "type": "integer",

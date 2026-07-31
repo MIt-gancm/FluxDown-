@@ -1170,6 +1170,9 @@ pub async fn run(db_dir: PathBuf) {
                         extra_headers: msg.extra_headers,
                         selected_file_indices: msg.selected_file_indices,
                         start_paused: msg.start_paused,
+                        http_user: msg.http_user,
+                        http_password: msg.http_password,
+                        save_site_auth: msg.save_site_auth,
                         ..Default::default()
                     })
                     .await;
@@ -1647,6 +1650,9 @@ pub async fn run(db_dir: PathBuf) {
                         body,
                         audio_url: if msg.audio_url.is_empty() { None } else { Some(msg.audio_url) },
                         start_paused: msg.start_paused,
+                        http_user: msg.http_user,
+                        http_password: msg.http_password,
+                        save_site_auth: msg.save_site_auth,
                         ..Default::default()
                     })
                     .await;
@@ -2641,6 +2647,9 @@ async fn handle_api_command(
                     body: req.body.map(Into::into),
                     audio_url: req.audio_url,
                     start_paused: req.start_paused,
+                    http_user: req.http_user,
+                    http_password: req.http_password,
+                    save_site_auth: req.save_site_auth,
                     ..Default::default()
                 })
                 .await;

@@ -308,6 +308,8 @@ pub(crate) struct RequestOptions {
     pub user_agent: String,
     pub checksum: String,
     pub ignore_tls_errors: bool,
+    pub http_user: String,
+    pub http_passwd: String,
     pub pause: bool,
 }
 
@@ -318,7 +320,8 @@ pub(crate) struct RequestOptions {
 /// `split`→segments、`all-proxy`|`http-proxy`|`https-proxy`→proxy_url
 /// （优先 `all-proxy`）、`user-agent`→user_agent、`checksum`→checksum
 /// （原样透传，格式已是 `algo=hex`）、`check-certificate=false`→忽略 TLS
-/// 证书错误、`pause`→pause（一次性动作标记）。
+/// 证书错误、`http-user`/`http-passwd`→HTTP Basic 认证凭据、
+/// `pause`→pause（一次性动作标记）。
 /// 其余未知键静默忽略（对齐 aria2：不认识的选项不报错）。
 ///
 /// `options.gid`（自定义 GID）显式拒绝——GID 由 `task_id` 派生，
@@ -362,6 +365,12 @@ pub(crate) fn parse_request_options(
     }
     if let Some(v) = opts.get("checksum").and_then(|v| v.as_str()) {
         out.checksum = v.to_string();
+    }
+    if let Some(v) = opts.get("http-user").and_then(|v| v.as_str()) {
+        out.http_user = v.to_string();
+    }
+    if let Some(v) = opts.get("http-passwd").and_then(|v| v.as_str()) {
+        out.http_passwd = v.to_string();
     }
     out.ignore_tls_errors = option_is_false(opts.get("check-certificate"));
     out.pause = option_is_true(opts.get("pause"));
@@ -451,6 +460,9 @@ pub(crate) fn build_create_task_request(
         body: None,
         audio_url: None,
         start_paused: opts.pause,
+        http_user: opts.http_user,
+        http_password: opts.http_passwd,
+        save_site_auth: false,
     }
 }
 
@@ -1053,6 +1065,8 @@ mod tests {
             "checksum": "sha-256=deadbeef",
             "check-certificate": "false",
             "pause": "true",
+            "http-user": "alice",
+            "http-passwd": "secret",
             "header": ["Cookie: a=b", "X-Custom: v"],
         });
         let opts = parse_request_options(options.as_object()).unwrap();
@@ -1067,6 +1081,8 @@ mod tests {
         assert!(opts.pause);
         assert_eq!(opts.cookies, "a=b");
         assert_eq!(opts.headers.unwrap().get("X-Custom").unwrap(), "v");
+        assert_eq!(opts.http_user, "alice");
+        assert_eq!(opts.http_passwd, "secret");
     }
 
     #[test]

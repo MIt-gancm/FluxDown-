@@ -98,6 +98,17 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
   /// 选中的哈希算法（与后端 verify_checksum 支持的算法名一致）。
   String _selectedHashAlgo = 'sha-256';
 
+  /// HTTP Basic 认证（仅单条 URL 非种子路径生效；留空 = 引擎自动套用
+  /// 已为该站点保存的凭据）。
+  final _httpAuthUserController = TextEditingController();
+  final _httpAuthPasswordController = TextEditingController();
+
+  /// 密码输入框明文显示切换。
+  bool _showHttpAuthPassword = false;
+
+  /// 是否把本次凭据按站点保存到本地（引擎侧明文存 config）。
+  bool _saveSiteAuth = false;
+
   /// 自定义请求头列表（#347），每项含一对 key/value 输入控制器。
   final List<_HeaderRow> _headerRows = [];
 
@@ -505,6 +516,8 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     _userAgentController.dispose();
     _cookieController.dispose();
     _checksumController.dispose();
+    _httpAuthUserController.dispose();
+    _httpAuthPasswordController.dispose();
     for (final row in _headerRows) {
       row.dispose();
     }
@@ -1109,6 +1122,9 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
         checksum: _resolveChecksum(entry.checksum),
         ignoreTlsErrors: _ignoreTlsErrors,
         extraHeaders: extraHeaders,
+        httpUser: _httpAuthUserController.text.trim(),
+        httpPassword: _httpAuthPasswordController.text,
+        saveSiteAuth: _saveSiteAuth,
         startPaused: later,
       );
     } else {
@@ -2005,6 +2021,71 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                       ),
                     ],
                   ),
+                  // HTTP Basic 认证 — 仅单条 URL 非种子路径生效
+                  if (!_isBatch && !_allMagnet && !_hasTorrentFiles) ...[
+                    const SizedBox(height: 10),
+                    _SectionLabel(text: s.taskHttpAuth, c: c),
+                    const SizedBox(height: 4),
+                    Text(
+                      s.taskHttpAuthDesc,
+                      style: TextStyle(fontSize: 11, color: c.textMuted),
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: ShadInput(
+                            controller: _httpAuthUserController,
+                            placeholder: Text(s.taskHttpAuthUser),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: ShadInput(
+                            controller: _httpAuthPasswordController,
+                            placeholder: Text(s.taskHttpAuthPassword),
+                            obscureText: !_showHttpAuthPassword,
+                            trailing: MouseRegion(
+                              cursor: SystemMouseCursors.click,
+                              child: GestureDetector(
+                                onTap: () => setState(
+                                  () => _showHttpAuthPassword =
+                                      !_showHttpAuthPassword,
+                                ),
+                                child: Icon(
+                                  _showHttpAuthPassword
+                                      ? LucideIcons.eyeOff
+                                      : LucideIcons.eye,
+                                  size: 14,
+                                  color: c.textMuted,
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            s.taskHttpAuthSaveForSite,
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: c.textPrimary,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        ShadSwitch(
+                          value: _saveSiteAuth,
+                          onChanged: (v) =>
+                              setState(() => _saveSiteAuth = v),
+                        ),
+                      ],
+                    ),
+                  ],
                   // 自定义请求头（#347）
                   const SizedBox(height: 10),
                   _SectionLabel(text: s.taskHeaders, c: c),

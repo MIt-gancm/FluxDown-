@@ -289,6 +289,12 @@ export interface CreateTaskRequest {
   headers?: Record<string, string>
   /** true = 稍后下载：任务以 paused 状态创建，不自动启动 */
   startPaused?: boolean
+  /** HTTP Basic 认证用户名；非空时引擎注入 Authorization 头 */
+  httpUser?: string
+  /** HTTP Basic 认证密码 */
+  httpPassword?: string
+  /** true = 按站点保存凭据，后续同站点任务自动套用 */
+  saveSiteAuth?: boolean
 }
 
 export interface CreatedTask {

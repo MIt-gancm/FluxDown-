@@ -219,6 +219,9 @@ Map<String, dynamic> quickFormResultToJson(QuickDownloadFormResult form) => {
   'extraHeaders': form.extraHeaders,
   'startLater': form.startLater,
   'targetDeviceId': form.targetDeviceId,
+  'httpUser': form.httpUser,
+  'httpPassword': form.httpPassword,
+  'saveSiteAuth': form.saveSiteAuth,
 };
 
 QuickDownloadFormResult quickFormResultFromJson(Map<String, dynamic> map) =>
@@ -236,6 +239,9 @@ QuickDownloadFormResult quickFormResultFromJson(Map<String, dynamic> map) =>
       threadsUserModified: map['threadsUserModified'] as bool? ?? false,
       startLater: map['startLater'] as bool? ?? false,
       targetDeviceId: map['targetDeviceId'] as String? ?? '',
+      httpUser: map['httpUser'] as String? ?? '',
+      httpPassword: map['httpPassword'] as String? ?? '',
+      saveSiteAuth: map['saveSiteAuth'] as bool? ?? false,
       extraHeaders: {
         for (final e
             in (map['extraHeaders'] as Map<String, dynamic>? ?? const {})

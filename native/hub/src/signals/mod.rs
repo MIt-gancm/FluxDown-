@@ -50,6 +50,17 @@ pub struct CreateTask {
     /// 按序恢复或用户手动恢复。
     #[serde(default)]
     pub start_paused: bool,
+    /// HTTP Basic 认证用户名（空 = 未提供；非空时引擎注入
+    /// `Authorization: Basic` 头，覆盖 extra_headers 里的同名头）。
+    #[serde(default)]
+    pub http_user: String,
+    /// HTTP Basic 认证密码（仅 `http_user` 非空时有意义）。
+    #[serde(default)]
+    pub http_password: String,
+    /// 为此网站保存凭据（按 host[:port] 存入 config，后续同站点任务
+    /// 未显式提供凭据时自动套用）。
+    #[serde(default)]
+    pub save_site_auth: bool,
 }
 
 /// Single entry in a batch download (URL + optional filename + optional checksum)
@@ -298,6 +309,15 @@ pub struct ConfirmExternalDownload {
     /// 稍后下载：true = 建任务后不启动（paused 落库）。
     #[serde(default)]
     pub start_paused: bool,
+    /// HTTP Basic 认证用户名（快速下载表单手填；空 = 未提供）。
+    #[serde(default)]
+    pub http_user: String,
+    /// HTTP Basic 认证密码（仅 `http_user` 非空时有意义）。
+    #[serde(default)]
+    pub http_password: String,
+    /// 为此网站保存凭据。
+    #[serde(default)]
+    pub save_site_auth: bool,
 }
 
 // ========== Config signals ==========

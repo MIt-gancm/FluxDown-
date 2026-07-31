@@ -170,6 +170,9 @@ void submitQuickDownload({
         startPaused: result.startLater,
         audioUrl: audioUrl,
         extraHeaders: result.extraHeaders,
+        httpUser: result.httpUser,
+        httpPassword: result.httpPassword,
+        saveSiteAuth: result.saveSiteAuth,
       ).sendSignalToRust();
     } else {
       // 单条带校验 — ConfirmExternalDownload 信号无 checksum 字段，

@@ -738,6 +738,9 @@ class DownloadController extends ChangeNotifier {
     Map<String, String> extraHeaders = const {},
     List<int> selectedFileIndices = const [],
     bool startPaused = false,
+    String httpUser = '',
+    String httpPassword = '',
+    bool saveSiteAuth = false,
   }) {
     logInfo(
       _tag,
@@ -758,6 +761,9 @@ class DownloadController extends ChangeNotifier {
       extraHeaders: extraHeaders,
       selectedFileIndices: selectedFileIndices,
       startPaused: startPaused,
+      httpUser: httpUser,
+      httpPassword: httpPassword,
+      saveSiteAuth: saveSiteAuth,
     ).sendSignalToRust();
   }
 
@@ -795,6 +801,9 @@ class DownloadController extends ChangeNotifier {
       extraHeaders: const {},
       selectedFileIndices: selectedFileIndices,
       startPaused: startPaused,
+      httpUser: '',
+      httpPassword: '',
+      saveSiteAuth: false,
     ).sendSignalToRust();
   }
 
@@ -867,6 +876,9 @@ class DownloadController extends ChangeNotifier {
         extraHeaders: const {},
         selectedFileIndices: selectedFileIndices,
         startPaused: startPaused,
+        httpUser: '',
+        httpPassword: '',
+        saveSiteAuth: false,
       ).sendSignalToRust();
     } catch (e) {
       logInfo(_tag, 'failed to read torrent file: $e');

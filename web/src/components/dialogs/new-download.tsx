@@ -63,6 +63,9 @@ interface FormState {
   headers: HeaderRow[]
   proxyUrl: string
   checksum: string
+  httpUser: string
+  httpPassword: string
+  saveSiteAuth: boolean
   advOpen: boolean
   /** 下发目标：空串 = 本机（默认，走现有本地引擎路径）；`cloud:<deviceId>` = FluxCloud
    *  云中转已登录设备；`link:<fingerprint>` = 局域网直连(link)已配对设备。见下方
@@ -83,6 +86,9 @@ function emptyForm(saveDir = ''): FormState {
     headers: [],
     proxyUrl: '',
     checksum: '',
+    httpUser: '',
+    httpPassword: '',
+    saveSiteAuth: false,
     advOpen: false,
     deviceId: '',
   }
@@ -282,6 +288,9 @@ export function NewDownloadDialog() {
             userAgent: form.userAgent || undefined,
             queueId,
             checksum: form.checksum.trim() || undefined,
+            httpUser: form.httpUser.trim() || undefined,
+            httpPassword: form.httpUser.trim() ? form.httpPassword : undefined,
+            saveSiteAuth: form.httpUser.trim() && form.saveSiteAuth ? true : undefined,
             startPaused: startPaused || undefined,
           })
         }
@@ -490,6 +499,38 @@ export function NewDownloadDialog() {
                   value={form.checksum}
                   onChange={(e) => set('checksum', e.target.value)}
                 />
+                <label className="field-label">{t('newDl.httpAuth')}</label>
+                <div className="grid2">
+                  <input
+                    className="text-input"
+                    type="text"
+                    spellCheck={false}
+                    autoComplete="off"
+                    placeholder={t('newDl.httpAuthUser')}
+                    aria-label={t('newDl.httpAuthUser')}
+                    value={form.httpUser}
+                    onChange={(e) => set('httpUser', e.target.value)}
+                  />
+                  <input
+                    className="text-input"
+                    type="password"
+                    autoComplete="new-password"
+                    placeholder={t('newDl.httpAuthPassword')}
+                    aria-label={t('newDl.httpAuthPassword')}
+                    value={form.httpPassword}
+                    onChange={(e) => set('httpPassword', e.target.value)}
+                  />
+                </div>
+                <label className="mcheck mt-2">
+                  <input
+                    type="checkbox"
+                    checked={form.saveSiteAuth}
+                    onChange={(e) => set('saveSiteAuth', e.target.checked)}
+                  />
+                  <i />
+                  {t('newDl.httpAuthSave')}
+                </label>
+                <p className="mt-1 text-xs text-text3">{t('newDl.httpAuthHint')}</p>
               </div>
               {Object.keys(lineErrors).length > 0 && (
                 <div className="mt-3 flex flex-col gap-1">

@@ -157,6 +157,9 @@ class ExternalDownloadService {
         audioUrl: req.audioUrl,
         extraHeaders: const {},
         startPaused: false,
+        httpUser: '',
+        httpPassword: '',
+        saveSiteAuth: false,
       ).sendSignalToRust();
       return;
     }
@@ -205,6 +208,9 @@ class ExternalDownloadService {
             audioUrl: entry.audioUrl,
             extraHeaders: const {},
             startPaused: false,
+            httpUser: '',
+            httpPassword: '',
+            saveSiteAuth: false,
           ).sendSignalToRust();
         } else {
           BatchCreateTask(

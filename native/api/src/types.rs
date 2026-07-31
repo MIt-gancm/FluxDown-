@@ -452,6 +452,18 @@ pub struct CreateTaskRequest {
     /// 按序恢复或用户手动恢复。缺省 false = 立即开始。
     #[serde(default)]
     pub start_paused: bool,
+    /// HTTP Basic 认证用户名。非空时引擎生成 `Authorization: Basic` 头
+    /// 注入请求（覆盖 `headers` 中的同名头）。空 = 未提供，若该站点有
+    /// 已保存凭据则自动套用。
+    #[serde(default)]
+    pub http_user: String,
+    /// HTTP Basic 认证密码（仅 `httpUser` 非空时有意义，允许为空串）。
+    #[serde(default)]
+    pub http_password: String,
+    /// 为此网站保存凭据：true 且 `httpUser` 非空时按站点（host[:port]）
+    /// 持久化，供后续同站点任务自动套用。
+    #[serde(default)]
+    pub save_site_auth: bool,
 }
 
 fn default_true() -> bool {
