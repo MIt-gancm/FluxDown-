@@ -157,6 +157,8 @@ interface ReleaseInfo {
   } | null;
 }
 
+type Channel = "stable" | "frontier";
+
 function formatSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -164,7 +166,13 @@ function formatSize(bytes: number): string {
 
 export default function DownloadSection() {
   const { t, locale } = useLocale();
-  const [release, setRelease] = useState<ReleaseInfo | null>(null);
+  // 下载渠道：正式版 / 预览版（frontier 时桌面 / 移动端 / Web 版 / CLI 均按
+  // 渠道取 SemVer 最大；浏览器扩展不打包预发布，恒为稳定版）
+  const [channel, setChannel] = useState<Channel>("stable");
+  const [channelCache, setChannelCache] = useState<
+    Partial<Record<Channel, ReleaseInfo>>
+  >({});
+  const release = channelCache[channel] ?? null;
   const [loading, setLoading] = useState(true);
   const [selectedArch, setSelectedArch] = useState<Record<string, string>>({});
   const [activePlatform, setActivePlatform] = useState("windows");
@@ -211,15 +219,28 @@ export default function DownloadSection() {
   }, []);
 
   useEffect(() => {
-    fetch("/api/release")
+    if (channelCache[channel]) return;
+    let cancelled = false;
+    setLoading(true);
+    fetch(
+      channel === "frontier" ? "/api/release?channel=frontier" : "/api/release",
+    )
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       })
-      .then((data: ReleaseInfo) => setRelease(data))
+      .then((data: ReleaseInfo) => {
+        if (!cancelled)
+          setChannelCache((prev) => ({ ...prev, [channel]: data }));
+      })
       .catch((err) => console.error("Failed to fetch release info:", err))
-      .finally(() => setLoading(false));
-  }, []);
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [channel, channelCache]);
 
   // Hero「更多版本」下拉选中平台后跳转到本区并切换面板。
   // 本组件 client:visible 懒水合，事件可能先于监听器发出——挂载时消费挂起值兜底。
@@ -684,6 +705,35 @@ export default function DownloadSection() {
               {t("dl.subtitle")}
             </p>
           </motion.div>
+
+          {/* 渠道切换：正式版 / 预览版 */}
+          <div className="max-w-4xl mx-auto mb-6 flex flex-col items-center gap-2">
+            <div className="inline-flex items-center rounded-lg border border-dark-border bg-dark-surface1 p-1">
+              {(["stable", "frontier"] as const).map((ch) => (
+                <button
+                  key={ch}
+                  type="button"
+                  onClick={() => setChannel(ch)}
+                  className={`px-4 py-1.5 rounded-md text-xs font-semibold transition-colors cursor-pointer ${
+                    channel === ch
+                      ? ch === "frontier"
+                        ? "bg-amber-500/15 text-amber-400"
+                        : "bg-brand-blue/15 text-brand-blue"
+                      : "text-dark-text-muted hover:text-dark-text-secondary"
+                  }`}
+                >
+                  {ch === "stable"
+                    ? t("dl.channelStable")
+                    : t("dl.channelFrontier")}
+                </button>
+              ))}
+            </div>
+            {channel === "frontier" && (
+              <p className="text-[11px] text-dark-text-muted max-w-md text-center">
+                {t("dl.channelFrontierHint")}
+              </p>
+            )}
+          </div>
 
           {/* Platform selector panel（左侧平台列表 + 右侧详情面板） */}
           <motion.div

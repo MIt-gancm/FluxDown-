@@ -16,6 +16,8 @@ import {
   Cpu,
   Terminal,
   Smartphone,
+  Globe,
+  HardDrive,
 } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
 
@@ -65,6 +67,49 @@ function inferAssetMeta(name: string): {
       label: "CLI",
       sub,
       icon: <Terminal className="w-3.5 h-3.5" />,
+    };
+  }
+  // FluxDown Server（独立 server-v* release，命名 FluxDown-Server-<ver>-<os>-<arch>.<ext>）
+  if (lower.startsWith("fluxdown-server-")) {
+    const nasQnap = lower.match(/-qnap-(x64|arm64)\.qpkg$/);
+    if (nasQnap) {
+      return {
+        label: "NAS",
+        sub: `QNAP ${nasQnap[1]}`,
+        icon: <HardDrive className="w-3.5 h-3.5" />,
+      };
+    }
+    const nasSyno = lower.match(/-synology-(dsm6|dsm7)-(x64|arm64)\.spk$/);
+    if (nasSyno) {
+      return {
+        label: "NAS",
+        sub: `Synology ${nasSyno[1].toUpperCase()} ${nasSyno[2]}`,
+        icon: <HardDrive className="w-3.5 h-3.5" />,
+      };
+    }
+    const platMatch = lower.match(
+      /-(windows|linux|macos)-(x64|arm64)\.(zip|tar\.gz)$/,
+    );
+    return {
+      label: "Server",
+      sub: platMatch ? `${platMatch[1]} ${platMatch[2]}` : "Web 版",
+      icon: <Globe className="w-3.5 h-3.5" />,
+    };
+  }
+  // OpenWrt ipk（命名 fluxdown-server_<ver>_<arch>.ipk / luci-app-fluxdown_<ver>_all.ipk）
+  if (lower.startsWith("luci-app-fluxdown_") && lower.endsWith(".ipk")) {
+    return {
+      label: "NAS",
+      sub: "OpenWrt LuCI",
+      icon: <HardDrive className="w-3.5 h-3.5" />,
+    };
+  }
+  if (lower.startsWith("fluxdown-server_") && lower.endsWith(".ipk")) {
+    const archMatch = lower.match(/_([a-z0-9_-]+)\.ipk$/);
+    return {
+      label: "NAS",
+      sub: `OpenWrt ${archMatch?.[1] ?? ""}`.trim(),
+      icon: <HardDrive className="w-3.5 h-3.5" />,
     };
   }
   // Android（独立 mobile-v* release，命名 FluxDown-<ver>-android-<abi>.apk）
@@ -233,9 +278,11 @@ const PLATFORM_ORDER: Record<string, number> = {
   Windows: 0,
   macOS: 1,
   Linux: 2,
-  扩展: 3,
-  Android: 4,
-  CLI: 5,
+  Server: 3,
+  NAS: 4,
+  Android: 5,
+  扩展: 6,
+  CLI: 7,
   其他: 99,
 };
 

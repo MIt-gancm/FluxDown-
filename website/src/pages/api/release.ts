@@ -194,9 +194,10 @@ export const GET: APIRoute = async ({ url }) => {
 
     const releases = allReleases;
     const published = releases.filter((r) => !r.draft && !r.prerelease);
-    // 渠道感知候选池：frontier 放行 prerelease（含稳定版），stable 等同 published。
-    // 仅桌面客户端(version/assets)与移动端(mobile)按渠道选取；扩展/服务器/CLI
-    // 恒取稳定版——官网下载页消费它们，且缺省 channel=stable 已保证官网永远稳定。
+    // 渠道感知候选池：frontier 放行 prerelease（含稳定版）。桌面客户端、
+    // 移动端、服务器与 CLI 均按渠道选取（预发布 tag 会打包这四类组件，
+    // 组件无改动时不重建 → frontier 取 SemVer 最大自然回落稳定版）；
+    // 唯浏览器扩展恒取稳定版——商店版本号不可回退，预发布 tag 不打包扩展。
     const appPool = includePrerelease
       ? releases.filter((r) => !r.draft)
       : published;
@@ -240,17 +241,25 @@ export const GET: APIRoute = async ({ url }) => {
       );
 
     // FluxDown Server release：独立 server-v* release（headless Web 服务器）
-    const serverRelease = published.find(
-      (r) =>
-        /^server-v\d+\.\d+\.\d+$/.test(r.tag_name) &&
-        r.assets.some((a) => a.name.startsWith("FluxDown-Server-")),
+    const serverRe = includePrerelease
+      ? /^server-v\d+\.\d+\.\d+(-[\w.]+)?$/
+      : /^server-v\d+\.\d+\.\d+$/;
+    const serverRelease = pickRelease(
+      appPool,
+      serverRe,
+      (a) => a.name.startsWith("FluxDown-Server-"),
+      includePrerelease,
     );
 
     // FluxDown CLI release：独立 cli-v* release（命令行客户端 fluxdown）
-    const cliRelease = published.find(
-      (r) =>
-        /^cli-v\d+\.\d+\.\d+$/.test(r.tag_name) &&
-        r.assets.some((a) => a.name.startsWith("FluxDown-CLI-")),
+    const cliRe = includePrerelease
+      ? /^cli-v\d+\.\d+\.\d+(-[\w.]+)?$/
+      : /^cli-v\d+\.\d+\.\d+$/;
+    const cliRelease = pickRelease(
+      appPool,
+      cliRe,
+      (a) => a.name.startsWith("FluxDown-CLI-"),
+      includePrerelease,
     );
 
     // FluxDown 移动端 release：独立 mobile-v* release（Android APK）

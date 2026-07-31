@@ -134,6 +134,9 @@ function isDownloadableAsset(name: string): boolean {
     lower.endsWith(".tar.xz") ||
     lower.endsWith(".tar.bz2") ||
     lower.endsWith(".zst") ||
+    lower.endsWith(".ipk") ||
+    lower.endsWith(".qpkg") ||
+    lower.endsWith(".spk") ||
     lower.endsWith(".msi") ||
     lower.endsWith(".apk")
   );
@@ -177,7 +180,30 @@ async function getCachedReleases(
     const raw = await fetchAllGitHubReleases();
 
     // 只保留 v* 客户端 release（含预览预发布）；extension-v* / website-v*
-    // 组件 release 不属于 App 更新日志（且其 tag 无法按 semver 解析）
+    // 组件 release 不属于 App 更新日志（且其 tag 无法按 semver 解析）。
+    // 但 server-v* / mobile-v* / cli-v* 是同一次发版按组件拆出的伴生 release
+    // （版本号与 App tag 一致），其资产（含 NAS 套件与 APK）合并进对应
+    // App 条目一起展示。
+    const companions = new Map<string, GitHubRelease[]>();
+    for (const r of raw) {
+      if (r.draft) continue;
+      const m = /^(?:server|mobile|cli)-v(.+)$/.exec(r.tag_name);
+      if (!m) continue;
+      const list = companions.get(m[1]);
+      if (list) list.push(r);
+      else companions.set(m[1], [r]);
+    }
+
+    const toAssets = (r: GitHubRelease): ReleaseAsset[] =>
+      (r.assets || [])
+        .filter((a) => isDownloadableAsset(a.name))
+        .map((a) => ({
+          name: a.name,
+          size: a.size,
+          // 通过我们自己的代理端点下载，携带 tag 参数定位到对应版本
+          download_url: `/api/download/${encodeURIComponent(a.name)}?tag=${encodeURIComponent(r.tag_name)}`,
+        }));
+
     all = raw
       .filter((r) => !r.draft && /^v\d/.test(r.tag_name))
       .sort(
@@ -191,14 +217,12 @@ async function getCachedReleases(
         published_at: r.published_at,
         body: r.body || "",
         prerelease: r.prerelease,
-        assets: (r.assets || [])
-          .filter((a) => isDownloadableAsset(a.name))
-          .map((a) => ({
-            name: a.name,
-            size: a.size,
-            // 通过我们自己的代理端点下载，携带 tag 参数定位到对应版本
-            download_url: `/api/download/${encodeURIComponent(a.name)}?tag=${encodeURIComponent(r.tag_name)}`,
-          })),
+        assets: [
+          ...toAssets(r),
+          ...(companions.get(r.tag_name.replace(/^v/, "")) ?? []).flatMap(
+            toAssets,
+          ),
+        ],
       }));
 
     setCached(CACHE_KEY, all);
