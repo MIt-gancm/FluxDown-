@@ -13125,8 +13125,18 @@ class _LoginDialogContentState extends State<_LoginDialogContent> {
   int _resendRemaining = 0;
 
   @override
+  void initState() {
+    super.initState();
+    // 「发送验证码」按钮的启用条件依赖账号输入内容，输入变化需触发重建。
+    _accountController.addListener(_onAccountChanged);
+  }
+
+  void _onAccountChanged() => setState(() {});
+
+  @override
   void dispose() {
     _timer?.cancel();
+    _accountController.removeListener(_onAccountChanged);
     _accountController.dispose();
     _passwordController.dispose();
     _codeController.dispose();
