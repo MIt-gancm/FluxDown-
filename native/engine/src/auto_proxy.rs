@@ -952,27 +952,48 @@ mod tests {
 
     // ---- 守卫 --------------------------------------------------------------
 
+    /// 每条守卫都必须是**独立的否决权**:从一组全部满足的基线出发,单独破坏
+    /// 任意一条都要拒绝放行。
     #[test]
     fn should_probe_requires_all_guards() {
-        let ok = |f: &dyn Fn(&mut (Duration, f64, usize, i64, bool, bool))| {
-            let mut args = (
-                Duration::from_secs(11),
-                100.0 * 1024.0,
-                4usize,
-                64 * 1024 * 1024i64,
-                false,
-                false,
-            );
-            f(&mut args);
-            should_probe(MIN_RUNTIME, args.0, args.1, args.2, args.3, args.4, args.5)
+        struct Guards {
+            runtime: Duration,
+            throughput_bps: f64,
+            alive: usize,
+            remaining_bytes: i64,
+            limiter_active: bool,
+            conn_sensitive: bool,
+        }
+        let ok = |break_one: &dyn Fn(&mut Guards)| {
+            let mut g = Guards {
+                runtime: Duration::from_secs(11),
+                throughput_bps: 100.0 * 1024.0,
+                alive: 4,
+                remaining_bytes: 64 * 1024 * 1024,
+                limiter_active: false,
+                conn_sensitive: false,
+            };
+            break_one(&mut g);
+            should_probe(
+                MIN_RUNTIME,
+                g.runtime,
+                g.throughput_bps,
+                g.alive,
+                g.remaining_bytes,
+                g.limiter_active,
+                g.conn_sensitive,
+            )
         };
         assert!(ok(&|_| {}), "全守卫满足应放行");
-        assert!(!ok(&|a| a.0 = Duration::from_secs(5)), "运行不足 10s 拒绝");
-        assert!(!ok(&|a| a.1 = SLOW_BPS + 1.0), "速度达标拒绝");
-        assert!(!ok(&|a| a.2 = 0), "无活跃连接拒绝");
-        assert!(!ok(&|a| a.3 = 1024 * 1024), "剩余过小拒绝");
-        assert!(!ok(&|a| a.4 = true), "限速激活拒绝");
-        assert!(!ok(&|a| a.5 = true), "连接敏感态拒绝");
+        assert!(
+            !ok(&|g| g.runtime = Duration::from_secs(5)),
+            "运行不足 10s 拒绝"
+        );
+        assert!(!ok(&|g| g.throughput_bps = SLOW_BPS + 1.0), "速度达标拒绝");
+        assert!(!ok(&|g| g.alive = 0), "无活跃连接拒绝");
+        assert!(!ok(&|g| g.remaining_bytes = 1024 * 1024), "剩余过小拒绝");
+        assert!(!ok(&|g| g.limiter_active = true), "限速激活拒绝");
+        assert!(!ok(&|g| g.conn_sensitive = true), "连接敏感态拒绝");
     }
 
     #[test]

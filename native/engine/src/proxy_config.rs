@@ -77,46 +77,79 @@ impl ProxyMode {
 pub enum ProxyType {
     Http,
     Https,
+    /// SOCKS4,目标地址由客户端本地解析后以 IP 下发。
     Socks4,
+    /// SOCKS4a——SOCKS4 的远端解析扩展,目标 hostname 原样交给代理。设置页
+    /// 下拉不提供这一项(纯 SOCKS4 服务端会拒绝 4a 请求,不能当默认值);
+    /// 只有用户在自定义代理 URL 字段显式写 `socks4a://` 时才会出现——那是
+    /// 用户对自己代理能力的声明,必须原样兑现而不是悄悄降级成 SOCKS4。
+    Socks4a,
+    /// SOCKS5。恒为代理侧 DNS 解析,见 [`Self::scheme`]。
     Socks5,
 }
 
 impl ProxyType {
-    /// 与标准库 `FromStr::from_str` 同名会引发 clippy `should_implement_trait`——
-    /// 此函数语义不同(无法识别的输入回退到默认值,而非返回 `Err`),故用
-    /// `parse_str` 命名以示区分。
-    pub fn parse_str(s: &str) -> Self {
+    /// 识别代理类型字符串(配置 wire 值或 URL scheme)。
+    ///
+    /// 与标准库 `FromStr::from_str` 同名会引发 clippy `should_implement_trait`,
+    /// 故用 `parse_str` 命名。**无法识别返回 `None`,绝不静默折算**:曾经的
+    /// `_ => Http` 通配兜底会把任何拼错或未覆盖的 scheme 变成 HTTP 代理,
+    /// 对 SOCKS 端口发出 HTTP CONNECT,表现为无从归因的连接失败。识别集覆盖
+    /// reqwest 接受的全部代理 scheme,兜底策略由各调用方按自身语境显式选择。
+    ///
+    /// `socks5h`/`socks4a` 是同一枚举值的远端解析别名与独立变体,见
+    /// [`Self::scheme`]。
+    pub fn parse_str(s: &str) -> Option<Self> {
         match s {
-            "https" => Self::Https,
-            "socks4" => Self::Socks4,
-            "socks5" => Self::Socks5,
-            _ => Self::Http,
+            "http" => Some(Self::Http),
+            "https" => Some(Self::Https),
+            "socks4" => Some(Self::Socks4),
+            "socks4a" => Some(Self::Socks4a),
+            // `socks5h` 与 `socks5` 同义:本类型的 SOCKS5 恒走代理侧解析。
+            "socks5" | "socks5h" => Some(Self::Socks5),
+            _ => None,
         }
     }
 
+    /// 持久化 wire 值(DB `proxy_type` 列、设置页下拉、Dart/前端协议)。
+    /// **与 [`Self::scheme`] 是两条独立通道**,不随 reqwest 的 scheme 变化。
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Http => "http",
             Self::Https => "https",
             Self::Socks4 => "socks4",
+            Self::Socks4a => "socks4a",
             Self::Socks5 => "socks5",
         }
     }
 
     /// URL scheme used by reqwest's `Proxy::all(url)`.
+    ///
+    /// SOCKS5 用 `socks5h` 而非 `socks5`:reqwest 对 `socks5` 的语义是**客户端
+    /// 本地解析目标 hostname**、只把解析出的 IP 经隧道转发,`socks5h` 才把
+    /// hostname 原样交给代理解析。目标域名在 DNS 层被投毒/封锁时,本地解析
+    /// 拿到的是错误地址,请求在发出前目标就已经错了——代理能连通真实主机也
+    /// 无济于事。代理侧解析是 SOCKS5 的通用预期(与 curl 的 `socks5h` 一致),
+    /// 代价是代理必须支持 domain ATYP(RFC 1928 §4 ATYP=0x03),仅接受 IP 的
+    /// 实现会失败。
+    ///
+    /// SOCKS4 保持 `socks4`(本地解析):远端解析需要 SOCKS4a,而 SOCKS4a 请求
+    /// 会被纯 SOCKS4 服务端拒绝,不能当默认值。用户显式选 [`Self::Socks4a`]
+    /// 时按 `socks4a` 下发,由用户自己为代理能力背书。
     pub fn scheme(&self) -> &'static str {
         match self {
             Self::Http => "http",
             Self::Https => "https",
             Self::Socks4 => "socks4",
-            Self::Socks5 => "socks5",
+            Self::Socks4a => "socks4a",
+            Self::Socks5 => "socks5h",
         }
     }
 
-    /// Whether this is a SOCKS variant (4 or 5).
+    /// Whether this is a SOCKS variant (4 / 4a / 5).
     #[allow(dead_code)]
     pub fn is_socks(&self) -> bool {
-        matches!(self, Self::Socks4 | Self::Socks5)
+        matches!(self, Self::Socks4 | Self::Socks4a | Self::Socks5)
     }
 }
 
@@ -159,9 +192,11 @@ impl ProxyConfig {
             .get("proxy_mode")
             .map(|v| ProxyMode::parse_str(v))
             .unwrap_or(ProxyMode::None);
+        // 缺键或值损坏 → Http:这是设置页从未保存过代理类型时的历史默认值,
+        // 且 `proxy_mode` 通常同时为 `none`,不会真的去连一个 HTTP 代理。
         let proxy_type = map
             .get("proxy_type")
-            .map(|v| ProxyType::parse_str(v))
+            .and_then(|v| ProxyType::parse_str(v))
             .unwrap_or(ProxyType::Http);
         let host = map.get("proxy_host").cloned().unwrap_or_default();
         let port = map
@@ -194,9 +229,11 @@ impl ProxyConfig {
         self.proxy_type.is_socks()
     }
 
-    /// Build the full proxy URL string, e.g. `socks5://user:pass@host:port`.
+    /// Build the full proxy URL string, e.g. `socks5h://user:pass@host:port`.
     ///
-    /// Used by reqwest's `Proxy::all(url)` and for display purposes.
+    /// scheme 由 [`ProxyType::scheme`] 给出(SOCKS5 → `socks5h`),**与持久化的
+    /// `proxy_type` 值([`ProxyType::as_str`],恒为 `socks5`)是两条独立通道**。
+    /// Used by reqwest's `Proxy::all(url)`.
     /// Returns `None` if mode is `None` or host is empty.
     pub fn to_proxy_url(&self) -> Option<String> {
         match self.mode {
@@ -283,6 +320,10 @@ impl ProxyConfig {
     /// Used for per-task proxy override where the user provides a single URL.
     /// 两个哨兵值见 [`Self::DIRECT_SENTINEL`]（→ 直连）与
     /// [`Self::SYSTEM_SENTINEL`]（→ `System` 模式，调用方应随后 `resolve()`）。
+    ///
+    /// scheme 无法识别(用户拼错)时按 [`ProxyType::Http`] 处理并打日志。
+    /// 这里刻意**不**回退直连:静默直连会把本该走代理的流量放到明网上,
+    /// 用户还以为代理生效了;按 HTTP 处理则在建连阶段就报错,可归因。
     pub fn from_proxy_url(url: &str) -> Self {
         if url.is_empty() || url == Self::DIRECT_SENTINEL {
             return Self::default();
@@ -301,7 +342,13 @@ impl ProxyConfig {
             ("http", url)
         };
 
-        let proxy_type = ProxyType::parse_str(scheme);
+        let proxy_type = ProxyType::parse_str(scheme).unwrap_or_else(|| {
+            log_info!(
+                "[proxy] unrecognized proxy URL scheme {:?}, treating as http",
+                scheme
+            );
+            ProxyType::Http
+        });
 
         // Extract auth (user:pass@) if present
         let (auth, host_port) = if let Some(at_idx) = rest.rfind('@') {
@@ -806,20 +853,36 @@ fn socks5_auth(
 // SOCKS4 synchronous TCP helper (for FTP proxy)
 // ---------------------------------------------------------------------------
 
-/// Establish a TCP connection through a SOCKS4 proxy (synchronous).
+/// Establish a TCP connection through a SOCKS4/SOCKS4a proxy (synchronous).
 ///
-/// SOCKS4 only supports IPv4 addresses — domain names are resolved locally
-/// before connecting (SOCKS4a would support remote resolution, but is less
-/// commonly configured).
+/// `remote_dns = false`（SOCKS4，RFC 无正式文本，见 SOCKS4 协议规范）：目标
+/// 域名在本地解析成 IPv4 后下发，代理只看到 IP。
+/// `remote_dns = true`（SOCKS4a）：DSTIP 填 `0.0.0.x`（x ≠ 0，这个非法 IP 就是
+/// 4a 的信号），USERID 之后追加以 NUL 结尾的目标域名，由代理解析。纯 SOCKS4
+/// 服务端不认这个扩展，因此只在用户显式选择 [`ProxyType::Socks4a`] 时启用。
 pub fn socks4_connect_sync(
     proxy_host: &str,
     proxy_port: u16,
     target_host: &str,
     target_port: u16,
+    remote_dns: bool,
     timeout: std::time::Duration,
 ) -> Result<std::net::TcpStream, DownloadError> {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
+
+    // 4a 的域名以裸字节 + NUL 终止上送:非 ASCII 会被代理按字节乱解,内嵌
+    // NUL 会截断整条请求。在建连之前就拒绝,不发畸形包。
+    if remote_dns
+        && (target_host.is_empty()
+            || !target_host.is_ascii()
+            || target_host.as_bytes().contains(&0))
+    {
+        return Err(DownloadError::Other(format!(
+            "SOCKS4a rejects non-ASCII target host: {}",
+            target_host
+        )));
+    }
 
     let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
     let sock_addr: std::net::SocketAddr = proxy_addr.parse().or_else(|_| {
@@ -836,30 +899,33 @@ pub fn socks4_connect_sync(
     stream.set_read_timeout(Some(timeout)).ok();
     stream.set_write_timeout(Some(timeout)).ok();
 
-    // Resolve target to IPv4
-    let target_addr = format!("{}:{}", target_host, target_port);
-    let target_ip = target_addr
-        .to_socket_addrs()
-        .map_err(|e| DownloadError::Other(format!("target DNS resolve error: {}", e)))?
-        .find(|a| a.is_ipv4())
-        .ok_or_else(|| {
-            DownloadError::Other(format!(
-                "SOCKS4 requires IPv4 but {} has no IPv4 address",
-                target_host
-            ))
-        })?;
-
-    let ip_bytes = match target_ip.ip() {
-        std::net::IpAddr::V4(ipv4) => ipv4.octets(),
-        _ => {
-            return Err(DownloadError::Other(
-                "SOCKS4 requires IPv4 address".to_string(),
-            ));
+    // DSTIP：4a 用 0.0.0.1 占位，否则本地解析出真实 IPv4。
+    let ip_bytes: [u8; 4] = if remote_dns {
+        [0, 0, 0, 1]
+    } else {
+        let target_addr = format!("{}:{}", target_host, target_port);
+        let target_ip = target_addr
+            .to_socket_addrs()
+            .map_err(|e| DownloadError::Other(format!("target DNS resolve error: {}", e)))?
+            .find(|a| a.is_ipv4())
+            .ok_or_else(|| {
+                DownloadError::Other(format!(
+                    "SOCKS4 requires IPv4 but {} has no IPv4 address",
+                    target_host
+                ))
+            })?;
+        match target_ip.ip() {
+            std::net::IpAddr::V4(ipv4) => ipv4.octets(),
+            _ => {
+                return Err(DownloadError::Other(
+                    "SOCKS4 requires IPv4 address".to_string(),
+                ));
+            }
         }
     };
 
     // SOCKS4 CONNECT request
-    let req = vec![
+    let mut req = vec![
         0x04, // VN
         0x01, // CD = CONNECT
         (target_port >> 8) as u8,
@@ -870,6 +936,12 @@ pub fn socks4_connect_sync(
         ip_bytes[3],
         0x00, // USERID (null-terminated empty string)
     ];
+    if remote_dns {
+        // 目标域名以 NUL 结尾追加在 USERID 之后，由代理解析（合法性已在建连
+        // 之前校验）。
+        req.extend_from_slice(target_host.as_bytes());
+        req.push(0x00);
+    }
 
     stream
         .write_all(&req)
@@ -901,7 +973,7 @@ pub fn socks4_connect_sync(
     Ok(stream)
 }
 
-/// Convenience: connect through either SOCKS4 or SOCKS5 based on proxy config.
+/// Convenience: connect through SOCKS4 / SOCKS4a / SOCKS5 based on proxy config.
 pub fn socks_connect_sync(
     proxy: &ProxyConfig,
     target_host: &str,
@@ -918,9 +990,14 @@ pub fn socks_connect_sync(
             &proxy.password,
             timeout,
         ),
-        ProxyType::Socks4 => {
-            socks4_connect_sync(&proxy.host, proxy.port, target_host, target_port, timeout)
-        }
+        ProxyType::Socks4 | ProxyType::Socks4a => socks4_connect_sync(
+            &proxy.host,
+            proxy.port,
+            target_host,
+            target_port,
+            proxy.proxy_type == ProxyType::Socks4a,
+            timeout,
+        ),
         _ => Err(DownloadError::Other(format!(
             "socks_connect_sync called with non-SOCKS proxy type: {}",
             proxy.proxy_type.as_str()
@@ -1075,7 +1152,7 @@ pub fn proxy_connect_sync(
     timeout: std::time::Duration,
 ) -> Result<std::net::TcpStream, DownloadError> {
     match proxy.proxy_type {
-        ProxyType::Socks4 | ProxyType::Socks5 => {
+        ProxyType::Socks4 | ProxyType::Socks4a | ProxyType::Socks5 => {
             socks_connect_sync(proxy, target_host, target_port, timeout)
         }
         ProxyType::Http | ProxyType::Https => {
@@ -1147,9 +1224,14 @@ pub async fn test_proxy_connection(
 ) -> Result<i64, DownloadError> {
     use std::time::Instant;
 
+    // 类型无法识别时必须报错,不能悄悄按另一种协议去测:设置页那个「测试」
+    // 按钮的全部价值就在于它测的是用户真正会用的那条链路,测出来的「通过」
+    // 如果来自别的协议,比不测更有害。
+    let proxy_type = ProxyType::parse_str(proxy_type)
+        .ok_or_else(|| DownloadError::Other(format!("unsupported proxy type: {}", proxy_type)))?;
     let config = ProxyConfig {
         mode: ProxyMode::Manual,
-        proxy_type: ProxyType::parse_str(proxy_type),
+        proxy_type,
         host: proxy_host.to_string(),
         port: proxy_port.parse::<u16>().unwrap_or(0),
         username: proxy_username.to_string(),
@@ -1161,7 +1243,14 @@ pub async fn test_proxy_connection(
         DownloadError::Other("incomplete proxy config (host or port missing)".to_string())
     })?;
 
-    log_info!("[proxy-test] testing proxy: {}", proxy_url);
+    // 只记 scheme + host:port:`proxy_url` 的 userinfo 段带明文凭据,而日志
+    // 是用户提 issue 时会整份贴出来的东西(`build_client_inner` 同理)。
+    log_info!(
+        "[proxy-test] testing proxy: {}://{}:{}",
+        config.proxy_type.scheme(),
+        config.host,
+        config.port
+    );
 
     let mut proxy = reqwest::Proxy::all(&proxy_url)
         .map_err(|e| DownloadError::Other(format!("invalid proxy URL: {}", e)))?;
@@ -1240,7 +1329,7 @@ mod tests {
     use super::{
         ProxyConfig, ProxyMode, ProxyType, base64_encode, is_proxy_tls_handshake_failure,
         parse_connect_status_line, parse_host_port, parse_multi_protocol_proxy,
-        parse_windows_proxy_server, percent_decode, percent_encode_userinfo,
+        parse_windows_proxy_server, percent_decode, percent_encode_userinfo, socks4_connect_sync,
     };
     use std::collections::HashMap;
 
@@ -1270,14 +1359,39 @@ mod tests {
     // ProxyType
     // -----------------------------------------------------------------------
 
+    /// 识别集必须覆盖 reqwest 接受的每一个代理 scheme,识别不了的一律 `None`
+    /// ——绝不静默折算成 Http(那会把 SOCKS 端口当 HTTP 代理用)。
     #[test]
-    fn proxy_type_parse_str_roundtrip() {
-        assert_eq!(ProxyType::parse_str("http"), ProxyType::Http);
-        assert_eq!(ProxyType::parse_str("https"), ProxyType::Https);
-        assert_eq!(ProxyType::parse_str("socks4"), ProxyType::Socks4);
-        assert_eq!(ProxyType::parse_str("socks5"), ProxyType::Socks5);
-        assert_eq!(ProxyType::parse_str("unknown"), ProxyType::Http);
-        assert_eq!(ProxyType::parse_str(""), ProxyType::Http);
+    fn proxy_type_parse_str_recognizes_every_reqwest_scheme() {
+        assert_eq!(ProxyType::parse_str("http"), Some(ProxyType::Http));
+        assert_eq!(ProxyType::parse_str("https"), Some(ProxyType::Https));
+        assert_eq!(ProxyType::parse_str("socks4"), Some(ProxyType::Socks4));
+        assert_eq!(ProxyType::parse_str("socks4a"), Some(ProxyType::Socks4a));
+        assert_eq!(ProxyType::parse_str("socks5"), Some(ProxyType::Socks5));
+        assert_eq!(ProxyType::parse_str("socks5h"), Some(ProxyType::Socks5));
+    }
+
+    #[test]
+    fn proxy_type_parse_str_rejects_instead_of_defaulting_to_http() {
+        assert_eq!(ProxyType::parse_str("unknown"), None);
+        assert_eq!(ProxyType::parse_str(""), None);
+        assert_eq!(ProxyType::parse_str("SOCKS5"), None);
+        assert_eq!(ProxyType::parse_str("socks"), None);
+    }
+
+    /// 每个变体的 wire 值都必须能被自己解析回来,否则往返一圈就换了协议。
+    #[test]
+    fn proxy_type_as_str_parses_back_to_itself() {
+        for t in [
+            ProxyType::Http,
+            ProxyType::Https,
+            ProxyType::Socks4,
+            ProxyType::Socks4a,
+            ProxyType::Socks5,
+        ] {
+            assert_eq!(ProxyType::parse_str(t.as_str()), Some(t.clone()), "{:?}", t);
+            assert_eq!(ProxyType::parse_str(t.scheme()), Some(t.clone()), "{:?}", t);
+        }
     }
 
     #[test]
@@ -1285,7 +1399,25 @@ mod tests {
         assert_eq!(ProxyType::Http.scheme(), "http");
         assert_eq!(ProxyType::Https.scheme(), "https");
         assert_eq!(ProxyType::Socks4.scheme(), "socks4");
-        assert_eq!(ProxyType::Socks5.scheme(), "socks5");
+        assert_eq!(ProxyType::Socks4a.scheme(), "socks4a");
+        // 代理侧 DNS 解析,见 `ProxyType::scheme` 文档。
+        assert_eq!(ProxyType::Socks5.scheme(), "socks5h");
+    }
+
+    /// scheme(reqwest URL)与 as_str(持久化 wire 值)必须保持解耦:
+    /// UI 下拉/DB/Dart 侧的 `proxy_type` 恒为 `socks5`,绝不能漂成 `socks5h`。
+    #[test]
+    fn proxy_type_as_str_is_not_the_reqwest_scheme() {
+        assert_eq!(ProxyType::Socks5.as_str(), "socks5");
+        assert_ne!(ProxyType::Socks5.as_str(), ProxyType::Socks5.scheme());
+        for t in [
+            ProxyType::Http,
+            ProxyType::Https,
+            ProxyType::Socks4,
+            ProxyType::Socks4a,
+        ] {
+            assert_eq!(t.as_str(), t.scheme());
+        }
     }
 
     #[test]
@@ -1293,6 +1425,7 @@ mod tests {
         assert!(!ProxyType::Http.is_socks());
         assert!(!ProxyType::Https.is_socks());
         assert!(ProxyType::Socks4.is_socks());
+        assert!(ProxyType::Socks4a.is_socks());
         assert!(ProxyType::Socks5.is_socks());
     }
 
@@ -1385,8 +1518,221 @@ mod tests {
         };
         assert_eq!(
             config.to_proxy_url().as_deref(),
-            Some("socks5://admin:secret@socks.example.com:1080")
+            Some("socks5h://admin:secret@socks.example.com:1080")
         );
+    }
+
+    /// 用户/外部 API 手写 `socks5h://` 时必须解析回 Socks5,再序列化仍是
+    /// `socks5h`——否则 `tasks.proxy_url` 往返一圈会退化成 HTTP CONNECT。
+    #[test]
+    fn socks5h_url_roundtrips_through_from_proxy_url() {
+        let c = ProxyConfig::from_proxy_url("socks5h://user:pass@127.0.0.1:1080");
+        assert_eq!(c.mode, ProxyMode::Manual);
+        assert_eq!(c.proxy_type, ProxyType::Socks5);
+        assert_eq!(c.host, "127.0.0.1");
+        assert_eq!(c.port, 1080);
+        assert_eq!(c.username, "user");
+        assert_eq!(c.password, "pass");
+        assert_eq!(
+            c.to_proxy_url().as_deref(),
+            Some("socks5h://user:pass@127.0.0.1:1080")
+        );
+    }
+
+    /// UI 侧仍然只会写出 `socks5://`(下拉值 = `as_str`),引擎必须把它归一化
+    /// 成代理侧解析——这条链路才是手动 SOCKS5 代理的实际生产路径。
+    #[test]
+    fn plain_socks5_task_url_is_normalized_to_remote_dns() {
+        let c = ProxyConfig::from_proxy_url("socks5://127.0.0.1:3067");
+        assert_eq!(c.proxy_type, ProxyType::Socks5);
+        assert_eq!(
+            c.to_proxy_url().as_deref(),
+            Some("socks5h://127.0.0.1:3067")
+        );
+    }
+
+    /// `socks4a://` 曾被 `_ => Http` 通配吞成 HTTP 代理——对着 SOCKS 端口发
+    /// HTTP CONNECT,失败得毫无线索。现在必须原样兑现远端解析语义。
+    #[test]
+    fn socks4a_url_is_honored_not_downgraded() {
+        let c = ProxyConfig::from_proxy_url("socks4a://127.0.0.1:9050");
+        assert_eq!(c.proxy_type, ProxyType::Socks4a);
+        assert!(c.is_socks());
+        assert_eq!(
+            c.to_proxy_url().as_deref(),
+            Some("socks4a://127.0.0.1:9050")
+        );
+    }
+
+    /// SOCKS4/SOCKS4a 请求的线格式(手写握手,没有库兜底):4a 用非法 DSTIP
+    /// `0.0.0.1` 当信号、并在 USERID 的 NUL 之后追加以 NUL 结尾的目标域名;
+    /// 非 4a 必须本地解析出真实 IPv4 且不追加任何东西。字节错一位代理就把
+    /// 整条请求当垃圾丢掉。
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn socks4_request_wire_format_matches_the_dns_mode() {
+        use std::io::{Read, Write};
+
+        /// stub 代理捕获到的一条请求。
+        struct Request {
+            /// 定长部分:VN CD DSTPORT(2) DSTIP(4) USERID-NUL。
+            head: [u8; 9],
+            /// 定长部分之后的字节(4a 的域名 + NUL;非 4a 应为空)。
+            tail: Vec<u8>,
+        }
+        struct Stub {
+            port: u16,
+            handle: std::thread::JoinHandle<Request>,
+        }
+
+        /// 收一条请求、回一个成功应答,把收到的字节交回来。头部 9 字节定长;
+        /// 之后再单读一次——4a 的域名与头部同一个 write 发出,必然已在缓冲区,
+        /// 非 4a 则读到超时返回空。
+        fn stub_socks4() -> Stub {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub socks4");
+            let port = listener.local_addr().expect("stub addr").port();
+            let handle = std::thread::spawn(move || {
+                let (mut sock, _) = listener.accept().expect("accept from client");
+                sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                    .ok();
+                let mut head = [0u8; 9];
+                sock.read_exact(&mut head).expect("read request head");
+                let mut buf = [0u8; 256];
+                let n = sock.read(&mut buf).unwrap_or(0);
+                // 0x5A = request granted
+                sock.write_all(&[0, 0x5A, 0, 0, 0, 0, 0, 0])
+                    .expect("write reply");
+                Request {
+                    head,
+                    tail: buf[..n].to_vec(),
+                }
+            });
+            Stub { port, handle }
+        }
+
+        let timeout = std::time::Duration::from_secs(5);
+
+        // SOCKS4a:域名原样上送,DSTIP 是 0.0.0.1 哨兵。
+        let stub = stub_socks4();
+        socks4_connect_sync(
+            "127.0.0.1",
+            stub.port,
+            "blocked.example.invalid",
+            8080,
+            true,
+            timeout,
+        )
+        .expect("socks4a connect");
+        let req = stub.handle.join().expect("stub thread");
+        assert_eq!(&req.head[..2], &[0x04, 0x01], "VN=4 CD=CONNECT");
+        assert_eq!(&req.head[2..4], &8080u16.to_be_bytes(), "DSTPORT 网络序");
+        assert_eq!(&req.head[4..8], &[0, 0, 0, 1], "4a 哨兵 DSTIP");
+        assert_eq!(req.head[8], 0, "空 USERID 的终止 NUL");
+        assert_eq!(req.tail, b"blocked.example.invalid\0", "域名交给代理解析");
+
+        // SOCKS4:本地解析出 IPv4 下发,请求到 USERID 的 NUL 为止。
+        let stub = stub_socks4();
+        socks4_connect_sync("127.0.0.1", stub.port, "127.0.0.1", 8080, false, timeout)
+            .expect("socks4 connect");
+        let req = stub.handle.join().expect("stub thread");
+        assert_eq!(&req.head[4..8], &[127, 0, 0, 1], "本地解析出的真实 IPv4");
+        assert!(req.tail.is_empty(), "非 4a 不得追加域名");
+    }
+
+    /// 4a 的域名走裸字节 + NUL 终止,非 ASCII 会被代理按字节乱解、含 NUL 会
+    /// 直接截断整条请求——两者都必须在发包前拒绝,而不是发一条畸形请求。
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    fn socks4a_rejects_hosts_it_cannot_encode() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let timeout = std::time::Duration::from_secs(5);
+        for bad in ["测试.example.com", "a\0b.example.com", ""] {
+            let err = socks4_connect_sync("127.0.0.1", port, bad, 80, true, timeout)
+                .expect_err("必须拒绝");
+            assert!(
+                err.to_string().contains("SOCKS4a"),
+                "错误要指明是 SOCKS4a 编码问题: {}",
+                err
+            );
+        }
+    }
+
+    /// 手动 SOCKS5 代理的**端到端行为契约**:生产路径构建出来的 client 必须
+    /// 把目标 hostname 原样交给代理解析(RFC 1928 §4 ATYP=0x03 DOMAINNAME),
+    /// 而不是本地解析后只把 IP 送过去。DNS 被投毒/封锁的域名下,本地解析拿到
+    /// 的地址是错的,代理再通也救不回来。
+    ///
+    /// stub 代理只做 RFC 1928 问候 + 读一条 CONNECT 请求,读完即断——断言只
+    /// 看代理收到了什么,不需要真实出网。目标域名取不可解析的 `.invalid`
+    /// (RFC 2606):本地解析路径根本到不了代理,accept 超时即判定回归。
+    #[tokio::test]
+    #[allow(clippy::unwrap_used, clippy::expect_used)]
+    async fn manual_socks5_client_hands_hostname_to_the_proxy() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub socks5 listener");
+        let proxy_port = listener.local_addr().expect("stub listener addr").port();
+
+        let stub = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept from client");
+            // 问候:VER NMETHODS METHODS... → 选“无认证”。
+            let mut head = [0u8; 2];
+            sock.read_exact(&mut head).await.expect("read greeting");
+            let mut methods = vec![0u8; head[1] as usize];
+            sock.read_exact(&mut methods).await.expect("read methods");
+            sock.write_all(&[0x05, 0x00]).await.expect("write choice");
+            // 请求:VER CMD RSV ATYP DST.ADDR DST.PORT。
+            let mut req = [0u8; 4];
+            sock.read_exact(&mut req).await.expect("read request head");
+            let atyp = req[3];
+            let addr = match atyp {
+                0x01 => {
+                    let mut v4 = [0u8; 4];
+                    sock.read_exact(&mut v4).await.expect("read ipv4");
+                    std::net::Ipv4Addr::from(v4).to_string()
+                }
+                0x03 => {
+                    let mut len = [0u8; 1];
+                    sock.read_exact(&mut len).await.expect("read domain len");
+                    let mut name = vec![0u8; len[0] as usize];
+                    sock.read_exact(&mut name).await.expect("read domain");
+                    String::from_utf8_lossy(&name).into_owned()
+                }
+                other => format!("unsupported atyp {}", other),
+            };
+            (atyp, addr)
+        });
+
+        let config = ProxyConfig {
+            mode: ProxyMode::Manual,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: proxy_port,
+            username: String::new(),
+            password: String::new(),
+            no_proxy_list: String::new(),
+        };
+        let client = crate::downloader::build_client_with_tls_policy(&config, "", false)
+            .expect("build manual socks5 client");
+        // 请求必然失败(stub 不回 reply),只用来驱动一次代理握手。
+        let driver = tokio::spawn(async move {
+            client
+                .get("http://poisoned.example.invalid/seg0")
+                .send()
+                .await
+        });
+
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(5), stub)
+            .await
+            .expect("代理未收到任何连接:目标域名被本地解析吞掉了(socks5 而非 socks5h)")
+            .expect("stub socks5 task panicked");
+        driver.abort();
+
+        assert_eq!(observed.0, 0x03, "SOCKS5 请求必须用 DOMAINNAME 地址类型");
+        assert_eq!(observed.1, "poisoned.example.invalid");
     }
 
     #[test]
@@ -1766,7 +2112,7 @@ mod tests {
         // '@' and ':' in credentials must be percent-encoded
         assert!(url.contains("user%40domain"));
         assert!(url.contains("p%40ss%3Aword"));
-        assert!(url.starts_with("socks5://"));
+        assert!(url.starts_with("socks5h://"));
         assert!(url.ends_with("@proxy.com:1080"));
     }
 

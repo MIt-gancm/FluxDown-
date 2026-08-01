@@ -822,19 +822,20 @@ mod tests {
 
     #[test]
     fn bump_confirm_uses_credit_clock_not_renewal_gap() {
+        // 续期节奏取计分窗的一半:相邻两次续期永远 < 窗口,但第三次距上次
+        // 计分已 1.5 倍窗口。基准若错挂在 proxy_ts 上,最常用的 host 反而
+        // 永远攒不够确认次数、到不了 AdoptProxy。
+        let renew_gap = PROXY_CONFIRM_GAP_SECS / 2;
         let mut e = HostRoute::default();
         bump_proxy_confirm(&mut e, NOW);
         assert_eq!(e.proxy_n, 1, "首次确认 +1");
-        // 高频使用病例：每 5h 续期。若计分基准是 proxy_ts，任何相邻间隔
-        // 都 <12h，最常用的 host 反而永远到不了 AdoptProxy；credit clock
-        // （confirm_ts）下第三次续期距上次计分 15h > 12h，正常 +1。
-        bump_proxy_confirm(&mut e, NOW + 5 * 3600);
-        bump_proxy_confirm(&mut e, NOW + 10 * 3600);
-        assert_eq!(e.proxy_n, 1, "距上次计分 <12h 不加分");
-        assert_eq!(e.proxy_ts, NOW + 10 * 3600, "续期必须刷新时间戳");
-        bump_proxy_confirm(&mut e, NOW + 15 * 3600);
-        assert_eq!(e.proxy_n, 2, "计分窗到点即 +1，不被高频续期推迟");
-        assert_eq!(e.confirm_ts, NOW + 15 * 3600, "计分时钟随计分推进");
+        bump_proxy_confirm(&mut e, NOW + renew_gap);
+        bump_proxy_confirm(&mut e, NOW + 2 * renew_gap);
+        assert_eq!(e.proxy_n, 1, "距上次计分未过窗口不加分");
+        assert_eq!(e.proxy_ts, NOW + 2 * renew_gap, "续期必须刷新时间戳");
+        bump_proxy_confirm(&mut e, NOW + 3 * renew_gap);
+        assert_eq!(e.proxy_n, 2, "计分窗到点即 +1,不被高频续期推迟");
+        assert_eq!(e.confirm_ts, NOW + 3 * renew_gap, "计分时钟随计分推进");
     }
 
     #[test]
