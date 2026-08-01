@@ -297,6 +297,35 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message,
     return 0;
   }
 
+  // 最大化几何：窗口样式去掉了 WS_CAPTION（见 win32_window.cpp），系统
+  // 预填的 MINMAXINFO 默认值随之退化为「整个显示器矩形」而非工作区，
+  // 最大化后会盖住任务栏。window_manager 的 WM_GETMINMAXINFO 分支只写
+  // Min/MaxTrackSize 且返回 0（短路 DefWindowProc），不会纠正这一点。
+  // 故在转发给插件之前按窗口所在显示器的工作区改写 ptMaxSize /
+  // ptMaxPosition —— 不 return，让插件继续叠加最小尺寸约束。
+  // ptMaxPosition 是相对显示器左上角的偏移，不是屏幕绝对坐标。
+  // 全屏由插件剥掉 WS_THICKFRAME 后直接 SetWindowPos 到显示器矩形，
+  // 此处以 WS_THICKFRAME 为闸门跳过，避免把全屏夹回工作区。
+  if (message == WM_GETMINMAXINFO &&
+      (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_THICKFRAME) != 0) {
+    MONITORINFO mi = {};
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST),
+                       &mi)) {
+      auto* info = reinterpret_cast<MINMAXINFO*>(lparam);
+      const LONG work_w = mi.rcWork.right - mi.rcWork.left;
+      const LONG work_h = mi.rcWork.bottom - mi.rcWork.top;
+      info->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left;
+      info->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top;
+      info->ptMaxSize.x = work_w;
+      info->ptMaxSize.y = work_h;
+      // 只放大不缩小：默认 MaxTrackSize 基于主显示器，副屏更大时会把
+      // 最大化尺寸夹小；同时不主动限制用户手动拖拽的上限。
+      info->ptMaxTrackSize.x = std::max(info->ptMaxTrackSize.x, work_w);
+      info->ptMaxTrackSize.y = std::max(info->ptMaxTrackSize.y, work_h);
+    }
+  }
+
   // Give Flutter, including plugins, an opportunity to handle window messages.
   if (flutter_controller_) {
     std::optional<LRESULT> result =
