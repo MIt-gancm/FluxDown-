@@ -1734,21 +1734,42 @@ class SettingsProvider extends ChangeNotifier {
     applyLoadedConfig(pack.message.entries);
   }
 
+  /// 已完整逐键打印过的配置快照哈希（进程级）。
+  ///
+  /// 一次启动里 `ConfigLoaded` 会被多个 SettingsProvider 实例各收一遍
+  /// （HomePage 的 globalInstance + ExternalDownloadService 持有的 fallback
+  /// 实例），内容完全相同却各刷 60~120 行。实测一个会话触发 5 次、
+  /// 占日志总量 70%+，把 2MB 分卷阈值迅速撑爆、挤掉真正有用的历史。
+  /// 内容与上次一致时只留一行摘要。
+  static int? _dumpedConfigHash;
+
   /// Applies config entries loaded from Rust.
   /// Exposed for tests; production code receives them via the signal stream.
   @visibleForTesting
   void applyLoadedConfig(List<ConfigEntry> entries) {
-    logInfo('Settings', '_onConfigLoaded: ${entries.length} entries');
+    final hash = Object.hashAll([
+      for (final entry in entries) Object.hash(entry.key, entry.value),
+    ]);
+    final dumpKeys = hash != _dumpedConfigHash;
+    _dumpedConfigHash = hash;
+    logInfo(
+      'Settings',
+      dumpKeys
+          ? '_onConfigLoaded: ${entries.length} entries'
+          : '_onConfigLoaded: ${entries.length} entries (unchanged)',
+    );
     String legacyOpenDirCmd = '';
     // 追踪 reveal_file_cmd 键是否出现在配置中（区分「从未设置」与「已清空」）。
     bool revealFileCmdPresent = false;
     // 追踪「程序」分类迁移是否已执行过（键存在 = 已迁移，删除不再复活）。
     bool programCategoryMigrated = false;
     for (final entry in entries) {
-      logInfo(
-        'Settings',
-        '  config: ${entry.key}=${_truncateForLog(entry.value)}',
-      );
+      if (dumpKeys) {
+        logInfo(
+          'Settings',
+          '  config: ${entry.key}=${_truncateForLog(entry.value)}',
+        );
+      }
       switch (entry.key) {
         case 'default_save_dir':
           _defaultSaveDir = entry.value;

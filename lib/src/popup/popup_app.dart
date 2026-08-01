@@ -242,11 +242,16 @@ class _PopupShellState extends State<_PopupShell> {
 
   /// 测量标题栏 + 表单内容的自然总高并上报原生宿主。
   ///
-  /// 首次（新载荷首帧）走 `reveal`：原生一次到位设高并显示窗口；
+  /// 首次（新载荷首帧）走 `reveal`：原生一次到位设尺寸并显示窗口；
   /// 此后走 `resize`：内容在 AnimatedSize 中渐变，本方法随动画每帧触发，
   /// 原生窗口以小步长平滑跟随。高度均经 [_kMaxWindowHeight] 截断。
   /// 清单视图态由 [_requestManifestResize] 负责固定尺寸，本方法直接返回
   /// （Offstage 中的表单仍在布局，不得用其尺寸驱动窗口）。
+  ///
+  /// reveal **必须同时带宽度**：原生宿主在 show 时只移动窗口、不再重置
+  /// 尺寸（隐藏状态下改尺寸会撞上 macOS 的 1 秒 resize 同步超时，见
+  /// PopupWindowHost.showPopup），所以上一次会话若停在清单视图态
+  /// （780 宽）关窗，宽度归位只能由本次 reveal 负责。
   void _requestResize() {
     if (!mounted || _manifest != null) return;
     final bodySize = _contentKey.currentContext?.size;
@@ -257,15 +262,16 @@ class _PopupShellState extends State<_PopupShell> {
     if (!_revealed) {
       _revealed = true;
       _lastSentHeight = target;
-      _popupChannel.invokeMethod<void>('reveal', {'height': target}).catchError(
-        (_) {
-          // 旧版原生宿主无 reveal（NotImplemented）：其 show 流程会自行
-          // 显示窗口，退化为既有行为——补发 resize 修正高度即可。
-          _popupChannel
-              .invokeMethod<void>('resize', {'height': target})
-              .catchError((_) {});
-        },
-      );
+      _lastSentWidth = _kFormWindowWidth;
+      final args = <String, double>{
+        'height': target,
+        'width': _kFormWindowWidth,
+      };
+      _popupChannel.invokeMethod<void>('reveal', args).catchError((_) {
+        // 旧版原生宿主无 reveal（NotImplemented）：其 show 流程会自行
+        // 显示窗口，退化为既有行为——补发 resize 修正尺寸即可。
+        _popupChannel.invokeMethod<void>('resize', args).catchError((_) {});
+      });
       return;
     }
     // 从清单视图返回表单后宽度需归位（needWidthRestore 强制重发一次）。

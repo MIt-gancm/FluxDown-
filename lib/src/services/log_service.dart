@@ -29,6 +29,18 @@ class LogService {
   LogService._();
   static final LogService instance = LogService._();
 
+  /// 测试专用实例：日志目录显式指定，且不启动定时刷盘定时器
+  /// （`writeStringSync` 本身就是直写 syscall，测试可直接读文件校验）。
+  /// 生产代码一律用 [instance] + [init]。
+  @visibleForTesting
+  factory LogService.forTest(Directory logDir) {
+    final service = LogService._();
+    service._initialized = true;
+    service._logDir = logDir;
+    service._rotateSink();
+    return service;
+  }
+
   RandomAccessFile? _raf;
   String? _currentDateTag;
   Timer? _flushTimer;
@@ -46,10 +58,6 @@ class LogService {
   /// 日志目录总大小默认上限（可由设置覆盖，见 [maxTotalBytes]）
   static const int _defaultMaxTotalBytes = 10 * 1024 * 1024;
 
-  /// 距上次 stat 实际文件大小的写入字节阈值。
-  /// Dart/Rust 两端写同一文件，自身计数会低估，需周期性校准。
-  static const int _sizeCheckIntervalBytes = 64 * 1024;
-
   /// 日志文件名格式：fluxdown_YYYY-MM-DD.log 或 fluxdown_YYYY-MM-DD.N.log
   static final RegExp _logNamePattern = RegExp(
     r'^fluxdown_(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.log$',
@@ -60,11 +68,9 @@ class LogService {
   /// 当前日期内的分卷序号（0 = 无序号的首个文件）
   int _currentPart = 0;
 
-  /// 当前文件大小估算（打开时 stat 初始化 + 自身写入累加，周期性校准）
-  int _approxSize = 0;
-
-  /// 距上次 stat 校准以来自身写入的字节数
-  int _bytesSinceStat = 0;
+  /// 当前文件大小。每次写入前经 [_writeRaw] 的 `lengthSync()` 重新读取，
+  /// 因此始终等于文件真实长度。
+  int _fileSize = 0;
 
   /// 日志目录总大小上限（字节）。设置后立即执行一次超量清理。
   set maxTotalBytes(int bytes) {
@@ -123,6 +129,33 @@ class LogService {
     });
   }
 
+  /// 把 [text] 追加到当前日志文件尾。
+  ///
+  /// **必须经本方法写，不要直接 `_raf.writeStringSync`。**
+  /// Rust 端（native/engine/src/logger.rs）用真正的 `O_APPEND` 写同一个文件，
+  /// 而 dart:io 的 `FileMode.append` 并不带 `O_APPEND`——它只是
+  /// `open(O_RDWR|O_CREAT)` 之后做一次 `lseek(SEEK_END)`
+  /// （dart-sdk runtime/bin/file_macos.cc / file_win.cc）。这个 fd 的写位置
+  /// 只随 Dart 自己的写入前进，Rust 每追加 N 字节，Dart 的下一次写就从落后
+  /// N 字节处开始，**原地覆盖掉 Rust 刚写的内容**。Dart 写入量远大于 Rust，
+  /// 结果是 Rust 侧日志几乎全军覆没（实测：macOS 用户 6 个会话 3400+ 行里
+  /// 一条 Rust 日志都没有，Windows 上也只有会话末尾 Dart 停写后的残余）。
+  ///
+  /// 因此每次写前用 `lengthSync()` 读真实长度并在落后时重新 seek。
+  /// 残留竞态仅剩「seek 与 write 之间 Rust 恰好追加一行」，窗口在微秒级，
+  /// 最坏影响是偶发一行被覆盖，而不是当前的整体丢失。
+  void _writeRaw(String text) {
+    final raf = _raf;
+    if (raf == null) return;
+    final length = raf.lengthSync();
+    if (length != _fileSize) {
+      raf.setPositionSync(length);
+    }
+    raf.writeStringSync(text);
+    _fileSize = length + text.length;
+    _dirty = true;
+  }
+
   /// 写一条日志。[tag] 是模块标签，[message] 是内容。
   void log(String tag, String message) {
     if (!_initialized) return;
@@ -131,16 +164,12 @@ class LogService {
       final now = DateTime.now();
       final ts =
           '${_pad2(now.hour)}:${_pad2(now.minute)}:${_pad2(now.second)}.${_pad3(now.millisecond)}';
-      final line = '$ts [$tag] $message\n';
-      _raf?.writeStringSync(line);
-      _dirty = true;
-      _approxSize += line.length;
-      _bytesSinceStat += line.length;
+      _writeRaw('$ts [$tag] $message\n');
       _maybeRollBySize();
       // 仅在 debug 模式下输出到控制台，避免 release 模式的字符串缓存开销
       if (kDebugMode) {
         // ignore: avoid_print
-        print(line.trimRight());
+        print('$ts [$tag] $message');
       }
     } catch (e) {
       // 日志服务本身不应该抛异常影响业务
@@ -289,16 +318,14 @@ class LogService {
     _currentPart = _scanActivePart(dateTag);
     _openCurrentFile();
 
-    final header =
-        '\n'
-        '====== FluxDown log session started at $now ======\n'
-        '  pid: $pid\n'
-        '  exe: ${Platform.resolvedExecutable}\n'
-        '  isolate: ${Isolate.current.debugName}\n'
-        '\n';
-    _raf!.writeStringSync(header);
-    _approxSize += header.length;
-    _dirty = true;
+    _writeRaw(
+      '\n'
+      '====== FluxDown log session started at $now ======\n'
+      '  pid: $pid\n'
+      '  exe: ${Platform.resolvedExecutable}\n'
+      '  isolate: ${Isolate.current.debugName}\n'
+      '\n',
+    );
     _enforceTotalSize();
   }
 
@@ -314,8 +341,7 @@ class LogService {
   void _openCurrentFile() {
     final file = File(_filePath(_currentDateTag!, _currentPart));
     _raf = file.openSync(mode: FileMode.append);
-    _approxSize = _raf!.lengthSync();
-    _bytesSinceStat = 0;
+    _fileSize = _raf!.lengthSync();
   }
 
   String _filePath(String dateTag, int part) {
@@ -344,16 +370,10 @@ class LogService {
     return maxPart;
   }
 
-  /// 大小检查与自动分割：自身写入量达到阈值时 stat 一次实际大小校准，
-  /// 超过单文件上限则切换到新分卷并触发总量清理。
+  /// 自动分割：当前文件超过单文件上限时切换到新分卷并触发总量清理。
+  /// [_fileSize] 由 [_writeRaw] 每次写入时按真实文件长度刷新，无需再额外校准。
   void _maybeRollBySize() {
-    if (_bytesSinceStat >= _sizeCheckIntervalBytes) {
-      _bytesSinceStat = 0;
-      try {
-        _approxSize = _raf?.lengthSync() ?? _approxSize;
-      } catch (_) {}
-    }
-    if (_approxSize < _maxFileBytes || _currentDateTag == null) return;
+    if (_fileSize < _maxFileBytes || _currentDateTag == null) return;
 
     _closeRaf();
     final next = _scanActivePart(_currentDateTag!);

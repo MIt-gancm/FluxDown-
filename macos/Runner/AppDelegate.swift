@@ -6,7 +6,16 @@ import UserNotifications
 class AppDelegate: FlutterAppDelegate, UNUserNotificationCenterDelegate {
   override func applicationDidFinishLaunching(_ notification: Notification) {
     UNUserNotificationCenter.current().delegate = self
-    super.applicationDidFinishLaunching(notification)
+    // 不能调 super：FlutterAppDelegate 只实现了 applicationWillFinishLaunching:，
+    // 没有 applicationDidFinishLaunching:（见 Flutter engine
+    // shell/platform/darwin/macos/framework/Source/FlutterAppDelegate.mm）。
+    // Swift 允许写 super 是因为该方法是 NSApplicationDelegate 的 optional 协议
+    // 要求，运行时 objc_msgSendSuper 落空 → NSInvalidArgumentException：
+    //   -[FluxDown.AppDelegate applicationDidFinishLaunching:]: unrecognized selector
+    // 异常会从 -[NSApplication _postDidFinishNotification] 一路抛穿
+    // _handleAEOpenEvent:，使排在本 delegate 之后注册的
+    // NSApplicationDidFinishLaunchingNotification 观察者全部收不到通知，
+    // 且被 AppKit 在 runloop 边界吞掉（不崩溃、不产生崩溃报告）。
   }
 
   override func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

@@ -47,19 +47,13 @@ const MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 /// 日志目录总大小默认上限（可由设置覆盖）
 const DEFAULT_MAX_TOTAL_BYTES: u64 = 10 * 1024 * 1024;
 
-/// 距上次 stat 实际文件大小的写入字节阈值。
-/// Dart/Rust 两端写同一文件，自身计数会低估，需周期性校准。
-const SIZE_CHECK_INTERVAL_BYTES: u64 = 64 * 1024;
-
 struct LogState {
     date_tag: String,
     /// 当前日期内的分卷序号（0 = 无序号的首个文件）
     part: u32,
     file: Option<File>,
-    /// 当前文件大小估算（打开时 stat 初始化 + 自身写入累加，周期性校准）
-    approx_size: u64,
-    /// 距上次 stat 校准以来自身写入的字节数
-    bytes_since_stat: u64,
+    /// 当前文件实际大小（每次写入后经 `metadata()` 刷新，见 `maybe_roll_by_size`）
+    size: u64,
 }
 
 struct AppLogger {
@@ -78,8 +72,7 @@ impl AppLogger {
                 date_tag: String::new(),
                 part: 0,
                 file: None,
-                approx_size: 0,
-                bytes_since_stat: 0,
+                size: 0,
             }),
         }
     }
@@ -106,8 +99,6 @@ impl AppLogger {
                 let _ = f.flush();
             }
         }
-        state.approx_size += line.len() as u64;
-        state.bytes_since_stat += line.len() as u64;
         self.maybe_roll_by_size(&mut state);
     }
 
@@ -126,12 +117,11 @@ impl AppLogger {
         self.open_current_file(state);
     }
 
-    /// 打开 (date_tag, part) 对应的日志文件（append 模式），并 stat 初始化大小估算。
+    /// 打开 (date_tag, part) 对应的日志文件（append 模式），并 stat 初始化大小。
     fn open_current_file(&self, state: &mut LogState) {
         let path = self.file_path(&state.date_tag, state.part);
         if let Ok(f) = OpenOptions::new().create(true).append(true).open(&path) {
-            state.approx_size = f.metadata().map(|m| m.len()).unwrap_or(0);
-            state.bytes_since_stat = 0;
+            state.size = f.metadata().map(|m| m.len()).unwrap_or(0);
             state.file = Some(f);
         }
     }
@@ -173,18 +163,20 @@ impl AppLogger {
         }
     }
 
-    /// 大小检查与自动分割：自身写入量达到阈值时 stat 一次实际大小校准，
-    /// 超过单文件上限则切换到新分卷并触发总量清理。
+    /// 每次写入后按**真实文件长度**决定是否分割，超限则切换到新分卷并触发
+    /// 总量清理。
+    ///
+    /// 必须每次都 stat，不能靠自身写入量累加：Dart 端（lib/src/services/
+    /// log_service.dart）写同一个文件且写入量远大于本端，自身计数必然低估 ——
+    /// 那会导致 Dart 已经滚到新分卷、本端还在往写满的旧分卷里追加，两端
+    /// 时间线被拆散（本端写入频率低，一次 fstat 的开销可忽略）。
     fn maybe_roll_by_size(&self, state: &mut LogState) {
-        if state.bytes_since_stat >= SIZE_CHECK_INTERVAL_BYTES {
-            state.bytes_since_stat = 0;
-            if let Some(ref f) = state.file
-                && let Ok(meta) = f.metadata()
-            {
-                state.approx_size = meta.len();
-            }
+        if let Some(ref f) = state.file
+            && let Ok(meta) = f.metadata()
+        {
+            state.size = meta.len();
         }
-        if state.approx_size < MAX_FILE_BYTES || state.date_tag.is_empty() {
+        if state.size < MAX_FILE_BYTES || state.date_tag.is_empty() {
             return;
         }
 
@@ -223,7 +215,7 @@ impl AppLogger {
             let _ = f.write_all(header.as_bytes());
             let _ = f.flush();
         }
-        state.approx_size += header.len() as u64;
+        self.maybe_roll_by_size(&mut state);
     }
 
     /// 清理超过 `max_days` 天的 `fluxdown_*.log` 文件

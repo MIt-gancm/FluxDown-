@@ -5,7 +5,8 @@
 // - 主引擎通道 fluxdown/popup_host（注册在主引擎 messenger 上）：show / close / relay，
 //   回调 onResult / onClosed / onRelay。
 // - 弹窗引擎通道 fluxdown/popup_child（注册在弹窗引擎 messenger 上）：ready / submit /
-//   cancel / pickFolder / startDrag / resize（可选 width）/ relay，回调 setPayload / onRelay。
+//   cancel / pickFolder / startDrag / reveal（height + width）/ resize（height，可选
+//   width）/ relay，回调 setPayload / appendPayload / onRelay。
 //
 // 设计原则（方案评审硬性约束，勿改）：
 // - 弹窗窗口 + 弹窗引擎懒创建、常驻复用：首次 show 创建，之后仅 hide/show，
@@ -15,6 +16,13 @@
 //   不初始化 Rust；所有环境数据经载荷 JSON 注入。
 // - 系统级关闭（performClose / windowShouldClose）语义等价于 cancel：隐藏 + 中继
 //   onClosed，禁止真正销毁窗口。
+// - **窗口隐藏（orderOut）期间绝不改尺寸**：Flutter macOS embedder 的
+//   FlutterView.setFrameSize: 会同步进入 FlutterResizeSynchronizer.beginResize，
+//   自旋阻塞主线程等一帧新尺寸画面、硬超时 1.0 秒；而 orderOut 的窗口
+//   NSWindow.screen == nil，FlutterDisplayLink 不注册 vsync，那一帧永远不来。
+//   show 只负责移动位置，尺寸（宽 + 高）一律由 reveal 在窗口已上屏后一次设定
+//   —— 弹窗 Dart 因此必须在 reveal 里同时带 width（见 popup_app.dart
+//   _requestResize）。Windows/Linux 宿主无此约束，但保持同一套消息语义。
 
 import Cocoa
 import CoreGraphics
@@ -135,6 +143,14 @@ final class PopupWindowHost: NSObject, NSWindowDelegate {
     /// 由弹窗 Dart 在新载荷首帧就绪后经 reveal 一次到位「设高 + 显示」——
     /// 消除旧表单闪现与默认高度→内容高度的二段跳。同时武装兜底定时器：
     /// reveal 超时未到达时按当前尺寸强制显示，保证窗口永远弹得出来。
+    ///
+    /// 硬性约束（勿改）：**窗口隐藏期间绝不改尺寸**。macOS embedder 的
+    /// `FlutterView.setFrameSize:` 会同步调用 `FlutterResizeSynchronizer`
+    /// `beginResize`，它自旋阻塞主线程直到光栅线程提交一帧新尺寸画面，
+    /// 硬超时 1.0 秒；而 `orderOut` 的窗口 `NSWindow.screen == nil`，
+    /// `FlutterDisplayLink` 因此不注册 vsync，新尺寸帧永远等不到 —— 每次
+    /// 复用弹窗都白白吃满 1 秒主线程停摆（见 issue #244，实测 1034/1046/
+    /// 1054ms，而首次 show 因 `didReceiveFrame == false` 直接放行只要 3ms）。
     private func showPopup(payloadJson: String) -> Bool {
         let win = ensurePopupWindow()
 
@@ -146,9 +162,10 @@ final class PopupWindowHost: NSObject, NSWindowDelegate {
             pendingPayload = payloadJson
         }
 
-        // 重置为初始尺寸并居中：避免复用窗口残留上一次请求 resize() 后的
-        // 高度；reveal 到达时会按内容实高覆盖。
-        repositionCentered(win, width: kPopupWidth, height: kPopupInitialHeight)
+        // 仅居中，不动尺寸：高度一律由 reveal 按内容实高一次设定
+        // （reveal 缺席时兜底定时器按当前尺寸显示，比强行塞回默认高度更贴近
+        // 上一次的真实内容高度）。
+        recenter(win)
 
         let fallback = DispatchWorkItem { [weak self] in
             self?.revealFallback = nil
@@ -161,10 +178,30 @@ final class PopupWindowHost: NSObject, NSWindowDelegate {
     }
 
     /// 显示并激活（reveal 握手的显示端；也是兜底定时器的强制显示入口）。
-    private func presentPopup() {
+    ///
+    /// `logicalHeight` 非 nil 时先设高再显示，且**先把窗口以全透明状态上屏**
+    /// 再改尺寸：`NSWindow.screen` 只有窗口 ordered-in 后才非 nil，
+    /// `FlutterDisplayLink` 依赖它注册 vsync；隐藏态改尺寸会让
+    /// `FlutterResizeSynchronizer` 空等一帧永远不来的新尺寸画面并硬超时 1 秒
+    /// （详见 showPopup 注释）。透明期内窗口不可见、不吃鼠标事件，
+    /// 用户看到的仍是「一次到位」的显示，没有二段跳。
+    private func presentPopup(logicalHeight: CGFloat? = nil, width: CGFloat? = nil) {
         revealFallback?.cancel()
         revealFallback = nil
         guard let win = window else { return }
+        if let height = logicalHeight {
+            if win.isVisible {
+                applyLogicalHeight(height, width: width)
+            } else {
+                let restoreAlpha = win.alphaValue
+                win.alphaValue = 0
+                win.ignoresMouseEvents = true
+                win.orderFront(nil)
+                applyLogicalHeight(height, width: width)
+                win.ignoresMouseEvents = false
+                win.alphaValue = restoreAlpha
+            }
+        }
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         syncPopupScale()
@@ -178,7 +215,7 @@ final class PopupWindowHost: NSObject, NSWindowDelegate {
     /// the layer scale already looks right.
     private func syncPopupScale() {
         guard let win = window, let view = popupController?.view else { return }
-        // Ordered-out windows report screen == nil; fall back like repositionCentered.
+        // Ordered-out windows report screen == nil; fall back like recenter.
         let scale = win.screen?.backingScaleFactor
             ?? NSScreen.screens.first?.backingScaleFactor
             ?? win.backingScaleFactor
@@ -322,14 +359,16 @@ final class PopupWindowHost: NSObject, NSWindowDelegate {
         case "resize":
             handleResize(call, result: result)
         case "reveal":
-            // reveal 握手：新载荷首帧已就绪 — 设高完成后显示并激活
-            // （presentPopup 内部解除兜底定时器）。已可见时等价一次 resize。
-            if let args = call.arguments as? [String: Any],
-                let height = (args["height"] as? NSNumber)?.doubleValue, height > 0 {
-                let width = (args["width"] as? NSNumber)?.doubleValue
-                applyLogicalHeight(CGFloat(height), width: width.flatMap { $0 > 0 ? CGFloat($0) : nil })
-            }
-            presentPopup()
+            // reveal 握手：新载荷首帧已就绪 — 设高 + 显示交给 presentPopup
+            // 一并完成（内部解除兜底定时器，并保证设高时窗口已在屏，
+            // 避免隐藏态 resize 撞上 1 秒的 FlutterResizeSynchronizer 超时）。
+            // 已可见时等价一次 resize。
+            let args = call.arguments as? [String: Any]
+            let height = (args?["height"] as? NSNumber)?.doubleValue ?? 0
+            let width = (args?["width"] as? NSNumber)?.doubleValue ?? 0
+            let logicalHeight: CGFloat? = height > 0 ? CGFloat(height) : nil
+            let logicalWidth: CGFloat? = width > 0 ? CGFloat(width) : nil
+            presentPopup(logicalHeight: logicalHeight, width: logicalWidth)
             result(nil)
         default:
             result(FlutterMethodNotImplemented)
@@ -453,18 +492,26 @@ final class PopupWindowHost: NSObject, NSWindowDelegate {
     // 窗口定位
     // -------------------------------------------------------------------
 
-    /// 以给定逻辑尺寸居中于主屏（screens.first，全局坐标原点所在屏，与 FloatingBallPanel
-    /// 的主屏约定一致）。取不到屏幕信息时退化为仅设置尺寸，不改变原点。
-    /// 仅重定位/设尺寸，不改变窗口可见性（显示由 presentPopup 负责）。
-    private func repositionCentered(_ win: NSWindow, width: CGFloat, height: CGFloat) {
-        guard let visible = NSScreen.screens.first?.visibleFrame else {
-            let old = win.frame
-            win.setFrame(NSRect(x: old.origin.x, y: old.origin.y, width: width, height: height), display: true)
-            return
-        }
-        let x = visible.origin.x + (visible.width - width) / 2
-        let y = visible.origin.y + (visible.height - height) / 2
-        win.setFrame(NSRect(x: x, y: y, width: width, height: height), display: true)
+    /// 把弹窗摆到主屏（screens.first，全局坐标原点所在屏，与 FloatingBallPanel
+    /// 的主屏约定一致）的固定起始位置。取不到屏幕信息时原地不动。
+    ///
+    /// 只移动、绝不改尺寸：`setFrameOrigin` 不触碰 contentView 的
+    /// `setFrameSize:`，因此不会唤起 `FlutterResizeSynchronizer` 的阻塞式
+    /// resize 同步；尺寸一律由 reveal / resize 在窗口已在屏时设定。
+    /// 不改变窗口可见性（显示由 presentPopup 负责）。
+    ///
+    /// 锚的是**顶边**而不是中心：`applyLogicalHeight` 以旧 frame 的 maxY 为锚
+    /// 反推新 origin.y，所以把顶边固定在「kPopupInitialHeight 高的窗口居中时
+    /// 的顶边」，reveal 设高后的最终位置与「先居中到默认高度再设高」逐像素
+    /// 一致，也与 Windows/Linux 宿主的摆放语义保持同构。
+    private func recenter(_ win: NSWindow) {
+        guard let visible = NSScreen.screens.first?.visibleFrame else { return }
+        let size = win.frame.size
+        let topY = visible.origin.y + (visible.height + kPopupInitialHeight) / 2
+        win.setFrameOrigin(NSPoint(
+            x: visible.origin.x + (visible.width - size.width) / 2,
+            y: topY - size.height
+        ))
     }
 
     // -------------------------------------------------------------------
