@@ -32,17 +32,18 @@ use crate::signals::{
     DetectSystemProxy, DownloadUpdate, Ed2kServerSubscriptionResult, ExternalDownloadRequest,
     FfmpegInstallProgress, FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList,
     FileAssociationStatus, GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin,
-    InstallPlugin, InstallUpdate, InstallYtdlp, MoveTaskToQueue, OpenFile, ProbeTorrentMeta,
-    ProxyTestResult, RefreshRssSource, RenameGroup, RenameTask, RenameTaskResult,
-    ReorderQueueTasks, RequestAllGroups, RequestAllQueues, RequestAllRssSources, RequestAllTasks,
-    RequestConfig, RequestFfmpegStatus, RequestFfmpegVersions, RequestMarketIndex, RequestPlugins,
-    RequestRssItems, RequestUpdateFailureMarker, RequestWebhookDeliveries, RequestYtdlpStatus,
-    RequestYtdlpVersions, RescanFiles, ResolvePreviewRequest, RevealFile, SaveConfig,
-    SavePluginSettings, SelectBtFiles, SelectHlsQuality, SelectResolveVariant, SetFileAssociation,
-    SetPluginEnabled, SetPriorityTask, SetQueueSchedule, SetRssItemAction, SetTaskSeedLimits,
-    SetUrlProtocol, SimulateWebhookEvent, StartQueue, StopQueue, SystemProxyInfo,
-    TaskSegmentsUpdated, TestProxyConnection, TestWebhookEndpoint, TrackerSubscriptionResult,
-    UninstallFfmpeg, UninstallPlugin, UninstallYtdlp, UpdateCheckResult,
+    InstallPlugin, InstallUpdate, InstallYtdlp, MoveTaskToQueue, NativeListenerRestartResult,
+    NmhRepairResult, OpenFile, ProbeTorrentMeta, ProxyTestResult, RefreshRssSource, RenameGroup,
+    RenameTask, RenameTaskResult, ReorderQueueTasks, RepairNmhRegistration, RequestAllGroups,
+    RequestAllQueues, RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
+    RequestFfmpegVersions, RequestMarketIndex, RequestPlugins, RequestRssItems,
+    RequestUpdateFailureMarker, RequestWebhookDeliveries, RequestYtdlpStatus, RequestYtdlpVersions,
+    RescanFiles, ResolvePreviewRequest, RestartNativeListener, RevealFile, RunDiagnostics,
+    SaveConfig, SavePluginSettings, SelectBtFiles, SelectHlsQuality, SelectResolveVariant,
+    SetFileAssociation, SetPluginEnabled, SetPriorityTask, SetQueueSchedule, SetRssItemAction,
+    SetTaskSeedLimits, SetUrlProtocol, SimulateWebhookEvent, StartQueue, StopQueue,
+    SystemProxyInfo, TaskSegmentsUpdated, TestProxyConnection, TestWebhookEndpoint,
+    TrackerSubscriptionResult, UninstallFfmpeg, UninstallPlugin, UninstallYtdlp, UpdateCheckResult,
     UpdateEd2kServerSubscription, UpdateFailureMarker, UpdateQueue, UpdateRssSource,
     UpdateTaskSegments, UpdateTrackerSubscription, UrlProtocolStatus, ValidateRssFeed,
     WebhookDeliveries, WebhookPresets, WebhookSimulateAck, WebhookTestResult, YtdlpInstallProgress,
@@ -1149,6 +1150,61 @@ pub async fn run(db_dir: PathBuf) {
             link_dispatch(signal.message);
         }
     });
+
+    // 设置页 Doctor：诊断 + 就地修复（NMH 重注册 / 监听重启）。这些都只读写
+    // 注册表与本机端点，完全不碰 Engine，所以既不进主 `select!`（64 分支已满）
+    // 也不并进 `aux_tx`——那条通道的语义是「需要 actor 独占的 Engine」。每条
+    // 请求再 spawn 一层，探针的秒级超时不会拖住后续请求。
+    {
+        let run_diag_recv = RunDiagnostics::get_dart_signal_receiver();
+        let repair_nmh_recv = RepairNmhRegistration::get_dart_signal_receiver();
+        let restart_listener_recv = RestartNativeListener::get_dart_signal_receiver();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(signal) = run_diag_recv.recv() => {
+                        let msg = signal.message;
+                        tokio::spawn(async move {
+                            crate::diagnostics::run(msg.local_server_port, msg.local_server_enabled)
+                                .await
+                                .send_signal_to_dart();
+                        });
+                    }
+                    Some(_) = repair_nmh_recv.recv() => {
+                        tokio::spawn(async move {
+                            let outcome = tokio::task::spawn_blocking(|| {
+                                crate::nmh_registry::register().map_err(|e| format!("{e:#}"))
+                            })
+                            .await;
+                            let error = match outcome {
+                                Ok(Ok(())) => String::new(),
+                                Ok(Err(e)) => e,
+                                Err(e) => format!("repair task panicked: {e}"),
+                            };
+                            if !error.is_empty() {
+                                log_info!("[doctor] NMH re-registration failed: {}", error);
+                            }
+                            NmhRepairResult { ok: error.is_empty(), error }.send_signal_to_dart();
+                        });
+                    }
+                    Some(_) = restart_listener_recv.recv() => {
+                        tokio::spawn(async move {
+                            let error = match crate::native_messaging::restart_listener().await {
+                                Ok(()) => String::new(),
+                                Err(e) => e,
+                            };
+                            if !error.is_empty() {
+                                log_info!("[doctor] listener restart failed: {}", error);
+                            }
+                            NativeListenerRestartResult { ok: error.is_empty(), error }
+                                .send_signal_to_dart();
+                        });
+                    }
+                    else => break,
+                }
+            }
+        });
+    }
 
     loop {
         tokio::select! {

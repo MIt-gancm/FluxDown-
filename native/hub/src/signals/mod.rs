@@ -2046,3 +2046,75 @@ pub struct WebhookTestResult {
     pub latency_ms: i64,
     pub error_message: String,
 }
+
+// ---------------------------------------------------------------------------
+// 设置页 Doctor（诊断 / 一键修复）
+// ---------------------------------------------------------------------------
+
+/// 跑一遍设置页 Doctor 诊断（Dart → Rust）。
+///
+/// 本地服务端口/开关由 Dart 传入而非引擎现查，好处是整条诊断链路不碰 actor，
+/// 也不需要 `Engine` 句柄（见 `diagnostics::run`）。
+#[derive(Deserialize, DartSignal)]
+pub struct RunDiagnostics {
+    /// 本地 HTTP 服务端口（`GET /ping` 探活用）。
+    pub local_server_port: i32,
+    /// 本地 HTTP 服务总开关；false 时该项报 `info`（已关闭）而不是失败。
+    pub local_server_enabled: bool,
+}
+
+/// 单项诊断结论。
+#[derive(Serialize, SignalPiece)]
+pub struct DiagnosticCheck {
+    /// 稳定 wire id，Dart 按它查标题 i18n（`nmh_binary` / `nmh_manifest` /
+    /// `nmh_browser` / `app_listener` / `local_server` / `url_protocol` /
+    /// `torrent_association` / `log_dir`）。
+    pub id: String,
+    /// 子项名（浏览器名 / 协议 scheme）；空 = 该 id 只有一条。不翻译。
+    pub target: String,
+    /// `ok` | `warn` | `error` | `info`。
+    pub level: String,
+    /// 技术细节（路径 / 注册表值 / 错误原文）。不翻译，原样展示 + 进复制文本。
+    pub detail: String,
+    /// 修复建议 wire code（`reinstall_app` / `reregister_nmh` / `restart_app` /
+    /// `enable_local_server` / `check_firewall` / `enable_protocol` /
+    /// `protocol_claimed` / `check_disk`）；空 = 无建议。
+    pub hint: String,
+}
+
+/// Doctor 诊断报告（Rust → Dart）。
+#[derive(Serialize, RustSignal)]
+pub struct DiagnosticsReport {
+    pub checks: Vec<DiagnosticCheck>,
+    /// 环境信息行（`os: …` / `exe: …` / `logDir: …` 等），原样展示 + 进复制文本。
+    pub environment: Vec<String>,
+    /// NMH 中继自身日志尾部（首行是日志文件路径）；空 = 无日志文件。
+    pub nmh_log_tail: String,
+}
+
+/// 「一键修复」重写 NMH 注册（Dart → Rust）。幂等，等价于启动时的自动注册。
+#[derive(Deserialize, DartSignal)]
+pub struct RepairNmhRegistration {}
+
+/// NMH 重注册结果（Rust → Dart）。
+#[derive(Serialize, RustSignal)]
+pub struct NmhRepairResult {
+    pub ok: bool,
+    /// 失败原因原文；ok 时为空。
+    pub error: String,
+}
+
+/// 重启本机 Native Messaging 监听端点（Dart → Rust）。
+///
+/// 监听被外部拆掉（安全软件清理端点 / 端口名被抢）后不必重启整个 App，
+/// Doctor 页直接就地拉起。
+#[derive(Deserialize, DartSignal)]
+pub struct RestartNativeListener {}
+
+/// 监听重启结果（Rust → Dart）。
+#[derive(Serialize, RustSignal)]
+pub struct NativeListenerRestartResult {
+    pub ok: bool,
+    /// 失败原因原文；ok 时为空。
+    pub error: String,
+}

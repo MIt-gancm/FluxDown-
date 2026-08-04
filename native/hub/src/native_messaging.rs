@@ -449,6 +449,12 @@ mod server {
         loop {
             let raw = match read_framed_message(&mut pipe).await {
                 Ok(data) => data,
+                // 对端读完应答就断开是正常收尾（中继退出、Doctor 的 ping 探针），
+                // 按 error 打会让每次诊断都往日志里塞一行假故障。
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log_info!("[nmh-pipe] client disconnected");
+                    break;
+                }
                 Err(e) => {
                     log_info!("[nmh-pipe] read error: {}", e);
                     break;
@@ -590,57 +596,62 @@ mod server {
         }
     }
 
-    /// Spawn the Named Pipe server, feeding download requests into `tx` and
-    /// answering `tasks`/`task_op`/`open_file`/`reveal_file` via `api_host`.
-    /// The receiving end of `tx` is owned by `download_actor` and shared with
-    /// the local HTTP takeover server so both transports converge on one
-    /// channel.
-    pub fn spawn_listener_with(tx: mpsc::Sender<Vec<DownloadRequest>>, api_host: Arc<dyn ApiHost>) {
-        tokio::spawn(async move {
-            log_info!("[nmh-pipe] starting Named Pipe server at {}", PIPE_NAME);
+    /// Accept loop for an already-created pipe server instance.
+    async fn accept_loop(
+        mut server: tokio::net::windows::named_pipe::NamedPipeServer,
+        tx: mpsc::Sender<Vec<DownloadRequest>>,
+        api_host: Arc<dyn ApiHost>,
+    ) {
+        loop {
+            // Wait for a client to connect.
+            if let Err(e) = server.connect().await {
+                log_info!("[nmh-pipe] connect error: {}", e);
+                // Brief pause before retrying.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
 
-            // Create the first server instance before entering the loop.
-            let mut server = match create_instance(true) {
+            log_info!("[nmh-pipe] client connected");
+
+            // Create the next server instance to accept the next client
+            // while we handle the current one.
+            let next_server = match create_instance(false) {
                 Ok(s) => s,
                 Err(e) => {
-                    log_info!("[nmh-pipe] failed to create pipe server: {}", e);
-                    return;
+                    log_info!("[nmh-pipe] failed to create next pipe instance: {}", e);
+                    // Can't accept more clients, but handle the current one.
+                    let tx_clone = tx.clone();
+                    let api_host_clone = api_host.clone();
+                    tokio::spawn(handle_pipe_client(server, tx_clone, api_host_clone));
+                    // Exit the accept loop — single client mode until restart.
+                    break;
                 }
             };
 
-            loop {
-                // Wait for a client to connect.
-                if let Err(e) = server.connect().await {
-                    log_info!("[nmh-pipe] connect error: {}", e);
-                    // Brief pause before retrying.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    continue;
-                }
+            // Hand off the connected server to a task.
+            let connected = std::mem::replace(&mut server, next_server);
+            let tx_clone = tx.clone();
+            let api_host_clone = api_host.clone();
+            tokio::spawn(handle_pipe_client(connected, tx_clone, api_host_clone));
+        }
+    }
 
-                log_info!("[nmh-pipe] client connected");
-
-                // Create the next server instance to accept the next client
-                // while we handle the current one.
-                let next_server = match create_instance(false) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log_info!("[nmh-pipe] failed to create next pipe instance: {}", e);
-                        // Can't accept more clients, but handle the current one.
-                        let tx_clone = tx.clone();
-                        let api_host_clone = api_host.clone();
-                        tokio::spawn(handle_pipe_client(server, tx_clone, api_host_clone));
-                        // Exit the accept loop — single client mode until restart.
-                        break;
-                    }
-                };
-
-                // Hand off the connected server to a task.
-                let connected = std::mem::replace(&mut server, next_server);
-                let tx_clone = tx.clone();
-                let api_host_clone = api_host.clone();
-                tokio::spawn(handle_pipe_client(connected, tx_clone, api_host_clone));
-            }
-        });
+    /// Create the pipe server and spawn its accept loop, feeding download
+    /// requests into `tx` and answering `tasks`/`task_op`/`open_file`/
+    /// `reveal_file` via `api_host`. The receiving end of `tx` is owned by
+    /// `download_actor` and shared with the local HTTP takeover server so both
+    /// transports converge on one channel.
+    ///
+    /// The first instance is created **before** spawning so a bind failure is
+    /// returned to the caller instead of dying inside a detached task — the
+    /// Doctor page's "restart listener" action needs that verdict.
+    pub fn start_listener(
+        tx: mpsc::Sender<Vec<DownloadRequest>>,
+        api_host: Arc<dyn ApiHost>,
+    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+        log_info!("[nmh-pipe] starting Named Pipe server at {}", PIPE_NAME);
+        let server = create_instance(true)?;
+        Ok(tokio::spawn(accept_loop(server, tx, api_host)))
     }
 }
 
@@ -789,6 +800,11 @@ mod server {
         loop {
             let raw = match read_framed_message(&mut stream).await {
                 Ok(data) => data,
+                // 与 Windows 侧同口径：正常断开不算故障（见 handle_pipe_client）。
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    log_info!("[nmh-uds] client disconnected");
+                    break;
+                }
                 Err(e) => {
                     log_info!("[nmh-uds] read error: {}", e);
                     break;
@@ -819,50 +835,172 @@ mod server {
         }
     }
 
-    pub fn spawn_listener_with(tx: mpsc::Sender<Vec<DownloadRequest>>, api_host: Arc<dyn ApiHost>) {
-        let sock_path = socket_path();
-
-        tokio::spawn(async move {
-            // Remove stale socket file left by a previous run.
-            let _ = std::fs::remove_file(&sock_path);
-
-            let listener = match UnixListener::bind(&sock_path) {
-                Ok(l) => {
-                    log_info!(
-                        "[nmh-uds] Unix socket server started at {}",
-                        sock_path.display()
-                    );
-                    l
+    /// Accept loop for an already-bound Unix socket listener.
+    async fn accept_loop(
+        listener: UnixListener,
+        tx: mpsc::Sender<Vec<DownloadRequest>>,
+        api_host: Arc<dyn ApiHost>,
+    ) {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    log_info!("[nmh-uds] client connected");
+                    let tx_clone = tx.clone();
+                    let api_host_clone = api_host.clone();
+                    tokio::spawn(handle_client(stream, tx_clone, api_host_clone));
                 }
                 Err(e) => {
-                    log_info!("[nmh-uds] failed to bind Unix socket: {}", e);
-                    return;
-                }
-            };
-
-            // Restrict socket to owner-only so other local users cannot connect.
-            if let Err(e) =
-                std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
-            {
-                log_info!("[nmh-uds] failed to set socket permissions: {}", e);
-            }
-
-            loop {
-                match listener.accept().await {
-                    Ok((stream, _)) => {
-                        log_info!("[nmh-uds] client connected");
-                        let tx_clone = tx.clone();
-                        let api_host_clone = api_host.clone();
-                        tokio::spawn(handle_client(stream, tx_clone, api_host_clone));
-                    }
-                    Err(e) => {
-                        log_info!("[nmh-uds] accept error: {}", e);
-                    }
+                    log_info!("[nmh-uds] accept error: {}", e);
                 }
             }
-        });
+        }
+    }
+
+    /// Bind the Unix socket and spawn its accept loop.
+    ///
+    /// Binding happens **before** spawning so a bind failure is returned to the
+    /// caller instead of dying inside a detached task — the Doctor page's
+    /// "restart listener" action needs that verdict.
+    pub fn start_listener(
+        tx: mpsc::Sender<Vec<DownloadRequest>>,
+        api_host: Arc<dyn ApiHost>,
+    ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+        let sock_path = socket_path();
+        // Remove stale socket file left by a previous run (or by the listener
+        // we are replacing).
+        let _ = std::fs::remove_file(&sock_path);
+        let listener = UnixListener::bind(&sock_path)?;
+        log_info!(
+            "[nmh-uds] Unix socket server started at {}",
+            sock_path.display()
+        );
+
+        // Restrict socket to owner-only so other local users cannot connect.
+        if let Err(e) = std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+        {
+            log_info!("[nmh-uds] failed to set socket permissions: {}", e);
+        }
+
+        Ok(tokio::spawn(accept_loop(listener, tx, api_host)))
     }
 }
+
+// ---------------------------------------------------------------------------
+// Listener probe (settings page Doctor)
+// ---------------------------------------------------------------------------
+
+/// The endpoint the NMH relay connects to: Named Pipe path on Windows, Unix
+/// socket path elsewhere. Shown verbatim in the Doctor report.
+pub fn listener_endpoint() -> String {
+    #[cfg(windows)]
+    {
+        PIPE_NAME.to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        server::socket_path().to_string_lossy().into_owned()
+    }
+}
+
+/// Round-trip one `{"action":"ping"}` frame over any framed transport and
+/// require a `pong` reply.
+///
+/// [`PipeResponse`] is serialize-only, so the reply is matched on the raw
+/// bytes rather than deserialized — adding `Deserialize` just for the probe
+/// would put a test-only obligation on the wire type.
+async fn ping_round_trip<S>(stream: &mut S) -> Result<(), String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let payload = br#"{"action":"ping","msg_id":0}"#;
+    let len = payload.len() as u32;
+    stream
+        .write_all(&len.to_le_bytes())
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    stream
+        .write_all(payload)
+        .await
+        .map_err(|e| format!("write failed: {e}"))?;
+    stream
+        .flush()
+        .await
+        .map_err(|e| format!("flush failed: {e}"))?;
+
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let len = u32::from_le_bytes(len_buf);
+    if len == 0 || len > MAX_MESSAGE_SIZE {
+        return Err(format!("invalid reply length: {len}"));
+    }
+    let mut buf = vec![0u8; len as usize];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .map_err(|e| format!("read failed: {e}"))?;
+    let reply = String::from_utf8_lossy(&buf);
+    if reply.contains("pong") {
+        Ok(())
+    } else {
+        Err(format!("unexpected reply: {reply}"))
+    }
+}
+
+/// Connect to the local Native Messaging endpoint and ping it — exactly what
+/// the NMH relay does, so a green result proves the browser path works end to
+/// end up to the relay.
+///
+/// A wedged app (connection accepted, no reply) surfaces as a timeout instead
+/// of a false green, which is the whole point of probing rather than checking
+/// whether the listener task was spawned.
+pub async fn probe_listener(timeout: std::time::Duration) -> Result<(), String> {
+    let probe = async {
+        #[cfg(windows)]
+        {
+            let mut pipe = tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(PIPE_NAME)
+                .map_err(|e| format!("connect failed: {e}"))?;
+            ping_round_trip(&mut pipe).await
+        }
+        #[cfg(not(windows))]
+        {
+            let path = server::socket_path();
+            let mut stream = tokio::net::UnixStream::connect(&path)
+                .await
+                .map_err(|e| format!("connect failed: {e}"))?;
+            ping_round_trip(&mut stream).await
+        }
+    };
+    match tokio::time::timeout(timeout, probe).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("no response within {}ms", timeout.as_millis())),
+    }
+}
+
+/// Launch parameters + current accept-loop handle, kept so the Doctor page can
+/// restart the listener without the actor having to hand its channel over
+/// again.
+struct ListenerState {
+    tx: mpsc::Sender<Vec<DownloadRequest>>,
+    api_host: Arc<dyn ApiHost>,
+    handle: Option<tokio::task::JoinHandle<()>>,
+    /// A restart is in flight; a second one must not race it for the endpoint.
+    restarting: bool,
+}
+
+/// `None` until the actor starts the listener once.
+static LISTENER: std::sync::Mutex<Option<ListenerState>> = std::sync::Mutex::new(None);
+
+/// How long to keep retrying the bind after aborting the previous accept loop.
+/// The aborted task only releases the pipe handle / socket file when it is next
+/// polled, so the first attempt can legitimately lose the race.
+const RESTART_ATTEMPTS: u32 = 20;
+const RESTART_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Spawn the Native Messaging listener, feeding requests into the provided
 /// sender. Used by `download_actor` so that both the NMH transport and the
@@ -871,11 +1009,96 @@ mod server {
 /// `api_host` answers the `tasks`/`task_op`/`open_file`/`reveal_file`
 /// actions (task panel queries/controls), sharing the same instance the
 /// local HTTP API server uses.
+///
+/// A bind failure is logged, not fatal: the app stays usable and the Doctor
+/// page reports `app_listener` as failed with a restart action.
 pub fn spawn_native_messaging_listener_with(
     tx: mpsc::Sender<Vec<DownloadRequest>>,
     api_host: Arc<dyn ApiHost>,
 ) {
-    server::spawn_listener_with(tx, api_host);
+    let handle = match server::start_listener(tx.clone(), api_host.clone()) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            log_error!("[nmh] failed to start listener: {e:#}");
+            None
+        }
+    };
+    if let Ok(mut guard) = LISTENER.lock() {
+        *guard = Some(ListenerState {
+            tx,
+            api_host,
+            handle,
+            restarting: false,
+        });
+    }
+}
+
+/// Tear down the current accept loop and start a fresh one (settings page
+/// Doctor).
+///
+/// This is the recovery path for a listener that was never created or was torn
+/// down out from under us — security software killing the endpoint is the
+/// common case, and the user should not have to restart the whole app to get
+/// browser interception back.
+pub async fn restart_listener() -> Result<(), String> {
+    let (tx, api_host) = {
+        let mut guard = LISTENER
+            .lock()
+            .map_err(|_| "listener state poisoned".to_string())?;
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| "listener was never started".to_string())?;
+        // Two restarts in flight would race for the same endpoint name and one
+        // of them would report a bogus failure.
+        if state.restarting {
+            return Err("a restart is already in progress".to_string());
+        }
+        state.restarting = true;
+        if let Some(handle) = state.handle.take() {
+            handle.abort();
+        }
+        (state.tx.clone(), state.api_host.clone())
+    };
+
+    let outcome = rebind(tx, api_host).await;
+    if let Ok(mut guard) = LISTENER.lock()
+        && let Some(state) = guard.as_mut()
+    {
+        state.restarting = false;
+    }
+    outcome
+}
+
+/// Retry the bind until the aborted accept loop has released the endpoint.
+async fn rebind(
+    tx: mpsc::Sender<Vec<DownloadRequest>>,
+    api_host: Arc<dyn ApiHost>,
+) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 1..=RESTART_ATTEMPTS {
+        // Yield first: the aborted task must be polled once before it drops the
+        // pipe handle / socket file.
+        tokio::time::sleep(RESTART_RETRY_DELAY).await;
+        match server::start_listener(tx.clone(), api_host.clone()) {
+            Ok(handle) => {
+                if let Ok(mut guard) = LISTENER.lock()
+                    && let Some(state) = guard.as_mut()
+                {
+                    state.handle = Some(handle);
+                } else {
+                    // Losing the handle would leak an accept loop on the next
+                    // restart; fail loudly instead.
+                    handle.abort();
+                    return Err("listener state unavailable".to_string());
+                }
+                log_info!("[nmh] listener restarted on attempt {}", attempt);
+                return Ok(());
+            }
+            Err(e) => last_err = format!("{e:#}"),
+        }
+    }
+    log_error!("[nmh] listener restart failed: {}", last_err);
+    Err(last_err)
 }
 
 // wire 类型（DownloadRequest/RequestBody）的反序列化测试随类型迁移至
@@ -885,6 +1108,14 @@ pub fn spawn_native_messaging_listener_with(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    /// Doctor 的「重启监听」在监听从未启动过时必须回一条可读错误，而不是
+    /// panic 或空转 —— 那条 wire 错误会原样显示在诊断页上。
+    #[tokio::test]
+    async fn restart_without_a_started_listener_reports_it() {
+        let err = restart_listener().await.expect_err("must not succeed");
+        assert!(err.contains("never started"), "unexpected error: {err}");
+    }
 
     #[test]
     fn parse_batch_download_accepts_items_with_per_item_auth() {

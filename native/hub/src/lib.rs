@@ -1,6 +1,7 @@
 mod actors;
 mod api_host;
 mod compat_flags;
+mod diagnostics;
 mod file_association;
 mod logger;
 #[cfg(target_os = "macos")]

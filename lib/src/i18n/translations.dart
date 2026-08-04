@@ -2096,4 +2096,98 @@ class S {
     'queue.drained' => webhookEventQueueDrained,
     _ => wire,
   };
+
+  // ─────────────────────────────────────────────
+  // Doctor 环境诊断
+  // ─────────────────────────────────────────────
+  String get settingsCatDoctor => _r('settingsCatDoctor');
+  String get settingsCatDoctorDesc => _r('settingsCatDoctorDesc');
+  String get doctorTitle => _r('doctorTitle');
+  String get doctorDesc => _r('doctorDesc');
+  String get doctorRun => _r('doctorRun');
+  String get doctorRunning => _r('doctorRunning');
+  String doctorLastRun(String time) => _r('doctorLastRun', {'time': time});
+  String get doctorNeverRun => _r('doctorNeverRun');
+  String get doctorCopyReport => _r('doctorCopyReport');
+  String get doctorCopied => _r('doctorCopied');
+  String get doctorRepairNmh => _r('doctorRepairNmh');
+  String get doctorRepairing => _r('doctorRepairing');
+  String get doctorRepairOk => _r('doctorRepairOk');
+  String doctorRepairFailed(String error) =>
+      _r('doctorRepairFailed', {'error': error});
+  String get doctorAllHealthy => _r('doctorAllHealthy');
+  String doctorIssuesFound(int n) => _r('doctorIssuesFound', {'n': n});
+  String get doctorNmhLogTitle => _r('doctorNmhLogTitle');
+  String get doctorNmhLogEmpty => _r('doctorNmhLogEmpty');
+  String get doctorEnvTitle => _r('doctorEnvTitle');
+  String get doctorCheckNmhBinary => _r('doctorCheckNmhBinary');
+  String get doctorCheckNmhManifest => _r('doctorCheckNmhManifest');
+  String get doctorCheckNmhBrowser => _r('doctorCheckNmhBrowser');
+  String get doctorCheckAppListener => _r('doctorCheckAppListener');
+  String get doctorCheckLocalServer => _r('doctorCheckLocalServer');
+  String get doctorCheckUrlProtocol => _r('doctorCheckUrlProtocol');
+  String get doctorCheckTorrentAssociation =>
+      _r('doctorCheckTorrentAssociation');
+  String get doctorCheckLogDir => _r('doctorCheckLogDir');
+  String get doctorLevelOk => _r('doctorLevelOk');
+  String get doctorLevelWarn => _r('doctorLevelWarn');
+  String get doctorLevelError => _r('doctorLevelError');
+  String get doctorLevelInfo => _r('doctorLevelInfo');
+  String get doctorHintReinstallApp => _r('doctorHintReinstallApp');
+  String get doctorHintReregisterNmh => _r('doctorHintReregisterNmh');
+  String get doctorHintRestartApp => _r('doctorHintRestartApp');
+  String get doctorHintEnableLocalServer => _r('doctorHintEnableLocalServer');
+  String get doctorHintCheckFirewall => _r('doctorHintCheckFirewall');
+  String get doctorHintEnableProtocol => _r('doctorHintEnableProtocol');
+  String get doctorHintProtocolClaimed => _r('doctorHintProtocolClaimed');
+  String get doctorHintCheckDisk => _r('doctorHintCheckDisk');
+  String get doctorActionReregister => _r('doctorActionReregister');
+  String get doctorActionRestartListener => _r('doctorActionRestartListener');
+  String get doctorActionEnableService => _r('doctorActionEnableService');
+  String get doctorActionRegister => _r('doctorActionRegister');
+  String get doctorActionOpenLogDir => _r('doctorActionOpenLogDir');
+  String get doctorListenerRestartOk => _r('doctorListenerRestartOk');
+  String doctorListenerRestartFailed(String error) =>
+      _r('doctorListenerRestartFailed', {'error': error});
+  String get doctorRunDoneHealthy => _r('doctorRunDoneHealthy');
+  String doctorRunDoneIssues(int n) =>
+      _r('doctorRunDoneIssues', {'n': n});
+  List<String> get searchKeywordsDoctor =>
+      _r('searchKeywordsDoctor').split(',');
+
+  /// 检查项 id wire → 本地化标题；未知 id 回退原始 wire 串
+  /// （Rust 侧新增检查项时 UI 不留白，也不必等 Dart 侧同版本跟进）。
+  String doctorCheckLabel(String id) => switch (id) {
+    'nmh_binary' => doctorCheckNmhBinary,
+    'nmh_manifest' => doctorCheckNmhManifest,
+    'nmh_browser' => doctorCheckNmhBrowser,
+    'app_listener' => doctorCheckAppListener,
+    'local_server' => doctorCheckLocalServer,
+    'url_protocol' => doctorCheckUrlProtocol,
+    'torrent_association' => doctorCheckTorrentAssociation,
+    'log_dir' => doctorCheckLogDir,
+    _ => id,
+  };
+
+  /// 等级 wire → 本地化标签；未知等级回退原始 wire 串。
+  String doctorLevelLabel(String level) => switch (level) {
+    'ok' => doctorLevelOk,
+    'warn' => doctorLevelWarn,
+    'error' => doctorLevelError,
+    'info' => doctorLevelInfo,
+    _ => level,
+  };
+
+  /// 修复建议 code → 本地化建议；未知 code 回退原始 wire 串。
+  String doctorHintLabel(String code) => switch (code) {
+    'reinstall_app' => doctorHintReinstallApp,
+    'reregister_nmh' => doctorHintReregisterNmh,
+    'restart_app' => doctorHintRestartApp,
+    'enable_local_server' => doctorHintEnableLocalServer,
+    'check_firewall' => doctorHintCheckFirewall,
+    'enable_protocol' => doctorHintEnableProtocol,
+    'protocol_claimed' => doctorHintProtocolClaimed,
+    'check_disk' => doctorHintCheckDisk,
+    _ => code,
+  };
 }
