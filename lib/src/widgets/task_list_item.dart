@@ -511,6 +511,7 @@ class TaskHoverActionCluster extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
+    final s = LocaleScope.of(context);
     final buttons = <Widget>[];
     switch (task.status) {
       case TaskStatus.downloading:
@@ -518,35 +519,70 @@ class TaskHoverActionCluster extends StatelessWidget {
       case TaskStatus.preparing:
       case TaskStatus.resuming:
         buttons.add(
-          TaskActionButton(icon: LucideIcons.pause, primary: true, onTap: onPause),
+          TaskActionButton(
+            icon: LucideIcons.pause,
+            primary: true,
+            tooltip: s.pause,
+            onTap: onPause,
+          ),
         );
       case TaskStatus.paused:
       case TaskStatus.error:
         buttons.add(
-          TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
+          TaskActionButton(
+            icon: LucideIcons.play,
+            primary: true,
+            tooltip: s.resume,
+            onTap: onResume,
+          ),
         );
       case TaskStatus.completed:
         // 做种中可暂停；做种停止后可重新开始做种。
         if (task.isSeeding) {
           buttons.add(
-            TaskActionButton(icon: LucideIcons.pause, primary: true, onTap: onPause),
+            TaskActionButton(
+              icon: LucideIcons.pause,
+              primary: true,
+              tooltip: s.pause,
+              onTap: onPause,
+            ),
           );
         } else if (task.isSeedingStopped) {
           buttons.add(
-            TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
+            TaskActionButton(
+              icon: LucideIcons.play,
+              primary: true,
+              tooltip: s.resume,
+              onTap: onResume,
+            ),
           );
         }
       case TaskStatus.canceled:
         break; // 终态，无操作按钮（canceled 是只读远程镜像）
     }
+    // 「打开文件」——与右键菜单同条件（已完成且文件仍在磁盘上）
+    if (task.status == TaskStatus.completed && !task.fileMissing) {
+      buttons.add(
+        TaskActionButton(
+          icon: LucideIcons.fileOutput,
+          tooltip: s.openFile,
+          onTap: () => openFile(task.filePath),
+        ),
+      );
+    }
     buttons.add(
       TaskActionButton(
         icon: LucideIcons.folderOpen,
+        tooltip: s.openFolder,
         onTap: () => openFolder(task.revealFolderPath),
       ),
     );
     buttons.add(
-      TaskActionButton(icon: LucideIcons.moreHorizontal, onTapDown: onMoreTapDown),
+      TaskActionButton(
+        icon: LucideIcons.moreHorizontal,
+        tooltip: s.moreActions,
+        onTapDown: onMoreTapDown,
+      ),
     );
 
     return Container(
@@ -576,12 +612,22 @@ class TaskHoverActionCluster extends StatelessWidget {
   }
 }
 
+/// hover 多久弹出操作按钮说明。
+const Duration kTaskActionTooltipDelay = Duration(milliseconds: 300);
+
 /// 28×28 单个行/卡片操作按钮（design-proto-spec §5 `.act`）。
+///
+/// [tooltip] 非空时挂延迟气泡。`ShadTooltip` 不自带 hover 检测（靠 child 内层
+/// `ShadGestureDetector` 回调），本按钮的 child 是朴素 `MouseRegion`+
+/// `GestureDetector`，故与 [OverflowTooltipText] 同法自持
+/// [ShadTooltipController] + [Timer] 驱动显隐——既拿到确定的 300ms 延迟，
+/// 也不往手势层加识别器去和列表行的点击选中抢竞技场。
 class TaskActionButton extends StatefulWidget {
   final IconData icon;
   final VoidCallback? onTap;
   final void Function(TapDownDetails)? onTapDown;
   final bool primary;
+  final String? tooltip;
 
   const TaskActionButton({
     super.key,
@@ -589,6 +635,7 @@ class TaskActionButton extends StatefulWidget {
     this.onTap,
     this.onTapDown,
     this.primary = false,
+    this.tooltip,
   });
 
   @override
@@ -597,18 +644,59 @@ class TaskActionButton extends StatefulWidget {
 
 class _TaskActionButtonState extends State<TaskActionButton> {
   bool _hovered = false;
+  final ShadTooltipController _tooltipController = ShadTooltipController();
+  Timer? _tooltipTimer;
+
+  @override
+  void didUpdateWidget(TaskActionButton oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 列表行复用 State：按钮语义变了（如任务从下载中变完成）就作废上一条气泡。
+    if (oldWidget.tooltip != widget.tooltip) _hideTooltip();
+  }
+
+  @override
+  void dispose() {
+    _tooltipTimer?.cancel();
+    _tooltipController.dispose();
+    super.dispose();
+  }
+
+  void _scheduleTooltip() {
+    if (widget.tooltip == null) return;
+    _tooltipTimer?.cancel();
+    _tooltipTimer = Timer(kTaskActionTooltipDelay, () {
+      if (mounted) _tooltipController.show();
+    });
+  }
+
+  void _hideTooltip() {
+    _tooltipTimer?.cancel();
+    _tooltipTimer = null;
+    if (_tooltipController.isOpen) _tooltipController.hide();
+  }
 
   @override
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
-    return MouseRegion(
-      onEnter: (_) => setState(() => _hovered = true),
-      onExit: (_) => setState(() => _hovered = false),
+    final Widget button = MouseRegion(
+      onEnter: (_) {
+        setState(() => _hovered = true);
+        _scheduleTooltip();
+      },
+      onExit: (_) {
+        setState(() => _hovered = false);
+        _hideTooltip();
+      },
       cursor: SystemMouseCursors.click,
       child: GestureDetector(
         onTap: widget.onTap,
-        onTapDown: widget.onTapDown,
+        // 点下即撤气泡：「更多」会弹菜单盖住按钮，届时 MouseRegion 的 exit
+        // 不一定触发，气泡会滞留在菜单旁边。
+        onTapDown: (details) {
+          _hideTooltip();
+          widget.onTapDown?.call(details);
+        },
         child: Container(
           width: 28,
           height: 28,
@@ -628,8 +716,17 @@ class _TaskActionButtonState extends State<TaskActionButton> {
         ),
       ),
     );
+    final tooltip = widget.tooltip;
+    if (tooltip == null) return button;
+    // 无入场动画：已经等了 300ms，再叠淡入只是把等待拖长（同 task_list /
+    // rss_item_list 的既有 tooltip）。
+    return ShadTooltip(
+      controller: _tooltipController,
+      effects: const [],
+      builder: (_) => Text(tooltip),
+      child: button,
+    );
   }
-
 }
 
 // =============================================================================
@@ -810,7 +907,7 @@ void showTaskContextMenu(
   if (task.status == TaskStatus.completed && !task.fileMissing) {
     items.add(
       ContextMenuItem(
-        icon: LucideIcons.externalLink,
+        icon: LucideIcons.fileOutput,
         label: s.openFile,
         color: c.textPrimary,
         action: () => _openFile(filePath),

@@ -986,18 +986,34 @@ class _MemberActionCluster extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
+    final s = LocaleScope.of(context);
     final primaryBtn = switch (task.status) {
-      TaskStatus.error =>
-        TaskActionButton(icon: LucideIcons.rotateCcw, primary: true, onTap: onResume),
+      TaskStatus.error => TaskActionButton(
+        icon: LucideIcons.rotateCcw,
+        primary: true,
+        tooltip: s.resume,
+        onTap: onResume,
+      ),
       TaskStatus.downloading ||
       TaskStatus.pending ||
       TaskStatus.preparing ||
-      TaskStatus.resuming =>
-        TaskActionButton(icon: LucideIcons.pause, primary: true, onTap: onPause),
-      TaskStatus.paused =>
-        TaskActionButton(icon: LucideIcons.play, primary: true, onTap: onResume),
-      TaskStatus.completed =>
-        TaskActionButton(icon: LucideIcons.externalLink, onTap: onOpenFile),
+      TaskStatus.resuming => TaskActionButton(
+        icon: LucideIcons.pause,
+        primary: true,
+        tooltip: s.pause,
+        onTap: onPause,
+      ),
+      TaskStatus.paused => TaskActionButton(
+        icon: LucideIcons.play,
+        primary: true,
+        tooltip: s.resume,
+        onTap: onResume,
+      ),
+      TaskStatus.completed => TaskActionButton(
+        icon: LucideIcons.fileOutput,
+        tooltip: s.openFile,
+        onTap: onOpenFile,
+      ),
       // 已取消：只读远程镜像，「打开文件」不适用，留出等宽占位避免布局跳动
       TaskStatus.canceled => const SizedBox(width: 28, height: 28),
     };
@@ -1013,7 +1029,11 @@ class _MemberActionCluster extends StatelessWidget {
         children: [
           primaryBtn,
           const SizedBox(width: 2),
-          TaskActionButton(icon: LucideIcons.moreHorizontal, onTapDown: onMoreTapDown),
+          TaskActionButton(
+            icon: LucideIcons.moreHorizontal,
+            tooltip: s.moreActions,
+            onTapDown: onMoreTapDown,
+          ),
         ],
       ),
     );
