@@ -39,6 +39,12 @@ There is one configured token (`local_server_token`); how it must be presented d
 
 Constant-time comparison is used everywhere a token is checked, to avoid timing side-channels.
 
+### Cross-origin (CORS)
+
+By default the service returns **no** `Access-Control-Allow-Origin` on any request, so a cross-origin `fetch()` from a web page is blocked at the preflight — that is precisely why requiring the `X-FluxDown-Client` header keeps arbitrary web pages out (userscripts use `GM_xmlhttpRequest`, which is not subject to CORS).
+
+The **Allow cross-origin access from any website (CORS)** setting (`local_server_cors_allow_all`, off by default) gives that barrier up: preflight and real responses both carry `Access-Control-Allow-Origin: *`, and the preflight additionally carries `Access-Control-Allow-Private-Network: true` — the equivalent of aria2's `--rpc-allow-origin-all`. Its purpose is to let sites that probe for an aria2 service with a browser `fetch` detect FluxDown; the cost is that any web page can probe this port and submit download links. Still in effect: takeover and aria2 submissions raise the confirmation dialog on the desktop app, and the management API and MCP still require the token.
+
 ## Takeover/aria2 vs. management API: different semantics
 
 `POST /download`, `/download/batch`, and `aria2.addUri` all funnel into the same "external download" path. **On the desktop app**, this pops a confirmation dialog before anything downloads — the assumption is a browser extension or userscript on an untrusted page is asking on the user's behalf, so a human confirms it. **On the headless server**, there's no UI to show a confirmation dialog, so the same entry points create the task directly, identically to the management API.

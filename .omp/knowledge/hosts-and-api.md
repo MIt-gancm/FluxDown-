@@ -19,7 +19,8 @@
 | OpenAPI | `GET /api/v1/openapi.json`（utoipa 3.1，含漂移守卫测试） | 随管理 API | 无 |
 
 - **`ApiHost` trait**（`service.rs`）：必需方法（list/get/create/delete/pause/continue task、pause/continue all、list_queues、submit_external）+ 可默认降级方法（config/plugins/market/groups/resolve_preview/subscribe_task_events/…）。`UNKNOWN_ENDPOINT_MESSAGE` 区分未注册路由 404 与资源 404。
-- **鉴权**（`auth.rs`）：常量时间比较；接管需 `X-FluxDown-Client` 头（利用 CORS 预检挡跨源 fetch）；管理/MCP 强制非空 token（403）。桌面硬绑 127.0.0.1，不返 CORS 头。
+- **鉴权**（`auth.rs`）：常量时间比较；接管需 `X-FluxDown-Client` 头（利用 CORS 预检挡跨源 fetch）；管理/MCP 强制非空 token（403）。桌面默认绑 127.0.0.1（`local_server_lan_enabled` 可改绑 0.0.0.0），默认不返 CORS 头。
+- **CORS 豁免开关**（`local_server_cors_allow_all`，默认 false）：开启后 `cors_and_preflight` 中间件对预检与真实响应都发 `Access-Control-Allow-Origin: *`（+ `Allow-Private-Network: true`、`Allow-Headers` 回显），等价 aria2 `--rpc-allow-origin-all`。这是安全模型第 2 条的显式豁免——供「用浏览器 `fetch` 探测 aria2」的网站识别本机服务，代价是任意网页可探测/提交下载（仍受确认框 + 管理 token 保护）。
 - **语义区分**：脚本接管 → 外部下载流程（弹确认框）；aria2 `addUri`/管理 `POST /tasks` → 直接建任务返真实 ID（自动化预期无弹框）。`takeover.rs` 的 batch 两形态合并为单 `DownloadRequest`（url 换行 join，匹配 Dart 单确认约定）。
 - **aria2 纯映射**（`aria2.rs`）：GID↔task_id 编解码、`METHOD_NAMES`=36、`NOTIFICATION_NAMES`=6、业务错误统一 `code:1`。
 

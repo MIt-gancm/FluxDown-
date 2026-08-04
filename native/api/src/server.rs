@@ -20,7 +20,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post, put};
@@ -52,6 +52,15 @@ const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 const BIND_RETRIES: u32 = 20;
 /// 每次重绑重试间隔。
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// `Allow` / `Access-Control-Allow-Methods` 的方法全集。
+const ALLOWED_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
+/// `Access-Control-Allow-Origin` / `-Allow-Headers` 的通配值（仅在
+/// `cors_allow_all` 开启时使用）。
+const WILDCARD: HeaderValue = HeaderValue::from_static("*");
+/// Chrome 私有网络访问（Private/Local Network Access）预检响应头。
+/// `http` crate 未内置该常量，此处自建。
+const ALLOW_PRIVATE_NETWORK: HeaderName =
+    HeaderName::from_static("access-control-allow-private-network");
 
 /// API 服务器配置，从 DB config 表加载。
 ///
@@ -91,6 +100,15 @@ pub struct ApiServerConfig {
     /// 为 true 时绑定 `0.0.0.0` 使同网络 / 用户自建组网内的设备可达（供免账号本地
     /// 配对的响应方场景）；为 false 时仅绑回环 `127.0.0.1`。
     pub lan_enabled: bool,
+    /// 允许任意来源的跨域（CORS）请求（`local_server_cors_allow_all`，默认 false）。
+    ///
+    /// 默认关闭时本服务对**任何**请求都不返回 `Access-Control-*` 头，浏览器页面
+    /// 的跨域 `fetch()` 一律在预检阶段被拦下（见 [`crate::auth`] 安全模型第 2 条）。
+    /// 开启后预检与真实响应都带 `Access-Control-Allow-Origin: *`
+    /// （外加 `Access-Control-Allow-Private-Network: true`，用于 Chrome
+    /// 的本地网络访问门禁），等价于 aria2 的 `--rpc-allow-origin-all`——
+    /// 把「aria2 RPC 探活」写死成浏览器 `fetch` 的网站需要它才能识别本机服务。
+    pub cors_allow_all: bool,
     /// 宿主应用版本号（`/ping`、`/api/v1/info` 返回）。
     pub app_version: String,
 }
@@ -118,6 +136,7 @@ impl ApiServerConfig {
             management_enabled: flag("local_server_api_enabled", false),
             mcp_enabled: flag("local_server_mcp_enabled", false),
             lan_enabled: flag("local_server_lan_enabled", false),
+            cors_allow_all: flag("local_server_cors_allow_all", false),
             app_version: app_version.to_string(),
         }
     }
@@ -339,7 +358,10 @@ fn build_router(state: AppState) -> Router {
     }
     router
         .fallback(unknown_endpoint)
-        .layer(middleware::from_fn(options_preflight))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cors_and_preflight,
+        ))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }
@@ -348,7 +370,7 @@ fn build_router(state: AppState) -> Router {
 ///
 /// 与桌面 [`spawn_api_server`] 的差异：**不含** `/api/v1/openapi.json`
 /// 与 404 fallback，调用方 `merge` 自己的扩展路由、提供合并版 OpenAPI
-/// 与 SPA fallback，不会与本函数产生路由冲突。已附带 OPTIONS 预检拒绝
+/// 与 SPA fallback，不会与本函数产生路由冲突。已附带 OPTIONS 预检 / CORS
 /// 与请求体大小限制两层中间件（与桌面行为一致）。
 pub fn api_router(host: Arc<dyn ApiHost>, config: ApiServerConfig) -> Router {
     let state = AppState {
@@ -356,22 +378,64 @@ pub fn api_router(host: Arc<dyn ApiHost>, config: ApiServerConfig) -> Router {
         config: Arc::new(config),
     };
     register_core(state.clone())
-        .layer(middleware::from_fn(options_preflight))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            cors_and_preflight,
+        ))
         .layer(DefaultBodyLimit::max(MAX_BODY_SIZE))
         .with_state(state)
 }
 
-/// OPTIONS 预检统一回 204（**故意不带** `Access-Control-Allow-Origin`，
-/// 使恶意网页的跨域预检失败 —— 见 [`crate::auth`] 安全模型第 2 条）。
-async fn options_preflight(req: axum::extract::Request, next: Next) -> Response {
+/// OPTIONS 预检 + CORS 响应头。
+///
+/// **默认（`cors_allow_all == false`）**：预检统一回 204 且不带任何
+/// `Access-Control-*` 头，恶意网页的跨域预检失败 —— 见 [`crate::auth`]
+/// 安全模型第 2 条。
+///
+/// **用户显式开启后**：预检与真实响应都带 `Access-Control-Allow-Origin: *`，
+/// 等价于 aria2 的 `--rpc-allow-origin-all`。`Allow-Headers` 原样回显请求的
+/// `Access-Control-Request-Headers`（缺省 `*`），使 `X-FluxDown-Client` /
+/// `X-FluxDown-Token` / `Authorization` 等自定义头都能过检；额外带
+/// `Access-Control-Allow-Private-Network: true` 满足 Chrome 对「公网页面 →
+/// 本地回环」的私有网络访问门禁。不发 `Allow-Credentials`：`*` 与凭据互斥，
+/// 且本服务鉴权走请求头而非 Cookie，浏览器不会自动附带任何身份。
+async fn cors_and_preflight(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let allow_all = state.config.cors_allow_all;
     if req.method() == Method::OPTIONS {
-        return (
-            StatusCode::NO_CONTENT,
-            [(header::ALLOW, "GET, POST, PUT, DELETE, OPTIONS")],
-        )
-            .into_response();
+        let requested_headers = req
+            .headers()
+            .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+            .cloned();
+        let mut resp = (StatusCode::NO_CONTENT, [(header::ALLOW, ALLOWED_METHODS)]).into_response();
+        if allow_all {
+            let h = resp.headers_mut();
+            h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, WILDCARD);
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_METHODS,
+                HeaderValue::from_static(ALLOWED_METHODS),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_ALLOW_HEADERS,
+                requested_headers.unwrap_or(WILDCARD),
+            );
+            h.insert(
+                header::ACCESS_CONTROL_MAX_AGE,
+                HeaderValue::from_static("600"),
+            );
+            h.insert(ALLOW_PRIVATE_NETWORK, HeaderValue::from_static("true"));
+        }
+        return resp;
     }
-    next.run(req).await
+    let mut resp = next.run(req).await;
+    if allow_all {
+        resp.headers_mut()
+            .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, WILDCARD);
+    }
+    resp
 }
 
 async fn unknown_endpoint() -> Response {
@@ -2044,6 +2108,10 @@ mod tests {
             "false".to_string(),
         );
         map.insert("local_server_api_enabled".to_string(), "true".to_string());
+        map.insert(
+            "local_server_cors_allow_all".to_string(),
+            "true".to_string(),
+        );
 
         let cfg = ApiServerConfig::from_config_map(&map, "2.3.4");
 
@@ -2053,7 +2121,16 @@ mod tests {
         assert!(!cfg.takeover_enabled);
         assert!(!cfg.jsonrpc_enabled);
         assert!(cfg.management_enabled);
+        assert!(cfg.cors_allow_all);
         assert_eq!(cfg.app_version, "2.3.4");
+    }
+
+    /// CORS 放行是安全模型的显式豁免，缺省必须为关——默认值回归会静默让
+    /// 任意网页可访问本机服务。
+    #[test]
+    fn cors_allow_all_defaults_to_false() {
+        let cfg = ApiServerConfig::from_config_map(&HashMap::new(), "1.0.0");
+        assert!(!cfg.cors_allow_all);
     }
 
     #[test]

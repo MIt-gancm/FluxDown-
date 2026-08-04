@@ -1828,7 +1828,7 @@ async fn management_disabled_returns_404_for_tasks() {
 }
 
 // ---------------------------------------------------------------------------
-// OPTIONS 预检
+// OPTIONS 预检 / CORS 开关
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1842,6 +1842,56 @@ async fn options_preflight_returns_204_without_cors_header() {
             "path={path} must not carry an Access-Control-Allow-Origin header"
         );
     }
+}
+
+/// `cors_allow_all` 开启后预检回全套 CORS 头（含 Chrome 私有网络访问放行），
+/// 且 `Allow-Headers` 原样回显请求头清单——否则自定义头（`X-FluxDown-Client`
+/// 等）过不了检，接管入口对浏览器仍然不可用。
+#[tokio::test]
+async fn cors_allow_all_preflight_returns_cors_headers() {
+    let server = TestServer::start(MockHost::new(), |c| c.cors_allow_all = true).await;
+    let resp = server
+        .send(&request(
+            "OPTIONS",
+            routes::JSONRPC,
+            &[
+                ("Origin", "https://evil.example"),
+                ("Access-Control-Request-Method", "POST"),
+                ("Access-Control-Request-Headers", "content-type"),
+            ],
+            "",
+        ))
+        .await;
+    assert_eq!(resp.status, 204);
+    assert_eq!(resp.headers["access-control-allow-origin"], "*");
+    assert_eq!(
+        resp.headers["access-control-allow-methods"],
+        "GET, POST, PUT, DELETE, OPTIONS"
+    );
+    assert_eq!(resp.headers["access-control-allow-headers"], "content-type");
+    assert_eq!(resp.headers["access-control-allow-private-network"], "true");
+}
+
+/// 真实（非预检）响应也要带 `Access-Control-Allow-Origin`，否则浏览器仍会
+/// 丢弃响应体——只放行预检等于没开。
+#[tokio::test]
+async fn cors_allow_all_adds_origin_header_to_real_response() {
+    let server = TestServer::start(MockHost::new(), |c| c.cors_allow_all = true).await;
+    let body = json!({"jsonrpc": "2.0", "id": "1", "method": "aria2.getVersion", "params": []})
+        .to_string();
+    let resp = server
+        .send(&request(
+            "POST",
+            routes::JSONRPC,
+            &[
+                ("Origin", "https://evil.example"),
+                ("Content-Type", "application/json"),
+            ],
+            &body,
+        ))
+        .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.headers["access-control-allow-origin"], "*");
 }
 
 // ---------------------------------------------------------------------------

@@ -285,6 +285,7 @@ class S {
   String get boostBannerCancel => _r('boostBannerCancel');
   String get openFile => _r('openFile');
   String get openFolder => _r('openFolder');
+  String get moreActions => _r('moreActions');
   String get copyUrl => _r('copyUrl');
   String get urlCopied => _r('urlCopied');
   String get copyFileAction => _r('copyFileAction');
@@ -836,6 +837,9 @@ class S {
   String get localDeviceCodeExpired => _r('localDeviceCodeExpired');
   String get apiServiceLanEnable => _r('apiServiceLanEnable');
   String get apiServiceLanEnableDesc => _r('apiServiceLanEnableDesc');
+  String get apiServiceCorsAllowAll => _r('apiServiceCorsAllowAll');
+  String get apiServiceCorsAllowAllDesc => _r('apiServiceCorsAllowAllDesc');
+  String get apiServiceCorsAllowAllHelp => _r('apiServiceCorsAllowAllHelp');
 
   // 标题栏按钮
   String get titlebarButtons => _r('titlebarButtons');
@@ -1193,6 +1197,9 @@ class S {
   String get apiServiceMcp => _r('apiServiceMcp');
   String get apiServiceMcpDesc => _r('apiServiceMcpDesc');
   String get apiServiceAddress => _r('apiServiceAddress');
+  String get apiServiceHost => _r('apiServiceHost');
+  String get apiServiceHostLoopback => _r('apiServiceHostLoopback');
+  String get apiServiceHostNone => _r('apiServiceHostNone');
   List<String> get searchKeywordsApiService =>
       _r('searchKeywordsApiService').split(',');
 

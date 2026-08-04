@@ -183,6 +183,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _localServerApiEnabled = false;
   bool _localServerMcpEnabled = false;
   bool _localServerLanEnabled = false;
+  bool _localServerCorsAllowAll = false;
 
   // UA 设置
   String _globalUserAgent = ''; // 空字符串 = 使用内置 Chrome UA
@@ -446,6 +447,7 @@ class SettingsProvider extends ChangeNotifier {
   bool get localServerApiEnabled => _localServerApiEnabled;
   bool get localServerMcpEnabled => _localServerMcpEnabled;
   bool get localServerLanEnabled => _localServerLanEnabled;
+  bool get localServerCorsAllowAll => _localServerCorsAllowAll;
 
   // UA 设置 Getter
   String get globalUserAgent => _globalUserAgent;
@@ -1499,6 +1501,16 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('local_server_lan_enabled', value.toString());
   }
 
+  /// 允许任意来源的跨域（CORS）请求：开启后本机 API 对所有响应带
+  /// `Access-Control-Allow-Origin: *`（Rust 端热重启监听），使浏览器页面里的
+  /// 跨域 `fetch()` 能直接调用本机服务；关闭则预检失败、网页无法访问。
+  void setLocalServerCorsAllowAll(bool value) {
+    if (_localServerCorsAllowAll == value) return;
+    _localServerCorsAllowAll = value;
+    notifyListeners();
+    _saveToRust('local_server_cors_allow_all', value.toString());
+  }
+
   /// 生成 32 位随机 hex token（管理 API 自动鉴权 / UI 手动重新生成共用）
   static String _generateHexToken() {
     final r = Random.secure();
@@ -2031,6 +2043,8 @@ class SettingsProvider extends ChangeNotifier {
           _localServerMcpEnabled = entry.value == 'true';
         case 'local_server_lan_enabled':
           _localServerLanEnabled = entry.value == 'true';
+        case 'local_server_cors_allow_all':
+          _localServerCorsAllowAll = entry.value == 'true';
         case 'global_user_agent':
           _globalUserAgent = entry.value;
         case 'default_queue_id':

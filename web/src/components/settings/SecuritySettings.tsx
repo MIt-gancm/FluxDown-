@@ -1,7 +1,7 @@
 // 安全与访问：local_server_* 配置组 + 令牌管理 + WS 会话状态。
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { Eye, EyeOff, RefreshCw } from 'lucide-react'
+import { CircleHelp, Eye, EyeOff, RefreshCw } from 'lucide-react'
 import { api } from '../../lib/api'
 import { CopyButton } from '../CopyButton'
 import { useI18n } from '../../lib/i18n'
@@ -25,6 +25,7 @@ export function SecuritySettings({
   const takeover = (config.local_server_takeover_enabled ?? 'true') === 'true'
   const jsonrpc = (config.local_server_jsonrpc_enabled ?? 'true') === 'true'
   const mcp = (config.local_server_mcp_enabled ?? 'true') === 'true'
+  const corsAllowAll = (config.local_server_cors_allow_all ?? 'false') === 'true'
   const origin = window.location.origin
   const conn = useStore(connStore)
   const qc = useQueryClient()
@@ -105,6 +106,21 @@ export function SecuritySettings({
           <SetSwitch checked={mcp} onCheckedChange={(v) => mutate({ local_server_mcp_enabled: String(v) })} />
         </SetRow>
         <AddrRow value={`${origin}/mcp`} copyTitle={t('set.sec.copyAddr')} />
+      </div>
+      <div className="set-group">
+        <SetRow
+          title={
+            <>
+              {t('set.sec.cors')}
+              <span className="set-help" title={t('set.sec.corsHelp')}>
+                <CircleHelp />
+              </span>
+            </>
+          }
+          desc={t('set.sec.corsDesc')}
+        >
+          <SetSwitch checked={corsAllowAll} onCheckedChange={(v) => mutate({ local_server_cors_allow_all: String(v) })} />
+        </SetRow>
       </div>
       <div className="set-group">
         <SetRow

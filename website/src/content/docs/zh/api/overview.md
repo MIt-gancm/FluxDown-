@@ -3,7 +3,7 @@ title: API 总览
 description: FluxDown 的 HTTP API——五组路由、鉴权方式,以及它与 headless 服务器的关系。
 section: api
 order: 1
-sourceHash: "ed8a77b8f8c6"
+sourceHash: "618afb3e9283"
 ---
 
 FluxDown 内置一套小型 HTTP API,供浏览器扩展、油猴脚本、aria2 客户端与自动化工具使用,存在于两个地方:
@@ -39,6 +39,12 @@ headless 服务器额外把这些端点挂在 `/api/v1/*` 下,是桌面客户端
 | `/api/v1/ws`、`/api/v1/tasks/{id}/file` | `?token=<token>` 查询参数(浏览器的导航跳转/WebSocket 升级无法自定义请求头)。 |
 
 所有 token 校验都使用常量时间比较,避免时序侧信道。
+
+### 跨域(CORS)
+
+服务默认对任何请求都**不返回** `Access-Control-Allow-Origin`,网页里的跨域 `fetch()` 会在预检阶段被浏览器拦下——这正是"脚本接管必须带 `X-FluxDown-Client` 头"能挡住任意网页的原因(油猴脚本走 `GM_xmlhttpRequest`,不受 CORS 约束)。
+
+设置里的**允许任意网页跨域访问(CORS)**(`local_server_cors_allow_all`,默认关)可以放弃这道防线:开启后预检与真实响应都带 `Access-Control-Allow-Origin: *`,预检额外带 `Access-Control-Allow-Private-Network: true`,等价于 aria2 的 `--rpc-allow-origin-all`。用途是让那些"用浏览器 `fetch` 探测 aria2 服务"的网站能识别到 FluxDown;代价是任意网页都能探测本机端口并提交下载链接。此时仍生效的防护:桌面端接管/aria2 提交会弹确认框,管理 API 与 MCP 仍强制校验 token。
 
 ## 接管 / aria2 与管理 API 的语义区别
 

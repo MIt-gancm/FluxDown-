@@ -7,7 +7,11 @@
 //!    请求带 `X-FluxDown-Client` 头。恶意网页用 `fetch()` 跨域携带自定义头会触发
 //!    CORS 预检（OPTIONS），而本服务**不返回** `Access-Control-Allow-Origin`，
 //!    预检失败 → 浏览器拦截真实请求。油猴 `GM_xmlhttpRequest` 不受 CORS 约束、
-//!    可自由设置该头，故脚本正常工作、恶意网页被挡。
+//!    可自由设置该头，故脚本正常工作、恶意网页被挡。**用户可显式开启
+//!    `local_server_cors_allow_all` 放弃这道防线**（默认关；见
+//!    `ApiServerConfig::cors_allow_all`）——那些把「aria2 探活」写死成浏览器
+//!    `fetch` 的网站需要它，代价是任意网页都能探测并提交下载，此时只剩
+//!    第 4/5/6 条防护。
 //! 3. **JSON-RPC 合法性门禁**：`/jsonrpc` 不校验 `Content-Type`（与真实 aria2
 //!    一致），以「请求体能否解析为合法 JSON-RPC」为准入门槛。
 //! 4. **可选 token**（`local_server_token` 非空时启用）：请求需带匹配的
