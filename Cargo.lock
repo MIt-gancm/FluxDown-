@@ -1385,6 +1385,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "dash-mpd",
+ "directories",
  "ed25519-dalek",
  "encoding_rs",
  "feed-rs",

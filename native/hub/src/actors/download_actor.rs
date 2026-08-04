@@ -59,6 +59,10 @@ use fluxdown_api::server::{ApiServerConfig, ApiServerHandle, spawn_api_server};
 use fluxdown_api::service::TaskEvent;
 
 /// Compute default save directory (platform-dependent).
+///
+/// 桌面端一律由系统 API 给出（`fluxdown_engine::user_dirs`）：Windows 读已知
+/// 文件夹 `FOLDERID_Downloads`、Linux 读 XDG user-dirs——用户把「下载」文件夹
+/// 迁到别的盘符/路径后仍然正确，绝不用 `$HOME/Downloads` 拼。
 pub(crate) fn default_save_dir() -> String {
     // Android：应用专属外部目录（免权限可写）；公共 Download 目录需
     // SAF / All-files 权限，由 Dart 侧引导用户选择后经配置下发。
@@ -68,19 +72,7 @@ pub(crate) fn default_save_dir() -> String {
             return format!("/storage/emulated/0/Android/data/{pkg}/files/Download");
         }
     }
-    if cfg!(target_os = "windows")
-        && let Some(profile) = std::env::var_os("USERPROFILE")
-    {
-        let mut p = PathBuf::from(profile);
-        p.push("Downloads");
-        return p.to_string_lossy().into_owned();
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push("Downloads");
-        return p.to_string_lossy().into_owned();
-    }
-    ".".to_string()
+    fluxdown_engine::user_dirs::download_dir_or_cwd()
 }
 
 /// Build a [`BtConfig`] from the raw config key-value map.

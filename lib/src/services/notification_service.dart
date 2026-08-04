@@ -382,11 +382,10 @@ class NotificationService {
     await openFolder(resolved);
   }
 
-  String _resolveDefaultDir() {
-    final home =
-        Platform.environment['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        '.';
-    return '$home${Platform.pathSeparator}Downloads';
-  }
+  /// 通知未携带文件路径时的兜底目录：用配置里的默认保存目录
+  /// （由 Rust 经系统 API 解析后下发，见 `native/engine/src/user_dirs.rs`），
+  /// **不在 Dart 侧拼 `$HOME/Downloads`**——用户迁移过「下载」文件夹时会打开错目录。
+  /// 配置尚未就绪时返回空串，[_openFolder] 直接不动作。
+  String _resolveDefaultDir() =>
+      SettingsProvider.globalInstance?.defaultSaveDir ?? '';
 }

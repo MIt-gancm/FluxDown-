@@ -637,15 +637,13 @@ fn sanitize_filename(raw: &str) -> String {
 fn pick_download_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
-        if let Ok(home) = std::env::var("HOME") {
-            let downloads = PathBuf::from(home).join("Downloads");
-            if downloads.is_dir() {
-                return downloads;
-            }
-            // Best-effort create — fall through to temp_dir on failure.
-            if std::fs::create_dir_all(&downloads).is_ok() {
-                return downloads;
-            }
+        // 系统 API 解析（`fluxdown_engine::user_dirs`），不拼 `$HOME/Downloads`。
+        if let Some(downloads) = fluxdown_engine::user_dirs::download_dir()
+            && (downloads.is_dir()
+                // Best-effort create — fall through to temp_dir on failure.
+                || std::fs::create_dir_all(&downloads).is_ok())
+        {
+            return downloads;
         }
     }
     #[cfg(target_os = "android")]

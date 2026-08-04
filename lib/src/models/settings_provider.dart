@@ -2195,17 +2195,20 @@ class SettingsProvider extends ChangeNotifier {
   /// 平台默认下载目录（公开只读：供移动端判断「用户是否已自定义」）
   static String get platformDefaultSaveDir => _platformDefaultSaveDir();
 
-  /// 平台默认下载目录
+  /// 平台默认下载目录。
+  ///
+  /// **桌面端不在 Dart 侧推导**：真实默认值由 Rust 用系统 API 解析
+  /// （Windows 已知文件夹 `FOLDERID_Downloads` / Linux XDG user-dirs /
+  /// macOS，见 `native/engine/src/user_dirs.rs`），首次运行写入 config 并随
+  /// 配置下发到这里。`$HOME/Downloads` 拼接在用户迁移过「下载」文件夹时是
+  /// 错的，故桌面端返回空串——配置到达前 UI 只显示占位符，不会写出错路径。
   static String _platformDefaultSaveDir() {
     if (Platform.isAndroid) {
       // 应用专属外部目录，无需存储权限即可写入；
       // 公共 Download 目录（SAF/MediaStore）作为后续跟进项。
+      // 与 Rust 侧 `download_actor::default_save_dir` 的 Android 分支保持一致。
       return '/storage/emulated/0/Android/data/com.fluxdown.app/files/Download';
     }
-    final home =
-        Platform.environment['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        '.';
-    return '$home${Platform.pathSeparator}Downloads';
+    return '';
   }
 }

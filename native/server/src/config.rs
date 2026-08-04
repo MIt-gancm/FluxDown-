@@ -131,21 +131,10 @@ fn builtin_demo_url(bind: &str) -> String {
     format!("http://127.0.0.1:{port}{}", crate::demo::DEMO_FILE_PATH)
 }
 
-/// 平台默认下载目录（复制自 `download_actor.rs` 的私有 helper）。
+/// 平台默认下载目录（与 App 侧 `download_actor::default_save_dir` 同源：
+/// 走系统 API 解析，不做 `$HOME/Downloads` 拼接）。
 pub fn default_save_dir() -> String {
-    if cfg!(target_os = "windows")
-        && let Some(profile) = std::env::var_os("USERPROFILE")
-    {
-        let mut p = PathBuf::from(profile);
-        p.push("Downloads");
-        return p.to_string_lossy().into_owned();
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let mut p = PathBuf::from(home);
-        p.push("Downloads");
-        return p.to_string_lossy().into_owned();
-    }
-    ".".to_string()
+    fluxdown_engine::user_dirs::download_dir_or_cwd()
 }
 
 /// 访问密钥最短长度。

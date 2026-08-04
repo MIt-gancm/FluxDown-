@@ -629,7 +629,8 @@ class _FluxDownAppState extends State<FluxDownApp>
     _settingsForExternal.addListener(listener);
 
     // Timeout fallback — if config never arrives within 10s, try anyway
-    // (defaultSaveDir has a platform fallback so it won't be empty).
+    // （桌面端默认目录只由 Rust 经系统 API 解析后下发，Dart 侧无拼接兜底：
+    //  配置真的没到时 defaultSaveDir 为空，下游会记日志并跳过，不写错路径）。
     timeout = Timer(const Duration(seconds: 10), () {
       logInfo(
         'FluxDownApp',

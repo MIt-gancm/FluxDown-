@@ -1450,17 +1450,6 @@ class DownloadController extends ChangeNotifier {
     }
   }
 
-  /// 默认下载目录
-  static String get defaultSaveDir {
-    // Windows: C:\Users\<user>\Downloads
-    // macOS/Linux: ~/Downloads
-    final home =
-        Platform.environment['USERPROFILE'] ??
-        Platform.environment['HOME'] ??
-        '.';
-    return '$home${Platform.pathSeparator}Downloads';
-  }
-
   // ---------------------------------------------------------------------------
   // Signal listeners
   // ---------------------------------------------------------------------------

@@ -47,6 +47,8 @@ pub mod selection;
 pub mod site_auth;
 pub mod speed_limiter;
 pub mod tracker_subscription;
+/// 用户主目录下的系统标准目录（下载目录：Windows 已知文件夹 / XDG user-dirs）。
+pub mod user_dirs;
 /// 任务事件 Webhook 推送（免费自托管，BYOE）。
 pub mod webhook;
 
