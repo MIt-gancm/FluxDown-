@@ -585,8 +585,11 @@ body {
   transition: background .12s, color .12s;
 }
 .mbtn:hover:not(:disabled) { background: var(--hover); color: var(--text); }
-.mbtn.danger { color: var(--danger); }
+.mbtn.danger:not(:disabled) { color: var(--danger); }
 .mbtn.danger:hover:not(:disabled) { background: rgba(239,68,68,.08); color: var(--danger); }
+/* 「清理失效任务」：有失效任务时转琥珀色（对齐桌面管理栏）。 */
+.mbtn.warn:not(:disabled) { color: var(--warning); }
+.mbtn.warn:hover:not(:disabled) { background: rgba(245,158,11,.1); color: var(--warning); }
 .mbtn:disabled { opacity: .4; cursor: not-allowed; }
 .mcheck { display: flex; align-items: center; gap: 7px; cursor: pointer; font-size: 12.5px; }
 .mcheck input { display: none; }
@@ -695,6 +698,8 @@ body {
 .trow-meta .ok { color: var(--success); font-weight: 500; }
 .trow-meta .err { color: var(--danger); }
 .trow-meta .paused-t { color: var(--warning); }
+/* 已完成但产物已从磁盘上消失（文件跟踪）：与桌面端一致转琥珀色。 */
+.trow-meta .warn { color: var(--warning); font-weight: 500; }
 .trow-meta .plugin-activity { display: inline-flex; align-items: center; gap: 4px; color: var(--accent); }
 .trow-meta .extra-col { color: var(--text3); }
 

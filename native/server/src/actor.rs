@@ -139,6 +139,13 @@ pub enum ActorCmd {
         task_id: String,
         ack: oneshot::Sender<()>,
     },
+    /// 立即重扫已完成任务的产物文件是否仍在磁盘上（文件跟踪）。headless 没有
+    /// 窗口聚焦事件，定时器最长 300s 才轮到一次；Web 前端在页面获得焦点时经
+    /// `POST /api/v1/tasks/rescan` 打这条命令，语义与桌面 `RescanFiles` 一致。
+    /// 扫描是 detached 的（`spawn_file_scan` 立即返回），ack 只表示已受理。
+    RescanFiles {
+        ack: oneshot::Sender<()>,
+    },
     /// 设置单任务做种限制覆盖（-2 = 跟随全局，-1 = 不限制，>=0 = 自定义，
     /// 0 视同不限制；分享率为千分比）。`upload_limit_bps` 为任务级做种
     /// 上传限速（B/s，0 = 不限），在下一次 torrent add 时烘焙生效。
@@ -587,6 +594,10 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
         }
         ActorCmd::Boost { task_id, ack } => {
             engine.manager.set_priority_task(task_id).await;
+            let _ = ack.send(());
+        }
+        ActorCmd::RescanFiles { ack } => {
+            engine.manager.spawn_file_scan();
             let _ = ack.send(());
         }
         ActorCmd::TestProxy {

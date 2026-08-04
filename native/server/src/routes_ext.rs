@@ -120,6 +120,7 @@ pub fn extra_router(state: ServerState) -> Router {
         .route(paths::QUEUE_ORDER, put(reorder_queue))
         .route(paths::TASK_QUEUE, put(move_task_queue))
         .route(paths::TASK_BOOST, put(boost_task))
+        .route(paths::TASKS_RESCAN, post(rescan_files))
         .route(paths::FS_LIST, get(fs_list))
         .route(paths::PROXY_TEST, post(proxy_test))
         .route(paths::TOKEN_REGENERATE, post(token_regenerate))
@@ -188,6 +189,7 @@ pub mod paths {
     pub const QUEUE_ORDER: &str = "/api/v1/queues/{id}/order";
     pub const TASK_QUEUE: &str = "/api/v1/tasks/{id}/queue";
     pub const TASK_BOOST: &str = "/api/v1/tasks/{id}/boost";
+    pub const TASKS_RESCAN: &str = "/api/v1/tasks/rescan";
     pub const TASK_FILE: &str = "/api/v1/tasks/{id}/file";
     pub const FS_LIST: &str = "/api/v1/fs/list";
     pub const PROXY_TEST: &str = "/api/v1/proxy/test";
@@ -688,6 +690,19 @@ async fn boost_task(
     state
         .send_cmd(|ack| ActorCmd::Boost { task_id: id, ack })
         .await?;
+    Ok(ok_response())
+}
+
+/// 立即重扫已完成任务的产物文件是否仍在磁盘上（文件跟踪）。headless 没有窗口
+/// 聚焦事件，定时器最长 300s 才轮到一次——Web 前端在页面重新获得焦点时打这个
+/// 端点，取得与桌面「主窗获焦即重扫」一致的时效。扫描是 detached 的，引擎侧
+/// 的 `scanning` 标志保证不会重叠，因此本端点可以安全地被反复调用。
+#[utoipa::path(post, path = "/api/v1/tasks/rescan", tag = "server",
+    responses((status = 200, description = "已受理，扫描在后台进行；结果经 WS `fileMissingChanged` 推送")),
+    security(("bearer_token" = []), ("api_key" = []))
+)]
+async fn rescan_files(State(state): State<ServerState>) -> Result<Response, ApiError> {
+    state.send_cmd(|ack| ActorCmd::RescanFiles { ack }).await?;
     Ok(ok_response())
 }
 
@@ -1347,6 +1362,7 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         reorder_queue,
         move_task_queue,
         boost_task,
+        rescan_files,
         task_file,
         fs_list,
         proxy_test,
@@ -1376,6 +1392,7 @@ async fn component_ytdlp_uninstall(State(state): State<ServerState>) -> Result<R
         crate::wire::WsClientMsg,
         crate::wire::SegmentDetailDto,
         crate::wire::QueuePositionDto,
+        crate::wire::FileMissingUpdateDto,
         crate::wire::HlsQualityOptionDto,
         crate::wire::ResolveVariantOptionDto,
         crate::wire::BtFileDto,

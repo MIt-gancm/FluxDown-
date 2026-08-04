@@ -85,6 +85,15 @@ impl From<QueuePosition> for QueuePositionDto {
     }
 }
 
+/// 文件跟踪扫描判定的产物文件存在性变化（`fileMissingChanged` 载荷）。
+#[derive(Debug, Clone, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct FileMissingUpdateDto {
+    pub task_id: String,
+    /// true = 已完成任务的目标文件从磁盘上消失；false = 重新探测到存在（自愈）。
+    pub missing: bool,
+}
+
 /// HLS 可选码率变体（`hlsSelectionRequest` 载荷）。
 #[derive(Debug, Clone, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -237,6 +246,9 @@ pub enum WsServerMsg {
     TaskRouteChanged { task_id: String, route: String },
     /// 队列内位置批量更新。
     QueuePositionsChanged { positions: Vec<QueuePositionDto> },
+    /// 文件跟踪扫描结果增量：已完成任务的产物文件在磁盘上消失/回归。
+    /// 只带本轮变化项，客户端按 taskId patch `fileMissing`，不重发全量快照。
+    FileMissingChanged { updates: Vec<FileMissingUpdateDto> },
     /// Boost 优先任务变化。
     PriorityTaskChanged {
         priority_task_id: String,

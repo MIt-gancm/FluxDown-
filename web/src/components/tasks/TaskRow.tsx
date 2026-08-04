@@ -99,7 +99,11 @@ function TaskMeta({ t }: { t: ViewTask }) {
   if (t.status === 3) {
     return (
       <>
-        <span className="ok">{tr('status.completed')}</span>
+        {t.fileMissing ? (
+          <span className="warn">{tr('status.fileMissing')}</span>
+        ) : (
+          <span className="ok">{tr('status.completed')}</span>
+        )}
         {sep}
         <span>{fmtBytes(t.totalBytes)}</span>
         {isSeedingStopped(t) && t.seedingMessage && (
@@ -352,7 +356,8 @@ export function TaskRow({
           <span className="trow-pct">{pct}%</span>
           {/* hover 披露的快捷操作（桌面 §4.3 行操作簇的 web 对等物：「打开文件夹」
               换成 web 可执行操作——已完成任务「保存到本地」+ 任意状态「复制链接」） */}
-          {t.status === 3 && (
+          {/* 文件已从磁盘上消失时不再提供「保存到本地」：点了必然 404。 */}
+          {t.status === 3 && !t.fileMissing && (
             <button
               type="button"
               className="task-act hover-act"

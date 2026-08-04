@@ -28,14 +28,15 @@ use crate::rinf_sink::RinfEventSink;
 use crate::signals::{
     BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
     ClearWebhookDeliveries, ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask,
-    CreateQueue, CreateRssSource, CreateTask, CreateTaskGroup, DeleteQueue, DeleteRssSource,
-    DetectSystemProxy, DownloadUpdate, Ed2kServerSubscriptionResult, ExternalDownloadRequest,
-    FfmpegInstallProgress, FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList,
-    FileAssociationStatus, GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin,
-    InstallPlugin, InstallUpdate, InstallYtdlp, MoveTaskToQueue, NativeListenerRestartResult,
-    NmhRepairResult, OpenFile, ProbeTorrentMeta, ProxyTestResult, RefreshRssSource, RenameGroup,
-    RenameTask, RenameTaskResult, ReorderQueueTasks, RepairNmhRegistration, RequestAllGroups,
-    RequestAllQueues, RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
+    CopyPathToClipboard, CopyPathToClipboardResult, CreateQueue, CreateRssSource, CreateTask,
+    CreateTaskGroup, DeleteQueue, DeleteRssSource, DetectSystemProxy, DownloadUpdate,
+    Ed2kServerSubscriptionResult, ExternalDownloadRequest, FfmpegInstallProgress,
+    FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList, FileAssociationStatus,
+    GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin, InstallPlugin,
+    InstallUpdate, InstallYtdlp, MoveTaskToQueue, NativeListenerRestartResult, NmhRepairResult,
+    OpenFile, ProbeTorrentMeta, ProxyTestResult, RefreshRssSource, RenameGroup, RenameTask,
+    RenameTaskResult, ReorderQueueTasks, RepairNmhRegistration, RequestAllGroups, RequestAllQueues,
+    RequestAllRssSources, RequestAllTasks, RequestConfig, RequestFfmpegStatus,
     RequestFfmpegVersions, RequestMarketIndex, RequestPlugins, RequestRssItems,
     RequestUpdateFailureMarker, RequestWebhookDeliveries, RequestYtdlpStatus, RequestYtdlpVersions,
     RescanFiles, ResolvePreviewRequest, RestartNativeListener, RevealFile, RunDiagnostics,
@@ -1019,6 +1020,8 @@ pub async fn run(db_dir: PathBuf) {
         /// 文件跟踪扫描回流的「文件已消失」任务批次，需删除其任务记录
         /// （config `file_missing_action == "delete"`）。
         MissingCleanup(Vec<String>),
+        /// 右键「复制文件」：把任务落盘的文件/文件夹放进系统剪贴板。
+        CopyPath(CopyPathToClipboard),
     }
     let (aux_tx, mut aux_rx) = mpsc::unbounded_channel::<AuxSignal>();
     // 文件丢失自动清理泵：引擎 detached 扫描 → mpsc → aux_tx → 主循环单分支。
@@ -1041,6 +1044,7 @@ pub async fn run(db_dir: PathBuf) {
         let rename_task_recv = RenameTask::get_dart_signal_receiver();
         let request_all_groups_recv = RequestAllGroups::get_dart_signal_receiver();
         let seed_limits_recv = SetTaskSeedLimits::get_dart_signal_receiver();
+        let copy_path_recv = CopyPathToClipboard::get_dart_signal_receiver();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -1064,6 +1068,9 @@ pub async fn run(db_dir: PathBuf) {
                     }
                     Some(signal) = seed_limits_recv.recv() => {
                         if group_tx.send(AuxSignal::SeedLimits(signal.message)).is_err() { break; }
+                    }
+                    Some(signal) = copy_path_recv.recv() => {
+                        if group_tx.send(AuxSignal::CopyPath(signal.message)).is_err() { break; }
                     }
                     else => break,
                 }
@@ -1577,6 +1584,20 @@ pub async fn run(db_dir: PathBuf) {
                     }
                     // 删除没有专属信号——重发全量快照，Dart 任务列表才会移除这些行。
                     engine.manager.load_and_send_all_tasks().await;
+                }
+                AuxSignal::CopyPath(msg) => {
+                    // 剪贴板是同步系统 API（Windows）/ 子进程（macOS·Linux），
+                    // 丢到阻塞池，别把 current_thread actor 卡住。
+                    let outcome = tokio::task::spawn_blocking(move || {
+                        crate::clipboard_file::copy_path(&msg.path)
+                    })
+                    .await;
+                    let (ok, is_dir, error) = match outcome {
+                        Ok(Ok(is_dir)) => (true, is_dir, String::new()),
+                        Ok(Err(e)) => (false, false, e),
+                        Err(e) => (false, false, format!("os:{e}")),
+                    };
+                    CopyPathToClipboardResult { ok, is_dir, error }.send_signal_to_dart();
                 }
                 }
             }

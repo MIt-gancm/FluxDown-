@@ -86,7 +86,7 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
       <>
         <span>
           {t.status === 3
-            ? tr('status.completed')
+            ? tr(t.fileMissing ? 'status.fileMissing' : 'status.completed')
             : t.status === 2
               ? tr('status.paused')
               : t.status === 5

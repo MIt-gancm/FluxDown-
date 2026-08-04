@@ -466,6 +466,20 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
 
 const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, referrer, group_id, rss_source_id, origin_url, auto_route";
 
+/// 文件跟踪扫描的最小任务投影（[`Db::load_file_tracking_rows`]）。扫描只需
+/// 要判定「目标路径是否被活跃任务占用」和「已完成任务的产物是否还在盘上」，
+/// 走 [`TASK_COLUMNS`] 的全列反序列化在几万任务规模下是纯浪费。
+#[derive(Debug, Clone)]
+pub struct FileTrackingRow {
+    pub task_id: String,
+    pub save_dir: String,
+    pub file_name: String,
+    /// 库中当前的「文件已丢失」标志，用于只上报真正的边沿变化。
+    pub file_missing: bool,
+    /// 0/1/5 = 活跃（占用目标路径），3 = 已完成（待探测）。
+    pub status: i32,
+}
+
 /// 把 `AnyRow` 映射为 [`GroupInfo`]。
 fn group_from_row(row: &AnyRow) -> Result<GroupInfo, sqlx::Error> {
     Ok(GroupInfo {
@@ -1034,6 +1048,39 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// 批量落库文件跟踪标志：语义与 [`Self::update_task_file_missing`] 完全
+    /// 一致（逐行 `WHERE id AND status = 3`），但整批在**同一个事务**里提交。
+    /// SQLite 默认 `synchronous=FULL`，逐条独立 UPDATE 意味着每条一次 fsync；
+    /// 外置盘掉线这类「上万条同时翻转」的场景下那是分钟级的阻塞，还会和下载
+    /// 落库抢 `busy_timeout`。整批一次 commit 把 N 次 fsync 压成 1 次。
+    ///
+    /// 返回实际写入的条目（跳过扫描期间已离开 status=3 的行），供调用方据此
+    /// 下发事件与自动清理。任一条出错则整批回滚——文件跟踪是幂等的，下一轮
+    /// 扫描会重新判定。
+    pub async fn update_tasks_file_missing(
+        &self,
+        updates: &[(String, bool)],
+    ) -> Result<Vec<(String, bool)>, DbError> {
+        if updates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut applied = Vec::with_capacity(updates.len());
+        for (id, missing) in updates {
+            let result =
+                sqlx::query("UPDATE tasks SET file_missing = $1 WHERE id = $2 AND status = 3")
+                    .bind(*missing as i32)
+                    .bind(id.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+            if result.rows_affected() > 0 {
+                applied.push((id.clone(), *missing));
+            }
+        }
+        tx.commit().await?;
+        Ok(applied)
+    }
+
     /// 更新任务完成时已上传字节数（BT 做种后分享率基准）。
     pub async fn update_task_uploaded_at_completion(
         &self,
@@ -1354,6 +1401,30 @@ impl Db {
             tasks.push(task_from_row(row)?);
         }
         Ok(tasks)
+    }
+
+    /// 加载文件跟踪扫描所需的最小投影：活跃（0/1/5，用于目标路径占用判定）
+    /// 与已完成（3，待探测）的任务，只取 5 列且不排序。相对
+    /// [`Self::load_all_tasks`] 省掉全表全列反序列化与一次排序——扫描每 5 分钟
+    /// （headless）或每次窗口获焦（桌面）跑一遍，几万任务时这是主要开销。
+    pub async fn load_file_tracking_rows(&self) -> Result<Vec<FileTrackingRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, save_dir, file_name, file_missing, status FROM tasks \
+             WHERE status IN (0, 1, 3, 5)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(FileTrackingRow {
+                task_id: row.try_get("id")?,
+                save_dir: row.try_get("save_dir").unwrap_or_default(),
+                file_name: row.try_get("file_name").unwrap_or_default(),
+                file_missing: row.try_get::<i32, _>("file_missing").unwrap_or(0) != 0,
+                status: row.try_get("status")?,
+            });
+        }
+        Ok(out)
     }
 
     pub async fn load_task_by_id(&self, id: &str) -> Result<Option<TaskInfo>, DbError> {
@@ -5104,6 +5175,72 @@ mod tests {
             !task.file_missing,
             "file_missing must remain unchanged for a non-completed task"
         );
+    }
+
+    /// 批量版与单条版语义一致：completed 行写入并出现在返回值里，非 completed
+    /// 行被 `AND status = 3` 挡下且不进返回值——调用方正是据此过滤下发的事件
+    /// 与自动清理批次。
+    #[tokio::test]
+    async fn update_tasks_file_missing_applies_only_to_completed_rows() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task(&db, "done").await;
+        insert_task(&db, "busy").await;
+        db.update_task_status("done", 3, "")
+            .await
+            .expect("mark completed");
+        db.update_task_status("busy", 1, "")
+            .await
+            .expect("mark downloading");
+
+        let applied = db
+            .update_tasks_file_missing(&[("done".to_string(), true), ("busy".to_string(), true)])
+            .await
+            .expect("batch update");
+        assert_eq!(applied, vec![("done".to_string(), true)]);
+
+        let done = db
+            .load_task_by_id("done")
+            .await
+            .expect("load")
+            .expect("task present");
+        let busy = db
+            .load_task_by_id("busy")
+            .await
+            .expect("load")
+            .expect("task present");
+        assert!(done.file_missing, "completed 行必须写入");
+        assert!(!busy.file_missing, "非 completed 行必须原样不动");
+    }
+
+    /// 文件跟踪投影只取扫描真正要用的行：活跃（0/1/5，用于目标路径占用判定）
+    /// 与已完成（3，待探测）。paused/error 不参与扫描，必须在 SQL 里就被滤掉。
+    #[tokio::test]
+    async fn load_file_tracking_rows_returns_active_and_completed_only() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        for (id, status) in [("done", 3), ("busy", 1), ("paused", 2), ("failed", 4)] {
+            insert_task(&db, id).await;
+            db.update_task_status(id, status, "")
+                .await
+                .expect("set status");
+        }
+        db.update_tasks_file_missing(&[("done".to_string(), true)])
+            .await
+            .expect("mark missing");
+
+        let mut rows = db.load_file_tracking_rows().await.expect("load rows");
+        rows.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+        let ids: Vec<&str> = rows.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["busy", "done"]);
+
+        let done = &rows[1];
+        assert_eq!(done.status, 3);
+        assert!(done.file_missing, "投影必须带上库中的 file_missing 现值");
+        assert_eq!(done.save_dir, "/tmp");
+        assert_eq!(done.file_name, "file.bin");
     }
 
     /// 不存在的任务 id：更新必须是空操作而不是报错。

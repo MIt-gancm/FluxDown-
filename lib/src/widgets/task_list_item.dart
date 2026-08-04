@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -16,6 +18,7 @@ import 'file_type_icon.dart';
 import '../models/download_controller.dart';
 import 'overflow_tooltip_text.dart';
 import '../services/open_folder.dart';
+import '../services/clipboard_file.dart';
 import 'queue_manager_dialog.dart';
 import 'task_columns.dart';
 import '../services/cloud/cloud_auth_service.dart';
@@ -854,6 +857,25 @@ void showTaskContextMenu(
   }
   dividers.add(items.length - 1); // 文件操作组后加分隔线
 
+  // --- 复制文件 / 复制文件夹（放进系统剪贴板，可在文件管理器 Ctrl+V 粘贴）---
+  // 落地类型现场 stat 判定：BT 全选多文件种子落成一个根目录、其余情况（含 BT
+  // 单文件）落成单个文件，菜单文案与实际复制对象随之切换；对象已不在磁盘上
+  // （被外部删除、fileMissing 标记还没刷新）则整项不出现。
+  if (task.status == TaskStatus.completed && !task.fileMissing) {
+    final landed = FileSystemEntity.typeSync(filePath);
+    if (landed != FileSystemEntityType.notFound) {
+      final isDir = landed == FileSystemEntityType.directory;
+      items.add(
+        ContextMenuItem(
+          icon: LucideIcons.clipboardCopy,
+          label: isDir ? s.copyFolderAction : s.copyFileAction,
+          color: c.textPrimary,
+          action: () => _copyPathWithToast(context, filePath),
+        ),
+      );
+    }
+  }
+
   // --- 复制下载地址 ---
   items.add(
     ContextMenuItem(
@@ -963,6 +985,34 @@ void showIgnorePluginRetryDialog(BuildContext context, {required String taskId})
 Future<void> _openFile(String filePath) => openFile(filePath);
 
 Future<void> _openFolder(String filePath) => openFolder(filePath);
+
+/// 右键菜单「复制文件 / 复制文件夹」：把落盘对象放进系统剪贴板（Rust 侧
+/// `clipboard_file.rs`），toast 按实际复制到的类型回显。
+Future<void> _copyPathWithToast(BuildContext context, String path) async {
+  final s = LocaleScope.of(context);
+  final sonner = FluxSonner.of(context);
+  String title;
+  try {
+    final result = await copyPathToClipboard(path);
+    title = result.ok
+        ? (result.isDir ? s.folderCopiedToClipboard : s.fileCopiedToClipboard)
+        : _copyPathErrorText(s, result.error);
+  } on TimeoutException {
+    title = s.copyFileFailed;
+  }
+  sonner.show(
+    ShadToast(title: Text(title), duration: const Duration(seconds: 2)),
+  );
+}
+
+/// 剪贴板错误短码 → 本地化文案；`os:<detail>` 等未知码落到通用失败提示
+/// （详情已由 Rust 侧写进日志，不塞给用户）。
+String _copyPathErrorText(S s, String code) => switch (code) {
+  'not_found' => s.copyFileErrNotFound,
+  'no_tool' => s.copyFileErrNoTool,
+  'unsupported' => s.copyFileErrUnsupported,
+  _ => s.copyFileFailed,
+};
 
 // =============================================================================
 // 任务重命名对话框

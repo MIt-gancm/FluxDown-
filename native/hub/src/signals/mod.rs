@@ -193,6 +193,24 @@ pub struct OpenFile {
     pub path: String,
 }
 
+/// Dart → Rust：把任务落盘的文件/文件夹放进系统剪贴板（文件管理器里可直接
+/// `Ctrl+V` 粘贴出一份拷贝）。`path` 是落盘对象绝对路径，文件与文件夹共用
+/// 同一条信号，类型由 Rust 侧 `fs::metadata` 判定，见 `clipboard_file.rs`。
+#[derive(Deserialize, DartSignal)]
+pub struct CopyPathToClipboard {
+    pub path: String,
+}
+
+/// 剪贴板复制结果（Rust → Dart）。`is_dir` 供 Dart 区分「已复制文件夹 / 已
+/// 复制文件」提示；`error` 是稳定短码（`not_found` / `no_tool` /
+/// `unsupported` / `os:<detail>`），Dart 侧映射为本地化文案。
+#[derive(Serialize, RustSignal)]
+pub struct CopyPathToClipboardResult {
+    pub ok: bool,
+    pub is_dir: bool,
+    pub error: String,
+}
+
 // ========== Rust → Dart signals ==========
 
 /// Task progress update — sent periodically during download

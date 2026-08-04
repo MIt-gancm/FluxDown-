@@ -216,17 +216,21 @@ function GeneralTab({ t, queues, groups }: { t: ViewTask; queues: QueueDto[]; gr
         <DField label={tr('detail.error')} value={translateBackendMessage(t.errorMessage)} copy />
       ) : null}
       <div className="d-actions">
+        {/* 已完成任务给「保存到本地」；产物已从磁盘上消失（文件跟踪）则整个按钮
+            不出现（点了必然 404），也不该退化成对已完成任务无意义的 Boost。 */}
         {t.status === 3 ? (
-          <button
-            type="button"
-            className="btn primary sm"
-            onClick={() => {
-              location.href = taskFileUrl(t.taskId)
-            }}
-          >
-            <Download size={15} />
-            {tr('task.saveToLocal')}
-          </button>
+          t.fileMissing ? null : (
+            <button
+              type="button"
+              className="btn primary sm"
+              onClick={() => {
+                location.href = taskFileUrl(t.taskId)
+              }}
+            >
+              <Download size={15} />
+              {tr('task.saveToLocal')}
+            </button>
+          )
         ) : (
           <button type="button" className="btn ghost sm" onClick={() => boostMut.mutate()}>
             <Zap size={15} />

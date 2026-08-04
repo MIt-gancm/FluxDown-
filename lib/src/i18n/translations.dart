@@ -287,6 +287,14 @@ class S {
   String get openFolder => _r('openFolder');
   String get copyUrl => _r('copyUrl');
   String get urlCopied => _r('urlCopied');
+  String get copyFileAction => _r('copyFileAction');
+  String get copyFolderAction => _r('copyFolderAction');
+  String get fileCopiedToClipboard => _r('fileCopiedToClipboard');
+  String get folderCopiedToClipboard => _r('folderCopiedToClipboard');
+  String get copyFileFailed => _r('copyFileFailed');
+  String get copyFileErrNotFound => _r('copyFileErrNotFound');
+  String get copyFileErrNoTool => _r('copyFileErrNoTool');
+  String get copyFileErrUnsupported => _r('copyFileErrUnsupported');
   String get errorCopied => _r('errorCopied');
   String get renameTask => _r('renameTask');
   String get redownloadTask => _r('redownloadTask');

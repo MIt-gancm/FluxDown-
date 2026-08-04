@@ -359,6 +359,7 @@ export type WsServerMsg =
   | { type: 'taskQueueChanged'; taskId: string; queueId: string }
   | { type: 'taskRouteChanged'; taskId: string; route: string }
   | { type: 'queuePositionsChanged'; positions: { taskId: string; position: number }[] }
+  | { type: 'fileMissingChanged'; updates: { taskId: string; missing: boolean }[] }
   | { type: 'priorityTaskChanged'; priorityTaskId: string; autoPausedCount: number }
   | { type: 'hlsSelectionRequest'; taskId: string; options: HlsQualityOption[] }
   | { type: 'btSelectionRequest'; taskId: string; files: BtFileEntry[] }

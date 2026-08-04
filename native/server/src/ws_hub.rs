@@ -34,7 +34,7 @@ use fluxdown_engine::model::{BtFileEntry, HlsQualityOption, ResolveVariantOption
 use fluxdown_engine::selection::{HostSelection, SelectionOutcome};
 use tokio::sync::{broadcast, oneshot};
 
-use crate::wire::WsServerMsg;
+use crate::wire::{FileMissingUpdateDto, WsServerMsg};
 
 /// 无客户端应答时 BT 文件选择的兜底超时（与桌面端常量一致）。
 const BT_SELECTION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -410,6 +410,14 @@ impl EventSink for EngineEventSink {
                     deliveries: entries.into_iter().map(Into::into).collect(),
                 }
             }
+            // 文件跟踪扫描增量：只带本轮变化的 taskId，客户端就地 patch
+            // `fileMissing`（`keep` 模式下不会有别的事件重发全量快照）。
+            EngineEvent::FileMissingChanged(updates) => WsServerMsg::FileMissingChanged {
+                updates: updates
+                    .into_iter()
+                    .map(|(task_id, missing)| FileMissingUpdateDto { task_id, missing })
+                    .collect(),
+            },
             // `#[non_exhaustive]`：未来新增变体默认丢弃并记录日志。
             other => {
                 log_info!("[ws-hub] unhandled engine event: {:?}", other);
@@ -1085,6 +1093,29 @@ mod tests {
         let snap = hub.live_speeds_snapshot();
         assert!(snap.contains_key("keep-me"));
         assert!(!snap.contains_key("drop-me"));
+    }
+
+    /// `FileMissingChanged` 必须被翻译成 `fileMissingChanged` 广播帧。它曾落进
+    /// `other =>` 兜底被丢弃，导致 `file_missing_action == "keep"`（默认）下
+    /// Web 端永远看不到文件跟踪结果——只能等某个副作用重发全量 `TasksSnapshot`。
+    #[tokio::test]
+    async fn engine_event_sink_broadcasts_file_missing_changed() {
+        let hub = Arc::new(WsHub::new(16));
+        let mut rx = hub.events.subscribe();
+        let sink = EngineEventSink(Arc::clone(&hub));
+
+        sink.emit(EngineEvent::FileMissingChanged(vec![
+            ("gone".to_string(), true),
+            ("back".to_string(), false),
+        ]));
+
+        let frame = rx.try_recv().expect("fileMissingChanged must be broadcast");
+        let json: serde_json::Value = serde_json::from_str(&frame).expect("valid json frame");
+        assert_eq!(json["type"], "fileMissingChanged");
+        assert_eq!(json["updates"][0]["taskId"], "gone");
+        assert_eq!(json["updates"][0]["missing"], true);
+        assert_eq!(json["updates"][1]["taskId"], "back");
+        assert_eq!(json["updates"][1]["missing"], false);
     }
 
     fn mk_task(task_id: &str, status: i32) -> TaskInfo {

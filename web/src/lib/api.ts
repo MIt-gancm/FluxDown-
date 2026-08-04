@@ -137,6 +137,8 @@ export const api = {
   pauseAll: () => apiFetch<unknown>('/api/v1/tasks/pause', { method: 'PUT' }),
   continueAll: () => apiFetch<unknown>('/api/v1/tasks/continue', { method: 'PUT' }),
   boostTask: (id: string) => apiFetch<unknown>(`/api/v1/tasks/${id}/boost`, { method: 'PUT' }),
+  /** 立即重扫已完成任务的产物是否还在磁盘上；结果经 WS `fileMissingChanged` 回来。 */
+  rescanFiles: () => apiFetch<unknown>('/api/v1/tasks/rescan', { method: 'POST' }),
   moveTaskToQueue: (id: string, queueId: string) =>
     apiFetch<unknown>(`/api/v1/tasks/${id}/queue`, {
       method: 'PUT',

@@ -6,6 +6,7 @@
 
 import { useSyncExternalStore } from 'react'
 import type { QueryClient } from '@tanstack/react-query'
+import { api } from './api'
 import { getBase, getToken, isAuthenticated } from './auth'
 import { t } from './i18n'
 import type {
@@ -159,7 +160,38 @@ export function connectWs(queryClient: QueryClient) {
   queryClientRef = queryClient
   if (socket && socket.readyState <= WebSocket.OPEN) return
   if (!isAuthenticated()) return
+  installRescanTriggers()
   openSocket()
+}
+
+// ---------------- 文件跟踪重扫 ----------------
+
+/** 重扫最小间隔，与桌面窗口获焦的节流一致（`main.dart` `_rescanMinInterval`）。 */
+const RESCAN_MIN_INTERVAL_MS = 30_000
+let lastRescanAt = 0
+let rescanTriggersInstalled = false
+
+/** 请求服务端立即重扫已完成任务的产物是否还在磁盘上。冷却期内直接忽略——扫描
+ *  幂等，引擎侧还有 `scanning` 标志防重叠。结果经 `fileMissingChanged` 回来。 */
+export function requestRescan() {
+  if (!isAuthenticated()) return
+  const now = Date.now()
+  if (now - lastRescanAt < RESCAN_MIN_INTERVAL_MS) return
+  lastRescanAt = now
+  // 静默失败：这不是用户显式动作，失败下一次触发/定时器会自愈。
+  void api.rescanFiles().catch(() => {})
+}
+
+/** 页面重新获得焦点 = 用户很可能刚在文件管理器里删/移了文件。headless 没有
+ *  桌面那样的窗口聚焦信号，只有 300s 定时器兜底；没有这个触发的话「文件已
+ *  删除」最长要 5 分钟才反映到界面（`file_missing_action=delete` 同理）。 */
+function installRescanTriggers() {
+  if (rescanTriggersInstalled) return
+  rescanTriggersInstalled = true
+  window.addEventListener('focus', requestRescan)
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') requestRescan()
+  })
 }
 
 function wsUrl(): string {
@@ -190,6 +222,8 @@ function openSocket() {
     // 立即测一次 RTT
     pingSentAt = performance.now()
     sendWs({ type: 'ping' })
+    // 重连成功后补一次：断线期间的扫描结果推送可能已经错过。
+    requestRescan()
   }
 
   ws.onmessage = (e) => {
@@ -307,6 +341,14 @@ function dispatch(msg: WsServerMsg) {
       const pos = new Map(msg.positions.map((p) => [p.taskId, p.position]))
       queryClientRef?.setQueryData<TaskDto[]>(['tasks'], (old) =>
         old?.map((t) => (pos.has(t.taskId) ? { ...t, queueOrder: pos.get(t.taskId) } : t)),
+      )
+      break
+    }
+    case 'fileMissingChanged': {
+      // 文件跟踪扫描增量（`keep` 模式下没有别的事件会重发全量快照）。
+      const flags = new Map(msg.updates.map((u) => [u.taskId, u.missing]))
+      queryClientRef?.setQueryData<TaskDto[]>(['tasks'], (old) =>
+        old?.map((t) => (flags.has(t.taskId) ? { ...t, fileMissing: flags.get(t.taskId) } : t)),
       )
       break
     }

@@ -83,7 +83,7 @@ export function TaskContextMenu({
               {tr('task.resumeSeeding')}
             </ContextMenu.Item>
           )}
-          {t.status === 3 && (
+          {t.status === 3 && !t.fileMissing && (
             <ContextMenu.Item
               className="ctx-item"
               onSelect={() => {

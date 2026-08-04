@@ -182,6 +182,10 @@ const FILE_SCAN_CONCURRENCY: usize = 64;
 /// 重试时长。
 const FILE_SCAN_STAT_TIMEOUT_SECS: u64 = 5;
 
+/// 文件丢失自动清理批次上限：`missing_cleanup_tx` 容量只有 8，一次投递几万
+/// 个 id 会让宿主 actor 在一个命令周期里删空整张表。分块投递让删除按轮摊开。
+const MISSING_CLEANUP_BATCH: usize = 500;
+
 /// 文件跟踪：构造 completed 任务的目标磁盘路径。`file_name` 为空或不安全
 /// （未命名 magnet、路径穿越等）时返回 `None`——无法可靠判定存在性，跳过。
 fn task_target_path(save_dir: &str, file_name: &str) -> Option<PathBuf> {
@@ -233,17 +237,17 @@ async fn scan_missing_files(
     }
     let _guard = ScanGuard(scanning);
 
-    let tasks = match db.load_all_tasks().await {
-        Ok(t) => t,
+    let rows = match db.load_file_tracking_rows().await {
+        Ok(r) => r,
         Err(e) => {
-            log_info!("[file-scan] load_all_tasks error: {}", e);
+            log_info!("[file-scan] load_file_tracking_rows error: {}", e);
             return;
         }
     };
 
     // 活跃任务（pending/downloading/preparing）占用的目标路径：避免正在重下
     // 同名文件时把旧的 completed 任务误判为丢失。
-    let active_paths: HashSet<(&str, &str)> = tasks
+    let active_paths: HashSet<(&str, &str)> = rows
         .iter()
         .filter(|t| matches!(t.status, 0 | 1 | 5))
         .map(|t| (t.save_dir.as_str(), t.file_name.as_str()))
@@ -251,7 +255,7 @@ async fn scan_missing_files(
 
     let sem = Arc::new(Semaphore::new(FILE_SCAN_CONCURRENCY));
     let mut futs = Vec::new();
-    for t in tasks.iter().filter(|t| t.status == 3) {
+    for t in rows.iter().filter(|t| t.status == 3) {
         if active_paths.contains(&(t.save_dir.as_str(), t.file_name.as_str())) {
             continue;
         }
@@ -268,33 +272,37 @@ async fn scan_missing_files(
         });
     }
 
-    let mut changes: Vec<(String, bool)> = Vec::new();
-    for (id, missing) in futures_util::future::join_all(futs)
+    // 先收齐全部探测结果，再一次事务写回。逐条独立 UPDATE 在「外置盘掉线」
+    // 这类上万条同时翻转的场景下是上万次 fsync（SQLite 默认 synchronous=FULL）。
+    let probed: Vec<(String, bool)> = futures_util::future::join_all(futs)
         .await
         .into_iter()
         .flatten()
-    {
-        match db.update_task_file_missing(&id, missing).await {
-            Ok(true) => changes.push((id, missing)),
-            Ok(false) => {} // 任务已离开 status=3（被删/状态变化）→ 良性空操作
-            Err(e) => log_info!("[file-scan] update {} error: {}", id, e),
+        .collect();
+    // 已离开 status=3 的行（扫描期间被删/重下）在库层被跳过，不进 changes。
+    let changes = match db.update_tasks_file_missing(&probed).await {
+        Ok(c) => c,
+        Err(e) => {
+            log_info!("[file-scan] batch update error: {}", e);
+            return;
         }
-    }
+    };
 
     if !changes.is_empty() {
         // `file_missing_action == "delete"`：把本轮新判定为丢失的任务回流给
-        // 宿主 actor 删除记录。通道满 = 上一批还没被消费，本轮直接丢弃，
+        // 宿主 actor 删除记录。通道满 = 上一批还没被消费，剩余分块直接丢弃，
         // 下一轮扫描会重新报告（无棘轮，不阻塞扫描）。
         if auto_delete {
-            let gone: Vec<String> = changes
+            let gone: Vec<&str> = changes
                 .iter()
                 .filter(|(_, missing)| *missing)
-                .map(|(id, _)| id.clone())
+                .map(|(id, _)| id.as_str())
                 .collect();
-            if !gone.is_empty()
-                && let Err(e) = cleanup_tx.try_send(gone)
-            {
-                log_info!("[file-scan] missing cleanup channel send failed: {}", e);
+            for batch in gone.chunks(MISSING_CLEANUP_BATCH) {
+                if let Err(e) = cleanup_tx.try_send(batch.iter().map(|s| s.to_string()).collect()) {
+                    log_info!("[file-scan] missing cleanup channel send failed: {}", e);
+                    break;
+                }
             }
         }
         // 事件照常发：UI 先看到 file_missing 状态变化，随后收到删除确认。

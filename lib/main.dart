@@ -368,6 +368,12 @@ class _FluxDownAppState extends State<FluxDownApp>
   /// 防止 _performGracefulExit 被并发调用多次
   bool _isExiting = false;
 
+  /// 文件跟踪重扫的最小间隔。主窗获焦是高频事件（alt-tab、从别的程序切回），
+  /// 而一次重扫要遍历全部已完成任务逐个 stat，几万任务时代价可观。
+  static const _rescanMinInterval = Duration(seconds: 30);
+  DateTime? _lastRescanAt;
+  Timer? _pendingRescan;
+
   @override
   void initState() {
     super.initState();
@@ -471,6 +477,7 @@ class _FluxDownAppState extends State<FluxDownApp>
   @override
   void dispose() {
     logInfo('FluxDownApp', 'dispose called');
+    _pendingRescan?.cancel();
     UpdateService.instance.removeListener(_onUpdateServiceChanged);
     _singleInstanceChannel.setMethodCallHandler(null);
     TrayService.instance.onExitApp = null;
@@ -919,6 +926,26 @@ class _FluxDownAppState extends State<FluxDownApp>
     // Wayland 降级形态③：主窗获焦时读一次剪贴板（失焦读取被协议门控）
     unawaited(WaylandDegradationService.instance.checkClipboardOnRestore());
     // 文件跟踪：主窗获焦时用户可能刚在资源管理器删/移了文件，触发一次重扫。
+    _requestRescanFiles();
+  }
+
+  /// 发一次文件跟踪重扫请求，最小间隔 [_rescanMinInterval]。冷却期内的触发
+  /// 不丢弃而是折叠成一次尾沿补发——否则「获焦 → 切出去删文件 → 再获焦」
+  /// 会被直接吞掉，而桌面端没有定时器兜底（只有 headless server 有）。
+  void _requestRescanFiles() {
+    final last = _lastRescanAt;
+    final elapsed = last == null ? null : DateTime.now().difference(last);
+    if (elapsed != null && elapsed < _rescanMinInterval) {
+      _pendingRescan ??= Timer(_rescanMinInterval - elapsed, () {
+        _pendingRescan = null;
+        _lastRescanAt = DateTime.now();
+        RescanFiles().sendSignalToRust();
+      });
+      return;
+    }
+    _pendingRescan?.cancel();
+    _pendingRescan = null;
+    _lastRescanAt = DateTime.now();
     RescanFiles().sendSignalToRust();
   }
 
