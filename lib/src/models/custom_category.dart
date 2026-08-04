@@ -1,4 +1,43 @@
 import 'dart:convert';
+import 'dart:io';
+
+/// 目录名里必须剔除的字符：路径分隔符、Windows 保留符号与控制字符。
+final RegExp _invalidDirNameChars = RegExp(r'[\\/:*?"<>|\x00-\x1f]');
+final RegExp _dirNameWhitespace = RegExp(r'\s+');
+
+/// 把分类显示名净化成可用的目录名：非法字符换成空格、压缩空白、去掉 Windows
+/// 会静默丢弃的结尾点与空格。净化后为空说明这个名字做不出目录，返回 ''。
+String sanitizeCategoryDirName(String label) {
+  var out = label
+      .replaceAll(_invalidDirNameChars, ' ')
+      .replaceAll(_dirNameWhitespace, ' ')
+      .trim();
+  while (out.isNotEmpty && (out.endsWith('.') || out.endsWith(' '))) {
+    out = out.substring(0, out.length - 1);
+  }
+  return out;
+}
+
+/// 「一键分类目录」的落盘路径推导：默认下载目录 [baseDir] 下的同名子目录。
+///
+/// [baseDir] 为空、或 [label] 净化后为空时返回 ''（调用方跳过该分类）。
+/// [separator] 仅供测试注入，默认取当前平台分隔符。
+///
+/// Web 侧必须给出同样的结果，镜像实现见 `web/src/lib/categories.ts` 的
+/// `categoryDirUnder`；两端改一处就要改另一处，否则同一台机器上桌面与 Web
+/// 一键出来的目录会不一致。
+String categoryDirUnder(String baseDir, String label, {String? separator}) {
+  var root = baseDir.trim();
+  if (root.isEmpty) return '';
+  final folder = sanitizeCategoryDirName(label);
+  if (folder.isEmpty) return '';
+  while (root.length > 1 && (root.endsWith('/') || root.endsWith('\\'))) {
+    root = root.substring(0, root.length - 1);
+  }
+  // 根目录（"/" 或 "\"）本身就带分隔符，直接拼名字。
+  if (root.endsWith('/') || root.endsWith('\\')) return '$root$folder';
+  return '$root${separator ?? Platform.pathSeparator}$folder';
+}
 
 /// 图标标识 — 映射到 LucideIcons
 enum CategoryIcon {

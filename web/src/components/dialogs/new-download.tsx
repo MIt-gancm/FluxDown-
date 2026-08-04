@@ -12,6 +12,8 @@ import * as Dialog from '@radix-ui/react-dialog'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronRight, Plus, X } from 'lucide-react'
 import { api } from '../../lib/api'
+import { parseCategories, resolveCategorySaveDir, visibleCategories } from '../../lib/categories'
+import { CATEGORIES_KEY } from '../../lib/config'
 import { cloudApi } from '../../lib/cloud/client'
 import { cloudDeviceId, useCloudSession } from '../../lib/cloud/session'
 import { linkApi } from '../../lib/link'
@@ -185,14 +187,7 @@ export function NewDownloadDialog() {
   const effectiveSaveDir =
     rememberLastSaveDir && lastSaveDir !== '' ? lastSaveDir : (config?.default_save_dir ?? '')
 
-  // 保存目录默认值来自服务器配置；一旦用户手动改过就不再被配置覆盖。
-  useEffect(() => {
-    if (open && !form.saveDirTouched && effectiveSaveDir) {
-      setForm((f) => ({ ...f, saveDir: effectiveSaveDir }))
-    }
-  }, [open, effectiveSaveDir, form.saveDirTouched])
-
-  // 默认队列同理：未手动改过时跟随 config 的 default_queue_id（空 = 主队列）。
+  // 默认队列：未手动改过时跟随 config 的 default_queue_id（空 = 主队列）。
   useEffect(() => {
     const queueId = config?.default_queue_id
     if (open && !form.queueIdTouched && queueId) {
@@ -209,6 +204,24 @@ export function NewDownloadDialog() {
     [form.urls],
   )
   const isSingle = urlLines.length <= 1
+
+  // 分类保存目录：未手动改过保存目录时，按首条链接（或已填的文件名）匹配分类的
+  // 「分类保存目录」，命中就用它，否则退回全局默认目录 —— 与桌面
+  // NewDownloadDialog._tryAutoApplySaveDir 同语义。默认状态下没有任何分类设了
+  // 目录，解析恒为空串，行为与本功能上线前完全一致。
+  const categories = useMemo(
+    () => visibleCategories(parseCategories(config?.[CATEGORIES_KEY])),
+    [config],
+  )
+  const autoSaveDir =
+    resolveCategorySaveDir(form.fileName.trim(), urlLines[0] ?? '', categories) || effectiveSaveDir
+
+  // 保存目录默认值来自服务器配置；一旦用户手动改过就不再被自动值覆盖。
+  useEffect(() => {
+    if (open && !form.saveDirTouched && autoSaveDir) {
+      setForm((f) => ({ ...f, saveDir: autoSaveDir }))
+    }
+  }, [open, autoSaveDir, form.saveDirTouched])
 
   // 站点凭据自动回填：单条 http/https URL 且认证区可见时，按站点键查已保存凭据回填
   // 用户名/密码；仅当字段为空或仍是上次自动值时才回填/更新，切到无凭据站点则清空。

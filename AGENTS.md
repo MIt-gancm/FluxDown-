@@ -160,6 +160,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `native/api` 契约 | 重跑 `gen_openapi` 覆盖 `website/public/openapi.json` |
 | 任一 UI 文案 | 只补 **en + zh 基线对**：App `assets/i18n/{en,zh}.json` + `translations.dart` getter；`web/src/lib/locales/{en,zh}.json`；`website/src/lib/locales/{en,zh-CN}.json`；`fluxDown/utils/locales/{en,zh-CN}.ts`。社区语言（`ja` 等）由 Weblate 维护，**不碰**（运行时键级回退英文） |
 | web 设置项 / 对话框字段归属 | **基准 = 桌面**：同一功能在两端的分类归属与分区排序必须一致（桌面 `settings_page.dart` 分类 ↔ web 分区组件 GeneralSettings/DownloadSettings/ProxySettings…）。双端并行开发时归属分类要写成一份共享契约，禁止两份各自措辞 |
+| 「一键分类目录」的目录名推导 | `lib/src/models/custom_category.dart` 的 `sanitizeCategoryDirName` / `categoryDirUnder` ↔ `web/src/lib/categories.ts` 同名函数（含分隔符归一）；**且内置分类显示名两端逐字一致**（App `assets/i18n` 的 `categoryVideo/...` ↔ web `type.video/...`），否则同一台机器上桌面与 Web 会各建一套目录（`Document` vs `Documents`） |
 
 ---
 

@@ -874,6 +874,11 @@ class S {
   String get extensionsRequired => _r('extensionsRequired');
   String get categorySaveDir => _r('categorySaveDir');
   String get categorySaveDirDesc => _r('categorySaveDirDesc');
+  String get autoCategoryDirs => _r('autoCategoryDirs');
+  String autoCategoryDirsConfirm(String example) =>
+      _r('autoCategoryDirsConfirm', {'example': example});
+  String get clearCategoryDirs => _r('clearCategoryDirs');
+  String get clearCategoryDirsConfirm => _r('clearCategoryDirsConfirm');
   String get restoreDefaultPath => _r('restoreDefaultPath');
   String get nCustomCategories => _r('nCustomCategories');
   String get resetBuiltinCategories => _r('resetBuiltinCategories');

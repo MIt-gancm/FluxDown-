@@ -5,12 +5,16 @@
 // 写出的 JSON 与桌面 `CustomCategory.toJson()` 逐字段一致（见 lib/categories.ts 的
 // serializeCategories），两端共用引擎 config 表的同一行。
 import { useState } from 'react'
-import { ChevronDown, ChevronUp, Eye, EyeOff, Pencil, Plus, RotateCcw, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronUp, Eye, EyeOff, FolderTree, FolderX, Pencil, Plus, RotateCcw, Trash2 } from 'lucide-react'
 import {
   CATEGORY_ICON_KEYS,
+  applyCategoryDirs,
+  categoryDirUnder,
+  categoryDirsApplied,
   categoryIcon,
   categoryIconByKey,
   categoryLabel,
+  clearCategoryDirs,
   defaultCategories,
   defaultCategoryOf,
   formatExtensionsInput,
@@ -103,6 +107,43 @@ export function CategoriesSettings({
     commit(defaultCategories())
   }
 
+  // 一键分类目录：两态。尚未全部指向「默认下载目录 / 分类名」时是「应用」，
+  // 已全部指向时变成「清除」——与桌面设置页同一枚按钮、同一套语义。
+  const baseDir = (config.default_save_dir ?? '').trim()
+  const dirsApplied = categoryDirsApplied(cats, baseDir)
+
+  async function toggleCategoryDirs() {
+    if (baseDir === '') return
+    if (dirsApplied) {
+      const ok = await confirmDialog({
+        title: t('set.general.categoryDirsClear'),
+        message: t('set.general.categoryDirsClearConfirm'),
+        danger: true,
+      })
+      if (!ok) return
+      setEditor(null)
+      commit(clearCategoryDirs(cats))
+      return
+    }
+    // 举例用第一个可推导出目录的分类，让用户先看清实际会建在哪。
+    let sample = ''
+    for (const cat of cats) {
+      if (cat.builtinType === 'all') continue
+      const dir = categoryDirUnder(baseDir, categoryLabel(cat))
+      if (dir !== '') {
+        sample = dir
+        break
+      }
+    }
+    const ok = await confirmDialog({
+      title: t('set.general.categoryDirsApply'),
+      message: t('set.general.categoryDirsApplyConfirm', { example: sample }),
+    })
+    if (!ok) return
+    setEditor(null)
+    commit(applyCategoryDirs(cats, baseDir))
+  }
+
   function openEditor(target: Category | null) {
     setEditor({
       target,
@@ -164,8 +205,14 @@ export function CategoriesSettings({
     setEditor(null)
   }
 
-  /** 列表副标题：无后缀的特殊内置说明自己的匹配规则，其余显示扩展名或正则。 */
+  /** 列表副标题：匹配规则 + 已设置的分类保存目录（一键分类目录后能直接看到落点）。 */
   function subtitle(cat: Category): string {
+    const rule = matchSummary(cat)
+    if (cat.saveDir === '') return rule
+    return rule === '' ? cat.saveDir : `${rule}  ·  ${cat.saveDir}`
+  }
+
+  function matchSummary(cat: Category): string {
     if (cat.builtinType === 'all') return t('set.general.categoryAllDesc')
     if (cat.builtinType === 'other') return t('set.general.categoryOtherDesc')
     if (cat.matchMode === 'extension' && cat.extensions.length > 0) {
@@ -300,6 +347,15 @@ export function CategoriesSettings({
       <h2 className="set-title mt-6">{t('set.general.categories')}</h2>
       <p className="set-desc">{t('set.general.categoriesDesc')}</p>
       <div className="mb-2 flex items-center justify-end gap-2">
+        <button
+          type="button"
+          className="btn ghost sm"
+          disabled={baseDir === ''}
+          onClick={() => void toggleCategoryDirs()}
+        >
+          {dirsApplied ? <FolderX size={13} /> : <FolderTree size={13} />}
+          {dirsApplied ? t('set.general.categoryDirsClear') : t('set.general.categoryDirsApply')}
+        </button>
         <button type="button" className="btn ghost sm" onClick={() => void resetAll()}>
           <RotateCcw size={13} />
           {t('set.general.categoryResetAll')}

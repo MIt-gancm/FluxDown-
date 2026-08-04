@@ -927,6 +927,57 @@ class SettingsProvider extends ChangeNotifier {
     _persistCategories();
   }
 
+  /// 一键分类目录 —— 把每个分类（「全部文件」除外，它等同于全局默认目录）的保存
+  /// 目录设为默认下载目录下的同名子目录。[labelOf] 给出分类的本地化显示名，
+  /// 内置分类按当前界面语言落盘（`视频` / `Video`）。
+  ///
+  /// 返回实际改写的分类数；默认下载目录为空时什么都不做。
+  int applyCategorySaveDirs(String Function(CustomCategory) labelOf) {
+    var changed = 0;
+    for (var i = 0; i < _customCategories.length; i++) {
+      final cat = _customCategories[i];
+      if (cat.builtinType == 'all') continue;
+      final dir = categoryDirUnder(_defaultSaveDir, labelOf(cat));
+      if (dir.isEmpty || dir == cat.saveDir) continue;
+      _customCategories[i] = cat.copyWith(saveDir: dir);
+      changed++;
+    }
+    if (changed == 0) return 0;
+    notifyListeners();
+    _persistCategories();
+    return changed;
+  }
+
+  /// 清除所有分类的保存目录，回到「一切都落默认下载目录」。返回清空的分类数。
+  int clearCategorySaveDirs() {
+    var changed = 0;
+    for (var i = 0; i < _customCategories.length; i++) {
+      final cat = _customCategories[i];
+      if (cat.saveDir.isEmpty) continue;
+      _customCategories[i] = cat.copyWith(saveDir: '');
+      changed++;
+    }
+    if (changed == 0) return 0;
+    notifyListeners();
+    _persistCategories();
+    return changed;
+  }
+
+  /// 每个可设目录的分类是否都已指向「默认下载目录 / 分类名」。
+  /// 一键按钮据此在「应用」与「清除」两态之间切换；任一分类被手动改成别的目录
+  /// 都算未应用，此时再点一次按钮就是覆盖式重新应用。
+  bool categorySaveDirsApplied(String Function(CustomCategory) labelOf) {
+    var any = false;
+    for (final cat in _customCategories) {
+      if (cat.builtinType == 'all') continue;
+      final dir = categoryDirUnder(_defaultSaveDir, labelOf(cat));
+      if (dir.isEmpty) continue;
+      any = true;
+      if (cat.saveDir != dir) return false;
+    }
+    return any;
+  }
+
   // 代理设置 Setters
 
   void setProxyMode(String value) {

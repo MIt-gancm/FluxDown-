@@ -2259,7 +2259,9 @@ class _CustomCategoryManager extends StatelessWidget {
 
   const _CustomCategoryManager({required this.settingsProvider});
 
-  /// 内置分类的 i18n 名称
+  /// 内置分类的 i18n 名称。这些文案不只是标签：「一键分类目录」拿它当目录名
+  /// （`categoryDirUnder`），Web 侧 `web/src/lib/categories.ts` 的 BUILTIN_LABEL
+  /// 必须逐字一致，否则两端会在同一台机器上建出两套目录。
   static String _builtinLabel(S s, String? builtinType) =>
       switch (builtinType) {
         'all' => s.categoryAll,
@@ -2288,60 +2290,56 @@ class _CustomCategoryManager extends StatelessWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // 标题行
-        Row(
-          children: [
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    s.customCategories,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w600,
-                      color: c.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    s.categoryPriorityNote,
-                    style: TextStyle(fontSize: 11.5, color: c.textMuted),
-                  ),
-                ],
+        // 标题 + 操作区（按钮换行排布：三枚按钮在窄栏下不会溢出）
+        Text(
+          s.customCategories,
+          style: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: c.textPrimary,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          s.categoryPriorityNote,
+          style: TextStyle(fontSize: 11.5, color: c.textMuted),
+        ),
+        const SizedBox(height: 8),
+        Align(
+          alignment: Alignment.centerRight,
+          child: Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            alignment: WrapAlignment.end,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              _oneClickDirsButton(context, s, c),
+              ShadButton.outline(
+                size: ShadButtonSize.sm,
+                onPressed: () => _confirmResetAll(context, s, c),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(LucideIcons.rotateCcw, size: 13, color: c.textMuted),
+                    const SizedBox(width: 4),
+                    Text(s.resetBuiltinCategories),
+                  ],
+                ),
               ),
-            ),
-            Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                ShadButton.outline(
-                  size: ShadButtonSize.sm,
-                  onPressed: () => _confirmResetAll(context, s, c),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(LucideIcons.rotateCcw, size: 13, color: c.textMuted),
-                      const SizedBox(width: 4),
-                      Text(s.resetBuiltinCategories),
-                    ],
-                  ),
+              ShadButton.outline(
+                size: ShadButtonSize.sm,
+                onPressed: () => _showCategoryDialog(context, s, c),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(LucideIcons.plus, size: 13, color: c.textSecondary),
+                    const SizedBox(width: 4),
+                    Text(s.addCategory),
+                  ],
                 ),
-                const SizedBox(width: 8),
-                ShadButton.outline(
-                  size: ShadButtonSize.sm,
-                  onPressed: () => _showCategoryDialog(context, s, c),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Icon(LucideIcons.plus, size: 13, color: c.textSecondary),
-                      const SizedBox(width: 4),
-                      Text(s.addCategory),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ],
+              ),
+            ],
+          ),
         ),
         const SizedBox(height: 10),
         // 分类列表（Column 替代 ReorderableListView，避免 MaterialLocalizations 依赖）
@@ -2374,6 +2372,88 @@ class _CustomCategoryManager extends StatelessWidget {
                 : null,
           ),
       ],
+    );
+  }
+
+  /// 一键分类目录：两态按钮。尚未全部指向「默认下载目录 / 分类名」时是「应用」，
+  /// 已全部指向时变成「清除」，用同一枚按钮完成开与关。
+  Widget _oneClickDirsButton(BuildContext context, S s, AppColors c) {
+    String labelOf(CustomCategory cat) => displayName(s, cat);
+    final applied = settingsProvider.categorySaveDirsApplied(labelOf);
+    final baseDir = settingsProvider.defaultSaveDir;
+    // 默认下载目录为空时推导不出任何目录，按钮直接禁用。
+    final enabled = baseDir.trim().isNotEmpty;
+    return ShadButton.outline(
+      size: ShadButtonSize.sm,
+      onPressed: enabled
+          ? () => _confirmCategoryDirs(context, s, c, applied: applied)
+          : null,
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            applied ? LucideIcons.folderX : LucideIcons.folderTree,
+            size: 13,
+            color: c.textSecondary,
+          ),
+          const SizedBox(width: 4),
+          Text(applied ? s.clearCategoryDirs : s.autoCategoryDirs),
+        ],
+      ),
+    );
+  }
+
+  void _confirmCategoryDirs(
+    BuildContext context,
+    S s,
+    AppColors c, {
+    required bool applied,
+  }) {
+    // 举例用第一个可推导出目录的分类，让用户先看清实际会建在哪。
+    var sample = '';
+    for (final cat in settingsProvider.customCategories) {
+      if (cat.builtinType == 'all') continue;
+      final dir = categoryDirUnder(
+        settingsProvider.defaultSaveDir,
+        displayName(s, cat),
+      );
+      if (dir.isNotEmpty) {
+        sample = dir;
+        break;
+      }
+    }
+    showShadDialog(
+      context: context,
+      barrierColor: c.dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (ctx) => ShadDialog(
+        title: Text(applied ? s.clearCategoryDirs : s.autoCategoryDirs),
+        description: Text(
+          applied
+              ? s.clearCategoryDirsConfirm
+              : s.autoCategoryDirsConfirm(sample),
+        ),
+        actions: [
+          ShadButton.outline(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(s.cancel),
+          ),
+          ShadButton(
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              if (applied) {
+                settingsProvider.clearCategorySaveDirs();
+              } else {
+                settingsProvider.applyCategorySaveDirs(
+                  (cat) => displayName(s, cat),
+                );
+              }
+            },
+            child: Text(s.confirm),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2492,8 +2572,15 @@ class _CategoryTile extends StatefulWidget {
 class _CategoryTileState extends State<_CategoryTile> {
   bool _isHovered = false;
 
-  /// 描述文本：内置特殊分类显示"内置"，其余显示扩展名或正则
+  /// 描述文本：内置特殊分类显示"内置"，其余显示扩展名或正则；
+  /// 设了分类保存目录的再在后面挂上目录（一键分类目录后能直接看到落点）。
   String _subtitle(CustomCategory cat, S s) {
+    final rule = _matchSummary(cat, s);
+    if (cat.saveDir.isEmpty) return rule;
+    return rule.isEmpty ? cat.saveDir : '$rule  ·  ${cat.saveDir}';
+  }
+
+  String _matchSummary(CustomCategory cat, S s) {
     // "全部文件" 和 "其他" 不显示扩展名
     if (cat.builtinType == 'all' || cat.builtinType == 'other') {
       return s.builtinCategory;

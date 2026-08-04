@@ -84,6 +84,9 @@ const ICONS: Record<string, LucideIcon> = {
   zap: Zap,
 }
 
+// 内置分类显示名。这些文案不只是标签：`categoryDirUnder` 拿它当目录名，桌面
+// （assets/i18n 的 categoryVideo/categoryAudio/…）与这里必须**逐字一致**，
+// 否则两端「一键分类目录」会在同一台机器上建出两套目录（Document vs Documents）。
 const BUILTIN_LABEL: Record<BuiltinType, I18nKey> = {
   all: 'type.all',
   video: 'type.video',
@@ -326,4 +329,105 @@ export function isSpecialBuiltin(c: Category | null): boolean {
 /** 重排后按数组下标重写 position，保证排序稳定（对齐桌面 reorderCustomCategories）。 */
 export function repositionCategories(cats: Category[]): Category[] {
   return cats.map((c, i) => ({ ...c, position: i }))
+}
+
+// ---------------------------------------------------------------------------
+// 分类保存目录：一键分类目录 + 新建下载时的目录解析
+// ---------------------------------------------------------------------------
+//
+// 桌面镜像：`lib/src/models/custom_category.dart` 的 sanitizeCategoryDirName /
+// categoryDirUnder，以及 `settings_provider.dart` 的 resolveCategorySaveDir。
+// 同一台机器上桌面与 Web 一键出来的目录必须逐字一致，改一处就要改另一处。
+
+// 控制字符是有意匹配的：文件系统不接受它们，与桌面同规剔除。
+// eslint-disable-next-line no-control-regex
+const INVALID_DIR_CHARS = /[\\/:*?"<>|\u0000-\u001f]/g
+
+/** 分类显示名 → 目录名：非法字符换空格、压缩空白、去掉 Windows 会丢弃的结尾点/空格。 */
+export function sanitizeCategoryDirName(label: string): string {
+  let out = label.replace(INVALID_DIR_CHARS, ' ').replace(/\s+/g, ' ').trim()
+  while (out !== '' && (out.endsWith('.') || out.endsWith(' '))) out = out.slice(0, -1)
+  return out
+}
+
+/** 目标机器的路径分隔符。宿主可能是 Linux 服务器而浏览器在 Windows，只能从目录本身反推。 */
+function separatorOf(base: string): string {
+  return /^[a-zA-Z]:[\\/]/.test(base) || (base.includes('\\') && !base.includes('/')) ? '\\' : '/'
+}
+
+/** 「默认下载目录 / 分类名」。目录为空或分类名净化后为空时返回 ''（调用方跳过）。 */
+export function categoryDirUnder(baseDir: string, label: string): string {
+  let root = baseDir.trim()
+  if (root === '') return ''
+  const folder = sanitizeCategoryDirName(label)
+  if (folder === '') return ''
+  const sep = separatorOf(root)
+  while (root.length > 1 && (root.endsWith('/') || root.endsWith('\\'))) root = root.slice(0, -1)
+  // 根目录（"/" 或 "\"）本身就带分隔符，直接拼名字。
+  if (root.endsWith('/') || root.endsWith('\\')) return `${root}${folder}`
+  return `${root}${sep}${folder}`
+}
+
+/** 一键：每个分类（「全部文件」除外，它等同于全局默认目录）指向同名子目录。 */
+export function applyCategoryDirs(cats: Category[], baseDir: string): Category[] {
+  return cats.map((c) => {
+    if (c.builtinType === 'all') return c
+    const dir = categoryDirUnder(baseDir, categoryLabel(c))
+    return dir === '' || dir === c.saveDir ? c : { ...c, saveDir: dir }
+  })
+}
+
+/** 清除所有分类的保存目录，回到「一切都落默认下载目录」。 */
+export function clearCategoryDirs(cats: Category[]): Category[] {
+  return cats.map((c) => (c.saveDir === '' ? c : { ...c, saveDir: '' }))
+}
+
+/** 每个可设目录的分类是否都已指向「默认下载目录 / 分类名」（一键按钮的两态判定）。 */
+export function categoryDirsApplied(cats: Category[], baseDir: string): boolean {
+  let any = false
+  for (const c of cats) {
+    if (c.builtinType === 'all') continue
+    const dir = categoryDirUnder(baseDir, categoryLabel(c))
+    if (dir === '') continue
+    any = true
+    if (c.saveDir !== dir) return false
+  }
+  return any
+}
+
+/** URL 末段派生的文件名（必须含 '.'），取不到返回 ''。 */
+function fileNameFromUrl(url: string): string {
+  try {
+    const path = new URL(url, 'http://x/').pathname
+    const last = decodeURIComponent(path.split('/').pop() ?? '')
+    return last.includes('.') ? last : ''
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 按分类规则解析保存目录：普通分类按 position 先命中先用，都不命中再看「其他」。
+ * 没有任何分类设了目录（默认状态）时返回 ''，由调用方回退全局默认目录。
+ *
+ * [cats] 需传已过滤可见 + 按 position 排序的列表（`visibleCategories`）。
+ * 文件名为空或不含扩展名时用 URL 末段兜底 —— 与桌面
+ * `SettingsProvider.resolveCategorySaveDir` 逐条对齐。
+ */
+export function resolveCategorySaveDir(fileName: string, url: string, cats: Category[]): string {
+  let name = fileName
+  if ((name === '' || !name.includes('.')) && url !== '') {
+    const derived = fileNameFromUrl(url)
+    if (derived !== '') name = derived
+  }
+  if (name === '') return ''
+  const normals = cats.filter((c) => c.builtinType !== 'all' && c.builtinType !== 'other')
+  for (const c of normals) {
+    if (c.saveDir !== '' && matchesCategory(c, name)) return c.saveDir
+  }
+  const other = cats.find((c) => c.builtinType === 'other')
+  if (other && other.saveDir !== '' && !normals.some((c) => matchesCategory(c, name))) {
+    return other.saveDir
+  }
+  return ''
 }
