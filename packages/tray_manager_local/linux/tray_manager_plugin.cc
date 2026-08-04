@@ -44,6 +44,10 @@ G_DEFINE_TYPE(TrayManagerPlugin, tray_manager_plugin, g_object_get_type())
 #define DBUSMENU_PATH     "/MenuBar"
 #define DBUSMENU_IFACE    "com.canonical.dbusmenu"
 
+// Stable application identifier exposed as StatusNotifierItem.Id. It must not
+// change at runtime: hosts derive their per-item identity from it.
+#define SNI_APP_ID        "FluxDown"
+
 // ─── Menu entry ───────────────────────────────────────────────────────────────
 
 struct MenuEntry {
@@ -62,6 +66,10 @@ static guint               s_own_id    = 0;
 static guint               s_sni_reg   = 0;
 static guint               s_menu_reg  = 0;
 static bool                s_active    = false;
+static std::string         s_bus_name;
+static guint               s_watcher_id = 0;
+static bool                s_name_acquired  = false;
+static bool                s_watcher_present = false;
 static std::string         s_icon_path;
 static std::string         s_title     = "FluxDown";
 static std::vector<MenuEntry> s_menu_items;
@@ -140,6 +148,8 @@ static const char SNI_XML[] =
     " \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n"
     "<node>\n"
     "  <interface name='org.kde.StatusNotifierItem'>\n"
+    "    <property name='Id'         type='s'            access='read'/>\n"
+    "    <property name='Category'   type='s'            access='read'/>\n"
     "    <property name='Status'     type='s'            access='read'/>\n"
     "    <property name='Title'      type='s'            access='read'/>\n"
     "    <property name='IconName'   type='s'            access='read'/>\n"
@@ -187,7 +197,14 @@ static void sni_method_call(GDBusConnection*, const gchar*, const gchar*,
 
 static GVariant* sni_get_property(GDBusConnection*, const gchar*,
                                   const gchar*, const gchar*,
-                                  const gchar* prop, GError**, gpointer) {
+                                  const gchar* prop, GError** error,
+                                  gpointer) {
+  // GNOME's AppIndicator host treats Id and Menu as the properties that gate
+  // item readiness: without Id it retries a few times, then drops the icon.
+  if (strcmp(prop, "Id") == 0)
+    return g_variant_new_string(SNI_APP_ID);
+  if (strcmp(prop, "Category") == 0)
+    return g_variant_new_string("ApplicationStatus");
   if (strcmp(prop, "Status") == 0)
     return g_variant_new_string(s_active ? "Active" : "Passive");
   if (strcmp(prop, "Title") == 0)
@@ -207,6 +224,9 @@ static GVariant* sni_get_property(GDBusConnection*, const gchar*,
   if (strcmp(prop, "ItemIsMenu") == 0)
     // FALSE → Plasma calls Activate on left-click (not ContextMenu).
     return g_variant_new_boolean(FALSE);
+  // GDBus requires the error to be set whenever NULL is returned.
+  g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+              "No such property: %s", prop);
   return nullptr;
 }
 
@@ -476,17 +496,49 @@ static void on_bus_acquired(GDBusConnection* conn, const gchar*, gpointer) {
   }
 }
 
-static void on_name_acquired(GDBusConnection*, const gchar* name, gpointer) {
-  // Register with StatusNotifierWatcher so system trays discover us.
+static void on_register_finished(GObject* source, GAsyncResult* res,
+                                 gpointer) {
+  GError* err = nullptr;
+  GVariant* ret =
+      g_dbus_connection_call_finish(G_DBUS_CONNECTION(source), res, &err);
+  if (ret) g_variant_unref(ret);
+  if (err) {
+    g_warning("tray_manager: RegisterStatusNotifierItem failed: %s",
+              err->message);
+    g_error_free(err);
+  }
+}
+
+// Registration is redone every time the watcher shows up: the host may start
+// after us, be restarted, or have its tray support toggled. A one-shot call
+// at name-acquired time would lose the icon permanently in those cases.
+static void register_with_watcher() {
+  if (!s_conn || !s_name_acquired || !s_watcher_present) return;
   g_dbus_connection_call(s_conn,
                          SNI_WATCHER_BUS, SNI_WATCHER_PATH, SNI_WATCHER_IFACE,
                          "RegisterStatusNotifierItem",
-                         g_variant_new("(s)", name),
+                         g_variant_new("(s)", s_bus_name.c_str()),
                          nullptr, G_DBUS_CALL_FLAGS_NONE,
-                         -1, nullptr, nullptr, nullptr);
+                         -1, nullptr, on_register_finished, nullptr);
+}
+
+static void on_watcher_appeared(GDBusConnection*, const gchar*,
+                                const gchar*, gpointer) {
+  s_watcher_present = true;
+  register_with_watcher();
+}
+
+static void on_watcher_vanished(GDBusConnection*, const gchar*, gpointer) {
+  s_watcher_present = false;
+}
+
+static void on_name_acquired(GDBusConnection*, const gchar*, gpointer) {
+  s_name_acquired = true;
+  register_with_watcher();
 }
 
 static void on_name_lost(GDBusConnection*, const gchar*, gpointer) {
+  s_name_acquired = false;
   g_warning("tray_manager: failed to acquire StatusNotifierItem bus name");
 }
 
@@ -499,11 +551,17 @@ static void ensure_dbus_initialized() {
   // Bus name format required by the SNI spec.
   gchar* bus_name =
       g_strdup_printf("org.kde.StatusNotifierItem-%d-1", (int)getpid());
+  s_bus_name = bus_name;
   s_own_id = g_bus_own_name(G_BUS_TYPE_SESSION, bus_name,
                              G_BUS_NAME_OWNER_FLAGS_NONE,
                              on_bus_acquired, on_name_acquired, on_name_lost,
                              nullptr, nullptr);
   g_free(bus_name);
+
+  s_watcher_id = g_bus_watch_name(G_BUS_TYPE_SESSION, SNI_WATCHER_BUS,
+                                  G_BUS_NAME_WATCHER_FLAGS_NONE,
+                                  on_watcher_appeared, on_watcher_vanished,
+                                  nullptr, nullptr);
 }
 
 // ─── Flutter method handlers ─────────────────────────────────────────────────
@@ -578,6 +636,12 @@ done:
 
 static FlMethodResponse* handle_destroy() {
   s_active = false;
+  if (s_watcher_id) {
+    g_bus_unwatch_name(s_watcher_id);
+    s_watcher_id = 0;
+  }
+  s_watcher_present = false;
+  s_name_acquired = false;
   if (s_conn) {
     if (s_sni_reg) {
       g_dbus_connection_unregister_object(s_conn, s_sni_reg);
@@ -593,6 +657,7 @@ static FlMethodResponse* handle_destroy() {
     g_bus_unown_name(s_own_id);
     s_own_id = 0;
   }
+  s_bus_name.clear();
   return FL_METHOD_RESPONSE(
       fl_method_success_response_new(fl_value_new_bool(true)));
 }
