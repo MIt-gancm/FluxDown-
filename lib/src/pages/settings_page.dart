@@ -377,6 +377,13 @@ List<SettingsSearchItem> get settingsSearchItems {
     ),
     SettingsSearchItem(
       category: SettingsCategory.download,
+      label: s.fileMissingAction,
+      description: s.fileMissingActionDesc,
+      keywords: s.searchKeywordsFileMissing,
+      icon: LucideIcons.fileX,
+    ),
+    SettingsSearchItem(
+      category: SettingsCategory.download,
       label: s.defaultThreads,
       description: s.defaultThreadsDesc,
       keywords: s.searchKeywordsThreads,
@@ -3234,6 +3241,36 @@ class _DownloadContent extends StatelessWidget {
                     onChanged: (v) {
                       if (v != null) {
                         settingsProvider.setFileExistsBehavior(v);
+                      }
+                    },
+                  ),
+                ),
+                _SettingRow(
+                  label: s.fileMissingAction,
+                  description: s.fileMissingActionDesc,
+                  child: ShadSelect<String>(
+                    initialValue:
+                        settingsProvider.fileMissingAction == 'delete'
+                        ? 'delete'
+                        : 'keep',
+                    options: [
+                      ShadOption(
+                        value: 'keep',
+                        child: Text(s.fileMissingKeep),
+                      ),
+                      ShadOption(
+                        value: 'delete',
+                        child: Text(s.fileMissingDelete),
+                      ),
+                    ],
+                    selectedOptionBuilder: (context, value) => Text(
+                      value == 'delete'
+                          ? s.fileMissingDelete
+                          : s.fileMissingKeep,
+                    ),
+                    onChanged: (v) {
+                      if (v != null) {
+                        settingsProvider.setFileMissingAction(v);
                       }
                     },
                   ),

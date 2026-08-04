@@ -70,6 +70,7 @@ export function DownloadSettings({
   const cdnMaxNodes = Number(config.cdn_max_nodes ?? '0')
   const proxyMode = config.proxy_mode ?? 'none'
   const fileExistsBehavior = config.file_exists_behavior ?? 'rename'
+  const fileMissingAction = config.file_missing_action ?? 'keep'
   const maxConcurrent = Number(config.max_concurrent_tasks ?? '5')
   const defaultSegments = Number(config.default_segments ?? '0')
   const autoMaxConnections = Number(config.auto_max_connections ?? '16')
@@ -169,6 +170,20 @@ export function DownloadSettings({
               { value: 'overwrite', label: t('set.download.fileExistsOverwrite') },
             ]}
             width={160}
+          />
+        </SetRow>
+        <SetRow
+          title={t('set.download.fileMissingAction')}
+          desc={t('set.download.fileMissingActionDesc')}
+        >
+          <SetSelect
+            value={fileMissingAction === 'delete' ? 'delete' : 'keep'}
+            onValueChange={(v) => mutate({ file_missing_action: v })}
+            options={[
+              { value: 'keep', label: t('set.download.fileMissingKeep') },
+              { value: 'delete', label: t('set.download.fileMissingDelete') },
+            ]}
+            width={200}
           />
         </SetRow>
         {queues.length > 0 && (

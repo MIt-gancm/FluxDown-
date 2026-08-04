@@ -121,11 +121,14 @@ pub struct BatchCreateTask {
     pub unattended: bool,
 }
 
-/// Control an existing task (pause/resume/cancel/delete)
+/// Control an existing task (pause/resume/cancel/delete/restart)
 #[derive(Deserialize, DartSignal)]
 pub struct ControlTask {
     pub task_id: String,
-    pub action: i32, // 0=pause, 1=resume, 2=cancel, 3=delete(+files), 4=delete(record only)
+    /// 0=pause, 1=resume, 2=cancel, 3=delete(+files), 4=delete(record only),
+    /// 5=restart（「重新下载」：丢弃磁盘产物与进度后从零重下；BT 不支持，
+    /// 引擎侧直接忽略）。
+    pub action: i32,
 }
 
 /// 修改某个已存在任务的分段（线程）数（Dart → Rust）。

@@ -199,6 +199,10 @@ class S {
   String selectedCount(int n) => _r('selectedCount', {'n': n});
   String get deleteTask => _r('deleteTask');
   String get deleteTaskAndFile => _r('deleteTaskAndFile');
+  String get cleanStaleTasks => _r('cleanStaleTasks');
+  String get cleanStaleTasksTitle => _r('cleanStaleTasksTitle');
+  String cleanStaleTasksDesc(int count) =>
+      _r('cleanStaleTasksDesc', {'count': count});
 
   // ─────────────────────────────────────────────
   // TaskList
@@ -285,6 +289,7 @@ class S {
   String get urlCopied => _r('urlCopied');
   String get errorCopied => _r('errorCopied');
   String get renameTask => _r('renameTask');
+  String get redownloadTask => _r('redownloadTask');
   String get renameTaskTitle => _r('renameTaskTitle');
   String get renameTaskPlaceholder => _r('renameTaskPlaceholder');
   String get renameTaskSuccess => _r('renameTaskSuccess');
@@ -721,6 +726,10 @@ class S {
   String get fileExistsBehaviorDesc => _r('fileExistsBehaviorDesc');
   String get fileExistsRename => _r('fileExistsRename');
   String get fileExistsOverwrite => _r('fileExistsOverwrite');
+  String get fileMissingAction => _r('fileMissingAction');
+  String get fileMissingActionDesc => _r('fileMissingActionDesc');
+  String get fileMissingKeep => _r('fileMissingKeep');
+  String get fileMissingDelete => _r('fileMissingDelete');
   String get keepAwakeWhileDownloading => _r('keepAwakeWhileDownloading');
   String get keepAwakeWhileDownloadingDesc =>
       _r('keepAwakeWhileDownloadingDesc');
@@ -1457,6 +1466,9 @@ class S {
   List<String> get searchKeywordsFileExists =>
       _r('searchKeywordsFileExists').split(',')
         ..addAll(['overwrite', 'rename', 'exists', 'duplicate', 'conflict']);
+  List<String> get searchKeywordsFileMissing =>
+      _r('searchKeywordsFileMissing').split(',')
+        ..addAll(['missing', 'deleted', 'moved', 'cleanup']);
   List<String> get searchKeywordsKeepAwake =>
       _r('searchKeywordsKeepAwake').split(',')
         ..addAll(['awake', 'sleep', 'screen', 'wake']);

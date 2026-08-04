@@ -193,6 +193,9 @@ class SettingsProvider extends ChangeNotifier {
   // 文件已存在时的处理方式（'rename' = 自动重命名，'overwrite' = 覆盖旧文件）
   String _fileExistsBehavior = 'rename';
 
+  // 任务文件被删除/移动后的动作（'keep' = 保留任务记录，'delete' = 自动删除任务记录）
+  String _fileMissingAction = 'keep';
+
   // 新建下载对话框上次选择的线程数（'' = 未记录，'auto' = 自动，数字串 = 固定）
   String _lastDialogThreads = '';
 
@@ -452,6 +455,9 @@ class SettingsProvider extends ChangeNotifier {
 
   // 文件已存在时处理方式 Getter
   String get fileExistsBehavior => _fileExistsBehavior;
+
+  // 文件被删除/移动时的动作 Getter
+  String get fileMissingAction => _fileMissingAction;
 
   // 新建下载对话框上次选择的线程数 Getter
   String get lastDialogThreads => _lastDialogThreads;
@@ -1476,6 +1482,14 @@ class SettingsProvider extends ChangeNotifier {
     _saveToRust('file_exists_behavior', value);
   }
 
+  // 文件被删除/移动时的动作 Setter
+  void setFileMissingAction(String value) {
+    if (_fileMissingAction == value) return;
+    _fileMissingAction = value;
+    notifyListeners();
+    _saveToRust('file_missing_action', value);
+  }
+
   // 文件管理器命令 Setters
   void setRevealFileCmd(String value) {
     if (_revealFileCmd == value) return;
@@ -1972,6 +1986,8 @@ class SettingsProvider extends ChangeNotifier {
           _defaultQueueId = entry.value;
         case 'file_exists_behavior':
           _fileExistsBehavior = entry.value.isEmpty ? 'rename' : entry.value;
+        case 'file_missing_action':
+          _fileMissingAction = entry.value == 'delete' ? 'delete' : 'keep';
         case 'last_dialog_threads':
           _lastDialogThreads = entry.value;
         case 'last_target_device':

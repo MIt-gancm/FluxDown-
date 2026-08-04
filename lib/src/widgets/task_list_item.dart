@@ -835,6 +835,23 @@ void showTaskContextMenu(
       ),
     );
   }
+  // --- 重新下载（非 BT 且当前不在下载中）---
+  // 不管目标文件是否还在磁盘上：一律丢弃现有产物与进度，从零重下。
+  if (!task.isBt &&
+      task.status != TaskStatus.pending &&
+      task.status != TaskStatus.downloading &&
+      task.status != TaskStatus.preparing &&
+      task.status != TaskStatus.resuming) {
+    items.add(
+      ContextMenuItem(
+        icon: LucideIcons.rotateCcw,
+        label: s.redownloadTask,
+        color: c.textPrimary,
+        action: () =>
+            ControlTask(taskId: task.id, action: 5).sendSignalToRust(),
+      ),
+    );
+  }
   dividers.add(items.length - 1); // 文件操作组后加分隔线
 
   // --- 复制下载地址 ---
@@ -1147,6 +1164,43 @@ void showBatchDeleteConfirmDialog(
       cancelLabel: s.cancel,
       confirmLabel: s.batchDeleteConfirmTitle(deleteFiles),
       isDeleteFiles: deleteFiles,
+      onCancel: () => Navigator.of(ctx).pop(),
+      onConfirm: () {
+        Navigator.of(ctx).pop();
+        onConfirm();
+      },
+    ),
+  );
+}
+
+// =============================================================================
+// 清理失效任务确认对话框（管理栏「清理失效任务」）
+// =============================================================================
+
+/// 失效任务（文件已删除/移动 + 下载失败）批量清理确认。
+///
+/// 两类的磁盘处理不同（前者只删记录，后者连残片一起删），差异写在描述文案里；
+/// 对话框本身复用删除内容组件，`isDeleteFiles: false` 用非破坏性配色——主体
+/// 语义是「清理记录」，不是「删你的文件」。
+void showCleanStaleTasksDialog(
+  BuildContext context, {
+  required int count,
+  required VoidCallback onConfirm,
+}) {
+  if (!context.mounted) return;
+  final c = AppColors.of(context);
+  final s = LocaleScope.of(context);
+  showShadDialog(
+    context: context,
+    barrierColor: c.dialogBarrier,
+    animateIn: const [],
+    animateOut: const [],
+    builder: (ctx) => _DeleteConfirmDialogContent(
+      title: s.cleanStaleTasksTitle,
+      description: s.cleanStaleTasksDesc(count),
+      cancelLabel: s.cancel,
+      confirmLabel: s.cleanStaleTasksTitle,
+      isDeleteFiles: false,
       onCancel: () => Navigator.of(ctx).pop(),
       onConfirm: () {
         Navigator.of(ctx).pop();

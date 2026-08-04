@@ -634,6 +634,42 @@ class DownloadController extends ChangeNotifier {
       _tag,
       'deleteCheckedTasks: ${ids.length} tasks, deleteFiles=$deleteFiles',
     );
+    _deleteTasksBatch(ids, deleteFiles: deleteFiles);
+  }
+
+  /// 「失效任务」= 已完成但文件已被删除/移动 + 下载失败。作用域与「全选」
+  /// 一致（当前筛选列表）。两类的**磁盘语义不同**，所以分开返回：
+  /// - missing：产物已不在磁盘上，只删记录；
+  /// - failed：可能留着一份谁也续不上的 `.fdownloading` 残片，记录一删就成
+  ///   孤儿文件，必须连文件一起清。
+  List<String> get staleMissingTaskIds => [
+    for (final t in filteredTasks)
+      if (t.status == TaskStatus.completed && t.fileMissing) t.id,
+  ];
+
+  List<String> get staleFailedTaskIds => [
+    for (final t in filteredTasks)
+      if (t.status == TaskStatus.error) t.id,
+  ];
+
+  int get staleTaskCount =>
+      staleMissingTaskIds.length + staleFailedTaskIds.length;
+
+  /// 清理失效任务。两批分别下发，各按自己的磁盘语义处理。
+  void deleteStaleTasks() {
+    final missing = staleMissingTaskIds;
+    final failed = staleFailedTaskIds;
+    logInfo(
+      _tag,
+      'deleteStaleTasks: ${missing.length} missing + ${failed.length} failed',
+    );
+    _deleteTasksBatch(missing, deleteFiles: false);
+    _deleteTasksBatch(failed, deleteFiles: true);
+  }
+
+  /// 批量删除共用实现：乐观移除本地行 + 单次 BatchControlTask IPC，
+  /// 收尾退出管理模式。
+  void _deleteTasksBatch(List<String> ids, {required bool deleteFiles}) {
     if (ids.isEmpty) return;
 
     // 进度追踪：批量删除 ≥2 个任务时启用，等待 Rust 逐个发回删除确认信号。

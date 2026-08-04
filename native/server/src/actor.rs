@@ -260,6 +260,7 @@ pub async fn run_actor(
     mut retry_rx: mpsc::Receiver<String>,
     mut resolve_rx: mpsc::UnboundedReceiver<ResolveOutcome>,
     mut plugin_retry_rx: mpsc::UnboundedReceiver<(String, u64)>,
+    mut missing_cleanup_rx: mpsc::Receiver<Vec<String>>,
 ) {
     // 启动预热：加载队列缓存（每队列限速/并发生效）+ 广播全量任务快照。
     engine.manager.load_queues().await;
@@ -308,6 +309,15 @@ pub async fn run_actor(
                     log_info!("[server-actor] auto-retry: resuming task {}", task_id);
                     engine.manager.resume_task_auto(&task_id).await;
                 }
+            }
+            Some(ids) = missing_cleanup_rx.recv() => {
+                // config `file_missing_action == "delete"`：文件跟踪扫描发现
+                // 产物已不在磁盘上，只删任务记录（delete_files=false，无文件
+                // 可删）。收尾与 `ActorCmd::DeleteTask` 一致：重发全量快照，
+                // WsHub 据此判定并发出 aria2 onDownloadStop。
+                log_info!("[server-actor] auto-deleting {} task(s) whose files vanished", ids.len());
+                engine.manager.delete_tasks_batch(&ids, false).await;
+                engine.manager.load_and_send_all_tasks().await;
             }
             Some(out) = resolve_rx.recv() => {
                 engine.manager.on_resolve_ready(out).await;
@@ -815,6 +825,11 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
             "file_exists_behavior" => {
                 if let Some(v) = all.get(key) {
                     engine.manager.set_file_exists_overwrite(v == "overwrite");
+                }
+            }
+            "file_missing_action" => {
+                if let Some(v) = all.get(key) {
+                    engine.manager.set_missing_file_auto_delete(v == "delete");
                 }
             }
             k if k == fluxdown_engine::webhook::CONFIG_KEY_ENDPOINTS => {

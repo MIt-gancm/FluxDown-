@@ -495,6 +495,11 @@ pub async fn run(db_dir: PathBuf) {
         if let Some(v) = cfg.get("file_exists_behavior") {
             engine.manager.set_file_exists_overwrite(v == "overwrite");
         }
+        // 任务的文件被删除/移动时的动作（"keep"=保留任务记录，默认；
+        // "delete"=文件消失后自动删除任务记录）。
+        if let Some(v) = cfg.get("file_missing_action") {
+            engine.manager.set_missing_file_auto_delete(v == "delete");
+        }
     }
 
     if let Some(rx) = engine.manager.take_progress_rx() {
@@ -527,6 +532,12 @@ pub async fn run(db_dir: PathBuf) {
             rx
         }
     };
+
+    // 文件跟踪扫描判定「文件已消失」后的自动清理回流通道（config
+    // `file_missing_action == "delete"`）。主 `select!` 已占满 64 分支上限，
+    // 这条通道由下方后台泵合流进 `aux_tx`，不新增主循环分支。
+    let missing_cleanup_rx: Option<mpsc::Receiver<Vec<String>>> =
+        engine.manager.take_missing_cleanup_rx();
 
     // Off-actor plugin resolve 回流通道（见插件系统契约一，关键）：resolver
     // 平面在独立 tokio task 上异步执行，结果经 `resolve_rx` 回流本循环调用
@@ -1005,8 +1016,22 @@ pub async fn run(db_dir: PathBuf) {
         SeedingTick,
         /// 任务级做种限制覆盖写入（热读，下一次做种求值 tick 生效）。
         SeedLimits(SetTaskSeedLimits),
+        /// 文件跟踪扫描回流的「文件已消失」任务批次，需删除其任务记录
+        /// （config `file_missing_action == "delete"`）。
+        MissingCleanup(Vec<String>),
     }
     let (aux_tx, mut aux_rx) = mpsc::unbounded_channel::<AuxSignal>();
+    // 文件丢失自动清理泵：引擎 detached 扫描 → mpsc → aux_tx → 主循环单分支。
+    if let Some(mut rx) = missing_cleanup_rx {
+        let cleanup_tx = aux_tx.clone();
+        tokio::spawn(async move {
+            while let Some(ids) = rx.recv().await {
+                if cleanup_tx.send(AuxSignal::MissingCleanup(ids)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let group_tx = aux_tx.clone();
     {
         let preview_recv = ResolvePreviewRequest::get_dart_signal_receiver();
@@ -1301,6 +1326,8 @@ pub async fn run(db_dir: PathBuf) {
                         engine.manager.delete_task(&msg.task_id, false).await;
                         rinf_sink.broadcast_task_stop(&msg.task_id);
                     }
+                    // 重新下载：丢弃已有产物与进度，从零重下。
+                    5 => engine.manager.restart_task(&msg.task_id).await,
                     _ => {}
                 }
             }
@@ -1539,6 +1566,17 @@ pub async fn run(db_dir: PathBuf) {
                             msg.upload_limit_bps,
                         )
                         .await;
+                }
+                AuxSignal::MissingCleanup(ids) => {
+                    // `file_missing_action == "delete"`：文件已不在磁盘上，
+                    // 只删任务记录（delete_files=false，无文件可删）。
+                    log_info!("[actor] auto-deleting {} task(s) whose files vanished", ids.len());
+                    engine.manager.delete_tasks_batch(&ids, false).await;
+                    for task_id in &ids {
+                        rinf_sink.broadcast_task_stop(task_id);
+                    }
+                    // 删除没有专属信号——重发全量快照，Dart 任务列表才会移除这些行。
+                    engine.manager.load_and_send_all_tasks().await;
                 }
                 }
             }
@@ -3065,6 +3103,11 @@ async fn apply_config_key(
             let v = value == "overwrite";
             log_info!("[actor] updating file_exists_behavior overwrite to {}", v);
             engine.manager.set_file_exists_overwrite(v);
+        }
+        "file_missing_action" => {
+            let v = value == "delete";
+            log_info!("[actor] updating file_missing_action auto-delete to {}", v);
+            engine.manager.set_missing_file_auto_delete(v);
         }
         "max_auto_retries" => {
             if let Ok(v) = value.parse::<i32>() {

@@ -41,6 +41,7 @@ class TaskTabBar extends StatelessWidget {
   ) {
     final checkedCount = ctrl.checkedCount;
     final allChecked = ctrl.isAllFilteredChecked;
+    final staleCount = ctrl.staleTaskCount;
 
     return Container(
       height: 40,
@@ -85,47 +86,75 @@ class TaskTabBar extends StatelessWidget {
             ),
           ),
 
-          const Spacer(),
+          // 右侧动作组：`Expanded` 吃掉剩余空间，内部 `reverse: true` 的横向
+          // 滚动让内容贴右对齐——第 5 个按钮加进来后，窄窗（900）+ 宽侧边栏
+          // （320）+ 英文长标签的组合会超出 40px 行宽，硬 Row 会直接甩溢出条纹。
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              reverse: true,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // 清理失效任务：文件已删除/移动 + 下载失败的任务
+                  _ManageButton(
+                    icon: LucideIcons.brushCleaning,
+                    label: s.cleanStaleTasks,
+                    color: staleCount > 0 ? AppColors.amber : c.textMuted,
+                    onTap: staleCount > 0
+                        ? () => showCleanStaleTasksDialog(
+                            context,
+                            count: staleCount,
+                            onConfirm: ctrl.deleteStaleTasks,
+                          )
+                        : null,
+                  ),
+                  const SizedBox(width: 4),
 
-          // 删除任务按钮
-          _ManageButton(
-            icon: LucideIcons.trash2,
-            label: s.deleteTask,
-            color: checkedCount > 0 ? c.textPrimary : c.textMuted,
-            onTap: checkedCount > 0
-                ? () => showBatchDeleteConfirmDialog(
-                    context,
-                    count: checkedCount,
-                    deleteFiles: false,
-                    onConfirm: () =>
-                        ctrl.deleteCheckedTasks(deleteFiles: false),
-                  )
-                : null,
-          ),
-          const SizedBox(width: 4),
+                  // 删除任务按钮
+                  _ManageButton(
+                    icon: LucideIcons.trash2,
+                    label: s.deleteTask,
+                    color: checkedCount > 0 ? c.textPrimary : c.textMuted,
+                    onTap: checkedCount > 0
+                        ? () => showBatchDeleteConfirmDialog(
+                            context,
+                            count: checkedCount,
+                            deleteFiles: false,
+                            onConfirm: () =>
+                                ctrl.deleteCheckedTasks(deleteFiles: false),
+                          )
+                        : null,
+                  ),
+                  const SizedBox(width: 4),
 
-          // 删除任务和文件按钮
-          _ManageButton(
-            icon: LucideIcons.fileX,
-            label: s.deleteTaskAndFile,
-            color: checkedCount > 0 ? AppColors.red : c.textMuted,
-            onTap: checkedCount > 0
-                ? () => showBatchDeleteConfirmDialog(
-                    context,
-                    count: checkedCount,
-                    deleteFiles: true,
-                    onConfirm: () => ctrl.deleteCheckedTasks(deleteFiles: true),
-                  )
-                : null,
-          ),
-          const SizedBox(width: 8),
+                  // 删除任务和文件按钮
+                  _ManageButton(
+                    icon: LucideIcons.fileX,
+                    label: s.deleteTaskAndFile,
+                    color: checkedCount > 0 ? AppColors.red : c.textMuted,
+                    onTap: checkedCount > 0
+                        ? () => showBatchDeleteConfirmDialog(
+                            context,
+                            count: checkedCount,
+                            deleteFiles: true,
+                            onConfirm: () =>
+                                ctrl.deleteCheckedTasks(deleteFiles: true),
+                          )
+                        : null,
+                  ),
+                  const SizedBox(width: 8),
 
-          // 退出管理模式
-          _ManageButton(
-            icon: LucideIcons.x,
-            label: s.cancel,
-            color: c.textSecondary,
-            onTap: () => ctrl.exitManageMode(),
+                  // 退出管理模式
+                  _ManageButton(
+                    icon: LucideIcons.x,
+                    label: s.cancel,
+                    color: c.textSecondary,
+                    onTap: () => ctrl.exitManageMode(),
+                  ),
+                ],
+              ),
+            ),
           ),
         ],
       ),

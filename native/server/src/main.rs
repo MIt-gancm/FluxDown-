@@ -193,6 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(v) = all_cfg.get("file_exists_behavior") {
         engine.manager.set_file_exists_overwrite(v == "overwrite");
     }
+    // 任务的文件被删除/移动时的动作（"keep"=保留任务记录，默认；
+    // "delete"=文件消失后自动删除任务记录）。
+    if let Some(v) = all_cfg.get("file_missing_action") {
+        engine.manager.set_missing_file_auto_delete(v == "delete");
+    }
 
     // 进度上报旁路：progress_rx 独立消费（不 spawn 则无任何进度事件）。
     if let Some(rx) = engine.manager.take_progress_rx() {
@@ -218,6 +223,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .manager
         .take_plugin_retry_rx()
         .ok_or("take_plugin_retry_rx returned None (already taken)")?;
+    let missing_cleanup_rx = engine
+        .manager
+        .take_missing_cleanup_rx()
+        .ok_or("take_missing_cleanup_rx returned None (already taken)")?;
 
     let db_handle = engine.db.clone();
     let selector_handle = engine.selector.clone();
@@ -235,6 +244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         retry_rx,
         resolve_rx,
         plugin_retry_rx,
+        missing_cleanup_rx,
     ));
 
     // 本地设备互联（P2P 局域网配对 + mDNS 发现 + 直连传输）。

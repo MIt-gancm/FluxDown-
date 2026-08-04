@@ -213,7 +213,13 @@ async fn probe_missing(path: &Path) -> Option<bool> {
 /// [`DownloadManager::spawn_file_scan`] 在 detached task 中调用；`scanning`
 /// 标志确保同一时刻只有一个扫描在跑。双向判定（探到存在即把标志翻回 false），
 /// 无棘轮，文件移回后自愈。
-async fn scan_missing_files(db: Db, sink: Arc<dyn EventSink>, scanning: Arc<AtomicBool>) {
+async fn scan_missing_files(
+    db: Db,
+    sink: Arc<dyn EventSink>,
+    scanning: Arc<AtomicBool>,
+    auto_delete: bool,
+    cleanup_tx: mpsc::Sender<Vec<String>>,
+) {
     // 防重叠：已有扫描在跑就直接返回。
     if scanning.swap(true, Ordering::SeqCst) {
         return;
@@ -276,6 +282,22 @@ async fn scan_missing_files(db: Db, sink: Arc<dyn EventSink>, scanning: Arc<Atom
     }
 
     if !changes.is_empty() {
+        // `file_missing_action == "delete"`：把本轮新判定为丢失的任务回流给
+        // 宿主 actor 删除记录。通道满 = 上一批还没被消费，本轮直接丢弃，
+        // 下一轮扫描会重新报告（无棘轮，不阻塞扫描）。
+        if auto_delete {
+            let gone: Vec<String> = changes
+                .iter()
+                .filter(|(_, missing)| *missing)
+                .map(|(id, _)| id.clone())
+                .collect();
+            if !gone.is_empty()
+                && let Err(e) = cleanup_tx.try_send(gone)
+            {
+                log_info!("[file-scan] missing cleanup channel send failed: {}", e);
+            }
+        }
+        // 事件照常发：UI 先看到 file_missing 状态变化，随后收到删除确认。
         sink.emit(EngineEvent::FileMissingChanged(changes));
     }
 }
@@ -309,6 +331,37 @@ fn is_safe_file_name(name: &str) -> bool {
                     | Component::Prefix(_)
             )
         })
+}
+
+/// 「重新下载」的磁盘清理原语：删掉 `path`，`NotFound` 视为成功。
+///
+/// `contended = true`（刚取消过在途 spawn）时最多重试 10 次、每次间隔
+/// 100 ms：`pause_task_silent` 只 cancel token 不等 spawned task 退出，
+/// 而 Windows 上被写入方持有的文件 `remove_file` 会直接失败——不给这个
+/// 窗口留重试，残留的 `.fdownloading` 会被下一轮下载当成可续传数据，
+/// 「从零重下」的承诺就破了。仍失败只记日志，不阻断重启流程。
+async fn remove_file_retrying(task_id: &str, path: &Path, contended: bool) {
+    const MAX_ATTEMPTS: u32 = 10;
+    let attempts = if contended { MAX_ATTEMPTS } else { 1 };
+    for attempt in 1..=attempts {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                if attempt == attempts {
+                    log_info!(
+                        "[manager] restart_task {}: remove {} failed after {} attempt(s): {}",
+                        task_id,
+                        path.display(),
+                        attempt,
+                        e
+                    );
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
 }
 
 /// 延迟二次清理：删除任务时若等待 spawned 下载 handle 超时，下载任务可能
@@ -1296,6 +1349,16 @@ pub struct DownloadManager {
     /// 文件跟踪扫描是否正在进行（防重叠）。内存级；`Arc` 以便 detached 扫描
     /// task 与调用方共享同一标志。
     scanning: Arc<AtomicBool>,
+    /// 任务的文件被删除/移动时是否自动删除任务记录（config
+    /// `file_missing_action` == `"delete"`，默认 false = 仅标记 `file_missing`
+    /// 并保留任务记录）。开启时文件跟踪扫描把新判定为丢失的 task_id 经
+    /// `missing_cleanup_tx` 回流给宿主 actor 执行删除。
+    missing_file_auto_delete: bool,
+    /// 文件丢失自动清理回流通道发送端：detached 扫描把本轮新判定为丢失的
+    /// task_id 批次投进来，actor loop 收到后调用 `delete_tasks_batch`。
+    missing_cleanup_tx: mpsc::Sender<Vec<String>>,
+    /// 文件丢失自动清理回流接收端（仅取一次，交给 actor loop）。
+    missing_cleanup_rx: Option<mpsc::Receiver<Vec<String>>>,
     /// Boost 模式当前优先任务 ID（内存级，重启清空）。None = 无优先任务。
     priority_task_id: Option<String>,
     /// 因 Boost 模式自动暂停的任务 ID 集合（内存级，重启清空）。
@@ -1412,6 +1475,7 @@ impl DownloadManager {
         let (tx, rx) = mpsc::channel(8192);
         let (done_tx, done_rx) = mpsc::channel(64);
         let (retry_tx, retry_rx) = mpsc::channel(32);
+        let (missing_cleanup_tx, missing_cleanup_rx) = mpsc::channel(8);
         #[cfg(feature = "plugins")]
         let (resolve_tx, resolve_rx) = mpsc::unbounded_channel();
         #[cfg(feature = "plugins")]
@@ -1457,6 +1521,9 @@ impl DownloadManager {
             startup_reset_done: false,
             suppress_bulk_broadcasts: false,
             scanning: Arc::new(AtomicBool::new(false)),
+            missing_file_auto_delete: false,
+            missing_cleanup_tx,
+            missing_cleanup_rx: Some(missing_cleanup_rx),
             priority_task_id: None,
             auto_paused_ids: HashSet::new(),
             auto_retry_counts: HashMap::new(),
@@ -1504,6 +1571,14 @@ impl DownloadManager {
     /// The actor loop should select on this to resume stalled tasks.
     pub fn take_retry_rx(&mut self) -> Option<mpsc::Receiver<String>> {
         self.retry_rx.take()
+    }
+
+    /// Take the receiver for file-missing auto-cleanup batches.
+    /// The actor loop should select on this and delete the reported task
+    /// records (config `file_missing_action` == `"delete"`). 宿主不取时
+    /// 通道会被填满，扫描侧的 `try_send` 静默失败——行为安全。
+    pub fn take_missing_cleanup_rx(&mut self) -> Option<mpsc::Receiver<Vec<String>>> {
+        self.missing_cleanup_rx.take()
     }
 
     // ===================================================================
@@ -2387,6 +2462,16 @@ impl DownloadManager {
     /// they were spawned with.
     pub fn set_file_exists_overwrite(&mut self, v: bool) {
         self.file_exists_overwrite = v;
+    }
+
+    /// Update the "file deleted or moved" behavior (config
+    /// `file_missing_action`): `true` = automatically delete the task record
+    /// once the file-tracking scan finds the file gone (`"delete"`),
+    /// `false` = keep the record and only flag it (`"keep"`, default).
+    /// Takes effect from the next scan onwards; the scan already in flight
+    /// keeps the value it was spawned with.
+    pub fn set_missing_file_auto_delete(&mut self, on: bool) {
+        self.missing_file_auto_delete = on;
     }
 
     /// Update global speed limit (bytes/sec).  Takes effect immediately on
@@ -3681,8 +3766,10 @@ impl DownloadManager {
         let db = self.db.clone();
         let sink = self.sink.clone();
         let scanning = self.scanning.clone();
+        let auto_delete = self.missing_file_auto_delete;
+        let cleanup_tx = self.missing_cleanup_tx.clone();
         tokio::spawn(async move {
-            scan_missing_files(db, sink, scanning).await;
+            scan_missing_files(db, sink, scanning, auto_delete, cleanup_tx).await;
         });
     }
 
@@ -5440,6 +5527,130 @@ impl DownloadManager {
     /// 使累积计数得以持久到下次失败，从而正确触发重试上限与递增退避。
     pub async fn resume_task_auto(&mut self, task_id: &str) {
         self.resume_task_inner(task_id).await;
+    }
+
+    /// 「重新下载」：把任务彻底退回未开始状态后重新启动——不管磁盘上是否
+    /// 已有产物，一律丢弃重下。
+    ///
+    /// 与 [`Self::resume_task`]（续传）的区别在于起飞前的复位：先取消在途
+    /// spawn，再删掉最终文件与 `.fdownloading` 临时文件、清空段行与
+    /// 进度/总大小/完成时间/错误信息，因此新一轮下载必定从 0 字节开始。
+    /// 复位全部同步完成于 resume 之前，UI 收到的全量快照即复位后状态。
+    ///
+    /// BT 任务不走这条路（librqbit 有自己的重校验语义），直接返回；
+    /// 任务不存在同样直接返回。
+    pub async fn restart_task(&mut self, task_id: &str) {
+        let Ok(Some(task)) = self.db.load_task_by_id(task_id).await else {
+            log_info!("[manager] restart_task {}: task not found", task_id);
+            return;
+        };
+        if is_bt_url(&task.url) {
+            log_info!(
+                "[manager] restart_task {}: BT task — restart not supported",
+                task_id
+            );
+            return;
+        }
+
+        // 1. 先停掉在途 spawn（含尚未起飞的排队项）。静默暂停路径已处理
+        //    token cancel / active_tasks 摘除 / pending_queue 摘除 / 落 paused。
+        //    注意它**不**等待 spawned task 退出：下面的磁盘清理因此要为
+        //    「写入方还没松手」留出重试窗口（Windows 上占用中的文件
+        //    `remove_file` 直接失败）。
+        let was_active =
+            self.active_tasks.contains_key(task_id) || matches!(task.status, 0 | 1 | 5);
+        if was_active {
+            log_info!(
+                "[manager] restart_task {}: cancelling in-flight spawn first",
+                task_id
+            );
+            self.pause_task_silent(task_id).await;
+        }
+
+        // 2. 磁盘清理（best-effort，NotFound 静默）。暂停之后重新读库，拿到
+        //    spawned task 可能已 dedup 落库的最新 file_name。
+        let t = match self.db.load_task_by_id(task_id).await {
+            Ok(Some(t)) => t,
+            _ => task,
+        };
+        if is_safe_file_name(&t.file_name) {
+            let path = PathBuf::from(&t.save_dir).join(&t.file_name);
+            let temp_path = PathBuf::from(format!("{}{}", path.display(), downloader::TEMP_EXT));
+            for p in [&path, &temp_path] {
+                remove_file_retrying(task_id, p, was_active).await;
+            }
+            // DASH 音轨 sidecar（轨对任务的视频轨 URL 非 .mpd，需查库确认）
+            // 与其临时文件一并清理，否则重下会复用上一轮的旧音轨。
+            let has_audio_sidecar = dash_downloader::is_dash_url(&t.url)
+                || self
+                    .db
+                    .load_audio_url(task_id)
+                    .await
+                    .unwrap_or_default()
+                    .is_some();
+            if has_audio_sidecar {
+                let audio_path = dash_downloader::build_audio_path(&path);
+                let audio_temp =
+                    PathBuf::from(format!("{}{}", audio_path.display(), downloader::TEMP_EXT));
+                remove_file_retrying(task_id, &audio_temp, was_active).await;
+                remove_file_retrying(task_id, &audio_path, was_active).await;
+            }
+        } else {
+            log_info!(
+                "[manager] restart_task {}: unsafe file name, skipping disk cleanup",
+                task_id
+            );
+        }
+
+        // 3. DB 复位。`update_task_file_missing` 只作用于 status=3 的行，
+        //    因此必须排在把状态改回 0 之前。`update_task_status(_, 0, "")`
+        //    同时清空 error_message 与 completed_at（见 Db::update_task_status）。
+        if let Err(e) = self.db.delete_segments(task_id).await {
+            log_info!(
+                "[manager] restart_task {}: delete_segments error: {}",
+                task_id,
+                e
+            );
+        }
+        if let Err(e) = self.db.update_task_progress(task_id, 0).await {
+            log_info!(
+                "[manager] restart_task {}: reset progress error: {}",
+                task_id,
+                e
+            );
+        }
+        if let Err(e) = self.db.update_task_total_bytes(task_id, 0).await {
+            log_info!(
+                "[manager] restart_task {}: reset total_bytes error: {}",
+                task_id,
+                e
+            );
+        }
+        if let Err(e) = self.db.update_task_file_missing(task_id, false).await {
+            log_info!(
+                "[manager] restart_task {}: clear file_missing error: {}",
+                task_id,
+                e
+            );
+        }
+        if let Err(e) = self.db.update_task_status(task_id, 0, "").await {
+            log_info!(
+                "[manager] restart_task {}: reset status error: {}",
+                task_id,
+                e
+            );
+        }
+
+        // 4. 内存态复位：重试配额/failover 标记/退避占用全部作废。
+        self.auto_retry_counts.remove(task_id);
+        self.auto_failover_pending.remove(task_id);
+        self.retry_scheduled.remove(task_id);
+
+        // 5. 重新起飞，并下发全量快照——TaskProgress 字段不全，进度归零必须
+        //    靠全量快照才能让 UI 看到。
+        log_info!("[manager] restart_task {}: reset done, resuming", task_id);
+        self.resume_task(task_id).await;
+        self.load_and_send_all_tasks().await;
     }
 
     async fn resume_task_inner(&mut self, task_id: &str) {
@@ -9276,6 +9487,12 @@ mod tests {
         }
     }
 
+    /// 文件跟踪测试用的空清理通道发送端：`auto_delete = false` 的用例不会
+    /// 触碰它，只是为了填满 `scan_missing_files` 的形参。
+    fn noop_cleanup_tx() -> mpsc::Sender<Vec<String>> {
+        mpsc::channel(8).0
+    }
+
     /// 插入一个任务并把状态推进到 `status`：`Db::insert_task` 固定以
     /// status=0 落库，文件跟踪测试需要 completed(3)/downloading(1) 等具体
     /// 状态。
@@ -9640,7 +9857,14 @@ mod tests {
         let sink = Arc::new(RecordingSink::new());
 
         // (a) 文件仍在：不落库变化、不发事件。
-        scan_missing_files(db.clone(), sink.clone(), Arc::new(AtomicBool::new(false))).await;
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            noop_cleanup_tx(),
+        )
+        .await;
         let task = db
             .load_task_by_id("t-roundtrip")
             .await
@@ -9657,7 +9881,14 @@ mod tests {
 
         // (b) 文件被删：翻为 true，发一次事件。
         std::fs::remove_file(&file_path).expect("delete test file");
-        scan_missing_files(db.clone(), sink.clone(), Arc::new(AtomicBool::new(false))).await;
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            noop_cleanup_tx(),
+        )
+        .await;
         let task = db
             .load_task_by_id("t-roundtrip")
             .await
@@ -9683,7 +9914,14 @@ mod tests {
 
         // (c) 文件移回：翻回 false，再发一次事件（双向自愈，无棘轮）。
         std::fs::write(&file_path, b"data").expect("recreate test file");
-        scan_missing_files(db.clone(), sink.clone(), Arc::new(AtomicBool::new(false))).await;
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            noop_cleanup_tx(),
+        )
+        .await;
         let task = db
             .load_task_by_id("t-roundtrip")
             .await
@@ -9725,7 +9963,14 @@ mod tests {
         insert_task_at_status(&db, "t-downloading", &save_dir, "movie.mp4", 1).await;
 
         let sink = Arc::new(RecordingSink::new());
-        scan_missing_files(db.clone(), sink.clone(), Arc::new(AtomicBool::new(false))).await;
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            noop_cleanup_tx(),
+        )
+        .await;
 
         let task = db
             .load_task_by_id("t-downloading")
@@ -9759,7 +10004,14 @@ mod tests {
         insert_task_at_status(&db, "t-active-redownload", &save_dir, file_name, 1).await;
 
         let sink = Arc::new(RecordingSink::new());
-        scan_missing_files(db.clone(), sink.clone(), Arc::new(AtomicBool::new(false))).await;
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            noop_cleanup_tx(),
+        )
+        .await;
 
         let completed = db
             .load_task_by_id("t-completed-stale")
@@ -9771,6 +10023,149 @@ mod tests {
             "completed task sharing a target path with an active task must be skipped"
         );
         assert!(sink.events().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `file_missing_action` 回流契约：`auto_delete = true` 时，本轮**新**判定
+    /// 为丢失的任务 id（且仅这些）经清理通道回流一次；`"keep"`（false）时
+    /// 通道保持空——UI 只看到标记，不删记录。
+    #[tokio::test]
+    async fn scan_missing_files_auto_delete_reports_ids() {
+        let dir = unique_filetrack_test_dir("scan_autodelete");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        let gone_path = dir.join("gone.bin");
+        std::fs::write(&gone_path, b"data").expect("write test file");
+        std::fs::write(dir.join("kept.bin"), b"data").expect("write kept file");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "t-autodel", &save_dir, "gone.bin", 3).await;
+        insert_task_at_status(&db, "t-kept", &save_dir, "kept.bin", 3).await;
+        std::fs::remove_file(&gone_path).expect("delete test file");
+
+        let sink = Arc::new(RecordingSink::new());
+
+        // keep 模式：照常标记 + 发事件，但一个 id 都不回流。
+        let (keep_tx, mut keep_rx) = mpsc::channel(8);
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            false,
+            keep_tx,
+        )
+        .await;
+        assert!(keep_rx.try_recv().is_err(), "keep 模式不得回流任何 task_id");
+
+        // 复位标记，让下一轮扫描重新把它判定为「新丢失」。
+        db.update_task_file_missing("t-autodel", false)
+            .await
+            .expect("reset file_missing");
+
+        // delete 模式：恰好回流那一个丢失的任务，文件仍在的任务不受牵连。
+        let (del_tx, mut del_rx) = mpsc::channel(8);
+        scan_missing_files(
+            db.clone(),
+            sink.clone(),
+            Arc::new(AtomicBool::new(false)),
+            true,
+            del_tx,
+        )
+        .await;
+        let ids = del_rx
+            .try_recv()
+            .expect("delete 模式必须回流丢失的 task_id");
+        assert_eq!(ids, vec!["t-autodel".to_string()]);
+        assert!(del_rx.try_recv().is_err(), "只应回流一批");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 「重新下载」契约：磁盘产物被删、DB 进度/总大小/丢失标记/完成时间全部
+    /// 复位、段行清空。这些复位在 `restart_task` 内同步完成于 resume 之前，
+    /// 因此断言不与后续（必定失败的）下载 spawn 竞态。
+    #[tokio::test]
+    async fn restart_task_resets_progress_and_files() {
+        let dir = unique_filetrack_test_dir("restart_reset");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let save_dir = dir.to_string_lossy().to_string();
+        let file_path = dir.join("done.bin");
+        std::fs::write(&file_path, b"stale payload").expect("write test file");
+
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        // 端口 1 必定拒绝连接：重启后的下载会立刻失败，零真实网络流量。
+        db.insert_task(
+            "t-restart",
+            "http://127.0.0.1:1/x.bin",
+            "done.bin",
+            &save_dir,
+            1,
+            4096,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert task");
+        db.update_task_progress("t-restart", 4096)
+            .await
+            .expect("seed progress");
+        db.update_task_status("t-restart", 3, "")
+            .await
+            .expect("mark completed");
+        db.update_task_file_missing("t-restart", true)
+            .await
+            .expect("flag missing");
+        db.insert_segments("t-restart", &[(0, 0, 4095)])
+            .await
+            .expect("insert segments");
+
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: save_dir.clone(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            Arc::new(RecordingSink::new()),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+
+        mgr.restart_task("t-restart").await;
+
+        assert!(
+            !file_path.exists(),
+            "restart 必须丢弃上一轮的磁盘产物，即使它还在"
+        );
+        let task = db
+            .load_task_by_id("t-restart")
+            .await
+            .expect("load")
+            .expect("task present");
+        assert_eq!(task.downloaded_bytes, 0, "进度必须归零");
+        assert_eq!(task.total_bytes, 0, "总大小必须归零，重下时重新探测");
+        assert!(!task.file_missing, "file_missing 标记必须清除");
+        assert_eq!(task.completed_at, "", "completed_at 必须清空");
+        assert!(
+            db.load_segments("t-restart")
+                .await
+                .expect("load segments")
+                .is_empty(),
+            "段行必须清空，否则重下会按旧布局续传"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1925,6 +1925,9 @@ impl Db {
             // "overwrite" = 冲突仅来自磁盘上已存在的最终文件时保留原名，
             // 完成时覆盖旧文件（临时文件 / 并发任务预订仍照旧编号改名）。
             ("file_exists_behavior", "rename"),
+            // 任务的文件被删除或移动时的动作："keep" = 保留任务记录（默认，
+            // 仅标记 file_missing）；"delete" = 扫描到文件消失后自动删除任务记录。
+            ("file_missing_action", "keep"),
             // 自动重试：-1=无限，0=关闭，1..10=次数。延迟（秒）固定基值×已重试次数。
             ("max_auto_retries", "3"),
             ("auto_retry_delay_secs", "5"),
