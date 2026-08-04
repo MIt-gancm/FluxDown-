@@ -10,6 +10,7 @@
 
 import { useState } from 'react'
 import { ArrowDownWideNarrow, ArrowUpNarrowWide, CircleAlert, RefreshCw, CheckCheck, Loader2, Radio, Search, Settings2 } from 'lucide-react'
+import { OverflowTooltip } from '../OverflowTooltip'
 import { ApiError } from '../../lib/api'
 import { cn } from '../../lib/cn'
 import { fmtBytes, fmtRelativeUnix, fmtShortTime } from '../../lib/format'
@@ -112,7 +113,7 @@ export function RssItemList({ source }: { source: RssSourceDto }) {
         </span>
         <div className="rss-head-main">
           <div className="rss-head-name">
-            <b>{sourceDisplayName(source)}</b>
+            <OverflowTooltip as="b" text={sourceDisplayName(source)} />
             {unread > 0 && <span className="rss-chip new">{t('rss.unreadCount', { count: unread })}</span>}
           </div>
           {/* 一行说清「多久抓一次 / 上次怎么样 / 抓到了往哪放」。 */}
@@ -269,7 +270,7 @@ function RssRow({
     <div className="rss-row">
       <div className="rss-row-main">
         <div className="rss-row-name">
-          <b title={item.title}>{item.title}</b>
+          <OverflowTooltip as="b" text={item.title} />
         </div>
         <div className="rss-row-meta">
           {pub && <span>{pub}</span>}

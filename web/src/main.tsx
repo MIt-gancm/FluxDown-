@@ -2,9 +2,11 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { RouterProvider } from '@tanstack/react-router'
+import * as Tooltip from '@radix-ui/react-tooltip'
 import './index.css'
 import { router } from './router'
 import { ConfirmDialog } from './components/dialogs/confirm-dialog'
+import { OVERFLOW_TOOLTIP_DELAY } from './components/OverflowTooltip'
 import { ThemeProvider } from './lib/theme'
 import { ToastHost } from './lib/toast'
 import { I18nProvider } from './lib/i18n'
@@ -50,7 +52,11 @@ createRoot(document.getElementById('root')!).render(
     <QueryClientProvider client={queryClient}>
       <I18nProvider>
         <ThemeProvider>
-          <RouterProvider router={router} />
+          {/* 全局唯一 Tooltip.Provider：skipDelayDuration 让相邻条目之间连续划过时
+              第二个气泡立刻出现，而不是每行都重新等 500ms（见 OverflowTooltip）。 */}
+          <Tooltip.Provider delayDuration={OVERFLOW_TOOLTIP_DELAY} skipDelayDuration={300}>
+            <RouterProvider router={router} />
+          </Tooltip.Provider>
           <ConfirmDialog />
           <ToastHost />
         </ThemeProvider>

@@ -21,12 +21,23 @@
 library;
 
 import 'dart:async';
+import 'dart:math' as math;
 
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
 /// 悬浮多久弹出全名。
 const Duration kOverflowTooltipDelay = Duration(milliseconds: 500);
+
+/// 气泡自身的宽度上限。超过就换行——RSS 条目标题、种子文件名动辄上百字符，
+/// 不设上限时 `ShadPortal` 只按窗口宽度 loosen 约束，气泡会拉成横跨整个窗口的
+/// 一长条；而一旦真的比窗口还宽，`positionDependentBox` 会把它居中放置，
+/// 两端同时被裁掉——恰好把用户想看的结尾也裁没了。
+const double kOverflowTooltipMaxWidth = 420;
+
+/// 气泡与窗口左右边缘的最小留白。窗口比 [kOverflowTooltipMaxWidth] 还窄时
+/// （小窗 / 移动端）按窗口宽度收紧，保证气泡整体仍在窗口内。
+const double kOverflowTooltipViewportMargin = 16;
 
 class OverflowTooltipText extends StatefulWidget {
   /// 显示文本，同时也是未指定 [tooltip] 时的气泡内容。
@@ -128,7 +139,22 @@ class _OverflowTooltipTextState extends State<OverflowTooltipText> {
           // 无入场动画：已经等了 500ms，再叠 200ms 淡入只是把等待拖长；
           // 提示要么不出现，要么立刻在那儿（同 task_list / rss_item_list）。
           effects: const [],
-          builder: (_) => Text(widget.tooltip ?? widget.text),
+          builder: (context) {
+            final available =
+                MediaQuery.sizeOf(context).width -
+                kOverflowTooltipViewportMargin * 2;
+            return ConstrainedBox(
+              constraints: BoxConstraints(
+                // 下限兜底：窗口窄到 32px 以内时 available 会变成 0 甚至负数，
+                // 直接传给 BoxConstraints 会让气泡塌成一条竖线。
+                maxWidth: math.max(
+                  120,
+                  math.min(kOverflowTooltipMaxWidth, available),
+                ),
+              ),
+              child: Text(widget.tooltip ?? widget.text),
+            );
+          },
           child: MouseRegion(
             onEnter: (_) => _scheduleShow(),
             onExit: (_) => _hide(),

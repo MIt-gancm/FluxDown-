@@ -11,6 +11,7 @@ import { useState, type ReactNode } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQuery } from '@tanstack/react-query'
 import { CheckCircle2, CircleAlert, Loader2, Settings2, X } from 'lucide-react'
+import { OverflowTooltip } from '../OverflowTooltip'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/cn'
 import { fmtBytes, queueDisplayName } from '../../lib/format'
@@ -478,7 +479,7 @@ function RssDialogContent({
                           <span className={cn('rss-mark', verdict.accepted ? 'y' : 'n')}>
                             {verdict.accepted ? t('rss.willDownload') : t('rss.willFilter')}
                           </span>
-                          <span className="rss-preview-name" title={item.title}>{item.title}</span>
+                          <OverflowTooltip className="rss-preview-name" text={item.title} />
                           <span className="rss-preview-why">
                             {verdict.accepted
                               ? item.enclosureLength > 0

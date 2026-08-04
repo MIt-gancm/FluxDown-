@@ -10,6 +10,7 @@ import '../models/rss_filter.dart';
 import '../models/rss_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
+import 'overflow_tooltip_text.dart';
 import 'rss_item_list.dart' show rssReasonLabel;
 
 /// 抓取间隔下拉的候选（分钟）。覆盖「追更」到「日更聚合」两端，
@@ -640,10 +641,8 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
           ),
           const SizedBox(width: 8),
           Expanded(
-            child: Text(
+            child: OverflowTooltipText(
               item.title,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
               style: TextStyle(
                 fontSize: 11.5,
                 color: hit ? c.textPrimary : c.textMuted,

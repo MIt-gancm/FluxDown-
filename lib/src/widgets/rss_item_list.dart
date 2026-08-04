@@ -8,6 +8,7 @@ import '../models/rss_filter.dart';
 import '../models/rss_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
+import 'overflow_tooltip_text.dart';
 
 /// RSS 条目流：选中侧边栏某个订阅时占据主区（替换任务列表）。
 ///
@@ -164,14 +165,13 @@ class _RssItemListState extends State<RssItemList> {
               crossAxisAlignment: CrossAxisAlignment.start,
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text(
+                OverflowTooltipText(
                   rssDisplayName(source),
                   style: TextStyle(
                     fontSize: 13,
                     fontWeight: FontWeight.w600,
                     color: c.textPrimary,
                   ),
-                  overflow: TextOverflow.ellipsis,
                 ),
                 const SizedBox(height: 2),
                 Text(
@@ -414,11 +414,9 @@ class _RssItemRowState extends State<_RssItemRow> {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
+                  OverflowTooltipText(
                     item.title,
                     style: TextStyle(fontSize: 12.5, color: c.textPrimary),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
                   ),
                   const SizedBox(height: 3),
                   Row(

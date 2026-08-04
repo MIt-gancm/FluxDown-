@@ -135,4 +135,39 @@ void main() {
     await tester.pump();
     expect(taps, 1);
   });
+
+  testWidgets('气泡宽度不超过上限，长文本换行而不是横跨整个窗口', (tester) async {
+    tester.view.physicalSize = const Size(1200, 800);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    // 单行放不下的超长标题：不设上限时 ShadPortal 只按窗口宽度 loosen 约束，
+    // 气泡会被拉成横跨 1200px 的一长条。
+    const longTitle = '$_longName $_longName $_longName';
+    await tester.pumpWidget(_wrap(const OverflowTooltipText(longTitle)));
+    await _hover(tester, find.text(longTitle));
+    await tester.pump(kOverflowTooltipDelay + const Duration(milliseconds: 50));
+    await tester.pumpAndSettle();
+
+    // 气泡里的那一份（列表里被省略号截断的是另一份）
+    final bubble = tester.getSize(find.text(longTitle).last);
+    expect(bubble.width, lessThanOrEqualTo(kOverflowTooltipMaxWidth));
+    expect(bubble.height, greaterThan(20), reason: '超出上限的部分应换行而不是被裁掉');
+  });
+
+  testWidgets('窗口比气泡上限还窄时按窗口宽度收紧', (tester) async {
+    tester.view.physicalSize = const Size(300, 600);
+    tester.view.devicePixelRatio = 1;
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(_wrap(const OverflowTooltipText(_longName)));
+    await _hover(tester, find.text(_longName));
+    await tester.pump(kOverflowTooltipDelay + const Duration(milliseconds: 50));
+    await tester.pumpAndSettle();
+
+    expect(
+      tester.getSize(find.text(_longName).last).width,
+      lessThanOrEqualTo(300 - kOverflowTooltipViewportMargin * 2),
+    );
+  });
 }

@@ -143,6 +143,22 @@ body {
 .icon-btn.danger { color: var(--danger); }
 .icon-btn.danger:hover { background: rgba(239,68,68,.1); color: var(--danger); }
 
+/* ---------- 溢出文本悬浮气泡（components/OverflowTooltip.tsx） ---------- */
+
+/* 宽度上限取「420px 与视口可用宽度」的较小者：Radix 把碰撞检测算出的可用宽度写进
+   --radix-tooltip-content-available-width，窗口比气泡窄时（小窗 / 移动端）自动收紧
+   并换行，不会横向溢出视口。overflow-wrap: anywhere 兜住不含空格的长串（种子名、
+   URL），否则单个「词」照样能把气泡撑爆。 */
+.ovf-tip {
+  max-width: min(420px, var(--radix-tooltip-content-available-width, 420px));
+  padding: 6px 9px; border-radius: 7px;
+  background: var(--surface); border: 1px solid var(--border);
+  box-shadow: var(--shadow); z-index: 70; /* 压过一切浮层：弹窗 z-34、移动端抽屉 z-60 */
+  font-size: 12px; line-height: 1.5; color: var(--text);
+  white-space: normal; overflow-wrap: anywhere;
+  animation: ctxIn .12s ease;
+}
+
 /* ---------- 显示选项按钮 + 面板 ---------- */
 
 .view-btn { position: relative; }
@@ -1182,6 +1198,9 @@ body {
 .set-row.stack { flex-direction: column; align-items: stretch; gap: 8px; }
 .set-info { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .set-info b { font-size: 13px; font-weight: 500; }
+/* 设置项标题旁的问号：原生 title 悬浮提示，解释开关的收益与代价。 */
+.set-help { display: inline-flex; vertical-align: -2px; margin-left: 4px; color: var(--text3); cursor: help; }
+.set-help svg { width: 13px; height: 13px; }
 .set-info span { font-size: 11.5px; color: var(--text3); line-height: 1.5; }
 .set-value { font-size: 12.5px; color: var(--text2); display: flex; align-items: center; gap: 6px; }
 .set-value svg { width: 13px; height: 13px; color: var(--text3); }
