@@ -1879,7 +1879,11 @@ fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Opt
             // 应该读取该字段。目前以 urlencoding_decode 的
             // "UTF-8 优先，GBK fallback" 表现足够应对老旧中文服务器
             // （它们通常话不对题，声明 UTF-8 但发 GBK）。
-            let name = name.trim();
+            // 非标准实现（腾讯云 COS 等）会把整个 ext-value 用双引号包起来：
+            // `filename*="UTF-8''foo.exe"`。RFC 6266 的 ext-value 是 token 不
+            // 允许加引号，若原样保留，尾引号会跟进文件名（Windows 上再被
+            // sanitize_filename 换成 `_`，落盘名多一个下划线）。
+            let name = name.trim().trim_matches('"').trim();
             if let Some(encoded) = name.split('\'').nth(2)
                 && let Ok(decoded) = urlencoding_decode(encoded)
             {
@@ -4341,6 +4345,16 @@ mod tests {
         let headers = make_headers_with_cd("attachment; filename*=UTF-8''%E6%96%87%E4%BB%B6.pdf");
         let name = extract_from_content_disposition(&headers);
         assert_eq!(name.as_deref(), Some("文件.pdf"));
+    }
+
+    #[test]
+    fn content_disposition_filename_star_quoted_ext_value() {
+        // 腾讯云 COS（devtools.wxqcloud.qq.com.cn 等）把整个 ext-value 加了引号，
+        // RFC 6266 不允许；尾引号若泄漏进文件名，会被 sanitize 成 `..exe_`。
+        let headers =
+            make_headers_with_cd("attachment; filename*=\"UTF-8''wechat_devtools_x64.exe\"");
+        let name = extract_from_content_disposition(&headers);
+        assert_eq!(name.as_deref(), Some("wechat_devtools_x64.exe"));
     }
 
     #[test]

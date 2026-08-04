@@ -3267,6 +3267,17 @@ export default defineBackground(() => {
   }
 
   /**
+   * 剥掉值两端的双引号。
+   *
+   * 用于 `filename*=` 的 ext-value 与无引号 `filename=`：RFC 6266 规定
+   * ext-value 是 token、不得加引号，但腾讯云 COS 等实现会发
+   * `filename*="UTF-8''foo.exe"`，尾引号若不剥掉会跟进文件名。
+   */
+  function stripSurroundingQuotes(v: string): string {
+    return v.trim().replace(/^"+/, "").replace(/"+$/, "").trim();
+  }
+
+  /**
    * 从 Content-Disposition 头解析文件名
    *
    * 支持格式：
@@ -3275,6 +3286,8 @@ export default defineBackground(() => {
    * - Content-Disposition: attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A.pdf
    * - Content-Disposition: attachment; filename="%E6%B0%B8%E7%94%9F.mp4"（#406）
    * - Content-Disposition: attachment; filename="<raw UTF-8/GBK bytes>"（#380）
+   * - Content-Disposition: attachment; filename*="UTF-8''report.pdf"
+   *   （非标准：ext-value 被加了引号，腾讯云 COS 等）
    */
   function parseContentDispositionFilename(disposition: string): string {
     if (!disposition) return "";
@@ -3287,7 +3300,9 @@ export default defineBackground(() => {
       /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i,
     );
     if (starMatch) {
-      const decoded = decodeDispositionFilenameValue(starMatch[1]);
+      const decoded = decodeDispositionFilenameValue(
+        stripSurroundingQuotes(starMatch[1]),
+      );
       if (decoded) return decoded;
     }
 
@@ -3300,7 +3315,9 @@ export default defineBackground(() => {
     // 最后尝试 filename=...（无引号）
     const plainMatch = disposition.match(/filename\s*=\s*([^\s;]+)/i);
     if (plainMatch) {
-      return decodeDispositionFilenameValue(plainMatch[1]);
+      return decodeDispositionFilenameValue(
+        stripSurroundingQuotes(plainMatch[1]),
+      );
     }
 
     return "";
