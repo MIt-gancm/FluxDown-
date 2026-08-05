@@ -13,6 +13,7 @@ import { I18nProvider } from './lib/i18n'
 import { connectWs } from './lib/ws'
 import { isAuthenticated, saveCredentials } from './lib/auth'
 import { attachCdnServices } from './lib/cloud/cdn'
+import { attachRemoteTasks } from './lib/cloud/useRemoteTasks'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -46,6 +47,10 @@ if (isAuthenticated()) connectWs(queryClient)
 // FluxCloud CDN 聚合配置拉取 + 众包遥测上报：常开后台服务，云账户登录即生效
 // （未登录静默待命；断网静默重试，对齐桌面端 home_page 的接线，见 lib/cloud/cdn.ts）。
 attachCdnServices()
+
+// FluxCloud 跨设备任务：登录即常驻 `/tasks/events` SSE（查看端快照 + 本机接单执行端）。
+// 必须与路由无关地常开——否则本机在别的设备眼里时隐时现，下发到本机的任务也收不到。
+attachRemoteTasks(queryClient)
 
 createRoot(document.getElementById('root')!).render(
   <StrictMode>

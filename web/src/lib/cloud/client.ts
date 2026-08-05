@@ -1,10 +1,13 @@
 // FluxCloud 云账户 REST 客户端 —— 独立于本地下载器的 lib/api.ts，走 FluxCloud
 // server 契约 v1（见 FluxCloud/server）。401（需鉴权接口）自动用 refreshToken 刷新
-// 一次并重放原请求，刷新也失败则清空会话并把原 401 抛出去；并发请求触发的刷新
-// 去重为单个 in-flight promise，避免刷新风暴。
+// 一次并重放原请求；刷新请求本身只在明确判定「refreshToken 已失效」（401/403）时
+// 才清会话，网络错误/5xx 原样抛出不清会话——刷新走的是同一条外网链路，一次超时/
+// 网关抖动不该把执行端正在维护的跨设备任务绑定表也一并打散（见 session.ts 顶部
+// 注释 clearCloudSession vs signOutCloud）。并发请求触发的刷新去重为单个 in-flight
+// promise，避免刷新风暴。
 
 import { applyCloudSession, clearCloudSession, cloudDefaultDeviceName, cloudDeviceId, CLOUD_DEVICE_PLATFORM, getCloudAccessToken, getCloudRefreshToken } from './session'
-import type { AuthResponse, CdnConfig, CdnConfigResult, CloudDevice, CloudProfile, DevicesResponse, LoginResult, RemoteTask, RemoteTasksResponse, TtlResponse } from './types'
+import type { AuthResponse, CdnConfig, CdnConfigResult, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
 import { CloudApiError } from './types'
 
 /** 默认服务地址：Actions 打包时经 VITE_FLUXCLOUD_BASE_URL 构建期注入官方地址，
@@ -79,7 +82,10 @@ async function rawRequest<T>(method: string, path: string, body?: unknown, authe
 
 let refreshing: Promise<void> | null = null
 
-/** 401 时用 refreshToken 刷新一次；并发请求共享同一个 in-flight promise。刷新失败清空会话。 */
+/** 401 时用 refreshToken 刷新一次；并发请求共享同一个 in-flight promise。
+ *  只有服务端明确判定 refreshToken 失效（401/403）才清会话；网络错误/5xx 说明这次
+ *  刷新请求本身没送达或对方临时故障，与"账号在别处登出/token 被吊销"是两件事，
+ *  原样抛出交由重试路径处理，绝不能借机清会话。 */
 function refreshSession(): Promise<void> {
   if (!refreshing) {
     refreshing = (async () => {
@@ -92,7 +98,7 @@ function refreshSession(): Promise<void> {
         const auth = await rawRequest<AuthResponse>('POST', '/auth/refresh', { refreshToken: rt })
         applyCloudSession(auth)
       } catch (e) {
-        clearCloudSession()
+        if (e instanceof CloudApiError && (e.status === 401 || e.status === 403)) clearCloudSession()
         throw e
       }
     })().finally(() => {
@@ -206,6 +212,24 @@ export const cloudApi = {
   /** GET /tasks/remote：拉取当前账号下全部跨设备任务全量（持久态 join 内存进度快照，
    *  首次加载/SSE 断线重连用，见 mdc §1.4）。 */
   remoteTasks: () => authedRequest<RemoteTasksResponse>('GET', '/tasks/remote'),
+
+  /** POST /tasks/{id}/status：执行端上报任务状态转换（服务端落库 + 广播给发起端）。 */
+  reportTaskStatus: (id: string, body: TaskStatusReport) =>
+    authedRequest<unknown>('POST', `/tasks/${id}/status`, body),
+
+  /** POST /tasks/progress：执行端批量上报进度（服务端仅更内存快照 + 广播，不落库）。 */
+  reportProgress: (items: ProgressReportItem[]) =>
+    authedRequest<unknown>('POST', '/tasks/progress', { items }),
+
+  /** POST /tasks/{id}/command：发起端向执行端下发控制命令（pause/resume/cancel）。 */
+  commandTask: (id: string, action: RemoteTaskAction) =>
+    authedRequest<unknown>('POST', `/tasks/${id}/command`, { action }),
+
+  /** POST /tasks/presence：维持 SSE 连接的执行端每 30s 续一次租——服务端 presence
+   *  仅在有活跃 SSE 连接时才认"在线"，心跳负责把这条租约的 TTL 往后推，避免长连接
+   *  本身健康但久不产生业务请求时被后台 sweeper 误判离线（进而让发起端的 pause/
+   *  resume 落空于 409 target_device_offline）。成功 204。 */
+  pingPresence: () => authedRequest<unknown>('POST', '/tasks/presence'),
 
   /** GET /cdn/config：ETag 条件请求（P1 §四契约），304 返回 notModified。
    *  命中 401 时刷新一次并重放（fetchCdnConfigOnce 不走 authedRequest 因返回形态不同）。 */

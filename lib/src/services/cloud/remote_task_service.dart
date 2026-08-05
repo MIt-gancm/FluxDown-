@@ -35,6 +35,10 @@ const _kSseIdleTimeout = Duration(seconds: 75);
 const _kReportInterval = Duration(seconds: 1);
 const _kFlushDebounce = Duration(milliseconds: 300);
 const _kPresenceDebounce = Duration(seconds: 2);
+
+/// presence 心跳间隔（C1+C2 契约）：服务端 sweeper 每 30s 扫一次、90s 未
+/// 收到心跳判定离线，30s 心跳给了整整一轮 sweep 周期的冗余。
+const _kHeartbeatInterval = Duration(seconds: 30);
 const _kRetryDelays = [
   Duration(seconds: 5),
   Duration(seconds: 15),
@@ -47,6 +51,23 @@ const _kRetryDelays = [
 /// 每次 notifyListeners（下载中每秒多次）都触发一次 O(pendingRebind ×
 /// localTasks) 全表扫描。
 const _kMaxRebindAttempts = 20;
+
+/// 本地任务在 [DownloadController.localTasks] 里连续缺失多少轮才判定为
+/// "已被删除"（C9 第 3 条）：DownloadController 未暴露显式的强制刷新
+/// 入口，1s 一轮采样期间引擎任务表可能存在短暂过渡态（刚重启/刚批量
+/// 操作），第一次查不到不能当场判死刑，靠计数换一段宽限窗口。
+const _kMissGraceRounds = 3;
+
+/// 本地任务确认已被删除后回报服务端的错误文案（C9 第 5 条）：这是回传
+/// 给服务端存库的数据字段，不是 UI 文案，固定英文常量，不走 i18n。
+const _kLocalTaskGoneError =
+    'local task no longer exists on the executing device';
+
+/// [RemoteTaskService._safeReportStatus] 的上报结果，驱动"确认式推进"
+/// （C9 第 1 条）：只有 [ok] 才能推进去重表/settled/解绑，[fatal] 直接
+/// 解绑放弃（服务端已明确拒绝，重试无意义），[retry] 什么都不改，让
+/// 下一轮 [RemoteTaskService._reportTick] 用同一个 wire 值自然重试。
+enum _ReportOutcome { ok, retry, fatal }
 
 /// 跨设备任务协同服务单例。home_page 在 providers 就绪后调 [attach] 一次。
 class RemoteTaskService extends ChangeNotifier {
@@ -83,6 +104,10 @@ class RemoteTaskService extends ChangeNotifier {
   /// 执行端已上报的最近状态：remoteTaskId → wire 状态（去重，仅转换才上报）。
   final Map<String, String> _lastStatus = {};
 
+  /// 本地任务在 [DownloadController.localTasks] 里连续缺失的轮次计数：
+  /// 本地 taskId → 已缺失轮数，见 [_kMissGraceRounds]/[_handleMissingLocal]。
+  final Map<String, int> _missCount = {};
+
   String get _deviceId => DeviceIdentity.deviceId();
 
   bool _running = false;
@@ -90,12 +115,18 @@ class RemoteTaskService extends ChangeNotifier {
   bool _authAttached = false;
   bool _controllerAttached = false;
 
+  /// [_reportTick] 重入防护：定时器不能叠层——上一轮上报（含网络往返）
+  /// 还没跑完时，下一轮 tick 直接跳过，避免同一 rid 被并发上报两次不同
+  /// 状态，把 [_lastStatus] 的"仅转换才上报"去重打穿。
+  bool _ticking = false;
+
   HttpClient? _sseHttp;
   StreamSubscription<String>? _sseSub;
   Timer? _sseWatchdog;
   Timer? _reportTimer;
   Timer? _flushTimer;
   Timer? _presenceTimer;
+  Timer? _heartbeatTimer;
   Timer? _retryTimer;
   int _retryAttempt = 0;
 
@@ -155,6 +186,7 @@ class RemoteTaskService extends ChangeNotifier {
   void stop() {
     _stopped = true;
     _running = false;
+    _ticking = false;
     _cancelRetry();
     _reportTimer?.cancel();
     _reportTimer = null;
@@ -169,6 +201,7 @@ class RemoteTaskService extends ChangeNotifier {
     _pendingRebind.clear();
     _pendingRebindAttempts.clear();
     _lastStatus.clear();
+    _missCount.clear();
     DownloadController.globalInstance?.updateRemoteTasks(const []);
     notifyListeners();
   }
@@ -189,6 +222,7 @@ class RemoteTaskService extends ChangeNotifier {
       // 依赖服务端回发的自身 presence 事件在重连重叠期（引用计数未过 0↔1）不广播，
       // 不能只靠事件驱动。
       _schedulePresenceRefresh();
+      _startHeartbeat();
     } catch (e, stack) {
       if (_stopped) return;
       logError(_tag, 'sync/connect failed', e, stack);
@@ -342,6 +376,8 @@ class RemoteTaskService extends ChangeNotifier {
   }
 
   void _closeSse() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
     _sseWatchdog?.cancel();
     _sseWatchdog = null;
     _sseSub?.cancel();
@@ -399,6 +435,25 @@ class RemoteTaskService extends ChangeNotifier {
     });
   }
 
+  /// SSE 连接建立后每 [_kHeartbeatInterval] 调一次 /tasks/presence（C1+C9
+  /// 第 6 条）：presence 租约靠心跳续期，SSE 本身出错（网络中间设备静默
+  /// 丢包等）不一定会立刻触发 onError/onDone，心跳独立兜底。[_closeSse]
+  /// 统一负责取消（断连/重连/登出/stop() 都会经过它）。
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = Timer.periodic(_kHeartbeatInterval, (_) {
+      unawaited(_safePingPresence());
+    });
+  }
+
+  Future<void> _safePingPresence() async {
+    try {
+      await CloudClient.instance.pingPresence();
+    } catch (e, stack) {
+      logError(_tag, 'pingPresence failed', e, stack);
+    }
+  }
+
   // ── 接收端：把下发任务落到本地引擎执行 ───────────────────────────────
 
   /// 幂等：同一 rid 只会被真正接受一次（[_isAlreadyAccepted] 挡重复调用）。
@@ -407,15 +462,38 @@ class RemoteTaskService extends ChangeNotifier {
   /// 网络抖动可能让同一条 rid 被触发多次（比如上一次 accepted 状态上报
   /// 还没落到服务端、又发生一次重连），不加这道防线会对同一条下发重复
   /// createTask，在本机长出两个真实任务。
+  /// 接单失败（本地建任务同步抛异常）时必须回报 failed，否则云端任务
+  /// 永远挂在 pending，发起端再也等不到结果（C9 第 4 条）。带 saveDir
+  /// 先降级重试一次再判定失败（C9 第 4 条附带条款）：发起端下发的
+  /// saveDir 是它自己本机的路径，跨设备/跨平台（Windows 盘符在其他
+  /// 平台上不存在等）大概率非法，去掉后退回本机默认目录更可能成功。
   void _acceptDispatch(RemoteTask r) {
     if (_isAlreadyAccepted(r.id)) return;
     final ctrl = DownloadController.globalInstance;
     if (ctrl == null) return;
-    ctrl.createTask(
-      url: r.url,
-      saveDir: _effectiveSaveDir(r),
-      fileName: r.fileName,
-    );
+    final saveDir = _effectiveSaveDir(r);
+    try {
+      ctrl.createTask(url: r.url, saveDir: saveDir, fileName: r.fileName);
+    } catch (e, stack) {
+      if (saveDir.isEmpty) {
+        logError(_tag, 'acceptDispatch createTask failed: ${r.id}', e, stack);
+        unawaited(_safeReportStatus(r.id, 'failed', error: '$e'));
+        return;
+      }
+      logError(
+        _tag,
+        'acceptDispatch createTask failed with saveDir, retrying without it: ${r.id}',
+        e,
+        stack,
+      );
+      try {
+        ctrl.createTask(url: r.url, saveDir: '', fileName: r.fileName);
+      } catch (e2, stack2) {
+        logError(_tag, 'acceptDispatch createTask retry failed: ${r.id}', e2, stack2);
+        unawaited(_safeReportStatus(r.id, 'failed', error: '$e2'));
+        return;
+      }
+    }
     // createTask 是 rinf 单向信号（fire-and-forget），Dart 侧拿不到新任务的
     // 同步 id（调查过 download_controller.dart：签名是 void，id 由 Rust 异步
     // 生成后才经 AllTasks 信号回流），只能追加进 url 对应的待关联队列，靠
@@ -587,53 +665,106 @@ class RemoteTaskService extends ChangeNotifier {
       ..removeAll(gaveUp);
   }
 
-  void _reportTick() {
+  /// 每秒一轮：先上报状态转换（成功才推进去重表/解绑，见 [_applyReportOutcome]），
+  /// 再批量上报活跃任务的进度。[_ticking] 防重入——见字段注释。
+  Future<void> _reportTick() async {
+    if (_ticking) return;
     if (_localToRemote.isEmpty) return;
     final ctrl = DownloadController.globalInstance;
     if (ctrl == null) return;
-    final byId = {for (final t in ctrl.localTasks) t.id: t};
-    final reports = <ProgressReport>[];
-    final settledLocalIds = <String>[];
-    for (final entry in _localToRemote.entries) {
-      final t = byId[entry.key];
-      if (t == null) continue;
-      final rid = entry.value;
-      final wire = _localStatusToWire(t.status);
-      if (_lastStatus[rid] != wire) {
-        _lastStatus[rid] = wire;
-        unawaited(
-          _safeReportStatus(
+    _ticking = true;
+    try {
+      final byId = {for (final t in ctrl.localTasks) t.id: t};
+      final reports = <ProgressReport>[];
+      for (final entry in _localToRemote.entries.toList()) {
+        final localId = entry.key;
+        final rid = entry.value;
+        final t = byId[localId];
+        if (t == null) {
+          await _handleMissingLocal(localId, rid);
+          continue;
+        }
+        _missCount.remove(localId);
+        final wire = _localStatusToWire(t.status);
+        if (_lastStatus[rid] != wire) {
+          final outcome = await _safeReportStatus(
             rid,
             wire,
             totalBytes: t.totalBytes > 0 ? t.totalBytes : null,
             fileName: t.fileName.isNotEmpty ? t.fileName : null,
             error: t.status == TaskStatus.error ? t.errorMessage : null,
-          ),
-        );
-        if (wire == 'completed' || wire == 'failed') {
-          settledLocalIds.add(entry.key);
+          );
+          _applyReportOutcome(outcome, localId: localId, rid: rid, wire: wire);
+        }
+        if (t.status == TaskStatus.downloading) {
+          reports.add(
+            ProgressReport(
+              taskId: rid,
+              downloadedBytes: t.downloadedBytes,
+              speed: t.speed,
+              progress: t.totalBytes > 0 ? t.downloadedBytes / t.totalBytes : 0,
+            ),
+          );
         }
       }
-      if (t.status == TaskStatus.downloading) {
-        reports.add(
-          ProgressReport(
-            taskId: rid,
-            downloadedBytes: t.downloadedBytes,
-            speed: t.speed,
-            progress: t.totalBytes > 0 ? t.downloadedBytes / t.totalBytes : 0,
-          ),
-        );
+      if (reports.isNotEmpty) {
+        await _safeReportProgress(reports);
       }
-    }
-    if (reports.isNotEmpty) {
-      unawaited(_safeReportProgress(reports));
-    }
-    for (final id in settledLocalIds) {
-      _localToRemote.remove(id);
+    } finally {
+      _ticking = false;
     }
   }
 
-  Future<void> _safeReportStatus(
+  /// 本地任务在 [ctrl.localTasks] 里查不到时的宽限判定（C9 第 3 条）：
+  /// DownloadController 未暴露显式的"强制刷新本地任务表"入口，1s 一轮
+  /// 采样期间引擎任务表可能存在短暂过渡态（刚重启/刚批量操作），第一次
+  /// 查不到不能当场判死刑，连续 [_kMissGraceRounds] 轮仍缺失才真正判定
+  /// 为"已被用户删除"并回报固定错误文案的终态失败。
+  Future<void> _handleMissingLocal(String localId, String rid) async {
+    final misses = (_missCount[localId] ?? 0) + 1;
+    _missCount[localId] = misses;
+    if (misses < _kMissGraceRounds) return;
+    const wire = 'failed';
+    if (_lastStatus[rid] == wire) return;
+    final outcome = await _safeReportStatus(rid, wire, error: _kLocalTaskGoneError);
+    _applyReportOutcome(outcome, localId: localId, rid: rid, wire: wire);
+  }
+
+  /// [_reportTick]/[_handleMissingLocal] 共用的"确认式推进"落地点（C9 第 1
+  /// 条）：只有上报真正成功（[_ReportOutcome.ok]）才写 [_lastStatus]、才
+  /// 在终态时解绑；[_ReportOutcome.fatal]（服务端已明确拒绝：409 状态冲突/
+  /// 403 设备不匹配/404）直接解绑放弃，重试没有意义；[_ReportOutcome.retry]
+  /// 什么都不改，让下一轮 tick 用同一个 wire 值自然重试——这正是修复
+  /// BLOCKER 的关键：绝不能在上报成功之前就"看起来已经报过"。
+  void _applyReportOutcome(
+    _ReportOutcome outcome, {
+    required String localId,
+    required String rid,
+    required String wire,
+  }) {
+    switch (outcome) {
+      case _ReportOutcome.ok:
+        _lastStatus[rid] = wire;
+        if (RemoteTaskStatus.fromWire(wire).isTerminal) {
+          _localToRemote.remove(localId);
+          _lastStatus.remove(rid);
+          _missCount.remove(localId);
+        }
+      case _ReportOutcome.fatal:
+        _localToRemote.remove(localId);
+        _lastStatus.remove(rid);
+        _missCount.remove(localId);
+      case _ReportOutcome.retry:
+        break;
+    }
+  }
+
+  /// 上报单条状态转换，返回 [_ReportOutcome] 驱动调用方的确认式推进
+  /// （见 [_applyReportOutcome]）。404/409 task_state_conflict/403
+  /// task_device_mismatch 视为服务端明确拒绝，判 [_ReportOutcome.fatal]；
+  /// 其余异常（网络错误、5xx、401 刷新失败等）都是暂时性故障，判
+  /// [_ReportOutcome.retry]，交给下一轮 tick 自然重试。
+  Future<_ReportOutcome> _safeReportStatus(
     String id,
     String status, {
     int? totalBytes,
@@ -648,10 +779,24 @@ class RemoteTaskService extends ChangeNotifier {
         fileName: fileName,
         error: error,
       );
+      return _ReportOutcome.ok;
+    } on CloudApiException catch (e, stack) {
+      if (_isFatalReportError(e)) {
+        logError(_tag, 'reportTaskStatus fatal (${e.code}): $id', e, stack);
+        return _ReportOutcome.fatal;
+      }
+      logError(_tag, 'reportTaskStatus failed: $id', e, stack);
+      return _ReportOutcome.retry;
     } catch (e, stack) {
       logError(_tag, 'reportTaskStatus failed: $id', e, stack);
+      return _ReportOutcome.retry;
     }
   }
+
+  bool _isFatalReportError(CloudApiException e) =>
+      e.status == 404 ||
+      (e.status == 409 && e.code == 'task_state_conflict') ||
+      (e.status == 403 && e.code == 'task_device_mismatch');
 
   Future<void> _safeReportProgress(List<ProgressReport> items) async {
     try {
@@ -663,6 +808,11 @@ class RemoteTaskService extends ChangeNotifier {
 
   // ── 状态映射 ─────────────────────────────────────────────────────────
 
+  /// 穷举 [TaskStatus] 全部取值（switch 无 `_` 兜底）：新增枚举值时编译器
+  /// 会强制在这里显式决策 wire 映射，不会被静默吞成 'accepted'——这正是
+  /// 修复 canceled 曾被兜底吞掉这一 MAJOR 缺陷的根本手段，而不只是加一
+  /// 个 case。pending 映射到 'accepted'：本地任务刚落地、引擎尚未真正
+  /// 开始，语义上等同"已被本机接受、还没下载"。
   String _localStatusToWire(TaskStatus s) => switch (s) {
     TaskStatus.downloading ||
     TaskStatus.preparing ||
@@ -670,7 +820,8 @@ class RemoteTaskService extends ChangeNotifier {
     TaskStatus.paused => 'paused',
     TaskStatus.completed => 'completed',
     TaskStatus.error => 'failed',
-    _ => 'accepted',
+    TaskStatus.canceled => 'canceled',
+    TaskStatus.pending => 'accepted',
   };
 
   TaskStatus _mapStatus(RemoteTaskStatus s) => switch (s) {

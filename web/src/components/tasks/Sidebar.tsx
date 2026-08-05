@@ -16,6 +16,7 @@ import { api } from '../../lib/api'
 import { categoryIcon, categoryIdOf, categoryLabel, parseCategories, visibleCategories, ALL_CATEGORY } from '../../lib/categories'
 import { cloudApi } from '../../lib/cloud/client'
 import { cloudDeviceId, useCloudSession } from '../../lib/cloud/session'
+import { deviceLabel } from '../../lib/cloud/deviceLabel'
 import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
 import { linkApi } from '../../lib/link'
 import { clearCredentials, getBase } from '../../lib/auth'
@@ -72,8 +73,10 @@ export function Sidebar() {
     enabled: session.status === 'authenticated',
     staleTime: 10_000,
   })
+  // 展示只列远端（不含本机），但 deviceLabel 判重名基准用 cloudDevices（含本机）——
+  // 见 deviceLabel.ts 的硬约定。
   const remoteDevices = cloudDevices.filter((d) => d.deviceId !== myDeviceId)
-  const { remoteTasks } = useRemoteTasks()
+  const { remoteTasks, onlineDeviceIds } = useRemoteTasks()
   // 本地设备(link)小节：仅展示已配对设备（在线圆点），不参与 deviceFilter 任务过滤——
   // 本地设备的任务运行在对端，本端看不到其进度，点击没有意义。
   const { data: linkDevices = [] } = useQuery({
@@ -342,6 +345,9 @@ export function Sidebar() {
                 {remoteDevices.map((d) => {
                   const Icon = d.platform === 'android' || d.platform === 'ios' ? Smartphone : Monitor
                   const count = remoteTasks.filter((rt) => rt.toDevice === d.deviceId).length
+                  // devices 查询是 10s 缓存的快照，SSE presence 是实时的：取并集，
+                  // 免得刚上线的设备在导航里还挂着灰点。
+                  const online = (d.isOnline ?? false) || onlineDeviceIds.has(d.deviceId)
                   return (
                     <button
                       key={d.id}
@@ -350,8 +356,8 @@ export function Sidebar() {
                       onClick={() => { setDeviceFilter(d.deviceId); setRssFilter(null); setSidebarOpen(false) }}
                     >
                       <Icon size={15} />
-                      <i className={cn('queue-dot', d.isOnline && 'on')} title={d.isOnline ? t('link.online') : t('link.offline')} />
-                      <span>{d.name || '-'}</span>
+                      <i className={cn('queue-dot', online && 'on')} title={online ? t('link.online') : t('link.offline')} />
+                      <span>{deviceLabel(d, cloudDevices)}</span>
                       <em>{count || ''}</em>
                     </button>
                   )

@@ -8,6 +8,7 @@ import { type FormEvent, useEffect, useState } from 'react'
 import { Eye, EyeOff, RefreshCw } from 'lucide-react'
 import { api, ApiError } from '../lib/api'
 import { saveCredentials } from '../lib/auth'
+import { resyncRemoteTasks } from '../lib/cloud/useRemoteTasks'
 import { translateBackendMessage, useI18n } from '../lib/i18n'
 import { randomAccessKey, validateAccessKey } from '../lib/token-policy'
 import { CopyButton } from '../components/CopyButton'
@@ -57,6 +58,10 @@ export function LoginScreen() {
       const target = effectiveBase()
       await api.probe(target, token)
       saveCredentials(target, token, remember)
+      // 面板停在 /login 时云账号的 SSE 可能一直健康（它只看云账号登录态），期间
+      // 收到的下发会被执行端的 !isAuthenticated() 丢弃，也没有信号触发它重连去
+      // 补一次全量——本地登录成功是唯一能感知到这个转变的时刻，必须显式补一次。
+      resyncRemoteTasks()
       navigate({ to: '/' })
     } catch (err) {
       setError(err instanceof ApiError ? translateBackendMessage(err.message) : t('login.connectFailed'))
@@ -83,6 +88,7 @@ export function LoginScreen() {
       await api.completeSetup('', token)
       await api.probe('', token)
       saveCredentials('', token, remember)
+      resyncRemoteTasks() // 同上：首次设置向导成功即视为一次本地登录，同样要补单。
       navigate({ to: '/' })
     } catch (err) {
       setError(err instanceof ApiError ? translateBackendMessage(err.message) : t('login.connectFailed'))

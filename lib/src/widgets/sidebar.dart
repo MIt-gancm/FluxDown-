@@ -23,6 +23,7 @@ import 'rss_manager_dialog.dart';
 import 'rss_wizard_dialog.dart';
 import '../models/rss_provider.dart';
 import '../services/cloud/cloud_auth_service.dart';
+import '../services/cloud/device_identity.dart';
 import '../services/link/local_pairing_service.dart';
 import 'add_device_dialog.dart';
 
@@ -649,6 +650,10 @@ class _SidebarState extends State<Sidebar> {
   Widget _buildDeviceSection(DownloadController ctrl, S s, AppColors c) {
     final deviceFilter = ctrl.deviceFilter;
     final remoteDevices = CloudAuthService.instance.remoteDevices;
+    // deviceLabel 判重名基准必须含本机：本机与某台远端同名时，本机也在
+    // 设置页/新建下载里被加了短码，侧栏若只按 remoteDevices 判重名会漏判，
+    // 同一台远端设备在三处入口显示不同名字。
+    final allDevices = CloudAuthService.instance.devices;
     // 本地配对设备（局域网直连，免账号）。移动端 supported 恒为 false，
     // localDevices 恒为空列表，天然不需要额外的平台判断。
     final localDevices = LocalPairingService.instance.localDevices;
@@ -690,7 +695,7 @@ class _SidebarState extends State<Sidebar> {
           for (final device in remoteDevices)
             _NavItem(
               icon: _deviceTypeIcon(device.platform),
-              label: device.name,
+              label: deviceLabel(device, allDevices),
               count: ctrl.countForDevice(device.deviceId),
               isSelected: !_rssActive && deviceFilter == device.deviceId,
               isOnline: device.isOnline,

@@ -97,6 +97,26 @@ export interface RemoteTask {
 export interface RemoteTasksResponse {
   tasks: RemoteTask[]
 }
+
+/** POST /tasks/{id}/status 请求体：执行端上报状态转换（totalBytes/fileName 探测到才带，
+ *  error 仅 failed 时有意义）。 */
+export interface TaskStatusReport {
+  status: RemoteTaskStatus
+  totalBytes?: number
+  fileName?: string
+  error?: string
+}
+
+/** POST /tasks/progress 请求体 items[] 单项：执行端批量上报进度（服务端只更内存快照）。 */
+export interface ProgressReportItem {
+  taskId: string
+  downloadedBytes: number
+  speed: number
+  progress: number
+}
+
+/** POST /tasks/{id}/command 的动作集：发起端对执行端的远程控制。 */
+export type RemoteTaskAction = 'pause' | 'resume' | 'cancel'
 /** GET /cdn/config 响应 resolvers[]（snake_case wire，直接对应引擎 config 表键约定，
  *  与本文件其余 camelCase 模型不同——对齐桌面端 cloud_models.dart CdnConfig）。 */
 export interface CdnResolverEntry {

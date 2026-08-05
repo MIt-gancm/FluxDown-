@@ -16,6 +16,8 @@ import { parseCategories, resolveCategorySaveDir, visibleCategories } from '../.
 import { CATEGORIES_KEY } from '../../lib/config'
 import { cloudApi } from '../../lib/cloud/client'
 import { cloudDeviceId, useCloudSession } from '../../lib/cloud/session'
+import { deviceLabel } from '../../lib/cloud/deviceLabel'
+import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
 import { linkApi } from '../../lib/link'
 import { cn } from '../../lib/cn'
 import { queueDisplayName } from '../../lib/format'
@@ -130,12 +132,15 @@ export function NewDownloadDialog() {
   const { data: queues } = useQuery({ queryKey: ['queues'], queryFn: api.listQueues, enabled: open })
   const { data: stats } = useQuery({ queryKey: ['stats'], queryFn: api.stats, enabled: open })
   const session = useCloudSession()
+  const { onlineDeviceIds } = useRemoteTasks()
   const { data: cloudDevices = [] } = useQuery({
     queryKey: ['cloud', 'devices'],
     queryFn: () => cloudApi.devices().then((r) => r.devices),
     enabled: open && session.status === 'authenticated',
     staleTime: 10_000,
   })
+  // 展示只列远端（不含本机），但 deviceLabel 判重名基准用 cloudDevices（含本机）——
+  // 见 deviceLabel.ts 的硬约定。
   const remoteDevices = cloudDevices.filter((d) => d.deviceId !== cloudDeviceId())
   const showCloudDevices = session.status === 'authenticated' && remoteDevices.length > 0
   // 本地设备(link)分组：局域网直连已配对设备，与云中转完全独立；宿主未启用/不支持时
@@ -149,15 +154,33 @@ export function NewDownloadDialog() {
   })
   const showLinkDevices = linkDevices.length > 0
   const showDeviceSelect = showCloudDevices || showLinkDevices
+  // 离线设备保留在列表里：服务端支持离线下发，对端上线后会 catch-up 领取，
+  // 因此只做视觉标注而不禁用。在线判定取「服务端快照 ∪ SSE 实时 presence」，
+  // 后者能在设备刚上/下线、devices 查询尚未刷新时立即反映。
+  const withOffline = (label: string, online: boolean) => (online ? label : `${label} (${t('link.offline')})`)
   const deviceOptions = [
     { value: '', label: t('cloud.deviceCurrent') },
     ...(showCloudDevices
-      ? remoteDevices.map((d) => ({ value: `cloud:${d.deviceId}`, label: d.name || '-', group: t('newDl.deviceGroupCloud') }))
+      ? remoteDevices.map((d) => ({
+          value: `cloud:${d.deviceId}`,
+          label: withOffline(deviceLabel(d, cloudDevices), (d.isOnline ?? false) || onlineDeviceIds.has(d.deviceId)),
+          group: t('newDl.deviceGroupCloud'),
+        }))
       : []),
     ...(showLinkDevices
-      ? linkDevices.map((d) => ({ value: `link:${d.fingerprint}`, label: d.name || '-', group: t('newDl.deviceGroupDirect') }))
+      ? linkDevices.map((d) => ({
+          value: `link:${d.fingerprint}`,
+          label: withOffline(d.name || '-', d.online),
+          group: t('newDl.deviceGroupDirect'),
+        }))
       : []),
   ]
+  // 选中目标是离线云设备时给出提示：默认只把 "(Offline)" 追加进选项标签，
+  // 提交是静默的，用户容易以为下发失败或没反应，见下方渲染处的提示行。
+  const selectedCloudDeviceId = form.deviceId.startsWith('cloud:') ? form.deviceId.slice('cloud:'.length) : ''
+  const selectedCloudDevice = selectedCloudDeviceId ? remoteDevices.find((d) => d.deviceId === selectedCloudDeviceId) : undefined
+  const selectedTargetOffline =
+    selectedCloudDevice !== undefined && !((selectedCloudDevice.isOnline ?? false) || onlineDeviceIds.has(selectedCloudDevice.deviceId))
   const demoMode = stats?.demoMode ?? false
   const demoUrl = stats?.demoUrl ?? ''
 
@@ -477,6 +500,7 @@ export function NewDownloadDialog() {
                 <>
                   <label className="field-label">{t('newDl.dispatchTo')}</label>
                   <SelectField value={form.deviceId} onChange={(v) => set('deviceId', v)} options={deviceOptions} ariaLabel={t('newDl.dispatchTo')} />
+                  {selectedTargetOffline && <p className="mt-1 text-xs text-text3">{t('newDl.offlineTargetHint')}</p>}
                 </>
               )}
               <div className="grid2">

@@ -7,8 +7,9 @@ import { ArrowLeft, Check, ChevronRight, Cloud, Copy, Monitor, Pencil, Search, S
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '../../lib/cn'
 import { CLOUD_BASE_URL_EDITABLE, cloudApi, getCloudBaseUrl, isCloudBaseUrlCustom, resetCloudBaseUrl, setCloudBaseUrl } from '../../lib/cloud/client'
+import { deviceLabel } from '../../lib/cloud/deviceLabel'
 import { suggest } from '../../lib/cloud/nickname'
-import { applyCloudSession, clearCloudSession, cloudDeviceId, getCloudRefreshToken, useCloudSession } from '../../lib/cloud/session'
+import { applyCloudSession, cloudDeviceId, getCloudRefreshToken, signOutCloud, useCloudSession } from '../../lib/cloud/session'
 import { CloudApiError, type CloudDevice } from '../../lib/cloud/types'
 import { confirmDialog } from '../../lib/confirm'
 import { copyText } from '../../lib/copy'
@@ -638,7 +639,7 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
         // 尽力通知服务端吊销 refreshToken，失败也不阻塞本地登出。
       }
     }
-    clearCloudSession()
+    signOutCloud()
   }
 
   return (
@@ -776,6 +777,7 @@ function DeviceListSection() {
                   <DeviceItem
                     key={d.id}
                     device={d}
+                    label={deviceLabel(d, sorted)}
                     isCurrent={d.deviceId === currentId}
                     open={openId === d.id}
                     onToggle={() => setOpenId((cur) => (cur === d.id ? null : d.id))}
@@ -799,11 +801,14 @@ function DeviceListSection() {
  *  App 版本、设备 ID），对标 Telegram/Google 设备管理的信息量，不做额外采集。 */
 function DeviceItem({
   device,
+  label,
   isCurrent,
   open,
   onToggle,
 }: {
   device: CloudDevice
+  /** 展示名：重名设备已带 deviceId 短码后缀，重命名输入仍编辑原始 device.name。 */
+  label: string
   isCurrent: boolean
   open: boolean
   onToggle: () => void
@@ -826,7 +831,7 @@ function DeviceItem({
   const deleteMut = useMutation({
     mutationFn: () => cloudApi.deleteDevice(device.id),
     onSuccess: () => {
-      if (isCurrent) clearCloudSession()
+      if (isCurrent) signOutCloud()
       void qc.invalidateQueries({ queryKey: DEVICES_QUERY_KEY })
     },
   })
@@ -877,7 +882,7 @@ function DeviceItem({
             <div className="min-w-0 flex-1 text-left">
               <div className="flex items-center gap-2">
                 <i className={cn('queue-dot', device.isOnline && 'on')} title={device.isOnline ? t('link.online') : t('link.offline')} />
-                <b className="truncate text-[13px] font-medium">{device.name || '-'}</b>
+                <b className="truncate text-[13px] font-medium">{label}</b>
                 {isCurrent ? (
                   <span className="flex-shrink-0 rounded-full bg-accent-weak px-1.5 py-0.5 text-[9.5px] font-semibold text-accent">
                     {t('cloud.deviceCurrent')}

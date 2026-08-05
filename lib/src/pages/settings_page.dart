@@ -32,6 +32,7 @@ import '../services/cloud/cloud_auth_service.dart';
 import '../services/cloud/cloud_client.dart';
 import '../services/cloud/config_sync_service.dart';
 import '../services/cloud/cloud_models.dart';
+import '../services/cloud/device_identity.dart';
 import '../services/cloud/nickname_pool.dart';
 import '../services/floating_ball/floating_ball_service.dart';
 import '../services/link/link_models.dart';
@@ -12735,6 +12736,7 @@ class _DeviceListSectionState extends State<_DeviceListSection> {
                   ),
                 _DeviceRow(
                   device: visible[i],
+                  label: deviceLabel(visible[i], devices),
                   isCurrent: visible[i].deviceId == currentId,
                   onChanged: _model.load,
                 ),
@@ -12943,6 +12945,7 @@ class _DeviceManageAllDialogState extends State<_DeviceManageAllDialog> {
                           ),
                         _DeviceRow(
                           device: device,
+                          label: deviceLabel(device, widget.model.devices),
                           isCurrent: device.deviceId == currentId,
                           onChanged: widget.model.load,
                         ),
@@ -13005,11 +13008,16 @@ String _absoluteWithRelative(String isoDate) {
 
 class _DeviceRow extends StatelessWidget {
   final CloudDevice device;
+
+  /// 展示名：重名设备已由 [deviceLabel] 附上 deviceId 短码，行内直接用它，
+  /// 不再单独读 device.name（详情弹窗展示完整 deviceId，无需短码）。
+  final String label;
   final bool isCurrent;
   final VoidCallback onChanged;
 
   const _DeviceRow({
     required this.device,
+    required this.label,
     required this.isCurrent,
     required this.onChanged,
   });
@@ -13077,7 +13085,7 @@ class _DeviceRow extends StatelessWidget {
                       children: [
                         Flexible(
                           child: Text(
-                            device.name.isEmpty ? '—' : device.name,
+                            label,
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               fontSize: 13,

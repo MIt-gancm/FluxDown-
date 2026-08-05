@@ -2,8 +2,10 @@
 // v1.1 新增），对应契约「请求中的设备信息」。所有发令牌的 FluxCloud 接口都要带上
 // 这些字段。
 //
-// deviceId 首次调用时随机生成（UUID v4）并落盘 kv_store，此后永久不变（生成方式同
-// analytics_service.dart 的匿名设备 ID，避免为此单引入 uuid 包依赖）。
+// deviceId 首次调用时随机生成（UUID v4）并立即落盘 kv_store，之后进程内走内存
+// 缓存、跨进程走 kv_store，正常使用下保持不变；只有清空 kv 存储、便携版与安装版
+// 互换、或更换数据目录时会重新生成（对服务端等同于一台新设备）。生成方式同
+// analytics_service.dart 的匿名设备 ID，避免为此单引入 uuid 包依赖。
 // deviceName 默认取本机名（桌面）/设备型号（移动），用户可在「账户」设置中改名；
 // 探测失败时留空交服务端按 devicePlatform 兜底（见契约注释）。
 // appVersion 直接复用 update_service.dart 的构建期版本号（--dart-define
@@ -18,6 +20,7 @@ import 'package:device_info_plus/device_info_plus.dart';
 import '../kv_store.dart';
 import '../log_service.dart';
 import '../update_service.dart';
+import 'cloud_models.dart';
 
 const _tag = 'DeviceIdentity';
 const _kDeviceIdKey = 'cloud_device_id';
@@ -26,15 +29,38 @@ const _kDeviceNameKey = 'cloud_device_name';
 class DeviceIdentity {
   DeviceIdentity._();
 
-  /// 持久客户端设备 ID（UUID v4）；首次访问生成并落盘，此后永久不变，
+  /// 进程内缓存：首次解析后全程复用，保证并发/重入调用不会各自生成一个 UUID。
+  static String? _cachedDeviceId;
+
+  /// 持久客户端设备 ID（UUID v4）；首次访问生成并立即落盘，
   /// 是服务端 devices 表识别"同一设备"的唯一依据。
   static String deviceId() {
+    final cached = _cachedDeviceId;
+    if (cached != null) return cached;
     final existing = KvStore.instance.getString(_kDeviceIdKey);
-    if (existing != null && existing.isNotEmpty) return existing;
+    if (existing != null && existing.isNotEmpty) {
+      return _cachedDeviceId = existing;
+    }
     final id = _uuidV4();
-    // 落盘为 fire-and-forget：本次调用后续读取已经从内存缓存命中，不必等待。
-    unawaited(KvStore.instance.setString(_kDeviceIdKey, id));
+    _cachedDeviceId = id;
+    unawaited(_persistDeviceId(id));
     return id;
+  }
+
+  /// 落盘首次生成的 deviceId。丢失它的代价是云端凭空多出一台同名幽灵设备、
+  /// 白占套餐设备额度，所以这里不接受便携后端 400ms 防抖窗口内的进程退出：
+  /// setString 同步更新缓存并登记防抖，紧跟的 flush 取消防抖并同步写文件——
+  /// 两个调用都在第一个 await 之前同步执行完，[deviceId] 返回时文件已落盘。
+  /// 安装后端 flush 为 no-op，写入由 SharedPreferences 自身完成。
+  static Future<void> _persistDeviceId(String id) async {
+    try {
+      final written = KvStore.instance.setString(_kDeviceIdKey, id);
+      final flushed = KvStore.instance.flush();
+      await written;
+      await flushed;
+    } catch (e, stack) {
+      logError(_tag, 'failed to persist device id', e, stack);
+    }
   }
 
   /// 纯函数：Dart `Platform.operatingSystem` 取值 → 契约 devicePlatform 枚举字符串
@@ -123,3 +149,27 @@ class DeviceIdentity {
         '${h.substring(12, 16)}-${h.substring(16, 20)}-${h.substring(20)}';
   }
 }
+
+/// 同名设备可区分标签：[device] 的名称在 [all] 中重复出现时追加 deviceId 前 6 位
+/// 短码（形如 `DESKTOP-RSQ4S1D · c0db03`）。服务端不禁止重名，同型号手机或同一
+/// 批装机的办公机在列表里长得一模一样，用户无从判断该把任务下发给哪台；名称唯一
+/// 时保持原样，不用短码污染绝大多数场景。名称为空时直接用短码兜底。
+///
+/// 硬约定：[all] 必须传入含本机在内的全量设备列表——本机与某台远端同名也要能
+/// 被短码区分，否则设置页/侧栏/新建下载三处入口对同一台远端设备算出的重名结果
+/// 会不一致，导致同一设备在不同页面显示不同的名字。
+String deviceLabel(CloudDevice device, List<CloudDevice> all) {
+  final short = _deviceShortCode(device.deviceId);
+  final name = device.name.trim();
+  if (name.isEmpty) return short;
+  var seen = 0;
+  for (final other in all) {
+    if (other.name.trim() != name) continue;
+    seen++;
+    if (seen > 1) return '$name · $short';
+  }
+  return name;
+}
+
+String _deviceShortCode(String deviceId) =>
+    deviceId.length <= 6 ? deviceId : deviceId.substring(0, 6);

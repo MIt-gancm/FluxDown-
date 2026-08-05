@@ -39,6 +39,7 @@ import '../services/bt_file_selection_service.dart';
 import '../services/resolve_preview_client.dart';
 import '../services/cloud/cloud_auth_service.dart';
 import '../services/cloud/cloud_client.dart';
+import '../services/cloud/device_identity.dart';
 import '../services/link/link_models.dart';
 import '../services/link/local_pairing_service.dart';
 
@@ -1465,6 +1466,13 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
     final c = AppColors.of(context);
     final s = LocaleScope.of(context);
     final m = AppMetrics.of(context);
+    // 下发目标选择器展示不含本机的 remoteDevices，但 deviceLabel 判重名
+    // 基准必须是含本机的全量名册——本机与某台远端同名时，设置页/侧栏都会
+    // 给两台加短码，这里若只按 remoteDevices 判重名会漏判，同一台远端
+    // 设备在三处入口显示不同名字。取一次复用，避免 getter 在 options
+    // 循环里每项重建一次列表。
+    final remoteDevices = CloudAuthService.instance.remoteDevices;
+    final allDevices = CloudAuthService.instance.devices;
 
     return ShadDialog(
       // 左右各让 6px 从 padding 移入 scrollPadding：内容位置不变，
@@ -1727,7 +1735,7 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                   const SizedBox(height: 8),
                   // "下载到"目标设备 — 渐进披露：存在云账户远程设备或已配对本地
                   // 设备时才出现，都没有时界面零变化（契约 v1 §3.2/§6.2 语义扩展到本地）。
-                  if (CloudAuthService.instance.hasRemoteDevices ||
+                  if (remoteDevices.isNotEmpty ||
                       (LocalPairingService.instance.supported &&
                           LocalPairingService.instance.hasLocalDevices)) ...[
                     _SectionLabel(text: s.downloadTo, c: c),
@@ -1736,15 +1744,14 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                       initialValue: _selectedDeviceId ?? '',
                       options: [
                         ShadOption(value: '', child: Text(s.thisDevice)),
-                        for (final device
-                            in CloudAuthService.instance.remoteDevices)
+                        for (final device in remoteDevices)
                           ShadOption(
                             value: device.deviceId,
                             child: Row(
                               mainAxisSize: MainAxisSize.min,
                               children: [
                                 Text(
-                                  device.name,
+                                  deviceLabel(device, allDevices),
                                   style: device.isOnline
                                       ? null
                                       : TextStyle(color: c.textMuted),
@@ -1799,12 +1806,12 @@ class _NewDownloadDialogContentState extends State<_NewDownloadDialogContent> {
                       ],
                       selectedOptionBuilder: (context, value) {
                         if (value.isEmpty) return Text(s.thisDevice);
-                        final cloudDevice = CloudAuthService.instance.remoteDevices
+                        final cloudDevice = remoteDevices
                             .where((d) => d.deviceId == value)
                             .firstOrNull;
                         if (cloudDevice != null) {
                           return Text(
-                            cloudDevice.name,
+                            deviceLabel(cloudDevice, allDevices),
                             overflow: TextOverflow.ellipsis,
                             maxLines: 1,
                           );

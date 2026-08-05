@@ -13,16 +13,16 @@
 import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { ChevronDown, ChevronRight, Download, Folder } from 'lucide-react'
+import { ChevronDown, ChevronRight, Folder } from 'lucide-react'
 import { api } from '../../lib/api'
 import { parseCategories, visibleCategories } from '../../lib/categories'
 import { CATEGORIES_KEY, useConfigQuery } from '../../lib/config'
 import { cloudDeviceId } from '../../lib/cloud/session'
-import type { RemoteTask, RemoteTaskStatus } from '../../lib/cloud/types'
+import type { RemoteTask } from '../../lib/cloud/types'
 import { useRemoteTasks } from '../../lib/cloud/useRemoteTasks'
 import { cn } from '../../lib/cn'
-import { fmtBytes, fmtSpeed } from '../../lib/format'
-import { useI18n, type I18nKey } from '../../lib/i18n'
+import { fmtBytes } from '../../lib/format'
+import { useI18n } from '../../lib/i18n'
 import { bucketEntities, compareSectionEntities, orderSections, type SectionEntity } from '../../lib/list-sections'
 import { compressPathChain, dirKey, flattenGroupMembers, groupDisplayName } from '../../lib/task-group'
 import { useViewPrefs } from '../../lib/view-prefs'
@@ -30,6 +30,7 @@ import type { GroupDto } from '../../lib/types'
 import { GroupRow } from './GroupRow'
 import { SeedingSummaryBar } from './SeedingSummaryBar'
 import { GroupGridCard, TaskGridCard } from './GridCard'
+import { RemoteTaskRow } from './RemoteTaskRow'
 import { TaskRow } from './TaskRow'
 import { filterTasks } from './filters'
 import { useTasksUi } from './context'
@@ -59,17 +60,6 @@ const GRID_CARD_HEIGHT = 138
 const GRID_GAP = 10
 const GRID_ROW_SIZE = GRID_CARD_HEIGHT + GRID_GAP
 const GRID_CARD_MIN_WIDTH = 210
-
-/** 跨设备任务状态 → 文案键（mdc §1.1 状态机）。 */
-const REMOTE_STATUS_KEY: Record<RemoteTaskStatus, I18nKey> = {
-  pending: 'remote.status.pending',
-  accepted: 'remote.status.accepted',
-  downloading: 'remote.status.downloading',
-  paused: 'remote.status.paused',
-  completed: 'remote.status.completed',
-  failed: 'remote.status.failed',
-  canceled: 'remote.status.canceled',
-}
 
 export function TaskList() {
   const { t } = useI18n()
@@ -261,38 +251,7 @@ export function TaskList() {
                     <TaskRow task={item.task} queues={queues} density={prefs.density} protocolBadges={prefs.protocolBadges} columns={prefs.columns} />
                   </div>
                 )}
-                {item.kind === 'remoterow' && (
-                  <div className={cn('task-row', isCompact && 'compact')}>
-                    <span className="trow-icon">
-                      <Download size={19} />
-                    </span>
-                    <div className="trow-main">
-                      <div className="trow-name">
-                        <b>{item.task.fileName || item.task.url}</b>
-                      </div>
-                      <div className="trow-meta">
-                        <span>{REMOTE_STATUS_KEY[item.task.status] ? t(REMOTE_STATUS_KEY[item.task.status]) : item.task.status}</span>
-                        {item.task.status === 'downloading' && (
-                          <>
-                            <span>
-                              {' '}
-                              · {fmtBytes(item.task.downloadedBytes)}
-                              {item.task.totalBytes ? ` / ${fmtBytes(item.task.totalBytes)}` : ''}
-                            </span>
-                            <span> · {fmtSpeed(item.task.speed)}</span>
-                          </>
-                        )}
-                        {item.task.error && <span className="text-danger"> · {item.task.error}</span>}
-                      </div>
-                      <div className="trow-bar">
-                        <i style={{ width: `${Math.round((item.task.progress || 0) * 100)}%` }} />
-                      </div>
-                    </div>
-                    <div className="trow-side">
-                      <span className="trow-pct">{Math.round((item.task.progress || 0) * 100)}%</span>
-                    </div>
-                  </div>
-                )}
+                {item.kind === 'remoterow' && <RemoteTaskRow task={item.task} density={prefs.density} />}
                 {item.kind === 'gridrow' && (
                   <div className="grid-row" style={{ '--grid-cols': cardsPerRow } as CSSProperties}>
                     {item.entities.map((e) =>

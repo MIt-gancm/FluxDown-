@@ -363,6 +363,13 @@ class CloudClient {
     );
   });
 
+  /// POST /tasks/presence：维持本设备到本账号 presence 租约的心跳（C1+C2
+  /// 契约）。无请求体，成功 204；调用方（RemoteTaskService）在维持 SSE
+  /// 长连期间每 30s 调用一次续租，服务端 90s 未收到心跳会判定离线。
+  Future<void> pingPresence() => _authed(() async {
+    await _request('POST', '/tasks/presence', authed: true);
+  });
+
   /// POST /me/email/code：向当前绑定邮箱发送验证码（邮箱变更第一步），返回 TTL（秒）。
   Future<int> sendEmailChangeCode() => _authed(() async {
     final json = await _request('POST', '/me/email/code', authed: true);
