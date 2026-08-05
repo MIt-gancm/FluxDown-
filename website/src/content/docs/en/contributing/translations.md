@@ -1,15 +1,14 @@
 ---
 title: Translating FluxDown
-description: Help translate the app, the web UI, and this website into your language — no coding required.
+description: Help translate the app, the web UI, and this website by contributing on GitHub.
 section: contributing
 order: 2
 ---
 
-FluxDown is translated by its community on a self-hosted [Weblate](https://translate.zerx.dev/projects/fluxdown/) instance. Everything happens in the browser — **no Git, no coding, no build setup required**.
+FluxDown translations are maintained in the public [zerx-lab/FluxDown](https://github.com/zerx-lab/FluxDown) repository. Community members contribute language updates through GitHub pull requests.
 
 ## What can be translated
 
-![FluxDown project on Weblate](/docs/weblate/project.png)
 
 | Component | What it covers |
 | --- | --- |
@@ -21,34 +20,28 @@ English is the source language; Simplified Chinese is maintained by the core tea
 
 ## Quick start
 
-1. [Register](https://translate.zerx.dev/accounts/register/) on the translation site (email or GitHub login).
-2. Open the [FluxDown project](https://translate.zerx.dev/projects/fluxdown/) and pick a component and a language.
-3. Translate string by string — the editor shows the English source, nearby strings, and a glossary:
-
-![Weblate translation editor](/docs/weblate/editor.png)
-
-Press **Save and continue** to move through the list. Not sure about a string? Click **Suggest** instead — another translator can review it later.
+1. Fork [zerx-lab/FluxDown](https://github.com/zerx-lab/FluxDown) and create a branch from `main`.
+2. Add or update the relevant translation file:
+   - **Desktop & Mobile App**: `assets/i18n/`
+   - **Web App**: `web/src/lib/locales/`
+   - **Website**: `website/src/lib/locales/`
+3. Open a pull request against `main`. A maintainer will review and merge it.
 
 ## Placeholders
 
-Text in curly braces like `{name}`, `{count}`, or `{speed}` is replaced with live values at runtime. **Keep placeholders exactly as-is** — reposition them freely to fit your language's grammar, but never translate or delete what's inside the braces. Weblate warns you automatically if a placeholder goes missing.
+Text in curly braces like `{name}`, `{count}`, or `{speed}` is replaced with live values at runtime. **Keep placeholders exactly as-is** — reposition them freely to fit your language's grammar, but never translate or delete what's inside the braces.
 
 ## Starting a new language
 
-Your language isn't listed yet? Open a component and click **Start new translation**:
+Your language isn't listed yet? Add a translation file for it in the relevant component directory and include `languageNativeName` first so the language selector can label it correctly. Then open a pull request against `main`.
 
-![Starting a new translation](/docs/weblate/new-language.png)
+After it merges:
 
-Weblate creates the translation file for you and opens a pull request against the FluxDown repository once you start translating. After it merges:
-
-- **App**: your language appears automatically in *Settings → Language* in the next release — the app discovers translation files at runtime.
+- **App**: your language appears automatically in *Settings → Language* in the next release.
 - **Web UI & website**: the language shows up in the language switcher with the next deploy.
-
-No code changes are needed anywhere. The language selector labels itself with the `languageNativeName` string, so translate that key first.
 
 ## Tips
 
 - **Partial translations are fine.** Untranslated strings fall back to English key by key — a 30% translated language is already useful.
-- **Consistency beats literalness.** Check the glossary and nearby strings; reuse the same term for the same concept.
-- **You will be asked to sign the CLA** on your first contribution — a one-time click inside Weblate.
-- Found a typo in the English source? Report it via the [feedback form](/feedback) or open an issue — source strings are managed in the repository.
+- **Consistency beats literalness.** Check nearby strings and reuse the same term for the same concept.
+- Found a typo in the English source? Include the correction in your pull request, or open an issue.

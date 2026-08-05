@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { cn, DEMO_URL, GITHUB_REPO_URL } from "@/lib/utils";
+import { cn, GITHUB_REPO_URL } from "@/lib/utils";
 import { useLocale, saveLocale, type Locale } from "@/lib/i18n";
 import { LOCALES } from "@/lib/locales";
 
@@ -308,7 +308,6 @@ export function FloatingNavbar({ className }: { className?: string }) {
     { name: t("nav.features"), link: "/#features" },
     { name: t("nav.download"), link: "/#download" },
     { name: t("nav.pricing"), link: "/pricing" },
-    { name: t("nav.demo"), link: DEMO_URL, external: true },
   ];
 
   // 「资源」下拉菜单

@@ -1,4 +1,4 @@
-// 翻译源文件为 JSON（en.json 为源语言，社区经 Weblate 贡献其他语言）。
+// 翻译源文件为 JSON（en.json 为源语言，社区通过 GitHub Pull Request 贡献其他语言）。
 // 语言注册表由 import.meta.glob 自动发现：新增 <lang>.json 即自动出现在语言下拉框，
 // 无需改代码。缺失/空串的键在构建注册表时回退到英文（键级 fallback）。
 import enJson from "./en.json";

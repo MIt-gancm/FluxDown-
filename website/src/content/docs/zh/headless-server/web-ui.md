@@ -3,7 +3,7 @@ title: Web 界面
 description: 用服务器自带的浏览器界面登录并管理下载。
 section: headless-server
 order: 3
-sourceHash: "fe1ceb808226"
+sourceHash: "d8c1fe3d011f"
 ---
 
 服务器跑起来后(见[服务器部署](/docs/zh/headless-server/setup/)),在浏览器里打开它的地址即可,例如 `http://<host>:17800/`。它的任务管理体验与桌面客户端一致,只是为远程、多会话场景做了适配。
@@ -14,17 +14,6 @@ sourceHash: "fe1ceb808226"
 
 勾选**"记住此设备"**会把 token 存进 `localStorage`(浏览器重启后依然有效);不勾选则存进 `sessionStorage`(关闭标签页即清除)。token 只会发给服务器本身,不会流向别处。
 
-### 在线演示
-
-公开演示站部署在 [https://demo.zerx.dev/](https://demo.zerx.dev/),使用以下共享访问令牌登录:
-
-```
-fxd_bfc6b03e8e494ec8907415a2e8a0b21b
-```
-
-需要把令牌手动粘贴到登录页的**访问令牌**输入框——Web 界面不会识别页面 URL 里携带的 token,在地址后面加 `?token=...` 不起作用。服务器地址保持预填值即可。
-
-演示站运行在演示模式下(`FLUXDOWN_DEMO`,见[服务器部署](/docs/zh/headless-server/setup/)):只能下载内置生成的测试文件;由于令牌是公开的,站内的一切内容任何人都能看到和改动。
 
 <!-- TODO(screenshot): 登录页,展示服务器地址与访问令牌输入框 -->
 

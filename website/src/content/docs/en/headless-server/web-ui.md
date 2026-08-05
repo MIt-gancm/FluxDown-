@@ -13,17 +13,6 @@ The login screen asks for a **server address** (pre-filled with the current orig
 
 Checking **"Remember this device"** stores the token in `localStorage` (persists across browser restarts); leaving it unchecked stores it in `sessionStorage` (cleared when the tab closes). Nothing is ever sent anywhere except to the server itself.
 
-### Trying the public demo
-
-A public demo instance runs at [https://demo.zerx.dev/](https://demo.zerx.dev/). Sign in with this shared access token:
-
-```
-fxd_bfc6b03e8e494ec8907415a2e8a0b21b
-```
-
-You must paste the token into the **access token** field on the login screen — the Web UI does not read a token from the page URL, so appending `?token=...` to the address has no effect. Leave the server address as pre-filled.
-
-The demo server runs in demo mode (`FLUXDOWN_DEMO`, see [Server Setup](/docs/en/headless-server/setup/)): only a built-in generated test file can be downloaded, and since the token is public, treat everything on it as visible to and modifiable by anyone.
 
 <!-- TODO(screenshot): login screen with server address and token fields -->
 
