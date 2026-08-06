@@ -177,5 +177,12 @@ const ogImageUrl = OG_IMAGE_URL;
         };
       })();
     </script>
+
+    <!--
+      LangBot 客服机器人组件(全站)。
+      走同域代理 /api/langbot-widget.js:上游脚本注入的 baseUrl 是 http://127.0.0.1:5300,
+      直连会让所有 API/WS/logo 请求打到访客本机。代理只重写地址,其余原样透传。
+    -->
+    <script is:inline defer data-title="FD助手" src="/api/langbot-widget.js"></script>
   </body>
 </html>
