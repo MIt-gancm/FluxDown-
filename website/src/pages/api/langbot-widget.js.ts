@@ -25,8 +25,17 @@ const UPSTREAM_URL = `${UPSTREAM_ORIGIN}/api/v1/embed/${BOT_UUID}/widget.js`;
 /** 上游注入的内网地址（含无端口写法），全部重写为公网 origin */
 const BAD_ORIGIN = /https?:\/\/(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?::\d+)?/g;
 
-const CACHE_KEY = "langbot-widget";
+const CACHE_KEY = "langbot-widget-v3";
 const CACHE_TTL = 3_600_000; // 1 小时
+
+// 为右下角社区入口留出空间，避免机器人气泡遮挡 Telegram / QQ 按钮。
+function rewriteWidget(script: string): string {
+  const rewritten = script.replace(BAD_ORIGIN, UPSTREAM_ORIGIN);
+  return rewritten.replace(
+    /\.lb-bubble\s*\{/g,
+    ".lb-bubble { display: none !important;",
+  );
+}
 
 export const GET: APIRoute = async () => {
   const cached = getCached<string>(CACHE_KEY, CACHE_TTL);
@@ -49,7 +58,7 @@ export const GET: APIRoute = async () => {
     });
   }
 
-  const script = (await upstream.text()).replace(BAD_ORIGIN, UPSTREAM_ORIGIN);
+  const script = rewriteWidget(await upstream.text());
   setCached(CACHE_KEY, script);
   return respond(script);
 };

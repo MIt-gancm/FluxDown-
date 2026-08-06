@@ -39,6 +39,7 @@
     "telegramGroup.step2": "在 Telegram 应用或网页端打开，无需搜索群组",
     "telegramGroup.step3": "点击「加入群组」即可成为社区成员",
     "community.floatLabel": "加入社区",
+    "community.bot": "Bot",
     "community.telegram": "Telegram 群",
     "community.qq": "QQ 群",
     "qqGroup.badge": "QQ 社区群",

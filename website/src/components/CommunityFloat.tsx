@@ -33,21 +33,28 @@ const communities = [
       </svg>
     ),
   },
+  {
+    id: "langbot",
+    href: "#",
+    external: false,
+    labelKey: "community.bot" as const,
+    color: "#2563eb",
+    hoverColor: "#1d4ed8",
+    shadowColor: "rgba(37,99,235,0.35)",
+    icon: (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="white">
+        <path d="M20 9V7c0-1.1-.9-2-2-2h-3c0-1.66-1.34-3-3-3S9 3.34 9 5H6c-1.1 0-2 .9-2 2v2c-1.66 0-3 1.34-3 3s1.34 3 3 3v4c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2v-4c1.66 0 3-1.34 3-3s-1.34-3-3-3z" />
+      </svg>
+    ),
+  },
 ];
 
 export default function CommunityFloat() {
   const { t } = useLocale();
   const [open, setOpen] = useState(false);
-  const [visible, setVisible] = useState(false);
+  const visible = true;
   const ref = useRef<HTMLDivElement>(null);
 
-  // 滚动超过 300px 后显示
-  useEffect(() => {
-    const onScroll = () => setVisible(window.scrollY > 300);
-    onScroll();
-    window.addEventListener("scroll", onScroll, { passive: true });
-    return () => window.removeEventListener("scroll", onScroll);
-  }, []);
 
   // 点击外部关闭
   useEffect(() => {
@@ -89,7 +96,6 @@ export default function CommunityFloat() {
                   }}
                   className="flex items-center gap-2.5"
                 >
-                  {/* Tooltip label */}
                   <motion.span
                     initial={{ opacity: 0, x: 8 }}
                     animate={{ opacity: 1, x: 0 }}
@@ -105,7 +111,16 @@ export default function CommunityFloat() {
                     href={item.href}
                     target={item.external ? "_blank" : undefined}
                     rel={item.external ? "noopener noreferrer" : undefined}
-                    onClick={() => setOpen(false)}
+                    onClick={(event) => {
+                      if (item.id === "langbot") {
+                        event.preventDefault();
+                        document
+                          .querySelector<HTMLElement>("#langbot-widget-root")
+                          ?.shadowRoot?.querySelector<HTMLButtonElement>(".lb-bubble")
+                          ?.click();
+                      }
+                      setOpen(false);
+                    }}
                     className="flex items-center justify-center w-11 h-11 rounded-full transition-transform hover:scale-110 active:scale-95 cursor-pointer shadow-lg"
                     style={{
                       background: item.color,
