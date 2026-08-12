@@ -998,16 +998,20 @@ class _NavItemState extends State<_NavItem> {
                 ],
               ),
               const SizedBox(width: 8),
-              Text(
-                widget.label,
-                style: TextStyle(
-                  fontSize: 12.5,
-                  color: selected ? c.accent : c.textSecondary,
-                  fontWeight: selected ? FontWeight.w500 : FontWeight.normal,
+              Expanded(
+                child: Text(
+                  widget.label,
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    color: selected ? c.accent : c.textSecondary,
+                    fontWeight: selected ? FontWeight.w500 : FontWeight.normal,
+                  ),
                 ),
               ),
-              if (widget.count != null) ...[
-                const Spacer(),
+              if (widget.count != null) const SizedBox(width: 4),
+              if (widget.count != null)
                 Text(
                   widget.count.toString(),
                   style: TextStyle(
@@ -1016,7 +1020,6 @@ class _NavItemState extends State<_NavItem> {
                     fontFeatures: const [FontFeature.tabularFigures()],
                   ),
                 ),
-              ],
             ],
           ),
         ),

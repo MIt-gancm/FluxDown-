@@ -14,7 +14,7 @@ export const ANNOUNCEMENTS: Announcement[] = [
   {
     id: "pricing-vote-open",
     messageKey: "announcement.6",
-    link: "/pricing",
+    link: "/pricing/vote",
     date: "2026-07-29",
     active: true,
   },

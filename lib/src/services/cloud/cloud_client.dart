@@ -405,6 +405,51 @@ class CloudClient {
     return CloudProfile.fromJson(json);
   });
 
+  // ── 套餐 / 订单（微信 Native 扫码购买，见 local://pay-contract.md）───────
+
+  /// GET /plans/catalog：公开无鉴权，返回上架套餐（含活动价快照）。
+  Future<List<CloudPlan>> getPlansCatalog() async {
+    final json = await _request('GET', '/plans/catalog');
+    final list = json['value'] as List<dynamic>? ?? const [];
+    return list
+        .map((e) => CloudPlan.fromJson(e as Map<String, dynamic>))
+        .toList();
+  }
+
+  /// POST /orders：创建订单（同用户同套餐已有未过期 pending 订单时服务端直接复用返回）。
+  Future<CloudOrder> createOrder(String planCode, {String? deviceId}) =>
+      _authed(() async {
+        final json = await _request(
+          'POST',
+          '/orders',
+          body: {
+            'planCode': planCode,
+            if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+          },
+          authed: true,
+        );
+        return CloudOrder.fromJson(json);
+      });
+
+  /// GET /orders/{orderNo}：查询单个订单（仅本人），支付期间每 2s 轮询用。
+  Future<CloudOrder> getOrder(String orderNo) => _authed(() async {
+    final json = await _request(
+      'GET',
+      '/orders/${Uri.encodeComponent(orderNo)}',
+      authed: true,
+    );
+    return CloudOrder.fromJson(json);
+  });
+
+  /// GET /orders：本人订单列表，按创建时间倒序，最多 20 条。
+  Future<List<CloudOrder>> listOrders() => _authed(() async {
+    final json = await _request('GET', '/orders', authed: true);
+    final list = json['value'] as List<dynamic>? ?? const [];
+    return list
+        .map((e) => CloudOrder.fromJson(e as Map<String, dynamic>))
+        .toList();
+  });
+
   // ── 配置同步（Bearer UserAuth，401 自动刷新重放一次；SSE 事件流由
   //    ConfigSyncService 用独立 HttpClient 直连，不走本类）──────────────────
 

@@ -87,18 +87,27 @@ class Entitlements {
   Map<String, dynamic> toJson() => raw;
 }
 
-/// GET /me 响应：用户信息 + 套餐能力快照。
+/// GET /me 响应：用户信息 + 套餐能力快照 + 差价升级抵扣基数。
 class CloudProfile {
   final CloudUser user;
   final Entitlements entitlements;
 
-  const CloudProfile({required this.user, required this.entitlements});
+  /// 当前套餐的等效已付额（分）：购买更高档套餐时服务端按此抵扣；
+  /// 免费/后台授予用户为 0。
+  final int purchaseCreditMinor;
+
+  const CloudProfile({
+    required this.user,
+    required this.entitlements,
+    this.purchaseCreditMinor = 0,
+  });
 
   factory CloudProfile.fromJson(Map<String, dynamic> json) => CloudProfile(
     user: CloudUser.fromJson(json),
     entitlements: Entitlements.fromJson(
       json['entitlements'] as Map<String, dynamic>?,
     ),
+    purchaseCreditMinor: (json['purchaseCreditMinor'] as num?)?.toInt() ?? 0,
   );
 }
 
@@ -215,6 +224,199 @@ class CloudApiException implements Exception {
 
   @override
   String toString() => 'CloudApiException($status $code: $message)';
+}
+
+/// 套餐活动档位（对应服务端 campaign.stages[]）：早鸟/首发/原价等阶梯定价，
+/// [quota] 为该档位限量，null 表示不限量（通常是最后的"原价"档）。
+class CloudPlanCampaignStage {
+  final String label;
+  final int priceMinor;
+  final int? quota;
+
+  const CloudPlanCampaignStage({
+    required this.label,
+    required this.priceMinor,
+    this.quota,
+  });
+
+  factory CloudPlanCampaignStage.fromJson(Map<String, dynamic> json) =>
+      CloudPlanCampaignStage(
+        label: (json['label'] as String?) ?? '',
+        priceMinor: (json['priceMinor'] as num?)?.toInt() ?? 0,
+        quota: (json['quota'] as num?)?.toInt(),
+      );
+}
+
+/// 套餐限时活动（仅活动 active 时随 catalog 下发）：阶梯限量定价 + 当前生效价快照。
+class CloudPlanCampaign {
+  final String name;
+  final String? endAt;
+  final List<CloudPlanCampaignStage> stages;
+  final int soldTotal;
+  final List<int> stageSold;
+  final int currentStageIndex;
+  final int effectivePriceMinor;
+
+  const CloudPlanCampaign({
+    required this.name,
+    this.endAt,
+    required this.stages,
+    required this.soldTotal,
+    required this.stageSold,
+    required this.currentStageIndex,
+    required this.effectivePriceMinor,
+  });
+
+  factory CloudPlanCampaign.fromJson(Map<String, dynamic> json) {
+    final stages = (json['stages'] as List<dynamic>? ?? const [])
+        .map((e) => CloudPlanCampaignStage.fromJson(e as Map<String, dynamic>))
+        .toList();
+    final stageSold = (json['stageSold'] as List<dynamic>? ?? const [])
+        .map((e) => (e as num).toInt())
+        .toList();
+    return CloudPlanCampaign(
+      name: (json['name'] as String?) ?? '',
+      endAt: json['endAt'] as String?,
+      stages: stages,
+      soldTotal: (json['soldTotal'] as num?)?.toInt() ?? 0,
+      stageSold: stageSold,
+      currentStageIndex: (json['currentStageIndex'] as num?)?.toInt() ?? 0,
+      effectivePriceMinor: (json['effectivePriceMinor'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  /// 当前生效档位；[currentStageIndex] 越界（服务端数据异常）兜底 null，UI 需容错。
+  CloudPlanCampaignStage? get currentStage =>
+      currentStageIndex >= 0 && currentStageIndex < stages.length
+          ? stages[currentStageIndex]
+          : null;
+
+  /// 当前档位已售；[currentStageIndex] 越界兜底 0。
+  int get currentStageSold =>
+      currentStageIndex >= 0 && currentStageIndex < stageSold.length
+          ? stageSold[currentStageIndex]
+          : 0;
+}
+
+/// 上架套餐（GET /plans/catalog 响应元素，见契约 v1 CatalogPlanDto）。
+class CloudPlan {
+  final String code;
+  final String name;
+  final String description;
+  final String? badge;
+  final String icon;
+  final String color;
+  final int priceMinor;
+  final String currency;
+  final List<String> highlights;
+
+  /// 套餐能力集原始 json（同 [Entitlements] 的前向兼容设计，字段由服务端自由演进）。
+  final Map<String, dynamic> entitlementsRaw;
+  final int sort;
+  final CloudPlanCampaign? campaign;
+
+  const CloudPlan({
+    required this.code,
+    required this.name,
+    required this.description,
+    this.badge,
+    required this.icon,
+    required this.color,
+    required this.priceMinor,
+    required this.currency,
+    required this.highlights,
+    required this.entitlementsRaw,
+    required this.sort,
+    this.campaign,
+  });
+
+  factory CloudPlan.fromJson(Map<String, dynamic> json) => CloudPlan(
+    code: json['code'] as String,
+    name: (json['name'] as String?) ?? '',
+    description: (json['description'] as String?) ?? '',
+    badge: json['badge'] as String?,
+    icon: (json['icon'] as String?) ?? '',
+    color: (json['color'] as String?) ?? '',
+    priceMinor: (json['priceMinor'] as num?)?.toInt() ?? 0,
+    currency: (json['currency'] as String?) ?? 'CNY',
+    highlights: (json['highlights'] as List<dynamic>? ?? const [])
+        .map((e) => e as String)
+        .toList(),
+    entitlementsRaw:
+        (json['entitlements'] as Map<String, dynamic>?) ?? const {},
+    sort: (json['sort'] as num?)?.toInt() ?? 0,
+    campaign: json['campaign'] is Map<String, dynamic>
+        ? CloudPlanCampaign.fromJson(json['campaign'] as Map<String, dynamic>)
+        : null,
+  );
+
+  /// 实际成交价：活动生效价优先，否则套餐基础价（同契约「购买价」定义）。
+  int get effectivePriceMinor => campaign?.effectivePriceMinor ?? priceMinor;
+}
+
+/// 购买订单（POST/GET /orders 响应，见契约 v1 OrderDto）。[status] 取值
+/// pending | paid | failed | expired，见下方 isPending 等便捷 getter。
+class CloudOrder {
+  final String orderNo;
+  final String planCode;
+  final String planName;
+  final String status;
+  final int amountMinor;
+  final int listPriceMinor;
+
+  /// 差价升级抵扣额（分，0 = 全款单）；等效全款 = creditMinor + amountMinor。
+  final int creditMinor;
+  final String? upgradeFromPlan;
+  final String currency;
+  final String? campaignName;
+  final String? stageLabel;
+
+  /// 微信 Native 收款二维码内容；failed 时可能为 null。
+  final String? codeUrl;
+  final String createdAt;
+  final String? paidAt;
+  final String expiresAt;
+
+  const CloudOrder({
+    required this.orderNo,
+    required this.planCode,
+    required this.planName,
+    required this.status,
+    required this.amountMinor,
+    required this.listPriceMinor,
+    this.creditMinor = 0,
+    this.upgradeFromPlan,
+    required this.currency,
+    this.campaignName,
+    this.stageLabel,
+    this.codeUrl,
+    required this.createdAt,
+    this.paidAt,
+    required this.expiresAt,
+  });
+
+  factory CloudOrder.fromJson(Map<String, dynamic> json) => CloudOrder(
+    orderNo: json['orderNo'] as String,
+    planCode: json['planCode'] as String,
+    planName: (json['planName'] as String?) ?? '',
+    status: (json['status'] as String?) ?? 'pending',
+    amountMinor: (json['amountMinor'] as num?)?.toInt() ?? 0,
+    listPriceMinor: (json['listPriceMinor'] as num?)?.toInt() ?? 0,
+    creditMinor: (json['creditMinor'] as num?)?.toInt() ?? 0,
+    upgradeFromPlan: json['upgradeFromPlan'] as String?,
+    currency: (json['currency'] as String?) ?? 'CNY',
+    campaignName: json['campaignName'] as String?,
+    stageLabel: json['stageLabel'] as String?,
+    codeUrl: json['codeUrl'] as String?,
+    createdAt: (json['createdAt'] as String?) ?? '',
+    paidAt: json['paidAt'] as String?,
+    expiresAt: (json['expiresAt'] as String?) ?? '',
+  );
+
+  bool get isPending => status == 'pending';
+  bool get isPaid => status == 'paid';
+  bool get isFailed => status == 'failed';
+  bool get isExpired => status == 'expired';
 }
 
 /// 配置同步单条目（对应服务端 GET /sync/items 响应的 items[]，见契约 v1 数据模型）。

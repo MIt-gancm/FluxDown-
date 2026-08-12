@@ -206,6 +206,15 @@ export default defineConfig({
         access: "secret",
         optional: true,
       }),
+
+      // ── 可选：FluxCloud 云端服务根地址（无 /api 前缀）──
+      // /api/cloud/plans 经服务端中转拉取公开套餐目录 GET /api/v1/plans/catalog
+      FLUXCLOUD_API_BASE: envField.string({
+        context: "server",
+        access: "secret",
+        default: "http://127.0.0.1:8720",
+        optional: true,
+      }),
     },
   },
 });

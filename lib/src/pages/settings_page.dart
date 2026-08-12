@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:rinf/rinf.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import '../widgets/flux_sonner.dart';
 import '../../main.dart';
 import '../bindings/bindings.dart';
@@ -1036,13 +1037,19 @@ class _SettingsSidebarState extends State<_SettingsSidebar> {
                     ),
             )
           else
-            for (final cat in SettingsCategory.values)
-              _SettingsNavItem(
-                icon: cat.icon,
-                label: cat.localizedLabel,
-                isSelected: widget.selected == cat,
-                onTap: () => widget.onSelect(cat),
+            Expanded(
+              child: ListView(
+                children: [
+                  for (final cat in SettingsCategory.values)
+                    _SettingsNavItem(
+                      icon: cat.icon,
+                      label: cat.localizedLabel,
+                      isSelected: widget.selected == cat,
+                      onTap: () => widget.onSelect(cat),
+                    ),
+                ],
               ),
+            ),
         ],
       ),
     );
@@ -11351,6 +11358,39 @@ class _AccountContentState extends State<_AccountContent> {
     }
   }
 
+  /// 手动刷新云端全量信息（个人资料/套餐能力/抵扣基数 + 设备名册）。
+  bool _cloudRefreshing = false;
+
+  Future<void> _refreshCloudInfo() async {
+    if (_cloudRefreshing || !CloudAuthService.instance.isLoggedIn) return;
+    setState(() => _cloudRefreshing = true);
+    try {
+      await CloudAuthService.instance.refreshProfile();
+      await CloudAuthService.instance.fetchDevices();
+      if (!mounted) return;
+      FluxSonner.of(context).show(
+        ShadToast(
+          title: Text(LocaleScope.of(context).accountCloudRefreshDone),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      FluxSonner.of(context).show(
+        ShadToast.destructive(
+          title: Text(_cloudErrorText(LocaleScope.of(context), e)),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      FluxSonner.of(
+        context,
+      ).show(ShadToast.destructive(title: Text(e.toString())));
+    } finally {
+      if (mounted) setState(() => _cloudRefreshing = false);
+    }
+  }
+
   Future<void> _silentRefreshProfile() async {
     try {
       await CloudAuthService.instance.refreshProfile();
@@ -11696,6 +11736,38 @@ class _AccountContentState extends State<_AccountContent> {
           ),
         ),
         const SizedBox(width: 12),
+        // 手动刷新云端全量信息：资料/套餐/能力/抵扣 + 设备名册。
+        ShadTooltip(
+          builder: (_) => Text(s.accountCloudRefresh),
+          child: ShadIconButton.ghost(
+            icon: _cloudRefreshing
+                ? SizedBox(
+                    width: 14,
+                    height: 14,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 1.5,
+                      color: c.textSecondary,
+                    ),
+                  )
+                : Icon(
+                    LucideIcons.refreshCw,
+                    size: 14,
+                    color: c.textSecondary,
+                  ),
+            onPressed: _cloudRefreshing
+                ? null
+                : () => unawaited(_refreshCloudInfo()),
+          ),
+        ),
+        const SizedBox(width: 4),
+        // 套餐体系与配额随服务端演进，本地无法可靠判断"是否已是最高档"，故始终展示；
+        // 真正的可购性由购买对话框按 catalog 过滤，并把已拥有套餐标"当前套餐"。
+        ShadButton.outline(
+          size: ShadButtonSize.sm,
+          onPressed: () => _showPlanPurchaseDialog(context),
+          child: Text(s.accountPlanUpgrade),
+        ),
+        const SizedBox(width: 8),
         ShadButton.outline(
           size: ShadButtonSize.sm,
           onPressed: () => unawaited(CloudAuthService.instance.logout()),
@@ -11991,6 +12063,11 @@ String _cloudErrorText(S s, CloudApiException e) => switch (e.code) {
   'registration_closed' => s.accountErrorRegistrationClosed,
   'registration_incomplete' => s.accountErrorRegistrationIncomplete,
   'device_limit' => s.accountErrorDeviceLimit,
+  'payment_disabled' => s.accountPlanErrorPaymentDisabled,
+  'plan_not_purchasable' => s.accountPlanErrorNotPurchasable,
+  'plan_already_owned' => s.accountPlanErrorAlreadyOwned,
+  'gateway_error' => s.accountPlanErrorGateway,
+  'not_an_upgrade' => s.accountPlanErrorNotUpgrade,
   'validation_error' =>
     e.message.isNotEmpty ? e.message : s.accountErrorValidation,
   'network_error' => s.accountErrorNetwork,
@@ -12049,6 +12126,774 @@ void _showChangeEmailDialog(BuildContext context, String currentEmail) {
     builder: (_) => _ChangeEmailDialog(currentEmail: currentEmail),
   );
 }
+
+// ─────────────────────────────────────────────
+// 套餐购买（微信 Native 扫码，见 local://pay-contract.md）
+// ─────────────────────────────────────────────
+
+void _showPlanPurchaseDialog(BuildContext context) {
+  showShadDialog(
+    context: context,
+    barrierColor: AppColors.of(context).dialogBarrier,
+    animateIn: const [],
+    animateOut: const [],
+    builder: (_) => const _PlanPurchaseDialog(),
+  );
+}
+
+/// 套餐图标名（服务端 icon 字段，语义化名称）→ LucideIcons；未收录时兜底皇冠图标。
+IconData _planIcon(String name) => switch (name) {
+  'crown' => LucideIcons.crown,
+  'rocket' => LucideIcons.rocket,
+  'star' => LucideIcons.star,
+  'gem' => LucideIcons.gem,
+  'diamond' => LucideIcons.diamond,
+  'zap' => LucideIcons.zap,
+  'shield' => LucideIcons.shield,
+  'sparkles' => LucideIcons.sparkles,
+  _ => LucideIcons.crown,
+};
+
+/// "#RRGGBB"/"#AARRGGBB" → Color；格式非法返回 null，调用方自行兜底。
+Color? _tryParseHexColor(String hex) {
+  final h = hex.trim().replaceFirst('#', '');
+  if (h.length != 6 && h.length != 8) return null;
+  final value = int.tryParse(h, radix: 16);
+  if (value == null) return null;
+  return Color(h.length == 6 ? 0xFF000000 | value : value);
+}
+
+/// 分 → 元两位小数；CNY 显示 "¥" 前缀，其余货币显示代码前缀（见契约「金额展示」）。
+String _formatMinorAmount(int minor, String currency) {
+  final yuan = (minor / 100).toStringAsFixed(2);
+  return currency.toUpperCase() == 'CNY'
+      ? '¥$yuan'
+      : '${currency.toUpperCase()} $yuan';
+}
+
+/// mm:ss 倒计时文案。
+String _formatCountdown(int seconds) {
+  final clamped = seconds < 0 ? 0 : seconds;
+  final m = (clamped ~/ 60).toString().padLeft(2, '0');
+  final sec = (clamped % 60).toString().padLeft(2, '0');
+  return '$m:$sec';
+}
+
+/// 订单剩余支付秒数；[CloudOrder.expiresAt] 非法或已过期兜底 0。
+int _orderRemainingSeconds(CloudOrder order) {
+  final expires = DateTime.tryParse(order.expiresAt);
+  if (expires == null) return 0;
+  final diff = expires.toLocal().difference(DateTime.now());
+  return diff.isNegative ? 0 : diff.inSeconds;
+}
+
+enum _PlanPurchaseStep { select, paying, success }
+
+/// 购买套餐对话框：选套餐 → 微信扫码支付（2s 轮询订单状态）→ 结果。
+/// 风格同 [_LoginDialogContent]（ShadDialog + 局部 State，不进 CloudAuthService）。
+class _PlanPurchaseDialog extends StatefulWidget {
+  const _PlanPurchaseDialog();
+
+  @override
+  State<_PlanPurchaseDialog> createState() => _PlanPurchaseDialogState();
+}
+
+class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
+  _PlanPurchaseStep _step = _PlanPurchaseStep.select;
+
+  bool _loadingPlans = true;
+  List<CloudPlan> _plans = const [];
+  String? _loadError;
+
+  /// 选套餐步的横幅提示：订单过期/失败回退时展示，重新选套餐后清空。
+  String? _notice;
+
+  CloudPlan? _selected;
+  bool _creatingOrder = false;
+  String? _createError;
+
+  CloudOrder? _order;
+  Timer? _pollTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadPlans());
+    // 抵扣基数来自 /me（purchaseCreditMinor）：打开时刷一次保证升级价新鲜；
+    // 监听 auth service 以便刷新完成后重算各卡片的升级价。
+    CloudAuthService.instance.addListener(_onAuthChanged);
+    unawaited(
+      CloudAuthService.instance.refreshProfile().catchError((_) {
+        // 拉取失败按 0 抵扣展示，服务端下单时仍会按真实抵扣计算。
+      }),
+    );
+  }
+
+  void _onAuthChanged() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  void dispose() {
+    CloudAuthService.instance.removeListener(_onAuthChanged);
+    _pollTimer?.cancel();
+    super.dispose();
+  }
+
+  /// 可能在 initState 里被调用：此时不允许触碰 InheritedWidget（LocaleScope.of），
+  /// 错误文案一律用免 context 的 [currentS] 解析。
+  Future<void> _loadPlans() async {
+    setState(() {
+      _loadingPlans = true;
+      _loadError = null;
+    });
+    try {
+      final catalog = await CloudClient.instance.getPlansCatalog();
+      final purchasable =
+          catalog
+              .where((p) => p.code != 'free' && p.effectivePriceMinor > 0)
+              .toList()
+            ..sort((a, b) => a.sort.compareTo(b.sort));
+      if (!mounted) return;
+      setState(() {
+        _plans = purchasable;
+        _loadingPlans = false;
+      });
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingPlans = false;
+        _loadError = _cloudErrorText(currentS, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingPlans = false;
+        _loadError = e.toString();
+      });
+    }
+  }
+
+  Future<void> _purchase() async {
+    final selected = _selected;
+    if (selected == null || _creatingOrder) return;
+    final s = LocaleScope.of(context);
+    setState(() {
+      _creatingOrder = true;
+      _createError = null;
+    });
+    try {
+      final order = await CloudClient.instance.createOrder(
+        selected.code,
+        deviceId: DeviceIdentity.deviceId(),
+      );
+      if (!mounted) return;
+      setState(() {
+        _order = order;
+        _creatingOrder = false;
+        _step = _PlanPurchaseStep.paying;
+      });
+      _startPolling();
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _creatingOrder = false;
+        _createError = _cloudErrorText(s, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _creatingOrder = false;
+        _createError = e.toString();
+      });
+    }
+  }
+
+  void _startPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => unawaited(_poll()),
+    );
+  }
+
+  /// 每 2s 查单：paid → 刷新 /me 后进入成功态；expired/failed → 回到选套餐步
+  /// 并提示重新下单；网络抖动静默忽略、下一轮重试，其余 API 异常终止轮询并
+  /// 回退选套餐步展示错误文案。
+  Future<void> _poll() async {
+    final order = _order;
+    if (order == null) return;
+    final s = LocaleScope.of(context);
+    try {
+      final updated = await CloudClient.instance.getOrder(order.orderNo);
+      if (!mounted) return;
+      if (updated.isPaid) {
+        _pollTimer?.cancel();
+        setState(() => _order = updated);
+        try {
+          await CloudAuthService.instance.refreshProfile();
+        } catch (_) {
+          // 刷新失败不阻断成功态展示；plan chip 会在下次拉取时兜底更新。
+        }
+        if (!mounted) return;
+        setState(() => _step = _PlanPurchaseStep.success);
+      } else if (updated.isExpired || updated.isFailed) {
+        _pollTimer?.cancel();
+        setState(() {
+          _order = null;
+          _selected = null;
+          _step = _PlanPurchaseStep.select;
+          _notice = s.accountPlanOrderExpired;
+        });
+      } else {
+        setState(() => _order = updated);
+      }
+    } on CloudApiException catch (e) {
+      _pollTimer?.cancel();
+      if (!mounted) return;
+      setState(() {
+        _order = null;
+        _selected = null;
+        _step = _PlanPurchaseStep.select;
+        _notice = _cloudErrorText(s, e);
+      });
+    } catch (_) {
+      // 网络抖动：静默忽略，下一轮重试（同设备名册刷新的容错策略）。
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return switch (_step) {
+      _PlanPurchaseStep.select => _buildSelect(s, c),
+      _PlanPurchaseStep.paying => _buildPaying(s, c),
+      _PlanPurchaseStep.success => _buildSuccess(s, c),
+    };
+  }
+
+  Widget _buildSelect(S s, AppColors c) {
+    final currentPlan = CloudAuthService.instance.user?.plan;
+    // 标题与购买按钮分别经 titlePinned / actions(actionsPinned 缺省 true) 钉住，
+    // 只有套餐列表在 ShadDialog 内置滚动区内滚动——套餐再多也不会把按钮挤出视口。
+    return ShadDialog(
+      title: Text(s.accountPlanDialogTitle),
+      constraints: const BoxConstraints(maxWidth: 460, maxHeight: 580),
+      titlePinned: true,
+      actionsAxis: Axis.vertical,
+      actions: [
+        if (_createError != null)
+          SizedBox(
+            width: double.infinity,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: Text(
+                _createError!,
+                style: TextStyle(fontSize: 11.5, color: c.statusError),
+              ),
+            ),
+          ),
+        ShadButton(
+          width: double.infinity,
+          enabled: _selected != null && !_creatingOrder,
+          onPressed: _purchase,
+          child: _creatingOrder
+              ? SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.5,
+                    color: c.dialogBg,
+                  ),
+                )
+              : Text(s.accountPlanBuy),
+        ),
+      ],
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 4),
+          if (_notice != null) ...[
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              decoration: BoxDecoration(
+                color: c.statusWarning.withValues(alpha: 0.12),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Text(
+                _notice!,
+                style: TextStyle(fontSize: 11.5, color: c.statusWarning),
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+          _buildPlanList(s, c, currentPlan),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPlanList(S s, AppColors c, String? currentPlan) {
+    if (_loadingPlans) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 40),
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final loadError = _loadError;
+    if (loadError != null) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 24),
+        child: Column(
+          children: [
+            Icon(LucideIcons.circleAlert, size: 22, color: c.statusError),
+            const SizedBox(height: 8),
+            Text(
+              loadError,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+            const SizedBox(height: 10),
+            ShadButton.outline(
+              size: ShadButtonSize.sm,
+              onPressed: () => unawaited(_loadPlans()),
+              child: Text(s.accountDevicesRetry),
+            ),
+          ],
+        ),
+      );
+    }
+    if (_plans.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 40),
+        child: Center(
+          child: Text(
+            s.accountPlanEmpty,
+            style: TextStyle(fontSize: 12.5, color: c.textMuted),
+          ),
+        ),
+      );
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        for (final plan in _plans) ...[
+          _PlanCard(
+            plan: plan,
+            isCurrent: plan.code == currentPlan,
+            isSelected: _selected?.code == plan.code,
+            creditMinor: CloudAuthService.instance.purchaseCreditMinor,
+            onTap: () => setState(() {
+              _selected = plan;
+              _notice = null;
+            }),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildPaying(S s, AppColors c) {
+    final order = _order!;
+    final remaining = _orderRemainingSeconds(order);
+    final codeUrl = order.codeUrl;
+    return ShadDialog(
+      title: Text(s.accountPlanPayingTitle),
+      constraints: const BoxConstraints(maxWidth: 360),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 4),
+          // 白底容器：暗色主题下二维码前景/背景对比不足会导致扫码失败，
+          // 强制白底 + 内边距不受外层主题影响。
+          Container(
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(12),
+            ),
+            child: codeUrl != null && codeUrl.isNotEmpty
+                ? QrImageView(
+                    data: codeUrl,
+                    size: 180,
+                    backgroundColor: Colors.white,
+                    padding: EdgeInsets.zero,
+                  )
+                : SizedBox(
+                    width: 180,
+                    height: 180,
+                    child: Center(
+                      child: Icon(
+                        LucideIcons.qrCode,
+                        size: 40,
+                        color: c.textMuted,
+                      ),
+                    ),
+                  ),
+          ),
+          const SizedBox(height: 14),
+          Text(
+            _formatMinorAmount(order.amountMinor, order.currency),
+            style: TextStyle(
+              fontSize: 22,
+              fontWeight: FontWeight.w700,
+              color: c.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 6),
+          if (order.creditMinor > 0) ...[
+            const SizedBox(height: 4),
+            Text(
+              s.accountPlanCreditApplied(
+                _formatMinorAmount(order.creditMinor, order.currency),
+              ),
+              style: TextStyle(fontSize: 11, color: c.textMuted),
+            ),
+            const SizedBox(height: 2),
+          ],
+          Text(
+            s.accountPlanScanHint,
+            style: TextStyle(fontSize: 12, color: c.textMuted),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            s.accountPlanExpiresIn(_formatCountdown(remaining)),
+            style: TextStyle(
+              fontSize: 11,
+              color: remaining <= 0 ? c.statusError : c.textMuted,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSuccess(S s, AppColors c) {
+    return ShadDialog(
+      constraints: const BoxConstraints(maxWidth: 340),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 4),
+          Icon(LucideIcons.circleCheck, size: 40, color: c.statusSuccess),
+          const SizedBox(height: 12),
+          Text(
+            s.accountPlanPaidSuccess,
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w600,
+              color: c.textPrimary,
+            ),
+          ),
+          const SizedBox(height: 16),
+          ShadButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: Text(s.close),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 单个套餐卡片：名称/badge/描述/highlights/价格；有活动时展示活动价+原价划线+
+/// 档位 label + 限量进度；已拥有的套餐标"当前套餐"且不可点选。
+class _PlanCard extends StatelessWidget {
+  final CloudPlan plan;
+  final bool isCurrent;
+  final bool isSelected;
+
+  /// 差价升级抵扣基数（当前套餐等效已付额，分）；0 = 无抵扣。
+  final int creditMinor;
+  final VoidCallback onTap;
+
+  const _PlanCard({
+    required this.plan,
+    required this.isCurrent,
+    required this.isSelected,
+    required this.creditMinor,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+    final planColor = _tryParseHexColor(plan.color) ?? c.accent;
+    final campaign = plan.campaign;
+    final stage = campaign?.currentStage;
+    final active = isSelected && !isCurrent;
+    // 目标价不高于已付额 = 非升级（服务端 not_an_upgrade 同口径），置灰不可选。
+    final blocked =
+        !isCurrent && creditMinor > 0 && plan.effectivePriceMinor <= creditMinor;
+    final disabled = isCurrent || blocked;
+    return Opacity(
+      opacity: disabled ? 0.6 : 1,
+      child: GestureDetector(
+        onTap: disabled ? null : onTap,
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          padding: const EdgeInsets.all(12),
+          decoration: BoxDecoration(
+            color: active ? m.soft(c.accent) : c.surface1,
+            borderRadius: m.brCard,
+            border: Border.all(
+              color: active ? c.accent : m.borderFade(c.border),
+              width: active ? 1.5 : 1,
+            ),
+          ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Container(
+                    width: 28,
+                    height: 28,
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: planColor.withValues(alpha: 0.14),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Icon(
+                      _planIcon(plan.icon),
+                      size: 15,
+                      color: planColor,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Wrap(
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      spacing: 6,
+                      runSpacing: 4,
+                      children: [
+                        Text(
+                          plan.name,
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.w600,
+                            color: c.textPrimary,
+                          ),
+                        ),
+                        if (plan.badge != null && plan.badge!.isNotEmpty)
+                          _PlanTag(
+                            text: plan.badge!,
+                            color: c.accent,
+                            background: c.accent.withValues(alpha: 0.14),
+                          ),
+                        if (isCurrent)
+                          _PlanTag(
+                            text: s.accountPlanCurrent,
+                            color: c.textMuted,
+                            background: c.surface2,
+                          ),
+                        if (blocked)
+                          _PlanTag(
+                            text: s.accountPlanLowerTier,
+                            color: c.textMuted,
+                            background: c.surface2,
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _PlanPrice(
+                    plan: plan,
+                    stage: stage,
+                    creditMinor: isCurrent || blocked ? 0 : creditMinor,
+                  ),
+                ],
+              ),
+              if (plan.description.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Text(
+                  plan.description,
+                  style: TextStyle(fontSize: 11.5, color: c.textMuted),
+                ),
+              ],
+              if (plan.highlights.isNotEmpty) ...[
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final h in plan.highlights)
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 7,
+                          vertical: 3,
+                        ),
+                        decoration: BoxDecoration(
+                          color: c.surface2,
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          h,
+                          style: TextStyle(
+                            fontSize: 10.5,
+                            color: c.textSecondary,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ],
+              if (campaign != null && stage != null && stage.quota != null) ...[
+                const SizedBox(height: 10),
+                _CampaignProgress(campaign: campaign, stage: stage),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlanTag extends StatelessWidget {
+  final String text;
+  final Color color;
+  final Color background;
+
+  const _PlanTag({
+    required this.text,
+    required this.color,
+    required this.background,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        text,
+        style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.w600, color: color),
+      ),
+    );
+  }
+}
+
+/// 价格块：大字实付价（有抵扣时 = 生效价 − 抵扣额），其下依次可见
+/// 划线原价（活动或抵扣时）、档位 label、抵扣说明。
+class _PlanPrice extends StatelessWidget {
+  final CloudPlan plan;
+  final CloudPlanCampaignStage? stage;
+
+  /// 差价升级抵扣额（分）；0 = 全款展示。
+  final int creditMinor;
+
+  const _PlanPrice({required this.plan, this.stage, this.creditMinor = 0});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final hasCampaign = plan.campaign != null;
+    final hasCredit = creditMinor > 0;
+    final payable = plan.effectivePriceMinor - creditMinor;
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          _formatMinorAmount(hasCredit ? payable : plan.effectivePriceMinor,
+              plan.currency),
+          style: TextStyle(
+            fontSize: 15,
+            fontWeight: FontWeight.w700,
+            color: c.accent,
+          ),
+        ),
+        // 划线价：抵扣时划生效价（活动价），否则活动时划套餐基础价。
+        if (hasCredit)
+          Text(
+            _formatMinorAmount(plan.effectivePriceMinor, plan.currency),
+            style: TextStyle(
+              fontSize: 10.5,
+              color: c.textMuted,
+              decoration: TextDecoration.lineThrough,
+            ),
+          )
+        else if (hasCampaign)
+          Text(
+            _formatMinorAmount(plan.priceMinor, plan.currency),
+            style: TextStyle(
+              fontSize: 10.5,
+              color: c.textMuted,
+              decoration: TextDecoration.lineThrough,
+            ),
+          ),
+        if (hasCampaign && stage != null && stage!.label.isNotEmpty)
+          Text(
+            stage!.label,
+            style: TextStyle(fontSize: 9.5, color: c.textMuted),
+          ),
+        if (hasCredit)
+          Text(
+            s.accountPlanCreditApplied(
+              _formatMinorAmount(creditMinor, plan.currency),
+            ),
+            style: TextStyle(fontSize: 9.5, color: c.textMuted),
+          ),
+      ],
+    );
+  }
+}
+
+/// 活动限量档位进度：进度条 + "已售 x/quota" 文案。
+class _CampaignProgress extends StatelessWidget {
+  final CloudPlanCampaign campaign;
+  final CloudPlanCampaignStage stage;
+
+  const _CampaignProgress({required this.campaign, required this.stage});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+    final quota = stage.quota!;
+    final sold = campaign.currentStageSold;
+    final ratio = quota <= 0 ? 1.0 : (sold / quota).clamp(0.0, 1.0);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ClipRRect(
+          borderRadius: m.brXs,
+          child: LinearProgressIndicator(
+            value: ratio,
+            backgroundColor: c.surface2,
+            valueColor: AlwaysStoppedAnimation<Color>(c.accent),
+            minHeight: 4,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          s.accountPlanLimitedSold(sold, quota),
+          style: TextStyle(fontSize: 10, color: c.textMuted),
+        ),
+      ],
+    );
+  }
+}
+
 
 // ─────────────────────────────────────────────
 // 服务器地址设置
