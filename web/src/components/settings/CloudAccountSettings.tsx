@@ -75,6 +75,29 @@ function isValidOriginId(n: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// 昵称自助修改：错误码 → 本地化文案，独立于 CLOUD_ERROR_KEYS（登录/注册场景）。
+// ---------------------------------------------------------------------------
+
+const NICKNAME_ERROR_KEYS: Record<string, I18nKey> = {
+  validation_error: 'cloud.err.nicknameInvalid',
+}
+
+function nicknameErrorText(t: (key: I18nKey, params?: Record<string, string | number>) => string, err: unknown): string {
+  if (err instanceof CloudApiError) {
+    const key = NICKNAME_ERROR_KEYS[err.code]
+    if (key) return t(key)
+    return err.message || t('cloud.err.unknown')
+  }
+  return t('cloud.err.network')
+}
+
+/** 昵称规则（契约）：trim 后 1-32 字符。 */
+function isValidNickname(v: string): boolean {
+  const trimmed = v.trim()
+  return trimmed.length > 0 && trimmed.length <= 32
+}
+
+// ---------------------------------------------------------------------------
 // 平台标签：契约已知取值 windows|macos|linux|android|ios|web，未知值原样展示。
 // ---------------------------------------------------------------------------
 
@@ -657,6 +680,9 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
   const qc = useQueryClient()
   const [loggingOut, setLoggingOut] = useState(false)
   const [originIdEditOpen, setOriginIdEditOpen] = useState(false)
+  const [nicknameEditOpen, setNicknameEditOpen] = useState(false)
+  const [nicknameRevealed, setNicknameRevealed] = useState(false)
+  const [nicknameHovering, setNicknameHovering] = useState(false)
   const displayName = user.nickname || user.email.split('@')[0]
 
   // 套餐能力 + 自助修改机会是否已用掉：GET /me 独立拉取（登录/刷新响应的 entitlements
@@ -689,12 +715,40 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
     setOriginIdEditOpen(false)
   }
 
+  // 昵称修改成功：同步会话快照（驱动展示名立即刷新）+ 更新 me 查询缓存，关闭对话框
+  // 交由 NicknameEditDialog 自身在 onChanged 后统一处理。
+  function handleNicknameChanged(profile: CloudProfile) {
+    updateCloudUser({ nickname: profile.nickname })
+    qc.setQueryData(ME_QUERY_KEY, profile)
+    setNicknameEditOpen(false)
+  }
+
   return (
     <>
       <div className="set-group">
         <div className="flex items-center gap-3 p-4">
-          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
-            <b className="text-[14px] font-semibold">{displayName}</b>
+          <div
+            className="flex min-w-0 flex-1 flex-wrap items-center gap-2"
+            onMouseEnter={() => setNicknameHovering(true)}
+            onMouseLeave={() => setNicknameHovering(false)}
+          >
+            <b
+              className="cursor-pointer text-[14px] font-semibold"
+              onClick={() => setNicknameRevealed((v) => !v)}
+            >
+              {displayName}
+            </b>
+            {nicknameRevealed || nicknameHovering ? (
+              <button
+                type="button"
+                className="icon-btn sm flex-shrink-0"
+                title={t('cloud.nicknameEditBtn')}
+                aria-label={t('cloud.nicknameEditBtn')}
+                onClick={() => setNicknameEditOpen(true)}
+              >
+                <Pencil size={14} />
+              </button>
+            ) : null}
             {user.plan ? (
               <span className="rounded-full bg-accent-weak px-2 py-0.5 text-[10.5px] font-semibold text-accent">{user.plan}</span>
             ) : null}
@@ -727,6 +781,12 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
       </div>
       <DeviceListSection />
       <OriginIdEditDialog open={originIdEditOpen} onClose={() => setOriginIdEditOpen(false)} onChanged={handleOriginIdChanged} />
+      <NicknameEditDialog
+        open={nicknameEditOpen}
+        currentNickname={user.nickname}
+        onClose={() => setNicknameEditOpen(false)}
+        onChanged={handleNicknameChanged}
+      />
     </>
   )
 }
@@ -880,6 +940,111 @@ function OriginIdEditDialog({
                 <AlertTriangle size={13} className="mt-[1px] flex-shrink-0" />
                 {t('cloud.originIdEditWarning')}
               </p>
+              {error ? <p className="mt-2 text-[12px] text-danger">{error}</p> : null}
+            </div>
+            <footer className="dlg-foot">
+              <Dialog.Close asChild>
+                <button type="button" className="btn ghost">
+                  {t('common.cancel')}
+                </button>
+              </Dialog.Close>
+              <button type="submit" className="btn primary" disabled={changeMut.isPending || !value.trim()}>
+                {changeMut.isPending ? t('common.loading') : t('common.confirm')}
+              </button>
+            </footer>
+          </form>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+/** 昵称自助修改对话框：单文本输入 + 长度校验（trim 后 1-32 字符，服务端再校验一次）。
+ *  成功后把返回的最新 profile 经 onChanged 回传给调用方（LoggedInPanel 负责同步会话
+ *  快照 + 缓存 + 关闭对话框），本组件自身不持有“是否已提交成功”的全局状态。 */
+function NicknameEditDialog({
+  open,
+  currentNickname,
+  onClose,
+  onChanged,
+}: {
+  open: boolean
+  currentNickname: string
+  onClose: () => void
+  onChanged: (profile: CloudProfile) => void
+}) {
+  const { t } = useI18n()
+  const [value, setValue] = useState('')
+  const [error, setError] = useState('')
+
+  // 每次打开回填当前昵称，清空上次的错误。
+  useEffect(() => {
+    if (open) {
+      setValue(currentNickname)
+      setError('')
+    }
+  }, [open, currentNickname])
+
+  const changeMut = useMutation({
+    mutationFn: (nickname: string) => cloudApi.changeNickname(nickname),
+    onSuccess: (profile) => {
+      toast(t('cloud.nicknameEditSuccess'))
+      onChanged(profile)
+    },
+    onError: (err) => setError(nicknameErrorText(t, err)),
+  })
+
+  function confirm() {
+    const trimmed = value.trim()
+    if (!isValidNickname(trimmed)) {
+      setError(t('cloud.err.nicknameInvalid'))
+      return
+    }
+    setError('')
+    changeMut.mutate(trimmed)
+  }
+
+  return (
+    <Dialog.Root
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) onClose()
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="wbackdrop show" />
+        <Dialog.Content className="dialog sm show" aria-describedby={undefined}>
+          <header className="dlg-head">
+            <Dialog.Title asChild>
+              <b>{t('cloud.nicknameEditTitle')}</b>
+            </Dialog.Title>
+            <Dialog.Close asChild>
+              <button type="button" className="icon-btn sm" aria-label={t('common.close')}>
+                <X size={16} />
+              </button>
+            </Dialog.Close>
+          </header>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              confirm()
+            }}
+          >
+            <div className="dlg-body">
+              <label className="field-label" htmlFor="nickname-edit-value">
+                {t('cloud.nicknameEditLabel')}
+              </label>
+              <input
+                id="nickname-edit-value"
+                className="text-input"
+                type="text"
+                autoFocus
+                maxLength={32}
+                placeholder={t('cloud.nicknameEditPlaceholder')}
+                value={value}
+                disabled={changeMut.isPending}
+                onChange={(e) => setValue(e.target.value)}
+              />
               {error ? <p className="mt-2 text-[12px] text-danger">{error}</p> : null}
             </div>
             <footer className="dlg-foot">

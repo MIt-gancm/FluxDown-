@@ -208,6 +208,10 @@ export const cloudApi = {
    *  409 origin_id_already_changed / 409 origin_id_taken。 */
   changeOriginId: (value: number) => authedRequest<CloudProfile>('PUT', '/me/origin-id', { originId: value }),
 
+  /** PUT /me/nickname：自助修改昵称(1-32 字符，服务端 trim 后校验)，成功返回与 GET /me
+   *  相同结构的最新 profile。 */
+  changeNickname: (nickname: string) => authedRequest<CloudProfile>('PUT', '/me/nickname', { nickname }),
+
   /** GET /devices：当前用户名下已信任设备，按 lastSeenAt 降序。 */
   devices: () => authedRequest<DevicesResponse>('GET', '/devices'),
 

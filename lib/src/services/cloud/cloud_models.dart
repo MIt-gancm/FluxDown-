@@ -41,6 +41,10 @@ class CloudUser {
   /// PUT /me/origin-id）；缺省 false（老快照/未激活用户）。
   final bool originIdChanged;
 
+  /// 当前套餐下的会员编号（v1.4 新增）：仅当当前套餐 badgeNumbered=true 且
+  /// 已分配时非空；切换套餐后变回 null（服务端行为，客户端不缓存推导）。
+  final int? membershipOrdinal;
+
   const CloudUser({
     required this.id,
     required this.email,
@@ -51,6 +55,7 @@ class CloudUser {
     this.lastLoginAt,
     this.originId,
     this.originIdChanged = false,
+    this.membershipOrdinal,
   });
 
   factory CloudUser.fromJson(Map<String, dynamic> json) => CloudUser(
@@ -63,6 +68,7 @@ class CloudUser {
     lastLoginAt: json['lastLoginAt'] as String?,
     originId: (json['originId'] as num?)?.toInt(),
     originIdChanged: (json['originIdChanged'] as bool?) ?? false,
+    membershipOrdinal: (json['membershipOrdinal'] as num?)?.toInt(),
   );
 
   Map<String, dynamic> toJson() => {
@@ -75,6 +81,7 @@ class CloudUser {
     'lastLoginAt': lastLoginAt,
     'originId': originId,
     'originIdChanged': originIdChanged,
+    'membershipOrdinal': membershipOrdinal,
   };
 }
 
@@ -331,6 +338,21 @@ class CloudPlan {
   final String? badge;
   final String icon;
   final String color;
+
+  /// 徽标视觉样式（v1.4 新增，服务端 admin_plans.rs::BADGE_STYLES 白名单）：
+  /// outline | solid | medal | ribbon。缺省 'outline'（兼容旧快照/未知值）。
+  final String badgeStyle;
+
+  /// 徽标专用强调色（v1.4 新增，独立于套餐整体识别色 [color]）。缺省空串时
+  /// 渲染方应回退到 [color] 或主题 accent。
+  final String badgeColor;
+
+  /// 徽标是否追加会员编号（v1.4 新增，配合 [CloudUser.membershipOrdinal]）。
+  final bool badgeNumbered;
+
+  /// 会员编号补零位数（v1.4 新增，1-6，缺省 4）。
+  final int badgeNumberDigits;
+
   final int priceMinor;
   final String currency;
   final List<String> highlights;
@@ -347,6 +369,10 @@ class CloudPlan {
     this.badge,
     required this.icon,
     required this.color,
+    this.badgeStyle = 'outline',
+    this.badgeColor = '',
+    this.badgeNumbered = false,
+    this.badgeNumberDigits = 4,
     required this.priceMinor,
     required this.currency,
     required this.highlights,
@@ -362,6 +388,10 @@ class CloudPlan {
     badge: json['badge'] as String?,
     icon: (json['icon'] as String?) ?? '',
     color: (json['color'] as String?) ?? '',
+    badgeStyle: (json['badgeStyle'] as String?) ?? 'outline',
+    badgeColor: (json['badgeColor'] as String?) ?? '',
+    badgeNumbered: (json['badgeNumbered'] as bool?) ?? false,
+    badgeNumberDigits: (json['badgeNumberDigits'] as num?)?.toInt() ?? 4,
     priceMinor: (json['priceMinor'] as num?)?.toInt() ?? 0,
     currency: (json['currency'] as String?) ?? 'CNY',
     highlights: (json['highlights'] as List<dynamic>? ?? const [])

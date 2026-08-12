@@ -20,12 +20,101 @@ interface CloudPlan {
   name: string;
   description: string;
   badge: string | null;
+  badgeStyle: string;
+  badgeColor: string;
+  badgeNumbered: boolean;
+  badgeNumberDigits: number;
   icon: string;
   color: string;
   priceMinor: number;
   currency: string;
   highlights: string[];
   campaign: CloudCampaign | null;
+}
+
+/** 徽标前置图标：认证/勋章语义的简笔圆形对勾，纯描边，不依赖渐变。 */
+function BadgeCheckIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={`shrink-0 ${className ?? ""}`}
+    >
+      <circle cx="12" cy="12" r="9" />
+      <path d="m8.5 12.5 2.5 2.5 4.5-5" />
+    </svg>
+  );
+}
+
+/**
+ * 套餐徽标（行内 pill）：按 badgeStyle 渲染 outline / solid / medal 三种形态，
+ * 颜色一律来自 badgeColor（Tailwind 任意值类无法覆盖运营自定义 hex，必须内联 style）。
+ * ribbon 需要卡片级绝对定位，这里返回 null，改由 PlanBadgeRibbon 在卡片容器渲染，
+ * 避免重复展示。官网无登录态/个人编号上下文：badgeNumbered 即使为 true 也不展示
+ * 具体编号，只展示徽标文案本身。
+ */
+function PlanBadgePill({ plan }: { plan: CloudPlan }) {
+  if (!plan.badge || plan.badgeStyle === "ribbon") return null;
+  const color = plan.badgeColor;
+  const label = plan.badge;
+
+  if (plan.badgeStyle === "solid") {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold text-white"
+        style={{ backgroundColor: color }}
+      >
+        <BadgeCheckIcon />
+        {label}
+      </span>
+    );
+  }
+
+  if (plan.badgeStyle === "medal") {
+    return (
+      <span
+        className="inline-flex items-stretch overflow-hidden rounded-full border text-[11px] font-semibold"
+        style={{ borderColor: color }}
+      >
+        <span className="flex items-center px-1.5 text-white" style={{ backgroundColor: color }}>
+          <BadgeCheckIcon />
+        </span>
+        <span className="flex items-center px-2 py-0.5" style={{ color, backgroundColor: `${color}1a` }}>
+          {label}
+        </span>
+      </span>
+    );
+  }
+
+  // outline：默认样式的强化版，更粗描边 + 图标
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full border-[1.5px] px-2.5 py-0.5 text-[11px] font-semibold"
+      style={{ borderColor: color, color, backgroundColor: `${color}1a` }}
+    >
+      <BadgeCheckIcon />
+      {label}
+    </span>
+  );
+}
+
+/** ribbon 样式：卡片右上角斜切色带，依赖卡片容器自身的 relative + overflow-hidden。 */
+function PlanBadgeRibbon({ plan }: { plan: CloudPlan }) {
+  if (!plan.badge || plan.badgeStyle !== "ribbon") return null;
+  return (
+    <div
+      className="pointer-events-none absolute right-[-34px] top-[14px] z-10 w-[130px] rotate-45 py-1 text-center text-[10px] font-bold tracking-wide text-white shadow-sm"
+      style={{ backgroundColor: plan.badgeColor }}
+    >
+      {plan.badge}
+    </div>
+  );
 }
 
 function formatPrice(minor: number, currency: string, locale: string): string {
@@ -197,6 +286,7 @@ export default function PricingPage() {
                       : "border-dark-border bg-dark-surface1/30"
                   }`}
                 >
+                  <PlanBadgeRibbon plan={plan} />
                   {/* 活动横幅：占据卡片顶部整条，避免碎片化徽章堆叠 */}
                   {c && (
                     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-6 sm:px-8 py-2.5 bg-brand-sky/10 border-b border-brand-sky/20 text-xs">
@@ -219,11 +309,7 @@ export default function PricingPage() {
                   <div className="flex flex-col flex-1 p-6 sm:p-8">
                     <div className="flex items-center gap-2.5">
                       <h2 className="text-lg font-semibold text-dark-text">{plan.name}</h2>
-                      {plan.badge && (
-                        <span className="rounded-full border border-brand-sky/30 bg-brand-sky/10 px-2.5 py-0.5 text-[11px] font-semibold text-brand-sky">
-                          {plan.badge}
-                        </span>
-                      )}
+                      {plan.badge && <PlanBadgePill plan={plan} />}
                     </div>
                     <div className="mt-4 flex items-baseline gap-2.5">
                       <span className="text-4xl font-bold tracking-tight text-dark-text tabular-nums">

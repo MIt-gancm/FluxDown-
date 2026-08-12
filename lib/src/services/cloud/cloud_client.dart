@@ -436,6 +436,18 @@ class CloudClient {
     return CloudProfile.fromJson(json);
   });
 
+  /// PUT /me/nickname：提交新昵称（1-32 字符，服务端 trim 后校验），
+  /// 成功后返回最新用户资料（同 GET /me 结构）。
+  Future<CloudProfile> changeNickname(String nickname) => _authed(() async {
+    final json = await _request(
+      'PUT',
+      '/me/nickname',
+      body: {'nickname': nickname},
+      authed: true,
+    );
+    return CloudProfile.fromJson(json);
+  });
+
   // ── 套餐 / 订单（微信 Native 扫码购买，见 local://pay-contract.md）───────
 
   /// GET /plans/catalog：公开无鉴权，返回上架套餐（含活动价快照）。

@@ -11365,6 +11365,37 @@ class _AccountContentState extends State<_AccountContent> {
       _cloudProfileRefreshedThisSession = true;
       unawaited(_silentRefreshProfile());
     }
+    // 账户头徽标渲染用套餐目录快照：公开无鉴权接口，与登录态无关，页面挂载时
+    // 即拉取一次；不复用购买对话框内部的 _plans（那边按"可购买"过滤掉了免费
+    // 档，这里需要能匹配到当前套餐哪怕是免费档）。
+    unawaited(_loadCatalogPlans());
+  }
+
+  /// 账户头徽标渲染用：套餐目录快照（未过滤）。拉取失败时保持为空列表，由
+  /// [_NicknameRow] 优雅降级为纯文本 pill，不影响页面其余部分。
+  List<CloudPlan> _catalogPlans = const [];
+
+  Future<void> _loadCatalogPlans() async {
+    try {
+      final catalog = await CloudClient.instance.getPlansCatalog();
+      if (!mounted) return;
+      setState(() => _catalogPlans = catalog);
+    } catch (e, stack) {
+      logError(
+        'CloudAuth',
+        'account header plan catalog fetch failed',
+        e,
+        stack,
+      );
+    }
+  }
+
+  /// 按套餐 code 查找目录中的 [CloudPlan]；未加载完成或未匹配到时返回 null。
+  CloudPlan? _planForCode(String code) {
+    for (final p in _catalogPlans) {
+      if (p.code == code) return p;
+    }
+    return null;
   }
 
   /// 手动刷新云端全量信息（个人资料/套餐能力/抵扣基数 + 设备名册）。
@@ -11668,41 +11699,14 @@ class _AccountContentState extends State<_AccountContent> {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Row(
-                children: [
-                  Flexible(
-                    child: Text(
-                      displayName,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.w600,
-                        color: c.textPrimary,
-                      ),
-                    ),
-                  ),
-                  if (user.plan.isNotEmpty) ...[
-                    const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: c.accent.withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Text(
-                        user.plan,
-                        style: TextStyle(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w600,
-                          color: c.accent,
-                        ),
-                      ),
-                    ),
-                  ],
-                ],
+              _NicknameRow(
+                displayName: displayName,
+                planCode: user.plan,
+                plan: _planForCode(user.plan),
+                membershipOrdinal: user.membershipOrdinal,
+                c: c,
+                s: s,
+                onEdit: () => _showNicknameEditDialog(context, user.nickname),
               ),
               const SizedBox(height: 6),
               // Origin ID 胶囊徽章：类 QQ 号的唯一数字身份，理论上登录态不会为 null
@@ -11840,6 +11844,135 @@ class _AccountContentState extends State<_AccountContent> {
       ShadToast(
         title: Text(LocaleScope.of(context).accountOriginIdCopied),
         duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+}
+
+/// 昵称 + 套餐徽标行：铅笔默认隐藏，仅在整行悬浮或点击昵称文字后才显示/保持可见，
+/// 避免常态下与徽标挤在一起显得杂乱；真正触发编辑对话框的是点击铅笔本身。
+class _NicknameRow extends StatefulWidget {
+  final String displayName;
+
+  /// 用户当前套餐 code（raw，即 [CloudUser.plan]）：既是"是否展示徽标"的存在性
+  /// 判据，也是 [plan] 匹配失败时的纯文本降级兜底（目录未加载完成/服务端暂无
+  /// 该 code 时不让徽标整个消失）。
+  final String planCode;
+
+  /// [planCode] 对应的套餐配置；null = 未匹配到，降级为旧的纯文本 pill。
+  final CloudPlan? plan;
+
+  /// 当前套餐下的会员编号；仅当 [plan] 非空且 badgeNumbered 时才会被使用。
+  final int? membershipOrdinal;
+  final AppColors c;
+  final S s;
+  final VoidCallback onEdit;
+
+  const _NicknameRow({
+    required this.displayName,
+    required this.planCode,
+    this.plan,
+    this.membershipOrdinal,
+    required this.c,
+    required this.s,
+    required this.onEdit,
+  });
+
+  @override
+  State<_NicknameRow> createState() => _NicknameRowState();
+}
+
+class _NicknameRowState extends State<_NicknameRow> {
+  bool _hovering = false;
+  bool _revealed = false;
+
+  /// 套餐徽标 pill：硬规则——是否渲染徽标唯一由 [CloudPlan.badge] 是否非空决定，
+  /// 为空（服务端未配置，如免费版/专业版）时返回 null，整行完全不出现任何徽标
+  /// （不用 name 兜底、不猜测样式）。[plan] 本身为 null（目录未加载完成/未匹配
+  /// 到该 code，纯数据可用性问题而非"该套餐无徽标"的设计意图）时降级为旧的纯
+  /// 文本 pill，展示原始 planCode，不崩溃。
+  Widget? _planPill() {
+    final plan = widget.plan;
+    if (plan == null) {
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+        decoration: BoxDecoration(
+          color: widget.c.accent.withValues(alpha: 0.12),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Text(
+          widget.planCode,
+          style: TextStyle(
+            fontSize: 10,
+            fontWeight: FontWeight.w600,
+            color: widget.c.accent,
+          ),
+        ),
+      );
+    }
+    final badge = plan.badge;
+    if (badge == null || badge.isEmpty) return null;
+    final badgeColor = _tryParseHexColor(plan.badgeColor) ?? widget.c.accent;
+    return _PlanTag(
+      text: _withMembershipOrdinal(
+        badge,
+        plan.badgeNumbered ? widget.membershipOrdinal : null,
+        plan.badgeNumberDigits,
+      ),
+      color: badgeColor,
+      background: badgeColor.withValues(alpha: 0.12),
+      style: plan.badgeStyle,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final showPencil = _hovering || _revealed;
+    final pill = _planPill();
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovering = true),
+      onExit: (_) => setState(() => _hovering = false),
+      child: Row(
+        children: [
+          Flexible(
+            child: GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              onTap: () => setState(() => _revealed = !_revealed),
+              child: Text(
+                widget.displayName,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                  color: widget.c.textPrimary,
+                ),
+              ),
+            ),
+          ),
+          if (pill != null) ...[
+            const SizedBox(width: 8),
+            pill,
+          ],
+          if (showPencil) ...[
+            const SizedBox(width: 4),
+            ShadTooltip(
+              effects: const [],
+              builder: (_) => Text(widget.s.accountNicknameEditTooltip),
+              child: MouseRegion(
+                cursor: SystemMouseCursors.click,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: widget.onEdit,
+                  child: Icon(
+                    LucideIcons.pencil,
+                    size: 12,
+                    color: widget.c.textMuted,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -12193,6 +12326,16 @@ void _showOriginIdEditDialog(BuildContext context, int? currentOriginId) {
   );
 }
 
+void _showNicknameEditDialog(BuildContext context, String currentNickname) {
+  showShadDialog(
+    context: context,
+    // FluxDown 弹出层无进出场动画（rule: shad-overlay-no-animation）。
+    animateIn: const [],
+    animateOut: const [],
+    builder: (_) => _NicknameEditDialog(currentNickname: currentNickname),
+  );
+}
+
 // ─────────────────────────────────────────────
 // 套餐购买（微信 Native 扫码，见 local://pay-contract.md）
 // ─────────────────────────────────────────────
@@ -12227,6 +12370,14 @@ Color? _tryParseHexColor(String hex) {
   final value = int.tryParse(h, radix: 16);
   if (value == null) return null;
   return Color(h.length == 6 ? 0xFF000000 | value : value);
+}
+
+/// 编号后缀：`{base} No.{编号补零至 digits 位}`；[ordinal] 为 null 时原样返回
+/// base（契约约定：编号只在能拿到具体编号的场景显示，不猜测/不占位）。
+String _withMembershipOrdinal(String base, int? ordinal, int digits) {
+  if (ordinal == null) return base;
+  final d = digits < 1 ? 1 : (digits > 6 ? 6 : digits);
+  return '$base No.${ordinal.toString().padLeft(d, '0')}';
 }
 
 /// 分 → 元两位小数；CNY 显示 "¥" 前缀，其余货币显示代码前缀（见契约「金额展示」）。
@@ -12557,6 +12708,7 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
             isCurrent: plan.code == currentPlan,
             isSelected: _selected?.code == plan.code,
             creditMinor: CloudAuthService.instance.purchaseCreditMinor,
+            membershipOrdinal: CloudAuthService.instance.user?.membershipOrdinal,
             onTap: () => setState(() {
               _selected = plan;
               _notice = null;
@@ -12681,6 +12833,10 @@ class _PlanCard extends StatelessWidget {
 
   /// 差价升级抵扣基数（当前套餐等效已付额，分）；0 = 无抵扣。
   final int creditMinor;
+
+  /// 当前用户在其当前套餐下的会员编号；仅当 [isCurrent] 且 plan.badgeNumbered
+  /// 时才会拼进徽标文案（非当前套餐卡片不猜测/不显示编号，见需求约束）。
+  final int? membershipOrdinal;
   final VoidCallback onTap;
 
   const _PlanCard({
@@ -12688,6 +12844,7 @@ class _PlanCard extends StatelessWidget {
     required this.isCurrent,
     required this.isSelected,
     required this.creditMinor,
+    this.membershipOrdinal,
     required this.onTap,
   });
 
@@ -12697,6 +12854,7 @@ class _PlanCard extends StatelessWidget {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
     final planColor = _tryParseHexColor(plan.color) ?? c.accent;
+    final badgeColor = _tryParseHexColor(plan.badgeColor) ?? c.accent;
     final campaign = plan.campaign;
     final stage = campaign?.currentStage;
     final active = isSelected && !isCurrent;
@@ -12758,9 +12916,16 @@ class _PlanCard extends StatelessWidget {
                         ),
                         if (plan.badge != null && plan.badge!.isNotEmpty)
                           _PlanTag(
-                            text: plan.badge!,
-                            color: c.accent,
-                            background: c.accent.withValues(alpha: 0.14),
+                            text: _withMembershipOrdinal(
+                              plan.badge!,
+                              isCurrent && plan.badgeNumbered
+                                  ? membershipOrdinal
+                                  : null,
+                              plan.badgeNumberDigits,
+                            ),
+                            color: badgeColor,
+                            background: badgeColor.withValues(alpha: 0.14),
+                            style: plan.badgeStyle,
                           ),
                         if (isCurrent)
                           _PlanTag(
@@ -12831,34 +12996,146 @@ class _PlanCard extends StatelessWidget {
   }
 }
 
+/// 套餐徽标/状态标签 pill。[style] 仅供"套餐徽标"场景使用（服务端
+/// admin_plans.rs::BADGE_STYLES 白名单：outline | solid | medal | ribbon）；
+/// "当前套餐"/"不可选" 等固定态标签不传该参数，走原有纯色胶囊（默认 'plain'）。
+/// 约束：全部纯色/描边/双色块渲染，不使用任何渐变。
 class _PlanTag extends StatelessWidget {
   final String text;
   final Color color;
   final Color background;
+  final String style;
 
   const _PlanTag({
     required this.text,
     required this.color,
     required this.background,
+    this.style = 'plain',
   });
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
-      decoration: BoxDecoration(
-        color: background,
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Text(
-        text,
-        style: TextStyle(
-          fontSize: 9.5,
-          fontWeight: FontWeight.w600,
-          color: color,
-        ),
-      ),
-    );
+    switch (style) {
+      case 'outline':
+        // 描边胶囊：粗描边 + 图标 + 浅色底（当前默认风格的强化版）。
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1.5),
+          decoration: BoxDecoration(
+            border: Border.all(color: color, width: 1.3),
+            color: color.withValues(alpha: 0.08),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(LucideIcons.crown, size: 9, color: color),
+              const SizedBox(width: 3),
+              Text(
+                text,
+                style: TextStyle(
+                  fontSize: 9.5,
+                  fontWeight: FontWeight.w600,
+                  color: color,
+                ),
+              ),
+            ],
+          ),
+        );
+      case 'solid':
+        // 实心胶囊：底色填充，白字，视觉权重最高，适合小空间一眼可见。
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1.5),
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text(
+            text,
+            style: const TextStyle(
+              fontSize: 9.5,
+              fontWeight: FontWeight.w700,
+              color: Colors.white,
+            ),
+          ),
+        );
+      case 'medal':
+        // 双色勋章式：左图标块（实心）+ 右文字块（描边），质感偏认证/勋章。
+        return Container(
+          clipBehavior: Clip.antiAlias,
+          decoration: BoxDecoration(
+            border: Border.all(color: color, width: 1),
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 5,
+                  vertical: 1.5,
+                ),
+                color: color,
+                child: const Icon(
+                  LucideIcons.crown,
+                  size: 9,
+                  color: Colors.white,
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 6,
+                  vertical: 1.5,
+                ),
+                child: Text(
+                  text,
+                  style: TextStyle(
+                    fontSize: 9.5,
+                    fontWeight: FontWeight.w600,
+                    color: color,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        );
+      case 'ribbon':
+        // 角标丝带本应贴在卡片右上角斜切展示（只适合有边角的卡片容器，不适合
+        // 行内 pill 场景，见需求文档）；此处简化为「实心 + 更粗字重 + 加宽字
+        // 距」近似，与 solid 拉开可辨识差异——这是有意的简化实现，非缺陷。
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 1.5),
+          decoration: BoxDecoration(
+            color: color,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text(
+            text,
+            style: const TextStyle(
+              fontSize: 9.5,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.6,
+              color: Colors.white,
+            ),
+          ),
+        );
+      case 'plain':
+      default:
+        return Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+          decoration: BoxDecoration(
+            color: background,
+            borderRadius: BorderRadius.circular(999),
+          ),
+          child: Text(
+            text,
+            style: TextStyle(
+              fontSize: 9.5,
+              fontWeight: FontWeight.w600,
+              color: color,
+            ),
+          ),
+        );
+    }
   }
 }
 
@@ -14419,6 +14696,115 @@ class _RenameDeviceDialogState extends State<_RenameDeviceDialog> {
     final c = AppColors.of(context);
     return ShadDialog(
       title: Text(s.accountDeviceRenameTitle),
+      constraints: const BoxConstraints(maxWidth: 360),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          ShadInput(
+            controller: _controller,
+            enabled: !_busy,
+            autofocus: true,
+            onSubmitted: (_) => _submit(),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              _error!,
+              style: TextStyle(fontSize: 11.5, color: c.statusError),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: ShadButton.outline(
+                  enabled: !_busy,
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text(s.cancel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ShadButton(
+                  enabled: !_busy,
+                  onPressed: _submit,
+                  child: Text(s.confirm),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _NicknameEditDialog extends StatefulWidget {
+  final String currentNickname;
+
+  const _NicknameEditDialog({required this.currentNickname});
+
+  @override
+  State<_NicknameEditDialog> createState() => _NicknameEditDialogState();
+}
+
+class _NicknameEditDialogState extends State<_NicknameEditDialog> {
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.currentNickname,
+  );
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final s = LocaleScope.of(context);
+    final nickname = _controller.text.trim();
+    if (nickname.isEmpty || nickname.length > 32) {
+      setState(() => _error = s.accountNicknameEditInvalid);
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await CloudAuthService.instance.changeNickname(nickname);
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      FluxSonner.of(context).show(
+        ShadToast(
+          title: Text(s.accountNicknameEditSuccess),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = _cloudErrorText(s, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return ShadDialog(
+      title: Text(s.accountNicknameEditTitle),
       constraints: const BoxConstraints(maxWidth: 360),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,

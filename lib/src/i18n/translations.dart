@@ -621,6 +621,10 @@ class S {
   String get accountErrorDeviceLimit => _r('accountErrorDeviceLimit');
   String get accountDeviceRenameTitle => _r('accountDeviceRenameTitle');
   String get accountDeviceRenameInvalid => _r('accountDeviceRenameInvalid');
+  String get accountNicknameEditTooltip => _r('accountNicknameEditTooltip');
+  String get accountNicknameEditTitle => _r('accountNicknameEditTitle');
+  String get accountNicknameEditInvalid => _r('accountNicknameEditInvalid');
+  String get accountNicknameEditSuccess => _r('accountNicknameEditSuccess');
   String get accountDeviceDeleteConfirmTitle =>
       _r('accountDeviceDeleteConfirmTitle');
   String get accountDeviceDeleteConfirmDesc =>

@@ -258,6 +258,16 @@ class CloudAuthService extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// 提交新昵称，成功后刷新本地用户/套餐能力快照。
+  Future<void> changeNickname(String nickname) async {
+    final profile = await CloudClient.instance.changeNickname(nickname);
+    _user = profile.user;
+    _entitlements = profile.entitlements;
+    _purchaseCreditMinor = profile.purchaseCreditMinor;
+    await _persistUser();
+    notifyListeners();
+  }
+
   // ── 设备管理 ─────────────────────────────────────────────────────────
 
   /// 拉取设备名册并更新缓存（设置页与侧栏共用；成功后 notifyListeners）。
