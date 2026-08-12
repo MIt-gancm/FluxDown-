@@ -39,10 +39,9 @@ class MainFlutterWindow: NSWindow {
         // 单例通过 static let 自持，弹窗窗口/引擎懒创建、常驻复用，不随本窗口生命周期回收。
         PopupWindowHost.shared.register(with: flutterViewController.engine.binaryMessenger)
 
-        // 主窗口恢复 + 应用菜单原生动作通道（macOS）— MethodChannel `com.fluxdown/window`。
-        // restore：托盘/悬浮球点击恢复窗口，走 AppDelegate 与 Dock 点击相同的
-        // 可靠激活序列（ignoringOtherApps: true），规避 window_manager
-        // show()/focus() 在 App 非前台时无法把窗口带到前台的问题。
+        // 主窗口托盘状态 + 应用菜单原生动作通道（macOS）— MethodChannel
+        // `com.fluxdown/window`。restore/hideToTray 成对切换 activation policy，
+        // 并由 AppDelegate 保证窗口可见性、Dock 和焦点的操作顺序。
         // hide/hideOthers/showAll/zoom/front/toggleFullScreen：Flutter 的
         // PlatformMenuItem 无法绑定 AppKit 标准 selector，应用菜单栏的这些
         // 系统动作经本通道转发（见 lib/main.dart _buildMacMenus）。
@@ -52,7 +51,36 @@ class MainFlutterWindow: NSWindow {
         ).setMethodCallHandler { [weak self] (_ call: FlutterMethodCall, result: @escaping FlutterResult) in
             switch call.method {
             case "restore":
-                (NSApp.delegate as? AppDelegate)?.restoreMainWindow()
+                guard let appDelegate = NSApp.delegate as? AppDelegate else {
+                    result(FlutterError(
+                        code: "window_delegate_unavailable",
+                        message: "AppDelegate is unavailable",
+                        details: nil))
+                    return
+                }
+                guard appDelegate.restoreMainWindow() else {
+                    result(FlutterError(
+                        code: "window_restore_failed",
+                        message: "Failed to restore the main window",
+                        details: nil))
+                    return
+                }
+                result(nil)
+            case "hideToTray":
+                guard let appDelegate = NSApp.delegate as? AppDelegate else {
+                    result(FlutterError(
+                        code: "window_delegate_unavailable",
+                        message: "AppDelegate is unavailable",
+                        details: nil))
+                    return
+                }
+                guard appDelegate.hideMainWindowToTray() else {
+                    result(FlutterError(
+                        code: "window_hide_to_tray_failed",
+                        message: "Failed to hide the main window to the tray",
+                        details: nil))
+                    return
+                }
                 result(nil)
             case "hide":
                 NSApp.hide(nil)

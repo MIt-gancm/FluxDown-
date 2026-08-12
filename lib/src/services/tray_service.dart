@@ -32,6 +32,11 @@ Future<void> restoreMainWindow() async {
     } catch (e, stack) {
       logError(_tag, 'native restore failed, falling back', e, stack);
     }
+    try {
+      await windowManager.setSkipTaskbar(false);
+    } catch (e, stack) {
+      logError(_tag, 'failed to restore macOS regular policy', e, stack);
+    }
   }
   await windowManager.show();
   await windowManager.focus();
@@ -247,7 +252,11 @@ class TrayService with TrayListener {
     }
   }
 
-  /// 隐藏窗口到托盘
+  /// 隐藏窗口到托盘。
+  ///
+  /// macOS 原生路径会在同一 AppKit 调用中先隐藏主窗口，再切换 accessory
+  /// activation policy，使 Dock 与应用菜单消失；通道不可用时降级到
+  /// window_manager 的等价操作。其它平台仅隐藏窗口。
   Future<void> hideToTray() async {
     logInfo(_tag, 'hideToTray called, _isExiting=$_isExiting');
     if (_isExiting) {
@@ -255,7 +264,19 @@ class TrayService with TrayListener {
       return;
     }
     try {
+      if (Platform.isMacOS) {
+        try {
+          await _macWindowChannel.invokeMethod<void>('hideToTray');
+          logInfo(_tag, 'hideToTray done (native)');
+          return;
+        } catch (e, stack) {
+          logError(_tag, 'native hideToTray failed, falling back', e, stack);
+        }
+      }
       await windowManager.hide();
+      if (Platform.isMacOS) {
+        await windowManager.setSkipTaskbar(true);
+      }
       logInfo(_tag, 'hideToTray done');
     } catch (e, stack) {
       logError(_tag, 'hideToTray error', e, stack);

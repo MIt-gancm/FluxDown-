@@ -28,11 +28,23 @@ class AppDelegate: FlutterAppDelegate, UNUserNotificationCenterDelegate {
     return false
   }
 
+  /// 隐藏主窗口并切换为仅菜单栏驻留的 accessory 应用。
+  ///
+  /// 必须先 orderOut 主窗口再隐藏 Dock，避免可见窗口短暂处于没有应用菜单的
+  /// accessory 状态。返回 false 时 Dart 侧会走 window_manager 降级路径。
+  @discardableResult
+  func hideMainWindowToTray() -> Bool {
+    guard let window = mainFlutterWindow else { return false }
+    window.orderOut(nil)
+    return NSApp.setActivationPolicy(.accessory)
+  }
+
   /// 可靠地把主窗口从「关闭到托盘」(orderOut) 或最小化恢复并置于前台。
   ///
   /// 供 Dock 点击 (applicationShouldHandleReopen) 与托盘/悬浮球点击
   /// (MethodChannel `com.fluxdown/window` → restore) 共用。
   ///
+  /// 先恢复 regular 策略，确保 Dock 与应用菜单在窗口出现前完成恢复。
   /// 不走 window_manager 的 show()/focus()：其 focus() 使用
   /// NSApp.activate(ignoringOtherApps: false)，在用户已切到别的 App 后
   /// 点击托盘时，macOS 13+ 常常不把本 App 带到前台，导致窗口 orderFront
@@ -40,8 +52,10 @@ class AppDelegate: FlutterAppDelegate, UNUserNotificationCenterDelegate {
   /// ignoringOtherApps: true 强制前台。
   /// 注意：不遍历 NSApp.windows —— 悬浮球 FloatingBallPanel 也在其中，
   /// 不能被激活聚焦。
-  func restoreMainWindow() {
-    guard let window = mainFlutterWindow else { return }
+  @discardableResult
+  func restoreMainWindow() -> Bool {
+    let policyRestored = NSApp.setActivationPolicy(.regular)
+    guard let window = mainFlutterWindow else { return false }
     if window.isMiniaturized {
       window.deminiaturize(nil)
     }
@@ -50,6 +64,7 @@ class AppDelegate: FlutterAppDelegate, UNUserNotificationCenterDelegate {
     }
     window.makeKeyAndOrderFront(self)
     NSApp.activate(ignoringOtherApps: true)
+    return policyRestored
   }
 
   override func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
