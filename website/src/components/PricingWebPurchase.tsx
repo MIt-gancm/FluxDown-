@@ -55,6 +55,7 @@ const ERROR_KEYS: Record<string, keyof Messages> = {
   plan_not_purchasable: "webbuy.err.notPurchasable",
   plan_already_owned: "webbuy.err.alreadyOwned",
   not_an_upgrade: "webbuy.err.notAnUpgrade",
+  plan_tier_not_higher: "webbuy.err.tierNotHigher",
   gateway_error: "webbuy.err.gateway",
   upstream_unreachable: "webbuy.err.gateway",
 };

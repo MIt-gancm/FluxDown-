@@ -490,6 +490,7 @@
   "accountPlanErrorPaymentDisabled": "支付功能暂未开放",
   "accountPlanErrorGateway": "支付网关请求失败，请稍后重试",
   "accountPlanErrorNotUpgrade": "已付金额不低于该套餐价格，无需差价购买",
+  "accountPlanErrorTierNotHigher": "已拥有更高档位套餐，买断制仅支持购买价格更高的套餐",
   "accountOriginIdEditTooltip": "修改 Origin ID",
   "accountOriginIdEditTitle": "修改 Origin ID",
   "accountOriginIdEditDesc": "选一个新的 Origin ID，也可以点骰子随机推荐一个。此操作仅可进行一次。",

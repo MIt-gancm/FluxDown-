@@ -690,6 +690,8 @@ class S {
       _r('accountPlanErrorPaymentDisabled');
   String get accountPlanErrorGateway => _r('accountPlanErrorGateway');
   String get accountPlanErrorNotUpgrade => _r('accountPlanErrorNotUpgrade');
+  String get accountPlanErrorTierNotHigher =>
+      _r('accountPlanErrorTierNotHigher');
   String get accountOriginIdEditTooltip => _r('accountOriginIdEditTooltip');
   String get accountOriginIdEditTitle => _r('accountOriginIdEditTitle');
   String get accountOriginIdEditDesc => _r('accountOriginIdEditDesc');

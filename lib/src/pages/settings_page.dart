@@ -12254,6 +12254,7 @@ String _cloudErrorText(S s, CloudApiException e) => switch (e.code) {
   'plan_already_owned' => s.accountPlanErrorAlreadyOwned,
   'gateway_error' => s.accountPlanErrorGateway,
   'not_an_upgrade' => s.accountPlanErrorNotUpgrade,
+  'plan_tier_not_higher' => s.accountPlanErrorTierNotHigher,
   'origin_id_taken' => s.accountOriginIdErrorTaken,
   'origin_id_already_changed' => s.accountOriginIdErrorAlreadyChanged,
   'origin_id_change_not_allowed' => s.accountOriginIdErrorNotAllowed,
@@ -12652,6 +12653,16 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
     );
   }
 
+  /// 已购套餐（含后台授予）的基准价（分）；[_plans] 未含该 code（如已下架）时按 0
+  /// 处理——与服务端 order.rs 的兜底口径一致，不做客户端主观拦截。
+  int _ownedPlanPriceMinor(String? code) {
+    if (code == null) return 0;
+    for (final plan in _plans) {
+      if (plan.code == code) return plan.priceMinor;
+    }
+    return 0;
+  }
+
   Widget _buildPlanList(S s, AppColors c, String? currentPlan) {
     if (_loadingPlans) {
       return const Padding(
@@ -12699,6 +12710,7 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
         ),
       );
     }
+    final ownedPriceMinor = _ownedPlanPriceMinor(currentPlan);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
@@ -12708,6 +12720,7 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
             isCurrent: plan.code == currentPlan,
             isSelected: _selected?.code == plan.code,
             creditMinor: CloudAuthService.instance.purchaseCreditMinor,
+            ownedPriceMinor: ownedPriceMinor,
             membershipOrdinal: CloudAuthService.instance.user?.membershipOrdinal,
             onTap: () => setState(() {
               _selected = plan;
@@ -12834,6 +12847,9 @@ class _PlanCard extends StatelessWidget {
   /// 差价升级抵扣基数（当前套餐等效已付额，分）；0 = 无抵扣。
   final int creditMinor;
 
+  /// 已购套餐（含后台授予，来源无关）的基准价（分）；0 = 免费/无套餐，不设升级门槛。
+  final int ownedPriceMinor;
+
   /// 当前用户在其当前套餐下的会员编号；仅当 [isCurrent] 且 plan.badgeNumbered
   /// 时才会拼进徽标文案（非当前套餐卡片不猜测/不显示编号，见需求约束）。
   final int? membershipOrdinal;
@@ -12844,6 +12860,7 @@ class _PlanCard extends StatelessWidget {
     required this.isCurrent,
     required this.isSelected,
     required this.creditMinor,
+    required this.ownedPriceMinor,
     this.membershipOrdinal,
     required this.onTap,
   });
@@ -12858,11 +12875,16 @@ class _PlanCard extends StatelessWidget {
     final campaign = plan.campaign;
     final stage = campaign?.currentStage;
     final active = isSelected && !isCurrent;
+    // 买断制「只可升不可降」：已购套餐（不论购买/后台授予）基准价不低于本套餐基准价即
+    // 不可购买——与获得方式无关，服务端 order.rs 同口径拦截（plan_tier_not_higher）。
+    final tierBlocked =
+        !isCurrent && ownedPriceMinor > 0 && plan.priceMinor <= ownedPriceMinor;
     // 目标价不高于已付额 = 非升级（服务端 not_an_upgrade 同口径），置灰不可选。
-    final blocked =
+    final creditBlocked =
         !isCurrent &&
         creditMinor > 0 &&
         plan.effectivePriceMinor <= creditMinor;
+    final blocked = tierBlocked || creditBlocked;
     final disabled = isCurrent || blocked;
     return Opacity(
       opacity: disabled ? 0.6 : 1,

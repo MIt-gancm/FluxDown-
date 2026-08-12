@@ -146,6 +146,7 @@
   "webbuy.err.notPurchasable": "This plan is not available for purchase",
   "webbuy.err.alreadyOwned": "This account already owns the plan",
   "webbuy.err.notAnUpgrade": "The amount already paid covers this plan — no purchase needed",
+  "webbuy.err.tierNotHigher": "You already own a higher-tier plan — buyout plans only support purchasing a higher-priced tier",
   "webbuy.err.gateway": "Payment gateway request failed, please try again later",
   "webbuy.err.expired": "Order expired, please start over",
   "webbuy.err.failed": "Payment failed, please start over",

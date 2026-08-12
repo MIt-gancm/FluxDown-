@@ -490,6 +490,7 @@
   "accountPlanErrorPaymentDisabled": "Payments are currently unavailable",
   "accountPlanErrorGateway": "Payment gateway request failed, please try again later",
   "accountPlanErrorNotUpgrade": "Your paid amount already covers this plan's price — no upgrade needed",
+  "accountPlanErrorTierNotHigher": "You already own a higher-tier plan — buyout plans only support purchasing a higher-priced tier",
   "accountOriginIdEditTooltip": "Edit Origin ID",
   "accountOriginIdEditTitle": "Edit Origin ID",
   "accountOriginIdEditDesc": "Pick a new Origin ID, or roll the dice for a random suggestion. This can only be done once.",
