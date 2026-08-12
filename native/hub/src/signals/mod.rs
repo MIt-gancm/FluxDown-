@@ -740,6 +740,14 @@ pub struct SetFileAssociation {
 #[derive(Deserialize, DartSignal)]
 pub struct CheckFileAssociation {}
 
+/// Rewrite the `IconLocation` of Windows shortcuts (desktop / Start Menu /
+/// taskbar pin) targeting this app so they follow the chosen app icon.
+/// Windows-only — see `shortcut_icon.rs`; no-op elsewhere.
+#[derive(Deserialize, DartSignal)]
+pub struct UpdateShortcutIcons {
+    pub icon_path: String,
+}
+
 /// Report .torrent file association status back to Dart (Rust → Dart).
 #[derive(Serialize, RustSignal)]
 pub struct FileAssociationStatus {

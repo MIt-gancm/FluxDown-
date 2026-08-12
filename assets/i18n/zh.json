@@ -427,6 +427,8 @@
   "accountErrorRegistrationClosed": "注册功能已关闭",
   "accountErrorRegistrationIncomplete": "注册未完成，请先完成邮箱验证",
   "accountErrorValidation": "请检查邮箱格式，密码需至少 8 位",
+  "accountErrorInvalidEmail": "请输入正确的邮箱格式",
+  "accountErrorPasswordTooShort": "密码需至少 8 位字符",
   "accountErrorNetwork": "网络请求失败，请检查网络或服务器地址",
   "accountErrorDeviceLimit": "设备数量已达套餐上限，删除不再使用的设备或升级专业版后可继续添加",
   "accountErrorUnknown": "出了点问题，请重试",

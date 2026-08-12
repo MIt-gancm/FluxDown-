@@ -613,6 +613,9 @@ class S {
   String get accountErrorRegistrationIncomplete =>
       _r('accountErrorRegistrationIncomplete');
   String get accountErrorValidation => _r('accountErrorValidation');
+  String get accountErrorInvalidEmail => _r('accountErrorInvalidEmail');
+  String get accountErrorPasswordTooShort =>
+      _r('accountErrorPasswordTooShort');
   String get accountErrorNetwork => _r('accountErrorNetwork');
   String get accountErrorUnknown => _r('accountErrorUnknown');
   String get accountErrorDeviceLimit => _r('accountErrorDeviceLimit');

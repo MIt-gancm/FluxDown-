@@ -427,6 +427,8 @@
   "accountErrorRegistrationClosed": "Registration is currently closed",
   "accountErrorRegistrationIncomplete": "Registration isn't finished yet — please verify your email to continue",
   "accountErrorValidation": "Please check your email and use a password with at least 8 characters",
+  "accountErrorInvalidEmail": "Please enter a valid email address",
+  "accountErrorPasswordTooShort": "Password must be at least 8 characters",
   "accountErrorNetwork": "Network request failed, please check your connection or server address",
   "accountErrorDeviceLimit": "Device limit for your plan reached — remove an unused device or upgrade to Pro to add more",
   "accountErrorUnknown": "Something went wrong, please try again",

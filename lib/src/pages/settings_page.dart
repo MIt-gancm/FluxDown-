@@ -328,14 +328,13 @@ List<SettingsSearchItem> get settingsSearchItems {
       keywords: s.searchKeywordsUiScale,
       icon: LucideIcons.maximize,
     ),
-    if (Platform.isWindows)
-      SettingsSearchItem(
-        category: SettingsCategory.appearance,
-        label: s.appIcon,
-        description: s.appIconDesc,
-        keywords: s.searchKeywordsAppIcon,
-        icon: LucideIcons.image,
-      ),
+    SettingsSearchItem(
+      category: SettingsCategory.appearance,
+      label: s.appIcon,
+      description: s.appIconDesc,
+      keywords: s.searchKeywordsAppIcon,
+      icon: LucideIcons.image,
+    ),
     SettingsSearchItem(
       category: SettingsCategory.download,
       label: s.defaultSaveDir,
@@ -1388,25 +1387,26 @@ class _SettingsContentState extends State<_SettingsContent> {
         settingsProvider: settingsProvider,
         downloadController: widget.downloadController,
       ),
-      SettingsCategory.extensions => tabId == _kTabComponents
-          ? Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: const [
-                _ComponentsContent(
-                  key: ValueKey('component-ffmpeg'),
-                  kind: _ComponentKind.ffmpeg,
-                ),
-                SizedBox(height: 12),
-                _ComponentsContent(
-                  key: ValueKey('component-ytdlp'),
-                  kind: _ComponentKind.ytdlp,
-                ),
-              ],
-            )
-          : PluginListView(
-              provider: widget.pluginProvider,
-              onNavigateToComponents: () => _selectTab(_kTabComponents),
-            ),
+      SettingsCategory.extensions =>
+        tabId == _kTabComponents
+            ? Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: const [
+                  _ComponentsContent(
+                    key: ValueKey('component-ffmpeg'),
+                    kind: _ComponentKind.ffmpeg,
+                  ),
+                  SizedBox(height: 12),
+                  _ComponentsContent(
+                    key: ValueKey('component-ytdlp'),
+                    kind: _ComponentKind.ytdlp,
+                  ),
+                ],
+              )
+            : PluginListView(
+                provider: widget.pluginProvider,
+                onNavigateToComponents: () => _selectTab(_kTabComponents),
+              ),
       SettingsCategory.doctor => DoctorReportView(
         settingsProvider: settingsProvider,
       ),
@@ -2843,13 +2843,12 @@ class _AppearanceContent extends StatelessWidget {
               vertical: true,
               child: const _UiScaleSelector(),
             ),
-            if (Platform.isWindows)
-              _SettingRow(
-                label: s.appIcon,
-                description: s.appIconDesc,
-                vertical: true,
-                child: const _AppIconSelector(),
-              ),
+            _SettingRow(
+              label: s.appIcon,
+              description: s.appIconDesc,
+              vertical: true,
+              child: const _AppIconSelector(),
+            ),
           ],
         ),
       ],
@@ -2964,7 +2963,7 @@ class _UiScaleChipState extends State<_UiScaleChip> {
 }
 
 // ─────────────────────────────────────────────
-// 应用图标选择器（仅 Windows）
+// 应用图标选择器
 // ─────────────────────────────────────────────
 
 class _AppIconSelector extends StatefulWidget {
@@ -3345,15 +3344,11 @@ class _DownloadContent extends StatelessWidget {
                   label: s.fileMissingAction,
                   description: s.fileMissingActionDesc,
                   child: ShadSelect<String>(
-                    initialValue:
-                        settingsProvider.fileMissingAction == 'delete'
+                    initialValue: settingsProvider.fileMissingAction == 'delete'
                         ? 'delete'
                         : 'keep',
                     options: [
-                      ShadOption(
-                        value: 'keep',
-                        child: Text(s.fileMissingKeep),
-                      ),
+                      ShadOption(value: 'keep', child: Text(s.fileMissingKeep)),
                       ShadOption(
                         value: 'delete',
                         child: Text(s.fileMissingDelete),
@@ -3722,11 +3717,7 @@ class _SiteAuthCredentialListState extends State<_SiteAuthCredentialList> {
                 initialUser: e.value.user,
                 initialPass: e.value.pass,
               ),
-              child: Icon(
-                LucideIcons.pencil,
-                size: 14,
-                color: c.textSecondary,
-              ),
+              child: Icon(LucideIcons.pencil, size: 14, color: c.textSecondary),
             ),
           ),
           ShadTooltip(
@@ -3897,7 +3888,8 @@ class _SiteAuthCredentialDialogState extends State<_SiteAuthCredentialDialog> {
 
   /// 归一化后的站点键；新增模式解析失败/为空时为 null（禁用保存）。
   String? get _resolvedSite =>
-      widget.site ?? _SiteAuthCredentialList._normalizeSite(_siteController.text);
+      widget.site ??
+      _SiteAuthCredentialList._normalizeSite(_siteController.text);
 
   bool get _canSave =>
       _resolvedSite != null && _userController.text.trim().isNotEmpty;
@@ -6441,7 +6433,10 @@ class _ApiServiceContentState extends State<_ApiServiceContent> {
                             const SizedBox(height: 2),
                             Text(
                               s.apiServiceLanEnableDesc,
-                              style: TextStyle(fontSize: 11.5, color: c.textMuted),
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                color: c.textMuted,
+                              ),
                             ),
                           ],
                         ),
@@ -6533,10 +6528,14 @@ class _ApiServiceContentState extends State<_ApiServiceContent> {
                                 ),
                                 const SizedBox(width: 4),
                                 ShadTooltip(
-                                  waitDuration: const Duration(milliseconds: 200),
+                                  waitDuration: const Duration(
+                                    milliseconds: 200,
+                                  ),
                                   effects: const [],
                                   builder: (_) => ConstrainedBox(
-                                    constraints: const BoxConstraints(maxWidth: 360),
+                                    constraints: const BoxConstraints(
+                                      maxWidth: 360,
+                                    ),
                                     child: Text(
                                       s.apiServiceCorsAllowAllHelp,
                                       style: const TextStyle(
@@ -6560,7 +6559,10 @@ class _ApiServiceContentState extends State<_ApiServiceContent> {
                             const SizedBox(height: 2),
                             Text(
                               s.apiServiceCorsAllowAllDesc,
-                              style: TextStyle(fontSize: 11.5, color: c.textMuted),
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                color: c.textMuted,
+                              ),
                             ),
                           ],
                         ),
@@ -6655,7 +6657,10 @@ class _NotifyContent extends StatefulWidget {
   final SettingsProvider settingsProvider;
   final DownloadController? downloadController;
 
-  const _NotifyContent({required this.settingsProvider, this.downloadController});
+  const _NotifyContent({
+    required this.settingsProvider,
+    this.downloadController,
+  });
 
   @override
   State<_NotifyContent> createState() => _NotifyContentState();
@@ -6773,7 +6778,11 @@ class _NotifyContentState extends State<_NotifyContent> {
               padding: const EdgeInsets.symmetric(horizontal: 4),
               child: Text(
                 s.webhookSemantics,
-                style: TextStyle(fontSize: 10.5, height: 1.6, color: c.textMuted),
+                style: TextStyle(
+                  fontSize: 10.5,
+                  height: 1.6,
+                  color: c.textMuted,
+                ),
               ),
             ),
           ],
@@ -11469,7 +11478,8 @@ class _AccountContentState extends State<_AccountContent> {
                       cursor: SystemMouseCursors.click,
                       child: GestureDetector(
                         behavior: HitTestBehavior.opaque,
-                        onTap: () => _showChangeEmailDialog(context, user.email),
+                        onTap: () =>
+                            _showChangeEmailDialog(context, user.email),
                         child: Padding(
                           padding: const EdgeInsets.symmetric(
                             horizontal: 16,
@@ -11792,11 +11802,7 @@ class _AccountContentState extends State<_AccountContent> {
                       color: c.textSecondary,
                     ),
                   )
-                : Icon(
-                    LucideIcons.refreshCw,
-                    size: 14,
-                    color: c.textSecondary,
-                  ),
+                : Icon(LucideIcons.refreshCw, size: 14, color: c.textSecondary),
             onPressed: _cloudRefreshing
                 ? null
                 : () => unawaited(_refreshCloudInfo()),
@@ -11972,7 +11978,11 @@ Widget _configSyncRow(BuildContext context) {
                 color: c.surface2,
                 borderRadius: BorderRadius.circular(8),
               ),
-              child: Icon(LucideIcons.refreshCw, size: 15, color: c.textSecondary),
+              child: Icon(
+                LucideIcons.refreshCw,
+                size: 15,
+                color: c.textSecondary,
+              ),
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -12692,7 +12702,9 @@ class _PlanCard extends StatelessWidget {
     final active = isSelected && !isCurrent;
     // 目标价不高于已付额 = 非升级（服务端 not_an_upgrade 同口径），置灰不可选。
     final blocked =
-        !isCurrent && creditMinor > 0 && plan.effectivePriceMinor <= creditMinor;
+        !isCurrent &&
+        creditMinor > 0 &&
+        plan.effectivePriceMinor <= creditMinor;
     final disabled = isCurrent || blocked;
     return Opacity(
       opacity: disabled ? 0.6 : 1,
@@ -12840,7 +12852,11 @@ class _PlanTag extends StatelessWidget {
       ),
       child: Text(
         text,
-        style: TextStyle(fontSize: 9.5, fontWeight: FontWeight.w600, color: color),
+        style: TextStyle(
+          fontSize: 9.5,
+          fontWeight: FontWeight.w600,
+          color: color,
+        ),
       ),
     );
   }
@@ -12869,8 +12885,10 @@ class _PlanPrice extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         Text(
-          _formatMinorAmount(hasCredit ? payable : plan.effectivePriceMinor,
-              plan.currency),
+          _formatMinorAmount(
+            hasCredit ? payable : plan.effectivePriceMinor,
+            plan.currency,
+          ),
           style: TextStyle(
             fontSize: 15,
             fontWeight: FontWeight.w700,
@@ -12949,7 +12967,6 @@ class _CampaignProgress extends StatelessWidget {
     );
   }
 }
-
 
 // ─────────────────────────────────────────────
 // 服务器地址设置
@@ -13292,8 +13309,14 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
                   const SizedBox(height: 12),
                   if (code != null && code.isNotEmpty) ...[
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                      decoration: BoxDecoration(color: c.surface2, borderRadius: m.brInput),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      decoration: BoxDecoration(
+                        color: c.surface2,
+                        borderRadius: m.brInput,
+                      ),
                       child: Row(
                         children: [
                           Expanded(
@@ -13304,7 +13327,9 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
                                 fontWeight: FontWeight.w700,
                                 letterSpacing: 2,
                                 color: c.textPrimary,
-                                fontFeatures: const [FontFeature.tabularFigures()],
+                                fontFeatures: const [
+                                  FontFeature.tabularFigures(),
+                                ],
                               ),
                             ),
                           ),
@@ -13323,8 +13348,14 @@ class _LocalDeviceSectionState extends State<_LocalDeviceSection> {
                     ),
                   ] else if (_expiredCodeSnapshot != null) ...[
                     Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-                      decoration: BoxDecoration(color: c.surface2, borderRadius: m.brInput),
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 14,
+                        vertical: 12,
+                      ),
+                      decoration: BoxDecoration(
+                        color: c.surface2,
+                        borderRadius: m.brInput,
+                      ),
                       child: Text(
                         _expiredCodeSnapshot!.split('').join('  '),
                         style: TextStyle(
@@ -15680,12 +15711,18 @@ class _RegisterDialogContentState extends State<_RegisterDialogContent> {
     }
   }
 
+  static final _emailRe = RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$');
+
   Future<void> _submitForm() async {
     final s = LocaleScope.of(context);
     final email = _emailController.text.trim();
     final password = _passwordController.text;
-    if (email.isEmpty || password.length < 8) {
-      setState(() => _error = s.accountErrorValidation);
+    if (!_emailRe.hasMatch(email)) {
+      setState(() => _error = s.accountErrorInvalidEmail);
+      return;
+    }
+    if (password.length < 8) {
+      setState(() => _error = s.accountErrorPasswordTooShort);
       return;
     }
     await _register();

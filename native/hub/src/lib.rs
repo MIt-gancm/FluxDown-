@@ -13,6 +13,7 @@ mod protocol_registry;
 mod reveal_file;
 pub mod rinf_selection;
 mod rinf_sink;
+mod shortcut_icon;
 mod signal_bridge;
 mod signals;
 mod updater;
@@ -36,5 +37,6 @@ write_interface!();
 async fn main() {
     logger::init();
     spawn(create_actors());
+    spawn(shortcut_icon::listen());
     dart_shutdown().await;
 }

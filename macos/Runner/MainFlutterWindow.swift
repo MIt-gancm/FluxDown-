@@ -72,6 +72,23 @@ class MainFlutterWindow: NSWindow {
             case "toggleFullScreen":
                 self?.toggleFullScreen(nil)
                 result(nil)
+            case "setAppIcon":
+                // 由 AppIconService（lib/src/services/app_icon_service.dart）驱动，
+                // 与 Windows 改写 .lnk / Linux 覆盖 XDG 图标主题是同一层职责：
+                // 让持久化的"快捷方式"图标跟随用户选择，而不只是运行时窗口图标。
+                let args = call.arguments as? [String: Any]
+                let iconPath = args?["iconPath"] as? String
+                let image = iconPath.flatMap { NSImage(contentsOfFile: $0) }
+                // 运行时 Dock / Cmd-Tab 图标：nil 时 AppKit 自动恢复默认 bundle 图标。
+                NSApp.applicationIconImage = image
+                // 持久化 Finder / Dock（含未运行时的固定图标）覆盖：只写入 Finder
+                // 自定义图标元数据，不触碰已签名 .app bundle 的实际内容，不影响
+                // 代码签名。nil 清除覆盖，恢复 bundle 真实图标。已知限制：
+                // Launchpad 直接读 LaunchServices 缓存的 bundle 图标，不经过
+                // 这层覆盖。
+                NSWorkspace.shared.setIcon(
+                    image, forFile: Bundle.main.bundlePath, options: [])
+                result(nil)
             default:
                 result(FlutterMethodNotImplemented)
             }

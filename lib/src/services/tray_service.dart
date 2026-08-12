@@ -63,10 +63,13 @@ class TrayService with TrayListener {
   // Windows 系统托盘图标路径（深/浅色任务栏各一套）
   String? _winTrayDarkPath; // 白色箭头 — 适配深色任务栏
   String? _winTrayLightPath; // 深蓝色箭头 — 适配浅色任务栏
+  // Linux 默认托盘图标路径（init() 中计算一次，无深浅色变体）
+  String? _linuxDefaultTrayIconPath;
   // 当前有效的深/浅色状态，初始值跟随系统，后续由 setIsDark() 驱动
   bool _isDark = false;
-  // 自定义应用图标覆盖（由 AppIconService 驱动）：非 null 时托盘固定使用
-  // 该 ICO 文件，忽略深/浅色变体
+  // 自定义应用图标覆盖（由 AppIconService 驱动）：非 null 时 Windows/Linux
+  // 托盘固定使用该图标文件，忽略深/浅色变体。macOS 不支持覆盖——菜单栏图标
+  // 固定用系统模板图（HIG 惯例，随亮暗色自动着色）。
   String? _customIconPath;
 
   /// 应用退出回调 — 由外部（如 _FluxDownAppState）设置以实现优雅退出。
@@ -95,7 +98,7 @@ class TrayService with TrayListener {
       _isDark =
           WidgetsBinding.instance.platformDispatcher.platformBrightness ==
           Brightness.dark;
-      iconPath = _windowsTrayIconPath();
+      iconPath = _effectiveTrayIconPath();
       isTemplate = false;
     } else if (Platform.isMacOS) {
       // macOS: tray_manager 使用 rootBundle.load() 加载，需要 Flutter asset key
@@ -104,7 +107,7 @@ class TrayService with TrayListener {
       isTemplate = true;
     } else {
       // Linux: exe is at <prefix>/bin/, flutter_assets at <prefix>/data/flutter_assets/
-      iconPath = p.join(
+      _linuxDefaultTrayIconPath = p.join(
         exeDir,
         'data',
         'flutter_assets',
@@ -112,6 +115,7 @@ class TrayService with TrayListener {
         'logo',
         'fluxdown_logo.png',
       );
+      iconPath = _effectiveTrayIconPath();
       isTemplate = false;
     }
 
@@ -128,8 +132,8 @@ class TrayService with TrayListener {
         MenuItem.checkbox(
           key: 'toggle_ball',
           label: currentS.trayShowFloatingBall,
-          checked: SettingsProvider.globalInstance?.floatingBallEnabled ??
-              false,
+          checked:
+              SettingsProvider.globalInstance?.floatingBallEnabled ?? false,
         ),
         MenuItem.separator(),
         MenuItem(key: 'exit_app', label: currentS.trayExit),
@@ -150,8 +154,8 @@ class TrayService with TrayListener {
         MenuItem.checkbox(
           key: 'toggle_ball',
           label: currentS.trayShowFloatingBall,
-          checked: SettingsProvider.globalInstance?.floatingBallEnabled ??
-              false,
+          checked:
+              SettingsProvider.globalInstance?.floatingBallEnabled ?? false,
         ),
         MenuItem.separator(),
         MenuItem(key: 'exit_app', label: currentS.trayExit),
@@ -171,14 +175,17 @@ class TrayService with TrayListener {
   }
 
   // ─────────────────────────────────────────────
-  // Windows 深/浅色模式托盘图标切换
+  // Windows 深/浅色切换 + Windows/Linux 自定义图标覆盖
   // ─────────────────────────────────────────────
 
-  /// 返回当前生效的 Windows 托盘图标路径（自定义覆盖优先）
-  String _windowsTrayIconPath() {
+  /// 返回当前生效的托盘图标路径（自定义覆盖优先，否则按平台取默认值）。
+  String _effectiveTrayIconPath() {
     final custom = _customIconPath;
     if (custom != null) return custom;
-    return _isDark ? (_winTrayDarkPath ?? '') : (_winTrayLightPath ?? '');
+    if (Platform.isWindows) {
+      return _isDark ? (_winTrayDarkPath ?? '') : (_winTrayLightPath ?? '');
+    }
+    return _linuxDefaultTrayIconPath ?? '';
   }
 
   /// 由外部（_FluxDownAppState）在应用主题或系统亮度变化时调用，
@@ -189,7 +196,7 @@ class TrayService with TrayListener {
     _isDark = isDark;
     if (_customIconPath != null) return; // 自定义图标覆盖中，深浅色不影响托盘
     if (!_initialized || _isExiting) return;
-    final newPath = _windowsTrayIconPath();
+    final newPath = _effectiveTrayIconPath();
     logInfo(_tag, 'setIsDark($isDark) → $newPath');
     try {
       await trayManager.setIcon(newPath, isTemplate: false);
@@ -199,13 +206,14 @@ class TrayService with TrayListener {
   }
 
   /// 设置或清除自定义托盘图标覆盖（由 AppIconService 调用）。
-  /// [path] 为 null 时恢复深/浅色默认图标。
+  /// [path] 为 null 时恢复默认图标。macOS 菜单栏图标固定用系统模板图
+  /// （HIG 惯例，随亮暗色自动着色），不随 App 图标切换，直接忽略。
   Future<void> setCustomIcon(String? path) async {
-    if (!Platform.isWindows) return;
+    if (Platform.isMacOS) return;
     if (_customIconPath == path) return; // 无变化，跳过
     _customIconPath = path;
     if (!_initialized || _isExiting) return;
-    final newPath = _windowsTrayIconPath();
+    final newPath = _effectiveTrayIconPath();
     logInfo(_tag, 'setCustomIcon($path) → $newPath');
     try {
       await trayManager.setIcon(newPath, isTemplate: false);
