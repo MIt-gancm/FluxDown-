@@ -129,6 +129,7 @@
     "webbuy.fieldPlan": "当前套餐",
     "webbuy.notMe": "不是我的账号",
     "webbuy.confirmPay": "确认并付款",
+    "webbuy.wechatBadge": "微信支付",
     "webbuy.scanTitle": "使用微信扫码支付",
     "webbuy.credit": "已抵扣当前套餐 {amount}",
     "webbuy.pricePlan": "套餐价格",

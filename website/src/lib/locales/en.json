@@ -129,6 +129,7 @@
   "webbuy.fieldPlan": "Current plan",
   "webbuy.notMe": "Not my account",
   "webbuy.confirmPay": "Confirm & pay",
+  "webbuy.wechatBadge": "WeChat Pay",
   "webbuy.scanTitle": "Scan with WeChat to pay",
   "webbuy.credit": "Credit applied: {amount} from your current plan",
   "webbuy.pricePlan": "Plan price",
