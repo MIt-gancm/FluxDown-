@@ -12,6 +12,10 @@ export interface CloudUser {
   status: CloudUserStatus
   /** Origin ID(v1.2 新增):类 QQ 号唯一数字身份,从 10001 起严格递增;pending 用户为 null。 */
   originId: number | null
+  /** 是否已用掉套餐赠送的那一次 Origin ID 自助修改机会(v1.3 新增,见 originIdEdit
+   *  entitlement)。旧会话快照(登录早于此字段上线)反序列化后为 undefined,按“未修改”
+   *  兜底,语义上与 false 等价。 */
+  originIdChanged?: boolean
   createdAt: string
   lastLoginAt?: string
 }
@@ -19,6 +23,9 @@ export interface CloudUser {
 /** 套餐能力集：服务端自由演进字段，本文件只按需声明已知字段，未知字段仍可原样读取。 */
 export interface Entitlements {
   maxSyncDevices?: number
+  /** 套餐是否允许自助修改 Origin ID(v1.3 新增)，配合 CloudUser.originIdChanged
+   *  共同决定编辑入口是否展示。 */
+  originIdEdit?: boolean
   [key: string]: unknown
 }
 
@@ -59,6 +66,17 @@ export type LoginResult =
 /** GET /me 响应：UserDto 字段打平 + entitlements。 */
 export interface CloudProfile extends CloudUser {
   entitlements: Entitlements
+}
+
+/** GET /me/origin-id/random 响应：套餐允许时给出的建议 Origin ID(倾向"豹子号"，不锁定)。 */
+export interface RandomOriginIdResponse {
+  originId: number
+}
+
+/** GET /me/origin-id/check 响应：提交前可用性预检。reason 仅在 available=false 时有意义。 */
+export interface CheckOriginIdResponse {
+  available: boolean
+  reason: 'invalid' | 'taken' | null
 }
 
 /** POST /auth/register、/auth/code/send 等发码接口的响应。 */

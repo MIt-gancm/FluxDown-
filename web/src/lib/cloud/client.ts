@@ -7,7 +7,7 @@
 // promise，避免刷新风暴。
 
 import { applyCloudSession, clearCloudSession, cloudDefaultDeviceName, cloudDeviceId, CLOUD_DEVICE_PLATFORM, getCloudAccessToken, getCloudRefreshToken } from './session'
-import type { AuthResponse, CdnConfig, CdnConfigResult, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
+import type { AuthResponse, CdnConfig, CdnConfigResult, CheckOriginIdResponse, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RandomOriginIdResponse, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
 import { CloudApiError } from './types'
 
 /** 默认服务地址：Actions 打包时经 VITE_FLUXCLOUD_BASE_URL 构建期注入官方地址，
@@ -194,6 +194,19 @@ export const cloudApi = {
 
   /** GET /me：当前用户信息 + 套餐能力快照。 */
   me: () => authedRequest<CloudProfile>('GET', '/me'),
+
+  /** GET /me/origin-id/random：套餐允许自助改 Origin ID 时给出一个建议值(倾向"豹子号"，
+   *  不锁定，仅供骰子按钮回填输入框)。403 origin_id_change_not_allowed / 409
+   *  origin_id_already_changed。 */
+  randomOriginId: () => authedRequest<RandomOriginIdResponse>('GET', '/me/origin-id/random'),
+
+  /** GET /me/origin-id/check：提交前可用性预检，value 为待改的 Origin ID。 */
+  checkOriginId: (value: number) => authedRequest<CheckOriginIdResponse>('GET', `/me/origin-id/check?value=${encodeURIComponent(String(value))}`),
+
+  /** PUT /me/origin-id：自助修改 Origin ID(套餐终身仅一次)，成功返回与 GET /me 相同结构的
+   *  最新 profile。错误：400 validation_error / 403 origin_id_change_not_allowed /
+   *  409 origin_id_already_changed / 409 origin_id_taken。 */
+  changeOriginId: (value: number) => authedRequest<CloudProfile>('PUT', '/me/origin-id', { originId: value }),
 
   /** GET /devices：当前用户名下已信任设备，按 lastSeenAt 降序。 */
   devices: () => authedRequest<DevicesResponse>('GET', '/devices'),

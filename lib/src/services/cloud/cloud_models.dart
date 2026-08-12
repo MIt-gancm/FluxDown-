@@ -37,6 +37,10 @@ class CloudUser {
   /// 唯一数字身份（v1.2 新增，类 QQ 号）：激活时分配，pending 用户为 null。
   final int? originId;
 
+  /// 是否已用掉自助修改 Origin ID 的唯一一次机会（v1.3 新增，见契约
+  /// PUT /me/origin-id）；缺省 false（老快照/未激活用户）。
+  final bool originIdChanged;
+
   const CloudUser({
     required this.id,
     required this.email,
@@ -46,6 +50,7 @@ class CloudUser {
     required this.createdAt,
     this.lastLoginAt,
     this.originId,
+    this.originIdChanged = false,
   });
 
   factory CloudUser.fromJson(Map<String, dynamic> json) => CloudUser(
@@ -57,6 +62,7 @@ class CloudUser {
     createdAt: (json['createdAt'] as String?) ?? '',
     lastLoginAt: json['lastLoginAt'] as String?,
     originId: (json['originId'] as num?)?.toInt(),
+    originIdChanged: (json['originIdChanged'] as bool?) ?? false,
   );
 
   Map<String, dynamic> toJson() => {
@@ -68,6 +74,7 @@ class CloudUser {
     'createdAt': createdAt,
     'lastLoginAt': lastLoginAt,
     'originId': originId,
+    'originIdChanged': originIdChanged,
   };
 }
 
@@ -83,6 +90,9 @@ class Entitlements {
 
   /// 同时保有登录会话/同步的设备数上限（同服务端 entitlement.rs 语义）。
   int get maxSyncDevices => (raw['maxSyncDevices'] as num?)?.toInt() ?? 0;
+
+  /// 当前套餐是否允许自助修改一次 Origin ID（v1.3 新增）。
+  bool get originIdEdit => (raw['originIdEdit'] as bool?) ?? false;
 
   Map<String, dynamic> toJson() => raw;
 }
@@ -109,6 +119,21 @@ class CloudProfile {
     ),
     purchaseCreditMinor: (json['purchaseCreditMinor'] as num?)?.toInt() ?? 0,
   );
+}
+
+/// GET /me/origin-id/check 响应：指定 Origin ID 是否可用；不可用时 [reason]
+/// 为 "invalid"（格式不合法，如 <10000）或 "taken"（已被占用）。
+class OriginIdCheckResult {
+  final bool available;
+  final String? reason;
+
+  const OriginIdCheckResult({required this.available, this.reason});
+
+  factory OriginIdCheckResult.fromJson(Map<String, dynamic> json) =>
+      OriginIdCheckResult(
+        available: json['available'] as bool? ?? false,
+        reason: json['reason'] as String?,
+      );
 }
 
 /// 受信任设备（对应服务端 DeviceDto）。

@@ -405,6 +405,37 @@ class CloudClient {
     return CloudProfile.fromJson(json);
   });
 
+  // ── Origin ID 自助修改（v1.3 新增，见契约 GET/PUT /me/origin-id）───────
+
+  /// GET /me/origin-id/random：随机生成一个建议 Origin ID（"豹子号"友好，不锁定，
+  /// 仅供输入框预填，最终是否可用仍以提交时服务端裁决为准）。
+  Future<int> randomOriginId() => _authed(() async {
+    final json = await _request('GET', '/me/origin-id/random', authed: true);
+    return (json['originId'] as num).toInt();
+  });
+
+  /// GET /me/origin-id/check?value=：查询指定 Origin ID 是否可用（提交前预检）。
+  Future<OriginIdCheckResult> checkOriginId(int value) => _authed(() async {
+    final json = await _request(
+      'GET',
+      '/me/origin-id/check?value=$value',
+      authed: true,
+    );
+    return OriginIdCheckResult.fromJson(json);
+  });
+
+  /// PUT /me/origin-id：提交新 Origin ID（≥10000 的整数，全局仅可成功一次），
+  /// 成功后返回最新用户资料（同 GET /me 结构）。
+  Future<CloudProfile> changeOriginId(int originId) => _authed(() async {
+    final json = await _request(
+      'PUT',
+      '/me/origin-id',
+      body: {'originId': originId},
+      authed: true,
+    );
+    return CloudProfile.fromJson(json);
+  });
+
   // ── 套餐 / 订单（微信 Native 扫码购买，见 local://pay-contract.md）───────
 
   /// GET /plans/catalog：公开无鉴权，返回上架套餐（含活动价快照）。

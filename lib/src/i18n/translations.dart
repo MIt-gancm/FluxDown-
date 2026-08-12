@@ -683,6 +683,21 @@ class S {
       _r('accountPlanErrorPaymentDisabled');
   String get accountPlanErrorGateway => _r('accountPlanErrorGateway');
   String get accountPlanErrorNotUpgrade => _r('accountPlanErrorNotUpgrade');
+  String get accountOriginIdEditTooltip => _r('accountOriginIdEditTooltip');
+  String get accountOriginIdEditTitle => _r('accountOriginIdEditTitle');
+  String get accountOriginIdEditDesc => _r('accountOriginIdEditDesc');
+  String get accountOriginIdEditPlaceholder =>
+      _r('accountOriginIdEditPlaceholder');
+  String get accountOriginIdEditRoll => _r('accountOriginIdEditRoll');
+  String get accountOriginIdEditWarning => _r('accountOriginIdEditWarning');
+  String get accountOriginIdEditConfirm => _r('accountOriginIdEditConfirm');
+  String get accountOriginIdEditSuccess => _r('accountOriginIdEditSuccess');
+  String get accountOriginIdInvalid => _r('accountOriginIdInvalid');
+  String get accountOriginIdErrorTaken => _r('accountOriginIdErrorTaken');
+  String get accountOriginIdErrorAlreadyChanged =>
+      _r('accountOriginIdErrorAlreadyChanged');
+  String get accountOriginIdErrorNotAllowed =>
+      _r('accountOriginIdErrorNotAllowed');
 
   // 配置同步 —— FluxCloud 云端设置同步（见 local://sync-contract.md）
   String get cloudSyncTitle => _r('cloudSyncTitle');

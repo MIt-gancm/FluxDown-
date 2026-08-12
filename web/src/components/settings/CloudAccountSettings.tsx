@@ -2,24 +2,27 @@
 // 一台 web 设备接入 FluxCloud，见 lib/cloud/*）。未登录时纯介绍 + 登录/注册卡片，不影响
 // 面板本地功能；已登录展示资料卡 + 设备列表 + 云服务器地址。
 
+import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Check, ChevronRight, Cloud, Copy, Monitor, Pencil, Search, Smartphone, Trash2, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Check, ChevronRight, Cloud, Copy, Monitor, Pencil, Search, Smartphone, Trash2, X } from 'lucide-react'
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '../../lib/cn'
 import { CLOUD_BASE_URL_EDITABLE, cloudApi, getCloudBaseUrl, isCloudBaseUrlCustom, resetCloudBaseUrl, setCloudBaseUrl } from '../../lib/cloud/client'
 import { deviceLabel } from '../../lib/cloud/deviceLabel'
 import { suggest } from '../../lib/cloud/nickname'
-import { applyCloudSession, cloudDeviceId, getCloudRefreshToken, signOutCloud, useCloudSession } from '../../lib/cloud/session'
-import { CloudApiError, type CloudDevice } from '../../lib/cloud/types'
+import { applyCloudSession, cloudDeviceId, getCloudRefreshToken, signOutCloud, updateCloudUser, useCloudSession } from '../../lib/cloud/session'
+import { CloudApiError, type CloudDevice, type CloudProfile } from '../../lib/cloud/types'
 import { confirmDialog } from '../../lib/confirm'
 import { copyText } from '../../lib/copy'
 import { fmtIsoTime, fmtRelativeTime } from '../../lib/format'
 import type { I18nKey } from '../../lib/i18n'
 import { useI18n } from '../../lib/i18n'
+import { toast } from '../../lib/toast'
 import { DirectDevicesSection } from './DirectDevicesSection'
 import { SetRow, TextInput } from './controls'
 
 const DEVICES_QUERY_KEY = ['cloud', 'devices']
+const ME_QUERY_KEY = ['cloud', 'me']
 
 // ---------------------------------------------------------------------------
 // 错误码 → 本地化文案；未识别的 code 回退服务端原文 message。
@@ -44,6 +47,31 @@ function cloudErrorText(t: (key: I18nKey, params?: Record<string, string | numbe
     return err.message || t('cloud.err.unknown')
   }
   return t('cloud.err.network')
+}
+
+// ---------------------------------------------------------------------------
+// Origin ID 自助修改：错误码 → 本地化文案，独立于 CLOUD_ERROR_KEYS（登录/注册场景）。
+// ---------------------------------------------------------------------------
+
+const ORIGIN_ID_ERROR_KEYS: Record<string, I18nKey> = {
+  origin_id_taken: 'cloud.err.originIdTaken',
+  origin_id_already_changed: 'cloud.err.originIdAlreadyChanged',
+  origin_id_change_not_allowed: 'cloud.err.originIdChangeNotAllowed',
+  validation_error: 'cloud.err.originIdInvalid',
+}
+
+function originIdErrorText(t: (key: I18nKey, params?: Record<string, string | number>) => string, err: unknown): string {
+  if (err instanceof CloudApiError) {
+    const key = ORIGIN_ID_ERROR_KEYS[err.code]
+    if (key) return t(key)
+    return err.message || t('cloud.err.unknown')
+  }
+  return t('cloud.err.network')
+}
+
+/** OID 规则（契约）：≥10000 的整数。 */
+function isValidOriginId(n: number): boolean {
+  return Number.isInteger(n) && n >= 10000
 }
 
 // ---------------------------------------------------------------------------
@@ -626,8 +654,19 @@ function RegisterCard({
 
 function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan: string; originId: number | null } }) {
   const { t } = useI18n()
+  const qc = useQueryClient()
   const [loggingOut, setLoggingOut] = useState(false)
+  const [originIdEditOpen, setOriginIdEditOpen] = useState(false)
   const displayName = user.nickname || user.email.split('@')[0]
+
+  // 套餐能力 + 自助修改机会是否已用掉：GET /me 独立拉取（登录/刷新响应的 entitlements
+  // 不落会话快照，仅在这一处门控编辑入口用得上，没必要为它扩大 session.ts 的职责）。
+  const meQuery = useQuery({
+    queryKey: ME_QUERY_KEY,
+    queryFn: () => cloudApi.me(),
+    staleTime: 10_000,
+  })
+  const canEditOriginId = !!meQuery.data?.entitlements.originIdEdit && !meQuery.data?.originIdChanged
 
   async function logout() {
     setLoggingOut(true)
@@ -642,6 +681,14 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
     signOutCloud()
   }
 
+  // 修改成功：同步会话快照（驱动上方 OriginIdBadge 立即刷新）+ 更新 me 查询缓存，
+  // 关闭对话框交由 OriginIdEditDialog 自身在 onChanged 后统一处理。
+  function handleOriginIdChanged(profile: CloudProfile) {
+    updateCloudUser({ originId: profile.originId, originIdChanged: profile.originIdChanged })
+    qc.setQueryData(ME_QUERY_KEY, profile)
+    setOriginIdEditOpen(false)
+  }
+
   return (
     <>
       <div className="set-group">
@@ -652,6 +699,17 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
               <span className="rounded-full bg-accent-weak px-2 py-0.5 text-[10.5px] font-semibold text-accent">{user.plan}</span>
             ) : null}
             <OriginIdBadge originId={user.originId} />
+            {canEditOriginId ? (
+              <button
+                type="button"
+                className="icon-btn sm flex-shrink-0"
+                title={t('cloud.originIdEditBtn')}
+                aria-label={t('cloud.originIdEditBtn')}
+                onClick={() => setOriginIdEditOpen(true)}
+              >
+                <Pencil size={14} />
+              </button>
+            ) : null}
           </div>
           <button type="button" className="btn ghost sm flex-shrink-0" disabled={loggingOut} onClick={() => void logout()}>
             {t('common.logout')}
@@ -668,6 +726,7 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
         </SetRow>
       </div>
       <DeviceListSection />
+      <OriginIdEditDialog open={originIdEditOpen} onClose={() => setOriginIdEditOpen(false)} onChanged={handleOriginIdChanged} />
     </>
   )
 }
@@ -695,6 +754,148 @@ function OriginIdBadge({ originId }: { originId: number | null }) {
       <span>#{originId == null ? '—' : originId}</span>
       {originId != null ? copied ? <Check size={11} /> : <Copy size={11} /> : null}
     </button>
+  )
+}
+
+/** Origin ID 自助修改对话框：数字输入 + 骰子建议 + 「仅一次」醒目提示；确认前先用
+ *  GET /me/origin-id/check 预检可用性，通过才提交 PUT /me/origin-id。成功后把返回的
+ *  最新 profile 经 onChanged 回传给调用方（LoggedInPanel 负责同步会话快照 + 缓存 +
+ *  关闭对话框），本组件自身不持有“是否已提交成功”的全局状态。 */
+function OriginIdEditDialog({
+  open,
+  onClose,
+  onChanged,
+}: {
+  open: boolean
+  onClose: () => void
+  onChanged: (profile: CloudProfile) => void
+}) {
+  const { t } = useI18n()
+  const [value, setValue] = useState('')
+  const [error, setError] = useState('')
+  const [rolling, setRolling] = useState(false)
+
+  // 每次打开清空上次输入/错误，避免残留上一次会话的值。
+  useEffect(() => {
+    if (open) {
+      setValue('')
+      setError('')
+    }
+  }, [open])
+
+  async function roll() {
+    setRolling(true)
+    setError('')
+    try {
+      const res = await cloudApi.randomOriginId()
+      setValue(String(res.originId))
+    } catch (err) {
+      setError(originIdErrorText(t, err))
+    } finally {
+      setRolling(false)
+    }
+  }
+
+  const changeMut = useMutation({
+    mutationFn: async (n: number) => {
+      const check = await cloudApi.checkOriginId(n)
+      if (!check.available) {
+        throw new CloudApiError(check.reason === 'taken' ? 'origin_id_taken' : 'validation_error', '', 409)
+      }
+      return cloudApi.changeOriginId(n)
+    },
+    onSuccess: (profile) => {
+      toast(t('cloud.originIdEditSuccess'))
+      onChanged(profile)
+    },
+    onError: (err) => setError(originIdErrorText(t, err)),
+  })
+
+  function confirm() {
+    const n = Number.parseInt(value, 10)
+    if (!isValidOriginId(n)) {
+      setError(t('cloud.err.originIdInvalid'))
+      return
+    }
+    setError('')
+    changeMut.mutate(n)
+  }
+
+  return (
+    <Dialog.Root
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) onClose()
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="wbackdrop show" />
+        <Dialog.Content className="dialog sm show" aria-describedby={undefined}>
+          <header className="dlg-head">
+            <Dialog.Title asChild>
+              <b>{t('cloud.originIdEditTitle')}</b>
+            </Dialog.Title>
+            <Dialog.Close asChild>
+              <button type="button" className="icon-btn sm" aria-label={t('common.close')}>
+                <X size={16} />
+              </button>
+            </Dialog.Close>
+          </header>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              confirm()
+            }}
+          >
+            <div className="dlg-body">
+              <label className="field-label" htmlFor="origin-id-edit-value">
+                {t('cloud.originIdEditLabel')}
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  id="origin-id-edit-value"
+                  className="text-input flex-1"
+                  type="text"
+                  inputMode="numeric"
+                  autoFocus
+                  placeholder={t('cloud.originIdEditPlaceholder')}
+                  value={value}
+                  disabled={changeMut.isPending}
+                  onChange={(e) => setValue(e.target.value.replace(/\D/g, ''))}
+                />
+                <button
+                  type="button"
+                  className="icon-btn flex-shrink-0"
+                  disabled={rolling || changeMut.isPending}
+                  title={t('cloud.originIdEditRoll')}
+                  aria-label={t('cloud.originIdEditRoll')}
+                  onClick={() => void roll()}
+                >
+                  <span aria-hidden="true" className="text-[15px] leading-none">
+                    🎲
+                  </span>
+                </button>
+              </div>
+              <p className="mt-2 flex items-start gap-1.5 text-[11.5px] font-medium text-warning">
+                <AlertTriangle size={13} className="mt-[1px] flex-shrink-0" />
+                {t('cloud.originIdEditWarning')}
+              </p>
+              {error ? <p className="mt-2 text-[12px] text-danger">{error}</p> : null}
+            </div>
+            <footer className="dlg-foot">
+              <Dialog.Close asChild>
+                <button type="button" className="btn ghost">
+                  {t('common.cancel')}
+                </button>
+              </Dialog.Close>
+              <button type="submit" className="btn primary" disabled={changeMut.isPending || !value.trim()}>
+                {changeMut.isPending ? t('common.loading') : t('common.confirm')}
+              </button>
+            </footer>
+          </form>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
   )
 }
 

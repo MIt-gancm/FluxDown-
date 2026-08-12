@@ -11427,7 +11427,7 @@ class _AccountContentState extends State<_AccountContent> {
                       ? const EdgeInsets.symmetric(horizontal: 20, vertical: 18)
                       : null,
                   child: loggedIn && user != null
-                      ? _profileBody(context, s, c, user)
+                      ? _profileBody(context, s, c, user, auth.entitlements)
                       : _heroBody(context, s, c),
                 ),
                 // 未登录：暴露免账号「本地设备」区（本机配对码 + 已配对名册 +
@@ -11612,11 +11612,21 @@ class _AccountContentState extends State<_AccountContent> {
   /// 已登录：头像 + 两行身份块（第一行 昵称 + 套餐 chip，第二行 Origin ID 胶囊，
   /// 可点复制）+ 右侧退出登录按钮；头像取昵称首字符（无字符回退云图标）。
   /// 邮箱不在此展示——移至下方「账号与安全」分组（见 _AccountContentState.build）。
-  Widget _profileBody(BuildContext context, S s, AppColors c, CloudUser user) {
+  Widget _profileBody(
+    BuildContext context,
+    S s,
+    AppColors c,
+    CloudUser user,
+    Entitlements? entitlements,
+  ) {
     final displayName = user.nickname.isNotEmpty
         ? user.nickname
         : user.email.split('@').first;
     final hasOriginId = user.originId != null;
+    // 自助修改 Origin ID 入口门控：套餐允许（entitlements.originIdEdit）且
+    // 尚未用掉那一次机会（!user.originIdChanged）才展示，见契约 v1.3。
+    final canEditOriginId =
+        (entitlements?.originIdEdit ?? false) && !user.originIdChanged;
     final initial = _avatarInitial(displayName);
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
@@ -11687,50 +11697,83 @@ class _AccountContentState extends State<_AccountContent> {
               const SizedBox(height: 6),
               // Origin ID 胶囊徽章：类 QQ 号的唯一数字身份，理论上登录态不会为 null
               // （防御兜底灰色 "#—"，不可点）；中英文显示名统一 "Origin ID"，见契约。
-              ShadTooltip(
-                builder: (_) => const Text('Origin ID'),
-                child: MouseRegion(
-                  cursor: hasOriginId
-                      ? SystemMouseCursors.click
-                      : MouseCursor.defer,
-                  child: GestureDetector(
-                    onTap: hasOriginId
-                        ? () =>
-                              unawaited(_copyOriginId(context, user.originId!))
-                        : null,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 8,
-                        vertical: 3,
-                      ),
-                      decoration: BoxDecoration(
-                        color: (hasOriginId ? c.accent : c.textMuted)
-                            .withValues(alpha: 0.12),
-                        borderRadius: BorderRadius.circular(999),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Text(
-                            hasOriginId ? '#${user.originId}' : '#—',
-                            style: TextStyle(
-                              fontSize: 11.5,
-                              fontWeight: FontWeight.w600,
-                              fontFeatures: const [
-                                FontFeature.tabularFigures(),
-                              ],
-                              color: hasOriginId ? c.accent : c.textMuted,
-                            ),
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  ShadTooltip(
+                    effects: const [],
+                    builder: (_) => const Text('Origin ID'),
+                    child: MouseRegion(
+                      cursor: hasOriginId
+                          ? SystemMouseCursors.click
+                          : MouseCursor.defer,
+                      child: GestureDetector(
+                        onTap: hasOriginId
+                            ? () => unawaited(
+                                _copyOriginId(context, user.originId!),
+                              )
+                            : null,
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 3,
                           ),
-                          if (hasOriginId) ...[
-                            const SizedBox(width: 3),
-                            Icon(LucideIcons.copy, size: 10, color: c.accent),
-                          ],
-                        ],
+                          decoration: BoxDecoration(
+                            color: (hasOriginId ? c.accent : c.textMuted)
+                                .withValues(alpha: 0.12),
+                            borderRadius: BorderRadius.circular(999),
+                          ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Text(
+                                hasOriginId ? '#${user.originId}' : '#—',
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontWeight: FontWeight.w600,
+                                  fontFeatures: const [
+                                    FontFeature.tabularFigures(),
+                                  ],
+                                  color: hasOriginId ? c.accent : c.textMuted,
+                                ),
+                              ),
+                              if (hasOriginId) ...[
+                                const SizedBox(width: 3),
+                                Icon(
+                                  LucideIcons.copy,
+                                  size: 10,
+                                  color: c.accent,
+                                ),
+                              ],
+                            ],
+                          ),
+                        ),
                       ),
                     ),
                   ),
-                ),
+                  // 自助修改 Origin ID 入口：仅套餐允许且尚未用掉那一次机会才展示
+                  // （见 canEditOriginId 计算 / 契约 v1.3 originIdEdit + originIdChanged）。
+                  if (canEditOriginId) ...[
+                    const SizedBox(width: 4),
+                    ShadTooltip(
+                      effects: const [],
+                      builder: (_) => Text(s.accountOriginIdEditTooltip),
+                      child: MouseRegion(
+                        cursor: SystemMouseCursors.click,
+                        child: GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onTap: () =>
+                              _showOriginIdEditDialog(context, user.originId),
+                          child: Icon(
+                            LucideIcons.pencilLine,
+                            size: 12,
+                            color: c.textMuted,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ],
               ),
             ],
           ),
@@ -12068,6 +12111,9 @@ String _cloudErrorText(S s, CloudApiException e) => switch (e.code) {
   'plan_already_owned' => s.accountPlanErrorAlreadyOwned,
   'gateway_error' => s.accountPlanErrorGateway,
   'not_an_upgrade' => s.accountPlanErrorNotUpgrade,
+  'origin_id_taken' => s.accountOriginIdErrorTaken,
+  'origin_id_already_changed' => s.accountOriginIdErrorAlreadyChanged,
+  'origin_id_change_not_allowed' => s.accountOriginIdErrorNotAllowed,
   'validation_error' =>
     e.message.isNotEmpty ? e.message : s.accountErrorValidation,
   'network_error' => s.accountErrorNetwork,
@@ -12124,6 +12170,16 @@ void _showChangeEmailDialog(BuildContext context, String currentEmail) {
     // 误点背景不应关闭弹窗导致重来。
     barrierDismissible: false,
     builder: (_) => _ChangeEmailDialog(currentEmail: currentEmail),
+  );
+}
+
+void _showOriginIdEditDialog(BuildContext context, int? currentOriginId) {
+  showShadDialog(
+    context: context,
+    // FluxDown 弹出层无进出场动画（rule: shad-overlay-no-animation）。
+    animateIn: const [],
+    animateOut: const [],
+    builder: (_) => _OriginIdEditDialog(currentOriginId: currentOriginId),
   );
 }
 
@@ -14853,6 +14909,221 @@ class _ChangeEmailDialogState extends State<_ChangeEmailDialog> {
                           ),
                         )
                       : Text(s.accountEmailChangeSendNewCode),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// Origin ID 自助修改对话框：数字输入 + 骰子随机建议 + 提交前可用性预检，
+// 全局仅可成功一次（见契约 PUT /me/origin-id）。
+// ─────────────────────────────────────────────
+
+class _OriginIdEditDialog extends StatefulWidget {
+  final int? currentOriginId;
+
+  const _OriginIdEditDialog({this.currentOriginId});
+
+  @override
+  State<_OriginIdEditDialog> createState() => _OriginIdEditDialogState();
+}
+
+class _OriginIdEditDialogState extends State<_OriginIdEditDialog> {
+  final _controller = TextEditingController();
+
+  bool _busy = false;
+  bool _rolling = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// 骰子按钮：拉取一个随机建议值填入输入框（不锁定，仍需提交时预检+服务端裁决）。
+  Future<void> _rollRandom() async {
+    final s = LocaleScope.of(context);
+    setState(() {
+      _rolling = true;
+      _error = null;
+    });
+    try {
+      final value = await CloudAuthService.instance.randomOriginId();
+      if (!mounted) return;
+      setState(() {
+        _rolling = false;
+        _controller.text = value.toString();
+      });
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _rolling = false;
+        _error = _cloudErrorText(s, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _rolling = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  /// 本地校验 → 可用性预检 → 提交；三步任一失败都在对话框内展示错误，不关闭。
+  Future<void> _submit() async {
+    final s = LocaleScope.of(context);
+    final value = int.tryParse(_controller.text.trim());
+    if (value == null || value < 10000) {
+      setState(() => _error = s.accountOriginIdInvalid);
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final check = await CloudAuthService.instance.checkOriginId(value);
+      if (!check.available) {
+        if (!mounted) return;
+        setState(() {
+          _busy = false;
+          _error = check.reason == 'taken'
+              ? s.accountOriginIdErrorTaken
+              : s.accountOriginIdInvalid;
+        });
+        return;
+      }
+      await CloudAuthService.instance.changeOriginId(value);
+      if (!mounted) return;
+      Navigator.of(context).pop();
+      FluxSonner.of(context).show(
+        ShadToast(
+          title: Text(s.accountOriginIdEditSuccess),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = _cloudErrorText(s, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final busy = _busy || _rolling;
+    return ShadDialog(
+      title: Text(s.accountOriginIdEditTitle),
+      constraints: const BoxConstraints(maxWidth: 400),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 4),
+          Text(
+            s.accountOriginIdEditDesc,
+            style: TextStyle(fontSize: 12, height: 1.5, color: c.textMuted),
+          ),
+          const SizedBox(height: 14),
+          ShadInput(
+            controller: _controller,
+            placeholder: Text(s.accountOriginIdEditPlaceholder),
+            enabled: !busy,
+            autofocus: true,
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            trailing: ShadTooltip(
+              effects: const [],
+              builder: (_) => Text(s.accountOriginIdEditRoll),
+              child: MouseRegion(
+                cursor: busy ? MouseCursor.defer : SystemMouseCursors.click,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: busy ? null : () => unawaited(_rollRandom()),
+                  child: _rolling
+                      ? SizedBox(
+                          width: 15,
+                          height: 15,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 1.5,
+                            color: c.textMuted,
+                          ),
+                        )
+                      : Icon(LucideIcons.dices, size: 15, color: c.textMuted),
+                ),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          // 仅一次警示条：同设备删除确认弹窗的告警条视觉规范。
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(
+              color: c.statusError.withValues(alpha: 0.08),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(LucideIcons.triangleAlert, size: 14, color: c.statusError),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    s.accountOriginIdEditWarning,
+                    style: TextStyle(fontSize: 11.5, color: c.statusError),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              _error!,
+              style: TextStyle(fontSize: 11.5, color: c.statusError),
+            ),
+          ],
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                child: ShadButton.outline(
+                  enabled: !busy,
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text(s.cancel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ShadButton(
+                  enabled: !busy,
+                  onPressed: _submit,
+                  child: _busy
+                      ? SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 1.5,
+                            color: c.dialogBg,
+                          ),
+                        )
+                      : Text(s.accountOriginIdEditConfirm),
                 ),
               ),
             ],

@@ -64,6 +64,16 @@ export function applyCloudSession(auth: AuthResponse) {
   cloudSessionStore.set({ status: 'authenticated', user: auth.user })
 }
 
+/** 部分字段更新当前用户快照（如 Origin ID 自助修改成功后），不涉及令牌，仅同步本地
+ *  存储 + 通知订阅者。未登录态下为空操作。 */
+export function updateCloudUser(patch: Partial<CloudUser>) {
+  const cur = cloudSessionStore.get()
+  if (cur.status !== 'authenticated' || !cur.user) return
+  const next: CloudUser = { ...cur.user, ...patch }
+  localStorage.setItem(USER_KEY, JSON.stringify(next))
+  cloudSessionStore.set({ status: 'authenticated', user: next })
+}
+
 /** 清空云账户会话（会话失效 / 令牌刷新失败等被动路径）。绝不能在这里连带清派生状态
  *  ——网络抖动触发的一次 401/403 不该把执行端正在维护的跨设备任务绑定表也清空，
  *  否则设备重连后所有正在执行的下发任务都会被误判为"账号变了"而失联。 */

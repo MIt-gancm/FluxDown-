@@ -239,6 +239,25 @@ class CloudAuthService extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ── Origin ID 自助修改 ───────────────────────────────────────────────
+
+  /// 拉取一个随机建议 Origin ID（不锁定，仅供输入框预填）。
+  Future<int> randomOriginId() => CloudClient.instance.randomOriginId();
+
+  /// 提交前预检：指定 Origin ID 是否可用。
+  Future<OriginIdCheckResult> checkOriginId(int value) =>
+      CloudClient.instance.checkOriginId(value);
+
+  /// 提交新 Origin ID（全局仅可成功一次），成功后刷新本地用户/套餐能力快照。
+  Future<void> changeOriginId(int originId) async {
+    final profile = await CloudClient.instance.changeOriginId(originId);
+    _user = profile.user;
+    _entitlements = profile.entitlements;
+    _purchaseCreditMinor = profile.purchaseCreditMinor;
+    await _persistUser();
+    notifyListeners();
+  }
+
   // ── 设备管理 ─────────────────────────────────────────────────────────
 
   /// 拉取设备名册并更新缓存（设置页与侧栏共用；成功后 notifyListeners）。
