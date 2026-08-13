@@ -70,7 +70,7 @@ impl<W: AsyncWrite + Unpin> Rc4Writer<W> {
     /// Attempt to drain `pending` into `inner`. Returns the number of bytes
     /// written so far (the caller applies `drain(..n)` itself).
     fn poll_drain_pending(
-        inner: Pin<&mut W>,
+        mut inner: Pin<&mut W>,
         pending: &[u8],
         cx: &mut Context<'_>,
     ) -> Poll<io::Result<usize>> {
