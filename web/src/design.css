@@ -409,6 +409,18 @@ body {
 .key-field-actions button svg { width: 13px; height: 13px; }
 .key-field-actions button.copied,
 .key-field-actions button.copied:hover { color: var(--success); }
+
+/* 云账户注册的密码明文切换：单个眼睛按钮浮在输入框右内缘。不复用 .key-field
+   （那套为三个按钮预留了 82px 右缩进，单按钮下输入区被白白吃掉一截）。 */
+.pw-field { position: relative; }
+.pw-field .text-input { padding-right: 36px; }
+.pw-field .pw-toggle {
+  position: absolute; top: 50%; right: 5px; transform: translateY(-50%);
+  color: var(--text3); width: 23px; height: 23px; border-radius: 6px;
+  display: grid; place-items: center;
+}
+.pw-field .pw-toggle:hover { background: var(--hover); color: var(--text); }
+.pw-field .pw-toggle svg { width: 14px; height: 14px; }
 .login-feats { position: relative; display: flex; gap: 26px; }
 .login-feats span { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: var(--text3); text-align: center; }
 .login-feats b { font-size: 12.5px; color: var(--text2); }

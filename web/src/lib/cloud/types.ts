@@ -18,6 +18,8 @@ export interface CloudUser {
   originIdChanged?: boolean
   createdAt: string
   lastLoginAt?: string
+  /** 当前套餐下的会员编号（v1.4）：仅当套餐 badgeNumbered=true 且已分配时非空。 */
+  membershipOrdinal?: number | null
 }
 
 /** 套餐能力集：服务端自由演进字段，本文件只按需声明已知字段，未知字段仍可原样读取。 */
@@ -82,6 +84,19 @@ export interface CheckOriginIdResponse {
 /** POST /auth/register、/auth/code/send 等发码接口的响应。 */
 export interface TtlResponse {
   ttlSeconds: number
+}
+/** GET /plans/catalog 响应元素（公开无鉴权，仅取账户页徽标渲染所需字段；
+ *  未声明字段原样保留在对象上，落盘快照时一并存储）。 */
+export interface CatalogPlan {
+  code: string
+  name: string
+  badge?: string | null
+  /** outline | solid | medal | ribbon（服务端 admin_plans.rs::BADGE_STYLES 白名单）。 */
+  badgeStyle: string
+  /** #RRGGBB 徽标专用强调色。 */
+  badgeColor: string
+  badgeNumbered?: boolean
+  badgeNumberDigits?: number
 }
 
 /** GET /devices 响应。 */

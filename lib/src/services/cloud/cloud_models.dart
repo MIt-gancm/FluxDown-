@@ -277,6 +277,12 @@ class CloudPlanCampaignStage {
         priceMinor: (json['priceMinor'] as num?)?.toInt() ?? 0,
         quota: (json['quota'] as num?)?.toInt(),
       );
+  /// 序列化回 wire 形态（供套餐目录本地快照落盘，与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'label': label,
+    'priceMinor': priceMinor,
+    'quota': quota,
+  };
 }
 
 /// 套餐限时活动（仅活动 active 时随 catalog 下发）：阶梯限量定价 + 当前生效价快照。
@@ -316,6 +322,16 @@ class CloudPlanCampaign {
       effectivePriceMinor: (json['effectivePriceMinor'] as num?)?.toInt() ?? 0,
     );
   }
+  /// 序列化回 wire 形态（供套餐目录本地快照落盘，与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'name': name,
+    'endAt': endAt,
+    'stages': [for (final s in stages) s.toJson()],
+    'soldTotal': soldTotal,
+    'stageSold': stageSold,
+    'currentStageIndex': currentStageIndex,
+    'effectivePriceMinor': effectivePriceMinor,
+  };
 
   /// 当前生效档位；[currentStageIndex] 越界（服务端数据异常）兜底 null，UI 需容错。
   CloudPlanCampaignStage? get currentStage =>
@@ -404,6 +420,25 @@ class CloudPlan {
         ? CloudPlanCampaign.fromJson(json['campaign'] as Map<String, dynamic>)
         : null,
   );
+  /// 序列化回 wire 形态（供套餐目录本地快照落盘，与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'code': code,
+    'name': name,
+    'description': description,
+    'badge': badge,
+    'icon': icon,
+    'color': color,
+    'badgeStyle': badgeStyle,
+    'badgeColor': badgeColor,
+    'badgeNumbered': badgeNumbered,
+    'badgeNumberDigits': badgeNumberDigits,
+    'priceMinor': priceMinor,
+    'currency': currency,
+    'highlights': highlights,
+    'entitlements': entitlementsRaw,
+    'sort': sort,
+    if (campaign != null) 'campaign': campaign!.toJson(),
+  };
 
   /// 实际成交价：活动生效价优先，否则套餐基础价（同契约「购买价」定义）。
   int get effectivePriceMinor => campaign?.effectivePriceMinor ?? priceMinor;

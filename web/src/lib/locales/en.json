@@ -507,6 +507,8 @@
   "cloud.emailPlaceholder": "Email address",
   "cloud.accountPlaceholder": "Email / Origin ID",
   "cloud.passwordPlaceholder": "Password",
+  "cloud.showPassword": "Show password",
+  "cloud.hidePassword": "Hide password",
   "cloud.sendCode": "Send code",
   "cloud.codeLoginSubtitle": "A code was sent to {email}, valid for 10 minutes.",
   "cloud.deviceVerifyTitle": "New device verification",

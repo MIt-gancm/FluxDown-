@@ -39,6 +39,7 @@ import '../services/floating_ball/floating_ball_service.dart';
 import '../services/link/link_models.dart';
 import '../services/link/local_pairing_service.dart';
 import '../services/local_interfaces.dart';
+import '../services/kv_store.dart';
 import '../services/log_service.dart';
 import '../services/update_service.dart';
 import '../theme/app_colors.dart';
@@ -11371,16 +11372,42 @@ class _AccountContentState extends State<_AccountContent> {
     unawaited(_loadCatalogPlans());
   }
 
-  /// 账户头徽标渲染用：套餐目录快照（未过滤）。拉取失败时保持为空列表，由
-  /// [_NicknameRow] 优雅降级为纯文本 pill，不影响页面其余部分。
-  List<CloudPlan> _catalogPlans = const [];
+  /// 套餐目录本地快照键：上次成功拉取的 catalog 原样落盘。首帧徽标必须
+  /// 是"上次最终显示的 UI"——冷启动 /me 与目录都还没返回时，若从空目录
+  /// 起步，徽标会先闪一帧默认纯文本 pill 再跳成正式徽标（或短暂消失）。
+  static const _kPlanCatalogCacheKey = 'cloud_plans_catalog';
+
+  /// 账户头徽标渲染用：套餐目录快照（未过滤）。初始值来自本地快照（无快照
+  /// 时为空列表，由 [_NicknameRow] 优雅降级为纯文本 pill），挂载后台拉取
+  /// 成功再覆盖并回写快照，不影响页面其余部分。
+  late List<CloudPlan> _catalogPlans = _restoreCatalogCache();
+
+  static List<CloudPlan> _restoreCatalogCache() {
+    final raw = KvStore.instance.getString(_kPlanCatalogCacheKey);
+    if (raw == null || raw.isEmpty) return const [];
+    try {
+      final list = jsonDecode(raw) as List<dynamic>;
+      return [
+        for (final e in list) CloudPlan.fromJson(e as Map<String, dynamic>),
+      ];
+    } catch (e, stack) {
+      // 快照损坏按无缓存处理，等待网络拉取覆盖；不让账户页整体失败。
+      logError('CloudAuth', 'plan catalog cache decode failed', e, stack);
+      return const [];
+    }
+  }
 
   Future<void> _loadCatalogPlans() async {
     try {
       final catalog = await CloudClient.instance.getPlansCatalog();
       if (!mounted) return;
       setState(() => _catalogPlans = catalog);
+      await KvStore.instance.setString(
+        _kPlanCatalogCacheKey,
+        jsonEncode([for (final p in catalog) p.toJson()]),
+      );
     } catch (e, stack) {
+      // 拉取失败保持既有快照渲染（正是"保证上次最终显示的 UI"的场景）。
       logError(
         'CloudAuth',
         'account header plan catalog fetch failed',
@@ -16027,6 +16054,8 @@ class _RegisterDialogContentState extends State<_RegisterDialogContent> {
 
   bool _busy = false;
   String? _error;
+  /// 密码输入框明文显示切换（同站点凭据对话框的眼睛按钮模式）。
+  bool _showPassword = false;
   Timer? _timer;
   int _ttlRemaining = 0;
   int _resendRemaining = 0;
@@ -16213,8 +16242,19 @@ class _RegisterDialogContentState extends State<_RegisterDialogContent> {
           ShadInput(
             controller: _passwordController,
             placeholder: Text(s.accountPasswordPlaceholder),
-            obscureText: true,
+            obscureText: !_showPassword,
             enabled: !_busy,
+            trailing: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => setState(() => _showPassword = !_showPassword),
+                child: Icon(
+                  _showPassword ? LucideIcons.eyeOff : LucideIcons.eye,
+                  size: 14,
+                  color: c.textMuted,
+                ),
+              ),
+            ),
           ),
           const SizedBox(height: 4),
           Text(

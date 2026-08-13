@@ -4,14 +4,14 @@
 
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, ArrowLeft, Check, ChevronRight, Cloud, Copy, Monitor, Pencil, Search, Smartphone, Trash2, X } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Check, ChevronRight, Cloud, Copy, Crown, Eye, EyeOff, Monitor, Pencil, Search, Smartphone, Trash2, X } from 'lucide-react'
 import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
 import { cn } from '../../lib/cn'
 import { CLOUD_BASE_URL_EDITABLE, cloudApi, getCloudBaseUrl, isCloudBaseUrlCustom, resetCloudBaseUrl, setCloudBaseUrl } from '../../lib/cloud/client'
 import { deviceLabel } from '../../lib/cloud/deviceLabel'
 import { suggest } from '../../lib/cloud/nickname'
 import { applyCloudSession, cloudDeviceId, getCloudRefreshToken, signOutCloud, updateCloudUser, useCloudSession } from '../../lib/cloud/session'
-import { CloudApiError, type CloudDevice, type CloudProfile } from '../../lib/cloud/types'
+import { CloudApiError, type CatalogPlan, type CloudDevice, type CloudProfile, type CloudUser } from '../../lib/cloud/types'
 import { confirmDialog } from '../../lib/confirm'
 import { copyText } from '../../lib/copy'
 import { fmtIsoTime, fmtRelativeTime } from '../../lib/format'
@@ -23,6 +23,106 @@ import { SetRow, TextInput } from './controls'
 
 const DEVICES_QUERY_KEY = ['cloud', 'devices']
 const ME_QUERY_KEY = ['cloud', 'me']
+// ---------------------------------------------------------------------------
+// 套餐目录快照：上次成功拉取的 catalog 落盘 localStorage。首帧徽标必须是
+// "上次最终显示的 UI"——刷新页面或云端暂不可达时，若从空目录起步，徽标会
+// 先闪一帧默认纯文本 pill 再跳成正式徽标。与桌面端 cloud_plans_catalog 对称。
+// ---------------------------------------------------------------------------
+
+const PLAN_CATALOG_CACHE_KEY = 'fluxdown.cloud.plansCatalog'
+
+function readCatalogCache(): CatalogPlan[] {
+  try {
+    const raw = localStorage.getItem(PLAN_CATALOG_CACHE_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw) as unknown
+    return Array.isArray(parsed) ? (parsed as CatalogPlan[]) : []
+  } catch {
+    return []
+  }
+}
+
+function writeCatalogCache(list: CatalogPlan[]) {
+  try {
+    localStorage.setItem(PLAN_CATALOG_CACHE_KEY, JSON.stringify(list))
+  } catch {
+    /* 隐私模式/配额耗尽：下次仍从网络拉取，仅损失首帧缓存 */
+  }
+}
+
+/** 套餐目录：初始值取本地快照，挂载后台拉取覆盖并回写快照；拉取失败保持
+ *  既有快照渲染（正是"保证上次最终显示的 UI"的场景，失败静默）。 */
+function useCatalogPlans(): CatalogPlan[] {
+  const [catalog, setCatalog] = useState<CatalogPlan[]>(readCatalogCache)
+  useEffect(() => {
+    let alive = true
+    cloudApi
+      .plansCatalog()
+      .then((list) => {
+        if (!alive) return
+        setCatalog(list)
+        writeCatalogCache(list)
+      })
+      .catch(() => {})
+    return () => {
+      alive = false
+    }
+  }, [])
+  return catalog
+}
+
+const BADGE_HEX_RE = /^#[0-9a-f]{6}$/i
+
+/** 编号后缀：badgeNumbered 且拿到具体编号才拼（不猜测/不占位），补零位数 1-6。 */
+function badgeLabel(plan: CatalogPlan, ordinal: number | null | undefined): string {
+  const base = plan.badge ?? ''
+  if (!plan.badgeNumbered || ordinal == null) return base
+  const digits = Math.min(Math.max(plan.badgeNumberDigits ?? 4, 1), 6)
+  return `${base} No.${String(ordinal).padStart(digits, '0')}`
+}
+
+/** 套餐徽标 pill：形状/颜色完全由服务端 badgeStyle/badgeColor 数据驱动（对齐
+ *  桌面端 _PlanTag 的 outline | solid | medal | ribbon 四态），未知 style 兜底
+ *  outline；颜色非法回退主题 accent。纯色/描边渲染，不使用渐变。 */
+function PlanBadge({ plan, ordinal }: { plan: CatalogPlan; ordinal: number | null | undefined }) {
+  const color = BADGE_HEX_RE.test(plan.badgeColor?.trim() ?? '') ? plan.badgeColor.trim() : 'var(--accent)'
+  const label = badgeLabel(plan, ordinal)
+  const base = 'inline-flex items-center gap-1 rounded-full px-2 py-px text-[10.5px] font-semibold leading-[17px]'
+  switch (plan.badgeStyle) {
+    case 'solid':
+      return (
+        <span className={base} style={{ backgroundColor: color, color: '#fff' }}>
+          {label}
+        </span>
+      )
+    case 'medal':
+      return (
+        <span className="inline-flex items-stretch overflow-hidden rounded-full border text-[10.5px] font-semibold leading-[17px]" style={{ borderColor: color }}>
+          <span className="flex items-center px-1.5" style={{ backgroundColor: color, color: '#fff' }}>
+            <Crown size={9} />
+          </span>
+          <span className="px-1.5 py-px" style={{ color }}>
+            {label}
+          </span>
+        </span>
+      )
+    case 'ribbon':
+      // 角标丝带只适合卡片容器，行内 pill 场景近似为实心 + 粗字重 + 加宽字距
+      // （同桌面端 _PlanTag 的有意简化）。
+      return (
+        <span className={base} style={{ backgroundColor: color, color: '#fff', fontWeight: 800, letterSpacing: '0.05em' }}>
+          {label}
+        </span>
+      )
+    default:
+      return (
+        <span className={base} style={{ border: `1.3px solid ${color}`, color, backgroundColor: 'color-mix(in srgb, currentColor 8%, transparent)' }}>
+          <Crown size={9} />
+          {label}
+        </span>
+      )
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 错误码 → 本地化文案；未识别的 code 回退服务端原文 message。
@@ -534,6 +634,8 @@ function RegisterCard({
   const [sentAt, setSentAt] = useState(0)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  // 密码明文显示切换（眼睛按钮，同登录页访问密钥的既有模式）。
+  const [showPassword, setShowPassword] = useState(false)
 
   async function doRegister() {
     setBusy(true)
@@ -622,15 +724,26 @@ function RegisterCard({
             onChange={(e) => setEmail(e.target.value)}
           />
           <label className="field-label">{t('cloud.passwordPlaceholder')}</label>
-          <input
-            className="text-input"
-            type="password"
-            required
-            placeholder={t('cloud.passwordPlaceholder')}
-            value={password}
-            disabled={busy}
-            onChange={(e) => setPassword(e.target.value)}
-          />
+          <div className="pw-field">
+            <input
+              className="text-input"
+              type={showPassword ? 'text' : 'password'}
+              required
+              placeholder={t('cloud.passwordPlaceholder')}
+              value={password}
+              disabled={busy}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <button
+              type="button"
+              className="pw-toggle"
+              title={showPassword ? t('cloud.hidePassword') : t('cloud.showPassword')}
+              aria-label={showPassword ? t('cloud.hidePassword') : t('cloud.showPassword')}
+              onClick={() => setShowPassword((v) => !v)}
+            >
+              {showPassword ? <EyeOff /> : <Eye />}
+            </button>
+          </div>
           <p className="mt-1 text-[11px] text-text3">{t('cloud.passwordHint')}</p>
           <label className="field-label">{t('cloud.nicknamePlaceholder')}</label>
           <div className="flex items-center gap-2">
@@ -675,7 +788,7 @@ function RegisterCard({
 // 已登录：资料卡 + 设备列表
 // ---------------------------------------------------------------------------
 
-function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan: string; originId: number | null } }) {
+function LoggedInPanel({ user }: { user: CloudUser }) {
   const { t } = useI18n()
   const qc = useQueryClient()
   const [loggingOut, setLoggingOut] = useState(false)
@@ -684,6 +797,9 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
   const [nicknameRevealed, setNicknameRevealed] = useState(false)
   const [nicknameHovering, setNicknameHovering] = useState(false)
   const displayName = user.nickname || user.email.split('@')[0]
+  // 徽标渲染用套餐目录（本地快照秒开 + 后台拉取覆盖，见 useCatalogPlans）。
+  const catalog = useCatalogPlans()
+  const currentPlan = catalog.find((p) => p.code === user.plan)
 
   // 套餐能力 + 自助修改机会是否已用掉：GET /me 独立拉取（登录/刷新响应的 entitlements
   // 不落会话快照，仅在这一处门控编辑入口用得上，没必要为它扩大 session.ts 的职责）。
@@ -693,6 +809,8 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
     staleTime: 10_000,
   })
   const canEditOriginId = !!meQuery.data?.entitlements.originIdEdit && !meQuery.data?.originIdChanged
+  // 旧会话快照（登录早于 membershipOrdinal 上线）缺该字段时回退 /me 结果。
+  const membershipOrdinal = user.membershipOrdinal ?? meQuery.data?.membershipOrdinal
 
   async function logout() {
     setLoggingOut(true)
@@ -749,7 +867,15 @@ function LoggedInPanel({ user }: { user: { nickname: string; email: string; plan
                 <Pencil size={14} />
               </button>
             ) : null}
-            {user.plan ? (
+            {currentPlan ? (
+              // 硬规则同桌面端：徽标是否渲染唯一由 plan.badge 是否非空决定，
+              // 空（服务端未配置，如免费档）时整行不出现任何徽标。
+              currentPlan.badge ? (
+                <PlanBadge plan={currentPlan} ordinal={membershipOrdinal} />
+              ) : null
+            ) : user.plan ? (
+              // 目录未加载完成/未匹配到该 code：纯数据可用性问题，降级为旧的
+              // 纯文本 pill 展示原始 plan code，不让徽标整个消失。
               <span className="rounded-full bg-accent-weak px-2 py-0.5 text-[10.5px] font-semibold text-accent">{user.plan}</span>
             ) : null}
             <OriginIdBadge originId={user.originId} />

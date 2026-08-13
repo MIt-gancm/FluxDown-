@@ -507,6 +507,8 @@
   "cloud.emailPlaceholder": "邮箱地址",
   "cloud.accountPlaceholder": "邮箱 / Origin ID",
   "cloud.passwordPlaceholder": "密码",
+  "cloud.showPassword": "显示密码",
+  "cloud.hidePassword": "隐藏密码",
   "cloud.sendCode": "获取验证码",
   "cloud.codeLoginSubtitle": "验证码已发送至 {email}，10 分钟内有效。",
   "cloud.deviceVerifyTitle": "新设备验证",

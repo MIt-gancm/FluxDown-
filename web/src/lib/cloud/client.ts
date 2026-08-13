@@ -7,7 +7,7 @@
 // promise，避免刷新风暴。
 
 import { applyCloudSession, clearCloudSession, cloudDefaultDeviceName, cloudDeviceId, CLOUD_DEVICE_PLATFORM, getCloudAccessToken, getCloudRefreshToken } from './session'
-import type { AuthResponse, CdnConfig, CdnConfigResult, CheckOriginIdResponse, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RandomOriginIdResponse, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
+import type { AuthResponse, CatalogPlan, CdnConfig, CdnConfigResult, CheckOriginIdResponse, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RandomOriginIdResponse, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
 import { CloudApiError } from './types'
 
 /** 默认服务地址：Actions 打包时经 VITE_FLUXCLOUD_BASE_URL 构建期注入官方地址，
@@ -194,6 +194,8 @@ export const cloudApi = {
 
   /** GET /me：当前用户信息 + 套餐能力快照。 */
   me: () => authedRequest<CloudProfile>('GET', '/me'),
+  /** GET /plans/catalog：公开无鉴权，返回上架套餐（账户页徽标渲染用）。 */
+  plansCatalog: () => rawRequest<CatalogPlan[]>('GET', '/plans/catalog'),
 
   /** GET /me/origin-id/random：套餐允许自助改 Origin ID 时给出一个建议值(倾向"豹子号"，
    *  不锁定，仅供骰子按钮回填输入框)。403 origin_id_change_not_allowed / 409
