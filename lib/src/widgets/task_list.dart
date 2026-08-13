@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:ui' as ui;
 
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 import '../i18n/locale_provider.dart';
 import '../models/download_controller.dart';
@@ -66,6 +69,282 @@ class _TaskListState extends State<TaskList> {
   GlobalKey _memberKeyFor(String taskId) =>
       _memberRowKeys.putIfAbsent(taskId, () => GlobalKey());
 
+  // ===========================================================================
+  // Ctrl/Shift 点击多选 + 鼠标框选（marquee）—— design 契约见调用方文档。
+  // ===========================================================================
+
+  bool get _ctrlHeld =>
+      HardwareKeyboard.instance.isControlPressed ||
+      HardwareKeyboard.instance.isMetaPressed;
+  bool get _shiftHeld => HardwareKeyboard.instance.isShiftPressed;
+
+  /// 框选拖动阈值（px）：未超过视为普通点击，不激活框选。
+  static const double _marqueeDragThreshold = 4.0;
+
+  /// 靠近列表上/下边缘自动滚动的触发区宽度（px）。
+  static const double _marqueeAutoScrollZone = 24.0;
+  static const double _marqueeAutoScrollMinStep = 4.0;
+  static const double _marqueeAutoScrollMaxStep = 16.0;
+
+  /// 右缘滚动条留白（px）—— 起点落在此区域内的按下不作为框选候选，避免和
+  /// 系统/自绘滚动条交互冲突。
+  static const double _marqueeScrollbarGutter = 16.0;
+
+  /// 列表/网格主体的根 key —— 框选坐标换算的 ancestor，也是自动滚动读取
+  /// 视口尺寸的依据。
+  final GlobalKey _bodyKey = GlobalKey();
+
+  /// 任务行 GlobalKey（框选靠 RenderBox 位置命中；分组头/组内成员/目录行
+  /// 不参与框选，不建 key，同 [_memberRowKeys] 模式）。
+  final Map<String, GlobalKey> _taskRowKeys = {};
+
+  GlobalKey _taskKeyFor(String taskId) =>
+      _taskRowKeys.putIfAbsent(taskId, () => GlobalKey());
+
+  /// 当前渲染顺序下可参与 Shift 范围选择 / 框选的任务 id，每次 build 前
+  /// 刷新（跳过折叠分组头下的行；只收有 taskId 的顶层任务行——任务组/组内
+  /// 成员/目录行不参与，与现有管理模式覆盖范围一致）。
+  List<String> _orderedVisibleIds = const [];
+
+  /// 按下时的候选起点（内容坐标：dy 已叠加 scrollOffset），超过阈值才激活。
+  Offset? _marqueeDownContentPos;
+
+  /// 最近一次指针在 body 视口内的局部坐标（未叠加 scrollOffset）——自动
+  /// 滚动 tick 复用。
+  Offset? _marqueePointerViewportPos;
+
+  /// 按下瞬间是否按住 Ctrl（激活时决定 base 是否继承原有选择）。
+  bool _marqueeDownCtrl = false;
+
+  /// 是否已激活框选（超过拖动阈值）。
+  bool _marqueeActive = false;
+
+  /// 激活时的基础选择集合：按下时按住 Ctrl 则为当时 checkedTaskIds 的拷贝，
+  /// 否则为空集。
+  Set<String> _marqueeBase = const {};
+
+  /// 可见任务行矩形缓存（内容坐标）。激活时逐帧刷新；滚出视口的行保留旧
+  /// 缓存，保证框缩小时仍能正确取消选中。
+  final Map<String, Rect> _marqueeRects = {};
+
+  /// 当前框选矩形（内容坐标），驱动可视层与命中判定。
+  Rect? _marqueeContentRect;
+
+  Timer? _marqueeAutoScrollTimer;
+
+  RenderBox? get _bodyRenderBox =>
+      _bodyKey.currentContext?.findRenderObject() as RenderBox?;
+
+  double get _scrollOffset =>
+      _scrollController.hasClients ? _scrollController.offset : 0.0;
+
+  Offset _toContentOffset(Offset viewportLocal) =>
+      Offset(viewportLocal.dx, viewportLocal.dy + _scrollOffset);
+
+  /// Ctrl/Shift 点击任务行的公共路由：修饰键命中时走范围/单选状态机
+  /// （design 契约 §1/§2），否则维持原有点击语义 —— [isManage] 由调用方
+  /// 按当前实际管理模式静态传入（列表形态下与 `TaskListItem` 内部
+  /// `isManage ? onToggleChecked : onTap` 分支保持一致；网格形态自身即按
+  /// `isManage` 分支，动态传入同样成立）。
+  void _handleTaskTap(String taskId, {required bool isManage}) {
+    if (_ctrlHeld || _shiftHeld) {
+      widget.controller.modifierTapTask(
+        taskId,
+        isShift: _shiftHeld,
+        isCtrl: _ctrlHeld,
+        orderedVisibleIds: _orderedVisibleIds,
+      );
+    } else if (isManage) {
+      widget.controller.toggleTaskChecked(taskId);
+    } else {
+      widget.onTaskTap?.call(taskId);
+    }
+  }
+
+  /// 当前渲染顺序下可参与多选的任务 id：跳过折叠分组头下的行，只收顶层
+  /// [TaskEntity]（任务组/组内成员/目录行不参与）。
+  List<String> _computeOrderedVisibleTaskIds(List<ListSection> sections) {
+    final ids = <String>[];
+    for (final section in sections) {
+      if (section.title != null && _foldedSections.contains(section.key)) {
+        continue;
+      }
+      for (final entity in section.entities) {
+        if (entity is TaskEntity) ids.add(entity.task.id);
+      }
+    }
+    return ids;
+  }
+
+  void _onMarqueePointerDown(PointerDownEvent event) {
+    _marqueeDownContentPos = null;
+    _marqueePointerViewportPos = null;
+    if (event.kind != PointerDeviceKind.mouse ||
+        event.buttons != kPrimaryMouseButton) {
+      return;
+    }
+    final body = _bodyRenderBox;
+    if (body == null) return;
+    final local = body.globalToLocal(event.position);
+    if (local.dx > body.size.width - _marqueeScrollbarGutter) return;
+    _marqueeDownContentPos = _toContentOffset(local);
+    _marqueePointerViewportPos = local;
+    _marqueeDownCtrl = _ctrlHeld;
+  }
+
+  void _onMarqueePointerMove(PointerMoveEvent event) {
+    final downContent = _marqueeDownContentPos;
+    if (downContent == null) return;
+    final body = _bodyRenderBox;
+    if (body == null) return;
+    final local = body.globalToLocal(event.position);
+    _marqueePointerViewportPos = local;
+    final currentContent = _toContentOffset(local);
+
+    if (!_marqueeActive) {
+      if ((currentContent - downContent).distance < _marqueeDragThreshold) {
+        return;
+      }
+      _marqueeActive = true;
+      _marqueeBase = _marqueeDownCtrl
+          ? Set.of(widget.controller.checkedTaskIds)
+          : const <String>{};
+      _marqueeRects.clear();
+      _startMarqueeAutoScroll();
+    }
+    _updateMarqueeRect(downContent, currentContent, body);
+  }
+
+  void _endMarqueeGesture([PointerEvent? _]) {
+    _marqueeAutoScrollTimer?.cancel();
+    _marqueeAutoScrollTimer = null;
+    _marqueeDownContentPos = null;
+    _marqueePointerViewportPos = null;
+    if (_marqueeActive) {
+      setState(() {
+        _marqueeActive = false;
+        _marqueeContentRect = null;
+      });
+    }
+  }
+
+  void _startMarqueeAutoScroll() {
+    _marqueeAutoScrollTimer?.cancel();
+    _marqueeAutoScrollTimer = Timer.periodic(
+      const Duration(milliseconds: 16),
+      (_) => _tickMarqueeAutoScroll(),
+    );
+  }
+
+  void _tickMarqueeAutoScroll() {
+    if (!_marqueeActive || !_scrollController.hasClients) return;
+    final body = _bodyRenderBox;
+    final pointer = _marqueePointerViewportPos;
+    final down = _marqueeDownContentPos;
+    if (body == null || pointer == null || down == null) return;
+    final height = body.size.height;
+    double delta = 0;
+    if (pointer.dy < _marqueeAutoScrollZone) {
+      final proximity =
+          ((_marqueeAutoScrollZone - pointer.dy) / _marqueeAutoScrollZone)
+              .clamp(0.0, 1.0);
+      delta =
+          -(_marqueeAutoScrollMinStep +
+              (_marqueeAutoScrollMaxStep - _marqueeAutoScrollMinStep) *
+                  proximity);
+    } else if (pointer.dy > height - _marqueeAutoScrollZone) {
+      final proximity =
+          ((pointer.dy - (height - _marqueeAutoScrollZone)) /
+                  _marqueeAutoScrollZone)
+              .clamp(0.0, 1.0);
+      delta =
+          _marqueeAutoScrollMinStep +
+          (_marqueeAutoScrollMaxStep - _marqueeAutoScrollMinStep) * proximity;
+    }
+    if (delta == 0) return;
+    final position = _scrollController.position;
+    final next = (_scrollController.offset + delta).clamp(
+      position.minScrollExtent,
+      position.maxScrollExtent,
+    );
+    if (next == _scrollController.offset) return;
+    _scrollController.jumpTo(next);
+    _updateMarqueeRect(down, _toContentOffset(pointer), body);
+  }
+
+  void _updateMarqueeRect(
+    Offset downContent,
+    Offset currentContent,
+    RenderBox body,
+  ) {
+    final rect = Rect.fromPoints(downContent, currentContent);
+    _refreshMarqueeRects(body);
+    final visibleIds = _orderedVisibleIds.toSet();
+    final hits = <String>{
+      for (final entry in _marqueeRects.entries)
+        if (visibleIds.contains(entry.key) && entry.value.overlaps(rect))
+          entry.key,
+    };
+    widget.controller.setMarqueeChecked(hits, base: _marqueeBase);
+    setState(() => _marqueeContentRect = rect);
+  }
+
+  void _refreshMarqueeRects(RenderBox body) {
+    final scrollOffset = _scrollOffset;
+    for (final entry in _taskRowKeys.entries) {
+      final ctx = entry.value.currentContext;
+      if (ctx == null) continue;
+      final renderObj = ctx.findRenderObject();
+      if (renderObj is! RenderBox || !renderObj.attached) continue;
+      final topLeft = renderObj.localToGlobal(Offset.zero, ancestor: body);
+      _marqueeRects[entry.key] = Rect.fromLTWH(
+        topLeft.dx,
+        topLeft.dy + scrollOffset,
+        renderObj.size.width,
+        renderObj.size.height,
+      );
+    }
+  }
+
+  Widget _buildMarqueeArea(BuildContext context, Widget body) {
+    final c = AppColors.of(context);
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: _onMarqueePointerDown,
+      onPointerMove: _onMarqueePointerMove,
+      onPointerUp: _endMarqueeGesture,
+      onPointerCancel: _endMarqueeGesture,
+      child: Stack(
+        key: _bodyKey,
+        children: [
+          body,
+          if (_marqueeActive && _marqueeContentRect != null)
+            _buildMarqueeOverlay(c),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMarqueeOverlay(AppColors c) {
+    final body = _bodyRenderBox;
+    final contentRect = _marqueeContentRect;
+    if (body == null || contentRect == null) return const SizedBox.shrink();
+    final viewportRect = contentRect.translate(0, -_scrollOffset);
+    final visible = viewportRect.intersect(Offset.zero & body.size);
+    if (visible.isEmpty) return const SizedBox.shrink();
+    return Positioned.fromRect(
+      rect: visible,
+      child: IgnorePointer(
+        child: Container(
+          decoration: BoxDecoration(
+            border: Border.all(color: c.accent, width: 1),
+            color: c.accent.withValues(alpha: 0.10),
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -76,6 +355,7 @@ class _TaskListState extends State<TaskList> {
   void dispose() {
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
+    _marqueeAutoScrollTimer?.cancel();
     super.dispose();
   }
 
@@ -216,6 +496,7 @@ class _TaskListState extends State<TaskList> {
         final prefs = _prefs;
         final sections = widget.controller.buildListSections(prefs);
         final isEmpty = sections.every((s) => s.entities.isEmpty);
+        _orderedVisibleIds = _computeOrderedVisibleTaskIds(sections);
         // 底色由主区统一给（HomePage._buildContentArea = surface1），
         // 这里不再自带一层 —— 两块列表各染各的会让切换 RSS 时底色跳。
         return LayoutBuilder(
@@ -237,9 +518,22 @@ class _TaskListState extends State<TaskList> {
                     children: [
                       isEmpty
                           ? _buildEmpty(context)
-                          : prefs.form == ViewForm.list
-                          ? _buildListBody(context, prefs, sections, listWidth)
-                          : _buildGridBody(context, prefs, sections, listWidth),
+                          : _buildMarqueeArea(
+                              context,
+                              prefs.form == ViewForm.list
+                                  ? _buildListBody(
+                                      context,
+                                      prefs,
+                                      sections,
+                                      listWidth,
+                                    )
+                                  : _buildGridBody(
+                                      context,
+                                      prefs,
+                                      sections,
+                                      listWidth,
+                                    ),
+                            ),
                       if (_showScrollToTop)
                         Positioned(
                           right: 16,
@@ -412,11 +706,11 @@ class _TaskListState extends State<TaskList> {
                     }
                     final task = (entity as TaskEntity).task;
                     return RepaintBoundary(
-                      key: ValueKey(task.id),
+                      key: _taskKeyFor(task.id),
                       child: TaskListItem(
                         task: task,
                         isSelected: task.id == widget.controller.selectedTaskId,
-                        onTap: () => widget.onTaskTap?.call(task.id),
+                        onTap: () => _handleTaskTap(task.id, isManage: false),
                         onDoubleTap: () => _onDoubleTap(task),
                         onPause: () => widget.controller.pauseTask(task.id),
                         onResume: () => widget.controller.resumeTask(task.id),
@@ -439,7 +733,7 @@ class _TaskListState extends State<TaskList> {
                           task.id,
                         ),
                         onToggleChecked: () =>
-                            widget.controller.toggleTaskChecked(task.id),
+                            _handleTaskTap(task.id, isManage: true),
                         density: prefs.density,
                         columns: columns,
                         protocolBadges: prefs.protocolBadges,
@@ -589,6 +883,7 @@ class _TaskListState extends State<TaskList> {
       final width = cardWidth * span + gap * (span - 1);
       children.add(
         SizedBox(
+          key: entity is TaskEntity ? _taskKeyFor(entity.task.id) : null,
           width: width,
           height: _gridCardHeight,
           child: _buildGridCard(context, entity, isManage),
@@ -633,13 +928,7 @@ class _TaskListState extends State<TaskList> {
       isSelected: task.id == widget.controller.selectedTaskId,
       isManageMode: isManage,
       isChecked: widget.controller.checkedTaskIds.contains(task.id),
-      onTap: () {
-        if (isManage) {
-          widget.controller.toggleTaskChecked(task.id);
-        } else {
-          widget.onTaskTap?.call(task.id);
-        }
-      },
+      onTap: () => _handleTaskTap(task.id, isManage: isManage),
       onDoubleTap: () => _onDoubleTap(task),
       onPause: () => widget.controller.pauseTask(task.id),
       onResume: () => widget.controller.resumeTask(task.id),

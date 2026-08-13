@@ -10,7 +10,7 @@
 // 成员）可见，命中成员文件名时组行+命中成员可见（组行仅在有可见成员时出现，计数按可见
 // 成员）。组行本身不参与既有多选批量。
 
-import { useEffect, useRef, useState, type CSSProperties, type MouseEvent } from 'react'
+import { useEffect, useRef, useState, type CSSProperties, type MouseEvent, type PointerEvent as ReactPointerEvent } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import { ChevronDown, ChevronRight, Folder } from 'lucide-react'
@@ -60,6 +60,12 @@ const GRID_CARD_HEIGHT = 138
 const GRID_GAP = 10
 const GRID_ROW_SIZE = GRID_CARD_HEIGHT + GRID_GAP
 const GRID_CARD_MIN_WIDTH = 210
+// 框选（marquee）调参：拖动位移超过该阈值才激活，避免吞掉普通点击；激活后指针进入
+// 容器上下边缘这个宽度区间即自动滚动，速度按贴近边缘程度在 [MIN,MAX] 间线性插值。
+const MARQUEE_ACTIVATE_PX = 4
+const MARQUEE_EDGE_PX = 28
+const MARQUEE_SCROLL_STEP_MIN = 4
+const MARQUEE_SCROLL_STEP_MAX = 18
 
 export function TaskList() {
   const { t } = useI18n()
@@ -78,6 +84,10 @@ export function TaskList() {
     collapsedDirs,
     toggleDirCollapsed,
     clearSelection,
+    selected,
+    setSelected,
+    enterManageMode,
+    visibleTaskOrderRef,
   } = useTasksUi()
   const prefs = useViewPrefs(statusTab)
   const tasks = useViewTasks()
@@ -88,7 +98,26 @@ export function TaskList() {
   const isRemoteDeviceFilter = deviceFilter !== null && deviceFilter !== cloudDeviceId()
   const remoteTasksForDevice = isRemoteDeviceFilter ? remoteTasks.filter((rt) => rt.toDevice === deviceFilter) : []
   const parentRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
   const [containerWidth, setContainerWidth] = useState(960)
+  // 框选拖拽会话：pointerdown 时建立，pointerup/cancel 时清空；不用 state 是因为
+  // pointermove 高频触发，state 更新走 setSelected/setMarqueeRect 已够，会话本身
+  // 只需在事件间存活，不需要触发渲染。
+  const dragRef = useRef<{
+    pointerId: number
+    ctrlAtStart: boolean
+    base: Set<string>
+    startX: number
+    startY: number
+    clientX: number
+    clientY: number
+    active: boolean
+    rafId: number | null
+  } | null>(null)
+  // 框选松手后短暂拦截紧随其后的 click（否则会被当成点在行/空白上，
+  // 触发详情面板打开或清空选中）；容器 onClickCapture 消费一次即复位。
+  const suppressClickRef = useRef(false)
+  const [marqueeRect, setMarqueeRect] = useState<{ left: number; top: number; width: number; height: number } | null>(null)
 
   useEffect(() => {
     const el = parentRef.current
@@ -180,6 +209,19 @@ export function TaskList() {
     }
   }
 
+  // 可参与多选的可见顺序（Shift 范围选择/框选用）：任务组行/折叠分组内成员/远程行
+  // 都不参与，与 flat 装配规则保持一致——每次渲染后写入，供事件回调读取最新值。
+  useEffect(() => {
+    const order: string[] = []
+    for (const item of flat) {
+      if (item.kind === 'row' || item.kind === 'groupmember') order.push(item.task.taskId)
+      else if (item.kind === 'gridrow') {
+        for (const e of item.entities) if (e.kind === 'task') order.push(e.task.taskId)
+      }
+    }
+    visibleTaskOrderRef.current = order
+  })
+
   // 紧凑档行高（design §4.4：任务/组行 44+4、目录行 24）；网格形态密度不适用。
   const isCompact = prefs.density === 'compact'
   const virtualizer = useVirtualizer({
@@ -217,13 +259,168 @@ export function TaskList() {
     if (!(e.target as HTMLElement).closest('.task-row, .grow, .gcard, .group-head, .gdir-row, .ctxmenu')) clearSelection()
   }
 
+  // 卸载时若还在拖拽中，取消挂着的自动滚动 rAF，避免泄漏。
+  useEffect(() => {
+    return () => {
+      const rafId = dragRef.current?.rafId
+      if (rafId !== null && rafId !== undefined) cancelAnimationFrame(rafId)
+    }
+  }, [])
+
+  function isInteractiveTarget(target: EventTarget | null) {
+    return target instanceof HTMLElement && target.closest('button, input, a, select, textarea, .mcheck, .ctxmenu') !== null
+  }
+
+  // 客户端坐标 → 内容坐标：相对撑高层（`contentRef`）左上角，与虚拟项的 `vi.start`
+  // 同一坐标系——撑高层随滚动整体位移，这里直接减它的 boundingRect 天然抵消滚动。
+  function contentPoint(clientX: number, clientY: number) {
+    const rect = contentRef.current?.getBoundingClientRect()
+    if (!rect) return { x: 0, y: 0 }
+    return { x: clientX - rect.left, y: clientY - rect.top }
+  }
+
+  // 框选命中：纵向用 virtualizer.measurementsCache 与矩形做区间相交——它覆盖全量
+  // flat（懒物化，见 lazy-measurements.ts），不依赖行是否已经渲染进 DOM；横向
+  // row/groupmember 视为整行命中，gridrow 按行内槽位坐标算（group 卡占 2 槽但
+  // 跳过不参与多选，网格降级）。
+  function computeMarqueeHits(x1: number, y1: number, x2: number, y2: number): Set<string> {
+    const top = Math.min(y1, y2)
+    const bottom = Math.max(y1, y2)
+    const left = Math.min(x1, x2)
+    const right = Math.max(x1, x2)
+    const hits = new Set<string>()
+    const cellWidth = isGrid ? (containerWidth - (cardsPerRow - 1) * GRID_GAP) / cardsPerRow : 0
+    for (let i = 0; i < flat.length; i++) {
+      const m = virtualizer.measurementsCache[i]
+      if (!m || m.end < top || m.start > bottom) continue
+      const item = flat[i]
+      if (item.kind === 'row' || item.kind === 'groupmember') {
+        hits.add(item.task.taskId)
+      } else if (item.kind === 'gridrow') {
+        let used = 0
+        for (const e of item.entities) {
+          const cost = e.kind === 'group' ? Math.min(2, cardsPerRow) : 1
+          const slotLeft = used * (cellWidth + GRID_GAP)
+          const slotRight = slotLeft + cellWidth * cost + GRID_GAP * (cost - 1)
+          if (e.kind === 'task' && slotRight >= left && slotLeft <= right) hits.add(e.task.taskId)
+          used += cost
+        }
+      }
+    }
+    return hits
+  }
+
+  // 按当前拖拽矩形重算选中态 + 可视框；随拖动实时增减（矩形缩小会取消命中，不是只增）。
+  function applyMarqueeRect(startX: number, startY: number, curX: number, curY: number, base: Set<string> | null) {
+    const hits = computeMarqueeHits(startX, startY, curX, curY)
+    setSelected(base ? new Set([...base, ...hits]) : hits)
+    setMarqueeRect({ left: Math.min(startX, curX), top: Math.min(startY, curY), width: Math.abs(curX - startX), height: Math.abs(curY - startY) })
+  }
+
+  // 指针贴近容器可视上/下边缘 MARQUEE_EDGE_PX 内时持续滚动，速度按贴近程度插值；
+  // 每帧都用最新 lastClient 坐标重算矩形，滚动位移不会让已选中范围跟丢。
+  function marqueeAutoScrollTick() {
+    const drag = dragRef.current
+    const el = parentRef.current
+    if (!drag || !drag.active || !el) return
+    const rect = el.getBoundingClientRect()
+    const distTop = drag.clientY - rect.top
+    const distBottom = rect.bottom - drag.clientY
+    let dy = 0
+    if (distTop < MARQUEE_EDGE_PX) {
+      const proximity = 1 - Math.max(0, distTop) / MARQUEE_EDGE_PX
+      dy = -(MARQUEE_SCROLL_STEP_MIN + proximity * (MARQUEE_SCROLL_STEP_MAX - MARQUEE_SCROLL_STEP_MIN))
+    } else if (distBottom < MARQUEE_EDGE_PX) {
+      const proximity = 1 - Math.max(0, distBottom) / MARQUEE_EDGE_PX
+      dy = MARQUEE_SCROLL_STEP_MIN + proximity * (MARQUEE_SCROLL_STEP_MAX - MARQUEE_SCROLL_STEP_MIN)
+    }
+    if (dy !== 0) {
+      el.scrollTop += dy
+      const cur = contentPoint(drag.clientX, drag.clientY)
+      applyMarqueeRect(drag.startX, drag.startY, cur.x, cur.y, drag.ctrlAtStart ? drag.base : null)
+    }
+    drag.rafId = requestAnimationFrame(marqueeAutoScrollTick)
+  }
+
+  function onMarqueePointerDown(e: ReactPointerEvent<HTMLDivElement>) {
+    if (isRemoteDeviceFilter || e.button !== 0 || isInteractiveTarget(e.target)) return
+    const { x, y } = contentPoint(e.clientX, e.clientY)
+    dragRef.current = {
+      pointerId: e.pointerId,
+      ctrlAtStart: e.ctrlKey || e.metaKey,
+      base: new Set(selected),
+      startX: x,
+      startY: y,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      active: false,
+      rafId: null,
+    }
+  }
+
+  function onMarqueePointerMove(e: ReactPointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    drag.clientX = e.clientX
+    drag.clientY = e.clientY
+    const { x, y } = contentPoint(e.clientX, e.clientY)
+    if (!drag.active) {
+      if (Math.hypot(x - drag.startX, y - drag.startY) <= MARQUEE_ACTIVATE_PX) return
+      drag.active = true
+      // 到这里才捕获指针：pointerdown 就捕获会让 Chrome 把兼容 click 一并重定向到
+      // 容器，行/卡片的 onClick 永远收不到；激活后捕获只为拖出窗口时仍收到 move/up，
+      // 而框选松手后的 click 本来就会被 suppressClickRef 吞掉，重定向无副作用。
+      e.currentTarget.setPointerCapture(e.pointerId)
+      enterManageMode()
+      drag.rafId = requestAnimationFrame(marqueeAutoScrollTick)
+    }
+    applyMarqueeRect(drag.startX, drag.startY, x, y, drag.ctrlAtStart ? drag.base : null)
+  }
+
+  function endMarqueeDrag(e: ReactPointerEvent<HTMLDivElement>) {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    if (drag.rafId !== null) cancelAnimationFrame(drag.rafId)
+    // 激活过（真正框选过）才吞掉紧随的 click；纯点击（未过阈值）不受影响，原有
+    // 单击/双击/右键行为照常。
+    if (drag.active) suppressClickRef.current = true
+    dragRef.current = null
+    setMarqueeRect(null)
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.releasePointerCapture(e.pointerId)
+  }
+
+  // 框选松手后的 click 先打到这里（捕获阶段先于冒泡阶段的 onScrollAreaClick）：
+  // 吞掉这一次，避免被当成点在行/空白上误触发详情面板或清空选中。
+  function onScrollAreaClickCapture(e: MouseEvent<HTMLDivElement>) {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false
+      e.preventDefault()
+      e.stopPropagation()
+    }
+  }
+
   return (
-    <div className={cn('task-scroll', manageMode && 'manage', isGrid && 'grid-form')} ref={parentRef} onClick={onScrollAreaClick}>
+    <div
+      className={cn('task-scroll', manageMode && 'manage', isGrid && 'grid-form', marqueeRect && 'marqueeing')}
+      ref={parentRef}
+      onClick={onScrollAreaClick}
+      onClickCapture={onScrollAreaClickCapture}
+      onPointerDown={onMarqueePointerDown}
+      onPointerMove={onMarqueePointerMove}
+      onPointerUp={endMarqueeDrag}
+      onPointerCancel={endMarqueeDrag}
+    >
       {statusTab === 'seeding' && <SeedingSummaryBar />}
       {flat.length === 0 ? (
         <p className="empty-tip">{t('list.empty')}</p>
       ) : (
-        <div style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+        <div ref={contentRef} style={{ height: virtualizer.getTotalSize(), position: 'relative' }}>
+          {marqueeRect && (
+            <div
+              className="task-marquee"
+              style={{ left: marqueeRect.left, top: marqueeRect.top, width: marqueeRect.width, height: marqueeRect.height }}
+            />
+          )}
           {virtualizer.getVirtualItems().map((vi) => {
             const item = flat[vi.index]
             return (

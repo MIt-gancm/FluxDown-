@@ -41,7 +41,7 @@ function StatusIcon({ status }: { status: ViewTask['status'] }) {
 /** 单任务网格卡 1×（design-proto `.gcard`）。 */
 export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTask; queues: QueueDto[]; protocolBadges: boolean }) {
   const { t: tr } = useI18n()
-  const { selectTask, closeDetail, currentTaskId, detailOpen, selected, setSelected } = useTasksUi()
+  const { selectTask, closeDetail, currentTaskId, detailOpen, selected, modifierClickTask, toggleTaskSelected } = useTasksUi()
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['tasks'] })
 
@@ -56,15 +56,6 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
   const pct = t.totalBytes > 0 ? Math.round((t.downloadedBytes / t.totalBytes) * 100) : 0
   const cls = statusIconClass(t.status)
   const name = t.fileName || t.url
-
-  function toggleSelected(checked: boolean) {
-    setSelected((prev) => {
-      const next = new Set(prev)
-      if (checked) next.add(t.taskId)
-      else next.delete(t.taskId)
-      return next
-    })
-  }
 
   const meta = isSeeding(t) ? (
     <>
@@ -112,10 +103,22 @@ export function TaskGridCard({ task: t, queues, protocolBadges }: { task: ViewTa
       <div
         className={cn('gcard', t.status === 3 && 'is-done-card', t.status === 4 && 'is-err-card', currentTaskId === t.taskId && 'selected')}
         // 左键单击打开详情；再次点击已选中的卡 = 关闭（右键只弹菜单）。
-        onClick={() => (currentTaskId === t.taskId && detailOpen ? closeDetail() : selectTask(t.taskId))}
+        // Ctrl/Cmd 或 Shift 按下时改走多选（见 context.tsx modifierClickTask）。
+        onClick={(e) => {
+          if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            modifierClickTask(t.taskId, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+            return
+          }
+          if (currentTaskId === t.taskId && detailOpen) closeDetail()
+          else selectTask(t.taskId)
+        }}
+        // Shift+点击默认会拉出一段文本选区，先按下就拦掉。
+        onMouseDown={(e) => {
+          if (e.shiftKey) e.preventDefault()
+        }}
       >
         <label className="mcheck gcard-check" onClick={(e) => e.stopPropagation()}>
-          <input type="checkbox" checked={selected.has(t.taskId)} onChange={(e) => toggleSelected(e.target.checked)} />
+          <input type="checkbox" checked={selected.has(t.taskId)} onChange={(e) => toggleTaskSelected(t.taskId, e.target.checked)} />
           <i />
         </label>
         <div className="gcard-top">

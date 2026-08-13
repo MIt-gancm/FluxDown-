@@ -1,7 +1,7 @@
 // 任务主界面的纯 UI 状态（筛选 / 搜索 / 选中 / 折叠 / 详情面板），与服务端数据（React Query）分离。
 // react-compiler 已启用，不手写 useMemo/useCallback。
 
-import { createContext, useContext, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react'
+import { createContext, useContext, useRef, useState, type Dispatch, type ReactNode, type RefObject, type SetStateAction } from 'react'
 import { dirKey } from '../../lib/task-group'
 import { ALL_CATEGORY } from '../../lib/categories'
 import type { StatusTab } from './filters'
@@ -30,6 +30,20 @@ interface TasksUiState {
   setManageMode: Dispatch<SetStateAction<boolean>>
   selected: Set<string>
   setSelected: Dispatch<SetStateAction<Set<string>>>
+  /** 范围多选锚点（Shift 范围选择的起点 taskId）：退出管理模式/批量删除后失效——批量删除
+   *  后该 taskId 已不在 visibleTaskOrderRef 里，下一次 Shift 点击会按“锚点不在可见顺序中”
+   *  退化为单选，无需额外清理。 */
+  rangeAnchorRef: RefObject<string | null>
+  /** 当前可见渲染顺序（仅含可参与多选的 taskId，按渲染先后）：TaskList 每次渲染后写入，
+   *  供 Shift 范围选择与框选命中计算使用。 */
+  visibleTaskOrderRef: RefObject<string[]>
+  /** 进入管理模式但不清空 selected（Ctrl/Shift 点击、框选走这条路径）；对比会清空
+   *  selected 的 setManageMode（手动切换管理模式开关）。 */
+  enterManageMode: () => void
+  /** 手动点复选框：更新选中态并把 anchor 设为该任务。 */
+  toggleTaskSelected: (taskId: string, checked: boolean) => void
+  /** Ctrl/Shift 修饰键点击任务行/卡片的统一处理（多选契约见 TaskList.tsx）。 */
+  modifierClickTask: (taskId: string, mods: { ctrl: boolean; shift: boolean }) => void
   foldedSections: Set<string>
   toggleSectionFold: (key: string) => void
   expandedGroups: Set<string>
@@ -68,6 +82,8 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
   const [search, setSearch] = useState('')
   const [manageMode, setManageModeState] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const rangeAnchorRef = useRef<string | null>(null)
+  const visibleTaskOrderRef = useRef<string[]>([])
   const [foldedSections, setFoldedSections] = useState<Set<string>>(new Set())
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set())
   const [scrollTarget, setScrollTarget] = useState<string | null>(null)
@@ -80,8 +96,59 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
   const [detailTab, setDetailTab] = useState<DetailTab>('general')
 
   function setManageMode(v: SetStateAction<boolean>) {
-    setManageModeState(v)
+    setManageModeState((prev) => {
+      const next = typeof v === 'function' ? (v as (p: boolean) => boolean)(prev) : v
+      if (!next) rangeAnchorRef.current = null
+      return next
+    })
     setSelected(new Set())
+  }
+  /** Ctrl/Shift 点击、框选的入口：进入管理模式但不清空 selected（区别于 setManageMode）。 */
+  function enterManageMode() {
+    setManageModeState(true)
+  }
+  function toggleTaskSelected(taskId: string, checked: boolean) {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (checked) next.add(taskId)
+      else next.delete(taskId)
+      return next
+    })
+    rangeAnchorRef.current = taskId
+  }
+  // 契约（TaskList.tsx 顶部注释同步）：纯 Ctrl → 切换该任务并把 anchor 设为它；
+  // Shift 时若 anchor 缺失/已不在当前可见顺序（如筛选变化、批量删除）里，退化为单选
+  // 该任务并重设 anchor；否则按可见顺序取 anchor↔目标闭区间，无 Ctrl 替换选择、
+  // 同时按 Ctrl 与既有选择取并集，anchor 保持不变。
+  function modifierClickTask(taskId: string, mods: { ctrl: boolean; shift: boolean }) {
+    enterManageMode()
+    if (mods.shift) {
+      const order = visibleTaskOrderRef.current
+      const anchor = rangeAnchorRef.current
+      const anchorIdx = anchor !== null ? order.indexOf(anchor) : -1
+      const targetIdx = order.indexOf(taskId)
+      if (anchorIdx < 0 || targetIdx < 0) {
+        rangeAnchorRef.current = taskId
+        // 与桌面端对齐：锚点失效时退化为单选，但按住 Ctrl 仍保留既有选择（并集）。
+        if (mods.ctrl) setSelected((prev) => new Set(prev).add(taskId))
+        else setSelected(new Set([taskId]))
+        return
+      }
+      const [lo, hi] = anchorIdx <= targetIdx ? [anchorIdx, targetIdx] : [targetIdx, anchorIdx]
+      const range = order.slice(lo, hi + 1)
+      if (mods.ctrl) setSelected((prev) => new Set([...prev, ...range]))
+      else setSelected(new Set(range))
+      return
+    }
+    if (mods.ctrl) {
+      setSelected((prev) => {
+        const next = new Set(prev)
+        if (next.has(taskId)) next.delete(taskId)
+        else next.add(taskId)
+        return next
+      })
+      rangeAnchorRef.current = taskId
+    }
   }
   function setDeviceFilter(v: SetStateAction<string | null>) {
     setDeviceFilterState((prev) => {
@@ -180,6 +247,11 @@ export function TasksUiProvider({ children }: { children: ReactNode }) {
         setManageMode,
         selected,
         setSelected,
+        rangeAnchorRef,
+        visibleTaskOrderRef,
+        enterManageMode,
+        toggleTaskSelected,
+        modifierClickTask,
         foldedSections,
         toggleSectionFold,
         expandedGroups,

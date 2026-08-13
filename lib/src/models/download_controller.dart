@@ -12,6 +12,7 @@ import 'download_queue.dart';
 import 'download_task.dart';
 import 'list_entity.dart';
 import 'task_group.dart';
+import 'task_selection.dart';
 import 'view_prefs.dart';
 
 const _tag = 'DownloadCtrl';
@@ -70,6 +71,10 @@ class DownloadController extends ChangeNotifier {
   // 管理模式（多选）
   bool _isManageMode = false;
   final Set<String> _checkedTaskIds = {};
+
+  /// Shift 范围选择锚点 —— Ctrl/Shift 点击、手动勾选复选框均会收敛到最近
+  /// 一次操作的目标任务；退出管理模式 / 批量删除后清空（design 契约 §5）。
+  String? _rangeAnchorTaskId;
 
   // 时间分组折叠状态（key 为 TimeGroup，value 为是否折叠）
   final Map<TimeGroup, bool> _collapsedGroups = {};
@@ -576,7 +581,10 @@ class DownloadController extends ChangeNotifier {
   /// 进入/退出管理模式
   void toggleManageMode() {
     _isManageMode = !_isManageMode;
-    if (!_isManageMode) _checkedTaskIds.clear();
+    if (!_isManageMode) {
+      _checkedTaskIds.clear();
+      _rangeAnchorTaskId = null;
+    }
     _safeNotifyListeners();
   }
 
@@ -590,16 +598,70 @@ class DownloadController extends ChangeNotifier {
     if (!_isManageMode) return;
     _isManageMode = false;
     _checkedTaskIds.clear();
+    _rangeAnchorTaskId = null;
     _safeNotifyListeners();
   }
 
-  /// 切换单个任务的选中状态
+  /// 切换单个任务的选中状态；锚点收敛到该任务（Shift 范围选择的起点）。
   void toggleTaskChecked(String taskId) {
     if (_checkedTaskIds.contains(taskId)) {
       _checkedTaskIds.remove(taskId);
     } else {
       _checkedTaskIds.add(taskId);
     }
+    _rangeAnchorTaskId = taskId;
+    _safeNotifyListeners();
+  }
+
+  /// Ctrl/Shift 修饰键点击任务行（design 契约 §1/§2）：
+  /// - 仅 Shift：按 [taskSelectionRange] 选中 anchor→[taskId] 在
+  ///   [orderedVisibleIds]（当前可见渲染顺序）中的闭区间；未按 Ctrl 时替换
+  ///   现有选择，按住 Ctrl 时与现有选择取并集；anchor 本身不变。锚点缺失或
+  ///   已不在当前可见顺序中（被过滤/分组折叠）时退化为单选 [taskId] 并把
+  ///   锚点收敛到它。
+  /// - 仅 Ctrl：等价 [toggleTaskChecked]（切换勾选 + 锚点收敛到 [taskId]）。
+  /// 两者都会先进入管理模式。
+  void modifierTapTask(
+    String taskId, {
+    required bool isShift,
+    required bool isCtrl,
+    required List<String> orderedVisibleIds,
+  }) {
+    _isManageMode = true;
+    if (isShift) {
+      final anchor = _rangeAnchorTaskId;
+      final anchorValid = anchor != null && orderedVisibleIds.contains(anchor);
+      final range = anchorValid
+          ? taskSelectionRange(orderedVisibleIds, anchor, taskId)
+          : [taskId];
+      if (isCtrl) {
+        _checkedTaskIds.addAll(range);
+      } else {
+        _checkedTaskIds
+          ..clear()
+          ..addAll(range);
+      }
+      if (!anchorValid) _rangeAnchorTaskId = taskId;
+    } else {
+      if (_checkedTaskIds.contains(taskId)) {
+        _checkedTaskIds.remove(taskId);
+      } else {
+        _checkedTaskIds.add(taskId);
+      }
+      _rangeAnchorTaskId = taskId;
+    }
+    _safeNotifyListeners();
+  }
+
+  /// 鼠标框选（marquee）实时命中集合写回：整体替换为 [base] ∪ [hits]，
+  /// 进入管理模式。锚点不受影响——框选结束后继续 Shift 点击仍以框选前手动
+  /// 选中的锚点为准。
+  void setMarqueeChecked(Set<String> hits, {required Set<String> base}) {
+    _isManageMode = true;
+    _checkedTaskIds
+      ..clear()
+      ..addAll(base)
+      ..addAll(hits);
     _safeNotifyListeners();
   }
 
@@ -695,6 +757,7 @@ class DownloadController extends ChangeNotifier {
     BatchControlTask(taskIds: ids, action: action).sendSignalToRust();
 
     _checkedTaskIds.clear();
+    _rangeAnchorTaskId = null;
     _isManageMode = false;
     _safeNotifyListeners();
   }

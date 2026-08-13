@@ -285,7 +285,7 @@ export function TaskRow({
   columns?: Set<TaskColumnId>
 }) {
   const { t: tr } = useI18n()
-  const { selectTask, closeDetail, currentTaskId, detailOpen, selected, setSelected } = useTasksUi()
+  const { selectTask, closeDetail, currentTaskId, detailOpen, selected, modifierClickTask, toggleTaskSelected } = useTasksUi()
   const priority = useStore(priorityStore)
   const qc = useQueryClient()
   const invalidate = () => qc.invalidateQueries({ queryKey: ['tasks'] })
@@ -302,15 +302,6 @@ export function TaskRow({
   const cls = statusIconClass(t.status)
   const isBoost = priority.priorityTaskId === t.taskId
 
-  function toggleSelected(checked: boolean) {
-    setSelected((prev) => {
-      const next = new Set(prev)
-      if (checked) next.add(t.taskId)
-      else next.delete(t.taskId)
-      return next
-    })
-  }
-
   return (
     <TaskContextMenu
       task={t}
@@ -324,10 +315,22 @@ export function TaskRow({
       <div
         className={cn('task-row', density === 'compact' && 'compact', currentTaskId === t.taskId && 'selected')}
         // 左键单击打开详情；再次点击已选中的行 = 关闭（右键不经这里，不影响面板）。
-        onClick={() => (currentTaskId === t.taskId && detailOpen ? closeDetail() : selectTask(t.taskId))}
+        // Ctrl/Cmd 或 Shift 按下时改走多选（见 context.tsx modifierClickTask）。
+        onClick={(e) => {
+          if (e.ctrlKey || e.metaKey || e.shiftKey) {
+            modifierClickTask(t.taskId, { ctrl: e.ctrlKey || e.metaKey, shift: e.shiftKey })
+            return
+          }
+          if (currentTaskId === t.taskId && detailOpen) closeDetail()
+          else selectTask(t.taskId)
+        }}
+        // Shift+点击默认会拉出一段文本选区，先按下就拦掉。
+        onMouseDown={(e) => {
+          if (e.shiftKey) e.preventDefault()
+        }}
       >
         <label className="mcheck trow-check" onClick={(e) => e.stopPropagation()}>
-          <input type="checkbox" checked={selected.has(t.taskId)} onChange={(e) => toggleSelected(e.target.checked)} />
+          <input type="checkbox" checked={selected.has(t.taskId)} onChange={(e) => toggleTaskSelected(t.taskId, e.target.checked)} />
           <i />
         </label>
         <span className={cn('trow-icon', cls)}>

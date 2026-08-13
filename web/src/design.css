@@ -638,6 +638,13 @@ body {
 .task-scroll { flex: 1; overflow-y: auto; padding: 10px 14px 16px; }
 .task-scroll::-webkit-scrollbar { width: 6px; }
 .task-scroll::-webkit-scrollbar-thumb { background: var(--track); border-radius: 4px; }
+/* 框选拖拽中：容器整体禁用文本选择，避免拖动误选出一段文字。 */
+.task-scroll.marqueeing { user-select: none; }
+/* 框选可视矩形：内容坐标定位在撑高层内部，跟随滚动天然正确，不吃指针事件。 */
+.task-marquee {
+  position: absolute; z-index: 5; pointer-events: none;
+  border: 1px solid var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
 
 .group-head {
   display: flex; align-items: center; gap: 7px;
