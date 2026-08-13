@@ -1,0 +1,33 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - "feat/**"
+      - main
+  workflow_dispatch:
+
+jobs:
+  cargo-check:
+    name: cargo check fluxdown_engine
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+
+      - name: Check fluxdown_engine
+        run: cargo check -p fluxdown_engine
