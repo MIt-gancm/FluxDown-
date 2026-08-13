@@ -56,6 +56,7 @@ use librqbit_core::{
 use parking_lot::RwLock;
 use peer_binary_protocol::Handshake;
 use serde::{Deserialize, Serialize};
+use sha1w::{ISha1, Sha1};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Notify,
@@ -467,7 +468,8 @@ fn torrent_file_from_info_bytes(info_bytes: &[u8], trackers: &[url::Url]) -> any
 
 pub(crate) struct CheckedIncomingConnection {
     pub addr: SocketAddr,
-    pub stream: tokio::net::TcpStream,
+    pub read: crate::mse::BoxedRead,
+    pub write: crate::mse::BoxedWrite,
     pub read_buf: ReadBuf,
     pub handshake: Handshake<ByteBufOwned>,
 }
@@ -738,7 +740,7 @@ impl Session {
     async fn check_incoming_connection(
         self: Arc<Self>,
         addr: SocketAddr,
-        mut stream: TcpStream,
+        stream: TcpStream,
     ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         let rwtimeout = self
             .peer_opts
@@ -750,11 +752,68 @@ impl Session {
             bail!("Incoming ip {incoming_ip} is in blocklist");
         }
 
-        let mut read_buf = ReadBuf::new();
-        let h = read_buf
-            .read_handshake(&mut stream, rwtimeout)
+        // Snapshot the (SKEY hash -> info_hash) mapping for every known torrent
+        // so the MSE acceptor can resolve the peer's obfuscated info hash.
+        let torrent_keys: Vec<([u8; 20], [u8; 20])> = self
+            .db
+            .read()
+            .torrents
+            .values()
+            .map(|torrent| {
+                let info_hash = torrent.info_hash().0;
+                let mut h = Sha1::new();
+                h.update(b"req2");
+                h.update(&info_hash);
+                (h.finish(), info_hash)
+            })
+            .collect();
+
+        let lookup = |skey_hash: &[u8; 20]| -> Option<[u8; 20]> {
+            torrent_keys
+                .iter()
+                .find(|(k, _)| k == skey_hash)
+                .map(|(_, info_hash)| *info_hash)
+        };
+
+        let (read_half, write_half) = stream.into_split();
+        let incoming = crate::mse::incoming(read_half, write_half, lookup);
+        let incoming = tokio::time::timeout(rwtimeout, incoming)
             .await
-            .context("error reading handshake")?;
+            .context("MSE incoming handshake timed out")??;
+
+        match incoming {
+            crate::mse::IncomingOutcome::Encrypted {
+                read,
+                write,
+                handshake_bytes,
+                info_hash,
+            } => {
+                let (h, _size) = Handshake::deserialize(&handshake_bytes[..])
+                    .map_err(|e| anyhow::anyhow!("error deserializing MSE handshake: {e:?}"))?;
+                if h.info_hash != info_hash {
+                    bail!("MSE handshake info hash does not match SKEY");
+                }
+                self.finish_incoming_connection(addr, h, Box::new(read), Box::new(write))
+            }
+            crate::mse::IncomingOutcome::Plaintext {
+                read,
+                write,
+                prefix,
+            } => {
+                let (h, _size) = Handshake::deserialize(&prefix[..])
+                    .map_err(|e| anyhow::anyhow!("error deserializing plaintext handshake: {e:?}"))?;
+                self.finish_incoming_connection(addr, h, Box::new(read), Box::new(write))
+            }
+        }
+    }
+
+    fn finish_incoming_connection(
+        &self,
+        addr: SocketAddr,
+        h: Handshake<ByteBuf<'_>>,
+        read: crate::mse::BoxedRead,
+        write: crate::mse::BoxedWrite,
+    ) -> anyhow::Result<(Arc<TorrentStateLive>, CheckedIncomingConnection)> {
         trace!("received handshake from {addr}: {:?}", h);
 
         if h.peer_id == self.peer_id.0 {
@@ -779,9 +838,10 @@ impl Session {
                 live,
                 CheckedIncomingConnection {
                     addr,
-                    stream,
+                    read,
+                    write,
                     handshake,
-                    read_buf,
+                    read_buf: ReadBuf::new(),
                 },
             ));
         }

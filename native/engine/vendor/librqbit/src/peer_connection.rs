@@ -126,7 +126,8 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         read_buf: ReadBuf,
         handshake: Handshake<ByteBufOwned>,
-        mut conn: tokio::net::TcpStream,
+        read: crate::mse::BoxedRead,
+        mut write: crate::mse::BoxedWrite,
         have_broadcast: tokio::sync::broadcast::Receiver<ValidPieceIndex>,
     ) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
@@ -152,7 +153,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let mut write_buf = Vec::<u8>::with_capacity(PIECE_MESSAGE_DEFAULT_LEN);
         let handshake = Handshake::new(self.info_hash, self.peer_id);
         handshake.serialize(&mut write_buf);
-        with_timeout(rwtimeout, conn.write_all(&write_buf))
+        with_timeout(rwtimeout, write.write_all(&write_buf))
             .await
             .context("error writing handshake")?;
         write_buf.clear();
@@ -160,8 +161,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let handshake_supports_extended = handshake.supports_extended();
 
         self.handler.on_handshake(handshake)?;
-
-        let (read, write) = conn.into_split();
 
         self.manage_peer(ManagePeerArgs {
             handshake_supports_extended,

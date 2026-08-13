@@ -240,9 +240,10 @@ pub enum IncomingOutcome<R, W> {
         write: Rc4Writer<W>,
         /// The client's decrypted BT handshake (the IA payload).
         handshake_bytes: Vec<u8>,
-        /// `hash("req2", info_hash)` — the session uses this to match the
-        /// torrent, since the info hash itself is obfuscated.
-        skey_hash: [u8; 20],
+        /// The torrent info hash resolved from the obfuscated SKEY by the
+        /// session's `lookup` callback. The session matches its torrents on
+        /// this value (and should verify it agrees with the handshake).
+        info_hash: [u8; 20],
     },
     Plaintext {
         read: R,
@@ -368,6 +369,6 @@ where
         read: Rc4Reader::new(read, decrypt),
         write: Rc4Writer::new(write, encrypt),
         handshake_bytes,
-        skey_hash,
+        info_hash,
     })
 }

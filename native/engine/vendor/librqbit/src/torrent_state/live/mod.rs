@@ -472,7 +472,8 @@ impl TorrentStateLive {
                 rx,
                 checked_peer.read_buf,
                 checked_peer.handshake,
-                checked_peer.stream,
+                checked_peer.read,
+                checked_peer.write,
                 self.have_broadcast_tx.subscribe()
             ) => {r}
         };
