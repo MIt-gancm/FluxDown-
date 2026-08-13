@@ -76,7 +76,7 @@ impl<W: AsyncWrite + Unpin> Rc4Writer<W> {
     ) -> Poll<io::Result<usize>> {
         let mut written = 0;
         while written < pending.len() {
-            match inner.poll_write(cx, &pending[written..]) {
+            match inner.as_mut().poll_write(cx, &pending[written..]) {
                 Poll::Ready(Ok(0)) => return Poll::Ready(Err(write_zero_err())),
                 Poll::Ready(Ok(n)) => written += n,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
