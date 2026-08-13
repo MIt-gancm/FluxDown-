@@ -155,7 +155,7 @@ const FALLBACK_CARDS: {
   },
 ];
 
-/** 定价模型说明：账户可选 / 买断基础云端 / 重度另计 / 已购不改口。 */
+/** 定价模型说明：账户可选 / 一次买断 / 附加另购。 */
 const MODEL_NOTES: {
   titleKey: keyof Messages;
   descKey: keyof Messages;
@@ -189,15 +189,6 @@ const MODEL_NOTES: {
         <path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4a2 2 0 0 0 1-1.73Z" />
         <path d="M3.3 7 12 12l8.7-5" />
         <path d="M12 22V12" />
-      </svg>
-    ),
-  },
-  {
-    titleKey: "pricing.noteKeptTitle",
-    descKey: "pricing.noteKeptDesc",
-    icon: (
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-        <path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z" />
       </svg>
     ),
   },
@@ -425,13 +416,13 @@ export default function PricingPage() {
           <p className="text-sm text-dark-text-muted">{t("pricing.freeNote")}</p>
         </motion.div>
 
-        {/* ── 定价模型说明：买断基础云端 / 重度另计 / 已购不改口 ── */}
+        {/* ── 定价模型说明：账户可选 / 一次买断 / 附加另购 ── */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true }}
           transition={{ duration: 0.5 }}
-          className="mt-16 sm:mt-20 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 max-w-5xl mx-auto"
+          className="mt-16 sm:mt-20 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 max-w-5xl mx-auto"
         >
           {MODEL_NOTES.map((note) => (
             <div
