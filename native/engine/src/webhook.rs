@@ -302,15 +302,6 @@ pub fn validate_endpoint(spec: &EndpointSpec) -> Result<(), String> {
 // 服务预设
 // ---------------------------------------------------------------------------
 
-/// 请求体转义上下文——决定占位符替换时如何转义变量值。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Escape {
-    /// JSON 字符串内：转义 `"` `\` 与控制字符。
-    Json,
-    /// `application/x-www-form-urlencoded`：百分号编码。
-    Form,
-}
-
 /// v1 预设矩阵。`Custom` 发 §3.2 信封原文。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
@@ -385,18 +376,11 @@ impl Preset {
         }
     }
 
+    /// 全部预设统一 JSON 请求体。Server酱官方 SDK（Go/JS/Python）即
+    /// `application/json`；其 form 解析（尤其 Server酱³ push.ft07.com）观测到
+    /// 不做百分号解码，form 载荷里的 URL/空格会原样显示成 `%2F` / `+`。
     fn content_type(self) -> &'static str {
-        match self {
-            Preset::ServerChan => "application/x-www-form-urlencoded",
-            _ => "application/json",
-        }
-    }
-
-    fn escape(self) -> Escape {
-        match self {
-            Preset::ServerChan => Escape::Form,
-            _ => Escape::Json,
-        }
+        "application/json"
     }
 
     /// 预设默认 body 模板。`Custom` 返回空串——它走 §3.2 信封，无模板。
@@ -413,7 +397,7 @@ impl Preset {
             Preset::Bark => {
                 r#"{"title":"{event.title}","body":"{event.summary}","group":"FluxDown"}"#
             }
-            Preset::ServerChan => "title={event.title}&desp={event.summary}",
+            Preset::ServerChan => r#"{"title":"{event.title}","desp":"{event.summary}"}"#,
             // chat_id 走 URL query（?chat_id=…），body 只带文本。
             Preset::Telegram => r#"{"text":"{event.title}\n{event.summary}"}"#,
             Preset::Discord => r#"{"content":"**{event.title}**\n{event.summary}"}"#,
@@ -552,26 +536,12 @@ fn json_escape(raw: &str) -> String {
     out
 }
 
-fn form_escape(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len() + 8);
-    for byte in raw.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            b' ' => out.push('+'),
-            b => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// 占位符替换。
+/// 占位符替换。变量值一律按 JSON 字符串上下文转义。
 ///
 /// 一个占位符是**不含嵌套 `{` 的** `{…}` 段；不在变量表里的段原样保留。
 /// 两条规则合起来保证 JSON 字面量安然无恙：`{"text":"{event.title}"}` 的外层
 /// `{` 因为内部还有 `{` 而被判定为普通字符，内层 `{event.title}` 才是占位符。
-fn render_template(template: &str, vars: &Vars, escape: Escape) -> String {
+fn render_template(template: &str, vars: &Vars) -> String {
     let mut out = String::with_capacity(template.len() + 64);
     let bytes = template.as_bytes();
     let mut i = 0usize;
@@ -597,10 +567,7 @@ fn render_template(template: &str, vars: &Vars, escape: Escape) -> String {
         let end = j + 1;
         let key = &template[i..end];
         match vars.get(key) {
-            Some(value) => out.push_str(&match escape {
-                Escape::Json => json_escape(value),
-                Escape::Form => form_escape(value),
-            }),
+            Some(value) => out.push_str(&json_escape(value)),
             None => out.push_str(key),
         }
         i = end;
@@ -1221,7 +1188,7 @@ impl Inner {
         let body = if template.is_empty() {
             self.envelope(event, &delivery_id, &timestamp)
         } else {
-            render_template(&template, &vars, preset.escape())
+            render_template(&template, &vars)
         };
         record.request_body = truncate(&body, MAX_LOG_BODY);
 
@@ -1445,7 +1412,6 @@ mod tests {
         let out = render_template(
             r#"{"text":"{event.title}: {task.fileName}","n":{task.totalBytes}}"#,
             &vars,
-            Escape::Json,
         );
         assert_eq!(
             out,
@@ -1461,17 +1427,20 @@ mod tests {
         let event = sample_event();
         let vars = vars_for(&event, "");
         assert_eq!(
-            render_template("{not.a.var} {event}", &vars, Escape::Json),
+            render_template("{not.a.var} {event}", &vars),
             "{not.a.var} task.completed"
         );
     }
 
     #[test]
-    fn form_escape_encodes_reserved_chars() {
+    fn serverchan_template_keeps_url_verbatim() {
         let event = sample_event();
         let vars = vars_for(&event, "");
-        let out = render_template("desp={task.saveDir}", &vars, Escape::Form);
-        assert_eq!(out, "desp=D%3A%5CDownloads");
+        let out = render_template(Preset::ServerChan.default_template(), &vars);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // JSON 载荷里 URL / 路径不做百分号编码，接收端按原文显示。
+        assert_eq!(parsed["title"], "Download completed");
+        assert!(!out.contains("%2F"), "no percent-encoding in JSON payload");
     }
 
     #[test]
@@ -1482,7 +1451,7 @@ mod tests {
         }
         event.kind = WebhookEventKind::TaskFailed;
         let vars = vars_for(&event, "");
-        let out = render_template(r#"{"e":"{task.errorMessage}"}"#, &vars, Escape::Json);
+        let out = render_template(r#"{"e":"{task.errorMessage}"}"#, &vars);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["e"], "line1\nline2");
     }
@@ -1497,15 +1466,10 @@ mod tests {
                 continue;
             }
             let vars = vars_for(&event, "mytopic");
-            let out = render_template(template, &vars, preset.escape());
-            match preset.escape() {
-                Escape::Json => {
-                    serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
-                        panic!("{} produced invalid JSON: {e}\n{out}", preset.wire())
-                    });
-                }
-                Escape::Form => assert!(out.contains('=')),
-            }
+            let out = render_template(template, &vars);
+            serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
+                panic!("{} produced invalid JSON: {e}\n{out}", preset.wire())
+            });
             assert!(
                 !out.contains("{event.title}"),
                 "{} left a placeholder unrendered",
@@ -1518,7 +1482,7 @@ mod tests {
     fn ntfy_default_template_carries_derived_topic() {
         let event = sample_event();
         let vars = vars_for(&event, "zero-downloads");
-        let out = render_template(Preset::Ntfy.default_template(), &vars, Escape::Json);
+        let out = render_template(Preset::Ntfy.default_template(), &vars);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["topic"], "zero-downloads");
     }
