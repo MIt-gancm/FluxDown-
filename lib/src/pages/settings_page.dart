@@ -13017,6 +13017,11 @@ class _ReferralGate extends StatefulWidget {
   State<_ReferralGate> createState() => _ReferralGateState();
 }
 
+/// 「说明」子 Tab 的推介总览本地缓存键：冷启动先渲染上次快照，后台静默刷新
+/// （stale-while-revalidate），避免每次进入子 Tab 都先转圈。缓存按 userId
+/// 校验，跨账号切换不会串读旧数据。
+const _kReferralSummaryCacheKey = 'referral_summary_cache';
+
 class _ReferralGateState extends State<_ReferralGate> {
   bool _loading = true;
   String? _error;
@@ -13025,14 +13030,34 @@ class _ReferralGateState extends State<_ReferralGate> {
   @override
   void initState() {
     super.initState();
+    final userId = CloudAuthService.instance.user?.id;
+    final cached = userId == null
+        ? null
+        : KvStore.instance.getString(_kReferralSummaryCacheKey);
+    if (cached != null) {
+      try {
+        final decoded = jsonDecode(cached) as Map<String, dynamic>;
+        if (decoded['userId'] == userId) {
+          _summary = CloudReferralSummary.fromJson(
+            decoded['summary'] as Map<String, dynamic>,
+          );
+          _loading = false;
+        }
+      } catch (_) {
+        // 缓存损坏/格式不符：当作无缓存，走正常网络加载流程。
+      }
+    }
     unawaited(_load());
   }
 
   Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    final hasCache = _summary != null;
+    if (!hasCache) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final summary = await CloudClient.instance.getReferralSummary();
       if (!mounted) return;
@@ -13040,14 +13065,31 @@ class _ReferralGateState extends State<_ReferralGate> {
         _summary = summary;
         _loading = false;
       });
+      final userId = CloudAuthService.instance.user?.id;
+      if (userId != null) {
+        unawaited(
+          KvStore.instance.setString(
+            _kReferralSummaryCacheKey,
+            jsonEncode({'userId': userId, 'summary': summary.toJson()}),
+          ),
+        );
+      }
     } on CloudApiException catch (e) {
       if (!mounted) return;
+      if (hasCache) {
+        setState(() => _loading = false);
+        return;
+      }
       setState(() {
         _loading = false;
         _error = _cloudErrorText(currentS, e);
       });
     } catch (e) {
       if (!mounted) return;
+      if (hasCache) {
+        setState(() => _loading = false);
+        return;
+      }
       setState(() {
         _loading = false;
         _error = e.toString();
