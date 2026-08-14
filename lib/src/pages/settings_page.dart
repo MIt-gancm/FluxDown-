@@ -12358,6 +12358,7 @@ String _cloudErrorText(S s, CloudApiException e) => switch (e.code) {
   'referral_code_invalid' => s.accountPlanErrorReferralInvalid,
   'referral_self_use' => s.accountPlanErrorReferralSelfUse,
   'referral_already_used' => s.accountPlanErrorReferralAlreadyUsed,
+  'referral_plan_excluded' => s.accountPlanErrorReferralPlanExcluded,
   'referral_code_taken' => s.accountReferralCodeTaken,
   'origin_id_taken' => s.accountOriginIdErrorTaken,
   'origin_id_already_changed' => s.accountOriginIdErrorAlreadyChanged,
@@ -12637,6 +12638,7 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
               'self_use' => s.accountPlanErrorReferralSelfUse,
               'already_used' => s.accountPlanErrorReferralAlreadyUsed,
               'not_found' => s.accountPlanErrorReferralNotFound,
+              'plan_excluded' => s.accountPlanErrorReferralPlanExcluded,
               _ => s.accountPlanErrorReferralInvalid,
             };
           });

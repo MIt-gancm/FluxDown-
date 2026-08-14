@@ -702,7 +702,8 @@ class CloudReferralRecordsResult {
 }
 
 /// GET /referral/validate 响应：下单前预校验推荐码是否可用。[reason] 仅在
-/// [valid]=false 时非空，取值 feature_disabled | not_found | self_use | no_discount。
+/// [valid]=false 时非空，取值 feature_disabled | plan_excluded | not_found |
+/// self_use | already_used | no_discount。
 class CloudReferralValidateResult {
   final bool valid;
   final int discountMinor;

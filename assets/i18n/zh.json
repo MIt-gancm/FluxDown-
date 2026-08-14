@@ -499,6 +499,7 @@
   "accountPlanErrorReferralSelfUse": "不能使用自己的邀请码",
   "accountPlanErrorReferralNotFound": "邀请码不存在",
   "accountPlanErrorReferralAlreadyUsed": "你已使用过邀请码，每个账号仅可使用一次",
+  "accountPlanErrorReferralPlanExcluded": "该套餐不参与推介返利，无法使用邀请码",
   "accountOriginIdEditTooltip": "修改 Origin ID",
   "accountOriginIdEditTitle": "修改 Origin ID",
   "accountOriginIdEditDesc": "选一个新的 Origin ID，也可以点骰子随机推荐一个。此操作仅可进行一次。",

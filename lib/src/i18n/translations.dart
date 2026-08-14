@@ -706,6 +706,8 @@ class S {
       _r('accountPlanErrorReferralNotFound');
   String get accountPlanErrorReferralAlreadyUsed =>
       _r('accountPlanErrorReferralAlreadyUsed');
+  String get accountPlanErrorReferralPlanExcluded =>
+      _r('accountPlanErrorReferralPlanExcluded');
   String get accountOriginIdEditTooltip => _r('accountOriginIdEditTooltip');
   String get accountOriginIdEditTitle => _r('accountOriginIdEditTitle');
   String get accountOriginIdEditDesc => _r('accountOriginIdEditDesc');
