@@ -13,6 +13,7 @@ import 'kv_store.dart';
 import 'log_service.dart';
 import 'platform_utils.dart';
 import 'tray_service.dart';
+import 'win32_window_icon.dart';
 
 const _tag = 'AppIconService';
 
@@ -49,8 +50,9 @@ const _macWindowChannel = MethodChannel('com.fluxdown/window');
 ///   Windows 用多尺寸 `.ico`（WM_SETICON / .lnk IconLocation 都吃这个
 ///   容器），Linux/macOS 用单张 256px `.png`（`gtk_window_set_icon_from_file`
 ///   / `NSImage` 直接吃 PNG，不需要 ICO 容器）；
-/// - 运行时窗口/任务栏图标：Windows 用 `window_manager.setIcon`
-///   （WM_SETICON），Linux 同样用 `window_manager.setIcon`
+/// - 运行时窗口/任务栏图标：Windows 走自研 `win32_window_icon.dart`
+///   （256px `WM_SETICON`；window_manager.setIcon 硬编码 16/32px，DPI
+///   缩放下任务栏静默不更新），Linux 用 `window_manager.setIcon`
 ///   （`gtk_window_set_icon_from_file`），macOS 没有等价的 window_manager
 ///   实现，经 `com.fluxdown/window` 原生通道调用
 ///   `NSApp.applicationIconImage`；
@@ -221,7 +223,7 @@ class AppIconService extends ChangeNotifier {
   Future<void> useDefault() async {
     try {
       if (Platform.isWindows) {
-        await windowManager.setIcon(_defaultIconPath);
+        await _applyWindowsRuntimeIcon(_defaultIconPath);
         await TrayService.instance.setCustomIcon(null);
         UpdateShortcutIcons(iconPath: _defaultIconPath).sendSignalToRust();
       } else if (Platform.isLinux) {
@@ -336,7 +338,7 @@ class AppIconService extends ChangeNotifier {
   /// 任务栏/托盘图标，并同步持久化的「快捷方式」图标引用。
   Future<void> _applyIcon(String path) async {
     if (Platform.isWindows) {
-      await windowManager.setIcon(path);
+      await _applyWindowsRuntimeIcon(path);
       await TrayService.instance.setCustomIcon(path);
       // 桌面 / 开始菜单 / 任务栏固定的 .lnk 图标是静态引用，WM_SETICON
       // 只影响当前进程窗口——交给 Rust 侧用 COM 重写 IconLocation
@@ -351,6 +353,17 @@ class AppIconService extends ChangeNotifier {
         'iconPath': path,
       });
     }
+  }
+
+  /// Windows 运行时窗口/任务栏/Alt-Tab 图标（见 win32_window_icon.dart
+  /// 头注释：window_manager.setIcon 的 16/32px 图标在 DPI 缩放下会被
+  /// 任务栏静默忽略）。主窗口定位失败时回退 window_manager——至少保住
+  /// Alt-Tab 大图标，不至于完全无效。
+  Future<void> _applyWindowsRuntimeIcon(String path) async {
+    if (setMainWindowIconWin32(path)) return;
+    logError(_tag, 'WM_SETICON via FindWindow failed, '
+        'falling back to windowManager.setIcon');
+    await windowManager.setIcon(path);
   }
 
   /// 覆盖 Linux 用户级 XDG 图标主题路径，并尽力刷新图标缓存。

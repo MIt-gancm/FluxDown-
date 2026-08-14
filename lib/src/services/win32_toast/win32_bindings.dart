@@ -203,6 +203,42 @@ typedef _FindWindowW_Dart =
 final findWindowW = _user32
     .lookupFunction<_FindWindowW_Native, _FindWindowW_Dart>('FindWindowW');
 
+// SendMessageW
+typedef _SendMessageW_Native =
+    LRESULT Function(IntPtr hWnd, Uint32 uMsg, WPARAM wParam, LPARAM lParam);
+typedef _SendMessageW_Dart =
+    int Function(int hWnd, int uMsg, int wParam, int lParam);
+final sendMessageW = _user32
+    .lookupFunction<_SendMessageW_Native, _SendMessageW_Dart>('SendMessageW');
+
+// LoadImageW
+typedef _LoadImageW_Native =
+    IntPtr Function(
+      HINSTANCE hInst,
+      Pointer<Utf16> name,
+      Uint32 type,
+      Int32 cx,
+      Int32 cy,
+      Uint32 fuLoad,
+    );
+typedef _LoadImageW_Dart =
+    int Function(
+      int hInst,
+      Pointer<Utf16> name,
+      int type,
+      int cx,
+      int cy,
+      int fuLoad,
+    );
+final loadImageW = _user32
+    .lookupFunction<_LoadImageW_Native, _LoadImageW_Dart>('LoadImageW');
+
+// DestroyIcon
+typedef _DestroyIcon_Native = Int32 Function(IntPtr hIcon);
+typedef _DestroyIcon_Dart = int Function(int hIcon);
+final destroyIcon = _user32
+    .lookupFunction<_DestroyIcon_Native, _DestroyIcon_Dart>('DestroyIcon');
+
 // CreateWindowExW
 typedef _CreateWindowExW_Native =
     IntPtr Function(

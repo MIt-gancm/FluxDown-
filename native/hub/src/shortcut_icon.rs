@@ -13,7 +13,8 @@
 //!
 //! `AppIconService` (`lib/src/services/app_icon_service.dart`) switches the
 //! *running* window/taskbar-button/Alt-Tab/tray icon via `WM_SETICON`
-//! (`window_manager.setIcon`), which only affects the current process's own
+//! (`lib/src/services/win32_window_icon.dart`), which only affects the
+//! current process's own
 //! window handle — it cannot touch a `.lnk` file's static `IconLocation`,
 //! nor the exe's own on-disk PE resources. Without this module, changing
 //! the app icon in Settings never propagates to the desktop icon, the Start
