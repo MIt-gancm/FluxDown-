@@ -341,6 +341,31 @@ fn is_safe_file_name(name: &str) -> bool {
         })
 }
 
+/// 「删除任务并删除文件」/「重新下载」是否可以删除 `save_dir/file_name`
+/// 指向的最终产物。
+///
+/// 所有协议的最终文件都在**完成期**才由 temp/staging rename 产生，而
+/// `file_name` 的 dedup 改名落库时机是：非 BT 在启动序幕
+/// （`finalize_start_file_name`），BT 更晚、在完成期
+/// （`bt_downloader::compute_completion_layout`）。因此未完成任务的
+/// `save_dir/file_name` 要么不存在，要么指向**别的来源**的同名文件。
+/// 典型误删场景：下载完成 A → 删任务保留文件 → 同链接重新添加为稍后
+/// 下载（从未启动，`file_name` 未 dedup）→「删除任务和文件」删掉的是
+/// 早前的成品 A。只有完成（status=3）的任务才认领最终路径。
+fn task_owns_final_file(status: i32) -> bool {
+    status == 3
+}
+
+/// 任务是否启动过（进入过启动序幕，`file_name` 已 dedup 落库）。
+///
+/// 用于 DASH 音轨 sidecar（`<stem>.audio.m4a`）的删除守卫：sidecar 可能
+/// 在任务完成前就已 rename 到位，启动过的任务其派生路径归本任务命名
+/// 空间，删除文件时应当清理；从未启动的任务连 sidecar 也不曾产生，
+/// 跳过以免撞上同名旧任务遗留的文件。
+fn task_has_started(status: i32, downloaded_bytes: i64) -> bool {
+    task_owns_final_file(status) || downloaded_bytes > 0
+}
+
 /// 「重新下载」的磁盘清理原语：删掉 `path`，`NotFound` 视为成功。
 ///
 /// `contended = true`（刚取消过在途 spawn）时最多重试 10 次、每次间隔
@@ -5577,6 +5602,8 @@ impl DownloadManager {
 
         // 2. 磁盘清理（best-effort，NotFound 静默）。暂停之后重新读库，拿到
         //    spawned task 可能已 dedup 落库的最新 file_name。
+        // 暂停前的原始状态：重载后的 t.status 会被 pause_task_silent 改写。
+        let orig_status = task.status;
         let t = match self.db.load_task_by_id(task_id).await {
             Ok(Some(t)) => t,
             _ => task,
@@ -5584,9 +5611,15 @@ impl DownloadManager {
         if is_safe_file_name(&t.file_name) {
             let path = PathBuf::from(&t.save_dir).join(&t.file_name);
             let temp_path = PathBuf::from(format!("{}{}", path.display(), downloader::TEMP_EXT));
-            for p in [&path, &temp_path] {
-                remove_file_retrying(task_id, p, was_active).await;
+            // 最终产物认领判定（详见 task_owns_final_file）：从未启动的任务
+            // `file_name` 未经启动期 dedup，可能与早前同名任务留下的成品相
+            // 撞——重下靠启动期 dedup 另起新名即可，绝不能删别人的文件。
+            // 用暂停前的原始 status 判定（pause_task_silent 会把活跃任务改
+            // 成 2，而活跃任务不可能是 3，语义一致）。
+            if task_owns_final_file(orig_status) {
+                remove_file_retrying(task_id, &path, was_active).await;
             }
+            remove_file_retrying(task_id, &temp_path, was_active).await;
             // DASH 音轨 sidecar（轨对任务的视频轨 URL 非 .mpd，需查库确认）
             // 与其临时文件一并清理，否则重下会复用上一轮的旧音轨。
             let has_audio_sidecar = dash_downloader::is_dash_url(&t.url)
@@ -5601,7 +5634,9 @@ impl DownloadManager {
                 let audio_temp =
                     PathBuf::from(format!("{}{}", audio_path.display(), downloader::TEMP_EXT));
                 remove_file_retrying(task_id, &audio_temp, was_active).await;
-                remove_file_retrying(task_id, &audio_path, was_active).await;
+                if task_has_started(orig_status, t.downloaded_bytes) {
+                    remove_file_retrying(task_id, &audio_path, was_active).await;
+                }
             }
         } else {
             log_info!(
@@ -6496,13 +6531,26 @@ impl DownloadManager {
 
         // 在 handle 等待之后加载 DB，确保获取到 spawned task 可能更新的最新 file_name。
         if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
+            // 最终产物认领判定（详见 task_owns_final_file）：未完成任务的
+            // save_dir/file_name 可能是未 dedup 的原始名，指向早前同名任务
+            // 留下的成品，删除文件时必须跳过。
+            let owns_final = task_owns_final_file(t.status);
+            let has_started = task_has_started(t.status, t.downloaded_bytes);
             // 若 handle 超时且文件名已知，记录信息以便后续延迟清理
             if handle_timed_out && !t.file_name.is_empty() {
+                // BT 的最终路径同样只归完成任务所有（dedup 在完成期），
+                // 延迟清理沿用同一守卫；非 BT 走到这里必然启动过（有
+                // handle），file_name 已 dedup，最终路径归本任务命名空间。
+                let deferred_delete_files = if is_bt_url(&t.url) {
+                    delete_files && owns_final
+                } else {
+                    delete_files
+                };
                 deferred_cleanup = Some((
                     t.save_dir.clone(),
                     t.file_name.clone(),
                     t.url.clone(),
-                    delete_files,
+                    deferred_delete_files,
                 ));
                 // handle 被 abort 时 spawned task 的 TaskDone 不会发出,on_task_done
                 // 无法释放 reserved_temp_paths 预订。此处按 DB 中(已 dedup 落库的)
@@ -6555,7 +6603,9 @@ impl DownloadManager {
                 // SharedBtSession.handles) and session.delete could not be
                 // called above.  We skip the outer path.exists() guard and
                 // let each operation fail silently if the path is absent.
-                if delete_files && is_safe_file_name(&t.file_name) {
+                // owns_final 守卫：BT 的 dedup 在完成期，未完成任务的
+                // file_name 可能撞上早前同名任务的成品目录/文件。
+                if delete_files && owns_final && is_safe_file_name(&t.file_name) {
                     if path.is_dir() {
                         let _ = tokio::fs::remove_dir_all(&path).await;
                     } else {
@@ -6606,12 +6656,13 @@ impl DownloadManager {
                     let audio_temp =
                         PathBuf::from(format!("{}{}", audio_path.display(), downloader::TEMP_EXT));
                     let _ = tokio::fs::remove_file(&audio_temp).await;
-                    if delete_files {
+                    if delete_files && has_started {
                         let _ = tokio::fs::remove_file(&audio_path).await;
                     }
                 }
 
                 if delete_files
+                    && owns_final
                     && is_safe_file_name(&t.file_name)
                     && let Err(e) = tokio::fs::remove_file(&path).await
                     && e.kind() != std::io::ErrorKind::NotFound
@@ -6752,6 +6803,11 @@ impl DownloadManager {
             if let Some(t) = info_map.get(tid.as_str()) {
                 // Task has DB info → needs file cleanup.
                 let path = PathBuf::from(&t.save_dir).join(&t.file_name);
+                // 最终产物认领判定（详见 task_owns_final_file）：未完成任务
+                // 的 file_name 可能是未 dedup 的原始名，指向早前同名任务留下
+                // 的成品，删除文件时必须跳过。
+                let owns_final = task_owns_final_file(t.status);
+                let has_started = task_has_started(t.status, t.downloaded_bytes);
 
                 if is_bt_url(&t.url) {
                     let bt_session = self.bt_session.clone();
@@ -6807,7 +6863,9 @@ impl DownloadManager {
                         // Only attempted when file_name is non-empty and safe;
                         // covers the cross-session case where librqbit already
                         // moved the file out of the staging directory.
-                        if delete_files && safe {
+                        // owns_final 守卫：BT 的 dedup 在完成期，未完成任务的
+                        // file_name 可能撞上早前同名任务的成品目录/文件。
+                        if delete_files && owns_final && safe {
                             let Ok(_permit) = sem.acquire().await else {
                                 return;
                             };
@@ -6851,7 +6909,7 @@ impl DownloadManager {
                                 save_dir_owned,
                                 file_name_owned,
                                 url_owned,
-                                delete_files,
+                                delete_files && owns_final,
                                 tid_owned,
                             ));
                         }
@@ -6930,12 +6988,13 @@ impl DownloadManager {
                                 crate::downloader::TEMP_EXT
                             ));
                             let _ = tokio::fs::remove_file(&audio_temp).await;
-                            if delete_files {
+                            if delete_files && has_started {
                                 let _ = tokio::fs::remove_file(&audio_path).await;
                             }
                         }
 
                         if delete_files
+                            && owns_final
                             && is_safe_file_name(&file_name)
                             && let Err(e) = tokio::fs::remove_file(&path).await
                             && e.kind() != std::io::ErrorKind::NotFound
