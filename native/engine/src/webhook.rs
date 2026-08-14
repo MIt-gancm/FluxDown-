@@ -1467,9 +1467,8 @@ mod tests {
             }
             let vars = vars_for(&event, "mytopic");
             let out = render_template(template, &vars);
-            serde_json::from_str::<serde_json::Value>(&out).unwrap_or_else(|e| {
-                panic!("{} produced invalid JSON: {e}\n{out}", preset.wire())
-            });
+            serde_json::from_str::<serde_json::Value>(&out)
+                .unwrap_or_else(|e| panic!("{} produced invalid JSON: {e}\n{out}", preset.wire()));
             assert!(
                 !out.contains("{event.title}"),
                 "{} left a placeholder unrendered",
