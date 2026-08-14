@@ -172,9 +172,8 @@ where
     write.write_all(&xor20(&skey_hash, &req3)).await?;
 
     let pad_c = random_pad(MAX_PAD);
-    let mut encrypted = Vec::with_capacity(
-        VC_LEN + 4 + 2 + pad_c.len() + 2 + initial_payload.len(),
-    );
+    let mut encrypted =
+        Vec::with_capacity(VC_LEN + 4 + 2 + pad_c.len() + 2 + initial_payload.len());
     encrypted.extend_from_slice(&[0u8; VC_LEN]);
     encrypted.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
     encrypted.extend_from_slice(&(pad_c.len() as u16).to_be_bytes());
@@ -273,8 +272,8 @@ where
     let mut obfuscated_skey = [0u8; 20];
     read.read_exact(&mut obfuscated_skey).await?;
     let skey_hash = xor20(&obfuscated_skey, &sha1(&[b"req3", &secret]));
-    let info_hash = lookup(&skey_hash)
-        .ok_or_else(|| anyhow::anyhow!("MSE unknown info hash in SKEY"))?;
+    let info_hash =
+        lookup(&skey_hash).ok_or_else(|| anyhow::anyhow!("MSE unknown info hash in SKEY"))?;
     let (mut encrypt, mut decrypt) = derive_keys(&secret, &info_hash, false);
 
     let mut vc = [0u8; VC_LEN];

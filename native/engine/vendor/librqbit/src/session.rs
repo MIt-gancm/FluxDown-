@@ -801,23 +801,14 @@ impl Session {
                     ReadBuf::new(),
                 )
             }
-            crate::mse::IncomingOutcome::Plaintext {
-                mut read,
-                write,
-            } => {
+            crate::mse::IncomingOutcome::Plaintext { mut read, write } => {
                 let mut read_buf = ReadBuf::new();
                 let h = read_buf
                     .read_handshake(&mut read, rwtimeout)
                     .await
                     .context("error reading fragmented plaintext handshake")?
                     .clone_to_owned(None);
-                self.finish_incoming_connection(
-                    addr,
-                    h,
-                    Box::new(read),
-                    Box::new(write),
-                    read_buf,
-                )
+                self.finish_incoming_connection(addr, h, Box::new(read), Box::new(write), read_buf)
             }
         }
     }
@@ -1638,8 +1629,7 @@ mod tests {
                 .collect()
         }
 
-        let mut info_bytes = b"d6:lengthi1e4:name4:test12:piece lengthi16384e6:pieces20:"
-            .to_vec();
+        let mut info_bytes = b"d6:lengthi1e4:name4:test12:piece lengthi16384e6:pieces20:".to_vec();
         info_bytes.extend_from_slice(&[0x42; 20]);
         info_bytes.push(b'e');
         let trackers = vec![
@@ -1655,8 +1645,7 @@ mod tests {
         let parsed_trackers = get_trackers(&parsed.meta);
         let regenerated =
             torrent_file_from_info_bytes(parsed.info_bytes.as_ref(), &parsed_trackers).unwrap();
-        let regenerated_parsed =
-            torrent_from_bytes_ext::<ByteBuf>(regenerated.as_ref()).unwrap();
+        let regenerated_parsed = torrent_from_bytes_ext::<ByteBuf>(regenerated.as_ref()).unwrap();
         assert_eq!(parsed.meta.info_hash, regenerated_parsed.meta.info_hash);
         assert_eq!(parsed.meta.info, regenerated_parsed.meta.info);
         assert_eq!(parsed.info_bytes, regenerated_parsed.info_bytes);

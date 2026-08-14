@@ -105,7 +105,11 @@ async fn connect_with_mse_fallback(
     connect_timeout: Duration,
     rwtimeout: Duration,
     initial_payload: &[u8; 68],
-) -> anyhow::Result<(crate::mse::BoxedRead, crate::mse::BoxedWrite, Option<anyhow::Error>)> {
+) -> anyhow::Result<(
+    crate::mse::BoxedRead,
+    crate::mse::BoxedWrite,
+    Option<anyhow::Error>,
+)> {
     let (mse_read, mse_write) = with_timeout(connect_timeout, connector.connect(addr))
         .await
         .context("error connecting")?;
