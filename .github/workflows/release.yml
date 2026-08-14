@@ -247,6 +247,40 @@ jobs:
             Write-Host "Renamed build\windows\x64 -> build\windows\arm64"
           }
 
+      # ── Bundle MSVC CRT runtime DLLs ──
+      # Flutter 的 Windows 构建产物不含 VC 运行库；开发机普遍装有 VCRedist
+      # 从未暴露，但干净系统（winget 安装器验证环境、精简版 Windows）上
+      # 所有 exe 直接 STATUS_DLL_NOT_FOUND (0xC0000135)。把 CRT DLL 随应用
+      # 目录分发（Flutter 官方推荐的自包含发行方式），安装器与 portable zip
+      # 同时受益，无需安装器额外拉 VCRedist。
+      # DLL 架构按 flux_down.exe 的 PE 头实测，而不是相信 matrix.arch
+      # （ARM64 job 里 Flutter 经 x64 仿真运行，产物实际架构以 PE 头为准）。
+      - name: Bundle MSVC CRT runtime DLLs
+        shell: pwsh
+        run: |
+          $release = "build\windows\${{ matrix.arch }}\runner\Release"
+          $bytes = [System.IO.File]::ReadAllBytes("$release\flux_down.exe")
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+          $archDir = switch ($machine) {
+            0x8664 { 'x64' }
+            0xAA64 { 'arm64' }
+            default { throw ("Unexpected PE machine type: 0x{0:X4}" -f $machine) }
+          }
+          Write-Host "flux_down.exe PE machine: $archDir"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "Visual Studio installation not found via vswhere" }
+          $crtDir = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\$archDir\Microsoft.VC1*.CRT" -Directory |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $crtDir) { throw "MSVC CRT redist for $archDir not found under $vsRoot" }
+          Copy-Item "$($crtDir.FullName)\msvcp140*.dll", "$($crtDir.FullName)\vcruntime140*.dll" $release -Force
+          foreach ($required in 'msvcp140.dll', 'vcruntime140.dll') {
+            if (-not (Test-Path "$release\$required")) { throw "$required missing after CRT copy" }
+          }
+          Get-ChildItem "$release\msvcp140*.dll", "$release\vcruntime140*.dll" |
+            ForEach-Object { Write-Host "bundled $($_.Name) ($($_.Length) bytes)" }
+
       # ── SignPath 签名 Round 1: 应用 exe（flux_down / fluxdown_nmh / fluxdown_updater）──
       # 必须在 Inno Setup 打包与 portable zip 之前完成，
       # 保证安装器内嵌与便携版解压出的 exe 均已带签名。
