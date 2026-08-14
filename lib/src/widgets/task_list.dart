@@ -1743,7 +1743,7 @@ class _ScrollToTopButtonState extends State<_ScrollToTopButton> {
           width: 36,
           height: 36,
           decoration: BoxDecoration(
-            color: _isHovered ? const Color(0xFFF5F5F5) : Colors.white,
+            color: _isHovered ? c.surface3 : c.surface2,
             borderRadius: m.brBadge,
             border: Border.all(color: c.border, width: 1),
           ),
