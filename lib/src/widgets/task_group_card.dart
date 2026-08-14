@@ -28,8 +28,9 @@ import 'task_list_item.dart';
 /// 组聚合状态 → 文案（同任务状态标签复用同一套 i18n 键）。
 String groupStatusLabel(TaskStatus status, S s) => switch (status) {
   TaskStatus.pending => s.statusPending,
-  TaskStatus.downloading || TaskStatus.preparing || TaskStatus.resuming =>
-    s.statusDownloading,
+  TaskStatus.downloading ||
+  TaskStatus.preparing ||
+  TaskStatus.resuming => s.statusDownloading,
   TaskStatus.paused => s.statusPaused,
   TaskStatus.completed => s.statusCompleted,
   TaskStatus.error => s.statusError,
@@ -74,9 +75,7 @@ void showGroupContextMenu(
 }) {
   final c = AppColors.of(context);
   final s = LocaleScope.of(context);
-  final hasActive = group.members.any(
-    (m) => m.statusBucket.isActiveOrQueued,
-  );
+  final hasActive = group.members.any((m) => m.statusBucket.isActiveOrQueued);
 
   final items = <ContextMenuItem>[
     hasActive
@@ -198,8 +197,9 @@ Color _sparkBarColor(TaskStatus status, AppColors c) => switch (status) {
   TaskStatus.error => AppColors.red,
   TaskStatus.paused => AppColors.amber,
   TaskStatus.pending => c.surface3,
-  TaskStatus.downloading || TaskStatus.preparing || TaskStatus.resuming =>
-    c.accent,
+  TaskStatus.downloading ||
+  TaskStatus.preparing ||
+  TaskStatus.resuming => c.accent,
   TaskStatus.canceled => c.textMuted,
 };
 
@@ -239,7 +239,9 @@ class _GroupSparkline extends StatelessWidget {
   Widget _sparkBar(ListEntity m, AppColors c, S s) {
     final fraction = math.max(0.14, m.progress.clamp(0.0, 1.0));
     var barHeight = height * fraction;
-    if (m.statusBucket == TaskStatus.error) barHeight = math.max(barHeight, 6.0);
+    if (m.statusBucket == TaskStatus.error) {
+      barHeight = math.max(barHeight, 6.0);
+    }
     return ShadTooltip(
       builder: (_) =>
           Text('${m.name} · ${(m.progress * 100).toStringAsFixed(0)}%'),
@@ -396,7 +398,10 @@ Widget buildGroupIcon(AppColors c, AppMetrics m, double size, int memberCount) {
           right: -5,
           bottom: -5,
           child: Container(
-            constraints: BoxConstraints(minWidth: badgeSize, minHeight: badgeSize),
+            constraints: BoxConstraints(
+              minWidth: badgeSize,
+              minHeight: badgeSize,
+            ),
             padding: const EdgeInsets.symmetric(horizontal: 3),
             decoration: BoxDecoration(
               color: c.accent,
@@ -500,7 +505,10 @@ class _TaskGroupRowState extends State<TaskGroupRow> {
           Container(
             width: 3,
             height: compact ? 20 : 28,
-            decoration: BoxDecoration(color: c.accent, borderRadius: m.brProgress),
+            decoration: BoxDecoration(
+              color: c.accent,
+              borderRadius: m.brProgress,
+            ),
           ),
           const SizedBox(width: 13),
         ],
@@ -742,9 +750,7 @@ class _GroupActionCluster extends StatelessWidget {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
-    final hasActive = group.members.any(
-      (e) => e.statusBucket.isActiveOrQueued,
-    );
+    final hasActive = group.members.any((e) => e.statusBucket.isActiveOrQueued);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 4),
       decoration: BoxDecoration(
@@ -788,7 +794,6 @@ class GroupMemberRow extends StatefulWidget {
   final DownloadTask task;
   final ViewDensity density;
   final bool isSelected;
-  final int flashEpoch;
   final VoidCallback onTap;
   final VoidCallback onPause;
   final VoidCallback onResume;
@@ -800,7 +805,6 @@ class GroupMemberRow extends StatefulWidget {
     required this.task,
     required this.density,
     required this.isSelected,
-    this.flashEpoch = 0,
     required this.onTap,
     required this.onPause,
     required this.onResume,
@@ -833,7 +837,11 @@ class _GroupMemberRowState extends State<GroupMemberRow> {
     final compact = widget.density == ViewDensity.compact;
     final rowHeight = compact ? 44.0 : 52.0;
     final iconSize = compact ? 22.0 : 26.0;
-    final statusColor = taskStatusColor(task.status, c, fileMissing: task.fileMissing);
+    final statusColor = taskStatusColor(
+      task.status,
+      c,
+      fileMissing: task.fileMissing,
+    );
 
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),
@@ -860,22 +868,8 @@ class _GroupMemberRowState extends State<GroupMemberRow> {
                 width: 2,
                 child: ColoredBox(color: c.accentBg),
               ),
-              if (widget.flashEpoch > 0)
-                Positioned.fill(
-                  child: IgnorePointer(
-                    child: TweenAnimationBuilder<double>(
-                      key: ValueKey(widget.flashEpoch),
-                      tween: Tween(begin: 1.0, end: 0.0),
-                      duration: const Duration(milliseconds: 1600),
-                      curve: Curves.easeOut,
-                      // 以 accentBg 自身 alpha 为峰值淡出（规则：同基底零透明端；
-                      // 若用 withValues(alpha: value) 则起点是全饱和 accent 盖脸）。
-                      builder: (context, value, _) => ColoredBox(
-                        color: c.accentBg.withValues(alpha: c.accentBg.a * value),
-                      ),
-                    ),
-                  ),
-                ),
+              // jumpToFail 的闪烁高亮由 task_list.dart 的 _flashWrap 统一
+              // 覆盖，本行不再自带动画层。
               Padding(
                 padding: EdgeInsets.fromLTRB(30, 6, 16, 6),
                 child: Row(
@@ -932,14 +926,21 @@ class _GroupMemberRowState extends State<GroupMemberRow> {
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(taskStatusIcon(task.status), size: 11, color: statusColor),
+                          Icon(
+                            taskStatusIcon(task.status),
+                            size: 11,
+                            color: statusColor,
+                          ),
                           const SizedBox(width: 3),
                           Flexible(
                             child: Text(
                               task.statusText,
                               maxLines: 1,
                               overflow: TextOverflow.ellipsis,
-                              style: TextStyle(fontSize: 11, color: statusColor),
+                              style: TextStyle(
+                                fontSize: 11,
+                                color: statusColor,
+                              ),
                             ),
                           ),
                         ],
@@ -1089,7 +1090,11 @@ class GroupDirRow extends StatelessWidget {
                   AnimatedRotation(
                     turns: collapsed ? -0.25 : 0,
                     duration: const Duration(milliseconds: 150),
-                    child: Icon(LucideIcons.chevronDown, size: 11, color: c.textMuted),
+                    child: Icon(
+                      LucideIcons.chevronDown,
+                      size: 11,
+                      color: c.textMuted,
+                    ),
                   ),
                   const SizedBox(width: 6),
                   Icon(LucideIcons.folder, size: 12, color: c.textMuted),
@@ -1234,7 +1239,12 @@ class _TaskGroupCardState extends State<TaskGroupCard> {
                     compact: true,
                   ),
                   const SizedBox(height: 6),
-                  _GroupSparkline(members: group.members, height: 14, barWidth: 4, gap: 2),
+                  _GroupSparkline(
+                    members: group.members,
+                    height: 14,
+                    barWidth: 4,
+                    gap: 2,
+                  ),
                   const SizedBox(height: 6),
                   buildGroupSumBar(group, c, height: 4),
                   // 尾行弹性底对齐：与 _TaskGridCard 同款——卡片受
