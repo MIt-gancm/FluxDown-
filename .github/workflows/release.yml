@@ -1684,6 +1684,7 @@ jobs:
           build-args: |
             FLUXDOWN_SERVER_VERSION=${{ steps.version.outputs.VERSION }}
             FLUXDOWN_ANALYTICS_APP_KEY=${{ secrets.ANALYTICS_APP_KEY }}
+            VITE_FLUXCLOUD_BASE_URL=${{ secrets.FLUXCLOUD_BASE_URL }}
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 

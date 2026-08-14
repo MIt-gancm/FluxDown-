@@ -19,6 +19,10 @@ WORKDIR /src/web
 COPY web/package.json web/bun.lock ./
 RUN bun install --frozen-lockfile
 COPY web/ ./
+# 云端 base URL 构建期烘焙进 SPA（与 release.yml build-web 的 VITE_FLUXCLOUD_BASE_URL
+# 注入对称；缺省 = 本地开发回退 127.0.0.1:8720，见 web/src/lib/cloud/client.ts）。
+ARG VITE_FLUXCLOUD_BASE_URL
+ENV VITE_FLUXCLOUD_BASE_URL=$VITE_FLUXCLOUD_BASE_URL
 RUN bun run build
 
 # ── Stage 2: Rust 服务器（workspace 成员，仅编译 fluxdown_server，按 TARGETARCH 交叉编译）──
