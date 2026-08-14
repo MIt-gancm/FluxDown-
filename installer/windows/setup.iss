@@ -40,6 +40,10 @@ ArchitecturesInstallIn64BitMode=arm64
 ArchitecturesInstallIn64BitMode=x64compatible
 #endif
 PrivilegesRequired=lowest
+; ACL 受限场景（如安装目录由提权进程创建）允许用户改选管理员安装，
+; 而不是在写文件时直接 access denied 死路。静默安装（自动更新 /SILENT）
+; 不弹此对话框，仍按 lowest 执行。
+PrivilegesRequiredOverridesAllowed=dialog
 CloseApplications=force
 SetupIconFile=..\..\windows\runner\resources\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -116,6 +120,11 @@ begin
   Result := '';
   { Force-kill flux_down.exe as a fallback in case Restart Manager fails }
   Exec('taskkill', '/f /im {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  { Upgrade installs must overwrite the previous uninstaller; a stray
+    read-only attribute on it makes CreateFile fail with access denied.
+    Clear the attribute up-front (no-op when the files do not exist). }
+  Exec('attrib', '-r "' + ExpandConstant('{app}\unins000.exe') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('attrib', '-r "' + ExpandConstant('{app}\unins000.dat') + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { Small delay to ensure file locks are released }
   Sleep(500);
 end;
