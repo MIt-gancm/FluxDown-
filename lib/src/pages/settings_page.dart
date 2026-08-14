@@ -50,6 +50,7 @@ import '../widgets/category_edit_dialog.dart';
 import '../widgets/add_device_dialog.dart';
 import '../widgets/dir_picker_field.dart';
 import '../widgets/doctor_report_view.dart';
+import '../widgets/markdown_body.dart';
 import '../widgets/number_selector.dart';
 import '../widgets/plugin_list_view.dart';
 import '../widgets/webhook_delivery_panel.dart';
@@ -74,7 +75,8 @@ enum SettingsCategory {
   notify(icon: LucideIcons.bellRing),
   extensions(icon: LucideIcons.puzzle),
   doctor(icon: LucideIcons.stethoscope),
-  about(icon: LucideIcons.info);
+  about(icon: LucideIcons.info),
+  referral(icon: LucideIcons.gift);
 
   final IconData icon;
 
@@ -87,6 +89,7 @@ extension SettingsCategoryI18n on SettingsCategory {
     return switch (this) {
       SettingsCategory.general => s.settingsCatGeneral,
       SettingsCategory.account => s.settingsCatAccount,
+      SettingsCategory.referral => s.settingsCatReferral,
       SettingsCategory.appearance => s.settingsCatAppearance,
       SettingsCategory.download => s.settingsCatDownload,
       SettingsCategory.bt => s.settingsCatBt,
@@ -105,6 +108,7 @@ extension SettingsCategoryI18n on SettingsCategory {
     return switch (this) {
       SettingsCategory.general => s.settingsCatGeneralDesc,
       SettingsCategory.account => s.settingsCatAccountDesc,
+      SettingsCategory.referral => s.settingsCatReferralDesc,
       SettingsCategory.appearance => s.settingsCatAppearanceDesc,
       SettingsCategory.download => s.settingsCatDownloadDesc,
       SettingsCategory.bt => s.settingsCatBtDesc,
@@ -130,6 +134,9 @@ const _kTabSeeding = 'seeding';
 const _kTabServers = 'servers';
 const _kTabPlugins = 'plugins';
 const _kTabComponents = 'components';
+const _kTabReferralIntro = 'referralIntro';
+const _kTabReferralCodes = 'referralCodes';
+const _kTabReferralRecords = 'referralRecords';
 
 /// 分类下的子 Tab 描述。
 class _SettingsTabSpec {
@@ -157,6 +164,17 @@ List<_SettingsTabSpec> _settingsTabsFor(SettingsCategory category) {
     SettingsCategory.extensions => [
       _SettingsTabSpec(id: _kTabPlugins, label: s.settingsCatPlugins),
       _SettingsTabSpec(id: _kTabComponents, label: s.settingsCatComponents),
+    ],
+    SettingsCategory.referral => [
+      _SettingsTabSpec(
+        id: _kTabReferralIntro,
+        label: s.accountReferralTabIntro,
+      ),
+      _SettingsTabSpec(id: _kTabReferralCodes, label: s.accountReferralTabCode),
+      _SettingsTabSpec(
+        id: _kTabReferralRecords,
+        label: s.accountReferralTabRecords,
+      ),
     ],
     _ => const [],
   };
@@ -633,6 +651,12 @@ class _SettingsPageState extends State<SettingsPage> {
     final hl = widget.initialHighlight;
     _selected =
         hl?.category ?? widget.initialCategory ?? SettingsCategory.general;
+    // 「推介有奖」分类仅登录后可见，防御性兜底：初始态若落在该分类但未登录
+    // （理论上不会发生，调用方按登录态选择初始分类），回退到通用设置。
+    if (_selected == SettingsCategory.referral &&
+        !CloudAuthService.instance.isLoggedIn) {
+      _selected = SettingsCategory.general;
+    }
     if (hl != null) {
       _highlight = SettingsHighlightRequest(
         seq: ++_highlightSeq,
@@ -640,6 +664,28 @@ class _SettingsPageState extends State<SettingsPage> {
         description: hl.description,
       );
     }
+    CloudAuthService.instance.addListener(_onAuthChanged);
+  }
+
+  @override
+  void dispose() {
+    CloudAuthService.instance.removeListener(_onAuthChanged);
+    super.dispose();
+  }
+
+  /// 登出时若正停留在「推介有奖」分类（该分类登出后从侧边栏隐藏），
+  /// 自动回退到通用设置，避免内容区停留在已不可达的分类上。
+  void _onAuthChanged() {
+    if (_selected == SettingsCategory.referral &&
+        !CloudAuthService.instance.isLoggedIn) {
+      setState(() => _selected = SettingsCategory.general);
+    }
+  }
+
+  /// 切换当前选中分类：侧边栏点击、搜索跳转、页内跳转（如资料卡「推介有奖」
+  /// 按钮）共用。
+  void _selectCategory(SettingsCategory category) {
+    setState(() => _selected = category);
   }
 
   /// 搜索结果选中：切换分类并下发高亮请求。
@@ -775,7 +821,7 @@ class _SettingsPageState extends State<SettingsPage> {
                   _SettingsSidebar(
                     width: _sidebarWidth,
                     selected: _selected,
-                    onSelect: (cat) => setState(() => _selected = cat),
+                    onSelect: _selectCategory,
                     onSearchSelect: _onSearchSelect,
                   ),
                   // 右侧内容区
@@ -1038,16 +1084,23 @@ class _SettingsSidebarState extends State<_SettingsSidebar> {
             )
           else
             Expanded(
-              child: ListView(
-                children: [
-                  for (final cat in SettingsCategory.values)
-                    _SettingsNavItem(
-                      icon: cat.icon,
-                      label: cat.localizedLabel,
-                      isSelected: widget.selected == cat,
-                      onTap: () => widget.onSelect(cat),
-                    ),
-                ],
+              child: ListenableBuilder(
+                listenable: CloudAuthService.instance,
+                builder: (context, _) {
+                  final loggedIn = CloudAuthService.instance.isLoggedIn;
+                  return ListView(
+                    children: [
+                      for (final cat in SettingsCategory.values)
+                        if (cat != SettingsCategory.referral || loggedIn)
+                          _SettingsNavItem(
+                            icon: cat.icon,
+                            label: cat.localizedLabel,
+                            isSelected: widget.selected == cat,
+                            onTap: () => widget.onSelect(cat),
+                          ),
+                    ],
+                  );
+                },
               ),
             ),
         ],
@@ -1327,30 +1380,48 @@ class _SettingsContentState extends State<_SettingsContent> {
               ),
             ),
             Expanded(
-              child: SingleChildScrollView(
-                controller: _scrollController,
-                padding: const EdgeInsets.fromLTRB(40, 20, 36, 24),
-                child: aligned(
-                  AnimatedSwitcher(
-                    duration: const Duration(milliseconds: 120),
-                    layoutBuilder: (currentChild, previousChildren) {
-                      return Stack(
-                        alignment: Alignment.topLeft,
-                        children: [...previousChildren, ?currentChild],
-                      );
-                    },
-                    child: KeyedSubtree(
-                      key: ValueKey('${category.name}:$tabId'),
-                      child: _buildBody(category, tabId),
+              child: _bodyOwnsScroll(category, tabId)
+                  // 内容自持滚动：固定区（如推介页统计卡）钉在头部下方，
+                  // 由内容组件内部决定哪一段可滚。
+                  ? Padding(
+                      padding: const EdgeInsets.fromLTRB(40, 20, 36, 24),
+                      child: aligned(
+                        KeyedSubtree(
+                          key: ValueKey('${category.name}:$tabId'),
+                          child: _buildBody(category, tabId),
+                        ),
+                      ),
+                    )
+                  : SingleChildScrollView(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.fromLTRB(40, 20, 36, 24),
+                      child: aligned(
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 120),
+                          layoutBuilder: (currentChild, previousChildren) {
+                            return Stack(
+                              alignment: Alignment.topLeft,
+                              children: [...previousChildren, ?currentChild],
+                            );
+                          },
+                          child: KeyedSubtree(
+                            key: ValueKey('${category.name}:$tabId'),
+                            child: _buildBody(category, tabId),
+                          ),
+                        ),
+                      ),
                     ),
-                  ),
-                ),
-              ),
             ),
           ],
         );
       },
     );
+  }
+
+  /// 该（分类, 子 Tab）是否自持滚动区域：true 时页面不再包共享
+  /// [SingleChildScrollView]，内容组件自行划分固定区与可滚区。
+  bool _bodyOwnsScroll(SettingsCategory category, String tabId) {
+    return category == SettingsCategory.referral && tabId == _kTabReferralIntro;
   }
 
   /// 按（分类, 子 Tab）构建内容主体；子树身份由外层 [KeyedSubtree] 承担。
@@ -1363,6 +1434,11 @@ class _SettingsContentState extends State<_SettingsContent> {
       SettingsCategory.account => _AccountContent(
         settingsProvider: settingsProvider,
       ),
+      SettingsCategory.referral => switch (tabId) {
+        _kTabReferralCodes => const _ReferralCodesContent(),
+        _kTabReferralRecords => const _ReferralRecordsContent(),
+        _ => const _ReferralIntroContent(),
+      },
       SettingsCategory.appearance => const _AppearanceContent(),
       SettingsCategory.download => _DownloadContent(
         settingsProvider: settingsProvider,
@@ -11976,10 +12052,7 @@ class _NicknameRowState extends State<_NicknameRow> {
               ),
             ),
           ),
-          if (pill != null) ...[
-            const SizedBox(width: 8),
-            pill,
-          ],
+          if (pill != null) ...[const SizedBox(width: 8), pill],
           if (showPencil) ...[
             const SizedBox(width: 4),
             ShadTooltip(
@@ -12282,6 +12355,10 @@ String _cloudErrorText(S s, CloudApiException e) => switch (e.code) {
   'gateway_error' => s.accountPlanErrorGateway,
   'not_an_upgrade' => s.accountPlanErrorNotUpgrade,
   'plan_tier_not_higher' => s.accountPlanErrorTierNotHigher,
+  'referral_code_invalid' => s.accountPlanErrorReferralInvalid,
+  'referral_self_use' => s.accountPlanErrorReferralSelfUse,
+  'referral_already_used' => s.accountPlanErrorReferralAlreadyUsed,
+  'referral_code_taken' => s.accountReferralCodeTaken,
   'origin_id_taken' => s.accountOriginIdErrorTaken,
   'origin_id_already_changed' => s.accountOriginIdErrorAlreadyChanged,
   'origin_id_change_not_allowed' => s.accountOriginIdErrorNotAllowed,
@@ -12432,6 +12509,18 @@ int _orderRemainingSeconds(CloudOrder order) {
   return diff.isNegative ? 0 : diff.inSeconds;
 }
 
+/// 邀请码输入实时转大写（服务端存储/比对统一大写形态）。
+class _UpperCaseTextFormatter extends TextInputFormatter {
+  @override
+  TextEditingValue formatEditUpdate(
+    TextEditingValue oldValue,
+    TextEditingValue newValue,
+  ) => TextEditingValue(
+    text: newValue.text.toUpperCase(),
+    selection: newValue.selection,
+  );
+}
+
 enum _PlanPurchaseStep { select, paying, success }
 
 /// 购买套餐对话框：选套餐 → 微信扫码支付（2s 轮询订单状态）→ 结果。
@@ -12460,6 +12549,9 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
   CloudOrder? _order;
   Timer? _pollTimer;
 
+  /// 可选邀请码输入；提交前先 validateReferralCode 校验，通过才随下单一并发送。
+  final _referralCodeController = TextEditingController();
+
   @override
   void initState() {
     super.initState();
@@ -12482,6 +12574,7 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
   void dispose() {
     CloudAuthService.instance.removeListener(_onAuthChanged);
     _pollTimer?.cancel();
+    _referralCodeController.dispose();
     super.dispose();
   }
 
@@ -12519,18 +12612,41 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
     }
   }
 
+  /// 提交前若填了邀请码先校验：无效时就地报错（区分 self_use/not_found 文案）
+  /// 不发单；校验通过或未填码则直接下单。
   Future<void> _purchase() async {
     final selected = _selected;
     if (selected == null || _creatingOrder) return;
     final s = LocaleScope.of(context);
+    final referralCode = _referralCodeController.text.trim().toUpperCase();
     setState(() {
       _creatingOrder = true;
       _createError = null;
     });
     try {
+      if (referralCode.isNotEmpty) {
+        final validated = await CloudClient.instance.validateReferralCode(
+          referralCode,
+          selected.code,
+        );
+        if (!validated.valid) {
+          if (!mounted) return;
+          setState(() {
+            _creatingOrder = false;
+            _createError = switch (validated.reason) {
+              'self_use' => s.accountPlanErrorReferralSelfUse,
+              'already_used' => s.accountPlanErrorReferralAlreadyUsed,
+              'not_found' => s.accountPlanErrorReferralNotFound,
+              _ => s.accountPlanErrorReferralInvalid,
+            };
+          });
+          return;
+        }
+      }
       final order = await CloudClient.instance.createOrder(
         selected.code,
         deviceId: DeviceIdentity.deviceId(),
+        referralCode: referralCode.isEmpty ? null : referralCode,
       );
       if (!mounted) return;
       setState(() {
@@ -12674,6 +12790,12 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
             ),
             const SizedBox(height: 10),
           ],
+          ShadInput(
+            controller: _referralCodeController,
+            placeholder: Text(s.accountPlanReferralCodePlaceholder),
+            inputFormatters: [_UpperCaseTextFormatter()],
+          ),
+          const SizedBox(height: 10),
           _buildPlanList(s, c, currentPlan),
         ],
       ),
@@ -12748,7 +12870,8 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
             isSelected: _selected?.code == plan.code,
             creditMinor: CloudAuthService.instance.purchaseCreditMinor,
             ownedPriceMinor: ownedPriceMinor,
-            membershipOrdinal: CloudAuthService.instance.user?.membershipOrdinal,
+            membershipOrdinal:
+                CloudAuthService.instance.user?.membershipOrdinal,
             onTap: () => setState(() {
               _selected = plan;
               _notice = null;
@@ -12818,6 +12941,16 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
             ),
             const SizedBox(height: 2),
           ],
+          if (order.referralDiscountMinor > 0) ...[
+            const SizedBox(height: 4),
+            Text(
+              s.accountPlanReferralDiscountApplied(
+                _formatMinorAmount(order.referralDiscountMinor, order.currency),
+              ),
+              style: TextStyle(fontSize: 11, color: c.textMuted),
+            ),
+            const SizedBox(height: 2),
+          ],
           Text(
             s.accountPlanScanHint,
             style: TextStyle(fontSize: 12, color: c.textMuted),
@@ -12857,6 +12990,1247 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
           ShadButton(
             onPressed: () => Navigator.of(context).pop(),
             child: Text(s.close),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────
+// 推介有奖分类页：说明 / 我的推荐码 / 收益记录 —— 子 Tab 走分类头部路由
+// （固定不随内容滚动），每次进入子 Tab 重建 State 并重新拉取，保证远程说明与
+// 开关状态最新。
+// ─────────────────────────────────────────────
+
+/// 推介三个子 Tab 共用的门控外壳：进入时拉取 [CloudReferralSummary]，处理
+/// 加载中 / 拉取失败 / 活动未开启 三态；正常时把 summary 交给 [builder]。
+class _ReferralGate extends StatefulWidget {
+  final Widget Function(BuildContext context, CloudReferralSummary summary)
+  builder;
+
+  const _ReferralGate({required this.builder});
+
+  @override
+  State<_ReferralGate> createState() => _ReferralGateState();
+}
+
+class _ReferralGateState extends State<_ReferralGate> {
+  bool _loading = true;
+  String? _error;
+  CloudReferralSummary? _summary;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final summary = await CloudClient.instance.getReferralSummary();
+      if (!mounted) return;
+      setState(() {
+        _summary = summary;
+        _loading = false;
+      });
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = _cloudErrorText(currentS, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    if (_loading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 40),
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final error = _error;
+    if (error != null) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 24),
+        child: Column(
+          children: [
+            Icon(LucideIcons.circleAlert, size: 22, color: c.statusError),
+            const SizedBox(height: 8),
+            Text(
+              error,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+            const SizedBox(height: 10),
+            ShadButton.outline(
+              size: ShadButtonSize.sm,
+              onPressed: () => unawaited(_load()),
+              child: Text(s.accountDevicesRetry),
+            ),
+          ],
+        ),
+      );
+    }
+    final summary = _summary!;
+    if (!summary.enabled) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 32),
+        child: Column(
+          children: [
+            Icon(LucideIcons.gift, size: 22, color: c.textMuted),
+            const SizedBox(height: 8),
+            Text(
+              s.accountReferralDisabledNotice,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12.5, color: c.textMuted),
+            ),
+          ],
+        ),
+      );
+    }
+    return widget.builder(context, summary);
+  }
+}
+
+/// 「说明」子 Tab：收益总览与规则卡片全部来自 summary，无额外请求。
+class _ReferralIntroContent extends StatelessWidget {
+  const _ReferralIntroContent();
+
+  @override
+  Widget build(BuildContext context) {
+    return _ReferralGate(
+      builder: (_, summary) => _ReferralIntroTab(summary: summary),
+    );
+  }
+}
+
+/// 「我的推荐码」子 Tab：码列表分页 + 创建 / 复制 / 删除。
+class _ReferralCodesContent extends StatefulWidget {
+  const _ReferralCodesContent();
+
+  @override
+  State<_ReferralCodesContent> createState() => _ReferralCodesContentState();
+}
+
+class _ReferralCodesContentState extends State<_ReferralCodesContent> {
+  static const _pageSize = 20;
+
+  bool _loaded = false;
+  bool _loading = false;
+  String? _error;
+  List<CloudReferralCode> _codes = const [];
+  int _page = 1;
+  int _total = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_load());
+  }
+
+  Future<void> _load({int page = 1}) async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final result = await CloudClient.instance.getReferralCodes(
+        page: page,
+        pageSize: _pageSize,
+      );
+      if (!mounted) return;
+      setState(() {
+        _codes = result.items;
+        _total = result.total;
+        _page = page;
+        _loaded = true;
+        _loading = false;
+      });
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = _cloudErrorText(currentS, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  Future<void> _copyCode(BuildContext context, String code) async {
+    await Clipboard.setData(ClipboardData(text: code));
+    if (!context.mounted) return;
+    FluxSonner.of(context).show(
+      ShadToast(
+        title: Text(LocaleScope.of(context).accountReferralCodeCopied),
+        duration: const Duration(seconds: 2),
+      ),
+    );
+  }
+
+  Future<void> _createCode(BuildContext context) async {
+    final created = await showShadDialog<CloudReferralCode>(
+      context: context,
+      barrierColor: AppColors.of(context).dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (_) => const _CreateReferralCodeDialog(),
+    );
+    if (created != null) unawaited(_load(page: _page));
+  }
+
+  Future<void> _deleteCode(BuildContext context, CloudReferralCode code) async {
+    final deleted = await showShadDialog<bool>(
+      context: context,
+      barrierColor: AppColors.of(context).dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (_) => _DeleteReferralCodeDialog(code: code),
+    );
+    if (deleted != true) return;
+    // 删光本页时回退一页：按删除后的预期总数推算末页，当前页超出范围则回退。
+    final remainingTotal = _total > 0 ? _total - 1 : 0;
+    final lastPage = remainingTotal <= 0
+        ? 1
+        : ((remainingTotal - 1) ~/ _pageSize) + 1;
+    unawaited(_load(page: _page > lastPage ? lastPage : _page));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return _ReferralGate(
+      builder: (context, _) => _ReferralCodeTab(
+        loading: _loading && !_loaded,
+        error: _error,
+        codes: _codes,
+        page: _page,
+        pageSize: _pageSize,
+        total: _total,
+        onRetry: () => unawaited(_load(page: _page)),
+        onCreate: () => unawaited(_createCode(context)),
+        onCopy: (code) => unawaited(_copyCode(context, code)),
+        onDelete: (code) => unawaited(_deleteCode(context, code)),
+        onPageChanged: (page) => unawaited(_load(page: page)),
+      ),
+    );
+  }
+}
+
+/// 「收益记录」子 Tab：买家搜索 + 分页列表。
+class _ReferralRecordsContent extends StatefulWidget {
+  const _ReferralRecordsContent();
+
+  @override
+  State<_ReferralRecordsContent> createState() =>
+      _ReferralRecordsContentState();
+}
+
+class _ReferralRecordsContentState extends State<_ReferralRecordsContent> {
+  static const _pageSize = 20;
+
+  bool _loaded = false;
+  bool _loading = false;
+  String? _error;
+  List<CloudReferralRecord> _records = const [];
+  int _page = 1;
+  int _total = 0;
+  String _search = '';
+  final _searchController = TextEditingController();
+
+  @override
+  void initState() {
+    super.initState();
+    // 搜索框内容变化需要驱动清空按钮的显隐，触发方式仍是回车/按钮（不做即时过滤）。
+    _searchController.addListener(() => setState(() {}));
+    unawaited(_load());
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load({int page = 1, String? search}) async {
+    final query = search ?? _search;
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final result = await CloudClient.instance.getReferralRecords(
+        page: page,
+        pageSize: _pageSize,
+        search: query,
+      );
+      if (!mounted) return;
+      setState(() {
+        _records = result.items;
+        _total = result.total;
+        _page = page;
+        _search = query.trim();
+        _loaded = true;
+        _loading = false;
+      });
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = _cloudErrorText(currentS, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  /// 搜索：回车或按钮触发，回到第 1 页；清空搜索框同样走这里，空串等价于取消过滤。
+  void _searchRecords(String query) => unawaited(_load(page: 1, search: query));
+
+  @override
+  Widget build(BuildContext context) {
+    return _ReferralGate(
+      builder: (context, _) => _ReferralRecordsTab(
+        loading: _loading && !_loaded,
+        error: _error,
+        records: _records,
+        page: _page,
+        pageSize: _pageSize,
+        total: _total,
+        searchController: _searchController,
+        searching: _search.isNotEmpty,
+        onRetry: () => unawaited(_load(page: _page)),
+        onSearch: _searchRecords,
+        onPageChanged: (page) => unawaited(_load(page: page)),
+      ),
+    );
+  }
+}
+
+/// 说明 Tab：收益总览（待兑付/已兑付/邀请人数，各自独立卡片）+ 规则卡片
+/// （remote [summary.description] 非空时走 [MarkdownBody] 渲染支持分节标题/
+/// 列表/加粗，为空时回退 [summary.rules] 自动文案）+ 卡内底部兑付联系方式。
+/// [summary.rewardEnabled]=false 时隐藏金额，仅展示邀请人数与不参与返现提示。
+class _ReferralIntroTab extends StatelessWidget {
+  final CloudReferralSummary summary;
+
+  const _ReferralIntroTab({required this.summary});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+
+    final stats = <(String, String)>[
+      if (summary.rewardEnabled)
+        (
+          s.accountReferralStatPending,
+          _formatMinorAmount(summary.pendingRewardMinor, 'CNY'),
+        ),
+      if (summary.rewardEnabled)
+        (
+          s.accountReferralStatPaid,
+          _formatMinorAmount(summary.paidRewardMinor, 'CNY'),
+        ),
+      (s.accountReferralStatInvited, '${summary.invitedCount}'),
+    ];
+    final hasDescription = summary.description.trim().isNotEmpty;
+    final hasRules = summary.rules.isNotEmpty;
+    final hasContact = summary.contact.isNotEmpty;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Row(
+          children: [
+            for (var i = 0; i < stats.length; i++) ...[
+              if (i > 0) const SizedBox(width: 10),
+              _ReferralStatCard(label: stats[i].$1, value: stats[i].$2),
+            ],
+          ],
+        ),
+        if (!summary.rewardEnabled) ...[
+          const SizedBox(height: 10),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 9),
+            decoration: BoxDecoration(
+              color: m.subtle(c.statusWarning),
+              borderRadius: m.brCard,
+              border: Border.all(color: m.borderSubtle(c.statusWarning)),
+            ),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Icon(
+                  LucideIcons.triangleAlert,
+                  size: 13,
+                  color: c.statusWarning,
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    s.accountReferralRewardDisabledNotice,
+                    style: TextStyle(fontSize: 11.5, color: c.statusWarning),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+        // 统计卡与提示条固定，规则卡自持滚动（页面级共享滚动对本 Tab 豁免，
+        // 见 _bodyOwnsScroll）。
+        if (hasDescription || hasRules || hasContact) ...[
+          const SizedBox(height: 14),
+          Expanded(
+            child: SingleChildScrollView(
+              child: Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: c.surface1,
+                  borderRadius: m.brDialog,
+                  border: Border.all(color: m.borderMedium(c.border)),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (hasDescription)
+                      MarkdownBody(markdown: summary.description)
+                    else if (hasRules) ...[
+                      Text(
+                        s.accountReferralRulesTitle,
+                        style: TextStyle(
+                          fontSize: 12.5,
+                          fontWeight: FontWeight.w600,
+                          color: c.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      for (final rule in summary.rules)
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 10),
+                          child: Row(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Container(
+                                width: 22,
+                                height: 22,
+                                alignment: Alignment.center,
+                                decoration: BoxDecoration(
+                                  color: m.soft(c.accent),
+                                  borderRadius: m.brSm,
+                                ),
+                                child: Icon(
+                                  LucideIcons.badgePercent,
+                                  size: 12,
+                                  color: c.accent,
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(
+                                child: Padding(
+                                  padding: const EdgeInsets.only(top: 3),
+                                  child: Text(
+                                    s.accountReferralRuleItem(
+                                      rule.planName,
+                                      rule.rewardPercent,
+                                      _formatMinorAmount(
+                                        rule.discountMinor,
+                                        'CNY',
+                                      ),
+                                    ),
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      height: 1.5,
+                                      color: c.textSecondary,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                    ],
+                    if (hasContact) ...[
+                      if (hasDescription || hasRules) ...[
+                        const SizedBox(height: 6),
+                        Container(height: 1, color: m.borderFade(c.border)),
+                        const SizedBox(height: 12),
+                      ],
+                      Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Icon(LucideIcons.info, size: 13, color: c.textMuted),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              s.accountReferralRedeemHint(summary.contact),
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                height: 1.5,
+                                color: c.textMuted,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+/// 收益总览单项卡片：白底描边圆角容器，大号金额（tabular 数字）+ 次级标签。
+class _ReferralStatCard extends StatelessWidget {
+  final String label;
+  final String value;
+
+  const _ReferralStatCard({required this.label, required this.value});
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+        decoration: BoxDecoration(
+          color: c.surface1,
+          borderRadius: m.brCard,
+          border: Border.all(color: m.borderMedium(c.border)),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              value,
+              style: TextStyle(
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                color: c.textPrimary,
+                fontFeatures: const [FontFeature.tabularFigures()],
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(label, style: TextStyle(fontSize: 11, color: c.textMuted)),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 通用分页控件：上一页/下一页 outline 图标按钮 + 「第 x / y 页」文本；
+/// 总页数 ≤1（含空列表）时整体隐藏，避免空占位。[total]/[pageSize] 推算
+/// 总页数，[page] 为当前 1-based 页码。
+class _ReferralPagination extends StatelessWidget {
+  final int page;
+  final int pageSize;
+  final int total;
+  final ValueChanged<int> onPageChanged;
+
+  const _ReferralPagination({
+    required this.page,
+    required this.pageSize,
+    required this.total,
+    required this.onPageChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final totalPages = total <= 0 ? 1 : ((total - 1) ~/ pageSize) + 1;
+    if (totalPages <= 1) return const SizedBox.shrink();
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.only(top: 12),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          ShadIconButton.outline(
+            icon: const Icon(LucideIcons.chevronLeft, size: 14),
+            onPressed: page > 1 ? () => onPageChanged(page - 1) : null,
+          ),
+          const SizedBox(width: 12),
+          Text(
+            s.accountReferralPageIndicator(page, totalPages),
+            style: TextStyle(
+              fontSize: 12,
+              color: c.textMuted,
+              fontFeatures: const [FontFeature.tabularFigures()],
+            ),
+          ),
+          const SizedBox(width: 12),
+          ShadIconButton.outline(
+            icon: const Icon(LucideIcons.chevronRight, size: 14),
+            onPressed: page < totalPages ? () => onPageChanged(page + 1) : null,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 我的推荐码 Tab：顶部「创建邀请码」按钮行 + 码列表卡片（单容器 + 发丝线
+/// 分隔，每行 code / 有效订单数 / 累计返利 / 创建时间 / 复制+删除）；空态引导创建。
+class _ReferralCodeTab extends StatelessWidget {
+  final bool loading;
+  final String? error;
+  final List<CloudReferralCode> codes;
+  final int page;
+  final int pageSize;
+  final int total;
+  final VoidCallback onRetry;
+  final VoidCallback onCreate;
+  final ValueChanged<String> onCopy;
+  final ValueChanged<CloudReferralCode> onDelete;
+  final ValueChanged<int> onPageChanged;
+
+  const _ReferralCodeTab({
+    required this.loading,
+    required this.error,
+    required this.codes,
+    required this.page,
+    required this.pageSize,
+    required this.total,
+    required this.onRetry,
+    required this.onCreate,
+    required this.onCopy,
+    required this.onDelete,
+    required this.onPageChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Align(
+          alignment: Alignment.centerRight,
+          child: ShadButton.outline(
+            size: ShadButtonSize.sm,
+            leading: Icon(LucideIcons.plus, size: 13),
+            onPressed: onCreate,
+            child: Text(s.accountReferralCodeCreate),
+          ),
+        ),
+        const SizedBox(height: 10),
+        _buildList(context, s, c),
+        if (!loading && error == null && codes.isNotEmpty)
+          _ReferralPagination(
+            page: page,
+            pageSize: pageSize,
+            total: total,
+            onPageChanged: onPageChanged,
+          ),
+      ],
+    );
+  }
+
+  Widget _buildList(BuildContext context, S s, AppColors c) {
+    if (loading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 32),
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final err = error;
+    if (err != null && codes.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 24),
+        child: Column(
+          children: [
+            Icon(LucideIcons.circleAlert, size: 22, color: c.statusError),
+            const SizedBox(height: 8),
+            Text(
+              err,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+            const SizedBox(height: 10),
+            ShadButton.outline(
+              size: ShadButtonSize.sm,
+              onPressed: onRetry,
+              child: Text(s.accountDevicesRetry),
+            ),
+          ],
+        ),
+      );
+    }
+    if (codes.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 32),
+        child: Center(
+          child: Text(
+            s.accountReferralCodeEmpty,
+            textAlign: TextAlign.center,
+            style: TextStyle(fontSize: 12.5, color: c.textMuted),
+          ),
+        ),
+      );
+    }
+    final m = AppMetrics.of(context);
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: c.surface1,
+        borderRadius: m.brDialog,
+        border: Border.all(color: m.borderMedium(c.border), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < codes.length; i++) ...[
+            if (i > 0)
+              Container(
+                height: 1,
+                margin: const EdgeInsets.only(left: 14),
+                color: m.borderFade(c.border),
+              ),
+            _ReferralCodeRow(
+              code: codes[i],
+              onCopy: () => onCopy(codes[i].code),
+              onDelete: () => onDelete(codes[i]),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+/// 单个推荐码行：code（等宽加粗）+ 统计（有效订单数/累计返利/创建时间）
+/// + 复制/删除操作；容器边框由 [_ReferralCodeTab] 的列表卡片统一承担。
+class _ReferralCodeRow extends StatelessWidget {
+  final CloudReferralCode code;
+  final VoidCallback onCopy;
+  final VoidCallback onDelete;
+
+  const _ReferralCodeRow({
+    required this.code,
+    required this.onCopy,
+    required this.onDelete,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  code.code,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                    fontFamily: 'monospace',
+                    letterSpacing: 1,
+                    color: c.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  '${s.accountReferralCodeStats(code.paidOrderCount, _formatMinorAmount(code.rewardMinor, 'CNY'))}'
+                  '  ·  ${_relativeDeviceTime(code.createdAt)}',
+                  style: TextStyle(fontSize: 10.5, color: c.textMuted),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 4),
+          ShadTooltip(
+            effects: const [],
+            builder: (_) => Text(s.accountReferralCodeCopy),
+            child: ShadIconButton.ghost(
+              icon: Icon(LucideIcons.copy, size: 14, color: c.textSecondary),
+              onPressed: onCopy,
+            ),
+          ),
+          ShadTooltip(
+            effects: const [],
+            builder: (_) => Text(s.accountReferralCodeDeleteConfirmTitle),
+            child: ShadIconButton.ghost(
+              icon: Icon(LucideIcons.trash2, size: 14, color: c.statusError),
+              onPressed: onDelete,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 创建推荐码对话框：自定义 4-16 位字母数字（实时大写化）或留空随机生成。
+class _CreateReferralCodeDialog extends StatefulWidget {
+  const _CreateReferralCodeDialog();
+
+  @override
+  State<_CreateReferralCodeDialog> createState() =>
+      _CreateReferralCodeDialogState();
+}
+
+class _CreateReferralCodeDialogState extends State<_CreateReferralCodeDialog> {
+  final _controller = TextEditingController();
+  bool _busy = false;
+  String? _error;
+
+  static final _codePattern = RegExp(r'^[A-Z0-9]{4,16}$');
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final s = LocaleScope.of(context);
+    final raw = _controller.text.trim();
+    if (raw.isNotEmpty && !_codePattern.hasMatch(raw)) {
+      setState(() => _error = s.accountReferralCodeCreateInvalid);
+      return;
+    }
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      final created = await CloudClient.instance.createReferralCode(
+        code: raw.isEmpty ? null : raw,
+      );
+      if (!mounted) return;
+      Navigator.of(context).pop(created);
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = _cloudErrorText(s, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return ShadDialog(
+      title: Text(s.accountReferralCodeCreateTitle),
+      description: Text(s.accountReferralCodeCreateDesc),
+      constraints: const BoxConstraints(maxWidth: 360),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 8),
+          ShadInput(
+            controller: _controller,
+            enabled: !_busy,
+            autofocus: true,
+            placeholder: Text(s.accountReferralCodeCreatePlaceholder),
+            inputFormatters: [_UpperCaseTextFormatter()],
+            onSubmitted: (_) => unawaited(_submit()),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: 6),
+            Text(
+              _error!,
+              style: TextStyle(fontSize: 11.5, color: c.statusError),
+            ),
+          ],
+          const SizedBox(height: 14),
+          Row(
+            children: [
+              Expanded(
+                child: ShadButton.outline(
+                  enabled: !_busy,
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: Text(s.cancel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ShadButton(
+                  enabled: !_busy,
+                  onPressed: () => unawaited(_submit()),
+                  child: Text(s.confirm),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 删除推荐码确认对话框：硬删除，历史订单归因不受影响。
+class _DeleteReferralCodeDialog extends StatefulWidget {
+  final CloudReferralCode code;
+
+  const _DeleteReferralCodeDialog({required this.code});
+
+  @override
+  State<_DeleteReferralCodeDialog> createState() =>
+      _DeleteReferralCodeDialogState();
+}
+
+class _DeleteReferralCodeDialogState extends State<_DeleteReferralCodeDialog> {
+  bool _busy = false;
+  String? _error;
+
+  Future<void> _confirm() async {
+    final s = LocaleScope.of(context);
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await CloudClient.instance.deleteReferralCode(widget.code.id);
+      if (!mounted) return;
+      Navigator.of(context).pop(true);
+    } on CloudApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = _cloudErrorText(s, e);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.toString();
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return ShadDialog(
+      title: Text(s.accountReferralCodeDeleteConfirmTitle),
+      description: Text(s.accountReferralCodeDeleteConfirmDesc),
+      constraints: const BoxConstraints(maxWidth: 380),
+      actions: [
+        ShadButton.outline(
+          enabled: !_busy,
+          onPressed: () => Navigator.of(context).pop(false),
+          child: Text(s.cancel),
+        ),
+        ShadButton.destructive(
+          enabled: !_busy,
+          onPressed: () => unawaited(_confirm()),
+          child: Text(s.confirm),
+        ),
+      ],
+      child: _error != null
+          ? Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Text(
+                _error!,
+                style: TextStyle(fontSize: 11.5, color: c.statusError),
+              ),
+            )
+          : null,
+    );
+  }
+}
+
+/// 收益记录 Tab：描边列表容器（买家/金额/返利/使用码/状态 badge/时间），
+/// 空态与错误态复用套餐列表风格。
+class _ReferralRecordsTab extends StatelessWidget {
+  final bool loading;
+  final String? error;
+  final List<CloudReferralRecord> records;
+  final int page;
+  final int pageSize;
+  final int total;
+  final TextEditingController searchController;
+  final bool searching;
+  final VoidCallback onRetry;
+  final ValueChanged<String> onSearch;
+  final ValueChanged<int> onPageChanged;
+
+  const _ReferralRecordsTab({
+    required this.loading,
+    required this.error,
+    required this.records,
+    required this.page,
+    required this.pageSize,
+    required this.total,
+    required this.searchController,
+    required this.searching,
+    required this.onRetry,
+    required this.onSearch,
+    required this.onPageChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _buildSearchRow(s, c),
+        const SizedBox(height: 10),
+        _buildList(context, s, c),
+        if (!loading && error == null && records.isNotEmpty)
+          _ReferralPagination(
+            page: page,
+            pageSize: pageSize,
+            total: total,
+            onPageChanged: onPageChanged,
+          ),
+      ],
+    );
+  }
+
+  /// 买家昵称/邮箱搜索行：回车或右侧按钮触发，清空搜索框后再触发即取消过滤；
+  /// 输入非空时输入框内展示清空「×」，点击直接清空并重新以空词触发一次。
+  Widget _buildSearchRow(S s, AppColors c) {
+    final query = searchController.text;
+    return Row(
+      children: [
+        Expanded(
+          child: ShadInput(
+            controller: searchController,
+            placeholder: Text(s.accountReferralSearchPlaceholder),
+            leading: Icon(LucideIcons.search, size: 13, color: c.textMuted),
+            trailing: query.isEmpty
+                ? null
+                : MouseRegion(
+                    cursor: SystemMouseCursors.click,
+                    child: GestureDetector(
+                      onTap: () {
+                        searchController.clear();
+                        onSearch('');
+                      },
+                      child: Icon(LucideIcons.x, size: 12, color: c.textMuted),
+                    ),
+                  ),
+            onSubmitted: onSearch,
+          ),
+        ),
+        const SizedBox(width: 8),
+        ShadIconButton.outline(
+          icon: const Icon(LucideIcons.search, size: 14),
+          onPressed: () => onSearch(searchController.text),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildList(BuildContext context, S s, AppColors c) {
+    if (loading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 32),
+        child: Center(
+          child: SizedBox(
+            width: 20,
+            height: 20,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    final err = error;
+    if (err != null) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 24),
+        child: Column(
+          children: [
+            Icon(LucideIcons.circleAlert, size: 22, color: c.statusError),
+            const SizedBox(height: 8),
+            Text(
+              err,
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 12, color: c.textMuted),
+            ),
+            const SizedBox(height: 10),
+            ShadButton.outline(
+              size: ShadButtonSize.sm,
+              onPressed: onRetry,
+              child: Text(s.accountDevicesRetry),
+            ),
+          ],
+        ),
+      );
+    }
+    if (records.isEmpty) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 32),
+        child: Center(
+          child: Text(
+            searching
+                ? s.accountReferralSearchEmpty
+                : s.accountReferralRecordsEmpty,
+            style: TextStyle(fontSize: 12.5, color: c.textMuted),
+          ),
+        ),
+      );
+    }
+    final m = AppMetrics.of(context);
+    return Container(
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        color: c.surface1,
+        borderRadius: m.brDialog,
+        border: Border.all(color: m.borderMedium(c.border), width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          for (var i = 0; i < records.length; i++) ...[
+            if (i > 0)
+              Container(
+                height: 1,
+                margin: const EdgeInsets.only(left: 14),
+                color: m.borderFade(c.border),
+              ),
+            _ReferralRecordRow(record: records[i]),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _ReferralRecordRow extends StatelessWidget {
+  final CloudReferralRecord record;
+
+  const _ReferralRecordRow({required this.record});
+
+  @override
+  Widget build(BuildContext context) {
+    final s = LocaleScope.of(context);
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+    final (statusText, statusColor) = switch (record.status) {
+      'paid' => (s.accountReferralStatusPaid, c.statusSuccess),
+      'revoked' => (s.accountReferralStatusRevoked, c.textMuted),
+      _ => (s.accountReferralStatusPending, c.statusWarning),
+    };
+    final code = record.referralCode;
+    final subtitle = code == null || code.isEmpty
+        ? '${s.accountReferralRecordOrderAmount(_formatMinorAmount(record.orderAmountMinor, 'CNY'))}'
+              '  ·  ${_relativeDeviceTime(record.createdAt)}'
+        : '${s.accountReferralRecordOrderAmount(_formatMinorAmount(record.orderAmountMinor, 'CNY'))}'
+              '  ·  $code'
+              '  ·  ${_relativeDeviceTime(record.createdAt)}';
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      child: Row(
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  record.buyerLabel,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: c.textPrimary,
+                  ),
+                ),
+                const SizedBox(height: 3),
+                Text(
+                  subtitle,
+                  style: TextStyle(fontSize: 10.5, color: c.textMuted),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              Text(
+                '+${_formatMinorAmount(record.rewardMinor, 'CNY')}',
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w700,
+                  color: c.textPrimary,
+                  fontFeatures: const [FontFeature.tabularFigures()],
+                ),
+              ),
+              const SizedBox(height: 3),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
+                decoration: BoxDecoration(
+                  color: m.soft(statusColor),
+                  borderRadius: m.brPill,
+                ),
+                child: Text(
+                  statusText,
+                  style: TextStyle(
+                    fontSize: 10,
+                    fontWeight: FontWeight.w600,
+                    color: statusColor,
+                  ),
+                ),
+              ),
+            ],
           ),
         ],
       ),
@@ -16054,6 +17428,7 @@ class _RegisterDialogContentState extends State<_RegisterDialogContent> {
 
   bool _busy = false;
   String? _error;
+
   /// 密码输入框明文显示切换（同站点凭据对话框的眼睛按钮模式）。
   bool _showPassword = false;
   Timer? _timer;

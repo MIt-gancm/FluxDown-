@@ -15,7 +15,7 @@
 //   analytics_enabled、log_max_size_mb、ui_scale、悬浮球坐标、torrent/ed2k 关联 ——
 //   这些描述"这台机器"的行为/尺寸/系统集成状态，不是用户偏好。
 // - 代理全部字段 —— 隐私：value 可被管理员在后台查看，代理地址/账号密码不得上云。
-// - 导入主题正文（FluxThemeTokens JSON）—— 体积超出单条 8192 字节限额且高频
+// - 导入主题正文（FluxThemeTokens JSON）—— 体积大（单条限额 64KB）且高频
 //   变更价值低；目录只同步"当前选中哪个自定义主题 ID"，主题内容不同步。
 
 import 'package:flutter/material.dart';

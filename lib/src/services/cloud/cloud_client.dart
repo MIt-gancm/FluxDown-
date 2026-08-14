@@ -460,19 +460,25 @@ class CloudClient {
   }
 
   /// POST /orders：创建订单（同用户同套餐已有未过期 pending 订单时服务端直接复用返回）。
-  Future<CloudOrder> createOrder(String planCode, {String? deviceId}) =>
-      _authed(() async {
-        final json = await _request(
-          'POST',
-          '/orders',
-          body: {
-            'planCode': planCode,
-            if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
-          },
-          authed: true,
-        );
-        return CloudOrder.fromJson(json);
-      });
+  /// [referralCode] 非空时随下单一并校验/入库（服务端权威计算立减与归因）。
+  Future<CloudOrder> createOrder(
+    String planCode, {
+    String? deviceId,
+    String? referralCode,
+  }) => _authed(() async {
+    final json = await _request(
+      'POST',
+      '/orders',
+      body: {
+        'planCode': planCode,
+        if (deviceId != null && deviceId.isNotEmpty) 'deviceId': deviceId,
+        if (referralCode != null && referralCode.isNotEmpty)
+          'referralCode': referralCode,
+      },
+      authed: true,
+    );
+    return CloudOrder.fromJson(json);
+  });
 
   /// GET /orders/{orderNo}：查询单个订单（仅本人），支付期间每 2s 轮询用。
   Future<CloudOrder> getOrder(String orderNo) => _authed(() async {
@@ -491,6 +497,79 @@ class CloudClient {
     return list
         .map((e) => CloudOrder.fromJson(e as Map<String, dynamic>))
         .toList();
+  });
+
+  // ── 推介有奖（Bearer UserAuth，401 自动刷新重放一次）───────────────────
+
+  /// GET /referral/summary：收益总览 + 说明文案 + 生效规则表；多码化后不再
+  /// 随 summary 下发单一推荐码，见 [getReferralCodes]。
+  Future<CloudReferralSummary> getReferralSummary() => _authed(() async {
+    final json = await _request('GET', '/referral/summary', authed: true);
+    return CloudReferralSummary.fromJson(json);
+  });
+
+  /// GET /referral/codes：我名下的推荐码列表，按创建时间升序，分页返回
+  /// （[pageSize] 服务端上限 100；单用户码数上限另受创建接口 10 个约束）。
+  Future<CloudReferralCodesResult> getReferralCodes({
+    int page = 1,
+    int pageSize = 20,
+  }) => _authed(() async {
+    final json = await _request(
+      'GET',
+      '/referral/codes?page=$page&pageSize=$pageSize',
+      authed: true,
+    );
+    return CloudReferralCodesResult.fromJson(json);
+  });
+
+  /// POST /referral/codes：创建一个推荐码；[code] 为空时服务端随机生成 8 位。
+  Future<CloudReferralCode> createReferralCode({String? code}) => _authed(() async {
+    final json = await _request(
+      'POST',
+      '/referral/codes',
+      body: {if (code != null && code.trim().isNotEmpty) 'code': code.trim()},
+      authed: true,
+    );
+    return CloudReferralCode.fromJson(json);
+  });
+
+  /// DELETE /referral/codes/{id}：删除我名下的推荐码（历史订单归因不受影响）。
+  Future<void> deleteReferralCode(String id) => _authed(() async {
+    await _request('DELETE', '/referral/codes/$id', authed: true);
+  });
+
+  /// GET /referral/records：我作为推荐人产生的返利台账，按创建时间倒序分页；
+  /// [search] 非空时按买家昵称/邮箱大小写不敏感子串过滤（trim 后为空则不下发）。
+  Future<CloudReferralRecordsResult> getReferralRecords({
+    int page = 1,
+    int pageSize = 20,
+    String? search,
+  }) => _authed(() async {
+    final trimmedSearch = search?.trim() ?? '';
+    final query = StringBuffer('page=$page&pageSize=$pageSize');
+    if (trimmedSearch.isNotEmpty) {
+      query.write('&search=${Uri.encodeQueryComponent(trimmedSearch)}');
+    }
+    final json = await _request(
+      'GET',
+      '/referral/records?$query',
+      authed: true,
+    );
+    return CloudReferralRecordsResult.fromJson(json);
+  });
+
+  /// GET /referral/validate：下单前预校验推荐码对目标套餐是否可用 + 立减额。
+  Future<CloudReferralValidateResult> validateReferralCode(
+    String code,
+    String planCode,
+  ) => _authed(() async {
+    final json = await _request(
+      'GET',
+      '/referral/validate?code=${Uri.encodeQueryComponent(code)}'
+      '&planCode=${Uri.encodeQueryComponent(planCode)}',
+      authed: true,
+    );
+    return CloudReferralValidateResult.fromJson(json);
   });
 
   // ── 配置同步（Bearer UserAuth，401 自动刷新重放一次；SSE 事件流由

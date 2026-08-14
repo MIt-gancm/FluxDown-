@@ -179,6 +179,73 @@ export interface CdnConfigResult {
   config: CdnConfig | null
 }
 
+/** GET /referral/summary 响应 rules[]：仅含 enabled 且 price_minor>0 的套餐(按解析后的
+ *  生效值，override 已回落 default)。 */
+export interface ReferralRule {
+  planCode: string
+  planName: string
+  priceMinor: number
+  discountMinor: number
+  rewardPercent: number
+}
+
+/** GET /referral/summary 响应：推介有奖总览。enabled=false 时其余字段仍照常返回；
+ *  rewardEnabled=false 时该用户的码仍给买家优惠、仍记归因，但永不产生返利台账行——
+ *  客户端据此隐藏金额，只展示邀请人数。description 为 admin 后台可编辑的说明文案
+ *  （可空串，为空时客户端回退展示 rules 自动列表）；推荐码改由独立的
+ *  GET /referral/codes 管理，不再随本接口下发。 */
+export interface ReferralSummary {
+  enabled: boolean
+  description: string
+  rewardEnabled: boolean
+  contact: string
+  invitedCount: number
+  pendingRewardMinor: number
+  paidRewardMinor: number
+  totalRewardMinor: number
+  rules: ReferralRule[]
+}
+
+/** GET /referral/codes 响应 items[] 单个推荐码；paidOrderCount/rewardMinor 为该码文本
+ *  快照命中的本人已付订单数、与对应返利台账合计(pending+paid，排除 revoked)。 */
+export interface ReferralCode {
+  id: string
+  code: string
+  paidOrderCount: number
+  rewardMinor: number
+  createdAt: string
+}
+
+/** GET /referral/codes 响应：本人名下全部推荐码，按创建时间升序，分页（每用户码上限
+ *  仍为 10，分页主要为未来扩容留口子）。 */
+export interface ReferralCodesResponse {
+  total: number
+  items: ReferralCode[]
+}
+
+/** referral_rewards.status：pending 待兑付 / paid 已兑付(人工标记) / revoked 已撤销。 */
+export type ReferralRecordStatus = 'pending' | 'paid' | 'revoked'
+
+/** GET /referral/records 响应 items[] 单条返利台账行；buyerLabel 服务端已脱敏
+ *  (昵称优先，否则邮箱首字符+***+@域名)；referralCode 为该笔订单使用的推荐码文本快照。 */
+export interface ReferralRecord {
+  id: string
+  buyerLabel: string
+  orderAmountMinor: number
+  rewardMinor: number
+  rewardPercent: number
+  status: ReferralRecordStatus
+  createdAt: string
+  paidAt: string | null
+  referralCode: string | null
+}
+
+/** GET /referral/records 响应：分页返利台账。 */
+export interface ReferralRecordsResponse {
+  total: number
+  items: ReferralRecord[]
+}
+
 /** 服务端错误统一形态 `{code, message}`，附带 HTTP 状态码方便按 code/status 分支处理。 */
 export class CloudApiError extends Error {
   code: string

@@ -7,7 +7,7 @@
 // promise，避免刷新风暴。
 
 import { applyCloudSession, clearCloudSession, cloudDefaultDeviceName, cloudDeviceId, CLOUD_DEVICE_PLATFORM, getCloudAccessToken, getCloudRefreshToken } from './session'
-import type { AuthResponse, CatalogPlan, CdnConfig, CdnConfigResult, CheckOriginIdResponse, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RandomOriginIdResponse, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
+import type { AuthResponse, CatalogPlan, CdnConfig, CdnConfigResult, CheckOriginIdResponse, CloudDevice, CloudProfile, DevicesResponse, LoginResult, ProgressReportItem, RandomOriginIdResponse, ReferralCode, ReferralCodesResponse, ReferralRecordsResponse, ReferralSummary, RemoteTask, RemoteTaskAction, RemoteTasksResponse, TaskStatusReport, TtlResponse } from './types'
 import { CloudApiError } from './types'
 
 /** 默认服务地址：Actions 打包时经 VITE_FLUXCLOUD_BASE_URL 构建期注入官方地址，
@@ -265,4 +265,26 @@ export const cloudApi = {
   /** POST /cdn/report：上报一批 CDN 众包遥测样本（≤64 条/次，超量由调用方分批；
    *  device_hash 由服务端从鉴权设备派生，本端不发送）。成功 204。 */
   cdnReport: (samples: unknown[]) => authedRequest<unknown>('POST', '/cdn/report', { samples }),
+
+  /** GET /referral/summary：推介有奖总览。 */
+  referralSummary: () => authedRequest<ReferralSummary>('GET', '/referral/summary'),
+
+  /** GET /referral/records：分页返利台账(仅本人作为推荐人产生的记录)。search 非空时按
+   *  买家昵称/邮箱大小写不敏感子串匹配，trim 后为空则忽略。 */
+  referralRecords: (page: number, pageSize: number, search?: string) => {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) })
+    const q = search?.trim()
+    if (q) params.set('search', q)
+    return authedRequest<ReferralRecordsResponse>('GET', `/referral/records?${params.toString()}`)
+  },
+
+  /** GET /referral/codes：本人名下推荐码，按创建时间升序，分页。 */
+  referralCodes: (page = 1, pageSize = 20) =>
+    authedRequest<ReferralCodesResponse>('GET', `/referral/codes?page=${page}&pageSize=${pageSize}`),
+
+  /** POST /referral/codes：创建推荐码；code 留空/省略时服务端随机生成 8 位。 */
+  createReferralCode: (code?: string) => authedRequest<ReferralCode>('POST', '/referral/codes', code ? { code } : {}),
+
+  /** DELETE /referral/codes/{id}：删除本人名下推荐码（历史订单归因不受影响）。 */
+  deleteReferralCode: (id: string) => authedRequest<unknown>('DELETE', `/referral/codes/${id}`),
 }

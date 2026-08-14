@@ -539,6 +539,8 @@ class S {
   String get settingsCatAboutDesc => _r('settingsCatAboutDesc');
   String get settingsCatAccount => _r('settingsCatAccount');
   String get settingsCatAccountDesc => _r('settingsCatAccountDesc');
+  String get settingsCatReferral => _r('settingsCatReferral');
+  String get settingsCatReferralDesc => _r('settingsCatReferralDesc');
 
   // 账户 —— FluxCloud 登录/注册/设备管理
   String get accountHeroSubtitle => _r('accountHeroSubtitle');
@@ -680,6 +682,10 @@ class S {
   String accountPlanCreditApplied(String amount) =>
       _r('accountPlanCreditApplied', {'amount': amount});
   String get accountPlanLowerTier => _r('accountPlanLowerTier');
+  String get accountPlanReferralCodePlaceholder =>
+      _r('accountPlanReferralCodePlaceholder');
+  String accountPlanReferralDiscountApplied(String amount) =>
+      _r('accountPlanReferralDiscountApplied', {'amount': amount});
   String get accountCloudRefresh => _r('accountCloudRefresh');
   String get accountCloudRefreshDone => _r('accountCloudRefreshDone');
   String get accountPlanErrorAlreadyOwned =>
@@ -692,6 +698,14 @@ class S {
   String get accountPlanErrorNotUpgrade => _r('accountPlanErrorNotUpgrade');
   String get accountPlanErrorTierNotHigher =>
       _r('accountPlanErrorTierNotHigher');
+  String get accountPlanErrorReferralInvalid =>
+      _r('accountPlanErrorReferralInvalid');
+  String get accountPlanErrorReferralSelfUse =>
+      _r('accountPlanErrorReferralSelfUse');
+  String get accountPlanErrorReferralNotFound =>
+      _r('accountPlanErrorReferralNotFound');
+  String get accountPlanErrorReferralAlreadyUsed =>
+      _r('accountPlanErrorReferralAlreadyUsed');
   String get accountOriginIdEditTooltip => _r('accountOriginIdEditTooltip');
   String get accountOriginIdEditTitle => _r('accountOriginIdEditTitle');
   String get accountOriginIdEditDesc => _r('accountOriginIdEditDesc');
@@ -707,6 +721,59 @@ class S {
       _r('accountOriginIdErrorAlreadyChanged');
   String get accountOriginIdErrorNotAllowed =>
       _r('accountOriginIdErrorNotAllowed');
+
+  // 推介有奖 —— 多推荐码 + 人工兑付返利
+  String get accountReferralDisabledNotice =>
+      _r('accountReferralDisabledNotice');
+  String get accountReferralTabIntro => _r('accountReferralTabIntro');
+  String get accountReferralTabCode => _r('accountReferralTabCode');
+  String get accountReferralTabRecords => _r('accountReferralTabRecords');
+  String get accountReferralStatPending => _r('accountReferralStatPending');
+  String get accountReferralStatPaid => _r('accountReferralStatPaid');
+  String get accountReferralStatInvited => _r('accountReferralStatInvited');
+  String get accountReferralRewardDisabledNotice =>
+      _r('accountReferralRewardDisabledNotice');
+  String get accountReferralRulesTitle => _r('accountReferralRulesTitle');
+  String accountReferralRuleItem(String planName, int percent, String discount) =>
+      _r('accountReferralRuleItem', {
+        'planName': planName,
+        'percent': percent,
+        'discount': discount,
+      });
+  String accountReferralRedeemHint(String contact) =>
+      _r('accountReferralRedeemHint', {'contact': contact});
+  String get accountReferralCodeCopy => _r('accountReferralCodeCopy');
+  String get accountReferralCodeCopied => _r('accountReferralCodeCopied');
+  String get accountReferralCodeCreate => _r('accountReferralCodeCreate');
+  String get accountReferralCodeCreateTitle =>
+      _r('accountReferralCodeCreateTitle');
+  String get accountReferralCodeCreateDesc =>
+      _r('accountReferralCodeCreateDesc');
+  String get accountReferralCodeCreatePlaceholder =>
+      _r('accountReferralCodeCreatePlaceholder');
+  String get accountReferralCodeCreateInvalid =>
+      _r('accountReferralCodeCreateInvalid');
+  String get accountReferralCodeTaken => _r('accountReferralCodeTaken');
+  String get accountReferralCodeDeleteConfirmTitle =>
+      _r('accountReferralCodeDeleteConfirmTitle');
+  String get accountReferralCodeDeleteConfirmDesc =>
+      _r('accountReferralCodeDeleteConfirmDesc');
+  String get accountReferralCodeEmpty => _r('accountReferralCodeEmpty');
+  String accountReferralCodeStats(int count, String amount) =>
+      _r('accountReferralCodeStats', {'count': count, 'amount': amount});
+  String get accountReferralRecordsEmpty => _r('accountReferralRecordsEmpty');
+  String get accountReferralStatusPending =>
+      _r('accountReferralStatusPending');
+  String get accountReferralStatusPaid => _r('accountReferralStatusPaid');
+  String get accountReferralStatusRevoked =>
+      _r('accountReferralStatusRevoked');
+  String accountReferralRecordOrderAmount(String amount) =>
+      _r('accountReferralRecordOrderAmount', {'amount': amount});
+  String get accountReferralSearchPlaceholder =>
+      _r('accountReferralSearchPlaceholder');
+  String get accountReferralSearchEmpty => _r('accountReferralSearchEmpty');
+  String accountReferralPageIndicator(int x, int y) =>
+      _r('accountReferralPageIndicator', {'x': x, 'y': y});
 
   // 配置同步 —— FluxCloud 云端设置同步（见 local://sync-contract.md）
   String get cloudSyncTitle => _r('cloudSyncTitle');

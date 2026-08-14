@@ -5,19 +5,21 @@
 import * as Dialog from '@radix-ui/react-dialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ArrowLeft, Check, ChevronRight, Cloud, Copy, Crown, Eye, EyeOff, Monitor, Pencil, Search, Smartphone, Trash2, X } from 'lucide-react'
-import { type FormEvent, useEffect, useMemo, useRef, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { CopyButton } from '../CopyButton'
 import { cn } from '../../lib/cn'
 import { CLOUD_BASE_URL_EDITABLE, cloudApi, getCloudBaseUrl, isCloudBaseUrlCustom, resetCloudBaseUrl, setCloudBaseUrl } from '../../lib/cloud/client'
 import { deviceLabel } from '../../lib/cloud/deviceLabel'
 import { suggest } from '../../lib/cloud/nickname'
 import { applyCloudSession, cloudDeviceId, getCloudRefreshToken, signOutCloud, updateCloudUser, useCloudSession } from '../../lib/cloud/session'
-import { CloudApiError, type CatalogPlan, type CloudDevice, type CloudProfile, type CloudUser } from '../../lib/cloud/types'
+import { CloudApiError, type CatalogPlan, type CloudDevice, type CloudProfile, type CloudUser, type ReferralCode, type ReferralRecord, type ReferralRecordStatus } from '../../lib/cloud/types'
 import { confirmDialog } from '../../lib/confirm'
 import { copyText } from '../../lib/copy'
 import { fmtIsoTime, fmtRelativeTime } from '../../lib/format'
 import type { I18nKey } from '../../lib/i18n'
 import { useI18n } from '../../lib/i18n'
 import { toast } from '../../lib/toast'
+import { MarkdownLite } from '../../lib/markdown'
 import { DirectDevicesSection } from './DirectDevicesSection'
 import { SetRow, TextInput } from './controls'
 
@@ -195,6 +197,24 @@ function nicknameErrorText(t: (key: I18nKey, params?: Record<string, string | nu
 function isValidNickname(v: string): boolean {
   const trimmed = v.trim()
   return trimmed.length > 0 && trimmed.length <= 32
+}
+
+// ---------------------------------------------------------------------------
+// 推荐码创建：错误码 → 本地化文案，独立于 CLOUD_ERROR_KEYS。格式/上限校验走
+// AppError::Validation，服务端已给出中文提示消息，走 fallback 原样透传。
+// ---------------------------------------------------------------------------
+
+const REFERRAL_CODE_ERROR_KEYS: Record<string, I18nKey> = {
+  referral_code_taken: 'cloud.referral.err.codeTaken',
+}
+
+function referralCodeErrorText(t: (key: I18nKey, params?: Record<string, string | number>) => string, err: unknown): string {
+  if (err instanceof CloudApiError) {
+    const key = REFERRAL_CODE_ERROR_KEYS[err.code]
+    if (key) return t(key)
+    return err.message || t('cloud.err.unknown')
+  }
+  return t('cloud.err.network')
 }
 
 // ---------------------------------------------------------------------------
@@ -794,6 +814,7 @@ function LoggedInPanel({ user }: { user: CloudUser }) {
   const [loggingOut, setLoggingOut] = useState(false)
   const [originIdEditOpen, setOriginIdEditOpen] = useState(false)
   const [nicknameEditOpen, setNicknameEditOpen] = useState(false)
+  const [referralOpen, setReferralOpen] = useState(false)
   const [nicknameRevealed, setNicknameRevealed] = useState(false)
   const [nicknameHovering, setNicknameHovering] = useState(false)
   const displayName = user.nickname || user.email.split('@')[0]
@@ -904,6 +925,11 @@ function LoggedInPanel({ user }: { user: CloudUser }) {
         <SetRow title={t('cloud.emailLabel')}>
           <span className="min-w-0 flex-shrink truncate text-[12.5px] text-text2">{user.email}</span>
         </SetRow>
+        <SetRow title={t('cloud.referral.rowTitle')} desc={t('cloud.referral.rowDesc')}>
+          <button type="button" className="btn ghost sm" onClick={() => setReferralOpen(true)}>
+            {t('cloud.referral.openBtn')}
+          </button>
+        </SetRow>
       </div>
       <DeviceListSection />
       <OriginIdEditDialog open={originIdEditOpen} onClose={() => setOriginIdEditOpen(false)} onChanged={handleOriginIdChanged} />
@@ -913,6 +939,7 @@ function LoggedInPanel({ user }: { user: CloudUser }) {
         onClose={() => setNicknameEditOpen(false)}
         onChanged={handleNicknameChanged}
       />
+      <ReferralDialog open={referralOpen} onClose={() => setReferralOpen(false)} />
     </>
   )
 }
@@ -1187,6 +1214,365 @@ function NicknameEditDialog({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// 推介有奖：我的推荐码 + 收益总览 + 规则 + 返利记录（人工兑付，见需求文档）
+// ---------------------------------------------------------------------------
+
+/** 单页返利记录条数；「加载更多」在当前列表末尾追加，不做页码导航。 */
+const REFERRAL_RECORDS_PAGE_SIZE = 20
+
+const REFERRAL_STATUS_KEYS: Record<ReferralRecordStatus, I18nKey> = {
+  pending: 'cloud.referral.status.pending',
+  paid: 'cloud.referral.status.paid',
+  revoked: 'cloud.referral.status.revoked',
+}
+
+/** 分（i64 最小货币单位）→ 元，两位小数，人民币符号前缀——web 侧唯一出现金额的场景。 */
+function fmtYuan(minor: number): string {
+  return `¥${(minor / 100).toFixed(2)}`
+}
+
+function ReferralStatusBadge({ status }: { status: ReferralRecordStatus }) {
+  const { t } = useI18n()
+  const cls =
+    status === 'paid'
+      ? 'border-success/40 bg-success/10 text-success'
+      : status === 'revoked'
+        ? 'border-danger/40 bg-danger/10 text-danger'
+        : 'border-accent/40 bg-accent-weak text-accent'
+  return <span className={cn('flex-shrink-0 rounded border px-1.5 py-0.5 font-mono text-[10px]', cls)}>{t(REFERRAL_STATUS_KEYS[status])}</span>
+}
+
+/** 推介有奖对话框：打开时拉取总览（GET /referral/summary）与推荐码列表（GET
+ *  /referral/codes），每次打开都重新拉取。enabled=false 只展示未开放提示；
+ *  rewardEnabled=false（内部员工，见需求文档 referral_reward_enabled）时永不产生
+ *  返利台账行，这里对应隐藏全部金额与返利记录区块，只展示邀请人数 + 不参与返现
+ *  提示——推荐码依旧可正常创建/展示/复制，买家优惠与归因统计不受影响。
+ *  description 非空时优先展示 admin 后台配置的说明文案（保留换行），为空回退展示
+ *  rules 自动生成的套餐列表。返利记录（GET /referral/records）只在 rewardEnabled
+ *  时才有拉取的必要，支持按买家昵称/邮箱子串搜索（回车提交，搜索变更即从第 1 页
+ *  重拉），「加载更多」在本地状态里追加而非用查询库分页缓存。 */
+function ReferralDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useI18n()
+  const qc = useQueryClient()
+  const [records, setRecords] = useState<ReferralRecord[]>([])
+  const [recordsTotal, setRecordsTotal] = useState(0)
+  const [recordsPage, setRecordsPage] = useState(1)
+  const [recordsLoading, setRecordsLoading] = useState(false)
+  const [recordsError, setRecordsError] = useState(false)
+  const [recordsSearchInput, setRecordsSearchInput] = useState('')
+  const [recordsSearch, setRecordsSearch] = useState('')
+  const [newCode, setNewCode] = useState('')
+  const [createError, setCreateError] = useState('')
+
+  const summaryQuery = useQuery({
+    queryKey: ['cloud', 'referralSummary'],
+    queryFn: () => cloudApi.referralSummary(),
+    enabled: open,
+    staleTime: 10_000,
+  })
+  const summary = summaryQuery.data
+  const showRewards = !!summary?.enabled && !!summary?.rewardEnabled
+
+  const codesQuery = useQuery({
+    queryKey: ['cloud', 'referralCodes'],
+    queryFn: () => cloudApi.referralCodes(),
+    enabled: open && !!summary?.enabled,
+    staleTime: 10_000,
+  })
+  const codes = codesQuery.data?.items ?? []
+
+  const createMut = useMutation({
+    mutationFn: (code: string) => cloudApi.createReferralCode(code || undefined),
+    onSuccess: () => {
+      setNewCode('')
+      setCreateError('')
+      void qc.invalidateQueries({ queryKey: ['cloud', 'referralCodes'] })
+    },
+    onError: (err) => setCreateError(referralCodeErrorText(t, err)),
+  })
+
+  const loadRecords = useCallback(async (page: number, search: string) => {
+    setRecordsLoading(true)
+    setRecordsError(false)
+    try {
+      const res = await cloudApi.referralRecords(page, REFERRAL_RECORDS_PAGE_SIZE, search)
+      setRecords((prev) => (page === 1 ? res.items : [...prev, ...res.items]))
+      setRecordsTotal(res.total)
+      setRecordsPage(page)
+    } catch {
+      setRecordsError(true)
+    } finally {
+      setRecordsLoading(false)
+    }
+  }, [])
+
+  // 每次打开重置分页态与搜索态；rewardEnabled=false 时台账永远为空，不值得发请求。
+  useEffect(() => {
+    if (open && showRewards) {
+      setRecords([])
+      setRecordsTotal(0)
+      setRecordsSearchInput('')
+      setRecordsSearch('')
+      void loadRecords(1, '')
+    }
+  }, [open, showRewards, loadRecords])
+
+  // 每次打开重置创建输入态，避免带着上次残留的错误提示或半输入值。
+  useEffect(() => {
+    if (open) {
+      setNewCode('')
+      setCreateError('')
+    }
+  }, [open])
+
+  // 搜索提交：trim 后写入已生效搜索词并从第 1 页重新拉取，与「打开重置」共用同一份
+  // 列表清空逻辑，避免翻页态残留串号。
+  function submitRecordsSearch() {
+    const q = recordsSearchInput.trim()
+    setRecordsSearch(q)
+    setRecords([])
+    setRecordsTotal(0)
+    void loadRecords(1, q)
+  }
+
+  const hasMoreRecords = records.length < recordsTotal
+
+  return (
+    <Dialog.Root
+      open={open}
+      onOpenChange={(o) => {
+        if (!o) onClose()
+      }}
+    >
+      <Dialog.Portal>
+        <Dialog.Overlay className="wbackdrop show" />
+        <Dialog.Content className="dialog show" style={{ width: 480 }} aria-describedby={undefined}>
+          <header className="dlg-head">
+            <Dialog.Title asChild>
+              <b>{t('cloud.referral.dialogTitle')}</b>
+            </Dialog.Title>
+            <Dialog.Close asChild>
+              <button type="button" className="icon-btn sm" aria-label={t('common.close')}>
+                <X size={16} />
+              </button>
+            </Dialog.Close>
+          </header>
+          <div className="dlg-body thin-scroll" style={{ maxHeight: 480, overflowY: 'auto' }}>
+            {summaryQuery.isLoading ? (
+              <p className="p-4 text-[12px] text-text3">{t('common.loading')}</p>
+            ) : summaryQuery.isError || !summary ? (
+              <div className="flex items-center justify-between p-4">
+                <p className="text-[12px] text-danger">{t('cloud.referral.loadFailed')}</p>
+                <button type="button" className="btn ghost sm" onClick={() => void summaryQuery.refetch()}>
+                  {t('common.retry')}
+                </button>
+              </div>
+            ) : !summary.enabled ? (
+              <p className="set-desc">{t('cloud.referral.disabledNotice')}</p>
+            ) : (
+              <>
+                <label className="field-label" style={{ marginTop: 0 }}>
+                  {t('cloud.referral.codesTitle')}
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="text-input flex-1 font-mono uppercase"
+                    maxLength={16}
+                    placeholder={t('cloud.referral.codeCreatePlaceholder')}
+                    value={newCode}
+                    disabled={createMut.isPending}
+                    onChange={(e) => {
+                      setNewCode(e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, ''))
+                      setCreateError('')
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') createMut.mutate(newCode)
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="btn ghost sm flex-shrink-0"
+                    disabled={createMut.isPending}
+                    onClick={() => createMut.mutate(newCode)}
+                  >
+                    {createMut.isPending ? t('common.loading') : t('cloud.referral.codeCreateBtn')}
+                  </button>
+                </div>
+                {createError ? <p className="mt-1 text-[11.5px] text-danger">{createError}</p> : null}
+
+                <div className="mt-2 flex flex-col gap-1.5">
+                  {codesQuery.isLoading ? (
+                    <p className="p-2 text-[12px] text-text3">{t('common.loading')}</p>
+                  ) : codesQuery.isError ? (
+                    <div className="flex items-center justify-between p-2">
+                      <p className="text-[12px] text-danger">{t('cloud.referral.codesLoadFailed')}</p>
+                      <button type="button" className="btn ghost sm" onClick={() => void codesQuery.refetch()}>
+                        {t('common.retry')}
+                      </button>
+                    </div>
+                  ) : codes.length === 0 ? (
+                    <p className="p-2 text-[12px] text-text3">{t('cloud.referral.codesEmpty')}</p>
+                  ) : (
+                    codes.map((c) => <ReferralCodeRow key={c.id} code={c} />)
+                  )}
+                </div>
+
+                {showRewards ? (
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <div className="rounded-lg bg-surface2 px-2 py-2.5 text-center">
+                      <b className="block text-[15px] font-semibold text-text">{summary.invitedCount}</b>
+                      <span className="text-[10.5px] text-text3">{t('cloud.referral.invitedCount')}</span>
+                    </div>
+                    <div className="rounded-lg bg-surface2 px-2 py-2.5 text-center">
+                      <b className="block text-[15px] font-semibold text-text">{fmtYuan(summary.pendingRewardMinor)}</b>
+                      <span className="text-[10.5px] text-text3">{t('cloud.referral.pendingReward')}</span>
+                    </div>
+                    <div className="rounded-lg bg-surface2 px-2 py-2.5 text-center">
+                      <b className="block text-[15px] font-semibold text-text">{fmtYuan(summary.paidRewardMinor)}</b>
+                      <span className="text-[10.5px] text-text3">{t('cloud.referral.paidReward')}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-3">
+                    <p className="text-[12.5px] text-text2">{t('cloud.referral.invitedCountLine', { n: summary.invitedCount })}</p>
+                    <p className="mt-1 text-[11.5px] text-text3">{t('cloud.referral.rewardDisabledNotice')}</p>
+                  </div>
+                )}
+
+                {summary.description.trim() ? (
+                  <MarkdownLite text={summary.description} className="mt-4" />
+                ) : summary.rules.length > 0 ? (
+                  <>
+                    <p className="mb-1 mt-4 text-[12px] font-semibold text-text2">{t('cloud.referral.rulesTitle')}</p>
+                    <div className="flex flex-col gap-1.5">
+                      {summary.rules.map((r) => (
+                        <div key={r.planCode} className="flex items-center justify-between rounded-lg border border-line px-3 py-2 text-[12px]">
+                          <span className="text-text2">{r.planName}</span>
+                          <span className="text-text3">
+                            {t('cloud.referral.ruleDiscount', { amount: fmtYuan(r.discountMinor) })}
+                            {showRewards ? ` · ${t('cloud.referral.ruleReward', { percent: r.rewardPercent })}` : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : null}
+
+                {showRewards ? (
+                  <p className="mt-3 text-[11.5px] text-text3">
+                    {summary.contact ? t('cloud.referral.redeemNote', { contact: summary.contact }) : t('cloud.referral.redeemNoteNoContact')}
+                  </p>
+                ) : null}
+
+                {showRewards ? (
+                  <>
+                    <p className="mb-1 mt-4 text-[12px] font-semibold text-text2">{t('cloud.referral.recordsTitle')}</p>
+                    <div className="relative mb-2">
+                      <Search size={13} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text3" />
+                      <input
+                        className="text-input"
+                        style={{ paddingLeft: 30 }}
+                        placeholder={t('cloud.referral.searchPlaceholder')}
+                        value={recordsSearchInput}
+                        onChange={(e) => setRecordsSearchInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') submitRecordsSearch()
+                        }}
+                      />
+                    </div>
+                    {recordsLoading && records.length === 0 ? (
+                      <p className="p-3 text-[12px] text-text3">{t('common.loading')}</p>
+                    ) : recordsError && records.length === 0 ? (
+                      <div className="flex items-center justify-between p-3">
+                        <p className="text-[12px] text-danger">{t('cloud.referral.recordsLoadFailed')}</p>
+                        <button type="button" className="btn ghost sm" onClick={() => void loadRecords(1, recordsSearch)}>
+                          {t('common.retry')}
+                        </button>
+                      </div>
+                    ) : records.length === 0 ? (
+                      <p className="p-3 text-[12px] text-text3">{recordsSearch ? t('cloud.referral.searchEmpty') : t('cloud.referral.recordsEmpty')}</p>
+                    ) : (
+                      <div className="flex flex-col gap-1">
+                        {records.map((r) => (
+                          <div key={r.id} className="flex items-center gap-2 border-b border-line py-2 text-[12px] last:border-b-0">
+                            <div className="min-w-0 flex-1">
+                              <p className="truncate text-text2">{r.buyerLabel}</p>
+                              <p className="text-[10.5px] text-text3">
+                                {r.referralCode ? `${r.referralCode} · ` : ''}
+                                {fmtRelativeTime(r.createdAt)}
+                              </p>
+                            </div>
+                            <span className="flex-shrink-0 font-mono text-[12px] text-text2">{fmtYuan(r.rewardMinor)}</span>
+                            <ReferralStatusBadge status={r.status} />
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                    {hasMoreRecords ? (
+                      <button
+                        type="button"
+                        className="btn ghost sm mt-2 w-full"
+                        disabled={recordsLoading}
+                        onClick={() => void loadRecords(recordsPage + 1, recordsSearch)}
+                      >
+                        {recordsLoading ? t('common.loading') : t('cloud.referral.loadMore')}
+                      </button>
+                    ) : null}
+                  </>
+                ) : null}
+              </>
+            )}
+          </div>
+        </Dialog.Content>
+      </Dialog.Portal>
+    </Dialog.Root>
+  )
+}
+
+/** 单条推荐码行：展示码/有效订单数/累计返利/创建时间，支持复制与删除（确认后硬
+ *  删除，历史订单归因不受影响）。 */
+function ReferralCodeRow({ code }: { code: ReferralCode }) {
+  const { t } = useI18n()
+  const qc = useQueryClient()
+
+  const deleteMut = useMutation({
+    mutationFn: () => cloudApi.deleteReferralCode(code.id),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: ['cloud', 'referralCodes'] }),
+  })
+
+  async function handleDelete() {
+    const ok = await confirmDialog({
+      title: t('cloud.referral.codeDeleteTitle'),
+      message: t('cloud.referral.codeDeleteDesc', { code: code.code }),
+      danger: true,
+    })
+    if (ok) deleteMut.mutate()
+  }
+
+  return (
+    <div className="token-box">
+      <div className="min-w-0 flex-1">
+        <span className="font-mono text-[13px] font-semibold tracking-[1px] text-text">{code.code}</span>
+        <p className="mt-0.5 text-[10.5px] text-text3">
+          {t('cloud.referral.codePaidOrders', { n: code.paidOrderCount })} · {fmtYuan(code.rewardMinor)} · {fmtRelativeTime(code.createdAt)}
+        </p>
+      </div>
+      <CopyButton value={code.code} />
+      <button
+        type="button"
+        className="text-text3 hover:text-danger"
+        title={t('cloud.referral.codeDeleteTitle')}
+        aria-label={t('cloud.referral.codeDeleteTitle')}
+        disabled={deleteMut.isPending}
+        onClick={() => void handleDelete()}
+      >
+        <Trash2 size={13} />
+      </button>
+    </div>
   )
 }
 

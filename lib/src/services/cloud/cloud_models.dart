@@ -461,6 +461,12 @@ class CloudOrder {
   final String? campaignName;
   final String? stageLabel;
 
+  /// 下单时填写的推荐码（无码或推荐系统未生效时为 null）。
+  final String? referralCode;
+
+  /// 推荐码带来的立减额（分，0 = 无立减），已内含在 [amountMinor] 中。
+  final int referralDiscountMinor;
+
   /// 微信 Native 收款二维码内容；failed 时可能为 null。
   final String? codeUrl;
   final String createdAt;
@@ -479,6 +485,8 @@ class CloudOrder {
     required this.currency,
     this.campaignName,
     this.stageLabel,
+    this.referralCode,
+    this.referralDiscountMinor = 0,
     this.codeUrl,
     required this.createdAt,
     this.paidAt,
@@ -497,6 +505,8 @@ class CloudOrder {
     currency: (json['currency'] as String?) ?? 'CNY',
     campaignName: json['campaignName'] as String?,
     stageLabel: json['stageLabel'] as String?,
+    referralCode: json['referralCode'] as String?,
+    referralDiscountMinor: (json['referralDiscountMinor'] as num?)?.toInt() ?? 0,
     codeUrl: json['codeUrl'] as String?,
     createdAt: (json['createdAt'] as String?) ?? '',
     paidAt: json['paidAt'] as String?,
@@ -507,6 +517,209 @@ class CloudOrder {
   bool get isPaid => status == 'paid';
   bool get isFailed => status == 'failed';
   bool get isExpired => status == 'expired';
+}
+
+/// 推介有奖规则档位（GET /referral/summary 响应 rules[] 元素）：遍历 rules
+/// 只含 enabled 且 price_minor>0 的套餐，按解析后的生效值下发。
+class CloudReferralRule {
+  final String planCode;
+  final String planName;
+  final int priceMinor;
+  final int discountMinor;
+  final int rewardPercent;
+
+  const CloudReferralRule({
+    required this.planCode,
+    required this.planName,
+    required this.priceMinor,
+    required this.discountMinor,
+    required this.rewardPercent,
+  });
+
+  factory CloudReferralRule.fromJson(Map<String, dynamic> json) =>
+      CloudReferralRule(
+        planCode: json['planCode'] as String,
+        planName: (json['planName'] as String?) ?? '',
+        priceMinor: (json['priceMinor'] as num?)?.toInt() ?? 0,
+        discountMinor: (json['discountMinor'] as num?)?.toInt() ?? 0,
+        rewardPercent: (json['rewardPercent'] as num?)?.toInt() ?? 0,
+      );
+}
+
+/// GET /referral/summary 响应：推介有奖总览——收益统计 + 说明文案 + 规则表。
+/// [enabled]=false 时功能未开启，其余字段仍照常返回。多码化后不再随 summary
+/// 下发单一推荐码，见 [CloudReferralCode] / `GET /referral/codes`。
+class CloudReferralSummary {
+  final bool enabled;
+
+  /// 后台可编辑的说明文案（多行，保留换行）；空串时客户端回退到 [rules] 自动渲染。
+  final String description;
+
+  /// 当前账号是否参与返现（管理员可为内部账号关闭；关闭后码仍可用于买家立减）。
+  final bool rewardEnabled;
+  final String contact;
+  final int invitedCount;
+  final int pendingRewardMinor;
+  final int paidRewardMinor;
+  final int totalRewardMinor;
+  final List<CloudReferralRule> rules;
+
+  const CloudReferralSummary({
+    required this.enabled,
+    required this.description,
+    required this.rewardEnabled,
+    required this.contact,
+    required this.invitedCount,
+    required this.pendingRewardMinor,
+    required this.paidRewardMinor,
+    required this.totalRewardMinor,
+    required this.rules,
+  });
+
+  factory CloudReferralSummary.fromJson(Map<String, dynamic> json) =>
+      CloudReferralSummary(
+        enabled: json['enabled'] as bool? ?? false,
+        description: (json['description'] as String?) ?? '',
+        rewardEnabled: json['rewardEnabled'] as bool? ?? true,
+        contact: (json['contact'] as String?) ?? '',
+        invitedCount: (json['invitedCount'] as num?)?.toInt() ?? 0,
+        pendingRewardMinor: (json['pendingRewardMinor'] as num?)?.toInt() ?? 0,
+        paidRewardMinor: (json['paidRewardMinor'] as num?)?.toInt() ?? 0,
+        totalRewardMinor: (json['totalRewardMinor'] as num?)?.toInt() ?? 0,
+        rules: (json['rules'] as List<dynamic>? ?? const [])
+            .map((e) => CloudReferralRule.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
+}
+
+/// GET/POST /referral/codes 响应单条：一个可自定义或随机生成的推荐码及其统计。
+/// [paidOrderCount] 为该码文本快照命中的本人 status=paid 订单数，[rewardMinor]
+/// 为关联订单的返利台账合计（pending+paid，排除 revoked）。
+class CloudReferralCode {
+  final String id;
+  final String code;
+  final int paidOrderCount;
+  final int rewardMinor;
+  final String createdAt;
+
+  const CloudReferralCode({
+    required this.id,
+    required this.code,
+    required this.paidOrderCount,
+    required this.rewardMinor,
+    required this.createdAt,
+  });
+
+  factory CloudReferralCode.fromJson(Map<String, dynamic> json) =>
+      CloudReferralCode(
+        id: json['id'] as String,
+        code: (json['code'] as String?) ?? '',
+        paidOrderCount: (json['paidOrderCount'] as num?)?.toInt() ?? 0,
+        rewardMinor: (json['rewardMinor'] as num?)?.toInt() ?? 0,
+        createdAt: (json['createdAt'] as String?) ?? '',
+      );
+}
+
+/// GET /referral/codes 响应：总条数 + 当页推荐码列表。
+class CloudReferralCodesResult {
+  final int total;
+  final List<CloudReferralCode> items;
+
+  const CloudReferralCodesResult({required this.total, required this.items});
+
+  factory CloudReferralCodesResult.fromJson(Map<String, dynamic> json) =>
+      CloudReferralCodesResult(
+        total: (json['total'] as num?)?.toInt() ?? 0,
+        items: (json['items'] as List<dynamic>? ?? const [])
+            .map((e) => CloudReferralCode.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
+}
+
+/// GET /referral/records 响应单条：一笔已归因给我的订单产生的返利台账行。
+/// [status] 取值 pending（待兑付）| paid（已兑付）| revoked（已撤销）。
+class CloudReferralRecord {
+  final String id;
+
+  /// 买家脱敏展示名（服务端已脱敏：优先昵称，否则邮箱首字符+***+@域名）。
+  final String buyerLabel;
+  final int orderAmountMinor;
+  final int rewardMinor;
+  final int rewardPercent;
+  final String status;
+  final String createdAt;
+  final String? paidAt;
+
+  /// 该笔订单下单时使用的推荐码文本快照（无码时为 null）。
+  final String? referralCode;
+
+  const CloudReferralRecord({
+    required this.id,
+    required this.buyerLabel,
+    required this.orderAmountMinor,
+    required this.rewardMinor,
+    required this.rewardPercent,
+    required this.status,
+    required this.createdAt,
+    this.paidAt,
+    this.referralCode,
+  });
+
+  factory CloudReferralRecord.fromJson(Map<String, dynamic> json) =>
+      CloudReferralRecord(
+        id: json['id'] as String,
+        buyerLabel: (json['buyerLabel'] as String?) ?? '',
+        orderAmountMinor: (json['orderAmountMinor'] as num?)?.toInt() ?? 0,
+        rewardMinor: (json['rewardMinor'] as num?)?.toInt() ?? 0,
+        rewardPercent: (json['rewardPercent'] as num?)?.toInt() ?? 0,
+        status: (json['status'] as String?) ?? 'pending',
+        createdAt: (json['createdAt'] as String?) ?? '',
+        paidAt: json['paidAt'] as String?,
+        referralCode: json['referralCode'] as String?,
+      );
+
+  bool get isPending => status == 'pending';
+  bool get isPaid => status == 'paid';
+  bool get isRevoked => status == 'revoked';
+}
+
+/// GET /referral/records 响应：总条数 + 当页收益记录列表。
+class CloudReferralRecordsResult {
+  final int total;
+  final List<CloudReferralRecord> items;
+
+  const CloudReferralRecordsResult({required this.total, required this.items});
+
+  factory CloudReferralRecordsResult.fromJson(Map<String, dynamic> json) =>
+      CloudReferralRecordsResult(
+        total: (json['total'] as num?)?.toInt() ?? 0,
+        items: (json['items'] as List<dynamic>? ?? const [])
+            .map(
+              (e) => CloudReferralRecord.fromJson(e as Map<String, dynamic>),
+            )
+            .toList(),
+      );
+}
+
+/// GET /referral/validate 响应：下单前预校验推荐码是否可用。[reason] 仅在
+/// [valid]=false 时非空，取值 feature_disabled | not_found | self_use | no_discount。
+class CloudReferralValidateResult {
+  final bool valid;
+  final int discountMinor;
+  final String? reason;
+
+  const CloudReferralValidateResult({
+    required this.valid,
+    required this.discountMinor,
+    this.reason,
+  });
+
+  factory CloudReferralValidateResult.fromJson(Map<String, dynamic> json) =>
+      CloudReferralValidateResult(
+        valid: json['valid'] as bool? ?? false,
+        discountMinor: (json['discountMinor'] as num?)?.toInt() ?? 0,
+        reason: json['reason'] as String?,
+      );
 }
 
 /// 配置同步单条目（对应服务端 GET /sync/items 响应的 items[]，见契约 v1 数据模型）。
