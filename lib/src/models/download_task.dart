@@ -38,6 +38,18 @@ enum SeedingStatus {
   queued,
 }
 
+/// 文件名未确认时的展示占位：用任务 URL 顶替「未知文件」，让用户在
+/// probe / BT 元数据取回前也能分辨任务（Web SPA 早已是 fileName || url，
+/// 此处对齐）。超长 URL（尤其 magnet 带一串 tracker）截断加省略号——
+/// 该值还会流入重命名预填与删除确认文案，不能无限长。
+/// URL 为空时（理论不可达）回退 i18n 占位符。
+String placeholderTaskName(String url) {
+  if (url.isEmpty) return currentS.unknownFile;
+  const max = 64;
+  if (url.length <= max) return url;
+  return '${url.substring(0, max)}…';
+}
+
 /// Convert a Rust seeding status code to the Dart enum.
 ///
 /// Mirrors [taskStatusFromInt] and must stay in sync with
@@ -511,7 +523,7 @@ class DownloadTask {
     return DownloadTask(
       id: info.taskId,
       url: info.url,
-      fileName: hasName ? info.fileName : currentS.unknownFile,
+      fileName: hasName ? info.fileName : placeholderTaskName(info.url),
       saveDir: info.saveDir,
       status: taskStatusFromInt(info.status),
       downloadedBytes: info.downloadedBytes,

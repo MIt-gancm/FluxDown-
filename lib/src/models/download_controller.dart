@@ -1896,7 +1896,8 @@ class DownloadController extends ChangeNotifier {
       var task = DownloadTask(
         id: p.taskId,
         url: p.url,
-        fileName: p.fileName.isEmpty ? currentS.unknownFile : p.fileName,
+        fileName:
+            p.fileName.isEmpty ? placeholderTaskName(p.url) : p.fileName,
         saveDir: p.saveDir,
         status: newStatus,
         downloadedBytes: p.downloadedBytes,
