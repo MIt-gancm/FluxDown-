@@ -41,11 +41,11 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
   bool _sheetOpen = false;
 
   /// 新建下载弹层是否正在展示（区别于更新提示等其他弹层）。
-  /// 弹层可见期间到达的分享 / 协议 URL 经 [_shareAppendCtrl] 合入表单，
-  /// 支撑扩展批量协议唤起（逐条 VIEW intent，间隔 800ms）。
+  /// 新建下载弹层已打开时，后续协议请求会把完整元数据合入表单。
   bool _downloadSheetOpen = false;
   bool _externalSheetVisible = false;
-  final _shareAppendCtrl = StreamController<String>.broadcast();
+  final _shareAppendCtrl =
+      StreamController<SharedDownloadRequest>.broadcast();
 
   /// 自动更新检查只触发一次（等配置加载完成后）。
   bool _updateCheckScheduled = false;
@@ -180,7 +180,7 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
   Future<void> _onShared(SharedDownloadRequest request) async {
     if (!mounted) return;
     if (_downloadSheetOpen) {
-      _shareAppendCtrl.add(request.url);
+      _shareAppendCtrl.add(request);
       return;
     }
     if (_sheetOpen) return;
@@ -201,7 +201,7 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
         initialCookies: request.cookies,
         initialReferrer: request.referrer,
         initialHeaders: request.headers,
-        appendUrls: _shareAppendCtrl.stream,
+        appendRequests: _shareAppendCtrl.stream,
       );
       if (request.external) {
         await ShareIntentService.returnToSourceApp();

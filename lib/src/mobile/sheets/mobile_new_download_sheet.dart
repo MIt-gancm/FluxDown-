@@ -14,6 +14,7 @@ import '../../theme/app_colors.dart';
 import '../../theme/app_metrics.dart';
 import '../mobile_ui.dart';
 import '../services/mobile_storage_service.dart';
+import '../services/share_intent_service.dart';
 
 enum MobileNewDownloadResult { submitted, submittedLater }
 
@@ -27,7 +28,7 @@ Future<MobileNewDownloadResult?> showMobileNewDownloadSheet(
   String initialCookies = '',
   String initialReferrer = '',
   Map<String, String> initialHeaders = const {},
-  Stream<String>? appendUrls,
+  Stream<SharedDownloadRequest>? appendRequests,
 }) {
   return showMobileSheet<MobileNewDownloadResult>(
     context,
@@ -39,7 +40,7 @@ Future<MobileNewDownloadResult?> showMobileNewDownloadSheet(
       initialCookies: initialCookies,
       initialReferrer: initialReferrer,
       initialHeaders: initialHeaders,
-      appendUrls: appendUrls,
+      appendRequests: appendRequests,
       rootContext: context,
     ),
   );
@@ -50,8 +51,7 @@ class _NewDownloadSheet extends StatefulWidget {
   final SettingsProvider settings;
   final String initialUrl;
 
-  /// fluxdown:// 协议携带的建议文件名（协议模式不带 Cookie，
-  /// Content-Disposition 场景引擎推断不出正确文件名）。
+  /// 协议唤起可携带文件名、Cookie、Referer 和请求头。
   /// 仅当用户未改动预填 URL 时随任务提交。
   final String initialFileName;
 
@@ -61,7 +61,7 @@ class _NewDownloadSheet extends StatefulWidget {
 
   /// 弹层可见期间追加到 URL 输入框的后续分享 / 协议 URL
   /// （扩展批量协议唤起逐条 VIEW intent 到达，合入现有表单）。
-  final Stream<String>? appendUrls;
+  final Stream<SharedDownloadRequest>? appendRequests;
 
   /// 弹层关闭后仍存活的外层 context（用于 Toast）
   final BuildContext rootContext;
@@ -74,7 +74,7 @@ class _NewDownloadSheet extends StatefulWidget {
     required this.initialCookies,
     required this.initialReferrer,
     required this.initialHeaders,
-    this.appendUrls,
+    this.appendRequests,
     required this.rootContext,
   });
 
@@ -91,16 +91,28 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
   /// 自定义请求头列表（#347），每项含一对 key/value 输入控制器。
   final List<_MobileHeaderRow> _headerRows = [];
 
+  final List<SharedDownloadRequest> _requests = [];
+
   late String _threads; // 'auto' | '4' | '8' | '16' | '32'
   late String _queueId;
   String _uaPreset = 'default';
   bool _advancedOpen = false;
-  StreamSubscription<String>? _appendSub;
+  StreamSubscription<SharedDownloadRequest>? _appendSub;
 
   @override
   void initState() {
     super.initState();
     _urlController = TextEditingController(text: widget.initialUrl);
+    _requests.add(
+      SharedDownloadRequest(
+        url: widget.initialUrl,
+        filename: widget.initialFileName,
+        cookies: widget.initialCookies,
+        referrer: widget.initialReferrer,
+        headers: widget.initialHeaders,
+        external: true,
+      ),
+    );
     _dirController = TextEditingController(
       text: widget.settings.effectiveDefaultSaveDir,
     );
@@ -119,19 +131,19 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
         !widget.controller.queues.any((q) => q.queueId == _queueId)) {
       _queueId = kMainQueueId;
     }
-    // 弹层可见期间逐条到达的批量协议 URL：追加为新行（去重）
-    _appendSub = widget.appendUrls?.listen(_appendUrl);
+    _appendSub = widget.appendRequests?.listen(_appendRequest);
   }
 
-  void _appendUrl(String url) {
-    if (!mounted || url.isEmpty) return;
+  void _appendRequest(SharedDownloadRequest request) {
+    if (!mounted || request.url.isEmpty) return;
+    if (_requests.any((entry) => entry.url == request.url)) return;
+    _requests.add(request);
     final lines = _urlController.text
         .split('\n')
-        .map((l) => l.trim())
-        .where((l) => l.isNotEmpty)
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
         .toList();
-    if (lines.contains(url)) return;
-    lines.add(url);
+    lines.add(request.url);
     _urlController.text = lines.join('\n');
   }
 
@@ -215,33 +227,45 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
     // 事后可经任务操作弹层移动队列）。
     final queueId = later ? kLaterQueueId : _queueId;
 
-    if (urls.length == 1) {
+    final requestByUrl = <String, SharedDownloadRequest>{
+      for (final request in _requests)
+        if (request.url.isNotEmpty) request.url: request,
+    };
+
+    Map<String, String> headersFor(String url) {
+      final requestHeaders = <String, String>{
+        ...(requestByUrl[url]?.headers ?? const {}),
+      };
+      final referrer = requestByUrl[url]?.referrer ?? widget.initialReferrer;
+      if (referrer.isNotEmpty &&
+          !requestHeaders.keys.any((key) => key.toLowerCase() == 'referer')) {
+        requestHeaders['Referer'] = referrer;
+      }
+      if (url == widget.initialUrl || !requestByUrl.containsKey(url)) {
+        requestHeaders.addAll(extraHeaders);
+      }
+      return requestHeaders;
+    }
+
+    String cookiesFor(String url) =>
+        requestByUrl.containsKey(url) && url != widget.initialUrl
+            ? requestByUrl[url]?.cookies ?? ''
+            : cookies;
+
+    String filenameFor(String url) => requestByUrl[url]?.filename ?? fileName;
+
+    for (final url in urls) {
+      final headers = headersFor(url);
       widget.controller.createTask(
-        url: urls.first,
+        url: url,
         saveDir: saveDir,
-        fileName: fileName,
+        fileName: filenameFor(url),
         segments: segments,
-        cookies: cookies,
+        cookies: cookiesFor(url),
         userAgent: userAgent,
         queueId: queueId,
-        checksum: checksum,
-        extraHeaders: extraHeaders,
-        startPaused: later,
-      );
-    } else {
-      // 批量下载共享目录/线程/UA，校验值仅单任务支持
-      widget.controller.batchCreateTask(
-        entries: [
-          for (final url in urls)
-            UrlEntry(url: url, fileName: '', checksum: '', audioUrl: ''),
-        ],
-        saveDir: saveDir,
-        segments: segments,
-        userAgent: userAgent,
-        queueId: queueId,
-        cookies: cookies,
-        referrer: widget.initialReferrer,
-        extraHeaders: extraHeaders,
+        checksum: urls.length == 1 ? checksum : '',
+        extraHeaders: headers,
         startPaused: later,
       );
     }
