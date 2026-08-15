@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/services.dart';
@@ -19,6 +20,24 @@ const _tag = 'ShareIntent';
 ///
 /// 分享内容可能夹带描述文字（如“看看这个 https://x/f.zip”），[extractUrl]
 /// 从中提取首个可下载的 URL / magnet。
+class SharedDownloadRequest {
+  final String url;
+  final String filename;
+  final String cookies;
+  final String referrer;
+  final Map<String, String> headers;
+  final bool external;
+
+  const SharedDownloadRequest({
+    required this.url,
+    this.filename = '',
+    this.cookies = '',
+    this.referrer = '',
+    this.headers = const {},
+    this.external = false,
+  });
+}
+
 class ShareIntentService {
   ShareIntentService._();
 
@@ -27,14 +46,11 @@ class ShareIntentService {
   /// 当前平台是否支持系统分享接入
   static bool get supported => Platform.isAndroid || Platform.isIOS;
 
-  static void Function(String url, String filename)? _onShared;
+  static void Function(SharedDownloadRequest request)? _onShared;
 
   /// 注册分享回调，并立即拉取冷启动时暂存的分享内容。
-  ///
-  /// [onShared] 收到的是已提取的 URL / magnet 与可选的建议文件名
-  /// （仅 fluxdown:// 协议携带，其余场景为空串）；提取失败则不回调。
   static Future<void> init(
-    void Function(String url, String filename) onShared,
+    void Function(SharedDownloadRequest request) onShared,
   ) async {
     if (!supported) return;
     _onShared = onShared;
@@ -58,12 +74,29 @@ class ShareIntentService {
     }
   }
 
+  static Future<void> returnToSourceApp() async {
+    if (!Platform.isAndroid) return;
+    try {
+      await _channel.invokeMethod<bool>('moveTaskToBack');
+    } catch (e, st) {
+      logError(_tag, 'moveTaskToBack failed', e, st);
+    }
+  }
+
   static void _dispatch(Object? raw) {
     final String? text;
     var filename = '';
+    var cookies = '';
+    var referrer = '';
+    var headers = const <String, String>{};
+    var external = false;
     if (raw is Map) {
       text = raw['url'] as String?;
       filename = (raw['filename'] as String?)?.trim() ?? '';
+      cookies = raw['cookies'] as String? ?? '';
+      referrer = (raw['referrer'] as String?)?.trim() ?? '';
+      headers = _decodeHeaders(raw['headers'] as String?);
+      external = raw['external'] == 'true';
     } else {
       text = raw as String?;
     }
@@ -74,8 +107,36 @@ class ShareIntentService {
       }
       return;
     }
-    logInfo(_tag, 'shared url received');
-    _onShared?.call(url, filename);
+    logInfo(
+      _tag,
+      'shared url received: cookies_len=${cookies.length}, headers=${headers.length}',
+    );
+    _onShared?.call(
+      SharedDownloadRequest(
+        url: url,
+        filename: filename,
+        cookies: cookies,
+        referrer: referrer,
+        headers: headers,
+        external: external,
+      ),
+    );
+  }
+
+  static Map<String, String> _decodeHeaders(String? raw) {
+    if (raw == null || raw.isEmpty) return const {};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return const {};
+      return {
+        for (final entry in decoded.entries)
+          if (entry.key is String && entry.value is String)
+            entry.key as String: entry.value as String,
+      };
+    } catch (e) {
+      logInfo(_tag, 'invalid shared headers ignored: $e');
+      return const {};
+    }
   }
 
   /// 从分享文本中提取首个可下载链接。
@@ -91,7 +152,7 @@ class ShareIntentService {
   }
 
   static final RegExp _urlPattern = RegExp(
-    r'(magnet:\?[^\s]+|(?:https?|ftp)://[^\s]+)',
+    r'(magnet:\?[^\s]+|ed2k://[^\s]+|(?:https?|ftp)://[^\s]+)',
     caseSensitive: false,
   );
 }

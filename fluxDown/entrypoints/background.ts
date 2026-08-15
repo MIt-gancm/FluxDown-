@@ -2378,11 +2378,26 @@ export default defineBackground(() => {
   async function openProtocolUrl(
     url: string,
     filename?: string,
+    cookies?: string,
+    referrer?: string,
+    headers?: Record<string, string>,
   ): Promise<boolean> {
     const params = new URLSearchParams({ url });
     if (filename) params.set("filename", filename);
+    if (cookies) params.set("cookies", cookies);
+    if (referrer) params.set("referrer", referrer);
+    if (headers && Object.keys(headers).length > 0) {
+      params.set("headers", JSON.stringify(headers));
+    }
     const protocolUrl = `fluxdown://download?${params.toString()}`;
-    console.log("[FluxDown] protocol mode — opening:", protocolUrl);
+    console.log(
+      "[FluxDown] protocol mode — opening:",
+      url,
+      "cookies_len=",
+      cookies?.length ?? 0,
+      "headers=",
+      Object.keys(headers || {}).length,
+    );
     try {
       if (protocolTabId !== null) {
         try {
@@ -2432,40 +2447,17 @@ export default defineBackground(() => {
     // 引擎收到后分别下载 + mux 合并。追加为末位可选参数，不影响既有调用方。
     audioUrl?: string,
   ): Promise<boolean> {
-    // === fluxdown:// 自定义协议模式 ===
-    // 开启后跳过 NMH/远端投递，经协议 URL 唤起 FluxDown 客户端
-    // （Android: 系统 VIEW intent；桌面: 系统协议处理器）。
-    // 限制：不经过 NMH，Cookie/Headers/method/body 无法携带，适用于公开文件。
-    {
-      const protocolSettings = await getCachedSettings();
-      if (protocolSettings.enableFluxdownProtocol) {
-        if (audioUrl) {
-          // 音视频分轨对（video+audio mux）无法经协议 URL 表达 —— 丢弃
-          // audioUrl 会下成无声视频。返回失败让调用方回退浏览器下载。
-          console.warn(
-            "[FluxDown] protocol mode cannot carry audioUrl; falling back to browser download",
-          );
-          await incrementStat("failed");
-          return false;
-        } else {
-          const ok = await openProtocolUrl(url, filename);
-          await incrementStat(ok ? "sent" : "failed");
-          if (ok && (await shouldNotifyChannel("local"))) {
-            const shownName = filename || extractCleanFilename(url) || url;
-            notify(
-              t("notify.downloadSent"),
-              t("notify.sentToFluxDown", { name: shownName }),
-            );
-          }
-          return ok;
-        }
-      }
+    const protocolSettings = await getCachedSettings();
+    if (protocolSettings.enableFluxdownProtocol && audioUrl) {
+      console.warn(
+        "[FluxDown] protocol mode cannot carry audioUrl; falling back to browser download",
+      );
+      await incrementStat("failed");
+      return false;
     }
 
-    // === 预热 NMH 链路（fire-and-forget） ===
-    // App 冷启动 ~0.7-1s，下方 cookie/认证收集最多 ~500ms。先发 warmup
-    // 让两者并行；App 已运行时 warmup 是 ~1ms 本地应答，无副作用。
-    warmupNativeHost();
+    // 协议模式同样先收集 Cookie/Headers，再经 fluxdown:// 传给 Android。
+    if (!protocolSettings.enableFluxdownProtocol) warmupNativeHost();
 
     // === 提取认证信息（Cookie / Authorization 等） ===
     // 策略 1：从 webRequest 缓存获取（最可靠 — 浏览器真正发出的请求头）
@@ -2561,6 +2553,25 @@ export default defineBackground(() => {
       }
     }
 
+    if (protocolSettings.enableFluxdownProtocol) {
+      const ok = await openProtocolUrl(
+        url,
+        filename,
+        cookieString,
+        referrer,
+        extraHeaders,
+      );
+      await incrementStat(ok ? "sent" : "failed");
+      if (ok && (await shouldNotifyChannel("local"))) {
+        const shownName = filename || extractCleanFilename(url) || url;
+        notify(
+          t("notify.downloadSent"),
+          t("notify.sentToFluxDown", { name: shownName }),
+        );
+      }
+      return ok;
+    }
+
     const request: DownloadRequest = {
       url,
       filename: filename || "",
@@ -2574,7 +2585,14 @@ export default defineBackground(() => {
       audioUrl: audioUrl || undefined,
     };
 
-    console.log("[FluxDown] Sending to FluxDown app:", request);
+    console.log(
+      "[FluxDown] Sending to FluxDown app:",
+      url,
+      "cookies_len=",
+      cookieString.length,
+      "headers=",
+      Object.keys(extraHeaders).length,
+    );
 
     const response = await sendDownloadRequest(request);
     const notifyOk = await shouldNotifyChannel(response.channel);
@@ -2941,34 +2959,10 @@ export default defineBackground(() => {
           return { success: false, message: "No items" };
         }
 
-        // === fluxdown:// 协议模式：批量走逐条协议唤起 ===
-        // 复用单标签页顺序导航，每条间隔 800ms 让系统逐条派发
-        // （Android: VIEW intent；桌面: 协议处理器 → 第二实例转发）。
-        // 认证信息无法携带。
-        {
-          const protoSettings = await getCachedSettings();
-          if (protoSettings.enableFluxdownProtocol) {
-            let batchProtoSent = 0;
-            for (const item of items) {
-              const ok = await openProtocolUrl(item.url, item.filename);
-              if (ok) batchProtoSent++;
-              await new Promise((r) => setTimeout(r, 800));
-            }
-            await incrementStat(batchProtoSent > 0 ? "sent" : "failed");
-            if (batchProtoSent > 0 && (await shouldNotifyChannel("local"))) {
-              notify(
-                t("notify.downloadSent"),
-                t("notify.batchSentDetail", {
-                  count: String(batchProtoSent),
-                }),
-              );
-            }
-            return { success: batchProtoSent > 0, sent: batchProtoSent };
-          }
-        }
+        const protoSettings = await getCachedSettings();
 
-        // 预热 NMH：App 冷启动与下方逐项 cookie 收集（各 500ms 上限）并行
-        warmupNativeHost();
+        // 本机协议模式不需要预热 Native Messaging。
+        if (!protoSettings.enableFluxdownProtocol) warmupNativeHost();
 
         // 为每个 URL 提取 cookies，构建 BatchDownloadItem 列表
         // Bug 9 修复：cookies API 加 500ms 超时，与 sendToFluxDown 保持一致
@@ -3033,6 +3027,29 @@ export default defineBackground(() => {
             };
           }),
         );
+
+        if (protoSettings.enableFluxdownProtocol) {
+          let batchProtoSent = 0;
+          for (const item of batchItems) {
+            const ok = await openProtocolUrl(
+              item.url,
+              item.filename,
+              item.cookies,
+              item.referrer,
+              item.headers,
+            );
+            if (ok) batchProtoSent++;
+            await new Promise((r) => setTimeout(r, 800));
+          }
+          await incrementStat(batchProtoSent > 0 ? "sent" : "failed");
+          if (batchProtoSent > 0 && (await shouldNotifyChannel("local"))) {
+            notify(
+              t("notify.downloadSent"),
+              t("notify.batchSentDetail", { count: String(batchProtoSent) }),
+            );
+          }
+          return { success: batchProtoSent > 0, sent: batchProtoSent };
+        }
 
         // 单次 HTTP POST 发送所有 URL（用换行符连接）
         const response = await sendBatchDownloadRequest(batchItems);

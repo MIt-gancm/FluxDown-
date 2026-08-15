@@ -15,22 +15,30 @@ import '../../theme/app_metrics.dart';
 import '../mobile_ui.dart';
 import '../services/mobile_storage_service.dart';
 
+enum MobileNewDownloadResult { submitted, submittedLater }
+
 /// 新建下载底部弹层
-Future<void> showMobileNewDownloadSheet(
+Future<MobileNewDownloadResult?> showMobileNewDownloadSheet(
   BuildContext context, {
   required DownloadController controller,
   required SettingsProvider settings,
   String initialUrl = '',
   String initialFileName = '',
+  String initialCookies = '',
+  String initialReferrer = '',
+  Map<String, String> initialHeaders = const {},
   Stream<String>? appendUrls,
 }) {
-  return showMobileSheet<void>(
+  return showMobileSheet<MobileNewDownloadResult>(
     context,
     builder: (ctx) => _NewDownloadSheet(
       controller: controller,
       settings: settings,
       initialUrl: initialUrl,
       initialFileName: initialFileName,
+      initialCookies: initialCookies,
+      initialReferrer: initialReferrer,
+      initialHeaders: initialHeaders,
       appendUrls: appendUrls,
       rootContext: context,
     ),
@@ -47,6 +55,10 @@ class _NewDownloadSheet extends StatefulWidget {
   /// 仅当用户未改动预填 URL 时随任务提交。
   final String initialFileName;
 
+  final String initialCookies;
+  final String initialReferrer;
+  final Map<String, String> initialHeaders;
+
   /// 弹层可见期间追加到 URL 输入框的后续分享 / 协议 URL
   /// （扩展批量协议唤起逐条 VIEW intent 到达，合入现有表单）。
   final Stream<String>? appendUrls;
@@ -59,6 +71,9 @@ class _NewDownloadSheet extends StatefulWidget {
     required this.settings,
     required this.initialUrl,
     required this.initialFileName,
+    required this.initialCookies,
+    required this.initialReferrer,
+    required this.initialHeaders,
     this.appendUrls,
     required this.rootContext,
   });
@@ -89,8 +104,13 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
     _dirController = TextEditingController(
       text: widget.settings.effectiveDefaultSaveDir,
     );
-    _cookieController = TextEditingController();
+    _cookieController = TextEditingController(text: widget.initialCookies);
     _checksumController = TextEditingController();
+    for (final entry in widget.initialHeaders.entries) {
+      _headerRows.add(
+        _MobileHeaderRow(keyText: entry.key, valueText: entry.value),
+      );
+    }
     final last = widget.settings.lastDialogThreads;
     _threads = const {'4', '8', '16', '32'}.contains(last) ? last : 'auto';
     _queueId = widget.settings.defaultQueueId;
@@ -178,6 +198,10 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
       if (key.isEmpty) continue;
       extraHeaders[key] = row.valueController.text.trim();
     }
+    if (widget.initialReferrer.isNotEmpty &&
+        !extraHeaders.keys.any((key) => key.toLowerCase() == 'referer')) {
+      extraHeaders['Referer'] = widget.initialReferrer;
+    }
 
     // 协议唤起携带的建议文件名：仅当 URL 仍是预填的那条时生效
     // （用户改成别的地址后沿用旧文件名会张冠李戴）。
@@ -216,11 +240,17 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
         userAgent: userAgent,
         queueId: queueId,
         cookies: cookies,
+        referrer: widget.initialReferrer,
+        extraHeaders: extraHeaders,
         startPaused: later,
       );
     }
 
-    Navigator.of(context).pop();
+    Navigator.of(context).pop(
+      later
+          ? MobileNewDownloadResult.submittedLater
+          : MobileNewDownloadResult.submitted,
+    );
     showMobileToast(widget.rootContext, s.mobileDownloadStarted);
   }
 
@@ -496,8 +526,12 @@ class _DirPickRow extends StatelessWidget {
 
 /// 自定义请求头的一行输入：持有 key / value 两个文本控制器（#347）。
 class _MobileHeaderRow {
-  final TextEditingController keyController = TextEditingController();
-  final TextEditingController valueController = TextEditingController();
+  final TextEditingController keyController;
+  final TextEditingController valueController;
+
+  _MobileHeaderRow({String keyText = '', String valueText = ''})
+    : keyController = TextEditingController(text: keyText),
+      valueController = TextEditingController(text: valueText);
 
   void dispose() {
     keyController.dispose();
