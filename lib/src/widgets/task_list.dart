@@ -57,13 +57,14 @@ class _TaskListState extends State<TaskList> {
   /// （design-proto-spec §1 `state.folded` 同为运行态，不进 `tabPrefs`）。
   final Set<String> _foldedSections = {};
 
-  /// 「N 失败」直达高亮：目标成员 ID + 递增 epoch（每次触发换新 epoch，
-  /// 驱动 GroupMemberRow 内部一次性淡出动画重新播放）。
-  String? _flashMemberId;
+  /// 「N 失败」直达高亮：目标成员任务 ID + 递增 epoch（每次触发换新
+  /// epoch，驱动 [_flashWrap] 的一次性淡出动画重新播放）。
+  String? _flashTaskId;
   int _flashEpoch = 0;
 
-  /// 组成员行 GlobalKey（仅成员行需要——`jumpToFail` 滚动定位依赖
-  /// `GlobalKey.currentContext`；任务/组/目录行沿用轻量 ValueKey）。
+  /// 组成员行 GlobalKey（仅成员行需要——`jumpToFail` / 搜索定位滚动依赖
+  /// `GlobalKey.currentContext`；组/目录行沿用轻量 ValueKey，顶层任务行
+  /// 的 key 见 [_taskRowKeys]）。
   final Map<String, GlobalKey> _memberRowKeys = {};
 
   GlobalKey _memberKeyFor(String taskId) =>
@@ -473,7 +474,7 @@ class _TaskListState extends State<TaskList> {
     final failedTask = failed;
     widget.controller.revealGroupMember(group.groupId, failedTask.id);
     setState(() {
-      _flashMemberId = failedTask.id;
+      _flashTaskId = failedTask.id;
       _flashEpoch++;
     });
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -488,6 +489,179 @@ class _TaskListState extends State<TaskList> {
     });
   }
 
+  /// 搜索结果直达（[DownloadController.revealTask] 的视图侧收尾）：定位
+  /// 目标行所在分桶（必要时打开「显示已完成」、展开折叠分桶头），滚动到
+  /// 视口中央。网格形态下组成员没有独立卡片，退化为定位所属组卡。
+  void _startReveal(String taskId) {
+    if (!mounted) return;
+    var prefs = _prefs;
+    var sections = widget.controller.buildListSections(prefs);
+    var target = _locateRevealTarget(sections, prefs, taskId);
+    if (target == null && !prefs.showCompleted) {
+      // 筛选维度已由 controller.revealTask 放宽，唯一还能藏住任务的
+      // 视图层开关是「显示已完成」——打开后重试。
+      widget.viewPrefsStore.update(
+        _tab,
+        (p) => p.copyWith(showCompleted: true),
+      );
+      prefs = _prefs;
+      sections = widget.controller.buildListSections(prefs);
+      target = _locateRevealTarget(sections, prefs, taskId);
+    }
+    if (target == null) return;
+    final t = target;
+    setState(() => _foldedSections.remove(t.sectionKey));
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final centerY = _estimateRevealCenterY(
+        widget.controller.buildListSections(_prefs),
+        _prefs,
+        t.entityId,
+      );
+      unawaited(_scrollToRevealCenter(t.entityId, centerY));
+    });
+  }
+
+  /// 在分桶结果中定位 reveal 目标。顶层任务行与（列表形态已展开的）组
+  /// 成员行直接命中；网格形态组成员不产出独立卡片，退化为所属组卡。
+  ({String sectionKey, String entityId})? _locateRevealTarget(
+    List<ListSection> sections,
+    ViewPrefs prefs,
+    String taskId,
+  ) {
+    for (final section in sections) {
+      for (final e in section.entities) {
+        if ((e is TaskEntity || e is GroupMemberEntity) && e.id == taskId) {
+          return (sectionKey: section.key, entityId: taskId);
+        }
+      }
+    }
+    if (prefs.form != ViewForm.list) {
+      for (final section in sections) {
+        for (final e in section.entities) {
+          if (e is GroupEntity && e.members.any((m) => m.id == taskId)) {
+            return (sectionKey: section.key, entityId: e.groupId);
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  /// 目标行中心的内容坐标 y——行高全是密度常量（任务/组行 44|64、组成员
+  /// 44|52、目录行 24|28、分桶头 32、网格卡 138），可以精确累加；虚拟化
+  /// 列表滚不到未实体化的行，只能算不能量。找不到目标返回 null。
+  double? _estimateRevealCenterY(
+    List<ListSection> sections,
+    ViewPrefs prefs,
+    String entityId,
+  ) {
+    final compact = prefs.density == ViewDensity.compact;
+    var y = 0.0;
+    if (prefs.form == ViewForm.list) {
+      final rowH = compact ? 44.0 : 64.0; // TaskListItem / TaskGroupRow 同高
+      final memberH = compact ? 44.0 : 52.0;
+      final dirH = compact ? 24.0 : 28.0;
+      for (final section in sections) {
+        if (section.title != null) {
+          y += _kSectionHeaderExtent;
+          if (_foldedSections.contains(section.key)) continue;
+        }
+        for (final e in section.entities) {
+          final h = switch (e) {
+            GroupMemberEntity() => memberH,
+            GroupDirEntity() => dirH,
+            _ => rowH,
+          };
+          if (e.id == entityId) return y + h / 2;
+          y += h;
+        }
+      }
+      return null;
+    }
+    // 网格：复刻 _buildGridBody 的列数与行装箱几何。
+    final listWidth = widget.controller.listContentWidth;
+    final usableWidth = (listWidth - 32).clamp(
+      _gridMinCardWidth,
+      double.infinity,
+    );
+    final cols =
+        (((usableWidth + _gridGap) / (_gridMinCardWidth + _gridGap)).floor())
+            .clamp(1, 999);
+    for (final section in sections) {
+      if (section.title != null) {
+        y += _kSectionHeaderExtent;
+        if (_foldedSections.contains(section.key)) continue;
+      }
+      y += 10; // SliverPadding top（fromLTRB(16, 10, 16, 4)）
+      for (final row in _packGridRows(section.entities, cols)) {
+        if (row.any((e) => e.id == entityId)) {
+          return y + _gridCardHeight / 2;
+        }
+        y += _gridCardHeight + _gridGap;
+      }
+      y += 4; // SliverPadding bottom
+    }
+    return null;
+  }
+
+  /// 先按估算 y 把目标滚进视口（虚拟化行随之实体化），再用 ensureVisible
+  /// 校正估算与真实布局的残差；网格组卡无 GlobalKey，自然跳过校正。
+  Future<void> _scrollToRevealCenter(String entityId, double? centerY) async {
+    if (!mounted || !_scrollController.hasClients) return;
+    final position = _scrollController.position;
+    if (centerY != null) {
+      final target = (centerY - position.viewportDimension / 2).clamp(
+        0.0,
+        position.maxScrollExtent,
+      );
+      if ((target - position.pixels).abs() > 1) {
+        await _scrollController.animateTo(
+          target,
+          duration: const Duration(milliseconds: 300),
+          curve: Curves.easeOutCubic,
+        );
+      }
+    }
+    if (!mounted) return;
+    final ctx =
+        (_taskRowKeys[entityId] ?? _memberRowKeys[entityId])?.currentContext;
+    if (ctx != null && ctx.mounted) {
+      await Scrollable.ensureVisible(
+        ctx,
+        alignment: 0.5,
+        duration: const Duration(milliseconds: 150),
+      );
+    }
+  }
+
+  /// 一次性闪烁高亮覆盖层（jumpToFail「N 失败」直达专用）：以 accentBg 自身
+  /// alpha 为峰值 1.6s 淡出（同基底零透明端；若用 withValues(alpha: value)
+  /// 则起点是全饱和 accent 盖脸），epoch 作 key 保证重复触发重播。非目标
+  /// 行零开销直返 child。
+  Widget _flashWrap(String taskId, Widget child) {
+    if (taskId != _flashTaskId || _flashEpoch == 0) return child;
+    final c = AppColors.of(context);
+    return Stack(
+      children: [
+        child,
+        Positioned.fill(
+          child: IgnorePointer(
+            child: TweenAnimationBuilder<double>(
+              key: ValueKey(_flashEpoch),
+              tween: Tween(begin: 1.0, end: 0.0),
+              duration: const Duration(milliseconds: 1600),
+              curve: Curves.easeOut,
+              builder: (context, value, _) => ColoredBox(
+                color: c.accentBg.withValues(alpha: c.accentBg.a * value),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
@@ -497,6 +671,13 @@ class _TaskListState extends State<TaskList> {
         final sections = widget.controller.buildListSections(prefs);
         final isEmpty = sections.every((s) => s.entities.isEmpty);
         _orderedVisibleIds = _computeOrderedVisibleTaskIds(sections);
+        // 消费 controller 挂起的「搜索直达」定位请求（消费即清，一次性）。
+        final revealTaskId = widget.controller.takePendingRevealTask();
+        if (revealTaskId != null) {
+          WidgetsBinding.instance.addPostFrameCallback(
+            (_) => _startReveal(revealTaskId),
+          );
+        }
         // 底色由主区统一给（HomePage._buildContentArea = surface1），
         // 这里不再自带一层 —— 两块列表各染各的会让切换 RSS 时底色跳。
         return LayoutBuilder(
@@ -619,8 +800,7 @@ class _TaskListState extends State<TaskList> {
                               widget.controller.selectedGroupId,
                           density: prefs.density,
                           // 行点击 = 查看组详情；展开/收起仅由左侧 chevron 触发。
-                          onTap: () =>
-                              widget.onGroupTap?.call(entity.groupId),
+                          onTap: () => widget.onGroupTap?.call(entity.groupId),
                           onToggleExpand: () => widget.controller
                               .toggleGroupExpanded(entity.groupId),
                           onPauseAll: () =>
@@ -637,9 +817,8 @@ class _TaskListState extends State<TaskList> {
                             context,
                             downloadGroup.sourceUrl,
                           ),
-                          onDelete: ({required bool deleteFiles}) => widget
-                              .controller
-                              .deleteGroup(
+                          onDelete: ({required bool deleteFiles}) =>
+                              widget.controller.deleteGroup(
                                 entity.groupId,
                                 deleteFiles: deleteFiles,
                               ),
@@ -653,37 +832,40 @@ class _TaskListState extends State<TaskList> {
                       final task = entity.task;
                       return RepaintBoundary(
                         key: _memberKeyFor(task.id),
-                        child: GroupMemberRow(
-                          task: task,
-                          density: prefs.density,
-                          isSelected:
-                              task.id == widget.controller.selectedTaskId,
-                          flashEpoch:
-                              task.id == _flashMemberId ? _flashEpoch : 0,
-                          onTap: () => widget.onTaskTap?.call(task.id),
-                          onPause: () => widget.controller.pauseTask(task.id),
-                          onResume: () =>
-                              widget.controller.resumeTask(task.id),
-                          onOpenFile: () => openFile(task.filePath),
-                          onMoreTapDown: (details) => showTaskContextMenu(
-                            context,
-                            details.globalPosition,
+                        child: _flashWrap(
+                          task.id,
+                          GroupMemberRow(
                             task: task,
-                            onPause: () =>
-                                widget.controller.pauseTask(task.id),
+                            density: prefs.density,
+                            isSelected:
+                                task.id == widget.controller.selectedTaskId,
+                            onTap: () => widget.onTaskTap?.call(task.id),
+                            onPause: () => widget.controller.pauseTask(task.id),
                             onResume: () =>
                                 widget.controller.resumeTask(task.id),
-                            onDelete: ({required bool deleteFiles}) => widget
-                                .controller
-                                .deleteTask(task.id, deleteFiles: deleteFiles),
-                            isPriority:
-                                widget.controller.priorityTaskId == task.id,
-                            onBoost: () =>
-                                widget.controller.setPriorityTask(task.id),
-                            onEditThreads: () => showEditThreadsDialog(
+                            onOpenFile: () => openFile(task.filePath),
+                            onMoreTapDown: (details) => showTaskContextMenu(
                               context,
-                              widget.controller,
-                              task,
+                              details.globalPosition,
+                              task: task,
+                              onPause: () =>
+                                  widget.controller.pauseTask(task.id),
+                              onResume: () =>
+                                  widget.controller.resumeTask(task.id),
+                              onDelete: ({required bool deleteFiles}) =>
+                                  widget.controller.deleteTask(
+                                    task.id,
+                                    deleteFiles: deleteFiles,
+                                  ),
+                              isPriority:
+                                  widget.controller.priorityTaskId == task.id,
+                              onBoost: () =>
+                                  widget.controller.setPriorityTask(task.id),
+                              onEditThreads: () => showEditThreadsDialog(
+                                context,
+                                widget.controller,
+                                task,
+                              ),
                             ),
                           ),
                         ),
@@ -707,36 +889,40 @@ class _TaskListState extends State<TaskList> {
                     final task = (entity as TaskEntity).task;
                     return RepaintBoundary(
                       key: _taskKeyFor(task.id),
-                      child: TaskListItem(
-                        task: task,
-                        isSelected: task.id == widget.controller.selectedTaskId,
-                        onTap: () => _handleTaskTap(task.id, isManage: false),
-                        onDoubleTap: () => _onDoubleTap(task),
-                        onPause: () => widget.controller.pauseTask(task.id),
-                        onResume: () => widget.controller.resumeTask(task.id),
-                        onDelete: ({required bool deleteFiles}) => widget
-                            .controller
-                            .deleteTask(task.id, deleteFiles: deleteFiles),
-                        isPriority:
-                            widget.controller.priorityTaskId == task.id,
-                        onBoost: () =>
-                            widget.controller.setPriorityTask(task.id),
-                        onEditThreads: () => showEditThreadsDialog(
-                          context,
-                          widget.controller,
-                          task,
+                      child: _flashWrap(
+                        task.id,
+                        TaskListItem(
+                          task: task,
+                          isSelected:
+                              task.id == widget.controller.selectedTaskId,
+                          onTap: () => _handleTaskTap(task.id, isManage: false),
+                          onDoubleTap: () => _onDoubleTap(task),
+                          onPause: () => widget.controller.pauseTask(task.id),
+                          onResume: () => widget.controller.resumeTask(task.id),
+                          onDelete: ({required bool deleteFiles}) => widget
+                              .controller
+                              .deleteTask(task.id, deleteFiles: deleteFiles),
+                          isPriority:
+                              widget.controller.priorityTaskId == task.id,
+                          onBoost: () =>
+                              widget.controller.setPriorityTask(task.id),
+                          onEditThreads: () => showEditThreadsDialog(
+                            context,
+                            widget.controller,
+                            task,
+                          ),
+                          isPluginProcessing: widget.controller
+                              .isPluginProcessing(task.id),
+                          isManageMode: isManage,
+                          isChecked: widget.controller.checkedTaskIds.contains(
+                            task.id,
+                          ),
+                          onToggleChecked: () =>
+                              _handleTaskTap(task.id, isManage: true),
+                          density: prefs.density,
+                          columns: columns,
+                          protocolBadges: prefs.protocolBadges,
                         ),
-                        isPluginProcessing: widget.controller
-                            .isPluginProcessing(task.id),
-                        isManageMode: isManage,
-                        isChecked: widget.controller.checkedTaskIds.contains(
-                          task.id,
-                        ),
-                        onToggleChecked: () =>
-                            _handleTaskTap(task.id, isManage: true),
-                        density: prefs.density,
-                        columns: columns,
-                        protocolBadges: prefs.protocolBadges,
                       ),
                     );
                   }, childCount: section.entities.length),
@@ -774,7 +960,10 @@ class _TaskListState extends State<TaskList> {
   ) {
     final isManage = widget.controller.isManageMode;
     const gap = _gridGap;
-    final usableWidth = (listWidth - 32).clamp(_gridMinCardWidth, double.infinity);
+    final usableWidth = (listWidth - 32).clamp(
+      _gridMinCardWidth,
+      double.infinity,
+    );
     final cols = (((usableWidth + gap) / (_gridMinCardWidth + gap)).floor())
         .clamp(1, 999);
     final cardWidth = (usableWidth - (cols - 1) * gap) / cols;
@@ -847,10 +1036,7 @@ class _TaskListState extends State<TaskList> {
 
   /// 贪心行装箱：任务占 1 槽，组占 2 槽（本波 [GroupEntity] 恒空集不产出，
   /// 此逻辑为下一波组卡片预留）。
-  List<List<ListEntity>> _packGridRows(
-    List<ListEntity> entities,
-    int cols,
-  ) {
+  List<List<ListEntity>> _packGridRows(List<ListEntity> entities, int cols) {
     final rows = <List<ListEntity>>[];
     var current = <ListEntity>[];
     var used = 0;
@@ -886,14 +1072,24 @@ class _TaskListState extends State<TaskList> {
           key: entity is TaskEntity ? _taskKeyFor(entity.task.id) : null,
           width: width,
           height: _gridCardHeight,
-          child: _buildGridCard(context, entity, isManage),
+          child: _flashWrap(
+            entity.id,
+            _buildGridCard(context, entity, isManage),
+          ),
         ),
       );
     }
-    return Row(crossAxisAlignment: CrossAxisAlignment.start, children: children);
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: children,
+    );
   }
 
-  Widget _buildGridCard(BuildContext context, ListEntity entity, bool isManage) {
+  Widget _buildGridCard(
+    BuildContext context,
+    ListEntity entity,
+    bool isManage,
+  ) {
     if (entity is GroupEntity) {
       final downloadGroup = widget.controller.groupById(entity.groupId);
       if (downloadGroup == null) return const SizedBox.shrink();
@@ -1280,10 +1476,13 @@ class _ManageToggleButtonState extends State<_ManageToggleButton> {
   }
 }
 
-
 // =============================================================================
 // 分组头（吸顶 + 玻璃 + 聚合信息 + hover 批量操作）
 // =============================================================================
+
+/// 分桶头 sliver 高度（[_SectionHeaderDelegate] 的 min/maxExtent，也是
+/// [_TaskListState._estimateRevealCenterY] 定位估算的依据）。
+const double _kSectionHeaderExtent = 32;
 
 class _SectionHeaderDelegate extends SliverPersistentHeaderDelegate {
   final ListSection section;
@@ -1301,12 +1500,16 @@ class _SectionHeaderDelegate extends SliverPersistentHeaderDelegate {
   });
 
   @override
-  double get minExtent => 32;
+  double get minExtent => _kSectionHeaderExtent;
   @override
-  double get maxExtent => 32;
+  double get maxExtent => _kSectionHeaderExtent;
 
   @override
-  Widget build(BuildContext context, double shrinkOffset, bool overlapsContent) {
+  Widget build(
+    BuildContext context,
+    double shrinkOffset,
+    bool overlapsContent,
+  ) {
     return _SectionHeaderRow(
       section: section,
       folded: folded,
@@ -1550,13 +1753,20 @@ class _TaskGridCardState extends State<_TaskGridCard> {
     final isDone = task.status == TaskStatus.completed;
     final isErr = task.status == TaskStatus.error;
     final isDl = task.status == TaskStatus.downloading;
-    final color = taskStatusColor(task.status, c, fileMissing: task.fileMissing);
-    final selected = widget.isSelected || (widget.isManageMode && widget.isChecked);
+    final color = taskStatusColor(
+      task.status,
+      c,
+      fileMissing: task.fileMissing,
+    );
+    final selected =
+        widget.isSelected || (widget.isManageMode && widget.isChecked);
 
     final metaText = isDl
         ? '${task.speedText} · ${(task.progress * 100).toStringAsFixed(0)}%'
         : isErr
-        ? (task.errorMessage.isEmpty ? currentS.subtitleError : task.errorMessage)
+        ? (task.errorMessage.isEmpty
+              ? currentS.subtitleError
+              : task.errorMessage)
         : '${task.statusText} · ${task.sizeText}';
 
     return MouseRegion(
@@ -1743,7 +1953,7 @@ class _ScrollToTopButtonState extends State<_ScrollToTopButton> {
           width: 36,
           height: 36,
           decoration: BoxDecoration(
-            color: _isHovered ? const Color(0xFFF5F5F5) : Colors.white,
+            color: _isHovered ? c.surface3 : c.surface2,
             borderRadius: m.brBadge,
             border: Border.all(color: c.border, width: 1),
           ),

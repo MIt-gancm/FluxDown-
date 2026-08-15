@@ -69,6 +69,7 @@ class _HomePageState extends State<HomePage> {
   final _pluginProvider = PluginProvider();
   final _rssProvider = RssProvider();
   final _headerBarKey = GlobalKey<HeaderBarState>();
+
   /// 任务列表视图系统偏好 store（全局 + 按状态页签覆盖层，contract-dart.md）。
   final _viewPrefsStore = ViewPrefsStore();
 
@@ -85,6 +86,7 @@ class _HomePageState extends State<HomePage> {
 
   // Detail panel
   bool _isDetailOpen = false;
+
   /// false=底部，true=右侧。默认右侧，切换后持久化。
   bool _detailOnRight =
       KvStore.instance.getBool('detail_panel_on_right') ?? true;
@@ -193,9 +195,9 @@ class _HomePageState extends State<HomePage> {
     final text = name.isEmpty
         ? currentS.duplicateTorrentToastUnnamed
         : currentS.duplicateTorrentToast(name);
-    FluxSonner.of(context).show(
-      ShadToast(title: Text(text), duration: const Duration(seconds: 4)),
-    );
+    FluxSonner.of(
+      context,
+    ).show(ShadToast(title: Text(text), duration: const Duration(seconds: 4)));
   }
 
   /// 主区当前被 RSS 条目流占据（而非任务列表）。
@@ -249,7 +251,10 @@ class _HomePageState extends State<HomePage> {
     FluxSonner.of(context).show(
       ShadToast(
         title: Text(
-          currentS.cloudSyncAppliedToast(count, deviceName ?? currentS.cloudSyncOtherDevice),
+          currentS.cloudSyncAppliedToast(
+            count,
+            deviceName ?? currentS.cloudSyncOtherDevice,
+          ),
         ),
         duration: const Duration(seconds: 3),
       ),
@@ -357,6 +362,18 @@ class _HomePageState extends State<HomePage> {
     };
     AppMenuCallbacks.selectAll = () {
       if (!mounted || _showSettings || _isRssView) return;
+      // 输入框聚焦时把 Cmd+A 转回文本全选——菜单加速键已吞掉按键事件，
+      // 不转发的话输入框既收不到按键也得不到全选。
+      if (_isTextFieldFocused) {
+        final ctx = FocusManager.instance.primaryFocus?.context;
+        if (ctx != null) {
+          Actions.maybeInvoke(
+            ctx,
+            const SelectAllTextIntent(SelectionChangedCause.keyboard),
+          );
+        }
+        return;
+      }
       if (!_controller.isManageMode) _controller.enterManageMode();
       _controller.selectAllFiltered();
     };
@@ -493,8 +510,12 @@ class _HomePageState extends State<HomePage> {
       return true;
     }
 
-    // Cmd/Ctrl+A → 全选当前筛选列表（自动进入管理模式）。RSS 视图下不适用。
-    if (isMod && event.logicalKey == LogicalKeyboardKey.keyA && !_isRssView) {
+    // Cmd/Ctrl+A → 全选当前筛选列表（自动进入管理模式）。RSS 视图下不
+    // 适用；输入框聚焦时让路——把按键留给输入框做文本全选。
+    if (isMod &&
+        event.logicalKey == LogicalKeyboardKey.keyA &&
+        !_isRssView &&
+        !_isTextFieldFocused) {
       if (!_controller.isManageMode) {
         _controller.enterManageMode();
       }
@@ -601,9 +622,9 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 是否有文本输入组件（TextField/ShadInput 等，内部均落到 [EditableText]）
-  /// 持有焦点——全局单字母快捷键（V/G/S/Shift+D/↑↓/Space）必须在此时让路，
-  /// 否则会拦截用户在搜索框等处的正常输入。Ctrl/Cmd 组合键与 Esc/Del 不受
-  /// 此守卫影响（现状行为不变）。
+  /// 持有焦点——全局单字母快捷键（V/G/S/Shift+D/↑↓/Space）与 Ctrl/Cmd+A
+  /// 必须在此时让路，否则会拦截用户在搜索框等处的正常输入/文本全选。
+  /// 其余 Ctrl/Cmd 组合键与 Esc/Del 不受此守卫影响。
   bool get _isTextFieldFocused {
     final focus = FocusManager.instance.primaryFocus;
     final ctx = focus?.context;
@@ -638,8 +659,7 @@ class _HomePageState extends State<HomePage> {
   void _navigateSelection(int delta) {
     final entities = _navigableEntities();
     if (entities.isEmpty) return;
-    final currentId =
-        _controller.selectedTaskId ?? _controller.selectedGroupId;
+    final currentId = _controller.selectedTaskId ?? _controller.selectedGroupId;
     final currentIndex = currentId == null
         ? -1
         : entities.indexWhere((e) => e.id == currentId);
@@ -714,15 +734,15 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 从 RSS 条目流的「已下载」chip 跳到对应任务（P5 溯源的正向跳转）。
+  /// 从搜索结果 / RSS 条目流直达任务（P5 溯源的正向跳转）。
   ///
-  /// 先退出条目流再选中任务：条目流与任务列表共用主区，不退出的话选中了也
-  /// 看不见。同时把状态页签切回「全部」，否则任务可能被当前页签筛掉。
-  void _revealTaskFromRss(String taskId) {
+  /// 先退出条目流再定位：条目流与任务列表共用主区，不退出的话选中了也
+  /// 看不见。筛选放宽（状态页签/分类/队列）、组展开、滚动定位
+  /// 由 [DownloadController.revealTask] + TaskList 完成。
+  void _revealTask(String taskId) {
     if (taskId.isEmpty) return;
     _rssProvider.select('');
-    _controller.setStatusTab(StatusTab.all);
-    _controller.selectTask(taskId);
+    _controller.revealTask(taskId);
     setState(() => _isDetailOpen = true);
   }
 
@@ -829,9 +849,7 @@ class _HomePageState extends State<HomePage> {
           child: Column(
             children: [
               const SizedBox(height: 40),
-              Expanded(
-                child: _buildDetailPanel(isBottom: false),
-              ),
+              Expanded(child: _buildDetailPanel(isBottom: false)),
             ],
           ),
         ),
@@ -890,7 +908,7 @@ class _HomePageState extends State<HomePage> {
                 if (_rssProvider.selectedSourceId.isEmpty) return taskList!;
                 return RssItemList(
                   provider: _rssProvider,
-                  onOpenTask: _revealTaskFromRss,
+                  onOpenTask: _revealTask,
                   onManage: (sourceId) => showRssManagerDialog(
                     context,
                     _rssProvider,
@@ -937,7 +955,6 @@ class _HomePageState extends State<HomePage> {
       ),
     );
   }
-
 
   @override
   Widget build(BuildContext context) {
@@ -1059,6 +1076,7 @@ class _HomePageState extends State<HomePage> {
                   _controller,
                   _settingsProvider,
                 ),
+                onRevealTask: _revealTask,
                 onNavigateToSettings: (item) {
                   setState(() {
                     _initialSettingsCategory = item.category;
@@ -1435,7 +1453,7 @@ class _BatchDeleteProgressCard extends StatelessWidget {
           ),
           const SizedBox(height: 12),
           ClipRRect(
-          borderRadius: m.brSm,
+            borderRadius: m.brSm,
             child: LinearProgressIndicator(
               value: animatedProgress,
               backgroundColor: c.surface3,

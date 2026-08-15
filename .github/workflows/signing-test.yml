@@ -136,6 +136,33 @@ jobs:
             Write-Host "Renamed build\windows\x64 -> build\windows\arm64"
           }
 
+      # ── Bundle MSVC CRT runtime DLLs（与 release.yml 同步）──
+      # 干净系统上缺 VCRedist 时所有 exe 报 STATUS_DLL_NOT_FOUND；随应用
+      # 目录分发 CRT DLL，架构按 flux_down.exe 的 PE 头实测。
+      - name: Bundle MSVC CRT runtime DLLs
+        shell: pwsh
+        run: |
+          $release = "build\windows\${{ matrix.arch }}\runner\Release"
+          $bytes = [System.IO.File]::ReadAllBytes("$release\flux_down.exe")
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+          $archDir = switch ($machine) {
+            0x8664 { 'x64' }
+            0xAA64 { 'arm64' }
+            default { throw ("Unexpected PE machine type: 0x{0:X4}" -f $machine) }
+          }
+          Write-Host "flux_down.exe PE machine: $archDir"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsRoot = & $vswhere -latest -products * -property installationPath
+          if (-not $vsRoot) { throw "Visual Studio installation not found via vswhere" }
+          $crtDir = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\$archDir\Microsoft.VC1*.CRT" -Directory |
+            Sort-Object FullName | Select-Object -Last 1
+          if (-not $crtDir) { throw "MSVC CRT redist for $archDir not found under $vsRoot" }
+          Copy-Item "$($crtDir.FullName)\msvcp140*.dll", "$($crtDir.FullName)\vcruntime140*.dll" $release -Force
+          foreach ($required in 'msvcp140.dll', 'vcruntime140.dll') {
+            if (-not (Test-Path "$release\$required")) { throw "$required missing after CRT copy" }
+          }
+
       # ── SignPath 签名 Round 1: 应用 exe ──
       - name: Collect unsigned app executables
         shell: pwsh

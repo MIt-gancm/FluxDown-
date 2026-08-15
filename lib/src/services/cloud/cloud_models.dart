@@ -544,6 +544,16 @@ class CloudReferralRule {
         discountMinor: (json['discountMinor'] as num?)?.toInt() ?? 0,
         rewardPercent: (json['rewardPercent'] as num?)?.toInt() ?? 0,
       );
+
+  /// 序列化回 wire 形态（供推介页说明内容本地缓存落盘，stale-while-revalidate
+  /// 场景下与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'planCode': planCode,
+    'planName': planName,
+    'priceMinor': priceMinor,
+    'discountMinor': discountMinor,
+    'rewardPercent': rewardPercent,
+  };
 }
 
 /// GET /referral/summary 响应：推介有奖总览——收益统计 + 说明文案 + 规则表。
@@ -590,6 +600,20 @@ class CloudReferralSummary {
             .map((e) => CloudReferralRule.fromJson(e as Map<String, dynamic>))
             .toList(),
       );
+
+  /// 序列化回 wire 形态（供推介页说明内容本地缓存落盘：先展示缓存、后台静默
+  /// 刷新，与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'enabled': enabled,
+    'description': description,
+    'rewardEnabled': rewardEnabled,
+    'contact': contact,
+    'invitedCount': invitedCount,
+    'pendingRewardMinor': pendingRewardMinor,
+    'paidRewardMinor': paidRewardMinor,
+    'totalRewardMinor': totalRewardMinor,
+    'rules': [for (final r in rules) r.toJson()],
+  };
 }
 
 /// GET/POST /referral/codes 响应单条：一个可自定义或随机生成的推荐码及其统计。
@@ -702,7 +726,8 @@ class CloudReferralRecordsResult {
 }
 
 /// GET /referral/validate 响应：下单前预校验推荐码是否可用。[reason] 仅在
-/// [valid]=false 时非空，取值 feature_disabled | not_found | self_use | no_discount。
+/// [valid]=false 时非空，取值 feature_disabled | plan_excluded | not_found |
+/// self_use | already_used | no_discount。
 class CloudReferralValidateResult {
   final bool valid;
   final int discountMinor;
