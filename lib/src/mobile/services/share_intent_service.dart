@@ -74,12 +74,13 @@ class ShareIntentService {
     }
   }
 
-  static Future<void> returnToSourceApp() async {
-    if (!Platform.isAndroid) return;
+  static Future<bool> returnToSourceApp() async {
+    if (!Platform.isAndroid) return false;
     try {
-      await _channel.invokeMethod<bool>('moveTaskToBack');
+      return await _channel.invokeMethod<bool>('moveTaskToBack') ?? false;
     } catch (e, st) {
       logError(_tag, 'moveTaskToBack failed', e, st);
+      return false;
     }
   }
 

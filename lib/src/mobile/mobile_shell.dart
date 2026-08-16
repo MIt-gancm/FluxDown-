@@ -14,6 +14,7 @@ import '../services/kv_store.dart';
 import '../services/update_service.dart';
 import 'screens/mobile_settings_screen.dart';
 import '../services/foreground_service.dart';
+import 'services/external_return_state_machine.dart';
 import 'services/mobile_storage_service.dart';
 import 'screens/mobile_tasks_screen.dart';
 import 'services/share_intent_service.dart';
@@ -43,7 +44,7 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
   /// 新建下载弹层是否正在展示（区别于更新提示等其他弹层）。
   /// 新建下载弹层已打开时，后续协议请求会把完整元数据合入表单。
   bool _downloadSheetOpen = false;
-  bool _externalSheetVisible = false;
+  final _externalReturn = ExternalReturnStateMachine();
   final _shareAppendCtrl =
       StreamController<SharedDownloadRequest>.broadcast();
 
@@ -188,9 +189,10 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
     Navigator.of(context).popUntil((r) => r.isFirst);
     _sheetOpen = true;
     _downloadSheetOpen = true;
-    if (request.external) {
-      setState(() => _externalSheetVisible = true);
-    }
+    final externalFlowId = request.external
+        ? _externalReturn.beginExternalSheet()
+        : null;
+    if (externalFlowId != null) setState(() {});
     try {
       await showMobileNewDownloadSheet(
         context,
@@ -203,15 +205,15 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
         initialHeaders: request.headers,
         appendRequests: _shareAppendCtrl.stream,
       );
-      if (request.external) {
-        await ShareIntentService.returnToSourceApp();
+      if (externalFlowId != null && _externalReturn.beginReturn(externalFlowId)) {
+        final returned = await ShareIntentService.returnToSourceApp();
+        if (!returned && _externalReturn.returnFailed(externalFlowId) && mounted) {
+          setState(() {});
+        }
       }
     } finally {
       _sheetOpen = false;
       _downloadSheetOpen = false;
-      if (mounted && _externalSheetVisible) {
-        setState(() => _externalSheetVisible = false);
-      }
     }
   }
 
@@ -243,8 +245,13 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 文件跟踪：回到前台时用户可能刚在文件管理器删/移了文件，触发一次重扫。
+    if (state == AppLifecycleState.paused) {
+      _externalReturn.onPaused();
+      return;
+    }
     if (state == AppLifecycleState.resumed) {
+      if (_externalReturn.onResumed() && mounted) setState(() {});
+      // 文件跟踪：回到前台时用户可能刚在文件管理器删/移了文件，触发一次重扫。
       RescanFiles().sendSignalToRust();
     }
   }
@@ -280,7 +287,7 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
 
-    if (_externalSheetVisible) {
+    if (_externalReturn.shouldHideMainUi) {
       return const SizedBox.expand();
     }
 
