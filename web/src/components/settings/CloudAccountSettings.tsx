@@ -820,7 +820,6 @@ function LoggedInPanel({ user }: { user: CloudUser }) {
   const displayName = user.nickname || user.email.split('@')[0]
   // 徽标渲染用套餐目录（本地快照秒开 + 后台拉取覆盖，见 useCatalogPlans）。
   const catalog = useCatalogPlans()
-  const currentPlan = catalog.find((p) => p.code === user.plan)
 
   // 套餐能力 + 自助修改机会是否已用掉：GET /me 独立拉取（登录/刷新响应的 entitlements
   // 不落会话快照，仅在这一处门控编辑入口用得上，没必要为它扩大 session.ts 的职责）。
@@ -829,6 +828,8 @@ function LoggedInPanel({ user }: { user: CloudUser }) {
     queryFn: () => cloudApi.me(),
     staleTime: 10_000,
   })
+  // `/me` 的当前套餐快照不受上架状态过滤；公开目录仍只承担可售套餐。
+  const currentPlan = meQuery.data?.currentPlan ?? catalog.find((p) => p.code === user.plan)
   const canEditOriginId = !!meQuery.data?.entitlements.originIdEdit && !meQuery.data?.originIdChanged
   // 旧会话快照（登录早于 membershipOrdinal 上线）缺该字段时回退 /me 结果。
   const membershipOrdinal = user.membershipOrdinal ?? meQuery.data?.membershipOrdinal

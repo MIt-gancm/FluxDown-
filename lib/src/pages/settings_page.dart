@@ -11493,8 +11493,11 @@ class _AccountContentState extends State<_AccountContent> {
     }
   }
 
-  /// 按套餐 code 查找目录中的 [CloudPlan]；未加载完成或未匹配到时返回 null。
+  /// 按套餐 code 查找展示快照。当前用户套餐优先使用 `/me` 返回的快照，因此套餐
+  /// 下架后仍保留徽标、颜色和名称；其他套餐继续来自仅含上架项的公开目录。
   CloudPlan? _planForCode(String code) {
+    final current = CloudAuthService.instance.currentPlan;
+    if (current?.code == code) return current;
     for (final p in _catalogPlans) {
       if (p.code == code) return p;
     }
