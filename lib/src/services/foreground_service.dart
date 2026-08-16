@@ -203,7 +203,8 @@ class ForegroundServiceManager {
     final (title, text) = _composeContent();
     // 活跃 → 空闲 的状态翻转必须绕过节流立即刷新：完成帧常落在 1 秒节流
     // 窗口内，若不强制，归零后的空闲文案会被吞掉且无后续事件兜底。
-    final becameIdle = _controller?.activeCount == 0 && title != _lastTitle;
+    final becameIdle =
+        _controller?.downloadingCount == 0 && title != _lastTitle;
     final now = DateTime.now();
     if (!force && !becameIdle && now.difference(_lastUpdate) < _minInterval) {
       return;
@@ -228,17 +229,18 @@ class ForegroundServiceManager {
     }
   }
 
-  /// 组装通知标题/正文：活跃时显示"N 个任务下载中"+ 速度，空闲时静态文案。
+  /// 组装通知标题/正文：与主界面左上角保持一致，仅以真正下载中的任务数
+  /// 判定活跃；无下载任务即回落到空闲静态文案。
   (String, String) _composeContent() {
     final s = _strings;
     final dc = _controller;
     if (s == null || dc == null) {
       return ('FluxDown', 'Running');
     }
-    final active = dc.activeCount;
-    if (active > 0) {
+    final downloading = dc.downloadingCount;
+    if (downloading > 0) {
       final speed = '${DownloadTask.formatBytes(dc.totalDownloadSpeed)}/s';
-      return (s.fgServiceActiveTitle(active), s.fgServiceActiveText(speed));
+      return (s.fgServiceActiveTitle(downloading), s.fgServiceActiveText(speed));
     }
     return (s.fgServiceIdleTitle, s.fgServiceIdleText);
   }
