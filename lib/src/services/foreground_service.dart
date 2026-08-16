@@ -200,11 +200,16 @@ class ForegroundServiceManager {
 
   void _refreshNotification({bool force = false}) {
     if (!_started) return;
+    final (title, text) = _composeContent();
+    // 活跃 → 空闲 的状态翻转必须绕过节流立即刷新：完成帧常落在 1 秒节流
+    // 窗口内，若不强制，归零后的空闲文案会被吞掉且无后续事件兜底。
+    final becameIdle = _controller?.activeCount == 0 && title != _lastTitle;
     final now = DateTime.now();
-    if (!force && now.difference(_lastUpdate) < _minInterval) return;
+    if (!force && !becameIdle && now.difference(_lastUpdate) < _minInterval) {
+      return;
+    }
     _lastUpdate = now;
 
-    final (title, text) = _composeContent();
     if (!force && title == _lastTitle && text == _lastText) return;
     _lastTitle = title;
     _lastText = text;
