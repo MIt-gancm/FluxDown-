@@ -63,16 +63,10 @@
                 <category android:name="android.intent.category.BROWSABLE"/>
                 <data android:scheme="magnet"/>
             </intent-filter>
-            <!-- 外部下载器入口：普通 ACTION_VIEW 只传入单个 URL。
-                 浏览器自身页面内导航不会因此改变；来源应用显式发起
-                 ACTION_VIEW 时，系统才会把 FluxDown 放入候选列表。 -->
             <intent-filter>
-                <action android:name="android.intent.action.VIEW"/>
-                <category android:name="android.intent.category.DEFAULT"/>
-                <category android:name="android.intent.category.BROWSABLE"/>
-                <data android:scheme="http"/>
-                <data android:scheme="https"/>
-                <data android:scheme="ed2k"/>
+                <action android:name="android.intent.action.VIEW" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
             </intent-filter>
             <!-- 自定义协议 fluxdown:// 唤起新建下载（与浏览器插件联动）。
                 格式：fluxdown://download?url=<encoded-url>&filename=<name>
