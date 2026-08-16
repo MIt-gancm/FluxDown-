@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -27,6 +28,20 @@ import io.flutter.plugin.common.MethodChannel
  */
 class MainActivity : FlutterActivity() {
     override fun getBackgroundMode(): BackgroundMode = BackgroundMode.transparent
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // 普通 Launcher 冷启动应用不透明 splash，避免 Flutter 首帧前透出壁纸；
+        // 外部下载唤起保持 Manifest 声明的透明 LaunchTheme，弹窗可透出来源应用。
+        if (!isExternalIntent(intent)) {
+            setTheme(R.style.LaunchThemeSplash)
+        }
+        super.onCreate(savedInstanceState)
+    }
+
+    private fun isExternalIntent(value: Intent?): Boolean =
+        value?.action == Intent.ACTION_VIEW ||
+            value?.action == Intent.ACTION_SEND ||
+            value?.action == Intent.ACTION_SEND_MULTIPLE
 
     private var pendingResult: MethodChannel.Result? = null
     private var shareChannel: MethodChannel? = null
