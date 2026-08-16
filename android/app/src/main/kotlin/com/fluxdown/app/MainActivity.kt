@@ -14,6 +14,8 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.android.FlutterActivityLaunchConfigs.BackgroundMode
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.TimeUnit
 
 /**
  * FluxDown 移动端存储桥。
@@ -45,8 +47,8 @@ class MainActivity : FlutterActivity() {
 
     private var pendingResult: MethodChannel.Result? = null
     private var shareChannel: MethodChannel? = null
-    /** 冷启动时暂存的分享内容（url + filename），等 Dart 侧首次 getInitialShare 时取走。 */
-    private var pendingShare: HashMap<String, String>? = null
+    /** 冷启动时后台解析暂存的分享内容，Dart 首次 getInitialShare 时取走。 */
+    private val pendingShare = CompletableFuture<HashMap<String, String>?>()
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(
@@ -77,10 +79,15 @@ class MainActivity : FlutterActivity() {
         ).apply {
             setMethodCallHandler { call, result ->
                 when (call.method) {
-                    // Dart 侧就绪后主动拉取冷启动分享（取走即清空）
+                    // Dart 侧就绪后主动拉取冷启动分享（等待后台解析完成即取走）
                     "getInitialShare" -> {
-                        result.success(pendingShare)
-                        pendingShare = null
+                        result.success(
+                            try {
+                                pendingShare.get(2000, TimeUnit.MILLISECONDS)
+                            } catch (_: Exception) {
+                                null
+                            },
+                        )
                     }
                     "moveTaskToBack" -> {
                         result.success(moveTaskToBack(true))
@@ -89,8 +96,9 @@ class MainActivity : FlutterActivity() {
                 }
             }
         }
-        // 冷启动：configureFlutterEngine 时 Dart 尚未注册 handler，先暂存
-        pendingShare = extractShared(intent)
+        // 冷启动：后台线程解析 intent（超大输入不阻塞主线程），
+        // Dart 首帧后经 getInitialShare 取走；channel 此时尚未注册。
+        Thread { pendingShare.complete(extractShared(intent)) }.start()
     }
 
     // ── 目录选择（SAF） ──
@@ -298,9 +306,18 @@ class MainActivity : FlutterActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        val shared = extractShared(intent) ?: return
-        // Dart 侧已就绪，直接推送；channel 未建成则暂存兜底
-        shareChannel?.invokeMethod("onShare", shared) ?: run { pendingShare = shared }
+        // 后台解析避免阻塞主线程；完成后回主线程推送 Dart。
+        Thread {
+            val shared = extractShared(intent) ?: return@Thread
+            runOnUiThread {
+                if (shareChannel != null) {
+                    shareChannel?.invokeMethod("onShare", shared)
+                } else {
+                    // channel 尚未建立（极端时序）：暂存等待 getInitialShare
+                    pendingShare.complete(shared)
+                }
+            }
+        }.start()
     }
 
     /**
@@ -352,11 +369,12 @@ class MainActivity : FlutterActivity() {
         headers: String = "",
         external: Boolean = false,
     ): HashMap<String, String> = hashMapOf(
-        "url" to url,
-        "filename" to filename,
-        "cookies" to cookies,
-        "referrer" to referrer,
-        "headers" to headers,
+        "url" to url.take(MAX_URL_LEN),
+        "filename" to filename.take(MAX_NAME_LEN),
+        "cookies" to cookies.take(MAX_COOKIES_LEN),
+        "referrer" to referrer.take(MAX_REFERRER_LEN),
+        // headers 是 JSON，截断会破坏结构，超限直接丢弃
+        "headers" to if (headers.length <= MAX_HEADERS_JSON_LEN) headers else "",
         "external" to external.toString(),
     )
 
@@ -375,5 +393,12 @@ class MainActivity : FlutterActivity() {
         private const val SHARE_CHANNEL = "com.fluxdown/share"
         private const val REQUEST_PICK_DIR = 0x4D01
         private const val REQUEST_WRITE_PERM = 0x4D02
+
+        // 外部 intent 字段截断上限，防止超大输入卡死 UI
+        private const val MAX_URL_LEN = 8192
+        private const val MAX_NAME_LEN = 512
+        private const val MAX_COOKIES_LEN = 65536
+        private const val MAX_REFERRER_LEN = 8192
+        private const val MAX_HEADERS_JSON_LEN = 131072
     }
 }

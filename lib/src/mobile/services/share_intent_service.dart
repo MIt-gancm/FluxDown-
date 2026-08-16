@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:flutter/services.dart';
 
@@ -43,6 +44,15 @@ class ShareIntentService {
 
   static const _channel = MethodChannel('com.fluxdown/share');
 
+  /// 外部载荷截断上限，防止超大输入卡死 UI
+  static const int _maxUrlLen = 8192;
+  static const int _maxNameLen = 512;
+  static const int _maxCookiesLen = 65536;
+  static const int _maxReferrerLen = 8192;
+  static const int _maxHeaders = 60;
+  static const int _maxHeaderKeyLen = 512;
+  static const int _maxHeaderValueLen = 8192;
+
   /// 当前平台是否支持系统分享接入
   static bool get supported => Platform.isAndroid || Platform.isIOS;
 
@@ -57,7 +67,7 @@ class ShareIntentService {
     _channel.setMethodCallHandler(_handle);
     try {
       final initial = await _channel.invokeMethod<Object>('getInitialShare');
-      _dispatch(initial);
+      await _dispatch(initial);
     } catch (e, st) {
       logError(_tag, 'getInitialShare failed', e, st);
     }
@@ -70,7 +80,7 @@ class ShareIntentService {
 
   static Future<void> _handle(MethodCall call) async {
     if (call.method == 'onShare') {
-      _dispatch(call.arguments);
+      await _dispatch(call.arguments);
     }
   }
 
@@ -84,7 +94,20 @@ class ShareIntentService {
     }
   }
 
-  static void _dispatch(Object? raw) {
+  /// 后台 isolate 解析原始载荷，避免超大输入（长 Cookie / headers JSON）
+  /// 阻塞主 isolate 的界面渲染；解析完成后回调 [_onShared]。
+  static Future<void> _dispatch(Object? raw) async {
+    final parsed = await Isolate.run(() => _parse(raw));
+    if (parsed == null) return;
+    logInfo(
+      _tag,
+      'shared url received: url_len=${parsed.url.length}, '
+      'cookies_len=${parsed.cookies.length}, headers=${parsed.headers.length}',
+    );
+    _onShared?.call(parsed);
+  }
+
+  static SharedDownloadRequest? _parse(Object? raw) {
     final String? text;
     var filename = '';
     var cookies = '';
@@ -103,24 +126,21 @@ class ShareIntentService {
     }
     final url = extractUrl(text);
     if (url == null) {
-      if (text != null && text.isNotEmpty) {
-        logInfo(_tag, 'shared text has no usable url');
-      }
-      return;
+      return null;
     }
-    logInfo(
-      _tag,
-      'shared url received: cookies_len=${cookies.length}, headers=${headers.length}',
-    );
-    _onShared?.call(
-      SharedDownloadRequest(
-        url: url,
-        filename: filename,
-        cookies: cookies,
-        referrer: referrer,
-        headers: headers,
-        external: external,
-      ),
+    return SharedDownloadRequest(
+      url: url.length > _maxUrlLen ? url.substring(0, _maxUrlLen) : url,
+      filename: filename.length > _maxNameLen
+          ? filename.substring(0, _maxNameLen)
+          : filename,
+      cookies: cookies.length > _maxCookiesLen
+          ? cookies.substring(0, _maxCookiesLen)
+          : cookies,
+      referrer: referrer.length > _maxReferrerLen
+          ? referrer.substring(0, _maxReferrerLen)
+          : referrer,
+      headers: headers,
+      external: external,
     );
   }
 
@@ -129,13 +149,19 @@ class ShareIntentService {
     try {
       final decoded = jsonDecode(raw);
       if (decoded is! Map) return const {};
-      return {
-        for (final entry in decoded.entries)
-          if (entry.key is String && entry.value is String)
-            entry.key as String: entry.value as String,
-      };
-    } catch (e) {
-      logInfo(_tag, 'invalid shared headers ignored: $e');
+      final result = <String, String>{};
+      for (final entry in decoded.entries) {
+        if (result.length >= _maxHeaders) break;
+        final key = entry.key;
+        final value = entry.value;
+        if (key is! String || value is! String) continue;
+        if (key.length > _maxHeaderKeyLen) continue;
+        result[key] = value.length > _maxHeaderValueLen
+            ? value.substring(0, _maxHeaderValueLen)
+            : value;
+      }
+      return result;
+    } catch (_) {
       return const {};
     }
   }
