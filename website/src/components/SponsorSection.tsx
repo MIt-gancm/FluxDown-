@@ -1,8 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Heart, Loader2, CheckCircle2, X, RefreshCw } from "lucide-react";
+import { Heart, Loader2, CheckCircle2, X, RefreshCw, Copy, Check, CreditCard, Coins } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { useLocale } from "@/lib/i18n";
+import {
+  SiBinance,
+  SiEthereum,
+  SiPolygon,
+  SiSolana,
+} from "@icons-pack/react-simple-icons";
 
 /* ============================================================
    SponsorSection — Free-amount payment (zerx pay gateway)
@@ -44,6 +50,79 @@ const POLL_TIMEOUT = 5 * 60 * 1000; // 5 minutes
 
 // Public sponsor-wall issue (comments = wall entries).
 const SPONSOR_WALL_URL = "https://github.com/zerx-lab/FluxDown/issues/3";
+
+const EVM_WALLET_ADDRESS = "0x02cc164ccb539733102cfe5a613d32895835a048";
+const SOLANA_WALLET_ADDRESS = "7j8tNtE8BbKZGAeafE73cSwFE71wLaDXYdejeyJ6EAsL";
+
+const CRYPTO_DONATIONS = [
+  {
+    id: "ethereum",
+    titleKey: "sponsor.crypto.network.ethereum",
+    assets: "USDT · USDC · ETH",
+    address: EVM_WALLET_ADDRESS,
+  },
+  {
+    id: "arbitrum",
+    titleKey: "sponsor.crypto.network.arbitrum",
+    assets: "USDT · USDC · ETH",
+    address: EVM_WALLET_ADDRESS,
+  },
+  {
+    id: "bnb",
+    titleKey: "sponsor.crypto.network.bnb",
+    assets: "USDT · USDC · BNB",
+    address: EVM_WALLET_ADDRESS,
+  },
+  {
+    id: "polygon",
+    titleKey: "sponsor.crypto.network.polygon",
+    assets: "USDT · USDC · POL",
+    address: EVM_WALLET_ADDRESS,
+  },
+  {
+    id: "base",
+    titleKey: "sponsor.crypto.network.base",
+    assets: "USDC · ETH",
+    address: EVM_WALLET_ADDRESS,
+  },
+  {
+    id: "solana",
+    titleKey: "sponsor.crypto.network.solana",
+    assets: "USDT · USDC · SOL",
+    address: SOLANA_WALLET_ADDRESS,
+  },
+] as const;
+
+type CryptoDonation = (typeof CRYPTO_DONATIONS)[number];
+
+function NetworkLogo({ network }: { network: CryptoDonation["id"] }) {
+  const className = "h-5 w-5";
+  switch (network) {
+    case "ethereum":
+      return <SiEthereum className={className} color="#627EEA" />;
+    case "arbitrum":
+      return (
+        <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+          <path fill="#28A0F0" d="m12 1.5 9 5.25v10.5L12 22.5 3 17.25V6.75z" />
+          <path fill="#fff" d="m12.1 5.7 5.2 10.6h-2.5l-2.7-5.8-2.7 5.8H6.9z" />
+          <path fill="#fff" d="m14.8 7.6 2.4 4.8h-2.2l-1.3-2.8z" opacity=".75" />
+        </svg>
+      );
+    case "bnb":
+      return <SiBinance className={className} color="#F3BA2F" />;
+    case "polygon":
+      return <SiPolygon className={className} color="#8247E5" />;
+    case "base":
+      return (
+        <svg viewBox="0 0 24 24" className={className} aria-hidden="true">
+          <circle cx="12" cy="12" r="10" fill="#0052FF" />
+          <path fill="#fff" d="M12 6a6 6 0 1 0 0 12h4v-3h-4a3 3 0 1 1 0-6h4V6z" />
+        </svg>
+      );
+    case "solana":
+      return <SiSolana className={className} color="#9945FF" />;
+  }
+}
 
 interface WallSponsor {
   name: string;
@@ -91,6 +170,13 @@ export default function SponsorSection({
   const [message, setMessage] = useState<string>("");
   const [wallQueued, setWallQueued] = useState(false);
   const [pay, setPay] = useState<PayState>({ phase: "idle" });
+  const [sponsorMethod, setSponsorMethod] = useState<"wechat" | "crypto">(
+    "wechat",
+  );
+  const [cryptoAddressCopied, setCryptoAddressCopied] = useState(false);
+  const [cryptoDonation, setCryptoDonation] = useState<CryptoDonation | null>(
+    null,
+  );
 
   // Mirror name/message into a ref so the long-lived poll closure
   // reads the latest values without re-arming timers.
@@ -237,6 +323,28 @@ export default function SponsorSection({
     setPay({ phase: "idle" });
   }, [stopPolling]);
 
+  const closeCryptoModal = useCallback(() => {
+    setCryptoDonation(null);
+    setCryptoAddressCopied(false);
+  }, []);
+
+  const copyCryptoAddress = useCallback(async (address: string) => {
+    try {
+      await navigator.clipboard.writeText(address);
+    } catch {
+      const input = document.createElement("textarea");
+      input.value = address;
+      input.style.position = "fixed";
+      input.style.opacity = "0";
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand("copy");
+      document.body.removeChild(input);
+    }
+    setCryptoAddressCopied(true);
+    window.setTimeout(() => setCryptoAddressCopied(false), 2000);
+  }, []);
+
   return (
     <section
       id="sponsor"
@@ -290,6 +398,41 @@ export default function SponsorSection({
           viewport={{ once: true, amount: 0.2 }}
           transition={{ duration: 0.5, delay: 0.1 }}
         >
+          <div
+            className="mb-6 grid grid-cols-2 rounded-xl border border-dark-border/50 bg-dark-surface2/40 p-1"
+            role="tablist"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sponsorMethod === "wechat"}
+              onClick={() => setSponsorMethod("wechat")}
+              className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+                sponsorMethod === "wechat"
+                  ? "bg-dark-surface1 text-dark-text shadow-sm"
+                  : "text-dark-text-muted hover:text-dark-text-secondary"
+              }`}
+            >
+              <CreditCard className="h-4 w-4" />
+              {t("sponsor.pay.wechatBadge")}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={sponsorMethod === "crypto"}
+              onClick={() => setSponsorMethod("crypto")}
+              className={`inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors ${
+                sponsorMethod === "crypto"
+                  ? "bg-dark-surface1 text-dark-text shadow-sm"
+                  : "text-dark-text-muted hover:text-dark-text-secondary"
+              }`}
+            >
+              <Coins className="h-4 w-4" />
+              {t("sponsor.crypto.title")}
+            </button>
+          </div>
+          {sponsorMethod === "wechat" ? (
+            <>
           {/* Preset amount tiers */}
           <div className="grid grid-cols-3 sm:grid-cols-5 gap-2.5 mb-5">
             {PRESET_AMOUNTS.map((amt) => {
@@ -383,7 +526,45 @@ export default function SponsorSection({
           <p className="mt-3 text-center text-xs text-dark-text-muted">
             {t("sponsor.ctaHint")}
           </p>
+            </>
+          ) : (
+            <div>
+              <p className="mb-5 text-center text-xs text-dark-text-muted">
+                {t("sponsor.crypto.hint")}
+              </p>
+              <div className="grid gap-2.5 sm:grid-cols-2">
+                {CRYPTO_DONATIONS.map((donation) => (
+                  <button
+                    key={donation.id}
+                    type="button"
+                    onClick={() => {
+                      setCryptoAddressCopied(false);
+                      setCryptoDonation(donation);
+                    }}
+                    className="flex items-center gap-3 rounded-xl border border-dark-border/50 bg-dark-surface2/40 p-3.5 text-left transition-colors hover:border-brand-sky/50 hover:bg-dark-surface2"
+                  >
+                    <span className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-dark-border/50 bg-dark-bg">
+                      <NetworkLogo network={donation.id} />
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block text-sm font-medium text-dark-text">
+                        {t(donation.titleKey)}
+                      </span>
+                      <span className="mt-0.5 block text-xs text-dark-text-muted">
+                        {donation.assets}
+                      </span>
+                      <span className="mt-1 block text-[11px] text-brand-sky">
+                        {t("sponsor.crypto.open")}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
         </motion.div>
+
+
 
         {/* ── Latest sponsors (from the GitHub wall) ─────── */}
         {sponsors.length > 0 && (
@@ -635,6 +816,76 @@ export default function SponsorSection({
                   </button>
                 </div>
               )}
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* ── Cryptocurrency donation modal ────────────────── */}
+      <AnimatePresence>
+        {cryptoDonation && (
+          <motion.div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4 backdrop-blur-sm"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={closeCryptoModal}
+          >
+            <motion.div
+              className="relative w-full max-w-sm rounded-2xl border border-dark-border/60 bg-dark-surface1 p-7 text-center"
+              initial={{ opacity: 0, scale: 0.95, y: 12 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 12 }}
+              transition={{ duration: 0.2 }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                type="button"
+                onClick={closeCryptoModal}
+                className="absolute right-4 top-4 text-dark-text-muted transition-colors hover:text-dark-text"
+                aria-label={t("sponsor.crypto.close")}
+              >
+                <X className="h-4 w-4" />
+              </button>
+              <span className="inline-flex h-12 w-12 items-center justify-center rounded-xl border border-dark-border/50 bg-dark-bg">
+                <NetworkLogo network={cryptoDonation.id} />
+              </span>
+              <h3 className="mt-3 text-lg font-semibold text-dark-text">
+                {t(cryptoDonation.titleKey)}
+              </h3>
+              <p className="mt-1 text-sm text-dark-text-secondary">
+                {cryptoDonation.assets}
+              </p>
+              <div className="mt-5 inline-flex rounded-xl bg-white p-4">
+                <QRCodeSVG
+                  value={cryptoDonation.address}
+                  size={200}
+                  level="M"
+                  title={t("sponsor.crypto.address")}
+                />
+              </div>
+              <code className="mt-5 block break-all rounded-lg border border-dark-border/50 bg-dark-surface2/40 px-3 py-2.5 text-sm text-dark-text">
+                {cryptoDonation.address}
+              </code>
+              <button
+                type="button"
+                onClick={() => void copyCryptoAddress(cryptoDonation.address)}
+                className="mt-3 inline-flex items-center gap-1.5 rounded-lg border border-dark-border bg-dark-surface2/40 px-3 py-1.5 text-xs font-medium text-dark-text-secondary transition-colors hover:border-dark-text-muted hover:text-dark-text"
+              >
+                {cryptoAddressCopied ? (
+                  <Check className="h-3.5 w-3.5 text-emerald-400" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" />
+                )}
+                {cryptoAddressCopied
+                  ? t("sponsor.crypto.copied")
+                  : t("sponsor.crypto.copy")}
+              </button>
+              <p className="mt-4 text-xs leading-relaxed text-red-600">
+                {t("sponsor.crypto.notice", {
+                  network: t(cryptoDonation.titleKey),
+                })}
+              </p>
             </motion.div>
           </motion.div>
         )}
