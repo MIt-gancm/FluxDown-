@@ -33,7 +33,7 @@ use crate::ed2k::client::{Source, shared_client};
 use crate::ed2k::link::{Ed2kLink, parse_ed2k_link};
 use crate::ed2k::peer::download_block_on_stream;
 use crate::ed2k::server::{PeerAddr, parse_server_list};
-use crate::logger::{log_error, log_info};
+use crate::logger::log_info;
 
 /// 块下载失败时携带失败 peer 身份的错误，供调度层区分"投毒/越界 → 拉黑"
 /// 与"纯网络失败 → 退避"。`download_block_from_peer` 的所有 `Err` 路径一律
@@ -128,7 +128,13 @@ pub async fn run_ed2k_download(params: DownloadParams) {
                 task_id_log,
                 total
             );
-            let _ = params.db.update_task_status(&params.task_id, 3, "").await;
+            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
+                crate::logger::report_error(
+                    "ed2k-download",
+                    "persist completion status",
+                    &db_error,
+                );
+            }
             let _ = params
                 .progress_tx
                 .send(ProgressUpdate {
@@ -148,8 +154,14 @@ pub async fn run_ed2k_download(params: DownloadParams) {
         }
         Err(e) => {
             let msg = e.to_string();
-            log_error!("[ed2k-download] task {} error: {}", task_id_log, msg);
-            let _ = params.db.update_task_status(&params.task_id, 4, &msg).await;
+            crate::logger::report_error("ed2k-download", "run task", &e);
+            if let Err(db_error) = params.db.update_task_status(&params.task_id, 4, &msg).await {
+                crate::logger::report_error(
+                    "ed2k-download",
+                    "persist terminal error status",
+                    &db_error,
+                );
+            }
             let (dl, total) = match params.db.load_task_by_id(&params.task_id).await {
                 Ok(Some(t)) => (t.downloaded_bytes, t.total_bytes),
                 _ => (0, 0),

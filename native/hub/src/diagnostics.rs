@@ -254,19 +254,34 @@ fn probe_shell_registration() -> Vec<DiagnosticCheck> {
 fn probe_log_dir() -> DiagnosticCheck {
     let dir = fluxdown_engine::logger::log_dir();
     let files = fluxdown_engine::logger::list_log_files();
+    let health = fluxdown_engine::logger::health();
     let total: u64 = files.iter().map(|f| f.size).sum();
-    let summary = format!(
-        "{} ({} files, {:.1} MB)",
+    let mut summary = format!(
+        "{} ({} files, {:.1} MB; writer initialized={}, failures={})",
         dir.display(),
         files.len(),
-        total as f64 / (1024.0 * 1024.0)
+        total as f64 / (1024.0 * 1024.0),
+        health.initialized,
+        health.failure_count,
     );
+    if let Some(last_error) = health.last_error {
+        summary.push_str(" — last writer error: ");
+        summary.push_str(&last_error);
+    }
+
+    if !health.initialized {
+        return check("log_dir", "", ERROR, summary, HINT_CHECK_DISK);
+    }
 
     let probe_file = dir.join(".doctor_write_probe");
     match std::fs::write(&probe_file, b"") {
         Ok(()) => {
             let _ = std::fs::remove_file(&probe_file);
-            check("log_dir", "", OK, summary, "")
+            if health.degraded {
+                check("log_dir", "", WARN, summary, HINT_CHECK_DISK)
+            } else {
+                check("log_dir", "", OK, summary, "")
+            }
         }
         Err(e) => check(
             "log_dir",

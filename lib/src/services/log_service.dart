@@ -45,6 +45,10 @@ class LogService {
   String? _currentDateTag;
   Timer? _flushTimer;
   bool _initialized = false;
+  bool _degraded = false;
+  int _failureCount = 0;
+  String? _lastError;
+  int _errorSequence = 0;
 
   /// 自上次 flush 以来是否有新数据写入
   bool _dirty = false;
@@ -82,6 +86,18 @@ class LogService {
 
   int get maxTotalBytes => _maxTotalBytes;
 
+  /// 日志 writer 是否已成功初始化。
+  bool get initialized => _initialized;
+
+  /// 本次进程生命周期内是否发生过日志基础设施失败。
+  bool get degraded => _degraded;
+
+  /// 本次进程生命周期内累计日志基础设施失败次数。
+  int get failureCount => _failureCount;
+
+  /// 最近一次日志基础设施失败。
+  String? get lastError => _lastError;
+
   /// 日志目录
   late final Directory _logDir;
 
@@ -98,19 +114,16 @@ class LogService {
       if (!_logDir.existsSync()) {
         _logDir.createSync(recursive: true);
       }
-    } catch (e) {
-      // 目录创建失败（如 Program Files 无写权限），不能让日志服务崩溃阻止 runApp()
-      // ignore: avoid_print
-      print('[LogService] failed to create log dir ${_logDir.path}: $e');
+    } catch (e, stack) {
+      _recordFailure('create log directory', e, stack);
       _initialized = false;
       return;
     }
 
     try {
       _rotateSink();
-    } catch (e) {
-      // ignore: avoid_print
-      print('[LogService] failed to open log file: $e');
+    } catch (e, stack) {
+      _recordFailure('open log file', e, stack);
       _initialized = false;
       return;
     }
@@ -125,7 +138,9 @@ class LogService {
       try {
         _raf?.flushSync();
         _dirty = false;
-      } catch (_) {}
+      } catch (e, stack) {
+        _recordFailure('flush', e, stack);
+      }
     });
   }
 
@@ -146,48 +161,87 @@ class LogService {
   /// 最坏影响是偶发一行被覆盖，而不是当前的整体丢失。
   void _writeRaw(String text) {
     final raf = _raf;
-    if (raf == null) return;
+    if (raf == null) {
+      throw StateError('log file is not open');
+    }
     final length = raf.lengthSync();
     if (length != _fileSize) {
       raf.setPositionSync(length);
     }
-    raf.writeStringSync(text);
-    _fileSize = length + text.length;
+    final bytes = utf8.encode(text);
+    raf.writeFromSync(bytes);
+    _fileSize = length + bytes.length;
     _dirty = true;
   }
 
-  /// 写一条日志。[tag] 是模块标签，[message] 是内容。
+  /// 写一条 INFO 日志。[tag] 是稳定组件名，[message] 是事件内容。
   void log(String tag, String message) {
-    if (!_initialized) return;
+    _writeEntry('INFO', tag, message);
+  }
+
+  /// 记录错误、错误 ID 与完整堆栈，并立即刷盘。
+  void error(String tag, String message, [Object? err, StackTrace? stack]) {
+    final errorId =
+        'dart-${DateTime.now().microsecondsSinceEpoch.toRadixString(36)}-${_errorSequence++}';
+    final detail = StringBuffer(message);
+    if (err != null) detail.write('\nexception: $err');
+    if (stack != null) detail.write('\nstackTrace:\n$stack');
+    _writeEntry('ERROR', tag, detail.toString(), errorId: errorId, flush: true);
+  }
+
+  void _writeEntry(
+    String level,
+    String tag,
+    String message, {
+    String? errorId,
+    bool flush = false,
+  }) {
+    if (!_initialized) {
+      // ignore: avoid_print
+      print('[logger-uninitialized] $level [$tag] $message');
+      return;
+    }
     try {
       _rotateSink();
       final now = DateTime.now();
       final ts =
           '${_pad2(now.hour)}:${_pad2(now.minute)}:${_pad2(now.second)}.${_pad3(now.millisecond)}';
-      _writeRaw('$ts [$tag] $message\n');
+      final component = tag
+          .replaceAll('\\', '\\\\')
+          .replaceAll('"', '\\"')
+          .replaceAll('\n', '\\n');
+      final fields = errorId == null
+          ? 'component="$component"'
+          : 'component="$component" error_id="$errorId"';
+      final prefix = '$ts ${level.padRight(5)} flutter{$fields}: ';
+      for (final line in message.split('\n')) {
+        _writeRaw('$prefix$line\n');
+      }
       _maybeRollBySize();
-      // 仅在 debug 模式下输出到控制台，避免 release 模式的字符串缓存开销
+      if (flush) {
+        _raf?.flushSync();
+        _dirty = false;
+      }
       if (kDebugMode) {
         // ignore: avoid_print
-        print('$ts [$tag] $message');
+        print('$prefix$message');
       }
-    } catch (e) {
-      // 日志服务本身不应该抛异常影响业务
-      // ignore: avoid_print
-      print('[LogService] write error: $e');
+    } catch (e, stack) {
+      _recordFailure('write $level event', e, stack);
     }
   }
 
-  /// 记录错误（含堆栈）
-  void error(String tag, String message, [Object? err, StackTrace? stack]) {
-    log(tag, 'ERROR: $message');
-    if (err != null) log(tag, '  exception: $err');
-    if (stack != null) log(tag, '  stackTrace:\n$stack');
-    // 错误立即刷盘
-    try {
-      _raf?.flushSync();
-      _dirty = false;
-    } catch (_) {}
+  void _recordFailure(String operation, Object error, [StackTrace? stack]) {
+    _degraded = true;
+    _failureCount++;
+    _lastError = '$operation: $error';
+    // The persistent sink is unavailable; stderr is the only independent
+    // emergency sink. Never call log()/error() from here.
+    // ignore: avoid_print
+    print(
+      '[LogService] persistent logging degraded: $_lastError'
+      '${stack == null ? '' : '\n$stack'}',
+    );
   }
 
   /// 将所有日志文件打包为 ZIP 压缩包保存到 [zipPath]。
@@ -201,7 +255,9 @@ class LogService {
     try {
       _raf?.flushSync();
       _dirty = false;
-    } catch (_) {}
+    } catch (e, stack) {
+      _recordFailure('flush before export', e, stack);
+    }
 
     if (!_logDir.existsSync()) return 0;
 
@@ -230,7 +286,9 @@ class LogService {
     try {
       _raf?.flushSync();
       _dirty = false;
-    } catch (_) {}
+    } catch (e, stack) {
+      _recordFailure('flush before reading logs', e, stack);
+    }
 
     if (!_logDir.existsSync()) return '';
 
@@ -333,7 +391,9 @@ class LogService {
     try {
       _raf?.flushSync();
       _raf?.closeSync();
-    } catch (_) {}
+    } catch (e, stack) {
+      _recordFailure('close log file', e, stack);
+    }
     _raf = null;
   }
 
@@ -421,12 +481,12 @@ class LogService {
         try {
           f.file.deleteSync();
           total -= f.size;
-        } catch (_) {
-          // 单个文件删除失败（如被另一端持有句柄）不影响其他文件
+        } catch (e, stack) {
+          _recordFailure('delete oversized log ${f.file.path}', e, stack);
         }
       }
-    } catch (_) {
-      // 清理失败不影响日志服务正常运行
+    } catch (e, stack) {
+      _recordFailure('enforce total log size', e, stack);
     }
   }
 
@@ -469,12 +529,12 @@ class LogService {
           if (modified.isBefore(cutoff)) {
             entity.deleteSync();
           }
-        } catch (_) {
-          // 单个文件清理失败不影响其他文件
+        } catch (e, stack) {
+          _recordFailure('delete expired log ${entity.path}', e, stack);
         }
       }
-    } catch (_) {
-      // 清理失败不影响日志服务正常运行
+    } catch (e, stack) {
+      _recordFailure('clean expired logs', e, stack);
     }
   }
 

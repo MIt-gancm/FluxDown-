@@ -101,15 +101,16 @@ async fn reseed_with_parts_sidecar_passes_check_without_recreating_files() {
         offset += len;
     }
     let total_length = offset;
-    let selected_id = files
-        .iter()
-        .position(|f| f.relative_path.ends_with("b.bin"))
-        .unwrap();
+    // create_torrent follows the filesystem iterator order, which is not stable
+    // across platforms. Select the metadata's middle file so it always has two
+    // neighbours and therefore exercises both boundary pieces.
+    let selected_id = files.len() / 2;
+    let selected_source = content_dir.join(&files[selected_id].relative_path);
 
-    // 模拟完成：选中文件扁平搬到 save_dir 并**重命名**（旧实现在重命名后
-    // 续种必失败），staging（这里即 content_dir）保留副产物供边车提取。
-    let final_path = save_dir.join("B_renamed.bin");
-    std::fs::write(&final_path, &b).unwrap();
+    // Simulate completion by flattening and renaming the selected file. Keep the
+    // staging byproducts so the sidecar can extract neighbouring boundary bytes.
+    let final_path = save_dir.join("selected_renamed.bin");
+    std::fs::copy(&selected_source, &final_path).unwrap();
 
     let sidecar = root.join("task-e2e.parts");
     let segments = write_sidecar(&SidecarWriteRequest {
@@ -123,7 +124,7 @@ async fn reseed_with_parts_sidecar_passes_check_without_recreating_files() {
         stage_dir: content_dir.clone(),
     })
     .unwrap();
-    // b.bin 与 a、c 各共享一个边界 piece。
+    // The selected middle file shares one boundary piece with each neighbour.
     assert_eq!(segments, 2, "expected boundary bytes from both neighbours");
 
     let factory = load_seed_factory(&sidecar, &save_dir).unwrap().unwrap();
@@ -189,7 +190,7 @@ async fn reseed_with_parts_sidecar_passes_check_without_recreating_files() {
         .collect();
     assert_eq!(
         entries,
-        HashSet::from(["B_renamed.bin".to_string()]),
+        HashSet::from(["selected_renamed.bin".to_string()]),
         "unselected files must not be recreated in save_dir"
     );
 

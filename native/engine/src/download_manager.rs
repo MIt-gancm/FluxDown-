@@ -8,6 +8,7 @@ use reqwest::Client;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::bt_downloader::{self, BtConfig, BtDownloadParams, SharedBtSession, TorrentSource};
@@ -41,19 +42,21 @@ fn panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Handle a panicked download task: log the error, persist error status to DB,
-/// and send an error progress update to Dart.
-///
-/// This is the common panic-recovery logic shared by all download task spawns
-/// (HTTP, FTP, BT — both create and resume paths).
+/// Handle a panicked download task: persist error status and send an error
+/// progress update to Dart. The process-wide panic hook owns the root log event;
+/// the fallback below covers engine consumers that did not initialize it.
 async fn handle_task_panic(
     task_id: &str,
     msg: &str,
     db: &Db,
     progress_tx: &mpsc::Sender<ProgressUpdate>,
 ) {
-    log_info!("[download] PANIC in task {}: {}", task_id, msg);
-    let _ = db.update_task_status(task_id, 4, msg).await;
+    if !crate::logger::panic_hook_installed() {
+        crate::log_error!("[download] PANIC in task {}: {}", task_id, msg);
+    }
+    if let Err(db_error) = db.update_task_status(task_id, 4, msg).await {
+        crate::logger::report_error("download", "persist panic error status", &db_error);
+    }
     let _ = progress_tx
         .send(ProgressUpdate {
             task_id: task_id.to_string(),
@@ -5097,15 +5100,23 @@ impl DownloadManager {
         let panic_progress_tx = self.progress_tx.clone();
         let panic_task_id = task_id.clone();
         let panic_db = self.db.clone();
+        let task_span = tracing::error_span!("download_task", task_id = %task_id);
 
         let handle = if use_bt {
             // Lazily initialise the shared BT session.
             if let Err(e) = self.ensure_bt_session().await {
-                log_info!("[manager] failed to init BT session: {}", e);
-                let _ = self
+                crate::log_error!("[manager] failed to init BT session: {}", e);
+                if let Err(db_error) = self
                     .db
                     .update_task_status(&task_id, 4, &e.to_string())
-                    .await;
+                    .await
+                {
+                    crate::logger::report_error(
+                        "download-manager",
+                        "persist BT session initialization error",
+                        &db_error,
+                    );
+                }
                 let _ = self
                     .progress_tx
                     .send(ProgressUpdate {
@@ -5124,7 +5135,9 @@ impl DownloadManager {
             }
             // bt_session is guaranteed to be Some after ensure_bt_session().
             let Some(bt_ref) = self.bt_session.as_ref() else {
-                log_info!("[manager] BUG: bt_session is None after ensure_bt_session succeeded");
+                crate::log_error!(
+                    "[manager] BUG: bt_session is None after ensure_bt_session succeeded"
+                );
                 self.active_tasks.remove(&task_id);
                 return;
             };
@@ -5223,25 +5236,29 @@ impl DownloadManager {
                 },
             };
 
-            tokio::spawn(async move {
-                let result =
-                    std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
-                        .catch_unwind()
+            tokio::spawn(
+                async move {
+                    let result =
+                        std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
+                            .catch_unwind()
+                            .await;
+
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path: None, // BT 任务不使用文件名预订机制
+                        })
                         .await;
-
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path: None, // BT 任务不使用文件名预订机制
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         } else {
             let (task_client, task_proxy, (auto_route, auto_ctx)) =
                 self.task_http_context(&url, &proxy_url, &user_agent, &queue_id, ignore_tls_errors);
@@ -5331,44 +5348,49 @@ impl DownloadManager {
             };
 
             let reserved_set = Arc::clone(&self.reserved_temp_paths);
-            tokio::spawn(async move {
-                let mut params = params;
-                let reserved_temp_path = finalize_start_file_name(&mut params, &reserved_set).await;
-                let result = if use_ftp {
-                    std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_hls {
-                    std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_dash {
-                    std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_ed2k {
-                    std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
-                        .catch_unwind()
-                        .await
-                } else {
-                    std::panic::AssertUnwindSafe(downloader::run_download(params))
-                        .catch_unwind()
-                        .await
-                };
+            tokio::spawn(
+                async move {
+                    let mut params = params;
+                    let reserved_temp_path =
+                        finalize_start_file_name(&mut params, &reserved_set).await;
+                    let result = if use_ftp {
+                        std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_hls {
+                        std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_dash {
+                        std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_ed2k {
+                        std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
+                            .catch_unwind()
+                            .await
+                    } else {
+                        std::panic::AssertUnwindSafe(downloader::run_download(params))
+                            .catch_unwind()
+                            .await
+                    };
 
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path,
+                        })
+                        .await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path,
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         };
         if let Some(entry) = self.active_tasks.get_mut(&task_id) {
             entry.handle = Some(handle);
@@ -6011,12 +6033,20 @@ impl DownloadManager {
         let panic_progress_tx = self.progress_tx.clone();
         let panic_task_id = tid.clone();
         let panic_db = self.db.clone();
+        let task_span = tracing::error_span!("download_task", task_id = %tid);
 
         let handle = if use_bt {
             // Lazily initialise the shared BT session.
             if let Err(e) = self.ensure_bt_session().await {
-                log_info!("[manager] failed to init BT session for resume: {}", e);
-                let _ = self.db.update_task_status(task_id, 4, &e.to_string()).await;
+                crate::log_error!("[manager] failed to init BT session for resume: {}", e);
+                if let Err(db_error) = self.db.update_task_status(task_id, 4, &e.to_string()).await
+                {
+                    crate::logger::report_error(
+                        "download-manager",
+                        "persist resumed BT session initialization error",
+                        &db_error,
+                    );
+                }
                 let _ = self
                     .progress_tx
                     .send(ProgressUpdate {
@@ -6035,7 +6065,9 @@ impl DownloadManager {
             }
             // bt_session is guaranteed to be Some after ensure_bt_session().
             let Some(bt_ref) = self.bt_session.as_ref() else {
-                log_info!("[manager] BUG: bt_session is None after ensure_bt_session succeeded");
+                crate::log_error!(
+                    "[manager] BUG: bt_session is None after ensure_bt_session succeeded"
+                );
                 self.active_tasks.remove(task_id);
                 return;
             };
@@ -6046,7 +6078,7 @@ impl DownloadManager {
             let mut existing = match bt_ref.resume_task(task_id).await {
                 Ok(h) => h,
                 Err(e) => {
-                    log_info!("[manager] BT resume_task error (will re-add): {}", e);
+                    crate::log_warn!("[manager] BT resume_task error (will re-add): {}", e);
                     None
                 }
             };
@@ -6188,25 +6220,29 @@ impl DownloadManager {
                 upload_limit_bps,
             };
 
-            tokio::spawn(async move {
-                let result =
-                    std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
-                        .catch_unwind()
+            tokio::spawn(
+                async move {
+                    let result =
+                        std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
+                            .catch_unwind()
+                            .await;
+
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path: None, // BT 任务不使用文件名预订机制
+                        })
                         .await;
-
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path: None, // BT 任务不使用文件名预订机制
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         } else {
             // Resolve proxy and UA for resume: use global UA (cookies not
             // persisted in DB, so only proxy_url is available from task row).
@@ -6351,42 +6387,46 @@ impl DownloadManager {
                 unattended: task_unattended,
             };
 
-            tokio::spawn(async move {
-                let result = if use_ftp {
-                    std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_hls {
-                    std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_dash {
-                    std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_ed2k {
-                    std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
-                        .catch_unwind()
-                        .await
-                } else {
-                    std::panic::AssertUnwindSafe(downloader::run_download(params))
-                        .catch_unwind()
-                        .await
-                };
+            tokio::spawn(
+                async move {
+                    let result = if use_ftp {
+                        std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_hls {
+                        std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_dash {
+                        std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_ed2k {
+                        std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
+                            .catch_unwind()
+                            .await
+                    } else {
+                        std::panic::AssertUnwindSafe(downloader::run_download(params))
+                            .catch_unwind()
+                            .await
+                    };
 
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path: None, // resume 任务不预订文件名
+                        })
+                        .await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path: None, // resume 任务不预订文件名
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         };
         if let Some(entry) = self.active_tasks.get_mut(task_id) {
             entry.handle = Some(handle);
@@ -8652,23 +8692,31 @@ async fn emit_seeding_progress(
     seeding_status: i32,
     seeding_message: &str,
 ) {
-    if let Ok(Some(t)) = db.load_task_by_id(task_id).await {
-        sink.emit(EngineEvent::TaskProgress {
-            task_id: task_id.to_string(),
-            status: 3,
-            downloaded_bytes: t.downloaded_bytes,
-            total_bytes: t.total_bytes,
-            speed: 0,
-            file_name: t.file_name.clone(),
-            save_dir: t.save_dir.clone(),
-            url: t.url.clone(),
-            error_message: String::new(),
-            upload_speed_bps: 0,
-            uploaded_bytes: t.uploaded_bytes,
-            seeding_status,
-            seeding_message: seeding_message.to_string(),
-            seeding_time_secs: t.seeding_time_secs,
-        });
+    match db.load_task_by_id(task_id).await {
+        Ok(Some(t)) => {
+            sink.emit(EngineEvent::TaskProgress {
+                task_id: task_id.to_string(),
+                status: 3,
+                downloaded_bytes: t.downloaded_bytes,
+                total_bytes: t.total_bytes,
+                speed: 0,
+                file_name: t.file_name.clone(),
+                save_dir: t.save_dir.clone(),
+                url: t.url.clone(),
+                error_message: String::new(),
+                upload_speed_bps: 0,
+                uploaded_bytes: t.uploaded_bytes,
+                seeding_status,
+                seeding_message: seeding_message.to_string(),
+                seeding_time_secs: t.seeding_time_secs,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let span = tracing::error_span!("seeding_progress", task_id);
+            let _guard = span.enter();
+            crate::logger::report_error("download-manager", "load seeding progress", &error);
+        }
     }
 }
 
@@ -9004,7 +9052,15 @@ pub async fn progress_reporter(
                     // 落库顺序不确定。一个先发起、携带中途较小 downloaded_bytes
                     // 的后台写入可能在完成写入之后才抢到锁，把 100% 覆盖回中途值。
                     // 用 MAX 语义的单调写入彻底消除该顺序依赖（进度只前进不回退）。
-                    let _ = db_clone.update_task_progress_monotonic(&tid, dl).await;
+                    if let Err(error) = db_clone.update_task_progress_monotonic(&tid, dl).await {
+                        let span = tracing::error_span!("progress_persistence", task_id = %tid);
+                        let _guard = span.enter();
+                        crate::logger::report_error(
+                            "download-manager",
+                            "persist active progress",
+                            &error,
+                        );
+                    }
                 });
                 *task_last_save = now;
             }
@@ -9023,9 +9079,21 @@ pub async fn progress_reporter(
                 // （= 文件总大小），用 MAX 语义后，任何在其之后才落库的陈旧
                 // status=1 后台写入（携带更小的中途值）都会被钳制为 no-op，
                 // 不会把已显示的 100% 覆盖回中途进度。
-                let _ = db
+                if let Err(error) = db
                     .update_task_progress_monotonic(&update.task_id, update.downloaded_bytes)
-                    .await;
+                    .await
+                {
+                    let span = tracing::error_span!(
+                        "progress_persistence",
+                        task_id = %update.task_id
+                    );
+                    let _guard = span.enter();
+                    crate::logger::report_error(
+                        "download-manager",
+                        "persist completed progress",
+                        &error,
+                    );
+                }
             }
             // Use total_bytes when available; fall back to downloaded_bytes
             // for unknown-size downloads where total_bytes may still be 0.
@@ -9034,10 +9102,21 @@ pub async fn progress_reporter(
             } else {
                 update.downloaded_bytes
             };
-            if final_total > 0 {
-                let _ = db
+            if final_total > 0
+                && let Err(error) = db
                     .update_task_total_bytes(&update.task_id, final_total)
-                    .await;
+                    .await
+            {
+                let span = tracing::error_span!(
+                    "progress_persistence",
+                    task_id = %update.task_id
+                );
+                let _guard = span.enter();
+                crate::logger::report_error(
+                    "download-manager",
+                    "persist completed total bytes",
+                    &error,
+                );
             }
         }
 

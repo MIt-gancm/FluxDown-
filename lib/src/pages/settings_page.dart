@@ -11324,6 +11324,10 @@ class _LogExportCardState extends State<_LogExportCard> {
     final fileCount = LogService.instance.logFileCount;
     final sizeBytes = LogService.instance.logDirSizeBytes;
     final sizeText = UpdateService.formatBytes(sizeBytes);
+    final logger = LogService.instance;
+    final logStatusText = logger.initialized && !logger.degraded
+        ? s.logStatusHealthy
+        : s.logStatusDegraded(logger.failureCount, logger.lastError ?? '—');
 
     return _SettingCard(
       label: s.logExport,
@@ -11335,6 +11339,16 @@ class _LogExportCardState extends State<_LogExportCard> {
           Text(
             s.logExportInfo(fileCount, sizeText),
             style: TextStyle(fontSize: 12, color: c.textMuted),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            logStatusText,
+            style: TextStyle(
+              fontSize: 11,
+              color: logger.initialized && !logger.degraded
+                  ? c.textMuted
+                  : AppColors.red,
+            ),
           ),
           const SizedBox(height: 10),
           Row(

@@ -1060,6 +1060,8 @@
   "logExport": "导出日志",
   "logExportDesc": "导出运行日志，方便提交反馈时附带",
   "logExportInfo": "{count} 个日志文件，共 {size}",
+  "logStatusHealthy": "应用日志写入器:正常",
+  "logStatusDegraded": "应用日志写入器已降级({count} 次故障)。最近错误:{error}",
   "logExportButton": "导出日志",
   "logOpenDirButton": "打开目录",
   "logExportSuccess": "已导出 {count} 个日志文件",

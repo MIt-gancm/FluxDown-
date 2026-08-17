@@ -436,6 +436,7 @@ pub async fn check(current_version: &str, channel: &str) {
     match result {
         Ok(()) => {} // signal already sent inside check_inner
         Err(e) => {
+            fluxdown_engine::logger::report_error("updater", "check for update", &e);
             UpdateCheckResult {
                 has_update: false,
                 latest_version: String::new(),
@@ -578,6 +579,7 @@ async fn check_inner(current_version: &str, channel: &str) -> Result<(), UpdateE
 pub async fn download(url: &str, version: &str, file_size: i64) {
     let result = download_inner(url, version, file_size).await;
     if let Err(e) = result {
+        fluxdown_engine::logger::report_error("updater", "download update", &e);
         UpdateDownloadProgress {
             version: version.to_string(),
             downloaded_bytes: 0,

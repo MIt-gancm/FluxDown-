@@ -1510,6 +1510,9 @@ class S {
   String get logExportDesc => _r('logExportDesc');
   String logExportInfo(int count, String size) =>
       _r('logExportInfo', {'count': count, 'size': size});
+  String get logStatusHealthy => _r('logStatusHealthy');
+  String logStatusDegraded(int count, String error) =>
+      _r('logStatusDegraded', {'count': count, 'error': error});
   String get logExportButton => _r('logExportButton');
   String get logOpenDirButton => _r('logOpenDirButton');
   String logExportSuccess(int count) =>
