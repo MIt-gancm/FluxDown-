@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use reqwest::Client;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -198,6 +198,28 @@ fn task_target_path(save_dir: &str, file_name: &str) -> Option<PathBuf> {
     Some(PathBuf::from(save_dir).join(file_name))
 }
 
+/// BT 启动清理：目录中是否仍有任一非空文件。使用 Tokio 文件 API，把 Windows
+/// 网络盘/杀毒软件导致的阻塞 stat 移出 hub 的 current-thread runtime。
+async fn directory_has_real_data(path: &Path) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(path).await else {
+        return false;
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                if entry
+                    .metadata()
+                    .await
+                    .is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    return true;
+                }
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
 /// 文件跟踪：探测单个路径是否已丢失。`Some(true)`=确证不存在、`Some(false)`=
 /// 存在、`None`=不可判定（I/O 错误 / 超时 / 权限）。调用方对 `None` 保持原
 /// 标志不变，避免把「临时不可访问」误判为「已删除」（防误报）；掉盘等瞬时
@@ -250,34 +272,34 @@ async fn scan_missing_files(
 
     // 活跃任务（pending/downloading/preparing）占用的目标路径：避免正在重下
     // 同名文件时把旧的 completed 任务误判为丢失。
-    let active_paths: HashSet<(&str, &str)> = rows
+    let active_paths: HashSet<PathBuf> = rows
         .iter()
         .filter(|t| matches!(t.status, 0 | 1 | 5))
-        .map(|t| (t.save_dir.as_str(), t.file_name.as_str()))
+        .filter_map(|t| task_target_path(&t.save_dir, &t.file_name))
         .collect();
 
-    let sem = Arc::new(Semaphore::new(FILE_SCAN_CONCURRENCY));
-    let mut futs = Vec::new();
-    for t in rows.iter().filter(|t| t.status == 3) {
-        if active_paths.contains(&(t.save_dir.as_str(), t.file_name.as_str())) {
-            continue;
-        }
-        let Some(path) = task_target_path(&t.save_dir, &t.file_name) else {
-            continue;
-        };
-        let sem = sem.clone();
-        let id = t.task_id.clone();
-        let was_missing = t.file_missing;
-        futs.push(async move {
-            let _permit = sem.acquire_owned().await.ok()?;
-            let missing = probe_missing(&path).await?;
-            (missing != was_missing).then_some((id, missing))
+    // 只让固定数量的 stat future 同时存活。旧实现先为全部 completed 行构造
+    // future，再用信号量限制实际探测；历史任务很多时，等待中的 future 本身
+    // 会造成与任务数线性相关的瞬时分配。`buffered` 仍保持输入顺序。
+    let probe_futures = rows
+        .into_iter()
+        .filter(|t| t.status == 3)
+        .filter_map(move |t| {
+            let path = task_target_path(&t.save_dir, &t.file_name)?;
+            if active_paths.contains(&path) {
+                return None;
+            }
+            Some(async move {
+                let missing = probe_missing(&path).await?;
+                (missing != t.file_missing).then_some((t.task_id, missing))
+            })
         });
-    }
 
     // 先收齐全部探测结果，再一次事务写回。逐条独立 UPDATE 在「外置盘掉线」
     // 这类上万条同时翻转的场景下是上万次 fsync（SQLite 默认 synchronous=FULL）。
-    let probed: Vec<(String, bool)> = futures_util::future::join_all(futs)
+    let probed: Vec<(String, bool)> = futures_util::stream::iter(probe_futures)
+        .buffered(FILE_SCAN_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await
         .into_iter()
         .flatten()
@@ -4012,20 +4034,20 @@ impl DownloadManager {
             // Owned tuples:rescue 内含 move_path(最坏 2s 瞬时锁重试退避),
             // 必须经 spawn_blocking 跑,不能在 current_thread runtime 上同步
             // 阻塞(会冻结进度上报/FFI 响应)。
-            let rescue_input: Vec<(String, String, String)> = task_map
-                .iter()
-                .filter_map(|(&id, (status, save_dir, file_name, _))| {
-                    if *status != 3 {
-                        return None;
-                    }
-                    let stage = bt_downloader::bt_stage_dir(save_dir, id);
-                    if stage.exists() {
-                        Some((id.to_string(), save_dir.to_string(), file_name.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut rescue_input: Vec<(String, String, String)> = Vec::new();
+            for (&id, (status, save_dir, file_name, _)) in &task_map {
+                if *status != 3 {
+                    continue;
+                }
+                let stage = bt_downloader::bt_stage_dir(save_dir, id);
+                if tokio::fs::try_exists(stage).await.unwrap_or(false) {
+                    rescue_input.push((
+                        id.to_string(),
+                        save_dir.to_string(),
+                        file_name.to_string(),
+                    ));
+                }
+            }
 
             // Build total_bytes lookup for DB update after rescue.
             let total_bytes_map: std::collections::HashMap<&str, i64> = task_map
@@ -4086,13 +4108,15 @@ impl DownloadManager {
             }
 
             // Now scan all save_dirs for staging dirs and handle each case.
+            // Tokio fs keeps directory enumeration/stat/delete off the hub's
+            // current-thread runtime while preserving the existing decisions.
             for save_dir in &save_dirs {
-                let dir = std::path::Path::new(save_dir);
-                let entries = match std::fs::read_dir(dir) {
-                    Ok(e) => e,
+                let dir = Path::new(save_dir);
+                let mut entries = match tokio::fs::read_dir(dir).await {
+                    Ok(entries) => entries,
                     Err(_) => continue,
                 };
-                for entry in entries.filter_map(|e| e.ok()) {
+                while let Ok(Some(entry)) = entries.next_entry().await {
                     let file_name = entry.file_name();
                     let name_str = file_name.to_string_lossy();
                     if !name_str.starts_with(bt_downloader::BT_STAGE_PREFIX) {
@@ -4108,7 +4132,7 @@ impl DownloadManager {
                                 "[manager] startup cleanup: removing orphan staging dir {}",
                                 path.display()
                             );
-                            if let Err(e) = std::fs::remove_dir_all(&path) {
+                            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                                 log_info!(
                                     "[manager] startup cleanup: failed to remove orphan staging dir {}: {}",
                                     path.display(),
@@ -4123,13 +4147,7 @@ impl DownloadManager {
                             // 部分移动失败(权限/跨盘/IO)而保留了仍含真实数据的目录,
                             // 这里必须同样用 has_real_data 守卫保留,否则无条件
                             // remove_dir_all 会把这些文件永久删除(与 Case B 一致)。
-                            let has_real_data = std::fs::read_dir(&path)
-                                .map(|rd| {
-                                    rd.filter_map(|e| e.ok())
-                                        .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
-                                })
-                                .unwrap_or(false);
-                            if has_real_data {
+                            if directory_has_real_data(&path).await {
                                 log_info!(
                                     "[manager] startup cleanup: keeping completed-task staging dir {} (still has real data; rescue likely partially failed)",
                                     path.display()
@@ -4139,7 +4157,7 @@ impl DownloadManager {
                                     "[manager] startup cleanup: removing completed-task staging dir {}",
                                     path.display()
                                 );
-                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                                     log_info!(
                                         "[manager] startup cleanup: failed to remove completed staging dir {}: {}",
                                         path.display(),
@@ -4155,13 +4173,7 @@ impl DownloadManager {
                             // the task was paused/cancelled before any real data was
                             // written (e.g. the same torrent was re-added, creating a
                             // new task_id and new staging dir, making this one stale).
-                            let has_real_data = std::fs::read_dir(&path)
-                                .map(|rd| {
-                                    rd.filter_map(|e| e.ok())
-                                        .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
-                                })
-                                .unwrap_or(false);
-                            if has_real_data {
+                            if directory_has_real_data(&path).await {
                                 log_info!(
                                     "[manager] startup cleanup: keeping staging dir {} (task active/paused, has data)",
                                     path.display()
@@ -4171,7 +4183,7 @@ impl DownloadManager {
                                     "[manager] startup cleanup: removing empty staging dir {} (task active/paused but no real data)",
                                     path.display()
                                 );
-                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                                     log_info!(
                                         "[manager] startup cleanup: failed to remove empty staging dir {}: {}",
                                         path.display(),

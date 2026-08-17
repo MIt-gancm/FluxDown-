@@ -423,7 +423,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
     let sink: Arc<dyn EventSink> = rinf_sink.clone();
     let selector: Arc<dyn HostSelection> = Arc::new(RinfHostSelection::new());
 
-    let mut engine = Engine::new(
+    let mut engine = Engine::from_db(
         EngineConfig {
             max_concurrent,
             speed_limit_bps,
@@ -434,12 +434,11 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
             proxy_config,
             user_agent,
             // db_dir 已由 `actors::create_actors` 通过
-            // `fluxdown_engine::data_dir::resolve_data_dir(None)` 解析,
-            // 此处显式传入,使 `Engine::new` 内部的解析成为等价的直通,
-            // 保持与 `Db::open(&db_dir)`(上面已单独执行一次)完全一致的路径。
+            // `fluxdown_engine::data_dir::resolve_data_dir(None)` 解析。
             data_dir_override: Some(db_dir.clone()),
             database_url: None,
         },
+        db,
         sink.clone(),
         selector.clone(),
     )

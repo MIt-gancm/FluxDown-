@@ -710,7 +710,10 @@ enum CliAction {
 /// id; the Linux/macOS wrapper script forwards `"$@"`), so an empty argv is
 /// also treated as a human invocation.
 fn classify_cli_invocation<S: AsRef<str>>(args: &[S]) -> Option<CliAction> {
-    if args.iter().any(|a| matches!(a.as_ref(), "--version" | "-V")) {
+    if args
+        .iter()
+        .any(|a| matches!(a.as_ref(), "--version" | "-V"))
+    {
         return Some(CliAction::Version);
     }
     if args.is_empty() || args.iter().any(|a| matches!(a.as_ref(), "--help" | "-h")) {

@@ -217,8 +217,8 @@ class SettingsProvider extends ChangeNotifier {
   /// 配置是否已从 Rust 端加载完成
   bool _loaded = false;
 
-  /// 是否启用文件关联功能（查询/监听注册表状态）。
-  /// `_settingsForExternal`（main.dart）不需要此功能，设为 false 避免重复查询。
+  /// 是否启用文件关联功能（查询/监听注册表状态）。测试或不展示文件关联
+  /// 设置的专用宿主可关闭；桌面主界面的共享实例保持启用。
   final bool _enableFileAssoc;
 
   StreamSubscription<RustSignalPack<ConfigLoaded>>? _configSub;

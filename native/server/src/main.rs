@@ -87,8 +87,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log_info!("[server] database: {} (external)", masked);
     }
 
-    // 引导连接：读初始配置 + 首次运行初始化（Engine::new 内部会再建一个池，
-    // 与桌面 App 的双开模式一致——SQLite WAL / pg 均安全）。
+    // 引导连接：读初始配置 + 首次运行初始化；随后把同一连接池交给引擎，
+    // 避免重复打开数据库和再次执行 schema 初始化。
     let boot_db = match &server_cfg.database_url {
         Some(url) => Db::connect(url).await?,
         None => Db::open(&data_dir).await?,
@@ -146,7 +146,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let sink: Arc<dyn EventSink> = Arc::new(EngineEventSink(hub.clone()));
     let selector: Arc<dyn HostSelection> = Arc::new(WsHostSelection(hub.clone()));
 
-    let mut engine = Engine::new(
+    let mut engine = Engine::from_db(
         EngineConfig {
             max_concurrent,
             speed_limit_bps,
@@ -162,6 +162,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             data_dir_override: Some(data_dir.clone()),
             database_url: server_cfg.database_url.clone(),
         },
+        boot_db,
         sink.clone(),
         selector.clone(),
     )

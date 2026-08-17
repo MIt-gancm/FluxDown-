@@ -174,13 +174,15 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// 唯一构造入口:解析数据目录 → 打开数据库 → 构造
-    /// [`DownloadManager`]。
+    /// 解析数据目录、打开数据库并构造 [`DownloadManager`]。
+    ///
+    /// 已经为了读取启动配置打开数据库的宿主应改用 [`Self::from_db`]，避免
+    /// 重复创建连接池并再次执行 schema 初始化。
     ///
     /// # Errors
     ///
-    /// 数据目录解析失败、数据库打开失败或 HTTP client 构建失败(代理配置
-    /// 非法)时返回 [`EngineError`]。
+    /// 数据目录解析失败、数据库打开失败或 HTTP client 构建失败（代理配置
+    /// 非法）时返回 [`EngineError`]。
     pub async fn new(
         config: EngineConfig,
         sink: Arc<dyn EventSink>,
@@ -191,6 +193,36 @@ impl Engine {
             Some(url) => Db::connect(url).await?,
             None => Db::open(&data_dir).await?,
         };
+        Self::initialize(config, data_dir, db, sink, selector).await
+    }
+
+    /// 使用宿主已打开的数据库连接池构造引擎。
+    ///
+    /// 该入口与 [`Self::new`] 的运行时行为相同，只跳过数据库打开与 schema
+    /// 初始化。调用方必须传入与 `config.database_url`、数据目录相对应的
+    /// [`Db`]；引擎仍会执行队列播种、缓存恢复和插件/RSS/Webhook 装载。
+    ///
+    /// # Errors
+    ///
+    /// 数据目录解析失败或 HTTP client 构建失败（代理配置非法）时返回
+    /// [`EngineError`]。
+    pub async fn from_db(
+        config: EngineConfig,
+        db: Db,
+        sink: Arc<dyn EventSink>,
+        selector: Arc<dyn HostSelection>,
+    ) -> Result<Self, EngineError> {
+        let data_dir = data_dir::resolve_data_dir(config.data_dir_override.as_deref())?;
+        Self::initialize(config, data_dir, db, sink, selector).await
+    }
+
+    async fn initialize(
+        config: EngineConfig,
+        data_dir: PathBuf,
+        db: Db,
+        sink: Arc<dyn EventSink>,
+        selector: Arc<dyn HostSelection>,
+    ) -> Result<Self, EngineError> {
         // 读回持久化的域名连接上限观察（过期/旧版本数据在加载时丢弃）。
         segment_coordinator::load_domain_conn_caps(&db).await;
         // 读回持久化的 CDN 节点健康度（多节点聚合的跨任务先验，同上范式）。
@@ -238,10 +270,9 @@ impl Engine {
         // 组装并注入插件管理器（feature 关时整块不编译，下载主链路零变化）。
         #[cfg(feature = "plugins")]
         {
-            use std::sync::Arc as StdArc;
             let (proxy_cfg, plugin_sink, max_conc, data_dir_p) = plugin_ctx;
             let retry_tx = manager.plugin_retry_sender();
-            let bridge: StdArc<dyn plugin::PluginBridge> = StdArc::new(
+            let bridge: Arc<dyn plugin::PluginBridge> = Arc::new(
                 plugin::bridge::EngineBridge::new(
                     db.clone(),
                     &proxy_cfg,
@@ -250,7 +281,7 @@ impl Engine {
                 )
                 .map_err(|e| EngineError::Plugin(e.to_string()))?,
             );
-            let runtime: StdArc<dyn plugin::ScriptRuntime> = StdArc::new(
+            let runtime: Arc<dyn plugin::ScriptRuntime> = Arc::new(
                 plugin::quickjs::QuickJsScriptRuntime::new(max_conc)
                     .map_err(|e| EngineError::Plugin(e.to_string()))?,
             );
@@ -262,7 +293,7 @@ impl Engine {
                 .unwrap_or_default();
             let plugins_root = data_dir_p.join("plugins");
             let _ = tokio::fs::create_dir_all(&plugins_root).await;
-            let pm = StdArc::new(plugin::PluginManager::new(
+            let pm = Arc::new(plugin::PluginManager::new(
                 runtime,
                 bridge,
                 db.clone(),
@@ -273,7 +304,7 @@ impl Engine {
             pm.load_all().await;
             manager.install_plugin_manager(pm);
         }
-        // 装载 RSS 订阅到内存镜像——放在 Engine::new 而非交给宿主，保证任何
+        // 装载 RSS 订阅到内存镜像——放在引擎构造而非交给宿主，保证任何
         // 宿主（hub/server/CLI --local）都不必记得这一步就能让轮询生效。
         manager.rss.load().await;
         // 同理装载 webhook 端点表：桌面 / headless / CLI --local 共享 config
