@@ -1457,24 +1457,28 @@ mod tests {
     }
 
     #[test]
-    fn every_preset_default_template_renders_valid_payload() {
+    fn every_preset_default_template_renders_valid_payload() -> Result<(), String> {
         let event = sample_event();
         for preset in Preset::ALL {
             let template = preset.default_template();
             if template.is_empty() {
-                assert_eq!(preset, Preset::Custom);
+                if preset != Preset::Custom {
+                    return Err(format!(
+                        "{} unexpectedly has an empty template",
+                        preset.wire()
+                    ));
+                }
                 continue;
             }
             let vars = vars_for(&event, "mytopic");
             let out = render_template(template, &vars);
             serde_json::from_str::<serde_json::Value>(&out)
-                .unwrap_or_else(|e| panic!("{} produced invalid JSON: {e}\n{out}", preset.wire()));
-            assert!(
-                !out.contains("{event.title}"),
-                "{} left a placeholder unrendered",
-                preset.wire()
-            );
+                .map_err(|e| format!("{} produced invalid JSON: {e}\n{out}", preset.wire()))?;
+            if out.contains("{event.title}") {
+                return Err(format!("{} left a placeholder unrendered", preset.wire()));
+            }
         }
+        Ok(())
     }
 
     #[test]
@@ -1508,16 +1512,16 @@ mod tests {
     // ---- 签名（RFC 4231 测试向量） ----
 
     #[test]
-    fn hmac_matches_rfc4231_vector() {
+    fn hmac_matches_rfc4231_vector() -> Result<(), String> {
         // RFC 4231 Test Case 2: key="Jefe", data="what do ya want for nothing?"
-        let Ok(mut mac) = <SimpleHmac<Sha256> as Mac>::new_from_slice(b"Jefe") else {
-            panic!("hmac init failed");
-        };
+        let mut mac = <SimpleHmac<Sha256> as Mac>::new_from_slice(b"Jefe")
+            .map_err(|_| "hmac init failed".to_string())?;
         mac.update(b"what do ya want for nothing?");
         assert_eq!(
             hex::encode(mac.finalize().into_bytes()),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+        Ok(())
     }
 
     #[test]
@@ -1914,7 +1918,7 @@ mod tests {
     /// headless server 实测出现过 `queue.drained` 抢在 `task.completed`
     /// 前面送达。必须用多线程 flavor 跑，current_thread 掩盖这个 bug。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn same_endpoint_deliveries_keep_emit_order() {
+    async fn same_endpoint_deliveries_keep_emit_order() -> Result<(), String> {
         let server = spawn_mock("HTTP/1.1 200 OK");
         let d = dispatcher();
         d.reload_endpoints(&format!(
@@ -1942,14 +1946,16 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let Ok(seen) = server.events.lock() else {
-            panic!("mock lock poisoned")
-        };
+        let seen = server
+            .events
+            .lock()
+            .map_err(|_| "mock lock poisoned".to_string())?;
         assert_eq!(
             seen.as_slice(),
             order.map(|k| k.wire().to_string()),
             "同端点投递必须保序"
         );
+        Ok(())
     }
 
     #[test]

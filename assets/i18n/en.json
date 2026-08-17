@@ -1057,6 +1057,8 @@
   "logExport": "Export Logs",
   "logExportDesc": "Export logs to attach when submitting feedback",
   "logExportInfo": "{count} log file(s), {size} total",
+  "logStatusHealthy": "App log writer: healthy",
+  "logStatusDegraded": "App log writer degraded ({count} failure(s)). Last error: {error}",
   "logExportButton": "Export Logs",
   "logOpenDirButton": "Open Folder",
   "logExportSuccess": "Exported {count} log file(s)",

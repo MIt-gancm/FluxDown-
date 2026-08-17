@@ -32,6 +32,19 @@ export function AboutSettings({
   const update = useUpdateCheck()
   const channel = config?.web_update_channel === 'frontier' ? 'frontier' : 'stable'
   const logMaxSizeMb = Number(config?.log_max_size_mb ?? '10') || 10
+  const logStatus = !logs
+    ? t('common.loading')
+    : logs.initialized && !logs.degraded
+      ? t('set.about.logStatusHealthy')
+      : t('set.about.logStatusDegraded')
+  const logStatusDesc = !logs
+    ? undefined
+    : logs.initialized && !logs.degraded
+      ? t('set.about.logStatusHealthyDesc')
+      : t('set.about.logStatusDegradedDesc', {
+          count: logs.failureCount,
+          error: logs.lastError ?? t('common.unknown'),
+        })
 
   function logout() {
     clearCredentials()
@@ -81,6 +94,9 @@ export function AboutSettings({
             </span>
             {logDir ? <CopyButton value={logDir} /> : null}
           </div>
+        </SetRow>
+        <SetRow title={t('set.about.logStatus')} desc={logStatusDesc}>
+          <span className="set-value">{logStatus}</span>
         </SetRow>
         <SetRow
           title={t('set.about.logExport')}

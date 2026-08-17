@@ -561,6 +561,14 @@ export interface LogsResponse {
   /** 日志目录绝对路径（服务器文件系统）。 */
   dir: string
   files: LogFileDto[]
+  /** Rust 日志 writer 是否已成功初始化。 */
+  initialized: boolean
+  /** 本次进程生命周期内是否发生过日志基础设施失败。 */
+  degraded: boolean
+  /** 本次进程生命周期内累计日志基础设施失败次数。 */
+  failureCount: number
+  /** 最近一次日志基础设施失败；无失败时为 null。 */
+  lastError: string | null
 }
 
 // ---- 组件（ffmpeg / yt-dlp） ----

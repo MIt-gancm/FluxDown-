@@ -78,18 +78,18 @@ fn sub(a: &U768, b: &U768) -> (U768, bool) {
 
 fn mul(a: &U768, b: &U768) -> U1536 {
     let mut out = [0u64; 24];
-    for i in 0..12 {
+    for (i, &a_limb) in a.iter().enumerate() {
         let mut carry = 0u128;
-        for j in 0..12 {
+        for (j, &b_limb) in b.iter().enumerate() {
             let index = i + j;
-            let value = out[index] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
-            out[index] = value as u64;
+            let value = u128::from(out[index]) + u128::from(a_limb) * u128::from(b_limb) + carry;
+            out[index] = u64::try_from(value & u128::from(u64::MAX)).unwrap_or_default();
             carry = value >> 64;
         }
         let mut index = i + 12;
         while carry != 0 && index < out.len() {
-            let value = out[index] as u128 + carry;
-            out[index] = value as u64;
+            let value = u128::from(out[index]) + carry;
+            out[index] = u64::try_from(value & u128::from(u64::MAX)).unwrap_or_default();
             carry = value >> 64;
             index += 1;
         }

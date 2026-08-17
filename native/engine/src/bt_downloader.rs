@@ -4082,8 +4082,14 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 return Err(DownloadError::Cancelled);
             }
             let msg = format!("BT error: {err}");
-            log_info!("[BT] task={} error: {}", short_id(&task_id), &msg);
-            let _ = db.update_task_status(&task_id, STATUS_ERROR, &msg).await;
+            crate::log_error!("[BT] task={} error: {}", short_id(&task_id), &msg);
+            if let Err(db_error) = db.update_task_status(&task_id, STATUS_ERROR, &msg).await {
+                crate::logger::report_error(
+                    "bt-download",
+                    "persist terminal error status",
+                    &db_error,
+                );
+            }
             let _ = progress_tx
                 .send(ProgressUpdate {
                     task_id: task_id.clone(),
@@ -4633,7 +4639,9 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
 
             // 全部移动成功:此刻文件确已落到 save_dir,才写 STATUS_COMPLETED 并
             // 发完成信号——file_name 指向真实存在的磁盘名。
-            let _ = db.update_task_status(&task_id, STATUS_COMPLETED, "").await;
+            if let Err(db_error) = db.update_task_status(&task_id, STATUS_COMPLETED, "").await {
+                crate::logger::report_error("bt-download", "persist completion status", &db_error);
+            }
             // 完成落定,删除幂等哨兵(孤儿残留无害:status=3 不再进完成路径)。
             let _ = db
                 .delete_config(&format!("bt_completion_top_{}", task_id))

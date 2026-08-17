@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use fluxdown_engine::bt_downloader::BtConfig;
-use fluxdown_engine::db::Db;
+use fluxdown_engine::db::{Db, DbError};
 use fluxdown_engine::download_manager::{
     self, CreateGroupSpec, GroupItemSpec, NewTaskSpec, ResolvePreviewOutcome, TaskDone,
 };
@@ -14,7 +14,7 @@ use fluxdown_engine::events::EventSink;
 use fluxdown_engine::plugin::{PluginError, PluginManager};
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::selection::HostSelection;
-use fluxdown_engine::{Engine, EngineConfig};
+use fluxdown_engine::{Engine, EngineConfig, EngineError};
 use rinf::{DartSignal, RustSignal};
 use tokio::sync::{broadcast, mpsc};
 
@@ -50,6 +50,14 @@ use crate::signals::{
     WebhookDeliveries, WebhookPresets, WebhookSimulateAck, WebhookTestResult, YtdlpInstallProgress,
     YtdlpInstallResult, YtdlpStatusReport, YtdlpVersionList,
 };
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ActorError {
+    #[error("failed to open download database")]
+    OpenDatabase(#[source] DbError),
+    #[error("failed to initialize download engine")]
+    InitializeEngine(#[source] EngineError),
+}
 // 插件「分支体专用」信号（仅在 hub_plugins 分支体内构造）：mobile 不引入。
 use crate::signals::LinkCommand;
 #[cfg(hub_plugins)]
@@ -337,14 +345,8 @@ async fn load_initial_config(
     )
 }
 
-pub async fn run(db_dir: PathBuf) {
-    let db = match Db::open(&db_dir).await {
-        Ok(db) => db,
-        Err(e) => {
-            log_info!("Failed to open database: {}", e);
-            return;
-        }
-    };
+pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
+    let db = Db::open(&db_dir).await.map_err(ActorError::OpenDatabase)?;
 
     // Initialize default config values in DB (no-op if already set)
     if let Err(e) = db.init_default_config(&default_save_dir()).await {
@@ -421,7 +423,7 @@ pub async fn run(db_dir: PathBuf) {
     let sink: Arc<dyn EventSink> = rinf_sink.clone();
     let selector: Arc<dyn HostSelection> = Arc::new(RinfHostSelection::new());
 
-    let mut engine = match Engine::new(
+    let mut engine = Engine::new(
         EngineConfig {
             max_concurrent,
             speed_limit_bps,
@@ -442,13 +444,7 @@ pub async fn run(db_dir: PathBuf) {
         selector.clone(),
     )
     .await
-    {
-        Ok(e) => e,
-        Err(e) => {
-            log_info!("Failed to create engine: {}", e);
-            return;
-        }
-    };
+    .map_err(ActorError::InitializeEngine)?;
 
     engine.manager.set_default_segments(default_segments);
     engine
@@ -1848,7 +1844,6 @@ pub async fn run(db_dir: PathBuf) {
                         updater::check(&version, &channel)
                     );
                     if futures_util::FutureExt::catch_unwind(result).await.is_err() {
-                        log_info!("[updater] check panicked for version={}", version);
                         UpdateCheckResult {
                             has_update: false,
                             latest_version: String::new(),
@@ -1873,7 +1868,7 @@ pub async fn run(db_dir: PathBuf) {
                 let path = signal.message.installer_path;
                 tokio::task::spawn_blocking(move || {
                     if let Err(e) = updater::install(&path) {
-                        log_info!("[updater] install error: {}", e);
+                        fluxdown_engine::logger::report_error("updater", "install update", &e);
                         // Report the error back to the UI so the user can retry
                         // (e.g. they cancelled the pkexec password dialog).
                         crate::signals::UpdateDownloadProgress {

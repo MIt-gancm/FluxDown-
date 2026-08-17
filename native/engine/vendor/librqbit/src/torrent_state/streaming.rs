@@ -43,8 +43,8 @@ impl StreamState {
         let start = self.file_abs_offset + self.position;
         let end = (start + PER_STREAM_BUF_DEFAULT).min(self.file_abs_offset + self.file_len);
         let dpl = lengths.default_piece_length();
-        let start_id = (start / dpl as u64).try_into().unwrap();
-        let end_id = end.div_ceil(dpl as u64).try_into().unwrap();
+        let start_id = u32::try_from(start / u64::from(dpl)).unwrap_or(u32::MAX);
+        let end_id = u32::try_from(end.div_ceil(u64::from(dpl))).unwrap_or(u32::MAX);
         (start_id..end_id).filter_map(|i| lengths.validate_piece_index(i))
     }
 }
@@ -376,12 +376,11 @@ impl FileStream {
 
     fn set_position(&mut self, new_pos: u64) {
         self.position = new_pos;
-        self.streams
-            .streams
-            .get_mut(&self.stream_id)
-            .unwrap()
-            .value_mut()
-            .position = new_pos;
+        if let Some(mut stream) = self.streams.streams.get_mut(&self.stream_id) {
+            stream.value_mut().position = new_pos;
+        } else {
+            tracing::warn!(stream_id = self.stream_id, "stream state disappeared");
+        }
     }
 
     pub fn len(&self) -> u64 {

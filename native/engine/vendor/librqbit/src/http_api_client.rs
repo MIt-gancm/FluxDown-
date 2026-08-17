@@ -80,7 +80,7 @@ impl HttpApiClient {
             if root.server == "rqbit" {
                 return Ok(());
             }
-            anyhow::bail!("not an rqbit server at {}", &self.base_url)
+            anyhow::bail!("not an rqbit server at {}", self.base_url)
         }
         .boxed()
     }
@@ -102,8 +102,8 @@ impl HttpApiClient {
                 initial_peers: opts.initial_peers.map(InitialPeers),
                 ..Default::default()
             };
-            let qs = serde_urlencoded::to_string(&params).unwrap();
-            let url = format!("{}torrents?{}", &self.base_url, qs);
+            let qs = serde_urlencoded::to_string(&params)?;
+            let url = format!("{}torrents?{}", self.base_url, qs);
             let response = check_response(
                 self.client
                     .post(&url)

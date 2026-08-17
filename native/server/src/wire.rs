@@ -563,6 +563,14 @@ pub struct LogsResponse {
     pub dir: String,
     /// 全部日志文件（按日期 + 分卷序升序）。
     pub files: Vec<LogFileDto>,
+    /// 日志 writer 是否已成功初始化。
+    pub initialized: bool,
+    /// 本次进程生命周期内是否发生过日志写入/轮转/清理失败。
+    pub degraded: bool,
+    /// 本次进程生命周期内累计日志基础设施失败次数。
+    pub failure_count: u64,
+    /// 最近一次日志基础设施失败；无失败时为 `null`。
+    pub last_error: Option<String>,
 }
 
 /// token 重新生成响应（`POST /api/v1/token/regenerate`）。

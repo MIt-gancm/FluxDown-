@@ -20,8 +20,8 @@ impl Rc4 {
     /// keys, but keeping this constructor total makes misuse safe.
     pub fn new(key: &[u8]) -> Self {
         let mut s = [0u8; 256];
-        for (idx, slot) in s.iter_mut().enumerate() {
-            *slot = idx as u8;
+        for (slot, value) in s.iter_mut().zip(0..=u8::MAX) {
+            *slot = value;
         }
 
         if key.is_empty() {

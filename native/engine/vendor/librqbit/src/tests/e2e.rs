@@ -90,9 +90,15 @@ async fn _test_e2e_download(drop_checks: &DropChecks) {
                     max_random_sleep_ms: rand::rng().random_range(0u8..16),
                 }
                 .as_peer_id();
-                let listen_range_start = 15100u16 + i as u16;
-                let listen_range_end = listen_range_start + 1;
-                let listen_range = listen_range_start..listen_range_end;
+                let probe = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                    .context("error reserving an ephemeral test port")?;
+                let listen_port = probe
+                    .local_addr()
+                    .context("error reading ephemeral test port")?
+                    .port();
+                drop(probe);
+                let listen_range =
+                    listen_port..listen_port.checked_add(1).context("test port overflow")?;
                 let session = crate::Session::new_with_opts(
                     std::env::temp_dir().join("does_not_exist"),
                     SessionOptions {

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::{net::SocketAddr, sync::Arc};
 
 use bencode::from_bytes;
@@ -93,13 +94,11 @@ impl HandlerLocked {
             total_pieces,
         })
     }
-    fn piece_size(&self, index: u32) -> usize {
+    fn piece_size(&self, index: u32) -> anyhow::Result<usize> {
         if index as usize == self.total_pieces - 1 {
-            last_element_size(self.metadata_size as u64, CHUNK_SIZE as u64)
-                .try_into()
-                .unwrap()
+            Ok(last_element_size(self.metadata_size as u64, CHUNK_SIZE as u64).try_into()?)
         } else {
-            CHUNK_SIZE as usize
+            Ok(CHUNK_SIZE as usize)
         }
     }
     fn record_piece(&mut self, index: u32, data: &[u8], info_hash: Id20) -> anyhow::Result<bool> {
@@ -107,7 +106,7 @@ impl HandlerLocked {
             anyhow::bail!("wrong index");
         }
         let offset = (index * CHUNK_SIZE) as usize;
-        let size = self.piece_size(index);
+        let size = self.piece_size(index)?;
         if data.len() != size {
             anyhow::bail!(
                 "expected length of piece {} to be {}, but got {}",
@@ -172,14 +171,23 @@ impl PeerConnectionHandler for Handler {
             data,
         })) = msg
         {
-            let piece_ready =
-                self.locked
-                    .write()
+            let buffer = {
+                let mut locked = self.locked.write();
+                let state = locked
                     .as_mut()
-                    .unwrap()
-                    .record_piece(piece, &data, self.info_hash)?;
-            if piece_ready {
-                let buf = Bytes::from(self.locked.write().take().unwrap().buffer);
+                    .context("metadata reader completed before receiving piece")?;
+                if state.record_piece(piece, &data, self.info_hash)? {
+                    Some(Bytes::from(
+                        locked
+                            .take()
+                            .context("metadata reader state disappeared")?
+                            .buffer,
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some(buf) = buffer {
                 let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)
                     .map(|i| {
                         use clone_to_owned::CloneToOwned;

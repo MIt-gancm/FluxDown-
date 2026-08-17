@@ -86,13 +86,6 @@ impl ManagedTorrentState {
         }
     }
 
-    fn assert_paused(self) -> TorrentStatePaused {
-        match self {
-            Self::Paused(paused) => paused,
-            _ => panic!("Expected paused state"),
-        }
-    }
-
     pub(crate) fn take(&mut self) -> Self {
         std::mem::replace(self, Self::None)
     }
@@ -366,7 +359,15 @@ impl ManagedTorrent {
                     if start_paused {
                         return Ok(());
                     }
-                    let paused = g.state.take().assert_paused();
+                    let state = g.state.take();
+                    let paused = match state {
+                        ManagedTorrentState::Paused(paused) => paused,
+                        unexpected => {
+                            let state_name = unexpected.name();
+                            g.state = unexpected;
+                            bail!("expected paused state, found {state_name}");
+                        }
+                    };
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
                     g.state = ManagedTorrentState::Live(live.clone());
@@ -379,7 +380,10 @@ impl ManagedTorrent {
                     Ok(())
                 }
                 ManagedTorrentState::Error(_) => {
-                    let metadata = t.metadata.load_full().expect("TODO");
+                    let metadata = t
+                        .metadata
+                        .load_full()
+                        .context("torrent metadata is unavailable while restarting")?;
                     let initializing = Arc::new(TorrentStateInitializing::new(
                         t.shared.clone(),
                         metadata.clone(),

@@ -415,14 +415,10 @@ impl TorrentStateLive {
         )>,
     ) -> anyhow::Result<()> {
         while let Some((tx, ci)) = rx.recv().await {
-            self.ratelimits
-                .prepare_for_upload(NonZeroU32::new(ci.size).unwrap())
-                .await?;
+            let size = NonZeroU32::new(ci.size).context("zero-sized upload chunk")?;
+            self.ratelimits.prepare_for_upload(size).await?;
             if let Some(session) = self.shared.session.upgrade() {
-                session
-                    .ratelimits
-                    .prepare_for_upload(NonZeroU32::new(ci.size).unwrap())
-                    .await?;
+                session.ratelimits.prepare_for_upload(size).await?;
             }
             let _ = tx.send(WriterRequest::ReadChunkRequest(ci));
         }
@@ -617,13 +613,13 @@ impl TorrentStateLive {
     pub(crate) fn lock_read(
         &self,
         reason: &'static str,
-    ) -> TimedExistence<RwLockReadGuard<TorrentStateLocked>> {
+    ) -> TimedExistence<RwLockReadGuard<'_, TorrentStateLocked>> {
         TimedExistence::new(timeit(reason, || self.locked.read()), reason)
     }
     pub(crate) fn lock_write(
         &self,
         reason: &'static str,
-    ) -> TimedExistence<RwLockWriteGuard<TorrentStateLocked>> {
+    ) -> TimedExistence<RwLockWriteGuard<'_, TorrentStateLocked>> {
         TimedExistence::new(timeit(reason, || self.locked.write()), reason)
     }
 
@@ -825,11 +821,11 @@ impl TorrentStateLive {
             if let PeerState::Live(l) = pe.value().get_state() {
                 if l.has_full_torrent(self.lengths.total_pieces() as usize) {
                     let prev = pe.value_mut().set_not_needed(&self.peers);
-                    let _ = prev
-                        .take_live_no_counters()
-                        .unwrap()
-                        .tx
-                        .send(WriterRequest::Disconnect(Ok(())));
+                    if let Some(live) = prev.take_live_no_counters() {
+                        let _ = live.tx.send(WriterRequest::Disconnect(Ok(())));
+                    } else {
+                        warn!("peer state changed before full-torrent disconnect");
+                    }
                 }
             }
         }
@@ -1357,7 +1353,7 @@ impl PeerHandler {
         {
             anyhow::bail!(
                 "got request for a chunk that is not ready to upload. chunk {:?}",
-                &chunk_info
+                chunk_info
             );
         }
 
@@ -1538,15 +1534,17 @@ impl PeerHandler {
                     None => return Ok(()),
                 };
 
+                let request_length =
+                    NonZeroU32::new(request.length).context("zero-sized download request")?;
                 self.state
                     .ratelimits
-                    .prepare_for_download(NonZeroU32::new(request.length).unwrap())
+                    .prepare_for_download(request_length)
                     .await?;
 
                 if let Some(session) = self.state.torrent().session.upgrade() {
                     session
                         .ratelimits
-                        .prepare_for_download(NonZeroU32::new(request.length).unwrap())
+                        .prepare_for_download(request_length)
                         .await?;
                 }
 
@@ -1605,7 +1603,7 @@ impl PeerHandler {
         ) {
             Some(i) => i,
             None => {
-                anyhow::bail!("peer sent us an invalid piece {:?}", &piece,);
+                anyhow::bail!("peer sent us an invalid piece {:?}", piece);
             }
         };
 
@@ -1623,8 +1621,8 @@ impl PeerHandler {
                 if !h.inflight_requests.remove(&chunk_info) {
                     anyhow::bail!(
                         "peer sent us a piece we did not ask. Requested pieces: {:?}. Got: {:?}",
-                        &h.inflight_requests,
-                        &piece,
+                        h.inflight_requests,
+                        piece,
                     );
                 }
                 Ok(())
