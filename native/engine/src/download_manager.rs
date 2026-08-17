@@ -155,27 +155,73 @@ fn is_retriable_error(msg: &str) -> bool {
         || lower.contains("track probe failed")
 }
 
-/// `ProxyMode::Auto` 一次性备用链路的目标。与用户配置的通用自动重试分离：
-/// 每轮失败最多自动换路一次，避免直连/代理之间来回震荡。
+/// `ProxyMode::Auto` 一次性备用链路的目标。手动代理、系统代理和直连在
+/// 一个自动恢复周期内各尝试至多一次，避免坏链路之间无限震荡。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AutoFailoverTarget {
-    Proxy,
+    Proxy(crate::auto_proxy::CandidateSource),
     Direct,
+}
+
+#[derive(Debug, Default)]
+struct AutoFailoverAttempts {
+    direct: bool,
+    manual: bool,
+    system: bool,
+}
+
+impl AutoFailoverAttempts {
+    fn mark_source(&mut self, source: crate::auto_proxy::CandidateSource) {
+        match source {
+            crate::auto_proxy::CandidateSource::ManualFields => self.manual = true,
+            crate::auto_proxy::CandidateSource::System => self.system = true,
+        }
+    }
+
+    fn source_attempted(&self, source: crate::auto_proxy::CandidateSource) -> bool {
+        match source {
+            crate::auto_proxy::CandidateSource::ManualFields => self.manual,
+            crate::auto_proxy::CandidateSource::System => self.system,
+        }
+    }
 }
 
 fn auto_failover_target(
     auto_route: &str,
     error: &str,
-    candidate_available: bool,
+    candidate_sources: &[crate::auto_proxy::CandidateSource],
     network_reachable: bool,
+    attempts: &mut AutoFailoverAttempts,
 ) -> Option<AutoFailoverTarget> {
     if !crate::auto_proxy::is_route_transport_error(error) {
         return None;
     }
+
     if auto_route.starts_with("proxy") {
-        return network_reachable.then_some(AutoFailoverTarget::Direct);
+        if auto_route.ends_with(":manual") {
+            attempts.mark_source(crate::auto_proxy::CandidateSource::ManualFields);
+        } else if auto_route.ends_with(":system") {
+            attempts.mark_source(crate::auto_proxy::CandidateSource::System);
+        } else if candidate_sources.len() == 1 {
+            attempts.mark_source(candidate_sources[0]);
+        }
+    } else {
+        attempts.direct = true;
     }
-    candidate_available.then_some(AutoFailoverTarget::Proxy)
+
+    if let Some(source) = candidate_sources
+        .iter()
+        .copied()
+        .find(|source| !attempts.source_attempted(*source))
+    {
+        attempts.mark_source(source);
+        return Some(AutoFailoverTarget::Proxy(source));
+    }
+    if network_reachable && !attempts.direct {
+        attempts.direct = true;
+        return Some(AutoFailoverTarget::Direct);
+    }
+    None
 }
 
 /// Determine if a URL uses the FTP protocol (case-insensitive).
@@ -1307,10 +1353,9 @@ fn manifest_item_to_info(item: crate::plugin::ManifestItem) -> crate::model::Man
     }
 }
 
-/// 把 resolve 结果应用到 QueuedTask（再入前）。非 ephemeral 保持 hint_file_size=0
-/// 以正常 probe 取 ETag（保 resume If-Range 一致性）；ephemeral 走 skip-probe
-/// hint 路径：知大小用 total_bytes，不知大小用 -1（跳 probe + 大小未知，与
-/// resume 路径语义对称——绝不为 ephemeral 直链发出 probe 请求）。
+/// 把 resolve 结果应用到 QueuedTask（再入前）。非 ephemeral 保持
+/// `hint_file_size=0`，正常 probe 取得供 resume 后验校验的 validator；
+/// ephemeral 走 skip-probe hint 路径。
 #[cfg(feature = "plugins")]
 fn apply_resolve_to_queued(queued: &mut QueuedTask, res: crate::plugin::ResolveResult) {
     if !res.url.is_empty() {
@@ -1466,9 +1511,9 @@ pub struct DownloadManager {
     auto_proxy_cache: crate::auto_proxy::DecisionCache,
     /// 已排程的一次性备用链路目标。resume 消费后写入对应 failover 路由标签。
     auto_failover_pending: HashMap<String, AutoFailoverTarget>,
-    /// 当前自动恢复周期已经换过一次链路的任务。用户手动恢复/重下会清除，
-    /// 自动重试不会清除，防止坏直连与坏代理无限 ping-pong。
-    auto_failover_attempted: HashSet<String>,
+    /// 当前自动恢复周期已尝试过的三条链路。用户手动恢复/重下会清除，
+    /// 自动重试不会清除；每条链路至多一次，防止坏链路无限 ping-pong。
+    auto_failover_attempts: HashMap<String, AutoFailoverAttempts>,
     /// 当前正在下载（或排队准备启动）的任务已预订的临时文件路径集合。
     ///
     /// 用于解决 `dedup_filename` 的 TOCTOU 竞态：多个并发任务同时调用
@@ -1615,7 +1660,7 @@ impl DownloadManager {
             retry_rx: Some(retry_rx),
             auto_proxy_cache: crate::auto_proxy::DecisionCache::new(),
             auto_failover_pending: HashMap::new(),
-            auto_failover_attempted: HashSet::new(),
+            auto_failover_attempts: HashMap::new(),
             reserved_temp_paths: Arc::new(Mutex::new(HashSet::new())),
             sink,
             selector,
@@ -2606,7 +2651,7 @@ impl DownloadManager {
         // 误导可追溯性；指纹只覆盖系统代理，手动字段变更必须在此清）。
         self.auto_proxy_cache.clear();
         self.auto_failover_pending.clear();
-        self.auto_failover_attempted.clear();
+        self.auto_failover_attempts.clear();
         crate::route_health::clear_all(&self.db);
         Ok(())
     }
@@ -3535,7 +3580,7 @@ impl DownloadManager {
                 self.auto_retry_counts.remove(task_id);
                 self.retry_scheduled.remove(task_id);
                 self.auto_failover_pending.remove(task_id);
-                self.auto_failover_attempted.remove(task_id);
+                self.auto_failover_attempts.remove(task_id);
                 if let Err(e) = self.db.delete_task(task_id).await {
                     log_info!(
                         "[manager] duplicate cleanup {}: DB delete error: {}",
@@ -3564,57 +3609,64 @@ impl DownloadManager {
                 && !crate::ed2k::link::is_ed2k_url(&task.url)
                 && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
             {
-                let candidate_available =
-                    crate::auto_proxy::resolve_candidate(&self.proxy_config).is_some();
-                let network_reachable = crate::route_health::network_reachable();
-                let target = auto_failover_target(
-                    &task.auto_route,
-                    &task.error_message,
-                    candidate_available,
-                    network_reachable,
-                );
-
-                // 代理传输失败即作废正面先验；即使本轮已经换过一次、不再自动
-                // 换路，也必须让后续通用重试或新任务回到直连。
-                if target == Some(AutoFailoverTarget::Direct) {
+                let proxy_failed = task.auto_route.starts_with("proxy")
+                    && crate::auto_proxy::is_route_transport_error(&task.error_message);
+                if proxy_failed {
                     log_info!(
-                        "[manager] auto-proxy: task {} host {} 代理传输失败，作废先验并冷却",
+                        "[manager] auto-proxy: task {} host {} 代理传输失败，作废该 host 正面先验",
                         task_id,
                         host
                     );
-                    self.auto_proxy_cache
-                        .set(&host, crate::auto_proxy::Decision::Cooldown);
+                    self.auto_proxy_cache.clear_host(&host);
                     crate::route_health::clear_proxy_prior(&host, &self.db);
                 }
 
-                let target_allowed = match target {
-                    Some(AutoFailoverTarget::Proxy) => {
-                        !matches!(
-                            self.auto_proxy_cache.lookup(&host),
-                            Some(
-                                crate::auto_proxy::Decision::Cooldown
-                                    | crate::auto_proxy::Decision::NoSwitch
-                            )
-                        ) && !crate::route_health::no_switch_active(&host)
-                    }
-                    Some(AutoFailoverTarget::Direct) => true,
-                    None => false,
-                };
-                if target_allowed
-                    && !self.auto_failover_attempted.contains(task_id)
-                    && let Some(target) = target
+                let mut candidates = crate::auto_proxy::resolve_candidates(&self.proxy_config);
+                if let Some(crate::auto_proxy::Decision::Proxy(preferred)) =
+                    self.auto_proxy_cache.lookup(&host)
                 {
+                    candidates.sort_by_key(|candidate| candidate.source != preferred);
+                }
+                if matches!(
+                    self.auto_proxy_cache.lookup(&host),
+                    Some(crate::auto_proxy::Decision::NoSwitch)
+                ) || crate::route_health::no_switch_active(&host)
+                {
+                    candidates.clear();
+                }
+                let candidate_sources: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| candidate.source)
+                    .collect();
+                let network_reachable = crate::route_health::network_reachable();
+                let attempts = self
+                    .auto_failover_attempts
+                    .entry(task_id.to_string())
+                    .or_default();
+                let target = auto_failover_target(
+                    &task.auto_route,
+                    &task.error_message,
+                    &candidate_sources,
+                    network_reachable,
+                    attempts,
+                );
+
+                if let Some(target) = target {
                     let label = match target {
-                        AutoFailoverTarget::Proxy => "代理",
+                        AutoFailoverTarget::Proxy(
+                            crate::auto_proxy::CandidateSource::ManualFields,
+                        ) => "手动代理",
+                        AutoFailoverTarget::Proxy(crate::auto_proxy::CandidateSource::System) => {
+                            "系统代理"
+                        }
                         AutoFailoverTarget::Direct => "直连",
                     };
                     log_info!(
-                        "[manager] auto-proxy: task {} host {} 传输失败，立即换{}重试（不占通用重试配额）",
+                        "[manager] auto-proxy: task {} host {} 传输失败，立即换{}重试（每链路一次，不占通用重试配额）",
                         task_id,
                         host,
                         label
                     );
-                    self.auto_failover_attempted.insert(task_id.to_string());
                     self.auto_failover_pending
                         .insert(task_id.to_string(), target);
                     self.retry_scheduled
@@ -3683,7 +3735,7 @@ impl DownloadManager {
                 // 成功完成：结束本轮通用重试与一次性备用链路状态。
                 self.auto_retry_counts.remove(task_id);
                 self.auto_failover_pending.remove(task_id);
-                self.auto_failover_attempted.remove(task_id);
+                self.auto_failover_attempts.remove(task_id);
                 // 路由先验被动续期：经代理路由（采样切换/缓存采纳/failover）
                 // 完成的任务证明该 host 的代理链路仍然可用——真实传输即
                 // 观测，零探测成本。
@@ -4851,23 +4903,42 @@ impl DownloadManager {
                 None,
             ));
         }
-        let Some((candidate, source)) = auto_proxy::resolve_candidate(&self.proxy_config) else {
+        let candidates = auto_proxy::resolve_candidates(&self.proxy_config);
+        if candidates.is_empty() {
             return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
-        };
-        if forced_route == Some(AutoFailoverTarget::Proxy) {
+        }
+        if let Some(AutoFailoverTarget::Proxy(source)) = forced_route {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.source == source)
+            {
+                return Some((
+                    candidate.config.clone(),
+                    auto_proxy::route::with_source(auto_proxy::route::PROXY_FAILOVER, source),
+                    None,
+                ));
+            }
             return Some((
-                candidate,
-                auto_proxy::route::with_source(auto_proxy::route::PROXY_FAILOVER, source),
+                ProxyConfig::default(),
+                auto_proxy::route::DIRECT_FAILOVER,
                 None,
             ));
         }
         let Some(host) = crate::segment_coordinator::extract_host(url) else {
             return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
         };
-        let cached_proxy = self.auto_proxy_cache.lookup(&host) == Some(Decision::Proxy);
-        if cached_proxy && !has_partial {
+        let cached_source = match self.auto_proxy_cache.lookup(&host) {
+            Some(Decision::Proxy(source)) => Some(source),
+            _ => None,
+        };
+        if let Some(source) = cached_source
+            && !has_partial
+            && let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.source == source)
+        {
             return Some((
-                candidate,
+                candidate.config.clone(),
                 auto_proxy::route::with_source(auto_proxy::route::PROXY_CACHED, source),
                 None,
             ));
@@ -4877,16 +4948,24 @@ impl DownloadManager {
             Some(crate::route_health::RouteHint::SuppressProbe) => {
                 return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
             }
-            Some(crate::route_health::RouteHint::AdoptProxy) if !has_partial => {
+            // 持久层尚不记录获胜代理来源。仅一个候选时可安全采纳；手动和
+            // 系统代理同时存在时必须重新并行采样，不能猜中哪一个曾胜出。
+            Some(crate::route_health::RouteHint::AdoptProxy)
+                if !has_partial && candidates.len() == 1 =>
+            {
+                let candidate = &candidates[0];
                 return Some((
-                    candidate,
-                    auto_proxy::route::with_source(auto_proxy::route::PROXY_CACHED, source),
+                    candidate.config.clone(),
+                    auto_proxy::route::with_source(
+                        auto_proxy::route::PROXY_CACHED,
+                        candidate.source,
+                    ),
                     None,
                 ));
             }
             _ => {}
         }
-        let fast_reeval = cached_proxy
+        let fast_reeval = cached_source.is_some()
             || matches!(
                 hint,
                 Some(crate::route_health::RouteHint::FastReeval)
@@ -4894,11 +4973,10 @@ impl DownloadManager {
             );
         let ctx = (!ignore_tls_errors).then(|| {
             Arc::new(crate::auto_proxy::AutoProxyCtx {
-                candidate,
+                candidates,
                 cache: self.auto_proxy_cache.clone(),
                 host,
                 user_agent: user_agent.to_string(),
-                source,
                 fast_reeval,
                 require_validation: has_partial,
             })
@@ -5319,9 +5397,10 @@ impl DownloadManager {
             // ProxyMode::Auto 可追溯性：启动基线路由落库（非 Auto 写空串清除
             // 旧标签），非空时广播给客户端原位刷新详情面板「链路」行。
             let auto_route = match self.auto_failover_pending.remove(&task_id) {
-                Some(AutoFailoverTarget::Proxy) => {
-                    crate::auto_proxy::route::to_failover(auto_route)
-                }
+                Some(AutoFailoverTarget::Proxy(source)) => crate::auto_proxy::route::with_source(
+                    crate::auto_proxy::route::PROXY_FAILOVER,
+                    source,
+                ),
                 Some(AutoFailoverTarget::Direct) => crate::auto_proxy::route::DIRECT_FAILOVER,
                 None => auto_route,
             };
@@ -5631,7 +5710,7 @@ impl DownloadManager {
         // 保留其目标与单次守卫；否则允许新的手动周期再换路一次。
         self.auto_retry_counts.remove(task_id);
         if !self.auto_failover_pending.contains_key(task_id) {
-            self.auto_failover_attempted.remove(task_id);
+            self.auto_failover_attempts.remove(task_id);
         }
         self.resume_task_inner(task_id).await;
     }
@@ -5768,7 +5847,7 @@ impl DownloadManager {
         // 4. 内存态复位：重试配额/failover 标记/退避占用全部作废。
         self.auto_retry_counts.remove(task_id);
         self.auto_failover_pending.remove(task_id);
-        self.auto_failover_attempted.remove(task_id);
+        self.auto_failover_attempts.remove(task_id);
         self.retry_scheduled.remove(task_id);
 
         // 5. 重新起飞，并下发全量快照——TaskProgress 字段不全，进度归零必须
@@ -6367,8 +6446,8 @@ impl DownloadManager {
 
             // 普通 HTTP 续传已持久化文件大小、分段进度与原始 validator。
             // 已知大小时直接从真实缺口发 Range 请求，避免 HEAD / Range 0-0 /
-            // plain GET 重新消耗一次性签名 URL。下游仍用持久化的 ETag /
-            // Last-Modified 发送 If-Range：206 续传，版本变化返回 200 时清盘重下。
+            // plain GET 重新消耗一次性签名 URL。下游直接发送 Range，并用持久化的
+            // ETag / Last-Modified 对 206 响应做版本后验校验。
             //
             // 未知大小仅沿用未验证 hint 任务的免 probe 语义；FTP/HLS/DASH/ED2K
             // 使用各自下载器，不把 HTTP hint 契约扩散到协议专用路径。
@@ -6495,7 +6574,7 @@ impl DownloadManager {
         // 明确意图，必须从自动重试状态中移除，使后续 create/resume 干净起步。
         self.auto_retry_counts.remove(task_id);
         self.auto_failover_pending.remove(task_id);
-        self.auto_failover_attempted.remove(task_id);
+        self.auto_failover_attempts.remove(task_id);
         self.clear_pending_resolve(task_id);
 
         // Remove from pending queue if queued.
@@ -6582,7 +6661,7 @@ impl DownloadManager {
     pub async fn delete_task(&mut self, task_id: &str, delete_files: bool) {
         self.auto_retry_counts.remove(task_id);
         self.auto_failover_pending.remove(task_id);
-        self.auto_failover_attempted.remove(task_id);
+        self.auto_failover_attempts.remove(task_id);
         self.retry_scheduled.remove(task_id);
         self.clear_pending_resolve(task_id);
 
@@ -9540,36 +9619,98 @@ mod tests {
     }
 
     #[test]
-    fn auto_failover_selects_the_other_route_for_transport_failures() {
+    fn auto_failover_tries_manual_system_and_direct_at_most_once() {
+        use crate::auto_proxy::CandidateSource::{ManualFields, System};
+
+        let sources = [ManualFields, System];
+        let mut attempts = AutoFailoverAttempts::default();
         assert_eq!(
-            auto_failover_target("direct", "download stalled for 5s", true, true),
-            Some(AutoFailoverTarget::Proxy),
-            "直连中途断流应尝试候选代理"
+            auto_failover_target(
+                "direct",
+                "download stalled for 5s",
+                &sources,
+                true,
+                &mut attempts,
+            ),
+            Some(AutoFailoverTarget::Proxy(ManualFields)),
+            "直连中途断流应先尝试显式手动代理"
         );
         assert_eq!(
             auto_failover_target(
-                "proxy:cached:system",
+                "proxy:failover:manual",
                 "error decoding response body",
+                &sources,
                 true,
+                &mut attempts,
+            ),
+            Some(AutoFailoverTarget::Proxy(System)),
+            "手动代理失败后应继续尝试系统代理"
+        );
+        assert_eq!(
+            auto_failover_target(
+                "proxy:failover:system",
+                "operation timed out",
+                &sources,
                 true,
+                &mut attempts,
+            ),
+            None,
+            "三条已尝试链路不得再次循环"
+        );
+
+        let mut proxy_first = AutoFailoverAttempts::default();
+        assert_eq!(
+            auto_failover_target(
+                "proxy:cached:system",
+                "connection reset",
+                &sources,
+                true,
+                &mut proxy_first,
+            ),
+            Some(AutoFailoverTarget::Proxy(ManualFields)),
+            "系统代理先失败时应尝试尚未使用的手动代理"
+        );
+        assert_eq!(
+            auto_failover_target(
+                "proxy:failover:manual",
+                "connection reset",
+                &sources,
+                true,
+                &mut proxy_first,
             ),
             Some(AutoFailoverTarget::Direct),
-            "代理中途断流应回退直连"
+            "两个代理均失败后应回退尚未尝试的本地直连"
         );
+
+        let mut offline = AutoFailoverAttempts::default();
         assert_eq!(
-            auto_failover_target("proxy:cached", "operation timed out", true, false),
+            auto_failover_target(
+                "proxy:cached:system",
+                "operation timed out",
+                &[System],
+                false,
+                &mut offline,
+            ),
             None,
-            "整机离线时不得误判代理失效"
+            "整机离线且无其他代理时不得误判系统代理失效"
         );
+        let mut permanent = AutoFailoverAttempts::default();
         assert_eq!(
-            auto_failover_target("direct", "HTTP 404 Not Found", true, true),
+            auto_failover_target(
+                "direct",
+                "HTTP 404 Not Found",
+                &sources,
+                true,
+                &mut permanent,
+            ),
             None,
             "永久 HTTP 错误不得靠换路重试"
         );
+        let mut no_proxy = AutoFailoverAttempts::default();
         assert_eq!(
-            auto_failover_target("direct", "connection reset", false, true),
+            auto_failover_target("direct", "connection reset", &[], true, &mut no_proxy,),
             None,
-            "没有候选代理时保持原错误"
+            "没有候选代理且直连已失败时保持原错误"
         );
     }
 
@@ -9651,7 +9792,9 @@ mod tests {
         assert_eq!(scheduled.as_deref(), Some("t-auto-failover"));
         assert_eq!(
             mgr.auto_failover_pending.get("t-auto-failover"),
-            Some(&AutoFailoverTarget::Proxy)
+            Some(&AutoFailoverTarget::Proxy(
+                crate::auto_proxy::CandidateSource::ManualFields,
+            ))
         );
         assert!(
             !mgr.auto_retry_counts.contains_key("t-auto-failover"),

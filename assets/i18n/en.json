@@ -835,7 +835,7 @@
   "proxyModeManual": "Manual",
   "proxyModeManualDesc": "Custom proxy server",
   "proxyModeAuto": "Auto (Recommended)",
-  "proxyModeAutoDesc": "Starts direct without blocking, then compares a small proxy sample on substantial downloads and switches per site only when the proxy is clearly faster. Direct tasks keep multi-CDN acceleration.",
+  "proxyModeAutoDesc": "Starts direct without blocking, then compares small samples through every available manual and system proxy. It switches per site only when the fastest proxy is clearly better; direct tasks keep multi-CDN acceleration.",
   "taskRoute": "Route",
   "taskRouteDirect": "Direct",
   "taskRouteDirectSampled": "Direct (sampled)",

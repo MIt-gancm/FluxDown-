@@ -835,7 +835,7 @@
   "proxyModeManual": "手动配置",
   "proxyModeManualDesc": "自定义代理服务器",
   "proxyModeAuto": "自动（推荐）",
-  "proxyModeAutoDesc": "直连无阻塞起飞，大文件后台拉取少量代理样本对比；仅当代理明显更快时按站点切换。直连任务仍保留多 CDN 加速。",
+  "proxyModeAutoDesc": "直连无阻塞起飞，随后并行采样所有可用的手动代理与系统代理；仅当最快代理明显占优时按站点切换。直连任务仍保留多 CDN 加速。",
   "taskRoute": "链路",
   "taskRouteDirect": "直连",
   "taskRouteDirectSampled": "直连（已采样）",

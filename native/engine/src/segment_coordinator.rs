@@ -1962,8 +1962,8 @@ pub async fn run_coordinated_download(
                         }
 
                         let next_work = if serial_mode {
-                            let other_active = segments.values()
-                                .any(|s| s.state == SegState::Active);
+                            let other_active =
+                                segments.values().any(|s| s.state == SegState::Active);
                             if other_active {
                                 // 还有其他 worker 在下载 → 退休当前 worker，等它完成
                                 None
@@ -1971,7 +1971,7 @@ pub async fn run_coordinated_download(
                                 // 无其他活跃连接 → 取一个 Pending 分段（不拆分）
                                 find_next_pending_only(&mut segments)
                             }
-                        } else if worker_assign_txs.iter().filter(|t| t.is_some()).count()
+                        } else if worker_assign_txs.iter().filter(|tx| tx.is_some()).count()
                             > allowed_workers
                         {
                             // 乘性降级后的【自然退休】：存活 worker 数超出当前额度，
@@ -4381,55 +4381,29 @@ async fn do_segment(
         return Ok(seg_end - seg_start + 1);
     }
 
-    // hint 模式首连接：完全不带 Range/If-Range 的 plain GET——配额型端点
-    // （fnOS multiple-download）对 bounded Range 一律 400 且【作废 token】，
-    // 首枪必须是裸 GET。响应 200 走下方"开放式 200 直接采用"路径（no_range
-    // 仅与 open_ended 同真），写循环按共享 end_byte 预算截断。
+    // hint 模式首连接完全不带 Range；其余分段与 aria2 一致，只发送 Range。
+    // 部分一次性签名端点会把 If-Range 视为签名外请求头并立即作废 URL，
+    // 收到 403 后再重试纯 Range 已无法恢复。版本一致性由 206 响应的
+    // ETag/Last-Modified 后验校验保证。
     let plain_first = no_range && actual_start == 0;
-    // 多段下载始终用 GET——上游 resolve_file_info 已确保 spec.is_get_like()，
-    // 此处显式传入 GET 以规避：（1）调用方误传 non-GET spec；（2）spec.method
-    // 是 HEAD（HEAD 不携带 body，没有意义）。
+    // 多段下载始终用 GET——上游 resolve_file_info 已确保 spec.is_get_like()。
+    let range = if open_ended {
+        format!("bytes={actual_start}-")
+    } else {
+        format!("bytes={}-{}", actual_start, seg_end)
+    };
     let mut req = crate::downloader::build_request(client, url, reqwest::Method::GET, spec);
-    let mut validator_sent = false;
     if !plain_first {
-        // 开放式段不给终点：服务器把流一直送到文件尾，写循环按共享 end_byte 预算
-        // 截断。coordinator 可在其余连接被拒时就地扩容本段预算续流（吸收合并），
-        // 也天然兼容"对带终点 Range 返回 400"的怪异端点。
-        let range = if open_ended {
-            format!("bytes={actual_start}-")
-        } else {
-            format!("bytes={}-{}", actual_start, seg_end)
-        };
-        req = req.header("Range", range);
-        // If-Range：把"文件是否自 probe 起变化"的判定交给服务器。validator 一致 →
-        // 返回 206（正常分段）；不一致 → 返回 200 全量 → 下方 != 206 守卫触发
-        // RangeNotSupported，coordinator 取消并回退单流（download_single 的 If-Range
-        // 会再判一次），从而**即使 CDN 在 206 上剥离了 ETag/Last-Modified**也能阻止
-        // 新旧版本静默拼接（BUG-COORD-XVERSION-NO-CONDITIONAL）。下方逐段 ETag 比对
-        // 作为第二道防线保留（应对服务器忽略 If-Range 的情形）。
-        // If-Range 必须用【强】validator（RFC 7233 §3.2）：弱 ETag（`W/` 前缀）在
-        // If-Range 上语义未定义，部分严格服务器即便文件未变也会回 200，反而误触
-        // 下方回退。故强 ETag 优先，弱 ETag 跳过、回退 Last-Modified。
-        let validator = if !expected_etag.is_empty() && !expected_etag.starts_with("W/") {
-            Some(expected_etag.to_string())
-        } else if !expected_last_modified.is_empty() {
-            Some(expected_last_modified.to_string())
-        } else {
-            None
-        };
-        validator_sent = validator.is_some();
-        if let Some(v) = validator {
-            req = req.header("If-Range", v);
-        }
+        req = req.header("Range", &range);
     }
     // 等响应头与 cancel 竞速：惩罚型/停滞服务器可能接受 TCP 连接后长时间不回
     // 响应头（client 只有 connect_timeout，响应头无超时），若不竞速，删除/取消
-    // 任务会被卡在这里直到服务器开口，manager 的 5s handle 等待必然超时。
-    // 写循环内的 chunk 读取已有同样的竞速 + 停滞超时，此处补齐请求发起阶段。
+    // 任务会被卡在这里直到服务器开口。
     let resp = tokio::select! {
         _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
-        r = req.send() => r?.error_for_status()?,
+        r = req.send() => r?,
     };
+    let resp = resp.error_for_status()?;
 
     // --- Range 能力裁决（hint 模式，每任务恰好一次）------------------------
     // 依据首个成功响应：206（服务器履行了 Range）或 200 携带
@@ -4479,15 +4453,8 @@ async fn do_segment(
     // the coordinator cancels all workers for the current attempt.  On retry
     // the cached policy kicks in and the download proceeds in single-stream.
     if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        // 区分两种 non-206：
-        //   (a) 我们发了 If-Range 且响应 validator 与 probe【不同】→ 文件在 probe
-        //       与本段请求之间确实变了。这是"版本变化"而非"服务器不支持 Range"——
-        //       仅本任务回退单流（RangeNotSupported 会触发 run_download_inner 清理
-        //       临时文件并重下新版本）即可，【绝不】把整个主机记入单连接缓存，
-        //       否则一次文件变更会牵连该主机后续所有无关下载 24h 失去多段吞吐
-        //       （BUG-COORD-IFRANGE-200-POISONS-HOST）。
-        //   (b) 未发 validator，或响应 validator 与 probe 相同/缺失 → 服务器确实
-        //       无视 Range（如 FnOS NAS）。记录主机，后续任务直接走单流。
+        // Range 返回 non-206 时先依据响应 validator 区分文件版本变化与真正不支持
+        // Range；不能把一次文件替换误记成整个域名 24h 单连接。
         let resp_etag = resp
             .headers()
             .get(reqwest::header::ETAG)
@@ -4498,16 +4465,12 @@ async fn do_segment(
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let version_changed = validator_sent
+        let version_changed = !plain_first
             && ((!expected_etag.is_empty() && !resp_etag.is_empty() && resp_etag != expected_etag)
                 || (!expected_last_modified.is_empty()
                     && !resp_lm.is_empty()
                     && resp_lm != expected_last_modified));
-        // 分两类 non-206 处理：
-        //   • version_changed：文件在 probe 与本段请求之间变了（If-Range validator 不
-        //     匹配 → 服务器忽略 Range 回 200 全量新版本）。返回 VersionChanged，让上层
-        //     清空旧数据重下新版本；【绝不】记录主机单连接缓存（与 Range 能力无关）
-        //     （BUG-COORD-IFRANGE-200-POISONS-HOST）。
+        // validator 变化：清空旧数据重下新版本；不污染域名连接能力缓存。
         if version_changed {
             return Err(DownloadError::VersionChanged(resp.status().to_string()));
         }
