@@ -12,7 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use fluxdown_engine::bt_downloader::BtConfig;
@@ -30,6 +30,8 @@ struct Gauge {
     peak: AtomicUsize,
     range_gets: AtomicUsize,
     full_gets: AtomicUsize,
+    reject_reprobes: AtomicBool,
+    probe_rejections: AtomicUsize,
 }
 
 impl Gauge {
@@ -39,6 +41,8 @@ impl Gauge {
             peak: AtomicUsize::new(0),
             range_gets: AtomicUsize::new(0),
             full_gets: AtomicUsize::new(0),
+            reject_reprobes: AtomicBool::new(false),
+            probe_rejections: AtomicUsize::new(0),
         }
     }
     fn enter(&self) {
@@ -52,6 +56,7 @@ impl Gauge {
         self.peak.store(0, Ordering::SeqCst);
         self.range_gets.store(0, Ordering::SeqCst);
         self.full_gets.store(0, Ordering::SeqCst);
+        self.probe_rejections.store(0, Ordering::SeqCst);
     }
 }
 
@@ -121,6 +126,16 @@ async fn handle_conn(
     let total = body.len() as i64;
     let etag = "\"repro-etag-1\"";
     let lm = "Wed, 21 Oct 2025 07:28:00 GMT";
+    let is_metadata_probe =
+        method.eq_ignore_ascii_case("HEAD") || range == Some((0, Some(0))) || range.is_none();
+    if gauge.reject_reprobes.load(Ordering::SeqCst) && is_metadata_probe {
+        gauge.probe_rejections.fetch_add(1, Ordering::SeqCst);
+        stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
 
     if method.eq_ignore_ascii_case("HEAD") {
         let h = format!(
@@ -199,6 +214,8 @@ async fn handle_conn(
 struct ScenarioResult {
     phase1_peak: usize,
     resume_peaks: Vec<usize>,
+    resume_range_gets: Vec<usize>,
+    probe_rejections: Vec<usize>,
 }
 
 /// 跑一个完整场景：创建任务 → 下载一会 → N 轮(暂停 → 恢复 → 观察并发)。
@@ -208,6 +225,7 @@ async fn run_scenario(
     segments: i32,
     use_hint: bool,
     cycles: usize,
+    reject_reprobes: bool,
     method: Option<String>,
 ) -> ScenarioResult {
     let work_dir =
@@ -295,6 +313,8 @@ async fn run_scenario(
     );
 
     let mut resume_peaks = Vec::new();
+    let mut resume_range_gets = Vec::new();
+    let mut probe_rejections = Vec::new();
     for cycle in 1..=cycles {
         // ---- 暂停 ----
         engine.manager.pause_task(&task_id).await;
@@ -314,6 +334,9 @@ async fn run_scenario(
 
         // ---- 恢复 ----
         gauge.reset_peak();
+        gauge
+            .reject_reprobes
+            .store(reject_reprobes, Ordering::SeqCst);
         engine.manager.resume_task(&task_id).await;
         tokio::time::sleep(Duration::from_secs(4)).await;
         let peak = gauge.peak.load(Ordering::SeqCst);
@@ -324,12 +347,16 @@ async fn run_scenario(
             .unwrap()
             .map(|t| t.status)
             .unwrap_or(-1);
+        let range_gets = gauge.range_gets.load(Ordering::SeqCst);
+        let rejected = gauge.probe_rejections.load(Ordering::SeqCst);
         eprintln!(
-            "[{name}] cycle{cycle} resume: peak={peak}, range_gets={}, full_gets={}, status={status}",
-            gauge.range_gets.load(Ordering::SeqCst),
+            "[{name}] cycle{cycle} resume: peak={peak}, range_gets={range_gets}, \
+             full_gets={}, probe_rejections={rejected}, status={status}",
             gauge.full_gets.load(Ordering::SeqCst)
         );
         resume_peaks.push(peak);
+        resume_range_gets.push(range_gets);
+        probe_rejections.push(rejected);
         if status == 3 {
             break; // 已完成，无法再暂停
         }
@@ -341,6 +368,8 @@ async fn run_scenario(
     ScenarioResult {
         phase1_peak,
         resume_peaks,
+        resume_range_gets,
+        probe_rejections,
     }
 }
 
@@ -352,16 +381,24 @@ async fn run_scenario(
 #[ignore = "binds a local port; run with --ignored"]
 async fn pause_then_resume_keeps_multi_thread() {
     // 场景 1：显式 4 线程，两轮暂停/恢复
-    let explicit = run_scenario("explicit4", 4, false, 2, None).await;
+    let explicit = run_scenario("explicit4", 4, false, 2, false, None).await;
     // 场景 2：auto（segments=0，advisor 动态计算），两轮
-    let auto = run_scenario("auto0", 0, false, 2, None).await;
+    let auto = run_scenario("auto0", 0, false, 2, false, None).await;
     // 场景 3：浏览器扩展 hint 模式（跳过 probe），两轮
-    let hint = run_scenario("hint4", 4, true, 2, None).await;
+    let hint = run_scenario("hint4", 4, true, 2, false, None).await;
     // 场景 4：auto + hint（扩展流量 + 自动段数）
-    let auto_hint = run_scenario("auto_hint", 0, true, 2, None).await;
+    let auto_hint = run_scenario("auto_hint", 0, true, 2, false, None).await;
     // 场景 5：扩展误捕获 CORS 预检 OPTIONS 的 payload（飞书云盘实录）——
     // RequestSpec::from_captured 应重映射为 GET，保持多线程。
-    let options = run_scenario("options_remap", 4, true, 1, Some("OPTIONS".to_string())).await;
+    let options = run_scenario(
+        "options_remap",
+        4,
+        true,
+        1,
+        false,
+        Some("OPTIONS".to_string()),
+    )
+    .await;
 
     let mut failures = Vec::new();
     for (name, r) in [
@@ -385,6 +422,26 @@ async fn pause_then_resume_keeps_multi_thread() {
         }
     }
     assert!(failures.is_empty(), "复现成功：\n{}", failures.join("\n"));
+}
+/// 已经开始下载的签名 URL 会拒绝重新 HEAD、Range 0-0 或 plain GET，但允许从
+/// 真实缺口继续 Range。恢复必须零探测并继续传输数据。
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "binds a local port; run with --ignored"]
+async fn resume_skips_reprobe_for_known_http_task() {
+    let result = run_scenario("reject_reprobe", 4, false, 1, true, None).await;
+    assert_eq!(
+        result.probe_rejections,
+        vec![0],
+        "恢复不应发 HEAD、Range 0-0 或 plain GET"
+    );
+    assert!(
+        result.resume_range_gets.first().copied().unwrap_or(0) > 0,
+        "恢复后应直接发真实缺口 Range 请求"
+    );
+    assert!(
+        result.resume_peaks.first().copied().unwrap_or(0) > 0,
+        "恢复后应继续传输数据"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -475,13 +532,24 @@ async fn run_change_segments(
         .await
         .expect("create_task");
 
-    // 攒一点进度（部分下载）。
+    // 等到真实分片进度出现即进入变更窗口。不能以并发峰值作等待条件：域名 cap
+    // 可能让任务始终单流，等满超时会让小文件先完成，测试失去“活跃任务”前提。
     let mut waited = 0u64;
-    while gauge.peak.load(Ordering::SeqCst) < 2 && waited < 10_000 {
+    loop {
+        let downloaded: i64 = engine
+            .db
+            .load_segments(&task_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|s| s.downloaded_bytes)
+            .sum();
+        if downloaded >= 256 * 1024 || waited >= 5_000 {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(100)).await;
         waited += 100;
     }
-    tokio::time::sleep(Duration::from_millis(1200)).await;
 
     // pause_first：手动暂停后再改（详情面板暂停态入口）。
     // 否则：下载中直接改，验证引擎自动暂停→改→恢复（右键菜单入口）。

@@ -6306,22 +6306,24 @@ impl DownloadManager {
                 let pc = auto_override.unwrap_or_else(|| self.proxy_config.resolve());
                 (self.client.clone(), pc)
             };
-            // Range 未验证的 hint 任务（tasks.range_verified==0：源自浏览器扩展
-            // hint、从未拿到过 206/Accept-Ranges 证据）：resume 以 DB 里的
-            // total_bytes 作 hint 延续「跳过 probe + 首连接 plain GET」保守启动
-            // ——落回默认 probe 会对配额型端点（fnOS multiple-download）重新
-            // 发 HEAD/Range 并作废 token。已验证任务/旧库任务：照常 probe。
             let range_verified = self.db.get_task_range_verified(&tid).await.unwrap_or(true);
-            // resolver 插件本次 resolve 担保 Range 支持 → 视为已验证：配合下方
-            // ephemeral hint，跳过 probe 且按多段起飞（不落保守单流启动）。
             #[cfg(feature = "plugins")]
             let range_verified = range_verified || plugin_range_supported;
-            let resume_hint = if range_verified {
-                0 // no hint on resume; use probe to get current size
-            } else if task.total_bytes > 0 {
+
+            // 普通 HTTP 续传已持久化文件大小、分段进度与原始 validator。
+            // 已知大小时直接从真实缺口发 Range 请求，避免 HEAD / Range 0-0 /
+            // plain GET 重新消耗一次性签名 URL。下游仍用持久化的 ETag /
+            // Last-Modified 发送 If-Range：206 续传，版本变化返回 200 时清盘重下。
+            //
+            // 未知大小仅沿用未验证 hint 任务的免 probe 语义；FTP/HLS/DASH/ED2K
+            // 使用各自下载器，不把 HTTP hint 契约扩散到协议专用路径。
+            let is_plain_http = !use_ftp && !use_hls && !use_dash && !use_ed2k;
+            let resume_hint = if is_plain_http && task.total_bytes > 0 {
                 task.total_bytes
+            } else if is_plain_http && !range_verified {
+                -1
             } else {
-                -1 // 大小未知但确认可下载（沿用扩展 webRequest 嗅探语义）
+                0
             };
             // ephemeral 直链（一次性/防探测签名 URL）：resolve 刚给出新鲜直链，
             // probe 会作废它 → 跳过 probe（与 start 路径 hint 语义对称）。大小
