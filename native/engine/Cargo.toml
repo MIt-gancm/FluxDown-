@@ -57,6 +57,7 @@ uuid = { version = "1", features = ["v4"] }
 x25519-dalek = { version = "3", optional = true, features = ["static_secrets", "zeroize"] }
 # 插件 zip 安装（跨桌面/服务端；仅 plugins feature 开启时启用）
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 
 [target."cfg(windows)".dependencies]
 librqbit = { version = "8", default-features = false, features = ["default-tls"] }

@@ -406,10 +406,8 @@ class S {
   String get detailCdnKickBuild => _r('detailCdnKickBuild');
   String detailLogCdnBreaker(String host) =>
       _r('detailLogCdnBreaker', {'host': host});
-  String detailLogCdnFallbackFew(int candidates, int alive) => _r(
-    'detailLogCdnFallbackFew',
-    {'candidates': candidates, 'alive': alive},
-  );
+  String detailLogCdnFallbackFew(int candidates, int alive) =>
+      _r('detailLogCdnFallbackFew', {'candidates': candidates, 'alive': alive});
   String get detailLogCdnFallbackError => _r('detailLogCdnFallbackError');
   String detailLogCdnLeases(String host) =>
       _r('detailLogCdnLeases', {'host': host});
@@ -417,10 +415,8 @@ class S {
       _r('detailLogCdnLeasesNode', {'ip': ip, 'count': count});
   String detailLogCdnSummary(String host) =>
       _r('detailLogCdnSummary', {'host': host});
-  String detailLogCdnSummaryNode(String ip, String bytes, String speed) => _r(
-    'detailLogCdnSummaryNode',
-    {'ip': ip, 'bytes': bytes, 'speed': speed},
-  );
+  String detailLogCdnSummaryNode(String ip, String bytes, String speed) =>
+      _r('detailLogCdnSummaryNode', {'ip': ip, 'bytes': bytes, 'speed': speed});
   String get detailCdnNodeSys => _r('detailCdnNodeSys');
   String get detailNotSet => _r('detailNotSet');
   String get detailFollowGlobal => _r('detailFollowGlobal');
@@ -558,6 +554,8 @@ class S {
   String get accountFeatureMultiDevice => _r('accountFeatureMultiDevice');
   String get accountFeatureMultiDeviceDesc =>
       _r('accountFeatureMultiDeviceDesc');
+  String get accountFeatureReferral => _r('accountFeatureReferral');
+  String get accountFeatureReferralDesc => _r('accountFeatureReferralDesc');
   String get accountLoginDialogTitle => _r('accountLoginDialogTitle');
   String get accountLoginTabCode => _r('accountLoginTabCode');
   String get accountLoginTabPassword => _r('accountLoginTabPassword');
@@ -616,8 +614,7 @@ class S {
       _r('accountErrorRegistrationIncomplete');
   String get accountErrorValidation => _r('accountErrorValidation');
   String get accountErrorInvalidEmail => _r('accountErrorInvalidEmail');
-  String get accountErrorPasswordTooShort =>
-      _r('accountErrorPasswordTooShort');
+  String get accountErrorPasswordTooShort => _r('accountErrorPasswordTooShort');
   String get accountErrorNetwork => _r('accountErrorNetwork');
   String get accountErrorUnknown => _r('accountErrorUnknown');
   String get accountErrorDeviceLimit => _r('accountErrorDeviceLimit');
@@ -688,8 +685,7 @@ class S {
       _r('accountPlanReferralDiscountApplied', {'amount': amount});
   String get accountCloudRefresh => _r('accountCloudRefresh');
   String get accountCloudRefreshDone => _r('accountCloudRefreshDone');
-  String get accountPlanErrorAlreadyOwned =>
-      _r('accountPlanErrorAlreadyOwned');
+  String get accountPlanErrorAlreadyOwned => _r('accountPlanErrorAlreadyOwned');
   String get accountPlanErrorNotPurchasable =>
       _r('accountPlanErrorNotPurchasable');
   String get accountPlanErrorPaymentDisabled =>
@@ -736,12 +732,15 @@ class S {
   String get accountReferralRewardDisabledNotice =>
       _r('accountReferralRewardDisabledNotice');
   String get accountReferralRulesTitle => _r('accountReferralRulesTitle');
-  String accountReferralRuleItem(String planName, int percent, String discount) =>
-      _r('accountReferralRuleItem', {
-        'planName': planName,
-        'percent': percent,
-        'discount': discount,
-      });
+  String accountReferralRuleItem(
+    String planName,
+    int percent,
+    String discount,
+  ) => _r('accountReferralRuleItem', {
+    'planName': planName,
+    'percent': percent,
+    'discount': discount,
+  });
   String accountReferralRedeemHint(String contact) =>
       _r('accountReferralRedeemHint', {'contact': contact});
   String get accountReferralCodeCopy => _r('accountReferralCodeCopy');
@@ -764,11 +763,9 @@ class S {
   String accountReferralCodeStats(int count, String amount) =>
       _r('accountReferralCodeStats', {'count': count, 'amount': amount});
   String get accountReferralRecordsEmpty => _r('accountReferralRecordsEmpty');
-  String get accountReferralStatusPending =>
-      _r('accountReferralStatusPending');
+  String get accountReferralStatusPending => _r('accountReferralStatusPending');
   String get accountReferralStatusPaid => _r('accountReferralStatusPaid');
-  String get accountReferralStatusRevoked =>
-      _r('accountReferralStatusRevoked');
+  String get accountReferralStatusRevoked => _r('accountReferralStatusRevoked');
   String accountReferralRecordOrderAmount(String amount) =>
       _r('accountReferralRecordOrderAmount', {'amount': amount});
   String get accountReferralSearchPlaceholder =>
@@ -908,8 +905,7 @@ class S {
   String get localPairingCodeLabel => _r('localPairingCodeLabel');
   String get localPairingCodePlaceholder => _r('localPairingCodePlaceholder');
   String get localPairingCodeHint => _r('localPairingCodeHint');
-  String get localPairingCodeIncomplete =>
-      _r('localPairingCodeIncomplete');
+  String get localPairingCodeIncomplete => _r('localPairingCodeIncomplete');
   String get localPairingConnect => _r('localPairingConnect');
   String get localPairingManualAddress => _r('localPairingManualAddress');
   String get localPairingHostRequired => _r('localPairingHostRequired');
@@ -950,8 +946,7 @@ class S {
   String get localDeviceUnpair => _r('localDeviceUnpair');
   String get localDeviceUnpairConfirmTitle =>
       _r('localDeviceUnpairConfirmTitle');
-  String get localDeviceUnpairConfirmDesc =>
-      _r('localDeviceUnpairConfirmDesc');
+  String get localDeviceUnpairConfirmDesc => _r('localDeviceUnpairConfirmDesc');
   String get localDeviceCodeCopied => _r('localDeviceCodeCopied');
   String localDeviceCodeRemaining(int seconds) =>
       _r('localDeviceCodeRemaining', {'seconds': seconds});
@@ -1178,6 +1173,7 @@ class S {
     };
     return via == null ? label : '$label · $via';
   }
+
   String get proxyType => _r('proxyType');
   String get proxyHost => _r('proxyHost');
   String get proxyHostPlaceholder => _r('proxyHostPlaceholder');
@@ -1514,6 +1510,9 @@ class S {
   String get logExportDesc => _r('logExportDesc');
   String logExportInfo(int count, String size) =>
       _r('logExportInfo', {'count': count, 'size': size});
+  String get logStatusHealthy => _r('logStatusHealthy');
+  String logStatusDegraded(int count, String error) =>
+      _r('logStatusDegraded', {'count': count, 'error': error});
   String get logExportButton => _r('logExportButton');
   String get logOpenDirButton => _r('logOpenDirButton');
   String logExportSuccess(int count) =>
@@ -2011,15 +2010,13 @@ class S {
   // ─────────────────────────────────────────────
   String groupItemsCount(int n) => _r('groupItemsCount', {'n': n});
   String groupDoneCount(int n) => _r('groupDoneCount', {'n': n});
-  String groupDownloadingCount(int n) =>
-      _r('groupDownloadingCount', {'n': n});
+  String groupDownloadingCount(int n) => _r('groupDownloadingCount', {'n': n});
   String groupPendingCount(int n) => _r('groupPendingCount', {'n': n});
   String groupPausedCount(int n) => _r('groupPausedCount', {'n': n});
   String groupFailedCount(int n) => _r('groupFailedCount', {'n': n});
   String groupDoneOfTotal(int done, int total) =>
       _r('groupDoneOfTotal', {'done': done, 'total': total});
-  String groupEtaRemaining(String eta) =>
-      _r('groupEtaRemaining', {'eta': eta});
+  String groupEtaRemaining(String eta) => _r('groupEtaRemaining', {'eta': eta});
   String get groupPauseAll => _r('groupPauseAll');
   String get groupResumeAll => _r('groupResumeAll');
   String get groupRetryFailed => _r('groupRetryFailed');
@@ -2303,8 +2300,7 @@ class S {
   String doctorListenerRestartFailed(String error) =>
       _r('doctorListenerRestartFailed', {'error': error});
   String get doctorRunDoneHealthy => _r('doctorRunDoneHealthy');
-  String doctorRunDoneIssues(int n) =>
-      _r('doctorRunDoneIssues', {'n': n});
+  String doctorRunDoneIssues(int n) => _r('doctorRunDoneIssues', {'n': n});
   List<String> get searchKeywordsDoctor =>
       _r('searchKeywordsDoctor').split(',');
 

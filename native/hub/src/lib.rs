@@ -20,7 +20,6 @@ mod updater;
 
 use actors::create_actors;
 use rinf::{dart_shutdown, write_interface};
-use tokio::spawn;
 
 write_interface!();
 
@@ -35,8 +34,20 @@ write_interface!();
 //   • Never park the thread with `std::thread::sleep` or synchronous `Mutex` contention in async code.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    logger::init();
-    spawn(create_actors());
-    spawn(shortcut_icon::listen());
+    if let Err(error) = logger::init() {
+        eprintln!(
+            "FluxDown logger initialization failed: {}",
+            logger::format_error_chain(&error)
+        );
+        return;
+    }
+    logger::spawn_logged("hub", "create actors", async {
+        create_actors().await?;
+        Ok::<(), actors::CreateActorsError>(())
+    });
+    logger::spawn_logged("hub", "shortcut icon listener", async {
+        shortcut_icon::listen().await;
+        Ok::<(), std::convert::Infallible>(())
+    });
     dart_shutdown().await;
 }

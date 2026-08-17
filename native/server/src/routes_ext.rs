@@ -821,7 +821,16 @@ async fn logs_info() -> Result<Response, ApiError> {
             size: m.size as i64,
         })
         .collect();
-    Ok(axum::Json(LogsResponse { dir, files }).into_response())
+    let health = fluxdown_engine::logger::health();
+    Ok(axum::Json(LogsResponse {
+        dir,
+        files,
+        initialized: health.initialized,
+        degraded: health.degraded,
+        failure_count: health.failure_count,
+        last_error: health.last_error,
+    })
+    .into_response())
 }
 
 /// 导出全部日志为 zip 下载。`?token=` 鉴权（浏览器导航下载无法设 header，

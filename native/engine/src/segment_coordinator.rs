@@ -721,6 +721,15 @@ fn freeze_verdict_next_state(task_probes_used: u32) -> FreezeState {
         }
     }
 }
+/// 持续劣化收缩后的冻结状态。Active 至少进入 Soft 冷却，阻止下一完整 tick
+/// 立即倍增回原额度；已经处于 Soft/Hard 时说明冷却或试探期间仍在劣化，升级 Hard。
+fn sustained_shrink_next_state(current: FreezeState, task_probes_used: u32) -> FreezeState {
+    if matches!(current, FreezeState::Active) {
+        freeze_verdict_next_state(task_probes_used)
+    } else {
+        FreezeState::Hard
+    }
+}
 
 /// 任务尾正面学习规模：取「被接受过的规模」与「受益过的规模」之较小者，
 /// 防止 Freeze 不回滚场景下跨任务棘轮抬升 hint。
@@ -2870,10 +2879,9 @@ pub async fn run_coordinated_download(
                             allowed_workers = (allowed_workers / 2).max(1);
                             beneficial_scale = beneficial_scale.min(allowed_workers);
                             shrunk_this_tick = true;
-                            // Soft 期间触发 shrink → 升级 Hard（服务器在劣化，停止试探）。
-                            if matches!(freeze, FreezeState::Soft { .. }) {
-                                freeze = FreezeState::Hard;
-                            }
+                            // 收缩后至少进入 Soft 冷却，避免下一完整 tick 立即倍增回
+                            // 原额度；冷却/试探期间仍劣化则升级 Hard。
+                            freeze = sustained_shrink_next_state(freeze, soft_probe_task_used);
                             log_info!(
                                 "[adaptive] task {} sustained degradation shrink: {} -> {} \
                                  conns, throughput {:.0} B/s < peak {:.0} × {:.2}",
@@ -5089,7 +5097,8 @@ mod tests {
         find_next_work, freeze_verdict_next_state, hint_uncap_ceiling, initial_allowed_workers,
         is_single_conn_domain, is_tail, ramp_verdict, rebuild_seg_states, record_domain_conn_cap,
         record_domain_conn_hint, should_expand, should_shrink, soft_probe_eval_transition,
-        soft_probe_ready, try_proactive_split, try_split_largest, validate_coverage,
+        soft_probe_ready, sustained_shrink_next_state, try_proactive_split, try_split_largest,
+        validate_coverage,
     };
     use crate::downloader::{DownloadError, SegmentProgressInfo, is_server_rejection};
     use std::collections::BTreeMap;
@@ -6790,6 +6799,42 @@ mod tests {
                 cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
                 attempts: 0,
             }
+        );
+    }
+    /// Active 在持续劣化后必须先冷却，不能下一 tick 立即 32 → 64 抖回去。
+    #[test]
+    fn sustained_shrink_cools_active_before_reexpand() {
+        let next = sustained_shrink_next_state(FreezeState::Active, 0);
+        assert_eq!(
+            next,
+            FreezeState::Soft {
+                ticks_waited: 0,
+                cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+                attempts: 0,
+            }
+        );
+        assert!(!should_expand(
+            !matches!(next, FreezeState::Active),
+            false,
+            32,
+            32,
+            64,
+            false
+        ));
+    }
+
+    /// 冷却期间继续劣化或任务试探预算耗尽时永久停扩，避免连接风暴反复出现。
+    #[test]
+    fn sustained_shrink_escalates_unhealthy_or_exhausted_state() {
+        let soft = FreezeState::Soft {
+            ticks_waited: 0,
+            cooldown: RAMP_SOFT_PROBE_COOLDOWN_TICKS,
+            attempts: 0,
+        };
+        assert_eq!(sustained_shrink_next_state(soft, 0), FreezeState::Hard);
+        assert_eq!(
+            sustained_shrink_next_state(FreezeState::Active, RAMP_SOFT_PROBE_TASK_BUDGET),
+            FreezeState::Hard
         );
     }
 

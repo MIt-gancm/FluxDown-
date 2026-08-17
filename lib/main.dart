@@ -63,6 +63,19 @@ Future<void> _runStartupStep(
   }
 }
 
+/// 记录 Flutter 官方定义的启动边界：引擎完成首帧栅格化。
+void _logFirstFrameWhenRasterized(Stopwatch startupStopwatch) {
+  unawaited(
+    WidgetsBinding.instance.waitUntilFirstFrameRasterized.then((_) {
+      startupStopwatch.stop();
+      logInfo(
+        'startup',
+        'first frame rasterized in ${startupStopwatch.elapsedMilliseconds}ms',
+      );
+    }),
+  );
+}
+
 Future<void> main(List<String> args) async {
   // 独立快速下载小窗引擎入口：原生宿主以 --quick-popup 参数启动第二引擎。
   // 该引擎零插件注册、不初始化 Rust，所有环境数据经 fluxdown/popup_child
@@ -73,6 +86,7 @@ Future<void> main(List<String> args) async {
   }
 
   WidgetsFlutterBinding.ensureInitialized();
+  final startupStopwatch = Stopwatch()..start();
 
   // 初始化日志服务 — 必须尽早执行。
   // 预览版 Windows 上若 SharedPreferences / 插件初始化卡住，
@@ -80,12 +94,17 @@ Future<void> main(List<String> args) async {
   LogService.instance.init();
   logInfo('main', 'bootstrap start, args=$args');
 
-  // 初始化键值存储门面 — 必须早于任何 provider/service 读取（locale/theme/
-  // 窗口状态）。便携模式下改写 exe 目录 settings.json，消除首次打开写 C 盘。
+  // 必须早于所有 provider/service 读取。便携模式使用 exe 目录 settings.json。
   await _runStartupStep('kv store init', () => KvStore.instance.init());
 
-  // 初始化 i18n — 创建 LocaleNotifier 并从 SharedPreferences 恢复语言偏好
-  await _runStartupStep('i18n load', I18nStore.load);
+  // 主题只依赖已载入的 KvStore，与翻译资源加载互不依赖。并发等待可让
+  // AssetBundle I/O 与本地主题解析重叠，同时仍保证 runApp 前主题和语言
+  // 都已就绪，不引入首帧闪烁。
+  final themeProvider = ThemeProvider();
+  await Future.wait<void>([
+    _runStartupStep('i18n load', I18nStore.load),
+    _runStartupStep('theme init', () => themeProvider.init()),
+  ]);
   localeNotifier = LocaleNotifier();
   await _runStartupStep('locale init', () => localeNotifier.init());
 
@@ -131,11 +150,7 @@ Future<void> main(List<String> args) async {
     return true; // 已处理，不再向上传播
   };
 
-  logInfo('main', 'initializing theme...');
-  // 在 runApp 之前恢复主题设置，避免启动时主题闪烁
-  final themeProvider = ThemeProvider();
-  await _runStartupStep('theme init', () => themeProvider.init());
-  logInfo('main', 'theme init step finished');
+  logInfo('main', 'theme and locale init steps finished');
 
   // ===== 移动端启动流程 =====
   // Android / iOS 走精简初始化：无窗口管理、托盘、开机启动等桌面服务。
@@ -149,128 +164,120 @@ Future<void> main(List<String> args) async {
         localeNotifier: localeNotifier,
       ),
     );
+    _logFirstFrameWhenRasterized(startupStopwatch);
     return;
   }
 
-  logInfo('main', 'initializing windowManager...');
-  await windowManager.ensureInitialized();
+  // Rust、窗口、开机启动和托盘互不依赖。旧流程将四条 I/O 链完全串行，
+  // 任何一条慢路径都会直接累加到首帧时间。这里在同一 isolate 上并发等待
+  // I/O（不是多线程执行 Dart），仍在 runApp 前汇合，确保首帧契约不变。
+  final windowManagerReady = windowManager.ensureInitialized();
 
-  // 从 SharedPreferences 读取上次保存的窗口状态（纯读取，不调用 windowManager API）
-  logInfo('main', 'loading saved window state...');
-  await _runStartupStep(
-    'load saved window state',
-    () => WindowStateService.instance.loadState(),
-  );
+  final rustInit = () async {
+    logInfo('main', 'initializing Rust runtime...');
+    await initializeRust(assignRustSignal);
+    logInfo('main', 'Rust runtime initialized');
+  }();
 
-  // 不使用 waitUntilReadyToShow —— 它的回调参数类型是 VoidCallback，
-  // async 回调中的 await 全部变成 fire-and-forget，与原生层 first_frame_cb
-  // 的 gtk_widget_show / Win32 Show() 竞争，导致窗口以默认大小先显示再跳变。
-  // 且其内部会无条件执行 unmaximize()，破坏已恢复的最大化状态。
-  //
-  // 改为在 runApp 之前直接 await 逐步设置窗口属性，
-  // 所有 method-channel 调用同步完成后才进入 Flutter 渲染循环，
-  // first_frame_cb 触发 show 时窗口属性已就位，不会闪烁跳变。
-  // 窗口显示由原生层 first_frame_cb 控制（已处理 silentStart 逻辑）。
-  await windowManager.setTitleBarStyle(
-    TitleBarStyle.hidden,
-    windowButtonVisibility: Platform.isMacOS,
-  );
-  // macOS：设置 NSWindow 背景色为浅灰，使失焦时 traffic light 按钮（灰色圆圈）
-  // 在白色侧边栏背景上有足够对比度，不会"消失"。
-  if (Platform.isMacOS) {
-    await windowManager.setBackgroundColor(const Color(0xFFE5E5E5));
-  }
-  await windowManager.setMinimumSize(const Size(900, 500));
-  await _runStartupStep(
-    'apply saved window state',
-    () => WindowStateService.instance.applyState(),
-  );
-  logInfo('main', 'window state apply step finished before runApp');
+  final windowInit = () async {
+    logInfo('main', 'initializing windowManager...');
+    await windowManagerReady;
 
-  // 初始化开机启动支持（注册时附带 --silentStart 参数，开机自启免打扰）
-  // Windows 下路径加引号，防止含空格的安装路径（如 C:\Program Files\...）被 CreateProcess 截断解析失败。
-  // 该 Run 值（HKCU\...\CurrentVersion\Run 的 "FluxDown"）为运行时写入，
-  // 卸载时由 installer/windows/setup.iss 的 RemoveAutostartRunValue 清理——改动值名/格式需同步。
-  launchAtStartup.setup(
-    appName: 'FluxDown',
-    appPath: Platform.isWindows
-        ? '"${Platform.resolvedExecutable}"'
-        : Platform.resolvedExecutable,
-    args: ['--silentStart'],
-  );
-  // 确保注册表条目包含 --silentStart 参数，处理两种迁移场景：
-  // 1. 旧版本自行写入的条目（路径未加引号或缺少 --silentStart）
-  // 2. Windows 安装程序写入的条目（无 --silentStart，与 launchAtStartup 期望值不匹配）
-  try {
-    bool needsReEnable = await launchAtStartup.isEnabled();
-    if (!needsReEnable && Platform.isWindows) {
-      // launchAtStartup.isEnabled() 做精确值匹配，检测不到安装程序写入的旧条目。
-      // 用 reg query 直接检查注册表中是否存在任意值（含安装程序创建的条目）。
-      final regResult = await Process.run('reg', [
-        'query',
-        r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-        '/v',
-        'FluxDown',
-      ]);
-      if (regResult.exitCode == 0) {
-        needsReEnable = true;
-        logInfo(
-          'main',
-          'found legacy/installer autostart entry, migrating to --silentStart',
-        );
-      }
-    }
-    if (needsReEnable) {
-      await launchAtStartup.enable();
-      logInfo('main', 'launchAtStartup re-enabled with --silentStart arg');
-    }
-  } catch (e) {
-    logInfo('main', 'launchAtStartup refresh skipped: $e');
-  }
-  logInfo('main', 'launchAtStartup setup done');
-
-  // 初始化系统托盘
-  logInfo('main', 'initializing tray...');
-  await _runStartupStep(
-    'tray init',
-    () => TrayService.instance.init(),
-    timeout: const Duration(seconds: 5),
-  );
-  logInfo('main', 'tray init step finished');
-
-  // themeProvider 已加载完毕，立即将托盘图标修正为 app 当前生效主题
-  // （init() 默认使用系统亮度作为初始值，这里覆盖为 app 的显式设置）
-  if (Platform.isWindows) {
-    final mode = themeProvider.themeMode;
-    final bool trayIsDark;
-    if (mode == ThemeMode.dark) {
-      trayIsDark = true;
-    } else if (mode == ThemeMode.light) {
-      trayIsDark = false;
-    } else {
-      trayIsDark =
-          WidgetsBinding.instance.platformDispatcher.platformBrightness ==
-          Brightness.dark;
-    }
+    // 从 KvStore 读取上次保存的窗口状态（纯读取，不调用 windowManager API）。
     await _runStartupStep(
-      'tray theme sync',
-      () => TrayService.instance.setIsDark(trayIsDark),
+      'load saved window state',
+      () => WindowStateService.instance.loadState(),
     );
-    logInfo('main', 'tray isDark=$trayIsDark (from app theme: $mode)');
-  }
 
-  // 恢复用户自定义的应用图标（窗口/任务栏/托盘）。
-  // WM_SETICON 仅对当前进程生效，需每次启动重新应用；默认图标来自 exe 资源，无需处理。
+    // 不使用 waitUntilReadyToShow：其 VoidCallback 无法等待异步窗口设置，
+    // 会与原生 first_frame_cb 竞争并产生默认尺寸闪烁。
+    await windowManager.setTitleBarStyle(
+      TitleBarStyle.hidden,
+      windowButtonVisibility: Platform.isMacOS,
+    );
+    if (Platform.isMacOS) {
+      await windowManager.setBackgroundColor(const Color(0xFFE5E5E5));
+    }
+    await windowManager.setMinimumSize(const Size(900, 500));
+    await _runStartupStep(
+      'apply saved window state',
+      () => WindowStateService.instance.applyState(),
+    );
+    logInfo('main', 'window state apply step finished before runApp');
+  }();
+
+  final autostartInit = () async {
+    // 注册时附带 --silentStart；Windows 路径加引号，避免空格截断。
+    launchAtStartup.setup(
+      appName: 'FluxDown',
+      appPath: Platform.isWindows
+          ? '"${Platform.resolvedExecutable}"'
+          : Platform.resolvedExecutable,
+      args: ['--silentStart'],
+    );
+    try {
+      bool needsReEnable = await launchAtStartup.isEnabled();
+      if (!needsReEnable && Platform.isWindows) {
+        // 精确值匹配检测不到安装程序或旧版本写入的旧条目，直接查注册表。
+        final regResult = await Process.run('reg', [
+          'query',
+          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
+          '/v',
+          'FluxDown',
+        ]);
+        if (regResult.exitCode == 0) {
+          needsReEnable = true;
+          logInfo(
+            'main',
+            'found legacy/installer autostart entry, migrating to --silentStart',
+          );
+        }
+      }
+      if (needsReEnable) {
+        await launchAtStartup.enable();
+        logInfo('main', 'launchAtStartup re-enabled with --silentStart arg');
+      }
+    } catch (e) {
+      logInfo('main', 'launchAtStartup refresh skipped: $e');
+    }
+    logInfo('main', 'launchAtStartup setup done');
+  }();
+
+  final trayInit = () async {
+    await _runStartupStep(
+      'tray init',
+      () => TrayService.instance.init(),
+      timeout: const Duration(seconds: 5),
+    );
+
+    // 将 Windows 托盘图标修正为 app 当前主题，而非系统默认亮度。
+    if (Platform.isWindows) {
+      final mode = themeProvider.themeMode;
+      final trayIsDark = switch (mode) {
+        ThemeMode.dark => true,
+        ThemeMode.light => false,
+        ThemeMode.system =>
+          WidgetsBinding.instance.platformDispatcher.platformBrightness ==
+              Brightness.dark,
+      };
+      await _runStartupStep(
+        'tray theme sync',
+        () => TrayService.instance.setIsDark(trayIsDark),
+      );
+      logInfo('main', 'tray isDark=$trayIsDark (from app theme: $mode)');
+    }
+    logInfo('main', 'tray init step finished');
+  }();
+
+  await Future.wait<void>([rustInit, windowInit, autostartInit, trayInit]);
+
+  // AppIconService 依赖 windowManager 与 TrayService，必须在上面的汇合点之后。
   await _runStartupStep(
     'app icon init',
     () => AppIconService.instance.init(),
     timeout: const Duration(seconds: 5),
   );
   logInfo('main', 'app icon init step finished');
-
-  logInfo('main', 'initializing Rust runtime...');
-  await initializeRust(assignRustSignal);
-  logInfo('main', 'Rust runtime initialized');
 
   logInfo('main', 'calling runApp...');
 
@@ -282,6 +289,8 @@ Future<void> main(List<String> args) async {
       initialProtocolRequests: protocolRequests,
     ),
   );
+
+  _logFirstFrameWhenRasterized(startupStopwatch);
 }
 
 /// Normalize a file argument to a plain filesystem path.
@@ -358,7 +367,9 @@ class _FluxDownAppState extends State<FluxDownApp>
   late final ThemeProvider themeProvider;
   late final LocaleNotifier _localeNotifier;
   final _navigatorKey = GlobalKey<NavigatorState>();
-  final _settingsForExternal = SettingsProvider(enableFileAssoc: false);
+  // App 级服务与 HomePage 共享同一个配置实例，避免重复订阅五条 Rust 信号、
+  // 重复读取完整配置，并维持 SettingsProvider.globalInstance 单一所有者。
+  final _settingsForExternal = SettingsProvider();
 
   /// MethodChannel for receiving args from second instances (single-instance).
   static const _singleInstanceChannel = MethodChannel(
@@ -1038,7 +1049,7 @@ class _FluxDownAppState extends State<FluxDownApp>
                       navigatorKey: _navigatorKey,
                       color: theme.colorScheme.primary,
                       debugShowCheckedModeBanner: false,
-                      home: const HomePage(),
+                      home: HomePage(settingsProvider: _settingsForExternal),
                       builder: (context, child) {
                         final scale = themeProvider.uiScale;
                         if (scale == 1.0) return child!;

@@ -23,6 +23,7 @@ const _kAccessTokenKey = 'cloud_access_token';
 const _kRefreshTokenKey = 'cloud_refresh_token';
 const _kUserKey = 'cloud_user';
 const _kEntitlementsKey = 'cloud_entitlements';
+const _kCurrentPlanKey = 'cloud_current_plan';
 
 enum CloudAuthStatus { unauthenticated, authenticated }
 
@@ -49,6 +50,10 @@ class CloudAuthService extends ChangeNotifier {
   Entitlements? _entitlements;
   Entitlements? get entitlements => _entitlements;
 
+  /// 当前套餐展示快照；服务端不按上架状态过滤，保证历史套餐徽标可持续展示。
+  CloudPlan? _currentPlan;
+  CloudPlan? get currentPlan => _currentPlan;
+
   /// 当前套餐的等效已付额（分），差价升级抵扣基数；随 [refreshProfile] 更新，
   /// 不持久化（仅购买对话框展示用，会话内拉取即可）。
   int _purchaseCreditMinor = 0;
@@ -72,7 +77,11 @@ class CloudAuthService extends ChangeNotifier {
     final at = KvStore.instance.getString(_kAccessTokenKey);
     final rt = KvStore.instance.getString(_kRefreshTokenKey);
     final userJson = KvStore.instance.getString(_kUserKey);
-    if (at == null || at.isEmpty || rt == null || rt.isEmpty || userJson == null) {
+    if (at == null ||
+        at.isEmpty ||
+        rt == null ||
+        rt.isEmpty ||
+        userJson == null) {
       return;
     }
     try {
@@ -81,11 +90,22 @@ class CloudAuthService extends ChangeNotifier {
       _entitlements = Entitlements.fromJson(
         entJson != null ? jsonDecode(entJson) as Map<String, dynamic> : null,
       );
+      final currentPlanJson = KvStore.instance.getString(_kCurrentPlanKey);
+      _currentPlan = currentPlanJson == null
+          ? null
+          : CloudPlan.fromJson(
+              jsonDecode(currentPlanJson) as Map<String, dynamic>,
+            );
       CloudClient.instance.accessToken = at;
       CloudClient.instance.refreshToken = rt;
       _status = CloudAuthStatus.authenticated;
     } catch (e, stack) {
-      logError(_tag, 'restore session failed, treating as signed out', e, stack);
+      logError(
+        _tag,
+        'restore session failed, treating as signed out',
+        e,
+        stack,
+      );
     }
   }
 
@@ -96,10 +116,17 @@ class CloudAuthService extends ChangeNotifier {
     required String email,
     required String password,
     String? nickname,
-  }) => CloudClient.instance.register(email: email, password: password, nickname: nickname);
+  }) => CloudClient.instance.register(
+    email: email,
+    password: password,
+    nickname: nickname,
+  );
 
   /// 提交注册验证码：激活账户 + 信任当前设备 + 建立会话。
-  Future<void> registerVerify({required String email, required String code}) async {
+  Future<void> registerVerify({
+    required String email,
+    required String code,
+  }) async {
     final auth = await CloudClient.instance.registerVerify(
       email: email,
       code: code,
@@ -116,7 +143,10 @@ class CloudAuthService extends ChangeNotifier {
   /// 密码登录：设备已受信任直接建立会话；新设备返回 [LoginDeviceVerificationRequired]
   /// （服务端已自动发码），调用方转入验证码输入界面后再调 [loginVerify]。
   /// [account] 接受邮箱或纯数字 Origin ID（契约 v1.2）。
-  Future<LoginResult> login({required String account, required String password}) async {
+  Future<LoginResult> login({
+    required String account,
+    required String password,
+  }) async {
     final result = await CloudClient.instance.login(
       account: account,
       password: password,
@@ -182,7 +212,12 @@ class CloudAuthService extends ChangeNotifier {
       try {
         await CloudClient.instance.logout(rt);
       } catch (e, stack) {
-        logError(_tag, 'server logout failed, clearing local session anyway', e, stack);
+        logError(
+          _tag,
+          'server logout failed, clearing local session anyway',
+          e,
+          stack,
+        );
       }
     }
     await _clearSession();
@@ -202,6 +237,7 @@ class CloudAuthService extends ChangeNotifier {
     final profile = await CloudClient.instance.me();
     _user = profile.user;
     _entitlements = profile.entitlements;
+    _currentPlan = profile.currentPlan;
     _purchaseCreditMinor = profile.purchaseCreditMinor;
     await _persistUser();
     notifyListeners();
@@ -254,6 +290,7 @@ class CloudAuthService extends ChangeNotifier {
     _user = profile.user;
     _entitlements = profile.entitlements;
     _purchaseCreditMinor = profile.purchaseCreditMinor;
+    _currentPlan = profile.currentPlan;
     await _persistUser();
     notifyListeners();
   }
@@ -264,6 +301,7 @@ class CloudAuthService extends ChangeNotifier {
     _user = profile.user;
     _entitlements = profile.entitlements;
     _purchaseCreditMinor = profile.purchaseCreditMinor;
+    _currentPlan = profile.currentPlan;
     await _persistUser();
     notifyListeners();
   }
@@ -310,6 +348,7 @@ class CloudAuthService extends ChangeNotifier {
   Future<void> _applySession(AuthResponse auth) async {
     _user = auth.user;
     _entitlements = auth.entitlements;
+    _currentPlan = auth.currentPlan;
     _status = CloudAuthStatus.authenticated;
     CloudClient.instance.accessToken = auth.accessToken;
     CloudClient.instance.refreshToken = auth.refreshToken;
@@ -327,11 +366,21 @@ class CloudAuthService extends ChangeNotifier {
       _kEntitlementsKey,
       jsonEncode(_entitlements?.toJson() ?? const {}),
     );
+    final plan = _currentPlan;
+    if (plan == null) {
+      await KvStore.instance.remove(_kCurrentPlanKey);
+    } else {
+      await KvStore.instance.setString(
+        _kCurrentPlanKey,
+        jsonEncode(plan.toJson()),
+      );
+    }
   }
 
   Future<void> _clearSession() async {
     _user = null;
     _entitlements = null;
+    _currentPlan = null;
     _purchaseCreditMinor = 0;
     _devices = const [];
     _status = CloudAuthStatus.unauthenticated;
@@ -341,6 +390,7 @@ class CloudAuthService extends ChangeNotifier {
     await KvStore.instance.remove(_kRefreshTokenKey);
     await KvStore.instance.remove(_kUserKey);
     await KvStore.instance.remove(_kEntitlementsKey);
+    await KvStore.instance.remove(_kCurrentPlanKey);
     notifyListeners();
   }
 }

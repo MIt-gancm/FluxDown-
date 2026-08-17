@@ -6,6 +6,10 @@
 [workspace]
 resolver = "3"
 members = ["native/*"]
+exclude = ["native/engine/vendor/librqbit"]
+
+[patch.crates-io]
+librqbit = { path = "native/engine/vendor/librqbit" }
 
 [profile.release]
 # 移除全部符号（含符号表），最大化减小体积

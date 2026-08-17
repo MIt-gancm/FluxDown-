@@ -57,7 +57,10 @@ class AppMenuCallbacks {
 }
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  const HomePage({super.key, required this.settingsProvider});
+
+  /// 由 [FluxDownApp] 持有并与应用级服务共享，HomePage 不负责释放。
+  final SettingsProvider settingsProvider;
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -65,7 +68,7 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final _controller = DownloadController();
-  final _settingsProvider = SettingsProvider();
+  late final SettingsProvider _settingsProvider;
   final _pluginProvider = PluginProvider();
   final _rssProvider = RssProvider();
   final _headerBarKey = GlobalKey<HeaderBarState>();
@@ -105,9 +108,9 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
+    _settingsProvider = widget.settingsProvider;
     logInfo('HomePage', 'initState');
-    // 请求 Rust 端加载下载配置
-    _settingsProvider.requestConfig();
+    // 配置请求由持有共享 SettingsProvider 的 FluxDownApp 统一发送一次。
     // 请求插件列表 + 订阅熔断器自动禁用通知（弹 toast）
     _pluginProvider.requestPlugins();
     _pluginProvider.addListener(_onPluginProviderChanged);
@@ -331,7 +334,6 @@ class _HomePageState extends State<HomePage> {
     _controller.onTaskCompleted = null;
     _controller.onSegmentsUpdateResult = null;
     _controller.dispose();
-    _settingsProvider.dispose();
     _viewPrefsStore.dispose();
     super.dispose();
     logInfo('HomePage', 'dispose done');
