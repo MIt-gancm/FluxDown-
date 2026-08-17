@@ -1077,6 +1077,18 @@ mod tests {
     }
 
     #[test]
+    fn cache_clear_host_preserves_other_hosts() {
+        let cache = DecisionCache::new();
+        cache.set("a.com", Decision::Proxy(CandidateSource::System));
+        cache.set("b.com", Decision::Cooldown);
+
+        cache.clear_host("a.com");
+
+        assert_eq!(cache.lookup("a.com"), None);
+        assert_eq!(cache.lookup("b.com"), Some(Decision::Cooldown));
+    }
+
+    #[test]
     fn cache_clones_share_state() {
         let cache = DecisionCache::new();
         let clone = cache.clone();

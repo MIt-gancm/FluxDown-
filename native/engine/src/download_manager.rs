@@ -9800,6 +9800,23 @@ mod tests {
             !mgr.auto_retry_counts.contains_key("t-auto-failover"),
             "备用链路不得消耗用户配置的通用自动重试配额"
         );
+        let (selected_proxy, route, ctx) = mgr
+            .auto_route_decision(
+                "https://example.com/release.bin",
+                "",
+                false,
+                false,
+                Some(AutoFailoverTarget::Proxy(
+                    crate::auto_proxy::CandidateSource::ManualFields,
+                )),
+            )
+            .expect("auto mode should return a route decision");
+        assert_eq!(selected_proxy.port, 7890);
+        assert_eq!(route, crate::auto_proxy::route::PROXY_FAILOVER_MANUAL);
+        assert!(
+            ctx.is_none(),
+            "forced failover must not start another probe"
+        );
     }
 
     /// BUG-BT-PHANTOM-PIECES：完成前 piece 校验失败必须可自动重试——重试
