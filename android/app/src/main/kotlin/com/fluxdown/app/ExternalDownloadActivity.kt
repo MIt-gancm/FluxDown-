@@ -48,6 +48,9 @@ class ExternalDownloadActivity : FlutterActivity() {
 
     private fun bindAndDeliver(engine: FlutterEngine) {
         FluxdownEngine.cacheIfAbsent(engine)
+        // 透明弹窗接管渲染：结束仍存活、持有已解绑 FlutterView 的 MainActivity，
+        // 避免其之后被重新打开时黑屏（共享引擎渲染面同一时刻只能挂一个 view）。
+        FluxdownEngine.releaseMainHost()
         // 外部弹窗内同样能触发存储相关操作（换目录 / 装 APK / 打开文件）。
         AppStorage.bind(engine, this)
         if (shareChannel == null) {

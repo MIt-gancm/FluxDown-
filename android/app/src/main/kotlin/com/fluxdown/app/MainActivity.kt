@@ -26,6 +26,12 @@ class MainActivity : FlutterActivity() {
             FluxdownEngine.cacheIfAbsent(engine)
             AppStorage.bind(engine, this)
         }
+        FluxdownEngine.registerMain(this)
+    }
+
+    override fun onDestroy() {
+        FluxdownEngine.clearMain(this)
+        super.onDestroy()
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
