@@ -109,6 +109,9 @@ class CloudProfile {
   final CloudUser user;
   final Entitlements entitlements;
 
+  /// 当前套餐展示快照；即使套餐已下架也由服务端返回。
+  final CloudPlan? currentPlan;
+
   /// 当前套餐的等效已付额（分）：购买更高档套餐时服务端按此抵扣；
   /// 免费/后台授予用户为 0。
   final int purchaseCreditMinor;
@@ -116,6 +119,7 @@ class CloudProfile {
   const CloudProfile({
     required this.user,
     required this.entitlements,
+    this.currentPlan,
     this.purchaseCreditMinor = 0,
   });
 
@@ -124,6 +128,9 @@ class CloudProfile {
     entitlements: Entitlements.fromJson(
       json['entitlements'] as Map<String, dynamic>?,
     ),
+    currentPlan: json['currentPlan'] is Map<String, dynamic>
+        ? CloudPlan.fromJson(json['currentPlan'] as Map<String, dynamic>)
+        : null,
     purchaseCreditMinor: (json['purchaseCreditMinor'] as num?)?.toInt() ?? 0,
   );
 }
@@ -202,6 +209,7 @@ class AuthResponse {
   final int expiresIn;
   final CloudUser user;
   final Entitlements entitlements;
+  final CloudPlan? currentPlan;
   final CloudDevice device;
 
   const AuthResponse({
@@ -210,6 +218,7 @@ class AuthResponse {
     required this.expiresIn,
     required this.user,
     required this.entitlements,
+    this.currentPlan,
     required this.device,
   });
 
@@ -221,6 +230,9 @@ class AuthResponse {
     entitlements: Entitlements.fromJson(
       json['entitlements'] as Map<String, dynamic>?,
     ),
+    currentPlan: json['currentPlan'] is Map<String, dynamic>
+        ? CloudPlan.fromJson(json['currentPlan'] as Map<String, dynamic>)
+        : null,
     device: CloudDevice.fromJson(json['device'] as Map<String, dynamic>),
   );
 }
@@ -277,6 +289,7 @@ class CloudPlanCampaignStage {
         priceMinor: (json['priceMinor'] as num?)?.toInt() ?? 0,
         quota: (json['quota'] as num?)?.toInt(),
       );
+
   /// 序列化回 wire 形态（供套餐目录本地快照落盘，与 [fromJson] 互逆）。
   Map<String, dynamic> toJson() => {
     'label': label,
@@ -322,6 +335,7 @@ class CloudPlanCampaign {
       effectivePriceMinor: (json['effectivePriceMinor'] as num?)?.toInt() ?? 0,
     );
   }
+
   /// 序列化回 wire 形态（供套餐目录本地快照落盘，与 [fromJson] 互逆）。
   Map<String, dynamic> toJson() => {
     'name': name,
@@ -336,14 +350,14 @@ class CloudPlanCampaign {
   /// 当前生效档位；[currentStageIndex] 越界（服务端数据异常）兜底 null，UI 需容错。
   CloudPlanCampaignStage? get currentStage =>
       currentStageIndex >= 0 && currentStageIndex < stages.length
-          ? stages[currentStageIndex]
-          : null;
+      ? stages[currentStageIndex]
+      : null;
 
   /// 当前档位已售；[currentStageIndex] 越界兜底 0。
   int get currentStageSold =>
       currentStageIndex >= 0 && currentStageIndex < stageSold.length
-          ? stageSold[currentStageIndex]
-          : 0;
+      ? stageSold[currentStageIndex]
+      : 0;
 }
 
 /// 上架套餐（GET /plans/catalog 响应元素，见契约 v1 CatalogPlanDto）。
@@ -420,6 +434,7 @@ class CloudPlan {
         ? CloudPlanCampaign.fromJson(json['campaign'] as Map<String, dynamic>)
         : null,
   );
+
   /// 序列化回 wire 形态（供套餐目录本地快照落盘，与 [fromJson] 互逆）。
   Map<String, dynamic> toJson() => {
     'code': code,
@@ -506,7 +521,8 @@ class CloudOrder {
     campaignName: json['campaignName'] as String?,
     stageLabel: json['stageLabel'] as String?,
     referralCode: json['referralCode'] as String?,
-    referralDiscountMinor: (json['referralDiscountMinor'] as num?)?.toInt() ?? 0,
+    referralDiscountMinor:
+        (json['referralDiscountMinor'] as num?)?.toInt() ?? 0,
     codeUrl: json['codeUrl'] as String?,
     createdAt: (json['createdAt'] as String?) ?? '',
     paidAt: json['paidAt'] as String?,
@@ -544,6 +560,16 @@ class CloudReferralRule {
         discountMinor: (json['discountMinor'] as num?)?.toInt() ?? 0,
         rewardPercent: (json['rewardPercent'] as num?)?.toInt() ?? 0,
       );
+
+  /// 序列化回 wire 形态（供推介页说明内容本地缓存落盘，stale-while-revalidate
+  /// 场景下与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'planCode': planCode,
+    'planName': planName,
+    'priceMinor': priceMinor,
+    'discountMinor': discountMinor,
+    'rewardPercent': rewardPercent,
+  };
 }
 
 /// GET /referral/summary 响应：推介有奖总览——收益统计 + 说明文案 + 规则表。
@@ -590,6 +616,20 @@ class CloudReferralSummary {
             .map((e) => CloudReferralRule.fromJson(e as Map<String, dynamic>))
             .toList(),
       );
+
+  /// 序列化回 wire 形态（供推介页说明内容本地缓存落盘：先展示缓存、后台静默
+  /// 刷新，与 [fromJson] 互逆）。
+  Map<String, dynamic> toJson() => {
+    'enabled': enabled,
+    'description': description,
+    'rewardEnabled': rewardEnabled,
+    'contact': contact,
+    'invitedCount': invitedCount,
+    'pendingRewardMinor': pendingRewardMinor,
+    'paidRewardMinor': paidRewardMinor,
+    'totalRewardMinor': totalRewardMinor,
+    'rules': [for (final r in rules) r.toJson()],
+  };
 }
 
 /// GET/POST /referral/codes 响应单条：一个可自定义或随机生成的推荐码及其统计。
@@ -694,15 +734,14 @@ class CloudReferralRecordsResult {
       CloudReferralRecordsResult(
         total: (json['total'] as num?)?.toInt() ?? 0,
         items: (json['items'] as List<dynamic>? ?? const [])
-            .map(
-              (e) => CloudReferralRecord.fromJson(e as Map<String, dynamic>),
-            )
+            .map((e) => CloudReferralRecord.fromJson(e as Map<String, dynamic>))
             .toList(),
       );
 }
 
 /// GET /referral/validate 响应：下单前预校验推荐码是否可用。[reason] 仅在
-/// [valid]=false 时非空，取值 feature_disabled | not_found | self_use | no_discount。
+/// [valid]=false 时非空，取值 feature_disabled | plan_excluded | not_found |
+/// self_use | already_used | no_discount。
 class CloudReferralValidateResult {
   final bool valid;
   final int discountMinor;
@@ -910,10 +949,11 @@ class CdnResolverEntry {
 
   const CdnResolverEntry({required this.url, required this.ecs});
 
-  factory CdnResolverEntry.fromJson(Map<String, dynamic> json) => CdnResolverEntry(
-    url: json['url'] as String? ?? '',
-    ecs: json['ecs'] as bool? ?? false,
-  );
+  factory CdnResolverEntry.fromJson(Map<String, dynamic> json) =>
+      CdnResolverEntry(
+        url: json['url'] as String? ?? '',
+        ecs: json['ecs'] as bool? ?? false,
+      );
 }
 
 /// CDN 聚合下载云端 ECS 子网先验（GET /cdn/config 响应 ecs_subnets[]，P2 新增）：
@@ -924,13 +964,18 @@ class CdnEcsSubnetEntry {
   final String isp;
   final String subnet;
 
-  const CdnEcsSubnetEntry({required this.region, required this.isp, required this.subnet});
+  const CdnEcsSubnetEntry({
+    required this.region,
+    required this.isp,
+    required this.subnet,
+  });
 
-  factory CdnEcsSubnetEntry.fromJson(Map<String, dynamic> json) => CdnEcsSubnetEntry(
-    region: json['region'] as String? ?? '',
-    isp: json['isp'] as String? ?? '',
-    subnet: json['subnet'] as String? ?? '',
-  );
+  factory CdnEcsSubnetEntry.fromJson(Map<String, dynamic> json) =>
+      CdnEcsSubnetEntry(
+        region: json['region'] as String? ?? '',
+        isp: json['isp'] as String? ?? '',
+        subnet: json['subnet'] as String? ?? '',
+      );
 }
 
 /// GET /cdn/config 响应（P1 §四 + P2 §五契约）：CDN 多节点聚合下载云端配置快照。
@@ -973,5 +1018,8 @@ class CdnConfigResult {
 
   const CdnConfigResult({this.etag, this.config}) : notModified = false;
 
-  const CdnConfigResult.notModified() : etag = null, config = null, notModified = true;
+  const CdnConfigResult.notModified()
+    : etag = null,
+      config = null,
+      notModified = true;
 }

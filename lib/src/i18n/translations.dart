@@ -554,6 +554,8 @@ class S {
   String get accountFeatureMultiDevice => _r('accountFeatureMultiDevice');
   String get accountFeatureMultiDeviceDesc =>
       _r('accountFeatureMultiDeviceDesc');
+  String get accountFeatureReferral => _r('accountFeatureReferral');
+  String get accountFeatureReferralDesc => _r('accountFeatureReferralDesc');
   String get accountLoginDialogTitle => _r('accountLoginDialogTitle');
   String get accountLoginTabCode => _r('accountLoginTabCode');
   String get accountLoginTabPassword => _r('accountLoginTabPassword');
@@ -700,6 +702,8 @@ class S {
       _r('accountPlanErrorReferralNotFound');
   String get accountPlanErrorReferralAlreadyUsed =>
       _r('accountPlanErrorReferralAlreadyUsed');
+  String get accountPlanErrorReferralPlanExcluded =>
+      _r('accountPlanErrorReferralPlanExcluded');
   String get accountOriginIdEditTooltip => _r('accountOriginIdEditTooltip');
   String get accountOriginIdEditTitle => _r('accountOriginIdEditTitle');
   String get accountOriginIdEditDesc => _r('accountOriginIdEditDesc');

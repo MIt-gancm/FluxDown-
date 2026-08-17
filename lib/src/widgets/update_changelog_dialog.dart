@@ -140,6 +140,30 @@ class _ChangelogDialogContent extends StatelessWidget {
 }
 
 // ─────────────────────────────────────────────
+// Bilingual release body
+// ─────────────────────────────────────────────
+
+/// 双语 release body 的语言标记（由 release 工作流翻译步骤写入），
+/// 与官网 ChangelogSection.tsx 的解析契约一致。
+final _langMarkerRe = RegExp(r'<!--\s*fluxdown:lang:(zh|en)\s*-->');
+
+/// 从双语 release body 中取出当前语言区块。
+/// 无标记（历史版本 / 翻译失败回退）时原样返回全文。
+String pickLocaleBody(String body, String locale) {
+  final matches = _langMarkerRe.allMatches(body).toList();
+  if (matches.isEmpty) return body;
+
+  final sections = <String, String>{};
+  for (var i = 0; i < matches.length; i++) {
+    final start = matches[i].end;
+    final end = i + 1 < matches.length ? matches[i + 1].start : body.length;
+    sections[matches[i].group(1)!] = body.substring(start, end).trim();
+  }
+  final lang = locale.startsWith('zh') ? 'zh' : 'en';
+  return sections[lang] ?? sections['zh'] ?? body;
+}
+
+// ─────────────────────────────────────────────
 // Single release entry
 // ─────────────────────────────────────────────
 
@@ -227,7 +251,9 @@ class _ReleaseEntry extends StatelessWidget {
               const SizedBox(height: 8),
               // Markdown body
               if (release.body.isNotEmpty)
-                MarkdownBody(markdown: release.body),
+                MarkdownBody(
+                  markdown: pickLocaleBody(release.body, currentLocale),
+                ),
             ],
           ),
         ),

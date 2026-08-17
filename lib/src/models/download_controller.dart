@@ -26,6 +26,7 @@ class DownloadController extends ChangeNotifier {
   static DownloadController? globalInstance;
   final List<DownloadTask> _tasks = [];
   String? _selectedTaskId;
+
   /// 当前选中的任务组 ID（与 [_selectedTaskId] 互斥，见 [selectGroup]/
   /// [selectTask]）。
   String? _selectedGroupId;
@@ -313,8 +314,7 @@ class DownloadController extends ChangeNotifier {
         byCategory.where((t) => t.status == TaskStatus.paused).toList(),
       StatusTab.error =>
         byCategory.where((t) => t.status == TaskStatus.error).toList(),
-      StatusTab.seeding =>
-        byCategory.where((t) => t.isSeeding).toList(),
+      StatusTab.seeding => byCategory.where((t) => t.isSeeding).toList(),
     };
     _cachedFilteredTasks = result;
     return result;
@@ -456,9 +456,7 @@ class DownloadController extends ChangeNotifier {
   /// 开启时恒为 0）。
   int hiddenCompletedCount(ViewPrefs prefs) {
     if (prefs.showCompleted) return 0;
-    return filteredTasks
-        .where((t) => t.status == TaskStatus.completed)
-        .length;
+    return filteredTasks.where((t) => t.status == TaskStatus.completed).length;
   }
 
   /// 当前视图下可见实体的「展开」计数（组按成员数计；本波无组，等价于
@@ -469,8 +467,9 @@ class DownloadController extends ChangeNotifier {
       for (final e in section.entities) {
         // 组展开产出的成员/目录行已经由其所属 GroupEntity 计入一次。
         if (e is GroupMemberEntity || e is GroupDirEntity) continue;
-        count +=
-            e is GroupEntity ? (e.members.isEmpty ? 1 : e.members.length) : 1;
+        count += e is GroupEntity
+            ? (e.members.isEmpty ? 1 : e.members.length)
+            : 1;
       }
     }
     return count;
@@ -1467,7 +1466,8 @@ class DownloadController extends ChangeNotifier {
     final candidates = <String>[];
     for (int i = 0; i < _tasks.length; i++) {
       final t = _tasks[i];
-      final isPausedSeeder = t.status == TaskStatus.completed &&
+      final isPausedSeeder =
+          t.status == TaskStatus.completed &&
           t.seedingStatus == SeedingStatus.userStopped;
       if (t.status == TaskStatus.paused ||
           t.status == TaskStatus.error ||
@@ -1896,7 +1896,8 @@ class DownloadController extends ChangeNotifier {
       var task = DownloadTask(
         id: p.taskId,
         url: p.url,
-        fileName: p.fileName.isEmpty ? currentS.unknownFile : p.fileName,
+        fileName:
+            p.fileName.isEmpty ? placeholderTaskName(p.url) : p.fileName,
         saveDir: p.saveDir,
         status: newStatus,
         downloadedBytes: p.downloadedBytes,
@@ -2204,6 +2205,46 @@ class DownloadController extends ChangeNotifier {
     if (changed) _safeNotifyListeners();
   }
 
+  /// 待处理的「列表定位」请求：由 [revealTask] 写入、TaskList 在 build 中
+  /// 经 [takePendingRevealTask] 消费一次（消费即清——相比 epoch 记账，
+  /// 天然免疫 TaskList 因 RSS 视图切换重挂载导致的请求丢失/重放）。
+  String? _pendingRevealTaskId;
+
+  /// TaskList 专用：取走并清空待定位任务 id（无请求返回 null）。
+  String? takePendingRevealTask() {
+    final id = _pendingRevealTaskId;
+    _pendingRevealTaskId = null;
+    return id;
+  }
+
+  /// 搜索结果 / RSS 条目流直达任务：逐维放宽筛选（状态页签 → 分类 →
+  /// 队列，能不动就不动）保证任务在当前组合下可见；组成员任务展开所属
+  /// 组与目录；最后选中并挂起定位请求——TaskList 消费请求执行滚动定位
+  /// （「显示已完成」是视图层开关，由 TaskList 侧补齐）。
+  void revealTask(String taskId) {
+    DownloadTask? task;
+    for (final t in _tasks) {
+      if (t.id == taskId) {
+        task = t;
+        break;
+      }
+    }
+    if (task == null) return;
+
+    bool hidden() => !filteredTasks.any((t) => t.id == taskId);
+    if (hidden()) setStatusTab(StatusTab.all);
+    if (hidden()) setCategoryFilter(FileCategory.all); // 同时清掉自定义分类
+    // 队列维度只在分区激活（非 null）时切到任务所属队列——保持「分区
+    // 可见则恒有一个激活项」的侧边栏纪律（见 syncSidebarFilters）。
+    if (hidden() && _queueFilter != null && _queueFilter != task.queueId) {
+      setQueueFilter(task.queueId);
+    }
+    if (task.groupId.isNotEmpty) revealGroupMember(task.groupId, taskId);
+    selectTask(taskId);
+    _pendingRevealTaskId = taskId;
+    _safeNotifyListeners();
+  }
+
   /// 按聚合态二选一（design-proto-spec §8 组右键菜单 / §13 Space 键）：
   /// 任一成员活跃/排队则全部暂停，否则全部恢复。
   void toggleGroupPauseResume(String groupId) {
@@ -2439,7 +2480,8 @@ List<ListSection> bucketEntitiesByStatus(List<ListEntity> entities) {
   final buckets = <TaskStatus, List<ListEntity>>{};
   for (final e in entities) {
     final bucket =
-        _isActiveOrQueued(e.statusBucket) && e.statusBucket != TaskStatus.pending
+        _isActiveOrQueued(e.statusBucket) &&
+            e.statusBucket != TaskStatus.pending
         ? TaskStatus.downloading
         : e.statusBucket;
     (buckets[bucket] ??= []).add(e);
@@ -2489,7 +2531,11 @@ List<ListSection> bucketEntitiesByQueue(
   final defaultBucket = buckets[''];
   if (defaultBucket != null && defaultBucket.isNotEmpty) {
     sections.add(
-      ListSection(key: 'queue:', title: s.ungroupedTasks, entities: defaultBucket),
+      ListSection(
+        key: 'queue:',
+        title: s.ungroupedTasks,
+        entities: defaultBucket,
+      ),
     );
   }
   for (final q in queues) {
@@ -2555,7 +2601,9 @@ int compareEntitiesSmart(ListEntity a, ListEntity b) {
   };
   final diff = tier(a.statusBucket) - tier(b.statusBucket);
   if (diff != 0) return diff;
-  if (a.statusBucket == TaskStatus.pending && a is TaskEntity && b is TaskEntity) {
+  if (a.statusBucket == TaskStatus.pending &&
+      a is TaskEntity &&
+      b is TaskEntity) {
     return a.task.queuePosition.compareTo(b.task.queuePosition);
   }
   return a.createdAt.compareTo(b.createdAt);

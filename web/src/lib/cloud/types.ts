@@ -57,6 +57,8 @@ export interface AuthResponse {
   expiresIn: number
   user: CloudUser
   entitlements: Entitlements
+  /** 当前套餐展示快照；套餐下架后仍返回。 */
+  currentPlan?: CatalogPlan | null
   device: CloudDevice
 }
 
@@ -68,6 +70,8 @@ export type LoginResult =
 /** GET /me 响应：UserDto 字段打平 + entitlements。 */
 export interface CloudProfile extends CloudUser {
   entitlements: Entitlements
+  /** 当前套餐展示快照；套餐下架后仍返回。 */
+  currentPlan?: CatalogPlan | null
 }
 
 /** GET /me/origin-id/random 响应：套餐允许时给出的建议 Origin ID(倾向"豹子号"，不锁定)。 */
@@ -179,8 +183,8 @@ export interface CdnConfigResult {
   config: CdnConfig | null
 }
 
-/** GET /referral/summary 响应 rules[]：仅含 enabled 且 price_minor>0 的套餐(按解析后的
- *  生效值，override 已回落 default)。 */
+/** GET /referral/summary 响应 rules[]：仅含 enabled、price_minor>0 且参与推介返利的
+ *  套餐(按解析后的生效值，override 已回落 default；被覆盖档排除的套餐不下发)。 */
 export interface ReferralRule {
   planCode: string
   planName: string

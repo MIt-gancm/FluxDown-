@@ -63,6 +63,41 @@ void main() {
     expect(campaign.stageSold, [42, 0]);
   });
 
+  test('用户资料保留下架当前套餐的徽标展示快照', () {
+    const currentPlan = {
+      'code': 'legacy',
+      'name': '典藏套餐',
+      'description': '已下架但仍归属用户',
+      'badge': '典藏会员',
+      'icon': 'crown',
+      'color': '#6d28d9',
+      'badgeStyle': 'medal',
+      'badgeColor': '#7c3aed',
+      'badgeNumbered': true,
+      'badgeNumberDigits': 5,
+    };
+    const profileWire = {
+      'id': 'u1',
+      'email': 'u1@example.com',
+      'nickname': '用户',
+      'plan': 'legacy',
+      'status': 'active',
+      'createdAt': '2026-08-16T00:00:00Z',
+      'entitlements': <String, dynamic>{},
+      'currentPlan': currentPlan,
+    };
+
+    final profile = CloudProfile.fromJson(profileWire);
+
+    expect(profile.currentPlan?.code, profile.user.plan);
+    expect(profile.currentPlan?.name, '典藏套餐');
+    expect(profile.currentPlan?.badge, '典藏会员');
+    expect(profile.currentPlan?.badgeStyle, 'medal');
+    expect(profile.currentPlan?.badgeColor, '#7c3aed');
+    expect(profile.currentPlan?.badgeNumbered, isTrue);
+    expect(profile.currentPlan?.badgeNumberDigits, 5);
+  });
+
   test('无 campaign / 无徽标的免费档快照往返后 badge 保持 null', () {
     const wire = {'code': 'free', 'name': '免费版'};
     final restored = CloudPlan.fromJson(

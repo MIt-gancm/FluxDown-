@@ -691,7 +691,56 @@ fn reconnect_and_resend(
 // Main loop
 // ---------------------------------------------------------------------------
 
+/// Answer for a direct command-line invocation (bare argv or
+/// `--help`/`--version`); `None` when launched by a browser.
+#[derive(Debug, PartialEq, Eq)]
+enum CliAction {
+    Version,
+    Help,
+}
+
+/// Classify a direct command-line invocation (`args` = argv without the
+/// program name).
+///
+/// Package-manager validation pipelines (winget's installer validation runs
+/// every installed exe with `--help`/`--version`) and curious humans expect a
+/// prompt exit; the relay loop would otherwise block forever reading console
+/// stdin. A browser launch always passes at least one positional argument
+/// (Chrome/Edge: the extension origin; Firefox: manifest path + extension
+/// id; the Linux/macOS wrapper script forwards `"$@"`), so an empty argv is
+/// also treated as a human invocation.
+fn classify_cli_invocation<S: AsRef<str>>(args: &[S]) -> Option<CliAction> {
+    if args.iter().any(|a| matches!(a.as_ref(), "--version" | "-V")) {
+        return Some(CliAction::Version);
+    }
+    if args.is_empty() || args.iter().any(|a| matches!(a.as_ref(), "--help" | "-h")) {
+        return Some(CliAction::Help);
+    }
+    None
+}
+
 fn main() {
+    let cli_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(action) = classify_cli_invocation(&cli_args) {
+        match action {
+            CliAction::Version => println!("fluxdown_nmh {}", env!("CARGO_PKG_VERSION")),
+            CliAction::Help => println!(
+                "fluxdown_nmh {} — FluxDown Native Messaging Host\n\
+                 \n\
+                 Relays messages between a browser extension (stdin/stdout)\n\
+                 and the FluxDown app (named pipe / unix socket). Launched\n\
+                 by the browser via Native Messaging; not meant to be run\n\
+                 directly.\n\
+                 \n\
+                 Options:\n\
+                 \x20 -h, --help       Show this help and exit\n\
+                 \x20 -V, --version    Show version and exit",
+                env!("CARGO_PKG_VERSION")
+            ),
+        }
+        return;
+    }
+
     log("NMH started");
 
     let mut pipe: Option<pipe::PipeHandle> = None;
@@ -788,5 +837,39 @@ mod tests {
                 "{action} must still auto-launch the App"
             );
         }
+    }
+
+    #[test]
+    fn cli_invocation_exits_for_bare_help_and_version() {
+        assert_eq!(classify_cli_invocation::<&str>(&[]), Some(CliAction::Help));
+        assert_eq!(classify_cli_invocation(&["--help"]), Some(CliAction::Help));
+        assert_eq!(classify_cli_invocation(&["-h"]), Some(CliAction::Help));
+        assert_eq!(
+            classify_cli_invocation(&["--version"]),
+            Some(CliAction::Version)
+        );
+        assert_eq!(classify_cli_invocation(&["-V"]), Some(CliAction::Version));
+    }
+
+    #[test]
+    fn cli_invocation_falls_through_for_browser_launch_args() {
+        // Chrome/Edge pass the extension origin (plus --parent-window on
+        // Windows); Firefox passes the manifest path and extension id. All
+        // must reach the relay loop.
+        assert_eq!(
+            classify_cli_invocation(&["chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/"]),
+            None
+        );
+        assert_eq!(
+            classify_cli_invocation(&[
+                "chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/",
+                "--parent-window=12345"
+            ]),
+            None
+        );
+        assert_eq!(
+            classify_cli_invocation(&["/path/to/com.fluxdown.nmh.json", "fluxdown@zerx.dev"]),
+            None
+        );
     }
 }

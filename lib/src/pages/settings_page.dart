@@ -651,11 +651,8 @@ class _SettingsPageState extends State<SettingsPage> {
     final hl = widget.initialHighlight;
     _selected =
         hl?.category ?? widget.initialCategory ?? SettingsCategory.general;
-    // 「推介有奖」分类仅登录后可见，防御性兜底：初始态若落在该分类但未登录
-    // （理论上不会发生，调用方按登录态选择初始分类），回退到通用设置。
-    if (_selected == SettingsCategory.referral &&
-        !CloudAuthService.instance.isLoggedIn) {
-      _selected = SettingsCategory.general;
+    if (_selected == SettingsCategory.referral && !_referralAvailable) {
+      _selected = SettingsCategory.account;
     }
     if (hl != null) {
       _highlight = SettingsHighlightRequest(
@@ -665,31 +662,42 @@ class _SettingsPageState extends State<SettingsPage> {
       );
     }
     CloudAuthService.instance.addListener(_onAuthChanged);
+    widget.settingsProvider.addListener(_onReferralAvailabilityChanged);
   }
 
   @override
   void dispose() {
     CloudAuthService.instance.removeListener(_onAuthChanged);
+    widget.settingsProvider.removeListener(_onReferralAvailabilityChanged);
     super.dispose();
   }
 
-  /// 登出时若正停留在「推介有奖」分类（该分类登出后从侧边栏隐藏），
-  /// 自动回退到通用设置，避免内容区停留在已不可达的分类上。
-  void _onAuthChanged() {
-    if (_selected == SettingsCategory.referral &&
-        !CloudAuthService.instance.isLoggedIn) {
-      setState(() => _selected = SettingsCategory.general);
+  bool get _referralAvailable =>
+      CloudAuthService.instance.isLoggedIn &&
+      widget.settingsProvider.referralFeatureEnabled;
+
+  void _onAuthChanged() => _ensureReferralAvailable();
+
+  void _onReferralAvailabilityChanged() => _ensureReferralAvailable();
+
+  void _ensureReferralAvailable() {
+    if (_selected == SettingsCategory.referral && !_referralAvailable) {
+      setState(() => _selected = SettingsCategory.account);
     }
   }
 
   /// 切换当前选中分类：侧边栏点击、搜索跳转、页内跳转（如资料卡「推介有奖」
   /// 按钮）共用。
   void _selectCategory(SettingsCategory category) {
+    if (category == SettingsCategory.referral && !_referralAvailable) return;
     setState(() => _selected = category);
   }
 
   /// 搜索结果选中：切换分类并下发高亮请求。
   void _onSearchSelect(SettingsSearchItem item) {
+    if (item.category == SettingsCategory.referral && !_referralAvailable) {
+      return;
+    }
     setState(() {
       _selected = item.category;
       _highlight = SettingsHighlightRequest(
@@ -823,6 +831,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     selected: _selected,
                     onSelect: _selectCategory,
                     onSearchSelect: _onSearchSelect,
+                    settingsProvider: widget.settingsProvider,
                   ),
                   // 右侧内容区
                   Expanded(
@@ -940,11 +949,13 @@ class _SidebarResizeHandleState extends State<_SidebarResizeHandle> {
 class _SettingsSidebar extends StatefulWidget {
   final double width;
   final SettingsCategory selected;
+  final SettingsProvider settingsProvider;
   final ValueChanged<SettingsCategory> onSelect;
   final ValueChanged<SettingsSearchItem> onSearchSelect;
 
   const _SettingsSidebar({
     required this.width,
+    required this.settingsProvider,
     required this.selected,
     required this.onSelect,
     required this.onSearchSelect,
@@ -1086,21 +1097,27 @@ class _SettingsSidebarState extends State<_SettingsSidebar> {
             Expanded(
               child: ListenableBuilder(
                 listenable: CloudAuthService.instance,
-                builder: (context, _) {
-                  final loggedIn = CloudAuthService.instance.isLoggedIn;
-                  return ListView(
-                    children: [
-                      for (final cat in SettingsCategory.values)
-                        if (cat != SettingsCategory.referral || loggedIn)
-                          _SettingsNavItem(
-                            icon: cat.icon,
-                            label: cat.localizedLabel,
-                            isSelected: widget.selected == cat,
-                            onTap: () => widget.onSelect(cat),
-                          ),
-                    ],
-                  );
-                },
+                builder: (context, _) => ListenableBuilder(
+                  listenable: widget.settingsProvider,
+                  builder: (context, _) {
+                    final showReferral =
+                        CloudAuthService.instance.isLoggedIn &&
+                        widget.settingsProvider.referralFeatureEnabled;
+                    return ListView(
+                      children: [
+                        for (final cat in SettingsCategory.values)
+                          if (cat != SettingsCategory.referral || showReferral)
+                            _SettingsNavItem(
+                              key: ValueKey('settings-nav-${cat.name}'),
+                              icon: cat.icon,
+                              label: cat.localizedLabel,
+                              isSelected: widget.selected == cat,
+                              onTap: () => widget.onSelect(cat),
+                            ),
+                      ],
+                    );
+                  },
+                ),
               ),
             ),
         ],
@@ -1182,6 +1199,7 @@ class _SettingsNavItem extends StatefulWidget {
   final VoidCallback onTap;
 
   const _SettingsNavItem({
+    super.key,
     required this.icon,
     required this.label,
     required this.isSelected,
@@ -11507,8 +11525,11 @@ class _AccountContentState extends State<_AccountContent> {
     }
   }
 
-  /// 按套餐 code 查找目录中的 [CloudPlan]；未加载完成或未匹配到时返回 null。
+  /// 按套餐 code 查找展示快照。当前用户套餐优先使用 `/me` 返回的快照，因此套餐
+  /// 下架后仍保留徽标、颜色和名称；其他套餐继续来自仅含上架项的公开目录。
   CloudPlan? _planForCode(String code) {
+    final current = CloudAuthService.instance.currentPlan;
+    if (current?.code == code) return current;
     for (final p in _catalogPlans) {
       if (p.code == code) return p;
     }
@@ -11708,6 +11729,8 @@ class _AccountContentState extends State<_AccountContent> {
                       _configSyncRow(context),
                       _accountDivider(context),
                       _multiDeviceRow(context),
+                      _accountDivider(context),
+                      _referralFeatureRow(context, widget.settingsProvider),
                     ],
                   ),
                 ),
@@ -12126,6 +12149,63 @@ Widget _accountDivider(BuildContext context) {
   );
 }
 
+Widget _referralFeatureRow(
+  BuildContext context,
+  SettingsProvider settingsProvider,
+) {
+  return ListenableBuilder(
+    listenable: settingsProvider,
+    builder: (context, _) {
+      final s = LocaleScope.of(context);
+      final c = AppColors.of(context);
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Container(
+              width: 30,
+              height: 30,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: c.surface2,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(LucideIcons.gift, size: 15, color: c.textSecondary),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    s.accountFeatureReferral,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: c.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    s.accountFeatureReferralDesc,
+                    style: TextStyle(fontSize: 11.5, color: c.textMuted),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            ShadSwitch(
+              key: const ValueKey('referral-feature-switch'),
+              value: settingsProvider.referralFeatureEnabled,
+              onChanged: settingsProvider.setReferralFeatureEnabled,
+            ),
+          ],
+        ),
+      );
+    },
+  );
+}
+
 /// 多设备协同状态行：无独立开关，登录云账户后自动可用；已登录时用徽标展示当前
 /// 在线设备数（含本机），未登录时仅展示功能说明，设备列表见上方「设备协同」卡片。
 Widget _multiDeviceRow(BuildContext context) {
@@ -12372,6 +12452,7 @@ String _cloudErrorText(S s, CloudApiException e) => switch (e.code) {
   'referral_code_invalid' => s.accountPlanErrorReferralInvalid,
   'referral_self_use' => s.accountPlanErrorReferralSelfUse,
   'referral_already_used' => s.accountPlanErrorReferralAlreadyUsed,
+  'referral_plan_excluded' => s.accountPlanErrorReferralPlanExcluded,
   'referral_code_taken' => s.accountReferralCodeTaken,
   'origin_id_taken' => s.accountOriginIdErrorTaken,
   'origin_id_already_changed' => s.accountOriginIdErrorAlreadyChanged,
@@ -12651,6 +12732,7 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
               'self_use' => s.accountPlanErrorReferralSelfUse,
               'already_used' => s.accountPlanErrorReferralAlreadyUsed,
               'not_found' => s.accountPlanErrorReferralNotFound,
+              'plan_excluded' => s.accountPlanErrorReferralPlanExcluded,
               _ => s.accountPlanErrorReferralInvalid,
             };
           });
@@ -13029,6 +13111,11 @@ class _ReferralGate extends StatefulWidget {
   State<_ReferralGate> createState() => _ReferralGateState();
 }
 
+/// 「说明」子 Tab 的推介总览本地缓存键：冷启动先渲染上次快照，后台静默刷新
+/// （stale-while-revalidate），避免每次进入子 Tab 都先转圈。缓存按 userId
+/// 校验，跨账号切换不会串读旧数据。
+const _kReferralSummaryCacheKey = 'referral_summary_cache';
+
 class _ReferralGateState extends State<_ReferralGate> {
   bool _loading = true;
   String? _error;
@@ -13037,14 +13124,34 @@ class _ReferralGateState extends State<_ReferralGate> {
   @override
   void initState() {
     super.initState();
+    final userId = CloudAuthService.instance.user?.id;
+    final cached = userId == null
+        ? null
+        : KvStore.instance.getString(_kReferralSummaryCacheKey);
+    if (cached != null) {
+      try {
+        final decoded = jsonDecode(cached) as Map<String, dynamic>;
+        if (decoded['userId'] == userId) {
+          _summary = CloudReferralSummary.fromJson(
+            decoded['summary'] as Map<String, dynamic>,
+          );
+          _loading = false;
+        }
+      } catch (_) {
+        // 缓存损坏/格式不符：当作无缓存，走正常网络加载流程。
+      }
+    }
     unawaited(_load());
   }
 
   Future<void> _load() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    final hasCache = _summary != null;
+    if (!hasCache) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
     try {
       final summary = await CloudClient.instance.getReferralSummary();
       if (!mounted) return;
@@ -13052,14 +13159,31 @@ class _ReferralGateState extends State<_ReferralGate> {
         _summary = summary;
         _loading = false;
       });
+      final userId = CloudAuthService.instance.user?.id;
+      if (userId != null) {
+        unawaited(
+          KvStore.instance.setString(
+            _kReferralSummaryCacheKey,
+            jsonEncode({'userId': userId, 'summary': summary.toJson()}),
+          ),
+        );
+      }
     } on CloudApiException catch (e) {
       if (!mounted) return;
+      if (hasCache) {
+        setState(() => _loading = false);
+        return;
+      }
       setState(() {
         _loading = false;
         _error = _cloudErrorText(currentS, e);
       });
     } catch (e) {
       if (!mounted) return;
+      if (hasCache) {
+        setState(() => _loading = false);
+        return;
+      }
       setState(() {
         _loading = false;
         _error = e.toString();
