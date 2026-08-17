@@ -1,13 +1,13 @@
-//! `ProxyMode::Auto`——「直连优先，慢则采样，快则热切换」的决策机器。
+//! `ProxyMode::Auto`——「直连起飞，后台比较，择快切换」的决策机器。
 //!
 //! # 设计（成本递增阶梯）
 //!
-//! Auto 模式下任务一律**直连启动**（速度正常的任务零探测、零额外流量，
-//! 且直连态保留多 CDN 聚合资格——这是相对 System 模式的核心收益：System
-//! 模式会把全部任务的 CDN 聚合一刀切禁用）。仅当任务运行一段时间后仍然
-//! 慢（见 [`AutoSwitchState`] 的守卫清单），才经候选代理拉 256KB 采样；
-//! 代理单连接吞吐 ≥ 2× 直连单连接均速才热切换（[`NodePool`] 换 SYS
-//! client，新分段自然走代理，已下字节零丢弃）。
+//! Auto 模式下任务一律**直连启动**（零启动阻塞，且直连态保留多 CDN 聚合
+//! 资格——这是相对 System 模式的核心收益）。任务越过 coordinator 爬升期
+//! 且仍有足够数据时，经候选代理拉 256KB 样本；代理单连接吞吐 ≥ 2× 直连
+//! 单连接均速才热切换（[`NodePool`] 换 SYS client，新分段自然走代理，
+//! 已下字节零丢弃）。比较采用相同的单连接量纲，不以直连总吞吐作前置
+//! 否决——多分段总速会掩盖每条连接都很慢的 GitHub release 等场景。
 //!
 //! # 决策缓存（两层，风险不对称）
 //!
@@ -50,20 +50,16 @@ use crate::proxy_config::{ProxyConfig, ProxyMode, detect_system_proxy};
 // 常量（刻意不做设置项：没有证据表明用户需要调它们）
 // ---------------------------------------------------------------------------
 
-/// 任务须运行满该时长才允许采样——排除 coordinator 爬升期的假慢。
-const MIN_RUNTIME: Duration = Duration::from_secs(10);
+/// 任务须运行满该时长才允许采样——跨过 coordinator 3 个完整 ramp tick
+/// （2s/tick），避免爬升期的假慢。
+const MIN_RUNTIME: Duration = Duration::from_secs(6);
 
-/// 持久化先验记录该 host 有代理胜绩时的采样等待期（加速重评估；起飞
-/// 路由不变）。下限须跨过 coordinator 至少 3 个完整 ramp tick（2s/tick，
-/// 起步 2 连接逐档爬升）——再短会把爬升期的假慢当证据，系统性偏置
-/// AdoptProxy 的确认计分。
-const FAST_REEVAL_MIN_RUNTIME: Duration = Duration::from_secs(6);
-
-/// 「慢」的绝对阈值（字节/秒）。总吞吐低于它才考虑采样。
-const SLOW_BPS: f64 = 512.0 * 1024.0;
+/// 持久化先验记录该 host 有代理胜绩时的采样等待期。已有实证允许提前一个
+/// ramp tick 重评估；2× 胜出滞回仍负责挡住临界误切。
+const FAST_REEVAL_MIN_RUNTIME: Duration = Duration::from_secs(4);
 
 /// 剩余字节低于此值不采样——小尾巴切换收益覆盖不了探测成本。
-const MIN_REMAINING_BYTES: i64 = 8 * 1024 * 1024;
+const MIN_REMAINING_BYTES: i64 = 4 * 1024 * 1024;
 
 /// 代理须达到直连单连接均速的倍数才切换（滞回，防临界震荡）。
 const ADVANTAGE_RATIO: f64 = 2.0;
@@ -102,11 +98,13 @@ pub mod route {
     pub const DIRECT_SAMPLED: &str = "direct:sampled";
     /// 采样发现 validator 不一致，拒绝切换（完整性优先）。
     pub const DIRECT_PINNED: &str = "direct:pinned";
+    /// 代理失败后自动回退直连。
+    pub const DIRECT_FAILOVER: &str = "direct:failover";
     /// 本任务采样后热切换到代理。
     pub const PROXY_SAMPLED: &str = "proxy:sampled";
     /// 启动时采纳了缓存的域名级代理决策。
     pub const PROXY_CACHED: &str = "proxy:cached";
-    /// 直连失败后经代理自动重试（failover）。
+    /// 直连失败后经代理自动换路重试。
     pub const PROXY_FAILOVER: &str = "proxy:failover";
     /// 带来源后缀的代理标签（base × {system,manual}，全部静态）。
     pub const PROXY_SAMPLED_SYSTEM: &str = "proxy:sampled:system";
@@ -260,9 +258,11 @@ pub struct AutoProxyCtx {
     pub user_agent: String,
     /// 候选代理来源（决定切换后 wire 标签的 `:system`/`:manual` 后缀）。
     pub source: CandidateSource,
-    /// 持久化先验有该 host 的代理胜绩——缩短采样等待期（见
-    /// [`FAST_REEVAL_MIN_RUNTIME`]）。
+    /// 持久化先验有该 host 的代理胜绩——缩短采样等待期。
     pub fast_reeval: bool,
+    /// 任务已有局部数据时必须实际采样并核对 validator，不能直接采纳
+    /// 兄弟任务写入的代理租约。
+    pub require_validation: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,13 +389,12 @@ fn probe_transfer_bps(received: u64, first_chunk_len: u64, body_secs: f64, total
 
 /// 采样守卫：全部满足才允许发起采样。
 /// `min_runtime` = 本任务的采样等待期（先验加速时缩短）；`runtime` =
-/// 任务本次 spawn 已运行时长；`throughput_bps` = 最近窗口总吞吐；
-/// `alive` = 活跃连接数；`remaining` = 剩余字节。
-#[allow(clippy::too_many_arguments)]
+/// 任务本次 spawn 已运行时长；`alive` = 活跃连接数；`remaining` =
+/// 剩余字节。吞吐不在守卫里：Auto 比较的是代理与直连的**相对**性能，
+/// 直连多连接总吞吐高不代表代理没有显著优势。
 fn should_probe(
     min_runtime: Duration,
     runtime: Duration,
-    throughput_bps: f64,
     alive: usize,
     remaining_bytes: i64,
     limiter_active: bool,
@@ -403,7 +402,6 @@ fn should_probe(
 ) -> bool {
     runtime >= min_runtime
         && alive > 0
-        && throughput_bps < SLOW_BPS
         && remaining_bytes >= MIN_REMAINING_BYTES
         && !limiter_active
         && !conn_sensitive
@@ -496,7 +494,6 @@ impl AutoSwitchState {
                 if !should_probe(
                     min_runtime,
                     self.started.elapsed(),
-                    obs.throughput_bps,
                     obs.alive,
                     obs.remaining_bytes,
                     obs.limiter_active,
@@ -504,23 +501,22 @@ impl AutoSwitchState {
                 ) {
                     return;
                 }
-                // 缓存短路：兄弟任务已给出该 host 的决策。
+                // 缓存短路：兄弟任务已给出该 host 的决策。局部续传必须
+                // 重新采样 validator，不能仅凭 host 级租约直接换 edge。
                 match self.ctx.cache.lookup(&self.ctx.host) {
-                    Some(Decision::Proxy) => {
-                        // 采纳缓存决策直接切换（本任务确实慢，且该 host 已被
-                        // 证明代理更优），不再重复采样。
+                    Some(Decision::Proxy) if !self.ctx.require_validation => {
                         self.apply_switch(nodes, db, sink, task_id, route::PROXY_CACHED)
                             .await;
                     }
                     Some(Decision::Cooldown) | Some(Decision::NoSwitch) => {
                         self.phase = Phase::Done;
                     }
-                    None => {
+                    Some(Decision::Proxy) | None => {
                         let slot: Arc<StdMutex<Option<ProbeOutcome>>> =
                             Arc::new(StdMutex::new(None));
                         let baseline = obs.throughput_bps / obs.alive.max(1) as f64;
                         log_info!(
-                            "[auto-proxy] task {} host {} 直连慢（{:.0} B/s × {} conn），发起代理采样",
+                            "[auto-proxy] task {} host {} 开始代理对比（直连 {:.0} B/s × {} conn）",
                             task_id,
                             self.ctx.host,
                             obs.throughput_bps,
@@ -670,9 +666,9 @@ impl AutoSwitchState {
 // failover 支路（manager 侧调用）
 // ---------------------------------------------------------------------------
 
-/// 直连失败错误里「连接类」的子集——只有这类失败才值得 failover 到代理
-/// （404/校验失败换链路无意义）。比 `is_retriable_error` 更严格。
-pub fn is_connect_class_error(msg: &str) -> bool {
+/// 路由切换可能修复的传输层错误。覆盖建连失败与 body 中途断流；HTTP
+/// 状态、校验失败等永久错误不应靠换链路重试。
+pub fn is_route_transport_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("connection refused")
         || lower.contains("connection reset")
@@ -682,6 +678,13 @@ pub fn is_connect_class_error(msg: &str) -> bool {
         || lower.contains("network is down")
         || lower.contains("no route to host")
         || lower.contains("dns")
+        || lower.contains("stalled")
+        || lower.contains("broken pipe")
+        || lower.contains("eof")
+        || lower.contains("connection closed")
+        || lower.contains("connection abort")
+        || lower.contains("incomplete download")
+        || lower.contains("error decoding response body")
 }
 
 #[cfg(test)]
@@ -726,6 +729,7 @@ mod tests {
             user_agent: String::new(),
             source: CandidateSource::ManualFields,
             fast_reeval: false,
+            require_validation: false,
         }));
         state.backdate(MIN_RUNTIME + Duration::from_secs(5));
         state
@@ -870,12 +874,13 @@ mod tests {
         assert!(sink.0.lock().unwrap().is_empty(), "冷却决策零广播");
     }
 
-    /// 守卫未命中（速度正常）时状态机纹丝不动——即使缓存已判代理。
+    /// 局部续传即使看到兄弟任务的代理租约，也必须先实际采样 validator，
+    /// 不能直接切换到可能返回另一份内容的 CDN edge。
     #[tokio::test]
-    async fn fast_task_never_switches_even_with_cached_proxy_decision() {
+    async fn partial_resume_does_not_adopt_cached_proxy_without_probe() {
         let db = Db::connect("sqlite::memory:").await.expect("mem db");
         db.insert_task(
-            "t-fast",
+            "t-partial",
             "https://example.com/f.zip",
             "f.zip",
             "/tmp",
@@ -890,36 +895,40 @@ mod tests {
         .expect("insert task");
         let cache = DecisionCache::new();
         cache.set("example.com", Decision::Proxy);
-        let mut state = switch_state(&cache);
+        let mut state = AutoSwitchState::new(Arc::new(AutoProxyCtx {
+            candidate: manual_candidate(),
+            cache,
+            host: "example.com".to_string(),
+            user_agent: String::new(),
+            source: CandidateSource::ManualFields,
+            fast_reeval: true,
+            require_validation: true,
+        }));
+        state.backdate(MIN_RUNTIME + Duration::from_secs(1));
         let nodes = NodePool::single(reqwest::Client::new());
         let sink = CollectSink(StdMutex::new(Vec::new()));
-        let spec = crate::downloader::RequestSpec::empty_get();
-        let fast = TickObs {
-            throughput_bps: 10.0 * 1024.0 * 1024.0,
-            ..slow_obs()
-        };
 
         state
             .on_ramp_tick(
-                fast,
+                slow_obs(),
                 &nodes,
                 &db,
                 &sink,
-                "t-fast",
+                "t-partial",
                 "https://example.com/f.zip",
-                &spec,
-                "",
+                &crate::downloader::RequestSpec::empty_get(),
+                "\"locked\"",
                 "",
             )
             .await;
 
         let task = db
-            .load_task_by_id("t-fast")
+            .load_task_by_id("t-partial")
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(task.auto_route, "");
-        assert!(sink.0.lock().unwrap().is_empty(), "速度正常绝不采样/切换");
+        assert_eq!(task.auto_route, "", "采样完成前不得采纳代理租约");
+        assert!(sink.0.lock().unwrap().is_empty(), "采样完成前不得广播切换");
     }
 
     // ---- DecisionCache ----------------------------------------------------
@@ -958,7 +967,6 @@ mod tests {
     fn should_probe_requires_all_guards() {
         struct Guards {
             runtime: Duration,
-            throughput_bps: f64,
             alive: usize,
             remaining_bytes: i64,
             limiter_active: bool,
@@ -966,8 +974,7 @@ mod tests {
         }
         let ok = |break_one: &dyn Fn(&mut Guards)| {
             let mut g = Guards {
-                runtime: Duration::from_secs(11),
-                throughput_bps: 100.0 * 1024.0,
+                runtime: Duration::from_secs(7),
                 alive: 4,
                 remaining_bytes: 64 * 1024 * 1024,
                 limiter_active: false,
@@ -977,7 +984,6 @@ mod tests {
             should_probe(
                 MIN_RUNTIME,
                 g.runtime,
-                g.throughput_bps,
                 g.alive,
                 g.remaining_bytes,
                 g.limiter_active,
@@ -987,13 +993,23 @@ mod tests {
         assert!(ok(&|_| {}), "全守卫满足应放行");
         assert!(
             !ok(&|g| g.runtime = Duration::from_secs(5)),
-            "运行不足 10s 拒绝"
+            "运行不足 6s 拒绝"
         );
-        assert!(!ok(&|g| g.throughput_bps = SLOW_BPS + 1.0), "速度达标拒绝");
         assert!(!ok(&|g| g.alive = 0), "无活跃连接拒绝");
         assert!(!ok(&|g| g.remaining_bytes = 1024 * 1024), "剩余过小拒绝");
         assert!(!ok(&|g| g.limiter_active = true), "限速激活拒绝");
         assert!(!ok(&|g| g.conn_sensitive = true), "连接敏感态拒绝");
+        assert!(
+            should_probe(
+                MIN_RUNTIME,
+                Duration::from_secs(7),
+                16,
+                64 * 1024 * 1024,
+                false,
+                false,
+            ),
+            "多连接总吞吐不得掩盖代理相对优势"
+        );
     }
 
     #[test]
@@ -1002,18 +1018,17 @@ mod tests {
             should_probe(
                 min,
                 Duration::from_secs(runtime_secs),
-                100.0 * 1024.0,
                 4,
                 64 * 1024 * 1024,
                 false,
                 false,
             )
         };
-        assert!(!probe(MIN_RUNTIME, 7), "常规等待期 7s 不放行");
-        assert!(probe(FAST_REEVAL_MIN_RUNTIME, 7), "先验加速后 7s 放行");
+        assert!(!probe(MIN_RUNTIME, 5), "常规等待期 5s 不放行");
+        assert!(probe(FAST_REEVAL_MIN_RUNTIME, 5), "先验加速后 5s 放行");
         assert!(
-            !probe(FAST_REEVAL_MIN_RUNTIME, 5),
-            "加速下限跨 3 个 ramp tick"
+            !probe(FAST_REEVAL_MIN_RUNTIME, 3),
+            "加速至少跨 2 个 ramp tick"
         );
     }
 
@@ -1097,6 +1112,7 @@ mod tests {
         );
         // 非代理基础标签不带后缀。
         assert_eq!(with_source(DIRECT, CandidateSource::System), DIRECT);
+        assert_eq!(DIRECT_FAILOVER, "direct:failover");
         // failover 变体保留来源后缀；裸标签（旧库存量）不造假来源。
         assert_eq!(to_failover(PROXY_CACHED_SYSTEM), PROXY_FAILOVER_SYSTEM);
         assert_eq!(to_failover(PROXY_SAMPLED_MANUAL), PROXY_FAILOVER_MANUAL);
@@ -1107,13 +1123,16 @@ mod tests {
     // ---- failover 错误分类 ---------------------------------------------------
 
     #[test]
-    fn connect_class_is_stricter_than_retriable() {
-        assert!(is_connect_class_error("Connection refused (os error 111)"));
-        assert!(is_connect_class_error("operation timed out"));
-        assert!(is_connect_class_error("dns error: no record"));
-        assert!(!is_connect_class_error("HTTP 404 Not Found"));
-        assert!(!is_connect_class_error("checksum mismatch"));
-        // 可重试但非连接类：不触发 failover。
-        assert!(!is_connect_class_error("download stalled"));
+    fn route_transport_errors_include_connect_and_midstream_failures() {
+        assert!(is_route_transport_error(
+            "Connection refused (os error 111)"
+        ));
+        assert!(is_route_transport_error("operation timed out"));
+        assert!(is_route_transport_error("dns error: no record"));
+        assert!(is_route_transport_error("download stalled for 5s"));
+        assert!(is_route_transport_error("unexpected EOF"));
+        assert!(is_route_transport_error("error decoding response body"));
+        assert!(!is_route_transport_error("HTTP 404 Not Found"));
+        assert!(!is_route_transport_error("checksum mismatch"));
     }
 }

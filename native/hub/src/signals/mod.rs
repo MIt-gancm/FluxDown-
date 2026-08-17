@@ -462,9 +462,9 @@ pub struct TaskInfo {
     #[serde(default)]
     pub origin_url: String,
     /// `ProxyMode::Auto` 的任务级最终链路（空 = 非 Auto 模式）。wire 标签：
-    /// `direct` / `direct:sampled` / `direct:pinned` / `proxy:cached` /
-    /// `proxy:sampled` / `proxy:failover`（代理类标签带候选来源后缀
-    /// `:system`/`:manual`）。
+    /// `direct` / `direct:sampled` / `direct:pinned` / `direct:failover` /
+    /// `proxy:cached` / `proxy:sampled` / `proxy:failover`（代理类标签带
+    /// 候选来源后缀 `:system`/`:manual`）。
     #[serde(default)]
     pub auto_route: String,
 }

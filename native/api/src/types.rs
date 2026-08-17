@@ -225,9 +225,9 @@ pub struct TaskDto {
     #[serde(default)]
     pub origin_url: String,
     /// `ProxyMode::Auto` 的任务级最终链路（可追溯性）：`direct` /
-    /// `direct:sampled` / `direct:pinned` / `proxy:cached` /
-    /// `proxy:sampled` / `proxy:failover`（代理类标签带候选来源后缀
-    /// `:system`/`:manual`）；空 = 非 Auto 模式。
+    /// `direct:sampled` / `direct:pinned` / `direct:failover` /
+    /// `proxy:cached` / `proxy:sampled` / `proxy:failover`（代理类标签带
+    /// 候选来源后缀 `:system`/`:manual`）；空 = 非 Auto 模式。
     #[serde(default)]
     pub auto_route: String,
     /// 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）。
