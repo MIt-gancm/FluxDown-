@@ -37,8 +37,13 @@ class ExternalReturnStateMachine {
     return true;
   }
 
+  /// 回到前台：结束"返回来源应用"过渡，恢复显示主界面。
+  ///
+  /// 不再要求先经历过 `paused`（旧实现对双 Activity 共享引擎时跨任务丢失
+  /// paused 事件会永远卡在隐藏主界面 → 黑屏）。只要退出到来源应用的过渡已
+  /// 发起且当前不是弹窗打开态，下一次 `resumed` 即恢复显示。
   bool onResumed() {
-    if (_phase != ExternalReturnPhase.returningToSource || !_wasPaused) {
+    if (_phase != ExternalReturnPhase.returningToSource) {
       return false;
     }
     _phase = ExternalReturnPhase.normal;
