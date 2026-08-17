@@ -30,7 +30,7 @@
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:theme="@style/LaunchTheme"
+            android:theme="@style/MainTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
             android:windowSoftInputMode="adjustResize">
@@ -40,12 +40,29 @@
                  to determine the Window background behind the Flutter UI. -->
             <meta-data
               android:name="io.flutter.embedding.android.NormalTheme"
-              android:resource="@style/NormalTheme"
+              android:resource="@style/MainTheme"
               />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN"/>
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
+        </activity>
+        <!-- 外部下载唤起入口：透明主题（ExternalTheme）+ 独立任务栈，在来源应用
+             上方只显示新建下载弹窗。与 MainActivity 共享同一 FlutterEngine。 -->
+        <activity
+            android:name=".ExternalDownloadActivity"
+            android:exported="true"
+            android:launchMode="singleInstance"
+            android:taskAffinity=""
+            android:excludeFromRecents="true"
+            android:theme="@style/ExternalTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+              android:name="io.flutter.embedding.android.NormalTheme"
+              android:resource="@style/ExternalTheme"
+              />
             <!-- 接收分享的文本/链接（浏览器"分享"→ FluxDown 快速新建下载）。
                  注意：Via 的第三方下载器列表是闭源写死的白名单（见 GopeedLab/gopeed#412），
                  此 SEND filter 只是接收前提；出现在 Via 列表还需 Via 作者收录
