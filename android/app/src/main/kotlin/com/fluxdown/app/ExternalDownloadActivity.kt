@@ -27,13 +27,18 @@ class ExternalDownloadActivity : FlutterActivity() {
     override fun getCachedEngineId(): String? =
         if (FluxdownEngine.cached != null) FluxdownEngine.ENGINE_ID else null
 
-    override fun shouldDestroyEngineWithActivity(): Boolean = false
-
     private var shareChannel: MethodChannel? = null
     /** 冷启动时后台解析暂存的分享内容，Dart 首次 getInitialShare 时取走。 */
     private val pendingShare = CompletableFuture<HashMap<String, String>?>()
     /** 一个 Activity 实例只派发一次冷分享（避免回到前台/重绑事件重复触发）。 */
     private var shareDelivered = false
+    /** 本 Activity 是否创建了引擎（false = 应用已在运行，Dart 已 init 过，须走 onShare）。 */
+    private var createdEngine = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        createdEngine = FluxdownEngine.cached == null
+        super.onCreate(savedInstanceState)
+    }
 
     override fun onStart() {
         super.onStart()
@@ -41,6 +46,7 @@ class ExternalDownloadActivity : FlutterActivity() {
     }
 
     private fun bindAndDeliver(engine: FlutterEngine) {
+        FluxdownEngine.cacheIfAbsent(engine)
         // 外部弹窗内同样能触发存储相关操作（换目录 / 装 APK / 打开文件）。
         AppStorage.bind(engine, this)
         if (shareChannel == null) {
@@ -71,18 +77,14 @@ class ExternalDownloadActivity : FlutterActivity() {
         }
         if (shareDelivered) return
         shareDelivered = true
-        // 引擎是否已存在：已有 = 应用已在同进程运行（Dart 已 init 过，不会再拉
-        // getInitialShare），需直接 onShare 推送；新建 = 本次为进程冷启动，Dart
-        // 首帧后会 getInitialShare 取走。须在 cacheIfAbsent 之前判定。
-        val appAlreadyRunning = FluxdownEngine.cached != null
-        FluxdownEngine.cacheIfAbsent(engine)
-        // 后台线程解析 intent（超大输入不阻塞主线程）。
+        // 后台线程解析 intent（超大输入不阻塞主线程）。冷启动（引擎由本 Activity 新建）
+        // 交给 Dart getInitialShare 取走；应用已在运行（复用引擎）则直接 onShare 推送。
         Thread {
             val shared = extractShared(intent) ?: return@Thread
-            if (appAlreadyRunning) {
-                runOnUiThread { shareChannel?.invokeMethod("onShare", shared) }
-            } else {
+            if (createdEngine) {
                 pendingShare.complete(shared)
+            } else {
+                runOnUiThread { shareChannel?.invokeMethod("onShare", shared) }
             }
         }.start()
     }

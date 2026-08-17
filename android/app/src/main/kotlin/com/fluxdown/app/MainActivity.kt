@@ -20,8 +20,6 @@ class MainActivity : FlutterActivity() {
     override fun getCachedEngineId(): String? =
         if (FluxdownEngine.cached != null) FluxdownEngine.ENGINE_ID else null
 
-    override fun shouldDestroyEngineWithActivity(): Boolean = false
-
     override fun onStart() {
         super.onStart()
         getFlutterEngine()?.let { engine ->
