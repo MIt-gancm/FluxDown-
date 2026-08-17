@@ -387,6 +387,8 @@
   "accountFeatureConfigSyncDesc": "在多台设备间同步设置与主题",
   "accountFeatureMultiDevice": "多设备协同",
   "accountFeatureMultiDeviceDesc": "跨设备发现与连接、推送下载任务、查看进度与取回文件",
+  "accountFeatureReferral": "推介有奖",
+  "accountFeatureReferralDesc": "在设置侧边栏显示推荐码与奖励功能",
   "accountLoginDialogTitle": "登录 FluxDown 账户",
   "accountLoginTabCode": "验证码登录",
   "accountLoginTabPassword": "密码登录",

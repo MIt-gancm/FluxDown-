@@ -651,11 +651,8 @@ class _SettingsPageState extends State<SettingsPage> {
     final hl = widget.initialHighlight;
     _selected =
         hl?.category ?? widget.initialCategory ?? SettingsCategory.general;
-    // 「推介有奖」分类仅登录后可见，防御性兜底：初始态若落在该分类但未登录
-    // （理论上不会发生，调用方按登录态选择初始分类），回退到通用设置。
-    if (_selected == SettingsCategory.referral &&
-        !CloudAuthService.instance.isLoggedIn) {
-      _selected = SettingsCategory.general;
+    if (_selected == SettingsCategory.referral && !_referralAvailable) {
+      _selected = SettingsCategory.account;
     }
     if (hl != null) {
       _highlight = SettingsHighlightRequest(
@@ -665,31 +662,42 @@ class _SettingsPageState extends State<SettingsPage> {
       );
     }
     CloudAuthService.instance.addListener(_onAuthChanged);
+    widget.settingsProvider.addListener(_onReferralAvailabilityChanged);
   }
 
   @override
   void dispose() {
     CloudAuthService.instance.removeListener(_onAuthChanged);
+    widget.settingsProvider.removeListener(_onReferralAvailabilityChanged);
     super.dispose();
   }
 
-  /// 登出时若正停留在「推介有奖」分类（该分类登出后从侧边栏隐藏），
-  /// 自动回退到通用设置，避免内容区停留在已不可达的分类上。
-  void _onAuthChanged() {
-    if (_selected == SettingsCategory.referral &&
-        !CloudAuthService.instance.isLoggedIn) {
-      setState(() => _selected = SettingsCategory.general);
+  bool get _referralAvailable =>
+      CloudAuthService.instance.isLoggedIn &&
+      widget.settingsProvider.referralFeatureEnabled;
+
+  void _onAuthChanged() => _ensureReferralAvailable();
+
+  void _onReferralAvailabilityChanged() => _ensureReferralAvailable();
+
+  void _ensureReferralAvailable() {
+    if (_selected == SettingsCategory.referral && !_referralAvailable) {
+      setState(() => _selected = SettingsCategory.account);
     }
   }
 
   /// 切换当前选中分类：侧边栏点击、搜索跳转、页内跳转（如资料卡「推介有奖」
   /// 按钮）共用。
   void _selectCategory(SettingsCategory category) {
+    if (category == SettingsCategory.referral && !_referralAvailable) return;
     setState(() => _selected = category);
   }
 
   /// 搜索结果选中：切换分类并下发高亮请求。
   void _onSearchSelect(SettingsSearchItem item) {
+    if (item.category == SettingsCategory.referral && !_referralAvailable) {
+      return;
+    }
     setState(() {
       _selected = item.category;
       _highlight = SettingsHighlightRequest(
@@ -823,6 +831,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     selected: _selected,
                     onSelect: _selectCategory,
                     onSearchSelect: _onSearchSelect,
+                    settingsProvider: widget.settingsProvider,
                   ),
                   // 右侧内容区
                   Expanded(
@@ -940,11 +949,13 @@ class _SidebarResizeHandleState extends State<_SidebarResizeHandle> {
 class _SettingsSidebar extends StatefulWidget {
   final double width;
   final SettingsCategory selected;
+  final SettingsProvider settingsProvider;
   final ValueChanged<SettingsCategory> onSelect;
   final ValueChanged<SettingsSearchItem> onSearchSelect;
 
   const _SettingsSidebar({
     required this.width,
+    required this.settingsProvider,
     required this.selected,
     required this.onSelect,
     required this.onSearchSelect,
@@ -1086,21 +1097,27 @@ class _SettingsSidebarState extends State<_SettingsSidebar> {
             Expanded(
               child: ListenableBuilder(
                 listenable: CloudAuthService.instance,
-                builder: (context, _) {
-                  final loggedIn = CloudAuthService.instance.isLoggedIn;
-                  return ListView(
-                    children: [
-                      for (final cat in SettingsCategory.values)
-                        if (cat != SettingsCategory.referral || loggedIn)
-                          _SettingsNavItem(
-                            icon: cat.icon,
-                            label: cat.localizedLabel,
-                            isSelected: widget.selected == cat,
-                            onTap: () => widget.onSelect(cat),
-                          ),
-                    ],
-                  );
-                },
+                builder: (context, _) => ListenableBuilder(
+                  listenable: widget.settingsProvider,
+                  builder: (context, _) {
+                    final showReferral =
+                        CloudAuthService.instance.isLoggedIn &&
+                        widget.settingsProvider.referralFeatureEnabled;
+                    return ListView(
+                      children: [
+                        for (final cat in SettingsCategory.values)
+                          if (cat != SettingsCategory.referral || showReferral)
+                            _SettingsNavItem(
+                              key: ValueKey('settings-nav-${cat.name}'),
+                              icon: cat.icon,
+                              label: cat.localizedLabel,
+                              isSelected: widget.selected == cat,
+                              onTap: () => widget.onSelect(cat),
+                            ),
+                      ],
+                    );
+                  },
+                ),
               ),
             ),
         ],
@@ -1182,6 +1199,7 @@ class _SettingsNavItem extends StatefulWidget {
   final VoidCallback onTap;
 
   const _SettingsNavItem({
+    super.key,
     required this.icon,
     required this.label,
     required this.isSelected,
@@ -11697,6 +11715,8 @@ class _AccountContentState extends State<_AccountContent> {
                       _configSyncRow(context),
                       _accountDivider(context),
                       _multiDeviceRow(context),
+                      _accountDivider(context),
+                      _referralFeatureRow(context, widget.settingsProvider),
                     ],
                   ),
                 ),
@@ -12112,6 +12132,63 @@ Widget _accountDivider(BuildContext context) {
     height: 1,
     margin: const EdgeInsets.only(left: 52),
     color: m.borderFade(c.border),
+  );
+}
+
+Widget _referralFeatureRow(
+  BuildContext context,
+  SettingsProvider settingsProvider,
+) {
+  return ListenableBuilder(
+    listenable: settingsProvider,
+    builder: (context, _) {
+      final s = LocaleScope.of(context);
+      final c = AppColors.of(context);
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+        child: Row(
+          children: [
+            Container(
+              width: 30,
+              height: 30,
+              alignment: Alignment.center,
+              decoration: BoxDecoration(
+                color: c.surface2,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(LucideIcons.gift, size: 15, color: c.textSecondary),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    s.accountFeatureReferral,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: c.textPrimary,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    s.accountFeatureReferralDesc,
+                    style: TextStyle(fontSize: 11.5, color: c.textMuted),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: 12),
+            ShadSwitch(
+              key: const ValueKey('referral-feature-switch'),
+              value: settingsProvider.referralFeatureEnabled,
+              onChanged: settingsProvider.setReferralFeatureEnabled,
+            ),
+          ],
+        ),
+      );
+    },
   );
 }
 
