@@ -21,8 +21,7 @@ import '../bindings/bindings.dart' show ResolvePreviewResult;
 import '../i18n/locale_provider.dart';
 import '../models/download_queue.dart' show kMainQueueId;
 import '../services/file_picker_service.dart';
-import '../services/resolve_preview_client.dart'
-    show isManifestPreviewableUrl;
+import '../services/resolve_preview_client.dart' show isManifestPreviewableUrl;
 import '../theme/app_colors.dart';
 import '../theme/app_theme.dart';
 import '../theme/flux_theme_tokens.dart';
@@ -59,7 +58,7 @@ class QuickPopupApp extends StatefulWidget {
 class _QuickPopupAppState extends State<QuickPopupApp> {
   QuickPopupPayload? _payload;
 
-  /// 载荷代次 — 每次 setPayload 递增，作为表单子树的 Key 强制重置表单状态
+  /// 载荷代次 — 每次 setPayload 递增，强制重建 Navigator/Overlay 与表单状态。
   int _epoch = 0;
 
   /// 表单外部控制器 — appendPayload（小窗可见期间新请求合入表单）用。
@@ -134,10 +133,10 @@ class _QuickPopupAppState extends State<QuickPopupApp> {
                 child: FluxSonner(
                   child: ExcludeSemantics(
                     child: WidgetsApp(
+                      key: ValueKey(_epoch),
                       color: theme.colorScheme.primary,
                       debugShowCheckedModeBanner: false,
                       home: _PopupShell(
-                        key: ValueKey(_epoch),
                         payload: payload,
                         formController: _formController,
                         relayBus: _relayBus,
@@ -173,7 +172,6 @@ class _PopupShell extends StatefulWidget {
   final _PopupRelayBus relayBus;
 
   const _PopupShell({
-    super.key,
     required this.payload,
     required this.formController,
     required this.relayBus,
@@ -459,7 +457,9 @@ class _PopupShellState extends State<_PopupShell> {
         : _cancel;
 
     return CallbackShortcuts(
-      bindings: {const SingleActivator(LogicalKeyboardKey.escape): escapeAction},
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.escape): escapeAction,
+      },
       child: Focus(
         autofocus: true,
         child: Container(
@@ -502,9 +502,7 @@ class _PopupShellState extends State<_PopupShell> {
     return SingleChildScrollView(
       child: NotificationListener<SizeChangedLayoutNotification>(
         onNotification: (_) {
-          WidgetsBinding.instance.addPostFrameCallback(
-            (_) => _requestResize(),
-          );
+          WidgetsBinding.instance.addPostFrameCallback((_) => _requestResize());
           return true;
         },
         child: SizeChangedLayoutNotifier(
@@ -524,10 +522,7 @@ class _PopupShellState extends State<_PopupShell> {
                 children: [
                   Text(
                     s.fromBrowserExtension,
-                    style: TextStyle(
-                      fontSize: 13,
-                      color: c.textMuted,
-                    ),
+                    style: TextStyle(fontSize: 13, color: c.textMuted),
                   ),
                   const SizedBox(height: 16),
                   QuickDownloadForm(
