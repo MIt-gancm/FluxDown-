@@ -113,6 +113,11 @@ struct ServerState {
     /// 200 全量分支写 body 前 sleep 的毫秒数（0 = 不延迟）。用于让 hint 首枪
     /// plain GET 的流"在跑"，给 2s ramp tick 留出放出带 Range 并发段的窗口。
     throttle_full_ms: u64,
+    /// 签名端点允许的最大 Range 区间长度；超出时返回 403，开放式区间按到
+    /// 文件末尾计算。用于复现只接受小区间的下载服务。
+    max_range_len: Option<i64>,
+    /// Range 起点必须按该字节数对齐；非对齐请求返回 403。
+    range_start_alignment: Option<i64>,
 
     // --- 计数器（断言用）---
     head_count: AtomicUsize,
@@ -152,6 +157,8 @@ impl ServerState {
             reject_if_range_with_403: false,
             signature_invalid: std::sync::atomic::AtomicBool::new(false),
             throttle_full_ms: 0,
+            max_range_len: None,
+            range_start_alignment: None,
             head_count: AtomicUsize::new(0),
             full_get_count: AtomicUsize::new(0),
             range_get_count: AtomicUsize::new(0),
@@ -387,6 +394,32 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
             .range
             .map(|(s, e)| e.unwrap_or(total - 1).min(total - 1) - s + 1 > 1)
             .unwrap_or(false);
+    if let Some(alignment) = st.range_start_alignment
+        && is_segment_range_get
+        && req
+            .range
+            .map(|(start, _)| start.rem_euclid(alignment) != 0)
+            .unwrap_or(false)
+    {
+        st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(&mut stream, resp.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+    if let Some(max_len) = st.max_range_len
+        && is_segment_range_get
+        && req
+            .range
+            .map(|(start, end)| end.unwrap_or(total - 1).min(total - 1) - start + 1 > max_len)
+            .unwrap_or(false)
+    {
+        st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(&mut stream, resp.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
     // 只拒「分段」Range(probe 0-0 放行):全员被拒→单流回退的转换出口守护。
     if st.reject_segment_range_with_400 && is_segment_range_get {
         st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
@@ -760,7 +793,8 @@ async fn validated_plain_range_rejects_changed_version() {
     let _ = tokio::fs::remove_dir_all(&work_dir).await;
 }
 
-/// 无既有 segment 行的真实单流续传也必须直接采用纯 Range。
+/// 无既有 segment 行、已知大小且 `segments=1` 的真实恢复任务必须使用纯 Range，
+/// 不能把单连接误判成不支持续传；大缺口拆成有界闭区间并在同一任务内串行续完。
 #[tokio::test(flavor = "current_thread")]
 #[ignore = "binds a local port; run with --ignored"]
 async fn single_stream_resume_uses_plain_range_without_if_range() {
@@ -770,9 +804,13 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
     let _ = tokio::fs::remove_dir_all(&work_dir).await;
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
-    let body = Arc::new(gen_body(512 * 1024 + 13, 0x405));
+    const MAX_RANGE_LEN: i64 = 16 * 1024 * 1024;
+    let partial_len = (1024 + 128) * 1024;
+    let body = Arc::new(gen_body(17 * 1024 * 1024 + 13, 0x405));
     let mut server_state = ServerState::new(body.clone(), "single-etag");
     server_state.reject_if_range_with_403 = true;
+    server_state.max_range_len = Some(MAX_RANGE_LEN);
+    server_state.range_start_alignment = Some(1024 * 1024);
     let state = Arc::new(server_state);
     let server = start_server(state.clone()).await;
     let url = server.url("/single.bin");
@@ -792,16 +830,24 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
         .expect("set validator");
     tokio::fs::write(
         work_dir.join(format!("single.bin{TEMP_EXT}")),
-        &body[..128 * 1024],
+        &body[..partial_len],
     )
     .await
     .expect("seed partial temp");
+    db.update_task_progress("single-if-range-403", partial_len as i64)
+        .await
+        .expect("seed persisted progress");
 
     let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(64);
     let status = Arc::new(std::sync::atomic::AtomicI32::new(0));
     let observed = status.clone();
+    let preparing_downloaded = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let observed_preparing = preparing_downloaded.clone();
     let collector = tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
+            if update.status == 5 {
+                observed_preparing.store(update.downloaded_bytes, Ordering::SeqCst);
+            }
             if update.status >= 3 {
                 observed.store(update.status, Ordering::SeqCst);
             }
@@ -822,7 +868,7 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
         speed_limiter: SpeedLimiter::new(0),
         cookies: String::new(),
         referrer: String::new(),
-        hint_file_size: 0,
+        hint_file_size: body.len() as i64,
         proxy_config: ProxyConfig::default(),
         sink: Arc::new(NoopTestSink),
         selector: Arc::new(fluxdown_engine::NoopSelection),
@@ -844,6 +890,11 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
 
     assert_eq!(status.load(Ordering::SeqCst), 3, "单流续传应成功完成");
     assert_eq!(
+        preparing_downloaded.load(Ordering::SeqCst),
+        partial_len as i64,
+        "恢复任务进入 preparing 时不得把已持久化进度显示为 0"
+    );
+    assert_eq!(
         tokio::fs::read(work_dir.join("single.bin")).await.unwrap(),
         *body
     );
@@ -851,6 +902,20 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
         state.rejected_if_range_count.load(Ordering::SeqCst),
         0,
         "单流续传不得发送 If-Range"
+    );
+    assert_eq!(
+        state.rejected_range_count.load(Ordering::SeqCst),
+        0,
+        "单流续传不得发送超长或未按检查点对齐的 Range"
+    );
+    assert_eq!(
+        state.full_get_count.load(Ordering::SeqCst),
+        0,
+        "已验证 Range 的单流恢复不得发送全量 GET 从零重下"
+    );
+    assert!(
+        state.range_get_count.load(Ordering::SeqCst) >= 2,
+        "大缺口应拆成至少两个串行 Range"
     );
 
     let _ = tokio::fs::remove_dir_all(&work_dir).await;

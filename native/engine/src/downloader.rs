@@ -2255,6 +2255,12 @@ pub const DB_SAVE_INTERVAL_SECS: u64 = 3;
 /// 这条连接是唯一数据流，掐早了只有整任务重试一条路；多段路径重连廉价且
 /// 尾段抢救依赖快速回收，故用更激进的 5s。
 const CHUNK_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单流续传的单次 Range 上限。部分签名下载端点会拒绝超过 20 MiB 的区间；
+/// 取 16 MiB 为闭区间长度留出余量，并在同一任务内串行请求后续区间。
+const MAX_SINGLE_RESUME_RANGE_BYTES: i64 = 16 * 1024 * 1024;
+/// 与 aria2 控制文件的 piece 语义一致：只把完整 1 MiB 检查点作为可恢复进度。
+/// 任意连接中断留下的尾部不足一块，下一次 Range 从前一检查点覆盖重写。
+const SINGLE_RESUME_ALIGNMENT_BYTES: i64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -2514,6 +2520,18 @@ async fn compute_segments_with_advisor(p: &DownloadParams, info: &FileInfo) -> i
 /// (progress_reporter 对非空 file_name 锁存,空串 = 不变)。
 async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>), DownloadError> {
     log_info!("[download] task {} starting, url={}", p.task_id, p.url);
+    // 恢复任务进入 preparing 时保留已落库进度，避免 UI 在真正发出续传
+    // Range 前短暂显示为 0。后续 status=1 继续复用同一基线，不重复查库。
+    let (resume_downloaded, resume_total) = if p.is_resume {
+        p.db.load_task_by_id(&p.task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|task| (task.downloaded_bytes.max(0), task.total_bytes.max(0)))
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
 
     // Transition to status=5 (preparing) — probing server, resolving file info
     let _ = p.db.update_task_status(&p.task_id, 5, "").await;
@@ -2521,8 +2539,8 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         .progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
-            downloaded_bytes: 0,
-            total_bytes: 0,
+            downloaded_bytes: resume_downloaded,
+            total_bytes: resume_total,
             status: 5,
             error_message: String::new(),
             file_name: p.file_name.clone(),
@@ -2594,17 +2612,15 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         FileInfo {
             file_name: name,
             total_bytes: effective_size,
-            // Optimistically assume Range support for auto (0) and explicit
-            // multi-segment (> 1) requests.  Most servers that expose a
-            // Content-Length also honour Range headers.  The bandwidth probe
-            // is intentionally skipped for hint-mode tasks (see below) so no
-            // extra HTTP request is made that could consume a one-time CDN
-            // token (e.g. Lanzou cloud signed URLs).
-            // Only assume Range support when we have a real file size AND
-            // the original method is GET-like. POST + Range is undefined and
-            // unsafe; force single-stream so the assumed supports_range can
-            // never trip multi-segment for non-GET requests.
-            supports_range: p.hint_file_size > 0 && p.segment_count != 1 && p.spec.is_get_like(),
+            // Hint 模式没有 probe：自动/显式多段任务仍按既有策略乐观尝试
+            // Range；已持久化 range_verified 的恢复任务则必须沿用这份证据。
+            // segment_count=1 只限制并发，不等于禁用 Range——单流暂停后的断点
+            // 恢复仍需从临时文件缺口继续。fresh 单流没有既有字节，即使
+            // supports_range=true，download_single 也会发普通 GET，不会额外消耗
+            // 一次性 URL。非 GET 继续强制单流且禁止 Range，避免 POST 续传拼接。
+            supports_range: p.hint_file_size > 0
+                && (p.segment_count != 1 || p.range_verified)
+                && p.spec.is_get_like(),
             content_type: String::new(),
             // Hint mode skips the probe, so no ETag/Last-Modified available.
             etag: String::new(),
@@ -2798,17 +2814,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     // Immediately notify Dart: status=1 with resolved file name & total size.
     // For resume tasks, send persisted downloaded bytes as baseline so speed
     // smoothing doesn't treat resumed bytes as a fresh in-interval delta.
-    let initial_downloaded = if p.is_resume {
-        p.db.load_task_by_id(&p.task_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|t| t.downloaded_bytes.max(0))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
+    let initial_downloaded = resume_downloaded;
     let _ = p
         .progress_tx
         .send(ProgressUpdate {
@@ -3588,10 +3594,71 @@ struct SingleDownloadResult {
     /// 响应为准，probe/DB validator 可能描述的是旧版本。
     /// 真 206 续传为 `None`（磁盘内容与旧 validator 一致，沿用旧值）。
     latched_last_modified: Option<String>,
+    /// 真 206 本次请求的起点。调用方用它确认本轮确实推进，并在已知总大小
+    /// 尚未写满时继续发出下一个有界 Range。
+    resumed_range_start: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn download_single(
+    task_id: &str,
+    url: &str,
+    dest: &Path,
+    total_bytes: i64,
+    supports_range: bool,
+    client: &Client,
+    db: &Db,
+    progress_tx: &mpsc::Sender<ProgressUpdate>,
+    cancel_token: &CancellationToken,
+    speed_limiter: &SpeedLimiter,
+    spec: &RequestSpec,
+    expected_filename: &str,
+    expected_etag: &str,
+    expected_last_modified: &str,
+) -> Result<SingleDownloadResult, DownloadError> {
+    loop {
+        let result = download_single_once(
+            task_id,
+            url,
+            dest,
+            total_bytes,
+            supports_range,
+            client,
+            db,
+            progress_tx,
+            cancel_token,
+            speed_limiter,
+            spec,
+            expected_filename,
+            expected_etag,
+            expected_last_modified,
+        )
+        .await?;
+
+        let Some(range_start) = result.resumed_range_start else {
+            return Ok(result);
+        };
+        if total_bytes <= 0 {
+            return Ok(result);
+        }
+
+        let current_len = tokio::fs::metadata(dest).await?.len();
+        let expected_len = u64::try_from(total_bytes).map_err(|_| {
+            DownloadError::Other(format!("invalid negative total size: {total_bytes}"))
+        })?;
+        if current_len >= expected_len {
+            return Ok(result);
+        }
+        if current_len <= range_start {
+            return Err(DownloadError::Other(format!(
+                "resumed Range returned no data before expected total: {current_len}/{expected_len}"
+            )));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_single_once(
     task_id: &str,
     url: &str,
     dest: &Path,
@@ -3613,25 +3680,47 @@ async fn download_single(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Check if there's an existing partial file we can resume
-    let existing_len = match tokio::fs::metadata(dest).await {
-        Ok(m) => m.len() as i64,
+    let physical_existing_len = match tokio::fs::metadata(dest).await {
+        Ok(metadata) => i64::try_from(metadata.len()).map_err(|_| {
+            DownloadError::Other(format!(
+                "partial file is too large to resume: {} bytes",
+                metadata.len()
+            ))
+        })?,
         Err(_) => 0,
     };
 
-    // Resume only when the original method is GET-like.  POST + Range:bytes=N-
-    // is undefined in HTTP standards and most servers will ignore the Range
-    // header (returning 200 with the full body) — appending it to the partial
-    // file would corrupt the result.
+    // Resume only when the original method is GET-like. POST + Range is not a
+    // portable contract and most servers ignore it, which would corrupt an append.
     let want_resume = spec.is_get_like()
         && supports_range
-        && existing_len > 0
-        && (total_bytes == 0 || existing_len < total_bytes);
+        && physical_existing_len > 0
+        && (total_bytes == 0 || physical_existing_len < total_bytes);
+    let existing_len = if want_resume {
+        physical_existing_len - physical_existing_len.rem_euclid(SINGLE_RESUME_ALIGNMENT_BYTES)
+    } else {
+        physical_existing_len
+    };
+    if want_resume && existing_len != physical_existing_len {
+        log_info!(
+            "[download-single] task {} resume checkpoint aligned: {} -> {}",
+            task_id,
+            physical_existing_len,
+            existing_len
+        );
+    }
 
     let mut downloaded: i64;
     let mut file;
 
-    let range = format!("bytes={existing_len}-");
+    let range = if want_resume && total_bytes > 0 {
+        let end = existing_len
+            .saturating_add(MAX_SINGLE_RESUME_RANGE_BYTES - 1)
+            .min(total_bytes - 1);
+        format!("bytes={existing_len}-{end}")
+    } else {
+        format!("bytes={existing_len}-")
+    };
     let mut resp = build_request(client, url, spec.method.clone(), spec);
     if want_resume {
         // 与 aria2 一致，续传首枪只发送 Range。部分一次性签名端点会把
@@ -3814,6 +3903,10 @@ async fn download_single(
     if actual_resume {
         downloaded = existing_len;
         let mut raw_file = OpenOptions::new().write(true).open(dest).await?;
+        let resume_offset = u64::try_from(existing_len).map_err(|_| {
+            DownloadError::Other(format!("invalid negative resume offset: {existing_len}"))
+        })?;
+        raw_file.set_len(resume_offset).await?;
         raw_file.seek(std::io::SeekFrom::End(0)).await?;
         file = tokio::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, raw_file);
     } else {
@@ -3927,6 +4020,13 @@ async fn download_single(
         response_content_length,
         decompressed: encoding.is_some(),
         latched_last_modified,
+        resumed_range_start: if actual_resume {
+            Some(u64::try_from(existing_len).map_err(|_| {
+                DownloadError::Other(format!("invalid negative resume offset: {existing_len}"))
+            })?)
+        } else {
+            None
+        },
     })
 }
 

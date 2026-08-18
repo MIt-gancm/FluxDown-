@@ -1154,6 +1154,16 @@ struct ActiveTaskEntry {
     /// Used for per-queue concurrency counting.
     queue_id: String,
 }
+/// A task that has been asked to pause but whose spawned downloader has not
+/// finished flushing its buffered bytes and final progress yet.
+///
+/// Resume requests are latched here so a new generation cannot open the same
+/// temporary file until the cancelled generation has fully stopped.
+struct PendingPause {
+    generation: u64,
+    notify: bool,
+    resume_requested: bool,
+}
 
 /// off-actor resolve 的种类（start 或 resume 侧再入）。
 #[cfg(feature = "plugins")]
@@ -1396,6 +1406,12 @@ pub struct DownloadManager {
     ///   • bt_task_ids     (HashSet membership flag)
     ///   • active_task_queue   (queue_id string)
     active_tasks: HashMap<String, ActiveTaskEntry>,
+    /// Cancelled generations still flushing their final on-disk progress.
+    ///
+    /// The entry is removed only by the matching [`TaskDone`]. This keeps a
+    /// rapid pause→resume from overlapping two writers for the same temp file
+    /// and lets the old generation publish one authoritative paused frame.
+    pending_pauses: HashMap<String, PendingPause>,
     /// Monotonically increasing counter to distinguish different spawns of
     /// the same task_id.  Prevents a stale `TaskDone` from an old spawn
     /// from accidentally removing the token of a newer spawn.
@@ -1621,6 +1637,7 @@ impl DownloadManager {
             client,
             proxy_config,
             active_tasks: HashMap::new(),
+            pending_pauses: HashMap::new(),
             generation: 0,
             progress_tx: tx,
             progress_rx: Some(rx),
@@ -3540,6 +3557,11 @@ impl DownloadManager {
                 self.clear_priority().await;
             }
         }
+        // A user pause removes the active entry immediately so another task can
+        // use the freed slot, but its downloader may still be flushing. Only
+        // the matching TaskDone may publish the final paused frame or release a
+        // resume request that arrived during that flush window.
+        let resume_after_pause = self.finish_pending_pause(task_id, generation).await;
 
         // A slot freed up — try to start queued tasks.
         // SAFETY (current_thread): `remove` + `drain_queue` have no `.await` between
@@ -3547,6 +3569,9 @@ impl DownloadManager {
         // If this code is ever ported to a multi-threaded runtime, a lock around
         // `active_tokens` modifications would be required.
         self.drain_queue().await;
+        if resume_after_pause {
+            self.resume_task_inner(task_id).await;
+        }
 
         // ----- Auto-retry for retriable network errors ----------------------
         // 大文件下载因网络 stall、连接重置等瞬时错误失败后，自动延迟恢复，
@@ -4501,6 +4526,15 @@ impl DownloadManager {
             save_site_auth,
         )
         .await;
+        // 单任务 UA 也属于请求身份。将显式覆盖值并入已持久化请求头，使暂停、
+        // 进程重启后的 resume 与首次请求一致；调用方已捕获的 User-Agent 优先。
+        if !user_agent.is_empty()
+            && !extra_headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("user-agent"))
+        {
+            extra_headers.insert("User-Agent".to_string(), user_agent.clone());
+        }
         // 任务必属队列：未指定时归入内置主队列（'' 不再是有效归属，统一
         // 覆盖旧客户端信号 / aria2 / REST / CLI 等所有创建入口）。
         let queue_id = if queue_id.is_empty() {
@@ -5570,6 +5604,60 @@ impl DownloadManager {
             });
         }
     }
+    /// Publish the final paused frame after the matching downloader generation
+    /// has stopped and persisted its flushed byte count.
+    ///
+    /// Returns `true` when a resume request arrived during cancellation and may
+    /// now safely start a new generation. DB status and the active generation
+    /// are checked again so stale TaskDone messages cannot overwrite a newer
+    /// running task with `paused`.
+    async fn finish_pending_pause(&mut self, task_id: &str, generation: u64) -> bool {
+        let generation_matches = self
+            .pending_pauses
+            .get(task_id)
+            .is_some_and(|pending| pending.generation == generation);
+        if !generation_matches {
+            return false;
+        }
+        let Some(pending) = self.pending_pauses.remove(task_id) else {
+            return false;
+        };
+
+        if self
+            .active_tasks
+            .get(task_id)
+            .is_some_and(|entry| entry.generation != generation)
+        {
+            return false;
+        }
+
+        let Ok(Some(task)) = self.db.load_task_by_id(task_id).await else {
+            return false;
+        };
+        if task.status == 2 {
+            let _ = self
+                .progress_tx
+                .send(ProgressUpdate {
+                    task_id: task_id.to_string(),
+                    downloaded_bytes: task.downloaded_bytes,
+                    total_bytes: task.total_bytes,
+                    status: 2,
+                    error_message: String::new(),
+                    file_name: task.file_name.clone(),
+                    segment_details: None,
+                    ..Default::default()
+                })
+                .await;
+            self.send_segments_from_db(task_id, task.total_bytes).await;
+            if pending.notify {
+                let event = self
+                    .webhook_event_from_task(crate::webhook::WebhookEventKind::TaskPaused, &task);
+                self.webhook.emit(event);
+            }
+        }
+
+        pending.resume_requested && matches!(task.status, 0 | 2)
+    }
 
     /// 用户显式暂停**单个**任务。会发 `task.paused` webhook。
     ///
@@ -5588,6 +5676,15 @@ impl DownloadManager {
     async fn pause_task_inner(&mut self, task_id: &str, notify: bool) {
         self.clear_pending_resolve(task_id);
         self.retry_scheduled.remove(task_id);
+        // A repeated pause while the previous generation is still flushing is
+        // idempotent. Preserve an explicit notification request, but do not
+        // publish the stale DB snapshot as a terminal paused frame.
+        if let Some(pending) = self.pending_pauses.get_mut(task_id) {
+            pending.notify |= notify;
+            self.sync_queue_occupancy();
+            return;
+        }
+
         // Remove from pending queue if queued (not yet started).
         if let Some(pos) = self.pending_queue.iter().position(|q| q.task_id == task_id) {
             self.pending_queue.remove(pos);
@@ -5603,7 +5700,23 @@ impl DownloadManager {
         }
 
         if let Some(entry) = self.active_tasks.remove(task_id) {
+            let generation = entry.generation;
+            let has_spawned_downloader = entry.handle.is_some();
             entry.token.cancel();
+
+            // A real downloader must finish flushing before its paused progress
+            // becomes authoritative. Placeholder entries used by off-actor
+            // resolve have no writer and can still report immediately.
+            if has_spawned_downloader {
+                self.pending_pauses.insert(
+                    task_id.to_string(),
+                    PendingPause {
+                        generation,
+                        notify,
+                        resume_requested: false,
+                    },
+                );
+            }
 
             // For BT tasks, explicitly pause the torrent in the session so
             // that the handle stays cached for fast resume.  This is a
@@ -5615,12 +5728,14 @@ impl DownloadManager {
             }
 
             let _ = self.db.update_task_status(task_id, 2, "").await;
-            self.emit_progress_from_db(task_id, 2, 0, "", 0).await;
-
-            if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
-                // Send persisted segment data so the UI retains the download
-                // distribution visualization after pausing.
-                self.send_segments_from_db(task_id, t.total_bytes).await;
+            if !has_spawned_downloader {
+                self.emit_progress_from_db(task_id, 2, 0, "", 0).await;
+                if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
+                    self.send_segments_from_db(task_id, t.total_bytes).await;
+                }
+                if notify {
+                    self.emit_paused_webhook(task_id).await;
+                }
             }
 
             // A slot freed up — try to start queued tasks.
@@ -5632,18 +5747,11 @@ impl DownloadManager {
             }
             // NOTE: do NOT call maybe_release_bt_session() here.
             //
-            // pause_task() removes the task from active_tasks and cancels the
-            // CancellationToken, but the spawned BT task (bt_download_inner)
-            // may still be running on the shared BT runtime for up to ~500 ms
-            // (one poll-sleep interval) before it detects cancellation and exits.
-            //
-            // If we call maybe_release_bt_session() now, it sees no BT tasks in
-            // active_tasks and shuts down the runtime immediately — which aborts
-            // bt_download_inner mid-flight and causes run_bt_download to return a
-            // JoinError.  That JoinError propagates as DownloadError::Other (or
-            // Cancelled if our guard fires), and the spawned wrapper still sends
-            // done_tx → on_task_done → maybe_release_bt_session, so the session
-            // is released safely once the task has actually stopped.
+            // The spawned task may still be running while it flushes progress.
+            // Its TaskDone finalizes pending_pauses and only then allows a
+            // requested resume or BT session release.
+            self.sync_queue_occupancy();
+            return;
         }
 
         // Third branch: the task is a completed BT torrent that is seeding or
@@ -5860,6 +5968,11 @@ impl DownloadManager {
     async fn resume_task_inner(&mut self, task_id: &str) {
         // 排程中的自动重试已落地（或被手动恢复抢先），解除队列占用标记。
         self.retry_scheduled.remove(task_id);
+        if let Some(pending) = self.pending_pauses.get_mut(task_id) {
+            pending.resume_requested = true;
+            return;
+        }
+
         if self.active_tasks.contains_key(task_id) {
             // A task can be in active_tokens but already terminal in the DB:
             // this happens when the download task has finished (status=3/4
@@ -6383,16 +6496,23 @@ impl DownloadManager {
                 .instrument(task_span),
             )
         } else {
-            // Resolve proxy and UA for resume: use global UA (cookies not
-            // persisted in DB, so only proxy_url is available from task row).
-            //
+            // 恢复时优先沿用任务快照里的显式 User-Agent；否则重新解析队列/全局
+            // 默认值。cookies/referrer/extra_headers 已在上方从 DB 恢复。
+            let persisted_user_agent = resume_extra_headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("user-agent")
+                    .then(|| value.clone())
+            });
+            let resume_user_agent = match persisted_user_agent {
+                Some(value) => value,
+                None => self.resolved_task_ua("", &task.queue_id).to_string(),
+            };
             // ProxyMode::Auto：与 start 路径共用决策器；一次性备用链路在此
             // 消费并直接决定本轮实际 client 与可追溯标签。
             let forced_route = self.auto_failover_pending.remove(&tid);
             let auto = if task.proxy_url.is_empty() {
                 self.auto_route_decision(
                     &task.url,
-                    &self.global_user_agent,
+                    &resume_user_agent,
                     task.ignore_tls_errors,
                     task.downloaded_bytes > 0,
                     forced_route,
@@ -6414,7 +6534,7 @@ impl DownloadManager {
                 });
             }
             let needs_rebuild = !task.proxy_url.is_empty()
-                || !self.global_user_agent.is_empty()
+                || !resume_user_agent.is_empty()
                 || task.ignore_tls_errors
                 || matches!(&auto_override, Some(p) if p.mode != ProxyMode::None);
             let (task_client, task_proxy) = if needs_rebuild {
@@ -6427,7 +6547,7 @@ impl DownloadManager {
                 };
                 match downloader::build_client_with_tls_policy(
                     &pc,
-                    &self.global_user_agent,
+                    &resume_user_agent,
                     task.ignore_tls_errors,
                 ) {
                     Ok(c) => (c, pc),
@@ -6475,9 +6595,8 @@ impl DownloadManager {
                 resume_hint
             };
 
-            // 多 CDN 聚合输入（resume：UA 只有全局值可用，与上方 client 构建一致）。
-            let cdn =
-                self.cdn_task_input(task.ignore_tls_errors, &task_proxy, &self.global_user_agent);
+            // 多 CDN 聚合输入与主请求使用同一份恢复 UA。
+            let cdn = self.cdn_task_input(task.ignore_tls_errors, &task_proxy, &resume_user_agent);
             // 无人值守标记只被 HLS/DASH 画质选择消费，其余协议不多查一次库。
             let task_unattended =
                 (use_hls || use_dash) && self.db.is_task_unattended(&tid).await.unwrap_or(false);
@@ -7614,6 +7733,11 @@ impl DownloadManager {
         // 恢复后，下次可重试错误会立刻命中"已耗尽"分支、停在 error，与单任务
         // 手动恢复行为不一致（BUG-BATCH-RESUME-NO-RETRY-RESET）。
         self.auto_retry_counts.remove(task_id);
+        if let Some(pending) = self.pending_pauses.get_mut(task_id) {
+            pending.resume_requested = true;
+            return false;
+        }
+
         if self.active_tasks.contains_key(task_id) {
             let is_terminal = task_row.status == 3 || task_row.status == 4;
             if !is_terminal {
@@ -10007,6 +10131,199 @@ mod tests {
                 .await
                 .expect("advance task status");
         }
+    }
+    /// 暂停终态必须等下载器 flush + 最终进度落库后再进入 progress_reporter。
+    /// 否则暂停帧会携带 3 秒周期内的旧 DB 快照，恢复时表现为百分比前跳。
+    #[tokio::test]
+    async fn pause_publishes_flushed_progress_after_matching_task_done() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "pause-flush", "/tmp", "file.bin", 1).await;
+        db.update_task_total_bytes("pause-flush", 215_020_021)
+            .await
+            .expect("set total");
+        db.update_task_progress("pause-flush", 30_000_000)
+            .await
+            .expect("set stale persisted progress");
+
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: "/tmp".to_string(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        let mut progress_rx = mgr.take_progress_rx().expect("progress receiver");
+        let token = CancellationToken::new();
+        let waiter = token.clone();
+        let handle = tokio::spawn(async move {
+            waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            "pause-flush".to_string(),
+            ActiveTaskEntry {
+                token,
+                generation: 41,
+                handle: Some(handle),
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        mgr.pause_task("pause-flush").await;
+        assert!(
+            !sink.events().iter().any(|event| matches!(
+                event,
+                EngineEvent::TaskProgress {
+                    task_id,
+                    status: 2,
+                    ..
+                } if task_id == "pause-flush"
+            )),
+            "active pause must not publish the stale DB snapshot directly"
+        );
+        assert!(
+            progress_rx.try_recv().is_err(),
+            "progress_reporter must wait for the downloader's final flush"
+        );
+
+        db.update_task_progress("pause-flush", 31_513_021)
+            .await
+            .expect("persist flushed progress");
+        mgr.on_task_done(&TaskDone {
+            task_id: "pause-flush".to_string(),
+            generation: 41,
+            reserved_temp_path: None,
+        })
+        .await;
+
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(1), progress_rx.recv())
+            .await
+            .expect("paused progress should be published")
+            .expect("progress channel should stay open");
+        assert_eq!(paused.status, 2);
+        assert_eq!(paused.downloaded_bytes, 31_513_021);
+        assert_eq!(paused.total_bytes, 215_020_021);
+    }
+
+    /// 快速暂停→恢复不得在旧下载器尚未退出时启动新一代；旧世代迟到的
+    /// TaskDone 也不得把已经运行的新世代覆盖成 paused。
+    #[tokio::test]
+    async fn resume_waits_for_pause_flush_and_stale_done_cannot_pause_new_generation() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "pause-race", "/tmp", "file.bin", 1).await;
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: "/tmp".to_string(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        let mut progress_rx = mgr.take_progress_rx().expect("progress receiver");
+        let old_token = CancellationToken::new();
+        let old_waiter = old_token.clone();
+        let old_handle = tokio::spawn(async move {
+            old_waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            "pause-race".to_string(),
+            ActiveTaskEntry {
+                token: old_token,
+                generation: 51,
+                handle: Some(old_handle),
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        mgr.pause_task("pause-race").await;
+        mgr.resume_task("pause-race").await;
+        assert!(
+            !mgr.active_tasks.contains_key("pause-race"),
+            "resume must be deferred until the cancelled writer exits"
+        );
+        assert!(
+            mgr.pending_pauses
+                .get("pause-race")
+                .is_some_and(|pending| pending.resume_requested),
+            "resume intent must be retained while cancellation finishes"
+        );
+
+        // Model a newer generation installed by another actor operation before
+        // the old TaskDone is consumed. The stale completion must be harmless.
+        let new_token = CancellationToken::new();
+        let new_waiter = new_token.clone();
+        let new_handle = tokio::spawn(async move {
+            new_waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            "pause-race".to_string(),
+            ActiveTaskEntry {
+                token: new_token,
+                generation: 52,
+                handle: Some(new_handle),
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+        db.update_task_status("pause-race", 1, "")
+            .await
+            .expect("mark newer generation active");
+
+        mgr.on_task_done(&TaskDone {
+            task_id: "pause-race".to_string(),
+            generation: 51,
+            reserved_temp_path: None,
+        })
+        .await;
+
+        assert_eq!(
+            mgr.active_tasks
+                .get("pause-race")
+                .map(|entry| entry.generation),
+            Some(52),
+            "stale TaskDone must not remove the newer generation"
+        );
+        assert!(
+            progress_rx.try_recv().is_err(),
+            "stale pause completion must not publish a terminal paused frame"
+        );
+        assert!(
+            !sink.events().iter().any(|event| matches!(
+                event,
+                EngineEvent::TaskProgress {
+                    task_id,
+                    status: 2,
+                    ..
+                } if task_id == "pause-race"
+            )),
+            "newer running generation must stay visible"
+        );
     }
 
     /// 批量事件契约：批量恢复/暂停 N 个排队任务 = 常数条事件
