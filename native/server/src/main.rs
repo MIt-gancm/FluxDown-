@@ -55,6 +55,23 @@ pub(crate) const SERVER_VERSION: &str = {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    match run().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if fluxdown_engine::logger::health().initialized {
+                fluxdown_engine::logger::report_error("server", "main", error.as_ref());
+            } else {
+                eprintln!(
+                    "FluxDown server failed before logging initialized: {}",
+                    fluxdown_engine::logger::format_error_chain(error.as_ref())
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server_cfg = ServerConfig::from_env();
 
     // 数据目录：显式覆盖或平台自动探测（与桌面一致的解析器）。先解析、再初始化
@@ -62,7 +79,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `/data`），而非平台默认的 HOME 路径，才能持久化并让「关于」页正确显示。
     let data_dir =
         fluxdown_engine::data_dir::resolve_data_dir(server_cfg.data_dir_override.as_deref())?;
-    fluxdown_engine::logger::init_with_dir(&data_dir);
+    fluxdown_engine::logger::init_with_dir(&data_dir)?;
     log_info!("[server] data dir: {}", data_dir.display());
     if let Some(url) = &server_cfg.database_url {
         // 打印时掩掉凭证段，避免密码进日志。
@@ -70,8 +87,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         log_info!("[server] database: {} (external)", masked);
     }
 
-    // 引导连接：读初始配置 + 首次运行初始化（Engine::new 内部会再建一个池，
-    // 与桌面 App 的双开模式一致——SQLite WAL / pg 均安全）。
+    // 引导连接：读初始配置 + 首次运行初始化；随后把同一连接池交给引擎，
+    // 避免重复打开数据库和再次执行 schema 初始化。
     let boot_db = match &server_cfg.database_url {
         Some(url) => Db::connect(url).await?,
         None => Db::open(&data_dir).await?,
@@ -129,7 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sink: Arc<dyn EventSink> = Arc::new(EngineEventSink(hub.clone()));
     let selector: Arc<dyn HostSelection> = Arc::new(WsHostSelection(hub.clone()));
 
-    let mut engine = Engine::new(
+    let mut engine = Engine::from_db(
         EngineConfig {
             max_concurrent,
             speed_limit_bps,
@@ -145,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             data_dir_override: Some(data_dir.clone()),
             database_url: server_cfg.database_url.clone(),
         },
+        boot_db,
         sink.clone(),
         selector.clone(),
     )

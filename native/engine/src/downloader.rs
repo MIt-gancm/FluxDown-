@@ -2273,7 +2273,13 @@ pub async fn run_download(params: DownloadParams) {
                 task_id_log,
                 total
             );
-            let _ = params.db.update_task_status(&params.task_id, 3, "").await;
+            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
+                crate::logger::report_error(
+                    "http-download",
+                    "persist completion status",
+                    &db_error,
+                );
+            }
             let _ = params
                 .progress_tx
                 .send(ProgressUpdate {
@@ -2307,11 +2313,18 @@ pub async fn run_download(params: DownloadParams) {
             let full_msg = format!("{}{}", msg, chain);
             // checksum 失败时所有字节均已下载完毕（只是校验未通过），需特殊处理进度。
             let is_checksum_fail = matches!(e, DownloadError::ChecksumMismatch(_));
-            log_info!("[download] task {} error: {}", task_id_log, full_msg);
-            let _ = params
+            crate::log_error!("[download] task {} error: {}", task_id_log, full_msg);
+            if let Err(db_error) = params
                 .db
                 .update_task_status(&params.task_id, 4, &full_msg)
-                .await;
+                .await
+            {
+                crate::logger::report_error(
+                    "http-download",
+                    "persist terminal error status",
+                    &db_error,
+                );
+            }
 
             // Preserve actual progress from DB so the UI doesn't jump back to 0%.
             let (dl, total) = match params.db.load_task_by_id(&params.task_id).await {

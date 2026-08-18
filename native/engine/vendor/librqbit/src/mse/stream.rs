@@ -113,10 +113,7 @@ mod tests {
                     cx.waker().wake_by_ref();
                     Poll::Pending
                 }
-                Some(Action::Error) => Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected write failure",
-                ))),
+                Some(Action::Error) => Poll::Ready(Err(io::Error::other("injected write failure"))),
                 Some(Action::Limit(limit)) => {
                     let count = limit.min(data.len());
                     if let Ok(mut bytes) = self.bytes.lock() {
@@ -160,7 +157,7 @@ mod tests {
         writer.write_all(b"abcdefgh").await?;
         let actual = sink
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "poisoned test lock"))?
+            .map_err(|_| io::Error::other("poisoned test lock"))?
             .clone();
         assert_eq!(actual, expected(key, b"abcdefgh"));
         Ok(())
@@ -179,7 +176,7 @@ mod tests {
         writer.write_all(b"accepted").await?;
         let actual = sink
             .lock()
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "poisoned test lock"))?
+            .map_err(|_| io::Error::other("poisoned test lock"))?
             .clone();
         assert_eq!(actual, expected(key, b"accepted"));
         Ok(())

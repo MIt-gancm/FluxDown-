@@ -331,9 +331,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 .update_my_extended_handshake(&mut my_extended)?;
             let my_extended = Message::Extended(ExtendedMessage::Handshake(my_extended));
             trace!("sending extended handshake: {:?}", &my_extended);
-            my_extended
-                .serialize(&mut write_buf, &Default::default)
-                .unwrap();
+            my_extended.serialize(&mut write_buf, &Default::default)?;
             with_timeout(rwtimeout, write.write_all(&write_buf))
                 .await
                 .context("error writing extended handshake")?;

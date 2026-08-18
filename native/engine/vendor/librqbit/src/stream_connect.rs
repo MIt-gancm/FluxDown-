@@ -55,16 +55,17 @@ impl SocksProxyConfig {
     }
 }
 
+#[cfg(test)]
+type TestConnection = (
+    Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+    Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+);
+
 #[derive(Default)]
 pub(crate) struct StreamConnector {
     proxy_config: Option<SocksProxyConfig>,
     #[cfg(test)]
-    test_connections: std::sync::Mutex<
-        std::collections::VecDeque<(
-            Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-            Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
-        )>,
-    >,
+    test_connections: std::sync::Mutex<std::collections::VecDeque<TestConnection>>,
 }
 
 impl From<Option<SocksProxyConfig>> for StreamConnector {

@@ -284,10 +284,10 @@ impl ChunkTracker {
         let chunk_info = self.lengths.chunk_info_from_received_data(
             self.lengths.validate_piece_index(piece.index)?,
             piece.begin,
-            piece.block.as_ref().len().try_into().unwrap(),
+            piece.block.as_ref().len().try_into().ok()?,
         )?;
         let chunk_range = self.lengths.chunk_range(chunk_info.piece_index);
-        let chunk_range = self.chunk_status.get_mut(chunk_range).unwrap();
+        let chunk_range = self.chunk_status.get_mut(chunk_range)?;
         if chunk_range.all() {
             return Some(ChunkMarkingResult::PreviouslyCompleted);
         }

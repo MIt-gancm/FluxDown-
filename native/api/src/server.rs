@@ -195,7 +195,7 @@ pub fn spawn_api_server(host: Arc<dyn ApiHost>, config: ApiServerConfig) -> ApiS
                     break;
                 }
                 Err(e) if attempt + 1 == BIND_RETRIES => {
-                    log_info!("[api-server] failed to bind {}: {}", addr, e);
+                    fluxdown_engine::logger::report_error("local-api", "bind listener", &e);
                 }
                 Err(_) => tokio::time::sleep(BIND_RETRY_DELAY).await,
             }
@@ -233,8 +233,8 @@ pub(crate) async fn serve_on(
     )
     .with_graceful_shutdown(cancel.cancelled_owned())
     .await;
-    if let Err(e) = served {
-        log_info!("[api-server] serve error: {}", e);
+    if let Err(error) = served {
+        fluxdown_engine::logger::report_error("local-api", "serve requests", &error);
     } else {
         log_info!("[api-server] stopped");
     }
@@ -462,6 +462,18 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized => StatusCode::UNAUTHORIZED,
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        match &self {
+            ApiError::Internal(_) => {
+                fluxdown_engine::logger::report_error("local-api", "serve request", &self);
+            }
+            ApiError::Unavailable => {
+                fluxdown_engine::logger::report_warning("local-api", "serve request", &self);
+            }
+            ApiError::NotFound
+            | ApiError::BadRequest(_)
+            | ApiError::Conflict(_)
+            | ApiError::Unauthorized => {}
+        }
         result_response(status, false, &self.to_string())
     }
 }

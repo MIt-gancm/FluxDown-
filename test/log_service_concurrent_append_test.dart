@@ -28,10 +28,9 @@ void main() {
   });
 
   /// 目录里唯一那个 fluxdown_*.log。
-  File logFile() => dir
-      .listSync()
-      .whereType<File>()
-      .firstWhere((f) => f.path.endsWith('.log'));
+  File logFile() => dir.listSync().whereType<File>().firstWhere(
+    (f) => f.path.endsWith('.log'),
+  );
 
   /// 模拟 Rust 端：每次重新 open 并落到真实 EOF，语义等价于 O_APPEND。
   void appendLikeRust(File file, String text) {
@@ -53,17 +52,17 @@ void main() {
     // 修复前 rust-1 / rust-2 会被紧随其后的 Dart 写入整行覆盖。
     expect(content, contains('[rust] rust-1'));
     expect(content, contains('[rust] rust-2'));
-    expect(content, contains('[T] dart-1'));
-    expect(content, contains('[T] dart-2'));
-    expect(content, contains('[T] dart-3'));
+    expect(content, contains('flutter{component="T"}: dart-1'));
+    expect(content, contains('flutter{component="T"}: dart-2'));
+    expect(content, contains('flutter{component="T"}: dart-3'));
 
     // 交错顺序 = 实际写入顺序，说明没有任何一端在错误偏移上落笔。
     final offsets = [
-      content.indexOf('[T] dart-1'),
+      content.indexOf('flutter{component="T"}: dart-1'),
       content.indexOf('[rust] rust-1'),
-      content.indexOf('[T] dart-2'),
+      content.indexOf('flutter{component="T"}: dart-2'),
       content.indexOf('[rust] rust-2'),
-      content.indexOf('[T] dart-3'),
+      content.indexOf('flutter{component="T"}: dart-3'),
     ];
     expect(offsets, orderedEquals(List<int>.from(offsets)..sort()));
   });
@@ -82,9 +81,34 @@ void main() {
     appendLikeRust(file, rustLine);
     service.log('T', 'x'); // 与第一条等长
 
-    expect(
-      file.lengthSync(),
-      baseline + dartLineBytes * 2 + rustLine.length,
+    expect(file.lengthSync(), baseline + dartLineBytes * 2 + rustLine.length);
+  });
+
+  test('错误日志包含稳定组件、错误 ID，并为堆栈每行保留结构前缀', () {
+    final service = LogService.forTest(dir);
+    final file = logFile();
+
+    service.error(
+      'Worker',
+      'operation failed',
+      StateError('boom'),
+      StackTrace.fromString('frame-one\nframe-two'),
     );
+
+    final errorLines = file
+        .readAsLinesSync()
+        .where((line) => line.contains('ERROR flutter{component="Worker"'))
+        .toList();
+    expect(errorLines, hasLength(5));
+    final ids = errorLines
+        .map((line) => RegExp(r'error_id="([^"]+)"').firstMatch(line)?.group(1))
+        .toSet();
+    expect(ids.length, 1);
+    expect(ids.single, isNotNull);
+    expect(
+      errorLines.any((line) => line.endsWith(': operation failed')),
+      isTrue,
+    );
+    expect(errorLines.any((line) => line.endsWith(': frame-two')), isTrue);
   });
 }

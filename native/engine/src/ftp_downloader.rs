@@ -555,7 +555,9 @@ pub async fn run_ftp_download(params: DownloadParams) {
                 task_id_log,
                 total
             );
-            let _ = params.db.update_task_status(&params.task_id, 3, "").await;
+            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
+                crate::logger::report_error("ftp-download", "persist completion status", &db_error);
+            }
             let _ = params
                 .progress_tx
                 .send(ProgressUpdate {
@@ -575,14 +577,20 @@ pub async fn run_ftp_download(params: DownloadParams) {
         }
         Err(e) => {
             let msg = e.to_string();
-            log_info!("[ftp-download] task {} error: {}", task_id_log, msg);
-            let _ = params.db.update_task_status(&params.task_id, 4, &msg).await;
+            crate::logger::report_error("ftp-download", "run task", &e);
+            if let Err(db_error) = params.db.update_task_status(&params.task_id, 4, &msg).await {
+                crate::logger::report_error(
+                    "ftp-download",
+                    "persist terminal error status",
+                    &db_error,
+                );
+            }
 
             // Preserve actual progress from DB so the UI doesn't jump back to 0%.
             let (dl, total) = match params.db.load_task_by_id(&params.task_id).await {
                 Ok(Some(t)) => (t.downloaded_bytes, t.total_bytes),
                 other => {
-                    log_info!(
+                    crate::log_warn!(
                         "[ftp-download] task {} warning: failed to read progress from DB: {:?}",
                         task_id_log,
                         other.err()

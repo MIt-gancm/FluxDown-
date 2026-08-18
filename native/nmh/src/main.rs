@@ -712,7 +712,8 @@ enum CliAction {
 fn classify_cli_invocation<S: AsRef<str>>(args: &[S]) -> Option<CliAction> {
     if args
         .iter()
-        .any(|a| matches!(a.as_ref(), "--version" | "-V")) {
+        .any(|a| matches!(a.as_ref(), "--version" | "-V"))
+    {
         return Some(CliAction::Version);
     }
     if args.is_empty() || args.iter().any(|a| matches!(a.as_ref(), "--help" | "-h")) {

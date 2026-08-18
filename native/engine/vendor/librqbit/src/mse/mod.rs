@@ -55,6 +55,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixReader<R> {
     }
 }
 
+// The encrypted variant carries two independent cipher states inline. Boxing
+// would add a heap allocation to every MSE connection solely to reduce enum size.
+#[allow(clippy::large_enum_variant)]
 pub enum IncomingOutcome<R, W> {
     Encrypted {
         read: Rc4Reader<R>,
@@ -176,9 +179,12 @@ where
         Vec::with_capacity(VC_LEN + 4 + 2 + pad_c.len() + 2 + initial_payload.len());
     encrypted.extend_from_slice(&[0u8; VC_LEN]);
     encrypted.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
-    encrypted.extend_from_slice(&(pad_c.len() as u16).to_be_bytes());
+    let pad_c_length = u16::try_from(pad_c.len()).context("MSE PadC length exceeds u16")?;
+    encrypted.extend_from_slice(&pad_c_length.to_be_bytes());
     encrypted.extend_from_slice(&pad_c);
-    encrypted.extend_from_slice(&(BT_HANDSHAKE_LEN as u16).to_be_bytes());
+    let initial_payload_length =
+        u16::try_from(BT_HANDSHAKE_LEN).context("MSE handshake length exceeds u16")?;
+    encrypted.extend_from_slice(&initial_payload_length.to_be_bytes());
     encrypted.extend_from_slice(initial_payload);
     encrypt.apply_keystream(&mut encrypted);
     write.write_all(&encrypted).await?;
@@ -310,7 +316,8 @@ where
     let mut response = Vec::with_capacity(VC_LEN + 4 + 2 + pad_d.len());
     response.extend_from_slice(&[0u8; VC_LEN]);
     response.extend_from_slice(&CRYPTO_RC4.to_be_bytes());
-    response.extend_from_slice(&(pad_d.len() as u16).to_be_bytes());
+    let pad_d_length = u16::try_from(pad_d.len()).context("MSE PadD length exceeds u16")?;
+    response.extend_from_slice(&pad_d_length.to_be_bytes());
     response.extend_from_slice(&pad_d);
     encrypt.apply_keystream(&mut response);
     write.write_all(&response).await?;

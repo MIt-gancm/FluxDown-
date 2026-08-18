@@ -3,11 +3,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use futures_util::FutureExt;
+use futures_util::{FutureExt, StreamExt};
 use reqwest::Client;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::bt_downloader::{self, BtConfig, BtDownloadParams, SharedBtSession, TorrentSource};
@@ -41,19 +42,21 @@ fn panic_message(panic_info: &Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// Handle a panicked download task: log the error, persist error status to DB,
-/// and send an error progress update to Dart.
-///
-/// This is the common panic-recovery logic shared by all download task spawns
-/// (HTTP, FTP, BT — both create and resume paths).
+/// Handle a panicked download task: persist error status and send an error
+/// progress update to Dart. The process-wide panic hook owns the root log event;
+/// the fallback below covers engine consumers that did not initialize it.
 async fn handle_task_panic(
     task_id: &str,
     msg: &str,
     db: &Db,
     progress_tx: &mpsc::Sender<ProgressUpdate>,
 ) {
-    log_info!("[download] PANIC in task {}: {}", task_id, msg);
-    let _ = db.update_task_status(task_id, 4, msg).await;
+    if !crate::logger::panic_hook_installed() {
+        crate::log_error!("[download] PANIC in task {}: {}", task_id, msg);
+    }
+    if let Err(db_error) = db.update_task_status(task_id, 4, msg).await {
+        crate::logger::report_error("download", "persist panic error status", &db_error);
+    }
     let _ = progress_tx
         .send(ProgressUpdate {
             task_id: task_id.to_string(),
@@ -195,6 +198,28 @@ fn task_target_path(save_dir: &str, file_name: &str) -> Option<PathBuf> {
     Some(PathBuf::from(save_dir).join(file_name))
 }
 
+/// BT 启动清理：目录中是否仍有任一非空文件。使用 Tokio 文件 API，把 Windows
+/// 网络盘/杀毒软件导致的阻塞 stat 移出 hub 的 current-thread runtime。
+async fn directory_has_real_data(path: &Path) -> bool {
+    let Ok(mut entries) = tokio::fs::read_dir(path).await else {
+        return false;
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                if entry
+                    .metadata()
+                    .await
+                    .is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    return true;
+                }
+            }
+            Ok(None) | Err(_) => return false,
+        }
+    }
+}
+
 /// 文件跟踪：探测单个路径是否已丢失。`Some(true)`=确证不存在、`Some(false)`=
 /// 存在、`None`=不可判定（I/O 错误 / 超时 / 权限）。调用方对 `None` 保持原
 /// 标志不变，避免把「临时不可访问」误判为「已删除」（防误报）；掉盘等瞬时
@@ -247,34 +272,34 @@ async fn scan_missing_files(
 
     // 活跃任务（pending/downloading/preparing）占用的目标路径：避免正在重下
     // 同名文件时把旧的 completed 任务误判为丢失。
-    let active_paths: HashSet<(&str, &str)> = rows
+    let active_paths: HashSet<PathBuf> = rows
         .iter()
         .filter(|t| matches!(t.status, 0 | 1 | 5))
-        .map(|t| (t.save_dir.as_str(), t.file_name.as_str()))
+        .filter_map(|t| task_target_path(&t.save_dir, &t.file_name))
         .collect();
 
-    let sem = Arc::new(Semaphore::new(FILE_SCAN_CONCURRENCY));
-    let mut futs = Vec::new();
-    for t in rows.iter().filter(|t| t.status == 3) {
-        if active_paths.contains(&(t.save_dir.as_str(), t.file_name.as_str())) {
-            continue;
-        }
-        let Some(path) = task_target_path(&t.save_dir, &t.file_name) else {
-            continue;
-        };
-        let sem = sem.clone();
-        let id = t.task_id.clone();
-        let was_missing = t.file_missing;
-        futs.push(async move {
-            let _permit = sem.acquire_owned().await.ok()?;
-            let missing = probe_missing(&path).await?;
-            (missing != was_missing).then_some((id, missing))
+    // 只让固定数量的 stat future 同时存活。旧实现先为全部 completed 行构造
+    // future，再用信号量限制实际探测；历史任务很多时，等待中的 future 本身
+    // 会造成与任务数线性相关的瞬时分配。`buffered` 仍保持输入顺序。
+    let probe_futures = rows
+        .into_iter()
+        .filter(|t| t.status == 3)
+        .filter_map(move |t| {
+            let path = task_target_path(&t.save_dir, &t.file_name)?;
+            if active_paths.contains(&path) {
+                return None;
+            }
+            Some(async move {
+                let missing = probe_missing(&path).await?;
+                (missing != t.file_missing).then_some((t.task_id, missing))
+            })
         });
-    }
 
     // 先收齐全部探测结果，再一次事务写回。逐条独立 UPDATE 在「外置盘掉线」
     // 这类上万条同时翻转的场景下是上万次 fsync（SQLite 默认 synchronous=FULL）。
-    let probed: Vec<(String, bool)> = futures_util::future::join_all(futs)
+    let probed: Vec<(String, bool)> = futures_util::stream::iter(probe_futures)
+        .buffered(FILE_SCAN_CONCURRENCY)
+        .collect::<Vec<_>>()
         .await
         .into_iter()
         .flatten()
@@ -4009,20 +4034,20 @@ impl DownloadManager {
             // Owned tuples:rescue 内含 move_path(最坏 2s 瞬时锁重试退避),
             // 必须经 spawn_blocking 跑,不能在 current_thread runtime 上同步
             // 阻塞(会冻结进度上报/FFI 响应)。
-            let rescue_input: Vec<(String, String, String)> = task_map
-                .iter()
-                .filter_map(|(&id, (status, save_dir, file_name, _))| {
-                    if *status != 3 {
-                        return None;
-                    }
-                    let stage = bt_downloader::bt_stage_dir(save_dir, id);
-                    if stage.exists() {
-                        Some((id.to_string(), save_dir.to_string(), file_name.to_string()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            let mut rescue_input: Vec<(String, String, String)> = Vec::new();
+            for (&id, (status, save_dir, file_name, _)) in &task_map {
+                if *status != 3 {
+                    continue;
+                }
+                let stage = bt_downloader::bt_stage_dir(save_dir, id);
+                if tokio::fs::try_exists(stage).await.unwrap_or(false) {
+                    rescue_input.push((
+                        id.to_string(),
+                        save_dir.to_string(),
+                        file_name.to_string(),
+                    ));
+                }
+            }
 
             // Build total_bytes lookup for DB update after rescue.
             let total_bytes_map: std::collections::HashMap<&str, i64> = task_map
@@ -4083,13 +4108,15 @@ impl DownloadManager {
             }
 
             // Now scan all save_dirs for staging dirs and handle each case.
+            // Tokio fs keeps directory enumeration/stat/delete off the hub's
+            // current-thread runtime while preserving the existing decisions.
             for save_dir in &save_dirs {
-                let dir = std::path::Path::new(save_dir);
-                let entries = match std::fs::read_dir(dir) {
-                    Ok(e) => e,
+                let dir = Path::new(save_dir);
+                let mut entries = match tokio::fs::read_dir(dir).await {
+                    Ok(entries) => entries,
                     Err(_) => continue,
                 };
-                for entry in entries.filter_map(|e| e.ok()) {
+                while let Ok(Some(entry)) = entries.next_entry().await {
                     let file_name = entry.file_name();
                     let name_str = file_name.to_string_lossy();
                     if !name_str.starts_with(bt_downloader::BT_STAGE_PREFIX) {
@@ -4105,7 +4132,7 @@ impl DownloadManager {
                                 "[manager] startup cleanup: removing orphan staging dir {}",
                                 path.display()
                             );
-                            if let Err(e) = std::fs::remove_dir_all(&path) {
+                            if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                                 log_info!(
                                     "[manager] startup cleanup: failed to remove orphan staging dir {}: {}",
                                     path.display(),
@@ -4120,13 +4147,7 @@ impl DownloadManager {
                             // 部分移动失败(权限/跨盘/IO)而保留了仍含真实数据的目录,
                             // 这里必须同样用 has_real_data 守卫保留,否则无条件
                             // remove_dir_all 会把这些文件永久删除(与 Case B 一致)。
-                            let has_real_data = std::fs::read_dir(&path)
-                                .map(|rd| {
-                                    rd.filter_map(|e| e.ok())
-                                        .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
-                                })
-                                .unwrap_or(false);
-                            if has_real_data {
+                            if directory_has_real_data(&path).await {
                                 log_info!(
                                     "[manager] startup cleanup: keeping completed-task staging dir {} (still has real data; rescue likely partially failed)",
                                     path.display()
@@ -4136,7 +4157,7 @@ impl DownloadManager {
                                     "[manager] startup cleanup: removing completed-task staging dir {}",
                                     path.display()
                                 );
-                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                                     log_info!(
                                         "[manager] startup cleanup: failed to remove completed staging dir {}: {}",
                                         path.display(),
@@ -4152,13 +4173,7 @@ impl DownloadManager {
                             // the task was paused/cancelled before any real data was
                             // written (e.g. the same torrent was re-added, creating a
                             // new task_id and new staging dir, making this one stale).
-                            let has_real_data = std::fs::read_dir(&path)
-                                .map(|rd| {
-                                    rd.filter_map(|e| e.ok())
-                                        .any(|e| e.metadata().map(|m| m.len() > 0).unwrap_or(false))
-                                })
-                                .unwrap_or(false);
-                            if has_real_data {
+                            if directory_has_real_data(&path).await {
                                 log_info!(
                                     "[manager] startup cleanup: keeping staging dir {} (task active/paused, has data)",
                                     path.display()
@@ -4168,7 +4183,7 @@ impl DownloadManager {
                                     "[manager] startup cleanup: removing empty staging dir {} (task active/paused but no real data)",
                                     path.display()
                                 );
-                                if let Err(e) = std::fs::remove_dir_all(&path) {
+                                if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                                     log_info!(
                                         "[manager] startup cleanup: failed to remove empty staging dir {}: {}",
                                         path.display(),
@@ -5097,15 +5112,23 @@ impl DownloadManager {
         let panic_progress_tx = self.progress_tx.clone();
         let panic_task_id = task_id.clone();
         let panic_db = self.db.clone();
+        let task_span = tracing::error_span!("download_task", task_id = %task_id);
 
         let handle = if use_bt {
             // Lazily initialise the shared BT session.
             if let Err(e) = self.ensure_bt_session().await {
-                log_info!("[manager] failed to init BT session: {}", e);
-                let _ = self
+                crate::log_error!("[manager] failed to init BT session: {}", e);
+                if let Err(db_error) = self
                     .db
                     .update_task_status(&task_id, 4, &e.to_string())
-                    .await;
+                    .await
+                {
+                    crate::logger::report_error(
+                        "download-manager",
+                        "persist BT session initialization error",
+                        &db_error,
+                    );
+                }
                 let _ = self
                     .progress_tx
                     .send(ProgressUpdate {
@@ -5124,7 +5147,9 @@ impl DownloadManager {
             }
             // bt_session is guaranteed to be Some after ensure_bt_session().
             let Some(bt_ref) = self.bt_session.as_ref() else {
-                log_info!("[manager] BUG: bt_session is None after ensure_bt_session succeeded");
+                crate::log_error!(
+                    "[manager] BUG: bt_session is None after ensure_bt_session succeeded"
+                );
                 self.active_tasks.remove(&task_id);
                 return;
             };
@@ -5223,25 +5248,29 @@ impl DownloadManager {
                 },
             };
 
-            tokio::spawn(async move {
-                let result =
-                    std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
-                        .catch_unwind()
+            tokio::spawn(
+                async move {
+                    let result =
+                        std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
+                            .catch_unwind()
+                            .await;
+
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path: None, // BT 任务不使用文件名预订机制
+                        })
                         .await;
-
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path: None, // BT 任务不使用文件名预订机制
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         } else {
             let (task_client, task_proxy, (auto_route, auto_ctx)) =
                 self.task_http_context(&url, &proxy_url, &user_agent, &queue_id, ignore_tls_errors);
@@ -5331,44 +5360,49 @@ impl DownloadManager {
             };
 
             let reserved_set = Arc::clone(&self.reserved_temp_paths);
-            tokio::spawn(async move {
-                let mut params = params;
-                let reserved_temp_path = finalize_start_file_name(&mut params, &reserved_set).await;
-                let result = if use_ftp {
-                    std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_hls {
-                    std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_dash {
-                    std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_ed2k {
-                    std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
-                        .catch_unwind()
-                        .await
-                } else {
-                    std::panic::AssertUnwindSafe(downloader::run_download(params))
-                        .catch_unwind()
-                        .await
-                };
+            tokio::spawn(
+                async move {
+                    let mut params = params;
+                    let reserved_temp_path =
+                        finalize_start_file_name(&mut params, &reserved_set).await;
+                    let result = if use_ftp {
+                        std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_hls {
+                        std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_dash {
+                        std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_ed2k {
+                        std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
+                            .catch_unwind()
+                            .await
+                    } else {
+                        std::panic::AssertUnwindSafe(downloader::run_download(params))
+                            .catch_unwind()
+                            .await
+                    };
 
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path,
+                        })
+                        .await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path,
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         };
         if let Some(entry) = self.active_tasks.get_mut(&task_id) {
             entry.handle = Some(handle);
@@ -6011,12 +6045,20 @@ impl DownloadManager {
         let panic_progress_tx = self.progress_tx.clone();
         let panic_task_id = tid.clone();
         let panic_db = self.db.clone();
+        let task_span = tracing::error_span!("download_task", task_id = %tid);
 
         let handle = if use_bt {
             // Lazily initialise the shared BT session.
             if let Err(e) = self.ensure_bt_session().await {
-                log_info!("[manager] failed to init BT session for resume: {}", e);
-                let _ = self.db.update_task_status(task_id, 4, &e.to_string()).await;
+                crate::log_error!("[manager] failed to init BT session for resume: {}", e);
+                if let Err(db_error) = self.db.update_task_status(task_id, 4, &e.to_string()).await
+                {
+                    crate::logger::report_error(
+                        "download-manager",
+                        "persist resumed BT session initialization error",
+                        &db_error,
+                    );
+                }
                 let _ = self
                     .progress_tx
                     .send(ProgressUpdate {
@@ -6035,7 +6077,9 @@ impl DownloadManager {
             }
             // bt_session is guaranteed to be Some after ensure_bt_session().
             let Some(bt_ref) = self.bt_session.as_ref() else {
-                log_info!("[manager] BUG: bt_session is None after ensure_bt_session succeeded");
+                crate::log_error!(
+                    "[manager] BUG: bt_session is None after ensure_bt_session succeeded"
+                );
                 self.active_tasks.remove(task_id);
                 return;
             };
@@ -6046,7 +6090,7 @@ impl DownloadManager {
             let mut existing = match bt_ref.resume_task(task_id).await {
                 Ok(h) => h,
                 Err(e) => {
-                    log_info!("[manager] BT resume_task error (will re-add): {}", e);
+                    crate::log_warn!("[manager] BT resume_task error (will re-add): {}", e);
                     None
                 }
             };
@@ -6188,25 +6232,29 @@ impl DownloadManager {
                 upload_limit_bps,
             };
 
-            tokio::spawn(async move {
-                let result =
-                    std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
-                        .catch_unwind()
+            tokio::spawn(
+                async move {
+                    let result =
+                        std::panic::AssertUnwindSafe(bt_downloader::run_bt_download(bt_params))
+                            .catch_unwind()
+                            .await;
+
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path: None, // BT 任务不使用文件名预订机制
+                        })
                         .await;
-
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path: None, // BT 任务不使用文件名预订机制
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         } else {
             // Resolve proxy and UA for resume: use global UA (cookies not
             // persisted in DB, so only proxy_url is available from task row).
@@ -6270,22 +6318,24 @@ impl DownloadManager {
                 let pc = auto_override.unwrap_or_else(|| self.proxy_config.resolve());
                 (self.client.clone(), pc)
             };
-            // Range 未验证的 hint 任务（tasks.range_verified==0：源自浏览器扩展
-            // hint、从未拿到过 206/Accept-Ranges 证据）：resume 以 DB 里的
-            // total_bytes 作 hint 延续「跳过 probe + 首连接 plain GET」保守启动
-            // ——落回默认 probe 会对配额型端点（fnOS multiple-download）重新
-            // 发 HEAD/Range 并作废 token。已验证任务/旧库任务：照常 probe。
             let range_verified = self.db.get_task_range_verified(&tid).await.unwrap_or(true);
-            // resolver 插件本次 resolve 担保 Range 支持 → 视为已验证：配合下方
-            // ephemeral hint，跳过 probe 且按多段起飞（不落保守单流启动）。
             #[cfg(feature = "plugins")]
             let range_verified = range_verified || plugin_range_supported;
-            let resume_hint = if range_verified {
-                0 // no hint on resume; use probe to get current size
-            } else if task.total_bytes > 0 {
+
+            // 普通 HTTP 续传已持久化文件大小、分段进度与原始 validator。
+            // 已知大小时直接从真实缺口发 Range 请求，避免 HEAD / Range 0-0 /
+            // plain GET 重新消耗一次性签名 URL。下游仍用持久化的 ETag /
+            // Last-Modified 发送 If-Range：206 续传，版本变化返回 200 时清盘重下。
+            //
+            // 未知大小仅沿用未验证 hint 任务的免 probe 语义；FTP/HLS/DASH/ED2K
+            // 使用各自下载器，不把 HTTP hint 契约扩散到协议专用路径。
+            let is_plain_http = !use_ftp && !use_hls && !use_dash && !use_ed2k;
+            let resume_hint = if is_plain_http && task.total_bytes > 0 {
                 task.total_bytes
+            } else if is_plain_http && !range_verified {
+                -1
             } else {
-                -1 // 大小未知但确认可下载（沿用扩展 webRequest 嗅探语义）
+                0
             };
             // ephemeral 直链（一次性/防探测签名 URL）：resolve 刚给出新鲜直链，
             // probe 会作废它 → 跳过 probe（与 start 路径 hint 语义对称）。大小
@@ -6351,42 +6401,46 @@ impl DownloadManager {
                 unattended: task_unattended,
             };
 
-            tokio::spawn(async move {
-                let result = if use_ftp {
-                    std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_hls {
-                    std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_dash {
-                    std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
-                        .catch_unwind()
-                        .await
-                } else if use_ed2k {
-                    std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
-                        .catch_unwind()
-                        .await
-                } else {
-                    std::panic::AssertUnwindSafe(downloader::run_download(params))
-                        .catch_unwind()
-                        .await
-                };
+            tokio::spawn(
+                async move {
+                    let result = if use_ftp {
+                        std::panic::AssertUnwindSafe(ftp_downloader::run_ftp_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_hls {
+                        std::panic::AssertUnwindSafe(hls_downloader::run_hls_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_dash {
+                        std::panic::AssertUnwindSafe(dash_downloader::run_dash_download(params))
+                            .catch_unwind()
+                            .await
+                    } else if use_ed2k {
+                        std::panic::AssertUnwindSafe(crate::ed2k::run_ed2k_download(params))
+                            .catch_unwind()
+                            .await
+                    } else {
+                        std::panic::AssertUnwindSafe(downloader::run_download(params))
+                            .catch_unwind()
+                            .await
+                    };
 
-                if let Err(panic_info) = result {
-                    let msg = panic_message(&panic_info);
-                    handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx).await;
+                    if let Err(panic_info) = result {
+                        let msg = panic_message(&panic_info);
+                        handle_task_panic(&panic_task_id, &msg, &panic_db, &panic_progress_tx)
+                            .await;
+                    }
+
+                    let _ = done_tx
+                        .send(TaskDone {
+                            task_id: panic_task_id,
+                            generation: spawn_gen,
+                            reserved_temp_path: None, // resume 任务不预订文件名
+                        })
+                        .await;
                 }
-
-                let _ = done_tx
-                    .send(TaskDone {
-                        task_id: panic_task_id,
-                        generation: spawn_gen,
-                        reserved_temp_path: None, // resume 任务不预订文件名
-                    })
-                    .await;
-            })
+                .instrument(task_span),
+            )
         };
         if let Some(entry) = self.active_tasks.get_mut(task_id) {
             entry.handle = Some(handle);
@@ -8652,23 +8706,31 @@ async fn emit_seeding_progress(
     seeding_status: i32,
     seeding_message: &str,
 ) {
-    if let Ok(Some(t)) = db.load_task_by_id(task_id).await {
-        sink.emit(EngineEvent::TaskProgress {
-            task_id: task_id.to_string(),
-            status: 3,
-            downloaded_bytes: t.downloaded_bytes,
-            total_bytes: t.total_bytes,
-            speed: 0,
-            file_name: t.file_name.clone(),
-            save_dir: t.save_dir.clone(),
-            url: t.url.clone(),
-            error_message: String::new(),
-            upload_speed_bps: 0,
-            uploaded_bytes: t.uploaded_bytes,
-            seeding_status,
-            seeding_message: seeding_message.to_string(),
-            seeding_time_secs: t.seeding_time_secs,
-        });
+    match db.load_task_by_id(task_id).await {
+        Ok(Some(t)) => {
+            sink.emit(EngineEvent::TaskProgress {
+                task_id: task_id.to_string(),
+                status: 3,
+                downloaded_bytes: t.downloaded_bytes,
+                total_bytes: t.total_bytes,
+                speed: 0,
+                file_name: t.file_name.clone(),
+                save_dir: t.save_dir.clone(),
+                url: t.url.clone(),
+                error_message: String::new(),
+                upload_speed_bps: 0,
+                uploaded_bytes: t.uploaded_bytes,
+                seeding_status,
+                seeding_message: seeding_message.to_string(),
+                seeding_time_secs: t.seeding_time_secs,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let span = tracing::error_span!("seeding_progress", task_id);
+            let _guard = span.enter();
+            crate::logger::report_error("download-manager", "load seeding progress", &error);
+        }
     }
 }
 
@@ -9004,7 +9066,15 @@ pub async fn progress_reporter(
                     // 落库顺序不确定。一个先发起、携带中途较小 downloaded_bytes
                     // 的后台写入可能在完成写入之后才抢到锁，把 100% 覆盖回中途值。
                     // 用 MAX 语义的单调写入彻底消除该顺序依赖（进度只前进不回退）。
-                    let _ = db_clone.update_task_progress_monotonic(&tid, dl).await;
+                    if let Err(error) = db_clone.update_task_progress_monotonic(&tid, dl).await {
+                        let span = tracing::error_span!("progress_persistence", task_id = %tid);
+                        let _guard = span.enter();
+                        crate::logger::report_error(
+                            "download-manager",
+                            "persist active progress",
+                            &error,
+                        );
+                    }
                 });
                 *task_last_save = now;
             }
@@ -9023,9 +9093,21 @@ pub async fn progress_reporter(
                 // （= 文件总大小），用 MAX 语义后，任何在其之后才落库的陈旧
                 // status=1 后台写入（携带更小的中途值）都会被钳制为 no-op，
                 // 不会把已显示的 100% 覆盖回中途进度。
-                let _ = db
+                if let Err(error) = db
                     .update_task_progress_monotonic(&update.task_id, update.downloaded_bytes)
-                    .await;
+                    .await
+                {
+                    let span = tracing::error_span!(
+                        "progress_persistence",
+                        task_id = %update.task_id
+                    );
+                    let _guard = span.enter();
+                    crate::logger::report_error(
+                        "download-manager",
+                        "persist completed progress",
+                        &error,
+                    );
+                }
             }
             // Use total_bytes when available; fall back to downloaded_bytes
             // for unknown-size downloads where total_bytes may still be 0.
@@ -9034,10 +9116,21 @@ pub async fn progress_reporter(
             } else {
                 update.downloaded_bytes
             };
-            if final_total > 0 {
-                let _ = db
+            if final_total > 0
+                && let Err(error) = db
                     .update_task_total_bytes(&update.task_id, final_total)
-                    .await;
+                    .await
+            {
+                let span = tracing::error_span!(
+                    "progress_persistence",
+                    task_id = %update.task_id
+                );
+                let _guard = span.enter();
+                crate::logger::report_error(
+                    "download-manager",
+                    "persist completed total bytes",
+                    &error,
+                );
             }
         }
 

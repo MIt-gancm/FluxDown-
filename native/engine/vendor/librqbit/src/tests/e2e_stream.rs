@@ -25,7 +25,8 @@ async fn e2e_stream() -> anyhow::Result<()> {
     )
     .await?;
 
-    let orig_content = std::fs::read(files.path().join("0.data")).unwrap();
+    let orig_content =
+        std::fs::read(files.path().join("0.data")).context("error reading source content")?;
     let server_session = Session::new_with_opts(
         files.path().into(),
         crate::SessionOptions {
@@ -41,6 +42,11 @@ async fn e2e_stream() -> anyhow::Result<()> {
     .context("error creating server session")?;
 
     info!("created server session");
+    let output_folder = files
+        .path()
+        .to_str()
+        .context("source path is not valid UTF-8")?
+        .to_owned();
 
     timeout(
         Duration::from_secs(5),
@@ -49,14 +55,14 @@ async fn e2e_stream() -> anyhow::Result<()> {
                 AddTorrent::from_bytes(torrent.as_bytes()?),
                 Some(crate::AddTorrentOptions {
                     paused: false,
-                    output_folder: Some(files.path().to_str().unwrap().to_owned()),
+                    output_folder: Some(output_folder),
                     overwrite: true,
                     ..Default::default()
                 }),
             )
             .await?
             .into_handle()
-            .unwrap()
+            .context("server add did not return a torrent handle")?
             .wait_until_completed(),
     )
     .await?
@@ -65,8 +71,12 @@ async fn e2e_stream() -> anyhow::Result<()> {
     info!("server torrent was completed");
 
     let peer = SocketAddr::new(
-        "127.0.0.1".parse().unwrap(),
-        server_session.tcp_listen_port().unwrap(),
+        "127.0.0.1"
+            .parse()
+            .context("error parsing loopback address")?,
+        server_session
+            .tcp_listen_port()
+            .context("server session did not bind a TCP port")?,
     );
 
     let client_dir = TempDir::with_prefix("test_e2e_stream_client")?;
@@ -97,7 +107,7 @@ async fn e2e_stream() -> anyhow::Result<()> {
         )
         .await?
         .into_handle()
-        .unwrap();
+        .context("client add did not return a torrent handle")?;
 
     client_handle.wait_until_initialized().await?;
 
@@ -107,9 +117,7 @@ async fn e2e_stream() -> anyhow::Result<()> {
     let mut buf = Vec::<u8>::with_capacity(8192);
     stream.read_to_end(&mut buf).await?;
 
-    if buf != orig_content {
-        panic!("contents differ")
-    }
+    anyhow::ensure!(buf == orig_content, "contents differ");
 
     Ok(())
 }

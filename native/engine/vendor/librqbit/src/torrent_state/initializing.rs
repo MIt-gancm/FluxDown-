@@ -129,7 +129,7 @@ impl TorrentStateInitializing {
             let mut queue = queue.iter_ones().collect_vec();
             queue.shuffle(&mut rand::rng());
             for (tmp_id, piece_id) in queue.into_iter().enumerate() {
-                let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
+                let denom = u32::try_from((tmp_id + 1).min(50)).unwrap_or(50);
                 if rand::rng().random_ratio(1, denom) {
                     to_validate.set(piece_id, true);
                 }

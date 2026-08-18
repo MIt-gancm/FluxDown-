@@ -82,7 +82,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
                     Some(Err(e)) => {
                         debug!("{:#}", e);
                     },
-                    None => unreachable!()
+                    None => continue,
                 }
             }
 

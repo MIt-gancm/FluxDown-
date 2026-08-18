@@ -250,13 +250,33 @@ enum ConfigCmd {
 }
 
 fn main() -> ProcExitCode {
-    let cli = Cli::parse();
+    if let Err(error) = fluxdown_engine::logger::init() {
+        eprintln!(
+            "fluxdown: failed to initialize logger: {}",
+            fluxdown_engine::logger::format_error_chain(&error)
+        );
+        return ProcExitCode::from(ExitCode::Unknown.code() as u8);
+    }
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => {
+            let exit_code = error.exit_code();
+            if error.use_stderr() {
+                fluxdown_engine::logger::report_error("cli", "parse arguments", &error);
+            }
+            if let Err(print_error) = error.print() {
+                fluxdown_engine::logger::report_error("cli", "print argument error", &print_error);
+            }
+            return ProcExitCode::from(u8::try_from(exit_code).unwrap_or(1));
+        }
+    };
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
     {
         Ok(rt) => rt,
         Err(e) => {
+            fluxdown_engine::logger::report_error("cli", "start runtime", &e);
             eprintln!("fluxdown: failed to start runtime: {e}");
             return ProcExitCode::from(ExitCode::Unknown.code() as u8);
         }
@@ -306,6 +326,7 @@ async fn run(cli: Cli) -> i32 {
         return match cmd_config(args.action, json) {
             Ok(()) => ExitCode::Success.code(),
             Err(e) => {
+                fluxdown_engine::logger::report_error("cli", "config command", &e);
                 eprintln!("fluxdown: {e}");
                 e.exit().code()
             }
@@ -320,6 +341,7 @@ async fn run(cli: Cli) -> i32 {
         return match local::run_add_local(*a, json).await {
             Ok(()) => ExitCode::Success.code(),
             Err(e) => {
+                fluxdown_engine::logger::report_error("cli", "local add", &e);
                 eprintln!("fluxdown: {e}");
                 e.exit.code()
             }
@@ -329,6 +351,7 @@ async fn run(cli: Cli) -> i32 {
     // 加载持久化配置作为 flag/env 未指定时的兜底（优先级：flag/env > 配置文件 > 默认）。
     // 读取失败不致命：仅告警并退回空配置，仍可用 flag/env/默认驱动。
     let cfg = CliConfig::load().unwrap_or_else(|e| {
+        fluxdown_engine::logger::report_warning("cli", "load config", &e);
         eprintln!("fluxdown: warning: {e}");
         CliConfig::default()
     });
@@ -344,6 +367,7 @@ async fn run(cli: Cli) -> i32 {
     let client = match ApiClient::new(&base, &token, timeout) {
         Ok(c) => c,
         Err(e) => {
+            fluxdown_engine::logger::report_error("cli", "initialize client", &e);
             eprintln!("fluxdown: {e}");
             return e.exit.code();
         }
@@ -375,6 +399,7 @@ async fn run(cli: Cli) -> i32 {
     match result {
         Ok(()) => ExitCode::Success.code(),
         Err(e) => {
+            fluxdown_engine::logger::report_error("cli", "command", &e);
             eprintln!("fluxdown: {e}");
             e.exit.code()
         }

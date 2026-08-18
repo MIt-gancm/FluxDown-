@@ -81,11 +81,6 @@
                 <category android:name="android.intent.category.BROWSABLE"/>
                 <data android:scheme="magnet"/>
             </intent-filter>
-            <intent-filter>
-                <action android:name="android.intent.action.VIEW" />
-                <data android:scheme="http" />
-                <data android:scheme="https" />
-            </intent-filter>
             <!-- 自定义协议 fluxdown:// 唤起新建下载（与浏览器插件联动）。
                 格式：fluxdown://download?url=<encoded-url>&filename=<name>
                 浏览器插件的 enableFluxdownProtocol 开关开启后，拦截下载时
@@ -99,6 +94,30 @@
                     android:host="download"/>
             </intent-filter>
         </activity>
+        <!-- http(s) 二进制文件下载处理入口：带具体二进制 MIME 的 http/https 直链
+             才唤起 FluxDown 新建下载（Firefox 会按此匹配），避免把 FluxDown 当作
+             通用 Web/HTML 打开器（那类通用 scheme 匹配已移除）。 -->
+        <activity-alias
+            android:name="com.fluxdown.app.ExternalDownloadManager"
+            android:enabled="true"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:targetActivity="com.fluxdown.app.ExternalDownloadActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+                <data android:mimeType="application/octet-stream" />
+                <data android:mimeType="application/zip" />
+                <data android:mimeType="application/x-rar-compressed" />
+                <data android:mimeType="application/vnd.rar" />
+                <data android:mimeType="application/x-7z-compressed" />
+                <data android:mimeType="application/gzip" />
+                <data android:mimeType="application/vnd.android.package-archive" />
+            </intent-filter>
+        </activity-alias>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

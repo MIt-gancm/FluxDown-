@@ -204,7 +204,11 @@ impl Peer {
                     counters,
                 );
             }
-            PeerState::Connecting(..) | PeerState::Live(..) => unreachable!(),
+            unexpected => {
+                let state_name = unexpected.name();
+                self.set_state(unexpected, counters);
+                anyhow::bail!("peer state changed unexpectedly to {state_name}");
+            }
         }
         Ok(())
     }
@@ -215,9 +219,13 @@ impl Peer {
         counters: &PeerStates,
     ) -> Option<&mut LivePeerState> {
         if let PeerState::Connecting(_) = &self.state {
-            let tx = match self.take_state(counters) {
+            let previous = self.take_state(counters);
+            let tx = match previous {
                 PeerState::Connecting(tx) => tx,
-                _ => unreachable!(),
+                unexpected => {
+                    self.set_state(unexpected, counters);
+                    return None;
+                }
             };
             self.set_state(
                 PeerState::Live(LivePeerState::new(peer_id, tx, false)),

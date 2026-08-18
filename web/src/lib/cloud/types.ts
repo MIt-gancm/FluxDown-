@@ -57,6 +57,8 @@ export interface AuthResponse {
   expiresIn: number
   user: CloudUser
   entitlements: Entitlements
+  /** 当前套餐展示快照；套餐下架后仍返回。 */
+  currentPlan?: CatalogPlan | null
   device: CloudDevice
 }
 
@@ -68,6 +70,8 @@ export type LoginResult =
 /** GET /me 响应：UserDto 字段打平 + entitlements。 */
 export interface CloudProfile extends CloudUser {
   entitlements: Entitlements
+  /** 当前套餐展示快照；套餐下架后仍返回。 */
+  currentPlan?: CatalogPlan | null
 }
 
 /** GET /me/origin-id/random 响应：套餐允许时给出的建议 Origin ID(倾向"豹子号"，不锁定)。 */

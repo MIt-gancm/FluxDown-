@@ -171,7 +171,10 @@ fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
             .filename
             .to_pathbuf()
             .with_context(|| format!("filename of file {idx} is not valid utf8"))?;
-        if filename_re.is_match(full_path.to_str().unwrap()) {
+        let full_path = full_path
+            .to_str()
+            .with_context(|| format!("filename of file {idx} is not valid UTF-8"))?;
+        if filename_re.is_match(full_path) {
             only_files.push(idx);
         }
     }
@@ -625,8 +628,8 @@ impl Session {
             let blocklist: blocklist::Blocklist = if let Some(blocklist_url) = opts.blocklist_url {
                 blocklist::Blocklist::load_from_url(&blocklist_url)
                     .await
-                    .inspect_err(|e| warn!("failed to read blocklist: {e}"))
-                    .unwrap()
+                    .inspect_err(|error| warn!("failed to read blocklist: {error}"))
+                    .context("error loading blocklist")?
             } else {
                 blocklist::Blocklist::empty()
             };
@@ -1088,8 +1091,8 @@ impl Session {
         // Let the subfolder name be the longest filename
         let longest = files
             .iter()
-            .max_by_key(|(_, l)| l)
-            .unwrap()
+            .max_by_key(|(_, length)| length)
+            .context("torrent contains no files")?
             .0
             .file_stem()
             .context("can't determine longest filename")?;
@@ -1325,21 +1328,36 @@ impl Session {
             debug!("error pausing torrent before deletion: {e:#}")
         }
 
-        let metadata = removed.metadata.load_full().expect("TODO");
+        if let Some(persistence) = self.persistence.as_ref() {
+            if let Err(error) = persistence.delete(id).await {
+                error!(error = ?error, "error deleting torrent from persistence database");
+            } else {
+                debug!(?id, "deleted torrent from persistence database")
+            }
+        }
 
+        if !delete_files {
+            debug!("not deleting files");
+            info!(id, "deleted torrent");
+            return Ok(());
+        }
+
+        let metadata = removed
+            .metadata
+            .load_full()
+            .context("torrent deleted, but metadata is unavailable for deleting files")?;
         let storage = removed
-            .with_state_mut(|s| match s.take() {
-                ManagedTorrentState::Initializing(p) => p.files.take().ok(),
-                ManagedTorrentState::Paused(p) => Some(p.files),
-                ManagedTorrentState::Live(l) => l
+            .with_state_mut(|state| match state.take() {
+                ManagedTorrentState::Initializing(initializing) => initializing.files.take().ok(),
+                ManagedTorrentState::Paused(paused) => Some(paused.files),
+                ManagedTorrentState::Live(live) => live
                     .pause()
-                    // inspect_err not available in 1.75
-                    .map_err(|e| {
-                        warn!("error pausing torrent: {e:#}");
-                        e
+                    .map_err(|error| {
+                        warn!("error pausing torrent: {error:#}");
+                        error
                     })
                     .ok()
-                    .map(|p| p.files),
+                    .map(|paused| paused.files),
                 _ => None,
             })
             .map(Ok)
@@ -1348,34 +1366,19 @@ impl Session {
                     .shared
                     .storage_factory
                     .create(removed.shared(), &metadata)
-            });
+            })
+            .context("torrent deleted, but could not delete files")?;
 
-        if let Some(p) = self.persistence.as_ref() {
-            if let Err(e) = p.delete(id).await {
-                error!(error=?e, "error deleting torrent from persistence database");
-            } else {
-                debug!(?id, "deleted torrent from persistence database")
+        debug!("will delete files");
+        remove_files_and_dirs(&metadata.file_infos, &storage);
+        if removed.shared().options.output_folder != self.output_folder {
+            if let Err(error) = storage.remove_directory_if_empty(Path::new("")) {
+                warn!(
+                    "error removing {:?}: {error:#}",
+                    removed.shared().options.output_folder
+                );
             }
         }
-
-        match (storage, delete_files) {
-            (Err(e), true) => return Err(e).context("torrent deleted, but could not delete files"),
-            (Ok(storage), true) => {
-                debug!("will delete files");
-                remove_files_and_dirs(&metadata.file_infos, &storage);
-                if removed.shared().options.output_folder != self.output_folder {
-                    if let Err(e) = storage.remove_directory_if_empty(Path::new("")) {
-                        warn!(
-                            "error removing {:?}: {e:#}",
-                            removed.shared().options.output_folder
-                        )
-                    }
-                }
-            }
-            (_, false) => {
-                debug!("not deleting files")
-            }
-        };
 
         info!(id, "deleted torrent");
         Ok(())

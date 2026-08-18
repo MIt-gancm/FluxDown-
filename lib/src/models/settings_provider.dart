@@ -62,6 +62,7 @@ class SettingsProvider extends ChangeNotifier {
   bool _showSidebarQueues = true; // 显示队列区块
   bool _showSidebarCategory = true; // 显示分类区块
   bool _showSidebarRss = true; // 显示 RSS 订阅区块
+  bool _referralFeatureEnabled = false; // 推介有奖按需展示，默认隐藏避免侧边栏干扰
 
   // 侧边栏设备协同区显示（三态渐进披露）：
   // null=自动（有远程设备才显示）/ true=强制显示 / false=强制隐藏
@@ -216,8 +217,8 @@ class SettingsProvider extends ChangeNotifier {
   /// 配置是否已从 Rust 端加载完成
   bool _loaded = false;
 
-  /// 是否启用文件关联功能（查询/监听注册表状态）。
-  /// `_settingsForExternal`（main.dart）不需要此功能，设为 false 避免重复查询。
+  /// 是否启用文件关联功能（查询/监听注册表状态）。测试或不展示文件关联
+  /// 设置的专用宿主可关闭；桌面主界面的共享实例保持启用。
   final bool _enableFileAssoc;
 
   StreamSubscription<RustSignalPack<ConfigLoaded>>? _configSub;
@@ -299,6 +300,7 @@ class SettingsProvider extends ChangeNotifier {
   bool get showSidebarQueues => _showSidebarQueues;
   bool get showSidebarCategory => _showSidebarCategory;
   bool get showSidebarRss => _showSidebarRss;
+  bool get referralFeatureEnabled => _referralFeatureEnabled;
 
   /// 设备协同区显示覆盖（null=自动 / true=强制显示 / false=强制隐藏）。
   bool? get showSidebarDeviceOverride => _showSidebarDevice;
@@ -785,6 +787,13 @@ class SettingsProvider extends ChangeNotifier {
     _showSidebarRss = value;
     notifyListeners();
     _saveToRust('show_sidebar_rss', value.toString());
+  }
+
+  void setReferralFeatureEnabled(bool value) {
+    if (_referralFeatureEnabled == value) return;
+    _referralFeatureEnabled = value;
+    notifyListeners();
+    _saveToRust('referral_feature_enabled', value.toString());
   }
 
   /// 设置设备协同区显示覆盖（true=强制显示 / false=强制隐藏，右键隐藏与设置开关共用）。
@@ -2074,6 +2083,8 @@ class SettingsProvider extends ChangeNotifier {
           _showSidebarCategory = entry.value != 'false';
         case 'show_sidebar_rss':
           _showSidebarRss = entry.value != 'false';
+        case 'referral_feature_enabled':
+          _referralFeatureEnabled = entry.value == 'true';
         case 'show_sidebar_device':
           _showSidebarDevice = entry.value == 'true'
               ? true

@@ -58,8 +58,12 @@ fn choose_piece_length(_input_files: &[Cow<'_, Path>]) -> u32 {
     2 * 1024 * 1024
 }
 
-fn osstr_to_bytes(o: &OsStr) -> Vec<u8> {
-    o.to_str().unwrap().to_owned().into_bytes()
+fn osstr_to_bytes(value: &OsStr) -> anyhow::Result<Vec<u8>> {
+    Ok(value
+        .to_str()
+        .context("torrent paths must be valid UTF-8")?
+        .as_bytes()
+        .to_vec())
 }
 
 async fn create_torrent_raw<'a>(
@@ -75,7 +79,7 @@ async fn create_torrent_raw<'a>(
     let single_file_mode = !is_dir;
     let name: ByteBufOwned = match options.name {
         Some(name) => name.as_bytes().into(),
-        None => osstr_to_bytes(basename).into(),
+        None => osstr_to_bytes(basename)?.into(),
     };
 
     let mut input_files: Vec<Cow<'a, Path>> = Default::default();
@@ -122,8 +126,8 @@ async fn create_torrent_raw<'a>(
                     .context("internal error, can't strip prefix")?;
                 let path = filename
                     .components()
-                    .map(|c| osstr_to_bytes(c.as_os_str()).into())
-                    .collect();
+                    .map(|component| osstr_to_bytes(component.as_os_str()).map(ByteBufOwned::from))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
                 output_files.push(TorrentMetaV1File {
                     length,
                     path,
