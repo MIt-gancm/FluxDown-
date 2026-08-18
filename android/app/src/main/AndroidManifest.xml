@@ -111,6 +111,20 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
         </activity-alias>
+        <!-- 通用 http/https 直链匹配（View Handlers 兜底）：任意 scheme 直链唤起
+             下载，不仅限于带二进制 MIME 的。 -->
+        <activity-alias
+            android:name="com.fluxdown.app.ExternalBrowserCompatActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:targetActivity="com.fluxdown.app.ExternalDownloadActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <data android:scheme="http" />
+                <data android:scheme="https" />
+            </intent-filter>
+        </activity-alias>
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data
