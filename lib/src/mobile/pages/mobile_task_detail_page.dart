@@ -237,7 +237,10 @@ class _FileHeaderCard extends StatelessWidget {
       await openFile(filePath);
     } catch (e) {
       if (context.mounted) {
-        showMobileToast(context, _openFileErrorText(LocaleScope.of(context), e));
+        showMobileToast(
+          context,
+          mobileFileErrorText(LocaleScope.of(context), e),
+        );
       }
     }
   }
@@ -905,20 +908,11 @@ class _Actions extends StatelessWidget {
       await openFile(filePath);
     } catch (e) {
       if (context.mounted) {
-        showMobileToast(context, _openFileErrorText(LocaleScope.of(context), e));
+        showMobileToast(
+          context,
+          mobileFileErrorText(LocaleScope.of(context), e),
+        );
       }
     }
   }
-}
-
-/// 移动端"打开文件"失败原因 → i18n 提示文案。
-String _openFileErrorText(S s, Object e) {
-  if (e is OpenFileException) {
-    return switch (e.error) {
-      OpenFileError.notFound => s.mobileFileNotFound,
-      OpenFileError.noHandler => s.mobileNoAppToOpen,
-      OpenFileError.failed => s.mobileOpenFileFailed,
-    };
-  }
-  return s.mobileOpenFileFailed;
 }

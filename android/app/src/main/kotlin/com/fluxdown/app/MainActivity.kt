@@ -2,6 +2,7 @@ package com.fluxdown.app
 
 import android.Manifest
 import android.app.Activity
+import android.content.ClipData
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
@@ -49,7 +50,13 @@ class MainActivity : FlutterActivity() {
                 // 应用内更新：唤起系统安装器安装下载好的 APK
                 "installApk" -> installApk(call.argument<String>("path"), result)
                 // 用系统默认应用打开已下载文件（无关联时回退系统选择器）
-                "openFile" -> openFile(call.argument<String>("path"), result)
+                "openFile" -> openFile(
+                    call.argument<String>("path"),
+                    call.argument<Boolean>("chooser"),
+                    result,
+                )
+                // 分享已下载文件（ACTION_SEND + 系统选择器）
+                "shareFile" -> shareFile(call.argument<String>("path"), result)
                 else -> result.notImplemented()
             }
         }
@@ -217,13 +224,18 @@ class MainActivity : FlutterActivity() {
     // ── 打开已下载文件 ──
 
     /**
-     * 用系统默认应用打开文件：经 FileProvider 暴露 content:// URI + ACTION_VIEW。
+     * 用系统应用打开文件：经 FileProvider 暴露 content:// URI + ACTION_VIEW。
      * targetSdk ≥ 24 禁止把 file:// URI 递出应用，必须走 content://。
-     * 无应用声明处理该 MIME（或系统拒绝）时，放宽为 星/星 并经系统选择器
-     * （Intent.createChooser）让用户自选应用。
+     * [chooser] 为 true 时强制拉起系统选择器（「更多打开方式」），由用户自选
+     * 应用；否则用默认关联应用打开，无应用声明处理该 MIME（或系统拒绝）时
+     * 放宽为 星/星 并经系统选择器兜底。
      * 错误码：bad_args / not_found / open_failed / no_handler，Dart 侧据此提示。
      */
-    private fun openFile(path: String?, result: MethodChannel.Result) {
+    private fun openFile(
+        path: String?,
+        chooser: Boolean?,
+        result: MethodChannel.Result,
+    ) {
         if (path.isNullOrEmpty()) {
             result.error("bad_args", "path is required", null)
             return
@@ -250,6 +262,16 @@ class MainActivity : FlutterActivity() {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
+        if (chooser == true) {
+            // 强制选择器：让用户自选应用
+            try {
+                startActivity(Intent.createChooser(view, null))
+                result.success(true)
+            } catch (e: Exception) {
+                result.error("no_handler", e.message, null)
+            }
+            return
+        }
         try {
             startActivity(view)
             result.success(true)
@@ -260,16 +282,57 @@ class MainActivity : FlutterActivity() {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
             try {
-                val chooser = Intent.createChooser(fallback, null).apply {
+                val chooserIntent = Intent.createChooser(fallback, null).apply {
                     addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 }
-                startActivity(chooser)
+                startActivity(chooserIntent)
                 result.success(true)
             } catch (e: Exception) {
                 result.error("no_handler", e.message, null)
             }
         } catch (e: Exception) {
             result.error("open_failed", e.message, null)
+        }
+    }
+
+    /**
+     * 分享已下载文件：经 FileProvider 暴露 content:// URI + ACTION_SEND +
+     * 系统选择器，供用户挑选接收应用。
+     * 错误码：bad_args / not_found / open_failed / no_handler。
+     */
+    private fun shareFile(path: String?, result: MethodChannel.Result) {
+        if (path.isNullOrEmpty()) {
+            result.error("bad_args", "path is required", null)
+            return
+        }
+        val file = java.io.File(path)
+        if (!file.exists()) {
+            result.error("not_found", "file not found: $path", null)
+            return
+        }
+        val uri = try {
+            androidx.core.content.FileProvider.getUriForFile(
+                this,
+                "$packageName.fileprovider",
+                file,
+            )
+        } catch (e: IllegalArgumentException) {
+            result.error("open_failed", e.message, null)
+            return
+        }
+        val mime = android.webkit.MimeTypeMap.getSingleton()
+            .getMimeTypeFromExtension(file.extension.lowercase()) ?: "*/*"
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = mime
+            putExtra(Intent.EXTRA_STREAM, uri)
+            clipData = ClipData.newUri(contentResolver, file.name, uri)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(Intent.createChooser(send, null))
+            result.success(true)
+        } catch (e: Exception) {
+            result.error("no_handler", e.message, null)
         }
     }
 

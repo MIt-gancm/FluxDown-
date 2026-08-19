@@ -1767,6 +1767,9 @@ class S {
   String get mobileBoostOff => _r('mobileBoostOff');
   String get mobileRetry => _r('mobileRetry');
   String get mobileOpenFile => _r('mobileOpenFile');
+  String get mobileOpenWith => _r('mobileOpenWith');
+  String get mobileShareFile => _r('mobileShareFile');
+  String get mobileShareFailed => _r('mobileShareFailed');
   String get mobileOpenFileFailed => _r('mobileOpenFileFailed');
   String get mobileFileNotFound => _r('mobileFileNotFound');
   String get mobileNoAppToOpen => _r('mobileNoAppToOpen');

@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
@@ -6,6 +8,7 @@ import '../../i18n/locale_provider.dart';
 import '../../models/download_controller.dart';
 import '../../models/download_queue.dart';
 import '../../models/download_task.dart';
+import '../../services/open_folder.dart';
 import '../../theme/app_colors.dart';
 import '../../theme/app_metrics.dart';
 import '../mobile_ui.dart';
@@ -141,8 +144,43 @@ Future<void> showMobileTaskActionSheet(
         },
       );
 
-      // 平铺为一个宫格：常规动作在前，危险动作在后
+      // 已完成且文件存在的任务（Android）：打开 / 更多打开方式 / 分享文件。
+      // 其他状态无落盘文件可操作；iOS 的 openFile 本身就带系统「打开方式」菜单，
+      // 且未实现分享，故仅 Android 门控展示。
+      final fileItems = <Widget>[
+        if (task.status == TaskStatus.completed &&
+            !task.fileMissing &&
+            Platform.isAndroid) ...[
+          tile(
+            icon: LucideIcons.file,
+            label: s.mobileOpenFile,
+            onTap: () {
+              Navigator.of(ctx).pop();
+              _openTaskFile(context, task, forceChooser: false);
+            },
+          ),
+          tile(
+            icon: LucideIcons.share2,
+            label: s.mobileOpenWith,
+            onTap: () {
+              Navigator.of(ctx).pop();
+              _openTaskFile(context, task, forceChooser: true);
+            },
+          ),
+          tile(
+            icon: LucideIcons.share,
+            label: s.mobileShareFile,
+            onTap: () {
+              Navigator.of(ctx).pop();
+              _shareTaskFile(context, task);
+            },
+          ),
+        ],
+      ];
+
+      // 平铺为一个宫格：文件操作在前，常规动作随后，危险动作在最后
       final tiles = <Widget>[
+        ...fileItems,
         ?toggleItem,
         ?boostItem,
         copyItem,
@@ -181,10 +219,10 @@ Future<void> showMobileTaskActionSheet(
         title: task.fileName,
         child: LayoutBuilder(
           builder: (ctx3, constraints) {
-            // 按可用宽度动态分列：tile 最小 104px，2~4 列
+            // 固定四列宫格（两行）：tile 等比分配可用宽度，超出的动作落到第二行。
             const gap = 10.0;
+            const cols = 4;
             final width = constraints.maxWidth;
-            final cols = (width / 114).floor().clamp(2, 4);
             final tileWidth = (width - gap * (cols - 1)) / cols;
             return Padding(
               padding: const EdgeInsets.symmetric(vertical: 4),
@@ -330,5 +368,37 @@ Future<void> confirmMobileDeleteTask(
       context,
       deleteFiles ? s.mobileTaskFileDeleted : s.mobileTaskDeleted,
     );
+  }
+}
+
+/// 打开任务文件；[forceChooser] 为 true 时强制系统「打开方式」选择器。
+Future<void> _openTaskFile(
+  BuildContext context,
+  DownloadTask task, {
+  bool forceChooser = false,
+}) async {
+  try {
+    await openFile(task.filePath, forceChooser: forceChooser);
+  } catch (e) {
+    if (context.mounted) {
+      showMobileToast(
+        context,
+        mobileFileErrorText(LocaleScope.of(context), e),
+      );
+    }
+  }
+}
+
+/// 分享任务文件到其他应用。
+Future<void> _shareTaskFile(BuildContext context, DownloadTask task) async {
+  try {
+    await shareFile(task.filePath);
+  } catch (e) {
+    if (!context.mounted) return;
+    final s = LocaleScope.of(context);
+    final msg = e is OpenFileException && e.error == OpenFileError.notFound
+        ? s.mobileFileNotFound
+        : s.mobileShareFailed;
+    showMobileToast(context, msg);
   }
 }
