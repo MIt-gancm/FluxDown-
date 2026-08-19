@@ -625,7 +625,12 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
   void _startDownload({bool startLater = false, String? queueOverride}) {
     if (widget.resolving) return;
     final saveDir = _saveDirController.text.trim();
-    if (saveDir.isEmpty) return;
+    if (saveDir.isEmpty) {
+      FluxSonner.of(
+        context,
+      ).show(ShadToast.destructive(title: Text(currentS.selectSaveDir)));
+      return;
+    }
 
     // 队列归属挂在动作按钮上（表单不再有队列字段）：箭头菜单显式指定 >
     // 动作默认——稍后下载 → 「稍后下载」队列；开始下载 → 默认队列。
@@ -803,9 +808,7 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
                   ShadOption(
                     value: d.deviceId,
                     child: Text(
-                      d.isOnline
-                          ? d.name
-                          : '${d.name} (${s.deviceOffline})',
+                      d.isOnline ? d.name : '${d.name} (${s.deviceOffline})',
                       overflow: TextOverflow.ellipsis,
                       maxLines: 1,
                     ),
@@ -835,11 +838,7 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
                       .firstOrNull;
                   name = cloudDevice?.name ?? localDevice?.name ?? value;
                 }
-                return Text(
-                  name,
-                  overflow: TextOverflow.ellipsis,
-                  maxLines: 1,
-                );
+                return Text(name, overflow: TextOverflow.ellipsis, maxLines: 1);
               },
               onChanged: (id) {
                 if (id == null) return;
@@ -954,8 +953,8 @@ class _QuickDownloadFormState extends State<QuickDownloadForm> {
                         cursor: SystemMouseCursors.click,
                         child: GestureDetector(
                           onTap: () => setState(
-                            () => _showHttpAuthPassword =
-                                !_showHttpAuthPassword,
+                            () =>
+                                _showHttpAuthPassword = !_showHttpAuthPassword,
                           ),
                           child: Icon(
                             _showHttpAuthPassword

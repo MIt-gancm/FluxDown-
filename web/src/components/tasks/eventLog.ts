@@ -163,6 +163,7 @@ const ROUTE_LABEL_KEYS: Record<string, import('../../lib/i18n').I18nKey> = {
   direct: 'detail.route.direct',
   'direct:sampled': 'detail.route.directSampled',
   'direct:pinned': 'detail.route.directPinned',
+  'direct:failover': 'detail.route.directFailover',
   'proxy:cached': 'detail.route.proxyCached',
   'proxy:sampled': 'detail.route.proxySampled',
   'proxy:failover': 'detail.route.proxyFailover',

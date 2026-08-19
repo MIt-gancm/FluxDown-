@@ -668,9 +668,9 @@ impl Db {
             .await?;
         // ProxyMode::Auto 的任务级最终链路（可追溯性）：wire 标签见
         // `auto_proxy::route`（direct / direct:sampled / direct:pinned /
-        // proxy:cached / proxy:sampled / proxy:failover）。空 = 非 Auto 模式
-        // 或任务从未启动。每次任务启动时由 manager 重写，运行中热切换由
-        // coordinator 侧状态机更新。
+        // direct:failover / proxy:cached / proxy:sampled / proxy:failover）。
+        // 空 = 非 Auto 模式或任务从未启动。每次任务启动时由 manager 重写，
+        // 运行中热切换由 coordinator 侧状态机更新。
         self.add_column_if_missing("tasks", "auto_route", "TEXT NOT NULL DEFAULT ''")
             .await?;
         // 无人值守创建标记（外部接管/RSS 等自动化入口 + 「免打扰跳过二次选择」

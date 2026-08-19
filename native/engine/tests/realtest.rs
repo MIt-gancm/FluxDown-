@@ -106,9 +106,18 @@ struct ServerState {
     /// `bytes=0-0` 照常 206——用于复现"probe 判定支持 Range,分段连接却全被
     /// 400 拒"的端点(守护 coordinator 全员被拒→RangeNotSupported 转换出口)。
     reject_segment_range_with_400: bool,
+    /// 一次性签名 CDN：任何携带 If-Range 的请求返回 403，并永久作废该 URL；
+    /// 此后纯 Range 也返回 403。用于证明“403 后再降级”已经太晚。
+    reject_if_range_with_403: bool,
+    signature_invalid: std::sync::atomic::AtomicBool,
     /// 200 全量分支写 body 前 sleep 的毫秒数（0 = 不延迟）。用于让 hint 首枪
     /// plain GET 的流"在跑"，给 2s ramp tick 留出放出带 Range 并发段的窗口。
     throttle_full_ms: u64,
+    /// 签名端点允许的最大 Range 区间长度；超出时返回 403，开放式区间按到
+    /// 文件末尾计算。用于复现只接受小区间的下载服务。
+    max_range_len: Option<i64>,
+    /// Range 起点必须按该字节数对齐；非对齐请求返回 403。
+    range_start_alignment: Option<i64>,
 
     // --- 计数器（断言用）---
     head_count: AtomicUsize,
@@ -116,6 +125,7 @@ struct ServerState {
     range_get_count: AtomicUsize,
     swapped: AtomicUsize,
     rejected_range_count: AtomicUsize,
+    rejected_if_range_count: AtomicUsize,
 }
 
 impl ServerState {
@@ -144,12 +154,17 @@ impl ServerState {
             throttle_range_ms: 0,
             reject_range_with_400: false,
             reject_segment_range_with_400: false,
+            reject_if_range_with_403: false,
+            signature_invalid: std::sync::atomic::AtomicBool::new(false),
             throttle_full_ms: 0,
+            max_range_len: None,
+            range_start_alignment: None,
             head_count: AtomicUsize::new(0),
             full_get_count: AtomicUsize::new(0),
             range_get_count: AtomicUsize::new(0),
             swapped: AtomicUsize::new(0),
             rejected_range_count: AtomicUsize::new(0),
+            rejected_if_range_count: AtomicUsize::new(0),
         }
     }
 }
@@ -345,6 +360,22 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         return Ok(());
     }
 
+    if st.signature_invalid.load(Ordering::SeqCst) {
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(&mut stream, resp.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
+    if st.reject_if_range_with_403 && req.if_range.is_some() {
+        st.rejected_if_range_count.fetch_add(1, Ordering::SeqCst);
+        st.signature_invalid.store(true, Ordering::SeqCst);
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(&mut stream, resp.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+
     // GET
     // If-Range 语义（真实服务器行为）：若客户端带了 If-Range 且 validator 与当前
     // 版本不一致（ETag 变化 或 Last-Modified 变化），服务器**忽略 Range，返回 200
@@ -363,6 +394,32 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
             .range
             .map(|(s, e)| e.unwrap_or(total - 1).min(total - 1) - s + 1 > 1)
             .unwrap_or(false);
+    if let Some(alignment) = st.range_start_alignment
+        && is_segment_range_get
+        && req
+            .range
+            .map(|(start, _)| start.rem_euclid(alignment) != 0)
+            .unwrap_or(false)
+    {
+        st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(&mut stream, resp.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
+    if let Some(max_len) = st.max_range_len
+        && is_segment_range_get
+        && req
+            .range
+            .map(|(start, end)| end.unwrap_or(total - 1).min(total - 1) - start + 1 > max_len)
+            .unwrap_or(false)
+    {
+        st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
+        let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        write_all(&mut stream, resp.as_bytes()).await?;
+        let _ = stream.shutdown().await;
+        return Ok(());
+    }
     // 只拒「分段」Range(probe 0-0 放行):全员被拒→单流回退的转换出口守护。
     if st.reject_segment_range_with_400 && is_segment_range_get {
         st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
@@ -651,6 +708,217 @@ async fn run_coord(
     drop(tx);
     let _ = dh.await;
     (res.map(|_| ()), dest)
+}
+
+/// 一次性签名 CDN 可能在看见 `If-Range` 时立即作废 URL，403 后再降级已经太晚。
+/// 续传首枪必须直接使用 aria2 兼容的纯 Range，并校验响应 validator。
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "binds a local port; run with --ignored"]
+async fn resume_uses_validated_plain_range_without_if_range() {
+    let work_dir = unique_dir("if_range_403");
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+    let body = Arc::new(gen_body(2 * 1024 * 1024 + 17, 0x403));
+    let mut server_state = ServerState::new(body.clone(), "signed-etag");
+    server_state.reject_if_range_with_403 = true;
+    let state = Arc::new(server_state);
+    let server = start_server(state.clone()).await;
+    let cancel = CancellationToken::new();
+
+    let (result, dest) = run_coord(
+        &work_dir,
+        "if-range-403",
+        &server.url("/file"),
+        body.len() as i64,
+        4,
+        "\"signed-etag\"",
+        &cancel,
+    )
+    .await;
+
+    result.expect("纯 Range 206 且 validator 一致时应完成续传");
+    assert_eq!(
+        state.rejected_if_range_count.load(Ordering::SeqCst),
+        0,
+        "一次性签名 URL 不得先被 If-Range 请求作废"
+    );
+    assert!(
+        state.range_get_count.load(Ordering::SeqCst) > 0,
+        "必须发出并完成普通 Range 请求"
+    );
+    assert_eq!(tokio::fs::read(&dest).await.unwrap(), *body);
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+}
+
+/// 不发送 If-Range 后仍必须验证服务器返回的版本标识；validator 不一致时不得
+/// 接受纯 Range 响应，否则会把旧任务进度与新文件分段静默拼接。
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "binds a local port; run with --ignored"]
+async fn validated_plain_range_rejects_changed_version() {
+    let work_dir = unique_dir("if_range_403_changed");
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+    let body = Arc::new(gen_body(1024 * 1024 + 31, 0x404));
+    let mut server_state = ServerState::new(body.clone(), "new-etag");
+    server_state.reject_if_range_with_403 = true;
+    let state = Arc::new(server_state);
+    let server = start_server(state.clone()).await;
+    let cancel = CancellationToken::new();
+
+    let (result, _dest) = run_coord(
+        &work_dir,
+        "if-range-403-changed",
+        &server.url("/file"),
+        body.len() as i64,
+        4,
+        "\"old-etag\"",
+        &cancel,
+    )
+    .await;
+
+    let error = result.expect_err("validator 变化时不得接受纯 Range 续传");
+    assert!(
+        error.to_string().contains("ETag mismatch"),
+        "应明确报告版本不一致，实际为：{error}"
+    );
+    assert_eq!(
+        state.rejected_if_range_count.load(Ordering::SeqCst),
+        0,
+        "版本校验不得以先发送 If-Range 为代价"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+}
+
+/// 无既有 segment 行、已知大小且 `segments=1` 的真实恢复任务必须使用纯 Range，
+/// 不能把单连接误判成不支持续传；大缺口拆成有界闭区间并在同一任务内串行续完。
+#[tokio::test(flavor = "current_thread")]
+#[ignore = "binds a local port; run with --ignored"]
+async fn single_stream_resume_uses_plain_range_without_if_range() {
+    use fluxdown_engine::downloader::{DownloadParams, TEMP_EXT, run_download};
+
+    let work_dir = unique_dir("single_if_range_403");
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    tokio::fs::create_dir_all(&work_dir).await.unwrap();
+
+    const MAX_RANGE_LEN: i64 = 16 * 1024 * 1024;
+    let partial_len = (1024 + 128) * 1024;
+    let body = Arc::new(gen_body(17 * 1024 * 1024 + 13, 0x405));
+    let mut server_state = ServerState::new(body.clone(), "single-etag");
+    server_state.reject_if_range_with_403 = true;
+    server_state.max_range_len = Some(MAX_RANGE_LEN);
+    server_state.range_start_alignment = Some(1024 * 1024);
+    let state = Arc::new(server_state);
+    let server = start_server(state.clone()).await;
+    let url = server.url("/single.bin");
+    let db = Db::open(&work_dir).await.expect("db");
+    insert_simple_task(
+        &db,
+        &work_dir,
+        "single-if-range-403",
+        &url,
+        "single.bin",
+        1,
+        body.len() as i64,
+    )
+    .await;
+    db.set_task_validator("single-if-range-403", "\"single-etag\"", "")
+        .await
+        .expect("set validator");
+    tokio::fs::write(
+        work_dir.join(format!("single.bin{TEMP_EXT}")),
+        &body[..partial_len],
+    )
+    .await
+    .expect("seed partial temp");
+    db.update_task_progress("single-if-range-403", partial_len as i64)
+        .await
+        .expect("seed persisted progress");
+
+    let (tx, mut rx) = mpsc::channel::<ProgressUpdate>(64);
+    let status = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let observed = status.clone();
+    let preparing_downloaded = Arc::new(std::sync::atomic::AtomicI64::new(-1));
+    let observed_preparing = preparing_downloaded.clone();
+    let collector = tokio::spawn(async move {
+        while let Some(update) = rx.recv().await {
+            if update.status == 5 {
+                observed_preparing.store(update.downloaded_bytes, Ordering::SeqCst);
+            }
+            if update.status >= 3 {
+                observed.store(update.status, Ordering::SeqCst);
+            }
+        }
+    });
+    run_download(DownloadParams {
+        task_id: "single-if-range-403".to_string(),
+        url,
+        save_dir: work_dir.to_string_lossy().to_string(),
+        file_name: "single.bin".to_string(),
+        segment_count: 1,
+        is_resume: true,
+        range_verified: true,
+        db,
+        client: test_client(),
+        progress_tx: tx,
+        cancel_token: CancellationToken::new(),
+        speed_limiter: SpeedLimiter::new(0),
+        cookies: String::new(),
+        referrer: String::new(),
+        hint_file_size: body.len() as i64,
+        proxy_config: ProxyConfig::default(),
+        sink: Arc::new(NoopTestSink),
+        selector: Arc::new(fluxdown_engine::NoopSelection),
+        checksum: String::new(),
+        extra_headers: std::collections::HashMap::new(),
+        spec: RequestSpec::empty_get(),
+        audio_url: None,
+        auto_max_connections: 0,
+        use_server_time: false,
+        allow_overwrite: false,
+        spawn_gen: 1,
+        ffmpeg_path: None,
+        cdn: fluxdown_engine::cdn::CdnTaskInput::default(),
+        unattended: false,
+        auto_proxy: None,
+    })
+    .await;
+    let _ = collector.await;
+
+    assert_eq!(status.load(Ordering::SeqCst), 3, "单流续传应成功完成");
+    assert_eq!(
+        preparing_downloaded.load(Ordering::SeqCst),
+        partial_len as i64,
+        "恢复任务进入 preparing 时不得把已持久化进度显示为 0"
+    );
+    assert_eq!(
+        tokio::fs::read(work_dir.join("single.bin")).await.unwrap(),
+        *body
+    );
+    assert_eq!(
+        state.rejected_if_range_count.load(Ordering::SeqCst),
+        0,
+        "单流续传不得发送 If-Range"
+    );
+    assert_eq!(
+        state.rejected_range_count.load(Ordering::SeqCst),
+        0,
+        "单流续传不得发送超长或未按检查点对齐的 Range"
+    );
+    assert_eq!(
+        state.full_get_count.load(Ordering::SeqCst),
+        0,
+        "已验证 Range 的单流恢复不得发送全量 GET 从零重下"
+    );
+    assert!(
+        state.range_get_count.load(Ordering::SeqCst) >= 2,
+        "大缺口应拆成至少两个串行 Range"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&work_dir).await;
 }
 
 // ===========================================================================

@@ -1,26 +1,27 @@
-//! `ProxyMode::Auto`——「直连优先，慢则采样，快则热切换」的决策机器。
+//! `ProxyMode::Auto`——「直连起飞，后台比较，择快切换」的决策机器。
 //!
 //! # 设计（成本递增阶梯）
 //!
-//! Auto 模式下任务一律**直连启动**（速度正常的任务零探测、零额外流量，
-//! 且直连态保留多 CDN 聚合资格——这是相对 System 模式的核心收益：System
-//! 模式会把全部任务的 CDN 聚合一刀切禁用）。仅当任务运行一段时间后仍然
-//! 慢（见 [`AutoSwitchState`] 的守卫清单），才经候选代理拉 256KB 采样；
-//! 代理单连接吞吐 ≥ 2× 直连单连接均速才热切换（[`NodePool`] 换 SYS
-//! client，新分段自然走代理，已下字节零丢弃）。
+//! Auto 模式下任务一律**直连启动**（零启动阻塞，且直连态保留多 CDN 聚合
+//! 资格——这是相对 System 模式的核心收益）。任务越过 coordinator 爬升期
+//! 且仍有足够数据时，经全部可用候选代理（手动字段 + 系统代理，端点相同则
+//! 去重）并行拉取 256KB 样本；取最快代理与直连单连接均速比较，达到 2×
+//! 才热切换（[`NodePool`] 换 SYS client，新分段自然走胜出代理，已下字节
+//! 零丢弃）。比较采用相同的单连接量纲，不以直连总吞吐作前置否决——多分段
+//! 总速会掩盖每条连接都很慢的 GitHub release 等场景。
 //!
 //! # 决策缓存（两层，风险不对称）
 //!
-//! 决策以 host 为 key 缓存在内存（[`DecisionCache`]），租约制——网络环境
-//! 易变，重启清零回到直连是特性。同 host 批量任务只探测一次：胜者写租约，
-//! 后续任务启动即采纳。跨重启另有 [`crate::route_health`] 持久化先验，
-//! 三态消费（见 `RouteHint`）：Cooldown/NoSwitch 落盘（过期无害，指数
-//! 退避抑制重复采样）；Proxy 胜绩单日仅作加速信号（缩短 [`MIN_RUNTIME`]
-//! 等待期，直连起飞保留多 CDN 聚合资格），≥2 个「不同天」确认且 72h 内
-//! 有实证胜出的 host 直接以代理起飞（AdoptProxy，**显式让出 CDN 聚合
-//! 资格**换零慢速窗口）。「持久化代理决策 + 代理失效」的锁死由两道
-//! 自愈闭环杜绝：反向 failover（连接类失败作废先验）+ 72h 实证重验
-//! （降档直连重比）。
+//! 决策以 host 为 key 缓存在内存（[`DecisionCache`]），租约制且记录胜出
+//! 来源——网络环境易变，重启清零回到直连是特性。同 host 批量任务只探测
+//! 一次，后续任务按来源采纳。跨重启另有 [`crate::route_health`] 持久化
+//! 先验，三态消费（见 `RouteHint`）：Cooldown/NoSwitch 落盘（过期无害，
+//! 指数退避抑制重复采样）；Proxy 胜绩单日仅作加速信号（缩短
+//! [`MIN_RUNTIME`] 等待期）。持久层未记录代理来源，因此 ≥2 天且 72h 内
+//! 有实证胜出的 AdoptProxy 仅在当前只有一个候选时直接代理起飞；手动与
+//! 系统代理并存时回到直连并快速并行复评，绝不猜旧胜者。「持久化代理
+//! 决策 + 代理失效」的锁死由两道自愈闭环杜绝：传输失败后按未尝试链路
+//! 换手动代理/系统代理/直连 + 72h 实证重验。
 //!
 //! # 完整性防线（前置，不做事后回退）
 //!
@@ -50,20 +51,16 @@ use crate::proxy_config::{ProxyConfig, ProxyMode, detect_system_proxy};
 // 常量（刻意不做设置项：没有证据表明用户需要调它们）
 // ---------------------------------------------------------------------------
 
-/// 任务须运行满该时长才允许采样——排除 coordinator 爬升期的假慢。
-const MIN_RUNTIME: Duration = Duration::from_secs(10);
+/// 任务须运行满该时长才允许采样——跨过 coordinator 3 个完整 ramp tick
+/// （2s/tick），避免爬升期的假慢。
+const MIN_RUNTIME: Duration = Duration::from_secs(6);
 
-/// 持久化先验记录该 host 有代理胜绩时的采样等待期（加速重评估；起飞
-/// 路由不变）。下限须跨过 coordinator 至少 3 个完整 ramp tick（2s/tick，
-/// 起步 2 连接逐档爬升）——再短会把爬升期的假慢当证据，系统性偏置
-/// AdoptProxy 的确认计分。
-const FAST_REEVAL_MIN_RUNTIME: Duration = Duration::from_secs(6);
-
-/// 「慢」的绝对阈值（字节/秒）。总吞吐低于它才考虑采样。
-const SLOW_BPS: f64 = 512.0 * 1024.0;
+/// 持久化先验记录该 host 有代理胜绩时的采样等待期。已有实证允许提前一个
+/// ramp tick 重评估；2× 胜出滞回仍负责挡住临界误切。
+const FAST_REEVAL_MIN_RUNTIME: Duration = Duration::from_secs(4);
 
 /// 剩余字节低于此值不采样——小尾巴切换收益覆盖不了探测成本。
-const MIN_REMAINING_BYTES: i64 = 8 * 1024 * 1024;
+const MIN_REMAINING_BYTES: i64 = 4 * 1024 * 1024;
 
 /// 代理须达到直连单连接均速的倍数才切换（滞回，防临界震荡）。
 const ADVANTAGE_RATIO: f64 = 2.0;
@@ -102,11 +99,13 @@ pub mod route {
     pub const DIRECT_SAMPLED: &str = "direct:sampled";
     /// 采样发现 validator 不一致，拒绝切换（完整性优先）。
     pub const DIRECT_PINNED: &str = "direct:pinned";
+    /// 代理失败后自动回退直连。
+    pub const DIRECT_FAILOVER: &str = "direct:failover";
     /// 本任务采样后热切换到代理。
     pub const PROXY_SAMPLED: &str = "proxy:sampled";
     /// 启动时采纳了缓存的域名级代理决策。
     pub const PROXY_CACHED: &str = "proxy:cached";
-    /// 直连失败后经代理自动重试（failover）。
+    /// 直连失败后经代理自动换路重试。
     pub const PROXY_FAILOVER: &str = "proxy:failover";
     /// 带来源后缀的代理标签（base × {system,manual}，全部静态）。
     pub const PROXY_SAMPLED_SYSTEM: &str = "proxy:sampled:system";
@@ -145,11 +144,11 @@ pub mod route {
 }
 
 /// Auto 候选代理的来源（决定 wire 标签后缀，供 UI 展示「最终用的是谁」）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CandidateSource {
     /// 系统代理检测命中（Windows 注册表等）。
     System,
-    /// 无系统代理，回退用户已填的手动地址字段。
+    /// 用户在设置中填写的手动代理地址。
     ManualFields,
 }
 
@@ -160,11 +159,11 @@ pub enum CandidateSource {
 /// host 级路由决策。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
-    /// 该 host 走代理（租约期内新任务启动即采纳）。
-    Proxy,
-    /// 采样过无优势，冷却期内不再采样。
+    /// 该 host 走指定来源的代理（租约期内新任务启动即采纳）。
+    Proxy(CandidateSource),
+    /// 采样过全部候选均无优势，冷却期内不再采样。
     Cooldown,
-    /// validator 不一致，禁止切换（完整性防线）。
+    /// 全部可用代理均出现 validator 不一致，禁止切换（完整性防线）。
     NoSwitch,
 }
 
@@ -197,7 +196,7 @@ impl DecisionCache {
 
     pub fn set(&self, host: &str, decision: Decision) {
         let ttl = match decision {
-            Decision::Proxy => PROXY_LEASE_TTL,
+            Decision::Proxy(_) => PROXY_LEASE_TTL,
             Decision::Cooldown => COOLDOWN_TTL,
             Decision::NoSwitch => NO_SWITCH_TTL,
         };
@@ -206,6 +205,16 @@ impl DecisionCache {
             Err(poisoned) => poisoned.into_inner(),
         };
         map.insert(host.to_string(), (decision, Instant::now() + ttl));
+    }
+
+    /// 仅清除一个 host 的内存决策。代理链路失败时使用；不写全局冷却，
+    /// 让同 host 的另一个代理候选仍可接管。
+    pub fn clear_host(&self, host: &str) {
+        let mut map = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        map.remove(host);
     }
 
     /// 代理设置变更时清空全部决策（旧决策针对旧候选代理，已无意义）。
@@ -222,35 +231,69 @@ impl DecisionCache {
 // 候选代理解析
 // ---------------------------------------------------------------------------
 
-/// 解析 Auto 模式的候选代理：优先系统代理，无系统代理时回退用户已填的
-/// 手动地址字段。两者皆无 → `None`（Auto 完全等价直连，零开销短路）。
-/// 附带候选来源，决定 wire 标签后缀。
+/// 已解析为可直接构建 client 的 Auto 代理候选。
+#[derive(Debug, Clone)]
+pub struct ProxyCandidate {
+    pub config: ProxyConfig,
+    pub source: CandidateSource,
+}
+
+/// 解析 Auto 模式的全部候选代理：手动字段与系统代理同时存在时全部返回；
+/// 完全相同的代理 URL 只保留手动候选（显式配置优先，避免重复采样同一端点）。
 ///
-/// 仅对 `mode == Auto` 的配置有意义；其余模式恒返回 `None`。
-pub fn resolve_candidate(config: &ProxyConfig) -> Option<(ProxyConfig, CandidateSource)> {
+/// 仅对 `mode == Auto` 的配置有意义；其余模式返回空列表。
+pub fn resolve_candidates(config: &ProxyConfig) -> Vec<ProxyCandidate> {
+    let system = match detect_system_proxy() {
+        Ok(system) => system,
+        Err(error) => {
+            log_info!("[auto-proxy] 系统代理检测失败: {error}");
+            None
+        }
+    };
+    resolve_candidates_with_system(config, system)
+}
+
+fn resolve_candidates_with_system(
+    config: &ProxyConfig,
+    system: Option<ProxyConfig>,
+) -> Vec<ProxyCandidate> {
     if config.mode != ProxyMode::Auto {
-        return None;
+        return Vec::new();
     }
-    if let Ok(Some(sys)) = detect_system_proxy() {
-        return Some((sys, CandidateSource::System));
-    }
+
+    let mut candidates = Vec::with_capacity(2);
     if !config.host.is_empty() && config.port != 0 {
         let mut manual = config.clone();
         manual.mode = ProxyMode::Manual;
-        return Some((manual, CandidateSource::ManualFields));
+        candidates.push(ProxyCandidate {
+            config: manual,
+            source: CandidateSource::ManualFields,
+        });
     }
-    None
+    if let Some(system) = system {
+        let system_url = system.to_proxy_url();
+        let duplicate = candidates
+            .iter()
+            .any(|candidate| candidate.config.to_proxy_url() == system_url);
+        if !duplicate {
+            candidates.push(ProxyCandidate {
+                config: system,
+                source: CandidateSource::System,
+            });
+        }
+    }
+    candidates
 }
 
 // ---------------------------------------------------------------------------
 // 任务级上下文（manager 构造，穿透 DownloadParams 进 coordinator）
 // ---------------------------------------------------------------------------
 
-/// Auto 直连启动的任务携带的切换上下文。仅当候选代理存在且任务以直连
-/// 起飞时构造；缓存已判代理/无候选的任务为 `None`（无可切换项）。
+/// Auto 直连启动的任务携带的切换上下文。仅当至少一个候选代理存在且任务
+/// 以直连起飞时构造；缓存已判代理/无候选的任务为 `None`（无可切换项）。
 pub struct AutoProxyCtx {
-    /// 已解析为 Manual 模式的候选代理。
-    pub candidate: ProxyConfig,
+    /// 已解析为 Manual 模式的全部候选代理（手动字段 + 系统代理）。
+    pub candidates: Vec<ProxyCandidate>,
     /// manager 级共享决策缓存。
     pub cache: DecisionCache,
     /// 任务 URL 的 host（含端口），决策缓存 key。
@@ -258,11 +301,11 @@ pub struct AutoProxyCtx {
     /// 任务解析后的有效 UA（任务 > 队列 > 全局），切换 client 与采样
     /// client 与任务 client 保持一致。
     pub user_agent: String,
-    /// 候选代理来源（决定切换后 wire 标签的 `:system`/`:manual` 后缀）。
-    pub source: CandidateSource,
-    /// 持久化先验有该 host 的代理胜绩——缩短采样等待期（见
-    /// [`FAST_REEVAL_MIN_RUNTIME`]）。
+    /// 持久化先验有该 host 的代理胜绩——缩短采样等待期。
     pub fast_reeval: bool,
+    /// 任务已有局部数据时必须实际采样并核对 validator，不能直接采纳
+    /// 兄弟任务写入的代理租约。
+    pub require_validation: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -277,6 +320,11 @@ struct ProbeOutcome {
     validators_ok: bool,
     /// 诊断信息（仅日志）。
     detail: String,
+}
+
+struct CandidateProbeOutcome {
+    candidate: ProxyCandidate,
+    outcome: ProbeOutcome,
 }
 
 /// 经候选代理拉取 `Range: bytes=0-262143` 并测速。**独立 client、独立
@@ -389,13 +437,12 @@ fn probe_transfer_bps(received: u64, first_chunk_len: u64, body_secs: f64, total
 
 /// 采样守卫：全部满足才允许发起采样。
 /// `min_runtime` = 本任务的采样等待期（先验加速时缩短）；`runtime` =
-/// 任务本次 spawn 已运行时长；`throughput_bps` = 最近窗口总吞吐；
-/// `alive` = 活跃连接数；`remaining` = 剩余字节。
-#[allow(clippy::too_many_arguments)]
+/// 任务本次 spawn 已运行时长；`alive` = 活跃连接数；`remaining` =
+/// 剩余字节。吞吐不在守卫里：Auto 比较的是代理与直连的**相对**性能，
+/// 直连多连接总吞吐高不代表代理没有显著优势。
 fn should_probe(
     min_runtime: Duration,
     runtime: Duration,
-    throughput_bps: f64,
     alive: usize,
     remaining_bytes: i64,
     limiter_active: bool,
@@ -403,7 +450,6 @@ fn should_probe(
 ) -> bool {
     runtime >= min_runtime
         && alive > 0
-        && throughput_bps < SLOW_BPS
         && remaining_bytes >= MIN_REMAINING_BYTES
         && !limiter_active
         && !conn_sensitive
@@ -413,6 +459,18 @@ fn should_probe(
 /// 基线取「采样发起时」与「结果落地时」两个窗口的较大者（保守）。
 fn proxy_wins(probe_bps: f64, baseline_per_conn_bps: f64) -> bool {
     probe_bps > 0.0 && probe_bps >= baseline_per_conn_bps * ADVANTAGE_RATIO
+}
+
+fn fastest_proxy_winner(
+    outcomes: &[CandidateProbeOutcome],
+    baseline_per_conn_bps: f64,
+) -> Option<&CandidateProbeOutcome> {
+    outcomes
+        .iter()
+        .filter(|result| {
+            result.outcome.validators_ok && proxy_wins(result.outcome.bps, baseline_per_conn_bps)
+        })
+        .max_by(|left, right| left.outcome.bps.total_cmp(&right.outcome.bps))
 }
 
 // ---------------------------------------------------------------------------
@@ -437,9 +495,9 @@ pub struct TickObs {
 enum Phase {
     /// 等待守卫命中。
     Idle,
-    /// 采样已 off-loop 发起，等待结果回流。
+    /// 全部代理采样已 off-loop 并行发起，等待结果回流。
     Probing {
-        slot: Arc<StdMutex<Option<ProbeOutcome>>>,
+        slot: Arc<StdMutex<Option<Vec<CandidateProbeOutcome>>>>,
         baseline_per_conn: f64,
     },
     /// 终局（已切换 / 已放弃），本任务不再动作。
@@ -448,7 +506,7 @@ enum Phase {
 
 /// 单任务的 Auto 切换状态机。由 coordinator 在每个完整 ramp tick 驱动。
 ///
-/// 不变式：每任务至多采样一次、至多切换一次、切换后绝不回切——震荡
+/// 不变式：每任务至多采样一轮、至多切换一次、切换后绝不回切——震荡
 /// 由「一次性 + 2× 滞回 + host 冷却」三重压制。
 pub struct AutoSwitchState {
     ctx: Arc<AutoProxyCtx>,
@@ -496,7 +554,6 @@ impl AutoSwitchState {
                 if !should_probe(
                     min_runtime,
                     self.started.elapsed(),
-                    obs.throughput_bps,
                     obs.alive,
                     obs.remaining_bytes,
                     obs.limiter_active,
@@ -504,71 +561,142 @@ impl AutoSwitchState {
                 ) {
                     return;
                 }
-                // 缓存短路：兄弟任务已给出该 host 的决策。
+
+                // 缓存短路：兄弟任务已给出该 host 的胜出代理来源。局部续传
+                // 必须重新采样 validator，不能仅凭 host 级租约直接换 edge。
                 match self.ctx.cache.lookup(&self.ctx.host) {
-                    Some(Decision::Proxy) => {
-                        // 采纳缓存决策直接切换（本任务确实慢，且该 host 已被
-                        // 证明代理更优），不再重复采样。
-                        self.apply_switch(nodes, db, sink, task_id, route::PROXY_CACHED)
+                    Some(Decision::Proxy(source)) if !self.ctx.require_validation => {
+                        if let Some(candidate) = self
+                            .ctx
+                            .candidates
+                            .iter()
+                            .find(|candidate| candidate.source == source)
+                            .cloned()
+                        {
+                            self.apply_switch(
+                                &candidate,
+                                nodes,
+                                db,
+                                sink,
+                                task_id,
+                                route::PROXY_CACHED,
+                            )
                             .await;
+                            return;
+                        }
                     }
                     Some(Decision::Cooldown) | Some(Decision::NoSwitch) => {
                         self.phase = Phase::Done;
+                        return;
                     }
-                    None => {
-                        let slot: Arc<StdMutex<Option<ProbeOutcome>>> =
-                            Arc::new(StdMutex::new(None));
-                        let baseline = obs.throughput_bps / obs.alive.max(1) as f64;
-                        log_info!(
-                            "[auto-proxy] task {} host {} 直连慢（{:.0} B/s × {} conn），发起代理采样",
-                            task_id,
-                            self.ctx.host,
-                            obs.throughput_bps,
-                            obs.alive
-                        );
-                        let probe_slot = slot.clone();
-                        let candidate = self.ctx.candidate.clone();
-                        let ua = self.ctx.user_agent.clone();
-                        let url = url.to_string();
-                        let spec = spec.clone();
-                        let etag = etag.to_string();
-                        let lm = last_modified.to_string();
-                        // off-loop 采样：绝不阻塞 coordinator 事件循环。
-                        tokio::spawn(async move {
-                            let outcome =
-                                probe_proxy(&candidate, &ua, &url, &spec, &etag, &lm).await;
-                            let mut guard = match probe_slot.lock() {
-                                Ok(g) => g,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            *guard = Some(outcome);
-                        });
-                        self.phase = Phase::Probing {
-                            slot,
-                            baseline_per_conn: baseline,
-                        };
-                    }
+                    Some(Decision::Proxy(_)) | None => {}
                 }
+
+                let slot: Arc<StdMutex<Option<Vec<CandidateProbeOutcome>>>> =
+                    Arc::new(StdMutex::new(None));
+                let baseline = obs.throughput_bps / obs.alive.max(1) as f64;
+                log_info!(
+                    "[auto-proxy] task {} host {} 开始三路对比（直连 {:.0} B/s × {} conn，{} 个代理候选）",
+                    task_id,
+                    self.ctx.host,
+                    obs.throughput_bps,
+                    obs.alive,
+                    self.ctx.candidates.len()
+                );
+                let probe_slot = slot.clone();
+                let candidates = self.ctx.candidates.clone();
+                let ua = self.ctx.user_agent.clone();
+                let url = url.to_string();
+                let spec = spec.clone();
+                let etag = etag.to_string();
+                let lm = last_modified.to_string();
+                // off-loop 并行采样全部候选：绝不阻塞 coordinator 事件循环。
+                tokio::spawn(async move {
+                    let mut probes = tokio::task::JoinSet::new();
+                    for candidate in candidates {
+                        let ua = ua.clone();
+                        let url = url.clone();
+                        let spec = spec.clone();
+                        let etag = etag.clone();
+                        let lm = lm.clone();
+                        probes.spawn(async move {
+                            let outcome =
+                                probe_proxy(&candidate.config, &ua, &url, &spec, &etag, &lm).await;
+                            CandidateProbeOutcome { candidate, outcome }
+                        });
+                    }
+                    let mut outcomes = Vec::with_capacity(probes.len());
+                    while let Some(result) = probes.join_next().await {
+                        if let Ok(outcome) = result {
+                            outcomes.push(outcome);
+                        }
+                    }
+                    let mut guard = match probe_slot.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    *guard = Some(outcomes);
+                });
+                self.phase = Phase::Probing {
+                    slot,
+                    baseline_per_conn: baseline,
+                };
             }
             Phase::Probing {
                 slot,
                 baseline_per_conn,
             } => {
-                let outcome = {
+                let outcomes = {
                     let mut guard = match slot.lock() {
                         Ok(g) => g,
                         Err(poisoned) => poisoned.into_inner(),
                     };
                     guard.take()
                 };
-                let Some(outcome) = outcome else {
+                let Some(outcomes) = outcomes else {
                     return; // 采样仍在途，下个 tick 再看。
                 };
                 // 基线保守取两个窗口的较大者。
                 let baseline = baseline_per_conn.max(obs.throughput_bps / obs.alive.max(1) as f64);
-                if !outcome.validators_ok {
+                for result in &outcomes {
                     log_info!(
-                        "[auto-proxy] task {} host {} 代理侧 validator 不一致（不同 CDN edge），拒绝切换",
+                        "[auto-proxy] task {} host {} {:?} 候选采样 {:.0} B/s（validator={}，{}）",
+                        task_id,
+                        self.ctx.host,
+                        result.candidate.source,
+                        result.outcome.bps,
+                        result.outcome.validators_ok,
+                        result.outcome.detail
+                    );
+                }
+                let winner = fastest_proxy_winner(&outcomes, baseline)
+                    .map(|result| (result.candidate.clone(), result.outcome.bps));
+
+                if let Some((candidate, winner_bps)) = winner {
+                    log_info!(
+                        "[auto-proxy] task {} host {} {:?} 代理胜出（{:.0} vs 基线 {:.0} B/s/conn），热切换",
+                        task_id,
+                        self.ctx.host,
+                        candidate.source,
+                        winner_bps,
+                        baseline
+                    );
+                    self.ctx
+                        .cache
+                        .set(&self.ctx.host, Decision::Proxy(candidate.source));
+                    // 持久化胜绩只在切换实际生效后记——client 构建失败的
+                    // 候选代理不配留下先验（apply_switch 失败臂已降内存冷却）。
+                    if self
+                        .apply_switch(&candidate, nodes, db, sink, task_id, route::PROXY_SAMPLED)
+                        .await
+                    {
+                        crate::route_health::record_proxy_win(&self.ctx.host, winner_bps, db);
+                    }
+                } else if !outcomes.is_empty()
+                    && outcomes.iter().all(|result| !result.outcome.validators_ok)
+                {
+                    log_info!(
+                        "[auto-proxy] task {} host {} 全部代理候选 validator 不一致，拒绝切换",
                         task_id,
                         self.ctx.host
                     );
@@ -576,33 +704,11 @@ impl AutoSwitchState {
                     crate::route_health::record_no_switch(&self.ctx.host, db);
                     self.publish(db, sink, task_id, route::DIRECT_PINNED).await;
                     self.phase = Phase::Done;
-                } else if proxy_wins(outcome.bps, baseline) {
-                    log_info!(
-                        "[auto-proxy] task {} host {} 代理胜出（{:.0} vs 基线 {:.0} B/s/conn，{}），热切换",
-                        task_id,
-                        self.ctx.host,
-                        outcome.bps,
-                        baseline,
-                        outcome.detail
-                    );
-                    self.ctx.cache.set(&self.ctx.host, Decision::Proxy);
-                    // 持久化胜绩只在切换实际生效后记——client 构建失败的
-                    // 候选代理不配留下先验（apply_switch 失败臂已降内存
-                    // 冷却）。
-                    if self
-                        .apply_switch(nodes, db, sink, task_id, route::PROXY_SAMPLED)
-                        .await
-                    {
-                        crate::route_health::record_proxy_win(&self.ctx.host, outcome.bps, db);
-                    }
                 } else {
                     log_info!(
-                        "[auto-proxy] task {} host {} 代理无优势（{:.0} vs 基线 {:.0} B/s/conn，{}），保持直连",
+                        "[auto-proxy] task {} host {} 全部代理候选均无 2× 优势，保持直连",
                         task_id,
-                        self.ctx.host,
-                        outcome.bps,
-                        baseline,
-                        outcome.detail
+                        self.ctx.host
                     );
                     self.ctx.cache.set(&self.ctx.host, Decision::Cooldown);
                     crate::route_health::record_cooldown(&self.ctx.host, db);
@@ -613,20 +719,21 @@ impl AutoSwitchState {
         }
     }
 
-    /// 构建代理 client 并原子替换 NodePool 的服务节点。失败降级为冷却
+    /// 构建胜出代理 client 并原子替换 NodePool 的服务节点。失败降级为冷却
     /// （保持直连，任务不受影响）。`base` 是不带来源后缀的代理基础标签，
-    /// 此处按候选来源补 `:system`/`:manual` 后缀。返回切换是否实际生效。
+    /// 此处按胜出候选来源补 `:system`/`:manual` 后缀。返回切换是否实际生效。
     async fn apply_switch(
         &mut self,
+        candidate: &ProxyCandidate,
         nodes: &Arc<NodePool>,
         db: &Db,
         sink: &dyn EventSink,
         task_id: &str,
         base: &'static str,
     ) -> bool {
-        let label = route::with_source(base, self.ctx.source);
+        let label = route::with_source(base, candidate.source);
         let switched = match crate::downloader::build_client_with_tls_policy(
-            &self.ctx.candidate,
+            &candidate.config,
             &self.ctx.user_agent,
             false,
         ) {
@@ -637,8 +744,9 @@ impl AutoSwitchState {
             }
             Err(e) => {
                 log_error!(
-                    "[auto-proxy] task {} 代理 client 构建失败，保持直连: {e}",
-                    task_id
+                    "[auto-proxy] task {} {:?} 代理 client 构建失败，保持直连: {e}",
+                    task_id,
+                    candidate.source
                 );
                 self.ctx.cache.set(&self.ctx.host, Decision::Cooldown);
                 false
@@ -670,9 +778,9 @@ impl AutoSwitchState {
 // failover 支路（manager 侧调用）
 // ---------------------------------------------------------------------------
 
-/// 直连失败错误里「连接类」的子集——只有这类失败才值得 failover 到代理
-/// （404/校验失败换链路无意义）。比 `is_retriable_error` 更严格。
-pub fn is_connect_class_error(msg: &str) -> bool {
+/// 路由切换可能修复的传输层错误。覆盖建连失败与 body 中途断流；HTTP
+/// 状态、校验失败等永久错误不应靠换链路重试。
+pub fn is_route_transport_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
     lower.contains("connection refused")
         || lower.contains("connection reset")
@@ -682,6 +790,13 @@ pub fn is_connect_class_error(msg: &str) -> bool {
         || lower.contains("network is down")
         || lower.contains("no route to host")
         || lower.contains("dns")
+        || lower.contains("stalled")
+        || lower.contains("broken pipe")
+        || lower.contains("eof")
+        || lower.contains("connection closed")
+        || lower.contains("connection abort")
+        || lower.contains("incomplete download")
+        || lower.contains("error decoding response body")
 }
 
 #[cfg(test)]
@@ -712,20 +827,23 @@ mod tests {
         }
     }
 
-    fn manual_candidate() -> ProxyConfig {
-        let mut c = auto_config("127.0.0.1", 1);
-        c.mode = ProxyMode::Manual;
-        c
+    fn manual_candidate() -> ProxyCandidate {
+        let mut config = auto_config("127.0.0.1", 1);
+        config.mode = ProxyMode::Manual;
+        ProxyCandidate {
+            config,
+            source: CandidateSource::ManualFields,
+        }
     }
 
     fn switch_state(cache: &DecisionCache) -> AutoSwitchState {
         let mut state = AutoSwitchState::new(Arc::new(AutoProxyCtx {
-            candidate: manual_candidate(),
+            candidates: vec![manual_candidate()],
             cache: cache.clone(),
             host: "example.com".to_string(),
             user_agent: String::new(),
-            source: CandidateSource::ManualFields,
             fast_reeval: false,
+            require_validation: false,
         }));
         state.backdate(MIN_RUNTIME + Duration::from_secs(5));
         state
@@ -764,7 +882,10 @@ mod tests {
         .await
         .expect("insert task");
         let cache = DecisionCache::new();
-        cache.set("example.com", Decision::Proxy);
+        cache.set(
+            "example.com",
+            Decision::Proxy(CandidateSource::ManualFields),
+        );
         let mut state = switch_state(&cache);
         let nodes = NodePool::single(reqwest::Client::new());
         let sink = CollectSink(StdMutex::new(Vec::new()));
@@ -870,12 +991,13 @@ mod tests {
         assert!(sink.0.lock().unwrap().is_empty(), "冷却决策零广播");
     }
 
-    /// 守卫未命中（速度正常）时状态机纹丝不动——即使缓存已判代理。
+    /// 局部续传即使看到兄弟任务的代理租约，也必须先实际采样 validator，
+    /// 不能直接切换到可能返回另一份内容的 CDN edge。
     #[tokio::test]
-    async fn fast_task_never_switches_even_with_cached_proxy_decision() {
+    async fn partial_resume_does_not_adopt_cached_proxy_without_probe() {
         let db = Db::connect("sqlite::memory:").await.expect("mem db");
         db.insert_task(
-            "t-fast",
+            "t-partial",
             "https://example.com/f.zip",
             "f.zip",
             "/tmp",
@@ -889,37 +1011,43 @@ mod tests {
         .await
         .expect("insert task");
         let cache = DecisionCache::new();
-        cache.set("example.com", Decision::Proxy);
-        let mut state = switch_state(&cache);
+        cache.set(
+            "example.com",
+            Decision::Proxy(CandidateSource::ManualFields),
+        );
+        let mut state = AutoSwitchState::new(Arc::new(AutoProxyCtx {
+            candidates: vec![manual_candidate()],
+            cache,
+            host: "example.com".to_string(),
+            user_agent: String::new(),
+            fast_reeval: true,
+            require_validation: true,
+        }));
+        state.backdate(MIN_RUNTIME + Duration::from_secs(1));
         let nodes = NodePool::single(reqwest::Client::new());
         let sink = CollectSink(StdMutex::new(Vec::new()));
-        let spec = crate::downloader::RequestSpec::empty_get();
-        let fast = TickObs {
-            throughput_bps: 10.0 * 1024.0 * 1024.0,
-            ..slow_obs()
-        };
 
         state
             .on_ramp_tick(
-                fast,
+                slow_obs(),
                 &nodes,
                 &db,
                 &sink,
-                "t-fast",
+                "t-partial",
                 "https://example.com/f.zip",
-                &spec,
-                "",
+                &crate::downloader::RequestSpec::empty_get(),
+                "\"locked\"",
                 "",
             )
             .await;
 
         let task = db
-            .load_task_by_id("t-fast")
+            .load_task_by_id("t-partial")
             .await
             .expect("load")
             .expect("row");
-        assert_eq!(task.auto_route, "");
-        assert!(sink.0.lock().unwrap().is_empty(), "速度正常绝不采样/切换");
+        assert_eq!(task.auto_route, "", "采样完成前不得采纳代理租约");
+        assert!(sink.0.lock().unwrap().is_empty(), "采样完成前不得广播切换");
     }
 
     // ---- DecisionCache ----------------------------------------------------
@@ -927,19 +1055,37 @@ mod tests {
     #[test]
     fn cache_lookup_returns_fresh_decision() {
         let cache = DecisionCache::new();
-        cache.set("example.com", Decision::Proxy);
-        assert_eq!(cache.lookup("example.com"), Some(Decision::Proxy));
+        cache.set(
+            "example.com",
+            Decision::Proxy(CandidateSource::ManualFields),
+        );
+        assert_eq!(
+            cache.lookup("example.com"),
+            Some(Decision::Proxy(CandidateSource::ManualFields))
+        );
         assert_eq!(cache.lookup("other.com"), None);
     }
 
     #[test]
     fn cache_clear_drops_all_decisions() {
         let cache = DecisionCache::new();
-        cache.set("a.com", Decision::Proxy);
+        cache.set("a.com", Decision::Proxy(CandidateSource::System));
         cache.set("b.com", Decision::Cooldown);
         cache.clear();
         assert_eq!(cache.lookup("a.com"), None);
         assert_eq!(cache.lookup("b.com"), None);
+    }
+
+    #[test]
+    fn cache_clear_host_preserves_other_hosts() {
+        let cache = DecisionCache::new();
+        cache.set("a.com", Decision::Proxy(CandidateSource::System));
+        cache.set("b.com", Decision::Cooldown);
+
+        cache.clear_host("a.com");
+
+        assert_eq!(cache.lookup("a.com"), None);
+        assert_eq!(cache.lookup("b.com"), Some(Decision::Cooldown));
     }
 
     #[test]
@@ -958,7 +1104,6 @@ mod tests {
     fn should_probe_requires_all_guards() {
         struct Guards {
             runtime: Duration,
-            throughput_bps: f64,
             alive: usize,
             remaining_bytes: i64,
             limiter_active: bool,
@@ -966,8 +1111,7 @@ mod tests {
         }
         let ok = |break_one: &dyn Fn(&mut Guards)| {
             let mut g = Guards {
-                runtime: Duration::from_secs(11),
-                throughput_bps: 100.0 * 1024.0,
+                runtime: Duration::from_secs(7),
                 alive: 4,
                 remaining_bytes: 64 * 1024 * 1024,
                 limiter_active: false,
@@ -977,7 +1121,6 @@ mod tests {
             should_probe(
                 MIN_RUNTIME,
                 g.runtime,
-                g.throughput_bps,
                 g.alive,
                 g.remaining_bytes,
                 g.limiter_active,
@@ -987,13 +1130,23 @@ mod tests {
         assert!(ok(&|_| {}), "全守卫满足应放行");
         assert!(
             !ok(&|g| g.runtime = Duration::from_secs(5)),
-            "运行不足 10s 拒绝"
+            "运行不足 6s 拒绝"
         );
-        assert!(!ok(&|g| g.throughput_bps = SLOW_BPS + 1.0), "速度达标拒绝");
         assert!(!ok(&|g| g.alive = 0), "无活跃连接拒绝");
         assert!(!ok(&|g| g.remaining_bytes = 1024 * 1024), "剩余过小拒绝");
         assert!(!ok(&|g| g.limiter_active = true), "限速激活拒绝");
         assert!(!ok(&|g| g.conn_sensitive = true), "连接敏感态拒绝");
+        assert!(
+            should_probe(
+                MIN_RUNTIME,
+                Duration::from_secs(7),
+                16,
+                64 * 1024 * 1024,
+                false,
+                false,
+            ),
+            "多连接总吞吐不得掩盖代理相对优势"
+        );
     }
 
     #[test]
@@ -1002,18 +1155,17 @@ mod tests {
             should_probe(
                 min,
                 Duration::from_secs(runtime_secs),
-                100.0 * 1024.0,
                 4,
                 64 * 1024 * 1024,
                 false,
                 false,
             )
         };
-        assert!(!probe(MIN_RUNTIME, 7), "常规等待期 7s 不放行");
-        assert!(probe(FAST_REEVAL_MIN_RUNTIME, 7), "先验加速后 7s 放行");
+        assert!(!probe(MIN_RUNTIME, 5), "常规等待期 5s 不放行");
+        assert!(probe(FAST_REEVAL_MIN_RUNTIME, 5), "先验加速后 5s 放行");
         assert!(
-            !probe(FAST_REEVAL_MIN_RUNTIME, 5),
-            "加速下限跨 3 个 ramp tick"
+            !probe(FAST_REEVAL_MIN_RUNTIME, 3),
+            "加速至少跨 2 个 ramp tick"
         );
     }
 
@@ -1046,40 +1198,84 @@ mod tests {
         assert!(!proxy_wins(0.0, 0.0), "采样失败（0 bps）不切换");
     }
 
+    #[test]
+    fn fastest_proxy_winner_compares_every_valid_candidate() {
+        let manual = CandidateProbeOutcome {
+            candidate: manual_candidate(),
+            outcome: ProbeOutcome {
+                bps: 2_000_000.0,
+                validators_ok: false,
+                detail: "mismatch".to_string(),
+            },
+        };
+        let mut system_candidate = manual_candidate();
+        system_candidate.source = CandidateSource::System;
+        system_candidate.config.port = 2;
+        let system = CandidateProbeOutcome {
+            candidate: system_candidate,
+            outcome: ProbeOutcome {
+                bps: 1_000_000.0,
+                validators_ok: true,
+                detail: "ok".to_string(),
+            },
+        };
+
+        let outcomes = [manual, system];
+        let winner = fastest_proxy_winner(&outcomes, 400_000.0).expect("system should win");
+
+        assert_eq!(winner.candidate.source, CandidateSource::System);
+    }
+
     // ---- 候选解析 ----------------------------------------------------------
 
     #[test]
-    fn resolve_candidate_ignores_non_auto_modes() {
+    fn resolve_candidates_ignores_non_auto_modes() {
         let mut cfg = auto_config("127.0.0.1", 7890);
+        let mut system = auto_config("127.0.0.1", 7891);
+        system.mode = ProxyMode::Manual;
         cfg.mode = ProxyMode::Manual;
-        assert!(resolve_candidate(&cfg).is_none());
+        assert!(resolve_candidates_with_system(&cfg, Some(system.clone())).is_empty());
         cfg.mode = ProxyMode::None;
-        assert!(resolve_candidate(&cfg).is_none());
+        assert!(resolve_candidates_with_system(&cfg, Some(system)).is_empty());
     }
 
     #[test]
-    fn resolve_candidate_falls_back_to_manual_fields() {
-        // 非 Windows 或系统代理未开启时走手动字段回退；Windows 上若恰有
-        // 系统代理则返回系统代理——两者皆为合法 Some，此处只断言不为空
-        // 且模式已具体化（绝不把 Auto 原样漏出去）。
+    fn resolve_candidates_keeps_manual_and_distinct_system_proxy() {
         let cfg = auto_config("127.0.0.1", 7890);
-        let (resolved, source) = resolve_candidate(&cfg).expect("有手动字段应有候选");
-        assert_eq!(resolved.mode, ProxyMode::Manual);
-        // 非 Windows 恒为手动字段回退；Windows 命中系统代理时是 System。
-        assert!(matches!(
-            source,
-            CandidateSource::ManualFields | CandidateSource::System
-        ));
+        let mut system = auto_config("127.0.0.1", 7891);
+        system.mode = ProxyMode::Manual;
+
+        let candidates = resolve_candidates_with_system(&cfg, Some(system));
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].source, CandidateSource::ManualFields);
+        assert_eq!(candidates[0].config.port, 7890);
+        assert_eq!(candidates[1].source, CandidateSource::System);
+        assert_eq!(candidates[1].config.port, 7891);
     }
 
     #[test]
-    fn resolve_candidate_empty_fields_may_yield_none() {
+    fn resolve_candidates_deduplicates_identical_proxy_endpoint() {
+        let cfg = auto_config("127.0.0.1", 7890);
+        let mut system = cfg.clone();
+        system.mode = ProxyMode::Manual;
+
+        let candidates = resolve_candidates_with_system(&cfg, Some(system));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source, CandidateSource::ManualFields);
+    }
+
+    #[test]
+    fn resolve_candidates_accepts_system_without_manual_fields() {
         let cfg = auto_config("", 0);
-        // 无手动字段时取决于系统代理；但绝不能返回 Auto 模式的原始配置。
-        if let Some((resolved, _source)) = resolve_candidate(&cfg) {
-            assert_eq!(resolved.mode, ProxyMode::Manual);
-            assert!(!resolved.host.is_empty());
-        }
+        let mut system = auto_config("127.0.0.1", 7891);
+        system.mode = ProxyMode::Manual;
+
+        let candidates = resolve_candidates_with_system(&cfg, Some(system));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].source, CandidateSource::System);
     }
 
     // ---- 路由标签组合 --------------------------------------------------------
@@ -1097,6 +1293,7 @@ mod tests {
         );
         // 非代理基础标签不带后缀。
         assert_eq!(with_source(DIRECT, CandidateSource::System), DIRECT);
+        assert_eq!(DIRECT_FAILOVER, "direct:failover");
         // failover 变体保留来源后缀；裸标签（旧库存量）不造假来源。
         assert_eq!(to_failover(PROXY_CACHED_SYSTEM), PROXY_FAILOVER_SYSTEM);
         assert_eq!(to_failover(PROXY_SAMPLED_MANUAL), PROXY_FAILOVER_MANUAL);
@@ -1107,13 +1304,16 @@ mod tests {
     // ---- failover 错误分类 ---------------------------------------------------
 
     #[test]
-    fn connect_class_is_stricter_than_retriable() {
-        assert!(is_connect_class_error("Connection refused (os error 111)"));
-        assert!(is_connect_class_error("operation timed out"));
-        assert!(is_connect_class_error("dns error: no record"));
-        assert!(!is_connect_class_error("HTTP 404 Not Found"));
-        assert!(!is_connect_class_error("checksum mismatch"));
-        // 可重试但非连接类：不触发 failover。
-        assert!(!is_connect_class_error("download stalled"));
+    fn route_transport_errors_include_connect_and_midstream_failures() {
+        assert!(is_route_transport_error(
+            "Connection refused (os error 111)"
+        ));
+        assert!(is_route_transport_error("operation timed out"));
+        assert!(is_route_transport_error("dns error: no record"));
+        assert!(is_route_transport_error("download stalled for 5s"));
+        assert!(is_route_transport_error("unexpected EOF"));
+        assert!(is_route_transport_error("error decoding response body"));
+        assert!(!is_route_transport_error("HTTP 404 Not Found"));
+        assert!(!is_route_transport_error("checksum mismatch"));
     }
 }

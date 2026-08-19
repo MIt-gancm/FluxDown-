@@ -313,8 +313,8 @@ class CdnEventData {
 /// Auto 代理链路定论事件（来自 Rust `TaskRouteChanged` 信号，本次会话
 /// 内存记录，不持久化）。供详情面板日志 Tab 展示；基线 `direct` 不记录。
 class RouteEventData {
-  /// wire 标签（direct:sampled / direct:pinned / proxy:cached /
-  /// proxy:sampled / proxy:failover），文案经 `S.taskRouteLabel` 本地化。
+  /// wire 标签（direct:sampled / direct:pinned / direct:failover /
+  /// proxy:cached / proxy:sampled / proxy:failover），文案经 `S.taskRouteLabel` 本地化。
   final String route;
 
   /// 事件接收时刻（本地时间），供日志 Tab 展示时间戳。
@@ -441,8 +441,8 @@ class DownloadTask {
   /// 是否为远程设备上执行的任务（经 FluxCloud 回流的只读视图，非本地引擎任务）。
   final bool isRemote;
 
-  /// Auto 代理模式下引擎选择的链路标签（wire 值如 `direct` / `proxy:failover`；
-  /// 空 = 非 Auto 模式，详情面板不显示该行）。
+  /// Auto 代理模式下引擎选择的链路标签（wire 值如 `direct` /
+  /// `direct:failover` / `proxy:failover`；空 = 非 Auto 模式）。
   final String autoRoute;
 
   /// 任务级做种限制覆盖（三态哨兵：-2=跟随全局设置、-1=不限制、>=0=自定义，

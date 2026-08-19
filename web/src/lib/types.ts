@@ -33,9 +33,9 @@ export interface TaskDto {
   groupId?: string
   /** 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）；旧服务端可能缺省 */
   queueOrder?: number
-  /** Auto 代理模式的路由标签（direct / direct:sampled / direct:pinned / proxy:cached /
-   *  proxy:sampled / proxy:failover；代理类标签带 `:system`/`:manual` 来源后缀；
-   *  空 = 非 Auto 模式）；旧服务端可能缺省 */
+  /** Auto 代理模式的路由标签（direct / direct:sampled / direct:pinned /
+   *  direct:failover / proxy:cached / proxy:sampled / proxy:failover；代理类标签
+   *  带 `:system`/`:manual` 来源后缀；空 = 非 Auto 模式）；旧服务端可能缺省 */
   autoRoute?: string
   /** BT 做种累计上传字节数（非 BT 恒 0）；旧服务端可能缺省 */
   uploadedBytes?: number

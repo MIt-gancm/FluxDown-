@@ -249,7 +249,7 @@ pub(crate) fn is_single_conn_domain(url: &str) -> bool {
 /// 旧版本数据在加载时整体丢弃并重新学习，绝不跨版本猜测字段含义。
 /// 与 aria2 `server-stat-timeout` 的思路一致：学习数据是可再生的性能缓存，
 /// 失效的正确处置是丢弃重学，而非迁移。
-const CONN_CAP_FORMAT_VERSION: &str = "v2";
+const CONN_CAP_FORMAT_VERSION: &str = "v3";
 
 /// 序列化缓存为 config 存储格式：首行版本标记，之后每行
 /// `host<TAB>cap<TAB>cap_ts<TAB>hint<TAB>hint_ts`（0 = 该观察面无记录）。
@@ -1173,6 +1173,43 @@ impl ReportScope {
     }
 }
 
+/// 本次 coordinator generation 中仍在读取 body 的已验证响应数。
+///
+/// `total_downloaded` 与 Completed 段都包含恢复前的历史进度，不能证明“当前这批
+/// 连接里仍有请求成功”。域名连接上限只有在 403/429 与另一个已通过 Range、
+/// validator、大小和编码校验的存活响应并存时才可学习。
+#[derive(Default)]
+struct GenerationEvidence {
+    active_responses: AtomicI64,
+}
+
+impl GenerationEvidence {
+    fn has_active_response(&self) -> bool {
+        self.active_responses.load(Ordering::Relaxed) > 0
+    }
+
+    fn can_learn_conn_cap(&self, server_rejection: bool) -> bool {
+        server_rejection && self.has_active_response()
+    }
+
+    fn response_started(&self) -> ActiveResponseGuard<'_> {
+        self.active_responses.fetch_add(1, Ordering::Relaxed);
+        ActiveResponseGuard {
+            counter: &self.active_responses,
+        }
+    }
+}
+
+struct ActiveResponseGuard<'a> {
+    counter: &'a AtomicI64,
+}
+
+impl Drop for ActiveResponseGuard<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// spawn_worker 所需共享句柄的集合，支持事件循环中途（ramp-up 扩容）动态增开
 /// worker——启动时与扩容时走完全相同的 spawn 路径，避免两处参数漂移。
 ///
@@ -1194,6 +1231,7 @@ struct WorkerSpawnCtx {
     reconnect_hostile: Arc<AtomicBool>,
     range_verdict: Arc<AtomicU8>,
     total_downloaded: Arc<AtomicI64>,
+    generation_evidence: Arc<GenerationEvidence>,
     seg_states: Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     db: Db,
     speed_limiter: SpeedLimiter,
@@ -1230,6 +1268,7 @@ impl WorkerSpawnCtx {
             self.reconnect_hostile.clone(),
             self.range_verdict.clone(),
             self.total_downloaded.clone(),
+            self.generation_evidence.clone(),
             self.seg_states.clone(),
             self.db.clone(),
             self.speed_limiter.clone(),
@@ -1585,6 +1624,7 @@ pub async fn run_coordinated_download(
     let total_downloaded = Arc::new(AtomicI64::new(
         segments.values().map(|s| s.downloaded_bytes).sum::<i64>(),
     ));
+    let generation_evidence = Arc::new(GenerationEvidence::default());
 
     // 规划总大小的【共享可变】视图。worker 栈上的 i64 拷贝会在就地扩容后过期
     // （尾段 worker 拿旧值 → 对同一分母反复误报 TrueSizeLarger / 进度上报错误
@@ -1754,6 +1794,7 @@ pub async fn run_coordinated_download(
         conn_sensitive: conn_sensitive.clone(),
         reconnect_hostile: reconnect_hostile.clone(),
         total_downloaded: total_downloaded.clone(),
+        generation_evidence: generation_evidence.clone(),
         range_verdict: range_verdict.clone(),
         seg_states: seg_states.clone(),
         db: db.clone(),
@@ -1962,8 +2003,8 @@ pub async fn run_coordinated_download(
                         }
 
                         let next_work = if serial_mode {
-                            let other_active = segments.values()
-                                .any(|s| s.state == SegState::Active);
+                            let other_active =
+                                segments.values().any(|s| s.state == SegState::Active);
                             if other_active {
                                 // 还有其他 worker 在下载 → 退休当前 worker，等它完成
                                 None
@@ -1971,7 +2012,7 @@ pub async fn run_coordinated_download(
                                 // 无其他活跃连接 → 取一个 Pending 分段（不拆分）
                                 find_next_pending_only(&mut segments)
                             }
-                        } else if worker_assign_txs.iter().filter(|t| t.is_some()).count()
+                        } else if worker_assign_txs.iter().filter(|tx| tx.is_some()).count()
                             > allowed_workers
                         {
                             // 乘性降级后的【自然退休】：存活 worker 数超出当前额度，
@@ -2307,34 +2348,27 @@ pub async fn run_coordinated_download(
                         }
 
                         // 失败处置分三类：
-                        //   (1) 403/429 服务器拒绝多连接 + 有其它段在工作；
-                        //   (2) 瞬时 RangeNotSupported——已下载过数据（any_data，证明
-                        //       Range 工作过），本次却收到 200 全量响应（alist 代理迅雷/
-                        //       光鸭云盘在连接压力下偶发）；
-                        //   (3) 真·无 Range（从未拿到 206）或其它致命错误。
-                        // (1)(2) 走串行降级：保数据、退休失败 worker、保活其它 worker、
-                        // 不 cancel、不清文件；(3) 走 Path B：仅停 workers 并上报错误。
+                        //   (1) 403/429/400 拒绝，且本 generation 还有其它请求在途；
+                        //   (2) 任务已有可保留 Range 进度后偶发 200 全量响应；
+                        //   (3) 当前 URL 全部拒绝、真·无 Range 或其它致命错误。
+                        // (1)(2) 走串行降级：保数据、退休失败 worker、保活其它 worker；
+                        // (3) 走 Path B：仅停 workers 并上报错误。
                         let is_range_err =
                             matches!(error, DownloadError::RangeNotSupported(_));
-                        // 是否已有任意段真正拿到过 206 并写入数据（含 resume 起始进度）。
+                        // 是否存在任何可保留进度；这里允许历史进度参与，只用于决定
+                        // 重试/清盘，不用于学习跨任务域名连接上限。
                         let any_data = total_downloaded.load(Ordering::Relaxed) > 0;
-                        let other_working = segments.values().any(|s| {
-                            s.index != seg_index
-                                && matches!(s.state, SegState::Active | SegState::Completed)
-                        });
+                        // Active 只代表当前 generation 请求仍在途；Completed 是历史
+                        // 状态，绝不能作为“当前还有其它连接”的证据。
+                        let other_in_flight = has_other_in_flight(&segments, seg_index);
 
-                        // 瞬时 200：Range 工作过（any_data）却收到 RangeNotSupported。
-                        // 绝不能当永久错误（取消任务 + 删数据 + 投毒主机）处理。
+                        // Range 曾工作过却收到 RangeNotSupported，可按瞬时 200 处理以
+                        // 保留进度；是否写域名 cap 仍由存活的已验证响应单独门控。
                         let transient_range = is_range_err && any_data;
                         let server_rejection = is_server_rejection(&error);
-                        // 400 亦按连接级拒绝处理，但仅当 other_working（同 URL 其他
-                        // 连接工作正常，证明请求本身合法）：配额型端点（如 fnOS
-                        // multiple-download 的 token 请求次数配额）对超额连接回 400
-                        // 而非 403/429。与 403/429 不同，400 语义宽泛，绝不写入
-                        // 域名连接数缓存（下方两处 record 仍只看 server_rejection）。
+                        // 400 可参与当前任务降级，但语义宽泛，永不写域名连接缓存。
                         let conn_rejection = server_rejection || is_http_400(&error);
-
-                        if (conn_rejection && other_working) || transient_range {
+                        if (conn_rejection && other_in_flight) || transient_range {
                             // ---- 分级自适应降级 ----
                             // 第 1 次拒绝且存活连接充足：乘性减半连接额度，冻结扩容，
                             // 保留所有存活连接（超额部分完成当前段后自然退休）；
@@ -2362,9 +2396,9 @@ pub async fn run_coordinated_download(
                                     allowed_workers,
                                     reason
                                 );
-                                // 仅 403/429（真·连接数限制）记录域名连接上限缓存。
-                                // 瞬时 200 不记录（服务器明确支持 Range，见下方注释）。
-                                if server_rejection {
+                                // 仅当拒绝发生时有另一个【已验证响应】仍在传 body，
+                                // 才能证明是连接压力而非签名 URL 整体失效。
+                                if generation_evidence.can_learn_conn_cap(server_rejection) {
                                     record_domain_conn_cap_persist(
                                         url,
                                         allowed_workers as i32,
@@ -2380,11 +2414,9 @@ pub async fn run_coordinated_download(
                                     reason
                                 );
                                 serial_mode = true;
-                                // 仅 403/429（真·连接数限制）记录域名单连接缓存。瞬时 200
-                                // 【绝不】记录——服务器明确支持 Range（已服务过半 206），
-                                // 一次偶发 200 不应把整个主机打成单连接 24h、阻断续传与
-                                // 多段吞吐（BUG-COORD-TRANSIENT-200-POISONS-HOST）。
-                                if server_rejection {
+                                // 同上：只凭历史 Completed 段或其它尚未收到响应的
+                                // Active 请求，不能把整个域名投毒成 24h 单连接。
+                                if generation_evidence.can_learn_conn_cap(server_rejection) {
                                     record_single_conn_domain_persist(url, db);
                                 }
                             }
@@ -3683,6 +3715,12 @@ fn try_proactive_split(
 // Helper: check completion
 // ---------------------------------------------------------------------------
 
+fn has_other_in_flight(segments: &BTreeMap<i32, LiveSegment>, failed_index: i32) -> bool {
+    segments
+        .values()
+        .any(|s| s.index != failed_index && s.state == SegState::Active)
+}
+
 fn all_done(segments: &BTreeMap<i32, LiveSegment>) -> bool {
     segments.values().all(|s| s.state == SegState::Completed)
 }
@@ -4001,6 +4039,7 @@ fn spawn_worker(
     reconnect_hostile: Arc<AtomicBool>,
     range_verdict: Arc<AtomicU8>,
     total_downloaded: Arc<AtomicI64>,
+    generation_evidence: Arc<GenerationEvidence>,
     seg_states: Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     db: Db,
     speed_limiter: SpeedLimiter,
@@ -4049,6 +4088,7 @@ fn spawn_worker(
                 &range_verdict,
                 &event_tx,
                 &total_downloaded,
+                &generation_evidence,
                 &planned_total,
                 size_is_estimate,
                 &first_validators,
@@ -4146,9 +4186,9 @@ fn spawn_worker(
 /// HTTP 400 Bad Request 判定。
 ///
 /// 配额型下载端点（fnOS `multiple-download?token=`：一个 token 只允许固定次数
-/// 成功 GET）对超额请求返回 400 而非 403/429。coordinator 仅在有其他连接正常
-/// 工作（other_working，证明同一 URL 请求合法）时把 400 归入连接级拒绝走降级；
-/// 且 400 绝不写入域名连接数缓存（语义宽泛，避免把坏 URL 学习成主机级降速）。
+/// 成功 GET）对超额请求返回 400 而非 403/429。coordinator 仅在同 generation
+/// 仍有其他请求在途时把 400 归入连接级拒绝走降级；且 400 绝不写入域名连接数
+/// 缓存（语义宽泛，避免把坏 URL 学习成主机级降速）。
 fn is_http_400(e: &DownloadError) -> bool {
     matches!(
         e,
@@ -4180,6 +4220,7 @@ async fn do_segment_with_retry(
     range_verdict: &AtomicU8,
     event_tx: &mpsc::Sender<WorkerEvent>,
     total_downloaded: &AtomicI64,
+    generation_evidence: &GenerationEvidence,
     planned_total: &AtomicI64,
     size_is_estimate: bool,
     first_validators: &StdMutex<Option<(String, String)>>,
@@ -4217,6 +4258,7 @@ async fn do_segment_with_retry(
             range_verdict,
             event_tx,
             total_downloaded,
+            generation_evidence,
             planned_total,
             size_is_estimate,
             first_validators,
@@ -4251,11 +4293,9 @@ async fn do_segment_with_retry(
             // 立即返回，绝不当瞬时错误退避重试（BUG-HTTP-HINT-UNDERSIZED）。
             Err(e @ DownloadError::TrueSizeLarger(_)) => return Err(e),
             // RangeNotSupported 的两义性处理：
-            //   • total_downloaded==0：从未有任何段拿到过 206 → 服务器真的无视 Range
-            //     （如 FnOS NAS）。立即返回让 coordinator 快速回退单流，不空烧退避。
-            //   • total_downloaded>0：Range 明确工作过，本次 200 是瞬时的（alist 代理
-            //     云盘在连接压力下偶发全量响应）。落入下方通用 Err(e) 分支像普通瞬时
-            //     错误一样带退避重试——换连接重发多数即恢复 206。
+            //   • 没有任何可保留进度：立即返回，让 coordinator 快速回退单流；
+            //   • 已有进度（含恢复前历史进度）：按瞬时 200 重试，避免一次响应
+            //     波动清掉大文件断点。
             Err(e @ DownloadError::RangeNotSupported(_))
                 if total_downloaded.load(Ordering::Relaxed) == 0 =>
             {
@@ -4357,6 +4397,7 @@ async fn do_segment(
     range_verdict: &AtomicU8,
     event_tx: &mpsc::Sender<WorkerEvent>,
     total_downloaded: &AtomicI64,
+    generation_evidence: &GenerationEvidence,
     // 当前规划总大小的共享视图（coordinator 就地扩容时更新，见 planned_total 注释）。
     planned_total: &AtomicI64,
     // `planned_total` 是否为【未经 probe 验证的估计值】（fresh hint 模式）。true 时
@@ -4381,55 +4422,29 @@ async fn do_segment(
         return Ok(seg_end - seg_start + 1);
     }
 
-    // hint 模式首连接：完全不带 Range/If-Range 的 plain GET——配额型端点
-    // （fnOS multiple-download）对 bounded Range 一律 400 且【作废 token】，
-    // 首枪必须是裸 GET。响应 200 走下方"开放式 200 直接采用"路径（no_range
-    // 仅与 open_ended 同真），写循环按共享 end_byte 预算截断。
+    // hint 模式首连接完全不带 Range；其余分段与 aria2 一致，只发送 Range。
+    // 部分一次性签名端点会把 If-Range 视为签名外请求头并立即作废 URL，
+    // 收到 403 后再重试纯 Range 已无法恢复。版本一致性由 206 响应的
+    // ETag/Last-Modified 后验校验保证。
     let plain_first = no_range && actual_start == 0;
-    // 多段下载始终用 GET——上游 resolve_file_info 已确保 spec.is_get_like()，
-    // 此处显式传入 GET 以规避：（1）调用方误传 non-GET spec；（2）spec.method
-    // 是 HEAD（HEAD 不携带 body，没有意义）。
+    // 多段下载始终用 GET——上游 resolve_file_info 已确保 spec.is_get_like()。
+    let range = if open_ended {
+        format!("bytes={actual_start}-")
+    } else {
+        format!("bytes={}-{}", actual_start, seg_end)
+    };
     let mut req = crate::downloader::build_request(client, url, reqwest::Method::GET, spec);
-    let mut validator_sent = false;
     if !plain_first {
-        // 开放式段不给终点：服务器把流一直送到文件尾，写循环按共享 end_byte 预算
-        // 截断。coordinator 可在其余连接被拒时就地扩容本段预算续流（吸收合并），
-        // 也天然兼容"对带终点 Range 返回 400"的怪异端点。
-        let range = if open_ended {
-            format!("bytes={actual_start}-")
-        } else {
-            format!("bytes={}-{}", actual_start, seg_end)
-        };
-        req = req.header("Range", range);
-        // If-Range：把"文件是否自 probe 起变化"的判定交给服务器。validator 一致 →
-        // 返回 206（正常分段）；不一致 → 返回 200 全量 → 下方 != 206 守卫触发
-        // RangeNotSupported，coordinator 取消并回退单流（download_single 的 If-Range
-        // 会再判一次），从而**即使 CDN 在 206 上剥离了 ETag/Last-Modified**也能阻止
-        // 新旧版本静默拼接（BUG-COORD-XVERSION-NO-CONDITIONAL）。下方逐段 ETag 比对
-        // 作为第二道防线保留（应对服务器忽略 If-Range 的情形）。
-        // If-Range 必须用【强】validator（RFC 7233 §3.2）：弱 ETag（`W/` 前缀）在
-        // If-Range 上语义未定义，部分严格服务器即便文件未变也会回 200，反而误触
-        // 下方回退。故强 ETag 优先，弱 ETag 跳过、回退 Last-Modified。
-        let validator = if !expected_etag.is_empty() && !expected_etag.starts_with("W/") {
-            Some(expected_etag.to_string())
-        } else if !expected_last_modified.is_empty() {
-            Some(expected_last_modified.to_string())
-        } else {
-            None
-        };
-        validator_sent = validator.is_some();
-        if let Some(v) = validator {
-            req = req.header("If-Range", v);
-        }
+        req = req.header("Range", &range);
     }
     // 等响应头与 cancel 竞速：惩罚型/停滞服务器可能接受 TCP 连接后长时间不回
     // 响应头（client 只有 connect_timeout，响应头无超时），若不竞速，删除/取消
-    // 任务会被卡在这里直到服务器开口，manager 的 5s handle 等待必然超时。
-    // 写循环内的 chunk 读取已有同样的竞速 + 停滞超时，此处补齐请求发起阶段。
+    // 任务会被卡在这里直到服务器开口。
     let resp = tokio::select! {
         _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
-        r = req.send() => r?.error_for_status()?,
+        r = req.send() => r?,
     };
+    let resp = resp.error_for_status()?;
 
     // --- Range 能力裁决（hint 模式，每任务恰好一次）------------------------
     // 依据首个成功响应：206（服务器履行了 Range）或 200 携带
@@ -4479,15 +4494,8 @@ async fn do_segment(
     // the coordinator cancels all workers for the current attempt.  On retry
     // the cached policy kicks in and the download proceeds in single-stream.
     if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        // 区分两种 non-206：
-        //   (a) 我们发了 If-Range 且响应 validator 与 probe【不同】→ 文件在 probe
-        //       与本段请求之间确实变了。这是"版本变化"而非"服务器不支持 Range"——
-        //       仅本任务回退单流（RangeNotSupported 会触发 run_download_inner 清理
-        //       临时文件并重下新版本）即可，【绝不】把整个主机记入单连接缓存，
-        //       否则一次文件变更会牵连该主机后续所有无关下载 24h 失去多段吞吐
-        //       （BUG-COORD-IFRANGE-200-POISONS-HOST）。
-        //   (b) 未发 validator，或响应 validator 与 probe 相同/缺失 → 服务器确实
-        //       无视 Range（如 FnOS NAS）。记录主机，后续任务直接走单流。
+        // Range 返回 non-206 时先依据响应 validator 区分文件版本变化与真正不支持
+        // Range；不能把一次文件替换误记成整个域名 24h 单连接。
         let resp_etag = resp
             .headers()
             .get(reqwest::header::ETAG)
@@ -4498,16 +4506,12 @@ async fn do_segment(
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        let version_changed = validator_sent
+        let version_changed = !plain_first
             && ((!expected_etag.is_empty() && !resp_etag.is_empty() && resp_etag != expected_etag)
                 || (!expected_last_modified.is_empty()
                     && !resp_lm.is_empty()
                     && resp_lm != expected_last_modified));
-        // 分两类 non-206 处理：
-        //   • version_changed：文件在 probe 与本段请求之间变了（If-Range validator 不
-        //     匹配 → 服务器忽略 Range 回 200 全量新版本）。返回 VersionChanged，让上层
-        //     清空旧数据重下新版本；【绝不】记录主机单连接缓存（与 Range 能力无关）
-        //     （BUG-COORD-IFRANGE-200-POISONS-HOST）。
+        // validator 变化：清空旧数据重下新版本；不污染域名连接能力缓存。
         if version_changed {
             return Err(DownloadError::VersionChanged(resp.status().to_string()));
         }
@@ -4531,13 +4535,8 @@ async fn do_segment(
                     resp.status()
                 );
             }
-            //   • 非版本变化的 200：仅当【从未下载到任何数据】(total_downloaded==0，从头到尾
-            //     没有一个段拿到过 206) 才记录主机——这是真·服务器无视 Range（如 FnOS NAS）。
-            //     若已下载过数据（Range 明确工作过），本次 200 是【瞬时】的（alist 代理迅雷/
-            //     光鸭云盘在连接压力下偶发全量响应），绝不能因一次瞬时 200 把整个主机打成
-            //     单连接 24h、阻断续传与多段吞吐（BUG-COORD-TRANSIENT-200-POISONS-HOST）。
-            //     判定与 coordinator transient_range 一致，均以 total_downloaded>0 为
-            //     "Range 工作过"的证据。
+            // 历史或本轮任一成功 Range 都证明该主机具备 Range 能力；偶发 200
+            // 不能把整个域名标记成单连接。
             if total_downloaded.load(Ordering::Relaxed) == 0 {
                 record_single_conn_domain_persist(url, db);
             }
@@ -4780,6 +4779,11 @@ async fn do_segment(
         let _ = event_tx.send(WorkerEvent::OpenEndedEstablished).await;
     }
 
+    // 到这里响应已通过状态、Range、validator、大小与编码校验；在 body 流存活
+    // 期间登记为“当前 generation 正在被服务”。403/429 只有与这份同时成功证据
+    // 并存，才有资格学习域名连接上限。
+    let _active_response = generation_evidence.response_started();
+
     let mut stream = resp.bytes_stream();
 
     let file = OpenOptions::new().write(true).open(dest).await?;
@@ -4903,7 +4907,6 @@ async fn do_segment(
                         seg_downloaded += len;
                         total_downloaded.fetch_add(len, Ordering::Relaxed);
 
-                        // Update shared segment state (workers → coordinator channel).
                         // Only `downloaded_bytes` is written — `end_byte` is
                         // exclusively owned by the coordinator.
                         update_seg_state(seg_states, seg_idx, seg_downloaded);
@@ -5094,11 +5097,11 @@ mod tests {
         RAMP_SOFT_PROBE_TASK_BUDGET, RampVerdict, SegState, TAIL_MIN_SPLIT_BYTES, all_done,
         beneficial_hint_scale, build_seg_state_vec, check_cross_segment_validators, conn_cap_cache,
         domain_conn_hint, dynamic_min_split_bytes, extract_host, find_next_pending_only,
-        find_next_work, freeze_verdict_next_state, hint_uncap_ceiling, initial_allowed_workers,
-        is_single_conn_domain, is_tail, ramp_verdict, rebuild_seg_states, record_domain_conn_cap,
-        record_domain_conn_hint, should_expand, should_shrink, soft_probe_eval_transition,
-        soft_probe_ready, sustained_shrink_next_state, try_proactive_split, try_split_largest,
-        validate_coverage,
+        find_next_work, freeze_verdict_next_state, has_other_in_flight, hint_uncap_ceiling,
+        initial_allowed_workers, is_single_conn_domain, is_tail, ramp_verdict, rebuild_seg_states,
+        record_domain_conn_cap, record_domain_conn_hint, should_expand, should_shrink,
+        soft_probe_eval_transition, soft_probe_ready, sustained_shrink_next_state,
+        try_proactive_split, try_split_largest, validate_coverage,
     };
     use crate::downloader::{DownloadError, SegmentProgressInfo, is_server_rejection};
     use std::collections::BTreeMap;
@@ -5318,8 +5321,8 @@ mod tests {
 
     #[test]
     fn http_400_is_not_server_rejection() {
-        // 分类必须与 403/429 区分：400 走连接级拒绝降级（需 other_working 佐证），
-        // 但绝不写入域名连接数缓存（record 只看 is_server_rejection）。
+        // 分类必须与 403/429 区分：400 走连接级拒绝降级（需同 generation
+        // 其它在途请求佐证），但绝不写入域名连接数缓存。
         assert!(!is_server_rejection(&make_status_error(400)));
     }
 
@@ -5971,6 +5974,24 @@ mod tests {
         assert!(!all_done(&segs));
     }
 
+    #[test]
+    fn completed_segments_do_not_prove_current_connection_success() {
+        let mut segs = BTreeMap::new();
+        segs.insert(0, make_seg(0, 0, 99, 100, SegState::Completed));
+        segs.insert(1, make_seg(1, 100, 199, 0, SegState::Active));
+
+        assert!(
+            !has_other_in_flight(&segs, 1),
+            "恢复前完成的段不能把当前 URL 的 403 误判为并发限制"
+        );
+
+        segs.insert(2, make_seg(2, 200, 299, 0, SegState::Active));
+        assert!(
+            has_other_in_flight(&segs, 1),
+            "同 generation 的其它在途请求应允许当前任务自适应降级"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // LiveSegment methods
     // -----------------------------------------------------------------------
@@ -6225,17 +6246,21 @@ mod tests {
         );
 
         let raw = serialize_conn_caps(&map);
-        assert!(raw.starts_with("v2\n"), "首行必须是版本标记");
+        assert!(raw.starts_with("v3\n"), "首行必须是版本标记");
         assert_eq!(parse_conn_caps(&raw), map, "roundtrip 必须无损");
     }
 
     #[test]
     fn conn_caps_unknown_version_discarded_entirely() {
         use super::parse_conn_caps;
-        // 旧版本（v1）/未来版本/无版本头的数据整体丢弃（重新学习），
-        // 绝不跨版本猜测字段含义
+        // 旧版本（含产生过误降级记录的 v2）/未来版本/无版本头整体丢弃，
+        // 绝不跨版本猜测字段含义。
         assert!(parse_conn_caps("v1\na.example.com\t4\t1000").is_empty());
-        assert!(parse_conn_caps("v3\na.example.com\t4\t1000\t8\t1000").is_empty());
+        assert!(
+            parse_conn_caps("v2\na.example.com\t1\t1000\t0\t0").is_empty(),
+            "旧策略写出的单连接缓存必须失效并重新学习"
+        );
+        assert!(parse_conn_caps("v4\na.example.com\t4\t1000\t8\t1000").is_empty());
         assert!(parse_conn_caps("a.example.com\t4\t1000\t0\t0").is_empty());
         assert!(parse_conn_caps("").is_empty());
     }
@@ -6243,7 +6268,7 @@ mod tests {
     #[test]
     fn conn_caps_malformed_lines_skipped_within_version() {
         use super::{ConnPolicyEntry, parse_conn_caps};
-        let raw = "v2\nok.example.com\t4\t1000\t8\t1500\n\
+        let raw = "v3\nok.example.com\t4\t1000\t8\t1500\n\
                    缺字段\t4\t1\nbad-cap.example.com\tx\t1\t0\t0\n\
                    neg.example.com\t-1\t1\t0\t0\nempty.example.com\t0\t0\t0\t0";
         let map = parse_conn_caps(raw);
@@ -6256,6 +6281,34 @@ mod tests {
                 hint: 8,
                 hint_ts: 1500,
             })
+        );
+    }
+
+    #[test]
+    fn conn_cap_learning_requires_concurrent_validated_response() {
+        use super::GenerationEvidence;
+
+        let evidence = GenerationEvidence::default();
+        assert!(
+            !evidence.can_learn_conn_cap(true),
+            "仅收到 403/429、没有当前成功响应时不得学习域名连接上限"
+        );
+
+        {
+            let _active = evidence.response_started();
+            assert!(
+                evidence.can_learn_conn_cap(true),
+                "拒绝与另一个已验证响应同时存在时才构成连接压力证据"
+            );
+            assert!(
+                !evidence.can_learn_conn_cap(false),
+                "非 403/429 错误不得写入连接上限"
+            );
+        }
+
+        assert!(
+            !evidence.can_learn_conn_cap(true),
+            "成功响应结束后不能用旧证据污染后续 URL"
         );
     }
 
@@ -6346,6 +6399,40 @@ mod tests {
             cache.remove(fresh_host);
             cache.remove(stale_host);
             cache.remove(mixed_host);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn legacy_v2_single_connection_cap_is_ignored_on_engine_start() {
+        use super::{CONN_CAP_CONFIG_KEY, domain_conn_cap, load_domain_conn_caps, now_unix_secs};
+
+        let dir = std::env::temp_dir().join(format!("fluxdown_connv2_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db = crate::db::Db::open(&dir).await.expect("open db");
+        let host = format!("legacy-v2-{}.example.com", uuid::Uuid::new_v4());
+        let url = format!("https://{host}/signed?token=expired");
+        if let Ok(mut cache) = conn_cap_cache().lock() {
+            cache.remove(&host);
+        }
+
+        db.set_config(
+            CONN_CAP_CONFIG_KEY,
+            &format!("v2\n{host}\t1\t{}\t0\t0", now_unix_secs()),
+        )
+        .await
+        .expect("seed legacy cap");
+
+        load_domain_conn_caps(&db).await;
+        assert_eq!(
+            domain_conn_cap(&url),
+            None,
+            "旧实现由失效签名 URL 写出的 24h 单连接限制不得继续生效"
+        );
+
+        if let Ok(mut cache) = conn_cap_cache().lock() {
+            cache.remove(&host);
         }
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);

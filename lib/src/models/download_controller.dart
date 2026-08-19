@@ -24,6 +24,16 @@ enum StatusTab { all, downloading, completed, paused, error, seeding }
 class DownloadController extends ChangeNotifier {
   /// 全局单例引用，供无 context 场景（如 ExternalDownloadService）读取队列信息
   static DownloadController? globalInstance;
+  static Completer<DownloadController>? _globalInstanceCompleter;
+
+  /// Completes when a live controller has registered itself as [globalInstance].
+  static Future<DownloadController> get whenGlobalInstanceAvailable {
+    final current = globalInstance;
+    if (current != null) return Future.value(current);
+    return (_globalInstanceCompleter ??= Completer<DownloadController>())
+        .future;
+  }
+
   final List<DownloadTask> _tasks = [];
   String? _selectedTaskId;
 
@@ -39,6 +49,7 @@ class DownloadController extends ChangeNotifier {
 
   /// 命名队列列表（来自 Rust AllQueues 信号）
   List<DownloadQueue> _queues = [];
+  final Completer<void> _queuesLoadedCompleter = Completer<void>();
 
   /// 当前队列筛选 ID：null = 不过滤（显示全部），'' = 默认队列，非空 = 指定命名队列
   String? _queueFilter;
@@ -162,20 +173,30 @@ class DownloadController extends ChangeNotifier {
 
   bool _disposed = false;
 
-  DownloadController() {
+  DownloadController({bool requestInitialState = true}) {
     logInfo(_tag, 'constructor — starting listeners');
     globalInstance = this;
+    final instanceWaiter = _globalInstanceCompleter;
+    if (instanceWaiter != null && !instanceWaiter.isCompleted) {
+      instanceWaiter.complete(this);
+    }
+    _globalInstanceCompleter = null;
     _startListening();
-    // 启动时请求所有持久化任务和队列
-    const RequestAllTasks().sendSignalToRust();
-    const RequestAllQueues().sendSignalToRust();
-    const RequestAllGroups().sendSignalToRust();
+    if (requestInitialState) {
+      // 启动时请求所有持久化任务和队列
+      const RequestAllTasks().sendSignalToRust();
+      const RequestAllQueues().sendSignalToRust();
+      const RequestAllGroups().sendSignalToRust();
+    }
   }
 
   @override
   void dispose() {
     logInfo(_tag, 'dispose called');
     _disposed = true;
+    if (!_queuesLoadedCompleter.isCompleted) {
+      _queuesLoadedCompleter.complete();
+    }
     if (globalInstance == this) globalInstance = null;
     _progressSub?.cancel();
     _allTasksSub?.cancel();
@@ -233,6 +254,9 @@ class DownloadController extends ChangeNotifier {
 
   /// 命名队列列表（已按 position 排序）
   List<DownloadQueue> get queues => _queues;
+
+  /// Completes after the first AllQueues snapshot, including an empty snapshot.
+  Future<void> get whenQueuesLoaded => _queuesLoadedCompleter.future;
 
   /// 当前队列筛选（null = 不过滤，'' = 默认队列，非空 = 指定命名队列）
   String? get queueFilter => _queueFilter;
@@ -1896,8 +1920,7 @@ class DownloadController extends ChangeNotifier {
       var task = DownloadTask(
         id: p.taskId,
         url: p.url,
-        fileName:
-            p.fileName.isEmpty ? placeholderTaskName(p.url) : p.fileName,
+        fileName: p.fileName.isEmpty ? placeholderTaskName(p.url) : p.fileName,
         saveDir: p.saveDir,
         status: newStatus,
         downloadedBytes: p.downloadedBytes,
@@ -2088,8 +2111,13 @@ class DownloadController extends ChangeNotifier {
   }
 
   void _onAllQueues(RustSignalPack<AllQueues> pack) {
+    applyLoadedQueues(pack.message.queues);
+  }
+
+  /// Applies an authoritative queue snapshot from Rust.
+  @visibleForTesting
+  void applyLoadedQueues(List<QueueInfo> incoming) {
     if (_disposed) return;
-    final incoming = pack.message.queues;
     logInfo(_tag, '_onAllQueues: ${incoming.length} queues');
     _queues = incoming.map(DownloadQueue.fromQueueInfo).toList()
       ..sort((a, b) => a.position.compareTo(b.position));
@@ -2098,6 +2126,9 @@ class DownloadController extends ChangeNotifier {
         _queueFilter!.isNotEmpty &&
         !_queues.any((q) => q.queueId == _queueFilter)) {
       _queueFilter = null;
+    }
+    if (!_queuesLoadedCompleter.isCompleted) {
+      _queuesLoadedCompleter.complete();
     }
     _safeNotifyListeners();
   }

@@ -8,6 +8,7 @@
 //! 2. 「为此网站保存」→ 凭据按站点键落 config 键 `site_auth_credentials`；
 //! 3. 同站点后续任务未显式给凭据 → 自动套用已保存凭据；
 //! 4. 其他站点 / 已带 Authorization 头的任务不受影响。
+//! 5. 显式单任务 User-Agent → 并入请求上下文快照，resume 复用同一请求身份。
 //!
 //! 任务全部 `start_paused` 落库，不发起真实网络请求。
 
@@ -160,6 +161,61 @@ async fn explicit_credentials_are_injected_saved_and_auto_applied() {
         headers.get("authorization").map(String::as_str),
         Some("Bearer tok"),
         "captured Authorization must win over the saved credential"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&work).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_user_agent_is_snapshotted_without_overriding_captured_header() {
+    let work = std::env::temp_dir().join(format!("fluxdown-task-ua-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let mut engine = make_engine(&work).await;
+    let save_dir = work.to_string_lossy().into_owned();
+
+    let id = engine
+        .manager
+        .create_task(NewTaskSpec {
+            url: "http://download.example/file.bin".to_string(),
+            save_dir: save_dir.clone(),
+            file_name: "file.bin".to_string(),
+            start_paused: true,
+            user_agent: "Task-UA/1.0".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("create task");
+    let headers = task_headers(&engine, &id).await;
+    let persisted = headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case("user-agent")
+            .then_some(value.as_str())
+    });
+    assert_eq!(
+        persisted,
+        Some("Task-UA/1.0"),
+        "explicit task User-Agent must survive pause and process restart"
+    );
+
+    let mut captured = HashMap::new();
+    captured.insert("user-agent".to_string(), "Captured-UA/2.0".to_string());
+    let captured_id = engine
+        .manager
+        .create_task(NewTaskSpec {
+            url: "http://download.example/captured.bin".to_string(),
+            save_dir,
+            file_name: "captured.bin".to_string(),
+            start_paused: true,
+            user_agent: "Task-UA/1.0".to_string(),
+            extra_headers: captured,
+            ..Default::default()
+        })
+        .await
+        .expect("create captured task");
+    let captured_headers = task_headers(&engine, &captured_id).await;
+    assert_eq!(
+        captured_headers.get("user-agent").map(String::as_str),
+        Some("Captured-UA/2.0"),
+        "captured request header must keep precedence over the separate task field"
     );
 
     let _ = tokio::fs::remove_dir_all(&work).await;

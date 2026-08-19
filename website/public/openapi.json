@@ -4471,7 +4471,7 @@
         "properties": {
           "autoRoute": {
             "type": "string",
-            "description": "`ProxyMode::Auto` 的任务级最终链路（可追溯性）：`direct` /\n`direct:sampled` / `direct:pinned` / `proxy:cached` /\n`proxy:sampled` / `proxy:failover`（代理类标签带候选来源后缀\n`:system`/`:manual`）；空 = 非 Auto 模式。"
+            "description": "`ProxyMode::Auto` 的任务级最终链路（可追溯性）：`direct` /\n`direct:sampled` / `direct:pinned` / `direct:failover` /\n`proxy:cached` / `proxy:sampled` / `proxy:failover`（代理类标签带\n候选来源后缀 `:system`/`:manual`）；空 = 非 Auto 模式。"
           },
           "checksum": {
             "type": "string",

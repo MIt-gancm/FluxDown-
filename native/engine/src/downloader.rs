@@ -38,13 +38,11 @@ pub enum DownloadError {
     /// single-stream mode.
     #[error("server does not support Range requests (returned {0} instead of 206 Partial Content)")]
     RangeNotSupported(String),
-    /// 服务器在 probe 与分段/续传请求之间【更换了文件】：客户端发了 `If-Range`
-    /// 条件请求，但服务器的 validator（ETag/Last-Modified）与 probe 时不一致，于是
-    /// 【忽略 Range 返回 200 全量当前文件】。与 [`RangeNotSupported`] 严格区分：后者
-    /// 是服务器根本不支持 Range（回退单流续下同一文件即可）；本变体意味着旧数据已
-    /// 作废，必须【清空临时文件 + 重新下载新版本】，绝不能把旧字节当可续传（否则
-    /// 产出新旧版本混合的损坏文件）。也【绝不】记录主机单连接缓存（文件变化与服务器
-    /// Range 能力无关）。
+    /// 服务器在 probe 与分段/续传请求之间【更换了文件】：Range 响应的
+    /// validator（ETag/Last-Modified）与已落盘版本不一致。与
+    /// [`RangeNotSupported`] 严格区分：后者是服务器根本不支持 Range；本变体
+    /// 意味着旧数据已不能与当前响应拼接，必须清空临时文件后重新下载。文件变化
+    /// 与服务器 Range 能力无关，因此绝不记录主机单连接缓存。
     #[error("file changed on server during download (validator mismatch, server returned {0})")]
     VersionChanged(String),
     /// 服务器对 `Range: bytes=X-Y` 请求回了 `206 Partial Content`，但响应的
@@ -2257,6 +2255,12 @@ pub const DB_SAVE_INTERVAL_SECS: u64 = 3;
 /// 这条连接是唯一数据流，掐早了只有整任务重试一条路；多段路径重连廉价且
 /// 尾段抢救依赖快速回收，故用更激进的 5s。
 const CHUNK_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 单流续传的单次 Range 上限。部分签名下载端点会拒绝超过 20 MiB 的区间；
+/// 取 16 MiB 为闭区间长度留出余量，并在同一任务内串行请求后续区间。
+const MAX_SINGLE_RESUME_RANGE_BYTES: i64 = 16 * 1024 * 1024;
+/// 与 aria2 控制文件的 piece 语义一致：只把完整 1 MiB 检查点作为可恢复进度。
+/// 任意连接中断留下的尾部不足一块，下一次 Range 从前一检查点覆盖重写。
+const SINGLE_RESUME_ALIGNMENT_BYTES: i64 = 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -2516,6 +2520,18 @@ async fn compute_segments_with_advisor(p: &DownloadParams, info: &FileInfo) -> i
 /// (progress_reporter 对非空 file_name 锁存,空串 = 不变)。
 async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>), DownloadError> {
     log_info!("[download] task {} starting, url={}", p.task_id, p.url);
+    // 恢复任务进入 preparing 时保留已落库进度，避免 UI 在真正发出续传
+    // Range 前短暂显示为 0。后续 status=1 继续复用同一基线，不重复查库。
+    let (resume_downloaded, resume_total) = if p.is_resume {
+        p.db.load_task_by_id(&p.task_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|task| (task.downloaded_bytes.max(0), task.total_bytes.max(0)))
+            .unwrap_or((0, 0))
+    } else {
+        (0, 0)
+    };
 
     // Transition to status=5 (preparing) — probing server, resolving file info
     let _ = p.db.update_task_status(&p.task_id, 5, "").await;
@@ -2523,8 +2539,8 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         .progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
-            downloaded_bytes: 0,
-            total_bytes: 0,
+            downloaded_bytes: resume_downloaded,
+            total_bytes: resume_total,
             status: 5,
             error_message: String::new(),
             file_name: p.file_name.clone(),
@@ -2596,17 +2612,15 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         FileInfo {
             file_name: name,
             total_bytes: effective_size,
-            // Optimistically assume Range support for auto (0) and explicit
-            // multi-segment (> 1) requests.  Most servers that expose a
-            // Content-Length also honour Range headers.  The bandwidth probe
-            // is intentionally skipped for hint-mode tasks (see below) so no
-            // extra HTTP request is made that could consume a one-time CDN
-            // token (e.g. Lanzou cloud signed URLs).
-            // Only assume Range support when we have a real file size AND
-            // the original method is GET-like. POST + Range is undefined and
-            // unsafe; force single-stream so the assumed supports_range can
-            // never trip multi-segment for non-GET requests.
-            supports_range: p.hint_file_size > 0 && p.segment_count != 1 && p.spec.is_get_like(),
+            // Hint 模式没有 probe：自动/显式多段任务仍按既有策略乐观尝试
+            // Range；已持久化 range_verified 的恢复任务则必须沿用这份证据。
+            // segment_count=1 只限制并发，不等于禁用 Range——单流暂停后的断点
+            // 恢复仍需从临时文件缺口继续。fresh 单流没有既有字节，即使
+            // supports_range=true，download_single 也会发普通 GET，不会额外消耗
+            // 一次性 URL。非 GET 继续强制单流且禁止 Range，避免 POST 续传拼接。
+            supports_range: p.hint_file_size > 0
+                && (p.segment_count != 1 || p.range_verified)
+                && p.spec.is_get_like(),
             content_type: String::new(),
             // Hint mode skips the probe, so no ETag/Last-Modified available.
             etag: String::new(),
@@ -2756,11 +2770,9 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
 
     // Resume 一致性校验所需的【版本标识】（ETag / Last-Modified）。
     //   • 首次下载（非续传）：用本次 probe 的值，并持久化到 DB，作为将来续传的基准。
-    //   • 续传：用【首次下载时存的原值】而非本次重新 probe 的值——这样若两次会话
-    //     之间服务器把文件换成了【相同长度但内容不同】的新版本，下游的 If-Range
-    //     会因 validator 不匹配触发服务器返回 200 全量 → 整文件重下，杜绝"旧前缀 +
-    //     新尾部"静默拼接（BUG-HTTP-SINGLE-RESUME-SPLICE）。仅靠本次 probe 值无法
-    //     检出：续传 probe 看到的已是新版本，validator 自洽却与磁盘旧数据不符。
+    //   • 续传：用【首次下载时存的原值】而非本次重新 probe 的值，与 Range 响应
+    //     的 validator 做后验比对。这样即使两次会话间文件被同长度替换，也不会把
+    //     旧前缀与新尾部静默拼接（BUG-HTTP-SINGLE-RESUME-SPLICE）。
     let (resume_etag, resume_last_modified) = if p.is_resume {
         let (oe, olm) =
             p.db.get_task_validator(&p.task_id)
@@ -2802,17 +2814,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     // Immediately notify Dart: status=1 with resolved file name & total size.
     // For resume tasks, send persisted downloaded bytes as baseline so speed
     // smoothing doesn't treat resumed bytes as a fresh in-interval delta.
-    let initial_downloaded = if p.is_resume {
-        p.db.load_task_by_id(&p.task_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|t| t.downloaded_bytes.max(0))
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
+    let initial_downloaded = resume_downloaded;
     let _ = p
         .progress_tx
         .send(ProgressUpdate {
@@ -3026,8 +3028,8 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                 //     带 Range 的请求直接回 4xx 且全程未服务过一个字节（coordinator
                 //     在"全员被拒 + any_data==0"时归一为本变体，如 fnOS
                 //     multiple-download 配额端点——仅裸 GET 可用）。
-                //   • VersionChanged：文件在 probe 与分段请求间变了（If-Range validator
-                //     不匹配 → 200 全量新版本），旧数据作废需重下。
+                //   • VersionChanged：文件在 probe 与分段请求间变了，响应 validator
+                //     与落盘版本不匹配，旧数据作废需重下。
                 //   • RangeMisaligned：服务器回 206 却发【从 0 的全量流】（Content-Range
                 //     起点不符，如 123 盘失效签名 URL）；已写入段数据是错位垃圾，必须清空。
                 // 注意：有已下数据的【瞬时 200】不会走到这里——coordinator 已在串行降级
@@ -3456,11 +3458,9 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     );
 
     if p.use_server_time {
-        // 单流路径优先用【实际响应】锁存的 Last-Modified：If-Range 失配（文件在
-        // 暂停/下载期间变更）会导致 200 全量重下新内容，此时 probe/DB validator
-        // 里的旧时间已不属于磁盘上的字节。多段路径无此偏差——validator 失配即
-        // 整体作废并回退单流（同样拿到锁存值），仍走多段完成的只能是原版本文件，
-        // probe/DB 值即正确值。
+        // 单流路径优先用【实际响应】锁存的 Last-Modified：服务器忽略 Range 返回
+        // 200 全量时会从头覆盖，此时 probe/DB validator 可能已不属于磁盘内容。
+        // 多段成功时 validator 已逐响应校验，probe/DB 值仍然正确。
         //
         // hint 模式（浏览器扩展 takeover，probe 被跳过）下 `resume_last_modified`
         // 恒为空串——do_segment 已把首个响应的 validator 落到 DB（见
@@ -3590,11 +3590,13 @@ struct SingleDownloadResult {
     /// `total_bytes` — the caller MUST skip the file-size integrity check.
     decompressed: bool,
     /// 服务器【实际响应】的 `Last-Modified`。仅当响应体从 byte 0 全量服务时为
-    /// `Some`（全新下载，或 If-Range 失配回退 200 重下新版本）——此时磁盘内容
-    /// 以该响应为准，probe/DB validator 可能描述的是旧版本，调用方设置文件
-    /// mtime 时必须优先采用本值（空串 = 该响应未携带此头，应放弃服务器时间）。
+    /// `Some`（全新下载，或服务器忽略 Range 后从头覆盖）——此时磁盘内容以该
+    /// 响应为准，probe/DB validator 可能描述的是旧版本。
     /// 真 206 续传为 `None`（磁盘内容与旧 validator 一致，沿用旧值）。
     latched_last_modified: Option<String>,
+    /// 真 206 本次请求的起点。调用方用它确认本轮确实推进，并在已知总大小
+    /// 尚未写满时继续发出下一个有界 Range。
+    resumed_range_start: Option<u64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3611,9 +3613,66 @@ async fn download_single(
     speed_limiter: &SpeedLimiter,
     spec: &RequestSpec,
     expected_filename: &str,
-    // 续传一致性校验：probe 阶段看到的文件版本标识。非空时，续传请求会附带
-    // `If-Range: <validator>`，由服务器判断文件是否变化——变了则返回 200 全量，
-    // actual_resume 随之为 false → 从 0 重下，杜绝"旧前缀 + 新尾部"的静默拼接。
+    expected_etag: &str,
+    expected_last_modified: &str,
+) -> Result<SingleDownloadResult, DownloadError> {
+    loop {
+        let result = download_single_once(
+            task_id,
+            url,
+            dest,
+            total_bytes,
+            supports_range,
+            client,
+            db,
+            progress_tx,
+            cancel_token,
+            speed_limiter,
+            spec,
+            expected_filename,
+            expected_etag,
+            expected_last_modified,
+        )
+        .await?;
+
+        let Some(range_start) = result.resumed_range_start else {
+            return Ok(result);
+        };
+        if total_bytes <= 0 {
+            return Ok(result);
+        }
+
+        let current_len = tokio::fs::metadata(dest).await?.len();
+        let expected_len = u64::try_from(total_bytes).map_err(|_| {
+            DownloadError::Other(format!("invalid negative total size: {total_bytes}"))
+        })?;
+        if current_len >= expected_len {
+            return Ok(result);
+        }
+        if current_len <= range_start {
+            return Err(DownloadError::Other(format!(
+                "resumed Range returned no data before expected total: {current_len}/{expected_len}"
+            )));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_single_once(
+    task_id: &str,
+    url: &str,
+    dest: &Path,
+    total_bytes: i64,
+    supports_range: bool,
+    client: &Client,
+    db: &Db,
+    progress_tx: &mpsc::Sender<ProgressUpdate>,
+    cancel_token: &CancellationToken,
+    speed_limiter: &SpeedLimiter,
+    spec: &RequestSpec,
+    expected_filename: &str,
+    // 续传一致性校验：probe 阶段看到的文件版本标识。Range 206 返回后与响应
+    // validator 做后验比对，避免发送可能作废一次性签名 URL 的 If-Range。
     expected_etag: &str,
     expected_last_modified: &str,
 ) -> Result<SingleDownloadResult, DownloadError> {
@@ -3621,46 +3680,77 @@ async fn download_single(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Check if there's an existing partial file we can resume
-    let existing_len = match tokio::fs::metadata(dest).await {
-        Ok(m) => m.len() as i64,
+    let physical_existing_len = match tokio::fs::metadata(dest).await {
+        Ok(metadata) => i64::try_from(metadata.len()).map_err(|_| {
+            DownloadError::Other(format!(
+                "partial file is too large to resume: {} bytes",
+                metadata.len()
+            ))
+        })?,
         Err(_) => 0,
     };
 
-    // Resume only when the original method is GET-like.  POST + Range:bytes=N-
-    // is undefined in HTTP standards and most servers will ignore the Range
-    // header (returning 200 with the full body) — appending it to the partial
-    // file would corrupt the result.
+    // Resume only when the original method is GET-like. POST + Range is not a
+    // portable contract and most servers ignore it, which would corrupt an append.
     let want_resume = spec.is_get_like()
         && supports_range
-        && existing_len > 0
-        && (total_bytes == 0 || existing_len < total_bytes);
+        && physical_existing_len > 0
+        && (total_bytes == 0 || physical_existing_len < total_bytes);
+    let existing_len = if want_resume {
+        physical_existing_len - physical_existing_len.rem_euclid(SINGLE_RESUME_ALIGNMENT_BYTES)
+    } else {
+        physical_existing_len
+    };
+    if want_resume && existing_len != physical_existing_len {
+        log_info!(
+            "[download-single] task {} resume checkpoint aligned: {} -> {}",
+            task_id,
+            physical_existing_len,
+            existing_len
+        );
+    }
 
     let mut downloaded: i64;
     let mut file;
 
-    let mut req = build_request(client, url, spec.method.clone(), spec);
+    let range = if want_resume && total_bytes > 0 {
+        let end = existing_len
+            .saturating_add(MAX_SINGLE_RESUME_RANGE_BYTES - 1)
+            .min(total_bytes - 1);
+        format!("bytes={existing_len}-{end}")
+    } else {
+        format!("bytes={existing_len}-")
+    };
+    let mut resp = build_request(client, url, spec.method.clone(), spec);
     if want_resume {
-        req = req.header("Range", format!("bytes={}-", existing_len));
-        // If-Range：让服务器自己判定文件是否自 probe 起变化。validator 一致 →
-        // 返回 206 续传；不一致 → 返回 200 全量，下方 actual_resume 变 false →
-        // File::create 截断从 0 重下。优先用【强】ETag；弱 ETag（`W/` 前缀）在
-        // If-Range 上语义未定义、可能让服务器恒回 200（RFC 7233 §3.2），故跳过、
-        // 回退 Last-Modified。两者皆空（如某些 FTP-over-HTTP 或裸 CDN）则不带
-        // If-Range，退化为原有行为（仍受 206/encoding 守卫保护，不会更糟）。
-        let validator = if !expected_etag.is_empty() && !expected_etag.starts_with("W/") {
-            Some(expected_etag.to_string())
-        } else if !expected_last_modified.is_empty() {
-            Some(expected_last_modified.to_string())
-        } else {
-            None
-        };
-        if let Some(v) = validator {
-            req = req.header("If-Range", v);
+        // 与 aria2 一致，续传首枪只发送 Range。部分一次性签名端点会把
+        // If-Range 视为签名外请求头并立即作废 URL；收到 403 后再降级已经太晚。
+        // 版本安全由下方对 206 响应的 ETag/Last-Modified 后验校验保证。
+        resp = resp.header("Range", &range);
+    }
+    let mut resp = resp.send().await?.error_for_status()?;
+
+    if want_resume && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let resp_etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let resp_lm = resp
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if (!expected_etag.is_empty() && !resp_etag.is_empty() && resp_etag != expected_etag)
+            || (!expected_last_modified.is_empty()
+                && !resp_lm.is_empty()
+                && resp_lm != expected_last_modified)
+        {
+            return Err(DownloadError::VersionChanged(
+                "validator mismatch on resumed Range response".to_string(),
+            ));
         }
     }
-
-    let mut resp = req.send().await?.error_for_status()?;
 
     // F019: 当我们发了开放式 Range 请求 `bytes=N-`，服务器返回 206 且带
     // Content-Encoding（部分 CDN 行为）时，响应体是【压缩流任意中间字节】起的
@@ -3813,6 +3903,10 @@ async fn download_single(
     if actual_resume {
         downloaded = existing_len;
         let mut raw_file = OpenOptions::new().write(true).open(dest).await?;
+        let resume_offset = u64::try_from(existing_len).map_err(|_| {
+            DownloadError::Other(format!("invalid negative resume offset: {existing_len}"))
+        })?;
+        raw_file.set_len(resume_offset).await?;
         raw_file.seek(std::io::SeekFrom::End(0)).await?;
         file = tokio::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, raw_file);
     } else {
@@ -3926,6 +4020,13 @@ async fn download_single(
         response_content_length,
         decompressed: encoding.is_some(),
         latched_last_modified,
+        resumed_range_start: if actual_resume {
+            Some(u64::try_from(existing_len).map_err(|_| {
+                DownloadError::Other(format!("invalid negative resume offset: {existing_len}"))
+            })?)
+        } else {
+            None
+        },
     })
 }
 

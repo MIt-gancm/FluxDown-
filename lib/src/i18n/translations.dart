@@ -1132,6 +1132,7 @@ class S {
   String get taskRouteDirect => _r('taskRouteDirect');
   String get taskRouteDirectSampled => _r('taskRouteDirectSampled');
   String get taskRouteDirectPinned => _r('taskRouteDirectPinned');
+  String get taskRouteDirectFailover => _r('taskRouteDirectFailover');
   String get taskRouteProxyCached => _r('taskRouteProxyCached');
   String get taskRouteProxySampled => _r('taskRouteProxySampled');
   String get taskRouteProxyFailover => _r('taskRouteProxyFailover');
@@ -1166,6 +1167,7 @@ class S {
       'direct' => taskRouteDirect,
       'direct:sampled' => taskRouteDirectSampled,
       'direct:pinned' => taskRouteDirectPinned,
+      'direct:failover' => taskRouteDirectFailover,
       'proxy:cached' => taskRouteProxyCached,
       'proxy:sampled' => taskRouteProxySampled,
       'proxy:failover' => taskRouteProxyFailover,

@@ -278,9 +278,7 @@ async fn run_scenario(
     if let Some(mut rx) = engine.manager.take_progress_rx() {
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
     }
-    if let Some(mut done_rx) = engine.manager.take_done_rx() {
-        tokio::spawn(async move { while done_rx.recv().await.is_some() {} });
-    }
+    let mut done_rx = engine.manager.take_done_rx().expect("done receiver");
 
     let hint = if use_hint { size as i64 } else { 0 };
     let task_id = engine
@@ -323,6 +321,13 @@ async fn run_scenario(
             tokio::time::sleep(Duration::from_millis(100)).await;
             waited += 100;
         }
+        let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .expect("paused downloader should stop")
+            .expect("done channel should stay open");
+        assert_eq!(done.task_id, task_id);
+        engine.manager.on_task_done(&done).await;
+
         tokio::time::sleep(Duration::from_millis(300)).await;
         let segs = engine.db.load_segments(&task_id).await.unwrap();
         eprintln!(
@@ -516,9 +521,7 @@ async fn run_change_segments(
     if let Some(mut rx) = engine.manager.take_progress_rx() {
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
     }
-    if let Some(mut done_rx) = engine.manager.take_done_rx() {
-        tokio::spawn(async move { while done_rx.recv().await.is_some() {} });
-    }
+    let mut done_rx = engine.manager.take_done_rx().expect("done receiver");
 
     let task_id = engine
         .manager
@@ -561,6 +564,12 @@ async fn run_change_segments(
             waited += 100;
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
+        let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .expect("paused downloader should stop")
+            .expect("done channel should stay open");
+        assert_eq!(done.task_id, task_id);
+        engine.manager.on_task_done(&done).await;
     }
 
     // 改线程数前快照。
@@ -580,6 +589,16 @@ async fn run_change_segments(
         .await
         .expect("set_task_segments");
     assert!(ok, "[{name}] 改线程数应成功");
+    if !pause_first {
+        // 活跃改线程数内部走 pause→resume。resume 会等旧 writer 的 TaskDone，
+        // 与生产 actor 相同地消费完成信号后才允许新世代起飞。
+        let done = tokio::time::timeout(Duration::from_secs(10), done_rx.recv())
+            .await
+            .expect("segment-change pause should stop")
+            .expect("done channel should stay open");
+        assert_eq!(done.task_id, task_id);
+        engine.manager.on_task_done(&done).await;
+    }
 
     // 改后快照：段行必须保留、tasks.segments 已更新、已下字节不减少。
     let segs_after = engine.db.load_segments(&task_id).await.unwrap();

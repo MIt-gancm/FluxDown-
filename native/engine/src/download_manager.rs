@@ -155,6 +155,75 @@ fn is_retriable_error(msg: &str) -> bool {
         || lower.contains("track probe failed")
 }
 
+/// `ProxyMode::Auto` 一次性备用链路的目标。手动代理、系统代理和直连在
+/// 一个自动恢复周期内各尝试至多一次，避免坏链路之间无限震荡。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoFailoverTarget {
+    Proxy(crate::auto_proxy::CandidateSource),
+    Direct,
+}
+
+#[derive(Debug, Default)]
+struct AutoFailoverAttempts {
+    direct: bool,
+    manual: bool,
+    system: bool,
+}
+
+impl AutoFailoverAttempts {
+    fn mark_source(&mut self, source: crate::auto_proxy::CandidateSource) {
+        match source {
+            crate::auto_proxy::CandidateSource::ManualFields => self.manual = true,
+            crate::auto_proxy::CandidateSource::System => self.system = true,
+        }
+    }
+
+    fn source_attempted(&self, source: crate::auto_proxy::CandidateSource) -> bool {
+        match source {
+            crate::auto_proxy::CandidateSource::ManualFields => self.manual,
+            crate::auto_proxy::CandidateSource::System => self.system,
+        }
+    }
+}
+
+fn auto_failover_target(
+    auto_route: &str,
+    error: &str,
+    candidate_sources: &[crate::auto_proxy::CandidateSource],
+    network_reachable: bool,
+    attempts: &mut AutoFailoverAttempts,
+) -> Option<AutoFailoverTarget> {
+    if !crate::auto_proxy::is_route_transport_error(error) {
+        return None;
+    }
+
+    if auto_route.starts_with("proxy") {
+        if auto_route.ends_with(":manual") {
+            attempts.mark_source(crate::auto_proxy::CandidateSource::ManualFields);
+        } else if auto_route.ends_with(":system") {
+            attempts.mark_source(crate::auto_proxy::CandidateSource::System);
+        } else if candidate_sources.len() == 1 {
+            attempts.mark_source(candidate_sources[0]);
+        }
+    } else {
+        attempts.direct = true;
+    }
+
+    if let Some(source) = candidate_sources
+        .iter()
+        .copied()
+        .find(|source| !attempts.source_attempted(*source))
+    {
+        attempts.mark_source(source);
+        return Some(AutoFailoverTarget::Proxy(source));
+    }
+    if network_reachable && !attempts.direct {
+        attempts.direct = true;
+        return Some(AutoFailoverTarget::Direct);
+    }
+    None
+}
+
 /// Determine if a URL uses the FTP protocol (case-insensitive).
 fn is_ftp_url(url: &str) -> bool {
     url.get(..6)
@@ -1085,6 +1154,16 @@ struct ActiveTaskEntry {
     /// Used for per-queue concurrency counting.
     queue_id: String,
 }
+/// A task that has been asked to pause but whose spawned downloader has not
+/// finished flushing its buffered bytes and final progress yet.
+///
+/// Resume requests are latched here so a new generation cannot open the same
+/// temporary file until the cancelled generation has fully stopped.
+struct PendingPause {
+    generation: u64,
+    notify: bool,
+    resume_requested: bool,
+}
 
 /// off-actor resolve 的种类（start 或 resume 侧再入）。
 #[cfg(feature = "plugins")]
@@ -1284,10 +1363,9 @@ fn manifest_item_to_info(item: crate::plugin::ManifestItem) -> crate::model::Man
     }
 }
 
-/// 把 resolve 结果应用到 QueuedTask（再入前）。非 ephemeral 保持 hint_file_size=0
-/// 以正常 probe 取 ETag（保 resume If-Range 一致性）；ephemeral 走 skip-probe
-/// hint 路径：知大小用 total_bytes，不知大小用 -1（跳 probe + 大小未知，与
-/// resume 路径语义对称——绝不为 ephemeral 直链发出 probe 请求）。
+/// 把 resolve 结果应用到 QueuedTask（再入前）。非 ephemeral 保持
+/// `hint_file_size=0`，正常 probe 取得供 resume 后验校验的 validator；
+/// ephemeral 走 skip-probe hint 路径。
 #[cfg(feature = "plugins")]
 fn apply_resolve_to_queued(queued: &mut QueuedTask, res: crate::plugin::ResolveResult) {
     if !res.url.is_empty() {
@@ -1328,6 +1406,12 @@ pub struct DownloadManager {
     ///   • bt_task_ids     (HashSet membership flag)
     ///   • active_task_queue   (queue_id string)
     active_tasks: HashMap<String, ActiveTaskEntry>,
+    /// Cancelled generations still flushing their final on-disk progress.
+    ///
+    /// The entry is removed only by the matching [`TaskDone`]. This keeps a
+    /// rapid pause→resume from overlapping two writers for the same temp file
+    /// and lets the old generation publish one authoritative paused frame.
+    pending_pauses: HashMap<String, PendingPause>,
     /// Monotonically increasing counter to distinguish different spawns of
     /// the same task_id.  Prevents a stale `TaskDone` from an old spawn
     /// from accidentally removing the token of a newer spawn.
@@ -1441,10 +1525,11 @@ pub struct DownloadManager {
     /// 网络环境易变，持久化过期决策比重探更伤）。与 coordinator 侧
     /// 采样状态机共享同一份表（[`crate::auto_proxy::DecisionCache`]）。
     auto_proxy_cache: crate::auto_proxy::DecisionCache,
-    /// 直连连接类失败后已写入代理租约、等待自动重试的任务集合。
-    /// resume 时消费一次，把该任务的路由标签定为 `proxy:failover`
-    /// （区别于普通缓存采纳的 `proxy:cached`，可追溯性）。
-    auto_failover_pending: HashSet<String>,
+    /// 已排程的一次性备用链路目标。resume 消费后写入对应 failover 路由标签。
+    auto_failover_pending: HashMap<String, AutoFailoverTarget>,
+    /// 当前自动恢复周期已尝试过的三条链路。用户手动恢复/重下会清除，
+    /// 自动重试不会清除；每条链路至多一次，防止坏链路无限 ping-pong。
+    auto_failover_attempts: HashMap<String, AutoFailoverAttempts>,
     /// 当前正在下载（或排队准备启动）的任务已预订的临时文件路径集合。
     ///
     /// 用于解决 `dedup_filename` 的 TOCTOU 竞态：多个并发任务同时调用
@@ -1552,6 +1637,7 @@ impl DownloadManager {
             client,
             proxy_config,
             active_tasks: HashMap::new(),
+            pending_pauses: HashMap::new(),
             generation: 0,
             progress_tx: tx,
             progress_rx: Some(rx),
@@ -1590,7 +1676,8 @@ impl DownloadManager {
             retry_tx,
             retry_rx: Some(retry_rx),
             auto_proxy_cache: crate::auto_proxy::DecisionCache::new(),
-            auto_failover_pending: HashSet::new(),
+            auto_failover_pending: HashMap::new(),
+            auto_failover_attempts: HashMap::new(),
             reserved_temp_paths: Arc::new(Mutex::new(HashSet::new())),
             sink,
             selector,
@@ -2581,6 +2668,7 @@ impl DownloadManager {
         // 误导可追溯性；指纹只覆盖系统代理，手动字段变更必须在此清）。
         self.auto_proxy_cache.clear();
         self.auto_failover_pending.clear();
+        self.auto_failover_attempts.clear();
         crate::route_health::clear_all(&self.db);
         Ok(())
     }
@@ -3469,6 +3557,11 @@ impl DownloadManager {
                 self.clear_priority().await;
             }
         }
+        // A user pause removes the active entry immediately so another task can
+        // use the freed slot, but its downloader may still be flushing. Only
+        // the matching TaskDone may publish the final paused frame or release a
+        // resume request that arrived during that flush window.
+        let resume_after_pause = self.finish_pending_pause(task_id, generation).await;
 
         // A slot freed up — try to start queued tasks.
         // SAFETY (current_thread): `remove` + `drain_queue` have no `.await` between
@@ -3476,6 +3569,9 @@ impl DownloadManager {
         // If this code is ever ported to a multi-threaded runtime, a lock around
         // `active_tokens` modifications would be required.
         self.drain_queue().await;
+        if resume_after_pause {
+            self.resume_task_inner(task_id).await;
+        }
 
         // ----- Auto-retry for retriable network errors ----------------------
         // 大文件下载因网络 stall、连接重置等瞬时错误失败后，自动延迟恢复，
@@ -3509,6 +3605,7 @@ impl DownloadManager {
                 self.auto_retry_counts.remove(task_id);
                 self.retry_scheduled.remove(task_id);
                 self.auto_failover_pending.remove(task_id);
+                self.auto_failover_attempts.remove(task_id);
                 if let Err(e) = self.db.delete_task(task_id).await {
                     log_info!(
                         "[manager] duplicate cleanup {}: DB delete error: {}",
@@ -3528,54 +3625,100 @@ impl DownloadManager {
                 self.maybe_release_bt_session().await;
                 return;
             }
-            // ProxyMode::Auto 反向 failover（**独立于自动重试配额**——作废
-            // 坏先验与是否还要重试互不相干，否则 max_auto_retries=0 时
-            // AdoptProxy 误判会锁死到 7 天 TTL）：任务本轮经代理起飞/切换
-            // （auto_route 以 proxy 开头）且以连接类错误失败 → 代理链路
-            // 本身坏了。作废该 host 的持久化先验，并写一段内存冷却挡住
-            // 紧随其后的重采样（短请求能通、长传输会断的不稳定代理会让
-            // 256KB 采样再次「胜出」形成抖动环）；重试/新任务回直连起飞。
+            // 本轮是否已排程恢复——决定 `task.failed` 是否应立即发出。
+            let mut retry_pending = false;
             if task.status == 4
                 && self.proxy_config.mode == ProxyMode::Auto
                 && task.proxy_url.is_empty()
-                && task.auto_route.starts_with("proxy")
                 && !is_bt_url(&task.url)
                 && !crate::ed2k::link::is_ed2k_url(&task.url)
-                && crate::auto_proxy::is_connect_class_error(&task.error_message)
-                // 整机断网时所有代理路由任务都会报连接类错误，与代理无关
-                // ——有默认路由才认定「代理死了」，否则保留先验等网络恢复。
-                && crate::route_health::network_reachable()
                 && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
             {
-                log_info!(
-                    "[manager] auto-proxy 反向 failover: task {} host {} 代理链路连接失败，作废先验并冷却，回直连",
-                    task_id,
-                    host
+                let proxy_failed = task.auto_route.starts_with("proxy")
+                    && crate::auto_proxy::is_route_transport_error(&task.error_message);
+                if proxy_failed {
+                    log_info!(
+                        "[manager] auto-proxy: task {} host {} 代理传输失败，作废该 host 正面先验",
+                        task_id,
+                        host
+                    );
+                    self.auto_proxy_cache.clear_host(&host);
+                    crate::route_health::clear_proxy_prior(&host, &self.db);
+                }
+
+                let mut candidates = crate::auto_proxy::resolve_candidates(&self.proxy_config);
+                if let Some(crate::auto_proxy::Decision::Proxy(preferred)) =
+                    self.auto_proxy_cache.lookup(&host)
+                {
+                    candidates.sort_by_key(|candidate| candidate.source != preferred);
+                }
+                if matches!(
+                    self.auto_proxy_cache.lookup(&host),
+                    Some(crate::auto_proxy::Decision::NoSwitch)
+                ) || crate::route_health::no_switch_active(&host)
+                {
+                    candidates.clear();
+                }
+                let candidate_sources: Vec<_> = candidates
+                    .iter()
+                    .map(|candidate| candidate.source)
+                    .collect();
+                let network_reachable = crate::route_health::network_reachable();
+                let attempts = self
+                    .auto_failover_attempts
+                    .entry(task_id.to_string())
+                    .or_default();
+                let target = auto_failover_target(
+                    &task.auto_route,
+                    &task.error_message,
+                    &candidate_sources,
+                    network_reachable,
+                    attempts,
                 );
-                self.auto_proxy_cache
-                    .set(&host, crate::auto_proxy::Decision::Cooldown);
-                crate::route_health::clear_proxy_prior(&host, &self.db);
+
+                if let Some(target) = target {
+                    let label = match target {
+                        AutoFailoverTarget::Proxy(
+                            crate::auto_proxy::CandidateSource::ManualFields,
+                        ) => "手动代理",
+                        AutoFailoverTarget::Proxy(crate::auto_proxy::CandidateSource::System) => {
+                            "系统代理"
+                        }
+                        AutoFailoverTarget::Direct => "直连",
+                    };
+                    log_info!(
+                        "[manager] auto-proxy: task {} host {} 传输失败，立即换{}重试（每链路一次，不占通用重试配额）",
+                        task_id,
+                        host,
+                        label
+                    );
+                    self.auto_failover_pending
+                        .insert(task_id.to_string(), target);
+                    self.retry_scheduled
+                        .insert(task_id.to_string(), task.queue_id.clone());
+                    let tx = self.retry_tx.clone();
+                    let tid = task_id.to_string();
+                    tokio::spawn(async move {
+                        let _ = tx.send(tid).await;
+                    });
+                    retry_pending = true;
+                }
             }
-            // 本轮是否又排了一次自动重试——决定 `task.failed` 该不该发。
-            let mut retry_pending = false;
-            // max == 0：用户关闭了自动重试，直接跳过（不分配计数）。
-            if max_retries != 0 && task.status == 4 && is_retriable_error(&task.error_message) {
+
+            // 通用自动重试只在备用链路没有接管本轮时参与。备用链路始终有
+            // 一次机会，即使用户把 max_auto_retries 设为 0 或配额已耗尽。
+            if !retry_pending
+                && max_retries != 0
+                && task.status == 4
+                && is_retriable_error(&task.error_message)
+            {
                 let count = self
                     .auto_retry_counts
                     .entry(task_id.to_string())
                     .or_insert(0);
-                // 无限（-1）时不设上限；否则按 *count < max 判定。
                 if max_retries == -1 || (*count as i32) < max_retries {
                     *count += 1;
                     let attempt = *count;
-                    // 延迟 = 基础值 × 已重试次数（递增），但封顶到 MAX_AUTO_RETRY_DELAY_SECS，
-                    // 避免无限模式下退避无界增长。
-                    //
-                    // 防护：无限重试（-1）模式下强制 base 至少 1s。否则当用户同时选了
-                    // "无限重试"+"延迟 0s"（两者皆为合法 UI 取值）时，delay 恒为 0、
-                    // 计数无上限 → 对永久失活的主机（connection refused 在毫秒级失败且
-                    // 被判定为可重试）形成零延迟热循环，疯狂重连、刷 DB、永不进入
-                    // 稳定 error 态。有限次数模式仍允许 0 延迟（最多重试 n 次后自然停止）。
                     let base = if max_retries == -1 {
                         self.auto_retry_delay_secs.max(1)
                     } else {
@@ -3603,40 +3746,8 @@ impl DownloadManager {
                         let _ = tx.send(tid).await;
                     });
                     retry_pending = true;
-                    // 退避期间该任务仍算占用队列，防止误报 `queue.drained`。
                     self.retry_scheduled
                         .insert(task_id.to_string(), task.queue_id.clone());
-                    // ProxyMode::Auto 正向 failover 支路：直连的连接类失败
-                    // （被墙/链路劣化）且候选代理存在 → 给该 host 写代理
-                    // 租约，让即将到来的自动重试直接以代理起飞；
-                    // auto_failover_pending 使 resume 把路由记为
-                    // proxy:failover（可追溯）。仅在该 host 无任何缓存决策
-                    // 时介入：代理链路的失败由上方反向支路处理（其写入的
-                    // Cooldown 也天然挡住本支路），Cooldown/NoSwitch 是
-                    // 新鲜的反证。
-                    if self.proxy_config.mode == ProxyMode::Auto
-                        && task.proxy_url.is_empty()
-                        && !task.auto_route.starts_with("proxy")
-                        && !is_bt_url(&task.url)
-                        && !crate::ed2k::link::is_ed2k_url(&task.url)
-                        && crate::auto_proxy::is_connect_class_error(&task.error_message)
-                        && crate::auto_proxy::resolve_candidate(&self.proxy_config).is_some()
-                        && let Some(host) = crate::segment_coordinator::extract_host(&task.url)
-                        && self.auto_proxy_cache.lookup(&host).is_none()
-                        // 持久化 NoSwitch（validator 不一致）跨重启延续到
-                        // failover 门禁：已知会命中不同 edge 的代理绝不许
-                        // 被推上带局部进度的续传。
-                        && !crate::route_health::no_switch_active(&host)
-                    {
-                        log_info!(
-                            "[manager] auto-proxy failover: task {} host {} 直连连接失败，重试将经代理",
-                            task_id,
-                            host
-                        );
-                        self.auto_proxy_cache
-                            .set(&host, crate::auto_proxy::Decision::Proxy);
-                        self.auto_failover_pending.insert(task_id.to_string());
-                    }
                 } else {
                     log_info!(
                         "[manager] auto-retry exhausted for task {} ({} attempts), staying in error",
@@ -3644,9 +3755,12 @@ impl DownloadManager {
                         max_retries
                     );
                 }
-            } else if task.status == 3 {
-                // 任务成功完成，清除重试计数
+            }
+            if task.status == 3 {
+                // 成功完成：结束本轮通用重试与一次性备用链路状态。
                 self.auto_retry_counts.remove(task_id);
+                self.auto_failover_pending.remove(task_id);
+                self.auto_failover_attempts.remove(task_id);
                 // 路由先验被动续期：经代理路由（采样切换/缓存采纳/failover）
                 // 完成的任务证明该 host 的代理链路仍然可用——真实传输即
                 // 观测，零探测成本。
@@ -4412,6 +4526,15 @@ impl DownloadManager {
             save_site_auth,
         )
         .await;
+        // 单任务 UA 也属于请求身份。将显式覆盖值并入已持久化请求头，使暂停、
+        // 进程重启后的 resume 与首次请求一致；调用方已捕获的 User-Agent 优先。
+        if !user_agent.is_empty()
+            && !extra_headers
+                .keys()
+                .any(|name| name.eq_ignore_ascii_case("user-agent"))
+        {
+            extra_headers.insert("User-Agent".to_string(), user_agent.clone());
+        }
         // 任务必属队列：未指定时归入内置主队列（'' 不再是有效归属，统一
         // 覆盖旧客户端信号 / aria2 / REST / CLI 等所有创建入口）。
         let queue_id = if queue_id.is_empty() {
@@ -4786,25 +4909,18 @@ impl DownloadManager {
         }
     }
 
-    /// `ProxyMode::Auto` 的启动期路由决策（每任务一次）：
-    /// - 非 Auto 模式 → `None`（沿用既有代理解析路径）；
-    /// - Auto 且无候选代理 / URL 无 host → 直连，无切换上下文（零开销短路）；
-    /// - Auto 且缓存判该 host 走代理 → 有效代理 = 候选，路由 `proxy:cached`；
-    /// - Auto 且直连起飞 → 有效代理 = 直连（保留多 CDN 聚合资格），路由
-    ///   `direct`，并在任务未忽略 TLS 时携带热切换上下文供 coordinator
-    ///   采样/切换（忽略 TLS 的任务与 CDN 聚合同理排除在采样之外）。
+    /// `ProxyMode::Auto` 的启动期路由决策（每任务一次）。
     ///
-    /// `has_partial`：任务已有局部数据（resume 且 downloaded>0）。此时
-    /// AdoptProxy 降档为 FastReeval——host 级先验担保不了逐文件的
-    /// validator 一致性，直接换代理起飞可能命中不同 CDN edge 触发
-    /// If-Range 失配 200 全量、静默清空几十 GB 进度；降档后切代理重新
-    /// 经由带 `validators_ok` 守卫的采样路径发生。
+    /// 常规启动直连起飞并携带后台比较上下文；新任务可采纳 host 级代理先验。
+    /// 局部续传不直接采纳内存/持久代理先验，必须经 validator 采样。`forced_route`
+    /// 来自一次性备用链路：它独立于通用自动重试配额，且优先于普通先验。
     fn auto_route_decision(
         &self,
         url: &str,
         user_agent: &str,
         ignore_tls_errors: bool,
         has_partial: bool,
+        forced_route: Option<AutoFailoverTarget>,
     ) -> Option<(
         ProxyConfig,
         &'static str,
@@ -4814,51 +4930,89 @@ impl DownloadManager {
         if self.proxy_config.mode != ProxyMode::Auto {
             return None;
         }
-        let Some((candidate, source)) = auto_proxy::resolve_candidate(&self.proxy_config) else {
+        if forced_route == Some(AutoFailoverTarget::Direct) {
+            return Some((
+                ProxyConfig::default(),
+                auto_proxy::route::DIRECT_FAILOVER,
+                None,
+            ));
+        }
+        let candidates = auto_proxy::resolve_candidates(&self.proxy_config);
+        if candidates.is_empty() {
             return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
-        };
+        }
+        if let Some(AutoFailoverTarget::Proxy(source)) = forced_route {
+            if let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.source == source)
+            {
+                return Some((
+                    candidate.config.clone(),
+                    auto_proxy::route::with_source(auto_proxy::route::PROXY_FAILOVER, source),
+                    None,
+                ));
+            }
+            return Some((
+                ProxyConfig::default(),
+                auto_proxy::route::DIRECT_FAILOVER,
+                None,
+            ));
+        }
         let Some(host) = crate::segment_coordinator::extract_host(url) else {
             return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
         };
-        if self.auto_proxy_cache.lookup(&host) == Some(Decision::Proxy) {
+        let cached_source = match self.auto_proxy_cache.lookup(&host) {
+            Some(Decision::Proxy(source)) => Some(source),
+            _ => None,
+        };
+        if let Some(source) = cached_source
+            && !has_partial
+            && let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.source == source)
+        {
             return Some((
-                candidate,
+                candidate.config.clone(),
                 auto_proxy::route::with_source(auto_proxy::route::PROXY_CACHED, source),
                 None,
             ));
         }
-        // 持久化先验（内存缓存 miss 后的跨重启延续）：近期无优势/validator
-        // 不一致 → 跳过采样机器（零开销直连）；多天确认的代理胜绩 → 直接
-        // 代理起飞（零慢速窗口，误判由反向 failover 自愈）；单日胜绩 →
-        // 直连起飞但缩短采样等待期。
         let hint = crate::route_health::startup_hint(&host);
         match hint {
             Some(crate::route_health::RouteHint::SuppressProbe) => {
                 return Some((ProxyConfig::default(), auto_proxy::route::DIRECT, None));
             }
-            Some(crate::route_health::RouteHint::AdoptProxy) if !has_partial => {
+            // 持久层尚不记录获胜代理来源。仅一个候选时可安全采纳；手动和
+            // 系统代理同时存在时必须重新并行采样，不能猜中哪一个曾胜出。
+            Some(crate::route_health::RouteHint::AdoptProxy)
+                if !has_partial && candidates.len() == 1 =>
+            {
+                let candidate = &candidates[0];
                 return Some((
-                    candidate,
-                    auto_proxy::route::with_source(auto_proxy::route::PROXY_CACHED, source),
+                    candidate.config.clone(),
+                    auto_proxy::route::with_source(
+                        auto_proxy::route::PROXY_CACHED,
+                        candidate.source,
+                    ),
                     None,
                 ));
             }
             _ => {}
         }
-        // AdoptProxy 带局部数据时降档：同样享受缩短的采样等待期。
-        let fast_reeval = matches!(
-            hint,
-            Some(crate::route_health::RouteHint::FastReeval)
-                | Some(crate::route_health::RouteHint::AdoptProxy)
-        );
+        let fast_reeval = cached_source.is_some()
+            || matches!(
+                hint,
+                Some(crate::route_health::RouteHint::FastReeval)
+                    | Some(crate::route_health::RouteHint::AdoptProxy)
+            );
         let ctx = (!ignore_tls_errors).then(|| {
             Arc::new(crate::auto_proxy::AutoProxyCtx {
-                candidate,
+                candidates,
                 cache: self.auto_proxy_cache.clone(),
                 host,
                 user_agent: user_agent.to_string(),
-                source,
                 fast_reeval,
+                require_validation: has_partial,
             })
         });
         Some((ProxyConfig::default(), auto_proxy::route::DIRECT, ctx))
@@ -4891,7 +5045,7 @@ impl DownloadManager {
         let auto = if proxy_url.is_empty() {
             // do_start_task 只走首次启动（resume 由 do_resume_task 承接），
             // meta-probe 不写路由——两类调用方均无局部数据。
-            self.auto_route_decision(url, resolved_ua, ignore_tls_errors, false)
+            self.auto_route_decision(url, resolved_ua, ignore_tls_errors, false, None)
         } else {
             None
         };
@@ -5276,11 +5430,13 @@ impl DownloadManager {
                 self.task_http_context(&url, &proxy_url, &user_agent, &queue_id, ignore_tls_errors);
             // ProxyMode::Auto 可追溯性：启动基线路由落库（非 Auto 写空串清除
             // 旧标签），非空时广播给客户端原位刷新详情面板「链路」行。
-            // 手动重启一个曾排定 failover 重试的任务时消费其标记。
-            let auto_route = if self.auto_failover_pending.remove(&task_id) {
-                crate::auto_proxy::route::to_failover(auto_route)
-            } else {
-                auto_route
+            let auto_route = match self.auto_failover_pending.remove(&task_id) {
+                Some(AutoFailoverTarget::Proxy(source)) => crate::auto_proxy::route::with_source(
+                    crate::auto_proxy::route::PROXY_FAILOVER,
+                    source,
+                ),
+                Some(AutoFailoverTarget::Direct) => crate::auto_proxy::route::DIRECT_FAILOVER,
+                None => auto_route,
             };
             if let Err(e) = self.db.set_task_auto_route(&task_id, auto_route).await {
                 log_info!("[manager] task {} auto_route 落库失败: {}", task_id, e);
@@ -5448,6 +5604,60 @@ impl DownloadManager {
             });
         }
     }
+    /// Publish the final paused frame after the matching downloader generation
+    /// has stopped and persisted its flushed byte count.
+    ///
+    /// Returns `true` when a resume request arrived during cancellation and may
+    /// now safely start a new generation. DB status and the active generation
+    /// are checked again so stale TaskDone messages cannot overwrite a newer
+    /// running task with `paused`.
+    async fn finish_pending_pause(&mut self, task_id: &str, generation: u64) -> bool {
+        let generation_matches = self
+            .pending_pauses
+            .get(task_id)
+            .is_some_and(|pending| pending.generation == generation);
+        if !generation_matches {
+            return false;
+        }
+        let Some(pending) = self.pending_pauses.remove(task_id) else {
+            return false;
+        };
+
+        if self
+            .active_tasks
+            .get(task_id)
+            .is_some_and(|entry| entry.generation != generation)
+        {
+            return false;
+        }
+
+        let Ok(Some(task)) = self.db.load_task_by_id(task_id).await else {
+            return false;
+        };
+        if task.status == 2 {
+            let _ = self
+                .progress_tx
+                .send(ProgressUpdate {
+                    task_id: task_id.to_string(),
+                    downloaded_bytes: task.downloaded_bytes,
+                    total_bytes: task.total_bytes,
+                    status: 2,
+                    error_message: String::new(),
+                    file_name: task.file_name.clone(),
+                    segment_details: None,
+                    ..Default::default()
+                })
+                .await;
+            self.send_segments_from_db(task_id, task.total_bytes).await;
+            if pending.notify {
+                let event = self
+                    .webhook_event_from_task(crate::webhook::WebhookEventKind::TaskPaused, &task);
+                self.webhook.emit(event);
+            }
+        }
+
+        pending.resume_requested && matches!(task.status, 0 | 2)
+    }
 
     /// 用户显式暂停**单个**任务。会发 `task.paused` webhook。
     ///
@@ -5466,6 +5676,15 @@ impl DownloadManager {
     async fn pause_task_inner(&mut self, task_id: &str, notify: bool) {
         self.clear_pending_resolve(task_id);
         self.retry_scheduled.remove(task_id);
+        // A repeated pause while the previous generation is still flushing is
+        // idempotent. Preserve an explicit notification request, but do not
+        // publish the stale DB snapshot as a terminal paused frame.
+        if let Some(pending) = self.pending_pauses.get_mut(task_id) {
+            pending.notify |= notify;
+            self.sync_queue_occupancy();
+            return;
+        }
+
         // Remove from pending queue if queued (not yet started).
         if let Some(pos) = self.pending_queue.iter().position(|q| q.task_id == task_id) {
             self.pending_queue.remove(pos);
@@ -5481,7 +5700,23 @@ impl DownloadManager {
         }
 
         if let Some(entry) = self.active_tasks.remove(task_id) {
+            let generation = entry.generation;
+            let has_spawned_downloader = entry.handle.is_some();
             entry.token.cancel();
+
+            // A real downloader must finish flushing before its paused progress
+            // becomes authoritative. Placeholder entries used by off-actor
+            // resolve have no writer and can still report immediately.
+            if has_spawned_downloader {
+                self.pending_pauses.insert(
+                    task_id.to_string(),
+                    PendingPause {
+                        generation,
+                        notify,
+                        resume_requested: false,
+                    },
+                );
+            }
 
             // For BT tasks, explicitly pause the torrent in the session so
             // that the handle stays cached for fast resume.  This is a
@@ -5493,12 +5728,14 @@ impl DownloadManager {
             }
 
             let _ = self.db.update_task_status(task_id, 2, "").await;
-            self.emit_progress_from_db(task_id, 2, 0, "", 0).await;
-
-            if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
-                // Send persisted segment data so the UI retains the download
-                // distribution visualization after pausing.
-                self.send_segments_from_db(task_id, t.total_bytes).await;
+            if !has_spawned_downloader {
+                self.emit_progress_from_db(task_id, 2, 0, "", 0).await;
+                if let Ok(Some(t)) = self.db.load_task_by_id(task_id).await {
+                    self.send_segments_from_db(task_id, t.total_bytes).await;
+                }
+                if notify {
+                    self.emit_paused_webhook(task_id).await;
+                }
             }
 
             // A slot freed up — try to start queued tasks.
@@ -5510,18 +5747,11 @@ impl DownloadManager {
             }
             // NOTE: do NOT call maybe_release_bt_session() here.
             //
-            // pause_task() removes the task from active_tasks and cancels the
-            // CancellationToken, but the spawned BT task (bt_download_inner)
-            // may still be running on the shared BT runtime for up to ~500 ms
-            // (one poll-sleep interval) before it detects cancellation and exits.
-            //
-            // If we call maybe_release_bt_session() now, it sees no BT tasks in
-            // active_tasks and shuts down the runtime immediately — which aborts
-            // bt_download_inner mid-flight and causes run_bt_download to return a
-            // JoinError.  That JoinError propagates as DownloadError::Other (or
-            // Cancelled if our guard fires), and the spawned wrapper still sends
-            // done_tx → on_task_done → maybe_release_bt_session, so the session
-            // is released safely once the task has actually stopped.
+            // The spawned task may still be running while it flushes progress.
+            // Its TaskDone finalizes pending_pauses and only then allows a
+            // requested resume or BT session release.
+            self.sync_queue_occupancy();
+            return;
         }
 
         // Third branch: the task is a completed BT torrent that is seeding or
@@ -5584,8 +5814,12 @@ impl DownloadManager {
     }
 
     pub async fn resume_task(&mut self, task_id: &str) {
-        // 用户手动恢复时重置自动重试计数，让下次失败重新获得完整重试配额。
+        // 用户手动恢复开启新一轮重试预算。若备用链路已排程但尚未回流，
+        // 保留其目标与单次守卫；否则允许新的手动周期再换路一次。
         self.auto_retry_counts.remove(task_id);
+        if !self.auto_failover_pending.contains_key(task_id) {
+            self.auto_failover_attempts.remove(task_id);
+        }
         self.resume_task_inner(task_id).await;
     }
 
@@ -5721,6 +5955,7 @@ impl DownloadManager {
         // 4. 内存态复位：重试配额/failover 标记/退避占用全部作废。
         self.auto_retry_counts.remove(task_id);
         self.auto_failover_pending.remove(task_id);
+        self.auto_failover_attempts.remove(task_id);
         self.retry_scheduled.remove(task_id);
 
         // 5. 重新起飞，并下发全量快照——TaskProgress 字段不全，进度归零必须
@@ -5733,6 +5968,11 @@ impl DownloadManager {
     async fn resume_task_inner(&mut self, task_id: &str) {
         // 排程中的自动重试已落地（或被手动恢复抢先），解除队列占用标记。
         self.retry_scheduled.remove(task_id);
+        if let Some(pending) = self.pending_pauses.get_mut(task_id) {
+            pending.resume_requested = true;
+            return;
+        }
+
         if self.active_tasks.contains_key(task_id) {
             // A task can be in active_tokens but already terminal in the DB:
             // this happens when the download task has finished (status=3/4
@@ -6256,19 +6496,26 @@ impl DownloadManager {
                 .instrument(task_span),
             )
         } else {
-            // Resolve proxy and UA for resume: use global UA (cookies not
-            // persisted in DB, so only proxy_url is available from task row).
-            //
-            // ProxyMode::Auto：与 start 路径同一决策器（缓存判代理 → 以代理
-            // 起飞；否则直连 + 热切换上下文）。failover 重试在此消费标记，
-            // 把路由标签定为 proxy:failover（可追溯性）。
-            let was_failover = self.auto_failover_pending.remove(&tid);
+            // 恢复时优先沿用任务快照里的显式 User-Agent；否则重新解析队列/全局
+            // 默认值。cookies/referrer/extra_headers 已在上方从 DB 恢复。
+            let persisted_user_agent = resume_extra_headers.iter().find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("user-agent")
+                    .then(|| value.clone())
+            });
+            let resume_user_agent = match persisted_user_agent {
+                Some(value) => value,
+                None => self.resolved_task_ua("", &task.queue_id).to_string(),
+            };
+            // ProxyMode::Auto：与 start 路径共用决策器；一次性备用链路在此
+            // 消费并直接决定本轮实际 client 与可追溯标签。
+            let forced_route = self.auto_failover_pending.remove(&tid);
             let auto = if task.proxy_url.is_empty() {
                 self.auto_route_decision(
                     &task.url,
-                    &self.global_user_agent,
+                    &resume_user_agent,
                     task.ignore_tls_errors,
                     task.downloaded_bytes > 0,
+                    forced_route,
                 )
             } else {
                 None
@@ -6276,11 +6523,6 @@ impl DownloadManager {
             let (auto_override, (auto_route, auto_ctx)) = match auto {
                 Some((proxy, route, ctx)) => (Some(proxy), (route, ctx)),
                 None => (None, ("", None)),
-            };
-            let auto_route = if was_failover {
-                crate::auto_proxy::route::to_failover(auto_route)
-            } else {
-                auto_route
             };
             if let Err(e) = self.db.set_task_auto_route(&tid, auto_route).await {
                 log_info!("[manager] task {} auto_route 落库失败: {}", tid, e);
@@ -6292,7 +6534,7 @@ impl DownloadManager {
                 });
             }
             let needs_rebuild = !task.proxy_url.is_empty()
-                || !self.global_user_agent.is_empty()
+                || !resume_user_agent.is_empty()
                 || task.ignore_tls_errors
                 || matches!(&auto_override, Some(p) if p.mode != ProxyMode::None);
             let (task_client, task_proxy) = if needs_rebuild {
@@ -6305,7 +6547,7 @@ impl DownloadManager {
                 };
                 match downloader::build_client_with_tls_policy(
                     &pc,
-                    &self.global_user_agent,
+                    &resume_user_agent,
                     task.ignore_tls_errors,
                 ) {
                     Ok(c) => (c, pc),
@@ -6324,8 +6566,8 @@ impl DownloadManager {
 
             // 普通 HTTP 续传已持久化文件大小、分段进度与原始 validator。
             // 已知大小时直接从真实缺口发 Range 请求，避免 HEAD / Range 0-0 /
-            // plain GET 重新消耗一次性签名 URL。下游仍用持久化的 ETag /
-            // Last-Modified 发送 If-Range：206 续传，版本变化返回 200 时清盘重下。
+            // plain GET 重新消耗一次性签名 URL。下游直接发送 Range，并用持久化的
+            // ETag / Last-Modified 对 206 响应做版本后验校验。
             //
             // 未知大小仅沿用未验证 hint 任务的免 probe 语义；FTP/HLS/DASH/ED2K
             // 使用各自下载器，不把 HTTP hint 契约扩散到协议专用路径。
@@ -6353,9 +6595,8 @@ impl DownloadManager {
                 resume_hint
             };
 
-            // 多 CDN 聚合输入（resume：UA 只有全局值可用，与上方 client 构建一致）。
-            let cdn =
-                self.cdn_task_input(task.ignore_tls_errors, &task_proxy, &self.global_user_agent);
+            // 多 CDN 聚合输入与主请求使用同一份恢复 UA。
+            let cdn = self.cdn_task_input(task.ignore_tls_errors, &task_proxy, &resume_user_agent);
             // 无人值守标记只被 HLS/DASH 画质选择消费，其余协议不多查一次库。
             let task_unattended =
                 (use_hls || use_dash) && self.db.is_task_unattended(&tid).await.unwrap_or(false);
@@ -6452,6 +6693,7 @@ impl DownloadManager {
         // 明确意图，必须从自动重试状态中移除，使后续 create/resume 干净起步。
         self.auto_retry_counts.remove(task_id);
         self.auto_failover_pending.remove(task_id);
+        self.auto_failover_attempts.remove(task_id);
         self.clear_pending_resolve(task_id);
 
         // Remove from pending queue if queued.
@@ -6538,6 +6780,7 @@ impl DownloadManager {
     pub async fn delete_task(&mut self, task_id: &str, delete_files: bool) {
         self.auto_retry_counts.remove(task_id);
         self.auto_failover_pending.remove(task_id);
+        self.auto_failover_attempts.remove(task_id);
         self.retry_scheduled.remove(task_id);
         self.clear_pending_resolve(task_id);
 
@@ -7490,6 +7733,11 @@ impl DownloadManager {
         // 恢复后，下次可重试错误会立刻命中"已耗尽"分支、停在 error，与单任务
         // 手动恢复行为不一致（BUG-BATCH-RESUME-NO-RETRY-RESET）。
         self.auto_retry_counts.remove(task_id);
+        if let Some(pending) = self.pending_pauses.get_mut(task_id) {
+            pending.resume_requested = true;
+            return false;
+        }
+
         if self.active_tasks.contains_key(task_id) {
             let is_terminal = task_row.status == 3 || task_row.status == 4;
             if !is_terminal {
@@ -9494,6 +9742,207 @@ mod tests {
         );
     }
 
+    #[test]
+    fn auto_failover_tries_manual_system_and_direct_at_most_once() {
+        use crate::auto_proxy::CandidateSource::{ManualFields, System};
+
+        let sources = [ManualFields, System];
+        let mut attempts = AutoFailoverAttempts::default();
+        assert_eq!(
+            auto_failover_target(
+                "direct",
+                "download stalled for 5s",
+                &sources,
+                true,
+                &mut attempts,
+            ),
+            Some(AutoFailoverTarget::Proxy(ManualFields)),
+            "直连中途断流应先尝试显式手动代理"
+        );
+        assert_eq!(
+            auto_failover_target(
+                "proxy:failover:manual",
+                "error decoding response body",
+                &sources,
+                true,
+                &mut attempts,
+            ),
+            Some(AutoFailoverTarget::Proxy(System)),
+            "手动代理失败后应继续尝试系统代理"
+        );
+        assert_eq!(
+            auto_failover_target(
+                "proxy:failover:system",
+                "operation timed out",
+                &sources,
+                true,
+                &mut attempts,
+            ),
+            None,
+            "三条已尝试链路不得再次循环"
+        );
+
+        let mut proxy_first = AutoFailoverAttempts::default();
+        assert_eq!(
+            auto_failover_target(
+                "proxy:cached:system",
+                "connection reset",
+                &sources,
+                true,
+                &mut proxy_first,
+            ),
+            Some(AutoFailoverTarget::Proxy(ManualFields)),
+            "系统代理先失败时应尝试尚未使用的手动代理"
+        );
+        assert_eq!(
+            auto_failover_target(
+                "proxy:failover:manual",
+                "connection reset",
+                &sources,
+                true,
+                &mut proxy_first,
+            ),
+            Some(AutoFailoverTarget::Direct),
+            "两个代理均失败后应回退尚未尝试的本地直连"
+        );
+
+        let mut offline = AutoFailoverAttempts::default();
+        assert_eq!(
+            auto_failover_target(
+                "proxy:cached:system",
+                "operation timed out",
+                &[System],
+                false,
+                &mut offline,
+            ),
+            None,
+            "整机离线且无其他代理时不得误判系统代理失效"
+        );
+        let mut permanent = AutoFailoverAttempts::default();
+        assert_eq!(
+            auto_failover_target(
+                "direct",
+                "HTTP 404 Not Found",
+                &sources,
+                true,
+                &mut permanent,
+            ),
+            None,
+            "永久 HTTP 错误不得靠换路重试"
+        );
+        let mut no_proxy = AutoFailoverAttempts::default();
+        assert_eq!(
+            auto_failover_target("direct", "connection reset", &[], true, &mut no_proxy,),
+            None,
+            "没有候选代理且直连已失败时保持原错误"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_failover_runs_when_general_auto_retry_is_disabled() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.insert_task(
+            "t-auto-failover",
+            "https://example.com/release.bin",
+            "release.bin",
+            "",
+            4,
+            32 * 1024 * 1024,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert task");
+        db.set_task_auto_route("t-auto-failover", crate::auto_proxy::route::DIRECT)
+            .await
+            .expect("set direct route");
+        db.update_task_status("t-auto-failover", 4, "download stalled for 5s")
+            .await
+            .expect("set transport failure");
+
+        let proxy_config = ProxyConfig {
+            mode: ProxyMode::Auto,
+            proxy_type: crate::proxy_config::ProxyType::Http,
+            host: "127.0.0.1".to_string(),
+            port: 7890,
+            username: String::new(),
+            password: String::new(),
+            no_proxy_list: String::new(),
+        };
+        let mut mgr = DownloadManager::new(
+            db,
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: String::new(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config,
+                user_agent: String::new(),
+            },
+            Arc::new(RecordingSink::new()),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        mgr.set_max_auto_retries(0);
+        let mut retry_rx = mgr.take_retry_rx().expect("retry receiver");
+        mgr.active_tasks.insert(
+            "t-auto-failover".to_string(),
+            ActiveTaskEntry {
+                token: CancellationToken::new(),
+                generation: 7,
+                handle: None,
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        mgr.on_task_done(&TaskDone {
+            task_id: "t-auto-failover".to_string(),
+            generation: 7,
+            reserved_temp_path: None,
+        })
+        .await;
+
+        let scheduled = tokio::time::timeout(std::time::Duration::from_secs(1), retry_rx.recv())
+            .await
+            .expect("failover should schedule immediately");
+        assert_eq!(scheduled.as_deref(), Some("t-auto-failover"));
+        assert_eq!(
+            mgr.auto_failover_pending.get("t-auto-failover"),
+            Some(&AutoFailoverTarget::Proxy(
+                crate::auto_proxy::CandidateSource::ManualFields,
+            ))
+        );
+        assert!(
+            !mgr.auto_retry_counts.contains_key("t-auto-failover"),
+            "备用链路不得消耗用户配置的通用自动重试配额"
+        );
+        let (selected_proxy, route, ctx) = mgr
+            .auto_route_decision(
+                "https://example.com/release.bin",
+                "",
+                false,
+                false,
+                Some(AutoFailoverTarget::Proxy(
+                    crate::auto_proxy::CandidateSource::ManualFields,
+                )),
+            )
+            .expect("auto mode should return a route decision");
+        assert_eq!(selected_proxy.port, 7890);
+        assert_eq!(route, crate::auto_proxy::route::PROXY_FAILOVER_MANUAL);
+        assert!(
+            ctx.is_none(),
+            "forced failover must not start another probe"
+        );
+    }
+
     /// BUG-BT-PHANTOM-PIECES：完成前 piece 校验失败必须可自动重试——重试
     /// 路径会重新 add_torrent 并触发 librqbit 全量校验,只补齐损坏 piece。
     #[test]
@@ -9682,6 +10131,199 @@ mod tests {
                 .await
                 .expect("advance task status");
         }
+    }
+    /// 暂停终态必须等下载器 flush + 最终进度落库后再进入 progress_reporter。
+    /// 否则暂停帧会携带 3 秒周期内的旧 DB 快照，恢复时表现为百分比前跳。
+    #[tokio::test]
+    async fn pause_publishes_flushed_progress_after_matching_task_done() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "pause-flush", "/tmp", "file.bin", 1).await;
+        db.update_task_total_bytes("pause-flush", 215_020_021)
+            .await
+            .expect("set total");
+        db.update_task_progress("pause-flush", 30_000_000)
+            .await
+            .expect("set stale persisted progress");
+
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: "/tmp".to_string(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        let mut progress_rx = mgr.take_progress_rx().expect("progress receiver");
+        let token = CancellationToken::new();
+        let waiter = token.clone();
+        let handle = tokio::spawn(async move {
+            waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            "pause-flush".to_string(),
+            ActiveTaskEntry {
+                token,
+                generation: 41,
+                handle: Some(handle),
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        mgr.pause_task("pause-flush").await;
+        assert!(
+            !sink.events().iter().any(|event| matches!(
+                event,
+                EngineEvent::TaskProgress {
+                    task_id,
+                    status: 2,
+                    ..
+                } if task_id == "pause-flush"
+            )),
+            "active pause must not publish the stale DB snapshot directly"
+        );
+        assert!(
+            progress_rx.try_recv().is_err(),
+            "progress_reporter must wait for the downloader's final flush"
+        );
+
+        db.update_task_progress("pause-flush", 31_513_021)
+            .await
+            .expect("persist flushed progress");
+        mgr.on_task_done(&TaskDone {
+            task_id: "pause-flush".to_string(),
+            generation: 41,
+            reserved_temp_path: None,
+        })
+        .await;
+
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(1), progress_rx.recv())
+            .await
+            .expect("paused progress should be published")
+            .expect("progress channel should stay open");
+        assert_eq!(paused.status, 2);
+        assert_eq!(paused.downloaded_bytes, 31_513_021);
+        assert_eq!(paused.total_bytes, 215_020_021);
+    }
+
+    /// 快速暂停→恢复不得在旧下载器尚未退出时启动新一代；旧世代迟到的
+    /// TaskDone 也不得把已经运行的新世代覆盖成 paused。
+    #[tokio::test]
+    async fn resume_waits_for_pause_flush_and_stale_done_cannot_pause_new_generation() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        insert_task_at_status(&db, "pause-race", "/tmp", "file.bin", 1).await;
+        let sink = Arc::new(RecordingSink::new());
+        let mut mgr = DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: "/tmp".to_string(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            sink.clone(),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager");
+        let mut progress_rx = mgr.take_progress_rx().expect("progress receiver");
+        let old_token = CancellationToken::new();
+        let old_waiter = old_token.clone();
+        let old_handle = tokio::spawn(async move {
+            old_waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            "pause-race".to_string(),
+            ActiveTaskEntry {
+                token: old_token,
+                generation: 51,
+                handle: Some(old_handle),
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+
+        mgr.pause_task("pause-race").await;
+        mgr.resume_task("pause-race").await;
+        assert!(
+            !mgr.active_tasks.contains_key("pause-race"),
+            "resume must be deferred until the cancelled writer exits"
+        );
+        assert!(
+            mgr.pending_pauses
+                .get("pause-race")
+                .is_some_and(|pending| pending.resume_requested),
+            "resume intent must be retained while cancellation finishes"
+        );
+
+        // Model a newer generation installed by another actor operation before
+        // the old TaskDone is consumed. The stale completion must be harmless.
+        let new_token = CancellationToken::new();
+        let new_waiter = new_token.clone();
+        let new_handle = tokio::spawn(async move {
+            new_waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            "pause-race".to_string(),
+            ActiveTaskEntry {
+                token: new_token,
+                generation: 52,
+                handle: Some(new_handle),
+                is_bt: false,
+                queue_id: String::new(),
+            },
+        );
+        db.update_task_status("pause-race", 1, "")
+            .await
+            .expect("mark newer generation active");
+
+        mgr.on_task_done(&TaskDone {
+            task_id: "pause-race".to_string(),
+            generation: 51,
+            reserved_temp_path: None,
+        })
+        .await;
+
+        assert_eq!(
+            mgr.active_tasks
+                .get("pause-race")
+                .map(|entry| entry.generation),
+            Some(52),
+            "stale TaskDone must not remove the newer generation"
+        );
+        assert!(
+            progress_rx.try_recv().is_err(),
+            "stale pause completion must not publish a terminal paused frame"
+        );
+        assert!(
+            !sink.events().iter().any(|event| matches!(
+                event,
+                EngineEvent::TaskProgress {
+                    task_id,
+                    status: 2,
+                    ..
+                } if task_id == "pause-race"
+            )),
+            "newer running generation must stay visible"
+        );
     }
 
     /// 批量事件契约：批量恢复/暂停 N 个排队任务 = 常数条事件
