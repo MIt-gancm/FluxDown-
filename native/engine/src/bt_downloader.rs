@@ -568,6 +568,16 @@ impl SharedBtSession {
             // explicit path makes it work on every platform and keeps DHT
             // state next to session.json.
             dht: dht.then(|| librqbit::DhtSessionConfig {
+                // 多节点 bootstrap：上游默认仅 transmissionbt + libtorrent.org
+                // （后者在部分网络反复失败），补主流路由器保证纯 DHT 磁力
+                // （URL 无 tracker）能可靠引导并发现 seed。
+                bootstrap_addrs: Some(vec![
+                    "router.bittorrent.com:6881".to_string(),
+                    "router.utorrent.com:6881".to_string(),
+                    "router.bitcomet.net:6881".to_string(),
+                    "dht.transmissionbt.com:6881".to_string(),
+                    "dht.libtorrent.org:25401".to_string(),
+                ]),
                 persistence: Some(librqbit::dht::DhtPersistenceConfig {
                     config_filename: Some(dht_config_path.clone()),
                     ..Default::default()
@@ -599,6 +609,12 @@ impl SharedBtSession {
                     // Generous read/write timeout to avoid dropping slow
                     // but otherwise healthy peers.
                     read_write_timeout: Some(Duration::from_secs(20)),
+                    // 独立握手超时（BT 握手 + MSE 交换）：静默/无响应 peer 10s
+                    // 内出局，不占用连接槽位，swarm 启动爬升更快。
+                    handshake_timeout: Some(Duration::from_secs(10)),
+                    // 出站连接平滑：每秒最多 30 个尝试，避免对劣质 peer 池
+                    // 发起连接风暴（78% 无效连接淹没有效连接）。
+                    connect_rate: Some(30),
                     ..Default::default()
                 }),
             }),
@@ -620,6 +636,15 @@ impl SharedBtSession {
             // DHT/tracker storms when many BT tasks start at once.
             concurrent_init_limit: Some(3),
             mse_mode: bt_config.mse_mode,
+            // 失败 peer 激进淘汰：5s 起步、factor 4、封顶 600s、累计 30 分钟
+            // 出池（上游默认 10s/6x/3600s/24h）。更快淘汰僵尸 peer 并让短暂
+            // 失败的好 peer 更快重试。
+            peer_backoff: Some(librqbit::PeerBackoffConfig {
+                min_delay: Duration::from_secs(5),
+                factor: 4.0,
+                max_delay: Duration::from_secs(600),
+                total_delay: Some(Duration::from_secs(1800)),
+            }),
             ..Default::default()
         };
 

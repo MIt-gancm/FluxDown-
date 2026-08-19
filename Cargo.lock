@@ -2494,7 +2494,7 @@ dependencies = [
 [[package]]
 name = "librqbit"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2557,7 +2557,7 @@ dependencies = [
 [[package]]
 name = "librqbit-bencode"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "arrayvec",
@@ -2573,7 +2573,7 @@ dependencies = [
 [[package]]
 name = "librqbit-buffers"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "bytes",
  "librqbit-clone-to-owned",
@@ -2584,7 +2584,7 @@ dependencies = [
 [[package]]
 name = "librqbit-clone-to-owned"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "bytes",
 ]
@@ -2592,7 +2592,7 @@ dependencies = [
 [[package]]
 name = "librqbit-core"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2621,7 +2621,7 @@ dependencies = [
 [[package]]
 name = "librqbit-dht"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "backon",
@@ -2668,7 +2668,7 @@ dependencies = [
 [[package]]
 name = "librqbit-lsd"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "atoi 3.1.0",
@@ -2687,7 +2687,7 @@ dependencies = [
 [[package]]
 name = "librqbit-peer-protocol"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -2707,7 +2707,7 @@ dependencies = [
 [[package]]
 name = "librqbit-sha1-wrapper"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "assert_cfg",
  "aws-lc-rs",
@@ -2717,7 +2717,7 @@ dependencies = [
 [[package]]
 name = "librqbit-tracker-comms"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2745,7 +2745,7 @@ dependencies = [
 [[package]]
 name = "librqbit-upnp"
 version = "9.0.0"
-source = "git+https://github.com/lingdiansr/rqbit?branch=mse#41b896d6741e240b1cf9ede4345e03674a2ac6ec"
+source = "git+https://github.com/lingdiansr/rqbit?branch=mse-dev#3860dbe08c0b11efc0d8499de128b5a18195c44d"
 dependencies = [
  "anyhow",
  "bstr",
