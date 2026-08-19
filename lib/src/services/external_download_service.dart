@@ -8,6 +8,7 @@ import 'package:rinf/rinf.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../bindings/bindings.dart';
+import '../models/download_controller.dart';
 import '../models/settings_provider.dart';
 import '../widgets/quick_download_dialog.dart';
 import '../widgets/quick_download_form.dart';
@@ -79,6 +80,27 @@ class ExternalDownloadService {
     _sub = ExternalDownloadRequest.rustSignalStream.listen(_onRequest);
   }
 
+  Future<SettingsProvider> _waitForSettings() async {
+    while (true) {
+      final candidate = SettingsProvider.globalInstance ?? settingsProvider;
+      await candidate.whenLoaded;
+      if (identical(
+        candidate,
+        SettingsProvider.globalInstance ?? settingsProvider,
+      )) {
+        return candidate;
+      }
+    }
+  }
+
+  Future<void> _waitForQueues() async {
+    while (true) {
+      final controller = await DownloadController.whenGlobalInstanceAvailable;
+      await controller.whenQueuesLoaded;
+      if (identical(controller, DownloadController.globalInstance)) return;
+    }
+  }
+
   /// 桌面端 `fluxdown://` 协议唤起入口（启动参数 / 第二实例转发）。
   ///
   /// Windows 上 `protocol_registry` 把 `fluxdown://` 注册到本 exe，浏览器
@@ -117,16 +139,16 @@ class ExternalDownloadService {
       'received request: url=${req.url}, filename=${req.filename}, size=${req.fileSize}',
     );
 
+    final readySettings = await _waitForSettings();
+
     // 音视频轨对（浏览器扩展嗅探到离散 video/audio 轨，通用语义，非站点
     // 特判）：browser 侧已完成清晰度确认。免打扰开启时宿主直接建任务
     // （不拆分为多任务，audioUrl 原样传 Rust 走离散轨道下载 + mux 旁路）；
     // 免打扰关闭时落入下方弹窗路径，让用户在 FluxDown 内二次确认（audioUrl
     // 经弹窗/小窗独立通道透传，不进 URL 文本、不被换行拆分）。
-    final trackPairSilent =
-        (SettingsProvider.globalInstance ?? settingsProvider)
-            .silentDownloadEnabled;
+    final trackPairSilent = readySettings.silentDownloadEnabled;
     if (req.audioUrl.isNotEmpty && trackPairSilent) {
-      final trackSettings = SettingsProvider.globalInstance ?? settingsProvider;
+      final trackSettings = readySettings;
       final requestedDir = req.saveDir.trim();
       final matchedDir = trackSettings.resolveCategorySaveDir(
         req.filename,
@@ -167,8 +189,8 @@ class ExternalDownloadService {
     }
 
     // 免打扰下载：不弹确认框、不抢前台，直接按默认设置创建任务。
-    // 优先 globalInstance（始终反映用户最新设置），fallback 到启动时实例。
-    final silentSettings = SettingsProvider.globalInstance ?? settingsProvider;
+    // Settings readiness was established before any branch decision.
+    final silentSettings = readySettings;
     if (silentSettings.silentDownloadEnabled) {
       // url 可能是换行连接的多条 URL（aria2 addUri 多 URI / 脚本接管批量），
       // 与快速下载对话框共用同一解析器：单条走 ConfirmExternalDownload
@@ -248,6 +270,10 @@ class ExternalDownloadService {
       logError(_tag, 'silent download: no entries or save dir, falling back');
     }
 
+    // QuickPopupPayload freezes queues and settings for a second Flutter
+    // engine. Wait for the authoritative first queue snapshot before taking it.
+    await _waitForQueues();
+
     // ── 首选路径：独立小窗（不抢主窗口前台）──
     // 小窗仍可见时把新请求合入现有表单（append 模式）；若原生报告窗口
     // 实际不可见（状态失步），tryAppend 已复位标志，继续走正常显示流程。
@@ -256,7 +282,7 @@ class ExternalDownloadService {
       if (handled) return;
     }
     if (!_dialogOpen) {
-      final popupSettings = SettingsProvider.globalInstance ?? settingsProvider;
+      final popupSettings = readySettings;
       final requestedDir = req.saveDir.trim();
       final matchedDir = popupSettings.resolveCategorySaveDir(
         req.filename,
@@ -318,11 +344,8 @@ class ExternalDownloadService {
       }
 
       logInfo(_tag, 'showing quick download dialog...');
-      // 优先使用 globalInstance（HomePage 的主 SettingsProvider，始终反映用户最新设置）。
-      // ExternalDownloadService 持有的 settingsProvider 是启动时创建的独立实例，
-      // 不会收到用户在 UI 中修改设置后的变更通知，仅作为 fallback。
-      final effectiveSettings =
-          SettingsProvider.globalInstance ?? settingsProvider;
+      // Reuse the readiness-checked provider used for this request.
+      final effectiveSettings = readySettings;
       final requestedDir = req.saveDir.trim();
       showQuickDownloadDialog(
         context,

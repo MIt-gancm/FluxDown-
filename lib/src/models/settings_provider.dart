@@ -216,6 +216,7 @@ class SettingsProvider extends ChangeNotifier {
 
   /// 配置是否已从 Rust 端加载完成
   bool _loaded = false;
+  final Completer<void> _loadedCompleter = Completer<void>();
 
   /// 是否启用文件关联功能（查询/监听注册表状态）。测试或不展示文件关联
   /// 设置的专用宿主可关闭；桌面主界面的共享实例保持启用。
@@ -258,6 +259,9 @@ class SettingsProvider extends ChangeNotifier {
   // ---------------------------------------------------------------------------
 
   bool get loaded => _loaded;
+
+  /// Completes after the first full configuration snapshot has been applied.
+  Future<void> get whenLoaded => _loadedCompleter.future;
   String get defaultSaveDir => _defaultSaveDir;
   int get defaultSegments => _defaultSegments;
   int get autoMaxConnections => _autoMaxConnections;
@@ -2122,6 +2126,9 @@ class SettingsProvider extends ChangeNotifier {
       _saveToRust('reveal_file_cmd', legacyOpenDirCmd);
     }
     _loaded = true;
+    if (!_loadedCompleter.isCompleted) {
+      _loadedCompleter.complete();
+    }
     notifyListeners();
     // 首次启动：若无自定义分类配置，使用内置默认分类
     if (_customCategories.isEmpty) {
