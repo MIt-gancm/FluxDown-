@@ -571,10 +571,11 @@ impl SharedBtSession {
                 // 多节点 bootstrap：上游默认仅 transmissionbt + libtorrent.org
                 // （后者在部分网络反复失败），补主流路由器保证纯 DHT 磁力
                 // （URL 无 tracker）能可靠引导并发现 seed。
+                // 注：router.bitcomet.net 已废弃（bitcomet.net 域名整体指向
+                // 127.0.0.1，官方迁移至 bitcomet.com，且无对应 DHT 子域），已移除。
                 bootstrap_addrs: Some(vec![
                     "router.bittorrent.com:6881".to_string(),
                     "router.utorrent.com:6881".to_string(),
-                    "router.bitcomet.net:6881".to_string(),
                     "dht.transmissionbt.com:6881".to_string(),
                     "dht.libtorrent.org:25401".to_string(),
                 ]),
