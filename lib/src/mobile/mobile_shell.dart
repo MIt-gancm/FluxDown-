@@ -224,9 +224,11 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 文件跟踪：回到前台时用户可能刚在文件管理器删/移了文件，触发一次重扫。
     if (state == AppLifecycleState.resumed) {
+      // 文件跟踪：回到前台时用户可能刚在文件管理器删/移了文件。
       RescanFiles().sendSignalToRust();
+      // 同进程引擎重建后内存列表是空的；再要一次快照自愈。
+      _controller.requestPersistedState();
     }
   }
 

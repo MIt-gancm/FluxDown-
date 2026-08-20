@@ -1225,6 +1225,12 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         });
     }
 
+    // 进循环前主动推一次快照。Dart 的 RequestAllTasks 可能在 receiver
+    // 就绪前就发出（或二次 isolate 时旧 actor 已死），不能只靠请求灌表。
+    engine.manager.load_and_send_all_tasks().await;
+    engine.manager.send_all_queues().await;
+    engine.manager.send_all_groups().await;
+
     loop {
         tokio::select! {
             Some(signal) = create_recv.recv() => {

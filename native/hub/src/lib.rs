@@ -35,11 +35,14 @@ write_interface!();
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = logger::init() {
-        eprintln!(
-            "FluxDown logger initialization failed: {}",
-            logger::format_error_chain(&error)
-        );
-        return;
+        // 同进程二次 isolate：logger 已由上次 runtime 装好，继续拉 actor。
+        if !error.is_already_initialized() {
+            eprintln!(
+                "FluxDown logger initialization failed: {}",
+                logger::format_error_chain(&error)
+            );
+            return;
+        }
     }
     logger::spawn_logged("hub", "create actors", async {
         create_actors().await?;

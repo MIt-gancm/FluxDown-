@@ -80,6 +80,13 @@ pub enum LoggerInitError {
     InstallSubscriber(#[source] tracing::subscriber::SetGlobalDefaultError),
 }
 
+impl LoggerInitError {
+    /// 同进程二次 isolate / 热重启：subscriber 与 LOGGER 已由上次 runtime 装好。
+    pub fn is_already_initialized(&self) -> bool {
+        matches!(self, Self::AlreadyInitialized | Self::InstallSubscriber(_))
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LoggerHealth {
     pub initialized: bool,
@@ -463,6 +470,9 @@ pub(crate) fn panic_hook_installed() -> bool {
 // ══════════════════════════════════════════════════
 
 /// 初始化全局日志与 `tracing` subscriber。必须在启动任何后台任务前调用。
+///
+/// 同进程二次 isolate（Android Activity 重建 / rinf 热重启）再调一次是
+/// 成功：subscriber 与文件 logger 是进程级一次性资源，已装好则直接返回。
 pub fn init() -> Result<(), LoggerInitError> {
     let data_dir =
         crate::data_dir::resolve_data_dir(None).map_err(LoggerInitError::ResolveDataDirectory)?;
@@ -479,6 +489,11 @@ pub fn init_with_dir(data_dir: &Path) -> Result<(), LoggerInitError> {
 }
 
 fn init_at(log_dir: PathBuf) -> Result<(), LoggerInitError> {
+    if let Some(existing) = LOGGER.get() {
+        existing.write_impl("[logger] init skipped (already initialized)", false);
+        return Ok(());
+    }
+
     let logger = Arc::new(AppLogger::new(log_dir.clone())?);
     logger
         .write_session_header()
@@ -515,15 +530,28 @@ fn init_at(log_dir: PathBuf) -> Result<(), LoggerInitError> {
         .compact()
         .finish();
     if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+        // subscriber 已被上次 runtime 装上。把本次 logger 挂上（或接受
+        // 竞态下别人先挂上的），不要当成致命错误掐死 actor。
+        if LOGGER.set(logger.clone()).is_ok() {
+            install_panic_hook();
+            logger.write_impl(
+                "[logger] tracing subscriber already installed; reused existing",
+                false,
+            );
+            return Ok(());
+        }
+        if LOGGER.get().is_some() {
+            return Ok(());
+        }
         logger.write_impl(
             &format!("[logger] failed to install tracing subscriber: {error}"),
             true,
         );
         return Err(LoggerInitError::InstallSubscriber(error));
     }
-    LOGGER
-        .set(logger)
-        .map_err(|_| LoggerInitError::AlreadyInitialized)?;
+    if LOGGER.set(logger).is_err() {
+        return Ok(());
+    }
     install_panic_hook();
     tracing::info!("[logger] tracing subscriber initialized");
     Ok(())
@@ -862,8 +890,8 @@ mod tests {
     use thiserror::Error;
 
     use super::{
-        AppLogWriterFactory, AppLogger, format_error_chain, install_panic_hook, list_log_files_in,
-        parse_log_name, report_error, spawn_logged,
+        AppLogWriterFactory, AppLogger, LoggerInitError, format_error_chain, install_panic_hook,
+        list_log_files_in, parse_log_name, report_error, spawn_logged,
     };
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -988,6 +1016,16 @@ mod tests {
             source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "root failure"),
         };
         assert_eq!(format_error_chain(&error), "outer failure: root failure");
+    }
+
+    #[test]
+    fn already_initialized_is_reentry_safe() {
+        assert!(LoggerInitError::AlreadyInitialized.is_already_initialized());
+        let fatal = LoggerInitError::CreateDirectory {
+            path: std::path::PathBuf::from("/tmp"),
+            source: std::io::Error::other("nope"),
+        };
+        assert!(!fatal.is_already_initialized());
     }
 
     #[test]

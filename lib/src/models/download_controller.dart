@@ -183,11 +183,15 @@ class DownloadController extends ChangeNotifier {
     _globalInstanceCompleter = null;
     _startListening();
     if (requestInitialState) {
-      // 启动时请求所有持久化任务和队列
-      const RequestAllTasks().sendSignalToRust();
-      const RequestAllQueues().sendSignalToRust();
-      const RequestAllGroups().sendSignalToRust();
+      requestPersistedState();
     }
+  }
+
+  /// 向引擎请求全量任务 / 队列 / 组快照。构造时与移动端回前台都会走这里。
+  void requestPersistedState() {
+    const RequestAllTasks().sendSignalToRust();
+    const RequestAllQueues().sendSignalToRust();
+    const RequestAllGroups().sendSignalToRust();
   }
 
   @override

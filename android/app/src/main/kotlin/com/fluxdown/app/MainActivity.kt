@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Environment
 import android.provider.DocumentsContract
 import android.provider.Settings
@@ -29,6 +30,20 @@ class MainActivity : FlutterActivity() {
     private var shareChannel: MethodChannel? = null
     /** 冷启动时暂存的分享内容（url + filename），等 Dart 侧首次 getInitialShare 时取走。 */
     private var pendingShare: HashMap<String, String>? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // 桌面图标再进：部分 ROM（尤其小米）会在已有任务上再叠一个
+        // MAIN/LAUNCHER Activity，从而新建 FlutterEngine、二次 initializeRust。
+        if (!isTaskRoot
+            && intent.hasCategory(Intent.CATEGORY_LAUNCHER)
+            && intent.action == Intent.ACTION_MAIN
+        ) {
+            finish()
+            return
+        }
+        super.onCreate(savedInstanceState)
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
         MethodChannel(
