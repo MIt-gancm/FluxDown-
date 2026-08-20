@@ -219,9 +219,9 @@ Future<void> showMobileTaskActionSheet(
         title: task.fileName,
         child: LayoutBuilder(
           builder: (ctx3, constraints) {
-            // 固定四列宫格（两行）：tile 等比分配可用宽度，超出的动作落到第二行。
+            // 固定三列宫格（两行）：tile 等比分配可用宽度，超出的动作落到第二行。
             const gap = 10.0;
-            const cols = 4;
+            const cols = 3;
             final width = constraints.maxWidth;
             final tileWidth = (width - gap * (cols - 1)) / cols;
             return Padding(
