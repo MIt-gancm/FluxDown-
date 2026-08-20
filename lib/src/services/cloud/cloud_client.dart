@@ -450,7 +450,7 @@ class CloudClient {
 
   // ── 套餐 / 订单（微信 Native 扫码购买，见 local://pay-contract.md）───────
 
-  /// GET /plans/catalog：公开无鉴权，返回上架套餐（含活动价快照）。
+  /// GET /plans/catalog：公开无鉴权。含上架套餐，以及下架但仍官网展示的套餐。
   Future<List<CloudPlan>> getPlansCatalog() async {
     final json = await _request('GET', '/plans/catalog');
     final list = json['value'] as List<dynamic>? ?? const [];

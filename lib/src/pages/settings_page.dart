@@ -12684,7 +12684,12 @@ class _PlanPurchaseDialogState extends State<_PlanPurchaseDialog> {
       final catalog = await CloudClient.instance.getPlansCatalog();
       final purchasable =
           catalog
-              .where((p) => p.code != 'free' && p.effectivePriceMinor > 0)
+              .where(
+                (p) =>
+                    p.purchasable &&
+                    p.code != 'free' &&
+                    p.effectivePriceMinor > 0,
+              )
               .toList()
             ..sort((a, b) => a.sort.compareTo(b.sort));
       if (!mounted) return;

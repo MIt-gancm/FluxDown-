@@ -112,6 +112,7 @@
     "pricing.campaignEnds": "活动 {date} 截止",
     "pricing.cloudFree": "免费",
     "pricing.buyInApp": "也可在 FluxDown 桌面客户端内购买",
+    "pricing.unavailable": "已停止销售",
     "webbuy.button": "网页购买",
     "webbuy.title": "购买 {plan}",
     "webbuy.close": "关闭",

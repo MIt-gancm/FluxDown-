@@ -112,6 +112,7 @@
   "pricing.campaignEnds": "Offer ends on {date}",
   "pricing.cloudFree": "Free",
   "pricing.buyInApp": "Also available inside the FluxDown desktop app",
+  "pricing.unavailable": "No longer for sale",
   "webbuy.button": "Buy online",
   "webbuy.title": "Buy {plan}",
   "webbuy.close": "Close",

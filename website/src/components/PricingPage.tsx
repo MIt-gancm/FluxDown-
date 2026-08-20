@@ -29,6 +29,8 @@ interface CloudPlan {
   priceMinor: number;
   currency: string;
   highlights: string[];
+  /** 缺省视为可购买，兼容旧目录响应。下架但仍展示的套餐为 false。 */
+  purchasable?: boolean;
   campaign: CloudCampaign | null;
 }
 
@@ -265,6 +267,7 @@ export default function PricingPage() {
                   : null;
               const hasDiscount = c != null && c.effectivePriceMinor < plan.priceMinor;
               const priceMinor = c ? c.effectivePriceMinor : plan.priceMinor;
+              const purchasable = plan.purchasable !== false;
               const featured = plan.priceMinor > 0;
               return (
                 <motion.div
@@ -345,17 +348,25 @@ export default function PricingPage() {
                     {featured && (
                       <div className="mt-auto pt-6">
                         <div className="border-t border-dark-border pt-4">
-                          <WebPurchase
-                            plan={{
-                              code: plan.code,
-                              name: plan.name,
-                              priceMinor,
-                              currency: plan.currency,
-                            }}
-                          />
-                          <p className="mt-2.5 text-xs text-dark-text-muted text-center">
-                            {t("pricing.buyInApp")}
-                          </p>
+                          {purchasable ? (
+                            <>
+                              <WebPurchase
+                                plan={{
+                                  code: plan.code,
+                                  name: plan.name,
+                                  priceMinor,
+                                  currency: plan.currency,
+                                }}
+                              />
+                              <p className="mt-2.5 text-xs text-dark-text-muted text-center">
+                                {t("pricing.buyInApp")}
+                              </p>
+                            </>
+                          ) : (
+                            <p className="text-center text-sm text-dark-text-muted">
+                              {t("pricing.unavailable")}
+                            </p>
+                          )}
                         </div>
                       </div>
                     )}

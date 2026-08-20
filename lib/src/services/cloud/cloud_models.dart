@@ -360,7 +360,8 @@ class CloudPlanCampaign {
       : 0;
 }
 
-/// 上架套餐（GET /plans/catalog 响应元素，见契约 v1 CatalogPlanDto）。
+/// 公开套餐目录（GET /plans/catalog 响应元素，见契约 v1 CatalogPlanDto）。
+/// 含上架套餐，以及下架但仍在官网展示的套餐（[purchasable] 为 false）。
 class CloudPlan {
   final String code;
   final String name;
@@ -391,6 +392,8 @@ class CloudPlan {
   final Map<String, dynamic> entitlementsRaw;
   final int sort;
   final CloudPlanCampaign? campaign;
+  /// 是否可在线购买。旧快照缺省视为 true。
+  final bool purchasable;
 
   const CloudPlan({
     required this.code,
@@ -409,6 +412,7 @@ class CloudPlan {
     required this.entitlementsRaw,
     required this.sort,
     this.campaign,
+    this.purchasable = true,
   });
 
   factory CloudPlan.fromJson(Map<String, dynamic> json) => CloudPlan(
@@ -430,6 +434,7 @@ class CloudPlan {
     entitlementsRaw:
         (json['entitlements'] as Map<String, dynamic>?) ?? const {},
     sort: (json['sort'] as num?)?.toInt() ?? 0,
+    purchasable: json['purchasable'] as bool? ?? true,
     campaign: json['campaign'] is Map<String, dynamic>
         ? CloudPlanCampaign.fromJson(json['campaign'] as Map<String, dynamic>)
         : null,
@@ -452,6 +457,7 @@ class CloudPlan {
     'highlights': highlights,
     'entitlements': entitlementsRaw,
     'sort': sort,
+    'purchasable': purchasable,
     if (campaign != null) 'campaign': campaign!.toJson(),
   };
 
