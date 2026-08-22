@@ -3,11 +3,13 @@ import 'dart:ui';
 
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
-import '../widgets/flux_sonner.dart';
 
+import '../i18n/translations.dart';
 import '../models/download_task.dart';
+import '../services/open_folder.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
+import '../widgets/flux_sonner.dart';
 
 /// 顶栏 / Dock 通用毛玻璃滤镜
 final ImageFilter mobileBlurFilter = ImageFilter.blur(sigmaX: 22, sigmaY: 22);
@@ -62,6 +64,18 @@ void showMobileToast(BuildContext context, String message) {
       duration: const Duration(milliseconds: 2000),
     ),
   );
+}
+
+/// 移动端"打开/分享文件"失败原因 → i18n 提示文案。任务操作面板与详情页共用。
+String mobileFileErrorText(S s, Object e) {
+  if (e is OpenFileException) {
+    return switch (e.error) {
+      OpenFileError.notFound => s.mobileFileNotFound,
+      OpenFileError.noHandler => s.mobileNoAppToOpen,
+      OpenFileError.failed => s.mobileOpenFileFailed,
+    };
+  }
+  return s.mobileOpenFileFailed;
 }
 
 /// 玻璃卡片装饰（浅色: 白面板；深色: 深面板）

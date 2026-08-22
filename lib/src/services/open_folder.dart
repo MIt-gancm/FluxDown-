@@ -56,28 +56,35 @@ Future<void> openFolder(String filePath) async {
   RevealFile(path: filePath).sendSignalToRust();
 }
 
-/// 用系统默认程序打开文件。
+/// 用系统默认程序打开文件（[forceChooser] 为 true 时强制拉起系统「打开方式」
+/// 选择器，供用户自选应用，对应「更多打开方式」）。
 ///
 /// **桌面平台（Windows/macOS/Linux）实现**：
 /// 交给 Rust 端以**裸路径**经 shell 打开（Windows `explorer.exe` / macOS `open`
 /// / Linux `xdg-open`），正确解析扩展名关联，包括 .mp4 等由 UWP/Store 应用处理
 /// 的类型。此前用 `launchUrl(Uri.file())` 传 `file://` URL，ShellExecute 无法据此
 /// 激活 UWP 关联应用，导致这类文件"点开没反应"。实现见 native/hub/src/reveal_file.rs。
+/// 桌面端忽略 [forceChooser]（无对应的强制选择器语义）。
 ///
 /// **移动平台（Android/iOS）实现**：
 /// 经 `com.fluxdown/storage` MethodChannel 走原生实现：
 /// - **Android**（MainActivity.kt `openFile`）：FileProvider 生成 content:// URI +
 ///   ACTION_VIEW（targetSdk ≥ 24 禁止 file:// 出应用）；按扩展名解析 MIME 交给
 ///   默认关联应用，无关联时回退系统选择器（chooser）让用户自选。
+///   [forceChooser] 为 true 时跳过默认应用、直接强制系统选择器。
 /// - **iOS**（AppDelegate.swift `openFile`）：UIDocumentInteractionController
-///   弹出系统"打开方式"菜单，由用户选择应用。
+///   弹出系统"打开方式"菜单，由用户选择应用（本就带选择菜单，[forceChooser]
+///   不产生额外差异）。
 ///
 /// 失败抛 [OpenFileException]（notFound / noHandler / failed），由调用端映射
 /// 为 i18n 提示。
-Future<void> openFile(String filePath) async {
+Future<void> openFile(String filePath, {bool forceChooser = false}) async {
   if (Platform.isAndroid || Platform.isIOS) {
     try {
-      await _storageChannel.invokeMethod<bool>('openFile', {'path': filePath});
+      await _storageChannel.invokeMethod<bool>(
+        'openFile',
+        {'path': filePath, 'chooser': forceChooser},
+      );
     } on PlatformException catch (e) {
       final error = switch (e.code) {
         'not_found' => OpenFileError.notFound,
@@ -89,5 +96,30 @@ Future<void> openFile(String filePath) async {
   } else {
     // 桌面端：发送 Rust 信号
     OpenFile(path: filePath).sendSignalToRust();
+  }
+}
+
+/// 分享已下载文件：经系统分享面板（Android ACTION_SEND + 选择器）将文件发给
+/// 其他应用。仅 Android 原生实现（MainActivity.kt `shareFile`）；其他平台未提供
+/// 原生分享入口，调用会抛 [OpenFileException.failed]。
+///
+/// 失败抛 [OpenFileException]（notFound / noHandler / failed），由调用端映射
+/// 为 i18n 提示。
+Future<void> shareFile(String filePath) async {
+  if (!Platform.isAndroid) {
+    throw const OpenFileException(
+      OpenFileError.failed,
+      'shareFile is not supported on this platform',
+    );
+  }
+  try {
+    await _storageChannel.invokeMethod<bool>('shareFile', {'path': filePath});
+  } on PlatformException catch (e) {
+    final error = switch (e.code) {
+      'not_found' => OpenFileError.notFound,
+      'no_handler' => OpenFileError.noHandler,
+      _ => OpenFileError.failed,
+    };
+    throw OpenFileException(error, e.message ?? e.code);
   }
 }
