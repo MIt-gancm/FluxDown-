@@ -301,6 +301,83 @@ pub fn default_tracker_list() -> String {
 // ---------------------------------------------------------------------------
 // BT configuration — user-settable via the Settings page
 // ---------------------------------------------------------------------------
+/// FluxDown-owned MSE policy. Keeping this type at the engine boundary avoids
+/// exposing the concrete BitTorrent backend to host crates.
+///
+/// ```
+/// use fluxdown_engine::bt_downloader::BtMseMode;
+///
+/// assert_eq!(BtMseMode::from("forced"), BtMseMode::Forced);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BtMseMode {
+    /// Reject encrypted peer handshakes and use plaintext only.
+    Disabled,
+    /// Prefer encrypted handshakes while retaining plaintext compatibility.
+    #[default]
+    Enabled,
+    /// Require encryption for every peer connection.
+    Forced,
+}
+
+impl From<&str> for BtMseMode {
+    fn from(value: &str) -> Self {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("disabled") {
+            Self::Disabled
+        } else if value.eq_ignore_ascii_case("forced") {
+            Self::Forced
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
+impl From<BtMseMode> for librqbit::MseMode {
+    fn from(value: BtMseMode) -> Self {
+        match value {
+            BtMseMode::Disabled => Self::Disabled,
+            BtMseMode::Enabled => Self::Enabled,
+            BtMseMode::Forced => Self::Forced,
+        }
+    }
+}
+
+fn is_retryable_listener_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse
+                    | std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+            )
+        })
+    })
+}
+fn probe_listener_port(port: u16) -> std::io::Result<()> {
+    // librqbit enables SO_REUSEADDR for TCP on Windows, which can make its
+    // bind appear successful even when another process owns the port. Probe
+    // with the standard library first; session construction still handles a
+    // later bind failure if another process wins the remaining race.
+    match std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            // An IPv6-only host can still use the dual-stack candidate.
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// User-configurable BT session settings, loaded from the DB config table.
 #[derive(Debug, Clone)]
@@ -334,7 +411,7 @@ pub struct BtConfig {
     pub seed_max_active: usize,
     /// MSE (Message Stream Encryption) policy for BT peer connections.
     /// Emergency escape hatch settable via config API/CLI; no Settings UI.
-    pub mse_mode: librqbit::MseMode,
+    pub mse_mode: BtMseMode,
 }
 
 impl Default for BtConfig {
@@ -353,7 +430,7 @@ impl Default for BtConfig {
             seed_limit_operator: crate::bt_seeding::SeedingLimitOperator::Or,
             seed_then_action: "stop".to_string(),
             seed_max_active: 0,
-            mse_mode: librqbit::MseMode::Enabled,
+            mse_mode: BtMseMode::Enabled,
         }
     }
 }
@@ -558,7 +635,7 @@ impl SharedBtSession {
         let save_dir = default_save_dir.to_owned();
         let save_dir_for_cleanup = save_dir.clone();
         let dht_config_path = persistence_folder.join("dht.json");
-        let build_opts = |dht: bool| SessionOptions {
+        let build_opts = |dht: bool, port: u16, ipv4_only: bool| SessionOptions {
             // 9.0: `dht: None` disables DHT entirely; `Some(config)` enables it
             // with optional persistence. When DHT is on we pin the routing
             // table file inside our app-private data directory. librqbit's
@@ -585,20 +662,22 @@ impl SharedBtSession {
                 }),
                 ..Default::default()
             }),
-            // 9.0 dropped the port-range fallback: a single listen_addr is
-            // bound (port_start); port_end is no longer used.
-            //
-            // Bind [::] (dualstack) instead of 0.0.0.0: librqbit-dualstack
-            // only applies IPV6_V6ONLY=0 to the [::] wildcard; a v4 address
-            // yields a v4-only socket and every IPv6 inbound peer gets RST'd
-            // at the kernel (observed: 46/46 v6 SYN → RST+ACK). With [::]
-            // and v4-mapped sockets both families are accepted.
+            // librqbit 9 accepts one listen address. Session construction
+            // below walks the configured range and tries dual-stack first,
+            // then IPv4-only, preserving the existing port-range contract on
+            // occupied ports and hosts without usable IPv6.
             listen: Some(ListenerOptions {
                 mode: ListenerMode::TcpOnly,
-                listen_addr: SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port_start)),
+                listen_addr: if ipv4_only {
+                    SocketAddr::from(([0, 0, 0, 0], port))
+                } else {
+                    SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port))
+                },
                 enable_upnp_port_forwarding: enable_upnp,
+                ipv4_only,
                 ..Default::default()
             }),
+            ipv4_only,
             connect: Some(ConnectionOptions {
                 enable_tcp: true,
                 proxy_url: None,
@@ -636,7 +715,7 @@ impl SharedBtSession {
             // Limit concurrent torrent initialisation to 3 to prevent
             // DHT/tracker storms when many BT tasks start at once.
             concurrent_init_limit: Some(3),
-            mse_mode: bt_config.mse_mode,
+            mse_mode: bt_config.mse_mode.into(),
             // 失败 peer 激进淘汰：5s 起步、factor 4、封顶 600s、累计 30 分钟
             // 出池（上游默认 10s/6x/3600s/24h）。更快淘汰僵尸 peer 并让短暂
             // 失败的好 peer 更快重试。
@@ -647,6 +726,36 @@ impl SharedBtSession {
                 total_delay: Some(Duration::from_secs(1800)),
             }),
             ..Default::default()
+        };
+        let start_session = |dht: bool| -> anyhow::Result<Arc<Session>> {
+            let mut last_listener_error = None;
+            for port in port_start..=port_end {
+                if let Err(error) = probe_listener_port(port) {
+                    log_info!("[BT] listener port {port} unavailable: {error}");
+                    last_listener_error = Some(error.into());
+                    continue;
+                }
+                for ipv4_only in [false, true] {
+                    match rt.block_on(Session::new_with_opts(
+                        save_dir.clone().into(),
+                        build_opts(dht, port, ipv4_only),
+                    )) {
+                        Ok(session) => return Ok(session),
+                        Err(error) if !ipv4_only || is_retryable_listener_error(&error) => {
+                            let family = if ipv4_only { "IPv4" } else { "dual-stack" };
+                            log_info!(
+                                "[BT] session candidate {family} port {port} unavailable: {error:#}"
+                            );
+                            last_listener_error = Some(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            match last_listener_error {
+                Some(error) => Err(error),
+                None => Err(anyhow::anyhow!("BT listener port range is empty")),
+            }
         };
 
         // 降级阶梯：DHT 状态是**纯缓存**，绝不该让它把整个 BT 子系统锁死。
@@ -665,10 +774,7 @@ impl SharedBtSession {
         //
         // 错误一律用 `{e:#}` 而非 `{e}`：anyhow 的 `Display` 只打最外层 context，
         // 真正的根因（bind 失败/权限/解析）会被静默吞掉，正是这次排查最大的阻碍。
-        let session = match rt.block_on(Session::new_with_opts(
-            save_dir.clone().into(),
-            build_opts(enable_dht),
-        )) {
+        let session = match start_session(enable_dht) {
             Ok(s) => s,
             Err(first) if enable_dht => {
                 log_error!(
@@ -676,10 +782,7 @@ impl SharedBtSession {
                     dht_config_path.display()
                 );
                 let _ = std::fs::remove_file(&dht_config_path);
-                match rt.block_on(Session::new_with_opts(
-                    save_dir.clone().into(),
-                    build_opts(true),
-                )) {
+                match start_session(true) {
                     Ok(s) => {
                         log_info!("[BT] session init recovered after resetting DHT state");
                         s
@@ -688,11 +791,7 @@ impl SharedBtSession {
                         log_error!(
                             "[BT] session init still failing with a fresh DHT: {second:#} — falling back to DHT-off (trackers + PEX only)"
                         );
-                        rt.block_on(Session::new_with_opts(
-                            save_dir.clone().into(),
-                            build_opts(false),
-                        ))
-                        .map_err(|e| {
+                        start_session(false).map_err(|e| {
                             DownloadError::Other(format!("BT session init failed: {e:#}"))
                         })?
                     }
@@ -5083,6 +5182,68 @@ mod tests {
                 len: *len,
             })
             .collect()
+    }
+    #[test]
+    fn bt_mse_mode_parses_supported_values_without_allocating() {
+        assert_eq!(
+            super::BtMseMode::from("disabled"),
+            super::BtMseMode::Disabled
+        );
+        assert_eq!(super::BtMseMode::from(" FORCED "), super::BtMseMode::Forced);
+        assert_eq!(super::BtMseMode::from("Enabled"), super::BtMseMode::Enabled);
+        assert_eq!(super::BtMseMode::from("invalid"), super::BtMseMode::Enabled);
+        assert_eq!(super::BtMseMode::default(), super::BtMseMode::Enabled);
+    }
+
+    #[test]
+    fn shared_bt_session_uses_next_port_when_range_start_is_occupied() {
+        let (occupied, port_start, port_end) = (0..64)
+            .find_map(|_| {
+                let mut occupied = Vec::with_capacity(2);
+                let port_start = match std::net::TcpListener::bind(("[::]", 0)) {
+                    Ok(listener) => {
+                        let port = listener.local_addr().ok()?.port();
+                        occupied.push(listener);
+                        if let Ok(ipv4_listener) = std::net::TcpListener::bind(("0.0.0.0", port)) {
+                            occupied.push(ipv4_listener);
+                        }
+                        port
+                    }
+                    Err(_) => {
+                        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).ok()?;
+                        let port = listener.local_addr().ok()?.port();
+                        occupied.push(listener);
+                        port
+                    }
+                };
+                let port_end = port_start.checked_add(1)?;
+                let probe = std::net::TcpListener::bind(("0.0.0.0", port_end)).ok()?;
+                drop(probe);
+                Some((occupied, port_start, port_end))
+            })
+            .expect("the OS must provide two adjacent ephemeral test ports");
+        let work = unique_test_dir("listener_port_fallback");
+        std::fs::create_dir_all(&work).expect("the test directory must be creatable");
+        let work_string = work.to_string_lossy().into_owned();
+        let config = super::BtConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            port_start,
+            port_end,
+            ..Default::default()
+        };
+
+        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config)
+            .expect("the free successor port must allow BT session creation");
+        let listen_addr = session
+            .session
+            .listen_addr()
+            .expect("a configured BT listener must expose its bound address");
+
+        assert_eq!(listen_addr.port(), port_end);
+        drop(session);
+        drop(occupied);
+        std::fs::remove_dir_all(work).expect("the BT session test directory must be removable");
     }
 
     // -------------------------------------------------------------------------

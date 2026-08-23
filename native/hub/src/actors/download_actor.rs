@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_downloader::{BtConfig, BtMseMode};
 use fluxdown_engine::db::{Db, DbError};
 use fluxdown_engine::download_manager::{
     self, CreateGroupSpec, GroupItemSpec, NewTaskSpec, ResolvePreviewOutcome, TaskDone,
@@ -149,17 +149,11 @@ fn bt_config_from_map(cfg: &HashMap<String, String>) -> BtConfig {
             .get("bt_seed_max_active")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0),
-        mse_mode: parse_mse_mode(cfg.get("bt_mse_mode").map(String::as_str)),
-    }
-}
-
-/// Parse the MSE policy config value ("disabled"/"enabled"/"forced",
-/// case-insensitive). Missing or unknown values fall back to `Enabled`.
-fn parse_mse_mode(value: Option<&str>) -> librqbit::MseMode {
-    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("disabled") => librqbit::MseMode::Disabled,
-        Some("forced") => librqbit::MseMode::Forced,
-        _ => librqbit::MseMode::Enabled,
+        mse_mode: cfg
+            .get("bt_mse_mode")
+            .map(String::as_str)
+            .map(BtMseMode::from)
+            .unwrap_or_default(),
     }
 }
 

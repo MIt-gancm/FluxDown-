@@ -8,7 +8,7 @@ resolver = "3"
 members = ["native/*"]
 
 [patch.crates-io]
-librqbit = { git = "https://github.com/lingdiansr/rqbit", branch = "mse-dev" }
+librqbit = { git = "https://github.com/lingdiansr/rqbit", rev = "3860dbe08c0b11efc0d8499de128b5a18195c44d" }
 
 [profile.release]
 # 移除全部符号（含符号表），最大化减小体积

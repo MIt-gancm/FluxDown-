@@ -123,8 +123,10 @@ async fn fresh_add_creates_sparse_files_without_physical_reservation() {
         &content_dir,
         CreateTorrentOptions {
             name: Some("sparse-fresh"),
+            trackers: Vec::new(),
             piece_length: Some(16 * 1024),
         },
+        &librqbit::spawn_utils::BlockingSpawner::new(1),
     )
     .await
     .unwrap();
@@ -201,8 +203,10 @@ async fn readd_with_complete_data_marks_existing_files_and_finishes() {
         &content_dir,
         CreateTorrentOptions {
             name: Some("sparse-readd"),
+            trackers: Vec::new(),
             piece_length: Some(16 * 1024),
         },
+        &librqbit::spawn_utils::BlockingSpawner::new(1),
     )
     .await
     .unwrap();

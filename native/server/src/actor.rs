@@ -11,7 +11,7 @@ use base64::Engine as _;
 use fluxdown_api::service::ApiError;
 use fluxdown_api::types::CreateTaskRequest;
 use fluxdown_engine::Engine;
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_downloader::{BtConfig, BtMseMode};
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{
     CreateGroupSpec, NewTaskSpec, ResolveOutcome, ResolvePreviewOutcome, TaskDone,
@@ -1026,17 +1026,11 @@ pub fn bt_config_from_map(cfg: &HashMap<String, String>) -> BtConfig {
             .get("bt_seed_max_active")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0),
-        mse_mode: parse_mse_mode(cfg.get("bt_mse_mode").map(String::as_str)),
-    }
-}
-
-/// Parse the MSE policy config value ("disabled"/"enabled"/"forced",
-/// case-insensitive). Missing or unknown values fall back to `Enabled`.
-fn parse_mse_mode(value: Option<&str>) -> librqbit::MseMode {
-    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
-        Some("disabled") => librqbit::MseMode::Disabled,
-        Some("forced") => librqbit::MseMode::Forced,
-        _ => librqbit::MseMode::Enabled,
+        mse_mode: cfg
+            .get("bt_mse_mode")
+            .map(String::as_str)
+            .map(BtMseMode::from)
+            .unwrap_or_default(),
     }
 }
 
@@ -1252,6 +1246,7 @@ mod tests {
             ("bt_custom_trackers", "udp://tracker.example:80/announce"),
             ("bt_tracker_sub_enabled", "true"),
             ("bt_tracker_sub_cache", "udp://sub.example:80/announce"),
+            ("bt_mse_mode", "forced"),
         ]);
 
         let bt = bt_config_from_map(&cfg);
@@ -1262,6 +1257,7 @@ mod tests {
         assert_eq!(bt.port_end, 6950);
         assert_eq!(bt.custom_trackers, "udp://tracker.example:80/announce");
         assert_eq!(bt.subscription_trackers, "udp://sub.example:80/announce");
+        assert_eq!(bt.mse_mode, BtMseMode::Forced);
     }
 
     #[test]
