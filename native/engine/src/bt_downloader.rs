@@ -18,6 +18,7 @@
 //!   we report "preparing" status to Dart while we wait.
 
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,8 +32,9 @@ use windows_sys::Win32::Storage::FileSystem::{
 
 use bytes::Bytes;
 use librqbit::{
-    AddTorrent, AddTorrentOptions, AddTorrentResponse, ManagedTorrent, PeerConnectionOptions,
-    Session, SessionOptions, SessionPersistenceConfig,
+    AddTorrent, AddTorrentOptions, AddTorrentResponse, ConnectionOptions, ListenerMode,
+    ListenerOptions, ManagedTorrent, PeerConnectionOptions, Session, SessionOptions,
+    SessionPersistenceConfig,
 };
 
 /// Alias for librqbit's `BtHandle` (`Arc<ManagedTorrent>`).
@@ -116,11 +118,9 @@ impl TorrentSource {
                 .ok()?
                 .as_id20()
                 .map(|id| id.as_string()),
-            TorrentSource::TorrentFileBytes(bytes) => {
-                librqbit::torrent_from_bytes::<librqbit::ByteBufOwned>(bytes)
-                    .ok()
-                    .map(|t| t.info_hash.as_string())
-            }
+            TorrentSource::TorrentFileBytes(bytes) => librqbit::torrent_from_bytes(bytes)
+                .ok()
+                .map(|t| t.info_hash.as_string()),
         }
     }
 }
@@ -301,6 +301,83 @@ pub fn default_tracker_list() -> String {
 // ---------------------------------------------------------------------------
 // BT configuration — user-settable via the Settings page
 // ---------------------------------------------------------------------------
+/// FluxDown-owned MSE policy. Keeping this type at the engine boundary avoids
+/// exposing the concrete BitTorrent backend to host crates.
+///
+/// ```
+/// use fluxdown_engine::bt_downloader::BtMseMode;
+///
+/// assert_eq!(BtMseMode::from("forced"), BtMseMode::Forced);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BtMseMode {
+    /// Reject encrypted peer handshakes and use plaintext only.
+    Disabled,
+    /// Prefer encrypted handshakes while retaining plaintext compatibility.
+    #[default]
+    Enabled,
+    /// Require encryption for every peer connection.
+    Forced,
+}
+
+impl From<&str> for BtMseMode {
+    fn from(value: &str) -> Self {
+        let value = value.trim();
+        if value.eq_ignore_ascii_case("disabled") {
+            Self::Disabled
+        } else if value.eq_ignore_ascii_case("forced") {
+            Self::Forced
+        } else {
+            Self::Enabled
+        }
+    }
+}
+
+impl From<BtMseMode> for librqbit::MseMode {
+    fn from(value: BtMseMode) -> Self {
+        match value {
+            BtMseMode::Disabled => Self::Disabled,
+            BtMseMode::Enabled => Self::Enabled,
+            BtMseMode::Forced => Self::Forced,
+        }
+    }
+}
+
+fn is_retryable_listener_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrInUse
+                    | std::io::ErrorKind::AddrNotAvailable
+                    | std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+            )
+        })
+    })
+}
+fn probe_listener_port(port: u16) -> std::io::Result<()> {
+    // librqbit enables SO_REUSEADDR for TCP on Windows, which can make its
+    // bind appear successful even when another process owns the port. Probe
+    // with the standard library first; session construction still handles a
+    // later bind failure if another process wins the remaining race.
+    match std::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))) {
+        Ok(listener) => {
+            drop(listener);
+            Ok(())
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+            ) =>
+        {
+            // An IPv6-only host can still use the dual-stack candidate.
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
 
 /// User-configurable BT session settings, loaded from the DB config table.
 #[derive(Debug, Clone)]
@@ -332,6 +409,9 @@ pub struct BtConfig {
     /// Max simultaneously active seeders (0 = unlimited). Completed torrents
     /// beyond the cap wait in a FIFO seeding queue until a slot frees up.
     pub seed_max_active: usize,
+    /// MSE (Message Stream Encryption) policy for BT peer connections.
+    /// Emergency escape hatch settable via config API/CLI; no Settings UI.
+    pub mse_mode: BtMseMode,
 }
 
 impl Default for BtConfig {
@@ -350,6 +430,7 @@ impl Default for BtConfig {
             seed_limit_operator: crate::bt_seeding::SeedingLimitOperator::Or,
             seed_then_action: "stop".to_string(),
             seed_max_active: 0,
+            mse_mode: BtMseMode::Enabled,
         }
     }
 }
@@ -554,36 +635,74 @@ impl SharedBtSession {
         let save_dir = default_save_dir.to_owned();
         let save_dir_for_cleanup = save_dir.clone();
         let dht_config_path = persistence_folder.join("dht.json");
-        let build_opts = |dht: bool| SessionOptions {
-            disable_dht: !dht,
-            disable_dht_persistence: !dht,
-            // Pin the DHT routing-table file inside our app-private data
-            // directory. librqbit's default resolves a system config/cache
-            // dir (via `directories`), which FAILS on Android (no XDG dirs)
-            // and surfaces as "BT session init failed: error initializing
-            // persistent DHT". Providing an explicit path makes it work on
-            // every platform and keeps DHT state next to session.json.
-            dht_config: Some(librqbit::dht::PersistentDhtConfig {
-                config_filename: Some(dht_config_path.clone()),
+        let build_opts = |dht: bool, port: u16, ipv4_only: bool| SessionOptions {
+            // 9.0: `dht: None` disables DHT entirely; `Some(config)` enables it
+            // with optional persistence. When DHT is on we pin the routing
+            // table file inside our app-private data directory. librqbit's
+            // default resolves a system config/cache dir (via `directories`),
+            // which FAILS on Android (no XDG dirs) and surfaces as "BT session
+            // init failed: error initializing persistent DHT". Providing an
+            // explicit path makes it work on every platform and keeps DHT
+            // state next to session.json.
+            dht: dht.then(|| librqbit::DhtSessionConfig {
+                // 多节点 bootstrap：上游默认仅 transmissionbt + libtorrent.org
+                // （后者在部分网络反复失败），补主流路由器保证纯 DHT 磁力
+                // （URL 无 tracker）能可靠引导并发现 seed。
+                // 注：router.bitcomet.net 已废弃（bitcomet.net 域名整体指向
+                // 127.0.0.1，官方迁移至 bitcomet.com，且无对应 DHT 子域），已移除。
+                bootstrap_addrs: Some(vec![
+                    "router.bittorrent.com:6881".to_string(),
+                    "router.utorrent.com:6881".to_string(),
+                    "dht.transmissionbt.com:6881".to_string(),
+                    "dht.libtorrent.org:25401".to_string(),
+                ]),
+                persistence: Some(librqbit::dht::DhtPersistenceConfig {
+                    config_filename: Some(dht_config_path.clone()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
-            listen_port_range: Some(port_start..port_end.saturating_add(1)),
-            enable_upnp_port_forwarding: enable_upnp,
+            // librqbit 9 accepts one listen address. Session construction
+            // below walks the configured range and tries dual-stack first,
+            // then IPv4-only, preserving the existing port-range contract on
+            // occupied ports and hosts without usable IPv6.
+            listen: Some(ListenerOptions {
+                mode: ListenerMode::TcpOnly,
+                listen_addr: if ipv4_only {
+                    SocketAddr::from(([0, 0, 0, 0], port))
+                } else {
+                    SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port))
+                },
+                enable_upnp_port_forwarding: enable_upnp,
+                ipv4_only,
+                ..Default::default()
+            }),
+            ipv4_only,
+            connect: Some(ConnectionOptions {
+                enable_tcp: true,
+                proxy_url: None,
+                // Optimised peer connection parameters.
+                peer_opts: Some(PeerConnectionOptions {
+                    // Slightly shorter connect timeout — drop unresponsive
+                    // peers faster so we can try others sooner.
+                    connect_timeout: Some(Duration::from_secs(10)),
+                    // Generous read/write timeout to avoid dropping slow
+                    // but otherwise healthy peers.
+                    read_write_timeout: Some(Duration::from_secs(20)),
+                    // 独立握手超时（BT 握手 + MSE 交换）：静默/无响应 peer 10s
+                    // 内出局，不占用连接槽位，swarm 启动爬升更快。
+                    handshake_timeout: Some(Duration::from_secs(10)),
+                    // 出站连接平滑：每秒最多 30 个尝试，避免对劣质 peer 池
+                    // 发起连接风暴（78% 无效连接淹没有效连接）。
+                    connect_rate: Some(30),
+                    ..Default::default()
+                }),
+            }),
             trackers: trackers.clone(),
             ratelimits: librqbit::limits::LimitsConfig {
                 download_bps,
                 upload_bps,
             },
-            // Optimised peer connection parameters.
-            peer_opts: Some(PeerConnectionOptions {
-                // Slightly shorter connect timeout — drop unresponsive
-                // peers faster so we can try others sooner.
-                connect_timeout: Some(Duration::from_secs(10)),
-                // Generous read/write timeout to avoid dropping slow
-                // but otherwise healthy peers.
-                read_write_timeout: Some(Duration::from_secs(20)),
-                ..Default::default()
-            }),
             // Enable persistence so that session.json and per-torrent
             // .bitv (piece bitfield) files are written to disk.
             persistence: Some(SessionPersistenceConfig::Json {
@@ -593,15 +712,50 @@ impl SharedBtSession {
             // paused/restarted torrents can skip re-verification.
             // Requires `persistence` to be set to take effect.
             fastresume: true,
-            // Buffer writes in memory before flushing to disk.  Reduces
-            // I/O contention from many small pieces.  64 MiB is enough
-            // for high-speed connections while keeping RSS reasonable
-            // (was 128 — saved ~64 MB of potential RSS).
-            defer_writes_up_to: Some(64),
             // Limit concurrent torrent initialisation to 3 to prevent
             // DHT/tracker storms when many BT tasks start at once.
             concurrent_init_limit: Some(3),
+            mse_mode: bt_config.mse_mode.into(),
+            // 失败 peer 激进淘汰：5s 起步、factor 4、封顶 600s、累计 30 分钟
+            // 出池（上游默认 10s/6x/3600s/24h）。更快淘汰僵尸 peer 并让短暂
+            // 失败的好 peer 更快重试。
+            peer_backoff: Some(librqbit::PeerBackoffConfig {
+                min_delay: Duration::from_secs(5),
+                factor: 4.0,
+                max_delay: Duration::from_secs(600),
+                total_delay: Some(Duration::from_secs(1800)),
+            }),
             ..Default::default()
+        };
+        let start_session = |dht: bool| -> anyhow::Result<Arc<Session>> {
+            let mut last_listener_error = None;
+            for port in port_start..=port_end {
+                if let Err(error) = probe_listener_port(port) {
+                    log_info!("[BT] listener port {port} unavailable: {error}");
+                    last_listener_error = Some(error.into());
+                    continue;
+                }
+                for ipv4_only in [false, true] {
+                    match rt.block_on(Session::new_with_opts(
+                        save_dir.clone().into(),
+                        build_opts(dht, port, ipv4_only),
+                    )) {
+                        Ok(session) => return Ok(session),
+                        Err(error) if !ipv4_only || is_retryable_listener_error(&error) => {
+                            let family = if ipv4_only { "IPv4" } else { "dual-stack" };
+                            log_info!(
+                                "[BT] session candidate {family} port {port} unavailable: {error:#}"
+                            );
+                            last_listener_error = Some(error);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+            match last_listener_error {
+                Some(error) => Err(error),
+                None => Err(anyhow::anyhow!("BT listener port range is empty")),
+            }
         };
 
         // 降级阶梯：DHT 状态是**纯缓存**，绝不该让它把整个 BT 子系统锁死。
@@ -620,10 +774,7 @@ impl SharedBtSession {
         //
         // 错误一律用 `{e:#}` 而非 `{e}`：anyhow 的 `Display` 只打最外层 context，
         // 真正的根因（bind 失败/权限/解析）会被静默吞掉，正是这次排查最大的阻碍。
-        let session = match rt.block_on(Session::new_with_opts(
-            save_dir.clone().into(),
-            build_opts(enable_dht),
-        )) {
+        let session = match start_session(enable_dht) {
             Ok(s) => s,
             Err(first) if enable_dht => {
                 log_error!(
@@ -631,10 +782,7 @@ impl SharedBtSession {
                     dht_config_path.display()
                 );
                 let _ = std::fs::remove_file(&dht_config_path);
-                match rt.block_on(Session::new_with_opts(
-                    save_dir.clone().into(),
-                    build_opts(true),
-                )) {
+                match start_session(true) {
                     Ok(s) => {
                         log_info!("[BT] session init recovered after resetting DHT state");
                         s
@@ -643,11 +791,7 @@ impl SharedBtSession {
                         log_error!(
                             "[BT] session init still failing with a fresh DHT: {second:#} — falling back to DHT-off (trackers + PEX only)"
                         );
-                        rt.block_on(Session::new_with_opts(
-                            save_dir.clone().into(),
-                            build_opts(false),
-                        ))
-                        .map_err(|e| {
+                        start_session(false).map_err(|e| {
                             DownloadError::Other(format!("BT session init failed: {e:#}"))
                         })?
                     }
@@ -691,11 +835,13 @@ impl SharedBtSession {
         }
 
         log_info!(
-            "[BT] shared session created (DHT={}, UPnP={}, ports={}-{}, {} trackers, speed_limit={} B/s, upload_limit={} B/s, worker_threads={}, persistence=on)",
+            "[BT] shared session created (DHT={}, UPnP={}, ports={}-{}, listen_addr={:?}, mse_mode={:?}, {} trackers, speed_limit={} B/s, upload_limit={} B/s, worker_threads={}, persistence=on)",
             enable_dht,
             enable_upnp,
             port_start,
             port_end,
+            session.listen_addr(),
+            bt_config.mse_mode,
             total_tracker_count,
             speed_limit_bps,
             upload_limit_bps,
@@ -828,7 +974,7 @@ impl SharedBtSession {
             {
                 if matches!(
                     handle.stats().state,
-                    librqbit::TorrentStatsState::Initializing
+                    librqbit::TorrentStatsState::Initializing { .. }
                 ) {
                     log_info!(
                         "[BT] task={} pause requested during init — deferring until check completes",
@@ -935,7 +1081,8 @@ impl SharedBtSession {
             !s.finished
                 && matches!(
                     s.state,
-                    librqbit::TorrentStatsState::Paused | librqbit::TorrentStatsState::Initializing
+                    librqbit::TorrentStatsState::Paused
+                        | librqbit::TorrentStatsState::Initializing { .. }
                 )
         })
     }
@@ -2942,9 +3089,9 @@ async fn verify_staged_pieces(
                     })
                     .collect();
                 verify_pieces_core(
-                    meta.lengths.default_piece_length(),
+                    meta.lengths().default_piece_length(),
                     &files,
-                    |idx, digest| meta.info.compare_hash(idx, digest),
+                    |idx, digest| meta.info.info().compare_hash(idx, digest),
                 )
             })
             .map_err(|e| format!("metadata unavailable: {e}"))
@@ -2980,6 +3127,8 @@ pub fn build_add_torrent_options(
     output_folder: String,
     upload_limit_bps: u64,
 ) -> AddTorrentOptions {
+    // `opts` is only mutated by the Windows-only storage override below.
+    #[allow(unused_mut)]
     let mut opts = AddTorrentOptions {
         overwrite: true,
         output_folder: Some(output_folder),
@@ -3526,7 +3675,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 .iter()
                 .map(|fi| (fi.offset_in_torrent, fi.len))
                 .collect();
-            let pieces = meta.lengths.total_pieces();
+            let pieces = meta.lengths().total_pieces();
             (offsets, pieces)
         })
         .unwrap_or((Vec::new(), 0));
@@ -3918,7 +4067,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     len: fi.len,
                 })
                 .collect();
-            (files, total_non_padding, meta.info.files.is_some())
+            (files, total_non_padding, meta.info.info().files.is_some())
         })
         .unwrap_or_default();
     let all_selected = !selected_files.is_empty() && selected_files.len() == non_padding_count;
@@ -4414,8 +4563,8 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                             if selected_ids.len() == layout.moves.len() {
                                 let files_meta = handle.with_metadata(|meta| {
                                     (
-                                        meta.lengths.default_piece_length(),
-                                        meta.lengths.total_length(),
+                                        meta.lengths().default_piece_length(),
+                                        meta.lengths().total_length(),
                                         meta.file_infos
                                             .iter()
                                             .map(|fi| crate::bt_partfile::PartsFileMeta {
@@ -4857,7 +5006,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
 
             let status_code = match stats.state {
                 librqbit::TorrentStatsState::Live => STATUS_DOWNLOADING,
-                librqbit::TorrentStatsState::Initializing => STATUS_PREPARING,
+                librqbit::TorrentStatsState::Initializing { .. } => STATUS_PREPARING,
                 librqbit::TorrentStatsState::Paused => STATUS_PREPARING, // unreachable after guard above
                 librqbit::TorrentStatsState::Error => STATUS_ERROR,
             };
@@ -4949,32 +5098,28 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
 /// before the user confirms the download.  It is purely local (no network).
 pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) -> TorrentMetaResult {
     // librqbit re-exports librqbit_core::torrent_metainfo::* at the crate root,
-    // so torrent_from_bytes_ext and ByteBuf are both accessible via librqbit::.
-    use librqbit::{ByteBuf, torrent_from_bytes_ext};
-
+    // so torrent_from_bytes and the validation API are accessible via librqbit::.
     let result: Result<TorrentMetaResult, String> = (|| {
-        // ByteBuf<'_> borrows torrent_bytes; the parsed value must not outlive it.
-        let parsed = torrent_from_bytes_ext::<ByteBuf<'_>>(&torrent_bytes)
+        let parsed = librqbit::torrent_from_bytes(&torrent_bytes)
             .map_err(|e| format!("torrent parse error: {e}"))?;
-        let info = &parsed.meta.info;
+        // 9.0 returns an unvalidated torrent; validate to get file iteration
+        // and name access (raw TorrentMetaV1Info file access is crate-private).
+        let info = parsed
+            .info
+            .data
+            .validate()
+            .map_err(|e| format!("torrent validation error: {e}"))?;
 
         // Build file list. For single-file torrents this yields one entry.
         let mut files: Vec<BtFileEntry> = Vec::new();
         let mut total_bytes: i64 = 0;
-        for (idx, fd) in info
-            .iter_file_details()
-            .map_err(|e| format!("iter_file_details error: {e}"))?
-            .enumerate()
-        {
+        for (idx, fd) in info.iter_file_details().enumerate() {
             // Skip padding files (BEP-47).
             let attrs: librqbit::FileDetailsAttrs = fd.attrs();
             if attrs.padding {
                 continue;
             }
-            let path = fd
-                .filename
-                .to_string()
-                .unwrap_or_else(|_| format!("file_{idx}"));
+            let path = fd.filename.to_string();
             let size = fd.len as i64;
             total_bytes += size;
             files.push(BtFileEntry {
@@ -4985,11 +5130,9 @@ pub fn probe_torrent_meta(probe_id: String, torrent_bytes: Vec<u8>) -> TorrentMe
         }
 
         let name = info
-            .name
-            .as_ref()
-            .and_then(|n: &ByteBuf<'_>| std::str::from_utf8(n.as_ref()).ok())
-            .unwrap_or("Unknown")
-            .to_owned();
+            .name()
+            .map(|n| n.into_owned())
+            .unwrap_or_else(|| "Unknown".to_owned());
 
         Ok(TorrentMetaResult {
             probe_id: probe_id.clone(),
@@ -5039,6 +5182,68 @@ mod tests {
                 len: *len,
             })
             .collect()
+    }
+    #[test]
+    fn bt_mse_mode_parses_supported_values_without_allocating() {
+        assert_eq!(
+            super::BtMseMode::from("disabled"),
+            super::BtMseMode::Disabled
+        );
+        assert_eq!(super::BtMseMode::from(" FORCED "), super::BtMseMode::Forced);
+        assert_eq!(super::BtMseMode::from("Enabled"), super::BtMseMode::Enabled);
+        assert_eq!(super::BtMseMode::from("invalid"), super::BtMseMode::Enabled);
+        assert_eq!(super::BtMseMode::default(), super::BtMseMode::Enabled);
+    }
+
+    #[test]
+    fn shared_bt_session_uses_next_port_when_range_start_is_occupied() {
+        let (occupied, port_start, port_end) = (0..64)
+            .find_map(|_| {
+                let mut occupied = Vec::with_capacity(2);
+                let port_start = match std::net::TcpListener::bind(("[::]", 0)) {
+                    Ok(listener) => {
+                        let port = listener.local_addr().ok()?.port();
+                        occupied.push(listener);
+                        if let Ok(ipv4_listener) = std::net::TcpListener::bind(("0.0.0.0", port)) {
+                            occupied.push(ipv4_listener);
+                        }
+                        port
+                    }
+                    Err(_) => {
+                        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).ok()?;
+                        let port = listener.local_addr().ok()?.port();
+                        occupied.push(listener);
+                        port
+                    }
+                };
+                let port_end = port_start.checked_add(1)?;
+                let probe = std::net::TcpListener::bind(("0.0.0.0", port_end)).ok()?;
+                drop(probe);
+                Some((occupied, port_start, port_end))
+            })
+            .expect("the OS must provide two adjacent ephemeral test ports");
+        let work = unique_test_dir("listener_port_fallback");
+        std::fs::create_dir_all(&work).expect("the test directory must be creatable");
+        let work_string = work.to_string_lossy().into_owned();
+        let config = super::BtConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            port_start,
+            port_end,
+            ..Default::default()
+        };
+
+        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config)
+            .expect("the free successor port must allow BT session creation");
+        let listen_addr = session
+            .session
+            .listen_addr()
+            .expect("a configured BT listener must expose its bound address");
+
+        assert_eq!(listen_addr.port(), port_end);
+        drop(session);
+        drop(occupied);
+        std::fs::remove_dir_all(work).expect("the BT session test directory must be removable");
     }
 
     // -------------------------------------------------------------------------

@@ -4,7 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_downloader::{BtConfig, BtMseMode};
 use fluxdown_engine::db::{Db, DbError};
 use fluxdown_engine::download_manager::{
     self, CreateGroupSpec, GroupItemSpec, NewTaskSpec, ResolvePreviewOutcome, TaskDone,
@@ -149,6 +149,11 @@ fn bt_config_from_map(cfg: &HashMap<String, String>) -> BtConfig {
             .get("bt_seed_max_active")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0),
+        mse_mode: cfg
+            .get("bt_mse_mode")
+            .map(String::as_str)
+            .map(BtMseMode::from)
+            .unwrap_or_default(),
     }
 }
 
@@ -3000,7 +3005,8 @@ async fn apply_config_key(
         | "bt_port_end"
         | "bt_custom_trackers"
         | "bt_tracker_sub_enabled"
-        | "bt_tracker_sub_urls" => {
+        | "bt_tracker_sub_urls"
+        | "bt_mse_mode" => {
             log_info!("[actor] BT session config changed: {}={}", key, value);
             // Reload the full BT config from DB to stay consistent.
             let all_cfg = engine.db.get_all_config().await.unwrap_or_default();

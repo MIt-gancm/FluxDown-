@@ -47,12 +47,14 @@ const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x200;
 /// 从 torrent 字节解析出各文件的相对路径（librqbit 打开文件时相对
 /// output_folder 使用的就是这些路径）。
 fn relative_paths(torrent_bytes: &[u8]) -> Vec<PathBuf> {
-    let parsed = librqbit::torrent_from_bytes::<librqbit::ByteBufOwned>(torrent_bytes).unwrap();
+    let parsed = librqbit::torrent_from_bytes(torrent_bytes).unwrap();
     parsed
         .info
-        .iter_file_details()
+        .data
+        .validate()
         .unwrap()
-        .map(|fd| fd.filename.to_pathbuf().unwrap())
+        .iter_file_details()
+        .map(|fd| fd.filename.to_pathbuf())
         .collect()
 }
 
@@ -90,16 +92,13 @@ async fn local_session(root: &Path) -> (std::sync::Arc<Session>, PathBuf) {
     let session = Session::new_with_opts(
         session_dir,
         SessionOptions {
-            disable_dht: true,
-            disable_dht_persistence: true,
+            dht: None,
             // 与生产一致开 JSON 持久化 + fastresume：update_db 的 TypeId
             // 白名单与 BitVFactory 面都必须被真实执行到。
             persistence: Some(librqbit::SessionPersistenceConfig::Json {
                 folder: Some(persist_dir.clone()),
             }),
             fastresume: true,
-            listen_port_range: None,
-            enable_upnp_port_forwarding: false,
             ..Default::default()
         },
     )
@@ -124,8 +123,10 @@ async fn fresh_add_creates_sparse_files_without_physical_reservation() {
         &content_dir,
         CreateTorrentOptions {
             name: Some("sparse-fresh"),
+            trackers: Vec::new(),
             piece_length: Some(16 * 1024),
         },
+        &librqbit::spawn_utils::BlockingSpawner::new(1),
     )
     .await
     .unwrap();
@@ -202,8 +203,10 @@ async fn readd_with_complete_data_marks_existing_files_and_finishes() {
         &content_dir,
         CreateTorrentOptions {
             name: Some("sparse-readd"),
+            trackers: Vec::new(),
             piece_length: Some(16 * 1024),
         },
+        &librqbit::spawn_utils::BlockingSpawner::new(1),
     )
     .await
     .unwrap();

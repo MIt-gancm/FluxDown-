@@ -11,7 +11,7 @@ use base64::Engine as _;
 use fluxdown_api::service::ApiError;
 use fluxdown_api::types::CreateTaskRequest;
 use fluxdown_engine::Engine;
-use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::bt_downloader::{BtConfig, BtMseMode};
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{
     CreateGroupSpec, NewTaskSpec, ResolveOutcome, ResolvePreviewOutcome, TaskDone,
@@ -890,6 +890,7 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
             | "bt_tracker_sub_enabled"
             | "bt_tracker_sub_urls"
             | "bt_tracker_sub_cache"
+            | "bt_mse_mode"
                 if !bt_applied =>
             {
                 bt_applied = true;
@@ -1025,6 +1026,11 @@ pub fn bt_config_from_map(cfg: &HashMap<String, String>) -> BtConfig {
             .get("bt_seed_max_active")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(0),
+        mse_mode: cfg
+            .get("bt_mse_mode")
+            .map(String::as_str)
+            .map(BtMseMode::from)
+            .unwrap_or_default(),
     }
 }
 
@@ -1240,6 +1246,7 @@ mod tests {
             ("bt_custom_trackers", "udp://tracker.example:80/announce"),
             ("bt_tracker_sub_enabled", "true"),
             ("bt_tracker_sub_cache", "udp://sub.example:80/announce"),
+            ("bt_mse_mode", "forced"),
         ]);
 
         let bt = bt_config_from_map(&cfg);
@@ -1250,6 +1257,7 @@ mod tests {
         assert_eq!(bt.port_end, 6950);
         assert_eq!(bt.custom_trackers, "udp://tracker.example:80/announce");
         assert_eq!(bt.subscription_trackers, "udp://sub.example:80/announce");
+        assert_eq!(bt.mse_mode, BtMseMode::Forced);
     }
 
     #[test]
