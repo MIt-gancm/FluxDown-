@@ -417,6 +417,7 @@
   "accountDeviceVerifyTitle": "New device verification",
   "accountDeviceVerifySubtitle": "This device hasn't signed in before. Enter the code sent to {email} to trust it.",
   "accountDeviceVerifySubtitleGeneric": "This device hasn't signed in before. Enter the code sent to your account's email to trust it.",
+  "accountDeviceVerifyReplacementNotice": "Your device limit has been reached. After verification, the least recently used device will be signed out.",
   "accountRegisterVerifyTitle": "Verify your email",
   "accountRegisterVerifySubtitle": "We sent a code to {email}. Enter it to finish creating your account.",
   "accountCodeExpireIn": "Code expires in {seconds}s",

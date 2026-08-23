@@ -237,8 +237,8 @@ class AuthResponse {
   );
 }
 
-/// POST /auth/login 的 tagged 响应：设备已受信任则直接下发令牌（[LoginOk]），
-/// 新设备则要求邮箱验证码（[LoginDeviceVerificationRequired]）。
+/// POST /auth/login 的 tagged 响应：设备已受信任则直接下发令牌（[LoginOk]）；
+/// 新设备要求邮箱验证码，并通过响应字段预告验证后是否会替换最久未使用设备。
 sealed class LoginResult {
   const LoginResult();
 }
@@ -250,7 +250,12 @@ class LoginOk extends LoginResult {
 
 class LoginDeviceVerificationRequired extends LoginResult {
   final int ttlSeconds;
-  const LoginDeviceVerificationRequired(this.ttlSeconds);
+  final bool willReplaceDevices;
+
+  const LoginDeviceVerificationRequired(
+    this.ttlSeconds, {
+    this.willReplaceDevices = false,
+  });
 }
 
 /// 服务端错误统一形态 `{code, message}`（见 error.rs），附带 HTTP 状态码方便
@@ -392,6 +397,7 @@ class CloudPlan {
   final Map<String, dynamic> entitlementsRaw;
   final int sort;
   final CloudPlanCampaign? campaign;
+
   /// 是否可在线购买。旧快照缺省视为 true。
   final bool purchasable;
 

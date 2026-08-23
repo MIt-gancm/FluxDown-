@@ -47,13 +47,16 @@ class CloudApiConfig {
   /// 是否为用户自定义地址（非默认值），供设置页展示"恢复默认"按钮状态。
   static bool get isCustom {
     final custom = KvStore.instance.getString(_kApiBaseKvKey);
-    return custom != null && custom.trim().isNotEmpty && custom.trim() != _kDefaultApiBase;
+    return custom != null &&
+        custom.trim().isNotEmpty &&
+        custom.trim() != _kDefaultApiBase;
   }
 
   static Future<void> setBaseUrl(String url) =>
       KvStore.instance.setString(_kApiBaseKvKey, url.trim());
 
-  static Future<void> resetToDefault() => KvStore.instance.remove(_kApiBaseKvKey);
+  static Future<void> resetToDefault() =>
+      KvStore.instance.remove(_kApiBaseKvKey);
 }
 
 class CloudClient {
@@ -135,8 +138,8 @@ class CloudClient {
     return AuthResponse.fromJson(json);
   }
 
-  /// POST /auth/login：tagged 响应，设备已受信任直接下发令牌，
-  /// 新设备则返回 deviceVerificationRequired（服务端已自动发码）。
+  /// POST /auth/login：tagged 响应，设备已受信任直接下发令牌；
+  /// 新设备返回 deviceVerificationRequired，服务端自动发码，并可预告是否会替换旧设备。
   /// [account] 接受邮箱或纯数字 Origin ID（契约 v1.2），服务端字段名 account。
   Future<LoginResult> login({
     required String account,
@@ -159,7 +162,10 @@ class CloudClient {
     );
     final status = json['status'] as String?;
     if (status == 'deviceVerificationRequired') {
-      return LoginDeviceVerificationRequired(_ttlSeconds(json));
+      return LoginDeviceVerificationRequired(
+        _ttlSeconds(json),
+        willReplaceDevices: json['willReplaceDevices'] == true,
+      );
     }
     final authJson = json['auth'];
     if (status == 'ok' && authJson is Map<String, dynamic>) {
@@ -199,7 +205,11 @@ class CloudClient {
 
   /// POST /auth/code/send：发送验证码登录用的验证码，返回 TTL（秒）。
   Future<int> sendCode(String email) async {
-    final json = await _request('POST', '/auth/code/send', body: {'email': email});
+    final json = await _request(
+      'POST',
+      '/auth/code/send',
+      body: {'email': email},
+    );
     return _ttlSeconds(json);
   }
 
@@ -246,7 +256,11 @@ class CloudClient {
 
   /// POST /auth/logout。
   Future<void> logout(String refreshToken) async {
-    await _request('POST', '/auth/logout', body: {'refreshToken': refreshToken});
+    await _request(
+      'POST',
+      '/auth/logout',
+      body: {'refreshToken': refreshToken},
+    );
   }
 
   // ── 已登录接口（Bearer UserAuth，401 自动刷新重放一次）──────────────────
@@ -523,15 +537,17 @@ class CloudClient {
   });
 
   /// POST /referral/codes：创建一个推荐码；[code] 为空时服务端随机生成 8 位。
-  Future<CloudReferralCode> createReferralCode({String? code}) => _authed(() async {
-    final json = await _request(
-      'POST',
-      '/referral/codes',
-      body: {if (code != null && code.trim().isNotEmpty) 'code': code.trim()},
-      authed: true,
-    );
-    return CloudReferralCode.fromJson(json);
-  });
+  Future<CloudReferralCode> createReferralCode({String? code}) => _authed(
+    () async {
+      final json = await _request(
+        'POST',
+        '/referral/codes',
+        body: {if (code != null && code.trim().isNotEmpty) 'code': code.trim()},
+        authed: true,
+      );
+      return CloudReferralCode.fromJson(json);
+    },
+  );
 
   /// DELETE /referral/codes/{id}：删除我名下的推荐码（历史订单归因不受影响）。
   Future<void> deleteReferralCode(String id) => _authed(() async {
@@ -566,7 +582,7 @@ class CloudClient {
     final json = await _request(
       'GET',
       '/referral/validate?code=${Uri.encodeQueryComponent(code)}'
-      '&planCode=${Uri.encodeQueryComponent(planCode)}',
+          '&planCode=${Uri.encodeQueryComponent(planCode)}',
       authed: true,
     );
     return CloudReferralValidateResult.fromJson(json);
@@ -577,15 +593,17 @@ class CloudClient {
 
   /// GET /sync/items：拉取 version > since 的条目（含墓碑），resync=true 时
   /// 客户端应重置水位线并将本地目录中云端缺失的键标脏重传。
-  Future<SyncPullResult> syncPull({required int since, required String deviceId}) =>
-      _authed(() async {
-        final json = await _request(
-          'GET',
-          '/sync/items?since=$since&deviceId=${Uri.encodeQueryComponent(deviceId)}',
-          authed: true,
-        );
-        return SyncPullResult.fromJson(json);
-      });
+  Future<SyncPullResult> syncPull({
+    required int since,
+    required String deviceId,
+  }) => _authed(() async {
+    final json = await _request(
+      'GET',
+      '/sync/items?since=$since&deviceId=${Uri.encodeQueryComponent(deviceId)}',
+      authed: true,
+    );
+    return SyncPullResult.fromJson(json);
+  });
 
   /// PUT /sync/items：批量推送本地变更，返回服务端最新 revision。回包 revision
   /// 恰为本地水位线+1 时，ConfigSyncService 会快进水位线以消除自回显 pull；
@@ -610,55 +628,65 @@ class CloudClient {
   /// If-None-Match 请求头、读取响应 ETag 头，且 304 是正常「未变更」结果
   /// 而非错误，与其余接口的错误语义不同。[ifNoneMatch] 传入上次持久化的
   /// ETag（原样回传，含引号）。
-  Future<CdnConfigResult> fetchCdnConfig({String? ifNoneMatch}) => _authed(() async {
-    _ensureHttp();
-    final uri = Uri.parse('${CloudApiConfig.baseUrl}$_kApiPrefix/cdn/config');
-    try {
-      final req = await _http!.getUrl(uri).timeout(_timeout);
-      req.headers.set('Accept', 'application/json');
-      if (accessToken != null && accessToken!.isNotEmpty) {
-        req.headers.set('Authorization', 'Bearer $accessToken');
-      }
-      if (ifNoneMatch != null && ifNoneMatch.isNotEmpty) {
-        req.headers.set('If-None-Match', ifNoneMatch);
-      }
-      final res = await req.close().timeout(_timeout);
-      if (res.statusCode == 304) {
-        await res.drain<void>();
-        return const CdnConfigResult.notModified();
-      }
-      final text = await res.transform(utf8.decoder).join();
-      if (res.statusCode >= 200 && res.statusCode < 300) {
-        final etag = res.headers.value(HttpHeaders.etagHeader);
-        final json = text.trim().isEmpty
-            ? const <String, dynamic>{}
-            : jsonDecode(text) as Map<String, dynamic>;
-        return CdnConfigResult(etag: etag, config: CdnConfig.fromJson(json));
-      }
-      var code = 'unknown_error';
-      var message = 'HTTP ${res.statusCode}';
+  Future<CdnConfigResult> fetchCdnConfig({String? ifNoneMatch}) => _authed(
+    () async {
+      _ensureHttp();
+      final uri = Uri.parse('${CloudApiConfig.baseUrl}$_kApiPrefix/cdn/config');
       try {
-        final decoded = jsonDecode(text);
-        if (decoded is Map<String, dynamic>) {
-          code = (decoded['code'] as String?) ?? code;
-          message = (decoded['message'] as String?) ?? message;
+        final req = await _http!.getUrl(uri).timeout(_timeout);
+        req.headers.set('Accept', 'application/json');
+        if (accessToken != null && accessToken!.isNotEmpty) {
+          req.headers.set('Authorization', 'Bearer $accessToken');
         }
-      } catch (_) {
-        // 错误体不是合法 JSON：保留默认 code/message，不阻断错误抛出。
+        if (ifNoneMatch != null && ifNoneMatch.isNotEmpty) {
+          req.headers.set('If-None-Match', ifNoneMatch);
+        }
+        final res = await req.close().timeout(_timeout);
+        if (res.statusCode == 304) {
+          await res.drain<void>();
+          return const CdnConfigResult.notModified();
+        }
+        final text = await res.transform(utf8.decoder).join();
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          final etag = res.headers.value(HttpHeaders.etagHeader);
+          final json = text.trim().isEmpty
+              ? const <String, dynamic>{}
+              : jsonDecode(text) as Map<String, dynamic>;
+          return CdnConfigResult(etag: etag, config: CdnConfig.fromJson(json));
+        }
+        var code = 'unknown_error';
+        var message = 'HTTP ${res.statusCode}';
+        try {
+          final decoded = jsonDecode(text);
+          if (decoded is Map<String, dynamic>) {
+            code = (decoded['code'] as String?) ?? code;
+            message = (decoded['message'] as String?) ?? message;
+          }
+        } catch (_) {
+          // 错误体不是合法 JSON：保留默认 code/message，不阻断错误抛出。
+        }
+        throw CloudApiException(
+          code: code,
+          message: message,
+          status: res.statusCode,
+        );
+      } on CloudApiException {
+        rethrow;
+      } on TimeoutException {
+        throw const CloudApiException(
+          code: 'network_error',
+          message: '请求超时，请检查网络或服务器地址',
+          status: 0,
+        );
+      } catch (e) {
+        throw CloudApiException(
+          code: 'network_error',
+          message: '网络请求失败：$e',
+          status: 0,
+        );
       }
-      throw CloudApiException(code: code, message: message, status: res.statusCode);
-    } on CloudApiException {
-      rethrow;
-    } on TimeoutException {
-      throw const CloudApiException(
-        code: 'network_error',
-        message: '请求超时，请检查网络或服务器地址',
-        status: 0,
-      );
-    } catch (e) {
-      throw CloudApiException(code: 'network_error', message: '网络请求失败：$e', status: 0);
-    }
-  });
+    },
+  );
 
   // ── CDN 众包遥测上报（Bearer UserAuth；P2 §五契约，由 CdnReportService
   //    每 30min + 启动时上传引擎侧缓冲的 `cdn_pending_reports`）────────────
@@ -667,10 +695,16 @@ class CloudClient {
   /// （服务端单次批量上限），超量由调用方分批；样本元素形状与契约
   /// `samples[]` 一致（host/ip/connect_ms?/throughput_bps?/ok），
   /// `device_hash` 由服务端从鉴权设备 id 派生，本端不发送。成功 204。
-  Future<void> reportCdnSamples(List<Map<String, dynamic>> samples) => _authed(() async {
-    if (samples.isEmpty) return;
-    await _request('POST', '/cdn/report', body: {'samples': samples}, authed: true);
-  });
+  Future<void> reportCdnSamples(List<Map<String, dynamic>> samples) =>
+      _authed(() async {
+        if (samples.isEmpty) return;
+        await _request(
+          'POST',
+          '/cdn/report',
+          body: {'samples': samples},
+          authed: true,
+        );
+      });
 
   // ── 内部实现 ─────────────────────────────────────────────────────────
 
@@ -810,7 +844,11 @@ class CloudClient {
       } catch (_) {
         // 错误体不是合法 JSON：保留默认 code/message，不阻断错误抛出。
       }
-      throw CloudApiException(code: code, message: message, status: res.statusCode);
+      throw CloudApiException(
+        code: code,
+        message: message,
+        status: res.statusCode,
+      );
     } on CloudApiException {
       rethrow;
     } on TimeoutException {

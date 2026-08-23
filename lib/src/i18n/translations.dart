@@ -593,6 +593,8 @@ class S {
       _r('accountDeviceVerifySubtitle', {'email': email});
   String get accountDeviceVerifySubtitleGeneric =>
       _r('accountDeviceVerifySubtitleGeneric');
+  String get accountDeviceVerifyReplacementNotice =>
+      _r('accountDeviceVerifyReplacementNotice');
   String get accountRegisterVerifyTitle => _r('accountRegisterVerifyTitle');
   String accountRegisterVerifySubtitle(String email) =>
       _r('accountRegisterVerifySubtitle', {'email': email});

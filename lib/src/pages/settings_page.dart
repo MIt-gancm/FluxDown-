@@ -16497,6 +16497,7 @@ class _DeleteDeviceDialogState extends State<_DeleteDeviceDialog> {
 
 class _CodeVerifyForm extends StatelessWidget {
   final String subtitle;
+  final String? notice;
   final TextEditingController codeController;
   final int ttlRemaining;
   final int resendRemaining;
@@ -16508,6 +16509,7 @@ class _CodeVerifyForm extends StatelessWidget {
 
   const _CodeVerifyForm({
     required this.subtitle,
+    this.notice,
     required this.codeController,
     required this.ttlRemaining,
     required this.resendRemaining,
@@ -16531,6 +16533,24 @@ class _CodeVerifyForm extends StatelessWidget {
           subtitle,
           style: TextStyle(fontSize: 12, height: 1.5, color: c.textMuted),
         ),
+        if (notice != null) ...[
+          const SizedBox(height: 8),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+            decoration: BoxDecoration(
+              color: c.statusWarning.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              notice!,
+              style: TextStyle(
+                fontSize: 11.5,
+                height: 1.4,
+                color: c.statusWarning,
+              ),
+            ),
+          ),
+        ],
         const SizedBox(height: 14),
         ShadInput(
           controller: codeController,
@@ -17144,6 +17164,7 @@ class _LoginDialogContentState extends State<_LoginDialogContent> {
   bool _busy = false;
   String? _error;
   bool _codeSent = false;
+  bool _willReplaceDevices = false;
 
   Timer? _timer;
   int _ttlRemaining = 0;
@@ -17277,10 +17298,14 @@ class _LoginDialogContentState extends State<_LoginDialogContent> {
       switch (result) {
         case LoginOk():
           Navigator.of(context).pop();
-        case LoginDeviceVerificationRequired(:final ttlSeconds):
+        case LoginDeviceVerificationRequired(
+          :final ttlSeconds,
+          :final willReplaceDevices,
+        ):
           setState(() {
             _busy = false;
             _step = _LoginStep.deviceVerify;
+            _willReplaceDevices = willReplaceDevices;
           });
           _startCountdown(ttlSeconds);
       }
@@ -17356,6 +17381,9 @@ class _LoginDialogContentState extends State<_LoginDialogContent> {
           subtitle: _isNumericAccount
               ? s.accountDeviceVerifySubtitleGeneric
               : s.accountDeviceVerifySubtitle(_account),
+          notice: _willReplaceDevices
+              ? s.accountDeviceVerifyReplacementNotice
+              : null,
           codeController: _codeController,
           ttlRemaining: _ttlRemaining,
           resendRemaining: _resendRemaining,
@@ -17366,6 +17394,7 @@ class _LoginDialogContentState extends State<_LoginDialogContent> {
           onBack: () => setState(() {
             _step = _LoginStep.form;
             _error = null;
+            _willReplaceDevices = false;
             _codeController.clear();
           }),
         ),

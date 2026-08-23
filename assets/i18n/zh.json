@@ -417,6 +417,7 @@
   "accountDeviceVerifyTitle": "新设备验证",
   "accountDeviceVerifySubtitle": "此设备尚未登录过，请输入发送到 {email} 的验证码以信任该设备",
   "accountDeviceVerifySubtitleGeneric": "此设备尚未登录过，请输入发送到你账号绑定邮箱的验证码以信任该设备",
+  "accountDeviceVerifyReplacementNotice": "设备数量已达上限，验证完成后将退出最久未使用的设备",
   "accountRegisterVerifyTitle": "验证邮箱",
   "accountRegisterVerifySubtitle": "我们已向 {email} 发送验证码，输入以完成注册",
   "accountCodeExpireIn": "验证码 {seconds} 秒后过期",
