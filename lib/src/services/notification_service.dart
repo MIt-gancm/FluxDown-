@@ -202,6 +202,12 @@ class NotificationService {
   static const _categorySingle = 'fluxdown_download_complete';
   static const _categoryBatch = 'fluxdown_batch_complete';
 
+  /// Android 通知渠道 ID 必须稳定，变更会新建渠道。
+  static const _androidChannelId = 'download_complete';
+
+  /// Android 通知小图标资源名。
+  static const _androidSmallIcon = 'ic_notification';
+
   /// Linux/macOS：整批一条系统通知（单文件显示文件名，多文件显示汇总），
   /// 带"打开文件夹/打开文件"动作按钮（批量仅"打开文件夹"）。
   ///
@@ -229,6 +235,12 @@ class NotificationService {
 
     try {
       final details = NotificationDetails(
+        android: AndroidNotificationDetails(
+          _androidChannelId,
+          s.notifyOnComplete,
+          channelDescription: s.notifyOnCompleteDesc,
+          icon: _androidSmallIcon,
+        ),
         linux: LinuxNotificationDetails(
           defaultActionName: 'open',
           actions: [
@@ -313,6 +325,7 @@ class NotificationService {
           appUserModelId: _appUserModelId,
           guid: _appGuid,
         ),
+        android: AndroidInitializationSettings(_androidSmallIcon),
         linux: linux,
         macOS: darwin,
       );

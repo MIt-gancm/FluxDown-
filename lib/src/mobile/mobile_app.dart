@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart' show MaterialPageRoute;
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
@@ -68,44 +69,56 @@ class _FluxDownMobileAppState extends State<FluxDownMobileApp> {
     final FluxThemeTokens tokens = widget.themeProvider.activeTokens(context);
     final theme = buildThemeFromTokens(tokens);
 
-    return LocaleScope(
-      s: widget.localeNotifier.s,
-      child: FluxThemeScope(
-        tokens: tokens,
-        child: ShadTheme(
-          data: theme,
-          child: Directionality(
-            textDirection: TextDirection.ltr,
-            child: DefaultTextStyle(
-              style: theme.textTheme.p.copyWith(
-                color: theme.colorScheme.foreground,
-              ),
-              child: ShadToaster(
-                child: ShadSonner(
-                  alignment: Alignment.topCenter,
-                  padding: EdgeInsets.only(
-                    top: MediaQuery.of(context).padding.top + 12,
-                    left: 16,
-                    right: 16,
-                    bottom: 16,
-                  ),
-                  child: WidgetsApp(
-                    navigatorKey: _navigatorKey,
-                    color: theme.colorScheme.primary,
-                    debugShowCheckedModeBanner: false,
-                    home: WithForegroundTask(
-                      child: MobileShell(
-                        themeProvider: widget.themeProvider,
-                        localeNotifier: widget.localeNotifier,
-                      ),
+    // Android 系统栏图标按当前主题反色；亮色主题用深色图标，暗色主题反之。
+    final iconBrightness = tokens.appearance == Brightness.dark
+        ? Brightness.light
+        : Brightness.dark;
+    final overlayStyle = SystemUiOverlayStyle(
+      statusBarIconBrightness: iconBrightness,
+      systemNavigationBarIconBrightness: iconBrightness,
+    );
+
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: overlayStyle,
+      child: LocaleScope(
+        s: widget.localeNotifier.s,
+        child: FluxThemeScope(
+          tokens: tokens,
+          child: ShadTheme(
+            data: theme,
+            child: Directionality(
+              textDirection: TextDirection.ltr,
+              child: DefaultTextStyle(
+                style: theme.textTheme.p.copyWith(
+                  color: theme.colorScheme.foreground,
+                ),
+                child: ShadToaster(
+                  child: ShadSonner(
+                    alignment: Alignment.topCenter,
+                    padding: EdgeInsets.only(
+                      top: MediaQuery.of(context).padding.top + 12,
+                      left: 16,
+                      right: 16,
+                      bottom: 16,
                     ),
-                    pageRouteBuilder:
-                        <T>(RouteSettings settings, WidgetBuilder builder) {
-                          return MaterialPageRoute<T>(
-                            settings: settings,
-                            builder: builder,
-                          );
-                        },
+                    child: WidgetsApp(
+                      navigatorKey: _navigatorKey,
+                      color: theme.colorScheme.primary,
+                      debugShowCheckedModeBanner: false,
+                      home: WithForegroundTask(
+                        child: MobileShell(
+                          themeProvider: widget.themeProvider,
+                          localeNotifier: widget.localeNotifier,
+                        ),
+                      ),
+                      pageRouteBuilder:
+                          <T>(RouteSettings settings, WidgetBuilder builder) {
+                            return MaterialPageRoute<T>(
+                              settings: settings,
+                              builder: builder,
+                            );
+                          },
+                    ),
                   ),
                 ),
               ),
