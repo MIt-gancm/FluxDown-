@@ -74,7 +74,7 @@ libc = "0.2"
 librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
 # default-features = false：去掉 default-tls（native-tls→openssl，Android 交叉编译无 openssl）；
 # 其余默认特性显式保留，Linux/macOS 行为不变
-reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "cookies", "json", "socks", "charset", "http2", "system-proxy", "macos-system-configuration"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "cookies", "json", "socks", "charset", "http2", "system-proxy", "macos-system-configuration"] }
 
 [dev-dependencies]
 http = "1.4.0"
