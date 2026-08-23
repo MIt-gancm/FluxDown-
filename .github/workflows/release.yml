@@ -149,29 +149,15 @@ jobs:
           restore-keys: |
             engine-verify-${{ runner.os }}-
 
-      - name: Test vendored librqbit MSE
-        if: needs.changes.outputs.engine == 'true'
-        run: |
-          cargo test --manifest-path native/engine/vendor/librqbit/Cargo.toml --lib mse
-          cargo test --manifest-path native/engine/vendor/librqbit/Cargo.toml --lib read_buf
-          cargo test --manifest-path native/engine/vendor/librqbit/Cargo.toml --lib fresh_redial
-          cargo test --manifest-path native/engine/vendor/librqbit/Cargo.toml --lib --no-run
-
-      - name: Verify engine workspace
-        if: needs.changes.outputs.engine == 'true'
-        run: |
-          cargo check --locked -p fluxdown_engine
-          cargo test --locked -p fluxdown_engine
-          cargo fmt --check
-          cargo fmt --manifest-path native/engine/vendor/librqbit/Cargo.toml -- --check
-
       - name: Verify librqbit patch source
+        id: librqbit
         if: needs.changes.outputs.engine == 'true'
         shell: bash
         run: |
           cargo metadata --locked --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
           python - "$RUNNER_TEMP/cargo-metadata.json" <<'PY'
           import json
+          import os
           import pathlib
           import sys
 
@@ -181,14 +167,36 @@ jobs:
               raise SystemExit(f"expected one librqbit package, found {len(packages)}")
           package = packages[0]
           manifest = pathlib.Path(package["manifest_path"]).as_posix()
-          if package["version"] != "8.1.1":
+          if package["version"] != "9.0.0":
               raise SystemExit(f"unexpected librqbit version: {package['version']}")
-          if package["source"] is not None:
-              raise SystemExit(f"librqbit still resolves from registry: {package['source']}")
-          if not manifest.endswith("/native/engine/vendor/librqbit/Cargo.toml"):
-              raise SystemExit(f"unexpected librqbit manifest: {manifest}")
-          print(f"verified vendored librqbit {package['version']}: {manifest}")
+          source = package["source"] or ""
+          prefix = "git+https://github.com/lingdiansr/rqbit?rev="
+          if not source.startswith(prefix):
+              raise SystemExit(f"librqbit must resolve from a pinned MSE fork revision, got: {source}")
+          requested_rev, separator, resolved_rev = source.removeprefix(prefix).partition("#")
+          if not separator or requested_rev != resolved_rev:
+              raise SystemExit(f"librqbit requested and resolved revisions differ: {source}")
+          if "/native/engine/vendor/" in manifest:
+              raise SystemExit(f"librqbit must not resolve from the vendored copy: {manifest}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"manifest={manifest}", file=output)
+          print(f"verified fork librqbit {package['version']}: {manifest} ({source})")
           PY
+
+      - name: Test resolved librqbit MSE fork
+        if: needs.changes.outputs.engine == 'true'
+        run: |
+          cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib mse
+          cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib read_buf
+          cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib fresh_redial
+          cargo test --manifest-path "${{ steps.librqbit.outputs.manifest }}" --lib --no-run
+
+      - name: Verify engine workspace
+        if: needs.changes.outputs.engine == 'true'
+        run: |
+          cargo check --locked -p fluxdown_engine
+          cargo test --locked -p fluxdown_engine
+          cargo fmt --check
 
   # ── 并行 Job 1: 构建 Windows 安装包（x64 + ARM64）──
   build-windows:
