@@ -45,8 +45,7 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
   /// 新建下载弹层已打开时，后续协议请求会把完整元数据合入表单。
   bool _downloadSheetOpen = false;
   final _externalReturn = ExternalReturnStateMachine();
-  final _shareAppendCtrl =
-      StreamController<SharedDownloadRequest>.broadcast();
+  final _shareAppendCtrl = StreamController<SharedDownloadRequest>.broadcast();
 
   /// 自动更新检查只触发一次（等配置加载完成后）。
   bool _updateCheckScheduled = false;
@@ -75,6 +74,12 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
     _settings.addListener(_maybeScheduleUpdateCheck);
     UpdateService.instance.addListener(_onUpdateChanged);
     _maybeScheduleUpdateCheck();
+  }
+
+  @override
+  void didUpdateWidget(covariant MobileShell oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    ForegroundServiceManager.instance.updateStrings(widget.localeNotifier.s);
   }
 
   /// 配置加载完成且开启了自动检查 → 延迟数秒触发一次版本检查
@@ -205,9 +210,12 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
         initialHeaders: request.headers,
         appendRequests: _shareAppendCtrl.stream,
       );
-      if (externalFlowId != null && _externalReturn.beginReturn(externalFlowId)) {
+      if (externalFlowId != null &&
+          _externalReturn.beginReturn(externalFlowId)) {
         final returned = await ShareIntentService.returnToSourceApp();
-        if (!returned && _externalReturn.returnFailed(externalFlowId) && mounted) {
+        if (!returned &&
+            _externalReturn.returnFailed(externalFlowId) &&
+            mounted) {
           setState(() {});
         }
       }
@@ -245,10 +253,6 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused) {
-      _externalReturn.onPaused();
-      return;
-    }
     if (state == AppLifecycleState.resumed) {
       if (_externalReturn.onResumed() && mounted) setState(() {});
       // 文件跟踪：回到前台时用户可能刚在文件管理器删/移了文件，触发一次重扫。

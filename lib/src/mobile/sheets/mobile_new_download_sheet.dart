@@ -4,7 +4,6 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 
-import '../../bindings/bindings.dart';
 import '../../i18n/locale_provider.dart';
 import '../../models/download_controller.dart';
 import '../../models/download_queue.dart';

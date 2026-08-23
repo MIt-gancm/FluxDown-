@@ -3,7 +3,6 @@ enum ExternalReturnPhase { normal, externalSheet, returningToSource }
 class ExternalReturnStateMachine {
   var _phase = ExternalReturnPhase.normal;
   var _flowId = 0;
-  var _wasPaused = false;
 
   ExternalReturnPhase get phase => _phase;
   bool get shouldHideMainUi => _phase != ExternalReturnPhase.normal;
@@ -19,7 +18,6 @@ class ExternalReturnStateMachine {
       return false;
     }
     _phase = ExternalReturnPhase.returningToSource;
-    _wasPaused = false;
     return true;
   }
 
@@ -28,12 +26,6 @@ class ExternalReturnStateMachine {
       return false;
     }
     _phase = ExternalReturnPhase.normal;
-    return true;
-  }
-
-  bool onPaused() {
-    if (_phase != ExternalReturnPhase.returningToSource) return false;
-    _wasPaused = true;
     return true;
   }
 
@@ -47,7 +39,6 @@ class ExternalReturnStateMachine {
       return false;
     }
     _phase = ExternalReturnPhase.normal;
-    _wasPaused = false;
     return true;
   }
 }

@@ -8,7 +8,6 @@ import io.flutter.embedding.android.FlutterActivityLaunchConfigs.BackgroundMode
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.TimeUnit
 
 /**
  * FluxDown 外部下载唤起入口（透明窗口弹下载框）。
@@ -27,6 +26,13 @@ class ExternalDownloadActivity : FlutterActivity() {
 
     override fun getCachedEngineId(): String? =
         if (FluxdownEngine.cached != null) FluxdownEngine.ENGINE_ID else null
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
+
+    override fun detachFromFlutterEngine() {
+        super.detachFromFlutterEngine()
+        finishAndRemoveTask()
+    }
 
     private var shareChannel: MethodChannel? = null
     /** 冷启动时后台解析暂存的分享内容，Dart 首次 getInitialShare 时取走。 */
@@ -48,9 +54,6 @@ class ExternalDownloadActivity : FlutterActivity() {
 
     private fun bindAndDeliver(engine: FlutterEngine) {
         FluxdownEngine.cacheIfAbsent(engine)
-        // 透明弹窗接管渲染：结束仍存活、持有已解绑 FlutterView 的 MainActivity，
-        // 避免其之后被重新打开时黑屏（共享引擎渲染面同一时刻只能挂一个 view）。
-        FluxdownEngine.releaseMainHost()
         // 外部弹窗内同样能触发存储相关操作（换目录 / 装 APK / 打开文件）。
         AppStorage.bind(engine, this)
         if (shareChannel == null) {
@@ -60,19 +63,17 @@ class ExternalDownloadActivity : FlutterActivity() {
             ).apply {
                 setMethodCallHandler { call, result ->
                     when (call.method) {
-                        // Dart 侧就绪后主动拉取冷启动分享（等待后台解析完成即取走）
+                        // Dart 侧就绪后主动拉取冷启动分享；解析完成后异步回传，
+                        // 绝不能在 Android 主线程等待 Future。
                         "getInitialShare" -> {
-                            result.success(
-                                try {
-                                    pendingShare.get(2000, TimeUnit.MILLISECONDS)
-                                } catch (_: Exception) {
-                                    null
-                                },
-                            )
+                            pendingShare.whenComplete { shared, _ ->
+                                runOnUiThread { result.success(shared) }
+                            }
                         }
-                        // 关闭弹窗后把本 external 任务移到后台，露出来源应用
+                        // 关闭弹窗后显式移除 external 独立任务，露出来源应用。
                         "moveTaskToBack" -> {
-                            result.success(moveTaskToBack(true))
+                            finishAndRemoveTask()
+                            result.success(true)
                         }
                         else -> result.notImplemented()
                     }
@@ -84,10 +85,11 @@ class ExternalDownloadActivity : FlutterActivity() {
         // 后台线程解析 intent（超大输入不阻塞主线程）。冷启动（引擎由本 Activity 新建）
         // 交给 Dart getInitialShare 取走；应用已在运行（复用引擎）则直接 onShare 推送。
         Thread {
-            val shared = extractShared(intent) ?: return@Thread
+            val shared = extractShared(intent)
             if (createdEngine) {
+                // 无有效载荷也必须完成 Future，避免 Dart 侧永久等待。
                 pendingShare.complete(shared)
-            } else {
+            } else if (shared != null) {
                 runOnUiThread { shareChannel?.invokeMethod("onShare", shared) }
             }
         }.start()
@@ -97,6 +99,14 @@ class ExternalDownloadActivity : FlutterActivity() {
         if (!AppStorage.onActivityResult(this, requestCode, resultCode, data)) {
             super.onActivityResult(requestCode, resultCode, data)
         }
+    }
+
+    override fun onDestroy() {
+        pendingShare.complete(null)
+        shareChannel?.setMethodCallHandler(null)
+        shareChannel = null
+        AppStorage.unbind(this)
+        super.onDestroy()
     }
 
     /** 热启动（singleInstance）：external 任务已在/被置顶，新分享 intent 到达。 */

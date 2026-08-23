@@ -346,10 +346,11 @@ jobs:
           npm run build:firefox
           mkdir -p ../build/extension
           (cd .output && zip -qr "../../build/extension/FluxDown-${VERSION}-chrome.zip" chrome-mv3)
-          npx web-ext build --source-dir .output/firefox-mv2 --artifacts-dir ../build/extension --overwrite-dest
-          FIREFOX_ZIP=$(find ../build/extension -maxdepth 1 -name '*.zip' -print -quit)
-          test -n "$FIREFOX_ZIP"
-          mv "$FIREFOX_ZIP" "../build/extension/FluxDown-${VERSION}-firefox.zip"
+          npx web-ext build \
+            --source-dir .output/firefox-mv2 \
+            --artifacts-dir ../build/extension \
+            --filename "FluxDown-${VERSION}-firefox.zip" \
+            --overwrite-dest
       - name: Upload extension test artifacts
         uses: actions/upload-artifact@v4
         with:

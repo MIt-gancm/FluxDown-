@@ -12,6 +12,7 @@ import android.provider.DocumentsContract
 import android.provider.Settings
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.lang.ref.WeakReference
 
 /**
  * FluxDown 移动端本地存储能力（SAF 目录选择 / 公共目录写权限 / 应用内更新 /
@@ -26,14 +27,37 @@ object AppStorage {
     private const val REQUEST_PICK_DIR = 0x4D01
     private const val REQUEST_WRITE_PERM = 0x4D02
 
+    private var channel: MethodChannel? = null
+    private var boundActivity: WeakReference<Activity>? = null
     private var pendingResult: MethodChannel.Result? = null
+    private var pendingActivity: WeakReference<Activity>? = null
 
     /** 在给定引擎上登记 `com.fluxdown/storage` channel。 */
     fun bind(engine: FlutterEngine, activity: Activity) {
-        MethodChannel(
+        val previousActivity = boundActivity?.get()
+        if (previousActivity === activity && channel != null) return
+        if (previousActivity != null) {
+            unbind(previousActivity)
+        } else {
+            channel?.setMethodCallHandler(null)
+            channel = null
+            if (pendingResult != null) {
+                pendingResult?.error(
+                    "activity_destroyed",
+                    "directory picker host was destroyed",
+                    null,
+                )
+                pendingResult = null
+                pendingActivity = null
+            }
+        }
+        val nextChannel = MethodChannel(
             engine.dartExecutor.binaryMessenger,
             CHANNEL,
-        ).setMethodCallHandler { call, result ->
+        )
+        channel = nextChannel
+        boundActivity = WeakReference(activity)
+        nextChannel.setMethodCallHandler { call, result ->
             when (call.method) {
                 "pickDirectory" -> pickDirectory(activity, result)
                 "hasAllFilesAccess" -> result.success(hasAllFilesAccess(activity))
@@ -54,6 +78,19 @@ object AppStorage {
         }
     }
 
+    /** 仅由当前 channel 宿主解绑，避免旧 Activity 销毁时清掉新宿主的 handler。 */
+    fun unbind(activity: Activity) {
+        if (boundActivity?.get() !== activity) return
+        channel?.setMethodCallHandler(null)
+        channel = null
+        boundActivity = null
+        if (pendingActivity?.get() === activity) {
+            pendingResult?.error("activity_destroyed", "directory picker host was destroyed", null)
+            pendingResult = null
+            pendingActivity = null
+        }
+    }
+
     /** 目录选择器结果统一入口。返回 true=已消费；false=交由 Activity 默认处理。 */
     fun onActivityResult(
         activity: Activity,
@@ -62,8 +99,10 @@ object AppStorage {
         data: Intent?,
     ): Boolean {
         if (requestCode != REQUEST_PICK_DIR) return false
+        if (pendingActivity?.get() !== activity) return false
         val result = pendingResult ?: return true
         pendingResult = null
+        pendingActivity = null
         val uri = data?.data
         if (resultCode != Activity.RESULT_OK || uri == null) {
             result.success(null) // 用户取消
@@ -116,6 +155,7 @@ object AppStorage {
             return
         }
         pendingResult = result
+        pendingActivity = WeakReference(activity)
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
             addFlags(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
@@ -127,6 +167,7 @@ object AppStorage {
             activity.startActivityForResult(intent, REQUEST_PICK_DIR)
         } catch (e: Exception) {
             pendingResult = null
+            pendingActivity = null
             result.error("unavailable", e.message, null)
         }
     }

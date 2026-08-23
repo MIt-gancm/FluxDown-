@@ -54,7 +54,6 @@
             android:exported="true"
             android:launchMode="singleInstance"
             android:taskAffinity=""
-            android:noHistory="true"
             android:excludeFromRecents="true"
             android:theme="@style/ExternalTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
@@ -121,6 +120,8 @@
             android:targetActivity="com.fluxdown.app.ExternalDownloadActivity">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="http" />
                 <data android:scheme="https" />
             </intent-filter>

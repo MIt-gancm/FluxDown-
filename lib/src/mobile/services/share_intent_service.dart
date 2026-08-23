@@ -8,7 +8,7 @@ import '../../services/log_service.dart';
 
 const _tag = 'ShareIntent';
 
-/// 系统分享 / URL scheme 接入桥（对应 Android [MainActivity] 的
+/// 系统分享 / URL scheme 接入桥（对应 Android [ExternalDownloadActivity] 的
 /// `com.fluxdown/share` channel 与 iOS [AppDelegate] 的同名 channel）。
 ///
 /// 两端约定：

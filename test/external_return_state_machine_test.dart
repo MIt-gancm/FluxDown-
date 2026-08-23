@@ -9,7 +9,15 @@ void main() {
     expect(state.shouldHideMainUi, isTrue);
     expect(state.beginReturn(flow), isTrue);
     expect(state.shouldHideMainUi, isTrue);
-    expect(state.onPaused(), isTrue);
+    expect(state.onResumed(), isTrue);
+    expect(state.shouldHideMainUi, isFalse);
+  });
+
+  test('restores the host on resume even when paused was not delivered', () {
+    final state = ExternalReturnStateMachine();
+    final flow = state.beginExternalSheet();
+
+    expect(state.beginReturn(flow), isTrue);
     expect(state.onResumed(), isTrue);
     expect(state.shouldHideMainUi, isFalse);
   });
