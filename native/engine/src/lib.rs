@@ -223,6 +223,11 @@ impl Engine {
         sink: Arc<dyn EventSink>,
         selector: Arc<dyn HostSelection>,
     ) -> Result<Self, EngineError> {
+        // librqbit 9 fork 启用了 rustls 的 aws_lc_rs 特性，会把全局默认 TLS
+        // 供应商从 ring 静默切成 aws-lc-rs，导致 Android/iOS 上所有 HTTPS 握手
+        // 失败（纯 HTTP 不受影响）。此处强制锁回 ring；若已有 provider 被装则
+        // install_default 返回 Err，可安全忽略。
+        let _ = rustls::crypto::ring::default_provider().install_default();
         // 读回持久化的域名连接上限观察（过期/旧版本数据在加载时丢弃）。
         segment_coordinator::load_domain_conn_caps(&db).await;
         // 读回持久化的 CDN 节点健康度（多节点聚合的跨任务先验，同上范式）。
