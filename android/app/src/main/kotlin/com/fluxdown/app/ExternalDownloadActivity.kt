@@ -8,6 +8,7 @@ import io.flutter.embedding.android.FlutterActivityLaunchConfigs.BackgroundMode
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.util.concurrent.CompletableFuture
+import org.json.JSONObject
 
 /**
  * FluxDown 外部下载唤起入口（透明窗口弹下载框）。
@@ -136,9 +137,9 @@ class ExternalDownloadActivity : FlutterActivity() {
 
     /**
      * 从 intent 提取可下载链接及协议携带的请求上下文。
-     * `fluxdown://download` 可携带 filename/cookies/referrer/headers；普通
-     * ACTION_VIEW/ACTION_SEND 只有 URL。所有此入口 intent 均标记 external，
-     * 供 Dart 在弹层关闭后返回来源应用。
+     * `fluxdown://download` 可携带 filename/cookies/referrer/headers；X 浏览器
+     * 的普通 ACTION_VIEW 可通过 extra 携带 User-Agent/Cookie/Referer。
+     * 所有此入口 intent 均标记 external，供 Dart 在弹层关闭后返回来源应用。
      */
     private fun extractShared(intent: Intent?): HashMap<String, String>? {
         if (intent == null) return null
@@ -168,7 +169,21 @@ class ExternalDownloadActivity : FlutterActivity() {
                         null
                     }
                 } else {
-                    sharePayload(data, external = true)
+                    val userAgent = intent.getStringExtra("User-Agent")?.trim().orEmpty()
+                    val headers = if (userAgent.isEmpty()) {
+                        ""
+                    } else {
+                        JSONObject()
+                            .put("User-Agent", userAgent.take(MAX_HEADER_VALUE_LEN))
+                            .toString()
+                    }
+                    sharePayload(
+                        url = data,
+                        cookies = intent.getStringExtra("Cookie").orEmpty(),
+                        referrer = intent.getStringExtra("Referer")?.trim().orEmpty(),
+                        headers = headers,
+                        external = true,
+                    )
                 }
             }
             else -> null
@@ -210,6 +225,7 @@ class ExternalDownloadActivity : FlutterActivity() {
         private const val MAX_NAME_LEN = 512
         private const val MAX_COOKIES_LEN = 65536
         private const val MAX_REFERRER_LEN = 8192
+        private const val MAX_HEADER_VALUE_LEN = 8192
         private const val MAX_HEADERS_JSON_LEN = 131072
     }
 }
