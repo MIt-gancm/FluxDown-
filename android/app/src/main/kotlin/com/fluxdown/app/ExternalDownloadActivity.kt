@@ -20,7 +20,8 @@ import org.json.JSONObject
  *
  * 与 [MainActivity] 共享同一个 FlutterEngine（见 [FluxdownEngine]）。share 与
  * storage channel 优先在 [configureFlutterEngine] 绑定，确保 Dart 冷启动拉取分享前
- * handler 已就绪；[onStart] 保留幂等兜底。
+ * handler 已就绪；[onStart] 保留幂等兜底。另作为 MainActivity 转发老调用方
+ * 下载请求的落点：把带下载参数的 intent 原样转到这里即可复用完整弹窗流程。
  */
 class ExternalDownloadActivity : FlutterActivity() {
     override fun getBackgroundMode(): BackgroundMode = BackgroundMode.transparent
