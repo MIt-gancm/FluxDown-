@@ -39,12 +39,52 @@ pub fn desktop_executable() -> Option<PathBuf> {
     path.is_file().then_some(path)
 }
 
+/// 引擎下载中临时文件后缀（`fluxdown_engine::downloader::TEMP_EXT`）；agent 不依赖引擎，
+/// 此处镜像同一字面量。
+const DOWNLOADING_SUFFIX: &str = ".fdownloading";
+
+/// 用系统默认程序打开任务产物；最终文件尚不存在（下载中 / 暂停 / 已被移走）时报错，
+/// 不交给系统命令静默失败。
 pub fn open_task(task: &fluxdown_protocol::TaskDto) -> Result<(), PlatformError> {
-    launch_path(&PathBuf::from(&task.save_dir).join(&task.file_name), false)
+    let path = PathBuf::from(&task.save_dir).join(&task.file_name);
+    if task.file_name.is_empty() || !path.exists() {
+        return Err(PlatformError::Failed(format!(
+            "task file not found: {}",
+            path.display()
+        )));
+    }
+    launch_path(&path, false)
 }
 
+/// 在文件管理器中定位任务；目标见 [`reveal_target`]。
 pub fn reveal_task(task: &fluxdown_protocol::TaskDto) -> Result<(), PlatformError> {
-    launch_path(&PathBuf::from(&task.save_dir).join(&task.file_name), true)
+    let (path, reveal) = reveal_target(Path::new(&task.save_dir), &task.file_name)?;
+    launch_path(&path, reveal)
+}
+
+/// 定位目标按优先级：最终产物 → 下载中临时文件 `<name>.fdownloading` → 保存目录本身
+/// （`false` = 打开目录而非选中条目）。未完成任务的最终文件不存在，直接 `open -R` /
+/// `explorer /select` 会静默失败或跳到无关目录。保存目录也不存在时报错。
+fn reveal_target(save_dir: &Path, file_name: &str) -> Result<(PathBuf, bool), PlatformError> {
+    if !file_name.is_empty() {
+        let final_path = save_dir.join(file_name);
+        if final_path.exists() {
+            return Ok((final_path, true));
+        }
+        let mut temp = final_path.into_os_string();
+        temp.push(DOWNLOADING_SUFFIX);
+        let temp = PathBuf::from(temp);
+        if temp.exists() {
+            return Ok((temp, true));
+        }
+    }
+    if save_dir.is_dir() {
+        return Ok((save_dir.to_path_buf(), false));
+    }
+    Err(PlatformError::Failed(format!(
+        "task directory not found: {}",
+        save_dir.display()
+    )))
 }
 
 /// 用系统默认程序打开 `path`；`reveal` 为 true 时改为在文件管理器中定位。
@@ -173,9 +213,15 @@ pub fn set_url_protocol(scheme: &str, enabled: bool) -> Result<(), PlatformError
 }
 
 #[cfg(target_os = "linux")]
-fn launch_path(path: &Path, _reveal: bool) -> Result<(), PlatformError> {
+fn launch_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
+    // xdg-open 无「选中」语义：定位时打开所在目录，避免直接打开（未完成的）文件。
+    let target = if reveal {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
     std::process::Command::new("xdg-open")
-        .arg(path)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -349,5 +395,41 @@ mod tests {
         assert!(!should_launch_for_prompt(1, 0, 20_000));
         assert!(!should_launch_for_prompt(0, 15_000, 20_000));
         assert!(should_launch_for_prompt(0, 0, 10_000));
+    }
+
+    #[test]
+    fn reveal_target_prefers_final_then_temp_then_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown-agent-reveal-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        // 暂停 / 下载中：只有临时文件。
+        let temp = dir.join("a.dmg.fdownloading");
+        std::fs::write(&temp, b"partial").expect("write temp");
+        assert_eq!(reveal_target(&dir, "a.dmg").expect("temp"), (temp, true));
+
+        // 已完成：最终文件优先。
+        let final_path = dir.join("a.dmg");
+        std::fs::write(&final_path, b"done").expect("write final");
+        assert_eq!(
+            reveal_target(&dir, "a.dmg").expect("final"),
+            (final_path, true)
+        );
+
+        // 尚未落盘（排队 / 名称未知）：打开保存目录。
+        assert_eq!(
+            reveal_target(&dir, "missing.bin").expect("dir"),
+            (dir.clone(), false)
+        );
+        assert_eq!(reveal_target(&dir, "").expect("dir"), (dir.clone(), false));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(matches!(
+            reveal_target(&dir, "a.dmg"),
+            Err(PlatformError::Failed(_))
+        ));
     }
 }
