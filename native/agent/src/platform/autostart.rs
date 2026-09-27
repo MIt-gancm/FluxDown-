@@ -8,21 +8,91 @@
 //!   升级后原条目被原地改写而不是遗留两份）。
 //! - Linux：`~/.config/autostart/fluxdown.desktop`（XDG autostart）。
 //!
-//! “已启用”要求条目以 `--autostart` 指向当前 agent；程序移动/升级后旧条目视为未启用，
-//! 用户重新开启即覆盖为新路径。[`targets`] 只判断条目是否指向某个可执行文件，用于识别
-//! 并迁移旧版直接拉起桌面程序的条目。
+//! “已注册”要求条目以 `--autostart` 指向当前 agent；程序移动/升级后旧条目视为未注册，
+//! 用户重新开启即覆盖为新路径。“已启用”= 已注册且未被系统级开关禁用（Windows
+//! `Explorer\StartupApproved\Run` 首字节为奇数；XDG `Hidden=true` /
+//! `X-GNOME-Autostart-enabled=false`）。
+//!
+//! 与 Flutter 客户端（`lib/src/services/autostart_service.dart`）同一契约：
+//! [`enable`] 是用户在应用内的明确开启，写入条目并清除系统级禁用标记；
+//! [`retarget`] 只供启动时的自动迁移使用，只改写启动目标，**绝不**改变系统级启用状态——
+//! 用户在系统设置 / 任务管理器 / 桌面环境里关掉的自启不能被应用重新打开。
+//! [`targets`] 只判断条目是否指向某个可执行文件，用于识别并迁移旧版直接拉起桌面程序的条目。
+
+/// Windows `StartupApproved\Run` 值：缺失或为空 = 启用；首字节奇数 = 用户在系统设置 /
+/// 任务管理器里禁用。
+#[cfg(any(target_os = "windows", test))]
+fn startup_approved(value: Option<&[u8]>) -> bool {
+    value
+        .and_then(|bytes| bytes.first())
+        .is_none_or(|flag| flag % 2 == 0)
+}
+
+/// `[Desktop Entry]` 组内的 `key=value` 行；`=` 两侧空白忽略。
+#[cfg(any(target_os = "linux", test))]
+fn desktop_entry_lines(content: &str) -> impl Iterator<Item = (usize, &str, &str)> {
+    let mut in_entry = false;
+    content
+        .split('\n')
+        .enumerate()
+        .filter_map(move |(index, raw)| {
+            let line = raw.trim();
+            if line.starts_with('[') {
+                in_entry = line == "[Desktop Entry]";
+                return None;
+            }
+            if !in_entry {
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (index, key, value.trim()))
+        })
+}
+
+/// 条目被桌面环境禁用：`Hidden=true`（XDG 规范）或 `X-GNOME-Autostart-enabled=false`。
+#[cfg(any(target_os = "linux", test))]
+fn xdg_user_disabled(content: &str) -> bool {
+    desktop_entry_lines(content).any(|(_, key, value)| {
+        (key == "Hidden" && value == "true")
+            || (key == "X-GNOME-Autostart-enabled" && value == "false")
+    })
+}
+
+/// 把 `[Desktop Entry]` 组的 `Exec` 行换成 `exec_line`（缺失则插在组头之后），其余行
+/// 逐字保留；无变化或没有 `[Desktop Entry]` 组时返回 `None`。
+#[cfg(any(target_os = "linux", test))]
+fn xdg_retarget_exec(content: &str, exec_line: &str) -> Option<String> {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    if let Some((index, _, _)) = desktop_entry_lines(content).find(|(_, key, _)| *key == "Exec") {
+        if lines[index] == exec_line {
+            return None;
+        }
+        lines[index] = exec_line;
+        return Some(lines.join("\n"));
+    }
+    let header = lines
+        .iter()
+        .position(|line| line.trim() == "[Desktop Entry]")?;
+    lines.insert(header + 1, exec_line);
+    Some(lines.join("\n"))
+}
 
 #[cfg(target_os = "windows")]
 mod inner {
     use std::path::Path;
 
-    use winreg::RegKey;
-    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, RegType};
+    use winreg::{RegKey, RegValue};
 
     use crate::platform::{AUTOSTART_ARG, PlatformError, registry_executable};
 
     const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const APPROVED_KEY: &str =
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
     const VALUE_NAME: &str = "FluxDown";
+    /// 首字节 2 = 启用；与 Windows 设置、任务管理器及 Flutter `launch_at_startup` 写入格式一致。
+    const APPROVED_ENABLED: [u8; 12] = [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
     pub fn supported(desktop: Option<&Path>) -> bool {
         desktop.is_some()
@@ -38,11 +108,23 @@ mod inner {
         key.get_value::<String, _>(VALUE_NAME).ok()
     }
 
-    pub fn is_enabled(agent: &Path) -> bool {
+    fn approved() -> bool {
+        let value = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(APPROVED_KEY, KEY_READ)
+            .ok()
+            .and_then(|key| key.get_raw_value(VALUE_NAME).ok());
+        super::startup_approved(value.as_ref().map(|value| value.bytes.as_slice()))
+    }
+
+    pub fn is_registered(agent: &Path) -> bool {
         let Ok(exe) = registry_executable(Some(agent)) else {
             return false;
         };
         registered_value().is_some_and(|value| value.eq_ignore_ascii_case(&command_line(&exe)))
+    }
+
+    pub fn is_enabled(agent: &Path) -> bool {
+        is_registered(agent) && approved()
     }
 
     pub fn targets(executable: &Path) -> bool {
@@ -53,27 +135,47 @@ mod inner {
         registered_value().is_some_and(|value| value.to_ascii_lowercase().starts_with(&quoted))
     }
 
-    pub fn enable(agent: &Path) -> Result<(), PlatformError> {
+    pub fn retarget(agent: &Path) -> Result<(), PlatformError> {
         let exe = registry_executable(Some(agent))?;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let (key, _) = hkcu.create_subkey_with_flags(RUN_KEY, KEY_WRITE)?;
         key.set_value(VALUE_NAME, &command_line(&exe))?;
-        tracing::info!(exe, "enabled autostart");
+        tracing::info!(exe, "retargeted autostart entry");
         Ok(())
     }
 
-    pub fn disable() -> Result<(), PlatformError> {
+    pub fn enable(agent: &Path) -> Result<(), PlatformError> {
+        retarget(agent)?;
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-        let key = match hkcu.open_subkey_with_flags(RUN_KEY, KEY_WRITE) {
+        let (key, _) = hkcu.create_subkey_with_flags(APPROVED_KEY, KEY_WRITE)?;
+        key.set_raw_value(
+            VALUE_NAME,
+            &RegValue {
+                bytes: APPROVED_ENABLED.to_vec(),
+                vtype: RegType::REG_BINARY,
+            },
+        )?;
+        tracing::info!("enabled autostart");
+        Ok(())
+    }
+
+    fn delete_value(path: &str) -> Result<(), PlatformError> {
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let key = match hkcu.open_subkey_with_flags(path, KEY_WRITE) {
             Ok(key) => key,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         match key.delete_value(VALUE_NAME) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
         }
+    }
+
+    pub fn disable() -> Result<(), PlatformError> {
+        delete_value(RUN_KEY)?;
+        delete_value(APPROVED_KEY)?;
         tracing::info!("disabled autostart");
         Ok(())
     }
@@ -149,15 +251,26 @@ mod inner {
         std::fs::read_to_string(plist_path().ok()?).ok()
     }
 
-    pub fn is_enabled(agent: &Path) -> bool {
+    /// 「系统设置 → 登录项 → 允许在后台」关闭的状态由 Background Task Management 维护，
+    /// 没有公开 API 可读，这里只能以 plist 是否指向当前 agent 判断。
+    pub fn is_registered(agent: &Path) -> bool {
         content().is_some_and(|content| {
             content.contains(&program_element(agent))
                 && content.contains(&format!("<string>{AUTOSTART_ARG}</string>"))
         })
     }
 
+    pub fn is_enabled(agent: &Path) -> bool {
+        is_registered(agent)
+    }
+
     pub fn targets(executable: &Path) -> bool {
         content().is_some_and(|content| content.contains(&program_element(executable)))
+    }
+
+    /// plist 只有启动目标，迁移即整份重写；登录项的后台许可不在文件里，不受影响。
+    pub fn retarget(agent: &Path) -> Result<(), PlatformError> {
+        enable(agent)
     }
 
     pub fn enable(agent: &Path) -> Result<(), PlatformError> {
@@ -237,8 +350,14 @@ mod inner {
         std::fs::read_to_string(entry_path().ok()?).ok()
     }
 
-    pub fn is_enabled(agent: &Path) -> bool {
+    pub fn is_registered(agent: &Path) -> bool {
         content().is_some_and(|content| content.contains(&exec_line(agent)))
+    }
+
+    pub fn is_enabled(agent: &Path) -> bool {
+        content().is_some_and(|content| {
+            content.contains(&exec_line(agent)) && !super::xdg_user_disabled(&content)
+        })
     }
 
     pub fn targets(executable: &Path) -> bool {
@@ -246,6 +365,20 @@ mod inner {
         content().is_some_and(|content| content.contains(&exec))
     }
 
+    /// 只替换 `Exec` 行，保留 `Hidden` / `X-GNOME-Autostart-enabled` 等用户禁用标记。
+    pub fn retarget(agent: &Path) -> Result<(), PlatformError> {
+        let path = entry_path()?;
+        let content = std::fs::read_to_string(&path)?;
+        let exec = exec_line(agent);
+        let Some(updated) = super::xdg_retarget_exec(&content, exec.trim_end()) else {
+            return Ok(());
+        };
+        std::fs::write(&path, updated)?;
+        tracing::info!(path = %path.display(), "retargeted autostart entry");
+        Ok(())
+    }
+
+    /// 整份重写：用户在应用内明确开启，连同禁用标记一起清掉。
     pub fn enable(agent: &Path) -> Result<(), PlatformError> {
         let path = entry_path()?;
         if let Some(parent) = path.parent() {
@@ -278,12 +411,22 @@ mod inner {
         false
     }
 
+    pub fn is_registered(_agent: &Path) -> bool {
+        false
+    }
+
     pub fn is_enabled(_agent: &Path) -> bool {
         false
     }
 
     pub fn targets(_executable: &Path) -> bool {
         false
+    }
+
+    pub fn retarget(_agent: &Path) -> Result<(), PlatformError> {
+        Err(PlatformError::Unsupported(
+            "autostart is not supported on this platform",
+        ))
     }
 
     pub fn enable(_agent: &Path) -> Result<(), PlatformError> {
@@ -299,4 +442,51 @@ mod inner {
     }
 }
 
-pub use inner::{disable, enable, is_enabled, supported, targets};
+pub use inner::{disable, enable, is_enabled, is_registered, retarget, supported, targets};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_approved_follows_first_byte_parity() {
+        assert!(startup_approved(None));
+        assert!(startup_approved(Some(&[])));
+        assert!(startup_approved(Some(&[2, 0, 0])));
+        assert!(!startup_approved(Some(&[3, 0, 0])));
+    }
+
+    #[test]
+    fn xdg_disable_markers_only_count_inside_desktop_entry() {
+        assert!(xdg_user_disabled(
+            "[Desktop Entry]\nExec=a\nHidden = true\n"
+        ));
+        assert!(xdg_user_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=false\n"
+        ));
+        assert!(!xdg_user_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=true\n"
+        ));
+        assert!(!xdg_user_disabled(
+            "[Desktop Entry]\nExec=a\n[Desktop Action x]\nHidden=true\n"
+        ));
+    }
+
+    #[test]
+    fn xdg_retarget_replaces_exec_and_keeps_disable_markers() {
+        let content = "[Desktop Entry]\nExec=\"/old\" --autostart\nHidden=true\n";
+        assert_eq!(
+            xdg_retarget_exec(content, "Exec=\"/new\" --autostart").as_deref(),
+            Some("[Desktop Entry]\nExec=\"/new\" --autostart\nHidden=true\n")
+        );
+        assert_eq!(
+            xdg_retarget_exec(content, "Exec=\"/old\" --autostart"),
+            None
+        );
+        assert_eq!(
+            xdg_retarget_exec("[Desktop Entry]\nName=x\n", "Exec=y").as_deref(),
+            Some("[Desktop Entry]\nExec=y\nName=x\n")
+        );
+        assert_eq!(xdg_retarget_exec("Name=x\n", "Exec=y"), None);
+    }
+}

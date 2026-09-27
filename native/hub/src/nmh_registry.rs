@@ -19,6 +19,40 @@
 //! outside the Windows installer's [Registry]/[Files] tracking, so
 //! `installer/windows/setup.iss` removes them explicitly on uninstall
 //! (`CurUninstallStepChanged` + `[UninstallDelete]`) — keep both in sync.
+//!
+//! Several FluxDown installs (Flutter / GPUI, installed / dev builds) may share
+//! one machine and therefore one registration entry point (the Unix launcher
+//! script, the Windows HKCU keys). Startup self-heal ([`auto_register`]) follows
+//! the ownership rule in [`may_take_over`] instead of "last launch wins", so two
+//! installs never overwrite each other on every start; the explicit Doctor
+//! repair ([`register`]) always points the registration at this install.
+//! The rules mirror `native/agent/src/nmh.rs::registry` one-to-one — change both.
+
+use std::io;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+/// Edge Add-ons store extension ID. Edge ignores the manifest `key` field, so
+/// its store build gets a different ID than Chrome and must be listed
+/// explicitly (Chromium native messaging `allowed_origins` has no wildcard).
+/// Without this, Edge store users get "Access to the specified native
+/// messaging host is forbidden" → extension stuck on "未连接".
+const EDGE_EXTENSION_ID: &str = "chrome-extension://nglkkjbogjghekbhhcnccnpfedjbdhhd/";
+/// Windows `register_with` writes every registry key unconditionally, so even
+/// browsers that are not installed must check out; Unix only writes manifests
+/// for installed browsers.
+const REGISTERS_EVERY_TARGET: bool = cfg!(target_os = "windows");
+/// Path fragments of dev builds and temporary mounts (matched lowercase, `/`-separated).
+const TRANSIENT_RELAY_MARKERS: [&str; 7] = [
+    "/target/debug/",
+    "/target/release/",
+    "/build/macos/build/products/",
+    "/build/linux/",
+    "/build/windows/",
+    "/.mount_",
+    "/apptranslocation/",
+];
 
 /// 单个浏览器的 NMH 注册状态。
 #[derive(Debug, Clone)]
@@ -29,16 +63,30 @@ pub struct NmhTarget {
     pub location: String,
     /// 该浏览器是否安装（配置根目录存在）。false 时 Doctor 只报 `info`，不算故障。
     pub installed: bool,
-    /// 已注册且指向当前中继 = true。
+    /// 清单完整且与当前生效的注册一致（中继归属由 [`NmhDiagnosis::relay_owner`] 单独给出）。
     pub ok: bool,
     /// `ok == false` 时的具体原因（英文技术描述，不翻译）；ok 时为空串。
     /// 例：`"registry key missing"` / `"manifest file missing: <path>"` /
-    /// `"manifest points to <old exe>"` / `"missing Edge origin"`。
+    /// `"missing Edge origin"`。
     pub issue: String,
 }
 
+/// 注册当前指向的中继相对本安装的归属。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RelayOwner {
+    /// 未注册：类 Unix 启动脚本不存在；Windows 三个注册表键都不存在。
+    #[default]
+    Missing,
+    /// 指向本安装的中继。
+    Current,
+    /// 指向另一份仍存在的 FluxDown 中继：扩展可用，浏览器冷启动会拉起那份安装。
+    OtherInstall,
+    /// 指向的中继不存在或无法解析（安装被移除、AppImage 挂载点失效、脚本被改坏）。
+    Broken,
+}
+
 /// NMH 注册整体诊断快照。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NmhDiagnosis {
     /// NMH 中继可执行文件绝对路径；空 = 未找到。
     pub exe_path: String,
@@ -48,27 +96,285 @@ pub struct NmhDiagnosis {
     pub chromium_manifest: String,
     /// Firefox 清单文件绝对路径（同上；Linux 与 chromium 同名不同目录时给第一个候选）。
     pub firefox_manifest: String,
+    /// 注册入口：类 Unix 为启动脚本路径，Windows 为提供生效中继的注册表键。
+    pub relay_location: String,
+    /// 注册实际指向的中继；未注册或无法解析时为空。
+    pub registered_relay: String,
+    /// `registered_relay` 相对本安装的归属。
+    pub relay_owner: RelayOwner,
     /// 每个浏览器一条。未找到中继时可为空 vec。
     pub targets: Vec<NmhTarget>,
 }
 
-impl NmhDiagnosis {
-    /// All-empty snapshot; each platform's `diagnose()` fills it in.
-    fn empty() -> Self {
-        Self {
-            exe_path: String::new(),
-            exe_error: String::new(),
-            chromium_manifest: String::new(),
-            firefox_manifest: String::new(),
-            targets: Vec::new(),
+/// [`auto_register`] 的结果。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AutoRegisterOutcome {
+    /// 注册完整，未改动任何文件。
+    UpToDate,
+    /// 已重写注册，指向给定中继（可能是保留下来的另一份安装）。
+    Registered(PathBuf),
+}
+
+/// 清单声明的 `path`。
+fn manifest_relay(manifest: &Value) -> Option<&str> {
+    manifest.get("path").and_then(Value::as_str)
+}
+
+/// Chromium 清单是否放行 Edge 商店扩展。
+fn manifest_allows_edge(manifest: &Value) -> bool {
+    manifest
+        .get("allowed_origins")
+        .and_then(Value::as_array)
+        .is_some_and(|origins| {
+            origins
+                .iter()
+                .any(|origin| origin.as_str() == Some(EDGE_EXTENSION_ID))
+        })
+}
+
+/// 开发构建（cargo / Flutter 产物）或临时挂载（AppImage、macOS App Translocation）里的中继。
+fn is_transient_relay(path: &Path) -> bool {
+    let normalized = path
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_ascii_lowercase();
+    TRANSIENT_RELAY_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
+}
+
+/// 两个中继路径是否指向同一文件（Windows 不区分大小写；再以 canonicalize 兜底符号链接）。
+fn same_relay(a: &Path, b: &Path) -> bool {
+    let literal = if cfg!(target_os = "windows") {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    };
+    literal
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+fn classify_relay(registered: &Path, current: &Path) -> RelayOwner {
+    if same_relay(registered, current) {
+        RelayOwner::Current
+    } else if registered.is_file() {
+        RelayOwner::OtherInstall
+    } else {
+        RelayOwner::Broken
+    }
+}
+
+/// 启动自愈能否把注册改指向本安装：未注册、失效或已是本安装时总可以；另一份健康
+/// 安装只在它是开发构建/临时路径、而本安装不是时才被接管，其余情况保持先到者。
+fn may_take_over(owner: RelayOwner, registered: &Path, current: &Path) -> bool {
+    match owner {
+        RelayOwner::Missing | RelayOwner::Broken | RelayOwner::Current => true,
+        RelayOwner::OtherInstall => is_transient_relay(registered) && !is_transient_relay(current),
+    }
+}
+
+/// 显式修复：把全部注册改指向本安装的中继。
+pub fn register() -> Result<(), io::Error> {
+    inner::register_with(&inner::find_nmh_exe()?)
+}
+
+/// 启动自愈：注册缺失、失效或不完整时按归属规则重写，完好时不碰任何文件。
+pub fn auto_register() -> Result<AutoRegisterOutcome, io::Error> {
+    let diagnosis = inner::diagnose();
+    if diagnosis.exe_path.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, diagnosis.exe_error));
+    }
+    let current = PathBuf::from(&diagnosis.exe_path);
+    let registered = PathBuf::from(&diagnosis.registered_relay);
+    let relay = if may_take_over(diagnosis.relay_owner, &registered, &current) {
+        current
+    } else {
+        registered.clone()
+    };
+    let complete = matches!(
+        diagnosis.relay_owner,
+        RelayOwner::Current | RelayOwner::OtherInstall
+    ) && same_relay(&relay, &registered)
+        && diagnosis
+            .targets
+            .iter()
+            .all(|target| target.ok || !(target.installed || REGISTERS_EVERY_TARGET));
+    if complete {
+        return Ok(AutoRegisterOutcome::UpToDate);
+    }
+    inner::register_with(&relay)?;
+    Ok(AutoRegisterOutcome::Registered(relay))
+}
+
+/// POSIX 单引号转义：`'` → `'\''`。
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+/// 启动脚本内容：`exec` 真实中继并转发浏览器追加的参数。
+#[cfg(unix)]
+fn wrapper_script(relay: &Path) -> String {
+    format!(
+        "#!/bin/sh\nexec {} \"$@\"\n",
+        shell_quote(&relay.to_string_lossy())
+    )
+}
+
+/// 启动脚本 `exec '<relay>' "$@"` 里的中继路径（兼容 `'\''` 转义）。
+#[cfg(unix)]
+fn parse_wrapper_relay(script: &str) -> Option<PathBuf> {
+    let rest = script
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("exec "))?;
+    let mut relay = String::new();
+    let mut chars = rest.trim_start().chars();
+    loop {
+        match chars.next() {
+            Some('\'') => loop {
+                match chars.next()? {
+                    '\'' => break,
+                    other => relay.push(other),
+                }
+            },
+            Some('\\') => relay.push(chars.next()?),
+            _ => break,
         }
+    }
+    (!relay.is_empty()).then(|| PathBuf::from(relay))
+}
+
+/// 启动脚本的归属与其指向的中继；不可执行的脚本浏览器拉不起来，按失效处理。
+#[cfg(unix)]
+fn diagnose_wrapper(wrapper: &Path, current: &Path) -> (RelayOwner, String) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = match std::fs::read_to_string(wrapper) {
+        Ok(script) => script,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            return (RelayOwner::Missing, String::new());
+        }
+        Err(_) => return (RelayOwner::Broken, String::new()),
+    };
+    let Some(relay) = parse_wrapper_relay(&script) else {
+        return (RelayOwner::Broken, String::new());
+    };
+    let executable =
+        std::fs::metadata(wrapper).is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0);
+    let owner = if executable {
+        classify_relay(&relay, current)
+    } else {
+        RelayOwner::Broken
+    };
+    (owner, relay.to_string_lossy().into_owned())
+}
+
+/// 单个浏览器清单的问题：必须是指向启动脚本的合法 JSON；完好时为空串。
+/// 中继归属由启动脚本单独判定，不在每个浏览器上重复报告。
+#[cfg(unix)]
+fn manifest_issue(manifest: &Path, wrapper_str: &str, require_edge_origin: bool) -> String {
+    let location = manifest.to_string_lossy();
+    match std::fs::read_to_string(manifest) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            format!("manifest file missing: {location}")
+        }
+        Err(e) => format!("manifest unreadable: {location}: {e:#}"),
+        Ok(content) => match serde_json::from_str::<Value>(&content) {
+            Err(e) => format!("manifest is not valid JSON: {location}: {e:#}"),
+            Ok(json) if manifest_relay(&json) != Some(wrapper_str) => {
+                format!("manifest does not point to the launcher script: {location}")
+            }
+            Ok(json) if require_edge_origin && !manifest_allows_edge(&json) => {
+                format!("missing Edge origin in manifest: {location}")
+            }
+            Ok(_) => String::new(),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{RelayOwner, classify_relay, is_transient_relay, may_take_over};
+
+    const INSTALLED: &str = "/Applications/FluxDown.app/Contents/MacOS/fluxdown_nmh";
+    const DEV: &str = "/Users/dev/FluxDown/build/macos/Build/Products/Debug/FluxDown.app/Contents/MacOS/fluxdown_nmh";
+
+    #[test]
+    fn healthy_other_install_is_only_taken_over_from_a_dev_build() {
+        let other_installed = Path::new("/opt/fluxdown/fluxdown_nmh");
+        assert!(!is_transient_relay(other_installed));
+        assert!(is_transient_relay(Path::new(DEV)));
+        assert!(!may_take_over(
+            RelayOwner::OtherInstall,
+            other_installed,
+            Path::new(INSTALLED)
+        ));
+        assert!(!may_take_over(
+            RelayOwner::OtherInstall,
+            other_installed,
+            Path::new(DEV)
+        ));
+        assert!(may_take_over(
+            RelayOwner::OtherInstall,
+            Path::new(DEV),
+            Path::new(INSTALLED)
+        ));
+        for owner in [RelayOwner::Missing, RelayOwner::Broken, RelayOwner::Current] {
+            assert!(may_take_over(owner, other_installed, Path::new(DEV)));
+        }
+    }
+
+    #[test]
+    fn classify_distinguishes_current_other_and_missing_relays() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_hub_nmh_owner_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let current = dir.join("current_nmh");
+        let other = dir.join("other_nmh");
+        std::fs::write(&current, b"").ok();
+        std::fs::write(&other, b"").ok();
+        assert_eq!(classify_relay(&current, &current), RelayOwner::Current);
+        assert_eq!(classify_relay(&other, &current), RelayOwner::OtherInstall);
+        assert_eq!(
+            classify_relay(&dir.join("removed_nmh"), &current),
+            RelayOwner::Broken
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wrapper_relay_round_trips_through_shell_quoting() {
+        use super::{parse_wrapper_relay, wrapper_script};
+
+        for relay in [INSTALLED, "/home/o'brien/My Apps/fluxdown_nmh"] {
+            assert_eq!(
+                parse_wrapper_relay(&wrapper_script(Path::new(relay))).as_deref(),
+                Some(Path::new(relay))
+            );
+        }
+        assert_eq!(parse_wrapper_relay("#!/bin/sh\necho hi\n"), None);
     }
 }
 
 #[cfg(target_os = "windows")]
 mod inner {
+    use super::{EDGE_EXTENSION_ID, NmhDiagnosis, NmhTarget, RelayOwner};
     use crate::logger::log_info;
     use serde::Serialize;
+    use serde_json::Value;
     use std::io;
     use std::path::{Path, PathBuf};
     use winreg::RegKey;
@@ -88,13 +394,6 @@ mod inner {
 
     /// Chrome extension ID — pinned via `key` in wxt.config.ts manifest.
     const CHROME_EXTENSION_ID: &str = "chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/";
-
-    /// Edge Add-ons store extension ID. Edge ignores the manifest `key` field, so
-    /// its store build gets a different ID than Chrome and must be listed
-    /// explicitly (Chromium native messaging `allowed_origins` has no wildcard).
-    /// Without this, Edge store users get "Access to the specified native
-    /// messaging host is forbidden" → extension stuck on "未连接".
-    const EDGE_EXTENSION_ID: &str = "chrome-extension://nglkkjbogjghekbhhcnccnpfedjbdhhd/";
 
     /// Firefox extension ID (matches `browser_specific_settings.gecko.id` in manifest).
     const FIREFOX_EXTENSION_ID: &str = "fluxdown@fluxdown.app";
@@ -134,7 +433,7 @@ mod inner {
     /// 1. Same directory as the current app exe (production deployment)
     /// 2. Cargo workspace `target/debug/` (development — `flutter run`)
     /// 3. Cargo workspace `target/release/` (development — release build)
-    fn find_nmh_exe() -> Result<PathBuf, io::Error> {
+    pub(super) fn find_nmh_exe() -> Result<PathBuf, io::Error> {
         // 1. Next to current exe (production: NMH ships alongside the app)
         if let Ok(exe) = std::env::current_exe() {
             let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -273,127 +572,20 @@ mod inner {
         Ok(())
     }
 
-    /// Returns `true` if NMH registration is missing or stale and needs to be (re)written.
-    ///
-    /// Checks that:
-    ///   1. Chrome/Edge registry keys exist and point to the Chromium manifest.
-    ///   2. Each registered manifest file exists and references the current NMH exe.
-    ///   3. The registered NMH's parent directory matches the current exe's directory
-    ///      (detects version switches: dev → portable / installed).
-    ///   4. Firefox is treated as optional — its absence does not trigger re-registration.
-    ///
-    /// If the NMH exe cannot be found, returns `true` so that `register()` can
-    /// report the proper "exe not found" error.
-    pub fn needs_update() -> bool {
-        let Ok(nmh_exe) = find_nmh_exe() else {
-            return true;
-        };
-        // 清单由 serde_json 写出，路径中的 `\` 被转义为 `\\`；
-        // 用转义后的形式做内容匹配，否则 Windows 上永远不匹配、每次启动都重注册。
-        let expected_exe_json = strip_unc_prefix(&nmh_exe.to_string_lossy()).replace('\\', "\\\\");
-        // 注册表值必须精确指向当前用户数据目录下的清单：旧版本写在 exe 旁边
-        // （全局安装时不可写），命中即强制迁移。
-        let Ok((expected_chromium, expected_firefox)) = expected_manifest_paths() else {
-            return true;
-        };
-        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    const FIREFOX_REG_PATH: &str = r"Software\Mozilla\NativeMessagingHosts";
+    /// `(registry path, label, is Chromium manifest)`; the first key that resolves
+    /// to a relay defines the active registration.
+    const REG_TARGETS: [(&str, &str, bool); 3] = [
+        (CHROMIUM_REG_PATHS[0], "Chrome", true),
+        (CHROMIUM_REG_PATHS[1], "Edge", true),
+        (FIREFOX_REG_PATH, "Firefox", false),
+    ];
 
-        // --- 版本切换检测 ---
-        // 读取已注册 Chrome 清单中的 NMH path，与当前 exe 目录对比。
-        // 目录不同说明用户切换了版本（dev → portable / installed），强制重新注册。
-        // canonicalize 会加 `\\?\` UNC 前缀，而清单里的 path 写入时已去前缀；
-        // 比较前同样去掉，否则永远判定"目录变了"、每次启动都重注册。
-        let current_exe_dir = std::env::current_exe()
-            .ok()
-            .map(|exe| std::fs::canonicalize(&exe).unwrap_or(exe))
-            .and_then(|p| {
-                p.parent()
-                    .map(|d| PathBuf::from(strip_unc_prefix(&d.to_string_lossy())))
-            });
-
-        if let Some(exe_dir) = &current_exe_dir {
-            let chrome_reg = format!(
-                "{}\\{}",
-                r"Software\Google\Chrome\NativeMessagingHosts", NMH_NAME
-            );
-            if let Ok(key) = hkcu.open_subkey_with_flags(&chrome_reg, KEY_READ)
-                && let Ok(manifest_str) = key.get_value::<String, _>("")
-                && let Ok(content) = std::fs::read_to_string(&manifest_str)
-                && let Ok(json) = serde_json::from_str::<serde_json::Value>(&content)
-                && let Some(registered_str) = json["path"].as_str()
-            {
-                let registered_dir = Path::new(registered_str).parent();
-                if registered_dir
-                    .map(|d| d != exe_dir.as_path())
-                    .unwrap_or(true)
-                {
-                    log_info!(
-                        "[nmh_registry] exe dir changed: registered NMH dir={:?}, current exe dir={:?} → needs update",
-                        registered_dir,
-                        exe_dir
-                    );
-                    return true;
-                }
-            }
-        }
-        // ---------------------
-
-        // Check Chrome and Edge point to the Chromium manifest with the correct path.
-        // Other Chromium browsers (Brave, Vivaldi, Opera) fall back to Chrome's key.
-        for reg_path in CHROMIUM_REG_PATHS {
-            let full_path = format!("{}\\{}", reg_path, NMH_NAME);
-            let Ok(key) = hkcu.open_subkey_with_flags(&full_path, KEY_READ) else {
-                return true;
-            };
-            let Ok(manifest_str): Result<String, _> = key.get_value("") else {
-                return true;
-            };
-            if !manifest_str.eq_ignore_ascii_case(&expected_chromium) {
-                return true; // wrong manifest, or legacy location next to the exe
-            }
-            if !Path::new(&manifest_str).exists() {
-                return true;
-            }
-            let Ok(content) = std::fs::read_to_string(&manifest_str) else {
-                return true;
-            };
-            if !content.contains(&expected_exe_json) {
-                return true;
-            }
-            // Content versioning: an existing manifest predating Edge support
-            // lacks the Edge origin. Force a rewrite so upgraded users get it
-            // (path-only checks above would otherwise return false and skip register()).
-            if !content.contains(EDGE_EXTENSION_ID) {
-                return true;
-            }
-        }
-
-        // Firefox 键缺失也要重注册：能走到这里说明 Chromium 键完好（本机曾完整
-        // 注册过），此时 Firefox 键被外部删除（杀毒/清理工具）应当自愈；
-        // register() 无条件写 Firefox 键，对未安装 Firefox 的机器同样无害幂等。
-        let firefox_reg = format!("{}\\{}", r"Software\Mozilla\NativeMessagingHosts", NMH_NAME);
-        match hkcu.open_subkey_with_flags(&firefox_reg, KEY_READ) {
-            Err(_) => return true,
-            Ok(key) => {
-                let Ok(manifest_str): Result<String, _> = key.get_value("") else {
-                    return true;
-                };
-                if !manifest_str.eq_ignore_ascii_case(&expected_firefox) {
-                    return true; // old shared manifest or legacy install-dir location
-                }
-                if !Path::new(&manifest_str).exists() {
-                    return true;
-                }
-                let Ok(content) = std::fs::read_to_string(&manifest_str) else {
-                    return true;
-                };
-                if !content.contains(&expected_exe_json) {
-                    return true;
-                }
-            }
-        }
-
-        false
+    /// What one registry key resolves to.
+    enum Registration {
+        KeyMissing(String),
+        Invalid(String),
+        Valid { manifest: String, json: Value },
     }
 
     /// `true` if `%VAR%\<rest…>` exists and is a directory.
@@ -409,49 +601,70 @@ mod inner {
         path.is_dir()
     }
 
-    /// Read-only registration check for one browser key.
-    /// Returns the failure reason, or an empty string when everything matches.
-    /// Mirrors `needs_update()` step by step — do not diverge.
-    fn diagnose_registry(
-        hkcu: &RegKey,
-        reg_path: &str,
+    fn read_registration(hkcu: &RegKey, reg_path: &str) -> Registration {
+        let full_path = format!("{reg_path}\\{NMH_NAME}");
+        let Ok(key) = hkcu.open_subkey_with_flags(&full_path, KEY_READ) else {
+            return Registration::KeyMissing(format!("registry key missing: HKCU\\{full_path}"));
+        };
+        let Ok(manifest) = key.get_value::<String, _>("") else {
+            return Registration::Invalid(format!(
+                "registry default value unreadable: HKCU\\{full_path}"
+            ));
+        };
+        let content = match std::fs::read_to_string(&manifest) {
+            Ok(content) => content,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return Registration::Invalid(format!("manifest file missing: {manifest}"));
+            }
+            Err(e) => {
+                return Registration::Invalid(format!("manifest unreadable: {manifest}: {e:#}"));
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(json) => Registration::Valid { manifest, json },
+            Err(e) => {
+                Registration::Invalid(format!("manifest is not valid JSON: {manifest}: {e:#}"))
+            }
+        }
+    }
+
+    /// One key's problem relative to the active registration; empty when fine.
+    /// With `owner_is_current` the manifest must also live in this install's data
+    /// dir (migrates manifests older releases wrote next to the exe).
+    fn target_issue(
+        registration: &Registration,
+        registered: &Path,
+        owner_is_current: bool,
         expected_manifest: &str,
-        expected_exe_json: &str,
         require_edge_origin: bool,
     ) -> String {
-        let full_path = format!("{}\\{}", reg_path, NMH_NAME);
-        let Ok(key) = hkcu.open_subkey_with_flags(&full_path, KEY_READ) else {
-            return format!("registry key missing: HKCU\\{}", full_path);
+        let (manifest, json) = match registration {
+            Registration::KeyMissing(issue) | Registration::Invalid(issue) => {
+                return issue.clone();
+            }
+            Registration::Valid { manifest, json } => (manifest, json),
         };
-        let Ok(manifest_str): Result<String, _> = key.get_value("") else {
-            return format!("registry default value unreadable: HKCU\\{}", full_path);
+        let Some(relay) = super::manifest_relay(json) else {
+            return format!("manifest has no relay path: {manifest}");
         };
-        if !manifest_str.eq_ignore_ascii_case(expected_manifest) {
-            return format!("registry points to unexpected manifest: {}", manifest_str);
+        if !super::same_relay(Path::new(&strip_unc_prefix(relay)), registered) {
+            return format!(
+                "manifest points to a different relay than the active registration: {manifest}"
+            );
         }
-        if !Path::new(&manifest_str).exists() {
-            return format!("manifest file missing: {}", manifest_str);
+        if owner_is_current && !manifest.eq_ignore_ascii_case(expected_manifest) {
+            return format!("registry points to unexpected manifest: {manifest}");
         }
-        let content = match std::fs::read_to_string(&manifest_str) {
-            Ok(c) => c,
-            Err(e) => return format!("manifest unreadable: {}: {e:#}", manifest_str),
-        };
-        if !content.contains(expected_exe_json) {
-            return format!("manifest does not point to current relay: {}", manifest_str);
-        }
-        if require_edge_origin && !content.contains(EDGE_EXTENSION_ID) {
-            return format!("missing Edge origin in manifest: {}", manifest_str);
+        if require_edge_origin && !super::manifest_allows_edge(json) {
+            return format!("missing Edge origin in manifest: {manifest}");
         }
         String::new()
     }
 
-    /// Read-only snapshot of the NMH registration state for the Doctor page.
-    ///
-    /// Never writes the registry, manifests or directories — `needs_update()`
-    /// judgement rules are reused verbatim so Doctor and startup self-heal
-    /// never disagree.
-    pub fn diagnose() -> super::NmhDiagnosis {
-        let mut diag = super::NmhDiagnosis::empty();
+    /// Read-only snapshot of the NMH registration state for the Doctor page and
+    /// startup self-heal. Never writes the registry, manifests or directories.
+    pub fn diagnose() -> NmhDiagnosis {
+        let mut diag = NmhDiagnosis::default();
 
         let nmh_exe = match find_nmh_exe() {
             Ok(p) => p,
@@ -468,76 +681,92 @@ mod inner {
             }
             Err(e) => {
                 diag.exe_error = format!("{e:#}");
+                diag.exe_path.clear();
                 return diag;
             }
         }
 
-        // 与 needs_update() 同口径：清单由 serde_json 写出，路径里的 `\` 被转义为 `\\`。
-        let expected_exe_json = diag.exe_path.replace('\\', "\\\\");
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let registrations = REG_TARGETS.map(|(reg_path, _, _)| read_registration(&hkcu, reg_path));
+        let active =
+            REG_TARGETS
+                .iter()
+                .zip(&registrations)
+                .find_map(|((reg_path, _, _), registration)| match registration {
+                    Registration::Valid { json, .. } => super::manifest_relay(json)
+                        .map(|relay| (*reg_path, strip_unc_prefix(relay))),
+                    _ => None,
+                });
+        match active {
+            Some((reg_path, relay)) => {
+                diag.relay_location = format!("HKCU\\{reg_path}\\{NMH_NAME}");
+                diag.relay_owner =
+                    super::classify_relay(Path::new(&relay), Path::new(&diag.exe_path));
+                diag.registered_relay = relay;
+            }
+            None => {
+                diag.relay_location = format!("HKCU\\{}\\{NMH_NAME}", CHROMIUM_REG_PATHS[0]);
+                diag.relay_owner = if registrations
+                    .iter()
+                    .all(|registration| matches!(registration, Registration::KeyMissing(_)))
+                {
+                    RelayOwner::Missing
+                } else {
+                    RelayOwner::Broken
+                };
+            }
+        }
 
-        // CHROMIUM_REG_PATHS 顺序 = [Chrome, Edge]，与安装判定目录一一对应。
-        let chromium_installed = [
+        let registered = PathBuf::from(&diag.registered_relay);
+        let owner_is_current = diag.relay_owner == RelayOwner::Current;
+        let installed = [
             env_dir_exists("LOCALAPPDATA", &["Google", "Chrome", "User Data"]),
             env_dir_exists("LOCALAPPDATA", &["Microsoft", "Edge", "User Data"]),
+            env_dir_exists("APPDATA", &["Mozilla", "Firefox"]),
         ];
-        for ((reg_path, label), installed) in CHROMIUM_REG_PATHS
-            .iter()
-            .zip(["Chrome", "Edge"])
-            .zip(chromium_installed)
+        for (((reg_path, label, chromium), registration), installed) in
+            REG_TARGETS.iter().zip(&registrations).zip(installed)
         {
-            let issue = diagnose_registry(
-                &hkcu,
-                reg_path,
-                &diag.chromium_manifest,
-                &expected_exe_json,
-                true,
+            let expected_manifest = if *chromium {
+                &diag.chromium_manifest
+            } else {
+                &diag.firefox_manifest
+            };
+            let issue = target_issue(
+                registration,
+                &registered,
+                owner_is_current,
+                expected_manifest,
+                *chromium,
             );
-            diag.targets.push(super::NmhTarget {
-                label: label.to_string(),
-                location: format!("HKCU\\{}\\{}", reg_path, NMH_NAME),
+            diag.targets.push(NmhTarget {
+                label: (*label).to_string(),
+                location: format!("HKCU\\{reg_path}\\{NMH_NAME}"),
                 installed,
                 ok: issue.is_empty(),
                 issue,
             });
         }
 
-        let firefox_reg = r"Software\Mozilla\NativeMessagingHosts";
-        let issue = diagnose_registry(
-            &hkcu,
-            firefox_reg,
-            &diag.firefox_manifest,
-            &expected_exe_json,
-            false,
-        );
-        diag.targets.push(super::NmhTarget {
-            label: "Firefox".to_string(),
-            location: format!("HKCU\\{}\\{}", firefox_reg, NMH_NAME),
-            installed: env_dir_exists("APPDATA", &["Mozilla", "Firefox"]),
-            ok: issue.is_empty(),
-            issue,
-        });
-
         diag
     }
 
-    /// Register the NMH for all supported browsers.
+    /// Point every browser's registration at `relay`.
     ///
     /// Writes two separate manifest files:
     /// - Chromium manifest (Chrome/Edge): contains `allowed_origins`
     /// - Firefox manifest: contains `allowed_extensions` ONLY
     ///
-    /// This is idempotent — safe to call on every startup.
-    pub fn register() -> Result<(), io::Error> {
-        let nmh_exe = find_nmh_exe()?;
-        let (chromium_path, firefox_path) = write_manifests(&nmh_exe)?;
+    /// Idempotent.
+    pub(super) fn register_with(relay: &Path) -> Result<(), io::Error> {
+        let (chromium_path, firefox_path) = write_manifests(relay)?;
         let chromium_str = strip_unc_prefix(&chromium_path.to_string_lossy());
         let firefox_str = strip_unc_prefix(&firefox_path.to_string_lossy());
-        let nmh_str = strip_unc_prefix(&nmh_exe.to_string_lossy());
+        let nmh_str = strip_unc_prefix(&relay.to_string_lossy());
         register_registry(&chromium_str, &firefox_str)?;
-        remove_legacy_manifests(&nmh_exe);
+        remove_legacy_manifests(relay);
         log_info!(
-            "[nmh_registry] NMH registered: exe={}, chromium_manifest={}, firefox_manifest={}",
+            "[nmh_registry] NMH registered: relay={}, chromium_manifest={}, firefox_manifest={}",
             nmh_str,
             chromium_str,
             firefox_str,
@@ -590,22 +819,25 @@ mod inner {
     #[cfg(test)]
     #[allow(clippy::unwrap_used, clippy::expect_used)]
     mod tests {
-        use super::{NMH_NAME, needs_update, register};
+        use super::NMH_NAME;
+        use crate::nmh_registry::{AutoRegisterOutcome, auto_register, register};
         use winreg::RegKey;
         use winreg::enums::{HKEY_CURRENT_USER, KEY_WRITE};
 
-        /// 本机注册表冒烟：Firefox 键被外部删除后 `needs_update()` 必须自愈判定。
+        /// 本机注册表冒烟：Firefox 键被外部删除后启动自愈必须重写注册。
         ///
         /// 依赖真实 HKCU 注册表与已构建的 `fluxdown_nmh.exe`（`cargo build -p fluxdown_nmh`），
-        /// 会改写本机 NMH 注册（指向 workspace target 目录，安装版启动时会自行纠正），
-        /// 故标记 ignore，手动执行：
+        /// 会改写本机 NMH 注册（指向 workspace target 目录），故标记 ignore，手动执行：
         /// `cargo test -p hub -- --ignored firefox_key_self_heal`
         #[test]
         #[ignore]
         fn firefox_key_self_heal() {
             // 基线：全量注册后一切匹配。
             register().expect("register");
-            assert!(!needs_update(), "fresh register must be up to date");
+            assert_eq!(
+                auto_register().expect("auto register"),
+                AutoRegisterOutcome::UpToDate
+            );
 
             // 模拟外部删除 Firefox 键（杀毒/清理工具场景）。
             let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -614,17 +846,14 @@ mod inner {
                 .expect("open Mozilla NMH parent");
             parent.delete_subkey(NMH_NAME).expect("delete firefox key");
 
-            // 修复点：缺失必须触发重注册（旧代码此处返回 false）。
-            assert!(
-                needs_update(),
-                "missing Firefox key must trigger re-registration"
-            );
-
-            // register() 自愈恢复。
-            register().expect("re-register");
-            assert!(
-                !needs_update(),
-                "self-healed registration must be up to date"
+            // 缺失必须触发重注册，重写后恢复完好。
+            assert!(matches!(
+                auto_register().expect("self heal"),
+                AutoRegisterOutcome::Registered(_)
+            ));
+            assert_eq!(
+                auto_register().expect("auto register"),
+                AutoRegisterOutcome::UpToDate
             );
         }
     }
@@ -633,6 +862,7 @@ mod inner {
 // Linux: write NMH manifest files to XDG browser directories.
 #[cfg(target_os = "linux")]
 mod inner {
+    use super::{EDGE_EXTENSION_ID, NmhDiagnosis, NmhTarget};
     use crate::logger::log_info;
     use serde::Serialize;
     use std::io;
@@ -648,10 +878,6 @@ mod inner {
     const MANIFEST_FILENAME_CHROMIUM: &str = "com.fluxdown.nmh.json";
     const MANIFEST_FILENAME_FIREFOX: &str = "com.fluxdown.nmh.json";
     const CHROME_EXTENSION_ID: &str = "chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/";
-    /// Edge Add-ons store extension ID — differs from Chrome (Edge ignores the
-    /// manifest `key`) and must be whitelisted explicitly, else Edge store users
-    /// get "forbidden" on connectNative → stuck on "未连接".
-    const EDGE_EXTENSION_ID: &str = "chrome-extension://nglkkjbogjghekbhhcnccnpfedjbdhhd/";
     const FIREFOX_EXTENSION_ID: &str = "fluxdown@fluxdown.app";
 
     #[derive(Serialize)]
@@ -749,7 +975,7 @@ mod inner {
     /// Returns multiple paths: standard location, Flatpak sandboxed variants,
     /// and Firefox-fork browsers (LibreWolf, Waterfox).
     /// Registration writes to every dir whose browser profile root exists;
-    /// needs_update requires each such dir's manifest to exist and match
+    /// startup self-heal requires each such dir's manifest to exist and match
     /// (self-heals external deletion and browsers installed later, #159).
     fn firefox_nmh_dirs() -> Vec<PathBuf> {
         let Some(home) = home_dir() else {
@@ -776,7 +1002,7 @@ mod inner {
         ]
     }
 
-    fn find_nmh_exe() -> Result<PathBuf, io::Error> {
+    pub(super) fn find_nmh_exe() -> Result<PathBuf, io::Error> {
         // 1. Next to current exe (production deployment, including AppImage mount)
         if let Ok(exe) = std::env::current_exe() {
             let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -832,13 +1058,12 @@ mod inner {
         })
     }
 
-    /// Write the shell wrapper script that exec's the real NMH binary.
+    /// Write the shell wrapper script that exec's `relay`.
     ///
     /// By registering a wrapper script instead of the binary directly, we
     /// provide a stable path even when the binary lives in a temporary AppImage
-    /// mount point.  On every app launch the wrapper is rewritten to point at
-    /// the current binary path, so it stays correct after updates.
-    fn write_wrapper_script(nmh_exe: &Path) -> Result<PathBuf, io::Error> {
+    /// mount point; self-heal rewrites it whenever the registered relay is gone.
+    fn write_wrapper_script(relay: &Path) -> Result<PathBuf, io::Error> {
         let Some(wp) = wrapper_path() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -848,9 +1073,7 @@ mod inner {
         if let Some(parent) = wp.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let exe_str = nmh_exe.to_string_lossy();
-        let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe_str);
-        std::fs::write(&wp, script)?;
+        std::fs::write(&wp, super::wrapper_script(relay))?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&wp, std::fs::Permissions::from_mode(0o755))?;
         Ok(wp)
@@ -894,7 +1117,7 @@ mod inner {
     /// Proxy for "browser is installed": the NMH dir's parent is the browser's
     /// profile/config root (e.g. `~/.config/microsoft-edge`, `~/.mozilla`),
     /// which only exists once the browser has run at least once. Same heuristic
-    /// as Bitwarden desktop. Scopes register()/needs_update() to browsers actually
+    /// as Bitwarden desktop. Scopes registration and self-heal to browsers actually
     /// present instead of spraying manifests into never-used dirs (#159).
     fn browser_installed(nmh_dir: &Path) -> bool {
         nmh_dir.parent().is_some_and(|p| p.is_dir())
@@ -933,57 +1156,6 @@ mod inner {
         };
         let mozilla_compat = home.join(".mozilla").join("native-messaging-hosts");
         dir == mozilla_compat.as_path() && firefox_family_present(&home)
-    }
-
-    pub fn needs_update() -> bool {
-        let Ok(nmh_exe) = find_nmh_exe() else {
-            return true;
-        };
-        let expected_exe = nmh_exe.to_string_lossy().into_owned();
-
-        // Check that the wrapper script exists and points at the current binary.
-        let Some(wp) = wrapper_path() else {
-            return true;
-        };
-        if !wp.exists() {
-            return true;
-        }
-        let wrapper_ok = std::fs::read_to_string(&wp)
-            .map(|c| c.contains(&expected_exe))
-            .unwrap_or(false);
-        if !wrapper_ok {
-            log_info!("[nmh_registry] wrapper script outdated → needs update");
-            return true;
-        }
-
-        let wrapper_str = wp.to_string_lossy().into_owned();
-
-        // Per-installed-browser check (#159): every Chromium browser whose
-        // profile root exists must have a manifest pointing at the wrapper AND
-        // containing the Edge origin (content versioning: rewrite manifests
-        // predating Edge support). A single missing/stale manifest — e.g. a
-        // browser installed after FluxDown first registered — must trigger
-        // re-register; the old `.any()` let one healthy browser mask the rest.
-        let chromium_ok = chromium_nmh_dirs()
-            .iter()
-            .filter(|dir| browser_installed(dir))
-            .all(|dir| {
-                std::fs::read_to_string(dir.join(MANIFEST_FILENAME_CHROMIUM))
-                    .map(|c| c.contains(&wrapper_str) && c.contains(EDGE_EXTENSION_ID))
-                    .unwrap_or(false)
-            });
-
-        // Firefox 同规则：装了才要求清单有效（自愈外部删除 / 后装浏览器）。
-        let firefox_ok = firefox_nmh_dirs()
-            .iter()
-            .filter(|dir| firefox_dir_installed(dir))
-            .all(|dir| {
-                std::fs::read_to_string(dir.join(MANIFEST_FILENAME_FIREFOX))
-                    .map(|c| c.contains(&wrapper_str))
-                    .unwrap_or(false)
-            });
-
-        !(chromium_ok && firefox_ok)
     }
 
     /// Human-readable browser name for an NMH manifest directory.
@@ -1028,47 +1200,28 @@ mod inner {
     }
 
     /// Read-only manifest check for one browser directory.
-    /// `wrapper_issue` surfaces a broken wrapper script once the manifest
-    /// itself checks out (manifests point at the wrapper, not the binary).
     fn diagnose_dir(
         dir: &Path,
         installed: bool,
         manifest_filename: &str,
         wrapper_str: &str,
         require_edge_origin: bool,
-        wrapper_issue: Option<&str>,
-    ) -> super::NmhTarget {
-        let location = dir.join(manifest_filename).to_string_lossy().into_owned();
-        let issue = match std::fs::read_to_string(dir.join(manifest_filename)) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                format!("manifest file missing: {}", location)
-            }
-            Err(e) => format!("manifest unreadable: {}: {e:#}", location),
-            Ok(content) => {
-                if !content.contains(wrapper_str) {
-                    format!("manifest does not point to current relay: {}", location)
-                } else if require_edge_origin && !content.contains(EDGE_EXTENSION_ID) {
-                    format!("missing Edge origin in manifest: {}", location)
-                } else {
-                    wrapper_issue.unwrap_or_default().to_string()
-                }
-            }
-        };
-        super::NmhTarget {
+    ) -> NmhTarget {
+        let manifest = dir.join(manifest_filename);
+        let issue = super::manifest_issue(&manifest, wrapper_str, require_edge_origin);
+        NmhTarget {
             label: label_for_dir(dir),
-            location,
+            location: manifest.to_string_lossy().into_owned(),
             installed,
             ok: issue.is_empty(),
             issue,
         }
     }
 
-    /// Read-only snapshot of the NMH registration state for the Doctor page.
-    ///
-    /// Never writes manifests, the wrapper script or any directory — the
-    /// judgement rules mirror `needs_update()` exactly.
-    pub fn diagnose() -> super::NmhDiagnosis {
-        let mut diag = super::NmhDiagnosis::empty();
+    /// Read-only snapshot of the NMH registration state for the Doctor page and
+    /// startup self-heal. Never writes manifests, the wrapper script or any directory.
+    pub fn diagnose() -> NmhDiagnosis {
+        let mut diag = NmhDiagnosis::default();
 
         let chromium_dirs = chromium_nmh_dirs();
         let firefox_dirs = firefox_nmh_dirs();
@@ -1099,19 +1252,10 @@ mod inner {
             return diag;
         };
         let wrapper_str = wp.to_string_lossy().into_owned();
-        let wrapper_issue = if !wp.exists() {
-            Some(format!("wrapper script missing: {}", wrapper_str))
-        } else if std::fs::read_to_string(&wp)
-            .map(|c| c.contains(&diag.exe_path))
-            .unwrap_or(false)
-        {
-            None
-        } else {
-            Some(format!(
-                "wrapper script does not point to current relay: {}",
-                wrapper_str
-            ))
-        };
+        let (owner, relay) = super::diagnose_wrapper(&wp, &nmh_exe);
+        diag.relay_owner = owner;
+        diag.registered_relay = relay;
+        diag.relay_location = wrapper_str.clone();
 
         for dir in &chromium_dirs {
             diag.targets.push(diagnose_dir(
@@ -1120,7 +1264,6 @@ mod inner {
                 MANIFEST_FILENAME_CHROMIUM,
                 &wrapper_str,
                 true,
-                wrapper_issue.as_deref(),
             ));
         }
         for dir in &firefox_dirs {
@@ -1130,18 +1273,16 @@ mod inner {
                 MANIFEST_FILENAME_FIREFOX,
                 &wrapper_str,
                 false,
-                wrapper_issue.as_deref(),
             ));
         }
 
         diag
     }
 
-    pub fn register() -> Result<(), io::Error> {
-        let nmh_exe = find_nmh_exe()?;
-
+    /// Point the wrapper script at `relay` and write manifests for installed browsers.
+    pub(super) fn register_with(relay: &Path) -> Result<(), io::Error> {
         // Write wrapper script first; manifests point to it.
-        let wrapper = write_wrapper_script(&nmh_exe)?;
+        let wrapper = write_wrapper_script(relay)?;
         log_info!("[nmh_registry] NMH wrapper script: {}", wrapper.display());
 
         for dir in chromium_nmh_dirs() {
@@ -1183,8 +1324,8 @@ mod inner {
         }
 
         log_info!(
-            "[nmh_registry] NMH registered: exe={}, wrapper={}",
-            nmh_exe.display(),
+            "[nmh_registry] NMH registered: relay={}, wrapper={}",
+            relay.display(),
             wrapper.display()
         );
         Ok(())
@@ -1247,6 +1388,7 @@ mod inner {
 // macOS: write NMH manifest files to ~/Library/Application Support browser directories.
 #[cfg(target_os = "macos")]
 mod inner {
+    use super::{EDGE_EXTENSION_ID, NmhDiagnosis, NmhTarget};
     use crate::logger::log_info;
     use serde::Serialize;
     use std::io;
@@ -1264,10 +1406,6 @@ mod inner {
     const NMH_WRAPPER_NAME: &str = "fluxdown_nmh.sh";
     const MANIFEST_FILENAME: &str = "com.fluxdown.nmh.json";
     const CHROME_EXTENSION_ID: &str = "chrome-extension://meleenglfggcmcajknpeeeiobnpfmahc/";
-    /// Edge Add-ons store extension ID — differs from Chrome (Edge ignores the
-    /// manifest `key`) and must be whitelisted explicitly, else Edge store users
-    /// get "forbidden" on connectNative → stuck on "未连接".
-    const EDGE_EXTENSION_ID: &str = "chrome-extension://nglkkjbogjghekbhhcnccnpfedjbdhhd/";
     const FIREFOX_EXTENSION_ID: &str = "fluxdown@fluxdown.app";
 
     #[derive(Serialize)]
@@ -1387,7 +1525,7 @@ mod inner {
         })
     }
 
-    fn find_nmh_exe() -> Result<PathBuf, io::Error> {
+    pub(super) fn find_nmh_exe() -> Result<PathBuf, io::Error> {
         // 1. Next to current exe (production: inside .app bundle Contents/MacOS/)
         if let Ok(exe) = std::env::current_exe() {
             let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
@@ -1438,7 +1576,7 @@ mod inner {
     /// the browser spawns `/bin/sh`, which in turn exec's `fluxdown_nmh`.
     /// The shell inherits the NMH stdin/stdout pipe and transparently relays
     /// it to the binary — zero overhead, no extra process.
-    fn write_wrapper_script(nmh_exe: &Path) -> Result<PathBuf, io::Error> {
+    fn write_wrapper_script(relay: &Path) -> Result<PathBuf, io::Error> {
         let Some(home) = home_dir() else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1451,10 +1589,9 @@ mod inner {
             .join("fluxdown");
         std::fs::create_dir_all(&dir)?;
         let script_path = dir.join(NMH_WRAPPER_NAME);
-        let exe_str = nmh_exe.to_string_lossy();
-        // Use `exec` so the shell process is replaced by the binary (no extra
-        // zombie process). Pass "$@" to forward any arguments Chrome may add.
-        let script = format!("#!/bin/sh\nexec '{}' \"$@\"\n", exe_str);
+        // `exec` replaces the shell with the relay (no extra process); "$@"
+        // forwards any arguments Chrome may add.
+        let script = super::wrapper_script(relay);
         std::fs::write(&script_path, script)?;
         // The script must be executable.
         use std::os::unix::fs::PermissionsExt;
@@ -1500,7 +1637,7 @@ mod inner {
     /// Proxy for "browser is installed": the NMH dir's parent is the browser's
     /// profile/user-data root (e.g. `~/Library/Application Support/Microsoft Edge`),
     /// which only exists once the browser has run at least once. Same heuristic
-    /// as Bitwarden desktop. Scopes register()/needs_update() to browsers actually
+    /// as Bitwarden desktop. Scopes registration and self-heal to browsers actually
     /// present instead of spraying manifests into never-used dirs (#159).
     fn browser_installed(nmh_dir: &Path) -> bool {
         nmh_dir.parent().is_some_and(|p| p.is_dir())
@@ -1517,71 +1654,14 @@ mod inner {
         })
     }
 
-    pub fn needs_update() -> bool {
-        let Ok(nmh_exe) = find_nmh_exe() else {
-            return true;
-        };
-        // The manifest now points to the shell wrapper, but the wrapper
-        // contains the path to the real binary. Check that the wrapper exists
-        // and that its content references the current NMH exe path.
-        let expected_exe = nmh_exe.to_string_lossy().into_owned();
-
-        // 版本切换检测：wrapper 内容里包含的 NMH exe 路径是否与当前一致。
-        let wrapper_path = home_dir().map(|h| {
+    /// `~/Library/Application Support/fluxdown/fluxdown_nmh.sh`.
+    fn wrapper_path() -> Option<PathBuf> {
+        home_dir().map(|h| {
             h.join("Library")
                 .join("Application Support")
                 .join("fluxdown")
                 .join(NMH_WRAPPER_NAME)
-        });
-
-        if let Some(ref wp) = wrapper_path {
-            if !wp.exists() {
-                return true;
-            }
-            let wrapper_ok = std::fs::read_to_string(wp)
-                .map(|c| c.contains(&expected_exe))
-                .unwrap_or(false);
-            if !wrapper_ok {
-                log_info!(
-                    "[nmh_registry] wrapper script outdated or missing exe path → needs update"
-                );
-                return true;
-            }
-        } else {
-            return true;
-        }
-
-        let wrapper_str = wrapper_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        // Per-installed-browser check (#159): every Chromium browser whose
-        // profile root exists must have a manifest pointing at the wrapper AND
-        // containing the Edge origin (content versioning: rewrite manifests
-        // predating Edge support). A single missing/stale manifest — e.g. Edge
-        // installed after FluxDown first registered — must trigger re-register;
-        // the old `.any()` let one healthy browser mask all the others.
-        let chromium_ok = chromium_nmh_dirs()
-            .iter()
-            .filter(|dir| browser_installed(dir))
-            .all(|dir| {
-                std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
-                    .map(|c| c.contains(&wrapper_str) && c.contains(EDGE_EXTENSION_ID))
-                    .unwrap_or(false)
-            });
-
-        // Firefox 同规则：装了才要求清单有效（自愈外部删除 / 后装浏览器）。
-        let firefox_ok = !firefox_installed()
-            || firefox_nmh_dir()
-                .map(|dir| {
-                    std::fs::read_to_string(dir.join(MANIFEST_FILENAME))
-                        .map(|c| c.contains(&wrapper_str))
-                        .unwrap_or(false)
-                })
-                .unwrap_or(true);
-
-        !(chromium_ok && firefox_ok)
+        })
     }
 
     /// Human-readable browser name for an NMH manifest directory.
@@ -1620,46 +1700,27 @@ mod inner {
     }
 
     /// Read-only manifest check for one browser directory.
-    /// `wrapper_issue` surfaces a broken wrapper script once the manifest
-    /// itself checks out (manifests point at the wrapper, not the binary).
     fn diagnose_dir(
         dir: &Path,
         installed: bool,
         wrapper_str: &str,
         require_edge_origin: bool,
-        wrapper_issue: Option<&str>,
-    ) -> super::NmhTarget {
-        let location = dir.join(MANIFEST_FILENAME).to_string_lossy().into_owned();
-        let issue = match std::fs::read_to_string(dir.join(MANIFEST_FILENAME)) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                format!("manifest file missing: {}", location)
-            }
-            Err(e) => format!("manifest unreadable: {}: {e:#}", location),
-            Ok(content) => {
-                if !content.contains(wrapper_str) {
-                    format!("manifest does not point to current relay: {}", location)
-                } else if require_edge_origin && !content.contains(EDGE_EXTENSION_ID) {
-                    format!("missing Edge origin in manifest: {}", location)
-                } else {
-                    wrapper_issue.unwrap_or_default().to_string()
-                }
-            }
-        };
-        super::NmhTarget {
+    ) -> NmhTarget {
+        let manifest = dir.join(MANIFEST_FILENAME);
+        let issue = super::manifest_issue(&manifest, wrapper_str, require_edge_origin);
+        NmhTarget {
             label: label_for_dir(dir),
-            location,
+            location: manifest.to_string_lossy().into_owned(),
             installed,
             ok: issue.is_empty(),
             issue,
         }
     }
 
-    /// Read-only snapshot of the NMH registration state for the Doctor page.
-    ///
-    /// Never writes manifests, the wrapper script or any directory — the
-    /// judgement rules mirror `needs_update()` exactly.
-    pub fn diagnose() -> super::NmhDiagnosis {
-        let mut diag = super::NmhDiagnosis::empty();
+    /// Read-only snapshot of the NMH registration state for the Doctor page and
+    /// startup self-heal. Never writes manifests, the wrapper script or any directory.
+    pub fn diagnose() -> NmhDiagnosis {
+        let mut diag = NmhDiagnosis::default();
 
         let chromium_dirs = chromium_nmh_dirs();
         let firefox_dir = firefox_nmh_dir();
@@ -1680,28 +1741,14 @@ mod inner {
         diag.exe_path = nmh_exe.to_string_lossy().into_owned();
 
         // 无 home 时上面的目录列表同样为空，直接返回空快照。
-        let Some(home) = home_dir() else {
+        let Some(wp) = wrapper_path() else {
             return diag;
         };
-        let wp = home
-            .join("Library")
-            .join("Application Support")
-            .join("fluxdown")
-            .join(NMH_WRAPPER_NAME);
         let wrapper_str = wp.to_string_lossy().into_owned();
-        let wrapper_issue = if !wp.exists() {
-            Some(format!("wrapper script missing: {}", wrapper_str))
-        } else if std::fs::read_to_string(&wp)
-            .map(|c| c.contains(&diag.exe_path))
-            .unwrap_or(false)
-        {
-            None
-        } else {
-            Some(format!(
-                "wrapper script does not point to current relay: {}",
-                wrapper_str
-            ))
-        };
+        let (owner, relay) = super::diagnose_wrapper(&wp, &nmh_exe);
+        diag.relay_owner = owner;
+        diag.registered_relay = relay;
+        diag.relay_location = wrapper_str.clone();
 
         for dir in &chromium_dirs {
             diag.targets.push(diagnose_dir(
@@ -1709,27 +1756,20 @@ mod inner {
                 browser_installed(dir),
                 &wrapper_str,
                 true,
-                wrapper_issue.as_deref(),
             ));
         }
         if let Some(dir) = &firefox_dir {
-            diag.targets.push(diagnose_dir(
-                dir,
-                firefox_installed(),
-                &wrapper_str,
-                false,
-                wrapper_issue.as_deref(),
-            ));
+            diag.targets
+                .push(diagnose_dir(dir, firefox_installed(), &wrapper_str, false));
         }
 
         diag
     }
 
-    pub fn register() -> Result<(), io::Error> {
-        let nmh_exe = find_nmh_exe()?;
-
+    /// Point the wrapper script at `relay` and write manifests for installed browsers.
+    pub(super) fn register_with(relay: &Path) -> Result<(), io::Error> {
         // Write the shell wrapper script first; manifests point to it.
-        let wrapper = write_wrapper_script(&nmh_exe)?;
+        let wrapper = write_wrapper_script(relay)?;
         log_info!("[nmh_registry] NMH wrapper script: {}", wrapper.display());
 
         for dir in chromium_nmh_dirs() {
@@ -1766,8 +1806,8 @@ mod inner {
         }
 
         log_info!(
-            "[nmh_registry] NMH registered: exe={}, wrapper={}",
-            nmh_exe.display(),
+            "[nmh_registry] NMH registered: relay={}, wrapper={}",
+            relay.display(),
             wrapper.display()
         );
         Ok(())
@@ -1799,18 +1839,23 @@ mod inner {
 #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 mod inner {
     use std::io;
+    use std::path::{Path, PathBuf};
 
-    pub fn needs_update() -> bool {
-        false
+    pub(super) fn find_nmh_exe() -> Result<PathBuf, io::Error> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "unsupported platform",
+        ))
     }
 
     pub fn diagnose() -> super::NmhDiagnosis {
-        let mut diag = super::NmhDiagnosis::empty();
-        diag.exe_error = "unsupported platform".into();
-        diag
+        super::NmhDiagnosis {
+            exe_error: "unsupported platform".into(),
+            ..super::NmhDiagnosis::default()
+        }
     }
 
-    pub fn register() -> Result<(), io::Error> {
+    pub(super) fn register_with(_relay: &Path) -> Result<(), io::Error> {
         Ok(())
     }
 
@@ -1821,4 +1866,4 @@ mod inner {
 }
 
 #[allow(unused_imports)]
-pub use inner::{diagnose, needs_update, register, unregister};
+pub use inner::{diagnose, unregister};

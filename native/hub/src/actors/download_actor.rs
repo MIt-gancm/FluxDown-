@@ -971,15 +971,16 @@ pub async fn run(
     tokio::task::spawn_blocking(crate::compat_flags::clear_runasadmin_self);
 
     // Auto-register NMH (Native Messaging Host) for browser extension communication.
-    // Only re-registers when the registry is missing, incomplete, or stale (exe path changed).
-    tokio::task::spawn_blocking(|| {
-        if !crate::nmh_registry::needs_update() {
+    // Only rewrites a missing, broken or incomplete registration, and never takes
+    // it over from another healthy FluxDown install (see `nmh_registry::auto_register`).
+    tokio::task::spawn_blocking(|| match crate::nmh_registry::auto_register() {
+        Ok(crate::nmh_registry::AutoRegisterOutcome::UpToDate) => {
             log_info!("[actor] NMH already registered and up to date");
-            return;
         }
-        if let Err(e) = crate::nmh_registry::register() {
-            log_info!("[actor] NMH registration failed: {}", e);
+        Ok(crate::nmh_registry::AutoRegisterOutcome::Registered(relay)) => {
+            log_info!("[actor] NMH registered: relay={}", relay.display());
         }
+        Err(e) => log_info!("[actor] NMH registration failed: {e:#}"),
     });
 
     // 缓存浏览器扩展捕获的请求事务上下文（headers/method/body + per-item

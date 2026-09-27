@@ -68,6 +68,12 @@ SharedPreferences 门面，**便携模式**（`portable` 标记）写 `<exe>/por
 ### 其它服务/模型（新）
 `analytics_service.dart`（两条匿名事件，`ANALYTICS_APP_KEY` define + `analytics_enabled` 门控）、`update_service.dart`（changelog vs `APP_VERSION`，`update_channel` stable/frontier）、`platform_utils.dart`（便携检测 + 数据目录迁移，与 `data_dir.rs` 同步）、`resolve_variant_service.dart`（rinf 信号驱动全局弹窗）；`models/`：`plugin_provider`、`components_provider`（Ffmpeg/Ytdlp 控制器）、`ua_presets`（UA 单一事实源）、`custom_category`、`manifest_breadcrumb`。
 
+### 开机自启：`services/autostart_service.dart` ↔ agent `platform/autostart.rs`（同一语义）
+- **已启用** = 本应用条目存在且未被系统级开关禁用：Windows `Explorer\StartupApproved\Run\FluxDown` 首字节奇数 = 用户在系统设置 / 任务管理器关闭；Linux `[Desktop Entry]` 内 `Hidden=true` 或 `X-GNOME-Autostart-enabled=false`。macOS 登录项的后台许可无公开 API，只看条目本身。
+- **应用内开启** 写条目并清除系统禁用标记（Windows `StartupApproved` 写 `02 00…`，Linux 整份重写）；**关闭** 删条目（Windows 连 `StartupApproved` 值一起删）。
+- **启动时自动迁移**（Flutter `refreshRegistration`：`--silentStart` / 新路径；agent `migrate_legacy_autostart` → `retarget`：旧版指向桌面的条目改指 agent）只改写启动目标（`Run` 值 / `Exec` 行），**绝不**改系统级启用状态——不得复用 `enable` / launch_at_startup 的 `enable()`（后者强写 `StartupApproved=02`，曾导致用户在系统里关掉的自启被重新打开）。
+- 条目坐标：Windows 两端同用 `HKCU\…\Run` 值名 `FluxDown`（Flutter `"<FluxDown.exe>" --silentStart`、GPUI `"<fluxdown-agent.exe>" --autostart`，另见 `installer/windows/setup.iss`）；Linux Flutter `$XDG_CONFIG_HOME/autostart/FluxDown.desktop`（AppImage 指向 `$APPIMAGE`，不能用临时挂载路径），GPUI `fluxdown.desktop`；macOS Flutter 走 SMAppService 登录项（LaunchAtLogin，`--silentStart` 不会传入），GPUI 走 `~/Library/LaunchAgents/dev.zerx.fluxdown.desktop.plist`。
+
 ### 桌面 widgets 架构（不逐文件，按族看）
 - **视图系统**：`task_list` + `task_list_item`（行）、`task_columns`（列注册表，表头/行单一事实源）、`view_options_panel`（UI，backed by `models/view_prefs`）、`task_tab_bar`、`status_bar`、`sidebar`、`header_bar`。列表/网格双形态 + 舒适/紧凑双密度 + 多维分组吸顶 + 动态列。
 - **manifest 对话框族**：`manifest_select_dialog`/`manifest_select_view`（与 popup 共享）/`manifest_dialog_chrome`/`manifest_browse_list`/`manifest_advanced_panel`（backed by `models/manifest_selection`+`manifest_breadcrumb`）。

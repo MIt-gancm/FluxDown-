@@ -220,6 +220,16 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
     let mut nmh_task = tokio::spawn(
         crate::nmh::NmhService::new(daemon.clone(), capture.clone()).run(cancel.clone()),
     );
+    // 浏览器扩展靠 NMH 注册找到中继：启动时按归属规则自愈，不与并存的另一份 FluxDown 互相覆盖。
+    tokio::task::spawn_blocking(|| match crate::nmh::registry::auto_register() {
+        Ok(crate::nmh::registry::AutoRegisterOutcome::UpToDate) => {
+            tracing::debug!("NMH registration up to date");
+        }
+        Ok(crate::nmh::registry::AutoRegisterOutcome::Registered(relay)) => {
+            tracing::info!(relay = %relay.display(), "NMH registration repaired");
+        }
+        Err(error) => tracing::warn!(error = %error, "NMH auto-registration failed"),
+    });
     let diagnostics = Arc::new(crate::diagnostics::DiagnosticsService::new(
         daemon.clone(),
         daemon_config,

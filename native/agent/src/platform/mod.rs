@@ -175,17 +175,18 @@ pub fn set_autostart(enabled: bool) -> Result<(), PlatformError> {
 }
 
 /// 旧版自启条目直接拉起桌面程序（`fluxdown-desktop --minimized`）；启动时改写为 agent，
-/// 托盘驻留与「启动时最小化到托盘」才能在不开界面的情况下生效。
+/// 托盘驻留与「启动时最小化到托盘」才能在不开界面的情况下生效。只改写启动目标：
+/// 用户在系统层禁用的条目迁移后仍保持禁用。
 pub fn migrate_legacy_autostart() -> Result<(), PlatformError> {
     let Some(desktop) = desktop_executable() else {
         return Ok(());
     };
     let agent = agent_executable()?;
-    if autostart::is_enabled(&agent) || !autostart::targets(&desktop) {
+    if autostart::is_registered(&agent) || !autostart::targets(&desktop) {
         return Ok(());
     }
     tracing::info!("migrating legacy desktop autostart entry to fluxdown-agent");
-    autostart::enable(&agent)
+    autostart::retarget(&agent)
 }
 
 fn agent_executable() -> Result<PathBuf, PlatformError> {

@@ -2442,6 +2442,7 @@ class S {
   String get doctorCheckNmhBinary => _r('doctorCheckNmhBinary');
   String get doctorCheckNmhManifest => _r('doctorCheckNmhManifest');
   String get doctorCheckNmhBrowser => _r('doctorCheckNmhBrowser');
+  String get doctorCheckNmhRelay => _r('doctorCheckNmhRelay');
   String get doctorCheckAppListener => _r('doctorCheckAppListener');
   String get doctorCheckLocalServer => _r('doctorCheckLocalServer');
   String get doctorCheckUrlProtocol => _r('doctorCheckUrlProtocol');
@@ -2454,6 +2455,7 @@ class S {
   String get doctorLevelInfo => _r('doctorLevelInfo');
   String get doctorHintReinstallApp => _r('doctorHintReinstallApp');
   String get doctorHintReregisterNmh => _r('doctorHintReregisterNmh');
+  String get doctorHintNmhOtherInstall => _r('doctorHintNmhOtherInstall');
   String get doctorHintRestartApp => _r('doctorHintRestartApp');
   String get doctorHintEnableLocalServer => _r('doctorHintEnableLocalServer');
   String get doctorHintCheckFirewall => _r('doctorHintCheckFirewall');
@@ -2461,6 +2463,7 @@ class S {
   String get doctorHintProtocolClaimed => _r('doctorHintProtocolClaimed');
   String get doctorHintCheckDisk => _r('doctorHintCheckDisk');
   String get doctorActionReregister => _r('doctorActionReregister');
+  String get doctorActionUseThisInstall => _r('doctorActionUseThisInstall');
   String get doctorActionRestartListener => _r('doctorActionRestartListener');
   String get doctorActionEnableService => _r('doctorActionEnableService');
   String get doctorActionRegister => _r('doctorActionRegister');
@@ -2479,6 +2482,7 @@ class S {
     'nmh_binary' => doctorCheckNmhBinary,
     'nmh_manifest' => doctorCheckNmhManifest,
     'nmh_browser' => doctorCheckNmhBrowser,
+    'nmh_relay' => doctorCheckNmhRelay,
     'app_listener' => doctorCheckAppListener,
     'local_server' => doctorCheckLocalServer,
     'url_protocol' => doctorCheckUrlProtocol,
@@ -2500,6 +2504,7 @@ class S {
   String doctorHintLabel(String code) => switch (code) {
     'reinstall_app' => doctorHintReinstallApp,
     'reregister_nmh' => doctorHintReregisterNmh,
+    'nmh_other_install' => doctorHintNmhOtherInstall,
     'restart_app' => doctorHintRestartApp,
     'enable_local_server' => doctorHintEnableLocalServer,
     'check_firewall' => doctorHintCheckFirewall,

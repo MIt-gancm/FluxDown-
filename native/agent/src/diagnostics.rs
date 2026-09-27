@@ -23,6 +23,7 @@ use crate::state::{AgentState, StateStore};
 const CHECK_NMH_BINARY: &str = "nmh_binary";
 const CHECK_NMH_MANIFEST: &str = "nmh_manifest";
 const CHECK_NMH_BROWSER: &str = "nmh_browser";
+const CHECK_NMH_RELAY: &str = "nmh_relay";
 const CHECK_APP_LISTENER: &str = "app_listener";
 const CHECK_LOCAL_SERVER: &str = "local_server";
 const CHECK_DAEMON: &str = "daemon";
@@ -33,6 +34,7 @@ const CHECK_LOG_DIR: &str = "log_dir";
 /// 提示码；UI 映射 `doctorHint{Camel}`。
 const HINT_REINSTALL_APP: &str = "reinstall_app";
 const HINT_REREGISTER_NMH: &str = "reregister_nmh";
+const HINT_NMH_OTHER_INSTALL: &str = "nmh_other_install";
 const HINT_RESTART_APP: &str = "restart_app";
 const HINT_ENABLE_LOCAL_SERVER: &str = "enable_local_server";
 const HINT_CHECK_FIREWALL: &str = "check_firewall";
@@ -41,6 +43,8 @@ const HINT_CHECK_DISK: &str = "check_disk";
 
 /// 修复动作；UI 映射 `doctorAction{Camel}`，并作为 `repair` 的 `action`。
 pub const ACTION_REREGISTER: &str = "reregister";
+/// 把由另一份 FluxDown 提供的 NMH 注册改指向本安装；执行上与 `reregister` 相同。
+pub const ACTION_USE_THIS_INSTALL: &str = "use_this_install";
 pub const ACTION_ENABLE_SERVICE: &str = "enable_service";
 pub const ACTION_REGISTER: &str = "register";
 pub const ACTION_OPEN_LOG_DIR: &str = "open_log_dir";
@@ -126,7 +130,7 @@ impl DiagnosticsService {
     /// 执行修复动作；成功返回 `{ok:true}` 或 daemon RPC 的返回值。
     pub async fn repair(&self, params: &DiagnosticRepairParams) -> Result<Value, DiagnosticsError> {
         match params.action.as_str() {
-            ACTION_REREGISTER => {
+            ACTION_REREGISTER | ACTION_USE_THIS_INSTALL => {
                 spawn_blocking_io(crate::nmh::registry::register).await?;
                 Ok(json!({ "ok": true }))
             }
@@ -437,9 +441,9 @@ fn check(
     }
 }
 
-/// `nmh_binary`、`nmh_manifest`、每个浏览器一条 `nmh_browser`。
+/// `nmh_binary`、`nmh_manifest`、`nmh_relay`、每个浏览器一条 `nmh_browser`。
 fn nmh_checks(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> Vec<DiagnosticCheckDto> {
-    let mut checks = Vec::with_capacity(2 + diagnosis.targets.len());
+    let mut checks = Vec::with_capacity(3 + diagnosis.targets.len());
     if diagnosis.exe_path.is_empty() {
         checks.push(check(
             CHECK_NMH_BINARY,
@@ -463,6 +467,9 @@ fn nmh_checks(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> Vec<DiagnosticC
         &diagnosis.chromium_manifest,
         &diagnosis.firefox_manifest,
     ));
+    if !diagnosis.exe_path.is_empty() {
+        checks.push(relay_check(diagnosis));
+    }
     for target in &diagnosis.targets {
         let (level, detail, hint, repair) = if !target.installed {
             (
@@ -491,6 +498,55 @@ fn nmh_checks(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> Vec<DiagnosticC
         ));
     }
     checks
+}
+
+/// 注册入口（启动脚本 / 注册表键）实际指向哪个中继。这是所有浏览器共用的根因，只报一次；
+/// 指向另一份仍可用的 FluxDown 安装只是提示，扩展照常工作。
+fn relay_check(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> DiagnosticCheckDto {
+    use crate::nmh::registry::RelayOwner;
+
+    let location = &diagnosis.relay_location;
+    let relay = &diagnosis.registered_relay;
+    let (level, detail, hint, action) = match diagnosis.relay_owner {
+        RelayOwner::Current => (
+            DiagnosticLevel::Ok,
+            format!("{location} → {relay}"),
+            "",
+            None,
+        ),
+        RelayOwner::OtherInstall => (
+            DiagnosticLevel::Info,
+            format!("{location} → {relay} (another FluxDown installation)"),
+            HINT_NMH_OTHER_INSTALL,
+            Some(ACTION_USE_THIS_INSTALL),
+        ),
+        RelayOwner::Broken if relay.is_empty() => (
+            DiagnosticLevel::Error,
+            format!("{location} — cannot resolve relay path"),
+            HINT_REREGISTER_NMH,
+            Some(ACTION_REREGISTER),
+        ),
+        RelayOwner::Broken => (
+            DiagnosticLevel::Error,
+            format!("{location} → {relay} (relay missing or not executable)"),
+            HINT_REREGISTER_NMH,
+            Some(ACTION_REREGISTER),
+        ),
+        RelayOwner::Missing => (
+            DiagnosticLevel::Error,
+            format!("{location} — not registered"),
+            HINT_REREGISTER_NMH,
+            Some(ACTION_REREGISTER),
+        ),
+    };
+    check(
+        CHECK_NMH_RELAY,
+        "",
+        level,
+        detail,
+        hint,
+        action.map(|action| (action, "")),
+    )
 }
 
 /// Chromium 与 Firefox 两份清单都要存在；缺一份是安装未完成或清理工具误删的典型症状。
@@ -855,11 +911,12 @@ mod tests {
 
     use super::{
         ACTION_ENABLE_SERVICE, ACTION_OPEN_LOG_DIR, ACTION_REGISTER, ACTION_REREGISTER,
-        HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER, HINT_ENABLE_PROTOCOL, HINT_REINSTALL_APP,
-        HINT_REREGISTER_NMH, TARGET_TORRENT, daemon_export_url, daemon_log_dir, manifest_check,
-        nmh_checks, probe_local_server, probe_log_dir, shell_checks,
+        ACTION_USE_THIS_INSTALL, HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER, HINT_ENABLE_PROTOCOL,
+        HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP, HINT_REREGISTER_NMH, TARGET_TORRENT,
+        daemon_export_url, daemon_log_dir, manifest_check, nmh_checks, probe_local_server,
+        probe_log_dir, relay_check, shell_checks,
     };
-    use crate::nmh::registry::{NmhDiagnosis, NmhTarget};
+    use crate::nmh::registry::{NmhDiagnosis, NmhTarget, RelayOwner};
 
     fn target(label: &str, installed: bool, ok: bool) -> NmhTarget {
         NmhTarget {
@@ -879,37 +936,71 @@ mod tests {
     fn nmh_checks_map_levels_hints_and_repairs() {
         let diagnosis = NmhDiagnosis {
             exe_path: "/app/fluxdown_nmh".to_owned(),
-            exe_error: String::new(),
             chromium_manifest: "/missing/chromium.json".to_owned(),
             firefox_manifest: "/missing/firefox.json".to_owned(),
+            relay_location: "/data/fluxdown_nmh.sh".to_owned(),
+            registered_relay: "/app/fluxdown_nmh".to_owned(),
+            relay_owner: RelayOwner::Current,
             targets: vec![
                 target("Chrome", true, true),
                 target("Edge", true, false),
                 target("Firefox", false, false),
             ],
+            ..NmhDiagnosis::default()
         };
         let checks = nmh_checks(&diagnosis);
-        assert_eq!(checks.len(), 5);
+        assert_eq!(checks.len(), 6);
         assert_eq!(checks[0].id, "nmh_binary");
         assert_eq!(checks[0].level, DiagnosticLevel::Ok);
         assert_eq!(checks[1].id, "nmh_manifest");
         assert_eq!(checks[1].level, DiagnosticLevel::Error);
         assert_eq!(checks[1].hint, HINT_REREGISTER_NMH);
         assert!(checks[1].detail.contains("missing: chromium, firefox"));
-        assert_eq!(checks[2].target, "Chrome");
+        assert_eq!(checks[2].id, "nmh_relay");
         assert_eq!(checks[2].level, DiagnosticLevel::Ok);
-        assert!(checks[2].repair.is_none());
-        assert_eq!(checks[3].target, "Edge");
-        assert_eq!(checks[3].level, DiagnosticLevel::Error);
-        assert_eq!(checks[3].hint, HINT_REREGISTER_NMH);
+        assert_eq!(checks[3].target, "Chrome");
+        assert_eq!(checks[3].level, DiagnosticLevel::Ok);
+        assert!(checks[3].repair.is_none());
+        assert_eq!(checks[4].target, "Edge");
+        assert_eq!(checks[4].level, DiagnosticLevel::Error);
+        assert_eq!(checks[4].hint, HINT_REREGISTER_NMH);
         assert_eq!(
-            checks[3].repair.as_ref().map(|r| r.action.as_str()),
+            checks[4].repair.as_ref().map(|r| r.action.as_str()),
             Some(ACTION_REREGISTER)
         );
-        assert_eq!(checks[4].target, "Firefox");
-        assert_eq!(checks[4].level, DiagnosticLevel::Info);
-        assert!(checks[4].detail.contains("browser not installed"));
-        assert!(checks[4].hint.is_empty());
+        assert_eq!(checks[5].target, "Firefox");
+        assert_eq!(checks[5].level, DiagnosticLevel::Info);
+        assert!(checks[5].detail.contains("browser not installed"));
+        assert!(checks[5].hint.is_empty());
+    }
+
+    #[test]
+    fn relay_owned_by_another_install_is_info_but_broken_relay_is_an_error() {
+        let mut diagnosis = NmhDiagnosis {
+            exe_path: "/app/fluxdown_nmh".to_owned(),
+            relay_location: "/data/fluxdown_nmh.sh".to_owned(),
+            registered_relay: "/other/fluxdown_nmh".to_owned(),
+            relay_owner: RelayOwner::OtherInstall,
+            ..NmhDiagnosis::default()
+        };
+        let other = relay_check(&diagnosis);
+        assert_eq!(other.level, DiagnosticLevel::Info);
+        assert_eq!(other.hint, HINT_NMH_OTHER_INSTALL);
+        assert!(other.detail.contains("/other/fluxdown_nmh"));
+        assert_eq!(
+            other.repair.as_ref().map(|r| r.action.as_str()),
+            Some(ACTION_USE_THIS_INSTALL)
+        );
+        for owner in [RelayOwner::Broken, RelayOwner::Missing] {
+            diagnosis.relay_owner = owner;
+            let broken = relay_check(&diagnosis);
+            assert_eq!(broken.level, DiagnosticLevel::Error, "{owner:?}");
+            assert_eq!(broken.hint, HINT_REREGISTER_NMH);
+            assert_eq!(
+                broken.repair.as_ref().map(|r| r.action.as_str()),
+                Some(ACTION_REREGISTER)
+            );
+        }
     }
 
     #[test]

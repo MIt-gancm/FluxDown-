@@ -3,10 +3,10 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
-import 'package:launch_at_startup/launch_at_startup.dart';
 import 'package:rinf/rinf.dart';
 
 import '../bindings/bindings.dart';
+import '../services/autostart_service.dart';
 import '../services/log_service.dart';
 import 'custom_category.dart';
 import 'webhook_endpoint.dart';
@@ -1654,7 +1654,7 @@ class SettingsProvider extends ChangeNotifier {
   }
 
   /// 设置开机自启动，返回是否成功。
-  /// 操作后通过 [launchAtStartup.isEnabled] 验证注册表实际状态，
+  /// 操作后通过 [AutostartService.isEnabled] 验证系统实际状态，
   /// 若与预期不符则回滚 UI 状态。
   Future<bool> setAutoStartup(bool value) async {
     if (_autoStartup == value) return true;
@@ -1665,13 +1665,13 @@ class SettingsProvider extends ChangeNotifier {
 
     try {
       if (value) {
-        await launchAtStartup.enable();
+        await AutostartService.instance.enable();
       } else {
-        await launchAtStartup.disable();
+        await AutostartService.instance.disable();
       }
 
       // 验证实际状态
-      final actual = await launchAtStartup.isEnabled();
+      final actual = await AutostartService.instance.isEnabled();
       if (actual == value) {
         _saveToRust('auto_startup', value.toString());
         return true;
@@ -2212,11 +2212,11 @@ class SettingsProvider extends ChangeNotifier {
     _ => '',
   };
 
-  /// 启动时同步开机启动状态（从系统注册表读取实际状态）。
-  /// 移动端无开机启动概念，launch_at_startup 插件也未注册，直接跳过。
+  /// 启动时同步开机启动状态（从系统自启条目读取实际状态，含系统级禁用）。
+  /// 移动端无开机启动概念，直接跳过。
   Future<void> _syncAutoStartupState() async {
     if (Platform.isAndroid || Platform.isIOS) return;
-    final actual = await launchAtStartup.isEnabled();
+    final actual = await AutostartService.instance.isEnabled();
     if (_autoStartup != actual) {
       _autoStartup = actual;
       notifyListeners();

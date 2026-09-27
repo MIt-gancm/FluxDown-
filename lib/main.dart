@@ -4,7 +4,6 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:launch_at_startup/launch_at_startup.dart';
 import 'package:rinf/rinf.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 import 'src/widgets/flux_sonner.dart';
@@ -28,6 +27,7 @@ import 'src/services/resolve_variant_service.dart';
 import 'src/services/bt_file_selection_service.dart';
 import 'src/services/analytics_service.dart';
 import 'src/services/app_icon_service.dart';
+import 'src/services/autostart_service.dart';
 import 'src/services/log_service.dart';
 import 'src/services/kv_store.dart';
 import 'src/services/notification_service.dart';
@@ -214,40 +214,14 @@ Future<void> main(List<String> args) async {
   }();
 
   final autostartInit = () async {
-    // 注册时附带 --silentStart；Windows 路径加引号，避免空格截断。
-    launchAtStartup.setup(
-      appName: 'FluxDown',
-      appPath: Platform.isWindows
-          ? '"${Platform.resolvedExecutable}"'
-          : Platform.resolvedExecutable,
-      args: ['--silentStart'],
-    );
+    AutostartService.instance.setup();
     try {
-      bool needsReEnable = await launchAtStartup.isEnabled();
-      if (!needsReEnable && Platform.isWindows) {
-        // 精确值匹配检测不到安装程序或旧版本写入的旧条目，直接查注册表。
-        final regResult = await Process.run('reg', [
-          'query',
-          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-          '/v',
-          'FluxDown',
-        ]);
-        if (regResult.exitCode == 0) {
-          needsReEnable = true;
-          logInfo(
-            'main',
-            'found legacy/installer autostart entry, migrating to --silentStart',
-          );
-        }
-      }
-      if (needsReEnable) {
-        await launchAtStartup.enable();
-        logInfo('main', 'launchAtStartup re-enabled with --silentStart arg');
-      }
+      // 只迁移已存在条目的启动目标，不改系统级启用状态（用户在系统里关掉的自启保持关闭）。
+      await AutostartService.instance.refreshRegistration();
     } catch (e) {
-      logInfo('main', 'launchAtStartup refresh skipped: $e');
+      logInfo('main', 'autostart refresh skipped: $e');
     }
-    logInfo('main', 'launchAtStartup setup done');
+    logInfo('main', 'autostart setup done');
   }();
 
   final trayInit = () async {
