@@ -35,6 +35,8 @@ pub enum ButtonVariant {
     Primary,
     Secondary,
     Ghost,
+    /// 外链 / 跳转类文字操作：幽灵按钮外观 + `colors.accentText` 文字，悬停同样只做中性加深。
+    Link,
     Destructive,
 }
 
@@ -77,7 +79,7 @@ pub fn loading_button(
 fn text_button_frame(id: impl Into<ElementId>, variant: ButtonVariant, cx: &App) -> Button {
     let theme = active_theme(cx);
     let tokens = theme.tokens();
-    let palette = ButtonPalette::for_variant(variant, tokens.colors);
+    let palette = ButtonPalette::for_variant(variant, tokens.colors, theme.extended().colors);
 
     Button::new(id)
         .h(theme.density().control)
@@ -213,7 +215,7 @@ fn icon_button_frame(
 ) -> Button {
     let theme = active_theme(cx);
     let tokens = theme.tokens();
-    let palette = ButtonPalette::for_variant(variant, tokens.colors);
+    let palette = ButtonPalette::for_variant(variant, tokens.colors, theme.extended().colors);
 
     Button::new(id)
         .size(theme.density().control)
@@ -242,7 +244,11 @@ pub fn primary_icon_button(
     let theme = active_theme(cx);
     let tokens = theme.tokens();
     let label = label.into();
-    let palette = ButtonPalette::for_variant(ButtonVariant::Primary, tokens.colors);
+    let palette = ButtonPalette::for_variant(
+        ButtonVariant::Primary,
+        tokens.colors,
+        theme.extended().colors,
+    );
 
     Button::new(id)
         .h(theme.density().control)
@@ -344,8 +350,8 @@ pub fn navigation_button(
 
 /// 创建带图标与尾部信息的侧栏导航按钮。
 ///
-/// 选中态是中性底色 + 正文色 + 中等字重（强调色只留给主操作与进行中的下载），
-/// 未选中为二级文字色；图标颜色由调用方决定。
+/// 选中态是中性底色 + `navSelectedForeground` 文字 + 中等字重，未选中为二级文字色；
+/// 图标颜色由调用方决定，常规导航项用 [`nav_icon_color`]（选中时强调色落在图标上）。
 pub fn sidebar_navigation_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -361,7 +367,7 @@ pub fn sidebar_navigation_button(
     let (background, foreground, weight) = if selected {
         (
             extended.nav_selected,
-            tokens.colors.foreground,
+            extended.nav_selected_foreground,
             FontWeight::MEDIUM,
         )
     } else {
@@ -371,10 +377,10 @@ pub fn sidebar_navigation_button(
             FontWeight::NORMAL,
         )
     };
-    let hover_background = if selected {
-        extended.nav_selected
+    let (hover_background, hover_foreground) = if selected {
+        (extended.nav_selected, extended.nav_selected_foreground)
     } else {
-        extended.nav_hover
+        (extended.nav_hover, tokens.colors.foreground)
     };
 
     Button::new(id)
@@ -392,11 +398,7 @@ pub fn sidebar_navigation_button(
         .text_color(foreground)
         .text_size(tokens.typography.sm.size)
         .font_weight(weight)
-        .hover(move |style| {
-            style
-                .bg(hover_background)
-                .text_color(tokens.colors.foreground)
-        })
+        .hover(move |style| style.bg(hover_background).text_color(hover_foreground))
         .active(move |style| style.bg(extended.nav_selected))
         .focus_visible(move |style| style.bg(hover_background))
         .selected(selected)
@@ -413,10 +415,21 @@ pub fn sidebar_navigation_button(
         .child(trailing)
 }
 
+/// 导航项（侧栏、设置分类、活动栏、订阅源列表）的图标色：选中取 `navSelectedIcon`
+/// （强调色，保证与选中底色 ≥ 3:1），未选中取二级文字色。
+pub fn nav_icon_color(selected: bool, cx: &App) -> Hsla {
+    let theme = active_theme(cx);
+    if selected {
+        theme.extended().colors.nav_selected_icon
+    } else {
+        theme.tokens().colors.muted_foreground
+    }
+}
+
 /// 创建活动栏按钮。
 ///
-/// 选中态为中性底色 + 正文色图标；未选中为二级文字色图标，悬停时出现浅底。
-/// 活动栏与侧栏同为 `chrome` 底色，不用强调色块抢内容区的注意力。
+/// 选中态为中性底色 + 强调色图标（图标色由调用方经 [`nav_icon_color`] 决定）；未选中为
+/// 二级文字色图标，悬停时出现浅底。活动栏与侧栏同为 `chrome` 底色，不铺强调色块。
 pub fn activity_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -430,14 +443,14 @@ pub fn activity_button(
     let colors = tokens.colors;
     let extended = theme.extended().colors;
     let (background, foreground) = if selected {
-        (extended.nav_selected, colors.foreground)
+        (extended.nav_selected, extended.nav_selected_icon)
     } else {
         (transparent(extended.nav_hover), colors.muted_foreground)
     };
-    let hover_background = if selected {
-        extended.nav_selected
+    let (hover_background, hover_foreground) = if selected {
+        (extended.nav_selected, extended.nav_selected_icon)
     } else {
-        extended.nav_hover
+        (extended.nav_hover, colors.foreground)
     };
 
     // 颜色直接落在基础样式上：`styles.selected` 的 text_color 不会传给 svg 图标。
@@ -450,7 +463,7 @@ pub fn activity_button(
         .rounded(theme.components().nav_item_radius)
         .bg(background)
         .text_color(foreground)
-        .hover(move |style| style.bg(hover_background).text_color(colors.foreground))
+        .hover(move |style| style.bg(hover_background).text_color(hover_foreground))
         .active(move |style| style.bg(extended.nav_selected))
         .focus_visible(move |style| style.bg(hover_background))
         .accessibility_label(label)
@@ -519,7 +532,18 @@ struct ButtonPalette {
 }
 
 impl ButtonPalette {
-    fn for_variant(variant: ButtonVariant, colors: fluxdown_ui_theme::ColorTokens) -> Self {
+    fn for_variant(
+        variant: ButtonVariant,
+        colors: fluxdown_ui_theme::ColorTokens,
+        extended: fluxdown_ui_theme::ExtendedColors,
+    ) -> Self {
+        let ghost = Self {
+            background: transparent(colors.background),
+            foreground: colors.foreground,
+            border: transparent(colors.border),
+            hover: colors.muted,
+            active: shift_toward_contrast(colors.muted, 0.04),
+        };
         match variant {
             ButtonVariant::Primary => Self::filled(colors.primary, colors.primary_foreground),
             // 次要按钮：内容底色 + 描边（outline），悬停只做中性加深，不泛强调色。
@@ -530,12 +554,10 @@ impl ButtonPalette {
                 hover: colors.muted,
                 active: shift_toward_contrast(colors.muted, 0.04),
             },
-            ButtonVariant::Ghost => Self {
-                background: transparent(colors.background),
-                foreground: colors.foreground,
-                border: transparent(colors.border),
-                hover: colors.muted,
-                active: shift_toward_contrast(colors.muted, 0.04),
+            ButtonVariant::Ghost => ghost,
+            ButtonVariant::Link => Self {
+                foreground: extended.accent_text,
+                ..ghost
             },
             ButtonVariant::Destructive => {
                 Self::filled(colors.destructive, colors.destructive_foreground)

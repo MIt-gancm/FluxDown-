@@ -303,6 +303,7 @@ function defaultRef(spec: TokenSpec): string {
   const expr = spec.default;
   if (expr.kind === "ref" || expr.kind === "refAlpha" || expr.kind === "refOffset") return `{${expr.path}}`;
   if (expr.kind === "mix") return `{${expr.from}}`;
+  if (expr.kind === "contrast") return `{${expr.color}}`;
   return `{${refCandidates(spec)[0] ?? spec.path}}`;
 }
 

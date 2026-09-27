@@ -28,6 +28,7 @@ import {
   parseHexColor,
   parseWire,
   tokenValueJson,
+  withMinContrast,
   withOpacity,
   type Reference,
   type WireValue,
@@ -208,6 +209,18 @@ class Resolver {
             from.type === "color" ? from.color : TRANSPARENT,
             to.type === "color" ? to.color : TRANSPARENT,
             expr.amount[this.mode],
+          ),
+        };
+      }
+      case "contrast": {
+        const color = this.evalPath(expr.color);
+        const against = this.evalPath(expr.against);
+        return {
+          type: "color",
+          color: withMinContrast(
+            color.type === "color" ? color.color : TRANSPARENT,
+            against.type === "color" ? against.color : TRANSPARENT,
+            expr.min,
           ),
         };
       }

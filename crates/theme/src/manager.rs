@@ -321,99 +321,7 @@ fn install(
     let extended = &theme.extended;
 
     ComponentTheme::change(mode, None, cx);
-    {
-        let component_theme = ComponentTheme::global_mut(cx);
-        component_theme.apply_semantic_tokens(tokens);
-        component_theme.focus_ring = false;
-        // gpui-component 的对话框、输入框、Root 等取 `background`；FluxDown 的内容面统一是
-        // `surface`（chrome 区由各页显式着色），这里对齐，避免对话框发灰与白色内容区不一致。
-        component_theme.background = tokens.colors.surface;
-        component_theme.tokens.background = tokens.colors.surface.into();
-        // gpui-component 的 `text_base` 取 `font_size`（默认映射到 md=16px），
-        // 对桌面密度偏大；与 Flutter 桌面端 13px 正文基线对齐取 sm。
-        component_theme.font_size = tokens.typography.sm.size;
-        component_theme.title_bar = extended.colors.chrome;
-        component_theme.title_bar_border = extended.colors.hairline;
-        // gpui-component 的 Sidebar / Settings 侧栏只读 sidebar_* 系列，legacy
-        // `apply_semantic_tokens` 不会同步它们；不映射就会留在库默认的黑/白。
-        component_theme.sidebar = tokens.colors.surface;
-        component_theme.sidebar_foreground = tokens.colors.surface_foreground;
-        component_theme.sidebar_border = tokens.colors.border;
-        component_theme.sidebar_accent = tokens.colors.accent;
-        component_theme.sidebar_accent_foreground = tokens.colors.accent_foreground;
-        component_theme.sidebar_primary = tokens.colors.primary;
-        component_theme.sidebar_primary_foreground = tokens.colors.primary_foreground;
-        component_theme.tokens.sidebar = tokens.colors.surface.into();
-        component_theme.tokens.sidebar_foreground = tokens.colors.surface_foreground.into();
-        component_theme.tokens.sidebar_border = tokens.colors.border.into();
-        component_theme.tokens.sidebar_accent = tokens.colors.accent.into();
-        component_theme.tokens.sidebar_accent_foreground = tokens.colors.accent_foreground.into();
-        component_theme.tokens.sidebar_primary = tokens.colors.primary.into();
-        component_theme.tokens.sidebar_primary_foreground = tokens.colors.primary_foreground.into();
-        // legacy Button/Link 系列同样不在 apply_semantic_tokens 内；不同步则 gpui-component
-        // 的 `Button::primary()` 永远是库默认黑/白，不跟随强调色。
-        let colors = tokens.colors;
-        let primary_hover = shift_toward_contrast(colors.primary, 0.08);
-        let primary_active = shift_toward_contrast(colors.primary, 0.13);
-        let secondary_hover = shift_toward_contrast(colors.secondary, 0.05);
-        let secondary_active = shift_toward_contrast(colors.secondary, 0.09);
-        let danger_hover = shift_toward_contrast(colors.destructive, 0.08);
-        let danger_active = shift_toward_contrast(colors.destructive, 0.13);
-        component_theme.primary_hover = primary_hover;
-        component_theme.primary_active = primary_active;
-        component_theme.secondary_hover = secondary_hover;
-        component_theme.secondary_active = secondary_active;
-        component_theme.danger_hover = danger_hover;
-        component_theme.danger_active = danger_active;
-        component_theme.link = colors.primary;
-        component_theme.button_primary = colors.primary;
-        component_theme.button_primary_foreground = colors.primary_foreground;
-        component_theme.button_primary_hover = primary_hover;
-        component_theme.button_primary_active = primary_active;
-        component_theme.button_secondary = colors.secondary;
-        component_theme.button_secondary_foreground = colors.secondary_foreground;
-        component_theme.button_secondary_hover = secondary_hover;
-        component_theme.button_secondary_active = secondary_active;
-        component_theme.button_danger = colors.destructive;
-        component_theme.button_danger_foreground = colors.destructive_foreground;
-        component_theme.button_danger_hover = danger_hover;
-        component_theme.button_danger_active = danger_active;
-        component_theme.tokens.primary_hover = primary_hover.into();
-        component_theme.tokens.primary_active = primary_active.into();
-        component_theme.tokens.secondary_hover = secondary_hover.into();
-        component_theme.tokens.secondary_active = secondary_active.into();
-        component_theme.tokens.danger_hover = danger_hover.into();
-        component_theme.tokens.danger_active = danger_active.into();
-        component_theme.tokens.link = colors.primary.into();
-        component_theme.tokens.button_primary = colors.primary.into();
-        component_theme.tokens.button_primary_foreground = colors.primary_foreground.into();
-        component_theme.tokens.button_primary_hover = primary_hover.into();
-        component_theme.tokens.button_primary_active = primary_active.into();
-        component_theme.tokens.button_secondary = colors.secondary.into();
-        component_theme.tokens.button_secondary_foreground = colors.secondary_foreground.into();
-        component_theme.tokens.button_secondary_hover = secondary_hover.into();
-        component_theme.tokens.button_secondary_active = secondary_active.into();
-        component_theme.tokens.button_danger = colors.destructive.into();
-        component_theme.tokens.button_danger_foreground = colors.destructive_foreground.into();
-        component_theme.tokens.button_danger_hover = danger_hover.into();
-        component_theme.tokens.button_danger_active = danger_active.into();
-        // 下载列表不画网格：行分隔线与表头竖线都取透明，只靠悬停 / 选中底色
-        // 区分行；表头与内容同底色。列宽拖拽柄在悬停表头时仍按 `border` 显示。
-        let no_line = tokens.colors.surface.opacity(0.);
-        component_theme.table = tokens.colors.surface;
-        component_theme.table_active = tokens.colors.accent;
-        component_theme.table_active_border = tokens.colors.primary;
-        component_theme.table_even = tokens.colors.surface;
-        component_theme.table_head = tokens.colors.surface;
-        component_theme.table_head_foreground = extended.colors.text_tertiary;
-        component_theme.table_hover = extended.colors.row_hover;
-        component_theme.table_row_border = no_line;
-        component_theme.tokens.table = tokens.colors.surface.into();
-        component_theme.tokens.table_active = tokens.colors.accent.into();
-        component_theme.tokens.table_even = tokens.colors.surface.into();
-        component_theme.tokens.table_head = tokens.colors.surface.into();
-        component_theme.tokens.table_hover.background = extended.colors.row_hover.into();
-    }
+    project_onto_kit(ComponentTheme::global_mut(cx), &theme);
     ComponentTheme::sync_base(cx);
     {
         let base_theme = gpui_base::Theme::global_mut(cx);
@@ -435,6 +343,99 @@ fn install(
     if let Some(window) = window {
         window.refresh();
     }
+}
+
+/// 同时写 gpui-component 的 legacy 颜色字段与同名 `tokens` 字段（控件分别读两者）。
+macro_rules! paint {
+    ($kit:ident, $($field:ident = $value:expr),+ $(,)?) => {
+        $(
+            let value: gpui::Hsla = $value;
+            $kit.$field = value;
+            $kit.tokens.$field = value.into();
+        )+
+    };
+}
+
+/// 把解析后的 FluxDown token 投影到 gpui-component 主题。
+///
+/// `ComponentTheme::change` 按库默认主题（primary = neutral-900 / neutral-50）推导全部派生色，
+/// `apply_semantic_tokens` 只覆盖 17 个 Base 色；凡是库控件会读、又应跟随 FluxDown 主题的派生色
+/// 都必须在这里重写，否则停留在库默认的黑 / 白 / 灰。强调色派生取注册表 token，主题文件可覆盖。
+fn project_onto_kit(kit: &mut ComponentTheme, theme: &ResolvedTheme) {
+    let tokens = &theme.base;
+    let colors = tokens.colors;
+    let extended = theme.extended.colors;
+    kit.apply_semantic_tokens(tokens);
+    kit.focus_ring = false;
+    // gpui-component 的 `text_base` 取 `font_size`（默认映射到 md=16px），
+    // 对桌面密度偏大；与 Flutter 桌面端 13px 正文基线对齐取 sm。
+    kit.font_size = tokens.typography.sm.size;
+
+    let primary_hover = shift_toward_contrast(colors.primary, 0.08);
+    let primary_active = shift_toward_contrast(colors.primary, 0.13);
+    let secondary_hover = shift_toward_contrast(colors.secondary, 0.05);
+    let secondary_active = shift_toward_contrast(colors.secondary, 0.09);
+    let danger_hover = shift_toward_contrast(colors.destructive, 0.08);
+    let danger_active = shift_toward_contrast(colors.destructive, 0.13);
+    // 下载列表不画网格：行分隔线与表头竖线都取透明，只靠悬停 / 选中底色
+    // 区分行；表头与内容同底色。列宽拖拽柄在悬停表头时仍按 `border` 显示。
+    let no_line = colors.surface.opacity(0.);
+    paint!(
+        kit,
+        // 对话框、输入框、Root 等取 `background`；FluxDown 的内容面统一是 `surface`
+        // （chrome 区由各页显式着色），这里对齐，避免对话框发灰与白色内容区不一致。
+        background = colors.surface,
+        title_bar = extended.chrome,
+        title_bar_border = extended.hairline,
+        // Sidebar / Settings 侧栏只读 sidebar_* 系列。
+        sidebar = colors.surface,
+        sidebar_foreground = colors.surface_foreground,
+        sidebar_border = colors.border,
+        sidebar_accent = colors.accent,
+        sidebar_accent_foreground = colors.accent_foreground,
+        sidebar_primary = colors.primary,
+        sidebar_primary_foreground = colors.primary_foreground,
+        // Button / Link 系列：`Button::primary()` 等。
+        primary_hover = primary_hover,
+        primary_active = primary_active,
+        secondary_hover = secondary_hover,
+        secondary_active = secondary_active,
+        danger_hover = danger_hover,
+        danger_active = danger_active,
+        button_primary = colors.primary,
+        button_primary_foreground = colors.primary_foreground,
+        button_primary_hover = primary_hover,
+        button_primary_active = primary_active,
+        button_secondary = colors.secondary,
+        button_secondary_foreground = colors.secondary_foreground,
+        button_secondary_hover = secondary_hover,
+        button_secondary_active = secondary_active,
+        button_danger = colors.destructive,
+        button_danger_foreground = colors.destructive_foreground,
+        button_danger_hover = danger_hover,
+        button_danger_active = danger_active,
+        // 强调色派生：链接、输入框光标与选区、列表选中、进度条、滑块、拖放。
+        link = extended.accent_text,
+        link_hover = extended.accent_text,
+        link_active = extended.accent_text,
+        caret = extended.caret,
+        selection = extended.text_selection,
+        list_active = colors.accent,
+        list_active_border = colors.primary,
+        progress_bar = extended.progress_fill,
+        slider_bar = colors.primary,
+        slider_thumb = colors.primary_foreground,
+        drag_border = extended.drag_border,
+        drop_target = extended.drop_target,
+        table = colors.surface,
+        table_active = colors.accent,
+        table_active_border = colors.primary,
+        table_even = colors.surface,
+        table_head = colors.surface,
+        table_head_foreground = extended.text_tertiary,
+        table_hover = extended.row_hover,
+        table_row_border = no_line,
+    );
 }
 
 /// 向对比方向偏移亮度：亮色变暗、暗色变亮（hover / active 派生）。

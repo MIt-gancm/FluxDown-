@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use fluxdown_ui_components::{
-    ControlExt as _, FluxIcon, segmented_tabs, sidebar_navigation_button,
+    ControlExt as _, FluxIcon, nav_icon_color, segmented_tabs, sidebar_navigation_button,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -149,16 +149,10 @@ impl SettingsView {
     }
 
     fn render_nav_item(&self, page: &SettingsPage, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = active_theme(cx);
-        let tokens = theme.tokens();
-        let icon_size = theme.extended().icon.lg;
+        let icon_size = active_theme(cx).extended().icon.lg;
         let selected = self.selected == page.title || self.selected == page.key;
         let key = SharedString::from(page.key);
-        let icon_color = if selected {
-            tokens.colors.foreground
-        } else {
-            tokens.colors.muted_foreground
-        };
+        let icon_color = nav_icon_color(selected, cx);
 
         sidebar_navigation_button(
             SharedString::from(format!("settings-nav-{}", page.key)),

@@ -273,11 +273,14 @@ impl DownloadView {
         };
         let view = cx.weak_entity();
 
+        // 限速生效时触发器用强调色文字，一眼可见当前被限速；未限速保持中性。
+        let limited_color = (value > 0).then(|| active_theme(cx).extended().colors.accent_text);
+
         status_button(element_id, cx)
             .child(status_button_content(
                 Some(icon),
                 Some(trigger_label),
-                None,
+                limited_color,
                 cx,
             ))
             .tooltip(title.clone())

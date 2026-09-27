@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use fluxdown_ui_components::activity_button as activity_bar_button;
+use fluxdown_ui_components::{activity_button as activity_bar_button, nav_icon_color};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -371,9 +371,7 @@ impl ShellView {
 
     fn route_button(&self, route: &ShellRoute, cx: &mut Context<Self>) -> AnyElement {
         let selected = self.active_route == Some(route.id);
-        let theme = active_theme(cx);
-        let colors = theme.tokens().colors;
-        let icon_size = theme.extended().icon.lg + ACTIVITY_ICON_EXTRA;
+        let icon_size = active_theme(cx).extended().icon.lg + ACTIVITY_ICON_EXTRA;
         let label = SharedString::from(self.translator.read(cx).text(route.label_key).to_owned());
         let tooltip_label = label.clone();
         let route_id = route.id;
@@ -390,11 +388,11 @@ impl ShellView {
                 activity_bar_button(
                     route.button_id,
                     label,
-                    route.icon.clone().size(icon_size).text_color(if selected {
-                        colors.foreground
-                    } else {
-                        colors.muted_foreground
-                    }),
+                    route
+                        .icon
+                        .clone()
+                        .size(icon_size)
+                        .text_color(nav_icon_color(selected, cx)),
                     selected,
                     ACTIVITY_BUTTON_SIZE,
                     cx,

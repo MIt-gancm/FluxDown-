@@ -6,8 +6,8 @@ use fluxdown_protocol::{
     method,
 };
 use fluxdown_ui_components::{
-    CheckState, ControlExt as _, FluxIcon, caption_number, check_mark, tabular_numbers,
-    toolbar_action_button,
+    CheckState, ControlExt as _, FluxIcon, caption_number, check_mark, nav_icon_color,
+    tabular_numbers, toolbar_action_button,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -523,10 +523,8 @@ impl RssView {
                     .child(Icon::new(FluxIcon::Rss).size(extended.icon.lg).text_color(
                         if unhealthy {
                             colors.destructive
-                        } else if selected {
-                            colors.foreground
                         } else {
-                            colors.muted_foreground
+                            nav_icon_color(selected, cx)
                         },
                     ))
                     .child(
@@ -539,7 +537,7 @@ impl RssView {
                                     .text_size(tokens.typography.sm.size)
                                     .line_height(tokens.typography.sm.line_height)
                                     .text_color(if selected {
-                                        colors.foreground
+                                        extended.colors.nav_selected_foreground
                                     } else {
                                         colors.muted_foreground
                                     })

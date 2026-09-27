@@ -510,7 +510,7 @@ fn theme_actions(translator: &Translator, disabled: bool, cx: &App) -> impl gpui
             row_button(
                 "appearance-theme-more",
                 translator.text("themeMore").to_owned(),
-                ButtonVariant::Ghost,
+                ButtonVariant::Link,
                 cx,
             )
             .on_click(|_, _, cx| cx.open_url(THEME_GALLERY_URL)),

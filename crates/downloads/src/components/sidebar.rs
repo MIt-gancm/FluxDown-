@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use fluxdown_protocol::{CustomCategoryDto, QueueDto};
 use fluxdown_ui_components::{
-    Button, FluxIcon, category_icon, sidebar_navigation_button, tabular_numbers,
+    Button, FluxIcon, category_icon, nav_icon_color, sidebar_navigation_button, tabular_numbers,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -208,7 +208,7 @@ impl DownloadView {
             })
     }
 
-    /// 普通导航行（分类子项 / 队列 / 设备）：点击选中；图标选中为正文色、未选中为二级文字色。
+    /// 普通导航行（分类子项 / 队列 / 设备）：点击选中；图标选中为强调色、未选中为二级文字色。
     fn nav_item(
         &self,
         id: impl Into<gpui::ElementId>,
@@ -220,12 +220,7 @@ impl DownloadView {
     ) -> Button {
         let (count, dot) = trailing;
         let selected = self.selected_item == selection;
-        let colors = active_theme(cx).tokens().colors;
-        let icon_color = if selected {
-            colors.foreground
-        } else {
-            colors.muted_foreground
-        };
+        let icon_color = nav_icon_color(selected, cx);
 
         sidebar_navigation_button(
             id,
@@ -271,7 +266,7 @@ impl DownloadView {
 
     /// 状态项：图标位在悬停时换成分类展开箭头（点击箭头只切换展开，Notion / Linear
     /// 式做法，不额外占一列缩进）；行其余部分点击切换展开并选中该状态。
-    /// 失败项在有失败任务时图标用 destructive 作为唯一提示。
+    /// 失败项在有失败任务时图标用 destructive、下载中有任务时用强调色，作为唯一的状态提示。
     fn status_item(
         &self,
         status: DownloadStatusFilter,
@@ -287,12 +282,12 @@ impl DownloadView {
         let count = self.filter_count(&filter, cx);
         let selection = SidebarSelection::Download(filter);
         let selected = self.selected_item == selection;
-        let icon_color = if status == DownloadStatusFilter::Failed && count > 0 {
-            colors.destructive
-        } else if selected {
-            colors.foreground
-        } else {
-            colors.muted_foreground
+        let icon_color = match status {
+            DownloadStatusFilter::Failed if count > 0 => colors.destructive,
+            DownloadStatusFilter::Incomplete if count > 0 => {
+                theme.extended().colors.nav_selected_icon
+            }
+            _ => nav_icon_color(selected, cx),
         };
 
         let status_glyph = div()

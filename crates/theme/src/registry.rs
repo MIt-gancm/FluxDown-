@@ -102,6 +102,13 @@ pub enum DefaultExpr {
         to: &'static str,
         amount: ByMode<f32>,
     },
+    /// 保持 `color` 的色相与饱和度，只沿亮度远离 `against`，直到 WCAG 对比度不低于
+    /// `min`（已达标则原样，alpha 不变）。任意强调色下都需要可读的文字 / 图标用它派生。
+    Contrast {
+        color: &'static str,
+        against: &'static str,
+        min: f32,
+    },
     /// 字面量（可按模式不同）。
     Literal(ByMode<Literal>),
     /// 按模式选择不同表达式。
@@ -199,6 +206,14 @@ const fn mix(from: &'static str, to: &'static str, dark: f32, light: f32) -> Def
         from,
         to,
         amount: ByMode { dark, light },
+    }
+}
+
+const fn contrast(color: &'static str, against: &'static str, min: f32) -> DefaultExpr {
+    DefaultExpr::Contrast {
+        color,
+        against,
+        min,
     }
 }
 
@@ -356,6 +371,34 @@ pub static TOKENS: &[TokenSpec] = &[
             dark: mix("colors.muted", "colors.surface", 0.15, 0.15),
             light: mix("colors.muted", "colors.border", 0.65, 0.65),
         }),
+    ),
+    // 选中导航项：文字默认保持正文色，图标取强调色并保证与选中底色 ≥ 3:1（WCAG 非文本）。
+    color(
+        "colors.navSelectedForeground",
+        DefaultExpr::Ref("colors.foreground"),
+    ),
+    color(
+        "colors.navSelectedIcon",
+        contrast("colors.primary", "colors.navSelected", 3.),
+    ),
+    // ── colors：强调色派生 ──
+    // 强调色文字（链接、生效中的状态、活跃计数）：与内容底色 ≥ 4.5:1（WCAG AA 正文）。
+    color(
+        "colors.accentText",
+        contrast("colors.primary", "colors.surface", 4.5),
+    ),
+    color("colors.caret", DefaultExpr::Ref("colors.accentText")),
+    color(
+        "colors.textSelection",
+        DefaultExpr::RefAlpha("colors.primary", 0.3),
+    ),
+    color(
+        "colors.dragBorder",
+        DefaultExpr::RefAlpha("colors.primary", 0.65),
+    ),
+    color(
+        "colors.dropTarget",
+        DefaultExpr::RefAlpha("colors.primary", 0.2),
     ),
     // ── colors：下载状态 ──
     color(
@@ -549,6 +592,16 @@ fn default_json(expr: &DefaultExpr) -> OrderedJson {
                 "light": (number_value(amount.light)),
             },
         }),
+        DefaultExpr::Contrast {
+            color,
+            against,
+            min,
+        } => ordered_json!({
+            "kind": "contrast",
+            "color": (*color),
+            "against": (*against),
+            "min": (number_value(*min)),
+        }),
         DefaultExpr::Literal(values) => ordered_json!({
             "kind": "literal",
             "value": { "dark": (literal_json(values.dark)), "light": (literal_json(values.light)) },
@@ -688,6 +741,10 @@ mod tests {
             DefaultExpr::Mix { from, to, .. } => {
                 out.push(from);
                 out.push(to);
+            }
+            DefaultExpr::Contrast { color, against, .. } => {
+                out.push(color);
+                out.push(against);
             }
             DefaultExpr::Mode(exprs) => {
                 referenced(&exprs.dark, out);

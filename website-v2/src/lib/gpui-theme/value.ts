@@ -135,6 +135,41 @@ export function mixSrgb(from: Hsla, to: Hsla, amount: number): Hsla {
   return hslaFromRgb({ r: lerp(a.r, b.r), g: lerp(a.g, b.g), b: lerp(a.b, b.b), a: 1 });
 }
 
+/** Rust `relative_luminance`（WCAG 相对亮度，逐步 f32；alpha 不参与）。 */
+export function relativeLuminance(color: Hsla): number {
+  const { r, g, b } = rgbFromHsla(color);
+  const linear = (channel: number) =>
+    channel <= f(0.03928) ? f(channel / f(12.92)) : f(Math.pow(f(f(channel + f(0.055)) / f(1.055)), f(2.4)));
+  return f(f(f(f(0.2126) * linear(r)) + f(f(0.7152) * linear(g))) + f(f(0.0722) * linear(b)));
+}
+
+/** 相对亮度的黑白分界（Rust `CONTRAST_PIVOT`）。 */
+const CONTRAST_PIVOT = f(0.17913);
+const CONTRAST_STEP = f(0.01);
+
+/** WCAG 对比度（参数为相对亮度，顺序无关）。 */
+function contrastRatio(a: number, b: number): number {
+  const [light, dark] = a > b ? [a, b] : [b, a];
+  return f(f(light + f(0.05)) / f(dark + f(0.05)));
+}
+
+/**
+ * 注册表 `contrast` 表达式（Rust `with_min_contrast`）：保持色相 / 饱和度 / alpha，沿亮度远离
+ * `against`，直到对比度 ≥ `min` 或亮度到头；已达标原样返回。
+ */
+export function withMinContrast(color: Hsla, against: Hsla, min: number): Hsla {
+  const background = relativeLuminance(against);
+  const darken = background > CONTRAST_PIVOT;
+  const target = f(min);
+  let current = color;
+  for (;;) {
+    if (contrastRatio(relativeLuminance(current), background) >= target) return current;
+    const next = darken ? Math.max(f(current.l - CONTRAST_STEP), 0) : Math.min(f(current.l + CONTRAST_STEP), 1);
+    if (next === current.l) return current;
+    current = { ...current, l: next };
+  }
+}
+
 export function tokenValueJson(value: TokenValue): Json {
   switch (value.type) {
     case "color":

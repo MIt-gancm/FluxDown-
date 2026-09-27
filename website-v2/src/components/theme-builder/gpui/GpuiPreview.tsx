@@ -485,9 +485,9 @@ export function GpuiPreview({
                 style={{
                   borderRadius: v("components.navItem.radius"),
                   backgroundColor: index === 0 ? v("colors.navSelected") : undefined,
-                  color: index === 0 ? v("colors.foreground") : v("colors.mutedForeground"),
+                  color: index === 0 ? v("colors.navSelectedIcon") : v("colors.mutedForeground"),
                 }}
-                {...tokenAttrs("components.navItem.radius", "colors.navSelected", "colors.navHover", "colors.foreground", "colors.mutedForeground")}
+                {...tokenAttrs("components.navItem.radius", "colors.navSelected", "colors.navHover", "colors.navSelectedIcon", "colors.mutedForeground")}
               >
                 <Icon style={{ width: v("icon.lg"), height: v("icon.lg") }} />
               </span>
@@ -531,7 +531,11 @@ export function GpuiPreview({
             const active = folder === key && category === null;
             const open = expanded === key;
             const iconColor =
-              key === "failed" && failedCount > 0 ? v("colors.destructive") : active ? v("colors.foreground") : v("colors.mutedForeground");
+              key === "failed" && failedCount > 0
+                ? v("colors.destructive")
+                : (key === "downloading" && count > 0) || active
+                  ? v("colors.navSelectedIcon")
+                  : v("colors.mutedForeground");
             return (
               <div key={key}>
                 <button
@@ -546,11 +550,12 @@ export function GpuiPreview({
                     height: v("density.navRow"),
                     borderRadius: v("components.navItem.radius"),
                     backgroundColor: active ? v("colors.navSelected") : undefined,
+                    color: active ? v("colors.navSelectedForeground") : v("colors.mutedForeground"),
                     paddingInline: v("spacing.sm"),
                     gap: v("spacing.sm"),
                     ...text("sm"),
                   }}
-                  {...tokenAttrs("density.navRow", "components.navItem.radius", "colors.navSelected", "colors.navHover", "colors.foreground", "colors.mutedForeground")}
+                  {...tokenAttrs("density.navRow", "components.navItem.radius", "colors.navSelected", "colors.navHover", "colors.navSelectedForeground", "colors.navSelectedIcon", "colors.mutedForeground")}
                 >
                   <ChevronRight
                     className="shrink-0 transition-transform"
@@ -586,12 +591,12 @@ export function GpuiPreview({
                           paddingLeft: `calc(${v("spacing.sm")} + ${v("spacing.lg")})`,
                           paddingRight: v("spacing.sm"),
                           gap: v("spacing.sm"),
-                          color: catActive ? v("colors.foreground") : v("colors.mutedForeground"),
+                          color: catActive ? v("colors.navSelectedForeground") : v("colors.mutedForeground"),
                           ...text("sm"),
                         }}
-                        {...tokenAttrs("density.navRow", "spacing.lg", "components.navItem.radius", "colors.navSelected", "colors.mutedForeground")}
+                        {...tokenAttrs("density.navRow", "spacing.lg", "components.navItem.radius", "colors.navSelected", "colors.navSelectedForeground", "colors.navSelectedIcon", "colors.mutedForeground")}
                       >
-                        <CatIcon className="shrink-0" style={iconMd} />
+                        <CatIcon className="shrink-0" style={{ ...iconMd, color: catActive ? v("colors.navSelectedIcon") : undefined }} />
                         <span className="min-w-0 flex-1 truncate">{t.categories[cat]}</span>
                         <span className="tabular-nums" style={{ ...text("caption"), fontFamily: v("typography.mono"), color: v("colors.textTertiary") }}>
                           {catCount}

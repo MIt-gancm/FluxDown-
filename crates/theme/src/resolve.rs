@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 
 use crate::builtin::{BuiltinBase, base_values};
 use crate::document::get_path;
-use crate::extended::primary_with_contrast;
+use crate::extended::{primary_with_contrast, with_min_contrast};
 use crate::json::OrderedJson;
 use crate::registry::{ByMode, DefaultExpr, Literal, TOKENS, TokenKind, TokenSpec, token};
 use crate::value::{
@@ -345,6 +345,15 @@ impl Resolver<'_> {
                 let from = self.eval_path(from)?.as_color().unwrap_or_default();
                 let to = self.eval_path(to)?.as_color().unwrap_or_default();
                 TokenValue::Color(mix(from, to, amount.get(self.mode)))
+            }
+            DefaultExpr::Contrast {
+                color,
+                against,
+                min,
+            } => {
+                let color = self.eval_path(color)?.as_color().unwrap_or_default();
+                let against = self.eval_path(against)?.as_color().unwrap_or_default();
+                TokenValue::Color(with_min_contrast(color, against, *min))
             }
             DefaultExpr::Literal(values) => literal_value(*values, self.mode),
             DefaultExpr::Mode(exprs) => {

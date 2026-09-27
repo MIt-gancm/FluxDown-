@@ -193,6 +193,41 @@
               "x-fluxdown-token": "colors.navSelected",
               "x-fluxdown-kind": "color"
             },
+            "navSelectedForeground": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.navSelectedForeground",
+              "x-fluxdown-kind": "color"
+            },
+            "navSelectedIcon": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.navSelectedIcon",
+              "x-fluxdown-kind": "color"
+            },
+            "accentText": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.accentText",
+              "x-fluxdown-kind": "color"
+            },
+            "caret": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.caret",
+              "x-fluxdown-kind": "color"
+            },
+            "textSelection": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.textSelection",
+              "x-fluxdown-kind": "color"
+            },
+            "dragBorder": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.dragBorder",
+              "x-fluxdown-kind": "color"
+            },
+            "dropTarget": {
+              "$ref": "#/$defs/color",
+              "x-fluxdown-token": "colors.dropTarget",
+              "x-fluxdown-kind": "color"
+            },
             "statusDownloading": {
               "$ref": "#/$defs/color",
               "x-fluxdown-token": "colors.statusDownloading",

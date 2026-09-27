@@ -470,6 +470,111 @@
       "scales": false
     },
     {
+      "path": "colors.navSelectedForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.foreground"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.navSelectedIcon",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "contrast",
+        "color": "colors.primary",
+        "against": "colors.navSelected",
+        "min": 3
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.accentText",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "contrast",
+        "color": "colors.primary",
+        "against": "colors.surface",
+        "min": 4.5
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.caret",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.accentText"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.textSelection",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "refAlpha",
+        "path": "colors.primary",
+        "alpha": 0.3
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.dragBorder",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "refAlpha",
+        "path": "colors.primary",
+        "alpha": 0.65
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.dropTarget",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "refAlpha",
+        "path": "colors.primary",
+        "alpha": 0.2
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
       "path": "colors.statusDownloading",
       "group": "colors",
       "kind": "color",

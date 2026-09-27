@@ -18,6 +18,7 @@ export type DefaultExpr =
   | { kind: "refAlpha"; path: string; alpha: number }
   | { kind: "refOffset"; path: string; offset: number }
   | { kind: "mix"; from: string; to: string; amount: ByMode<number> }
+  | { kind: "contrast"; color: string; against: string; min: number }
   | { kind: "literal"; value: ByMode<string | number> }
   | { kind: "byMode"; dark: DefaultExpr; light: DefaultExpr };
 
