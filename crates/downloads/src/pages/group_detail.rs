@@ -143,7 +143,7 @@ impl GroupDetailView {
         v_flex()
             .gap(tokens.spacing.sm)
             .p(tokens.spacing.md)
-            .border_b_1()
+            .border_b(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(
                 div()

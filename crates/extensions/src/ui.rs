@@ -4,17 +4,17 @@
 //! 标题 sm MEDIUM；说明 / 元信息 xs + 二级文字色；状态色只取扩展 token
 //! （成功 success、警示 warning、失败 destructive、进行中 primary）。
 
-use fluxdown_ui_theme::{CONTROL_HEIGHT, SemanticThemeTokens};
-use gpui::{Div, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, div, px};
+use fluxdown_ui_theme::FluxThemeState;
+use gpui::{Div, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, div};
 use gpui_component::{Icon, IconNamed, h_flex};
 
 use crate::pages::Frame;
 
-/// 卡片内的结构分隔线（hairline 1px）。
+/// 卡片内的结构分隔线（hairline，`stroke.thin` 粗）。
 pub(crate) fn divider(frame: Frame<'_>) -> Div {
     div()
         .w_full()
-        .h(px(1.))
+        .h(frame.extended.stroke.thin)
         .flex_none()
         .bg(frame.extended.colors.hairline)
 }
@@ -50,14 +50,15 @@ pub(crate) fn meta_text(text: impl Into<SharedString>, frame: Frame<'_>) -> Div 
         .child(text.into())
 }
 
-/// 中性小胶囊（来源 / 版本 / 计数等标签）：caption 字号、muted 底、二级文字色。
+/// 中性小胶囊（来源 / 版本 / 计数等标签）：caption 字号、muted 底、二级文字色、
+/// `components.badge.radius` 圆角。
 pub(crate) fn neutral_pill(text: impl Into<SharedString>, frame: Frame<'_>) -> Div {
     let caption = frame.extended.caption;
     div()
         .flex_none()
         .px(frame.tokens.spacing.sm)
         .py(frame.tokens.spacing.xxs)
-        .rounded(frame.tokens.radius.full)
+        .rounded(frame.components.badge_radius)
         .bg(frame.tokens.colors.muted)
         .text_size(caption.size)
         .line_height(caption.line_height)
@@ -105,16 +106,17 @@ pub(crate) fn status_line(
 pub(crate) fn path_box(
     text: impl Into<SharedString>,
     placeholder: bool,
-    tokens: &SemanticThemeTokens,
+    theme: &FluxThemeState,
 ) -> Div {
+    let tokens = theme.tokens();
     let sm = tokens.typography.sm;
     h_flex()
         .w_full()
-        .h(CONTROL_HEIGHT)
+        .h(theme.density().control)
         .px(tokens.spacing.md)
         .items_center()
         .rounded(tokens.radius.md)
-        .border_1()
+        .border(theme.extended().stroke.thin)
         .border_color(tokens.colors.border)
         .bg(tokens.colors.background)
         .child(

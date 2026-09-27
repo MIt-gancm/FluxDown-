@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_component::{Icon, TitleBar, h_flex, menu::AppMenuBar, tooltip::Tooltip, v_flex};
 
-use crate::{SHELL_TITLE_BAR_HEIGHT, assets::APP_LOGO_PATH};
+use crate::assets::APP_LOGO_PATH;
 
 /// shell 路由的稳定标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,7 +188,7 @@ impl AuxiliaryWindowView {
 
         // 显式 `.bg` 覆盖 gpui-component 默认渐变；`.h` 经 refine_style 覆盖默认 34px。
         title_bar
-            .h(SHELL_TITLE_BAR_HEIGHT)
+            .h(theme.density().title_bar)
             .bg(extended.chrome)
             .border_color(extended.hairline)
             .child(
@@ -340,7 +340,7 @@ impl ShellView {
 
         // 显式 `.bg` 覆盖 gpui-component 默认渐变；`.h` 经 refine_style 覆盖默认 34px。
         title_bar
-            .h(SHELL_TITLE_BAR_HEIGHT)
+            .h(theme.density().title_bar)
             .bg(extended.chrome)
             .border_color(extended.hairline)
             .child(

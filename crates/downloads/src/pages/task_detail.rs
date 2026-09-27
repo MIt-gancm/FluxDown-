@@ -18,7 +18,7 @@ use fluxdown_ui_components::{
     tabular_numbers,
 };
 use fluxdown_ui_i18n::Translator;
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, AppContext as _, ClipboardItem, Context, Div, Entity, EventEmitter,
     FontWeight, Hsla, InteractiveElement as _, IntoElement, ParentElement, SharedString,
@@ -38,7 +38,7 @@ use activity::ActivityFeed;
 use crate::{
     components::{
         segment_progress::render_segment_progress,
-        task_table::{PROGRESS_BAR_HEIGHT, progress_bar_color, progress_track_color, status_color},
+        task_table::{progress_bar_color, progress_track_color, status_color},
     },
     controller::{
         DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult, SeedLimits,
@@ -654,7 +654,7 @@ impl TaskDetailView {
         v_flex()
             .gap(tokens.spacing.md)
             .p(tokens.spacing.md)
-            .border_b_1()
+            .border_b(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(
                 h_flex()
@@ -761,7 +761,7 @@ impl TaskDetailView {
         v_flex()
             .gap(tokens.spacing.sm)
             .p(tokens.spacing.md)
-            .border_b_1()
+            .border_b(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(Self::render_head_title(name, cx))
             .child(render_segment_progress(
@@ -769,7 +769,8 @@ impl TaskDetailView {
                 progress,
                 (f32::from(window.viewport_size().width) - 2. * f32::from(tokens.spacing.md))
                     .max(0.),
-                PROGRESS_BAR_HEIGHT,
+                active_theme(cx).components().progress_height,
+                active_theme(cx).components().progress_radius,
                 bar_color,
                 progress_track_color(cx),
             ))
@@ -1070,7 +1071,7 @@ impl TaskDetailView {
             })
             .child(
                 div()
-                    .h(px(1.))
+                    .h(extended.stroke.thin)
                     .my(tokens.spacing.md)
                     .bg(extended.colors.hairline),
             )
@@ -1387,7 +1388,7 @@ pub(crate) fn detail_row(label: SharedString, value: impl IntoElement, cx: &App)
     h_flex()
         .items_center()
         .gap(tokens.spacing.md)
-        .min_h(CONTROL_HEIGHT)
+        .min_h(theme.density().control)
         .py(tokens.spacing.xxs)
         .child(
             div()

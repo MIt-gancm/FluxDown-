@@ -3,6 +3,8 @@
 use std::cmp::Ordering;
 
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
+use fluxdown_ui_theme::DensityTokens;
+use gpui::Pixels;
 use serde::{Deserialize, Serialize};
 
 use super::{DownloadTaskView, TaskState};
@@ -18,11 +20,12 @@ pub(crate) enum ViewDensity {
 }
 
 impl ViewDensity {
-    /// 任务行高：紧凑单行 30；舒适双行 44（13/18 正文 + 12/16 元信息 + 上下留白）。
-    pub(crate) fn row_height(self) -> f32 {
+    /// 任务行高：舒适双行取 `density.taskRow`（默认 44 = 13/18 正文 + 12/16 元信息 + 上下留白），
+    /// 紧凑单行取 `density.taskRowCompact`（默认 30）。
+    pub(crate) fn row_height(self, density: &DensityTokens) -> Pixels {
         match self {
-            Self::Comfortable => 44.,
-            Self::Compact => 30.,
+            Self::Comfortable => density.task_row,
+            Self::Compact => density.task_row_compact,
         }
     }
 

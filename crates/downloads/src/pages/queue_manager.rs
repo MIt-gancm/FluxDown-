@@ -509,7 +509,7 @@ impl QueueManagerView {
             .px(tokens.spacing.sm)
             .py(tokens.spacing.md)
             .bg(extended.colors.chrome)
-            .border_r_1()
+            .border_r(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(
                 h_flex()
@@ -593,7 +593,7 @@ impl QueueManagerView {
             .pb(tokens.spacing.md)
             .gap(tokens.spacing.sm)
             .items_center()
-            .border_b_1()
+            .border_b(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(
                 div()
@@ -911,7 +911,7 @@ impl QueueManagerView {
             .items_center()
             .gap(tokens.spacing.sm)
             .bg(extended.colors.chrome)
-            .border_t_1()
+            .border_t(extended.stroke.thin)
             .border_color(extended.colors.hairline);
         if !is_creating && !form.is_builtin() {
             footer = footer.child(

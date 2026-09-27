@@ -1,0 +1,13 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "tokens": {
+    "radius": { "md": 100 },
+    "spacing": { "xxl": 99 },
+    "typography": { "sm": { "size": 4 }, "md": { "lineHeight": 10 }, "lg": { "weight": 1000 } },
+    "stroke": { "thin": -1 },
+    "icon": { "lg": 2 },
+    "density": { "navRow": 200 },
+    "components": { "button": { "radius": "{spacing.xxl}" } }
+  }
+}

@@ -18,8 +18,8 @@ use fluxdown_ui_components::{
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, App, AppContext as _, ClickEvent, Context, Div, Hsla, InteractiveElement as _,
-    IntoElement, ParentElement, Pixels, SharedString, StatefulInteractiveElement as _, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, WeakEntity,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon, Sizable as _, Size, WindowExt as _,
@@ -41,21 +41,18 @@ use crate::{
 const SPEED_PRESETS_MB: [i64; 4] = [1, 5, 10, 50];
 /// 完成后关机延迟预设（分钟）。
 const SHUTDOWN_PRESETS_MIN: [i64; 4] = [1, 5, 10, 30];
-/// 状态栏高度。
-const STATUS_BAR_HEIGHT: Pixels = px(28.);
-/// 状态栏内按钮高度（在 28px 栏内上下各留 3px）；chrome 区小按钮统一此高度。
-const STATUS_CONTROL_HEIGHT: Pixels = px(22.);
 
-/// 状态栏带文字的小按钮外壳：ghost、22 高、横向 `spacing.xs`。
+/// 状态栏带文字的小按钮外壳：ghost、`density.statusControl` 高、横向 `spacing.xs`。
 ///
 /// gpui-component 按钮会按 `Size` 在内部 label 上覆盖字号与图标尺寸，所以内容一律经
 /// [`status_button_content`] 作为子元素传入，确保 caption 字号 + `icon.sm` 生效。
 fn status_button(id: &'static str, cx: &App) -> Button {
+    let theme = active_theme(cx);
     Button::new(id)
         .ghost()
         .with_size(Size::XSmall)
-        .h(STATUS_CONTROL_HEIGHT)
-        .px(active_theme(cx).tokens().spacing.xs)
+        .h(theme.density().status_control)
+        .px(theme.tokens().spacing.xs)
 }
 
 /// 状态栏按钮内容：可选图标 + 可选文字，caption 字号、等宽数字；`color` 为空时继承按钮前景色。
@@ -406,7 +403,7 @@ impl DownloadView {
             .collect();
 
         status_button("shutdown-trigger", cx)
-            .min_w(STATUS_CONTROL_HEIGHT)
+            .min_w(active_theme(cx).density().status_control)
             .child(status_button_content(Some(FluxIcon::Power), None, None, cx))
             .tooltip(if can_arm {
                 title.clone()
@@ -476,7 +473,9 @@ impl DownloadView {
         command: ToolbarCommand,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        let icon_size = active_theme(cx).extended().icon.sm;
+        let theme = active_theme(cx);
+        let icon_size = theme.extended().icon.sm;
+        let control_size = theme.density().status_control;
         let tooltip_label = label.clone();
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
@@ -484,7 +483,7 @@ impl DownloadView {
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .child(
                 toolbar_action_button(id, label, Icon::new(icon).size(icon_size), false, false, cx)
-                    .size(STATUS_CONTROL_HEIGHT)
+                    .size(control_size)
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.execute_toolbar(command, cx);
                     })),
@@ -508,6 +507,8 @@ impl DownloadView {
         let extended = theme.extended();
         let chrome = extended.colors.chrome;
         let hairline = extended.colors.hairline;
+        let stroke = extended.stroke.thin;
+        let bar_height = theme.density().status_bar;
         let caption_size = extended.caption.size;
         let caption_line_height = extended.caption.line_height;
         let icon_size = extended.icon.sm;
@@ -552,14 +553,14 @@ impl DownloadView {
 
         h_flex()
             .w_full()
-            .h(STATUS_BAR_HEIGHT)
+            .h(bar_height)
             .flex_none()
             .items_center()
             .justify_between()
             .gap(spacing.md)
             .px(spacing.sm)
             .bg(chrome)
-            .border_t_1()
+            .border_t(stroke)
             .border_color(hairline)
             .text_size(caption_size)
             .line_height(caption_line_height)

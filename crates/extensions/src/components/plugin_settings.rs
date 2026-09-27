@@ -10,7 +10,7 @@ use fluxdown_ui_components::{
     option_row,
 };
 use fluxdown_ui_i18n::Translator;
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AnyElement, AppContext as _, ClipboardItem, Context, Entity, IntoElement,
     ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
@@ -262,6 +262,7 @@ impl PluginSettingsForm {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let disabled = self.saving;
+        let control_height = active_theme(cx).density().control;
         match &self.controls[index] {
             FieldControl::Text(input) => Input::new(input)
                 .control(cx)
@@ -271,7 +272,7 @@ impl PluginSettingsForm {
                 .into_any_element(),
             FieldControl::Textarea(input) => Textarea::new(input)
                 .w_full()
-                .h(CONTROL_HEIGHT * 3.)
+                .h(control_height * 3.)
                 .text_size(active_theme(cx).tokens().typography.sm.size)
                 .disabled(disabled)
                 .into_any_element(),
@@ -335,7 +336,7 @@ impl PluginSettingsForm {
                                 )
                             })
                             .scrollable(true)
-                            .max_h(CONTROL_HEIGHT * 8.)
+                            .max_h(control_height * 8.)
                     })
                     .into_any_element()
             }
@@ -349,7 +350,7 @@ impl PluginSettingsForm {
                     path.clone()
                 };
                 input_with_action(
-                    ui::path_box(display, path.is_empty(), active_theme(cx).tokens()),
+                    ui::path_box(display, path.is_empty(), active_theme(cx)),
                     Button::new(("plugin-setting-folder", index))
                         .outline()
                         .icon(FluxIcon::FolderOpen)

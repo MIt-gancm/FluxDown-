@@ -129,6 +129,7 @@ impl ExtensionsView {
             translator: self.translator.read(cx),
             tokens: theme.tokens(),
             extended: theme.extended(),
+            components: theme.components(),
             stale: self.controller.is_stale(),
         };
         let Frame {
@@ -288,7 +289,7 @@ impl ExtensionsView {
                     this.child(form_field(
                         translator.text("pluginInstallDirLabel").to_owned(),
                         input_with_action(
-                            ui::path_box(display, dev_dir_empty, tokens),
+                            ui::path_box(display, dev_dir_empty, active_theme(cx)),
                             h_flex()
                                 .gap(tokens.spacing.sm)
                                 .items_center()

@@ -10,7 +10,7 @@ use fluxdown_ui_components::{
     toolbar_action_button,
 };
 use fluxdown_ui_i18n::Translator;
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, FontWeight, Hsla,
     InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, SharedString,
@@ -865,6 +865,7 @@ impl Render for RssView {
         let theme = active_theme(cx);
         let tokens = theme.tokens().clone();
         let extended = theme.extended().clone();
+        let control_height = theme.density().control;
         let colors = tokens.colors;
         let xs = tokens.typography.xs;
         let stale = self.controller.stale;
@@ -904,7 +905,7 @@ impl Render for RssView {
             .h_full()
             .min_h_0()
             .bg(extended.colors.chrome)
-            .border_r_1()
+            .border_r(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(
                 h_flex()
@@ -969,7 +970,7 @@ impl Render for RssView {
                     .px(tokens.spacing.lg)
                     .py(tokens.spacing.md)
                     .gap(tokens.spacing.md)
-                    .border_b_1()
+                    .border_b(extended.stroke.thin)
                     .border_color(extended.colors.hairline)
                     .child(
                         h_flex()
@@ -1109,12 +1110,12 @@ impl Render for RssView {
                         .gap(tokens.spacing.sm)
                         .px(tokens.spacing.lg)
                         .py(tokens.spacing.xxs)
-                        .border_b_1()
+                        .border_b(extended.stroke.thin)
                         .border_color(extended.colors.hairline)
                         .child(
                             h_flex()
                                 .id("rss-select-visible")
-                                .h(CONTROL_HEIGHT)
+                                .h(control_height)
                                 .items_center()
                                 .gap(tokens.spacing.md)
                                 .cursor_pointer()
@@ -1306,7 +1307,7 @@ impl Render for RssView {
                     .gap(tokens.spacing.md)
                     .px(tokens.spacing.lg)
                     .py(tokens.spacing.md)
-                    .border_b_1()
+                    .border_b(extended.stroke.thin)
                     .border_color(extended.colors.hairline)
                     .child(
                         v_flex()

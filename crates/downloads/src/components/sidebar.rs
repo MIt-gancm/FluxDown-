@@ -2,7 +2,7 @@ use std::time::Instant;
 
 use fluxdown_protocol::{CustomCategoryDto, QueueDto};
 use fluxdown_ui_components::{
-    Button, FluxIcon, NAV_ROW_HEIGHT, category_icon, sidebar_navigation_button, tabular_numbers,
+    Button, FluxIcon, category_icon, sidebar_navigation_button, tabular_numbers,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -29,8 +29,6 @@ use crate::{
 };
 
 const SHOW_SIDEBAR_CATEGORY_PREF: &str = "ui.show_sidebar_category";
-/// 分区标题行高。
-const SECTION_HEADER_HEIGHT: Pixels = px(24.);
 /// 运行中队列的状态圆点直径。
 const RUNNING_DOT_SIZE: Pixels = px(6.);
 /// 导航行悬停组：状态项的展开箭头只在所在行悬停（或已展开）时显示。
@@ -87,6 +85,7 @@ impl DownloadView {
         let header_color = extended.colors.text_tertiary;
         let caption = extended.caption;
         let chevron_size = extended.icon.sm;
+        let header_height = theme.density().section_header;
         let chevron_rotation = percentage(open_amount * 0.25);
         let this = cx.weak_entity();
         let hide_label = self.strings.hide_section.clone();
@@ -94,7 +93,7 @@ impl DownloadView {
         h_flex()
             .id(id)
             .group(SECTION_HEADER_GROUP)
-            .h(SECTION_HEADER_HEIGHT)
+            .h(header_height)
             .px(spacing.sm)
             .items_center()
             .justify_between()
@@ -546,7 +545,7 @@ impl DownloadView {
                 div()
                     .w_full()
                     .overflow_hidden()
-                    .h(NAV_ROW_HEIGHT * (category_count * open_amount))
+                    .h(active_theme(cx).density().nav_row * (category_count * open_amount))
                     .child(self.render_categories(status, cx)),
             )
     }
@@ -584,7 +583,7 @@ impl DownloadView {
                 div()
                     .w_full()
                     .overflow_hidden()
-                    .h(NAV_ROW_HEIGHT * (row_count * open_amount))
+                    .h(active_theme(cx).density().nav_row * (row_count * open_amount))
                     .child(body),
             )
     }
@@ -778,7 +777,7 @@ impl DownloadView {
                 div()
                     .w_full()
                     .overflow_hidden()
-                    .h(NAV_ROW_HEIGHT * (count * open_amount))
+                    .h(active_theme(cx).density().nav_row * (count * open_amount))
                     .child(v_flex().w_full().opacity(open_amount).children(items)),
             )
     }
@@ -844,7 +843,7 @@ impl DownloadView {
                 div()
                     .w_full()
                     .overflow_hidden()
-                    .h(NAV_ROW_HEIGHT * (count * open_amount))
+                    .h(active_theme(cx).density().nav_row * (count * open_amount))
                     .child(v_flex().w_full().opacity(open_amount).children(items)),
             )
     }

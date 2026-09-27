@@ -1,14 +1,15 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use gpui::{App, Global, Window};
+use gpui::{App, Global, SharedString, Window};
 use gpui_component::{Theme as ComponentTheme, ThemeMode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    AppearancePreferences, ExtendedTokens, FluxThemeDefinition, SemanticThemeTokens,
-    ensure_primary_contrast, normalize_ui_scale_percent,
+    AppearancePreferences, BuiltinThemeId, ComponentTokens, DensityTokens, Diagnostic,
+    ExtendedTokens, ResolveOptions, ResolvedTheme, SemanticThemeTokens, ThemeDocument,
+    ThemeSelection, normalize_ui_scale_percent, resolve_with,
 };
 
 /// 用户主题偏好；`System` 在每次安装时解析当前系统明暗模式。
@@ -31,28 +32,59 @@ impl ThemePreference {
     }
 }
 
+/// 亮暗两个槽位各自使用的主题文件。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThemeDocuments {
+    pub dark: Arc<ThemeDocument>,
+    pub light: Arc<ThemeDocument>,
+}
+
+impl ThemeDocuments {
+    /// 同一文件同时用于两个槽位。
+    #[must_use]
+    pub fn single(document: Arc<ThemeDocument>) -> Self {
+        Self {
+            dark: Arc::clone(&document),
+            light: document,
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, mode: ThemeMode) -> &Arc<ThemeDocument> {
+        match mode {
+            ThemeMode::Dark => &self.dark,
+            ThemeMode::Light => &self.light,
+        }
+    }
+}
+
 /// 当前应用主题的完整快照。
 ///
 /// gpui-component 的 legacy `Theme` 无法持久保存自定义 spacing/shadow；本全局状态
-/// 因此保留完整 Base token，并在每次切换后重新投影到 `gpui_base::Theme`。
+/// 因此保留完整解析结果，并在每次切换后重新投影到 `gpui_base::Theme`。
 #[derive(Clone)]
 pub struct FluxThemeState {
-    definition: Arc<FluxThemeDefinition>,
+    documents: ThemeDocuments,
     appearance: AppearancePreferences,
     mode: ThemeMode,
-    tokens: SemanticThemeTokens,
-    extended: ExtendedTokens,
+    theme: ResolvedTheme,
+    diagnostics: Arc<[Diagnostic]>,
 }
 
 impl Global for FluxThemeState {}
 
 impl FluxThemeState {
-    /// 当前主题定义（未缩放）。
-    pub fn definition(&self) -> &Arc<FluxThemeDefinition> {
-        &self.definition
+    /// 当前明暗模式正在使用的主题文件（未缩放）。
+    pub fn document(&self) -> &Arc<ThemeDocument> {
+        self.documents.get(self.mode)
     }
 
-    /// 用户当前的外观选项（内置主题、强调色、缩放、明暗偏好）。
+    /// 两个槽位的主题文件。
+    pub fn documents(&self) -> &ThemeDocuments {
+        &self.documents
+    }
+
+    /// 用户当前的外观选项（主题槽位、强调色、缩放、明暗偏好）。
     pub fn appearance(&self) -> &AppearancePreferences {
         &self.appearance
     }
@@ -72,59 +104,151 @@ impl FluxThemeState {
         self.appearance.ui_scale_percent
     }
 
-    /// 当前完整 Base token（已按界面缩放）；应用自有组件应只从这里取值。
-    pub fn tokens(&self) -> &SemanticThemeTokens {
-        &self.tokens
+    /// 完整运行时主题（已按界面缩放）。
+    pub fn resolved(&self) -> &ResolvedTheme {
+        &self.theme
     }
 
-    /// FluxDown 扩展 token（状态色、三级文字、字号/图标阶梯；已按界面缩放）。
+    /// 当前完整 Base token（已按界面缩放）；应用自有组件应只从这里取值。
+    pub fn tokens(&self) -> &SemanticThemeTokens {
+        &self.theme.base
+    }
+
+    /// FluxDown 扩展 token（扩展/状态/进度色、caption/title、图标、线宽、焦点环；已按界面缩放）。
     pub fn extended(&self) -> &ExtendedTokens {
-        &self.extended
+        &self.theme.extended
+    }
+
+    /// 控件高度阶梯（已按界面缩放，标题栏除外）。
+    pub fn density(&self) -> &DensityTokens {
+        &self.theme.density
+    }
+
+    /// 组件级 token（已按界面缩放）。
+    pub fn components(&self) -> &ComponentTokens {
+        &self.theme.components
+    }
+
+    /// 当前模式主题文件的解析诊断。
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
+/// 本机主题库中已加载的自定义主题（`custom:<id>` → 文件）。主题库的存取由调用方
+/// 实现，本 crate 只保存已解析的文件。
+#[derive(Default)]
+struct CustomThemes(HashMap<SharedString, Arc<ThemeDocument>>);
+
+impl Global for CustomThemes {}
+
+/// 提供（或替换）一个自定义主题；当前槽位正在使用该 id 时立即重新安装。
+pub fn register_custom_theme(
+    id: impl Into<SharedString>,
+    document: Arc<ThemeDocument>,
+    cx: &mut App,
+) {
+    let id = id.into();
+    cx.default_global::<CustomThemes>()
+        .0
+        .insert(id.clone(), document);
+    reinstall_if_selected(&id, cx);
+}
+
+/// 移除一个自定义主题；当前槽位正在使用该 id 时回退到内置默认主题。
+pub fn unregister_custom_theme(id: &str, cx: &mut App) {
+    let removed = cx
+        .try_global::<CustomThemes>()
+        .is_some_and(|themes| themes.0.contains_key(id));
+    if removed {
+        cx.global_mut::<CustomThemes>().0.remove(id);
+        reinstall_if_selected(id, cx);
+    }
+}
+
+/// 已提供的自定义主题。
+pub fn custom_theme(id: &str, cx: &App) -> Option<Arc<ThemeDocument>> {
+    cx.try_global::<CustomThemes>()
+        .and_then(|themes| themes.0.get(id).cloned())
+}
+
+fn reinstall_if_selected(id: &str, cx: &mut App) {
+    let Some(state) = cx.try_global::<FluxThemeState>() else {
+        return;
+    };
+    let appearance = state.appearance.clone();
+    let selected = [&appearance.dark_theme, &appearance.light_theme]
+        .into_iter()
+        .any(|selection| {
+            selection
+                .custom_id()
+                .is_some_and(|custom| custom.as_ref() == id)
+        });
+    if selected {
+        let documents = selection_documents(&appearance, cx);
+        install(documents, appearance, None, cx);
+    }
+}
+
+/// 槽位选择 → 主题文件；未提供的自定义主题回退到该槽位的内置默认主题。
+fn selection_documents(appearance: &AppearancePreferences, cx: &App) -> ThemeDocuments {
+    let document = |mode: ThemeMode| match appearance.theme(mode) {
+        ThemeSelection::Builtin(id) => Arc::new(ThemeDocument::builtin(*id)),
+        ThemeSelection::Custom(id) => custom_theme(id, cx)
+            .unwrap_or_else(|| Arc::new(ThemeDocument::builtin(BuiltinThemeId::default_for(mode)))),
+    };
+    ThemeDocuments {
+        dark: document(ThemeMode::Dark),
+        light: document(ThemeMode::Light),
     }
 }
 
 /// 在 `gpui_component::init` 后安装与 Flutter 客户端一致的默认主题。
 pub fn init(cx: &mut App) {
     let appearance = AppearancePreferences::default();
-    install(Arc::new(appearance.definition()), appearance, None, cx);
+    let documents = selection_documents(&appearance, cx);
+    install(documents, appearance, None, cx);
 }
 
 /// 返回当前完整主题状态。
 ///
-/// 调用方必须先执行 [`init`] 或 [`install_theme`]；桌面 shell 在创建任何 view 前
+/// 调用方必须先执行 [`init`] 或 [`install_document`]；桌面 shell 在创建任何 view 前
 /// 建立这一不变量。
 pub fn active_theme(cx: &App) -> &FluxThemeState {
     cx.global::<FluxThemeState>()
 }
 
-/// 安装任意主题定义并把完整 token 同步到 gpui-component 与 gpui-base。
+/// 把一个主题文件同时装入亮暗两个槽位并同步到 gpui-component 与 gpui-base。
 ///
-/// 其余外观选项（强调色、缩放）沿用当前状态；未初始化时取默认值。
-pub fn install_theme(
-    definition: Arc<FluxThemeDefinition>,
+/// 其余外观选项（强调色、缩放）沿用当前状态；未初始化时取默认值。之后的
+/// [`set_appearance`] 在主题槽位与强调色不变时继续沿用该文件。
+pub fn install_document(
+    document: Arc<ThemeDocument>,
     preference: ThemePreference,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
     let mut appearance = cx
         .try_global::<FluxThemeState>()
-        .map_or_else(AppearancePreferences::default, |state| state.appearance);
+        .map_or_else(AppearancePreferences::default, |state| {
+            state.appearance.clone()
+        });
     appearance.theme_mode = preference;
-    install(definition, appearance, window, cx);
+    install(ThemeDocuments::single(document), appearance, window, cx);
 }
 
-/// 应用一组外观选项。内置主题/强调色未变时沿用当前定义（含通过
-/// [`install_theme`] 装入的自定义定义），否则按内置预设重新解析。
+/// 应用一组外观选项。主题槽位/强调色未变时沿用当前文件（含通过
+/// [`install_document`] 装入的文件），否则按槽位选择重新取文件。
 pub fn set_appearance(
     appearance: AppearancePreferences,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
-    let definition = match cx.try_global::<FluxThemeState>() {
-        Some(state) if state.appearance.same_palette(&appearance) => Arc::clone(&state.definition),
-        _ => Arc::new(appearance.definition()),
+    let documents = match cx.try_global::<FluxThemeState>() {
+        Some(state) if state.appearance.same_palette(&appearance) => state.documents.clone(),
+        _ => selection_documents(&appearance, cx),
     };
-    install(definition, appearance, window, cx);
+    install(documents, appearance, window, cx);
 }
 
 /// 偏好快照 → 外观。读取 `appearance.theme_mode` / `appearance.dark_theme` /
@@ -147,7 +271,7 @@ pub fn set_theme_preference(
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
-    let mut appearance = active_theme(cx).appearance;
+    let mut appearance = active_theme(cx).appearance.clone();
     appearance.theme_mode = preference;
     set_appearance(appearance, window, cx);
 }
@@ -158,7 +282,7 @@ pub fn set_theme_preference(
 /// `Theme::font_size` 写入窗口 rem，因此这里通过缩放排版/间距/圆角 token
 /// 驱动所有窗口，无需逐窗口调用 `set_rem_size`。
 pub fn set_ui_scale(percent: u16, cx: &mut App) {
-    let mut appearance = active_theme(cx).appearance;
+    let mut appearance = active_theme(cx).appearance.clone();
     appearance.ui_scale_percent = normalize_ui_scale_percent(percent);
     set_appearance(appearance, None, cx);
 }
@@ -181,21 +305,25 @@ pub fn sync_system_theme(window: &mut Window, cx: &mut App) {
 }
 
 fn install(
-    definition: Arc<FluxThemeDefinition>,
+    documents: ThemeDocuments,
     appearance: AppearancePreferences,
     window: Option<&mut Window>,
     cx: &mut App,
 ) {
     let mode = appearance.theme_mode.resolve(cx);
-    let mut tokens = definition.tokens(mode).clone();
-    scale_tokens(&mut tokens, appearance.ui_scale());
-    ensure_primary_contrast(&mut tokens, mode);
-    let extended = ExtendedTokens::derive(&tokens, mode, appearance.ui_scale());
+    let options = ResolveOptions {
+        accent: Some(appearance.accent()),
+        ensure_primary_contrast: true,
+    };
+    let (values, diagnostics) = resolve_with(documents.get(mode), mode, &options);
+    let theme = values.to_theme(appearance.ui_scale());
+    let tokens = &theme.base;
+    let extended = &theme.extended;
 
     ComponentTheme::change(mode, None, cx);
     {
         let component_theme = ComponentTheme::global_mut(cx);
-        component_theme.apply_semantic_tokens(&tokens);
+        component_theme.apply_semantic_tokens(tokens);
         component_theme.focus_ring = false;
         // gpui-component 的对话框、输入框、Root 等取 `background`；FluxDown 的内容面统一是
         // `surface`（chrome 区由各页显式着色），这里对齐，避免对话框发灰与白色内容区不一致。
@@ -294,11 +422,11 @@ fn install(
         base_theme.resizable.handle = extended.colors.hairline;
     }
     cx.set_global(FluxThemeState {
-        definition,
+        documents,
         appearance,
         mode,
-        tokens,
-        extended,
+        theme,
+        diagnostics: diagnostics.into(),
     });
 
     for handle in cx.windows() {
@@ -309,81 +437,11 @@ fn install(
     }
 }
 
-/// 按界面缩放倍率放大尺寸类 token；颜色与字重不变。
-fn scale_tokens(tokens: &mut SemanticThemeTokens, scale: f32) {
-    if scale == 1. {
-        return;
-    }
-    let radius = &mut tokens.radius;
-    radius.sm *= scale;
-    radius.md *= scale;
-    radius.lg *= scale;
-    radius.xl *= scale;
-
-    let spacing = &mut tokens.spacing;
-    spacing.xxs *= scale;
-    spacing.xs *= scale;
-    spacing.sm *= scale;
-    spacing.md *= scale;
-    spacing.lg *= scale;
-    spacing.xl *= scale;
-    spacing.xxl *= scale;
-
-    let typography = &mut tokens.typography;
-    for text in [
-        &mut typography.xs,
-        &mut typography.sm,
-        &mut typography.md,
-        &mut typography.lg,
-        &mut typography.xl,
-        &mut typography.mono_md,
-    ] {
-        text.size *= scale;
-        text.line_height *= scale;
-    }
-
-    let shadow = &mut tokens.shadow;
-    for level in [&mut shadow.sm, &mut shadow.md, &mut shadow.lg] {
-        for box_shadow in level.iter_mut() {
-            box_shadow.offset.x *= scale;
-            box_shadow.offset.y *= scale;
-            box_shadow.blur_radius *= scale;
-            box_shadow.spread_radius *= scale;
-        }
-    }
-}
-
 /// 向对比方向偏移亮度：亮色变暗、暗色变亮（hover / active 派生）。
 fn shift_toward_contrast(color: gpui::Hsla, amount: f32) -> gpui::Hsla {
     let delta = if color.l >= 0.5 { -amount } else { amount };
     gpui::Hsla {
         l: (color.l + delta).clamp(0., 1.),
         ..color
-    }
-}
-#[cfg(test)]
-mod tests {
-    use gpui::px;
-
-    use super::scale_tokens;
-    use crate::FluxThemeDefinition;
-
-    #[test]
-    fn scale_tokens_scales_sizes_and_keeps_colors() {
-        let definition = FluxThemeDefinition::fluxdown_default();
-        let mut tokens = definition.light.clone();
-        scale_tokens(&mut tokens, 1.5);
-
-        assert_eq!(tokens.typography.md.size, px(24.));
-        assert_eq!(tokens.typography.sm.line_height, px(27.));
-        assert_eq!(tokens.spacing.md, px(18.));
-        assert_eq!(tokens.radius.md, px(9.));
-        assert_eq!(tokens.radius.full, definition.light.radius.full);
-        assert_eq!(tokens.shadow.md[0].blur_radius, px(12.));
-        assert_eq!(tokens.colors, definition.light.colors);
-
-        let mut unchanged = definition.light.clone();
-        scale_tokens(&mut unchanged, 1.);
-        assert_eq!(unchanged, definition.light);
     }
 }

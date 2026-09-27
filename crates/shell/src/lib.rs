@@ -12,17 +12,15 @@ use gpui_component::TitleBar;
 pub use assets::*;
 pub use view::*;
 
-/// 统一顶栏高度（逻辑像素）。交通灯按它垂直居中，故不随界面缩放。
+/// 交通灯对齐的顶栏高度（逻辑像素）：窗口创建时写入平台窗口选项，是窗口级而非主题值，
+/// 取 `density.titleBar` 的默认值（该 token 同样不随界面缩放）。标题栏本身按 token 渲染。
 const TITLE_BAR_HEIGHT_PX: f32 = 40.;
 /// macOS 交通灯按钮框高度（AppKit 标准窗口按钮 14×16 的高）。
 const TRAFFIC_LIGHT_BUTTON_HEIGHT_PX: f32 = 16.;
 /// 交通灯纵向偏移：按钮框在顶栏内垂直居中；横向与纵向留白一致。
 const TRAFFIC_LIGHT_INSET_PX: f32 = (TITLE_BAR_HEIGHT_PX - TRAFFIC_LIGHT_BUTTON_HEIGHT_PX) / 2.;
 
-/// shell 自绘标题栏（主窗口统一顶栏与辅助窗口标题栏）的高度。
-pub const SHELL_TITLE_BAR_HEIGHT: Pixels = px(TITLE_BAR_HEIGHT_PX);
-
-/// 交通灯在 [`SHELL_TITLE_BAR_HEIGHT`] 高的标题栏内垂直居中的位置。
+/// 交通灯在 [`TITLE_BAR_HEIGHT_PX`] 高的标题栏内垂直居中的位置。
 fn traffic_light_position() -> Point<Pixels> {
     point(px(TRAFFIC_LIGHT_INSET_PX), px(TRAFFIC_LIGHT_INSET_PX))
 }

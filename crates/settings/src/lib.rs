@@ -1,17 +1,19 @@
 //! GPUI 设置能力页面与设置分区。
 //!
 //! 设置通过共享的翻译 Entity 和主题全局状态更新 UI，不依赖其他业务能力；
-//! 全部读写经 [`SettingsPort`] 注入的单一 agent 会话。
+//! 全部读写经 [`SettingsPort`] 注入的单一 agent 会话，导入主题经 [`ThemeLibrary`] 存取本机文件。
 
 mod port;
 mod sections;
 mod store;
+mod theme_library;
 mod ui;
 mod view;
 mod webhook_view;
 
-pub use port::{PortFuture, SettingsPort};
+pub use port::{PortFuture, SettingsPort, StoredTheme, ThemeInfo, ThemeLibrary};
 pub use store::{SettingsError, SettingsErrorKind, SettingsStore};
+pub use theme_library::install_theme_library;
 pub use view::{ActivityBarToggle, SettingsContentSlots, SettingsView};
 pub use webhook_view::WebhookView;
 

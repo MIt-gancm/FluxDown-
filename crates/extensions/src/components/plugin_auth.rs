@@ -348,6 +348,7 @@ impl Render for PluginAuthDialog {
             translator,
             tokens: theme.tokens(),
             extended: theme.extended(),
+            components: theme.components(),
             stale: false,
         };
         let tokens = frame.tokens;

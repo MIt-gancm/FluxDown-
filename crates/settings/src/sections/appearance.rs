@@ -1,31 +1,42 @@
-//! 外观：语言、明暗模式、内置主题、强调色、界面缩放。
+//! 外观：语言、明暗模式、主题（内置 + 已导入，含导入 / 导出 / 删除）、强调色、界面缩放。
 //!
 //! 每个控件同时写入偏好（走 `agent.preferences.patch`）并立即通过主题 crate 生效；
 //! 偏好快照回流时 app 调用 `fluxdown_ui_theme::apply_appearance_preferences` 幂等对齐。
 
+use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{
     AccentScheme, AppearancePreferences, BuiltinThemeId, COLOR_SCHEME_KEY, CUSTOM_COLOR_KEY,
-    DARK_THEME_KEY, ExtendedTokens, LIGHT_THEME_KEY, THEME_MODE_KEY, ThemePreference, UI_SCALE_KEY,
-    UI_SCALE_PERCENTS, active_theme, argb_color, color_argb, foreground_for, set_appearance,
-    set_theme_preference, set_ui_scale,
+    ColorTokens, DARK_THEME_KEY, ExportMode, ExtendedTokens, LIGHT_THEME_KEY, THEME_MODE_KEY,
+    ThemeMode, ThemePreference, ThemeSelection, UI_SCALE_KEY, UI_SCALE_PERCENTS, active_theme,
+    argb_color, color_argb, foreground_for, set_appearance, set_theme_preference, set_ui_scale,
 };
 use gpui::{
-    App, AppContext as _, Entity, Hsla, InteractiveElement as _, IntoElement as _, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement as _, Styled, Subscription, Window, div,
-    prelude::FluentBuilder as _, px,
+    Anchor, App, AppContext as _, Entity, Hsla, InteractiveElement as _, IntoElement as _,
+    ParentElement, PathPromptOptions, Pixels, SharedString, StatefulInteractiveElement as _,
+    Styled, Subscription, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Icon,
+    Disableable as _, Icon, WindowExt as _,
+    button::Button,
     color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
+    notification::Notification,
     tooltip::Tooltip,
     v_flex,
 };
 
 use super::SectionContext;
-use crate::ui::{Control, SettingsPage, SettingsSection, meta_text};
+use crate::theme_library::{
+    self, ImportError, ImportOutcome, delete_theme, diagnostic_counts, export_document,
+    export_file_name, import_text, register_imported,
+};
+use crate::ui::{Control, SettingsPage, SettingsSection, meta_text, row_button};
 use crate::{component_locale, store::SettingsStore};
-use fluxdown_ui_components::FluxIcon;
+use fluxdown_ui_components::{ButtonVariant, ControlExt as _, FluxIcon};
+
+/// 主题画廊（Flutter `_ThemeActions` 的「更多主题」同一地址）。
+const THEME_GALLERY_URL: &str = "https://fluxdown.zerx.dev/themes";
 
 pub(crate) const LOCALE_KEY: &str = "general.locale";
 
@@ -138,13 +149,17 @@ pub fn theme_preference(value: &str) -> ThemePreference {
     }
 }
 
-// ───────────────────────── 内置主题卡片 ─────────────────────────
+// ───────────────────────── 主题卡片 ─────────────────────────
 
-/// 与 Flutter `_ThemeSelector` 一致：只展示与当前明暗模式同外观的预设卡片。
+/// 与 Flutter `_ThemeSelector` 一致：只展示可放进当前明暗槽位的卡片——同外观的内置预设，
+/// 以及按 [`theme_library::theme_available_in`] 判定可用的已导入主题（当前选中的导入主题
+/// 即使不匹配也显示，便于切走或删除）。卡片下方为导入 / 导出 / 更多主题操作。
 fn theme_cards_field(ctx: &SectionContext) -> Control {
     let store = ctx.store();
+    let translator = ctx.translator.clone();
     let dark_label = ctx.t("themeDarkTheme");
     let light_label = ctx.t("themeLightTheme");
+    let delete_label = ctx.t("delete");
     let labels: Vec<(BuiltinThemeId, SharedString)> = BuiltinThemeId::ALL
         .into_iter()
         .map(|id| (id, ctx.t(id.label_key())))
@@ -153,7 +168,7 @@ fn theme_cards_field(ctx: &SectionContext) -> Control {
         move |disabled: bool, _key: &SharedString, _window: &mut Window, cx: &mut App| {
             let state = active_theme(cx);
             let mode = state.mode();
-            let selected = state.appearance().builtin_theme(mode);
+            let selected = state.appearance().theme(mode).clone();
             let tokens = state.tokens().clone();
             let extended = state.extended().clone();
             let group_label = if mode.is_dark() {
@@ -162,48 +177,174 @@ fn theme_cards_field(ctx: &SectionContext) -> Control {
                 light_label.clone()
             };
 
+            let builtin_cards = BuiltinThemeId::presets_for(mode).map(|id| {
+                let label = labels
+                    .iter()
+                    .find(|(candidate, _)| *candidate == id)
+                    .map_or_else(
+                        || SharedString::from(id.wire_name()),
+                        |(_, label)| label.clone(),
+                    );
+                let store = store.clone();
+                theme_card(
+                    ThemeCard {
+                        element_id: SharedString::from(format!("theme-card-{}", id.wire_name())),
+                        label,
+                        preview: id.colors(),
+                        selected: selected == ThemeSelection::Builtin(id),
+                    },
+                    disabled,
+                    &tokens,
+                    &extended,
+                    move |cx| select_theme(ThemeSelection::Builtin(id), &store, cx),
+                    None,
+                )
+                .into_any_element()
+            });
+            let custom_cards = theme_library::imported_themes(cx)
+                .into_iter()
+                .filter(|theme| theme.available_in(mode) || selected.custom_id() == Some(&theme.id))
+                .map(|theme| {
+                    let selection = ThemeSelection::Custom(theme.id.clone());
+                    let select_store = store.clone();
+                    let delete_store = store.clone();
+                    let delete_id = theme.id.clone();
+                    let delete_translator = translator.clone();
+                    theme_card(
+                        ThemeCard {
+                            element_id: SharedString::from(format!(
+                                "theme-card-custom-{}",
+                                theme.id
+                            )),
+                            label: theme.name.clone(),
+                            preview: theme.preview(mode),
+                            selected: selected == selection,
+                        },
+                        disabled,
+                        &tokens,
+                        &extended,
+                        move |cx| select_theme(selection.clone(), &select_store, cx),
+                        Some(CardDelete {
+                            label: delete_label.clone(),
+                            on_delete: Box::new(move |window, cx| {
+                                delete_custom_theme(
+                                    &delete_id,
+                                    &delete_store,
+                                    &delete_translator,
+                                    window,
+                                    cx,
+                                );
+                            }),
+                        }),
+                    )
+                    .into_any_element()
+                });
+
             v_flex()
                 .w_full()
                 .gap(tokens.spacing.xs)
                 .child(meta_text(cx).child(group_label))
-                .child(h_flex().gap(tokens.spacing.sm).flex_wrap().children(
-                    BuiltinThemeId::presets_for(mode).map(|id| {
-                        let label = labels
-                            .iter()
-                            .find(|(candidate, _)| *candidate == id)
-                            .map_or_else(
-                                || SharedString::from(id.wire_name()),
-                                |(_, label)| label.clone(),
-                            );
-                        theme_card(
-                            id,
-                            label,
-                            id == selected,
-                            disabled,
-                            &tokens,
-                            &extended,
-                            store.clone(),
-                        )
-                    }),
-                ))
+                .child(
+                    h_flex()
+                        .gap(tokens.spacing.sm)
+                        .flex_wrap()
+                        .children(builtin_cards)
+                        .children(custom_cards),
+                )
+                .child(theme_actions(&translator, disabled, cx))
                 .into_any_element()
         },
     )
 }
 
-fn theme_card(
-    id: BuiltinThemeId,
+fn slot_key(mode: ThemeMode) -> &'static str {
+    if mode.is_dark() {
+        DARK_THEME_KEY
+    } else {
+        LIGHT_THEME_KEY
+    }
+}
+
+/// 把当前明暗槽位切到 `selection` 并写偏好（`builtin:<name>` / `custom:<id>`）。
+fn select_theme(selection: ThemeSelection, store: &Entity<SettingsStore>, cx: &mut App) {
+    let mut appearance = active_theme(cx).appearance().clone();
+    let mode = active_theme(cx).mode();
+    if *appearance.theme(mode) == selection {
+        return;
+    }
+    let value = selection.pref_value();
+    appearance.set_theme(mode, selection);
+    set_appearance(appearance, None, cx);
+    store.update(cx, |store, cx| {
+        store.set_pref_str(slot_key(mode), value, cx)
+    });
+}
+
+/// 删除已导入主题；任一槽位正选中它时回退到该槽位的内置默认主题并写偏好。
+fn delete_custom_theme(
+    id: &SharedString,
+    store: &Entity<SettingsStore>,
+    translator: &Translator,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Err(error) = delete_theme(id, cx) {
+        window.push_notification(
+            Notification::error(format!("{}: {error}", translator.text("themeDeleteError"))),
+            cx,
+        );
+        return;
+    }
+    let mut appearance = active_theme(cx).appearance().clone();
+    let fallback: Vec<ThemeMode> = [ThemeMode::Dark, ThemeMode::Light]
+        .into_iter()
+        .filter(|mode| appearance.theme(*mode).custom_id() == Some(id))
+        .collect();
+    for mode in &fallback {
+        appearance.set_builtin_theme(*mode, BuiltinThemeId::default_for(*mode));
+    }
+    if !fallback.is_empty() {
+        set_appearance(appearance.clone(), None, cx);
+        store.update(cx, |store, cx| {
+            for mode in fallback {
+                store.set_pref_str(slot_key(mode), appearance.theme(mode).pref_value(), cx);
+            }
+        });
+    }
+    cx.refresh_windows();
+}
+
+struct ThemeCard {
+    element_id: SharedString,
     label: SharedString,
+    preview: ColorTokens,
     selected: bool,
+}
+
+type WindowHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+struct CardDelete {
+    label: SharedString,
+    on_delete: WindowHandler,
+}
+
+fn theme_card(
+    card: ThemeCard,
     disabled: bool,
     tokens: &fluxdown_ui_theme::SemanticThemeTokens,
     extended: &ExtendedTokens,
-    store: Entity<SettingsStore>,
+    on_select: impl Fn(&mut App) + 'static,
+    delete: Option<CardDelete>,
 ) -> impl gpui::IntoElement {
+    let ThemeCard {
+        element_id,
+        label,
+        preview,
+        selected,
+    } = card;
     let colors = tokens.colors;
     let row_hover = extended.colors.row_hover;
     let check_size = extended.icon.sm;
-    let preview = id.colors();
     let bar = |width: gpui::DefiniteLength, color: Hsla| {
         div()
             .w(width)
@@ -248,9 +389,25 @@ fn theme_card(
                     preview.muted_foreground.opacity(0.4),
                 )),
         );
+    let delete_button = delete.filter(|_| !disabled).map(|delete| {
+        let CardDelete { label, on_delete } = delete;
+        div()
+            .id(SharedString::from(format!("{element_id}-delete")))
+            .flex_shrink_0()
+            .cursor_pointer()
+            .rounded(tokens.radius.sm)
+            .text_color(colors.muted_foreground)
+            .hover(move |style| style.text_color(colors.destructive))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .on_click(move |_, window, cx| {
+                cx.stop_propagation();
+                on_delete(window, cx);
+            })
+            .child(Icon::new(FluxIcon::X).size(check_size))
+    });
 
     div()
-        .id(SharedString::from(format!("theme-card-{}", id.wire_name())))
+        .id(element_id)
         .w(px(THEME_CARD_WIDTH))
         .p(tokens.spacing.sm)
         .rounded(tokens.radius.lg)
@@ -266,40 +423,235 @@ fn theme_card(
                 .when(!selected, |this| {
                     this.hover(move |style| style.bg(row_hover))
                 })
-                .on_click(move |_, _, cx| {
-                    let mut appearance = *active_theme(cx).appearance();
-                    let mode = active_theme(cx).mode();
-                    if appearance.builtin_theme(mode) == id {
-                        return;
-                    }
-                    appearance.set_builtin_theme(mode, id);
-                    set_appearance(appearance, None, cx);
-                    let key = if mode.is_dark() {
-                        DARK_THEME_KEY
-                    } else {
-                        LIGHT_THEME_KEY
-                    };
-                    store.update(cx, |store, cx| store.set_pref_str(key, id.pref_value(), cx));
-                })
+                .on_click(move |_, _, cx| on_select(cx))
         })
         .child(preview_element)
         .child(
             h_flex()
                 .mt(tokens.spacing.xs)
+                .gap(tokens.spacing.xs)
                 .justify_between()
                 .items_center()
                 .text_size(tokens.typography.xs.size)
                 .line_height(tokens.typography.xs.line_height)
                 .text_color(colors.foreground)
-                .child(label)
-                .when(selected, |this| {
-                    this.child(
-                        Icon::new(FluxIcon::Check)
-                            .size(check_size)
-                            .text_color(colors.primary),
-                    )
+                .child(div().min_w_0().truncate().child(label))
+                .child(
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap(tokens.spacing.xxs)
+                        .items_center()
+                        .when(selected, |this| {
+                            this.child(
+                                Icon::new(FluxIcon::Check)
+                                    .size(check_size)
+                                    .text_color(colors.primary),
+                            )
+                        })
+                        .children(delete_button),
+                ),
+        )
+}
+
+// ───────────────────────── 导入 / 导出 ─────────────────────────
+
+/// 「导入」「导出 ▾（仅差异 / 完整主题）」「更多主题」。
+fn theme_actions(translator: &Translator, disabled: bool, cx: &App) -> impl gpui::IntoElement {
+    let tokens = active_theme(cx).tokens();
+    let has_library = theme_library::library(cx).is_some();
+    let import_translator = translator.clone();
+    let export_items = [
+        (ExportMode::Diff, "themeExportDiff"),
+        (ExportMode::Full, "themeExportFull"),
+    ]
+    .map(|(mode, key)| {
+        (
+            mode,
+            SharedString::from(translator.text(key).to_owned()),
+            translator.clone(),
+        )
+    });
+    h_flex()
+        .mt(tokens.spacing.xs)
+        .gap(tokens.spacing.sm)
+        .flex_wrap()
+        .child(
+            row_button(
+                "appearance-theme-import",
+                translator.text("themeImport").to_owned(),
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(disabled || !has_library)
+            .on_click(move |_, window, cx| import_themes(import_translator.clone(), window, cx)),
+        )
+        .child(
+            Button::new("appearance-theme-export")
+                .outline()
+                .control(cx)
+                .label(translator.text("themeExport").to_owned())
+                .dropdown_caret(true)
+                .disabled(disabled)
+                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                    export_items
+                        .iter()
+                        .fold(menu, |menu, (mode, label, translator)| {
+                            let mode = *mode;
+                            let translator = translator.clone();
+                            menu.item(PopupMenuItem::new(label.clone()).on_click(
+                                move |_, window, cx| {
+                                    export_theme(mode, translator.clone(), window, cx)
+                                },
+                            ))
+                        })
                 }),
         )
+        .child(
+            row_button(
+                "appearance-theme-more",
+                translator.text("themeMore").to_owned(),
+                ButtonVariant::Ghost,
+                cx,
+            )
+            .on_click(|_, _, cx| cx.open_url(THEME_GALLERY_URL)),
+        )
+}
+
+/// 选择一个或多个主题文件（本格式 / v1 / Flutter FluxThemeJson），逐个解析并原样存入主题库，
+/// 成功的立即注册；结束后以通知汇总成功数、诊断（迁移 / 未知键 / 非法值 / 越界 / 新版本等）
+/// 与失败原因。
+fn import_themes(translator: Translator, window: &mut Window, cx: &mut App) {
+    let Some(library) = theme_library::library(cx) else {
+        return;
+    };
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: true,
+        prompt: Some(SharedString::from(
+            translator.text("themeImport").to_owned(),
+        )),
+    });
+    let window_handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = receiver.await else {
+            return;
+        };
+        let results = cx
+            .background_spawn(async move {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let name = path.file_name().map_or_else(
+                            || path.display().to_string(),
+                            |name| name.to_string_lossy().into_owned(),
+                        );
+                        let result = std::fs::read_to_string(&path)
+                            .map_err(ImportError::Read)
+                            .and_then(|text| import_text(library.as_ref(), &text));
+                        (name, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
+        let report = cx.update(|cx| import_report(results, &translator, cx));
+        let _ = window_handle.update(cx, move |_, window, cx| {
+            for notification in report {
+                window.push_notification(notification, cx);
+            }
+        });
+    })
+    .detach();
+}
+
+/// 注册成功项并生成汇总通知：成功数 / 各文件诊断计数 / 失败原因。
+fn import_report(
+    results: Vec<(String, Result<ImportOutcome, ImportError>)>,
+    translator: &Translator,
+    cx: &mut App,
+) -> Vec<Notification> {
+    let mut imported = 0usize;
+    let mut adjusted = Vec::new();
+    let mut failed = Vec::new();
+    for (name, result) in results {
+        match result {
+            Ok(outcome) => {
+                imported += 1;
+                let counts = diagnostic_counts(&outcome.diagnostics);
+                if !counts.is_empty() {
+                    let summary = counts
+                        .into_iter()
+                        .map(|(key, count)| format!("{} {count}", translator.text(key)))
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                    adjusted.push(format!("{name}: {summary}"));
+                }
+                register_imported(outcome.theme, cx);
+            }
+            Err(error) => {
+                let reason = translator.text(error.i18n_key());
+                failed.push(match error.io_detail() {
+                    Some(detail) => format!("{name}: {reason} ({detail})"),
+                    None => format!("{name}: {reason}"),
+                });
+            }
+        }
+    }
+    if imported > 0 {
+        cx.refresh_windows();
+    }
+
+    let mut notifications = Vec::new();
+    if imported > 0 {
+        notifications.push(Notification::success(format!(
+            "{} ({imported})",
+            translator.text("themeImportSuccess")
+        )));
+    }
+    if !adjusted.is_empty() {
+        notifications.push(
+            Notification::warning(adjusted.join("\n"))
+                .title(translator.text("themeImportDiagnosticsTitle").to_owned())
+                .autohide(false),
+        );
+    }
+    if !failed.is_empty() {
+        notifications.push(
+            Notification::error(failed.join("\n"))
+                .title(translator.text("themeImportError").to_owned())
+                .autohide(false),
+        );
+    }
+    notifications
+}
+
+/// 把当前明暗模式生效的主题导出为文件：`Diff` 只写与基底不同的值，`Full` 写出全部 token。
+/// 内置主题连同用户强调色一起导出。
+fn export_theme(mode: ExportMode, translator: Translator, window: &mut Window, cx: &mut App) {
+    let document = export_document(cx);
+    let text = document.to_json_pretty(mode);
+    let file_name = export_file_name(&document);
+    let directory = std::env::home_dir().unwrap_or_else(std::env::temp_dir);
+    let receiver = cx.prompt_for_new_path(&directory, Some(&file_name));
+    let window_handle = window.window_handle();
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(path))) = receiver.await else {
+            return;
+        };
+        let result = cx
+            .background_spawn(async move { std::fs::write(&path, text) })
+            .await;
+        let _ = window_handle.update(cx, move |_, window, cx| {
+            let notification = match result {
+                Ok(()) => Notification::success(translator.text("themeExportSuccess").to_owned()),
+                Err(error) => {
+                    Notification::error(format!("{}: {error}", translator.text("themeExportError")))
+                }
+            };
+            window.push_notification(notification, cx);
+        });
+    })
+    .detach();
 }
 
 // ───────────────────────── 强调色 ─────────────────────────
@@ -321,7 +673,7 @@ fn color_scheme_field(ctx: &SectionContext) -> Control {
     Control::custom(
         move |disabled: bool, _key: &SharedString, window: &mut Window, cx: &mut App| {
             let state = active_theme(cx);
-            let appearance = *state.appearance();
+            let appearance = state.appearance().clone();
             let tokens = state.tokens().clone();
             let icon_size = state.extended().icon.md;
 
@@ -332,7 +684,7 @@ fn color_scheme_field(ctx: &SectionContext) -> Control {
                     color_dot(
                         *scheme,
                         label.clone(),
-                        appearance,
+                        appearance.clone(),
                         disabled,
                         &tokens,
                         icon_size,
@@ -396,7 +748,7 @@ fn color_dot(
                     this.hover(move |style| style.border_color(colors.muted_foreground))
                 })
                 .on_click(move |_, _, cx| {
-                    let mut appearance = *active_theme(cx).appearance();
+                    let mut appearance = active_theme(cx).appearance().clone();
                     if appearance.color_scheme == scheme {
                         return;
                     }
@@ -438,7 +790,7 @@ fn custom_color_picker(
                         return;
                     }
                     slot.last_synced = argb;
-                    let mut appearance = *active_theme(cx).appearance();
+                    let mut appearance = active_theme(cx).appearance().clone();
                     appearance.color_scheme = AccentScheme::Custom;
                     appearance.custom_color = argb;
                     set_appearance(appearance, None, cx);

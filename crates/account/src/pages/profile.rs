@@ -245,6 +245,7 @@ fn plan_tag(
     let spacing = tokens.spacing;
     let caption = &extended.caption;
     let icon_size = extended.icon.sm;
+    let stroke = extended.stroke.thin;
     let crown = move |tint: Hsla| {
         Icon::empty()
             .path(CROWN_ICON_PATH)
@@ -264,7 +265,7 @@ fn plan_tag(
         "outline" => pill()
             .gap(spacing.xxs)
             .px(spacing.sm)
-            .border_1()
+            .border(stroke)
             .border_color(color)
             .bg(color.opacity(0.08))
             .child(crown(color))
@@ -277,7 +278,7 @@ fn plan_tag(
             .into_any_element(),
         "medal" => pill()
             .overflow_hidden()
-            .border_1()
+            .border(stroke)
             .border_color(color)
             .child(
                 div()

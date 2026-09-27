@@ -46,10 +46,10 @@ pub(crate) fn render(
         )
 }
 
-/// 行首图标块：`CONTROL_HEIGHT` 见方的中性底 + `icon.lg` 图标。
+/// 行首图标块：`density.control` 见方的中性底 + `icon.lg` 图标。
 fn row_icon(tokens: &SemanticThemeTokens, icon: impl IconNamed, cx: &App) -> impl IntoElement {
     div()
-        .size(fluxdown_ui_theme::CONTROL_HEIGHT)
+        .size(active_theme(cx).density().control)
         .flex_none()
         .flex()
         .items_center()
@@ -176,7 +176,7 @@ fn multi_device_row(
                 div()
                     .px(tokens.spacing.sm)
                     .py(tokens.spacing.xxs)
-                    .rounded(tokens.radius.full)
+                    .rounded(active_theme(cx).components().badge_radius)
                     .bg(tokens.colors.muted)
                     .text_size(caption.size)
                     .line_height(caption.line_height)

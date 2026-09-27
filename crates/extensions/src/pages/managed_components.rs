@@ -8,7 +8,7 @@ use fluxdown_protocol::{
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, IconControlExt as _, card, input_with_action, tabular_numbers,
 };
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement,
     SharedString, Styled, Window, div, prelude::FluentBuilder as _,
@@ -122,6 +122,7 @@ impl ExtensionsView {
             translator: self.translator.read(cx),
             tokens: theme.tokens(),
             extended: theme.extended(),
+            components: theme.components(),
             stale: self.controller.is_stale(),
         };
         let cards = COMPONENT_KINDS
@@ -237,6 +238,7 @@ impl ExtensionsView {
             tokens,
             extended,
             stale,
+            ..
         } = frame;
         let Some(status) = status else {
             // 快照已到但没有该组件：daemon 未编译组件支持（或当前平台不可用）。
@@ -409,6 +411,7 @@ impl ExtensionsView {
             tokens,
             extended,
             stale,
+            ..
         } = frame;
         let slot = component_slot(kind);
         let supported = status.is_none_or(|status| status.managed_supported);
@@ -435,7 +438,7 @@ impl ExtensionsView {
         let versions = ui.versions.clone();
         let selected = ui.selected_version.clone();
         let view = cx.entity().downgrade();
-        let menu_max_h = CONTROL_HEIGHT * 8.;
+        let menu_max_h = active_theme(cx).density().control * 8.;
         v_flex()
             .w_full()
             .gap(tokens.spacing.sm)

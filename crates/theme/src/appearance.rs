@@ -3,16 +3,16 @@
 
 use std::collections::BTreeMap;
 
-use gpui::{Hsla, Rgba, rgb};
+use gpui::{Hsla, Rgba, SharedString, rgb};
 use gpui_component::ThemeMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{FluxThemeDefinition, ThemePreference};
+use crate::ThemePreference;
 
 /// 云同步目录键：`ThemeMode.name`（`system` | `light` | `dark`）。
 pub const THEME_MODE_KEY: &str = "appearance.theme_mode";
-/// 云同步目录键：`builtin:<BuiltinThemeId.name>`（`custom:<id>` 为导入主题，桌面端不支持）。
+/// 云同步目录键：`builtin:<BuiltinThemeId.name>` 或 `custom:<id>`（本机主题库中的导入主题）。
 pub const DARK_THEME_KEY: &str = "appearance.dark_theme";
 /// 云同步目录键：同 [`DARK_THEME_KEY`]，亮色槽位。
 pub const LIGHT_THEME_KEY: &str = "appearance.light_theme";
@@ -211,12 +211,56 @@ pub fn normalize_ui_scale_percent(percent: u16) -> u16 {
     ((clamped + 5) / 10) * 10
 }
 
+/// 明暗槽位选中的主题。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ThemeSelection {
+    Builtin(BuiltinThemeId),
+    /// 本机主题库中的主题 id；文件内容由调用方经 [`crate::register_custom_theme`] 提供，
+    /// 未提供时该槽位回退到内置默认主题。
+    Custom(SharedString),
+}
+
+impl ThemeSelection {
+    /// 偏好值前缀：`custom:<id>`。
+    pub const CUSTOM_PREFIX: &'static str = "custom:";
+
+    /// 写入 `appearance.dark_theme` / `appearance.light_theme` 的值。
+    #[must_use]
+    pub fn pref_value(&self) -> String {
+        match self {
+            Self::Builtin(id) => id.pref_value(),
+            Self::Custom(id) => format!("{}{id}", Self::CUSTOM_PREFIX),
+        }
+    }
+
+    /// 解析偏好值；内置主题只接受与槽位外观一致的预设。
+    #[must_use]
+    pub fn parse(value: &str, mode: ThemeMode) -> Option<Self> {
+        if let Some(id) = value.strip_prefix(Self::CUSTOM_PREFIX) {
+            let id = id.trim();
+            return (!id.is_empty()).then(|| Self::Custom(SharedString::from(id.to_owned())));
+        }
+        BuiltinThemeId::parse(value)
+            .filter(|id| id.appearance() == mode)
+            .map(Self::Builtin)
+    }
+
+    /// 自定义主题 id。
+    #[must_use]
+    pub fn custom_id(&self) -> Option<&SharedString> {
+        match self {
+            Self::Custom(id) => Some(id),
+            Self::Builtin(_) => None,
+        }
+    }
+}
+
 /// 用户在外观页可调的全部选项；与偏好快照一一对应。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppearancePreferences {
     pub theme_mode: ThemePreference,
-    pub dark_theme: BuiltinThemeId,
-    pub light_theme: BuiltinThemeId,
+    pub dark_theme: ThemeSelection,
+    pub light_theme: ThemeSelection,
     pub color_scheme: AccentScheme,
     /// ARGB；仅在 `color_scheme == Custom` 时生效。
     pub custom_color: u32,
@@ -228,8 +272,8 @@ impl Default for AppearancePreferences {
     fn default() -> Self {
         Self {
             theme_mode: ThemePreference::System,
-            dark_theme: BuiltinThemeId::DefaultDark,
-            light_theme: BuiltinThemeId::DefaultLight,
+            dark_theme: ThemeSelection::Builtin(BuiltinThemeId::DefaultDark),
+            light_theme: ThemeSelection::Builtin(BuiltinThemeId::DefaultLight),
             color_scheme: AccentScheme::Blue,
             custom_color: DEFAULT_CUSTOM_COLOR,
             ui_scale_percent: 100,
@@ -247,8 +291,8 @@ impl AppearancePreferences {
                 .get(THEME_MODE_KEY)
                 .and_then(Value::as_str)
                 .map_or(defaults.theme_mode, parse_theme_mode),
-            dark_theme: parse_builtin(values.get(DARK_THEME_KEY), ThemeMode::Dark),
-            light_theme: parse_builtin(values.get(LIGHT_THEME_KEY), ThemeMode::Light),
+            dark_theme: parse_selection(values.get(DARK_THEME_KEY), ThemeMode::Dark),
+            light_theme: parse_selection(values.get(LIGHT_THEME_KEY), ThemeMode::Light),
             color_scheme: values
                 .get(COLOR_SCHEME_KEY)
                 .and_then(Value::as_str)
@@ -263,13 +307,6 @@ impl AppearancePreferences {
                 .and_then(parse_ui_scale_percent)
                 .unwrap_or(defaults.ui_scale_percent),
         }
-    }
-
-    /// 由内置主题对 + 强调色解析出完整主题定义。
-    #[must_use]
-    pub fn definition(&self) -> FluxThemeDefinition {
-        FluxThemeDefinition::builtin_pair(self.dark_theme, self.light_theme)
-            .with_accent(self.color_scheme, self.custom_color)
     }
 
     /// 生效的强调色。
@@ -290,20 +327,34 @@ impl AppearancePreferences {
         f64::from(self.ui_scale_percent) / 100.
     }
 
-    /// 指定槽位当前选中的内置主题。
+    /// 指定槽位当前选中的主题。
+    #[must_use]
+    pub fn theme(&self, mode: ThemeMode) -> &ThemeSelection {
+        match mode {
+            ThemeMode::Dark => &self.dark_theme,
+            ThemeMode::Light => &self.light_theme,
+        }
+    }
+
+    /// 指定槽位当前选中的内置主题；选中自定义主题时为该槽位的内置默认主题（即其回退）。
     #[must_use]
     pub fn builtin_theme(&self, mode: ThemeMode) -> BuiltinThemeId {
-        match mode {
-            ThemeMode::Dark => self.dark_theme,
-            ThemeMode::Light => self.light_theme,
+        match self.theme(mode) {
+            ThemeSelection::Builtin(id) => *id,
+            ThemeSelection::Custom(_) => BuiltinThemeId::default_for(mode),
         }
     }
 
     /// 设置指定槽位的内置主题。
     pub fn set_builtin_theme(&mut self, mode: ThemeMode, id: BuiltinThemeId) {
+        self.set_theme(mode, ThemeSelection::Builtin(id));
+    }
+
+    /// 设置指定槽位的主题。
+    pub fn set_theme(&mut self, mode: ThemeMode, selection: ThemeSelection) {
         match mode {
-            ThemeMode::Dark => self.dark_theme = id,
-            ThemeMode::Light => self.light_theme = id,
+            ThemeMode::Dark => self.dark_theme = selection,
+            ThemeMode::Light => self.light_theme = selection,
         }
     }
 
@@ -326,13 +377,12 @@ fn parse_theme_mode(value: &str) -> ThemePreference {
     }
 }
 
-/// 槽位只接受与其外观一致的内置主题；`custom:` 导入主题与未知值回退默认。
-fn parse_builtin(value: Option<&Value>, mode: ThemeMode) -> BuiltinThemeId {
+/// 槽位接受与其外观一致的内置主题或 `custom:<id>`；未知值回退默认。
+fn parse_selection(value: Option<&Value>, mode: ThemeMode) -> ThemeSelection {
     value
         .and_then(Value::as_str)
-        .and_then(BuiltinThemeId::parse)
-        .filter(|id| id.appearance() == mode)
-        .unwrap_or_else(|| BuiltinThemeId::default_for(mode))
+        .and_then(|value| ThemeSelection::parse(value, mode))
+        .unwrap_or_else(|| ThemeSelection::Builtin(BuiltinThemeId::default_for(mode)))
 }
 
 /// 接受 ARGB 整数（sync_catalog）或 6/8 位十六进制串（KvStore / 手输）。
@@ -390,8 +440,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AccentScheme, AppearancePreferences, BuiltinThemeId, DEFAULT_CUSTOM_COLOR, argb_color,
-        color_argb, normalize_ui_scale_percent, parse_hex_argb, rgb_hex,
+        AccentScheme, AppearancePreferences, BuiltinThemeId, DEFAULT_CUSTOM_COLOR, ThemeSelection,
+        argb_color, color_argb, normalize_ui_scale_percent, parse_hex_argb, rgb_hex,
     };
     use crate::ThemePreference;
 
@@ -421,8 +471,14 @@ mod tests {
             ("ui_scale", json!(1.2)),
         ]));
         assert_eq!(prefs.theme_mode, ThemePreference::Dark);
-        assert_eq!(prefs.dark_theme, BuiltinThemeId::Nord);
-        assert_eq!(prefs.light_theme, BuiltinThemeId::WarmLight);
+        assert_eq!(
+            prefs.dark_theme,
+            ThemeSelection::Builtin(BuiltinThemeId::Nord)
+        );
+        assert_eq!(
+            prefs.light_theme,
+            ThemeSelection::Builtin(BuiltinThemeId::WarmLight)
+        );
         assert_eq!(prefs.color_scheme, AccentScheme::Custom);
         assert_eq!(prefs.custom_color, 0xFF11_2233);
         assert_eq!(prefs.ui_scale_percent, 120);
@@ -432,18 +488,46 @@ mod tests {
     fn invalid_values_fall_back_per_key() {
         let prefs = AppearancePreferences::from_values(&values(&[
             ("appearance.theme_mode", json!("purple")),
-            ("appearance.dark_theme", json!("custom:1700000000_0")),
+            ("appearance.dark_theme", json!("custom:")),
             ("appearance.light_theme", json!("builtin:nord")),
             ("appearance.color_scheme", json!("teal")),
             ("appearance.custom_color", json!("#ABCDEF")),
             ("ui_scale", json!("3.0")),
         ]));
         assert_eq!(prefs.theme_mode, ThemePreference::System);
-        assert_eq!(prefs.dark_theme, BuiltinThemeId::DefaultDark);
-        assert_eq!(prefs.light_theme, BuiltinThemeId::DefaultLight);
+        assert_eq!(
+            prefs.builtin_theme(ThemeMode::Dark),
+            BuiltinThemeId::DefaultDark
+        );
+        assert_eq!(
+            prefs.dark_theme,
+            ThemeSelection::Builtin(BuiltinThemeId::DefaultDark)
+        );
+        assert_eq!(
+            prefs.light_theme,
+            ThemeSelection::Builtin(BuiltinThemeId::DefaultLight)
+        );
         assert_eq!(prefs.color_scheme, AccentScheme::Blue);
         assert_eq!(prefs.custom_color, 0xFFAB_CDEF);
         assert_eq!(prefs.ui_scale_percent, 100);
+    }
+
+    #[test]
+    fn custom_selection_round_trips_and_falls_back_to_default_builtin() {
+        let prefs = AppearancePreferences::from_values(&values(&[(
+            "appearance.dark_theme",
+            json!("custom:1700000000_0"),
+        )]));
+        let selection = ThemeSelection::Custom("1700000000_0".into());
+        assert_eq!(prefs.dark_theme, selection);
+        assert_eq!(selection.pref_value(), "custom:1700000000_0");
+        assert_eq!(
+            prefs.builtin_theme(ThemeMode::Dark),
+            BuiltinThemeId::DefaultDark
+        );
+        let mut other = prefs.clone();
+        other.set_builtin_theme(ThemeMode::Dark, BuiltinThemeId::DefaultDark);
+        assert!(!prefs.same_palette(&other));
     }
 
     #[test]
@@ -490,7 +574,7 @@ mod tests {
     #[test]
     fn same_palette_ignores_custom_color_unless_custom_scheme() {
         let base = AppearancePreferences::default();
-        let mut other = base;
+        let mut other = base.clone();
         other.custom_color = 0xFF00_0000;
         other.ui_scale_percent = 120;
         other.theme_mode = ThemePreference::Dark;

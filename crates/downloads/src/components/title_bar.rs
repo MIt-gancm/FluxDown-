@@ -5,11 +5,9 @@
 
 use std::rc::Rc;
 
-use fluxdown_ui_components::{
-    CheckState, ControlExt as _, FluxIcon, NAV_ROW_HEIGHT, check_mark, segmented_tabs,
-};
+use fluxdown_ui_components::{CheckState, ControlExt as _, FluxIcon, check_mark, segmented_tabs};
 use fluxdown_ui_i18n::{Translator, keys};
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, FocusHandle,
     Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
@@ -174,13 +172,13 @@ impl DownloadTitleBar {
             .w(SEARCH_WIDTH)
             .min_w(SEARCH_MIN_WIDTH)
             .flex_shrink(1.)
-            .h(CONTROL_HEIGHT)
+            .h(theme.density().control)
             .pl(tokens.spacing.sm)
             .pr(tokens.spacing.xs)
             .gap(tokens.spacing.xs)
             .items_center()
             .rounded(tokens.radius.md)
-            .border_1()
+            .border(extended.stroke.thin)
             .map(|this| {
                 // 聚焦外观在渲染时判定（焦点变化会刷新窗口）；悬停样式在 gpui 里晚于
                 // 焦点样式应用，所以只在未聚焦时挂悬停，避免聚焦态被悬停盖成灰底。
@@ -224,7 +222,7 @@ impl DownloadTitleBar {
                         .flex_none()
                         .px(tokens.spacing.xs)
                         .rounded(tokens.radius.sm)
-                        .border_1()
+                        .border(extended.stroke.thin)
                         .border_color(chrome.hairline)
                         .bg(colors.surface)
                         .text_size(caption.size)
@@ -263,7 +261,7 @@ impl DownloadTitleBar {
                     .unwrap_or_default();
                 let body_max_height = VIEW_MENU_MAX_BODY_HEIGHT
                     .min(window.viewport_size().height - VIEW_MENU_WINDOW_RESERVE)
-                    .max(NAV_ROW_HEIGHT * 3.);
+                    .max(active_theme(cx).density().nav_row * 3.);
                 view_menu_content(
                     ViewMenuContext {
                         title_bar: &title_bar,
@@ -319,6 +317,8 @@ struct MenuStyle {
     section_top: Pixels,
     section_bottom: Pixels,
     radius: Pixels,
+    row_height: Pixels,
+    stroke: Pixels,
     body_size: Pixels,
     caption_size: Pixels,
     caption_line_height: Pixels,
@@ -342,6 +342,8 @@ impl MenuStyle {
             section_top: tokens.spacing.sm,
             section_bottom: tokens.spacing.xxs,
             radius: tokens.radius.sm,
+            row_height: theme.density().nav_row,
+            stroke: extended.stroke.thin,
             body_size: tokens.typography.sm.size,
             caption_size: extended.caption.size,
             caption_line_height: extended.caption.line_height,
@@ -368,7 +370,10 @@ impl MenuStyle {
     }
 
     fn separator(self) -> Div {
-        div().h(px(1.)).my(self.section_bottom).bg(self.hairline)
+        div()
+            .h(self.stroke)
+            .my(self.section_bottom)
+            .bg(self.hairline)
     }
 
     /// 单选 / 开关行：左侧对勾标记当前值。
@@ -381,7 +386,7 @@ impl MenuStyle {
     ) -> impl IntoElement {
         h_flex()
             .id(id)
-            .h(NAV_ROW_HEIGHT)
+            .h(self.row_height)
             .mx(self.section_bottom)
             .px(self.pad_x - self.section_bottom)
             .gap(self.gap)
@@ -511,7 +516,7 @@ fn columns_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<A
             let persist_drop = Rc::clone(&persist);
             h_flex()
                 .id(format!("download-column-menu-item-{}", kind.key()))
-                .h(NAV_ROW_HEIGHT)
+                .h(style.row_height)
                 .mx(style.section_bottom)
                 .px(style.pad_x - style.section_bottom)
                 .gap(style.gap)

@@ -37,7 +37,7 @@ use fluxdown_ui_components::{
     form_field, form_gap, form_row, input_with_action, option_group, option_row,
 };
 use fluxdown_ui_i18n::Translator;
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, FontWeight,
     InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, SharedString,
@@ -1397,7 +1397,7 @@ impl NewDownloadView {
             .child(
                 div()
                     .flex_1()
-                    .h(px(1.))
+                    .h(extended.stroke.thin)
                     .ml(tokens.spacing.sm)
                     .bg(extended.colors.hairline),
             )
@@ -1462,9 +1462,9 @@ impl NewDownloadView {
         let enabled = self.can_submit(cx);
         let later_queue = self.queue_label(fluxdown_protocol::LATER_QUEUE_ID);
         let start_queue = self.queue_label(&self.context.queue_id);
-        // 分体按钮：两半统一控件高度（`Size::Size` 让右侧箭头半成为 28×28 方块，
+        // 分体按钮：两半统一控件高度（`Size::Size` 让右侧箭头半成为 `density.control` 见方，
         // 文字取 `text_base` = 13px），左半主按钮再经 `control` 统一内边距。
-        let split_size = Size::Size(CONTROL_HEIGHT);
+        let split_size = Size::Size(theme.density().control);
         h_flex()
             .w_full()
             .flex_none()
@@ -1473,7 +1473,7 @@ impl NewDownloadView {
             .justify_end()
             .gap(tokens.spacing.sm)
             .bg(theme.extended().colors.chrome)
-            .border_t_1()
+            .border_t(theme.extended().stroke.thin)
             .border_color(theme.extended().colors.hairline)
             .child(
                 Button::new("new-download-cancel")

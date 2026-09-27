@@ -94,6 +94,7 @@ fn device_row(
     with_divider: bool,
     cx: &App,
 ) -> impl IntoElement {
+    let badge_radius = active_theme(cx).components().badge_radius;
     div()
         .w_full()
         .when(with_divider, |this| this.child(ui::row_divider(cx)))
@@ -121,7 +122,7 @@ fn device_row(
                                 div()
                                     .px(tokens.spacing.xs)
                                     .py(tokens.spacing.xxs)
-                                    .rounded(tokens.radius.full)
+                                    .rounded(badge_radius)
                                     .bg(tokens.colors.accent)
                                     .text_size(extended.caption.size)
                                     .line_height(extended.caption.line_height)

@@ -52,12 +52,8 @@ const CELL_PADDING_X: f32 = 8.;
 const PROGRESS_LABEL_WIDTH: f32 = 32.;
 /// 进度条与百分比的间距。
 const PROGRESS_GAP: f32 = 8.;
-/// 进度条高度（详情窗口复用，保证与主表格一致）。
-pub(crate) const PROGRESS_BAR_HEIGHT: f32 = 4.;
-/// 暂停态进度条：muted_foreground 的 40%。
+/// 暂停态进度条：`statusPaused` 的 40%。
 const PAUSED_BAR_ALPHA: f32 = 0.4;
-/// 进度轨道：muted_foreground 的淡化派生；半透明，叠在行悬停底色上仍可见。
-const PROGRESS_TRACK_ALPHA: f32 = 0.16;
 /// 行悬停操作按钮边长。
 const ROW_ACTION_SIZE: f32 = 24.;
 /// 选中底色左右内缩（inset 样式）。
@@ -236,10 +232,10 @@ impl Render for DraggedColumnMenuItem {
             .py(tokens.spacing.xs)
             .gap(tokens.spacing.sm)
             .rounded(tokens.radius.sm)
-            .border_1()
+            .border(theme.extended().stroke.thin)
             .border_color(tokens.colors.border)
             .bg(tokens.colors.surface)
-            .shadow_sm()
+            .shadow(tokens.shadow.sm.clone())
             .text_size(tokens.typography.sm.size)
             .line_height(tokens.typography.sm.line_height)
             .text_color(tokens.colors.surface_foreground)
@@ -1423,7 +1419,8 @@ impl DownloadTableDelegate {
             .into_any_element()
     }
 
-    /// 进度单元格：4px 满圆角条 + 整数百分比；完成态整格留空（完成只由状态列表达）。
+    /// 进度单元格：`components.progress` 高度 / 圆角的条 + 整数百分比；完成态整格留空
+    /// （完成只由状态列表达）。
     fn render_progress_cell(&self, task: &DownloadTaskView, cx: &App) -> AnyElement {
         if task.state == TaskState::Completed {
             return div().into_any_element();
@@ -1451,7 +1448,8 @@ impl DownloadTableDelegate {
                     task.runtime.as_deref(),
                     task.progress,
                     bar_width,
-                    PROGRESS_BAR_HEIGHT,
+                    theme.components().progress_height,
+                    theme.components().progress_radius,
                     bar_color,
                     progress_track_color(cx),
                 ),
@@ -2041,7 +2039,7 @@ impl TableDelegate for DownloadTableDelegate {
             .items_center()
             .child(
                 div()
-                    .w(px(1.))
+                    .w(extended.stroke.thin)
                     .h(px(COLUMN_DIVIDER_HEIGHT))
                     .bg(extended.colors.hairline),
             );
@@ -2078,7 +2076,8 @@ impl TableDelegate for DownloadTableDelegate {
         _window: &mut Window,
         cx: &mut Context<TableState<Self>>,
     ) -> Stateful<Div> {
-        let row_height = px(self.prefs.density.row_height());
+        let theme = active_theme(cx);
+        let row_height = self.prefs.density.row_height(theme.density());
         let Some(VisibleRow::Task(id)) = self.visible.get(row_ix).cloned() else {
             return div().id(("download-group-row", row_ix)).h(row_height);
         };
@@ -2086,8 +2085,10 @@ impl TableDelegate for DownloadTableDelegate {
             return div().id(("download-task-row", row_ix)).h(row_height);
         };
         let selected = self.selected_tasks.contains(&key);
-        let tokens = active_theme(cx).tokens();
-        let (accent, radius) = (tokens.colors.accent, tokens.radius.md);
+        let (accent, radius) = (
+            theme.tokens().colors.accent,
+            theme.components().task_row_radius,
+        );
 
         div()
             .id(("download-task-row", row_ix))
@@ -2359,16 +2360,16 @@ fn task_command(key: &RowKey, action: ToolbarCommand) -> Option<DownloadsCommand
     })
 }
 
-/// 进度条颜色：下载中 primary、失败 destructive、暂停弱化中性、其余三级文字。
-/// 主表格与详情窗口共用。
+/// 进度条颜色：下载中 `progressFill`、失败 `statusFailed`、暂停为 `statusPaused` 的 40%、
+/// 排队 / 完成取对应状态色。主表格与详情窗口共用。
 pub(crate) fn progress_bar_color(state: TaskState, cx: &App) -> Hsla {
-    let theme = active_theme(cx);
-    let colors = &theme.tokens().colors;
+    let colors = &active_theme(cx).extended().colors;
     match state {
-        TaskState::Downloading => colors.primary,
-        TaskState::Paused => colors.muted_foreground.opacity(PAUSED_BAR_ALPHA),
-        TaskState::Failed => colors.destructive,
-        TaskState::Pending | TaskState::Completed => theme.extended().colors.text_tertiary,
+        TaskState::Downloading => colors.progress_fill,
+        TaskState::Paused => colors.status_paused.opacity(PAUSED_BAR_ALPHA),
+        TaskState::Failed => colors.status_failed,
+        TaskState::Pending => colors.status_queued,
+        TaskState::Completed => colors.status_completed,
     }
 }
 
@@ -2387,25 +2388,21 @@ pub(crate) fn kind_icon(kind: TaskKind) -> FluxIcon {
     }
 }
 
-/// 进度轨道颜色：muted_foreground 的淡化派生。主表格与详情窗口共用。
+/// 进度轨道颜色（`progressTrack`）。主表格与详情窗口共用。
 pub(crate) fn progress_track_color(cx: &App) -> Hsla {
-    active_theme(cx)
-        .tokens()
-        .colors
-        .muted_foreground
-        .opacity(PROGRESS_TRACK_ALPHA)
+    active_theme(cx).extended().colors.progress_track
 }
 
-/// 状态文字色：只有下载中（primary）与失败（destructive）着色，暂停为二级文字，
-/// 排队 / 完成退为三级文字。主表格与详情窗口共用。
+/// 状态文字色（`status*`）：默认只有下载中（primary）与失败（destructive）着色，暂停为
+/// 二级文字，排队 / 完成退为三级文字。主表格与详情窗口共用。
 pub(crate) fn status_color(state: TaskState, cx: &App) -> Hsla {
-    let theme = active_theme(cx);
-    let colors = &theme.tokens().colors;
+    let colors = &active_theme(cx).extended().colors;
     match state {
-        TaskState::Downloading => colors.primary,
-        TaskState::Failed => colors.destructive,
-        TaskState::Paused => colors.muted_foreground,
-        TaskState::Pending | TaskState::Completed => theme.extended().colors.text_tertiary,
+        TaskState::Downloading => colors.status_downloading,
+        TaskState::Failed => colors.status_failed,
+        TaskState::Paused => colors.status_paused,
+        TaskState::Pending => colors.status_queued,
+        TaskState::Completed => colors.status_completed,
     }
 }
 

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json",
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "meta": { "id": "nord-square", "name": "Nord Square", "author": "x", "version": "1.0.0" },
+  "extends": "builtin:nord",
+  "tokens": { "radius": { "md": 2, "lg": 4 } },
+  "dark": { "colors": { "primary": "#5E81AC" } }
+}

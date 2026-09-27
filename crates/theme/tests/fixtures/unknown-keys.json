@@ -1,0 +1,12 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "meta": { "name": "Unknown Keys", "homepage": "https://example.com" },
+  "x-editor": { "lastOpened": "colors", "zoom": 2 },
+  "tokens": {
+    "colors": { "primary": "#8B5CF6", "sparkle": "#FFFFFF" },
+    "motion": { "fast": 120 },
+    "typography": { "sm": { "size": 14, "letterSpacing": 0.2 } }
+  },
+  "dark": { "colors": { "background": "#101010" }, "x-notes": "keep me" }
+}

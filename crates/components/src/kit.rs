@@ -1,7 +1,7 @@
 //! 全应用共用的控件规格：按钮 / 输入框统一高度与字号、分段标签、复选行。
 //!
 //! 规则（所有窗口与页面一致）：
-//! - 唯一一档控件高度 [`CONTROL_HEIGHT`]（28）、13px 正文字号：页面工具栏、对话框、表单页、
+//! - 唯一一档控件高度 `density.control`（默认 28）、13px 正文字号：页面工具栏、对话框、表单页、
 //!   设置行、列表行内、独立窗口里的按钮 / 输入框 / 下拉 / 数字输入全部同高同内边距
 //!   → [`ControlExt::control`] / [`IconControlExt::control_icon`]；chrome 纯图标按钮优先 `toolbar_action_button`。
 //! - 变体只用 gpui-component 的 `primary()` / `ghost()` / `outline()` / `danger()`，
@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     AnyElement, App, Div, ElementId, FontWeight, InteractiveElement as _, IntoElement,
     ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled,
@@ -30,13 +30,13 @@ use crate::{CheckState, check_mark, tabular_numbers};
 
 /// 统一控件尺寸（带文字按钮与输入框）。
 pub trait ControlExt: Sized {
-    /// 28px 高、13px 字。
+    /// `density.control` 高、13px 字。
     fn control(self, cx: &App) -> Self;
 }
 
 /// 纯图标按钮尺寸。
 pub trait IconControlExt: Sized {
-    /// 28×28（与同行输入框等高）。
+    /// `density.control` 见方（与同行输入框等高）。
     fn control_icon(self, cx: &App) -> Self;
 }
 
@@ -45,9 +45,10 @@ pub trait IconControlExt: Sized {
 // 再用实例样式把高度与内边距收回到目标档位。
 impl ControlExt for Button {
     fn control(self, cx: &App) -> Self {
-        let tokens = active_theme(cx).tokens();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
         self.with_size(Size::Medium)
-            .h(CONTROL_HEIGHT)
+            .h(theme.density().control)
             .px(tokens.spacing.sm + tokens.spacing.xxs)
             .text_size(tokens.typography.sm.size)
     }
@@ -55,8 +56,11 @@ impl ControlExt for Button {
 
 // 图标与带文字按钮的前置图标同为 `Medium`（16px）。
 impl IconControlExt for Button {
-    fn control_icon(self, _cx: &App) -> Self {
-        Styled::size(self.with_size(Size::Medium), CONTROL_HEIGHT)
+    fn control_icon(self, cx: &App) -> Self {
+        Styled::size(
+            self.with_size(Size::Medium),
+            active_theme(cx).density().control,
+        )
     }
 }
 
@@ -66,8 +70,9 @@ impl IconControlExt for Button {
 // 静默忽略而退回 `Size::Medium` 的 2rem（26px），比同行按钮 / 下拉矮一截。
 impl ControlExt for Input {
     fn control(self, cx: &App) -> Self {
-        let tokens = active_theme(cx).tokens();
-        Styled::h(self.with_size(Size::Medium), CONTROL_HEIGHT).text_size(tokens.typography.sm.size)
+        let theme = active_theme(cx);
+        Styled::h(self.with_size(Size::Medium), theme.density().control)
+            .text_size(theme.tokens().typography.sm.size)
     }
 }
 
@@ -75,15 +80,16 @@ impl ControlExt for Input {
 // `text_size` 覆盖不到；取 `Large`（text_base = 13）再把外框高度收回到目标档位，
 // 内部输入框与加减按钮都是 `h_full`，随外框高度走。
 impl ControlExt for NumberInput {
-    fn control(self, _cx: &App) -> Self {
-        self.with_size(Size::Large).h(CONTROL_HEIGHT)
+    fn control(self, cx: &App) -> Self {
+        self.with_size(Size::Large)
+            .h(active_theme(cx).density().control)
     }
 }
 
 type TabSelect = Rc<dyn Fn(usize, &mut Window, &mut App)>;
 
 /// 分段标签（macOS segmented control 风格）：浅灰轨道内，选中项白底 + 细阴影 +
-/// 正文色中等字重，未选中为二级文字色。高 28（轨道），项高 24。
+/// 正文色中等字重，未选中为二级文字色。轨道高 `density.control`，项高再减 4。
 pub fn segmented_tabs(
     id: impl Into<ElementId>,
     labels: impl IntoIterator<Item = SharedString>,
@@ -97,16 +103,18 @@ pub fn segmented_tabs(
     let extended = theme.extended().colors;
     let on_select: TabSelect = Rc::new(on_select);
     let id: ElementId = id.into();
-    let inner = CONTROL_HEIGHT - px(4.);
+    let control = theme.density().control;
+    let tab_radius = theme.components().tab_radius;
+    let inner = control - px(4.);
 
     div()
         .flex()
         .flex_none()
         .items_center()
-        .h(CONTROL_HEIGHT)
+        .h(control)
         .p(px(2.))
         .gap(px(2.))
-        .rounded(tokens.radius.md + px(1.))
+        .rounded(tab_radius + px(1.))
         .bg(extended.nav_hover)
         .children(labels.into_iter().enumerate().map(|(index, label)| {
             let active = index == selected;
@@ -120,7 +128,7 @@ pub fn segmented_tabs(
                 .px(tokens.spacing.md)
                 .flex()
                 .items_center()
-                .rounded(tokens.radius.md)
+                .rounded(tab_radius)
                 .text_size(tokens.typography.sm.size)
                 .cursor_pointer()
                 .map(|this| {
@@ -155,7 +163,7 @@ pub fn check_row(
         .flex()
         .items_center()
         .gap(tokens.spacing.sm)
-        .min_h(CONTROL_HEIGHT)
+        .min_h(theme.density().control)
         .px(tokens.spacing.xs)
         .rounded(tokens.radius.md)
         .cursor_pointer()
@@ -233,12 +241,9 @@ pub fn dialog_footer(
         .child(DialogAction::new().child(AutofocusAction { child: ok, intent }))
 }
 
-/// 焦点环与按钮之间的留白，以及环本身的线宽（同 Web 的 `ring-offset-1 ring-2`）。
-const FOCUS_RING_OFFSET: Pixels = px(1.);
-const FOCUS_RING_WIDTH: Pixels = px(2.);
-
 /// 首帧把焦点移到自身的包装：焦点句柄存于元素状态，对话框关闭后随元素一起释放，
-/// 下次打开重新创建并再次聚焦。聚焦时在按钮外描一圈与主操作同色、带留白的焦点环。
+/// 下次打开重新创建并再次聚焦。聚焦时在按钮外描一圈与主操作同色、带留白的焦点环
+/// （线宽 / 留白取 `focusRing.width` / `focusRing.offset`，同 Web 的 `ring-offset-1 ring-2`）。
 ///
 /// 不用 gpui-component 的 `focus_ring_style`：FluxDown 主题关闭了 `focus_ring`，
 /// 那条路径只改边框色，对无边框的包装层不可见。
@@ -260,12 +265,13 @@ impl RenderOnce for AutofocusAction {
             .read(cx)
             .clone();
         let focused = focus.is_focused(window);
+        let focus_ring = active_theme(cx).extended().focus_ring;
         let theme = cx.theme();
         let ring_color = match self.intent {
             DialogIntent::Confirm => theme.primary,
             DialogIntent::Destructive => theme.danger,
         };
-        let outset = FOCUS_RING_OFFSET + FOCUS_RING_WIDTH;
+        let outset = focus_ring.offset + focus_ring.width;
         let ring_radius = theme.radius + outset;
         div()
             .relative()
@@ -280,7 +286,7 @@ impl RenderOnce for AutofocusAction {
                         .left(-outset)
                         .right(-outset)
                         .bottom(-outset)
-                        .border(FOCUS_RING_WIDTH)
+                        .border(focus_ring.width)
                         .border_color(ring_color)
                         .rounded(ring_radius),
                 )
@@ -436,13 +442,17 @@ pub fn option_row(
 
 /// 开关 / 选项分组：一张 [`crate::card`]，行与行之间 hairline 分隔（macOS 分组表单风格）。
 pub fn option_group(rows: impl IntoIterator<Item = AnyElement>, cx: &App) -> Div {
-    let hairline = active_theme(cx).extended().colors.hairline;
+    let theme = active_theme(cx);
+    let hairline = theme.extended().colors.hairline;
+    let stroke = theme.extended().stroke.thin;
     let mut group = crate::card(cx).flex().flex_col().w_full().overflow_hidden();
     for (index, row) in rows.into_iter().enumerate() {
         group = group.child(
             div()
                 .w_full()
-                .when(index > 0, |this| this.border_t_1().border_color(hairline))
+                .when(index > 0, |this| {
+                    this.border_t(stroke).border_color(hairline)
+                })
                 .child(row),
         );
     }

@@ -452,7 +452,8 @@ impl ProgressWindowView {
                             self.runtime.as_ref(),
                             row.progress,
                             bar_width,
-                            BAR_HEIGHT,
+                            px(BAR_HEIGHT),
+                            active_theme(cx).components().progress_radius,
                             progress_bar_color(row.state, cx),
                             progress_track_color(cx),
                         ),
@@ -503,7 +504,7 @@ impl ProgressWindowView {
                                 ))
                                 .child(stat(connections.0, connections.1, false)),
                         )
-                        .child(div().h(px(1.)).bg(extended.colors.hairline))
+                        .child(div().h(extended.stroke.thin).bg(extended.colors.hairline))
                         .child(
                             v_flex()
                                 .pt(tokens.spacing.xs)
@@ -743,7 +744,7 @@ impl ProgressWindowView {
                 div()
                     .px(tokens.spacing.md)
                     .py(tokens.spacing.xs)
-                    .border_b_1()
+                    .border_b(extended.stroke.thin)
                     .border_color(extended.colors.hairline)
                     .child(columns(
                         header_text(SharedString::from("#")),
@@ -817,7 +818,7 @@ impl ProgressWindowView {
             .gap(tokens.spacing.sm)
             .px(tokens.spacing.lg)
             .py(tokens.spacing.md)
-            .border_t_1()
+            .border_t(theme.extended().stroke.thin)
             .border_color(theme.extended().colors.hairline)
             .bg(theme.extended().colors.chrome)
     }
@@ -878,7 +879,7 @@ impl ProgressWindowView {
                                     .items_center()
                                     .justify_center()
                                     .rounded_full()
-                                    .border_2()
+                                    .border(extended.stroke.strong)
                                     .border_color(tokens.colors.surface)
                                     .bg(badge_color)
                                     .child(

@@ -128,6 +128,7 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
         translator,
         tokens: theme.tokens(),
         extended: theme.extended(),
+        components: theme.components(),
         stale: false,
     };
     let tokens = frame.tokens;

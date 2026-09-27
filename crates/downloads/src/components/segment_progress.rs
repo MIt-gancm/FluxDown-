@@ -3,7 +3,7 @@
 
 use fluxdown_protocol::TaskRuntimeDto;
 use gpui::{
-    AnyElement, Hsla, IntoElement as _, ParentElement as _, Styled as _, div, px, relative,
+    AnyElement, Hsla, IntoElement as _, ParentElement as _, Pixels, Styled as _, div, px, relative,
 };
 
 /// 「正在写入但尚无已完成字节」的像素用主色的这一透明度绘制：与已完成部分同色系
@@ -72,12 +72,14 @@ fn pixels(runtime: &TaskRuntimeDto, width: usize) -> Vec<Pixel> {
 }
 
 /// 主列表与详情共用的真实分段进度条；无分段事实时退回任务总进度。
-/// `width` 是可用像素宽度，按可见列重新投影而非按段数分配宽度。
+/// `width` 是可用像素宽度，按可见列重新投影而非按段数分配宽度；`height` / `radius`
+/// 由调用方按主题（`components.progress.*`）给出。
 pub(crate) fn render_segment_progress(
     runtime: Option<&TaskRuntimeDto>,
     fallback_progress: f32,
     width: f32,
-    height: f32,
+    height: Pixels,
+    radius: Pixels,
     color: Hsla,
     muted: Hsla,
 ) -> AnyElement {
@@ -86,9 +88,9 @@ pub(crate) fn render_segment_progress(
         .relative()
         .flex_none()
         .w(px(width as f32))
-        .h(px(height.max(1.)))
+        .h(height.max(px(1.)))
         .overflow_hidden()
-        .rounded_full()
+        .rounded(radius)
         .bg(muted);
     if let Some(runtime) =
         runtime.filter(|runtime| runtime.total_bytes > 0 && !runtime.segments.is_empty())

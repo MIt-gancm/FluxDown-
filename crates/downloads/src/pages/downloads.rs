@@ -29,7 +29,7 @@ use crate::{
     pages::task_detail::TaskDetailView,
     strings::DownloadStrings,
 };
-use fluxdown_ui_components::{ControlExt as _, FluxIcon, TOOLBAR_BUTTON_SIZE};
+use fluxdown_ui_components::{ControlExt as _, FluxIcon};
 use fluxdown_ui_i18n::Translator;
 use gpui::{
     App, AppContext as _, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, FontWeight,
@@ -1496,6 +1496,8 @@ impl DownloadView {
         let tokens = theme.tokens().clone();
         let icon_size = theme.extended().icon.md;
         let hairline = theme.extended().colors.hairline;
+        let stroke = theme.extended().stroke.thin;
+        let toolbar_button = theme.density().toolbar_button;
         let tertiary = theme.extended().colors.text_tertiary;
         let placement = self
             .table_state
@@ -1552,14 +1554,14 @@ impl DownloadView {
             .bg(tokens.colors.surface)
             .child(
                 h_flex()
-                    // 面板头：28 的图标按钮上下各留 spacing.xxs。
-                    .h(TOOLBAR_BUTTON_SIZE + tokens.spacing.xs)
+                    // 面板头：`density.toolbarButton` 的图标按钮上下各留 spacing.xxs。
+                    .h(toolbar_button + tokens.spacing.xs)
                     .flex_none()
                     .items_center()
                     .justify_between()
                     .pl(tokens.spacing.md)
                     .pr(tokens.spacing.xxs)
-                    .border_b_1()
+                    .border_b(stroke)
                     .border_color(hairline)
                     .child(
                         div()

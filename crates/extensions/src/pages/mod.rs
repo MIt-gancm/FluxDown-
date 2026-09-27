@@ -1,7 +1,7 @@
 //! 扩展分类的两个子页：插件（已安装 / 安装 / 市场）与受管组件（ffmpeg / yt-dlp）。
 
 use fluxdown_ui_i18n::Translator;
-use fluxdown_ui_theme::{ExtendedTokens, SemanticThemeTokens};
+use fluxdown_ui_theme::{ComponentTokens, ExtendedTokens, SemanticThemeTokens};
 
 pub mod managed_components;
 pub mod plugins;
@@ -12,5 +12,6 @@ pub(crate) struct Frame<'a> {
     pub translator: &'a Translator,
     pub tokens: &'a SemanticThemeTokens,
     pub extended: &'a ExtendedTokens,
+    pub components: &'a ComponentTokens,
     pub stale: bool,
 }

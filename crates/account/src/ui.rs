@@ -6,12 +6,13 @@
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, Div, FontWeight, ParentElement, SharedString, Styled, div};
 
-/// 卡片内部的行间分隔线（hairline 1px）。
+/// 卡片内部的行间分隔线（hairline，`stroke.thin` 粗）。
 pub(crate) fn row_divider(cx: &App) -> Div {
+    let extended = active_theme(cx).extended();
     div()
         .w_full()
-        .h(gpui::px(1.))
-        .bg(active_theme(cx).extended().colors.hairline)
+        .h(extended.stroke.thin)
+        .bg(extended.colors.hairline)
 }
 
 /// 卡片组上方的分组标题：标题 sm MEDIUM + 可选 xs 二级说明。

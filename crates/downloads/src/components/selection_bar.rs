@@ -63,7 +63,7 @@ impl DownloadView {
     fn selection_delete_menu(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = active_theme(cx);
         let tokens = theme.tokens();
-        let radius = tokens.radius.md;
+        let radius = theme.components().button_radius;
         let destructive = tokens.colors.destructive;
         let icon_size = theme.extended().icon.md;
         let delete_task = self.strings.delete_task.clone();
@@ -130,6 +130,7 @@ impl DownloadView {
         let text_size = tokens.typography.xs.size;
         let line_height = tokens.typography.xs.line_height;
         let hairline = theme.extended().colors.hairline;
+        let stroke = theme.extended().stroke.thin;
         let icon_size = theme.extended().icon.md;
         let count_label = SharedString::from(
             self.translator
@@ -143,7 +144,7 @@ impl DownloadView {
         let separator = move || {
             div()
                 .flex_none()
-                .w(px(1.))
+                .w(stroke)
                 .h(separator_height)
                 .mx(spacing.xs)
                 .bg(hairline)
@@ -216,7 +217,7 @@ impl DownloadView {
                         .gap(spacing.xxs)
                         .items_center()
                         .bg(surface)
-                        .border_1()
+                        .border(stroke)
                         .border_color(hairline)
                         .rounded(radius)
                         .shadow(shadow)

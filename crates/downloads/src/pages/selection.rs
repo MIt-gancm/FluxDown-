@@ -499,7 +499,7 @@ impl SelectionView {
             .px(tokens.spacing.md)
             .py(tokens.spacing.sm)
             .bg(extended.colors.chrome)
-            .border_t_1()
+            .border_t(extended.stroke.thin)
             .border_color(extended.colors.hairline)
             .child(field_hint(countdown, cx).font_features(tabular_numbers()))
             .child(
