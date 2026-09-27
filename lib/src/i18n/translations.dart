@@ -1083,6 +1083,7 @@ class S {
   String get builtinCategory => _r('builtinCategory');
   String get customCategory => _r('customCategory');
   String get categoryPriorityNote => _r('categoryPriorityNote');
+  String get categoryPriorityDragNote => _r('categoryPriorityDragNote');
   String get settingFailed => _r('settingFailed');
   String get autoStartupFailedDesc => _r('autoStartupFailedDesc');
 

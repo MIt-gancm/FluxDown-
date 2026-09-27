@@ -166,18 +166,6 @@ pub(crate) fn row_loading_danger_button(
         .flex_shrink_0()
 }
 
-/// 列表行内的纯图标按钮（上移 / 下移等）：套件图标按钮，不被长文本挤压。
-/// 返回值已设置悬停，调用方不得再 `.hover()`。
-pub(crate) fn row_icon_button(
-    id: impl Into<ElementId>,
-    label: impl Into<SharedString>,
-    icon: impl IntoElement,
-    variant: ButtonVariant,
-    cx: &App,
-) -> fluxdown_ui_components::Button {
-    fluxdown_ui_components::icon_button(id, label, icon, variant, cx).flex_shrink_0()
-}
-
 /// 空状态：FluxIcon 32px 三级文字色 + 标题 sm MEDIUM + 说明 xs，居中。
 pub(crate) fn empty_state(
     icon: impl Into<Icon>,

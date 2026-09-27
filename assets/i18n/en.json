@@ -818,6 +818,7 @@
   "builtinCategory": "Built-in",
   "customCategory": "Custom",
   "categoryPriorityNote": "Custom categories take priority over built-in ones. Use arrows to reorder.",
+  "categoryPriorityDragNote": "Custom categories take priority over built-in ones. Drag rows to reorder.",
   "settingFailed": "Setting Failed",
   "autoStartupFailedDesc": "Failed to modify startup setting. Please check system permissions.",
   "language": "Language",

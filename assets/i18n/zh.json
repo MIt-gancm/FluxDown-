@@ -818,6 +818,7 @@
   "builtinCategory": "内置",
   "customCategory": "自定义",
   "categoryPriorityNote": "自定义分类优先于内置分类匹配，上下箭头可调整顺序",
+  "categoryPriorityDragNote": "自定义分类优先于内置分类匹配，按住拖动可调整顺序",
   "settingFailed": "设置失败",
   "autoStartupFailedDesc": "无法修改开机自启动设置，请检查系统权限。",
   "language": "语言",

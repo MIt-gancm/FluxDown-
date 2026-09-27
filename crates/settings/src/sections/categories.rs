@@ -4,16 +4,16 @@ use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, category_icon};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, Context, InteractiveElement as _, IntoElement as _, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
+    App, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _,
 };
-use gpui_component::{Icon, h_flex, tooltip::Tooltip, v_flex};
+use gpui_component::{Icon, h_flex, v_flex};
 
 use super::{SectionContext, category_dialog};
 use crate::store::SettingsStore;
 use crate::ui::{
     SettingsRow, SettingsSection, body_text, meta_text, row_button, row_danger_button,
-    row_icon_button,
 };
 
 pub(crate) use fluxdown_protocol::CUSTOM_CATEGORIES_PREF_KEY as CATEGORIES_KEY;
@@ -60,10 +60,40 @@ pub(crate) fn display_name(translator: &Translator, entry: &CategoryEntry) -> Sh
     }
 }
 
+/// 拖拽中的分类行：载荷是分类 id，预览显示图标 + 名称。
+#[derive(Clone)]
+struct DraggedCategory {
+    id: String,
+    label: SharedString,
+    icon: String,
+}
+
+impl Render for DraggedCategory {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        h_flex()
+            .px(tokens.spacing.md)
+            .py(tokens.spacing.xs)
+            .gap(tokens.spacing.sm)
+            .items_center()
+            .rounded(tokens.radius.sm)
+            .border_1()
+            .border_color(tokens.colors.border)
+            .bg(tokens.colors.surface)
+            .shadow_sm()
+            .text_color(tokens.colors.surface_foreground)
+            .child(Icon::new(FluxIcon::GripVertical).size(extended.icon.md))
+            .child(Icon::new(category_icon(&self.icon)).size(extended.icon.md))
+            .child(self.label.clone())
+    }
+}
+
 pub(crate) fn group(ctx: &SectionContext, _cx: &mut App) -> SettingsSection {
     SettingsSection::new()
         .title(ctx.t("customCategories"))
-        .subtitle(ctx.t("categoryPriorityNote"))
+        .subtitle(ctx.t("categoryPriorityDragNote"))
         .row(list_item(ctx))
 }
 
@@ -72,8 +102,6 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
     let translator = ctx.translator.clone();
     let builtin = ctx.t("builtinCategory");
     let custom = ctx.t("customCategory");
-    let move_up = ctx.t("moveUpAction");
-    let move_down = ctx.t("moveDownAction");
     let edit = ctx.t("editCategory");
     let delete = ctx.t("delete");
     let add = ctx.t("addCategory");
@@ -86,9 +114,8 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
             let tokens = theme.tokens();
             let extended = theme.extended();
             let list = read_categories(store.read(cx));
-            let count = list.len();
             let mut column = v_flex().w_full().gap(tokens.spacing.xxs);
-            for (index, entry) in list.iter().enumerate() {
+            for entry in &list {
                 let name = display_name(&translator, entry);
                 let details = if entry.match_mode == "regex" {
                     format!("{regex_label}: {}", entry.regex_pattern)
@@ -103,17 +130,19 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
                         .join(", ")
                 };
                 let save_dir = entry.save_dir.clone();
-                let up_store = store.clone();
-                let down_store = store.clone();
+                let drop_store = store.clone();
                 let edit_store = store.clone();
                 let edit_translator = translator.clone();
                 let edit_entry = entry.clone();
                 let delete_store = store.clone();
-                let id_up = entry.id.clone();
-                let id_down = entry.id.clone();
+                let id_drop = entry.id.clone();
                 let id_delete = entry.id.clone();
-                let up_tooltip = move_up.clone();
-                let down_tooltip = move_down.clone();
+                let drag = DraggedCategory {
+                    id: entry.id.clone(),
+                    label: name.clone(),
+                    icon: entry.icon.clone(),
+                };
+                let accent = tokens.colors.primary;
                 column = column.child(
                     h_flex()
                         .id(SharedString::from(format!("category-row-{}", entry.id)))
@@ -123,7 +152,41 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
                         .px(tokens.spacing.sm)
                         .py(tokens.spacing.xs)
                         .rounded(tokens.radius.md)
+                        .border_1()
+                        .border_color(gpui::transparent_black())
                         .hover(|style| style.bg(extended.colors.row_hover))
+                        // 整行是落点；只有左侧抓手可发起拖拽。禁用态不可拖。
+                        .when(!disabled, |row| {
+                            row.drag_over::<DraggedCategory>(move |style, _, _, _| {
+                                style.border_color(accent)
+                            })
+                            .on_drop(
+                                move |drag: &DraggedCategory, _, cx| {
+                                    let target = id_drop.clone();
+                                    drop_store.update(cx, |store, cx| {
+                                        reorder_category(store, &drag.id, &target, cx);
+                                    });
+                                },
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("category-grip-{}", entry.id)))
+                                .flex_none()
+                                .p(tokens.spacing.xxs)
+                                .rounded(tokens.radius.sm)
+                                .text_color(extended.colors.text_tertiary)
+                                .when(!disabled, |grip| {
+                                    grip.cursor_grab()
+                                        .hover(|style| {
+                                            style
+                                                .bg(tokens.colors.muted)
+                                                .text_color(tokens.colors.foreground)
+                                        })
+                                        .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                })
+                                .child(Icon::new(FluxIcon::GripVertical).size(extended.icon.md)),
+                        )
                         .child(
                             Icon::new(category_icon(&entry.icon))
                                 .size(extended.icon.lg)
@@ -167,40 +230,6 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
                                             .child(SharedString::from(save_dir)),
                                     )
                                 }),
-                        )
-                        .child(
-                            row_icon_button(
-                                SharedString::from(format!("category-up-{}", entry.id)),
-                                move_up.clone(),
-                                Icon::new(FluxIcon::ArrowUp).size(extended.icon.md),
-                                ButtonVariant::Ghost,
-                                cx,
-                            )
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(up_tooltip.clone()).build(window, cx)
-                            })
-                            .disabled(disabled || index == 0)
-                            .on_click(move |_, _, cx| {
-                                let id = id_up.clone();
-                                up_store.update(cx, |store, cx| move_category(store, &id, -1, cx));
-                            }),
-                        )
-                        .child(
-                            row_icon_button(
-                                SharedString::from(format!("category-down-{}", entry.id)),
-                                move_down.clone(),
-                                Icon::new(FluxIcon::ArrowDown).size(extended.icon.md),
-                                ButtonVariant::Ghost,
-                                cx,
-                            )
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(down_tooltip.clone()).build(window, cx)
-                            })
-                            .disabled(disabled || index + 1 == count)
-                            .on_click(move |_, _, cx| {
-                                let id = id_down.clone();
-                                down_store.update(cx, |store, cx| move_category(store, &id, 1, cx));
-                            }),
                         )
                         .child(
                             row_button(
@@ -297,22 +326,34 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
     .keywords([ctx.t("customCategories"), ctx.t("customCategory")])
 }
 
-pub(crate) fn move_category(
+/// 把 `from` 移到 `to` 当前所在位置（先移除再插入：向下拖落在目标之后，向上拖落在目标之前）。
+pub(crate) fn reorder_category(
     store: &mut SettingsStore,
-    id: &str,
-    delta: isize,
+    from: &str,
+    to: &str,
     cx: &mut Context<SettingsStore>,
 ) {
     let mut list = read_categories(store);
-    let Some(index) = list.iter().position(|entry| entry.id == id) else {
-        return;
-    };
-    let target = index as isize + delta;
-    if target < 0 || target as usize >= list.len() {
+    if !reorder(&mut list, from, to) {
         return;
     }
-    list.swap(index, target as usize);
     write_categories(store, list, cx);
+}
+
+/// 纯列表重排；无变化（同一项 / id 不存在）返回 false。
+fn reorder(list: &mut Vec<CategoryEntry>, from: &str, to: &str) -> bool {
+    let (Some(from), Some(to)) = (
+        list.iter().position(|entry| entry.id == from),
+        list.iter().position(|entry| entry.id == to),
+    ) else {
+        return false;
+    };
+    if from == to {
+        return false;
+    }
+    let entry = list.remove(from);
+    list.insert(to, entry);
+    true
 }
 
 /// 「一键分类目录」：把每个分类的保存目录设为默认下载目录下的同名子目录。
@@ -393,6 +434,31 @@ pub(crate) fn category_dir_under(base_dir: &str, label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(list: &[CategoryEntry]) -> Vec<&str> {
+        list.iter().map(|entry| entry.id.as_str()).collect()
+    }
+
+    #[test]
+    fn drag_reorder_moves_to_target_slot_both_directions() {
+        let mut list = CategoryEntry::builtin_defaults();
+        let before: Vec<String> = list.iter().map(|entry| entry.id.clone()).collect();
+        let (a, c) = (before[0].clone(), before[2].clone());
+
+        // 向下拖：a 落到 c 的位置（c 之后）。
+        assert!(reorder(&mut list, &a, &c));
+        assert_eq!(ids(&list)[..3], [&*before[1], &*before[2], &*before[0]]);
+
+        // 向上拖回原位。
+        assert!(reorder(&mut list, &a, &before[1]));
+        assert_eq!(
+            ids(&list),
+            before.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        assert!(!reorder(&mut list, &a, &a));
+        assert!(!reorder(&mut list, "missing", &a));
+    }
 
     #[test]
     fn sanitizes_dir_names_like_dart() {
