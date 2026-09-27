@@ -32,13 +32,28 @@ impl DownloadView {
         on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.icon_action_with_state(id, label, icon, destructive, false, on_click, cx)
+    }
+
+    /// [`Self::icon_action`] 的可禁用版本：`disabled` 时保留悬浮提示但不响应点击。
+    #[allow(clippy::too_many_arguments)]
+    fn icon_action_with_state(
+        &self,
+        id: &'static str,
+        label: SharedString,
+        icon: Icon,
+        destructive: bool,
+        disabled: bool,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let tooltip_label = label.clone();
         div()
             .id(SharedString::from(format!("{id}-tooltip")))
             .flex_none()
             .tooltip(move |window, cx| Tooltip::new(tooltip_label.clone()).build(window, cx))
             .child(
-                toolbar_action_button(id, label, icon, destructive, false, cx)
+                toolbar_action_button(id, label, icon, destructive, disabled, cx)
                     .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx))),
             )
             .into_any_element()
@@ -156,11 +171,12 @@ impl DownloadView {
             ));
         }
         if selection.any_local {
-            actions.push(self.icon_action(
+            actions.push(self.icon_action_with_state(
                 "download-selection-open",
                 self.strings.open_file.clone(),
                 Icon::new(FluxIcon::ExternalLink).size(icon_size),
                 false,
+                !selection.all_openable,
                 |this, _, cx| this.execute_toolbar(ToolbarCommand::Open, cx),
                 cx,
             ));

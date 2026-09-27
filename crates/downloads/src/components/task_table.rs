@@ -1127,6 +1127,7 @@ impl DownloadTableDelegate {
     /// （已删除任务不算），完整遍历以得到数量与各类可用性。
     pub(crate) fn selection_summary(&self) -> SelectionSummary {
         let mut summary = SelectionSummary::default();
+        let mut any_unopenable = false;
         for key in &self.selected_tasks {
             let Some(row) = self.store.get(key) else {
                 continue;
@@ -1134,13 +1135,27 @@ impl DownloadTableDelegate {
             summary.count += 1;
             summary.any = true;
             summary.any_local |= key.is_local();
+            any_unopenable |= !is_openable(key, row.state);
             match row.state {
                 TaskState::Downloading | TaskState::Pending => summary.any_active = true,
                 TaskState::Paused | TaskState::Failed => summary.any_resumable = true,
                 TaskState::Completed => {}
             }
         }
+        summary.all_openable = summary.any && !any_unopenable;
         summary
+    }
+
+    /// 选中任务里仍存在且可打开文件的 key（本地 + 已完成）。
+    fn openable_selected_keys(&self) -> Vec<RowKey> {
+        self.selected_keys()
+            .into_iter()
+            .filter(|key| {
+                self.store
+                    .get(key)
+                    .is_some_and(|row| is_openable(key, row.state))
+            })
+            .collect()
     }
 
     pub(crate) fn toggle_group_collapsed(&mut self, key: &str) {
@@ -2248,15 +2263,22 @@ pub(crate) enum ToolbarCommand {
 
 /// 选中集合投影（选择条 / 工具栏 / 快捷键）：只统计仍存在于 store 的选中任务。
 /// - `count`：选中数量；`any`：是否有选中（删除 / 取消选择）。
-/// - `any_local`：含本地任务（打开文件 / 在文件夹中显示；远程任务没有本机文件）。
+/// - `any_local`：含本地任务（在文件夹中显示；远程任务没有本机文件）。
+/// - `all_openable`：全部为本地已完成任务（打开文件；未完成的产物尚不存在）。
 /// - `any_active`：含下载中 / 排队（暂停）；`any_resumable`：含暂停 / 失败（继续）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SelectionSummary {
     pub(crate) count: usize,
     pub(crate) any: bool,
     pub(crate) any_local: bool,
+    pub(crate) all_openable: bool,
     pub(crate) any_active: bool,
     pub(crate) any_resumable: bool,
+}
+
+/// 只有本地已完成任务有可打开的最终文件；下载中 / 暂停时磁盘上只有 `.fdownloading`。
+fn is_openable(key: &RowKey, state: TaskState) -> bool {
+    key.is_local() && state == TaskState::Completed
 }
 
 /// 行悬停操作；执行时映射为 [`ToolbarCommand`]，与工具栏 / 右键菜单同一命令路径。
@@ -2475,6 +2497,14 @@ impl DownloadView {
         match action {
             ToolbarCommand::PauseAll => vec![DownloadsCommand::PauseAll],
             ToolbarCommand::ResumeAll => vec![DownloadsCommand::ResumeAll],
+            ToolbarCommand::Open => self
+                .table_state
+                .read(cx)
+                .delegate()
+                .openable_selected_keys()
+                .iter()
+                .filter_map(|key| task_command(key, action))
+                .collect(),
             _ => self
                 .table_state
                 .read(cx)
@@ -2620,6 +2650,7 @@ mod tests {
                 count: 1,
                 any: true,
                 any_local: true,
+                all_openable: false,
                 any_active: false,
                 any_resumable: true,
             }
@@ -2633,9 +2664,30 @@ mod tests {
                 count: 2,
                 any: true,
                 any_local: true,
+                all_openable: false,
                 any_active: true,
                 any_resumable: true,
             }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn open_file_requires_every_selected_task_completed() -> Result<(), I18nError> {
+        // t0 已完成、t1 已暂停（磁盘上只有 `.fdownloading`）。
+        let mut delegate = delegate(&[3, 2])?;
+        delegate.selected_tasks.insert(RowKey::Local("t0".into()));
+        assert!(delegate.selection_summary().all_openable);
+        assert_eq!(
+            delegate.openable_selected_keys(),
+            [RowKey::Local("t0".into())]
+        );
+
+        delegate.selected_tasks.insert(RowKey::Local("t1".into()));
+        assert!(!delegate.selection_summary().all_openable);
+        assert_eq!(
+            delegate.openable_selected_keys(),
+            [RowKey::Local("t0".into())]
         );
         Ok(())
     }
