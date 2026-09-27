@@ -16,11 +16,11 @@ use std::rc::Rc;
 use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
 use gpui::{
     AnyElement, App, Div, ElementId, FontWeight, InteractiveElement as _, IntoElement,
-    ParentElement, Pixels, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement as _, Styled,
+    Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Sizable as _, Size,
+    ActiveTheme as _, Sizable as _, Size,
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     input::{Input, NumberInput},
@@ -195,11 +195,16 @@ pub enum DialogIntent {
     Destructive,
 }
 
+/// 对话框主操作按钮外层的键位上下文：打开即聚焦，`space` 在此上下文绑定到对话框
+/// `Confirm`（`enter` 由 gpui-component 的 `Dialog` 上下文冒泡处理）。
+pub const DIALOG_PRIMARY_KEY_CONTEXT: &str = "DialogPrimaryAction";
+
 /// 统一的对话框底栏：右对齐，「取消」(outline) 在左、主操作在右，均为 28 高控件。
 ///
 /// 取代 `DialogButtonProps`（其默认按钮是 32 高、不经过 [`ControlExt`]）。取消经
 /// `DialogClose` 关闭对话框并触发 `on_cancel`，主操作经 `DialogAction` 分发
 /// `Confirm`，与默认底栏同一路径，`on_ok` 语义不变。`cancel` 为 `None` 时只显示主操作。
+/// 主操作打开时默认聚焦（显示焦点环），回车 / 空格即确认。
 pub fn dialog_footer(
     cancel: Option<SharedString>,
     ok: impl Into<SharedString>,
@@ -225,7 +230,62 @@ pub fn dialog_footer(
                 ),
             )
         })
-        .child(DialogAction::new().child(ok))
+        .child(DialogAction::new().child(AutofocusAction { child: ok, intent }))
+}
+
+/// 焦点环与按钮之间的留白，以及环本身的线宽（同 Web 的 `ring-offset-1 ring-2`）。
+const FOCUS_RING_OFFSET: Pixels = px(1.);
+const FOCUS_RING_WIDTH: Pixels = px(2.);
+
+/// 首帧把焦点移到自身的包装：焦点句柄存于元素状态，对话框关闭后随元素一起释放，
+/// 下次打开重新创建并再次聚焦。聚焦时在按钮外描一圈与主操作同色、带留白的焦点环。
+///
+/// 不用 gpui-component 的 `focus_ring_style`：FluxDown 主题关闭了 `focus_ring`，
+/// 那条路径只改边框色，对无边框的包装层不可见。
+#[derive(IntoElement)]
+struct AutofocusAction {
+    child: Button,
+    intent: DialogIntent,
+}
+
+impl RenderOnce for AutofocusAction {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let focus = window
+            .use_keyed_state("dialog-primary-focus", cx, |window, cx| {
+                let handle = cx.focus_handle();
+                let target = handle.clone();
+                window.defer(cx, move |window, cx| window.focus(&target, cx));
+                handle
+            })
+            .read(cx)
+            .clone();
+        let focused = focus.is_focused(window);
+        let theme = cx.theme();
+        let ring_color = match self.intent {
+            DialogIntent::Confirm => theme.primary,
+            DialogIntent::Destructive => theme.danger,
+        };
+        let outset = FOCUS_RING_OFFSET + FOCUS_RING_WIDTH;
+        let ring_radius = theme.radius + outset;
+        div()
+            .relative()
+            .key_context(DIALOG_PRIMARY_KEY_CONTEXT)
+            .track_focus(&focus)
+            .child(self.child)
+            .when(focused, |this| {
+                this.child(
+                    div()
+                        .absolute()
+                        .top(-outset)
+                        .left(-outset)
+                        .right(-outset)
+                        .bottom(-outset)
+                        .border(FOCUS_RING_WIDTH)
+                        .border_color(ring_color)
+                        .rounded(ring_radius),
+                )
+            })
+    }
 }
 
 /// 对话框 / 确认框标题：`extended.title`（15/20 半粗）+ 正文色，底部 `spacing.xs`

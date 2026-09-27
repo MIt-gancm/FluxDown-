@@ -47,6 +47,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("s", dl::CycleSort, dl_ctx),
         KeyBinding::new(&format!("{p}-i"), dl::ToggleDetailPanel, dl_ctx),
         KeyBinding::new("escape", dl::ClearSelection, dl_ctx),
+        KeyBinding::new(
+            "space",
+            gpui_component::dialog::Confirm { secondary: false },
+            Some(fluxdown_ui_components::DIALOG_PRIMARY_KEY_CONTEXT),
+        ),
     ];
     if cfg!(target_os = "macos") {
         bindings.extend([
