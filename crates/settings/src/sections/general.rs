@@ -5,9 +5,14 @@ use fluxdown_ui_components::FluxIcon;
 use gpui::App;
 
 use super::{SectionContext, categories};
+use crate::ActivityBarToggle;
 use crate::ui::{Control, SettingsPage, SettingsSection};
 
-pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
+pub(crate) fn page(
+    ctx: &SectionContext,
+    activity_bar: &[ActivityBarToggle],
+    cx: &mut App,
+) -> SettingsPage {
     // 首次进入拉取系统集成状态（自启 / 文件关联 / URL scheme）。
     if ctx.store.read(cx).integration().is_none() && !ctx.store.read(cx).is_busy("integration") {
         ctx.store.update(cx, |store, cx| store.load_integration(cx));
@@ -23,7 +28,7 @@ pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
         startup_section(ctx, cx),
         system_section(ctx, cx),
         sidebar_section(ctx),
-        activity_bar_section(ctx),
+        activity_bar_section(ctx, activity_bar),
         categories::group(ctx, cx),
     ])
 }
@@ -168,20 +173,20 @@ fn show_sidebar_device_field(ctx: &SectionContext) -> Control {
     )
 }
 
-fn activity_bar_section(ctx: &SectionContext) -> SettingsSection {
-    SettingsSection::new()
-        .title(ctx.t("activityBarSection"))
-        .subtitle(ctx.t("activityBarSectionDesc"))
-        .row(ctx.item(
-            "showActivityRss",
-            Some("showActivityRssDesc"),
-            ctx.pref_switch("ui.show_activity_rss", true),
-        ))
-        .row(ctx.item(
-            "showActivityTheme",
-            Some("showActivityThemeDesc"),
-            ctx.pref_switch("ui.show_activity_theme", true),
-        ))
+/// 活动栏开关由 app 的活动栏注册表派生：注册了可选入口即自动出现在这里。
+fn activity_bar_section(ctx: &SectionContext, toggles: &[ActivityBarToggle]) -> SettingsSection {
+    toggles.iter().fold(
+        SettingsSection::new()
+            .title(ctx.t("activityBarSection"))
+            .subtitle(ctx.t("activityBarSectionDesc")),
+        |section, toggle| {
+            section.row(ctx.item(
+                toggle.title_key,
+                Some(toggle.desc_key),
+                ctx.pref_switch(toggle.pref_key, true),
+            ))
+        },
+    )
 }
 
 #[derive(Clone, Copy)]

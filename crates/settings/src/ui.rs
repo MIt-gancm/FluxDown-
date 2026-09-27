@@ -5,7 +5,9 @@
 //! - 组标题 caption MEDIUM + 三级文字色；行标题 `typography.sm`，说明 `typography.xs` 二级文字色；
 //! - 右侧控件一律统一档 [`fluxdown_ui_theme::CONTROL_HEIGHT`]（28）：按钮 / 输入走 `ControlExt::control`，下拉为
 //!   outline + caret，数字输入同高；横排行最小行高 [`ROW_MIN_HEIGHT`]；
-//!   宽度只用 [`INPUT_WIDTH`] / [`INPUT_WIDE_WIDTH`] / [`NUMBER_WIDTH`] / [`DROPDOWN_MIN_WIDTH`] 四档；开关保持 `Switch`。
+//!   宽度只用 [`INPUT_WIDTH`] / [`INPUT_WIDE_WIDTH`] / [`NUMBER_WIDTH`] / [`DROPDOWN_MIN_WIDTH`] 四档（数字旁的单位下拉用
+//!   [`UNIT_DROPDOWN_WIDTH`]）；开关保持 `Switch`。数字带物理量时必须显示单位（[`Control::unit`] 固定单位，
+//!   或数字 + 单位下拉）。
 //! - 列表行内操作（上移 / 下移 / 测试 / 删除…）同高：[`row_button`] / [`row_icon_button`] 只额外禁止被长文本挤压。
 
 use std::rc::Rc;
@@ -20,6 +22,7 @@ use gpui::{
 use gpui_component::{
     Disableable as _, Icon,
     button::Button,
+    h_flex,
     input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     menu::{DropdownMenu as _, PopupMenuItem},
     switch::Switch,
@@ -35,6 +38,8 @@ pub(crate) const INPUT_WIDE_WIDTH: f32 = 420.;
 pub(crate) const NUMBER_WIDTH: f32 = 132.;
 /// 行内下拉按钮的最小宽度档位（文案更长时自然撑开）。
 pub(crate) const DROPDOWN_MIN_WIDTH: f32 = 160.;
+/// 数字输入旁单位下拉（KB/s、MB/s…）的固定宽度。
+pub(crate) const UNIT_DROPDOWN_WIDTH: f32 = 88.;
 /// 横排设置行的最小行高：28 高控件 + 上下各 10px。
 pub(crate) const ROW_MIN_HEIGHT: f32 = 48.;
 
@@ -193,8 +198,8 @@ pub(crate) fn empty_state(
 /// 触发双列排布的最小内容宽度（与 Flutter `_AdaptiveSections` 一致）。
 pub(crate) const TWO_COLUMN_MIN_WIDTH: f32 = 920.;
 
-type Getter<T> = Rc<dyn Fn(&App) -> T>;
-type Setter<T> = Rc<dyn Fn(T, &mut App)>;
+pub(crate) type Getter<T> = Rc<dyn Fn(&App) -> T>;
+pub(crate) type Setter<T> = Rc<dyn Fn(T, &mut App)>;
 /// 自定义渲染：`(disabled, key, window, cx)`。
 type Renderer = Rc<dyn Fn(bool, &SharedString, &mut Window, &mut App) -> AnyElement>;
 
@@ -211,6 +216,8 @@ pub(crate) enum Control {
         step: f64,
         get: Getter<f64>,
         set: Setter<f64>,
+        /// 固定单位后缀（如 `MB`）；`None` = 无量纲计数。
+        unit: Option<SharedString>,
     },
     Input {
         get: Getter<SharedString>,
@@ -247,7 +254,17 @@ impl Control {
             step,
             get: Rc::new(get),
             set: Rc::new(set),
+            unit: None,
         }
+    }
+
+    /// 给数字控件加固定单位后缀；对非数字控件无效。
+    #[must_use]
+    pub(crate) fn unit(mut self, label: impl Into<SharedString>) -> Self {
+        if let Self::Number { unit, .. } = &mut self {
+            *unit = Some(label.into());
+        }
+        self
     }
 
     pub(crate) fn input<G, S>(get: G, set: S) -> Self
@@ -504,9 +521,16 @@ fn render_control(
             step,
             get,
             set,
-        } => render_number(
-            *min, *max, *step, get, set, disabled, key, vertical, window, cx,
-        ),
+            unit,
+        } => {
+            let number = render_number(
+                *min, *max, *step, get, set, disabled, key, vertical, window, cx,
+            );
+            match unit {
+                None => number,
+                Some(unit) => with_unit_suffix(number, unit.clone(), vertical, cx),
+            }
+        }
         Control::Input { get, set } => render_input(get, set, disabled, key, vertical, window, cx),
         Control::Dropdown { options, get, set } => dropdown_button(
             format!("{key}-dropdown"),
@@ -518,6 +542,27 @@ fn render_control(
             cx,
         ),
     }
+}
+
+/// 数字输入 + 右侧固定单位文字。
+fn with_unit_suffix(
+    number: AnyElement,
+    unit: SharedString,
+    vertical: bool,
+    cx: &App,
+) -> AnyElement {
+    let tokens = active_theme(cx).tokens();
+    h_flex()
+        .gap(tokens.spacing.sm)
+        .items_center()
+        .when(vertical, |this| this.w_full())
+        .child(
+            div()
+                .when(vertical, |this| this.flex_1().min_w_0())
+                .child(number),
+        )
+        .child(meta_text(cx).flex_shrink_0().child(unit))
+        .into_any_element()
 }
 
 /// 下拉选择按钮：当前值显示为 label，菜单项带勾选态；供 [`Control::Dropdown`]
@@ -629,7 +674,7 @@ struct NumberSlot {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_number(
+pub(crate) fn render_number(
     min: f64,
     max: f64,
     step: f64,
@@ -732,12 +777,15 @@ fn render_number(
         .into_any_element()
 }
 
-/// 整数不显示小数位（`3` 而非 `3.0`）。
+/// 数字输入的回显文本：整数不显示小数位（`3` 而非 `3.0`）；步进累加的浮点噪声
+/// （`1.3 - 1` = `0.30000000000000004`）不外显，最多 9 位小数并去掉尾随 0。
 fn format_number(value: f64) -> String {
-    if value.fract().abs() < f64::EPSILON {
-        format!("{}", value as i64)
+    let text = format!("{value:.9}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" {
+        "0".to_owned()
     } else {
-        format!("{value}")
+        text.to_owned()
     }
 }
 
@@ -1068,5 +1116,21 @@ impl SettingsPage {
             Some(tab) => tab.render(&format!("{}-{}", self.key, tab.id), width, window, cx),
             None => div().into_any_element(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_number;
+
+    #[test]
+    fn number_text_hides_float_step_noise() {
+        assert_eq!(format_number(1.3 - 1.0), "0.3");
+        assert_eq!(format_number(0.1 + 0.2), "0.3");
+        assert_eq!(format_number(1.3 + 1.0), "2.3");
+        assert_eq!(format_number(1024.0), "1024");
+        assert_eq!(format_number(1.5), "1.5");
+        assert_eq!(format_number(0.0), "0");
+        assert_eq!(format_number(-0.0000000001), "0");
     }
 }

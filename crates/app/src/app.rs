@@ -15,7 +15,7 @@ use fluxdown_protocol::{
 use fluxdown_ui_downloads::DownloadView;
 use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator, system_locale};
 use fluxdown_ui_settings::{SettingsStore, component_locale};
-use fluxdown_ui_shell::{RouteId, ShellView};
+use fluxdown_ui_shell::ShellView;
 use gpui::{App, AppContext as _, Entity, Global, WeakEntity};
 use gpui_component::menu::AppMenuBar;
 use tokio::sync::mpsc;
@@ -536,22 +536,13 @@ fn apply_preferences(cx: &mut App) {
     }
 }
 
-/// 偏好快照/事件 → 活动栏可选项可见性（RSS 路由、主题切换动作）。
+/// 偏好快照/事件 → 活动栏可选入口可见性（条目与偏好键见 `activity` 注册表）。
 fn apply_activity_bar_preferences(values: &BTreeMap<String, serde_json::Value>, cx: &mut App) {
     let Some(shell) = Desktop::global(cx).main_shell.clone() else {
         return;
     };
-    let show_activity_rss = values
-        .get("ui.show_activity_rss")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
-    let show_activity_theme = values
-        .get("ui.show_activity_theme")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true);
     let _ = shell.update(cx, |shell, cx| {
-        shell.set_route_visible(RouteId::new("rss"), show_activity_rss, cx);
-        shell.set_action_visible("activity-theme", show_activity_theme, cx);
+        crate::activity::apply_visibility(shell, values, cx);
     });
 }
 

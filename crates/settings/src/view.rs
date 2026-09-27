@@ -33,11 +33,22 @@ use crate::ui::{
 /// 分类导航列宽（与下载侧栏默认宽一致）。
 const SIDEBAR_WIDTH: f32 = 200.;
 
-/// app 注入的外部内容槽：账户页与扩展页由对应 capability 提供。
+/// app 注入的外部内容：账户页与扩展页由对应 capability 提供；活动栏开关由 app 的
+/// 活动栏注册表派生。
 #[derive(Default)]
 pub struct SettingsContentSlots {
     pub account: Option<AnyView>,
     pub extensions: Option<AnyView>,
+    /// 「通用 → 活动栏」分区的开关行，按活动栏自上而下顺序。
+    pub activity_bar: Vec<ActivityBarToggle>,
+}
+
+/// 活动栏可选入口的可见性开关：一个布尔偏好（缺省视为显示）+ 标题 / 描述文案键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityBarToggle {
+    pub pref_key: &'static str,
+    pub title_key: &'static str,
+    pub desc_key: &'static str,
 }
 
 /// 设置能力的顶层页面。
@@ -108,7 +119,7 @@ impl SettingsView {
             translator_entity: &self.translator,
         };
         vec![
-            general::page(&ctx, cx),
+            general::page(&ctx, &self.slots.activity_bar, cx),
             sections::slot_page(
                 &ctx,
                 "account",

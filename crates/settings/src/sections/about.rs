@@ -168,7 +168,7 @@ fn logs_section(ctx: &SectionContext) -> SettingsSection {
         .row(ctx.item(
             "logMaxSize",
             Some("logMaxSizeDesc"),
-            ctx.pref_number("log_max_size_mb", 10, 1, 1024),
+            ctx.pref_number("log_max_size_mb", 10, 1, 1024).unit("MB"),
         ))
         .row(ctx.item("logExportButton", None, export_control(ctx)))
 }

@@ -49,6 +49,7 @@ pub fn open(cx: &mut App) {
                 SettingsContentSlots {
                     account: Some(account.clone().into()),
                     extensions: Some(extensions.clone().into()),
+                    activity_bar: crate::activity::toggles(),
                 },
                 window,
                 cx,

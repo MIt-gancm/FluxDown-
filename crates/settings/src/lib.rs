@@ -12,7 +12,7 @@ mod webhook_view;
 
 pub use port::{PortFuture, SettingsPort};
 pub use store::{SettingsError, SettingsErrorKind, SettingsStore};
-pub use view::{SettingsContentSlots, SettingsView};
+pub use view::{ActivityBarToggle, SettingsContentSlots, SettingsView};
 pub use webhook_view::WebhookView;
 
 /// 打开分类编辑对话框（`id = None` 新建；未知 id 视为新建）。供 app 把下载侧栏的

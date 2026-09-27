@@ -13,6 +13,7 @@ use gpui::{App, AppContext as _, Window, WindowHandle, px, size};
 use gpui_component::{Icon, Root};
 
 use crate::{
+    activity::ActivityEntry,
     app::Desktop,
     capability_ports::AgentRssPort,
     downloads_port::AgentDownloadsPort,
@@ -56,70 +57,79 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
         let downloads_title_bar = downloads.update(cx, |downloads, cx| downloads.new_title_bar(cx));
 
         // RSS / Webhook 暂无顶栏插槽：统一顶栏保持空白拖拽区。
-        let routes = vec![
-            ShellRoute::new(
-                RouteId::new("downloads"),
-                "activity-downloads",
-                "activity-downloads-tooltip",
-                keys::MOBILE_NAV_DOWNLOADS,
-                Icon::new(FluxIcon::Download),
-                downloads.clone().into(),
-            )
-            .with_title_bar(downloads_title_bar),
-            ShellRoute::new(
-                RouteId::new("rss"),
-                "activity-rss",
-                "activity-rss-tooltip",
-                "sidebarRss",
-                Icon::new(FluxIcon::Rss),
-                rss.clone().into(),
-            )
-            .optional(true),
-            ShellRoute::new(
-                RouteId::new("webhooks"),
-                "activity-webhooks",
-                "activity-webhooks-tooltip",
-                "webhookNavTitle",
-                Icon::new(FluxIcon::Webhook),
-                webhooks.into(),
-            )
-            .optional(true),
-        ];
-        let actions = vec![
-            ShellAction::with_dynamic_icon(
-                "activity-theme",
-                "activity-theme-tooltip",
-                "activityThemeToggle",
-                |cx| {
-                    if active_theme(cx).mode().is_dark() {
-                        Icon::new(FluxIcon::Sun)
-                    } else {
-                        Icon::new(FluxIcon::Moon)
-                    }
-                },
-                toggle_theme,
-            )
-            .optional(true),
-            ShellAction::new(
-                "activity-settings",
-                "activity-settings-tooltip",
-                keys::SETTINGS,
-                Icon::new(FluxIcon::Settings),
-                move |_, cx| crate::windows::settings::open(cx),
-            ),
-        ];
+        let mut routes = Vec::new();
+        let mut actions = Vec::new();
+        for entry in ActivityEntry::ALL {
+            let button_id = entry.button_id();
+            let optional = entry.toggle().is_some();
+            match entry {
+                ActivityEntry::Downloads => routes.push(
+                    ShellRoute::new(
+                        RouteId::new("downloads"),
+                        button_id,
+                        "activity-downloads-tooltip",
+                        keys::MOBILE_NAV_DOWNLOADS,
+                        Icon::new(FluxIcon::Download),
+                        downloads.clone().into(),
+                    )
+                    .with_title_bar(downloads_title_bar.clone())
+                    .optional(optional),
+                ),
+                ActivityEntry::Rss => routes.push(
+                    ShellRoute::new(
+                        RouteId::new("rss"),
+                        button_id,
+                        "activity-rss-tooltip",
+                        "sidebarRss",
+                        Icon::new(FluxIcon::Rss),
+                        rss.clone().into(),
+                    )
+                    .optional(optional),
+                ),
+                ActivityEntry::Webhooks => routes.push(
+                    ShellRoute::new(
+                        RouteId::new("webhooks"),
+                        button_id,
+                        "activity-webhooks-tooltip",
+                        "webhookNavTitle",
+                        Icon::new(FluxIcon::Webhook),
+                        webhooks.clone().into(),
+                    )
+                    .optional(optional),
+                ),
+                ActivityEntry::Theme => actions.push(
+                    ShellAction::with_dynamic_icon(
+                        button_id,
+                        "activity-theme-tooltip",
+                        "activityThemeToggle",
+                        |cx| {
+                            if active_theme(cx).mode().is_dark() {
+                                Icon::new(FluxIcon::Sun)
+                            } else {
+                                Icon::new(FluxIcon::Moon)
+                            }
+                        },
+                        toggle_theme,
+                    )
+                    .optional(optional),
+                ),
+                ActivityEntry::Settings => actions.push(
+                    ShellAction::new(
+                        button_id,
+                        "activity-settings-tooltip",
+                        keys::SETTINGS,
+                        Icon::new(FluxIcon::Settings),
+                        move |_, cx| crate::windows::settings::open(cx),
+                    )
+                    .optional(optional),
+                ),
+            }
+        }
         let shell =
             cx.new(|cx| ShellView::new(translator.clone(), routes, actions, Some(menu_bar), cx));
-        // 活动栏可选项的初始可见性：偏好缺省视同 true（与设置页默认值一致）。
-        let show_activity_rss = Desktop::pref(cx, "ui.show_activity_rss")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(true);
-        let show_activity_theme = Desktop::pref(cx, "ui.show_activity_theme")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(true);
+        let preferences = Desktop::global(cx).preferences.clone();
         shell.update(cx, |shell, cx| {
-            shell.set_route_visible(RouteId::new("rss"), show_activity_rss, cx);
-            shell.set_action_visible("activity-theme", show_activity_theme, cx);
+            crate::activity::apply_visibility(shell, &preferences, cx);
         });
 
         let settings_for_categories = settings_store.clone();

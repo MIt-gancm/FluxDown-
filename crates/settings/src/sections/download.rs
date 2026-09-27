@@ -5,7 +5,7 @@ use fluxdown_ui_theme::active_theme;
 use gpui::{App, ParentElement, SharedString, Styled, px};
 use gpui_component::h_flex;
 
-use super::{SectionContext, user_agent};
+use super::{SectionContext, rate_limit, user_agent};
 use crate::ui::{Control, SettingsPage, SettingsSection, body_text, meta_text};
 
 pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
@@ -193,30 +193,13 @@ fn connection_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
         .row(ctx.item(
             "speedLimit",
             Some("speedLimitDesc"),
-            bytes_per_second_control(ctx, "speed_limit_bytes"),
+            rate_limit::control(ctx, "speed_limit_bytes", "speed_limit_unit"),
         ))
         .row(ctx.item(
             "uploadLimit",
             Some("uploadLimitDesc"),
-            bytes_per_second_control(ctx, "upload_limit_bytes"),
+            rate_limit::control(ctx, "upload_limit_bytes", "upload_limit_unit"),
         ))
-}
-
-/// 以 KB/s 显示与编辑字节速率键；0 = 不限。
-fn bytes_per_second_control(ctx: &SectionContext, key: &'static str) -> Control {
-    let get = ctx.store();
-    let set = ctx.store();
-    Control::number(
-        0.0,
-        (i64::MAX / 1024) as f64,
-        64.0,
-        move |cx: &App| (get.read(cx).daemon_i64(key) / 1024) as f64,
-        move |value, cx: &mut App| {
-            set.update(cx, |store, cx| {
-                store.set_daemon_i64(key, (value.round() as i64).saturating_mul(1024), cx);
-            });
-        },
-    )
 }
 
 fn conn_policy_control(ctx: &SectionContext) -> Control {

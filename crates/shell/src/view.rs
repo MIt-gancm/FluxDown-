@@ -285,35 +285,28 @@ impl ShellView {
         }
     }
 
-    /// 设置路由的可见性（宿主偏好回流入口）；隐藏当前活跃路由时自动切到首条可见路由。
-    pub fn set_route_visible(&mut self, route: RouteId, visible: bool, cx: &mut Context<Self>) {
-        let Some(target) = self.routes.iter_mut().find(|r| r.id == route) else {
+    /// 按活动栏按钮 id 设置可选路由或动作的可见性（宿主偏好回流入口）；
+    /// 隐藏当前活跃路由时自动切到首条可见路由。
+    pub fn set_entry_visible(&mut self, button_id: &str, visible: bool, cx: &mut Context<Self>) {
+        if let Some(route) = self.routes.iter_mut().find(|r| r.button_id == button_id) {
+            if route.visible == visible {
+                return;
+            }
+            route.visible = visible;
+            let id = route.id;
+            if !visible && self.active_route == Some(id) {
+                self.active_route = self.routes.iter().find(|r| r.visible).map(|r| r.id);
+            }
+            cx.notify();
+            return;
+        }
+        let Some(action) = self.actions.iter_mut().find(|a| a.button_id == button_id) else {
             return;
         };
-        if target.visible == visible {
+        if action.visible == visible {
             return;
         }
-        target.visible = visible;
-        if !visible && self.active_route == Some(route) {
-            self.active_route = self.routes.iter().find(|r| r.visible).map(|r| r.id);
-        }
-        cx.notify();
-    }
-
-    /// 设置活动栏动作的可见性（宿主偏好回流入口）。
-    pub fn set_action_visible(
-        &mut self,
-        button_id: &'static str,
-        visible: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(target) = self.actions.iter_mut().find(|a| a.button_id == button_id) else {
-            return;
-        };
-        if target.visible == visible {
-            return;
-        }
-        target.visible = visible;
+        action.visible = visible;
         cx.notify();
     }
 

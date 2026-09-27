@@ -42,7 +42,7 @@ macro_rules! spec {
     };
 }
 
-/// 与 `lib/src/services/cloud/sync_catalog.dart` 一一对应的 53 个键。
+/// 与 `lib/src/services/cloud/sync_catalog.dart` 对应的键，外加 GPUI 活动栏专属的 `ui.show_activity_*`，共 54 个。
 pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("appearance.theme_mode", Preferences),
     spec!("appearance.dark_theme", Preferences),
@@ -60,6 +60,7 @@ pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("ui.show_sidebar_category", Preferences),
     spec!("ui.show_sidebar_rss", Preferences),
     spec!("ui.show_activity_rss", Preferences),
+    spec!("ui.show_activity_webhooks", Preferences),
     spec!("ui.show_activity_theme", Preferences),
     spec!("ui.show_titlebar_pause_all", Preferences),
     spec!("ui.show_titlebar_resume_all", Preferences),
@@ -234,6 +235,7 @@ fn boolean_key(key: &str) -> bool {
             | "ui.show_sidebar_category"
             | "ui.show_sidebar_rss"
             | "ui.show_activity_rss"
+            | "ui.show_activity_webhooks"
             | "ui.show_activity_theme"
             | "ui.show_titlebar_pause_all"
             | "ui.show_titlebar_resume_all"
@@ -300,14 +302,14 @@ mod tests {
 
     #[test]
     fn catalog_has_exact_unique_flutter_count_and_namespaced_daemon_mapping() {
-        assert_eq!(SYNC_SETTING_SPECS.len(), 53);
+        assert_eq!(SYNC_SETTING_SPECS.len(), 54);
         assert_eq!(
             SYNC_SETTING_SPECS
                 .iter()
                 .map(|spec| spec.key)
                 .collect::<HashSet<_>>()
                 .len(),
-            53
+            54
         );
         let spec = setting_spec("download.max_concurrent_tasks").expect("download spec");
         assert_eq!(spec.owner, SettingOwner::Daemon);

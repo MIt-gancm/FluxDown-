@@ -15,6 +15,7 @@ pub(crate) mod ed2k;
 pub(crate) mod general;
 pub(crate) mod notify;
 pub(crate) mod proxy;
+pub(crate) mod rate_limit;
 pub(crate) mod site_auth;
 pub(crate) mod subscription;
 pub(crate) mod user_agent;
