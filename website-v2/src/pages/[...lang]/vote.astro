@@ -1,0 +1,21 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import CommunityStyles from "@/components/community/CommunityStyles.astro";
+import PlatformPoll from "@/components/community/PlatformPoll";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { polls } from "@/i18n/messages/polls";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = polls[lang].platform;
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <CommunityStyles />
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
+
+  <section class="frame">
+    <PlatformPoll client:load lang={lang} />
+  </section>
+</Layout>

@@ -1,0 +1,38 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import PluginMarket from "@/components/markets/PluginMarket";
+import HowTo from "@/components/markets/HowTo.astro";
+import { PLUGIN_PUBLISH_GUIDE_URL } from "@/components/markets/plugin-data";
+import { markets } from "@/i18n/messages/markets";
+import { common } from "@/i18n/messages/common";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { ArrowUpRight, Download } from "lucide-react";
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = markets[lang].plugins;
+---
+
+<Layout lang={lang} title={t.metaTitle} description={t.metaDescription}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede}>
+    <a class="btn btn-primary" href={href("/download", lang)}>
+      <Download size={15} aria-hidden="true" />
+      {common[lang].nav.download}
+    </a>
+    <a class="btn btn-secondary" href={PLUGIN_PUBLISH_GUIDE_URL} target="_blank" rel="noopener noreferrer">
+      {t.submitCta}
+      <ArrowUpRight size={15} aria-hidden="true" />
+    </a>
+  </PageHeader>
+
+  <section class="frame">
+    <PluginMarket client:load lang={lang} />
+  </section>
+
+  <HowTo
+    eyebrow={t.howTo.eyebrow}
+    title={t.howTo.title}
+    steps={[t.howTo.step1, t.howTo.step2, t.howTo.step3]}
+    guide={{ href: PLUGIN_PUBLISH_GUIDE_URL, label: t.howTo.guideLink }}
+  />
+</Layout>

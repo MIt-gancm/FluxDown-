@@ -1,0 +1,150 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import { ArrowRight } from "lucide-react";
+import { announcements } from "@/i18n/messages/announcements";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { sortedAnnouncements } from "@/lib/announcements";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = announcements[lang];
+const items = sortedAnnouncements();
+const dateFormat = new Intl.DateTimeFormat(lang === "zh" ? "zh-CN" : "en-US", {
+  year: "numeric",
+  month: "short",
+  day: "numeric",
+  timeZone: "UTC",
+});
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
+  <section class="frame">
+    <div class="section-tight">
+      {
+        items.length === 0 ? (
+          <p class="py-16 text-center text-[14px] text-muted">{t.empty}</p>
+        ) : (
+          <>
+            <p class="eyebrow-plain mb-4">{t.count(items.length)}</p>
+            <ol class="list">
+              {items.map((item, i) => {
+                const inner = (
+                  <>
+                    <div class="meta">
+                      <span class:list={["status", item.active ? "is-active" : "is-ended"]}>
+                        {item.active && <span class="live-dot" aria-hidden="true" />}
+                        {item.active ? t.active : t.ended}
+                      </span>
+                      <time class="mono num text-[12.5px] text-subtle" datetime={item.date}>
+                        {dateFormat.format(new Date(`${item.date}T00:00:00Z`))}
+                      </time>
+                    </div>
+                    <p class="text">{item.text[lang]}</p>
+                    {item.link && (
+                      <span class="open">
+                        {t.open}
+                        <ArrowRight size={15} strokeWidth={1.75} aria-hidden="true" />
+                      </span>
+                    )}
+                  </>
+                );
+                return (
+                  <li id={item.id} data-reveal style={`--d:${Math.min(i, 6)}`} class:list={[!item.active && "ended"]}>
+                    {item.link ? (
+                      <a class="row spot" href={href(item.link, lang)}>
+                        {inner}
+                      </a>
+                    ) : (
+                      <div class="row">{inner}</div>
+                    )}
+                  </li>
+                );
+              })}
+            </ol>
+          </>
+        )
+      }
+    </div>
+  </section>
+</Layout>
+
+<style>
+  .list {
+    border-top: 1px solid var(--line);
+  }
+  .list > li {
+    border-bottom: 1px solid var(--line);
+  }
+  .row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 8px 32px;
+    padding: 22px 12px;
+    margin-inline: -12px;
+    transition: background-color 160ms;
+  }
+  @media (min-width: 760px) {
+    .row {
+      grid-template-columns: 200px minmax(0, 1fr) auto;
+      align-items: baseline;
+    }
+  }
+  a.row:hover {
+    background: var(--bg-sunken);
+  }
+  .meta {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  @media (min-width: 760px) {
+    .meta {
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 6px;
+    }
+  }
+  .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+  }
+  .status.is-active {
+    color: var(--ok);
+  }
+  .status.is-ended {
+    color: var(--fg-subtle);
+  }
+  .text {
+    font-size: 16px;
+    line-height: 1.55;
+    color: var(--fg);
+  }
+  .ended .text {
+    color: var(--fg-muted);
+  }
+  .open {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--fg-subtle);
+    white-space: nowrap;
+    transition: color 160ms;
+  }
+  a.row:hover .open {
+    color: var(--accent-ink);
+  }
+  .open :global(svg) {
+    transition: transform 200ms var(--ease-out);
+  }
+  a.row:hover .open :global(svg) {
+    transform: translateX(2px);
+  }
+</style>

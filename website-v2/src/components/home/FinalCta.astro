@@ -1,0 +1,111 @@
+---
+/** 收尾 CTA:同心环 + 神经点云球(neural-sphere.ts),呼应首屏线稿与粒子流。 */
+import { BookOpen } from "lucide-react";
+import { BrandIcon } from "../icons/brand";
+import { home } from "../../i18n/messages/home";
+import { common } from "../../i18n/messages/common";
+import { href } from "../../i18n/routing";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].cta;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif accent-gradient">$1</span>');
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="cta">
+    <div class="cta-rings" aria-hidden="true">
+      {Array.from({ length: 7 }, (_, i) => <span style={`--r:${i}`} />)}
+    </div>
+    <canvas class="cta-sphere" aria-hidden="true" data-sphere></canvas>
+    <div class="relative flex flex-col items-center gap-7 text-center">
+      <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+      <h2 class="display max-w-[16ch] !text-[clamp(2.4rem,5.6vw,4.6rem)]" data-reveal set:html={title} />
+      <p class="lede" data-reveal style="--d:1">{t.lede}</p>
+      <div class="flex flex-wrap items-center justify-center gap-3" data-reveal style="--d:2">
+        <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-magnetic>
+          {common[lang].actions.download}
+          <span class="kbd">D</span>
+        </a>
+        <a href={`/docs/${lang}/`} class="btn btn-secondary btn-lg" data-magnetic>
+          <BookOpen size={15} strokeWidth={1.75} />
+          {t.docs}
+        </a>
+      </div>
+      <div class="flex items-center gap-5 text-subtle" data-reveal style="--d:3">
+        <BrandIcon name="apple" size={18} title="macOS" />
+        <BrandIcon name="windows" size={16} title="Windows" />
+        <BrandIcon name="linux" size={18} title="Linux" />
+        <span class="h-4 w-px bg-line"></span>
+        <BrandIcon name="docker" size={18} title="Docker" />
+        <BrandIcon name="android" size={18} title="Android" />
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  import { mountStage } from "../../scripts/particle-stage";
+  import { NeuralSphere } from "./neural-sphere";
+
+  const host = document.querySelector<HTMLElement>(".cta");
+  const canvas = host?.querySelector<HTMLCanvasElement>("[data-sphere]");
+  if (host && canvas) mountStage(canvas, host, new NeuralSphere());
+</script>
+
+<style>
+  .cta {
+    position: relative;
+    overflow: hidden;
+    padding: clamp(96px, 14vw, 180px) 24px;
+    isolation: isolate;
+  }
+  .cta::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background: radial-gradient(ellipse 50% 60% at 50% 55%, var(--accent-soft), transparent 70%);
+  }
+  .cta-sphere {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .cta-rings {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    z-index: -1;
+  }
+  .cta-rings span {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: calc(180px + var(--r) * 150px);
+    aspect-ratio: 1;
+    border-radius: 50%;
+    border: 1px solid var(--line);
+    translate: -50% -50%;
+    animation: ring 6s linear calc(var(--r) * 0.6s - 6s) infinite;
+  }
+  @keyframes ring {
+    0% {
+      border-color: var(--line);
+    }
+    12% {
+      border-color: var(--accent-line);
+    }
+    40%,
+    100% {
+      border-color: var(--line);
+    }
+  }
+</style>

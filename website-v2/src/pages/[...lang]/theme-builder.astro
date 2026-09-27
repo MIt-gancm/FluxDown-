@@ -1,0 +1,44 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import ThemeBuilder from "@/components/theme-builder/ThemeBuilder";
+import { themeBuilder } from "@/i18n/messages/themeBuilder";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { ArrowRight, FileJson, MousePointerClick } from "lucide-react";
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = themeBuilder[lang];
+---
+
+<Layout lang={lang} title={t.metaTitle} description={t.metaDescription}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede}>
+    <a class="btn btn-secondary" href={href("/themes", lang)}>
+      {t.browseThemes}
+      <ArrowRight size={15} aria-hidden="true" />
+    </a>
+  </PageHeader>
+
+  <section class="frame" aria-label={t.eyebrow}>
+    <ThemeBuilder client:load lang={lang} />
+  </section>
+
+  <section class="frame">
+    <div class="rule"></div>
+    <div class="cells grid-cols-1 md:grid-cols-2">
+      <div class="cell flex gap-4" data-reveal>
+        <FileJson size={18} className="mt-0.5 shrink-0 text-accent-ink" aria-hidden="true" />
+        <div>
+          <h2 class="text-[15px] font-semibold text-fg">{t.tb.compat.title}</h2>
+          <p class="mt-1.5 text-sm leading-relaxed text-muted">{t.tb.compat.desc}</p>
+        </div>
+      </div>
+      <div class="cell flex gap-4" data-reveal style="--d:1">
+        <MousePointerClick size={18} className="mt-0.5 shrink-0 text-accent-ink" aria-hidden="true" />
+        <div>
+          <h2 class="text-[15px] font-semibold text-fg">{t.tb.context.title}</h2>
+          <p class="mt-1.5 text-sm leading-relaxed text-muted">{t.tb.rightClickHint}</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</Layout>

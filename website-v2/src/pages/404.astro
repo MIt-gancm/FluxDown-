@@ -1,0 +1,77 @@
+---
+/**
+ * 全站唯一 404(Astro 只支持一个根级 404)。页面静态预渲染,语言无法从 URL 得知,
+ * 因此两种语言都直出,首帧前由内联脚本按 `/zh` 前缀切换可见语言(并同步 <html lang> 与标题)。
+ */
+import Layout from "@/layouts/Layout.astro";
+import BrokenDownload from "@/components/info/BrokenDownload.astro";
+import { LANGS } from "@/i18n/config";
+import { href } from "@/i18n/routing";
+import { guides } from "@/i18n/messages/guides";
+import { docsPath } from "@/lib/site-nav";
+---
+
+<Layout lang="en" title="404 - FluxDown" description="Page not found." noindex alternates={[]}>
+  <script is:inline>
+    if (/^\/zh(\/|$)/.test(location.pathname)) {
+      document.documentElement.classList.add("nf-zh");
+      document.documentElement.lang = "zh-CN";
+      document.title = "404 - 页面未找到 - FluxDown";
+    }
+  </script>
+
+  <section class="frame">
+    <div class="section grid items-center gap-12 lg:grid-cols-[minmax(0,1fr)_minmax(0,520px)] lg:gap-16">
+      <div>
+        <span class="eyebrow">Error 404</span>
+        <p class="nf-code num ink-gradient" aria-hidden="true">404</p>
+        {
+          LANGS.map((lang) => {
+            const t = guides[lang].notFound;
+            return (
+              <div class="nf-copy" data-l={lang} lang={lang === "zh" ? "zh-CN" : "en"}>
+                <h1 class="h3">{t.title}</h1>
+                <p class="lede mt-3 max-w-[46ch]">{t.desc}</p>
+                <div class="mt-8 flex flex-wrap gap-3">
+                  <a class="btn btn-primary" href={href("/", lang)}>
+                    {t.home}
+                  </a>
+                  <a class="btn btn-secondary" href={href("/download", lang)}>
+                    {t.download}
+                  </a>
+                  <a class="btn btn-ghost" href={docsPath(lang)}>
+                    {t.docs}
+                  </a>
+                  <a class="btn btn-ghost" href={href("/feedback", lang)}>
+                    {t.feedback}
+                  </a>
+                </div>
+              </div>
+            );
+          })
+        }
+      </div>
+      <BrokenDownload readout={guides.en.notFound.readout} />
+    </div>
+  </section>
+</Layout>
+
+<style>
+  .nf-code {
+    margin-block: 8px 20px;
+    font-size: clamp(5.5rem, 16vw, 10rem);
+    font-weight: 560;
+    line-height: 0.9;
+    letter-spacing: -0.06em;
+    user-select: none;
+  }
+  .nf-copy[data-l="zh"] {
+    display: none;
+  }
+  :global(html.nf-zh) .nf-copy[data-l="en"] {
+    display: none;
+  }
+  :global(html.nf-zh) .nf-copy[data-l="zh"] {
+    display: block;
+  }
+</style>

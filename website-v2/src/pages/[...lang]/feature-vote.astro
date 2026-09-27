@@ -1,0 +1,25 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import CommunityStyles from "@/components/community/CommunityStyles.astro";
+import FeatureVoteApp from "@/components/community/FeatureVoteApp";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { roadmap } from "@/i18n/messages/roadmap";
+import { common } from "@/i18n/messages/common";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = roadmap[lang];
+const nav = common[lang].nav;
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <CommunityStyles />
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede}>
+    <a class="btn btn-ticks" href={href("/feedback", lang)}>{nav.feedback}</a>
+  </PageHeader>
+
+  <section class="frame">
+    <FeatureVoteApp client:load lang={lang} />
+  </section>
+</Layout>

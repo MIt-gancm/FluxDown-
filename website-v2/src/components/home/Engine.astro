@@ -1,0 +1,335 @@
+---
+/**
+ * 01 · 引擎:动态分段可视化(segment-sim 模拟 segment_coordinator 的爬升 + 对半拆分接管)。
+ */
+import { RotateCcw } from "lucide-react";
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].engine;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const MAX = 16;
+---
+
+<section class="frame" id="features">
+  <div class="rule"></div>
+  <div class="section grid gap-12 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)] lg:gap-16 grid-cols-1">
+    <div class="flex flex-col gap-6">
+      <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+      <h2 class="h2" data-reveal set:html={title} />
+      <p class="lede" data-reveal style="--d:1">{t.lede}</p>
+      <dl class="mt-2 grid gap-px overflow-hidden rounded-[10px] border border-line bg-line sm:grid-cols-2 grid-cols-1" data-reveal style="--d:2">
+        {
+          t.points.map((p, i) => (
+            <div class="flex flex-col gap-1.5 bg-bg p-5">
+              <dt class="flex items-center gap-2 text-[14px] font-medium text-fg">
+                <span class="mono text-[11px] text-accent-ink">{String(i + 1).padStart(2, "0")}</span>
+                {p.k}
+              </dt>
+              <dd class="text-[13.5px] leading-relaxed text-muted">{p.v}</dd>
+            </div>
+          ))
+        }
+      </dl>
+    </div>
+
+    <div class="fig self-start rounded-[12px]" data-reveal style="--d:1" data-seg-viz data-max={MAX}>
+      <div class="fig-bar">
+        <span>fig. 02</span>
+        <span>{t.figure}</span>
+        <button type="button" class="seg-replay" data-seg-replay aria-label={t.replay}>
+          <RotateCcw size={12} strokeWidth={2} />
+        </button>
+      </div>
+      <div class="flex flex-col gap-5 p-[clamp(16px,2.4vw,28px)]">
+        <div class="flex flex-wrap items-end justify-between gap-4">
+          <div class="min-w-0">
+            <div class="mono truncate text-[12.5px] text-fg">archlinux-2026.09.01-x86_64.iso</div>
+            <div class="mono text-[11.5px] text-subtle" data-seg-bytes>0 B / 1.2 GB</div>
+          </div>
+          <div class="flex gap-6">
+            <div class="text-right">
+              <div class="num text-[22px] font-medium leading-none tracking-[-0.03em] text-fg"><span data-seg-conn>1</span><span class="text-subtle">/{MAX}</span></div>
+              <div class="mono mt-1 text-[10.5px] uppercase tracking-[0.1em] text-subtle">{t.connections}</div>
+            </div>
+            <div class="text-right">
+              <div class="num text-[22px] font-medium leading-none tracking-[-0.03em] text-fg" data-seg-speed>0 B/s</div>
+              <div class="mono mt-1 text-[10.5px] uppercase tracking-[0.1em] text-subtle">{t.speed}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="seg-bar" data-seg-bar>
+          <div class="seg-layer" data-seg-layer></div>
+          <div class="seg-marks" data-seg-marks></div>
+        </div>
+        <div class="mono -mt-3 flex justify-between text-[10.5px] text-subtle">
+          <span>0x0</span>
+          <span data-seg-pct>0.0%</span>
+          <span>1.2 GB</span>
+        </div>
+
+        <div class="grid grid-cols-4 gap-px overflow-hidden rounded-[8px] border border-line bg-line sm:grid-cols-8" data-seg-workers>
+          {
+            Array.from({ length: MAX }, (_, i) => (
+              <div class="seg-worker" data-state="idle">
+                <span class="mono text-[10px] text-subtle">C{String(i + 1).padStart(2, "0")}</span>
+                <span class="seg-meter"><i /></span>
+              </div>
+            ))
+          }
+        </div>
+
+        <div class="mono flex flex-wrap gap-x-5 gap-y-2 text-[11px] text-subtle">
+          <span class="flex items-center gap-2"><i class="seg-key seg-key-done"></i>{t.legendDone}</span>
+          <span class="flex items-center gap-2"><i class="seg-key seg-key-head"></i>{t.legendWorker}</span>
+          <span class="flex items-center gap-2"><i class="seg-key seg-key-split"></i>{t.legendSteal}</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  import { SegmentSim, formatBytes } from "./segment-sim";
+
+  const MB = 1024 * 1024;
+  const SIZE = 1.2 * 1024 * MB;
+  const STEP = 1 / 60;
+
+  document.querySelectorAll<HTMLElement>("[data-seg-viz]").forEach((root) => {
+    const max = Number(root.dataset.max ?? 16);
+    const layer = root.querySelector<HTMLElement>("[data-seg-layer]");
+    const marks = root.querySelector<HTMLElement>("[data-seg-marks]");
+    const conn = root.querySelector<HTMLElement>("[data-seg-conn]");
+    const speed = root.querySelector<HTMLElement>("[data-seg-speed]");
+    const bytes = root.querySelector<HTMLElement>("[data-seg-bytes]");
+    const pct = root.querySelector<HTMLElement>("[data-seg-pct]");
+    const workers = [...root.querySelectorAll<HTMLElement>(".seg-worker")];
+    if (!layer || !marks) return;
+
+    let sim = new SegmentSim({ size: SIZE, maxConn: max, perConn: 5.2 * MB, seed: 42, rampEvery: 0.8 });
+    let pieces: { fill: HTMLElement; head: HTMLElement }[] = [];
+    let seenSplits = 0;
+    let doneAt = 0;
+    let textClock = 0;
+
+    const restart = () => {
+      sim = new SegmentSim({ size: SIZE, maxConn: max, perConn: 5.2 * MB, seed: 42 + Math.floor(performance.now()) % 97, rampEvery: 0.8 });
+      layer.replaceChildren();
+      marks.replaceChildren();
+      pieces = [];
+      seenSplits = 0;
+      doneAt = 0;
+    };
+
+    const render = (updateText: boolean) => {
+      while (pieces.length < sim.segments.length) {
+        const fill = document.createElement("span");
+        fill.className = "seg-fill";
+        const head = document.createElement("span");
+        head.className = "seg-head";
+        layer.append(fill, head);
+        pieces.push({ fill, head });
+      }
+      sim.segments.forEach((s, i) => {
+        const p = pieces[i];
+        if (!p) return;
+        const left = (s.start / SIZE) * 100;
+        const width = ((s.pos - s.start) / SIZE) * 100;
+        p.fill.style.left = `${left}%`;
+        p.fill.style.width = `${width}%`;
+        p.head.style.left = `${(s.pos / SIZE) * 100}%`;
+        p.head.classList.toggle("is-active", s.pos < s.end);
+        p.head.classList.toggle("is-slow", s.base < 2 * MB);
+      });
+      for (; seenSplits < sim.splits.length; seenSplits++) {
+        const split = sim.splits[seenSplits];
+        if (!split) continue;
+        const mark = document.createElement("span");
+        mark.className = "seg-mark";
+        mark.style.left = `${(split.offset / SIZE) * 100}%`;
+        marks.append(mark);
+      }
+      if (updateText) {
+        const active = sim.active;
+        if (conn) conn.textContent = String(active.length);
+        if (speed) speed.textContent = `${formatBytes(sim.speed)}/s`;
+        if (bytes) bytes.textContent = `${formatBytes(sim.downloaded)} / ${formatBytes(SIZE)}`;
+        if (pct) pct.textContent = `${(sim.progress * 100).toFixed(1)}%`;
+        workers.forEach((w, i) => {
+          const seg = active.find((s) => s.worker === i);
+          w.dataset.state = seg ? (seg.base < 2 * MB ? "slow" : "active") : "idle";
+          w.style.setProperty("--level", seg ? String(Math.min(1, seg.speed / (7 * MB))) : "0");
+        });
+      }
+    };
+
+    let visible = false;
+    let raf = 0;
+    let last = 0;
+    let acc = 0;
+    const frame = (now: number) => {
+      raf = 0;
+      if (!visible || document.hidden) return;
+      acc += Math.min(0.1, last ? (now - last) / 1000 : STEP);
+      last = now;
+      while (acc >= STEP) {
+        acc -= STEP;
+        if (!sim.done) sim.step(STEP);
+        else if (!doneAt) doneAt = now;
+      }
+      textClock += 1;
+      render(textClock % 6 === 0);
+      if (doneAt && now - doneAt > 2600) restart();
+      raf = requestAnimationFrame(frame);
+    };
+    const play = () => {
+      if (!raf && visible && !document.hidden) {
+        last = 0;
+        raf = requestAnimationFrame(frame);
+      }
+    };
+    root.querySelector("[data-seg-replay]")?.addEventListener("click", () => {
+      restart();
+      play();
+    });
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      for (let i = 0; i < 420; i++) sim.step(STEP);
+      render(true);
+      return;
+    }
+    new IntersectionObserver(([entry]) => {
+      visible = Boolean(entry?.isIntersecting);
+      play();
+    }, { threshold: 0.25 }).observe(root);
+    document.addEventListener("visibilitychange", play);
+  });
+</script>
+
+<style is:global>
+  @layer components {
+    .seg-replay {
+      display: grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      color: var(--fg-subtle);
+      transition: color 150ms, background-color 150ms;
+    }
+    .seg-replay:hover {
+      color: var(--fg);
+      background: var(--bg-inset);
+    }
+    .seg-bar {
+      position: relative;
+      height: 56px;
+      overflow: hidden;
+      border-radius: 8px;
+      background:
+        repeating-linear-gradient(-45deg, var(--line) 0 1px, transparent 1px 6px),
+        var(--bg-sunken);
+      box-shadow: 0 0 0 1px var(--line-strong) inset;
+    }
+    .seg-layer,
+    .seg-marks {
+      position: absolute;
+      inset: 0;
+    }
+    .seg-fill {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      background: linear-gradient(180deg, color-mix(in oklch, var(--accent) 88%, white), var(--accent));
+      box-shadow: -1px 0 0 color-mix(in oklch, var(--bg) 70%, transparent) inset;
+    }
+    .seg-head {
+      position: absolute;
+      top: -2px;
+      bottom: -2px;
+      width: 2px;
+      margin-left: -1px;
+      background: transparent;
+    }
+    .seg-head.is-active {
+      background: var(--cyan);
+      box-shadow: 0 0 10px 1px var(--cyan);
+    }
+    .seg-head.is-active.is-slow {
+      background: var(--warn);
+      box-shadow: 0 0 10px 1px var(--warn);
+    }
+    .seg-mark {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      width: 1px;
+      background: var(--fg);
+      opacity: 0;
+      animation: seg-mark 1.4s var(--ease-out);
+    }
+    @keyframes seg-mark {
+      0% {
+        opacity: 0.9;
+        box-shadow: 0 0 0 3px color-mix(in oklch, var(--fg) 25%, transparent);
+      }
+      100% {
+        opacity: 0;
+      }
+    }
+    .seg-worker {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 8px 9px;
+      background: var(--bg-elev);
+      transition: background-color 300ms;
+    }
+    .seg-meter {
+      position: relative;
+      height: 3px;
+      overflow: hidden;
+      border-radius: 9px;
+      background: var(--bg-inset);
+    }
+    .seg-meter i {
+      position: absolute;
+      inset: 0;
+      transform-origin: left;
+      transform: scaleX(var(--level, 0));
+      background: var(--accent);
+      transition: transform 200ms linear;
+    }
+    .seg-worker[data-state="slow"] .seg-meter i {
+      background: var(--warn);
+    }
+    .seg-worker[data-state="idle"] .mono {
+      opacity: 0.5;
+    }
+    .seg-key {
+      display: inline-block;
+      width: 12px;
+      height: 8px;
+      border-radius: 2px;
+    }
+    .seg-key-done {
+      background: var(--accent);
+    }
+    .seg-key-head {
+      width: 2px;
+      height: 12px;
+      background: var(--cyan);
+      box-shadow: 0 0 6px var(--cyan);
+    }
+    .seg-key-split {
+      width: 1px;
+      height: 12px;
+      background: var(--fg);
+    }
+  }
+</style>

@@ -124,5 +124,4 @@ assets/screenshot/
 
 # Git worktrees
 .worktrees/
-website-v2/
 .tmp*

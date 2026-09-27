@@ -1,0 +1,22 @@
+---
+/** 社群落地页的「如何加入」编号步骤。 */
+interface Props {
+  heading: string;
+  steps: readonly string[];
+}
+const { heading, steps } = Astro.props;
+---
+
+<div class="flex flex-col gap-4" data-reveal style="--d:2">
+  <h2 class="eyebrow">{heading}</h2>
+  <ol class="border-t border-line">
+    {
+      steps.map((step, i) => (
+        <li class="flex gap-4 border-b border-line py-4 text-[15px] leading-relaxed text-muted">
+          <span class="mono num pt-0.5 text-xs text-subtle">{String(i + 1).padStart(2, "0")}</span>
+          <span>{step}</span>
+        </li>
+      ))
+    }
+  </ol>
+</div>

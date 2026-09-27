@@ -1,0 +1,242 @@
+---
+/**
+ * 文档首页(静态预渲染,en/zh 各一条路由):hero + 内联搜索(支持 `?q=`)+ 分区卡片 + 社区共建条。
+ */
+import { getCollection } from "astro:content";
+import { ArrowRight, ArrowUpRight } from "lucide-react";
+import Layout from "@/layouts/Layout.astro";
+import DocsSearch from "@/components/docs/DocsSearch";
+import { BrandIcon } from "@/components/icons/brand";
+import { SECTION_ICONS, docsAlternates, docsRepoTree } from "@/components/docs/meta";
+import { buildDocsNav, type DocsLang } from "@/lib/docs-nav";
+import { docs } from "@/i18n/messages/docs";
+
+export const prerender = true;
+
+export function getStaticPaths() {
+  return [{ params: { lang: "en" } }, { params: { lang: "zh" } }];
+}
+
+const lang = Astro.params.lang as DocsLang;
+const t = docs[lang];
+const all = await getCollection("docs");
+const { groups } = buildDocsNav(all, lang);
+// contributing 由底部共建条承载,卡片区保持 3 × 2 平衡
+const cards = groups.filter((g) => g.id !== "contributing");
+const firstPage = groups[0]?.items[0]?.href ?? `/docs/${lang}/`;
+const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+---
+
+<Layout
+  lang={lang}
+  title={t.metaTitle}
+  description={t.metaDescription}
+  alternates={docsAlternates("", ["en", "zh"])}
+>
+  <section class="frame">
+    <div class="section docs-hero">
+      <div class="docs-hero-copy">
+        <span class="eyebrow" data-scramble>{t.index.eyebrow}</span>
+        <h1 class="h2" data-reveal set:html={titleHtml} />
+        <p class="lede max-w-[58ch]" data-reveal style="--d:1">{t.index.lede}</p>
+        <div class="flex flex-wrap gap-3" data-reveal style="--d:2">
+          <a href={firstPage} class="btn btn-primary">
+            {t.index.start}
+            <ArrowRight size={15} aria-hidden="true" />
+          </a>
+          <a href={docsRepoTree()} target="_blank" rel="noopener noreferrer" class="btn btn-ticks">
+            <BrandIcon name="github" size={15} />
+            {t.index.contribute}
+          </a>
+        </div>
+      </div>
+      <div class="docs-hero-search" data-reveal style="--d:3">
+        <DocsSearch client:load lang={lang} variant="hero" />
+      </div>
+    </div>
+    <div class="rule"></div>
+  </section>
+
+  <section class="frame" aria-labelledby="docs-sections-label">
+    <h2 id="docs-sections-label" class="sr-only">{t.index.sectionsLabel}</h2>
+    <div class="cells docs-cards">
+      {
+        cards.map((group, i) => {
+          const Icon = SECTION_ICONS[group.id];
+          return (
+            <article id={group.id} class="cell spot docs-card" data-reveal style={`--d:${i}`}>
+              <div class="docs-card-top">
+                <span class="docs-card-icon">
+                  <Icon size={16} strokeWidth={1.6} aria-hidden="true" />
+                </span>
+                <span class="eyebrow-plain num">{String(i + 1).padStart(2, "0")}</span>
+              </div>
+              <h3 class="h3 docs-card-title">{group.label}</h3>
+              <p class="docs-card-desc">{t.sections[group.id]}</p>
+              <ul class="docs-card-links">
+                {group.items.map((item) => (
+                  <li>
+                    <a href={item.href}>
+                      <span>{item.title}</span>
+                      {item.fallback && (
+                        <span class="docs-card-tag" title={t.nav.untranslatedTitle}>
+                          {t.nav.untranslated}
+                        </span>
+                      )}
+                      <ArrowRight size={13} className="docs-card-arrow" aria-hidden="true" />
+                    </a>
+                  </li>
+                ))}
+              </ul>
+              <p class="eyebrow-plain num docs-card-count">{t.index.pages(group.items.length)}</p>
+            </article>
+          );
+        })
+      }
+    </div>
+    <div class="rule"></div>
+  </section>
+
+  <section class="frame" id="contributing">
+    <div class="section-tight docs-community">
+      <div class="max-w-[60ch]">
+        <h2 class="h3">{t.index.communityTitle}</h2>
+        <p class="mt-3 text-[15px] leading-relaxed text-muted">{t.index.communityBody}</p>
+      </div>
+      <div class="flex shrink-0 flex-wrap gap-3">
+        <a href={`/docs/${lang}/contributing/translations/`} class="btn btn-secondary">
+          {t.index.translate}
+          <ArrowUpRight size={14} aria-hidden="true" />
+        </a>
+        <a href={`/docs/${lang}/contributing/docs/`} class="btn btn-ghost">
+          {t.index.guide}
+          <ArrowRight size={14} aria-hidden="true" />
+        </a>
+      </div>
+    </div>
+  </section>
+</Layout>
+
+<style>
+  .docs-hero {
+    display: grid;
+    gap: 40px;
+  }
+  .docs-hero-copy {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 20px;
+  }
+  .docs-hero-search {
+    max-width: 680px;
+  }
+
+  .docs-cards {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 720px) {
+    .docs-cards {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+  @media (min-width: 1100px) {
+    .docs-cards {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+  .docs-card {
+    display: flex;
+    flex-direction: column;
+    scroll-margin-top: calc(var(--header-h) + 16px);
+  }
+  .docs-card:target {
+    background: var(--bg-sunken);
+  }
+  .docs-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .docs-card-icon {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: var(--bg-elev);
+    color: var(--accent-ink);
+  }
+  .docs-card-title {
+    margin-top: 22px;
+  }
+  .docs-card-desc {
+    margin-top: 8px;
+    font-size: 14px;
+    line-height: 1.6;
+    color: var(--fg-muted);
+  }
+  .docs-card-links {
+    margin-top: 18px;
+    border-top: 1px solid var(--line);
+  }
+  .docs-card-links a {
+    position: relative;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 0;
+    border-bottom: 1px dashed var(--line);
+    font-size: 14px;
+    color: var(--fg);
+    transition: color 160ms var(--ease-out);
+  }
+  .docs-card-links a > span:first-child {
+    flex: 1;
+  }
+  .docs-card-links a:hover {
+    color: var(--accent-ink);
+  }
+  .docs-card-links :global(.docs-card-arrow) {
+    color: var(--fg-subtle);
+    opacity: 0;
+    transform: translateX(-4px);
+    transition:
+      opacity 160ms var(--ease-out),
+      transform 160ms var(--ease-out);
+  }
+  .docs-card-links a:hover :global(.docs-card-arrow),
+  .docs-card-links a:focus-visible :global(.docs-card-arrow) {
+    opacity: 1;
+    transform: none;
+    color: var(--accent-ink);
+  }
+  .docs-card-tag {
+    padding: 0 5px;
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    color: var(--fg-subtle);
+  }
+  .docs-card-count {
+    margin-top: auto;
+    padding-top: 20px;
+  }
+
+  .docs-community {
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+  @media (min-width: 900px) {
+    .docs-community {
+      flex-direction: row;
+      align-items: center;
+      justify-content: space-between;
+    }
+  }
+</style>

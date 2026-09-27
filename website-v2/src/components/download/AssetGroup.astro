@@ -1,0 +1,127 @@
+---
+/**
+ * 一组下载文件(某个平台 / 某类构建)。脚本根据行是否全部隐藏切换「本次未提供」提示,
+ * 并给访客所在平台的分组加 `data-current` 高亮。
+ */
+import AssetRow from "./AssetRow.astro";
+import { download } from "@/i18n/messages/download";
+import type { Lang } from "@/i18n/config";
+
+export interface RowSpec {
+  path: string;
+  label: string;
+  detail?: string;
+  ext: string;
+}
+
+interface Props {
+  lang: Lang;
+  id?: string;
+  title: string;
+  desc?: string;
+  /** 分组对应的访客平台(windows / macos / linux / android),用于高亮。 */
+  os?: string;
+  /** 版本号在 release JSON 中的路径。 */
+  versionPath?: string;
+  fallback: string;
+  rows: RowSpec[];
+  notifyHref?: string;
+}
+const { lang, id, title, desc, os, versionPath, fallback, rows, notifyHref } = Astro.props;
+const t = download[lang];
+---
+
+<div class="group" id={id} data-group data-os={os}>
+  <div class="group-head">
+    <span class="group-icon" aria-hidden="true"><slot name="icon" /></span>
+    <div class="min-w-0">
+      <h3 class="group-title">
+        {title}
+        {versionPath && <span class="group-version" data-version={versionPath} hidden></span>}
+      </h3>
+      {desc && <p class="group-desc">{desc}</p>}
+    </div>
+    <span class="chip group-yours" data-yours hidden><span class="live-dot"></span>{t.state.yours}</span>
+  </div>
+  <div class="group-rows">
+    {rows.map((row) => <AssetRow {...row} fallback={fallback} />)}
+  </div>
+  <p class="group-empty" data-empty hidden>
+    {t.state.notInRelease}
+    {notifyHref && <a class="link" href={notifyHref}>{t.state.notify}</a>}
+  </p>
+  <slot />
+</div>
+
+<style>
+  .group {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    height: 100%;
+    padding: clamp(20px, 2.4vw, 30px);
+  }
+  .group[data-current]::before {
+    content: "";
+    position: absolute;
+    inset: 0 0 auto;
+    height: 2px;
+    background: var(--accent);
+  }
+  .group-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+  }
+  .group-icon {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    color: var(--fg);
+    background: var(--bg-elev);
+    box-shadow: 0 0 0 1px var(--line-strong) inset;
+  }
+  .group-icon:empty {
+    display: none;
+  }
+  .group-title {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 17px;
+    font-weight: 560;
+    letter-spacing: -0.015em;
+  }
+  .group-version {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 400;
+    letter-spacing: 0;
+    color: var(--fg-subtle);
+  }
+  .group-desc {
+    margin-top: 2px;
+    font-size: 13px;
+    color: var(--fg-muted);
+  }
+  .group-yours {
+    margin-left: auto;
+    color: var(--fg);
+  }
+  .group-rows {
+    display: flex;
+    flex-direction: column;
+  }
+  .group-empty {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--fg-subtle);
+  }
+</style>

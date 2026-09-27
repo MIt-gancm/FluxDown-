@@ -1,0 +1,52 @@
+---
+/** 一览数据条:累计下载量(/api/release 实时)+ 可从源码核实的常量。 */
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].stats;
+const stats = [
+  { value: null, label: t.downloads, live: true },
+  { value: 6, label: t.protocols },
+  { value: 3, label: t.platforms },
+  { value: 0, label: t.ads },
+];
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="flex items-center justify-center py-4">
+    <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+  </div>
+  <div class="cells grid-cols-2 border-t border-line md:grid-cols-4">
+    {
+      stats.map((stat, i) => (
+        <div class="cell spot spot-edge flex flex-col gap-2" data-reveal style={`--d:${i}`}>
+          <span class="num text-[clamp(2rem,4vw,3rem)] font-medium leading-none tracking-[-0.04em] text-fg" data-stat={stat.live ? "downloads" : undefined} data-count={stat.value ?? undefined}>
+            {stat.value ?? "—"}
+          </span>
+          <span class="mono text-[12px] uppercase tracking-[0.08em] text-subtle">{stat.label}</span>
+        </div>
+      ))
+    }
+  </div>
+</section>
+
+<script>
+  import { observeAll } from "../../scripts/motion";
+  const el = document.querySelector<HTMLElement>('[data-stat="downloads"]');
+  if (el) {
+    fetch("/api/release")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: { total_downloads?: number } | null) => {
+        const total = data?.total_downloads;
+        if (typeof total !== "number" || total <= 0) return;
+        el.dataset.count = String(total);
+        observeAll(el.parentElement ?? document);
+      })
+      .catch(() => {});
+  }
+</script>

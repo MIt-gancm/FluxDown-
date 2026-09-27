@@ -1,0 +1,432 @@
+---
+/**
+ * /film/ — 产品短片舞台(noindex)。1920×1080 画布上用首页同一套 GPUI 复刻界面编排片头、
+ * 镜头推拉、字幕与片尾,按统一时钟播放;也是 public/film/ 视频的录制源:
+ *
+ *   ?hold=1      不自动开始;录制脚本逐帧调用 window.__film.seek(t) 后截图,再用 ffmpeg 合成
+ *   ?t=19.8      静止在第 19.8 秒(public/og.png 即 1200×630 视口下的该帧)
+ *   ?speed=0.5   实时播放倍速(预览用)
+ *
+ * 画布始终是深色(录制产物不随访问者主题变化)。
+ */
+import Layout from "@/layouts/Layout.astro";
+import Logo from "@/components/site/Logo.astro";
+import AppReplica from "@/components/home/AppReplica.astro";
+import { BrandIcon } from "@/components/icons/brand";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { film } from "@/i18n/messages/film";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = film[lang];
+---
+
+<Layout lang={lang} title={t.title} noindex chrome={false} alternates={[]}>
+  <script is:inline slot="head">document.documentElement.dataset.theme = "dark";</script>
+  <div class="film-viewport">
+    <div class="stage" data-stage>
+      <div class="stage-grid" aria-hidden="true"></div>
+      <div class="stage-glow" aria-hidden="true" data-glow></div>
+
+      <div class="intro" data-intro>
+        <div data-intro-logo><Logo size={64} wordmark={false} /></div>
+        <div class="intro-word" data-intro-word>FluxDown</div>
+        <div class="intro-tag mono" data-intro-tag>{t.tagline}</div>
+      </div>
+
+      <div class="camera" data-camera>
+        <div class="window" data-window>
+          <AppReplica lang={lang} id="film-app" external />
+        </div>
+      </div>
+
+      <div class="caption" data-caption>
+        <span class="caption-k mono" data-caption-k></span>
+        <span class="caption-v" data-caption-v></span>
+      </div>
+
+      <div class="outro" data-outro>
+        <Logo size={44} wordmark={false} />
+        <div class="outro-title">
+          <span>{t.endTitle}</span>
+          <span class="serif accent-gradient">{t.endAccent}</span>
+        </div>
+        <div class="outro-meta mono">
+          <BrandIcon name="apple" size={15} />
+          <BrandIcon name="windows" size={13} />
+          <BrandIcon name="linux" size={15} />
+          <span>{t.endMeta}</span>
+        </div>
+        <div class="outro-url mono">fluxdown.zerx.dev</div>
+      </div>
+
+      <div class="stage-progress" aria-hidden="true"><i data-progress></i></div>
+    </div>
+  </div>
+
+  <script define:vars={{ captions: t.captions }} is:inline>
+    window.__filmCaptions = captions;
+  </script>
+  <script>
+    import { mountAppDemo } from "../../components/home/app-demo";
+
+    type Caption = { k: string; v: string };
+    const captions = (window as unknown as { __filmCaptions: Caption[] }).__filmCaptions;
+    const params = new URLSearchParams(location.search);
+    const speed = Number(params.get("speed") ?? 1) || 1;
+    const freezeAt = params.has("t") ? Number(params.get("t")) : null;
+
+    const $ = <T extends Element>(sel: string) => document.querySelector<T>(sel);
+    const stage = $<HTMLElement>("[data-stage]");
+    const app = $<HTMLElement>("#film-app");
+    const camera = $<HTMLElement>("[data-camera]");
+    const win = $<HTMLElement>("[data-window]");
+    const intro = $<HTMLElement>("[data-intro]");
+    const introLogo = $<HTMLElement>("[data-intro-logo]");
+    const introWord = $<HTMLElement>("[data-intro-word]");
+    const introTag = $<HTMLElement>("[data-intro-tag]");
+    const outro = $<HTMLElement>("[data-outro]");
+    const caption = $<HTMLElement>("[data-caption]");
+    const captionK = $<HTMLElement>("[data-caption-k]");
+    const captionV = $<HTMLElement>("[data-caption-v]");
+    const progress = $<HTMLElement>("[data-progress]");
+    const glow = $<HTMLElement>("[data-glow]");
+
+    const DURATION = 21;
+    const DEMO_START = 3;
+
+    const clamp = (x: number) => Math.min(1, Math.max(0, x));
+    const ease = (x: number) => 1 - Math.pow(1 - clamp(x), 3);
+    const inOut = (x: number) => {
+      const c = clamp(x);
+      return c < 0.5 ? 4 * c * c * c : 1 - Math.pow(-2 * c + 2, 3) / 2;
+    };
+    /** t 在 [a,b] 区间的归一化进度 */
+    const span = (t: number, a: number, b: number) => clamp((t - a) / (b - a));
+    const lerp = (a: number, b: number, k: number) => a + (b - a) * k;
+
+    // 镜头关键帧:scale + 焦点(窗口内百分比)
+    const shots = [
+      { t: 0, s: 1, x: 50, y: 50 },
+      { t: 5.1, s: 1, x: 50, y: 50 },
+      { t: 6.0, s: 1.22, x: 53, y: 40 },
+      { t: 8.8, s: 1.22, x: 53, y: 40 },
+      { t: 10.8, s: 1.7, x: 68, y: 12 },
+      { t: 14.3, s: 1.7, x: 68, y: 12 },
+      { t: 15.3, s: 1, x: 50, y: 50 },
+      { t: DURATION, s: 1, x: 50, y: 50 },
+    ];
+    const cameraAt = (t: number) => {
+      for (let i = 0; i < shots.length - 1; i++) {
+        const a = shots[i]!;
+        const b = shots[i + 1]!;
+        if (t <= b.t) {
+          const k = inOut(span(t, a.t, b.t));
+          return { s: lerp(a.s, b.s, k), x: lerp(a.x, b.x, k), y: lerp(a.y, b.y, k) };
+        }
+      }
+      return shots[shots.length - 1]!;
+    };
+    const captionPlan = [
+      { from: 4.2, to: 8.8, i: 0 },
+      { from: 10.3, to: 14.3, i: 1 },
+      { from: 14.9, to: 17.1, i: 2 },
+    ];
+
+    if (stage && app && camera && win) {
+      const demo = mountAppDemo(app, { external: true });
+      let shownCaption = -1;
+
+      const render = (t: number) => {
+        // 片头
+        const introIn = ease(span(t, 0.1, 1.2));
+        const introOut = ease(span(t, 2.2, 3.0));
+        if (intro) intro.style.opacity = String(introIn * (1 - introOut));
+        if (intro) intro.style.transform = `translateY(${-40 * introOut}px) scale(${1 - 0.04 * introOut})`;
+        if (introLogo) introLogo.style.transform = `scale(${lerp(0.6, 1, ease(span(t, 0.1, 0.9)))})`;
+        if (introWord) introWord.style.clipPath = `inset(0 ${100 - 100 * ease(span(t, 0.4, 1.5))}% 0 0)`;
+        if (introTag) introTag.style.opacity = String(ease(span(t, 1.1, 1.9)));
+
+        // 窗口入场 / 退场
+        const enter = ease(span(t, 2.5, 3.6));
+        const exit = inOut(span(t, 17.2, 18.1));
+        win.style.opacity = String(enter * (1 - exit));
+        win.style.transform = `perspective(2400px) translateY(${lerp(80, 0, enter) - 30 * exit}px) rotateX(${lerp(14, 0, enter)}deg) scale(${lerp(0.9, 1, enter) - 0.06 * exit})`;
+
+        // 镜头
+        const cam = cameraAt(t);
+        camera.style.transformOrigin = `${cam.x}% ${cam.y}%`;
+        camera.style.transform = `scale(${cam.s})`;
+        if (glow) glow.style.opacity = String(0.5 + 0.5 * Math.sin(t * 0.8) ** 2);
+
+        // 字幕:按时间线计算淡入淡出(逐帧可复现)
+        const active = captionPlan.find((c) => t >= c.from - 0.1 && t < c.to + 0.5);
+        if (caption) {
+          const k = active ? ease(span(t, active.from, active.from + 0.5)) * (1 - ease(span(t, active.to, active.to + 0.45))) : 0;
+          caption.style.opacity = String(k);
+          caption.style.translate = `-50% ${(1 - k) * 16}px`;
+        }
+        if (active && active.i !== shownCaption && captionK && captionV) {
+          shownCaption = active.i;
+          captionK.textContent = captions[active.i]?.k ?? "";
+          captionV.textContent = captions[active.i]?.v ?? "";
+        }
+
+        // 片尾
+        const outroIn = ease(span(t, 17.6, 18.8));
+        if (outro) {
+          outro.style.opacity = String(outroIn);
+          outro.style.transform = `translateY(${lerp(24, 0, outroIn)}px)`;
+        }
+        if (progress) progress.style.transform = `scaleX(${clamp(t / DURATION)})`;
+      };
+
+      let filmTime = 0;
+      let demoTime = 0;
+      const step = (dt: number) => {
+        filmTime += dt;
+        if (demo && filmTime >= DEMO_START && filmTime < 17.5) {
+          const target = filmTime - DEMO_START;
+          if (target > demoTime) {
+            demo.advance(target - demoTime);
+            demoTime = demo.time;
+          }
+        }
+        render(filmTime);
+      };
+      const restart = () => {
+        filmTime = 0;
+        demoTime = 0;
+        demo?.reset();
+        render(0);
+      };
+
+      // 画布按视口等比缩放(录制时视口即 1920×1080)
+      const fit = () => {
+        const s = Math.min(window.innerWidth / 1920, window.innerHeight / 1080);
+        stage.style.setProperty("--stage-scale", String(s));
+      };
+      fit();
+      window.addEventListener("resize", fit);
+
+      let running = false;
+      let last = 0;
+      const loop = (now: number) => {
+        if (!running) return;
+        const dt = last ? Math.min(0.05, (now - last) / 1000) : 0;
+        last = now;
+        step(dt * speed);
+        if (filmTime >= DURATION) {
+          if (params.has("hold")) {
+            running = false;
+            (window as unknown as { __filmDone?: boolean }).__filmDone = true;
+            return;
+          }
+          restart();
+        }
+        requestAnimationFrame(loop);
+      };
+      const start = () => {
+        restart();
+        running = true;
+        last = 0;
+        requestAnimationFrame(loop);
+      };
+      /** 逐帧录制:把影片推进到绝对时间 t(只能向前;t 小于当前时间时从头重放) */
+      const seek = (t: number) => {
+        if (t < filmTime) restart();
+        while (filmTime + 1e-6 < t) step(Math.min(1 / 60, t - filmTime));
+      };
+      (window as unknown as { __film: unknown }).__film = { start, seek, duration: DURATION };
+
+      if (freezeAt !== null) {
+        // 静帧(海报 / OG 图)不显示播放进度
+        progress?.parentElement?.setAttribute("hidden", "");
+        restart();
+        seek(freezeAt);
+      } else if (!params.has("hold")) {
+        start();
+      } else {
+        render(0);
+      }
+    }
+  </script>
+
+  <style is:global>
+    html,
+    body {
+      background: #07080a;
+      overflow: hidden;
+    }
+    body.page-bg::before {
+      display: none;
+    }
+    .film-viewport {
+      position: fixed;
+      inset: 0;
+    }
+    .stage {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 1920px;
+      height: 1080px;
+      overflow: hidden;
+      transform: translate(-50%, -50%) scale(var(--stage-scale, 1));
+      background: radial-gradient(ellipse 80% 70% at 50% 45%, #10131a, #07080a 70%);
+      color: #f5f5f7;
+    }
+    .stage-grid {
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(rgb(255 255 255 / 0.035) 1px, transparent 1px) 0 0 / 64px 64px,
+        linear-gradient(90deg, rgb(255 255 255 / 0.035) 1px, transparent 1px) 0 0 / 64px 64px;
+      mask-image: radial-gradient(ellipse 70% 70% at 50% 50%, #000 30%, transparent 80%);
+    }
+    .stage-glow {
+      position: absolute;
+      left: 50%;
+      top: 58%;
+      width: 1400px;
+      height: 700px;
+      translate: -50% -50%;
+      background: radial-gradient(ellipse at center, rgb(59 130 246 / 0.22), transparent 65%);
+      filter: blur(20px);
+    }
+    .intro {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 26px;
+      opacity: 0;
+    }
+    .intro-word {
+      font-size: 132px;
+      font-weight: 650;
+      letter-spacing: -0.06em;
+      line-height: 1;
+      background: linear-gradient(180deg, #fff 30%, #8f98a8);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+      padding-inline: 8px;
+    }
+    .intro-tag {
+      font-size: 22px;
+      letter-spacing: 0.02em;
+      color: #9aa3b2;
+    }
+    .camera {
+      position: absolute;
+      left: 50%;
+      top: 50%;
+      width: 1480px;
+      translate: -50% -46%;
+      will-change: transform;
+    }
+    .window {
+      opacity: 0;
+      will-change: transform, opacity;
+    }
+    .window .app {
+      box-shadow:
+        0 0 0 1px rgb(255 255 255 / 0.08),
+        0 50px 140px -30px rgb(0 0 0 / 0.9),
+        0 0 160px -40px rgb(59 130 246 / 0.35);
+    }
+    .caption {
+      position: absolute;
+      left: 50%;
+      bottom: 64px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 16px 28px 16px 18px;
+      border-radius: 999px;
+      translate: -50% 16px;
+      opacity: 0;
+      background: rgb(16 18 24 / 0.82);
+      backdrop-filter: blur(16px);
+      box-shadow:
+        0 0 0 1px rgb(255 255 255 / 0.1),
+        0 20px 50px -10px rgb(0 0 0 / 0.7);
+      font-size: 34px;
+      font-weight: 550;
+      letter-spacing: -0.02em;
+      white-space: nowrap;
+    }
+    /* 舞台内一切过渡由时间线逐帧计算,禁用 CSS 过渡/动画以保证录制可复现 */
+    .stage *,
+    .stage *::before,
+    .stage *::after {
+      transition: none !important;
+      animation: none !important;
+    }
+    .caption-k {
+      display: grid;
+      place-items: center;
+      width: 46px;
+      height: 46px;
+      border-radius: 999px;
+      font-size: 17px;
+      color: #fff;
+      background: #3b82f6;
+    }
+    .outro {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 30px;
+      opacity: 0;
+    }
+    .outro-title {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-size: 112px;
+      font-weight: 580;
+      line-height: 1;
+      letter-spacing: -0.05em;
+    }
+    .outro-title .serif {
+      font-size: 1.08em;
+      padding-inline: 12px;
+    }
+    .outro-meta {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 20px;
+      color: #9aa3b2;
+    }
+    .outro-url {
+      padding: 10px 20px;
+      border-radius: 999px;
+      font-size: 20px;
+      color: #dbe3f0;
+      box-shadow: 0 0 0 1px rgb(255 255 255 / 0.14) inset;
+    }
+    .stage-progress {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 3px;
+      background: rgb(255 255 255 / 0.06);
+    }
+    .stage-progress i {
+      position: absolute;
+      inset: 0;
+      transform-origin: left;
+      transform: scaleX(0);
+      background: linear-gradient(90deg, #3b82f6, #22d3ee);
+    }
+  </style>
+</Layout>

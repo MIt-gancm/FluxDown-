@@ -1,0 +1,2966 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "schemaUrl": "https://fluxdown.zerx.dev/schemas/gpui-theme.v2.json",
+  "groups": [
+    "colors",
+    "radius",
+    "spacing",
+    "typography",
+    "shadow",
+    "stroke",
+    "focusRing",
+    "icon",
+    "density",
+    "components"
+  ],
+  "extends": [
+    "builtin:default",
+    "builtin:default-dark",
+    "builtin:default-light",
+    "builtin:midnight-blue",
+    "builtin:nord",
+    "builtin:warm-light"
+  ],
+  "defaultExtends": "builtin:default",
+  "radiusFullThreshold": 1000,
+  "fontSentinels": {
+    "monospace": "平台默认等宽字体（macOS Menlo / Windows Consolas / Linux DejaVu Sans Mono）"
+  },
+  "resolution": {
+    "layerOrder": [
+      "<mode>",
+      "tokens",
+      "base|default"
+    ],
+    "evaluationOrder": "registry",
+    "refOpacity": "multiply",
+    "mix": "srgb-opaque",
+    "lineHeightAtLeastSize": true,
+    "kitBoundIgnoresOverrides": true,
+    "invalidOrCycleFallsThrough": true,
+    "colorOutput": "#rrggbbaa lowercase, round(channel * 255)",
+    "runtimeOnly": [
+      "accent",
+      "ensurePrimaryContrast",
+      "uiScale"
+    ]
+  },
+  "accentTokenPaths": [
+    "colors.primary",
+    "colors.primaryForeground",
+    "colors.accent",
+    "colors.accentForeground",
+    "colors.ring"
+  ],
+  "shadowDefaults": {
+    "x": 0,
+    "y": 0,
+    "blur": 0,
+    "spread": 0,
+    "color": "#0000002e",
+    "inset": false
+  },
+  "tokens": [
+    {
+      "path": "colors.background",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.foreground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.surface",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.surfaceForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.primary",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.primaryForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.secondary",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.secondaryForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.muted",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.mutedForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.accent",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.accentForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.destructive",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.destructiveForeground",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.border",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.input",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.ring",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.success",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": "#30d158ff",
+          "light": "#1f9d55ff"
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.warning",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": "#ffb340ff",
+          "light": "#c77c02ff"
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.info",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.primary"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.textTertiary",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "mix",
+        "from": "colors.mutedForeground",
+        "to": "colors.surface",
+        "amount": {
+          "dark": 0.38,
+          "light": 0.38
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.hairline",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "mix",
+        "from": "colors.border",
+        "to": "colors.surface",
+        "amount": {
+          "dark": 0.35,
+          "light": 0.4
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.rowHover",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "mix",
+        "from": "colors.muted",
+        "to": "colors.surface",
+        "amount": {
+          "dark": 0.45,
+          "light": 0.4
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.chrome",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "byMode",
+        "dark": {
+          "kind": "mix",
+          "from": "colors.background",
+          "to": "colors.surface",
+          "amount": {
+            "dark": 0.35,
+            "light": 0.35
+          }
+        },
+        "light": {
+          "kind": "mix",
+          "from": "colors.background",
+          "to": "colors.muted",
+          "amount": {
+            "dark": 0.35,
+            "light": 0.35
+          }
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.navHover",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "mix",
+        "from": "colors.chrome",
+        "to": "colors.navSelected",
+        "amount": {
+          "dark": 0.55,
+          "light": 0.55
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.navSelected",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "byMode",
+        "dark": {
+          "kind": "mix",
+          "from": "colors.muted",
+          "to": "colors.surface",
+          "amount": {
+            "dark": 0.15,
+            "light": 0.15
+          }
+        },
+        "light": {
+          "kind": "mix",
+          "from": "colors.muted",
+          "to": "colors.border",
+          "amount": {
+            "dark": 0.65,
+            "light": 0.65
+          }
+        }
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.statusDownloading",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.primary"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.statusCompleted",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.textTertiary"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.statusFailed",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.destructive"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.statusPaused",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.mutedForeground"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.statusQueued",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.textTertiary"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.progressTrack",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "refAlpha",
+        "path": "colors.mutedForeground",
+        "alpha": 0.16
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "colors.progressFill",
+      "group": "colors",
+      "kind": "color",
+      "default": {
+        "kind": "ref",
+        "path": "colors.primary"
+      },
+      "range": null,
+      "since": 2,
+      "modeDependent": true,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "radius.none",
+      "group": "radius",
+      "kind": "radius",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "radius.sm",
+      "group": "radius",
+      "kind": "radius",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "radius.md",
+      "group": "radius",
+      "kind": "radius",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "radius.lg",
+      "group": "radius",
+      "kind": "radius",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "radius.xl",
+      "group": "radius",
+      "kind": "radius",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "radius.full",
+      "group": "radius",
+      "kind": "radius",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.xxs",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.xs",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.sm",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.md",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.lg",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.xl",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "spacing.xxl",
+      "group": "spacing",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 0,
+        "max": 64
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.sans",
+      "group": "typography",
+      "kind": "fontFamily",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.mono",
+      "group": "typography",
+      "kind": "fontFamily",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.xs.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.xs.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.xs.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.sm.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.sm.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.sm.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.md.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.md.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.md.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.lg.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.lg.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.lg.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.xl.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.xl.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.xl.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.monoMd.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.monoMd.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.monoMd.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "base"
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.caption.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 11,
+          "light": 11
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.caption.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 14,
+          "light": 14
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.caption.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 400,
+          "light": 400
+        }
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "typography.title.size",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 15,
+          "light": 15
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 40
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.title.lineHeight",
+      "group": "typography",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 20,
+          "light": 20
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "typography.title.weight",
+      "group": "typography",
+      "kind": "fontWeight",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 600,
+          "light": 600
+        }
+      },
+      "range": {
+        "min": 100,
+        "max": 900
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "shadow.sm",
+      "group": "shadow",
+      "kind": "shadow",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "shadow.md",
+      "group": "shadow",
+      "kind": "shadow",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "shadow.lg",
+      "group": "shadow",
+      "kind": "shadow",
+      "default": {
+        "kind": "base"
+      },
+      "range": null,
+      "since": 1,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "stroke.thin",
+      "group": "stroke",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 1,
+          "light": 1
+        }
+      },
+      "range": {
+        "min": 0,
+        "max": 4
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "stroke.strong",
+      "group": "stroke",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 2,
+          "light": 2
+        }
+      },
+      "range": {
+        "min": 0,
+        "max": 4
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "focusRing.width",
+      "group": "focusRing",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 2,
+          "light": 2
+        }
+      },
+      "range": {
+        "min": 0,
+        "max": 4
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "focusRing.offset",
+      "group": "focusRing",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 1,
+          "light": 1
+        }
+      },
+      "range": {
+        "min": 0,
+        "max": 4
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "icon.sm",
+      "group": "icon",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 12,
+          "light": 12
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 32
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "icon.md",
+      "group": "icon",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 14,
+          "light": 14
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 32
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "icon.lg",
+      "group": "icon",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 16,
+          "light": 16
+        }
+      },
+      "range": {
+        "min": 8,
+        "max": 32
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.control",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 28,
+          "light": 28
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.navRow",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 28,
+          "light": 28
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.toolbarButton",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 28,
+          "light": 28
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.titleBar",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 40,
+          "light": 40
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": false
+    },
+    {
+      "path": "density.statusBar",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 28,
+          "light": 28
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.statusControl",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 22,
+          "light": 22
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.sectionHeader",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 24,
+          "light": 24
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.taskRow",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 44,
+          "light": 44
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.taskRowCompact",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 30,
+          "light": 30
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "density.checkMark",
+      "group": "density",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 16,
+          "light": 16
+        }
+      },
+      "range": {
+        "min": 16,
+        "max": 96
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.button.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.input.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": true,
+      "scales": true
+    },
+    {
+      "path": "components.dialog.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.lg"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": true,
+      "scales": true
+    },
+    {
+      "path": "components.card.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.lg"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.badge.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.full"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.navItem.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.progress.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.full"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.progress.height",
+      "group": "components",
+      "kind": "length",
+      "default": {
+        "kind": "literal",
+        "value": {
+          "dark": 4,
+          "light": 4
+        }
+      },
+      "range": {
+        "min": 1,
+        "max": 16
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.taskRow.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.checkbox.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "refOffset",
+        "path": "radius.sm",
+        "offset": 1
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.tab.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": false,
+      "scales": true
+    },
+    {
+      "path": "components.menu.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": true,
+      "scales": true
+    },
+    {
+      "path": "components.tooltip.radius",
+      "group": "components",
+      "kind": "radius",
+      "default": {
+        "kind": "ref",
+        "path": "radius.md"
+      },
+      "range": {
+        "min": 0,
+        "max": 9999
+      },
+      "since": 2,
+      "modeDependent": false,
+      "kitBound": true,
+      "scales": true
+    }
+  ],
+  "builtins": {
+    "builtin:default": {
+      "dark": {
+        "colors.background": "#1c1c1eff",
+        "colors.foreground": "#f5f5f7ff",
+        "colors.surface": "#2c2c2eff",
+        "colors.surfaceForeground": "#f5f5f7ff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#3a3a3cff",
+        "colors.secondaryForeground": "#f5f5f7ff",
+        "colors.muted": "#3a3a3cff",
+        "colors.mutedForeground": "#a1a1a6ff",
+        "colors.accent": "#3b82f62e",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#48484aff",
+        "colors.input": "#48484aff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      },
+      "light": {
+        "colors.background": "#f8f9faff",
+        "colors.foreground": "#09090bff",
+        "colors.surface": "#ffffffff",
+        "colors.surfaceForeground": "#09090bff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#f1f3f5ff",
+        "colors.secondaryForeground": "#09090bff",
+        "colors.muted": "#f1f3f5ff",
+        "colors.mutedForeground": "#71717aff",
+        "colors.accent": "#3b82f61a",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#e4e4e7ff",
+        "colors.input": "#e4e4e7ff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      }
+    },
+    "builtin:default-dark": {
+      "dark": {
+        "colors.background": "#1c1c1eff",
+        "colors.foreground": "#f5f5f7ff",
+        "colors.surface": "#2c2c2eff",
+        "colors.surfaceForeground": "#f5f5f7ff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#3a3a3cff",
+        "colors.secondaryForeground": "#f5f5f7ff",
+        "colors.muted": "#3a3a3cff",
+        "colors.mutedForeground": "#a1a1a6ff",
+        "colors.accent": "#3b82f62e",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#48484aff",
+        "colors.input": "#48484aff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      },
+      "light": {
+        "colors.background": "#f8f9faff",
+        "colors.foreground": "#09090bff",
+        "colors.surface": "#ffffffff",
+        "colors.surfaceForeground": "#09090bff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#f1f3f5ff",
+        "colors.secondaryForeground": "#09090bff",
+        "colors.muted": "#f1f3f5ff",
+        "colors.mutedForeground": "#71717aff",
+        "colors.accent": "#3b82f61a",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#e4e4e7ff",
+        "colors.input": "#e4e4e7ff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      }
+    },
+    "builtin:default-light": {
+      "dark": {
+        "colors.background": "#1c1c1eff",
+        "colors.foreground": "#f5f5f7ff",
+        "colors.surface": "#2c2c2eff",
+        "colors.surfaceForeground": "#f5f5f7ff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#3a3a3cff",
+        "colors.secondaryForeground": "#f5f5f7ff",
+        "colors.muted": "#3a3a3cff",
+        "colors.mutedForeground": "#a1a1a6ff",
+        "colors.accent": "#3b82f62e",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#48484aff",
+        "colors.input": "#48484aff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      },
+      "light": {
+        "colors.background": "#f8f9faff",
+        "colors.foreground": "#09090bff",
+        "colors.surface": "#ffffffff",
+        "colors.surfaceForeground": "#09090bff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#f1f3f5ff",
+        "colors.secondaryForeground": "#09090bff",
+        "colors.muted": "#f1f3f5ff",
+        "colors.mutedForeground": "#71717aff",
+        "colors.accent": "#3b82f61a",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#e4e4e7ff",
+        "colors.input": "#e4e4e7ff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      }
+    },
+    "builtin:midnight-blue": {
+      "dark": {
+        "colors.background": "#0f172aff",
+        "colors.foreground": "#f1f5f9ff",
+        "colors.surface": "#1e293bff",
+        "colors.surfaceForeground": "#f1f5f9ff",
+        "colors.primary": "#60a5faff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#334155ff",
+        "colors.secondaryForeground": "#f1f5f9ff",
+        "colors.muted": "#334155ff",
+        "colors.mutedForeground": "#94a3b8ff",
+        "colors.accent": "#60a5fa26",
+        "colors.accentForeground": "#60a5faff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#334155ff",
+        "colors.input": "#334155ff",
+        "colors.ring": "#60a5faff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      },
+      "light": {
+        "colors.background": "#f8f9faff",
+        "colors.foreground": "#09090bff",
+        "colors.surface": "#ffffffff",
+        "colors.surfaceForeground": "#09090bff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#f1f3f5ff",
+        "colors.secondaryForeground": "#09090bff",
+        "colors.muted": "#f1f3f5ff",
+        "colors.mutedForeground": "#71717aff",
+        "colors.accent": "#3b82f61a",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#e4e4e7ff",
+        "colors.input": "#e4e4e7ff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      }
+    },
+    "builtin:nord": {
+      "dark": {
+        "colors.background": "#2e3440ff",
+        "colors.foreground": "#eceff4ff",
+        "colors.surface": "#3b4252ff",
+        "colors.surfaceForeground": "#eceff4ff",
+        "colors.primary": "#88c0d0ff",
+        "colors.primaryForeground": "#2e3440ff",
+        "colors.secondary": "#434c5eff",
+        "colors.secondaryForeground": "#eceff4ff",
+        "colors.muted": "#434c5eff",
+        "colors.mutedForeground": "#d8dee9ff",
+        "colors.accent": "#88c0d026",
+        "colors.accentForeground": "#88c0d0ff",
+        "colors.destructive": "#bf616aff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#4c566aff",
+        "colors.input": "#4c566aff",
+        "colors.ring": "#88c0d0ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      },
+      "light": {
+        "colors.background": "#f8f9faff",
+        "colors.foreground": "#09090bff",
+        "colors.surface": "#ffffffff",
+        "colors.surfaceForeground": "#09090bff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#f1f3f5ff",
+        "colors.secondaryForeground": "#09090bff",
+        "colors.muted": "#f1f3f5ff",
+        "colors.mutedForeground": "#71717aff",
+        "colors.accent": "#3b82f61a",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#e4e4e7ff",
+        "colors.input": "#e4e4e7ff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      }
+    },
+    "builtin:warm-light": {
+      "dark": {
+        "colors.background": "#1c1c1eff",
+        "colors.foreground": "#f5f5f7ff",
+        "colors.surface": "#2c2c2eff",
+        "colors.surfaceForeground": "#f5f5f7ff",
+        "colors.primary": "#3b82f6ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#3a3a3cff",
+        "colors.secondaryForeground": "#f5f5f7ff",
+        "colors.muted": "#3a3a3cff",
+        "colors.mutedForeground": "#a1a1a6ff",
+        "colors.accent": "#3b82f62e",
+        "colors.accentForeground": "#3b82f6ff",
+        "colors.destructive": "#ef4444ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#48484aff",
+        "colors.input": "#48484aff",
+        "colors.ring": "#3b82f6ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      },
+      "light": {
+        "colors.background": "#fffbebff",
+        "colors.foreground": "#1c1917ff",
+        "colors.surface": "#ffffffff",
+        "colors.surfaceForeground": "#1c1917ff",
+        "colors.primary": "#e11d48ff",
+        "colors.primaryForeground": "#ffffffff",
+        "colors.secondary": "#fef3c7ff",
+        "colors.secondaryForeground": "#1c1917ff",
+        "colors.muted": "#fef3c7ff",
+        "colors.mutedForeground": "#78716cff",
+        "colors.accent": "#e11d481a",
+        "colors.accentForeground": "#e11d48ff",
+        "colors.destructive": "#dc2626ff",
+        "colors.destructiveForeground": "#ffffffff",
+        "colors.border": "#e7e5e4ff",
+        "colors.input": "#e7e5e4ff",
+        "colors.ring": "#e11d48ff",
+        "radius.none": 0,
+        "radius.sm": 3,
+        "radius.md": 6,
+        "radius.lg": 8,
+        "radius.xl": 12,
+        "radius.full": 9999,
+        "spacing.xxs": 2,
+        "spacing.xs": 4,
+        "spacing.sm": 8,
+        "spacing.md": 12,
+        "spacing.lg": 16,
+        "spacing.xl": 24,
+        "spacing.xxl": 32,
+        "typography.sans": "MiSans",
+        "typography.mono": "monospace",
+        "typography.xs.size": 12,
+        "typography.xs.lineHeight": 16,
+        "typography.xs.weight": 400,
+        "typography.sm.size": 13,
+        "typography.sm.lineHeight": 18,
+        "typography.sm.weight": 400,
+        "typography.md.size": 16,
+        "typography.md.lineHeight": 24,
+        "typography.md.weight": 400,
+        "typography.lg.size": 18,
+        "typography.lg.lineHeight": 28,
+        "typography.lg.weight": 400,
+        "typography.xl.size": 20,
+        "typography.xl.lineHeight": 28,
+        "typography.xl.weight": 400,
+        "typography.monoMd.size": 13,
+        "typography.monoMd.lineHeight": 20,
+        "typography.monoMd.weight": 400,
+        "shadow.sm": [
+          {
+            "x": 0,
+            "y": 1,
+            "blur": 2,
+            "spread": 0,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.md": [
+          {
+            "x": 0,
+            "y": 4,
+            "blur": 8,
+            "spread": -2,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ],
+        "shadow.lg": [
+          {
+            "x": 0,
+            "y": 12,
+            "blur": 24,
+            "spread": -4,
+            "color": "#0000002e",
+            "inset": false
+          }
+        ]
+      }
+    }
+  },
+  "migrations": {
+    "v1KeyRenames": [
+      {
+        "from": "colors.surface_foreground",
+        "to": "colors.surfaceForeground"
+      },
+      {
+        "from": "colors.primary_foreground",
+        "to": "colors.primaryForeground"
+      },
+      {
+        "from": "colors.secondary_foreground",
+        "to": "colors.secondaryForeground"
+      },
+      {
+        "from": "colors.muted_foreground",
+        "to": "colors.mutedForeground"
+      },
+      {
+        "from": "colors.accent_foreground",
+        "to": "colors.accentForeground"
+      },
+      {
+        "from": "colors.destructive_foreground",
+        "to": "colors.destructiveForeground"
+      },
+      {
+        "from": "typography.mono_md",
+        "to": "typography.monoMd"
+      },
+      {
+        "from": "typography.xs.line_height",
+        "to": "typography.xs.lineHeight"
+      },
+      {
+        "from": "typography.sm.line_height",
+        "to": "typography.sm.lineHeight"
+      },
+      {
+        "from": "typography.md.line_height",
+        "to": "typography.md.lineHeight"
+      },
+      {
+        "from": "typography.lg.line_height",
+        "to": "typography.lg.lineHeight"
+      },
+      {
+        "from": "typography.xl.line_height",
+        "to": "typography.xl.lineHeight"
+      },
+      {
+        "from": "typography.monoMd.line_height",
+        "to": "typography.monoMd.lineHeight"
+      }
+    ],
+    "steps": []
+  },
+  "flutterAdapter": {
+    "appearances": [
+      "dark",
+      "light"
+    ],
+    "extends": "builtin:default",
+    "metaKeys": [
+      "name",
+      "author"
+    ],
+    "colorInput": "AARRGGBB or RRGGBB (optional leading #, surrounding whitespace trimmed, case-insensitive); RRGGBB means alpha ff",
+    "colorOutput": "#rrggbbaa lowercase",
+    "colorMap": [
+      {
+        "from": "surface.background",
+        "to": [
+          "colors.background"
+        ]
+      },
+      {
+        "from": "surface.surface1",
+        "to": [
+          "colors.surface"
+        ]
+      },
+      {
+        "from": "surface.surface2",
+        "to": [
+          "colors.secondary",
+          "colors.muted"
+        ]
+      },
+      {
+        "from": "text.primary",
+        "to": [
+          "colors.foreground",
+          "colors.surfaceForeground",
+          "colors.secondaryForeground"
+        ]
+      },
+      {
+        "from": "text.secondary",
+        "to": [
+          "colors.mutedForeground"
+        ]
+      },
+      {
+        "from": "accent.color",
+        "to": [
+          "colors.primary",
+          "colors.accentForeground",
+          "colors.ring"
+        ]
+      },
+      {
+        "from": "accent.foreground",
+        "to": [
+          "colors.primaryForeground"
+        ]
+      },
+      {
+        "from": "accent.background",
+        "to": [
+          "colors.accent"
+        ]
+      },
+      {
+        "from": "border.default",
+        "to": [
+          "colors.border",
+          "colors.input"
+        ]
+      },
+      {
+        "from": "status.error",
+        "to": [
+          "colors.destructive"
+        ]
+      },
+      {
+        "from": "status.success",
+        "to": [
+          "colors.success"
+        ]
+      },
+      {
+        "from": "status.warning",
+        "to": [
+          "colors.warning"
+        ]
+      }
+    ]
+  }
+}

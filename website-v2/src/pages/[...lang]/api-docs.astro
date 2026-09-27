@@ -1,0 +1,145 @@
+---
+/**
+ * API 参考:Scalar(CDN)渲染 public/openapi.json。
+ * Scalar 配色直接映射到站点设计令牌,主题切换时同步其 light/dark 模式类(语法高亮等)。
+ */
+import { FileJson, BookOpen } from "lucide-react";
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { docs } from "@/i18n/messages/docs";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = docs[lang].apiDocs;
+
+const SCALAR_CDN = "https://cdn.jsdelivr.net/npm/@scalar/api-reference";
+
+const tokens = [
+  "--scalar-font:var(--font-sans)",
+  "--scalar-font-code:var(--font-mono)",
+  "--scalar-color-1:var(--fg)",
+  "--scalar-color-2:var(--fg-muted)",
+  "--scalar-color-3:var(--fg-subtle)",
+  "--scalar-color-accent:var(--accent-ink)",
+  "--scalar-background-1:var(--bg)",
+  "--scalar-background-2:var(--bg-elev)",
+  "--scalar-background-3:var(--bg-inset)",
+  "--scalar-background-accent:var(--accent-soft)",
+  "--scalar-border-color:var(--line)",
+  "--scalar-radius:6px",
+  "--scalar-radius-lg:10px",
+  "--scalar-sidebar-background-1:var(--bg)",
+  "--scalar-sidebar-border-color:var(--line)",
+  "--scalar-sidebar-color-1:var(--fg)",
+  "--scalar-sidebar-color-2:var(--fg-muted)",
+  "--scalar-sidebar-color-active:var(--accent-ink)",
+  "--scalar-sidebar-item-active-background:var(--accent-soft)",
+  "--scalar-sidebar-search-background:var(--bg-elev)",
+  "--scalar-sidebar-search-border-color:var(--line)",
+  "--scalar-custom-header-height:var(--header-h)",
+].join(";");
+
+const config = {
+  url: "/openapi.json",
+  theme: "none",
+  layout: "modern",
+  hideDarkModeToggle: true,
+  withDefaultFonts: false,
+  searchHotKey: "j",
+  metaData: { title: "FluxDown API Reference", description: t.description },
+  customCss: `.light-mode,.dark-mode,.light-mode .sidebar,.dark-mode .sidebar{${tokens}}`,
+};
+---
+
+<Layout lang={lang} title={t.title} description={t.description}>
+  <PageHeader eyebrow={t.eyebrow} title={t.heading} lede={t.lede}>
+    <a href="/openapi.json" class="btn btn-secondary" target="_blank" rel="noopener">
+      <FileJson size={15} strokeWidth={1.75} aria-hidden="true" />
+      <span class="mono text-[13px]">{t.spec}</span>
+    </a>
+    <a href={`/docs/${lang}/api/overview/`} class="btn btn-ghost">
+      <BookOpen size={15} strokeWidth={1.75} aria-hidden="true" />
+      {t.guide}
+    </a>
+  </PageHeader>
+
+  <section class="frame">
+    <div class="fig-bar"><span>fig. 01</span><span>{t.figure}</span></div>
+    <div id="api-reference" class="api-ref" data-config={JSON.stringify(config)} data-src={SCALAR_CDN}>
+      <p class="api-ref-status" data-status role="status">{t.loading}</p>
+      <p class="api-ref-status" data-failed hidden role="alert">
+        {t.failed}
+        <a href="/openapi.json" class="link">{t.failedCta}</a>
+      </p>
+    </div>
+  </section>
+</Layout>
+
+<script>
+  const host = document.getElementById("api-reference");
+  if (host) {
+    const status = host.querySelector<HTMLElement>("[data-status]");
+    const failed = host.querySelector<HTMLElement>("[data-failed]");
+    const fail = () => {
+      if (status) status.hidden = true;
+      if (failed) failed.hidden = false;
+    };
+    const isDark = () => document.documentElement.dataset.theme !== "light";
+    // Scalar 把颜色模式类挂在 body 上;站点主题切换时同步(配色本身已映射到站点令牌)
+    const syncMode = () => {
+      document.body.classList.toggle("dark-mode", isDark());
+      document.body.classList.toggle("light-mode", !isDark());
+    };
+
+    const script = document.createElement("script");
+    script.src = host.dataset.src ?? "";
+    script.async = true;
+    script.onerror = fail;
+    script.onload = () => {
+      const scalar = (window as unknown as { Scalar?: { createApiReference: (el: Element, cfg: unknown) => unknown } }).Scalar;
+      if (!scalar) return fail();
+      const config = JSON.parse(host.dataset.config ?? "{}") as Record<string, unknown>;
+      const mount = document.createElement("div");
+      host.append(mount);
+      try {
+        scalar.createApiReference(mount, {
+          ...config,
+          darkMode: isDark(),
+          forceDarkModeState: isDark() ? "dark" : "light",
+        });
+      } catch {
+        return fail();
+      }
+      status?.remove();
+      syncMode();
+      new MutationObserver(syncMode).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["data-theme"],
+      });
+    };
+    document.head.append(script);
+  }
+</script>
+
+<style>
+  .api-ref {
+    min-height: 60vh;
+  }
+  .api-ref-status {
+    padding: 64px 24px;
+    text-align: center;
+    font-size: 14px;
+    color: var(--fg-subtle);
+  }
+  .api-ref-status[data-failed] {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    color: var(--danger);
+  }
+  .api-ref-status[data-failed][hidden] {
+    display: none;
+  }
+</style>

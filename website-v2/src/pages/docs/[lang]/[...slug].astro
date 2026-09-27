@@ -1,0 +1,500 @@
+---
+/**
+ * 文档正文页(全部静态预渲染)。
+ * 路由:以 en 集合为 slug 全集 × {en, zh};zh 缺译 → 渲染 en 内容 + 未翻译横幅 + noindex,
+ * 不参与 hreflang / sitemap(判定单一来源 docs-fallback.ts)。zh 的 sourceHash 与 en 正文哈希
+ * 不一致 → 过期横幅(sourceHash 缺失视为新鲜度未知,不提示)。
+ */
+import { getCollection, render } from "astro:content";
+import { ChevronRight, PanelLeft, TriangleAlert, Languages, X } from "lucide-react";
+import Layout from "@/layouts/Layout.astro";
+import DocsSidebar from "@/components/docs/DocsSidebar.astro";
+import DocsToc from "@/components/docs/DocsToc.astro";
+import DocsPageNav from "@/components/docs/DocsPageNav.astro";
+import DocsSearch from "@/components/docs/DocsSearch";
+import DocsFeedbackForm from "@/components/docs/DocsFeedbackForm";
+import { BrandIcon } from "@/components/icons/brand";
+import { docsAlternates, docsSourceLinks } from "@/components/docs/meta";
+import { buildDocsNav, type DocsLang } from "@/lib/docs-nav";
+import { getFallbackSlugs } from "@/lib/docs-fallback";
+import { docsSourceHash } from "@/lib/docs-hash";
+import { docs } from "@/i18n/messages/docs";
+
+export const prerender = true;
+
+export async function getStaticPaths() {
+  const all = await getCollection("docs");
+  const en = all.filter((e) => e.id.startsWith("en/"));
+  const zhMap = new Map(all.filter((e) => e.id.startsWith("zh/")).map((e) => [e.id.slice(3), e]));
+  const fallbackSlugs = getFallbackSlugs();
+
+  return en.flatMap((e) => {
+    const slug = e.id.slice(3);
+    const zh = zhMap.get(slug);
+    const hasZh = zh !== undefined && !fallbackSlugs.has(slug);
+    const enPath = { params: { lang: "en", slug }, props: { entry: e, slug, fallback: false, stale: false, hasZh } };
+    if (!hasZh) {
+      return [enPath, { params: { lang: "zh", slug }, props: { entry: e, slug, fallback: true, stale: false, hasZh } }];
+    }
+    const stale = zh.data.sourceHash !== undefined && zh.data.sourceHash !== docsSourceHash(e.body ?? "");
+    return [enPath, { params: { lang: "zh", slug }, props: { entry: zh, slug, fallback: false, stale, hasZh } }];
+  });
+}
+
+const { entry, slug, fallback, stale, hasZh } = Astro.props;
+const lang = Astro.params.lang as DocsLang;
+const t = docs[lang];
+
+const all = await getCollection("docs");
+const { groups, flat } = buildDocsNav(all, lang);
+const { Content, headings } = await render(entry);
+
+const alternates = fallback ? [] : docsAlternates(`${slug}/`, hasZh ? ["en", "zh"] : ["en"]);
+const idx = flat.findIndex((i) => i.slug === slug);
+const prev = idx > 0 ? (flat[idx - 1] ?? null) : null;
+const next = idx >= 0 && idx < flat.length - 1 ? (flat[idx + 1] ?? null) : null;
+
+const contentLang = fallback ? "en" : lang;
+const links = docsSourceLinks(contentLang, slug, fallback);
+const pagePath = `/docs/${lang}/${slug}/`;
+const section = groups.find((g) => g.id === entry.data.section);
+---
+
+<Layout
+  lang={lang}
+  title={t.pageTitle(entry.data.title)}
+  description={entry.data.description ?? t.pageFallbackDescription}
+  alternates={alternates}
+  noindex={fallback}
+>
+  <div class="frame">
+    <div class="docs-mbar">
+      <button type="button" class="btn btn-secondary btn-sm" popovertarget="docs-drawer">
+        <PanelLeft size={14} strokeWidth={1.75} aria-hidden="true" />
+        {t.nav.menu}
+      </button>
+      <span class="docs-mbar-trail">
+        {section && <span class="text-subtle">{section.label}</span>}
+        <ChevronRight size={12} className="shrink-0 text-subtle" aria-hidden="true" />
+        <span class="truncate text-fg">{entry.data.title}</span>
+      </span>
+    </div>
+
+    <div id="docs-drawer" class="docs-drawer" popover>
+      <div class="docs-drawer-head">
+        <a href={`/docs/${lang}/`} class="eyebrow">{t.docs}</a>
+        <button
+          type="button"
+          class="btn btn-ghost btn-sm !px-2"
+          popovertarget="docs-drawer"
+          popovertargetaction="hide"
+          aria-label={t.nav.close}
+        >
+          <X size={16} aria-hidden="true" />
+        </button>
+      </div>
+      <div class="docs-drawer-body">
+        <DocsSearch client:idle lang={lang} />
+        <DocsSidebar groups={groups} currentPath={pagePath} lang={lang} />
+      </div>
+    </div>
+
+    <div class="docs-grid">
+      <aside class="docs-side">
+        <div class="docs-side-inner">
+          <DocsSearch client:idle lang={lang} />
+          <DocsSidebar groups={groups} currentPath={pagePath} lang={lang} />
+        </div>
+      </aside>
+
+      <div class="docs-main">
+        <article
+          data-docs-article
+          lang={contentLang === "zh" ? "zh-CN" : "en"}
+          data-anchor-label={t.anchor("")}
+          data-copy-label={t.copy}
+          data-copy-aria={t.copyCode}
+          data-copied-label={t.copied}
+        >
+          <nav aria-label={t.breadcrumb} class="docs-crumbs" lang={lang === "zh" ? "zh-CN" : "en"}>
+            <ol>
+              <li><a href={`/docs/${lang}/`}>{t.docs}</a></li>
+              {section && <li><a href={`/docs/${lang}/#${section.id}`}>{section.label}</a></li>}
+              <li><span aria-current="page">{entry.data.title}</span></li>
+            </ol>
+          </nav>
+
+          {
+            fallback && (
+              <p class="docs-note" lang="zh-CN">
+                <Languages size={15} strokeWidth={1.75} className="docs-note-icon" aria-hidden="true" />
+                <span>
+                  {t.fallbackBanner}{" "}
+                  <a href={links.translate} target="_blank" rel="noopener noreferrer" class="link">
+                    {t.fallbackCta} →
+                  </a>
+                </span>
+              </p>
+            )
+          }
+          {
+            stale && (
+              <p class="docs-note">
+                <TriangleAlert size={15} strokeWidth={1.75} className="docs-note-icon" aria-hidden="true" />
+                <span>
+                  {t.staleBanner}{" "}
+                  <a href={links.edit} target="_blank" rel="noopener noreferrer" class="link">
+                    {t.staleCta} →
+                  </a>
+                </span>
+              </p>
+            )
+          }
+
+          <header class="docs-head">
+            {section && <p class="eyebrow">{section.label}</p>}
+            <h1 class="docs-title">{entry.data.title}</h1>
+            {entry.data.description && <p class="docs-desc">{entry.data.description}</p>}
+            <a href={links.edit} target="_blank" rel="noopener noreferrer" class="docs-edit" lang={lang === "zh" ? "zh-CN" : "en"}>
+              <BrandIcon name="github" size={13} />
+              {t.edit}
+            </a>
+          </header>
+
+          <div class="docs-toc-inline">
+            <DocsToc headings={headings} lang={lang} variant="inline" />
+          </div>
+
+          <div class="prose docs-prose">
+            <Content />
+          </div>
+        </article>
+
+        <DocsPageNav
+          prev={prev}
+          next={next}
+          editUrl={links.edit}
+          historyUrl={links.history}
+          translateUrl={links.translate}
+          lang={lang}
+        />
+        <DocsFeedbackForm client:visible pagePath={pagePath} lang={lang} />
+      </div>
+
+      <aside class="docs-rail">
+        <div class="docs-rail-inner">
+          <DocsToc headings={headings} lang={lang} />
+        </div>
+      </aside>
+    </div>
+  </div>
+</Layout>
+
+<script>
+  import "@/components/docs/enhance.ts";
+</script>
+
+<style>
+  .docs-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 1024px) {
+    .docs-grid {
+      grid-template-columns: 264px minmax(0, 1fr);
+    }
+  }
+  @media (min-width: 1240px) {
+    .docs-grid {
+      grid-template-columns: 264px minmax(0, 1fr) 224px;
+    }
+  }
+
+  .docs-side,
+  .docs-rail {
+    display: none;
+  }
+  @media (min-width: 1024px) {
+    .docs-side {
+      display: block;
+      border-right: 1px solid var(--line);
+    }
+    .docs-mbar {
+      display: none !important;
+    }
+  }
+  @media (min-width: 1240px) {
+    .docs-rail {
+      display: block;
+      border-left: 1px solid var(--line);
+    }
+    .docs-toc-inline {
+      display: none;
+    }
+  }
+  .docs-side-inner,
+  .docs-rail-inner {
+    position: sticky;
+    top: var(--header-h);
+    max-height: calc(100dvh - var(--header-h));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+  }
+  .docs-side-inner {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding: 28px 18px 40px;
+  }
+  .docs-rail-inner {
+    padding: 36px 22px 40px;
+  }
+
+  .docs-mbar {
+    position: sticky;
+    top: var(--header-h);
+    z-index: 20;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+    padding: 10px clamp(16px, 4vw, 28px);
+    border-bottom: 1px solid var(--line);
+    background: color-mix(in oklch, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+  }
+  .docs-mbar-trail {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    font-size: 13px;
+  }
+  .docs-mbar-trail > :first-child {
+    flex: none;
+  }
+
+  .docs-main {
+    min-width: 0;
+    padding: clamp(28px, 4vw, 48px) clamp(18px, 4vw, 56px) clamp(56px, 8vw, 96px);
+  }
+  .docs-main > * {
+    max-width: 72ch;
+  }
+
+  .docs-crumbs ol {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+    color: var(--fg-subtle);
+  }
+  .docs-crumbs li + li::before {
+    content: "/";
+    margin-right: 8px;
+    color: var(--line-strong);
+  }
+  .docs-crumbs a:hover {
+    color: var(--fg);
+  }
+  .docs-crumbs [aria-current] {
+    color: var(--fg-muted);
+  }
+
+  .docs-note {
+    display: flex;
+    gap: 10px;
+    margin-top: 20px;
+    padding: 11px 14px;
+    border: 1px solid color-mix(in oklch, var(--warn) 35%, var(--line));
+    border-left: 2px solid var(--warn);
+    border-radius: 0 8px 8px 0;
+    background: color-mix(in oklch, var(--warn) 7%, transparent);
+    font-size: 13.5px;
+    line-height: 1.55;
+    color: var(--fg);
+  }
+  .docs-note :global(.docs-note-icon) {
+    flex: none;
+    margin-top: 2px;
+    color: var(--warn);
+  }
+
+  .docs-head {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 14px;
+    margin-top: 28px;
+    padding-bottom: 28px;
+    border-bottom: 1px solid var(--line);
+  }
+  .docs-title {
+    font-size: clamp(1.9rem, 3.2vw, 2.55rem);
+    font-weight: 580;
+    line-height: 1.1;
+    letter-spacing: -0.032em;
+    color: var(--fg);
+  }
+  .docs-desc {
+    font-size: 1.06rem;
+    line-height: 1.6;
+    color: var(--fg-muted);
+  }
+  .docs-edit {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    padding: 4px 10px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--fg-muted);
+    transition:
+      color 160ms var(--ease-out),
+      border-color 160ms var(--ease-out);
+  }
+  .docs-edit:hover {
+    color: var(--fg);
+    border-color: var(--line-strong);
+  }
+  .docs-toc-inline {
+    margin-top: 24px;
+  }
+  .docs-prose {
+    margin-top: 28px;
+  }
+</style>
+
+<style is:global>
+  @media (max-width: 1023px) {
+    html {
+      scroll-padding-top: calc(var(--header-h) + 72px);
+    }
+  }
+
+  /* 移动端文档抽屉(Popover API:Esc / 点击遮罩关闭,无 JS) */
+  #docs-drawer {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: min(340px, 88vw);
+    height: 100dvh;
+    max-height: none;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-right: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--fg);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    transform: translateX(-100%);
+    transition:
+      transform 300ms var(--ease-out),
+      overlay 300ms allow-discrete,
+      display 300ms allow-discrete;
+  }
+  #docs-drawer:popover-open {
+    transform: none;
+  }
+  @starting-style {
+    #docs-drawer:popover-open {
+      transform: translateX(-100%);
+    }
+  }
+  #docs-drawer::backdrop {
+    background: color-mix(in oklch, var(--bg) 50%, transparent);
+    backdrop-filter: blur(4px);
+  }
+  .docs-drawer-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 56px;
+    padding-inline: 18px 10px;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);
+  }
+  .docs-drawer-body {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    padding: 20px 14px 40px;
+  }
+
+  /* 正文增强(enhance.ts 注入):标题锚点 + 代码块外框 */
+  .docs-prose :is(h2, h3, h4) {
+    position: relative;
+  }
+  .docs-prose .h-anchor {
+    margin-left: 0.4em;
+    font-family: var(--font-mono);
+    font-weight: 400;
+    color: var(--fg-subtle);
+    text-decoration: none;
+    opacity: 0;
+    transition: opacity 160ms var(--ease-out), color 160ms var(--ease-out);
+  }
+  .docs-prose :is(h2, h3, h4):hover .h-anchor,
+  .docs-prose .h-anchor:focus-visible {
+    opacity: 1;
+  }
+  .docs-prose .h-anchor:hover {
+    color: var(--accent-ink);
+  }
+  @media (hover: none) {
+    .docs-prose .h-anchor {
+      opacity: 0.5;
+    }
+  }
+  .docs-prose .code-block {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-sunken);
+    overflow: hidden;
+  }
+  .docs-prose .code-block pre {
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+  }
+  .docs-prose .code-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 34px;
+    padding-inline: 14px 6px;
+    border-bottom: 1px solid var(--line);
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+  }
+  .docs-prose .code-copy {
+    height: 24px;
+    padding-inline: 8px;
+    border-radius: 6px;
+    font: inherit;
+    letter-spacing: 0.08em;
+    color: var(--fg-muted);
+    cursor: pointer;
+    transition: color 160ms var(--ease-out), background-color 160ms var(--ease-out);
+  }
+  .docs-prose .code-copy:hover {
+    color: var(--fg);
+    background: var(--bg-inset);
+  }
+  .docs-prose .code-copy[data-copied] {
+    color: var(--ok);
+  }
+</style>

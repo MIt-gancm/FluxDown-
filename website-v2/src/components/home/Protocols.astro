@@ -1,0 +1,317 @@
+---
+/** 02 · 协议:六种协议卡片,每张带一个表意的 SVG 微动画(纯 CSS)。 */
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].protocols;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const peers = Array.from({ length: 6 }, (_, i) => {
+  const a = (i / 6) * Math.PI * 2 - Math.PI / 2;
+  return { x: 60 + Math.cos(a) * 44, y: 34 + Math.sin(a) * 24, i };
+});
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section flex flex-col gap-12">
+    <div class="grid gap-6 lg:grid-cols-2 lg:items-end grid-cols-1">
+      <div class="flex flex-col gap-6">
+        <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+        <h2 class="h2" data-reveal set:html={title} />
+      </div>
+      <p class="lede lg:justify-self-end lg:max-w-[46ch]" data-reveal style="--d:1">{t.lede}</p>
+    </div>
+
+    <div class="cells proto-grid overflow-hidden rounded-[12px] border border-line sm:grid-cols-2 lg:grid-cols-3 grid-cols-1">
+      {
+        t.items.map((item, i) => (
+          <article class="cell spot spot-edge flex flex-col gap-4" data-reveal style={`--d:${i % 3}`}>
+            <div class="flex items-center justify-between">
+              <span class="mono text-[11px] text-subtle">P/{String(i + 1).padStart(2, "0")}</span>
+              <span class="chip mono !h-[22px] !text-[10.5px] uppercase tracking-[0.06em]">{item.tag}</span>
+            </div>
+            <div class="proto-glyph" aria-hidden="true">
+              {i === 0 && (
+                <svg viewBox="0 0 120 68">
+                  {[0, 1, 2, 3].map((n) => (
+                    <g>
+                      <rect x="6" y={10 + n * 14} width="108" height="6" rx="3" class="g-track" />
+                      <rect x="6" y={10 + n * 14} width="108" height="6" rx="3" class="g-fill g-lane" style={`--dur:${2.2 + n * 0.55}s`} />
+                    </g>
+                  ))}
+                </svg>
+              )}
+              {i === 1 && (
+                <svg viewBox="0 0 120 68">
+                  <rect x="6" y="31" width="108" height="6" rx="3" class="g-track" />
+                  <rect x="6" y="31" width="108" height="6" rx="3" class="g-fill g-resume" />
+                  <path d="M70 22v24" class="g-line g-pause" />
+                  <text x="70" y="17" class="g-label" text-anchor="middle">resume</text>
+                </svg>
+              )}
+              {i === 2 && (
+                <svg viewBox="0 0 120 68">
+                  {peers.map((p) => (
+                    <>
+                      <path d={`M${p.x} ${p.y}L60 34`} class="g-line" />
+                      <path d={`M${p.x} ${p.y}L60 34`} pathLength="100" class="g-flow" style={`--delay:${p.i * 0.35}s`} />
+                      <circle cx={p.x} cy={p.y} r="4" class="g-node" />
+                    </>
+                  ))}
+                  <circle cx="60" cy="34" r="7" class="g-core" />
+                </svg>
+              )}
+              {i === 3 && (
+                <svg viewBox="0 0 120 68">
+                  {Array.from({ length: 24 }, (_, n) => (
+                    <rect x={6 + (n % 8) * 13.7} y={8 + Math.floor(n / 8) * 13} width="10" height="9" rx="1.5" class="g-frag" style={`--delay:${n * 0.09}s`} />
+                  ))}
+                  <rect x="6" y="52" width="108" height="6" rx="3" class="g-track" />
+                  <rect x="6" y="52" width="108" height="6" rx="3" class="g-fill g-merge" />
+                </svg>
+              )}
+              {i === 4 && (
+                <svg viewBox="0 0 120 68">
+                  <path d="M6 16 Q 12 6 18 16 T 30 16 T 42 16 T 54 16 T 66 16" class="g-wave" />
+                  {[0, 1, 2, 3, 4].map((n) => (
+                    <rect x={6 + n * 12.5} y="38" width="10" height="10" rx="1.5" class="g-frame" style={`--delay:${n * 0.18}s`} />
+                  ))}
+                  <path d="M70 16 C 84 16 84 34 96 34 M70 43 C 84 43 84 34 96 34" class="g-line" />
+                  <rect x="96" y="28" width="18" height="12" rx="2.5" class="g-fill g-mux" />
+                </svg>
+              )}
+              {i === 5 && (
+                <svg viewBox="0 0 120 68">
+                  {Array.from({ length: 6 }, (_, n) => (
+                    <g style={`--delay:${n * 0.4}s`} class="g-block">
+                      <rect x={6 + n * 18.6} y="18" width="15" height="22" rx="2" class="g-track" />
+                      <rect x={6 + n * 18.6} y="18" width="15" height="22" rx="2" class="g-fill g-hash" />
+                      <path d={`M${9.5 + n * 18.6} 50l3 3 5-6`} class="g-check" />
+                    </g>
+                  ))}
+                </svg>
+              )}
+            </div>
+            <div class="flex flex-col gap-1.5">
+              <h3 class="text-[17px] font-medium tracking-[-0.01em] text-fg">{item.name}</h3>
+              <p class="text-[14px] leading-relaxed text-muted">{item.desc}</p>
+            </div>
+          </article>
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<style is:global>
+  @layer components {
+    .proto-glyph {
+      height: 84px;
+      margin-block: 6px 4px;
+      padding: 8px 0;
+      border-block: 1px dashed var(--line);
+    }
+    .proto-glyph svg {
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+    }
+    .g-track {
+      fill: var(--bg-inset);
+    }
+    .g-fill {
+      fill: var(--accent);
+    }
+    .g-line {
+      fill: none;
+      stroke: var(--line-strong);
+      stroke-width: 1;
+    }
+    .g-label {
+      font-family: var(--font-mono);
+      font-size: 8px;
+      fill: var(--fg-subtle);
+    }
+    .g-lane {
+      transform-box: fill-box;
+      transform-origin: left;
+      animation: g-grow var(--dur) var(--ease-out) infinite;
+    }
+    @keyframes g-grow {
+      0% {
+        transform: scaleX(0);
+      }
+      70%,
+      100% {
+        transform: scaleX(1);
+      }
+    }
+    .g-resume {
+      transform-box: fill-box;
+      transform-origin: left;
+      animation: g-resume 4.4s var(--ease-out) infinite;
+    }
+    @keyframes g-resume {
+      0% {
+        transform: scaleX(0);
+      }
+      30%,
+      55% {
+        transform: scaleX(0.59);
+      }
+      85%,
+      100% {
+        transform: scaleX(1);
+      }
+    }
+    .g-pause {
+      stroke: var(--warn);
+      stroke-dasharray: 2 2;
+      animation: g-blink 4.4s steps(1) infinite;
+    }
+    @keyframes g-blink {
+      0%,
+      28% {
+        opacity: 0;
+      }
+      30%,
+      55% {
+        opacity: 1;
+      }
+      56%,
+      100% {
+        opacity: 0.25;
+      }
+    }
+    .g-flow {
+      fill: none;
+      stroke: var(--accent);
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-dasharray: 10 100;
+      stroke-dashoffset: 110;
+      animation: g-flow 2.1s linear var(--delay) infinite;
+    }
+    @keyframes g-flow {
+      to {
+        stroke-dashoffset: 0;
+      }
+    }
+    .g-node {
+      fill: var(--bg-elev);
+      stroke: var(--fg-subtle);
+      stroke-width: 1;
+    }
+    .g-core {
+      fill: var(--accent);
+      filter: drop-shadow(0 0 6px color-mix(in oklch, var(--accent) 70%, transparent));
+    }
+    .g-frag {
+      fill: var(--bg-inset);
+      animation: g-frag 3.6s var(--ease-out) var(--delay) infinite;
+    }
+    @keyframes g-frag {
+      0%,
+      8% {
+        fill: var(--bg-inset);
+      }
+      12%,
+      80% {
+        fill: var(--accent);
+      }
+      100% {
+        fill: var(--bg-inset);
+      }
+    }
+    .g-merge {
+      transform-box: fill-box;
+      transform-origin: left;
+      animation: g-merge 3.6s var(--ease-out) infinite;
+    }
+    @keyframes g-merge {
+      0%,
+      60% {
+        transform: scaleX(0);
+      }
+      85%,
+      100% {
+        transform: scaleX(1);
+      }
+    }
+    .g-wave {
+      fill: none;
+      stroke: var(--cyan);
+      stroke-width: 1.6;
+      stroke-dasharray: 90;
+      stroke-dashoffset: 90;
+      animation: g-wave 3s var(--ease-out) infinite;
+    }
+    @keyframes g-wave {
+      60%,
+      100% {
+        stroke-dashoffset: 0;
+      }
+    }
+    .g-frame {
+      fill: var(--bg-inset);
+      animation: g-frag 3s var(--ease-out) var(--delay) infinite;
+    }
+    .g-mux {
+      animation: g-pulse 3s ease-in-out infinite;
+    }
+    @keyframes g-pulse {
+      0%,
+      55% {
+        opacity: 0.15;
+      }
+      70%,
+      100% {
+        opacity: 1;
+      }
+    }
+    .g-hash {
+      transform-box: fill-box;
+      transform-origin: bottom;
+      animation: g-hash 4.8s var(--ease-out) var(--delay) infinite;
+    }
+    @keyframes g-hash {
+      0% {
+        transform: scaleY(0);
+      }
+      25%,
+      90% {
+        transform: scaleY(1);
+      }
+      100% {
+        transform: scaleY(0);
+      }
+    }
+    .g-check {
+      fill: none;
+      stroke: var(--ok);
+      stroke-width: 1.6;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+      stroke-dasharray: 12;
+      stroke-dashoffset: 12;
+      animation: g-check 4.8s var(--ease-out) var(--delay) infinite;
+    }
+    @keyframes g-check {
+      0%,
+      28% {
+        stroke-dashoffset: 12;
+      }
+      38%,
+      90% {
+        stroke-dashoffset: 0;
+      }
+      100% {
+        stroke-dashoffset: 12;
+      }
+    }
+  }
+</style>

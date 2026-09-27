@@ -1,0 +1,67 @@
+---
+/** 07 · 默认隐私:出站数据清单(与 AGENTS.md 遥测不变式一致:仅两条匿名部署事件)。 */
+import { Check, Minus } from "lucide-react";
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].privacy;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section grid gap-12 lg:grid-cols-2 lg:gap-16 grid-cols-1">
+    <div class="flex flex-col gap-6">
+      <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+      <h2 class="h2" data-reveal set:html={title} />
+      <p class="lede" data-reveal style="--d:1">{t.lede}</p>
+    </div>
+
+    <figure class="fig self-center overflow-hidden rounded-[12px]" data-reveal style="--d:1">
+      <figcaption class="fig-bar">
+        <span>fig. 05</span>
+        <span>{t.figure}</span>
+      </figcaption>
+      <table class="w-full text-left">
+        <thead>
+          <tr class="mono text-[10.5px] uppercase tracking-[0.12em] text-subtle">
+            <th class="px-5 py-3 font-normal">{t.colData}</th>
+            <th class="px-5 py-3 text-right font-normal">{t.colSent}</th>
+          </tr>
+        </thead>
+        <tbody>
+          {
+            t.rows.map((row, i) => (
+              <tr class="border-t border-line" data-reveal style={`--d:${i + 1}`}>
+                <td class="px-5 py-3.5">
+                  <span class="mono text-[13px] text-fg">{row.k}</span>
+                  {row.note && <span class="mono ml-2 text-[11px] text-subtle">({row.note})</span>}
+                </td>
+                <td class="px-5 py-3.5 text-right">
+                  <span class:list={["inline-flex items-center gap-2 text-[13px]", row.sent ? "text-muted" : "text-ok"]}>
+                    {row.sent ? <Minus size={13} strokeWidth={2} /> : <Check size={13} strokeWidth={2} />}
+                    {row.v}
+                  </span>
+                </td>
+              </tr>
+            ))
+          }
+        </tbody>
+      </table>
+    </figure>
+  </div>
+  <div class="cells border-t border-line md:grid-cols-3 grid-cols-1">
+    {
+      t.items.map((item, i) => (
+        <div class="cell spot spot-edge flex flex-col gap-2" data-reveal style={`--d:${i}`}>
+          <h3 class="text-[16px] font-medium text-fg">{item.k}</h3>
+          <p class="text-[14px] leading-relaxed text-muted">{item.v}</p>
+        </div>
+      ))
+    }
+  </div>
+</section>

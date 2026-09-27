@@ -1,0 +1,35 @@
+---
+/**
+ * 内页统一抬头:[ EYEBROW ] + 大标题(可含 serif 强调)+ 导语 + 可选操作区。
+ * 标题中用 `<em>` 包裹的片段渲染为斜体衬线强调(zh 下自动退化为粗体)。
+ */
+interface Props {
+  eyebrow: string;
+  title: string;
+  lede?: string;
+  align?: "left" | "center";
+}
+const { eyebrow, title, lede, align = "left" } = Astro.props;
+const html = title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+---
+
+<section class="frame">
+  <div
+    class:list={[
+      "section relative flex flex-col gap-5 pb-[clamp(40px,6vw,72px)]",
+      align === "center" && "items-center text-center",
+    ]}
+  >
+    <span class="eyebrow" data-scramble>{eyebrow}</span>
+    <h1 class="h2 max-w-[20ch]" data-reveal set:html={html} />
+    {lede && <p class="lede max-w-[62ch]" data-reveal style="--d:1">{lede}</p>}
+    {
+      Astro.slots.has("default") && (
+        <div class="mt-2 flex flex-wrap gap-3" data-reveal style="--d:2">
+          <slot />
+        </div>
+      )
+    }
+  </div>
+  <div class="rule"></div>
+</section>

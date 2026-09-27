@@ -1,0 +1,45 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import CopyButton from "@/components/community/CopyButton";
+import JoinSteps from "@/components/community/JoinSteps.astro";
+import { BrandIcon } from "@/components/icons/brand";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { groups } from "@/i18n/messages/groups";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = groups[lang].qq;
+const QQ_GROUP_NUMBER = "832143651";
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description} noindex>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
+
+  <section class="frame">
+    <div class="cells md:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+      <div class="cell grid place-items-center">
+        <figure class="fig w-full max-w-[320px]" data-reveal>
+          <figcaption class="fig-bar"><span>fig. 01</span><span>{t.figCaption}</span></figcaption>
+          <div class="grid place-items-center bg-white p-5">
+            <img src="/qq-group.png" alt={t.qrAlt} width="371" height="368" class="aspect-square w-full max-w-[240px]" />
+          </div>
+        </figure>
+      </div>
+
+      <div class="cell flex flex-col gap-10">
+        <div class="flex flex-col gap-3" data-reveal style="--d:1">
+          <p class="eyebrow-plain inline-flex items-center gap-2">
+            <BrandIcon name="qq" size={12} />
+            {t.groupNumber}
+          </p>
+          <div class="flex flex-wrap items-center gap-4">
+            <span class="mono num select-all text-[clamp(1.9rem,4vw,2.6rem)] font-medium tracking-[0.08em] text-fg">{QQ_GROUP_NUMBER}</span>
+            <CopyButton client:visible value={QQ_GROUP_NUMBER} label={t.copy} copiedLabel={t.copied} ariaLabel={t.copyLabel} />
+          </div>
+        </div>
+        <JoinSteps heading={t.howToJoin} steps={t.steps} />
+      </div>
+    </div>
+  </section>
+</Layout>

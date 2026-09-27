@@ -1,0 +1,304 @@
+---
+/**
+ * 05 · 全平台:Docker / CLI / REST / aria2 / MCP 代码标签页(命令逐字取自 docs)+ 四个运行形态。
+ */
+import { Code } from "astro:components";
+import { ArrowUpRight } from "lucide-react";
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].everywhere;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+
+const tabs = [
+  {
+    id: "docker",
+    file: "terminal",
+    lang: "bash",
+    doc: "headless-server/docker",
+    code: `docker run -d \\
+  --name fluxdown-server \\
+  --restart unless-stopped \\
+  -p 17800:17800 \\
+  -v fluxdown-data:/data \\
+  -v /path/to/downloads:/root/Downloads \\
+  ghcr.io/zerx-lab/fluxdown-server:latest`,
+  },
+  {
+    id: "cli",
+    file: "terminal",
+    lang: "bash",
+    doc: "api/cli",
+    code: `# talk to the running app or server
+fluxdown add https://example.com/a.zip https://example.com/b.zip
+
+# read URLs from a file or stdin
+cat urls.txt | fluxdown add -i -
+
+# no app running? embed the engine
+fluxdown add https://example.com/file.zip --local`,
+  },
+  {
+    id: "rest",
+    file: "terminal",
+    lang: "bash",
+    doc: "api/overview",
+    code: `curl -X POST http://<host>:17800/api/v1/tasks \\
+  -H "Authorization: Bearer <token>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"url":"https://example.com/file.zip","segments":8}'
+# -> {"taskId":"..."}`,
+  },
+  {
+    id: "aria2",
+    file: "terminal",
+    lang: "bash",
+    doc: "api/overview",
+    code: `curl -X POST http://<host>:17800/jsonrpc \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "id": "1",
+    "method": "aria2.addUri",
+    "params": ["token:<token>", ["https://example.com/file.zip"]]
+  }'`,
+  },
+  {
+    id: "mcp",
+    file: "mcp.json",
+    lang: "json",
+    doc: "api/overview",
+    code: `{
+  "mcpServers": {
+    "fluxdown": {
+      "url": "http://<host>:17800/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}`,
+  },
+] as const;
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section flex flex-col gap-12">
+    <div class="grid gap-6 lg:grid-cols-2 lg:items-end grid-cols-1">
+      <div class="flex flex-col gap-6">
+        <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+        <h2 class="h2" data-reveal set:html={title} />
+      </div>
+      <p class="lede lg:max-w-[48ch] lg:justify-self-end" data-reveal style="--d:1">{t.lede}</p>
+    </div>
+
+    <div class="fig overflow-hidden rounded-[12px]" data-reveal data-tabs>
+      <div class="ev-tabs" role="tablist">
+        {
+          tabs.map((tab, i) => (
+            <button
+              type="button"
+              role="tab"
+              id={`ev-tab-${tab.id}`}
+              aria-controls={`ev-panel-${tab.id}`}
+              aria-selected={i === 0 ? "true" : "false"}
+              tabindex={i === 0 ? 0 : -1}
+              class="ev-tab"
+            >
+              {t.tabs[tab.id]}
+            </button>
+          ))
+        }
+      </div>
+      {
+        tabs.map((tab, i) => (
+          <div
+            class="ev-panel"
+            role="tabpanel"
+            id={`ev-panel-${tab.id}`}
+            aria-labelledby={`ev-tab-${tab.id}`}
+            hidden={i !== 0}
+          >
+            <div class="ev-code">
+              <div class="ev-code-bar">
+                <span class="mono text-[11px] text-subtle">{tab.file}</span>
+                <button type="button" class="ev-copy mono" data-copy data-label={t.copy} data-done={t.copied}>
+                  {t.copy}
+                </button>
+              </div>
+              <div class="ev-code-body">
+                <Code code={tab.code} lang={tab.lang} themes={{ light: "github-light", dark: "github-dark" }} defaultColor={false} />
+              </div>
+              <template data-raw>{tab.code}</template>
+            </div>
+            <aside class="ev-note">
+              <p class="text-[14.5px] leading-relaxed text-muted">{t.notes[tab.id]}</p>
+              <a href={`/docs/${lang}/${tab.doc}/`} class="link inline-flex items-center gap-1 text-[13.5px]">
+                docs/{tab.doc}
+                <ArrowUpRight size={13} strokeWidth={2} />
+              </a>
+            </aside>
+          </div>
+        ))
+      }
+    </div>
+
+    <div class="cells overflow-hidden rounded-[12px] border border-line grid-cols-2 lg:grid-cols-4">
+      {
+        t.surfaces.map((s, i) => (
+          <div class="cell spot spot-edge flex flex-col gap-1" data-reveal style={`--d:${i}`}>
+            <span class="text-[16px] font-medium text-fg">{s.k}</span>
+            <span class="mono text-[12px] text-subtle">{s.v}</span>
+          </div>
+        ))
+      }
+    </div>
+  </div>
+</section>
+
+<script>
+  document.querySelectorAll<HTMLElement>("[data-tabs]").forEach((root) => {
+    const tabs = [...root.querySelectorAll<HTMLButtonElement>("[role=tab]")];
+    const select = (tab: HTMLButtonElement) => {
+      for (const other of tabs) {
+        const selected = other === tab;
+        other.setAttribute("aria-selected", String(selected));
+        other.tabIndex = selected ? 0 : -1;
+        const panel = root.querySelector<HTMLElement>(`#${other.getAttribute("aria-controls")}`);
+        if (panel) panel.hidden = !selected;
+      }
+    };
+    tabs.forEach((tab, i) => {
+      tab.addEventListener("click", () => select(tab));
+      tab.addEventListener("keydown", (event) => {
+        const delta = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+        if (!delta) return;
+        const next = tabs[(i + delta + tabs.length) % tabs.length];
+        if (next) {
+          select(next);
+          next.focus();
+        }
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>("[data-copy]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const raw = button.closest(".ev-code")?.querySelector("template")?.innerHTML ?? "";
+        const text = new DOMParser().parseFromString(raw, "text/html").documentElement.textContent ?? raw;
+        try {
+          await navigator.clipboard.writeText(text);
+          button.textContent = button.dataset.done ?? "";
+          setTimeout(() => (button.textContent = button.dataset.label ?? ""), 1600);
+        } catch {
+          // 剪贴板不可用(非安全上下文):保持原文案
+        }
+      });
+    });
+  });
+</script>
+
+<style is:global>
+  @layer components {
+    .ev-tabs {
+      display: flex;
+      gap: 2px;
+      overflow-x: auto;
+      padding: 6px;
+      border-bottom: 1px solid var(--line);
+      background: var(--bg-sunken);
+      scrollbar-width: none;
+    }
+    .ev-tab {
+      position: relative;
+      height: 30px;
+      padding-inline: 14px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      color: var(--fg-subtle);
+      white-space: nowrap;
+      transition:
+        color 150ms,
+        background-color 150ms;
+    }
+    .ev-tab:hover {
+      color: var(--fg);
+    }
+    .ev-tab[aria-selected="true"] {
+      color: var(--fg);
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line-strong) inset,
+        0 1px 2px oklch(0 0 0 / 0.05);
+    }
+    .ev-panel {
+      display: grid;
+      min-height: 280px;
+    }
+    .ev-panel[hidden] {
+      display: none;
+    }
+    @media (min-width: 900px) {
+      .ev-panel {
+        grid-template-columns: minmax(0, 1fr) 300px;
+      }
+    }
+    .ev-panel:not([hidden]) .ev-code-body {
+      animation: ev-in 360ms var(--ease-out);
+    }
+    @keyframes ev-in {
+      from {
+        opacity: 0;
+        transform: translateY(4px);
+      }
+    }
+    .ev-code {
+      min-width: 0;
+      border-right: 1px solid var(--line);
+    }
+    .ev-code-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 36px;
+      padding: 0 12px 0 18px;
+      border-bottom: 1px dashed var(--line);
+    }
+    .ev-copy {
+      height: 24px;
+      padding: 0 8px;
+      border-radius: 5px;
+      font-size: 11px;
+      color: var(--fg-subtle);
+      transition:
+        color 150ms,
+        background-color 150ms;
+    }
+    .ev-copy:hover {
+      color: var(--fg);
+      background: var(--bg-inset);
+    }
+    .ev-code-body pre {
+      margin: 0;
+      padding: 20px 22px 24px;
+      overflow-x: auto;
+      font-size: 13px;
+      line-height: 1.7;
+      background: transparent !important;
+    }
+    .ev-code-body code {
+      font-family: var(--font-mono);
+    }
+    .ev-note {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 22px 24px;
+      background: var(--bg-sunken);
+    }
+  }
+</style>

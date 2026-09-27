@@ -1,0 +1,55 @@
+---
+/** Free vs premium capability table (shared by /pricing/ and /pricing/why/). */
+import { Check, Minus } from "lucide-react";
+import type { Lang } from "@/i18n/config";
+import { pricing } from "@/i18n/messages/pricing";
+
+interface Props {
+  lang: Lang;
+  figTag?: string;
+}
+const { lang, figTag } = Astro.props;
+const t = pricing[lang].compare;
+---
+
+<figure class="fig overflow-x-auto">
+  <figcaption class="fig-bar">
+    <span>{figTag ?? t.figTag}</span>
+    <span>{t.figCaption}</span>
+  </figcaption>
+  <table class="w-full min-w-[520px] border-collapse text-left text-sm">
+    <thead>
+      <tr class="border-b border-line font-mono text-[11px] uppercase tracking-[0.12em] text-subtle">
+        <th scope="col" class="w-[46%] px-5 py-3 font-medium">{t.feature}</th>
+        <th scope="col" class="px-5 py-3 font-medium">{t.free}</th>
+        <th scope="col" class="px-5 py-3 font-medium text-accent-ink">{t.paid}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {
+        t.rows.map((row) => (
+          <tr class="border-b border-line last:border-b-0 transition-colors hover:bg-sunken">
+            <th scope="row" class="px-5 py-3.5 font-medium">
+              {row.label}
+            </th>
+            {[row.free, row.paid].map((value, i) =>
+              value === "—" ? (
+                <td class="px-5 py-3.5 text-subtle">
+                  <Minus size={14} aria-hidden="true" />
+                  <span class="sr-only">{t.none}</span>
+                </td>
+              ) : (
+                <td class:list={["px-5 py-3.5", i === 0 ? "text-muted" : "text-fg"]}>
+                  <span class="inline-flex items-center gap-2">
+                    <Check size={14} className="shrink-0 text-accent" aria-hidden="true" />
+                    {value}
+                  </span>
+                </td>
+              ),
+            )}
+          </tr>
+        ))
+      }
+    </tbody>
+  </table>
+</figure>

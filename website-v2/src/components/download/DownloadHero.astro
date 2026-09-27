@@ -1,0 +1,242 @@
+---
+/**
+ * 下载页首屏:左侧标题 + 渠道切换,右侧「你的构建」面板。
+ * 服务端渲染的是无 JS 的中性状态(主按钮跳到平台矩阵);客户端脚本识别 OS / 架构后
+ * 改写主按钮、元数据与累计下载量。
+ */
+import { Download, ArrowUpRight, Monitor } from "lucide-react";
+import { BrandIcon } from "@/components/icons/brand";
+import { download } from "@/i18n/messages/download";
+import { href } from "@/i18n/routing";
+import { GITHUB_URL } from "@/lib/site-nav";
+import type { Lang } from "@/i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = download[lang];
+const title = t.hero.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+---
+
+<section class="frame">
+  <div class="section hero">
+    <div class="flex flex-col gap-6">
+      <span class="eyebrow" data-scramble>{t.hero.eyebrow}</span>
+      <h1 class="display max-w-[14ch]" data-reveal set:html={title} />
+      <p class="lede max-w-[54ch]" data-reveal style="--d:1">{t.hero.lede}</p>
+      <div class="flex flex-col gap-3" data-reveal style="--d:2">
+        <div class="segmented" role="group" aria-label={t.channel.label} data-js hidden>
+          <button type="button" data-channel="stable" aria-pressed="true">{t.channel.stable}</button>
+          <button type="button" data-channel="frontier" aria-pressed="false">{t.channel.preview}</button>
+        </div>
+        <p class="max-w-[56ch] text-[13px] leading-relaxed text-muted" data-preview-hint hidden>
+          {t.channel.previewHint}
+        </p>
+        <p class="eyebrow-plain">{t.hero.free}</p>
+      </div>
+    </div>
+
+    <div class="fig panel" data-reveal style="--d:2">
+      <div class="fig-bar"><span>fig. 01</span><span>your build</span></div>
+      <div class="panel-body">
+        <div class="flex items-center gap-3">
+          <span class="os-icon" aria-hidden="true">
+            <span data-os-icon="none"><Monitor size={18} strokeWidth={1.75} /></span>
+            <span data-os-icon="windows" hidden><BrandIcon name="windows" size={16} /></span>
+            <span data-os-icon="macos" hidden><BrandIcon name="apple" size={17} /></span>
+            <span data-os-icon="linux" hidden><BrandIcon name="linux" size={17} /></span>
+            <span data-os-icon="android" hidden><BrandIcon name="android" size={17} /></span>
+            <span data-os-icon="ios" hidden><BrandIcon name="apple" size={17} /></span>
+          </span>
+          <p class="text-[13px] text-muted" data-hero-status>{t.hero.choose}</p>
+        </div>
+
+        <a href="#desktop" class="btn btn-primary btn-lg primary" data-primary>
+          <Download size={17} strokeWidth={2} aria-hidden="true" />
+          <span class="truncate" data-primary-label>{t.hero.allPlatforms}</span>
+          <span class="kbd ml-auto" aria-hidden="true" data-js hidden>D</span>
+        </a>
+        <p class="sr-only" data-js hidden>{t.hero.pressD}</p>
+        <a href="#desktop" class="link self-start text-[13px]" data-alt hidden></a>
+
+        <dl class="meta">
+          <div>
+            <dt>{t.hero.version}</dt>
+            <dd class="mono num" data-hero-version>—</dd>
+          </div>
+          <div>
+            <dt>{t.hero.size}</dt>
+            <dd class="mono num" data-hero-size>—</dd>
+          </div>
+          <div>
+            <dt>{t.hero.released}</dt>
+            <dd class="mono num" data-hero-date>—</dd>
+          </div>
+        </dl>
+
+        <div class="flex flex-wrap gap-x-5 gap-y-2 text-[13px]">
+          <a class="link" href={href("/changelog", lang)} data-hero-notes>{t.hero.notes}</a>
+          <a class="link inline-flex items-center gap-1" href={`${GITHUB_URL}/releases/latest`} target="_blank" rel="noopener" data-hero-github>
+            {t.hero.github}<ArrowUpRight size={13} strokeWidth={2} aria-hidden="true" />
+          </a>
+        </div>
+
+        <div class="error" role="alert" data-error hidden>
+          <p>{t.state.error}</p>
+          <div class="flex flex-wrap gap-2">
+            <a class="btn btn-secondary btn-sm" href={`${GITHUB_URL}/releases`} target="_blank" rel="noopener">
+              <BrandIcon name="github" size={14} />{t.state.githubReleases}
+            </a>
+            <button type="button" class="btn btn-ghost btn-sm" data-retry>{t.state.retry}</button>
+          </div>
+        </div>
+      </div>
+      <div class="total" data-total-wrap hidden>
+        <span class="eyebrow-plain">{t.stats.label}</span>
+        <span class="total-num num" data-total></span>
+        <p class="total-note">{t.stats.note}</p>
+      </div>
+    </div>
+  </div>
+  <div class="rule"></div>
+</section>
+
+<style>
+  .hero {
+    display: grid;
+    gap: clamp(40px, 6vw, 72px);
+    align-items: end;
+  }
+  @media (min-width: 1024px) {
+    .hero {
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+    }
+  }
+  .segmented {
+    display: inline-flex;
+    align-self: flex-start;
+    padding: 3px;
+    border-radius: 9px;
+    background: var(--bg-sunken);
+    box-shadow: 0 0 0 1px var(--line) inset;
+  }
+  .segmented button {
+    height: 30px;
+    padding-inline: 14px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--fg-muted);
+    transition: color 160ms, background-color 160ms, box-shadow 160ms;
+  }
+  .segmented button:hover {
+    color: var(--fg);
+  }
+  .segmented button[aria-pressed="true"] {
+    color: var(--fg);
+    background: var(--bg-elev);
+    box-shadow: 0 0 0 1px var(--line-strong) inset, 0 1px 2px oklch(0 0 0 / 0.06);
+  }
+  .segmented button[data-channel="frontier"][aria-pressed="true"] {
+    color: var(--warn);
+  }
+  .panel {
+    box-shadow: var(--shadow-float);
+  }
+  .panel-body {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    padding: clamp(20px, 2.6vw, 28px);
+  }
+  .os-icon {
+    display: grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    background: var(--bg-sunken);
+    box-shadow: 0 0 0 1px var(--line-strong) inset;
+  }
+  .primary {
+    width: 100%;
+    justify-content: flex-start;
+    --btn-h: 52px;
+  }
+  :global([data-state="loading"]) .primary {
+    opacity: 0.75;
+  }
+  .meta {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    border-block: 1px solid var(--line);
+  }
+  .meta > div {
+    padding: 12px 0;
+  }
+  .meta > div + div {
+    padding-left: 14px;
+    border-left: 1px solid var(--line);
+  }
+  .meta dt {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+  }
+  .meta dd {
+    margin-top: 4px;
+    font-size: 13.5px;
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  :global([data-state="loading"]) .meta dd {
+    color: transparent;
+    width: 70%;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--bg-inset), var(--line), var(--bg-inset));
+    background-size: 200% 100%;
+    animation: hero-shimmer 1.4s linear infinite;
+  }
+  @keyframes hero-shimmer {
+    to {
+      background-position: -200% 0;
+    }
+  }
+  .error {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 14px;
+    border-radius: 8px;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--fg);
+    background: color-mix(in oklch, var(--danger) 8%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--danger) 35%, transparent) inset;
+  }
+  .total {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 4px 12px;
+    padding: 14px clamp(20px, 2.6vw, 28px);
+    border-top: 1px solid var(--line);
+    background: var(--bg-sunken);
+  }
+  .total-note {
+    flex-basis: 100%;
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+  }
+  .total-num {
+    font-size: 22px;
+    font-weight: 560;
+    letter-spacing: -0.02em;
+  }
+</style>

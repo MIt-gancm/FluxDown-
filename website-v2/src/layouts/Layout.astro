@@ -1,0 +1,155 @@
+---
+/**
+ * 全站基础布局:SEO 头、主题预绘制、字体预加载、外壳(Header / Footer / 命令面板)。
+ *
+ * - 语言由页面显式传入(URL 决定);hreflang 默认按当前路径生成 en/zh 双向簇,
+ *   docs 等自有语言结构的页面传 `alternates` 覆盖,无变体页面传 `alternates={[]}`。
+ * - `chrome={false}` 用于需要整屏自管的工具页(只保留 <head> 与主题)。
+ */
+import "../styles/global.css";
+import Header from "../components/site/Header.astro";
+import Footer from "../components/site/Footer.astro";
+import CommandPalette from "../components/site/CommandPalette";
+import AnnouncementBar from "../components/site/AnnouncementBar.astro";
+import AnnouncementPopup from "../components/site/AnnouncementPopup";
+import { SITE_URL, OG_IMAGE_URL, OG_IMAGE_WIDTH, OG_IMAGE_HEIGHT, HOME_META, buildGraph } from "../lib/seo";
+import { HREFLANG, HTML_LANG, LANGS, OG_LOCALE, type Lang } from "../i18n/config";
+import { common } from "../i18n/messages/common";
+import { PRODUCT_LINKS, COMMUNITY_LINKS, docsPath } from "../lib/site-nav";
+import { href, switchLang } from "../i18n/routing";
+
+interface Props {
+  lang: Lang;
+  title?: string;
+  description?: string;
+  canonicalUrl?: string;
+  alternates?: { lang: string; href: string }[];
+  noindex?: boolean;
+  /** 页面级追加的 JSON-LD 节点(如 FAQPage / BreadcrumbList),并入全站 @graph。 */
+  jsonLdNodes?: Record<string, unknown>[];
+  ogImage?: string;
+  chrome?: boolean;
+}
+
+const {
+  lang,
+  title = HOME_META[lang].title,
+  description = HOME_META[lang].description,
+  canonicalUrl,
+  noindex = false,
+  jsonLdNodes = [],
+  ogImage = OG_IMAGE_URL,
+  chrome = true,
+} = Astro.props;
+
+const pathname = Astro.url.pathname;
+const normalizedPath = pathname === "/" ? "/" : `${pathname.replace(/\/$/, "")}/`;
+const canonical = canonicalUrl ?? `${SITE_URL}${normalizedPath}`;
+
+const alternates =
+  Astro.props.alternates ??
+  [
+    ...LANGS.map((l) => ({ lang: HREFLANG[l], href: `${SITE_URL}${switchLang(normalizedPath, l)}` })),
+    { lang: "x-default", href: `${SITE_URL}${switchLang(normalizedPath, "en")}` },
+  ];
+
+const t = common[lang];
+
+// 命令面板数据:页面导航在服务端本地化后下发,文档索引由面板按需拉取。
+const paletteLinks = [
+  { label: t.nav.download, href: href("/download", lang) },
+  { label: t.nav.docs, href: docsPath(lang) },
+  { label: t.nav.pricing, href: href("/pricing", lang) },
+  { label: t.nav.faq, href: href("/faq", lang) },
+  ...[...PRODUCT_LINKS, ...COMMUNITY_LINKS].map((link) => ({
+    label: t.nav[link.label],
+    href: href(link.path, lang),
+  })),
+];
+---
+
+<!doctype html>
+<html lang={HTML_LANG[lang]} data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="canonical" href={canonical} />
+    {noindex && <meta name="robots" content="noindex" />}
+    {alternates.map((a) => <link rel="alternate" hreflang={a.lang} href={a.href} />)}
+
+    <!-- 主题预绘制:在首帧前确定 data-theme,避免闪烁。默认跟随系统。 -->
+    <script is:inline>
+      (function () {
+        var theme = null;
+        try { theme = localStorage.getItem("fluxdown-theme"); } catch (e) {}
+        if (theme !== "light" && theme !== "dark") {
+          theme = window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+        }
+        document.documentElement.dataset.theme = theme;
+      })();
+    </script>
+
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="32x32" />
+    <link rel="apple-touch-icon" href="/logo.png" />
+    <meta name="theme-color" content="#0d0e11" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f8f9fa" media="(prefers-color-scheme: light)" />
+    <link rel="preload" href="/fonts/geist-normal-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/geist-mono-normal-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="/fonts/instrument-serif-italic-latin.woff2" as="font" type="font/woff2" crossorigin />
+
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical} />
+    <meta property="og:site_name" content="FluxDown" />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content={String(OG_IMAGE_WIDTH)} />
+    <meta property="og:image:height" content={String(OG_IMAGE_HEIGHT)} />
+    <meta property="og:image:alt" content="FluxDown — the download manager, rebuilt in Rust" />
+    <meta property="og:locale" content={OG_LOCALE[lang]} />
+    {LANGS.filter((l) => l !== lang).map((l) => <meta property="og:locale:alternate" content={OG_LOCALE[l]} />)}
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
+
+    <script is:inline type="application/ld+json" set:html={JSON.stringify(buildGraph(jsonLdNodes))} />
+    <slot name="head" />
+  </head>
+  <body class="page-bg">
+    <a
+      href="#main"
+      class="sr-only focus:not-sr-only focus:fixed focus:left-4 focus:top-3 focus:z-[100] focus:rounded-md focus:bg-elev focus:px-3 focus:py-2 focus:text-sm"
+      >{t.skip}</a
+    >
+    {chrome && <AnnouncementBar lang={lang} />}
+    {chrome && <Header lang={lang} />}
+    <main id="main">
+      <slot />
+    </main>
+    {chrome && <Footer lang={lang} />}
+    {
+      chrome && (
+        <CommandPalette
+          client:idle
+          lang={lang}
+          links={paletteLinks}
+          altLangHref={switchLang(normalizedPath, lang === "en" ? "zh" : "en")}
+        />
+      )
+    }
+    {chrome && <AnnouncementPopup client:idle lang={lang} />}
+
+    <script>
+      import "../scripts/motion.ts";
+    </script>
+    <!--
+      LangBot 客服机器人组件(全站)。走同域代理 /api/langbot-widget.js:上游脚本注入的
+      baseUrl 是 http://127.0.0.1:5300,直连会让所有请求打到访客本机。
+    -->
+    <script is:inline defer data-title="FD助手" src="/api/langbot-widget.js"></script>
+  </body>
+</html>

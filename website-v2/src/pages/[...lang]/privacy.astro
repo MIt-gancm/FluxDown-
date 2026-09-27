@@ -1,0 +1,24 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import LegalDoc from "@/components/info/LegalDoc.astro";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { legal } from "@/i18n/messages/legal";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = legal[lang];
+const doc = t.privacy;
+---
+
+<Layout lang={lang} title={doc.meta.title} description={doc.meta.description}>
+  <LegalDoc
+    eyebrow={doc.eyebrow}
+    title={doc.title}
+    updatedLabel={t.updated}
+    updated={doc.updated}
+    indexLabel={t.index}
+    intro={doc.intro}
+    sections={doc.sections}
+    links={{ feedback: href("/feedback", lang) }}
+  />
+</Layout>

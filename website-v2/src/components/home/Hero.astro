@@ -1,0 +1,372 @@
+---
+/**
+ * 首页首屏:汇聚线稿(多源 → 一个文件)+ 粒子数据流 + 标题 + 下载 CTA + GPUI 客户端实时复刻。
+ * 线稿与粒子共用 hero-geometry 的通道几何;粒子的交互见 flux-field.ts。
+ * 主按钮文案在客户端按系统改写为「下载 macOS 版」等,链接统一指向 /download/(那里做架构精确匹配)。
+ */
+import { ArrowRight, Play } from "lucide-react";
+import AppReplica from "./AppReplica.astro";
+import { CHANNELS, FOCUS, VIEW, channelPath } from "./hero-geometry";
+import { BrandIcon } from "../icons/brand";
+import { home } from "../../i18n/messages/home";
+import { common } from "../../i18n/messages/common";
+import { href } from "../../i18n/routing";
+import type { Lang } from "../../i18n/config";
+import { GITHUB_URL } from "../../lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].hero;
+const actions = common[lang].actions;
+
+const osLabels = {
+  mac: actions.downloadFor("macOS"),
+  win: actions.downloadFor("Windows"),
+  linux: actions.downloadFor("Linux"),
+};
+---
+
+<section class="frame hero">
+  <div class="hero-head">
+    <svg class="hero-layer hero-streams" viewBox={`0 0 ${VIEW.w} ${VIEW.h}`} preserveAspectRatio="xMidYMax slice" aria-hidden="true">
+      <g class="hero-lines">
+        {CHANNELS.map((c) => <path d={channelPath(c)} />)}
+      </g>
+      <circle cx={FOCUS.x} cy={FOCUS.y} r="5" class="hero-focus"></circle>
+    </svg>
+    <canvas class="hero-layer hero-particles" aria-hidden="true" data-flux></canvas>
+
+    <div class="hero-copy">
+      <a href={href("/changelog", lang)} class="hero-badge" data-reveal>
+        <span class="hero-badge-tag">{t.badge}</span>
+        <span>{t.badgeText}</span>
+        <ArrowRight size={13} strokeWidth={2} />
+      </a>
+
+      <h1 class="display hero-title" data-reveal style="--d:1">
+        <span class="block">{t.titleA}</span>
+        <span class="block serif accent-gradient pr-[0.08em]">{t.titleB}</span>
+      </h1>
+
+      <p class="lede mx-auto max-w-[60ch]" data-reveal style="--d:2">{t.lede}</p>
+
+      <div class="flex flex-wrap items-center justify-center gap-3" data-reveal style="--d:3">
+        <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-magnetic data-hero-download data-labels={JSON.stringify(osLabels)}>
+          <span data-hero-download-label>{actions.download}</span>
+          <span class="kbd">D</span>
+        </a>
+        <a href={GITHUB_URL} class="btn btn-ticks btn-lg" data-magnetic target="_blank" rel="noopener">
+          <BrandIcon name="github" size={15} />
+          {t.secondary}
+        </a>
+      </div>
+
+      <div class="mono flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-[12px] text-subtle" data-reveal style="--d:4">
+        <span class="flex items-center gap-2">
+          <BrandIcon name="apple" size={12} />
+          <BrandIcon name="windows" size={11} />
+          <BrandIcon name="linux" size={12} />
+          {t.platforms}
+        </span>
+        <span class="opacity-40">/</span>
+        <span>{t.license}</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="hero-figure" data-reveal style="--d:4">
+    <div class="hero-tilt">
+      <div class="fig hero-fig">
+        <div class="fig-bar">
+          <span>fig. 01</span>
+          <span>{t.figure}</span>
+          <button type="button" class="hero-film" data-film-open>
+            <Play size={11} strokeWidth={2.2} fill="currentColor" />
+            {t.film}
+          </button>
+        </div>
+        <div class="p-[clamp(10px,2.6vw,36px)]">
+          <AppReplica lang={lang} />
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  import { mountStage } from "../../scripts/particle-stage";
+  import { FluxField } from "./flux-field";
+
+  // 按系统改写主按钮文案(不改链接:下载页负责精确匹配架构)
+  const btn = document.querySelector<HTMLElement>("[data-hero-download]");
+  const label = btn?.querySelector<HTMLElement>("[data-hero-download-label]");
+  if (btn && label) {
+    const labels = JSON.parse(btn.dataset.labels ?? "{}") as Record<string, string>;
+    const ua = navigator.userAgent;
+    const os = /Mac/i.test(ua) && !/iPhone|iPad/i.test(ua) ? "mac" : /Win/i.test(ua) ? "win" : /Linux|X11/i.test(ua) && !/Android/i.test(ua) ? "linux" : null;
+    if (os && labels[os]) label.textContent = labels[os];
+  }
+
+  const head = document.querySelector<HTMLElement>(".hero-head");
+  const canvas = head?.querySelector<HTMLCanvasElement>("[data-flux]");
+  if (head && canvas) {
+    const field = new FluxField();
+    mountStage(canvas, head, field);
+    // 悬停 / 聚焦下载按钮:数据流加速汇聚
+    for (const [type, on] of [["pointerenter", true], ["pointerleave", false], ["focus", true], ["blur", false]] as const) {
+      btn?.addEventListener(type, () => field.setSurge(on));
+    }
+  }
+</script>
+
+<style>
+  .hero {
+    position: relative;
+    overflow: hidden;
+  }
+  .hero-head {
+    position: relative;
+    padding-top: clamp(56px, 9vw, 112px);
+    padding-bottom: clamp(56px, 8vw, 96px);
+  }
+  .hero-layer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+  }
+  .hero-streams {
+    mask-image:
+      radial-gradient(ellipse 40% 46% at 50% 44%, transparent 62%, #000 100%),
+      linear-gradient(to bottom, transparent, #000 14%);
+    mask-composite: intersect;
+  }
+  /* 粒子层的中心遮罩比线稿柔和:标题区仍保留约两成可见,让指针交互在文案上方也有回应 */
+  .hero-particles {
+    mask-image:
+      radial-gradient(ellipse 40% 46% at 50% 44%, oklch(0 0 0 / 0.2) 50%, #000 100%),
+      linear-gradient(to bottom, transparent, #000 12%);
+    mask-composite: intersect;
+  }
+  .hero-lines path {
+    fill: none;
+    stroke: var(--line-strong);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+  }
+  .hero-focus {
+    fill: var(--accent);
+    filter: drop-shadow(0 0 8px var(--accent));
+    animation: focus-pulse 2.4s ease-in-out infinite;
+  }
+  @keyframes focus-pulse {
+    50% {
+      opacity: 0.4;
+    }
+  }
+  .hero-copy {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 26px;
+    padding-inline: 20px;
+    text-align: center;
+  }
+  .hero-title {
+    margin-block: 4px 2px;
+  }
+  .hero-title .serif {
+    font-size: 1.08em;
+    line-height: 1.02;
+  }
+  /* 强调词:渐变缓慢流动,像液态金属上的反光 */
+  .hero-title .accent-gradient {
+    background-image: linear-gradient(
+      100deg,
+      var(--accent-ink) 0%,
+      var(--cyan) 30%,
+      var(--accent-ink) 55%,
+      var(--cyan) 80%,
+      var(--accent-ink) 100%
+    );
+    background-size: 220% 100%;
+    animation: hero-sheen 9s ease-in-out infinite alternate;
+  }
+  @keyframes hero-sheen {
+    to {
+      background-position: 100% 0;
+    }
+  }
+  @property --hero-orbit {
+    syntax: "<angle>";
+    inherits: false;
+    initial-value: 0deg;
+  }
+  .hero-badge {
+    position: relative;
+    isolation: isolate;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    height: 32px;
+    padding: 0 12px 0 4px;
+    border-radius: 999px;
+    font-size: 13px;
+    color: var(--fg-muted);
+    background: var(--bg-elev);
+    box-shadow:
+      0 0 0 1px var(--line) inset,
+      0 1px 2px oklch(0 0 0 / 0.04);
+    transition:
+      color 160ms,
+      box-shadow 240ms;
+  }
+  /* 沿胶囊边框环行的一段光弧 */
+  .hero-badge::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    padding: 1px;
+    border-radius: inherit;
+    background: conic-gradient(
+      from var(--hero-orbit),
+      transparent 0 62%,
+      color-mix(in oklch, var(--accent) 80%, transparent) 80%,
+      var(--cyan) 88%,
+      transparent 96%
+    );
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#000 0 0) content-box exclude,
+      linear-gradient(#000 0 0);
+    animation: hero-orbit 5s linear infinite;
+    pointer-events: none;
+  }
+  @keyframes hero-orbit {
+    to {
+      --hero-orbit: 360deg;
+    }
+  }
+  .hero-badge:hover {
+    color: var(--fg);
+    box-shadow:
+      0 0 0 1px var(--line-strong) inset,
+      0 6px 20px -8px color-mix(in oklch, var(--accent) 45%, transparent);
+  }
+  .hero-badge :global(svg) {
+    transition: transform 240ms var(--ease-out);
+  }
+  .hero-badge:hover :global(svg) {
+    transform: translateX(3px);
+  }
+  .hero-badge-tag {
+    position: relative;
+    overflow: hidden;
+    display: inline-grid;
+    place-items: center;
+    height: 24px;
+    padding-inline: 9px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent-fg);
+    background: var(--accent);
+  }
+  /* 标签上周期掠过的高光 */
+  .hero-badge-tag::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(105deg, transparent 30%, oklch(1 0 0 / 0.45) 50%, transparent 70%) no-repeat;
+    background-size: 250% 100%;
+    background-position: 130% 0;
+    animation: hero-glint 4.8s var(--ease-out) 1.2s infinite;
+  }
+  @keyframes hero-glint {
+    0%,
+    70% {
+      background-position: 130% 0;
+    }
+    100% {
+      background-position: -30% 0;
+    }
+  }
+  .hero-figure {
+    position: relative;
+    perspective: 1600px;
+  }
+  .hero-fig {
+    border-inline: 0;
+    border-bottom: 0;
+    background: color-mix(in oklch, var(--bg-sunken) 70%, transparent);
+    background-image: radial-gradient(var(--line) 1px, transparent 1px);
+    background-size: 18px 18px;
+  }
+  /* 汇聚焦点落在窗口顶沿:顶边一道向两侧衰减的受光线 */
+  .hero-fig::before {
+    content: "";
+    position: absolute;
+    top: -1px;
+    left: 50%;
+    width: min(70%, 720px);
+    height: 1px;
+    translate: -50% 0;
+    background: linear-gradient(90deg, transparent, var(--accent-line) 30%, var(--cyan) 50%, var(--accent-line) 70%, transparent);
+    opacity: 0.8;
+    pointer-events: none;
+  }
+  .hero-film {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 22px;
+    padding-inline: 8px;
+    border-radius: 999px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: none;
+    color: var(--fg-muted);
+    background: var(--bg-elev);
+    box-shadow: 0 0 0 1px var(--line-strong) inset;
+    transition: color 160ms;
+  }
+  .hero-film:hover {
+    color: var(--accent-ink);
+  }
+  @supports (animation-timeline: view()) {
+    .hero-tilt {
+      transform-origin: 50% 0;
+      animation: hero-tilt linear both;
+      animation-timeline: view();
+      animation-range: entry 0% cover 45%;
+    }
+    @keyframes hero-tilt {
+      from {
+        transform: rotateX(16deg) scale(0.94) translateY(-20px);
+      }
+      to {
+        transform: none;
+      }
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .hero-tilt,
+    .hero-title .accent-gradient,
+    .hero-badge::before,
+    .hero-badge-tag::after {
+      animation: none;
+    }
+  }
+</style>

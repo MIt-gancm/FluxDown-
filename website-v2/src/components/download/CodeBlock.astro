@@ -1,0 +1,59 @@
+---
+/** 带图注栏与复制按钮的命令块;复制按钮依赖 JS,无 JS 时隐藏(`data-js`)。 */
+import { download } from "@/i18n/messages/download";
+import type { Lang } from "@/i18n/config";
+
+interface Props {
+  lang: Lang;
+  id: string;
+  caption: string;
+  code: string;
+}
+const { lang, id, caption, code } = Astro.props;
+const t = download[lang];
+---
+
+<figure class="fig code">
+  <div class="fig-bar">
+    <span>{caption}</span>
+    <button type="button" class="copy" data-copy={id} data-js hidden aria-label={`${t.copy}: ${caption}`}>
+      <span data-copy-label>{t.copy}</span>
+    </button>
+  </div>
+  <pre><code id={id}>{code}</code></pre>
+</figure>
+
+<style>
+  .code {
+    background: var(--bg-sunken);
+    min-width: 0;
+  }
+  .code .fig-bar {
+    background: var(--bg-elev);
+  }
+  pre {
+    overflow-x: auto;
+    padding: 16px 18px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--fg);
+  }
+  .copy {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fg-muted);
+    padding: 2px 6px;
+    border-radius: 4px;
+    transition: color 160ms, background-color 160ms;
+  }
+  .copy:hover {
+    color: var(--fg);
+    background: var(--bg-inset);
+  }
+  .copy[data-copied] {
+    color: var(--ok);
+  }
+</style>

@@ -1,0 +1,260 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { faq } from "@/i18n/messages/faq";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = faq[lang];
+
+// FAQPage 结构化数据与页面可见问答同源(同一语言、同一字符串)。
+const faqNode = {
+  "@type": "FAQPage",
+  inLanguage: lang === "zh" ? "zh-CN" : "en",
+  mainEntity: t.groups.flatMap((g) =>
+    g.items.map((item) => ({
+      "@type": "Question",
+      name: item.q,
+      acceptedAnswer: { "@type": "Answer", text: item.a },
+    })),
+  ),
+};
+
+let counter = 0;
+const groups = t.groups.map((g) => ({
+  ...g,
+  items: g.items.map((item) => ({ ...item, n: String(++counter).padStart(2, "0") })),
+}));
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description} jsonLdNodes={[faqNode]}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
+
+  <section class="frame">
+    <div class="section-tight grid gap-10 lg:grid-cols-[232px_minmax(0,1fr)] lg:gap-16">
+      <nav class="topics" aria-label={t.topics}>
+        <p class="eyebrow-plain mb-4">{t.topics}</p>
+        <ul>
+          {
+            groups.map((g) => (
+              <li>
+                <a href={`#${g.id}`}>
+                  <span>{g.title}</span>
+                  <span class="mono num text-subtle">{String(g.items.length).padStart(2, "0")}</span>
+                </a>
+              </li>
+            ))
+          }
+        </ul>
+        <p class="mt-6 hidden text-[13px] leading-relaxed text-muted lg:block">
+          {t.more}
+          <a class="link" href={href("/feedback", lang)}>{t.contact}</a>
+        </p>
+      </nav>
+
+      <div class="faq grid gap-14">
+        {
+          groups.map((g) => (
+            <section aria-labelledby={`${g.id}-h`} id={g.id} class="faq-group">
+              <div class="mb-2 flex items-baseline justify-between gap-4 border-b border-line-strong pb-4">
+                <h2 id={`${g.id}-h`} class="h3">
+                  {g.title}
+                </h2>
+                <span class="eyebrow-plain num">{t.count(g.items.length)}</span>
+              </div>
+              {g.items.map((item) => (
+                <details class="faq-item">
+                  <summary>
+                    <span class="faq-n mono num" aria-hidden="true">
+                      Q.{item.n}
+                    </span>
+                    <span class="faq-q">{item.q}</span>
+                    <span class="faq-icon" aria-hidden="true" />
+                  </summary>
+                  <div class="faq-a">
+                    <p>{item.a}</p>
+                    {item.link && (
+                      <a class="faq-more mono" href={href(item.link, lang)}>
+                        {t.readMore} <span aria-hidden="true">→</span> {href(item.link, lang)}
+                      </a>
+                    )}
+                  </div>
+                </details>
+              ))}
+            </section>
+          ))
+        }
+
+        <div class="cta flex flex-wrap items-center justify-between gap-4">
+          <p class="text-[15px] text-muted">{t.more}</p>
+          <a class="btn btn-secondary" href={href("/feedback", lang)}>{t.contact}</a>
+        </div>
+      </div>
+    </div>
+  </section>
+</Layout>
+
+<style>
+  .topics {
+    align-self: start;
+  }
+  .topics ul {
+    display: grid;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+  }
+  .topics li + li {
+    border-top: 1px solid var(--line);
+  }
+  .topics a {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    font-size: 14px;
+    color: var(--fg-muted);
+    transition: color 160ms;
+  }
+  .topics a:hover {
+    color: var(--fg);
+  }
+  .topics a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+  @media (min-width: 1024px) {
+    .topics {
+      position: sticky;
+      top: calc(var(--header-h) + 28px);
+    }
+  }
+
+  .faq-group {
+    scroll-margin-top: calc(var(--header-h) + 24px);
+  }
+
+  /* ── Accordion ── */
+  .faq {
+    interpolate-size: allow-keywords;
+  }
+  .faq-item {
+    border-bottom: 1px solid var(--line);
+  }
+  .faq-item::details-content {
+    block-size: 0;
+    overflow: clip;
+    transition:
+      block-size 340ms var(--ease-out),
+      content-visibility 340ms allow-discrete;
+  }
+  .faq-item[open]::details-content {
+    block-size: auto;
+  }
+  .faq-item summary {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    align-items: baseline;
+    gap: 16px;
+    padding-block: 20px;
+    cursor: pointer;
+    list-style: none;
+    border-radius: 4px;
+  }
+  .faq-item summary::-webkit-details-marker {
+    display: none;
+  }
+  .faq-item summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 4px;
+  }
+  .faq-n {
+    width: 3rem;
+    font-size: 11.5px;
+    letter-spacing: 0.06em;
+    color: var(--fg-subtle);
+    transition: color 200ms;
+  }
+  .faq-q {
+    font-size: 16px;
+    font-weight: 520;
+    line-height: 1.45;
+    color: var(--fg);
+    transition: color 160ms;
+  }
+  .faq-item summary:hover .faq-q {
+    color: var(--accent-ink);
+  }
+  .faq-item[open] .faq-n {
+    color: var(--accent-ink);
+  }
+  /* 十字 → 斜叉:两条 1px 线,与 blueprint 十字节点同语汇。 */
+  .faq-icon {
+    position: relative;
+    align-self: center;
+    width: 11px;
+    height: 11px;
+    transition: transform 320ms var(--ease-out);
+  }
+  .faq-icon::before,
+  .faq-icon::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    margin: auto;
+    background: var(--fg-muted);
+  }
+  .faq-icon::before {
+    width: 1px;
+  }
+  .faq-icon::after {
+    height: 1px;
+  }
+  .faq-item[open] .faq-icon {
+    transform: rotate(45deg);
+  }
+  .faq-a {
+    display: grid;
+    gap: 12px;
+    padding: 0 27px 24px 0;
+    margin-left: calc(3rem + 16px);
+    font-size: 15px;
+    line-height: 1.72;
+    color: var(--fg-muted);
+    max-width: 68ch;
+  }
+  .faq-item[open] .faq-a {
+    animation: faq-in 360ms var(--ease-out);
+  }
+  @keyframes faq-in {
+    from {
+      opacity: 0;
+      transform: translateY(-4px);
+    }
+  }
+  .faq-more {
+    justify-self: start;
+    font-size: 12px;
+    letter-spacing: 0.02em;
+    color: var(--accent-ink);
+    text-decoration: underline;
+    text-decoration-color: var(--accent-line);
+    text-underline-offset: 3px;
+  }
+  .faq-more:hover {
+    text-decoration-color: currentColor;
+  }
+  @media (max-width: 640px) {
+    .faq-a {
+      margin-left: 0;
+      padding-right: 0;
+    }
+  }
+
+  .cta {
+    padding: 20px 22px;
+    border: 1px dashed var(--line-strong);
+    border-radius: var(--radius);
+  }
+</style>

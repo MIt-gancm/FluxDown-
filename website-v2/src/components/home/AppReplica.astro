@@ -1,0 +1,686 @@
+---
+/**
+ * GPUI 客户端主窗口的 DOM 复刻(布局、配色与文案逐项对齐 crates/shell + crates/downloads):
+ * 40px 统一顶栏、活动栏、状态/队列侧栏、任务表、状态栏,以及「新建下载」子窗口。
+ * 首帧由 SSR 直出;`app-demo.ts` 接管后驱动脚本化演示(新建 → 动态分段 → 完成)。
+ *
+ * 设计尺寸固定 1120×700,由脚本按容器宽度等比缩放(保持像素级比例)。
+ */
+import {
+  Archive,
+  ArrowDown,
+  ArrowUp,
+  CircleAlert,
+  CircleArrowDown,
+  CircleCheck,
+  CirclePause,
+  Cpu,
+  Disc3,
+  FileText,
+  Film,
+  Folder,
+  HardDrive,
+  Image,
+  Layers,
+  Moon,
+  Music,
+  Pause,
+  Play,
+  Plus,
+  Power,
+  Rows3,
+  Rss,
+  Search,
+  Settings,
+  SlidersHorizontal,
+  Webhook,
+  Download,
+} from "lucide-react";
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+import { DEMO_FREE, DEMO_SAVE_DIR, DEMO_TASKS } from "./demo-data";
+import { formatBytes } from "./segment-sim";
+
+interface Props {
+  lang: Lang;
+  id?: string;
+  /** 外部时钟驱动(/film/ 录制舞台):不自动播放,由页面脚本 mount 并推进 */
+  external?: boolean;
+}
+const { lang, id = "app-replica", external = false } = Astro.props;
+const t = home[lang].app;
+
+const count = (pred: (task: (typeof DEMO_TASKS)[number]) => boolean) => DEMO_TASKS.filter(pred).length;
+const sidebar = [
+  { key: "all", icon: Layers, label: t.all, n: DEMO_TASKS.length, selected: true },
+  { key: "video", icon: Film, label: t.video, n: count((x) => x.category === "video"), sub: true },
+  { key: "audio", icon: Music, label: t.audio, n: count((x) => x.category === "audio"), sub: true },
+  { key: "document", icon: FileText, label: t.document, n: count((x) => x.category === "document"), sub: true },
+  { key: "image", icon: Image, label: t.image, n: 0, sub: true },
+  { key: "program", icon: Cpu, label: t.program, n: count((x) => x.category === "program"), sub: true },
+  { key: "archive", icon: Archive, label: t.archive, n: count((x) => x.category === "archive"), sub: true },
+  { key: "downloading", icon: CircleArrowDown, label: t.downloading, n: count((x) => x.status === "downloading") },
+  { key: "completed", icon: CircleCheck, label: t.completed, n: count((x) => x.status === "completed") },
+  { key: "failed", icon: CircleAlert, label: t.failed, n: 0 },
+  { key: "paused", icon: CirclePause, label: t.paused, n: count((x) => x.status === "paused") },
+];
+const statusLabel = { downloading: t.downloading, completed: t.completed, paused: t.paused };
+const icons = { disc: Disc3, film: Film, archive: Archive, music: Music, file: FileText };
+const iconProps = { size: 14, strokeWidth: 1.75 };
+---
+
+<div class="app-fit" data-app-fit>
+  <div
+    class="app"
+    id={id}
+    data-app
+    data-external={external || undefined}
+    data-labels={JSON.stringify({ status: statusLabel, done: t.done })}
+    role="img"
+    aria-label="FluxDown desktop client"
+  >
+    <!-- 图标模板:脚本渲染行时克隆 -->
+    {
+      Object.entries(icons).map(([name, Icon]) => (
+        <template data-icon={name}>
+          <Icon {...iconProps} />
+        </template>
+      ))
+    }
+
+    <div class="app-titlebar">
+      <div class="app-lights"><i></i><i></i><i></i></div>
+      <div class="app-search">
+        <Search size={13} strokeWidth={1.75} />
+        <span>{t.search}</span>
+        <kbd>⌘F</kbd>
+      </div>
+      <div class="app-tool"><SlidersHorizontal size={13} strokeWidth={1.75} />{t.view}</div>
+      <div class="app-primary" data-new-button><Plus size={13} strokeWidth={2} />{t.newDownload}</div>
+    </div>
+
+    <div class="app-body">
+      <div class="app-activity">
+        <span class="is-active"><Download size={16} strokeWidth={1.75} /></span>
+        <span><Rss size={16} strokeWidth={1.75} /></span>
+        <span><Webhook size={16} strokeWidth={1.75} /></span>
+        <span class="mt-auto"><Moon size={16} strokeWidth={1.75} /></span>
+        <span><Settings size={16} strokeWidth={1.75} /></span>
+      </div>
+
+      <div class="app-sidebar">
+        <div class="app-group">{t.status}</div>
+        {
+          sidebar.map((item) => (
+            <div class:list={["app-nav", item.sub && "is-sub", item.selected && "is-selected"]} data-count-key={item.key}>
+              <item.icon size={14} strokeWidth={1.75} />
+              <span class="flex-1 truncate">{item.label}</span>
+              <span class="app-count" data-n>{item.n > 0 ? item.n : ""}</span>
+            </div>
+          ))
+        }
+        <div class="app-group mt-3">{t.queues}</div>
+        <div class="app-nav"><Rows3 size={14} strokeWidth={1.75} /><span class="flex-1">{t.mainQueue}</span><span class="app-count" data-queue-count>{DEMO_TASKS.length}</span></div>
+        <div class="app-nav"><Rows3 size={14} strokeWidth={1.75} /><span class="flex-1">{t.later}</span></div>
+      </div>
+
+      <div class="app-content">
+        <div class="app-row app-head">
+          <span></span>
+          <span>{t.colName}</span>
+          <span class="text-right">{t.colSize}</span>
+          <span>{t.colProgress}</span>
+          <span class="text-right">{t.colSpeed}</span>
+          <span class="text-right">{t.colEta}</span>
+          <span>{t.colStatus}</span>
+        </div>
+        <div class="app-rows" data-rows>
+          {
+            DEMO_TASKS.map((task) => {
+              const Icon = icons[task.icon];
+              return (
+                <div class="app-row" data-status={task.status}>
+                  <span class="app-ficon"><Icon {...iconProps} /></span>
+                  <span class="truncate text-[var(--app-fg)]">{task.name}</span>
+                  <span class="text-right">{formatBytes(task.size)}</span>
+                  <span class="app-progress">
+                    {task.status !== "completed" && (
+                      <span class="app-track"><span class="app-fill" style={`width:${task.progress * 100}%`} /></span>
+                    )}
+                  </span>
+                  <span class="text-right">—</span>
+                  <span class="text-right">—</span>
+                  <span class="app-status">{statusLabel[task.status]}</span>
+                </div>
+              );
+            })
+          }
+        </div>
+        <div class="app-toast" data-toast>
+          <CircleCheck size={15} strokeWidth={1.75} />
+          <div class="min-w-0">
+            <div class="app-toast-title">{t.done}</div>
+            <div class="app-toast-body truncate" data-toast-body></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="app-statusbar">
+      <span class="app-stat"><ArrowDown size={12} strokeWidth={2} /><b data-total-speed>0 B/s</b></span>
+      <span class="app-stat"><ArrowUp size={12} strokeWidth={2} />0 B/s</span>
+      <span class="app-stat"><Pause size={12} strokeWidth={2} /></span>
+      <span class="app-stat"><Play size={12} strokeWidth={2} /></span>
+      <span class="app-spark" aria-hidden="true"><svg viewBox="0 0 120 16" preserveAspectRatio="none"><path data-spark d="" /></svg></span>
+      <span class="ml-auto app-stat"><ArrowDown size={12} strokeWidth={2} />{t.unlimited}</span>
+      <span class="app-stat"><ArrowUp size={12} strokeWidth={2} />{t.unlimited}</span>
+      <span class="app-stat"><Power size={12} strokeWidth={2} /></span>
+      <span class="app-stat"><HardDrive size={12} strokeWidth={2} />{t.free(DEMO_FREE)}</span>
+    </div>
+
+    <!-- 「新建下载」窗口(GPUI 中为独立普通窗口) -->
+    <div class="app-dialog" data-dialog>
+      <div class="app-dialog-bar">
+        <div class="app-lights"><i></i><i></i><i></i></div>
+        <span>{t.newDownload}</span>
+      </div>
+      <div class="app-dialog-body">
+        <label>{t.url}</label>
+        <div class="app-input app-textarea"><span data-typed></span><i class="app-caret"></i></div>
+        <div class="grid grid-cols-[1fr_120px] gap-3">
+          <div>
+            <label>{t.fileName}</label>
+            <div class="app-input" data-resolved-name></div>
+          </div>
+          <div>
+            <label>{t.segments}</label>
+            <div class="app-input justify-between">{t.auto}<span class="opacity-50">⌄</span></div>
+          </div>
+        </div>
+        <label>{t.saveTo}</label>
+        <div class="app-input gap-2"><Folder size={13} strokeWidth={1.75} />{DEMO_SAVE_DIR}<span class="ml-auto opacity-60" data-resolved-size></span></div>
+      </div>
+      <div class="app-dialog-foot">
+        <div class="app-btn">{t.cancel}</div>
+        <div class="app-btn app-btn-primary" data-start-button>{t.start}</div>
+      </div>
+    </div>
+
+    <svg class="app-cursor" data-cursor width="18" height="22" viewBox="0 0 18 22" aria-hidden="true">
+      <path d="M1.5 1.5v16.2l4.3-4.1 2.8 6.6 2.9-1.2-2.8-6.5h6z" fill="#111" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></path>
+    </svg>
+    <span class="app-click" data-click></span>
+  </div>
+</div>
+
+<script>
+  import { mountAppDemo } from "./app-demo";
+  document.querySelectorAll<HTMLElement>("[data-app]:not([data-external])").forEach((el) => mountAppDemo(el));
+</script>
+
+<style is:global>
+  @layer components {
+    .app-fit {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1120 / 700;
+    }
+    .app {
+      /* GPUI 默认亮色主题(crates/theme definition.rs + extended.rs 派生) */
+      --app-bg: #f6f7f8;
+      --app-surface: #ffffff;
+      --app-fg: #09090b;
+      --app-muted: #71717a;
+      --app-tertiary: #a6a6ac;
+      --app-hairline: #efeff1;
+      --app-border: #e4e4e7;
+      --app-selected: #e9e9ec;
+      --app-hover: #f7f8f9;
+      --app-primary: #2563eb;
+      --app-track: #eceef1;
+      position: absolute;
+      left: 0;
+      top: 0;
+      width: 1120px;
+      height: 700px;
+      transform-origin: 0 0;
+      transform: scale(var(--app-scale, 1));
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-radius: 12px;
+      background: var(--app-bg);
+      color: var(--app-muted);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      line-height: 18px;
+      box-shadow: var(--shadow-window);
+      user-select: none;
+      contain: layout paint;
+    }
+    [data-theme="dark"] .app {
+      --app-bg: #212123;
+      --app-surface: #2c2c2e;
+      --app-fg: #f5f5f7;
+      --app-muted: #a1a1a6;
+      --app-tertiary: #737377;
+      --app-hairline: #3e3e40;
+      --app-border: #48484a;
+      --app-selected: #38383a;
+      --app-hover: #333335;
+      --app-primary: #3b82f6;
+      --app-track: #3a3a3c;
+    }
+    .app svg {
+      flex: none;
+    }
+    .app-titlebar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      height: 40px;
+      padding: 0 12px 0 14px;
+      border-bottom: 1px solid var(--app-hairline);
+    }
+    .app-lights {
+      display: flex;
+      gap: 8px;
+      margin-right: auto;
+    }
+    .app-lights i {
+      width: 12px;
+      height: 12px;
+      border-radius: 99px;
+      background: #ff5f57;
+      box-shadow: 0 0 0 0.5px rgb(0 0 0 / 0.12) inset;
+    }
+    .app-lights i:nth-child(2) {
+      background: #febc2e;
+    }
+    .app-lights i:nth-child(3) {
+      background: #28c840;
+    }
+    .app-search {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      width: 280px;
+      height: 28px;
+      padding: 0 6px 0 10px;
+      border-radius: 7px;
+      background: var(--app-selected);
+      color: var(--app-tertiary);
+    }
+    .app-search span {
+      flex: 1;
+    }
+    .app-search kbd {
+      font-family: var(--font-sans);
+      font-size: 11px;
+      padding: 0 5px;
+      border-radius: 4px;
+      background: var(--app-surface);
+      color: var(--app-tertiary);
+    }
+    .app-tool {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 28px;
+      padding: 0 8px;
+      color: var(--app-fg);
+    }
+    .app-primary {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 28px;
+      padding: 0 12px;
+      border-radius: 7px;
+      background: var(--app-primary);
+      color: #fff;
+      font-weight: 500;
+      transition:
+        filter 120ms,
+        transform 120ms;
+    }
+    .app-primary.is-pressed,
+    .app-btn.is-pressed {
+      filter: brightness(0.88);
+      transform: scale(0.97);
+    }
+    .app-body {
+      display: flex;
+      flex: 1;
+      min-height: 0;
+    }
+    .app-activity {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+      width: 48px;
+      padding: 8px 0 10px;
+    }
+    .app-activity span {
+      display: grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      color: var(--app-muted);
+    }
+    .app-activity .is-active {
+      background: var(--app-selected);
+      color: var(--app-fg);
+    }
+    .app-sidebar {
+      width: 176px;
+      padding: 6px 8px;
+    }
+    .app-group {
+      padding: 8px 8px 4px;
+      font-size: 11px;
+      line-height: 14px;
+      color: var(--app-tertiary);
+    }
+    .app-nav {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      height: 26px;
+      padding: 0 8px;
+      border-radius: 6px;
+      color: var(--app-fg);
+    }
+    .app-nav svg {
+      color: var(--app-muted);
+    }
+    .app-nav.is-sub {
+      padding-left: 22px;
+    }
+    .app-nav.is-selected {
+      background: var(--app-selected);
+      font-weight: 500;
+    }
+    .app-count {
+      font-size: 11px;
+      color: var(--app-tertiary);
+      font-variant-numeric: tabular-nums;
+    }
+    .app-content {
+      position: relative;
+      flex: 1;
+      min-width: 0;
+      background: var(--app-surface);
+      border-left: 1px solid var(--app-hairline);
+      border-top-left-radius: 0;
+    }
+    .app-row {
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr) 76px 150px 86px 64px 86px;
+      align-items: center;
+      gap: 0 10px;
+      height: 34px;
+      padding: 0 14px 0 10px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+    .app-head {
+      height: 32px;
+      border-bottom: 1px solid var(--app-hairline);
+      font-size: 12px;
+      color: var(--app-tertiary);
+    }
+    .app-rows .app-row {
+      transition: background-color 400ms;
+    }
+    .app-rows .app-row.is-new {
+      background: color-mix(in srgb, var(--app-primary) 12%, transparent);
+    }
+    .app-ficon {
+      display: grid;
+      place-items: center;
+      color: var(--app-muted);
+    }
+    .app-progress {
+      display: flex;
+      align-items: center;
+    }
+    .app-track {
+      position: relative;
+      width: 100%;
+      height: 4px;
+      overflow: hidden;
+      border-radius: 99px;
+      background: var(--app-track);
+    }
+    .app-fill,
+    .app-seg {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: 0;
+      background: var(--app-primary);
+    }
+    .app-row[data-status="paused"] .app-fill,
+    .app-row[data-status="paused"] .app-seg {
+      background: var(--app-tertiary);
+    }
+    .app-status {
+      color: var(--app-tertiary);
+    }
+    .app-row[data-status="downloading"] .app-status {
+      color: var(--app-primary);
+    }
+    .app-toast {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      width: 290px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: var(--app-surface);
+      color: #22a35a;
+      box-shadow:
+        0 0 0 1px var(--app-border),
+        0 12px 32px -8px rgb(0 0 0 / 0.25);
+      opacity: 0;
+      transform: translateY(10px) scale(0.98);
+      transition:
+        opacity 260ms,
+        transform 360ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .app-toast.is-visible {
+      opacity: 1;
+      transform: none;
+    }
+    .app-toast-title {
+      color: var(--app-fg);
+      font-weight: 500;
+    }
+    .app-toast-body {
+      font-size: 12px;
+      color: var(--app-muted);
+    }
+    .app-statusbar {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      height: 28px;
+      padding: 0 12px 0 60px;
+      border-top: 1px solid var(--app-hairline);
+      font-size: 12px;
+      color: var(--app-muted);
+      font-variant-numeric: tabular-nums;
+    }
+    .app-stat {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .app-stat b {
+      font-weight: 500;
+      color: var(--app-fg);
+      min-width: 70px;
+    }
+    .app-spark {
+      width: 120px;
+      height: 16px;
+    }
+    .app-spark svg {
+      display: block;
+      width: 100%;
+      height: 100%;
+      overflow: visible;
+    }
+    .app-spark path {
+      fill: none;
+      stroke: var(--app-primary);
+      stroke-width: 1.25;
+      vector-effect: non-scaling-stroke;
+    }
+    .app-dialog {
+      position: absolute;
+      left: 330px;
+      top: 118px;
+      width: 520px;
+      border-radius: 11px;
+      background: var(--app-surface);
+      box-shadow:
+        0 0 0 1px var(--app-border),
+        0 24px 64px -12px rgb(0 0 0 / 0.35);
+      opacity: 0;
+      transform: translateY(12px) scale(0.97);
+      pointer-events: none;
+      transition:
+        opacity 220ms,
+        transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    .app-dialog.is-open {
+      opacity: 1;
+      transform: none;
+    }
+    .app-dialog-bar {
+      display: flex;
+      align-items: center;
+      height: 38px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--app-hairline);
+      background: var(--app-bg);
+      border-radius: 11px 11px 0 0;
+      color: var(--app-fg);
+      font-weight: 500;
+    }
+    .app-dialog-bar .app-lights {
+      margin-right: 14px;
+    }
+    .app-dialog-body {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      padding: 14px 16px 6px;
+    }
+    .app-dialog-body label {
+      margin-top: 4px;
+      font-size: 12px;
+      color: var(--app-muted);
+    }
+    .app-input {
+      display: flex;
+      align-items: center;
+      min-height: 28px;
+      padding: 0 10px;
+      border-radius: 6px;
+      color: var(--app-fg);
+      box-shadow: 0 0 0 1px var(--app-border) inset;
+      overflow: hidden;
+      white-space: nowrap;
+    }
+    .app-textarea {
+      align-items: flex-start;
+      height: 56px;
+      padding-top: 6px;
+      white-space: normal;
+      word-break: break-all;
+      box-shadow:
+        0 0 0 1px var(--app-primary) inset,
+        0 0 0 3px color-mix(in srgb, var(--app-primary) 20%, transparent);
+    }
+    .app-caret {
+      display: inline-block;
+      width: 1px;
+      height: 15px;
+      margin-top: 1px;
+      background: var(--app-primary);
+      animation: app-blink 1s steps(1) infinite;
+    }
+    @keyframes app-blink {
+      50% {
+        opacity: 0;
+      }
+    }
+    .app-dialog-foot {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      padding: 12px 16px 14px;
+    }
+    .app-btn {
+      display: grid;
+      place-items: center;
+      height: 28px;
+      padding: 0 14px;
+      border-radius: 7px;
+      color: var(--app-fg);
+      box-shadow: 0 0 0 1px var(--app-border) inset;
+      transition:
+        filter 120ms,
+        transform 120ms;
+    }
+    .app-btn-primary {
+      background: var(--app-primary);
+      color: #fff;
+      box-shadow: none;
+    }
+    .app-cursor {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 10;
+      opacity: 0;
+      transform: translate(900px, 460px);
+      filter: drop-shadow(0 2px 3px rgb(0 0 0 / 0.3));
+      pointer-events: none;
+    }
+    .app-click {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 9;
+      width: 34px;
+      height: 34px;
+      margin: -17px 0 0 -17px;
+      border-radius: 99px;
+      border: 2px solid var(--app-primary);
+      opacity: 0;
+      pointer-events: none;
+    }
+    .app-click.is-firing {
+      animation: app-click 520ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    @keyframes app-click {
+      from {
+        opacity: 0.9;
+        scale: 0.3;
+      }
+      to {
+        opacity: 0;
+        scale: 1.4;
+      }
+    }
+  }
+</style>

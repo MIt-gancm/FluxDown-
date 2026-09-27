@@ -1,0 +1,141 @@
+---
+/**
+ * 文档页脚:源文件链接(编辑 / 历史 / 翻译)+ 上一页 / 下一页。
+ */
+import { ArrowLeft, ArrowRight, History, Languages, SquarePen } from "lucide-react";
+import type { DocsNavItem } from "@/lib/docs-nav";
+import type { Lang } from "@/i18n/config";
+import { docs } from "@/i18n/messages/docs";
+
+interface Props {
+  prev: DocsNavItem | null;
+  next: DocsNavItem | null;
+  editUrl: string;
+  historyUrl: string;
+  translateUrl?: string;
+  lang: Lang;
+}
+
+const { prev, next, editUrl, historyUrl, translateUrl, lang } = Astro.props;
+const t = docs[lang];
+---
+
+<footer class="docs-foot">
+  <div class="docs-foot-meta">
+    <a href={editUrl} target="_blank" rel="noopener noreferrer">
+      <SquarePen size={13} strokeWidth={1.75} aria-hidden="true" />
+      {t.edit}
+    </a>
+    <a href={historyUrl} target="_blank" rel="noopener noreferrer">
+      <History size={13} strokeWidth={1.75} aria-hidden="true" />
+      {t.history}
+    </a>
+    {
+      translateUrl && (
+        <a href={translateUrl} target="_blank" rel="noopener noreferrer">
+          <Languages size={13} strokeWidth={1.75} aria-hidden="true" />
+          {t.translate}
+        </a>
+      )
+    }
+  </div>
+
+  {
+    (prev || next) && (
+      <nav class="docs-pager cells" aria-label={t.pagination}>
+        {prev ? (
+          <a href={prev.href} rel="prev" class="docs-pager-link spot">
+            <span class="eyebrow-plain">
+              <ArrowLeft size={12} aria-hidden="true" />
+              {t.prev}
+            </span>
+            <span class="docs-pager-title">{prev.title}</span>
+          </a>
+        ) : (
+          <span class="docs-pager-empty" aria-hidden="true" />
+        )}
+        {next ? (
+          <a href={next.href} rel="next" class="docs-pager-link docs-pager-next spot">
+            <span class="eyebrow-plain">
+              {t.next}
+              <ArrowRight size={12} aria-hidden="true" />
+            </span>
+            <span class="docs-pager-title">{next.title}</span>
+          </a>
+        ) : (
+          <span class="docs-pager-empty" aria-hidden="true" />
+        )}
+      </nav>
+    )
+  }
+</footer>
+
+<style>
+  .docs-foot {
+    margin-top: 56px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+  }
+  .docs-foot-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 22px;
+    padding-top: 18px;
+    border-top: 1px solid var(--line);
+  }
+  .docs-foot-meta a {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    color: var(--fg-muted);
+    transition: color 160ms var(--ease-out);
+  }
+  .docs-foot-meta a:hover {
+    color: var(--accent-ink);
+  }
+  .docs-pager {
+    grid-template-columns: 1fr;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  @media (min-width: 640px) {
+    .docs-pager {
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+  .docs-pager-link {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 18px 20px;
+    transition: background-color 160ms var(--ease-out);
+  }
+  .docs-pager-link:hover {
+    background: var(--bg-sunken);
+  }
+  .docs-pager-link .eyebrow-plain {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .docs-pager-next {
+    align-items: flex-end;
+    text-align: right;
+  }
+  .docs-pager-title {
+    font-size: 15px;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .docs-pager-link:hover .docs-pager-title {
+    color: var(--accent-ink);
+  }
+  @media (max-width: 639px) {
+    .docs-pager-empty {
+      display: none;
+    }
+  }
+</style>

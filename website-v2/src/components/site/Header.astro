@@ -1,0 +1,484 @@
+---
+/**
+ * 站点顶栏:沿页面导轨(rails)延伸的细线外框;下拉菜单纯 CSS(hover / focus-within),
+ * 移动端菜单使用原生 Popover API(零 JS)。`D` 快捷键命中 `data-shortcut="d"` 的下载按钮。
+ */
+import { ChevronDown, Menu, Moon, Search, Sun, X, Languages } from "lucide-react";
+import { BrandIcon } from "../icons/brand";
+import Logo from "./Logo.astro";
+import { common } from "../../i18n/messages/common";
+import { href, switchLang, stripLang } from "../../i18n/routing";
+import { LANG_LABEL, type Lang } from "../../i18n/config";
+import { COMMUNITY_LINKS, GITHUB_URL, PRODUCT_LINKS, docsPath } from "../../lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = common[lang];
+const path = stripLang(Astro.url.pathname);
+const other: Lang = lang === "en" ? "zh" : "en";
+const otherHref = switchLang(Astro.url.pathname, other);
+
+const menus = [
+  {
+    id: "product",
+    label: t.nav.product,
+    links: PRODUCT_LINKS,
+    featured: { href: href("/download", lang), title: t.nav.featuredProduct, desc: t.nav.featuredProductDesc, external: false },
+  },
+  {
+    id: "community",
+    label: t.nav.community,
+    links: COMMUNITY_LINKS,
+    featured: { href: GITHUB_URL, title: t.nav.featuredCommunity, desc: t.nav.featuredCommunityDesc, external: true },
+  },
+];
+const flat = [
+  { label: t.nav.docs, href: docsPath(lang), active: Astro.url.pathname.startsWith("/docs") },
+  { label: t.nav.pricing, href: href("/pricing", lang), active: path.startsWith("/pricing") },
+  { label: t.nav.changelog, href: href("/changelog", lang), active: path.startsWith("/changelog") },
+];
+const isActive = (links: typeof PRODUCT_LINKS) =>
+  links.some((l) => !l.path.includes("#") && path.startsWith(l.path));
+---
+
+<header class="site-header">
+  <div class="frame header-inner">
+    <a href={href("/", lang)} class="flex items-center rounded-md" aria-label="FluxDown">
+      <Logo size={22} />
+    </a>
+
+    <nav class="hidden items-center gap-0.5 lg:flex" aria-label="Main">
+      {
+        menus.map((menu) => (
+          <div class="nav-item">
+            <button type="button" class="nav-link" data-active={isActive(menu.links) || undefined} aria-haspopup="true">
+              {menu.label}
+              <ChevronDown size={13} strokeWidth={2} className="nav-caret" />
+            </button>
+            <div class="nav-panel">
+              <div class="nav-panel-inner">
+                <a
+                  href={menu.featured.href}
+                  class="nav-feature"
+                  target={menu.featured.external ? "_blank" : undefined}
+                  rel={menu.featured.external ? "noopener" : undefined}
+                >
+                  <span class="nav-feature-art" data-kind={menu.id} aria-hidden="true">
+                    {menu.id === "product" ? (
+                      <span class="nav-feature-bar">
+                        <i /><i /><i /><i />
+                      </span>
+                    ) : (
+                      <BrandIcon name="github" size={26} />
+                    )}
+                  </span>
+                  <span class="flex flex-col gap-1.5 p-3.5">
+                    {menu.id === "product" && <span class="nav-feature-badge">{t.nav.newBadge}</span>}
+                    <span class="text-[13.5px] font-medium leading-snug text-fg">{menu.featured.title}</span>
+                    <span class="text-[12.5px] leading-relaxed text-subtle">{menu.featured.desc}</span>
+                  </span>
+                </a>
+                <div class="nav-links">
+                  {menu.links.map((link) => (
+                    <a href={href(link.path, lang)} class="nav-entry">
+                      <span class="nav-entry-icon">
+                        <link.icon size={15} strokeWidth={1.75} />
+                      </span>
+                      <span class="min-w-0 flex-1">
+                        <span class="block whitespace-nowrap text-[13.5px] font-medium text-fg">{t.nav[link.label]}</span>
+                        {link.desc && <span class="block truncate text-[12px] text-subtle">{t.nav[link.desc]}</span>}
+                      </span>
+                    </a>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        ))
+      }
+      {
+        flat.map((item) => (
+          <a href={item.href} class="nav-link" data-active={item.active || undefined}>
+            {item.label}
+          </a>
+        ))
+      }
+    </nav>
+
+    <div class="ml-auto flex items-center gap-1.5">
+      <button type="button" class="search-trigger hidden md:inline-flex" data-palette-open aria-label={t.search.open}>
+        <Search size={14} strokeWidth={2} />
+        <span class="text-[13px]">{t.search.open}</span>
+        <span class="kbd ml-3">⌘K</span>
+      </button>
+      <a href={GITHUB_URL} class="icon-btn hidden sm:inline-grid" aria-label={t.nav.github} target="_blank" rel="noopener">
+        <BrandIcon name="github" size={16} />
+      </a>
+      <a href={otherHref} class="icon-btn hidden sm:inline-grid" hreflang={other} aria-label={LANG_LABEL[other]} title={LANG_LABEL[other]}>
+        <span class="mono text-[11.5px] font-semibold">{other === "zh" ? "中" : "EN"}</span>
+      </a>
+      <button type="button" class="icon-btn" data-theme-toggle aria-label={t.theme.toggle}>
+        <Sun size={16} strokeWidth={1.75} className="theme-sun" />
+        <Moon size={16} strokeWidth={1.75} className="theme-moon" />
+      </button>
+      <a href={href("/download", lang)} class="btn btn-primary btn-sm ml-1.5" data-shortcut="d">
+        {t.nav.download}
+        <span class="kbd hidden sm:inline-grid">D</span>
+      </a>
+      <button type="button" class="icon-btn lg:hidden" popovertarget="mobile-nav" aria-label={t.nav.menu}>
+        <Menu size={18} strokeWidth={1.75} />
+      </button>
+    </div>
+  </div>
+</header>
+
+<div id="mobile-nav" popover class="mobile-nav">
+  <div class="flex h-[var(--header-h)] items-center justify-between border-b border-line px-5">
+    <Logo size={22} />
+    <button type="button" class="icon-btn" popovertarget="mobile-nav" popovertargetaction="hide" aria-label={t.nav.close}>
+      <X size={18} strokeWidth={1.75} />
+    </button>
+  </div>
+  <div class="overflow-y-auto px-5 pb-10 pt-4">
+    <a href={href("/download", lang)} class="btn btn-primary btn-lg mb-6 w-full">{t.nav.download}</a>
+    {
+      [...flat].map((item) => (
+        <a href={item.href} class="mobile-link">
+          {item.label}
+        </a>
+      ))
+    }
+    {
+      menus.map((menu) => (
+        <div class="mt-6">
+          <div class="eyebrow-plain mb-2">{menu.label}</div>
+          {menu.links.map((link) => (
+            <a href={href(link.path, lang)} class="mobile-link">
+              <link.icon size={16} strokeWidth={1.75} className="text-subtle" />
+              {t.nav[link.label]}
+            </a>
+          ))}
+        </div>
+      ))
+    }
+    <div class="mt-8 flex items-center gap-2 border-t border-line pt-6">
+      <a href={otherHref} class="btn btn-secondary btn-sm" hreflang={other}>
+        <Languages size={14} strokeWidth={1.75} />
+        {LANG_LABEL[other]}
+      </a>
+      <a href={GITHUB_URL} class="btn btn-secondary btn-sm" target="_blank" rel="noopener">
+        <BrandIcon name="github" size={14} />
+        GitHub
+      </a>
+    </div>
+  </div>
+</div>
+
+<script>
+  document.addEventListener("click", (event) => {
+    if ((event.target as Element | null)?.closest("[data-palette-open]")) {
+      window.dispatchEvent(new CustomEvent("palette:open"));
+    }
+  });
+</script>
+
+<style is:global>
+  @layer components {
+    .site-header {
+      position: sticky;
+      top: 0;
+      z-index: 50;
+      height: var(--header-h);
+      background: color-mix(in oklch, var(--bg) 78%, transparent);
+      backdrop-filter: saturate(1.6) blur(14px);
+      -webkit-backdrop-filter: saturate(1.6) blur(14px);
+      border-bottom: 1px solid transparent;
+      transition: border-color 200ms;
+    }
+    .site-header[data-scrolled] {
+      border-bottom-color: var(--line);
+    }
+    /* 阅读进度:底边一道随页面滚动增长的强调色细线(仅支持滚动时间线的浏览器) */
+    .site-header::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: -1px;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent) 30%, var(--cyan));
+      transform-origin: 0 50%;
+      scale: 0 1;
+      pointer-events: none;
+    }
+    @supports (animation-timeline: scroll()) {
+      .site-header::after {
+        animation: header-progress linear both;
+        animation-timeline: scroll(root);
+      }
+      @keyframes header-progress {
+        to {
+          scale: 1 1;
+        }
+      }
+    }
+    .header-inner {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+      height: 100%;
+      padding-inline: clamp(14px, 2vw, 22px);
+    }
+    .nav-item {
+      position: relative;
+    }
+    .nav-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      height: 32px;
+      padding-inline: 10px;
+      border-radius: 7px;
+      font-size: 13.5px;
+      color: var(--fg-muted);
+      transition:
+        color 150ms,
+        background-color 150ms;
+    }
+    .nav-link:hover,
+    .nav-item:focus-within > .nav-link,
+    .nav-link[data-active] {
+      color: var(--fg);
+    }
+    .nav-link:hover {
+      background: var(--bg-inset);
+    }
+    .nav-caret {
+      opacity: 0.6;
+      transition: transform 200ms var(--ease-out);
+    }
+    .nav-item:hover .nav-caret,
+    .nav-item:focus-within .nav-caret {
+      transform: rotate(180deg);
+    }
+    .nav-panel {
+      position: absolute;
+      left: -12px;
+      top: 100%;
+      padding-top: 12px;
+      opacity: 0;
+      visibility: hidden;
+      transform: translateY(-6px) scale(0.985);
+      transform-origin: 40px 0;
+      transition:
+        opacity 160ms,
+        transform 240ms var(--ease-out),
+        visibility 0s 240ms;
+    }
+    .nav-item:hover .nav-panel,
+    .nav-item:focus-within .nav-panel {
+      opacity: 1;
+      visibility: visible;
+      transform: none;
+      transition-delay: 60ms, 60ms, 0s;
+    }
+    /* 悬停桥:按钮与面板之间的空隙不丢 hover */
+    .nav-panel::before {
+      content: "";
+      position: absolute;
+      inset: 0 0 auto;
+      height: 12px;
+    }
+    .nav-panel-inner {
+      display: grid;
+      grid-template-columns: 216px 460px;
+      gap: 6px;
+      width: max-content;
+      padding: 6px;
+      border-radius: 14px;
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line),
+        var(--shadow-float);
+    }
+    .nav-links {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-content: start;
+      gap: 2px;
+      padding: 2px;
+    }
+    .nav-feature {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      border-radius: 10px;
+      background: var(--bg-sunken);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      transition: box-shadow 200ms;
+    }
+    .nav-feature:hover {
+      box-shadow: 0 0 0 1px var(--accent-line) inset;
+    }
+    .nav-feature-art {
+      position: relative;
+      display: grid;
+      place-items: center;
+      height: 92px;
+      border-bottom: 1px solid var(--line);
+      color: var(--fg-muted);
+      background:
+        radial-gradient(var(--line-strong) 1px, transparent 1px) 0 0 / 12px 12px,
+        radial-gradient(ellipse 70% 80% at 50% 100%, var(--accent-soft), transparent 70%);
+    }
+    .nav-feature-bar {
+      position: relative;
+      width: 128px;
+      height: 8px;
+      overflow: hidden;
+      border-radius: 99px;
+      background: var(--bg-inset);
+      box-shadow: 0 0 0 1px var(--line-strong) inset;
+    }
+    .nav-feature-bar i {
+      position: absolute;
+      top: 0;
+      bottom: 0;
+      left: calc(var(--n) * 25%);
+      width: 25%;
+      background: var(--accent);
+      transform-origin: left;
+      animation: nav-seg 2.8s var(--ease-out) infinite;
+      animation-delay: calc(var(--n) * 0.12s);
+    }
+    .nav-feature-bar i:nth-child(1) { --n: 0; }
+    .nav-feature-bar i:nth-child(2) { --n: 1; }
+    .nav-feature-bar i:nth-child(3) { --n: 2; }
+    .nav-feature-bar i:nth-child(4) { --n: 3; }
+    @keyframes nav-seg {
+      0% {
+        transform: scaleX(0);
+      }
+      60%,
+      100% {
+        transform: scaleX(0.96);
+      }
+    }
+    .nav-feature-badge {
+      align-self: flex-start;
+      padding: 1px 7px;
+      border-radius: 99px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--accent-fg);
+      background: var(--accent);
+    }
+    .nav-entry {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 9px 10px;
+      border-radius: 9px;
+      transition: background-color 140ms;
+    }
+    .nav-entry:hover,
+    .nav-entry:focus-visible {
+      background: var(--bg-sunken);
+    }
+    .nav-entry-icon {
+      display: grid;
+      flex: none;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      color: var(--fg-muted);
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line-strong) inset,
+        0 1px 2px oklch(0 0 0 / 0.04);
+      transition: color 140ms;
+    }
+    .nav-entry:hover .nav-entry-icon {
+      color: var(--accent-ink);
+    }
+    .icon-btn {
+      display: inline-grid;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 7px;
+      color: var(--fg-muted);
+      transition:
+        color 150ms,
+        background-color 150ms;
+    }
+    .icon-btn:hover {
+      color: var(--fg);
+      background: var(--bg-inset);
+    }
+    .search-trigger {
+      align-items: center;
+      gap: 8px;
+      height: 32px;
+      padding-inline: 10px 5px;
+      border-radius: 8px;
+      color: var(--fg-subtle);
+      background: var(--bg-sunken);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      transition: color 150ms;
+    }
+    .search-trigger:hover {
+      color: var(--fg-muted);
+    }
+    [data-theme="dark"] .theme-sun,
+    [data-theme="light"] .theme-moon {
+      display: none;
+    }
+    .mobile-nav {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100dvh;
+      max-width: none;
+      max-height: none;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      color: var(--fg);
+      background: var(--bg);
+      opacity: 0;
+      transform: translateY(-8px);
+      transition:
+        opacity 220ms,
+        transform 260ms var(--ease-out),
+        display 260ms allow-discrete,
+        overlay 260ms allow-discrete;
+    }
+    .mobile-nav:popover-open {
+      display: flex;
+      flex-direction: column;
+      opacity: 1;
+      transform: none;
+    }
+    @starting-style {
+      .mobile-nav:popover-open {
+        opacity: 0;
+        transform: translateY(-8px);
+      }
+    }
+    .mobile-link {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding-block: 11px;
+      border-bottom: 1px solid var(--line);
+      font-size: 16px;
+    }
+  }
+</style>
