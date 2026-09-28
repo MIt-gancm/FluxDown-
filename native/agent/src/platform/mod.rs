@@ -561,22 +561,17 @@ fn registry_executable(executable: Option<&Path>) -> Result<String, PlatformErro
 #[cfg(windows)]
 mod windows_shell {
     /// `SHChangeNotify(SHCNE_ASSOCCHANGED)` 通知资源管理器关联已变化。
-    ///
-    /// 直接声明 FFI，避免为一个符号引入 `windows-sys` 的 `Win32_UI_Shell`。
     pub fn notify_association_changed() {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn SHChangeNotify(
-                wEventId: i32,
-                uFlags: u32,
-                dwItem1: *const std::ffi::c_void,
-                dwItem2: *const std::ffi::c_void,
-            );
-        }
-        // SAFETY: SHCNE_ASSOCCHANGED (0x0800_0000) + SHCNF_IDLIST (0) 不读取
-        // item 指针，传 null 合法。
+        use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
+
+        // SAFETY: SHCNE_ASSOCCHANGED + SHCNF_IDLIST 不读取 item 指针，传 null 合法。
         unsafe {
-            SHChangeNotify(0x0800_0000, 0, std::ptr::null(), std::ptr::null());
+            SHChangeNotify(
+                SHCNE_ASSOCCHANGED as i32,
+                SHCNF_IDLIST,
+                std::ptr::null(),
+                std::ptr::null(),
+            );
         }
     }
 }
