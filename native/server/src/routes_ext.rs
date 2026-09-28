@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -27,6 +28,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post, put};
 use fluxdown_api::auth::{TokenCell, check_management_auth, constant_time_eq};
 use fluxdown_api::service::ApiError;
+use fluxdown_engine::auth::is_sensitive_config_key;
 use fluxdown_engine::components::{
     ffmpeg_status, install_ffmpeg, install_ytdlp, list_versions, list_ytdlp_versions,
     uninstall_ffmpeg, uninstall_ytdlp, ytdlp_status,
@@ -73,6 +75,9 @@ pub struct ServerState {
     pub ffmpeg_installing: Arc<AtomicBool>,
     /// yt-dlp 托管安装互斥标志：安装/更新期间为 `true`，防止并发重复安装。
     pub ytdlp_installing: Arc<AtomicBool>,
+    /// 磁盘剩余空间缓存：(采样时刻, 字节数)。任务活跃时每次实测；完全
+    /// 空闲时 60s TTL 内复用，避免 `/stats` 高频轮询频繁唤醒 NAS/网络盘。
+    pub disk_space_cache: Arc<Mutex<Option<(Instant, u64)>>>,
 }
 
 impl ServerState {
@@ -391,7 +396,12 @@ async fn get_config(State(state): State<ServerState>) -> Result<Response, ApiErr
         .get_all_config()
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
-    Ok(axum::Json(map).into_response())
+    Ok(axum::Json(
+        map.into_iter()
+            .filter(|(key, _)| !is_sensitive_config_key(key))
+            .collect::<HashMap<_, _>>(),
+    )
+    .into_response())
 }
 
 /// 批量写入配置键值并 live-apply 到引擎。
@@ -402,13 +412,21 @@ async fn get_config(State(state): State<ServerState>) -> Result<Response, ApiErr
 /// 其余 `local_server_*` 键仍是重启生效。
 #[utoipa::path(put, path = "/api/v1/config", tag = "server",
     request_body = HashMap<String, String>,
-    responses((status = 200, description = "已持久化并应用")),
+    responses(
+        (status = 200, description = "已持久化并应用"),
+        (status = 400, description = "含插件/站点认证凭据键，须改走专用端点写入", body = fluxdown_protocol::daemon::ResultMessage),
+    ),
     security(("bearer_token" = []), ("api_key" = []))
 )]
 async fn put_config(
     State(state): State<ServerState>,
     axum::Json(mut entries): axum::Json<HashMap<String, String>>,
 ) -> Result<Response, ApiError> {
+    if entries.keys().any(|key| is_sensitive_config_key(key)) {
+        return Err(ApiError::BadRequest(
+            "config 键包含插件/站点认证凭据命名空间；请改用 /api/v1/plugins/{identity}/auth 或 /api/v1/site-auth".into(),
+        ));
+    }
     if let Some(next) = entries.get_mut("local_server_token") {
         // 先归一化再校验并落库：库里存了带空白的值、内存 cell 存去空白的值，
         // 会在下次重启时神不知鬼不觉地换掉密钥。
@@ -901,31 +919,37 @@ async fn fs_list(
     let mut dirs = Vec::new();
     // 群晖/QNAP 等套件以受限用户运行，浏览到授权目录之外会 EACCES。
     // 此时不整体失败（否则选择器卡死显示「目录读取失败」，无法后退换路径），
-    // 而是返回空子目录列表 + 可用的 parent，让用户仍能沿面包屑/上级继续导航。
-    if let Ok(mut rd) = tokio::fs::read_dir(base_path).await {
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let Ok(ft) = entry.file_type().await else {
-                continue;
-            };
-            if !ft.is_dir() {
-                continue;
+    // 而是返回空子目录列表 + `denied=true` + 可用的 parent：前端据此提示
+    // 「需在 NAS 上给套件用户授权」，用户仍能沿面包屑/上级继续导航。
+    let mut denied = false;
+    match tokio::fs::read_dir(base_path).await {
+        Ok(mut rd) => {
+            while let Ok(Some(entry)) = rd.next_entry().await {
+                let Ok(ft) = entry.file_type().await else {
+                    continue;
+                };
+                if !ft.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // 隐藏目录（.git 等）不进选择器。
+                if name.starts_with('.') {
+                    continue;
+                }
+                dirs.push(FsEntry {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    name,
+                });
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            // 隐藏目录（.git 等）不进选择器。
-            if name.starts_with('.') {
-                continue;
-            }
-            dirs.push(FsEntry {
-                path: entry.path().to_string_lossy().into_owned(),
-                name,
-            });
         }
+        Err(e) => denied = e.kind() == std::io::ErrorKind::PermissionDenied,
     }
     dirs.sort_by_key(|a| a.name.to_lowercase());
     Ok(axum::Json(FsListResponse {
         path: base,
         parent,
         dirs,
+        denied,
     })
     .into_response())
 }
@@ -1121,7 +1145,35 @@ async fn setup_complete(
 )]
 async fn stats(State(state): State<ServerState>) -> Result<Response, ApiError> {
     let save_dir = state.current_save_dir().await;
-    let disk_free_bytes = fs2::available_space(FsPath::new(&save_dir)).ok();
+    /// 空闲期磁盘空间缓存的有效期：足够摊薄高频轮询，又不会让用户在设置页
+    /// 看到明显过期的剩余空间数字。
+    const DISK_SPACE_CACHE_TTL: Duration = Duration::from_secs(60);
+    let has_active_download = state.db.count_tasks_by_status(1).await.unwrap_or(0) > 0;
+    let disk_free_bytes = if has_active_download {
+        // 任务正在下载，磁盘占用实时变化，每次都实测。
+        fs2::available_space(FsPath::new(&save_dir)).ok()
+    } else {
+        let cached = state
+            .disk_space_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .filter(|(sampled_at, _)| sampled_at.elapsed() < DISK_SPACE_CACHE_TTL)
+            .map(|(_, bytes)| bytes);
+        match cached {
+            Some(bytes) => Some(bytes),
+            None => {
+                let fresh = fs2::available_space(FsPath::new(&save_dir)).ok();
+                if let Some(bytes) = fresh {
+                    *state
+                        .disk_space_cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some((Instant::now(), bytes));
+                }
+                fresh
+            }
+        }
+    };
     Ok(axum::Json(StatsResponse {
         disk_free_bytes,
         save_dir,
@@ -1155,12 +1207,10 @@ async fn component_ffmpeg_status(State(state): State<ServerState>) -> Result<Res
     ),
     security(("bearer_token" = []), ("api_key" = []))
 )]
-async fn component_ffmpeg_versions(
-    State(_state): State<ServerState>,
-) -> Result<Response, ApiError> {
+async fn component_ffmpeg_versions(State(state): State<ServerState>) -> Result<Response, ApiError> {
     let client =
         build_client(&ProxyConfig::default(), "").map_err(|e| ApiError::Internal(e.to_string()))?;
-    let versions = list_versions(&client)
+    let versions = list_versions(&state.db, &client)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(axum::Json(fluxdown_engine_protocol::ffmpeg_versions_to_dto(versions)).into_response())
@@ -1267,10 +1317,10 @@ async fn component_ytdlp_status(State(state): State<ServerState>) -> Result<Resp
     ),
     security(("bearer_token" = []), ("api_key" = []))
 )]
-async fn component_ytdlp_versions(State(_state): State<ServerState>) -> Result<Response, ApiError> {
+async fn component_ytdlp_versions(State(state): State<ServerState>) -> Result<Response, ApiError> {
     let client =
         build_client(&ProxyConfig::default(), "").map_err(|e| ApiError::Internal(e.to_string()))?;
-    let versions = list_ytdlp_versions(&client)
+    let versions = list_ytdlp_versions(&state.db, &client)
         .await
         .map_err(|e| ApiError::Internal(e.to_string()))?;
     Ok(axum::Json(fluxdown_engine_protocol::ytdlp_versions_to_dto(versions)).into_response())

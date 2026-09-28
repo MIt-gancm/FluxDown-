@@ -13,8 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::db::Db;
 use crate::events::EventSink;
-use crate::logger::log_info;
+use crate::logger::{log_info, log_warn};
+use crate::output;
 use crate::speed_limiter::SpeedLimiter;
+use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferTracker};
 
 // ---------------------------------------------------------------------------
 // Error
@@ -38,11 +40,15 @@ pub enum DownloadError {
     /// single-stream mode.
     #[error("server does not support Range requests (returned {0} instead of 206 Partial Content)")]
     RangeNotSupported(String),
-    /// 服务器在 probe 与分段/续传请求之间【更换了文件】：Range 响应的
-    /// validator（ETag/Last-Modified）与已落盘版本不一致。与
-    /// [`RangeNotSupported`] 严格区分：后者是服务器根本不支持 Range；本变体
-    /// 意味着旧数据已不能与当前响应拼接，必须清空临时文件后重新下载。文件变化
-    /// 与服务器 Range 能力无关，因此绝不记录主机单连接缓存。
+    /// 服务器在 probe 与分段/续传请求之间【更换了文件】：Range 响应的强
+    /// validator（ETag）与已落盘版本不一致，或 Last-Modified 不一致且响应
+    /// `Content-Range` 总大小与已知总大小【也】不一致（分段路径下起点还须
+    /// 不一致）——见 [`crate::downloader::validator_mismatch_is_fatal`]。
+    /// 与 [`RangeNotSupported`] 严格区分：后者是服务器根本不支持 Range；本
+    /// 变体意味着旧数据已不能与当前响应拼接，必须清空临时文件后重新下载。
+    /// 文件变化与服务器 Range 能力无关，因此绝不记录主机单连接缓存。仅
+    /// Last-Modified 不同但总大小（及分段起点）一致时视为跨 CDN edge 的
+    /// 时钟/格式差异，不触发本变体，改为记录一条警告后继续。
     #[error("file changed on server during download (validator mismatch, server returned {0})")]
     VersionChanged(String),
     /// 服务器对 `Range: bytes=X-Y` 请求回了 `206 Partial Content`，但响应的
@@ -92,6 +98,15 @@ pub enum DownloadError {
     /// 调度层据此把违规 peer 拉黑（贯穿整个下载调用），而非仅退避。
     #[error("ed2k integrity violation: {0}")]
     Ed2kIntegrity(String),
+    /// URL 仅因 `.m3u8`/`.m3u` 扩展名被 [`crate::hls_downloader::is_hls_url`]
+    /// 判定为 HLS，但拉取到的内容根本不是合法 M3U8 播放列表——典型场景是
+    /// WebDAV/网盘把普通文本文件（曲目列表等）恰好命名为 `.m3u8`。
+    /// 与其它变体不同：该错误只可能在 HLS 下载器**拉取并解析 playlist**这
+    /// 一最早阶段产生，此时尚未创建任何临时文件、写入任何字节——调度层
+    /// （`download_manager::do_start_task` / `do_resume_task`）捕获后不落
+    /// 终态失败，而是把任务原样交给普通 HTTP 下载器按字面文件保存。
+    #[error("not an HLS playlist: {0}")]
+    NotAnHlsPlaylist(String),
     #[error("{0}")]
     Other(String),
 }
@@ -109,6 +124,21 @@ pub(crate) fn is_server_rejection(e: &DownloadError) -> bool {
             } else {
                 false
             }
+        }
+        _ => false,
+    }
+}
+
+/// 检测下载错误是否为 HTTP 416 Range Not Satisfiable。
+///
+/// BUG-HTTP-416-RETRY-EXHAUST：服务器对当前 Range 明确拒绝（典型于续传偏移
+/// 越界——临时文件被外部截断，或服务器文件在两次探测间缩小）。重试同一
+/// Range 必然拿到同样的 416，与瞬时网络错误不同；调用方应据此短路重试，
+/// 而不是空烧完整的重试预算后才失败。
+pub(crate) fn is_range_not_satisfiable(e: &DownloadError) -> bool {
+    match e {
+        DownloadError::Request(req_err) => {
+            req_err.status() == Some(reqwest::StatusCode::RANGE_NOT_SATISFIABLE)
         }
         _ => false,
     }
@@ -145,6 +175,8 @@ pub struct FileInfo {
 #[derive(Default)]
 pub struct ProgressUpdate {
     pub task_id: String,
+    /// Observed active reads and byte-range geometry; absent when not sampled.
+    pub runtime: Option<crate::transfer_activity::TaskRuntime>,
     pub downloaded_bytes: i64,
     pub total_bytes: i64,
     pub status: i32,
@@ -178,6 +210,8 @@ pub struct ProgressUpdate {
 #[derive(Clone)]
 pub struct SegmentProgressInfo {
     pub index: i32,
+    /// None denotes geometry without a transport-level activity observation.
+    pub active: Option<bool>,
     pub start_byte: i64,
     pub end_byte: i64,
     pub downloaded_bytes: i64,
@@ -279,11 +313,15 @@ pub struct DownloadParams {
     /// 见 [`crate::cdn::CdnTaskInput`]）。`enabled == false`（默认）时多段
     /// 路径构造单节点池，行为与现状逐字节一致。
     pub cdn: crate::cdn::CdnTaskInput,
-    /// `ProxyMode::Auto` 直连起飞任务的热切换上下文（候选代理 + host 决策
-    /// 缓存），由 manager 构造（见 [`crate::auto_proxy::AutoProxyCtx`]）。
-    /// `None` = 非 Auto 模式 / 无候选代理 / 已按缓存决策走代理启动——
-    /// 三者都不存在「运行中切换」这回事，多段路径零行为变化。
+    /// `ProxyMode::Auto` 任务的多路径上下文（起飞路径 + 备选路径及其先验），
+    /// 由 manager 构造（见 [`crate::auto_proxy::AutoProxyCtx`]）。`None` =
+    /// 非 Auto 模式 / 无候选代理 / 一次性 failover 链路 / 忽略 TLS 错误——
+    /// 单路径，多段路径零行为变化。
     pub auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
+    /// 多网卡聚合的任务级输入（全局开关打开时由 manager 构造，见
+    /// [`crate::multi_nic::MultiNicInput`]）。`None` = 功能关闭，多段路径零
+    /// 行为变化。
+    pub multi_nic: Option<std::sync::Arc<crate::multi_nic::MultiNicInput>>,
     /// 无人值守任务（`tasks.unattended`，RSS/免打扰接管创建）：HLS/DASH
     /// 画质选择跳过 `HostSelection` 弹窗，直接取最高码率（与超时默认值
     /// 一致）。仅 HLS/DASH 路径读取；BT 文件选择在创建时已落库，不经此。
@@ -669,7 +707,14 @@ pub fn unsupported_content_encoding(headers: &reqwest::header::HeaderMap) -> Opt
             // 字符编码错填进 Content-Encoding 头，响应体实际未压缩。按未知
             // 编码拒绝会把这类误写永久挡在下载之外（#413），故与 "none" 一样
             // 按 no-op 放行。
-            "identity" | "none" | "" | "utf-8" | "utf8" => {}
+            // "aws-chunked"（S3/兼容对象存储的分块签名传输封装，如 UFile/
+            // 阿里 OSS）是【传输层】framing token，不是 body 内容编码——
+            // 该封装本就发生在 chunk-size/签名 trailer 这一层，等到 HTTP
+            // 客户端把 body 交给我们时已经是普通字节流，不需要（也没有
+            // 额外可反转的）解压步骤。个别源站/CDN 把它错填进
+            // Content-Encoding 而不是 Transfer-Encoding，若按未知编码
+            // 处理会导致这条本可正常下载的响应被永久拒绝并报“无法解码”。
+            "identity" | "none" | "" | "utf-8" | "utf8" | "aws-chunked" => {}
             "gzip" | "x-gzip" | "br" | "brotli" | "deflate" | "zstd" => layers.push(lower),
             other => {
                 has_unknown = true;
@@ -757,6 +802,46 @@ pub(crate) fn is_range_response_misaligned(cr_start: Option<i64>, actual_start: 
         Some(s) => s != actual_start,
         None => actual_start > 0,
     }
+}
+
+/// 单次 Range 响应的 validator 不一致是否构成【致命】版本变化。
+///
+/// - ETag 在两侧均非空且不同 → 致命：ETag 是强 validator，不同即不同版本，
+///   任何情况下都不可容忍。
+/// - 仅 Last-Modified 不同：响应 `Content-Range` 的总大小（分母，见
+///   [`parse_content_range_total`]）与本任务已知总大小一致——需要校验起点
+///   时（分段路径）起点也与请求偏移一致——判定为同一份内容在不同 CDN edge
+///   间的时钟/格式差异，不致命；否则致命。
+/// - 两侧均无差异 → 不致命。
+///
+/// `content_range_total` / `known_total`：`known_total <= 0` 表示总大小
+/// 未知，此时无法佐证"同一份内容"，按致命处理。
+/// `content_range_start` / `requested_start`：仅分段路径传 `Some` 校验起点；
+/// 单流续传传 `None` 跳过——该路径的起点错位由
+/// [`is_range_response_misaligned`] 另行处理，走安全的全量回退而非报错。
+pub(crate) fn validator_mismatch_is_fatal(
+    etag_mismatch: bool,
+    last_modified_mismatch: bool,
+    content_range_total: Option<i64>,
+    known_total: i64,
+    content_range_start: Option<i64>,
+    requested_start: Option<i64>,
+) -> bool {
+    if etag_mismatch {
+        return true;
+    }
+    if !last_modified_mismatch {
+        return false;
+    }
+    if known_total <= 0 || content_range_total != Some(known_total) {
+        return true;
+    }
+    if let Some(requested_start) = requested_start
+        && content_range_start != Some(requested_start)
+    {
+        return true;
+    }
+    false
 }
 
 /// Wrap a response byte stream with transparent decompression if the server
@@ -871,7 +956,24 @@ pub fn build_pinned_client(
         proxy_config,
         user_agent,
         ignore_tls_errors,
-        Some((host, ip)),
+        ClientRoute::Pinned { host, ip },
+    )
+}
+
+/// 构建出口绑定到指定网卡的直连下载 client（多网卡聚合的额外链路）。与
+/// [`build_client_with_tls_policy`] 同参装配（UA/TLS/池参数逐项一致、恒不走
+/// 代理），仅追加出口绑定与按链路地址族过滤的 DNS 解析，见
+/// [`crate::multi_nic`]「出口绑定」。
+pub fn build_link_client(
+    user_agent: &str,
+    ignore_tls_errors: bool,
+    link: &crate::multi_nic::LinkBinding,
+) -> Result<Client, DownloadError> {
+    build_client_inner(
+        &crate::proxy_config::ProxyConfig::default(),
+        user_agent,
+        ignore_tls_errors,
+        ClientRoute::Link(link),
     )
 }
 
@@ -884,17 +986,32 @@ pub fn build_client_with_tls_policy(
     user_agent: &str,
     ignore_tls_errors: bool,
 ) -> Result<Client, DownloadError> {
-    build_client_inner(proxy_config, user_agent, ignore_tls_errors, None)
+    build_client_inner(
+        proxy_config,
+        user_agent,
+        ignore_tls_errors,
+        ClientRoute::Default,
+    )
 }
 
-/// 共享装配核心：[`build_client_with_tls_policy`] 与 [`build_pinned_client`]
-/// 的唯一实现体。`pin = Some((host, ip))` 时追加 `.resolve()` DNS 钉定，
-/// 其余配置两者逐字节相同（代理/UA/TLS/池参数绝不允许分叉）。
+/// client 的出口/解析定制（除此之外所有构建产物逐字节相同）。
+enum ClientRoute<'a> {
+    /// 系统 DNS + 系统路由。
+    Default,
+    /// DNS 钉定到 `ip`（多 CDN 节点池的 pinned client）。
+    Pinned { host: &'a str, ip: std::net::IpAddr },
+    /// 出口绑定到指定网卡（多网卡聚合的额外链路）。
+    Link(&'a crate::multi_nic::LinkBinding),
+}
+
+/// 共享装配核心：[`build_client_with_tls_policy`]、[`build_pinned_client`] 与
+/// [`build_link_client`] 的唯一实现体。`route` 只追加 DNS 钉定或出口绑定，
+/// 其余配置三者逐字节相同（代理/UA/TLS/池参数绝不允许分叉）。
 fn build_client_inner(
     proxy_config: &crate::proxy_config::ProxyConfig,
     user_agent: &str,
     ignore_tls_errors: bool,
-    pin: Option<(&str, std::net::IpAddr)>,
+    route: ClientRoute<'_>,
 ) -> Result<Client, DownloadError> {
     use crate::proxy_config::{ProxyMode, detect_system_proxy};
 
@@ -1044,9 +1161,15 @@ fn build_client_inner(
         }
     }
 
-    // --- DNS 钉定（多 CDN 节点池的 pinned client）---
-    if let Some((host, ip)) = pin {
-        builder = builder.resolve(host, std::net::SocketAddr::new(ip, 0));
+    // --- DNS 钉定（多 CDN 节点池）/ 出口绑定（多网卡聚合）---
+    match route {
+        ClientRoute::Default => {}
+        ClientRoute::Pinned { host, ip } => {
+            builder = builder.resolve(host, std::net::SocketAddr::new(ip, 0));
+        }
+        ClientRoute::Link(link) => {
+            builder = crate::multi_nic::bind_to_link(builder, link);
+        }
     }
 
     let client = builder.build()?;
@@ -1866,11 +1989,16 @@ fn has_plausible_extension(name: &str) -> bool {
 
 fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let disposition = headers.get(reqwest::header::CONTENT_DISPOSITION)?;
-    // Use from_utf8 instead of to_str(): the http crate's to_str() rejects any byte > 0x7E,
-    // but some servers (e.g. z-lib CDN) embed raw UTF-8 characters (Chinese, Japanese, etc.)
-    // directly in the filename="" parameter.  Those bytes are valid UTF-8 even though they
-    // are not ASCII, so from_utf8 succeeds where to_str would silently return None.
-    let value = std::str::from_utf8(disposition.as_bytes()).ok()?;
+    // HeaderValue may contain raw UTF-8, GBK, or Big5 bytes in legacy filename= values.
+    // Carry each header byte as a Latin-1 code unit so the ASCII parameter structure can
+    // be split with &str tools; every value is turned back into its original bytes with
+    // `latin1_bytes` before decoding — `str::as_bytes` on this carrier would re-encode
+    // the non-ASCII code units as two-byte UTF-8 and corrupt raw legacy bytes.
+    let value: String = disposition
+        .as_bytes()
+        .iter()
+        .map(|&byte| byte as char)
+        .collect();
 
     // Prefer filename*= (RFC 5987 / RFC 6266) over filename=
     for part in value.split(';') {
@@ -1880,16 +2008,20 @@ fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Opt
             // e.g. UTF-8''My%20File.pdf
             //
             // 注：按 RFC 5987 charset 字段明确指定编码，严格实现
-            // 应该读取该字段。目前以 urlencoding_decode 的
-            // "UTF-8 优先，GBK fallback" 表现足够应对老旧中文服务器
+            // 应该读取该字段。这里读取并支持 UTF-8、GBK 与 Big5；
+            // 对声明不可靠的老旧中文服务器仍保留候选探测。
             // （它们通常话不对题，声明 UTF-8 但发 GBK）。
             // 非标准实现（腾讯云 COS 等）会把整个 ext-value 用双引号包起来：
             // `filename*="UTF-8''foo.exe"`。RFC 6266 的 ext-value 是 token 不
             // 允许加引号，若原样保留，尾引号会跟进文件名（Windows 上再被
             // sanitize_filename 换成 `_`，落盘名多一个下划线）。
             let name = name.trim().trim_matches('"').trim();
-            if let Some(encoded) = name.split('\'').nth(2)
-                && let Ok(decoded) = urlencoding_decode(encoded)
+            let mut parts = name.splitn(3, '\'');
+            let charset = parts.next();
+            let _language = parts.next();
+            if let Some(encoded) = parts.next()
+                && let Ok(decoded) =
+                    percent_decode_bytes_with_charset(&latin1_bytes(encoded), charset)
             {
                 let decoded = decoded.trim();
                 if !decoded.is_empty() {
@@ -1910,14 +2042,17 @@ fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Opt
                 // percent-encoded sequences, try URL-decoding it so that
                 // `%E6%B0%B8%E7%94%9F.mp4` becomes `永生.mp4`.
                 if name.contains('%')
-                    && let Ok(decoded) = urlencoding_decode(name)
+                    && let Ok(decoded) =
+                        percent_decode_bytes_with_charset(&latin1_bytes(name), None)
                 {
                     let decoded = decoded.trim();
                     if !decoded.is_empty() && decoded != name {
                         return Some(sanitize_filename(decoded));
                     }
                 }
-                return Some(sanitize_filename(name));
+                let decoded = decode_bytes_with_charset(&latin1_bytes(name), None)
+                    .unwrap_or_else(|_| name.to_owned());
+                return Some(sanitize_filename(&decoded));
             }
         }
     }
@@ -2043,8 +2178,30 @@ fn hex_nibble(b: u8) -> Option<u8> {
 /// 在调用前已 `split('?')` 丢弃 query，故 `+`→空格 在所有实际用途下都是错的
 /// （会把 `C++Primer.pdf` 损坏成 `C  Primer.pdf`）。
 fn urlencoding_decode(s: &str) -> Result<String, String> {
-    let mut result = Vec::with_capacity(s.len());
-    let bytes = s.as_bytes();
+    urlencoding_decode_with_charset(s, None)
+}
+
+/// 解码 URL / `Content-Disposition` 中的百分号转义，并在声明了字符集时
+/// 使用声明的字符集。未声明字符集时保留 UTF-8 → GBK/Big5 的兼容探测。
+fn urlencoding_decode_with_charset(s: &str, charset: Option<&str>) -> Result<String, String> {
+    percent_decode_bytes_with_charset(s.as_bytes(), charset)
+}
+
+/// 把 Latin-1 载体字符串（每个 char 的码位 = 原始字节值）还原为原始字节。
+///
+/// 只用于 `extract_from_content_disposition`：响应头按 RFC 7230 是字节序列，
+/// 这里用 `byte as char` 承载以便按 ASCII 结构切分，取值前必须还原。
+fn latin1_bytes(carrier: &str) -> Vec<u8> {
+    carrier.chars().map(|ch| (ch as u32 & 0xff) as u8).collect()
+}
+
+/// 字节级百分号解码 + 字符集解码：`bytes` 是待解码的原始字节（可含字面的
+/// 非 ASCII 字节），`%XX` 展开后整体交给 [`decode_bytes_with_charset`]。
+fn percent_decode_bytes_with_charset(
+    bytes: &[u8],
+    charset: Option<&str>,
+) -> Result<String, String> {
+    let mut result = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
@@ -2059,44 +2216,120 @@ fn urlencoding_decode(s: &str) -> Result<String, String> {
         result.push(bytes[i]);
         i += 1;
     }
-    decode_bytes_utf8_or_gbk(&result)
+    decode_bytes_with_charset(&result, charset)
 }
 
-/// 将一组字节解码为字符串，优先 UTF-8，失败时回退到 GBK。
+/// 将一组字节解码为字符串，优先 UTF-8，失败时兼容 GBK 与 Big5。
 ///
 /// HTML5 规范要求 URL percent-encoding 使用 UTF-8，但大量老旧中文站点
 /// （包括一些 CDN/云存储）仍使用 GBK 编码，如 `%CE%C4%BC%FE.txt`
 /// 对应 GBK 的 "文件.txt"。若不做回退则 UTF-8 解码必然失败，最终
 /// 用户看到 `%CE%C4%BC%FE.txt` 这种看似乱码的文件名。
 ///
-/// # 已知局限
-///
-/// GBK 的字节空间很宽松（0x81-0xFE × 0x40-0xFE），其他二字节编码
-/// 的字节序列（如 Big5、Shift-JIS）也可能被 GBK “成功”解码为错误的中文。
-/// 权衡上这个误判仅在罕见场景下发生（现代 Big5/Latin 站点几乎不会
-/// 在 URL 中使用非 UTF-8 percent-encoding），而 GBK 中文乱码是老旧中文
-/// 站点的高频问题。
-///
 /// # 返回值
 ///
-/// 返回 Err 仅当两种编码都无法解码时（极罕见，需要出现 GBK 不允许的
+/// 返回 Err 仅当候选编码都无法解码时（极罕见，需要出现 GBK/Big5 都不允许的
 /// 字节组合，如 0x81 0x7F）。
 pub(crate) fn decode_bytes_utf8_or_gbk(bytes: &[u8]) -> Result<String, String> {
-    match std::str::from_utf8(bytes) {
-        Ok(s) => Ok(s.to_string()),
-        Err(_) => {
-            // 使用 decode_without_bom_handling_and_without_replacement：
-            // 遇到非法字节时返回 None，不插入 U+FFFD。
-            // 这样可以准确区分 “GBK 中合法但含替换字符” 和 “GBK 解码失败”。
-            match encoding_rs::GBK.decode_without_bom_handling_and_without_replacement(bytes) {
-                Some(decoded) => Ok(decoded.into_owned()),
-                None => Err(format!(
-                    "bytes are neither valid UTF-8 nor valid GBK ({} bytes)",
-                    bytes.len()
-                )),
+    decode_bytes_with_charset(bytes, None)
+}
+
+fn decode_bytes_with_charset(bytes: &[u8], charset: Option<&str>) -> Result<String, String> {
+    match normalized_legacy_charset(charset) {
+        Some(LegacyCharset::Gbk) => decode_with_encoding(bytes, encoding_rs::GBK, "GBK"),
+        Some(LegacyCharset::Big5) => decode_with_encoding(bytes, encoding_rs::BIG5, "Big5"),
+        Some(LegacyCharset::Utf8) | None => match std::str::from_utf8(bytes) {
+            Ok(s) => Ok(s.to_string()),
+            Err(_) => {
+                // Some legacy servers declare UTF-8 but send GBK/Big5 bytes.
+                // Preserve the historical compatibility fallback for that case.
+                decode_legacy_filename(bytes)
             }
-        }
+        },
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LegacyCharset {
+    Utf8,
+    Gbk,
+    Big5,
+}
+
+fn normalized_legacy_charset(charset: Option<&str>) -> Option<LegacyCharset> {
+    let charset = charset?.trim().trim_matches('"').to_ascii_lowercase();
+    match charset.as_str() {
+        "utf-8" | "utf8" => Some(LegacyCharset::Utf8),
+        "gbk" | "gb2312" | "gb18030" | "cp936" => Some(LegacyCharset::Gbk),
+        "big5" | "big5-hkscs" | "cp950" | "windows-950" => Some(LegacyCharset::Big5),
+        _ => None,
+    }
+}
+
+fn decode_with_encoding(
+    bytes: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+    label: &str,
+) -> Result<String, String> {
+    encoding
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|decoded| decoded.into_owned())
+        .ok_or_else(|| format!("bytes are not valid {label} ({} bytes)", bytes.len()))
+}
+
+/// 对未声明字符集的传统中文文件名做有限候选选择。
+///
+/// GBK 与 Big5 的字节范围存在重叠，不能简单地把 Big5 放在 GBK 前面，否则
+/// 现有大陆站点的文件名会被误判。优先保留 GBK；只有 Big5 候选明显更像中文，
+/// 且 GBK 候选含假名、控制字符、私用区字符等典型误解码结果时才选择 Big5。
+fn decode_legacy_filename(bytes: &[u8]) -> Result<String, String> {
+    let gbk = encoding_rs::GBK
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|decoded| decoded.into_owned());
+    let big5 = encoding_rs::BIG5
+        .decode_without_bom_handling_and_without_replacement(bytes)
+        .map(|decoded| decoded.into_owned());
+
+    match (gbk, big5) {
+        (Some(gbk), Some(big5))
+            if has_strong_legacy_mojibake(&gbk)
+                && filename_encoding_score(&big5) > filename_encoding_score(&gbk) =>
+        {
+            Ok(big5)
+        }
+        (Some(gbk), _) => Ok(gbk),
+        (None, Some(big5)) => Ok(big5),
+        (None, None) => Err(format!(
+            "bytes are neither valid GBK nor Big5 ({} bytes)",
+            bytes.len()
+        )),
+    }
+}
+
+fn filename_encoding_score(value: &str) -> i32 {
+    value.chars().fold(0, |score, ch| {
+        score
+            + if ch.is_control() {
+                -8
+            } else if ('\u{3040}'..='\u{30ff}').contains(&ch) {
+                -5
+            } else if ('\u{4e00}'..='\u{9fff}').contains(&ch) {
+                2
+            } else if ch == '\u{fffd}' {
+                -10
+            } else {
+                0
+            }
+    })
+}
+
+fn has_strong_legacy_mojibake(value: &str) -> bool {
+    value.chars().any(|ch| {
+        ch.is_control()
+            || ('\u{3040}'..='\u{30ff}').contains(&ch)
+            || ('\u{e000}'..='\u{f8ff}').contains(&ch)
+            || ch == '\u{fffd}'
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2374,37 +2607,102 @@ pub async fn run_download(params: DownloadParams) {
     }
 }
 
-/// Verify that a file at `path` matches the checksum in `spec`.
-///
-/// `spec` format: `"algo=hexhash"`, e.g. `"sha-256=abc123..."` or `"md5=d41d8c..."`.
-/// Supported algorithms: `sha-256`/`sha256`, `sha-512`/`sha512`, `sha-1`/`sha1`, `md5`.
-/// Returns `Ok(())` if the digest matches, or `Err(DownloadError::ChecksumMismatch)` if not.
-async fn verify_checksum(path: &Path, spec: &str) -> Result<(), DownloadError> {
-    let sep = spec.find('=').ok_or_else(|| {
-        DownloadError::Other(format!(
-            "invalid checksum format (expected algo=hash): {}",
-            spec
-        ))
-    })?;
-    let algo_raw = spec[..sep].trim().to_lowercase();
-    let expected_hex = spec[sep + 1..].trim().to_lowercase();
+/// Hex-digit length expected for each supported checksum algorithm's digest.
+/// Must stay in lockstep with the hashers dispatched in [`verify_checksum`].
+fn checksum_hex_len(algo: &str) -> Option<usize> {
+    match algo {
+        "md5" => Some(32),
+        "sha1" => Some(40),
+        "sha256" => Some(64),
+        "sha512" => Some(128),
+        _ => None,
+    }
+}
 
-    // Normalize algorithm aliases to a canonical key.
+/// Normalize a user-provided checksum spec into the canonical `algo=hex`
+/// form consumed by [`verify_checksum`].
+///
+/// BUG-CHECKSUM-PREFIX：用户常把从下载页复制来的、自带算法前缀的哈希值
+/// （如 `sha256:abcdef...`）整段粘进哈希输入框，拼出 `sha256=sha256:abcdef...`
+/// 这样的 spec；旧实现直接把 `sha256:abcdef...` 当哈希值参与比较，永远校验
+/// 失败。本函数：
+/// - 识别 `algo=hash` 中的 `algo`（含 `sha-256`/`sha256` 等别名）；
+/// - 若 `hash` 自身带 `<prefix>:` 前缀，且该前缀归一化（去掉 `-`、转小写）
+///   后与已选定的 `algo` 相同，剥离该前缀——**绝不**猜测/剥离与所选算法
+///   不符的前缀，那是真实的输入错误，必须报错而非静默按错误算法比对；
+/// - 校验剥离后的哈希是纯十六进制、且长度与算法匹配（md5=32, sha1=40,
+///   sha256=64, sha512=128）。
+///
+/// 返回规范化后的 `algo=hex`（小写），或描述具体问题的错误字符串。
+pub fn normalize_checksum_spec(spec: &str) -> Result<String, String> {
+    let spec = spec.trim();
+    let sep = spec
+        .find('=')
+        .ok_or_else(|| format!("invalid checksum format (expected algo=hash): {}", spec))?;
+    let algo_raw = spec[..sep].trim().to_lowercase();
+    let hash_raw = spec[sep + 1..].trim();
+
     let algo = match algo_raw.as_str() {
         "sha-256" | "sha256" => "sha256",
         "sha-512" | "sha512" => "sha512",
         "sha-1" | "sha1" => "sha1",
         "md5" => "md5",
-        other => {
-            return Err(DownloadError::Other(format!(
-                "unsupported checksum algorithm: {}",
-                other
-            )));
-        }
+        other => return Err(format!("unsupported checksum algorithm: {}", other)),
     };
 
-    let path_owned = path.to_path_buf();
+    // Strip a redundant "<algo>:" prefix pasted onto the hash itself — only
+    // when it names the *same* algorithm already selected via `algo=`.
+    let hash = if let Some((prefix, rest)) = hash_raw.split_once(':') {
+        let normalized_prefix = prefix.trim().to_lowercase().replace('-', "");
+        if normalized_prefix == algo {
+            rest.trim()
+        } else {
+            return Err(format!(
+                "checksum hash prefix does not match algorithm: expected {}, got {}",
+                algo,
+                prefix.trim()
+            ));
+        }
+    } else {
+        hash_raw
+    };
+
+    let hash = hash.to_lowercase();
+    if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("checksum hash is not valid hex: {}", hash));
+    }
+    let expected_len = checksum_hex_len(algo).unwrap_or(0);
+    if hash.len() != expected_len {
+        return Err(format!(
+            "checksum hash length mismatch for {}: expected {} hex chars, got {}",
+            algo,
+            expected_len,
+            hash.len()
+        ));
+    }
+
+    Ok(format!("{}={}", algo, hash))
+}
+
+/// Verify that a file at `path` matches the checksum in `spec`.
+///
+/// `spec` format: `"algo=hexhash"`, e.g. `"sha-256=abc123..."` or `"md5=d41d8c..."`.
+/// Supported algorithms: `sha-256`/`sha256`, `sha-512`/`sha512`, `sha-1`/`sha1`, `md5`.
+/// `spec` is passed through [`normalize_checksum_spec`] first, which also
+/// strips a redundant `<algo>:` prefix pasted onto the hash value.
+/// Returns `Ok(())` if the digest matches, or `Err(DownloadError::ChecksumMismatch)` if not.
+async fn verify_checksum(path: &Path, spec: &str) -> Result<(), DownloadError> {
+    let normalized = normalize_checksum_spec(spec).map_err(DownloadError::Other)?;
+    let (algo, expected_hex) = normalized.split_once('=').ok_or_else(|| {
+        DownloadError::Other(format!(
+            "internal: normalized checksum spec missing separator: {}",
+            normalized
+        ))
+    })?;
     let algo_owned = algo.to_string();
+    let expected_hex = expected_hex.to_string();
+
+    let path_owned = path.to_path_buf();
 
     let actual_hex = tokio::task::spawn_blocking(move || -> Result<String, DownloadError> {
         use std::io::Read;
@@ -2986,6 +3284,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             p.spawn_gen,
             allow_hint_uncap,
             p.auto_proxy.clone(),
+            p.multi_nic.clone(),
         )
         .await;
 
@@ -3013,7 +3312,14 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                         p.sink.emit(crate::events::EngineEvent::TaskCdnEvent {
                             task_id: p.task_id.clone(),
                             kind: "summary".to_string(),
-                            host: nodes_for_summary.host().to_string(),
+                            host: if nodes_for_summary.host().is_empty() {
+                                reqwest::Url::parse(&p.url)
+                                    .ok()
+                                    .and_then(|u| u.host_str().map(str::to_string))
+                                    .unwrap_or_default()
+                            } else {
+                                nodes_for_summary.host().to_string()
+                            },
                             nodes: stats,
                             ip: String::new(),
                             reason: String::new(),
@@ -3049,6 +3355,18 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                     status
                 );
                 actual_use_segments = false;
+                if let Err(e) = crate::task_activity::record(
+                    &p.db,
+                    p.sink.as_ref(),
+                    &p.task_id,
+                    "fallback",
+                    format!("HTTP 分段回退单流：{status}"),
+                    Some(1),
+                )
+                .await
+                {
+                    tracing::error!(task_id = %p.task_id, error = %e, "failed to persist HTTP fallback");
+                }
                 // 清空多段残留：删 DB segment 行 + 删预分配临时文件。对两种触发都正确：
                 //   • 真·无 Range：预分配文件全零、无有效数据；
                 //   • 版本变化：已完成段是【旧版本】字节，整体作废，必须删以重下新版本。
@@ -3062,6 +3380,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                     false, // server doesn't support Range — never attempt it
                     client,
                     &p.db,
+                    p.sink.as_ref(),
                     &p.progress_tx,
                     &p.cancel_token,
                     &p.speed_limiter,
@@ -3114,6 +3433,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             effective_supports_range,
             client,
             &p.db,
+            p.sink.as_ref(),
             &p.progress_tx,
             &p.cancel_token,
             &p.speed_limiter,
@@ -3605,6 +3925,45 @@ struct SingleDownloadResult {
     resumed_range_start: Option<u64>,
 }
 
+fn single_runtime(task_id: &str, downloaded: i64, total: i64, active: bool) -> TaskRuntime {
+    TaskRuntime {
+        task_id: task_id.to_owned(),
+        sampled_at_ms: chrono::Utc::now().timestamp_millis(),
+        sample_sequence: crate::transfer_activity::next_sample_sequence(),
+        active_transfers: Some(u32::from(active)),
+        connected_peers: None,
+        parallelism_limit: Some(1),
+        total_bytes: total,
+        segments: if total > 0 {
+            vec![TaskSegment {
+                index: 0,
+                start_byte: 0,
+                end_byte: total - 1,
+                downloaded_bytes: downloaded,
+                active: Some(active),
+            }]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+fn single_segment_progress(
+    downloaded: i64,
+    total: i64,
+    active: bool,
+) -> Option<Vec<SegmentProgressInfo>> {
+    (total > 0).then(|| {
+        vec![SegmentProgressInfo {
+            index: 0,
+            start_byte: 0,
+            end_byte: total - 1,
+            downloaded_bytes: downloaded,
+            active: Some(active),
+        }]
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_single(
     task_id: &str,
@@ -3614,6 +3973,7 @@ async fn download_single(
     supports_range: bool,
     client: &Client,
     db: &Db,
+    sink: &dyn EventSink,
     progress_tx: &mpsc::Sender<ProgressUpdate>,
     cancel_token: &CancellationToken,
     speed_limiter: &SpeedLimiter,
@@ -3660,6 +4020,18 @@ async fn download_single(
                 "resumed Range returned no data before expected total: {current_len}/{expected_len}"
             )));
         }
+        if let Err(e) = crate::task_activity::record(
+            db,
+            sink,
+            task_id,
+            "retry",
+            format!("HTTP 单流续传短响应：{current_len}/{expected_len}，从偏移 {current_len} 重试"),
+            Some(1),
+        )
+        .await
+        {
+            tracing::error!(task_id, error = %e, "failed to persist HTTP single-stream retry");
+        }
     }
 }
 
@@ -3682,9 +4054,7 @@ async fn download_single_once(
     expected_etag: &str,
     expected_last_modified: &str,
 ) -> Result<SingleDownloadResult, DownloadError> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    output::ensure_parent(dest).await?;
 
     let physical_existing_len = match tokio::fs::metadata(dest).await {
         Ok(metadata) => i64::try_from(metadata.len()).map_err(|_| {
@@ -3734,7 +4104,24 @@ async fn download_single_once(
         // 版本安全由下方对 206 响应的 ETag/Last-Modified 后验校验保证。
         resp = resp.header("Range", &range);
     }
-    let mut resp = resp.send().await?.error_for_status()?;
+    let mut resp = resp.send().await?;
+    // BUG-HTTP-416-RETRY-EXHAUST：续传 Range 偏移越界时服务器回 416（临时文件
+    // 被外部截断、或服务器文件在两次探测间缩小）。error_for_status() 会把它
+    // 变成不可恢复的错误直接终止任务；416 语义明确——重试同一 Range 必然拿到
+    // 同样的响应，唯一出路是放弃续传偏移，不带 Range 重新请求从头下载整个
+    // 文件（与下方"Range-on-206 压缩"回退同一手法：丢弃当前响应重新发送）。
+    if want_resume && resp.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
+        log_info!(
+            "[download-single] task {} 续传 Range 请求收到 416 Range Not Satisfiable，\
+             放弃续传偏移 {} 重新从头请求完整文件",
+            task_id,
+            existing_len
+        );
+        drop(resp);
+        let full_req = build_request(client, url, spec.method.clone(), spec);
+        resp = full_req.send().await?;
+    }
+    let mut resp = resp.error_for_status()?;
 
     if want_resume && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
         let resp_etag = resp
@@ -3747,14 +4134,35 @@ async fn download_single_once(
             .get(reqwest::header::LAST_MODIFIED)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        if (!expected_etag.is_empty() && !resp_etag.is_empty() && resp_etag != expected_etag)
-            || (!expected_last_modified.is_empty()
-                && !resp_lm.is_empty()
-                && resp_lm != expected_last_modified)
-        {
-            return Err(DownloadError::VersionChanged(
-                "validator mismatch on resumed Range response".to_string(),
-            ));
+        let etag_mismatch =
+            !expected_etag.is_empty() && !resp_etag.is_empty() && resp_etag != expected_etag;
+        let last_modified_mismatch = !expected_last_modified.is_empty()
+            && !resp_lm.is_empty()
+            && resp_lm != expected_last_modified;
+        if etag_mismatch || last_modified_mismatch {
+            let content_range_total = parse_content_range_total(resp.headers());
+            if validator_mismatch_is_fatal(
+                etag_mismatch,
+                last_modified_mismatch,
+                content_range_total,
+                total_bytes,
+                None,
+                None,
+            ) {
+                return Err(DownloadError::VersionChanged(
+                    "validator mismatch on resumed Range response".to_string(),
+                ));
+            }
+            log_warn!(
+                "[download-single] task {} 续传响应 Last-Modified 不同（probe=\"{}\" 本次=\"{}\"）\
+                 但 Content-Range 总大小（{:?}）与已知总大小（{}）一致，判定为跨 CDN edge 的\
+                 时钟/格式差异，继续续传",
+                task_id,
+                expected_last_modified,
+                resp_lm,
+                content_range_total,
+                total_bytes
+            );
         }
     }
 
@@ -3938,6 +4346,18 @@ async fn download_single_once(
     // Treat size as unknown so progress reports don't show wrong percentages
     // and the final integrity check is skipped.
     let total_bytes = if encoding.is_some() { 0 } else { total_bytes };
+    let reading = TransferTracker::new().start(0);
+    // Do not park a validated response behind a full UI progress channel before
+    // its first body read. The periodic sample or final frame will follow.
+    let _ = progress_tx.try_send(ProgressUpdate {
+        task_id: task_id.to_owned(),
+        downloaded_bytes: downloaded,
+        total_bytes,
+        status: 1,
+        segment_details: single_segment_progress(downloaded, total_bytes, true),
+        runtime: Some(single_runtime(task_id, downloaded, total_bytes, true)),
+        ..Default::default()
+    });
 
     let mut last_report = std::time::Instant::now();
     let mut last_db_save = std::time::Instant::now();
@@ -3991,12 +4411,8 @@ async fn download_single_once(
                                     status: 1,
                                     error_message: String::new(),
                                     file_name: String::new(),
-                                    segment_details: Some(vec![SegmentProgressInfo {
-                                        index: 0,
-                                        start_byte: 0,
-                                        end_byte: if total_bytes > 0 { total_bytes - 1 } else { 0 },
-                                        downloaded_bytes: downloaded,
-                                    }]),
+                                    segment_details: single_segment_progress(downloaded, total_bytes, true),
+                                    runtime: Some(single_runtime(task_id, downloaded, total_bytes, true)),
                                     ..Default::default()
                                 })
                                 .await;
@@ -4020,6 +4436,18 @@ async fn download_single_once(
         }
     }
 
+    drop(reading);
+    let _ = progress_tx
+        .send(ProgressUpdate {
+            task_id: task_id.to_owned(),
+            downloaded_bytes: downloaded,
+            total_bytes,
+            status: 1,
+            runtime: Some(single_runtime(task_id, downloaded, total_bytes, false)),
+            segment_details: single_segment_progress(downloaded, total_bytes, false),
+            ..Default::default()
+        })
+        .await;
     file.flush().await?;
     let _ = db.update_task_progress(task_id, downloaded).await;
     Ok(SingleDownloadResult {
@@ -4064,10 +4492,9 @@ async fn download_multi_segment(
     spawn_gen: i64,
     allow_hint_uncap: bool,
     auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
+    multi_nic: Option<std::sync::Arc<crate::multi_nic::MultiNicInput>>,
 ) -> Result<i64, DownloadError> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    output::ensure_parent(dest).await?;
 
     // NOTE: total_bytes arriving here is already the *effective* value returned
     // by update_task_file_info_resume — it is consistent with the stored segment
@@ -4102,6 +4529,7 @@ async fn download_multi_segment(
         spawn_gen,
         allow_hint_uncap,
         auto_proxy,
+        multi_nic,
     )
     .await
 }
@@ -4117,6 +4545,7 @@ mod tests {
         PROBE_MAX_RETRIES, PROBE_RETRY_BASE_DELAY, PROBE_TIMEOUT, TEMP_EXT, dedup_filename,
         extract_filename, extract_from_content_disposition, extract_from_url, format_probe_failure,
         mime_to_ext, parse_http_date, sanitize_filename, urlencoding_decode,
+        urlencoding_decode_with_charset,
     };
     use std::time::Duration;
 
@@ -4346,6 +4775,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn extract_from_content_disposition_big5_filename() {
+        // 台湾站点常见的 Big5/CP950 编码：“中文” = A4 A4 A4 E5。
+        let headers = make_headers_with_cd("attachment; filename=\"%A4%A4%A4%E5.txt\"");
+        let name = extract_from_content_disposition(&headers);
+        assert_eq!(
+            name.as_deref(),
+            Some("中文.txt"),
+            "Big5 percent-encoded Content-Disposition 应能被正确解码"
+        );
+    }
+
+    #[test]
+    fn extract_from_content_disposition_explicit_big5_charset() {
+        let headers = make_headers_with_cd("attachment; filename*=Big5''%A4%A4%A4%E5.txt");
+        let name = extract_from_content_disposition(&headers);
+        assert_eq!(name.as_deref(), Some("中文.txt"));
+    }
+
+    #[test]
+    fn extract_from_content_disposition_explicit_big5_charset_overrides_utf8() {
+        // C2 A1 is valid UTF-8 (U+00A1) but Big5 "癒". The declared charset
+        // must win when both decoders accept the same bytes.
+        let headers = make_headers_with_cd("attachment; filename*=Big5''%C2%A1.txt");
+        let name = extract_from_content_disposition(&headers);
+        assert_eq!(name.as_deref(), Some("癒.txt"));
+    }
+
+    #[test]
+    fn extract_from_content_disposition_raw_big5_bytes() {
+        let headers = make_headers_with_raw_cd(b"attachment; filename=\"\xA4\xA4\xA4\xE5.txt\"");
+        let name = extract_from_content_disposition(&headers);
+        assert_eq!(name.as_deref(), Some("中文.txt"));
+    }
+
+    fn make_headers_with_raw_cd(raw: &[u8]) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let value = reqwest::header::HeaderValue::from_bytes(raw)
+            .unwrap_or_else(|_| reqwest::header::HeaderValue::from_static("attachment"));
+        headers.insert(reqwest::header::CONTENT_DISPOSITION, value);
+        headers
+    }
+
+    #[test]
+    fn extract_from_content_disposition_raw_utf8_in_filename_star() {
+        // 非标准但常见：filename* 的 ext-value 直接塞原始 UTF-8 字节而非 %XX。
+        // 回归：Latin-1 载体若经 str::as_bytes 二次编码会得到 "ä¸\u{ad}æ__.txt"。
+        let headers =
+            make_headers_with_raw_cd(b"attachment; filename*=UTF-8''\xe4\xb8\xad\xe6\x96\x87.txt");
+        assert_eq!(
+            extract_from_content_disposition(&headers).as_deref(),
+            Some("中文.txt")
+        );
+    }
+
+    #[test]
+    fn extract_from_content_disposition_raw_utf8_mixed_with_percent() {
+        // 原始 UTF-8 字节与 %20 混排：percent 分支也必须先还原原始字节。
+        let headers =
+            make_headers_with_raw_cd(b"attachment; filename=\"\xe4\xb8\xad\xe6\x96\x87%20a.txt\"");
+        assert_eq!(
+            extract_from_content_disposition(&headers).as_deref(),
+            Some("中文 a.txt")
+        );
+    }
+
+    #[test]
+    fn extract_from_content_disposition_raw_gbk_with_declared_charset() {
+        let headers = make_headers_with_raw_cd(b"attachment; filename*=GBK''\xce\xc4\xbc\xfe.txt");
+        assert_eq!(
+            extract_from_content_disposition(&headers).as_deref(),
+            Some("文件.txt")
+        );
+    }
+
     // -----------------------------------------------------------------------
     // urlencoding_decode
     // -----------------------------------------------------------------------
@@ -4409,22 +4913,33 @@ mod tests {
         assert_eq!(result, "€", "GBK 0x80 应解码为 €");
     }
 
-    // ——— 已知局限（文档性测试，默认 ignore）———
-    //
-    // GBK fallback 存在 false-positive：非 UTF-8 且非 GBK 的编码（如 Big5、
-    // ISO-8859-1）也可能被 GBK “成功”解码为错误的中文。考虑到：
-    //   1. 现代 Big5/Latin 站点几乎不会在 URL 中使用非 UTF-8 percent-encoding
-    //   2. 本修复主要目标是 “老旧中文站点的 GBK URL” 高频场景
-    //   3. 我们接受该权衡，后续可考虑加入 chardet/Big5 预检测
+    #[test]
+    fn urlencoding_decode_mislabeled_utf8_falls_back_to_gbk() {
+        let result =
+            urlencoding_decode_with_charset("%CE%C4%BC%FE", Some("UTF-8")).unwrap_or_default();
+        assert_eq!(result, "文件");
+    }
 
     #[test]
-    #[ignore = "记录 GBK fallback false-positive 行为，不是回归报警"]
-    fn urlencoding_decode_big5_chinese_filename_misdecoded_as_gbk() {
-        // Big5 编码的 “中文” = A4 A4 A4 E5
-        // UTF-8 失败 → GBK 成功但解码为 “いゅ”（错误的日文假名）
+    fn urlencoding_decode_big5_chinese_filename() {
+        // Big5 编码的 “中文” = A4 A4 A4 E5；GBK 会错误解码为日文假名。
         let result = urlencoding_decode("%A4%A4%A4%E5").unwrap_or_default();
-        eprintln!("big5 bytes decoded as GBK: {:?}", result);
-        assert_ne!(result, "中文", "已知局限：不会还原 Big5");
+        assert_eq!(result, "中文");
+    }
+
+    #[test]
+    fn urlencoding_decode_big5_filename_with_private_use_mojibake() {
+        // Big5 “檔案下載” = C0 C9 AE D7 A4 55 B8 FC；GBK 会产生私用区字符。
+        let result = urlencoding_decode("%C0%C9%AE%D7%A4%55%B8%FC").unwrap_or_default();
+        assert_eq!(result, "檔案下載");
+    }
+
+    #[test]
+    fn urlencoding_decode_ambiguous_legacy_bytes_keeps_gbk() {
+        // C0 C9 也能被两种编码解码为普通 CJK 字符，无法可靠自动判断；
+        // 未出现强乱码特征时保留既有 GBK 优先行为，避免静默误改文件名。
+        let result = urlencoding_decode("%C0%C9").unwrap_or_default();
+        assert_eq!(result, "郎");
     }
 
     #[test]
@@ -5449,6 +5964,20 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_content_encoding_aws_chunked_is_supported() {
+        // BUG-AWS-CHUNKED-FALSE-REJECT：S3 兼容对象存储把请求侧的分块签名
+        // framing token 误填进响应 Content-Encoding；body 到达我们手里时
+        // 早已是普通字节流，按未知编码拒绝会把可正常下载的响应挡在外面。
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            reqwest::header::HeaderValue::from_static("aws-chunked"),
+        );
+        assert!(super::unsupported_content_encoding(&headers).is_none());
+        assert!(super::detect_content_encoding(&headers).is_none());
+    }
+
+    #[test]
     fn unsupported_content_encoding_gzip_is_supported() {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
@@ -5697,6 +6226,98 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // validator_mismatch_is_fatal（CDN edge Last-Modified 漂移容差）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validator_mismatch_last_modified_only_same_total_is_tolerated() {
+        // 仅 Last-Modified 不同，但 Content-Range 总大小与已知总大小一致——
+        // 同一份内容在不同 CDN edge 间的时钟/格式差异，不应判定为致命。
+        assert!(!super::validator_mismatch_is_fatal(
+            false,
+            true,
+            Some(639494994),
+            639494994,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn validator_mismatch_etag_differs_is_fatal() {
+        // ETag 是强 validator，不同即不同版本——即使总大小一致也必须致命，
+        // 不受 Last-Modified 容差规则影响。
+        assert!(super::validator_mismatch_is_fatal(
+            true,
+            true,
+            Some(639494994),
+            639494994,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn validator_mismatch_last_modified_and_total_differ_is_fatal() {
+        // 总大小也不一致——不是同一份内容，必须致命。
+        assert!(super::validator_mismatch_is_fatal(
+            false,
+            true,
+            Some(4747867),
+            639494994,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn validator_mismatch_no_mismatch_is_not_fatal() {
+        assert!(!super::validator_mismatch_is_fatal(
+            false, false, None, 0, None, None,
+        ));
+    }
+
+    #[test]
+    fn validator_mismatch_unknown_total_is_fatal() {
+        // 已知总大小未知（<= 0）时无法佐证"同一份内容"，保守判定致命。
+        assert!(super::validator_mismatch_is_fatal(
+            false,
+            true,
+            Some(639494994),
+            0,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn validator_mismatch_segment_start_mismatch_is_fatal() {
+        // 分段路径：总大小一致但 Content-Range 起点与请求偏移不符——同样
+        // 不能排除内容错位，必须致命。
+        assert!(super::validator_mismatch_is_fatal(
+            false,
+            true,
+            Some(639494994),
+            639494994,
+            Some(0),
+            Some(508073519),
+        ));
+    }
+
+    #[test]
+    fn validator_mismatch_segment_start_match_is_tolerated() {
+        // 分段路径：总大小与起点均一致——容忍。
+        assert!(!super::validator_mismatch_is_fatal(
+            false,
+            true,
+            Some(639494994),
+            639494994,
+            Some(508073519),
+            Some(508073519),
+        ));
+    }
+
+    // -----------------------------------------------------------------------
     // is_server_rejection
     // -----------------------------------------------------------------------
 
@@ -5744,6 +6365,87 @@ mod tests {
         assert!(!super::is_server_rejection(&super::DownloadError::Other(
             "403 forbidden".to_string()
         )));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_range_not_satisfiable
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn range_not_satisfiable_detects_416() {
+        assert!(super::is_range_not_satisfiable(&make_status_error(416)));
+    }
+
+    #[test]
+    fn range_not_satisfiable_ignores_other_statuses() {
+        assert!(!super::is_range_not_satisfiable(&make_status_error(403)));
+        assert!(!super::is_range_not_satisfiable(&make_status_error(404)));
+        assert!(!super::is_range_not_satisfiable(&make_status_error(500)));
+    }
+
+    #[test]
+    fn range_not_satisfiable_ignores_non_request_errors() {
+        assert!(!super::is_range_not_satisfiable(
+            &super::DownloadError::Cancelled
+        ));
+        assert!(!super::is_range_not_satisfiable(
+            &super::DownloadError::Other("416 range not satisfiable".to_string())
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // normalize_checksum_spec
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_checksum_plain_form_still_ok() {
+        let hash = "a".repeat(64);
+        let spec = format!("sha256={hash}");
+        assert_eq!(
+            super::normalize_checksum_spec(&spec).as_deref(),
+            Ok(spec.as_str())
+        );
+    }
+
+    #[test]
+    fn normalize_checksum_strips_matching_algo_prefix_and_lowercases() {
+        let hash = "AB".repeat(32); // 64 hex chars, uppercase
+        let spec = format!("sha256=sha256:{hash}");
+        let normalized = super::normalize_checksum_spec(&spec).expect("must normalize");
+        assert_eq!(normalized, format!("sha256={}", hash.to_lowercase()));
+    }
+
+    #[test]
+    fn normalize_checksum_mismatched_prefix_is_error() {
+        let hash = "a".repeat(64);
+        let spec = format!("sha256=md5:{hash}");
+        let err = super::normalize_checksum_spec(&spec).expect_err("mismatched prefix must fail");
+        assert!(
+            err.contains("md5") && err.contains("sha256"),
+            "error should name both algorithms: {err}"
+        );
+    }
+
+    #[test]
+    fn normalize_checksum_wrong_length_is_error() {
+        let spec = format!("sha256={}", "a".repeat(63)); // one short of 64
+        assert!(super::normalize_checksum_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn normalize_checksum_non_hex_is_error() {
+        let spec = format!("md5={}", "z".repeat(32));
+        assert!(super::normalize_checksum_spec(&spec).is_err());
+    }
+
+    #[test]
+    fn normalize_checksum_unsupported_algo_is_error() {
+        assert!(super::normalize_checksum_spec("crc32=deadbeef").is_err());
+    }
+
+    #[test]
+    fn normalize_checksum_missing_separator_is_error() {
+        assert!(super::normalize_checksum_spec("sha256deadbeef").is_err());
     }
 
     // -----------------------------------------------------------------------

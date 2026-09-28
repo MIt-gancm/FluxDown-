@@ -13,9 +13,10 @@ use fluxdown_protocol::daemon::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
     LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
     LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
-    MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse,
-    RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse,
-    TaskDto,
+    MarketEntryDto, PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto,
+    ResolvePreviewRequest, ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto,
+    RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto, SiteAuthEntryDto,
+    SiteAuthSaveRequest, TaskDto,
 };
 
 /// 404 fallback 响应的 message —— 请求命中了未注册的路由（例如管理 API 分组
@@ -94,6 +95,22 @@ pub trait ApiHost: Send + Sync {
         ))
     }
 
+    /// 更换任务下载源地址（旧链接失效但内容不变，保留已下载进度续传）。
+    ///
+    /// 错误消息为稳定错误码字符串（`invalid-url` / `task-active` /
+    /// `task-completed` / `bt-unsupported` / `not-found` /
+    /// `protocol-unsupported` / `protocol-mismatch`，或 thunder 链接解码
+    /// 失败的原文），宿主实现须按状态映射：`not-found` →
+    /// [`ApiError::NotFound`]、`invalid-url` → [`ApiError::BadRequest`]、
+    /// 其余业务拒绝 → [`ApiError::Conflict`]，且除 `not-found` 外错误码
+    /// 字符串原样保留。默认实现返回不支持错误。
+    async fn change_task_url(&self, task_id: &str, url: &str) -> Result<(), ApiError> {
+        let _ = (task_id, url);
+        Err(ApiError::Internal(
+            "task url change not supported by this host".to_string(),
+        ))
+    }
+
     /// 暂停全部活跃任务。
     async fn pause_all(&self) -> Result<(), ApiError>;
 
@@ -134,6 +151,36 @@ pub trait ApiHost: Send + Sync {
         let _ = changes;
         Err(ApiError::Internal(
             "config change not supported by this host".to_string(),
+        ))
+    }
+
+    /// 列出已保存的站点凭据，只返回站点和用户名。
+    async fn list_site_auth(&self) -> Result<Vec<SiteAuthEntryDto>, ApiError> {
+        Ok(Vec::new())
+    }
+
+    /// 读取单站点凭据详情。该接口是定向受保护接口，不属于通用配置快照。
+    async fn get_site_auth(&self, site: &str) -> Result<Option<SiteAuthCredentialDto>, ApiError> {
+        let _ = site;
+        Ok(None)
+    }
+
+    /// 保存单站点凭据。
+    async fn save_site_auth(
+        &self,
+        request: SiteAuthSaveRequest,
+    ) -> Result<SiteAuthEntryDto, ApiError> {
+        let _ = request;
+        Err(ApiError::Internal(
+            "site auth change not supported by this host".to_string(),
+        ))
+    }
+
+    /// 删除单站点凭据。
+    async fn delete_site_auth(&self, site: &str) -> Result<(), ApiError> {
+        let _ = site;
+        Err(ApiError::Internal(
+            "site auth change not supported by this host".to_string(),
         ))
     }
 
@@ -180,6 +227,15 @@ pub trait ApiHost: Send + Sync {
         entries: HashMap<String, String>,
     ) -> Result<(), ApiError> {
         let _ = (identity, entries);
+        Err(plugins_unsupported())
+    }
+
+    /// 驱动插件登录流程（二维码/账号登录）；默认宿主不提供插件运行时。
+    async fn plugin_auth(
+        &self,
+        request: PluginAuthRequest,
+    ) -> Result<PluginAuthResponse, ApiError> {
+        let _ = request;
         Err(plugins_unsupported())
     }
 

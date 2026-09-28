@@ -41,7 +41,6 @@ pub mod keys {
     pub const MAIN_QUEUE: &str = "mainQueue";
     pub const MENU_FILE: &str = "menuFile";
     pub const MENU_HELP: &str = "menuHelp";
-    pub const MENU_ITEMS_PENDING: &str = "menuItemsPending";
     pub const MENU_TASKS: &str = "menuTasks";
     pub const MENU_TOOLS: &str = "menuTools";
     pub const MOBILE_NAV_DOWNLOADS: &str = "mobileNavDownloads";
@@ -58,11 +57,9 @@ pub mod keys {
     pub const STATUS_DOWNLOADING: &str = "statusDownloading";
     pub const STATUS_ERROR: &str = "statusError";
     pub const VIEW_COLUMNS_AT_LEAST_ONE: &str = "viewColumnsAtLeastOne";
-    pub const VIEW_COLUMNS_MENU_TITLE: &str = "viewColumnsMenuTitle";
     pub const VIEW_COLUMNS_RESET_ACTION: &str = "viewColumnsResetAction";
     pub const STATUS_PAUSED: &str = "statusPaused";
     pub const STATUS_SEEDING: &str = "statusSeeding";
-    pub const STOP_ALL: &str = "stopAll";
     pub const TAB_ALL: &str = "tabAll";
     pub const THEME_MODE: &str = "themeMode";
     pub const THEME_MODE_DARK: &str = "themeModeDark";
@@ -257,6 +254,25 @@ impl Translator {
     ) -> &'translator str {
         self.catalog.native_name(locale)
     }
+}
+
+/// 系统界面语言：`LC_ALL` → `LC_MESSAGES` → `LANG` 中第一个非空值，去掉编码后缀；
+/// `C` / `POSIX` 或都未设置时为 `en`。偏好 `general.locale` 为 `system` 时使用，桌面、
+/// 设置页与 agent 托盘共用同一推导，保证文案同语言。
+#[must_use]
+pub fn system_locale() -> String {
+    ["LC_ALL", "LC_MESSAGES", "LANG"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .find(|value| !value.trim().is_empty())
+        .and_then(|value| {
+            value
+                .split('.')
+                .next()
+                .map(|locale| locale.trim().to_owned())
+        })
+        .filter(|locale| !locale.is_empty() && locale != "C" && locale != "POSIX")
+        .unwrap_or_else(|| "en".to_owned())
 }
 
 fn normalize_locale(locale: &str) -> String {

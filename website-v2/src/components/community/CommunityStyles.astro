@@ -1,0 +1,577 @@
+---
+/**
+ * 社区页(反馈 / 路线图 / 投票 / Logo)React 岛共用样式。
+ * React 渲染的标记无法被 Astro 作用域样式命中,故用全局样式并放入 components 层,
+ * 以保证 Tailwind 工具类仍可覆盖;首行重申层顺序,避免本样式先于 global.css 加载时打乱层级。
+ */
+---
+
+<style is:global>
+  @layer theme, base, components, utilities;
+
+  @layer components {
+    .btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* ── Tabs ── */
+    .cm-tabs {
+      display: inline-flex;
+      gap: 2px;
+      max-width: 100%;
+      padding: 3px;
+      border-radius: 10px;
+      background: var(--bg-sunken);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .cm-tabs [role="tab"] {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      height: 32px;
+      padding-inline: 12px;
+      border-radius: 7px;
+      font-size: 13px;
+      font-weight: 520;
+      color: var(--fg-muted);
+      white-space: nowrap;
+      transition:
+        color 160ms,
+        background-color 160ms,
+        box-shadow 160ms;
+    }
+    .cm-tabs [role="tab"]:hover {
+      color: var(--fg);
+    }
+    .cm-tabs [role="tab"][aria-selected="true"] {
+      color: var(--fg);
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line-strong) inset,
+        0 1px 2px oklch(0 0 0 / 0.06);
+    }
+    .cm-tabs-line {
+      gap: 4px;
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+    .cm-tabs-line [role="tab"] {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      letter-spacing: 0.04em;
+      border-radius: 6px;
+    }
+    .cm-tabs-line [role="tab"][aria-selected="true"] {
+      color: var(--accent-ink);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 1px var(--accent-line) inset;
+    }
+
+    /* ── Labels / state ── */
+    .cm-label,
+    .cm-state {
+      --c: var(--fg-subtle);
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      font-weight: 500;
+      line-height: 1;
+      white-space: nowrap;
+      color: color-mix(in oklch, var(--c) 72%, var(--fg));
+      background: color-mix(in oklch, var(--c) 13%, transparent);
+      box-shadow: 0 0 0 1px color-mix(in oklch, var(--c) 40%, transparent) inset;
+    }
+    .cm-label {
+      height: 20px;
+      padding-inline: 7px;
+      font-size: 11px;
+    }
+    .cm-state {
+      --c: var(--ok);
+      gap: 5px;
+      height: 24px;
+      padding-inline: 9px;
+      font-size: 12px;
+    }
+    .cm-state-completed {
+      --c: var(--accent);
+    }
+    .cm-state-not_planned,
+    .cm-state-duplicate {
+      --c: var(--fg-subtle);
+    }
+    .cm-status {
+      display: inline-flex;
+      align-items: center;
+      height: 22px;
+      padding-inline: 8px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--accent-ink);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 1px var(--accent-line) inset;
+    }
+
+    /* ── Issue table ── */
+    .cm-table {
+      width: 100%;
+      min-width: 760px;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+    .cm-table th {
+      height: 38px;
+      padding: 0 16px;
+      text-align: left;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      white-space: nowrap;
+      color: var(--fg-subtle);
+      background: var(--bg-sunken);
+      border-bottom: 1px solid var(--line);
+    }
+    .cm-table td {
+      padding: 12px 16px;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+    }
+    .cm-table :is(th, td):first-child {
+      padding-left: clamp(20px, 4vw, 56px);
+    }
+    .cm-table :is(th, td):last-child {
+      padding-right: clamp(20px, 4vw, 56px);
+    }
+    .cm-table tbody tr:last-child td {
+      border-bottom: 0;
+    }
+    .cm-row {
+      cursor: pointer;
+      transition: background-color 120ms;
+    }
+    .cm-row:hover {
+      background: var(--bg-sunken);
+    }
+    .cm-row-title {
+      color: var(--fg);
+    }
+    .cm-row:hover .cm-row-title > .line-clamp-2 {
+      color: var(--accent-ink);
+    }
+    .cm-group td {
+      padding-block: 8px;
+      background: var(--bg-sunken);
+    }
+    .cm-sort {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font: inherit;
+      letter-spacing: inherit;
+      text-transform: inherit;
+      color: inherit;
+      transition: color 160ms;
+    }
+    .cm-sort:hover,
+    .cm-sort.is-active {
+      color: var(--fg);
+    }
+    .cm-sort.is-active svg {
+      color: var(--accent-ink);
+    }
+
+    /* ── Cards ── */
+    .cm-card {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      width: 100%;
+      padding: 14px;
+      text-align: left;
+      border-radius: 8px;
+      background: var(--bg-elev);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      transition:
+        box-shadow 160ms,
+        transform 160ms var(--ease-out);
+    }
+    .cm-card:hover {
+      transform: translateY(-1px);
+      box-shadow:
+        0 0 0 1px var(--line-strong) inset,
+        var(--shadow-float);
+    }
+    .cm-card-accent {
+      padding-left: 18px;
+    }
+    .cm-card-accent::before {
+      content: "";
+      position: absolute;
+      top: 12px;
+      bottom: 12px;
+      left: 0;
+      width: 2px;
+      background: var(--c);
+      opacity: 0.75;
+    }
+    .cm-dashed {
+      border: 1px dashed var(--line-strong);
+      border-radius: 8px;
+    }
+    .cm-columns {
+      scrollbar-width: thin;
+    }
+
+    /* ── Issue dialog ── */
+    .cm-dialog {
+      width: min(720px, calc(100vw - 24px));
+      max-width: none;
+      max-height: none;
+      margin: 6vh auto auto;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: var(--fg);
+      overflow: visible;
+    }
+    .cm-dialog::backdrop {
+      background: color-mix(in oklch, var(--bg) 62%, transparent);
+      backdrop-filter: blur(4px);
+    }
+    .cm-dialog-panel {
+      display: flex;
+      flex-direction: column;
+      max-height: min(86vh, 900px);
+      overflow: hidden;
+      border-radius: 12px;
+      background: var(--bg);
+      box-shadow:
+        0 0 0 1px var(--line-strong),
+        var(--shadow-window);
+    }
+    .cm-dialog[open] .cm-dialog-panel {
+      animation: cm-rise 220ms var(--ease-out);
+    }
+    html:has(.cm-dialog[open]) {
+      overflow: hidden;
+    }
+    .cm-post-dev {
+      border-left: 2px solid var(--accent);
+    }
+
+    /* ── Markdown body ── */
+    .cm-md {
+      font-size: 14px;
+      line-height: 1.65;
+      color: var(--fg-muted);
+      overflow-wrap: anywhere;
+    }
+    .cm-md > * + * {
+      margin-top: 0.6em;
+    }
+    .cm-md :is(h3, h4) {
+      margin-top: 1.1em;
+      font-weight: 600;
+      color: var(--fg);
+    }
+    .cm-md h3 {
+      font-size: 15px;
+    }
+    .cm-md h4 {
+      font-size: 14px;
+    }
+    .cm-md > :first-child {
+      margin-top: 0;
+    }
+    .cm-md strong {
+      font-weight: 600;
+      color: var(--fg);
+    }
+    .cm-md code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      color: var(--accent-ink);
+      background: var(--bg-inset);
+    }
+    .cm-md ul {
+      padding-left: 1.25em;
+      list-style: disc;
+    }
+    .cm-md li::marker {
+      color: var(--fg-subtle);
+    }
+
+    /* ── Feedback type (radio cells) ── */
+    .cm-choice {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 16px 8px;
+      text-align: center;
+      color: var(--fg-muted);
+      cursor: pointer;
+      transition:
+        color 160ms,
+        background-color 160ms,
+        box-shadow 160ms;
+    }
+    .cm-choice:hover {
+      color: var(--fg);
+      background: var(--bg-sunken);
+    }
+    .cm-choice.is-checked {
+      color: var(--accent-ink);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 1px var(--accent) inset;
+    }
+    .cm-choice:has(:focus-visible) {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+    }
+
+    /* ── Feature vote ── */
+    .cm-feature {
+      position: relative;
+      display: flex;
+      align-items: flex-start;
+      gap: clamp(12px, 2vw, 18px);
+      padding: 18px clamp(14px, 2.4vw, 22px);
+    }
+    .cm-feature::before {
+      content: "";
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      width: var(--pct, 0%);
+      height: 2px;
+      background: var(--accent);
+      opacity: 0.8;
+      transition: width 700ms var(--ease-out);
+    }
+    .cm-feature.is-new {
+      box-shadow: 0 0 0 1px var(--accent) inset;
+    }
+    .cm-feature > button:first-of-type:hover .truncate {
+      color: var(--accent-ink);
+    }
+    .cm-rank {
+      flex: none;
+      width: 24px;
+      padding-top: 3px;
+      font-size: 12px;
+      color: var(--fg-subtle);
+    }
+    .cm-rank.is-top {
+      color: var(--accent-ink);
+    }
+    .cm-vote {
+      flex: none;
+      align-self: center;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-width: 64px;
+      height: 34px;
+      padding-inline: 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: var(--fg-muted);
+      background: var(--bg-elev);
+      box-shadow: 0 0 0 1px var(--line-strong) inset;
+      transition:
+        color 160ms,
+        background-color 160ms,
+        box-shadow 160ms,
+        transform 160ms var(--ease-out);
+    }
+    .cm-vote:hover {
+      color: var(--accent-ink);
+      box-shadow: 0 0 0 1px var(--accent-line) inset;
+    }
+    .cm-vote:active {
+      transform: scale(0.96);
+    }
+    .cm-vote.is-on {
+      color: var(--accent-fg);
+      background: var(--accent);
+      box-shadow: 0 6px 18px -8px color-mix(in oklch, var(--accent) 70%, transparent);
+    }
+    .cm-vote.is-on svg {
+      animation: cm-pop 360ms var(--ease-spring);
+    }
+    .cm-vote:disabled {
+      opacity: 0.55;
+      cursor: wait;
+    }
+    .cm-propose {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      height: 52px;
+      font-size: 14px;
+      color: var(--fg-muted);
+      transition:
+        color 160ms,
+        border-color 160ms,
+        background-color 160ms;
+    }
+    .cm-propose:hover {
+      color: var(--fg);
+      border-color: var(--accent-line);
+      background: var(--bg-sunken);
+    }
+    .cm-page {
+      display: inline-grid;
+      place-items: center;
+      min-width: 34px;
+      height: 34px;
+      padding-inline: 8px;
+      border-radius: 7px;
+      font-size: 13px;
+      color: var(--fg-muted);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      transition:
+        color 160ms,
+        box-shadow 160ms;
+    }
+    .cm-page:hover:not(:disabled) {
+      color: var(--fg);
+      box-shadow: 0 0 0 1px var(--line-strong) inset;
+    }
+    .cm-page.is-active {
+      color: var(--accent-ink);
+      background: var(--accent-soft);
+      box-shadow: 0 0 0 1px var(--accent-line) inset;
+    }
+    .cm-page:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    /* ── Platform poll ── */
+    .cm-poll {
+      display: flex;
+      flex-direction: column;
+      min-height: 340px;
+      text-align: left;
+      transition:
+        background-color 200ms,
+        opacity 200ms,
+        box-shadow 200ms;
+    }
+    .cm-poll:not(:disabled):hover {
+      background: var(--bg-sunken);
+    }
+    .cm-poll:disabled {
+      cursor: default;
+    }
+    .cm-poll.is-mine {
+      background: color-mix(in oklch, var(--c) 6%, var(--bg));
+      box-shadow: 0 0 0 1px var(--c) inset;
+    }
+    .cm-poll.is-dim {
+      opacity: 0.6;
+    }
+    .cm-poll-icon {
+      display: grid;
+      place-items: center;
+      width: 40px;
+      height: 40px;
+      border-radius: 9px;
+      color: var(--c);
+      background: color-mix(in oklch, var(--c) 12%, transparent);
+      box-shadow: 0 0 0 1px color-mix(in oklch, var(--c) 30%, transparent) inset;
+    }
+    .cm-meter {
+      display: block;
+      height: 4px;
+      overflow: hidden;
+      border-radius: 2px;
+      background: var(--bg-inset);
+    }
+    .cm-meter > span {
+      display: block;
+      width: var(--pct, 0%);
+      height: 100%;
+      background: var(--c);
+      transition: width 900ms var(--ease-out);
+    }
+    @starting-style {
+      .cm-meter > span {
+        width: 0;
+      }
+    }
+
+    /* ── Logo results ── */
+    .cm-checker {
+      background-color: var(--bg-sunken);
+      background-image: repeating-conic-gradient(var(--bg-inset) 0 25%, transparent 0 50%);
+      background-size: 16px 16px;
+    }
+    .cm-logo {
+      position: relative;
+    }
+    .cm-logo.is-top::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      box-shadow: 0 0 0 1px var(--accent) inset;
+    }
+    .cm-logo-rank {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      padding: 3px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      line-height: 1;
+      color: var(--fg-muted);
+      background: var(--bg-elev);
+      box-shadow: 0 0 0 1px var(--line) inset;
+    }
+    .cm-logo.is-top .cm-logo-rank {
+      color: var(--accent-fg);
+      background: var(--accent);
+      box-shadow: none;
+    }
+
+    .cm-notice {
+      animation: cm-fade 240ms var(--ease-out);
+    }
+  }
+
+  @keyframes cm-rise {
+    from {
+      opacity: 0;
+      transform: translateY(8px) scale(0.985);
+    }
+  }
+  @keyframes cm-pop {
+    40% {
+      transform: scale(1.3) rotate(-12deg);
+    }
+  }
+  @keyframes cm-fade {
+    from {
+      opacity: 0;
+      transform: translateY(3px);
+    }
+  }
+</style>

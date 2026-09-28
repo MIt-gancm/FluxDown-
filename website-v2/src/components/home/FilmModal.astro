@@ -1,0 +1,112 @@
+---
+/**
+ * 产品短片弹窗:原生 <dialog>,由任意 `[data-film-open]` 触发;视频在首次打开时才加载。
+ * 短片(public/film/)由 /film/ 舞台逐帧截图后经 ffmpeg 合成,录制方法见 README。
+ */
+import { X } from "lucide-react";
+import { common } from "../../i18n/messages/common";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+---
+
+<dialog class="film" data-film aria-label="FluxDown film">
+  <div class="film-frame">
+    <button type="button" class="film-close" data-film-close aria-label={common[lang].nav.close}>
+      <X size={16} strokeWidth={2} />
+    </button>
+    <video
+      data-film-video
+      playsinline
+      controls
+      preload="none"
+      poster={`/film/fluxdown-film-${lang}.jpg`}
+      data-src={`/film/fluxdown-film-${lang}.mp4`}></video>
+  </div>
+</dialog>
+
+<script>
+  const dialog = document.querySelector<HTMLDialogElement>("[data-film]");
+  const video = dialog?.querySelector<HTMLVideoElement>("[data-film-video]");
+  if (dialog && video) {
+    const load = () => {
+      if (video.dataset.loaded) return;
+      video.dataset.loaded = "1";
+      video.src = video.dataset.src ?? "";
+    };
+    document.addEventListener("click", (event) => {
+      const target = event.target as Element | null;
+      if (target?.closest("[data-film-open]")) {
+        load();
+        dialog.showModal();
+        video.currentTime = 0;
+        void video.play().catch(() => {});
+      } else if (target?.closest("[data-film-close]") || target === dialog) {
+        dialog.close();
+      }
+    });
+    dialog.addEventListener("close", () => video.pause());
+  }
+</script>
+
+<style>
+  .film {
+    width: min(1200px, calc(100vw - 32px));
+    max-width: none;
+    max-height: none;
+    margin: auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    overflow: visible;
+  }
+  .film::backdrop {
+    background: oklch(0.1 0.01 265 / 0.72);
+    backdrop-filter: blur(10px);
+  }
+  .film[open] .film-frame {
+    animation: film-in 420ms var(--ease-out);
+  }
+  @keyframes film-in {
+    from {
+      opacity: 0;
+      transform: scale(0.96) translateY(10px);
+    }
+  }
+  .film-frame {
+    position: relative;
+    overflow: hidden;
+    border-radius: 14px;
+    background: #000;
+    box-shadow:
+      0 0 0 1px oklch(1 0 0 / 0.1),
+      0 40px 120px -20px oklch(0 0 0 / 0.8);
+  }
+  .film-frame video {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+  }
+  .film-close {
+    position: absolute;
+    right: 12px;
+    top: 12px;
+    z-index: 1;
+    display: grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 99px;
+    color: #fff;
+    background: oklch(0 0 0 / 0.5);
+    backdrop-filter: blur(8px);
+    transition: background-color 150ms;
+  }
+  .film-close:hover {
+    background: oklch(0 0 0 / 0.75);
+  }
+</style>

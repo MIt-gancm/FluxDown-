@@ -10,3 +10,4 @@ workspace = true
 fluxdown_ui_theme = { path = "../theme" }
 gpui.workspace = true
 gpui-base.workspace = true
+gpui-component.workspace = true

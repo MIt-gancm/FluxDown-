@@ -1,65 +1,60 @@
 //! 分类新增 / 编辑对话框：字段、校验与保存语义与
 //! `lib/src/widgets/category_edit_dialog.dart` 逐条对齐。
 
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{
+    ControlExt as _, DialogIntent, category_icon, dialog_title, field_error, form, form_field,
+    input_with_action, segmented_tabs,
+};
 use fluxdown_ui_i18n::Translator;
-use fluxdown_ui_theme::active_theme;
+use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
 use gpui::{
     App, AppContext as _, ClickEvent, Context, Div, Entity, InteractiveElement as _, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Icon, IconName, WindowExt as _,
-    button::ButtonVariant as ComponentButtonVariant,
-    dialog::DialogButtonProps,
+    Disableable as _, Icon, WindowExt as _,
+    button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
-    v_flex,
+    scroll::ScrollableElement as _,
 };
 
 use super::categories::{CategoryEntry, read_categories, write_categories};
 use crate::store::SettingsStore;
+use crate::ui::{danger_ghost_button, dialog_footer};
 
-/// Dart `CategoryIcon` 名（持久化的 wire 值）→ 本地可用图标。
+/// 图标选择器可选的 Dart `CategoryIcon` 名（持久化的 wire 值，顺序即网格顺序）。
 ///
-/// gpui-component 只内置一小组 Lucide 图标；没有对应矢量的名字回退到
-/// 语义最接近的图标（存储值不变，Flutter 端仍按原名渲染）。
-pub(crate) const CATEGORY_ICONS: &[(&str, IconName)] = &[
-    ("folders", IconName::Folder),
-    ("film", IconName::GalleryVerticalEnd),
-    ("music", IconName::Play),
-    ("fileText", IconName::File),
-    ("image", IconName::GalleryVerticalEnd),
-    ("archive", IconName::Inbox),
-    ("file", IconName::File),
-    ("code", IconName::SquareTerminal),
-    ("database", IconName::HardDrive),
-    ("gamepad", IconName::Bot),
-    ("globe", IconName::Globe),
-    ("bookmark", IconName::Star),
-    ("box", IconName::Inbox),
-    ("cpu", IconName::Cpu),
-    ("disc", IconName::MemoryStick),
-    ("font", IconName::ALargeSmall),
-    ("hardDrive", IconName::HardDrive),
-    ("library", IconName::BookOpen),
-    ("package2", IconName::Inbox),
-    ("pen", IconName::Replace),
-    ("printer", IconName::Frame),
-    ("smartphone", IconName::MemoryStick),
-    ("subtitles", IconName::CaseSensitive),
-    ("type", IconName::ALargeSmall),
-    ("zap", IconName::BatteryCharging),
+/// 渲染统一经 `fluxdown_ui_components::category_icon` 映射，与下载侧栏分类子项
+/// 显示一致（存储值不变，Flutter 端仍按原名渲染）。
+pub(crate) const CATEGORY_ICONS: &[&str] = &[
+    "folders",
+    "film",
+    "music",
+    "fileText",
+    "image",
+    "archive",
+    "file",
+    "code",
+    "database",
+    "gamepad",
+    "globe",
+    "bookmark",
+    "box",
+    "cpu",
+    "disc",
+    "font",
+    "hardDrive",
+    "library",
+    "package2",
+    "pen",
+    "printer",
+    "smartphone",
+    "subtitles",
+    "type",
+    "zap",
 ];
-
-/// 分类 wire 图标名 → 渲染图标；未知名字回退通用文件图标。
-pub(crate) fn icon_for(name: &str) -> IconName {
-    CATEGORY_ICONS
-        .iter()
-        .find(|(key, _)| *key == name)
-        .map_or(IconName::File, |(_, icon)| icon.clone())
-}
 
 /// 扩展名文本 → 规范化列表：逗号 / 中文逗号 / 空白分隔，去点、转小写、去空。
 pub(crate) fn parse_extensions(text: &str) -> Vec<String> {
@@ -145,10 +140,10 @@ pub(crate) fn open(
     );
     let view = cx.new(|cx| CategoryDialog::new(store, translator, existing, window, cx));
     let name = view.read(cx).name.clone();
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
         let view = view.clone();
         dialog
-            .title(title.clone())
+            .title(dialog_title(title.clone(), cx))
             .w(px(520.))
             .content(move |content, _, _| content.child(view.clone()))
     });
@@ -332,19 +327,18 @@ impl CategoryDialog {
         let title = self.t("deleteCategory");
         let description = self.t("deleteCategoryConfirm");
         let cancel = self.t("cancel");
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let store = store.clone();
             let id = id.clone();
             alert
-                .title(title.clone())
+                .title(dialog_title(title.clone(), cx))
                 .description(description.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(title.clone())
-                        .ok_variant(ComponentButtonVariant::Danger)
-                        .cancel_text(cancel.clone())
-                        .show_cancel(true),
-                )
+                .footer(fluxdown_ui_components::dialog_footer(
+                    Some(cancel.clone()),
+                    title.clone(),
+                    DialogIntent::Destructive,
+                    cx,
+                ))
                 .on_ok(move |_, window, cx| {
                     let id = id.clone();
                     store.update(cx, |store, cx| {
@@ -390,26 +384,22 @@ impl CategoryDialog {
         .detach();
     }
 
-    fn label(&self, key: &str, cx: &App) -> Div {
-        let tokens = active_theme(cx).tokens();
-        div()
-            .text_xs()
-            .font_weight(tokens.typography.sm.weight)
-            .text_color(tokens.colors.muted_foreground)
-            .child(self.t(key))
-    }
-
     fn render_icon_grid(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
         let colors = tokens.colors;
-        let mut grid = h_flex().flex_wrap().gap(tokens.spacing.xs);
-        for (name, icon) in CATEGORY_ICONS {
+        let mut grid = h_flex()
+            .flex_wrap()
+            .gap(tokens.spacing.xs + tokens.spacing.xxs);
+        for name in CATEGORY_ICONS {
             let selected = self.icon == *name;
             let name = *name;
+            // 本格是自建 div，悬停只在这里设置一次（未选中时）。
             grid = grid.child(
                 div()
                     .id(SharedString::from(format!("category-icon-{name}")))
-                    .size(px(30.))
+                    .size(CONTROL_HEIGHT)
                     .flex()
                     .items_center()
                     .justify_center()
@@ -427,8 +417,10 @@ impl CategoryDialog {
                         colors.muted_foreground
                     })
                     .cursor_pointer()
-                    .hover(move |style| style.bg(colors.muted))
-                    .child(Icon::new(icon.clone()).size(px(14.)))
+                    .when(!selected, |this| {
+                        this.hover(move |style| style.bg(extended.colors.row_hover))
+                    })
+                    .child(Icon::new(category_icon(name)).size(extended.icon.lg))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.icon = name.to_owned();
                         cx.notify();
@@ -438,145 +430,110 @@ impl CategoryDialog {
         grid
     }
 
-    fn render_mode_chip(
-        &self,
-        id: &'static str,
-        label_key: &str,
-        target: MatchMode,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let variant = if self.match_mode == target {
-            ButtonVariant::Primary
-        } else {
-            ButtonVariant::Secondary
-        };
-        button(id, self.t(label_key), variant, cx).on_click(cx.listener(
-            move |this, _: &ClickEvent, _, cx| {
-                this.match_mode = target;
-                this.error = None;
-                cx.notify();
-            },
-        ))
+    fn render_match_mode(&self, cx: &mut Context<Self>) -> Div {
+        let view = cx.entity();
+        form_field(
+            self.t("matchMode"),
+            h_flex().child(segmented_tabs(
+                "category-match-mode",
+                [self.t("matchByExtension"), self.t("matchByRegex")],
+                match self.match_mode {
+                    MatchMode::Extension => 0,
+                    MatchMode::Regex => 1,
+                },
+                move |index, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.match_mode = if index == 0 {
+                            MatchMode::Extension
+                        } else {
+                            MatchMode::Regex
+                        };
+                        this.error = None;
+                        cx.notify();
+                    });
+                },
+                cx,
+            )),
+            None,
+            cx,
+        )
     }
 
-    fn render_match_rules(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        let column = v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("matchMode", cx))
-            .child(
-                h_flex()
-                    .gap(tokens.spacing.sm)
-                    .child(self.render_mode_chip(
-                        "category-match-extension",
-                        "matchByExtension",
-                        MatchMode::Extension,
-                        cx,
-                    ))
-                    .child(self.render_mode_chip(
-                        "category-match-regex",
-                        "matchByRegex",
-                        MatchMode::Regex,
-                        cx,
-                    )),
-            )
-            .child(div().h(tokens.spacing.xs));
-        match self.match_mode {
-            MatchMode::Extension => column
-                .child(self.label("extensionsLabel", cx))
-                .child(Input::new(&self.extensions).w_full()),
-            MatchMode::Regex => column
-                .child(self.label("regexLabel", cx))
-                .child(Input::new(&self.regex).w_full()),
-        }
+    fn render_match_input(&self, cx: &mut Context<Self>) -> Div {
+        let (label, input) = match self.match_mode {
+            MatchMode::Extension => ("extensionsLabel", &self.extensions),
+            MatchMode::Regex => ("regexLabel", &self.regex),
+        };
+        form_field(
+            self.t(label),
+            Input::new(input).control(cx).w_full(),
+            None,
+            cx,
+        )
     }
 
     fn render_save_dir(&self, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
         let has_value = !self.save_dir.read(cx).value().trim().is_empty();
-        let mut row = h_flex()
+        let actions = h_flex()
             .gap(tokens.spacing.sm)
-            .items_center()
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.save_dir).w_full()),
+                Button::new("category-pick-dir")
+                    .outline()
+                    .label(self.t("browse"))
+                    .control(cx)
+                    .disabled(self.picking_dir)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.pick_dir(window, cx);
+                    })),
             )
-            .child(
-                button(
-                    "category-pick-dir",
-                    self.t("browse"),
-                    ButtonVariant::Secondary,
-                    cx,
+            .when(has_value, |this| {
+                this.child(
+                    Button::new("category-clear-dir")
+                        .ghost()
+                        .label(self.t("restoreDefaultPath"))
+                        .control(cx)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.save_dir
+                                .update(cx, |input, cx| input.set_value("", window, cx));
+                            cx.notify();
+                        })),
                 )
-                .disabled(self.picking_dir)
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.pick_dir(window, cx);
-                })),
-            );
-        if has_value {
-            row = row.child(
-                button(
-                    "category-clear-dir",
-                    self.t("restoreDefaultPath"),
-                    ButtonVariant::Ghost,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.save_dir
-                        .update(cx, |input, cx| input.set_value("", window, cx));
-                    cx.notify();
-                })),
-            );
-        }
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("categorySaveDir", cx))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(tokens.colors.muted_foreground)
-                    .child(self.t("categorySaveDirDesc")),
-            )
-            .child(row)
+            });
+        form_field(
+            self.t("categorySaveDir"),
+            input_with_action(Input::new(&self.save_dir).control(cx).w_full(), actions, cx),
+            Some(self.t("categorySaveDirDesc")),
+            cx,
+        )
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        let mut row = h_flex().w_full().items_center().gap(tokens.spacing.sm);
-        if self.can_delete() {
-            row = row.child(
-                button(
-                    "category-dialog-delete",
-                    self.t("deleteCategory"),
-                    ButtonVariant::Destructive,
-                    cx,
-                )
+        let delete = self.can_delete().then(|| {
+            danger_ghost_button("category-dialog-delete", self.t("deleteCategory"), cx)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     this.confirm_delete(window, cx);
-                })),
-            );
-        }
-        row.child(div().flex_1())
-            .child(
-                button(
-                    "category-dialog-cancel",
-                    self.t("cancel"),
-                    ButtonVariant::Secondary,
-                    cx,
-                )
-                .on_click(|_, window, cx| window.close_dialog(cx)),
-            )
-            .child(
-                button(
-                    "category-dialog-save",
-                    self.t("confirm"),
-                    ButtonVariant::Primary,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx))),
-            )
+                }))
+                .into_any_element()
+        });
+        dialog_footer(
+            delete,
+            [
+                Button::new("category-dialog-cancel")
+                    .outline()
+                    .label(self.t("cancel"))
+                    .control(cx)
+                    .on_click(|_, window, cx| window.close_dialog(cx))
+                    .into_any_element(),
+                Button::new("category-dialog-save")
+                    .primary()
+                    .label(self.t("confirm"))
+                    .control(cx)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx)))
+                    .into_any_element(),
+            ],
+            cx,
+        )
     }
 }
 
@@ -585,36 +542,43 @@ impl Render for CategoryDialog {
         let tokens = active_theme(cx).tokens().clone();
         let show_rules = !self.is_special_builtin();
         let show_dir = self.builtin_type() != Some("all");
-        let mut column = v_flex()
-            .w_full()
-            .gap(tokens.spacing.md)
-            .child(
-                v_flex()
-                    .gap(tokens.spacing.xs)
-                    .child(self.label("categoryName", cx))
-                    .child(Input::new(&self.name).w_full()),
-            )
-            .child(
-                v_flex()
-                    .gap(tokens.spacing.xs)
-                    .child(self.label("categoryIcon", cx))
-                    .child(self.render_icon_grid(cx)),
-            );
+        let mut body = form(cx)
+            .child(form_field(
+                self.t("categoryName"),
+                Input::new(&self.name).control(cx).w_full(),
+                None,
+                cx,
+            ))
+            .child(form_field(
+                self.t("categoryIcon"),
+                self.render_icon_grid(cx),
+                None,
+                cx,
+            ));
         if show_rules {
-            column = column.child(self.render_match_rules(cx));
+            body = body
+                .child(self.render_match_mode(cx))
+                .child(self.render_match_input(cx));
         }
         if show_dir {
-            column = column.child(self.render_save_dir(cx));
+            body = body.child(self.render_save_dir(cx));
         }
-        if let Some(error) = self.error.clone() {
-            column = column.child(
+        div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap(tokens.spacing.lg)
+            .child(
                 div()
-                    .text_xs()
-                    .text_color(tokens.colors.destructive)
-                    .child(error),
-            );
-        }
-        column.child(self.render_footer(cx))
+                    .w_full()
+                    .max_h(px(480.))
+                    .overflow_y_scrollbar()
+                    .child(body),
+            )
+            .when_some(self.error.clone(), |this, error| {
+                this.child(field_error(error, cx))
+            })
+            .child(self.render_footer(cx).pt(tokens.spacing.sm))
     }
 }
 
@@ -647,11 +611,5 @@ mod tests {
         assert!(!regex_looks_valid(r"abc)"));
         assert!(!regex_looks_valid(r"[abc"));
         assert!(!regex_looks_valid(r"abc\"));
-    }
-
-    #[test]
-    fn icon_lookup_falls_back_to_file() {
-        assert!(matches!(icon_for("cpu"), IconName::Cpu));
-        assert!(matches!(icon_for("nope"), IconName::File));
     }
 }

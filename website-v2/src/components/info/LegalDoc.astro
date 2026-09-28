@@ -1,0 +1,222 @@
+---
+/**
+ * 法务 / 政策类长文骨架:PageHeader + 粘性章节目录 + `.prose` 正文。
+ *
+ * - 章节标题前缀两位 mono 序号,目录与标题同源;滚动时由 IntersectionObserver 标记当前章节。
+ * - `intro` / `body` / `items` 允许内联 HTML(来自 i18n 静态字面量);`{key}` 占位符由 `links` 替换为本地化站内链接。
+ * - 默认插槽渲染在引言与第一章之间(如代码签名流程图)。
+ */
+import PageHeader from "@/components/site/PageHeader.astro";
+
+interface Section {
+  id: string;
+  title: string;
+  body: string;
+  items: readonly string[];
+}
+
+interface Props {
+  eyebrow: string;
+  title: string;
+  updatedLabel: string;
+  updated: string;
+  indexLabel: string;
+  intro: string;
+  sections: readonly Section[];
+  links?: Record<string, string>;
+}
+
+const { eyebrow, title, updatedLabel, updated, indexLabel, intro, sections, links = {} } = Astro.props;
+
+const fill = (html: string) => html.replace(/\{(\w+)\}/g, (m, key: string) => links[key] ?? m);
+const n = (i: number) => String(i + 1).padStart(2, "0");
+---
+
+<PageHeader eyebrow={eyebrow} title={title}>
+  <span class="updated mono num">
+    <span class="text-subtle">{updatedLabel}</span>
+    <span aria-hidden="true" class="text-line-strong">/</span>
+    <span>{updated}</span>
+  </span>
+</PageHeader>
+
+<section class="frame">
+  <div class="section-tight grid gap-10 lg:grid-cols-[232px_minmax(0,1fr)] lg:gap-16">
+    <nav class="toc" aria-label={indexLabel}>
+      <p class="eyebrow-plain mb-4">{indexLabel}</p>
+      <ol>
+        {
+          sections.map((s, i) => (
+            <li>
+              <a href={`#${s.id}`} data-toc={s.id}>
+                <span class="mono num toc-n">{n(i)}</span>
+                <span>{s.title}</span>
+              </a>
+            </li>
+          ))
+        }
+      </ol>
+    </nav>
+
+    <article class="prose legal">
+      <p class="legal-intro" set:html={fill(intro)} />
+      <slot />
+      {
+        sections.map((s, i) => (
+          <Fragment>
+            <h2 id={s.id} data-toc-target>
+              <span class="mono num legal-n" aria-hidden="true">
+                {n(i)}
+              </span>
+              {s.title}
+            </h2>
+            {s.body && <p set:html={fill(s.body)} />}
+            {s.items.length > 0 && (
+              <ul>
+                {s.items.map((item) => (
+                  <li set:html={fill(item)} />
+                ))}
+              </ul>
+            )}
+          </Fragment>
+        ))
+      }
+    </article>
+  </div>
+</section>
+
+<script>
+  const links = new Map<string, HTMLAnchorElement>();
+  document.querySelectorAll<HTMLAnchorElement>("[data-toc]").forEach((a) => links.set(a.dataset.toc!, a));
+  const targets = [...document.querySelectorAll<HTMLElement>("[data-toc-target]")];
+  if (targets.length && "IntersectionObserver" in window) {
+    const visible = new Set<string>();
+    const mark = () => {
+      const current = targets.find((t) => visible.has(t.id))?.id;
+      links.forEach((a, id) => {
+        if (id === current) a.setAttribute("aria-current", "true");
+        else a.removeAttribute("aria-current");
+      });
+    };
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting) visible.add(e.target.id);
+          else visible.delete(e.target.id);
+        }
+        mark();
+      },
+      { rootMargin: "-80px 0px -55% 0px" },
+    );
+    targets.forEach((t) => io.observe(t));
+  }
+</script>
+
+<style>
+  .updated {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    height: 28px;
+    padding-inline: 10px;
+    border: 1px dashed var(--line-strong);
+    border-radius: 6px;
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    color: var(--fg-muted);
+  }
+
+  .toc {
+    align-self: start;
+    padding: 18px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+  }
+  .toc ol {
+    display: grid;
+    gap: 2px;
+  }
+  .toc a {
+    display: flex;
+    gap: 12px;
+    padding: 6px 8px;
+    margin-inline: -8px;
+    border-radius: 6px;
+    font-size: 13.5px;
+    line-height: 1.4;
+    color: var(--fg-muted);
+    transition:
+      color 160ms,
+      background-color 160ms;
+  }
+  .toc a:hover {
+    color: var(--fg);
+    background: var(--bg-inset);
+  }
+  .toc a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 0;
+  }
+  .toc a[aria-current="true"] {
+    color: var(--fg);
+  }
+  .toc a[aria-current="true"] .toc-n {
+    color: var(--accent-ink);
+  }
+  .toc-n {
+    flex: none;
+    padding-top: 1px;
+    font-size: 11.5px;
+    color: var(--fg-subtle);
+    transition: color 160ms;
+  }
+  @media (min-width: 1024px) {
+    .toc {
+      position: sticky;
+      top: calc(var(--header-h) + 28px);
+      padding: 0;
+      border: 0;
+      background: none;
+    }
+    .toc ol {
+      border-left: 1px solid var(--line);
+      padding-left: 14px;
+      margin-left: 0;
+    }
+    .toc a {
+      position: relative;
+    }
+    .toc a[aria-current="true"]::before {
+      content: "";
+      position: absolute;
+      left: -15px;
+      top: 6px;
+      bottom: 6px;
+      width: 1px;
+      background: var(--accent);
+    }
+  }
+
+  .legal {
+    max-width: 74ch;
+  }
+  .legal-intro {
+    font-size: 1.06rem;
+    color: var(--fg);
+  }
+  .legal h2 {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+  }
+  .legal h2:first-of-type {
+    margin-top: 2em;
+  }
+  .legal-n {
+    font-size: 0.62em;
+    font-weight: 500;
+    letter-spacing: 0.06em;
+    color: var(--accent-ink);
+  }
+</style>

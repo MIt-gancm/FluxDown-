@@ -4,31 +4,49 @@
 //! 创建后以 [`ShellRoute`] 注入。
 
 mod assets;
-mod strings;
 mod view;
 
-use gpui::{SharedString, WindowDecorations, WindowOptions, size};
+use gpui::{Pixels, Point, SharedString, WindowDecorations, WindowOptions, point, px, size};
 use gpui_component::TitleBar;
 
 pub use assets::*;
 pub use view::*;
 
-/// 构造 FluxDown 主窗口选项。
-pub fn main_window_options() -> WindowOptions {
+/// 交通灯对齐的顶栏高度（逻辑像素）：窗口创建时写入平台窗口选项，是窗口级而非主题值，
+/// 取 `density.titleBar` 的默认值（该 token 同样不随界面缩放）。标题栏本身按 token 渲染。
+const TITLE_BAR_HEIGHT_PX: f32 = 40.;
+/// macOS 交通灯按钮框高度（AppKit 标准窗口按钮 14×16 的高）。
+const TRAFFIC_LIGHT_BUTTON_HEIGHT_PX: f32 = 16.;
+/// 交通灯纵向偏移：按钮框在顶栏内垂直居中；横向与纵向留白一致。
+const TRAFFIC_LIGHT_INSET_PX: f32 = (TITLE_BAR_HEIGHT_PX - TRAFFIC_LIGHT_BUTTON_HEIGHT_PX) / 2.;
+
+/// 交通灯在 [`TITLE_BAR_HEIGHT_PX`] 高的标题栏内垂直居中的位置。
+fn traffic_light_position() -> Point<Pixels> {
+    point(px(TRAFFIC_LIGHT_INSET_PX), px(TRAFFIC_LIGHT_INSET_PX))
+}
+
+/// 以 gpui-component `TitleBar` 窗口选项为基础，交通灯改为对齐 shell 标题栏高度。
+fn shell_window_options() -> WindowOptions {
     let mut options = TitleBar::window_options();
-    options.window_min_size = Some(size(gpui::px(720.), gpui::px(520.)));
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        titlebar.traffic_light_position = Some(traffic_light_position());
+    }
+    options.window_min_size = Some(size(px(720.), px(520.)));
     options.window_decorations = Some(WindowDecorations::Client);
     options
 }
 
+/// 构造 FluxDown 主窗口选项。
+pub fn main_window_options() -> WindowOptions {
+    shell_window_options()
+}
+
 /// 构造使用 FluxDown 自定义标题栏的辅助窗口选项。
 pub fn auxiliary_window_options(title: impl Into<SharedString>) -> WindowOptions {
-    let mut options = TitleBar::window_options();
+    let mut options = shell_window_options();
     if let Some(titlebar) = options.titlebar.as_mut() {
         titlebar.title = Some(title.into());
     }
-    options.window_min_size = Some(size(gpui::px(720.), gpui::px(520.)));
-    options.window_decorations = Some(WindowDecorations::Client);
     options
 }
 
@@ -48,7 +66,7 @@ mod tests {
                 .titlebar
                 .as_ref()
                 .and_then(|titlebar| titlebar.traffic_light_position),
-            Some(point(px(9.), px(9.)))
+            Some(point(px(12.), px(12.)))
         );
         assert_eq!(
             options
@@ -81,7 +99,7 @@ mod tests {
                 .titlebar
                 .as_ref()
                 .and_then(|titlebar| titlebar.traffic_light_position),
-            Some(point(px(9.), px(9.)))
+            Some(point(px(12.), px(12.)))
         );
         assert_eq!(options.window_min_size, Some(size(px(720.), px(520.))));
         assert_eq!(

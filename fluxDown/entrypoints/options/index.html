@@ -199,6 +199,13 @@
           <div class="opt-row-info">
             <div class="opt-row-title" data-i18n="settings.interceptMode">Intercept Mode</div>
             <div class="opt-row-desc" id="modeHint"></div>
+            <div class="opt-row-desc opt-row-note">
+              <svg class="opt-row-note-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                <circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" />
+                <path d="M12 7v5m0 4h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+              <span data-i18n="settings.localDownloadHint">Locally generated blob:/data: files are not supported and use the browser download</span>
+            </div>
           </div>
           <div class="opt-row-control">
             <select id="interceptModeSelect">
@@ -234,7 +241,16 @@
               <option value="1048576">1 MB</option>
               <option value="5242880">5 MB</option>
               <option value="10485760">10 MB</option>
+              <option value="52428800">50 MB</option>
+              <option value="104857600">100 MB</option>
+              <option value="209715200">200 MB</option>
+              <option value="524288000">500 MB</option>
+              <option value="custom" data-i18n="options.rules.minFileSizeCustom">Custom</option>
             </select>
+            <div class="ext-input-row hidden" id="minSizeCustomRow">
+              <input type="number" id="minSizeCustomInput" min="0" step="1" inputmode="numeric"
+                data-i18n-placeholder="options.rules.minFileSizeCustomPlaceholder" placeholder="MB" autocomplete="off">
+            </div>
           </div>
         </div>
 
@@ -253,6 +269,20 @@
               <summary data-i18n="options.rules.builtinExts">Built-in extensions</summary>
               <div class="tags-container opt-tags" id="builtinExtList"></div>
             </details>
+          </div>
+        </div>
+
+        <div class="opt-row opt-row-stack">
+          <div class="opt-row-info">
+            <div class="opt-row-title" data-i18n="options.rules.excludeExtTitle">Excluded Extensions</div>
+            <div class="opt-row-desc" data-i18n="options.rules.excludeExtDesc">Downloads matching these extensions are never intercepted, even if they also match the include list above (e.g. .torrent, .crx).</div>
+          </div>
+          <div class="opt-rule-editor">
+            <div class="ext-input-row">
+              <input type="text" id="excludeExtInput" data-i18n-placeholder="options.rules.excludeExtPlaceholder" placeholder="e.g. .torrent" autocomplete="off">
+              <button class="btn-small accent" id="excludeExtAddBtn" data-i18n="options.rules.add">Add</button>
+            </div>
+            <div class="tags-container opt-tags" id="excludeExtList"></div>
           </div>
         </div>
 

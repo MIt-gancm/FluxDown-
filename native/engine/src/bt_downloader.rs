@@ -46,8 +46,10 @@ use tokio_util::sync::CancellationToken;
 use crate::bt_seeding::{SeedingManager, SeedingRegistration, UnregisteredSeed};
 use crate::db::Db;
 use crate::downloader::{DownloadError, ProgressUpdate, SegmentProgressInfo};
+use crate::events::EventSink;
 use crate::logger::{log_error, log_info};
 use crate::model::{BtFileEntry, TorrentMetaResult};
+use crate::output;
 use crate::selection::{HostSelection, SelectionOutcome};
 
 // ---------------------------------------------------------------------------
@@ -244,6 +246,20 @@ fn hex_val(b: u8) -> Option<u8> {
         _ => None,
     }
 }
+
+/// Upper bound for the BT runtime's blocking pool (tokio default: 512).
+///
+/// librqbit resolves every tracker hostname with `tokio::net::lookup_host`
+/// (one `spawn_blocking` getaddrinfo per tracker per torrent), so starting
+/// ~20 torrents × ~80 trackers fans out ~1700 concurrent lookups and grows the
+/// pool to the cap; the per-chunk `block_in_place` hand-offs then keep waking
+/// those idle threads round-robin so they never hit the keep-alive and stay
+/// alive for the whole session (observed: 520 `bt-runtime` threads).
+/// getaddrinfo is serialized by the system resolver anyway: the same burst
+/// finishes *faster* with 64 threads (0.37 s vs 0.49 s), and a loopback swarm
+/// keeps identical throughput down to a cap of 16. 64 leaves headroom for the
+/// long-running `spawn_blocking` work (completion moves, full re-verification).
+const BT_MAX_BLOCKING_THREADS: usize = 64;
 
 /// Well-known public trackers used to accelerate peer discovery for magnet
 /// links that ship without `tr=` parameters.
@@ -588,6 +604,7 @@ impl SharedBtSession {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(worker_threads)
+            .max_blocking_threads(BT_MAX_BLOCKING_THREADS)
             .thread_name("bt-runtime")
             .build()
             .map_err(|e| DownloadError::Other(format!("failed to build BT runtime: {e}")))?;
@@ -1398,6 +1415,7 @@ pub struct BtDownloadParams {
     pub save_dir: String,
     pub db: Db,
     pub progress_tx: mpsc::Sender<ProgressUpdate>,
+    pub sink: Arc<dyn EventSink>,
     pub cancel_token: CancellationToken,
     /// Handle to the shared BT session.
     pub session: Arc<Session>,
@@ -1479,6 +1497,7 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
     });
 
     let progress_tx = params.progress_tx.clone();
+    let sink = params.sink.clone();
     let db = params.db.clone();
     let torrent_source = params.torrent_source.clone();
     let save_dir = params.save_dir.clone();
@@ -1503,6 +1522,7 @@ pub async fn run_bt_download(params: BtDownloadParams) -> Result<(), DownloadErr
         save_dir,
         db,
         progress_tx,
+        sink,
         cancelled: cancelled_clone,
         session,
         shared_bt,
@@ -1588,6 +1608,7 @@ struct BtInnerParams {
     save_dir: String,
     db: Db,
     progress_tx: mpsc::Sender<ProgressUpdate>,
+    sink: Arc<dyn EventSink>,
     cancelled: Arc<AtomicBool>,
     session: Arc<Session>,
     shared_bt: Arc<SharedBtSession>,
@@ -2084,15 +2105,21 @@ struct CompletionLayout {
 ///   merge/replace children only in this mode.
 ///
 /// Layout decisions:
-/// - **All-selected multi-file torrent** → preserve rqbit's default
+/// - **All-selected multi-file torrent, or a partial multi-file selection
+///   that still contains a sub-directory** → preserve rqbit's default
 ///   `save_dir/<torrent name>/...` layout even though FluxDown downloads into
 ///   a task-scoped staging dir.  The torrent root is always the outer final
-///   container; selected relative paths remain the content paths inside it.
-/// - **Single file (partial or otherwise)** → single-file flat move (basename
-///   only, no container, optional `custom_name` rename).
-/// - **Partial selection of multiple files** → per-file flat move; basenames
-///   are deduped against save_dir AND against in-batch siblings.  `custom_name`
-///   does not apply (no obvious "container" to rename).
+///   container; selected relative paths (including any sub-directories, even
+///   when only some sibling files were selected) remain the content paths
+///   inside it.  (#543: a flat per-basename move previously dropped every
+///   sub-directory whenever the selection was partial.)
+/// - **Single file selected from a single-file torrent (or a multi-file
+///   torrent whose one selected file sits at the top level)** → single-file
+///   flat move (basename only, no container, optional `custom_name` rename).
+/// - **Partial selection of multiple files that are all top-level (no
+///   sub-directory among them)** → per-file flat move; basenames are deduped
+///   against save_dir AND against in-batch siblings.  `custom_name` does not
+///   apply (no obvious "container" to rename).
 ///
 /// The reason completion is driven by selected metadata paths (and never by reading
 /// staging dir contents) is that BT pieces span file boundaries, so librqbit
@@ -2177,7 +2204,18 @@ fn compute_completion_layout(input: CompletionLayoutInput<'_>) -> Option<Complet
     // here and preserve every torrent-relative path below it. If a valid
     // torrent happens to contain an inner directory with the same name as the
     // torrent root, that inner component must remain (`Root/Root/file`).
-    if all_selected && is_multi_file_torrent {
+    //
+    // #543: this must also trigger for a *partial* multi-file selection as
+    // long as at least one selected file lives under a sub-directory —
+    // otherwise the flat per-basename branch below silently drops that
+    // sub-directory structure. A partial selection whose files are all
+    // top-level keeps the flat-move behavior (no container to build).
+    let has_selected_subdir = selected_files.iter().any(|file| {
+        file.relative_path
+            .parent()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+    });
+    if is_multi_file_torrent && (all_selected || has_selected_subdir) {
         let final_top = match reuse_top {
             Some(n) if !save_dir.join(n).exists() || save_dir.join(n).is_dir() => n.to_string(),
             _ => dedup_name_in_dir(save_dir, desired_container, claimed, allow_overwrite),
@@ -2198,7 +2236,9 @@ fn compute_completion_layout(input: CompletionLayoutInput<'_>) -> Option<Complet
         });
     }
 
-    // Single-file flat move (single selected file regardless of all_selected).
+    // Single-file flat move: reached only when the container branch above
+    // did not fire — i.e. a genuinely single-file torrent, or a multi-file
+    // torrent whose one selected file sits at the top level (no sub-dir).
     if selected_files.len() == 1 {
         let file = &selected_files[0];
         let rel = &file.relative_path;
@@ -2231,7 +2271,9 @@ fn compute_completion_layout(input: CompletionLayoutInput<'_>) -> Option<Complet
         });
     }
 
-    // Per-file flat move: covers all-selected flat torrent + partial multi.
+    // Per-file flat move: covers an all-top-level flat torrent (all
+    // selected or partial) — no selected file has a sub-directory, so
+    // there is nothing for the container branch above to preserve.
     // Dedup each basename against save_dir AND against names already chosen
     // in this batch so two staged files cannot collide on the same dst.
     // `taken` 存小写折叠名:批内两个仅大小写不同的 basename(种子内合法)
@@ -2443,7 +2485,7 @@ fn move_file(src: &Path, dst: &Path, budget: &mut u32, replace: bool) -> std::io
 /// 单个子项失败**不中止兄弟项**(尽量多移,减少下一轮重试量),记录首个
 /// 错误于循环结束后返回——上层将本次 completion 标 ERROR 并保留重试。
 fn move_dir_recursive(src: &Path, dst: &Path, budget: &mut u32) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
+    output::ensure_dir_sync(dst)?;
     let mut first_err: Option<std::io::Error> = None;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
@@ -2526,10 +2568,8 @@ fn move_completion_item(
         ));
     }
 
-    if let Some(parent) = dst.parent()
-        && !parent.exists()
-    {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(parent) = dst.parent() {
+        output::ensure_dir_sync(parent)?;
     }
     if retrying_completion && task_owned_container && dst.exists() {
         move_path_with_file_replace(src, dst, true)?;
@@ -2611,6 +2651,24 @@ fn build_bt_segments(
     )
 }
 
+/// BT peers come from librqbit live statistics; virtual geometry is not concurrency.
+fn bt_runtime(
+    task_id: &str,
+    total_bytes: i64,
+    connected_peers: Option<u32>,
+) -> crate::transfer_activity::TaskRuntime {
+    crate::transfer_activity::TaskRuntime {
+        task_id: task_id.to_owned(),
+        sampled_at_ms: chrono::Utc::now().timestamp_millis(),
+        sample_sequence: crate::transfer_activity::next_sample_sequence(),
+        active_transfers: None,
+        connected_peers,
+        parallelism_limit: None,
+        total_bytes,
+        segments: Vec::new(),
+    }
+}
+
 /// Multi-file torrent: map each file to a segment.
 fn build_multi_file_segments(
     total_bytes: i64,
@@ -2648,6 +2706,7 @@ fn build_multi_file_segments(
             // Clamp into `[0, span]` so a subset/total mismatch can never yield
             // a negative downloaded count.
             downloaded_bytes: (dl_bytes as i64).clamp(0, span),
+            active: None,
         });
     }
     segs
@@ -2709,6 +2768,7 @@ fn build_piece_scatter_segments(
                 start_byte: start,
                 end_byte: end,
                 downloaded_bytes: seg_dl.clamp(0, end - start + 1),
+                active: None,
             });
         }
         // Correction: ensure total visual bytes match actual downloaded_bytes
@@ -2789,6 +2849,7 @@ fn build_piece_scatter_segments(
             start_byte: start,
             end_byte: end,
             downloaded_bytes: dl.clamp(0, seg_size),
+            active: None,
         });
     }
 
@@ -3191,6 +3252,8 @@ async fn apply_only_files_after_init(
     only: &HashSet<usize>,
     task_id: &str,
     cancelled: &AtomicBool,
+    db: &Db,
+    sink: &dyn EventSink,
 ) -> bool {
     const MAX_ATTEMPTS: u32 = 5;
     for attempt in 1..=MAX_ATTEMPTS {
@@ -3241,6 +3304,19 @@ async fn apply_only_files_after_init(
                     MAX_ATTEMPTS,
                     e
                 );
+                if attempt < MAX_ATTEMPTS
+                    && let Err(journal_error) = crate::task_activity::record(
+                        db,
+                        sink,
+                        task_id,
+                        "retry",
+                        format!("BT 文件选择第 {attempt}/{MAX_ATTEMPTS} 次应用失败，即将重试：{e}"),
+                        None,
+                    )
+                    .await
+                {
+                    crate::log_error!("[task-activity] failed to persist retry: {}", journal_error);
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
@@ -3255,6 +3331,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         save_dir,
         db,
         progress_tx,
+        sink,
         cancelled,
         session,
         shared_bt,
@@ -3323,13 +3400,14 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         // Create the staging directory now (before librqbit does) so we can
         // immediately mark it hidden.  librqbit uses `overwrite: true` and
         // will reuse the directory if it already exists.
-        if let Err(e) = std::fs::create_dir_all(&stage_dir) {
+        if let Err(e) = output::ensure_dir_sync(&stage_dir) {
             log_info!(
                 "[BT] task={} failed to pre-create staging dir '{}': {}",
                 short_id(&task_id),
                 stage_dir.display(),
                 e
             );
+            return Err(e.into());
         } else {
             set_hidden(&stage_dir);
         }
@@ -3961,7 +4039,16 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     .filter(|&i| i >= 0)
                     .map(|i| i as usize)
                     .collect();
-                if apply_only_files_after_init(&session, &handle, &only, &task_id, &cancelled).await
+                if apply_only_files_after_init(
+                    &session,
+                    &handle,
+                    &only,
+                    &task_id,
+                    &cancelled,
+                    &db,
+                    sink.as_ref(),
+                )
+                .await
                 {
                     log_info!(
                         "[BT] task={} file selection applied post-add ({} file(s))",
@@ -4138,6 +4225,11 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 &file_offsets,
                 total_pieces,
                 init_pieces,
+            )),
+            runtime: Some(bt_runtime(
+                &task_id,
+                total_bytes,
+                stats.live.as_ref().map(|l| l.snapshot.peer_stats.live),
             )),
             ..Default::default()
         })
@@ -4899,6 +4991,11 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     error_message: String::new(),
                     file_name: completed_name,
                     segment_details: Some(finished_segs),
+                    runtime: Some(bt_runtime(
+                        &task_id,
+                        final_total,
+                        stats.live.as_ref().map(|l| l.snapshot.peer_stats.live),
+                    )),
                     upload_speed_bps: completed_upload_speed_bps,
                     bt_data_finished: false,
                     uploaded_bytes: completed_uploaded_bytes,
@@ -5061,6 +5158,11 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     error_message: String::new(),
                     file_name: String::new(),
                     segment_details: Some(seg_details),
+                    runtime: Some(bt_runtime(
+                        &task_id,
+                        total,
+                        stats.live.as_ref().map(|l| l.snapshot.peer_stats.live),
+                    )),
                     upload_speed_bps,
                     uploaded_bytes: cumulative_upload,
                     ..Default::default()
@@ -5352,24 +5454,23 @@ mod tests {
 
     #[test]
     fn completion_layout_dedup_uses_numeric_suffix() {
-        // Two selected files with the same basename in different sub-dirs:
-        // their flat destinations collide and must be deduped as
-        // "file.txt" + "file (1).txt", not "_file.txt".
-        let tmp = std::env::temp_dir().join(format!(
-            "fluxdown_bt_test_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let _ = std::fs::create_dir_all(&tmp);
-        let stage = tmp.join(".stage");
+        // Two top-level selected files whose basenames only differ by case
+        // collide (case-insensitive filesystems / Windows) once folded to
+        // lowercase, and must be deduped as "File.txt" + "file (1).txt",
+        // not "_file.txt". (Previously this test used two same-basename
+        // files in different sub-dirs to force the collision, but #543 made
+        // a partial multi-file selection containing a sub-directory take the
+        // container branch instead, where the sub-dirs no longer collide —
+        // so the case-fold collision below is used to keep exercising this
+        // in-batch numeric-suffix dedup path.)
+        let save = unique_test_dir("dedup_numeric_suffix");
+        let stage = save.join(".stage");
         let _ = std::fs::create_dir_all(&stage);
 
-        let selected = completion_files(&["dirA/file.txt", "dirB/file.txt"]);
+        let selected = completion_files(&["File.txt", "file.txt"]);
         let claims = HashSet::new();
         let layout = super::compute_completion_layout(super::CompletionLayoutInput {
-            save_dir: &tmp,
+            save_dir: &save,
             stage_dir: &stage,
             selected_files: &selected,
             all_selected: false,
@@ -5380,7 +5481,7 @@ mod tests {
             allow_overwrite: false,
             claimed: &claims,
         });
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_dir_all(&save);
 
         // Avoid `.unwrap()`/`.expect()` (denied by clippy) — match explicitly.
         let moves = match layout {
@@ -5398,10 +5499,55 @@ mod tests {
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("");
-        assert_eq!(dst0, "file.txt");
+        assert_eq!(dst0, "File.txt");
         assert_eq!(dst1, "file (1).txt");
         // No underscore-prefixed name should ever be produced.
         assert!(!dst1.starts_with('_'), "must not stack underscore prefixes");
+    }
+
+    /// #543: a *partial* multi-file selection that still contains a
+    /// sub-directory must preserve that sub-directory under the task's
+    /// container, not flatten it to a bare basename.
+    #[test]
+    fn completion_layout_partial_selection_with_subdir_preserves_container() {
+        let save = unique_test_dir("partial_subdir_container");
+        let stage = save.join(".stage");
+        let _ = std::fs::create_dir_all(&stage);
+        // Torrent has 3 files; user only selected 2, one of which sits under
+        // "sub/dir/".
+        let selected = completion_files(&["top.txt", "sub/dir/inner.bin"]);
+
+        let claims = HashSet::new();
+        let layout = super::compute_completion_layout(super::CompletionLayoutInput {
+            save_dir: &save,
+            stage_dir: &stage,
+            selected_files: &selected,
+            all_selected: false,
+            is_multi_file_torrent: true,
+            custom_name: "",
+            torrent_root_name: "Pack",
+            reuse_top: None,
+            allow_overwrite: false,
+            claimed: &claims,
+        });
+        let layout = match layout {
+            Some(v) => v,
+            None => panic!("layout should be Some"),
+        };
+
+        assert_eq!(layout.top_level_name, "Pack");
+        assert!(
+            layout.task_owned_container,
+            "partial selection with a sub-dir must still own its container"
+        );
+        assert_eq!(layout.moves.len(), 2);
+        assert_eq!(layout.moves[0].dst, save.join("Pack").join("top.txt"));
+        assert_eq!(
+            layout.moves[1].dst,
+            save.join("Pack").join("sub").join("dir").join("inner.bin")
+        );
+
+        let _ = std::fs::remove_dir_all(&save);
     }
 
     #[test]

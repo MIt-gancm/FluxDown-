@@ -75,6 +75,8 @@ pub enum PeerFault {
     Unrequested,
     /// 用 zlib 压缩帧（`OP_COMPRESSEDPART`）发送（正常路径变体）。
     Compressed,
+    /// Hold the first body response so tests can observe a pending peer read.
+    DelayBody,
 }
 
 /// 单文件 mock peer：按 leech 客户端期望的时序应答。
@@ -198,6 +200,10 @@ async fn serve_peer(
                     .map_err(DownloadError::Io)?;
             }
             OP_REQUESTPARTS | OP_REQUESTPARTS_I64 => {
+                if fault == PeerFault::DelayBody && !fired {
+                    fired = true;
+                    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                }
                 let large = opcode == OP_REQUESTPARTS_I64;
                 let rp = RequestParts::decode(&payload, large)?;
                 if fault == PeerFault::Unrequested && !fired {

@@ -5,20 +5,22 @@ use fluxdown_protocol::{
     ApplicationErrorCode, ComponentKind, ComponentStatusDto, ComponentVersions,
     DaemonConfigSnapshot, RpcErrorData,
 };
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, IconControlExt as _, card, input_with_action, tabular_numbers,
+};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AppContext as _, Context, Entity, Focusable as _, IntoElement, ParentElement,
-    SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
+    SharedString, Styled, Window, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _, StyledExt as _,
-    WindowExt as _,
-    button::{Button, ButtonVariant, ButtonVariants as _},
-    dialog::DialogButtonProps,
+    Disableable as _, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
     progress::Progress,
-    tag::Tag,
+    spinner::Spinner,
     v_flex,
 };
 
@@ -26,7 +28,7 @@ use super::Frame;
 use crate::{
     ExtensionsView,
     controller::{COMPONENT_KINDS, ComponentSummary, component_slot, component_summary},
-    error_text,
+    error_text, ui,
 };
 
 /// 组件标题文案键（插件依赖提醒也用它显示组件名）。
@@ -115,9 +117,12 @@ impl ExtensionsView {
         for kind in COMPONENT_KINDS {
             self.prepare_component(kind, window, cx);
         }
+        let theme = active_theme(cx);
         let frame = Frame {
             translator: self.translator.read(cx),
-            theme: cx.theme(),
+            tokens: theme.tokens(),
+            extended: theme.extended(),
+            components: theme.components(),
             stale: self.controller.is_stale(),
         };
         let cards = COMPONENT_KINDS
@@ -127,7 +132,10 @@ impl ExtensionsView {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        v_flex().w_full().gap_4().children(cards)
+        v_flex()
+            .w_full()
+            .gap(frame.tokens.spacing.lg)
+            .children(cards)
     }
 
     /// 渲染前的可变准备：创建路径输入框、同步配置值、懒拉版本列表。
@@ -188,38 +196,34 @@ impl ExtensionsView {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let Frame {
-            translator, theme, ..
+            translator, tokens, ..
         } = frame;
         let slot = component_slot(kind);
         let ui = &self.components[slot];
         let status = self.controller.component(kind).map(component_summary);
         let title = translator.text(title_key(kind)).to_owned();
-        v_flex()
+        card(cx)
+            .flex()
+            .flex_col()
             .w_full()
-            .gap_3()
-            .p_4()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
+            .gap(tokens.spacing.md)
+            .p(tokens.spacing.lg)
             .child(
                 v_flex()
-                    .gap_0p5()
-                    .child(div().text_sm().font_semibold().child(title.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(translator.text(desc_key(kind)).to_owned()),
-                    ),
+                    .gap(tokens.spacing.xxs)
+                    .child(ui::title_text(title.clone(), frame))
+                    .child(ui::meta_text(
+                        translator.text(desc_key(kind)).to_owned(),
+                        frame,
+                    )),
             )
             .child(self.render_status_row(&title, status, frame))
             .when_some(status, |this, status| {
                 this.child(self.render_system_path_row(status, frame))
             })
-            .child(div().h(px(1.)).w_full().bg(theme.border))
+            .child(ui::divider(frame))
             .child(self.render_manual_path(kind, ui, &title, frame, cx))
-            .child(div().h(px(1.)).w_full().bg(theme.border))
+            .child(ui::divider(frame))
             .child(self.render_install_section(kind, ui, status, &title, frame, cx))
     }
 
@@ -231,41 +235,33 @@ impl ExtensionsView {
     ) -> impl IntoElement {
         let Frame {
             translator,
-            theme,
+            tokens,
+            extended,
             stale,
+            ..
         } = frame;
         let Some(status) = status else {
             // 快照已到但没有该组件：daemon 未编译组件支持（或当前平台不可用）。
             if !stale {
-                return h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Icon::new(IconName::TriangleAlert)
-                            .small()
-                            .text_color(theme.warning),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(translator.text("settingsUnsupportedOnPlatform").to_owned()),
-                    );
+                return ui::status_line(
+                    FluxIcon::CircleAlert,
+                    extended.colors.warning,
+                    translator.text("settingsUnsupportedOnPlatform").to_owned(),
+                    frame,
+                );
             }
             return h_flex()
-                .gap_2()
+                .gap(tokens.spacing.sm)
                 .items_center()
                 .child(
-                    Icon::new(IconName::LoaderCircle)
-                        .small()
-                        .text_color(theme.muted_foreground),
+                    Spinner::new()
+                        .with_size(extended.icon.md)
+                        .color(tokens.colors.muted_foreground),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(translator.text("componentsStatusLoading").to_owned()),
-                );
+                .child(ui::meta_text(
+                    translator.text("componentsStatusLoading").to_owned(),
+                    frame,
+                ));
         };
         if status.source == "none" {
             let key = if status.managed_supported {
@@ -273,62 +269,38 @@ impl ExtensionsView {
             } else {
                 "componentsStatusNotFoundUnsupported"
             };
-            return h_flex()
-                .gap_2()
-                .items_start()
-                .child(
-                    Icon::new(IconName::TriangleAlert)
-                        .small()
-                        .text_color(theme.warning),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .child(translator.text_with(key, &[("name", title)])),
-                );
+            return ui::status_line(
+                FluxIcon::CircleAlert,
+                extended.colors.warning,
+                translator.text_with(key, &[("name", title)]),
+                frame,
+            );
         }
-        h_flex()
-            .gap_2()
-            .items_start()
-            .child(
-                Icon::new(IconName::CircleCheck)
-                    .small()
-                    .text_color(theme.success),
-            )
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_1()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .flex_wrap()
-                            .child(
-                                Tag::info()
-                                    .child(translator.text(source_key(status.source)).to_owned()),
+        ui::status_line(
+            FluxIcon::CircleCheck,
+            extended.colors.success,
+            v_flex()
+                .gap(tokens.spacing.xs)
+                .child(
+                    h_flex()
+                        .gap(tokens.spacing.sm)
+                        .items_center()
+                        .flex_wrap()
+                        .child(ui::neutral_pill(
+                            translator.text(source_key(status.source)).to_owned(),
+                            frame,
+                        ))
+                        .when(!status.version.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .font_features(tabular_numbers())
+                                    .child(format!("v{}", status.version)),
                             )
-                            .when(!status.version.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("v{}", status.version)),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .truncate()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(status.path.to_owned()),
-                    ),
-            )
+                        }),
+                )
+                .child(div().w_full().truncate().child(status.path.to_owned())),
+            frame,
+        )
     }
 
     fn render_system_path_row(
@@ -337,36 +309,26 @@ impl ExtensionsView {
         frame: Frame<'_>,
     ) -> impl IntoElement {
         let Frame {
-            translator, theme, ..
+            translator, tokens, ..
         } = frame;
         let found = !status.system_path.is_empty();
-        h_flex()
-            .gap_1p5()
-            .items_center()
-            .child(
-                Icon::new(IconName::SquareTerminal)
-                    .xsmall()
-                    .text_color(theme.muted_foreground),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(translator.text("componentsSystemPathLabel").to_owned()),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(if found {
-                        status.system_path.to_owned()
-                    } else {
-                        translator.text("componentsSystemPathNotFound").to_owned()
-                    }),
-            )
+        ui::status_line(
+            FluxIcon::SquareTerminal,
+            tokens.colors.muted_foreground,
+            h_flex()
+                .gap(tokens.spacing.xs)
+                .child(
+                    div()
+                        .flex_none()
+                        .child(translator.text("componentsSystemPathLabel").to_owned()),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(if found {
+                    status.system_path.to_owned()
+                } else {
+                    translator.text("componentsSystemPathNotFound").to_owned()
+                })),
+            frame,
+        )
     }
 
     fn render_manual_path(
@@ -379,41 +341,40 @@ impl ExtensionsView {
     ) -> impl IntoElement {
         let Frame {
             translator,
-            theme,
+            tokens,
             stale,
+            ..
         } = frame;
         let slot = component_slot(kind);
         let busy = stale || ui.saving_path;
         v_flex()
             .w_full()
-            .gap_2()
+            .gap(tokens.spacing.sm)
             .child(
                 v_flex()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .child(translator.text("componentsManualPathLabel").to_owned()),
-                    )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(
+                    .gap(tokens.spacing.xxs)
+                    .child(ui::title_text(
+                        translator.text("componentsManualPathLabel").to_owned(),
+                        frame,
+                    ))
+                    .child(ui::meta_text(
                         translator.text_with("componentsManualPathDesc", &[("name", title)]),
+                        frame,
                     )),
             )
-            .child(
+            .child(input_with_action(
+                div().w_full().children(
+                    ui.path_input
+                        .as_ref()
+                        .map(|input| Input::new(input).control(cx).w_full().disabled(busy)),
+                ),
                 h_flex()
-                    .w_full()
-                    .gap_2()
+                    .gap(tokens.spacing.sm)
                     .items_center()
-                    .children(
-                        ui.path_input
-                            .as_ref()
-                            .map(|input| Input::new(input).flex_1().small().disabled(busy)),
-                    )
                     .child(
                         Button::new(("component-path-save", slot))
                             .outline()
-                            .small()
+                            .control(cx)
                             .label(translator.text("componentsManualPathSave").to_owned())
                             .loading(ui.saving_path)
                             .disabled(busy)
@@ -424,15 +385,16 @@ impl ExtensionsView {
                     .child(
                         Button::new(("component-path-clear", slot))
                             .ghost()
-                            .small()
-                            .icon(IconName::Close)
+                            .control_icon(cx)
+                            .icon(FluxIcon::X)
                             .tooltip(translator.text("componentsManualPathClear").to_owned())
                             .disabled(busy)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.clear_manual_path(kind, window, cx);
                             })),
                     ),
-            )
+                cx,
+            ))
     }
 
     fn render_install_section(
@@ -446,31 +408,20 @@ impl ExtensionsView {
     ) -> impl IntoElement {
         let Frame {
             translator,
-            theme,
+            tokens,
+            extended,
             stale,
+            ..
         } = frame;
         let slot = component_slot(kind);
         let supported = status.is_none_or(|status| status.managed_supported);
         if !supported {
-            return h_flex()
-                .gap_1p5()
-                .items_start()
-                .child(
-                    Icon::new(IconName::Info)
-                        .xsmall()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(
-                            translator
-                                .text_with("componentsManagedUnsupported", &[("name", title)]),
-                        ),
-                );
+            return ui::status_line(
+                FluxIcon::Info,
+                tokens.colors.muted_foreground,
+                translator.text_with("componentsManagedUnsupported", &[("name", title)]),
+                frame,
+            );
         }
         let has_managed = status.is_some_and(|status| status.has_managed());
         let managed_version = status.map(|status| status.managed_version.to_owned());
@@ -487,24 +438,23 @@ impl ExtensionsView {
         let versions = ui.versions.clone();
         let selected = ui.selected_version.clone();
         let view = cx.entity().downgrade();
+        let menu_max_h = active_theme(cx).density().control * 8.;
         v_flex()
             .w_full()
-            .gap_2()
+            .gap(tokens.spacing.sm)
             .child(
                 h_flex()
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_semibold()
-                            .child(translator.text("componentsInstallSectionTitle").to_owned()),
-                    )
+                    .child(ui::title_text(
+                        translator.text("componentsInstallSectionTitle").to_owned(),
+                        frame,
+                    ))
                     .child(
                         Button::new(("component-versions-refresh", slot))
                             .ghost()
-                            .small()
+                            .control(cx)
                             .label(translator.text("componentsFetchVersionsButton").to_owned())
                             .loading(ui.versions_loading)
                             .disabled(ui.versions_loading || stale)
@@ -513,39 +463,38 @@ impl ExtensionsView {
                             })),
                     ),
             )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(translator.text(install_desc_key(kind)).to_owned()),
-            )
+            .child(ui::meta_text(
+                translator.text(install_desc_key(kind)).to_owned(),
+                frame,
+            ))
             .when_some(managed_version.filter(|_| has_managed), |this, version| {
-                this.child(div().text_xs().text_color(theme.muted_foreground).child(
+                this.child(ui::meta_text(
                     translator.text_with("componentsManagedVersionLabel", &[("version", &version)]),
+                    frame,
                 ))
             })
             .when_some(ui.versions_error.clone(), |this, error| {
                 this.child(
                     h_flex()
-                        .gap_2()
+                        .gap(tokens.spacing.sm)
                         .items_center()
                         .child(
-                            Icon::new(IconName::TriangleAlert)
-                                .xsmall()
-                                .text_color(theme.warning),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().text_xs().child(
+                            ui::status_line(
+                                FluxIcon::CircleAlert,
+                                tokens.colors.destructive,
                                 translator.text_with(
                                     "componentsVersionsLoadFailed",
                                     &[("message", &error)],
                                 ),
-                            ),
+                                frame,
+                            )
+                            .flex_1()
+                            .min_w_0(),
                         )
                         .child(
                             Button::new(("component-versions-retry", slot))
                                 .outline()
-                                .small()
+                                .control(cx)
                                 .label(translator.text("componentsRetryVersions").to_owned())
                                 .loading(ui.versions_loading)
                                 .disabled(ui.versions_loading || stale)
@@ -555,12 +504,14 @@ impl ExtensionsView {
                         ),
                 )
             })
-            .child(
+            // 版本下拉吃满剩余宽度，安装 / 卸载与之同行、同为统一控件档。
+            .child(input_with_action(
                 Button::new(("component-version-select", slot))
                     .outline()
-                    .small()
                     .label(version_label)
                     .dropdown_caret(true)
+                    .control(cx)
+                    .w_full()
                     .disabled(versions.is_empty() || busy)
                     .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                         let menu = versions.iter().fold(menu, |menu, version| {
@@ -579,17 +530,15 @@ impl ExtensionsView {
                                     }),
                             )
                         });
-                        menu.scrollable(true).max_h(px(240.))
+                        menu.scrollable(true).max_h(menu_max_h)
                     }),
-            )
-            .child(
                 h_flex()
-                    .gap_2()
+                    .gap(tokens.spacing.sm)
                     .items_center()
                     .child(
                         Button::new(("component-install", slot))
                             .primary()
-                            .small()
+                            .control(cx)
                             .label(
                                 translator
                                     .text(if ui.installing {
@@ -611,7 +560,7 @@ impl ExtensionsView {
                         this.child(
                             Button::new(("component-uninstall", slot))
                                 .outline()
-                                .small()
+                                .control(cx)
                                 .label(translator.text("componentsUninstallButton").to_owned())
                                 .loading(ui.uninstalling)
                                 .disabled(busy)
@@ -620,7 +569,8 @@ impl ExtensionsView {
                                 })),
                         )
                     }),
-            )
+                cx,
+            ))
             .when(ui.installing, |this| {
                 let fraction = (ui.total_bytes > 0)
                     .then(|| (ui.downloaded_bytes as f64 / ui.total_bytes as f64).clamp(0., 1.));
@@ -640,18 +590,18 @@ impl ExtensionsView {
                 this.child(
                     v_flex()
                         .w_full()
-                        .gap_1()
+                        .gap(tokens.spacing.xs)
                         .child(
                             Progress::new(("component-progress", slot))
                                 .w_full()
+                                .color(tokens.colors.primary)
                                 .loading(fraction.is_none())
                                 .value(fraction.map_or(0., |fraction| (fraction * 100.) as f32)),
                         )
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(text),
+                            ui::meta_text(text, frame)
+                                .font_features(tabular_numbers())
+                                .text_size(extended.caption.size),
                         ),
                 )
             })
@@ -755,18 +705,17 @@ impl ExtensionsView {
         let ok = SharedString::from(translator.text("componentsUninstallButton").to_owned());
         let cancel = SharedString::from(translator.text("cancel").to_owned());
         let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let view = view.clone();
             alert
-                .title(title.clone())
+                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .description(body.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(ok.clone())
-                        .ok_variant(ButtonVariant::Danger)
-                        .cancel_text(cancel.clone())
-                        .show_cancel(true),
-                )
+                .footer(fluxdown_ui_components::dialog_footer(
+                    Some(cancel.clone()),
+                    ok.clone(),
+                    fluxdown_ui_components::DialogIntent::Destructive,
+                    cx,
+                ))
                 .on_ok(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| this.uninstall_component(kind, window, cx));
                     true

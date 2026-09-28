@@ -1,0 +1,2 @@
+[alias]
+desktop-dev = "run --quiet -p fluxdown-desktop-dev --"

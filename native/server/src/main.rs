@@ -52,8 +52,33 @@ pub(crate) const SERVER_VERSION: &str = {
     if injected.is_empty() { "dev" } else { injected }
 };
 
+/// `--version`/`-V`/`--help`/`-h`：打印后立即退出，不启动 tokio 运行时/服务器（#643）。
+/// 返回 `Some(exit_code)` 时调用方应立即退出；`None` 表示按正常流程启动服务器。
+fn handle_cli_flags() -> Option<i32> {
+    match std::env::args().nth(1).as_deref() {
+        Some("--version" | "-V") => {
+            println!("fluxdown-server {SERVER_VERSION}");
+            Some(0)
+        }
+        Some("--help" | "-h") => {
+            println!(
+                "fluxdown-server {SERVER_VERSION}\n\n\
+                 Headless FluxDown download server. All configuration is via \
+                 environment variables (FLUXDOWN_BIND, FLUXDOWN_DATA_DIR, FLUXDOWN_TOKEN, ...) \
+                 — see https://fluxdown.zerx.dev/docs/en/headless-server/setup/ for the full \
+                 reference. Run with no arguments to start the server."
+            );
+            Some(0)
+        }
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(code) = handle_cli_flags() {
+        std::process::exit(code);
+    }
     match run().await {
         Ok(()) => Ok(()),
         Err(error) => {
@@ -207,9 +232,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(v) = all_cfg.get("use_server_time") {
         engine.manager.set_use_server_time(v == "true");
     }
-    // 文件已存在时的处理方式（"rename"=自动重命名，默认；"overwrite"=覆盖旧文件）。
+    // 文件已存在时的处理方式（"rename"=自动重命名，默认；"overwrite"=覆盖旧
+    // 文件；"skip"=跳过下载）。
     if let Some(v) = all_cfg.get("file_exists_behavior") {
-        engine.manager.set_file_exists_overwrite(v == "overwrite");
+        engine
+            .manager
+            .set_file_exists_behavior(download_manager::FileExistsBehavior::from_config_str(v));
+    }
+    // 空闲（无活跃/排队任务）时是否仍执行周期性文件跟踪扫描（默认开启）。
+    if let Some(v) = all_cfg.get("idle_file_scan") {
+        engine.manager.set_idle_file_scan(v != "0");
     }
     // 任务的文件被删除/移动时的动作（"keep"=保留任务记录，默认；
     // "delete"=文件消失后自动删除任务记录）。
@@ -222,7 +254,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(download_manager::progress_reporter(
             rx,
             engine.db.clone(),
-            sink.clone(),
+            engine.activity_sink.clone(),
         ));
     }
     let done_rx = engine
@@ -482,6 +514,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         data_dir: engine_data_dir,
         ffmpeg_installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ytdlp_installing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        disk_space_cache: Arc::new(std::sync::Mutex::new(None)),
     };
     let mut app: Router = api_router(host, api_cfg).merge(extra_router(state));
     if server_cfg.demo_url.is_some() {

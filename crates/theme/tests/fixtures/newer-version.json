@@ -1,0 +1,8 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 3,
+  "meta": { "name": "From The Future" },
+  "extends": "builtin:midnight-blue",
+  "tokens": { "colors": { "accent": "#60A5FA33" }, "motion": { "fast": 90 } },
+  "surfaces": { "glass": true }
+}

@@ -1,0 +1,247 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import ChangelogTimeline from "@/components/changelog/ChangelogTimeline";
+import { BrandIcon } from "@/components/icons/brand";
+import { changelog } from "@/i18n/messages/changelog";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { GITHUB_URL } from "@/lib/site-nav";
+import { SITE_URL } from "@/lib/seo";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = changelog[lang];
+
+const jsonLdNodes = [
+  {
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "FluxDown", item: `${SITE_URL}${href("/", lang)}` },
+      { "@type": "ListItem", position: 2, name: t.eyebrow, item: `${SITE_URL}${href("/changelog", lang)}` },
+    ],
+  },
+];
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description} jsonLdNodes={jsonLdNodes}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede}>
+    <a class="btn btn-secondary" href={`${GITHUB_URL}/releases`} target="_blank" rel="noopener">
+      <BrandIcon name="github" size={15} />
+      {t.github}
+    </a>
+  </PageHeader>
+  <section class="frame">
+    <ChangelogTimeline client:load lang={lang} />
+  </section>
+</Layout>
+
+<style is:global>
+  @layer components {
+    .cl-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+    }
+    @media (min-width: 1024px) {
+      .cl-layout {
+        grid-template-columns: 240px minmax(0, 1fr);
+      }
+    }
+    .cl-aside {
+      padding: 24px clamp(20px, 4vw, 56px);
+      border-bottom: 1px solid var(--line);
+    }
+    @media (min-width: 1024px) {
+      .cl-aside {
+        padding: 40px 24px;
+        border-bottom: 0;
+        border-right: 1px solid var(--line);
+      }
+      .cl-aside-inner {
+        position: sticky;
+        top: calc(var(--header-h) + 32px);
+        max-height: calc(100dvh - var(--header-h) - 64px);
+        overflow-y: auto;
+      }
+    }
+    .cl-layout .segmented {
+      display: inline-flex;
+      padding: 3px;
+      border-radius: 9px;
+      background: var(--bg-sunken);
+      box-shadow: 0 0 0 1px var(--line) inset;
+    }
+    .cl-layout .segmented button {
+      height: 28px;
+      padding-inline: 12px;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--fg-muted);
+      transition: color 160ms, background-color 160ms;
+    }
+    .cl-layout .segmented button:hover {
+      color: var(--fg);
+    }
+    .cl-layout .segmented button[aria-pressed="true"] {
+      color: var(--fg);
+      background: var(--bg-elev);
+      box-shadow: 0 0 0 1px var(--line-strong) inset;
+    }
+    .cl-layout .segmented button[data-channel="frontier"][aria-pressed="true"] {
+      color: var(--warn);
+    }
+    .cl-index {
+      display: flex;
+      flex-direction: column;
+      border-left: 1px solid var(--line);
+    }
+    .cl-index a {
+      display: block;
+      margin-left: -1px;
+      padding: 4px 0 4px 12px;
+      border-left: 1px solid transparent;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      color: var(--fg-subtle);
+      transition: color 160ms, border-color 160ms;
+    }
+    .cl-index a:hover {
+      color: var(--fg);
+    }
+    .cl-index a[aria-current] {
+      color: var(--accent-ink);
+      border-left-color: var(--accent);
+    }
+    .cl-main {
+      min-width: 0;
+      padding: clamp(28px, 4vw, 56px) clamp(20px, 4vw, 56px) clamp(56px, 8vw, 112px);
+    }
+    .cl-timeline {
+      position: relative;
+      padding-left: 28px;
+    }
+    .cl-timeline::before {
+      content: "";
+      position: absolute;
+      left: 4px;
+      top: 10px;
+      bottom: 0;
+      width: 1px;
+      background: var(--line);
+    }
+    .cl-entry {
+      position: relative;
+      scroll-margin-top: calc(var(--header-h) + 24px);
+    }
+    .cl-entry + .cl-entry {
+      margin-top: clamp(40px, 5vw, 64px);
+      padding-top: clamp(40px, 5vw, 64px);
+      border-top: 1px solid var(--line);
+    }
+    .cl-node {
+      position: absolute;
+      left: -28px;
+      top: 10px;
+      width: 9px;
+      height: 9px;
+      background: var(--bg);
+      box-shadow: 0 0 0 1px var(--accent) inset;
+    }
+    .cl-entry + .cl-entry .cl-node {
+      top: calc(clamp(40px, 5vw, 64px) + 10px);
+    }
+    .cl-node[data-rc] {
+      box-shadow: 0 0 0 1px var(--warn) inset;
+    }
+    .cl-entry:target .cl-node,
+    .cl-entry:first-child .cl-node {
+      background: var(--accent);
+    }
+    .cl-entry:target .cl-node[data-rc],
+    .cl-entry:first-child .cl-node[data-rc] {
+      background: var(--warn);
+    }
+    .cl-chip-stable {
+      color: var(--accent-ink);
+      box-shadow: 0 0 0 1px var(--accent-line) inset;
+      background: var(--accent-soft);
+    }
+    .cl-chip-rc {
+      color: var(--warn);
+      box-shadow: 0 0 0 1px color-mix(in oklch, var(--warn) 40%, transparent) inset;
+      background: color-mix(in oklch, var(--warn) 10%, transparent);
+    }
+    .cl-assets {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--bg-elev);
+    }
+    .cl-assets summary::-webkit-details-marker {
+      display: none;
+    }
+    .cl-assets .cl-caret {
+      transition: transform 200ms var(--ease-out);
+    }
+    .cl-assets[open] .cl-caret {
+      transform: rotate(180deg);
+    }
+    .cl-skeleton {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .cl-skeleton span {
+      height: 12px;
+      border-radius: 3px;
+      background: linear-gradient(90deg, var(--bg-inset), var(--line), var(--bg-inset));
+      background-size: 200% 100%;
+      animation: cl-shimmer 1.4s linear infinite;
+    }
+    .cl-skeleton span:first-child {
+      height: 20px;
+    }
+    @keyframes cl-shimmer {
+      to {
+        background-position: -200% 0;
+      }
+    }
+    .cl-error {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      padding: 16px;
+      border-radius: var(--radius);
+      font-size: 14px;
+      background: color-mix(in oklch, var(--danger) 8%, transparent);
+      box-shadow: 0 0 0 1px color-mix(in oklch, var(--danger) 35%, transparent) inset;
+    }
+  }
+
+  /* .prose 未分层,覆盖它的规则也须未分层(只作用于更新说明内部元素,不与工具类冲突)。 */
+  .prose.cl-body {
+    max-width: 76ch;
+    font-size: 15px;
+  }
+  .prose.cl-body h3 {
+    margin-top: 1.8em;
+    padding-top: 0;
+    border-top: 0;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+  }
+  .prose.cl-body > h3:first-child,
+  .prose.cl-body > h4:first-child {
+    margin-top: 0;
+  }
+  .prose.cl-body h4 {
+    font-size: 14.5px;
+  }
+  .prose.cl-body h3 + ul,
+  .prose.cl-body h4 + ul {
+    margin-top: 0.6em;
+  }
+</style>

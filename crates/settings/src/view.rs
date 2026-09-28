@@ -1,24 +1,55 @@
-//! 设置窗口内容：左侧分类 + 搜索 + 右侧分区（gpui-component `Settings` DSL）。
+//! 设置窗口内容：左侧分类导航 + 搜索，右侧「标题 + 描述 + 子 Tab」头部与白色内容区。
+//!
+//! 布局与 Flutter 桌面端 `lib/src/pages/settings_page.dart` 对齐：分类同序、
+//! 子 Tab 同分区、宽视口双列分组卡片。
 
+use std::collections::HashMap;
+
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, nav_icon_color, segmented_tabs, sidebar_navigation_button,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyView, Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window,
-    div, prelude::FluentBuilder as _, px,
+    AnyView, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
-use gpui_component::{Sizable as _, group_box::GroupBoxVariant, setting::Settings, v_flex};
+use gpui_component::{
+    Icon,
+    input::{Input, InputState},
+    scroll::ScrollableElement as _,
+    v_flex,
+};
 
+use crate::search::SettingsTarget;
 use crate::sections::{
     self, SectionContext, about, api, appearance, bt, doctor, download, ed2k, general, notify,
     proxy,
 };
 use crate::store::{SettingsErrorKind, SettingsStore};
+use crate::ui::{
+    CONTENT_PADDING_LEFT, CONTENT_PADDING_RIGHT, SettingsPage, meta_text, page_heading,
+};
 
-/// app 注入的外部内容槽：账户页与扩展页由对应 capability 提供。
+/// 分类导航列宽（与下载侧栏默认宽一致）。
+const SIDEBAR_WIDTH: f32 = 200.;
+
+/// app 注入的外部内容：账户页与扩展页由对应 capability 提供；活动栏开关由 app 的
+/// 活动栏注册表派生。
 #[derive(Default)]
 pub struct SettingsContentSlots {
     pub account: Option<AnyView>,
     pub extensions: Option<AnyView>,
+    /// 「通用 → 活动栏」分区的开关行，按活动栏自上而下顺序。
+    pub activity_bar: Vec<ActivityBarToggle>,
+}
+
+/// 活动栏可选入口的可见性开关：一个布尔偏好（缺省视为显示）+ 标题 / 描述文案键。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActivityBarToggle {
+    pub pref_key: &'static str,
+    pub title_key: &'static str,
+    pub desc_key: &'static str,
 }
 
 /// 设置能力的顶层页面。
@@ -26,6 +57,11 @@ pub struct SettingsView {
     store: Entity<SettingsStore>,
     translator: Entity<Translator>,
     slots: SettingsContentSlots,
+    search: Entity<InputState>,
+    /// 当前选中分类的 key。
+    selected: SharedString,
+    /// 每个分类会话内记住的子 Tab id。
+    tab_by_page: HashMap<SharedString, &'static str>,
 }
 
 impl SettingsView {
@@ -37,14 +73,21 @@ impl SettingsView {
         translator: Entity<Translator>,
         store: Entity<SettingsStore>,
         slots: SettingsContentSlots,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        let placeholder = translator.read(cx).text("settingsSearchHint").to_owned();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
         Self {
             store,
             translator,
             slots,
+            search,
+            selected: SharedString::from("general"),
+            tab_by_page: HashMap::new(),
         }
     }
 
@@ -68,73 +111,285 @@ impl SettingsView {
             .last_notice()
             .map(|key| (SharedString::from(translator.text(key).to_owned()), false))
     }
-}
 
-impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = active_theme(cx).tokens().clone();
+    fn pages(&self, cx: &mut Context<Self>) -> Vec<SettingsPage> {
         let translator = self.translator.read(cx).clone();
         let ctx = SectionContext {
             store: &self.store,
             translator: &translator,
             translator_entity: &self.translator,
         };
-        let pages = vec![
-            general::page(&ctx, cx),
-            sections::slot_page(
-                &ctx,
-                "settingsCatAccount",
-                "settingsCatAccountDesc",
-                gpui_component::IconName::User,
-                self.slots.account.clone(),
-            ),
-            appearance::page(&ctx, cx),
-            download::page(&ctx, cx),
-            bt::page(&ctx, cx),
-            ed2k::page(&ctx, cx),
-            proxy::page(&ctx, cx),
-            api::page(&ctx, cx),
-            notify::page(&ctx, cx),
-            sections::slot_page(
-                &ctx,
-                "settingsCatExtensions",
-                "settingsCatExtensionsDesc",
-                gpui_component::IconName::Settings2,
-                self.slots.extensions.clone(),
-            ),
-            doctor::page(&ctx, cx),
-            about::page(&ctx, cx),
-        ];
+        build_pages(
+            &ctx,
+            &self.slots.activity_bar,
+            self.slots.account.clone(),
+            self.slots.extensions.clone(),
+            cx,
+        )
+    }
+
+    /// 定位到设置项：切到目标分类与子 Tab；指向具体行时以行标题填入搜索框筛出该行，
+    /// 指向分类 / Tab 时清空搜索。
+    pub fn reveal(&mut self, target: &SettingsTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = SharedString::from(target.page);
+        if !target.tab.is_empty() {
+            self.tab_by_page
+                .insert(SharedString::from(target.page), target.tab);
+        }
+        let query = target.row.clone().unwrap_or_default();
+        self.search
+            .update(cx, |search, cx| search.set_value(query, window, cx));
+        cx.notify();
+    }
+
+    fn render_nav_item(&self, page: &SettingsPage, cx: &mut Context<Self>) -> impl IntoElement {
+        let icon_size = active_theme(cx).extended().icon.lg;
+        let selected = self.selected == page.title || self.selected == page.key;
+        let key = SharedString::from(page.key);
+        let icon_color = nav_icon_color(selected, cx);
+
+        sidebar_navigation_button(
+            SharedString::from(format!("settings-nav-{}", page.key)),
+            page.title.clone(),
+            page.nav_icon().size(icon_size).text_color(icon_color),
+            div(),
+            selected,
+            cx,
+        )
+        .on_click(cx.listener(move |this, _, _, cx| {
+            if this.selected != key {
+                this.selected = key.clone();
+                cx.notify();
+            }
+        }))
+    }
+
+    fn render_sidebar(&self, pages: &[SettingsPage], cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
+        let items: Vec<_> = pages
+            .iter()
+            .map(|page| self.render_nav_item(page, cx).into_any_element())
+            .collect();
+
+        v_flex()
+            .flex_none()
+            .w(px(SIDEBAR_WIDTH))
+            .h_full()
+            .min_h_0()
+            .px(tokens.spacing.sm)
+            .py(tokens.spacing.md)
+            .gap(tokens.spacing.md)
+            .bg(extended.colors.chrome)
+            .border_r_1()
+            .border_color(extended.colors.hairline)
+            .child(
+                Input::new(&self.search).control(cx).prefix(
+                    Icon::new(FluxIcon::Search)
+                        .size(extended.icon.md)
+                        .text_color(extended.colors.text_tertiary),
+                ),
+            )
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .gap(tokens.spacing.xxs)
+                    .children(items)
+                    .overflow_y_scrollbar(),
+            )
+    }
+
+    fn active_tab_id(&self, page: &SettingsPage) -> &'static str {
+        let tabs = page.visible_tabs();
+        if tabs.is_empty() {
+            return "";
+        }
+        let saved = self.tab_by_page.get(&SharedString::from(page.key)).copied();
+        match saved {
+            Some(id) if tabs.iter().any(|tab| tab.id == id) => id,
+            _ => tabs.first().map_or("", |tab| tab.id),
+        }
+    }
+
+    fn render_tabs(
+        &self,
+        page: &SettingsPage,
+        tab_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Div> {
+        let tabs = page.visible_tabs();
+        if tabs.is_empty() {
+            return None;
+        }
+        let ids: Vec<&'static str> = tabs.iter().map(|tab| tab.id).collect();
+        let selected = ids.iter().position(|id| *id == tab_id).unwrap_or(0);
+        let labels: Vec<SharedString> = tabs.iter().map(|tab| tab.label.clone()).collect();
+        let key = SharedString::from(page.key);
+        let view = cx.entity().downgrade();
+        Some(segmented_tabs(
+            SharedString::from(format!("settings-tabs-{}", page.key)),
+            labels,
+            selected,
+            move |index, _, cx| {
+                let Some(id) = ids.get(index).copied() else {
+                    return;
+                };
+                let key = key.clone();
+                // 视图已释放（窗口关闭中）时忽略点击。
+                let _ = view.update(cx, |this, cx| {
+                    this.tab_by_page.insert(key, id);
+                    cx.notify();
+                });
+            },
+            cx,
+        ))
+    }
+
+    fn render_content(
+        &self,
+        page: &SettingsPage,
+        content_width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
+        let tab_id = self.active_tab_id(page);
+        let tabs = self.render_tabs(page, tab_id, cx);
+
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .bg(tokens.colors.surface)
+            .child(
+                v_flex()
+                    .w_full()
+                    .flex_none()
+                    .px(px(CONTENT_PADDING_LEFT))
+                    .pt(tokens.spacing.lg)
+                    .pb(tokens.spacing.md)
+                    .gap(tokens.spacing.md)
+                    .border_b_1()
+                    .border_color(extended.colors.hairline)
+                    .child(page_heading(
+                        page.title.clone(),
+                        page.description.clone(),
+                        cx,
+                    ))
+                    .children(tabs),
+            )
+            .child(
+                v_flex()
+                    .id(gpui::ElementId::from(SharedString::from(format!(
+                        "settings-body-{}-{tab_id}",
+                        page.key
+                    ))))
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .pl(px(CONTENT_PADDING_LEFT))
+                    .pr(px(CONTENT_PADDING_RIGHT))
+                    .pt(tokens.spacing.lg + tokens.spacing.xs)
+                    .pb(tokens.spacing.xl)
+                    .overflow_y_scrollbar()
+                    .child(page.render_tab(tab_id, content_width, window, cx)),
+            )
+    }
+}
+
+/// 全部设置分类页（设置窗口渲染与搜索索引共用同一份构建）。
+pub(crate) fn build_pages(
+    ctx: &SectionContext,
+    activity_bar: &[ActivityBarToggle],
+    account: Option<AnyView>,
+    extensions: Option<AnyView>,
+    cx: &mut App,
+) -> Vec<SettingsPage> {
+    vec![
+        general::page(ctx, activity_bar, cx),
+        sections::slot_page(
+            ctx,
+            "account",
+            "settingsCatAccount",
+            "settingsCatAccountDesc",
+            FluxIcon::User,
+            account,
+        ),
+        appearance::page(ctx, cx),
+        download::page(ctx, cx),
+        bt::page(ctx, cx),
+        ed2k::page(ctx, cx),
+        proxy::page(ctx, cx),
+        api::page(ctx, cx),
+        notify::page(ctx, cx),
+        sections::slot_page(
+            ctx,
+            "extensions",
+            "settingsCatExtensions",
+            "settingsCatExtensionsDesc",
+            FluxIcon::Package,
+            extensions,
+        ),
+        doctor::page(ctx, cx),
+        about::page(ctx, cx),
+    ]
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = active_theme(cx).tokens().clone();
+        let query = self.search.read(cx).value().trim().to_lowercase();
+        let pages: Vec<SettingsPage> = self
+            .pages(cx)
+            .into_iter()
+            .filter_map(|page| page.filtered(&query))
+            .collect();
+        if !pages.iter().any(|page| self.selected == page.key)
+            && let Some(first) = pages.first()
+        {
+            self.selected = SharedString::from(first.key);
+        }
+        // 内容区可用宽度：窗口宽 - 侧栏 - 左右留白（列数判定用，不参与布局）。
+        let content_width = f32::from(window.viewport_size().width)
+            - SIDEBAR_WIDTH
+            - CONTENT_PADDING_LEFT
+            - CONTENT_PADDING_RIGHT;
         let feedback = self.feedback(cx);
+        let active = pages
+            .iter()
+            .find(|page| self.selected == page.key)
+            .or_else(|| pages.first());
 
         v_flex()
             .size_full()
             .min_w_0()
             .min_h_0()
-            .bg(tokens.colors.background)
+            .bg(tokens.colors.surface)
             .when_some(feedback, |this, (text, is_error)| {
                 this.child(
-                    div()
+                    meta_text(cx)
                         .w_full()
-                        .px(tokens.spacing.xl)
+                        .px(px(CONTENT_PADDING_LEFT))
                         .py(tokens.spacing.sm)
-                        .text_size(tokens.typography.sm.size)
-                        .text_color(if is_error {
-                            tokens.colors.destructive
-                        } else {
-                            tokens.colors.muted_foreground
-                        })
+                        .when(is_error, |this| this.text_color(tokens.colors.destructive))
                         .child(text),
                 )
             })
             .child(
-                div().flex_1().min_h_0().child(
-                    Settings::new("fluxdown-settings")
-                        .sidebar_width(px(200.))
-                        .with_group_variant(GroupBoxVariant::Outline)
-                        .small()
-                        .pages(pages),
-                ),
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .flex()
+                    .items_stretch()
+                    .child(self.render_sidebar(&pages, cx))
+                    .children(
+                        active.map(|page| self.render_content(page, content_width, window, cx)),
+                    ),
             )
     }
 }

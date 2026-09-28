@@ -80,7 +80,7 @@ pub struct DaemonConfigPatch {
 }
 
 /// daemon 运行状态投影。
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct DaemonRuntimeStatsDto {
@@ -596,6 +596,61 @@ pub struct PluginDto {
     /// manifest 声明的能力权限（如 `["ffmpeg"]`，供 UI 展示授权徽章）。
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// 是否声明平台登录入口。
+    #[serde(default)]
+    pub auth_supported: bool,
+    /// manifest 声明的订阅 provider ID，供订阅创建界面生成可选来源。
+    #[serde(default)]
+    pub subscription_provider_ids: Vec<String>,
+    /// `Loaded` / `Failed`；与 `enabled` 独立，手动禁用的插件仍可能已加载。
+    #[serde(default = "default_plugin_load_status")]
+    pub load_status: String,
+    /// 加载失败的可读原因；成功时为空。
+    #[serde(default)]
+    pub load_error: String,
+}
+
+fn default_plugin_load_status() -> String {
+    "Loaded".to_string()
+}
+
+/// 驱动插件平台登录（二维码/账号登录）的请求。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PluginAuthRequest {
+    #[serde(default)]
+    pub identity: String,
+    /// `begin` / `poll` / `cancel` / `logout` / `status`。
+    pub action: String,
+    #[serde(default)]
+    pub site: String,
+    #[serde(default)]
+    pub auth_ref: String,
+    #[serde(default)]
+    pub session_id: String,
+    /// 账号、验证码或平台登录流程需要的额外输入。
+    #[serde(default)]
+    pub input: String,
+}
+
+/// 插件平台登录交互状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PluginAuthResponse {
+    /// `pending` / `success` / `error`。
+    pub status: String,
+    pub session_id: String,
+    /// 二维码文本、data URL 或其他挑战内容。
+    #[serde(default)]
+    pub challenge: Option<String>,
+    #[serde(default)]
+    pub challenge_type: Option<String>,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub auth_ref: Option<String>,
 }
 
 /// 安装 dev 插件请求体。
@@ -613,6 +668,15 @@ pub struct InstallPluginDevRequest {
 pub struct RenameTaskRequest {
     /// 新文件名（不含路径分隔符；引擎侧校验非法字符与状态）。
     pub file_name: String,
+}
+
+/// 更换任务下载源地址请求体。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeTaskUrlRequest {
+    /// 新下载地址（http(s)/ftp，或待解封装的 `thunder://` 链接）。
+    pub url: String,
 }
 
 /// 设置插件启用状态请求体。
@@ -1140,6 +1204,12 @@ pub struct LinkOkResponse {
 pub struct RssSourceDto {
     #[serde(default)]
     pub source_id: String,
+    /// 来源 provider 的稳定 ID；缺省为内置 RSS provider。
+    #[serde(default = "default_rss_provider_id")]
+    pub provider_id: String,
+    /// provider 专属配置 JSON；缺省为空。
+    #[serde(default)]
+    pub provider_config: String,
     pub url: String,
     /// 空 = 用 feed 标题回填。
     #[serde(default)]
@@ -1209,6 +1279,10 @@ pub struct RssSourceDto {
     /// 只读：未处理条目数（侧边栏 badge）。
     #[serde(default)]
     pub unread_count: i32,
+}
+
+fn default_rss_provider_id() -> String {
+    "rss".to_string()
 }
 
 /// 订阅流中的一个条目（`GET /api/v1/rss/{id}/items`）。
@@ -1642,6 +1716,30 @@ pub struct SiteAuthEntryDto {
     pub user: String,
 }
 
+/// 单站点 HTTP Basic 凭据详情；仅由受保护的定向查询返回（`GET
+/// /api/v1/site-auth/{site}`，须管理 token；本机 RPC `daemon.siteAuth.match`）。
+/// `pass` 是明文密码，不脱敏——保留是为了表单可以回填原值；只应用于编辑对话框 /
+/// 新建下载认证框这类需要原文的场景，不要在列表/日志里回显（L-1；列表接口
+/// [`SiteAuthEntryDto`] 本就不含 `pass`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAuthCredentialDto {
+    pub site: String,
+    pub user: String,
+    pub pass: String,
+}
+
+/// 保存单站点 HTTP Basic 凭据的请求。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAuthSaveRequest {
+    pub site: String,
+    pub user: String,
+    pub pass: String,
+}
+
 /// `daemon.siteAuth.delete` 参数。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1650,12 +1748,36 @@ pub struct SiteAuthDeleteParams {
     pub site: String,
 }
 
+/// `daemon.siteAuth.match` 参数：按下载链接的站点键（`host` / `host:port`，与引擎
+/// 自动套用规则同一实现）查已保存凭据；结果为 [`SiteAuthCredentialDto`] 或 `null`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAuthMatchParams {
+    pub url: String,
+}
+
 /// 引擎学习到的按域连接上限摘要（`daemon.config.connPolicy`）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct ConnPolicySummaryDto {
     pub domain_count: u64,
+}
+
+/// 系统代理检测结果（`daemon.config.systemProxy`）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SystemProxyDto {
+    /// 是否检测到系统代理。
+    pub detected: bool,
+    /// `http` / `https` / `socks4` / `socks5`；未检测到时为空串。
+    pub proxy_type: String,
+    pub host: String,
+    pub port: u16,
+    /// 逗号分隔的排除列表；未检测到时为空串。
+    pub no_list: String,
 }
 
 /// Tracker 订阅刷新结果（`POST /api/v1/bt/tracker-sub/refresh`）。
@@ -1776,6 +1898,11 @@ pub struct FsListResponse {
     pub parent: Option<String>,
     /// 子目录列表（不含文件）。
     pub dirs: Vec<FsEntry>,
+    /// 服务进程对该目录无读取权限（EACCES）。此时 `dirs` 必为空，但语义是
+    /// 「看不到」而非「没有」——NAS 套件以受限用户运行、未给共享文件夹授权时
+    /// 就是这种情况，前端据此提示授权而不是显示「空目录」。
+    #[serde(default)]
+    pub denied: bool,
 }
 
 /// 服务器运行状态（`GET /api/v1/stats`，前端状态栏用）。

@@ -377,9 +377,10 @@ class MobileTasksScreenState extends State<MobileTasksScreen> {
         return _MobileTaskCard(
           task: task,
           controller: widget.controller,
-          onTap: () => _openDetail(task),
-          onLongPress: () =>
+          // #541：单击直接弹操作菜单（更直观）；详情页保留为长按次级入口。
+          onTap: () =>
               showMobileTaskActionSheet(context, widget.controller, task),
+          onLongPress: () => _openDetail(task),
         );
       }
       cursor -= g.tasks.length;

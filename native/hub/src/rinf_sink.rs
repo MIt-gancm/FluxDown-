@@ -389,6 +389,9 @@ impl EventSink for RinfEventSink {
                 }
                 .send_signal_to_dart();
             }
+            // Flutter 继续消费 TaskProgress / SegmentProgress；活动由 JournalSink 落库，
+            // 这两种扩展通知无需重复投影，也不能对每帧同步写日志。
+            EngineEvent::TaskRuntimeChanged(_) | EngineEvent::TaskActivityAdded(_) => {}
             // `#[non_exhaustive]`：未来新增变体默认丢弃并记录日志，而非编译失败。
             _ => {
                 crate::logger::log_info!(

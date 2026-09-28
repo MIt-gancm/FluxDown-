@@ -1,7 +1,7 @@
 //! macOS Core Foundation 最小 FFI：`file_association`（文档类型）与
-//! `protocol_registry`（URL scheme）共用的 CFString/CFBundle 辅助。
+//! `protocol_registry`（URL scheme）共用的 CFString/CFArray/CFBundle 辅助。
 //!
-//! 只需五个符号，直接声明而不引入 `core-foundation` crate。
+//! 只声明实际调用的符号，不引入 `core-foundation` crate。
 
 use std::ffi::{CString, c_char, c_void};
 use std::io;
@@ -10,6 +10,7 @@ use std::io;
 const CF_ENCODING_UTF8: u32 = 0x0800_0100;
 
 pub type CFStringRef = *const c_void;
+pub type CFArrayRef = *const c_void;
 type CFBundleRef = *const c_void;
 type CFAllocatorRef = *const c_void;
 
@@ -28,6 +29,8 @@ unsafe extern "C" {
         encoding: u32,
     ) -> u8;
     fn CFRelease(cf: *const c_void);
+    fn CFArrayGetCount(the_array: CFArrayRef) -> isize;
+    fn CFArrayGetValueAtIndex(the_array: CFArrayRef, idx: isize) -> *const c_void;
     fn CFBundleGetMainBundle() -> CFBundleRef;
     fn CFBundleGetIdentifier(bundle: CFBundleRef) -> CFStringRef;
 }
@@ -107,12 +110,30 @@ pub fn cf_to_string(cf: CFStringRef) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 当前进程所在 `.app` 的 bundle id（如 `com.fluxdown.app`）。
+/// 读取自持 `CFArray<CFString>`（`LSCopyAll*Handlers*` 的返回值）；空引用返回空列表。
+pub fn cf_string_array(array: &CfOwned) -> Vec<String> {
+    let raw = array.raw();
+    if raw.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: `raw` 是 `array` 持有的非空 CFArrayRef，在本函数内存活。
+    let count = unsafe { CFArrayGetCount(raw) };
+    (0..count)
+        .filter_map(|index| {
+            // SAFETY: `index` 在 `[0, count)` 内；返回的元素为数组持有的借用引用，
+            // 不在此释放，只在 `array` 存活期间读取。
+            let value = unsafe { CFArrayGetValueAtIndex(raw, index) };
+            cf_to_string(value)
+        })
+        .collect()
+}
+
+/// 当前进程所在 `.app` 的 bundle id。
 ///
-/// agent 与 `fluxdown-desktop` 同处 `FluxDown.app/Contents/MacOS/`，Core
-/// Foundation 会从可执行文件路径向上解析出外层 bundle；在 bundle 之外运行
-/// （如 `target/release`）时没有 Info.plist，返回 `None`，此时 Launch Services
-/// 注册不可用。
+/// Core Foundation 从可执行文件路径向上解析最近的 bundle：打包后 agent 位于辅助
+/// bundle `FluxDownAgent.app` 内，得到的是辅助 bundle 的 id（外层 id 见
+/// `platform::host_bundle_id`）；在 bundle 之外运行（如 `target/release`）时没有
+/// Info.plist，返回 `None`，此时 Launch Services 注册不可用。
 pub fn main_bundle_id() -> Option<String> {
     // SAFETY: `CFBundleGetMainBundle` 返回借用引用或 null；`CFBundleGetIdentifier`
     // 同样返回借用引用——均不在此释放。

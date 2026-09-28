@@ -13,7 +13,8 @@ use fluxdown_engine::Engine;
 use fluxdown_engine::bt_downloader::{BtConfig, BtMseMode};
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{
-    CreateGroupSpec, NewTaskSpec, ResolveOutcome, ResolvePreviewOutcome, TaskDone,
+    CreateGroupSpec, FileExistsBehavior, NewTaskSpec, ResolveOutcome, ResolvePreviewOutcome,
+    TaskDone,
 };
 use fluxdown_engine::log_info;
 use fluxdown_engine::proxy_config::ProxyConfig;
@@ -55,6 +56,14 @@ pub enum ActorCmd {
     RenameTask {
         task_id: String,
         file_name: String,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    /// 更换任务下载源地址。错误为引擎稳定错误码字符串（`invalid-url` /
+    /// `task-active` / `task-completed` / `bt-unsupported` / `not-found` /
+    /// `protocol-unsupported` / `protocol-mismatch`）或 thunder 解码错误原文。
+    ChangeTaskUrl {
+        task_id: String,
+        url: String,
         ack: oneshot::Sender<Result<(), String>>,
     },
     DeleteTask {
@@ -333,7 +342,12 @@ pub async fn run_actor(
                 engine.manager.plugin_request_retry(&task_id, delay_ms).await;
             }
             _ = rescan_timer.tick() => {
-                engine.manager.spawn_file_scan();
+                // 完全空闲（无活跃/排队任务）且用户关闭了 idle_file_scan 时跳过
+                // 本次定时扫描，避免不必要地唤醒 NAS/网络盘；窗口聚焦、手动
+                // 重扫 API 直接调用 spawn_file_scan，不受此判定影响。
+                if engine.manager.should_run_idle_scan() {
+                    engine.manager.spawn_file_scan();
+                }
             }
             _ = queue_schedule_tick.tick() => {
                 engine.manager.tick_queue_schedules().await;
@@ -446,6 +460,9 @@ async fn handle_cmd(cmd: ActorCmd, engine: &mut Engine) {
             ack,
         } => {
             let _ = ack.send(engine.manager.rename_task(&task_id, &file_name).await);
+        }
+        ActorCmd::ChangeTaskUrl { task_id, url, ack } => {
+            let _ = ack.send(engine.manager.change_task_url(&task_id, &url).await);
         }
         ActorCmd::SetTaskSeedLimits {
             task_id,
@@ -837,7 +854,14 @@ async fn apply_config(engine: &mut Engine, keys: &[String]) {
             }
             "file_exists_behavior" => {
                 if let Some(v) = all.get(key) {
-                    engine.manager.set_file_exists_overwrite(v == "overwrite");
+                    engine
+                        .manager
+                        .set_file_exists_behavior(FileExistsBehavior::from_config_str(v));
+                }
+            }
+            "idle_file_scan" => {
+                if let Some(v) = all.get(key) {
+                    engine.manager.set_idle_file_scan(v != "0");
                 }
             }
             "file_missing_action" => {

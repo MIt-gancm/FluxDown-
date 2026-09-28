@@ -214,11 +214,39 @@ void main() {
       expect(compareEntities(ViewSortKey.created, SortDir.desc, older, newer), greaterThan(0));
     });
 
-    test('name: lexicographic, direction honored', () {
-      final a = TaskEntity(_task(id: '1', fileName: 'alpha.zip'));
-      final b = TaskEntity(_task(id: '2', fileName: 'beta.zip'));
-      expect(compareEntities(ViewSortKey.name, SortDir.asc, a, b), lessThan(0));
-      expect(compareEntities(ViewSortKey.name, SortDir.desc, a, b), greaterThan(0));
+    test('name: natural numeric order, direction honored', () {
+      final entities = [
+        TaskEntity(_task(id: '1', fileName: 'episode 10.zip')),
+        TaskEntity(_task(id: '2', fileName: 'episode 2.zip')),
+        TaskEntity(_task(id: '3', fileName: 'episode 100.zip')),
+        TaskEntity(_task(id: '4', fileName: 'episode 1.zip')),
+      ];
+      entities.sort(
+        (a, b) => compareEntities(ViewSortKey.name, SortDir.asc, a, b),
+      );
+      expect(entities.map((entity) => entity.name), [
+        'episode 1.zip',
+        'episode 2.zip',
+        'episode 10.zip',
+        'episode 100.zip',
+      ]);
+
+      final descending = [...entities]
+        ..sort(
+          (a, b) => compareEntities(ViewSortKey.name, SortDir.desc, a, b),
+        );
+      expect(descending.map((entity) => entity.name), [
+        'episode 100.zip',
+        'episode 10.zip',
+        'episode 2.zip',
+        'episode 1.zip',
+      ]);
+    });
+
+    test('name: compares numeric values before later text', () {
+      final a = TaskEntity(_task(id: '1', fileName: 'part 2 side b.zip'));
+      final b = TaskEntity(_task(id: '2', fileName: 'part 2 side a.zip'));
+      expect(compareEntities(ViewSortKey.name, SortDir.asc, a, b), greaterThan(0));
     });
 
     test('size: total bytes, direction honored', () {

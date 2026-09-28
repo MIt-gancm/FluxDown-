@@ -425,6 +425,14 @@ List<SettingsSearchItem> get settingsSearchItems {
       keywords: s.searchKeywordsCdnMulti,
       icon: LucideIcons.network,
     ),
+    if (!Platform.isAndroid && !Platform.isIOS)
+      SettingsSearchItem(
+        category: SettingsCategory.download,
+        label: s.multiNicEnabled,
+        description: s.multiNicEnabledDesc,
+        keywords: s.searchKeywordsMultiNic,
+        icon: LucideIcons.cable,
+      ),
     SettingsSearchItem(
       category: SettingsCategory.download,
       label: s.connPolicyCache,
@@ -1924,11 +1932,15 @@ class _SettingRow extends StatefulWidget {
   final Widget child;
   final bool vertical;
 
+  /// 标题右侧的附加小部件（如帮助图标），为空时仅显示标题文本。
+  final Widget? labelTrailing;
+
   const _SettingRow({
     required this.label,
     required this.description,
     required this.child,
     this.vertical = false,
+    this.labelTrailing,
   });
 
   @override
@@ -1945,6 +1957,24 @@ class _SettingRowState extends State<_SettingRow> with _HighlightConsumer {
   Widget build(BuildContext context) {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
+    final labelText = Text(
+      widget.label,
+      style: TextStyle(
+        fontSize: 13,
+        fontWeight: FontWeight.w500,
+        color: c.textPrimary,
+      ),
+    );
+    final trailing = widget.labelTrailing;
+    final label = trailing == null
+        ? labelText
+        : Row(
+            children: [
+              Flexible(child: labelText),
+              const SizedBox(width: 4),
+              trailing,
+            ],
+          );
     return AnimatedContainer(
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOut,
@@ -1959,14 +1989,7 @@ class _SettingRowState extends State<_SettingRow> with _HighlightConsumer {
           ? Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  widget.label,
-                  style: TextStyle(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w500,
-                    color: c.textPrimary,
-                  ),
-                ),
+                label,
                 const SizedBox(height: 2),
                 Text(
                   widget.description,
@@ -1982,14 +2005,7 @@ class _SettingRowState extends State<_SettingRow> with _HighlightConsumer {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        widget.label,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w500,
-                          color: c.textPrimary,
-                        ),
-                      ),
+                      label,
                       const SizedBox(height: 2),
                       Text(
                         widget.description,
@@ -3333,6 +3349,64 @@ class _DownloadContent extends StatelessWidget {
     );
   }
 
+  /// 多网卡聚合下载说明弹窗：原理、何时有效/无效、防拖慢机制与注意事项。
+  /// 每段形如「引导语：正文」，引导语加粗便于扫读。
+  void _showMultiNicHelp(BuildContext context, S s) {
+    final c = AppColors.of(context);
+    final paragraphs = s.multiNicHelp.split('\n\n');
+    showShadDialog(
+      context: context,
+      barrierColor: c.dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (ctx) => ShadDialog(
+        title: Text(s.multiNicHelpTitle),
+        constraints: const BoxConstraints(maxWidth: 520, maxHeight: 600),
+        titlePinned: true,
+        actions: [
+          ShadButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(s.close),
+          ),
+        ],
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (var i = 0; i < paragraphs.length; i++) ...[
+              if (i > 0) const SizedBox(height: 12),
+              _multiNicHelpParagraph(c, paragraphs[i]),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 把「引导语：正文」/「Lead: body」拆成加粗引导语 + 常规正文；无分隔符则整段常规。
+  Widget _multiNicHelpParagraph(AppColors c, String text) {
+    final style = TextStyle(fontSize: 13, height: 1.65, color: c.textSecondary);
+    var cut = text.indexOf('：');
+    var sepLen = 1;
+    if (cut < 0) {
+      cut = text.indexOf(': ');
+      sepLen = 2;
+    }
+    if (cut <= 0) return Text(text, style: style);
+    return Text.rich(
+      TextSpan(
+        style: style,
+        children: [
+          TextSpan(
+            text: text.substring(0, cut + sepLen),
+            style: TextStyle(fontWeight: FontWeight.w600, color: c.textPrimary),
+          ),
+          TextSpan(text: text.substring(cut + sepLen)),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final listenable = downloadController != null
@@ -3493,6 +3567,30 @@ class _DownloadContent extends StatelessWidget {
                     description: s.cdnMaxNodesDesc,
                     child: _CdnMaxNodesSelector(
                       settingsProvider: settingsProvider,
+                    ),
+                  ),
+                // 多网卡聚合仅桌面端：移动端无多网卡并存场景且系统不允许按网卡绑定。
+                if (!Platform.isAndroid && !Platform.isIOS)
+                  _SettingRow(
+                    label: s.multiNicEnabled,
+                    description: s.multiNicEnabledDesc,
+                    labelTrailing: ShadTooltip(
+                      waitDuration: const Duration(milliseconds: 200),
+                      effects: const [],
+                      builder: (_) => Text(s.multiNicHelpHint),
+                      child: ShadGestureDetector(
+                        cursor: SystemMouseCursors.click,
+                        onTap: () => _showMultiNicHelp(context, s),
+                        child: Icon(
+                          LucideIcons.circleHelp,
+                          size: 13,
+                          color: AppColors.of(context).textMuted,
+                        ),
+                      ),
+                    ),
+                    child: ShadSwitch(
+                      value: settingsProvider.multiNicEnabled,
+                      onChanged: settingsProvider.setMultiNicEnabled,
                     ),
                   ),
                 _SettingRow(

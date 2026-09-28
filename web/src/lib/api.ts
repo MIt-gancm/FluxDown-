@@ -23,6 +23,7 @@ import type {
   MarketEntry,
   PingInfo,
   PluginDto,
+  PluginAuthResponse,
   ProxyTestRequest,
   ProxyTestResponse,
   QueueDto,
@@ -35,6 +36,8 @@ import type {
   RssSourceDto,
   RssValidateRequest,
   RssValidateResponse,
+  SiteAuthCredential,
+  SiteAuthEntry,
   SetupStatus,
   StatsResponse,
   TaskDto,
@@ -151,6 +154,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ fileName }),
     }),
+  // 更换任务下载源地址（错误码经 body.message 原样透传：invalid-url/
+  // task-active/task-completed/bt-unsupported/protocol-unsupported/
+  // protocol-mismatch/not-found 或引擎原文，由弹窗侧映射文案）
+  changeTaskUrl: (id: string, url: string) =>
+    apiFetch<unknown>(`/api/v1/tasks/${id}/url`, {
+      method: 'PUT',
+      body: JSON.stringify({ url }),
+    }),
 
   // 任务组与前置预解析（多文件下载）
   resolvePreview: (req: ResolvePreviewRequest) =>
@@ -201,6 +212,16 @@ export const api = {
   getConfig: () => apiFetch<ConfigMap>('/api/v1/config'),
   putConfig: (entries: ConfigMap) =>
     apiFetch<unknown>('/api/v1/config', { method: 'PUT', body: JSON.stringify(entries) }),
+  listSiteAuth: () => apiFetch<SiteAuthEntry[]>('/api/v1/site-auth'),
+  getSiteAuth: (site: string) =>
+    apiFetch<SiteAuthCredential>(`/api/v1/site-auth/${encodeURIComponent(site)}`),
+  saveSiteAuth: (request: SiteAuthCredential) =>
+    apiFetch<SiteAuthEntry>('/api/v1/site-auth', {
+      method: 'PUT',
+      body: JSON.stringify(request),
+    }),
+  deleteSiteAuth: (site: string) =>
+    apiFetch<unknown>(`/api/v1/site-auth/${encodeURIComponent(site)}`, { method: 'DELETE' }),
 
   refreshTrackerSub: () =>
     apiFetch<TrackerSubRefreshResponse>('/api/v1/bt/tracker-sub/refresh', { method: 'POST' }),
@@ -249,6 +270,11 @@ export const api = {
     apiFetch<unknown>(`/api/v1/plugins/${identity}/settings`, {
       method: 'PUT',
       body: JSON.stringify(entries),
+    }),
+  pluginAuth: (identity: string, request: { action: string; site?: string; authRef?: string; sessionId?: string; input?: string }) =>
+    apiFetch<PluginAuthResponse>(`/api/v1/plugins/${encodeURIComponent(identity)}/auth`, {
+      method: 'POST',
+      body: JSON.stringify(request),
     }),
   uninstallPlugin: (identity: string) =>
     apiFetch<unknown>(`/api/v1/plugins/${identity}`, { method: 'DELETE' }),

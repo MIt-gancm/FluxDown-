@@ -1,0 +1,166 @@
+//! 扩展页共用的版式小积木：分隔线、标题 / 元信息文字、状态行、空状态（卡片 / 对话框标题直接用 `fluxdown_ui_components::{card, dialog_title}`）。
+//!
+//! 规则与全应用一致：分隔线用 hairline；
+//! 标题 sm MEDIUM；说明 / 元信息 xs + 二级文字色；状态色只取扩展 token
+//! （成功 success、警示 warning、失败 destructive、进行中 primary）。
+
+use fluxdown_ui_theme::FluxThemeState;
+use gpui::{Div, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled, div};
+use gpui_component::{Icon, IconNamed, h_flex};
+
+use crate::pages::Frame;
+
+/// 卡片内的结构分隔线（hairline，`stroke.thin` 粗）。
+pub(crate) fn divider(frame: Frame<'_>) -> Div {
+    div()
+        .w_full()
+        .h(frame.extended.stroke.thin)
+        .flex_none()
+        .bg(frame.extended.colors.hairline)
+}
+
+/// 标题文字：sm MEDIUM 正文色。
+pub(crate) fn title_text(text: impl Into<SharedString>, frame: Frame<'_>) -> Div {
+    let sm = frame.tokens.typography.sm;
+    div()
+        .text_size(sm.size)
+        .line_height(sm.line_height)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(frame.tokens.colors.foreground)
+        .child(text.into())
+}
+
+/// 正文文字：sm 正文色。
+pub(crate) fn body_text(text: impl Into<SharedString>, frame: Frame<'_>) -> Div {
+    let sm = frame.tokens.typography.sm;
+    div()
+        .text_size(sm.size)
+        .line_height(sm.line_height)
+        .text_color(frame.tokens.colors.foreground)
+        .child(text.into())
+}
+
+/// 说明 / 元信息文字：xs 二级文字色。
+pub(crate) fn meta_text(text: impl Into<SharedString>, frame: Frame<'_>) -> Div {
+    let xs = frame.tokens.typography.xs;
+    div()
+        .text_size(xs.size)
+        .line_height(xs.line_height)
+        .text_color(frame.tokens.colors.muted_foreground)
+        .child(text.into())
+}
+
+/// 中性小胶囊（来源 / 版本 / 计数等标签）：caption 字号、muted 底、二级文字色、
+/// `components.badge.radius` 圆角。
+pub(crate) fn neutral_pill(text: impl Into<SharedString>, frame: Frame<'_>) -> Div {
+    let caption = frame.extended.caption;
+    div()
+        .flex_none()
+        .px(frame.tokens.spacing.sm)
+        .py(frame.tokens.spacing.xxs)
+        .rounded(frame.components.badge_radius)
+        .bg(frame.tokens.colors.muted)
+        .text_size(caption.size)
+        .line_height(caption.line_height)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(frame.tokens.colors.muted_foreground)
+        .child(text.into())
+}
+
+/// 状态行：`icon.md` 着色图标 + xs 文字（文字保持二级色，只有图标承载状态色）。
+pub(crate) fn status_line(
+    icon: impl IconNamed,
+    color: Hsla,
+    text: impl IntoElement,
+    frame: Frame<'_>,
+) -> Div {
+    let xs = frame.tokens.typography.xs;
+    h_flex()
+        .gap(frame.tokens.spacing.sm)
+        .items_start()
+        .child(
+            div()
+                .flex_none()
+                .h(xs.line_height)
+                .flex()
+                .items_center()
+                .child(
+                    Icon::new(icon)
+                        .size(frame.extended.icon.md)
+                        .text_color(color),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(xs.size)
+                .line_height(xs.line_height)
+                .text_color(frame.tokens.colors.muted_foreground)
+                .child(text),
+        )
+}
+
+/// 只读路径框：与输入框同高（统一控件档）、同描边；未选择时显示占位色文字。
+/// 配合 `input_with_action` + 「浏览」按钮使用。
+pub(crate) fn path_box(
+    text: impl Into<SharedString>,
+    placeholder: bool,
+    theme: &FluxThemeState,
+) -> Div {
+    let tokens = theme.tokens();
+    let sm = tokens.typography.sm;
+    h_flex()
+        .w_full()
+        .h(theme.density().control)
+        .px(tokens.spacing.md)
+        .items_center()
+        .rounded(tokens.radius.md)
+        .border(theme.extended().stroke.thin)
+        .border_color(tokens.colors.border)
+        .bg(tokens.colors.background)
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(sm.size)
+                .line_height(sm.line_height)
+                .text_color(if placeholder {
+                    tokens.colors.muted_foreground
+                } else {
+                    tokens.colors.foreground
+                })
+                .child(text.into()),
+        )
+}
+
+/// 状态色小胶囊：caption 字号，状态色文字 + 10% 同色底（失败 / 撤回等需要着色的状态）。
+pub(crate) fn tone_pill(text: impl Into<SharedString>, color: Hsla, frame: Frame<'_>) -> Div {
+    neutral_pill(text, frame)
+        .bg(color.opacity(0.1))
+        .text_color(color)
+}
+
+/// 空状态：32px 图标（text_tertiary）+ sm MEDIUM 标题 + 可选 xs 说明，居中。
+pub(crate) fn empty_state(
+    icon: impl IconNamed,
+    title: impl Into<SharedString>,
+    desc: Option<SharedString>,
+    frame: Frame<'_>,
+) -> Div {
+    let tokens = frame.tokens;
+    gpui_component::v_flex()
+        .w_full()
+        .items_center()
+        .justify_center()
+        .gap(tokens.spacing.xs)
+        .py(tokens.spacing.xl)
+        .child(
+            Icon::new(icon)
+                .size(frame.extended.icon.lg * 2.)
+                .text_color(frame.extended.colors.text_tertiary),
+        )
+        .child(title_text(title, frame).mt(tokens.spacing.xs))
+        .children(desc.map(|desc| meta_text(desc, frame).text_center()))
+}

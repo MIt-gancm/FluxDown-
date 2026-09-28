@@ -17,7 +17,7 @@ import {
   looksLikeJson,
   scanForMediaUrls,
 } from "@/utils/media-sniff";
-import { parseDashJson } from "@/utils/dash-manifest";
+import { parseDashJson, parseDashXml } from "@/utils/dash-manifest";
 export default defineUnlistedScript(() => {
   // 防止重复注入
   if ((window as any).__fluxdown_interceptor__) return;
@@ -27,6 +27,25 @@ export default defineUnlistedScript(() => {
   // 拦到标准 DASH JSON manifest 时派发：权威清晰度 + 视频/音频轨 URL 列表，
   // 供 Isolated World 转发给 background 存入 tab 级 manifest store。
   const FLUXDOWN_DASH_EVENT = "fluxdown-dash-manifest";
+  // SPA history changes are observed here because this script runs in MAIN
+  // world; the isolated content script cannot see page-world monkey patches.
+  const FLUXDOWN_PAGE_URL_EVENT = "fluxdown-page-url-changed";
+
+  function notifyPageUrlChanged(): void {
+    document.dispatchEvent(new CustomEvent(FLUXDOWN_PAGE_URL_EVENT));
+  }
+
+  const originalPushState = history.pushState;
+  const originalReplaceState = history.replaceState;
+  history.pushState = function (...args: Parameters<History["pushState"]>): void {
+    originalPushState.apply(this, args);
+    notifyPageUrlChanged();
+  };
+  history.replaceState = function (...args: Parameters<History["replaceState"]>): void {
+    originalReplaceState.apply(this, args);
+    notifyPageUrlChanged();
+  };
+  window.addEventListener("popstate", notifyPageUrlChanged);
 
   /** 已通知过的 URL 集合（防止重复通知） */
   const notifiedUrls = new Set<string>();
@@ -54,6 +73,25 @@ export default defineUnlistedScript(() => {
       lower === "application/octet-stream-m3u8" ||
       lower === "application/dash+xml"
     );
+  }
+
+  /** DASH 清单通常是 application/dash+xml，也可能是流 URL + text/xml/JSON。 */
+  function isDashManifestResponse(ct: string, url: string): boolean {
+    if (!isHttpUrl(url) || isSkippableCt(ct)) return false;
+    const lower = ct.toLowerCase();
+    if (
+      lower.includes("dash+xml") ||
+      lower.startsWith("text/xml") ||
+      lower.startsWith("application/xml")
+    ) return true;
+    if (lower.startsWith("text/html")) return false;
+    // Do not treat generic `/playlist` API endpoints as DASH merely because
+    // their path contains a streaming-looking word. JSON DASH endpoints may
+    // still be discovered by the guarded generic JSON branch below.
+    return /(?:\.mpd|\/manifest(?:\/|$))/i.test(url) &&
+      !lower.startsWith("video/") &&
+      !lower.startsWith("audio/") &&
+      !lower.includes("mpegurl");
   }
 
   /**
@@ -137,19 +175,37 @@ export default defineUnlistedScript(() => {
   const MAX_SNIFF_CL = 2 * 1024 * 1024; // Content-Length 门槛：>2MB 不读
   const MAX_SNIFF_READ = 512 * 1024; // 累积读上限：清单 / JSON API 均远小于此
 
+  function emitDashManifest(
+    manifest: ReturnType<typeof parseDashJson>,
+    url: string,
+  ): void {
+    if (!manifest) return;
+    document.dispatchEvent(
+      new CustomEvent(FLUXDOWN_DASH_EVENT, {
+        detail: {
+          manifest,
+          manifestUrl: url,
+          pageUrl: window.location.href,
+        },
+      }),
+    );
+  }
+
   /** JSON.parse 后的对象若命中标准 DASH 结构，派发权威轨对事件（结构驱动，无站点特判）。 */
   function tryDashManifest(obj: unknown, url: string): void {
     try {
-      const manifest = parseDashJson(obj, url);
-      if (manifest) {
-        document.dispatchEvent(
-          new CustomEvent(FLUXDOWN_DASH_EVENT, {
-            detail: { manifest, pageUrl: window.location.href },
-          }),
-        );
-      }
+      emitDashManifest(parseDashJson(obj, url), url);
     } catch {
       // 深扫异常绝不冒泡
+    }
+  }
+
+  /** XML MPD 响应体命中后派发权威轨道事件。 */
+  function tryDashXmlManifest(text: string, url: string): void {
+    try {
+      emitDashManifest(parseDashXml(text, url), url);
+    } catch {
+      // XML 解析异常绝不冒泡
     }
   }
 
@@ -164,6 +220,9 @@ export default defineUnlistedScript(() => {
       if (!text) return;
       const magic = sniffManifestMagic(text.slice(0, 512));
       if (magic) {
+        if (magic === "dash-manifest") {
+          tryDashXmlManifest(text, url);
+        }
         notify(type, url, magic);
         return;
       }
@@ -265,10 +324,11 @@ export default defineUnlistedScript(() => {
 
         // 响应体清单 / JSON 深扫：覆盖「通用 CT + 非 .m3u8 URL」的清单与 JSON 内嵌媒体 URL
         if (
-          !isMediaContentType(ct) &&
-          !isStreamingUrl(finalUrl) &&
-          isHttpUrl(finalUrl) &&
-          !isSkippableCt(ct) &&
+          (isDashManifestResponse(ct, finalUrl) ||
+            (!isMediaContentType(ct) &&
+              !isStreamingUrl(finalUrl) &&
+              isHttpUrl(finalUrl) &&
+              !isSkippableCt(ct))) &&
           (!cl || parseInt(cl, 10) <= MAX_SNIFF_CL)
         ) {
           readBodyAndSniff(response.clone(), finalUrl, ct).catch(() => {});
@@ -349,10 +409,11 @@ export default defineUnlistedScript(() => {
 
         // 响应体清单 / JSON 深扫（XHR）
         if (
-          !isMediaContentType(ct) &&
-          !isStreamingUrl(responseUrl) &&
-          isHttpUrl(responseUrl) &&
-          !isSkippableCt(ct)
+          isDashManifestResponse(ct, responseUrl) ||
+          (!isMediaContentType(ct) &&
+            !isStreamingUrl(responseUrl) &&
+            isHttpUrl(responseUrl) &&
+            !isSkippableCt(ct))
         ) {
           const rt = this.responseType;
           if (rt === "" || rt === "text") {
@@ -390,11 +451,11 @@ export default defineUnlistedScript(() => {
     return originalSend.apply(this, args);
   };
 
-  // ===== 一次性 CDN 下载 URL 抢先拦截 =====
+  // ===== 一次性 CDN 下载 URL 预识别 =====
   // 针对使用 AJAX 获取一次性签名 URL 再跳转下载的网站（如蓝奏云）。
-  // 通过拦截 AJAX 响应，在浏览器发起 CDN GET 之前将 URL 发给 FluxDown，
-  // 并由 background 通过 declarativeNetRequest 阻断浏览器的 CDN 请求，
-  // 确保 FluxDown 是第一个（也是唯一的）请求方。
+  // 此脚本只将 URL 标记给 background，用于识别需要页面继续执行的中转链接；
+  // 它不取消请求，也不会提前创建下载任务。最终的通用接管由
+  // downloads.onDeterminingFilename 在已知最终 URL 后完成。
   //
   // 目前支持的规则：
   //   - 蓝奏云系列 (/ajaxm.php)：响应 {zt:1, dom:"https://...", url:"/file/?token", inf:"filename"}

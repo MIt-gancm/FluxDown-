@@ -6,28 +6,11 @@
 tools:
   # write: 自动放行 read/write 层级工具，exec（bash/browser 等）需确认。
   # 想全自动时改回 yolo，或临时用 `omp --yolo`。
-  approvalMode: write
-  approval:
-    # 读类工具直接放行，减少打断
-    read: allow
-    grep: allow
-    glob: allow
-    lsp: allow
-    # 编辑类放行（write 模式下本就自动，显式写死防止全局层改动）
-    edit: allow
-    write: allow
-    ast_edit: allow
-    # bash 保持确认：破坏性命令的最终人工闸门（TTSR 规则先行机器拦截）
-    bash: allow
-    # 浏览器/联网类按需确认
-    browser: allow
-    # eval（JS/Python 内核）放行：与 bash 同级的执行工具
-    eval: allow
-    # task 放行：子代理是本配置的主要生产力路径；命令类红线由
-    # TTSR + RULES.md 随上下文传入子代理（子代理继承 context files 与规则）
-    task: allow
+  approvalMode: yolo
 
 # ---- TTSR：流中断规则（规则体见 .omp/rules/*.md）----
+# 安全红线类规则（no-unsafe-in-rust / no-unwrap-in-rust / forbidden-commands）用 after-gap 短间隔，
+# 保证同一会话内反复触碰仍会被再次拦截；风格提示类规则（windows-no-console-window）用 never 只提醒不中断。
 ttsr:
   enabled: true
   # discard：中断时丢弃违规半成品输出后重试，避免污染上下文

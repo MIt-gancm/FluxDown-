@@ -1,0 +1,14 @@
+{
+  "identity": "fluxdown@subscription-json",
+  "name": "JSON Subscription (示例)",
+  "version": "1.0.0",
+  "description": "演示插件订阅 provider：从 JSON 接口返回统一订阅条目。",
+  "homepage": "https://fluxdown.zerx.dev",
+  "subscriptions": [
+    {
+      "providerId": "json-feed",
+      "entry": "subscribe.js",
+      "timeoutMs": 10000
+    }
+  ]
+}

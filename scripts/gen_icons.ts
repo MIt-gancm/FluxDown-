@@ -10,7 +10,7 @@
  * 从 assets/logo/fluxdown_logo.svg 生成以下全部图标:
  *
  *   assets/logo/
- *     fluxdown_logo.png (600×600)
+ *     fluxdown_logo.png (600×600；Linux 打包图标，GPUI PC 客户端 X11 窗口图标同源)
  *     fluxdown_bolt.png (512×512, 内置备选应用图标「闪电」)
  *     logo.png (600×600)
  *     tray_iconTemplate.png (36×36, macOS 2x 菜单栏模板图标)
@@ -23,7 +23,7 @@
  *     tray_win_light.ico (16,32 — 浅色模式深蓝色箭头托盘图标)
  *
  *   macos/Runner/Assets.xcassets/AppIcon.appiconset/
- *     app_icon_{16,32,64,128,256,512,1024}.png
+ *     app_icon_{16,32,64,128,256,512,1024}.png（app_icon_512 同时是 GPUI 裸二进制的 Dock 图标）
  *
  *   ios/Runner/Assets.xcassets/AppIcon.appiconset/
  *     Icon-App-20x20@{1x,2x,3x}.png  Icon-App-29x29@{1x,2x,3x}.png

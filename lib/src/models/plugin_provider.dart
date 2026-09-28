@@ -5,6 +5,7 @@ import 'package:rinf/rinf.dart';
 
 import '../bindings/bindings.dart';
 import '../services/log_service.dart';
+import 'components_provider.dart';
 
 /// 插件系统状态（已安装列表 + 插件市场索引）。
 ///
@@ -21,6 +22,9 @@ class PluginProvider extends ChangeNotifier {
   PluginOpResult? _lastOpResult;
   int _opResultSeq = 0;
 
+  PluginAuthResult? _lastAuthResult;
+  int _authResultSeq = 0;
+
   PluginAutoDisabledNotice? _lastAutoDisabledNotice;
   int _autoDisabledSeq = 0;
 
@@ -28,6 +32,7 @@ class PluginProvider extends ChangeNotifier {
 
   StreamSubscription<RustSignalPack<PluginList>>? _pluginListSub;
   StreamSubscription<RustSignalPack<PluginOpResult>>? _opResultSub;
+  StreamSubscription<RustSignalPack<PluginAuthResult>>? _authResultSub;
   StreamSubscription<RustSignalPack<PluginAutoDisabledNotice>>?
   _autoDisabledSub;
   StreamSubscription<RustSignalPack<MarketIndexLoaded>>? _marketSub;
@@ -43,6 +48,7 @@ class PluginProvider extends ChangeNotifier {
     _disposed = true;
     _pluginListSub?.cancel();
     _opResultSub?.cancel();
+    _authResultSub?.cancel();
     _autoDisabledSub?.cancel();
     _marketSub?.cancel();
     super.dispose();
@@ -68,6 +74,9 @@ class PluginProvider extends ChangeNotifier {
   /// 随每次 [PluginOpResult] 信号单调递增，供调用方判断"是否是新结果"。
   int get opResultSeq => _opResultSeq;
 
+  PluginAuthResult? get lastAuthResult => _lastAuthResult;
+  int get authResultSeq => _authResultSeq;
+
   /// 最近一次熔断器自动禁用通知。
   PluginAutoDisabledNotice? get lastAutoDisabledNotice =>
       _lastAutoDisabledNotice;
@@ -82,6 +91,7 @@ class PluginProvider extends ChangeNotifier {
   void _startListening() {
     _pluginListSub = PluginList.rustSignalStream.listen(_onPluginList);
     _opResultSub = PluginOpResult.rustSignalStream.listen(_onOpResult);
+    _authResultSub = PluginAuthResult.rustSignalStream.listen(_onAuthResult);
     _autoDisabledSub = PluginAutoDisabledNotice.rustSignalStream.listen(
       _onAutoDisabled,
     );
@@ -101,6 +111,26 @@ class PluginProvider extends ChangeNotifier {
       'Plugin',
       'op result: op=${pack.message.op} identity=${pack.message.identity} '
           'ok=${pack.message.ok} failedKey=${pack.message.failedKey}',
+    );
+    // #399：插件 install/market_install/uninstall 成功后，其声明依赖的
+    // ffmpeg/yt-dlp 组件识别结果可能已变化（如系统 PATH 中原本存在但插件
+    // 安装前未探测过），主动广播重新探测，避免用户需要重启应用才能刷新。
+    if (pack.message.ok &&
+        (pack.message.op == 'install' ||
+            pack.message.op == 'market_install' ||
+            pack.message.op == 'uninstall')) {
+      ComponentController.refreshAllLive();
+    }
+    _safeNotifyListeners();
+  }
+
+  void _onAuthResult(RustSignalPack<PluginAuthResult> pack) {
+    _lastAuthResult = pack.message;
+    _authResultSeq++;
+    logInfo(
+      'Plugin',
+      'auth result: identity=${pack.message.identity} '
+          'status=${pack.message.status}',
     );
     _safeNotifyListeners();
   }
@@ -165,6 +195,25 @@ class PluginProvider extends ChangeNotifier {
   void setEnabled(String identity, bool enabled) {
     logInfo('Plugin', 'setEnabled: $identity=$enabled');
     SetPluginEnabled(identity: identity, enabled: enabled).sendSignalToRust();
+  }
+
+  void authenticate({
+    required String identity,
+    required String action,
+    String site = '',
+    String authRef = '',
+    String sessionId = '',
+    String input = '',
+  }) {
+    logInfo('Plugin', 'authenticate: $identity action=$action');
+    AuthenticatePlugin(
+      identity: identity,
+      action: action,
+      site: site,
+      authRef: authRef,
+      sessionId: sessionId,
+      input: input,
+    ).sendSignalToRust();
   }
 
   void saveSettings(String identity, Map<String, String> values) {

@@ -96,6 +96,8 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
   late String _queueId;
   String _uaPreset = 'default';
   bool _advancedOpen = false;
+  // #403：移动端补齐忽略证书错误开关，与桌面「高级」选项对齐。
+  bool _ignoreTlsErrors = false;
   StreamSubscription<SharedDownloadRequest>? _appendSub;
 
   @override
@@ -265,6 +267,8 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
         queueId: queueId,
         checksum: urls.length == 1 ? checksum : '',
         extraHeaders: headers,
+        // #403：透传移动端新增的忽略证书错误开关。
+        ignoreTlsErrors: _ignoreTlsErrors,
         startPaused: later,
       );
     }
@@ -399,6 +403,38 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
             ),
           ),
           if (_advancedOpen) ...[
+            // #403：忽略证书错误开关（自签名证书场景），与桌面「高级」选项对齐。
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        s.taskIgnoreTlsErrors,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w500,
+                          color: c.textPrimary,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        s.taskIgnoreTlsErrorsDesc,
+                        style: TextStyle(fontSize: 11.5, color: c.textMuted),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 12),
+                ShadSwitch(
+                  value: _ignoreTlsErrors,
+                  onChanged: (v) => setState(() => _ignoreTlsErrors = v),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             const MobileFieldLabel('User-Agent'),
             Wrap(
               spacing: 8,

@@ -1,0 +1,192 @@
+---
+import { Moon, Sun } from "lucide-react";
+import Logo from "./Logo.astro";
+import { BrandIcon } from "../icons/brand";
+import { common } from "../../i18n/messages/common";
+import { href, switchLang } from "../../i18n/routing";
+import { LANG_LABEL, LANGS, type Lang } from "../../i18n/config";
+import { GITHUB_URL, TELEGRAM_URL, docsPath } from "../../lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = common[lang].footer;
+const nav = common[lang].nav;
+const year = new Date().getFullYear();
+
+const columns = [
+  {
+    title: t.product,
+    links: [
+      { label: t.download, path: "/download" },
+      { label: t.features, path: "/#features" },
+      { label: t.plugins, path: "/plugins" },
+      { label: t.themes, path: "/themes" },
+      { label: t.changelog, path: "/changelog" },
+      { label: t.pricing, path: "/pricing" },
+    ],
+  },
+  {
+    title: t.resources,
+    links: [
+      { label: t.docs, path: docsPath(lang) },
+      { label: t.apiDocs, path: "/api-docs" },
+      { label: t.faq, path: "/faq" },
+      { label: t.macosGatekeeper, path: "/macos-gatekeeper" },
+      { label: t.securityAlert, path: "/security-alert" },
+    ],
+  },
+  {
+    title: t.community,
+    links: [
+      { label: t.announcements, path: "/announcements" },
+      { label: t.feedback, path: "/feedback" },
+      { label: t.featureVote, path: "/feature-vote" },
+      { label: t.sponsor, path: "/sponsor" },
+      { label: t.telegram, path: "/telegram-group" },
+      { label: t.qq, path: "/qq-group" },
+    ],
+  },
+  {
+    title: t.legal,
+    links: [
+      { label: t.privacy, path: "/privacy" },
+      { label: t.terms, path: "/terms" },
+      { label: t.codeSigning, path: "/code-signing" },
+    ],
+  },
+];
+---
+
+<footer class="site-footer frame">
+  <div class="rule"></div>
+  <div class="grid gap-12 px-[clamp(20px,4vw,56px)] pb-10 pt-16 md:grid-cols-[1.3fr_repeat(4,1fr)]">
+    <div class="flex flex-col gap-5">
+      <Logo size={26} />
+      <p class="max-w-[30ch] text-[14px] leading-relaxed text-muted">{common[lang].brandTagline}</p>
+      <div class="flex flex-wrap gap-2">
+        <span class="chip"><span class="live-dot"></span>{t.status}</span>
+      </div>
+      <div class="flex items-center gap-1 text-muted">
+        <a href={GITHUB_URL} target="_blank" rel="noopener" class="icon-btn" aria-label="GitHub">
+          <BrandIcon name="github" size={16} />
+        </a>
+        <a href={TELEGRAM_URL} target="_blank" rel="noopener" class="icon-btn" aria-label="Telegram">
+          <BrandIcon name="telegram" size={16} />
+        </a>
+        <a href={href("/qq-group", lang)} class="icon-btn" aria-label={nav.qq}>
+          <BrandIcon name="qq" size={16} />
+        </a>
+      </div>
+    </div>
+    {
+      columns.map((column) => (
+        <div>
+          <div class="eyebrow-plain mb-4">{column.title}</div>
+          <ul class="flex flex-col gap-2.5">
+            {column.links.map((link) => (
+              <li>
+                <a href={href(link.path, lang)} class="footer-link">
+                  {link.label}
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))
+    }
+  </div>
+
+  <div class="wordmark spot" aria-hidden="true">
+    <span>FluxDown</span>
+  </div>
+
+  <div
+    class="flex flex-col gap-4 border-t border-line px-[clamp(20px,4vw,56px)] py-5 text-[12.5px] text-subtle sm:flex-row sm:items-center sm:justify-between"
+  >
+    <div class="mono flex flex-wrap items-center gap-x-4 gap-y-1">
+      <span>{t.copyright(year)}</span>
+      <span>{t.license}</span>
+      <span>{t.built}</span>
+    </div>
+    <div class="flex items-center gap-1">
+      {
+        LANGS.map((l) => (
+          <a
+            href={switchLang(Astro.url.pathname, l)}
+            hreflang={l}
+            class:list={["footer-lang", l === lang && "is-current"]}
+            aria-current={l === lang ? "true" : undefined}
+          >
+            {LANG_LABEL[l]}
+          </a>
+        ))
+      }
+      <span class="mx-1 h-4 w-px bg-line"></span>
+      <button type="button" class="icon-btn" data-theme-toggle aria-label={common[lang].theme.toggle}>
+        <Sun size={15} strokeWidth={1.75} className="theme-sun" />
+        <Moon size={15} strokeWidth={1.75} className="theme-moon" />
+      </button>
+    </div>
+  </div>
+</footer>
+
+<style is:global>
+  @layer components {
+    .site-footer {
+      margin-top: 0;
+    }
+    .footer-link {
+      font-size: 13.5px;
+      color: var(--fg-muted);
+      transition: color 150ms;
+    }
+    .footer-link:hover {
+      color: var(--fg);
+    }
+    .footer-lang {
+      padding: 4px 8px;
+      border-radius: 6px;
+      transition:
+        color 150ms,
+        background-color 150ms;
+    }
+    .footer-lang:hover {
+      color: var(--fg);
+    }
+    .footer-lang.is-current {
+      color: var(--fg);
+      background: var(--bg-inset);
+    }
+    .wordmark {
+      position: relative;
+      overflow: hidden;
+      height: clamp(90px, 16vw, 210px);
+      user-select: none;
+    }
+    .wordmark span {
+      position: absolute;
+      inset: 0.02em 0 auto;
+      text-align: center;
+      font-size: clamp(110px, 21.5vw, 290px);
+      font-weight: 700;
+      line-height: 0.9;
+      letter-spacing: -0.07em;
+      white-space: nowrap;
+      color: transparent;
+      -webkit-text-stroke: 1px var(--line-strong);
+      background: radial-gradient(
+        340px circle at var(--mx, 50%) var(--my, 120%),
+        color-mix(in oklch, var(--accent) 70%, transparent),
+        transparent 70%
+      );
+      -webkit-background-clip: text;
+      background-clip: text;
+      mask-image: linear-gradient(to bottom, #000 35%, transparent 100%);
+    }
+    .wordmark.spot::after {
+      display: none;
+    }
+  }
+</style>

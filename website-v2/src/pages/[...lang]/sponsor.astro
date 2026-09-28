@@ -1,0 +1,28 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import SponsorSupport from "@/components/sponsor/SponsorSupport";
+import SponsorWall from "@/components/sponsor/SponsorWall";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { sponsor } from "@/i18n/messages/sponsor";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = sponsor[lang];
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
+
+  <div class="frame">
+    <div class="cells lg:grid-cols-[minmax(0,6fr)_minmax(0,5fr)]">
+      <section class="section-tight" aria-label={t.eyebrow}>
+        <SponsorSupport client:load lang={lang} />
+      </section>
+      <section class="section-tight" aria-labelledby="sponsor-wall-heading">
+        <SponsorWall client:visible lang={lang} />
+      </section>
+    </div>
+    <div class="rule"></div>
+  </div>
+</Layout>

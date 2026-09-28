@@ -1,0 +1,57 @@
+---
+/** 命令行与 Android 两组构建,并排显示。 */
+import { SquareTerminal } from "lucide-react";
+import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
+import { BrandIcon } from "@/components/icons/brand";
+import { download } from "@/i18n/messages/download";
+import type { Lang } from "@/i18n/config";
+import { GITHUB_URL } from "@/lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = download[lang];
+const fallback = `${GITHUB_URL}/releases`;
+
+const c = "cli.assets";
+const cli: RowSpec[] = [
+  { path: `${c}.windows_x64`, label: t.os.windows, detail: "x64", ext: ".zip" },
+  { path: `${c}.windows_arm64`, label: t.os.windows, detail: "ARM64", ext: ".zip" },
+  { path: `${c}.linux_x64`, label: t.os.linux, detail: "x64", ext: ".tar.gz" },
+  { path: `${c}.linux_arm64`, label: t.os.linux, detail: "ARM64", ext: ".tar.gz" },
+  { path: `${c}.macos_arm64`, label: t.os.macos, detail: t.arch.appleSilicon, ext: ".tar.gz" },
+  { path: `${c}.macos_x64`, label: t.os.macos, detail: t.arch.intel, ext: ".tar.gz" },
+];
+const m = "mobile.assets";
+const android: RowSpec[] = [
+  { path: `${m}.android_arm64`, label: "arm64-v8a", ext: ".apk" },
+  { path: `${m}.android_armv7`, label: "armeabi-v7a", ext: ".apk" },
+  { path: `${m}.android_x64`, label: "x86_64", ext: ".apk" },
+  { path: `${m}.android_universal`, label: t.android.universal, ext: ".apk" },
+];
+---
+
+<section class="frame" aria-label={`${t.cli.title} · ${t.android.title}`}>
+  <div class="cells tools">
+    <AssetGroup lang={lang} id="cli" title={t.cli.title} desc={t.cli.desc} versionPath="cli.version" fallback={fallback} rows={cli}>
+      <Fragment slot="icon"><SquareTerminal size={16} strokeWidth={1.75} /></Fragment>
+      <a class="link mt-auto self-start text-[13px]" href={`/docs/${lang}/api/cli/`}>{t.cli.docs}</a>
+    </AssetGroup>
+    <AssetGroup lang={lang} id="android" os="android" title={t.android.title} desc={t.android.desc} versionPath="mobile.version" fallback={fallback} rows={android} notifyHref="#subscribe">
+      <Fragment slot="icon"><BrandIcon name="android" size={16} /></Fragment>
+    </AssetGroup>
+  </div>
+  <div class="rule"></div>
+</section>
+
+<style>
+  .tools {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 760px) {
+    .tools {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+</style>

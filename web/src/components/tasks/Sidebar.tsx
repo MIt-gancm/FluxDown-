@@ -532,6 +532,7 @@ function RssSourceRow({ source: s }: { source: RssSourceDto }) {
           title={errTip || (s.enabled ? t('rss.stateEnabled') : t('rss.stateDisabled'))}
         />
         <span title={errTip || displayName}>{displayName}</span>
+        {s.providerId !== 'rss' && <small className="text-text3">{s.providerId}</small>}
         <em>{s.unreadCount || ''}</em>
       </button>
       <div className="queue-actions">

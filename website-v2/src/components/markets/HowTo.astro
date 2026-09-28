@@ -1,0 +1,43 @@
+---
+/** 市场页底部「如何使用」:三步编号格 + 指南外链(静态渲染,不依赖索引加载)。 */
+import { ArrowUpRight } from "lucide-react";
+
+interface Props {
+  eyebrow: string;
+  title: string;
+  steps: readonly string[];
+  guide: { href: string; label: string };
+}
+const { eyebrow, title, steps, guide } = Astro.props;
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section-tight">
+    <span class="eyebrow">{eyebrow}</span>
+    <h2 class="h3 mt-3" data-reveal>{title}</h2>
+  </div>
+  <ol class="cells grid-cols-1 border-t border-line md:grid-cols-3">
+    {
+      steps.map((step, i) => (
+        <li class="cell flex flex-col gap-4" data-reveal style={`--d:${i}`}>
+          <span class="num font-mono text-[11px] tracking-[0.14em] text-subtle">
+            {String(i + 1).padStart(2, "0")} / {String(steps.length).padStart(2, "0")}
+          </span>
+          <p class="text-[14.5px] leading-relaxed text-muted">{step}</p>
+          {i === steps.length - 1 && (
+            <a
+              href={guide.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              class="link mt-auto inline-flex items-center gap-1 text-sm"
+            >
+              {guide.label}
+              <ArrowUpRight size={14} aria-hidden="true" />
+            </a>
+          )}
+        </li>
+      ))
+    }
+  </ol>
+</section>

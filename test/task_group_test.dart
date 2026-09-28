@@ -312,6 +312,25 @@ void main() {
       },
     );
 
+    test('member files use natural order within their full paths', () {
+      final members = [
+        _task(id: 'v10', fileName: 'ep10.mp4', saveDir: '/root/Group/videos'),
+        _task(id: 'v2', fileName: 'ep2.mp4', saveDir: '/root/Group/videos'),
+        _task(id: 'v1', fileName: 'ep1.mp4', saveDir: '/root/Group/videos'),
+      ];
+
+      final flat = flattenGroupMembers(
+        group: group,
+        members: members,
+        isDirCollapsed: (_) => false,
+      );
+
+      expect(
+        flat.whereType<GroupMemberEntity>().map((e) => e.task.id),
+        ['v1', 'v2', 'v10'],
+      );
+    });
+
     test('collapsed directory hides its member rows but keeps the dir header', () {
       final members = [
         _task(id: 'v1', fileName: 'ep1.mp4', saveDir: '/root/Group/videos'),

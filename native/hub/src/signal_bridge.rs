@@ -188,6 +188,8 @@ impl From<rss_model::RssSourceInfo> for signals::RssSourceEntry {
     fn from(s: rss_model::RssSourceInfo) -> Self {
         Self {
             source_id: s.source_id,
+            provider_id: s.provider_id,
+            provider_config: s.provider_config,
             url: s.url,
             name: s.name,
             enabled: s.enabled,
@@ -226,6 +228,8 @@ impl From<signals::RssSourceEntry> for rss_model::RssSourceInfo {
     fn from(s: signals::RssSourceEntry) -> Self {
         Self {
             source_id: s.source_id,
+            provider_id: s.provider_id,
+            provider_config: s.provider_config,
             url: s.url,
             name: s.name,
             enabled: s.enabled,

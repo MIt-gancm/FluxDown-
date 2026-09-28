@@ -51,6 +51,9 @@ struct MockHostInner {
     renamed: Vec<(String, String)>,
     /// 一次性：下一次 `rename_task` 返回该错误（模拟引擎错误码透传）。
     rename_error: Option<ApiError>,
+    changed_url: Vec<(String, String)>,
+    /// 一次性：下一次 `change_task_url` 返回该错误（模拟引擎错误码透传）。
+    change_url_error: Option<ApiError>,
     pause_all_calls: u32,
     continue_all_calls: u32,
     config: HashMap<String, String>,
@@ -127,6 +130,11 @@ impl MockHost {
         self
     }
 
+    fn with_change_url_error(mut self, err: ApiError) -> Self {
+        self.inner.get_mut().unwrap().change_url_error = Some(err);
+        self
+    }
+
     /// 模拟宿主未接线任务事件源：`subscribe_task_events()` 恒返回 `None`。
     fn without_task_events(mut self) -> Self {
         self.events = None;
@@ -159,6 +167,10 @@ impl MockHost {
 
     fn renamed(&self) -> Vec<(String, String)> {
         self.inner.lock().unwrap().renamed.clone()
+    }
+
+    fn changed_url(&self) -> Vec<(String, String)> {
+        self.inner.lock().unwrap().changed_url.clone()
     }
 
     fn pause_all_calls(&self) -> u32 {
@@ -261,6 +273,17 @@ impl ApiHost for MockHost {
         inner
             .renamed
             .push((task_id.to_string(), file_name.to_string()));
+        Ok(())
+    }
+
+    async fn change_task_url(&self, task_id: &str, url: &str) -> Result<(), ApiError> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(e) = inner.change_url_error.take() {
+            return Err(e);
+        }
+        inner
+            .changed_url
+            .push((task_id.to_string(), url.to_string()));
         Ok(())
     }
 
@@ -1516,6 +1539,106 @@ async fn rename_task_without_token_returns_401_and_bad_payload_returns_400() {
         .await;
     assert_eq!(bad.status, 400);
     assert!(server.host.renamed().is_empty());
+}
+
+#[tokio::test]
+async fn change_task_url_forwards_camel_case_body_to_host() {
+    let server = TestServer::start(MockHost::new(), |c| {
+        c.token.set("T");
+        c.management_enabled = true;
+    })
+    .await;
+    let body = json!({"url": "http://example.com/new.bin"}).to_string();
+    let resp = server
+        .send(&request(
+            "PUT",
+            &routes::task_url_path("t1"),
+            &[("X-FluxDown-Token", "T")],
+            &body,
+        ))
+        .await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        server.host.changed_url(),
+        vec![("t1".to_string(), "http://example.com/new.bin".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn change_task_url_maps_engine_error_codes_to_status_and_passes_message_through() {
+    // 错误码字符串必须原样出现在响应 `message` 里（web 端据此做 i18n 映射）；
+    // HTTP 状态按 ApiError 惯例：400/404/409。
+    let cases = [
+        (
+            ApiError::BadRequest("invalid-url".to_string()),
+            400,
+            "invalid-url",
+        ),
+        (ApiError::NotFound, 404, "not found"),
+        (
+            ApiError::Conflict("task-active".to_string()),
+            409,
+            "task-active",
+        ),
+        (
+            ApiError::Conflict("task-completed".to_string()),
+            409,
+            "task-completed",
+        ),
+        (
+            ApiError::Conflict("bt-unsupported".to_string()),
+            409,
+            "bt-unsupported",
+        ),
+        (
+            ApiError::Conflict("protocol-mismatch".to_string()),
+            409,
+            "protocol-mismatch",
+        ),
+    ];
+    for (err, status, message) in cases {
+        let server = TestServer::start(MockHost::new().with_change_url_error(err), |c| {
+            c.token.set("T");
+            c.management_enabled = true;
+        })
+        .await;
+        let body = json!({"url": "http://example.com/new.bin"}).to_string();
+        let resp = server
+            .send(&request(
+                "PUT",
+                &routes::task_url_path("t1"),
+                &[("X-FluxDown-Token", "T")],
+                &body,
+            ))
+            .await;
+        assert_eq!(resp.status, status, "message={message}");
+        assert_eq!(resp.json()["message"], message);
+        assert!(server.host.changed_url().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn change_task_url_without_token_returns_401_and_bad_payload_returns_400() {
+    let server = TestServer::start(MockHost::new(), |c| {
+        c.token.set("T");
+        c.management_enabled = true;
+    })
+    .await;
+    let body = json!({"url": "http://example.com/new.bin"}).to_string();
+    let resp = server
+        .send(&request("PUT", &routes::task_url_path("t1"), &[], &body))
+        .await;
+    assert_eq!(resp.status, 401);
+    let bad = server
+        .send(&request(
+            "PUT",
+            &routes::task_url_path("t1"),
+            &[("X-FluxDown-Token", "T")],
+            "{}",
+        ))
+        .await;
+    assert_eq!(bad.status, 400);
+    assert!(server.host.changed_url().is_empty());
 }
 
 // ---------------------------------------------------------------------------

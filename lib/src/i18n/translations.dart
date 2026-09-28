@@ -114,6 +114,8 @@ class S {
   String get deleteQueueAction => _r('deleteQueueAction');
   String get queueNameLabel => _r('queueNameLabel');
   String get queueNameHint => _r('queueNameHint');
+  String get queueNameRequired => _r('queueNameRequired');
+  String get queueSaveAction => _r('queueSaveAction');
   String get queueSpeedLimit => _r('queueSpeedLimit');
   String get queueSpeedLimitHint => _r('queueSpeedLimitHint');
   String get queueUploadLimit => _r('queueUploadLimit');
@@ -134,6 +136,12 @@ class S {
   String get mainQueue => _r('mainQueue');
   String get laterQueue => _r('laterQueue');
   String get ungroupedTasks => _r('ungroupedTasks');
+  String get remoteTasksGroup => _r('remoteTasksGroup');
+  String get tooManyWindowsHint => _r('tooManyWindowsHint');
+  String get openTaskInWindowAction => _r('openTaskInWindowAction');
+  String get taskWindowPinOnTop => _r('taskWindowPinOnTop');
+  String get unsupportedDropHint => _r('unsupportedDropHint');
+  String get taskCreatedToast => _r('taskCreatedToast');
   String get startQueueAction => _r('startQueueAction');
   String get stopQueueAction => _r('stopQueueAction');
   String get queueRunningBadge => _r('queueRunningBadge');
@@ -154,6 +162,8 @@ class S {
   String get queueScheduleStopLabel => _r('queueScheduleStopLabel');
   String get queueScheduleTimeHint => _r('queueScheduleTimeHint');
   String get queueScheduleTimeInvalid => _r('queueScheduleTimeInvalid');
+  String get queueScheduleTimeUnset => _r('queueScheduleTimeUnset');
+  String get queueScheduleTimePickHint => _r('queueScheduleTimePickHint');
   String get queueScheduleDays => _r('queueScheduleDays');
   String get weekdaysShort => _r('weekdaysShort');
   String get queueTasksOrderHint => _r('queueTasksOrderHint');
@@ -181,6 +191,7 @@ class S {
   // ─────────────────────────────────────────────
   String get newDownload => _r('newDownload');
   String get searchPlaceholder => _r('searchPlaceholder');
+  String get searchTasksPlaceholder => _r('searchTasksPlaceholder');
   String get searchGroupTasks => _r('searchGroupTasks');
   String get searchGroupSettings => _r('searchGroupSettings');
   String settingsSearchSubtitle(String catLabel, String desc) =>
@@ -251,6 +262,7 @@ class S {
   String get viewGroupType => _r('viewGroupType');
   String get viewGroupQueue => _r('viewGroupQueue');
   String get viewGroupSite => _r('viewGroupSite');
+  String get viewGroupGroup => _r('viewGroupGroup');
   String get viewGroupNone => _r('viewGroupNone');
   String get viewSortSmart => _r('viewSortSmart');
   String get viewSortCreated => _r('viewSortCreated');
@@ -366,6 +378,43 @@ class S {
   String get detailTabGeneral => _r('detailTabGeneral');
   String get detailTabQueue => _r('detailTabQueue');
   String get detailTabLog => _r('detailTabLog');
+  String get taskActiveTransfers => _r('taskActiveTransfers');
+  String get taskConnectedPeers => _r('taskConnectedPeers');
+  String get detailActiveTransfers => _r('detailActiveTransfers');
+  String get detailConnectedPeers => _r('detailConnectedPeers');
+  String get detailActivityLoading => _r('detailActivityLoading');
+  String get detailActivityLoadMore => _r('detailActivityLoadMore');
+  String get detailActivityRetry => _r('detailActivityRetry');
+  String get detailActivityQueryFailed => _r('detailActivityQueryFailed');
+  String get detailActivityTruncated => _r('detailActivityTruncated');
+  String detailActivityRetainedRange(String oldest, String newest) =>
+      _r('detailActivityRetainedRange', {'oldest': oldest, 'newest': newest});
+  String get detailActivityKindCreated => _r('detailActivityKindCreated');
+  String get detailActivityKindStarted => _r('detailActivityKindStarted');
+  String get detailActivityKindPaused => _r('detailActivityKindPaused');
+  String get detailActivityKindResumed => _r('detailActivityKindResumed');
+  String get detailActivityKindCompleted => _r('detailActivityKindCompleted');
+  String get detailActivityKindFailed => _r('detailActivityKindFailed');
+  String get detailActivityKindDeleted => _r('detailActivityKindDeleted');
+  String get detailActivityKindRetry => _r('detailActivityKindRetry');
+  String get detailActivityKindRetrying => _r('detailActivityKindRetrying');
+  String get detailActivityKindStatusChanged =>
+      _r('detailActivityKindStatusChanged');
+  String get detailActivityKindStatus => _r('detailActivityKindStatus');
+  String get detailActivityKindError => _r('detailActivityKindError');
+  String get detailActivityKindSplit => _r('detailActivityKindSplit');
+  String get detailActivityKindCdnPool => _r('detailActivityKindCdnPool');
+  String get detailActivityKindCdnKick => _r('detailActivityKindCdnKick');
+  String get detailActivityKindCdnBreaker => _r('detailActivityKindCdnBreaker');
+  String get detailActivityKindCdnFallback =>
+      _r('detailActivityKindCdnFallback');
+  String get detailActivityKindCdnSummary => _r('detailActivityKindCdnSummary');
+  String get detailActivityKindNicLinks => _r('detailActivityKindNicLinks');
+  String get detailActivityKindNicOff => _r('detailActivityKindNicOff');
+  String get detailActivityKindJournalOverflow =>
+      _r('detailActivityKindJournalOverflow');
+  String get detailActivityJournalGap => _r('detailActivityJournalGap');
+  String get detailActivityKindUnknown => _r('detailActivityKindUnknown');
   String get detailTabAdvanced => _r('detailTabAdvanced');
   String get detailBoostActive => _r('detailBoostActive');
   String get infoProtocolSource => _r('infoProtocolSource');
@@ -424,6 +473,23 @@ class S {
   String detailLogCdnSummaryNode(String ip, String bytes, String speed) =>
       _r('detailLogCdnSummaryNode', {'ip': ip, 'bytes': bytes, 'speed': speed});
   String get detailCdnNodeSys => _r('detailCdnNodeSys');
+  String detailCdnNodeNic(String name) =>
+      _r('detailCdnNodeNic', {'name': name});
+  String detailLogNicKick(String name, String reason) =>
+      _r('detailLogNicKick', {'name': name, 'reason': reason});
+  String detailLogNicLinks(String host, int n) =>
+      _r('detailLogNicLinks', {'host': host, 'n': n});
+  String detailLogNicSummary(String host) =>
+      _r('detailLogNicSummary', {'host': host});
+  String detailLogNicOff(String reason) =>
+      _r('detailLogNicOff', {'reason': reason});
+  String get detailNicOffProxy => _r('detailNicOffProxy');
+  String get detailNicOffFakeIp => _r('detailNicOffFakeIp');
+  String get detailNicOffLocalTarget => _r('detailNicOffLocalTarget');
+  String get detailNicOffVpn => _r('detailNicOffVpn');
+  String get detailNicOffPrimaryUnknown => _r('detailNicOffPrimaryUnknown');
+  String get detailNicOffNoExtra => _r('detailNicOffNoExtra');
+  String get detailNicOffDns => _r('detailNicOffDns');
   String get detailNotSet => _r('detailNotSet');
   String get detailFollowGlobal => _r('detailFollowGlobal');
   String get detailActionFolder => _r('detailActionFolder');
@@ -520,6 +586,8 @@ class S {
   String shutdownCountdown(String time) =>
       _r('shutdownCountdown', {'time': time});
   String get shutdownCancelButton => _r('shutdownCancelButton');
+  String diskSpaceFreeLabel(String size) =>
+      _r('diskSpaceFreeLabel', {'size': size});
 
   // ─────────────────────────────────────────────
   // Settings — 分类
@@ -830,6 +898,10 @@ class S {
   String get closeToTrayDesc => _r('closeToTrayDesc');
   String get startMinimizedToTray => _r('startMinimizedToTray');
   String get startMinimizedToTrayDesc => _r('startMinimizedToTrayDesc');
+  String get trayUnavailableNoHost => _r('trayUnavailableNoHost');
+  String get trayUnavailableNoDisplay => _r('trayUnavailableNoDisplay');
+  String get trayUnavailableInitFailed => _r('trayUnavailableInitFailed');
+  String get trayUnavailableNotBuilt => _r('trayUnavailableNotBuilt');
   String get floatingBall => _r('floatingBall');
   String get floatingBallDesc => _r('floatingBallDesc');
   String get floatingBallActiveOnly => _r('floatingBallActiveOnly');
@@ -848,10 +920,24 @@ class S {
   String get ed2kLinkAssociationDesc => _r('ed2kLinkAssociationDesc');
   String get magnetLinkAssociation => _r('magnetLinkAssociation');
   String get magnetLinkAssociationDesc => _r('magnetLinkAssociationDesc');
+  String get associationOffIgnored => _r('associationOffIgnored');
   String get torrentAssocDialogTitle => _r('torrentAssocDialogTitle');
   String get torrentAssocDialogDesc => _r('torrentAssocDialogDesc');
   String get notifyOnComplete => _r('notifyOnComplete');
   String get notifyOnCompleteDesc => _r('notifyOnCompleteDesc');
+  String get progressWindowGroup => _r('progressWindowGroup');
+  String get showProgressWindow => _r('showProgressWindow');
+  String get showProgressWindowDesc => _r('showProgressWindowDesc');
+  String get showCompletionWindow => _r('showCompletionWindow');
+  String get showCompletionWindowDesc => _r('showCompletionWindowDesc');
+  String get progressWindowTitle => _r('progressWindowTitle');
+  String get progressWindowStop => _r('progressWindowStop');
+  String progressWindowSegments(int n) =>
+      _r('progressWindowSegments', {'n': n});
+  String get progressWindowPartsShow => _r('progressWindowPartsShow');
+  String get progressWindowPartsHide => _r('progressWindowPartsHide');
+  String get progressWindowPartWaiting => _r('progressWindowPartWaiting');
+  String get progressWindowShowCompletion => _r('progressWindowShowCompletion');
   String get silentDownload => _r('silentDownload');
   String get silentDownloadDesc => _r('silentDownloadDesc');
   String get silentSkipSelection => _r('silentSkipSelection');
@@ -1017,6 +1103,7 @@ class S {
   String get builtinCategory => _r('builtinCategory');
   String get customCategory => _r('customCategory');
   String get categoryPriorityNote => _r('categoryPriorityNote');
+  String get categoryPriorityDragNote => _r('categoryPriorityDragNote');
   String get settingFailed => _r('settingFailed');
   String get autoStartupFailedDesc => _r('autoStartupFailedDesc');
 
@@ -1088,6 +1175,11 @@ class S {
   String get autoMaxConnectionsDesc => _r('autoMaxConnectionsDesc');
   String get cdnMultiEnabled => _r('cdnMultiEnabled');
   String get cdnMultiEnabledDesc => _r('cdnMultiEnabledDesc');
+  String get multiNicEnabled => _r('multiNicEnabled');
+  String get multiNicEnabledDesc => _r('multiNicEnabledDesc');
+  String get multiNicHelpTitle => _r('multiNicHelpTitle');
+  String get multiNicHelpHint => _r('multiNicHelpHint');
+  String get multiNicHelp => _r('multiNicHelp');
   String get cdnMultiProxyConfirmTitle => _r('cdnMultiProxyConfirmTitle');
   String get cdnMultiProxyConfirmDescSystem =>
       _r('cdnMultiProxyConfirmDescSystem');
@@ -1363,6 +1455,8 @@ class S {
   String get btTrackerSubUpdateFailed => _r('btTrackerSubUpdateFailed');
   String get btTrackerSubPlaceholder => _r('btTrackerSubPlaceholder');
   String get btTrackerSubResetConfirm => _r('btTrackerSubResetConfirm');
+  String get btTrackerSubUrls => _r('btTrackerSubUrls');
+  String get btTrackerSubUrlsDesc => _r('btTrackerSubUrlsDesc');
   String get btPortInvalid => _r('btPortInvalid');
 
   // ─────────────────────────────────────────────
@@ -1448,6 +1542,8 @@ class S {
   String get ed2kServerSubUpdateFailed => _r('ed2kServerSubUpdateFailed');
   String get ed2kServerSubPlaceholder => _r('ed2kServerSubPlaceholder');
   String get ed2kServerSubResetConfirm => _r('ed2kServerSubResetConfirm');
+  String get ed2kServerSubUrls => _r('ed2kServerSubUrls');
+  String get ed2kServerSubUrlsDesc => _r('ed2kServerSubUrlsDesc');
 
   // ─────────────────────────────────────────────
   // File picker 错误
@@ -1589,6 +1685,9 @@ class S {
   List<String> get searchKeywordsCdnMulti =>
       _r('searchKeywordsCdnMulti').split(',')
         ..addAll(['cdn', 'node', 'multi-cdn', 'concurrent']);
+  List<String> get searchKeywordsMultiNic =>
+      _r('searchKeywordsMultiNic').split(',')
+        ..addAll(['nic', 'network', 'interface', 'multi-nic', 'aggregation']);
   List<String> get searchKeywordsSpeedLimit =>
       _r('searchKeywordsSpeedLimit').split(',')
         ..addAll(['speed', 'limit', 'bandwidth']);
@@ -1694,16 +1793,29 @@ class S {
   String get resolveVariantDesc => _r('resolveVariantDesc');
 
   // ─────────────────────────────────────────────
+  // GPUI 交互选择窗口（HLS/BT/变体通用）
+  // ─────────────────────────────────────────────
+  String selectionAutoDefaultIn(int seconds) =>
+      _r('selectionAutoDefaultIn', {'seconds': seconds});
+
+  // ─────────────────────────────────────────────
+  // GPUI 新建下载窗口：外部捕获提示
+  // ─────────────────────────────────────────────
+  String get newDownloadCaptureContextHint =>
+      _r('newDownloadCaptureContextHint');
+  String get newDownloadCaptureAuthHint => _r('newDownloadCaptureAuthHint');
+
+  // ─────────────────────────────────────────────
   // TrayService
   // ─────────────────────────────────────────────
   String get trayShowWindow => _r('trayShowWindow');
   String get trayExit => _r('trayExit');
+  String get trayCancelShutdown => _r('trayCancelShutdown');
 
   // ─────────────────────────────────────────────
   // 应用菜单与桌面标题栏
   // ─────────────────────────────────────────────
   String get menuFile => _r('menuFile');
-  String get menuItemsPending => _r('menuItemsPending');
   String get menuTasks => _r('menuTasks');
   String get menuTools => _r('menuTools');
   String get menuNewDownload => _r('menuNewDownload');
@@ -1719,6 +1831,18 @@ class S {
   String get menuWebsite => _r('menuWebsite');
   String get menuFeedback => _r('menuFeedback');
   String get menuAbout => _r('menuAbout');
+  String get menuOpenLogsFolder => _r('menuOpenLogsFolder');
+  String get menuOpenInWindow => _r('menuOpenInWindow');
+  String get menuClearFinished => _r('menuClearFinished');
+  String get menuDetailPanel => _r('menuDetailPanel');
+  String get menuCycleDensity => _r('menuCycleDensity');
+  String get menuCycleGroupBy => _r('menuCycleGroupBy');
+  String get menuCycleSort => _r('menuCycleSort');
+  String get closeWithActiveTasksTitle => _r('closeWithActiveTasksTitle');
+  String get closeWithActiveTasksHint => _r('closeWithActiveTasksHint');
+  String get protocolVersionLabel => _r('protocolVersionLabel');
+  String get updateAvailableToast => _r('updateAvailableToast');
+  String get goToDownload => _r('goToDownload');
   String get menuHide => _r('menuHide');
   String get menuHideOthers => _r('menuHideOthers');
   String get menuShowAll => _r('menuShowAll');
@@ -1826,6 +1950,12 @@ class S {
   String get pluginDevModeBadge => _r('pluginDevModeBadge');
   String get pluginDisabledManual => _r('pluginDisabledManual');
   String get pluginDisabledCircuitBreaker => _r('pluginDisabledCircuitBreaker');
+  String get pluginLoadStatusLoaded => _r('pluginLoadStatusLoaded');
+  String get pluginLoadStatusFailed => _r('pluginLoadStatusFailed');
+  String get pluginLoadErrorTitle => _r('pluginLoadErrorTitle');
+  String get pluginLoadErrorBody => _r('pluginLoadErrorBody');
+  String get pluginLoadErrorCopy => _r('pluginLoadErrorCopy');
+  String get pluginLoadErrorCopied => _r('pluginLoadErrorCopied');
   String get pluginSettingsTooltip => _r('pluginSettingsTooltip');
   String get pluginUninstallTooltip => _r('pluginUninstallTooltip');
   String get pluginUninstallTitle => _r('pluginUninstallTitle');
@@ -1876,6 +2006,8 @@ class S {
   String get pluginPermFfmpegDesc => _r('pluginPermFfmpegDesc');
   String get pluginPermYtdlpName => _r('pluginPermYtdlpName');
   String get pluginPermYtdlpDesc => _r('pluginPermYtdlpDesc');
+  String get pluginPermAuthName => _r('pluginPermAuthName');
+  String get pluginPermAuthDesc => _r('pluginPermAuthDesc');
   String get pluginPermUnknownDesc => _r('pluginPermUnknownDesc');
   String get pluginDetailUsage => _r('pluginDetailUsage');
   String get pluginDetailUsageBody => _r('pluginDetailUsageBody');
@@ -1888,6 +2020,21 @@ class S {
   // ─────────────────────────────────────────────
   String pluginSettingsDialogTitle(String name) =>
       _r('pluginSettingsDialogTitle', {'name': name});
+  String get pluginAuthButton => _r('pluginAuthButton');
+  String pluginAuthDialogTitle(String name) =>
+      _r('pluginAuthDialogTitle', {'name': name});
+  String get pluginAuthDescription => _r('pluginAuthDescription');
+  String get pluginAuthSitePlaceholder => _r('pluginAuthSitePlaceholder');
+  String get pluginAuthInputPlaceholder => _r('pluginAuthInputPlaceholder');
+  String get pluginAuthBegin => _r('pluginAuthBegin');
+  String get pluginAuthQr => _r('pluginAuthQr');
+  String get pluginAuthPoll => _r('pluginAuthPoll');
+  String get pluginAuthPending => _r('pluginAuthPending');
+  String pluginAuthFailed(String message) =>
+      _r('pluginAuthFailed', {'message': message});
+  String get pluginAuthInvalidResponse => _r('pluginAuthInvalidResponse');
+  String get pluginAuthSuccess => _r('pluginAuthSuccess');
+  String get pluginAuthLogout => _r('pluginAuthLogout');
   String get pluginSettingsSaveButton => _r('pluginSettingsSaveButton');
   String get pluginSettingsSaving => _r('pluginSettingsSaving');
   String pluginSettingsSaveFailed(String message) =>
@@ -2050,6 +2197,7 @@ class S {
   String get groupCopySourceLink => _r('groupCopySourceLink');
   String get groupDelete => _r('groupDelete');
   String get groupDeleteWithFiles => _r('groupDeleteWithFiles');
+  String get openGroupInWindowAction => _r('openGroupInWindowAction');
   String get groupPluginBadge => _r('groupPluginBadge');
   String get groupMemberExpiredResolve => _r('groupMemberExpiredResolve');
   String groupDirMeta(int count, String size) =>
@@ -2075,6 +2223,24 @@ class S {
   String get showSidebarRssDesc => _r('showSidebarRssDesc');
   String get rssSidebarEmptyHint => _r('rssSidebarEmptyHint');
   String get rssAddSource => _r('rssAddSource');
+  String get rssSubscriptions => _r('rssSubscriptions');
+  String rssUnreadCount(int n) => _r('rssUnreadCount', {'n': n});
+  String rssSelectedCount(int n) => _r('rssSelectedCount', {'n': n});
+  String get rssDownloadSelected => _r('rssDownloadSelected');
+  String get rssIgnoreSelected => _r('rssIgnoreSelected');
+  String get rssSelectVisible => _r('rssSelectVisible');
+  String get rssClearSelection => _r('rssClearSelection');
+  String get rssTaskMissing => _r('rssTaskMissing');
+  String get rssTaskCreated => _r('rssTaskCreated');
+  String rssItemsUpdated(int n) => _r('rssItemsUpdated', {'n': n});
+  String rssBatchResult(int done, int failed) =>
+      _r('rssBatchResult', {'done': done, 'failed': failed});
+  String get rssPublishedAt => _r('rssPublishedAt');
+  String get rssInvalidNumber => _r('rssInvalidNumber');
+  String get rssInvalidSizeRange => _r('rssInvalidSizeRange');
+  String get rssFeedRequired => _r('rssFeedRequired');
+  String get rssValidateBeforeSave => _r('rssValidateBeforeSave');
+  String get rssEditorAuthHint => _r('rssEditorAuthHint');
   String get rssManageTitle => _r('rssManageTitle');
   String get rssDeleteSource => _r('rssDeleteSource');
   String rssDeleteConfirmDesc(String name) =>
@@ -2126,6 +2292,8 @@ class S {
   String get rssNameLabel => _r('rssNameLabel');
   String get rssNameHint => _r('rssNameHint');
   String get rssIntervalLabel => _r('rssIntervalLabel');
+  String get rssProviderLabel => _r('rssProviderLabel');
+  String get rssProviderPluginHint => _r('rssProviderPluginHint');
   String get rssUrlLabel => _r('rssUrlLabel');
   String get rssUrlHint => _r('rssUrlHint');
   String get rssQueueLabel => _r('rssQueueLabel');
@@ -2182,6 +2350,7 @@ class S {
   String get settingsCatNotifyDesc => _r('settingsCatNotifyDesc');
   String get notifyGroupSystem => _r('notifyGroupSystem');
   String get notifyGroupWebhook => _r('notifyGroupWebhook');
+  String get webhookNavTitle => _r('webhookNavTitle');
   String get webhookAddEndpoint => _r('webhookAddEndpoint');
   String get webhookDeliveryLog => _r('webhookDeliveryLog');
   String get webhookEmptyTitle => _r('webhookEmptyTitle');
@@ -2252,6 +2421,7 @@ class S {
   String get webhookLogSimulateHint => _r('webhookLogSimulateHint');
   String get webhookLogPending => _r('webhookLogPending');
   String get webhookSimulateNoTarget => _r('webhookSimulateNoTarget');
+  String get webhookSimulateDispatched => _r('webhookSimulateDispatched');
   String get webhookLogClear => _r('webhookLogClear');
   String get webhookLogResponse => _r('webhookLogResponse');
   String get webhookLogHint4xx => _r('webhookLogHint4xx');
@@ -2299,6 +2469,7 @@ class S {
   String get doctorCheckNmhBinary => _r('doctorCheckNmhBinary');
   String get doctorCheckNmhManifest => _r('doctorCheckNmhManifest');
   String get doctorCheckNmhBrowser => _r('doctorCheckNmhBrowser');
+  String get doctorCheckNmhRelay => _r('doctorCheckNmhRelay');
   String get doctorCheckAppListener => _r('doctorCheckAppListener');
   String get doctorCheckLocalServer => _r('doctorCheckLocalServer');
   String get doctorCheckUrlProtocol => _r('doctorCheckUrlProtocol');
@@ -2311,13 +2482,16 @@ class S {
   String get doctorLevelInfo => _r('doctorLevelInfo');
   String get doctorHintReinstallApp => _r('doctorHintReinstallApp');
   String get doctorHintReregisterNmh => _r('doctorHintReregisterNmh');
+  String get doctorHintNmhOtherInstall => _r('doctorHintNmhOtherInstall');
   String get doctorHintRestartApp => _r('doctorHintRestartApp');
   String get doctorHintEnableLocalServer => _r('doctorHintEnableLocalServer');
   String get doctorHintCheckFirewall => _r('doctorHintCheckFirewall');
   String get doctorHintEnableProtocol => _r('doctorHintEnableProtocol');
   String get doctorHintProtocolClaimed => _r('doctorHintProtocolClaimed');
+  String get doctorHintAssociationOff => _r('doctorHintAssociationOff');
   String get doctorHintCheckDisk => _r('doctorHintCheckDisk');
   String get doctorActionReregister => _r('doctorActionReregister');
+  String get doctorActionUseThisInstall => _r('doctorActionUseThisInstall');
   String get doctorActionRestartListener => _r('doctorActionRestartListener');
   String get doctorActionEnableService => _r('doctorActionEnableService');
   String get doctorActionRegister => _r('doctorActionRegister');
@@ -2336,6 +2510,7 @@ class S {
     'nmh_binary' => doctorCheckNmhBinary,
     'nmh_manifest' => doctorCheckNmhManifest,
     'nmh_browser' => doctorCheckNmhBrowser,
+    'nmh_relay' => doctorCheckNmhRelay,
     'app_listener' => doctorCheckAppListener,
     'local_server' => doctorCheckLocalServer,
     'url_protocol' => doctorCheckUrlProtocol,
@@ -2357,11 +2532,13 @@ class S {
   String doctorHintLabel(String code) => switch (code) {
     'reinstall_app' => doctorHintReinstallApp,
     'reregister_nmh' => doctorHintReregisterNmh,
+    'nmh_other_install' => doctorHintNmhOtherInstall,
     'restart_app' => doctorHintRestartApp,
     'enable_local_server' => doctorHintEnableLocalServer,
     'check_firewall' => doctorHintCheckFirewall,
     'enable_protocol' => doctorHintEnableProtocol,
     'protocol_claimed' => doctorHintProtocolClaimed,
+    'association_off' => doctorHintAssociationOff,
     'check_disk' => doctorHintCheckDisk,
     _ => code,
   };

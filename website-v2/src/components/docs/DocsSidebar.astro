@@ -1,0 +1,120 @@
+---
+/**
+ * 文档侧边导航(静态):分区编号 + 页面链接,当前页 `aria-current="page"`。
+ * 桌面侧栏与移动抽屉共用。
+ */
+import type { DocsNavGroup } from "@/lib/docs-nav";
+import type { Lang } from "@/i18n/config";
+import { docs } from "@/i18n/messages/docs";
+
+interface Props {
+  groups: DocsNavGroup[];
+  currentPath: string;
+  lang: Lang;
+}
+
+const { groups, currentPath, lang } = Astro.props;
+const t = docs[lang];
+const current = currentPath.endsWith("/") ? currentPath : `${currentPath}/`;
+---
+
+<nav class="docs-nav" aria-label={t.nav.label}>
+  {
+    groups.map((group, gi) => (
+      <section class="docs-nav-group">
+        <h2 class="docs-nav-heading">
+          <span class="num text-subtle">{String(gi + 1).padStart(2, "0")}</span>
+          <span>{group.label}</span>
+        </h2>
+        <ul>
+          {group.items.map((item) => (
+            <li>
+              <a
+                href={item.href}
+                class="docs-nav-link"
+                aria-current={item.href === current ? "page" : undefined}
+              >
+                <span>{item.title}</span>
+                {item.fallback && (
+                  <span class="docs-nav-tag" title={t.nav.untranslatedTitle}>
+                    {t.nav.untranslated}
+                  </span>
+                )}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </section>
+    ))
+  }
+</nav>
+
+<style>
+  .docs-nav {
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    font-size: 13.5px;
+  }
+  .docs-nav-heading {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 6px;
+    padding-inline: 10px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 500;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg);
+  }
+  .docs-nav ul {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .docs-nav-link {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 5px 10px;
+    border-radius: 6px;
+    color: var(--fg-muted);
+    line-height: 1.45;
+    transition:
+      color 160ms var(--ease-out),
+      background-color 160ms var(--ease-out);
+  }
+  .docs-nav-link:hover {
+    color: var(--fg);
+    background: var(--bg-inset);
+  }
+  .docs-nav-link[aria-current="page"] {
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    font-weight: 500;
+  }
+  .docs-nav-link[aria-current="page"]::before {
+    content: "";
+    position: absolute;
+    left: -1px;
+    top: 7px;
+    bottom: 7px;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--accent);
+  }
+  .docs-nav-tag {
+    flex: none;
+    padding: 0 5px;
+    border: 1px solid var(--line-strong);
+    border-radius: 4px;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    color: var(--fg-subtle);
+  }
+</style>

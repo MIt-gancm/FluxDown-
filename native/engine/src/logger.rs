@@ -488,6 +488,75 @@ pub fn init_with_dir(data_dir: &Path) -> Result<(), LoggerInitError> {
     init_at(data_dir.join("logs"))
 }
 
+/// 默认日志级别决定优先级（474#1）：
+/// 1. `RUST_LOG` 环境变量——由 [`build_env_filter`] 处理，
+///    非空时始终优先于本函数返回的默认指令；
+/// 2. `FLUXDOWN_LOG_LEVEL` 环境变量（`error`/`warn`/`info`/`debug`/`trace`，
+///    大小写不敏感）——未设置 `RUST_LOG` 时的默认级别，供 headless
+///    server/CLI 无需改代码即可临时调高日志粒度排查问题；
+/// 3. 以上均未设置 → `INFO`（桌面端 UI 侧的等级选择留待后续迭代，当前只做
+///    环境变量这一层，见 474 讨论）。
+fn resolve_default_level_filter() -> tracing_subscriber::filter::LevelFilter {
+    parse_level_filter(std::env::var("FLUXDOWN_LOG_LEVEL").ok().as_deref())
+}
+
+/// [`resolve_default_level_filter`] 的纯实现，值显式传入以便测试
+/// （不依赖/不修改进程级 `std::env` 状态）。
+fn parse_level_filter(value: Option<&str>) -> tracing_subscriber::filter::LevelFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    let Some(raw) = value else {
+        return LevelFilter::INFO;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "error" => LevelFilter::ERROR,
+        "warn" => LevelFilter::WARN,
+        "info" => LevelFilter::INFO,
+        "debug" => LevelFilter::DEBUG,
+        "trace" => LevelFilter::TRACE,
+        other => {
+            if !other.is_empty() {
+                eprintln!(
+                    "[logger] 忽略未知 FLUXDOWN_LOG_LEVEL='{other}'（合法值：error/warn/info/debug/trace），回退 info"
+                );
+            }
+            LevelFilter::INFO
+        }
+    }
+}
+
+/// librqbit 按单个 peer / 单次 announce 打 INFO/WARN（MSE 握手成败、tracker
+/// announce 成功）。实测 18 个种子约 40 行/秒，几分钟就把 2MB 的轮转日志冲掉，
+/// 真正有用的诊断随之被挤出保留窗口。默认把这些目标压到更高等级。
+const NOISY_TARGET_DIRECTIVES: &[&str] = &[
+    "librqbit::peer_connection=error",
+    "librqbit::mse=warn",
+    "librqbit_tracker_comms=warn",
+];
+
+/// 组装全局过滤器。`rust_log` 为 `RUST_LOG` 的值：非空时完全由它决定，不叠加
+/// 任何内置指令；否则以 `level` 为默认级别，且仅在 INFO/WARN 下压制
+/// [`NOISY_TARGET_DIRECTIVES`]——显式调到 debug/trace 排查时保留全部输出，
+/// ERROR 下这些指令反而会抬高目标等级，故跳过。
+fn build_env_filter(
+    rust_log: Option<&str>,
+    level: tracing_subscriber::filter::LevelFilter,
+) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::filter::LevelFilter;
+    let builder = tracing_subscriber::EnvFilter::builder().with_default_directive(level.into());
+    if let Some(directives) = rust_log.filter(|value| !value.trim().is_empty()) {
+        return builder.parse_lossy(directives);
+    }
+    let mut filter = builder.parse_lossy("");
+    if level == LevelFilter::INFO || level == LevelFilter::WARN {
+        for directive in NOISY_TARGET_DIRECTIVES {
+            if let Ok(directive) = directive.parse() {
+                filter = filter.add_directive(directive);
+            }
+        }
+    }
+    filter
+}
+
 fn init_at(log_dir: PathBuf) -> Result<(), LoggerInitError> {
     if let Some(existing) = LOGGER.get() {
         existing.write_impl("[logger] init skipped (already initialized)", false);
@@ -514,9 +583,10 @@ fn init_at(log_dir: PathBuf) -> Result<(), LoggerInitError> {
         }
     }
 
-    let filter = tracing_subscriber::EnvFilter::builder()
-        .with_default_directive(tracing_subscriber::filter::LevelFilter::INFO.into())
-        .from_env_lossy();
+    let filter = build_env_filter(
+        std::env::var("RUST_LOG").ok().as_deref(),
+        resolve_default_level_filter(),
+    );
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(AppLogWriterFactory {
@@ -890,8 +960,9 @@ mod tests {
     use thiserror::Error;
 
     use super::{
-        AppLogWriterFactory, AppLogger, LoggerInitError, format_error_chain, install_panic_hook,
-        list_log_files_in, parse_log_name, report_error, spawn_logged,
+        AppLogWriterFactory, AppLogger, LoggerInitError, build_env_filter, format_error_chain,
+        install_panic_hook, list_log_files_in, parse_level_filter, parse_log_name, report_error,
+        spawn_logged,
     };
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
@@ -902,6 +973,53 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fluxdown_logtest_{tag}_{nanos}"));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // 474#1：FLUXDOWN_LOG_LEVEL 决定未设置 RUST_LOG 时的默认级别。
+    #[test]
+    fn parse_level_filter_recognizes_all_levels() {
+        use tracing_subscriber::filter::LevelFilter;
+        assert_eq!(parse_level_filter(Some("error")), LevelFilter::ERROR);
+        assert_eq!(parse_level_filter(Some("WARN")), LevelFilter::WARN);
+        assert_eq!(parse_level_filter(Some(" info ")), LevelFilter::INFO);
+        assert_eq!(parse_level_filter(Some("Debug")), LevelFilter::DEBUG);
+        assert_eq!(parse_level_filter(Some("trace")), LevelFilter::TRACE);
+    }
+
+    #[test]
+    fn parse_level_filter_falls_back_to_info_when_unset_or_invalid() {
+        use tracing_subscriber::filter::LevelFilter;
+        assert_eq!(parse_level_filter(None), LevelFilter::INFO);
+        assert_eq!(parse_level_filter(Some("")), LevelFilter::INFO);
+        assert_eq!(parse_level_filter(Some("verbose")), LevelFilter::INFO);
+    }
+
+    #[test]
+    fn default_filter_silences_per_peer_bt_noise_but_yields_to_explicit_config() {
+        use tracing::Level;
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // (MSE 逐 peer 警告, tracker announce 成功, 引擎自身 INFO)
+        let probe = |rust_log: Option<&str>, level: LevelFilter| {
+            let subscriber = tracing_subscriber::registry().with(build_env_filter(rust_log, level));
+            tracing::subscriber::with_default(subscriber, || {
+                (
+                    tracing::event_enabled!(target: "librqbit::peer_connection", Level::WARN),
+                    tracing::event_enabled!(target: "librqbit_tracker_comms::tracker_comms", Level::INFO),
+                    tracing::event_enabled!(target: "fluxdown_engine::logger", Level::INFO),
+                )
+            })
+        };
+
+        assert_eq!(probe(None, LevelFilter::INFO), (false, false, true));
+        assert_eq!(probe(Some("  "), LevelFilter::INFO), (false, false, true));
+        // 显式调到 debug 排查：不压制。
+        assert_eq!(probe(None, LevelFilter::DEBUG), (true, true, true));
+        // RUST_LOG 完全接管，内置压制指令不叠加。
+        assert_eq!(probe(Some("info"), LevelFilter::INFO), (true, true, true));
+        // ERROR 下不得因目标指令反而放出 WARN。
+        assert_eq!(probe(None, LevelFilter::ERROR), (false, false, false));
     }
 
     #[test]

@@ -36,6 +36,12 @@ const CONFIG_PATH_KEY: Record<ComponentName, string> = {
   ytdlp: 'component.ytdlp.path',
 }
 
+/** 官方 Release 页：托管安装失败（GitHub 限流/网络问题）时供用户手动下载后走「手动指定路径」（675#1）。 */
+const RELEASE_URL: Record<ComponentName, string> = {
+  ffmpeg: 'https://github.com/BtbN/FFmpeg-Builds/releases/latest',
+  ytdlp: 'https://github.com/yt-dlp/yt-dlp/releases/latest',
+}
+
 const SOURCE_TONE: Record<FfmpegSource, 'accent' | 'neutral' | 'danger'> = {
   manual: 'neutral',
   managed: 'accent',
@@ -245,6 +251,16 @@ function ComponentCard({
             />
           </>
         )}
+        <SetRow title={t('components.officialRelease')} desc={t('components.officialReleaseDesc')}>
+          <a
+            className="btn ghost sm flex-shrink-0"
+            href={RELEASE_URL[component]}
+            target="_blank"
+            rel="noreferrer"
+          >
+            {t('components.officialReleaseOpen')}
+          </a>
+        </SetRow>
         <TextFieldRow
           title={t('components.manualPath')}
           desc={t('components.manualPathDesc')}
@@ -269,6 +285,14 @@ function ComponentCard({
               <i style={{ width: pct !== null ? `${pct}%` : '100%' }} />
             </div>
           </div>
+        )}
+        {/* 396#1：安装请求本身同步失败（如互斥标志/网络错误）没有 WS componentResult
+            推送——不显示会让用户以为点击无反应。与下方 `result`（WS 推送的最终结果）
+            互斥展示：mutate() 重新发起时 TanStack Query 会先清掉上一次的 isError。 */}
+        {installMut.isError && (
+          <p className="text-[12px] text-danger" style={{ padding: '0 16px 14px' }}>
+            {translateBackendMessage(installMut.error.message)}
+          </p>
         )}
         {result && result.component === component && (
           <p
@@ -299,8 +323,14 @@ function ComponentCard({
   )
 }
 
+/** config 键：GitHub 镜像基址，须与 native/engine `components::CONFIG_COMPONENT_MIRROR_BASE` 一致。 */
+const CONFIG_MIRROR_BASE_KEY = 'component_mirror_base'
+
 export function ComponentsSettings() {
   const { t } = useI18n()
+  const { data: config } = useConfigQuery()
+  const configMut = useConfigMutation()
+  const mirrorBase = config?.[CONFIG_MIRROR_BASE_KEY] ?? ''
 
   const { data: ffmpegStatus, isLoading: ffmpegStatusLoading, isError: ffmpegStatusError } = useFfmpegStatusQuery()
   const ffmpegVersionsQuery = useFfmpegVersionsQuery(ffmpegStatus?.managedSupported === true)
@@ -315,6 +345,16 @@ export function ComponentsSettings() {
   return (
     <div className="set-panel">
       <p className="set-desc">{t('set.components.desc')}</p>
+
+      <div className="set-group">
+        <TextFieldRow
+          title={t('components.mirrorBase')}
+          desc={t('components.mirrorBaseDesc')}
+          value={mirrorBase}
+          placeholder={t('components.mirrorBasePlaceholder')}
+          onCommit={(v) => configMut.mutate({ [CONFIG_MIRROR_BASE_KEY]: v.trim() })}
+        />
+      </div>
 
       <ComponentCard
         component="ffmpeg"

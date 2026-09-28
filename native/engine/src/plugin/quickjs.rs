@@ -23,9 +23,9 @@ use rquickjs::{
 use tokio::sync::Semaphore;
 
 use super::runtime::{
-    ExecutionBudget, FfmpegSpec, HostContext, PluginBridge, PluginEntryKind, PluginError,
-    PluginEvent, PluginLogLevel, PluginScript, ResolveRequest, ResolveResult, ScriptRuntime,
-    YtdlpSpec,
+    AuthRequest, AuthResult, ExecutionBudget, FfmpegSpec, HostContext, PluginBridge,
+    PluginEntryKind, PluginError, PluginEvent, PluginLogLevel, PluginScript, ResolveRequest,
+    ResolveResult, ScriptRuntime, SubscriptionRequest, YtdlpSpec,
 };
 
 /// 硬顶（**CPU/中断**预算）：单次调用的 JS 字节码执行不得跨过该墙——interrupt
@@ -35,8 +35,12 @@ pub const HARD_TIMEOUT_CEILING: Duration = Duration::from_secs(30);
 /// 硬顶（**墙钟**预算）：单次调用的总墙钟时长上限（外层 `tokio::time::timeout`）。
 /// 覆盖长时 `await`（ffmpeg 转码可达分钟级），远大于中断顶。
 pub const HARD_WALL_CEILING: Duration = Duration::from_secs(1830);
-/// resolve 信号量 acquire 超时（超时 → `Overloaded`，fail-closed）。
+/// resolve/auth 信号量 acquire 超时（超时 → `Overloaded`，fail-closed）。
 const RESOLVE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(3);
+/// auth 平面并发上限（M-2）：独立于 resolve 信号量，容量刻意开小——登录/二维码
+/// 轮询是低频交互式调用，不该也不需要和 resolve 抢同一组 permit（否则高频轮询
+/// 会把正常下载任务的 resolve 挤到 `Overloaded`）。
+const AUTH_CONCURRENCY: usize = 2;
 /// resolve 返回 null/undefined 的哨兵。
 const NULL_SENTINEL: &str = "__FLUX_NULL__";
 /// storage.get 无值的哨兵。
@@ -56,10 +60,13 @@ pub struct QuickJsScriptRuntime {
     runtime: Option<tokio::runtime::Runtime>,
     /// runtime 的 handle（cheap clone，供 `spawn_handle` 恒可用，与 runtime 生命周期同步）。
     handle: tokio::runtime::Handle,
-    /// resolve 平面信号量：固定容量 `max(启动时 max_concurrent, workers)`。
+    /// resolve/subscription 共用信号量：固定容量 `max(启动时 max_concurrent, workers)`。
     resolve_sema: Arc<Semaphore>,
     /// hook 平面信号量：容量 = workers；`try_acquire` 失败即丢。
     hook_sema: Arc<Semaphore>,
+    /// auth 平面独立信号量（M-2）：与 resolve/subscription 物理隔离，登录轮询
+    /// 不会挤占正常下载任务的 resolve permit，反之亦然。
+    auth_sema: Arc<Semaphore>,
 }
 
 impl Drop for QuickJsScriptRuntime {
@@ -91,6 +98,7 @@ impl QuickJsScriptRuntime {
             handle,
             resolve_sema: Arc::new(Semaphore::new(resolve_cap)),
             hook_sema: Arc::new(Semaphore::new(workers.max(1))),
+            auth_sema: Arc::new(Semaphore::new(AUTH_CONCURRENCY)),
         })
     }
 
@@ -163,6 +171,7 @@ impl QuickJsScriptRuntime {
         let ffmpeg_permitted = host.ffmpeg_permitted;
         let ffmpeg_root = host.ffmpeg_root.clone();
         let ytdlp_permitted = host.ytdlp_permitted;
+        let auth_permitted = host.auth_permitted;
         let interrupt_ns_bridge = interrupt_ns.clone();
         let exec = ctx.async_with(async move |ctx| -> Result<String, PluginError> {
             inject_bridge(
@@ -174,6 +183,7 @@ impl QuickJsScriptRuntime {
                 ffmpeg_permitted,
                 ffmpeg_root,
                 ytdlp_permitted,
+                auth_permitted,
                 interrupt_ns_bridge,
             )
             .map_err(|e| PluginError::Runtime(format!("注入 flux 失败: {e}")))?;
@@ -296,6 +306,93 @@ impl ScriptRuntime for QuickJsScriptRuntime {
         let result: ResolveResult = serde_json::from_str(&raw)
             .map_err(|e| PluginError::InvalidOutput(format!("resolve 返回值非法: {e}")))?;
         Ok(Some(result))
+    }
+
+    async fn invoke_auth(
+        &self,
+        plugin: &PluginScript,
+        req: AuthRequest,
+        settings_json: String,
+        bridge: Arc<dyn PluginBridge>,
+        budget: ExecutionBudget,
+        host: HostContext,
+    ) -> Result<AuthResult, PluginError> {
+        // auth 平面独立信号量（M-2）：不与 resolve/subscription 共用容量，登录
+        // 轮询挤不掉正常下载任务的 resolve permit。
+        let permit = tokio::time::timeout(
+            RESOLVE_ACQUIRE_TIMEOUT,
+            self.auth_sema.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| PluginError::Overloaded)?
+        .map_err(|_| PluginError::Overloaded)?;
+        let _permit = permit;
+
+        let arg_json =
+            serde_json::to_string(&req).map_err(|e| PluginError::Runtime(e.to_string()))?;
+        let info_json = info_json(&plugin.identity, &plugin.version, &plugin.app_version);
+        let raw = self
+            .run_script(
+                plugin.source.clone(),
+                "authenticate",
+                true,
+                arg_json,
+                settings_json,
+                info_json,
+                None,
+                None,
+                bridge,
+                plugin.identity.clone(),
+                budget,
+                host,
+            )
+            .await?;
+        let result: AuthResult = serde_json::from_str(&raw)
+            .map_err(|e| PluginError::InvalidOutput(format!("authenticate 返回值非法: {e}")))?;
+        if !matches!(result.status.as_str(), "pending" | "success" | "error") {
+            return Err(PluginError::InvalidOutput(
+                "authenticate.status 必须是 pending/success/error".to_string(),
+            ));
+        }
+        Ok(result)
+    }
+
+    async fn invoke_subscription(
+        &self,
+        plugin: &PluginScript,
+        req: SubscriptionRequest,
+        settings_json: String,
+        bridge: Arc<dyn PluginBridge>,
+        budget: ExecutionBudget,
+        host: HostContext,
+    ) -> Result<String, PluginError> {
+        let permit = tokio::time::timeout(
+            RESOLVE_ACQUIRE_TIMEOUT,
+            self.resolve_sema.clone().acquire_owned(),
+        )
+        .await
+        .map_err(|_| PluginError::Overloaded)?
+        .map_err(|_| PluginError::Overloaded)?;
+        let _permit = permit;
+
+        let arg_json =
+            serde_json::to_string(&req).map_err(|e| PluginError::Runtime(e.to_string()))?;
+        let info_json = info_json(&plugin.identity, &plugin.version, &plugin.app_version);
+        self.run_script(
+            plugin.source.clone(),
+            "subscribe",
+            true,
+            arg_json,
+            settings_json,
+            info_json,
+            None,
+            None,
+            bridge,
+            plugin.identity.clone(),
+            budget,
+            host,
+        )
+        .await
     }
 
     async fn invoke_hook(
@@ -433,6 +530,7 @@ fn inject_bridge(
     ffmpeg_permitted: bool,
     ffmpeg_root: Option<PathBuf>,
     ytdlp_permitted: bool,
+    auth_permitted: bool,
     interrupt_ns: Arc<AtomicU64>,
 ) -> Result<(), rquickjs::Error> {
     let globals = ctx.globals();
@@ -449,6 +547,8 @@ fn inject_bridge(
                 async move {
                     let req: super::runtime::BridgeHttpRequest =
                         serde_json::from_str(&opts).unwrap_or_default();
+                    let mut req = req;
+                    req.auth_allowed = auth_permitted;
                     let payload = match b.http_request(&pid, req).await {
                         Ok(resp) => serde_json::json!({
                             "value": {
@@ -466,6 +566,75 @@ fn inject_bridge(
         )?
         .with_name("__flux_fetch")?;
         globals.set("__flux_fetch", f)?;
+    }
+
+    // 通用认证 API 仅在 manifest 声明 auth 权限时注入。
+    if auth_permitted {
+        // __flux_auth_get(authRef) -> Promise<String(JSON)>
+        let b = bridge.clone();
+        let pid = plugin_id.to_string();
+        let f = Function::new(
+            ctx.clone(),
+            Async(move |auth_ref: String| {
+                let b = b.clone();
+                let pid = pid.clone();
+                async move {
+                    let payload = match b.auth_get(&pid, &auth_ref).await {
+                        Ok(profile) => serde_json::json!({ "value": profile }),
+                        Err(e) => serde_json::json!({ "__fluxError": e.to_string() }),
+                    };
+                    Ok::<String, rquickjs::Error>(payload.to_string())
+                }
+            }),
+        )?
+        .with_name("__flux_auth_get")?;
+        globals.set("__flux_auth_get", f)?;
+
+        // __flux_auth_save(profileJson) -> Promise<String(JSON)>
+        let b = bridge.clone();
+        let pid = plugin_id.to_string();
+        let f = Function::new(
+            ctx.clone(),
+            Async(move |profile_json: String| {
+                let b = b.clone();
+                let pid = pid.clone();
+                async move {
+                    let payload =
+                        match serde_json::from_str::<crate::auth::AuthProfile>(&profile_json) {
+                            Ok(profile) => match b.auth_save(&pid, profile).await {
+                                Ok(auth_ref) => serde_json::json!({ "value": auth_ref }),
+                                Err(e) => serde_json::json!({ "__fluxError": e.to_string() }),
+                            },
+                            Err(e) => serde_json::json!({
+                                "__fluxError": format!("认证档案非法: {e}")
+                            }),
+                        };
+                    Ok::<String, rquickjs::Error>(payload.to_string())
+                }
+            }),
+        )?
+        .with_name("__flux_auth_save")?;
+        globals.set("__flux_auth_save", f)?;
+
+        // __flux_auth_remove(authRef) -> Promise<String(JSON)>
+        let b = bridge.clone();
+        let pid = plugin_id.to_string();
+        let f = Function::new(
+            ctx.clone(),
+            Async(move |auth_ref: String| {
+                let b = b.clone();
+                let pid = pid.clone();
+                async move {
+                    let payload = match b.auth_remove(&pid, &auth_ref).await {
+                        Ok(()) => serde_json::json!({ "value": true }),
+                        Err(e) => serde_json::json!({ "__fluxError": e.to_string() }),
+                    };
+                    Ok::<String, rquickjs::Error>(payload.to_string())
+                }
+            }),
+        )?
+        .with_name("__flux_auth_remove")?;
+        globals.set("__flux_auth_remove", f)?;
     }
 
     // __flux_storage_get(key) -> Promise<String>
@@ -860,6 +1029,27 @@ const FLUX_PRELUDE: &str = r#"
       if (r.__fluxError) throw new Error(r.__fluxError);
       return r.value;
     }),
+    // flux.auth：仅 manifest 授予 auth 权限时注入。凭据由宿主持久化，
+    // flux.fetch 会自动按 authRef 或当前插件/站点复用。
+    ...(typeof __flux_auth_get === 'function' ? {
+      auth: {
+        get: (authRef) => __flux_auth_get(String(authRef || '')).then((s) => {
+          const r = JSON.parse(s);
+          if (r.__fluxError) throw new Error(r.__fluxError);
+          return r.value;
+        }),
+        save: (profile) => __flux_auth_save(JSON.stringify(profile || {})).then((s) => {
+          const r = JSON.parse(s);
+          if (r.__fluxError) throw new Error(r.__fluxError);
+          return r.value;
+        }),
+        remove: (authRef) => __flux_auth_remove(String(authRef || '')).then((s) => {
+          const r = JSON.parse(s);
+          if (r.__fluxError) throw new Error(r.__fluxError);
+          return r.value;
+        }),
+      },
+    } : {}),
     storage: {
       get: (key) => __flux_storage_get(String(key)).then((s) => s === '__FLUX_NONE__' ? null : s),
       set: (key, value) => __flux_storage_set(String(key), String(value)).then((s) => {
@@ -949,9 +1139,9 @@ mod tests {
 
     use super::QuickJsScriptRuntime;
     use crate::plugin::runtime::{
-        BridgeHttpRequest, BridgeHttpResponse, ExecutionBudget, HostContext, PluginBridge,
-        PluginEntryKind, PluginError, PluginLogLevel, PluginScript, ResolveRequest, ResolveResult,
-        ScriptRuntime,
+        AuthRequest, BridgeHttpRequest, BridgeHttpResponse, ExecutionBudget, HostContext,
+        PluginBridge, PluginEntryKind, PluginError, PluginLogLevel, PluginScript, ResolveRequest,
+        ResolveResult, ScriptRuntime, SubscriptionRequest,
     };
 
     /// 测试桩：全空实现（OOM 测试不触网/不落盘）。
@@ -998,6 +1188,7 @@ mod tests {
         let req = ResolveRequest {
             task_id: "t1".to_string(),
             url: "http://example.com/".to_string(),
+            auth_ref: String::new(),
             cookies: String::new(),
             referrer: String::new(),
             user_agent: String::new(),
@@ -1025,6 +1216,57 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscription_entry_returns_normalized_json() {
+        let rt = QuickJsScriptRuntime::new(1).expect("runtime");
+        let script = PluginScript {
+            identity: "test@subscription".to_string(),
+            source: r#"
+                globalThis.subscribe = async (ctx) => ({
+                  title: "Demo feed",
+                  link: ctx.url,
+                  items: [{
+                    guid: ctx.providerConfig,
+                    title: "Episode 1",
+                    link: ctx.url,
+                    enclosureUrl: "https://cdn.example/episode-1.mp4",
+                    enclosureLength: 42,
+                    pubDate: 1710000000
+                  }]
+                });
+            "#
+            .to_string(),
+            entry_fn_hint: PluginEntryKind::Subscription,
+            version: "1.0.0".to_string(),
+            app_version: "0.0.0".to_string(),
+        };
+        let raw = rt
+            .invoke_subscription(
+                &script,
+                SubscriptionRequest {
+                    provider_id: "demo-json".to_string(),
+                    source_id: "source-1".to_string(),
+                    url: "https://example.com/feed".to_string(),
+                    provider_config: "item-1".to_string(),
+                    cookies: String::new(),
+                    user_agent: "FluxDown/test".to_string(),
+                },
+                "{}".to_string(),
+                Arc::new(NullBridge),
+                ExecutionBudget {
+                    timeout: Duration::from_secs(5),
+                    memory_limit_bytes: 16 * 1024 * 1024,
+                },
+                HostContext::default(),
+            )
+            .await
+            .expect("subscription entry");
+        let value: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(value["title"], "Demo feed");
+        assert_eq!(value["items"][0]["guid"], "item-1");
+        assert_eq!(value["items"][0]["enclosureLength"], 42);
+    }
+
     /// 用给定 host 上下文跑一段 resolver，返回其 `url` 字段（测试探针）。
     async fn probe_resolve(source: &str, host: HostContext) -> ResolveResult {
         let rt = QuickJsScriptRuntime::new(1).expect("runtime");
@@ -1038,6 +1280,7 @@ mod tests {
         let req = ResolveRequest {
             task_id: "t".to_string(),
             url: "http://x/".to_string(),
+            auth_ref: String::new(),
             cookies: String::new(),
             referrer: String::new(),
             user_agent: String::new(),
@@ -1085,6 +1328,74 @@ mod tests {
         )
         .await;
         assert_eq!(r.url, "object");
+    }
+
+    /// 无 auth 权限时，插件不能接触宿主认证存储。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_facade_absent_without_permission() {
+        let r = probe_resolve(
+            "globalThis.resolve = async () => ({ url: String(typeof flux.auth) });",
+            HostContext::default(),
+        )
+        .await;
+        assert_eq!(r.url, "undefined");
+    }
+
+    /// 授予 auth 权限后，插件可使用 get/save/remove 认证生命周期 API。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_facade_present_with_permission() {
+        let r = probe_resolve(
+            "globalThis.resolve = async () => ({ url: (typeof flux.auth) + ':' + \
+             (typeof flux.auth.get) + ':' + (typeof flux.auth.save) + ':' + \
+             (typeof flux.auth.remove) });",
+            HostContext {
+                auth_permitted: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        assert_eq!(r.url, "object:function:function:function");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_entry_returns_qr_challenge() {
+        let rt = QuickJsScriptRuntime::new(1).expect("runtime");
+        let script = PluginScript {
+            identity: "test@auth".to_string(),
+            source: "globalThis.authenticate = async (ctx) => ({ \
+                     status: 'pending', sessionId: ctx.sessionId, challenge: 'qr-data', \
+                     challengeType: 'text' });"
+                .to_string(),
+            entry_fn_hint: PluginEntryKind::Auth,
+            version: "1.0.0".to_string(),
+            app_version: "0.0.0".to_string(),
+        };
+        let result = rt
+            .invoke_auth(
+                &script,
+                AuthRequest {
+                    action: "begin".to_string(),
+                    site: "example.com".to_string(),
+                    auth_ref: "test@auth::example.com".to_string(),
+                    session_id: "s1".to_string(),
+                    input: String::new(),
+                },
+                "{}".to_string(),
+                Arc::new(NullBridge),
+                ExecutionBudget {
+                    timeout: Duration::from_secs(10),
+                    memory_limit_bytes: 32 * 1024 * 1024,
+                },
+                HostContext {
+                    auth_permitted: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("auth entry should succeed");
+        assert_eq!(result.status, "pending");
+        assert_eq!(result.session_id, "s1");
+        assert_eq!(result.challenge.as_deref(), Some("qr-data"));
     }
 
     /// 授权但无牢笼根（如 resolve 平面）→ run() 抛错、不触达 bridge。

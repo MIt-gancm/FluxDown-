@@ -143,6 +143,82 @@ export async function sendDownloadRequest(
   }
 }
 
+/**
+ * 固定并发度分批执行一组异步任务，返回结果顺序与输入顺序一致。用于给
+ * `remoteSendBatchPreservingAudio` 的音轨条目逐条 POST 加并发闸门——批量
+ * 入口对条数唯一的约束是 NMH 侧的 1000（`MAX_BATCH_ITEMS`），远程路径此前
+ * 没有任何闸门，用户「全选」多清晰度面板会瞬间发起数十~上百条并发连接，
+ * 容易撞连接数/限流并让 `DOWNLOAD_TIMEOUT_MS` 虚假超时。
+ */
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, items.length) }, () => worker()),
+  );
+  return results;
+}
+
+const TRACK_PAIR_FANOUT_CONCURRENCY = 6;
+
+/** The legacy HTTP batch endpoint joins URLs and cannot carry audioUrl. */
+async function remoteSendBatchPreservingAudio(
+  items: BatchDownloadItem[],
+  cfg: RemoteServerConfig,
+): Promise<ApiResponse> {
+  if (!items.some((item) => item.audioUrl)) {
+    return remoteSendBatchDownloadRequest(items, cfg);
+  }
+  const trackItems = items.filter((item) => item.audioUrl);
+  const plainItems = items.filter((item) => !item.audioUrl);
+
+  // 音轨条目逐条 POST（并发闸门见 mapWithConcurrency）与普通条目一次批量
+  // POST 是两组相互独立的请求，并发发出而不是先等音轨组结束再发普通组
+  // （此前的实现在这里把它们意外串行化，各自仍受 DOWNLOAD_TIMEOUT_MS 约束）。
+  const [trackResults, plainResult] = await Promise.all([
+    mapWithConcurrency(trackItems, TRACK_PAIR_FANOUT_CONCURRENCY, (item) =>
+      remoteSendDownloadRequest(item, cfg),
+    ),
+    plainItems.length > 0 ? remoteSendBatchDownloadRequest(plainItems, cfg) : null,
+  ]);
+
+  // 部分成功聚合语义对齐 NMH legacy 路径的 "x/y items sent (z failed)"：
+  // 任一条目失败都不能让已经建好的任务被上层判定为「整批失败」进而重试
+  // （background.ts 收到 success:false 后 incrementStat("failed") + 失败
+  // 通知，用户手动重试会把已接受的条目重复创建）。plainItems 那次批量
+  // POST 是单个 HTTP 调用，拿不到内部逐条结果，只能按该次调用的成功/
+  // 失败把 plainItems.length 整体计入成功或失败。
+  const succeededTracks = trackResults.filter((result) => result.success).length;
+  const plainSucceeded = plainItems.length > 0 && (plainResult?.success ?? false);
+  const succeeded = succeededTracks + (plainSucceeded ? plainItems.length : 0);
+  const total = items.length;
+  const failed = total - succeeded;
+
+  if (succeeded === 0) {
+    const firstFailureMessage =
+      trackResults.find((result) => !result.success)?.message ??
+      plainResult?.message ??
+      "All items failed";
+    return { success: false, message: `Batch failed: ${firstFailureMessage}` };
+  }
+  return {
+    success: true,
+    message: failed > 0
+      ? `${succeeded}/${total} items sent (${failed} failed)`
+      : `${succeeded} items sent`,
+  };
+}
+
 export async function sendBatchDownloadRequest(
   items: BatchDownloadItem[],
 ): Promise<ApiResponse> {
@@ -154,7 +230,7 @@ export async function sendBatchDownloadRequest(
   }
   if (mode === "always") {
     return stamp(
-      await remoteSendBatchDownloadRequest(items, cfg.remote),
+      await remoteSendBatchPreservingAudio(items, cfg.remote),
       "remote",
     );
   }
@@ -165,12 +241,12 @@ export async function sendBatchDownloadRequest(
       return stamp(result, "local");
     }
     return stamp(
-      await remoteSendBatchDownloadRequest(items, cfg.remote),
+      await remoteSendBatchPreservingAudio(items, cfg.remote),
       "remote",
     );
   } catch {
     return stamp(
-      await remoteSendBatchDownloadRequest(items, cfg.remote),
+      await remoteSendBatchPreservingAudio(items, cfg.remote),
       "remote",
     );
   }

@@ -60,6 +60,9 @@ const mimeInput = $<HTMLInputElement>('#mimeInput');
 const mimeAddBtn = $<HTMLButtonElement>('#mimeAddBtn');
 const mimeList = $('#mimeList')!;
 const mimeResetBtn = $<HTMLButtonElement>('#mimeResetBtn');
+const excludeExtInput = $<HTMLInputElement>('#excludeExtInput');
+const excludeExtAddBtn = $<HTMLButtonElement>('#excludeExtAddBtn');
+const excludeExtList = $('#excludeExtList')!;
 
 // 今日统计（仅重置按钮，数值本身显示在 popup）
 const resetStatsBtn = $<HTMLButtonElement>('#resetStatsBtn');
@@ -72,6 +75,8 @@ const remoteModeDesc = $('#remoteModeDesc')!;
 const interceptModeSelect = $<HTMLSelectElement>('#interceptModeSelect');
 const modeHint = $('#modeHint')!;
 const minSizeSelect = $<HTMLSelectElement>('#minSizeSelect');
+const minSizeCustomRow = $('#minSizeCustomRow')!;
+const minSizeCustomInput = $<HTMLInputElement>('#minSizeCustomInput');
 const magnetToggle = $<HTMLInputElement>('#magnetToggle');
 
 // 排除域名管理
@@ -173,8 +178,45 @@ interceptModeSelect.addEventListener('change', async () => {
   await saveSettings({ interceptMode: mode as 'smart' | 'all' });
 });
 
+/** minSizeSelect 的固定预设值；不在其中时视为自定义值，切到 "custom" 选项显示输入框。 */
+const MIN_SIZE_PRESETS: Record<string, true> = {
+  '0': true, '102400': true, '524288': true, '1048576': true,
+  '5242880': true, '10485760': true, '52428800': true,
+  '104857600': true, '209715200': true, '524288000': true,
+};
+
+/** 按当前 minFileSize 字节数回显 select：命中预设值直接选中；否则切到
+ * "custom" 并在自定义输入框回显对应 MB 数（向上取整避免出现 0）。 */
+function applyMinSizeSetting(bytes: number): void {
+  const key = String(bytes);
+  if (MIN_SIZE_PRESETS[key]) {
+    minSizeSelect.value = key;
+  } else {
+    minSizeSelect.value = 'custom';
+    minSizeCustomInput.value = String(Math.max(1, Math.ceil(bytes / (1024 * 1024))));
+  }
+  syncMinSizeCustomVisibility();
+}
+
+function syncMinSizeCustomVisibility(): void {
+  minSizeCustomRow.classList.toggle('hidden', minSizeSelect.value !== 'custom');
+}
+
 minSizeSelect.addEventListener('change', async () => {
+  syncMinSizeCustomVisibility();
+  if (minSizeSelect.value === 'custom') {
+    const mb = Math.max(0, Math.round(Number(minSizeCustomInput.value) || 0));
+    minSizeCustomInput.value = mb > 0 ? String(mb) : '';
+    await saveSettings({ minFileSize: mb * 1024 * 1024 });
+    return;
+  }
   await saveSettings({ minFileSize: parseInt(minSizeSelect.value, 10) });
+});
+
+minSizeCustomInput.addEventListener('change', async () => {
+  const mb = Math.max(0, Math.round(Number(minSizeCustomInput.value) || 0));
+  minSizeCustomInput.value = mb > 0 ? String(mb) : '';
+  await saveSettings({ minFileSize: mb * 1024 * 1024 });
 });
 
 // ===== 磁力链接接管开关（关闭后点击 magnet: 交还系统默认处理程序）=====
@@ -387,6 +429,43 @@ async function addCustomExtension() {
   showToast(t('options.rules.extAdded', { ext: normalized }));
 }
 
+function renderExcludeExtensions(exts: string[]) {
+  excludeExtList.replaceChildren(
+    ...exts.map((ext) =>
+      makeTag(ext, async () => {
+        const current = await loadSettings();
+        const next = current.excludeExtensions.filter((e) => e !== ext);
+        await saveSettings({ excludeExtensions: next });
+        renderExcludeExtensions(next);
+      }),
+    ),
+  );
+  excludeExtList.setAttribute('data-empty', t('options.rules.extEmpty'));
+}
+
+async function addExcludeExtension() {
+  const normalized = normalizeExtension(excludeExtInput.value);
+  if (!normalized) {
+    showToast(t('options.rules.extInvalid'), 'error');
+    return;
+  }
+  const current = await loadSettings();
+  if (current.excludeExtensions.includes(normalized)) {
+    showToast(t('options.rules.extExists', { ext: normalized }), 'error');
+    return;
+  }
+  const next = [...current.excludeExtensions, normalized];
+  await saveSettings({ excludeExtensions: next });
+  excludeExtInput.value = '';
+  renderExcludeExtensions(next);
+  showToast(t('options.rules.extAdded', { ext: normalized }));
+}
+
+excludeExtAddBtn.addEventListener('click', addExcludeExtension);
+excludeExtInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') addExcludeExtension();
+});
+
 /** MIME 归一化：小写；`type/` 前缀匹配整族，`type/subtype` 精确匹配 */
 function normalizeMime(input: string): string | null {
   const s = input.trim().toLowerCase();
@@ -532,7 +611,7 @@ async function init() {
   // 拦截模式 / 最小文件大小
   interceptModeSelect.value = settings.interceptMode || 'smart';
   updateModeHint(settings.interceptMode || 'smart');
-  minSizeSelect.value = String(settings.minFileSize);
+  applyMinSizeSetting(settings.minFileSize);
 
   // 磁力链接接管开关
   magnetToggle.checked = settings.interceptMagnet !== false;
@@ -545,6 +624,7 @@ async function init() {
     ...BUILTIN_EXTENSIONS.map((ext) => makeTag(ext)),
   );
   renderCustomExtensions(settings.customExtensions || []);
+  renderExcludeExtensions(settings.excludeExtensions || []);
   renderMimeTypes(settings.interceptMimeTypes || []);
 }
 

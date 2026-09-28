@@ -1,0 +1,141 @@
+---
+/**
+ * 本页目录(h2/h3,静态渲染)。scroll-spy 由 enhance.ts 根据 `[data-toc-link]` 高亮当前节。
+ * `variant="inline"` 用于窄屏:折叠在正文顶部的 <details>。
+ */
+import type { MarkdownHeading } from "astro";
+import type { Lang } from "@/i18n/config";
+import { docs } from "@/i18n/messages/docs";
+
+interface Props {
+  headings: MarkdownHeading[];
+  lang: Lang;
+  variant?: "rail" | "inline";
+}
+
+const { headings, lang, variant = "rail" } = Astro.props;
+const t = docs[lang];
+const items = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+{
+  items.length > 0 &&
+    (variant === "rail" ? (
+      <nav class="toc" aria-label={t.toc}>
+        <p class="eyebrow-plain toc-title">{t.toc}</p>
+        <ul>
+          {items.map((h) => (
+            <li>
+              <a href={`#${h.slug}`} class:list={["toc-link", h.depth === 3 && "toc-sub"]} data-toc-link={h.slug}>
+                {h.text}
+              </a>
+            </li>
+          ))}
+        </ul>
+        <a href="#main" class="toc-top">
+          ↑ {t.backToTop}
+        </a>
+      </nav>
+    ) : (
+      <details class="toc-inline">
+        <summary>
+          <span class="eyebrow-plain">{t.toc}</span>
+          <span class="toc-chevron" aria-hidden="true" />
+        </summary>
+        <ul>
+          {items.map((h) => (
+            <li>
+              <a href={`#${h.slug}`} class:list={["toc-link", h.depth === 3 && "toc-sub"]}>
+                {h.text}
+              </a>
+            </li>
+          ))}
+        </ul>
+      </details>
+    ))
+}
+
+<style>
+  .toc {
+    font-size: 13px;
+  }
+  .toc-title {
+    margin-bottom: 12px;
+  }
+  .toc ul {
+    border-left: 1px solid var(--line);
+  }
+  .toc-link {
+    display: block;
+    margin-left: -1px;
+    padding: 4px 0 4px 12px;
+    border-left: 1px solid transparent;
+    color: var(--fg-muted);
+    line-height: 1.45;
+    transition:
+      color 160ms var(--ease-out),
+      border-color 160ms var(--ease-out);
+  }
+  .toc-link:hover {
+    color: var(--fg);
+  }
+  .toc-sub {
+    padding-left: 24px;
+    font-size: 12.5px;
+  }
+  .toc-link[aria-current="location"] {
+    color: var(--accent-ink);
+    border-left-color: var(--accent);
+  }
+  .toc-top {
+    display: inline-block;
+    margin-top: 18px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    color: var(--fg-subtle);
+  }
+  .toc-top:hover {
+    color: var(--fg);
+  }
+
+  .toc-inline {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--bg-elev);
+    font-size: 13.5px;
+  }
+  .toc-inline summary {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    cursor: pointer;
+    list-style: none;
+  }
+  .toc-inline summary::-webkit-details-marker {
+    display: none;
+  }
+  .toc-chevron {
+    width: 7px;
+    height: 7px;
+    border-right: 1.5px solid var(--fg-subtle);
+    border-bottom: 1.5px solid var(--fg-subtle);
+    transform: rotate(45deg) translateY(-2px);
+    transition: transform 200ms var(--ease-out);
+  }
+  .toc-inline[open] .toc-chevron {
+    transform: rotate(225deg) translateY(-2px);
+  }
+  .toc-inline ul {
+    padding: 4px 14px 12px;
+    border-top: 1px solid var(--line);
+  }
+  .toc-inline .toc-link {
+    border-left: 0;
+    padding-left: 0;
+  }
+  .toc-inline .toc-sub {
+    padding-left: 14px;
+  }
+</style>

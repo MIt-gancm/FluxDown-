@@ -423,7 +423,7 @@ async fn desktop_regression_smoke() {
     tokio::spawn(fluxdown_engine::download_manager::progress_reporter(
         progress_rx,
         engine.db.clone(),
-        sink.clone(),
+        engine.activity_sink.clone(),
     ));
 
     let mut done_rx = engine

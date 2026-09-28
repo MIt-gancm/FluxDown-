@@ -53,6 +53,15 @@ fn all_example_plugin_manifests_are_valid() {
                 entry_path
             );
         }
+        for subscription in &manifest.subscriptions {
+            let entry_path = plugin_dir.join(&subscription.entry);
+            assert!(
+                entry_path.is_file(),
+                "{:?} 声明的 subscription 入口不存在: {:?}",
+                manifest_path,
+                entry_path
+            );
+        }
         checked += 1;
     }
     assert!(checked >= 2, "示例插件目录应至少含 echo-rewriter 与 ytdlp");

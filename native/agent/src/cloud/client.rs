@@ -1,8 +1,13 @@
 //! FluxCloud HTTPS 客户端、并发 401 单飞刷新与一次重放。
+//!
+//! 服务地址：`default_base_url` 由启动环境固定；仅调试构建允许经
+//! [`CloudClient::set_endpoint`] 覆盖（持久化在 agent 私有状态），与 Flutter
+//! `CloudApiConfig` 同一策略——正式包锁定默认地址，避免残留覆盖值指向失效地址。
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+use fluxdown_protocol::{AgentEvent, CloudEndpointDto};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -10,16 +15,24 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use super::models::{AuthResponse, CloudErrorBody, RefreshRequest};
+use crate::event_hub::AgentEventHub;
 use crate::state::{AgentState, CloudCredentials, StateStore};
+
+/// 是否允许运行期覆盖 FluxCloud 地址；与 Flutter `kDebugMode` 门控一致。
+const ENDPOINT_EDITABLE: bool = cfg!(debug_assertions);
 
 #[derive(Clone)]
 pub struct CloudClient {
-    base_url: String,
+    default_base_url: String,
+    base_url: Arc<RwLock<String>>,
     http: reqwest::Client,
     stream_http: reqwest::Client,
     state: Arc<Mutex<AgentState>>,
     store: Arc<StateStore>,
     refresh: Arc<Mutex<()>>,
+    /// 会话被清除（退出 / 刷新令牌被拒 / 远端撤销）时投影 `SessionChanged(None)`，
+    /// 让 UI 与 agent 私有状态永不脱节。
+    events: Option<AgentEventHub>,
 }
 
 impl CloudClient {
@@ -40,14 +53,101 @@ impl CloudClient {
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .map_err(|error| CloudError::transport(error.to_string()))?;
+        let default_base_url = normalize_base_url(&base_url);
         Ok(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
+            base_url: Arc::new(RwLock::new(default_base_url.clone())),
+            default_base_url,
             http,
             stream_http,
             state,
             store,
             refresh: Arc::new(Mutex::new(())),
+            events: None,
         })
+    }
+
+    /// 接入事件枢纽；生产运行链路必须调用，否则会话清除不会通知 UI。
+    #[must_use]
+    pub fn with_events(mut self, events: AgentEventHub) -> Self {
+        self.events = Some(events);
+        self
+    }
+
+    /// 启动时套用已持久化的地址覆盖；正式构建或覆盖值非法时保持默认地址。
+    pub async fn restore_endpoint_override(&self) {
+        if !ENDPOINT_EDITABLE {
+            return;
+        }
+        let Some(base_url) = self.state.lock().await.cloud_base_url_override.clone() else {
+            return;
+        };
+        match validate_base_url(&base_url) {
+            Ok(()) => {
+                self.swap_base_url(normalize_base_url(&base_url));
+                tracing::info!(base_url = %base_url, "using FluxCloud endpoint override");
+            }
+            Err(error) => {
+                tracing::warn!(base_url = %base_url, %error, "ignoring invalid FluxCloud endpoint override");
+            }
+        }
+    }
+
+    /// 当前生效地址、构建期默认地址与是否可改。
+    pub fn endpoint(&self) -> CloudEndpointDto {
+        CloudEndpointDto {
+            base_url: self.current_base_url(),
+            default_base_url: self.default_base_url.clone(),
+            editable: ENDPOINT_EDITABLE,
+        }
+    }
+
+    /// 覆盖（空串 = 恢复默认）FluxCloud 地址并持久化；后续请求立即使用新地址。
+    /// 正式构建拒绝调用。
+    pub async fn set_endpoint(&self, base_url: &str) -> Result<CloudEndpointDto, CloudError> {
+        if !ENDPOINT_EDITABLE {
+            return Err(CloudError::unsupported());
+        }
+        let trimmed = base_url.trim();
+        let next = if trimmed.is_empty() {
+            None
+        } else {
+            validate_base_url(trimmed)?;
+            Some(normalize_base_url(trimmed)).filter(|url| *url != self.default_base_url)
+        };
+        {
+            let mut state = self.state.lock().await;
+            state.cloud_base_url_override.clone_from(&next);
+            self.store
+                .save(&state)
+                .await
+                .map_err(|error| CloudError::transport(error.to_string()))?;
+        }
+        self.swap_base_url(next.unwrap_or_else(|| self.default_base_url.clone()));
+        Ok(self.endpoint())
+    }
+
+    fn current_base_url(&self) -> String {
+        self.base_url
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn swap_base_url(&self, base_url: String) {
+        *self
+            .base_url
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = base_url;
+    }
+
+    /// 本机设备身份 `(device_id, device_name, platform)`，供认证请求体与请求头共用。
+    pub(crate) async fn device_identity(&self) -> (String, String, String) {
+        let state = self.state.lock().await;
+        (
+            state.device_id.clone(),
+            state.device_name.clone(),
+            state.platform.clone(),
+        )
     }
 
     /// 无登录端点调用。
@@ -83,18 +183,22 @@ impl CloudClient {
         if response.status() != StatusCode::UNAUTHORIZED {
             return decode(response).await;
         }
-
-        let _guard = self.refresh.lock().await;
-        let current = self.access_token().await?;
-        let replay_token = if current != attempted {
-            current
-        } else {
-            self.refresh_session().await?
-        };
+        let replay_token = self.refreshed_access_token(&attempted).await?;
         let replay = self
             .send_once(method, path, body, Some(&replay_token))
             .await?;
         decode(replay).await
+    }
+
+    /// 401 后取可重放的 access token：单飞刷新，其他调用方已轮换过则直接复用新令牌。
+    /// 普通请求与 SSE 必须共用这一入口，否则并发刷新会用同一枚 refresh token 撞上服务端的一次性轮换。
+    async fn refreshed_access_token(&self, attempted: &str) -> Result<String, CloudError> {
+        let _guard = self.refresh.lock().await;
+        let current = self.access_token().await?;
+        if current != attempted {
+            return Ok(current);
+        }
+        self.refresh_session().await
     }
 
     /// 显式登录/注册成功后，先原子持久化令牌轮换再返回无令牌会话。
@@ -139,16 +243,23 @@ impl CloudClient {
         Ok(updated)
     }
 
-    /// 仅显式退出或已确认撤销时清除完整会话。
+    /// 清除完整会话（显式退出 / 刷新令牌被拒 / 远端撤销）并投影 `SessionChanged(None)`。
     pub async fn clear_session(&self) -> Result<(), CloudError> {
-        let mut state = self.state.lock().await;
-        state.credentials = None;
-        self.store
-            .save(&state)
-            .await
-            .map_err(|error| CloudError::transport(error.to_string()))
+        {
+            let mut state = self.state.lock().await;
+            state.credentials = None;
+            self.store
+                .save(&state)
+                .await
+                .map_err(|error| CloudError::transport(error.to_string()))?;
+        }
+        if let Some(events) = &self.events {
+            events.publish(AgentEvent::SessionChanged(Box::new(None)));
+        }
+        Ok(())
     }
 
+    /// 调用方必须持有 `self.refresh` 锁。
     async fn refresh_session(&self) -> Result<String, CloudError> {
         let refresh_token = {
             let state = self.state.lock().await;
@@ -176,13 +287,33 @@ impl CloudClient {
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
-            self.clear_session().await?;
-            return Err(CloudError::unauthorized());
+            return self.reject_refresh_token(&refresh_token).await;
         }
         let auth = decode::<AuthResponse>(response).await?;
         let access_token = auth.access_token.clone();
         self.persist_auth(auth).await?;
         Ok(access_token)
+    }
+
+    /// 服务端拒绝了 `rejected`：仅当它仍是当前凭证时才登出；期间凭证已被替换
+    /// （并发刷新 / 重新登录）说明被拒的只是过期副本，沿用当前 access token。
+    async fn reject_refresh_token(&self, rejected: &str) -> Result<String, CloudError> {
+        let current = {
+            let state = self.state.lock().await;
+            state.credentials.as_ref().map(|credentials| {
+                (
+                    credentials.refresh_token.clone(),
+                    credentials.access_token.clone(),
+                )
+            })
+        };
+        match current {
+            Some((refresh, access)) if refresh != rejected && !access.is_empty() => Ok(access),
+            _ => {
+                self.clear_session().await?;
+                Err(CloudError::unauthorized())
+            }
+        }
     }
 
     async fn access_token(&self) -> Result<String, CloudError> {
@@ -226,7 +357,7 @@ impl CloudClient {
         if response.status() != StatusCode::UNAUTHORIZED {
             return ensure_success(response).await;
         }
-        let replay_token = self.refresh_session().await?;
+        let replay_token = self.refreshed_access_token(&access_token).await?;
         ensure_success(self.send_stream_once(path, &replay_token).await?).await
     }
 
@@ -235,16 +366,9 @@ impl CloudClient {
         path: &str,
         bearer: &str,
     ) -> Result<reqwest::Response, CloudError> {
-        let (device_id, device_name, platform) = {
-            let state = self.state.lock().await;
-            (
-                state.device_id.clone(),
-                state.device_name.clone(),
-                state.platform.clone(),
-            )
-        };
+        let (device_id, device_name, platform) = self.device_identity().await;
         self.stream_http
-            .get(format!("{}{}", self.base_url, path))
+            .get(format!("{}{}", self.current_base_url(), path))
             .bearer_auth(bearer)
             .header("Accept", "text/event-stream")
             .header("X-FluxDown-Device-Id", device_id)
@@ -253,7 +377,7 @@ impl CloudClient {
             .header("X-FluxDown-Version", env!("CARGO_PKG_VERSION"))
             .send()
             .await
-            .map_err(|error| CloudError::transport(format!("{error:#}")))
+            .map_err(|error| CloudError::transport(error_chain(&error)))
     }
 
     async fn send_once(
@@ -263,17 +387,10 @@ impl CloudClient {
         body: Option<Value>,
         bearer: Option<&str>,
     ) -> Result<reqwest::Response, CloudError> {
-        let (device_id, device_name, platform) = {
-            let state = self.state.lock().await;
-            (
-                state.device_id.clone(),
-                state.device_name.clone(),
-                state.platform.clone(),
-            )
-        };
+        let (device_id, device_name, platform) = self.device_identity().await;
         let mut request = self
             .http
-            .request(method, format!("{}{}", self.base_url, path))
+            .request(method, format!("{}{}", self.current_base_url(), path))
             .header("X-FluxDown-Device-Id", device_id)
             .header("X-FluxDown-Device-Name", device_name)
             .header("X-FluxDown-Platform", platform)
@@ -287,7 +404,7 @@ impl CloudClient {
         request
             .send()
             .await
-            .map_err(|error| CloudError::transport(format!("{error:#}")))
+            .map_err(|error| CloudError::transport(error_chain(&error)))
     }
 }
 
@@ -319,9 +436,22 @@ async fn decode<R: DeserializeOwned>(response: reqwest::Response) -> Result<R, C
         return response
             .json::<R>()
             .await
-            .map_err(|error| CloudError::transport(format!("{error:#}")));
+            .map_err(|error| CloudError::transport(error_chain(&error)));
     }
     Err(response_error(response).await)
+}
+
+/// reqwest 的 `Display`（含 `{:#}`）只输出最外层「error sending request for url」，
+/// 超时 / 连接重置 / TLS / 代理等根因都在 `source()` 链里，必须逐层拼出。
+fn error_chain(error: &reqwest::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn validate_base_url(base_url: &str) -> Result<(), CloudError> {
@@ -340,6 +470,10 @@ fn validate_base_url(base_url: &str) -> Result<(), CloudError> {
             "FluxCloud URL must use HTTPS outside loopback".to_owned(),
         ))
     }
+}
+
+fn normalize_base_url(base_url: &str) -> String {
+    base_url.trim().trim_end_matches('/').to_owned()
 }
 
 fn now_unix() -> i64 {
@@ -363,6 +497,15 @@ impl CloudError {
             status: Some(401),
             code: Some("unauthorized".to_owned()),
             message: "authentication required".to_owned(),
+            retryable: false,
+        }
+    }
+
+    fn unsupported() -> Self {
+        Self {
+            status: None,
+            code: Some("unsupported".to_owned()),
+            message: "FluxCloud endpoint is fixed in release builds".to_owned(),
             retryable: false,
         }
     }
@@ -555,6 +698,208 @@ mod tests {
                 .credentials
                 .is_none()
         );
+        drop(client);
+        drop(state);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    async fn whoami(State(name): State<&'static str>) -> Response {
+        axum::Json(json!({ "server": name })).into_response()
+    }
+
+    async fn spawn_named(name: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind named mock");
+        let address = listener.local_addr().expect("named mock address");
+        let app = Router::new()
+            .route("/api/v1/whoami", get(whoami))
+            .with_state(name);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn endpoint_override_persists_routes_and_resets() {
+        let default_url = spawn_named("default").await;
+        let override_url = spawn_named("override").await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_endpoint_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let state = Arc::new(Mutex::new(AgentState::default()));
+        let client = CloudClient::new(default_url.clone(), state.clone(), store.clone())
+            .expect("cloud client");
+
+        let endpoint = client.endpoint();
+        assert!(endpoint.editable, "tests run under debug_assertions");
+        assert_eq!(endpoint.base_url, default_url);
+        assert_eq!(endpoint.default_base_url, default_url);
+
+        let set = client
+            .set_endpoint(&format!("{override_url}/"))
+            .await
+            .expect("override accepted");
+        assert_eq!(set.base_url, override_url);
+        assert_eq!(set.default_base_url, default_url);
+        let persisted = store.load().await.expect("reload state");
+        assert_eq!(
+            persisted.cloud_base_url_override.as_deref(),
+            Some(override_url.as_str())
+        );
+        let who = client
+            .public::<Value, Value>(reqwest::Method::GET, "/api/v1/whoami", None)
+            .await
+            .expect("override reachable");
+        assert_eq!(who["server"], "override");
+
+        let restored = CloudClient::new(default_url.clone(), state.clone(), store.clone())
+            .expect("second client");
+        restored.restore_endpoint_override().await;
+        assert_eq!(restored.endpoint().base_url, override_url);
+
+        let rejected = client
+            .set_endpoint("http://example.com")
+            .await
+            .expect_err("non-loopback http must be rejected");
+        assert_eq!(rejected.code.as_deref(), Some("invalidArgument"));
+        assert_eq!(client.endpoint().base_url, override_url);
+
+        let reset = client.set_endpoint("  ").await.expect("reset accepted");
+        assert_eq!(reset.base_url, default_url);
+        assert!(
+            store
+                .load()
+                .await
+                .expect("reload after reset")
+                .cloud_base_url_override
+                .is_none()
+        );
+        let who = client
+            .public::<Value, Value>(reqwest::Method::GET, "/api/v1/whoami", None)
+            .await
+            .expect("default reachable");
+        assert_eq!(who["server"], "default");
+
+        drop(client);
+        drop(restored);
+        drop(state);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// 服务端一次性轮换：refresh token 用过即作废，复用返回 401。
+    #[derive(Clone, Default)]
+    struct RotatingCloud {
+        inner: Arc<Mutex<(String, String, usize)>>,
+    }
+
+    fn bearer(headers: &HeaderMap) -> String {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    async fn rotating_protected(
+        State(cloud): State<RotatingCloud>,
+        headers: HeaderMap,
+    ) -> Response {
+        if bearer(&headers) == cloud.inner.lock().await.0 {
+            axum::Json(json!({ "ok": true })).into_response()
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+
+    async fn rotating_refresh(
+        State(cloud): State<RotatingCloud>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        // 模拟真实往返延迟，放大并发刷新窗口。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut inner = cloud.inner.lock().await;
+        if body["refreshToken"].as_str() != Some(inner.1.as_str()) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        inner.2 += 1;
+        inner.0 = format!("access-{}", inner.2);
+        inner.1 = format!("refresh-{}", inner.2);
+        axum::Json(json!({
+            "accessToken": inner.0,
+            "refreshToken": inner.1,
+            "expiresIn": 900,
+            "user": { "id": "u1", "email": "user@example.com" },
+            "device": { "id": "row1", "deviceId": "device1" }
+        }))
+        .into_response()
+    }
+
+    /// 重启后 access 已过期：普通请求与 SSE 重连同时 401，必须只刷新一次且保住会话
+    /// （曾因 SSE 绕过单飞锁，第二次刷新被拒后清空了刚轮换到手的新凭证）。
+    #[tokio::test]
+    async fn concurrent_request_and_stream_refresh_once_and_keep_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rotating cloud");
+        let address = listener.local_addr().expect("rotating address");
+        let cloud = RotatingCloud::default();
+        *cloud.inner.lock().await = ("access-0".to_owned(), "refresh-0".to_owned(), 0);
+        let app = Router::new()
+            .route("/api/v1/test", get(rotating_protected))
+            .route("/api/v1/stream", get(rotating_protected))
+            .route("/api/v1/auth/refresh", post(rotating_refresh))
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_rotation_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let session = serde_json::from_value(json!({
+            "user": { "id": "u1", "email": "user@example.com" },
+            "device": { "id": "row1", "deviceId": "device1" }
+        }))
+        .expect("session dto");
+        let state = Arc::new(Mutex::new(AgentState {
+            device_id: "device1".to_owned(),
+            credentials: Some(CloudCredentials {
+                access_token: "expired-access".to_owned(),
+                refresh_token: "refresh-0".to_owned(),
+                expires_at_unix: 0,
+                session: Some(session),
+            }),
+            ..AgentState::default()
+        }));
+        let client = CloudClient::new(format!("http://{address}"), state.clone(), store.clone())
+            .expect("cloud client");
+
+        let request =
+            client.authenticated::<Value, Value>(reqwest::Method::GET, "/api/v1/test", None);
+        let stream = client.authenticated_stream("/api/v1/stream");
+        let (request, stream) = tokio::join!(request, stream);
+        assert_eq!(request.expect("request replay")["ok"], true);
+        assert!(stream.expect("stream replay").status().is_success());
+        assert_eq!(cloud.inner.lock().await.2, 1, "exactly one rotation");
+        let persisted = store
+            .load()
+            .await
+            .expect("reload state")
+            .credentials
+            .expect("session survives");
+        assert_eq!(persisted.refresh_token, "refresh-1");
+
         drop(client);
         drop(state);
         drop(store);

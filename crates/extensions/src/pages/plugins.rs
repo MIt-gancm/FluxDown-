@@ -4,19 +4,24 @@
 use std::collections::HashSet;
 
 use fluxdown_protocol::{InstalledPlugin, MarketEntryDto, PluginDto};
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, IconControlExt as _, card, form, form_field, input_with_action,
+    tabular_numbers,
+};
+use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AppContext as _, Context, Entity, IntoElement, ParentElement, SharedString, Styled, Window,
-    div, prelude::FluentBuilder as _, px,
+    AppContext as _, Context, Div, Entity, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
-    button::{Button, ButtonVariant, ButtonVariants as _},
-    dialog::{DialogButtonProps, DialogFooter},
+    Disableable as _, Icon, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    dialog::DialogFooter,
     h_flex,
     input::{Input, InputEvent, InputState},
     link::Link,
     switch::Switch,
-    tag::Tag,
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -24,11 +29,12 @@ use super::Frame;
 use crate::{
     ExtensionsTab, ExtensionsView,
     components::{
+        plugin_auth::PluginAuthDialog,
         plugin_detail::{PluginDetail, open_plugin_detail, yanked_label},
         plugin_settings::PluginSettingsForm,
     },
     controller::{COMPONENT_KINDS, component_wire_name},
-    error_text,
+    error_text, ui,
 };
 
 /// 市场列表每次展开的条数。
@@ -118,58 +124,55 @@ impl ExtensionsView {
         self.ensure_market_loaded(window, cx);
         let search = self.ensure_market_search(window, cx);
         let query = search.read(cx).value().to_string();
+        let theme = active_theme(cx);
         let frame = Frame {
             translator: self.translator.read(cx),
-            theme: cx.theme(),
+            tokens: theme.tokens(),
+            extended: theme.extended(),
+            components: theme.components(),
             stale: self.controller.is_stale(),
         };
         let Frame {
             translator,
-            theme,
+            tokens,
             stale,
+            ..
         } = frame;
 
-        let installed = self
-            .controller
-            .plugins()
+        let plugins = self.controller.plugins();
+        let installed = plugins
             .iter()
             .enumerate()
             .map(|(index, plugin)| {
-                self.render_plugin_card(index, plugin, frame, cx)
+                self.render_plugin_row(index, plugin, frame, cx)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let installed_ids = self
-            .controller
-            .plugins()
+        let installed_ids = plugins
             .iter()
             .map(|plugin| plugin.identity.as_str())
             .collect::<HashSet<_>>();
 
         v_flex()
             .w_full()
-            .gap_3()
+            .gap(tokens.spacing.md)
             .child(
                 h_flex()
                     .w_full()
                     .items_center()
                     .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_semibold()
-                            .child(translator.text("pluginsSectionTitle").to_owned()),
-                    )
+                    .child(ui::title_text(
+                        translator.text("pluginsSectionTitle").to_owned(),
+                        frame,
+                    ))
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(tokens.spacing.sm)
                             .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(translator.text("pluginDevModeSwitch").to_owned()),
-                            )
+                            .child(ui::meta_text(
+                                translator.text("pluginDevModeSwitch").to_owned(),
+                                frame,
+                            ))
                             .child(
                                 Switch::new("plugin-dev-mode")
                                     .checked(self.plugins.dev_mode)
@@ -181,35 +184,34 @@ impl ExtensionsView {
                     ),
             )
             .child(self.render_install_area(frame, cx))
-            .when(installed.is_empty(), |this| {
-                this.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(translator.text("pluginsEmpty").to_owned()),
+            .child(if installed.is_empty() {
+                ui::empty_state(
+                    FluxIcon::Package,
+                    translator.text("pluginsEmpty").to_owned(),
+                    None,
+                    frame,
                 )
+            } else {
+                list_card(installed, frame, cx)
             })
-            .children(installed)
             .child(
                 v_flex()
                     .w_full()
-                    .pt_4()
-                    .gap_0p5()
+                    .pt(tokens.spacing.lg)
+                    .gap(tokens.spacing.xxs)
                     .child(
                         h_flex()
                             .w_full()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(translator.text("marketSectionTitle").to_owned()),
-                            )
+                            .child(ui::title_text(
+                                translator.text("marketSectionTitle").to_owned(),
+                                frame,
+                            ))
                             .child(
                                 Button::new("market-refresh")
                                     .ghost()
-                                    .small()
+                                    .control(cx)
                                     .label(translator.text("marketRefreshTooltip").to_owned())
                                     .loading(self.plugins.market.loading)
                                     .disabled(self.plugins.market.loading || stale)
@@ -218,12 +220,10 @@ impl ExtensionsView {
                                     })),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(translator.text("marketSectionDesc").to_owned()),
-                    ),
+                    .child(ui::meta_text(
+                        translator.text("marketSectionDesc").to_owned(),
+                        frame,
+                    )),
             )
             .child(self.render_market(&search, &query, &installed_ids, frame, cx))
     }
@@ -256,83 +256,81 @@ impl ExtensionsView {
     fn render_install_area(&self, frame: Frame<'_>, cx: &Context<Self>) -> impl IntoElement {
         let Frame {
             translator,
-            theme,
+            tokens,
             stale,
+            ..
         } = frame;
         let dev_dir = self.plugins.dev_dir.clone();
         let dev_dir_empty = dev_dir.is_empty();
-        h_flex()
-            .w_full()
-            .gap_3()
-            .items_center()
-            .p_3()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
-            .child(
-                Button::new("plugin-install-zip")
-                    .outline()
-                    .small()
-                    .icon(IconName::FolderOpen)
-                    .label(translator.text("pluginInstallZipButton").to_owned())
-                    .loading(self.plugins.installing_file)
-                    .disabled(stale || self.plugins.installing_file)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.pick_plugin_zip(window, cx);
-                    })),
-            )
-            .when(self.plugins.dev_mode, |this| {
-                this.child(
-                    h_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_sm()
-                                .text_color(if dev_dir_empty {
-                                    theme.muted_foreground
-                                } else {
-                                    theme.foreground
-                                })
-                                .child(if dev_dir_empty {
-                                    translator.text("pluginInstallDirPlaceholder").to_owned()
-                                } else {
-                                    dev_dir
-                                }),
-                        )
-                        .child(
-                            Button::new("plugin-pick-dev-dir")
-                                .outline()
-                                .small()
-                                .icon(IconName::FolderOpen)
-                                .tooltip(translator.text("pluginInstallDirLabel").to_owned())
-                                .disabled(self.plugins.installing_dir)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.pick_dev_dir(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("plugin-install-dev-dir")
-                                .primary()
-                                .small()
-                                .label(translator.text("pluginInstallDirButton").to_owned())
-                                .loading(self.plugins.installing_dir)
-                                .disabled(stale || dev_dir_empty || self.plugins.installing_dir)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.install_dev_dir(window, cx);
-                                })),
-                        ),
+        // 安装区：zip 安装按钮 + （开发模式下）「从目录安装」字段：只读路径框 +
+        // 选择目录 / 安装 同行按钮，全部统一控件档。
+        card(cx).w_full().p(tokens.spacing.md).child(
+            form(cx)
+                .child(
+                    h_flex().child(
+                        Button::new("plugin-install-zip")
+                            .outline()
+                            .icon(FluxIcon::FolderOpen)
+                            .label(translator.text("pluginInstallZipButton").to_owned())
+                            .control(cx)
+                            .loading(self.plugins.installing_file)
+                            .disabled(stale || self.plugins.installing_file)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pick_plugin_zip(window, cx);
+                            })),
+                    ),
                 )
-            })
+                .when(self.plugins.dev_mode, |this| {
+                    let display = if dev_dir_empty {
+                        translator.text("pluginInstallDirPlaceholder").to_owned()
+                    } else {
+                        dev_dir
+                    };
+                    this.child(form_field(
+                        translator.text("pluginInstallDirLabel").to_owned(),
+                        input_with_action(
+                            ui::path_box(display, dev_dir_empty, active_theme(cx)),
+                            h_flex()
+                                .gap(tokens.spacing.sm)
+                                .items_center()
+                                .child(
+                                    Button::new("plugin-pick-dev-dir")
+                                        .outline()
+                                        .icon(FluxIcon::FolderOpen)
+                                        .control_icon(cx)
+                                        .tooltip(
+                                            translator
+                                                .text("pluginInstallDirPlaceholder")
+                                                .to_owned(),
+                                        )
+                                        .disabled(self.plugins.installing_dir)
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.pick_dev_dir(window, cx);
+                                        })),
+                                )
+                                .child(
+                                    Button::new("plugin-install-dev-dir")
+                                        .primary()
+                                        .label(translator.text("pluginInstallDirButton").to_owned())
+                                        .control(cx)
+                                        .loading(self.plugins.installing_dir)
+                                        .disabled(
+                                            stale || dev_dir_empty || self.plugins.installing_dir,
+                                        )
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.install_dev_dir(window, cx);
+                                        })),
+                                ),
+                            cx,
+                        ),
+                        None,
+                        cx,
+                    ))
+                }),
+        )
     }
 
-    fn render_plugin_card(
+    fn render_plugin_row(
         &self,
         index: usize,
         plugin: &PluginDto,
@@ -341,56 +339,62 @@ impl ExtensionsView {
     ) -> impl IntoElement {
         let Frame {
             translator,
-            theme,
+            tokens,
             stale,
+            ..
         } = frame;
+        let destructive = tokens.colors.destructive;
         let identity = plugin.identity.clone();
         let busy = stale || self.plugins.busy.contains(&plugin.identity);
+        let load_failed = plugin.load_status == "Failed";
+        // 颜色是信号：只有加载失败 / 熔断停用着 destructive，其余状态中性。
         let badges = [
             plugin
                 .dev_mode
-                .then(|| Tag::info().child(translator.text("pluginDevModeBadge").to_owned())),
+                .then(|| ui::neutral_pill(translator.text("pluginDevModeBadge").to_owned(), frame)),
+            Some(if load_failed {
+                ui::tone_pill(
+                    translator.text("pluginLoadStatusFailed").to_owned(),
+                    destructive,
+                    frame,
+                )
+            } else {
+                ui::neutral_pill(translator.text("pluginLoadStatusLoaded").to_owned(), frame)
+            }),
             (plugin.disabled_reason == "Manual").then(|| {
-                Tag::secondary().child(translator.text("pluginDisabledManual").to_owned())
+                ui::neutral_pill(translator.text("pluginDisabledManual").to_owned(), frame)
             }),
             (plugin.disabled_reason == "CircuitBreaker").then(|| {
-                Tag::danger().child(translator.text("pluginDisabledCircuitBreaker").to_owned())
+                ui::tone_pill(
+                    translator.text("pluginDisabledCircuitBreaker").to_owned(),
+                    destructive,
+                    frame,
+                )
             }),
         ];
         let detail = PluginDetail::from_plugin(plugin);
         let detail_translator = translator.clone();
-        h_flex()
-            .w_full()
-            .gap_3()
-            .items_center()
-            .px_3()
-            .py_2()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
+        list_row(frame)
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_0p5()
+                    .gap(tokens.spacing.xxs)
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(tokens.spacing.sm)
                             .items_center()
                             .flex_wrap()
-                            .child(div().text_sm().font_semibold().child(plugin.name.clone()))
+                            .child(ui::title_text(plugin.name.clone(), frame))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("v{}", plugin.version)),
+                                ui::meta_text(format!("v{}", plugin.version), frame)
+                                    .font_features(tabular_numbers()),
                             )
                             .when(!plugin.homepage.is_empty(), |this| {
                                 this.child(
                                     Link::new(("plugin-homepage", index))
                                         .href(plugin.homepage.clone())
-                                        .text_xs()
+                                        .text_size(tokens.typography.xs.size)
                                         .child(plugin.homepage.clone()),
                                 )
                             })
@@ -398,68 +402,73 @@ impl ExtensionsView {
                     )
                     .when(!plugin.description.is_empty(), |this| {
                         this.child(
-                            div()
+                            ui::meta_text(plugin.description.clone(), frame)
+                                .w_full()
+                                .truncate(),
+                        )
+                    })
+                    .when(load_failed && !plugin.load_error.is_empty(), |this| {
+                        let load_error = plugin.load_error.clone();
+                        let load_error_tooltip = plugin.load_error.clone();
+                        this.child(
+                            ui::meta_text(load_error, frame)
+                                .id(("plugin-load-error", index))
                                 .w_full()
                                 .truncate()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(plugin.description.clone()),
+                                .text_color(destructive)
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(load_error_tooltip.clone()).build(window, cx)
+                                }),
                         )
                     }),
             )
             .child(
                 Button::new(("plugin-detail", index))
                     .ghost()
-                    .small()
-                    .icon(IconName::Info)
+                    .control_icon(cx)
+                    .icon(FluxIcon::Info)
                     .tooltip(translator.text("pluginDetailDescription").to_owned())
                     .on_click(move |_, window, cx| {
                         open_plugin_detail(detail.clone(), detail_translator.clone(), window, cx);
                     }),
             )
-            .child(
-                Switch::new(("plugin-enabled", index))
-                    .checked(plugin.enabled)
-                    .disabled(busy)
-                    .on_click({
-                        let identity = identity.clone();
-                        cx.listener(move |this, checked: &bool, window, cx| {
-                            let future = this
-                                .controller
-                                .set_plugin_enabled(identity.clone(), *checked);
-                            this.run_plugin_op(
-                                identity.clone(),
-                                PluginOp::SetEnabled,
-                                future,
-                                window,
-                                cx,
-                            );
-                        })
-                    }),
-            )
-            .when(!plugin.settings.is_empty(), |this| {
+            .when(!load_failed && !plugin.settings.is_empty(), |this| {
                 let identity = identity.clone();
                 this.child(
                     Button::new(("plugin-settings", index))
                         .ghost()
-                        .small()
-                        .icon(IconName::Settings2)
+                        .control_icon(cx)
+                        .icon(FluxIcon::Settings)
                         .tooltip(translator.text("pluginSettingsTooltip").to_owned())
-                        .disabled(busy)
+                        .disabled(busy || load_failed)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_plugin_settings(&identity, window, cx);
+                        })),
+                )
+            })
+            .when(!load_failed && plugin.auth_supported, |this| {
+                let identity = identity.clone();
+                this.child(
+                    Button::new(("plugin-auth", index))
+                        .outline()
+                        .control(cx)
+                        .label(translator.text("pluginAuthButton").to_owned())
+                        .disabled(busy || load_failed)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.open_plugin_auth(&identity, window, cx);
                         })),
                 )
             })
             .child(
                 Button::new(("plugin-uninstall", index))
                     .ghost()
-                    .small()
-                    .icon(IconName::Delete)
+                    .control_icon(cx)
+                    .icon(FluxIcon::Trash2)
                     .tooltip(translator.text("pluginUninstallTooltip").to_owned())
                     .disabled(busy)
                     .on_click({
                         let name = plugin.name.clone();
+                        let identity = identity.clone();
                         cx.listener(move |this, _, window, cx| {
                             this.confirm_uninstall_plugin(
                                 identity.clone(),
@@ -469,6 +478,23 @@ impl ExtensionsView {
                             );
                         })
                     }),
+            )
+            .child(
+                Switch::new(("plugin-enabled", index))
+                    .checked(plugin.enabled && !load_failed)
+                    .disabled(busy || load_failed)
+                    .on_click(cx.listener(move |this, checked: &bool, window, cx| {
+                        let future = this
+                            .controller
+                            .set_plugin_enabled(identity.clone(), *checked);
+                        this.run_plugin_op(
+                            identity.clone(),
+                            PluginOp::SetEnabled,
+                            future,
+                            window,
+                            cx,
+                        );
+                    })),
             )
     }
 
@@ -481,74 +507,87 @@ impl ExtensionsView {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let Frame {
-            translator, theme, ..
+            translator, tokens, ..
         } = frame;
         let market = &self.plugins.market;
-        let mut root = v_flex().w_full().gap_2();
+        let mut root = v_flex().w_full().gap(tokens.spacing.sm);
         if market.loading && market.entries.is_empty() {
-            return root.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(translator.text("pluginCommonLoading").to_owned()),
-            );
+            return root.child(ui::meta_text(
+                translator.text("pluginCommonLoading").to_owned(),
+                frame,
+            ));
         }
         if let Some(error) = &market.error {
-            return root.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.danger)
-                    .child(translator.text_with("marketLoadFailed", &[("message", error)])),
-            );
+            return root.child(ui::status_line(
+                FluxIcon::CircleAlert,
+                tokens.colors.destructive,
+                translator.text_with("marketLoadFailed", &[("message", error)]),
+                frame,
+            ));
         }
         if market.entries.is_empty() {
-            return root.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(translator.text("marketEmpty").to_owned()),
-            );
+            return root.child(ui::empty_state(
+                FluxIcon::Package,
+                translator.text("marketEmpty").to_owned(),
+                None,
+                frame,
+            ));
         }
-        root = root.child(Input::new(search).w_full().cleanable(true));
+        root = root.child(
+            Input::new(search)
+                .control(cx)
+                .w_full()
+                .prefix(
+                    Icon::new(FluxIcon::Search)
+                        .size(frame.extended.icon.md)
+                        .text_color(tokens.colors.muted_foreground),
+                )
+                .cleanable(true),
+        );
         let filtered = filter_market(&market.entries, query);
         if filtered.is_empty() {
-            return root.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child(translator.text("marketSearchNoResult").to_owned()),
-            );
+            return root.child(ui::empty_state(
+                FluxIcon::Search,
+                translator.text("marketSearchNoResult").to_owned(),
+                None,
+                frame,
+            ));
         }
         let remaining = filtered.len().saturating_sub(market.limit);
-        let cards = filtered
+        let rows = filtered
             .iter()
             .take(market.limit)
             .enumerate()
             .map(|(index, entry)| {
                 let installed = installed_ids.contains(entry.plugin_id.as_str());
                 let pending = market.pending.contains(&entry.plugin_id);
-                self.render_market_card(index, entry, installed, pending, frame, cx)
+                self.render_market_row(index, entry, installed, pending, frame, cx)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        root.children(cards).when(remaining > 0, |this| {
-            this.child(
-                Button::new("market-show-more")
-                    .ghost()
-                    .small()
-                    .label(
-                        translator
-                            .text_with("marketShowMore", &[("count", &remaining.to_string())]),
-                    )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.plugins.market.limit += MARKET_PAGE_SIZE;
-                        cx.notify();
-                    })),
-            )
-        })
+        root.child(list_card(rows, frame, cx))
+            .when(remaining > 0, |this| {
+                this.child(
+                    h_flex().justify_center().child(
+                        Button::new("market-show-more")
+                            .ghost()
+                            .control(cx)
+                            .label(
+                                translator.text_with(
+                                    "marketShowMore",
+                                    &[("count", &remaining.to_string())],
+                                ),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.plugins.market.limit += MARKET_PAGE_SIZE;
+                                cx.notify();
+                            })),
+                    ),
+                )
+            })
     }
 
-    fn render_market_card(
+    fn render_market_row(
         &self,
         index: usize,
         entry: &MarketEntryDto,
@@ -559,8 +598,9 @@ impl ExtensionsView {
     ) -> impl IntoElement {
         let Frame {
             translator,
-            theme,
+            tokens,
             stale,
+            ..
         } = frame;
         let name = if entry.name.is_empty() {
             entry.plugin_id.clone()
@@ -579,67 +619,50 @@ impl ExtensionsView {
             translator.text("marketInstallButton")
         }
         .to_owned();
-        h_flex()
-            .w_full()
-            .gap_3()
-            .items_center()
-            .px_3()
-            .py_2()
-            .rounded(theme.radius)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.secondary)
+        list_row(frame)
             .child(
                 v_flex()
                     .flex_1()
                     .min_w_0()
-                    .gap_0p5()
+                    .gap(tokens.spacing.xxs)
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap(tokens.spacing.sm)
                             .items_center()
                             .flex_wrap()
-                            .child(div().text_sm().font_semibold().child(name))
+                            .child(ui::title_text(name, frame))
                             .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("v{}", entry.version)),
+                                ui::meta_text(format!("v{}", entry.version), frame)
+                                    .font_features(tabular_numbers()),
                             )
                             .when(!entry.author.is_empty(), |this| {
-                                this.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(entry.author.clone()),
-                                )
+                                this.child(ui::meta_text(entry.author.clone(), frame))
                             })
                             .when(!entry.homepage.is_empty(), |this| {
                                 this.child(
                                     Link::new(("market-homepage", index))
                                         .href(entry.homepage.clone())
-                                        .text_xs()
+                                        .text_size(tokens.typography.xs.size)
                                         .child(entry.homepage.clone()),
                                 )
                             })
-                            .children(yanked.map(|label| Tag::danger().child(label))),
+                            .children(yanked.map(|label| {
+                                ui::tone_pill(label, tokens.colors.destructive, frame)
+                            })),
                     )
                     .when(!entry.description.is_empty(), |this| {
                         this.child(
-                            div()
+                            ui::meta_text(entry.description.clone(), frame)
                                 .w_full()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(entry.description.clone()),
+                                .truncate(),
                         )
                     }),
             )
             .child(
                 Button::new(("market-detail", index))
                     .ghost()
-                    .small()
-                    .icon(IconName::Info)
+                    .control_icon(cx)
+                    .icon(FluxIcon::Info)
                     .tooltip(translator.text("pluginDetailDescription").to_owned())
                     .on_click(move |_, window, cx| {
                         open_plugin_detail(detail.clone(), detail_translator.clone(), window, cx);
@@ -648,7 +671,7 @@ impl ExtensionsView {
             .child(
                 Button::new(("market-install", index))
                     .outline()
-                    .small()
+                    .control(cx)
                     .label(install_label)
                     .loading(pending)
                     .disabled(installed || pending || stale)
@@ -895,17 +918,17 @@ impl ExtensionsView {
         let later = SharedString::from(translator.text("pluginDepsLater").to_owned());
         let go = SharedString::from(translator.text("pluginDepsGoToComponents").to_owned());
         let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let view = view.clone();
             alert
-                .title(title.clone())
+                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .description(body.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(go.clone())
-                        .cancel_text(later.clone())
-                        .show_cancel(true),
-                )
+                .footer(fluxdown_ui_components::dialog_footer(
+                    Some(later.clone()),
+                    go.clone(),
+                    fluxdown_ui_components::DialogIntent::Confirm,
+                    cx,
+                ))
                 .on_ok(move |_, _, cx| {
                     let _ =
                         view.update(cx, |this, cx| this.show_tab(ExtensionsTab::Components, cx));
@@ -928,19 +951,18 @@ impl ExtensionsView {
         let ok = SharedString::from(translator.text("pluginUninstallTooltip").to_owned());
         let cancel = SharedString::from(translator.text("cancel").to_owned());
         let view = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
+        window.open_alert_dialog(cx, move |alert, _, cx| {
             let view = view.clone();
             let identity = identity.clone();
             alert
-                .title(title.clone())
+                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .description(body.clone())
-                .button_props(
-                    DialogButtonProps::default()
-                        .ok_text(ok.clone())
-                        .ok_variant(ButtonVariant::Danger)
-                        .cancel_text(cancel.clone())
-                        .show_cancel(true),
-                )
+                .footer(fluxdown_ui_components::dialog_footer(
+                    Some(cancel.clone()),
+                    ok.clone(),
+                    fluxdown_ui_components::DialogIntent::Destructive,
+                    cx,
+                ))
                 .on_ok(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
                         let future = this.controller.uninstall_plugin(identity.clone());
@@ -977,15 +999,17 @@ impl ExtensionsView {
             let form_for_content = form.clone();
             let form_for_save = form.clone();
             dialog
-                .title(title.clone())
-                .w(px(460.))
+                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+                .w(px(560.))
                 .overlay_closable(!is_saving)
                 .content(move |content, _, _| content.child(form_for_content.clone()))
                 .footer(
                     DialogFooter::new()
+                        .gap(active_theme(cx).tokens().spacing.sm)
                         .child(
                             Button::new("plugin-settings-cancel")
                                 .outline()
+                                .control(cx)
                                 .label(cancel.clone())
                                 .disabled(is_saving)
                                 .on_click(|_, window, cx| window.close_dialog(cx)),
@@ -993,6 +1017,7 @@ impl ExtensionsView {
                         .child(
                             Button::new("plugin-settings-save")
                                 .primary()
+                                .control(cx)
                                 .label(if is_saving {
                                     saving.clone()
                                 } else {
@@ -1007,6 +1032,60 @@ impl ExtensionsView {
                 )
         });
     }
+
+    fn open_plugin_auth(&self, identity: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plugin) = self.controller.plugin(identity) else {
+            return;
+        };
+        let translator = self.translator.clone();
+        let port = self.controller.port().clone();
+        let identity = plugin.identity.clone();
+        let title = SharedString::from(
+            self.translator
+                .read(cx)
+                .text_with("pluginAuthDialogTitle", &[("name", &plugin.name)]),
+        );
+        let dialog = cx.new(|cx| PluginAuthDialog::new(translator, port, identity, window, cx));
+        let dialog_for_cancel = dialog.clone();
+        window.open_dialog(cx, move |dialog_view, _, cx| {
+            let dialog_for_content = dialog.clone();
+            let dialog_for_cancel = dialog_for_cancel.clone();
+            dialog_view
+                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+                .w(px(520.))
+                .on_cancel(move |_, _, cx| {
+                    dialog_for_cancel.update(cx, |this, cx| this.cancel_session(cx));
+                    true
+                })
+                .content(move |content, _, _| content.child(dialog_for_content.clone()))
+        });
+    }
+}
+
+/// 列表卡片：一张 surface 卡片内纵向排列各行，行间 hairline 分隔（与下载表格同一「少线」风格）。
+fn list_card(rows: Vec<gpui::AnyElement>, frame: Frame<'_>, cx: &gpui::App) -> Div {
+    let count = rows.len();
+    card(cx)
+        .w_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .children(rows.into_iter().enumerate().flat_map(move |(index, row)| {
+            let divider = (index + 1 < count).then(|| ui::divider(frame).into_any_element());
+            std::iter::once(row).chain(divider)
+        }))
+}
+
+/// 列表行：横向排布、行内控件间距 `spacing.sm`，内边距 md / sm，悬停 `row_hover`。
+fn list_row(frame: Frame<'_>) -> Div {
+    let hover = frame.extended.colors.row_hover;
+    h_flex()
+        .w_full()
+        .gap(frame.tokens.spacing.sm)
+        .items_center()
+        .px(frame.tokens.spacing.md)
+        .py(frame.tokens.spacing.sm)
+        .hover(move |style| style.bg(hover))
 }
 
 #[cfg(test)]

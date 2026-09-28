@@ -1,0 +1,54 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import JoinSteps from "@/components/community/JoinSteps.astro";
+import { BrandIcon } from "@/components/icons/brand";
+import { ArrowUpRight } from "lucide-react";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { groups } from "@/i18n/messages/groups";
+import { TELEGRAM_URL } from "@/lib/site-nav";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = groups[lang].telegram;
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description} noindex>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.lede} />
+
+  <section class="frame">
+    <div class="cells md:grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+      <div class="cell grid place-items-center">
+        <figure class="fig w-full max-w-[320px]" data-reveal>
+          <figcaption class="fig-bar"><span>fig. 01</span><span>{t.figCaption}</span></figcaption>
+          <div class="tg-plate grid place-items-center gap-6 px-6 py-10">
+            <span class="tg-mark grid size-24 place-items-center rounded-[22px]">
+              <BrandIcon name="telegram" size={48} />
+            </span>
+            <a class="btn btn-primary btn-lg" href={TELEGRAM_URL} target="_blank" rel="noopener noreferrer">
+              {t.join}
+              <ArrowUpRight aria-hidden className="size-4" />
+            </a>
+          </div>
+        </figure>
+      </div>
+
+      <div class="cell flex flex-col justify-center">
+        <JoinSteps heading={t.howToJoin} steps={t.steps} />
+      </div>
+    </div>
+  </section>
+</Layout>
+
+<style>
+  .tg-plate {
+    background-image: radial-gradient(circle at 50% 38%, var(--accent-soft), transparent 62%);
+  }
+  .tg-mark {
+    color: var(--accent-ink);
+    background: var(--bg-elev);
+    box-shadow:
+      0 0 0 1px var(--line-strong) inset,
+      var(--shadow-float);
+  }
+</style>

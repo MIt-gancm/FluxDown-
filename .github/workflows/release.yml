@@ -4,6 +4,22 @@ on:
   push:
     tags:
       - "v*"
+  # 手动补跑：某个组件在正式发布中构建失败时，修好流水线后按已存在的 tag 重跑该组件，
+  # 产物上传到该 tag 对应的组件 release（不重跑其他组件、不动主 release）。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "已存在的发布 tag（例如 v0.4.8）"
+        required: true
+        type: string
+      component:
+        description: "要补跑的组件"
+        required: true
+        default: mobile
+        type: choice
+        options:
+          - mobile
+          - server
 
 permissions:
   contents: write
@@ -41,6 +57,7 @@ jobs:
       mobile: ${{ steps.detect.outputs.mobile }}
       cli: ${{ steps.detect.outputs.cli }}
       engine: ${{ steps.detect.outputs.engine }}
+      tag: ${{ steps.resolve.outputs.tag }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -48,12 +65,29 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      # tag 来源统一出口：push 取 refs/tags/*，手动补跑取输入并校验 tag 真实存在。
+      - name: Resolve release tag
+        id: resolve
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+            if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "::error::Tag ${TAG} 不存在"
+              exit 1
+            fi
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "::notice::Release tag: $TAG"
+
       # 分支守卫：预览版 tag（vX.Y.Z-rc.N）必须打在 main 分支上，
       # 稳定版 tag（vX.Y.Z）必须打在 stable 分支上。打错分支整条流水线在此失败。
       - name: Verify tag branch (stable=stable, frontier=main)
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ steps.resolve.outputs.tag }}"
           case "$TAG" in
             *-*) BRANCH=main ;;
             *)   BRANCH=stable ;;
@@ -70,7 +104,17 @@ jobs:
         id: detect
         shell: bash
         run: |
-          TAG="${GITHUB_REF#refs/tags/}"
+          TAG="${{ steps.resolve.outputs.tag }}"
+
+          # 手动补跑：只开启被选中的组件，跳过目录 diff 检测。
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            for c in app extension server mobile cli engine; do
+              if [ "$c" = "${{ inputs.component }}" ]; then echo "$c=true"; else echo "$c=false"; fi
+            done >> "$GITHUB_OUTPUT"
+            echo "::notice::Manual re-run of component ${{ inputs.component }} for ${TAG}"
+            exit 0
+          fi
+
           # 只匹配 v0.1.2 形式的版本 tag（glob 从头锚定，
           # 自动忽略 release 流程创建的 extension-v* / website-v* 组件 tag）
           PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
@@ -1220,11 +1264,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.changes.outputs.tag }}
 
       - name: Get version from tag
         id: version
         run: |
-          V="${GITHUB_REF#refs/tags/v}"
+          V="${{ needs.changes.outputs.tag }}"; V="${V#v}"
           echo "VERSION=$V" >> "$GITHUB_OUTPUT"
           echo "CLEAN_VERSION=${V%%-*}" >> "$GITHUB_OUTPUT"
 
@@ -1236,8 +1281,12 @@ jobs:
           java-version: "17"
 
       # ── Android SDK / NDK（Flutter 构建时需要）──
+      # packages 必须显式指定：action 默认值 "tools platform-tools" 里的 legacy
+      # `tools` 包已从 Google SDK 仓库下架，sdkmanager 会以 exit 1 失败。
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
 
       # ── Rust toolchain + Android 目标三元组（cargokit 编译各 ABI 的 cdylib）──
       - name: Setup Rust toolchain
@@ -1368,6 +1417,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.tag }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -1428,11 +1479,15 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.tag }}
 
       - name: Get version from tag
         id: version
         shell: bash
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          V="${{ needs.changes.outputs.tag }}"
+          echo "VERSION=${V#v}" >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -1551,10 +1606,14 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.tag }}
 
       - name: Get version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          V="${{ needs.changes.outputs.tag }}"
+          echo "VERSION=${V#v}" >> "$GITHUB_OUTPUT"
 
       - name: Download linux server tarballs
         uses: actions/download-artifact@v4
@@ -1763,10 +1822,23 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.changes.outputs.tag }}
+
+      # 补发仍构建原 tag 的源码，仅 Docker 构建配置取本次 workflow 提交的修复。
+      - name: Apply Docker build configuration for manual re-release
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags origin "$WORKFLOW_SHA"
+          git restore --source="$WORKFLOW_SHA" -- .dockerignore docker/server.Dockerfile
 
       - name: Get version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          V="${{ needs.changes.outputs.tag }}"
+          echo "VERSION=${V#v}" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU (arm64 runtime layer)
         uses: docker/setup-qemu-action@v3
@@ -1791,7 +1863,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/fluxdown-server
           tags: |
             type=raw,value=${{ steps.version.outputs.VERSION }}
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(needs.changes.outputs.tag, '-') }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -1872,6 +1944,15 @@ jobs:
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}
 
+      # 同步到阿里云 OSS（官网 /api/download 优先 302 到 OSS）；失败不阻断 GitHub Release
+      - name: Upload release assets to OSS
+        continue-on-error: true
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: ${{ github.ref_name }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+
   # ── Release Job 2: 浏览器扩展（独立 tag extension-v*，不抢占 latest）──
   release-extension:
     name: Release Browser Extension
@@ -1920,11 +2001,19 @@ jobs:
           draft: false
           make_latest: "false"
 
+      - name: Upload release assets to OSS
+        continue-on-error: true
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: extension-v${{ steps.version.outputs.VERSION }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+
   # ── Release Job 3: Headless 服务器（独立 tag server-v*，不抢占 latest）──
   release-server:
     name: Release Server
     runs-on: ubuntu-latest
-    needs: [build-server-docker, build-server-binaries, build-server-nas-packages]
+    needs: [changes, build-server-docker, build-server-binaries, build-server-nas-packages]
 
     steps:
       - name: Checkout repository
@@ -1935,7 +2024,10 @@ jobs:
 
       - name: Get version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          V="${{ needs.changes.outputs.tag }}"
+          echo "VERSION=${V#v}" >> "$GITHUB_OUTPUT"
+          echo "COMMIT=$(git rev-parse "$V^{commit}")" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
         uses: ./.github/actions/release-notes
@@ -1943,6 +2035,7 @@ jobs:
           component: Headless 服务器（含 Web 控制台）
           fallback-title: Server Release v${{ steps.version.outputs.VERSION }}
           paths: native/server/** web/** native/engine/** native/api/** docker/** packaging/**
+          tag: ${{ needs.changes.outputs.tag }}
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       # 附加下载方式说明（直接下载二进制 + Docker）
@@ -2004,13 +2097,22 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: server-v${{ steps.version.outputs.VERSION }}
+          target_commitish: ${{ steps.version.outputs.COMMIT }}
           name: FluxDown Server v${{ steps.version.outputs.VERSION }}
           files: release-assets/*
           body_path: RELEASE_NOTES.md
           generate_release_notes: false
           draft: false
           make_latest: "false"
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(needs.changes.outputs.tag, '-') }}
+
+      - name: Upload release assets to OSS
+        continue-on-error: true
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: server-v${{ steps.version.outputs.VERSION }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
 
   # ── Release Job: CLI（独立 tag cli-v*，不抢占 latest）──
   release-cli:
@@ -2101,11 +2203,19 @@ jobs:
           make_latest: "false"
           prerelease: ${{ contains(github.ref_name, '-') }}
 
+      - name: Upload release assets to OSS
+        continue-on-error: true
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: cli-v${{ steps.version.outputs.VERSION }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+
   # ── Release Job 4: 移动端（独立 tag mobile-v*，不抢占 latest）──
   release-mobile:
     name: Release Mobile
     runs-on: ubuntu-latest
-    needs: build-android
+    needs: [changes, build-android]
 
     steps:
       - name: Checkout repository
@@ -2113,10 +2223,14 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+          # 不检出 tag：本地 composite action（release-notes）从 workspace 加载，
+          # 检出 tag 会跑成旧版本 action。历史与 tag 已由 fetch-depth:0 + fetch-tags 提供。
 
       - name: Get version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        run: |
+          V="${{ needs.changes.outputs.tag }}"
+          echo "VERSION=${V#v}" >> "$GITHUB_OUTPUT"
 
       - name: Generate release notes
         uses: ./.github/actions/release-notes
@@ -2124,6 +2238,7 @@ jobs:
           component: Android 移动端
           fallback-title: Mobile Release v${{ steps.version.outputs.VERSION }}
           paths: native/engine/** android/** lib/src/mobile/**
+          tag: ${{ needs.changes.outputs.tag }}
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       - name: Download Android APK artifacts
@@ -2151,7 +2266,15 @@ jobs:
           generate_release_notes: false
           draft: false
           make_latest: "false"
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(needs.changes.outputs.tag, '-') }}
+
+      - name: Upload release assets to OSS
+        continue-on-error: true
+        uses: ./.github/actions/oss-upload
+        with:
+          tag: mobile-v${{ steps.version.outputs.VERSION }}
+          access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
+          access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
 
   # ── 最终 Job: 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
   # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB
@@ -2160,7 +2283,7 @@ jobs:
   cleanup-artifacts:
     name: Cleanup CI Artifacts
     runs-on: ubuntu-latest
-    needs: [release-app, release-extension, release-server, release-mobile, release-cli]
+    needs: [changes, release-app, release-extension, release-server, release-mobile, release-cli]
     if: ${{ always() && !cancelled() }}
 
     steps:
@@ -2169,7 +2292,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          CURRENT_TAG="${GITHUB_REF#refs/tags/}"
+          CURRENT_TAG="${{ needs.changes.outputs.tag }}"
           echo "🧹 Artifact cleanup: keeping artifacts from tag ${CURRENT_TAG} and any still-running workflow runs"
 
           # 收集所有未完成（queued/in_progress）run 的 id：并行的其他 tag 发布
@@ -2212,38 +2335,3 @@ jobs:
           if [ "$FAIL" -gt 0 ]; then
             echo "⚠️  ${FAIL} deletion(s) failed (will be retried next release)"
           fi
-
-  # ── 最终 Job: 通知国内镜像同步（mirror.qwld.cn）──
-  # 任一组件 release 成功后触发 githubProxy 拉取最新正式版/预览版资产。
-  # 镜像自身有兜底轮询，本步失败仅延迟镜像更新，不阻断发布（continue-on-error）。
-  # 需要仓库 secrets：MIRROR_SYNC_SECRET（与镜像端 FDPROXY_SECRET 一致）；
-  # 可选 MIRROR_SYNC_URL 覆盖默认地址。
-  notify-mirror:
-    name: Notify Download Mirror
-    runs-on: ubuntu-latest
-    needs: [release-app, release-extension, release-server, release-mobile, release-cli]
-    if: ${{ always() && !cancelled() && contains(needs.*.result, 'success') }}
-
-    steps:
-      - name: Trigger mirror sync
-        continue-on-error: true
-        env:
-          MIRROR_SYNC_URL: ${{ secrets.MIRROR_SYNC_URL || 'https://mirror.qwld.cn/sync' }}
-          MIRROR_SYNC_SECRET: ${{ secrets.MIRROR_SYNC_SECRET }}
-        run: |
-          if [ -z "$MIRROR_SYNC_SECRET" ]; then
-            echo "⚠️  MIRROR_SYNC_SECRET not configured, skipping mirror notification"
-            exit 0
-          fi
-          # 最多重试 3 次，每次 15s 超时；镜像端 202 表示已排队同步
-          for i in 1 2 3; do
-            if curl -fsS -m 15 -X POST \
-              -H "Authorization: Bearer ${MIRROR_SYNC_SECRET}" \
-              "$MIRROR_SYNC_URL"; then
-              echo "✅ Mirror sync triggered"
-              exit 0
-            fi
-            echo "⚠️  Attempt $i failed, retrying in 10s..."
-            sleep 10
-          done
-          echo "⚠️  Mirror unreachable after 3 attempts (mirror poll will catch up)"

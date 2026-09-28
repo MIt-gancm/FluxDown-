@@ -86,7 +86,11 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
     // 排空进度通道：段协调器每 ~200ms 阻塞 send，通道满（容量 8192）会卡死下载。
     // 复刻 server/hub 的 progress_reporter 接线（顺带把 downloaded_bytes 落 DB）。
     if let Some(prx) = engine.manager.take_progress_rx() {
-        tokio::spawn(progress_reporter(prx, engine.db.clone(), sink.clone()));
+        tokio::spawn(progress_reporter(
+            prx,
+            engine.db.clone(),
+            engine.activity_sink.clone(),
+        ));
     }
     let mut done_rx = engine
         .manager

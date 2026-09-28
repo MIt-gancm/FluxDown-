@@ -1,0 +1,46 @@
+---
+/**
+ * 下载页。结构全部服务端直出(每个文件行默认指向 GitHub Releases,无 JS 也能下载);
+ * 客户端脚本只负责平台识别与 /api/release 的实时数据(链接、大小、版本、累计下载量)。
+ */
+import Layout from "@/layouts/Layout.astro";
+import DownloadHero from "@/components/download/DownloadHero.astro";
+import DesktopMatrix from "@/components/download/DesktopMatrix.astro";
+import ServerSection from "@/components/download/ServerSection.astro";
+import ToolsSection from "@/components/download/ToolsSection.astro";
+import ExtensionSection from "@/components/download/ExtensionSection.astro";
+import SubscribeSection from "@/components/download/SubscribeSection.astro";
+import { download } from "@/i18n/messages/download";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { GITHUB_URL } from "@/lib/site-nav";
+import { SITE_URL } from "@/lib/seo";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = download[lang];
+
+const jsonLdNodes = [
+  {
+    "@type": "BreadcrumbList",
+    itemListElement: [
+      { "@type": "ListItem", position: 1, name: "FluxDown", item: `${SITE_URL}${href("/", lang)}` },
+      { "@type": "ListItem", position: 2, name: t.hero.eyebrow, item: `${SITE_URL}${href("/download", lang)}` },
+    ],
+  },
+];
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description} jsonLdNodes={jsonLdNodes}>
+  <div data-dl-root data-lang={lang} data-changelog={href("/changelog", lang)} data-github={GITHUB_URL}>
+    <DownloadHero lang={lang} />
+    <DesktopMatrix lang={lang} />
+    <ServerSection lang={lang} />
+    <ToolsSection lang={lang} />
+    <ExtensionSection lang={lang} />
+    <SubscribeSection lang={lang} />
+  </div>
+</Layout>
+
+<script>
+  import "@/components/download/client.ts";
+</script>

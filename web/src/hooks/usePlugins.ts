@@ -48,6 +48,15 @@ export function useUpdatePluginSettingsMutation() {
   })
 }
 
+export function usePluginAuthMutation() {
+  return useMutation({
+    mutationFn: ({ identity, request }: {
+      identity: string
+      request: { action: string; site?: string; authRef?: string; sessionId?: string; input?: string }
+    }) => api.pluginAuth(identity, request),
+  })
+}
+
 export function useUninstallPluginMutation() {
   const invalidate = useInvalidatePlugins()
   return useMutation({

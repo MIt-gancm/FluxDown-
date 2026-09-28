@@ -742,9 +742,8 @@ class _HomePageState extends State<HomePage> {
   /// 看不见。筛选放宽（状态页签/分类/队列）、组展开、滚动定位
   /// 由 [DownloadController.revealTask] + TaskList 完成。
   void _revealTask(String taskId) {
-    if (taskId.isEmpty) return;
+    if (taskId.isEmpty || !_controller.revealTask(taskId)) return;
     _rssProvider.select('');
-    _controller.revealTask(taskId);
     setState(() => _isDetailOpen = true);
   }
 
@@ -823,6 +822,7 @@ class _HomePageState extends State<HomePage> {
             controller: _controller,
             settingsProvider: _settingsProvider,
             rssProvider: _rssProvider,
+            pluginProvider: _pluginProvider,
           ),
         ),
       ],
@@ -915,6 +915,7 @@ class _HomePageState extends State<HomePage> {
                     context,
                     _rssProvider,
                     _controller,
+                    _pluginProvider,
                     sourceId,
                   ),
                 );

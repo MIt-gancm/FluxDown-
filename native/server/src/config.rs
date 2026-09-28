@@ -5,8 +5,10 @@
 //! | `FLUXDOWN_DATA_DIR` | 数据目录（DB/日志） | 平台自动探测 |
 //! | `FLUXDOWN_DATABASE_URL` | 数据库连接 URL（`sqlite:`/`postgres:`） | 数据目录下 SQLite |
 //! | `FLUXDOWN_BIND` | HTTP 监听地址 | `0.0.0.0:17800` |
+//! | `FLUXDOWN_SAVE_DIR` | 首次启动时播种的默认保存目录（库中已有 `default_save_dir` 后不再覆盖，Web 设置页改过的值优先） | 平台「下载」目录 |
 //! | `FLUXDOWN_WEBROOT` | 覆盖内嵌 Web UI，改从该磁盘目录托管 SPA | 未设置（用二进制内嵌的前端） |
-//! | `FLUXDOWN_TOKEN` | 预置管理访问密钥（仅在库中尚未设置时采纳） | 未设置（走 Web 向导） |
+//! | `FLUXDOWN_TOKEN` | 预置管理访问密钥（默认仅在库中尚未设置时采纳；见 `FLUXDOWN_TOKEN_FORCE`） | 未设置（走 Web 向导） |
+//! | `FLUXDOWN_TOKEN_FORCE` | 真值（`1`/`true`）时 `FLUXDOWN_TOKEN` 每次启动都覆盖库中已存的访问密钥（#535） | 未设置（`FLUXDOWN_TOKEN` 仅首次生效） |
 //! | `FLUXDOWN_DEMO` | 演示模式：仅允许下载内置本地演示文件 | 未设置（关闭） |
 //! | `FLUXDOWN_DEMO_URL` | 演示模式：仅允许下载该 URL（覆盖内置） | 未设置（关闭） |
 //! | `FLUXDOWN_LANG` | Web UI 默认语言（`en`/`zh`），设置页保存过语言后以保存值为准 | 未设置（回退浏览器语言） |
@@ -15,6 +17,12 @@
 //! 一次性打印的密钥等于把人锁在门外。库中无密钥时服务器进入「待设置」状态
 //! （管理 API 全线 403），由 Web 首次运行向导 `POST /api/v1/setup` 落定；
 //! 无人值守部署用 `FLUXDOWN_TOKEN` 预置。
+//!
+//! `FLUXDOWN_TOKEN` 与 `FLUXDOWN_TOKEN_FORCE` 语义不同（#535）：前者只在库里
+//! **还没有**密钥时采纳（一次性播种，之后 Web 界面/API 改过的密钥不会被环境
+//! 变量覆盖）；后者为真值时，每次进程启动都用 `FLUXDOWN_TOKEN` **强制覆盖**库
+//! 中已存的密钥——用于把访问密钥完全交给编排系统（k8s Secret / docker-compose
+//! env）管理、禁止经 Web 界面改密钥的场景。
 
 use std::path::PathBuf;
 
@@ -124,6 +132,13 @@ fn flag_truthy(v: &str) -> bool {
     )
 }
 
+/// `FLUXDOWN_TOKEN_FORCE` 是否为真值（`1`/`true`/`yes`/`on`，忽略大小写）。（#535）
+fn token_force_enabled() -> bool {
+    std::env::var("FLUXDOWN_TOKEN_FORCE")
+        .map(|v| flag_truthy(&v))
+        .unwrap_or(false)
+}
+
 /// 内置演示 URL：指向本进程自己挂载的 [`crate::demo::DEMO_FILE_PATH`]
 /// （下载器与服务器同机，走 127.0.0.1 回环，不出外网）。
 fn builtin_demo_url(bind: &str) -> String {
@@ -131,9 +146,20 @@ fn builtin_demo_url(bind: &str) -> String {
     format!("http://127.0.0.1:{port}{}", crate::demo::DEMO_FILE_PATH)
 }
 
-/// 平台默认下载目录（与 App 侧 `download_actor::default_save_dir` 同源：
-/// 走系统 API 解析，不做 `$HOME/Downloads` 拼接）。
+/// 默认下载目录：`FLUXDOWN_SAVE_DIR`（NAS 套件把授权的共享文件夹传进来）优先，
+/// 否则走平台「下载」目录（与 App 侧 `download_actor::default_save_dir` 同源：
+/// 系统 API 解析，不做 `$HOME/Downloads` 拼接）。
+///
+/// 只用于 `init_default_config` 的首次播种；库里一旦有 `default_save_dir`
+/// 就以库为准，环境变量不会覆盖用户在设置页改过的值。
 pub fn default_save_dir() -> String {
+    if let Some(dir) = std::env::var("FLUXDOWN_SAVE_DIR")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+    {
+        return dir;
+    }
     fluxdown_engine::user_dirs::download_dir_or_cwd()
 }
 
@@ -201,15 +227,38 @@ pub async fn ensure_server_config(db: &Db) -> Result<String, fluxdown_engine::db
         .get_config("local_server_token")
         .await?
         .unwrap_or_default();
-    if !token.is_empty() {
-        return Ok(token);
-    }
 
-    let Some(preset) = std::env::var("FLUXDOWN_TOKEN")
+    let preset = std::env::var("FLUXDOWN_TOKEN")
         .ok()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-    else {
+        .filter(|v| !v.is_empty());
+
+    if !token.is_empty() {
+        // #535：默认语义不变——库中已有密钥时忽略 FLUXDOWN_TOKEN。
+        // 只有显式打开 FLUXDOWN_TOKEN_FORCE 才允许环境变量强制覆盖已存密钥。
+        if !token_force_enabled() {
+            return Ok(token);
+        }
+        let Some(preset) = preset else {
+            return Ok(token);
+        };
+        return match validate_access_key(&preset) {
+            Ok(()) => {
+                db.set_config("local_server_token", &preset).await?;
+                log_info!(
+                    "[config] access key overridden from FLUXDOWN_TOKEN (FLUXDOWN_TOKEN_FORCE)"
+                );
+                Ok(preset)
+            }
+            Err(why) => {
+                log_info!("[server] FLUXDOWN_TOKEN rejected: {}", why);
+                eprintln!("FLUXDOWN_TOKEN 不符合密钥要求（{why}），已忽略；保留库中现有访问密钥。");
+                Ok(token)
+            }
+        };
+    }
+
+    let Some(preset) = preset else {
         return Ok(String::new());
     };
     if let Err(why) = validate_access_key(&preset) {

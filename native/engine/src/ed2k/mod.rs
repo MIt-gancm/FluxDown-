@@ -22,6 +22,7 @@ pub mod testutil;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -34,6 +35,8 @@ use crate::ed2k::link::{Ed2kLink, parse_ed2k_link};
 use crate::ed2k::peer::download_block_on_stream;
 use crate::ed2k::server::{PeerAddr, parse_server_list};
 use crate::logger::log_info;
+use crate::output;
+use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferTracker};
 
 /// 块下载失败时携带失败 peer 身份的错误，供调度层区分"投毒/越界 → 拉黑"
 /// 与"纯网络失败 → 退避"。`download_block_from_peer` 的所有 `Err` 路径一律
@@ -206,9 +209,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
     if temp_ok {
         params.db.init_ed2k_blocks(&task_id, block_count).await?;
     } else {
-        if let Some(parent) = temp_path.parent() {
-            let _ = tokio::fs::create_dir_all(parent).await;
-        }
+        output::ensure_parent(&temp_path).await?;
         let file = tokio::fs::File::create(&temp_path)
             .await
             .map_err(DownloadError::Io)?;
@@ -272,14 +273,20 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
     }
 
     let progress: Arc<StdMutex<HashMap<u64, i64>>> = Arc::new(StdMutex::new(HashMap::new()));
-    let progress_handle = spawn_progress_reporter(
-        params.db.clone(),
-        params.progress_tx.clone(),
-        task_id.clone(),
+    let tracker = TransferTracker::new();
+    let connected = TransferTracker::new();
+    let concurrency_limit = Arc::new(AtomicU32::new(0));
+    let progress_handle = spawn_progress_reporter(ProgressReporterContext {
+        db: params.db.clone(),
+        progress_tx: params.progress_tx.clone(),
+        task_id: task_id.clone(),
         total_bytes,
         part_size,
-        Arc::clone(&progress),
-    );
+        progress: Arc::clone(&progress),
+        tracker: tracker.clone(),
+        connected: connected.clone(),
+        concurrency_limit: Arc::clone(&concurrency_limit),
+    });
 
     let hashset_cache: Arc<OnceCell<Vec<[u8; 16]>>> = Arc::new(OnceCell::new());
     let client = shared_client();
@@ -353,6 +360,9 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                 Ok(()) => break 'outer Ok(total_bytes as i64),
                 Err(DownloadError::Ed2kIntegrity(_)) if finalize_retries < FINALIZE_MAX_RETRIES => {
                     finalize_retries += 1;
+                    if let Err(journal_error) = crate::task_activity::record(&params.db, params.sink.as_ref(), &task_id, "retry", format!("ED2K 完整性校验失败，重下坏块（第 {finalize_retries}/{FINALIZE_MAX_RETRIES} 轮）"), None).await {
+                        crate::log_error!("[task-activity] failed to persist retry: {}", journal_error);
+                    }
                     log_info!(
                         "[ed2k-download] task {} finalize found bad block, re-downloading (round {})",
                         task_id,
@@ -364,6 +374,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
             }
         }
         let concurrency = ed2k_concurrency(params.segment_count, pending.len());
+        concurrency_limit.store(concurrency as u32, Ordering::Relaxed);
         let mut join: JoinSet<BlockJoinResult> = JoinSet::new();
 
         let inner: Result<(), DownloadError> = loop {
@@ -381,10 +392,13 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                         let hc = Arc::clone(&hashset_cache);
                         let pg = Arc::clone(&progress);
                         let client = Arc::clone(&client);
+                        let tracker = tracker.clone();
+                        let connected = connected.clone();
                         join.spawn(async move {
                             // HighID 直连 / LowID 经服务器 callback 中转，拿到已连接流后拉块。
                             let r = match client.connect_source(src).await {
                                 Ok(stream) => {
+                                    let _connection = connected.start(bi as i32);
                                     download_block_on_stream(
                                         stream,
                                         &file_hash,
@@ -397,6 +411,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                                         &lim,
                                         &hc,
                                         &pg,
+                                        &tracker,
                                     )
                                     .await
                                 }
@@ -483,6 +498,25 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                     source_retries = 0;
                 } else {
                     source_retries += 1;
+                    if source_retries < MAX_SOURCE_RETRIES
+                        && let Err(journal_error) = crate::task_activity::record(
+                            &params.db,
+                            params.sink.as_ref(),
+                            &task_id,
+                            "retry",
+                            format!(
+                                "ED2K 找源为空，准备第 {}/{MAX_SOURCE_RETRIES} 次找源",
+                                source_retries + 1
+                            ),
+                            None,
+                        )
+                        .await
+                    {
+                        crate::log_error!(
+                            "[task-activity] failed to persist retry: {}",
+                            journal_error
+                        );
+                    }
                     if source_retries >= MAX_SOURCE_RETRIES {
                         break Err(DownloadError::Ed2k(
                             "no sources found for this ed2k file".into(),
@@ -510,6 +544,10 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                     Ok(v) => v,
                     Err(_) => continue,
                 };
+                // Old partial bytes are not a live connection and are not safe resume state.
+                if let Ok(mut map) = progress.lock() {
+                    map.remove(&bi);
+                }
                 match res {
                     Ok(md4) => {
                         let ok = if is_single {
@@ -540,6 +578,22 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                                 .update_ed2k_block(&task_id, bi, BLOCK_MISSING, 0, true)
                                 .await;
                             pending.push_back(bi);
+                            if strikes.get(&bi).copied().unwrap_or(0) + 1 < BLOCK_MAX_RETRIES
+                                && let Err(journal_error) = crate::task_activity::record(
+                                    &params.db,
+                                    params.sink.as_ref(),
+                                    &task_id,
+                                    "retry",
+                                    format!("ED2K 块 {bi} 校验失败，将更换源重试"),
+                                    None,
+                                )
+                                .await
+                            {
+                                crate::log_error!(
+                                    "[task-activity] failed to persist retry: {}",
+                                    journal_error
+                                );
+                            }
                             *strikes.entry(bi).or_insert(0) += 1;
                             integrity_bl.insert(src);
                             if strikes.get(&bi).copied().unwrap_or(0) >= BLOCK_MAX_RETRIES {
@@ -555,6 +609,21 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                             .update_ed2k_block(&task_id, bi, BLOCK_MISSING, 0, false)
                             .await;
                         pending.push_back(bi);
+                        if let Err(journal_error) = crate::task_activity::record(
+                            &params.db,
+                            params.sink.as_ref(),
+                            &task_id,
+                            "retry",
+                            format!("ED2K 块 {bi} 从 {src:?} 读取失败，将重试：{source}"),
+                            None,
+                        )
+                        .await
+                        {
+                            crate::log_error!(
+                                "[task-activity] failed to persist retry: {}",
+                                journal_error
+                            );
+                        }
                         // 完整性违规 → 拉黑该源；纯网络失败 → 退避。
                         if matches!(source, DownloadError::Ed2kIntegrity(_)) {
                             log_info!(
@@ -619,17 +688,35 @@ fn pick_source(
 ///
 /// 取锁窄作用域（`lock→clone→释放`），锁释放后才 `.await` DB，Future 保持 `Send`。
 /// 返回的 `JoinHandle` 由调用方在退出前 `abort()`（drop 引用不触发 cancel）。
-fn spawn_progress_reporter(
+struct ProgressReporterContext {
     db: crate::db::Db,
     progress_tx: tokio::sync::mpsc::Sender<ProgressUpdate>,
     task_id: String,
     total_bytes: u64,
     part_size: u64,
     progress: Arc<StdMutex<HashMap<u64, i64>>>,
-) -> tokio::task::JoinHandle<()> {
+    tracker: TransferTracker,
+    connected: TransferTracker,
+    concurrency_limit: Arc<AtomicU32>,
+}
+
+fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let ProgressReporterContext {
+            db,
+            progress_tx,
+            task_id,
+            total_bytes,
+            part_size,
+            progress,
+            tracker,
+            connected,
+            concurrency_limit,
+        } = context;
         loop {
             tokio::time::sleep(PROGRESS_TICK).await;
+            let sample_sequence = crate::transfer_activity::next_sample_sequence();
+            let sampled_at_ms = chrono::Utc::now().timestamp_millis();
             let snapshot: Vec<(u64, i64)> = {
                 let Ok(g) = progress.lock() else { continue };
                 g.iter().map(|(k, v)| (*k, *v)).collect()
@@ -642,18 +729,46 @@ fn spawn_progress_reporter(
             for (idx, state, _dl, _rt) in &blocks {
                 let (bs, be) = hash::part_span(*idx, total_bytes, part_size);
                 let block_len = (be - bs) as i64;
-                if *state == BLOCK_VERIFIED {
-                    downloaded += block_len;
-                } else if let Some((_, live)) = snapshot.iter().find(|(k, _)| k == idx) {
-                    downloaded += *live;
-                    segment_details.push(SegmentProgressInfo {
-                        index: *idx as i32,
-                        start_byte: bs as i64,
-                        end_byte: be as i64,
-                        downloaded_bytes: *live,
-                    });
-                }
+                let live = if *state == BLOCK_VERIFIED {
+                    block_len
+                } else {
+                    snapshot
+                        .iter()
+                        .find(|(k, _)| k == idx)
+                        .map(|(_, v)| *v)
+                        .unwrap_or(0)
+                };
+                downloaded += live;
+                segment_details.push(SegmentProgressInfo {
+                    index: *idx as i32,
+                    start_byte: bs as i64,
+                    end_byte: be as i64 - 1,
+                    downloaded_bytes: live,
+                    active: Some(tracker.is_active(*idx as i32)),
+                });
             }
+            let runtime = TaskRuntime {
+                task_id: task_id.clone(),
+                sampled_at_ms,
+                sample_sequence,
+                active_transfers: Some(tracker.active()),
+                connected_peers: Some(connected.active()),
+                parallelism_limit: match concurrency_limit.load(Ordering::Relaxed) {
+                    0 => None,
+                    n => Some(n),
+                },
+                total_bytes: total_bytes as i64,
+                segments: segment_details
+                    .iter()
+                    .map(|s| TaskSegment {
+                        index: s.index,
+                        start_byte: s.start_byte,
+                        end_byte: s.end_byte,
+                        downloaded_bytes: s.downloaded_bytes,
+                        active: s.active,
+                    })
+                    .collect(),
+            };
             let _ = progress_tx
                 .send(ProgressUpdate {
                     task_id: task_id.clone(),
@@ -662,11 +777,8 @@ fn spawn_progress_reporter(
                     status: 1,
                     error_message: String::new(),
                     file_name: String::new(),
-                    segment_details: if segment_details.is_empty() {
-                        None
-                    } else {
-                        Some(segment_details)
-                    },
+                    segment_details: Some(segment_details),
+                    runtime: Some(runtime),
                     ..Default::default()
                 })
                 .await;
@@ -967,6 +1079,59 @@ mod tests {
 
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_body_activity_starts_after_negotiation_and_stops_at_eof() {
+        let data = b"actual peer body".to_vec();
+        let total = data.len() as u64;
+        let part_size = hash::PART_SIZE;
+        let root = root_hash(&data, part_size);
+        let peer = match MockPeer::spawn(data.clone(), part_size, PeerFault::DelayBody).await {
+            Ok(peer) => peer,
+            Err(e) => panic!("mock peer: {e}"),
+        };
+        let dir = it_scratch_dir("peer_activity");
+        let dest = dir.join("body.tmp");
+        prep_dest(&dest, total).await;
+        let tracker = crate::transfer_activity::TransferTracker::new();
+        let observe = tracker.clone();
+        let task = tokio::spawn(async move {
+            let stream = tokio::net::TcpStream::connect(peer.addr)
+                .await
+                .map_err(DownloadError::Io)?;
+            let cache = fresh_hashset_cache();
+            let progress = empty_progress();
+            let cancel = new_cancel();
+            let limiter = no_limit();
+            crate::ed2k::peer::download_block_on_stream(
+                stream, &root, 0, total, part_size, false, &dest, &cancel, &limiter, &cache,
+                &progress, &tracker,
+            )
+            .await
+        });
+        let observed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if observe.is_active(0) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(observed.is_ok(), "peer body read never became active");
+        assert_eq!(observe.active(), 1);
+        let result = match task.await {
+            Ok(result) => result,
+            Err(e) => panic!("peer task panicked: {e}"),
+        };
+        let digest = match result {
+            Ok(digest) => digest,
+            Err(e) => panic!("peer transfer failed: {e}"),
+        };
+        assert_eq!(digest, hash::hash_part(&data));
+        assert_eq!(observe.active(), 0);
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 
     // --- peer 层：2. happy 多块，hashset_cache 跨块复用 ---

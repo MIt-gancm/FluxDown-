@@ -1,0 +1,109 @@
+---
+/**
+ * 单个下载文件行。服务端渲染时指向 GitHub Releases(无 JS 也能下载);
+ * 客户端脚本按 `data-asset` 路径从 /api/release 取到资产后改写为 /api/download/<file>,
+ * 本次发布没有该资产时整行隐藏。
+ */
+import { Download } from "lucide-react";
+
+interface Props {
+  /** /api/release JSON 中的资产路径,如 `assets.setup`、`server.assets.qnap_x64`。 */
+  path: string;
+  label: string;
+  detail?: string;
+  ext: string;
+  fallback: string;
+}
+const { path, label, detail, ext, fallback } = Astro.props;
+---
+
+<a class="asset" href={fallback} data-asset={path} data-fallback={fallback} rel="nofollow">
+  <span class="asset-main">
+    <span class="asset-label">{label}</span>
+    {detail && <span class="asset-detail">{detail}</span>}
+  </span>
+  <span class="asset-ext">{ext}</span>
+  <span class="asset-size" data-size></span>
+  <Download className="asset-icon" size={14} strokeWidth={1.75} aria-hidden="true" />
+</a>
+
+<style>
+  .asset {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto 4.6rem 14px;
+    align-items: center;
+    gap: 12px;
+    min-height: 44px;
+    padding: 8px 12px;
+    margin-inline: -12px;
+    border-radius: 6px;
+    transition:
+      background-color 160ms,
+      color 160ms;
+  }
+  .asset:hover {
+    background: var(--bg-inset);
+  }
+  .asset:hover :global(.asset-icon) {
+    color: var(--accent-ink);
+    transform: translateY(1px);
+  }
+  .asset-main {
+    display: flex;
+    min-width: 0;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 8px;
+  }
+  .asset-label {
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--fg);
+  }
+  .asset-detail {
+    font-size: 12.5px;
+    color: var(--fg-subtle);
+  }
+  .asset-ext {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--fg-muted);
+    padding: 1px 6px;
+    border-radius: 4px;
+    box-shadow: 0 0 0 1px var(--line) inset;
+  }
+  .asset-size {
+    justify-self: end;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg-subtle);
+  }
+  :global([data-state="loading"]) .asset-size {
+    width: 3.6rem;
+    height: 10px;
+    border-radius: 3px;
+    background: linear-gradient(90deg, var(--bg-inset), var(--line), var(--bg-inset));
+    background-size: 200% 100%;
+    animation: asset-shimmer 1.4s linear infinite;
+  }
+  @keyframes asset-shimmer {
+    to {
+      background-position: -200% 0;
+    }
+  }
+  .asset :global(.asset-icon) {
+    color: var(--fg-subtle);
+    transition:
+      color 160ms,
+      transform 160ms var(--ease-out);
+  }
+  @media (max-width: 420px) {
+    .asset {
+      grid-template-columns: minmax(0, 1fr) auto 14px;
+    }
+    .asset-size {
+      display: none;
+    }
+  }
+</style>

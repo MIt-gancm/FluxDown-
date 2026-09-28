@@ -5,17 +5,19 @@
 
 [workspace]
 resolver = "3"
-members = ["native/*", "crates/*"]
+members = ["native/*", "crates/*", "scripts/desktop-dev"]
 
 [workspace.package]
 edition = "2024"
 
 [workspace.dependencies]
-gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
-gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "334bbed2e8c47d606eb79ab05ddcebd60b823429" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "334bbed2e8c47d606eb79ab05ddcebd60b823429" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "334bbed2e8c47d606eb79ab05ddcebd60b823429" }
+# GPUI 走 gpui-kit 发布时精确锁定的 `gpui-pre` 快照；升级 gpui-kit 时必须同步到它
+# `Cargo.toml` 里的同一 `=` 版本，否则 gpui-component 可能与 GPUI API 不匹配。
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-base = "0.7.0"
+gpui-component = "0.7.0"
+gpui-component-assets = { package = "gpui-kit-assets", version = "0.7.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"
@@ -34,10 +36,28 @@ codegen-units = 16
 debug = "limited"
 split-debuginfo = "unpacked"
 
-[profile.dev.package.gpui]
+[profile.dev.package.gpui-pre]
 opt-level = 3
 
-[profile.dev.package.gpui_platform]
+[profile.dev.package.gpui-pre-platform]
+opt-level = 3
+
+# BT 数据面（逐字节 RC4、逐消息解析、MSE DH 大数运算）在 opt-level 0 下慢一个数量级：
+# 本地 loopback 实测 dev 基线 36.5 CPU·s/GB、吞吐封顶 165 MB/s；仅下面 5 个 crate
+# 开 O3 后 4.8 CPU·s/GB、854 MB/s。开发期跑 fluxdownd 下 BT 不再吃满多核。
+[profile.dev.package.librqbit]
+opt-level = 3
+
+[profile.dev.package.librqbit-core]
+opt-level = 3
+
+[profile.dev.package.librqbit-peer-protocol]
+opt-level = 3
+
+[profile.dev.package.librqbit-buffers]
+opt-level = 3
+
+[profile.dev.package.librqbit-bencode]
 opt-level = 3
 
 [profile.release]
@@ -51,3 +71,20 @@ lto = "fat"
 codegen-units = 1
 # 注意：不设 panic = "abort" —— engine 的 download_manager 依赖 catch_unwind
 # 恢复 task panic（见 AGENTS.md），abort 会让 panic 直接终止进程。
+
+# 例外：BT 热路径按速度优化。fat LTO 下 per-package opt-level 仍生效（实测 DH768
+# 2.46→1.60 ms）；loopback 每 GB CPU 4.46→4.06 s（-9%），代价约 +0.5 MB/产物。
+[profile.release.package.librqbit]
+opt-level = 3
+
+[profile.release.package.librqbit-core]
+opt-level = 3
+
+[profile.release.package.librqbit-peer-protocol]
+opt-level = 3
+
+[profile.release.package.librqbit-buffers]
+opt-level = 3
+
+[profile.release.package.librqbit-bencode]
+opt-level = 3

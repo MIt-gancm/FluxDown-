@@ -2,30 +2,44 @@
 //!
 //! 开机自启以 `--minimized` 拉起；系统把 `magnet:` / `ed2k:` / `fluxdown:` 链接或
 //! 直链交给本进程时，统一经 `agent.capture.submit` 交由 agent 建任务：
-//! 主实例自己提交，后续实例提交后立即退出，因此不依赖任何进程间通道。
+//! 主实例自己提交，后续实例经本机激活通道交给主实例后退出。
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+
+use fluxdown_protocol::{AgentSnapshot, capture_link};
 
 /// 已解析的命令行。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LaunchOptions {
     /// 启动后最小化主窗口（自启动场景）。
     pub minimized: bool,
+    /// 由 agent 为待确认的捕获 / 选择请求拉起：不开主窗口，只开确认窗口。
+    pub capture_only: bool,
+    /// 仅唤起已有 UI；绝不新建 UI 或启动本机后台服务。
+    pub activate_existing: bool,
     /// 需要交给 agent 的外部链接。
     pub urls: Vec<String>,
     /// 需要经 agent 上传后建任务的本机 `.torrent` 文件。
     pub torrent_files: Vec<PathBuf>,
+    /// agent 静默建成单个任务后拉起界面时携带：该任务按用户开始处理（弹进度窗口）。
+    pub progress_task: Option<String>,
 }
 
 impl LaunchOptions {
     #[must_use]
     pub fn from_args(args: impl IntoIterator<Item = String>) -> Self {
         let mut options = Self::default();
-        for arg in args {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--minimized" | "--start-minimized" => options.minimized = true,
-                value if is_capture_url(value) => options.urls.push(value.to_owned()),
+                "--capture" => options.capture_only = true,
+                "--activate-existing" => options.activate_existing = true,
+                "--progress-task" => {
+                    options.progress_task = args.next().filter(|task_id| !task_id.is_empty());
+                }
+                value if capture_link::is_capture_url(value) => options.urls.push(value.to_owned()),
                 value if value.starts_with("--") => {}
                 value => {
                     if let Some(path) = torrent_path(value) {
@@ -36,74 +50,39 @@ impl LaunchOptions {
         }
         options
     }
+
+    /// 普通启动：没有外部链接 / 种子文件，也不是自启 / 确认 / 唤起模式。
+    #[must_use]
+    pub fn is_plain(&self) -> bool {
+        !self.minimized
+            && !self.capture_only
+            && !self.activate_existing
+            && self.urls.is_empty()
+            && self.torrent_files.is_empty()
+    }
 }
 
-/// `.torrent` 路径或 `file://` URL → 本机路径。
+/// 「启动时最小化到托盘」偏好键（agent 偏好，与 agent 自启判定同一键）。
+const START_MINIMIZED_TO_TRAY_KEY: &str = "start_minimized_to_tray";
+
+/// 本进程冷启动了 FluxDown 服务时，是否只留托盘而不开主窗口：偏好开启且托盘确实可见
+/// （可用且驻留），否则隐藏主窗口会留下既无窗口也无托盘的状态。
+#[must_use]
+pub fn start_in_tray(snapshot: &AgentSnapshot) -> bool {
+    snapshot.shell.tray_available
+        && snapshot.shell.resident
+        && snapshot
+            .preferences
+            .values
+            .get(START_MINIMIZED_TO_TRAY_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+}
+
+/// `.torrent` 路径或 `file://` URL → 已存在的本机文件路径。
 #[must_use]
 pub fn torrent_path(value: &str) -> Option<PathBuf> {
-    let raw = value.strip_prefix("file://").map_or(value, |rest| rest);
-    let decoded = percent_decode(raw);
-    if !decoded.to_ascii_lowercase().ends_with(".torrent") {
-        return None;
-    }
-    let path = PathBuf::from(decoded);
-    path.is_file().then_some(path)
-}
-
-/// 判定参数是否为可直接建任务的链接（与 agent 捕获入口一致）。
-#[must_use]
-pub fn is_capture_url(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
-    [
-        "magnet:",
-        "ed2k://",
-        "fluxdown:",
-        "http://",
-        "https://",
-        "ftp://",
-        "ftps://",
-    ]
-    .iter()
-    .any(|scheme| lower.starts_with(scheme))
-}
-
-/// `fluxdown:` 协议 → 实际下载链接：`fluxdown://download?url=<encoded>` 或
-/// `fluxdown:<url>`；其他 scheme 原样返回。
-#[must_use]
-pub fn normalize_capture_url(value: &str) -> String {
-    let lower = value.to_ascii_lowercase();
-    if !lower.starts_with("fluxdown:") {
-        return value.to_owned();
-    }
-    let rest = &value["fluxdown:".len()..];
-    let rest = rest.trim_start_matches('/');
-    if let Some(query) = rest.strip_prefix("download?") {
-        for pair in query.split('&') {
-            if let Some(encoded) = pair.strip_prefix("url=") {
-                return percent_decode(encoded);
-            }
-        }
-    }
-    percent_decode(rest)
-}
-
-fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = &value[index + 1..index + 3];
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| value.to_owned())
+    capture_link::torrent_file_path(value).filter(|path| path.is_file())
 }
 
 /// 单实例锁：持有期间文件锁不释放；第二个进程 `try_acquire` 失败。
@@ -146,6 +125,7 @@ mod tests {
         let options = LaunchOptions::from_args(
             [
                 "--minimized",
+                "--activate-existing",
                 "magnet:?xt=urn:btih:abc",
                 "/tmp/x.torrent",
                 "--foo",
@@ -153,7 +133,12 @@ mod tests {
             .map(str::to_owned),
         );
         assert!(options.minimized);
+        assert!(options.activate_existing);
         assert_eq!(options.urls, vec!["magnet:?xt=urn:btih:abc"]);
+        let options =
+            LaunchOptions::from_args(["--capture", "--progress-task", "task-1"].map(str::to_owned));
+        assert!(options.capture_only);
+        assert_eq!(options.progress_task.as_deref(), Some("task-1"));
         assert!(options.torrent_files.is_empty());
         let file = std::env::temp_dir().join(format!("fluxdown-{}.torrent", std::process::id()));
         std::fs::write(&file, b"d8:announce0:e").expect("write");
@@ -167,16 +152,41 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_fluxdown_scheme() {
-        assert_eq!(
-            normalize_capture_url("fluxdown://download?url=https%3A%2F%2Fa.b%2Fc"),
-            "https://a.b/c"
-        );
-        assert_eq!(
-            normalize_capture_url("fluxdown:https://a.b/c"),
-            "https://a.b/c"
-        );
-        assert_eq!(normalize_capture_url("magnet:?x"), "magnet:?x");
+    fn start_in_tray_requires_preference_and_visible_tray() {
+        let snapshot = |pref: Option<bool>, available: bool, resident: bool| {
+            let mut snapshot = AgentSnapshot::default();
+            if let Some(pref) = pref {
+                snapshot
+                    .preferences
+                    .values
+                    .insert(START_MINIMIZED_TO_TRAY_KEY.to_owned(), pref.into());
+            }
+            snapshot.shell.tray_available = available;
+            snapshot.shell.resident = resident;
+            snapshot
+        };
+        assert!(start_in_tray(&snapshot(Some(true), true, true)));
+        assert!(!start_in_tray(&snapshot(None, true, true)));
+        assert!(!start_in_tray(&snapshot(Some(false), true, true)));
+        // 托盘不可用或未驻留（关闭了「关闭时最小化到托盘」）：隐藏会让应用无处可见。
+        assert!(!start_in_tray(&snapshot(Some(true), false, true)));
+        assert!(!start_in_tray(&snapshot(Some(true), true, false)));
+    }
+
+    #[test]
+    fn only_bare_launch_is_plain() {
+        assert!(LaunchOptions::from_args(Vec::<String>::new()).is_plain());
+        for arg in [
+            "--minimized",
+            "--capture",
+            "--activate-existing",
+            "magnet:?xt=urn:btih:abc",
+        ] {
+            assert!(
+                !LaunchOptions::from_args([arg.to_owned()]).is_plain(),
+                "{arg}"
+            );
+        }
     }
 
     #[test]
@@ -187,6 +197,9 @@ mod tests {
         let second = InstanceLock::try_acquire(&dir).expect("lock");
         assert!(second.is_none());
         drop(first);
+        let replacement = InstanceLock::try_acquire(&dir).expect("replacement lock");
+        assert!(replacement.is_some());
+        drop(replacement);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -267,7 +267,7 @@ pub fn write_sidecar(req: &SidecarWriteRequest) -> Result<usize, String> {
     }
 
     if let Some(parent) = req.sidecar_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
+        crate::output::ensure_dir_sync(parent).map_err(|e| e.to_string())?;
     }
     let tmp_path = req.sidecar_path.with_extension("parts.tmp");
     let mut out =

@@ -4,7 +4,6 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:launch_at_startup/launch_at_startup.dart';
 import 'package:rinf/rinf.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
 import 'src/widgets/flux_sonner.dart';
@@ -28,6 +27,7 @@ import 'src/services/resolve_variant_service.dart';
 import 'src/services/bt_file_selection_service.dart';
 import 'src/services/analytics_service.dart';
 import 'src/services/app_icon_service.dart';
+import 'src/services/autostart_service.dart';
 import 'src/services/log_service.dart';
 import 'src/services/kv_store.dart';
 import 'src/services/notification_service.dart';
@@ -214,40 +214,14 @@ Future<void> main(List<String> args) async {
   }();
 
   final autostartInit = () async {
-    // 注册时附带 --silentStart；Windows 路径加引号，避免空格截断。
-    launchAtStartup.setup(
-      appName: 'FluxDown',
-      appPath: Platform.isWindows
-          ? '"${Platform.resolvedExecutable}"'
-          : Platform.resolvedExecutable,
-      args: ['--silentStart'],
-    );
+    AutostartService.instance.setup();
     try {
-      bool needsReEnable = await launchAtStartup.isEnabled();
-      if (!needsReEnable && Platform.isWindows) {
-        // 精确值匹配检测不到安装程序或旧版本写入的旧条目，直接查注册表。
-        final regResult = await Process.run('reg', [
-          'query',
-          r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run',
-          '/v',
-          'FluxDown',
-        ]);
-        if (regResult.exitCode == 0) {
-          needsReEnable = true;
-          logInfo(
-            'main',
-            'found legacy/installer autostart entry, migrating to --silentStart',
-          );
-        }
-      }
-      if (needsReEnable) {
-        await launchAtStartup.enable();
-        logInfo('main', 'launchAtStartup re-enabled with --silentStart arg');
-      }
+      // 只迁移已存在条目的启动目标，不改系统级启用状态（用户在系统里关掉的自启保持关闭）。
+      await AutostartService.instance.refreshRegistration();
     } catch (e) {
-      logInfo('main', 'launchAtStartup refresh skipped: $e');
+      logInfo('main', 'autostart refresh skipped: $e');
     }
-    logInfo('main', 'launchAtStartup setup done');
+    logInfo('main', 'autostart setup done');
   }();
 
   final trayInit = () async {
@@ -900,19 +874,24 @@ class _FluxDownAppState extends State<FluxDownApp>
 
       // 便携模式下 KvStore 写入有防抖，退出前强制落盘，避免刚改的设置丢失。
       await KvStore.instance.flush();
-      logInfo('FluxDownApp', 'destroying window...');
       await LogService.instance.dispose();
-      await windowManager.destroy();
     } catch (e, stack) {
       logError('FluxDownApp', '_performGracefulExit error', e, stack);
-      // 兜底：无论如何都尝试销毁窗口
-      try {
-        await windowManager.destroy();
-      } catch (_) {}
     } finally {
-      // Linux 上 windowManager.destroy() 只销毁 GTK 窗口，进程不会自动退出
-      // 需要显式终止 Dart 进程（含 Rust 线程）
-      exit(0);
+      try {
+        // finalizeRust 同步等待 Rust 主函数返回；必须在销毁窗口/exit 前调用，
+        // 否则下载停止帧和活动历史还在后台队列里就会被强制终止。
+        finalizeRust();
+      } catch (e, stack) {
+        logError('FluxDownApp', 'finalizeRust error', e, stack);
+      } finally {
+        try {
+          await windowManager.destroy();
+        } finally {
+          // Linux 销毁 GTK 窗口不会自动退出进程。
+          exit(0);
+        }
+      }
     }
   }
 

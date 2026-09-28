@@ -1,0 +1,94 @@
+---
+/** 06 · 扩展:插件、托管组件、RSS、队列定时、Webhook、主题。 */
+import { ArrowRight, Boxes, CalendarClock, Palette, Puzzle, Rss, Webhook } from "lucide-react";
+import { home } from "../../i18n/messages/home";
+import { href } from "../../i18n/routing";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].extend;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const icons = [Puzzle, Boxes, Rss, CalendarClock, Webhook, Palette];
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section flex flex-col gap-12">
+    <div class="flex flex-wrap items-end justify-between gap-6">
+      <div class="flex max-w-[640px] flex-col gap-6">
+        <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+        <h2 class="h2" data-reveal set:html={title} />
+        <p class="lede" data-reveal style="--d:1">{t.lede}</p>
+      </div>
+      <a href={href("/plugins", lang)} class="btn btn-ticks" data-reveal style="--d:2">
+        {t.market}
+        <ArrowRight size={14} strokeWidth={2} />
+      </a>
+    </div>
+
+    <div class="cells overflow-hidden rounded-[12px] border border-line sm:grid-cols-2 lg:grid-cols-3 grid-cols-1">
+      {
+        t.items.map((item, i) => {
+          const Icon = icons[i] ?? Puzzle;
+          return (
+            <article class="cell spot spot-edge ext-card flex min-h-[220px] flex-col justify-between gap-10" data-reveal style={`--d:${i % 3}`}>
+              <div class="flex items-start justify-between">
+                <span class="ext-icon">
+                  <Icon size={20} strokeWidth={1.5} />
+                </span>
+                <span class="mono text-[11px] text-subtle">{String(i + 1).padStart(2, "0")}</span>
+              </div>
+              <div class="flex flex-col gap-2">
+                <h3 class="text-[17px] font-medium tracking-[-0.01em] text-fg">{item.k}</h3>
+                <p class="text-[14px] leading-relaxed text-muted">{item.v}</p>
+              </div>
+            </article>
+          );
+        })
+      }
+    </div>
+  </div>
+</section>
+
+<style is:global>
+  @layer components {
+    .ext-icon {
+      position: relative;
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      color: var(--fg-muted);
+      transition: color 250ms;
+    }
+    /* 定位角标:蓝图注册标记 */
+    .ext-icon::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        linear-gradient(currentColor, currentColor) top left / 7px 1px no-repeat,
+        linear-gradient(currentColor, currentColor) top left / 1px 7px no-repeat,
+        linear-gradient(currentColor, currentColor) top right / 7px 1px no-repeat,
+        linear-gradient(currentColor, currentColor) top right / 1px 7px no-repeat,
+        linear-gradient(currentColor, currentColor) bottom left / 7px 1px no-repeat,
+        linear-gradient(currentColor, currentColor) bottom left / 1px 7px no-repeat,
+        linear-gradient(currentColor, currentColor) bottom right / 7px 1px no-repeat,
+        linear-gradient(currentColor, currentColor) bottom right / 1px 7px no-repeat;
+      opacity: 0.45;
+      transition:
+        inset 300ms var(--ease-out),
+        opacity 300ms;
+    }
+    .ext-card:hover .ext-icon {
+      color: var(--accent-ink);
+    }
+    .ext-card:hover .ext-icon::before {
+      inset: -5px;
+      opacity: 1;
+    }
+  }
+</style>

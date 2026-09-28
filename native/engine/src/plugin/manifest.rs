@@ -145,6 +145,21 @@ pub struct ResolverDecl {
     pub multi: bool,
 }
 
+/// 单个订阅 provider 声明。v1 每插件至多一个 provider。
+///
+/// 插件入口函数名固定为 `subscribe`；`entry` 指向包含该函数的脚本文件。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SubscriptionDecl {
+    /// 公共订阅记录中的 `providerId`，由插件稳定维护。
+    pub provider_id: String,
+    /// provider 脚本入口文件。
+    pub entry: String,
+    /// 单次调用超时（毫秒），只能下调宿主预算。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
 /// hooks 声明。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -153,6 +168,20 @@ pub struct HooksDecl {
     pub events: Vec<String>,
     #[serde(rename = "match", default)]
     pub match_decl: Option<MatchDecl>,
+}
+
+/// 平台登录入口。脚本实现 `globalThis.authenticate(ctx)`，由 daemon 以
+/// `begin`/`poll`/`cancel`/`logout`/`status` action 驱动，登录成功后脚本调用
+/// `flux.auth.save`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AuthDecl {
+    pub entry: String,
+    /// 单次 auth 调用超时（毫秒）。独立于 resolver 的 timeoutMs（M-2：登录轮询
+    /// 与 resolve 分属不同的信号量/预算平面，不共享 resolver 的低超时配置）；
+    /// 未声明时宿主默认 30s，30s 硬顶。
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// 插件 manifest。
@@ -173,25 +202,33 @@ pub struct PluginManifest {
     pub min_app_version: String,
     #[serde(default)]
     pub resolvers: Vec<ResolverDecl>,
+    /// 订阅 provider 声明；v1 每插件至多一个。
+    #[serde(default)]
+    pub subscriptions: Vec<SubscriptionDecl>,
     #[serde(default)]
     pub hooks: Option<HooksDecl>,
+    /// 可选的平台特有登录入口。
+    #[serde(default)]
+    pub auth: Option<AuthDecl>,
     #[serde(default)]
     pub settings: Vec<SettingField>,
-    /// 声明式能力权限（v1 仅 `"ffmpeg"`）。空 = 无额外能力。授予的能力经宿主
+    /// 声明式能力权限（如 `"auth"`、`"ffmpeg"`）。空 = 无额外能力。授予的能力经宿主
     /// 门控注入对应 `flux.*` 门面（见 [`super::runtime::HostContext`]）。
     #[serde(default)]
     pub permissions: Vec<String>,
 }
 
 /// 合法事件名（manifest `hooks.events`）。
-pub const VALID_EVENTS: [&str; 4] = ["onStart", "onError", "onDone", "onMetaProbed"];
+pub const VALID_EVENTS: [&str; 5] = ["onStart", "onError", "onDone", "onMetaProbed", "onCancel"];
 
 /// ffmpeg 能力权限名（manifest `permissions`）。
 pub const PERMISSION_FFMPEG: &str = "ffmpeg";
 /// yt-dlp 能力权限名（manifest `permissions`）。
 pub const PERMISSION_YTDLP: &str = "ytdlp";
+/// 通用认证能力权限名（manifest `permissions`）。
+pub const PERMISSION_AUTH: &str = "auth";
 /// 合法能力权限（manifest `permissions`）。
-pub const VALID_PERMISSIONS: [&str; 2] = [PERMISSION_FFMPEG, PERMISSION_YTDLP];
+pub const VALID_PERMISSIONS: [&str; 3] = [PERMISSION_FFMPEG, PERMISSION_YTDLP, PERMISSION_AUTH];
 
 impl PluginManifest {
     /// 从 JSON 字节解析（不校验语义，仅结构）。
@@ -260,6 +297,40 @@ impl PluginManifest {
             }
         }
 
+        // subscriptions：v1 每插件至多一个 provider。
+        if self.subscriptions.len() > 1 {
+            return Err(PluginError::ManifestInvalid(
+                "v1 每插件至多一个 subscription provider".to_string(),
+            ));
+        }
+        for s in &self.subscriptions {
+            if !is_valid_provider_id(&s.provider_id) {
+                return Err(PluginError::ManifestInvalid(format!(
+                    "subscription providerId '{}' 非法：须为小写字母、数字、'_' 或 '-'",
+                    s.provider_id
+                )));
+            }
+            if s.provider_id == crate::rss::RSS_PROVIDER_ID {
+                return Err(PluginError::ManifestInvalid(format!(
+                    "subscription providerId '{}' 为内置 provider 保留字",
+                    s.provider_id
+                )));
+            }
+            if !is_safe_relative_path(&s.entry) {
+                return Err(PluginError::ManifestInvalid(format!(
+                    "subscription entry 路径 '{}' 非法",
+                    s.entry
+                )));
+            }
+            if let Some(t) = s.timeout_ms
+                && t == 0
+            {
+                return Err(PluginError::ManifestInvalid(
+                    "subscription timeoutMs 不可为 0".to_string(),
+                ));
+            }
+        }
+
         // hooks。
         if let Some(h) = &self.hooks {
             if !is_safe_relative_path(&h.entry) {
@@ -285,6 +356,28 @@ impl PluginManifest {
             {
                 return Err(PluginError::ManifestInvalid(
                     "hooks match.urls 不可为空".to_string(),
+                ));
+            }
+        }
+
+        // auth：入口同样是插件包内的可执行脚本，且必须显式授予认证能力。
+        if let Some(a) = &self.auth {
+            if !is_safe_relative_path(&a.entry) {
+                return Err(PluginError::ManifestInvalid(format!(
+                    "auth entry 路径 '{}' 非法",
+                    a.entry
+                )));
+            }
+            if !self.has_permission(PERMISSION_AUTH) {
+                return Err(PluginError::ManifestInvalid(
+                    "声明 auth.entry 时 permissions 必须包含 auth".to_string(),
+                ));
+            }
+            if let Some(t) = a.timeout_ms
+                && t == 0
+            {
+                return Err(PluginError::ManifestInvalid(
+                    "auth timeoutMs 不可为 0".to_string(),
                 ));
             }
         }
@@ -451,8 +544,10 @@ pub fn validate_setting_field(f: &SettingField) -> Result<(), PluginError> {
     Ok(())
 }
 
-/// identity 校验：`^[a-z0-9_-]+@[a-z0-9_-]+$`，禁 '.'。
-fn is_valid_identity(s: &str) -> bool {
+/// identity 校验：`^[a-z0-9_-]+@[a-z0-9_-]+$`，禁 '.'。`pub`：`plugin::manager`
+/// 的 `purge` 复用同一判据校验失败插件的 identity 是否安全可用于拼路径/config
+/// 键（671#8：此前 manager.rs 自留了一份逐字重复的 `is_safe_plugin_identity`）。
+pub fn is_valid_identity(s: &str) -> bool {
     let Some((author, name)) = s.split_once('@') else {
         return false;
     };
@@ -468,6 +563,13 @@ fn is_valid_identity(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
     };
     ok(author) && ok(name)
+}
+
+fn is_valid_provider_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// 相对路径安全：禁 `..`、绝对路径、`/` 或 `\` 开头、盘符（`C:`）、空段。
@@ -570,6 +672,35 @@ mod tests {
                              "options":[{"value":"a","label":"A"}],"default":"a"}]}"#,
         );
         assert!(m.validate().is_ok());
+    }
+
+    #[test]
+    fn subscription_manifest_passes() {
+        let m = parse_ok(
+            r#"{"identity":"a@b","name":"N","version":"1.0.0",
+                "subscriptions":[{"providerId":"demo-json","entry":"subscribe.js","timeoutMs":10000}]}"#,
+        );
+        assert!(m.validate().is_ok());
+        assert_eq!(m.subscriptions[0].provider_id, "demo-json");
+    }
+
+    #[test]
+    fn rejects_bad_subscription_provider_id() {
+        let m = parse_ok(
+            r#"{"identity":"a@b","name":"N","version":"1.0.0",
+                "subscriptions":[{"providerId":"Demo.JSON","entry":"subscribe.js"}]}"#,
+        );
+        assert!(m.validate().is_err());
+    }
+
+    /// 内置 `rss` 是保留字：插件声明会被内置 provider 遮蔽而永不调用。
+    #[test]
+    fn rejects_reserved_rss_provider_id() {
+        let m = parse_ok(
+            r#"{"identity":"a@b","name":"N","version":"1.0.0",
+                "subscriptions":[{"providerId":"rss","entry":"subscribe.js"}]}"#,
+        );
+        assert!(m.validate().is_err());
     }
 
     #[test]

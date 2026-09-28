@@ -1,28 +1,50 @@
 //! 「新建下载」表单：字段、顺序与提交语义与
 //! `lib/src/widgets/new_download_dialog.dart` 逐条对齐；纯规则见
 //! [`crate::model::new_download`]。
+//!
+//! 浏览器扩展 / NMH 的外部捕获也在本表单确认：捕获条目以链接行呈现（可与手填链接混合），
+//! 提交时经 `agent.capture.resolve` 确认，Cookie / 请求头 / 请求体等上下文由 agent 合并；
+//! 未确认的捕获在窗口关闭时一并忽略。
 
-use std::{collections::HashMap, path::PathBuf, rc::Rc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    rc::Rc,
+    sync::Arc,
+    time::Duration,
+};
 
 use crate::{
+    controller::{
+        DownloadsCommand, DownloadsPort, DownloadsResult, LAST_SAVE_DIR_PREF,
+        REMEMBER_LAST_SAVE_DIR_PREF,
+    },
     model::new_download::{
         DEFAULT_HASH_ALGORITHM, DraftOptions, HASH_ALGORITHMS, MAX_THREADS, ProxyChoice,
         THREAD_PRESETS, ThreadChoice, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UrlEntry,
-        build_requests, checksum_spec, custom_segments, detect_ua_preset, merge_imported,
-        parse_entries, ua_preset_keys, ua_preset_value,
+        append_entries, build_requests, capture_entry, checksum_spec, custom_segments,
+        detect_ua_preset, manual_proxy_url, merge_imported, parse_entries, ua_preset_keys,
+        ua_preset_value,
     },
     strings::NewDownloadStrings,
 };
-use fluxdown_protocol::CreateTaskRequest;
+use fluxdown_protocol::{
+    AgentSnapshot, CaptureResolveParams, CreateTaskRequest, PendingCaptureDto, QueueDto,
+    SiteAuthCredentialDto,
+};
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, IconControlExt as _, field_error, field_hint, field_label, form,
+    form_field, form_gap, form_row, input_with_action, option_group, option_row,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, App, AppContext as _, ClickEvent, Context, Div, Entity, InteractiveElement as _,
-    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement as _,
-    Styled, Window, div, prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Disableable as _, Icon, IconName, Sizable as _, WindowExt as _,
+    Disableable as _, Icon, Sizable as _, Size, WindowExt as _,
     button::{Button, ButtonVariants as _, DropdownButton},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
@@ -32,6 +54,15 @@ use gpui_component::{
     switch::Switch,
     v_flex,
 };
+
+/// 「自定义线程数」数字输入宽度。
+const CUSTOM_THREADS_WIDTH: Pixels = px(96.);
+/// 预设下拉（UA、校验算法）定宽，右侧输入框吃满剩余宽度。
+const PRESET_DROPDOWN_WIDTH: Pixels = px(140.);
+/// 请求头名称列宽。
+const HEADER_NAME_WIDTH: Pixels = px(168.);
+/// 链接停止变化多久后才查询站点凭据（逐键输入时不逐字符发 RPC）。
+const SITE_AUTH_LOOKUP_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// 队列下拉候选（显示名由表单按内置队列本地化）。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,15 +84,157 @@ pub struct NewDownloadContext {
     pub queues: Vec<NewDownloadQueue>,
     /// 全局手动代理 URL；空 = 未配置（对应下拉项置灰）。
     pub manual_proxy_url: String,
+    /// 预填链接（拖放）。
+    pub initial_urls: Vec<String>,
+}
+
+/// 从 agent 快照投影「新建下载」环境（无主窗口时的外部捕获确认、菜单入口共用规则）。
+#[must_use]
+pub fn new_download_context_from_snapshot(snapshot: &AgentSnapshot) -> NewDownloadContext {
+    build_new_download_context(
+        &snapshot.daemon.config.values,
+        &snapshot.daemon.runtime_stats.save_dir,
+        &snapshot.preferences.values,
+        &snapshot.daemon.queues,
+        None,
+    )
+}
+
+/// 与 Dart 一致：偏好 `remember_last_save_dir` 开启且有记录时沿用上次目录，否则用全局
+/// 默认（`default_save_dir`，空则 daemon 运行时目录）；队列优先 `selected_queue`，其次配置
+/// `default_queue_id`，最后主队列；线程数优先队列 `default_segments`，其次全局配置。
+pub(crate) fn build_new_download_context(
+    config: &BTreeMap<String, String>,
+    runtime_save_dir: &str,
+    preferences: &BTreeMap<String, serde_json::Value>,
+    queues: &[QueueDto],
+    selected_queue: Option<&str>,
+) -> NewDownloadContext {
+    let config_str = |key: &str| config.get(key).map_or("", |value| value.trim());
+    let remember = preferences
+        .get(REMEMBER_LAST_SAVE_DIR_PREF)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let last_save_dir = preferences
+        .get(LAST_SAVE_DIR_PREF)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let save_dir = if remember && !last_save_dir.is_empty() {
+        last_save_dir
+    } else {
+        match config_str("default_save_dir") {
+            "" => runtime_save_dir,
+            configured => configured,
+        }
+    };
+    let queue_id = selected_queue.unwrap_or_else(|| match config_str("default_queue_id") {
+        "" => fluxdown_protocol::MAIN_QUEUE_ID,
+        configured => configured,
+    });
+    let queue_segments = queues
+        .iter()
+        .find(|queue| queue.queue_id == queue_id)
+        .map_or(0, |queue| queue.default_segments);
+    let segments = if queue_segments > 0 {
+        queue_segments
+    } else {
+        config_str("default_segments").parse::<i32>().unwrap_or(0)
+    };
+    NewDownloadContext {
+        save_dir: save_dir.to_owned(),
+        queue_id: queue_id.to_owned(),
+        segments,
+        queues: queues
+            .iter()
+            .map(|queue| NewDownloadQueue {
+                id: queue.queue_id.clone(),
+                name: queue.name.clone(),
+            })
+            .collect(),
+        manual_proxy_url: manual_proxy_url(config),
+        initial_urls: Vec::new(),
+    }
+}
+
+/// 外部捕获条目的确认：事务 id + 表单产出的建任务参数。
+#[derive(Clone, Debug)]
+pub struct CapturedTask {
+    pub transaction_id: String,
+    pub request: CreateTaskRequest,
 }
 
 /// 表单确认后的提交内容。
 #[derive(Clone, Debug)]
 pub enum NewDownloadSubmission {
-    /// 每条链接一个请求，共享表单选项；宿主逐条调用 `daemon.task.create`。
-    Tasks(Vec<CreateTaskRequest>),
+    /// 每条链接一个请求，共享表单选项：普通链接逐条 `daemon.task.create`，
+    /// 外部捕获条目逐条 `agent.capture.resolve` 确认。
+    Tasks {
+        tasks: Vec<CreateTaskRequest>,
+        captures: Vec<CapturedTask>,
+    },
     /// 本机 `.torrent` 文件，交给 agent 读取上传。
     TorrentFiles(Vec<PathBuf>),
+}
+
+impl NewDownloadSubmission {
+    /// 提交后任务立即开始（非「稍后下载」）；本机种子文件由 agent 直接开始。
+    #[must_use]
+    pub fn starts_immediately(&self) -> bool {
+        match self {
+            Self::Tasks { tasks, captures } => tasks
+                .iter()
+                .chain(captures.iter().map(|capture| &capture.request))
+                .all(|request| !request.start_paused),
+            Self::TorrentFiles(_) => true,
+        }
+    }
+
+    /// 「上次保存目录」偏好写入（尽力而为，失败不影响建任务）。
+    #[must_use]
+    pub fn remember_save_dir_command(&self) -> Option<DownloadsCommand> {
+        let Self::Tasks { tasks, captures } = self else {
+            return None;
+        };
+        let save_dir = tasks
+            .first()
+            .or_else(|| captures.first().map(|capture| &capture.request))?
+            .save_dir
+            .clone();
+        Some(DownloadsCommand::SetLocalPreference {
+            key: LAST_SAVE_DIR_PREF,
+            value: serde_json::Value::String(save_dir),
+        })
+    }
+
+    /// 建任务 / 确认捕获 / 上传种子的端口命令，逐条执行。
+    #[must_use]
+    pub fn into_commands(self) -> Vec<DownloadsCommand> {
+        match self {
+            Self::Tasks { tasks, captures } => tasks
+                .into_iter()
+                .map(|request| {
+                    DownloadsCommand::Create(Box::new(fluxdown_protocol::DaemonCreateTaskParams {
+                        request,
+                        torrent_blob_id: None,
+                        unattended: false,
+                    }))
+                })
+                .chain(captures.into_iter().map(|capture| {
+                    DownloadsCommand::CaptureResolve(Box::new(CaptureResolveParams {
+                        transaction_id: capture.transaction_id,
+                        accepted: true,
+                        request: Some(capture.request),
+                    }))
+                }))
+                .collect(),
+            Self::TorrentFiles(paths) => paths
+                .iter()
+                .map(|path| DownloadsCommand::SubmitTorrentFile {
+                    path: path.display().to_string(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// 新建下载对话框的提交回调。
@@ -73,16 +246,30 @@ struct HeaderRow {
     value: Entity<InputState>,
 }
 
+/// HTTP 认证框的站点凭据自动回填状态（规则同 Dart `_maybeAutofillSiteAuth`）。
+#[derive(Default)]
+struct AuthAutofill {
+    /// 两框当前值来自站点凭据自动回填（链接换站点时可被更新 / 清空）。
+    filled: bool,
+    /// 用户手动编辑过认证框：此后本表单不再自动覆盖。
+    dirty: bool,
+    /// 当前回填目标链接（单条 http(s) 且不沿用浏览器认证时才有）。
+    target: Option<String>,
+}
+
 /// 独立窗口承载的「新建下载」表单。
 ///
-/// 提交或取消都会关闭自身所在窗口；任务创建失败的提示由
-/// [`super::downloads::DownloadView`] 展示。
+/// 提交或取消都会关闭自身所在窗口；任务创建失败的提示由宿主展示。视图释放时仍未确认的
+/// 外部捕获由宿主经 [`Self::take_captures`] 取走并忽略。
 pub struct NewDownloadView {
     strings: NewDownloadStrings,
     context: NewDownloadContext,
+    port: Arc<dyn DownloadsPort>,
     on_submit: NewDownloadSubmit,
     urls: Entity<TextareaState>,
     entries: Vec<UrlEntry>,
+    /// 尚未确认 / 忽略的外部捕获；按 URL 与链接行对应。
+    captures: Vec<PendingCaptureDto>,
     save_dir: Entity<InputState>,
     threads: ThreadChoice,
     custom_threads: Entity<InputState>,
@@ -91,6 +278,7 @@ pub struct NewDownloadView {
     http_user: Entity<InputState>,
     http_password: Entity<InputState>,
     save_site_auth: bool,
+    auth_autofill: AuthAutofill,
     proxy_choice: ProxyChoice,
     custom_proxy: Entity<InputState>,
     ignore_tls_errors: bool,
@@ -105,17 +293,21 @@ pub struct NewDownloadView {
 }
 
 impl NewDownloadView {
-    /// 创建表单并聚焦链接输入框。
+    /// 创建表单并聚焦链接输入框。`port` 用于站点凭据匹配。
     pub fn new(
         translator: Entity<Translator>,
         context: NewDownloadContext,
+        port: Arc<dyn DownloadsPort>,
         on_submit: NewDownloadSubmit,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let strings = NewDownloadStrings::from_translator(translator.read(cx));
-        let urls = cx
-            .new(|cx| TextareaState::new(window, cx).placeholder(strings.url_placeholder.clone()));
+        let urls = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .default_value(context.initial_urls.join("\n"))
+                .placeholder(strings.url_placeholder.clone())
+        });
         let save_dir = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(context.save_dir.clone())
@@ -139,25 +331,30 @@ impl NewDownloadView {
         let cookie = cx.new(|cx| {
             TextareaState::new(window, cx).placeholder(strings.cookie_placeholder.clone())
         });
+        let rename = cx
+            .new(|cx| InputState::new(window, cx).placeholder(strings.rename_placeholder.clone()));
         urls.update(cx, |input, cx| input.focus(window, cx));
 
-        let this = Self {
+        let mut this = Self {
             threads: ThreadChoice::from_segments(context.segments),
-            rename: Self::input(strings.rename_placeholder.clone(), window, cx),
+            rename,
             http_user: Self::input(strings.http_auth_user.clone(), window, cx),
             custom_proxy: Self::input(strings.proxy_placeholder.clone(), window, cx),
             user_agent: Self::input(strings.user_agent_desc.clone(), window, cx),
             checksum: Self::input(strings.checksum_placeholder.clone(), window, cx),
             strings,
             context,
+            port,
             on_submit,
             urls,
             entries: Vec::new(),
+            captures: Vec::new(),
             save_dir,
             custom_threads,
             advanced_open: false,
             http_password,
             save_site_auth: false,
+            auth_autofill: AuthAutofill::default(),
             proxy_choice: ProxyChoice::FollowGlobal,
             ignore_tls_errors: false,
             ua_preset: UA_PRESET_DEFAULT,
@@ -167,6 +364,7 @@ impl NewDownloadView {
             header_seq: 0,
             picking: false,
         };
+        this.refresh_entries(window, cx);
         this.subscribe_inputs(&translator, window, cx);
         this
     }
@@ -196,7 +394,7 @@ impl NewDownloadView {
             &self.urls,
             window,
             |this, _, event: &InputEvent, window, cx| match event {
-                InputEvent::Change => this.refresh_entries(cx),
+                InputEvent::Change => this.refresh_entries(window, cx),
                 InputEvent::PressEnter {
                     secondary: true, ..
                 } => this.submit(false, None, window, cx),
@@ -228,11 +426,181 @@ impl NewDownloadView {
             }
         })
         .detach();
+        // `set_value`（自动回填）不发 Change：这里只会收到用户手动编辑。
+        for input in [&self.http_user, &self.http_password] {
+            cx.subscribe(input, |this, _, event: &InputEvent, _| {
+                if let InputEvent::Change = event {
+                    this.auth_autofill.dirty = true;
+                    this.auth_autofill.filled = false;
+                }
+            })
+            .detach();
+        }
     }
 
-    fn refresh_entries(&mut self, cx: &mut Context<Self>) {
+    fn refresh_entries(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.entries = parse_entries(&self.urls.read(cx).value(), false);
+        self.sync_site_auth(window, cx);
         cx.notify();
+    }
+
+    /// 追加外部捕获：未见过的事务按链接行（含 `out=` 文件名）追加到链接框末尾，不改动
+    /// 已有文本；表单原本为空时沿用捕获方指定的保存目录。
+    pub fn add_captures(
+        &mut self,
+        captures: Vec<PendingCaptureDto>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fresh = captures
+            .into_iter()
+            .filter(|capture| {
+                !self
+                    .captures
+                    .iter()
+                    .any(|known| known.transaction_id == capture.transaction_id)
+            })
+            .collect::<Vec<_>>();
+        if fresh.is_empty() {
+            return;
+        }
+        let current = self.urls.read(cx).value().to_string();
+        if current.trim().is_empty()
+            && let Some(save_dir) = fresh
+                .iter()
+                .map(|capture| capture.save_dir.trim())
+                .find(|save_dir| !save_dir.is_empty())
+        {
+            let save_dir = save_dir.to_owned();
+            self.save_dir
+                .update(cx, |input, cx| input.set_value(save_dir, window, cx));
+        }
+        let text = append_entries(
+            &current,
+            fresh
+                .iter()
+                .map(|capture| capture_entry(&capture.url, &capture.file_name)),
+        );
+        self.urls
+            .update(cx, |input, cx| input.set_value(text, window, cx));
+        self.captures.extend(fresh);
+        self.refresh_entries(window, cx);
+    }
+
+    /// 只保留 agent 仍在等待确认的捕获（其余已在别处处理 / agent 重启丢失）；对应链接行
+    /// 保留为普通链接。
+    pub fn retain_captures(
+        &mut self,
+        pending: &[PendingCaptureDto],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let before = self.captures.len();
+        self.captures.retain(|capture| {
+            pending
+                .iter()
+                .any(|pending| pending.transaction_id == capture.transaction_id)
+        });
+        if self.captures.len() != before {
+            self.refresh_entries(window, cx);
+        }
+    }
+
+    fn capture_for(&self, url: &str) -> Option<&PendingCaptureDto> {
+        self.captures.iter().find(|capture| capture.url == url)
+    }
+
+    /// 单条链接且是带 `Authorization` 的浏览器捕获：沿用浏览器认证，不回填站点凭据。
+    fn uses_browser_auth(&self) -> bool {
+        matches!(self.entries.as_slice(), [entry]
+            if self.capture_for(&entry.url).is_some_and(PendingCaptureDto::has_authorization))
+    }
+
+    /// 站点凭据回填目标：单条 http(s) 链接，且不沿用浏览器认证。
+    fn site_auth_target(&self) -> Option<String> {
+        let [entry] = self.entries.as_slice() else {
+            return None;
+        };
+        let lower = entry.url.to_ascii_lowercase();
+        let http = lower.starts_with("http://") || lower.starts_with("https://");
+        (http && !self.uses_browser_auth()).then(|| entry.url.clone())
+    }
+
+    /// 链接变化后按站点键查已保存凭据并回填 / 更新 / 清空认证两框（用户手动编辑过则不动）。
+    /// 查询去抖；结果回来时目标已变则丢弃。
+    fn sync_site_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.auth_autofill.dirty {
+            return;
+        }
+        let target = self.site_auth_target();
+        if target == self.auth_autofill.target {
+            return;
+        }
+        self.auth_autofill.target.clone_from(&target);
+        let Some(url) = target else {
+            self.clear_autofilled_auth(window, cx);
+            return;
+        };
+        let port = self.port.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(SITE_AUTH_LOOKUP_DEBOUNCE)
+                .await;
+            let current = this
+                .read_with(cx, |this, _| {
+                    this.auth_autofill.target.as_deref() == Some(url.as_str())
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            let credential = match port
+                .execute(DownloadsCommand::SiteAuthMatch { url: url.clone() })
+                .await
+            {
+                Ok(DownloadsResult::Value(value)) => {
+                    serde_json::from_value::<Option<SiteAuthCredentialDto>>(value)
+                        .ok()
+                        .flatten()
+                }
+                _ => None,
+            };
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this.auth_autofill.dirty
+                    || this.auth_autofill.target.as_deref() != Some(url.as_str())
+                {
+                    return;
+                }
+                match credential {
+                    Some(credential) => {
+                        this.http_user
+                            .update(cx, |input, cx| input.set_value(credential.user, window, cx));
+                        this.http_password
+                            .update(cx, |input, cx| input.set_value(credential.pass, window, cx));
+                        this.auth_autofill.filled = true;
+                        cx.notify();
+                    }
+                    None => this.clear_autofilled_auth(window, cx),
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn clear_autofilled_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.auth_autofill.filled {
+            return;
+        }
+        for input in [&self.http_user, &self.http_password] {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
+        self.auth_autofill.filled = false;
+        cx.notify();
+    }
+
+    /// 取走仍未确认的外部捕获（宿主在视图释放时忽略它们，agent 不留悬挂事务）。
+    pub fn take_captures(&mut self) -> Vec<PendingCaptureDto> {
+        std::mem::take(&mut self.captures)
     }
 
     fn is_batch(&self) -> bool {
@@ -316,8 +684,22 @@ impl NewDownloadView {
             return;
         }
         let options = self.draft_options(later, queue_override, cx);
-        let requests = build_requests(&self.entries, &options);
-        (self.on_submit)(NewDownloadSubmission::Tasks(requests), window, cx);
+        let mut tasks = Vec::new();
+        let mut captures = Vec::new();
+        for request in build_requests(&self.entries, &options) {
+            match self
+                .captures
+                .iter()
+                .position(|capture| capture.url == request.url)
+            {
+                Some(index) => captures.push(CapturedTask {
+                    transaction_id: self.captures.remove(index).transaction_id,
+                    request,
+                }),
+                None => tasks.push(request),
+            }
+        }
+        (self.on_submit)(NewDownloadSubmission::Tasks { tasks, captures }, window, cx);
         window.remove_window();
     }
 
@@ -403,7 +785,7 @@ impl NewDownloadView {
                 let merged = merge_imported(&this.urls.read(cx).value(), imported);
                 this.urls
                     .update(cx, |input, cx| input.set_value(merged, window, cx));
-                this.refresh_entries(cx);
+                this.refresh_entries(window, cx);
                 window.push_notification(
                     Notification::success(this.strings.format_import_found(count)),
                     cx,
@@ -523,6 +905,7 @@ impl NewDownloadView {
     }
 
     /// 单选下拉：当前项打勾，禁用项置灰；选择后经弱引用回写表单。
+    /// `width = None` 时铺满所在字段宽度（与输入框同高同宽）。
     fn dropdown<T: Clone + PartialEq + 'static>(
         &self,
         id: &'static str,
@@ -531,7 +914,7 @@ impl NewDownloadView {
         options: Vec<(T, SharedString, bool)>,
         on_pick: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let label = options
             .iter()
             .find(|(value, _, _)| *value == current)
@@ -541,9 +924,13 @@ impl NewDownloadView {
         let on_pick = Rc::new(on_pick);
         Button::new(id)
             .outline()
+            .control(cx)
             .label(label)
             .dropdown_caret(true)
-            .when_some(width, |this, width| this.w(width))
+            .map(|button| match width {
+                Some(width) => button.flex_none().w(width),
+                None => button.w_full(),
+            })
             .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                 options.iter().fold(menu, |menu, (value, label, disabled)| {
                     let checked = *value == current;
@@ -563,6 +950,7 @@ impl NewDownloadView {
                     )
                 })
             })
+            .into_any_element()
     }
 
     /// 队列选择菜单：选中即以该队列提交（`later` 决定是否暂停）。
@@ -599,91 +987,130 @@ impl NewDownloadView {
         }
     }
 
-    fn label(&self, text: SharedString, cx: &App) -> Div {
+    /// 多行输入（链接 / Cookie）：13px 正文，与单行输入框同一视觉体系。
+    ///
+    /// 不要再加 `px`/`py`：多行 `Input` 已按尺寸给内部编辑区设置了内边距，外层再叠
+    /// 一层会让文字离边框两倍远。
+    fn textarea(state: &Entity<TextareaState>, height: Pixels, cx: &App) -> Textarea {
         let tokens = active_theme(cx).tokens();
-        div()
-            .text_xs()
-            .font_weight(tokens.typography.sm.weight)
-            .text_color(tokens.colors.muted_foreground)
-            .child(text)
+        Textarea::new(state)
+            .h(height)
+            .w_full()
+            .text_size(tokens.typography.sm.size)
+            .line_height(tokens.typography.sm.line_height)
     }
 
-    fn hint(&self, text: SharedString, cx: &App) -> Div {
-        let tokens = active_theme(cx).tokens();
-        div()
-            .text_xs()
-            .text_color(tokens.colors.muted_foreground)
-            .child(text)
+    /// 开关行（放进 `option_group`）。
+    fn toggle(
+        &self,
+        id: &'static str,
+        title: SharedString,
+        description: Option<SharedString>,
+        checked: bool,
+        on_change: fn(&mut Self, bool),
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        option_row(
+            title,
+            description,
+            Switch::new(id).checked(checked).on_click(cx.listener(
+                move |this, checked: &bool, _, cx| {
+                    on_change(this, *checked);
+                    cx.notify();
+                },
+            )),
+            cx,
+        )
+        .into_any_element()
     }
 
+    /// 窗口标题栏已显示「新建下载」，这里只保留一行说明，避免标题重复。
     fn render_header(&self, cx: &App) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .px(tokens.spacing.md)
+        let tokens = active_theme(cx).tokens();
+        div()
+            .flex_none()
+            .px(tokens.spacing.lg)
             .pt(tokens.spacing.md)
             .pb(tokens.spacing.sm)
-            .gap(tokens.spacing.xxs)
-            .child(
-                div()
-                    .text_size(tokens.typography.md.size)
-                    .font_weight(tokens.typography.md.weight)
-                    .child(self.strings.title.clone()),
-            )
-            .child(self.hint(self.strings.subtitle.clone(), cx))
+            .child(field_hint(self.strings.subtitle.clone(), cx))
     }
 
+    /// 链接：标签行右侧显示已识别条数；多行输入下方是种子 / 文本导入入口。
     fn render_urls(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let spacing = active_theme(cx).tokens().spacing;
         let count = self.entries.len();
         let has_text = !self.urls.read(cx).value().trim().is_empty();
-        let mut column = v_flex().gap(tokens.spacing.xs).child(
-            h_flex()
-                .justify_between()
-                .items_center()
-                .child(self.label(self.strings.url_label.clone(), cx))
-                .when(count > 0, |this| {
-                    this.child(self.hint(self.strings.format_url_count(count), cx))
-                }),
-        );
-        column = column.child(Textarea::new(&self.urls).h(px(120.)).w_full());
-        if has_text && count == 0 {
-            column = column.child(
-                div()
-                    .text_xs()
-                    .text_color(tokens.colors.destructive)
-                    .child(self.strings.no_valid_url.clone()),
-            );
-        }
-        column.child(
-            h_flex()
-                .gap(tokens.spacing.xs)
-                .child(
-                    Button::new("new-download-open-torrent")
-                        .ghost()
-                        .small()
-                        .icon(IconName::FolderOpen)
-                        .label(self.strings.open_torrent.clone())
-                        .disabled(self.picking)
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.pick_torrent_files(window, cx);
-                        })),
-                )
-                .child(
-                    Button::new("new-download-import-txt")
-                        .ghost()
-                        .small()
-                        .icon(IconName::File)
-                        .label(self.strings.import_txt.clone())
-                        .disabled(self.picking)
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.import_txt_files(window, cx);
-                        })),
-                ),
+        v_flex()
+            .w_full()
+            .gap(spacing.xs + spacing.xxs)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(field_label(self.strings.url_label.clone(), cx))
+                    .when(count > 0, |this| {
+                        this.child(field_hint(self.strings.format_url_count(count), cx))
+                    }),
+            )
+            .child(Self::textarea(&self.urls, px(128.), cx))
+            .when(has_text && count == 0, |this| {
+                this.child(field_error(self.strings.no_valid_url.clone(), cx))
+            })
+            .when(!self.captures.is_empty(), |this| {
+                this.child(field_hint(self.strings.capture_context_hint.clone(), cx))
+            })
+            .child(
+                h_flex()
+                    .gap(spacing.sm)
+                    .child(
+                        Button::new("new-download-open-torrent")
+                            .ghost()
+                            .icon(FluxIcon::FolderOpen)
+                            .label(self.strings.open_torrent.clone())
+                            .control(cx)
+                            .disabled(self.picking)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.pick_torrent_files(window, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("new-download-import-txt")
+                            .ghost()
+                            .icon(FluxIcon::FileText)
+                            .label(self.strings.import_txt.clone())
+                            .control(cx)
+                            .disabled(self.picking)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.import_txt_files(window, cx);
+                            })),
+                    ),
+            )
+    }
+
+    fn render_save_dir(&self, cx: &mut Context<Self>) -> Div {
+        form_field(
+            self.strings.save_dir.clone(),
+            input_with_action(
+                Input::new(&self.save_dir).control(cx).w_full(),
+                Button::new("new-download-browse")
+                    .outline()
+                    .icon(FluxIcon::FolderOpen)
+                    .label(self.strings.browse.clone())
+                    .control(cx)
+                    .disabled(self.picking)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.pick_save_dir(window, cx);
+                    })),
+                cx,
+            ),
+            None,
+            cx,
         )
     }
 
+    /// 线程数：下拉铺满字段；选「自定义」时右侧追加数字输入。
     fn render_threads(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let spacing = active_theme(cx).tokens().spacing;
         let mut options = vec![(ThreadChoice::Auto, self.strings.threads_auto.clone(), false)];
         options.extend(THREAD_PRESETS.iter().map(|value| {
             (
@@ -697,132 +1124,77 @@ impl NewDownloadView {
             self.strings.threads_custom.clone(),
             false,
         ));
-        let mut row = h_flex().gap(tokens.spacing.xs).child(self.dropdown(
+        let dropdown = self.dropdown(
             "new-download-threads",
-            Some(px(120.)),
+            None,
             self.threads,
             options,
             |this, choice, window, cx| this.set_threads(choice, window, cx),
             cx,
-        ));
-        if self.threads == ThreadChoice::Custom {
-            row = row.child(Input::new(&self.custom_threads).w(px(96.)));
-        }
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.threads.clone(), cx))
-            .child(row)
+        );
+        let control = h_flex()
+            .w_full()
+            .gap(spacing.sm)
+            .child(div().flex_1().min_w_0().child(dropdown))
+            .when(self.threads == ThreadChoice::Custom, |this| {
+                this.child(
+                    Input::new(&self.custom_threads)
+                        .control(cx)
+                        .flex_none()
+                        .w(CUSTOM_THREADS_WIDTH),
+                )
+            });
+        form_field(self.strings.threads.clone(), control, None, cx)
     }
 
-    fn render_save_dir_row(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        let save_dir = v_flex()
-            .flex_1()
-            .min_w_0()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.save_dir.clone(), cx))
-            .child(
-                h_flex()
-                    .gap(tokens.spacing.xs)
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.save_dir).w_full()),
-                    )
-                    .child(
-                        Button::new("new-download-browse")
-                            .outline()
-                            .label(self.strings.browse.clone())
-                            .disabled(self.picking)
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.pick_save_dir(window, cx);
-                            })),
-                    ),
+    /// 文件名 | 线程数并排；批量隐藏文件名，全磁力隐藏线程数。
+    fn render_name_threads(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let mut fields = Vec::with_capacity(2);
+        if !self.is_batch() {
+            fields.push(
+                form_field(
+                    self.strings.rename.clone(),
+                    Input::new(&self.rename).control(cx).w_full(),
+                    None,
+                    cx,
+                )
+                .into_any_element(),
             );
-        h_flex()
-            .gap(tokens.spacing.md)
-            .items_end()
-            .child(save_dir)
-            .when(!self.all_magnet(), |this| {
-                this.child(self.render_threads(cx))
-            })
-    }
-
-    fn render_rename(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.rename.clone(), cx))
-            .child(Input::new(&self.rename).w_full())
-    }
-
-    fn render_switch_row(
-        &self,
-        id: &'static str,
-        title: SharedString,
-        description: Option<SharedString>,
-        checked: bool,
-        on_change: impl Fn(&mut Self, bool) + 'static,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        h_flex()
-            .gap(tokens.spacing.lg)
-            .items_start()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(tokens.spacing.xxs)
-                    .child(div().text_sm().child(title))
-                    .when_some(description, |this, description| {
-                        this.child(self.hint(description, cx))
-                    }),
-            )
-            .child(Switch::new(id).checked(checked).on_click(cx.listener(
-                move |this, checked: &bool, _, cx| {
-                    on_change(this, *checked);
-                    cx.notify();
-                },
-            )))
+        }
+        if !self.all_magnet() {
+            fields.push(self.render_threads(cx).into_any_element());
+        }
+        (!fields.is_empty()).then(|| form_row(fields, cx))
     }
 
     fn render_http_auth(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.http_auth.clone(), cx))
-            .child(self.hint(self.strings.http_auth_desc.clone(), cx))
-            .child(
-                h_flex()
-                    .gap(tokens.spacing.sm)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.http_user).w_full()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.http_password).mask_toggle().w_full()),
-                    ),
-            )
-            .child(self.render_switch_row(
-                "new-download-save-site-auth",
-                self.strings.http_auth_save.clone(),
-                None,
-                self.save_site_auth,
-                |this, checked| this.save_site_auth = checked,
+        form_field(
+            self.strings.http_auth.clone(),
+            form_row(
+                [
+                    Input::new(&self.http_user)
+                        .control(cx)
+                        .w_full()
+                        .into_any_element(),
+                    Input::new(&self.http_password)
+                        .control(cx)
+                        .mask_toggle()
+                        .w_full()
+                        .into_any_element(),
+                ],
                 cx,
-            ))
+            ),
+            Some(if self.uses_browser_auth() {
+                self.strings.capture_auth_hint.clone()
+            } else {
+                self.strings.http_auth_desc.clone()
+            }),
+            cx,
+        )
     }
 
     fn render_proxy(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let spacing = active_theme(cx).tokens().spacing;
         let manual = self.context.manual_proxy_url.clone();
         let options = ProxyChoice::ALL
             .into_iter()
@@ -845,126 +1217,125 @@ impl NewDownloadView {
                 (choice, label, disabled)
             })
             .collect();
-        let mut column = v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.proxy.clone(), cx))
-            .child(self.hint(self.strings.proxy_desc.clone(), cx))
-            .child(self.dropdown(
-                "new-download-proxy",
-                None,
-                self.proxy_choice,
-                options,
-                |this, choice, _, cx| {
-                    this.proxy_choice = choice;
-                    cx.notify();
-                },
-                cx,
-            ));
-        if self.proxy_choice == ProxyChoice::Custom {
-            column = column.child(Input::new(&self.custom_proxy).w_full());
-        }
-        column
+        let dropdown = self.dropdown(
+            "new-download-proxy",
+            None,
+            self.proxy_choice,
+            options,
+            |this, choice, _, cx| {
+                this.proxy_choice = choice;
+                cx.notify();
+            },
+            cx,
+        );
+        let control = v_flex()
+            .w_full()
+            .gap(spacing.sm)
+            .child(dropdown)
+            .when(self.proxy_choice == ProxyChoice::Custom, |this| {
+                this.child(Input::new(&self.custom_proxy).control(cx).w_full())
+            });
+        form_field(
+            self.strings.proxy.clone(),
+            control,
+            Some(self.strings.proxy_desc.clone()),
+            cx,
+        )
+    }
+
+    /// 预设下拉 + 同行输入框（UA、校验和）：下拉定宽，输入框吃满剩余宽度。
+    fn preset_with_input(preset: AnyElement, input: &Entity<InputState>, cx: &App) -> Div {
+        let spacing = active_theme(cx).tokens().spacing;
+        h_flex().w_full().gap(spacing.sm).child(preset).child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(input).control(cx).w_full()),
+        )
     }
 
     fn render_user_agent(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
         let options = ua_preset_keys()
             .map(|key| (key, self.ua_label(key), false))
             .collect();
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.user_agent.clone(), cx))
-            .child(self.hint(self.strings.user_agent_desc.clone(), cx))
-            .child(
-                h_flex()
-                    .gap(tokens.spacing.sm)
-                    .items_center()
-                    .child(self.dropdown(
-                        "new-download-ua-preset",
-                        Some(px(150.)),
-                        self.ua_preset,
-                        options,
-                        |this, key, window, cx| this.set_ua_preset(key, window, cx),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.user_agent).w_full()),
-                    ),
-            )
+        let preset = self.dropdown(
+            "new-download-ua-preset",
+            Some(PRESET_DROPDOWN_WIDTH),
+            self.ua_preset,
+            options,
+            |this, key, window, cx| this.set_ua_preset(key, window, cx),
+            cx,
+        );
+        form_field(
+            self.strings.user_agent.clone(),
+            Self::preset_with_input(preset, &self.user_agent, cx),
+            Some(self.strings.user_agent_desc.clone()),
+            cx,
+        )
     }
 
     fn render_cookie(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.cookie.clone(), cx))
-            .child(self.hint(self.strings.cookie_desc.clone(), cx))
-            .child(Textarea::new(&self.cookie).h(px(56.)).w_full())
+        form_field(
+            self.strings.cookie.clone(),
+            Self::textarea(&self.cookie, px(72.), cx),
+            Some(self.strings.cookie_desc.clone()),
+            cx,
+        )
     }
 
     fn render_checksum(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
         let options = HASH_ALGORITHMS
             .iter()
             .map(|algorithm| (*algorithm, SharedString::from(*algorithm), false))
             .collect();
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.checksum.clone(), cx))
-            .child(self.hint(self.strings.checksum_desc.clone(), cx))
-            .child(
-                h_flex()
-                    .gap(tokens.spacing.sm)
-                    .items_center()
-                    .child(self.dropdown(
-                        "new-download-hash-algorithm",
-                        Some(px(110.)),
-                        self.hash_algorithm,
-                        options,
-                        |this, algorithm, _, cx| {
-                            this.hash_algorithm = algorithm;
-                            cx.notify();
-                        },
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&self.checksum).w_full()),
-                    ),
-            )
+        let preset = self.dropdown(
+            "new-download-hash-algorithm",
+            Some(PRESET_DROPDOWN_WIDTH),
+            self.hash_algorithm,
+            options,
+            |this, algorithm, _, cx| {
+                this.hash_algorithm = algorithm;
+                cx.notify();
+            },
+            cx,
+        );
+        form_field(
+            self.strings.checksum.clone(),
+            Self::preset_with_input(preset, &self.checksum, cx),
+            Some(self.strings.checksum_desc.clone()),
+            cx,
+        )
     }
 
+    /// 自定义请求头：每行「名称 | 值 | 删除」，末尾「添加请求头」。
     fn render_headers(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        let mut column = v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label(self.strings.headers.clone(), cx))
-            .child(self.hint(self.strings.headers_desc.clone(), cx));
+        let spacing = active_theme(cx).tokens().spacing;
+        let mut rows = v_flex().w_full().gap(spacing.sm);
         for row in &self.headers {
             let row_id = row.id;
-            column = column.child(
+            rows = rows.child(
                 h_flex()
-                    .gap(tokens.spacing.sm)
-                    .items_center()
-                    .child(div().w(px(160.)).child(Input::new(&row.key).w_full()))
+                    .w_full()
+                    .gap(spacing.sm)
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(HEADER_NAME_WIDTH)
+                            .child(Input::new(&row.key).control(cx).w_full()),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&row.value).w_full()),
+                            .child(Input::new(&row.value).control(cx).w_full()),
                     )
                     .child(
                         Button::new(SharedString::from(format!(
                             "new-download-header-remove-{row_id}"
                         )))
                         .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
+                        .icon(FluxIcon::X)
+                        .control_icon(cx)
                         .on_click(cx.listener(
                             move |this, _: &ClickEvent, _, cx| {
                                 this.headers.retain(|row| row.id != row_id);
@@ -974,105 +1345,152 @@ impl NewDownloadView {
                     ),
             );
         }
-        column.child(
-            div().child(
+        rows = rows.child(
+            h_flex().child(
                 Button::new("new-download-header-add")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Plus)
+                    .outline()
+                    .icon(FluxIcon::Plus)
                     .label(self.strings.add_header.clone())
+                    .control(cx)
                     .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         this.add_header_row(window, cx);
                     })),
             ),
+        );
+        form_field(
+            self.strings.headers.clone(),
+            rows,
+            Some(self.strings.headers_desc.clone()),
+            cx,
         )
     }
 
+    /// 「高级」折叠区：标题行可点击展开；展开后字段同样走 `form_field`，开关进 `option_group`。
     fn render_advanced(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
         let open = self.advanced_open;
-        let mut column = v_flex().gap(tokens.spacing.md).child(
-            h_flex()
-                .id("new-download-advanced-toggle")
-                .gap(tokens.spacing.xs)
-                .items_center()
-                .py(tokens.spacing.xs)
-                .cursor_pointer()
-                .text_color(tokens.colors.muted_foreground)
-                .child(
-                    Icon::new(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(px(14.)),
-                )
-                .child(div().text_xs().child(self.strings.advanced.clone()))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.advanced_open = !this.advanced_open;
-                    cx.notify();
-                })),
-        );
+        let disclosure = h_flex()
+            .id("new-download-advanced-toggle")
+            .w_full()
+            .gap(tokens.spacing.xs)
+            .items_center()
+            .cursor_pointer()
+            .child(
+                Icon::new(if open {
+                    FluxIcon::ChevronDown
+                } else {
+                    FluxIcon::ChevronRight
+                })
+                .size(extended.icon.md)
+                .text_color(extended.colors.text_tertiary),
+            )
+            .child(
+                div()
+                    .text_size(tokens.typography.sm.size)
+                    .line_height(tokens.typography.sm.line_height)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tokens.colors.foreground)
+                    .child(self.strings.advanced.clone()),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .h(extended.stroke.thin)
+                    .ml(tokens.spacing.sm)
+                    .bg(extended.colors.hairline),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.advanced_open = !this.advanced_open;
+                cx.notify();
+            }));
+        let section = v_flex().w_full().gap(form_gap(cx)).child(disclosure);
         if !open {
-            return column;
+            return section;
         }
-        if !self.is_batch() && !self.all_magnet() {
-            column = column.child(self.render_http_auth(cx));
-        }
-        column
-            .child(self.render_proxy(cx))
-            .child(self.render_switch_row(
-                "new-download-ignore-tls",
-                self.strings.ignore_tls.clone(),
-                Some(self.strings.ignore_tls_desc.clone()),
-                self.ignore_tls_errors,
-                |this, checked| this.ignore_tls_errors = checked,
+        let show_auth = !self.is_batch() && !self.all_magnet();
+        let mut options = Vec::with_capacity(2);
+        if show_auth {
+            options.push(self.toggle(
+                "new-download-save-site-auth",
+                self.strings.http_auth_save.clone(),
+                None,
+                self.save_site_auth,
+                |this, checked| this.save_site_auth = checked,
                 cx,
-            ))
-            .child(self.render_user_agent(cx))
-            .child(self.render_cookie(cx))
-            .child(self.render_checksum(cx))
-            .child(self.render_headers(cx))
+            ));
+        }
+        options.push(self.toggle(
+            "new-download-ignore-tls",
+            self.strings.ignore_tls.clone(),
+            Some(self.strings.ignore_tls_desc.clone()),
+            self.ignore_tls_errors,
+            |this, checked| this.ignore_tls_errors = checked,
+            cx,
+        ));
+        let mut fields = form(cx);
+        if show_auth {
+            fields = fields.child(self.render_http_auth(cx));
+        }
+        section.child(
+            fields
+                .child(self.render_proxy(cx))
+                .child(self.render_user_agent(cx))
+                .child(self.render_cookie(cx))
+                .child(self.render_checksum(cx))
+                .child(self.render_headers(cx))
+                .child(option_group(options, cx)),
+        )
     }
 
     fn render_form(&self, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .w_full()
-            .px(tokens.spacing.md)
-            .pb(tokens.spacing.md)
-            .gap(tokens.spacing.md)
+        form(cx)
+            .px(tokens.spacing.lg)
+            .pt(tokens.spacing.xs)
+            .pb(tokens.spacing.lg)
             .child(self.render_urls(cx))
-            .child(self.render_save_dir_row(cx))
-            .when(!self.is_batch(), |this| this.child(self.render_rename(cx)))
+            .child(self.render_save_dir(cx))
+            .children(self.render_name_threads(cx))
             .child(self.render_advanced(cx))
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
         let enabled = self.can_submit(cx);
         let later_queue = self.queue_label(fluxdown_protocol::LATER_QUEUE_ID);
         let start_queue = self.queue_label(&self.context.queue_id);
+        // 分体按钮：两半统一控件高度（`Size::Size` 让右侧箭头半成为 `density.control` 见方，
+        // 文字取 `text_base` = 13px），左半主按钮再经 `control` 统一内边距。
+        let split_size = Size::Size(theme.density().control);
         h_flex()
             .w_full()
-            .p(tokens.spacing.md)
+            .flex_none()
+            .px(tokens.spacing.lg)
+            .py(tokens.spacing.md)
             .justify_end()
-            .gap(tokens.spacing.xs)
+            .gap(tokens.spacing.sm)
+            .bg(theme.extended().colors.chrome)
+            .border_t(theme.extended().stroke.thin)
+            .border_color(theme.extended().colors.hairline)
             .child(
                 Button::new("new-download-cancel")
                     .outline()
-                    .small()
                     .label(self.strings.cancel.clone())
+                    .control(cx)
                     .on_click(|_, window, _| window.remove_window()),
             )
             .child(
                 DropdownButton::new("new-download-later")
                     .outline()
-                    .small()
+                    .with_size(split_size)
                     .disabled(!enabled)
                     .button(
                         Button::new("new-download-later-main")
                             .label(self.strings.download_later.clone())
+                            .control(cx)
                             .tooltip(self.strings.format_later_tooltip(&later_queue))
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.submit(true, None, window, cx);
@@ -1083,11 +1501,12 @@ impl NewDownloadView {
             .child(
                 DropdownButton::new("new-download-start")
                     .primary()
-                    .small()
+                    .with_size(split_size)
                     .disabled(!enabled)
                     .button(
                         Button::new("new-download-start-main")
                             .label(self.strings.format_start(self.entries.len()))
+                            .control(cx)
                             .tooltip(self.strings.format_start_tooltip(&start_queue))
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.submit(false, None, window, cx);
@@ -1103,6 +1522,8 @@ impl Render for NewDownloadView {
         let tokens = active_theme(cx).tokens().clone();
         v_flex()
             .size_full()
+            // 表单区用 surface（白），与设置窗口内容区一致。
+            .bg(tokens.colors.surface)
             .child(self.render_header(cx))
             .child(
                 div()
@@ -1110,7 +1531,6 @@ impl Render for NewDownloadView {
                     .min_h_0()
                     .child(self.render_form(cx).overflow_y_scrollbar()),
             )
-            .child(div().h(px(1.)).w_full().bg(tokens.colors.border))
             .child(self.render_footer(cx))
     }
 }

@@ -1,0 +1,19 @@
+---
+/** FluxDown 标志(品牌蓝圆角方块 + 下载箭头)与可选字标。 */
+interface Props {
+  size?: number;
+  wordmark?: boolean;
+  class?: string;
+}
+const { size = 24, wordmark = true, class: className } = Astro.props;
+---
+
+<span class:list={["inline-flex items-center gap-2", className]}>
+  <svg width={size} height={size} viewBox="56 56 400 400" aria-hidden="true" class="shrink-0">
+    <rect x="56" y="56" width="400" height="400" rx="96" fill="#3B82F6"></rect>
+    <path
+      d="M226 131q0-12 12-12h36q12 0 12 12v165l45-45q9-9 18 0l14 14q9 9 0 18l-98 98q-9 9-18 0l-98-98q-9-9 0-18l14-14q9-9 18 0l45 45z"
+      fill="#F2F4F8"></path>
+  </svg>
+  {wordmark && <span class="text-[17px] font-semibold tracking-[-0.03em] text-fg">FluxDown</span>}
+</span>

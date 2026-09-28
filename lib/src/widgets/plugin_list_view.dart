@@ -2,10 +2,13 @@
 // （zip 上传 / 目录 + 开发模式）+ 插件市场浏览/安装。
 
 import 'dart:async';
-import 'dart:typed_data';
+import 'dart:convert';
 
+import 'package:flutter/material.dart' show SelectableText;
+import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 import 'flux_sonner.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -40,6 +43,7 @@ class _PluginListViewState extends State<PluginListView> {
   int _lastOpSeq = -1;
   bool _installingZip = false;
   bool _installingDir = false;
+
   /// 开发模式开关跨页面导航保持（切走设置分类会销毁 State，
   /// 用 static 记住本次会话的选择，避免每次回来都重置为默认开）。
   static bool _devModeSticky = true;
@@ -113,7 +117,7 @@ class _PluginListViewState extends State<PluginListView> {
     try {
       final files = await FilePickerService.pickFiles(
         dialogTitle: currentS.pluginInstallZipButton,
-        allowedExtensions: const ['zip'],
+        allowedExtensions: const ['fxplug', 'zip'],
       );
       final file = files == null || files.isEmpty ? null : files.first;
       if (file != null) {
@@ -182,6 +186,18 @@ class _PluginListViewState extends State<PluginListView> {
           ),
         ],
       ),
+    );
+  }
+
+  void _showPluginAuth(PluginInfoSignal plugin) {
+    final c = AppColors.of(context);
+    showShadDialog(
+      context: context,
+      barrierColor: c.dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (_) =>
+          _PluginAuthDialog(plugin: plugin, provider: widget.provider),
     );
   }
 
@@ -274,6 +290,7 @@ class _PluginListViewState extends State<PluginListView> {
                 plugin: p,
                 provider: provider,
                 onUninstall: () => _confirmUninstall(p),
+                onAuth: () => _showPluginAuth(p),
               ),
             ),
         const SizedBox(height: 26),
@@ -432,18 +449,66 @@ class _PluginCard extends StatelessWidget {
   final PluginInfoSignal plugin;
   final PluginProvider provider;
   final VoidCallback onUninstall;
+  final VoidCallback onAuth;
 
   const _PluginCard({
     required this.plugin,
     required this.provider,
     required this.onUninstall,
+    required this.onAuth,
   });
+
+  void _showLoadError(BuildContext context) {
+    final s = currentS;
+    final c = AppColors.of(context);
+    final m = AppMetrics.of(context);
+    showShadDialog(
+      context: context,
+      barrierColor: c.dialogBarrier,
+      animateIn: const [],
+      animateOut: const [],
+      builder: (ctx) => ShadDialog(
+        title: Text(s.pluginLoadErrorTitle),
+        description: Text(s.pluginLoadErrorBody),
+        actions: [
+          ShadButton.outline(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: Text(s.close),
+          ),
+          ShadButton(
+            onPressed: () {
+              Clipboard.setData(ClipboardData(text: plugin.loadError));
+              Navigator.of(ctx).pop();
+              FluxSonner.of(
+                context,
+              ).show(ShadToast(title: Text(s.pluginLoadErrorCopied)));
+            },
+            child: Text(s.pluginLoadErrorCopy),
+          ),
+        ],
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 240),
+          child: SingleChildScrollView(
+            child: DefaultSelectionStyle(
+              selectionColor: m.soft(c.accent),
+              cursorColor: c.accent,
+              child: SelectableText(
+                plugin.loadError,
+                style: TextStyle(fontSize: 12, color: c.textSecondary),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final s = currentS;
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
+    final loadFailed = plugin.loadStatus == 'Failed';
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -504,6 +569,15 @@ class _PluginCard extends StatelessWidget {
                             color: c.accent,
                             bg: m.subtle(c.accent),
                           ),
+                        _Badge(
+                          text: loadFailed
+                              ? s.pluginLoadStatusFailed
+                              : s.pluginLoadStatusLoaded,
+                          color: loadFailed ? AppColors.red : AppColors.green,
+                          bg: m.subtle(
+                            loadFailed ? AppColors.red : AppColors.green,
+                          ),
+                        ),
                         if (plugin.disabledReason == 'Manual')
                           _Badge(
                             text: s.pluginDisabledManual,
@@ -522,16 +596,35 @@ class _PluginCard extends StatelessWidget {
                       const SizedBox(height: 2),
                       _HoverDescription(text: plugin.description),
                     ],
+                    if (loadFailed && plugin.loadError.isNotEmpty)
+                      Padding(
+                        padding: const EdgeInsets.only(top: 4),
+                        child: GestureDetector(
+                          onTap: () => _showLoadError(context),
+                          child: Text(
+                            plugin.loadError,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: AppColors.red,
+                            ),
+                          ),
+                        ),
+                      ),
                   ],
                 ),
               ),
               const SizedBox(width: 12),
               ShadSwitch(
-                value: plugin.enabled,
-                onChanged: (v) => provider.setEnabled(plugin.identity, v),
+                enabled: !loadFailed,
+                value: plugin.enabled && !loadFailed,
+                onChanged: loadFailed
+                    ? null
+                    : (v) => provider.setEnabled(plugin.identity, v),
               ),
               const SizedBox(width: 4),
-              if (plugin.settings.isNotEmpty)
+              if (!loadFailed && plugin.settings.isNotEmpty)
                 ShadIconButton.ghost(
                   icon: Icon(
                     LucideIcons.settings2,
@@ -544,6 +637,19 @@ class _PluginCard extends StatelessWidget {
                     provider: provider,
                   ),
                 ),
+              if (!loadFailed && plugin.authSupported)
+                ShadTooltip(
+                  effects: const [],
+                  builder: (_) => Text(s.pluginAuthButton),
+                  child: ShadIconButton.ghost(
+                    icon: Icon(
+                      LucideIcons.logIn,
+                      size: 16,
+                      color: c.textSecondary,
+                    ),
+                    onPressed: onAuth,
+                  ),
+                ),
               ShadIconButton.ghost(
                 icon: Icon(LucideIcons.trash2, size: 16, color: AppColors.red),
                 onPressed: onUninstall,
@@ -552,6 +658,339 @@ class _PluginCard extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class _PluginAuthDialog extends StatefulWidget {
+  final PluginInfoSignal plugin;
+  final PluginProvider provider;
+
+  const _PluginAuthDialog({required this.plugin, required this.provider});
+
+  @override
+  State<_PluginAuthDialog> createState() => _PluginAuthDialogState();
+}
+
+class _PluginAuthDialogState extends State<_PluginAuthDialog> {
+  int _lastSeq = -1;
+  String _sessionId = '';
+  String _authRef = '';
+  String _site = '';
+  String _input = '';
+  String _status = '';
+  String _challenge = '';
+  String _challengeType = '';
+  String _message = '';
+  String _lastAction = '';
+  // 对话框打开即查询登录态，首帧显示 loading 而非按钮。
+  bool _busy = true;
+  // 当前在途请求是否来自后台自动轮询：轮询不得锁定输入框/操作按钮。
+  bool _autoPoll = false;
+  bool _cancelSent = false;
+  Timer? _pollTimer;
+  Timer? _siteStatusTimer;
+
+  /// 由用户主动动作（begin/poll 点击、logout、切换站点）触发、仍在等待引擎
+  /// 回包的状态；后台自动轮询不计入，避免每 2 秒把输入框/按钮锁一次。
+  bool get _controlsBusy => _busy && !_autoPoll;
+
+  @override
+  void initState() {
+    super.initState();
+    _lastSeq = widget.provider.authResultSeq;
+    widget.provider.addListener(_onProviderChanged);
+    WidgetsBinding.instance.addPostFrameCallback((_) => _refreshSavedAuth());
+  }
+
+  @override
+  void dispose() {
+    widget.provider.removeListener(_onProviderChanged);
+    _pollTimer?.cancel();
+    _siteStatusTimer?.cancel();
+    // Esc / 遮罩 / 关闭按钮都走这里：还有会话挂着就通知引擎释放，
+    // 避免插件侧的轮询状态一直挂到超时（显式「取消」按钮已在 _cancel 里发过，
+    // _cancelSent 去重，这里不会重复发送）。
+    _sendCancelIfPending();
+    super.dispose();
+  }
+
+  void _onProviderChanged() {
+    if (!mounted || widget.provider.authResultSeq == _lastSeq) return;
+    _lastSeq = widget.provider.authResultSeq;
+    final result = widget.provider.lastAuthResult;
+    if (result == null || result.identity != widget.plugin.identity) return;
+    // 会话已经切换（取消旧会话后立即发起新一轮）：丢弃旧会话的迟到响应，
+    // 避免多插件/多会话信号串扰。
+    if (_sessionId.isNotEmpty &&
+        result.sessionId.isNotEmpty &&
+        result.sessionId != _sessionId) {
+      return;
+    }
+    final wasLogout = _lastAction == 'logout';
+    setState(() {
+      _busy = false;
+      _autoPoll = false;
+      _status = result.status;
+      _message = result.message;
+      _cancelSent = false;
+      if (wasLogout) {
+        // 引擎侧无论 logout 成功与否都已删除档案：本地登录态一并清空，
+        // 否则 authRef 残留会让「注销」按钮继续显示，用户回不到登录态。
+        _authRef = '';
+        _sessionId = '';
+        _challenge = '';
+        _challengeType = '';
+      } else {
+        _sessionId = result.status == 'pending' ? result.sessionId : '';
+        _authRef = result.status == 'success' ? result.authRef : '';
+        // challenge/challengeType 在协议上是可选字段：pending 轮询回包省略
+        // 时保留上一帧，避免二维码在第一次 poll 后消失。
+        if (result.status == 'pending') {
+          if (result.challenge.isNotEmpty) _challenge = result.challenge;
+          if (result.challengeType.isNotEmpty) {
+            _challengeType = result.challengeType;
+          }
+        } else {
+          _challenge = result.challenge;
+          _challengeType = result.challengeType;
+        }
+      }
+    });
+    if (_status == 'pending' && _challengeType.toLowerCase() == 'qrcode') {
+      _startPolling();
+    } else {
+      _pollTimer?.cancel();
+    }
+  }
+
+  void _refreshSavedAuth() {
+    if (!mounted) return;
+    _lastAction = 'status';
+    setState(() => _busy = true);
+    widget.provider.authenticate(
+      identity: widget.plugin.identity,
+      action: 'status',
+      site: _site,
+    );
+  }
+
+  void _onSiteChanged(String value) {
+    _site = value;
+    if (_sessionId.isNotEmpty) {
+      _sendCancelIfPending();
+      _pollTimer?.cancel();
+      setState(() {
+        _sessionId = '';
+        _challenge = '';
+        _challengeType = '';
+        _status = '';
+      });
+    }
+    _siteStatusTimer?.cancel();
+    _siteStatusTimer = Timer(
+      const Duration(milliseconds: 350),
+      _refreshSavedAuth,
+    );
+  }
+
+  void _startPolling() {
+    _pollTimer?.cancel();
+    _pollTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (!mounted || _busy || _sessionId.isEmpty) return;
+      _submit(auto: true);
+    });
+  }
+
+  void _submit({bool auto = false}) {
+    if (_busy) return;
+    _lastAction = _sessionId.isEmpty ? 'begin' : 'poll';
+    setState(() {
+      _busy = true;
+      _autoPoll = auto;
+    });
+    widget.provider.authenticate(
+      identity: widget.plugin.identity,
+      action: _lastAction,
+      site: _site,
+      authRef: _authRef,
+      sessionId: _sessionId,
+      input: _input,
+    );
+  }
+
+  void _logout() {
+    if (_busy) return;
+    _lastAction = 'logout';
+    setState(() => _busy = true);
+    _pollTimer?.cancel();
+    widget.provider.authenticate(
+      identity: widget.plugin.identity,
+      action: 'logout',
+      site: _site,
+      authRef: _authRef,
+    );
+  }
+
+  /// 对当前 pending 会话发一次 cancel（不等待回包）；同一会话只发一次。
+  void _sendCancelIfPending() {
+    if (_sessionId.isEmpty || _cancelSent) return;
+    _cancelSent = true;
+    widget.provider.authenticate(
+      identity: widget.plugin.identity,
+      action: 'cancel',
+      site: _site,
+      authRef: _authRef,
+      sessionId: _sessionId,
+    );
+  }
+
+  void _cancel() {
+    _sendCancelIfPending();
+    Navigator.of(context).pop();
+  }
+
+  Widget _challengeWidget() {
+    if (_challenge.isEmpty) return const SizedBox.shrink();
+    if (_challenge.startsWith('data:image/')) {
+      final comma = _challenge.indexOf(',');
+      if (comma > 0) {
+        try {
+          final bytes = base64Decode(_challenge.substring(comma + 1));
+          return Image.memory(
+            bytes,
+            height: 220,
+            width: 220,
+            fit: BoxFit.contain,
+          );
+        } on FormatException catch (_) {
+          // Fall through to text representation.
+        }
+      }
+    }
+    if (_challengeType.toLowerCase() == 'qrcode') {
+      return QrImageView(
+        data: _challenge,
+        size: 240,
+        backgroundColor: const Color(0xffffffff),
+        padding: const EdgeInsets.all(10),
+      );
+    }
+    return Text(_challenge);
+  }
+
+  Color _statusColor(AppColors c) {
+    switch (_status) {
+      case 'success':
+        return AppColors.green;
+      case 'error':
+        return AppColors.red;
+      default:
+        return c.textSecondary;
+    }
+  }
+
+  String _statusLabel(S s) {
+    switch (_status) {
+      case 'pending':
+        return s.pluginAuthPending;
+      case 'success':
+        return s.pluginAuthSuccess;
+      case 'error':
+        return s.pluginAuthFailed(
+          _message.isNotEmpty ? _message : s.pluginAuthInvalidResponse,
+        );
+      case '':
+        return '';
+      default:
+        // 插件返回了 begin/poll/cancel/logout/status 之外的未知 status。
+        return s.pluginAuthInvalidResponse;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final s = currentS;
+    final c = AppColors.of(context);
+    final label = _statusLabel(s);
+    final supplement =
+        (_status == 'pending' || _status == 'success') && _message.isNotEmpty
+        ? _message
+        : '';
+    return ShadDialog(
+      title: Text(
+        _challengeType.toLowerCase() == 'qrcode'
+            ? s.pluginAuthQr
+            : s.pluginAuthDialogTitle(widget.plugin.name),
+      ),
+      description: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Text(s.pluginAuthDescription),
+            const SizedBox(height: 8),
+            ShadInput(
+              placeholder: Text(s.pluginAuthSitePlaceholder),
+              enabled: !_controlsBusy,
+              onChanged: _onSiteChanged,
+            ),
+            const SizedBox(height: 8),
+            ShadInput(
+              placeholder: Text(s.pluginAuthInputPlaceholder),
+              enabled: !_controlsBusy,
+              onChanged: (v) => _input = v,
+            ),
+            if (_busy && !_autoPoll && _challenge.isEmpty) ...[
+              const SizedBox(height: 10),
+              Text(
+                s.pluginCommonLoading,
+                style: TextStyle(color: c.textSecondary),
+              ),
+            ],
+            if (_challenge.isNotEmpty) ...[
+              const SizedBox(height: 10),
+              Container(
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: c.surface2,
+                  borderRadius: AppMetrics.of(context).brDialog,
+                ),
+                child: Column(children: [_challengeWidget()]),
+              ),
+            ],
+            if (label.isNotEmpty) ...[
+              const SizedBox(height: 8),
+              Text(label, style: TextStyle(color: _statusColor(c))),
+            ],
+            if (supplement.isNotEmpty) ...[
+              const SizedBox(height: 4),
+              Text(
+                supplement,
+                style: TextStyle(color: c.textSecondary, fontSize: 11),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        if (_authRef.isEmpty)
+          ShadButton(
+            onPressed: _controlsBusy ? null : _submit,
+            child: Text(
+              _sessionId.isEmpty ? s.pluginAuthBegin : s.pluginAuthPoll,
+            ),
+          ),
+        if (_sessionId.isNotEmpty)
+          ShadButton.outline(
+            onPressed: _controlsBusy ? null : _cancel,
+            child: Text(s.cancel),
+          ),
+        if (_authRef.isNotEmpty && _status == 'success')
+          ShadButton.outline(
+            onPressed: _controlsBusy ? null : _logout,
+            child: Text(s.pluginAuthLogout),
+          ),
+      ],
     );
   }
 }

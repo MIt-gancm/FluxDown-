@@ -47,6 +47,8 @@ const TAB_KEYS: I18nKey[] = ['rss.tabBasic', 'rss.tabFilter', 'rss.tabAdvanced']
  *  启用/自动下载/携带 Referer/通知均开，智能去重默认关。 */
 const NEW_SOURCE: RssSourceDto = {
   sourceId: '',
+  providerId: 'rss',
+  providerConfig: '',
   url: '',
   name: '',
   enabled: true,
@@ -78,6 +80,8 @@ const NEW_SOURCE: RssSourceDto = {
 
 /** 表单态：体积与条数用文本框承载（`200M` / `2G` 字面量经 parseSize 往返）。 */
 interface RssForm {
+  providerId: string
+  providerConfig: string
   name: string
   url: string
   enabled: boolean
@@ -102,6 +106,8 @@ interface RssForm {
 
 function formOf(s: RssSourceDto): RssForm {
   return {
+    providerId: s.providerId || 'rss',
+    providerConfig: s.providerConfig,
     name: s.name,
     url: s.url,
     enabled: s.enabled,
@@ -169,6 +175,7 @@ function RssDialogContent({
   const [urlError, setUrlError] = useState('')
   const [validated, setValidated] = useState<{ feedTitle: string; items: RssItemDto[]; error: string } | null>(null)
   const { data: queues = [] } = useQuery({ queryKey: ['queues'], queryFn: api.listQueues })
+  const { data: plugins = [] } = useQuery({ queryKey: ['plugins'], queryFn: api.listPlugins })
   // 条目流只在对话框打开时才拉：本组件为每条订阅常驻挂载（Portal 才是按需的），
   // 否则侧边栏有几条订阅就会在首屏打出几个 items 请求。
   const { data: cachedItems = [] } = useRssItemsQuery(open ? (source?.sourceId ?? '') : '')
@@ -184,9 +191,29 @@ function RssDialogContent({
 
   const patch = (p: Partial<RssForm>) => setForm((f) => ({ ...f, ...p }))
 
+  const providerOptions = (() => {
+    const seen = new Set<string>(['rss'])
+    const options = [{ value: 'rss', label: t('rss.providerRss') }]
+    for (const plugin of plugins) {
+      if (!plugin.enabled || plugin.loadStatus === 'Failed') continue
+      for (const providerId of plugin.subscriptionProviderIds ?? []) {
+        if (seen.has(providerId)) continue
+        seen.add(providerId)
+        options.push({ value: providerId, label: `${plugin.name} · ${providerId}` })
+      }
+    }
+    // 老版本服务端可能尚未返回插件目录，但既有订阅仍需能编辑保存。
+    if (form.providerId && !seen.has(form.providerId)) {
+      options.push({ value: form.providerId, label: form.providerId })
+    }
+    return options
+  })()
+
   function buildDto(): RssSourceDto {
     return {
       ...(source ?? NEW_SOURCE),
+      providerId: form.providerId,
+      providerConfig: form.providerConfig,
       name: form.name.trim(),
       url: form.url.trim(),
       enabled: form.enabled,
@@ -232,6 +259,7 @@ function RssDialogContent({
 
   /** 验证是一次纯诊断调用：抓取失败也是 200，错误进 error 字段照常展示。 */
   async function runValidate() {
+    if (form.providerId !== 'rss') return
     const url = form.url.trim()
     if (!url) {
       setUrlError(t('rss.urlRequired'))
@@ -278,6 +306,7 @@ function RssDialogContent({
             <Dialog.Title asChild>
               <b className="flex items-center gap-2">
                 {source ? sourceDisplayName(source) : t('rss.newSource')}
+                {source && <span className="run-badge">{source.providerId === 'rss' ? t('rss.providerRss') : source.providerId}</span>}
                 {source && (
                   <span className={cn('run-badge', source.enabled && !source.lastError && 'on')}>
                     <i className={cn('queue-dot', source.enabled && !source.lastError && 'on')} />
@@ -304,6 +333,17 @@ function RssDialogContent({
 
             {tab === 0 && (
               <>
+                <label className="field-label">{t('rss.providerLabel')}</label>
+                <SelectField
+                  value={form.providerId}
+                  onChange={(v) => {
+                    patch({ providerId: v, providerConfig: v === 'rss' ? '' : form.providerConfig })
+                    setValidated(null)
+                  }}
+                  options={providerOptions}
+                  ariaLabel={t('rss.providerLabel')}
+                />
+                {form.providerId !== 'rss' && <p className="field-hint">{t('rss.providerPluginHint')}</p>}
                 <label className="field-label" htmlFor="rss-url">{t('rss.urlLabel')}</label>
                 <div className="dir-row">
                   <input
@@ -314,10 +354,12 @@ function RssDialogContent({
                     placeholder={t('rss.urlHint')}
                     onChange={(e) => { patch({ url: e.target.value }); setUrlError(''); setValidated(null) }}
                   />
-                  <button type="button" className="btn ghost" disabled={validate.isPending} onClick={() => void runValidate()}>
-                    {validate.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
-                    {t('rss.validate')}
-                  </button>
+                  {form.providerId === 'rss' && (
+                    <button type="button" className="btn ghost" disabled={validate.isPending} onClick={() => void runValidate()}>
+                      {validate.isPending ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
+                      {t('rss.validate')}
+                    </button>
+                  )}
                 </div>
                 {urlError && <p className="sched-summary warn"><CircleAlert size={13} /><span>{urlError}</span></p>}
                 {validated && (

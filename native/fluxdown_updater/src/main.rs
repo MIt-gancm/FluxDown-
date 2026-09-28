@@ -588,7 +588,6 @@ fn wait_for_pid(pid: u32) {
         while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
             thread::sleep(Duration::from_millis(250));
         }
-        return;
     }
 
     // Fallback for other Unix-like systems.
@@ -920,7 +919,7 @@ fn do_macos_app(tarball: &Path, app_bundle: &str, install_dir: &Path) -> Result<
             .map_err(UpdaterError::Io)?;
         log_msg(&format!("reopened: {}", dest_app.display())).ok();
 
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]

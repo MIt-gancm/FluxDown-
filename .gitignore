@@ -47,7 +47,8 @@ app.*.map.json
 /android/app/release
 
 # Rust related
-/.cargo/
+/.cargo/*
+!/.cargo/config.toml
 /target/
 
 # Generated signals
@@ -123,5 +124,7 @@ assets/screenshot/
 
 # Git worktrees
 .worktrees/
-website-v2/
 .tmp*
+
+# Promo video production workspace (local only)
+/promo-video/

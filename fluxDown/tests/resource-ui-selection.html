@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FluxDown resource-ui selection fixture</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    pre, input, textarea { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; }
+    pre { background: #f4f4f5; padding: 1rem; white-space: pre-wrap; }
+    label { display: block; margin: 1rem 0 0.25rem; font-weight: 600; }
+    input, textarea { width: 100%; box-sizing: border-box; padding: 0.4rem 0.5rem; }
+    textarea { min-height: 6rem; }
+  </style>
+</head>
+<body>
+<!--
+  Resource-UI copy/selection regression fixture (issue #305).
+
+  This page is a dependency-free browser fixture. It does NOT recreate the
+  FluxDown overlay. Exercise it with the real unpacked extension so the
+  content script, shadow root, and stylesheet under test are the ones that
+  ship.
+
+  Setup
+  -----
+  1. From fluxDown/: `bun run build` (Chromium/Edge) and `bun run build:firefox`.
+  2. Load the unpacked build:
+       Chromium/Edge → fluxDown/.output/chrome-mv3
+       Firefox       → fluxDown/.output/firefox-mv3
+  3. Confirm resource sniffing is enabled in the popup/settings, then serve
+     this file over localhost (extension content scripts skip file://):
+       python3 -m http.server 8765 --directory fluxDown/tests
+     Open http://127.0.0.1:8765/resource-ui-selection.html
+  4. Confirm the content script is running: the FluxDown floating dot should
+     appear. A missing UI is not a passing result — fix the
+     `createShadowRootUi` import first.
+
+  Expected page text (document Ctrl/Cmd+A then Ctrl/Cmd+C)
+  --------------------------------------------------------
+  Paste into an external plain-text editor. Copied text must match this
+  fixture (whitespace may include extra newlines from the browser) and must
+  NOT contain FluxDown labels, tab captions, resource filenames, badge
+  counts, quality text, or preview text — in English or Chinese.
+
+  Deterministic body strings used below:
+    192.0.2.1
+    192.0.2.2
+    198.51.100.10
+    203.0.113.50
+    FIXTURE_PAGE_SENTINEL
+    FIXTURE_INPUT_VALUE
+    FIXTURE_TEXTAREA_LINE_1
+    FIXTURE_TEXTAREA_LINE_2
+
+  Fail if the clipboard contains any of:
+    全选 / Select All
+    批量下载 / Download  (panel batch button)
+    FluxDown
+    panel tab captions (All / Video / …)
+    sniffable filenames (sample.mp4, sample.jpg, fixture-audio.mp3)
+    badge counts, quality-picker text, preview-modal text
+
+  Cases
+  -----
+  A. Baseline, sniffing ON, UI mounted, overlays closed:
+     Focus the document (not an input). Native select-all + copy. Compare
+     against a sniffing-disabled baseline: no extension chrome in the paste.
+  B. Repeat after opening and closing the resource panel, with populated
+     resources (links/media below), with the floating dot hidden, immediately
+     after closing an overlay, and after its transition would have ended.
+  C. Panel visible, document content focused: select-all + copy still must
+     exclude overlay text (isolation is not limited to closed UI).
+  D. Quality picker and preview modal in their existing resource flows:
+     open states remain visible and clickable; closed states contribute no
+     selected text and leave no invisible keyboard-focusable controls.
+     Immediate `visibility: hidden` on close may skip the close fade; that
+     tradeoff is accepted so overlay text cannot leak during opacity decay.
+  E. Focus the input, then the textarea: native select-all + copy must keep
+     the entire field value. Partial selection of the IP list / sentinel
+     paragraph on the page must still work; this stylesheet is shadow-scoped.
+  F. Toggle resource sniffing off and back on without reloading; repeat A.
+     Switch the extension between English and Chinese; labels must stay out
+     of the clipboard in both languages. Dot dragging, select-all checkbox,
+     batch button, and preview-close must still work.
+  G. Repeat A–E in Firefox with the Firefox build.
+
+  Do not intercept copy events or rewrite the clipboard from this fixture.
+-->
+  <h1>Resource UI selection fixture</h1>
+  <p>Plain-text IP list (issue #305 reproduction shape):</p>
+  <pre id="ip-list">192.0.2.1
+192.0.2.2
+198.51.100.10
+203.0.113.50</pre>
+  <p id="page-sentinel">FIXTURE_PAGE_SENTINEL</p>
+
+  <label for="fixture-input">Text input</label>
+  <input id="fixture-input" type="text" value="FIXTURE_INPUT_VALUE" autocomplete="off" spellcheck="false">
+
+  <label for="fixture-textarea">Textarea</label>
+  <textarea id="fixture-textarea" spellcheck="false">FIXTURE_TEXTAREA_LINE_1
+FIXTURE_TEXTAREA_LINE_2</textarea>
+
+  <h2>Sniffable resources (populate the real overlay, do not copy their labels)</h2>
+  <p>
+    <a href="https://example.com/sample.mp4">sample.mp4</a>
+    ·
+    <a href="https://example.com/sample.jpg">sample.jpg</a>
+    ·
+    <a href="https://example.com/fixture-audio.mp3">fixture-audio.mp3</a>
+  </p>
+  <video id="fixture-video" width="320" height="180" controls
+         src="https://example.com/sample.mp4"
+         poster="https://example.com/sample.jpg">
+  </video>
+  <audio id="fixture-audio" controls src="https://example.com/fixture-audio.mp3"></audio>
+</body>
+</html>

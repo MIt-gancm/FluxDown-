@@ -1,0 +1,105 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import LegalDoc from "@/components/info/LegalDoc.astro";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { legal } from "@/i18n/messages/legal";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = legal[lang];
+const doc = t.signing;
+---
+
+<Layout lang={lang} title={doc.meta.title} description={doc.meta.description}>
+  <LegalDoc
+    eyebrow={doc.eyebrow}
+    title={doc.title}
+    updatedLabel={t.updated}
+    updated={doc.updated}
+    indexLabel={t.index}
+    intro={doc.intro}
+    sections={doc.sections}
+    links={{ gatekeeper: href("/macos-gatekeeper", lang), privacy: href("/privacy", lang) }}
+  >
+    <figure class="fig pipeline" aria-label={doc.pipeline.caption}>
+      <div class="fig-bar"><span>fig. 01</span><span>{doc.pipeline.caption}</span></div>
+      <ol class="pipe">
+        {
+          doc.pipeline.steps.map((s, i) => (
+            <li class="pipe-step" data-reveal style={`--d:${i}`}>
+              <span class="pipe-k mono">
+                <span class="num">{String(i + 1).padStart(2, "0")}</span> {s.k}
+              </span>
+              <span class="pipe-v">{s.v}</span>
+            </li>
+          ))
+        }
+      </ol>
+    </figure>
+  </LegalDoc>
+</Layout>
+
+<style>
+  .pipeline {
+    margin-top: 2em;
+    border-radius: var(--radius);
+    overflow: hidden;
+  }
+  .pipe {
+    display: grid;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    gap: 1px;
+    background: var(--line);
+    padding: 0;
+    margin: 0;
+    list-style: none;
+  }
+  .pipe-step {
+    position: relative;
+    display: grid;
+    gap: 6px;
+    margin: 0;
+    padding: 16px 16px 18px;
+    background: var(--bg-elev);
+  }
+  /* 流向箭头:落在相邻单元格之间的 1px 分隔线上。 */
+  .pipe-step:not(:last-child)::after {
+    content: "";
+    position: absolute;
+    z-index: 1;
+    top: 50%;
+    right: -4px;
+    width: 7px;
+    height: 7px;
+    border-top: 1px solid var(--line-strong);
+    border-right: 1px solid var(--line-strong);
+    background: var(--bg-elev);
+    transform: translateY(-50%) rotate(45deg);
+  }
+  .pipe-k {
+    font-size: 10.5px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+  }
+  .pipe-k .num {
+    color: var(--accent-ink);
+  }
+  .pipe-v {
+    font-size: 13.5px;
+    line-height: 1.35;
+    color: var(--fg);
+  }
+  @media (max-width: 640px) {
+    .pipe {
+      grid-template-columns: 1fr;
+    }
+    .pipe-step:not(:last-child)::after {
+      top: auto;
+      bottom: -4px;
+      right: auto;
+      left: 20px;
+      transform: rotate(135deg);
+    }
+  }
+</style>

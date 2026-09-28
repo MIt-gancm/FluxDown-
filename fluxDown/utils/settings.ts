@@ -31,6 +31,12 @@ export interface FluxDownSettings {
   interceptMimeTypes: string[];
   /** 用户自定义追加的可拦截扩展名（含点，小写，如 ".epub"；与内置列表合并生效） */
   customExtensions: string[];
+  /**
+   * 排除的文件扩展名列表（含点，小写，如 ".torrent"/".crx"）。命中即不
+   * 拦截，即便同时命中 customExtensions/BUILTIN_EXTENSIONS 或 smart 模式
+   * 的 MIME/大小正向规则——优先级高于所有正向匹配（#177）。
+   */
+  excludeExtensions: string[];
   /** 排除的域名列表 */
   excludeDomains: string[];
   /**
@@ -202,6 +208,7 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
     "application/x-bittorrent",
   ],
   customExtensions: [],
+  excludeExtensions: [],
   excludeDomains: [],
   interceptMagnet: true,
 
@@ -279,6 +286,12 @@ export interface DownloadItemInfo {
   fileSize?: number;
   mime?: string;
   filename?: string;
+  /**
+   * 下载请求的来源页面 URL（对应 downloads.DownloadItem.referrer / webRequest 的
+   * originUrl/documentUrl）。用于识别由 FluxDown 自身远程 Web UI 发起的下载，
+   * 避免拦截后再次投递回同一远端形成死循环（#658）。
+   */
+  referrerUrl?: string;
 }
 
 /**
@@ -290,7 +303,16 @@ export function shouldIntercept(
 ): boolean {
   if (!settings.enabled) return false;
 
-  const { url, fileSize, mime, filename } = item;
+  const { url, fileSize, mime, filename, referrerUrl } = item;
+
+  // #658：FluxDown 远程 Web UI（settings.remoteUrl 指向的 fluxdown_server）上发起
+  // 的"下载已完成文件到本地"请求，不应被扩展再次拦截并回投同一远端，
+  // 否则会形成持续创建任务的死循环。命中依据：下载来源页（referrer）或下载
+  // URL 本身的 origin 与已配置的远程服务地址一致；或下载 URL 的路径就是
+  // fluxdown_server 的文件导出端点（覆盖经反代/不同主机名访问 Web UI 的情况）。
+  if (isFluxDownServerDownload(url, referrerUrl, settings.remoteUrl)) {
+    return false;
+  }
 
   // 检查域名排除
   try {
@@ -300,6 +322,15 @@ export function shouldIntercept(
     }
   } catch {
     // URL 解析失败，不拦截
+    return false;
+  }
+
+  // 检查排除扩展名（#177）：优先级高于 customExtensions/BUILTIN_EXTENSIONS
+  // 及 smart 模式下的 MIME/大小正向匹配——命中即不拦截。
+  if (
+    settings.excludeExtensions.length > 0 &&
+    matchByExtension(url, filename, settings.excludeExtensions)
+  ) {
     return false;
   }
 
@@ -356,6 +387,47 @@ export function shouldIntercept(
   //    同类产品（IDM/FDM）在此场景下也会拦截。
   //    如果用户不想拦截特定站点，可通过排除域名列表处理。
   return true;
+}
+
+/** fluxdown_server 自身的文件导出端点（web/src/lib/api.ts `taskFileUrl` / `logsExportUrl`）。 */
+const FLUXDOWN_EXPORT_PATH_RE = /^\/api\/v1\/(tasks\/[^/]+\/file|logs\/export)$/;
+
+/**
+ * 判断一次浏览器下载是否由 FluxDown 自身的远程 Web UI 发起（#658）。
+ * 命中任一条件即为真：
+ * - 下载 URL 路径是 fluxdown_server 的文件导出端点；
+ * - 已配置 remoteUrl，且 referrer 或下载 URL 的 origin 与其一致。
+ */
+export function isFluxDownServerDownload(
+  url: string,
+  referrerUrl: string | undefined,
+  remoteUrl: string,
+): boolean {
+  let parsedUrl: URL | null = null;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    parsedUrl = null;
+  }
+  if (parsedUrl && FLUXDOWN_EXPORT_PATH_RE.test(parsedUrl.pathname)) {
+    return true;
+  }
+  if (!remoteUrl) return false;
+  let fluxDownOrigin: string;
+  try {
+    fluxDownOrigin = new URL(remoteUrl).origin;
+  } catch {
+    return false;
+  }
+  if (parsedUrl && parsedUrl.origin === fluxDownOrigin) return true;
+  if (referrerUrl) {
+    try {
+      if (new URL(referrerUrl).origin === fluxDownOrigin) return true;
+    } catch {
+      // referrer 解析失败：忽略
+    }
+  }
+  return false;
 }
 
 /**

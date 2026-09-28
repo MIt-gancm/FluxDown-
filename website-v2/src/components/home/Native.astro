@@ -1,0 +1,301 @@
+---
+/**
+ * 03 · 原生:三进程架构的等距爆炸图。滚动推进 --p(0→1)让四层平面逐层分离,
+ * 右侧列表同步高亮当前层。大屏为 sticky 滚动叙事,小屏直接展示展开态。
+ */
+import { AppWindow, Cpu, RadioTower, Server } from "lucide-react";
+import { home } from "../../i18n/messages/home";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].native;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+const icons = [AppWindow, RadioTower, Server, Cpu];
+// 自上而下:界面在最上层,引擎在最底层
+const layers = t.layers.map((layer, i) => ({ ...layer, Icon: icons[i] ?? Cpu, depth: t.layers.length - 1 - i }));
+const facts = [
+  { k: t.noWebview, v: t.noWebviewDesc },
+  { k: t.resident, v: t.residentDesc },
+  { k: t.persistent, v: t.persistentDesc },
+];
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section pb-0">
+    <div class="grid gap-6 lg:grid-cols-2 lg:items-end grid-cols-1">
+      <div class="flex flex-col gap-6">
+        <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+        <h2 class="h2" data-reveal set:html={title} />
+      </div>
+      <p class="lede lg:max-w-[48ch] lg:justify-self-end" data-reveal style="--d:1">{t.lede}</p>
+    </div>
+  </div>
+
+  <div class="arch" data-arch>
+    <div class="arch-sticky">
+      <div class="arch-stage" aria-hidden="true">
+        <div class="arch-stack">
+          {
+            layers.map((layer) => (
+              <div class="arch-plane" style={`--i:${layer.depth}`} data-plane={layer.depth}>
+                <div class="arch-plane-face">
+                  <span class="arch-plane-id mono">{layer.id}</span>
+                  <span class="arch-plane-deco" data-kind={layer.depth} />
+                </div>
+              </div>
+            ))
+          }
+        </div>
+      </div>
+
+      <figure class="arch-list">
+        <figcaption class="fig-bar">
+          <span>fig. 03</span>
+          <span>{t.figure}</span>
+        </figcaption>
+        <ol>
+          {
+            layers.map((layer) => (
+              <li class="arch-item" data-layer={layer.depth}>
+                <span class="arch-item-icon">
+                  <layer.Icon size={16} strokeWidth={1.75} />
+                </span>
+                <div class="min-w-0">
+                  <div class="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+                    <span class="mono text-[13px] text-fg">{layer.id}</span>
+                    <span class="mono text-[10.5px] uppercase tracking-[0.12em] text-subtle">{layer.role}</span>
+                  </div>
+                  <p class="mt-1 text-[13.5px] leading-relaxed text-muted">{layer.desc}</p>
+                </div>
+              </li>
+            ))
+          }
+        </ol>
+      </figure>
+    </div>
+  </div>
+
+  <div class="cells border-t border-line md:grid-cols-3 grid-cols-1">
+    {
+      facts.map((fact, i) => (
+        <div class="cell spot spot-edge flex flex-col gap-2" data-reveal style={`--d:${i}`}>
+          <h3 class="text-[16px] font-medium text-fg">{fact.k}</h3>
+          <p class="text-[14px] leading-relaxed text-muted">{fact.v}</p>
+        </div>
+      ))
+    }
+  </div>
+</section>
+
+<script>
+  const arch = document.querySelector<HTMLElement>("[data-arch]");
+  if (arch) {
+    const items = [...arch.querySelectorAll<HTMLElement>("[data-layer]")];
+    const planes = [...arch.querySelectorAll<HTMLElement>("[data-plane]")];
+    const layerCount = items.length;
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const wide = window.matchMedia("(min-width: 1024px)");
+    let raf = 0;
+    const update = () => {
+      raf = 0;
+      let p = 1;
+      if (wide.matches && !reduced) {
+        const rect = arch.getBoundingClientRect();
+        const travel = rect.height - window.innerHeight;
+        p = travel > 0 ? Math.min(1, Math.max(0, -rect.top / travel)) : 1;
+      }
+      arch.style.setProperty("--p", p.toFixed(4));
+      // 列表自上而下(界面 → 引擎)依次点亮
+      const active = Math.min(layerCount - 1, Math.floor(p * layerCount));
+      const activeDepth = layerCount - 1 - active;
+      items.forEach((el) => el.toggleAttribute("data-active", Number(el.dataset.layer) === activeDepth));
+      planes.forEach((el) => el.toggleAttribute("data-active", Number(el.dataset.plane) === activeDepth));
+    };
+    const schedule = () => {
+      if (!raf) raf = requestAnimationFrame(update);
+    };
+    update();
+    window.addEventListener("scroll", schedule, { passive: true });
+    window.addEventListener("resize", schedule);
+    wide.addEventListener("change", schedule);
+  }
+</script>
+
+<style is:global>
+  @layer components {
+    .arch {
+      --p: 1;
+      position: relative;
+    }
+    .arch-sticky {
+      display: grid;
+      gap: 40px;
+      padding: 40px clamp(20px, 4vw, 56px) 64px;
+    }
+    @media (min-width: 1024px) {
+      .arch {
+        height: 180vh;
+      }
+      .arch-sticky {
+        position: sticky;
+        top: var(--header-h);
+        height: calc(100vh - var(--header-h));
+        grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);
+        align-items: center;
+        padding-block: 24px;
+      }
+    }
+    .arch-stage {
+      display: grid;
+      place-items: center;
+      min-height: 420px;
+      perspective: 2400px;
+    }
+    @media (max-width: 640px) {
+      .arch-stage {
+        min-height: 360px;
+        margin-block: 110px 40px;
+        zoom: 0.72;
+      }
+    }
+    .arch-stack {
+      position: relative;
+      width: 260px;
+      height: 260px;
+      transform-style: preserve-3d;
+      transform: rotateX(58deg) rotateZ(-42deg) translateZ(-60px);
+    }
+    .arch-plane {
+      position: absolute;
+      inset: 0;
+      transform-style: preserve-3d;
+      transform: translateZ(calc(var(--i) * (18px + var(--p) * 74px)));
+      transition: transform 120ms linear;
+    }
+    .arch-plane-face {
+      position: absolute;
+      inset: 0;
+      border-radius: 14px;
+      border: 1px solid var(--line-strong);
+      background:
+        linear-gradient(var(--line) 1px, transparent 1px) 0 0 / 20px 20px,
+        linear-gradient(90deg, var(--line) 1px, transparent 1px) 0 0 / 20px 20px,
+        color-mix(in oklch, var(--bg-elev) 92%, transparent);
+      box-shadow: 0 30px 60px -30px oklch(0 0 0 / 0.35);
+      transition:
+        border-color 300ms,
+        background-color 300ms,
+        box-shadow 300ms;
+    }
+    .arch-plane[data-active] .arch-plane-face {
+      border-color: var(--accent);
+      background:
+        linear-gradient(var(--accent-soft) 1px, transparent 1px) 0 0 / 20px 20px,
+        linear-gradient(90deg, var(--accent-soft) 1px, transparent 1px) 0 0 / 20px 20px,
+        color-mix(in srgb, var(--bg-elev) 92%, var(--accent));
+      box-shadow:
+        0 0 0 4px var(--accent-soft),
+        0 30px 60px -30px color-mix(in oklch, var(--accent) 60%, transparent);
+    }
+    .arch-plane-id {
+      position: absolute;
+      left: 16px;
+      bottom: 14px;
+      font-size: 13px;
+      color: var(--fg-muted);
+    }
+    .arch-plane[data-active] .arch-plane-id {
+      color: var(--accent-ink);
+    }
+    .arch-plane-deco {
+      position: absolute;
+      inset: 24px 24px 44px;
+      border-radius: 8px;
+    }
+    /* 界面:窗口线框 */
+    .arch-plane-deco[data-kind="3"] {
+      border: 1px solid var(--line-strong);
+      background:
+        linear-gradient(var(--line-strong), var(--line-strong)) 0 22px / 100% 1px no-repeat,
+        linear-gradient(var(--line-strong), var(--line-strong)) 46px 22px / 1px 100% no-repeat,
+        repeating-linear-gradient(var(--bg-elev) 0 18px, var(--line) 18px 19px) 58px 36px / calc(100% - 70px) 90px no-repeat;
+    }
+    /* 网关:同心信号环 */
+    .arch-plane-deco[data-kind="2"] {
+      background: repeating-radial-gradient(circle at 50% 50%, transparent 0 14px, var(--line-strong) 14px 15px);
+      mask-image: radial-gradient(circle, #000 60%, transparent 72%);
+    }
+    /* 守护进程:队列行 */
+    .arch-plane-deco[data-kind="1"] {
+      background: repeating-linear-gradient(var(--line-strong) 0 1px, transparent 1px 22px);
+    }
+    /* 引擎:芯片网格 */
+    .arch-plane-deco[data-kind="0"] {
+      inset: 50px 50px 70px;
+      border: 1px solid var(--line-strong);
+      background:
+        repeating-linear-gradient(90deg, var(--line-strong) 0 1px, transparent 1px 16px),
+        repeating-linear-gradient(var(--line-strong) 0 1px, transparent 1px 16px);
+      box-shadow:
+        0 0 0 12px color-mix(in oklch, var(--bg-elev) 80%, transparent),
+        0 0 0 13px var(--line-strong);
+    }
+    .arch-list {
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--bg-elev);
+    }
+    .arch-list ol {
+      display: flex;
+      flex-direction: column;
+    }
+    .arch-item {
+      position: relative;
+      display: flex;
+      gap: 14px;
+      padding: 18px 20px;
+      border-top: 1px solid var(--line);
+      transition: background-color 300ms;
+    }
+    .arch-item:first-child {
+      border-top: 0;
+    }
+    .arch-item::before {
+      content: "";
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 2px;
+      background: var(--accent);
+      transform: scaleY(0);
+      transition: transform 300ms var(--ease-out);
+    }
+    .arch-item[data-active] {
+      background: var(--bg-sunken);
+    }
+    .arch-item[data-active]::before {
+      transform: none;
+    }
+    .arch-item-icon {
+      display: grid;
+      flex: none;
+      place-items: center;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
+      color: var(--fg-muted);
+      background: var(--bg-sunken);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      transition: color 300ms;
+    }
+    .arch-item[data-active] .arch-item-icon {
+      color: var(--accent-ink);
+    }
+  }
+</style>

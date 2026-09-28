@@ -1,29 +1,39 @@
-//! `ProxyMode::Auto` 路由决策的跨重启先验——host 级采样结论持久化。
+//! `ProxyMode::Auto` 多路径调度的跨重启先验——host × 路径的时间折扣速率估计。
 //!
-//! 完全照搬 `cdn::health` 范式（进程级内存缓存 + config 表 JSON + 24h TTL +
-//! 版本标记整体丢弃重学），另加一个**网络指纹 epoch**：路由观察只在同一
-//! 网络环境下可信，加载/记录时指纹不符即整表丢弃重学（RFC 8305 §4
-//! 「历史数据 MUST NOT 跨接口使用、换网 SHOULD flush」；Chromium 以
-//! `last_local_address_when_quic_worked` 做同构判定）。指纹只存哈希，
-//! 不落原始 IP/代理地址。
+//! Auto 模式把直连、手动代理、系统代理视为同一 NodePool 内的并列路径，
+//! 由真实分段流量实测各路径速率并据此分配连接。本模块只负责**跨任务 /
+//! 跨重启的记忆**：每个 host 的每条路径维护一个时间折扣的单连接稳态速率
+//! 估计，任务开始时用来为池内各路径**播种初始估计**；一旦本任务产生实测
+//! 流量，实测值永远覆盖先验——先验只决定「从哪里开始试」，不决定结论。
 //!
-//! # 与内存 [`crate::auto_proxy::DecisionCache`] 的分工（风险不对称，刻意不同）
+//! # 估计器：几何均值 + 指数时间折扣
 //!
-//! - **Cooldown / NoSwitch 持久化**：过期或误存的代价 = 多等一个冷却窗或
-//!   多做一次 256KB 采样，无害。Cooldown 采用指数退避窗口
-//!   （300s × 2^n，封顶 24h——Chromium broken-alt-svc 同公式：
-//!   `initial_delay * (1 << broken_count)`，上限 2 天；aria2 Adaptive
-//!   选择器的 `2^counter` 天重测同理）：反复证明无优势的 host 越来越少
-//!   被采样，跨重启依然成立。
-//! - **Proxy 胜绩按确认天数分档**：单日一次性胜绩只作加速信号（任务仍
-//!   直连起飞保留多 CDN 聚合资格，仅把采样等待期从 `MIN_RUNTIME` 缩短为
-//!   `FAST_REEVAL_MIN_RUNTIME`）；在 ≥2 个「不同天」被确认的 host（境外
-//!   直连长期受限的典型）直接以代理起飞（AdoptProxy），有效期随确认
-//!   天数阶梯延长（24h×2^(n-1) 封顶 7 天）。误判/代理失效由**反向
-//!   failover** 自愈：代理起飞的任务连接类失败即作废先验回直连
-//!   （[`clear_proxy_prior`]），杜绝锁死。走代理路由的任务完成时确认
-//!   计分 + 续期（被动观测，零探测成本，参照 aria2 ServerStat 由真实
-//!   传输回写的模式）。
+//! 每条路径存 `(log_mean, weight, ts)`：`log_mean` 为 ln(B/s) 的加权均值
+//! （吞吐量近似对数正态、跨数量级，几何均值对单次异常快/慢样本更稳健），
+//! `weight` 为有效样本数。读取/记录时先按经过时间衰减：
+//! `w_now = weight × 0.5^(Δt / 12h)`；记录新观察
+//! `log_mean ← (w_now·log_mean + ln x) / (w_now + 1)`，`weight ← min(w_now + 1, 8)`。
+//!
+//! 为什么是折扣而不是 TTL 阶梯：网络路由环境是非平稳的（线路拥塞、代理
+//! 节点轮换、跨境链路时好时坏），非平稳多臂老虎机文献的标准做法是对历史
+//! 观察做指数折扣，让旧证据平滑失去话语权（如 Discounted Thompson
+//! Sampling，arXiv:2305.10718）。一个半衰期参数取代了原先冷却指数退避、
+//! 代理胜绩确认天数、AdoptProxy、72h 重验等手调阶梯：近期被反复证实的
+//! 路径权重高、先验可信；长期未观察的路径权重自然衰减到不足
+//! [`MIN_PRIOR_WEIGHT`] 即不再提供先验，调度器回到无先验的均匀探索。
+//! 权重封顶 [`MAX_WEIGHT`] 保证再「老牌」的结论也能被数次新观察扭转。
+//!
+//! # 网络指纹 epoch
+//!
+//! 路由观察只在同一网络环境下可信，加载/记录时指纹不符即整表丢弃重学
+//! （RFC 8305 §4「历史数据 MUST NOT 跨接口使用、换网 SHOULD flush」；
+//! Chromium 以 `last_local_address_when_quic_worked` 做同构判定）。指纹只存
+//! 哈希，不落原始 IP/代理地址。
+//!
+//! # NoSwitch（完整性防线）
+//!
+//! validator 不一致（代理命中不同 CDN edge）是正确性问题而非性能问题，
+//! 不进估计器：单独记录 24h，期间 forward failover 禁止把该 host 推上代理。
 //!
 //! 学习数据是可再生的性能缓存——版本不匹配 / 指纹不符 / 过期 / 解析失败
 //! 一律丢弃重学，绝不影响下载正确性。
@@ -36,6 +46,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::auto_proxy::{CandidateSource, RoutePath};
 use crate::db::Db;
 use crate::logger::log_info;
 
@@ -43,79 +54,98 @@ use crate::logger::log_info;
 const ROUTE_CONFIG_KEY: &str = "auto_route_health";
 
 /// 持久化格式版本。语义规则变化时递增——旧版本数据加载时整体丢弃重学。
-const ROUTE_FORMAT_VERSION: u32 = 1;
+/// v2：TTL 阶梯（冷却/胜绩/AdoptProxy）→ 每路径时间折扣速率估计。
+const ROUTE_FORMAT_VERSION: u32 = 2;
 
-/// 观察 TTL：与 `cdn_node_health`/`domain_conn_caps` 一致的 24h（aria2
-/// `--server-stat-timeout` 默认同为 86400s）。网络路由环境天级漂移，
-/// 更长的保留期无先例支撑。
-const ROUTE_TTL: Duration = Duration::from_secs(24 * 3600);
+/// NoSwitch 记录的有效期：与 `cdn_node_health`/`domain_conn_caps` 一致的
+/// 24h（aria2 `--server-stat-timeout` 默认同为 86400s）。
+const NO_SWITCH_TTL: Duration = Duration::from_secs(24 * 3600);
 
 /// 容量上限（prune-on-save）：超限按最新观察时间淘汰最旧 host。
 const MAX_HOSTS: usize = 512;
 
-/// Cooldown 指数退避基数（与内存态 `COOLDOWN_TTL` 同源：300s）。
-const COOLDOWN_BASE_SECS: u64 = 300;
-
-/// 退避指数封顶：300s × 2^8 = 21.3h，再翻倍即超 TTL 无意义。
-const COOLDOWN_MAX_SHIFT: u32 = 8;
-
 /// 网络指纹缓存时长——指纹计算含注册表/路由表查询，不必每次记录都做。
 const FINGERPRINT_CACHE: Duration = Duration::from_secs(60);
 
-/// 代理胜绩确认计分的「不同天」判定间隔：距上次确认超过 12h 才算新一天
-/// 的独立证据（防同日批量任务刷分）。
-const PROXY_CONFIRM_GAP_SECS: u64 = 12 * 3600;
+/// 折扣半衰期：12h。网络路由环境天级漂移——隔夜的观察保留约一半话语权，
+/// 三天前的观察基本只剩噪声级权重。
+const HALF_LIFE_SECS: f64 = 12.0 * 3600.0;
 
-/// 代理胜绩有效期封顶：7 天。证据换时长的上限——一周不用即重学。
-const PROXY_TTL_MAX_SECS: u64 = 7 * 24 * 3600;
+/// 有效样本权重封顶：任何结论最多相当于 8 次观察，保证数次新观察即可扭转。
+const MAX_WEIGHT: f64 = 8.0;
 
-/// 代理起飞（AdoptProxy）所需的最少「不同天」确认数。单日一次性的胜绩
-/// 只做加速信号，防偶发误判长期锁路由。
-const ADOPT_MIN_CONFIRMS: u32 = 2;
+/// 提供先验所需的最小衰减后权重：不足半个样本的证据不播种调度器。
+const MIN_PRIOR_WEIGHT: f64 = 0.5;
 
-/// AdoptProxy 的实证重验期：距上次**采样实证的胜出**（`win_ts`，非完成
-/// 续期）超过 72h → 降档 FastReeval，让一个任务直连起飞重验。直连仍烂
-/// 则 ~11s 内重新实证并续 72h；直连已恢复则任务直接享受快直连、续期链
-/// 自然断裂——防「代理够用就永不回头看直连」的 exploit 锁死（aria2
-/// Adaptive `2^counter` 天重测日程的简化形态）。
-const WIN_REVALIDATE_SECS: u64 = 72 * 3600;
+/// prune 阈值：衰减后权重低于此值的路径统计直接丢弃（已无任何话语权）。
+const PRUNE_WEIGHT: f64 = 0.05;
+
+/// 路径统计的绝对保留上限：7 天未更新即丢弃（与权重衰减双保险）。
+const MAX_STAT_AGE_SECS: u64 = 7 * 24 * 3600;
+
+/// 单条路径的时间折扣速率统计。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+struct PathStat {
+    /// ln(单连接稳态 B/s) 的加权均值。
+    log_mean: f64,
+    /// 上次更新时刻的有效样本权重（读取时按经过时间衰减）。
+    weight: f64,
+    /// 上次更新的 Unix 秒。
+    ts: u64,
+}
 
 /// 单 host 的路由观察。字段全部 `#[serde(default)]`：局部缺失按「无观察」
 /// 处理，绝不因格式演进丢整表。
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 struct HostRoute {
-    /// 上次代理胜绩（采样切换胜出 / 代理路由任务完成续期）的 Unix 秒，0 = 无。
-    #[serde(default)]
-    proxy_ts: u64,
-    /// 胜出采样的代理单连接吞吐（B/s，仅诊断日志用）。
-    #[serde(default)]
-    proxy_bps: f64,
-    /// 「不同天」确认次数（距上次计分超过 [`PROXY_CONFIRM_GAP_SECS`] 的
-    /// 胜出/续期各 +1）。驱动 TTL 阶梯与 AdoptProxy 门槛；反向 failover
-    /// 清零。
-    #[serde(default)]
-    proxy_n: u32,
-    /// 上次计分的 Unix 秒（独立于 proxy_ts 的计分时钟——以 proxy_ts 为
-    /// 基准的话，高频使用的 host 每次续期都会把窗口往后推，永远攒不满
-    /// AdoptProxy 门槛）。
-    #[serde(default)]
-    confirm_ts: u64,
-    /// 采样无优势的累计次数（指数退避的 n；胜出时清零）。
-    #[serde(default)]
-    cool_n: u32,
-    /// 上次采样无优势的 Unix 秒，0 = 无。
-    #[serde(default)]
-    cool_ts: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    direct: Option<PathStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    manual: Option<PathStat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system: Option<PathStat>,
     /// 上次 validator 不一致（代理命中不同 CDN edge）的 Unix 秒，0 = 无。
     #[serde(default)]
     nosw_ts: u64,
-    /// 上次**采样实证**胜出的 Unix 秒（完成续期不刷新它）。AdoptProxy
-    /// 的重验时钟。
-    #[serde(default)]
-    win_ts: u64,
 }
 
-/// 落盘格式：`{"v":1,"net":"<hash16>","hosts":{...}}`。
+impl HostRoute {
+    /// 网卡链路不持久化先验（拓扑易变、索引跨重启不稳定）。
+    fn slot(&self, route: RoutePath) -> Option<PathStat> {
+        match route {
+            RoutePath::Direct => self.direct,
+            RoutePath::Proxy(CandidateSource::ManualFields) => self.manual,
+            RoutePath::Proxy(CandidateSource::System) => self.system,
+            RoutePath::Link(_) => None,
+        }
+    }
+
+    fn slot_mut(&mut self, route: RoutePath) -> Option<&mut Option<PathStat>> {
+        match route {
+            RoutePath::Direct => Some(&mut self.direct),
+            RoutePath::Proxy(CandidateSource::ManualFields) => Some(&mut self.manual),
+            RoutePath::Proxy(CandidateSource::System) => Some(&mut self.system),
+            RoutePath::Link(_) => None,
+        }
+    }
+
+    /// 反向 failover 语义：丢弃两条代理路径的估计，直连估计与 NoSwitch 保留。
+    fn clear_proxy_stats(&mut self) {
+        self.manual = None;
+        self.system = None;
+    }
+
+    /// 最新观察时间（容量裁剪排序用）。
+    fn newest_ts(&self) -> u64 {
+        [self.direct, self.manual, self.system]
+            .iter()
+            .flatten()
+            .map(|s| s.ts)
+            .fold(self.nosw_ts, u64::max)
+    }
+}
+
+/// 落盘格式：`{"v":2,"net":"<hash16>","hosts":{...}}`。
 #[derive(Serialize, Deserialize)]
 struct RouteFile {
     v: u32,
@@ -123,20 +153,13 @@ struct RouteFile {
     hosts: HashMap<String, HostRoute>,
 }
 
-/// 启动期路由提示（`auto_route_decision` 在内存缓存 miss 后消费）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RouteHint {
-    /// 该 host 近期已被证明代理无优势 / validator 不一致——本任务跳过
-    /// 采样状态机（等效内存态 Cooldown/NoSwitch 的跨重启延续）。
-    SuppressProbe,
-    /// 该 host 有代理胜绩但确认不足 [`ADOPT_MIN_CONFIRMS`] 天——直连
-    /// 起飞不变，仅缩短采样等待期，慢了尽快重评估。
-    FastReeval,
-    /// 该 host 已在多个「不同天」被证明代理更优（如境外直连长期受限的
-    /// 场景）——直接以代理起飞，零慢速窗口。照 aria2 默认 Feedback
-    /// 选择器「对已知最快服务器直接贪心采用」的先例。两道自愈：连接类
-    /// 失败 → 反向 failover 作废先验；72h 无实证胜出 → 降档重验直连。
-    AdoptProxy,
+/// 某 host 某路径的先验：折扣后的单连接稳态速率（几何均值，B/s）与
+/// 衰减后的有效样本权重。调度器据此播种池内路径的初始估计，权重决定
+/// 先验相对实测的话语权。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PathPrior {
+    pub bps: f64,
+    pub weight: f64,
 }
 
 static ROUTES: OnceLock<StdMutex<HashMap<String, HostRoute>>> = OnceLock::new();
@@ -174,71 +197,58 @@ fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// 时间戳是否仍在 TTL 内。
+/// NoSwitch 时间戳是否仍在 TTL 内。未来时间戳（时钟回拨产物）按无效
+/// 观察处理——否则恒新鲜永不过期。
 fn fresh(recorded_secs: u64, now_secs: u64) -> bool {
-    fresh_within(recorded_secs, ROUTE_TTL.as_secs(), now_secs)
+    recorded_secs > 0
+        && recorded_secs <= now_secs
+        && now_secs - recorded_secs < NO_SWITCH_TTL.as_secs()
 }
 
-/// Cooldown 指数退避窗口秒数：`300 × 2^min(n,8)`，封顶 TTL。
-/// n 是「已累计的无优势次数」，首败（n=1）即 600s——比内存态 300s 略保守，
-/// 因为持久化条目要跨重启扛更久的环境漂移。
-fn cooldown_window_secs(cool_n: u32) -> u64 {
-    COOLDOWN_BASE_SECS
-        .saturating_mul(1u64 << cool_n.min(COOLDOWN_MAX_SHIFT))
-        .min(ROUTE_TTL.as_secs())
-}
-
-/// 代理胜绩的有效期：证据换时长。`24h × 2^(n-1)`，封顶 7 天——
-/// 连用 1 天记 24h，2 天 48h，3 天 96h，≥4 天 7 天（aria2 Adaptive
-/// 重测日程 `2^counter × 24h` 同构，方向取正面记忆）。
-fn proxy_ttl_secs(proxy_n: u32) -> u64 {
-    ROUTE_TTL
-        .as_secs()
-        .saturating_mul(1u64 << proxy_n.saturating_sub(1).min(3))
-        .min(PROXY_TTL_MAX_SECS)
-}
-
-/// 时间戳是否仍在给定 TTL 秒数内。未来时间戳（时钟回拨产物）按无效
-/// 观察处理——否则恒新鲜永不过期，AdoptProxy 会被变相钉死。
-fn fresh_within(recorded_secs: u64, ttl_secs: u64, now_secs: u64) -> bool {
-    recorded_secs > 0 && recorded_secs <= now_secs && now_secs - recorded_secs < ttl_secs
-}
-
-/// 代理胜绩确认：距上次**计分**（confirm_ts）超过
-/// [`PROXY_CONFIRM_GAP_SECS`] 才 +1；proxy_ts 无条件刷新（续期）。
-fn bump_proxy_confirm(e: &mut HostRoute, now: u64) {
-    if e.confirm_ts == 0 || now.saturating_sub(e.confirm_ts) > PROXY_CONFIRM_GAP_SECS {
-        e.proxy_n = e.proxy_n.saturating_add(1);
-        e.confirm_ts = now;
+/// 衰减到 `now` 的有效权重。数据非法（非有限值）或时间戳在未来（时钟
+/// 回拨）→ None，按不存在处理——否则未来时间戳永不衰减，会把旧结论钉死。
+fn decayed_weight(stat: &PathStat, now: u64) -> Option<f64> {
+    if stat.ts == 0 || stat.ts > now || !stat.log_mean.is_finite() || !stat.weight.is_finite() {
+        return None;
     }
-    e.proxy_ts = now;
+    let elapsed = (now - stat.ts) as f64;
+    let w = stat.weight.max(0.0) * 0.5f64.powf(elapsed / HALF_LIFE_SECS);
+    Some(w)
 }
 
-/// 纯决策函数：单 host 观察 → 启动期提示。优先级 NoSwitch > Cooldown >
-/// Proxy——完整性防线最高，冷却抑制次之；代理胜绩按确认天数分档
-/// （≥2 天且 72h 内有实证胜出才代理起飞，否则仅加速）。
-fn hint_for(entry: &HostRoute, now: u64) -> Option<RouteHint> {
-    if fresh(entry.nosw_ts, now) {
-        return Some(RouteHint::SuppressProbe);
+/// 纯函数：路径统计 → 先验（权重不足 [`MIN_PRIOR_WEIGHT`] → None）。
+fn prior_of(stat: &PathStat, now: u64) -> Option<PathPrior> {
+    let weight = decayed_weight(stat, now)?;
+    if weight < MIN_PRIOR_WEIGHT {
+        return None;
     }
-    if fresh_within(entry.cool_ts, cooldown_window_secs(entry.cool_n), now) {
-        return Some(RouteHint::SuppressProbe);
-    }
-    if fresh_within(entry.proxy_ts, proxy_ttl_secs(entry.proxy_n), now) {
-        let adopt = entry.proxy_n >= ADOPT_MIN_CONFIRMS
-            && fresh_within(entry.win_ts, WIN_REVALIDATE_SECS, now);
-        return Some(if adopt {
-            RouteHint::AdoptProxy
-        } else {
-            RouteHint::FastReeval
-        });
-    }
-    None
+    let bps = stat.log_mean.exp();
+    bps.is_finite().then_some(PathPrior { bps, weight })
+}
+
+/// 纯函数：把一次观察 `bps` 折入路径统计（先衰减旧权重，再在对数空间
+/// 加权平均）。调用方保证 `bps` 有限且为正。
+fn blend(slot: &mut Option<PathStat>, bps: f64, now: u64) {
+    let (log_mean, w) = slot
+        .as_ref()
+        .and_then(|s| decayed_weight(s, now).map(|w| (s.log_mean, w)))
+        .unwrap_or((0.0, 0.0));
+    *slot = Some(PathStat {
+        log_mean: (w * log_mean + bps.ln()) / (w + 1.0),
+        weight: (w + 1.0).min(MAX_WEIGHT),
+        ts: now,
+    });
+}
+
+/// 路径统计是否仍值得保留（权重未衰减殆尽且未超绝对保留期）。
+fn stat_alive(stat: &PathStat, now: u64) -> bool {
+    decayed_weight(stat, now).is_some_and(|w| w >= PRUNE_WEIGHT)
+        && now - stat.ts <= MAX_STAT_AGE_SECS
 }
 
 /// 纯函数：网络指纹 = sha256(系统代理 host:port + '\0' + 本机 LAN IP) 前
 /// 16 hex。两个输入都可为空（离线/无系统代理），退化为常量指纹——表现
-/// 同 24h TTL 纯时间失效，不比现状差。
+/// 同纯时间折扣失效，不比现状差。
 fn fingerprint_of(proxy: &str, lan_ip: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(proxy.as_bytes());
@@ -356,37 +366,26 @@ fn adopt_pending(fp: &str) {
     );
 }
 
-/// 就地清除过期观察 + 容量裁剪（淘汰最旧）。
+/// 就地清除失效观察 + 容量裁剪（淘汰最旧）。
 fn prune(map: &mut HashMap<String, HostRoute>, now: u64) {
     map.retain(|_, e| {
-        if !fresh_within(e.proxy_ts, proxy_ttl_secs(e.proxy_n), now) {
-            e.proxy_ts = 0;
-            e.proxy_bps = 0.0;
-            e.proxy_n = 0;
-            e.win_ts = 0;
-            e.confirm_ts = 0;
-        }
-        // cool 状态按 TTL（24h）保活**计数**：当前退避窗过后 host 即恢复
-        // 采样资格（hint_for 的显式窗口判定负责抑制），但 cool_n 保留——
-        // 再次无优势时退避才能真正升级（300s×2^n）。若在这里用当前窗口
-        // 判过期，窗口一过计数即清零，指数退避永远停在第一档。
-        if !fresh(e.cool_ts, now) {
-            e.cool_ts = 0;
-            e.cool_n = 0;
+        for slot in [&mut e.direct, &mut e.manual, &mut e.system] {
+            if slot.as_ref().is_some_and(|s| !stat_alive(s, now)) {
+                *slot = None;
+            }
         }
         if !fresh(e.nosw_ts, now) {
             e.nosw_ts = 0;
         }
-        e.proxy_ts != 0 || e.cool_ts != 0 || e.nosw_ts != 0
+        e.direct.is_some() || e.manual.is_some() || e.system.is_some() || e.nosw_ts != 0
     });
     if map.len() > MAX_HOSTS {
-        let newest = |e: &HostRoute| e.proxy_ts.max(e.cool_ts).max(e.nosw_ts);
-        let mut ts_sorted: Vec<u64> = map.values().map(newest).collect();
+        let mut ts_sorted: Vec<u64> = map.values().map(HostRoute::newest_ts).collect();
         ts_sorted.sort_unstable();
         let cutoff = ts_sorted[ts_sorted.len() - MAX_HOSTS];
         let mut kept = 0usize;
         map.retain(|_, e| {
-            if newest(e) >= cutoff && kept < MAX_HOSTS {
+            if e.newest_ts() >= cutoff && kept < MAX_HOSTS {
                 kept += 1;
                 true
             } else {
@@ -458,12 +457,31 @@ async fn load_with_fp(db: &Db, fp: String) {
     log_info!("[route-health] 已加载 {} 个 host 的路由先验", loaded);
 }
 
-/// 查询某 host 的启动期路由提示（无观察/已过期/换网 → None）。
-pub(crate) fn startup_hint(host: &str) -> Option<RouteHint> {
+/// 查询某 host 某路径的先验（无观察 / 权重衰减不足 / 换网 → None）。
+pub(crate) fn path_prior(host: &str, route: RoutePath) -> Option<PathPrior> {
     ensure_net_epoch();
     let now = now_unix_secs();
     let map = routes().lock().ok()?;
-    map.get(host).and_then(|e| hint_for(e, now))
+    map.get(host)
+        .and_then(|e| e.slot(route))
+        .and_then(|s| prior_of(&s, now))
+}
+
+/// 记录一次路径实测：`per_conn_bps` 为该路径单连接稳态速率（B/s）。
+/// 非有限值或 ≤0 直接忽略。立即落盘。
+pub(crate) fn record_path_rate(host: &str, route: RoutePath, per_conn_bps: f64, db: &Db) {
+    if !per_conn_bps.is_finite() || per_conn_bps <= 0.0 || route.is_link() {
+        return;
+    }
+    ensure_net_epoch();
+    let now = now_unix_secs();
+    if let Ok(mut map) = routes().lock() {
+        let e = map.entry(host.to_string()).or_default();
+        if let Some(slot) = e.slot_mut(route) {
+            blend(slot, per_conn_bps, now);
+        }
+    }
+    persist(db);
 }
 
 /// 该 host 是否有未过期的 validator 不一致记录。forward failover 门禁
@@ -479,34 +497,6 @@ pub(crate) fn no_switch_active(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 记录采样胜出：确认计分 + 实证时钟 + 写吞吐，清零冷却退避。低频且
-/// 语义重要，立即落盘。
-pub(crate) fn record_proxy_win(host: &str, probe_bps: f64, db: &Db) {
-    ensure_net_epoch();
-    let now = now_unix_secs();
-    if let Ok(mut map) = routes().lock() {
-        let e = map.entry(host.to_string()).or_default();
-        bump_proxy_confirm(e, now);
-        e.win_ts = now;
-        e.proxy_bps = probe_bps;
-        e.cool_n = 0;
-        e.cool_ts = 0;
-    }
-    persist(db);
-}
-
-/// 记录采样无优势：退避计数 +1。立即落盘。
-pub(crate) fn record_cooldown(host: &str, db: &Db) {
-    ensure_net_epoch();
-    let now = now_unix_secs();
-    if let Ok(mut map) = routes().lock() {
-        let e = map.entry(host.to_string()).or_default();
-        e.cool_n = e.cool_n.saturating_add(1);
-        e.cool_ts = now;
-    }
-    persist(db);
-}
-
 /// 记录 validator 不一致（完整性防线）。立即落盘。
 pub(crate) fn record_no_switch(host: &str, db: &Db) {
     ensure_net_epoch();
@@ -517,38 +507,22 @@ pub(crate) fn record_no_switch(host: &str, db: &Db) {
     persist(db);
 }
 
-/// 被动续期：经代理路由完成的任务证明该 host 的代理链路仍然可用——
-/// 确认计分 + 刷新胜绩时间戳（「每天用则续期」的零成本实现，间隔
-/// 超 12h 的续期同时累积确认天数）。任务完成是低频事件，立即落盘。
-pub(crate) fn touch_proxy_route(host: &str, db: &Db) {
-    ensure_net_epoch();
-    let now = now_unix_secs();
-    if let Ok(mut map) = routes().lock() {
-        bump_proxy_confirm(map.entry(host.to_string()).or_default(), now);
-    }
-    persist(db);
-}
-
-/// 反向 failover：代理起飞的任务连接类失败 → 作废该 host 的代理先验
-/// （胜绩/计分全清，冷却/NoSwitch 保留），重试回直连——杜绝「持久化
-/// 代理决策 + 代理失效 → 无法自愈」的锁死。立即落盘。
+/// 反向 failover：经代理的任务连接类失败 → 作废该 host 两条代理路径的
+/// 估计（直连估计 / NoSwitch 保留），重试回直连——杜绝「持久化代理先验 +
+/// 代理失效 → 无法自愈」的锁死。立即落盘。
 pub(crate) fn clear_proxy_prior(host: &str, db: &Db) {
     ensure_net_epoch();
     if let Ok(mut map) = routes().lock()
         && let Some(e) = map.get_mut(host)
     {
-        e.proxy_ts = 0;
-        e.proxy_bps = 0.0;
-        e.proxy_n = 0;
-        e.win_ts = 0;
-        e.confirm_ts = 0;
+        e.clear_proxy_stats();
     }
     persist(db);
 }
 
 /// 代理设置变更时全表作废（内存 + 持久化 + 离线暂存）：所有先验都是对
 /// 旧候选代理/旧出口的观察（指纹只覆盖系统代理，手动字段变更不换
-/// epoch），与 `clear_domain_conn_caps`、`DecisionCache::clear` 同点位
+/// epoch），与 `clear_domain_conn_caps` 同点位
 /// 调用。
 pub(crate) fn clear_all(db: &Db) {
     if let Ok(mut p) = pending().lock() {
@@ -624,90 +598,129 @@ fn persist(db: &Db) {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::{
-        ADOPT_MIN_CONFIRMS, COOLDOWN_BASE_SECS, HostRoute, MAX_HOSTS, PROXY_CONFIRM_GAP_SECS,
-        PROXY_TTL_MAX_SECS, ROUTE_FORMAT_VERSION, ROUTE_TTL, RouteFile, RouteHint,
-        WIN_REVALIDATE_SECS, bump_proxy_confirm, cooldown_window_secs, fingerprint_of, fresh,
-        hint_for, proxy_ttl_secs, prune,
+        HALF_LIFE_SECS, HostRoute, MAX_HOSTS, MAX_STAT_AGE_SECS, MAX_WEIGHT, PathStat,
+        ROUTE_CONFIG_KEY, ROUTE_FORMAT_VERSION, RouteFile, blend, decayed_weight, fingerprint_of,
+        load_with_fp, now_unix_secs, prior_of, prune, routes,
     };
     use std::collections::HashMap;
 
     const NOW: u64 = 2_000_000_000;
+    const HL: u64 = HALF_LIFE_SECS as u64;
 
-    #[test]
-    fn cooldown_backoff_doubles_and_caps() {
-        assert_eq!(cooldown_window_secs(0), COOLDOWN_BASE_SECS);
-        assert_eq!(cooldown_window_secs(1), 600, "首败 600s");
-        assert_eq!(cooldown_window_secs(3), 2400);
-        assert_eq!(cooldown_window_secs(8), 76800, "2^8 封顶前最大档");
-        assert_eq!(cooldown_window_secs(20), 76800, "指数封顶不溢出");
-        assert!(cooldown_window_secs(u32::MAX) <= ROUTE_TTL.as_secs());
+    fn stat(bps: f64, weight: f64, ts: u64) -> PathStat {
+        PathStat {
+            log_mean: bps.ln(),
+            weight,
+            ts,
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() <= 1e-9 * a.abs().max(b.abs()).max(1.0)
     }
 
     #[test]
-    fn hint_precedence_nosw_over_cool_over_proxy() {
-        let all = HostRoute {
-            proxy_ts: NOW,
-            proxy_bps: 1e6,
-            proxy_n: 1,
-            confirm_ts: NOW,
-            cool_n: 1,
-            cool_ts: NOW,
-            nosw_ts: NOW,
-            win_ts: NOW,
-        };
-        assert_eq!(hint_for(&all, NOW), Some(RouteHint::SuppressProbe));
-        let cool_and_proxy = HostRoute { nosw_ts: 0, ..all };
-        assert_eq!(
-            hint_for(&cool_and_proxy, NOW),
-            Some(RouteHint::SuppressProbe),
-            "冷却抑制优先于加速信号"
+    fn decay_halves_weight_per_half_life() {
+        let s = stat(1e6, 4.0, NOW - HL);
+        assert!(
+            close(decayed_weight(&s, NOW).unwrap(), 2.0),
+            "一个半衰期权重减半"
         );
-        let proxy_only = HostRoute {
-            cool_n: 0,
-            cool_ts: 0,
-            nosw_ts: 0,
-            ..all
-        };
-        assert_eq!(hint_for(&proxy_only, NOW), Some(RouteHint::FastReeval));
-        assert_eq!(hint_for(&HostRoute::default(), NOW), None);
+        let s2 = stat(1e6, 4.0, NOW - 2 * HL);
+        assert!(close(decayed_weight(&s2, NOW).unwrap(), 1.0));
+        let p = prior_of(&s, NOW).unwrap();
+        assert!(close(p.bps, 1e6), "衰减只影响权重，不改变速率估计");
+        assert!(close(p.weight, 2.0));
     }
 
     #[test]
-    fn cooldown_window_expiry_falls_through_to_proxy_hint() {
-        // 冷却窗（n=1 → 600s）过后：冷却失效，代理胜绩（TTL 内）接管。
-        let e = HostRoute {
-            proxy_ts: NOW - 700,
-            proxy_bps: 1e6,
-            proxy_n: 1,
-            confirm_ts: NOW - 700,
-            cool_n: 1,
-            cool_ts: NOW - 700,
-            nosw_ts: 0,
-            win_ts: NOW - 700,
-        };
-        assert_eq!(hint_for(&e, NOW), Some(RouteHint::FastReeval));
-        // 窗内仍抑制。
-        assert_eq!(hint_for(&e, NOW - 200), Some(RouteHint::SuppressProbe));
+    fn record_blends_geometrically_and_caps_weight() {
+        let mut slot = None;
+        blend(&mut slot, 1e6, NOW);
+        let p = prior_of(&slot.unwrap(), NOW).unwrap();
+        assert!(close(p.bps, 1e6) && close(p.weight, 1.0), "首次观察即估计");
+        blend(&mut slot, 4e6, NOW);
+        let p = prior_of(&slot.unwrap(), NOW).unwrap();
+        assert!(close(p.bps, 2e6), "等权两样本取几何均值 sqrt(1e6·4e6)");
+        assert!(close(p.weight, 2.0));
+        for _ in 0..50 {
+            blend(&mut slot, 4e6, NOW);
+        }
+        assert!(slot.unwrap().weight <= MAX_WEIGHT, "权重封顶");
+        // 满权重的旧结论也能被少数新观察明显拉动。
+        let mut old = Some(stat(1e6, MAX_WEIGHT, NOW));
+        blend(&mut old, 1e8, NOW);
+        let p = prior_of(&old.unwrap(), NOW).unwrap();
+        assert!(p.bps > 1e6 * 1.5, "封顶权重下单次观察仍有 1/9 话语权");
     }
 
     #[test]
-    fn hint_respects_ttl() {
-        let stale = HostRoute {
-            proxy_ts: NOW - ROUTE_TTL.as_secs() - 1,
-            nosw_ts: NOW - ROUTE_TTL.as_secs() - 1,
-            ..HostRoute::default()
-        };
-        assert_eq!(hint_for(&stale, NOW), None, "过期观察不可见");
-        assert!(!fresh(0, NOW), "0 = 无记录");
+    fn stale_evidence_yields_to_new_observation() {
+        // 陈旧的高权重结论衰减后，新观察占主导。
+        let mut slot = Some(stat(1e6, MAX_WEIGHT, NOW - 6 * HL));
+        blend(&mut slot, 1e8, NOW);
+        let p = prior_of(&slot.unwrap(), NOW).unwrap();
+        assert!(p.bps > 5e7, "8×2^-6=0.125 权重的旧证据只能轻微拉低新观察");
     }
 
     #[test]
-    fn prune_drops_stale_and_caps_hosts() {
+    fn prior_below_min_weight_is_none() {
+        let weak = stat(1e6, 1.0, NOW - 2 * HL); // 衰减到 0.25
+        assert_eq!(prior_of(&weak, NOW), None);
+        let ok = stat(1e6, 1.0, NOW - HL / 2); // ≈0.71
+        assert!(prior_of(&ok, NOW).is_some());
+    }
+
+    #[test]
+    fn future_timestamps_are_ignored() {
+        // 时钟回拨后 ts > now：按不存在处理，绝不恒不衰减。
+        let future = stat(1e6, MAX_WEIGHT, NOW + 3600);
+        assert_eq!(prior_of(&future, NOW), None);
+        let mut slot = Some(future);
+        blend(&mut slot, 3e6, NOW);
+        let s = slot.unwrap();
+        assert!(close(s.weight, 1.0), "未来条目不参与混合，从新观察重新开始");
+        assert!(close(s.log_mean.exp(), 3e6));
+        assert_eq!(s.ts, NOW);
+    }
+
+    #[test]
+    fn clear_proxy_keeps_direct_and_nosw() {
+        let mut e = HostRoute {
+            direct: Some(stat(1e6, 2.0, NOW)),
+            manual: Some(stat(5e6, 2.0, NOW)),
+            system: Some(stat(4e6, 2.0, NOW)),
+            nosw_ts: NOW,
+        };
+        e.clear_proxy_stats();
+        assert_eq!(e.manual, None);
+        assert_eq!(e.system, None);
+        assert_eq!(e.direct, Some(stat(1e6, 2.0, NOW)));
+        assert_eq!(e.nosw_ts, NOW);
+    }
+
+    #[test]
+    fn prune_drops_dead_stats_and_caps_hosts() {
         let mut map: HashMap<String, HostRoute> = HashMap::new();
         map.insert(
-            "stale.example".into(),
+            "decayed.example".into(),
             HostRoute {
-                proxy_ts: NOW - ROUTE_TTL.as_secs() - 1,
+                direct: Some(stat(1e6, MAX_WEIGHT, NOW - 10 * HL)), // 8/1024 < 0.05
+                ..HostRoute::default()
+            },
+        );
+        map.insert(
+            "ancient.example".into(),
+            HostRoute {
+                direct: Some(stat(1e6, 1e9, NOW - MAX_STAT_AGE_SECS - 1)),
+                ..HostRoute::default()
+            },
+        );
+        map.insert(
+            "mixed.example".into(),
+            HostRoute {
+                direct: Some(stat(1e6, 1.0, NOW)),
+                manual: Some(stat(1e6, 1.0, NOW - 20 * HL)),
                 ..HostRoute::default()
             },
         );
@@ -715,170 +728,21 @@ mod tests {
             map.insert(
                 format!("h{n}.example"),
                 HostRoute {
-                    proxy_ts: NOW - n as u64,
+                    direct: Some(stat(1e6, 1.0, NOW - n as u64)),
                     ..HostRoute::default()
                 },
             );
         }
         prune(&mut map, NOW);
         assert!(map.len() <= MAX_HOSTS);
-        assert!(!map.contains_key("stale.example"), "过期条目必须被清除");
+        assert!(!map.contains_key("decayed.example"), "权重衰减殆尽必须清除");
+        assert!(!map.contains_key("ancient.example"), "超绝对保留期必须清除");
+        let mixed = &map["mixed.example"];
+        assert!(
+            mixed.direct.is_some() && mixed.manual.is_none(),
+            "逐路径清除"
+        );
         assert!(map.contains_key("h0.example"), "最新条目必须保留");
-    }
-
-    #[test]
-    fn prune_keeps_cooldown_counter_within_ttl() {
-        // 当前退避窗（n=2 → 1200s）已过但仍在 24h 内：计数保留——
-        // 下次无优势时退避才能升级到 2400s，而不是永远停在第一档。
-        let mut map: HashMap<String, HostRoute> = HashMap::new();
-        map.insert(
-            "cool.example".into(),
-            HostRoute {
-                cool_n: 2,
-                cool_ts: NOW - cooldown_window_secs(2) - 1,
-                proxy_ts: NOW, // 让条目整体存活
-                ..HostRoute::default()
-            },
-        );
-        prune(&mut map, NOW);
-        let e = &map["cool.example"];
-        assert_eq!(e.cool_n, 2, "窗口过后计数保留（24h 内）");
-        // hint 侧此时已不再抑制（窗口判定在 hint_for）。
-        assert_eq!(hint_for(e, NOW), Some(RouteHint::FastReeval));
-        // 24h 无新败绩才整段清零。
-        if let Some(e) = map.get_mut("cool.example") {
-            e.cool_ts = NOW - ROUTE_TTL.as_secs() - 1;
-        }
-        prune(&mut map, NOW);
-        let e = &map["cool.example"];
-        assert_eq!(e.cool_n, 0, "超 24h 退避状态整段清零");
-        assert_eq!(e.cool_ts, 0);
-    }
-
-    #[test]
-    fn proxy_ttl_ladder_scales_with_confirms() {
-        assert_eq!(proxy_ttl_secs(0), ROUTE_TTL.as_secs(), "无计分退化 24h");
-        assert_eq!(proxy_ttl_secs(1), 24 * 3600);
-        assert_eq!(proxy_ttl_secs(2), 48 * 3600);
-        assert_eq!(proxy_ttl_secs(3), 96 * 3600);
-        assert_eq!(proxy_ttl_secs(4), PROXY_TTL_MAX_SECS, "≥4 天封顶 7 天");
-        assert_eq!(proxy_ttl_secs(u32::MAX), PROXY_TTL_MAX_SECS);
-    }
-
-    #[test]
-    fn adopt_requires_multi_day_confirms() {
-        let one_day = HostRoute {
-            proxy_ts: NOW,
-            proxy_n: 1,
-            win_ts: NOW,
-            ..HostRoute::default()
-        };
-        assert_eq!(
-            hint_for(&one_day, NOW),
-            Some(RouteHint::FastReeval),
-            "单日胜绩只加速，不代理起飞"
-        );
-        let confirmed = HostRoute {
-            proxy_n: ADOPT_MIN_CONFIRMS,
-            ..one_day
-        };
-        assert_eq!(
-            hint_for(&confirmed, NOW),
-            Some(RouteHint::AdoptProxy),
-            "≥2 天确认直接代理起飞"
-        );
-        // 阶梯 TTL：n=2 的胜绩 30h 前记录仍然有效（>24h、<48h）。
-        let aged = HostRoute {
-            proxy_ts: NOW - 30 * 3600,
-            ..confirmed
-        };
-        assert_eq!(hint_for(&aged, NOW), Some(RouteHint::AdoptProxy));
-        // 超出自身档位即失效。
-        let dead = HostRoute {
-            proxy_ts: NOW - 49 * 3600,
-            ..confirmed
-        };
-        assert_eq!(hint_for(&dead, NOW), None);
-    }
-
-    #[test]
-    fn adopt_demotes_without_recent_verified_win() {
-        // 完成续期把 proxy_ts 维持新鲜，但 win_ts（实证胜出）已超 72h：
-        // 降档 FastReeval 重验直连——防「代理够用就永不回头」的锁死。
-        let renewed_only = HostRoute {
-            proxy_ts: NOW,
-            proxy_n: 4,
-            win_ts: NOW - WIN_REVALIDATE_SECS - 1,
-            ..HostRoute::default()
-        };
-        assert_eq!(hint_for(&renewed_only, NOW), Some(RouteHint::FastReeval));
-        // 实证仍新鲜 → 继续代理起飞。
-        let verified = HostRoute {
-            win_ts: NOW - WIN_REVALIDATE_SECS + 3600,
-            ..renewed_only
-        };
-        assert_eq!(hint_for(&verified, NOW), Some(RouteHint::AdoptProxy));
-    }
-
-    #[test]
-    fn bump_confirm_uses_credit_clock_not_renewal_gap() {
-        // 续期节奏取计分窗的一半:相邻两次续期永远 < 窗口,但第三次距上次
-        // 计分已 1.5 倍窗口。基准若错挂在 proxy_ts 上,最常用的 host 反而
-        // 永远攒不够确认次数、到不了 AdoptProxy。
-        let renew_gap = PROXY_CONFIRM_GAP_SECS / 2;
-        let mut e = HostRoute::default();
-        bump_proxy_confirm(&mut e, NOW);
-        assert_eq!(e.proxy_n, 1, "首次确认 +1");
-        bump_proxy_confirm(&mut e, NOW + renew_gap);
-        bump_proxy_confirm(&mut e, NOW + 2 * renew_gap);
-        assert_eq!(e.proxy_n, 1, "距上次计分未过窗口不加分");
-        assert_eq!(e.proxy_ts, NOW + 2 * renew_gap, "续期必须刷新时间戳");
-        bump_proxy_confirm(&mut e, NOW + 3 * renew_gap);
-        assert_eq!(e.proxy_n, 2, "计分窗到点即 +1,不被高频续期推迟");
-        assert_eq!(e.confirm_ts, NOW + 3 * renew_gap, "计分时钟随计分推进");
-    }
-
-    #[test]
-    fn future_timestamps_are_invalid() {
-        // 时钟回拨后 recorded > now：按无效观察处理，绝不恒新鲜。
-        assert!(!fresh(NOW + 10, NOW));
-        let pinned = HostRoute {
-            proxy_ts: NOW + 3600,
-            proxy_n: 4,
-            win_ts: NOW + 3600,
-            ..HostRoute::default()
-        };
-        assert_eq!(hint_for(&pinned, NOW), None, "未来时间戳不产生任何提示");
-    }
-
-    #[test]
-    fn file_roundtrip_preserves_entries() {
-        let mut hosts = HashMap::new();
-        hosts.insert(
-            "gh.example".to_string(),
-            HostRoute {
-                proxy_ts: NOW,
-                proxy_bps: 2.5e6,
-                proxy_n: 3,
-                confirm_ts: NOW - 20,
-                cool_n: 1,
-                cool_ts: NOW - 10,
-                nosw_ts: 0,
-                win_ts: NOW - 20,
-            },
-        );
-        let file = RouteFile {
-            v: ROUTE_FORMAT_VERSION,
-            net: fingerprint_of("proxy:8080", "192.168.1.5"),
-            hosts,
-        };
-        let json = serde_json::to_string(&file).unwrap();
-        let back: RouteFile = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.v, ROUTE_FORMAT_VERSION);
-        assert_eq!(back.net, file.net);
-        let e = &back.hosts["gh.example"];
-        assert_eq!(e.proxy_ts, NOW);
-        assert_eq!(e.cool_n, 1);
     }
 
     #[test]
@@ -900,31 +764,25 @@ mod tests {
         assert_ne!(fingerprint_of("ab", ""), fingerprint_of("a", "b"));
     }
 
-    #[test]
-    fn missing_fields_deserialize_as_no_observation() {
-        // 旧条目/手改数据缺字段 → serde(default) 兜底，不炸整表。
-        let e: HostRoute = serde_json::from_str(r#"{"proxy_ts":123}"#).unwrap();
-        assert_eq!(e.proxy_ts, 123);
-        assert_eq!(e.cool_n, 0);
-        assert_eq!(e.nosw_ts, 0);
+    async fn mem_db() -> crate::db::Db {
+        crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("mem db")
     }
 
-    /// 组合契约：net 指纹不符 → 整表丢弃；相符 → 条目可查。经真实
-    /// config 表往返（in-memory sqlite）。
+    /// 组合契约：经真实 config 表往返（in-memory sqlite）后估计值不变；
+    /// net 指纹不符 → 整表丢弃。
     #[tokio::test]
-    async fn load_respects_net_epoch() {
-        use super::{ROUTE_CONFIG_KEY, load_with_fp, now_unix_secs, routes};
-        let db = crate::db::Db::connect("sqlite::memory:")
-            .await
-            .expect("mem db");
+    async fn load_roundtrips_estimates_and_respects_net_epoch() {
+        let db = mem_db().await;
+        let now = now_unix_secs();
+        let seeded = HostRoute {
+            direct: Some(stat(1.5e6, 3.0, now)),
+            system: Some(stat(6e6, 2.0, now)),
+            ..HostRoute::default()
+        };
         let mut hosts = HashMap::new();
-        hosts.insert(
-            "load-epoch.example".to_string(),
-            HostRoute {
-                proxy_ts: now_unix_secs(),
-                ..HostRoute::default()
-            },
-        );
+        hosts.insert("load-epoch.example".to_string(), seeded);
         let file = RouteFile {
             v: ROUTE_FORMAT_VERSION,
             net: "net-a".to_string(),
@@ -941,9 +799,34 @@ mod tests {
         );
 
         load_with_fp(&db, "net-a".to_string()).await;
+        let loaded = routes().lock().unwrap().get("load-epoch.example").copied();
+        let loaded = loaded.expect("指纹相符必须加载条目");
+        let same = |a: Option<PathStat>, b: Option<PathStat>| match (a, b) {
+            (Some(a), Some(b)) => {
+                close(a.log_mean, b.log_mean) && close(a.weight, b.weight) && a.ts == b.ts
+            }
+            _ => false,
+        };
+        assert!(same(loaded.direct, seeded.direct), "直连估计往返不变");
+        assert!(same(loaded.system, seeded.system), "代理估计往返不变");
+        assert_eq!(loaded.manual, None);
+    }
+
+    #[tokio::test]
+    async fn version_1_data_is_discarded() {
+        let db = mem_db().await;
+        let now = now_unix_secs();
+        // v1 条目里 nosw_ts 字段与 v2 同名，若不校验版本会被误装表。
+        let raw = format!(
+            r#"{{"v":1,"net":"net-v1","hosts":{{"v1.example":{{"proxy_ts":{now},"proxy_n":3,"nosw_ts":{now}}}}}}}"#
+        );
+        db.set_config(ROUTE_CONFIG_KEY, &raw)
+            .await
+            .expect("seed config");
+        load_with_fp(&db, "net-v1".to_string()).await;
         assert!(
-            routes().lock().unwrap().contains_key("load-epoch.example"),
-            "指纹相符必须加载条目"
+            !routes().lock().unwrap().contains_key("v1.example"),
+            "旧格式版本必须整体丢弃"
         );
     }
 }

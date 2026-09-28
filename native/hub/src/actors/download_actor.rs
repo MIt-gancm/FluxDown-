@@ -26,10 +26,10 @@ use crate::protocol_registry;
 use crate::rinf_selection::RinfHostSelection;
 use crate::rinf_sink::RinfEventSink;
 use crate::signals::{
-    BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate, CheckUrlProtocol,
-    ClearWebhookDeliveries, ConfigEntry, ConfigLoaded, ConfirmExternalDownload, ControlTask,
-    CopyPathToClipboard, CopyPathToClipboardResult, CreateQueue, CreateRssSource, CreateTask,
-    CreateTaskGroup, DeleteQueue, DeleteRssSource, DetectSystemProxy, DownloadUpdate,
+    AuthenticatePlugin, BatchControlTask, BatchCreateTask, CheckFileAssociation, CheckForUpdate,
+    CheckUrlProtocol, ClearWebhookDeliveries, ConfigEntry, ConfigLoaded, ConfirmExternalDownload,
+    ControlTask, CopyPathToClipboard, CopyPathToClipboardResult, CreateQueue, CreateRssSource,
+    CreateTask, CreateTaskGroup, DeleteQueue, DeleteRssSource, DetectSystemProxy, DownloadUpdate,
     Ed2kServerSubscriptionResult, ExternalDownloadRequest, FfmpegInstallProgress,
     FfmpegInstallResult, FfmpegStatusReport, FfmpegVersionList, FileAssociationStatus,
     GroupControl, IgnorePluginRetry, InstallFfmpeg, InstallMarketPlugin, InstallPlugin,
@@ -290,6 +290,7 @@ async fn load_initial_config(
     i32,
     bool,
     i32,
+    bool,
 ) {
     let config = db.get_all_config().await.unwrap_or_default();
     let max_concurrent = config
@@ -334,6 +335,10 @@ async fn load_initial_config(
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(0)
         .clamp(0, 8);
+    // 多网卡聚合下载开关。老库无此 key → 默认关闭。
+    let multi_nic_enabled = config
+        .get("multi_nic_enabled")
+        .is_some_and(|v| v == "1" || v == "true");
 
     (
         max_concurrent,
@@ -347,6 +352,7 @@ async fn load_initial_config(
         auto_max_connections,
         cdn_multi_enabled,
         cdn_max_nodes,
+        multi_nic_enabled,
     )
 }
 
@@ -385,7 +391,10 @@ async fn open_db_with_lease_retry(
     }
 }
 
-pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
+pub async fn run(
+    db_dir: PathBuf,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), ActorError> {
     let (db, write_guard) = open_db_with_lease_retry(&db_dir).await?;
 
     // Initialize default config values in DB (no-op if already set)
@@ -406,6 +415,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         auto_max_connections,
         cdn_multi_enabled,
         cdn_max_nodes,
+        multi_nic_enabled,
     ) = load_initial_config(&db).await;
     log_info!(
         "[actor] proxy config: mode={}, type={}, host={}, port={}",
@@ -492,6 +502,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         .set_auto_max_connections(auto_max_connections);
     engine.manager.set_cdn_multi_enabled(cdn_multi_enabled);
     engine.manager.set_cdn_max_nodes(cdn_max_nodes);
+    engine.manager.set_multi_nic_enabled(multi_nic_enabled);
 
     // Apply persisted log size cap (MB) to the global logger.
     if let Ok(Some(v)) = engine.db.get_config("log_max_size_mb").await
@@ -520,9 +531,12 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         if let Some(v) = cfg.get("use_server_time") {
             engine.manager.set_use_server_time(v == "true");
         }
-        // 文件已存在时的处理方式（"rename"=自动重命名，默认；"overwrite"=覆盖旧文件）。
+        // 文件已存在时的处理方式（"rename"=自动重命名，默认；"overwrite"=
+        // 覆盖旧文件；"skip"=跳过下载）。
         if let Some(v) = cfg.get("file_exists_behavior") {
-            engine.manager.set_file_exists_overwrite(v == "overwrite");
+            engine
+                .manager
+                .set_file_exists_behavior(download_manager::FileExistsBehavior::from_config_str(v));
         }
         // 任务的文件被删除/移动时的动作（"keep"=保留任务记录，默认；
         // "delete"=文件消失后自动删除任务记录）。
@@ -531,13 +545,13 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         }
     }
 
-    if let Some(rx) = engine.manager.take_progress_rx() {
+    let progress_task = engine.manager.take_progress_rx().map(|rx| {
         tokio::spawn(download_manager::progress_reporter(
             rx,
             engine.db.clone(),
-            sink.clone(),
-        ));
-    }
+            engine.activity_sink.clone(),
+        ))
+    });
 
     // Load named queue settings into the in-memory cache so that
     // per-queue speed limits and concurrency limits take effect immediately.
@@ -638,6 +652,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
     let install_plugin_recv = InstallPlugin::get_dart_signal_receiver();
     let uninstall_plugin_recv = UninstallPlugin::get_dart_signal_receiver();
     let set_plugin_enabled_recv = SetPluginEnabled::get_dart_signal_receiver();
+    let authenticate_plugin_recv = AuthenticatePlugin::get_dart_signal_receiver();
     let save_plugin_settings_recv = SavePluginSettings::get_dart_signal_receiver();
     let ignore_plugin_retry_recv = IgnorePluginRetry::get_dart_signal_receiver();
     let request_market_index_recv = RequestMarketIndex::get_dart_signal_receiver();
@@ -659,6 +674,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         InstallPlugin(InstallPlugin),
         UninstallPlugin(UninstallPlugin),
         SetPluginEnabled(SetPluginEnabled),
+        AuthenticatePlugin(AuthenticatePlugin),
         SavePluginSettings(SavePluginSettings),
         IgnorePluginRetry(IgnorePluginRetry),
         RequestMarketIndex,
@@ -679,6 +695,9 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                 }
                 Some(signal) = set_plugin_enabled_recv.recv() => {
                     let _ = plugin_cmd_tx.send(PluginHubCmd::SetPluginEnabled(signal.message)).await;
+                }
+                Some(signal) = authenticate_plugin_recv.recv() => {
+                    let _ = plugin_cmd_tx.send(PluginHubCmd::AuthenticatePlugin(signal.message)).await;
                 }
                 Some(signal) = save_plugin_settings_recv.recv() => {
                     let _ = plugin_cmd_tx.send(PluginHubCmd::SavePluginSettings(signal.message)).await;
@@ -960,15 +979,16 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
     tokio::task::spawn_blocking(crate::compat_flags::clear_runasadmin_self);
 
     // Auto-register NMH (Native Messaging Host) for browser extension communication.
-    // Only re-registers when the registry is missing, incomplete, or stale (exe path changed).
-    tokio::task::spawn_blocking(|| {
-        if !crate::nmh_registry::needs_update() {
+    // Only rewrites a missing, broken or incomplete registration, and never takes
+    // it over from another healthy FluxDown install (see `nmh_registry::auto_register`).
+    tokio::task::spawn_blocking(|| match crate::nmh_registry::auto_register() {
+        Ok(crate::nmh_registry::AutoRegisterOutcome::UpToDate) => {
             log_info!("[actor] NMH already registered and up to date");
-            return;
         }
-        if let Err(e) = crate::nmh_registry::register() {
-            log_info!("[actor] NMH registration failed: {}", e);
+        Ok(crate::nmh_registry::AutoRegisterOutcome::Registered(relay)) => {
+            log_info!("[actor] NMH registered: relay={}", relay.display());
         }
+        Err(e) => log_info!("[actor] NMH registration failed: {e:#}"),
     });
 
     // 缓存浏览器扩展捕获的请求事务上下文（headers/method/body + per-item
@@ -985,6 +1005,11 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         /// 文件大小提示：>0 已知大小、-1 已确认可下载但大小未知（跳过 probe）、
         /// 0 未知（正常 probe）。语义与 `DownloadRequest::file_size` 一致。
         file_size: i64,
+        /// 音频轨 URL（浏览器嗅探到的离散视频+音频轨对）。批量本地 NMH 请求
+        /// 不在确认信号里逐条携带该字段（`synthesize_batch_request` 合成的
+        /// 多行文本 / `parseQuickDownloadEntries` 都不编码 audioUrl），必须
+        /// 靠本缓存按 URL 找回，否则批量确认会静默产出无声视频任务。
+        audio_url: String,
     }
     let mut ext_request_cache: HashMap<String, ExtRequestCtx> = HashMap::new();
     // 缓存插入序（FIFO 淘汰用）：确认消费不回收队列条目（懒清理），
@@ -1038,6 +1063,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         Test(TestWebhookEndpoint),
     }
     enum AuxSignal {
+        Shutdown,
         Group(GroupSignal),
         Rss(RssSignal),
         Webhook(WebhookSignal),
@@ -1052,6 +1078,11 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
         CopyPath(CopyPathToClipboard),
     }
     let (aux_tx, mut aux_rx) = mpsc::unbounded_channel::<AuxSignal>();
+    let shutdown_tx = aux_tx.clone();
+    tokio::spawn(async move {
+        shutdown.cancelled().await;
+        let _ = shutdown_tx.send(AuxSignal::Shutdown);
+    });
     // 文件丢失自动清理泵：引擎 detached 扫描 → mpsc → aux_tx → 主循环单分支。
     if let Some(mut rx) = missing_cleanup_rx {
         let cleanup_tx = aux_tx.clone();
@@ -1319,11 +1350,19 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                     //   • referrer：缓存优先——批量表单【没有】referrer 输入框，
                     //     msg.referrer 只是首条请求的共享值，per-item 缓存更准。
                     //   • fileSize/method/body：仅存在于缓存。
+                    //   • audio_url：批量确认信号不逐条携带该字段——
+                    //     `synthesize_batch_request` 合成的多行文本只编码
+                    //     url/out=filename，`parseQuickDownloadEntries` 也
+                    //     不识别 audioUrl 选项行，故 `entry.audio_url` 对本地
+                    //     NMH 批量恒为空；必须靠本缓存按 URL 找回，否则批量
+                    //     确认会静默产出无声视频任务（信号值非空时仍优先，
+                    //     为未来可能携带该字段的调用方留出正确路径）。
                     let ctx = ext_request_cache.remove(&entry.url).unwrap_or_default();
                     let extra_headers = merge_ext_headers(ctx.headers, &msg.extra_headers);
                     let cookies = if msg.cookies.is_empty() { ctx.cookies } else { msg.cookies.clone() };
                     let referrer = if ctx.referrer.is_empty() { msg.referrer.clone() } else { ctx.referrer };
                     let body = ctx.body.map(nm_body_to_captured);
+                    let audio_url = if entry.audio_url.is_empty() { ctx.audio_url } else { entry.audio_url };
                     engine.manager
                         .create_task(NewTaskSpec {
                             url: entry.url,
@@ -1341,7 +1380,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                             extra_headers,
                             method: ctx.method,
                             body,
-                            audio_url: if entry.audio_url.is_empty() { None } else { Some(entry.audio_url) },
+                            audio_url: if audio_url.is_empty() { None } else { Some(audio_url) },
                             start_paused: msg.start_paused,
                             unattended_selection: msg.unattended,
                             ..Default::default()
@@ -1425,6 +1464,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
             // 主 select! 因此停在 64 分支上限之内。
             Some(aux) = aux_rx.recv() => {
                 match aux {
+                AuxSignal::Shutdown => break,
                 AuxSignal::Group(group_signal) => match group_signal {
                     GroupSignal::Preview(msg) => {
                         engine.manager
@@ -1705,9 +1745,10 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                     let has_headers =
                         req.headers.as_ref().is_some_and(|h| !h.is_empty());
                     let file_size = req.file_size.unwrap_or(0);
+                    let has_audio_url = req.audio_url.as_deref().is_some_and(|s| !s.is_empty());
                     if has_headers || req.method.is_some() || req.body.is_some()
                         || !req.cookies.is_empty() || !req.referrer.is_empty()
-                        || file_size != 0
+                        || file_size != 0 || has_audio_url
                     {
                         ext_request_cache.insert(
                             req.url.clone(),
@@ -1718,6 +1759,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                                 cookies: req.cookies.clone(),
                                 referrer: req.referrer.clone(),
                                 file_size,
+                                audio_url: req.audio_url.clone().unwrap_or_default(),
                             },
                         );
                         ext_cache_order.push_back(req.url.clone());
@@ -1769,11 +1811,15 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                 // = 用户在表单里主动清空，必须尊重该意图（与改动前语义一致）。
                 // hint_file_size 例外：表单不可编辑该值，0 只可能是"信号未携带"
                 // （批量弹窗缩减为单条确认的路径），回退缓存恢复 per-item 精度。
+                // audio_url 同理回退缓存：批量弹窗缩减为单条确认时，信号走的
+                // 也是本分支，而合成的多行文本/解析出的单条 URL 均不携带
+                // audioUrl，必须靠缓存恢复，否则批量退化单条同样会丢音轨。
                 let cookies = msg.cookies;
                 let referrer = msg.referrer;
                 let hint_file_size = if msg.hint_file_size == 0 { ctx.file_size } else { msg.hint_file_size };
                 let method = ctx.method;
                 let body = ctx.body.map(nm_body_to_captured);
+                let audio_url = if msg.audio_url.is_empty() { ctx.audio_url } else { msg.audio_url };
                 log_info!(
                     "[actor] user confirmed external download: url={}, cookies_len={}, extra_headers={}, method={:?}, has_body={}",
                     msg.url,
@@ -1798,7 +1844,7 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                         extra_headers,
                         method,
                         body,
-                        audio_url: if msg.audio_url.is_empty() { None } else { Some(msg.audio_url) },
+                        audio_url: if audio_url.is_empty() { None } else { Some(audio_url) },
                         start_paused: msg.start_paused,
                         http_user: msg.http_user,
                         http_password: msg.http_password,
@@ -2266,6 +2312,61 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                             }
                         }
                     }
+                    PluginHubCmd::AuthenticatePlugin(msg) => {
+                        #[cfg(hub_plugins)]
+                        {
+                            if let Some(pm) = engine.manager.plugin_manager() {
+                                let identity = msg.identity.clone();
+                                let session_id = msg.session_id.clone();
+                                tokio::spawn(async move {
+                                    let result = pm
+                                        .authenticate(
+                                            &identity,
+                                            fluxdown_engine::plugin::AuthRequest {
+                                                action: msg.action,
+                                                site: msg.site,
+                                                auth_ref: msg.auth_ref,
+                                                session_id: msg.session_id,
+                                                input: msg.input,
+                                            },
+                                        )
+                                        .await;
+                                    let result = match result {
+                                        Ok(result) => crate::signals::PluginAuthResult {
+                                            identity,
+                                            status: result.status,
+                                            session_id: result.session_id,
+                                            challenge: result.challenge.unwrap_or_default(),
+                                            challenge_type: result.challenge_type.unwrap_or_default(),
+                                            message: result.message,
+                                            auth_ref: result.auth_ref.unwrap_or_default(),
+                                        },
+                                        Err(error) => crate::signals::PluginAuthResult {
+                                            identity,
+                                            status: "error".to_string(),
+                                            session_id,
+                                            challenge: String::new(),
+                                            challenge_type: String::new(),
+                                            message: error.to_string(),
+                                            auth_ref: String::new(),
+                                        },
+                                    };
+                                    result.send_signal_to_dart();
+                                });
+                            } else {
+                                crate::signals::PluginAuthResult {
+                                    identity: msg.identity,
+                                    status: "error".to_string(),
+                                    session_id: msg.session_id,
+                                    challenge: String::new(),
+                                    challenge_type: String::new(),
+                                    message: "插件系统未启用".to_string(),
+                                    auth_ref: String::new(),
+                                }
+                                .send_signal_to_dart();
+                            }
+                        }
+                    }
                     PluginHubCmd::SavePluginSettings(msg) => {
                         #[cfg(hub_plugins)]
                         {
@@ -2394,8 +2495,9 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                 let proxy_cfg = ProxyConfig::from_config_map(&all_cfg);
                 match fluxdown_engine::downloader::build_client(&proxy_cfg, "") {
                     Ok(client) => {
+                        let db = engine.db.clone();
                         tokio::spawn(async move {
-                            match fluxdown_engine::components::list_versions(&client).await {
+                            match fluxdown_engine::components::list_versions(&db, &client).await {
                                 Ok(v) => {
                                     FfmpegVersionList {
                                         ok: true,
@@ -2509,8 +2611,11 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
                 let proxy_cfg = ProxyConfig::from_config_map(&all_cfg);
                 match fluxdown_engine::downloader::build_client(&proxy_cfg, "") {
                     Ok(client) => {
+                        let db = engine.db.clone();
                         tokio::spawn(async move {
-                            match fluxdown_engine::components::list_ytdlp_versions(&client).await {
+                            match fluxdown_engine::components::list_ytdlp_versions(&db, &client)
+                                .await
+                            {
                                 Ok(v) => {
                                     YtdlpVersionList {
                                         ok: true,
@@ -2624,6 +2729,9 @@ pub async fn run(db_dir: PathBuf) -> Result<(), ActorError> {
             }
         }
     }
+    api_server_handle.shutdown();
+    super::shutdown_engine(engine, progress_task).await;
+    Ok(())
 }
 
 #[cfg(hub_plugins)]
@@ -2816,6 +2924,10 @@ async fn handle_api_command(
         ApiCommand::ContinueTask { task_id, ack } => {
             engine.manager.resume_task(&task_id).await;
             let _ = ack.send(());
+        }
+        ApiCommand::ChangeTaskUrl { task_id, url, ack } => {
+            let result = engine.manager.change_task_url(&task_id, &url).await;
+            let _ = ack.send(result);
         }
         ApiCommand::DeleteTask {
             task_id,
@@ -3126,6 +3238,11 @@ async fn apply_config_key(
             log_info!("[actor] updating cdn_multi_enabled to {}", v);
             engine.manager.set_cdn_multi_enabled(v);
         }
+        "multi_nic_enabled" => {
+            let v = value == "1" || value == "true";
+            log_info!("[actor] updating multi_nic_enabled to {}", v);
+            engine.manager.set_multi_nic_enabled(v);
+        }
         "cdn_max_nodes" => {
             if let Ok(v) = value.parse::<i32>() {
                 let v = v.clamp(0, 8);
@@ -3157,9 +3274,10 @@ async fn apply_config_key(
             engine.manager.set_use_server_time(v);
         }
         "file_exists_behavior" => {
-            let v = value == "overwrite";
-            log_info!("[actor] updating file_exists_behavior overwrite to {}", v);
-            engine.manager.set_file_exists_overwrite(v);
+            log_info!("[actor] updating file_exists_behavior to {}", value);
+            engine.manager.set_file_exists_behavior(
+                download_manager::FileExistsBehavior::from_config_str(value),
+            );
         }
         "file_missing_action" => {
             let v = value == "delete";

@@ -1,7 +1,7 @@
 #!/bin/sh
 # FluxDown Server 群晖套件生命周期脚本（DSM 6 / DSM 7 通用）。
-# DSM 7 由套件专属用户运行（conf/privilege run-as package），var 目录归属该用户；
-# DSM 6 以 root 运行。数据/日志均落在 /var/packages/FluxDown/var。
+# DSM 7 由套件专属用户 sc-fluxdown 运行（conf/privilege run-as package），var 目录
+# 归属该用户；DSM 6 以 root 运行。数据/日志均落在 /var/packages/FluxDown/var。
 PKG_NAME="FluxDown"
 PKG_DIR="/var/packages/${PKG_NAME}"
 TARGET_DIR="${SYNOPKG_PKGDEST:-${PKG_DIR}/target}"
@@ -13,10 +13,34 @@ is_running() {
 	[ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
 }
 
+# DSM 7：向导选定的共享文件夹（postinst 落在 var/share_name，data-share worker
+# 已授权 sc-fluxdown）。解析成绝对路径喂给 FLUXDOWN_SAVE_DIR 作首次默认保存目录；
+# 否则套件用户没有 HOME/Downloads，服务器只会回退到不可写的 cwd。
+# 优先 DSM ≥7.0-41201 提供的 /var/packages/<pkg>/shares/<name> 软链，
+# 再回退扫 /volume*/<name>。解析不到就留空 → 服务器走平台默认。
+resolve_share_dir() {
+	name_file="${VAR_DIR}/share_name"
+	[ -r "$name_file" ] || return 0
+	name=$(tr -d '\r\n' < "$name_file")
+	[ -n "$name" ] || return 0
+	link="${PKG_DIR}/shares/${name}"
+	if [ -d "$link" ]; then
+		printf '%s' "$link"
+		return 0
+	fi
+	for vol in /volume*; do
+		if [ -d "${vol}/${name}" ]; then
+			printf '%s' "${vol}/${name}"
+			return 0
+		fi
+	done
+}
+
 start_server() {
 	mkdir -p "$VAR_DIR"
 	FLUXDOWN_DATA_DIR="$VAR_DIR" \
 	FLUXDOWN_BIND="0.0.0.0:17800" \
+	FLUXDOWN_SAVE_DIR="$(resolve_share_dir)" \
 		"$TARGET_DIR/bin/fluxdown-server" >> "$LOG_FILE" 2>&1 &
 	echo $! > "$PID_FILE"
 }

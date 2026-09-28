@@ -38,6 +38,8 @@ pub struct ParsedItem {
     pub link: String,
     /// enclosure 直链（`.torrent`/媒体直链；空 = 无 enclosure）。
     pub enclosure_url: String,
+    /// 可选二段解析标识；非空时由核心把条目 link 交给对应 resolver。
+    pub resolver_item: String,
     /// enclosure 声明大小（字节，0 = 未知）。
     pub enclosure_length: i64,
     /// 发布时间（Unix 秒，0 = 未知）。
@@ -168,6 +170,7 @@ fn map_entry(entry: &Entry) -> ParsedItem {
         title,
         link,
         enclosure_url,
+        resolver_item: String::new(),
         enclosure_length,
         pub_date: entry
             .published

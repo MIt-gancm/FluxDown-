@@ -15,6 +15,7 @@ pub(crate) mod ed2k;
 pub(crate) mod general;
 pub(crate) mod notify;
 pub(crate) mod proxy;
+pub(crate) mod rate_limit;
 pub(crate) mod site_auth;
 pub(crate) mod subscription;
 pub(crate) mod user_agent;
@@ -23,13 +24,11 @@ pub(crate) mod webhook_dialog;
 
 use fluxdown_protocol::{DaemonConfigKind, daemon_config_field};
 use fluxdown_ui_i18n::Translator;
-use gpui::{AnyView, App, Entity, IntoElement as _, ParentElement as _, SharedString};
-use gpui_component::{
-    Icon, IconName,
-    setting::{NumberFieldOptions, SettingField, SettingGroup, SettingItem, SettingPage},
-};
+use gpui::{AnyView, App, Entity, ParentElement as _, SharedString};
+use gpui_component::Icon;
 
 use crate::store::SettingsStore;
+use crate::ui::{Control, SettingsPage, SettingsRow, SettingsSection, SettingsTab, meta_text};
 
 /// 分区构建上下文：存储实体 + 当前语言的翻译快照 + 翻译实体 + app 注入的内容槽。
 pub(crate) struct SectionContext<'a> {
@@ -51,23 +50,22 @@ impl SectionContext<'_> {
 
     // ───────────────────────── daemon 字段 ─────────────────────────
 
-    pub(crate) fn daemon_switch(&self, key: &'static str) -> SettingField<bool> {
+    pub(crate) fn daemon_switch(&self, key: &'static str) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::switch(
+        Control::switch(
             move |cx: &App| get.read(cx).daemon_bool(key),
             move |value, cx: &mut App| {
                 set.update(cx, |store, cx| store.set_daemon_bool(key, value, cx));
             },
         )
-        .default_value(default_bool(key))
     }
 
-    pub(crate) fn daemon_number(&self, key: &'static str) -> SettingField<f64> {
+    pub(crate) fn daemon_number(&self, key: &'static str) -> Control {
         self.daemon_number_with(key, 1.0)
     }
 
-    pub(crate) fn daemon_number_with(&self, key: &'static str, step: f64) -> SettingField<f64> {
+    pub(crate) fn daemon_number_with(&self, key: &'static str, step: f64) -> Control {
         let get = self.store();
         let set = self.store();
         let (min, max, float) = match daemon_config_field(key).map(|field| field.kind) {
@@ -75,8 +73,10 @@ impl SectionContext<'_> {
             Some(DaemonConfigKind::Float { min }) => (min, f64::MAX, true),
             _ => (f64::MIN, f64::MAX, false),
         };
-        SettingField::number_input(
-            NumberFieldOptions { min, max, step },
+        Control::number(
+            min,
+            max,
+            step,
             move |cx: &App| {
                 if float {
                     get.read(cx).daemon_f64(key)
@@ -94,49 +94,38 @@ impl SectionContext<'_> {
                 });
             },
         )
-        .default_value(default_f64(key))
     }
 
-    pub(crate) fn daemon_input(&self, key: &'static str) -> SettingField<SharedString> {
+    pub(crate) fn daemon_input(&self, key: &'static str) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::input(
+        Control::input(
             move |cx: &App| SharedString::from(get.read(cx).daemon_str(key)),
             move |value: SharedString, cx: &mut App| {
                 set.update(cx, |store, cx| store.set_daemon(key, value.to_string(), cx));
             },
         )
-        .default_value(SharedString::from(
-            fluxdown_protocol::daemon_config_default(key),
-        ))
     }
 
-    /// 枚举下拉：`options` 为 `(wire 值, 文案)`；默认取协议目录。
+    /// 枚举下拉：`options` 为 `(wire 值, 文案)`。
     pub(crate) fn daemon_dropdown(
         &self,
         key: &'static str,
         options: Vec<(SharedString, SharedString)>,
-    ) -> SettingField<SharedString> {
+    ) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::dropdown(
+        Control::dropdown(
             options,
             move |cx: &App| SharedString::from(get.read(cx).daemon_str(key)),
             move |value: SharedString, cx: &mut App| {
                 set.update(cx, |store, cx| store.set_daemon(key, value.to_string(), cx));
             },
         )
-        .default_value(SharedString::from(
-            fluxdown_protocol::daemon_config_default(key),
-        ))
     }
 
     /// 由协议目录的枚举值生成下拉，文案键为 `{prefix}{Value}`（首字母大写驼峰）。
-    pub(crate) fn daemon_enum_dropdown(
-        &self,
-        key: &'static str,
-        label_prefix: &str,
-    ) -> SettingField<SharedString> {
+    pub(crate) fn daemon_enum_dropdown(&self, key: &'static str, label_prefix: &str) -> Control {
         let values: &[&str] = match daemon_config_field(key).map(|field| field.kind) {
             Some(DaemonConfigKind::Enum(values)) => values,
             _ => &[],
@@ -155,26 +144,21 @@ impl SectionContext<'_> {
 
     // ───────────────────────── 偏好字段 ─────────────────────────
 
-    pub(crate) fn pref_switch(&self, key: &'static str, default: bool) -> SettingField<bool> {
+    pub(crate) fn pref_switch(&self, key: &'static str, default: bool) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::switch(
+        Control::switch(
             move |cx: &App| get.read(cx).pref_bool(key, default),
             move |value, cx: &mut App| {
                 set.update(cx, |store, cx| store.set_pref_bool(key, value, cx));
             },
         )
-        .default_value(default)
     }
 
-    pub(crate) fn pref_input(
-        &self,
-        key: &'static str,
-        default: &'static str,
-    ) -> SettingField<SharedString> {
+    pub(crate) fn pref_input(&self, key: &'static str, default: &'static str) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::input(
+        Control::input(
             move |cx: &App| SharedString::from(get.read(cx).pref_str(key, default)),
             move |value: SharedString, cx: &mut App| {
                 set.update(cx, |store, cx| {
@@ -182,7 +166,6 @@ impl SectionContext<'_> {
                 });
             },
         )
-        .default_value(SharedString::from(default))
     }
 
     pub(crate) fn pref_number(
@@ -191,15 +174,13 @@ impl SectionContext<'_> {
         default: i64,
         min: i64,
         max: i64,
-    ) -> SettingField<f64> {
+    ) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::number_input(
-            NumberFieldOptions {
-                min: min as f64,
-                max: max as f64,
-                step: 1.0,
-            },
+        Control::number(
+            min as f64,
+            max as f64,
+            1.0,
             move |cx: &App| get.read(cx).pref_i64(key, default) as f64,
             move |value, cx: &mut App| {
                 set.update(cx, |store, cx| {
@@ -207,7 +188,6 @@ impl SectionContext<'_> {
                 });
             },
         )
-        .default_value(default as f64)
     }
 
     pub(crate) fn pref_dropdown(
@@ -215,10 +195,10 @@ impl SectionContext<'_> {
         key: &'static str,
         default: &'static str,
         options: Vec<(SharedString, SharedString)>,
-    ) -> SettingField<SharedString> {
+    ) -> Control {
         let get = self.store();
         let set = self.store();
-        SettingField::dropdown(
+        Control::dropdown(
             options,
             move |cx: &App| SharedString::from(get.read(cx).pref_str(key, default)),
             move |value: SharedString, cx: &mut App| {
@@ -227,34 +207,25 @@ impl SectionContext<'_> {
                 });
             },
         )
-        .default_value(SharedString::from(default))
     }
 
     // ───────────────────────── 条目 ─────────────────────────
 
-    /// 标题 + 可选描述的标准条目；描述键不存在时不显示描述。
-    pub(crate) fn item<F>(&self, title_key: &str, desc_key: Option<&str>, field: F) -> SettingItem
-    where
-        F: gpui_component::setting::AnySettingField + 'static,
-    {
-        let mut item = SettingItem::new(self.t(title_key), field);
+    /// 标题 + 可选描述的标准行；描述键不存在时不显示描述。
+    pub(crate) fn item(
+        &self,
+        title_key: &str,
+        desc_key: Option<&str>,
+        control: Control,
+    ) -> SettingsRow {
+        let mut row = SettingsRow::new(self.t(title_key), control);
         if let Some(desc_key) = desc_key
             && self.translator.text(desc_key) != desc_key
         {
-            item = item.description(self.t(desc_key));
+            row = row.description(self.t(desc_key));
         }
-        item
+        row
     }
-}
-
-fn default_bool(key: &str) -> bool {
-    matches!(fluxdown_protocol::daemon_config_default(key), "true" | "1")
-}
-
-fn default_f64(key: &str) -> f64 {
-    fluxdown_protocol::daemon_config_default(key)
-        .parse()
-        .unwrap_or(0.0)
 }
 
 /// `delete_files` → `DeleteFiles`；`or` → `Or`。
@@ -274,21 +245,20 @@ pub(crate) fn camel(value: &str) -> String {
 /// 由外部 capability 提供内容的整页（账户 / 扩展）；槽位为空时显示分类描述。
 pub(crate) fn slot_page(
     ctx: &SectionContext,
+    key: &'static str,
     title_key: &str,
     desc_key: &str,
-    icon: IconName,
+    icon: impl Into<Icon>,
     view: Option<AnyView>,
-) -> SettingPage {
-    let description = ctx.t(desc_key);
-    let item = match view {
-        Some(view) => SettingItem::render(move |_, _, _| view.clone().into_any_element()),
-        None => SettingItem::render(move |_, _, _| {
-            gpui::div().child(description.clone()).into_any_element()
-        }),
-    };
-    SettingPage::new(ctx.t(title_key))
-        .icon(Icon::new(icon))
-        .description(ctx.t(desc_key))
-        .resettable(false)
-        .group(SettingGroup::new().item(item))
+) -> SettingsPage {
+    let page = SettingsPage::new(key, ctx.t(title_key), ctx.t(desc_key), icon);
+    match view {
+        Some(view) => page.tab(SettingsTab::new("", SharedString::default()).view(view)),
+        None => {
+            let description = ctx.t(desc_key);
+            page.sections([SettingsSection::new().row(SettingsRow::custom(
+                move |_, _, _, cx: &mut App| meta_text(cx).child(description.clone()),
+            ))])
+        }
+    }
 }

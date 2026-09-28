@@ -1,0 +1,11 @@
+#!/bin/sh
+# DSM 7 postinst / postupgrade：把向导选定的共享文件夹名持久化到 var/share_name。
+# 向导变量只在安装脚本环境里可见，start-stop-status 拿不到，只能落盘转交。
+# 任何失败都不阻塞安装（exit 0）：没有这个文件时启动脚本回退平台默认目录。
+VAR_DIR="${SYNOPKG_PKGVAR:-/var/packages/FluxDown/var}"
+name=$(printf '%s' "${wizard_share_name:-}" | tr -d '\r\n')
+if [ -n "$name" ]; then
+	mkdir -p "$VAR_DIR" 2>/dev/null
+	printf '%s\n' "$name" > "$VAR_DIR/share_name" 2>/dev/null
+fi
+exit 0

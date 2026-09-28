@@ -6,6 +6,7 @@ import '../i18n/locale_provider.dart';
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
 import '../models/download_task.dart';
+import '../models/plugin_provider.dart';
 import '../models/rss_provider.dart';
 import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
@@ -19,24 +20,31 @@ Future<void> showRssWizardDialog(
   BuildContext context,
   RssProvider rss,
   DownloadController controller,
+  PluginProvider pluginProvider,
 ) {
   return showShadDialog(
     context: context,
     barrierColor: AppColors.of(context).dialogBarrier,
     animateIn: const [],
     animateOut: const [],
-    builder: (_) => RssWizardDialog(rss: rss, controller: controller),
+    builder: (_) => RssWizardDialog(
+      rss: rss,
+      controller: controller,
+      pluginProvider: pluginProvider,
+    ),
   );
 }
 
 class RssWizardDialog extends StatefulWidget {
   final RssProvider rss;
   final DownloadController controller;
+  final PluginProvider pluginProvider;
 
   const RssWizardDialog({
     super.key,
     required this.rss,
     required this.controller,
+    required this.pluginProvider,
   });
 
   @override
@@ -57,6 +65,8 @@ class _RssWizardDialogState extends State<RssWizardDialog> {
 
   String _queueId = kMainQueueId;
   bool _autoDownload = true;
+  String _providerId = 'rss';
+  String _providerConfig = '';
 
   @override
   void initState() {
@@ -86,6 +96,7 @@ class _RssWizardDialogState extends State<RssWizardDialog> {
   }
 
   void _validate() {
+    if (_providerId != 'rss') return;
     final url = _urlCtrl.text.trim();
     if (url.isEmpty) return;
     setState(() {
@@ -103,6 +114,8 @@ class _RssWizardDialogState extends State<RssWizardDialog> {
         // 首次流程刻意只问 URL / 队列 / 目录 / 自动下载四项（设计文档 P1），
         // 其余一律取引擎默认值——rinf 生成的构造器没有默认值，只能在这里写全。
         sourceId: '',
+        providerId: _providerId,
+        providerConfig: _providerConfig,
         url: url,
         name: _result?.feedTitle ?? '',
         enabled: true,
@@ -140,22 +153,40 @@ class _RssWizardDialogState extends State<RssWizardDialog> {
     final s = LocaleScope.of(context);
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
+    final providerOptions = <String, String>{'rss': 'RSS'};
+    for (final plugin in widget.pluginProvider.plugins) {
+      if (!plugin.enabled || plugin.loadStatus == 'Failed') continue;
+      for (final id in plugin.subscriptionProviderIds) {
+        providerOptions.putIfAbsent(id, () => '${plugin.name} · $id');
+      }
+    }
     final validated = _result != null && _result!.error.isEmpty;
+    // 插件 provider 没有「验证」步骤，按钮直接是「订阅」；URL 为空时禁用，
+    // 而不是让 _subscribe 静默 return（web 端同场景会报 rss.urlRequired）。
+    final urlEmpty = _urlCtrl.text.trim().isEmpty;
     return ShadDialog(
       title: Text(s.rssAddSource),
-      description: Text(validated ? s.rssWizardStep2 : s.rssWizardStep1),
+      description: Text(
+        _providerId == 'rss'
+            ? (validated ? s.rssWizardStep2 : s.rssWizardStep1)
+            : s.rssProviderPluginHint,
+      ),
       actions: [
         ShadButton.outline(
           onPressed: () => Navigator.of(context).pop(),
           child: Text(s.cancel),
         ),
         ShadButton(
-          onPressed: _validating
+          onPressed: _validating || urlEmpty
               ? null
-              : validated
+              : _providerId != 'rss' || validated
               ? _subscribe
               : _validate,
-          child: Text(validated ? s.rssWizardSubscribe : s.rssWizardValidate),
+          child: Text(
+            _providerId != 'rss' || validated
+                ? s.rssWizardSubscribe
+                : s.rssWizardValidate,
+          ),
         ),
       ],
       child: SizedBox(
@@ -166,6 +197,32 @@ class _RssWizardDialogState extends State<RssWizardDialog> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
+              Text(
+                s.rssProviderLabel,
+                style: TextStyle(
+                  fontSize: 11.5,
+                  fontWeight: FontWeight.w500,
+                  color: c.textSecondary,
+                ),
+              ),
+              const SizedBox(height: 6),
+              ShadSelect<String>(
+                initialValue: _providerId,
+                options: [
+                  for (final entry in providerOptions.entries)
+                    ShadOption(value: entry.key, child: Text(entry.value)),
+                ],
+                selectedOptionBuilder: (ctx, value) => Text(providerOptions[value] ?? value),
+                onChanged: (value) {
+                  if (value == null) return;
+                  setState(() {
+                    _providerId = value;
+                    _result = null;
+                    if (value == 'rss') _providerConfig = '';
+                  });
+                },
+              ),
+              const SizedBox(height: 14),
               Text(
                 s.rssUrlLabel,
                 style: TextStyle(
@@ -183,8 +240,9 @@ class _RssWizardDialogState extends State<RssWizardDialog> {
                   if (!_validating && !validated) _validate();
                 },
                 onChanged: (_) {
-                  // 改地址即作废上一次验证结果，避免用旧 feed 标题建新订阅。
-                  if (_result != null) setState(() => _result = null);
+                  // 改地址即作废上一次验证结果，避免用旧 feed 标题建新订阅；
+                  // 同时刷新按钮的空 URL 禁用态。
+                  setState(() => _result = null);
                 },
               ),
               const SizedBox(height: 6),

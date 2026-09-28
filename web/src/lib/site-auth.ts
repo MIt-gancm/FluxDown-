@@ -2,24 +2,6 @@
 // 引擎 site_auth::site_key 逐字一致 —— 仅 http/https，键 = 小写 host，端口显式且非协议
 // 默认（http:80 / https:443）才追加 `:port`。new URL().port 对默认端口本就返回 ''。
 
-/** config 键 site_auth_credentials 的 JSON 形态：站点键（host[:port]）→ 明文凭据。 */
-export interface SiteAuthEntry {
-  user: string
-  pass: string
-}
-
-/** 解析凭据表 JSON；损坏/缺失按空表处理，仅影响展示与回填，不主动覆写。 */
-export function parseSiteAuthStore(raw: string | undefined): Record<string, SiteAuthEntry> {
-  if (!raw) return {}
-  try {
-    const v: unknown = JSON.parse(raw)
-    if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, SiteAuthEntry>
-  } catch {
-    // 损坏的 JSON 按空处理。
-  }
-  return {}
-}
-
 /** 从下载 URL 提取站点键：仅 http/https，其余协议或解析失败返回 null。 */
 export function siteKeyFromUrl(url: string): string | null {
   try {
@@ -52,11 +34,12 @@ export function normalizeSiteKey(raw: string): string | null {
 
 /** 凭据列表模糊过滤 + 站点字典序排序：查询串按空白拆词，**每个词**都必须是
  *  `站点 + ' ' + 用户名` 的子串（大小写不敏感）。空查询返回全部。
- *  规则与桌面端 `filterSiteAuth`（Dart）保持一致。 */
+ *  规则与桌面端 `filterSiteAuth`（Dart）保持一致。只读 user 字段：入参收窄为该形状，
+ *  避免与 REST 列表 DTO（`types.ts` 的 `SiteAuthEntry`，无 pass 字段）产生类型冲突。 */
 export function filterSiteAuth(
-  store: Record<string, SiteAuthEntry>,
+  store: Record<string, { user: string }>,
   query: string,
-): [string, SiteAuthEntry][] {
+): [string, { user: string }][] {
   const entries = Object.entries(store).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
   const terms = query.toLowerCase().split(/\s+/).filter(Boolean)
   if (terms.length === 0) return entries

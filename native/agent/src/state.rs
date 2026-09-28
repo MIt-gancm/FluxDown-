@@ -53,6 +53,8 @@ pub struct AgentState {
     pub gateway_migration_revision: Option<u64>,
     pub analytics_install_reported: bool,
     pub analytics_last_active_day: u64,
+    /// 调试构建下用户覆盖的 FluxCloud 地址；正式构建启动时忽略（锁定固定地址）。
+    pub cloud_base_url_override: Option<String>,
 }
 
 /// 私有状态存储错误。

@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
-import 'package:tray_manager_example/pages/home.dart';
+
+import 'pages/home.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();

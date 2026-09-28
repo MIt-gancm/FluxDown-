@@ -98,8 +98,9 @@ class LogService {
   /// 最近一次日志基础设施失败。
   String? get lastError => _lastError;
 
-  /// 日志目录
-  late final Directory _logDir;
+  /// 日志目录。移动端可经 [relocateTo]（#533）在运行期迁移到外部可访问目录，
+  /// 因此非 `final`。
+  late Directory _logDir;
 
   /// 暴露日志目录路径，供导出日志等功能使用。
   Directory get logDir => _logDir;
@@ -361,6 +362,46 @@ class LogService {
     } catch (_) {}
     _raf = null;
     _initialized = false;
+  }
+
+  /// 将日志目录迁移到 [newDir]（#533：Android 把日志从应用内部私有存储
+  /// 迁到 `Android/data/<pkg>/files/logs`，使 adb / 电脑无需 Root 即可直接
+  /// 读取）。
+  ///
+  /// 旧目录里已有的 `fluxdown_*.log` 文件原样搬过去（先复制再删除旧文件，
+  /// 避免同分区 rename 在部分厂商 ROM 上跨越 FUSE 挂载点失败）；单个文件
+  /// 迁移失败时保留在旧目录，不影响其余文件与后续写入。
+  /// 迁移期间日志会短暂中断（`_rotateSink` 重开新目录下的文件），但不会
+  /// 丢失——旧文件已先行拷贝。失败时静默保留原目录，继续写旧位置。
+  Future<void> relocateTo(Directory newDir) async {
+    if (!_initialized) return;
+    if (p.equals(newDir.path, _logDir.path)) return;
+    try {
+      if (!newDir.existsSync()) newDir.createSync(recursive: true);
+      final oldDir = _logDir;
+      _closeRaf();
+      _currentDateTag = null;
+      if (oldDir.existsSync()) {
+        for (final entity in oldDir.listSync()) {
+          if (entity is! File) continue;
+          final name = p.basename(entity.path);
+          if (!_logNamePattern.hasMatch(name)) continue;
+          try {
+            final dest = File(p.join(newDir.path, name));
+            if (!dest.existsSync()) {
+              entity.copySync(dest.path);
+            }
+            entity.deleteSync();
+          } catch (_) {
+            // 单文件迁移失败：留在旧目录，不影响其余文件。
+          }
+        }
+      }
+      _logDir = newDir;
+      _rotateSink();
+    } catch (e, stack) {
+      _recordFailure('relocate log directory', e, stack);
+    }
   }
 
   // ── 内部 ──

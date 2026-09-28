@@ -282,8 +282,11 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      # packages 显式指定：默认值含已下架的 legacy `tools` 包，会导致 sdkmanager 失败
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
       - name: Setup Rust Android targets
         uses: dtolnay/rust-toolchain@stable
         with:

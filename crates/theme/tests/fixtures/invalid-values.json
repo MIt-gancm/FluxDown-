@@ -1,0 +1,21 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "meta": { "name": 5 },
+  "extends": "builtin:dracula",
+  "tokens": {
+    "colors": {
+      "primary": "blue",
+      "success": "{radius.md}",
+      "warning": "{colors.nope}",
+      "info": "#12345"
+    },
+    "radius": { "md": "8px", "lg": 10 },
+    "spacing": "wide",
+    "typography": { "sans": 5, "sm": { "weight": "bold" } },
+    "shadow": { "md": "big", "lg": [{ "blur": "x" }] },
+    "stroke": { "thin": "{stroke.strong}/50" },
+    "components": { "input": { "radius": 12 } }
+  },
+  "dark": { "colors": { "primary": "#FF000" } }
+}

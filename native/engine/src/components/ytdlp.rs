@@ -234,10 +234,13 @@ mod install {
 
     /// 列出近期可安装版本（排除 draft/prerelease；GitHub 返回即按新→旧）。
     pub async fn list_ytdlp_versions(
+        db: &Db,
         client: &reqwest::Client,
     ) -> Result<YtdlpVersions, ComponentError> {
         platform_asset().ok_or(ComponentError::Unsupported)?;
-        let releases = super::super::fetch_versions_json(client, "ytdlp", RELEASES_API).await?;
+        let mirror_base = super::super::component_mirror_base(db).await;
+        let releases =
+            super::super::fetch_versions_json(client, "ytdlp", RELEASES_API, &mirror_base).await?;
         let empty = Vec::new();
         let arr = releases.as_array().unwrap_or(&empty);
         let versions: Vec<String> = arr
@@ -268,11 +271,13 @@ mod install {
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<YtdlpStatus, ComponentError> {
         let asset = platform_asset().ok_or(ComponentError::Unsupported)?;
+        let mirror_base = super::super::component_mirror_base(db).await;
         let url = match version {
             Some(tag) => format!("{RELEASE_TAG_API}{tag}"),
             None => RELEASE_LATEST_API.to_string(),
         };
-        let release = super::super::fetch_github_json(client, &url).await?;
+        let release =
+            super::super::fetch_github_json_with_mirror(client, &url, &mirror_base).await?;
         let chosen_ver = release["tag_name"]
             .as_str()
             .filter(|s| !s.is_empty())
@@ -294,7 +299,7 @@ mod install {
             .map_err(|e| ComponentError::Io(e.to_string()))?;
         let target = managed_ytdlp_path(data_dir);
         let tmp = bin_dir.join("yt-dlp.download");
-        super::super::download_to_file(client, &dl_url, &tmp, progress).await?;
+        super::super::download_to_file(client, &dl_url, &mirror_base, &tmp, progress).await?;
 
         #[cfg(unix)]
         {

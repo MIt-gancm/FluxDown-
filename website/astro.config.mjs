@@ -133,14 +133,33 @@ export default defineConfig({
         optional: true,
       }),
 
-      // ── 可选：国内下载镜像（githubProxy 服务）根地址 ──
-      // /api/download 对 CN 地域请求 302 到 `${MIRROR_BASE_URL}/releases/<tag>/<file>`，
-      // 镜像不可达或未持有资产时自动回退 GitHub 直连。
-      MIRROR_BASE_URL: envField.string({
+      // ── 可选：阿里云 OSS 发布资产源（/api/download 优先 302 到此处，缺失回退 GitHub）──
+      // 对象布局 `<OSS_RELEASE_PREFIX>/<tag>/<file>`，与 .github/actions/oss-upload 一致。
+      // bucket 私有：官网用 AK/SK 签发 1h 预签名 URL；未配 AK/SK 时整条 OSS 路径关闭。
+      OSS_ACCESS_KEY_ID: envField.string({
         context: "server",
         access: "secret",
-        default: "https://mirror.qwld.cn",
         optional: true,
+      }),
+      OSS_ACCESS_KEY_SECRET: envField.string({
+        context: "server",
+        access: "secret",
+        optional: true,
+      }),
+      OSS_BUCKET: envField.string({
+        context: "server",
+        access: "secret",
+        default: "zerx-lab",
+      }),
+      OSS_ENDPOINT: envField.string({
+        context: "server",
+        access: "secret",
+        default: "oss-cn-beijing.aliyuncs.com",
+      }),
+      OSS_RELEASE_PREFIX: envField.string({
+        context: "server",
+        access: "secret",
+        default: "FluxDownRelease",
       }),
 
       // ── 赞助名录（Sponsor Wall）──
@@ -191,17 +210,6 @@ export default defineConfig({
         optional: true,
       }),
       SMTP_PASS: envField.string({
-        context: "server",
-        access: "secret",
-        optional: true,
-      }),
-
-      // ── 可选：中国大陆 GitHub 下载加速镜像列表（逗号分隔，覆盖内置默认值）──
-      // 例: https://ghproxy.net（默认，hunshcn/gh-proxy 公共实例，CF 加速）
-      // 注意：入选前核查 Google Safe Browsing 状态（ghfast.top 曾被拉黑，
-      // Chrome 弹全屏警告）；"地址发布页"如 ghproxy.link 不是代理，不可填
-      // 镜像不可用时下载路由自动降级到 GitHub 直连
-      DOWNLOAD_MIRRORS: envField.string({
         context: "server",
         access: "secret",
         optional: true,

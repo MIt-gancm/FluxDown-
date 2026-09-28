@@ -9,9 +9,35 @@ use crate::downloader::{
     DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, ProgressUpdate, TEMP_EXT,
     extract_from_url, sanitize_filename,
 };
+use crate::events::EventSink;
 use crate::logger::log_info;
 use crate::model::HlsQualityOption;
+use crate::output;
 use crate::selection::SelectionOutcome;
+use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferTracker};
+
+fn dash_runtime(task_id: &str, state: &ProgressState) -> TaskRuntime {
+    TaskRuntime {
+        task_id: task_id.to_owned(),
+        sampled_at_ms: chrono::Utc::now().timestamp_millis(),
+        sample_sequence: crate::transfer_activity::next_sample_sequence(),
+        active_transfers: Some(state.tracker.active()),
+        connected_peers: None,
+        parallelism_limit: Some(1),
+        total_bytes: state.total_bytes,
+        segments: state
+            .geometry
+            .iter()
+            .map(|s| TaskSegment {
+                index: s.index,
+                start_byte: s.start_byte,
+                end_byte: s.end_byte,
+                downloaded_bytes: s.downloaded_bytes,
+                active: s.active,
+            })
+            .collect(),
+    }
+}
 
 fn is_same_origin(base_url: &str, target_url: &str) -> bool {
     let base = match url::Url::parse(base_url) {
@@ -66,6 +92,8 @@ struct ProgressState {
     total_bytes: i64,
     last_report: std::time::Instant,
     last_db_save: std::time::Instant,
+    tracker: TransferTracker,
+    geometry: Vec<crate::downloader::SegmentProgressInfo>,
 }
 
 struct SegmentDownloadContext<'a> {
@@ -82,6 +110,7 @@ struct SegmentDownloadContext<'a> {
     progress_tx: &'a tokio::sync::mpsc::Sender<ProgressUpdate>,
     /// 块级 DB 进度持久化（5s 节流，单调写入防进度回退）。
     db: &'a crate::db::Db,
+    sink: &'a dyn EventSink,
 }
 
 pub async fn run_dash_download(params: DownloadParams) {
@@ -399,6 +428,8 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         total_bytes: 0,
         last_report: std::time::Instant::now(),
         last_db_save: std::time::Instant::now(),
+        tracker: TransferTracker::new(),
+        geometry: Vec::new(),
     };
 
     let video_bytes = download_track(
@@ -411,6 +442,15 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
     )
     .await?;
 
+    if video_bytes > 0 {
+        progress_state.geometry = vec![crate::downloader::SegmentProgressInfo {
+            index: -1,
+            start_byte: 0,
+            end_byte: video_bytes - 1,
+            downloaded_bytes: video_bytes,
+            active: Some(false),
+        }];
+    }
     let audio_adaptation = period.adaptations.iter().find(|a| is_audio_adaptation(a));
     let audio_bytes = if let Some(audio) = audio_adaptation {
         if audio.representations.is_empty() {
@@ -687,9 +727,12 @@ async fn download_track_coordinated(
         scope,
         p.spawn_gen,
         false, // DASH 轨：段数由轨长顾问决定，不走 hint 解封
-        // DASH 轨对不做 Auto 热切换（v1 边界：轨对是短分段串行流，切换收益
-        // 低且与 mux 时序纠缠）；启动期缓存决策/failover 已覆盖代理选择。
+        // DASH 轨对不做 Auto 多路径（v1 边界：轨对是短分段串行流，改道收益
+        // 低且与 mux 时序纠缠）；启动期先验起飞/failover 已覆盖代理选择。
         None,
+        // 轨对是大文件 HTTP 分段流，额外网卡链路直接增益；规划与挂载全在
+        // coordinator 内完成，与 mux 时序无关。
+        p.multi_nic.clone(),
     )
     .await;
 
@@ -790,6 +833,8 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
         total_bytes,
         last_report: std::time::Instant::now(),
         last_db_save: std::time::Instant::now(),
+        tracker: TransferTracker::new(),
+        geometry: Vec::new(),
     };
 
     // 每条轨道即一个完整媒体流 → 单分段、无 init、无 range（单流回退路径用）。
@@ -842,6 +887,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
                     start_byte: 0,
                     end_byte: v - 1,
                     downloaded_bytes: v,
+                    active: Some(false),
                 }]),
                 ..Default::default()
             })
@@ -863,6 +909,15 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     // 多段/跳过路径不经 progress_state 累计（coordinator 自行上报），此处校准
     // 基线，保证音频轨阶段的单流进度上报包含视频轨已下字节。
     progress_state.downloaded_bytes = progress_state.downloaded_bytes.max(video_bytes);
+    if video_bytes > 0 {
+        progress_state.geometry = vec![crate::downloader::SegmentProgressInfo {
+            index: -1,
+            start_byte: 0,
+            end_byte: video_bytes - 1,
+            downloaded_bytes: video_bytes,
+            active: Some(false),
+        }];
+    }
 
     let audio_path = build_audio_path(&dest_path);
     // 音频轨 FS 真值跳过（与视频轨对称）：mux 阶段取消的任务 resume 时，
@@ -924,6 +979,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
                     start_byte: 0,
                     end_byte: pair_actual - 1,
                     downloaded_bytes: pair_actual,
+                    active: Some(false),
                 }]),
                 ..Default::default()
             })
@@ -1740,9 +1796,7 @@ async fn download_track_inner(
     temp_path: &Path,
     progress_state: &mut ProgressState,
 ) -> Result<i64, DownloadError> {
-    if let Some(parent) = temp_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    output::ensure_parent(temp_path).await?;
 
     let mut file = File::create(temp_path).await?;
     let mut total_track: i64 = 0;
@@ -1757,6 +1811,7 @@ async fn download_track_inner(
         referrer: &p.referrer,
         progress_tx: &p.progress_tx,
         db: &p.db,
+        sink: p.sink.as_ref(),
     };
 
     let segment_iter = init_seg.iter().chain(media_segs.iter());
@@ -1808,7 +1863,12 @@ async fn download_track_inner(
                     status: 1,
                     error_message: String::new(),
                     file_name: String::new(),
-                    segment_details: None,
+                    segment_details: if progress_state.geometry.is_empty() {
+                        None
+                    } else {
+                        Some(progress_state.geometry.clone())
+                    },
+                    runtime: Some(dash_runtime(&p.task_id, progress_state)),
                     ..Default::default()
                 })
                 .await;
@@ -1861,6 +1921,7 @@ async fn download_segment_with_retry(
             .map_err(|e| DownloadError::Other(format!("failed to get file position: {e}")))?;
         // 快照进度：失败重试会 set_len 回退本段已写字节，进度须同步回滚。
         let progress_snapshot = progress_state.downloaded_bytes;
+        let geometry_len = progress_state.geometry.len();
 
         match download_segment_streaming(ctx, url, range, file, speed_limiter, progress_state).await
         {
@@ -1870,6 +1931,7 @@ async fn download_segment_with_retry(
                 file.set_len(start_pos).await?;
                 file.seek(std::io::SeekFrom::Start(start_pos)).await?;
                 progress_state.downloaded_bytes = progress_snapshot;
+                progress_state.geometry.truncate(geometry_len);
 
                 attempts += 1;
                 if attempts >= MAX_RETRIES {
@@ -1886,6 +1948,20 @@ async fn download_segment_with_retry(
                     MAX_RETRIES,
                     e
                 );
+                if let Err(journal_error) = crate::task_activity::record(
+                    ctx.db,
+                    ctx.sink,
+                    ctx.task_id,
+                    "retry",
+                    format!(
+                        "DASH 段 {seg_idx} 第 {attempts}/{MAX_RETRIES} 次尝试失败，即将重试：{e}"
+                    ),
+                    None,
+                )
+                .await
+                {
+                    crate::log_error!("[task-activity] failed to persist retry: {}", journal_error);
+                }
                 let delay = RETRY_BASE_DELAY * 2u32.saturating_pow(attempts - 1);
                 tokio::select! {
                     _ = ctx.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
@@ -1959,14 +2035,35 @@ async fn download_segment_streaming(
         None
     };
 
+    let geometry_index = progress_state.geometry.len() as i32;
+    let geometry_pos = progress_state.downloaded_bytes;
+    if let Some(length) = resp
+        .content_length()
+        .filter(|_| encoding.is_none())
+        .and_then(|n| i64::try_from(n).ok())
+        && length > 0
+    {
+        progress_state
+            .geometry
+            .push(crate::downloader::SegmentProgressInfo {
+                index: geometry_index,
+                start_byte: geometry_pos,
+                end_byte: geometry_pos.saturating_add(length).saturating_sub(1),
+                downloaded_bytes: 0,
+                active: Some(true),
+            });
+    }
     let raw_stream = resp.bytes_stream();
     let mut stream = crate::downloader::maybe_decompress_stream(raw_stream, encoding);
     let mut written: i64 = 0;
 
     loop {
-        let chunk = tokio::select! {
-            _ = ctx.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
-            c = stream.next() => c,
+        let chunk = {
+            let _transfer = progress_state.tracker.start(geometry_index);
+            tokio::select! {
+                _ = ctx.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
+                c = stream.next() => c,
+            }
         };
         let Some(chunk_result) = chunk else {
             break;
@@ -1994,6 +2091,11 @@ async fn download_segment_streaming(
         }
         written += chunk_len as i64;
         progress_state.downloaded_bytes += chunk_len as i64;
+        if let Some(segment) = progress_state.geometry.last_mut()
+            && segment.index == geometry_index
+        {
+            segment.downloaded_bytes = written;
+        }
 
         // 块级进度上报（200ms 节流）：track-pair 模式整轨即单 segment，若只在
         // segment 完成后上报，UI 将全程无进度（BUG：YouTube 240MB 轨 0% 挂满全场）。
@@ -2007,7 +2109,12 @@ async fn download_segment_streaming(
                     status: 1,
                     error_message: String::new(),
                     file_name: String::new(),
-                    segment_details: None,
+                    segment_details: if progress_state.geometry.is_empty() {
+                        None
+                    } else {
+                        Some(progress_state.geometry.clone())
+                    },
+                    runtime: Some(dash_runtime(ctx.task_id, progress_state)),
                     ..Default::default()
                 })
                 .await;
@@ -2028,6 +2135,11 @@ async fn download_segment_streaming(
     // 此时分段只写入了部分字节却被当作成功。若服务器声明了精确 Content-Length 且
     // 无压缩，写入字节数应与之相等；不等说明被截断，返回 Err 触发重试（重试前由
     // download_segment_with_retry 的 set_len(start_pos) 回退本段已写字节）。
+    if let Some(segment) = progress_state.geometry.last_mut()
+        && segment.index == geometry_index
+    {
+        segment.active = Some(false);
+    }
     if let Some(expected) = expected_len
         && written as u64 != expected
     {

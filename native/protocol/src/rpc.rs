@@ -7,10 +7,13 @@ use crate::error::{ApplicationErrorCode, RpcErrorData, RpcErrorObject};
 
 /// JSON-RPC wire 版本。
 pub const JSONRPC_VERSION: &str = "2.0";
-/// 当前本机服务协议版本。
-pub const PROTOCOL_VERSION: u32 = 2;
-/// 本机服务接受的最低协议版本。
-pub const MIN_PROTOCOL_VERSION: u32 = 2;
+/// 当前本机服务协议版本；v4 增加托盘驻留（`ShellChanged`）与完成后关机（`PowerChanged`）事件，
+/// v5 增加静默捕获建任务通知（`CaptureTasksStarted`）。
+pub const PROTOCOL_VERSION: u32 = 5;
+/// 旧客户端不能解析新增事件，必须在握手时拒绝混用而非运行中断连。
+pub const MIN_PROTOCOL_VERSION: u32 = 5;
+/// 服务收到 `system.shutdown` 而退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。
+pub const CLOSE_REASON_SERVICE_QUIT: &str = "service-quit";
 
 /// 本机服务在 FluxDown 架构中的职责。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,7 +61,7 @@ pub struct ServiceHello {
 }
 
 impl ServiceHello {
-    /// 创建协议 v2 握手响应。
+    /// 按当前协议基线创建握手响应。
     #[must_use]
     pub fn new(
         role: ServiceRole,
@@ -270,6 +273,7 @@ fn invalid_rpc_field(field: &str) -> RpcErrorData {
         retryable: false,
         field: Some(field.to_owned()),
         revision: None,
+        reason: None,
     }
 }
 
@@ -284,7 +288,7 @@ mod tests {
     use crate::error::{ApplicationErrorCode, RpcErrorData, RpcErrorObject};
 
     #[test]
-    fn negotiates_protocol_v2_and_stable_hello_shape() -> Result<(), serde_json::Error> {
+    fn negotiates_current_protocol_and_stable_hello_shape() -> Result<(), serde_json::Error> {
         let client = ClientHello {
             client_name: "fluxdown-desktop".to_owned(),
             client_version: "1.0.0".to_owned(),
@@ -309,7 +313,7 @@ mod tests {
                 "role": "agent",
                 "serviceName": "fluxdown-agent",
                 "serviceVersion": "1.0.0",
-                "protocolVersion": 2,
+                "protocolVersion": 5,
                 "instanceId": "instance-1",
                 "capabilities": ["agent.gateway"]
             })
@@ -322,14 +326,14 @@ mod tests {
         let client = ClientHello {
             client_name: "old-client".to_owned(),
             client_version: "0.1.0".to_owned(),
-            min_protocol_version: 1,
-            max_protocol_version: 1,
+            min_protocol_version: 3,
+            max_protocol_version: 3,
             requested_role: ServiceRole::Daemon,
             capabilities: Vec::new(),
         };
 
         let error = match negotiate_protocol(&client) {
-            Ok(version) => panic!("v1 unexpectedly negotiated protocol {version}"),
+            Ok(version) => panic!("v3 unexpectedly negotiated protocol {version}"),
             Err(error) => error,
         };
         assert_eq!(error.code, ApplicationErrorCode::ProtocolIncompatible);
@@ -375,8 +379,8 @@ mod tests {
             Some(json!({
                 "clientName": "desktop",
                 "clientVersion": "1",
-                "minProtocolVersion": 2,
-                "maxProtocolVersion": 2,
+                "minProtocolVersion": MIN_PROTOCOL_VERSION,
+                "maxProtocolVersion": PROTOCOL_VERSION,
                 "requestedRole": "agent",
                 "capabilities": ["client.selections"]
             })),

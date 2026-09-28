@@ -32,11 +32,13 @@ use fluxdown_api::service::{ApiError, ApiHost, LiveSpeed, TaskEvent};
 use fluxdown_protocol::daemon::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, QueueDto,
     ResolvePreviewRequest, ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto,
-    RssValidateRequest, RssValidateResponse, TaskDto,
+    RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto, SiteAuthEntryDto,
+    SiteAuthSaveRequest, TaskDto,
 };
 #[cfg(hub_link)]
 use std::time::Duration;
 
+use fluxdown_engine::auth::is_sensitive_config_key;
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec, ResolvePreviewOutcome};
 #[cfg(hub_link)]
@@ -50,7 +52,7 @@ use fluxdown_protocol::daemon::{
     LinkPingInfo, LinkTaskRequest,
 };
 #[cfg(hub_plugins)]
-use fluxdown_protocol::daemon::{MarketEntryDto, PluginDto};
+use fluxdown_protocol::daemon::{MarketEntryDto, PluginAuthRequest, PluginAuthResponse, PluginDto};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 /// 任务实时速率表：`task_id → LiveSpeed`。写端见 [`crate::rinf_sink::RinfEventSink`]；
@@ -87,6 +89,14 @@ pub enum ApiCommand {
     ContinueTask {
         task_id: String,
         ack: oneshot::Sender<()>,
+    },
+    /// 更换任务下载源地址。错误为引擎稳定错误码字符串（`invalid-url` /
+    /// `task-active` / `task-completed` / `bt-unsupported` / `not-found` /
+    /// `protocol-unsupported` / `protocol-mismatch`）或 thunder 解码错误原文。
+    ChangeTaskUrl {
+        task_id: String,
+        url: String,
+        ack: oneshot::Sender<Result<(), String>>,
     },
     DeleteTask {
         task_id: String,
@@ -338,6 +348,25 @@ impl ApiHost for HubApiHost {
         .await
     }
 
+    async fn change_task_url(&self, task_id: &str, url: &str) -> Result<(), ApiError> {
+        self.send_cmd(|ack| ApiCommand::ChangeTaskUrl {
+            task_id: task_id.to_string(),
+            url: url.to_string(),
+            ack,
+        })
+        .await?
+        .map_err(|e| match e.as_str() {
+            "not-found" => ApiError::NotFound,
+            "invalid-url" => ApiError::BadRequest(e),
+            "task-active"
+            | "task-completed"
+            | "bt-unsupported"
+            | "protocol-unsupported"
+            | "protocol-mismatch" => ApiError::Conflict(e),
+            _ => ApiError::Internal(e),
+        })
+    }
+
     async fn pause_all(&self) -> Result<(), ApiError> {
         self.send_cmd(|ack| ApiCommand::PauseAll { ack }).await
     }
@@ -369,6 +398,12 @@ impl ApiHost for HubApiHost {
         self.db
             .get_all_config()
             .await
+            .map(|config| {
+                config
+                    .into_iter()
+                    .filter(|(key, _)| !is_sensitive_config_key(key))
+                    .collect()
+            })
             .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
@@ -376,15 +411,115 @@ impl ApiHost for HubApiHost {
         // 先逐键持久化到 DB，全部成功后才触发引擎 live-apply。命令只携带
         // keys（不带值）：与 server 侧 `ActorCmd::ApplyConfig` 语义一致——
         // 接收端重新从 DB 整表读取，避免命令 payload 与 DB 状态不一致。
-        for (key, value) in &changes {
+        for (key, value) in changes
+            .iter()
+            .filter(|(key, _)| !is_sensitive_config_key(key))
+        {
             self.db
                 .set_config(key, value)
                 .await
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
         }
-        let keys: Vec<String> = changes.into_keys().collect();
+        let keys: Vec<String> = changes
+            .into_keys()
+            .filter(|key| !is_sensitive_config_key(key))
+            .collect();
         self.send_cmd(|ack| ApiCommand::ApplyConfig { keys, ack })
             .await
+    }
+
+    async fn list_site_auth(&self) -> Result<Vec<SiteAuthEntryDto>, ApiError> {
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        Ok(fluxdown_engine::site_auth::parse_store(&json)
+            .into_iter()
+            .map(|(site, credential)| SiteAuthEntryDto {
+                site,
+                user: credential.user,
+            })
+            .collect())
+    }
+
+    async fn get_site_auth(&self, site: &str) -> Result<Option<SiteAuthCredentialDto>, ApiError> {
+        let site = fluxdown_engine::site_auth::site_key(site)
+            .or_else(|| fluxdown_engine::site_auth::site_key(&format!("https://{site}")))
+            .ok_or_else(|| ApiError::BadRequest("invalid site".to_string()))?;
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        Ok(fluxdown_engine::site_auth::parse_store(&json)
+            .get(&site)
+            .cloned()
+            .map(|credential| SiteAuthCredentialDto {
+                site,
+                user: credential.user,
+                pass: credential.pass,
+            }))
+    }
+
+    async fn save_site_auth(
+        &self,
+        request: SiteAuthSaveRequest,
+    ) -> Result<SiteAuthEntryDto, ApiError> {
+        let site = fluxdown_engine::site_auth::site_key(&request.site)
+            .or_else(|| fluxdown_engine::site_auth::site_key(&format!("https://{}", request.site)))
+            .ok_or_else(|| ApiError::BadRequest("invalid site".to_string()))?;
+        if request.user.trim().is_empty() {
+            return Err(ApiError::BadRequest("user is required".to_string()));
+        }
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        let mut store = fluxdown_engine::site_auth::parse_store(&json);
+        let user = request.user.trim().to_string();
+        store.insert(
+            site.clone(),
+            fluxdown_engine::site_auth::SiteCredential {
+                user: user.clone(),
+                pass: request.pass,
+            },
+        );
+        self.db
+            .set_config(
+                fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY,
+                &fluxdown_engine::site_auth::serialize_store(&store),
+            )
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(SiteAuthEntryDto { site, user })
+    }
+
+    async fn delete_site_auth(&self, site: &str) -> Result<(), ApiError> {
+        let site = fluxdown_engine::site_auth::site_key(site)
+            .or_else(|| fluxdown_engine::site_auth::site_key(&format!("https://{site}")))
+            .ok_or_else(|| ApiError::BadRequest("invalid site".to_string()))?;
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        let mut store = fluxdown_engine::site_auth::parse_store(&json);
+        if store.remove(&site).is_none() {
+            return Err(ApiError::NotFound);
+        }
+        self.db
+            .set_config(
+                fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY,
+                &fluxdown_engine::site_auth::serialize_store(&store),
+            )
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
     async fn live_speeds(&self) -> Result<HashMap<String, LiveSpeed>, ApiError> {
@@ -435,6 +570,35 @@ impl ApiHost for HubApiHost {
         pm.update_settings(identity, &entries)
             .await
             .map_err(|e| ApiError::Internal(e.to_string()))
+    }
+
+    #[cfg(hub_plugins)]
+    async fn plugin_auth(
+        &self,
+        request: PluginAuthRequest,
+    ) -> Result<PluginAuthResponse, ApiError> {
+        let pm = self.plugin_manager.as_ref().ok_or(ApiError::Unavailable)?;
+        let result = pm
+            .authenticate(
+                &request.identity,
+                fluxdown_engine::plugin::AuthRequest {
+                    action: request.action,
+                    site: request.site,
+                    auth_ref: request.auth_ref,
+                    session_id: request.session_id,
+                    input: request.input,
+                },
+            )
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        Ok(PluginAuthResponse {
+            status: result.status,
+            session_id: result.session_id,
+            challenge: result.challenge,
+            challenge_type: result.challenge_type,
+            message: result.message,
+            auth_ref: result.auth_ref,
+        })
     }
 
     #[cfg(hub_plugins)]

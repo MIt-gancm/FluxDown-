@@ -52,11 +52,15 @@ impl RssItemStatus {
     }
 }
 
-/// 一个 RSS 订阅源的完整配置与运行态（`rss_sources` 表的一行）。
+/// 一个订阅源的完整配置与运行态（兼容保留 `Rss` 命名）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RssSourceInfo {
     /// UUID 主键。
     pub source_id: String,
+    /// 负责获取订阅内容的 provider。空值在归一化时回退为 [`RSS_PROVIDER_ID`]。
+    pub provider_id: String,
+    /// provider 专属配置（JSON 字符串；空值表示无额外配置）。
+    pub provider_config: String,
     /// feed 地址（可含 token 的私有 feed）。
     pub url: String,
     /// 显示名（空 = 用 feed 标题；创建时由验证结果回填）。
@@ -121,6 +125,8 @@ impl Default for RssSourceInfo {
     fn default() -> Self {
         Self {
             source_id: String::new(),
+            provider_id: RSS_PROVIDER_ID.to_string(),
+            provider_config: String::new(),
             url: String::new(),
             name: String::new(),
             enabled: true,
@@ -152,6 +158,9 @@ impl Default for RssSourceInfo {
     }
 }
 
+/// 内置 RSS/Atom/JSON Feed provider 的稳定 ID。
+pub const RSS_PROVIDER_ID: &str = "rss";
+
 /// 默认抓取间隔（分钟）。
 pub const DEFAULT_INTERVAL_MINUTES: i32 = 30;
 /// 默认单轮新建任务上限。
@@ -165,6 +174,12 @@ impl RssSourceInfo {
     /// 归一化用户可写字段到合法区间。CRUD 写入前统一调用，让 REST / 信号 /
     /// CLI 三条入口共享同一套边界，而不是各自校验。
     pub fn normalize(&mut self) {
+        if self.provider_id.trim().is_empty() {
+            self.provider_id = RSS_PROVIDER_ID.to_string();
+        } else {
+            self.provider_id = self.provider_id.trim().to_string();
+        }
+        self.provider_config = self.provider_config.trim().to_string();
         self.interval_minutes = self.interval_minutes.max(MIN_INTERVAL_MINUTES);
         self.max_per_fetch = self
             .max_per_fetch
@@ -199,6 +214,8 @@ pub struct RssItemInfo {
     pub link: String,
     /// enclosure 直链（Mikan 即 `.torrent`；空 = 回退 `link`）。
     pub enclosure_url: String,
+    /// 可选二段解析标识；非空时下载地址使用 `link`，由 resolver 获取精确资源。
+    pub resolver_item: String,
     /// enclosure 声明大小（字节，0 = 未知）。
     pub enclosure_length: i64,
     /// 发布时间（Unix 秒，0 = 未知）。
@@ -219,9 +236,13 @@ pub struct RssItemInfo {
 }
 
 impl RssItemInfo {
-    /// 实际下载地址：优先 `enclosure_url`，为空时回退 `link`（§2.2）。
+    /// 实际下载地址：带 `resolver_item` 时用条目 `link` 触发二段解析；否则优先
+    /// `enclosure_url`，为空时回退 `link`（§2.2）。
     #[must_use]
     pub fn download_url(&self) -> &str {
+        if !self.resolver_item.is_empty() && !self.link.is_empty() {
+            return &self.link;
+        }
         if self.enclosure_url.is_empty() {
             &self.link
         } else {

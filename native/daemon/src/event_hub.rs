@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use fluxdown_protocol::{
     DaemonEvent, DaemonSnapshot, EventFrame, ServiceEvent, Snapshot, SnapshotBody, WsServerMsg,
+    apply_daemon_event,
 };
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -68,17 +69,33 @@ impl DaemonEventHub {
 
     /// 先更新物化投影，再递增 sequence 并广播对应帧。
     pub fn publish(&self, event: DaemonEvent) -> EventFrame {
-        let frame = {
-            let mut state = lock_or_recover(&self.state);
-            apply_event(&mut state.snapshot, &event);
-            apply_runtime_stats(&mut state, &event);
-            state.sequence = state.sequence.saturating_add(1);
-            EventFrame {
-                epoch: state.epoch.clone(),
-                sequence: state.sequence,
-                event: ServiceEvent::Daemon(event),
-            }
+        let mut state = lock_or_recover(&self.state);
+        self.publish_locked(&mut state, event)
+    }
+
+    /// 发布事件；仅当它改变了运行时统计时，才在同一临界区内紧随发布
+    /// `RuntimeStatsChanged`。进度帧每个活动任务约每 0.5s 一次，这条路径
+    /// 不能为读取统计去克隆整份快照，也不该广播与上一帧相同的统计。
+    pub fn publish_with_runtime_stats(&self, event: DaemonEvent) {
+        let mut state = lock_or_recover(&self.state);
+        let before = state.snapshot.runtime_stats.clone();
+        self.publish_locked(&mut state, event);
+        if state.snapshot.runtime_stats != before {
+            let stats = state.snapshot.runtime_stats.clone();
+            self.publish_locked(&mut state, DaemonEvent::RuntimeStatsChanged(stats));
+        }
+    }
+
+    fn publish_locked(&self, state: &mut EventState, event: DaemonEvent) -> EventFrame {
+        apply_daemon_event(&mut state.snapshot, &event);
+        apply_runtime_stats(state, &event);
+        state.sequence = state.sequence.saturating_add(1);
+        let frame = EventFrame {
+            epoch: state.epoch.clone(),
+            sequence: state.sequence,
+            event: ServiceEvent::Daemon(event),
         };
+        // 与序号递增处于同一临界区，接收者不会收到乱序帧。
         let _ = self.events.send(frame.clone());
         frame
     }
@@ -86,55 +103,6 @@ impl DaemonEventHub {
     /// 原子替换投影并发布替换事件。
     pub fn replace_snapshot(&self, snapshot: DaemonSnapshot) -> EventFrame {
         self.publish(DaemonEvent::SnapshotReplaced(snapshot))
-    }
-}
-
-fn apply_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
-    match event {
-        DaemonEvent::SnapshotReplaced(replacement) => *snapshot = replacement.clone(),
-        DaemonEvent::Engine(message) => apply_engine_message(snapshot, message),
-        DaemonEvent::TaskChanged(task) => {
-            if let Some(existing) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|existing| existing.task_id == task.task_id)
-            {
-                *existing = task.clone();
-            } else {
-                snapshot.tasks.push(task.clone());
-            }
-        }
-        DaemonEvent::TaskDeleted { task_id } => {
-            snapshot.tasks.retain(|task| task.task_id != *task_id);
-        }
-        DaemonEvent::QueuesChanged(queues) => snapshot.queues.clone_from(queues),
-        DaemonEvent::GroupsChanged(groups) => snapshot.groups.clone_from(groups),
-        DaemonEvent::ConfigChanged(config) => snapshot.config.clone_from(config),
-        DaemonEvent::RssChanged {
-            source_id,
-            item_revision,
-        } => {
-            snapshot
-                .rss_item_revisions
-                .insert(source_id.clone(), *item_revision);
-        }
-        DaemonEvent::PluginsChanged(plugins) => snapshot.plugins.clone_from(plugins),
-        DaemonEvent::ComponentsChanged(components) => snapshot.components.clone_from(components),
-        DaemonEvent::WebhooksChanged(deliveries) => {
-            snapshot.webhook_deliveries.clone_from(deliveries);
-        }
-        DaemonEvent::RuntimeStatsChanged(stats) => snapshot.runtime_stats.clone_from(stats),
-        DaemonEvent::SelectionPending(request) => {
-            snapshot
-                .pending_selections
-                .retain(|pending| pending.request_id != request.request_id);
-            snapshot.pending_selections.push(request.clone());
-        }
-        DaemonEvent::SelectionResolved { request_id } => {
-            snapshot
-                .pending_selections
-                .retain(|pending| pending.request_id != *request_id);
-        }
     }
 }
 
@@ -222,141 +190,27 @@ fn apply_runtime_stats(state: &mut EventState, event: &DaemonEvent) {
     }
 }
 
-fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
-    match message {
-        WsServerMsg::TasksSnapshot { tasks } => snapshot.tasks.clone_from(tasks),
-        WsServerMsg::TaskProgress {
-            task_id,
-            status,
-            downloaded_bytes,
-            total_bytes,
-            file_name,
-            save_dir,
-            url,
-            error_message,
-            uploaded_bytes,
-            seeding_status,
-            seeding_message,
-            seeding_time_secs,
-            ..
-        } => {
-            if *status == 4 && error_message == "deleted" {
-                snapshot.tasks.retain(|task| task.task_id != *task_id);
-                return;
-            }
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
-                task.status = *status;
-                task.downloaded_bytes = *downloaded_bytes;
-                task.total_bytes = *total_bytes;
-                if !file_name.is_empty() {
-                    task.file_name.clone_from(file_name);
-                }
-                if !save_dir.is_empty() {
-                    task.save_dir.clone_from(save_dir);
-                }
-                if !url.is_empty() {
-                    task.url.clone_from(url);
-                }
-                task.error_message.clone_from(error_message);
-                task.uploaded_bytes = *uploaded_bytes;
-                task.seeding_status = *seeding_status;
-                task.seeding_message.clone_from(seeding_message);
-                task.seeding_time_secs = *seeding_time_secs;
-            }
-        }
-        WsServerMsg::TaskMetaProbed {
-            task_id,
-            file_name,
-            total_bytes,
-        } => {
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
-                if !file_name.is_empty() {
-                    task.file_name.clone_from(file_name);
-                }
-                task.total_bytes = *total_bytes;
-            }
-        }
-        WsServerMsg::TaskQueueChanged { task_id, queue_id } => {
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
-                task.queue_id.clone_from(queue_id);
-            }
-        }
-        WsServerMsg::TaskRouteChanged { task_id, route } => {
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
-                task.auto_route.clone_from(route);
-            }
-        }
-        WsServerMsg::QueuesChanged { queues } => snapshot.queues.clone_from(queues),
-        WsServerMsg::QueuePositionsChanged { positions } => {
-            snapshot.queue_positions.clone_from(positions);
-        }
-        WsServerMsg::GroupsChanged { groups } => snapshot.groups.clone_from(groups),
-        WsServerMsg::RssSourcesChanged { sources } => snapshot.rss_sources.clone_from(sources),
-        WsServerMsg::RssItemsChanged { source_id, .. } => {
-            let revision = snapshot
-                .rss_item_revisions
-                .entry(source_id.clone())
-                .or_default();
-            *revision = revision.saturating_add(1);
-        }
-        WsServerMsg::WebhookDeliveriesChanged { deliveries } => {
-            snapshot.webhook_deliveries.clone_from(deliveries);
-        }
-        WsServerMsg::FileMissingChanged { updates } => {
-            for update in updates {
-                if let Some(task) = snapshot
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.task_id == update.task_id)
-                {
-                    task.file_missing = update.missing;
-                }
-            }
-        }
-        WsServerMsg::PriorityTaskChanged {
-            priority_task_id, ..
-        } => {
-            snapshot.priority.clear();
-            if !priority_task_id.is_empty() {
-                snapshot.priority.push(priority_task_id.clone());
-            }
-        }
-        WsServerMsg::PluginAutoDisabled { identity, reason } => {
-            if let Some(plugin) = snapshot
-                .plugins
-                .iter_mut()
-                .find(|plugin| plugin.identity == *identity)
-            {
-                plugin.enabled = false;
-                plugin.disabled_reason.clone_from(reason);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// 将引擎事件无阻塞转换并发布到 daemon 事件中心。
 pub struct DaemonEngineEventSink(pub DaemonEventHub);
 
 impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
     fn emit(&self, event: fluxdown_engine::events::EngineEvent) {
         use fluxdown_engine::events::EngineEvent;
+        match event {
+            EngineEvent::TaskRuntimeChanged(runtime) => {
+                self.0.publish(DaemonEvent::TaskRuntimeChanged(
+                    fluxdown_engine_protocol::task_runtime_to_dto(runtime),
+                ));
+                return;
+            }
+            EngineEvent::TaskActivityAdded(activity) => {
+                self.0.publish(DaemonEvent::TaskActivityAdded(
+                    fluxdown_engine_protocol::task_activity_to_dto(activity),
+                ));
+                return;
+            }
+            _ => {}
+        }
 
         let message = match event {
             EngineEvent::TaskProgress {
@@ -580,10 +434,18 @@ impl fluxdown_engine::events::EventSink for DaemonEngineEventSink {
             message,
             WsServerMsg::TaskProgress { .. } | WsServerMsg::TasksSnapshot { .. }
         );
-        self.0.publish(DaemonEvent::Engine(message));
-        if updates_runtime && let SnapshotBody::Daemon(snapshot) = self.0.snapshot().body {
-            self.0
-                .publish(DaemonEvent::RuntimeStatsChanged(snapshot.runtime_stats));
+        let event = match message {
+            WsServerMsg::QueuesChanged { queues } => DaemonEvent::QueuesChanged(queues),
+            WsServerMsg::GroupsChanged { groups } => DaemonEvent::GroupsChanged(groups),
+            WsServerMsg::WebhookDeliveriesChanged { deliveries } => {
+                DaemonEvent::WebhooksChanged(deliveries)
+            }
+            message => DaemonEvent::Engine(message),
+        };
+        if updates_runtime {
+            self.0.publish_with_runtime_stats(event);
+        } else {
+            self.0.publish(event);
         }
     }
 }
@@ -596,9 +458,117 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use fluxdown_protocol::{DaemonEvent, DaemonSnapshot, SnapshotBody, TaskDto, WsServerMsg};
+    use fluxdown_engine::{
+        events::{EngineEvent, EventSink},
+        model::QueueInfo,
+    };
+    use fluxdown_protocol::{
+        DaemonEvent, DaemonSnapshot, ServiceEvent, SnapshotBody, TaskDto, WsServerMsg,
+    };
 
-    use super::DaemonEventHub;
+    use super::{DaemonEngineEventSink, DaemonEventHub};
+
+    #[test]
+    fn queue_engine_changes_reach_subscribers_as_queue_domain_events() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 8);
+        let (mut subscriber, _) = hub.subscribe_and_snapshot();
+        let sink = DaemonEngineEventSink(hub.clone());
+        let queue = QueueInfo {
+            queue_id: "work".into(),
+            name: "Work".into(),
+            speed_limit_kbps: 0,
+            upload_limit_kbps: 0,
+            max_concurrent: 0,
+            default_save_dir: String::new(),
+            position: 1,
+            default_segments: 0,
+            default_user_agent: String::new(),
+            is_running: true,
+            schedule_enabled: false,
+            schedule_start: String::new(),
+            schedule_stop: String::new(),
+            schedule_days: 127,
+        };
+        for queues in [
+            vec![queue.clone()],
+            vec![QueueInfo {
+                name: "Renamed".into(),
+                is_running: false,
+                ..queue
+            }],
+            vec![],
+        ] {
+            sink.emit(EngineEvent::QueuesChanged(queues));
+            let frame = subscriber
+                .try_recv()
+                .expect("subscriber receives queue change");
+            let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::QueuesChanged(changed)) =
+                frame.event
+            else {
+                panic!("queue changes must use the domain event consumed by live windows");
+            };
+            let SnapshotBody::Daemon(snapshot) = hub.snapshot().body else {
+                panic!("daemon snapshot expected");
+            };
+            assert_eq!(
+                serde_json::to_value(snapshot.queues).unwrap(),
+                serde_json::to_value(changed).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn groups_and_webhook_deliveries_reach_subscribers_as_domain_events() {
+        let hub = DaemonEventHub::new(DaemonSnapshot::default(), 8);
+        let (mut subscriber, _) = hub.subscribe_and_snapshot();
+        let sink = DaemonEngineEventSink(hub.clone());
+        sink.emit(EngineEvent::GroupsChanged(vec![
+            fluxdown_engine::model::GroupInfo {
+                group_id: "group-1".into(),
+                name: "Collection".into(),
+                source_url: String::new(),
+                save_dir: String::new(),
+                created_at: String::new(),
+            },
+        ]));
+        let frame = subscriber
+            .try_recv()
+            .expect("subscriber receives group change");
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::GroupsChanged(groups)) =
+            frame.event
+        else {
+            panic!("groups must use the domain event consumed by live windows");
+        };
+        assert_eq!(groups[0].name, "Collection");
+
+        sink.emit(EngineEvent::WebhookDeliveriesChanged(vec![
+            fluxdown_engine::webhook::WebhookDelivery {
+                delivery_id: "delivery-1".into(),
+                timestamp_ms: 1,
+                event: "task.completed".into(),
+                endpoint_id: String::new(),
+                endpoint_name: String::new(),
+                url: String::new(),
+                request_headers: String::new(),
+                request_body: String::new(),
+                status_code: 200,
+                response_body: String::new(),
+                latency_ms: 1,
+                attempts: 1,
+                success: true,
+                error: String::new(),
+            },
+        ]));
+        let frame = subscriber
+            .try_recv()
+            .expect("subscriber receives delivery change");
+        let fluxdown_protocol::ServiceEvent::Daemon(DaemonEvent::WebhooksChanged(deliveries)) =
+            frame.event
+        else {
+            panic!("deliveries must use the domain event consumed by live settings");
+        };
+        assert_eq!(deliveries[0].delivery_id, "delivery-1");
+    }
 
     #[test]
     fn subscribe_snapshot_cursor_discards_prior_frames() {
@@ -722,5 +692,107 @@ mod tests {
         assert_eq!(snapshot.runtime_stats.total_download_bps, 0);
         assert_eq!(snapshot.runtime_stats.total_upload_bps, 0);
         Ok(())
+    }
+
+    #[test]
+    fn runtime_stats_frame_follows_progress_only_when_stats_change() -> Result<(), serde_json::Error>
+    {
+        let task: TaskDto = serde_json::from_value(serde_json::json!({
+            "taskId":"task-live", "url":"https://example.com/live", "fileName":"live",
+            "saveDir":"/tmp", "status":1, "downloadedBytes":10, "totalBytes":100,
+            "errorMessage":"", "createdAt":"1", "proxyUrl":"", "queueId":"main", "checksum":""
+        }))?;
+        let hub = DaemonEventHub::new(
+            DaemonSnapshot {
+                tasks: vec![task],
+                ..DaemonSnapshot::default()
+            },
+            16,
+        );
+        let (mut subscriber, _) = hub.subscribe_and_snapshot();
+        let progress = |downloaded_bytes, speed| {
+            DaemonEvent::Engine(WsServerMsg::TaskProgress {
+                task_id: "task-live".to_owned(),
+                status: 1,
+                downloaded_bytes,
+                total_bytes: 100,
+                speed,
+                upload_speed: 0,
+                file_name: "live".to_owned(),
+                save_dir: "/tmp".to_owned(),
+                url: "https://example.com/live".to_owned(),
+                error_message: String::new(),
+                uploaded_bytes: 0,
+                seeding_status: 0,
+                seeding_message: String::new(),
+                seeding_time_secs: 0,
+            })
+        };
+        let mut drain = || {
+            std::iter::from_fn(|| subscriber.try_recv().ok())
+                .map(|frame| match frame.event {
+                    ServiceEvent::Daemon(DaemonEvent::RuntimeStatsChanged(stats)) => {
+                        Some(stats.total_download_bps)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        hub.publish_with_runtime_stats(progress(20, 100));
+        assert_eq!(drain(), [None, Some(100)]);
+        // 字节推进但聚合统计不变：只有进度帧。
+        hub.publish_with_runtime_stats(progress(30, 100));
+        assert_eq!(drain(), [None]);
+        hub.publish_with_runtime_stats(progress(40, 250));
+        assert_eq!(drain(), [None, Some(250)]);
+        Ok(())
+    }
+    #[test]
+    fn parallel_publish_preserves_broadcast_sequence_and_snapshot_cursor() {
+        let task: TaskDto = serde_json::from_value(serde_json::json!({
+            "taskId":"shared", "url":"https://example.com/x", "fileName":"x", "saveDir":"/tmp",
+            "status":1, "downloadedBytes":0, "totalBytes":100, "errorMessage":"",
+            "createdAt":"1", "proxyUrl":"", "queueId":"main", "checksum":""
+        }))
+        .expect("task fixture");
+        let hub = DaemonEventHub::new(
+            DaemonSnapshot {
+                tasks: vec![task],
+                ..Default::default()
+            },
+            1024,
+        );
+        let (mut subscriber, before) = hub.subscribe_and_snapshot();
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                let hub = hub.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        hub.publish(DaemonEvent::TaskRuntimeChanged(
+                            fluxdown_protocol::TaskRuntimeDto {
+                                task_id: "shared".into(),
+                                active_transfers: Some(1),
+                                ..Default::default()
+                            },
+                        ));
+                    }
+                });
+            }
+        });
+        for expected in 1..=400 {
+            let frame = subscriber
+                .try_recv()
+                .expect("all publications arrive without a gap");
+            assert_eq!(frame.epoch, before.epoch);
+            assert_eq!(frame.sequence, expected);
+        }
+        assert_eq!(hub.snapshot().sequence, 400);
+        let (_, after) = hub.subscribe_and_snapshot();
+        assert_eq!(after.sequence, 400);
+        let SnapshotBody::Daemon(body) = after.body else {
+            panic!("daemon snapshot")
+        };
+        assert_eq!(body.task_runtime["shared"].active_transfers, Some(1));
     }
 }

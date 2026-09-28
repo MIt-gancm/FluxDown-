@@ -29,6 +29,7 @@ const INFO: &str = "info";
 /// Wire hint codes. Mirrored by the Dart `doctorHint*` i18n keys.
 const HINT_REINSTALL_APP: &str = "reinstall_app";
 const HINT_REREGISTER_NMH: &str = "reregister_nmh";
+const HINT_NMH_OTHER_INSTALL: &str = "nmh_other_install";
 const HINT_RESTART_APP: &str = "restart_app";
 const HINT_ENABLE_LOCAL_SERVER: &str = "enable_local_server";
 const HINT_CHECK_FIREWALL: &str = "check_firewall";
@@ -64,7 +65,7 @@ fn check(id: &str, target: &str, level: &str, detail: String, hint: &str) -> Dia
 /// tail. Collected in one `spawn_blocking` hop so the async part stays to the
 /// two network/IPC probes.
 struct SyncProbe {
-    /// `nmh_binary`, `nmh_manifest`, `nmh_browser`×N.
+    /// `nmh_binary`, `nmh_manifest`, `nmh_relay`, `nmh_browser`×N.
     nmh: Vec<DiagnosticCheck>,
     /// `url_protocol`×3, `torrent_association`.
     shell: Vec<DiagnosticCheck>,
@@ -123,7 +124,7 @@ pub async fn run(local_server_port: i32, local_server_enabled: bool) -> Diagnost
 fn probe_sync() -> SyncProbe {
     let nmh_diag = crate::nmh_registry::diagnose();
 
-    let mut nmh = Vec::with_capacity(2 + nmh_diag.targets.len());
+    let mut nmh = Vec::with_capacity(3 + nmh_diag.targets.len());
     if nmh_diag.exe_path.is_empty() {
         nmh.push(check(
             "nmh_binary",
@@ -139,6 +140,9 @@ fn probe_sync() -> SyncProbe {
         &nmh_diag.chromium_manifest,
         &nmh_diag.firefox_manifest,
     ));
+    if !nmh_diag.exe_path.is_empty() {
+        nmh.push(relay_check(&nmh_diag));
+    }
     for target in &nmh_diag.targets {
         let (level, detail, hint) = if !target.installed {
             (
@@ -165,6 +169,41 @@ fn probe_sync() -> SyncProbe {
         environment: environment_lines(&nmh_diag.exe_path),
         nmh_log_tail: read_nmh_log_tail(),
     }
+}
+
+/// Which relay the registration entry point (launcher script / registry key)
+/// actually runs. It is the root cause shared by every browser, so it is
+/// reported once; a registration served by another, still-present FluxDown
+/// install is only informational — the extension keeps working.
+fn relay_check(diag: &crate::nmh_registry::NmhDiagnosis) -> DiagnosticCheck {
+    use crate::nmh_registry::RelayOwner;
+
+    let location = &diag.relay_location;
+    let relay = &diag.registered_relay;
+    let (level, detail, hint) = match diag.relay_owner {
+        RelayOwner::Current => (OK, format!("{location} → {relay}"), ""),
+        RelayOwner::OtherInstall => (
+            INFO,
+            format!("{location} → {relay} (another FluxDown installation)"),
+            HINT_NMH_OTHER_INSTALL,
+        ),
+        RelayOwner::Broken if relay.is_empty() => (
+            ERROR,
+            format!("{location} — cannot resolve relay path"),
+            HINT_REREGISTER_NMH,
+        ),
+        RelayOwner::Broken => (
+            ERROR,
+            format!("{location} → {relay} (relay missing or not executable)"),
+            HINT_REREGISTER_NMH,
+        ),
+        RelayOwner::Missing => (
+            ERROR,
+            format!("{location} — not registered"),
+            HINT_REREGISTER_NMH,
+        ),
+    };
+    check("nmh_relay", "", level, detail, hint)
 }
 
 /// Both manifest files must exist for Chromium *and* Firefox interception to
@@ -485,6 +524,7 @@ mod tests {
         "nmh_binary",
         "nmh_manifest",
         "nmh_browser",
+        "nmh_relay",
         "app_listener",
         "local_server",
         "url_protocol",
@@ -495,6 +535,7 @@ mod tests {
         "",
         super::HINT_REINSTALL_APP,
         super::HINT_REREGISTER_NMH,
+        super::HINT_NMH_OTHER_INSTALL,
         super::HINT_RESTART_APP,
         super::HINT_ENABLE_LOCAL_SERVER,
         super::HINT_CHECK_FIREWALL,

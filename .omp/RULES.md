@@ -8,3 +8,5 @@
 - `stable` 只能通过合并 `main`（或从 `main` cherry-pick）前进；hotfix 若直接进 `stable`，必须同回合同步回 `main`。
 - 一致性判定：`git log stable --not main --oneline` 必须为空。任何操作后不为空即违规，先修复再继续。
 - 稳定 tag `vX.Y.Z` 只从 `stable` 打；预览 tag `vX.Y.Z-rc.N` 只从 `main` 打。
+- GPUI 下载页侧栏：「状态」文件夹（全部/下载中/已完成/失败/已暂停）已内嵌分类子项，**不做独立的「分类」分区**（用户 2026-09-09 明确决定）；分类的新建/编辑走状态文件夹内分类子项的右键菜单。
+- Rust 全部默认安全：禁止新增 `unsafe`（块 / fn / impl / extern）。唯一例外是 std 与现有直接依赖（`fs2` / `directories`）都没有安全封装的平台 FFI，且必须 `cfg` 门控 + `// SAFETY:` 注释 + 最小范围 + 安全外层函数 + RAII 守卫；`native/{api,protocol,daemon,server}` 与 `crates/*` 恒为零 `unsafe`。细则见 `rule://no-unsafe-in-rust`。

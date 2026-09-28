@@ -789,6 +789,8 @@ fn rss_source_state(s: &RssSourceDto) -> String {
 async fn cmd_rss_add(client: &ApiClient, a: RssAddArgs, json: bool) -> Result<(), ClientError> {
     let req = RssSourceDto {
         source_id: String::new(),
+        provider_id: "rss".to_string(),
+        provider_config: String::new(),
         url: a.feed_url,
         name: a.name.unwrap_or_default(),
         enabled: true,

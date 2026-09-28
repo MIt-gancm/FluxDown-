@@ -143,10 +143,10 @@ mod inner {
 mod inner {
     use std::path::Path;
 
-    use crate::platform::PlatformError;
     use crate::platform::macos_cf::{
-        CFStringRef, CfOwned, cf_string, cf_to_string, main_bundle_id,
+        CFArrayRef, CFStringRef, CfOwned, cf_string, cf_string_array, cf_to_string,
     };
+    use crate::platform::{PlatformError, host_bundle_id, successor_handler};
 
     /// Info.plist 中声明的 `.torrent` UTI。
     const TORRENT_UTI: &str = "org.bittorrent.torrent";
@@ -164,10 +164,11 @@ mod inner {
             role: u32,
             handler_bundle_id: CFStringRef,
         ) -> i32;
+        fn LSCopyAllRoleHandlersForContentType(content_type: CFStringRef, role: u32) -> CFArrayRef;
     }
 
     pub fn supported(_desktop: Option<&Path>) -> bool {
-        main_bundle_id().is_some()
+        host_bundle_id().is_some()
     }
 
     /// `.torrent` 当前是否关联到本 bundle。
@@ -183,7 +184,7 @@ mod inner {
         let Some(handler_id) = cf_to_string(handler.raw()) else {
             return false;
         };
-        main_bundle_id().is_some_and(|mine| handler_id.eq_ignore_ascii_case(&mine))
+        host_bundle_id().is_some_and(|mine| handler_id.eq_ignore_ascii_case(&mine))
     }
 
     /// 把本 bundle 设为 `.torrent` 默认处理程序。
@@ -191,7 +192,7 @@ mod inner {
     /// bundle 首次被系统扫描或启动时即已向 Launch Services 登记其 Info.plist
     /// 中声明的 UTI。
     pub fn associate(_desktop: Option<&Path>) -> Result<(), PlatformError> {
-        let bundle_id = main_bundle_id().ok_or(PlatformError::Unsupported(
+        let bundle_id = host_bundle_id().ok_or(PlatformError::Unsupported(
             "fluxdown-agent is not running inside an app bundle",
         ))?;
         let uti = cf_string(TORRENT_UTI)?;
@@ -208,23 +209,38 @@ mod inner {
         Ok(())
     }
 
-    /// 把 `.torrent` 交还系统默认；仅在当前由本 bundle 持有时执行。
+    /// 把 `.torrent` 移交给另一个已安装的候选程序；仅在当前由本 bundle 持有时执行。
+    ///
+    /// 没有其他候选时 Launch Services 必然回落到本 bundle，无从让出：保持现状，
+    /// 由 `torrent_assoc_user_disabled` 在捕获入口拦截系统交来的文件。
     pub fn disassociate() -> Result<(), PlatformError> {
+        let Some(mine) = host_bundle_id() else {
+            return Ok(());
+        };
         if !is_associated() {
             tracing::info!(".torrent not associated to FluxDown, skipping removal");
             return Ok(());
         }
         let uti = cf_string(TORRENT_UTI)?;
-        let empty = cf_string("")?;
-        // SAFETY: 两个 CFStringRef 在调用期间存活。
+        // SAFETY: `uti.raw()` 是有效 CFStringRef；返回的数组引用归我们所有，由 `CfOwned` 释放。
+        let candidates =
+            CfOwned::new(unsafe { LSCopyAllRoleHandlersForContentType(uti.raw(), LS_ROLES_ALL) });
+        let Some(successor) = successor_handler(cf_string_array(&candidates), &mine) else {
+            tracing::info!(
+                "no other .torrent handler installed; FluxDown stays the system default"
+            );
+            return Ok(());
+        };
+        let id = cf_string(&successor)?;
+        // SAFETY: 两个 CFStringRef 在调用期间存活；函数不接管所有权。
         let status =
-            unsafe { LSSetDefaultRoleHandlerForContentType(uti.raw(), LS_ROLES_ALL, empty.raw()) };
+            unsafe { LSSetDefaultRoleHandlerForContentType(uti.raw(), LS_ROLES_ALL, id.raw()) };
         if status != 0 {
             return Err(PlatformError::Failed(format!(
-                "LSSetDefaultRoleHandlerForContentType (clear) failed (OSStatus={status})"
+                "LSSetDefaultRoleHandlerForContentType (hand over) failed (OSStatus={status})"
             )));
         }
-        tracing::info!("removed .torrent association");
+        tracing::info!(successor, "handed .torrent association over");
         Ok(())
     }
 }

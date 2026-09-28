@@ -63,7 +63,7 @@ export function PluginsSettings() {
 
       <div className="set-group">
         <SetRow title={t('plugins.installZip')} desc={t('plugins.installZipDesc')}>
-          <input ref={fileRef} type="file" accept=".zip" className="hidden" onChange={onZipChosen} />
+          <input ref={fileRef} type="file" accept=".fxplug,.zip" className="hidden" onChange={onZipChosen} />
           <button
             type="button"
             className="btn ghost sm flex-shrink-0"
@@ -169,11 +169,18 @@ function DisabledBadge({ reason }: { reason: PluginDto['disabledReason'] }) {
   return <Badge tone={manual ? 'neutral' : 'danger'}>{manual ? t('plugins.disabledManual') : t('plugins.disabledCircuitBreaker')}</Badge>
 }
 
+function LoadStatusBadge({ plugin }: { plugin: PluginDto }) {
+  const { t } = useI18n()
+  const failed = plugin.loadStatus === 'Failed'
+  return <Badge tone={failed ? 'danger' : 'accent'}>{failed ? t('plugins.loadStatusFailed') : t('plugins.loadStatusLoaded')}</Badge>
+}
+
 // 权限徽章：manifest 声明的能力权限（后续新增权限补 PERMISSION_KEYS 即可；
 // 未知权限降级展示原始名）。
 const PERMISSION_KEYS: Record<string, { label: I18nKey; desc: I18nKey }> = {
   ffmpeg: { label: 'plugins.permFfmpeg', desc: 'plugins.permFfmpegDesc' },
   ytdlp: { label: 'plugins.permYtdlp', desc: 'plugins.permYtdlpDesc' },
+  auth: { label: 'plugins.permAuth', desc: 'plugins.permAuthDesc' },
 }
 
 function PermissionBadges({ permissions }: { permissions?: string[] }) {
@@ -234,6 +241,7 @@ function PluginCard({ plugin }: { plugin: PluginDto }) {
               <b className="text-[13px] font-semibold">{plugin.name}</b>
               <span className="text-[11px] tabular-nums text-text3">v{plugin.version}</span>
               {plugin.devMode && <Badge tone="accent">{t('plugins.devMode')}</Badge>}
+              <LoadStatusBadge plugin={plugin} />
               <DisabledBadge reason={plugin.disabledReason} />
               <PermissionBadges permissions={plugin.permissions} />
             </div>
@@ -252,18 +260,28 @@ function PluginCard({ plugin }: { plugin: PluginDto }) {
                 {plugin.homepage}
               </a>
             )}
+            {plugin.loadStatus === 'Failed' && plugin.loadError && (
+              <details className="mt-2 text-[12px] text-danger" onClick={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
+                <summary className="cursor-pointer">{t('plugins.loadErrorBody')}</summary>
+                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap rounded-md bg-danger/5 p-2 font-mono text-[11px]">
+                  {plugin.loadError}
+                </pre>
+              </details>
+            )}
           </div>
           <div className="flex flex-shrink-0 items-center gap-2" onClick={(e) => e.stopPropagation()}>
-            {plugin.settings.length > 0 && (
+            {plugin.loadStatus !== 'Failed' && (plugin.settings.length > 0 || plugin.authSupported) && (
               <PluginSettingsDialog
                 plugin={plugin}
+                authSupported={plugin.authSupported}
                 saving={settingsMut.isPending}
                 onSave={(entries, onDone) => settingsMut.mutate({ identity: plugin.identity, entries }, { onSuccess: onDone })}
               />
             )}
             <SetSwitch
-              checked={plugin.enabled}
+              checked={plugin.enabled && plugin.loadStatus !== 'Failed'}
               onCheckedChange={(v) => enabledMut.mutate({ identity: plugin.identity, enabled: v })}
+              disabled={plugin.loadStatus === 'Failed' || enabledMut.isPending}
             />
             <button
               type="button"

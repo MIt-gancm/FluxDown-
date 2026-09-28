@@ -1,0 +1,255 @@
+//! 插件卸载/认证回归测试：覆盖 PR #671 评审发现的三个问题。
+//!
+//! - 671#1：`purge` 用未校验的失败插件 identity 拼 config 键前缀，会清空全部
+//!   `plugin.dev.*` 注册（identity 恰为目录名 `"dev"` 时精确撞上该保留前缀）。
+//! - M-3：`authenticate("logout")` 在插件被禁用时也必须放行（走宿主兜底删除），
+//!   不应该要求先重新启用一个已知有问题的插件。
+//! - M-4：安装回滚复用的 `purge` 不得连带删除认证凭据；只有用户主动
+//!   `uninstall` 才清凭据。
+//! - 671#6：失败插件的 `PluginInfo.enabled` 必须被引擎强制为 `false`。
+//!
+//! 仅 `plugins` feature 下编译运行。
+
+#![cfg(feature = "plugins")]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use std::sync::Arc;
+
+use fluxdown_engine::auth::{self, AuthProfile};
+use fluxdown_engine::bt_downloader::BtConfig;
+use fluxdown_engine::plugin::AuthRequest;
+use fluxdown_engine::proxy_config::ProxyConfig;
+use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
+
+fn uniq() -> String {
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), n)
+}
+
+async fn make_engine(work: &std::path::Path) -> Engine {
+    let cfg = EngineConfig {
+        max_concurrent: 4,
+        speed_limit_bps: 0,
+        upload_limit_bps: 0,
+        default_save_dir: work.to_string_lossy().into_owned(),
+        app_data_dir: work.to_string_lossy().into_owned(),
+        bt_config: BtConfig::default(),
+        proxy_config: ProxyConfig::default(),
+        user_agent: String::new(),
+        data_dir_override: Some(work.to_path_buf()),
+        database_url: None,
+    };
+    Engine::new(cfg, Arc::new(NoopSink), Arc::new(NoopSelection))
+        .await
+        .expect("engine")
+}
+
+/// 带 auth 入口的最小 dev 插件：auth.js 只用于满足安装期 `check_compile`，
+/// 本文件的场景都不会真正驱动它跑 `authenticate()`。
+async fn write_auth_plugin(dir: &std::path::Path, identity: &str) {
+    tokio::fs::create_dir_all(dir).await.expect("mkdir plugin");
+    let manifest = format!(
+        r#"{{
+      "identity": "{identity}",
+      "name": "Test Auth Plugin",
+      "version": "1.0.0",
+      "permissions": ["auth"],
+      "auth": {{ "entry": "auth.js" }}
+    }}"#
+    );
+    tokio::fs::write(dir.join("manifest.json"), manifest)
+        .await
+        .expect("write manifest");
+    let auth_js = r#"
+      globalThis.authenticate = async (ctx) => {
+        return JSON.stringify({ status: "success" });
+      };
+    "#;
+    tokio::fs::write(dir.join("auth.js"), auth_js)
+        .await
+        .expect("write auth.js");
+}
+
+/// 671#1：`root/dev/` 恰是一个没有 manifest.json 的目录（插件开发者常见的
+/// 工作区习惯）→ 被当成 identity="dev" 的失败插件；卸载它不得清空 `plugin.
+/// dev.*` 命名空间下其他真实 dev 插件的注册。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn purge_of_directory_named_dev_does_not_wipe_other_dev_registrations() {
+    let work = std::env::temp_dir().join(format!("fluxdown-purge-dev-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let engine = make_engine(&work).await;
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+
+    // root/dev/ 是一个空目录：无 manifest.json，会被 load_all 当作失败插件，
+    // identity 落到目录名 "dev"（failure_identity 的目录名兜底分支）。
+    let plugins_root = work.join("plugins");
+    tokio::fs::create_dir_all(plugins_root.join("dev"))
+        .await
+        .expect("mkdir root/dev");
+
+    // 另一个真正的 dev 插件，装在 root 之外的任意目录，走 plugin.dev.<id> 注册。
+    let real_dev_src = work.join("real-dev-src");
+    write_auth_plugin(&real_dev_src, "tester@realdev").await;
+    pm.install_dev(&real_dev_src)
+        .await
+        .expect("install real dev plugin");
+
+    // 触发一次重新扫描，让 root/dev/ 目录被识别为失败插件（identity="dev"）。
+    pm.list().await;
+
+    // 卸载失败插件 "dev"：671#1 修复前会把 `plugin.dev.` 当前缀扫描删除，
+    // 连带清空 `plugin.dev.tester@realdev` 注册。
+    pm.uninstall("dev").await.expect("uninstall dev");
+
+    let plugins = pm.list().await;
+    assert!(
+        plugins.iter().any(|p| p.identity == "tester@realdev"),
+        "unrelated dev plugin registration must survive purging the unrelated \"dev\" directory, got: {:?}",
+        plugins.iter().map(|p| &p.identity).collect::<Vec<_>>()
+    );
+}
+
+/// M-3 + M-4：禁用插件仍可 logout（宿主兜底删除凭据，不驱动 JS）；
+/// 用户主动卸载会清凭据，但安装回滚（purge）不会。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disabled_plugin_logout_removes_credential_without_running_js() {
+    let work = std::env::temp_dir().join(format!("fluxdown-purge-auth-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let engine = make_engine(&work).await;
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+
+    let plugin_src = work.join("auth-plugin-src");
+    write_auth_plugin(&plugin_src, "tester@authflow").await;
+    pm.install_from_dir(&plugin_src)
+        .await
+        .expect("install auth plugin");
+
+    // 直接写入一份凭据（跳过真实登录流程，聚焦 logout/purge 的清理语义）。
+    let db = engine.db.clone();
+    let profile = AuthProfile {
+        auth_ref: "tester@authflow::https://example.com".to_string(),
+        plugin_id: "tester@authflow".to_string(),
+        site: "https://example.com".to_string(),
+        cookies: "sid=1".to_string(),
+        ..Default::default()
+    };
+    auth::save(&db, &profile).await.expect("seed credential");
+
+    // 禁用插件——M-3 修复前 authenticate() 在这里会直接报「插件未启用」。
+    pm.set_enabled("tester@authflow", false)
+        .await
+        .expect("disable plugin");
+
+    let result = pm
+        .authenticate(
+            "tester@authflow",
+            AuthRequest {
+                action: "logout".to_string(),
+                site: String::new(),
+                auth_ref: profile.auth_ref.clone(),
+                session_id: String::new(),
+                input: String::new(),
+            },
+        )
+        .await
+        .expect("logout on a disabled plugin must succeed via host-side fallback");
+    assert_eq!(result.status, "success");
+
+    let loaded = auth::load(&db, &profile.auth_ref)
+        .await
+        .expect("load after logout");
+    assert!(
+        loaded.is_none(),
+        "logout must remove the credential even while the plugin is disabled"
+    );
+}
+
+/// M-4：安装回滚（`install_dev` 因 manifest 非法而 `purge`）不得删除同一
+/// identity 已经保存的凭据——回滚不是用户主动卸载。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn install_rollback_purge_preserves_existing_credential() {
+    let work = std::env::temp_dir().join(format!("fluxdown-purge-rollback-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let engine = make_engine(&work).await;
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+
+    let db = engine.db.clone();
+    let profile = AuthProfile {
+        auth_ref: "tester@rollback::https://example.com".to_string(),
+        plugin_id: "tester@rollback".to_string(),
+        site: "https://example.com".to_string(),
+        cookies: "sid=1".to_string(),
+        ..Default::default()
+    };
+    auth::save(&db, &profile).await.expect("seed credential");
+
+    // 同 identity 的 dev 安装，但 manifest 本身非法（version 不是 semver）→
+    // `PluginManifest::parse`/`validate()` 在 `install_dev` 顶部直接失败，
+    // 根本不会写 `plugin.dev.<id>` 键、也走不到 `finish_install`/`purge`——
+    // 这里改用「manifest 合法但 auth 脚本编译失败」触发 `finish_install`
+    // 内部的 `check_compile` 失败，从而命中 `install_dev` 的
+    // `purge(&identity)` 回滚分支。
+    let bad_src = work.join("bad-dev-src");
+    tokio::fs::create_dir_all(&bad_src)
+        .await
+        .expect("mkdir bad src");
+    let manifest = r#"{
+      "identity": "tester@rollback",
+      "name": "Broken",
+      "version": "1.0.0",
+      "permissions": ["auth"],
+      "auth": { "entry": "auth.js" }
+    }"#;
+    tokio::fs::write(bad_src.join("manifest.json"), manifest)
+        .await
+        .expect("write manifest");
+    // 语法错误：check_compile 必然失败。
+    tokio::fs::write(bad_src.join("auth.js"), b"this is not valid javascript {{{")
+        .await
+        .expect("write broken auth.js");
+
+    let err = pm.install_dev(&bad_src).await;
+    assert!(
+        err.is_err(),
+        "install must fail on a syntactically broken auth entry"
+    );
+
+    let loaded = auth::load(&db, &profile.auth_ref)
+        .await
+        .expect("load after failed install");
+    assert!(
+        loaded.is_some(),
+        "a failed install's rollback purge must not delete a pre-existing credential for the same identity"
+    );
+}
+
+/// 671#6：失败插件（无 manifest.json 的裸目录）在 `list()` 里必须
+/// `enabled == false`，即便从未写过 `plugin.<identity>.enabled` 键
+/// （该键缺省会被 `plugin_state()` 当作「新装默认启用」解释成 true）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_plugin_is_reported_as_disabled_even_without_enabled_key() {
+    let work = std::env::temp_dir().join(format!("fluxdown-failed-enabled-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let engine = make_engine(&work).await;
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+
+    let plugins_root = work.join("plugins");
+    tokio::fs::create_dir_all(plugins_root.join("broken"))
+        .await
+        .expect("mkdir root/broken");
+    pm.load_all().await;
+
+    let plugins = pm.list().await;
+    let broken = plugins
+        .iter()
+        .find(|p| p.identity == "broken")
+        .expect("failed plugin listed");
+    assert_eq!(broken.load_status, "Failed");
+    assert!(
+        !broken.enabled,
+        "a failed plugin must never report enabled=true, contradicting its Failed load_status"
+    );
+}

@@ -3,7 +3,9 @@
 //! Provides the [`ProxyConfig`] type that holds user/system proxy settings and
 //! helper functions for:
 //! - Building proxy URLs for reqwest (`to_proxy_url`)
-//! - Detecting Windows system proxy via the registry
+//! - Detecting the system proxy: Windows registry, macOS `scutil --proxy`,
+//!   Linux `https_proxy`/`http_proxy`/`all_proxy` env vars falling back to
+//!   GNOME `gsettings org.gnome.system.proxy`
 //! - Parsing a Windows `ProxyServer` registry value (multi-protocol format)
 
 use std::collections::HashMap;
@@ -24,8 +26,8 @@ pub enum ProxyMode {
     System,
     /// User-specified proxy address.
     Manual,
-    /// 自动决策：任务直连启动，运行中确认慢且候选代理（系统代理，
-    /// 缺省回退手动字段）经采样证明显著更快时才按 host 热切换。
+    /// 自动决策：直连与候选代理（手动字段 + 系统代理）作为并行路径，由
+    /// 分段调度按同窗实测速率分配连接、按完成时间抢占交接。
     /// 决策粒度是**任务级**（见 [`crate::auto_proxy`]）；本模式值本身
     /// 绝不直接进 client 构建——[`ProxyConfig::resolve`] 与
     /// `build_client_inner` 都把它折算为直连，具体代理由 auto_proxy
@@ -369,7 +371,7 @@ impl ProxyConfig {
         };
 
         // Extract host and port
-        let (host, port) = parse_host_port(host_port);
+        let (_scheme_type, host, port) = parse_host_port(host_port);
 
         Self {
             mode: ProxyMode::Manual,
@@ -438,12 +440,294 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
     }))
 }
 
-/// Fallback for non-Windows platforms — returns `None`.
-#[cfg(not(target_os = "windows"))]
+/// macOS 系统代理检测：调用 `scutil --proxy` 读取 SystemConfiguration 的
+/// 代理字典（GUI 应用不继承终端 shell 的环境变量，而 `networksetup`/
+/// 系统偏好设置写入的代理只存在于 SystemConfiguration，读环境变量拿不到）。
+/// 子进程失败、超时或未启用任何协议均返回 `None`，从不向上抛错——系统代理
+/// 探测永远是尽力而为，绝不能因为它失败而拖垮整个下载流程。
+#[cfg(target_os = "macos")]
 pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
-    // On non-Windows, reqwest already reads HTTP_PROXY/HTTPS_PROXY env vars.
-    // We don't need extra detection.
+    Ok(cached_system_proxy_probe(|| {
+        let output = run_command_with_timeout("scutil", &["--proxy"], SYSTEM_PROXY_PROBE_TIMEOUT);
+        let text = match output {
+            Some(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+            _ => return None,
+        };
+        parse_scutil_proxy_output(&text)
+    }))
+}
+
+/// Linux 系统代理检测：先看 `https_proxy`/`http_proxy`/`all_proxy` 环境变量
+/// （桌面终端启动的进程、systemd 用户服务常见配置方式），环境变量都没有
+/// 时再退而求其次读 GNOME `gsettings org.gnome.system.proxy`（KDE/Clash 等
+/// 通过 V2rayN 之类客户端只写这里，不写环境变量，GUI 进程更拿不到父 shell
+/// 的环境变量）。子进程/命令缺失一律静默回退，不影响非 GNOME 桌面环境。
+#[cfg(target_os = "linux")]
+pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
+    Ok(cached_system_proxy_probe(|| {
+        detect_proxy_from_env().or_else(detect_proxy_from_gsettings)
+    }))
+}
+
+/// macOS/Linux 探测结果的短时缓存 TTL。`ProxyConfig::resolve()` 在 actor 线程
+/// 上同步调用，每次都拉起 `scutil`/`gsettings` 子进程既慢又会在密集建
+/// client 时（RSS 批量抓取、插件 bridge 构造）反复阻塞；系统代理配置本身
+/// 分钟级才会变，30s 内复用上次结果足够新鲜。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SYSTEM_PROXY_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+static SYSTEM_PROXY_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<ProxyConfig>)>> =
+    std::sync::Mutex::new(None);
+
+/// 带 TTL 的探测缓存：命中未过期结果直接返回，否则执行 `probe` 并回填。
+/// 锁中毒直接取内部值——缓存只是一个可重算的快照。
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn cached_system_proxy_probe(probe: impl FnOnce() -> Option<ProxyConfig>) -> Option<ProxyConfig> {
+    let mut guard = SYSTEM_PROXY_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, cached)) = guard.as_ref()
+        && at.elapsed() < SYSTEM_PROXY_CACHE_TTL
+    {
+        return cached.clone();
+    }
+    let fresh = probe();
+    *guard = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
+}
+
+/// 其余平台（Android/iOS 等）：沙箱环境不支持任意子进程与桌面配置源，保持
+/// 原有行为直接返回 `None`。
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
     Ok(None)
+}
+
+/// 单个外部命令探测的超时预算。`scutil`/`gsettings` 都是读取本地配置的
+/// 轻量命令，正常应在数十毫秒内返回；给到 1.2s 是为异常慢的系统（杀毒软件
+/// hook、容器/沙箱下的 IPC 延迟）留余量，同时仍满足"快速、尽力而为"的
+/// 探测语义——绝不能让一次系统代理探测拖住调用方数秒。
+#[allow(dead_code)] // 仅 macOS/Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+const SYSTEM_PROXY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1200);
+
+/// 运行外部命令并在超时后杀掉子进程放弃等待，而不是无限阻塞调用线程。
+/// 标准库没有内建的进程超时原语，这里用 `try_wait` 轮询代替：命令通常在
+/// 一两个轮询周期内就已退出，超时只在命令挂起/被沙箱拦截时触发。
+/// stdout 用管道读取；探测命令的输出量极小（不到 1KB），不会撞上管道满导致
+/// 子进程阻塞写入、我们又没在读的死锁。
+#[allow(dead_code)] // 仅 macOS/Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn run_command_with_timeout(
+    program: &str,
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut stdout);
+                }
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr: Vec::new(),
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 把 `scutil --proxy` 的字典输出（`Key : Value` 逐行，嵌套 `<array>` 块
+/// 用不到的 key 混进来也无妨）压成一个扁平 map。只有顶层标量字段
+/// （`HTTPEnable`/`HTTPProxy`/`HTTPPort` 等）会被后续查询用到。
+#[allow(dead_code)] // 仅 macOS 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn parse_scutil_dict(text: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim();
+            if !key.is_empty() {
+                map.insert(key.to_string(), value.trim().to_string());
+            }
+        }
+    }
+    map
+}
+
+/// 从 `scutil --proxy` 字典中选出一个已启用的代理协议，按 socks > https >
+/// http 优先（与 [`parse_windows_proxy_server`] 一致）。`HTTPSProxy` 字段
+/// 命名的是【流量目标】协议而非代理端点自身的传输层——该端点仍然只会
+/// 应答明文 HTTP `CONNECT`，因此映射到 [`ProxyType::Http`]，理由与
+/// Windows `ProxyServer` 的 `https=` 键完全相同（见该函数文档）。
+#[allow(dead_code)] // 仅 macOS 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn parse_scutil_proxy_output(text: &str) -> Option<ProxyConfig> {
+    let map = parse_scutil_dict(text);
+    let is_enabled = |key: &str| map.get(key).map(|v| v.trim() == "1").unwrap_or(false);
+    let host_port = |host_key: &str, port_key: &str| -> Option<(String, u16)> {
+        let host = map.get(host_key)?.trim();
+        if host.is_empty() {
+            return None;
+        }
+        let port = map
+            .get(port_key)
+            .and_then(|p| p.trim().parse::<u16>().ok())
+            .filter(|p| *p != 0)?;
+        Some((host.to_string(), port))
+    };
+    let candidates: [(&str, &str, &str, ProxyType); 3] = [
+        ("SOCKSEnable", "SOCKSProxy", "SOCKSPort", ProxyType::Socks5),
+        ("HTTPSEnable", "HTTPSProxy", "HTTPSPort", ProxyType::Http),
+        ("HTTPEnable", "HTTPProxy", "HTTPPort", ProxyType::Http),
+    ];
+    for (enable_key, host_key, port_key, proxy_type) in candidates {
+        if is_enabled(enable_key)
+            && let Some((host, port)) = host_port(host_key, port_key)
+        {
+            return Some(ProxyConfig {
+                mode: ProxyMode::Manual,
+                proxy_type,
+                host,
+                port,
+                ..Default::default()
+            });
+        }
+    }
+    None
+}
+
+/// 按 `https_proxy` > `http_proxy` > `all_proxy` 优先读取代理环境变量
+/// （同时兼容大小写变体），用 `url` crate 解析出协议/host/port/凭据。
+/// 纯读取无子进程，Windows/macOS 上调用也无害（多数情况下这些变量本就
+/// 未设置），因此不做平台 cfg 限制，方便跨平台单测覆盖解析逻辑。
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn detect_proxy_from_env() -> Option<ProxyConfig> {
+    let raw = first_nonempty_env(&["https_proxy", "HTTPS_PROXY"])
+        .or_else(|| first_nonempty_env(&["http_proxy", "HTTP_PROXY"]))
+        .or_else(|| first_nonempty_env(&["all_proxy", "ALL_PROXY"]))?;
+    parse_env_proxy_url(&raw)
+}
+
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn first_nonempty_env(names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// 解析形如 `http://user:pass@host:port` 的代理环境变量取值。这里的
+/// scheme 描述的是代理端点自身的传输层（标准 `http_proxy` 约定），与
+/// Windows 注册表/`scutil` 字典里【目标协议】语义的键名不同，因此按字面
+/// scheme 直接映射，不做目标→传输层的转换。
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn parse_env_proxy_url(raw: &str) -> Option<ProxyConfig> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let proxy_type = match parsed.scheme().to_ascii_lowercase().as_str() {
+        "socks5" | "socks5h" => ProxyType::Socks5,
+        "socks4" => ProxyType::Socks4,
+        "socks4a" => ProxyType::Socks4a,
+        "https" => ProxyType::Https,
+        _ => ProxyType::Http,
+    };
+    let port = parsed.port().unwrap_or(if proxy_type == ProxyType::Https {
+        443
+    } else {
+        8080
+    });
+    let username = percent_decode(parsed.username());
+    let password = parsed.password().map(percent_decode).unwrap_or_default();
+    Some(ProxyConfig {
+        mode: ProxyMode::Manual,
+        proxy_type,
+        host,
+        port,
+        username,
+        password,
+        no_proxy_list: first_nonempty_env(&["no_proxy", "NO_PROXY"]).unwrap_or_default(),
+    })
+}
+
+/// GNOME `gsettings` 代理配置：仅在 `org.gnome.system.proxy mode` 为
+/// `manual` 时生效（`none`/`auto` 均不该覆盖直连或 PAC 行为）。按 socks >
+/// https > http 优先，`https` schema 同样只声明目标协议而非端点传输层，
+/// 理由与 [`parse_scutil_proxy_output`] 相同。
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn detect_proxy_from_gsettings() -> Option<ProxyConfig> {
+    let mode = gsettings_get("org.gnome.system.proxy", "mode")?;
+    if mode != "manual" {
+        return None;
+    }
+    let candidates: [(&str, ProxyType); 3] = [
+        ("socks", ProxyType::Socks5),
+        ("https", ProxyType::Http),
+        ("http", ProxyType::Http),
+    ];
+    for (proto, proxy_type) in candidates {
+        let schema = format!("org.gnome.system.proxy.{proto}");
+        let Some(host) = gsettings_get(&schema, "host").filter(|h| !h.is_empty()) else {
+            continue;
+        };
+        let Some(port) = gsettings_get(&schema, "port")
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|p| *p != 0)
+        else {
+            continue;
+        };
+        return Some(ProxyConfig {
+            mode: ProxyMode::Manual,
+            proxy_type,
+            host,
+            port,
+            ..Default::default()
+        });
+    }
+    None
+}
+
+/// 剥掉 GNOME dconf 字符串取值外层的单引号（固定输出 `'value'`）；整数
+/// 取值不带引号，`trim_matches` 对其是无副作用的 no-op。
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn strip_gsettings_quotes(raw: &str) -> String {
+    raw.trim().trim_matches('\'').to_string()
+}
+
+/// 执行 `gsettings get <schema> <key>`。命令缺失、超时、非零退出码或剥引号
+/// 后为空一律返回 `None`。
+#[allow(dead_code)] // 仅 Linux 探测路径实际调用；其余平台保留供跨平台单测覆盖解析逻辑
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    let out = run_command_with_timeout(
+        "gsettings",
+        &["get", schema, key],
+        SYSTEM_PROXY_PROBE_TIMEOUT,
+    )?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = strip_gsettings_quotes(&String::from_utf8_lossy(&out.stdout));
+    if value.is_empty() { None } else { Some(value) }
 }
 
 /// Parse the Windows `ProxyServer` registry value.
@@ -481,9 +765,10 @@ pub fn parse_windows_proxy_server(server: &str) -> (ProxyType, String, u16) {
         }
     }
 
-    // Simple format: "host:port"
-    let (host, port) = parse_host_port(server);
-    (ProxyType::Http, host, port)
+    // Simple format: "host:port" (may itself carry a scheme prefix, see
+    // parse_host_port's BUG-PROXY-SCHEME-PREFIX doc).
+    let (scheme_type, host, port) = parse_host_port(server);
+    (scheme_type.unwrap_or(ProxyType::Http), host, port)
 }
 
 /// Parse multi-protocol proxy string like `http=host:port;https=host2:port2;socks=host3:port3`.
@@ -497,7 +782,7 @@ fn parse_multi_protocol_proxy(server: &str) -> HashMap<String, (String, u16)> {
         }
         if let Some((protocol, addr)) = entry.split_once('=') {
             let protocol = protocol.trim().to_ascii_lowercase();
-            let (host, port) = parse_host_port(addr.trim());
+            let (_scheme_type, host, port) = parse_host_port(addr.trim());
             if !host.is_empty() {
                 result.insert(protocol, (host, port));
             }
@@ -507,7 +792,30 @@ fn parse_multi_protocol_proxy(server: &str) -> HashMap<String, (String, u16)> {
 }
 
 /// Parse `host:port` string, defaulting port to 8080 if missing/invalid.
-fn parse_host_port(addr: &str) -> (String, u16) {
+///
+/// BUG-PROXY-SCHEME-PREFIX：一些环境（第三方代理工具改写的 Windows 注册表
+/// `ProxyServer` 值、手工填写的系统代理字符串）把完整 URL（如
+/// `http://127.0.0.1:20122`）而非文档规定的裸 `host:port` 写入本应是简单
+/// 格式的字段。若不剥离 scheme，`rfind(':')` 会把 `http://127.0.0.1` 整体
+/// 当作 host，调用方再叠加一次 scheme 前缀，拼出 `http://http://host:port`
+/// 这种畸形代理 URL，reqwest 直接连接失败。
+///
+/// 剥离出的 scheme 若为 `socks5`/`socks5h`，以 `Some(ProxyType::Socks5)`
+/// 返回，供默认按 HTTP 处理的调用方据此改判；其余 scheme（含无 scheme）
+/// 一律返回 `None`，调用方保留自己的默认类型。
+fn parse_host_port(addr: &str) -> (Option<ProxyType>, String, u16) {
+    let (scheme_type, addr) = match addr.find("://") {
+        Some(idx) => {
+            let scheme = addr[..idx].to_ascii_lowercase();
+            let ty = match scheme.as_str() {
+                "socks5" | "socks5h" => Some(ProxyType::Socks5),
+                _ => None,
+            };
+            (ty, &addr[idx + 3..])
+        }
+        None => (None, addr),
+    };
+
     // Handle IPv6: [::1]:port
     if let Some(bracket_end) = addr.find(']') {
         let host = addr[..=bracket_end].to_string();
@@ -516,7 +824,7 @@ fn parse_host_port(addr: &str) -> (String, u16) {
             .strip_prefix(':')
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(8080);
-        return (host, port);
+        return (scheme_type, host, port);
     }
 
     // Standard host:port
@@ -524,16 +832,16 @@ fn parse_host_port(addr: &str) -> (String, u16) {
         let host = addr[..colon].to_string();
         let port = addr[colon + 1..].parse::<u16>().unwrap_or(8080);
         if !host.is_empty() {
-            return (host, port);
+            return (scheme_type, host, port);
         }
     }
 
     // No port specified
     if !addr.is_empty() {
-        return (addr.to_string(), 8080);
+        return (scheme_type, addr.to_string(), 8080);
     }
 
-    (String::new(), 0)
+    (scheme_type, String::new(), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,11 +1633,14 @@ pub async fn test_proxy_connection(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         ProxyConfig, ProxyMode, ProxyType, base64_encode, is_proxy_tls_handshake_failure,
-        parse_connect_status_line, parse_host_port, parse_multi_protocol_proxy,
+        parse_connect_status_line, parse_env_proxy_url, parse_host_port,
+        parse_multi_protocol_proxy, parse_scutil_dict, parse_scutil_proxy_output,
         parse_windows_proxy_server, percent_decode, percent_encode_userinfo, socks4_connect_sync,
+        strip_gsettings_quotes,
     };
     use std::collections::HashMap;
 
@@ -1842,44 +2153,95 @@ mod tests {
 
     #[test]
     fn parse_host_port_standard() {
-        let (h, p) = parse_host_port("proxy.com:8080");
+        let (scheme, h, p) = parse_host_port("proxy.com:8080");
+        assert_eq!(scheme, None);
         assert_eq!(h, "proxy.com");
         assert_eq!(p, 8080);
     }
 
     #[test]
     fn parse_host_port_no_port_defaults_8080() {
-        let (h, p) = parse_host_port("proxy.com");
+        let (_scheme, h, p) = parse_host_port("proxy.com");
         assert_eq!(h, "proxy.com");
         assert_eq!(p, 8080);
     }
 
     #[test]
     fn parse_host_port_empty() {
-        let (h, p) = parse_host_port("");
+        let (_scheme, h, p) = parse_host_port("");
         assert!(h.is_empty());
         assert_eq!(p, 0);
     }
 
     #[test]
     fn parse_host_port_ipv6() {
-        let (h, p) = parse_host_port("[::1]:8080");
+        let (_scheme, h, p) = parse_host_port("[::1]:8080");
         assert_eq!(h, "[::1]");
         assert_eq!(p, 8080);
     }
 
     #[test]
     fn parse_host_port_ipv6_no_port() {
-        let (h, p) = parse_host_port("[::1]");
+        let (_scheme, h, p) = parse_host_port("[::1]");
         assert_eq!(h, "[::1]");
         assert_eq!(p, 8080);
     }
 
     #[test]
     fn parse_host_port_invalid_port() {
-        let (h, p) = parse_host_port("proxy.com:abc");
+        let (_scheme, h, p) = parse_host_port("proxy.com:abc");
         assert_eq!(h, "proxy.com");
         assert_eq!(p, 8080); // defaults to 8080
+    }
+
+    // BUG-PROXY-SCHEME-PREFIX：一个本应是裸 host:port 的字段实际携带了
+    // `http://` scheme 前缀（如 Windows ProxyServer 注册表值被第三方工具
+    // 改写）——必须剥离 scheme，不能让 `rfind(':')` 把它并入 host。
+    #[test]
+    fn parse_host_port_strips_http_scheme() {
+        let (scheme, h, p) = parse_host_port("http://127.0.0.1:20122");
+        assert_eq!(scheme, None);
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(p, 20122);
+    }
+
+    #[test]
+    fn parse_host_port_plain_unchanged() {
+        let (scheme, h, p) = parse_host_port("127.0.0.1:20122");
+        assert_eq!(scheme, None);
+        assert_eq!(h, "127.0.0.1");
+        assert_eq!(p, 20122);
+    }
+
+    #[test]
+    fn parse_host_port_strips_socks5_scheme_and_reports_type() {
+        let (scheme, h, p) = parse_host_port("socks5://h:1080");
+        assert_eq!(scheme, Some(ProxyType::Socks5));
+        assert_eq!(h, "h");
+        assert_eq!(p, 1080);
+    }
+
+    #[test]
+    fn parse_windows_proxy_simple_with_scheme_prefix_does_not_double_scheme() {
+        // BUG-PROXY-SCHEME-PREFIX 端到端：从 ProxyServer 值到最终代理 URL 全程
+        // 不出现重复 scheme。
+        let (ty, host, port) = parse_windows_proxy_server("http://127.0.0.1:20122");
+        assert_eq!(ty, ProxyType::Http);
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 20122);
+        let config = ProxyConfig {
+            mode: ProxyMode::Manual,
+            proxy_type: ty,
+            host,
+            port,
+            username: String::new(),
+            password: String::new(),
+            no_proxy_list: String::new(),
+        };
+        assert_eq!(
+            config.to_proxy_url().as_deref(),
+            Some("http://127.0.0.1:20122")
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2175,7 +2537,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // System proxy detection (Windows-only)
+    // System proxy detection
     // -----------------------------------------------------------------------
 
     #[cfg(target_os = "windows")]
@@ -2186,12 +2548,138 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    #[cfg(not(target_os = "windows"))]
+    // macOS/Linux 探测结果取决于当前测试机的真实代理配置（scutil / 环境
+    // 变量 / gsettings），不能断言具体值——只验证探测流程本身不会 panic
+    // 或返回 Err（子进程失败/命令缺失必须走 Ok(None) 兜底，而不是冒泡错误）。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
-    fn detect_system_proxy_returns_none_on_non_windows() {
+    fn detect_system_proxy_does_not_panic_on_macos_linux() {
+        let result = super::detect_system_proxy();
+        assert!(result.is_ok());
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn detect_system_proxy_returns_none_on_unsupported_platforms() {
         let result = super::detect_system_proxy();
         assert!(result.is_ok());
         assert!(result.unwrap_or(None).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // scutil --proxy 字典解析
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_scutil_dict_flattens_top_level_scalars() {
+        let text = "<dictionary> {\n  ExceptionsList : <array> {\n    0 : *.local\n  }\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : 127.0.0.1\n}\n";
+        let map = parse_scutil_dict(text);
+        assert_eq!(map.get("HTTPEnable").map(String::as_str), Some("1"));
+        assert_eq!(map.get("HTTPPort").map(String::as_str), Some("1087"));
+        assert_eq!(map.get("HTTPProxy").map(String::as_str), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn parse_scutil_proxy_output_all_disabled_returns_none() {
+        let text = "<dictionary> {\n  HTTPEnable : 0\n  HTTPSEnable : 0\n  SOCKSEnable : 0\n}\n";
+        assert!(parse_scutil_proxy_output(text).is_none());
+    }
+
+    #[test]
+    fn parse_scutil_proxy_output_http_only() {
+        let text =
+            "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : 127.0.0.1\n}\n";
+        let cfg = parse_scutil_proxy_output(text).expect("http proxy should be detected");
+        assert_eq!(cfg.proxy_type, ProxyType::Http);
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 1087);
+        assert_eq!(cfg.mode, ProxyMode::Manual);
+    }
+
+    /// `HTTPSProxy` 命名的是流量目标而非代理端点自身传输层——端点仍只说
+    /// 明文 HTTP CONNECT，必须映射到 [`ProxyType::Http`]，与 Windows
+    /// `ProxyServer` 的 `https=` 键同理（否则 reqwest 会对该端点误发 TLS
+    /// ClientHello 导致连接失败）。
+    #[test]
+    fn parse_scutil_proxy_output_https_maps_to_http_transport() {
+        let text =
+            "<dictionary> {\n  HTTPSEnable : 1\n  HTTPSPort : 1087\n  HTTPSProxy : 127.0.0.1\n}\n";
+        let cfg = parse_scutil_proxy_output(text).expect("https proxy should be detected");
+        assert_eq!(cfg.proxy_type, ProxyType::Http);
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 1087);
+    }
+
+    #[test]
+    fn parse_scutil_proxy_output_prefers_socks_over_https_and_http() {
+        let text = "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : 127.0.0.1\n  HTTPSEnable : 1\n  HTTPSPort : 1087\n  HTTPSProxy : 127.0.0.1\n  SOCKSEnable : 1\n  SOCKSPort : 1086\n  SOCKSProxy : 127.0.0.1\n}\n";
+        let cfg = parse_scutil_proxy_output(text).expect("socks proxy should win priority");
+        assert_eq!(cfg.proxy_type, ProxyType::Socks5);
+        assert_eq!(cfg.port, 1086);
+    }
+
+    #[test]
+    fn parse_scutil_proxy_output_enabled_but_empty_host_returns_none() {
+        // GUI 关掉某个协议但残留旧字段时常见：*Enable=1 但 host 字段是空串。
+        let text = "<dictionary> {\n  HTTPEnable : 1\n  HTTPPort : 1087\n  HTTPProxy : \n}\n";
+        assert!(parse_scutil_proxy_output(text).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // 代理环境变量解析（Linux GUI 进程常见，桌面终端会话导出）
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_env_proxy_url_plain_http() {
+        let cfg = parse_env_proxy_url("http://127.0.0.1:7890").expect("should parse");
+        assert_eq!(cfg.proxy_type, ProxyType::Http);
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 7890);
+        assert_eq!(cfg.mode, ProxyMode::Manual);
+    }
+
+    #[test]
+    fn parse_env_proxy_url_socks5_with_credentials() {
+        let cfg = parse_env_proxy_url("socks5://user:p%40ss@127.0.0.1:1080").expect("should parse");
+        assert_eq!(cfg.proxy_type, ProxyType::Socks5);
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 1080);
+        assert_eq!(cfg.username, "user");
+        assert_eq!(cfg.password, "p@ss");
+    }
+
+    #[test]
+    fn parse_env_proxy_url_https_scheme_keeps_tls_transport() {
+        // 少数工具（stunnel 包装的代理）会显式用 https:// 声明端点自身走
+        // TLS；这与 Windows/scutil 目标语义的 `https=` 键不同，字面 scheme
+        // 就是权威来源，必须原样映射到 Https 而不是降级为 Http。
+        let cfg = parse_env_proxy_url("https://proxy.example.com").expect("should parse");
+        assert_eq!(cfg.proxy_type, ProxyType::Https);
+        assert_eq!(cfg.port, 443);
+    }
+
+    #[test]
+    fn parse_env_proxy_url_invalid_returns_none() {
+        assert!(parse_env_proxy_url("not a url").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // gsettings 取值解析
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn strip_gsettings_quotes_removes_single_quotes() {
+        assert_eq!(strip_gsettings_quotes("'127.0.0.1'"), "127.0.0.1");
+    }
+
+    #[test]
+    fn strip_gsettings_quotes_leaves_bare_integer_unchanged() {
+        assert_eq!(strip_gsettings_quotes("1087\n"), "1087");
+    }
+
+    #[test]
+    fn strip_gsettings_quotes_empty_string_value_becomes_empty() {
+        assert_eq!(strip_gsettings_quotes("''"), "");
     }
 
     // -----------------------------------------------------------------------

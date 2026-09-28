@@ -44,7 +44,10 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac
 COPY Cargo.toml Cargo.lock ./
+# cargo 解析 workspace 时要读全部成员的 manifest，包括桌面开发工具。
 COPY native/ native/
+COPY crates/ crates/
+COPY scripts/desktop-dev/ scripts/desktop-dev/
 # Web SPA 在编译期由 native/server/build.rs 嵌入二进制（单文件分发，运行时层
 # 不再有 web/ 目录，也无需 FLUXDOWN_WEBROOT）。
 COPY --from=web /src/web/dist /webroot
@@ -65,9 +68,10 @@ RUN --mount=type=cache,id=fluxdown-cargo-registry-$TARGETARCH,target=/usr/local/
     && cp "target/$(cat /rust-target)/release/fluxdown-server" /usr/local/bin/fluxdown-server
 
 # ── Stage 3: 运行时（目标架构 debian-slim + ca-certificates，rustls 读系统根证书）──
+# xz-utils：托管 ffmpeg 组件在 Linux 上是 .tar.xz，components/ffmpeg.rs 走系统 `tar -xJf` 解压（#649）
 FROM debian:bookworm-slim
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl xz-utils \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=server /usr/local/bin/fluxdown-server /app/fluxdown-server

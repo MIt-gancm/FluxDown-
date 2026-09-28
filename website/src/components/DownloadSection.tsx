@@ -56,10 +56,9 @@ const DOCKER_COMPOSE_YML = `services:
 volumes:
   fluxdown-data:`;
 
-// Scoop 自托管源安装命令（本仓库 bucket）。官方 extras 源待项目达标后再加。
-
-const SCOOP_SELFHOSTED_CMD = `scoop bucket add fluxdown https://github.com/zerx-lab/FluxDown
-scoop install fluxdown/fluxdown`;
+// Scoop 官方 Extras 源安装命令（FluxDown 已收录进 ScoopInstaller/Extras，由 excavator 自动追新）。
+const SCOOP_CMD = `scoop bucket add extras
+scoop install extras/fluxdown`;
 
 /* Windows logo — not available in Simple Icons (trademark), use inline SVG.
    color="currentColor"（侧栏）渲染单色；不传 color（详情头部）渲染官方四色磁贴。 */
@@ -210,7 +209,7 @@ export default function DownloadSection() {
 
   const handleScoopCopy = useCallback(async () => {
     try {
-      await navigator.clipboard.writeText(SCOOP_SELFHOSTED_CMD);
+      await navigator.clipboard.writeText(SCOOP_CMD);
       setScoopCopied(true);
       setTimeout(() => setScoopCopied(false), 2000);
     } catch {
@@ -1262,10 +1261,10 @@ export default function DownloadSection() {
                 </button>
               </div>
               <pre className="rounded-lg bg-dark-bg border border-dark-border/60 p-4 text-xs leading-relaxed text-dark-text-secondary overflow-x-auto font-mono">
-                <code>{SCOOP_SELFHOSTED_CMD}</code>
+                <code>{SCOOP_CMD}</code>
               </pre>
               <p className="mt-3 text-[11px] text-dark-text-muted">
-                {t("dl.scoopSelfHostedHint")}
+                {t("dl.scoopHint")}
               </p>
             </div>
           </motion.div>

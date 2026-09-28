@@ -37,6 +37,10 @@ pub enum PluginEntryKind {
     Resolve,
     /// hook 入口：`globalThis.onStart/onError/onDone/onMetaProbed`（由 event 决定）。
     Hook,
+    /// auth 入口：`globalThis.authenticate`。
+    Auth,
+    /// 订阅 provider 入口：`globalThis.subscribe`。
+    Subscription,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,6 +53,11 @@ pub enum PluginEntryKind {
 pub struct ResolveRequest {
     pub task_id: String,
     pub url: String,
+    /// 当前插件对该站点的默认认证引用；只有声明了 `auth` 权限的插件才会被
+    /// 填充（M-5），未授权插件恒为空串。插件通常直接使用 `flux.fetch`，
+    /// bridge 会自动按该引用查找并复用凭据。
+    #[serde(default)]
+    pub auth_ref: String,
     pub cookies: String,
     pub referrer: String,
     pub user_agent: String,
@@ -59,6 +68,49 @@ pub struct ResolveRequest {
     /// 变体收敛静默取默认（不为 N 个子任务弹 N 个选择框）。引擎不解释具体格式，
     /// 由发起方（前端固定选择/引擎自动裂变）与插件约定（D5 契约）。
     pub resolver_item: String,
+}
+
+/// 一次平台登录动作。`action` 为 `begin`、`poll`、`cancel`、`logout` 或 `status`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthRequest {
+    pub action: String,
+    pub site: String,
+    pub auth_ref: String,
+    pub session_id: String,
+    pub input: String,
+}
+
+/// 插件登录入口返回的交互状态。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AuthResult {
+    /// `pending` / `success` / `error`。
+    pub status: String,
+    pub session_id: String,
+    /// 二维码内容、data URL 或平台要求展示给用户的挑战数据。
+    pub challenge: Option<String>,
+    pub challenge_type: Option<String>,
+    pub message: String,
+    pub auth_ref: Option<String>,
+}
+
+/// 传入插件订阅 provider 的请求上下文。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionRequest {
+    /// 当前 provider ID。
+    pub provider_id: String,
+    /// 公共订阅记录 ID。
+    pub source_id: String,
+    /// 订阅记录中的地址。
+    pub url: String,
+    /// provider 专属不透明配置 JSON 字符串。
+    pub provider_config: String,
+    /// 订阅级 Cookie。
+    pub cookies: String,
+    /// 已解析的 User-Agent。
+    pub user_agent: String,
 }
 
 /// `resolve(ctx)` 的返回值。返回 `null`/`undefined` 表示放行不改写（映射为
@@ -209,6 +261,26 @@ pub enum PluginEvent {
         file_name: String,
         total_bytes: i64,
     },
+    /// 任务被取消（用户手动取消 / variants 选择被取消 / 宿主取消）终态通知
+    /// （593#1）。与 onDone/onError 互斥：cancel_task 只在 generation 未被
+    /// on_task_done 接管的路径上发出，同一任务不会重复触发终态钩子。仅用于
+    /// 通知插件释放已转存的临时远程资源，不影响任务状态机、不支持重试。
+    Cancel {
+        task_id: String,
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<CancelReason>,
+    },
+}
+
+/// `onCancel` 载荷的可选取消原因。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CancelReason {
+    UserCancelled,
+    VariantSelectionCancelled,
+    HostCancelled,
+    Unknown,
 }
 
 impl PluginEvent {
@@ -219,6 +291,7 @@ impl PluginEvent {
             PluginEvent::Error { .. } => "onError",
             PluginEvent::Done { .. } => "onDone",
             PluginEvent::MetaProbed { .. } => "onMetaProbed",
+            PluginEvent::Cancel { .. } => "onCancel",
         }
     }
 
@@ -233,7 +306,8 @@ impl PluginEvent {
             PluginEvent::Start { url, .. }
             | PluginEvent::Error { url, .. }
             | PluginEvent::Done { url, .. }
-            | PluginEvent::MetaProbed { url, .. } => url,
+            | PluginEvent::MetaProbed { url, .. }
+            | PluginEvent::Cancel { url, .. } => url,
         }
     }
 }
@@ -280,6 +354,12 @@ pub struct BridgeHttpRequest {
     pub url: String,
     pub headers: HashMap<String, String>,
     pub body: Option<String>,
+    /// 显式认证引用；为空时 bridge 按插件 ID + 请求站点推导默认引用。
+    #[serde(default)]
+    pub auth_ref: Option<String>,
+    /// 由运行时注入，插件脚本不能自行打开认证能力。
+    #[serde(skip)]
+    pub auth_allowed: bool,
 }
 
 impl Default for BridgeHttpRequest {
@@ -289,6 +369,8 @@ impl Default for BridgeHttpRequest {
             url: String::new(),
             headers: HashMap::new(),
             body: None,
+            auth_ref: None,
+            auth_allowed: false,
         }
     }
 }
@@ -407,6 +489,9 @@ pub struct HostContext {
     /// yt-dlp 的文件牢笼由 bridge 自持（每插件 scratch 目录），故此处只需授权门，
     /// 无需牢笼根：resolve 与全部 hook 上下文下授权即可用（区别于 ffmpeg）。
     pub ytdlp_permitted: bool,
+    /// manifest `permissions` 是否含 `"auth"`——决定是否允许插件读取/保存
+    /// 通用认证凭据以及让 `flux.fetch` 自动注入凭据。
+    pub auth_permitted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -439,6 +524,28 @@ pub trait ScriptRuntime: Send + Sync {
         host: HostContext,
     ) -> Result<Option<ResolveResult>, PluginError>;
 
+    /// 调用 `globalThis.authenticate(ctx)`，返回一次登录交互状态。
+    async fn invoke_auth(
+        &self,
+        plugin: &PluginScript,
+        req: AuthRequest,
+        settings_json: String,
+        bridge: Arc<dyn PluginBridge>,
+        budget: ExecutionBudget,
+        host: HostContext,
+    ) -> Result<AuthResult, PluginError>;
+
+    /// 调用 `globalThis.subscribe(ctx)`，返回插件规范化后的 JSON 字符串。
+    async fn invoke_subscription(
+        &self,
+        plugin: &PluginScript,
+        req: SubscriptionRequest,
+        settings_json: String,
+        bridge: Arc<dyn PluginBridge>,
+        budget: ExecutionBudget,
+        host: HostContext,
+    ) -> Result<String, PluginError>;
+
     /// 通知钩子；**全部事件（含 Error）统一 fire-and-forget，实现方吞掉一切错误
     /// （仅日志），无返回值**。重试意图由脚本经 [`PluginBridge::request_retry`]
     /// 命令式发起，不走返回值通道。`settings_json` 同 [`Self::invoke_resolve`]。
@@ -468,6 +575,29 @@ pub trait PluginBridge: Send + Sync {
         plugin_id: &str,
         req: BridgeHttpRequest,
     ) -> Result<BridgeHttpResponse, PluginError>;
+
+    /// 读取插件自己的认证档案。默认 bridge 不提供认证能力。
+    async fn auth_get(
+        &self,
+        _plugin_id: &str,
+        _auth_ref: &str,
+    ) -> Result<Option<crate::auth::AuthProfile>, PluginError> {
+        Ok(None)
+    }
+
+    /// 写入或替换插件自己的认证档案，返回稳定 authRef。
+    async fn auth_save(
+        &self,
+        _plugin_id: &str,
+        _profile: crate::auth::AuthProfile,
+    ) -> Result<String, PluginError> {
+        Err(PluginError::Runtime("此 bridge 不支持认证存储".to_string()))
+    }
+
+    /// 删除插件自己的认证档案。
+    async fn auth_remove(&self, _plugin_id: &str, _auth_ref: &str) -> Result<(), PluginError> {
+        Err(PluginError::Runtime("此 bridge 不支持认证存储".to_string()))
+    }
 
     /// `flux.storage.get`。
     async fn storage_get(&self, plugin_id: &str, key: &str) -> Option<String>;
@@ -628,6 +758,7 @@ mod tests {
         let req = ResolveRequest {
             task_id: "t".into(),
             url: "u".into(),
+            auth_ref: String::new(),
             cookies: String::new(),
             referrer: String::new(),
             user_agent: "UA".into(),

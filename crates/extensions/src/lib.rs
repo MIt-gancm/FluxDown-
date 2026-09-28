@@ -3,21 +3,21 @@
 mod components;
 mod controller;
 mod pages;
+mod ui;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use fluxdown_protocol::{AgentSnapshot, ApplicationErrorCode, RpcErrorData, ServiceEvent};
+use fluxdown_protocol::{
+    AgentSnapshot, ApplicationErrorCode, ErrorReason, RpcErrorData, ServiceEvent,
+};
+use fluxdown_ui_components::segmented_tabs;
 use fluxdown_ui_i18n::Translator;
+use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Context, Entity, IntoElement, ParentElement, Render, Styled, Window, div,
+    Context, Entity, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
     prelude::FluentBuilder as _,
 };
-use gpui_component::{
-    ActiveTheme as _, WindowExt as _,
-    notification::Notification,
-    tab::{Tab, TabBar},
-    v_flex,
-};
+use gpui_component::{WindowExt as _, h_flex, notification::Notification, v_flex};
 
 use controller::{COMPONENT_KINDS, component_slot};
 pub use controller::{ExtensionsController, ExtensionsSignal};
@@ -153,9 +153,20 @@ impl ExtensionsView {
     }
 }
 
-/// agent 端口只回传错误码（服务端 message 不透传），按码映射通用文案。
+/// agent 端口不透传服务端 message：有细分原因时按原因给出可操作文案，否则按码映射通用文案。
 pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> String {
-    let key = match error.code {
+    let reason_key = error.reason.and_then(|reason| match reason {
+        ErrorReason::MarketUnreachable => Some("pluginErrorMarketUnreachable"),
+        ErrorReason::MarketIndexInvalid => Some("pluginErrorMarketIndexInvalid"),
+        ErrorReason::MarketIndexRollback => Some("pluginErrorMarketIndexRollback"),
+        ErrorReason::PluginNotInMarket => Some("pluginErrorNotInMarket"),
+        ErrorReason::PluginYanked => Some("pluginErrorYanked"),
+        ErrorReason::PluginDownloadFailed => Some("pluginErrorDownloadFailed"),
+        ErrorReason::PluginPackageTooLarge => Some("pluginErrorPackageTooLarge"),
+        ErrorReason::PluginPackageInvalid => Some("pluginErrorPackageInvalid"),
+        ErrorReason::Unknown => None,
+    });
+    let key = reason_key.unwrap_or(match error.code {
         ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout => {
             "localServiceDisconnected"
         }
@@ -168,7 +179,7 @@ pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> Strin
         | ApplicationErrorCode::Unauthorized
         | ApplicationErrorCode::Cancelled
         | ApplicationErrorCode::Internal => "localServiceActionFailed",
-    };
+    });
     translator.text(key).to_owned()
 }
 
@@ -189,27 +200,40 @@ impl Render for ExtensionsView {
         };
         let translator = self.translator.read(cx);
         let labels = [
-            translator.text("settingsCatPlugins").to_owned(),
-            translator.text("settingsCatComponents").to_owned(),
+            SharedString::from(translator.text("settingsCatPlugins").to_owned()),
+            SharedString::from(translator.text("settingsCatComponents").to_owned()),
         ];
-        let danger = cx.theme().danger;
+        let tokens = active_theme(cx).tokens();
+        let (spacing, typography, destructive) = (
+            tokens.spacing,
+            tokens.typography.xs,
+            tokens.colors.destructive,
+        );
+        let view = cx.entity().downgrade();
         v_flex()
             .w_full()
-            .gap_4()
+            .gap(spacing.md)
             .when_some(self.last_error.clone(), |this, error| {
-                this.child(div().text_sm().text_color(danger).child(error))
+                this.child(
+                    div()
+                        .text_size(typography.size)
+                        .line_height(typography.line_height)
+                        .text_color(destructive)
+                        .child(error),
+                )
             })
-            .child(
-                TabBar::new("extensions-tabs")
-                    .underline()
-                    .selected_index(tab.index())
-                    .on_click(cx.listener(|this, index: &usize, _, cx| {
-                        if let Some(tab) = ExtensionsTab::ALL.get(*index) {
-                            this.show_tab(*tab, cx);
-                        }
-                    }))
-                    .children(labels.into_iter().map(|label| Tab::new().label(label))),
-            )
+            // 标签条左对齐、保持自然宽度（外层行吸收纵向容器的横向拉伸）。
+            .child(h_flex().w_full().child(segmented_tabs(
+                "extensions-tabs",
+                labels,
+                tab.index(),
+                move |index, _, cx| {
+                    if let Some(tab) = ExtensionsTab::ALL.get(index) {
+                        let _ = view.update(cx, |this, cx| this.show_tab(*tab, cx));
+                    }
+                },
+                cx,
+            )))
             .child(body)
     }
 }

@@ -113,18 +113,43 @@ CHECKSUM=$(md5sum "$stage/package.tgz" | cut -d' ' -f1)
 } > "$stage/INFO"
 
 # ── conf/privilege：DSM 7 强制非 root，以套件专属用户运行；DSM 6 维持 root ──
+#    DSM 7 显式命名用户 sc-fluxdown（与 SynoCommunity 同款前缀），共享文件夹
+#    权限页「系统内部用户」里就是这个名字，文档 / Web 端提示都引用它。
 mkdir -p "$stage/conf"
 if [ "$DSM" = "dsm7" ]; then
-	printf '{"defaults":{"run-as":"package"}}\n' > "$stage/conf/privilege"
+	printf '{"defaults":{"run-as":"package"},"username":"sc-fluxdown","groupname":"sc-fluxdown"}\n' > "$stage/conf/privilege"
 else
 	printf '{"defaults":{"run-as":"root"}}\n' > "$stage/conf/privilege"
 fi
 
-# ── scripts/（生命周期脚本；除 start-stop-status 外均为幂等空脚本） ──
+# ── DSM 7：受限用户默认对任何共享文件夹都无权限，目录选择器里进 /volume1/<share>
+#    只会得到 EACCES（表现为「看不到共享文件夹」）。用 DSM 的 data-share 资源
+#    worker 在每次启动时创建/授权向导里选定的共享文件夹（rw → sc-fluxdown）；
+#    conf/resource 支持 {{wizard_key}} 模板（官方 docker 示例同款）。
+#    安装 / 升级向导都带同一个键：升级时 resource 会重新求值，缺键会变成空名。──
+if [ "$DSM" = "dsm7" ]; then
+	printf '{"data-share":{"shares":[{"name":"{{wizard_share_name}}","permission":{"rw":["sc-fluxdown"]}}]}}\n' > "$stage/conf/resource"
+	mkdir -p "$stage/WIZARD_UIFILES"
+	cp "$SCRIPT_DIR/wizard/install_uifile.sh" "$stage/WIZARD_UIFILES/install_uifile.sh"
+	cp "$SCRIPT_DIR/wizard/install_uifile.sh" "$stage/WIZARD_UIFILES/upgrade_uifile.sh"
+	chmod 755 "$stage/WIZARD_UIFILES/"*
+fi
+
+# ── scripts/（生命周期脚本）──
+#    postinst / postupgrade 把向导选的共享文件夹名落到 var/share_name，
+#    start-stop-status 据此解析路径传给 FLUXDOWN_SAVE_DIR（向导变量只在
+#    安装脚本环境里可见，启动脚本拿不到）。其余为幂等空脚本。
 mkdir -p "$stage/scripts"
 cp "$SCRIPT_DIR/scripts/start-stop-status" "$stage/scripts/start-stop-status"
-for s in preinst postinst preuninst postuninst preupgrade postupgrade; do
+for s in preinst preuninst postuninst preupgrade; do
 	printf '#!/bin/sh\nexit 0\n' > "$stage/scripts/$s"
+done
+for s in postinst postupgrade; do
+	if [ "$DSM" = "dsm7" ]; then
+		cp "$SCRIPT_DIR/scripts/save-share-name" "$stage/scripts/$s"
+	else
+		printf '#!/bin/sh\nexit 0\n' > "$stage/scripts/$s"
+	fi
 done
 chmod 755 "$stage/scripts/"*
 
@@ -136,8 +161,11 @@ else
 fi
 convert "$LOGO" -resize 256x256 "$stage/PACKAGE_ICON_256.PNG"
 
-# ── 顶层 tar 即 .spk ──
+# ── 顶层 tar 即 .spk（WIZARD_UIFILES 仅 DSM 7 存在）──
 mkdir -p "$(dirname "$OUT")"
+extra=""
+[ -d "$stage/WIZARD_UIFILES" ] && extra="WIZARD_UIFILES"
+# shellcheck disable=SC2086
 tar -cf "$OUT" --owner=0 --group=0 --numeric-owner -C "$stage" \
-	INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG package.tgz scripts conf
+	INFO PACKAGE_ICON.PNG PACKAGE_ICON_256.PNG package.tgz scripts conf $extra
 echo "built: $OUT"

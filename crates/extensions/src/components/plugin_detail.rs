@@ -3,11 +3,13 @@
 use std::rc::Rc;
 
 use fluxdown_protocol::{MarketEntryDto, PluginDto};
+use fluxdown_ui_components::tabular_numbers;
 use fluxdown_ui_i18n::Translator;
-use gpui::{App, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
-use gpui_component::{
-    ActiveTheme as _, StyledExt as _, WindowExt as _, h_flex, link::Link, tag::Tag, v_flex,
-};
+use fluxdown_ui_theme::active_theme;
+use gpui::{App, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
+use gpui_component::{WindowExt as _, h_flex, link::Link, v_flex};
+
+use crate::{pages::Frame, ui};
 
 /// 详情对话框的数据；调用侧从各自 DTO 拆字段。
 #[derive(Clone, Debug, Default)]
@@ -84,6 +86,10 @@ pub fn permission_label(translator: &Translator, permission: &str) -> (String, S
             translator.text("pluginPermYtdlpName").to_owned(),
             translator.text("pluginPermYtdlpDesc").to_owned(),
         ),
+        "auth" => (
+            translator.text("pluginPermAuthName").to_owned(),
+            translator.text("pluginPermAuthDesc").to_owned(),
+        ),
         other => (
             other.to_owned(),
             translator.text("pluginPermUnknownDesc").to_owned(),
@@ -100,43 +106,56 @@ pub fn open_plugin_detail(
 ) {
     let detail = Rc::new(detail);
     let translator = Rc::new(translator);
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
         let detail = detail.clone();
         let translator = translator.clone();
         dialog
-            .title(detail.name.clone())
+            .title(fluxdown_ui_components::dialog_title(
+                detail.name.clone(),
+                cx,
+            ))
             .w(px(480.))
             .content(move |root, _, cx| root.child(render_detail(&detail, &translator, cx)))
     });
 }
 
+/// 信息行标签列宽：容纳「最低应用版本」等最长标签。
+const LABEL_WIDTH: f32 = 96.;
+
 fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> impl IntoElement {
-    let theme = cx.theme().clone();
+    let theme = active_theme(cx);
+    let frame = Frame {
+        translator,
+        tokens: theme.tokens(),
+        extended: theme.extended(),
+        components: theme.components(),
+        stale: false,
+    };
+    let tokens = frame.tokens;
     let text = |key: &str| SharedString::from(translator.text(key).to_owned());
     let label_cell = |label: SharedString| {
-        div()
-            .w(px(96.))
+        ui::meta_text(label, frame)
+            .w(px(LABEL_WIDTH))
             .flex_shrink_0()
-            .text_xs()
-            .text_color(theme.muted_foreground)
-            .child(label)
     };
     let info_row = |label: SharedString, value: String| {
         h_flex()
             .w_full()
-            .gap_3()
-            .items_start()
+            .gap(tokens.spacing.md)
+            .items_baseline()
             .child(label_cell(label))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(value),
-            )
+            .child(ui::body_text(value, frame).flex_1().min_w_0())
     };
-    let section_title = |label: SharedString| div().pt_2().text_xs().font_semibold().child(label);
+    // 分区标题：caption MEDIUM + 三级文字色。
+    let section_title = |label: SharedString| {
+        div()
+            .pt(tokens.spacing.sm)
+            .text_size(frame.extended.caption.size)
+            .line_height(frame.extended.caption.line_height)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(frame.extended.colors.text_tertiary)
+            .child(label)
+    };
     let permissions = detail
         .permissions
         .iter()
@@ -144,39 +163,32 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
             let (name, description) = permission_label(translator, permission);
             v_flex()
                 .w_full()
-                .gap_0p5()
-                .child(div().text_xs().font_semibold().child(name))
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(description),
-                )
+                .gap(tokens.spacing.xxs)
+                .child(ui::title_text(name, frame))
+                .child(ui::meta_text(description, frame))
         })
         .collect::<Vec<_>>();
-    let mut content = v_flex().w_full().gap_2().child(
+    let mut content = v_flex().w_full().gap(tokens.spacing.sm).child(
         h_flex()
-            .gap_2()
+            .gap(tokens.spacing.sm)
             .items_center()
             .flex_wrap()
             .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("v{}", detail.version)),
+                ui::meta_text(format!("v{}", detail.version), frame)
+                    .font_features(tabular_numbers()),
             )
             .children(
                 detail
                     .yanked_label
                     .clone()
-                    .map(|label| Tag::danger().child(label)),
+                    .map(|label| ui::tone_pill(label, tokens.colors.destructive, frame)),
             )
             .children(
                 detail
                     .tags
                     .iter()
                     .cloned()
-                    .map(|tag| Tag::secondary().child(tag)),
+                    .map(|tag| ui::neutral_pill(tag, frame)),
             ),
     );
     content = content.child(info_row(
@@ -190,13 +202,13 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
         content = content.child(
             h_flex()
                 .w_full()
-                .gap_3()
-                .items_start()
+                .gap(tokens.spacing.md)
+                .items_baseline()
                 .child(label_cell(text("pluginDetailHomepage")))
                 .child(
                     Link::new("plugin-detail-homepage")
                         .href(detail.homepage.clone())
-                        .text_xs()
+                        .text_size(tokens.typography.sm.size)
                         .child(detail.homepage.clone()),
                 ),
         );
@@ -225,12 +237,7 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
     if !detail.description.is_empty() {
         content = content
             .child(section_title(text("pluginDetailDescription")))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.foreground)
-                    .child(detail.description.clone()),
-            );
+            .child(ui::body_text(detail.description.clone(), frame));
     }
     if !permissions.is_empty() {
         content = content
@@ -239,10 +246,5 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
     }
     content
         .child(section_title(text("pluginDetailUsage")))
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(text("pluginDetailUsageBody")),
-        )
+        .child(ui::meta_text(text("pluginDetailUsageBody"), frame))
 }

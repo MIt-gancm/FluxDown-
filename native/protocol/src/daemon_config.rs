@@ -40,7 +40,7 @@ const fn field(
 }
 
 pub const BT_SEED_TIME_UNITS: &[&str] = &["minutes", "hours", "days"];
-pub const FILE_EXISTS_BEHAVIORS: &[&str] = &["rename", "overwrite"];
+pub const FILE_EXISTS_BEHAVIORS: &[&str] = &["rename", "overwrite", "skip"];
 pub const FILE_MISSING_ACTIONS: &[&str] = &["keep", "delete"];
 pub const BT_SEED_LIMIT_OPERATORS: &[&str] = &["or", "and"];
 pub const BT_SEED_THEN_ACTIONS: &[&str] = &["stop", "delete", "delete_files"];
@@ -68,6 +68,7 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Integer { min: 0, max: 8 },
         "0",
     ),
+    field("multi_nic_enabled", DaemonConfigKind::Bool, "false"),
     field(
         "max_concurrent_tasks",
         DaemonConfigKind::Integer { min: 1, max: 1024 },
@@ -104,6 +105,7 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
     ),
     field("auto_resume_on_start", DaemonConfigKind::Bool, "false"),
     field("use_server_time", DaemonConfigKind::Bool, "false"),
+    field("dedup_same_url", DaemonConfigKind::Bool, "false"),
     field(
         "file_exists_behavior",
         DaemonConfigKind::Enum(FILE_EXISTS_BEHAVIORS),

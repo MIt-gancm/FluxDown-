@@ -119,11 +119,14 @@ fn default_true() -> bool {
     true
 }
 
-/// 当前账户资料与套餐快照。
+/// 当前账户资料与套餐快照（`GET /me`）。FluxCloud 把用户字段平铺在顶层，
+/// `entitlements` / `currentPlan` / `purchaseCreditMinor` 为同级字段（与 Flutter
+/// `CloudProfile.fromJson` 一致），因此 `user` 用 `flatten` 映射。
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct CloudProfile {
+    #[serde(flatten)]
     pub user: CloudUser,
     #[serde(default)]
     pub entitlements: Entitlements,
@@ -387,6 +390,10 @@ fn default_gateway_port() -> u16 {
 }
 
 /// 原子修改 agent 托管的兼容网关开关与用户 token。
+///
+/// 管理 API / MCP 端点强制鉴权：`api_enabled` 或 `mcp_enabled` 由关转开且（应用本次
+/// `user_token` 后）用户 token 仍为空时，agent 自动生成随机 token；反之显式把 token
+/// 清空（且本次未开启上述开关）时，agent 同时关闭 `api_enabled` 与 `mcp_enabled`。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -404,6 +411,52 @@ pub struct GatewayPatchParams {
     pub regenerate_user_token: bool,
 }
 
+/// agent 托盘不可用的原因。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum TrayUnavailableReason {
+    /// agent 未编译托盘支持（headless 构建）：关闭全部 UI 后后台恒驻留。
+    NotBuilt,
+    /// 没有图形会话（无 `DISPLAY` / `WAYLAND_DISPLAY`）。
+    NoDisplay,
+    /// 桌面环境没有 StatusNotifier 托盘宿主（如未启用 AppIndicator 扩展的 GNOME）。
+    NoHost,
+    /// 平台托盘初始化失败（如缺少 appindicator 运行库）。
+    InitFailed,
+}
+
+/// agent 系统外壳状态：托盘可用性，以及关闭全部官方 UI 后后台是否继续驻留。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ShellStatusDto {
+    /// 托盘图标可用（`close_to_tray` 偏好可以生效）。
+    pub tray_available: bool,
+    pub tray_unavailable_reason: Option<TrayUnavailableReason>,
+    /// `true`：关闭全部 UI 只退出界面，agent + daemon 继续运行；`false`：随界面一起退出。
+    pub resident: bool,
+}
+
+/// 完成后关机的调度状态（agent 拥有状态机与执行）。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PowerStatusDto {
+    /// 已排定的延迟（秒）；`None` = 未启用。
+    pub armed_delay_secs: Option<u64>,
+    /// 全部任务结束、真正开始倒计时后的剩余秒数；等待任务完成阶段为 `None`。
+    pub countdown_remaining_secs: Option<u64>,
+}
+
+/// `agent.power.arm` 参数：全部任务完成后再等待 `delay_secs` 秒关机（0 = 立即）。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PowerArmParams {
+    pub delay_secs: u64,
+}
+
 /// agent 配置同步状态投影。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -415,6 +468,25 @@ pub struct SyncStatusDto {
     pub last_error: Option<String>,
 }
 
+/// FluxCloud 服务地址；`editable=false`（正式构建）时 `base_url` 恒等于 `default_base_url`。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CloudEndpointDto {
+    pub base_url: String,
+    pub default_base_url: String,
+    pub editable: bool,
+}
+
+/// `agent.cloud.endpointSet` 参数；`base_url` 为空即恢复默认地址。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CloudEndpointSetParams {
+    #[serde(default)]
+    pub base_url: String,
+}
+
 /// agent 自有偏好设置及其原子版本。
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -424,7 +496,10 @@ pub struct AgentPreferencesDto {
     pub values: BTreeMap<String, Value>,
 }
 
-/// 等待官方 UI 确认的外部捕获请求；不包含 cookie 或 header。
+/// 等待官方 UI 确认的外部捕获请求。
+///
+/// 不含 cookie / header / 请求体原文（这些只留在 agent 的捕获事务里，确认时由 agent
+/// 合并进建任务参数），只给出携带摘要供 UI 提示。
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
@@ -434,6 +509,47 @@ pub struct PendingCaptureDto {
     #[serde(default)]
     pub file_name: String,
     pub created_at_unix_ms: i64,
+    /// 捕获方声明的文件大小（字节，0 = 未知）。
+    #[serde(default)]
+    pub file_size: i64,
+    /// 来源页面。
+    #[serde(default)]
+    pub referrer: String,
+    /// 捕获方指定的保存目录（空 = 未指定）。
+    #[serde(default)]
+    pub save_dir: String,
+    /// 是否携带浏览器 Cookie。
+    #[serde(default)]
+    pub has_cookies: bool,
+    /// 携带的请求头名（不含值）。
+    #[serde(default)]
+    pub header_names: Vec<String>,
+}
+
+impl PendingCaptureDto {
+    /// 浏览器请求已带 `Authorization` 头（HTTP 认证沿用浏览器原值）。
+    #[must_use]
+    pub fn has_authorization(&self) -> bool {
+        self.header_names
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case("authorization"))
+    }
+}
+
+/// `agent.capture.resolve` 参数。
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureResolveParams {
+    pub transaction_id: String,
+    pub accepted: bool,
+    /// 确认时官方 UI 表单产出的建任务参数（`None` = 按捕获原请求建任务）。
+    ///
+    /// agent 以捕获原请求为底合并：`url` / `method` / `body` / `audioUrl` 恒取捕获值；
+    /// `fileName` / `saveDir` / `cookies` / `referrer` 为空时取捕获值；`headers` 以捕获头
+    /// 为底、同名（忽略大小写）以表单为准；`userAgent` 非空时替换捕获的 `User-Agent` 头。
+    #[serde(default)]
+    pub request: Option<crate::daemon::CreateTaskRequest>,
 }
 
 /// 桌面系统集成状态（开机自启、`.torrent` 关联、URL scheme 注册）。
@@ -597,4 +713,203 @@ pub struct UpdateCheckResultDto {
     pub release_page_url: String,
     #[serde(default)]
     pub notes: Vec<ReleaseNoteDto>,
+}
+
+/// 偏好键：自定义分类列表（JSON 字符串或数组，与 Flutter `custom_categories` 同形）。
+pub const CUSTOM_CATEGORIES_PREF_KEY: &str = "custom_categories";
+
+/// 自定义分类（与 `lib/src/models/custom_category.dart` 同 JSON 形状）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CustomCategoryDto {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_category_icon")]
+    pub icon: String,
+    /// `extension` | `regex`。
+    #[serde(default = "default_category_match_mode")]
+    pub match_mode: String,
+    #[serde(default)]
+    pub extensions: Vec<String>,
+    #[serde(default)]
+    pub regex_pattern: String,
+    #[serde(default)]
+    pub position: i64,
+    #[serde(default = "default_category_visible")]
+    pub visible: bool,
+    #[serde(default)]
+    pub is_builtin: bool,
+    #[serde(default)]
+    pub builtin_type: Option<String>,
+    #[serde(default)]
+    pub save_dir: String,
+}
+
+fn default_category_icon() -> String {
+    "file".to_owned()
+}
+fn default_category_match_mode() -> String {
+    "extension".to_owned()
+}
+fn default_category_visible() -> bool {
+    true
+}
+
+impl CustomCategoryDto {
+    /// 内置分类基线（与 Flutter `CustomCategory.builtinDefaults` 同序同扩展名）。
+    #[must_use]
+    pub fn builtin_defaults() -> Vec<Self> {
+        let make = |id: &str, icon: &str, exts: &[&str], position: i64| Self {
+            id: format!("builtin_{id}"),
+            name: String::new(),
+            icon: icon.to_owned(),
+            match_mode: "extension".to_owned(),
+            extensions: exts.iter().map(|ext| (*ext).to_owned()).collect(),
+            regex_pattern: String::new(),
+            position,
+            visible: true,
+            is_builtin: true,
+            builtin_type: Some(id.to_owned()),
+            save_dir: String::new(),
+        };
+        vec![
+            make("all", "folders", &[], 0),
+            make(
+                "video",
+                "film",
+                &[
+                    "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m3u8",
+                ],
+                1,
+            ),
+            make(
+                "audio",
+                "music",
+                &["mp3", "flac", "wav", "aac", "ogg", "m4a", "wma", "opus"],
+                2,
+            ),
+            make(
+                "document",
+                "fileText",
+                &[
+                    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "md",
+                ],
+                3,
+            ),
+            make(
+                "image",
+                "image",
+                &[
+                    "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "avif",
+                ],
+                4,
+            ),
+            make(
+                "program",
+                "cpu",
+                &["exe", "msi", "dmg", "pkg", "deb", "rpm", "apk", "appimage"],
+                5,
+            ),
+            make(
+                "archive",
+                "archive",
+                &["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"],
+                6,
+            ),
+            make("other", "file", &[], 7),
+        ]
+    }
+
+    /// 从偏好值解析分类列表（JSON 字符串或数组）；空 / 损坏时回退内置基线，按 `position` 排序。
+    #[must_use]
+    pub fn from_preference(value: Option<&serde_json::Value>) -> Vec<Self> {
+        let parsed = match value {
+            Some(serde_json::Value::String(text)) => serde_json::from_str::<Vec<Self>>(text).ok(),
+            Some(value) => serde_json::from_value::<Vec<Self>>(value.clone()).ok(),
+            None => None,
+        };
+        let mut list = parsed
+            .filter(|list| !list.is_empty())
+            .unwrap_or_else(Self::builtin_defaults);
+        list.sort_by_key(|entry| entry.position);
+        list
+    }
+}
+
+#[cfg(test)]
+mod capture_dto_tests {
+    use serde_json::json;
+
+    use super::{CaptureResolveParams, PendingCaptureDto};
+
+    #[test]
+    fn resolve_params_without_request_field_deserializes() {
+        let params: CaptureResolveParams = serde_json::from_value(json!({
+            "transactionId": "tx-1",
+            "accepted": true,
+        }))
+        .expect("deserialize without request");
+        assert_eq!(params.transaction_id, "tx-1");
+        assert!(params.accepted);
+        assert!(params.request.is_none());
+    }
+
+    #[test]
+    fn pending_capture_without_optional_fields_deserializes_with_defaults() {
+        let capture: PendingCaptureDto = serde_json::from_value(json!({
+            "transactionId": "tx-2",
+            "url": "https://example.com/a.bin",
+            "fileName": "a.bin",
+            "createdAtUnixMs": 1_700_000_000_000_i64,
+        }))
+        .expect("deserialize legacy payload without optional fields");
+        assert_eq!(capture.transaction_id, "tx-2");
+        assert_eq!(capture.file_size, 0);
+        assert_eq!(capture.referrer, "");
+        assert!(!capture.has_cookies);
+        assert!(!capture.has_authorization());
+    }
+
+    #[test]
+    fn authorization_header_name_matches_case_insensitively() {
+        let capture: PendingCaptureDto = serde_json::from_value(json!({
+            "transactionId": "tx-3",
+            "url": "https://example.com/a.bin",
+            "createdAtUnixMs": 0,
+            "headerNames": ["accept", "AUTHORIZATION"],
+        }))
+        .expect("deserialize capture with header names");
+        assert!(capture.has_authorization());
+    }
+}
+
+#[cfg(test)]
+mod cloud_profile_tests {
+    use serde_json::json;
+
+    use super::CloudProfile;
+
+    /// FluxCloud `GET /me` 把用户字段平铺在顶层（同 Flutter `CloudProfile.fromJson`）。
+    #[test]
+    fn profile_parses_flat_me_payload() {
+        let profile: CloudProfile = serde_json::from_value(json!({
+            "id": "u1",
+            "email": "user@example.com",
+            "nickname": "User",
+            "plan": "founder",
+            "originId": 88888888,
+            "membershipOrdinal": 18,
+            "entitlements": { "originIdEdit": true },
+            "currentPlan": { "code": "founder", "name": "创始会员", "badge": "创始会员" },
+            "purchaseCreditMinor": 0
+        }))
+        .expect("flat /me payload");
+        assert_eq!(profile.user.email, "user@example.com");
+        assert_eq!(profile.user.origin_id, Some(88888888));
+        assert_eq!(
+            profile.current_plan.as_ref().map(|plan| plan.code.as_str()),
+            Some("founder")
+        );
+    }
 }

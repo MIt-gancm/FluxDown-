@@ -1,42 +1,45 @@
 //! Doctor：环境自检报告与就地修复。检查项 `id`/`hint`/`repair.action` 由 agent 给出。
 
 use fluxdown_protocol::{DiagnosticLevel, DiagnosticRepairParams, method};
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
-use gpui::{App, ClipboardItem, IntoElement as _, ParentElement, SharedString, Styled, div};
-use gpui_component::{
-    Icon, IconName, h_flex,
-    setting::{SettingGroup, SettingItem, SettingPage},
-    v_flex,
+use gpui::{
+    App, ClipboardItem, FontWeight, IntoElement as _, ParentElement, SharedString, Styled, div, px,
 };
+use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 
 use super::{SectionContext, camel};
+use crate::ui::{
+    SettingsPage, SettingsRow, SettingsSection, body_text, meta_text, row_loading_button,
+};
 
-pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingPage {
-    SettingPage::new(ctx.t("settingsCatDoctor"))
-        .icon(Icon::new(IconName::Info))
-        .description(ctx.t("settingsCatDoctorDesc"))
-        .resettable(false)
-        .group(
-            SettingGroup::new()
-                .title(ctx.t("doctorTitle"))
-                .description(ctx.t("doctorDesc"))
-                .item(toolbar_item(ctx))
-                .item(report_item(ctx)),
-        )
+pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
+    SettingsPage::new(
+        "doctor",
+        ctx.t("settingsCatDoctor"),
+        ctx.t("settingsCatDoctorDesc"),
+        FluxIcon::Gauge,
+    )
+    .sections([SettingsSection::new()
+        .title(ctx.t("doctorTitle"))
+        .subtitle(ctx.t("doctorDesc"))
+        .row(toolbar_item(ctx))
+        .row(report_item(ctx))])
 }
 
-fn toolbar_item(ctx: &SectionContext) -> SettingItem {
+fn toolbar_item(ctx: &SectionContext) -> SettingsRow {
     let store = ctx.store();
     let translator = ctx.translator.clone();
     let run = ctx.t("doctorRun");
     let running = ctx.t("doctorRunning");
     let copy = ctx.t("doctorCopyReport");
     let never = ctx.t("doctorNeverRun");
-    SettingItem::render(move |options, _, cx: &mut App| {
+    SettingsRow::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let busy = store.read(cx).is_busy("diagnostics");
+        // 修复动作同样占用 `diagnostics`，只有「运行检测」本身才让该按钮转圈。
+        let running_check = store.read(cx).is_busy_untagged("diagnostics");
         let report = store.read(cx).diagnostics().cloned();
         let summary = report.as_ref().map_or_else(
             || never.to_string(),
@@ -64,8 +67,7 @@ fn toolbar_item(ctx: &SectionContext) -> SettingItem {
             .justify_between()
             .gap(tokens.spacing.md)
             .child(
-                div()
-                    .text_sm()
+                body_text(cx)
                     .text_color(tokens.colors.muted_foreground)
                     .child(SharedString::from(summary)),
             )
@@ -74,7 +76,7 @@ fn toolbar_item(ctx: &SectionContext) -> SettingItem {
                     .gap(tokens.spacing.sm)
                     .child(
                         button("doctor-copy", copy.clone(), ButtonVariant::Secondary, cx)
-                            .disabled(options.is_disabled() || copy_report.is_none())
+                            .disabled(disabled || copy_report.is_none())
                             .on_click(move |_, _, cx| {
                                 if let Some(report) = &copy_report {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
@@ -84,13 +86,18 @@ fn toolbar_item(ctx: &SectionContext) -> SettingItem {
                             }),
                     )
                     .child(
-                        button(
+                        loading_button(
                             "doctor-run",
-                            if busy { running.clone() } else { run.clone() },
+                            if running_check {
+                                running.clone()
+                            } else {
+                                run.clone()
+                            },
                             ButtonVariant::Primary,
+                            running_check,
                             cx,
                         )
-                        .disabled(options.is_disabled() || busy)
+                        .disabled(disabled || busy)
                         .on_click(move |_, _, cx| {
                             run_store.update(cx, |store, cx| store.run_diagnostics(cx));
                         }),
@@ -101,11 +108,13 @@ fn toolbar_item(ctx: &SectionContext) -> SettingItem {
     .keywords([ctx.t("doctorRun"), ctx.t("doctorCopyReport")])
 }
 
-fn report_item(ctx: &SectionContext) -> SettingItem {
+fn report_item(ctx: &SectionContext) -> SettingsRow {
     let store = ctx.store();
     let translator = ctx.translator.clone();
-    SettingItem::render(move |options, _, cx: &mut App| {
-        let tokens = active_theme(cx).tokens();
+    SettingsRow::custom(move |disabled, _key, _window, cx: &mut App| {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended().colors;
         let Some(report) = store.read(cx).diagnostics().cloned() else {
             return div().into_any_element();
         };
@@ -125,8 +134,8 @@ fn report_item(ctx: &SectionContext) -> SettingItem {
                 DiagnosticLevel::Info => "doctorLevelInfo",
             };
             let level_color = match check.level {
-                DiagnosticLevel::Ok => tokens.colors.primary,
-                DiagnosticLevel::Warn => tokens.colors.accent_foreground,
+                DiagnosticLevel::Ok => extended.success,
+                DiagnosticLevel::Warn => extended.warning,
                 DiagnosticLevel::Error => tokens.colors.destructive,
                 DiagnosticLevel::Info => tokens.colors.muted_foreground,
             };
@@ -143,11 +152,12 @@ fn report_item(ctx: &SectionContext) -> SettingItem {
                 .py(tokens.spacing.xs)
                 .rounded(tokens.radius.md)
                 .border_1()
-                .border_color(tokens.colors.border)
+                .border_color(extended.hairline)
                 .child(
-                    div()
-                        .min_w_16()
-                        .text_xs()
+                    meta_text(cx)
+                        .flex_none()
+                        .w(px(64.))
+                        .font_weight(FontWeight::MEDIUM)
                         .text_color(level_color)
                         .child(SharedString::from(translator.text(level_key).to_owned())),
                 )
@@ -156,17 +166,11 @@ fn report_item(ctx: &SectionContext) -> SettingItem {
                         .flex_1()
                         .min_w_0()
                         .gap(tokens.spacing.xxs)
-                        .child(div().text_sm().child(SharedString::from(title)))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(tokens.colors.muted_foreground)
-                                .child(SharedString::from(check.detail.clone())),
-                        )
+                        .child(body_text(cx).child(SharedString::from(title)))
+                        .child(meta_text(cx).child(SharedString::from(check.detail.clone())))
                         .children(hint.map(|hint| {
-                            div()
-                                .text_xs()
-                                .text_color(tokens.colors.accent_foreground)
+                            meta_text(cx)
+                                .text_color(tokens.colors.foreground)
                                 .child(SharedString::from(hint))
                         })),
                 );
@@ -175,17 +179,24 @@ fn report_item(ctx: &SectionContext) -> SettingItem {
                 let label = SharedString::from(translator.text(&action_key).to_owned());
                 let repair_store = store.clone();
                 let params = repair.clone();
+                let tag = SharedString::from(format!("{}-{}", check.id, check.target));
+                let repairing = store.read(cx).is_busy_tagged("diagnostics", &tag);
                 row = row.child(
-                    button(
-                        SharedString::from(format!("doctor-repair-{}-{}", check.id, check.target)),
+                    row_loading_button(
+                        SharedString::from(format!("doctor-repair-{tag}")),
                         label,
                         ButtonVariant::Secondary,
+                        repairing,
                         cx,
                     )
-                    .disabled(options.is_disabled() || busy)
+                    .disabled(disabled || busy)
                     .on_click(move |_, _, cx| {
                         let params = params.clone();
-                        repair_store.update(cx, |store, cx| run_repair(store, params, cx));
+                        let tag = tag.clone();
+                        repair_store.update(cx, |store, cx| {
+                            run_repair(store, params, cx);
+                            store.tag_busy("diagnostics", tag);
+                        });
                     }),
                 );
             }

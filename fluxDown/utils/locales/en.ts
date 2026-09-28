@@ -29,6 +29,8 @@ const en: Record<MessageKey, string> = {
   "settings.modeAll": "Intercept All",
   "settings.hintSmart": "Smart detection based on filename, type, and size",
   "settings.hintAll": "Intercept all downloads (except excluded domains)",
+  "settings.localDownloadHint":
+    "Locally generated blob:/data: files are not supported and use the browser download",
   "settings.minFileSize": "Min File Size",
   "settings.sizeNoLimit": "No limit",
   "settings.interceptMagnet": "Take Over Magnet Links",
@@ -113,6 +115,12 @@ const en: Record<MessageKey, string> = {
     "Invalid format, e.g. application/epub+zip or video/",
   "options.rules.resetMime": "Restore Defaults",
   "options.rules.mimeResetDone": "Default MIME list restored",
+  "options.rules.excludeExtTitle": "Excluded Extensions",
+  "options.rules.excludeExtDesc":
+    "Downloads matching these extensions are never intercepted, even if they also match the include rules above (e.g. .torrent, .crx)",
+  "options.rules.excludeExtPlaceholder": "e.g. .torrent",
+  "options.rules.minFileSizeCustom": "Custom",
+  "options.rules.minFileSizeCustomPlaceholder": "Custom size (MB)",
 
 
   // Domain exclusion
@@ -146,6 +154,12 @@ const en: Record<MessageKey, string> = {
   "notify.fallbackBrowser": "Fell back to browser download",
   "notify.fallbackBrowserDetail":
     "Could not send to FluxDown, fell back to browser: {url}",
+  "notify.videoSourceUnavailableTitle": "Cannot Download This Video/Audio",
+  "notify.videoSourceUnavailableDetail":
+    "This source can't be downloaded directly (likely blob:/MSE stream); use the resource sniffer panel instead",
+  "notify.selectionInvalidTitle": "No Downloadable Link Found",
+  "notify.selectionInvalidDetail":
+    "The selection isn't a complete magnet:/ed2k:/http(s) link",
   "notify.appUnavailable": "FluxDown app not detected",
   "notify.appUnavailableDetail":
     "Temporarily using the browser's built-in download. Make sure the FluxDown desktop app is running; interception will resume automatically.",
@@ -187,6 +201,12 @@ const en: Record<MessageKey, string> = {
   "panel.trackVideo": "Video Track",
   "panel.trackAudio": "Audio Track",
   "panel.qualityUnknown": "Unknown Quality",
+  "panel.videoCandidate": "Video candidate",
+  "panel.videoIndex": "Video",
+  "panel.videoNeedsManifest": "Fragments found, but no playlist was found; raw fragments are not downloadable candidates",
+  "panel.autoQuality": "Auto",
+  "panel.originalQuality": "Original",
+  "panel.downloadCandidate": "Download video",
   "panel.previewTitle": "Preview",
   "panel.previewClose": "Close preview",
   "panel.previewFailed": "Preview failed to load, may require login or be blocked by CORS",
@@ -198,6 +218,12 @@ const en: Record<MessageKey, string> = {
   "panel.previewLimitedHint": "Browser preview failed due to CORS/login limits, but download may still succeed (the engine sends your session)",
   "panel.clearFailed": "Clear failed previews",
   "panel.clearFailedHint": "Hide resources that failed to preview (doesn't affect others, and doesn't mean they can't be downloaded)",
+  "panel.exportDebugLog": "Export debug log",
+  "panel.exportDebugLogTitle": "Export raw sniffed resources, playlists, and aggregation links for this page",
+  "panel.exportDebugLogDone": "Sniffer debug log exported",
+  "panel.exportDebugLogFailed": "Failed to export sniffer debug log",
+  "panel.clearResources": "Clear",
+  "panel.clearResourcesTitle": "Clear the sniffed resources on this page",
 
   // Shortcut toggle
   "shortcut.toggleTitle": "Intercept Toggle",
@@ -208,6 +234,7 @@ const en: Record<MessageKey, string> = {
   "contextMenu.sendToFluxDown": "Download this link with FluxDown",
   "contextMenu.sendImageToFluxDown": "Download this image with FluxDown",
   "contextMenu.sendVideoToFluxDown": "Download this video/audio with FluxDown",
+  "contextMenu.sendSelectionToFluxDown": "Download selection with FluxDown",
   "contextMenu.sendPageToFluxDown": "Download this page with FluxDown",
 
   // Manifest

@@ -43,6 +43,18 @@ export function openRenameTask(payload: RenameTaskPayload) {
   renameTaskStore.set(payload)
 }
 
+/** 更换任务下载源地址弹窗的触发载荷（消费后置 null）。 */
+export interface ChangeTaskUrlPayload {
+  taskId: string
+  url: string
+}
+
+export const changeTaskUrlStore = new Store<ChangeTaskUrlPayload | null>(null)
+
+export function openChangeTaskUrl(payload: ChangeTaskUrlPayload) {
+  changeTaskUrlStore.set(payload)
+}
+
 /** 做种限制对话框的触发载荷：当前任务的哨兵编码原值（-2/-1/>=0，见 types.ts TaskDto）。 */
 export interface SeedLimitsPayload {
   taskId: string

@@ -3,10 +3,10 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
-import 'package:launch_at_startup/launch_at_startup.dart';
 import 'package:rinf/rinf.dart';
 
 import '../bindings/bindings.dart';
+import '../services/autostart_service.dart';
 import '../services/log_service.dart';
 import 'custom_category.dart';
 import 'webhook_endpoint.dart';
@@ -27,6 +27,7 @@ class SettingsProvider extends ChangeNotifier {
   int _autoMaxConnections = 16; // 自动模式下智能调度的最大连接数上限
   bool _cdnMultiEnabled = false; // 多 CDN 节点并发下载（实验性，P0）：同一文件多节点并发拉取
   int _cdnMaxNodes = 0; // 单任务最多钉定的 CDN 节点数，0..=8；0 = 自动档
+  bool _multiNicEnabled = false; // 多网卡聚合下载：同一任务的分段连接绑定到不同网卡（仅本机，不参与云同步）
   int _connPolicyCount = 0; // 已学习的域名连接上限记录数（未过期）
   int _maxConcurrentTasks = 5;
   int _speedLimitBytes = 0; // 0 = 无限制
@@ -270,6 +271,7 @@ class SettingsProvider extends ChangeNotifier {
   int get autoMaxConnections => _autoMaxConnections;
   bool get cdnMultiEnabled => _cdnMultiEnabled;
   int get cdnMaxNodes => _cdnMaxNodes;
+  bool get multiNicEnabled => _multiNicEnabled;
 
   /// 引擎已学习的域名连接上限记录数（未过期条目；随 ConfigLoaded 刷新）。
   int get connPolicyCount => _connPolicyCount;
@@ -517,6 +519,13 @@ class SettingsProvider extends ChangeNotifier {
     _cdnMultiEnabled = value;
     notifyListeners();
     _saveToRust('cdn_multi_enabled', value ? '1' : '0');
+  }
+
+  void setMultiNicEnabled(bool value) {
+    if (_multiNicEnabled == value) return;
+    _multiNicEnabled = value;
+    notifyListeners();
+    _saveToRust('multi_nic_enabled', value ? '1' : '0');
   }
 
   void setCdnMaxNodes(int value) {
@@ -1654,7 +1663,7 @@ class SettingsProvider extends ChangeNotifier {
   }
 
   /// 设置开机自启动，返回是否成功。
-  /// 操作后通过 [launchAtStartup.isEnabled] 验证注册表实际状态，
+  /// 操作后通过 [AutostartService.isEnabled] 验证系统实际状态，
   /// 若与预期不符则回滚 UI 状态。
   Future<bool> setAutoStartup(bool value) async {
     if (_autoStartup == value) return true;
@@ -1665,13 +1674,13 @@ class SettingsProvider extends ChangeNotifier {
 
     try {
       if (value) {
-        await launchAtStartup.enable();
+        await AutostartService.instance.enable();
       } else {
-        await launchAtStartup.disable();
+        await AutostartService.instance.disable();
       }
 
       // 验证实际状态
-      final actual = await launchAtStartup.isEnabled();
+      final actual = await AutostartService.instance.isEnabled();
       if (actual == value) {
         _saveToRust('auto_startup', value.toString());
         return true;
@@ -1882,6 +1891,8 @@ class SettingsProvider extends ChangeNotifier {
           _cdnMultiEnabled = entry.value == '1' || entry.value == 'true';
         case 'cdn_max_nodes':
           _cdnMaxNodes = (int.tryParse(entry.value) ?? 0).clamp(0, 8);
+        case 'multi_nic_enabled':
+          _multiNicEnabled = entry.value == '1' || entry.value == 'true';
         case 'domain_conn_caps':
           _connPolicyCount = _parseConnPolicyCount(entry.value);
         case 'max_concurrent_tasks':
@@ -2212,11 +2223,11 @@ class SettingsProvider extends ChangeNotifier {
     _ => '',
   };
 
-  /// 启动时同步开机启动状态（从系统注册表读取实际状态）。
-  /// 移动端无开机启动概念，launch_at_startup 插件也未注册，直接跳过。
+  /// 启动时同步开机启动状态（从系统自启条目读取实际状态，含系统级禁用）。
+  /// 移动端无开机启动概念，直接跳过。
   Future<void> _syncAutoStartupState() async {
     if (Platform.isAndroid || Platform.isIOS) return;
-    final actual = await launchAtStartup.isEnabled();
+    final actual = await AutostartService.instance.isEnabled();
     if (_autoStartup != actual) {
       _autoStartup = actual;
       notifyListeners();

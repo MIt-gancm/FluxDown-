@@ -2,6 +2,9 @@ import { useState, useEffect } from "react";
 import { useLocale } from "@/lib/i18n";
 import { GITHUB_REPO_URL } from "@/lib/utils";
 
+/** 服务健康状态页（Uptime 监控，FluxDown 官网 / API / 云服务）。 */
+const STATUS_PAGE_URL = "https://monitor.zerx.dev/status/zerxlab";
+
 export default function Footer() {
   const { t, locale } = useLocale();
   // SSR 安全：初始值固定，useEffect 中更新为实际年份，避免 hydration mismatch
@@ -110,11 +113,19 @@ export default function Footer() {
                 { href: "/feedback/", label: t("footer.feedback") },
                 { href: "/feedback/", label: t("footer.contact") },
                 { href: "/sponsor/", label: t("footer.sponsor") },
-              ].map(({ href, label }, i) => (
+                {
+                  href: STATUS_PAGE_URL,
+                  label: t("footer.status"),
+                  external: true,
+                },
+              ].map(({ href, label, external }, i) => (
                 <li key={`${href}-${i}`}>
                   <a
                     href={href}
                     className="text-[13px] text-dark-text-secondary hover:text-brand-sky transition-colors duration-200"
+                    {...(external
+                      ? { target: "_blank", rel: "noopener noreferrer" }
+                      : {})}
                   >
                     {label}
                   </a>

@@ -1,5 +1,8 @@
 //! 全局 User-Agent：预设下拉 + 自定义输入，与 `lib/src/models/ua_presets.dart` 同基线。
 
+use std::rc::Rc;
+
+use fluxdown_ui_components::ControlExt as _;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, AppContext as _, Entity, IntoElement as _, ParentElement, SharedString, Styled,
@@ -7,11 +10,11 @@ use gpui::{
 };
 use gpui_component::{
     input::{Input, InputEvent, InputState},
-    setting::SettingField,
     v_flex,
 };
 
 use super::SectionContext;
+use crate::ui::{Control, INPUT_WIDE_WIDTH, dropdown_button};
 
 pub(crate) const UA_KEY: &str = "global_user_agent";
 
@@ -53,7 +56,7 @@ struct CustomSlot {
     _subscription: Subscription,
 }
 
-pub(crate) fn field(ctx: &SectionContext) -> SettingField<SharedString> {
+pub(crate) fn field(ctx: &SectionContext) -> Control {
     let store = ctx.store();
     let options: Vec<(SharedString, SharedString)> = vec![
         (
@@ -70,7 +73,7 @@ pub(crate) fn field(ctx: &SectionContext) -> SettingField<SharedString> {
         (SharedString::from("custom"), ctx.t("userAgentPresetCustom")),
     ];
     let placeholder = ctx.t("userAgentPlaceholder");
-    SettingField::render(move |render_options, window: &mut Window, cx: &mut App| {
+    Control::custom(move |disabled, key, window: &mut Window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let current = store.read(cx).daemon_str(UA_KEY);
         let preset = detect_preset(&current);
@@ -81,55 +84,45 @@ pub(crate) fn field(ctx: &SectionContext) -> SettingField<SharedString> {
             .unwrap_or(false)
             || preset == "custom";
 
-        // 预设用一组互斥按钮表达；选择自定义时展开输入框。
-        let buttons = gpui_component::h_flex()
-            .gap(tokens.spacing.xs)
-            .flex_wrap()
-            .children(options.iter().map(|(value, label)| {
-                let selected = if custom_active {
-                    value.as_ref() == "custom"
-                } else {
-                    value.as_ref() == preset
-                };
-                let value_for_click = value.clone();
-                let click_store = store.clone();
-                fluxdown_ui_components::button(
-                    SharedString::from(format!("ua-preset-{value}")),
-                    label.clone(),
-                    if selected {
-                        fluxdown_ui_components::ButtonVariant::Primary
-                    } else {
-                        fluxdown_ui_components::ButtonVariant::Secondary
-                    },
-                    cx,
-                )
-                .disabled(render_options.is_disabled())
-                .on_click(move |_, _, cx| {
-                    click_store.update(cx, |store, cx| match value_for_click.as_ref() {
-                        "default" => {
-                            store.set_transient("ua_custom_mode", serde_json::json!(false), cx);
-                            store.set_daemon(UA_KEY, "", cx);
+        let selected_key: SharedString = if custom_active {
+            SharedString::from("custom")
+        } else {
+            SharedString::from(preset)
+        };
+        let select_store = store.clone();
+        let dropdown = dropdown_button(
+            format!("{key}-preset-dropdown"),
+            &options,
+            selected_key,
+            disabled,
+            false,
+            Rc::new(move |value: SharedString, cx: &mut App| {
+                select_store.update(cx, |store, cx| match value.as_ref() {
+                    "default" => {
+                        store.set_transient("ua_custom_mode", serde_json::json!(false), cx);
+                        store.set_daemon(UA_KEY, "", cx);
+                    }
+                    "custom" => {
+                        store.set_transient("ua_custom_mode", serde_json::json!(true), cx);
+                    }
+                    preset_key => {
+                        store.set_transient("ua_custom_mode", serde_json::json!(false), cx);
+                        if let Some((_, ua)) = UA_PRESETS.iter().find(|(k, _)| *k == preset_key) {
+                            store.set_daemon(UA_KEY, *ua, cx);
                         }
-                        "custom" => {
-                            store.set_transient("ua_custom_mode", serde_json::json!(true), cx);
-                        }
-                        key => {
-                            store.set_transient("ua_custom_mode", serde_json::json!(false), cx);
-                            if let Some((_, ua)) = UA_PRESETS.iter().find(|(k, _)| *k == key) {
-                                store.set_daemon(UA_KEY, *ua, cx);
-                            }
-                        }
-                    });
-                })
-            }));
+                    }
+                });
+            }),
+            cx,
+        );
 
         let mut column = v_flex()
             .w_full()
             .gap(tokens.spacing.sm)
             .items_end()
-            .child(buttons);
+            .child(dropdown);
         if custom_active {
-            let slot = window.use_keyed_state(SharedString::from("settings-ua-custom"), cx, {
+            let slot = window.use_keyed_state(SharedString::from(format!("{key}-custom")), cx, {
                 let store = store.clone();
                 let current = SharedString::from(current.clone());
                 let placeholder = placeholder.clone();
@@ -171,8 +164,9 @@ pub(crate) fn field(ctx: &SectionContext) -> SettingField<SharedString> {
             let input = slot.read(cx).input.clone();
             column = column.child(
                 Input::new(&input)
-                    .w(px(420.))
-                    .disabled(render_options.is_disabled()),
+                    .control(cx)
+                    .w(px(INPUT_WIDE_WIDTH))
+                    .disabled(disabled),
             );
         }
         column.into_any_element()

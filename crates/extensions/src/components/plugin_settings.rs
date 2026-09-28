@@ -5,24 +5,29 @@
 use std::{collections::HashMap, sync::Arc};
 
 use fluxdown_protocol::{PluginDto, RpcErrorData, SettingFieldDto};
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, field_error, form, form_field, input_with_action, option_group,
+    option_row,
+};
 use fluxdown_ui_i18n::Translator;
+use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, AppContext as _, ClipboardItem, Context, Entity, InteractiveElement as _, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    Anchor, AnyElement, AppContext as _, ClipboardItem, Context, Entity, IntoElement,
+    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, IconName, Sizable as _, StyledExt as _, WindowExt as _,
+    Disableable as _, WindowExt as _,
     button::Button,
     h_flex,
     input::{Input, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     notification::Notification,
+    scroll::ScrollableElement as _,
     switch::Switch,
     v_flex,
 };
 
-use crate::{ExtensionsPort, controller::update_plugin_settings, error_text};
+use crate::{ExtensionsPort, controller::update_plugin_settings, error_text, ui};
 
 /// 前置校验失败原因；文案映射留给 UI 层。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,15 +262,18 @@ impl PluginSettingsForm {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let disabled = self.saving;
+        let control_height = active_theme(cx).density().control;
         match &self.controls[index] {
             FieldControl::Text(input) => Input::new(input)
+                .control(cx)
                 .w_full()
                 .disabled(disabled)
                 .when(field.widget == "password", Input::mask_toggle)
                 .into_any_element(),
             FieldControl::Textarea(input) => Textarea::new(input)
                 .w_full()
-                .h(px(96.))
+                .h(control_height * 3.)
+                .text_size(active_theme(cx).tokens().typography.sm.size)
                 .disabled(disabled)
                 .into_any_element(),
             FieldControl::Toggle(checked) => Switch::new(("plugin-setting-toggle", index))
@@ -301,10 +309,11 @@ impl PluginSettingsForm {
                 let current = value.clone();
                 let form = cx.entity();
                 Button::new(("plugin-setting-select", index))
-                    .label(label)
                     .outline()
-                    .small()
+                    .label(label)
                     .dropdown_caret(true)
+                    .control(cx)
+                    .w_full()
                     .disabled(disabled)
                     .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                         options
@@ -326,44 +335,34 @@ impl PluginSettingsForm {
                                         }),
                                 )
                             })
+                            .scrollable(true)
+                            .max_h(control_height * 8.)
                     })
                     .into_any_element()
             }
             FieldControl::Folder(path) => {
                 let translator = self.translator.read(cx);
                 let placeholder = translator.text("pluginFolderPickPlaceholder").to_owned();
-                let muted = cx.theme().muted_foreground;
-                let foreground = cx.theme().foreground;
+                let browse = translator.text("browse").to_owned();
                 let display = if path.is_empty() {
-                    placeholder.clone()
+                    placeholder
                 } else {
                     path.clone()
                 };
-                h_flex()
-                    .w_full()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_sm()
-                            .text_color(if path.is_empty() { muted } else { foreground })
-                            .child(display),
-                    )
-                    .child(
-                        Button::new(("plugin-setting-folder", index))
-                            .outline()
-                            .small()
-                            .icon(IconName::FolderOpen)
-                            .label(placeholder)
-                            .disabled(disabled)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.pick_folder(index, window, cx);
-                            })),
-                    )
-                    .into_any_element()
+                input_with_action(
+                    ui::path_box(display, path.is_empty(), active_theme(cx)),
+                    Button::new(("plugin-setting-folder", index))
+                        .outline()
+                        .icon(FluxIcon::FolderOpen)
+                        .label(browse)
+                        .control(cx)
+                        .disabled(disabled)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.pick_folder(index, window, cx);
+                        })),
+                    cx,
+                )
+                .into_any_element()
             }
         }
     }
@@ -409,80 +408,100 @@ impl PluginSettingsForm {
 
 impl Render for PluginSettingsForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+        let tokens = active_theme(cx).tokens().clone();
         let copy_label = self
             .translator
             .read(cx)
             .text("pluginCopyHelperScript")
             .to_owned();
-        let rows = (0..self.fields.len())
-            .map(|index| {
-                let field = &self.fields[index];
-                let title = if field.title.is_empty() {
-                    field.key.clone()
-                } else {
-                    field.title.clone()
-                };
-                let error = self.error_text(&field.key, cx);
-                let helper = field
-                    .helper_script
-                    .clone()
-                    .filter(|script| !script.is_empty())
-                    .map(|script| {
-                        let label = field
-                            .helper_label
-                            .clone()
-                            .filter(|label| !label.is_empty())
-                            .unwrap_or_else(|| copy_label.clone());
+        // 连续的开关字段合并进同一个 option_group；其余字段逐个 form_field。
+        let mut body = form(cx).when_some(self.server_error.clone(), |this, error| {
+            this.child(
+                field_error(error, cx)
+                    .w_full()
+                    .px(tokens.spacing.md)
+                    .py(tokens.spacing.sm)
+                    .rounded(tokens.radius.md)
+                    .bg(tokens.colors.destructive.opacity(0.1)),
+            )
+        });
+        let mut toggles: Vec<AnyElement> = Vec::new();
+        for index in 0..self.fields.len() {
+            let field = &self.fields[index];
+            let title = SharedString::from(if field.title.is_empty() {
+                field.key.clone()
+            } else {
+                field.title.clone()
+            });
+            let description = (!field.description.is_empty())
+                .then(|| SharedString::from(field.description.clone()));
+            let error = self.error_text(&field.key, cx);
+            let helper = field
+                .helper_script
+                .clone()
+                .filter(|script| !script.is_empty())
+                .map(|script| {
+                    let label = field
+                        .helper_label
+                        .clone()
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or_else(|| copy_label.clone());
+                    h_flex().child(
                         Button::new(("plugin-setting-helper", index))
                             .outline()
-                            .small()
-                            .icon(gpui_component::IconName::Copy)
+                            .icon(FluxIcon::Copy)
                             .label(label)
+                            .control(cx)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.copy_helper_script(script.clone(), window, cx);
-                            }))
-                    });
+                            })),
+                    )
+                });
+            let control = self.render_control(index, field, cx);
+            if matches!(self.controls[index], FieldControl::Toggle(_)) {
+                toggles.push(option_row(title, description, control, cx).into_any_element());
+                if helper.is_none() && error.is_none() {
+                    continue;
+                }
+                body = body.child(
+                    v_flex()
+                        .w_full()
+                        .gap(tokens.spacing.xs + tokens.spacing.xxs)
+                        .child(option_group(std::mem::take(&mut toggles), cx))
+                        .children(helper)
+                        .when_some(error, |this, error| this.child(field_error(error, cx))),
+                );
+                continue;
+            }
+            if !toggles.is_empty() {
+                body = body.child(option_group(std::mem::take(&mut toggles), cx));
+            }
+            body = body.child(
                 v_flex()
                     .w_full()
-                    .gap_1p5()
-                    .child(div().text_sm().font_semibold().child(title))
-                    .when(!field.description.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(field.description.clone()),
-                        )
-                    })
-                    .child(self.render_control(index, field, cx))
-                    .children(helper)
-                    .when_some(error, |this, error| {
-                        this.child(div().text_xs().text_color(theme.danger).child(error))
-                    })
-            })
-            .collect::<Vec<_>>();
-        v_flex()
-            .id("plugin-settings-form")
+                    .gap(tokens.spacing.xs + tokens.spacing.xxs)
+                    .child(form_field(
+                        title,
+                        v_flex()
+                            .w_full()
+                            .gap(tokens.spacing.xs + tokens.spacing.xxs)
+                            .child(control)
+                            .children(helper),
+                        description,
+                        cx,
+                    ))
+                    .when_some(error, |this, error| this.child(field_error(error, cx))),
+            );
+        }
+        if !toggles.is_empty() {
+            body = body.child(option_group(toggles, cx));
+        }
+        // 内容区随内容伸缩，超出上限时纵向滚动；内边距给输入框聚焦环留出空间。
+        div()
             .w_full()
-            .max_h(px(420.))
-            .overflow_y_scroll()
-            .gap_4()
-            .px_1()
-            .py_1()
-            .when_some(self.server_error.clone(), |this, error| {
-                this.child(
-                    div()
-                        .w_full()
-                        .p_2()
-                        .rounded(theme.radius)
-                        .bg(theme.danger.opacity(0.12))
-                        .text_xs()
-                        .text_color(theme.danger)
-                        .child(error),
-                )
-            })
-            .children(rows)
+            .max_h(px(460.))
+            .overflow_y_scrollbar()
+            .child(div().p(tokens.spacing.xxs).child(body))
     }
 }
 

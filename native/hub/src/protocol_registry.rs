@@ -101,8 +101,7 @@ mod inner {
     /// The exe-path check is what prevents a stale registration from being kept
     /// after the app is moved, upgraded, or run as a different portable build:
     /// without it, the presence of the (now-wrong) key would make startup skip
-    /// re-registration and leave the scheme pointing at a dead/old exe. This
-    /// mirrors `nmh_registry::needs_update`'s exe-drift detection. If the exe
+    /// re-registration and leave the scheme pointing at a dead/old exe. If the exe
     /// path cannot be determined, the value check alone decides the result so we
     /// do not spuriously force re-registration on a transient I/O error.
     ///

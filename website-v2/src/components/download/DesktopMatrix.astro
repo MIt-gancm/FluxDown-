@@ -1,0 +1,110 @@
+---
+/** 桌面端平台矩阵:Windows / macOS / Linux 三列,列出每个架构与包格式;下方 Scoop 安装。 */
+import { AlertTriangle } from "lucide-react";
+import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
+import CodeBlock from "./CodeBlock.astro";
+import { BrandIcon } from "@/components/icons/brand";
+import { download } from "@/i18n/messages/download";
+import { href } from "@/i18n/routing";
+import type { Lang } from "@/i18n/config";
+import { GITHUB_URL } from "@/lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = download[lang];
+const fallback = `${GITHUB_URL}/releases/latest`;
+const title = t.desktop.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+
+const windows: RowSpec[] = [
+  { path: "assets.setup", label: t.kind.installer, detail: "x64", ext: ".exe" },
+  { path: "assets.portable", label: t.kind.portable, detail: "x64", ext: ".zip" },
+  { path: "assets.setup_arm64", label: t.kind.installer, detail: "ARM64", ext: ".exe" },
+  { path: "assets.portable_arm64", label: t.kind.portable, detail: "ARM64", ext: ".zip" },
+];
+const macos: RowSpec[] = [
+  { path: "assets.macos_dmg_arm64", label: t.kind.dmg, detail: t.arch.appleSilicon, ext: ".dmg" },
+  { path: "assets.macos_tarball_arm64", label: t.kind.archive, detail: t.arch.appleSilicon, ext: ".tar.gz" },
+  { path: "assets.macos_dmg_x64", label: t.kind.dmg, detail: t.arch.intel, ext: ".dmg" },
+  { path: "assets.macos_tarball_x64", label: t.kind.archive, detail: t.arch.intel, ext: ".tar.gz" },
+];
+const linux: RowSpec[] = [
+  { path: "assets.linux_appimage", label: t.kind.appimage, detail: "x64", ext: ".AppImage" },
+  { path: "assets.linux_deb", label: t.kind.deb, detail: "x64", ext: ".deb" },
+  { path: "assets.linux_arch", label: t.kind.arch, detail: "x64", ext: ".pkg.tar.zst" },
+  { path: "assets.linux_tarball", label: t.kind.portable, detail: "x64", ext: ".tar.gz" },
+];
+const notify = "#subscribe";
+const SCOOP_CMD = "scoop bucket add extras\nscoop install extras/fluxdown";
+---
+
+<section class="frame" id="desktop" aria-labelledby="desktop-title">
+  <div class="section-tight flex flex-col gap-4">
+    <span class="eyebrow">{t.desktop.eyebrow}</span>
+    <h2 id="desktop-title" class="h2 max-w-[18ch]" data-reveal set:html={title} />
+    <p class="lede max-w-[60ch]" data-reveal style="--d:1">{t.desktop.lede}</p>
+  </div>
+  <div class="cells matrix border-t border-line">
+    <AssetGroup lang={lang} id="windows" os="windows" title={t.os.windows} desc={t.desktop.windowsReq} versionPath="version" fallback={fallback} rows={windows}>
+      <Fragment slot="icon"><BrandIcon name="windows" size={15} /></Fragment>
+    </AssetGroup>
+    <AssetGroup lang={lang} id="macos" os="macos" title={t.os.macos} versionPath="version" fallback={fallback} rows={macos} notifyHref={notify}>
+      <Fragment slot="icon"><BrandIcon name="apple" size={16} /></Fragment>
+      <a href={href("/macos-gatekeeper", lang)} class="note">
+        <AlertTriangle size={14} strokeWidth={1.75} className="text-warn" aria-hidden="true" />
+        <span>{t.desktop.macHelp} <span class="link">{t.desktop.macHelpLink}</span></span>
+      </a>
+    </AssetGroup>
+    <AssetGroup lang={lang} id="linux" os="linux" title={t.os.linux} versionPath="version" fallback={fallback} rows={linux} notifyHref={notify}>
+      <Fragment slot="icon"><BrandIcon name="linux" size={16} /></Fragment>
+    </AssetGroup>
+  </div>
+  <div class="scoop border-t border-line">
+    <div class="flex flex-col gap-2">
+      <h3 class="text-[17px] font-[560] tracking-[-0.015em]">{t.desktop.scoopTitle}</h3>
+      <p class="max-w-[46ch] text-[13.5px] leading-relaxed text-muted">{t.desktop.scoopDesc}</p>
+    </div>
+    <CodeBlock lang={lang} id="scoop-cmd" caption="powershell" code={SCOOP_CMD} />
+  </div>
+  <div class="rule"></div>
+</section>
+
+<style>
+  .matrix {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 900px) {
+    .matrix {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+  .note {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: auto;
+    padding: 10px 12px;
+    border-radius: 8px;
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--fg-muted);
+    background: color-mix(in oklch, var(--warn) 8%, transparent);
+    box-shadow: 0 0 0 1px color-mix(in oklch, var(--warn) 30%, transparent) inset;
+  }
+  .note :global(svg) {
+    flex: none;
+    margin-top: 2px;
+  }
+  .scoop {
+    display: grid;
+    gap: 20px;
+    padding: clamp(20px, 2.6vw, 32px) clamp(20px, 4vw, 56px);
+    align-items: center;
+  }
+  @media (min-width: 900px) {
+    .scoop {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    }
+  }
+</style>

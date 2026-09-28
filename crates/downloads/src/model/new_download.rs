@@ -25,6 +25,34 @@ impl UrlEntry {
     }
 }
 
+/// 外部捕获 → 条目：捕获文件名与链接路径末段逐字相同时省略 `out=`。
+///
+/// 这种 `out=` 与自动识别结果一致，却会在链接框里多出一行缩进的选项行，看起来像链接
+/// 被错误折行；只有真正改名（如 Content-Disposition 给出的名字）才保留。
+pub(crate) fn capture_entry(url: &str, file_name: &str) -> UrlEntry {
+    let file_name = file_name.trim();
+    let redundant = url_file_segment(url).is_some_and(|segment| segment == file_name);
+    UrlEntry {
+        url: url.to_owned(),
+        file_name: if redundant {
+            String::new()
+        } else {
+            file_name.to_owned()
+        },
+        checksum: String::new(),
+    }
+}
+
+/// `scheme://host/a/b.zip?x#y` → `b.zip`；无路径或以 `/` 结尾时为 `None`。
+fn url_file_segment(url: &str) -> Option<&str> {
+    let rest = &url[url.find("://")? + 3..];
+    let rest = &rest[..rest.find(['?', '#']).unwrap_or(rest.len())];
+    let path = &rest[rest.find('/')?..];
+    path.rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+}
+
 /// 解析多行文本为下载条目。
 ///
 /// - 原始行以空格 / Tab 开头 = 选项行，附着到上一条（`out=` / `checksum=`）；
@@ -132,6 +160,29 @@ pub(crate) fn merge_imported(existing_text: &str, imported: Vec<UrlEntry>) -> St
         .map(entry_to_text)
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// 把条目追加到现有文本末尾：原文逐字保留（含注释 / 尚未输完的行），已存在的 URL
+/// 跳过。用于外部捕获陆续进入正在编辑的表单。
+pub(crate) fn append_entries(
+    existing_text: &str,
+    entries: impl IntoIterator<Item = UrlEntry>,
+) -> String {
+    let mut seen = parse_entries(existing_text, false)
+        .into_iter()
+        .map(|entry| entry.url)
+        .collect::<HashSet<_>>();
+    let mut text = existing_text.trim_end().to_owned();
+    for entry in entries {
+        if !seen.insert(entry.url.clone()) {
+            continue;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&entry_to_text(&entry));
+    }
+    text
 }
 
 /// 强制直连哨兵值。
@@ -395,9 +446,65 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use super::{
-        DraftOptions, ProxyChoice, ThreadChoice, UrlEntry, build_requests, checksum_spec,
-        custom_segments, detect_ua_preset, manual_proxy_url, merge_imported, parse_entries,
+        DraftOptions, ProxyChoice, ThreadChoice, UrlEntry, append_entries, build_requests,
+        capture_entry, checksum_spec, custom_segments, detect_ua_preset, manual_proxy_url,
+        merge_imported, parse_entries,
     };
+
+    #[test]
+    fn append_entries_keeps_existing_text_verbatim_and_skips_known_urls() {
+        let existing = "# mine\nhttps://a.example/one.zip\nhttps://half-typ\n";
+        let text = append_entries(
+            existing,
+            [
+                UrlEntry {
+                    url: "https://a.example/one.zip".to_owned(),
+                    file_name: "dup.zip".to_owned(),
+                    ..UrlEntry::default()
+                },
+                UrlEntry {
+                    url: "https://b.example/two.bin".to_owned(),
+                    file_name: "two.bin".to_owned(),
+                    ..UrlEntry::default()
+                },
+            ],
+        );
+        assert_eq!(
+            text,
+            "# mine\nhttps://a.example/one.zip\nhttps://half-typ\nhttps://b.example/two.bin\n  out=two.bin"
+        );
+        assert_eq!(parse_entries(&text, false)[2].file_name, "two.bin");
+        assert_eq!(
+            append_entries(
+                "",
+                [UrlEntry {
+                    url: "https://c.example/x".to_owned(),
+                    ..UrlEntry::default()
+                }]
+            ),
+            "https://c.example/x"
+        );
+    }
+
+    #[test]
+    fn capture_entry_drops_only_file_names_matching_the_url_segment() {
+        let name = |url, file| capture_entry(url, file).file_name;
+        assert_eq!(
+            name(
+                "https://release.files.ghostty.org/1.3.1/Ghostty.dmg",
+                "Ghostty.dmg"
+            ),
+            ""
+        );
+        assert_eq!(name("https://a.example/dl/x.zip?sig=1#top", "x.zip"), "");
+        assert_eq!(
+            name("https://a.example/dl/x.zip", "renamed.zip"),
+            "renamed.zip"
+        );
+        assert_eq!(name("https://a.example/a%20b.zip", "a b.zip"), "a b.zip");
+        assert_eq!(name("https://a.example/", "index.html"), "index.html");
+        assert_eq!(name("https://a.example?f=x.zip", "x.zip"), "x.zip");
+    }
 
     #[test]
     fn strict_parse_requires_url_at_line_start_and_attaches_options() {

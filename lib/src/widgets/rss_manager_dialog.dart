@@ -6,6 +6,7 @@ import '../i18n/locale_provider.dart';
 import '../models/download_controller.dart';
 import '../models/download_queue.dart';
 import '../models/download_task.dart';
+import '../models/plugin_provider.dart';
 import '../models/rss_filter.dart';
 import '../models/rss_provider.dart';
 import '../theme/app_colors.dart';
@@ -22,6 +23,7 @@ Future<void> showRssManagerDialog(
   BuildContext context,
   RssProvider rss,
   DownloadController controller,
+  PluginProvider pluginProvider,
   String sourceId,
 ) {
   // 预览区吃的是已缓存条目；打开时补一次拉取，避免刚启动就打开对话框时
@@ -35,6 +37,7 @@ Future<void> showRssManagerDialog(
     builder: (_) => RssManagerDialog(
       rss: rss,
       controller: controller,
+      pluginProvider: pluginProvider,
       sourceId: sourceId,
     ),
   );
@@ -43,12 +46,14 @@ Future<void> showRssManagerDialog(
 class RssManagerDialog extends StatefulWidget {
   final RssProvider rss;
   final DownloadController controller;
+  final PluginProvider pluginProvider;
   final String sourceId;
 
   const RssManagerDialog({
     super.key,
     required this.rss,
     required this.controller,
+    required this.pluginProvider,
     required this.sourceId,
   });
 
@@ -80,6 +85,8 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
   bool _smartEpisode = false;
   bool _sendReferer = true;
   bool _notifyOnDownload = true;
+  String _providerId = 'rss';
+  String _providerConfig = '';
 
   @override
   void initState() {
@@ -87,6 +94,8 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
     final source = _source;
     if (source == null) return;
     _nameCtrl.text = source.name;
+    _providerId = source.providerId.isEmpty ? 'rss' : source.providerId;
+    _providerConfig = source.providerConfig;
     _urlCtrl.text = source.url;
     _saveDirCtrl.text = source.saveDir;
     _includeCtrl.text = source.includePattern;
@@ -151,6 +160,8 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
     widget.rss.update(
       RssSourceEntry(
         sourceId: source.sourceId,
+        providerId: _providerId,
+        providerConfig: _providerConfig,
         url: url,
         name: _nameCtrl.text.trim(),
         enabled: _enabled,
@@ -197,10 +208,29 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
         if (source == null) return const SizedBox.shrink();
         return ShadDialog(
           title: Text(s.rssManageTitle),
-          description: Text(
-            rssDisplayName(source),
-            overflow: TextOverflow.ellipsis,
-            maxLines: 1,
+          description: Row(
+            children: [
+              Expanded(
+                child: Text(
+                  rssDisplayName(source),
+                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                decoration: BoxDecoration(
+                  color: c.surface2,
+                  borderRadius: m.brXs,
+                  border: Border.all(color: c.border),
+                ),
+                child: Text(
+                  source.providerId == 'rss' ? 'RSS' : source.providerId,
+                  style: TextStyle(fontSize: 10, color: c.textMuted),
+                ),
+              ),
+            ],
           ),
           actions: [
             ShadButton.outline(
@@ -325,10 +355,43 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
   // ─────────────────────────────────────────────
 
   Widget _buildBasicTab(S s, AppColors c) {
+    final providerOptions = <String, String>{'rss': 'RSS'};
+    for (final plugin in widget.pluginProvider.plugins) {
+      if (!plugin.enabled || plugin.loadStatus == 'Failed') continue;
+      for (final id in plugin.subscriptionProviderIds) {
+        providerOptions.putIfAbsent(id, () => '${plugin.name} · $id');
+      }
+    }
+    providerOptions.putIfAbsent(_providerId, () => _providerId);
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
+        _fieldLabel(s.rssProviderLabel, c),
+        const SizedBox(height: 6),
+        ShadSelect<String>(
+          initialValue: _providerId,
+          options: [
+            for (final entry in providerOptions.entries)
+              ShadOption(value: entry.key, child: Text(entry.value)),
+          ],
+          selectedOptionBuilder: (ctx, value) => Text(providerOptions[value] ?? value),
+          onChanged: (value) {
+            if (value == null) return;
+            setState(() {
+              _providerId = value;
+              if (value == 'rss') _providerConfig = '';
+            });
+          },
+        ),
+        if (_providerId != 'rss') ...[
+          const SizedBox(height: 5),
+          Text(
+            s.rssProviderPluginHint,
+            style: TextStyle(fontSize: 11, color: c.textMuted, height: 1.4),
+          ),
+        ],
+        const SizedBox(height: 12),
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [

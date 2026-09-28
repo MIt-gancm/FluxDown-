@@ -71,6 +71,7 @@ export function DownloadSettings({
   const proxyMode = config.proxy_mode ?? 'none'
   const fileExistsBehavior = config.file_exists_behavior ?? 'rename'
   const fileMissingAction = config.file_missing_action ?? 'keep'
+  const idleFileScan = (config.idle_file_scan ?? '1') !== '0'
   const maxConcurrent = Number(config.max_concurrent_tasks ?? '5')
   const defaultSegments = Number(config.default_segments ?? '0')
   const autoMaxConnections = Number(config.auto_max_connections ?? '16')
@@ -163,13 +164,24 @@ export function DownloadSettings({
         </SetRow>
         <SetRow title={t('set.download.fileExists')} desc={t('set.download.fileExistsDesc')}>
           <SetSelect
-            value={fileExistsBehavior === 'overwrite' ? 'overwrite' : 'rename'}
+            value={
+              fileExistsBehavior === 'overwrite' || fileExistsBehavior === 'skip'
+                ? fileExistsBehavior
+                : 'rename'
+            }
             onValueChange={(v) => mutate({ file_exists_behavior: v })}
             options={[
               { value: 'rename', label: t('set.download.fileExistsRename') },
               { value: 'overwrite', label: t('set.download.fileExistsOverwrite') },
+              { value: 'skip', label: t('set.download.fileExistsSkip') },
             ]}
             width={160}
+          />
+        </SetRow>
+        <SetRow title={t('set.download.idleFileScan')} desc={t('set.download.idleFileScanDesc')}>
+          <SetSwitch
+            checked={idleFileScan}
+            onCheckedChange={(v) => mutate({ idle_file_scan: v ? '1' : '0' })}
           />
         </SetRow>
         <SetRow
@@ -314,7 +326,7 @@ export function DownloadSettings({
         </SetRow>
       </SetSection>
 
-      <SiteAuthCredentials config={config} mutate={mutate} />
+      <SiteAuthCredentials />
     </>
   )
 }

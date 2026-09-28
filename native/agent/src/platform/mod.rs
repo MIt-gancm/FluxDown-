@@ -1,10 +1,16 @@
 //! agent 桌面系统集成：任务文件打开/定位、官方桌面进程唤起、开机自启、
 //! `.torrent` 关联与 URL scheme 注册。
 //!
-//! 所有注册的目标都是官方桌面程序而非 agent 自身：Windows 指向同级
-//! `fluxdown-desktop.exe`，macOS 指向 agent 所在的 `.app` bundle，Linux 指向
-//! 打包的 `com.fluxdown.app.desktop`。全部函数同步阻塞，RPC 侧需放入
-//! `spawn_blocking`。
+//! 关联与 URL scheme 的注册目标是官方桌面程序：Windows 指向同级
+//! `fluxdown-desktop.exe`，macOS 指向外层 `FluxDown.app` bundle（见
+//! [`host_bundle_id`]），Linux 指向打包的 `com.fluxdown.app.desktop`。开机自启的目标是
+//! agent 自身（`--autostart`），由 agent 按托盘偏好决定是否再拉起桌面程序。全部函数
+//! 同步阻塞，RPC 侧需放入 `spawn_blocking`。
+//!
+//! macOS 打包布局：agent 与 `fluxdownd` 位于辅助 bundle
+//! `FluxDown.app/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/`（其 Info.plist 声明
+//! `LSUIElement`，常驻时不占 Dock），桌面程序位于外层 `FluxDown.app/Contents/MacOS/`。
+//! 不在该布局内（开发期 `target/release` 平铺）时按同级目录解析。
 
 mod autostart;
 mod file_association;
@@ -14,11 +20,14 @@ mod protocol_registry;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use fluxdown_protocol::PlatformIntegrationDto;
 
-static DESKTOP_LAUNCHED: AtomicBool = AtomicBool::new(false);
+/// 两次「为待确认交互拉起桌面程序」之间的最小间隔：断线重连抖动也不重复拉起。
+pub const PROMPT_LAUNCH_COOLDOWN_MS: i64 = 10_000;
+
+/// 自启动条目传给 agent 的参数。
+pub const AUTOSTART_ARG: &str = "--autostart";
 
 const DESKTOP_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "fluxdown-desktop.exe"
@@ -26,21 +35,129 @@ const DESKTOP_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "fluxdown-desktop"
 };
 
-/// 与 agent 同目录的官方桌面程序；文件不存在时返回 `None`。
+/// 官方桌面程序：macOS 辅助 bundle 布局下取外层 `Contents/MacOS/`，否则取 agent 同级；
+/// 文件不存在时返回 `None`。
 #[must_use]
 pub fn desktop_executable() -> Option<PathBuf> {
-    let path = std::env::current_exe()
-        .ok()?
-        .with_file_name(DESKTOP_EXECUTABLE_NAME);
+    let agent = std::env::current_exe().ok()?;
+    #[cfg(target_os = "macos")]
+    if let Some(host_dir) = host_macos_dir(&agent) {
+        let path = host_dir.join(DESKTOP_EXECUTABLE_NAME);
+        return path.is_file().then_some(path);
+    }
+    let path = agent.with_file_name(DESKTOP_EXECUTABLE_NAME);
     path.is_file().then_some(path)
 }
 
-pub fn open_task(task: &fluxdown_protocol::TaskDto) -> Result<(), PlatformError> {
-    launch_path(&PathBuf::from(&task.save_dir).join(&task.file_name), false)
+/// 辅助 bundle 的 bundle id = 外层 bundle id + 此后缀（打包脚本
+/// `scripts/package_gpui_macos.sh` 按此写入辅助 Info.plist）。
+#[cfg(target_os = "macos")]
+const HELPER_BUNDLE_ID_SUFFIX: &str = ".agent";
+
+/// agent 位于 `<Host>.app/Contents/Helpers/<Helper>.app/Contents/MacOS/` 时返回外层
+/// `<Host>.app/Contents/MacOS`；其他位置返回 `None`。
+#[cfg(target_os = "macos")]
+fn host_macos_dir(agent_exe: &Path) -> Option<PathBuf> {
+    let macos_dir = agent_exe.parent()?;
+    if !macos_dir.ends_with("Contents/MacOS") {
+        return None;
+    }
+    let helper_app = macos_dir.parent()?.parent()?;
+    if helper_app.extension()? != "app" {
+        return None;
+    }
+    let helpers = helper_app.parent()?;
+    let contents = helpers.parent()?;
+    if helpers.file_name()? != "Helpers" || contents.file_name()? != "Contents" {
+        return None;
+    }
+    if contents.parent()?.extension()? != "app" {
+        return None;
+    }
+    Some(contents.join("MacOS"))
 }
 
+/// `.torrent` 关联与 URL scheme 的注册目标：外层 `FluxDown.app` 的 bundle id。
+///
+/// 辅助 bundle 内由 Core Foundation 解析出的是辅助 bundle 自身的 id，按约定去掉
+/// [`HELPER_BUNDLE_ID_SUFFIX`] 得到外层 id；后缀不符说明打包错误，按不支持处理，
+/// 避免把关联登记到不声明 UTI / scheme 的辅助 bundle 上。
+#[cfg(target_os = "macos")]
+pub(crate) fn host_bundle_id() -> Option<String> {
+    let own = macos_cf::main_bundle_id()?;
+    let in_helper = std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| host_macos_dir(&exe).is_some());
+    host_id_from(own, in_helper)
+}
+
+#[cfg(target_os = "macos")]
+fn host_id_from(own: String, in_helper: bool) -> Option<String> {
+    if !in_helper {
+        return Some(own);
+    }
+    own.strip_suffix(HELPER_BUNDLE_ID_SUFFIX)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+}
+
+/// 释放关联时的接手程序：候选中第一个不是 FluxDown（`mine`）的 bundle id。
+///
+/// Launch Services 没有「无默认处理程序」状态，设空 bundle id 只会让系统回落到剩余候选；
+/// FluxDown 是唯一候选时返回 `None`，此时系统层面无法让出，由关联 opt-out 在捕获入口拦截。
+#[cfg(target_os = "macos")]
+fn successor_handler(candidates: Vec<String>, mine: &str) -> Option<String> {
+    candidates
+        .into_iter()
+        .find(|id| !id.is_empty() && !id.eq_ignore_ascii_case(mine))
+}
+
+/// 引擎下载中临时文件后缀（`fluxdown_engine::downloader::TEMP_EXT`）；agent 不依赖引擎，
+/// 此处镜像同一字面量。
+const DOWNLOADING_SUFFIX: &str = ".fdownloading";
+
+/// 用系统默认程序打开任务产物；最终文件尚不存在（下载中 / 暂停 / 已被移走）时报错，
+/// 不交给系统命令静默失败。
+pub fn open_task(task: &fluxdown_protocol::TaskDto) -> Result<(), PlatformError> {
+    let path = PathBuf::from(&task.save_dir).join(&task.file_name);
+    if task.file_name.is_empty() || !path.exists() {
+        return Err(PlatformError::Failed(format!(
+            "task file not found: {}",
+            path.display()
+        )));
+    }
+    launch_path(&path, false)
+}
+
+/// 在文件管理器中定位任务；目标见 [`reveal_target`]。
 pub fn reveal_task(task: &fluxdown_protocol::TaskDto) -> Result<(), PlatformError> {
-    launch_path(&PathBuf::from(&task.save_dir).join(&task.file_name), true)
+    let (path, reveal) = reveal_target(Path::new(&task.save_dir), &task.file_name)?;
+    launch_path(&path, reveal)
+}
+
+/// 定位目标按优先级：最终产物 → 下载中临时文件 `<name>.fdownloading` → 保存目录本身
+/// （`false` = 打开目录而非选中条目）。未完成任务的最终文件不存在，直接 `open -R` /
+/// `explorer /select` 会静默失败或跳到无关目录。保存目录也不存在时报错。
+fn reveal_target(save_dir: &Path, file_name: &str) -> Result<(PathBuf, bool), PlatformError> {
+    if !file_name.is_empty() {
+        let final_path = save_dir.join(file_name);
+        if final_path.exists() {
+            return Ok((final_path, true));
+        }
+        let mut temp = final_path.into_os_string();
+        temp.push(DOWNLOADING_SUFFIX);
+        let temp = PathBuf::from(temp);
+        if temp.exists() {
+            return Ok((temp, true));
+        }
+    }
+    if save_dir.is_dir() {
+        return Ok((save_dir.to_path_buf(), false));
+    }
+    Err(PlatformError::Failed(format!(
+        "task directory not found: {}",
+        save_dir.display()
+    )))
 }
 
 /// 用系统默认程序打开 `path`；`reveal` 为 true 时改为在文件管理器中定位。
@@ -48,22 +165,47 @@ pub fn open_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
     launch_path(path, reveal)
 }
 
-/// 首个待确认捕获在无 UI 时只拉起一次同级桌面程序。
-pub fn launch_desktop_once() -> Result<(), PlatformError> {
-    if DESKTOP_LAUNCHED.swap(true, Ordering::AcqRel) {
-        return Ok(());
-    }
+/// 无 UI 客户端连接且距上次拉起不低于冷却时间，才需要为待确认交互拉起桌面程序。
+#[must_use]
+pub fn should_launch_for_prompt(ui_clients: usize, last_launch_ms: i64, now_ms: i64) -> bool {
+    ui_clients == 0 && now_ms.saturating_sub(last_launch_ms) >= PROMPT_LAUNCH_COOLDOWN_MS
+}
+
+/// 拉起同级桌面程序；桌面已在运行时新进程经单实例通道转发激活/链接后立即退出。
+pub fn launch_desktop(args: &[&str]) -> Result<(), PlatformError> {
     let executable = desktop_executable().ok_or(PlatformError::Unsupported(
         "fluxdown-desktop is not installed next to fluxdown-agent",
     ))?;
     let mut command = std::process::Command::new(executable);
     command
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    set_no_console_window(&mut command);
+    detach_from_agent(&mut command);
     command.spawn()?;
     Ok(())
+}
+
+/// Unix 下桌面进程进入独立进程组：从终端启动的 agent 收到 Ctrl-C 不连带终止界面。
+#[cfg(unix)]
+fn detach_from_agent(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn detach_from_agent(command: &mut std::process::Command) {
+    set_no_console_window(command);
+}
+
+#[must_use]
+pub fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+        })
 }
 
 /// 当前系统集成状态快照。
@@ -82,7 +224,8 @@ pub fn integration_status() -> PlatformIntegrationDto {
         .collect();
     PlatformIntegrationDto {
         autostart_supported: autostart::supported(target),
-        autostart_enabled: target.is_some_and(autostart::is_enabled),
+        autostart_enabled: target.is_some()
+            && agent_executable().is_ok_and(|agent| autostart::is_enabled(&agent)),
         file_association_supported: file_association::supported(target),
         torrent_associated: file_association::is_associated(),
         url_protocol_supported: protocol_registry::supported(target),
@@ -93,14 +236,34 @@ pub fn integration_status() -> PlatformIntegrationDto {
     }
 }
 
+/// 开机自启 agent（`--autostart`）；要求桌面程序已安装在同级目录，保证自启后能拉起界面。
 pub fn set_autostart(enabled: bool) -> Result<(), PlatformError> {
     if !enabled {
         return autostart::disable();
     }
-    let desktop = desktop_executable().ok_or(PlatformError::Unsupported(
+    desktop_executable().ok_or(PlatformError::Unsupported(
         "fluxdown-desktop is not installed next to fluxdown-agent",
     ))?;
-    autostart::enable(&desktop)
+    autostart::enable(&agent_executable()?)
+}
+
+/// 旧版自启条目直接拉起桌面程序（`fluxdown-desktop --minimized`）；启动时改写为 agent，
+/// 托盘驻留与「启动时最小化到托盘」才能在不开界面的情况下生效。只改写启动目标：
+/// 用户在系统层禁用的条目迁移后仍保持禁用。
+pub fn migrate_legacy_autostart() -> Result<(), PlatformError> {
+    let Some(desktop) = desktop_executable() else {
+        return Ok(());
+    };
+    let agent = agent_executable()?;
+    if autostart::is_registered(&agent) || !autostart::targets(&desktop) {
+        return Ok(());
+    }
+    tracing::info!("migrating legacy desktop autostart entry to fluxdown-agent");
+    autostart::retarget(&agent)
+}
+
+fn agent_executable() -> Result<PathBuf, PlatformError> {
+    Ok(std::env::current_exe()?)
 }
 
 pub fn set_file_association(enabled: bool) -> Result<(), PlatformError> {
@@ -124,9 +287,15 @@ pub fn set_url_protocol(scheme: &str, enabled: bool) -> Result<(), PlatformError
 }
 
 #[cfg(target_os = "linux")]
-fn launch_path(path: &Path, _reveal: bool) -> Result<(), PlatformError> {
+fn launch_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
+    // xdg-open 无「选中」语义：定位时打开所在目录，避免直接打开（未完成的）文件。
+    let target = if reveal {
+        path.parent().unwrap_or(path)
+    } else {
+        path
+    };
     std::process::Command::new("xdg-open")
-        .arg(path)
+        .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -374,14 +543,14 @@ fn set_no_console_window(command: &mut std::process::Command) {
     command.creation_flags(0x0800_0000);
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 fn set_no_console_window(_command: &mut std::process::Command) {}
 
-/// 注册表命令行使用的桌面程序路径：canonicalize 解析符号链接后去掉 `\\?\`
+/// 注册表命令行使用的可执行文件路径：canonicalize 解析符号链接后去掉 `\\?\`
 /// 前缀，便于与安装器写入的值比较。
 #[cfg(windows)]
-fn registry_executable(desktop: Option<&Path>) -> Result<String, PlatformError> {
-    let path = desktop.ok_or(PlatformError::Unsupported(
+fn registry_executable(executable: Option<&Path>) -> Result<String, PlatformError> {
+    let path = executable.ok_or(PlatformError::Unsupported(
         "fluxdown-desktop.exe is not installed next to fluxdown-agent",
     ))?;
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -484,6 +653,69 @@ mod tests {
         assert_eq!(desktop_executable(), sibling.is_file().then_some(sibling));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn helper_bundle_resolves_host_macos_dir() {
+        let agent = Path::new(
+            "/Applications/FluxDown.app/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+        );
+        assert_eq!(
+            host_macos_dir(agent),
+            Some(PathBuf::from("/Applications/FluxDown.app/Contents/MacOS"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn flat_or_foreign_layouts_are_not_helper_bundles() {
+        for agent in [
+            "/Applications/FluxDown.app/Contents/MacOS/fluxdown-agent",
+            "/repo/target/release/fluxdown-agent",
+            "/x/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+            "/x/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+            "/Applications/FluxDown.app/Contents/Helpers/Agent/Contents/MacOS/fluxdown-agent",
+        ] {
+            assert_eq!(host_macos_dir(Path::new(agent)), None, "{agent}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_bundle_id_strips_helper_suffix_only_inside_helper() {
+        assert_eq!(
+            host_id_from("com.fluxdown.app.agent".to_owned(), true).as_deref(),
+            Some("com.fluxdown.app")
+        );
+        assert_eq!(
+            host_id_from("com.fluxdown.app".to_owned(), false).as_deref(),
+            Some("com.fluxdown.app")
+        );
+        assert_eq!(host_id_from("com.fluxdown.app".to_owned(), true), None);
+        assert_eq!(host_id_from(".agent".to_owned(), true), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_hands_over_to_first_other_candidate_only() {
+        let mine = "com.fluxdown.app";
+        assert_eq!(
+            successor_handler(
+                vec![
+                    "COM.FLUXDOWN.APP".to_owned(),
+                    String::new(),
+                    "org.qbittorrent.qBittorrent".to_owned(),
+                    "org.transmissionbt.Transmission".to_owned(),
+                ],
+                mine,
+            )
+            .as_deref(),
+            Some("org.qbittorrent.qBittorrent")
+        );
+        // 唯一候选是自己：Launch Services 无处可让。
+        assert_eq!(successor_handler(vec![mine.to_owned()], mine), None);
+        assert_eq!(successor_handler(Vec::new(), mine), None);
+    }
+
     #[test]
     fn integration_status_reports_all_schemes() {
         let status = integration_status();
@@ -499,6 +731,50 @@ mod tests {
         assert!(matches!(
             set_url_protocol("javascript", true),
             Err(PlatformError::InvalidScheme(_))
+        ));
+    }
+
+    #[test]
+    fn prompt_launch_requires_no_ui_clients_and_cooldown_elapsed() {
+        assert!(should_launch_for_prompt(0, 0, 20_000));
+        assert!(!should_launch_for_prompt(1, 0, 20_000));
+        assert!(!should_launch_for_prompt(0, 15_000, 20_000));
+        assert!(should_launch_for_prompt(0, 0, 10_000));
+    }
+
+    #[test]
+    fn reveal_target_prefers_final_then_temp_then_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown-agent-reveal-{}-{}",
+            std::process::id(),
+            now_unix_ms()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+
+        // 暂停 / 下载中：只有临时文件。
+        let temp = dir.join("a.dmg.fdownloading");
+        std::fs::write(&temp, b"partial").expect("write temp");
+        assert_eq!(reveal_target(&dir, "a.dmg").expect("temp"), (temp, true));
+
+        // 已完成：最终文件优先。
+        let final_path = dir.join("a.dmg");
+        std::fs::write(&final_path, b"done").expect("write final");
+        assert_eq!(
+            reveal_target(&dir, "a.dmg").expect("final"),
+            (final_path, true)
+        );
+
+        // 尚未落盘（排队 / 名称未知）：打开保存目录。
+        assert_eq!(
+            reveal_target(&dir, "missing.bin").expect("dir"),
+            (dir.clone(), false)
+        );
+        assert_eq!(reveal_target(&dir, "").expect("dir"), (dir.clone(), false));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+        assert!(matches!(
+            reveal_target(&dir, "a.dmg"),
+            Err(PlatformError::Failed(_))
         ));
     }
 }

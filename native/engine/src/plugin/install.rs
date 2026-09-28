@@ -17,6 +17,19 @@ const MAX_ENTRIES: usize = 200;
 
 /// 从 zip 字节安装到 `<root>/<identity>/`，返回 identity。
 pub fn install_from_zip(root: &Path, bytes: &[u8]) -> Result<String, PluginError> {
+    let outcome = install_from_zip_with_backup(root, bytes)?;
+    if let Err(error) = commit_install(&outcome) {
+        let _ = rollback_install(&outcome);
+        return Err(error);
+    }
+    Ok(outcome.identity().to_string())
+}
+
+/// 安装插件但保留旧版本，供 manager 在源码校验后提交或回滚。
+pub(crate) fn install_from_zip_with_backup(
+    root: &Path,
+    bytes: &[u8],
+) -> Result<InstallOutcome, PluginError> {
     let tmp = root.join(format!(".tmp_install_{}", uuid::Uuid::new_v4()));
     let result = (|| {
         std::fs::create_dir_all(&tmp)
@@ -26,14 +39,7 @@ pub fn install_from_zip(root: &Path, bytes: &[u8]) -> Result<String, PluginError
         let src_root = resolve_pkg_root(&tmp)?;
         let manifest = read_manifest(&src_root)?;
         let identity = manifest.identity.clone();
-        // 拷贝到最终目录（先清旧）。
-        let dest = root.join(&identity);
-        if dest.exists() {
-            std::fs::remove_dir_all(&dest)
-                .map_err(|e| PluginError::ManifestInvalid(format!("清理旧插件失败: {e}")))?;
-        }
-        copy_dir(&src_root, &dest)?;
-        Ok(identity)
+        install_staged_dir(root, &src_root, identity)
     })();
     // 清理临时目录（无论成败）。
     let _ = std::fs::remove_dir_all(&tmp);
@@ -42,17 +48,94 @@ pub fn install_from_zip(root: &Path, bytes: &[u8]) -> Result<String, PluginError
 
 /// 从目录安装（不剥壳，`path` 须直接含 manifest.json）。
 pub fn install_from_dir(root: &Path, path: &Path) -> Result<String, PluginError> {
+    let outcome = install_from_dir_with_backup(root, path)?;
+    if let Err(error) = commit_install(&outcome) {
+        let _ = rollback_install(&outcome);
+        return Err(error);
+    }
+    Ok(outcome.identity().to_string())
+}
+
+/// 安装目录插件但保留旧版本，供 manager 在源码校验后提交或回滚。
+pub(crate) fn install_from_dir_with_backup(
+    root: &Path,
+    path: &Path,
+) -> Result<InstallOutcome, PluginError> {
     let manifest = read_manifest(path)?;
     let identity = manifest.identity.clone();
-    let dest = root.join(&identity);
     std::fs::create_dir_all(root)
         .map_err(|e| PluginError::ManifestInvalid(format!("创建插件根目录失败: {e}")))?;
-    if dest.exists() {
-        std::fs::remove_dir_all(&dest)
-            .map_err(|e| PluginError::ManifestInvalid(format!("清理旧插件失败: {e}")))?;
+    install_staged_dir(root, path, identity)
+}
+
+/// 一次安装的结果。旧目录存在时已被改名为 backup，待源码校验通过后再删除。
+pub(crate) struct InstallOutcome {
+    identity: String,
+    dest: PathBuf,
+    backup: Option<PathBuf>,
+}
+
+impl InstallOutcome {
+    pub(crate) fn identity(&self) -> &str {
+        &self.identity
     }
-    copy_dir(path, &dest)?;
-    Ok(identity)
+
+    pub(crate) fn has_backup(&self) -> bool {
+        self.backup.is_some()
+    }
+}
+
+fn install_staged_dir(
+    root: &Path,
+    source: &Path,
+    identity: String,
+) -> Result<InstallOutcome, PluginError> {
+    let dest = root.join(&identity);
+    let backup = dest.exists().then(|| {
+        root.join(format!(
+            ".backup_install_{}_{}",
+            identity,
+            uuid::Uuid::new_v4()
+        ))
+    });
+    if let Some(backup) = &backup {
+        std::fs::rename(&dest, backup)
+            .map_err(|e| PluginError::ManifestInvalid(format!("备份旧插件失败: {e}")))?;
+    }
+    if let Err(error) = copy_dir(source, &dest) {
+        let _ = std::fs::remove_dir_all(&dest);
+        if let Some(backup) = &backup {
+            let _ = std::fs::rename(backup, &dest);
+        }
+        return Err(error);
+    }
+    Ok(InstallOutcome {
+        identity,
+        dest,
+        backup,
+    })
+}
+
+/// 提交安装：删除被替换的旧版本。
+pub(crate) fn commit_install(outcome: &InstallOutcome) -> Result<(), PluginError> {
+    if let Some(backup) = &outcome.backup {
+        std::fs::remove_dir_all(backup)
+            .map_err(|e| PluginError::ManifestInvalid(format!("清理旧插件备份失败: {e}")))?;
+    }
+    Ok(())
+}
+
+/// 回滚安装：删除新版本并恢复旧目录；新安装则只删除新目录。
+pub(crate) fn rollback_install(outcome: &InstallOutcome) -> Result<(), PluginError> {
+    if outcome.dest.exists() {
+        std::fs::remove_dir_all(&outcome.dest)
+            .map_err(|e| PluginError::ManifestInvalid(format!("清理失败插件目录失败: {e}")))?;
+    }
+    if let Some(backup) = &outcome.backup {
+        std::fs::rename(backup, &outcome.dest)
+            .map_err(|e| PluginError::ManifestInvalid(format!("恢复旧插件失败: {e}")))?;
+    }
+    Ok(())
 }
 
 fn read_manifest(dir: &Path) -> Result<PluginManifest, PluginError> {

@@ -69,6 +69,10 @@ object AppStorage {
                 // （Android/data 层禁止应用自建子树），Rust std::fs 才能直写。
                 "getExternalDownloadDir" ->
                     result.success(activity.getExternalFilesDir("Download")?.absolutePath)
+                // 应用专属外部日志目录（#533）：同理经 framework 创建，
+                // 供 adb / 电脑无需 Root 直接访问，便于排障。
+                "getExternalLogsDir" ->
+                    result.success(activity.getExternalFilesDir("logs")?.absolutePath)
                 // 应用内更新：唤起系统安装器安装下载好的 APK
                 "installApk" -> installApk(activity, call.argument<String>("path"), result)
                 // 用系统默认应用打开已下载文件（无关联时回退系统选择器）

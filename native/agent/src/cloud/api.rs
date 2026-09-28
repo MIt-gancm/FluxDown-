@@ -249,6 +249,18 @@ impl CloudApi {
         self.client.clear_session().await
     }
 
+    #[must_use]
+    pub fn endpoint(&self) -> fluxdown_protocol::CloudEndpointDto {
+        self.client.endpoint()
+    }
+
+    pub async fn set_endpoint(
+        &self,
+        base_url: &str,
+    ) -> Result<fluxdown_protocol::CloudEndpointDto, CloudError> {
+        self.client.set_endpoint(base_url).await
+    }
+
     async fn authed<P: Serialize>(
         &self,
         method: Method,

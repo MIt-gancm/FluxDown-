@@ -1,0 +1,20 @@
+{
+  "name": "Dracula",
+  "author": "flutter user",
+  "appearance": "dark",
+  "colors": {
+    "surface": { "background": "ff282a36", "surface1": "ff343746", "surface2": "ff44475a", "surface3": "ff4d5066" },
+    "element": { "hover": "14ffffff", "selected": "24bd93f9", "active": "33bd93f9" },
+    "text": { "primary": "fff8f8f2", "secondary": "ffbfbfbf", "muted": "ff6272a4", "disabled": "806272a4" },
+    "border": { "default": "ff44475a", "focused": "ffbd93f9" },
+    "accent": { "color": "ffbd93f9", "hover": "ffcaa8fa", "background": "2ebd93f9", "foreground": "ff282a36" },
+    "input": { "background": "ff21222c", "border": "ff44475a", "focusBorder": "ffbd93f9", "focusBackground": "ff282a36" },
+    "dialog": { "background": "ff343746", "barrier": "80000000" },
+    "switch": { "track": "ff44475a", "thumb": "fff8f8f2" },
+    "shadow": "ff000000",
+    "status": { "success": "ff50fa7b", "warning": "ffffb86c", "error": "zzff5555" },
+    "segmentPalette": ["ffbd93f9", "ff50fa7b"]
+  },
+  "metrics": { "radius": { "sm": 6, "md": 10 }, "stroke": { "thin": 1, "thick": 2 } },
+  "schemaVersion": 2
+}

@@ -1,0 +1,22 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "meta": { "name": "Refs And Alpha" },
+  "extends": "builtin:warm-light",
+  "tokens": {
+    "colors": {
+      "statusFailed": "{colors.warning}/80",
+      "progressTrack": "{colors.primary}/20",
+      "info": "#0EA5E9"
+    },
+    "shadow": {
+      "md": [{ "y": 2, "blur": 6, "color": "{colors.foreground}/10" }, { "y": 1, "blur": 1, "spread": 0, "color": "#00000014", "inset": true }]
+    },
+    "components": { "button": { "radius": "{radius.lg}" }, "progress": { "height": "{spacing.xs}" } }
+  },
+  "light": {
+    "colors": { "chrome": "{colors.surface}", "border": "#D6D3D1" },
+    "typography": { "sans": "Inter", "title": { "size": 17, "lineHeight": 22, "weight": 700 } }
+  },
+  "dark": { "density": { "taskRow": 40, "navRow": 30 } }
+}

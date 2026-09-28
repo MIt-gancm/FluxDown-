@@ -1,0 +1,110 @@
+---
+/** 浏览器扩展:官方商店链接(静态)、离线安装包(实时)与用户脚本说明。 */
+import { ArrowUpRight, ArrowRight } from "lucide-react";
+import AssetGroup, { type RowSpec } from "./AssetGroup.astro";
+import { BrandIcon, type BrandName } from "@/components/icons/brand";
+import { download } from "@/i18n/messages/download";
+import type { Lang } from "@/i18n/config";
+import { GITHUB_URL } from "@/lib/site-nav";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = download[lang];
+const title = t.ext.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+
+const stores: { name: BrandName; label: string; url: string }[] = [
+  { name: "chrome", label: t.ext.chrome, url: "https://chromewebstore.google.com/detail/fluxdown/meleenglfggcmcajknpeeeiobnpfmahc" },
+  { name: "edge", label: t.ext.edge, url: "https://microsoftedge.microsoft.com/addons/detail/fluxdown/nglkkjbogjghekbhhcnccnpfedjbdhhd" },
+  { name: "firefox", label: t.ext.firefox, url: "https://addons.mozilla.org/firefox/addon/fluxdown/" },
+];
+const offline: RowSpec[] = [
+  { path: "assets.extension", label: t.ext.offlineChrome, detail: "Chrome · Edge · Brave", ext: ".zip" },
+  { path: "assets.firefox_extension", label: t.ext.offlineFirefox, ext: ".xpi" },
+];
+---
+
+<section class="frame" id="extension" aria-labelledby="extension-title">
+  <div class="section-tight flex flex-col gap-4">
+    <span class="eyebrow">{t.ext.eyebrow}</span>
+    <h2 id="extension-title" class="h2 max-w-[20ch]" data-reveal set:html={title} />
+    <p class="lede max-w-[60ch]" data-reveal style="--d:1">{t.ext.lede}</p>
+  </div>
+  <div class="cells stores border-t border-line">
+    {
+      stores.map((store) => (
+        <a class="store spot" href={store.url} target="_blank" rel="noopener">
+          <span class="store-icon" aria-hidden="true">
+            <BrandIcon name={store.name} size={18} />
+          </span>
+          <span class="flex-1 text-[15px] font-medium">{store.label}</span>
+          <ArrowUpRight size={16} strokeWidth={1.75} className="store-arrow" aria-hidden="true" />
+        </a>
+      ))
+    }
+  </div>
+  <div class="cells ext-more border-t border-line">
+    <AssetGroup lang={lang} title={t.ext.offlineTitle} desc={t.ext.offlineNote} versionPath="extension_version" fallback={`${GITHUB_URL}/releases`} rows={offline}>
+      <a class="link mt-auto self-start text-[13px]" href={`/docs/${lang}/browser-extension/install/`}>{t.ext.extensionDocs}</a>
+    </AssetGroup>
+    <div class="flex flex-col gap-3 p-[clamp(20px,2.4vw,30px)]" id="userscript">
+      <div class="flex items-center gap-3">
+        <span class="store-icon" aria-hidden="true"><BrandIcon name="tampermonkey" size={16} /></span>
+        <h3 class="text-[17px] font-[560] tracking-[-0.015em]">{t.ext.userscriptTitle}</h3>
+      </div>
+      <p class="max-w-[52ch] text-[13.5px] leading-relaxed text-muted">{t.ext.userscriptDesc}</p>
+      <a class="link mt-auto inline-flex items-center gap-1 self-start text-[13px]" href={`/docs/${lang}/getting-started/settings/`}>
+        {t.ext.userscriptDocs}<ArrowRight size={13} strokeWidth={2} aria-hidden="true" />
+      </a>
+    </div>
+  </div>
+  <div class="rule"></div>
+</section>
+
+<style>
+  .stores {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 760px) {
+    .stores {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+  .store {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 22px clamp(20px, 2.4vw, 30px);
+    transition: background-color 160ms;
+  }
+  .store:hover {
+    background: var(--bg-sunken);
+  }
+  .store :global(.store-arrow) {
+    color: var(--fg-subtle);
+    transition: transform 200ms var(--ease-out), color 160ms;
+  }
+  .store:hover :global(.store-arrow) {
+    color: var(--accent-ink);
+    transform: translate(2px, -2px);
+  }
+  .store-icon {
+    display: grid;
+    place-items: center;
+    flex: none;
+    width: 34px;
+    height: 34px;
+    border-radius: 8px;
+    background: var(--bg-elev);
+    box-shadow: 0 0 0 1px var(--line-strong) inset;
+  }
+  .ext-more {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  @media (min-width: 760px) {
+    .ext-more {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+</style>

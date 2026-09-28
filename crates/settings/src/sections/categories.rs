@@ -1,133 +1,28 @@
 //! 自定义分类：模型（与 `lib/src/models/custom_category.dart` 同 JSON 形状）与列表分区。
 
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, category_icon};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
-use gpui::{App, Context, IntoElement as _, ParentElement, SharedString, Styled, div, px};
-use gpui_component::{
-    Icon, h_flex,
-    setting::{SettingGroup, SettingItem},
-    v_flex,
+use gpui::{
+    App, AppContext as _, Context, InteractiveElement as _, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _,
 };
-use serde::{Deserialize, Serialize};
+use gpui_component::{Icon, h_flex, v_flex};
 
 use super::{SectionContext, category_dialog};
 use crate::store::SettingsStore;
+use crate::ui::{
+    SettingsRow, SettingsSection, body_text, meta_text, row_button, row_danger_button,
+};
 
-pub(crate) const CATEGORIES_KEY: &str = "custom_categories";
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CategoryEntry {
-    pub id: String,
-    pub name: String,
-    #[serde(default = "default_icon")]
-    pub icon: String,
-    #[serde(default = "default_match_mode")]
-    pub match_mode: String,
-    #[serde(default)]
-    pub extensions: Vec<String>,
-    #[serde(default)]
-    pub regex_pattern: String,
-    #[serde(default)]
-    pub position: i64,
-    #[serde(default = "default_true")]
-    pub visible: bool,
-    #[serde(default)]
-    pub is_builtin: bool,
-    #[serde(default)]
-    pub builtin_type: Option<String>,
-    #[serde(default)]
-    pub save_dir: String,
-}
-
-fn default_icon() -> String {
-    "file".to_owned()
-}
-fn default_match_mode() -> String {
-    "extension".to_owned()
-}
-fn default_true() -> bool {
-    true
-}
-
-/// 内置分类基线（与 Flutter `CustomCategory.builtinDefaults` 同序同扩展名）。
-pub(crate) fn builtin_defaults() -> Vec<CategoryEntry> {
-    let make = |id: &str, icon: &str, exts: &[&str], position: i64| CategoryEntry {
-        id: format!("builtin_{id}"),
-        name: String::new(),
-        icon: icon.to_owned(),
-        match_mode: "extension".to_owned(),
-        extensions: exts.iter().map(|ext| (*ext).to_owned()).collect(),
-        regex_pattern: String::new(),
-        position,
-        visible: true,
-        is_builtin: true,
-        builtin_type: Some(id.to_owned()),
-        save_dir: String::new(),
-    };
-    vec![
-        make("all", "folders", &[], 0),
-        make(
-            "video",
-            "film",
-            &[
-                "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "ts", "m3u8",
-            ],
-            1,
-        ),
-        make(
-            "audio",
-            "music",
-            &["mp3", "flac", "wav", "aac", "ogg", "m4a", "wma", "opus"],
-            2,
-        ),
-        make(
-            "document",
-            "fileText",
-            &[
-                "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "epub", "md",
-            ],
-            3,
-        ),
-        make(
-            "image",
-            "image",
-            &[
-                "jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "heic", "avif",
-            ],
-            4,
-        ),
-        make(
-            "program",
-            "cpu",
-            &["exe", "msi", "dmg", "pkg", "deb", "rpm", "apk", "appimage"],
-            5,
-        ),
-        make(
-            "archive",
-            "archive",
-            &["zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso"],
-            6,
-        ),
-        make("other", "file", &[], 7),
-    ]
-}
+pub(crate) use fluxdown_protocol::CUSTOM_CATEGORIES_PREF_KEY as CATEGORIES_KEY;
+/// 分类模型：wire 形状归 protocol，设置页只读写偏好。
+pub(crate) type CategoryEntry = fluxdown_protocol::CustomCategoryDto;
 
 /// 读取分类列表；未设置或损坏时回退内置基线。
 pub(crate) fn read_categories(store: &SettingsStore) -> Vec<CategoryEntry> {
-    let parsed = match store.pref(CATEGORIES_KEY) {
-        Some(serde_json::Value::String(text)) => {
-            serde_json::from_str::<Vec<CategoryEntry>>(text).ok()
-        }
-        Some(value) => serde_json::from_value::<Vec<CategoryEntry>>(value.clone()).ok(),
-        None => None,
-    };
-    let mut list = parsed
-        .filter(|list| !list.is_empty())
-        .unwrap_or_else(builtin_defaults);
-    list.sort_by_key(|entry| entry.position);
-    list
+    CategoryEntry::from_preference(store.pref(CATEGORIES_KEY))
 }
 
 pub(crate) fn write_categories(
@@ -165,260 +60,300 @@ pub(crate) fn display_name(translator: &Translator, entry: &CategoryEntry) -> Sh
     }
 }
 
-pub(crate) fn group(ctx: &SectionContext, _cx: &mut App) -> SettingGroup {
-    SettingGroup::new()
-        .title(ctx.t("customCategories"))
-        .description(ctx.t("categoryPriorityNote"))
-        .item(list_item(ctx))
+/// 拖拽中的分类行：载荷是分类 id，预览显示图标 + 名称。
+#[derive(Clone)]
+struct DraggedCategory {
+    id: String,
+    label: SharedString,
+    icon: String,
 }
 
-fn list_item(ctx: &SectionContext) -> SettingItem {
+impl Render for DraggedCategory {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        h_flex()
+            .px(tokens.spacing.md)
+            .py(tokens.spacing.xs)
+            .gap(tokens.spacing.sm)
+            .items_center()
+            .rounded(tokens.radius.sm)
+            .border_1()
+            .border_color(tokens.colors.border)
+            .bg(tokens.colors.surface)
+            .shadow_sm()
+            .text_color(tokens.colors.surface_foreground)
+            .child(Icon::new(FluxIcon::GripVertical).size(extended.icon.md))
+            .child(Icon::new(category_icon(&self.icon)).size(extended.icon.md))
+            .child(self.label.clone())
+    }
+}
+
+pub(crate) fn group(ctx: &SectionContext, _cx: &mut App) -> SettingsSection {
+    SettingsSection::new()
+        .title(ctx.t("customCategories"))
+        .subtitle(ctx.t("categoryPriorityDragNote"))
+        .row(list_item(ctx))
+}
+
+fn list_item(ctx: &SectionContext) -> SettingsRow {
     let store = ctx.store();
     let translator = ctx.translator.clone();
     let builtin = ctx.t("builtinCategory");
     let custom = ctx.t("customCategory");
-    let move_up = ctx.t("moveUpAction");
-    let move_down = ctx.t("moveDownAction");
     let edit = ctx.t("editCategory");
     let delete = ctx.t("delete");
     let add = ctx.t("addCategory");
     let reset = ctx.t("resetBuiltinCategories");
     let auto_dirs = ctx.t("autoCategoryDirs");
     let regex_label = ctx.t("regexLabel");
-    SettingItem::render(move |options, _, cx: &mut App| {
-        let tokens = active_theme(cx).tokens();
-        let disabled = options.is_disabled();
-        let list = read_categories(store.read(cx));
-        let count = list.len();
-        let mut column = v_flex().w_full().gap(tokens.spacing.xs);
-        for (index, entry) in list.iter().enumerate() {
-            let name = display_name(&translator, entry);
-            let details = if entry.match_mode == "regex" {
-                format!("{regex_label}: {}", entry.regex_pattern)
-            } else if entry.extensions.is_empty() {
-                String::new()
-            } else {
-                entry
-                    .extensions
-                    .iter()
-                    .map(|ext| format!(".{ext}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let save_dir = entry.save_dir.clone();
-            let up_store = store.clone();
-            let down_store = store.clone();
-            let edit_store = store.clone();
-            let edit_translator = translator.clone();
-            let edit_entry = entry.clone();
-            let delete_store = store.clone();
-            let id_up = entry.id.clone();
-            let id_down = entry.id.clone();
-            let id_delete = entry.id.clone();
-            column = column.child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap(tokens.spacing.sm)
-                    .px(tokens.spacing.sm)
-                    .py(tokens.spacing.xs)
-                    .rounded(tokens.radius.md)
-                    .border_1()
-                    .border_color(tokens.colors.border)
-                    .child(
-                        Icon::new(category_dialog::icon_for(&entry.icon))
-                            .size(px(16.))
-                            .text_color(tokens.colors.muted_foreground),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(tokens.spacing.xxs)
-                            .child(
-                                h_flex()
-                                    .gap(tokens.spacing.sm)
-                                    .items_center()
-                                    .child(div().text_sm().child(name))
-                                    .child(
-                                        div()
-                                            .px(tokens.spacing.xs)
-                                            .rounded(tokens.radius.sm)
-                                            .bg(tokens.colors.accent)
-                                            .text_color(tokens.colors.accent_foreground)
-                                            .text_xs()
-                                            .child(if entry.is_builtin {
-                                                builtin.clone()
-                                            } else {
-                                                custom.clone()
-                                            }),
-                                    ),
+    SettingsRow::custom(
+        move |disabled: bool, _key: &SharedString, _window: &mut gpui::Window, cx: &mut App| {
+            let theme = active_theme(cx);
+            let tokens = theme.tokens();
+            let extended = theme.extended();
+            let list = read_categories(store.read(cx));
+            let mut column = v_flex().w_full().gap(tokens.spacing.xxs);
+            for entry in &list {
+                let name = display_name(&translator, entry);
+                let details = if entry.match_mode == "regex" {
+                    format!("{regex_label}: {}", entry.regex_pattern)
+                } else if entry.extensions.is_empty() {
+                    String::new()
+                } else {
+                    entry
+                        .extensions
+                        .iter()
+                        .map(|ext| format!(".{ext}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                let save_dir = entry.save_dir.clone();
+                let drop_store = store.clone();
+                let edit_store = store.clone();
+                let edit_translator = translator.clone();
+                let edit_entry = entry.clone();
+                let delete_store = store.clone();
+                let id_drop = entry.id.clone();
+                let id_delete = entry.id.clone();
+                let drag = DraggedCategory {
+                    id: entry.id.clone(),
+                    label: name.clone(),
+                    icon: entry.icon.clone(),
+                };
+                let accent = tokens.colors.primary;
+                column = column.child(
+                    h_flex()
+                        .id(SharedString::from(format!("category-row-{}", entry.id)))
+                        .w_full()
+                        .items_center()
+                        .gap(tokens.spacing.sm)
+                        .px(tokens.spacing.sm)
+                        .py(tokens.spacing.xs)
+                        .rounded(tokens.radius.md)
+                        .border_1()
+                        .border_color(gpui::transparent_black())
+                        .hover(|style| style.bg(extended.colors.row_hover))
+                        // 整行是落点；只有左侧抓手可发起拖拽。禁用态不可拖。
+                        .when(!disabled, |row| {
+                            row.drag_over::<DraggedCategory>(move |style, _, _, _| {
+                                style.border_color(accent)
+                            })
+                            .on_drop(
+                                move |drag: &DraggedCategory, _, cx| {
+                                    let target = id_drop.clone();
+                                    drop_store.update(cx, |store, cx| {
+                                        reorder_category(store, &drag.id, &target, cx);
+                                    });
+                                },
                             )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(tokens.colors.muted_foreground)
-                                    .child(SharedString::from(details)),
-                            )
-                            .when_some_dir(save_dir, tokens.colors.muted_foreground),
-                    )
-                    .child(
-                        button(
-                            SharedString::from(format!("category-up-{}", entry.id)),
-                            move_up.clone(),
-                            ButtonVariant::Ghost,
-                            cx,
+                        })
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("category-grip-{}", entry.id)))
+                                .flex_none()
+                                .p(tokens.spacing.xxs)
+                                .rounded(tokens.radius.sm)
+                                .text_color(extended.colors.text_tertiary)
+                                .when(!disabled, |grip| {
+                                    grip.cursor_grab()
+                                        .hover(|style| {
+                                            style
+                                                .bg(tokens.colors.muted)
+                                                .text_color(tokens.colors.foreground)
+                                        })
+                                        .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                                })
+                                .child(Icon::new(FluxIcon::GripVertical).size(extended.icon.md)),
                         )
-                        .disabled(disabled || index == 0)
-                        .on_click(move |_, _, cx| {
-                            let id = id_up.clone();
-                            up_store.update(cx, |store, cx| move_category(store, &id, -1, cx));
-                        }),
-                    )
-                    .child(
-                        button(
-                            SharedString::from(format!("category-down-{}", entry.id)),
-                            move_down.clone(),
-                            ButtonVariant::Ghost,
-                            cx,
+                        .child(
+                            Icon::new(category_icon(&entry.icon))
+                                .size(extended.icon.lg)
+                                .text_color(tokens.colors.muted_foreground),
                         )
-                        .disabled(disabled || index + 1 == count)
-                        .on_click(move |_, _, cx| {
-                            let id = id_down.clone();
-                            down_store.update(cx, |store, cx| move_category(store, &id, 1, cx));
-                        }),
-                    )
-                    .child(
-                        button(
-                            SharedString::from(format!("category-edit-{}", entry.id)),
-                            edit.clone(),
-                            ButtonVariant::Secondary,
-                            cx,
+                        .child(
+                            v_flex()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(tokens.spacing.xxs)
+                                .child(
+                                    h_flex()
+                                        .gap(tokens.spacing.sm)
+                                        .items_center()
+                                        .child(body_text(cx).child(name))
+                                        .child(
+                                            div()
+                                                .px(tokens.spacing.xs)
+                                                .rounded(tokens.radius.sm)
+                                                .bg(tokens.colors.muted)
+                                                .text_color(tokens.colors.muted_foreground)
+                                                .text_size(extended.caption.size)
+                                                .line_height(extended.caption.line_height)
+                                                .child(if entry.is_builtin {
+                                                    builtin.clone()
+                                                } else {
+                                                    custom.clone()
+                                                }),
+                                        ),
+                                )
+                                .when(!details.is_empty(), |this| {
+                                    this.child(
+                                        meta_text(cx).truncate().child(SharedString::from(details)),
+                                    )
+                                })
+                                .when(!save_dir.is_empty(), |this| {
+                                    this.child(
+                                        meta_text(cx)
+                                            .truncate()
+                                            .text_color(extended.colors.text_tertiary)
+                                            .child(SharedString::from(save_dir)),
+                                    )
+                                }),
                         )
-                        .disabled(disabled)
-                        .on_click(move |_, window, cx| {
-                            category_dialog::open(
-                                edit_store.clone(),
-                                edit_translator.clone(),
-                                Some(edit_entry.clone()),
-                                window,
+                        .child(
+                            row_button(
+                                SharedString::from(format!("category-edit-{}", entry.id)),
+                                edit.clone(),
+                                ButtonVariant::Secondary,
                                 cx,
-                            );
-                        }),
-                    )
-                    .child(
-                        button(
-                            SharedString::from(format!("category-delete-{}", entry.id)),
-                            delete.clone(),
-                            ButtonVariant::Destructive,
-                            cx,
-                        )
-                        .disabled(disabled || entry.is_builtin)
-                        .on_click(move |_, _, cx| {
-                            let id = id_delete.clone();
-                            delete_store.update(cx, |store, cx| {
-                                let list = read_categories(store)
-                                    .into_iter()
-                                    .filter(|entry| entry.id != id)
-                                    .collect();
-                                write_categories(store, list, cx);
-                            });
-                        }),
-                    ),
-            );
-        }
-        let reset_store = store.clone();
-        let auto_store = store.clone();
-        let add_store = store.clone();
-        let add_translator = translator.clone();
-        column
-            .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap(tokens.spacing.sm)
-                    .child(
-                        button("category-add", add.clone(), ButtonVariant::Primary, cx)
+                            )
                             .disabled(disabled)
                             .on_click(move |_, window, cx| {
                                 category_dialog::open(
-                                    add_store.clone(),
-                                    add_translator.clone(),
-                                    None,
+                                    edit_store.clone(),
+                                    edit_translator.clone(),
+                                    Some(edit_entry.clone()),
                                     window,
                                     cx,
                                 );
                             }),
-                    )
-                    .child(
-                        button(
-                            "category-auto-dirs",
-                            auto_dirs.clone(),
-                            ButtonVariant::Secondary,
-                            cx,
                         )
-                        .disabled(disabled)
-                        .on_click(move |_, _, cx| {
-                            auto_store.update(cx, apply_auto_dirs);
-                        }),
-                    )
-                    .child(
-                        button(
-                            "category-reset",
-                            reset.clone(),
-                            ButtonVariant::Secondary,
-                            cx,
+                        .child(
+                            row_danger_button(
+                                SharedString::from(format!("category-delete-{}", entry.id)),
+                                delete.clone(),
+                                cx,
+                            )
+                            .disabled(disabled || entry.is_builtin)
+                            .on_click(move |_, _, cx| {
+                                let id = id_delete.clone();
+                                delete_store.update(cx, |store, cx| {
+                                    let list = read_categories(store)
+                                        .into_iter()
+                                        .filter(|entry| entry.id != id)
+                                        .collect();
+                                    write_categories(store, list, cx);
+                                });
+                            }),
+                        ),
+                );
+            }
+            let reset_store = store.clone();
+            let auto_store = store.clone();
+            let add_store = store.clone();
+            let add_translator = translator.clone();
+            column
+                .child(
+                    h_flex()
+                        .w_full()
+                        .pt(tokens.spacing.sm)
+                        .justify_end()
+                        .gap(tokens.spacing.sm)
+                        .child(
+                            button(
+                                "category-auto-dirs",
+                                auto_dirs.clone(),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .disabled(disabled)
+                            .on_click(move |_, _, cx| {
+                                auto_store.update(cx, apply_auto_dirs);
+                            }),
                         )
-                        .disabled(disabled)
-                        .on_click(move |_, _, cx| {
-                            reset_store.update(cx, |store, cx| {
-                                write_categories(store, builtin_defaults(), cx);
-                            });
-                        }),
-                    ),
-            )
-            .into_any_element()
-    })
+                        .child(
+                            button(
+                                "category-reset",
+                                reset.clone(),
+                                ButtonVariant::Secondary,
+                                cx,
+                            )
+                            .disabled(disabled)
+                            .on_click(move |_, _, cx| {
+                                reset_store.update(cx, |store, cx| {
+                                    write_categories(store, CategoryEntry::builtin_defaults(), cx);
+                                });
+                            }),
+                        )
+                        .child(
+                            button("category-add", add.clone(), ButtonVariant::Primary, cx)
+                                .disabled(disabled)
+                                .on_click(move |_, window, cx| {
+                                    category_dialog::open(
+                                        add_store.clone(),
+                                        add_translator.clone(),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                        ),
+                )
+                .into_any_element()
+        },
+    )
     .keywords([ctx.t("customCategories"), ctx.t("customCategory")])
 }
 
-trait DirLine {
-    fn when_some_dir(self, dir: String, color: gpui::Hsla) -> Self;
-}
-
-impl DirLine for gpui::Div {
-    fn when_some_dir(self, dir: String, color: gpui::Hsla) -> Self {
-        if dir.is_empty() {
-            self
-        } else {
-            self.child(
-                div()
-                    .truncate()
-                    .text_xs()
-                    .text_color(color)
-                    .child(SharedString::from(dir)),
-            )
-        }
-    }
-}
-
-pub(crate) fn move_category(
+/// 把 `from` 移到 `to` 当前所在位置（先移除再插入：向下拖落在目标之后，向上拖落在目标之前）。
+pub(crate) fn reorder_category(
     store: &mut SettingsStore,
-    id: &str,
-    delta: isize,
+    from: &str,
+    to: &str,
     cx: &mut Context<SettingsStore>,
 ) {
     let mut list = read_categories(store);
-    let Some(index) = list.iter().position(|entry| entry.id == id) else {
-        return;
-    };
-    let target = index as isize + delta;
-    if target < 0 || target as usize >= list.len() {
+    if !reorder(&mut list, from, to) {
         return;
     }
-    list.swap(index, target as usize);
     write_categories(store, list, cx);
+}
+
+/// 纯列表重排；无变化（同一项 / id 不存在）返回 false。
+fn reorder(list: &mut Vec<CategoryEntry>, from: &str, to: &str) -> bool {
+    let (Some(from), Some(to)) = (
+        list.iter().position(|entry| entry.id == from),
+        list.iter().position(|entry| entry.id == to),
+    ) else {
+        return false;
+    };
+    if from == to {
+        return false;
+    }
+    let entry = list.remove(from);
+    list.insert(to, entry);
+    true
 }
 
 /// 「一键分类目录」：把每个分类的保存目录设为默认下载目录下的同名子目录。
@@ -499,6 +434,31 @@ pub(crate) fn category_dir_under(base_dir: &str, label: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ids(list: &[CategoryEntry]) -> Vec<&str> {
+        list.iter().map(|entry| entry.id.as_str()).collect()
+    }
+
+    #[test]
+    fn drag_reorder_moves_to_target_slot_both_directions() {
+        let mut list = CategoryEntry::builtin_defaults();
+        let before: Vec<String> = list.iter().map(|entry| entry.id.clone()).collect();
+        let (a, c) = (before[0].clone(), before[2].clone());
+
+        // 向下拖：a 落到 c 的位置（c 之后）。
+        assert!(reorder(&mut list, &a, &c));
+        assert_eq!(ids(&list)[..3], [&*before[1], &*before[2], &*before[0]]);
+
+        // 向上拖回原位。
+        assert!(reorder(&mut list, &a, &before[1]));
+        assert_eq!(
+            ids(&list),
+            before.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        assert!(!reorder(&mut list, &a, &a));
+        assert!(!reorder(&mut list, "missing", &a));
+    }
 
     #[test]
     fn sanitizes_dir_names_like_dart() {

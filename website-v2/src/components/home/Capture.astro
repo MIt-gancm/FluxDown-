@@ -1,0 +1,459 @@
+---
+/**
+ * 04 · 捕获:浏览器页面点击下载 → 扩展拦截 → 数据包飞入 FluxDown「新建下载」窗口。
+ * 7 秒循环,纯 CSS 关键帧(共享时长,各元素按百分比编排)。
+ */
+import { ArrowRight, Cookie, Disc3, Link2, Lock, RotateCw, ChevronLeft, ChevronRight } from "lucide-react";
+import { BrandIcon } from "../icons/brand";
+import { home } from "../../i18n/messages/home";
+import { href } from "../../i18n/routing";
+import type { Lang } from "../../i18n/config";
+
+interface Props {
+  lang: Lang;
+}
+const { lang } = Astro.props;
+const t = home[lang].capture;
+const app = home[lang].app;
+const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
+---
+
+<section class="frame">
+  <div class="rule"></div>
+  <div class="section grid gap-12 lg:grid-cols-[minmax(0,1.1fr)_minmax(0,0.9fr)] lg:gap-16 grid-cols-1">
+    <div class="fig order-2 self-center rounded-[12px] lg:order-1" data-reveal>
+      <div class="fig-bar">
+        <span>fig. 04</span>
+        <span>{t.figure}</span>
+      </div>
+      <div class="cap-stage" aria-hidden="true">
+        <div class="cap-browser">
+          <div class="cap-tabs">
+            <div class="cap-lights"><i></i><i></i><i></i></div>
+            <div class="cap-tab"><span class="cap-favicon"></span>Blender 4.2 LTS</div>
+          </div>
+          <div class="cap-toolbar">
+            <ChevronLeft size={14} strokeWidth={1.75} />
+            <ChevronRight size={14} strokeWidth={1.75} />
+            <RotateCw size={12} strokeWidth={1.75} />
+            <div class="cap-url"><Lock size={11} strokeWidth={2} />{t.browserUrl}</div>
+            <span class="cap-ext">
+              <svg width="16" height="16" viewBox="56 56 400 400"><rect x="56" y="56" width="400" height="400" rx="96" fill="#3B82F6"></rect><path d="M226 131q0-12 12-12h36q12 0 12 12v165l45-45q9-9 18 0l14 14q9 9 0 18l-98 98q-9 9-18 0l-98-98q-9-9 0-18l14-14q9-9 18 0l45 45z" fill="#F2F4F8"></path></svg>
+              <b>3</b>
+            </span>
+          </div>
+          <div class="cap-page">
+            <div class="cap-h"></div>
+            <div class="cap-line w-[82%]"></div>
+            <div class="cap-line w-[64%]"></div>
+            <div class="cap-media">
+              <span></span><span></span><span></span>
+            </div>
+            <div class="cap-button">{t.browserButton}<ArrowRight size={12} strokeWidth={2} /></div>
+            <div class="cap-line w-[40%]"></div>
+            <div class="cap-sniff mono">{t.sniffed}</div>
+          </div>
+          <svg class="cap-cursor" width="16" height="20" viewBox="0 0 18 22"><path d="M1.5 1.5v16.2l4.3-4.1 2.8 6.6 2.9-1.2-2.8-6.5h6z" fill="#111" stroke="#fff" stroke-width="1.3" stroke-linejoin="round"></path></svg>
+        </div>
+
+        <span class="cap-packet"><Disc3 size={12} strokeWidth={2} /></span>
+
+        <div class="cap-card">
+          <div class="cap-card-bar">
+            <div class="cap-lights"><i></i><i></i><i></i></div>
+            {app.newDownload}
+          </div>
+          <div class="flex flex-col gap-2 p-3">
+            <div class="cap-field"><Link2 size={11} strokeWidth={2} /><span class="truncate">…/blender-4.2.1-macos-arm64.dmg</span></div>
+            <div class="flex gap-2">
+              <div class="cap-field flex-1"><Cookie size={11} strokeWidth={2} />cookies · 4</div>
+              <div class="cap-field flex-1">referer ✓</div>
+            </div>
+            <div class="flex items-center justify-between pt-1">
+              <span class="cap-caught mono">{t.caught}</span>
+              <span class="cap-start">{app.start}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="order-1 flex flex-col gap-6 lg:order-2">
+      <span class="eyebrow" data-scramble>{t.eyebrow}</span>
+      <h2 class="h2" data-reveal set:html={title} />
+      <p class="lede" data-reveal style="--d:1">{t.lede}</p>
+      <ul class="mt-2 flex flex-col border-t border-line" data-reveal style="--d:2">
+        {
+          t.points.map((p) => (
+            <li class="grid gap-1 border-b border-line py-4 sm:grid-cols-[200px_1fr] sm:gap-6 grid-cols-1">
+              <span class="text-[14px] font-medium text-fg">{p.k}</span>
+              <span class="text-[14px] leading-relaxed text-muted">{p.v}</span>
+            </li>
+          ))
+        }
+      </ul>
+      <div class="flex flex-wrap items-center gap-3" data-reveal style="--d:3">
+        <a href={href("/download#extension", lang)} class="btn btn-secondary">
+          <BrandIcon name="chrome" size={14} />
+          <BrandIcon name="edge" size={14} />
+          <BrandIcon name="firefox" size={14} />
+          {t.cta}
+        </a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style is:global>
+  @layer components {
+    .cap-stage {
+      --cap: 7s;
+      position: relative;
+      padding: clamp(16px, 3vw, 36px);
+      padding-bottom: clamp(70px, 9vw, 96px);
+      background-image: radial-gradient(var(--line) 1px, transparent 1px);
+      background-size: 16px 16px;
+      overflow: hidden;
+    }
+    .cap-browser {
+      position: relative;
+      width: 82%;
+      overflow: hidden;
+      border-radius: 10px;
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line-strong),
+        0 20px 50px -24px oklch(0 0 0 / 0.35);
+      font-size: 12px;
+    }
+    .cap-tabs {
+      display: flex;
+      align-items: flex-end;
+      gap: 14px;
+      height: 34px;
+      padding: 0 10px;
+      background: var(--bg-sunken);
+    }
+    .cap-lights {
+      display: flex;
+      gap: 6px;
+      align-self: center;
+    }
+    .cap-lights i {
+      width: 9px;
+      height: 9px;
+      border-radius: 99px;
+      background: var(--line-strong);
+    }
+    .cap-tab {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      height: 26px;
+      padding: 0 12px;
+      border-radius: 8px 8px 0 0;
+      background: var(--bg-elev);
+      color: var(--fg);
+      white-space: nowrap;
+    }
+    .cap-favicon {
+      width: 10px;
+      height: 10px;
+      border-radius: 3px;
+      background: oklch(0.72 0.17 55);
+    }
+    .cap-toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      height: 36px;
+      padding: 0 10px;
+      color: var(--fg-subtle);
+      border-bottom: 1px solid var(--line);
+    }
+    .cap-url {
+      display: flex;
+      flex: 1;
+      align-items: center;
+      gap: 6px;
+      height: 24px;
+      padding: 0 10px;
+      overflow: hidden;
+      border-radius: 99px;
+      background: var(--bg-sunken);
+      color: var(--fg-muted);
+      white-space: nowrap;
+    }
+    .cap-ext {
+      position: relative;
+      display: grid;
+      place-items: center;
+    }
+    .cap-ext b {
+      position: absolute;
+      right: -6px;
+      top: -5px;
+      display: grid;
+      place-items: center;
+      min-width: 13px;
+      height: 13px;
+      padding: 0 3px;
+      border-radius: 99px;
+      font-size: 9px;
+      font-weight: 600;
+      color: #fff;
+      background: var(--danger);
+      animation: cap-badge var(--cap) var(--ease-spring) infinite;
+    }
+    .cap-page {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      padding: 22px 24px 26px;
+    }
+    .cap-h {
+      width: 46%;
+      height: 14px;
+      border-radius: 4px;
+      background: var(--fg);
+      opacity: 0.85;
+    }
+    .cap-line {
+      height: 7px;
+      border-radius: 4px;
+      background: var(--bg-inset);
+    }
+    .cap-media {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-block: 6px;
+    }
+    .cap-media span {
+      aspect-ratio: 16 / 9;
+      border-radius: 6px;
+      background: var(--bg-inset);
+      box-shadow: 0 0 0 1px var(--line) inset;
+      animation: cap-sniffed var(--cap) ease-in-out infinite;
+    }
+    .cap-button {
+      display: inline-flex;
+      align-self: flex-start;
+      align-items: center;
+      gap: 6px;
+      height: 28px;
+      padding: 0 12px;
+      border-radius: 7px;
+      font-weight: 500;
+      color: #fff;
+      background: oklch(0.62 0.17 55);
+      animation: cap-press var(--cap) ease infinite;
+    }
+    .cap-sniff {
+      position: absolute;
+      right: 10px;
+      top: 76px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      font-size: 10.5px;
+      color: var(--fg);
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line-strong),
+        var(--shadow-float);
+      animation: cap-tip var(--cap) var(--ease-out) infinite;
+    }
+    .cap-cursor {
+      position: absolute;
+      left: 0;
+      top: 0;
+      filter: drop-shadow(0 2px 3px rgb(0 0 0 / 0.3));
+      animation: cap-cursor var(--cap) var(--ease-out) infinite;
+    }
+    .cap-packet {
+      position: absolute;
+      left: 18%;
+      top: 62%;
+      display: grid;
+      place-items: center;
+      width: 26px;
+      height: 26px;
+      border-radius: 8px;
+      color: #fff;
+      background: var(--accent);
+      box-shadow: 0 6px 18px -4px color-mix(in oklch, var(--accent) 80%, transparent);
+      opacity: 0;
+      animation: cap-packet var(--cap) cubic-bezier(0.5, 0, 0.2, 1) infinite;
+    }
+    .cap-card {
+      position: absolute;
+      right: clamp(12px, 3vw, 28px);
+      bottom: clamp(14px, 2.4vw, 26px);
+      width: min(300px, 62%);
+      overflow: hidden;
+      border-radius: 10px;
+      background: var(--bg-elev);
+      box-shadow:
+        0 0 0 1px var(--line-strong),
+        var(--shadow-window);
+      font-size: 11.5px;
+      animation: cap-card var(--cap) var(--ease-out) infinite;
+    }
+    .cap-card-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      height: 28px;
+      padding: 0 10px;
+      border-bottom: 1px solid var(--line);
+      font-weight: 500;
+      color: var(--fg);
+      background: var(--bg-sunken);
+    }
+    .cap-card-bar .cap-lights i:nth-child(1) {
+      background: #ff5f57;
+    }
+    .cap-card-bar .cap-lights i:nth-child(2) {
+      background: #febc2e;
+    }
+    .cap-card-bar .cap-lights i:nth-child(3) {
+      background: #28c840;
+    }
+    .cap-field {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      height: 24px;
+      padding: 0 8px;
+      overflow: hidden;
+      border-radius: 5px;
+      color: var(--fg-muted);
+      box-shadow: 0 0 0 1px var(--line-strong) inset;
+      white-space: nowrap;
+    }
+    .cap-caught {
+      font-size: 10.5px;
+      color: var(--ok);
+    }
+    .cap-start {
+      padding: 4px 10px;
+      border-radius: 6px;
+      color: #fff;
+      background: var(--accent);
+      font-weight: 500;
+    }
+    @keyframes cap-cursor {
+      0% {
+        transform: translate(260px, 250px);
+        opacity: 0;
+      }
+      8% {
+        opacity: 1;
+      }
+      22%,
+      30% {
+        transform: translate(110px, 212px);
+        opacity: 1;
+      }
+      40%,
+      100% {
+        transform: translate(150px, 250px);
+        opacity: 0;
+      }
+    }
+    @keyframes cap-press {
+      0%,
+      23% {
+        filter: none;
+        transform: none;
+      }
+      24%,
+      27% {
+        filter: brightness(0.85);
+        transform: scale(0.96);
+      }
+      29%,
+      100% {
+        filter: none;
+        transform: none;
+      }
+    }
+    @keyframes cap-packet {
+      0%,
+      27% {
+        opacity: 0;
+        transform: translate(0, 0) scale(0.6);
+      }
+      30% {
+        opacity: 1;
+        transform: translate(0, 0) scale(1);
+      }
+      44% {
+        opacity: 1;
+        transform: translate(clamp(180px, 38vw, 330px), 40px) scale(0.9);
+      }
+      47%,
+      100% {
+        opacity: 0;
+        transform: translate(clamp(180px, 38vw, 330px), 40px) scale(0.4);
+      }
+    }
+    @keyframes cap-card {
+      0%,
+      42% {
+        opacity: 0;
+        transform: translateY(14px) scale(0.96);
+      }
+      48%,
+      90% {
+        opacity: 1;
+        transform: none;
+      }
+      96%,
+      100% {
+        opacity: 0;
+        transform: translateY(6px);
+      }
+    }
+    @keyframes cap-badge {
+      0%,
+      5% {
+        transform: scale(0);
+      }
+      10%,
+      100% {
+        transform: scale(1);
+      }
+    }
+    @keyframes cap-sniffed {
+      0%,
+      6% {
+        box-shadow: 0 0 0 1px var(--line) inset;
+      }
+      9%,
+      16% {
+        box-shadow: 0 0 0 2px var(--accent) inset;
+      }
+      20%,
+      100% {
+        box-shadow: 0 0 0 1px var(--line) inset;
+      }
+    }
+    @keyframes cap-tip {
+      0%,
+      8% {
+        opacity: 0;
+        transform: translateY(-4px);
+      }
+      11%,
+      20% {
+        opacity: 1;
+        transform: none;
+      }
+      24%,
+      100% {
+        opacity: 0;
+      }
+    }
+  }
+</style>

@@ -31,6 +31,7 @@ use crate::ed2k::proto::{
 use crate::ed2k::server::PeerAddr;
 use crate::logger::log_info;
 use crate::speed_limiter::SpeedLimiter;
+use crate::transfer_activity::TransferTracker;
 
 /// peer 单次 socket 读的 stall 超时。
 const PEER_STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -111,6 +112,7 @@ async fn download_block_inner(
     let stream = TcpStream::connect((peer.ip, peer.port))
         .await
         .map_err(DownloadError::Io)?;
+    let tracker = TransferTracker::new();
     download_block_on_stream(
         stream,
         file_hash,
@@ -123,6 +125,7 @@ async fn download_block_inner(
         limiter,
         hashset_cache,
         progress,
+        &tracker,
     )
     .await
 }
@@ -145,6 +148,7 @@ pub(crate) async fn download_block_on_stream(
     limiter: &SpeedLimiter,
     hashset_cache: &Arc<OnceCell<Vec<[u8; 16]>>>,
     progress: &Arc<StdMutex<HashMap<u64, i64>>>,
+    tracker: &TransferTracker,
 ) -> Result<[u8; 16], DownloadError> {
     let (block_start, block_end) = hash::part_span(block_index, total_bytes, part_size);
     let block_len = block_end - block_start;
@@ -206,12 +210,15 @@ pub(crate) async fn download_block_on_stream(
         }
 
         // 读一帧（stall 超时）。
+        // Count only the peer response read; queue, negotiation and hashing are not transfers.
+        let transfer = tracker.start(block_index as i32);
         let (proto_byte, opcode, payload) = tokio::time::timeout(
             PEER_STALL_TIMEOUT,
             proto::read_frame(&mut stream, MAX_PEER_FRAME),
         )
         .await
         .map_err(|_| DownloadError::Ed2k("peer stalled".into()))??;
+        drop(transfer);
 
         match proto::dispatch(proto_byte, opcode, &payload, large_file)? {
             Ed2kMessage::SendingPart {

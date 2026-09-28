@@ -71,23 +71,45 @@ impl CloudAuthService {
                 Some(&serde_json::json!({ "refreshToken": refresh_token })),
             )
             .await;
+        // `clear_session` 自身投影 `SessionChanged(None)`。
         self.client.clear_session().await?;
-        self.events
-            .publish(AgentEvent::SessionChanged(Box::new(None)));
         remote.map(|_| ())
     }
 
+    /// 与 Flutter `CloudClient._withDeviceInfo` 对齐：认证类请求体必须携带
+    /// `deviceId`（服务端必填，缺失 422）及 `deviceName` / `devicePlatform` / `appVersion`；
+    /// 响应兼容两种形态——tagged（`/auth/login`：`{status, auth}` 或
+    /// `{status: "deviceVerificationRequired", ttlSeconds, willReplaceDevices}`）
+    /// 与裸 `AuthResponse`（`/auth/*/verify`）。
     async fn authenticate<P: Serialize>(
         &self,
         path: &str,
         request: &P,
     ) -> Result<AgentLoginResult, CloudError> {
-        let value: Value = self
-            .client
-            .public(Method::POST, path, Some(request))
-            .await?;
-        if value.get("accessToken").is_some() {
-            let auth = serde_json::from_value::<AuthResponse>(value)
+        let mut body = serde_json::to_value(request)
+            .map_err(|error| CloudError::invalid_response(error.to_string()))?;
+        if let Value::Object(map) = &mut body {
+            let (device_id, device_name, platform) = self.client.device_identity().await;
+            map.insert("deviceId".to_owned(), Value::String(device_id));
+            if !device_name.is_empty() {
+                map.insert("deviceName".to_owned(), Value::String(device_name));
+            }
+            if !platform.is_empty() {
+                map.insert("devicePlatform".to_owned(), Value::String(platform));
+            }
+            map.insert(
+                "appVersion".to_owned(),
+                Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+            );
+        }
+        let value: Value = self.client.public(Method::POST, path, Some(&body)).await?;
+        let auth_value = match value.get("auth") {
+            Some(auth) if auth.get("accessToken").is_some() => Some(auth.clone()),
+            _ if value.get("accessToken").is_some() => Some(value.clone()),
+            _ => None,
+        };
+        if let Some(auth_value) = auth_value {
+            let auth = serde_json::from_value::<AuthResponse>(auth_value)
                 .map_err(|error| CloudError::invalid_response(error.to_string()))?;
             let session = self.client.persist_auth(auth).await?;
             self.events
@@ -115,5 +137,99 @@ impl CloudError {
             message,
             retryable: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::Router;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::post;
+    use fluxdown_protocol::{AgentLoginResult, AgentSnapshot};
+    use serde_json::{Value, json};
+    use tokio::sync::Mutex;
+
+    use super::CloudAuthService;
+    use crate::cloud::CloudClient;
+    use crate::event_hub::AgentEventHub;
+    use crate::state::{AgentState, StateStore};
+
+    /// 模拟 FluxCloud `/auth/login`：`deviceId` 必填（缺失 422），响应为 tagged 形态。
+    async fn login(axum::Json(body): axum::Json<Value>) -> Response {
+        if body.get("deviceId").and_then(Value::as_str) != Some("device1") {
+            return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+        }
+        axum::Json(json!({
+            "status": "ok",
+            "auth": {
+                "accessToken": "access",
+                "refreshToken": "refresh",
+                "expiresIn": 3600,
+                "user": {
+                    "id": "u1",
+                    "email": "user@example.com",
+                    "nickname": "User",
+                    "plan": "free",
+                    "status": "active",
+                    "createdAt": ""
+                },
+                "entitlements": {},
+                "device": {
+                    "id": "row1",
+                    "deviceId": "device1",
+                    "name": "Desktop",
+                    "createdAt": "",
+                    "lastSeenAt": ""
+                }
+            }
+        }))
+        .into_response()
+    }
+
+    #[tokio::test]
+    async fn login_sends_device_identity_and_unwraps_tagged_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind login mock");
+        let address = listener.local_addr().expect("login mock address");
+        let app = Router::new().route("/api/v1/auth/login", post(login));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_login_test_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let state = Arc::new(Mutex::new(AgentState {
+            device_id: "device1".to_owned(),
+            device_name: "Desktop".to_owned(),
+            platform: "macos".to_owned(),
+            ..AgentState::default()
+        }));
+        let client = CloudClient::new(format!("http://{address}"), state.clone(), store.clone())
+            .expect("cloud client");
+        let auth = CloudAuthService::new(client, AgentEventHub::new(AgentSnapshot::default()));
+
+        let result = auth
+            .login(&json!({ "account": "user@example.com", "password": "secret" }))
+            .await
+            .expect("login accepted");
+        let AgentLoginResult::Ok { session } = result else {
+            panic!("expected direct login");
+        };
+        assert_eq!(session.user.email, "user@example.com");
+        let credentials = state.lock().await.credentials.clone().expect("credentials");
+        assert_eq!(credentials.access_token, "access");
+
+        drop(auth);
+        drop(state);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
     }
 }

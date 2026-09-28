@@ -5,7 +5,7 @@
 import { useEffect, useRef, useState } from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronLeft, ChevronRight, Folder, FolderOpen, FolderX, X } from 'lucide-react'
+import { ChevronLeft, ChevronRight, Folder, FolderOpen, FolderX, Lock, X } from 'lucide-react'
 import { api } from '../../lib/api'
 import { cn } from '../../lib/cn'
 import { useI18n } from '../../lib/i18n'
@@ -141,7 +141,13 @@ export function FsPicker({ value, onChange }: FsPickerProps) {
                   {t('fs.loadFailed')}
                 </div>
               )}
-              {!isLoading && !isError && data?.dirs.length === 0 && (
+              {!isLoading && !isError && data?.denied && (
+                <div className="fs-empty">
+                  <Lock />
+                  {t('fs.denied')}
+                </div>
+              )}
+              {!isLoading && !isError && data && !data.denied && data.dirs.length === 0 && (
                 <div className="fs-empty">
                   <FolderOpen />
                   {t('fs.emptyDir')}

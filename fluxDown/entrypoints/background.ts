@@ -18,7 +18,7 @@
  *   - 为后续 onCreated 兜底提供可靠的元数据来源
  *
  * 第二层（主拦截）: downloads.onDeterminingFilename
- *   - 浏览器弹出「另存为」之前触发，suggest() 释放管线 + downloads.cancel() 取消下载
+ *   - 浏览器弹出「另存为」之前触发，先请求取消，再 suggest() 释放文件名管线
  *   - 最优先、最干净的拦截方式
  *   - 但对 JS location.href / meta refresh 触发的"导航转下载"存在 MV3 时序问题
  *
@@ -51,19 +51,25 @@ import type {
 } from "@/utils/native-messaging";
 import { loadSettings, shouldIntercept } from "@/utils/settings";
 import type { DownloadItemInfo } from "@/utils/settings";
+import { cancelBeforeFilenameResolution } from "@/utils/download-cancellation";
 import { initI18n, t } from "@/utils/i18n";
 import {
   matchSniffRule,
   classifyResource,
   extractFilenameFromUrl,
+  normalizeUrlForDedup,
 } from "@/utils/resource-types";
 import type { ResourceMessagePayload } from "@/utils/resource-types";
+import { normalizeDashManifest } from "@/utils/dash-manifest";
 import type { DashManifest } from "@/utils/dash-manifest";
+import {
+  buildMediaCandidates,
+  countMediaCandidateRows,
+} from "@/utils/media-candidates";
 import {
   addResources,
   addSniffedResource,
   getResourcesForTab,
-  getResourceCountForTab,
   clearResourcesForTab,
   updateBadgeForTab,
   initTabLifecycleListeners,
@@ -96,6 +102,25 @@ function incrementStat(field: "sent" | "failed"): Promise<void> {
     }
   });
   return _statChain;
+}
+
+/**
+ * 从选中文本中提取一个可下载的 magnet:/ed2k:/http(s) 纯文本链接（#348）。
+ * 仅接受完整且合法的链接格式，避免把选区里夹带的其他文字误判为下载源。
+ */
+function extractSelectionDownloadUrl(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const text = raw.trim();
+  if (!text) return null;
+  // magnet 链接：xt=urn:<hash-algo>:<hash> 是必需字段
+  if (/^magnet:\?xt=urn:[a-zA-Z0-9]+:[a-zA-Z0-9]+/i.test(text)) return text;
+  // ed2k 链接：ed2k://|file|<name>|<size>|<32位十六进制 hash>|/
+  if (/^ed2k:\/\/\|file\|[^|]+\|\d+\|[a-fA-F0-9]{32}\|\/?$/i.test(text)) {
+    return text;
+  }
+  // 纯文本形式的完整 http(s) 直链
+  if (/^https?:\/\/\S+$/i.test(text)) return text;
+  return null;
 }
 
 export default defineBackground(() => {
@@ -157,10 +182,33 @@ export default defineBackground(() => {
         .then((s) => {
           updateIcon(s.enabled);
           syncDownloadShelfState(s.enabled);
+          setDeterminingFilenameListenerActive(s.enabled);
         })
         .catch(() => {});
     }
   });
+
+  // #527/#609/#199/#293：onDeterminingFilename 的实际注册状态。拦截关闭后
+  // 必须真正 removeListener 把该事件让给其他扩展（脚本猫/PDM/IDM 等）——
+  // 仅在回调里 suggest() 放行不够，Chrome 只要本扩展仍注册着 listener 就
+  // 视为参与"确定文件名"的竞争。初次注册在下方 handleDeterminingFilename
+  // 定义处完成（保留 MV3 冷启动唤醒可靠性 + 现有冷启动预防拦截逻辑），
+  // 这里只声明状态位与切换函数，供 warmup / storage.onChanged 回调调用。
+  let _determiningFilenameListenerActive = false;
+  function setDeterminingFilenameListenerActive(active: boolean) {
+    if (!browser.downloads.onDeterminingFilename) return;
+    if (active === _determiningFilenameListenerActive) return;
+    if (active) {
+      browser.downloads.onDeterminingFilename.addListener(
+        handleDeterminingFilename,
+      );
+    } else {
+      browser.downloads.onDeterminingFilename.removeListener(
+        handleDeterminingFilename,
+      );
+    }
+    _determiningFilenameListenerActive = active;
+  }
 
   // ===== 同类产品核心策略：隐藏浏览器下载 UI =====
   // IDM / Motrix / FDM 等下载管理器均通过此 API 全局禁用浏览器下载栏，
@@ -194,6 +242,7 @@ export default defineBackground(() => {
       updateIcon(s.enabled);
       // 同类产品（IDM/Motrix/FDM）共同使用的策略：启动时立即隐藏下载 UI
       syncDownloadShelfState(s.enabled);
+      setDeterminingFilenameListenerActive(s.enabled);
       console.log("[FluxDown] Settings cache warmed up");
     })
     .catch((e) => {
@@ -216,16 +265,142 @@ export default defineBackground(() => {
   initTabLifecycleListeners();
 
   // ===== DASH manifest tab 级存储（权威清晰度 + 轨道 URL，仿 resource-store）=====
-  // 每 tab 只保留最新一份：manifest 是页面当前播放内容的完整清晰度列表，
-  // 旧的一份在新 manifest 到达后已无参考价值（不同分片会话失效）。
-  const tabDashManifests = new Map<number, DashManifest>();
+  // 同一页面可能同时存在多个播放器/播放会话，按规范化后的 manifest URL 保留
+  // 一个有界集合，由 UI 再投影为多个视频候选。
+  const tabDashManifests = new Map<number, Map<string, DashManifest>>();
+  const MAX_DASH_MANIFESTS_PER_TAB = 8;
+  const tabPageUrls = new Map<number, string>();
+  const tabResourceVersions = new Map<number, number>();
+  const tabManifestVersions = new Map<number, number>();
+  const tabCandidateCache = new Map<number, {
+    resourceVersion: number;
+    manifestVersion: number;
+    candidates: ReturnType<typeof buildMediaCandidates>;
+  }>();
+
+  function bumpTabVersion(versions: Map<number, number>, tabId: number): void {
+    versions.set(tabId, (versions.get(tabId) || 0) + 1);
+    tabCandidateCache.delete(tabId);
+  }
+
+  function clearTabProjection(tabId: number): void {
+    tabDashManifests.delete(tabId);
+    clearResourcesForTab(tabId);
+    bumpTabVersion(tabResourceVersions, tabId);
+    bumpTabVersion(tabManifestVersions, tabId);
+  }
+
+  /**
+   * origin+pathname+search（忽略 hash）。Chrome 的 `tabs.onUpdated` 对
+   * fragment 导航（`#comment-123`）和 `history.pushState`/`replaceState`
+   * 都会发出带 `changeInfo.url`、不带 `status` 的事件；同页面播放器点锚点/
+   * 用 replaceState 写回状态时 hash 常变而内容不变，若按原始 URL 整串比较
+   * 会把已嗅探到的分片/清单/认证上下文误判为"换页"而整体清空。
+   */
+  function pageUrlKey(url: string): string {
+    try {
+      const u = new URL(url);
+      return `${u.origin}${u.pathname}${u.search}`;
+    } catch {
+      return url;
+    }
+  }
+
+  /** Also catches history.pushState navigations reported by content scripts. */
+  function syncTabPageUrl(tabId: number, pageUrl: string): void {
+    if (!pageUrl) return;
+    const previous = tabPageUrls.get(tabId);
+    if (previous && pageUrlKey(previous) !== pageUrlKey(pageUrl)) clearTabProjection(tabId);
+    tabPageUrls.set(tabId, pageUrl);
+  }
+
+  function tabCandidates(tabId: number): ReturnType<typeof buildMediaCandidates> {
+    const resourceVersion = tabResourceVersions.get(tabId) || 0;
+    const manifestVersion = tabManifestVersions.get(tabId) || 0;
+    const cached = tabCandidateCache.get(tabId);
+    if (
+      cached &&
+      cached.resourceVersion === resourceVersion &&
+      cached.manifestVersion === manifestVersion
+    ) {
+      return cached.candidates;
+    }
+    const resources = getResourcesForTab(tabId);
+    const stored = tabDashManifests.get(tabId);
+    const manifests = stored
+      ? Array.from(stored.entries()).map(([url, manifest]) => ({ url, manifest }))
+      : [];
+    const candidates = buildMediaCandidates(resources, {
+      fallbackTitle: "Video",
+      pageUrl: resources.find((resource) => resource.pageUrl)?.pageUrl,
+      manifests,
+    });
+    tabCandidateCache.set(tabId, { resourceVersion, manifestVersion, candidates });
+    return candidates;
+  }
+
+  /**
+   * 计算资源面板实际展示的行数：媒体按候选/清晰度聚合，已被候选代表的
+   * 原始视频、音频和分片不重复计数；非媒体资源各占一行。
+   */
+  function displayedResourceCount(tabId: number): number {
+    const resources = getResourcesForTab(tabId);
+    const candidates = tabCandidates(tabId);
+    const representedIds = new Set(
+      candidates.flatMap((candidate) => candidate.rawResourceIds),
+    );
+    const rawCount = resources.filter(
+      (resource) =>
+        resource.type !== "video" &&
+        resource.type !== "stream" &&
+        !representedIds.has(resource.id),
+    ).length;
+    return countMediaCandidateRows(candidates) + rawCount;
+  }
+
+  const pendingBadgeUpdates = new Map<number, {
+    timer: ReturnType<typeof setTimeout>;
+    waiters: Array<() => void>;
+  }>();
+
+  function updateDisplayedBadgeForTab(tabId: number): Promise<void> {
+    return new Promise((resolve) => {
+      const pending = pendingBadgeUpdates.get(tabId);
+      if (pending) {
+        pending.waiters.push(resolve);
+        return;
+      }
+      const timer = setTimeout(() => {
+        const current = pendingBadgeUpdates.get(tabId);
+        pendingBadgeUpdates.delete(tabId);
+        try {
+          void updateBadgeForTab(tabId, displayedResourceCount(tabId)).catch((error) => {
+            console.warn("[FluxDown] failed to update displayed badge:", error);
+          });
+        } catch (error) {
+          console.warn("[FluxDown] failed to compute displayed badge count:", error);
+        }
+        for (const waiter of current?.waiters || [resolve]) waiter();
+      }, 50);
+      pendingBadgeUpdates.set(tabId, { timer, waiters: [resolve] });
+    });
+  }
+
   browser.tabs.onRemoved.addListener((tabId) => {
     tabDashManifests.delete(tabId);
+    tabPageUrls.delete(tabId);
+    tabResourceVersions.delete(tabId);
+    tabManifestVersions.delete(tabId);
+    tabCandidateCache.delete(tabId);
+    const pending = pendingBadgeUpdates.get(tabId);
+    if (pending) {
+      clearTimeout(pending.timer);
+      pendingBadgeUpdates.delete(tabId);
+      for (const resolve of pending.waiters) resolve();
+    }
   });
   browser.tabs.onUpdated.addListener((tabId, changeInfo) => {
-    if (changeInfo.status === "loading" && changeInfo.url) {
-      tabDashManifests.delete(tabId);
-    }
+    if (changeInfo.url) syncTabPageUrl(tabId, changeInfo.url);
   });
 
   // ===== 右键菜单：即使关闭自动拦截也可以手动发送链接到 FluxDown 下载 =====
@@ -267,6 +442,11 @@ export default defineBackground(() => {
           title: t("contextMenu.sendPageToFluxDown"),
           contexts: ["page"],
         });
+        browser.contextMenus.create({
+          id: "fluxdown-send-selection",
+          title: t("contextMenu.sendSelectionToFluxDown"),
+          contexts: ["selection"],
+        });
         console.log("[FluxDown] Context menus created");
       })
       .catch((e: unknown) => {
@@ -291,17 +471,73 @@ export default defineBackground(() => {
           case "fluxdown-send-page":
             downloadUrl = info.pageUrl;
             break;
+          case "fluxdown-send-selection": {
+            // #348 修复：选中的磁力/ed2k/http(s) 纯文本链接右键发送到 FluxDown。
+            const selectionUrl = extractSelectionDownloadUrl(info.selectionText);
+            if (!selectionUrl) {
+              notify(
+                t("notify.selectionInvalidTitle"),
+                t("notify.selectionInvalidDetail"),
+              );
+              return;
+            }
+            console.log(
+              "[FluxDown] Context menu download (selection):",
+              selectionUrl,
+            );
+            const selectionReferrer = tab?.url || info.pageUrl || "";
+            const selectionSendOk = await sendToFluxDown(
+              selectionUrl,
+              selectionReferrer,
+            );
+            if (!selectionSendOk) {
+              // magnet:/ed2k: 无法回退浏览器原生下载（浏览器不识别这些协议），
+              // 只提示失败；http(s) 纯文本链接可正常回退。
+              if (/^https?:/i.test(selectionUrl)) {
+                await fallbackAfterSendFailure(selectionUrl);
+              } else {
+                notify(t("notify.sendFailed"), selectionUrl);
+              }
+            }
+            return;
+          }
           default:
             return; // 非 FluxDown 菜单项，忽略
         }
 
-        if (!downloadUrl) return;
+        if (!downloadUrl) {
+          // #407 修复：视频/音频右键项常见 blob:/MSE 源（无 srcUrl），点击后
+          // 之前静默无反应；显式提示改走资源嗅探面板。
+          if (info.menuItemId === "fluxdown-send-video") {
+            notify(
+              t("notify.videoSourceUnavailableTitle"),
+              t("notify.videoSourceUnavailableDetail"),
+            );
+          }
+          return;
+        }
 
         // 过滤非 HTTP(S)/FTP 协议（javascript: / mailto: / data: 等不可下载）
         try {
           const protocol = new URL(downloadUrl).protocol;
-          if (!["http:", "https:", "ftp:"].includes(protocol)) return;
+          if (!["http:", "https:", "ftp:"].includes(protocol)) {
+            // #407 修复：视频/音频常见 blob:/MSE 源，协议过滤在此挡下，
+            // 之前静默无反应；显式提示改走资源嗅探面板。
+            if (info.menuItemId === "fluxdown-send-video") {
+              notify(
+                t("notify.videoSourceUnavailableTitle"),
+                t("notify.videoSourceUnavailableDetail"),
+              );
+            }
+            return;
+          }
         } catch {
+          if (info.menuItemId === "fluxdown-send-video") {
+            notify(
+              t("notify.videoSourceUnavailableTitle"),
+              t("notify.videoSourceUnavailableDetail"),
+            );
+          }
           return;
         }
 
@@ -714,7 +950,8 @@ export default defineBackground(() => {
             mainHeaders,
           );
           if (added > 0) {
-            updateBadgeForTab(details.tabId);
+            bumpTabVersion(tabResourceVersions, details.tabId);
+            updateDisplayedBadgeForTab(details.tabId);
             notifyContentScript(details.tabId);
           }
         }
@@ -807,7 +1044,8 @@ export default defineBackground(() => {
 
         if (added > 0) {
           // 更新 Badge
-          updateBadgeForTab(details.tabId);
+          bumpTabVersion(tabResourceVersions, details.tabId);
+          updateDisplayedBadgeForTab(details.tabId);
           // 推送给 Content Script UI
           notifyContentScript(details.tabId);
         }
@@ -844,12 +1082,16 @@ export default defineBackground(() => {
    * 向指定 tab 的 Content Script 推送最新 DASH manifest（权威清晰度 + 轨道 URL）
    */
   async function notifyDashManifest(tabId: number): Promise<void> {
-    const manifest = tabDashManifests.get(tabId);
-    if (!manifest) return;
+    const stored = tabDashManifests.get(tabId);
+    const dashManifests = stored
+      ? Array.from(stored.entries()).map(([url, manifest]) => ({ url, manifest }))
+      : [];
     try {
       await browser.tabs.sendMessage(tabId, {
         action: "dashManifestUpdated",
-        manifest,
+        // `manifest` 保留给旧版 content script；新 UI 使用有界数组。
+        manifest: dashManifests[dashManifests.length - 1]?.manifest,
+        dashManifests,
       });
     } catch {
       // Content script 可能还未注入
@@ -1046,11 +1288,14 @@ export default defineBackground(() => {
 
       const dispositionFilename =
         parseContentDispositionFilename(contentDisposition);
+      const referrer: string | undefined =
+        details.originUrl || details.documentUrl || undefined;
       const itemInfo: DownloadItemInfo = {
         url: details.url,
         fileSize: contentLength > 0 ? contentLength : -1,
         mime: contentType || undefined,
         filename: dispositionFilename || undefined,
+        referrerUrl: referrer,
       };
       if (!shouldIntercept(itemInfo, settings)) return undefined;
 
@@ -1063,10 +1308,6 @@ export default defineBackground(() => {
       });
 
       const cleanFilename = extractCleanFilename(itemInfo.filename, details.url);
-      const referrer =
-        (details as { originUrl?: string }).originUrl ||
-        (details as { documentUrl?: string }).documentUrl ||
-        undefined;
       // fire-and-forget：blocking 回调必须尽快返回；发送失败时回退浏览器下载
       sendToFluxDown(
         details.url,
@@ -1331,6 +1572,7 @@ export default defineBackground(() => {
       fileSize: rc.contentLength > 0 ? rc.contentLength : -1,
       mime: rc.contentType || undefined,
       filename: rc.dispositionFilename || originalItem.filename || undefined,
+      referrerUrl: originalItem.referrer || undefined,
     };
 
     const intercept = shouldIntercept(itemInfo, settings);
@@ -1399,6 +1641,7 @@ export default defineBackground(() => {
       fileSize,
       mime,
       filename,
+      referrerUrl: freshItem.referrer || originalItem.referrer || undefined,
     };
 
     if (hasActiveBypass(url)) return;
@@ -1485,507 +1728,260 @@ export default defineBackground(() => {
   // 在浏览器弹出「另存为」对话框之前触发，
   // suggest() 释放文件名管线 + downloads.cancel() 取消下载，不弹出任何浏览器下载 UI。
   // Firefox 不支持此 API，完全依赖第三层兜底拦截
-  if (browser.downloads.onDeterminingFilename)
-    browser.downloads.onDeterminingFilename.addListener(
-      (downloadItem, suggest) => {
-        const url = downloadItem.url;
-        // 使用 finalUrl（重定向后的真实 URL）作为下载 URL。
-        // 蓝奏云等 CDN 对浏览器 302 重定向到真实文件 URL，但对非浏览器客户端返回 HTML。
-        // 使用 finalUrl 让 Rust 下载器请求重定向后的真实 URL，绕过 CDN 反爬。
-        const downloadUrl = (downloadItem as any).finalUrl || url;
+  // #527/#609/#199/#293 修复：
+  // 1) 拦截关闭（或未启用）时必须真正 removeListener 把该事件让给其他扩展
+  //    （脚本猫/PDM/IDM 等）——仅在回调里 suggest() 放行不够，Chrome 只要
+  //    本扩展仍注册着 listener 就视为参与"确定文件名"的竞争，见上方
+  //    setDeterminingFilenameListenerActive()（由 warmup / storage.onChanged 驱动）。
+  // 2) 所有"放行"分支一律改为不带参数的 suggest()，不再重复回填
+  //    { filename: downloadItem.filename }——哪怕值与浏览器当前默认值一致，
+  //    显式传参也会被 Chrome 视为本扩展"确定了文件名"，与其他扩展的建议冲突
+  //    （典型现象：脚本猫报"另一扩展已确定其他文件名"，PDM/IDM 自定义文件名丢失）。
+  type DeterminingFilenameListener = Parameters<
+    NonNullable<typeof browser.downloads.onDeterminingFilename>["addListener"]
+  >[0];
+  const handleDeterminingFilename: DeterminingFilenameListener = (
+    downloadItem,
+    suggest,
+  ) => {
+    const url = downloadItem.url;
+    // finalUrl covers every ordinary href redirected through an API/CDN, not just
+    // a site-specific preempted URL.
+    const downloadUrl = (downloadItem as any).finalUrl || url;
+    let filenameResolved = false;
 
-        // 跳过 blob 和 data URL（filename 为空时传 undefined，避免 Chrome 抛出非空校验错误）
-        if (url.startsWith("blob:") || url.startsWith("data:")) {
-          suggest(
-            downloadItem.filename
-              ? { filename: downloadItem.filename }
-              : (undefined as any),
-          );
-          return;
-        }
+    const resolveFilename = () => {
+      if (filenameResolved) return;
+      filenameResolved = true;
+      suggest();
+    };
+    const releaseToBrowser = () => {
+      handledDownloads.delete(downloadItem.id);
+      resolveFilename();
+    };
+    const cancelBeforeResolvingFilename = () =>
+      cancelBeforeFilenameResolution(
+        downloadItem.id,
+        (id) => browser.downloads.cancel(id),
+        (query) => browser.downloads.erase(query),
+        resolveFilename,
+      );
+    const collectItemInfo = (): {
+      itemInfo: DownloadItemInfo;
+      referrer: string | undefined;
+    } => {
+      const cached = downloadItemCache.get(downloadItem.id);
+      const mime = downloadItem.mime || cached?.mime || undefined;
+      const fileSize =
+        (downloadItem.fileSize > 0 ? downloadItem.fileSize : undefined) ??
+        (cached && cached.fileSize > 0 ? cached.fileSize : undefined) ??
+        -1;
+      const filename = downloadItem.filename || cached?.filename || undefined;
+      const referrer = cached?.referrer || undefined;
+      return {
+        itemInfo: { url, fileSize, mime, filename, referrerUrl: referrer },
+        referrer,
+      };
+    };
 
-        // 如果已被兜底层处理，直接取消（不重复发送）
-        if (handledDownloads.get(downloadItem.id) === "fallback") {
-          console.log(
-            "[FluxDown] onDeterminingFilename: already handled by fallback, cancelling:",
+    const interceptAfterCancellation = async (
+      itemInfo: DownloadItemInfo,
+      referrer: string | undefined,
+    ) => {
+      let cancellationSucceeded = false;
+      let cleanFilename: string | undefined;
+      try {
+        // Chrome only settles downloads.cancel after this listener advances. The
+        // helper requests cancel first, then releases suggest immediately.
+        cancellationSucceeded = await cancelBeforeResolvingFilename();
+        if (!cancellationSucceeded) {
+          // Browser cancellation did not happen: retain its native download and
+          // do not also create a FluxDown capture window.
+          console.debug(
+            "[FluxDown] onDeterminingFilename: cancellation did not complete; leaving browser download intact:",
             downloadItem.id,
           );
-          // Chrome API 的 suggest() 不支持 cancel 属性，
-          // 无参数调用释放文件名决策管线，再通过 downloads.cancel() 取消下载
-          suggest();
-          browser.downloads.cancel(downloadItem.id).catch(() => {});
-          browser.downloads.erase({ id: downloadItem.id }).catch(() => {});
           return;
         }
 
-        // 预抢占 URL 检查：该 URL 已由 AJAX 拦截器检测为蓝奏云等中转页 URL。
-        // 中转页 URL 可能 302 重定向到真实文件 URL。如果 finalUrl 与原始 URL 不同，
-        // 说明重定向已发生，使用 finalUrl 正常拦截。如果相同，放行让浏览器处理。
-        const preemptEntry = preemptedUrls.get(url);
-        if (preemptEntry && preemptEntry.expiry > Date.now()) {
-          if (downloadUrl === url) {
-            // 未发生重定向 — 放行让浏览器继续下载（CDN 中转页或直传）
-            console.log(
-              "[FluxDown] onDeterminingFilename: preempted URL, no redirect detected, letting browser handle:",
-              url,
-            );
-            handledDownloads.delete(downloadItem.id);
-            suggest(
-              downloadItem.filename
-                ? { filename: downloadItem.filename }
-                : (undefined as any),
-            );
-            return;
-          }
-          // 发生重定向 — finalUrl 是真实文件 URL，继续走正常拦截流程
-          console.log(
-            "[FluxDown] onDeterminingFilename: preempted URL redirected, intercepting finalUrl:",
-            downloadUrl,
-          );
-        }
-
-        // P0 关键修复：立即预标记为 'primary-pending'，
-        // 阻止第三层（onCreated 兜底计时器）在我们异步处理期间竞态抢先执行。
-        // 若最终判断不需拦截，在放行时删除此标记。
-        handledDownloads.set(downloadItem.id, "primary");
-
-        // ===== 同步快速路径（修复 Linux 下载栏闪现问题） =====
-        // Linux Chrome 在 onCreated 触发时（即 suggest() 异步等待期间）就立即显示下载栏。
-        // 若设置缓存已热身，可同步调用 suggest() 释放管线，
-        // 在 onCreated 触发前完成，从而彻底避免下载栏出现。
-        // 注：同步调用 suggest 后无需 return true，Chrome 不会再等待异步 suggest。
-        const _syncSettings = _settingsCache;
-        if (_syncSettings !== null) {
-          if (hasActiveBypass(url)) {
-            handledDownloads.delete(downloadItem.id);
-            suggest(
-              downloadItem.filename
-                ? { filename: downloadItem.filename }
-                : (undefined as any),
-            );
-            downloadItemCache.delete(downloadItem.id);
-            return;
-          }
-          if (!_syncSettings.enabled) {
-            handledDownloads.delete(downloadItem.id);
-            suggest(
-              downloadItem.filename
-                ? { filename: downloadItem.filename }
-                : (undefined as any),
-            );
-            downloadItemCache.delete(downloadItem.id);
-            return;
-          }
-          // App 熔断期内：直接放行给浏览器原生下载，跳过拦截，避免弹窗风暴。
-          if (isAppKnownDown()) {
-            handledDownloads.delete(downloadItem.id);
-            suggest(
-              downloadItem.filename
-                ? { filename: downloadItem.filename }
-                : (undefined as any),
-            );
-            downloadItemCache.delete(downloadItem.id);
-            return;
-          }
-          const _syncCached = downloadItemCache.get(downloadItem.id);
-          const _syncMime = downloadItem.mime || _syncCached?.mime || undefined;
-          const _syncFileSize =
-            (downloadItem.fileSize > 0 ? downloadItem.fileSize : undefined) ??
-            (_syncCached && _syncCached.fileSize > 0
-              ? _syncCached.fileSize
-              : undefined) ??
-            -1;
-          const _syncFilename =
-            downloadItem.filename || _syncCached?.filename || undefined;
-          const _syncReferrer = _syncCached?.referrer || undefined;
-          const _syncItemInfo: DownloadItemInfo = {
-            url,
-            fileSize: _syncFileSize,
-            mime: _syncMime,
-            filename: _syncFilename,
-          };
-          if (shouldIntercept(_syncItemInfo, _syncSettings)) {
-            // 同步释放文件名决策管线——在 onCreated 触发前完成，Linux 不会显示下载栏
-            // Chrome API 的 suggest() 不支持 cancel 属性，
-            // 无参数调用释放管线，再通过 downloads.cancel() 实际取消下载
-            suggest();
-            console.log("[FluxDown] Intercepting download (sync-path):", {
-              url,
-              downloadUrl,
-              mime: _syncMime,
-              filename: _syncFilename,
-              fileSize: _syncFileSize,
-              mode: _syncSettings.interceptMode,
-            });
-            (async () => {
-              try {
-                try {
-                  await browser.downloads.cancel(downloadItem.id);
-                } catch {
-                  console.debug(
-                    "[FluxDown] sync-path: cancel after suggest (expected)",
-                  );
-                }
-                try {
-                  await browser.downloads.erase({ id: downloadItem.id });
-                } catch {
-                  console.debug(
-                    "[FluxDown] sync-path: erase after cancel (expected)",
-                  );
-                }
-                // 优先使用 responseDownloadCache 中的 Content-Disposition 文件名
-                // 同时检查 url 和 downloadUrl（重定向场景下两者不同）
-                const _syncDisposition =
-                  responseDownloadCache.get(downloadUrl)?.dispositionFilename ||
-                  responseDownloadCache.get(url)?.dispositionFilename ||
-                  "";
-                const _syncClean =
-                  _syncDisposition ||
-                  extractCleanFilename(_syncFilename, downloadUrl);
-                const sendOk = await sendToFluxDown(
-                  downloadUrl,
-                  _syncReferrer,
-                  _syncClean,
-                  _syncFileSize,
-                  _syncMime,
-                  // 重定向场景：传入原始 URL，让 sendToFluxDown 可回退查找 headers 缓存
-                  downloadUrl !== url ? url : undefined,
-                );
-                if (!sendOk) {
-                  // 发送失败，先 ping 确认 App 是否在线再决定是否回退
-                  await fallbackAfterSendFailure(downloadUrl, _syncClean);
-                }
-              } catch (e) {
-                console.error("[FluxDown] sync-path: sendToFluxDown error:", e);
-                // 异常情况：先 ping 确认 App 是否在线再决定是否回退
-                await fallbackAfterSendFailure(downloadUrl).catch(() => {});
-              } finally {
-                downloadItemCache.delete(downloadItem.id);
-              }
-            })();
-            return; // 同步 suggest 已调用，无需 return true
-          }
-          // shouldIntercept=false：若已有足够信息可以确定，同步放行
-          if (_syncMime || _syncFilename) {
-            handledDownloads.delete(downloadItem.id);
-            suggest(
-              downloadItem.filename
-                ? { filename: downloadItem.filename }
-                : (undefined as any),
-            );
-            downloadItemCache.delete(downloadItem.id);
-            return;
-          }
-          // mime 和 filename 均为空（极少见）→ 降级到下方异步路径
-        }
-
-        // ===== 冷启动预防拦截（同类产品 IDM/Motrix/FDM 调研后的最优策略） =====
-        // 当 MV3 Service Worker 刚被唤醒、settings 缓存尚未热身时（_syncSettings === null），
-        // 默认按"拦截"处理：先同步 suggest() 释放文件名管线阻止浏览器弹出任何下载 UI，
-        // 然后异步加载设置判断是否真正需要拦截。
-        // 核心原则：宁可误拦截后通过 fallbackToBrowserDownload 回退（用户无感），
-        //           也不要让浏览器下载 UI 闪现（用户可见且体验差）。
-        if (_syncSettings === null) {
-          // 同步释放文件名决策管线 — 在 onCreated 触发前完成，
-          // 彻底阻止下载栏和另存为对话框的出现
-          suggest();
-          console.log(
-            "[FluxDown] Cold-start pre-emptive intercept (settings cache not warmed):",
-            { url, downloadUrl },
-          );
-          (async () => {
-            try {
-              // 立即取消浏览器下载
-              try {
-                await browser.downloads.cancel(downloadItem.id);
-              } catch {
-                console.debug("[FluxDown] cold-start: cancel (expected)");
-              }
-              try {
-                await browser.downloads.erase({ id: downloadItem.id });
-              } catch {
-                console.debug("[FluxDown] cold-start: erase (expected)");
-              }
-
-              // 加载设置（这会同时预热缓存，后续下载走同步快速路径）
-              const settings = await getCachedSettings();
-
-              // 检查 bypass 令牌（基于时间，不消费）
-              if (hasActiveBypass(url)) {
-                handledDownloads.delete(downloadItem.id);
-                await fallbackToBrowserDownload(
-                  downloadUrl,
-                  undefined,
-                  true,
-                ).catch(() => {});
-                return;
-              }
-
-              // 拦截未启用 → 回退让浏览器重新下载
-              if (!settings.enabled) {
-                handledDownloads.delete(downloadItem.id);
-                await fallbackToBrowserDownload(
-                  downloadUrl,
-                  undefined,
-                  true,
-                ).catch(() => {});
-                return;
-              }
-
-              // App 熔断期内 → 静默回退浏览器下载，不再尝试发送，避免弹窗风暴。
-              if (isAppKnownDown()) {
-                handledDownloads.delete(downloadItem.id);
-                await fallbackToBrowserDownload(
-                  downloadUrl,
-                  undefined,
-                  true,
-                ).catch(() => {});
-                return;
-              }
-
-              // 收集元数据做拦截判断
-              const cached = downloadItemCache.get(downloadItem.id);
-              const mime = downloadItem.mime || cached?.mime || undefined;
-              const fileSize =
-                (downloadItem.fileSize > 0
-                  ? downloadItem.fileSize
-                  : undefined) ??
-                (cached && cached.fileSize > 0
-                  ? cached.fileSize
-                  : undefined) ??
-                -1;
-              const filename =
-                downloadItem.filename || cached?.filename || undefined;
-              const referrer = cached?.referrer || undefined;
-              const itemInfo: DownloadItemInfo = {
-                url,
-                fileSize,
-                mime,
-                filename,
-              };
-
-              if (!shouldIntercept(itemInfo, settings)) {
-                // 不应拦截 → 回退让浏览器重新下载（用户无感，静默不弹通知）
-                handledDownloads.delete(downloadItem.id);
-                await fallbackToBrowserDownload(
-                  downloadUrl,
-                  extractCleanFilename(filename, downloadUrl),
-                  true,
-                ).catch(() => {});
-                return;
-              }
-
-              // 应该拦截 → 发送给 FluxDown
-              const dispositionFilename =
-                responseDownloadCache.get(downloadUrl)?.dispositionFilename ||
-                responseDownloadCache.get(url)?.dispositionFilename ||
-                "";
-              const cleanFilename =
-                dispositionFilename ||
-                extractCleanFilename(filename, downloadUrl);
-              const sendOk = await sendToFluxDown(
-                downloadUrl,
-                referrer,
-                cleanFilename,
-                fileSize,
-                mime,
-                downloadUrl !== url ? url : undefined,
-              );
-              if (!sendOk) {
-                // 发送失败 — 清除 primary 标记，先 ping 确认 App 是否在线再决定是否回退
-                handledDownloads.delete(downloadItem.id);
-                await fallbackAfterSendFailure(
-                  downloadUrl,
-                  cleanFilename,
-                ).catch(() => {});
-              }
-            } catch (e) {
+        const dispositionFilename =
+          responseDownloadCache.get(downloadUrl)?.dispositionFilename ||
+          responseDownloadCache.get(url)?.dispositionFilename ||
+          "";
+        cleanFilename =
+          dispositionFilename ||
+          extractCleanFilename(itemInfo.filename, downloadUrl);
+        const sendOk = await sendToFluxDown(
+          downloadUrl,
+          referrer,
+          cleanFilename,
+          itemInfo.fileSize,
+          itemInfo.mime,
+          // finalUrl is the engine target; original url remains a cache fallback
+          // for request headers and captured form transactions.
+          downloadUrl !== url ? url : undefined,
+        );
+        if (!sendOk) {
+          handledDownloads.delete(downloadItem.id);
+          await fallbackAfterSendFailure(downloadUrl, cleanFilename).catch(
+            (error) =>
               console.error(
-                "[FluxDown] Cold-start pre-emptive intercept error:",
-                e,
-              );
-              handledDownloads.delete(downloadItem.id);
-              // 异常情况：先 ping 确认 App 是否在线再决定是否回退
-              await fallbackAfterSendFailure(downloadUrl).catch(() => {});
-            } finally {
-              downloadItemCache.delete(downloadItem.id);
-            }
-          })();
-          return; // 同步 suggest 已调用，无需 return true
+                "[FluxDown] failed to restore browser download after send failure:",
+                error,
+              ),
+          );
+        }
+      } catch (error) {
+        console.error(
+          "[FluxDown] onDeterminingFilename interception failed:",
+          error,
+        );
+        if (cancellationSucceeded) {
+          handledDownloads.delete(downloadItem.id);
+          await fallbackAfterSendFailure(downloadUrl, cleanFilename).catch(
+            (fallbackError) =>
+              console.error(
+                "[FluxDown] failed to restore browser download after interception error:",
+                fallbackError,
+              ),
+          );
+        } else if (!filenameResolved) {
+          releaseToBrowser();
+        }
+      }
+    };
+
+    const resolveWithLoadedSettings = async () => {
+      try {
+        const settings = await getCachedSettings();
+        if (!settings.enabled || hasActiveBypass(url) || isAppKnownDown()) {
+          releaseToBrowser();
+          return;
         }
 
-        // 异步判断（metadata 暂缺时的兜底路径 — 缓存已热但 mime/filename 均为空的极少见情况）
-        (async () => {
-          // Bug 2+5 修复：用 suggestCalled 保证 suggest 全局只调用一次。
-          // catch 块 + 正常路径都可能调用 suggest，两次调用会导致浏览器行为异常。
-          let suggestCalled = false;
-          // Bug R4-2 修复：追踪下载是否已被取消（suggest + cancel 已调用），
-          // 防止 sendToFluxDown 失败时 catch 块误删 handledDownloads 标记导致重复发送。
-          let downloadCancelled = false;
-          // Chrome API 的 suggest() 不支持 cancel 属性（FilenameSuggestion 只有 filename 和 conflictAction）。
-          // 正确的取消方式：suggest() 无参数释放管线 + downloads.cancel() 实际取消。
-          // 放行时：传入有效 filename 或 undefined（让浏览器使用默认文件名）。
-          const callSuggest = (
-            arg?: chrome.downloads.DownloadFilenameSuggestion,
-          ) => {
-            if (suggestCalled) return;
-            suggestCalled = true;
-            suggest(arg as any);
-          };
-          const callSuggestCancel = async () => {
-            downloadCancelled = true;
-            callSuggest(); // 无参数释放文件名决策管线
-            try {
-              await browser.downloads.cancel(downloadItem.id);
-            } catch {
-              console.debug(
-                "[FluxDown] async-path: cancel after suggest (expected)",
-              );
-            }
-            try {
-              await browser.downloads.erase({ id: downloadItem.id });
-            } catch {
-              console.debug(
-                "[FluxDown] async-path: erase after cancel (expected)",
-              );
-            }
-          };
+        const { itemInfo, referrer } = collectItemInfo();
+        if (!shouldIntercept(itemInfo, settings)) {
+          releaseToBrowser();
+          return;
+        }
 
-          try {
-            // 再次检查兜底状态（极少数情况：兜底层在预标记之前已完成）
-            if (handledDownloads.get(downloadItem.id) === "fallback") {
-              await callSuggestCancel();
-              return;
-            }
+        console.log("[FluxDown] Intercepting download (onDeterminingFilename):", {
+          url,
+          downloadUrl,
+          mime: itemInfo.mime,
+          filename: itemInfo.filename,
+          fileSize: itemInfo.fileSize,
+          mode: settings.interceptMode,
+        });
+        await interceptAfterCancellation(itemInfo, referrer);
+      } catch (error) {
+        console.error(
+          "[FluxDown] failed while resolving interception settings:",
+          error,
+        );
+        if (!filenameResolved) releaseToBrowser();
+      } finally {
+        downloadItemCache.delete(downloadItem.id);
+      }
+    };
 
-            // P3：使用内存缓存，避免每次拦截都 await storage.sync.get
-            const settings = await getCachedSettings();
-            if (!settings.enabled) {
-              // 不拦截，删除预标记，放行
-              handledDownloads.delete(downloadItem.id);
-              callSuggest(
-                downloadItem.filename
-                  ? { filename: downloadItem.filename }
-                  : undefined,
-              );
-              return;
-            }
+    // FluxDown cannot replay blob/data sources; do not compete with other
+    // download extensions for their filename decision.
+    if (url.startsWith("blob:") || url.startsWith("data:")) {
+      resolveFilename();
+      return;
+    }
 
-            // 检查 Alt+Click 绕过令牌（基于时间，不消费）
-            if (hasActiveBypass(url)) {
-              // Bug R2-1 修复：删除预标记，让浏览器正常下载
-              handledDownloads.delete(downloadItem.id);
-              callSuggest(
-                downloadItem.filename
-                  ? { filename: downloadItem.filename }
-                  : undefined,
-              );
-              return;
-            }
+    // The onCreated fallback already owns this item. Cancel first here as well,
+    // otherwise suggest could launch Save As while that capture is in flight.
+    if (handledDownloads.get(downloadItem.id) === "fallback") {
+      console.log(
+        "[FluxDown] onDeterminingFilename: already handled by fallback, cancelling:",
+        downloadItem.id,
+      );
+      void cancelBeforeResolvingFilename().then((cancelled) => {
+        if (!cancelled) {
+          console.debug(
+            "[FluxDown] fallback download had already ended before filename cancellation:",
+            downloadItem.id,
+          );
+        }
+      });
+      return true;
+    }
 
-            // App 熔断期内：删除预标记，放行给浏览器原生下载，跳过拦截。
-            if (isAppKnownDown()) {
-              handledDownloads.delete(downloadItem.id);
-              callSuggest(
-                downloadItem.filename
-                  ? { filename: downloadItem.filename }
-                  : undefined,
-              );
-              return;
-            }
+    // One-time transit URLs must first execute their page script. Direct URLs and
+    // all ordinary redirects take the generic cancellation path below.
+    const preemptEntry = preemptedUrls.get(url);
+    if (preemptEntry && preemptEntry.expiry > Date.now()) {
+      if (downloadUrl === url) {
+        console.log(
+          "[FluxDown] onDeterminingFilename: preempted URL has not redirected; letting browser handle:",
+          url,
+        );
+        resolveFilename();
+        return;
+      }
+      console.log(
+        "[FluxDown] onDeterminingFilename: preempted URL redirected, intercepting finalUrl:",
+        downloadUrl,
+      );
+    }
 
-            // 合并 onCreated 缓存的额外信息
-            const cached = downloadItemCache.get(downloadItem.id);
-            const mime = downloadItem.mime || cached?.mime || undefined;
-            const fileSize =
-              (downloadItem.fileSize > 0 ? downloadItem.fileSize : undefined) ??
-              (cached && cached.fileSize > 0 ? cached.fileSize : undefined) ??
-              -1;
-            const referrer = cached?.referrer || undefined;
+    // Claim before any await so onCreated cannot send a second capture while
+    // Chrome waits for the filename decision.
+    handledDownloads.set(downloadItem.id, "primary");
 
-            const itemInfo: DownloadItemInfo = {
-              url,
-              fileSize,
-              mime,
-              filename: downloadItem.filename || undefined,
-            };
+    const cachedSettings = _settingsCache;
+    if (cachedSettings !== null) {
+      if (
+        !cachedSettings.enabled ||
+        hasActiveBypass(url) ||
+        isAppKnownDown()
+      ) {
+        releaseToBrowser();
+        downloadItemCache.delete(downloadItem.id);
+        return;
+      }
 
-            if (!shouldIntercept(itemInfo, settings)) {
-              // 不拦截，删除预标记，放行
-              handledDownloads.delete(downloadItem.id);
-              callSuggest(
-                downloadItem.filename
-                  ? { filename: downloadItem.filename }
-                  : undefined,
-              );
-              return;
-            }
-
-            console.log(
-              "[FluxDown] Intercepting download (onDeterminingFilename):",
-              {
-                url,
-                downloadUrl,
-                mime,
-                filename: downloadItem.filename,
-                fileSize,
-                mode: settings.interceptMode,
-              },
-            );
-
-            // 先取消浏览器下载，再发送到 FluxDown（防止双下载）
-            // 与 sync 快速路径和 executeFallbackIntercept 保持一致策略：
-            // cancel-first 避免异步发送期间浏览器下载持续进行导致小文件已完成
-            await callSuggestCancel();
-
-            // 优先使用 responseDownloadCache 中的 Content-Disposition 文件名
-            // 同时检查 downloadUrl 和 url（重定向场景下两者不同）
-            const dispositionFilename =
-              responseDownloadCache.get(downloadUrl)?.dispositionFilename ||
-              responseDownloadCache.get(url)?.dispositionFilename ||
-              "";
-            const cleanFilename =
-              dispositionFilename ||
-              extractCleanFilename(downloadItem.filename, downloadUrl);
-            const sendOk = await sendToFluxDown(
-              downloadUrl,
-              referrer,
-              cleanFilename,
-              fileSize,
-              mime,
-              // 重定向场景：传入原始 URL，让 sendToFluxDown 可回退查找 headers 缓存
-              downloadUrl !== url ? url : undefined,
-            );
-
-            if (!sendOk) {
-              // 发送失败，先 ping 确认 App 是否在线再决定是否回退
-              handledDownloads.delete(downloadItem.id);
-              await fallbackAfterSendFailure(downloadUrl, cleanFilename);
-            }
-          } catch (e) {
-            console.error(
-              "[FluxDown] Error in onDeterminingFilename handler:",
-              e,
-            );
-            // Bug R4-2 修复：只有在下载尚未被取消（判断阶段出错）时，才清除预标记让兜底层接管。
-            // 若下载已被取消，保留 'primary' 标记，阻止兜底层重复拦截并重复发送。
-            if (!downloadCancelled) {
-              handledDownloads.delete(downloadItem.id);
-              callSuggest(
-                downloadItem.filename
-                  ? { filename: downloadItem.filename }
-                  : undefined,
-              );
-            }
-          } finally {
-            downloadItemCache.delete(downloadItem.id);
-          }
-        })();
-
-        // 返回 true 表示 suggest 将被异步调用
+      const { itemInfo, referrer } = collectItemInfo();
+      if (shouldIntercept(itemInfo, cachedSettings)) {
+        console.log("[FluxDown] Intercepting download (sync settings):", {
+          url,
+          downloadUrl,
+          mime: itemInfo.mime,
+          filename: itemInfo.filename,
+          fileSize: itemInfo.fileSize,
+          mode: cachedSettings.interceptMode,
+        });
+        void interceptAfterCancellation(itemInfo, referrer).finally(() => {
+          downloadItemCache.delete(downloadItem.id);
+        });
         return true;
-      },
+      }
+
+      // Complete metadata lets us immediately hand non-matching downloads back.
+      // Otherwise wait for the same metadata/settings path used during cold start.
+      if (itemInfo.mime || itemInfo.filename) {
+        releaseToBrowser();
+        downloadItemCache.delete(downloadItem.id);
+        return;
+      }
+    }
+
+    // Chrome may surface Save As before onCreated. Keep the filename pipeline
+    // pending for cold-start/metadata-empty decisions; it is the only path that
+    // can cancel before the chooser is scheduled.
+    void resolveWithLoadedSettings();
+    return true;
+  };
+
+  if (browser.downloads.onDeterminingFilename) {
+    browser.downloads.onDeterminingFilename.addListener(
+      handleDeterminingFilename,
     );
+    _determiningFilenameListenerActive = true;
+  }
 
   // ===== 消息处理（Popup + Content Script） =====
   //
@@ -2438,27 +2434,19 @@ export default defineBackground(() => {
     // 限制：不经过 NMH，Cookie/Headers/method/body 无法携带，适用于公开文件。
     {
       const protocolSettings = await getCachedSettings();
-      if (protocolSettings.enableFluxdownProtocol) {
-        if (audioUrl) {
-          // 音视频分轨对（video+audio mux）无法经协议 URL 表达 —— 丢弃
-          // audioUrl 会下成无声视频。返回失败让调用方回退浏览器下载。
-          console.warn(
-            "[FluxDown] protocol mode cannot carry audioUrl; falling back to browser download",
+      // fluxdown:// 只承载单 URL；音视频分轨对必须继续走 NMH/远程，
+      // 否则音频轨会被静默丢弃，最终得到无声视频。
+      if (protocolSettings.enableFluxdownProtocol && !audioUrl) {
+        const ok = await openProtocolUrl(url, filename);
+        await incrementStat(ok ? "sent" : "failed");
+        if (ok && (await shouldNotifyChannel("local"))) {
+          const shownName = filename || extractCleanFilename(url) || url;
+          notify(
+            t("notify.downloadSent"),
+            t("notify.sentToFluxDown", { name: shownName }),
           );
-          await incrementStat("failed");
-          return false;
-        } else {
-          const ok = await openProtocolUrl(url, filename);
-          await incrementStat(ok ? "sent" : "failed");
-          if (ok && (await shouldNotifyChannel("local"))) {
-            const shownName = filename || extractCleanFilename(url) || url;
-            notify(
-              t("notify.downloadSent"),
-              t("notify.sentToFluxDown", { name: shownName }),
-            );
-          }
-          return ok;
         }
+        return ok;
       }
     }
 
@@ -2542,6 +2530,18 @@ export default defineBackground(() => {
         "[FluxDown] Extra headers from stored resource:",
         Object.keys(extraHeaders).length,
       );
+    }
+
+    // #610 修复：确保发给引擎的 headers 携带浏览器真实 UA。
+    // 引擎已支持通过 extra_headers 的 User-Agent 键覆盖默认 UA（native/engine
+    // downloader.rs 有专门的 UA 降级重试逻辑，注释明确写着"浏览器扩展捕获
+    // 下载时通过 extra_headers 传入真实 UA"）——这是现有的、唯一的 UA 传递
+    // 通道，并非新增协议字段。webRequest 捕获的头通常已包含 User-Agent，
+    // 但右键菜单/快捷下载/资源面板手动下载等路径没有捕获记录，这里统一
+    // 兜底补上 navigator.userAgent，确保所有下载路径都带上浏览器真实 UA
+    // （不少反爬站点仅传 Cookie 而 UA 不一致仍会拦截，见 #610）。
+    if (!Object.keys(extraHeaders).some((k) => k.toLowerCase() === "user-agent")) {
+      extraHeaders = { ...extraHeaders, "User-Agent": navigator.userAgent };
     }
 
     // 反查浏览器原始 method 与 body —— 修复 form-POST 触发的下载（uupdump 等）。
@@ -2718,6 +2718,43 @@ export default defineBackground(() => {
   }
 
   // ===== 统一消息处理（Popup + Content Script） =====
+  /**
+   * 查找资源存储中的原始请求。
+   *
+   * Popup 发来的 DASH 轨道 URL 通常与 resource-store 中的 URL 相同，
+   * 但签名参数顺序或已知的缓存参数可能不同。resource-store 使用的也是
+   * normalizeUrlForDedup，因此下载兜底查找必须使用同一套归一化规则，
+   * 否则嗅探到的 Cookie/Referer 等认证上下文会在 Popup 路径丢失。
+   */
+  function findStoredResource(
+    stored: ReturnType<typeof getResourcesForTab>,
+    url: string,
+  ): ReturnType<typeof getResourcesForTab>[number] | undefined {
+    const exact = stored.find((resource) => resource.url === url);
+    if (exact) return exact;
+    const normalizedUrl = normalizeUrlForDedup(url);
+    return stored.find(
+      (resource) => normalizeUrlForDedup(resource.url) === normalizedUrl,
+    );
+  }
+
+  function mergeStoredHeaders(
+    primary: Record<string, string> | undefined,
+    secondary: Record<string, string> | undefined,
+  ): Record<string, string> | undefined {
+    if (!primary && !secondary) return undefined;
+    const merged = { ...(secondary || {}), ...(primary || {}) };
+    return Object.keys(merged).length > 0 ? merged : undefined;
+  }
+
+  function sameOrigin(firstUrl: string, secondUrl: string): boolean {
+    try {
+      return new URL(firstUrl).origin === new URL(secondUrl).origin;
+    } catch {
+      return false;
+    }
+  }
+
   async function handleMessage(
     message: any,
     sender: chrome.runtime.MessageSender,
@@ -2830,6 +2867,8 @@ export default defineBackground(() => {
 
         const pageUrl = sender.tab?.url || sender.url || "";
         const payloads: ResourceMessagePayload[] = message.resources || [];
+        const reportedPageUrl = payloads.find((payload) => payload.pageUrl)?.pageUrl || pageUrl;
+        syncTabPageUrl(tabId, reportedPageUrl);
 
         if (payloads.length === 0) return { success: true, added: 0 };
 
@@ -2837,12 +2876,24 @@ export default defineBackground(() => {
         const rdSettings = await getCachedSettings();
         if (!rdSettings.resourceSniffing) return { success: true, added: 0 };
 
-        const added = addResources(tabId, pageUrl, payloads);
+        const added = addResources(tabId, reportedPageUrl, payloads);
         if (added > 0) {
-          await updateBadgeForTab(tabId);
+          bumpTabVersion(tabResourceVersions, tabId);
+          await updateDisplayedBadgeForTab(tabId);
           await notifyContentScript(tabId);
         }
         return { success: true, added };
+      }
+
+      case "pageUrlChanged": {
+        const tabId = sender.tab?.id;
+        const pageUrl = typeof message.pageUrl === "string" ? message.pageUrl : "";
+        if (!tabId || tabId < 0 || !pageUrl) return { success: false };
+        syncTabPageUrl(tabId, pageUrl);
+        await updateDisplayedBadgeForTab(tabId);
+        await notifyContentScript(tabId);
+        await notifyDashManifest(tabId);
+        return { success: true };
       }
 
       // --- Content Script: DASH manifest 检测上报（权威清晰度 + 轨道 URL）---
@@ -2853,11 +2904,29 @@ export default defineBackground(() => {
         // 资源嗅探开关：关闭时丢弃（旧页面的 fetch 拦截脚本可能仍在运行）
         const dmSettings = await getCachedSettings();
         if (!dmSettings.resourceSniffing) return { success: false };
-        const manifest = message.manifest as DashManifest | undefined;
-        if (!manifest || (!manifest.video?.length && !manifest.audio?.length)) {
+        const manifest = normalizeDashManifest(message.manifest);
+        if (!manifest) {
           return { success: false };
         }
-        tabDashManifests.set(tabId, manifest);
+        syncTabPageUrl(tabId, typeof message.pageUrl === "string" ? message.pageUrl : sender.tab?.url || "");
+        const manifestUrl =
+          typeof message.manifestUrl === "string" && message.manifestUrl
+            ? normalizeUrlForDedup(message.manifestUrl)
+            : "__legacy__";
+        let stored = tabDashManifests.get(tabId);
+        if (!stored) {
+          stored = new Map();
+          tabDashManifests.set(tabId, stored);
+        }
+        stored.delete(manifestUrl);
+        stored.set(manifestUrl, manifest);
+        while (stored.size > MAX_DASH_MANIFESTS_PER_TAB) {
+          const oldest = stored.keys().next().value;
+          if (typeof oldest !== "string") break;
+          stored.delete(oldest);
+        }
+        bumpTabVersion(tabManifestVersions, tabId);
+        await updateDisplayedBadgeForTab(tabId);
         await notifyDashManifest(tabId);
         return { success: true };
       }
@@ -2869,11 +2938,37 @@ export default defineBackground(() => {
         const tabId =
           sender.tab?.id ??
           (typeof message.tabId === "number" ? message.tabId : -1);
-        if (!tabId || tabId < 0) return { resources: [], dashManifest: null };
+        if (!tabId || tabId < 0) {
+          return { resources: [], dashManifest: null, dashManifests: [] };
+        }
+        const stored = tabDashManifests.get(tabId);
+        const dashManifests = stored
+          ? Array.from(stored.entries()).map(([url, manifest]) => ({ url, manifest }))
+          : [];
         return {
           resources: getResourcesForTab(tabId),
-          dashManifest: tabDashManifests.get(tabId) ?? null,
+          dashManifest: dashManifests[dashManifests.length - 1]?.manifest ?? null,
+          dashManifests,
         };
+      }
+
+      // --- Content Script UI / Popup: 清空指定 tab 的嗅探资源列表（#559）---
+      // 长会话 SPA（抖音等）不断切换播放会话会持续累积嗅探资源，提供
+      // 一键清空入口。清空后同步刷新 badge 并推送空列表给页内面板，
+      // 保持 popup / 页内面板两处 UI 与 store 状态一致；后续嗅探到的
+      // 新资源会正常重新加入。
+      case "clearResources": {
+        const tabId =
+          sender.tab?.id ??
+          (typeof message.tabId === "number" ? message.tabId : -1);
+        if (!tabId || tabId < 0) {
+          return { success: false, message: "No tab" };
+        }
+        clearTabProjection(tabId);
+        await updateDisplayedBadgeForTab(tabId);
+        await notifyContentScript(tabId);
+        await notifyDashManifest(tabId);
+        return { success: true };
       }
 
       // --- Content Script UI / Popup: 触发单个资源下载 ---
@@ -2886,18 +2981,30 @@ export default defineBackground(() => {
         // 从资源存储中查找匹配的资源，获取嗅探时保存的 cookies/headers/fileSize。
         // 用户从资源面板点击下载时，原始请求的 requestHeaderCache 可能已过期，
         // 必须依赖持久存储的认证信息才能成功下载需要认证的资源（如政务站点 PDF）。
-        const dlTabId = sender.tab?.id;
+        // Popup 没有 sender.tab；它会把打开资源面板时的活跃 tabId 一并带回。
+        // Content Script 仍优先使用 sender.tab，避免信任页面脚本自报的 tabId。
+        const dlTabId =
+          sender.tab?.id ??
+          (typeof message.tabId === "number" ? message.tabId : undefined);
         let resCookies: string | undefined;
         let resHeaders: Record<string, string> | undefined;
         let resFileSize: number | undefined;
-        if (dlTabId && dlTabId >= 0) {
+        if (typeof dlTabId === "number" && dlTabId >= 0) {
           const tabRes = getResourcesForTab(dlTabId);
-          const matched = tabRes.find((r) => r.url === url);
-          if (matched) {
-            resCookies = matched.cookies;
-            resHeaders = matched.headers;
-            resFileSize = matched.size > 0 ? matched.size : undefined;
-          }
+          const matched = findStoredResource(tabRes, url);
+          const audioMatched =
+            typeof message.audioUrl === "string" && message.audioUrl
+              && sameOrigin(url, message.audioUrl)
+              ? findStoredResource(tabRes, message.audioUrl)
+              : undefined;
+          resCookies = matched?.cookies || audioMatched?.cookies;
+          resHeaders = mergeStoredHeaders(matched?.headers, audioMatched?.headers);
+          resFileSize =
+            matched && matched.size > 0
+              ? matched.size
+              : audioMatched && audioMatched.size > 0
+                ? audioMatched.size
+                : undefined;
         }
         // IDM/NDM 策略：对于从资源面板 / 嗅探触发的下载，必须跳过 probe。
         // 一次性 token URL（如 ctbpsp.com）的 token 已被浏览器消费，
@@ -2906,7 +3013,7 @@ export default defineBackground(() => {
         // fileSize = -1 → 大小未知但确认是下载资源，跳过 probe
         // fileSize = 0/undefined → 正常 probe（仅限手动添加的 URL）
         const effectiveFileSize = message.fileSize || resFileSize || -1;
-        await sendToFluxDown(
+        const sent = await sendToFluxDown(
           url,
           message.referrer,
           message.filename,
@@ -2918,7 +3025,10 @@ export default defineBackground(() => {
           // 离散音视频轨对：内容脚本清晰度选择小窗传来的音频轨 URL（可选）。
           message.audioUrl as string | undefined,
         );
-        return { success: true };
+        return {
+          success: sent,
+          message: sent ? undefined : t("notify.sendFailed"),
+        };
       }
 
       // --- Content Script UI: 批量下载多个资源 ---
@@ -2930,15 +3040,31 @@ export default defineBackground(() => {
       // batch_download action 的桌面应用会自动回退为逐条 download 循环。
       // 远程通道（fluxdown_server）：单次 POST /download/batch 发送全部条目。
       case "batchDownload": {
-        const items = message.items as Array<{
+        const rawItems = message.items as Array<{
           url: string;
+          audioUrl?: string;
           referrer?: string;
           filename?: string;
           fileSize?: number;
           mimeType?: string;
         }>;
-        if (!Array.isArray(items) || items.length === 0) {
+        if (!Array.isArray(rawItems) || rawItems.length === 0) {
           return { success: false, message: "No items" };
+        }
+
+        // 同一个候选可能同时由弹窗和页内面板触发，或因快速双击被重复
+        // 放进同一批次。相同视频轨 + 音频轨只允许创建一个任务；不同
+        // 清晰度/编码的 URL 仍然保留，用户明确选中多档时可以批量下载。
+        const seenBatchItems = new Set<string>();
+        const items = rawItems.filter((item) => {
+          if (!item?.url) return false;
+          const key = `${item.url}\u0000${item.audioUrl || ""}`;
+          if (seenBatchItems.has(key)) return false;
+          seenBatchItems.add(key);
+          return true;
+        });
+        if (items.length === 0) {
+          return { success: false, message: "No valid items" };
         }
 
         // === fluxdown:// 协议模式：批量走逐条协议唤起 ===
@@ -2947,7 +3073,12 @@ export default defineBackground(() => {
         // 认证信息无法携带。
         {
           const protoSettings = await getCachedSettings();
-          if (protoSettings.enableFluxdownProtocol) {
+          // fluxdown:// 只承载单 URL；带 audioUrl 的聚合视频必须走 NMH/远程，
+          // 避免批量下载时静默丢失音频轨。
+          if (
+            protoSettings.enableFluxdownProtocol &&
+            !items.some((item) => item.audioUrl)
+          ) {
             let batchProtoSent = 0;
             for (const item of items) {
               const ok = await openProtocolUrl(item.url, item.filename);
@@ -2975,9 +3106,13 @@ export default defineBackground(() => {
         // Bug R4-6 修复：并发提取所有 URL 的 cookies，避免串行 N×500ms 超时
         // 需要排除的浏览器内部头（Cookie 已单独处理）
         // 预加载当前 tab 的资源列表，用于 cookies/headers 兜底查找
-        const batchTabId = sender.tab?.id;
+        const batchTabId =
+          sender.tab?.id ??
+          (typeof message.tabId === "number" ? message.tabId : undefined);
         const batchTabResources =
-          batchTabId && batchTabId >= 0 ? getResourcesForTab(batchTabId) : [];
+          typeof batchTabId === "number" && batchTabId >= 0
+            ? getResourcesForTab(batchTabId)
+            : [];
 
         const batchItems: BatchDownloadItem[] = await Promise.all(
           items.map(async (item) => {
@@ -3005,24 +3140,23 @@ export default defineBackground(() => {
             }
             // 策略 3：从资源存储中恢复认证信息（兜底）
             if (!cookieString || Object.keys(extraHeaders).length === 0) {
-              const matchedRes = batchTabResources.find(
-                (r) => r.url === item.url,
-              );
-              if (matchedRes) {
-                if (!cookieString && matchedRes.cookies) {
-                  cookieString = matchedRes.cookies;
-                }
-                if (
-                  Object.keys(extraHeaders).length === 0 &&
-                  matchedRes.headers &&
-                  Object.keys(matchedRes.headers).length > 0
-                ) {
-                  extraHeaders = matchedRes.headers;
-                }
+              const matchedRes = findStoredResource(batchTabResources, item.url);
+              const audioMatchedRes = item.audioUrl
+                && sameOrigin(item.url, item.audioUrl)
+                ? findStoredResource(batchTabResources, item.audioUrl)
+                : undefined;
+              if (!cookieString) {
+                cookieString = matchedRes?.cookies || audioMatchedRes?.cookies || "";
+              }
+              if (Object.keys(extraHeaders).length === 0) {
+                extraHeaders =
+                  mergeStoredHeaders(matchedRes?.headers, audioMatchedRes?.headers) ||
+                  {};
               }
             }
             return {
               url: item.url,
+              audioUrl: item.audioUrl,
               referrer: item.referrer || "",
               filename: item.filename,
               cookies: cookieString,
@@ -3034,7 +3168,12 @@ export default defineBackground(() => {
           }),
         );
 
-        // 单次 HTTP POST 发送所有 URL（用换行符连接）
+        // NMH 的 batch_download 条目与 DownloadRequest 同构并携带逐条
+        // audioUrl；hub 侧按 URL 缓存该字段，并在快速下载对话框的单条确认
+        // （ConfirmExternalDownload）与多条确认（BatchCreateTask）两条路径下
+        // 都按 URL 回填，故本地批量始终保持一次往返、且不丢音轨。只有远程
+        // 旧版 /download/batch 不支持该字段，路由层才将带音频条目降级为
+        // 远程单条请求（见 remoteSendBatchPreservingAudio）。
         const response = await sendBatchDownloadRequest(batchItems);
         const batchNotifyOk = await shouldNotifyChannel(response.channel);
         if (response.success) {
@@ -3196,21 +3335,87 @@ export default defineBackground(() => {
   }
 
   /**
-   * 将字节数组解码为字符串：优先 UTF-8，失败时回退 GBK（老旧中文服务器常见），
-   * 双失败返回 `null`。与 Rust 引擎 `decode_bytes_utf8_or_gbk` 保持一致的策略，
+   * 将字节数组解码为字符串：优先 UTF-8，失败时兼容 GBK / Big5（老旧中文
+   * 服务器常见），双失败返回 `null`。与 Rust 引擎保持一致的策略，
    * 避免浏览器插件与桌面端对同一响应头解析出不同的文件名。
    */
-  function decodeBytesUtf8OrGbk(bytes: Uint8Array): string | null {
-    try {
-      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    } catch {
-      // fallthrough
+  type LegacyFilenameCharset = "utf-8" | "gbk" | "big5";
+
+  function normalizeLegacyFilenameCharset(
+    charset: string | undefined,
+  ): LegacyFilenameCharset | undefined {
+    const normalized = charset?.trim().replace(/^"+|"+$/g, "").toLowerCase();
+    if (!normalized) return undefined;
+    if (normalized === "utf-8" || normalized === "utf8") return "utf-8";
+    if (["gbk", "gb2312", "gb18030", "cp936"].includes(normalized)) {
+      return "gbk";
     }
+    if (
+      ["big5", "big5-hkscs", "cp950", "windows-950"].includes(normalized)
+    ) {
+      return "big5";
+    }
+    return undefined;
+  }
+
+  // 写成 \u{...} 转义而非字面字符：假名/CJK/私用区字符在编辑器与格式化
+  // 工具里容易被当成不可见字符吞掉，区间端点一旦丢失就退化成匹配连字符。
+  const KANA_RE = /[\u{3040}-\u{30ff}]/u;
+  const CJK_RE = /[\u{4e00}-\u{9fff}]/u;
+  const PUA_RE = /[\u{e000}-\u{f8ff}]/u;
+
+  function filenameEncodingScore(value: string): number {
+    let score = 0;
+    for (const ch of value) {
+      if (/\p{Cc}/u.test(ch)) score -= 8;
+      else if (KANA_RE.test(ch)) score -= 5;
+      else if (CJK_RE.test(ch)) score += 2;
+      else if (ch === "\ufffd") score -= 10;
+    }
+    return score;
+  }
+
+  function hasStrongLegacyMojibake(value: string): boolean {
+    return [...value].some(
+      (ch) =>
+        /\p{Cc}/u.test(ch) ||
+        KANA_RE.test(ch) ||
+        PUA_RE.test(ch) ||
+        ch === "\ufffd",
+    );
+  }
+
+  function tryDecode(bytes: Uint8Array, label: LegacyFilenameCharset): string | null {
     try {
-      return new TextDecoder("gbk", { fatal: true }).decode(bytes);
+      return new TextDecoder(label, { fatal: true }).decode(bytes);
     } catch {
       return null;
     }
+  }
+
+  function decodeBytesUtf8OrChineseLegacy(
+    bytes: Uint8Array,
+    charset?: string,
+  ): string | null {
+    const preferred = normalizeLegacyFilenameCharset(charset);
+    if (preferred === "gbk" || preferred === "big5") {
+      // 显式声明的字符集优先；解码失败返回 null，由调用方决定是否回退到
+      // 下一个 filename 参数（与 Rust 引擎 extract_from_content_disposition 一致）。
+      return tryDecode(bytes, preferred);
+    }
+
+    const utf8 = tryDecode(bytes, "utf-8");
+    if (utf8 !== null) return utf8;
+    // A mislabeled UTF-8 filename may still contain legacy Chinese bytes.
+    // Keep the compatibility fallback below for that non-conforming case.
+    const gbk = tryDecode(bytes, "gbk");
+    const big5 = tryDecode(bytes, "big5");
+    if (gbk === null) return big5;
+    if (big5 === null) return gbk;
+    return hasStrongLegacyMojibake(gbk) &&
+      filenameEncodingScore(big5) > filenameEncodingScore(gbk)
+      ? big5
+      : gbk;
   }
 
   /**
@@ -3254,16 +3459,21 @@ export default defineBackground(() => {
    *   产生重音拉丁字母乱码。
    *
    * 纯 ASCII 值直接返回，避免无谓的字节往返；否则按字节展开
-   * （percent-decode + Latin-1 还原）后用 UTF-8/GBK 解码，失败则回退原值。
+   * （percent-decode + Latin-1 还原）后用 UTF-8/GBK/Big5 解码。
+   * 解码失败返回 `null`（显式 charset 解码失败或候选编码全部不接受该字节），
+   * 由调用方决定回退到原值还是下一个 filename 参数。
    */
-  function decodeDispositionFilenameValue(raw: string): string {
+  function decodeDispositionFilenameValue(
+    raw: string,
+    charset?: string,
+  ): string | null {
     const trimmed = raw.trim();
     if (!trimmed || !/[%\u0080-\uffff]/.test(trimmed)) {
       return trimmed;
     }
     const bytes = percentDecodeToBytes(trimmed);
-    const decoded = decodeBytesUtf8OrGbk(bytes);
-    return decoded && decoded.trim() ? decoded : trimmed;
+    const decoded = decodeBytesUtf8OrChineseLegacy(bytes, charset);
+    return decoded && decoded.trim() ? decoded : null;
   }
 
   /**
@@ -3293,15 +3503,17 @@ export default defineBackground(() => {
     if (!disposition) return "";
 
     // 优先尝试 filename*（RFC 5987 编码：charset'lang'percent-encoded-name）。
-    // charset 字段按理应决定解码方式，这里统一走 UTF-8 优先 / GBK 回退
-    // （老旧中文服务器常声明 UTF-8 却实际发送 GBK），与 filename= 分支
-    // 及 Rust 引擎 extract_from_content_disposition 保持一致。
+    // charset 字段优先决定解码方式；未声明或声明不可靠时使用 UTF-8 优先、
+    // GBK/Big5 候选探测，与 filename= 分支及 Rust 引擎保持一致。
+    // charset 只允许 token 字符，避免在畸形头（`filename*=x.txt; note=a'b'c`）
+    // 上跨参数边界匹配；声明字符集解码失败时回退到 filename=（同 Rust 侧）。
     const starMatch = disposition.match(
-      /filename\*\s*=\s*[^']*'[^']*'([^;]+)/i,
+      /filename\*\s*=\s*"?([A-Za-z0-9_\-]*)'[^';"]*'([^;"]+)"?/i,
     );
     if (starMatch) {
       const decoded = decodeDispositionFilenameValue(
-        stripSurroundingQuotes(starMatch[1]),
+        stripSurroundingQuotes(starMatch[2]),
+        starMatch[1],
       );
       if (decoded) return decoded;
     }
@@ -3309,15 +3521,14 @@ export default defineBackground(() => {
     // 再尝试 filename="..."（带引号）
     const quotedMatch = disposition.match(/filename\s*=\s*"(.+?)"/i);
     if (quotedMatch) {
-      return decodeDispositionFilenameValue(quotedMatch[1]);
+      return decodeDispositionFilenameValue(quotedMatch[1]) ?? quotedMatch[1].trim();
     }
 
     // 最后尝试 filename=...（无引号）
     const plainMatch = disposition.match(/filename\s*=\s*([^\s;]+)/i);
     if (plainMatch) {
-      return decodeDispositionFilenameValue(
-        stripSurroundingQuotes(plainMatch[1]),
-      );
+      const plain = stripSurroundingQuotes(plainMatch[1]);
+      return decodeDispositionFilenameValue(plain) ?? plain;
     }
 
     return "";

@@ -32,21 +32,25 @@ pub mod filter;
 pub mod model;
 pub mod parser;
 
-use std::collections::HashSet;
+pub use model::RSS_PROVIDER_ID;
+
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use crate::auto_proxy::{self, CandidateSource};
 use crate::db::Db;
 use crate::downloader;
 use crate::events::{EngineEvent, EventSink};
 use crate::logger::{log_error, log_info};
-use crate::proxy_config::ProxyConfig;
+use crate::proxy_config::{ProxyConfig, ProxyMode};
 use crate::rss::filter::{CompiledRule, FilterRule, Verdict};
 use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
 use crate::rss::parser::{MAX_FEED_BYTES, ParsedFeed, parse_feed};
+use crate::subscription::{SubscriptionFetchRequest, SubscriptionProvider};
 
 /// 每源保留的条目上限（超量淘汰最旧的**非已下载**条目）。
 pub const MAX_ITEMS_PER_SOURCE: i32 = 500;
@@ -122,8 +126,10 @@ pub struct RssDownloadPlan {
     pub guid: String,
     /// 条目标题（通知文案）。
     pub title: String,
-    /// 下载地址（enclosure 优先，回退条目链接）。
+    /// 下载地址；带 resolverItem 时使用条目链接触发二段解析。
     pub url: String,
+    /// 插件二段解析标识（空 = 普通 RSS 直链）。
+    pub resolver_item: String,
     /// 订阅配置的保存目录（空 = 由调用方按 队列目录 → 全局目录 兜底）。
     pub save_dir: String,
     /// 目标队列（空 = 主队列）。
@@ -190,6 +196,10 @@ pub struct RssManager {
     sources: Vec<RssSourceInfo>,
     /// 正在抓取中的订阅——防同一源被 tick 与手动刷新重复派发。
     in_flight: HashSet<String>,
+    /// 订阅来源适配器。RSS 是内置 provider，插件可以注册自己的 provider。
+    providers: HashMap<String, Arc<dyn SubscriptionProvider>>,
+    /// 未命中内置 map 时交给宿主提供的动态 provider（插件路由）。
+    fallback_provider: Option<Arc<dyn SubscriptionProvider>>,
     tx: mpsc::UnboundedSender<RssEvent>,
     rx: Option<mpsc::UnboundedReceiver<RssEvent>>,
 }
@@ -198,11 +208,15 @@ impl RssManager {
     /// 构造（不读库；由 [`RssManager::load`] 装载）。
     pub fn new(db: Db, sink: Arc<dyn EventSink>) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
+        let mut providers: HashMap<String, Arc<dyn SubscriptionProvider>> = HashMap::new();
+        providers.insert(RSS_PROVIDER_ID.to_string(), Arc::new(BuiltinRssProvider));
         Self {
             db,
             sink,
             sources: Vec::new(),
             in_flight: HashSet::new(),
+            providers,
+            fallback_provider: None,
             tx,
             rx: Some(rx),
         }
@@ -231,6 +245,11 @@ impl RssManager {
     /// 按 ID 取订阅。
     pub fn source(&self, source_id: &str) -> Option<&RssSourceInfo> {
         self.sources.iter().find(|s| s.source_id == source_id)
+    }
+
+    /// 设置未命中固定 provider map 时使用的动态路由器。
+    pub fn set_fallback_provider(&mut self, provider: Arc<dyn SubscriptionProvider>) {
+        self.fallback_provider = Some(provider);
     }
 
     /// 广播订阅列表（含未读计数，重新读库以刷新 badge）。
@@ -380,40 +399,82 @@ impl RssManager {
         let Some(source) = self.source(source_id) else {
             return;
         };
-        let request = FetchRequest {
+        let provider_id = source.provider_id.clone();
+        let base_request = FetchRequest {
             source_id: source.source_id.clone(),
             url: source.url.clone(),
+            provider_id: provider_id.clone(),
+            provider_config: source.provider_config.clone(),
             cookies: source.cookies.clone(),
             user_agent: if source.user_agent.is_empty() {
                 global_ua.to_string()
             } else {
                 source.user_agent.clone()
             },
-            proxy: resolve_proxy(&source.proxy_url, proxy),
+            proxy: ProxyConfig::default(),
         };
+        let direct_proxy = resolve_proxy(&source.proxy_url, proxy);
+        // ProxyConfig::resolve() 把非 coordinator 路径的 Auto 折算成
+        // 直连（见该函数文档），只有 HTTP 下载 coordinator 消费 auto_proxy
+        // 的采样/决策。RSS 抓取独立于 coordinator，因此这里直连失败时按
+        // 「手动代理 → 系统代理」候选顺序手动重试一遍。仅内置 RSS provider
+        // 遵从 `request.proxy`（插件 provider 走 bridge 全局出口，订阅级
+        // 代理对其不生效，见 [`SubscriptionFetchRequest::proxy`] 文档），
+        // 所以只对它启用失败转移，避免对插件做无意义的重复抓取。
+        let eligible = source.proxy_url.is_empty()
+            && proxy.mode == ProxyMode::Auto
+            && provider_id == RSS_PROVIDER_ID;
+        let global_proxy = proxy.clone();
+        let fetch_url = source.url.clone();
+        let provider = self
+            .providers
+            .get(&provider_id)
+            .cloned()
+            .or_else(|| self.fallback_provider.clone());
         // 乐观置位 last_fetch_at：即便抓取任务本身崩了，due 判定也不会把这个
         // 源变成每 tick 重试的死循环（回流分支会用真实结果覆盖）。
-        self.in_flight.insert(request.source_id.clone());
+        self.in_flight.insert(base_request.source_id.clone());
         if let Some(s) = self
             .sources
             .iter_mut()
-            .find(|s| s.source_id == request.source_id)
+            .find(|s| s.source_id == base_request.source_id)
         {
             s.last_fetch_at = now;
         }
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let source_id = request.source_id.clone();
-            let outcome = match fetch_feed(&request).await {
-                Ok(feed) => RssFetchOutcome {
-                    source_id,
-                    feed,
-                    error: String::new(),
-                },
-                Err(error) => RssFetchOutcome {
+            let source_id = base_request.source_id.clone();
+            let outcome = match provider {
+                Some(provider) => {
+                    let result = fetch_with_auto_failover(
+                        &fetch_url,
+                        direct_proxy,
+                        eligible,
+                        &global_proxy,
+                        |proxy_cfg| {
+                            let mut req = base_request.clone();
+                            req.proxy = proxy_cfg;
+                            provider.fetch(req)
+                        },
+                    )
+                    .await;
+                    match result {
+                        Ok(feed) => RssFetchOutcome {
+                            source_id,
+                            feed,
+                            error: String::new(),
+                        },
+                        Err(error) => RssFetchOutcome {
+                            source_id,
+                            feed: ParsedFeed::default(),
+                            error,
+                        },
+                    }
+                }
+                None => RssFetchOutcome {
                     source_id,
                     feed: ParsedFeed::default(),
-                    error,
+                    error: format!("subscription provider not installed: {provider_id}"),
                 },
             };
             let _ = tx.send(RssEvent::Fetched(Box::new(outcome)));
@@ -436,19 +497,39 @@ impl RssManager {
         proxy: &ProxyConfig,
         global_ua: &str,
     ) -> impl Future<Output = RssValidateOutcome> + Send + use<> {
-        let request = FetchRequest {
+        let base_request = FetchRequest {
             source_id: String::new(),
+            provider_id: RSS_PROVIDER_ID.to_string(),
             url: url.clone(),
+            provider_config: String::new(),
             cookies,
             user_agent: if user_agent.is_empty() {
                 global_ua.to_string()
             } else {
                 user_agent
             },
-            proxy: resolve_proxy(&proxy_url, proxy),
+            proxy: ProxyConfig::default(),
         };
+        let direct_proxy = resolve_proxy(&proxy_url, proxy);
+        // 新建订阅向导/REST 验证同样只拿到折算后的直连配置，Auto 模式下
+        // 补一次候选代理重试，避免把「直连探测失败」误判为订阅地址本身
+        // 不可用（用户此前需手动切到 System 模式才能通过验证）。
+        let eligible = proxy_url.is_empty() && proxy.mode == ProxyMode::Auto;
+        let global_proxy = proxy.clone();
         async move {
-            match fetch_feed(&request).await {
+            let result = fetch_with_auto_failover(
+                &url,
+                direct_proxy,
+                eligible,
+                &global_proxy,
+                |proxy_cfg| {
+                    let mut req = base_request.clone();
+                    req.proxy = proxy_cfg;
+                    async move { fetch_feed(&req).await }
+                },
+            )
+            .await;
+            match result {
                 Ok(feed) => RssValidateOutcome {
                     request_id,
                     url,
@@ -508,7 +589,9 @@ impl RssManager {
     ) {
         let request = FetchRequest {
             source_id: plan.source_id.clone(),
+            provider_id: RSS_PROVIDER_ID.to_string(),
             url: plan.url.clone(),
+            provider_config: String::new(),
             cookies: plan.cookies.clone(),
             user_agent: if plan.user_agent.is_empty() {
                 global_ua.to_string()
@@ -650,6 +733,25 @@ impl RssManager {
             }
         }
 
+        let resolver_backfill: Vec<(String, String)> = outcome
+            .feed
+            .items
+            .iter()
+            .filter(|p| !p.resolver_item.is_empty() && known.contains(&p.guid))
+            .map(|p| (p.guid.clone(), p.resolver_item.clone()))
+            .collect();
+        let mut resolver_backfilled = 0u64;
+        if !resolver_backfill.is_empty() {
+            match self
+                .db
+                .backfill_rss_resolver_items(&source.source_id, &resolver_backfill)
+                .await
+            {
+                Ok(n) => resolver_backfilled = n,
+                Err(e) => log_error!("[rss] backfill resolver_item failed: {}", e),
+            }
+        }
+
         let fresh = rows.len();
         if let Err(e) = self.db.insert_rss_items(&rows).await {
             log_error!("[rss] persist items failed: {}", e);
@@ -696,7 +798,7 @@ impl RssManager {
                 ""
             }
         );
-        if fresh > 0 || backfilled > 0 || !plans.is_empty() {
+        if fresh > 0 || backfilled > 0 || resolver_backfilled > 0 || !plans.is_empty() {
             self.broadcast_items(&source.source_id, Vec::new()).await;
         }
         self.broadcast_sources().await;
@@ -827,6 +929,7 @@ fn item_from_parsed(source_id: &str, parsed: &parser::ParsedItem, fetched_at: i6
         title: parsed.title.clone(),
         link: parsed.link.clone(),
         enclosure_url: parsed.enclosure_url.clone(),
+        resolver_item: parsed.resolver_item.clone(),
         enclosure_length: parsed.enclosure_length,
         pub_date: parsed.pub_date,
         fetched_at,
@@ -843,6 +946,7 @@ fn plan_for(source: &RssSourceInfo, item: &RssItemInfo) -> RssDownloadPlan {
         guid: item.guid.clone(),
         title: item.title.clone(),
         url: item.download_url().to_string(),
+        resolver_item: item.resolver_item.clone(),
         save_dir: source.save_dir.clone(),
         queue_id: source.queue_id.clone(),
         start_paused: source.start_paused,
@@ -868,6 +972,55 @@ fn resolve_proxy(proxy_url: &str, global: &ProxyConfig) -> ProxyConfig {
     }
 }
 
+/// 非 coordinator 路径 Auto 模式抓取失败后的候选代理重试：先按 `attempt`
+/// 用给定配置发起一次抓取；`eligible` 为 `true` 且直连失败时，依次改用
+/// [`auto_proxy::resolve_candidates`] 给出的候选（手动字段优先于系统代理）
+/// 各重试一次，命中即返回；全部候选也失败则返回最后一次错误。
+/// `eligible = false` 时只跑一次给定配置，行为与不做失败转移一致。
+async fn fetch_with_auto_failover<F, Fut>(
+    url: &str,
+    direct_config: ProxyConfig,
+    eligible: bool,
+    global: &ProxyConfig,
+    mut attempt: F,
+) -> Result<ParsedFeed, String>
+where
+    F: FnMut(ProxyConfig) -> Fut,
+    Fut: Future<Output = Result<ParsedFeed, String>>,
+{
+    let first_error = match attempt(direct_config).await {
+        Ok(feed) => return Ok(feed),
+        Err(e) => e,
+    };
+    if !eligible {
+        return Err(first_error);
+    }
+    let mut last_error = first_error;
+    let candidates = auto_proxy::resolve_candidates(global);
+    let attempted = !candidates.is_empty();
+    for candidate in candidates {
+        log_info!(
+            "[rss] auto 模式直连抓取失败（{last_error}），改试{}代理重试: {url}",
+            candidate_label(candidate.source)
+        );
+        match attempt(candidate.config).await {
+            Ok(feed) => return Ok(feed),
+            Err(e) => last_error = e,
+        }
+    }
+    if attempted {
+        last_error = format!("{last_error}（auto 候选代理均已重试）");
+    }
+    Err(last_error)
+}
+
+fn candidate_label(source: CandidateSource) -> &'static str {
+    match source {
+        CandidateSource::ManualFields => "手动",
+        CandidateSource::System => "系统",
+    }
+}
+
 /// feed 站点根地址，用作 `.torrent` 下载的 Referer（部分 PT 站校验来源）。
 /// 解析失败时回退整条 feed 地址。
 fn feed_origin(feed_url: &str) -> String {
@@ -877,12 +1030,21 @@ fn feed_origin(feed_url: &str) -> String {
         .unwrap_or_else(|| feed_url.to_string())
 }
 
-struct FetchRequest {
-    source_id: String,
-    url: String,
-    cookies: String,
-    user_agent: String,
-    proxy: ProxyConfig,
+type FetchRequest = SubscriptionFetchRequest;
+
+struct BuiltinRssProvider;
+
+impl SubscriptionProvider for BuiltinRssProvider {
+    fn id(&self) -> &str {
+        RSS_PROVIDER_ID
+    }
+
+    fn fetch(
+        &self,
+        request: SubscriptionFetchRequest,
+    ) -> crate::subscription::SubscriptionFetchFuture {
+        Box::pin(async move { fetch_feed(&request).await })
+    }
 }
 
 /// 抓取并解析一个 feed。**只在 off-actor 任务里调用。**
@@ -953,8 +1115,10 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        MAX_BACKOFF_SECS, due_sources, effective_interval_secs, feed_origin, plan_for, rule_of,
+        MAX_BACKOFF_SECS, due_sources, effective_interval_secs, feed_origin,
+        fetch_with_auto_failover, plan_for, rule_of,
     };
+    use crate::proxy_config::{ProxyConfig, ProxyMode};
     use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
 
     fn source(id: &str, interval: i32, last_fetch: i64) -> RssSourceInfo {
@@ -1063,6 +1227,12 @@ mod tests {
         assert_eq!(plan.queue_id, "anime");
         assert_eq!(plan.size_hint, 418 * 1024 * 1024);
 
+        let mut resolver_item = item.clone();
+        resolver_item.resolver_item = "ep:123@q:80".to_string();
+        let resolver_plan = plan_for(&s, &resolver_item);
+        assert_eq!(resolver_plan.url, resolver_item.link);
+        assert_eq!(resolver_plan.resolver_item, "ep:123@q:80");
+
         s.send_referer = false;
         assert!(plan_for(&s, &item).referrer.is_empty());
 
@@ -1118,6 +1288,7 @@ mod tests {
             title: title.to_string(),
             link: format!("https://feed.test/item/{guid}"),
             enclosure_url: format!("https://feed.test/dl/{guid}.torrent"),
+            resolver_item: String::new(),
             enclosure_length: size,
             pub_date,
         }
@@ -1218,6 +1389,63 @@ mod tests {
                 .await
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_download_task_prevents_refetch_dispatch_but_allows_manual_redownload() {
+        let mut m = manager().await;
+        let id = subscribe(
+            &mut m,
+            RssSourceInfo {
+                url: "https://feed.test/rss".to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+        fetched(&mut m, &id, Vec::new()).await;
+        assert_eq!(
+            fetched(&mut m, &id, vec![parsed("episode", "Episode", 100, 10)]).await,
+            vec!["episode"]
+        );
+        m.db.insert_task(
+            "task-episode",
+            "https://feed.test/dl/episode",
+            "episode",
+            "/tmp",
+            3,
+            0,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("persist download task");
+        assert_eq!(
+            m.db.delete_task("task-episode").await.expect("delete"),
+            vec![id.clone()]
+        );
+        let old =
+            m.db.rss_item(&id, "episode")
+                .await
+                .expect("query")
+                .expect("item");
+        assert_eq!(old.status, RssItemStatus::Ignored);
+        assert!(old.task_id.is_empty());
+        assert_eq!(
+            fetched(
+                &mut m,
+                &id,
+                vec![
+                    parsed("episode", "Episode", 100, 10),
+                    parsed("next", "Next", 100, 20)
+                ]
+            )
+            .await,
+            vec!["next"],
+            "existing episode stays read while a genuinely new item still dispatches"
+        );
+        assert!(m.manual_download(&id, "episode").await.is_some());
     }
 
     #[tokio::test]
@@ -1424,5 +1652,99 @@ mod tests {
             })
             .await;
         assert!(plans.is_empty(), "no source, no tasks, no orphan rows");
+    }
+
+    fn auto_proxy_global() -> ProxyConfig {
+        ProxyConfig {
+            mode: ProxyMode::Auto,
+            host: "10.0.0.1".to_string(),
+            port: 1080,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_failover_skips_retry_when_not_eligible() {
+        let global = auto_proxy_global();
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let attempts_clone = attempts.clone();
+        let result = fetch_with_auto_failover(
+            "http://feed.test/rss",
+            ProxyConfig::default(),
+            false, // 订阅有专属代理，或全局非 Auto：不重试
+            &global,
+            move |_cfg| {
+                let attempts = attempts_clone.clone();
+                async move {
+                    *attempts.lock().expect("lock") += 1;
+                    Err("direct failed".to_string())
+                }
+            },
+        )
+        .await;
+        assert_eq!(result, Err("direct failed".to_string()));
+        assert_eq!(
+            *attempts.lock().expect("lock"),
+            1,
+            "not eligible must not retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_failover_retries_manual_candidate_after_direct_failure() {
+        let global = auto_proxy_global();
+        let modes_tried = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let modes_clone = modes_tried.clone();
+        let result = fetch_with_auto_failover(
+            "http://feed.test/rss",
+            ProxyConfig::default(),
+            true,
+            &global,
+            move |cfg| {
+                let modes = modes_clone.clone();
+                async move {
+                    modes.lock().expect("lock").push(cfg.mode.clone());
+                    if cfg.mode == ProxyMode::Manual {
+                        Ok(ParsedFeed::default())
+                    } else {
+                        Err("direct failed".to_string())
+                    }
+                }
+            },
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "must succeed once the manual candidate is tried"
+        );
+        assert_eq!(
+            *modes_tried.lock().expect("lock"),
+            vec![ProxyMode::None, ProxyMode::Manual],
+            "direct attempted first, then the manual candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_failover_exhausts_all_candidates_and_returns_last_error() {
+        let global = auto_proxy_global();
+        let attempts = std::sync::Arc::new(std::sync::Mutex::new(0u32));
+        let attempts_clone = attempts.clone();
+        let result = fetch_with_auto_failover(
+            "http://feed.test/rss",
+            ProxyConfig::default(),
+            true,
+            &global,
+            move |_cfg| {
+                let attempts = attempts_clone.clone();
+                async move {
+                    *attempts.lock().expect("lock") += 1;
+                    Err("failed".to_string())
+                }
+            },
+        )
+        .await;
+        assert_eq!(result, Err("failed（auto 候选代理均已重试）".to_string()));
+        // 直连 + 手动候选至少 2 次；测试机若配置了系统代理会再多一次系统候选。
+        assert!(*attempts.lock().expect("lock") >= 2);
     }
 }

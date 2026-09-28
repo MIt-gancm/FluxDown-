@@ -19,6 +19,43 @@ pub use ytdlp::*;
 
 use std::path::PathBuf;
 
+/// 组件下载镜像基址的 config 键（675#1）：GitHub Release API 未认证匿名限流
+/// 60 请求/小时，公司网络/部分地区直连 `github.com`/`api.github.com` 也可能
+/// 被拦截（403/超时）。用户可在设置里填一个 GitHub 反代地址（如自建
+/// `ghproxy`/`gh-proxy` 类反代的基址），非空时替换掉请求 URL 里的
+/// `https://api.github.com` 或 `https://github.com` 前缀（含 Release JSON
+/// 查询与资产直链下载两条路径）。空值（默认）= 不改写，直连 GitHub。
+pub const CONFIG_COMPONENT_MIRROR_BASE: &str = "component_mirror_base";
+
+/// 把 `url` 的 `https://api.github.com` / `https://github.com` 前缀替换为
+/// `mirror_base`（trim 首尾空白与末尾 `/`）。`mirror_base` 为空则原样返回。
+/// 纯函数，不做网络/IO，便于测试。
+#[cfg(any(feature = "components", test))]
+pub(crate) fn apply_component_mirror(url: &str, mirror_base: &str) -> String {
+    let mirror_base = mirror_base.trim().trim_end_matches('/');
+    if mirror_base.is_empty() {
+        return url.to_string();
+    }
+    for prefix in ["https://api.github.com", "https://github.com"] {
+        if let Some(rest) = url.strip_prefix(prefix) {
+            return format!("{mirror_base}{rest}");
+        }
+    }
+    url.to_string()
+}
+
+/// 读取用户配置的组件镜像基址（[`CONFIG_COMPONENT_MIRROR_BASE`]）；未设置
+/// 或读取失败均返回空串（= 不改写，直连 GitHub），不让配置读取失败阻断
+/// 安装流程。
+#[cfg(feature = "components")]
+pub(crate) async fn component_mirror_base(db: &crate::db::Db) -> String {
+    db.get_config(CONFIG_COMPONENT_MIRROR_BASE)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 /// 组件生效路径的来源。ffmpeg / yt-dlp 共用；`as_str` 为稳定 wire 字符串
 /// （跨 hub 信号 / server JSON / Dart 徽章共用）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,31 +162,72 @@ pub(crate) async fn fetch_github_json(
         .map_err(|e| ComponentError::Http(e.to_string()))
 }
 
+/// [`fetch_github_json`]，但先按用户配置的 [`CONFIG_COMPONENT_MIRROR_BASE`]
+/// 改写 `url`（675#1）：改写后请求失败（或未配置，改写后与原 URL 相同）
+/// 都回退直连原始 `url`，不让一次镜像故障拖垮整个安装流程。
+#[cfg(feature = "components")]
+pub(crate) async fn fetch_github_json_with_mirror(
+    client: &reqwest::Client,
+    url: &str,
+    mirror_base: &str,
+) -> Result<serde_json::Value, ComponentError> {
+    let mirrored = apply_component_mirror(url, mirror_base);
+    if mirrored != url
+        && let Ok(v) = fetch_github_json(client, &mirrored).await
+    {
+        return Ok(v);
+    }
+    fetch_github_json(client, url).await
+}
+
 /// 官网组件版本镜像的基地址。版本列表拉取优先经此转发（服务端持 token +
 /// 24h 缓存，规避 GitHub 匿名 API 每 IP 60/h 限流与直连 api.github.com 的
-/// 网络问题），失败回退直连 GitHub。
+/// 网络问题），失败依次回退用户配置的镜像（若有）与直连 GitHub。
 #[cfg(feature = "components")]
 const MIRROR_BASE: &str = "https://fluxdown.zerx.dev/api/components";
 
 /// 版本列表专用：优先经官网镜像 `MIRROR_BASE/<component>` 拉取（返回原样
-/// GitHub JSON），任何失败都回退直连 `github_url`。二进制下载不走此路径。
+/// GitHub JSON）；失败则经 [`fetch_github_json_with_mirror`] 依次尝试用户
+/// 配置的镜像与直连 `github_url`。二进制下载不走此路径。
 #[cfg(feature = "components")]
 pub(crate) async fn fetch_versions_json(
     client: &reqwest::Client,
     component: &str,
     github_url: &str,
+    mirror_base: &str,
 ) -> Result<serde_json::Value, ComponentError> {
-    let mirror = format!("{MIRROR_BASE}/{component}");
-    match fetch_github_json(client, &mirror).await {
-        Ok(v) => Ok(v),
-        Err(_) => fetch_github_json(client, github_url).await,
+    let official_mirror = format!("{MIRROR_BASE}/{component}");
+    if let Ok(v) = fetch_github_json(client, &official_mirror).await {
+        return Ok(v);
     }
+    fetch_github_json_with_mirror(client, github_url, mirror_base).await
 }
 
 /// 流式下载 `url` 到 `dest`，`progress(downloaded, total)` 上报进度（total=0 未知）。
 /// ffmpeg 归档 / yt-dlp 单二进制安装共用；每 256KB 上报一次避免信号风暴。
+/// 先按用户配置的 [`CONFIG_COMPONENT_MIRROR_BASE`] 改写 `url`（675#1）：改写后
+/// 下载失败（或未配置）都回退直连原始 `url`。
 #[cfg(feature = "components")]
 pub(crate) async fn download_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    mirror_base: &str,
+    dest: &std::path::Path,
+    progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<(), ComponentError> {
+    let mirrored = apply_component_mirror(url, mirror_base);
+    if mirrored != url
+        && download_to_file_from(client, &mirrored, dest, progress)
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+    download_to_file_from(client, url, dest, progress).await
+}
+
+#[cfg(feature = "components")]
+async fn download_to_file_from(
     client: &reqwest::Client,
     url: &str,
     dest: &std::path::Path,
@@ -200,7 +278,7 @@ pub(crate) async fn download_to_file(
 mod tests {
     use std::path::PathBuf;
 
-    use super::ComponentSource;
+    use super::{ComponentSource, apply_component_mirror};
 
     #[test]
     fn source_wire_strings() {
@@ -240,5 +318,43 @@ mod tests {
 
         assert_eq!(found, Some(root.join("second").join(name)));
         assert_eq!(none, None);
+    }
+
+    // 675#1：未配置镜像时原样返回。
+    #[test]
+    fn apply_component_mirror_noop_when_unset() {
+        let url = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+        assert_eq!(apply_component_mirror(url, ""), url);
+        assert_eq!(apply_component_mirror(url, "   "), url);
+    }
+
+    // 配置后改写 api.github.com 前缀（Release JSON 端点）。
+    #[test]
+    fn apply_component_mirror_rewrites_api_host() {
+        let url = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+        assert_eq!(
+            apply_component_mirror(url, "https://ghproxy.example.com/gh"),
+            "https://ghproxy.example.com/gh/repos/yt-dlp/yt-dlp/releases/latest"
+        );
+    }
+
+    // 配置后改写 github.com 前缀（资产直链下载）；末尾 `/` 与首尾空白容错。
+    #[test]
+    fn apply_component_mirror_rewrites_asset_download_host() {
+        let url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg.zip";
+        assert_eq!(
+            apply_component_mirror(url, "  https://ghproxy.example.com/gh/  "),
+            "https://ghproxy.example.com/gh/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg.zip"
+        );
+    }
+
+    // 不匹配已知前缀的 URL 原样透传（不误伤第三方镜像/官网 URL）。
+    #[test]
+    fn apply_component_mirror_leaves_unrelated_urls_untouched() {
+        let url = "https://fluxdown.zerx.dev/api/components/ffmpeg";
+        assert_eq!(
+            apply_component_mirror(url, "https://ghproxy.example.com/gh"),
+            url
+        );
     }
 }

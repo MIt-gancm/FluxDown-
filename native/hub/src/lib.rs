@@ -44,8 +44,10 @@ async fn main() {
             return;
         }
     }
-    logger::spawn_logged("hub", "create actors", async {
-        create_actors().await?;
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let actor_shutdown = shutdown.clone();
+    let mut actor_task = logger::spawn_logged("hub", "create actors", async move {
+        create_actors(actor_shutdown).await?;
         Ok::<(), actors::CreateActorsError>(())
     });
     logger::spawn_logged("hub", "shortcut icon listener", async {
@@ -53,4 +55,10 @@ async fn main() {
         Ok::<(), std::convert::Infallible>(())
     });
     dart_shutdown().await;
+    shutdown.cancel();
+    match tokio::time::timeout(std::time::Duration::from_secs(30), &mut actor_task).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => logger::report_error("hub", "stop actors", &error),
+        Err(error) => logger::report_error("hub", "stop actors timed out", &error),
+    }
 }

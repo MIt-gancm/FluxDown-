@@ -283,9 +283,14 @@ mod install {
     }
 
     /// 列出当前平台可安装的稳定版本（降序）。
-    pub async fn list_versions(client: &reqwest::Client) -> Result<FfmpegVersions, ComponentError> {
+    pub async fn list_versions(
+        db: &Db,
+        client: &reqwest::Client,
+    ) -> Result<FfmpegVersions, ComponentError> {
         let plat = platform_tag().ok_or(ComponentError::Unsupported)?;
-        let release = super::super::fetch_versions_json(client, "ffmpeg", RELEASE_API).await?;
+        let mirror_base = super::super::component_mirror_base(db).await;
+        let release =
+            super::super::fetch_versions_json(client, "ffmpeg", RELEASE_API, &mirror_base).await?;
         let empty = Vec::new();
         let assets = release["assets"].as_array().unwrap_or(&empty);
         let mut versions: Vec<String> = assets
@@ -314,7 +319,11 @@ mod install {
         progress: &(dyn Fn(u64, u64) + Send + Sync),
     ) -> Result<FfmpegStatus, ComponentError> {
         let plat = platform_tag().ok_or(ComponentError::Unsupported)?;
-        let release = super::super::fetch_github_json(client, RELEASE_API).await?;
+        let mirror_base = super::super::component_mirror_base(db).await;
+        // latest release 端点与 list_versions 相同，复用同一条镜像优先链路
+        // （官网镜像 → 用户配置镜像 → 直连 GitHub），675#1 无需额外维护第二套回退。
+        let release =
+            super::super::fetch_versions_json(client, "ffmpeg", RELEASE_API, &mirror_base).await?;
         let empty = Vec::new();
         let assets = release["assets"].as_array().unwrap_or(&empty);
 
@@ -352,7 +361,7 @@ mod install {
             "tar.xz"
         };
         let archive_path = bin_dir.join(format!("ffmpeg.download.{archive_ext}"));
-        super::super::download_to_file(client, &url, &archive_path, progress).await?;
+        super::super::download_to_file(client, &url, &mirror_base, &archive_path, progress).await?;
 
         // 解压出 `bin/ffmpeg[.exe]`（必需）+ `bin/ffprobe[.exe]`（best-effort）。
         let extract_result = extract_binaries(&archive_path, &bin_dir).await;

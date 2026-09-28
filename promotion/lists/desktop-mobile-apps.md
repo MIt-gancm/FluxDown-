@@ -27,7 +27,7 @@
 - 浏览器扩展**已上架三家商店**（Chrome Web Store / Edge Add-ons / Firefox AMO），扩展类清单可用。
 - Android：已发 per-ABI + universal APK（`com.fluxdown.app`），**未上架 F-Droid / IzzyOnDroid / Google Play**。
 - Android 端依赖已核查：`android/` 与 `pubspec.yaml` 中**无** Firebase / play-services / Crashlytics / 友盟 / Bugly 等专有 SDK → 满足 android-foss「无专有成分」要求。
-- Windows 包管理：仓库内有自建 Scoop manifest（`bucket/fluxdown.json`），**未提交到 ScoopInstaller/Extras**；**无 winget、无 Homebrew Cask**。
+- Windows 包管理：已收录进 **ScoopInstaller/Extras**（`scoop install extras/fluxdown`，excavator 自动追新，自托管 bucket 已移除）；**无 winget、无 Homebrew Cask**。
 
 ---
 
@@ -338,7 +338,7 @@ DimitrisPa fork 的 README 顶部已自称 *"a continuation of the now archived 
 1. **【阻塞 · 必做】统一官网 URL。** GitHub 仓库 Homepage 字段是 `https://www.fluxdown.com`，README 通篇是 `https://fluxdown.zerx.dev`。所有清单条目都要填官网，审核者一定会点开；两个域名不一致会直接引发「这项目到底哪个是官网」的质疑。**先决定唯一 canonical 域名，改掉仓库 Homepage 字段**，再按最终结果批量替换本文件里所有条目文本中的 `https://fluxdown.zerx.dev`。
 2. **【阻塞 · 仅限 0PandaDEV/awesome-windows】纯人工撰写与提交**，不得留下任何 AI 痕迹。
 3. **【非阻塞 · 强烈建议】上架 IzzyOnDroid。** 门槛远低于 F-Droid（无需进 F-Droid 构建系统，GitHub Releases 出 APK 即可申请）。收益：offa/android-foss 条目可加官方角标，可信度显著提升；也为将来进 F-Droid 铺路。**F-Droid 本身不是任何一个清单的硬性前置条件**——android-foss 与 open-source-android-apps 都接受纯 GitHub Releases 的条目。
-4. **【非阻塞 · 建议】Windows 包管理器上架。** 目前只有仓库内自建 Scoop manifest，未进 `ScoopInstaller/Extras`；无 winget、无 Homebrew Cask。三个 Windows/macOS 清单**都不把包管理器列为准入条件**，所以这不阻塞提交；但 winget（`microsoft/winget-pkgs`）与 Homebrew Cask（`Homebrew/homebrew-cask`）本身就是巨型收录仓库，属独立的高价值曝光渠道，值得单开任务。
+4. **【非阻塞 · 建议】Windows 包管理器上架。** Scoop 已进 `ScoopInstaller/Extras`；仍无 winget、无 Homebrew Cask。三个 Windows/macOS 清单**都不把包管理器列为准入条件**，所以这不阻塞提交；但 winget（`microsoft/winget-pkgs`）与 Homebrew Cask（`Homebrew/homebrew-cask`）本身就是巨型收录仓库，属独立的高价值曝光渠道，值得单开任务。
 5. **【非阻塞】** 所有清单均**无 star 门槛、无项目年龄门槛、无截图或演示站要求**。FluxDown 现有 1002 star 远超一般心理门槛，无需额外准备。
 
 ## 建议提交节奏

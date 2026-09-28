@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart' show LucideIcons;
@@ -11,6 +12,7 @@ import '../theme/app_colors.dart';
 import '../theme/app_metrics.dart';
 import '../theme/theme_provider.dart';
 import '../services/kv_store.dart';
+import '../services/log_service.dart';
 import '../services/update_service.dart';
 import 'screens/mobile_settings_screen.dart';
 import '../services/foreground_service.dart';
@@ -20,6 +22,8 @@ import 'screens/mobile_tasks_screen.dart';
 import 'services/share_intent_service.dart';
 import 'mobile_ui.dart';
 import 'sheets/mobile_new_download_sheet.dart';
+
+const _tag = 'MobileShell';
 
 /// 移动端根壳：任务列表主屏 + 右上角设置入口（push 路由进入设置页）
 class MobileShell extends StatefulWidget {
@@ -63,7 +67,16 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _settings.requestConfig();
-    _ensureAndroidSaveDir();
+    // #605：requestConfig() 只是发信号，真正配置回填是异步的；
+    // 若不等 whenLoaded 就比较 defaultSaveDir，会把尚未加载完成的
+    // 占位值误判为"未自定义"，从而用 Android 专属目录覆盖用户已保存的值。
+    // Completer 只 complete 一次，天然保证本方法每次应用生命周期只跑一次。
+    _settings.whenLoaded.then((_) {
+      if (mounted) _ensureAndroidSaveDir();
+    });
+    // #533：日志目录迁移到外部可访问目录，与 defaultSaveDir 一样不依赖
+    // settings 加载完成，可直接触发（幂等：非 Android 或已迁移过时空转）。
+    _ensureAndroidLogDir();
     ForegroundServiceManager.instance.start(
       _controller,
       widget.localeNotifier.s,
@@ -179,12 +192,72 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
     }
   }
 
-  /// 收到系统分享 / URL scheme 唤起的链接：切到下载页，弹新建下载弹层
-  /// 并预填 URL（fluxdown:// 协议携带的建议文件名一并预填）。
-  /// 新建下载弹层已打开时把 URL 追加进现有表单（批量协议唤起逐条到达）；
-  /// 其他弹层（更新提示等）打开时忽略，避免叠层。
+  /// 收到系统分享 / URL scheme 唤起的链接：免打扰下载（#315）开启时直接
+  /// 按默认设置建任务，不弹层；否则走原有交互式确认流程。
   Future<void> _onShared(SharedDownloadRequest request) async {
     if (!mounted) return;
+    // #315：settings 尚未加载完成时 silentDownloadEnabled 读到占位默认值
+    // false——等 whenLoaded 避免冷启动分享请求先于配置回填到达而误判。
+    await _settings.whenLoaded;
+    if (!mounted) return;
+    if (_settings.silentDownloadEnabled) {
+      await _createSilentTask(request);
+      return;
+    }
+    await _showDownloadSheet(request);
+  }
+
+  /// 免打扰下载（#315）：直接按默认设置创建任务，不弹新建下载确认框；
+  /// 结果由前台服务已有的任务状态通知反馈，无需额外 UI。unattended 直接
+  /// 取 silentSkipSelection，语义与桌面端 ExternalDownloadService 的免
+  /// 打扰分支一致（跳过 BT/HLS 二次选择弹窗）。
+  Future<void> _createSilentTask(SharedDownloadRequest request) async {
+    final url = request.url.trim();
+    if (url.isEmpty) return;
+    final matchedDir = _settings.resolveCategorySaveDir(
+      request.filename,
+      url: url,
+    );
+    final saveDir = matchedDir.isNotEmpty
+        ? matchedDir
+        : _settings.effectiveDefaultSaveDir;
+    if (saveDir.isEmpty) {
+      // 无可用保存目录：降级为交互式弹框让用户处理。
+      logInfo(_tag, 'silent download: no save dir, falling back to sheet');
+      await _showDownloadSheet(request);
+      return;
+    }
+    logInfo(_tag, 'silent download enabled, creating task directly: url=$url');
+    ConfirmExternalDownload(
+      url: url,
+      saveDir: saveDir,
+      fileName: request.filename,
+      segments: _settings.defaultSegments,
+      cookies: request.cookies,
+      referrer: request.referrer,
+      hintFileSize: 0,
+      proxyUrl: '',
+      userAgent: '',
+      queueId: _settings.defaultQueueId,
+      ignoreTlsErrors: false,
+      audioUrl: '',
+      extraHeaders: request.headers,
+      startPaused: false,
+      httpUser: '',
+      httpPassword: '',
+      saveSiteAuth: false,
+      unattended: _settings.silentSkipSelection,
+    ).sendSignalToRust();
+    if (request.external) {
+      await ShareIntentService.returnToSourceApp();
+    }
+  }
+
+  /// 原交互式确认流程：切到下载页，弹新建下载弹层并预填 URL
+  /// （fluxdown:// 协议携带的建议文件名一并预填）。新建下载弹层已打开时
+  /// 把 URL 追加进现有表单（批量协议唤起逐条到达）；其他弹层（更新提示
+  /// 等）打开时忽略，避免叠层。
+  Future<void> _showDownloadSheet(SharedDownloadRequest request) async {
     if (_downloadSheetOpen) {
       _shareAppendCtrl.add(request);
       return;
@@ -236,6 +309,15 @@ class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
         _settings.defaultSaveDir != dir) {
       _settings.setDefaultSaveDir(dir);
     }
+  }
+
+  /// Android：日志目录迁移到外部应用专属目录
+  /// （`Android/data/<pkg>/files/logs`，#533），使 adb / 电脑无需 Root
+  /// 即可直接访问，便于排障。
+  Future<void> _ensureAndroidLogDir() async {
+    final dir = await MobileStorageService.appExternalLogsDir();
+    if (dir == null || dir.isEmpty || !mounted) return;
+    await LogService.instance.relocateTo(Directory(dir));
   }
 
   @override

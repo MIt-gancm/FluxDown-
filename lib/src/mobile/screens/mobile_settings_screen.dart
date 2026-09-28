@@ -11,6 +11,8 @@ import '../../theme/app_colors.dart';
 import '../../theme/app_metrics.dart';
 import '../../theme/theme_provider.dart';
 import '../../services/update_service.dart';
+import '../../services/log_service.dart';
+import '../../services/open_folder.dart';
 import '../../models/ua_presets.dart';
 import '../services/mobile_storage_service.dart';
 import '../mobile_ui.dart';
@@ -234,6 +236,13 @@ class MobileSettingsScreen extends StatelessWidget {
                               ? s.updateChannelFrontier
                               : s.updateChannelStable,
                           onTap: () => _selectChannel(context),
+                        ),
+                        // #533：导出日志（脱敏 zip），经系统"打开方式"
+                        // 交给其他应用（如文件管理器的分享/上传），弥补
+                        // 日志目录迁到外部存储后仍需手动分享的场景。
+                        _Row(
+                          label: s.logExport,
+                          onTap: () => _exportLogs(context),
                         ),
                         _Row(
                           label: s.mobilePrivacyPolicy,
@@ -613,6 +622,31 @@ class MobileSettingsScreen extends StatelessWidget {
       placeholder: s.proxyPortPlaceholder,
       onSave: settings.setProxyPort,
     );
+  }
+
+  /// 导出日志为脱敏 zip，经系统"打开方式"交给其他应用处理（#533）。
+  /// 移动端没有 file_selector 保存对话框，因此固定写到日志目录同级，
+  /// 再借既有 [openFile] 的 FileProvider + ACTION_VIEW 通道递出应用。
+  Future<void> _exportLogs(BuildContext context) async {
+    final s = LocaleScope.of(context);
+    try {
+      final now = DateTime.now();
+      String pad2(int n) => n.toString().padLeft(2, '0');
+      final stamp =
+          '${now.year}${pad2(now.month)}${pad2(now.day)}_'
+          '${pad2(now.hour)}${pad2(now.minute)}${pad2(now.second)}';
+      final zipPath =
+          '${LogService.instance.logDir.parent.path}/fluxdown_logs_$stamp.zip';
+      final count = await LogService.instance.exportLogs(zipPath);
+      if (!context.mounted) return;
+      if (count <= 0) {
+        showMobileToast(context, s.logExportEmpty);
+        return;
+      }
+      await openFile(zipPath);
+    } catch (_) {
+      if (context.mounted) showMobileToast(context, s.logExportFailed);
+    }
   }
 }
 

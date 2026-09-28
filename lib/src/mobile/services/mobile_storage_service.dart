@@ -53,6 +53,21 @@ class MobileStorageService {
       return null;
     }
   }
+
+  /// 应用专属外部日志目录（`Android/data/<pkg>/files/logs`，#533）。
+  ///
+  /// 与下载目录同理，调用本身会让 framework 创建该目录树；日志目录随后
+  /// 由 [LogService.relocateTo] 从内部私有存储迁移过来，供 adb / 电脑
+  /// 无需 Root 直接访问，便于排障。
+  static Future<String?> appExternalLogsDir() async {
+    if (!supported) return null;
+    try {
+      return await _channel.invokeMethod<String>('getExternalLogsDir');
+    } on PlatformException catch (e) {
+      logInfo(_tag, 'getExternalLogsDir failed: ${e.message}');
+      return null;
+    }
+  }
 }
 
 /// 调起系统文件管理器选择下载目录，并处理：

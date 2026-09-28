@@ -1,0 +1,775 @@
+//! 下载页挂到 shell 统一顶栏的插槽：「新建」主按钮（与内容区左缘对齐）、搜索框、「视图」选项菜单。
+//!
+//! 插槽是独立实体（shell 在标题栏里渲染它，不在 [`DownloadView`] 的元素树内），
+//! 通过弱引用把操作转发给下载页；视图偏好的改写沿用 `mutate_prefs` 的重算与防抖持久化。
+
+use std::rc::Rc;
+
+use fluxdown_ui_components::{CheckState, ControlExt as _, FluxIcon, check_mark, segmented_tabs};
+use fluxdown_ui_i18n::{Translator, keys};
+use fluxdown_ui_theme::active_theme;
+use gpui::{
+    Anchor, AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, FocusHandle,
+    Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled,
+    WeakEntity, Window, canvas, div, prelude::FluentBuilder as _, px,
+};
+use gpui_component::{
+    Icon, Sizable as _, Size,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{Input, InputState},
+    popover::Popover,
+    scroll::ScrollableElement as _,
+    table::TableState,
+    v_flex,
+};
+
+use crate::{
+    components::task_table::{DownloadTableDelegate, DraggedColumnMenuItem},
+    model::view_prefs::{
+        DetailPlacement, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey,
+    },
+    pages::downloads::DownloadView,
+    strings::SEARCH_SHORTCUT_HINT,
+};
+
+/// 搜索框宽度（窄窗口下可收缩到 [`SEARCH_MIN_WIDTH`]）。
+const SEARCH_WIDTH: Pixels = px(280.);
+const SEARCH_MIN_WIDTH: Pixels = px(160.);
+/// 视图菜单宽度（容纳四个分段标签）。
+const VIEW_MENU_WIDTH: Pixels = px(320.);
+/// 视图菜单滚动区的最大高度；窗口较矮时再按可见高度收紧。
+const VIEW_MENU_MAX_BODY_HEIGHT: Pixels = px(420.);
+/// 弹层打开在顶栏下方：可见高度需扣除顶栏（40）、标签头与上下留白。
+const VIEW_MENU_WINDOW_RESERVE: Pixels = px(120.);
+
+/// 视图菜单的分页（分段标签）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ViewMenuPage {
+    #[default]
+    Columns,
+    Group,
+    Sort,
+    Display,
+}
+
+impl ViewMenuPage {
+    const ALL: [Self; 4] = [Self::Columns, Self::Group, Self::Sort, Self::Display];
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Columns => "viewSectionColumns",
+            Self::Group => "viewSectionGroupBy",
+            Self::Sort => "viewSectionSort",
+            Self::Display => "viewSectionDisplay",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL
+            .iter()
+            .position(|page| *page == self)
+            .unwrap_or_default()
+    }
+}
+
+const GROUP_OPTIONS: [ViewGroupBy; 7] = [
+    ViewGroupBy::None,
+    ViewGroupBy::Status,
+    ViewGroupBy::Date,
+    ViewGroupBy::Type,
+    ViewGroupBy::Queue,
+    ViewGroupBy::Site,
+    ViewGroupBy::Group,
+];
+
+const SORT_OPTIONS: [ViewSortKey; 6] = [
+    ViewSortKey::Smart,
+    ViewSortKey::Created,
+    ViewSortKey::Name,
+    ViewSortKey::Size,
+    ViewSortKey::Progress,
+    ViewSortKey::Speed,
+];
+
+fn group_by_key(group_by: ViewGroupBy) -> &'static str {
+    match group_by {
+        ViewGroupBy::None => "viewGroupNone",
+        ViewGroupBy::Status => "viewGroupStatus",
+        ViewGroupBy::Date => "viewGroupDate",
+        ViewGroupBy::Type => "viewGroupType",
+        ViewGroupBy::Queue => "viewGroupQueue",
+        ViewGroupBy::Site => "viewGroupSite",
+        ViewGroupBy::Group => "viewGroupGroup",
+    }
+}
+
+fn sort_key_key(sort_key: ViewSortKey) -> &'static str {
+    match sort_key {
+        ViewSortKey::Smart => "viewSortSmart",
+        ViewSortKey::Created => "viewSortCreated",
+        ViewSortKey::Name => "viewSortName",
+        ViewSortKey::Size => "viewSortSize",
+        ViewSortKey::Progress => "viewSortProgress",
+        ViewSortKey::Speed => "viewSortSpeed",
+    }
+}
+
+/// 顶栏内可交互元素的包裹：拦截左键按下冒泡，避免触发标题栏的窗口拖拽 / 双击缩放。
+fn interactive(child: impl IntoElement) -> Div {
+    div()
+        .flex_none()
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .child(child)
+}
+
+/// 下载页的统一顶栏插槽。
+pub struct DownloadTitleBar {
+    view: WeakEntity<DownloadView>,
+    translator: Entity<Translator>,
+    search_input: Entity<InputState>,
+    /// 搜索框外壳的焦点句柄：输入框（后代）聚焦时外壳切换为聚焦外观。
+    search_focus: FocusHandle,
+    table_state: Entity<TableState<DownloadTableDelegate>>,
+    /// 「视图」弹层当前分页。
+    view_menu_page: ViewMenuPage,
+    /// 插槽自身左缘的窗口横坐标（上一帧 prepaint 测得），与下载页 `content_left` 相减得前导留白。
+    slot_left: Pixels,
+}
+
+impl DownloadTitleBar {
+    pub(crate) fn new(
+        view: &Entity<DownloadView>,
+        translator: Entity<Translator>,
+        search_input: Entity<InputState>,
+        table_state: Entity<TableState<DownloadTableDelegate>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(view, |_, _, cx| cx.notify()).detach();
+        Self {
+            view: view.downgrade(),
+            translator,
+            search_input,
+            search_focus: cx.focus_handle(),
+            table_state,
+            view_menu_page: ViewMenuPage::default(),
+            slot_left: px(0.),
+        }
+    }
+
+    /// 顶栏搜索框：chrome 上的浅色填充胶囊，无描边；聚焦时变为内容底色 + 强调色描边。
+    /// 未输入时右侧显示快捷键提示徽标。
+    fn render_search(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let colors = tokens.colors;
+        let chrome = extended.colors;
+        let caption = extended.caption;
+        let input_focus = self.search_input.read(cx).focus_handle(cx);
+        let empty = self.search_input.read(cx).value().is_empty();
+        h_flex()
+            .id("download-search-box")
+            .track_focus(&self.search_focus)
+            .w(SEARCH_WIDTH)
+            .min_w(SEARCH_MIN_WIDTH)
+            .flex_shrink(1.)
+            .h(theme.density().control)
+            .pl(tokens.spacing.sm)
+            .pr(tokens.spacing.xs)
+            .gap(tokens.spacing.xs)
+            .items_center()
+            .rounded(tokens.radius.md)
+            .border(extended.stroke.thin)
+            .map(|this| {
+                // 聚焦外观在渲染时判定（焦点变化会刷新窗口）；悬停样式在 gpui 里晚于
+                // 焦点样式应用，所以只在未聚焦时挂悬停，避免聚焦态被悬停盖成灰底。
+                if self.search_focus.contains_focused(window, cx) {
+                    this.bg(colors.surface)
+                        .border_color(colors.primary.opacity(0.6))
+                } else {
+                    this.bg(chrome.nav_hover)
+                        .border_color(colors.primary.opacity(0.))
+                        .hover(move |style| style.bg(chrome.nav_selected))
+                }
+            })
+            .cursor_text()
+            .on_click(move |_, window, cx| window.focus(&input_focus, cx))
+            // 原下载页 `escape` 语义：清空查询并把焦点交回下载页。
+            .on_action(
+                cx.listener(|this, action: &gpui_component::input::Escape, window, cx| {
+                    let _ = this.view.update(cx, |view, cx| {
+                        view.on_search_escape(action, window, cx);
+                    });
+                }),
+            )
+            .child(
+                Icon::new(FluxIcon::Search)
+                    .size(extended.icon.md)
+                    .text_color(colors.muted_foreground),
+            )
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.search_input)
+                        .appearance(false)
+                        .with_size(Size::Small)
+                        .text_size(tokens.typography.sm.size)
+                        .w_full()
+                        .cleanable(true),
+                ),
+            )
+            .when(empty, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .px(tokens.spacing.xs)
+                        .rounded(tokens.radius.sm)
+                        .border(extended.stroke.thin)
+                        .border_color(chrome.hairline)
+                        .bg(colors.surface)
+                        .text_size(caption.size)
+                        .line_height(caption.line_height)
+                        .text_color(chrome.text_tertiary)
+                        .child(SEARCH_SHORTCUT_HINT),
+                )
+            })
+    }
+
+    fn render_view_menu(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let translator = self.translator.read(cx);
+        let trigger_label = SharedString::from(translator.text("viewMenuLabel").to_owned());
+        let tooltip = SharedString::from(translator.text("viewOptionsTitle").to_owned());
+        let view = self.view.clone();
+        let translator = self.translator.clone();
+        let table_state = self.table_state.clone();
+        let title_bar = cx.entity().downgrade();
+
+        Popover::new("download-view-popover")
+            .anchor(Anchor::TopRight)
+            .p_0()
+            .w(VIEW_MENU_WIDTH)
+            .trigger(
+                Button::new("download-view")
+                    .ghost()
+                    .control(cx)
+                    .icon(FluxIcon::SlidersHorizontal)
+                    .label(trigger_label)
+                    .tooltip(tooltip),
+            )
+            .content(move |_, window, cx| {
+                let page = title_bar
+                    .upgrade()
+                    .map(|title_bar| title_bar.read(cx).view_menu_page)
+                    .unwrap_or_default();
+                let body_max_height = VIEW_MENU_MAX_BODY_HEIGHT
+                    .min(window.viewport_size().height - VIEW_MENU_WINDOW_RESERVE)
+                    .max(active_theme(cx).density().nav_row * 3.);
+                view_menu_content(
+                    ViewMenuContext {
+                        title_bar: &title_bar,
+                        view: &view,
+                        translator: &translator,
+                        table_state: &table_state,
+                        page,
+                        body_max_height,
+                    },
+                    cx,
+                )
+            })
+    }
+}
+
+impl Render for DownloadTitleBar {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let spacing = active_theme(cx).tokens().spacing;
+        let new_label =
+            SharedString::from(self.translator.read(cx).text(keys::NEW_DOWNLOAD).to_owned());
+        let view = self.view.clone();
+        // 主按钮左缘 = 内容区左缘 + 一档留白（由 flex gap 提供）；未测得前 /
+        // 顶栏前导区（交通灯、应用菜单）更宽时贴插槽左缘。
+        let content_left = self
+            .view
+            .upgrade()
+            .map_or(px(0.), |view| view.read(cx).content_left);
+        let leading = if content_left > px(0.) {
+            (content_left - self.slot_left).max(px(0.))
+        } else {
+            px(0.)
+        };
+        let title_bar = cx.entity().downgrade();
+
+        h_flex()
+            .relative()
+            .size_full()
+            .min_w_0()
+            .items_center()
+            .gap(spacing.sm)
+            // 前导留白可在窄窗口下先于搜索框收缩；空白处保持窗口拖拽。
+            .child(div().flex_shrink(1.).min_w_0().w(leading))
+            .child(interactive(
+                Button::new("download-create")
+                    .primary()
+                    .control(cx)
+                    .icon(FluxIcon::Plus)
+                    .label(new_label)
+                    .on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |view, cx| view.open_new_download(window, cx));
+                    }),
+            ))
+            .child(div().flex_1().min_w_0())
+            .child(
+                interactive(self.render_search(window, cx))
+                    .flex_shrink(1.)
+                    .min_w(SEARCH_MIN_WIDTH),
+            )
+            .child(interactive(self.render_view_menu(cx)))
+            .child(left_edge_probe(
+                title_bar,
+                |title_bar| title_bar.slot_left,
+                |title_bar, left| title_bar.slot_left = left,
+            ))
+    }
+}
+
+/// 测量父元素左缘的窗口横坐标，变化时写回 `entity` 并重绘（下一帧生效）。
+///
+/// 父元素须 `relative()`；测量层显式 `inset_0()` 铺满父元素——只写 `size_full()` 的
+/// 绝对定位层会落在静态位置（`ElementExt::on_prepaint` 即如此），原点偏离父元素。
+pub(crate) fn left_edge_probe<T: 'static>(
+    entity: WeakEntity<T>,
+    get: fn(&T) -> Pixels,
+    set: fn(&mut T, Pixels),
+) -> impl IntoElement {
+    canvas(
+        move |bounds, window, cx| {
+            let left = bounds.origin.x;
+            let changed = entity
+                .upgrade()
+                .is_some_and(|entity| get(entity.read(cx)) != left);
+            if !changed {
+                return;
+            }
+            window.defer(cx, move |_, cx| {
+                let _ = entity.update(cx, |entity, cx| {
+                    set(entity, left);
+                    cx.notify();
+                });
+            });
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// 视图菜单共用的样式快照（颜色与尺寸均取自已缩放的 token）。
+#[derive(Clone, Copy)]
+struct MenuStyle {
+    pad_x: Pixels,
+    gap: Pixels,
+    section_top: Pixels,
+    section_bottom: Pixels,
+    radius: Pixels,
+    row_height: Pixels,
+    stroke: Pixels,
+    body_size: Pixels,
+    caption_size: Pixels,
+    caption_line_height: Pixels,
+    icon_sm: Pixels,
+    icon_md: Pixels,
+    foreground: Hsla,
+    tertiary: Hsla,
+    hover: Hsla,
+    hairline: Hsla,
+    accent: Hsla,
+}
+
+impl MenuStyle {
+    fn from_app(cx: &App) -> Self {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        Self {
+            pad_x: tokens.spacing.md,
+            gap: tokens.spacing.sm,
+            section_top: tokens.spacing.sm,
+            section_bottom: tokens.spacing.xxs,
+            radius: tokens.radius.sm,
+            row_height: theme.density().nav_row,
+            stroke: extended.stroke.thin,
+            body_size: tokens.typography.sm.size,
+            caption_size: extended.caption.size,
+            caption_line_height: extended.caption.line_height,
+            icon_sm: extended.icon.sm,
+            icon_md: extended.icon.md,
+            foreground: tokens.colors.foreground,
+            tertiary: extended.colors.text_tertiary,
+            hover: extended.colors.row_hover,
+            hairline: extended.colors.hairline,
+            accent: tokens.colors.accent,
+        }
+    }
+
+    fn section_title(self, label: impl Into<SharedString>) -> Div {
+        div()
+            .px(self.pad_x)
+            .pt(self.section_top)
+            .pb(self.section_bottom)
+            .text_size(self.caption_size)
+            .line_height(self.caption_line_height)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(self.tertiary)
+            .child(label.into())
+    }
+
+    fn separator(self) -> Div {
+        div()
+            .h(self.stroke)
+            .my(self.section_bottom)
+            .bg(self.hairline)
+    }
+
+    /// 单选 / 开关行：左侧对勾标记当前值。
+    fn option_row(
+        self,
+        id: impl Into<ElementId>,
+        label: impl Into<SharedString>,
+        checked: bool,
+        on_click: impl Fn(&mut App) + 'static,
+    ) -> impl IntoElement {
+        h_flex()
+            .id(id)
+            .h(self.row_height)
+            .mx(self.section_bottom)
+            .px(self.pad_x - self.section_bottom)
+            .gap(self.gap)
+            .items_center()
+            .rounded(self.radius)
+            .cursor_pointer()
+            .text_size(self.body_size)
+            .text_color(self.foreground)
+            .hover(move |style| style.bg(self.hover))
+            .child(div().flex_none().w(self.icon_md).when(checked, |this| {
+                this.child(
+                    Icon::new(FluxIcon::Check)
+                        .size(self.icon_md)
+                        .text_color(self.foreground),
+                )
+            }))
+            .child(div().flex_1().min_w_0().truncate().child(label.into()))
+            .on_click(move |_, _, cx| on_click(cx))
+    }
+}
+
+/// 经下载页改写视图偏好（重算可见行 + 防抖持久化，与快捷键 `on_cycle_*` 同路径）。
+fn update_prefs(
+    view: &WeakEntity<DownloadView>,
+    mutate: impl FnOnce(&mut ViewPrefs) + 'static,
+    cx: &mut App,
+) {
+    let _ = view.update(cx, |view, cx| view.mutate_prefs(mutate, cx));
+}
+
+/// 视图菜单一次渲染所需的上下文。
+struct ViewMenuContext<'a> {
+    title_bar: &'a WeakEntity<DownloadTitleBar>,
+    view: &'a WeakEntity<DownloadView>,
+    translator: &'a Entity<Translator>,
+    table_state: &'a Entity<TableState<DownloadTableDelegate>>,
+    page: ViewMenuPage,
+    /// 滚动区最大高度（已按窗口可见高度收紧）。
+    body_max_height: Pixels,
+}
+
+/// 视图菜单：顶部分段标签切页（列 / 分组 / 排序 / 显示），下方为可纵向滚动的选项区；
+/// 每页内容都不超过弹层最大高度，窗口过矮时滚动而非被裁切。
+fn view_menu_content(menu: ViewMenuContext<'_>, cx: &App) -> impl IntoElement + use<> {
+    let style = MenuStyle::from_app(cx);
+    let spacing = active_theme(cx).tokens().spacing;
+    let translator = menu.translator.read(cx);
+    let tabs = {
+        let title_bar = menu.title_bar.clone();
+        segmented_tabs(
+            "download-view-menu-tabs",
+            ViewMenuPage::ALL
+                .map(|page| SharedString::from(translator.text(page.label_key()).to_owned())),
+            menu.page.index(),
+            move |index, _, cx| {
+                let Some(page) = ViewMenuPage::ALL.get(index).copied() else {
+                    return;
+                };
+                let _ = title_bar.update(cx, |title_bar, cx| {
+                    title_bar.view_menu_page = page;
+                    cx.notify();
+                });
+            },
+            cx,
+        )
+    };
+    let body = match menu.page {
+        ViewMenuPage::Columns => columns_page(&menu, style, cx),
+        ViewMenuPage::Group => group_page(&menu, style, cx),
+        ViewMenuPage::Sort => sort_page(&menu, style, cx),
+        ViewMenuPage::Display => display_page(&menu, style, cx),
+    };
+
+    v_flex()
+        .w_full()
+        .child(
+            div()
+                .flex()
+                .px(style.pad_x)
+                .pt(style.pad_x)
+                .pb(spacing.sm)
+                .child(tabs),
+        )
+        .child(
+            v_flex()
+                .w_full()
+                .max_h(menu.body_max_height)
+                .pb(spacing.xs)
+                .children(body)
+                .overflow_y_scrollbar()
+                .id(SharedString::from(format!(
+                    "download-view-menu-{:?}",
+                    menu.page
+                ))),
+        )
+}
+
+fn menu_text(menu: &ViewMenuContext<'_>, key: &str, cx: &App) -> SharedString {
+    SharedString::from(menu.translator.read(cx).text(key).to_owned())
+}
+
+/// 列页：勾选显隐 + 拖动排序（手柄在右）+ 重置。
+fn columns_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<AnyElement> {
+    let table_state = menu.table_state;
+    let delegate = table_state.read(cx).delegate();
+    let columns = delegate.columns.clone();
+    let visible_count = columns.iter().filter(|column| column.visible).count();
+    let persist: Rc<dyn Fn(&mut App)> = {
+        let view = menu.view.clone();
+        Rc::new(move |cx: &mut App| {
+            let _ = view.update(cx, |view, cx| view.schedule_persist_prefs(cx));
+        })
+    };
+    let mut rows = columns
+        .into_iter()
+        .map(|column| {
+            let kind = column.kind;
+            let visible = column.visible;
+            let label = kind.label(&delegate.strings);
+            let drag = DraggedColumnMenuItem {
+                kind,
+                label: label.clone(),
+            };
+            let table_for_checkbox = table_state.clone();
+            let table_for_drop = table_state.clone();
+            let persist_checkbox = Rc::clone(&persist);
+            let persist_drop = Rc::clone(&persist);
+            h_flex()
+                .id(format!("download-column-menu-item-{}", kind.key()))
+                .h(style.row_height)
+                .mx(style.section_bottom)
+                .px(style.pad_x - style.section_bottom)
+                .gap(style.gap)
+                .items_center()
+                .rounded(style.radius)
+                .cursor_pointer()
+                .text_size(style.body_size)
+                .text_color(style.foreground)
+                .hover(move |this| this.bg(style.hover))
+                .drag_over::<DraggedColumnMenuItem>(move |this, _, _, _| this.bg(style.accent))
+                .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
+                .on_drop(move |drag: &DraggedColumnMenuItem, _, cx| {
+                    table_for_drop.update(cx, |table, cx| {
+                        table.delegate_mut().move_column_kind(drag.kind, kind);
+                        table.refresh(cx);
+                        cx.notify();
+                    });
+                    persist_drop(cx);
+                })
+                // 整行可点切换显隐（比小复选框更好点中）；拖动行不会产生 click。
+                .on_click(move |_, _, cx| {
+                    let changed = table_for_checkbox.update(cx, |table, cx| {
+                        let changed = table.delegate_mut().set_column_visible(kind, !visible);
+                        if changed {
+                            table.refresh(cx);
+                            cx.notify();
+                        }
+                        changed
+                    });
+                    if changed {
+                        persist_checkbox(cx);
+                    }
+                })
+                .child(check_mark(
+                    if visible {
+                        CheckState::Checked
+                    } else {
+                        CheckState::Unchecked
+                    },
+                    cx,
+                ))
+                .child(div().min_w_0().flex_1().truncate().child(label))
+                .child(
+                    Icon::new(FluxIcon::GripVertical)
+                        .size(style.icon_sm)
+                        .text_color(style.tertiary),
+                )
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+    if visible_count == 1 {
+        rows.push(
+            div()
+                .px(style.pad_x)
+                .py(style.section_bottom)
+                .text_size(style.caption_size)
+                .line_height(style.caption_line_height)
+                .text_color(style.tertiary)
+                .child(menu_text(menu, keys::VIEW_COLUMNS_AT_LEAST_ONE, cx))
+                .into_any_element(),
+        );
+    }
+    rows.push(style.separator().into_any_element());
+    let table_state = table_state.clone();
+    rows.push(
+        style
+            .option_row(
+                "download-columns-reset",
+                menu_text(menu, keys::VIEW_COLUMNS_RESET_ACTION, cx),
+                false,
+                move |cx| {
+                    table_state.update(cx, |table, cx| {
+                        table.delegate_mut().reset_columns();
+                        table.refresh(cx);
+                        cx.notify();
+                    });
+                    persist(cx);
+                },
+            )
+            .into_any_element(),
+    );
+    rows
+}
+
+/// 分组页：单选分组方式。
+fn group_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<AnyElement> {
+    let current = menu.table_state.read(cx).delegate().prefs().group_by;
+    GROUP_OPTIONS
+        .into_iter()
+        .map(|group_by| {
+            let view = menu.view.clone();
+            style
+                .option_row(
+                    SharedString::from(format!("download-view-group-{group_by:?}")),
+                    menu_text(menu, group_by_key(group_by), cx),
+                    current == group_by,
+                    move |cx| update_prefs(&view, move |prefs| prefs.group_by = group_by, cx),
+                )
+                .into_any_element()
+        })
+        .collect()
+}
+
+/// 排序页：排序键 + 方向。
+fn sort_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<AnyElement> {
+    let prefs = menu.table_state.read(cx).delegate().prefs();
+    let (current_key, current_dir) = (prefs.sort_key, prefs.sort_dir);
+    let mut rows = SORT_OPTIONS
+        .into_iter()
+        .map(|sort_key| {
+            let view = menu.view.clone();
+            style
+                .option_row(
+                    SharedString::from(format!("download-view-sort-{sort_key:?}")),
+                    menu_text(menu, sort_key_key(sort_key), cx),
+                    current_key == sort_key,
+                    move |cx| update_prefs(&view, move |prefs| prefs.sort_key = sort_key, cx),
+                )
+                .into_any_element()
+        })
+        .collect::<Vec<_>>();
+    rows.push(style.separator().into_any_element());
+    for (sort_dir, key) in [
+        (SortDir::Asc, "viewSortAscending"),
+        (SortDir::Desc, "viewSortDescending"),
+    ] {
+        let view = menu.view.clone();
+        rows.push(
+            style
+                .option_row(
+                    SharedString::from(format!("download-view-sort-dir-{sort_dir:?}")),
+                    menu_text(menu, key, cx),
+                    current_dir == sort_dir,
+                    move |cx| update_prefs(&view, move |prefs| prefs.sort_dir = sort_dir, cx),
+                )
+                .into_any_element(),
+        );
+    }
+    rows
+}
+
+/// 显示页：密度 + 详情面板（开关 + 位置）。
+fn display_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<AnyElement> {
+    let prefs = menu.table_state.read(cx).delegate().prefs().clone();
+    let mut rows = vec![
+        style
+            .section_title(menu_text(menu, "viewSectionDensity", cx))
+            .into_any_element(),
+    ];
+    for (density, key) in [
+        (ViewDensity::Compact, "viewDensityCompact"),
+        (ViewDensity::Comfortable, "viewDensityComfortable"),
+    ] {
+        let view = menu.view.clone();
+        rows.push(
+            style
+                .option_row(
+                    SharedString::from(format!("download-view-density-{density:?}")),
+                    menu_text(menu, key, cx),
+                    prefs.density == density,
+                    move |cx| update_prefs(&view, move |prefs| prefs.density = density, cx),
+                )
+                .into_any_element(),
+        );
+    }
+    rows.push(style.separator().into_any_element());
+    rows.push(
+        style
+            .section_title(menu_text(menu, "viewSectionDetailPanel", cx))
+            .into_any_element(),
+    );
+    let view = menu.view.clone();
+    rows.push(
+        style
+            .option_row(
+                "download-view-detail-open",
+                menu_text(menu, "viewDetailShow", cx),
+                prefs.detail_open,
+                move |cx| update_prefs(&view, |prefs| prefs.detail_open = !prefs.detail_open, cx),
+            )
+            .into_any_element(),
+    );
+    for (placement, key) in [
+        (DetailPlacement::Bottom, "viewDetailBottom"),
+        (DetailPlacement::Right, "viewDetailRight"),
+    ] {
+        let view = menu.view.clone();
+        rows.push(
+            style
+                .option_row(
+                    SharedString::from(format!("download-view-detail-{placement:?}")),
+                    menu_text(menu, key, cx),
+                    prefs.detail_placement == placement,
+                    move |cx| {
+                        update_prefs(&view, move |prefs| prefs.detail_placement = placement, cx)
+                    },
+                )
+                .into_any_element(),
+        );
+    }
+    rows
+}

@@ -1,17 +1,14 @@
 //! 关于：版本、软件更新、日志导出、浏览器扩展与捐赠链接。
 
 use fluxdown_protocol::method;
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, IntoElement as _, ParentElement, SharedString, Styled, div};
-use gpui_component::{
-    Icon, IconName, h_flex,
-    setting::{SettingField, SettingGroup, SettingItem, SettingPage},
-    v_flex,
-};
+use gpui_component::{h_flex, v_flex};
 use serde_json::json;
 
 use super::SectionContext;
+use crate::ui::{Control, SettingsPage, SettingsRow, SettingsSection, body_text, meta_text};
 
 pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const WEBSITE: &str = "https://fluxdown.zerx.dev";
@@ -20,29 +17,33 @@ const FIREFOX_STORE: &str = "https://addons.mozilla.org/firefox/addon/fluxdown/"
 const EDGE_STORE: &str = "https://microsoftedge.microsoft.com/addons/search/FluxDown";
 const DONATE: &str = "https://fluxdown.zerx.dev/sponsor";
 
-pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingPage {
-    SettingPage::new(ctx.t("settingsCatAbout"))
-        .icon(Icon::new(IconName::Info))
-        .description(ctx.t("settingsCatAboutDesc"))
-        .resettable(false)
-        .group(version_group(ctx))
-        .group(update_group(ctx))
-        .group(logs_group(ctx))
-        .group(links_group(ctx))
+pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
+    SettingsPage::new(
+        "about",
+        ctx.t("settingsCatAbout"),
+        ctx.t("settingsCatAboutDesc"),
+        FluxIcon::Info,
+    )
+    .sections([
+        version_section(ctx),
+        update_section(ctx),
+        logs_section(ctx),
+        links_section(ctx),
+    ])
 }
 
-fn version_group(ctx: &SectionContext) -> SettingGroup {
+fn version_section(ctx: &SectionContext) -> SettingsSection {
     let version = SharedString::from(format!("v{APP_VERSION}"));
-    SettingGroup::new()
+    SettingsSection::new()
         .title(SharedString::from("FluxDown"))
-        .item(ctx.item(
+        .row(ctx.item(
             "currentVersion",
             None,
-            SettingField::render(move |_, _, _| div().text_sm().child(version.clone())),
+            Control::custom(move |_, _, _, cx: &mut App| body_text(cx).child(version.clone())),
         ))
 }
 
-fn update_group(ctx: &SectionContext) -> SettingGroup {
+fn update_section(ctx: &SectionContext) -> SettingsSection {
     let channels = vec![
         (SharedString::from("stable"), ctx.t("updateChannelStable")),
         (
@@ -50,32 +51,32 @@ fn update_group(ctx: &SectionContext) -> SettingGroup {
             ctx.t("updateChannelFrontier"),
         ),
     ];
-    SettingGroup::new()
+    SettingsSection::new()
         .title(ctx.t("softwareUpdate"))
-        .item(ctx.item(
+        .row(ctx.item(
             "updateChannel",
             Some("updateChannelDesc"),
             ctx.pref_dropdown("general.update_channel", "stable", channels),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "autoCheckUpdate",
             Some("autoCheckUpdateDesc"),
             ctx.pref_switch("general.auto_check_update", true),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "checkUpdate",
             Some("checkUpdateDesc"),
-            check_update_field(ctx),
+            check_update_control(ctx),
         ))
-        .item(release_notes_item(ctx))
+        .row(release_notes_item(ctx))
 }
 
-fn check_update_field(ctx: &SectionContext) -> SettingField<SharedString> {
+fn check_update_control(ctx: &SectionContext) -> Control {
     let store = ctx.store();
     let translator = ctx.translator.clone();
     let check = ctx.t("checkUpdate");
     let latest = ctx.t("latestVersion");
-    SettingField::render(move |options, _, cx: &mut App| {
+    Control::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let busy = store.read(cx).is_busy("update");
         let result = store.read(cx).update_check().cloned();
@@ -105,12 +106,7 @@ fn check_update_field(ctx: &SectionContext) -> SettingField<SharedString> {
         h_flex()
             .gap(tokens.spacing.sm)
             .items_center()
-            .children(status.map(|status| {
-                div()
-                    .text_xs()
-                    .text_color(tokens.colors.muted_foreground)
-                    .child(SharedString::from(status))
-            }))
+            .children(status.map(|status| meta_text(cx).child(SharedString::from(status))))
             .children(download_url.map(|url| {
                 button(
                     "about-update-now",
@@ -121,13 +117,14 @@ fn check_update_field(ctx: &SectionContext) -> SettingField<SharedString> {
                 .on_click(move |_, _, cx| cx.open_url(&url))
             }))
             .child(
-                button(
+                loading_button(
                     "about-check-update",
                     check.clone(),
                     ButtonVariant::Secondary,
+                    busy,
                     cx,
                 )
-                .disabled(options.is_disabled() || busy)
+                .disabled(disabled || busy)
                 .on_click(move |_, _, cx| {
                     click_store.update(cx, |store, cx| {
                         let channel = store.pref_str("general.update_channel", "stable");
@@ -138,9 +135,9 @@ fn check_update_field(ctx: &SectionContext) -> SettingField<SharedString> {
     })
 }
 
-fn release_notes_item(ctx: &SectionContext) -> SettingItem {
+fn release_notes_item(ctx: &SectionContext) -> SettingsRow {
     let store = ctx.store();
-    SettingItem::render(move |_, _, cx: &mut App| {
+    SettingsRow::custom(move |_, _, _, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let Some(result) = store.read(cx).update_check().cloned() else {
             return div().into_any_element();
@@ -154,52 +151,50 @@ fn release_notes_item(ctx: &SectionContext) -> SettingItem {
             .children(result.notes.into_iter().take(10).map(|note| {
                 v_flex()
                     .gap(tokens.spacing.xxs)
-                    .child(div().text_sm().child(SharedString::from(format!(
+                    .child(body_text(cx).child(SharedString::from(format!(
                         "v{} {}",
                         note.version, note.published_at
                     ))))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(tokens.colors.muted_foreground)
-                            .child(SharedString::from(note.body)),
-                    )
+                    .child(meta_text(cx).child(SharedString::from(note.body)))
             }))
             .into_any_element()
     })
 }
 
-fn logs_group(ctx: &SectionContext) -> SettingGroup {
-    SettingGroup::new()
+fn logs_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
         .title(ctx.t("logExport"))
-        .description(ctx.t("logExportDesc"))
-        .item(ctx.item(
+        .subtitle(ctx.t("logExportDesc"))
+        .row(ctx.item(
             "logMaxSize",
             Some("logMaxSizeDesc"),
-            ctx.pref_number("log_max_size_mb", 10, 1, 1024),
+            ctx.pref_number("log_max_size_mb", 10, 1, 1024).unit("MB"),
         ))
-        .item(ctx.item("logExportButton", None, export_field(ctx)))
+        .row(ctx.item("logExportButton", None, export_control(ctx)))
 }
 
-fn export_field(ctx: &SectionContext) -> SettingField<SharedString> {
+fn export_control(ctx: &SectionContext) -> Control {
     let store = ctx.store();
     let export = ctx.t("logExportButton");
     let open = ctx.t("doctorActionOpenLogDir");
-    SettingField::render(move |options, _, cx: &mut App| {
+    Control::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         let busy = store.read(cx).is_busy("logExport");
+        let opening = store.read(cx).is_busy_tagged("logExport", "openLogDir");
+        let exporting = store.read(cx).is_busy_tagged("logExport", "exportLogs");
         let export_store = store.clone();
         let open_store = store.clone();
         h_flex()
             .gap(tokens.spacing.sm)
             .child(
-                button(
+                loading_button(
                     "about-open-log-dir",
                     open.clone(),
                     ButtonVariant::Secondary,
+                    opening,
                     cx,
                 )
-                .disabled(options.is_disabled())
+                .disabled(disabled || opening)
                 .on_click(move |_, _, cx| {
                     open_store.update(cx, |store, cx| {
                         store.call_with(
@@ -221,20 +216,23 @@ fn export_field(ctx: &SectionContext) -> SettingField<SharedString> {
                                         None,
                                         cx,
                                     );
+                                    store.tag_busy("logExport", "openLogDir");
                                 }
                             },
                         );
+                        store.tag_busy("logExport", "openLogDir");
                     });
                 }),
             )
             .child(
-                button(
+                loading_button(
                     "about-export-logs",
                     export.clone(),
                     ButtonVariant::Primary,
+                    exporting,
                     cx,
                 )
-                .disabled(options.is_disabled() || busy)
+                .disabled(disabled || busy)
                 .on_click(move |_, _, cx| {
                     let store = export_store.clone();
                     let receiver =
@@ -250,6 +248,7 @@ fn export_field(ctx: &SectionContext) -> SettingField<SharedString> {
                                     Some("logExportSuccessNotice"),
                                     cx,
                                 );
+                                store.tag_busy("logExport", "exportLogs");
                             });
                         }
                     })
@@ -259,11 +258,11 @@ fn export_field(ctx: &SectionContext) -> SettingField<SharedString> {
     })
 }
 
-fn links_group(ctx: &SectionContext) -> SettingGroup {
-    SettingGroup::new()
+fn links_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
         .title(ctx.t("extensionCardTitle"))
-        .description(ctx.t("extensionCardDesc"))
-        .item(link_item(
+        .subtitle(ctx.t("extensionCardDesc"))
+        .row(link_item(
             ctx,
             "extensionCardTitle",
             &[
@@ -272,10 +271,10 @@ fn links_group(ctx: &SectionContext) -> SettingGroup {
                 ("Edge", EDGE_STORE),
             ],
         ))
-        .item(link_item(
+        .row(link_item(
             ctx,
             "donateTitle",
-            &[("donateButton", DONATE), ("website", WEBSITE)],
+            &[("donateButton", DONATE), ("officialWebsite", WEBSITE)],
         ))
 }
 
@@ -283,7 +282,7 @@ fn link_item(
     ctx: &SectionContext,
     title_key: &str,
     links: &[(&'static str, &'static str)],
-) -> SettingItem {
+) -> SettingsRow {
     let links: Vec<(SharedString, &'static str)> = links
         .iter()
         .map(|(label, url)| {
@@ -292,14 +291,14 @@ fn link_item(
         })
         .collect();
     let title = ctx.t(title_key);
-    SettingItem::render(move |_, _, cx: &mut App| {
+    SettingsRow::custom(move |_, _, _, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
         h_flex()
             .w_full()
             .items_center()
             .justify_between()
             .gap(tokens.spacing.md)
-            .child(div().text_sm().child(title.clone()))
+            .child(body_text(cx).child(title.clone()))
             .child(
                 h_flex()
                     .gap(tokens.spacing.sm)

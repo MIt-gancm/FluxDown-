@@ -22,6 +22,7 @@ import 'queue_manager_dialog.dart';
 import 'rss_manager_dialog.dart';
 import 'rss_wizard_dialog.dart';
 import '../models/rss_provider.dart';
+import '../models/plugin_provider.dart';
 import '../services/cloud/cloud_auth_service.dart';
 import '../services/cloud/device_identity.dart';
 import '../services/link/local_pairing_service.dart';
@@ -31,11 +32,13 @@ class Sidebar extends StatefulWidget {
   final DownloadController controller;
   final SettingsProvider settingsProvider;
   final RssProvider rssProvider;
+  final PluginProvider pluginProvider;
   const Sidebar({
     super.key,
     required this.controller,
     required this.settingsProvider,
     required this.rssProvider,
+    required this.pluginProvider,
   });
 
   @override
@@ -422,7 +425,12 @@ class _SidebarState extends State<Sidebar> {
             ),
             trailing: _QueueAddButton(
               c: c,
-              onTap: () => showRssWizardDialog(context, rss, ctrl),
+              onTap: () => showRssWizardDialog(
+                context,
+                rss,
+                ctrl,
+                widget.pluginProvider,
+              ),
             ),
           ),
         ),
@@ -444,8 +452,13 @@ class _SidebarState extends State<Sidebar> {
               onTap: () => rss.select(source.sourceId),
               isRefreshing: rss.isRefreshing(source.sourceId),
               onRefresh: () => rss.refresh(source.sourceId),
-              onManage: () =>
-                  showRssManagerDialog(context, rss, ctrl, source.sourceId),
+              onManage: () => showRssManagerDialog(
+                context,
+                rss,
+                ctrl,
+                widget.pluginProvider,
+                source.sourceId,
+              ),
               onDelete: () => _showDeleteRssDialog(context, rss, s, c, source),
             ),
         ],

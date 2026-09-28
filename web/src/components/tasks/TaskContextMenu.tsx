@@ -2,11 +2,11 @@
 // 对齐 design/web/app.js ctxItems()。
 
 import * as ContextMenu from '@radix-ui/react-context-menu'
-import { ChevronRight, Copy, Download, Link2, ListOrdered, Pause, Pencil, Play, RotateCcw, Trash2, Zap } from 'lucide-react'
+import { ChevronRight, Copy, Download, Link, Link2, ListOrdered, Pause, Pencil, Play, RotateCcw, Trash2, Zap } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { taskFileUrl } from '../../lib/api'
 import { confirmDialog } from '../../lib/confirm'
-import { openRenameTask } from '../../lib/dialogs'
+import { openChangeTaskUrl, openRenameTask } from '../../lib/dialogs'
 import { copyText } from '../../lib/copy'
 import { queueDisplayName, taskShareUrl } from '../../lib/format'
 import { useI18n } from '../../lib/i18n'
@@ -38,6 +38,10 @@ export function TaskContextMenu({
   // 与引擎 rename_task 的 bt-unsupported / task-active 拒绝条件对齐。
   const isBt = t.url.startsWith('magnet:') || t.url.startsWith('torrent-file://') || t.url.endsWith('.torrent')
   const canRename = !isBt && t.status !== 1 && t.status !== 5
+  // 换源仅接受 http(s)/ftp 直链，且仅暂停/出错态可改（下载中/准备中/完成态
+  // 拒绝），与引擎 change_task_url 的协议与状态校验对齐。
+  const isHttpOrFtp = /^(https?|ftp):\/\//i.test(t.url)
+  const canChangeUrl = !isBt && isHttpOrFtp && (t.status === 2 || t.status === 4)
   return (
     <ContextMenu.Root>
       {/* 右键只弹菜单，不选中/不打开详情面板（对齐需求：仅左键单击打开）。 */}
@@ -106,6 +110,12 @@ export function TaskContextMenu({
             <ContextMenu.Item className="ctx-item" onSelect={() => openRenameTask({ taskId: t.taskId, fileName: t.fileName })}>
               <Pencil size={14} />
               {tr('task.rename')}
+            </ContextMenu.Item>
+          )}
+          {canChangeUrl && (
+            <ContextMenu.Item className="ctx-item" onSelect={() => openChangeTaskUrl({ taskId: t.taskId, url: t.url })}>
+              <Link size={14} />
+              {tr('task.changeUrl')}
             </ContextMenu.Item>
           )}
           {queues.filter((q) => q.queueId !== t.queueId).length > 0 && (

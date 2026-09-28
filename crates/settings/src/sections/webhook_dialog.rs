@@ -4,32 +4,47 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use fluxdown_protocol::{RpcErrorData, WebhookDeliveriesResponse, WebhookPresetDto, method};
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, IconControlExt as _, card, check_row, choice_chip, field_error,
+    field_hint, field_label, form, form_field, form_row, input_with_action, option_group,
+    option_row,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    Anchor, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity,
-    InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, px,
+    Anchor, AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Div, Entity,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, StyleRefinement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, relative,
 };
 use gpui_component::{
-    Icon, IconName, WindowExt as _,
-    checkbox::Checkbox,
+    Disableable as _, Icon, WindowExt as _,
+    button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     switch::Switch,
+    text::{TextView, TextViewStyle},
     v_flex,
 };
 use serde_json::{Value, json};
 
 use super::webhook::{EndpointSpec, WEBHOOK_EVENTS, read_endpoints, write_endpoints};
 use crate::store::SettingsStore;
+use crate::ui::dialog_footer;
 
 const PRESET_CUSTOM: &str = "custom";
 /// 与 Dart `WebhookEvents.defaults` 一致。
 const DEFAULT_EVENTS: &[&str] = &["task.completed", "task.failed"];
+/// 对话框宽度：左表单 + 右实时预览双栏（与 Flutter `maxWidth: 900` 对齐）；
+/// gpui-component 0.7 会按视口自动收窄，小窗口不会溢出。
+const DIALOG_WIDTH: f32 = 900.;
+/// 双栏区域高度（与 Flutter 512 对齐）：固定高度让「高级」展开 / 收起时对话框不跳动，
+/// 表单超出部分在左栏内滚动；视口不够高时随对话框一起收缩。
+const BODY_HEIGHT: f32 = 512.;
+/// 右栏预览宽度（与 Flutter 300 对齐）。
+const PREVIEW_WIDTH: f32 = 300.;
 
 /// 预览用样例变量——与引擎 `WebhookEvent::sample()` 对齐，仅用于预览。
 const SAMPLE_VARS: &[(&str, &str)] = &[
@@ -268,13 +283,12 @@ pub(crate) fn open(
     );
     let view = cx.new(|cx| WebhookDialog::new(store, translator, existing, window, cx));
     let name = view.read(cx).name.clone();
-    window.open_dialog(cx, move |dialog, _, _| {
+    window.open_dialog(cx, move |dialog, _, cx| {
         let view = view.clone();
         dialog
-            .title(title.clone())
-            .w(px(880.))
-            .margin_top(px(32.))
-            .content(move |content, _, _| content.child(view.clone()))
+            .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+            .w(px(DIALOG_WIDTH))
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
     name.update(cx, |input, cx| input.focus(window, cx));
 }
@@ -610,38 +624,21 @@ impl WebhookDialog {
 
     // ───────────────────────── 渲染 ─────────────────────────
 
-    fn label(&self, key: &str, cx: &App) -> Div {
-        let tokens = active_theme(cx).tokens();
-        div()
-            .text_xs()
-            .font_weight(tokens.typography.sm.weight)
-            .text_color(tokens.colors.muted_foreground)
-            .child(self.t(key))
-    }
-
-    fn hint(&self, text: SharedString, cx: &App) -> Div {
-        let tokens = active_theme(cx).tokens();
-        div()
-            .text_xs()
-            .text_color(tokens.colors.muted_foreground)
-            .child(text)
-    }
-
     fn render_preset_grid(&self, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
-        let mut grid = h_flex().flex_wrap().gap(tokens.spacing.sm);
+        let mut grid = h_flex()
+            .flex_wrap()
+            .gap(tokens.spacing.xs + tokens.spacing.xxs);
         for preset in &self.presets {
             let selected = preset.id == self.preset;
             let id = preset.id.clone();
+            // 悬停样式由 `choice_chip` 一次性决定：gpui 同一元素只能设置一次 `hover`，
+            // 调用方不得再对返回值叠加 `.hover()`。
             grid = grid.child(
-                button(
+                choice_chip(
                     SharedString::from(format!("webhook-preset-{}", preset.id)),
                     SharedString::from(preset.label.clone()),
-                    if selected {
-                        ButtonVariant::Primary
-                    } else {
-                        ButtonVariant::Secondary
-                    },
+                    selected,
                     cx,
                 )
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -654,72 +651,63 @@ impl WebhookDialog {
     }
 
     fn render_url_field(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
         let error = if self.url_touched {
             self.url_error(cx)
         } else {
             None
         };
-        let hint_key = match error {
-            Some(key) => key,
-            None if self.preset == "ntfy" => "webhookUrlHintNtfy",
-            None => "webhookUrlHint",
-        };
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("webhookFieldUrl", cx))
-            .child(Input::new(&self.url).w_full())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if error.is_some() {
-                        tokens.colors.destructive
-                    } else {
-                        tokens.colors.muted_foreground
-                    })
-                    .child(self.t(hint_key)),
-            )
+        let field = form_field(
+            self.t("webhookFieldUrl"),
+            Input::new(&self.url).control(cx).w_full(),
+            None,
+            cx,
+        );
+        match error {
+            Some(key) => field.child(field_error(self.t(key), cx)),
+            None => field.child(field_hint(
+                self.t(if self.preset == "ntfy" {
+                    "webhookUrlHintNtfy"
+                } else {
+                    "webhookUrlHint"
+                }),
+                cx,
+            )),
+        }
     }
 
     fn render_events(&self, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
         let empty = self.events.is_empty();
-        let mut chips = h_flex().flex_wrap().gap(tokens.spacing.sm);
+        let view = cx.entity();
+        // 两列网格：每项占半宽，check_row 自带整行悬停（不得再叠 `.hover()`）。
+        let mut grid = div().flex().flex_wrap().w_full().p(tokens.spacing.xs);
         for (wire, label_key) in WEBHOOK_EVENTS {
             let checked = self.events.contains(*wire);
             let wire = *wire;
-            chips = chips.child(
-                Checkbox::new(SharedString::from(format!("webhook-event-{wire}")))
-                    .label(self.t(label_key))
-                    .checked(checked)
-                    .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                        if *checked {
+            let view = view.clone();
+            grid = grid.child(div().w(relative(0.5)).min_w_0().child(check_row(
+                SharedString::from(format!("webhook-event-{wire}")),
+                checked,
+                self.t(label_key),
+                move |checked, _, cx| {
+                    view.update(cx, |this, cx| {
+                        if checked {
                             this.events.insert(wire.to_owned());
                         } else {
                             this.events.remove(wire);
                         }
                         cx.notify();
-                    })),
-            );
+                    });
+                },
+                cx,
+            )));
         }
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("webhookFieldEvents", cx))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if empty {
-                        tokens.colors.destructive
-                    } else {
-                        tokens.colors.muted_foreground
-                    })
-                    .child(self.t(if empty {
-                        "webhookEventsEmpty"
-                    } else {
-                        "webhookEventsHint"
-                    })),
-            )
-            .child(chips)
+        let field = form_field(self.t("webhookFieldEvents"), card(cx).child(grid), None, cx);
+        if empty {
+            field.child(field_error(self.t("webhookEventsEmpty"), cx))
+        } else {
+            field.child(field_hint(self.t("webhookEventsHint"), cx))
+        }
     }
 
     fn queue_name(&self, id: &str, cx: &App) -> SharedString {
@@ -737,8 +725,8 @@ impl WebhookDialog {
             )
     }
 
-    fn render_queue_filter(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+    /// 队列下拉：与输入框同高、铺满字段宽度。
+    fn render_queue_field(&self, cx: &mut Context<Self>) -> Div {
         let mut options = vec![(String::new(), self.t("webhookQueueAll"))];
         options.extend(self.store.read(cx).queues().iter().map(|queue| {
             (
@@ -748,59 +736,67 @@ impl WebhookDialog {
         }));
         let current = self.queue_id.clone();
         let this = cx.weak_entity();
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("webhookFieldQueue", cx))
-            .child(
-                gpui_component::button::Button::new("webhook-queue")
-                    .label(self.queue_name(&self.queue_id, cx))
-                    .dropdown_caret(true)
-                    .outline()
-                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
-                        options.iter().fold(menu, |menu, (value, label)| {
-                            let this = this.clone();
-                            let value = value.clone();
-                            menu.item(
-                                PopupMenuItem::new(label.clone())
-                                    .checked(*value == current)
-                                    .on_click(move |_, _, cx| {
-                                        let value = value.clone();
-                                        let _ = this.update(cx, |this, cx| {
-                                            this.queue_id = value;
-                                            cx.notify();
-                                        });
-                                    }),
-                            )
-                        })
-                    }),
-            )
+        form_field(
+            self.t("webhookFieldQueue"),
+            Button::new("webhook-queue")
+                .outline()
+                .label(self.queue_name(&self.queue_id, cx))
+                .dropdown_caret(true)
+                .control(cx)
+                .w_full()
+                .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                    options.iter().fold(menu, |menu, (value, label)| {
+                        let this = this.clone();
+                        let value = value.clone();
+                        menu.item(
+                            PopupMenuItem::new(label.clone())
+                                .checked(*value == current)
+                                .on_click(move |_, _, cx| {
+                                    let value = value.clone();
+                                    let _ = this.update(cx, |this, cx| {
+                                        this.queue_id = value;
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                }),
+            None,
+            cx,
+        )
     }
 
     fn render_headers(&self, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
-        let mut column = v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("webhookFieldHeaders", cx));
+        let mut rows = v_flex().w_full().gap(tokens.spacing.sm);
         for row in &self.headers {
             let row_id = row.id;
-            column = column.child(
+            let remove_label = self.t("webhookRowDelete");
+            rows = rows.child(
                 h_flex()
+                    .w_full()
                     .gap(tokens.spacing.sm)
                     .items_center()
-                    .child(div().w(px(150.)).child(Input::new(&row.key).w_full()))
+                    .child(
+                        div()
+                            .w(relative(0.36))
+                            .flex_none()
+                            .child(Input::new(&row.key).control(cx).w_full()),
+                    )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(Input::new(&row.value).w_full()),
+                            .child(Input::new(&row.value).control(cx).w_full()),
                     )
                     .child(
-                        button(
-                            SharedString::from(format!("webhook-header-remove-{row_id}")),
-                            self.t("webhookRowDelete"),
-                            ButtonVariant::Ghost,
-                            cx,
-                        )
+                        Button::new(SharedString::from(format!(
+                            "webhook-header-remove-{row_id}"
+                        )))
+                        .ghost()
+                        .icon(FluxIcon::X)
+                        .control_icon(cx)
+                        .tooltip(remove_label)
                         .on_click(cx.listener(
                             move |this, _: &ClickEvent, _, cx| {
                                 this.headers.retain(|row| row.id != row_id);
@@ -810,57 +806,58 @@ impl WebhookDialog {
                     ),
             );
         }
-        column.child(
-            div().child(
-                button(
-                    "webhook-header-add",
-                    self.t("webhookAddHeader"),
-                    ButtonVariant::Secondary,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    let mut seq = this.header_seq;
-                    let translator = this.translator.clone();
-                    let row = Self::header_row(&mut seq, &translator, "", "", window, cx);
-                    this.header_seq = seq;
-                    this.headers.push(row);
-                    cx.notify();
-                })),
+        rows = rows.child(
+            h_flex().child(
+                Button::new("webhook-header-add")
+                    .outline()
+                    .icon(FluxIcon::Plus)
+                    .label(self.t("webhookAddHeader"))
+                    .control(cx)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        let mut seq = this.header_seq;
+                        let translator = this.translator.clone();
+                        let row = Self::header_row(&mut seq, &translator, "", "", window, cx);
+                        this.header_seq = seq;
+                        this.headers.push(row);
+                        cx.notify();
+                    })),
             ),
-        )
+        );
+        form_field(self.t("webhookFieldHeaders"), rows, None, cx)
     }
 
     fn render_template(&self, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
-        let mut chips = h_flex().flex_wrap().gap(tokens.spacing.xs);
+        let mut chips = h_flex()
+            .flex_wrap()
+            .gap(tokens.spacing.xs + tokens.spacing.xxs);
         for variable in &self.variables {
             let insert = variable.clone();
             chips = chips.child(
-                button(
-                    SharedString::from(format!("webhook-var-{variable}")),
-                    SharedString::from(variable.clone()),
-                    ButtonVariant::Ghost,
-                    cx,
-                )
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.insert_variable(&insert, window, cx);
-                })),
+                Button::new(SharedString::from(format!("webhook-var-{variable}")))
+                    .outline()
+                    .label(SharedString::from(variable.clone()))
+                    .control(cx)
+                    .font_family(tokens.typography.mono.clone())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.insert_variable(&insert, window, cx);
+                    })),
             );
         }
-        v_flex()
-            .gap(tokens.spacing.xs)
-            .child(self.label("webhookFieldTemplate", cx))
-            .child(
-                Textarea::new(&self.template)
-                    .h(px(96.))
-                    .w_full()
-                    .font_family(tokens.typography.mono.clone()),
-            )
-            .child(self.hint(self.t("webhookTemplateHint"), cx))
-            .child(chips)
+        form_field(
+            self.t("webhookFieldTemplate"),
+            Textarea::new(&self.template)
+                .h(px(112.))
+                .w_full()
+                .font_family(tokens.typography.mono.clone()),
+            Some(self.t("webhookTemplateHint")),
+            cx,
+        )
+        .child(chips)
     }
 
-    fn render_switch_row(
+    /// 开关行（放进 `option_group`）。
+    fn toggle(
         &self,
         id: &'static str,
         title_key: &str,
@@ -868,165 +865,166 @@ impl WebhookDialog {
         checked: bool,
         on_change: impl Fn(&mut Self, bool, &mut Window, &mut Context<Self>) + 'static,
         cx: &mut Context<Self>,
-    ) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        h_flex()
-            .gap(tokens.spacing.lg)
-            .items_start()
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(tokens.spacing.xxs)
-                    .child(div().text_sm().child(self.t(title_key)))
-                    .child(self.hint(self.t(desc_key), cx)),
-            )
-            .child(Switch::new(id).checked(checked).on_click(cx.listener(
+    ) -> AnyElement {
+        option_row(
+            self.t(title_key),
+            Some(self.t(desc_key)),
+            Switch::new(id).checked(checked).on_click(cx.listener(
                 move |this, checked: &bool, window, cx| {
                     on_change(this, *checked, window, cx);
                     cx.notify();
                 },
-            )))
+            )),
+            cx,
+        )
+        .into_any_element()
     }
 
-    fn render_secret_row(&self, cx: &mut Context<Self>) -> Div {
+    /// 签名密钥：输入框 + 「重新生成 / 复制」，作为签名开关下方的分组行。
+    fn render_secret_row(&self, cx: &mut Context<Self>) -> AnyElement {
         let tokens = active_theme(cx).tokens().clone();
-        h_flex()
+        let actions = h_flex()
             .gap(tokens.spacing.sm)
-            .items_center()
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.secret).w_full()),
-            )
-            .child(
-                button(
-                    "webhook-secret-regenerate",
-                    self.t("webhookRegenerate"),
-                    ButtonVariant::Secondary,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    let secret = generate_secret();
-                    this.secret
-                        .update(cx, |input, cx| input.set_value(secret, window, cx));
-                    this.copied = false;
-                    cx.notify();
-                })),
-            )
-            .child(
-                button(
-                    "webhook-secret-copy",
-                    self.t(if self.copied {
-                        "webhookCopied"
-                    } else {
-                        "webhookCopy"
-                    }),
-                    ButtonVariant::Secondary,
-                    cx,
-                )
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy_secret(cx))),
-            )
-    }
-
-    fn render_advanced(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        let open = self.advanced_open;
-        let mut column = v_flex().gap(tokens.spacing.sm).child(
-            h_flex()
-                .id("webhook-advanced-toggle")
-                .gap(tokens.spacing.xs)
-                .items_center()
-                .py(tokens.spacing.xs)
-                .cursor_pointer()
-                .text_color(tokens.colors.muted_foreground)
-                .child(
-                    Icon::new(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .size(px(14.)),
-                )
-                .child(div().text_xs().child(self.t("webhookAdvanced")))
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.advanced_open = !this.advanced_open;
-                    cx.notify();
-                })),
-        );
-        if !open {
-            return column;
-        }
-        column = column
-            .child(self.render_headers(cx))
-            .child(self.render_template(cx))
-            .child(self.render_switch_row(
-                "webhook-sign",
-                "webhookFieldSign",
-                "webhookSignDesc",
-                self.sign_enabled,
-                |this, enabled, window, cx| {
-                    this.sign_enabled = enabled;
-                    if enabled && this.secret.read(cx).value().trim().is_empty() {
-                        // 开启签名时给一个够长够随机的起点；用户可随时改成自己的。
+                Button::new("webhook-secret-regenerate")
+                    .outline()
+                    .label(self.t("webhookRegenerate"))
+                    .control(cx)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                         let secret = generate_secret();
                         this.secret
                             .update(cx, |input, cx| input.set_value(secret, window, cx));
-                    }
-                },
+                        this.copied = false;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("webhook-secret-copy")
+                    .outline()
+                    .label(self.t(if self.copied {
+                        "webhookCopied"
+                    } else {
+                        "webhookCopy"
+                    }))
+                    .control(cx)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.copy_secret(cx))),
+            );
+        div()
+            .w_full()
+            .px(tokens.spacing.md)
+            .py(tokens.spacing.sm + tokens.spacing.xxs)
+            .child(input_with_action(
+                Input::new(&self.secret).control(cx).w_full(),
+                actions,
                 cx,
-            ));
+            ))
+            .into_any_element()
+    }
+
+    fn render_options(&self, cx: &mut Context<Self>) -> Div {
+        let mut rows = vec![self.toggle(
+            "webhook-sign",
+            "webhookFieldSign",
+            "webhookSignDesc",
+            self.sign_enabled,
+            |this, enabled, window, cx| {
+                this.sign_enabled = enabled;
+                if enabled && this.secret.read(cx).value().trim().is_empty() {
+                    // 开启签名时给一个够长够随机的起点；用户可随时改成自己的。
+                    let secret = generate_secret();
+                    this.secret
+                        .update(cx, |input, cx| input.set_value(secret, window, cx));
+                }
+            },
+            cx,
+        )];
         if self.sign_enabled {
-            column = column.child(self.render_secret_row(cx));
+            rows.push(self.render_secret_row(cx));
         }
-        column
-            .child(self.render_switch_row(
-                "webhook-allow-http",
-                "webhookFieldAllowHttp",
-                "webhookAllowHttpDesc",
-                self.allow_http,
-                |this, enabled, _, _| this.allow_http = enabled,
-                cx,
-            ))
-            .child(self.render_switch_row(
-                "webhook-use-proxy",
-                "webhookFieldUseProxy",
-                "webhookUseProxyDesc",
-                self.use_proxy,
-                |this, enabled, _, _| this.use_proxy = enabled,
-                cx,
-            ))
+        rows.push(self.toggle(
+            "webhook-allow-http",
+            "webhookFieldAllowHttp",
+            "webhookAllowHttpDesc",
+            self.allow_http,
+            |this, enabled, _, _| this.allow_http = enabled,
+            cx,
+        ));
+        rows.push(self.toggle(
+            "webhook-use-proxy",
+            "webhookFieldUseProxy",
+            "webhookUseProxyDesc",
+            self.use_proxy,
+            |this, enabled, _, _| this.use_proxy = enabled,
+            cx,
+        ));
+        option_group(rows, cx)
+    }
+
+    /// 「高级」折叠头：自建 div，悬停色只在这里设置一次。
+    fn render_advanced_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
+        let open = self.advanced_open;
+        h_flex()
+            .id("webhook-advanced-toggle")
+            .gap(tokens.spacing.xs)
+            .items_center()
+            .cursor_pointer()
+            .text_color(tokens.colors.muted_foreground)
+            .hover(move |style| style.text_color(tokens.colors.foreground))
+            .child(
+                Icon::new(if open {
+                    FluxIcon::ChevronDown
+                } else {
+                    FluxIcon::ChevronRight
+                })
+                .size(extended.icon.sm),
+            )
+            .child(
+                div()
+                    .text_size(tokens.typography.xs.size)
+                    .line_height(tokens.typography.xs.line_height)
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(self.t("webhookAdvanced")),
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.advanced_open = !this.advanced_open;
+                cx.notify();
+            }))
     }
 
     fn render_form(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .w_full()
-            .gap(tokens.spacing.lg)
-            .pr(tokens.spacing.md)
-            .child(
-                v_flex()
-                    .gap(tokens.spacing.sm)
-                    .child(self.label("webhookFieldPreset", cx))
-                    .child(self.render_preset_grid(cx)),
-            )
-            .child(
-                h_flex()
-                    .gap(tokens.spacing.md)
-                    .items_start()
-                    .child(
-                        v_flex()
-                            .w(px(170.))
-                            .gap(tokens.spacing.xs)
-                            .child(self.label("webhookFieldName", cx))
-                            .child(Input::new(&self.name).w_full()),
-                    )
-                    .child(div().flex_1().min_w_0().child(self.render_url_field(cx))),
-            )
+        let name_field = form_field(
+            self.t("webhookFieldName"),
+            Input::new(&self.name).control(cx).w_full(),
+            None,
+            cx,
+        );
+        let mut body = form(cx)
+            .child(form_field(
+                self.t("webhookFieldPreset"),
+                self.render_preset_grid(cx),
+                None,
+                cx,
+            ))
+            .child(form_row(
+                [
+                    name_field.into_any_element(),
+                    self.render_queue_field(cx).into_any_element(),
+                ],
+                cx,
+            ))
+            .child(self.render_url_field(cx))
             .child(self.render_events(cx))
-            .child(self.render_queue_filter(cx))
-            .child(self.render_advanced(cx))
+            .child(self.render_advanced_toggle(cx));
+        if self.advanced_open {
+            body = body
+                .child(self.render_headers(cx))
+                .child(self.render_template(cx))
+                .child(self.render_options(cx));
+        }
+        body
     }
 
     fn preview_body(&self, preset: Option<&WebhookPresetDto>, cx: &App) -> String {
@@ -1054,6 +1052,7 @@ impl WebhookDialog {
             .unwrap_or(rendered)
     }
 
+    /// 右栏：实时请求预览，卡片吃满栏高、内容自身滚动，底部是投递语义说明。
     fn render_preview(&self, preset: Option<&WebhookPresetDto>, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
         let url = {
@@ -1083,97 +1082,107 @@ impl WebhookDialog {
         }
         lines.push("─".repeat(28));
         lines.extend(self.preview_body(preset, cx).lines().map(str::to_owned));
-        let mut body = v_flex()
-            .w_full()
+        let preview = lines.join("\n");
+        // 预览要能鼠标选中/复制：用无语言的围栏代码块承载纯文本（不做高亮、不解析 Markdown），
+        // 围栏长度比正文里最长的反引号串多一，保证用户模板里的 ``` 不会提前闭合。
+        let longest_ticks = preview
+            .split(|ch| ch != '`')
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        let fence = "`".repeat(longest_ticks.max(2) + 1);
+        let markdown = format!("{fence}\n{preview}\n{fence}");
+        let code_style = StyleRefinement::default()
+            .p_0()
+            .rounded_none()
+            .bg(gpui::transparent_black())
             .font_family(tokens.typography.mono.clone())
-            .text_xs()
-            .text_color(tokens.colors.foreground);
-        for line in lines {
-            body = body.child(div().whitespace_normal().child(SharedString::from(line)));
-        }
+            .text_size(tokens.typography.xs.size)
+            .line_height(tokens.typography.xs.line_height)
+            .text_color(tokens.colors.foreground)
+            .whitespace_normal();
+        let body = TextView::markdown("webhook-request-preview", markdown)
+            .style(TextViewStyle::default().code_block(code_style))
+            .selectable(true)
+            .w_full();
         v_flex()
-            .h_full()
-            .gap(tokens.spacing.sm)
+            .flex_none()
+            .w(px(PREVIEW_WIDTH))
+            .min_h_0()
+            .pl(tokens.spacing.md)
+            .gap(tokens.spacing.xs + tokens.spacing.xxs)
+            .child(field_label(self.t("webhookPreviewTitle"), cx))
             .child(
-                div()
-                    .text_xs()
-                    .font_weight(tokens.typography.md.weight)
-                    .text_color(tokens.colors.muted_foreground)
-                    .child(self.t("webhookPreviewTitle")),
-            )
-            .child(
-                div()
+                card(cx)
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .rounded(tokens.radius.md)
-                    .border_1()
-                    .border_color(tokens.colors.border)
-                    .bg(tokens.colors.surface)
-                    .px(tokens.spacing.sm)
+                    .px(tokens.spacing.md)
                     .py(tokens.spacing.sm)
-                    .child(body.overflow_y_scrollbar()),
+                    .child(v_flex().size_full().child(body).overflow_y_scrollbar()),
             )
-            .child(self.hint(self.t("webhookPreviewMeta"), cx))
+            .child(field_hint(self.t("webhookPreviewMeta"), cx))
     }
 
+    /// 底栏：左端「发送测试」+ 结果文字，右端「取消 / 保存」。
     fn render_footer(&self, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let success = theme.extended().colors.success;
         let can_test = !self.testing && !self.url.read(cx).value().trim().is_empty();
         let can_save = self.can_save(cx);
-        let mut row = h_flex()
-            .w_full()
-            .items_center()
+        let leading = h_flex()
+            .flex_1()
+            .min_w_0()
             .gap(tokens.spacing.sm)
+            .items_center()
             .child(
-                button(
-                    "webhook-send-test",
-                    self.t(if self.testing {
+                Button::new("webhook-send-test")
+                    .outline()
+                    .label(self.t(if self.testing {
                         "webhookTesting"
                     } else {
                         "webhookSendTest"
-                    }),
-                    ButtonVariant::Secondary,
-                    cx,
+                    }))
+                    .control(cx)
+                    .loading(self.testing)
+                    .disabled(!can_test)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send_test(cx))),
+            )
+            .when_some(self.test_result.as_ref(), |this, outcome| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(tokens.typography.xs.size)
+                        .line_height(tokens.typography.xs.line_height)
+                        .text_color(if outcome.success {
+                            success
+                        } else {
+                            tokens.colors.destructive
+                        })
+                        .child(outcome.text.clone()),
                 )
-                .disabled(!can_test)
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send_test(cx))),
-            );
-        if let Some(outcome) = &self.test_result {
-            row = row.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_xs()
-                    .text_color(if outcome.success {
-                        tokens.colors.primary
-                    } else {
-                        tokens.colors.destructive
-                    })
-                    .child(outcome.text.clone()),
-            );
-        } else {
-            row = row.child(div().flex_1());
-        }
-        row.child(
-            button(
-                "webhook-dialog-cancel",
-                self.t("cancel"),
-                ButtonVariant::Ghost,
-                cx,
-            )
-            .on_click(|_, window, cx| window.close_dialog(cx)),
-        )
-        .child(
-            button(
-                "webhook-dialog-save",
-                self.t("webhookSaveEndpoint"),
-                ButtonVariant::Primary,
-                cx,
-            )
-            .disabled(!can_save)
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx))),
+            });
+        dialog_footer(
+            Some(leading.into_any_element()),
+            [
+                Button::new("webhook-dialog-cancel")
+                    .outline()
+                    .label(self.t("cancel"))
+                    .control(cx)
+                    .on_click(|_, window, cx| window.close_dialog(cx))
+                    .into_any_element(),
+                Button::new("webhook-dialog-save")
+                    .primary()
+                    .label(self.t("webhookSaveEndpoint"))
+                    .control(cx)
+                    .disabled(!can_save)
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx)))
+                    .into_any_element(),
+            ],
+            cx,
         )
     }
 }
@@ -1194,7 +1203,9 @@ fn sync_placeholder(
 
 impl Render for WebhookDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = active_theme(cx).tokens().clone();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let hairline = theme.extended().colors.hairline;
         let preset = self.current_preset().cloned();
         // 占位符随预设变化（名称 = 预设名，URL = 预设示例）。
         let name_hint = SharedString::from(
@@ -1211,32 +1222,37 @@ impl Render for WebhookDialog {
         );
         sync_placeholder(&self.name, name_hint, window, cx);
         sync_placeholder(&self.url, url_hint, window, cx);
+        // 左栏表单独立滚动、右栏预览常驻可见；底栏固定在双栏下方。
+        // 每层都 `min_h_0`：视口比 BODY_HEIGHT 矮时双栏随对话框收缩，底栏不被裁掉。
         v_flex()
             .w_full()
-            .h(px(440.))
-            .gap(tokens.spacing.md)
-            .child(self.hint(self.t("webhookDialogDesc"), cx))
+            .flex_1()
+            .min_h_0()
+            .gap(tokens.spacing.lg)
+            .child(field_hint(self.t("webhookDialogDesc"), cx))
             .child(
-                h_flex()
-                    .flex_1()
+                div()
+                    .flex()
+                    .w_full()
+                    .h(px(BODY_HEIGHT))
                     .min_h_0()
-                    .items_stretch()
-                    .gap(tokens.spacing.md)
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .child(self.render_form(cx).overflow_y_scrollbar()),
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .child(self.render_form(cx).pr(tokens.spacing.md)),
                     )
-                    .child(div().w(px(1.)).bg(tokens.colors.border))
-                    .child(
-                        div()
-                            .w(px(300.))
-                            .child(self.render_preview(preset.as_ref(), cx)),
-                    ),
+                    .child(div().flex_none().w(px(1.)).bg(hairline))
+                    .child(self.render_preview(preset.as_ref(), cx)),
             )
-            .child(div().h(px(1.)).w_full().bg(tokens.colors.border))
-            .child(self.render_footer(cx))
+            .child(
+                self.render_footer(cx)
+                    .pt(tokens.spacing.md)
+                    .border_t_1()
+                    .border_color(hairline),
+            )
     }
 }
 

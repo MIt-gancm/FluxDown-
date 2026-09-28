@@ -42,7 +42,7 @@ macro_rules! spec {
     };
 }
 
-/// 与 `lib/src/services/cloud/sync_catalog.dart` 一一对应的 51 个键。
+/// 与 `lib/src/services/cloud/sync_catalog.dart` 对应的键，外加 GPUI 活动栏专属的 `ui.show_activity_*`，共 54 个。
 pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("appearance.theme_mode", Preferences),
     spec!("appearance.dark_theme", Preferences),
@@ -59,6 +59,9 @@ pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("ui.show_sidebar_queues", Preferences),
     spec!("ui.show_sidebar_category", Preferences),
     spec!("ui.show_sidebar_rss", Preferences),
+    spec!("ui.show_activity_rss", Preferences),
+    spec!("ui.show_activity_webhooks", Preferences),
+    spec!("ui.show_activity_theme", Preferences),
     spec!("ui.show_titlebar_pause_all", Preferences),
     spec!("ui.show_titlebar_resume_all", Preferences),
     spec!("ui.show_titlebar_settings", Preferences),
@@ -231,6 +234,9 @@ fn boolean_key(key: &str) -> bool {
             | "ui.show_sidebar_queues"
             | "ui.show_sidebar_category"
             | "ui.show_sidebar_rss"
+            | "ui.show_activity_rss"
+            | "ui.show_activity_webhooks"
+            | "ui.show_activity_theme"
             | "ui.show_titlebar_pause_all"
             | "ui.show_titlebar_resume_all"
             | "ui.show_titlebar_settings"
@@ -254,7 +260,8 @@ fn boolean_key(key: &str) -> bool {
 fn integer_key(key: &str) -> bool {
     matches!(
         key,
-        "download.max_concurrent_tasks"
+        "appearance.custom_color"
+            | "download.max_concurrent_tasks"
             | "download.default_segments"
             | "download.auto_max_connections"
             | "download.cdn_max_nodes"
@@ -273,6 +280,8 @@ fn float_key(key: &str) -> bool {
 
 fn integer_range(key: &str) -> (i64, i64) {
     match key {
+        // Flutter `Color.toARGB32()`：无符号 32 位 ARGB。
+        "appearance.custom_color" => (0, i64::from(u32::MAX)),
         "download.max_concurrent_tasks" => (1, 1024),
         "download.default_segments" => (0, 64),
         "download.auto_max_connections" => (0, 128),
@@ -293,14 +302,14 @@ mod tests {
 
     #[test]
     fn catalog_has_exact_unique_flutter_count_and_namespaced_daemon_mapping() {
-        assert_eq!(SYNC_SETTING_SPECS.len(), 51);
+        assert_eq!(SYNC_SETTING_SPECS.len(), 54);
         assert_eq!(
             SYNC_SETTING_SPECS
                 .iter()
                 .map(|spec| spec.key)
                 .collect::<HashSet<_>>()
                 .len(),
-            51
+            54
         );
         let spec = setting_spec("download.max_concurrent_tasks").expect("download spec");
         assert_eq!(spec.owner, SettingOwner::Daemon);
@@ -314,5 +323,13 @@ mod tests {
         assert!(validate_value("download.max_auto_retries", &json!(-1)).is_ok());
         assert!(validate_value("bt.seed_then_action", &json!("delete_files")).is_ok());
         assert!(validate_value("bt.seed_then_action", &json!("remove")).is_err());
+    }
+
+    #[test]
+    fn custom_color_accepts_flutter_argb32_integer_only() {
+        assert!(validate_value("appearance.custom_color", &json!(0xFF11_2233_u32)).is_ok());
+        assert!(validate_value("appearance.custom_color", &json!(u32::MAX)).is_ok());
+        assert!(validate_value("appearance.custom_color", &json!(-1)).is_err());
+        assert!(validate_value("appearance.custom_color", &json!("ff112233")).is_err());
     }
 }

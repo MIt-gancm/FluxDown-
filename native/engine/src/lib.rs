@@ -4,7 +4,9 @@
 //! 与 [`selection::HostSelection`] 两个 trait 与宿主(hub/CLI/Web+Server/Phone)
 //! 解耦,不绑定具体的 FFI/信号/传输协议。
 
-/// `ProxyMode::Auto`：直连优先、慢则采样、快则热切换的自动代理决策。
+/// 插件通用认证凭据存储与请求注入。
+pub mod auth;
+/// `ProxyMode::Auto`：候选代理解析、多路径任务上下文与路由 wire 标签。
 pub mod auto_proxy;
 pub mod bt_downloader;
 /// BT 部分选择做种的 parts 边车（选中文件路径映射 + 跨文件边界字节）。
@@ -31,12 +33,17 @@ pub mod link;
 pub mod logger;
 pub mod meta_prober;
 pub mod model;
+/// 多网卡聚合下载：网卡枚举、链路规划与出口绑定。
+pub mod multi_nic;
+pub(crate) mod output;
+/// 多路径分段调度的纯判据（稳态速率采样、竞争集、均衡拆分、完成时间抢占）。
+pub(crate) mod path_scheduler;
 /// 插件系统（可选、可失败的下载中间层）。仅 `plugins` feature 下编译。
 #[cfg(feature = "plugins")]
 pub mod plugin;
 mod proc;
 pub mod proxy_config;
-/// `ProxyMode::Auto` 路由决策的跨重启先验（host 级采样结论持久化）。
+/// `ProxyMode::Auto` 各路径单连接速率的跨重启折扣先验。
 pub mod route_health;
 /// RSS 订阅自动下载（feed 轮询 → 规则过滤 → 建任务）。
 pub mod rss;
@@ -46,9 +53,16 @@ pub mod selection;
 /// 站点 HTTP Basic 认证凭据（per-host 保存 + 建任务时自动套用）。
 pub mod site_auth;
 pub mod speed_limiter;
+/// 通用订阅 provider 接口（RSS 与插件订阅共用）。
+pub mod subscription;
+pub mod task_activity;
+/// `thunder://` 链接解析（迅雷专有 base64 封装：`AA<真实地址>ZZ`）。
+pub mod thunder;
 pub mod tracker_subscription;
+pub mod transfer_activity;
 /// 用户主目录下的系统标准目录（下载目录：Windows 已知文件夹 / XDG user-dirs）。
 pub mod user_dirs;
+
 /// 任务事件 Webhook 推送（免费自托管，BYOE）。
 pub mod webhook;
 
@@ -164,6 +178,9 @@ pub struct Engine {
     pub db: Db,
     /// 任务生命周期管理器。
     pub manager: DownloadManager,
+    /// 与 manager 共用的源端活动代理；宿主的 progress_reporter 也必须用它。
+    pub activity_sink: Arc<dyn EventSink>,
+    activity_journal: Arc<task_activity::JournalSink>,
     /// 需要宿主介入决策的选择接口(HLS 画质/BT 文件选择),与传入
     /// [`Engine::new`] 的实例相同 —— 供宿主收到"投递答案"信号时直接调用
     /// `engine.selector.provide_*(...)`,不必另行持有一份引用。
@@ -247,6 +264,8 @@ impl Engine {
         // send_all_groups 由宿主主动调用触发，此处不广播）。
         let _ = db.gc_empty_groups().await;
         // 插件系统构造所需值需在 config 被 move 进 DownloadManagerConfig 前克隆。
+        let activity_journal = task_activity::JournalSink::start(db.clone(), sink);
+        let sink: Arc<dyn EventSink> = activity_journal.clone();
         #[cfg(feature = "plugins")]
         let plugin_ctx = (
             config.proxy_config.clone(),
@@ -268,7 +287,7 @@ impl Engine {
                 proxy_config: config.proxy_config,
                 user_agent: config.user_agent,
             },
-            sink,
+            sink.clone(),
             selector.clone(),
         )?;
         // 组装并注入插件管理器（feature 关时整块不编译，下载主链路零变化）。
@@ -306,6 +325,7 @@ impl Engine {
                 plugin_sink,
             ));
             pm.load_all().await;
+            manager.rss.set_fallback_provider(pm.subscription_router());
             manager.install_plugin_manager(pm);
         }
         // 装载 RSS 订阅到内存镜像——放在引擎构造而非交给宿主，保证任何
@@ -322,7 +342,17 @@ impl Engine {
             manager,
             selector,
             data_dir,
+            activity_sink: sink,
+            activity_journal,
         })
+    }
+    /// 等待事件队列中的活动全部持久化；停机前调用以免内存尾部丢失。
+    pub async fn flush_task_activity(&self) -> Result<(), String> {
+        self.activity_journal.flush().await
+    }
+    /// 报告器与 actor 排空后仍可执行最终刷盘。
+    pub fn activity_journal(&self) -> Arc<task_activity::JournalSink> {
+        self.activity_journal.clone()
     }
 
     /// 测试代理连通性,返回延迟(毫秒)。

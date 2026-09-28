@@ -263,22 +263,26 @@ class SplitEventData {
   }) : receivedAt = receivedAt ?? DateTime.now();
 }
 
-/// 多 CDN 并发下载的节点级活动事件（来自 Rust `TaskCdnEvent` 信号，
+/// 多 CDN 并发 / 多网卡聚合下载的链路级活动事件（来自 Rust `TaskCdnEvent` 信号，
 /// 本次会话内存记录，不持久化）。供详情面板日志 Tab 展示。
 class CdnEventData {
   /// "pool" | "kick" | "breaker" | "fallback" | "leases" | "summary"
+  /// | "links"（多网卡：已挂上额外网卡）| "links_off"（多网卡：未对本任务生效）
   final String kind;
 
-  /// 钉定目标 host。
+  /// 钉定目标 host（links_off 可能为空）。
   final String host;
 
-  /// pool/leases/summary 的节点清单（ip/来源/字节数/吞吐/并发段数）；其余事件为空。
+  /// pool/leases/summary/links 的节点清单（ip/来源/字节数/吞吐/并发段数）；其余事件为空。
+  /// 节点 ip 为 `SYS` 表示系统直连主链路，`NIC:<ifname>` 表示多网卡聚合的额外网卡
+  /// （links 中其 origin 为该网卡本地 IP）。
   final List<CdnNodeDetail> nodes;
 
   /// kick：被踢节点 IP；其余为空串。
   final String ip;
 
-  /// kick："validator"|"fail"|"build"；fallback："few"|"error"。
+  /// kick："validator"|"fail"|"build"；fallback："few"|"error"；
+  /// links_off："proxy"|"fake_ip"|"local_target"|"vpn"|"primary_unknown"|"no_extra"|"dns"。
   final String reason;
 
   /// pool/fallback：去重候选 IP 总数；kick(fail)：连续失败次数。

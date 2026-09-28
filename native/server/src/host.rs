@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use fluxdown_api::service::{ApiError, ApiHost, LiveSpeed, TaskEvent};
+use fluxdown_engine::auth::is_sensitive_config_key;
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec};
 use fluxdown_engine::link::{DiscoveredPeer, DiscoveryKind, LinkError, LinkManager, WireHello};
@@ -27,9 +28,10 @@ use fluxdown_protocol::daemon::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
     LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
     LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
-    LinkTaskRequest, MarketEntryDto, PluginDto, QueueDto, ResolvePreviewRequest,
-    ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest,
-    RssValidateResponse, TaskDto,
+    LinkTaskRequest, MarketEntryDto, PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto,
+    ResolvePreviewRequest, ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto,
+    RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto, SiteAuthEntryDto,
+    SiteAuthSaveRequest, TaskDto,
 };
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -226,6 +228,28 @@ impl ApiHost for ServerApiHost {
         })
     }
 
+    /// 更换任务下载源地址：经 actor 串行化到引擎，引擎错误码按 HTTP 语义
+    /// 映射（`not-found`→404、`invalid-url`→400、其余业务拒绝→409），除
+    /// `not-found` 外错误码字符串原样透传给客户端做 i18n 映射。
+    async fn change_task_url(&self, task_id: &str, url: &str) -> Result<(), ApiError> {
+        self.send_cmd(|ack| ActorCmd::ChangeTaskUrl {
+            task_id: task_id.to_string(),
+            url: url.to_string(),
+            ack,
+        })
+        .await?
+        .map_err(|e| match e.as_str() {
+            "not-found" => ApiError::NotFound,
+            "invalid-url" => ApiError::BadRequest(e),
+            "task-active"
+            | "task-completed"
+            | "bt-unsupported"
+            | "protocol-unsupported"
+            | "protocol-mismatch" => ApiError::Conflict(e),
+            _ => ApiError::Internal(e),
+        })
+    }
+
     async fn pause_all(&self) -> Result<(), ApiError> {
         self.send_cmd(|ack| ActorCmd::PauseAll { ack }).await
     }
@@ -325,6 +349,12 @@ impl ApiHost for ServerApiHost {
         self.db
             .get_all_config()
             .await
+            .map(|config| {
+                config
+                    .into_iter()
+                    .filter(|(key, _)| !is_sensitive_config_key(key))
+                    .collect()
+            })
             .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
@@ -341,8 +371,12 @@ impl ApiHost for ServerApiHost {
     /// （复用既有 `ActorCmd::ApplyConfig`，与 `/api/v1/config` REST 端点
     /// 走同一条路径，行为完全一致）。
     async fn apply_config(&self, changes: HashMap<String, String>) -> Result<(), ApiError> {
-        let keys: Vec<String> = changes.keys().cloned().collect();
-        for (key, value) in &changes {
+        let filtered: HashMap<_, _> = changes
+            .into_iter()
+            .filter(|(key, _)| !is_sensitive_config_key(key))
+            .collect();
+        let keys: Vec<String> = filtered.keys().cloned().collect();
+        for (key, value) in &filtered {
             self.db
                 .set_config(key, value)
                 .await
@@ -350,6 +384,94 @@ impl ApiHost for ServerApiHost {
         }
         self.send_cmd(|ack| ActorCmd::ApplyConfig { keys, ack })
             .await
+    }
+
+    async fn list_site_auth(&self) -> Result<Vec<SiteAuthEntryDto>, ApiError> {
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        Ok(fluxdown_engine::site_auth::parse_store(&json)
+            .into_iter()
+            .map(|(site, credential)| SiteAuthEntryDto {
+                site,
+                user: credential.user,
+            })
+            .collect())
+    }
+
+    async fn get_site_auth(&self, site: &str) -> Result<Option<SiteAuthCredentialDto>, ApiError> {
+        let site = normalize_site(site)?;
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        Ok(fluxdown_engine::site_auth::parse_store(&json)
+            .get(&site)
+            .cloned()
+            .map(|credential| SiteAuthCredentialDto {
+                site,
+                user: credential.user,
+                pass: credential.pass,
+            }))
+    }
+
+    async fn save_site_auth(
+        &self,
+        request: SiteAuthSaveRequest,
+    ) -> Result<SiteAuthEntryDto, ApiError> {
+        let site = normalize_site(&request.site)?;
+        if request.user.trim().is_empty() {
+            return Err(ApiError::BadRequest("user is required".to_string()));
+        }
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        let mut store = fluxdown_engine::site_auth::parse_store(&json);
+        let user = request.user.trim().to_string();
+        store.insert(
+            site.clone(),
+            fluxdown_engine::site_auth::SiteCredential {
+                user: user.clone(),
+                pass: request.pass,
+            },
+        );
+        self.db
+            .set_config(
+                fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY,
+                &fluxdown_engine::site_auth::serialize_store(&store),
+            )
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        Ok(SiteAuthEntryDto { site, user })
+    }
+
+    async fn delete_site_auth(&self, site: &str) -> Result<(), ApiError> {
+        let site = normalize_site(site)?;
+        let json = self
+            .db
+            .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))?
+            .unwrap_or_default();
+        let mut store = fluxdown_engine::site_auth::parse_store(&json);
+        if store.remove(&site).is_none() {
+            return Err(ApiError::NotFound);
+        }
+        self.db
+            .set_config(
+                fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY,
+                &fluxdown_engine::site_auth::serialize_store(&store),
+            )
+            .await
+            .map_err(|e| ApiError::Internal(e.to_string()))
     }
 
     /// aria2 `tellStatus`/`tellActive` 的 downloadSpeed 字段来源：读取
@@ -408,6 +530,35 @@ impl ApiHost for ServerApiHost {
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         self.hub.broadcast(&WsServerMsg::PluginsChanged {});
         Ok(())
+    }
+
+    /// 驱动插件登录流程；认证凭据由引擎统一保存，后续插件请求自动复用。
+    async fn plugin_auth(
+        &self,
+        request: PluginAuthRequest,
+    ) -> Result<PluginAuthResponse, ApiError> {
+        let pm = self.plugin_manager()?;
+        let result = pm
+            .authenticate(
+                &request.identity,
+                fluxdown_engine::plugin::AuthRequest {
+                    action: request.action,
+                    site: request.site,
+                    auth_ref: request.auth_ref,
+                    session_id: request.session_id,
+                    input: request.input,
+                },
+            )
+            .await
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+        Ok(PluginAuthResponse {
+            status: result.status,
+            session_id: result.session_id,
+            challenge: result.challenge,
+            challenge_type: result.challenge_type,
+            message: result.message,
+            auth_ref: result.auth_ref,
+        })
     }
 
     /// 从 zip 字节安装插件；成功后广播 `pluginsChanged`。
@@ -936,6 +1087,13 @@ impl ApiHost for ServerApiHost {
             .await
             .map_err(map_link_err)
     }
+}
+
+fn normalize_site(input: &str) -> Result<String, ApiError> {
+    let input = input.trim();
+    fluxdown_engine::site_auth::site_key(input)
+        .or_else(|| fluxdown_engine::site_auth::site_key(&format!("https://{input}")))
+        .ok_or_else(|| ApiError::BadRequest("invalid site".to_string()))
 }
 
 /// 引擎 `link::DiscoveredPeer` → wire DTO（`kind` → `source` 小写字符串）。

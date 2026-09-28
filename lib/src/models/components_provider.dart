@@ -68,6 +68,27 @@ abstract class ComponentController extends ChangeNotifier {
 
   StreamSubscription<RustSignalPack<ConfigLoaded>>? _configSub;
 
+  /// 当前存活的 [ComponentController] 实例（ffmpeg/yt-dlp 各分类页面各自
+  /// 持有独立实例，见 `settings_page.dart` 的 `_ComponentsContentState`）。
+  /// 用一个静态集合记录活跃实例，使插件安装等跨 provider 事件（#399）能在
+  /// 不引入应用级单例/service locator 的前提下广播「重新探测状态」。
+  static final Set<ComponentController> _liveInstances =
+      <ComponentController>{};
+
+  /// 广播给所有当前存活实例：重新探测状态。
+  ///
+  /// #399：插件安装/卸载成功后，其声明依赖的基础组件（ffmpeg/yt-dlp）识别
+  /// 结果可能已变化（如系统 PATH 中原本存在但插件安装前未探测过），但组件
+  /// 设置分类页面若恰好已打开则不会自动重新探测。由 [PluginProvider] 在
+  /// 收到成功的 install/market_install/uninstall 结果时调用。无存活实例时
+  /// 为空操作（下次进入组件分类页面本就会重新探测一次，见 [requestStatus]
+  /// 调用点）。
+  static void refreshAllLive() {
+    for (final c in _liveInstances) {
+      c.requestStatus();
+    }
+  }
+
   /// 日志标签（如 'ffmpeg'/'yt-dlp'），用于区分本实例的日志输出。
   String get logTag;
 
@@ -105,6 +126,7 @@ abstract class ComponentController extends ChangeNotifier {
   @protected
   void initListening() {
     logInfo('Components', '$logTag constructor');
+    _liveInstances.add(this);
     startListening();
     _loadManualPathFromCache();
     _configSub = ConfigLoaded.rustSignalStream.listen(_onConfigLoaded);
@@ -114,6 +136,7 @@ abstract class ComponentController extends ChangeNotifier {
   void dispose() {
     logInfo('Components', '$logTag dispose');
     _disposed = true;
+    _liveInstances.remove(this);
     cancelSubscriptions();
     _configSub?.cancel();
     super.dispose();

@@ -1,0 +1,11 @@
+{
+  "format": "fluxdown.gpui-theme",
+  "schemaVersion": 2,
+  "tokens": {
+    "colors": { "muted": "{colors.rowHover}" },
+    "spacing": { "md": "{spacing.md}" }
+  },
+  "dark": {
+    "colors": { "primary": "{colors.ring}", "ring": "{colors.primary}" }
+  }
+}

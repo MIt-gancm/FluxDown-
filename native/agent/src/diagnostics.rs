@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fluxdown_protocol::capture_link::OpenAssociation;
 use fluxdown_protocol::{
-    DiagnosticCheckDto, DiagnosticLevel, DiagnosticRepairParams, DiagnosticsReportDto,
-    LogExportParams, LogExportResult, LogPathsDto, PlatformIntegrationDto,
+    AgentSnapshot, DiagnosticCheckDto, DiagnosticLevel, DiagnosticRepairParams,
+    DiagnosticsReportDto, LogExportParams, LogExportResult, LogPathsDto, PlatformIntegrationDto,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -23,6 +24,7 @@ use crate::state::{AgentState, StateStore};
 const CHECK_NMH_BINARY: &str = "nmh_binary";
 const CHECK_NMH_MANIFEST: &str = "nmh_manifest";
 const CHECK_NMH_BROWSER: &str = "nmh_browser";
+const CHECK_NMH_RELAY: &str = "nmh_relay";
 const CHECK_APP_LISTENER: &str = "app_listener";
 const CHECK_LOCAL_SERVER: &str = "local_server";
 const CHECK_DAEMON: &str = "daemon";
@@ -33,14 +35,19 @@ const CHECK_LOG_DIR: &str = "log_dir";
 /// 提示码；UI 映射 `doctorHint{Camel}`。
 const HINT_REINSTALL_APP: &str = "reinstall_app";
 const HINT_REREGISTER_NMH: &str = "reregister_nmh";
+const HINT_NMH_OTHER_INSTALL: &str = "nmh_other_install";
 const HINT_RESTART_APP: &str = "restart_app";
 const HINT_ENABLE_LOCAL_SERVER: &str = "enable_local_server";
 const HINT_CHECK_FIREWALL: &str = "check_firewall";
 const HINT_ENABLE_PROTOCOL: &str = "enable_protocol";
+/// 用户已在设置中关闭该关联，但系统里没有其他可接手的程序（macOS 回落到 FluxDown）。
+const HINT_ASSOCIATION_OFF: &str = "association_off";
 const HINT_CHECK_DISK: &str = "check_disk";
 
 /// 修复动作；UI 映射 `doctorAction{Camel}`，并作为 `repair` 的 `action`。
 pub const ACTION_REREGISTER: &str = "reregister";
+/// 把由另一份 FluxDown 提供的 NMH 注册改指向本安装；执行上与 `reregister` 相同。
+pub const ACTION_USE_THIS_INSTALL: &str = "use_this_install";
 pub const ACTION_ENABLE_SERVICE: &str = "enable_service";
 pub const ACTION_REGISTER: &str = "register";
 pub const ACTION_OPEN_LOG_DIR: &str = "open_log_dir";
@@ -64,6 +71,7 @@ pub struct DiagnosticsService {
     state: Arc<Mutex<AgentState>>,
     store: Arc<StateStore>,
     api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
+    api_token: fluxdown_api::auth::TokenCell,
 }
 
 impl DiagnosticsService {
@@ -75,6 +83,7 @@ impl DiagnosticsService {
         state: Arc<Mutex<AgentState>>,
         store: Arc<StateStore>,
         api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
+        api_token: fluxdown_api::auth::TokenCell,
     ) -> Self {
         Self {
             daemon,
@@ -83,6 +92,7 @@ impl DiagnosticsService {
             state,
             store,
             api_switches,
+            api_token,
         }
     }
 
@@ -90,7 +100,8 @@ impl DiagnosticsService {
     pub async fn run(&self) -> Result<DiagnosticsReportDto, DiagnosticsError> {
         let gateway = self.state.lock().await.gateway.clone();
         let data_dir = self.store.data_dir().to_path_buf();
-        let sync_probe = tokio::task::spawn_blocking(move || probe_sync(&data_dir))
+        let opted_out = self.events.inspect(opted_out_associations);
+        let sync_probe = tokio::task::spawn_blocking(move || probe_sync(&data_dir, &opted_out))
             .await
             .map_err(join_error)?;
         let daemon = self.probe_daemon().await;
@@ -123,7 +134,7 @@ impl DiagnosticsService {
     /// 执行修复动作；成功返回 `{ok:true}` 或 daemon RPC 的返回值。
     pub async fn repair(&self, params: &DiagnosticRepairParams) -> Result<Value, DiagnosticsError> {
         match params.action.as_str() {
-            ACTION_REREGISTER => {
+            ACTION_REREGISTER | ACTION_USE_THIS_INSTALL => {
                 spawn_blocking_io(crate::nmh::registry::register).await?;
                 Ok(json!({ "ok": true }))
             }
@@ -306,8 +317,12 @@ impl DiagnosticsService {
     /// 与 `agent.gateway.patch` 同一条路径：持久化 → 运行时开关 → 广播 `GatewayChanged`。
     async fn enable_service(&self) -> Result<(), DiagnosticsError> {
         let mut state = self.state.lock().await;
+        let api_was_enabled = state.gateway.api_enabled;
+        let mcp_was_enabled = state.gateway.mcp_enabled;
         state.gateway.api_enabled = true;
+        crate::gateway::ensure_forced_auth_token(&mut state, api_was_enabled, mcp_was_enabled);
         let gateway = state.gateway.clone();
+        let user_token = state.gateway_user_token.clone();
         self.store.save(&state).await?;
         drop(state);
         self.api_switches.update(
@@ -317,6 +332,7 @@ impl DiagnosticsService {
             gateway.mcp_enabled,
             gateway.cors_enabled,
         );
+        self.api_token.set(user_token);
         self.events
             .publish(fluxdown_protocol::AgentEvent::GatewayChanged(gateway));
         Ok(())
@@ -400,10 +416,10 @@ struct SyncProbe {
     log_dir: DiagnosticCheckDto,
 }
 
-fn probe_sync(data_dir: &Path) -> SyncProbe {
+fn probe_sync(data_dir: &Path, opted_out: &[OpenAssociation]) -> SyncProbe {
     SyncProbe {
         nmh: nmh_checks(&crate::nmh::registry::diagnose()),
-        shell: shell_checks(&crate::platform::integration_status()),
+        shell: shell_checks(&crate::platform::integration_status(), opted_out),
         log_dir: probe_log_dir(data_dir),
     }
 }
@@ -429,9 +445,9 @@ fn check(
     }
 }
 
-/// `nmh_binary`、`nmh_manifest`、每个浏览器一条 `nmh_browser`。
+/// `nmh_binary`、`nmh_manifest`、`nmh_relay`、每个浏览器一条 `nmh_browser`。
 fn nmh_checks(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> Vec<DiagnosticCheckDto> {
-    let mut checks = Vec::with_capacity(2 + diagnosis.targets.len());
+    let mut checks = Vec::with_capacity(3 + diagnosis.targets.len());
     if diagnosis.exe_path.is_empty() {
         checks.push(check(
             CHECK_NMH_BINARY,
@@ -455,6 +471,9 @@ fn nmh_checks(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> Vec<DiagnosticC
         &diagnosis.chromium_manifest,
         &diagnosis.firefox_manifest,
     ));
+    if !diagnosis.exe_path.is_empty() {
+        checks.push(relay_check(diagnosis));
+    }
     for target in &diagnosis.targets {
         let (level, detail, hint, repair) = if !target.installed {
             (
@@ -483,6 +502,55 @@ fn nmh_checks(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> Vec<DiagnosticC
         ));
     }
     checks
+}
+
+/// 注册入口（启动脚本 / 注册表键）实际指向哪个中继。这是所有浏览器共用的根因，只报一次；
+/// 指向另一份仍可用的 FluxDown 安装只是提示，扩展照常工作。
+fn relay_check(diagnosis: &crate::nmh::registry::NmhDiagnosis) -> DiagnosticCheckDto {
+    use crate::nmh::registry::RelayOwner;
+
+    let location = &diagnosis.relay_location;
+    let relay = &diagnosis.registered_relay;
+    let (level, detail, hint, action) = match diagnosis.relay_owner {
+        RelayOwner::Current => (
+            DiagnosticLevel::Ok,
+            format!("{location} → {relay}"),
+            "",
+            None,
+        ),
+        RelayOwner::OtherInstall => (
+            DiagnosticLevel::Info,
+            format!("{location} → {relay} (another FluxDown installation)"),
+            HINT_NMH_OTHER_INSTALL,
+            Some(ACTION_USE_THIS_INSTALL),
+        ),
+        RelayOwner::Broken if relay.is_empty() => (
+            DiagnosticLevel::Error,
+            format!("{location} — cannot resolve relay path"),
+            HINT_REREGISTER_NMH,
+            Some(ACTION_REREGISTER),
+        ),
+        RelayOwner::Broken => (
+            DiagnosticLevel::Error,
+            format!("{location} → {relay} (relay missing or not executable)"),
+            HINT_REREGISTER_NMH,
+            Some(ACTION_REREGISTER),
+        ),
+        RelayOwner::Missing => (
+            DiagnosticLevel::Error,
+            format!("{location} — not registered"),
+            HINT_REREGISTER_NMH,
+            Some(ACTION_REREGISTER),
+        ),
+    };
+    check(
+        CHECK_NMH_RELAY,
+        "",
+        level,
+        detail,
+        hint,
+        action.map(|action| (action, "")),
+    )
 }
 
 /// Chromium 与 Firefox 两份清单都要存在；缺一份是安装未完成或清理工具误删的典型症状。
@@ -514,11 +582,58 @@ fn manifest_check(chromium: &str, firefox: &str) -> DiagnosticCheckDto {
     }
 }
 
+/// 用户在设置中手动关闭的关联（`OpenAssociation::opt_out_pref_key` 为 `true`）。
+fn opted_out_associations(snapshot: &AgentSnapshot) -> Vec<OpenAssociation> {
+    [
+        OpenAssociation::Torrent,
+        OpenAssociation::Magnet,
+        OpenAssociation::Ed2k,
+    ]
+    .into_iter()
+    .filter(|association| {
+        snapshot
+            .preferences
+            .values
+            .get(association.opt_out_pref_key())
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+    .collect()
+}
+
+/// 用户已关闭的关联：按意图报告，不提供「立即注册」（绕过设置页会与 opt-out 偏好矛盾）。
+/// 系统仍指向 FluxDown 说明没有其他候选可接手，报 info 解释 FluxDown 会忽略这些打开请求。
+fn opted_out_check(id: &str, target: &str, still_registered: bool) -> DiagnosticCheckDto {
+    if still_registered {
+        check(
+            id,
+            target,
+            DiagnosticLevel::Info,
+            "turned off in settings; no other handler installed, FluxDown ignores these opens"
+                .to_owned(),
+            HINT_ASSOCIATION_OFF,
+            None,
+        )
+    } else {
+        check(
+            id,
+            target,
+            DiagnosticLevel::Ok,
+            "turned off in settings".to_owned(),
+            "",
+            None,
+        )
+    }
+}
+
 /// `url_protocol`×3 与 `torrent_association`。
 ///
 /// `fluxdown://` 是深链入口，缺失报 warn；`magnet`/`ed2k`/`.torrent` 是可选项，只报 info，
-/// 否则用户会习惯性忽略整页。
-fn shell_checks(integration: &PlatformIntegrationDto) -> Vec<DiagnosticCheckDto> {
+/// 否则用户会习惯性忽略整页。用户已在设置中关闭的关联按 [`opted_out_check`] 报告。
+fn shell_checks(
+    integration: &PlatformIntegrationDto,
+    opted_out: &[OpenAssociation],
+) -> Vec<DiagnosticCheckDto> {
     let mut checks = Vec::with_capacity(URL_SCHEMES.len() + 1);
     for scheme in URL_SCHEMES {
         let registered = integration
@@ -526,6 +641,17 @@ fn shell_checks(integration: &PlatformIntegrationDto) -> Vec<DiagnosticCheckDto>
             .get(scheme)
             .copied()
             .unwrap_or(false);
+        let association = match scheme {
+            "magnet" => Some(OpenAssociation::Magnet),
+            "ed2k" => Some(OpenAssociation::Ed2k),
+            _ => None,
+        };
+        if integration.url_protocol_supported
+            && association.is_some_and(|association| opted_out.contains(&association))
+        {
+            checks.push(opted_out_check(CHECK_URL_PROTOCOL, scheme, registered));
+            continue;
+        }
         let (level, detail, hint, repair) = if !integration.url_protocol_supported {
             (
                 DiagnosticLevel::Info,
@@ -572,6 +698,12 @@ fn shell_checks(integration: &PlatformIntegrationDto) -> Vec<DiagnosticCheckDto>
             "not supported on this platform".to_owned(),
             "",
             None,
+        )
+    } else if opted_out.contains(&OpenAssociation::Torrent) {
+        opted_out_check(
+            CHECK_TORRENT_ASSOCIATION,
+            "",
+            integration.torrent_associated,
         )
     } else if integration.torrent_associated {
         check(
@@ -843,15 +975,18 @@ pub enum DiagnosticsError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use fluxdown_protocol::{DiagnosticLevel, PlatformIntegrationDto};
+    use fluxdown_protocol::capture_link::OpenAssociation;
+    use fluxdown_protocol::{AgentSnapshot, DiagnosticLevel, PlatformIntegrationDto};
+    use serde_json::json;
 
     use super::{
         ACTION_ENABLE_SERVICE, ACTION_OPEN_LOG_DIR, ACTION_REGISTER, ACTION_REREGISTER,
-        HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER, HINT_ENABLE_PROTOCOL, HINT_REINSTALL_APP,
-        HINT_REREGISTER_NMH, TARGET_TORRENT, daemon_export_url, daemon_log_dir, manifest_check,
-        nmh_checks, probe_local_server, probe_log_dir, shell_checks,
+        ACTION_USE_THIS_INSTALL, HINT_ASSOCIATION_OFF, HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER,
+        HINT_ENABLE_PROTOCOL, HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP, HINT_REREGISTER_NMH,
+        TARGET_TORRENT, daemon_export_url, daemon_log_dir, manifest_check, nmh_checks,
+        opted_out_associations, probe_local_server, probe_log_dir, relay_check, shell_checks,
     };
-    use crate::nmh::registry::{NmhDiagnosis, NmhTarget};
+    use crate::nmh::registry::{NmhDiagnosis, NmhTarget, RelayOwner};
 
     fn target(label: &str, installed: bool, ok: bool) -> NmhTarget {
         NmhTarget {
@@ -871,37 +1006,71 @@ mod tests {
     fn nmh_checks_map_levels_hints_and_repairs() {
         let diagnosis = NmhDiagnosis {
             exe_path: "/app/fluxdown_nmh".to_owned(),
-            exe_error: String::new(),
             chromium_manifest: "/missing/chromium.json".to_owned(),
             firefox_manifest: "/missing/firefox.json".to_owned(),
+            relay_location: "/data/fluxdown_nmh.sh".to_owned(),
+            registered_relay: "/app/fluxdown_nmh".to_owned(),
+            relay_owner: RelayOwner::Current,
             targets: vec![
                 target("Chrome", true, true),
                 target("Edge", true, false),
                 target("Firefox", false, false),
             ],
+            ..NmhDiagnosis::default()
         };
         let checks = nmh_checks(&diagnosis);
-        assert_eq!(checks.len(), 5);
+        assert_eq!(checks.len(), 6);
         assert_eq!(checks[0].id, "nmh_binary");
         assert_eq!(checks[0].level, DiagnosticLevel::Ok);
         assert_eq!(checks[1].id, "nmh_manifest");
         assert_eq!(checks[1].level, DiagnosticLevel::Error);
         assert_eq!(checks[1].hint, HINT_REREGISTER_NMH);
         assert!(checks[1].detail.contains("missing: chromium, firefox"));
-        assert_eq!(checks[2].target, "Chrome");
+        assert_eq!(checks[2].id, "nmh_relay");
         assert_eq!(checks[2].level, DiagnosticLevel::Ok);
-        assert!(checks[2].repair.is_none());
-        assert_eq!(checks[3].target, "Edge");
-        assert_eq!(checks[3].level, DiagnosticLevel::Error);
-        assert_eq!(checks[3].hint, HINT_REREGISTER_NMH);
+        assert_eq!(checks[3].target, "Chrome");
+        assert_eq!(checks[3].level, DiagnosticLevel::Ok);
+        assert!(checks[3].repair.is_none());
+        assert_eq!(checks[4].target, "Edge");
+        assert_eq!(checks[4].level, DiagnosticLevel::Error);
+        assert_eq!(checks[4].hint, HINT_REREGISTER_NMH);
         assert_eq!(
-            checks[3].repair.as_ref().map(|r| r.action.as_str()),
+            checks[4].repair.as_ref().map(|r| r.action.as_str()),
             Some(ACTION_REREGISTER)
         );
-        assert_eq!(checks[4].target, "Firefox");
-        assert_eq!(checks[4].level, DiagnosticLevel::Info);
-        assert!(checks[4].detail.contains("browser not installed"));
-        assert!(checks[4].hint.is_empty());
+        assert_eq!(checks[5].target, "Firefox");
+        assert_eq!(checks[5].level, DiagnosticLevel::Info);
+        assert!(checks[5].detail.contains("browser not installed"));
+        assert!(checks[5].hint.is_empty());
+    }
+
+    #[test]
+    fn relay_owned_by_another_install_is_info_but_broken_relay_is_an_error() {
+        let mut diagnosis = NmhDiagnosis {
+            exe_path: "/app/fluxdown_nmh".to_owned(),
+            relay_location: "/data/fluxdown_nmh.sh".to_owned(),
+            registered_relay: "/other/fluxdown_nmh".to_owned(),
+            relay_owner: RelayOwner::OtherInstall,
+            ..NmhDiagnosis::default()
+        };
+        let other = relay_check(&diagnosis);
+        assert_eq!(other.level, DiagnosticLevel::Info);
+        assert_eq!(other.hint, HINT_NMH_OTHER_INSTALL);
+        assert!(other.detail.contains("/other/fluxdown_nmh"));
+        assert_eq!(
+            other.repair.as_ref().map(|r| r.action.as_str()),
+            Some(ACTION_USE_THIS_INSTALL)
+        );
+        for owner in [RelayOwner::Broken, RelayOwner::Missing] {
+            diagnosis.relay_owner = owner;
+            let broken = relay_check(&diagnosis);
+            assert_eq!(broken.level, DiagnosticLevel::Error, "{owner:?}");
+            assert_eq!(broken.hint, HINT_REREGISTER_NMH);
+            assert_eq!(
+                broken.repair.as_ref().map(|r| r.action.as_str()),
+                Some(ACTION_REREGISTER)
+            );
+        }
     }
 
     #[test]
@@ -930,7 +1099,7 @@ mod tests {
             ]),
             ..PlatformIntegrationDto::default()
         };
-        let checks = shell_checks(&integration);
+        let checks = shell_checks(&integration, &[]);
         assert_eq!(checks.len(), 4);
         let fluxdown = &checks[0];
         assert_eq!(fluxdown.id, "url_protocol");
@@ -959,12 +1128,58 @@ mod tests {
 
         integration.url_protocol_supported = false;
         integration.file_association_supported = false;
-        let checks = shell_checks(&integration);
+        let checks = shell_checks(&integration, &[OpenAssociation::Magnet]);
         assert!(checks.iter().all(|c| c.level == DiagnosticLevel::Info));
         assert!(
             checks
                 .iter()
                 .all(|c| c.repair.is_none() && c.hint.is_empty())
+        );
+    }
+
+    #[test]
+    fn opted_out_associations_report_user_intent_without_register_repair() {
+        let integration = PlatformIntegrationDto {
+            url_protocol_supported: true,
+            file_association_supported: true,
+            // ed2k / .torrent：系统无其他候选，仍指向 FluxDown；magnet 已移交他人。
+            torrent_associated: true,
+            url_protocols: BTreeMap::from([
+                ("fluxdown".to_owned(), true),
+                ("magnet".to_owned(), false),
+                ("ed2k".to_owned(), true),
+            ]),
+            ..PlatformIntegrationDto::default()
+        };
+        let checks = shell_checks(
+            &integration,
+            &[
+                OpenAssociation::Torrent,
+                OpenAssociation::Magnet,
+                OpenAssociation::Ed2k,
+            ],
+        );
+        assert!(checks.iter().all(|c| c.repair.is_none()));
+        assert_eq!(checks[0].level, DiagnosticLevel::Ok);
+        let magnet = &checks[1];
+        assert_eq!(magnet.level, DiagnosticLevel::Ok);
+        assert!(magnet.hint.is_empty());
+        for sticky in [&checks[2], &checks[3]] {
+            assert_eq!(sticky.level, DiagnosticLevel::Info);
+            assert_eq!(sticky.hint, HINT_ASSOCIATION_OFF);
+        }
+    }
+
+    #[test]
+    fn only_true_opt_out_preferences_count() {
+        let mut snapshot = AgentSnapshot::default();
+        snapshot.preferences.values.extend([
+            ("ed2k_assoc_user_disabled".to_owned(), json!(true)),
+            ("magnet_assoc_user_disabled".to_owned(), json!(false)),
+        ]);
+        assert_eq!(
+            opted_out_associations(&snapshot),
+            vec![OpenAssociation::Ed2k]
         );
     }
 

@@ -222,9 +222,11 @@ async fn ytdlp_install_smoke() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn ytdlp_list_versions_smoke() {
+    let data_dir = unique_dir("data_list_versions_smoke");
+    let db = Db::open(&data_dir).await.expect("open db");
     let client = fluxdown_engine::downloader::build_client(&ProxyConfig::default(), "")
         .expect("build client");
-    let v = fluxdown_engine::components::list_ytdlp_versions(&client)
+    let v = fluxdown_engine::components::list_ytdlp_versions(&db, &client)
         .await
         .expect("list yt-dlp versions");
     assert!(!v.versions.is_empty(), "at least one version tag");

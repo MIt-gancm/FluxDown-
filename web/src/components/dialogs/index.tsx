@@ -3,6 +3,7 @@
 // lib/ws.ts），无需从外部传 props。
 
 import { BtFilesDialog } from './bt-files'
+import { ChangeTaskUrlDialog } from './change-task-url'
 import { HlsQualityDialog } from './hls-quality'
 import { IncomingPairingDialog } from './incoming-pairing'
 import { ManifestSelectDialog } from './manifest-select'
@@ -21,6 +22,7 @@ export function GlobalDialogs() {
       <BtFilesDialog />
       <IncomingPairingDialog />
       <RenameTaskDialog />
+      <ChangeTaskUrlDialog />
       <SeedLimitsDialog />
     </>
   )

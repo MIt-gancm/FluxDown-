@@ -32,7 +32,12 @@ const _kAppLogTailLines = 200;
 const _kLogBoxMaxHeight = 220.0;
 
 /// NMH 注册相关的 check id —— 这几项的修复动作都是「重写 NMH 注册」。
-const _kNmhCheckIds = {'nmh_binary', 'nmh_manifest', 'nmh_browser'};
+const _kNmhCheckIds = {
+  'nmh_binary',
+  'nmh_manifest',
+  'nmh_relay',
+  'nmh_browser',
+};
 
 /// 改注册表 / 改文件关联的动作只在 Rust 侧写完后回一条 status 信号，没有
 /// 「配置已生效」的 ack。这些动作触发后等这个时长再自动重跑诊断。
@@ -189,9 +194,9 @@ class _DoctorReportViewState extends State<DoctorReportView> {
       _run();
       return;
     }
-    FluxSonner.of(context).show(
-      ShadToast.destructive(title: Text(failTitle(s))),
-    );
+    FluxSonner.of(
+      context,
+    ).show(ShadToast.destructive(title: Text(failTitle(s))));
   }
 
   void _run({bool announce = false}) {
@@ -237,13 +242,19 @@ class _DoctorReportViewState extends State<DoctorReportView> {
     final sp = widget.settingsProvider;
     final key = '${check.id}:${check.target}';
     if (check.id == 'log_dir') {
-      return _RowAction(key: key, label: s.doctorActionOpenLogDir, run: _openLogDir);
+      return _RowAction(
+        key: key,
+        label: s.doctorActionOpenLogDir,
+        run: _openLogDir,
+      );
     }
     if (check.level == 'ok') return null;
     if (_kNmhCheckIds.contains(check.id)) {
       return _RowAction(
         key: key,
-        label: s.doctorActionReregister,
+        label: check.hint == 'nmh_other_install'
+            ? s.doctorActionUseThisInstall
+            : s.doctorActionReregister,
         run: () {
           setState(() => _busyRow = key);
           RepairNmhRegistration().sendSignalToRust();
@@ -264,8 +275,7 @@ class _DoctorReportViewState extends State<DoctorReportView> {
         return _RowAction(
           key: key,
           label: s.doctorActionEnableService,
-          run: () =>
-              _fireAndRecheck(key, () => sp.setLocalServerEnabled(true)),
+          run: () => _fireAndRecheck(key, () => sp.setLocalServerEnabled(true)),
         );
       case 'torrent_association':
         return _RowAction(
@@ -280,8 +290,10 @@ class _DoctorReportViewState extends State<DoctorReportView> {
         final VoidCallback? register = switch (check.target) {
           'magnet' => () => sp.setMagnetProtocolAssociation(true),
           'ed2k' => () => sp.setEd2kProtocolAssociation(true),
-          'fluxdown' => () =>
-              SetUrlProtocol(scheme: 'fluxdown', enable: true).sendSignalToRust(),
+          'fluxdown' => () => SetUrlProtocol(
+            scheme: 'fluxdown',
+            enable: true,
+          ).sendSignalToRust(),
           _ => null,
         };
         if (register == null) return null;
@@ -468,11 +480,7 @@ class _DoctorReportViewState extends State<DoctorReportView> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                LucideIcons.clipboardCopy,
-                size: 13,
-                color: c.textSecondary,
-              ),
+              Icon(LucideIcons.clipboardCopy, size: 13, color: c.textSecondary),
               const SizedBox(width: 6),
               Text(s.doctorCopyReport),
             ],
@@ -688,11 +696,7 @@ class _RowAction {
   final String label;
   final VoidCallback run;
 
-  const _RowAction({
-    required this.key,
-    required this.label,
-    required this.run,
-  });
+  const _RowAction({required this.key, required this.label, required this.run});
 }
 
 /// 行内修复按钮：本行在执行时转圈，其它行在任何动作执行期间一律禁用

@@ -1,0 +1,106 @@
+# 把 release 资产同步到阿里云 OSS（5 个 release job 共用）
+#
+# 对象布局与官网 website/src/lib/oss.ts 的 releaseObjectKey 契约（改一处须同步另一处）：
+#   oss://<bucket>/<prefix>/<版本>/<组件>/<asset-name>
+# 由该组件 GitHub Release 的 tag 推导：v0.4.8 → v0.4.8/app/，extension-v0.4.8 →
+# v0.4.8/extension/，server-v… / cli-v… / mobile-v… 同理。官网按同一路径做预签名
+# HEAD 探测后 302 到预签名 GET，缺失时回退 GitHub。
+# bucket 私有（开了「阻止公共访问」，对象不可 public-read），不要在这里设 ACL。
+#
+# 凭据只走 secrets（OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET）；未配置时整步跳过，
+# 不阻断 GitHub Release（官网自动回退 GitHub 直连）。
+name: Upload release assets to OSS
+description: 用 ossutil 把 release-assets/ 上传到阿里云 OSS 的 <prefix>/<版本>/<组件>/ 下
+
+inputs:
+  tag:
+    description: 该组件 GitHub Release 的 tag（决定 OSS 子目录）
+    required: true
+  dir:
+    description: 本地资产目录
+    required: false
+    default: release-assets
+  access-key-id:
+    description: RAM 用户 AccessKey ID（secrets.OSS_ACCESS_KEY_ID）
+    required: true
+  access-key-secret:
+    description: RAM 用户 AccessKey Secret（secrets.OSS_ACCESS_KEY_SECRET）
+    required: true
+  bucket:
+    description: OSS bucket
+    required: false
+    default: zerx-lab
+  prefix:
+    description: bucket 内根目录（无首尾斜杠）
+    required: false
+    default: FluxDownRelease
+  endpoint:
+    description: OSS endpoint
+    required: false
+    default: oss-cn-beijing.aliyuncs.com
+  region:
+    description: OSS region id
+    required: false
+    default: cn-beijing
+
+runs:
+  using: composite
+  steps:
+    # 固定版本直链（不用 install.sh：那会拉「最新版」，行为不可复现）
+    - name: Install ossutil
+      shell: bash
+      run: |
+        set -euo pipefail
+        V=2.3.0
+        curl -fsSL --retry 3 -o /tmp/ossutil.zip \
+          "https://gosspublic.alicdn.com/ossutil/v2/${V}/ossutil-${V}-linux-amd64.zip"
+        unzip -q -o /tmp/ossutil.zip -d /tmp/ossutil
+        sudo install -m 0755 "/tmp/ossutil/ossutil-${V}-linux-amd64/ossutil" /usr/local/bin/ossutil
+        ossutil version
+
+    - name: Upload to OSS
+      shell: bash
+      env:
+        OSS_ACCESS_KEY_ID: ${{ inputs.access-key-id }}
+        OSS_ACCESS_KEY_SECRET: ${{ inputs.access-key-secret }}
+        TAG: ${{ inputs.tag }}
+        DIR: ${{ inputs.dir }}
+        BASE: oss://${{ inputs.bucket }}/${{ inputs.prefix }}
+        ENDPOINT: ${{ inputs.endpoint }}
+        REGION: ${{ inputs.region }}
+      run: |
+        set -euo pipefail
+        if [ -z "$OSS_ACCESS_KEY_ID" ] || [ -z "$OSS_ACCESS_KEY_SECRET" ]; then
+          echo "⚠️  OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET not configured, skipping OSS upload"
+          exit 0
+        fi
+        case "$TAG" in
+          v*)   COMPONENT=app; VERSION=$TAG ;;
+          *-v*) COMPONENT=${TAG%%-v*}; VERSION=v${TAG#*-v} ;;
+          *)    echo "::error::invalid tag '$TAG'"; exit 1 ;;
+        esac
+        case "$TAG" in *[!A-Za-z0-9._-]*) echo "::error::invalid tag '$TAG'"; exit 1 ;; esac
+        DEST="$BASE/$VERSION/$COMPONENT/"
+        LOCAL_COUNT=$(find "$DIR" -maxdepth 1 -type f | wc -l)
+        echo "Uploading ${LOCAL_COUNT} file(s) from ${DIR}/ → ${DEST}"
+
+        # -f 覆盖：workflow_dispatch 补跑同 tag 时以新产物为准
+        for i in 1 2 3; do
+          if ossutil cp -r -f \
+               -e "$ENDPOINT" --region "$REGION" \
+               "$DIR/" "$DEST"; then
+            break
+          fi
+          if [ "$i" = 3 ]; then echo "::error::OSS upload failed after 3 attempts"; exit 1; fi
+          echo "⚠️  Attempt $i failed, retrying in 15s..."; sleep 15
+        done
+
+        # 校验：远端对象数不少于本地文件数
+        REMOTE_COUNT=$(ossutil ls -e "$ENDPOINT" --region "$REGION" "$DEST" --short-format 2>/dev/null \
+          | grep -c "^oss://" || true)
+        echo "Remote objects under ${DEST}: ${REMOTE_COUNT}"
+        if [ "$REMOTE_COUNT" -lt "$LOCAL_COUNT" ]; then
+          echo "::error::OSS verification failed: remote=${REMOTE_COUNT} < local=${LOCAL_COUNT}"
+          exit 1
+        fi
+        echo "✅ OSS upload complete: ${DEST}"

@@ -703,6 +703,7 @@ async fn run_coord(
         0,
         false,
         None,
+        None,
     )
     .await;
     drop(tx);
@@ -781,7 +782,7 @@ async fn validated_plain_range_rejects_changed_version() {
 
     let error = result.expect_err("validator 变化时不得接受纯 Range 续传");
     assert!(
-        error.to_string().contains("ETag mismatch"),
+        error.to_string().contains("validator mismatch"),
         "应明确报告版本不一致，实际为：{error}"
     );
     assert_eq!(
@@ -884,6 +885,7 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
         cdn: fluxdown_engine::cdn::CdnTaskInput::default(),
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
     })
     .await;
     let _ = collector.await;
@@ -1293,6 +1295,7 @@ async fn resume_after_cancel_is_byte_exact() {
         0,
         false,
         None,
+        None,
     )
     .await;
     drop(tx);
@@ -1334,6 +1337,7 @@ async fn resume_after_cancel_is_byte_exact() {
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         1,
         false,
+        None,
         None,
     )
     .await;
@@ -1544,6 +1548,7 @@ async fn run_full(
         spawn_gen: 1,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         auto_max_connections: 0, // 测试不裁剪 advisor
         task_id: task_id.to_string(),
         url: url.to_string(),
@@ -1633,6 +1638,7 @@ async fn run_full_server_time(
         spawn_gen: 1,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         auto_max_connections: 0,
         task_id: task_id.to_string(),
         url: url.to_string(),
@@ -1778,6 +1784,7 @@ async fn use_server_time_uses_new_last_modified_after_version_change() {
         spawn_gen: 1,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         auto_max_connections: 0,
         task_id: "mt-swap".to_string(),
         url,
@@ -2765,6 +2772,7 @@ async fn resume_of_unverified_hint_task_stays_plain_get() {
         spawn_gen: 1,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         auto_max_connections: 16,
         task_id: "rp".to_string(),
         url,
@@ -3001,6 +3009,7 @@ async fn manual_real_url_hint_download() {
         spawn_gen: 1,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         auto_max_connections: 16, // 与桌面 App 默认 user_cap 一致
         task_id: "manual".to_string(),
         url,
@@ -3157,6 +3166,7 @@ async fn transient_200_on_resume_is_absorbed_byte_exact() {
         fluxdown_engine::segment_coordinator::ReportScope::whole_task(),
         0,
         false,
+        None,
         None,
     )
     .await;

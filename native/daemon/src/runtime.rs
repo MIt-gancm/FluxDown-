@@ -1,6 +1,8 @@
 //! daemon 进程装配、引擎启动顺序与控制面生命周期。
 
 use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +37,17 @@ pub async fn run(
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
+
+    let _process_lease = match DaemonProcessLease::acquire(&data_dir)? {
+        Some(lease) => lease,
+        None => {
+            tracing::info!(
+                data_dir = %data_dir.display(),
+                "another fluxdownd owns the daemon process lease"
+            );
+            return Ok(());
+        }
+    };
 
     let (boot_db, write_guard) = open_database(&process_config, &data_dir).await?;
     let default_save_dir = fluxdown_engine::user_dirs::download_dir_or_cwd();
@@ -72,13 +85,14 @@ pub async fn run(
     .await?;
     apply_manager_settings(&mut engine, &all_config);
 
-    if let Some(progress) = engine.manager.take_progress_rx() {
+    let activity_journal = engine.activity_journal();
+    let progress_task = engine.manager.take_progress_rx().map(|progress| {
         tokio::spawn(download_manager::progress_reporter(
             progress,
             engine.db.clone(),
-            sink,
-        ));
-    }
+            engine.activity_sink.clone(),
+        ))
+    });
     let service_db = engine.db.clone();
     #[cfg(any(feature = "plugins", feature = "components"))]
     let service_data_dir = data_dir.clone();
@@ -147,6 +161,24 @@ pub async fn run(
         actor_task.abort();
         let _ = actor_task.await;
     }
+    if let Some(mut progress_task) = progress_task {
+        match tokio::time::timeout(Duration::from_secs(10), &mut progress_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "progress reporter stopped before journal flush")
+            }
+            Err(_) => {
+                progress_task.abort();
+                let _ = progress_task.await;
+                tracing::error!("progress reporter did not drain before journal flush");
+            }
+        }
+    }
+    match tokio::time::timeout(Duration::from_secs(10), activity_journal.flush()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "task activity journal final flush failed"),
+        Err(_) => tracing::error!("task activity journal final flush timed out"),
+    }
     if !startup_maintenance_task.is_finished() {
         startup_maintenance_task.abort();
     }
@@ -157,6 +189,29 @@ pub async fn run(
     result.map_err(Into::into)
 }
 
+/// An OS-backed process lease that identifies an already-running fluxdownd for this data dir.
+/// It is intentionally distinct from the engine writer lease: another host may legitimately hold
+/// the latter, which remains a startup error for this daemon.
+struct DaemonProcessLease {
+    _file: File,
+}
+
+impl DaemonProcessLease {
+    fn acquire(data_dir: &Path) -> Result<Option<Self>, std::io::Error> {
+        std::fs::create_dir_all(data_dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(data_dir.join("daemon.lock"))?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+}
 async fn open_database(
     config: &DaemonConfig,
     data_dir: &std::path::Path,
@@ -172,6 +227,7 @@ async fn initial_snapshot(
     config: &HashMap<String, String>,
 ) -> Result<DaemonSnapshot, fluxdown_engine::db::DbError> {
     Ok(DaemonSnapshot {
+        task_runtime: Default::default(),
         tasks: db
             .load_all_tasks()
             .await?
@@ -278,6 +334,9 @@ fn apply_manager_settings(engine: &mut Engine, config: &HashMap<String, String>)
         .set_cdn_max_nodes(i32_config(config, "cdn_max_nodes", 0).clamp(0, 8));
     engine
         .manager
+        .set_multi_nic_enabled(bool_config(config, "multi_nic_enabled", false));
+    engine
+        .manager
         .set_max_auto_retries(i32_config(config, "max_auto_retries", 3));
     engine
         .manager
@@ -285,10 +344,11 @@ fn apply_manager_settings(engine: &mut Engine, config: &HashMap<String, String>)
     engine
         .manager
         .set_use_server_time(bool_config(config, "use_server_time", false));
-    engine.manager.set_file_exists_overwrite(
+    engine.manager.set_file_exists_behavior(
         config
             .get("file_exists_behavior")
-            .is_some_and(|value| value == "overwrite"),
+            .map(|value| download_manager::FileExistsBehavior::from_config_str(value))
+            .unwrap_or(download_manager::FileExistsBehavior::Rename),
     );
     engine.manager.set_missing_file_auto_delete(
         config

@@ -9,7 +9,7 @@ use fluxdown_protocol::{
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::cloud::{CloudApi, CloudError};
@@ -65,14 +65,18 @@ impl RemoteTaskService {
 
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
         let mut retry_attempt = 0_usize;
+        let (mut session_events, _) = self.events.subscribe_and_snapshot();
         loop {
             if cancel.is_cancelled() {
                 return;
             }
             if !self.cloud.is_authenticated().await {
+                // 未登录：最多等 30s，或在 `SessionChanged(Some)`（登录成功）时立即醒来，
+                // 让设备名册 / 远程任务在登录后马上就位，而不是等下一轮。
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_secs(30)) => {},
+                    _ = wait_for_session(&mut session_events) => {},
                 }
                 continue;
             }
@@ -85,6 +89,10 @@ impl RemoteTaskService {
                     _ = tokio::time::sleep(delay) => {},
                 }
                 continue;
+            }
+            // 受信任设备名册随会话建立即刻投影（启动带凭证 / 登录），UI 不需要手动「重试」。
+            if let Err(error) = self.refresh_devices().await {
+                tracing::warn!(error = %error, "cloud device roster refresh failed");
             }
             self.rebuild_bindings().await;
             if let Err(error) = self.accept_pending_dispatches().await {
@@ -235,27 +243,13 @@ impl RemoteTaskService {
                     }
                 }
             }
-            "presence" => {
-                let value = self.cloud.devices(&self.local_device_id().await).await?;
-                let devices = value
-                    .get("devices")
-                    .or_else(|| value.get("value"))
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(serde_json::from_value)
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.events
-                    .publish(AgentEvent::CloudDevicesChanged(devices));
-            }
+            "presence" => self.refresh_devices().await?,
             "session.revoked" => {
                 let target = event.get("deviceId").and_then(Value::as_str);
                 let local = self.local_device_id().await;
                 if target.is_none_or(|target| target == local) {
+                    // `clear_session` 自身投影 `SessionChanged(None)`。
                     self.cloud.clear_session().await?;
-                    self.events
-                        .publish(AgentEvent::SessionChanged(Box::new(None)));
                 }
             }
             _ => {}
@@ -447,6 +441,23 @@ impl RemoteTaskService {
 
     pub async fn local_device_id(&self) -> String {
         self.state.lock().await.device_id.clone()
+    }
+
+    /// 拉取受信任设备名册并投影 `CloudDevicesChanged`（会话建立后与 presence 事件共用）。
+    pub async fn refresh_devices(&self) -> Result<(), RemoteError> {
+        let value = self.cloud.devices(&self.local_device_id().await).await?;
+        let devices = value
+            .get("devices")
+            .or_else(|| value.get("value"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(serde_json::from_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.events
+            .publish(AgentEvent::CloudDevicesChanged(devices));
+        Ok(())
     }
 
     pub async fn tasks(&self) -> Vec<RemoteTaskDto> {
@@ -647,6 +658,24 @@ pub enum RemoteError {
     Protocol(String),
 }
 
+/// 等到下一条 `SessionChanged(Some)`；接收端 lag 时也返回，由调用方重新检查登录态。
+async fn wait_for_session(events: &mut broadcast::Receiver<fluxdown_protocol::EventFrame>) {
+    loop {
+        match events.recv().await {
+            Ok(frame) => {
+                if let fluxdown_protocol::ServiceEvent::Agent(AgentEvent::SessionChanged(session)) =
+                    &frame.event
+                    && session.is_some()
+                {
+                    return;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => return,
+            Err(broadcast::error::RecvError::Closed) => std::future::pending::<()>().await,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -786,6 +815,109 @@ mod tests {
         })
         .await
         .expect("remote worker reconnected SSE and heartbeat");
+        cancel.cancel();
+        worker.await.expect("join remote worker");
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    async fn mock_devices() -> impl IntoResponse {
+        axum::Json(json!({
+            "devices": [{
+                "id": "row-1",
+                "deviceId": "device-1",
+                "name": "Desktop",
+                "platform": "macos",
+                "isCurrent": true
+            }]
+        }))
+    }
+
+    /// 登录前 worker 处于 30s 休眠；`SessionChanged(Some)` 必须立即唤醒它并把设备名册
+    /// 投影进快照——否则账户页得手动「重试」才有设备列表。
+    #[tokio::test]
+    async fn login_wakes_worker_and_projects_device_roster_immediately() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind remote mock");
+        let address = listener.local_addr().expect("remote mock address");
+        let mock = Arc::new(RemoteMockState::default());
+        let app = Router::new()
+            .route("/api/v1/tasks/remote", get(mock_remote_snapshot))
+            .route("/api/v1/tasks/events", get(mock_remote_events))
+            .route("/api/v1/tasks/presence", post(mock_presence))
+            .route("/api/v1/devices", get(mock_devices))
+            .with_state(mock.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_remote_login_wake_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(
+            StateStore::open(dir.clone())
+                .await
+                .expect("remote state store"),
+        );
+        let initial = AgentState {
+            device_id: "device-1".to_owned(),
+            ..Default::default()
+        };
+        store.save(&initial).await.expect("save remote state");
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let events =
+            crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let cloud = crate::cloud::CloudApi::new(
+            crate::cloud::CloudClient::new(
+                format!("http://{address}"),
+                state.clone(),
+                store.clone(),
+            )
+            .expect("remote cloud client"),
+        );
+        let service = Arc::new(RemoteTaskService::new(
+            cloud,
+            Arc::new(crate::daemon_client::DaemonClient::disconnected()),
+            events.clone(),
+            state.clone(),
+            store.clone(),
+        ));
+        let cancel = CancellationToken::new();
+        let worker = tokio::spawn(service.run(cancel.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(mock.snapshots.load(Ordering::SeqCst), 0);
+
+        // 模拟登录：先落凭证，再投影会话事件。
+        state.lock().await.credentials = Some(CloudCredentials {
+            access_token: "access".to_owned(),
+            refresh_token: "refresh".to_owned(),
+            expires_at_unix: i64::MAX,
+            session: None,
+        });
+        let session = serde_json::from_value::<fluxdown_protocol::AgentSessionDto>(json!({
+            "user": { "id": "u1", "email": "user@example.com" },
+            "device": { "id": "row-1", "deviceId": "device-1" }
+        }))
+        .expect("session dto");
+        events.publish(fluxdown_protocol::AgentEvent::SessionChanged(Box::new(
+            Some(session),
+        )));
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let fluxdown_protocol::SnapshotBody::Agent(agent) = events.snapshot().body
+                    && agent.cloud_devices.len() == 1
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("device roster projected right after login without manual retry");
         cancel.cancel();
         worker.await.expect("join remote worker");
         drop(store);

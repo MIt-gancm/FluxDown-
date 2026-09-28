@@ -889,6 +889,8 @@ impl WebhookDispatcher {
         {
             log_info!("[webhook] delivery log clear failed: {e}");
         }
+        // 显式清空立即广播当前快照；不能只删存储而让已打开的客户端保留旧记录。
+        self.inner.emit_snapshot();
     }
 
     /// 发一条事件。**同步、不阻塞**：只筛端点 + 投队列，网络 IO 全在
@@ -1875,6 +1877,9 @@ mod tests {
         }
         let seen = sink.0.lock().map(|v| v.clone()).unwrap_or_default();
         assert_eq!(seen, vec![1], "应当恰好推一份含 1 条记录的快照");
+        d.clear_deliveries().await;
+        let seen = sink.0.lock().map(|v| v.clone()).unwrap_or_default();
+        assert_eq!(seen, vec![1, 0], "清空后已订阅的 UI 必须立即收到空快照");
     }
 
     /// 节流窗口内的最后一条变化必须由尾随推送补上。

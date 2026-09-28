@@ -1,31 +1,35 @@
 //! API 服务：本机网关的功能开关、端口、访问令牌与 LAN 暴露。
 
 use fluxdown_protocol::GatewayPatchParams;
-use fluxdown_ui_components::{ButtonVariant, button};
+use fluxdown_ui_components::{
+    ButtonVariant, ControlExt as _, FluxIcon, button, icon_button, loading_icon_button,
+    tabular_numbers,
+};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, AppContext as _, ClipboardItem, Entity, ParentElement, SharedString, Styled, Window, div,
-    px,
+    App, AppContext as _, ClipboardItem, Entity, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, px,
 };
 use gpui_component::{
-    Icon, IconName, h_flex,
+    Icon, h_flex,
     input::{Input, InputEvent, InputState},
-    setting::{SettingField, SettingGroup, SettingPage},
-    v_flex,
+    tooltip::Tooltip,
 };
 
 use super::SectionContext;
+use crate::ui::{Control, INPUT_WIDTH, SettingsPage, SettingsSection, body_text};
 
-pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingPage {
-    SettingPage::new(ctx.t("settingsCatApiService"))
-        .icon(Icon::new(IconName::Globe))
-        .description(ctx.t("settingsCatApiServiceDesc"))
-        .resettable(false)
-        .group(service_group(ctx, cx))
-        .group(features_group(ctx))
+pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
+    SettingsPage::new(
+        "api",
+        ctx.t("settingsCatApiService"),
+        ctx.t("settingsCatApiServiceDesc"),
+        FluxIcon::Code,
+    )
+    .sections([service_section(ctx, cx), features_section(ctx)])
 }
 
-fn service_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
+fn service_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
     let gateway = ctx.store.read(cx).gateway().clone();
     let port_text = SharedString::from(gateway.port.to_string());
     let address = SharedString::from(format!("http://127.0.0.1:{}", gateway.port));
@@ -33,24 +37,28 @@ fn service_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
     let copied = ctx.t("apiServiceCopied");
     let copy_label = ctx.t("apiServiceCopy");
 
-    SettingGroup::new()
+    SettingsSection::new()
         .title(ctx.t("settingsCatApiService"))
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServicePort",
             Some("apiServicePortDesc"),
-            SettingField::render(move |_, _, _| div().child(port_text.clone())),
+            Control::custom(move |_, _, _, cx: &mut App| {
+                body_text(cx)
+                    .font_features(tabular_numbers())
+                    .child(port_text.clone())
+            }),
         ))
-        .item(
+        .row(
             ctx.item(
                 "apiServiceAddress",
                 None,
-                SettingField::render(move |_, _, cx: &mut App| {
+                Control::custom(move |_, _, _, cx: &mut App| {
                     let tokens = active_theme(cx).tokens();
                     let address = address_for_copy.clone();
                     h_flex()
                         .gap(tokens.spacing.sm)
                         .items_center()
-                        .child(div().text_sm().child(address.clone()))
+                        .child(body_text(cx).child(address.clone()))
                         .child(
                             button(
                                 "api-copy-address",
@@ -68,43 +76,43 @@ fn service_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
             )
             .keywords([copied.clone()]),
         )
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServiceLanEnable",
             Some("apiServiceLanEnableDesc"),
             gateway_switch(ctx, GatewayFlag::Lan),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServiceToken",
             Some("apiServiceTokenDesc"),
             token_field(ctx),
         ))
 }
 
-fn features_group(ctx: &SectionContext) -> SettingGroup {
-    SettingGroup::new()
+fn features_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
         .title(ctx.t("apiServiceFeaturesTitle"))
-        .description(ctx.t("apiServiceFeaturesDesc"))
-        .item(ctx.item(
+        .subtitle(ctx.t("apiServiceFeaturesDesc"))
+        .row(ctx.item(
             "apiServiceTakeover",
             Some("apiServiceTakeoverDesc"),
             gateway_switch(ctx, GatewayFlag::Takeover),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServiceJsonrpc",
             Some("apiServiceJsonrpcDesc"),
             gateway_switch(ctx, GatewayFlag::Jsonrpc),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServiceApi",
             Some("apiServiceApiDesc"),
             gateway_switch(ctx, GatewayFlag::Api),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServiceMcp",
             Some("apiServiceMcpDesc"),
             gateway_switch(ctx, GatewayFlag::Mcp),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "apiServiceCorsAllowAll",
             Some("apiServiceCorsAllowAllDesc"),
             gateway_switch(ctx, GatewayFlag::Cors),
@@ -121,10 +129,10 @@ enum GatewayFlag {
     Lan,
 }
 
-fn gateway_switch(ctx: &SectionContext, flag: GatewayFlag) -> SettingField<bool> {
+fn gateway_switch(ctx: &SectionContext, flag: GatewayFlag) -> Control {
     let get = ctx.store();
     let set = ctx.store();
-    SettingField::switch(
+    Control::switch(
         move |cx: &App| {
             let gateway = get.read(cx).gateway();
             match flag {
@@ -159,32 +167,36 @@ struct TokenSlot {
 
 /// 令牌：可见可编辑（回车/失焦提交自定义值）+ 复制 / 生成 / 清空。
 /// 文本经 `agent.gateway.revealToken` 按需读取，不走快照。
-fn token_field(ctx: &SectionContext) -> SettingField<SharedString> {
+fn token_field(ctx: &SectionContext) -> Control {
     let store = ctx.store();
     let generate = ctx.t("apiServiceTokenGenerate");
     let clear = ctx.t("apiServiceTokenClear");
     let copy = ctx.t("apiServiceCopy");
     let copied = ctx.t("apiServiceCopied");
     let placeholder = ctx.t("proxyNotConfigured");
-    SettingField::render(move |options, window: &mut Window, cx: &mut App| {
-        let tokens = active_theme(cx).tokens().clone();
+    Control::custom(move |disabled, key, window: &mut Window, cx: &mut App| {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let icon_size = theme.extended().icon.md;
         let snapshot = store.read(cx);
         let token: SharedString = snapshot
             .transient("gateway_user_token")
             .and_then(serde_json::Value::as_str)
             .map(|token| SharedString::from(token.to_owned()))
             .unwrap_or_default();
-        let revealed = snapshot.transient("gateway_user_token").is_some();
+        let needs_reveal = snapshot.gateway_token_needs_reveal();
         let busy = snapshot.is_busy("gateway") || snapshot.is_busy("gatewayToken");
+        let regenerating = snapshot.is_busy_tagged("gateway", "regenerateToken");
+        let clearing = snapshot.is_busy_tagged("gateway", "clearToken");
         let just_copied = snapshot
             .transient("gateway_token_copied")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        if !revealed && !busy {
+        if needs_reveal && !busy {
             store.update(cx, |store, cx| store.reveal_gateway_token(cx));
         }
 
-        let slot = window.use_keyed_state(SharedString::from("settings-api-token"), cx, {
+        let slot = window.use_keyed_state(SharedString::from(format!("{key}-token")), cx, {
             let store = store.clone();
             let token = token.clone();
             let placeholder = placeholder.clone();
@@ -235,100 +247,104 @@ fn token_field(ctx: &SectionContext) -> SettingField<SharedString> {
         let copy_token = token.clone();
         let generate_store = store.clone();
         let clear_store = store.clone();
-        v_flex()
-            .w(px(360.))
-            .max_w_full()
-            .gap(tokens.spacing.xs)
-            .items_end()
+        let copy_tooltip = if just_copied {
+            copied.clone()
+        } else {
+            copy.clone()
+        };
+        let generate_tooltip = generate.clone();
+        let clear_tooltip = clear.clone();
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(tokens.spacing.sm)
             .child(
                 Input::new(&input)
-                    .w_full()
-                    .disabled(options.is_disabled() || busy),
+                    .control(cx)
+                    .w(px(INPUT_WIDTH))
+                    .disabled(disabled || busy),
             )
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .gap(tokens.spacing.sm)
-                    .child(
-                        button(
-                            "api-token-copy",
-                            if just_copied {
-                                copied.clone()
-                            } else {
-                                copy.clone()
+                icon_button(
+                    "api-token-copy",
+                    copy.clone(),
+                    Icon::new(FluxIcon::Copy).size(icon_size),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .disabled(token.is_empty())
+                .tooltip(move |window, cx| Tooltip::new(copy_tooltip.clone()).build(window, cx))
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_token.to_string()));
+                    copy_store.update(cx, |store, cx| {
+                        store.set_transient("gateway_token_copied", serde_json::json!(true), cx);
+                    });
+                    let reset = copy_store.clone();
+                    cx.spawn(async move |cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_secs(2))
+                            .await;
+                        reset.update(cx, |store, cx| {
+                            store.set_transient(
+                                "gateway_token_copied",
+                                serde_json::json!(false),
+                                cx,
+                            );
+                        });
+                    })
+                    .detach();
+                }),
+            )
+            .child(
+                loading_icon_button(
+                    "api-token-generate",
+                    generate.clone(),
+                    Icon::new(FluxIcon::RotateCw).size(icon_size),
+                    ButtonVariant::Secondary,
+                    regenerating,
+                    cx,
+                )
+                .disabled(disabled || busy)
+                .tooltip(move |window, cx| Tooltip::new(generate_tooltip.clone()).build(window, cx))
+                .on_click(move |_, _, cx| {
+                    generate_store.update(cx, |store, cx| {
+                        store.patch_gateway(
+                            GatewayPatchParams {
+                                regenerate_user_token: true,
+                                ..Default::default()
                             },
-                            ButtonVariant::Secondary,
                             cx,
-                        )
-                        .disabled(token.is_empty())
-                        .on_click(move |_, _, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(
-                                copy_token.to_string(),
-                            ));
-                            copy_store.update(cx, |store, cx| {
-                                store.set_transient(
-                                    "gateway_token_copied",
-                                    serde_json::json!(true),
-                                    cx,
-                                );
-                            });
-                            let reset = copy_store.clone();
-                            cx.spawn(async move |cx| {
-                                cx.background_executor()
-                                    .timer(std::time::Duration::from_secs(2))
-                                    .await;
-                                reset.update(cx, |store, cx| {
-                                    store.set_transient(
-                                        "gateway_token_copied",
-                                        serde_json::json!(false),
-                                        cx,
-                                    );
-                                });
-                            })
-                            .detach();
-                        }),
-                    )
-                    .child(
-                        button(
-                            "api-token-generate",
-                            generate.clone(),
-                            ButtonVariant::Primary,
+                        );
+                        store.tag_busy("gateway", "regenerateToken");
+                    });
+                }),
+            )
+            .child(
+                loading_icon_button(
+                    "api-token-clear",
+                    clear.clone(),
+                    Icon::new(FluxIcon::Trash2)
+                        .size(icon_size)
+                        .text_color(tokens.colors.destructive),
+                    ButtonVariant::Secondary,
+                    clearing,
+                    cx,
+                )
+                .disabled(disabled || busy || token.is_empty())
+                .tooltip(move |window, cx| Tooltip::new(clear_tooltip.clone()).build(window, cx))
+                .on_click(move |_, _, cx| {
+                    clear_store.update(cx, |store, cx| {
+                        store.patch_gateway(
+                            GatewayPatchParams {
+                                user_token: Some(String::new()),
+                                ..Default::default()
+                            },
                             cx,
-                        )
-                        .disabled(options.is_disabled() || busy)
-                        .on_click(move |_, _, cx| {
-                            generate_store.update(cx, |store, cx| {
-                                store.patch_gateway(
-                                    GatewayPatchParams {
-                                        regenerate_user_token: true,
-                                        ..Default::default()
-                                    },
-                                    cx,
-                                );
-                            });
-                        }),
-                    )
-                    .child(
-                        button(
-                            "api-token-clear",
-                            clear.clone(),
-                            ButtonVariant::Destructive,
-                            cx,
-                        )
-                        .disabled(options.is_disabled() || busy || token.is_empty())
-                        .on_click(move |_, _, cx| {
-                            clear_store.update(cx, |store, cx| {
-                                store.patch_gateway(
-                                    GatewayPatchParams {
-                                        user_token: Some(String::new()),
-                                        ..Default::default()
-                                    },
-                                    cx,
-                                );
-                            });
-                        }),
-                    ),
+                        );
+                        store.tag_busy("gateway", "clearToken");
+                    });
+                }),
             )
     })
 }

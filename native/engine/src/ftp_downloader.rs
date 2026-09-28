@@ -26,9 +26,41 @@ use crate::downloader::{
     BUF_WRITER_CAPACITY, DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, FileInfo,
     ProgressUpdate, SegmentProgressInfo, TEMP_EXT, extract_from_url, sanitize_filename,
 };
+use crate::events::EventSink;
 use crate::logger::log_info;
+use crate::output;
 use crate::proxy_config::{self, ProxyConfig};
 use crate::speed_limiter::SpeedLimiter;
+use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferTracker};
+
+fn ftp_runtime(
+    task_id: &str,
+    total_bytes: i64,
+    limit: u32,
+    tracker: &TransferTracker,
+    segments: &[SegmentProgressInfo],
+    sample_sequence: u64,
+) -> TaskRuntime {
+    TaskRuntime {
+        task_id: task_id.to_owned(),
+        sampled_at_ms: chrono::Utc::now().timestamp_millis(),
+        sample_sequence,
+        active_transfers: Some(tracker.active()),
+        connected_peers: None,
+        parallelism_limit: Some(limit),
+        total_bytes,
+        segments: segments
+            .iter()
+            .map(|s| TaskSegment {
+                index: s.index,
+                start_byte: s.start_byte,
+                end_byte: s.end_byte,
+                downloaded_bytes: s.downloaded_bytes,
+                active: s.active,
+            })
+            .collect(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FTP URL parsing
@@ -813,6 +845,7 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     );
 
     let ftp_url = parse_ftp_url(&p.url)?;
+    let tracker = TransferTracker::new();
 
     if use_segments {
         ftp_download_multi_segment(
@@ -826,6 +859,8 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             &p.cancel_token,
             &p.speed_limiter,
             &p.proxy_config,
+            &tracker,
+            &p.sink,
             p.spawn_gen,
         )
         .await?;
@@ -846,6 +881,7 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 &p.cancel_token,
                 &p.speed_limiter,
                 &p.proxy_config,
+                &tracker,
             )
             .await
             {
@@ -863,6 +899,21 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                         MAX_RETRIES,
                         e
                     );
+                    if let Err(journal_error) = crate::task_activity::record(
+                        &p.db,
+                        p.sink.as_ref(),
+                        &p.task_id,
+                        "retry",
+                        format!("FTP 单流第 {attempts}/{MAX_RETRIES} 次尝试失败，即将重试：{e}"),
+                        None,
+                    )
+                    .await
+                    {
+                        crate::log_error!(
+                            "[task-activity] failed to persist retry: {}",
+                            journal_error
+                        );
+                    }
                     let delay = RETRY_BASE_DELAY * 2u32.saturating_pow(attempts - 1);
                     tokio::select! {
                         _ = p.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
@@ -991,10 +1042,9 @@ async fn ftp_download_single(
     cancel_token: &CancellationToken,
     speed_limiter: &SpeedLimiter,
     proxy_config: &ProxyConfig,
+    tracker: &TransferTracker,
 ) -> Result<(), DownloadError> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    output::ensure_parent(dest).await?;
 
     let existing_len = match tokio::fs::metadata(dest).await {
         Ok(m) => m.len() as i64,
@@ -1019,6 +1069,7 @@ async fn ftp_download_single(
     let progress_tx = progress_tx.clone();
     let cancel_token = cancel_token.clone();
     let speed_limiter = speed_limiter.clone();
+    let tracker = tracker.clone();
 
     // The blocking thread reads FTP data and sends chunks via channel
     // to the async side which handles file I/O and progress reporting.
@@ -1042,6 +1093,7 @@ async fn ftp_download_single(
         let cancelled = cancelled.clone();
         let resume_offset = if resume { existing_len } else { 0 };
         let proxy = proxy_config.clone();
+        let tracker_reader = tracker.clone();
 
         tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
             let proxy_opt = if proxy.is_active() {
@@ -1075,7 +1127,11 @@ async fn ftp_download_single(
                 if cancelled.load(Ordering::SeqCst) {
                     break;
                 }
-                match data_stream.read(&mut buf) {
+                let read = {
+                    let _transfer = tracker_reader.start(0);
+                    data_stream.read(&mut buf)
+                };
+                match read {
                     Ok(0) => break,
                     Ok(n) => {
                         consecutive_timeouts = 0;
@@ -1196,6 +1252,12 @@ async fn ftp_download_single(
                         downloaded += n as i64;
 
                         if last_report.elapsed().as_millis() >= 200 {
+                            let segment = SegmentProgressInfo {
+                                index: 0, start_byte: 0,
+                                end_byte: if total_bytes > 0 { total_bytes - 1 } else { 0 },
+                                downloaded_bytes: downloaded, active: Some(tracker.is_active(0)),
+                            };
+                            let runtime = ftp_runtime(&task_id, total_bytes, 1, &tracker, std::slice::from_ref(&segment), crate::transfer_activity::next_sample_sequence());
                             let _ = progress_tx
                                 .send(ProgressUpdate {
                                     task_id: task_id.clone(),
@@ -1204,12 +1266,8 @@ async fn ftp_download_single(
                                     status: 1,
                                     error_message: String::new(),
                                     file_name: String::new(),
-                                    segment_details: Some(vec![SegmentProgressInfo {
-                                        index: 0,
-                                        start_byte: 0,
-                                        end_byte: if total_bytes > 0 { total_bytes - 1 } else { 0 },
-                                        downloaded_bytes: downloaded,
-                                    }]),
+                                    segment_details: Some(vec![segment]),
+                                    runtime: Some(runtime),
                                     ..Default::default()
                                 })
                                 .await;
@@ -1266,11 +1324,11 @@ async fn ftp_download_multi_segment(
     cancel_token: &CancellationToken,
     speed_limiter: &SpeedLimiter,
     proxy_config: &ProxyConfig,
+    tracker: &TransferTracker,
+    sink: &Arc<dyn EventSink>,
     spawn_gen: i64,
 ) -> Result<(), DownloadError> {
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    output::ensure_parent(dest).await?;
 
     // 夺取段行布局属主权：先于 load_segments/建行（顺序即正确性，见
     // db::set_segments_epoch 文档）。旧 spawn 迟到的段进度写从此全类失效。
@@ -1359,6 +1417,7 @@ async fn ftp_download_multi_segment(
                 start_byte: *start,
                 end_byte: *end,
                 downloaded_bytes: *dl,
+                active: Some(false),
             })
             .collect(),
     ));
@@ -1402,6 +1461,8 @@ async fn ftp_download_multi_segment(
         let limiter = speed_limiter.clone();
         let sem = ftp_semaphore.clone();
         let proxy = proxy_config.clone();
+        let tracker = tracker.clone();
+        let sink = sink.clone();
 
         let handle = tokio::spawn(async move {
             // Acquire permit before opening FTP connection
@@ -1425,6 +1486,8 @@ async fn ftp_download_multi_segment(
                 &seg_states,
                 &limiter,
                 &proxy,
+                &tracker,
+                sink.as_ref(),
                 spawn_gen,
             )
             .await
@@ -1484,6 +1547,8 @@ async fn ftp_do_segment_with_retry(
     seg_states: &Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     speed_limiter: &SpeedLimiter,
     proxy_config: &ProxyConfig,
+    tracker: &TransferTracker,
+    sink: &dyn EventSink,
     spawn_gen: i64,
 ) -> Result<(), DownloadError> {
     let mut attempts = 0u32;
@@ -1505,6 +1570,7 @@ async fn ftp_do_segment_with_retry(
             seg_states,
             speed_limiter,
             proxy_config,
+            tracker,
             spawn_gen,
         )
         .await
@@ -1523,6 +1589,20 @@ async fn ftp_do_segment_with_retry(
                     if actual_start > seg_end {
                         return Ok(());
                     }
+                }
+                if let Err(journal_error) = crate::task_activity::record(
+                    db,
+                    sink,
+                    task_id,
+                    "retry",
+                    format!(
+                        "FTP 段 {seg_idx} 第 {attempts}/{MAX_RETRIES} 次尝试失败，即将重试：{e}"
+                    ),
+                    None,
+                )
+                .await
+                {
+                    crate::log_error!("[task-activity] failed to persist retry: {}", journal_error);
                 }
                 let delay = RETRY_BASE_DELAY * 2u32.saturating_pow(attempts - 1);
                 tokio::select! {
@@ -1557,6 +1637,7 @@ async fn ftp_do_segment(
     seg_states: &Arc<StdMutex<Vec<SegmentProgressInfo>>>,
     speed_limiter: &SpeedLimiter,
     proxy_config: &ProxyConfig,
+    tracker: &TransferTracker,
     spawn_gen: i64,
 ) -> Result<(), DownloadError> {
     let bytes_needed = (seg_end - actual_start + 1) as u64;
@@ -1582,6 +1663,7 @@ async fn ftp_do_segment(
         let cancelled = cancelled.clone();
         let seg_bytes_needed = bytes_needed;
         let proxy = proxy_config.clone();
+        let tracker_reader = tracker.clone();
 
         tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
             let proxy_opt = if proxy.is_active() {
@@ -1621,7 +1703,11 @@ async fn ftp_do_segment(
                 }
                 let to_read = (remaining as usize).min(buf.len());
 
-                match data_stream.read(&mut buf[..to_read]) {
+                let read = {
+                    let _transfer = tracker_reader.start(seg_idx);
+                    data_stream.read(&mut buf[..to_read])
+                };
+                match read {
                     Ok(0) => break,
                     Ok(n) => {
                         consecutive_timeouts = 0;
@@ -1788,11 +1874,15 @@ async fn ftp_do_segment(
                             }
 
                         if last_report.elapsed().as_millis() >= 200 {
-                            let current_total = total_downloaded.load(Ordering::Relaxed);
-                            let snapshot = seg_states
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .clone();
+                            let (mut snapshot, sample_sequence) = {
+                                let states = seg_states.lock().unwrap_or_else(|e| e.into_inner());
+                                (states.clone(), crate::transfer_activity::next_sample_sequence())
+                            };
+                            let current_total: i64 = snapshot.iter().map(|s| s.downloaded_bytes).sum();
+                            for segment in &mut snapshot {
+                                segment.active = Some(tracker.is_active(segment.index));
+                            }
+                            let runtime = ftp_runtime(task_id, total_bytes, MAX_CONCURRENT_FTP_CONNECTIONS as u32, tracker, &snapshot, sample_sequence);
                             let _ = progress_tx
                                 .send(ProgressUpdate {
                                     task_id: task_id.to_string(),
@@ -1802,6 +1892,7 @@ async fn ftp_do_segment(
                                     error_message: String::new(),
                                     file_name: String::new(),
                                     segment_details: Some(snapshot),
+                                    runtime: Some(runtime),
                                     ..Default::default()
                                 })
                                 .await;

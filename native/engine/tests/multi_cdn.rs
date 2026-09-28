@@ -261,6 +261,7 @@ async fn run_with_pool(
         0,
         false,
         None,
+        None,
     )
     .await;
     drop(tx);

@@ -1,0 +1,225 @@
+{
+  "schemaVersion": 1,
+  "name": "My Nord Tweak",
+  "author": "tester",
+  "light": {
+    "colors": {
+      "background": "#f8f9faff",
+      "foreground": "#09090bff",
+      "surface": "#ffffffff",
+      "surface_foreground": "#09090bff",
+      "primary": "#3b82f6ff",
+      "primary_foreground": "#ffffffff",
+      "secondary": "#f1f3f5ff",
+      "secondary_foreground": "#09090bff",
+      "muted": "#f1f3f5ff",
+      "muted_foreground": "#71717aff",
+      "accent": "#3b82f61a",
+      "accent_foreground": "#3b82f6ff",
+      "destructive": "#ef4444ff",
+      "destructive_foreground": "#ffffffff",
+      "border": "#e4e4e7ff",
+      "input": "#e4e4e7ff",
+      "ring": "#3b82f6ff"
+    },
+    "radius": {
+      "none": 0.0,
+      "sm": 3.0,
+      "md": 6.0,
+      "lg": 8.0,
+      "xl": 12.0,
+      "full": 9999.0
+    },
+    "spacing": {
+      "xxs": 2.0,
+      "xs": 4.0,
+      "sm": 8.0,
+      "md": 12.0,
+      "lg": 16.0,
+      "xl": 24.0,
+      "xxl": 32.0
+    },
+    "typography": {
+      "sans": "Inter",
+      "mono": "JetBrains Mono",
+      "xs": {
+        "size": 12.0,
+        "line_height": 16.0,
+        "weight": 400.0
+      },
+      "sm": {
+        "size": 13.0,
+        "line_height": 18.0,
+        "weight": 400.0
+      },
+      "md": {
+        "size": 16.0,
+        "line_height": 24.0,
+        "weight": 400.0
+      },
+      "lg": {
+        "size": 18.0,
+        "line_height": 28.0,
+        "weight": 400.0
+      },
+      "xl": {
+        "size": 20.0,
+        "line_height": 28.0,
+        "weight": 400.0
+      },
+      "mono_md": {
+        "size": 13.0,
+        "line_height": 20.0,
+        "weight": 400.0
+      }
+    },
+    "shadow": {
+      "sm": [
+        {
+          "color": "#0000002e",
+          "offset": {
+            "x": 0.0,
+            "y": 1.0
+          },
+          "blur_radius": 2.0,
+          "spread_radius": 0.0,
+          "inset": false
+        }
+      ],
+      "md": [
+        {
+          "color": "#0000002e",
+          "offset": {
+            "x": 0.0,
+            "y": 4.0
+          },
+          "blur_radius": 8.0,
+          "spread_radius": -2.0,
+          "inset": false
+        }
+      ],
+      "lg": [
+        {
+          "color": "#0000002e",
+          "offset": {
+            "x": 0.0,
+            "y": 12.0
+          },
+          "blur_radius": 24.0,
+          "spread_radius": -4.0,
+          "inset": false
+        }
+      ]
+    }
+  },
+  "dark": {
+    "colors": {
+      "background": "#2e3440ff",
+      "foreground": "#eceff4ff",
+      "surface": "#3b4252ff",
+      "surface_foreground": "#eceff4ff",
+      "primary": "#88c0d0ff",
+      "primary_foreground": "#2e3440ff",
+      "secondary": "#434c5eff",
+      "secondary_foreground": "#eceff4ff",
+      "muted": "#434c5eff",
+      "muted_foreground": "#d8dee9ff",
+      "accent": "#88c0d026",
+      "accent_foreground": "#88c0d0ff",
+      "destructive": "#bf616aff",
+      "destructive_foreground": "#ffffffff",
+      "border": "#4c566aff",
+      "input": "#4c566aff",
+      "ring": "#88c0d0ff"
+    },
+    "radius": {
+      "none": 0.0,
+      "sm": 3.0,
+      "md": 8.0,
+      "lg": 8.0,
+      "xl": 12.0,
+      "full": 9999.0
+    },
+    "spacing": {
+      "xxs": 2.0,
+      "xs": 4.0,
+      "sm": 8.0,
+      "md": 12.0,
+      "lg": 16.0,
+      "xl": 24.0,
+      "xxl": 40.0
+    },
+    "typography": {
+      "sans": "MiSans",
+      "mono": "JetBrains Mono",
+      "xs": {
+        "size": 12.0,
+        "line_height": 16.0,
+        "weight": 400.0
+      },
+      "sm": {
+        "size": 13.0,
+        "line_height": 18.0,
+        "weight": 400.0
+      },
+      "md": {
+        "size": 16.0,
+        "line_height": 24.0,
+        "weight": 400.0
+      },
+      "lg": {
+        "size": 18.0,
+        "line_height": 28.0,
+        "weight": 400.0
+      },
+      "xl": {
+        "size": 20.0,
+        "line_height": 28.0,
+        "weight": 400.0
+      },
+      "mono_md": {
+        "size": 13.0,
+        "line_height": 20.0,
+        "weight": 400.0
+      }
+    },
+    "shadow": {
+      "sm": [
+        {
+          "color": "#0000002e",
+          "offset": {
+            "x": 0.0,
+            "y": 1.0
+          },
+          "blur_radius": 2.0,
+          "spread_radius": 0.0,
+          "inset": false
+        }
+      ],
+      "md": [
+        {
+          "color": "#0000002e",
+          "offset": {
+            "x": 0.0,
+            "y": 4.0
+          },
+          "blur_radius": 8.0,
+          "spread_radius": -2.0,
+          "inset": false
+        }
+      ],
+      "lg": [
+        {
+          "color": "#0000002e",
+          "offset": {
+            "x": 0.0,
+            "y": 12.0
+          },
+          "blur_radius": 24.0,
+          "spread_radius": -4.0,
+          "inset": false
+        }
+      ]
+    }
+  }
+}

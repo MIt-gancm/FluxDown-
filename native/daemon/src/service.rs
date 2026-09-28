@@ -9,12 +9,14 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec};
+use fluxdown_engine::log_info;
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
     ApplicationErrorCode, CdnConfigApplyParams, CdnReportAckParams, CreateGroupRequest,
     CreateQueueRequest, DaemonConfigPatch, DaemonCreateTaskParams, MigrationAckParams,
     RpcErrorData, RpcErrorObject, RpcRequest, RpcResponse, SelectionResolutionDto, ServiceHello,
-    SiteAuthDeleteParams, SnapshotBody,
+    SiteAuthCredentialDto, SiteAuthDeleteParams, SiteAuthMatchParams, SnapshotBody,
+    TaskActivityQuery,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -162,6 +164,35 @@ impl DaemonService {
                     .find(|task| task.task_id == params.id)
                     .ok_or_else(not_found)?;
                 to_value(task)
+            }
+            method::DAEMON_TASK_ACTIVITY => {
+                let query = parse_params::<TaskActivityQuery>(params)?;
+                let page = self
+                    .db
+                    .query_task_activity(&fluxdown_engine::task_activity::TaskActivityQuery {
+                        task_id: query.task_id,
+                        before_id: query.before_id,
+                        after_id: query.after_id,
+                        limit: query.limit,
+                    })
+                    .await
+                    .map_err(|error| match error {
+                        fluxdown_engine::db::DbError::InvalidActivityQuery(message) => {
+                            invalid_argument("params", message)
+                        }
+                        other => internal_error(other.to_string()),
+                    })?;
+                to_value(fluxdown_protocol::TaskActivityPage {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(fluxdown_engine_protocol::task_activity_to_dto)
+                        .collect(),
+                    has_more: page.has_more,
+                    oldest_id: page.oldest_id,
+                    newest_id: page.newest_id,
+                    truncated: page.truncated,
+                })
             }
             method::DAEMON_TASK_CREATE => self.create_task(params).await,
             method::DAEMON_TASK_PAUSE => {
@@ -386,6 +417,26 @@ impl DaemonService {
                     domain_count: u64::try_from(count).unwrap_or(u64::MAX),
                 })
             }
+            method::DAEMON_CONFIG_SYSTEM_PROXY => {
+                let detected =
+                    tokio::task::spawn_blocking(fluxdown_engine::proxy_config::detect_system_proxy)
+                        .await
+                        .map_err(|error| internal_error(format!("{error:#}")))?;
+                to_value(match detected {
+                    Ok(Some(cfg)) => fluxdown_protocol::SystemProxyDto {
+                        detected: true,
+                        proxy_type: cfg.proxy_type.as_str().to_owned(),
+                        host: cfg.host,
+                        port: cfg.port,
+                        no_list: cfg.no_proxy_list,
+                    },
+                    Ok(None) => fluxdown_protocol::SystemProxyDto::default(),
+                    Err(error) => {
+                        log_info!("[daemon] system proxy detection error: {error:#}");
+                        fluxdown_protocol::SystemProxyDto::default()
+                    }
+                })
+            }
             method::DAEMON_CONFIG_CLEAR_CONN_POLICY => {
                 match self.actor.execute(ActorOperation::ClearConnPolicy).await {
                     Ok(ActorResult::ConnPolicy(summary)) => to_value(summary),
@@ -415,6 +466,16 @@ impl DaemonService {
             method::DAEMON_SITE_AUTH_CLEAR => {
                 self.site_auth_operation(ActorOperation::SiteAuthClear)
                     .await
+            }
+            method::DAEMON_SITE_AUTH_MATCH => {
+                let params = parse_params::<SiteAuthMatchParams>(params)?;
+                let json = self
+                    .db
+                    .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?
+                    .unwrap_or_default();
+                to_value(match_site_auth(&json, &params.url))
             }
             method::DAEMON_RSS_LIST_SOURCES => {
                 let sources = self
@@ -540,6 +601,32 @@ impl DaemonService {
             #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_LIST => to_value(self.list_plugins().await?),
             #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_AUTH => {
+                let request = parse_params::<fluxdown_protocol::PluginAuthRequest>(params)?;
+                let result = self
+                    .plugin_manager()?
+                    .authenticate(
+                        &request.identity,
+                        fluxdown_engine::plugin::AuthRequest {
+                            action: request.action,
+                            site: request.site,
+                            auth_ref: request.auth_ref,
+                            session_id: request.session_id,
+                            input: request.input,
+                        },
+                    )
+                    .await
+                    .map_err(|error| invalid_argument("auth", &error.to_string()))?;
+                to_value(fluxdown_protocol::PluginAuthResponse {
+                    status: result.status,
+                    session_id: result.session_id,
+                    challenge: result.challenge,
+                    challenge_type: result.challenge_type,
+                    message: result.message,
+                    auth_ref: result.auth_ref,
+                })
+            }
+            #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_SET_ENABLED => {
                 let params = parse_params::<PluginEnabledParams>(params)?;
                 let manager = self.plugin_manager()?;
@@ -573,7 +660,7 @@ impl DaemonService {
                     .plugin_manager()?
                     .install_from_zip(bytes)
                     .await
-                    .map_err(|error| invalid_argument("blobId", &error.to_string()))?;
+                    .map_err(|error| plugin_package_error("blobId", &error))?;
                 self.blobs
                     .consume(&params.blob_id, BlobKind::Plugin)
                     .await
@@ -592,7 +679,7 @@ impl DaemonService {
                     .plugin_manager()?
                     .install_dev(std::path::Path::new(&request.dir_path))
                     .await
-                    .map_err(|error| invalid_argument("dirPath", &error.to_string()))?;
+                    .map_err(|error| plugin_package_error("dirPath", &error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
                 self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
@@ -617,7 +704,7 @@ impl DaemonService {
                     .await?
                     .fetch_index()
                     .await
-                    .map_err(|error| invalid_argument("market", &error.to_string()))?;
+                    .map_err(|error| market_error(&error))?;
                 to_value(
                     index
                         .entries
@@ -634,7 +721,7 @@ impl DaemonService {
                     .await?
                     .install_latest(&request.plugin_id)
                     .await
-                    .map_err(|error| invalid_argument("pluginId", &error.to_string()))?;
+                    .map_err(|error| market_error(&error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
                 self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
@@ -1164,13 +1251,13 @@ impl DaemonService {
             .map_err(|error| internal_error(format!("{error:#}")))?;
         match component {
             fluxdown_protocol::ComponentKind::Ffmpeg => {
-                fluxdown_engine::components::list_versions(&client)
+                fluxdown_engine::components::list_versions(&self.db, &client)
                     .await
                     .map(fluxdown_engine_protocol::ffmpeg_versions_to_dto)
                     .map_err(|error| internal_error(error.to_string()))
             }
             fluxdown_protocol::ComponentKind::Ytdlp => {
-                fluxdown_engine::components::list_ytdlp_versions(&client)
+                fluxdown_engine::components::list_ytdlp_versions(&self.db, &client)
                     .await
                     .map(fluxdown_engine_protocol::ytdlp_versions_to_dto)
                     .map_err(|error| internal_error(error.to_string()))
@@ -1382,29 +1469,36 @@ impl DaemonService {
             .filter(|path| !path.as_os_str().is_empty())
             .map(|path| path.to_string_lossy().into_owned());
         let mut dirs = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(base_path).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let Ok(file_type) = entry.file_type().await else {
-                    continue;
-                };
-                if !file_type.is_dir() {
-                    continue;
+        // 受限用户（NAS 套件）浏览到未授权目录时 EACCES：不整体失败，返回
+        // `denied=true` 让 UI 提示授权，parent 仍可用以继续导航。
+        let mut denied = false;
+        match tokio::fs::read_dir(base_path).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let Ok(file_type) = entry.file_type().await else {
+                        continue;
+                    };
+                    if !file_type.is_dir() {
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with('.') {
+                        continue;
+                    }
+                    dirs.push(fluxdown_protocol::FsEntry {
+                        name,
+                        path: entry.path().to_string_lossy().into_owned(),
+                    });
                 }
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with('.') {
-                    continue;
-                }
-                dirs.push(fluxdown_protocol::FsEntry {
-                    name,
-                    path: entry.path().to_string_lossy().into_owned(),
-                });
             }
+            Err(e) => denied = e.kind() == std::io::ErrorKind::PermissionDenied,
         }
         dirs.sort_by_key(|entry| entry.name.to_lowercase());
         Ok(fluxdown_protocol::FsListResponse {
             path: base,
             parent,
             dirs,
+            denied,
         })
     }
 }
@@ -1575,6 +1669,18 @@ enum GroupAction {
     Resume,
 }
 
+/// 按链接站点键（与引擎 `apply_site_auth` 同一 `site_key`）查已保存凭据；非 http(s)
+/// 链接、无匹配或凭据表损坏都返回 `None`。
+fn match_site_auth(store_json: &str, url: &str) -> Option<SiteAuthCredentialDto> {
+    let site = fluxdown_engine::site_auth::site_key(url.trim())?;
+    let credential = fluxdown_engine::site_auth::parse_store(store_json).remove(&site)?;
+    Some(SiteAuthCredentialDto {
+        site,
+        user: credential.user,
+        pass: credential.pass,
+    })
+}
+
 fn parse_params<T: DeserializeOwned>(params: Option<Value>) -> Result<T, RpcErrorObject> {
     let Some(params) = params else {
         return Err(invalid_argument("params", "params are required"));
@@ -1616,6 +1722,7 @@ fn actor_error(error: ActorCallError) -> RpcErrorObject {
                     retryable: false,
                     field: None,
                     revision: Some(current),
+                    reason: None,
                 },
             )
         }
@@ -1642,7 +1749,77 @@ fn invalid_argument(field: &str, message: &str) -> RpcErrorObject {
             retryable: false,
             field: Some(field.to_owned()),
             revision: None,
+            reason: None,
         },
+    )
+}
+
+/// 插件包 / 插件目录校验失败：记录完整原因，客户端按细分原因展示。
+#[cfg(feature = "plugins")]
+fn plugin_package_error(
+    field: &str,
+    error: &fluxdown_engine::plugin::PluginError,
+) -> RpcErrorObject {
+    let message = error.to_string();
+    fluxdown_engine::log_warn!("[plugin] 安装失败: {message}");
+    let mut data = RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+        .with_reason(fluxdown_protocol::ErrorReason::PluginPackageInvalid);
+    data.field = Some(field.to_owned());
+    RpcErrorObject::application(message, data)
+}
+
+/// 市场索引 / 插件下载失败：按失败性质给出错误码与细分原因，并记录完整原因。
+#[cfg(feature = "plugins")]
+fn market_error(error: &fluxdown_engine::plugin::MarketError) -> RpcErrorObject {
+    use fluxdown_engine::plugin::MarketError;
+    use fluxdown_protocol::ErrorReason;
+    let (code, retryable, reason) = match error {
+        MarketError::Network(_) => (
+            ApplicationErrorCode::Unavailable,
+            true,
+            ErrorReason::MarketUnreachable,
+        ),
+        MarketError::IndexParse(_) | MarketError::IndexTooLarge => (
+            ApplicationErrorCode::Unavailable,
+            false,
+            ErrorReason::MarketIndexInvalid,
+        ),
+        MarketError::SequenceRollback { .. } => (
+            ApplicationErrorCode::Conflict,
+            false,
+            ErrorReason::MarketIndexRollback,
+        ),
+        MarketError::NotFound(_) => (
+            ApplicationErrorCode::NotFound,
+            false,
+            ErrorReason::PluginNotInMarket,
+        ),
+        MarketError::Yanked(_) => (
+            ApplicationErrorCode::Conflict,
+            false,
+            ErrorReason::PluginYanked,
+        ),
+        MarketError::AllMirrorsFailed | MarketError::HashMismatch { .. } => (
+            ApplicationErrorCode::Unavailable,
+            true,
+            ErrorReason::PluginDownloadFailed,
+        ),
+        MarketError::TooLarge => (
+            ApplicationErrorCode::InvalidArgument,
+            false,
+            ErrorReason::PluginPackageTooLarge,
+        ),
+        MarketError::Plugin(_) => (
+            ApplicationErrorCode::InvalidArgument,
+            false,
+            ErrorReason::PluginPackageInvalid,
+        ),
+    };
+    let message = error.to_string();
+    fluxdown_engine::log_warn!("[plugin-market] {message}");
+    RpcErrorObject::application(
+        message,
+        RpcErrorData::new(code, retryable).with_reason(reason),
     )
 }
 
@@ -1679,7 +1856,28 @@ fn unsupported_error(message: &str) -> RpcErrorObject {
 mod tests {
     use fluxdown_protocol::{ApplicationErrorCode, RpcErrorData};
 
-    use super::DaemonService;
+    use super::{DaemonService, match_site_auth};
+
+    #[test]
+    fn site_auth_match_uses_engine_site_key_including_non_default_port() {
+        let store = r#"{"example.com":{"user":"u","pass":"p"},"example.com:8443":{"user":"alt","pass":"q"}}"#;
+        let matched = match_site_auth(store, "https://EXAMPLE.com/files/a.bin?x=1")
+            .expect("default port matches bare host");
+        assert_eq!(
+            (
+                matched.site.as_str(),
+                matched.user.as_str(),
+                matched.pass.as_str()
+            ),
+            ("example.com", "u", "p")
+        );
+        let alt = match_site_auth(store, "https://example.com:8443/a.bin")
+            .expect("explicit non-default port matches host:port");
+        assert_eq!(alt.user, "alt");
+        assert!(match_site_auth(store, "https://other.example.com/a.bin").is_none());
+        assert!(match_site_auth(store, "magnet:?xt=urn:btih:abc").is_none());
+        assert!(match_site_auth("not json", "https://example.com/a.bin").is_none());
+    }
 
     #[tokio::test]
     async fn every_canonical_daemon_method_reaches_a_real_dispatch_branch() {

@@ -3,9 +3,14 @@
 pub const SYSTEM_HELLO: &str = "system.hello";
 pub const SYSTEM_PING: &str = "system.ping";
 pub const SYSTEM_SNAPSHOT: &str = "system.snapshot";
+/// 让服务优雅退出：daemon 关停引擎后退出；agent 先关停 daemon 再退出（完全退出）。
+///
+/// 允许作为连接首帧（握手前）调用：协议版本不兼容的新旧进程替换只能靠它完成。
+pub const SYSTEM_SHUTDOWN: &str = "system.shutdown";
 
 pub const DAEMON_TASK_LIST: &str = "daemon.task.list";
 pub const DAEMON_TASK_GET: &str = "daemon.task.get";
+pub const DAEMON_TASK_ACTIVITY: &str = "daemon.task.activity";
 pub const DAEMON_TASK_CREATE: &str = "daemon.task.create";
 pub const DAEMON_TASK_PAUSE: &str = "daemon.task.pause";
 pub const DAEMON_TASK_RESUME: &str = "daemon.task.resume";
@@ -39,9 +44,12 @@ pub const DAEMON_CONFIG_PATCH: &str = "daemon.config.patch";
 pub const DAEMON_CONFIG_PROXY_TEST: &str = "daemon.config.proxyTest";
 pub const DAEMON_CONFIG_CONN_POLICY: &str = "daemon.config.connPolicy";
 pub const DAEMON_CONFIG_CLEAR_CONN_POLICY: &str = "daemon.config.clearConnPolicy";
+pub const DAEMON_CONFIG_SYSTEM_PROXY: &str = "daemon.config.systemProxy";
 pub const DAEMON_SITE_AUTH_LIST: &str = "daemon.siteAuth.list";
 pub const DAEMON_SITE_AUTH_DELETE: &str = "daemon.siteAuth.delete";
 pub const DAEMON_SITE_AUTH_CLEAR: &str = "daemon.siteAuth.clear";
+/// 按下载链接匹配已保存的站点凭据（含明文密码，仅供本机官方 UI 表单回填）。
+pub const DAEMON_SITE_AUTH_MATCH: &str = "daemon.siteAuth.match";
 pub const DAEMON_RUNTIME_STATS: &str = "daemon.runtime.stats";
 pub const DAEMON_FS_LIST: &str = "daemon.fs.list";
 
@@ -55,6 +63,7 @@ pub const DAEMON_RSS_ITEM_ACTION: &str = "daemon.rss.itemAction";
 pub const DAEMON_RSS_VALIDATE: &str = "daemon.rss.validate";
 
 pub const DAEMON_PLUGIN_LIST: &str = "daemon.plugin.list";
+pub const DAEMON_PLUGIN_AUTH: &str = "daemon.plugin.auth";
 pub const DAEMON_PLUGIN_SET_ENABLED: &str = "daemon.plugin.setEnabled";
 pub const DAEMON_PLUGIN_UPDATE_SETTINGS: &str = "daemon.plugin.updateSettings";
 pub const DAEMON_PLUGIN_INSTALL: &str = "daemon.plugin.install";
@@ -118,6 +127,10 @@ pub const AGENT_SYNC_GET: &str = "agent.sync.get";
 pub const AGENT_SYNC_ENABLE: &str = "agent.sync.enable";
 pub const AGENT_SYNC_DISABLE: &str = "agent.sync.disable";
 pub const AGENT_SYNC_NOW: &str = "agent.sync.now";
+/// FluxCloud 服务地址读取；正式构建 `editable=false`，地址恒为构建期固定值。
+pub const AGENT_CLOUD_ENDPOINT_GET: &str = "agent.cloud.endpointGet";
+/// 仅调试构建可用（对齐 Flutter `CloudApiConfig`）：覆盖/恢复 FluxCloud 服务地址，立即生效。
+pub const AGENT_CLOUD_ENDPOINT_SET: &str = "agent.cloud.endpointSet";
 pub const AGENT_REMOTE_LIST: &str = "agent.remote.list";
 pub const AGENT_REMOTE_DISPATCH: &str = "agent.remote.dispatch";
 pub const AGENT_REMOTE_COMMAND: &str = "agent.remote.command";
@@ -152,6 +165,9 @@ pub const AGENT_DIAGNOSTICS_REPAIR: &str = "agent.diagnostics.repair";
 pub const AGENT_DIAGNOSTICS_LOG_PATHS: &str = "agent.diagnostics.logPaths";
 pub const AGENT_DIAGNOSTICS_EXPORT_LOGS: &str = "agent.diagnostics.exportLogs";
 pub const AGENT_UPDATE_CHECK: &str = "agent.update.check";
+/// 完成后关机：`{delaySecs}`；无活跃任务时拒绝（`InvalidArgument`）。
+pub const AGENT_POWER_ARM: &str = "agent.power.arm";
+pub const AGENT_POWER_DISARM: &str = "agent.power.disarm";
 
 pub const SERVICE_EVENT: &str = "service.event";
 
@@ -180,8 +196,10 @@ pub const ALL_METHODS: &[&str] = &[
     SYSTEM_HELLO,
     SYSTEM_PING,
     SYSTEM_SNAPSHOT,
+    SYSTEM_SHUTDOWN,
     DAEMON_TASK_LIST,
     DAEMON_TASK_GET,
+    DAEMON_TASK_ACTIVITY,
     DAEMON_TASK_CREATE,
     DAEMON_TASK_PAUSE,
     DAEMON_TASK_RESUME,
@@ -212,9 +230,11 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_CONFIG_PROXY_TEST,
     DAEMON_CONFIG_CONN_POLICY,
     DAEMON_CONFIG_CLEAR_CONN_POLICY,
+    DAEMON_CONFIG_SYSTEM_PROXY,
     DAEMON_SITE_AUTH_LIST,
     DAEMON_SITE_AUTH_DELETE,
     DAEMON_SITE_AUTH_CLEAR,
+    DAEMON_SITE_AUTH_MATCH,
     DAEMON_RUNTIME_STATS,
     DAEMON_FS_LIST,
     DAEMON_RSS_LIST_SOURCES,
@@ -226,6 +246,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_RSS_ITEM_ACTION,
     DAEMON_RSS_VALIDATE,
     DAEMON_PLUGIN_LIST,
+    DAEMON_PLUGIN_AUTH,
     DAEMON_PLUGIN_SET_ENABLED,
     DAEMON_PLUGIN_UPDATE_SETTINGS,
     DAEMON_PLUGIN_INSTALL,
@@ -283,6 +304,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_SYNC_ENABLE,
     AGENT_SYNC_DISABLE,
     AGENT_SYNC_NOW,
+    AGENT_CLOUD_ENDPOINT_GET,
+    AGENT_CLOUD_ENDPOINT_SET,
     AGENT_REMOTE_LIST,
     AGENT_REMOTE_DISPATCH,
     AGENT_REMOTE_COMMAND,
@@ -313,6 +336,8 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_DIAGNOSTICS_LOG_PATHS,
     AGENT_DIAGNOSTICS_EXPORT_LOGS,
     AGENT_UPDATE_CHECK,
+    AGENT_POWER_ARM,
+    AGENT_POWER_DISARM,
     SERVICE_EVENT,
 ];
 

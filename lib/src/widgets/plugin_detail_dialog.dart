@@ -186,6 +186,7 @@ class _PermissionRow extends StatelessWidget {
     final (name, desc) = switch (perm) {
       'ffmpeg' => (s.pluginPermFfmpegName, s.pluginPermFfmpegDesc),
       'ytdlp' => (s.pluginPermYtdlpName, s.pluginPermYtdlpDesc),
+      'auth' => (s.pluginPermAuthName, s.pluginPermAuthDesc),
       _ => (perm, s.pluginPermUnknownDesc),
     };
     return Padding(

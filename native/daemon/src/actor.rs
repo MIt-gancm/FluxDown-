@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use fluxdown_engine::Engine;
-use fluxdown_engine::download_manager::{CreateGroupSpec, NewTaskSpec, TaskDone};
+use fluxdown_engine::download_manager::{
+    CreateGroupSpec, FileExistsBehavior, NewTaskSpec, TaskDone,
+};
 #[cfg(feature = "plugins")]
 use fluxdown_engine::download_manager::{ResolveOutcome, ResolvePreviewOutcome};
 use fluxdown_engine::rss::RssValidateOutcome;
@@ -421,6 +423,11 @@ async fn run_actor(
     }
 
     engine.manager.shutdown().await;
+    match tokio::time::timeout(Duration::from_secs(5), engine.flush_task_activity()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::error!(%error, "daemon task activity flush failed"),
+        Err(_) => tracing::error!("daemon task activity flush timed out"),
+    }
     selections.resolve_all_defaults();
     commands.close();
     while let Some(command) = commands.recv().await {
@@ -1385,6 +1392,12 @@ async fn apply_live_config<'a>(
     {
         engine.manager.set_cdn_max_nodes(value);
     }
+    if keys.contains(&"multi_nic_enabled") {
+        engine.manager.set_multi_nic_enabled(
+            all.get("multi_nic_enabled")
+                .is_some_and(|value| value == "true"),
+        );
+    }
     if keys.contains(&"max_auto_retries")
         && let Some(value) = all
             .get("max_auto_retries")
@@ -1406,9 +1419,10 @@ async fn apply_live_config<'a>(
         );
     }
     if keys.contains(&"file_exists_behavior") {
-        engine.manager.set_file_exists_overwrite(
+        engine.manager.set_file_exists_behavior(
             all.get("file_exists_behavior")
-                .is_some_and(|value| value == "overwrite"),
+                .map(|value| FileExistsBehavior::from_config_str(value))
+                .unwrap_or(FileExistsBehavior::Rename),
         );
     }
     if keys.contains(&"file_missing_action") {

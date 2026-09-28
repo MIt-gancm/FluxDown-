@@ -1,314 +1,410 @@
-use fluxdown_ui_components::sidebar_navigation_button;
+use std::time::Instant;
+
+use fluxdown_protocol::{CustomCategoryDto, QueueDto};
+use fluxdown_ui_components::{
+    Button, FluxIcon, category_icon, nav_icon_color, sidebar_navigation_button, tabular_numbers,
+};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, Context, Div, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, div, percentage,
-    prelude::FluentBuilder as _, px,
+    AnyElement, App, Context, Div, FontWeight, Hsla, InteractiveElement as _, IntoElement,
+    MouseButton, ParentElement, Pixels, SharedString, StatefulInteractiveElement as _, Styled,
+    Window, div, percentage, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, IconName, animation::ease_in_out_cubic, h_flex,
-    scroll::ScrollableElement as _, v_flex,
+    Icon, WindowExt as _,
+    animation::ease_in_out_cubic,
+    h_flex,
+    menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
+    scroll::ScrollableElement as _,
+    v_flex,
 };
 
 use crate::{
+    controller::DownloadsCommand,
     model::{
-        DownloadCategory, DownloadFilter, DownloadStatusFilter, SidebarSection, SidebarSelection,
-        StatusFolderMotion,
+        DownloadFilter, DownloadStatusFilter, SidebarSection, SidebarSelection, StatusFolderMotion,
+        TaskSource,
     },
     pages::downloads::DownloadView,
 };
 
+const SHOW_SIDEBAR_CATEGORY_PREF: &str = "ui.show_sidebar_category";
+/// 运行中队列的状态圆点直径。
+const RUNNING_DOT_SIZE: Pixels = px(6.);
+/// 导航行悬停组：状态项的展开箭头只在所在行悬停（或已展开）时显示。
+const NAV_ROW_GROUP: &str = "download-sidebar-nav-row";
+/// 分区标题悬停组：折叠箭头与分区操作按钮只在悬停标题时显示。
+const SECTION_HEADER_GROUP: &str = "download-sidebar-section-header";
+
+fn folder_id(status: DownloadStatusFilter) -> &'static str {
+    match status {
+        DownloadStatusFilter::All => "download-folder-all",
+        DownloadStatusFilter::Incomplete => "download-folder-incomplete",
+        DownloadStatusFilter::Completed => "download-folder-completed",
+        DownloadStatusFilter::Failed => "download-folder-failed",
+        DownloadStatusFilter::Paused => "download-folder-paused",
+    }
+}
+
+/// 状态项图标：每个状态一个语义图标（内部仍沿用「状态文件夹」命名，视觉不再是文件夹）。
+fn status_icon(status: DownloadStatusFilter) -> FluxIcon {
+    match status {
+        DownloadStatusFilter::All => FluxIcon::Layers,
+        DownloadStatusFilter::Incomplete => FluxIcon::CircleArrowDown,
+        DownloadStatusFilter::Completed => FluxIcon::CircleCheck,
+        DownloadStatusFilter::Failed => FluxIcon::CircleAlert,
+        DownloadStatusFilter::Paused => FluxIcon::CirclePause,
+    }
+}
+
 impl DownloadView {
+    /// 分区容器：扁平分组（无卡片边框），分区之间只靠留白与小标题区分；
+    /// 首个分区顶部不再额外留白（侧栏根已有顶部内边距）。
+    fn section_container(first: bool, cx: &App) -> Div {
+        let spacing = active_theme(cx).tokens().spacing;
+        v_flex().w_full().when(!first, |this| this.pt(spacing.md))
+    }
+
+    /// 分区标题：点击折叠 / 展开，右键「隐藏此区块」写回 `ui.show_sidebar_*` 偏好。
+    /// 折叠箭头与 `trailing` 操作按钮只在悬停标题时出现。
     fn section_header(
         &self,
         id: &'static str,
         label: SharedString,
         section: SidebarSection,
         open_amount: f32,
+        trailing: Option<AnyElement>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let tokens = active_theme(cx).tokens();
-        let header_color = tokens.colors.muted_foreground.opacity(0.65);
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let spacing = tokens.spacing;
+        let radius = tokens.radius;
+        let hover_color = tokens.colors.muted_foreground;
+        let header_color = extended.colors.text_tertiary;
+        let caption = extended.caption;
+        let chevron_size = extended.icon.sm;
+        let header_height = theme.density().section_header;
         let chevron_rotation = percentage(open_amount * 0.25);
+        let this = cx.weak_entity();
+        let hide_label = self.strings.hide_section.clone();
 
         h_flex()
             .id(id)
-            .h(px(28.))
-            .px(tokens.spacing.sm)
+            .group(SECTION_HEADER_GROUP)
+            .h(header_height)
+            .px(spacing.sm)
             .items_center()
             .justify_between()
+            .gap(spacing.xs)
             .cursor_pointer()
-            .rounded(tokens.radius.sm)
-            .text_size(px(10.5))
+            .rounded(radius.md)
+            .text_size(caption.size)
+            .line_height(caption.line_height)
             .font_weight(FontWeight::MEDIUM)
             .text_color(header_color)
-            .hover(|style| {
-                style
-                    .bg(tokens.colors.muted)
-                    .text_color(tokens.colors.muted_foreground)
-            })
+            .hover(move |style| style.text_color(hover_color))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if matches!(section, SidebarSection::Queues) {
-                    this.retarget_queue_section(cx);
-                }
+                this.toggle_section(section, cx);
                 cx.notify();
             }))
-            .child(label)
+            .child(div().min_w_0().truncate().child(label))
             .child(
-                Icon::new(IconName::ChevronRight)
-                    .size(px(12.))
-                    .rotate(chevron_rotation),
+                h_flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(spacing.xxs)
+                    .invisible()
+                    .group_hover(SECTION_HEADER_GROUP, |style| style.visible())
+                    .children(trailing)
+                    .child(
+                        Icon::new(FluxIcon::ChevronRight)
+                            .size(chevron_size)
+                            .rotate(chevron_rotation),
+                    ),
             )
+            .context_menu(move |menu, _window, _cx| {
+                let this = this.clone();
+                menu.item(
+                    PopupMenuItem::new(hide_label.clone()).on_click(move |_, _window, cx| {
+                        let _ = this.update(cx, |this, cx| {
+                            this.execute_commands(
+                                vec![DownloadsCommand::SetSyncedPreference {
+                                    key: section.visibility_pref(),
+                                    value: serde_json::Value::Bool(false),
+                                }],
+                                cx,
+                            );
+                        });
+                    }),
+                )
+            })
     }
 
-    fn nav_item(
-        &self,
-        id: &'static str,
-        selection: SidebarSelection,
-        label: SharedString,
-        icon: IconName,
-        trailing: (SharedString, bool),
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let (count, show_dot) = trailing;
-        let tokens = active_theme(cx).tokens();
-        let selected = self.selected_item == selection;
+    /// 队列分区标题右侧齿轮按钮：打开队列管理窗口（随标题悬停出现）。
+    fn queue_manage_button(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let icon_size = extended.icon.sm;
+        let nav_hover = extended.colors.nav_hover;
+        let hover_foreground = tokens.colors.foreground;
+        let open_queue_manager = self.host.open_queue_manager.clone();
+        div()
+            .id("download-queue-manage")
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(icon_size + tokens.spacing.xs * 2.)
+            .rounded(tokens.radius.sm)
+            .cursor_pointer()
+            .text_color(tokens.colors.muted_foreground)
+            .hover(move |style| style.bg(nav_hover).text_color(hover_foreground))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(move |_, window, cx| {
+                if let Some(open) = open_queue_manager.clone() {
+                    open(window, cx);
+                }
+            })
+            .child(Icon::new(FluxIcon::Settings).size(icon_size))
+            .into_any_element()
+    }
+
+    /// 导航行尾部：可选状态圆点 + 计数（为 0 时不显示）。
+    fn nav_trailing(count: usize, selected: bool, dot: Option<Hsla>, cx: &App) -> Div {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let caption = extended.caption;
         let count_color = if selected {
-            tokens.colors.accent_foreground
-        } else {
-            tokens.colors.muted_foreground.opacity(0.65)
-        };
-        let dot_color = if selection == SidebarSelection::MainQueue {
-            cx.theme().success
-        } else {
             tokens.colors.muted_foreground
+        } else {
+            extended.colors.text_tertiary
         };
-        let trailing = h_flex()
+        h_flex()
             .flex_none()
             .items_center()
             .gap(tokens.spacing.xs)
-            .when(show_dot, |this| {
-                this.child(div().size(px(5.)).rounded_full().bg(dot_color))
+            .when_some(dot, |this, color| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .size(RUNNING_DOT_SIZE)
+                        .rounded_full()
+                        .bg(color),
+                )
             })
-            .child(
-                div()
-                    .min_w(px(12.))
-                    .text_right()
-                    .text_size(px(11.))
-                    .text_color(count_color)
-                    .child(count),
-            );
+            .when(count > 0, |this| {
+                this.child(
+                    div()
+                        .text_size(caption.size)
+                        .line_height(caption.line_height)
+                        .font_features(tabular_numbers())
+                        .text_color(count_color)
+                        .child(SharedString::from(count.to_string())),
+                )
+            })
+    }
+
+    /// 普通导航行（分类子项 / 队列 / 设备）：点击选中；图标选中为强调色、未选中为二级文字色。
+    fn nav_item(
+        &self,
+        id: impl Into<gpui::ElementId>,
+        selection: SidebarSelection,
+        label: SharedString,
+        icon: Icon,
+        trailing: (usize, Option<Hsla>),
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let (count, dot) = trailing;
+        let selected = self.selected_item == selection;
+        let icon_color = nav_icon_color(selected, cx);
 
         sidebar_navigation_button(
             id,
             label,
-            Icon::new(icon).size(px(14.)),
-            trailing,
+            icon.text_color(icon_color),
+            Self::nav_trailing(count, selected, dot, cx),
             selected,
             cx,
         )
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.select_item(selection, cx);
+            this.select_sidebar_item(selection.clone(), cx);
         }))
     }
 
-    fn select_item(&mut self, selection: SidebarSelection, cx: &mut Context<Self>) {
-        if self.selected_item == selection {
-            return;
-        }
-        self.selected_item = selection;
-        match selection {
-            SidebarSelection::Download(filter) => {
-                self.table_state.update(cx, |table, cx| {
-                    table.delegate_mut().set_filter(filter);
-                    table.refresh(cx);
-                });
-            }
-            SidebarSelection::MainQueue => {
-                self.table_state.update(cx, |table, cx| {
-                    table
-                        .delegate_mut()
-                        .set_queue_filter(fluxdown_protocol::MAIN_QUEUE_ID);
-                    table.refresh(cx);
-                });
-            }
-            SidebarSelection::LaterQueue => {
-                self.table_state.update(cx, |table, cx| {
-                    table
-                        .delegate_mut()
-                        .set_queue_filter(fluxdown_protocol::LATER_QUEUE_ID);
-                    table.refresh(cx);
-                });
-            }
-        }
-        cx.notify();
+    fn filter_count(&self, filter: &DownloadFilter, cx: &Context<Self>) -> usize {
+        self.table_state.read(cx).delegate().count_matching(filter)
     }
 
-    fn filter_count(&self, filter: DownloadFilter, cx: &Context<Self>) -> SharedString {
-        SharedString::from(
+    fn queue_count(&self, queue_id: &str, cx: &Context<Self>) -> usize {
+        self.table_state
+            .read(cx)
+            .delegate()
+            .count_in_queue(queue_id)
+    }
+
+    /// 设备计数：本机计所有本地任务；其余按远程任务来源设备 id / 指纹精确匹配。
+    fn device_count(&self, device_id: &str, cx: &Context<Self>) -> usize {
+        if device_id == SidebarSelection::LOCAL_DEVICE {
             self.table_state
                 .read(cx)
                 .delegate()
-                .count_matching(filter)
-                .to_string(),
-        )
-    }
-
-    fn queue_count(&self, queue_id: &str, cx: &Context<Self>) -> SharedString {
-        SharedString::from(
+                .count_where(|task| task.source == TaskSource::Local)
+        } else {
+            let device_id = device_id.to_owned();
             self.table_state
                 .read(cx)
                 .delegate()
-                .count_in_queue(queue_id)
-                .to_string(),
-        )
+                .count_where(move |task| {
+                    task.source == TaskSource::Remote && task.from_device == device_id
+                })
+        }
     }
 
-    fn folder_item(
+    /// 状态项：图标位在悬停时换成分类展开箭头（点击箭头只切换展开，Notion / Linear
+    /// 式做法，不额外占一列缩进）；行其余部分点击切换展开并选中该状态。
+    /// 失败项在有失败任务时图标用 destructive、下载中有任务时用强调色，作为唯一的状态提示。
+    fn status_item(
         &self,
-        id: &'static str,
         status: DownloadStatusFilter,
-        label: SharedString,
-        expanded: bool,
+        open_amount: f32,
+        has_children: bool,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let tokens = active_theme(cx).tokens();
-        let filter = DownloadFilter::new(status, DownloadCategory::All);
+    ) -> Button {
+        let theme = active_theme(cx);
+        let colors = theme.tokens().colors;
+        let icon_sizes = theme.extended().icon;
+        let slot_size = icon_sizes.lg;
+        let filter = DownloadFilter::status(status);
+        let count = self.filter_count(&filter, cx);
         let selection = SidebarSelection::Download(filter);
         let selected = self.selected_item == selection;
-        let foreground = if selected {
-            tokens.colors.accent_foreground
-        } else {
-            tokens.colors.muted_foreground
+        let icon_color = match status {
+            DownloadStatusFilter::Failed if count > 0 => colors.destructive,
+            DownloadStatusFilter::Incomplete if count > 0 => {
+                theme.extended().colors.nav_selected_icon
+            }
+            _ => nav_icon_color(selected, cx),
         };
-        let trailing = h_flex()
-            .flex_none()
+
+        let status_glyph = div()
+            .absolute()
+            .inset_0()
+            .flex()
             .items_center()
-            .gap(tokens.spacing.xs)
-            .text_color(foreground)
+            .justify_center()
+            .when(has_children, |this| {
+                this.group_hover(NAV_ROW_GROUP, |style| style.invisible())
+            })
             .child(
-                div()
-                    .min_w(px(12.))
-                    .text_right()
-                    .text_size(px(11.))
-                    .child(self.filter_count(filter, cx)),
-            )
-            .child(
-                Icon::new(if expanded {
-                    IconName::ChevronDown
-                } else {
-                    IconName::ChevronRight
-                })
-                .size(px(12.)),
+                Icon::new(status_icon(status))
+                    .size(icon_sizes.lg)
+                    .text_color(icon_color),
             );
+        let chevron = has_children.then(|| {
+            div()
+                .id(format!("{}-chevron", folder_id(status)))
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(theme.tokens().radius.sm)
+                .invisible()
+                .group_hover(NAV_ROW_GROUP, |style| style.visible())
+                .text_color(colors.foreground)
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.retarget_status_folder(status, cx);
+                    cx.notify();
+                }))
+                .child(
+                    Icon::new(FluxIcon::ChevronRight)
+                        .size(icon_sizes.md)
+                        .rotate(percentage(open_amount * 0.25)),
+                )
+        });
+        let leading = div()
+            .relative()
+            .flex_none()
+            .size(slot_size)
+            .child(status_glyph)
+            .children(chevron);
 
         sidebar_navigation_button(
-            id,
-            label,
-            Icon::new(if expanded {
-                IconName::FolderOpen
-            } else {
-                IconName::Folder
-            })
-            .size(px(14.)),
-            trailing,
+            folder_id(status),
+            self.folder_label(status),
+            leading,
+            Self::nav_trailing(count, selected, None, cx),
             selected,
             cx,
         )
+        .group(NAV_ROW_GROUP)
         .on_click(cx.listener(move |this, _, _, cx| {
             this.retarget_status_folder(status, cx);
-            this.select_item(selection, cx);
+            this.select_sidebar_item(selection.clone(), cx);
             cx.notify();
         }))
     }
 
-    fn category_item(
-        &self,
-        id: &'static str,
-        status: DownloadStatusFilter,
-        category: DownloadCategory,
-        label: SharedString,
-        icon: IconName,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let filter = DownloadFilter::new(status, category);
-        div().w_full().pl(px(18.)).child(self.nav_item(
-            id,
-            SidebarSelection::Download(filter),
-            label,
-            icon,
-            (self.filter_count(filter, cx), false),
-            cx,
-        ))
+    /// 状态项下的分类子项（内置 `all` 之外的可见分类）；分类的编辑 / 新建走这里的右键菜单。
+    fn category_entries(&self) -> Vec<CustomCategoryDto> {
+        self.controller
+            .categories()
+            .visible()
+            .filter(|rule| rule.dto.builtin_type.as_deref() != Some("all"))
+            .map(|rule| rule.dto.clone())
+            .collect()
     }
 
-    fn render_categories(&self, status: DownloadStatusFilter, cx: &mut Context<Self>) -> Div {
-        let items = match status {
-            DownloadStatusFilter::All => [
-                ("download-nav-all-video", DownloadCategory::Video),
-                ("download-nav-all-audio", DownloadCategory::Audio),
-                ("download-nav-all-document", DownloadCategory::Document),
-                ("download-nav-all-image", DownloadCategory::Image),
-                ("download-nav-all-program", DownloadCategory::Program),
-                ("download-nav-all-archive", DownloadCategory::Archive),
-                ("download-nav-all-other", DownloadCategory::Other),
-            ],
-            DownloadStatusFilter::Completed => [
-                ("download-nav-completed-video", DownloadCategory::Video),
-                ("download-nav-completed-audio", DownloadCategory::Audio),
-                (
-                    "download-nav-completed-document",
-                    DownloadCategory::Document,
-                ),
-                ("download-nav-completed-image", DownloadCategory::Image),
-                ("download-nav-completed-program", DownloadCategory::Program),
-                ("download-nav-completed-archive", DownloadCategory::Archive),
-                ("download-nav-completed-other", DownloadCategory::Other),
-            ],
-            DownloadStatusFilter::Incomplete => [
-                ("download-nav-incomplete-video", DownloadCategory::Video),
-                ("download-nav-incomplete-audio", DownloadCategory::Audio),
-                (
-                    "download-nav-incomplete-document",
-                    DownloadCategory::Document,
-                ),
-                ("download-nav-incomplete-image", DownloadCategory::Image),
-                ("download-nav-incomplete-program", DownloadCategory::Program),
-                ("download-nav-incomplete-archive", DownloadCategory::Archive),
-                ("download-nav-incomplete-other", DownloadCategory::Other),
-            ],
-        };
+    /// 分类子项显隐偏好；关闭后状态项保留，但不渲染分类子项也不显示展开箭头。
+    fn categories_visible(&self) -> bool {
+        self.controller
+            .preference_bool(SHOW_SIDEBAR_CATEGORY_PREF, true)
+    }
 
-        v_flex()
-            .w_full()
-            .children(items.into_iter().map(|(id, category)| {
-                let (label, icon) = match category {
-                    DownloadCategory::Video => (
-                        self.strings.category_video.clone(),
-                        IconName::GalleryVerticalEnd,
-                    ),
-                    DownloadCategory::Audio => {
-                        (self.strings.category_audio.clone(), IconName::File)
-                    }
-                    DownloadCategory::Document => {
-                        (self.strings.category_document.clone(), IconName::File)
-                    }
-                    DownloadCategory::Image => (
-                        self.strings.category_image.clone(),
-                        IconName::GalleryVerticalEnd,
-                    ),
-                    DownloadCategory::Program => {
-                        (self.strings.category_program.clone(), IconName::HardDrive)
-                    }
-                    DownloadCategory::Archive => {
-                        (self.strings.category_archive.clone(), IconName::Inbox)
-                    }
-                    DownloadCategory::Other | DownloadCategory::All => {
-                        (self.strings.category_other.clone(), IconName::File)
-                    }
-                };
-                self.category_item(id, status, category, label, icon, cx)
-            }))
+    /// 分类子项显示时的实际渲染数量；用于高度动画计算，偏好关闭时恒为 0。
+    fn visible_category_count(&self) -> f32 {
+        if self.categories_visible() {
+            self.category_entries().len() as f32
+        } else {
+            0.
+        }
+    }
+
+    /// 分类子项：比父项多缩进 `spacing.lg`（一级层次足够辨识，不再对齐父项文字，避免
+    /// 缩进过深）。缩进做在按钮内边距上，悬停 / 选中底色仍铺满整行宽度。
+    fn render_categories(&self, status: DownloadStatusFilter, cx: &mut Context<Self>) -> Div {
+        if !self.categories_visible() {
+            return v_flex().w_full();
+        }
+        let theme = active_theme(cx);
+        let spacing = theme.tokens().spacing;
+        let row_padding = spacing.sm + spacing.lg;
+        let icon_size = theme.extended().icon.md;
+        let entries = self.category_entries();
+        let mut items = Vec::with_capacity(entries.len());
+        for dto in entries {
+            let filter = DownloadFilter::with_category(status, &dto.id);
+            let count = self.filter_count(&filter, cx);
+            let menu = self.category_item_context_menu(&dto, cx);
+            let item = self
+                .nav_item(
+                    format!("download-nav-{}-{}", folder_id(status), dto.id),
+                    SidebarSelection::Download(filter),
+                    self.strings.category_label(&dto),
+                    Icon::new(category_icon(&dto.icon)).size(icon_size),
+                    (count, None),
+                    cx,
+                )
+                .pl(row_padding)
+                .context_menu(menu);
+            items.push(item);
+        }
+        v_flex().w_full().children(items)
     }
 
     fn retarget_status_folder(&mut self, status: DownloadStatusFilter, cx: &App) {
@@ -321,15 +417,15 @@ impl DownloadView {
             self.folder_motion_started_at = None;
         } else {
             self.folder_motion = self.folder_motion.retarget(
-                ease_in_out_cubic(self.folder_motion_linear_progress()),
+                Self::eased_motion_progress(self.folder_motion_started_at),
                 next,
             );
-            self.folder_motion_started_at = Some(std::time::Instant::now());
+            self.folder_motion_started_at = Some(Instant::now());
         }
         self.expanded_status = next;
     }
 
-    fn sidebar_motion_linear_progress(started_at: Option<std::time::Instant>) -> f32 {
+    fn sidebar_motion_linear_progress(started_at: Option<Instant>) -> f32 {
         let Some(started_at) = started_at else {
             return 1.;
         };
@@ -338,37 +434,74 @@ impl DownloadView {
         .clamp(0., 1.)
     }
 
-    fn folder_motion_linear_progress(&self) -> f32 {
-        Self::sidebar_motion_linear_progress(self.folder_motion_started_at)
+    /// 折叠动画的缓动进度（未开始 / 已结束为 1）。
+    fn eased_motion_progress(started_at: Option<Instant>) -> f32 {
+        ease_in_out_cubic(Self::sidebar_motion_linear_progress(started_at))
     }
 
-    fn retarget_queue_section(&mut self, cx: &App) {
-        let target = if self.queues_expanded { 1. } else { 0. };
-        let progress = ease_in_out_cubic(Self::sidebar_motion_linear_progress(
-            self.queue_motion_started_at,
-        ));
-        let current = self.queue_motion_from + (target - self.queue_motion_from) * progress;
-        let next = !self.queues_expanded;
+    /// 渲染时的折叠动画缓动进度：减弱动效时直接到终点；动画未结束时请求下一帧。
+    /// 分区与状态项两套折叠共用。
+    fn render_motion_progress(started_at: Option<Instant>, window: &mut Window, cx: &App) -> f32 {
         if cx.reduce_motion() {
-            self.queue_motion_from = if next { 1. } else { 0. };
-            self.queue_motion_started_at = None;
-        } else {
-            self.queue_motion_from = current;
-            self.queue_motion_started_at = Some(std::time::Instant::now());
+            return 1.;
         }
-        self.queues_expanded = next;
-    }
-
-    fn queue_open_amount(&self, window: &mut Window, cx: &App) -> f32 {
-        let target = if self.queues_expanded { 1. } else { 0. };
-        if cx.reduce_motion() {
-            return target;
-        }
-        let linear = Self::sidebar_motion_linear_progress(self.queue_motion_started_at);
+        let linear = Self::sidebar_motion_linear_progress(started_at);
         if linear < 1. {
             window.request_animation_frame();
         }
-        self.queue_motion_from + (target - self.queue_motion_from) * ease_in_out_cubic(linear)
+        ease_in_out_cubic(linear)
+    }
+
+    pub(crate) fn section_is_expanded(&self, section: SidebarSection) -> bool {
+        self.section_expanded.get(&section).copied().unwrap_or(true)
+    }
+
+    pub(crate) fn toggle_section(&mut self, section: SidebarSection, cx: &App) {
+        let expanded = self.section_is_expanded(section);
+        let target = if expanded { 1. } else { 0. };
+        let from = self
+            .section_motion_from
+            .get(&section)
+            .copied()
+            .unwrap_or(target);
+        let progress =
+            Self::eased_motion_progress(self.section_motion_started_at.get(&section).copied());
+        let current = from + (target - from) * progress;
+        let next = !expanded;
+        if cx.reduce_motion() {
+            self.section_motion_from
+                .insert(section, if next { 1. } else { 0. });
+            self.section_motion_started_at.remove(&section);
+        } else {
+            self.section_motion_from.insert(section, current);
+            self.section_motion_started_at
+                .insert(section, Instant::now());
+        }
+        self.section_expanded.insert(section, next);
+    }
+
+    pub(crate) fn section_open_amount(
+        &self,
+        section: SidebarSection,
+        window: &mut Window,
+        cx: &App,
+    ) -> f32 {
+        let target = if self.section_is_expanded(section) {
+            1.
+        } else {
+            0.
+        };
+        let progress = Self::render_motion_progress(
+            self.section_motion_started_at.get(&section).copied(),
+            window,
+            cx,
+        );
+        let from = self
+            .section_motion_from
+            .get(&section)
+            .copied()
+            .unwrap_or(target);
+        from + (target - from) * progress
     }
 
     fn folder_open_amount(
@@ -377,137 +510,387 @@ impl DownloadView {
         window: &mut Window,
         cx: &App,
     ) -> f32 {
-        if cx.reduce_motion() {
-            return if self.expanded_status == Some(status) {
-                1.
-            } else {
-                0.
-            };
-        }
-        let linear = self.folder_motion_linear_progress();
-        if linear < 1. {
-            window.request_animation_frame();
-        }
-        self.folder_motion.amount(status, ease_in_out_cubic(linear))
+        let progress = Self::render_motion_progress(self.folder_motion_started_at, window, cx);
+        self.folder_motion.amount(status, progress)
     }
 
-    fn render_filter_branch(
+    /// 状态项的显示文案：与 Flutter 桌面端 `widgets/sidebar.dart::_statusLabel` 同源。
+    fn folder_label(&self, status: DownloadStatusFilter) -> SharedString {
+        match status {
+            DownloadStatusFilter::All => self.strings.status_all.clone(),
+            DownloadStatusFilter::Incomplete => self.strings.status_incomplete.clone(),
+            DownloadStatusFilter::Completed => self.strings.status_completed.clone(),
+            DownloadStatusFilter::Failed => self.strings.tab_failed.clone(),
+            DownloadStatusFilter::Paused => self.strings.status_paused.clone(),
+        }
+    }
+
+    fn render_status_branch(
         &self,
-        id: &'static str,
         status: DownloadStatusFilter,
-        label: SharedString,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
-        let expanded = self.expanded_status == Some(status);
         let open_amount = self.folder_open_amount(status, window, cx);
+        let category_count = self.visible_category_count();
         v_flex()
             .w_full()
-            .child(self.folder_item(id, status, label, expanded, cx))
+            .child(self.status_item(status, open_amount, category_count > 0., cx))
             .child(
                 div()
                     .w_full()
                     .overflow_hidden()
-                    .h(px(32. * 7. * open_amount))
+                    .h(active_theme(cx).density().nav_row * (category_count * open_amount))
                     .child(self.render_categories(status, cx)),
             )
     }
 
-    fn render_download_tree(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        v_flex()
-            .mx(tokens.spacing.sm)
-            .mt(tokens.spacing.sm)
-            .px(tokens.spacing.xs)
-            .py(tokens.spacing.xs)
-            .border_1()
-            .border_color(tokens.colors.border)
-            .rounded(tokens.radius.md)
-            .child(self.render_filter_branch(
-                "download-folder-all",
-                DownloadStatusFilter::All,
-                self.strings.status_all.clone(),
-                window,
+    /// 状态区：全部 / 下载中 / 已完成 / 失败 / 暂停 五个状态项，各自可展开显示分类子项。
+    fn render_status_section(
+        &self,
+        first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let open_amount = self.section_open_amount(SidebarSection::Status, window, cx);
+        let category_count = self.visible_category_count();
+        let folder_open_sum: f32 = DownloadStatusFilter::ALL
+            .iter()
+            .map(|status| self.folder_open_amount(*status, window, cx))
+            .sum();
+        let row_count = DownloadStatusFilter::ALL.len() as f32 + category_count * folder_open_sum;
+
+        let mut body = v_flex().w_full();
+        for status in DownloadStatusFilter::ALL {
+            body = body.child(self.render_status_branch(status, window, cx));
+        }
+
+        Self::section_container(first, cx)
+            .child(self.section_header(
+                "download-status-toggle",
+                self.strings.sidebar_status.clone(),
+                SidebarSection::Status,
+                open_amount,
+                None,
                 cx,
             ))
-            .child(self.render_filter_branch(
-                "download-folder-completed",
-                DownloadStatusFilter::Completed,
-                self.strings.status_completed.clone(),
-                window,
-                cx,
-            ))
-            .child(self.render_filter_branch(
-                "download-folder-incomplete",
-                DownloadStatusFilter::Incomplete,
-                self.strings.status_incomplete.clone(),
-                window,
-                cx,
-            ))
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .h(active_theme(cx).density().nav_row * (row_count * open_amount))
+                    .child(body),
+            )
     }
 
-    fn render_queue_section(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
-        let tokens = active_theme(cx).tokens().clone();
-        let open_amount = self.queue_open_amount(window, cx);
-        v_flex()
-            .mx(tokens.spacing.sm)
-            .mt(tokens.spacing.sm)
-            .px(tokens.spacing.xs)
-            .py(tokens.spacing.xs)
-            .border_1()
-            .border_color(tokens.colors.border)
-            .rounded(tokens.radius.md)
+    /// 分类子项右键菜单：编辑（内置项不显示）、新建。
+    fn category_item_context_menu(
+        &self,
+        dto: &CustomCategoryDto,
+        _cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let open_editor = self.host.open_category_editor.clone();
+        let edit_label = self.strings.edit_category.clone();
+        let add_label = self.strings.add_category.clone();
+        let is_builtin = dto.is_builtin;
+        let category_id = dto.id.clone();
+
+        move |menu, _window, _cx| {
+            let menu = menu.when_some(
+                open_editor.clone().filter(|_| !is_builtin),
+                |menu, open_editor| {
+                    let category_id = category_id.clone();
+                    menu.item(PopupMenuItem::new(edit_label.clone()).on_click(
+                        move |_, window, cx| {
+                            open_editor(Some(category_id.clone()), window, cx);
+                        },
+                    ))
+                },
+            );
+            menu.when_some(open_editor.clone(), |menu, open_editor| {
+                menu.item(
+                    PopupMenuItem::new(add_label.clone()).on_click(move |_, window, cx| {
+                        open_editor(None, window, cx);
+                    }),
+                )
+            })
+        }
+    }
+
+    /// 队列右键菜单：启动/停止、管理队列、删除（主队列不显示，删除前确认）。
+    fn queue_item_context_menu(
+        &self,
+        queue: &QueueDto,
+        cx: &Context<Self>,
+    ) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+        let this = cx.weak_entity();
+        let start_label = self.strings.start_queue_action.clone();
+        let stop_label = self.strings.stop_queue_action.clone();
+        let manage_label = self.strings.manage_queue_action.clone();
+        let delete_label = self.strings.delete_queue_action.clone();
+        let delete_ok_label = self.strings.delete.clone();
+        let cancel_label = self.strings.cancel.clone();
+        let description = SharedString::from(self.strings.queue_delete_confirm_desc.replace(
+            "{name}",
+            if queue.name.is_empty() {
+                &queue.queue_id
+            } else {
+                &queue.name
+            },
+        ));
+        let open_queue_manager = self.host.open_queue_manager.clone();
+        let queue_id = queue.queue_id.clone();
+        let is_running = queue.is_running;
+        let is_main = queue.queue_id == fluxdown_protocol::MAIN_QUEUE_ID;
+
+        move |menu, _window, _cx| {
+            let menu = menu.item({
+                let this = this.clone();
+                let queue_id = queue_id.clone();
+                if is_running {
+                    PopupMenuItem::new(stop_label.clone()).on_click(move |_, _window, cx| {
+                        let queue_id = queue_id.clone();
+                        let _ = this.update(cx, |this, cx| {
+                            this.execute_commands(
+                                vec![DownloadsCommand::QueueStop { queue_id }],
+                                cx,
+                            );
+                        });
+                    })
+                } else {
+                    PopupMenuItem::new(start_label.clone()).on_click(move |_, _window, cx| {
+                        let queue_id = queue_id.clone();
+                        let _ = this.update(cx, |this, cx| {
+                            this.execute_commands(
+                                vec![DownloadsCommand::QueueStart { queue_id }],
+                                cx,
+                            );
+                        });
+                    })
+                }
+            });
+            let menu = menu.item({
+                let open_queue_manager = open_queue_manager.clone();
+                PopupMenuItem::new(manage_label.clone()).on_click(move |_, window, cx| {
+                    if let Some(open) = open_queue_manager.clone() {
+                        open(window, cx);
+                    }
+                })
+            });
+            menu.when(!is_main, |menu| {
+                let this = this.clone();
+                let queue_id = queue_id.clone();
+                let delete_label = delete_label.clone();
+                let title = delete_label.clone();
+                let description = description.clone();
+                let ok_label = delete_ok_label.clone();
+                let cancel_label = cancel_label.clone();
+                menu.separator()
+                    .item(
+                        PopupMenuItem::new(delete_label).on_click(move |_, window, cx| {
+                            let this = this.clone();
+                            let queue_id = queue_id.clone();
+                            let title = title.clone();
+                            let description = description.clone();
+                            let ok_label = ok_label.clone();
+                            let cancel_label = cancel_label.clone();
+                            window.open_alert_dialog(cx, move |dialog, _, cx| {
+                                let this = this.clone();
+                                let queue_id = queue_id.clone();
+                                dialog
+                                    .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+                                    .description(description.clone())
+                                    .footer(fluxdown_ui_components::dialog_footer(
+                                        Some(cancel_label.clone()),
+                                        ok_label.clone(),
+                                        fluxdown_ui_components::DialogIntent::Destructive,
+                                        cx,
+                                    ))
+                                    .on_ok(move |_, _, cx| {
+                                        let _ = this.update(cx, |this, cx| {
+                                            this.execute_commands(
+                                                vec![DownloadsCommand::QueueDelete {
+                                                    queue_id: queue_id.clone(),
+                                                }],
+                                                cx,
+                                            );
+                                        });
+                                        true
+                                    })
+                            });
+                        }),
+                    )
+            })
+        }
+    }
+
+    fn render_queue_section(
+        &self,
+        first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let open_amount = self.section_open_amount(SidebarSection::Queues, window, cx);
+        let queues: Vec<QueueDto> = self.controller.queues().to_vec();
+        let theme = active_theme(cx);
+        let running_color = theme.extended().colors.success;
+        let icon_size = theme.extended().icon.lg;
+        let count = queues.len() as f32;
+        let mut items = Vec::with_capacity(queues.len());
+        for queue in queues {
+            let id = queue.queue_id.clone();
+            let label = match id.as_str() {
+                fluxdown_protocol::MAIN_QUEUE_ID => self.strings.main_queue.clone(),
+                fluxdown_protocol::LATER_QUEUE_ID => self.strings.later_queue.clone(),
+                _ => SharedString::from(queue.name.clone()),
+            };
+            let dot = queue.is_running.then_some(running_color);
+            let task_count = self.queue_count(&id, cx);
+            let menu = self.queue_item_context_menu(&queue, cx);
+            items.push(
+                self.nav_item(
+                    format!("download-nav-queue-{id}"),
+                    SidebarSelection::Queue(id),
+                    label,
+                    Icon::new(FluxIcon::Rows3).size(icon_size),
+                    (task_count, dot),
+                    cx,
+                )
+                .context_menu(menu),
+            );
+        }
+        Self::section_container(first, cx)
             .child(self.section_header(
                 "download-queue-toggle",
                 self.strings.sidebar_queues.clone(),
                 SidebarSection::Queues,
                 open_amount,
+                Some(self.queue_manage_button(cx)),
                 cx,
             ))
             .child(
                 div()
                     .w_full()
                     .overflow_hidden()
-                    .h(px(32. * 2. * open_amount))
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .opacity(open_amount)
-                            .child(self.nav_item(
-                                "download-nav-main-queue",
-                                SidebarSelection::MainQueue,
-                                self.strings.main_queue.clone(),
-                                IconName::GalleryVerticalEnd,
-                                (self.queue_count(fluxdown_protocol::MAIN_QUEUE_ID, cx), true),
-                                cx,
-                            ))
-                            .child(self.nav_item(
-                                "download-nav-later-queue",
-                                SidebarSelection::LaterQueue,
-                                self.strings.later_queue.clone(),
-                                IconName::Pause,
-                                (
-                                    self.queue_count(fluxdown_protocol::LATER_QUEUE_ID, cx),
-                                    true,
-                                ),
-                                cx,
-                            )),
-                    ),
+                    .h(active_theme(cx).density().nav_row * (count * open_amount))
+                    .child(v_flex().w_full().opacity(open_amount).children(items)),
             )
     }
 
+    /// 设备区：本机 + 云设备 + 已配对设备；远程任务按来源设备 id / 指纹计数。
+    fn render_devices_section(
+        &self,
+        first: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let open_amount = self.section_open_amount(SidebarSection::Devices, window, cx);
+        let theme = active_theme(cx);
+        let icon_size = theme.extended().icon.lg;
+        let mut entries: Vec<(String, SharedString)> = vec![(
+            SidebarSelection::LOCAL_DEVICE.to_owned(),
+            self.strings.this_device.clone(),
+        )];
+        entries.extend(self.controller.cloud_devices().iter().map(|device| {
+            let name = if device.name.is_empty() {
+                device.device_id.clone()
+            } else {
+                device.name.clone()
+            };
+            (device.device_id.clone(), SharedString::from(name))
+        }));
+        entries.extend(self.controller.linked_devices().iter().map(|device| {
+            let name = if device.name.is_empty() {
+                device.fingerprint.clone()
+            } else {
+                device.name.clone()
+            };
+            (device.fingerprint.clone(), SharedString::from(name))
+        }));
+        let count = entries.len() as f32;
+        let mut items = Vec::with_capacity(entries.len());
+        for (id, label) in entries {
+            let icon = if id == SidebarSelection::LOCAL_DEVICE {
+                FluxIcon::Cpu
+            } else {
+                FluxIcon::Globe
+            };
+            let task_count = self.device_count(&id, cx);
+            items.push(self.nav_item(
+                format!("download-nav-device-{id}"),
+                SidebarSelection::Device(id),
+                label,
+                Icon::new(icon).size(icon_size),
+                (task_count, None),
+                cx,
+            ));
+        }
+        Self::section_container(first, cx)
+            .child(self.section_header(
+                "download-devices-toggle",
+                self.strings.sidebar_devices.clone(),
+                SidebarSection::Devices,
+                open_amount,
+                None,
+                cx,
+            ))
+            .child(
+                div()
+                    .w_full()
+                    .overflow_hidden()
+                    .h(active_theme(cx).density().nav_row * (count * open_amount))
+                    .child(v_flex().w_full().opacity(open_amount).children(items)),
+            )
+    }
+
+    /// 分区可见性：设备区三态（偏好显式设置则按值，未设置时按「是否有任何设备」
+    /// 判定，与 Flutter 桌面端 `showSidebarDeviceEffective` 同语义）；其余分区
+    /// 二态，默认显示。
+    fn section_visible(&self, section: SidebarSection) -> bool {
+        match section {
+            SidebarSection::Devices => self
+                .controller
+                .preference(section.visibility_pref())
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or_else(|| {
+                    !self.controller.cloud_devices().is_empty()
+                        || !self.controller.linked_devices().is_empty()
+                }),
+            _ => self
+                .controller
+                .preference_bool(section.visibility_pref(), true),
+        }
+    }
+
+    /// 侧栏根：与活动栏同为 `chrome` 底色；与内容区之间的分隔线由页面布局负责。
     pub(crate) fn render_sidebar(
         &self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let surface = active_theme(cx).tokens().colors.surface;
-        v_flex()
+        let theme = active_theme(cx);
+        let chrome = theme.extended().colors.chrome;
+        let spacing = theme.tokens().spacing;
+        let mut root = v_flex()
             .size_full()
             .min_w_0()
+            .px(spacing.sm)
+            .pt(spacing.sm)
             .overflow_y_scrollbar()
-            .bg(surface)
-            .child(self.render_download_tree(window, cx))
-            .child(self.render_queue_section(window, cx))
+            .bg(chrome);
+        let mut first = true;
+        for section in SidebarSection::ALL {
+            if !self.section_visible(section) {
+                continue;
+            }
+            let content: Div = match section {
+                SidebarSection::Status => self.render_status_section(first, window, cx),
+                SidebarSection::Queues => self.render_queue_section(first, window, cx),
+                SidebarSection::Devices => self.render_devices_section(first, window, cx),
+            };
+            first = false;
+            root = root.child(content);
+        }
+        root
     }
 }

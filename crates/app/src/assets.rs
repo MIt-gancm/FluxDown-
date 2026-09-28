@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 
-use fluxdown_ui_downloads::DownloadAssets;
+use fluxdown_ui_account::AccountAssets;
+use fluxdown_ui_components::ComponentAssets;
+use fluxdown_ui_rss::RssAssets;
 use fluxdown_ui_shell::ShellAssets;
 use gpui::{AssetSource, Result, SharedString};
 
@@ -12,7 +14,13 @@ impl AssetSource for DesktopAssets {
         if let Some(asset) = ShellAssets.load(path)? {
             return Ok(Some(asset));
         }
-        if let Some(asset) = DownloadAssets.load(path)? {
+        if let Some(asset) = ComponentAssets.load(path)? {
+            return Ok(Some(asset));
+        }
+        if let Some(asset) = RssAssets.load(path)? {
+            return Ok(Some(asset));
+        }
+        if let Some(asset) = AccountAssets.load(path)? {
             return Ok(Some(asset));
         }
         gpui_component_assets::Assets.load(path)
@@ -21,14 +29,18 @@ impl AssetSource for DesktopAssets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut assets = gpui_component_assets::Assets.list(path)?;
         assets.extend(ShellAssets.list(path)?);
-        assets.extend(DownloadAssets.list(path)?);
+        assets.extend(ComponentAssets.list(path)?);
+        assets.extend(RssAssets.list(path)?);
+        assets.extend(AccountAssets.list(path)?);
         Ok(assets)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use fluxdown_ui_downloads::DOWNLOAD_ICON_PATH;
+    use fluxdown_ui_account::{CLOUD_ICON_PATH, CROWN_ICON_PATH};
+    use fluxdown_ui_components::FluxIcon;
+    use fluxdown_ui_rss::RSS_ICON_PATH;
     use fluxdown_ui_shell::APP_LOGO_PATH;
     use gpui::AssetSource;
 
@@ -38,7 +50,10 @@ mod tests {
     fn desktop_assets_cover_shell_capabilities_and_component_icons() -> gpui::Result<()> {
         let assets = DesktopAssets;
         assert!(assets.load(APP_LOGO_PATH)?.is_some());
-        assert!(assets.load(DOWNLOAD_ICON_PATH)?.is_some());
+        assert!(assets.load(RSS_ICON_PATH)?.is_some());
+        assert!(assets.load(CROWN_ICON_PATH)?.is_some());
+        assert!(assets.load(CLOUD_ICON_PATH)?.is_some());
+        assert!(assets.load(FluxIcon::FilePlay.asset_path())?.is_some());
         assert!(assets.load("icons/window-close.svg")?.is_some());
         Ok(())
     }

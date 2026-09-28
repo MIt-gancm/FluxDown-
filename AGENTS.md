@@ -115,7 +115,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `ApiHost` | `native/api/src/service.rs` | 客户端→引擎（HTTP 契约） | REST/aria2/MCP 的能力面；必需方法 + 可默认降级方法 |
 
 - 当前两个生产宿主仍是 `hub`（App，actor=`download_actor.rs`）与 `server`（headless，actor=`actor.rs`）；`fluxdown_api` 只依赖 `&dyn ApiHost`，同一套 HTTP 面服务任意宿主。CLI 双模式：默认 HTTP 连宿主，`add --local` 内嵌引擎。
-- **迁移目标**：`native/daemon` 成为可独立运行的纯下载核心，`native/agent` 常驻承载账户/云同步/设备协同与官方 UI Gateway；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 进入废弃路径，任何新实现不得依赖它。
+- **迁移目标**：`native/daemon` 成为可独立运行的纯下载核心，`native/agent` 常驻承载账户/云同步/设备协同、官方 UI Gateway 与系统外壳（托盘、关闭 UI 后的驻留策略；GPUI 界面进程本身不驻留）；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 进入废弃路径，任何新实现不得依赖它。
 - **并发模型**：current_thread tokio actor 串行化写；每个下载 spawn 独立 task + CancellationToken；插件 resolve 永不阻塞 actor（off-actor spawn + 通道回流）。
 - 客户端捕获三条并行前端进同一本机 RPC（`:17800/download`）：扩展、用户脚本、桌面确认框。
 
@@ -127,7 +127,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - `fluxdown_engine`：零 rinf/Dart/axum 依赖，只经 `EventSink`/`HostSelection` 与宿主解耦。协议/分段/DB/队列/组/插件全在这里。
 - `fluxdown_api`：依赖 `fluxdown_protocol` 的规范 DTO 与 `&dyn ApiHost`，只定义 HTTP 路径/服务器/兼容层。零引擎、零 rinf。
 - `hub`：**唯一**碰 rinf FFI 的 crate（crate 名不可改，rinf 硬编码）。只做信号收发与类型转换，不含协议逻辑；`signal_bridge.rs` 是 `engine::model` ↔ `hub::signals` 的孤儿规则边界。
-- `crates/{i18n,theme,components,shell,downloads,settings,account,rss,extensions,app}`：GPUI PC 迁移层；`app` 是唯一 composition root，所有 capability 只依赖本地端口和 protocol DTO。新增页面与 capability 的 crate 边界、目录归属、依赖方向见 `rule://gpui-crate-architecture`。
+- `crates/{i18n,theme,components,shell,downloads,settings,account,rss,extensions,command_palette,app}`：GPUI PC 迁移层；`app` 是唯一 composition root，所有 capability 只依赖本地端口和 protocol DTO。新增页面与 capability 的 crate 边界、目录归属、依赖方向见 `rule://gpui-crate-architecture`。
 - `fluxdown_protocol`：唯一传输无关 wire 层；只能依赖序列化/纯类型能力，不依赖引擎、运行时、数据库、HTTP 或 UI。
 - `fluxdown_engine_protocol`：引擎模型与 protocol DTO 的无状态、无损转换边界；宿主使用命名函数，API/agent/UI 不依赖它。
 - `fluxdown_daemon`：`fluxdownd` 纯下载核心；独占 engine/下载 DB，拥有任务、队列、组、下载设置、RSS、插件、Webhook 与选择。
@@ -160,6 +160,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | 改这里 | 必须同步 |
 |---|---|
 | `engine/src/rss/filter.rs` | `lib/src/models/rss_filter.dart` + `web/src/lib/rss-filter.ts`（三份逐条对齐；预览与实际下载不一致会直接摧毁功能可信度） |
+| `crates/theme` 的 token 注册表 / 解析 / 迁移 / 导出（`registry.rs`、`resolve.rs`、`migrate.rs`、`document.rs`、`flutter.rs`） | 重跑 `cargo run -p fluxdown_ui_theme --example gen_theme_registry` → `website-v2/src/lib/gpui-theme/registry.json` + `website-v2/public/schemas/gpui-theme.v2.json` + fixtures `*.resolved.json`；`website-v2/src/lib/gpui-theme/*.ts` 逐项对齐并过 `cd website-v2 && bun test tests`。token **只加不改**，改名只走声明式 rename 迁移，已发布 fixtures 永不删除 |
 | `server/src/config.rs::validate_access_key` | `web/src/lib/token-policy.ts` |
 | `engine/src/data_dir.rs` | `lib/src/services/platform_utils.dart` 的 `KNOWN_ITEMS` |
 | `engine/src/webhook.rs` 的 `WebhookEventKind` | Dart `WebhookEvents.all` + TS `WEBHOOK_EVENTS`，**三处 wire 名逐字一致** |
@@ -169,6 +170,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | 任一 UI 文案 | 只补 **en + zh 基线对**：App `assets/i18n/{en,zh}.json` + `translations.dart` getter；`web/src/lib/locales/{en,zh}.json`；`website/src/lib/locales/{en,zh-CN}.json`；`fluxDown/utils/locales/{en,zh-CN}.ts`。社区语言（`ja` 等）由 Weblate 维护，**不碰**（运行时键级回退英文）。**`assets/i18n` 同时被 `crates/*`（GPUI，`ctx.t("key")` 运行时查键）嵌入**：Flutter 侧删键前先 `grep crates/`，`lib/` 无引用不等于死键 |
 | web 设置项 / 对话框字段归属 | **基准 = 桌面**：同一功能在两端的分类归属与分区排序必须一致（桌面 `settings_page.dart` 分类 ↔ web 分区组件 GeneralSettings/DownloadSettings/ProxySettings…）。双端并行开发时归属分类要写成一份共享契约，禁止两份各自措辞 |
 | 「一键分类目录」的目录名推导 | `lib/src/models/custom_category.dart` 的 `sanitizeCategoryDirName` / `categoryDirUnder` ↔ `web/src/lib/categories.ts` 同名函数（含分隔符归一）；**且内置分类显示名两端逐字一致**（App `assets/i18n` 的 `categoryVideo/...` ↔ web `type.video/...`），否则同一台机器上桌面与 Web 会各建一套目录（`Document` vs `Documents`） |
+| 开机自启语义（`lib/src/services/autostart_service.dart`） | `native/agent/src/platform/autostart.rs`：「已启用」都要尊重系统级禁用（Windows `StartupApproved`、XDG `Hidden` / `X-GNOME-Autostart-enabled`），启动时自动迁移只改启动目标、**绝不**改系统启用状态；细节见 `.omp/knowledge/clients.md`「开机自启」 |
 
 ---
 

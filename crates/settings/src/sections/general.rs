@@ -1,33 +1,45 @@
-//! 通用：启动与托盘、系统集成、界面可见性、自定义分类。
+//! 通用：启动与托盘、系统集成、侧边栏与活动栏可见性、自定义分类。
 
+use fluxdown_protocol::capture_link::OpenAssociation;
+use fluxdown_protocol::{PlatformIntegrationDto, ShellStatusDto, TrayUnavailableReason};
+use fluxdown_ui_components::FluxIcon;
 use gpui::App;
-use gpui_component::{
-    Icon, IconName,
-    setting::{SettingField, SettingGroup, SettingPage},
-};
 
 use super::{SectionContext, categories};
+use crate::ActivityBarToggle;
+use crate::ui::{Control, SettingsPage, SettingsSection};
 
-pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingPage {
+pub(crate) fn page(
+    ctx: &SectionContext,
+    activity_bar: &[ActivityBarToggle],
+    cx: &mut App,
+) -> SettingsPage {
     // 首次进入拉取系统集成状态（自启 / 文件关联 / URL scheme）。
     if ctx.store.read(cx).integration().is_none() && !ctx.store.read(cx).is_busy("integration") {
         ctx.store.update(cx, |store, cx| store.load_integration(cx));
     }
 
-    SettingPage::new(ctx.t("settingsCatGeneral"))
-        .icon(Icon::new(IconName::Settings2))
-        .description(ctx.t("settingsCatGeneralDesc"))
-        .group(startup_group(ctx, cx))
-        .group(system_group(ctx, cx))
-        .group(sidebar_group(ctx))
-        .group(titlebar_group(ctx))
-        .group(categories::group(ctx, cx))
+    SettingsPage::new(
+        "general",
+        ctx.t("settingsCatGeneral"),
+        ctx.t("settingsCatGeneralDesc"),
+        FluxIcon::Settings,
+    )
+    .sections([
+        startup_section(ctx, cx),
+        system_section(ctx, cx),
+        sidebar_section(ctx),
+        activity_bar_section(ctx, activity_bar),
+        categories::group(ctx, cx),
+    ])
 }
 
-fn startup_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
-    SettingGroup::new()
+fn startup_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
+    // 托盘由 agent 承载：可用性在运行期探测（Linux 取决于 StatusNotifier 宿主与 appindicator）。
+    let shell = ctx.store.read(cx).shell().clone();
+    SettingsSection::new()
         .title(ctx.t("settingsGroupStartupTray"))
-        .item(
+        .row(
             ctx.item(
                 "autoStartup",
                 Some("autoStartupDesc"),
@@ -35,46 +47,44 @@ fn startup_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
             )
             .disabled(!integration_supported(ctx, IntegrationKind::Autostart, cx)),
         )
-        .item(ctx.item(
-            "closeToTray",
-            Some("closeToTrayDesc"),
-            ctx.pref_switch("close_to_tray", true),
-        ))
-        .item(ctx.item(
-            "startMinimizedToTray",
-            Some("startMinimizedToTrayDesc"),
-            ctx.pref_switch("start_minimized_to_tray", false),
-        ))
+        .row(
+            ctx.item(
+                "closeToTray",
+                Some(tray_desc(&shell, "closeToTrayDesc")),
+                ctx.pref_switch("close_to_tray", true),
+            )
+            .disabled(!shell.tray_available),
+        )
+        .row(
+            ctx.item(
+                "startMinimizedToTray",
+                Some(tray_desc(&shell, "startMinimizedToTrayDesc")),
+                ctx.pref_switch("start_minimized_to_tray", false),
+            )
+            .disabled(!shell.tray_available),
+        )
 }
 
-fn system_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
-    let floating_ball = ctx
-        .store
-        .read(cx)
-        .pref_bool("general.floating_ball_enabled", false);
-    let mut group = SettingGroup::new()
-        .title(ctx.t("settingsGroupSystem"))
-        .item(ctx.item(
-            "floatingBall",
-            Some("floatingBallDesc"),
-            ctx.pref_switch("general.floating_ball_enabled", false),
-        ));
-    if floating_ball {
-        group = group.item(ctx.item(
-            "floatingBallActiveOnly",
-            Some("floatingBallActiveOnlyDesc"),
-            ctx.pref_switch("general.floating_ball_active_only", false),
-        ));
+/// 托盘不可用时用原因替换说明文案，告诉用户关闭窗口后会发生什么。
+fn tray_desc(shell: &ShellStatusDto, key: &'static str) -> &'static str {
+    match shell.tray_unavailable_reason {
+        None => key,
+        Some(TrayUnavailableReason::NotBuilt) => "trayUnavailableNotBuilt",
+        Some(TrayUnavailableReason::NoDisplay) => "trayUnavailableNoDisplay",
+        Some(TrayUnavailableReason::NoHost) => "trayUnavailableNoHost",
+        Some(TrayUnavailableReason::InitFailed) => "trayUnavailableInitFailed",
     }
-    if cfg!(target_os = "linux") {
-        group = group.item(ctx.item(
+}
+
+fn system_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
+    SettingsSection::new()
+        .title(ctx.t("settingsGroupSystem"))
+        .row(ctx.item(
             "clipboardWatch",
             Some("clipboardWatchDesc"),
             ctx.pref_switch("general.clipboard_watch", false),
-        ));
-    }
-    group
-        .item(
+        ))
+        .row(
             ctx.item(
                 "torrentFileAssociation",
                 Some("torrentFileAssociationDesc"),
@@ -82,7 +92,7 @@ fn system_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
             )
             .disabled(!integration_supported(ctx, IntegrationKind::Torrent, cx)),
         )
-        .item(
+        .row(
             ctx.item(
                 "magnetLinkAssociation",
                 Some("magnetLinkAssociationDesc"),
@@ -94,7 +104,7 @@ fn system_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
                 cx,
             )),
         )
-        .item(
+        .row(
             ctx.item(
                 "ed2kLinkAssociation",
                 Some("ed2kLinkAssociationDesc"),
@@ -106,93 +116,78 @@ fn system_group(ctx: &SectionContext, cx: &mut App) -> SettingGroup {
                 cx,
             )),
         )
-        .item(ctx.item(
+        .row(ctx.item(
             "keepAwakeWhileDownloading",
             Some("keepAwakeWhileDownloadingDesc"),
             ctx.pref_switch("download.keep_awake", false),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "analyticsEnabled",
             Some("analyticsEnabledDesc"),
             ctx.pref_switch("analytics_enabled", true),
         ))
 }
 
-fn sidebar_group(ctx: &SectionContext) -> SettingGroup {
-    SettingGroup::new()
+fn sidebar_section(ctx: &SectionContext) -> SettingsSection {
+    SettingsSection::new()
         .title(ctx.t("sidebarVisibility"))
-        .description(ctx.t("sidebarVisibilityDesc"))
-        .item(ctx.item(
+        .subtitle(ctx.t("sidebarVisibilityDesc"))
+        .row(ctx.item(
             "showSidebarStatus",
             Some("showSidebarStatusDesc"),
             ctx.pref_switch("ui.show_sidebar_status", true),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "showSidebarQueues",
             Some("showSidebarQueuesDesc"),
             ctx.pref_switch("ui.show_sidebar_queues", true),
         ))
-        .item(ctx.item(
-            "showSidebarRss",
-            Some("showSidebarRssDesc"),
-            ctx.pref_switch("ui.show_sidebar_rss", true),
-        ))
-        .item(ctx.item(
+        .row(ctx.item(
             "showSidebarCategory",
-            Some("showSidebarCategoryDesc"),
+            Some("showSidebarCategoryNestedDesc"),
             ctx.pref_switch("ui.show_sidebar_category", true),
         ))
-        .item(ctx.item(
+        .row(ctx.item(
             "showSidebarDevice",
             Some("showSidebarDeviceDesc"),
             show_sidebar_device_field(ctx),
         ))
 }
 
-/// `show_sidebar_device` 三态：未设置 = 登录后自动显示。开关显示有效值。
-fn show_sidebar_device_field(ctx: &SectionContext) -> SettingField<bool> {
+/// `ui.show_sidebar_devices` 三态：未设置 = 登录后自动显示。开关显示有效值。
+fn show_sidebar_device_field(ctx: &SectionContext) -> Control {
     let get = ctx.store();
     let set = ctx.store();
-    SettingField::switch(
+    Control::switch(
         move |cx: &App| {
             let store = get.read(cx);
             store
-                .pref("show_sidebar_device")
+                .pref("ui.show_sidebar_devices")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or_else(|| store.session().is_some())
         },
         move |value, cx: &mut App| {
             set.update(cx, |store, cx| {
-                store.set_pref_bool("show_sidebar_device", value, cx)
+                store.set_pref_bool("ui.show_sidebar_devices", value, cx)
             });
         },
     )
 }
 
-fn titlebar_group(ctx: &SectionContext) -> SettingGroup {
-    SettingGroup::new()
-        .title(ctx.t("titlebarButtons"))
-        .description(ctx.t("titlebarButtonsDesc"))
-        .item(ctx.item(
-            "showTitlebarPauseAll",
-            Some("showTitlebarPauseAllDesc"),
-            ctx.pref_switch("ui.show_titlebar_pause_all", true),
-        ))
-        .item(ctx.item(
-            "showTitlebarResumeAll",
-            Some("showTitlebarResumeAllDesc"),
-            ctx.pref_switch("ui.show_titlebar_resume_all", true),
-        ))
-        .item(ctx.item(
-            "showTitlebarSettings",
-            Some("showTitlebarSettingsDesc"),
-            ctx.pref_switch("ui.show_titlebar_settings", true),
-        ))
-        .item(ctx.item(
-            "showTitlebarTheme",
-            Some("showTitlebarThemeDesc"),
-            ctx.pref_switch("ui.show_titlebar_theme", true),
-        ))
+/// 活动栏开关由 app 的活动栏注册表派生：注册了可选入口即自动出现在这里。
+fn activity_bar_section(ctx: &SectionContext, toggles: &[ActivityBarToggle]) -> SettingsSection {
+    toggles.iter().fold(
+        SettingsSection::new()
+            .title(ctx.t("activityBarSection"))
+            .subtitle(ctx.t("activityBarSectionDesc")),
+        |section, toggle| {
+            section.row(ctx.item(
+                toggle.title_key,
+                Some(toggle.desc_key),
+                ctx.pref_switch(toggle.pref_key, true),
+            ))
+        },
+    )
 }
 
 #[derive(Clone, Copy)]
@@ -214,36 +209,98 @@ fn integration_supported(ctx: &SectionContext, kind: IntegrationKind, cx: &App) 
     })
 }
 
-/// 系统集成开关：值来自 agent 探测结果，切换即调用 agent 注册/注销。
-fn integration_switch(ctx: &SectionContext, kind: IntegrationKind) -> SettingField<bool> {
+/// 用户手动关闭关联时持久化的 opt-out 键（与 Flutter 设置、agent 捕获拦截同一键）。
+///
+/// macOS Launch Services 没有「无默认处理程序」：FluxDown 是唯一候选时，关闭后系统仍
+/// 回落到 FluxDown，探测值恒为 true。opt-out 让用户的「关闭」压过探测值，否则开关会被
+/// 立即顶回开启；agent 也据此拦截系统交来的链接 / 文件。
+fn opt_out_key(kind: IntegrationKind) -> Option<&'static str> {
+    let association = match kind {
+        IntegrationKind::Autostart => return None,
+        IntegrationKind::Torrent => OpenAssociation::Torrent,
+        IntegrationKind::Scheme("magnet") => OpenAssociation::Magnet,
+        IntegrationKind::Scheme(_) => OpenAssociation::Ed2k,
+    };
+    Some(association.opt_out_pref_key())
+}
+
+/// 开关显示值：系统探测为已关联，且用户未手动关闭。
+fn integration_enabled(
+    dto: &PlatformIntegrationDto,
+    kind: IntegrationKind,
+    user_disabled: bool,
+) -> bool {
+    let probed = match kind {
+        IntegrationKind::Autostart => dto.autostart_enabled,
+        IntegrationKind::Torrent => dto.torrent_associated,
+        IntegrationKind::Scheme(scheme) => dto.url_protocols.get(scheme).copied().unwrap_or(false),
+    };
+    probed && !user_disabled
+}
+
+/// 系统集成开关：值来自 agent 探测结果（叠加用户 opt-out），切换即调用 agent 注册/注销。
+fn integration_switch(ctx: &SectionContext, kind: IntegrationKind) -> Control {
     let get = ctx.store();
     let set = ctx.store();
-    SettingField::switch(
+    Control::switch(
         move |cx: &App| {
-            get.read(cx).integration().is_some_and(|dto| match kind {
-                IntegrationKind::Autostart => dto.autostart_enabled,
-                IntegrationKind::Torrent => dto.torrent_associated,
-                IntegrationKind::Scheme(scheme) => {
-                    dto.url_protocols.get(scheme).copied().unwrap_or(false)
-                }
-            })
+            let store = get.read(cx);
+            let user_disabled = opt_out_key(kind).is_some_and(|key| store.pref_bool(key, false));
+            store
+                .integration()
+                .is_some_and(|dto| integration_enabled(dto, kind, user_disabled))
         },
         move |value, cx: &mut App| {
-            set.update(cx, |store, cx| match kind {
-                IntegrationKind::Autostart => store.set_autostart(value, cx),
-                IntegrationKind::Torrent => {
-                    store.set_pref_bool("torrent_assoc_user_disabled", !value, cx);
-                    store.set_file_association(value, cx);
-                }
-                IntegrationKind::Scheme(scheme) => {
-                    let key: &'static str = match scheme {
-                        "magnet" => "magnet_assoc_user_disabled",
-                        _ => "ed2k_assoc_user_disabled",
-                    };
+            set.update(cx, |store, cx| {
+                if let Some(key) = opt_out_key(kind) {
                     store.set_pref_bool(key, !value, cx);
-                    store.set_url_protocol(scheme, value, cx);
+                }
+                match kind {
+                    IntegrationKind::Autostart => store.set_autostart(value, cx),
+                    IntegrationKind::Torrent => store.set_file_association(value, cx),
+                    IntegrationKind::Scheme(scheme) => store.set_url_protocol(scheme, value, cx),
                 }
             });
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn associated_everywhere() -> PlatformIntegrationDto {
+        PlatformIntegrationDto {
+            torrent_associated: true,
+            url_protocols: BTreeMap::from([("magnet".to_owned(), true), ("ed2k".to_owned(), true)]),
+            ..PlatformIntegrationDto::default()
+        }
+    }
+
+    #[test]
+    fn user_opt_out_wins_over_sticky_system_probe() {
+        // macOS：唯一候选时清空默认处理程序无效，探测仍报告已关联。
+        let dto = associated_everywhere();
+        for kind in [
+            IntegrationKind::Torrent,
+            IntegrationKind::Scheme("magnet"),
+            IntegrationKind::Scheme("ed2k"),
+        ] {
+            assert!(!integration_enabled(&dto, kind, true));
+            assert!(integration_enabled(&dto, kind, false));
+        }
+    }
+
+    #[test]
+    fn opt_out_cannot_turn_unassociated_on() {
+        let dto = PlatformIntegrationDto::default();
+        assert!(!integration_enabled(&dto, IntegrationKind::Torrent, false));
+        assert!(!integration_enabled(
+            &dto,
+            IntegrationKind::Scheme("magnet"),
+            false
+        ));
+    }
 }

@@ -23,6 +23,10 @@ inputs:
     description: 路径过滤（空格分隔的 glob，如 'native/cli/** native/api/**'）；留空 = 全仓
     required: false
     default: ""
+  tag:
+    description: 发布 tag（留空则取 GITHUB_REF；手动补跑时必须显式传入）
+    required: false
+    default: ""
   claude-token:
     description: CLAUDE_CODE_OAUTH_TOKEN
     required: true
@@ -61,7 +65,8 @@ runs:
     - name: Collect commit context
       shell: bash
       run: |
-        TAG="${GITHUB_REF#refs/tags/}"
+        TAG="${{ inputs.tag }}"
+        [ -n "$TAG" ] || TAG="${GITHUB_REF#refs/tags/}"
         PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
         RANGE="${PREV:+${PREV}..}${TAG}"
         echo "Context range: ${RANGE}"

@@ -1,0 +1,38 @@
+---
+/**
+ * 首页(/ 与 /zh/)。各分区组件位于 src/components/home/,叙事顺序:
+ * 首屏(GPUI 实时复刻)→ 一览 → 引擎 → 协议 → 原生架构 → 浏览器捕获 → 全平台 → 扩展 → 隐私 → 下载。
+ */
+import Layout from "@/layouts/Layout.astro";
+import Hero from "@/components/home/Hero.astro";
+import Stats from "@/components/home/Stats.astro";
+import Engine from "@/components/home/Engine.astro";
+import Protocols from "@/components/home/Protocols.astro";
+import Native from "@/components/home/Native.astro";
+import Capture from "@/components/home/Capture.astro";
+import Everywhere from "@/components/home/Everywhere.astro";
+import Extend from "@/components/home/Extend.astro";
+import Privacy from "@/components/home/Privacy.astro";
+import FinalCta from "@/components/home/FinalCta.astro";
+import FilmModal from "@/components/home/FilmModal.astro";
+import { langStaticPaths, resolveLang } from "@/i18n/routing";
+import { home } from "@/i18n/messages/home";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = home[lang];
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <Hero lang={lang} />
+  <Stats lang={lang} />
+  <Engine lang={lang} />
+  <Protocols lang={lang} />
+  <Native lang={lang} />
+  <Capture lang={lang} />
+  <Everywhere lang={lang} />
+  <Extend lang={lang} />
+  <Privacy lang={lang} />
+  <FinalCta lang={lang} />
+  <FilmModal lang={lang} />
+</Layout>

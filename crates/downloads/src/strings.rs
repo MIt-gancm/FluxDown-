@@ -1,6 +1,12 @@
 use fluxdown_ui_i18n::{Translator, keys};
 use gpui::SharedString;
 
+/// 「聚焦搜索」快捷键提示（与 app `menus.rs` 的 `secondary-f` 绑定一致），显示在顶栏搜索框右侧徽标里。
+#[cfg(target_os = "macos")]
+pub(crate) const SEARCH_SHORTCUT_HINT: &str = "⌘F";
+#[cfg(not(target_os = "macos"))]
+pub(crate) const SEARCH_SHORTCUT_HINT: &str = "Ctrl+F";
+
 #[derive(Clone)]
 pub(crate) struct DownloadStrings {
     pub(crate) category_archive: SharedString,
@@ -13,10 +19,21 @@ pub(crate) struct DownloadStrings {
     pub(crate) col_created: SharedString,
     pub(crate) col_eta: SharedString,
     pub(crate) col_file_name: SharedString,
+    pub(crate) col_progress: SharedString,
+    pub(crate) col_protocol: SharedString,
+    pub(crate) col_queue: SharedString,
     pub(crate) col_size: SharedString,
+    pub(crate) col_source: SharedString,
     pub(crate) col_speed: SharedString,
     pub(crate) col_status: SharedString,
+    pub(crate) active_transfers: SharedString,
+    pub(crate) connected_peers: SharedString,
     pub(crate) delete: SharedString,
+    pub(crate) delete_task: SharedString,
+    pub(crate) delete_task_and_file: SharedString,
+    delete_confirm_with_file: SharedString,
+    batch_delete_confirm_with_file: SharedString,
+    pub(crate) too_many_windows_hint: SharedString,
     pub(crate) confirm: SharedString,
     pub(crate) cancel: SharedString,
     pub(crate) disconnected: SharedString,
@@ -27,21 +44,70 @@ pub(crate) struct DownloadStrings {
     eta_hours: SharedString,
     pub(crate) later_queue: SharedString,
     pub(crate) pause: SharedString,
+    pub(crate) pause_all: SharedString,
     pub(crate) resume: SharedString,
+    pub(crate) resume_all: SharedString,
     pub(crate) main_queue: SharedString,
-    pub(crate) new_download: SharedString,
     pub(crate) open_file: SharedString,
     pub(crate) open_folder: SharedString,
+    pub(crate) remote_tasks: SharedString,
     pub(crate) sidebar_queues: SharedString,
     pub(crate) status_all: SharedString,
     pub(crate) status_completed: SharedString,
+    pub(crate) status_downloading: SharedString,
+    pub(crate) status_error: SharedString,
     pub(crate) status_incomplete: SharedString,
     pub(crate) status_paused: SharedString,
-    pub(crate) stop_all: SharedString,
+    pub(crate) status_pending: SharedString,
     pub(crate) today: SharedString,
-    pub(crate) view_columns_at_least_one: SharedString,
-    pub(crate) view_columns_menu_title: SharedString,
-    pub(crate) view_columns_reset_action: SharedString,
+    pub(crate) yesterday: SharedString,
+    pub(crate) this_week: SharedString,
+    pub(crate) this_month: SharedString,
+    pub(crate) older: SharedString,
+    pub(crate) ungrouped: SharedString,
+    pub(crate) site_bt: SharedString,
+    pub(crate) ignore_plugin_retry: SharedString,
+    pub(crate) ignore_plugin_retry_title: SharedString,
+    pub(crate) ignore_plugin_retry_msg: SharedString,
+    pub(crate) boost_download: SharedString,
+    pub(crate) cancel_boost: SharedString,
+    pub(crate) rename_task: SharedString,
+    pub(crate) rename_task_title: SharedString,
+    pub(crate) rename_task_placeholder: SharedString,
+    pub(crate) redownload_task: SharedString,
+    pub(crate) copy_url: SharedString,
+    /// 复制下载地址后的成功提示。
+    pub(crate) url_copied: SharedString,
+    pub(crate) move_to_queue: SharedString,
+    /// 右键「详情」：在停靠面板中查看。
+    pub(crate) detail: SharedString,
+    /// 详情面板头部「在独立窗口打开」。
+    pub(crate) open_in_window: SharedString,
+    pub(crate) group_pause_all: SharedString,
+    pub(crate) group_resume_all: SharedString,
+    pub(crate) group_retry_failed: SharedString,
+    pub(crate) group_open_folder: SharedString,
+    pub(crate) group_copy_source_link: SharedString,
+    pub(crate) group_delete: SharedString,
+    pub(crate) group_delete_with_files: SharedString,
+    group_delete_confirm_with_file: SharedString,
+    pub(crate) open_group_in_window: SharedString,
+    pub(crate) search_tasks_placeholder: SharedString,
+    pub(crate) unsupported_drop_hint: SharedString,
+    pub(crate) sidebar_status: SharedString,
+    pub(crate) sidebar_devices: SharedString,
+    pub(crate) this_device: SharedString,
+    pub(crate) add_category: SharedString,
+    pub(crate) edit_category: SharedString,
+    pub(crate) hide_section: SharedString,
+    pub(crate) start_queue_action: SharedString,
+    pub(crate) stop_queue_action: SharedString,
+    pub(crate) manage_queue_action: SharedString,
+    pub(crate) delete_queue_action: SharedString,
+    pub(crate) queue_delete_confirm_desc: SharedString,
+    pub(crate) tab_failed: SharedString,
+    pub(crate) empty_title: SharedString,
+    pub(crate) empty_subtitle: SharedString,
 }
 
 impl DownloadStrings {
@@ -57,9 +123,17 @@ impl DownloadStrings {
             col_created: shared(translator.text(keys::COL_CREATED)),
             col_eta: shared(translator.text(keys::COL_ETA)),
             col_file_name: shared(translator.text(keys::COL_FILE_NAME)),
+            col_progress: shared(translator.text("colProgress")),
+            col_protocol: shared(translator.text("colProtocol")),
+            col_queue: shared(translator.text("colQueue")),
             col_size: shared(translator.text(keys::COL_SIZE)),
+            col_source: shared(translator.text("colSource")),
             col_speed: shared(translator.text(keys::COL_SPEED)),
+            active_transfers: shared(translator.text("taskActiveTransfers")),
+            connected_peers: shared(translator.text("taskConnectedPeers")),
             confirm: shared(translator.text("confirm")),
+            empty_title: shared(translator.text("emptyTitle")),
+            empty_subtitle: shared(translator.text("emptySubtitle")),
             cancel: shared(translator.text("cancel")),
             disconnected: shared(translator.text("localServiceDisconnected")),
             action_failed: shared(translator.text("localServiceActionFailed")),
@@ -70,22 +144,73 @@ impl DownloadStrings {
             col_status: shared(translator.text(keys::COL_STATUS)),
             later_queue: shared(translator.text(keys::LATER_QUEUE)),
             delete: shared(translator.text(keys::DELETE)),
+            delete_task: shared(translator.text("deleteTask")),
+            delete_task_and_file: shared(translator.text("deleteTaskAndFile")),
+            delete_confirm_with_file: shared(translator.text("deleteConfirmDescWithFile")),
+            batch_delete_confirm_with_file: shared(
+                translator.text("batchDeleteConfirmDescWithFile"),
+            ),
+            too_many_windows_hint: shared(translator.text("tooManyWindowsHint")),
             main_queue: shared(translator.text(keys::MAIN_QUEUE)),
             pause: shared(translator.text(keys::PAUSE)),
+            pause_all: shared(translator.text("pauseAll")),
             resume: shared(translator.text(keys::RESUME)),
-            new_download: shared(translator.text(keys::NEW_DOWNLOAD)),
+            resume_all: shared(translator.text("resumeAll")),
             open_file: shared(translator.text("openFile")),
             open_folder: shared(translator.text("openFolder")),
+            remote_tasks: shared(translator.text("remoteTasksGroup")),
             sidebar_queues: shared(translator.text(keys::SIDEBAR_QUEUES)),
             status_all: shared(translator.text(keys::TAB_ALL)),
             status_completed: shared(translator.text(keys::STATUS_COMPLETED)),
-            status_incomplete: shared(translator.text(keys::STATUS_INCOMPLETE)),
+            status_downloading: shared(translator.text(keys::STATUS_DOWNLOADING)),
+            status_error: shared(translator.text(keys::STATUS_ERROR)),
+            status_incomplete: shared(translator.text("tabDownloading")),
             status_paused: shared(translator.text(keys::STATUS_PAUSED)),
-            stop_all: shared(translator.text(keys::STOP_ALL)),
+            status_pending: shared(translator.text("statusPending")),
             today: shared(translator.text(keys::TODAY)),
-            view_columns_at_least_one: shared(translator.text(keys::VIEW_COLUMNS_AT_LEAST_ONE)),
-            view_columns_menu_title: shared(translator.text(keys::VIEW_COLUMNS_MENU_TITLE)),
-            view_columns_reset_action: shared(translator.text(keys::VIEW_COLUMNS_RESET_ACTION)),
+            yesterday: shared(translator.text("yesterday")),
+            this_week: shared(translator.text("thisWeek")),
+            this_month: shared(translator.text("thisMonth")),
+            older: shared(translator.text("older")),
+            ungrouped: shared(translator.text("ungroupedTasks")),
+            site_bt: shared(translator.text("viewSiteBt")),
+            ignore_plugin_retry: shared(translator.text("taskIgnorePluginRetry")),
+            ignore_plugin_retry_title: shared(translator.text("taskIgnorePluginRetryTitle")),
+            ignore_plugin_retry_msg: shared(translator.text("taskIgnorePluginRetryMsg")),
+            boost_download: shared(translator.text("boostDownload")),
+            cancel_boost: shared(translator.text("cancelBoost")),
+            rename_task: shared(translator.text("renameTask")),
+            rename_task_title: shared(translator.text("renameTaskTitle")),
+            rename_task_placeholder: shared(translator.text("renameTaskPlaceholder")),
+            redownload_task: shared(translator.text("redownloadTask")),
+            copy_url: shared(translator.text("copyUrl")),
+            url_copied: shared(translator.text("urlCopied")),
+            move_to_queue: shared(translator.text("moveToQueueAction")),
+            detail: shared(translator.text("detail")),
+            open_in_window: shared(translator.text("menuOpenInWindow")),
+            group_pause_all: shared(translator.text("groupPauseAll")),
+            group_resume_all: shared(translator.text("groupResumeAll")),
+            group_retry_failed: shared(translator.text("groupRetryFailed")),
+            group_open_folder: shared(translator.text("groupOpenFolder")),
+            group_copy_source_link: shared(translator.text("groupCopySourceLink")),
+            group_delete: shared(translator.text("groupDelete")),
+            group_delete_with_files: shared(translator.text("groupDeleteWithFiles")),
+            group_delete_confirm_with_file: shared(translator.text("deleteConfirmDescWithFile")),
+            open_group_in_window: shared(translator.text("openGroupInWindowAction")),
+            search_tasks_placeholder: shared(translator.text("searchTasksPlaceholder")),
+            unsupported_drop_hint: shared(translator.text("unsupportedDropHint")),
+            sidebar_status: shared(translator.text(keys::SIDEBAR_STATUS)),
+            sidebar_devices: shared(translator.text("deviceSection")),
+            this_device: shared(translator.text("thisDevice")),
+            add_category: shared(translator.text("addCategory")),
+            edit_category: shared(translator.text("editCategory")),
+            hide_section: shared(translator.text("hideSection")),
+            start_queue_action: shared(translator.text("startQueueAction")),
+            stop_queue_action: shared(translator.text("stopQueueAction")),
+            manage_queue_action: shared(translator.text("manageQueueAction")),
+            delete_queue_action: shared(translator.text("deleteQueueAction")),
+            queue_delete_confirm_desc: shared(translator.text("queueDeleteConfirmDesc")),
+            tab_failed: shared(translator.text("tabError")),
         }
     }
 
@@ -99,12 +224,100 @@ impl DownloadStrings {
         };
         SharedString::from(template.replace("{n}", &value))
     }
+
+    /// 「删除任务及文件」确认文案：单个带文件名，多个带数量。
+    pub(crate) fn delete_with_files_description(
+        &self,
+        keys: &[crate::model::RowKey],
+        store: &crate::model::TaskStore,
+    ) -> SharedString {
+        if let [key] = keys {
+            let name = store
+                .get(key)
+                .map(|row| row.name.clone())
+                .unwrap_or_default();
+            SharedString::from(self.delete_confirm_with_file.replace("{fileName}", &name))
+        } else {
+            SharedString::from(
+                self.batch_delete_confirm_with_file
+                    .replace("{count}", &keys.len().to_string()),
+            )
+        }
+    }
+
+    /// 「删除任务组及文件」确认文案：复用单任务模板，代入组名。
+    pub(crate) fn group_delete_with_files_description(&self, group_name: &str) -> SharedString {
+        SharedString::from(
+            self.group_delete_confirm_with_file
+                .replace("{fileName}", group_name),
+        )
+    }
+
+    pub(crate) fn state_label(&self, state: crate::model::TaskState) -> SharedString {
+        match state {
+            crate::model::TaskState::Pending => self.status_pending.clone(),
+            crate::model::TaskState::Downloading => self.status_downloading.clone(),
+            crate::model::TaskState::Paused => self.status_paused.clone(),
+            crate::model::TaskState::Completed => self.status_completed.clone(),
+            crate::model::TaskState::Failed => self.status_error.clone(),
+        }
+    }
+
+    pub(crate) fn date_bucket_label(
+        &self,
+        bucket: crate::model::view_prefs::DateBucket,
+    ) -> SharedString {
+        use crate::model::view_prefs::DateBucket;
+        match bucket {
+            DateBucket::Today => self.today.clone(),
+            DateBucket::Yesterday => self.yesterday.clone(),
+            DateBucket::ThisWeek => self.this_week.clone(),
+            DateBucket::ThisMonth => self.this_month.clone(),
+            DateBucket::Older => self.older.clone(),
+        }
+    }
+
+    /// 分类显示名：内置项走 i18n（`categoryVideo`…），自定义项用 `name`。
+    pub(crate) fn category_label(
+        &self,
+        dto: &fluxdown_protocol::CustomCategoryDto,
+    ) -> SharedString {
+        match dto.builtin_type.as_deref() {
+            Some("all") => self.status_all.clone(),
+            Some("video") => self.category_video.clone(),
+            Some("audio") => self.category_audio.clone(),
+            Some("document") => self.category_document.clone(),
+            Some("image") => self.category_image.clone(),
+            Some("program") => self.category_program.clone(),
+            Some("archive") => self.category_archive.clone(),
+            Some("other") => self.category_other.clone(),
+            _ => SharedString::from(dto.name.clone()),
+        }
+    }
+
+    /// 无 host 任务的站点标签：BT 用「BT · Magnet」，其余 `—`。
+    pub(crate) fn site_unknown(&self, task: &crate::model::DownloadTaskView) -> SharedString {
+        if task.protocol == crate::model::TaskProtocol::Bt {
+            self.site_bt.clone()
+        } else {
+            SharedString::from("—")
+        }
+    }
+
+    /// 完整本地时间 `YYYY-MM-DD HH:MM:SS`（Unix 秒）：列表「创建时间」列与任务详情共用。
+    pub(crate) fn format_datetime(timestamp_secs: i64) -> SharedString {
+        use chrono::{Local, TimeZone};
+        Local
+            .timestamp_opt(timestamp_secs, 0)
+            .single()
+            .map(|at| SharedString::from(at.format("%Y-%m-%d %H:%M:%S").to_string()))
+            .unwrap_or_else(|| SharedString::from("—"))
+    }
 }
 
 /// 「新建下载」表单文案，键集与 `lib/src/widgets/new_download_dialog.dart` 一致。
 #[derive(Clone)]
 pub(crate) struct NewDownloadStrings {
-    pub(crate) title: SharedString,
     pub(crate) subtitle: SharedString,
     pub(crate) url_label: SharedString,
     pub(crate) url_placeholder: SharedString,
@@ -130,6 +343,8 @@ pub(crate) struct NewDownloadStrings {
     pub(crate) http_auth_user: SharedString,
     pub(crate) http_auth_password: SharedString,
     pub(crate) http_auth_save: SharedString,
+    pub(crate) capture_auth_hint: SharedString,
+    pub(crate) capture_context_hint: SharedString,
     pub(crate) proxy: SharedString,
     pub(crate) proxy_desc: SharedString,
     pub(crate) proxy_placeholder: SharedString,
@@ -173,7 +388,6 @@ pub(crate) struct NewDownloadStrings {
 impl NewDownloadStrings {
     pub(crate) fn from_translator(translator: &Translator) -> Self {
         Self {
-            title: shared(translator.text(keys::NEW_DOWNLOAD)),
             subtitle: shared(translator.text("batchDownloadDesc")),
             url_label: shared(translator.text("downloadUrl")),
             url_placeholder: shared(translator.text("batchUrlPlaceholder")),
@@ -199,6 +413,8 @@ impl NewDownloadStrings {
             http_auth_user: shared(translator.text("taskHttpAuthUser")),
             http_auth_password: shared(translator.text("taskHttpAuthPassword")),
             http_auth_save: shared(translator.text("taskHttpAuthSaveForSite")),
+            capture_auth_hint: shared(translator.text("newDownloadCaptureAuthHint")),
+            capture_context_hint: shared(translator.text("newDownloadCaptureContextHint")),
             proxy: shared(translator.text("taskProxy")),
             proxy_desc: shared(translator.text("taskProxyDesc")),
             proxy_placeholder: shared(translator.text("taskProxyPlaceholder")),
@@ -281,4 +497,32 @@ impl NewDownloadStrings {
 
 fn shared(value: &str) -> SharedString {
     SharedString::from(value.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Local, TimeZone};
+
+    use super::DownloadStrings;
+
+    #[test]
+    fn datetime_keeps_seconds_across_midnight_and_rejects_out_of_range() {
+        let before = Local
+            .with_ymd_and_hms(2026, 3, 18, 23, 59, 59)
+            .single()
+            .expect("valid local time");
+        let after = Local
+            .with_ymd_and_hms(2026, 3, 19, 0, 0, 0)
+            .single()
+            .expect("valid local time");
+        assert_eq!(
+            DownloadStrings::format_datetime(before.timestamp()).as_ref(),
+            "2026-03-18 23:59:59"
+        );
+        assert_eq!(
+            DownloadStrings::format_datetime(after.timestamp()).as_ref(),
+            "2026-03-19 00:00:00"
+        );
+        assert_eq!(DownloadStrings::format_datetime(i64::MAX).as_ref(), "—");
+    }
 }
