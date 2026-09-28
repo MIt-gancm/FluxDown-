@@ -501,15 +501,16 @@ class _RssManagerDialogState extends State<RssManagerDialog> {
                         ),
                       ),
                       const SizedBox(width: 4),
-                      Tooltip(
-                        message: s.selectSaveDir,
-                        child: ShadButton.ghost(
+                      ShadTooltip(
+                        effects: const [],
+                        builder: (_) => Text(s.selectSaveDir),
+                        child: ShadIconButton.ghost(
+                          icon: Icon(
+                            LucideIcons.folderOpen,
+                            size: 15,
+                            color: c.textSecondary,
+                          ),
                           onPressed: _isPickingSaveDir ? null : _pickSaveDir,
-                          size: ShadButtonSize.sm,
-                          width: 32,
-                          height: 32,
-                          padding: EdgeInsets.zero,
-                          child: Icon(LucideIcons.folderOpen, size: 15),
                         ),
                       ),
                     ],
