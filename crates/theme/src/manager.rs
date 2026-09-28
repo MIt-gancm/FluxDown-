@@ -327,7 +327,7 @@ fn install(
         let base_theme = gpui_base::Theme::global_mut(cx);
         base_theme.tokens = tokens.clone();
         // 面板分隔把手（侧栏|内容、详情面板）与其他结构线一致用 hairline。
-        base_theme.resizable.handle = extended.colors.hairline;
+        base_theme.resizable.handle = Some(extended.colors.hairline);
     }
     cx.set_global(FluxThemeState {
         documents,

@@ -69,6 +69,7 @@ mod legacy {
         colors.accent = accent.alpha(colors.accent.a);
         colors.accent_foreground = accent;
         colors.ring = accent;
+        colors.selection = accent.alpha(0.3);
     }
 
     pub fn ensure_primary_contrast(tokens: &mut SemanticThemeTokens, dark: bool) {
@@ -93,6 +94,8 @@ mod legacy {
         colors.primary = primary;
         colors.accent_foreground = primary;
         colors.ring = primary;
+        // `colors.textSelection` 引用解析后的 primary，对比度调整后随之变化。
+        colors.selection = primary.alpha(0.3);
     }
 
     pub fn scale_tokens(tokens: &mut SemanticThemeTokens, scale: f32) {
@@ -370,6 +373,7 @@ fn default_light_colors_match_flutter_tokens() {
             border: color(0xE4E4E7),
             input: color(0xE4E4E7),
             ring: color(0x3B82F6),
+            selection: color_with_alpha(0x3B82F6, 0.3),
         }
     );
 }
@@ -396,6 +400,7 @@ fn default_dark_colors_match_flutter_tokens() {
             border: color(0x48484A),
             input: color(0x48484A),
             ring: color(0x3B82F6),
+            selection: color_with_alpha(0x3B82F6, 0.3),
         }
     );
 }

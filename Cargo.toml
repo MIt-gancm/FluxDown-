@@ -11,11 +11,13 @@ members = ["native/*", "crates/*", "scripts/desktop-dev"]
 edition = "2024"
 
 [workspace.dependencies]
-gpui = { version = "0.2.2", git = "https://github.com/zed-industries/zed" }
-gpui_platform = { git = "https://github.com/zed-industries/zed" }
-gpui-base = { git = "https://github.com/longbridge/gpui-component", rev = "334bbed2e8c47d606eb79ab05ddcebd60b823429" }
-gpui-component = { git = "https://github.com/longbridge/gpui-component", rev = "334bbed2e8c47d606eb79ab05ddcebd60b823429" }
-gpui-component-assets = { git = "https://github.com/longbridge/gpui-component", rev = "334bbed2e8c47d606eb79ab05ddcebd60b823429" }
+# GPUI 走 gpui-kit 发布时精确锁定的 `gpui-pre` 快照；升级 gpui-kit 时必须同步到它
+# `Cargo.toml` 里的同一 `=` 版本，否则 gpui-component 可能与 GPUI API 不匹配。
+gpui = { package = "gpui-pre", version = "=0.3.7" }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }
+gpui-base = "0.7.0"
+gpui-component = "0.7.0"
+gpui-component-assets = { package = "gpui-kit-assets", version = "0.7.0" }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 thiserror = "2.0"
@@ -34,10 +36,10 @@ codegen-units = 16
 debug = "limited"
 split-debuginfo = "unpacked"
 
-[profile.dev.package.gpui]
+[profile.dev.package.gpui-pre]
 opt-level = 3
 
-[profile.dev.package.gpui_platform]
+[profile.dev.package.gpui-pre-platform]
 opt-level = 3
 
 # BT 数据面（逐字节 RC4、逐消息解析、MSE DH 大数运算）在 opt-level 0 下慢一个数量级：

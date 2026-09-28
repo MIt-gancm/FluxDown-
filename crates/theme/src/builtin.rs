@@ -236,6 +236,10 @@ impl BuiltinThemeId {
     }
 }
 
+/// 文本选区底色相对强调色的透明度，与注册表 `colors.textSelection` 的默认
+/// `RefAlpha("colors.primary", 0.3)` 一致。
+const TEXT_SELECTION_ALPHA: f32 = 0.3;
+
 /// Flutter Layer0 → Base 语义 token 的固定映射。
 fn color_tokens(palette: &Palette) -> ColorTokens {
     let accent = color(palette.accent);
@@ -259,6 +263,7 @@ fn color_tokens(palette: &Palette) -> ColorTokens {
         border: color(palette.border),
         input: color(palette.border),
         ring: accent,
+        selection: accent.alpha(TEXT_SELECTION_ALPHA),
     }
 }
 
@@ -286,6 +291,7 @@ fn apply_accent(colors: &mut ColorTokens, accent: Hsla) {
     colors.accent = accent.alpha(colors.accent.a);
     colors.accent_foreground = accent;
     colors.ring = accent;
+    colors.selection = accent.alpha(TEXT_SELECTION_ALPHA);
 }
 
 /// Flutter `_foregroundFor`：强调色相对亮度 > 0.5 取近黑，否则取白。

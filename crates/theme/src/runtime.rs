@@ -100,6 +100,9 @@ impl ResolvedTheme {
             };
             slot.set(&value);
         }
+        // Base `selection` 不是独立注册表 token：它与扩展 `colors.textSelection`
+        // 同义，统一由后者投影，保证 Base 选区与 gpui-component 选区同色。
+        theme.base.colors.selection = theme.extended.colors.text_selection;
         if theme.base.typography.mono.as_ref() == MONO_FONT_SENTINEL {
             theme.base.typography.mono = TypographyTokens::default().mono;
         }

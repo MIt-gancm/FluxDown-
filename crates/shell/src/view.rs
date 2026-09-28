@@ -217,7 +217,7 @@ impl AuxiliaryWindowView {
 }
 
 impl Render for AuxiliaryWindowView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = active_theme(cx).tokens().colors;
         v_flex()
             .size_full()
@@ -233,9 +233,6 @@ impl Render for AuxiliaryWindowView {
                     .bg(colors.surface)
                     .child(self.content.clone()),
             )
-            .children(gpui_component::Root::render_sheet_layer(window, cx))
-            .children(gpui_component::Root::render_dialog_layer(window, cx))
-            .children(gpui_component::Root::render_notification_layer(window, cx))
     }
 }
 
@@ -502,7 +499,7 @@ impl ShellView {
 }
 
 impl Render for ShellView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let colors = active_theme(cx).tokens().colors;
         v_flex()
             .size_full()
@@ -525,8 +522,5 @@ impl Render for ShellView {
                             .child(self.active_content()),
                     ),
             )
-            .children(gpui_component::Root::render_sheet_layer(window, cx))
-            .children(gpui_component::Root::render_dialog_layer(window, cx))
-            .children(gpui_component::Root::render_notification_layer(window, cx))
     }
 }
