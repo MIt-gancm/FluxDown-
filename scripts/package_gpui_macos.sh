@@ -173,7 +173,8 @@ else
   IDENTITY=-
   echo "!! no signing identity: ad-hoc signing (not distributable)"
 fi
-sign() { codesign --force "${SIGN_ARGS[@]}" -s "$IDENTITY" "$@"; }
+# macOS 自带 bash 3.2 在 `set -u` 下展开空数组会报 unbound variable（ad-hoc 签名时 SIGN_ARGS 为空）。
+sign() { codesign --force ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} -s "$IDENTITY" "$@"; }
 
 echo "== sign ($IDENTITY)"
 sign -i "$HOST_ID.daemon" "$HELPER/Contents/MacOS/fluxdownd"
