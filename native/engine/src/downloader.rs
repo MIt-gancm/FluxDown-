@@ -318,6 +318,10 @@ pub struct DownloadParams {
     /// 非 Auto 模式 / 无候选代理 / 一次性 failover 链路 / 忽略 TLS 错误——
     /// 单路径，多段路径零行为变化。
     pub auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
+    /// 多网卡聚合的任务级输入（全局开关打开时由 manager 构造，见
+    /// [`crate::multi_nic::MultiNicInput`]）。`None` = 功能关闭，多段路径零
+    /// 行为变化。
+    pub multi_nic: Option<std::sync::Arc<crate::multi_nic::MultiNicInput>>,
     /// 无人值守任务（`tasks.unattended`，RSS/免打扰接管创建）：HLS/DASH
     /// 画质选择跳过 `HostSelection` 弹窗，直接取最高码率（与超时默认值
     /// 一致）。仅 HLS/DASH 路径读取；BT 文件选择在创建时已落库，不经此。
@@ -952,7 +956,24 @@ pub fn build_pinned_client(
         proxy_config,
         user_agent,
         ignore_tls_errors,
-        Some((host, ip)),
+        ClientRoute::Pinned { host, ip },
+    )
+}
+
+/// 构建出口绑定到指定网卡的直连下载 client（多网卡聚合的额外链路）。与
+/// [`build_client_with_tls_policy`] 同参装配（UA/TLS/池参数逐项一致、恒不走
+/// 代理），仅追加出口绑定与按链路地址族过滤的 DNS 解析，见
+/// [`crate::multi_nic`]「出口绑定」。
+pub fn build_link_client(
+    user_agent: &str,
+    ignore_tls_errors: bool,
+    link: &crate::multi_nic::LinkBinding,
+) -> Result<Client, DownloadError> {
+    build_client_inner(
+        &crate::proxy_config::ProxyConfig::default(),
+        user_agent,
+        ignore_tls_errors,
+        ClientRoute::Link(link),
     )
 }
 
@@ -965,17 +986,32 @@ pub fn build_client_with_tls_policy(
     user_agent: &str,
     ignore_tls_errors: bool,
 ) -> Result<Client, DownloadError> {
-    build_client_inner(proxy_config, user_agent, ignore_tls_errors, None)
+    build_client_inner(
+        proxy_config,
+        user_agent,
+        ignore_tls_errors,
+        ClientRoute::Default,
+    )
 }
 
-/// 共享装配核心：[`build_client_with_tls_policy`] 与 [`build_pinned_client`]
-/// 的唯一实现体。`pin = Some((host, ip))` 时追加 `.resolve()` DNS 钉定，
-/// 其余配置两者逐字节相同（代理/UA/TLS/池参数绝不允许分叉）。
+/// client 的出口/解析定制（除此之外所有构建产物逐字节相同）。
+enum ClientRoute<'a> {
+    /// 系统 DNS + 系统路由。
+    Default,
+    /// DNS 钉定到 `ip`（多 CDN 节点池的 pinned client）。
+    Pinned { host: &'a str, ip: std::net::IpAddr },
+    /// 出口绑定到指定网卡（多网卡聚合的额外链路）。
+    Link(&'a crate::multi_nic::LinkBinding),
+}
+
+/// 共享装配核心：[`build_client_with_tls_policy`]、[`build_pinned_client`] 与
+/// [`build_link_client`] 的唯一实现体。`route` 只追加 DNS 钉定或出口绑定，
+/// 其余配置三者逐字节相同（代理/UA/TLS/池参数绝不允许分叉）。
 fn build_client_inner(
     proxy_config: &crate::proxy_config::ProxyConfig,
     user_agent: &str,
     ignore_tls_errors: bool,
-    pin: Option<(&str, std::net::IpAddr)>,
+    route: ClientRoute<'_>,
 ) -> Result<Client, DownloadError> {
     use crate::proxy_config::{ProxyMode, detect_system_proxy};
 
@@ -1125,9 +1161,15 @@ fn build_client_inner(
         }
     }
 
-    // --- DNS 钉定（多 CDN 节点池的 pinned client）---
-    if let Some((host, ip)) = pin {
-        builder = builder.resolve(host, std::net::SocketAddr::new(ip, 0));
+    // --- DNS 钉定（多 CDN 节点池）/ 出口绑定（多网卡聚合）---
+    match route {
+        ClientRoute::Default => {}
+        ClientRoute::Pinned { host, ip } => {
+            builder = builder.resolve(host, std::net::SocketAddr::new(ip, 0));
+        }
+        ClientRoute::Link(link) => {
+            builder = crate::multi_nic::bind_to_link(builder, link);
+        }
     }
 
     let client = builder.build()?;
@@ -3242,6 +3284,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             p.spawn_gen,
             allow_hint_uncap,
             p.auto_proxy.clone(),
+            p.multi_nic.clone(),
         )
         .await;
 
@@ -3269,7 +3312,14 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                         p.sink.emit(crate::events::EngineEvent::TaskCdnEvent {
                             task_id: p.task_id.clone(),
                             kind: "summary".to_string(),
-                            host: nodes_for_summary.host().to_string(),
+                            host: if nodes_for_summary.host().is_empty() {
+                                reqwest::Url::parse(&p.url)
+                                    .ok()
+                                    .and_then(|u| u.host_str().map(str::to_string))
+                                    .unwrap_or_default()
+                            } else {
+                                nodes_for_summary.host().to_string()
+                            },
                             nodes: stats,
                             ip: String::new(),
                             reason: String::new(),
@@ -4442,6 +4492,7 @@ async fn download_multi_segment(
     spawn_gen: i64,
     allow_hint_uncap: bool,
     auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
+    multi_nic: Option<std::sync::Arc<crate::multi_nic::MultiNicInput>>,
 ) -> Result<i64, DownloadError> {
     output::ensure_parent(dest).await?;
 
@@ -4478,6 +4529,7 @@ async fn download_multi_segment(
         spawn_gen,
         allow_hint_uncap,
         auto_proxy,
+        multi_nic,
     )
     .await
 }

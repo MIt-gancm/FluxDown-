@@ -179,6 +179,7 @@ fn make_params(
         spawn_gen,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         task_id: "tpr".to_string(),
         url: format!("{base}/video"),
         save_dir: work_dir.to_string_lossy().to_string(),

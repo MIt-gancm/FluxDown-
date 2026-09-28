@@ -1450,6 +1450,8 @@ fn activity_kind_key(kind: &str) -> &'static str {
         "cdn_breaker" => "detailActivityKindCdnBreaker",
         "cdn_fallback" => "detailActivityKindCdnFallback",
         "cdn_summary" => "detailActivityKindCdnSummary",
+        "nic_links" => "detailActivityKindNicLinks",
+        "nic_off" => "detailActivityKindNicOff",
         "retry" => "detailActivityKindRetry",
         "journal_overflow" => "detailActivityKindJournalOverflow",
         _ => "detailActivityKindUnknown",

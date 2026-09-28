@@ -1,5 +1,6 @@
 //! coordinator 侧的多路径调度状态：连接窗口采样 → 路径估计、冷路径探索、
-//! 完成时间抢占、`ProxyMode::Auto` 主导链路标签与跨任务先验回写。
+//! 完成时间抢占、`ProxyMode::Auto` 主导链路标签与跨任务先验回写、多网卡
+//! 额外链路的后台规划与挂载。
 //!
 //! 判据全部来自 [`crate::path_scheduler`]；路径选择本身在
 //! [`crate::cdn::NodePool::lease_for`]。本模块只在每个完整 ramp 窗口被
@@ -15,6 +16,8 @@ use crate::cdn::NodePool;
 use crate::db::Db;
 use crate::events::{EngineEvent, EventSink};
 use crate::logger::{log_error, log_info};
+use crate::model::CdnNodeInfo;
+use crate::multi_nic::{MultiNicInput, PreparedLinks};
 use crate::path_scheduler::{MIN_SAMPLE_WINDOWS, completion_secs, should_preempt, window_rate};
 
 /// 剩余字节低于此值不再探索冷路径——探索连接来不及进入稳态。
@@ -93,17 +96,45 @@ impl RouteLabeler {
     }
 }
 
+/// 多网卡额外链路的规划状态。
+enum LinkState {
+    /// 功能关闭或已处理完毕。
+    Idle,
+    /// 后台规划中（解析目标 + 枚举网卡 + 构建绑定 client）。
+    Pending(tokio::task::JoinHandle<PreparedLinks>),
+}
+
 /// coordinator 侧多路径状态（每次 `run_coordinated_download` 一份）。
 pub(super) struct Multipath {
     tracks: HashMap<u64, Track>,
     labeler: Option<RouteLabeler>,
     quiet_ticks: u32,
+    links: LinkState,
+    /// 目标 host（链路规划完成后填入；补齐无 sink 池暂存事件的归属）。
+    link_host: String,
+}
+
+impl Drop for Multipath {
+    fn drop(&mut self) {
+        // 下载先于规划结束：链路已无用武之地，不让后台任务继续构建 client。
+        if let LinkState::Pending(handle) = &self.links {
+            handle.abort();
+        }
+    }
 }
 
 impl Multipath {
     /// 构造并（Auto 任务）为每条备选路径构建 client 挂入节点池。client
-    /// 构建失败的路径跳过（与该路径不存在等价）。
-    pub(super) fn new(ctx: Option<Arc<AutoProxyCtx>>, nodes: &NodePool, task_id: &str) -> Self {
+    /// 构建失败的路径跳过（与该路径不存在等价）。多网卡聚合开启时在后台
+    /// 发起链路规划，结果由 [`Self::poll_links`] 在窗口边界挂入——首连接
+    /// 不等待 DNS/网卡枚举。
+    pub(super) fn new(
+        ctx: Option<Arc<AutoProxyCtx>>,
+        multi_nic: Option<Arc<MultiNicInput>>,
+        url: &str,
+        nodes: &NodePool,
+        task_id: &str,
+    ) -> Self {
         let labeler = ctx.map(|ctx| {
             let mut alternates = Vec::with_capacity(ctx.alternates.len());
             for alt in &ctx.alternates {
@@ -138,11 +169,102 @@ impl Multipath {
                 pinned: false,
             }
         });
+        let links = match multi_nic {
+            Some(input) => {
+                let url = url.to_string();
+                LinkState::Pending(tokio::spawn(async move {
+                    crate::multi_nic::prepare_links(&url, &input).await
+                }))
+            }
+            None => LinkState::Idle,
+        };
         Self {
             tracks: HashMap::new(),
             labeler,
             quiet_ticks: 0,
+            links,
+            link_host: String::new(),
         }
+    }
+
+    /// 窗口边界驱动：链路规划完成则挂入节点池并发 `links` / `links_off`
+    /// 事件；随后转发池内暂存的节点事件（无 sink 的单节点池挂了链路时，
+    /// 租约快照/踢除事件在此补齐任务归属后发出）。
+    pub(super) async fn poll_links(
+        &mut self,
+        nodes: &NodePool,
+        sink: &dyn EventSink,
+        task_id: &str,
+    ) {
+        if matches!(&self.links, LinkState::Pending(handle) if handle.is_finished())
+            && let LinkState::Pending(handle) = std::mem::replace(&mut self.links, LinkState::Idle)
+        {
+            match handle.await {
+                Ok(prepared) => self.attach_links(prepared, nodes, sink, task_id),
+                Err(e) => log_error!("[multi-nic] task {} 链路规划任务异常: {e}", task_id),
+            }
+        }
+        for mut event in nodes.take_deferred_events() {
+            if let EngineEvent::TaskCdnEvent {
+                task_id: owner,
+                host,
+                ..
+            } = &mut event
+            {
+                if owner.is_empty() {
+                    *owner = task_id.to_string();
+                }
+                if host.is_empty() {
+                    host.clone_from(&self.link_host);
+                }
+            }
+            sink.emit(event);
+        }
+    }
+
+    fn attach_links(
+        &mut self,
+        prepared: PreparedLinks,
+        nodes: &NodePool,
+        sink: &dyn EventSink,
+        task_id: &str,
+    ) {
+        self.link_host = prepared.host;
+        let (kind, reason, infos) = match prepared.outcome {
+            Ok(links) => {
+                let infos: Vec<CdnNodeInfo> = links
+                    .iter()
+                    .map(|(link, _)| CdnNodeInfo {
+                        ip: link.label(),
+                        origin: link.local_ip().map(|ip| ip.to_string()).unwrap_or_default(),
+                        bytes: 0,
+                        ewma_bps: 0,
+                        active: 0,
+                    })
+                    .collect();
+                log_info!(
+                    "[multi-nic] task {} host {} 挂入额外链路: {:?}",
+                    task_id,
+                    self.link_host,
+                    infos.iter().map(|n| n.ip.as_str()).collect::<Vec<_>>()
+                );
+                nodes.add_links(links);
+                ("links", String::new(), infos)
+            }
+            Err(reason) => ("links_off", reason.to_string(), Vec::new()),
+        };
+        sink.emit(EngineEvent::TaskCdnEvent {
+            task_id: task_id.to_string(),
+            kind: kind.to_string(),
+            host: self.link_host.clone(),
+            nodes: infos,
+            ip: String::new(),
+            reason,
+            candidates: 0,
+            alive: 0,
+            cap: 0,
+            auto_cap: false,
+        });
     }
 
     /// 完整 ramp 窗口驱动：采样 → 路径估计 → 探索开关 → 完成时间抢占。
@@ -230,7 +352,7 @@ impl Multipath {
         let Some(best) = nodes.best_measured_rate() else {
             return 0;
         };
-        let mut candidates: Vec<(f64, u64, i32, i64, f64)> = Vec::new();
+        let mut candidates: Vec<(f64, u64, i32, i64, f64, usize)> = Vec::new();
         for (&lease_id, track) in &self.tracks {
             if track.preempted || guards.protected_seg == Some(track.seg_index) {
                 continue;
@@ -255,14 +377,39 @@ impl Multipath {
                     track.seg_index,
                     remaining,
                     rate,
+                    track.node_id,
                 ));
             }
         }
         candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
         let budget = (live_count / 4).max(1);
+        let mut attempts = 0;
         let mut done = 0;
         let mut stalled_nodes: Vec<(usize, f64)> = Vec::new();
-        for (_, lease_id, seg_index, remaining, rate) in candidates.into_iter().take(budget) {
+        // 网卡链路本窗剩余的有效连接 = 在途租约 − 已被抢占但尚未归还的租约
+        // （首次触及时计算）：链路承载独立容量，慢于最优单连接不是交出最后
+        // 一条连接的理由——非停滞连接只在链路仍有其它连接时抢占；停滞连接
+        // 照常抢占并计入扣减。
+        let mut link_left: HashMap<usize, u32> = HashMap::new();
+        for (_, lease_id, seg_index, remaining, rate, node_id) in candidates {
+            if attempts == budget {
+                break;
+            }
+            if let Some(outstanding) = nodes.link_outstanding(node_id) {
+                let left = link_left.entry(node_id).or_insert_with(|| {
+                    let draining = self
+                        .tracks
+                        .values()
+                        .filter(|t| t.preempted && t.node_id == node_id)
+                        .count();
+                    outstanding.saturating_sub(u32::try_from(draining).unwrap_or(u32::MAX))
+                });
+                if rate > 0.0 && *left <= 1 {
+                    continue;
+                }
+                *left = left.saturating_sub(1);
+            }
+            attempts += 1;
             if nodes.preempt(lease_id) {
                 if let Some(track) = self.tracks.get_mut(&lease_id) {
                     track.preempted = true;
@@ -284,7 +431,7 @@ impl Multipath {
             }
         }
         if !stalled_nodes.is_empty() {
-            nodes.observe_window(&stalled_nodes);
+            nodes.observe_stalled(&stalled_nodes);
         }
         done
     }
@@ -299,10 +446,10 @@ impl Multipath {
         }
     }
 
-    /// 备选路径是否承载过流量（为真时连接规模观察混有代理连接，不得学习
-    /// 为源站域名连接上限/起步提示）。
+    /// 备选路径（代理 / 网卡链路）是否承载过流量（为真时连接规模观察混有
+    /// 其它出口的连接，不得学习为源站域名连接上限/起步提示）。
     pub(super) fn alternates_used(&self, nodes: &NodePool) -> bool {
-        self.labeler.is_some() && nodes.alternates_explored()
+        nodes.alternates_explored()
     }
 
     /// 处理代理路径 validator 踢除（记 NoSwitch）并按主导路径（已结束租约
@@ -428,5 +575,83 @@ mod tests {
             l.desired(&[(RoutePath::Direct, 10), (MANUAL, 1)], true),
             route::DIRECT_PINNED
         );
+    }
+
+    type HeldLease = (
+        crate::cdn::node_pool::NodeLease,
+        tokio_util::sync::CancellationToken,
+    );
+
+    /// 主链路单连接 10MB/s（实证）；链路 30 连接 × 1MB/s 的容量让前两次租借
+    /// 落到链路；另挂 6 条不在分段表里的主链路租约，只抬高在途数（抢占预算 = 2）。
+    fn nic_pool_with_two_slow_link_leases() -> (Arc<NodePool>, Vec<HeldLease>) {
+        use crate::cdn::node_pool::LeaseRequest;
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_links(vec![(
+            Arc::new(crate::multi_nic::LinkBinding {
+                name: "en-guard".into(),
+                index: 2,
+                v4: Some("172.20.10.2".parse().unwrap()),
+                v6: None,
+            }),
+            reqwest::Client::new(),
+        )]);
+        pool.observe_window(&[(0, 10e6)]);
+        pool.observe_window(&vec![(1, 1e6); 30]);
+        pool.set_explore(true);
+        let mut held = Vec::new();
+        for seg in 0..8 {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let lease = pool.lease_for(LeaseRequest {
+                seg_index: if seg < 2 { seg } else { 100 + seg },
+                start_downloaded: 0,
+                bytes: i64::MAX,
+                allow_alternates: seg < 2,
+                cancel: cancel.clone(),
+            });
+            if seg < 2 {
+                assert_eq!(lease.route(), RoutePath::Link(2));
+            }
+            held.push((lease, cancel));
+        }
+        (pool, held)
+    }
+
+    #[test]
+    fn slow_link_keeps_its_last_connection_across_preemption_ticks() {
+        let (pool, held) = nic_pool_with_two_slow_link_leases();
+        let mut segments: BTreeMap<i32, LiveSegment> = (0..2)
+            .map(|index| {
+                let start = i64::from(index) * 1_000_000_000;
+                (
+                    index,
+                    LiveSegment {
+                        index,
+                        start_byte: start,
+                        end_byte: start + 999_999_999,
+                        downloaded_bytes: 0,
+                        state: SegState::Active,
+                        rate_bps: None,
+                    },
+                )
+            })
+            .collect();
+        let guards = TickGuards {
+            sampling: true,
+            may_reroute: true,
+            remaining_total: i64::MAX,
+            protected_seg: None,
+        };
+        let mut mp = Multipath::new(None, None, "https://example.com/f", &pool, "t");
+        // 每窗 1s 下 1MB：稳态 1MB/s，远慢于最优 10MB/s 的一半 → 两条都满足抢占判据；
+        // 被抢占的租约在测试里一直未归还，模拟 worker 尚未退出的交接窗口。
+        for _ in 0..6 {
+            for seg in segments.values_mut() {
+                seg.downloaded_bytes += 1_000_000;
+            }
+            mp.on_tick(&pool, &mut segments, Duration::from_secs(1), &guards, "t");
+        }
+        let cancelled = held[..2].iter().filter(|(_, c)| c.is_cancelled()).count();
+        assert_eq!(cancelled, 1, "链路两条慢连接只能交出一条，最后一条保留");
     }
 }

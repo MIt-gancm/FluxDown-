@@ -74,6 +74,9 @@ librqbit = { version = "9", default-features = false, features = ["rust-tls"] }
 # 提供公共 CA 兜底，避免系统证书探测返回空库时所有 HTTPS 请求 UnknownIssuer。
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "cookies", "json", "socks", "charset", "http2", "system-proxy", "macos-system-configuration"] }
 
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
+if-addrs = "0.15"
+
 [dev-dependencies]
 http = "1.4.0"
 

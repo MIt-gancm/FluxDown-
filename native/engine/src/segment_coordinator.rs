@@ -1388,6 +1388,9 @@ pub async fn run_coordinated_download(
     // `ProxyMode::Auto` 任务的多路径上下文（None = 非 Auto/无候选/一次性
     // failover 链路——单路径，只做连接窗口采样与均衡拆分）。
     auto_proxy: Option<Arc<crate::auto_proxy::AutoProxyCtx>>,
+    // 多网卡聚合输入（None = 功能关闭）。额外链路在后台规划，首个完整 ramp
+    // 窗口挂入节点池，不推迟首连接。
+    multi_nic: Option<Arc<crate::multi_nic::MultiNicInput>>,
 ) -> Result<i64, DownloadError> {
     // ----- 0. Defensive checks ------------------------------------------------
     if total_bytes <= 0 {
@@ -1847,7 +1850,7 @@ pub async fn run_coordinated_download(
 
     // ---- 多路径调度（ProxyMode::Auto 的备选路径在首个 worker 租借前挂入
     // 节点池，先验占优的路径起飞即被选中；非 Auto 任务只做窗口采样）----
-    let mut multipath = multipath::Multipath::new(auto_proxy, &nodes, task_id);
+    let mut multipath = multipath::Multipath::new(auto_proxy, multi_nic, url, &nodes, task_id);
 
     // worker 生成上下文：启动与 ramp 扩容共用同一 spawn 路径。
     let ctx = WorkerSpawnCtx {
@@ -2894,6 +2897,9 @@ pub async fn run_coordinated_download(
                     range_verdict.load(Ordering::Relaxed) == RANGE_VERDICT_SUPPORTED;
                 let limiter_active = speed_limiter.limit() > 0;
                 sync_downloaded_from_shared(&mut segments, &seg_states);
+                // 多网卡聚合：后台规划完成后在本窗挂入额外链路（冷路径，随后
+                // 由下方探索逻辑各放 1 条真实分段连接实测）。
+                multipath.poll_links(&nodes, sink, task_id).await;
                 let mp_report = multipath.on_tick(
                     &nodes,
                     &mut segments,

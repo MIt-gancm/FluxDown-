@@ -1,12 +1,14 @@
-//! `NodePool` / `NodeLease`：多路径（直连 SYS / 多 CDN 钉定节点 / 候选代理）
-//! 的连接租借池。
+//! `NodePool` / `NodeLease`：多路径（直连 SYS / 多 CDN 钉定节点 / 候选代理 /
+//! 多网卡额外链路）的连接租借池。
 //!
 //! 池内 node[0] 恒为 **SYS 节点**（任务 client：Auto 任务按起飞路径是直连
 //! 或代理）——所有其它槽位被踢除后自动退到 SYS，任何情况下不比现状差
-//! （方案不变量 1）。其余槽位两类：
+//! （方案不变量 1）。其余槽位三类：
 //! - **钉定节点**（`ip = Some`）：直连路径上的多 CDN 候选 IP，懒建 client；
 //! - **备选路径**（`ip = None`，`route` 与 SYS 不同）：`ProxyMode::Auto`
-//!   的候选代理（或代理起飞任务的直连回路），构造时注入 client。
+//!   的候选代理（或代理起飞任务的直连回路），构造时注入 client；
+//! - **网卡链路**（`route = Link`）：多网卡聚合的额外出口，构造时注入绑定
+//!   出口的 client。
 //!
 //! 调度（[`NodePool::lease_for`]）全部确定性、无随机，判据见
 //! [`crate::path_scheduler`]：
@@ -16,8 +18,14 @@
 //! - **分散**：竞争集内 per-节点并发上限 `cap = ceil((租约+1)/竞争集大小)`
 //!   避免全部 worker 涌向当前最优节点（aria2#808：per-IP 限速下分散本身
 //!   就是收益），上限内选 `score = 估计 × 0.5^连续失败数` 最高者。
+//! - **独立容量均衡**（网卡链路）：链路之间不共享瓶颈，不适用竞争集。
+//!   每条链路（主链路 = 全部非链路槽位）容量 = 单连接估计 × 上窗实测
+//!   连接数，新租约给「容量 /（在途 + 1）」最高者（注水式分配，连接数随
+//!   容量成比例）；容量占比 ≥ [`crate::path_scheduler::LINK_FLOOR_SHARE`]
+//!   的空闲链路在可探索时保底 1 条连接。
 //! - 踢除：非 SYS 槽位连续失败 ≥3 或 validator 不一致（立即）→ 本任务内
-//!   不再选中；钉定节点跨任务由持久化健康度 TTL 衰减自然恢复。
+//!   不再选中；钉定节点跨任务由持久化健康度 TTL 衰减自然恢复；网卡链路
+//!   记入 [`crate::multi_nic`] 近期失败记忆。
 //!
 //! 速率估计由 coordinator 每个 ramp 窗口以连接稳态样本喂入
 //! （[`NodePool::observe_window`]）；段完成回报只为尚未被窗口实测的槽位
@@ -41,6 +49,7 @@ use crate::db::Db;
 use crate::downloader::DownloadError;
 use crate::events::{EngineEvent, EventSink};
 use crate::logger::log_info;
+use crate::multi_nic::LinkBinding;
 use crate::proxy_config::ProxyConfig;
 
 /// 段完成回报喂估计时的 EWMA 平滑系数（新样本权重）。
@@ -102,6 +111,10 @@ struct NodeSlot {
     /// 本任务经该节点实际传输的字节数（租约结束时由 worker 回报，含失败/
     /// 被抢占的租约；喂 `kind="summary"` 事件与主导路径判定）。
     bytes_done: u64,
+    /// 网卡链路的出口绑定（非链路槽位为 `None`）。
+    link: Option<Arc<LinkBinding>>,
+    /// 最近一个有样本的窗口里该槽位的实测连接数（链路容量 = 估计 × 此值）。
+    window_conns: u32,
 }
 
 impl NodeSlot {
@@ -125,11 +138,18 @@ impl NodeSlot {
             outstanding: 0,
             origin: String::new(),
             bytes_done: 0,
+            link: None,
+            window_conns: 0,
         }
     }
 
     fn score(&self) -> f64 {
         self.ewma_bps * 0.5f64.powi(self.fail_streak.min(60) as i32)
+    }
+
+    /// 槽位承载的容量估计：单连接估计 × 上窗实测连接数（未实测按 1 条）。
+    fn capacity(&self) -> f64 {
+        self.score() * f64::from(self.window_conns.max(1))
     }
 }
 
@@ -157,6 +177,8 @@ struct PoolInner {
     live: HashMap<u64, LiveConn>,
     /// 因 validator 不一致被踢除的代理路径（coordinator 取走后记 NoSwitch）。
     validator_kicked: Vec<RoutePath>,
+    /// 无 sink 的池挂了网卡链路时暂存的节点事件（coordinator 每窗转发）。
+    deferred: Vec<EngineEvent>,
 }
 
 /// 多路径节点池。见模块文档。
@@ -204,6 +226,7 @@ pub struct NodeLease {
     client: Client,
     ip: Option<IpAddr>,
     route: RoutePath,
+    link: Option<Arc<LinkBinding>>,
 }
 
 impl NodeLease {
@@ -234,7 +257,7 @@ impl NodeLease {
 
     /// 诊断用节点描述。
     pub fn describe(&self) -> String {
-        slot_label(self.node_id, self.ip, self.route)
+        slot_label(self.node_id, self.ip, self.route, self.link.as_deref())
     }
 }
 
@@ -257,14 +280,22 @@ impl Drop for NodeLease {
     }
 }
 
-/// 槽位的诊断/事件标签：钉定 IP、`PROXY:manual|system`、`DIRECT`（代理
-/// 起飞任务的直连回路）或 `SYS`。
-fn slot_label(node_id: usize, ip: Option<IpAddr>, route: RoutePath) -> String {
+/// 槽位的诊断/事件标签：钉定 IP、`PROXY:manual|system`、`NIC:<网卡名>`、
+/// `DIRECT`（代理起飞任务的直连回路）或 `SYS`。
+fn slot_label(
+    node_id: usize,
+    ip: Option<IpAddr>,
+    route: RoutePath,
+    link: Option<&LinkBinding>,
+) -> String {
     match (ip, route) {
         (Some(ip), _) => ip.to_string(),
         (None, _) if node_id == 0 => "SYS".to_string(),
         (None, RoutePath::Proxy(CandidateSource::ManualFields)) => "PROXY:manual".to_string(),
         (None, RoutePath::Proxy(CandidateSource::System)) => "PROXY:system".to_string(),
+        (None, RoutePath::Link(index)) => {
+            link.map_or_else(|| format!("NIC:#{index}"), LinkBinding::label)
+        }
         (None, RoutePath::Direct) => "DIRECT".to_string(),
     }
 }
@@ -294,6 +325,7 @@ impl NodePool {
                 last_leases_sig: Vec::new(),
                 live: HashMap::new(),
                 validator_kicked: Vec::new(),
+                deferred: Vec::new(),
             }),
         })
     }
@@ -364,6 +396,40 @@ impl NodePool {
             slot.cold = prior.is_none();
             inner.slots.push(slot);
         }
+    }
+
+    /// 多网卡聚合：挂入额外网卡链路（每条一个预建的绑定出口 client）。链路
+    /// 均为冷路径，经探索（1 条真实分段连接）实测后按独立容量参与均衡。
+    /// 同一网卡重复挂入被忽略。
+    pub fn add_links(&self, links: Vec<(Arc<LinkBinding>, Client)>) {
+        let mut inner = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (link, client) in links {
+            let route = RoutePath::Link(link.index);
+            if inner.slots.iter().any(|s| s.route == route) {
+                continue;
+            }
+            let mut slot = NodeSlot::new(None, route, Some(client), None);
+            slot.cold = true;
+            slot.origin = link.local_ip().map(|ip| ip.to_string()).unwrap_or_default();
+            slot.link = Some(link);
+            inner.slots.push(slot);
+        }
+    }
+
+    /// 网卡链路槽位的在途连接数（非链路槽位为 `None`）。抢占守卫据此保证
+    /// 链路至少留 1 条非停滞连接：链路承载独立容量，慢于最优单连接不是
+    /// 交出最后一条连接的理由。
+    pub fn link_outstanding(&self, node_id: usize) -> Option<u32> {
+        self.inner.lock().ok().and_then(|inner| {
+            inner
+                .slots
+                .get(node_id)
+                .filter(|s| s.route.is_link())
+                .map(|s| s.outstanding)
+        })
     }
 
     /// 是否多节点池（含 ≥1 个钉定或备选槽位，无论是否已被踢）。
@@ -477,7 +543,7 @@ impl NodePool {
                             );
                             slot.kicked = true;
                             if let Some(ip) = slot.ip {
-                                events.push(self.kick_event(ip, "build", 0));
+                                events.push(self.kick_event(ip.to_string(), "build", 0));
                             }
                             if let Some(evt) = self.check_breaker(&mut inner) {
                                 events.push(evt);
@@ -515,6 +581,7 @@ impl NodePool {
                 client,
                 ip: slot.ip,
                 route: slot.route,
+                link: slot.link.clone(),
             };
             // 节点并发分布快照（节流 + 变化检测；详情面板「日志」Tab）。
             if let Some(evt) = self.leases_event_locked(&mut inner) {
@@ -540,12 +607,13 @@ impl NodePool {
 
     /// `kind="leases"` 节点并发快照（持锁调用，事件由调用方在锁外发射）。
     ///
-    /// 门控：多节点池且 sink 存在；各槽位未归还租约数相对上次已发射快照
-    /// 发生变化；距上次发射 ≥ [`LEASES_EMIT_MIN_GAP`]。载荷 `nodes` 只含
-    /// 参与中的槽位（未被踢，或虽被踢但仍有在途租约），`active` = 当前
-    /// 未归还租约数，`bytes`/`ewma_bps` 为该节点截至目前的累计与估计。
+    /// 门控：多节点池且有事件出口（sink 或网卡链路的暂存转发）；各槽位未
+    /// 归还租约数相对上次已发射快照发生变化；距上次发射 ≥
+    /// [`LEASES_EMIT_MIN_GAP`]。载荷 `nodes` 只含参与中的槽位（未被踢，或
+    /// 虽被踢但仍有在途租约），`active` = 当前未归还租约数，`bytes`/
+    /// `ewma_bps` 为该节点截至目前的累计与估计。
     fn leases_event_locked(&self, inner: &mut PoolInner) -> Option<EngineEvent> {
-        if inner.slots.len() < 2 || self.sink.is_none() {
+        if inner.slots.len() < 2 || (self.sink.is_none() && !Self::has_links(&inner.slots)) {
             return None;
         }
         let sig: Vec<u32> = inner.slots.iter().map(|s| s.outstanding).collect();
@@ -592,7 +660,7 @@ impl NodePool {
 
     fn node_info(i: usize, s: &NodeSlot) -> crate::model::CdnNodeInfo {
         crate::model::CdnNodeInfo {
-            ip: slot_label(i, s.ip, s.route),
+            ip: slot_label(i, s.ip, s.route, s.link.as_deref()),
             origin: s.origin.clone(),
             bytes: s.bytes_done.min(i64::MAX as u64) as i64,
             ewma_bps: s.ewma_bps as i64,
@@ -600,15 +668,15 @@ impl NodePool {
         }
     }
 
-    /// 构造一条 `kind="kick"` 事件（`count` = 连续失败次数，validator/build
-    /// 路径为 0）。
-    fn kick_event(&self, ip: IpAddr, reason: &str, count: u32) -> EngineEvent {
+    /// 构造一条 `kind="kick"` 事件（`label` = 节点标签，见 `slot_label`；
+    /// `count` = 连续失败次数，validator/build 路径为 0）。
+    fn kick_event(&self, label: String, reason: &str, count: u32) -> EngineEvent {
         EngineEvent::TaskCdnEvent {
             task_id: self.task_id.clone(),
             kind: "kick".to_string(),
             host: self.host.clone(),
             nodes: Vec::new(),
-            ip: ip.to_string(),
+            ip: label,
             reason: reason.to_string(),
             candidates: count as i32,
             alive: 0,
@@ -617,20 +685,42 @@ impl NodePool {
         }
     }
 
-    /// 锁外批量发射（sink=None 时静默丢弃）。
+    fn has_links(slots: &[NodeSlot]) -> bool {
+        slots.iter().any(|s| s.route.is_link())
+    }
+
+    /// 锁外批量发射。无 sink 的池（单节点池）挂了网卡链路时暂存，由
+    /// coordinator 每窗经 [`Self::take_deferred_events`] 补齐归属后转发；
+    /// 其余无 sink 的池静默丢弃（行为与现状一致）。
     fn emit_all(&self, events: Vec<EngineEvent>) {
+        if events.is_empty() {
+            return;
+        }
         if let Some(sink) = &self.sink {
             for evt in events {
                 sink.emit(evt);
             }
+            return;
+        }
+        if let Ok(mut inner) = self.inner.lock()
+            && Self::has_links(&inner.slots)
+        {
+            inner.deferred.extend(events);
         }
     }
 
+    /// 取走暂存的节点事件（见 [`Self::emit_all`]）。
+    pub fn take_deferred_events(&self) -> Vec<EngineEvent> {
+        self.inner
+            .lock()
+            .map(|mut inner| std::mem::take(&mut inner.deferred))
+            .unwrap_or_default()
+    }
+
     /// 确定性选择（判据见模块文档）：
-    /// 1. 探索：允许时，首个无在途连接的冷路径；
-    /// 2. 竞争集：可用且非冷槽位中，score ≥ 最优 × `COMPETITIVE_RATIO` 者；
-    /// 3. 分散：竞争集内租约数低于 `cap = ceil((竞争集租约+1)/竞争集大小)`
-    ///    者按 score 取最高（同分 → 租约更少 → 编号更小）。
+    /// 1. 探索：允许时，首个无在途连接的冷路径（含冷网卡链路）；
+    /// 2. 主链路内（全部非链路槽位）：竞争集 + 分散，见 [`Self::pick_shared`]；
+    /// 3. 存在网卡链路时再做跨链路独立容量均衡，见 [`Self::pick_across_links`]。
     ///
     /// `allow_alternates = false` 时只在与 SYS 同路径的槽位（SYS + 钉定）内
     /// 选择。SYS 永不被踢、永不为冷，保证恒有解。
@@ -648,7 +738,30 @@ impl NodePool {
         {
             return cold;
         }
-        let known: Vec<usize> = usable.into_iter().filter(|&i| !slots[i].cold).collect();
+        let (links, shared): (Vec<usize>, Vec<usize>) = usable
+            .into_iter()
+            .filter(|&i| !slots[i].cold)
+            .partition(|&i| slots[i].route.is_link());
+        let primary_capacity: f64 = shared.iter().map(|&i| slots[i].capacity()).sum();
+        let primary_outstanding: u32 = shared.iter().map(|&i| slots[i].outstanding).sum();
+        let chosen = Self::pick_shared(slots, shared);
+        if links.is_empty() {
+            return chosen;
+        }
+        Self::pick_across_links(
+            slots,
+            chosen,
+            (primary_capacity, primary_outstanding),
+            &links,
+            explore,
+        )
+    }
+
+    /// 主链路内选择：
+    /// 1. 竞争集：`known` 中 score ≥ 最优 × `COMPETITIVE_RATIO` 者；
+    /// 2. 分散：竞争集内租约数低于 `cap = ceil((竞争集租约+1)/竞争集大小)`
+    ///    者按 score 取最高（同分 → 租约更少 → 编号更小）。
+    fn pick_shared(slots: &[NodeSlot], known: Vec<usize>) -> usize {
         let best = known
             .iter()
             .map(|&i| slots[i].ewma_bps)
@@ -680,6 +793,41 @@ impl NodePool {
                     && (a.outstanding < b.outstanding
                         || (a.outstanding == b.outstanding && i < chosen)));
             if better {
+                chosen = i;
+            }
+        }
+        chosen
+    }
+
+    /// 跨网卡链路的独立容量均衡（注水式）：
+    /// 1. 保底：可探索时，容量占比 ≥ [`crate::path_scheduler::LINK_FLOOR_SHARE`]
+    ///    且无在途连接的链路先拿 1 条（保持其估计新鲜，防被永久饿死）；
+    /// 2. 其余按边际单连接估计 [`crate::path_scheduler::link_marginal`] 取最高，
+    ///    同值留在主链路（`shared_choice`）。
+    fn pick_across_links(
+        slots: &[NodeSlot],
+        shared_choice: usize,
+        (primary_capacity, primary_outstanding): (f64, u32),
+        links: &[usize],
+        explore: bool,
+    ) -> usize {
+        use crate::path_scheduler::{LINK_FLOOR_SHARE, link_marginal};
+        let total_capacity =
+            primary_capacity + links.iter().map(|&i| slots[i].capacity()).sum::<f64>();
+        if explore
+            && let Some(&idle) = links.iter().find(|&&i| {
+                slots[i].outstanding == 0
+                    && slots[i].capacity() >= LINK_FLOOR_SHARE * total_capacity
+            })
+        {
+            return idle;
+        }
+        let mut chosen = shared_choice;
+        let mut best = link_marginal(primary_capacity, primary_outstanding);
+        for &i in links {
+            let marginal = link_marginal(slots[i].capacity(), slots[i].outstanding);
+            if marginal > best {
+                best = marginal;
                 chosen = i;
             }
         }
@@ -760,6 +908,12 @@ impl NodePool {
                         if immediate && matches!(slot.route, RoutePath::Proxy(_)) {
                             validator_kick = Some(slot.route);
                         }
+                        // 网卡链路连续失败（无路由/被上游拒绝）：后续任务暂不再
+                        // 规划它。validator 不一致只说明该出口命中了不同 CDN
+                        // edge，与链路可用性无关，不记忆。
+                        if !immediate && let Some(link) = slot.link.as_deref() {
+                            crate::multi_nic::record_link_failure(link);
+                        }
                         log_info!(
                             "[cdn-pool] host {} 节点 {} 被踢除（{}）",
                             self.host,
@@ -770,11 +924,12 @@ impl NodePool {
                                 format!("连续失败 {streak}")
                             }
                         );
-                        if let Some(ip) = ip {
+                        if ip.is_some() || slot.link.is_some() {
+                            let label = lease.describe();
                             events.push(if immediate {
-                                self.kick_event(ip, "validator", 0)
+                                self.kick_event(label, "validator", 0)
                             } else {
-                                self.kick_event(ip, "fail", streak)
+                                self.kick_event(label, "fail", streak)
                             });
                         }
                         if let Some(evt) = self.check_breaker(&mut inner) {
@@ -817,8 +972,20 @@ impl NodePool {
     }
 
     /// 喂入一个 ramp 窗口的观测：`samples` = (槽位, 单连接稳态 B/s)，同槽位
-    /// 取中位数融合进估计（首个实测样本直接覆盖先验）。
+    /// 取中位数融合进估计（首个实测样本直接覆盖先验），并以样本数刷新该
+    /// 槽位的窗口连接数（链路容量估计的乘数）。
     pub fn observe_window(&self, samples: &[(usize, f64)]) {
+        self.observe(samples, true);
+    }
+
+    /// 喂入被判停滞并抢占的连接（0 速率实证）：只融合速率估计，不改写窗口
+    /// 连接数——同窗 [`Self::observe_window`] 已给出真实连接规模，停滞子集
+    /// 不能把链路容量压成单连接。
+    pub fn observe_stalled(&self, samples: &[(usize, f64)]) {
+        self.observe(samples, false);
+    }
+
+    fn observe(&self, samples: &[(usize, f64)], count_conns: bool) {
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
@@ -839,6 +1006,9 @@ impl NodePool {
             slot.ewma_bps =
                 crate::path_scheduler::blend_rate(slot.ewma_bps, med, slot.measured_windows == 0);
             slot.measured_windows = slot.measured_windows.saturating_add(1);
+            if count_conns {
+                slot.window_conns = u32::try_from(values.len()).unwrap_or(u32::MAX);
+            }
             slot.cold = false;
             slot.evidence = true;
             if let (Some(ip), Some(db)) = (slot.ip, self.db.as_ref()) {
@@ -1420,5 +1590,146 @@ mod tests {
             .filter(|e| matches!(e, EngineEvent::TaskCdnEvent { kind, .. } if kind == "leases"))
             .count();
         assert_eq!(count, 1, "节流窗口内不得重复发射快照");
+    }
+
+    fn nic(name: &str, index: u8) -> Arc<crate::multi_nic::LinkBinding> {
+        Arc::new(crate::multi_nic::LinkBinding {
+            name: name.to_string(),
+            index: u32::from(index),
+            v4: Some(Ipv4Addr::new(172, 20, 10, index)),
+            v6: None,
+        })
+    }
+
+    /// 单节点池 + 一条已实测的网卡链路：主链路 `primary_conns` 条连接各
+    /// `primary_bps`，链路 1 条连接 `link_bps`。
+    fn measured_link_pool(
+        primary_conns: usize,
+        primary_bps: f64,
+        link_bps: f64,
+    ) -> (Arc<NodePool>, usize) {
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_links(vec![(nic("en1", 2), reqwest::Client::new())]);
+        let link = node_of(&pool, RoutePath::Link(2));
+        let mut samples = vec![(0usize, primary_bps); primary_conns];
+        samples.push((link, link_bps));
+        pool.observe_window(&samples);
+        pool.set_explore(true);
+        (pool, link)
+    }
+
+    #[test]
+    fn links_take_connections_in_proportion_to_capacity() {
+        // 主链路容量 80MB/s（8 × 10MB/s），热点 20MB/s（1 × 20MB/s）。
+        let (pool, _) = measured_link_pool(8, 10e6, 20e6);
+        let held: Vec<_> = (0..10).map(|_| pool.lease()).collect();
+        let on_link = held.iter().filter(|l| l.route().is_link()).count();
+        assert_eq!(on_link, 2, "容量 80:20 → 连接 8:2");
+        assert_eq!(held[0].describe(), "NIC:en1", "空闲链路先拿保底连接");
+    }
+
+    #[test]
+    fn saturated_primary_hands_extra_connections_to_a_fast_link() {
+        // 主链路已饱和：8 条连接每条只剩 2MB/s（容量 16MB/s）；热点单连接 30MB/s。
+        let (pool, _) = measured_link_pool(8, 2e6, 30e6);
+        let held: Vec<_> = (0..6).map(|_| pool.lease()).collect();
+        let on_link = held.iter().filter(|l| l.route().is_link()).count();
+        // 注水：30/(n+1) 与 16/(m+1) 交替取大 → 链路拿到多数新连接。
+        assert_eq!(on_link, 4);
+    }
+
+    #[test]
+    fn negligible_link_gets_no_connections() {
+        // 链路容量不足总量 5%：不值得占连接（也不保底）。
+        let (pool, _) = measured_link_pool(8, 10e6, 1e6);
+        let held: Vec<_> = (0..10).map(|_| pool.lease()).collect();
+        assert!(held.iter().all(|l| !l.route().is_link()));
+    }
+
+    #[test]
+    fn cold_link_is_explored_by_one_connection_first() {
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_links(vec![(nic("en1", 2), reqwest::Client::new())]);
+        // 未开放探索：冷链路不被选中。
+        assert_eq!(pool.lease().route(), RoutePath::Direct);
+        pool.set_explore(true);
+        let first = pool.lease();
+        assert_eq!(first.route(), RoutePath::Link(2));
+        let second = pool.lease();
+        assert_eq!(second.route(), RoutePath::Direct, "未实测前不加码冷链路");
+    }
+
+    #[test]
+    fn start_route_only_leases_never_use_links() {
+        let (pool, _) = measured_link_pool(1, 1e6, 50e6);
+        let lease = pool.lease_for(LeaseRequest {
+            seg_index: 0,
+            start_downloaded: 0,
+            bytes: i64::MAX,
+            allow_alternates: false,
+            cancel: CancellationToken::new(),
+        });
+        assert_eq!(
+            lease.route(),
+            RoutePath::Direct,
+            "开放式首段/plain GET 留在主链路"
+        );
+    }
+
+    #[test]
+    fn link_outstanding_is_reported_only_for_link_slots() {
+        let (pool, link) = measured_link_pool(8, 10e6, 20e6);
+        let first = pool.lease();
+        assert_eq!(first.route(), RoutePath::Link(2));
+        assert_eq!(pool.link_outstanding(link), Some(1));
+        assert_eq!(pool.link_outstanding(0), None, "主链路不受链路守卫保护");
+    }
+
+    #[test]
+    fn stalled_observation_keeps_window_connection_count() {
+        let (pool, _) = measured_link_pool(8, 10e6, 20e6);
+        pool.observe_stalled(&[(0, 0.0)]);
+        let sys_conns = pool.inner.lock().unwrap().slots[0].window_conns;
+        assert_eq!(sys_conns, 8, "停滞子集不得把主链路容量压成单连接");
+        pool.observe_window(&[(0, 10e6), (0, 10e6)]);
+        assert_eq!(pool.inner.lock().unwrap().slots[0].window_conns, 2);
+    }
+
+    #[test]
+    fn failing_link_is_kicked_remembered_and_reported() {
+        let binding = nic("en-kick-test", 9);
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_links(vec![(binding.clone(), reqwest::Client::new())]);
+        pool.set_explore(true);
+        let err = DownloadError::Other("connection refused".to_string());
+        for _ in 0..KICK_STREAK {
+            let lease = pool.lease();
+            assert_eq!(
+                lease.route(),
+                RoutePath::Link(9),
+                "冷链路失败后仍按探索重试"
+            );
+            pool.report(&lease, 0, Duration::from_millis(5), Err(&err));
+        }
+        assert_eq!(pool.lease().route(), RoutePath::Direct, "被踢链路不再派工");
+        assert!(
+            crate::multi_nic::is_recently_failed(&binding),
+            "踢除记入跨任务失败记忆"
+        );
+        let kicks: Vec<String> = pool
+            .take_deferred_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::events::EngineEvent::TaskCdnEvent { kind, ip, .. } if kind == "kick" => {
+                    Some(ip)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kicks,
+            vec!["NIC:en-kick-test".to_string()],
+            "无 sink 池暂存踢除事件"
+        );
     }
 }

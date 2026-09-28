@@ -110,19 +110,22 @@ struct HostRoute {
 }
 
 impl HostRoute {
+    /// 网卡链路不持久化先验（拓扑易变、索引跨重启不稳定）。
     fn slot(&self, route: RoutePath) -> Option<PathStat> {
         match route {
             RoutePath::Direct => self.direct,
             RoutePath::Proxy(CandidateSource::ManualFields) => self.manual,
             RoutePath::Proxy(CandidateSource::System) => self.system,
+            RoutePath::Link(_) => None,
         }
     }
 
-    fn slot_mut(&mut self, route: RoutePath) -> &mut Option<PathStat> {
+    fn slot_mut(&mut self, route: RoutePath) -> Option<&mut Option<PathStat>> {
         match route {
-            RoutePath::Direct => &mut self.direct,
-            RoutePath::Proxy(CandidateSource::ManualFields) => &mut self.manual,
-            RoutePath::Proxy(CandidateSource::System) => &mut self.system,
+            RoutePath::Direct => Some(&mut self.direct),
+            RoutePath::Proxy(CandidateSource::ManualFields) => Some(&mut self.manual),
+            RoutePath::Proxy(CandidateSource::System) => Some(&mut self.system),
+            RoutePath::Link(_) => None,
         }
     }
 
@@ -467,14 +470,16 @@ pub(crate) fn path_prior(host: &str, route: RoutePath) -> Option<PathPrior> {
 /// 记录一次路径实测：`per_conn_bps` 为该路径单连接稳态速率（B/s）。
 /// 非有限值或 ≤0 直接忽略。立即落盘。
 pub(crate) fn record_path_rate(host: &str, route: RoutePath, per_conn_bps: f64, db: &Db) {
-    if !per_conn_bps.is_finite() || per_conn_bps <= 0.0 {
+    if !per_conn_bps.is_finite() || per_conn_bps <= 0.0 || route.is_link() {
         return;
     }
     ensure_net_epoch();
     let now = now_unix_secs();
     if let Ok(mut map) = routes().lock() {
         let e = map.entry(host.to_string()).or_default();
-        blend(e.slot_mut(route), per_conn_bps, now);
+        if let Some(slot) = e.slot_mut(route) {
+            blend(slot, per_conn_bps, now);
+        }
     }
     persist(db);
 }

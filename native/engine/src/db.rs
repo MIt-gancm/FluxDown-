@@ -2458,6 +2458,7 @@ impl Db {
             // 大小/并发推导），1..=8 手动。
             ("cdn_multi_enabled", "0"),
             ("cdn_max_nodes", "0"),
+            ("multi_nic_enabled", "0"),
             ("max_concurrent_tasks", "5"),
             ("speed_limit_bytes", "0"),
             // 全局 BT 上传限速（B/s）："0" = 不限。与 speed_limit_bytes

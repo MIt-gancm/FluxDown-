@@ -184,29 +184,36 @@ pub enum EngineEvent {
         error: String,
     },
 
-    /// 多 CDN 并发下载的节点级活动事件（任务详情「日志」Tab 的可观测性）。
-    /// 对应 `hub::signals::TaskCdnEvent`；server → WS `taskCdnEvent`。
-    /// 仅多节点聚合被尝试/生效的任务发出；单节点池路径零事件。
+    /// 多 CDN 并发下载 / 多网卡聚合的节点级活动事件（任务详情「日志」Tab 的
+    /// 可观测性）。对应 `hub::signals::TaskCdnEvent`；server → WS `taskCdnEvent`。
+    /// 仅多节点聚合或多网卡聚合被尝试/生效的任务发出；单节点池路径零事件。
     TaskCdnEvent {
         task_id: String,
         /// 事件类型：
         /// - `"pool"`：多节点池就绪（`nodes` = 就绪节点清单，含来源与健康度先验）；
-        /// - `"kick"`：钉定节点被踢除（`ip`/`reason`/`count`）；
+        /// - `"kick"`：钉定节点或网卡链路被踢除（`ip`/`reason`/`count`）；
         /// - `"breaker"`：聚合熔断——被踢节点数过半，24h 内不再对该 host 聚合；
         /// - `"fallback"`：聚合已尝试但未成（存活候选不足/聚合任务异常），退单节点；
         /// - `"leases"`：节点并发分布快照（`nodes` = 参与中节点，`active` = 该节点
         ///   当前未归还的段租约数；租约借还时按 2s 节流 + 变化检测发射）；
-        /// - `"summary"`：多段下载结束后的节点贡献统计（`nodes` = 各节点字节数/实测吞吐）。
+        /// - `"summary"`：多段下载结束后的节点贡献统计（`nodes` = 各节点字节数/实测吞吐）；
+        /// - `"links"`：多网卡聚合挂入额外链路（`nodes` = 各链路，`ip` = `NIC:<网卡名>`、
+        ///   `origin` = 该网卡本地地址）；
+        /// - `"links_off"`：多网卡聚合已开启但本任务不聚合（`reason` =
+        ///   [`crate::multi_nic::off_reason`] 原因码）。
+        ///
+        /// 节点标签：`SYS`（任务主 client）、钉定 IP、`PROXY:manual|system`、
+        /// `NIC:<网卡名>`（网卡链路）、`DIRECT`。
         kind: String,
-        /// 钉定目标 host。
+        /// 钉定目标 host（多网卡事件为任务目标 host）。
         host: String,
-        /// `pool`/`leases`/`summary` 的节点清单；其余事件为空。
+        /// `pool`/`leases`/`summary`/`links` 的节点清单；其余事件为空。
         nodes: Vec<crate::model::CdnNodeInfo>,
-        /// `kick`：被踢节点 IP；其余事件为空串。
+        /// `kick`：被踢节点标签（钉定 IP 或 `NIC:<网卡名>`）；其余事件为空串。
         ip: String,
         /// `kick`：`"validator"`（内容不一致）/`"fail"`（连续失败）/`"build"`
         /// （pinned client 构建失败）；`fallback`：`"few"`（存活不足）/`"error"`
-        /// （聚合任务异常）。其余事件为空串。
+        /// （聚合任务异常）；`links_off`：原因码。其余事件为空串。
         reason: String,
         /// `pool`/`fallback`：去重候选 IP 总数；`kick`(fail)：连续失败次数。
         candidates: i32,

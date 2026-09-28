@@ -205,6 +205,7 @@ async fn run_one_real_download(
         0,
         false,
         None,
+        None,
     )
     .await;
 

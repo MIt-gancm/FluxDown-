@@ -409,6 +409,8 @@ class S {
   String get detailActivityKindCdnFallback =>
       _r('detailActivityKindCdnFallback');
   String get detailActivityKindCdnSummary => _r('detailActivityKindCdnSummary');
+  String get detailActivityKindNicLinks => _r('detailActivityKindNicLinks');
+  String get detailActivityKindNicOff => _r('detailActivityKindNicOff');
   String get detailActivityKindJournalOverflow =>
       _r('detailActivityKindJournalOverflow');
   String get detailActivityJournalGap => _r('detailActivityJournalGap');
@@ -471,6 +473,23 @@ class S {
   String detailLogCdnSummaryNode(String ip, String bytes, String speed) =>
       _r('detailLogCdnSummaryNode', {'ip': ip, 'bytes': bytes, 'speed': speed});
   String get detailCdnNodeSys => _r('detailCdnNodeSys');
+  String detailCdnNodeNic(String name) =>
+      _r('detailCdnNodeNic', {'name': name});
+  String detailLogNicKick(String name, String reason) =>
+      _r('detailLogNicKick', {'name': name, 'reason': reason});
+  String detailLogNicLinks(String host, int n) =>
+      _r('detailLogNicLinks', {'host': host, 'n': n});
+  String detailLogNicSummary(String host) =>
+      _r('detailLogNicSummary', {'host': host});
+  String detailLogNicOff(String reason) =>
+      _r('detailLogNicOff', {'reason': reason});
+  String get detailNicOffProxy => _r('detailNicOffProxy');
+  String get detailNicOffFakeIp => _r('detailNicOffFakeIp');
+  String get detailNicOffLocalTarget => _r('detailNicOffLocalTarget');
+  String get detailNicOffVpn => _r('detailNicOffVpn');
+  String get detailNicOffPrimaryUnknown => _r('detailNicOffPrimaryUnknown');
+  String get detailNicOffNoExtra => _r('detailNicOffNoExtra');
+  String get detailNicOffDns => _r('detailNicOffDns');
   String get detailNotSet => _r('detailNotSet');
   String get detailFollowGlobal => _r('detailFollowGlobal');
   String get detailActionFolder => _r('detailActionFolder');
@@ -1156,6 +1175,11 @@ class S {
   String get autoMaxConnectionsDesc => _r('autoMaxConnectionsDesc');
   String get cdnMultiEnabled => _r('cdnMultiEnabled');
   String get cdnMultiEnabledDesc => _r('cdnMultiEnabledDesc');
+  String get multiNicEnabled => _r('multiNicEnabled');
+  String get multiNicEnabledDesc => _r('multiNicEnabledDesc');
+  String get multiNicHelpTitle => _r('multiNicHelpTitle');
+  String get multiNicHelpHint => _r('multiNicHelpHint');
+  String get multiNicHelp => _r('multiNicHelp');
   String get cdnMultiProxyConfirmTitle => _r('cdnMultiProxyConfirmTitle');
   String get cdnMultiProxyConfirmDescSystem =>
       _r('cdnMultiProxyConfirmDescSystem');
@@ -1661,6 +1685,9 @@ class S {
   List<String> get searchKeywordsCdnMulti =>
       _r('searchKeywordsCdnMulti').split(',')
         ..addAll(['cdn', 'node', 'multi-cdn', 'concurrent']);
+  List<String> get searchKeywordsMultiNic =>
+      _r('searchKeywordsMultiNic').split(',')
+        ..addAll(['nic', 'network', 'interface', 'multi-nic', 'aggregation']);
   List<String> get searchKeywordsSpeedLimit =>
       _r('searchKeywordsSpeedLimit').split(',')
         ..addAll(['speed', 'limit', 'bandwidth']);

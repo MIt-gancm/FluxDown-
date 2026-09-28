@@ -110,16 +110,26 @@ pub enum RoutePath {
     Direct,
     /// 经指定来源的候选代理。
     Proxy(CandidateSource),
+    /// 出口绑定到指定网卡（OS 接口索引）的直连额外链路（多网卡聚合，见
+    /// [`crate::multi_nic`]）。与其它路径容量独立，派工按独立容量均衡。
+    Link(u32),
 }
 
 impl RoutePath {
-    /// 路径作为「主导链路」时的采样标签（运行中由实测转为主导）。
+    /// 路径作为「主导链路」时的采样标签（运行中由实测转为主导）。网卡链路
+    /// 本质是直连，与 Auto 多路径互斥（manager 保证），按直连归类。
     #[must_use]
     pub fn sampled_label(self) -> &'static str {
         match self {
-            Self::Direct => route::DIRECT_SAMPLED,
+            Self::Direct | Self::Link(_) => route::DIRECT_SAMPLED,
             Self::Proxy(source) => route::with_source(route::PROXY_SAMPLED, source),
         }
+    }
+
+    /// 是否多网卡聚合的额外链路。
+    #[must_use]
+    pub fn is_link(self) -> bool {
+        matches!(self, Self::Link(_))
     }
 }
 

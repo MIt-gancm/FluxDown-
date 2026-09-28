@@ -53,6 +53,10 @@ pub const MIN_SAMPLE_WINDOWS: u32 = 2;
 /// 拆分时双方各自至少保留的字节数（与尾部微拆分阈值同级）。
 pub const MIN_SPLIT_PIECE: i64 = 64 * 1024;
 
+/// 独立容量链路（多网卡）保底 1 条连接的最小容量占比：低于全部链路总容量
+/// 此比例的链路收益可忽略，不值得占用连接（徒增蜂窝流量与尾段风险）。
+pub const LINK_FLOOR_SHARE: f64 = 0.05;
+
 /// 一个窗口内单连接速率（B/s）。
 #[must_use]
 pub fn window_rate(bytes: i64, window: Duration) -> f64 {
@@ -93,6 +97,17 @@ pub fn blend_rate(current: f64, sample: f64, first_measurement: bool) -> f64 {
 #[must_use]
 pub fn is_competitive(score: f64, best: f64) -> bool {
     best <= 0.0 || score >= best * COMPETITIVE_RATIO
+}
+
+/// 独立容量链路（多网卡）的边际单连接估计：链路容量（B/s）按饱和假设
+/// 均摊到「在途 + 1」条连接上。新租约给该值最高的链路 = 注水式分配，
+/// 各链路连接数随容量成比例，已饱和链路不再被加码。
+#[must_use]
+pub fn link_marginal(capacity_bps: f64, outstanding: u32) -> f64 {
+    if !(capacity_bps.is_finite() && capacity_bps > 0.0) {
+        return 0.0;
+    }
+    capacity_bps / f64::from(outstanding.saturating_add(1))
 }
 
 /// 均衡完成拆分：持有者速率 `holder_bps`、帮手速率 `helper_bps` 下，

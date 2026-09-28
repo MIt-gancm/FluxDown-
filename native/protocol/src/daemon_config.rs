@@ -68,6 +68,7 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Integer { min: 0, max: 8 },
         "0",
     ),
+    field("multi_nic_enabled", DaemonConfigKind::Bool, "false"),
     field(
         "max_concurrent_tasks",
         DaemonConfigKind::Integer { min: 1, max: 1024 },

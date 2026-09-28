@@ -111,6 +111,7 @@ async fn track_pair_reports_midway_progress_with_real_total() {
         spawn_gen: 1,
         unattended: false,
         auto_proxy: None,
+        multi_nic: None,
         task_id: "tp".to_string(),
         url: format!("{base}/video"),
         save_dir: work_dir.to_string_lossy().to_string(),

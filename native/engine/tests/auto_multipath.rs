@@ -316,6 +316,7 @@ async fn run_auto(tag: &str, origin: &TestServer, proxy: &TestServer) -> RunOutc
         spawn_gen: 1,
         unattended: false,
         auto_proxy: Some(Arc::new(auto_ctx(origin.port, proxy.port))),
+        multi_nic: None,
         auto_max_connections: 0,
         task_id: task_id.clone(),
         url,

@@ -6,7 +6,7 @@ use gpui::{App, ParentElement, SharedString, Styled, px};
 use gpui_component::h_flex;
 
 use super::{SectionContext, rate_limit, user_agent};
-use crate::ui::{Control, SettingsPage, SettingsSection, body_text, meta_text};
+use crate::ui::{Control, Explain, SettingsPage, SettingsSection, body_text, meta_text};
 
 pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
     if ctx.store.read(cx).conn_policy().is_none() && !ctx.store.read(cx).is_busy("connPolicy") {
@@ -179,6 +179,19 @@ fn connection_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
             ctx.daemon_number("cdn_max_nodes"),
         ));
     }
+    section = section.row(
+        ctx.item(
+            "multiNicEnabled",
+            Some("multiNicEnabledDesc"),
+            ctx.daemon_switch("multi_nic_enabled"),
+        )
+        .explain(Explain {
+            hint: ctx.t("multiNicHelpHint"),
+            title: ctx.t("multiNicHelpTitle"),
+            body: ctx.t("multiNicHelp"),
+            close: ctx.t("close"),
+        }),
+    );
     section
         .row(ctx.item(
             "connPolicyCache",

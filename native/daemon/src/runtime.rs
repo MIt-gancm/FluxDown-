@@ -334,6 +334,9 @@ fn apply_manager_settings(engine: &mut Engine, config: &HashMap<String, String>)
         .set_cdn_max_nodes(i32_config(config, "cdn_max_nodes", 0).clamp(0, 8));
     engine
         .manager
+        .set_multi_nic_enabled(bool_config(config, "multi_nic_enabled", false));
+    engine
+        .manager
         .set_max_auto_retries(i32_config(config, "max_auto_retries", 3));
     engine
         .manager

@@ -1392,6 +1392,12 @@ async fn apply_live_config<'a>(
     {
         engine.manager.set_cdn_max_nodes(value);
     }
+    if keys.contains(&"multi_nic_enabled") {
+        engine.manager.set_multi_nic_enabled(
+            all.get("multi_nic_enabled")
+                .is_some_and(|value| value == "true"),
+        );
+    }
     if keys.contains(&"max_auto_retries")
         && let Some(value) = all
             .get("max_auto_retries")

@@ -288,7 +288,7 @@ impl EventSink for JournalSink {
                 cap,
                 auto_cap,
             } if kind != "leases" => {
-                let nodes = if kind == "pool" || kind == "summary" {
+                let nodes = if kind == "pool" || kind == "summary" || kind == "links" {
                     nodes
                         .iter()
                         .map(|node| {
@@ -313,6 +313,8 @@ impl EventSink for JournalSink {
                         "breaker" => "cdn_breaker",
                         "fallback" => "cdn_fallback",
                         "summary" => "cdn_summary",
+                        "links" => "nic_links",
+                        "links_off" => "nic_off",
                         _ => "cdn",
                     },
                     message,

@@ -290,6 +290,7 @@ async fn load_initial_config(
     i32,
     bool,
     i32,
+    bool,
 ) {
     let config = db.get_all_config().await.unwrap_or_default();
     let max_concurrent = config
@@ -334,6 +335,10 @@ async fn load_initial_config(
         .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(0)
         .clamp(0, 8);
+    // 多网卡聚合下载开关。老库无此 key → 默认关闭。
+    let multi_nic_enabled = config
+        .get("multi_nic_enabled")
+        .is_some_and(|v| v == "1" || v == "true");
 
     (
         max_concurrent,
@@ -347,6 +352,7 @@ async fn load_initial_config(
         auto_max_connections,
         cdn_multi_enabled,
         cdn_max_nodes,
+        multi_nic_enabled,
     )
 }
 
@@ -409,6 +415,7 @@ pub async fn run(
         auto_max_connections,
         cdn_multi_enabled,
         cdn_max_nodes,
+        multi_nic_enabled,
     ) = load_initial_config(&db).await;
     log_info!(
         "[actor] proxy config: mode={}, type={}, host={}, port={}",
@@ -495,6 +502,7 @@ pub async fn run(
         .set_auto_max_connections(auto_max_connections);
     engine.manager.set_cdn_multi_enabled(cdn_multi_enabled);
     engine.manager.set_cdn_max_nodes(cdn_max_nodes);
+    engine.manager.set_multi_nic_enabled(multi_nic_enabled);
 
     // Apply persisted log size cap (MB) to the global logger.
     if let Ok(Some(v)) = engine.db.get_config("log_max_size_mb").await
@@ -3229,6 +3237,11 @@ async fn apply_config_key(
             let v = value == "1" || value == "true";
             log_info!("[actor] updating cdn_multi_enabled to {}", v);
             engine.manager.set_cdn_multi_enabled(v);
+        }
+        "multi_nic_enabled" => {
+            let v = value == "1" || value == "true";
+            log_info!("[actor] updating multi_nic_enabled to {}", v);
+            engine.manager.set_multi_nic_enabled(v);
         }
         "cdn_max_nodes" => {
             if let Ok(v) = value.parse::<i32>() {

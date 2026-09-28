@@ -1696,7 +1696,15 @@ class _DetailPanelState extends State<DetailPanel> {
     return origin; // 未知标记原样展示（引擎新增来源时向前兼容）
   }
 
-  /// 多 CDN 事件 → 日志文案（多行：首行摘要，节点细节缩进列出）。
+  /// 链路节点标签：`SYS` = 系统直连（主链路），`NIC:<ifname>` = 多网卡聚合的
+  /// 额外网卡，其余为 CDN 节点 IP 原样展示。
+  String _cdnNodeLabel(S s, String ip) {
+    if (ip == 'SYS') return s.detailCdnNodeSys;
+    if (ip.startsWith('NIC:')) return s.detailCdnNodeNic(ip.substring(4));
+    return ip;
+  }
+
+  /// 多 CDN / 多网卡聚合事件 → 日志文案（多行：首行摘要，节点细节缩进列出）。
   /// 未知 kind 返回空串（调用方跳过，向前兼容）。
   String _cdnEventText(S s, CdnEventData e) {
     switch (e.kind) {
@@ -1720,7 +1728,9 @@ class _DetailPanelState extends State<DetailPanel> {
           'build' => s.detailCdnKickBuild,
           _ => s.detailCdnKickFail(e.candidates),
         };
-        return s.detailLogCdnKick(e.ip, reason);
+        return e.ip.startsWith('NIC:')
+            ? s.detailLogNicKick(e.ip.substring(4), reason)
+            : s.detailLogCdnKick(e.ip, reason);
       case 'breaker':
         return s.detailLogCdnBreaker(e.host);
       case 'fallback':
@@ -1730,7 +1740,7 @@ class _DetailPanelState extends State<DetailPanel> {
       case 'leases':
         final lines = <String>[s.detailLogCdnLeases(e.host)];
         for (final n in e.nodes) {
-          final ip = n.ip == 'SYS' ? s.detailCdnNodeSys : n.ip;
+          final ip = _cdnNodeLabel(s, n.ip);
           var line = '  ${s.detailLogCdnLeasesNode(ip, n.active)}';
           if (n.bytes > 0) {
             line += ' · ${DownloadTask.formatBytes(n.bytes)}';
@@ -1739,14 +1749,43 @@ class _DetailPanelState extends State<DetailPanel> {
         }
         return lines.join('\n');
       case 'summary':
-        final lines = <String>[s.detailLogCdnSummary(e.host)];
+        // 仅有系统直连 + 网卡链路（无 CDN 节点 IP）时是多网卡统计，标题随之区分。
+        final nicOnly =
+            e.nodes.any((n) => n.ip.startsWith('NIC:')) &&
+            e.nodes.every((n) => n.ip == 'SYS' || n.ip.startsWith('NIC:'));
+        final lines = <String>[
+          nicOnly
+              ? s.detailLogNicSummary(e.host)
+              : s.detailLogCdnSummary(e.host),
+        ];
         for (final n in e.nodes) {
-          final ip = n.ip == 'SYS' ? s.detailCdnNodeSys : n.ip;
+          final ip = _cdnNodeLabel(s, n.ip);
           lines.add(
             '  ${s.detailLogCdnSummaryNode(ip, DownloadTask.formatBytes(n.bytes), DownloadTask.formatBytes(n.ewmaBps))}',
           );
         }
         return lines.join('\n');
+      case 'links':
+        final lines = <String>[s.detailLogNicLinks(e.host, e.nodes.length)];
+        for (final n in e.nodes) {
+          var line = '  ${_cdnNodeLabel(s, n.ip)}';
+          if (n.origin.isNotEmpty) line += ' · ${n.origin}';
+          lines.add(line);
+        }
+        return lines.join('\n');
+      case 'links_off':
+        final reason = switch (e.reason) {
+          'proxy' => s.detailNicOffProxy,
+          'fake_ip' => s.detailNicOffFakeIp,
+          'local_target' => s.detailNicOffLocalTarget,
+          'vpn' => s.detailNicOffVpn,
+          'primary_unknown' => s.detailNicOffPrimaryUnknown,
+          'no_extra' => s.detailNicOffNoExtra,
+          'dns' => s.detailNicOffDns,
+          _ => e.reason, // 未知原因码原样展示（引擎新增时向前兼容）
+        };
+        final text = s.detailLogNicOff(reason);
+        return e.host.isEmpty ? text : '$text · ${e.host}';
       default:
         return '';
     }

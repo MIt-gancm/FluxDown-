@@ -1627,6 +1627,10 @@ pub struct DownloadManager {
     /// **0 = 自动**：按文件大小与并发连接数推导，默认值；SYS 兜底节点
     /// 不计入）。
     cdn_max_nodes: i32,
+    /// 多网卡聚合下载全局开关（config `multi_nic_enabled`，默认关）。任务级
+    /// 还需直连（无代理、无 Auto 多路径）、支持分段，且规划器在本机找到通向
+    /// 不同上游的额外网卡才会真正聚合，见 [`crate::multi_nic`]。
+    multi_nic_enabled: bool,
     /// In-memory cache of named queue settings (queue_id → QueueInfo).
     /// Kept in sync with the DB on every queue CRUD operation.
     queues: HashMap<String, QueueInfo>,
@@ -1817,6 +1821,7 @@ impl DownloadManager {
             use_server_time: false,
             file_exists_behavior: FileExistsBehavior::Rename,
             cdn_multi_enabled: false,
+            multi_nic_enabled: false,
             cdn_max_nodes: 0, // 0 = 自动档
             queues: HashMap::new(),
             queue_limiters: HashMap::new(),
@@ -2718,6 +2723,11 @@ impl DownloadManager {
     /// Update the Multi-CDN aggregation toggle (config `cdn_multi_enabled`).
     pub fn set_cdn_multi_enabled(&mut self, v: bool) {
         self.cdn_multi_enabled = v;
+    }
+
+    /// Update the multi-NIC aggregation toggle (config `multi_nic_enabled`).
+    pub fn set_multi_nic_enabled(&mut self, v: bool) {
+        self.multi_nic_enabled = v;
     }
 
     /// Update the Multi-CDN per-task pinned-node cap (config `cdn_max_nodes`).
@@ -5146,6 +5156,28 @@ impl DownloadManager {
         }
     }
 
+    /// 折算多网卡聚合的任务级输入：全局开关关闭 → `None`（多段路径零行为
+    /// 变化）。任务走代理（任务级/全局级，含 System 解析结果）或持有 Auto
+    /// 多路径上下文时出口是代理，标记 `blocked_by_proxy`，coordinator 只上报
+    /// `links_off/proxy` 不做规划。其余条件（地址族、VPN、同局域网）由
+    /// [`crate::multi_nic::prepare_links`] 在下载路径上判定。
+    fn multi_nic_input(
+        &self,
+        ignore_tls_errors: bool,
+        task_proxy: &ProxyConfig,
+        has_auto_paths: bool,
+        user_agent: &str,
+    ) -> Option<Arc<crate::multi_nic::MultiNicInput>> {
+        use crate::proxy_config::ProxyMode;
+        self.multi_nic_enabled.then(|| {
+            Arc::new(crate::multi_nic::MultiNicInput {
+                user_agent: user_agent.to_string(),
+                ignore_tls_errors,
+                blocked_by_proxy: task_proxy.mode != ProxyMode::None || has_auto_paths,
+            })
+        })
+    }
+
     /// `ProxyMode::Auto` 的启动期路由决策（每任务一次）。
     ///
     /// 常规启动构造多路径上下文：直连与全部候选代理都是节点池里的路径，
@@ -5225,7 +5257,8 @@ impl DownloadManager {
             .map_or(0, |(i, _)| i);
         let start = paths.remove(start_index);
         let label = match start.route {
-            RoutePath::Direct => route::DIRECT,
+            // Auto 候选只含直连与代理；网卡链路只由多网卡聚合在 coordinator 挂入。
+            RoutePath::Direct | RoutePath::Link(_) => route::DIRECT,
             RoutePath::Proxy(source) => route::with_source(route::PROXY_CACHED, source),
         };
         // 忽略 TLS 错误的任务不做多路径（备选路径 client 恒校验证书）。
@@ -5699,6 +5732,12 @@ impl DownloadManager {
                 &task_proxy,
                 self.resolved_task_ua(&user_agent, &queue_id),
             );
+            let multi_nic = self.multi_nic_input(
+                ignore_tls_errors,
+                &task_proxy,
+                auto_ctx.is_some(),
+                self.resolved_task_ua(&user_agent, &queue_id),
+            );
             // 无人值守标记只被 HLS/DASH 画质选择消费，其余协议不多查一次库。
             let task_unattended = (use_hls || use_dash)
                 && self.db.is_task_unattended(&task_id).await.unwrap_or(false);
@@ -5737,6 +5776,7 @@ impl DownloadManager {
                 ffmpeg_path: crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await,
                 cdn,
                 auto_proxy: auto_ctx,
+                multi_nic,
                 unattended: task_unattended,
             };
 
@@ -6998,6 +7038,12 @@ impl DownloadManager {
 
             // 多 CDN 聚合输入与主请求使用同一份恢复 UA。
             let cdn = self.cdn_task_input(task.ignore_tls_errors, &task_proxy, &resume_user_agent);
+            let multi_nic = self.multi_nic_input(
+                task.ignore_tls_errors,
+                &task_proxy,
+                auto_ctx.is_some(),
+                &resume_user_agent,
+            );
             // 无人值守标记只被 HLS/DASH 画质选择消费，其余协议不多查一次库。
             let task_unattended =
                 (use_hls || use_dash) && self.db.is_task_unattended(&tid).await.unwrap_or(false);
@@ -7040,6 +7086,7 @@ impl DownloadManager {
                 ffmpeg_path: crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await,
                 cdn,
                 auto_proxy: auto_ctx,
+                multi_nic,
                 unattended: task_unattended,
             };
 
