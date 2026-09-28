@@ -660,7 +660,7 @@ impl DaemonService {
                     .plugin_manager()?
                     .install_from_zip(bytes)
                     .await
-                    .map_err(|error| invalid_argument("blobId", &error.to_string()))?;
+                    .map_err(|error| plugin_package_error("blobId", &error))?;
                 self.blobs
                     .consume(&params.blob_id, BlobKind::Plugin)
                     .await
@@ -679,7 +679,7 @@ impl DaemonService {
                     .plugin_manager()?
                     .install_dev(std::path::Path::new(&request.dir_path))
                     .await
-                    .map_err(|error| invalid_argument("dirPath", &error.to_string()))?;
+                    .map_err(|error| plugin_package_error("dirPath", &error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
                 self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
@@ -704,7 +704,7 @@ impl DaemonService {
                     .await?
                     .fetch_index()
                     .await
-                    .map_err(|error| invalid_argument("market", &error.to_string()))?;
+                    .map_err(|error| market_error(&error))?;
                 to_value(
                     index
                         .entries
@@ -721,7 +721,7 @@ impl DaemonService {
                     .await?
                     .install_latest(&request.plugin_id)
                     .await
-                    .map_err(|error| invalid_argument("pluginId", &error.to_string()))?;
+                    .map_err(|error| market_error(&error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
                 self.publish_plugins().await?;
                 to_value(fluxdown_protocol::InstalledPlugin {
@@ -1722,6 +1722,7 @@ fn actor_error(error: ActorCallError) -> RpcErrorObject {
                     retryable: false,
                     field: None,
                     revision: Some(current),
+                    reason: None,
                 },
             )
         }
@@ -1748,7 +1749,77 @@ fn invalid_argument(field: &str, message: &str) -> RpcErrorObject {
             retryable: false,
             field: Some(field.to_owned()),
             revision: None,
+            reason: None,
         },
+    )
+}
+
+/// 插件包 / 插件目录校验失败：记录完整原因，客户端按细分原因展示。
+#[cfg(feature = "plugins")]
+fn plugin_package_error(
+    field: &str,
+    error: &fluxdown_engine::plugin::PluginError,
+) -> RpcErrorObject {
+    let message = error.to_string();
+    fluxdown_engine::log_warn!("[plugin] 安装失败: {message}");
+    let mut data = RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+        .with_reason(fluxdown_protocol::ErrorReason::PluginPackageInvalid);
+    data.field = Some(field.to_owned());
+    RpcErrorObject::application(message, data)
+}
+
+/// 市场索引 / 插件下载失败：按失败性质给出错误码与细分原因，并记录完整原因。
+#[cfg(feature = "plugins")]
+fn market_error(error: &fluxdown_engine::plugin::MarketError) -> RpcErrorObject {
+    use fluxdown_engine::plugin::MarketError;
+    use fluxdown_protocol::ErrorReason;
+    let (code, retryable, reason) = match error {
+        MarketError::Network(_) => (
+            ApplicationErrorCode::Unavailable,
+            true,
+            ErrorReason::MarketUnreachable,
+        ),
+        MarketError::IndexParse(_) | MarketError::IndexTooLarge => (
+            ApplicationErrorCode::Unavailable,
+            false,
+            ErrorReason::MarketIndexInvalid,
+        ),
+        MarketError::SequenceRollback { .. } => (
+            ApplicationErrorCode::Conflict,
+            false,
+            ErrorReason::MarketIndexRollback,
+        ),
+        MarketError::NotFound(_) => (
+            ApplicationErrorCode::NotFound,
+            false,
+            ErrorReason::PluginNotInMarket,
+        ),
+        MarketError::Yanked(_) => (
+            ApplicationErrorCode::Conflict,
+            false,
+            ErrorReason::PluginYanked,
+        ),
+        MarketError::AllMirrorsFailed | MarketError::HashMismatch { .. } => (
+            ApplicationErrorCode::Unavailable,
+            true,
+            ErrorReason::PluginDownloadFailed,
+        ),
+        MarketError::TooLarge => (
+            ApplicationErrorCode::InvalidArgument,
+            false,
+            ErrorReason::PluginPackageTooLarge,
+        ),
+        MarketError::Plugin(_) => (
+            ApplicationErrorCode::InvalidArgument,
+            false,
+            ErrorReason::PluginPackageInvalid,
+        ),
+    };
+    let message = error.to_string();
+    fluxdown_engine::log_warn!("[plugin-market] {message}");
+    RpcErrorObject::application(
+        message,
+        RpcErrorData::new(code, retryable).with_reason(reason),
     )
 }
 

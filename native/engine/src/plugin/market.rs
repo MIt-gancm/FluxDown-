@@ -254,12 +254,6 @@ impl MarketClient {
             .strip_prefix("sha256:")
             .unwrap_or(&entry.content_hash)
             .to_ascii_lowercase();
-        if entry.mirrors.is_empty() {
-            return Err(MarketError::NotFound(format!(
-                "{} 无可用镜像",
-                entry.plugin_id
-            )));
-        }
         for url in &entry.mirrors {
             // 镜像白名单：https-only（防降级）+ 字面量 IP 必须可全局路由（联邦
             // 索引的镜像 URL 不可全信，挡「把环回/内网地址伪装成镜像」的 SSRF

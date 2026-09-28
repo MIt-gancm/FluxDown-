@@ -273,6 +273,7 @@ fn invalid_rpc_field(field: &str) -> RpcErrorData {
         retryable: false,
         field: Some(field.to_owned()),
         revision: None,
+        reason: None,
     }
 }
 

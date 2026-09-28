@@ -639,12 +639,7 @@ impl GatewayService {
         let values = params
             .get("values")
             .and_then(serde_json::Value::as_object)
-            .ok_or_else(|| RpcErrorData {
-                code: ApplicationErrorCode::InvalidArgument,
-                retryable: false,
-                field: Some("values".to_owned()),
-                revision: None,
-            })?;
+            .ok_or_else(|| invalid_field("values"))?;
         let sync = params
             .get("sync")
             .and_then(serde_json::Value::as_bool)
@@ -886,24 +881,14 @@ fn required_string(params: &serde_json::Value, field: &str) -> Result<String, Rp
         .and_then(serde_json::Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
-        .ok_or_else(|| RpcErrorData {
-            code: ApplicationErrorCode::InvalidArgument,
-            retryable: false,
-            field: Some(field.to_owned()),
-            revision: None,
-        })
+        .ok_or_else(|| invalid_field(field))
 }
 
 fn required_i64(params: &serde_json::Value, field: &str) -> Result<i64, RpcErrorData> {
     params
         .get(field)
         .and_then(serde_json::Value::as_i64)
-        .ok_or_else(|| RpcErrorData {
-            code: ApplicationErrorCode::InvalidArgument,
-            retryable: false,
-            field: Some(field.to_owned()),
-            revision: None,
-        })
+        .ok_or_else(|| invalid_field(field))
 }
 
 fn pagination(params: &serde_json::Value) -> Result<(u32, u32), RpcErrorData> {
@@ -928,6 +913,7 @@ fn invalid_field(field: &str) -> RpcErrorData {
         retryable: false,
         field: Some(field.to_owned()),
         revision: None,
+        reason: None,
     }
 }
 

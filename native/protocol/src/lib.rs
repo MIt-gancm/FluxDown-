@@ -65,8 +65,9 @@ pub use daemon_config::{
     normalize_daemon_config_value,
 };
 pub use error::{
-    APPLICATION_ERROR_CODE, ApplicationErrorCode, INTERNAL_ERROR_CODE, INVALID_PARAMS_CODE,
-    INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE, RpcErrorData, RpcErrorObject,
+    APPLICATION_ERROR_CODE, ApplicationErrorCode, ErrorReason, INTERNAL_ERROR_CODE,
+    INVALID_PARAMS_CODE, INVALID_REQUEST_CODE, METHOD_NOT_FOUND_CODE, PARSE_ERROR_CODE,
+    RpcErrorData, RpcErrorObject,
 };
 pub use event::{
     AgentEvent, AgentSnapshot, DaemonEvent, DaemonSnapshot, EventFrame, ServiceEvent, Snapshot,

@@ -7,7 +7,9 @@ mod ui;
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
-use fluxdown_protocol::{AgentSnapshot, ApplicationErrorCode, RpcErrorData, ServiceEvent};
+use fluxdown_protocol::{
+    AgentSnapshot, ApplicationErrorCode, ErrorReason, RpcErrorData, ServiceEvent,
+};
 use fluxdown_ui_components::segmented_tabs;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -151,9 +153,20 @@ impl ExtensionsView {
     }
 }
 
-/// agent 端口只回传错误码（服务端 message 不透传），按码映射通用文案。
+/// agent 端口不透传服务端 message：有细分原因时按原因给出可操作文案，否则按码映射通用文案。
 pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> String {
-    let key = match error.code {
+    let reason_key = error.reason.and_then(|reason| match reason {
+        ErrorReason::MarketUnreachable => Some("pluginErrorMarketUnreachable"),
+        ErrorReason::MarketIndexInvalid => Some("pluginErrorMarketIndexInvalid"),
+        ErrorReason::MarketIndexRollback => Some("pluginErrorMarketIndexRollback"),
+        ErrorReason::PluginNotInMarket => Some("pluginErrorNotInMarket"),
+        ErrorReason::PluginYanked => Some("pluginErrorYanked"),
+        ErrorReason::PluginDownloadFailed => Some("pluginErrorDownloadFailed"),
+        ErrorReason::PluginPackageTooLarge => Some("pluginErrorPackageTooLarge"),
+        ErrorReason::PluginPackageInvalid => Some("pluginErrorPackageInvalid"),
+        ErrorReason::Unknown => None,
+    });
+    let key = reason_key.unwrap_or(match error.code {
         ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout => {
             "localServiceDisconnected"
         }
@@ -166,7 +179,7 @@ pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> Strin
         | ApplicationErrorCode::Unauthorized
         | ApplicationErrorCode::Cancelled
         | ApplicationErrorCode::Internal => "localServiceActionFailed",
-    };
+    });
     translator.text(key).to_owned()
 }
 
