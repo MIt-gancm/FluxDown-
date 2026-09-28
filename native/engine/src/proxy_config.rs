@@ -26,8 +26,8 @@ pub enum ProxyMode {
     System,
     /// User-specified proxy address.
     Manual,
-    /// 自动决策：任务直连启动，运行中确认慢且候选代理（系统代理，
-    /// 缺省回退手动字段）经采样证明显著更快时才按 host 热切换。
+    /// 自动决策：直连与候选代理（手动字段 + 系统代理）作为并行路径，由
+    /// 分段调度按同窗实测速率分配连接、按完成时间抢占交接。
     /// 决策粒度是**任务级**（见 [`crate::auto_proxy`]）；本模式值本身
     /// 绝不直接进 client 构建——[`ProxyConfig::resolve`] 与
     /// `build_client_inner` 都把它折算为直连，具体代理由 auto_proxy

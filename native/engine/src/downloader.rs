@@ -313,10 +313,10 @@ pub struct DownloadParams {
     /// 见 [`crate::cdn::CdnTaskInput`]）。`enabled == false`（默认）时多段
     /// 路径构造单节点池，行为与现状逐字节一致。
     pub cdn: crate::cdn::CdnTaskInput,
-    /// `ProxyMode::Auto` 直连起飞任务的热切换上下文（候选代理 + host 决策
-    /// 缓存），由 manager 构造（见 [`crate::auto_proxy::AutoProxyCtx`]）。
-    /// `None` = 非 Auto 模式 / 无候选代理 / 已按缓存决策走代理启动——
-    /// 三者都不存在「运行中切换」这回事，多段路径零行为变化。
+    /// `ProxyMode::Auto` 任务的多路径上下文（起飞路径 + 备选路径及其先验），
+    /// 由 manager 构造（见 [`crate::auto_proxy::AutoProxyCtx`]）。`None` =
+    /// 非 Auto 模式 / 无候选代理 / 一次性 failover 链路 / 忽略 TLS 错误——
+    /// 单路径，多段路径零行为变化。
     pub auto_proxy: Option<std::sync::Arc<crate::auto_proxy::AutoProxyCtx>>,
     /// 无人值守任务（`tasks.unattended`，RSS/免打扰接管创建）：HLS/DASH
     /// 画质选择跳过 `HostSelection` 弹窗，直接取最高码率（与超时默认值

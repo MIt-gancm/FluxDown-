@@ -6,7 +6,7 @@
 
 /// 插件通用认证凭据存储与请求注入。
 pub mod auth;
-/// `ProxyMode::Auto`：直连优先、慢则采样、快则热切换的自动代理决策。
+/// `ProxyMode::Auto`：候选代理解析、多路径任务上下文与路由 wire 标签。
 pub mod auto_proxy;
 pub mod bt_downloader;
 /// BT 部分选择做种的 parts 边车（选中文件路径映射 + 跨文件边界字节）。
@@ -34,12 +34,14 @@ pub mod logger;
 pub mod meta_prober;
 pub mod model;
 pub(crate) mod output;
+/// 多路径分段调度的纯判据（稳态速率采样、竞争集、均衡拆分、完成时间抢占）。
+pub(crate) mod path_scheduler;
 /// 插件系统（可选、可失败的下载中间层）。仅 `plugins` feature 下编译。
 #[cfg(feature = "plugins")]
 pub mod plugin;
 mod proc;
 pub mod proxy_config;
-/// `ProxyMode::Auto` 路由决策的跨重启先验（host 级采样结论持久化）。
+/// `ProxyMode::Auto` 各路径单连接速率的跨重启折扣先验。
 pub mod route_health;
 /// RSS 订阅自动下载（feed 轮询 → 规则过滤 → 建任务）。
 pub mod rss;

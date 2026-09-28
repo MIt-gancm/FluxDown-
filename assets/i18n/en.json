@@ -934,7 +934,7 @@
   "proxyModeManual": "Manual",
   "proxyModeManualDesc": "Custom proxy server",
   "proxyModeAuto": "Auto (Recommended)",
-  "proxyModeAutoDesc": "Starts direct without blocking, then compares small samples through every available manual and system proxy. It switches per site only when the fastest proxy is clearly better; direct tasks keep multi-CDN acceleration.",
+  "proxyModeAutoDesc": "Starts direct without blocking and treats every available manual and system proxy as a parallel path. Each path is measured with real segments whose bytes go straight into the file, connections flow to the faster path, slow connections hand off at the current byte, and direct and proxy can be combined. Direct still keeps multi-CDN acceleration.",
   "taskRoute": "Route",
   "taskRouteDirect": "Direct",
   "taskRouteDirectSampled": "Direct (sampled)",

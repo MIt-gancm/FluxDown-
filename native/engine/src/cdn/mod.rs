@@ -344,8 +344,18 @@ pub async fn finish_pool(
 pub(crate) fn is_node_attributable(e: &DownloadError) -> bool {
     match e {
         DownloadError::Request(_) => true,
+        DownloadError::Other(msg) => msg.contains("stalled") || is_validator_mismatch(e),
+        _ => is_validator_mismatch(e),
+    }
+}
+
+/// validator 不一致：跨段 latch 漂移（[`DownloadError::VersionChanged`]）或
+/// 206 响应与 probe 锁定值不符（`Other("segment N: validator mismatch …")`）。
+/// 多路径语境 = 该节点/路径提供的内容版本不同——立即踢除，不做连续失败计数。
+pub(crate) fn is_validator_mismatch(e: &DownloadError) -> bool {
+    match e {
         DownloadError::VersionChanged(_) => true,
-        DownloadError::Other(msg) => msg.contains("stalled"),
+        DownloadError::Other(msg) => msg.contains("validator mismatch"),
         _ => false,
     }
 }

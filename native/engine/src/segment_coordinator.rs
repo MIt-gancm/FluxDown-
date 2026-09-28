@@ -41,6 +41,8 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
+mod multipath;
+
 use crate::cdn::NodePool;
 use crate::db::Db;
 use crate::downloader::{
@@ -1056,6 +1058,9 @@ struct LiveSegment {
     /// Bytes downloaded within this segment (relative to start_byte).
     downloaded_bytes: i64,
     state: SegState,
+    /// 持有连接最近一个稳态窗口的实测速率（B/s）；未知（无持有者/预热窗/
+    /// 限速窗）为 `None`。拆分按它挑选预计完成最晚的段并均衡切分。
+    rate_bps: Option<f64>,
 }
 
 impl LiveSegment {
@@ -1101,6 +1106,9 @@ enum WorkerEvent {
         seg_index: i32,
         error: DownloadError,
     },
+    /// 分段被 coordinator 完成时间抢占（[`NodePool::preempt`]）：worker 已在
+    /// 取消分支刷盘并把进度写入共享 seg_states，本 worker 保活等待新派工。
+    Preempted { worker_id: usize, seg_index: i32 },
     /// hint 模式首连接的 Range 能力裁决（每任务恰好一次，见
     /// [`RANGE_VERDICT_UNKNOWN`]）。`supports_range == false` 时 coordinator
     /// 必须立即把 Pending 段吸收进开放式首段（不能等 ramp tick——LAN 上首段
@@ -1377,8 +1385,8 @@ pub async fn run_coordinated_download(
     // auto_max_connections 等于引擎默认值）为 true；用户显式段数或自定义上限
     // 时 false，尊重其设定的天花板。
     allow_hint_uncap: bool,
-    // `ProxyMode::Auto` 直连起飞任务的热切换上下文（None = 非 Auto/无候选/
-    // 已按缓存走代理——三者皆无运行中切换，本函数零行为变化）。
+    // `ProxyMode::Auto` 任务的多路径上下文（None = 非 Auto/无候选/一次性
+    // failover 链路——单路径，只做连接窗口采样与均衡拆分）。
     auto_proxy: Option<Arc<crate::auto_proxy::AutoProxyCtx>>,
 ) -> Result<i64, DownloadError> {
     // ----- 0. Defensive checks ------------------------------------------------
@@ -1465,6 +1473,7 @@ pub async fn run_coordinated_download(
                     end_byte: seg.end_byte,
                     downloaded_bytes: seg.downloaded_bytes,
                     state,
+                    rate_bps: None,
                 },
             );
             if seg.index >= next_index {
@@ -1836,6 +1845,10 @@ pub async fn run_coordinated_download(
         RANGE_VERDICT_SUPPORTED
     }));
 
+    // ---- 多路径调度（ProxyMode::Auto 的备选路径在首个 worker 租借前挂入
+    // 节点池，先验占优的路径起飞即被选中；非 Auto 任务只做窗口采样）----
+    let mut multipath = multipath::Multipath::new(auto_proxy, &nodes, task_id);
+
     // worker 生成上下文：启动与 ramp 扩容共用同一 spawn 路径。
     let ctx = WorkerSpawnCtx {
         event_tx,
@@ -1965,11 +1978,6 @@ pub async fn run_coordinated_download(
     let mut ramp_interval = tokio::time::interval(Duration::from_secs(RAMP_TICK_SECS));
     ramp_interval.tick().await; // consume the immediate first tick
 
-    // ---- ProxyMode::Auto 热切换状态机（None 时零开销）----
-    // 由下方 ramp tick 驱动：守卫命中才 off-loop 采样，采样证明代理显著
-    // 更快时经 NodePool::switch_to_client 在分段边界切换（见 auto_proxy 模块文档）。
-    let mut auto_switch = auto_proxy.map(crate::auto_proxy::AutoSwitchState::new);
-
     // UI 进度快照：coordinator 单点每 UI_REPORT_INTERVAL_MS 汇总 seg_states，
     // 取代各 worker 内 200ms 分散上报（字段语义与原 worker 发送一致）。
     let mut ui_interval =
@@ -2027,6 +2035,7 @@ pub async fn run_coordinated_download(
                                     end_byte: rem_end,
                                     downloaded_bytes: 0,
                                     state: SegState::Pending,
+                                    rate_bps: None,
                                 });
                                 shortfall_child = Some(child_idx);
                             } else {
@@ -2225,6 +2234,7 @@ pub async fn run_coordinated_download(
                                         end_byte: reported_total - 1,
                                         downloaded_bytes: 0,
                                         state: SegState::Pending,
+                                        rate_bps: None,
                                     },
                                 );
                                 effective_total_bytes = reported_total;
@@ -2596,6 +2606,75 @@ pub async fn run_coordinated_download(
                         }
                     }
 
+                    Some(WorkerEvent::Preempted { worker_id, seg_index }) => {
+                        // 完成时间抢占：worker 已在取消分支刷盘并把进度写入共享
+                        // seg_states。剩余字节回 Pending，本 worker 立即领新活——
+                        // 新租借按最新路径估计落到最优路径（通常正是剩余字节）。
+                        sync_downloaded_from_shared(&mut segments, &seg_states);
+                        if let Some(seg) = segments.get_mut(&seg_index) {
+                            seg.rate_bps = None;
+                            seg.state = if seg.remaining() == 0 {
+                                SegState::Completed
+                            } else {
+                                SegState::Pending
+                            };
+                        }
+                        if all_done(&segments) {
+                            for tx in &mut worker_assign_txs {
+                                *tx = None;
+                            }
+                            break;
+                        }
+                        let next_work = if serial_mode {
+                            let other_active =
+                                segments.values().any(|s| s.state == SegState::Active);
+                            if other_active {
+                                None
+                            } else {
+                                find_next_pending_only(&mut segments)
+                            }
+                        } else if reject_strikes > 0
+                            && worker_assign_txs.iter().filter(|tx| tx.is_some()).count()
+                                > allowed_workers
+                        {
+                            // 拒绝降级后的额度收缩期：本 worker 顺势退休。抢占本身
+                            // 是交接不是扩容，其余情况（含探索 worker 暂超额度）
+                            // 一律续派，避免余量等待下一个 Done。
+                            None
+                        } else {
+                            find_next_work(
+                                &mut segments,
+                                &mut next_index,
+                                effective_total_bytes,
+                                current_min_split,
+                            )
+                        };
+                        if let Some(next) = next_work {
+                            let new_seg_idx = next.assignment.seg_index;
+                            persist_segment_change(
+                                db, task_id, &segments,
+                                new_seg_idx, next.split_parent,
+                            ).await;
+                            if let Some(parent_idx) = next.split_parent {
+                                send_split_event(
+                                    sink, task_id, parent_idx, new_seg_idx,
+                                    &segments, false, scope,
+                                );
+                            }
+                            rebuild_seg_states(&segments, &seg_states);
+                            if let Some(Some(tx)) = worker_assign_txs.get(worker_id)
+                                && tx.send(next.assignment).await.is_err()
+                                && let Some(seg) = segments.get_mut(&new_seg_idx)
+                            {
+                                seg.state = SegState::Pending;
+                            }
+                        } else if let Some(slot) = worker_assign_txs.get_mut(worker_id) {
+                            // 无工可派/额度收缩期：退休本 worker，Pending 余量由存活
+                            // worker 拾取。
+                            *slot = None;
+                        }
+                    }
+
                     Some(WorkerEvent::RangeVerdict { supports_range }) => {
                         if supports_range {
                             // 首响应证实 Range 支持（206 或 Accept-Ranges: bytes）：
@@ -2808,23 +2887,69 @@ pub async fn run_coordinated_download(
                     *ticks_waited = ticks_waited.saturating_add(1);
                 }
 
-                // ---- ProxyMode::Auto：慢任务的代理采样/热切换钩子 ----
-                // 观察值全部取自本 tick 现成状态，零新增统计；状态机内部
-                // off-loop 采样，本调用只做守卫判定/结果落地，不阻塞事件循环。
-                if let Some(state) = auto_switch.as_mut() {
-                    let obs = crate::auto_proxy::TickObs {
-                        throughput_bps: throughput,
-                        alive,
-                        remaining_bytes: effective_total_bytes.saturating_sub(bytes),
-                        limiter_active: speed_limiter.limit() > 0,
-                        conn_sensitive: conn_sensitive.load(Ordering::Relaxed),
-                    };
-                    state
-                        .on_ramp_tick(
-                            obs, &nodes, db, sink, task_id, url, spec, etag, last_modified,
-                        )
-                        .await;
+                // ---- 多路径调度：窗口采样 / 冷路径探索 / 完成时间抢占 ----
+                // 连接稳态速率喂路径估计与段 rate_bps（拆分挑选与均衡切分），
+                // 慢于最优路径完成时间判据的在途连接在当前字节处被抢占交接。
+                let range_ok_now =
+                    range_verdict.load(Ordering::Relaxed) == RANGE_VERDICT_SUPPORTED;
+                let limiter_active = speed_limiter.limit() > 0;
+                sync_downloaded_from_shared(&mut segments, &seg_states);
+                let mp_report = multipath.on_tick(
+                    &nodes,
+                    &mut segments,
+                    Duration::from_secs_f64(elapsed),
+                    &multipath::TickGuards {
+                        sampling: !limiter_active,
+                        may_reroute: range_ok_now
+                            && !serial_mode
+                            && !limiter_active
+                            && !conn_sensitive.load(Ordering::Relaxed)
+                            && !reconnect_hostile.load(Ordering::Relaxed),
+                        remaining_total: effective_total_bytes.saturating_sub(bytes),
+                        protected_seg: open_ended_streaming,
+                    },
+                    task_id,
+                );
+                multipath.publish_route(&nodes, &segments, db, sink, task_id).await;
+                // 冷路径探索：额外放出 1 个 worker 承载探索连接（采样即真实
+                // 分段下载），不必等既有连接完成大段才轮到新租借。探索片须
+                // 足以跨过慢启动窗口（只从剩余 ≥ 2×EXPLORE_MIN_PIECE 的段拆），
+                // 且至多超出额度 1 个 worker。
+                if mp_report.explore_worker_wanted
+                    && alive <= allowed_workers
+                    && !all_done(&segments)
+                    && let Some(next) = try_split_largest(
+                        &mut segments,
+                        &mut next_index,
+                        2 * crate::path_scheduler::EXPLORE_MIN_PIECE,
+                    )
+                {
+                    let new_seg_idx = next.assignment.seg_index;
+                    persist_segment_change(
+                        db, task_id, &segments,
+                        new_seg_idx, next.split_parent,
+                    ).await;
+                    if let Some(parent_idx) = next.split_parent {
+                        send_split_event(
+                            sink, task_id, parent_idx, new_seg_idx,
+                            &segments, false, scope,
+                        );
+                    }
+                    rebuild_seg_states(&segments, &seg_states);
+                    let worker_id = worker_assign_txs.len();
+                    let (assign_tx, handle) = ctx.spawn(worker_id);
+                    if assign_tx.try_send(next.assignment).is_err() {
+                        if let Some(seg) = segments.get_mut(&new_seg_idx) {
+                            seg.state = SegState::Pending;
+                        }
+                    } else {
+                        worker_assign_txs.push(Some(assign_tx));
+                        worker_handles.push(Some(handle));
+                        alive += 1;
+                    }
                 }
+                let quiet_tick = multipath.take_quiet_tick();
+                let migrating = mp_report.preempted > 0 || quiet_tick;
 
                 // 正面学习采样：本窗口以 alive 条连接产生了真实吞吐且全程无
                 // 拒绝/降级/连接敏感信号 → 该规模已被服务器实际接受。
@@ -2849,9 +2974,10 @@ pub async fn run_coordinated_download(
                     let remaining = (effective_total_bytes - bytes).max(0);
                     let tail = is_tail(remaining, worker_cap, effective_total_bytes);
                     let mut shrunk_this_tick = false;
-                    if tail {
+                    if tail || migrating {
                         // 丢弃待评估的扩容：清 awaiting_ramp_eval 使下方 collapse
-                        // 评估短路（不回滚、不写域名缓存、不改 freeze）。
+                        // 评估短路（不回滚、不写域名缓存、不改 freeze）。路径交接
+                        // 期同理——吞吐波动来自改道而非连接额度。
                         awaiting_ramp_eval = false;
                         probe_window = false;
                     }
@@ -2907,11 +3033,15 @@ pub async fn run_coordinated_download(
                                     beneficial_scale = beneficial_scale.min(allowed_workers);
                                     // 多余 worker 完成当前段后经 Done 派工的额度检查
                                     // 自然退休；进行中的连接与已下数据零丢弃。
-                                    record_domain_conn_cap_persist(
-                                        url,
-                                        allowed_workers as i32,
-                                        db,
-                                    );
+                                    // 备选路径承载过流量时连接规模混有代理连接，
+                                    // 不学习为源站域名上限。
+                                    if !multipath.alternates_used(&nodes) {
+                                        record_domain_conn_cap_persist(
+                                            url,
+                                            allowed_workers as i32,
+                                            db,
+                                        );
+                                    }
                                     log_info!(
                                         "[adaptive] task {} ramp collapse rollback: {} -> {} \
                                          conns, throughput {:.0} -> {:.0} B/s（回滚并记入域名上限）",
@@ -2971,6 +3101,7 @@ pub async fn run_coordinated_download(
                         peak_throughput = throughput;
                         shrink_strikes = 0;
                     } else if !tail
+                        && !migrating
                         && should_shrink(
                             throughput,
                             peak_throughput,
@@ -3200,6 +3331,14 @@ pub async fn run_coordinated_download(
     );
     sink.emit(EngineEvent::TaskRuntimeChanged(runtime));
 
+    // 多路径：主导链路最终定论 + 各路径实测估计写入跨任务先验（成功与
+    // 取消/失败同样有效——估计来自已发生的真实传输）。
+    sync_downloaded_from_shared(&mut segments, &seg_states);
+    multipath
+        .publish_route(&nodes, &segments, db, sink, task_id)
+        .await;
+    multipath.record_priors(&nodes, db);
+
     // 抽干剩余 durable 水位（循环退出后 interval 不再 tick）。
     {
         let rows = take_durable_progress_rows(&durable_progress, &segments);
@@ -3292,6 +3431,7 @@ pub async fn run_coordinated_download(
         && reject_strikes == 0
         && !serial_mode
         && !conn_sensitive.load(Ordering::Relaxed)
+        && !multipath.alternates_used(&nodes)
     {
         record_domain_conn_hint_persist(url, hint_scale as i32, db);
     }
@@ -3464,6 +3604,7 @@ fn build_fresh_segments(count: i32, total_bytes: i64) -> FreshSegments {
                 end_byte: end,
                 downloaded_bytes: 0,
                 state: SegState::Pending,
+                rate_bps: None,
             },
         );
         db_segs.push((i, start, end));
@@ -3639,10 +3780,59 @@ fn find_next_pending_only(segments: &mut BTreeMap<i32, LiveSegment>) -> Option<N
     })
 }
 
-/// IDM-style in-half division: find the active segment with the most remaining
-/// bytes and split it at the midpoint of its remaining range.
+/// 拆分规划：挑选预计完成最晚的活动段（ECF：持有连接实测速率未知时按
+/// 当前最快连接速率估计，全部未知时退化为剩余字节最多），按持有者与帮手
+/// （当前最快连接）的速率比例切分剩余区间使双方同时完成（DEMS 均衡完成；
+/// 速率未知时为中点）。返回 `(段索引, 当前位置, 剩余字节, 拆分点)`；
+/// 无可拆段或拆分点非法 → `None`。
+fn plan_split(
+    segments: &BTreeMap<i32, LiveSegment>,
+    min_split: i64,
+) -> Option<(i32, i64, i64, i64)> {
+    let helper_bps = segments
+        .values()
+        .filter(|s| s.state == SegState::Active)
+        .filter_map(|s| s.rate_bps)
+        .filter(|r| *r > 0.0)
+        .max_by(f64::total_cmp);
+    let expected_finish = |s: &LiveSegment| -> f64 {
+        match helper_bps {
+            Some(helper) => {
+                crate::path_scheduler::completion_secs(s.remaining(), s.rate_bps.unwrap_or(helper))
+            }
+            None => s.remaining() as f64,
+        }
+    };
+    let best = segments
+        .values()
+        .filter(|s| s.state == SegState::Active && s.remaining() >= min_split)
+        .max_by(|a, b| {
+            expected_finish(a)
+                .total_cmp(&expected_finish(b))
+                .then(a.remaining().cmp(&b.remaining()))
+        })?;
+
+    // The current download position in the best segment.
+    let current_pos = best.start_byte + best.downloaded_bytes;
+    let remaining = best.end_byte - current_pos + 1;
+    if remaining < min_split {
+        return None;
+    }
+    let keep = crate::path_scheduler::balanced_keep(remaining, best.rate_bps, helper_bps);
+    let split_point = current_pos + keep;
+    // Validate: split_point must be within (current_pos, end_byte].
+    // This guarantees both halves are non-empty.
+    if split_point <= current_pos || split_point > best.end_byte {
+        return None;
+    }
+    Some((best.index, current_pos, remaining, split_point))
+}
+
+/// IDM-style division of the active segment expected to finish last (see
+/// [`plan_split`]): the holder keeps a rate-proportional share of its
+/// remaining range, the new segment takes the rest.
 ///
-/// Returns a `NextWork` for the **new** segment (upper half), including the
+/// Returns a `NextWork` for the **new** segment (upper part), including the
 /// index of the parent segment that was shrunk, or `None` if no segment is
 /// large enough to split.
 fn try_split_largest(
@@ -3661,33 +3851,8 @@ fn try_split_largest(
         return None;
     }
 
-    // Find the active segment with the most remaining bytes.
-    let best_idx = segments
-        .values()
-        .filter(|s| s.state == SegState::Active && s.remaining() >= min_split)
-        .max_by_key(|s| s.remaining())
-        .map(|s| s.index)?;
-
-    let best = segments.get(&best_idx)?;
-
-    // The current download position in the best segment.
-    let current_pos = best.start_byte + best.downloaded_bytes;
-    let remaining = best.end_byte - current_pos + 1;
-
-    if remaining < min_split {
-        return None;
-    }
-
-    // Split point = midpoint of the remaining range.
-    let split_point = current_pos + remaining / 2;
-
-    // Validate: split_point must be within (current_pos, end_byte].
-    // This guarantees both halves are non-empty.
-    if split_point <= current_pos || split_point > best.end_byte {
-        return None;
-    }
-
-    let old_end = best.end_byte;
+    let (best_idx, current_pos, remaining, split_point) = plan_split(segments, min_split)?;
+    let old_end = segments.get(&best_idx)?.end_byte;
 
     // New segment covers [split_point, old_end].
     let new_index = *next_index;
@@ -3699,6 +3864,7 @@ fn try_split_largest(
         end_byte: old_end,
         downloaded_bytes: 0,
         state: SegState::Active,
+        rate_bps: None,
     };
 
     // Shrink the original segment to [old_start, split_point - 1].
@@ -3734,7 +3900,8 @@ fn try_split_largest(
     })
 }
 
-/// Proactively split the largest active segment while other workers are still
+/// Proactively split the active segment expected to finish last (see
+/// [`plan_split`]) while other workers are still
 /// running, creating a **Pending** (not Active) child so that an idle or newly-
 /// freed worker can pick it up via `find_next_work`.
 ///
@@ -3768,27 +3935,8 @@ fn try_proactive_split(
         return None;
     }
 
-    // Find the active segment with the most remaining bytes.
-    let best_idx = segments
-        .values()
-        .filter(|s| s.state == SegState::Active && s.remaining() >= min_split)
-        .max_by_key(|s| s.remaining())
-        .map(|s| s.index)?;
-
-    let best = segments.get(&best_idx)?;
-    let current_pos = best.start_byte + best.downloaded_bytes;
-    let remaining = best.end_byte - current_pos + 1;
-
-    if remaining < min_split {
-        return None;
-    }
-
-    let split_point = current_pos + remaining / 2;
-    if split_point <= current_pos || split_point > best.end_byte {
-        return None;
-    }
-
-    let old_end = best.end_byte;
+    let (best_idx, _current_pos, _remaining, split_point) = plan_split(segments, min_split)?;
+    let old_end = segments.get(&best_idx)?.end_byte;
     let new_index = *next_index;
     *next_index += 1;
 
@@ -3799,6 +3947,7 @@ fn try_proactive_split(
         end_byte: old_end,
         downloaded_bytes: 0,
         state: SegState::Pending,
+        rate_bps: None,
     };
 
     if let Some(orig) = segments.get_mut(&best_idx) {
@@ -4179,8 +4328,19 @@ fn spawn_worker(
 
             // 每个 assignment 租借一个节点：段内重试沿用同一租约的 client
             //（keep-alive 连接不丢）；段失败重派后的下一次租借自然避开被
-            // 降权/踢除的节点——段间节点切换零新增状态机。
-            let lease = nodes.lease();
+            // 降权/踢除的节点——段间节点切换零新增状态机。开放式首段 /
+            // plain GET 是配额型端点的唯一生命线，只允许留在起飞路径。
+            // 分段令牌是任务令牌的子令牌：coordinator 完成时间抢占只取消
+            // 本段，任务级取消仍一并生效。
+            let seg_cancel = cancel_token.child_token();
+            let start_downloaded = assignment.actual_start - assignment.seg_start;
+            let lease = nodes.lease_for(crate::cdn::node_pool::LeaseRequest {
+                seg_index: assignment.seg_index,
+                start_downloaded,
+                bytes: assignment.seg_end - assignment.actual_start + 1,
+                allow_alternates: !assignment.open_ended && !assignment.no_range,
+                cancel: seg_cancel.clone(),
+            });
             let seg_started = Instant::now();
 
             let result = do_segment_with_retry(
@@ -4193,15 +4353,16 @@ fn spawn_worker(
                 assignment.seg_end,
                 assignment.open_ended,
                 assignment.no_range,
-                // 钉定租约收紧段内重试预算：失败快速上抛交给节点池切换；
-                // SYS 租约保持原 5 次预算（唯一数据流，耐心自愈 == 现状）。
-                if lease.is_pinned() {
+                // 非 SYS 租约（钉定节点 / 备选路径）收紧段内重试预算：失败
+                // 快速上抛交给节点池切换；SYS 租约保持原 5 次预算（唯一数据流，
+                // 耐心自愈 == 现状）。
+                if lease.is_attributable() {
                     PINNED_NODE_MAX_RETRIES
                 } else {
                     MAX_RETRIES
                 },
                 lease.client(),
-                &cancel_token,
+                &seg_cancel,
                 &conn_sensitive,
                 &reconnect_hostile,
                 &range_verdict,
@@ -4224,19 +4385,33 @@ fn spawn_worker(
             )
             .await;
 
-            // 健康度回报：成功喂 EWMA（≥256KB 段），失败降权/踢除。
+            // 本租约实际传输字节：成功取返回的段总量，失败/被抢占取取消与
+            // 停滞分支刷入共享 seg_states 的进度；减去租约起点即为本租约贡献。
+            let final_downloaded = match &result {
+                Ok(downloaded) => *downloaded,
+                Err(_) => seg_states
+                    .lock()
+                    .ok()
+                    .and_then(|states| {
+                        states
+                            .iter()
+                            .find(|s| s.index == assignment.seg_index)
+                            .map(|s| s.downloaded_bytes)
+                    })
+                    .unwrap_or(start_downloaded),
+            };
+            let transferred = (final_downloaded - start_downloaded).max(0) as u64;
+            nodes.record_transfer(&lease, transferred);
+
+            // 健康度回报：成功为未实测的节点提供初值（≥256KB 段），失败降权/踢除。
             // 取消不回报（非节点信号）。归还（并发额度）由 lease Drop 承担。
             match &result {
-                Ok(downloaded) => nodes.report(
-                    &lease,
-                    (*downloaded).max(0) as u64,
-                    seg_started.elapsed(),
-                    Ok(()),
-                ),
+                Ok(_) => nodes.report(&lease, transferred, seg_started.elapsed(), Ok(())),
                 Err(DownloadError::Cancelled) => {}
                 Err(e) => nodes.report(&lease, 0, seg_started.elapsed(), Err(e)),
             }
-            let lease_pinned = lease.is_pinned();
+            let lease_attributable = lease.is_attributable();
+            let lease_alternate = lease.is_alternate_path();
             let lease_desc = lease.describe();
             drop(lease);
 
@@ -4247,6 +4422,16 @@ fn spawn_worker(
                             worker_id,
                             seg_index: assignment.seg_index,
                             downloaded_bytes: downloaded,
+                        })
+                        .await;
+                }
+                Err(DownloadError::Cancelled) if !cancel_token.is_cancelled() => {
+                    // 仅本段令牌被取消 = coordinator 完成时间抢占：进度已在
+                    // 取消分支刷盘并写入 seg_states；上报后保活等待新派工。
+                    let _ = event_tx
+                        .send(WorkerEvent::Preempted {
+                            worker_id,
+                            seg_index: assignment.seg_index,
                         })
                         .await;
                 }
@@ -4261,11 +4446,27 @@ fn spawn_worker(
                     // 结束时关闭 channel，recv 返回 None 自然退出）。其余错误维持
                     // 原语义：报告后退出。
                     //
-                    // 多节点池的【钉定】租约上，节点可归因错误（连接失败/超时/
-                    // 停滞/validator 不一致/HTTP 拒绝）翻译为 CdnNodeFailed
-                    //（同为可恢复：coordinator 回收段重派，绝不升级为任务失败）。
-                    // SYS 租约的错误保持原样——语义与无聚合时完全一致。
-                    let e = if lease_pinned && crate::cdn::is_node_attributable(&e) {
+                    // 多路径池的非 SYS 租约（钉定节点 / 备选路径）上，节点可归因
+                    // 错误（连接失败/超时/停滞/validator 不一致/HTTP 拒绝）翻译为
+                    // CdnNodeFailed（同为可恢复：coordinator 回收段重派，绝不升级
+                    // 为任务失败）。备选路径（代理）另把 Range 失效/错位归因到
+                    // 路径本身——代理改写响应不能被误学成源站不支持 Range 并触发
+                    // 清盘回退。SYS 租约的错误保持原样——语义与单路径完全一致。
+                    let attributable = crate::cdn::is_node_attributable(&e)
+                        || (lease_alternate
+                            && matches!(
+                                e,
+                                DownloadError::RangeNotSupported(_)
+                                    | DownloadError::RangeMisaligned(_)
+                            ));
+                    // Auto 多路径：SYS 路径的传输层失败（连接重置/超时/停滞）在
+                    // 仍有其它路径存活时同样回收重派——直连被中途阻断时由代理
+                    // 接手，而不是整个任务失败。HTTP 状态/校验类错误保持原语义
+                    // （源站拒绝学习、清盘回退）。
+                    let sys_transport_fallback = !lease_attributable
+                        && crate::auto_proxy::is_route_transport_error(&format!("{e:#}"))
+                        && nodes.try_sys_transport_fallback();
+                    let e = if (lease_attributable && attributable) || sys_transport_fallback {
                         log_info!(
                             "[worker {}] task {} seg {} 节点 {} 可归因失败，翻译为 CdnNodeFailed: {}",
                             worker_id,
@@ -5285,6 +5486,7 @@ mod tests {
             end_byte: end,
             downloaded_bytes: downloaded,
             state,
+            rate_bps: None,
         }
     }
 

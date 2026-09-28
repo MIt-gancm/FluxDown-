@@ -850,7 +850,7 @@
   "set.proxy.mode": "代理模式",
   "set.proxy.none": "不使用代理",
   "set.proxy.auto": "自动（推荐）",
-  "set.proxy.autoDesc": "直连无阻塞起飞，随后并行采样所有可用的手动代理与系统代理；仅当最快代理明显占优时按站点切换；直连任务保留多 CDN 加速。",
+  "set.proxy.autoDesc": "直连无阻塞起飞，同时把手动代理与系统代理当作并行路径：以真实分段实测各路径速度，采样数据直接写入文件不浪费；连接自动流向更快的路径，慢连接在当前位置即时交接，可直连与代理叠加提速。直连仍保留多 CDN 加速。",
   "set.proxy.system": "系统代理",
   "set.proxy.manual": "手动配置",
   "set.proxy.type": "类型",
