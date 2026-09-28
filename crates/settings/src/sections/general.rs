@@ -1,6 +1,6 @@
 //! 通用：启动与托盘、系统集成、侧边栏与活动栏可见性、自定义分类。
 
-use fluxdown_protocol::{ShellStatusDto, TrayUnavailableReason};
+use fluxdown_protocol::{PlatformIntegrationDto, ShellStatusDto, TrayUnavailableReason};
 use fluxdown_ui_components::FluxIcon;
 use gpui::App;
 
@@ -208,36 +208,114 @@ fn integration_supported(ctx: &SectionContext, kind: IntegrationKind, cx: &App) 
     })
 }
 
-/// 系统集成开关：值来自 agent 探测结果，切换即调用 agent 注册/注销。
+/// 用户手动关闭关联时持久化的 opt-out 键（与 Flutter 设置同名）。
+///
+/// macOS Launch Services 没有「无默认处理程序」：FluxDown 是唯一候选时，清空
+/// 默认处理程序后系统仍回落到 FluxDown，探测值恒为 true。opt-out 让用户的
+/// 「关闭」压过探测值，否则开关会被立即顶回开启。
+fn opt_out_key(kind: IntegrationKind) -> Option<&'static str> {
+    match kind {
+        IntegrationKind::Autostart => None,
+        IntegrationKind::Torrent => Some("torrent_assoc_user_disabled"),
+        IntegrationKind::Scheme("magnet") => Some("magnet_assoc_user_disabled"),
+        IntegrationKind::Scheme(_) => Some("ed2k_assoc_user_disabled"),
+    }
+}
+
+/// 开关显示值：系统探测为已关联，且用户未手动关闭。
+fn integration_enabled(
+    dto: &PlatformIntegrationDto,
+    kind: IntegrationKind,
+    user_disabled: bool,
+) -> bool {
+    let probed = match kind {
+        IntegrationKind::Autostart => dto.autostart_enabled,
+        IntegrationKind::Torrent => dto.torrent_associated,
+        IntegrationKind::Scheme(scheme) => dto.url_protocols.get(scheme).copied().unwrap_or(false),
+    };
+    probed && !user_disabled
+}
+
+/// 系统集成开关：值来自 agent 探测结果（叠加用户 opt-out），切换即调用 agent 注册/注销。
 fn integration_switch(ctx: &SectionContext, kind: IntegrationKind) -> Control {
     let get = ctx.store();
     let set = ctx.store();
     Control::switch(
         move |cx: &App| {
-            get.read(cx).integration().is_some_and(|dto| match kind {
-                IntegrationKind::Autostart => dto.autostart_enabled,
-                IntegrationKind::Torrent => dto.torrent_associated,
-                IntegrationKind::Scheme(scheme) => {
-                    dto.url_protocols.get(scheme).copied().unwrap_or(false)
-                }
-            })
+            let store = get.read(cx);
+            let user_disabled = opt_out_key(kind).is_some_and(|key| store.pref_bool(key, false));
+            store
+                .integration()
+                .is_some_and(|dto| integration_enabled(dto, kind, user_disabled))
         },
         move |value, cx: &mut App| {
-            set.update(cx, |store, cx| match kind {
-                IntegrationKind::Autostart => store.set_autostart(value, cx),
-                IntegrationKind::Torrent => {
-                    store.set_pref_bool("torrent_assoc_user_disabled", !value, cx);
-                    store.set_file_association(value, cx);
-                }
-                IntegrationKind::Scheme(scheme) => {
-                    let key: &'static str = match scheme {
-                        "magnet" => "magnet_assoc_user_disabled",
-                        _ => "ed2k_assoc_user_disabled",
-                    };
+            set.update(cx, |store, cx| {
+                if let Some(key) = opt_out_key(kind) {
                     store.set_pref_bool(key, !value, cx);
-                    store.set_url_protocol(scheme, value, cx);
+                }
+                match kind {
+                    IntegrationKind::Autostart => store.set_autostart(value, cx),
+                    IntegrationKind::Torrent => store.set_file_association(value, cx),
+                    IntegrationKind::Scheme(scheme) => store.set_url_protocol(scheme, value, cx),
                 }
             });
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+
+    fn associated_everywhere() -> PlatformIntegrationDto {
+        PlatformIntegrationDto {
+            torrent_associated: true,
+            url_protocols: BTreeMap::from([("magnet".to_owned(), true), ("ed2k".to_owned(), true)]),
+            ..PlatformIntegrationDto::default()
+        }
+    }
+
+    #[test]
+    fn user_opt_out_wins_over_sticky_system_probe() {
+        // macOS：唯一候选时清空默认处理程序无效，探测仍报告已关联。
+        let dto = associated_everywhere();
+        for kind in [
+            IntegrationKind::Torrent,
+            IntegrationKind::Scheme("magnet"),
+            IntegrationKind::Scheme("ed2k"),
+        ] {
+            assert!(!integration_enabled(&dto, kind, true));
+            assert!(integration_enabled(&dto, kind, false));
+        }
+    }
+
+    #[test]
+    fn opt_out_cannot_turn_unassociated_on() {
+        let dto = PlatformIntegrationDto::default();
+        assert!(!integration_enabled(&dto, IntegrationKind::Torrent, false));
+        assert!(!integration_enabled(
+            &dto,
+            IntegrationKind::Scheme("magnet"),
+            false
+        ));
+    }
+
+    #[test]
+    fn each_association_has_its_own_opt_out_key() {
+        assert_eq!(opt_out_key(IntegrationKind::Autostart), None);
+        assert_eq!(
+            opt_out_key(IntegrationKind::Torrent),
+            Some("torrent_assoc_user_disabled")
+        );
+        assert_eq!(
+            opt_out_key(IntegrationKind::Scheme("magnet")),
+            Some("magnet_assoc_user_disabled")
+        );
+        assert_eq!(
+            opt_out_key(IntegrationKind::Scheme("ed2k")),
+            Some("ed2k_assoc_user_disabled")
+        );
+    }
 }
