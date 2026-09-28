@@ -183,18 +183,22 @@ impl CloudClient {
         if response.status() != StatusCode::UNAUTHORIZED {
             return decode(response).await;
         }
-
-        let _guard = self.refresh.lock().await;
-        let current = self.access_token().await?;
-        let replay_token = if current != attempted {
-            current
-        } else {
-            self.refresh_session().await?
-        };
+        let replay_token = self.refreshed_access_token(&attempted).await?;
         let replay = self
             .send_once(method, path, body, Some(&replay_token))
             .await?;
         decode(replay).await
+    }
+
+    /// 401 后取可重放的 access token：单飞刷新，其他调用方已轮换过则直接复用新令牌。
+    /// 普通请求与 SSE 必须共用这一入口，否则并发刷新会用同一枚 refresh token 撞上服务端的一次性轮换。
+    async fn refreshed_access_token(&self, attempted: &str) -> Result<String, CloudError> {
+        let _guard = self.refresh.lock().await;
+        let current = self.access_token().await?;
+        if current != attempted {
+            return Ok(current);
+        }
+        self.refresh_session().await
     }
 
     /// 显式登录/注册成功后，先原子持久化令牌轮换再返回无令牌会话。
@@ -255,6 +259,7 @@ impl CloudClient {
         Ok(())
     }
 
+    /// 调用方必须持有 `self.refresh` 锁。
     async fn refresh_session(&self) -> Result<String, CloudError> {
         let refresh_token = {
             let state = self.state.lock().await;
@@ -282,13 +287,33 @@ impl CloudClient {
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
-            self.clear_session().await?;
-            return Err(CloudError::unauthorized());
+            return self.reject_refresh_token(&refresh_token).await;
         }
         let auth = decode::<AuthResponse>(response).await?;
         let access_token = auth.access_token.clone();
         self.persist_auth(auth).await?;
         Ok(access_token)
+    }
+
+    /// 服务端拒绝了 `rejected`：仅当它仍是当前凭证时才登出；期间凭证已被替换
+    /// （并发刷新 / 重新登录）说明被拒的只是过期副本，沿用当前 access token。
+    async fn reject_refresh_token(&self, rejected: &str) -> Result<String, CloudError> {
+        let current = {
+            let state = self.state.lock().await;
+            state.credentials.as_ref().map(|credentials| {
+                (
+                    credentials.refresh_token.clone(),
+                    credentials.access_token.clone(),
+                )
+            })
+        };
+        match current {
+            Some((refresh, access)) if refresh != rejected && !access.is_empty() => Ok(access),
+            _ => {
+                self.clear_session().await?;
+                Err(CloudError::unauthorized())
+            }
+        }
     }
 
     async fn access_token(&self) -> Result<String, CloudError> {
@@ -332,7 +357,7 @@ impl CloudClient {
         if response.status() != StatusCode::UNAUTHORIZED {
             return ensure_success(response).await;
         }
-        let replay_token = self.refresh_session().await?;
+        let replay_token = self.refreshed_access_token(&access_token).await?;
         ensure_success(self.send_stream_once(path, &replay_token).await?).await
     }
 
@@ -352,7 +377,7 @@ impl CloudClient {
             .header("X-FluxDown-Version", env!("CARGO_PKG_VERSION"))
             .send()
             .await
-            .map_err(|error| CloudError::transport(format!("{error:#}")))
+            .map_err(|error| CloudError::transport(error_chain(&error)))
     }
 
     async fn send_once(
@@ -379,7 +404,7 @@ impl CloudClient {
         request
             .send()
             .await
-            .map_err(|error| CloudError::transport(format!("{error:#}")))
+            .map_err(|error| CloudError::transport(error_chain(&error)))
     }
 }
 
@@ -411,9 +436,22 @@ async fn decode<R: DeserializeOwned>(response: reqwest::Response) -> Result<R, C
         return response
             .json::<R>()
             .await
-            .map_err(|error| CloudError::transport(format!("{error:#}")));
+            .map_err(|error| CloudError::transport(error_chain(&error)));
     }
     Err(response_error(response).await)
+}
+
+/// reqwest 的 `Display`（含 `{:#}`）只输出最外层「error sending request for url」，
+/// 超时 / 连接重置 / TLS / 代理等根因都在 `source()` 链里，必须逐层拼出。
+fn error_chain(error: &reqwest::Error) -> String {
+    let mut message = error.to_string();
+    let mut source = std::error::Error::source(error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
 }
 
 fn validate_base_url(base_url: &str) -> Result<(), CloudError> {
@@ -750,6 +788,119 @@ mod tests {
 
         drop(client);
         drop(restored);
+        drop(state);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// 服务端一次性轮换：refresh token 用过即作废，复用返回 401。
+    #[derive(Clone, Default)]
+    struct RotatingCloud {
+        inner: Arc<Mutex<(String, String, usize)>>,
+    }
+
+    fn bearer(headers: &HeaderMap) -> String {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    async fn rotating_protected(
+        State(cloud): State<RotatingCloud>,
+        headers: HeaderMap,
+    ) -> Response {
+        if bearer(&headers) == cloud.inner.lock().await.0 {
+            axum::Json(json!({ "ok": true })).into_response()
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+
+    async fn rotating_refresh(
+        State(cloud): State<RotatingCloud>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Response {
+        // 模拟真实往返延迟，放大并发刷新窗口。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut inner = cloud.inner.lock().await;
+        if body["refreshToken"].as_str() != Some(inner.1.as_str()) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        inner.2 += 1;
+        inner.0 = format!("access-{}", inner.2);
+        inner.1 = format!("refresh-{}", inner.2);
+        axum::Json(json!({
+            "accessToken": inner.0,
+            "refreshToken": inner.1,
+            "expiresIn": 900,
+            "user": { "id": "u1", "email": "user@example.com" },
+            "device": { "id": "row1", "deviceId": "device1" }
+        }))
+        .into_response()
+    }
+
+    /// 重启后 access 已过期：普通请求与 SSE 重连同时 401，必须只刷新一次且保住会话
+    /// （曾因 SSE 绕过单飞锁，第二次刷新被拒后清空了刚轮换到手的新凭证）。
+    #[tokio::test]
+    async fn concurrent_request_and_stream_refresh_once_and_keep_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind rotating cloud");
+        let address = listener.local_addr().expect("rotating address");
+        let cloud = RotatingCloud::default();
+        *cloud.inner.lock().await = ("access-0".to_owned(), "refresh-0".to_owned(), 0);
+        let app = Router::new()
+            .route("/api/v1/test", get(rotating_protected))
+            .route("/api/v1/stream", get(rotating_protected))
+            .route("/api/v1/auth/refresh", post(rotating_refresh))
+            .with_state(cloud.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_rotation_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let session = serde_json::from_value(json!({
+            "user": { "id": "u1", "email": "user@example.com" },
+            "device": { "id": "row1", "deviceId": "device1" }
+        }))
+        .expect("session dto");
+        let state = Arc::new(Mutex::new(AgentState {
+            device_id: "device1".to_owned(),
+            credentials: Some(CloudCredentials {
+                access_token: "expired-access".to_owned(),
+                refresh_token: "refresh-0".to_owned(),
+                expires_at_unix: 0,
+                session: Some(session),
+            }),
+            ..AgentState::default()
+        }));
+        let client = CloudClient::new(format!("http://{address}"), state.clone(), store.clone())
+            .expect("cloud client");
+
+        let request =
+            client.authenticated::<Value, Value>(reqwest::Method::GET, "/api/v1/test", None);
+        let stream = client.authenticated_stream("/api/v1/stream");
+        let (request, stream) = tokio::join!(request, stream);
+        assert_eq!(request.expect("request replay")["ok"], true);
+        assert!(stream.expect("stream replay").status().is_success());
+        assert_eq!(cloud.inner.lock().await.2, 1, "exactly one rotation");
+        let persisted = store
+            .load()
+            .await
+            .expect("reload state")
+            .credentials
+            .expect("session survives");
+        assert_eq!(persisted.refresh_token, "refresh-1");
+
+        drop(client);
         drop(state);
         drop(store);
         let _ = tokio::fs::remove_dir_all(dir).await;
