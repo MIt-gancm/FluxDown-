@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use fluxdown_protocol::{RpcErrorData, WebhookDeliveriesResponse, WebhookPresetDto, method};
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, IconControlExt as _, card, check_row, choice_chip, field_error,
-    field_hint, form, form_field, form_row, input_with_action, option_group, option_row,
+    field_hint, field_label, form, form_field, form_row, input_with_action, option_group,
+    option_row,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -36,6 +37,14 @@ use crate::ui::dialog_footer;
 const PRESET_CUSTOM: &str = "custom";
 /// 与 Dart `WebhookEvents.defaults` 一致。
 const DEFAULT_EVENTS: &[&str] = &["task.completed", "task.failed"];
+/// 对话框宽度：左表单 + 右实时预览双栏（与 Flutter `maxWidth: 900` 对齐）；
+/// gpui-component 0.7 会按视口自动收窄，小窗口不会溢出。
+const DIALOG_WIDTH: f32 = 900.;
+/// 双栏区域高度（与 Flutter 512 对齐）：固定高度让「高级」展开 / 收起时对话框不跳动，
+/// 表单超出部分在左栏内滚动；视口不够高时随对话框一起收缩。
+const BODY_HEIGHT: f32 = 512.;
+/// 右栏预览宽度（与 Flutter 300 对齐）。
+const PREVIEW_WIDTH: f32 = 300.;
 
 /// 预览用样例变量——与引擎 `WebhookEvent::sample()` 对齐，仅用于预览。
 const SAMPLE_VARS: &[(&str, &str)] = &[
@@ -278,9 +287,8 @@ pub(crate) fn open(
         let view = view.clone();
         dialog
             .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
-            .w(px(640.))
-            .margin_top(px(32.))
-            .content(move |content, _, _| content.child(view.clone()))
+            .w(px(DIALOG_WIDTH))
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
     name.update(cx, |input, cx| input.focus(window, cx));
 }
@@ -986,7 +994,7 @@ impl WebhookDialog {
             }))
     }
 
-    fn render_form(&self, preset: Option<&WebhookPresetDto>, cx: &mut Context<Self>) -> Div {
+    fn render_form(&self, cx: &mut Context<Self>) -> Div {
         let name_field = form_field(
             self.t("webhookFieldName"),
             Input::new(&self.name).control(cx).w_full(),
@@ -1016,7 +1024,7 @@ impl WebhookDialog {
                 .child(self.render_template(cx))
                 .child(self.render_options(cx));
         }
-        body.child(self.render_preview(preset, cx))
+        body
     }
 
     fn preview_body(&self, preset: Option<&WebhookPresetDto>, cx: &App) -> String {
@@ -1044,6 +1052,7 @@ impl WebhookDialog {
             .unwrap_or(rendered)
     }
 
+    /// 右栏：实时请求预览，卡片吃满栏高、内容自身滚动，底部是投递语义说明。
     fn render_preview(&self, preset: Option<&WebhookPresetDto>, cx: &mut Context<Self>) -> Div {
         let tokens = active_theme(cx).tokens().clone();
         let url = {
@@ -1096,17 +1105,23 @@ impl WebhookDialog {
             .style(TextViewStyle::default().code_block(code_style))
             .selectable(true)
             .w_full();
-        form_field(
-            self.t("webhookPreviewTitle"),
-            card(cx)
-                .w_full()
-                .h(px(200.))
-                .px(tokens.spacing.md)
-                .py(tokens.spacing.sm)
-                .child(v_flex().size_full().child(body).overflow_y_scrollbar()),
-            Some(self.t("webhookPreviewMeta")),
-            cx,
-        )
+        v_flex()
+            .flex_none()
+            .w(px(PREVIEW_WIDTH))
+            .min_h_0()
+            .pl(tokens.spacing.md)
+            .gap(tokens.spacing.xs + tokens.spacing.xxs)
+            .child(field_label(self.t("webhookPreviewTitle"), cx))
+            .child(
+                card(cx)
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .px(tokens.spacing.md)
+                    .py(tokens.spacing.sm)
+                    .child(v_flex().size_full().child(body).overflow_y_scrollbar()),
+            )
+            .child(field_hint(self.t("webhookPreviewMeta"), cx))
     }
 
     /// 底栏：左端「发送测试」+ 结果文字，右端「取消 / 保存」。
@@ -1188,7 +1203,9 @@ fn sync_placeholder(
 
 impl Render for WebhookDialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = active_theme(cx).tokens().clone();
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let hairline = theme.extended().colors.hairline;
         let preset = self.current_preset().cloned();
         // 占位符随预设变化（名称 = 预设名，URL = 预设示例）。
         let name_hint = SharedString::from(
@@ -1205,19 +1222,37 @@ impl Render for WebhookDialog {
         );
         sync_placeholder(&self.name, name_hint, window, cx);
         sync_placeholder(&self.url, url_hint, window, cx);
-        // 内容区随内容伸缩、超出上限纵向滚动；底栏固定在下方。
+        // 左栏表单独立滚动、右栏预览常驻可见；底栏固定在双栏下方。
+        // 每层都 `min_h_0`：视口比 BODY_HEIGHT 矮时双栏随对话框收缩，底栏不被裁掉。
         v_flex()
             .w_full()
+            .flex_1()
+            .min_h_0()
             .gap(tokens.spacing.lg)
             .child(field_hint(self.t("webhookDialogDesc"), cx))
             .child(
                 div()
+                    .flex()
                     .w_full()
-                    .max_h(px(500.))
-                    .overflow_y_scrollbar()
-                    .child(self.render_form(preset.as_ref(), cx).pr(tokens.spacing.sm)),
+                    .h(px(BODY_HEIGHT))
+                    .min_h_0()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h_0()
+                            .overflow_y_scrollbar()
+                            .child(self.render_form(cx).pr(tokens.spacing.md)),
+                    )
+                    .child(div().flex_none().w(px(1.)).bg(hairline))
+                    .child(self.render_preview(preset.as_ref(), cx)),
             )
-            .child(self.render_footer(cx).pt(tokens.spacing.sm))
+            .child(
+                self.render_footer(cx)
+                    .pt(tokens.spacing.md)
+                    .border_t_1()
+                    .border_color(hairline),
+            )
     }
 }
 
