@@ -2,10 +2,15 @@
 //! `.torrent` 关联与 URL scheme 注册。
 //!
 //! 关联与 URL scheme 的注册目标是官方桌面程序：Windows 指向同级
-//! `fluxdown-desktop.exe`，macOS 指向 agent 所在的 `.app` bundle，Linux 指向
-//! 打包的 `com.fluxdown.app.desktop`。开机自启的目标是 agent 自身（`--autostart`），
-//! 由 agent 按托盘偏好决定是否再拉起桌面程序。全部函数同步阻塞，RPC 侧需放入
-//! `spawn_blocking`。
+//! `fluxdown-desktop.exe`，macOS 指向外层 `FluxDown.app` bundle（见
+//! [`host_bundle_id`]），Linux 指向打包的 `com.fluxdown.app.desktop`。开机自启的目标是
+//! agent 自身（`--autostart`），由 agent 按托盘偏好决定是否再拉起桌面程序。全部函数
+//! 同步阻塞，RPC 侧需放入 `spawn_blocking`。
+//!
+//! macOS 打包布局：agent 与 `fluxdownd` 位于辅助 bundle
+//! `FluxDown.app/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/`（其 Info.plist 声明
+//! `LSUIElement`，常驻时不占 Dock），桌面程序位于外层 `FluxDown.app/Contents/MacOS/`。
+//! 不在该布局内（开发期 `target/release` 平铺）时按同级目录解析。
 
 mod autostart;
 mod file_association;
@@ -30,13 +35,70 @@ const DESKTOP_EXECUTABLE_NAME: &str = if cfg!(windows) {
     "fluxdown-desktop"
 };
 
-/// 与 agent 同目录的官方桌面程序；文件不存在时返回 `None`。
+/// 官方桌面程序：macOS 辅助 bundle 布局下取外层 `Contents/MacOS/`，否则取 agent 同级；
+/// 文件不存在时返回 `None`。
 #[must_use]
 pub fn desktop_executable() -> Option<PathBuf> {
-    let path = std::env::current_exe()
-        .ok()?
-        .with_file_name(DESKTOP_EXECUTABLE_NAME);
+    let agent = std::env::current_exe().ok()?;
+    #[cfg(target_os = "macos")]
+    if let Some(host_dir) = host_macos_dir(&agent) {
+        let path = host_dir.join(DESKTOP_EXECUTABLE_NAME);
+        return path.is_file().then_some(path);
+    }
+    let path = agent.with_file_name(DESKTOP_EXECUTABLE_NAME);
     path.is_file().then_some(path)
+}
+
+/// 辅助 bundle 的 bundle id = 外层 bundle id + 此后缀（打包脚本
+/// `scripts/package_gpui_macos.sh` 按此写入辅助 Info.plist）。
+#[cfg(target_os = "macos")]
+const HELPER_BUNDLE_ID_SUFFIX: &str = ".agent";
+
+/// agent 位于 `<Host>.app/Contents/Helpers/<Helper>.app/Contents/MacOS/` 时返回外层
+/// `<Host>.app/Contents/MacOS`；其他位置返回 `None`。
+#[cfg(target_os = "macos")]
+fn host_macos_dir(agent_exe: &Path) -> Option<PathBuf> {
+    let macos_dir = agent_exe.parent()?;
+    if !macos_dir.ends_with("Contents/MacOS") {
+        return None;
+    }
+    let helper_app = macos_dir.parent()?.parent()?;
+    if helper_app.extension()? != "app" {
+        return None;
+    }
+    let helpers = helper_app.parent()?;
+    let contents = helpers.parent()?;
+    if helpers.file_name()? != "Helpers" || contents.file_name()? != "Contents" {
+        return None;
+    }
+    if contents.parent()?.extension()? != "app" {
+        return None;
+    }
+    Some(contents.join("MacOS"))
+}
+
+/// `.torrent` 关联与 URL scheme 的注册目标：外层 `FluxDown.app` 的 bundle id。
+///
+/// 辅助 bundle 内由 Core Foundation 解析出的是辅助 bundle 自身的 id，按约定去掉
+/// [`HELPER_BUNDLE_ID_SUFFIX`] 得到外层 id；后缀不符说明打包错误，按不支持处理，
+/// 避免把关联登记到不声明 UTI / scheme 的辅助 bundle 上。
+#[cfg(target_os = "macos")]
+pub(crate) fn host_bundle_id() -> Option<String> {
+    let own = macos_cf::main_bundle_id()?;
+    let in_helper = std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| host_macos_dir(&exe).is_some());
+    host_id_from(own, in_helper)
+}
+
+#[cfg(target_os = "macos")]
+fn host_id_from(own: String, in_helper: bool) -> Option<String> {
+    if !in_helper {
+        return Some(own);
+    }
+    own.strip_suffix(HELPER_BUNDLE_ID_SUFFIX)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
 }
 
 /// 引擎下载中临时文件后缀（`fluxdown_engine::downloader::TEMP_EXT`）；agent 不依赖引擎，
@@ -370,6 +432,47 @@ mod tests {
         let current = std::env::current_exe().expect("current exe");
         let sibling = current.with_file_name(DESKTOP_EXECUTABLE_NAME);
         assert_eq!(desktop_executable(), sibling.is_file().then_some(sibling));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn helper_bundle_resolves_host_macos_dir() {
+        let agent = Path::new(
+            "/Applications/FluxDown.app/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+        );
+        assert_eq!(
+            host_macos_dir(agent),
+            Some(PathBuf::from("/Applications/FluxDown.app/Contents/MacOS"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn flat_or_foreign_layouts_are_not_helper_bundles() {
+        for agent in [
+            "/Applications/FluxDown.app/Contents/MacOS/fluxdown-agent",
+            "/repo/target/release/fluxdown-agent",
+            "/x/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+            "/x/Contents/Helpers/FluxDownAgent.app/Contents/MacOS/fluxdown-agent",
+            "/Applications/FluxDown.app/Contents/Helpers/Agent/Contents/MacOS/fluxdown-agent",
+        ] {
+            assert_eq!(host_macos_dir(Path::new(agent)), None, "{agent}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_bundle_id_strips_helper_suffix_only_inside_helper() {
+        assert_eq!(
+            host_id_from("com.fluxdown.app.agent".to_owned(), true).as_deref(),
+            Some("com.fluxdown.app")
+        );
+        assert_eq!(
+            host_id_from("com.fluxdown.app".to_owned(), false).as_deref(),
+            Some("com.fluxdown.app")
+        );
+        assert_eq!(host_id_from("com.fluxdown.app".to_owned(), true), None);
+        assert_eq!(host_id_from(".agent".to_owned(), true), None);
     }
 
     #[test]

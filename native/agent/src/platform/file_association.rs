@@ -143,10 +143,8 @@ mod inner {
 mod inner {
     use std::path::Path;
 
-    use crate::platform::PlatformError;
-    use crate::platform::macos_cf::{
-        CFStringRef, CfOwned, cf_string, cf_to_string, main_bundle_id,
-    };
+    use crate::platform::macos_cf::{CFStringRef, CfOwned, cf_string, cf_to_string};
+    use crate::platform::{PlatformError, host_bundle_id};
 
     /// Info.plist 中声明的 `.torrent` UTI。
     const TORRENT_UTI: &str = "org.bittorrent.torrent";
@@ -167,7 +165,7 @@ mod inner {
     }
 
     pub fn supported(_desktop: Option<&Path>) -> bool {
-        main_bundle_id().is_some()
+        host_bundle_id().is_some()
     }
 
     /// `.torrent` 当前是否关联到本 bundle。
@@ -183,7 +181,7 @@ mod inner {
         let Some(handler_id) = cf_to_string(handler.raw()) else {
             return false;
         };
-        main_bundle_id().is_some_and(|mine| handler_id.eq_ignore_ascii_case(&mine))
+        host_bundle_id().is_some_and(|mine| handler_id.eq_ignore_ascii_case(&mine))
     }
 
     /// 把本 bundle 设为 `.torrent` 默认处理程序。
@@ -191,7 +189,7 @@ mod inner {
     /// bundle 首次被系统扫描或启动时即已向 Launch Services 登记其 Info.plist
     /// 中声明的 UTI。
     pub fn associate(_desktop: Option<&Path>) -> Result<(), PlatformError> {
-        let bundle_id = main_bundle_id().ok_or(PlatformError::Unsupported(
+        let bundle_id = host_bundle_id().ok_or(PlatformError::Unsupported(
             "fluxdown-agent is not running inside an app bundle",
         ))?;
         let uti = cf_string(TORRENT_UTI)?;

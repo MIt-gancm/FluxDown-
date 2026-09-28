@@ -38,7 +38,7 @@
 - 详情日志：`pages/task_detail_activity.rs` 通过 capability port 查询 `daemon.task.activity`，与实时 `TaskActivityAdded` 按持久 ID 合并；支持最新页、加载更早、断线补齐及失败重试，切换任务/失联作废在途结果。时间取源端 `timestamp_ms`；保留截断与源端队列缺口明确展示。关闭重开不丢历史，不再使用 View 私有状态变化记录冒充引擎日志。
 - 运行链路：`fluxdown-desktop` 探活/单飞启动 `fluxdown-agent`；agent 探活/单飞启动 `fluxdownd`（Unix 下两级子进程都进独立进程组，终端 Ctrl-C 不连带后台）。关闭全部窗口是否终止后两者由 agent 驻留策略决定（`close_to_tray` 且托盘可用 → 驻留）。
 - 开发入口：根目录 `cargo desktop-dev`（`scripts/desktop-dev`，无额外依赖）序列化开发构建（agent 带 `--features fluxdown_agent/desktop`，托盘与剪贴板监听只在该 feature 下编译）；已有 UI 时只唤起，否则先构建三个二进制再启动。`--build-only` 不启动或激活窗口。后台保留常驻/复用语义，不强杀或热替换；运行代码变更需先退出对应进程（托盘「退出」即完全退出），详情见 `CONTRIBUTING.md`。
-- 三个二进制作为同级文件进入 Windows/macOS/Linux app 包；agent/daemon 使用独立 bearer 文件，云 Token 只保存在 agent 私有状态。
+- 三个二进制在 Windows/Linux app 包中为同级文件；macOS 包（`scripts/package_gpui_macos.sh`）为 `FluxDown.app/Contents/MacOS/fluxdown-desktop` + 辅助 bundle `Contents/Helpers/FluxDownAgent.app/Contents/MacOS/{fluxdown-agent,fluxdownd}`：辅助 bundle 声明 `LSUIElement`，常驻 agent 不占 Dock（同 bundle 平铺时 Launch Services 按外层 Info.plist 把 agent 登记为前台 App，Dock 出现第二个图标）；辅助 bundle id = 外层 id + `.agent`，agent 据此还原外层 `com.fluxdown.app` 注册 `.torrent` / URL scheme（`platform::host_bundle_id`），桌面经 `service_bootstrap::bundled_agent_app` 定位辅助 bundle 并以 `open -g` 经 Launch Services 启动（直接 spawn 会让 agent 成为桌面 App 的附属进程，桌面退出后 Dock 以 `exited-with-subordinates` 残留图标直到 agent 退出），agent 经 `platform::desktop_executable` 反查外层桌面程序；打包后系统打开链接 / 种子的事件由桌面程序接收。agent/daemon 使用独立 bearer 文件，云 Token 只保存在 agent 私有状态。
 - gpui-base 尚未发布，依赖暂走固定 gpui-component git commit；Zed workspace 必须在 `Cargo.lock` 统一为单一提交，否则 `gpui` 类型会分裂。
 
 ---

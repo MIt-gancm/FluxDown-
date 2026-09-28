@@ -30,6 +30,8 @@ Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm
 
 构建期 dart-define：`APP_VERSION`、`ANALYTICS_APP_KEY`、`FLUXCLOUD_BASE_URL`、`STATS_*`。
 
+**macOS 签名/公证 secrets（2026-09-28 全部配置到 `zerx-lab/FluxDown`，workflow 尚未接入）**：分发走 DMG（Developer ID + notarytool），不上 Mac App Store。Team ID `KD4N89AAF5`（个人账户 Yunhua Qu）。`MACOS_CERT_P12_BASE64`（Developer ID Application 证书 + 私钥的 .p12，base64；证书 SHA1 `A14C6036…DAB3C`，2031-09-13 到期）、`MACOS_CERT_PASSWORD`（.p12 导出密码）、`APPLE_API_KEY_P8_BASE64`（App Store Connect 团队 API 密钥 .p8，base64，角色「开发者」）、`APPLE_API_KEY_ID`、`APPLE_API_ISSUER_ID`。公证用 `xcrun notarytool submit --key <p8> --key-id … --issuer …`，不用 Apple ID + App 专用密码。值只在 GitHub Secrets，**禁止**把 .p12/.p8/密码提交进仓库。
+
 `fluxdown-agent` 的 FluxCloud 地址解析（`native/agent/src/runtime.rs`）：运行期 env `FLUXCLOUD_BASE_URL` > 编译期同名 env（`option_env!`，正式包应在 `cargo build` 时注入，与 dart-define 同源）> `http://127.0.0.1:8720`。**仅调试构建**再叠加 agent 私有状态里的用户覆盖（`agent.cloud.endpointGet/Set`，GPUI 账户页「服务器地址」卡片；对齐 Flutter `CloudApiConfig` 的 `kDebugMode` 门控），正式构建忽略残留覆盖并拒绝 `endpointSet`。
 
 **GPUI 调试包**（`.github/workflows/gpui-debug-package.yml`，仅 `workflow_dispatch`，不发 Release）：输入 `ref` / `platform`（windows·linux·macos·all）/ `arch`（x64·arm64·all）/ `build_mode`，产出 `fluxdown-desktop` + `fluxdown-agent` + `fluxdownd` 同目录压缩包（Windows zip 带 MSVC CRT 与 `.pdb`，Unix tar.gz 保留可执行位）。始终走 `--release`：`gpui_windows` 在 `debug_assertions` 下运行期按构建机绝对路径读 `shaders.hlsl`，debug 包换机即失效；`fast` 模式只经 `CARGO_PROFILE_RELEASE_*` 关 LTO、保留行号符号。同理 macOS 主机无法交叉出 Windows release 包（着色器 `fxc` 预编译只在 Windows 主机的 build.rs 执行）。

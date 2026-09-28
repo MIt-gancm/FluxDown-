@@ -235,10 +235,8 @@ mod inner {
     use std::path::Path;
 
     use super::UrlScheme;
-    use crate::platform::PlatformError;
-    use crate::platform::macos_cf::{
-        CFStringRef, CfOwned, cf_string, cf_to_string, main_bundle_id,
-    };
+    use crate::platform::macos_cf::{CFStringRef, CfOwned, cf_string, cf_to_string};
+    use crate::platform::{PlatformError, host_bundle_id};
 
     #[link(name = "CoreServices", kind = "framework")]
     unsafe extern "C" {
@@ -250,7 +248,7 @@ mod inner {
     }
 
     pub fn supported(_desktop: Option<&Path>) -> bool {
-        main_bundle_id().is_some()
+        host_bundle_id().is_some()
     }
 
     /// 本 bundle 是否为 `proto` 的默认处理程序。
@@ -264,12 +262,12 @@ mod inner {
         let Some(handler_id) = cf_to_string(handler.raw()) else {
             return false;
         };
-        main_bundle_id().is_some_and(|mine| handler_id.eq_ignore_ascii_case(&mine))
+        host_bundle_id().is_some_and(|mine| handler_id.eq_ignore_ascii_case(&mine))
     }
 
     /// 把本 bundle 设为 `proto` 的默认处理程序。
     pub fn register(proto: UrlScheme, _desktop: Option<&Path>) -> Result<(), PlatformError> {
-        let bundle_id = main_bundle_id().ok_or(PlatformError::Unsupported(
+        let bundle_id = host_bundle_id().ok_or(PlatformError::Unsupported(
             "fluxdown-agent is not running inside an app bundle",
         ))?;
         let scheme = cf_string(proto.scheme)?;

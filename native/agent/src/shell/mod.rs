@@ -53,7 +53,8 @@ pub enum TrayAction {
     ResumeAll,
     CancelShutdown,
     Quit,
-    /// 系统把链接 / `.torrent` 交给了 agent（macOS 上 agent 与桌面同处一个 bundle）。
+    /// 系统把链接 / `.torrent` 交给了 agent（macOS 上仅当 agent 被 Launch Services 视为
+    /// 处理程序时出现，如未打包的开发布局；打包后这些事件由外层桌面程序接收）。
     OpenUrls(Vec<String>),
     /// 系统注销 / 关机：执行完全退出。
     SessionEnd,
