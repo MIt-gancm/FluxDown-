@@ -56,6 +56,7 @@ pub fn open(cx: &mut App) {
             )
         });
         attach(&session, &account, cx);
+        Desktop::global_mut(cx).settings_view = Some(settings.downgrade());
         attach(&session, &extensions, cx);
         let window_view =
             cx.new(|cx| AuxiliaryWindowView::new(translator, keys::SETTINGS, settings.into(), cx));

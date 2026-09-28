@@ -14,7 +14,7 @@ use fluxdown_protocol::{
 };
 use fluxdown_ui_downloads::DownloadView;
 use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator, system_locale};
-use fluxdown_ui_settings::{SettingsStore, component_locale};
+use fluxdown_ui_settings::{SettingsStore, SettingsView, component_locale};
 use fluxdown_ui_shell::ShellView;
 use gpui::{App, AppContext as _, Entity, Global, WeakEntity};
 use gpui_component::menu::AppMenuBar;
@@ -80,6 +80,8 @@ pub(crate) struct Desktop {
     /// 主窗口内的下载页（主窗口关闭后失效）。
     pub main_downloads: Option<WeakEntity<DownloadView>>,
     pub main_shell: Option<WeakEntity<ShellView>>,
+    /// 设置窗口内的设置页（窗口关闭后失效）：命令面板据此定位设置项。
+    pub settings_view: Option<WeakEntity<SettingsView>>,
     /// 最新偏好（快照 + `PreferencesChanged` 折叠）。
     pub preferences: BTreeMap<String, serde_json::Value>,
     /// 最新运行时统计（关窗 / 退出提示用）。
@@ -227,6 +229,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             menu_bar,
             main_downloads: None,
             main_shell: None,
+            settings_view: None,
             preferences: BTreeMap::new(),
             runtime_stats: DaemonRuntimeStatsDto::default(),
             shell: ShellStatusDto::default(),

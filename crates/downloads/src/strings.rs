@@ -76,7 +76,12 @@ pub(crate) struct DownloadStrings {
     pub(crate) rename_task_placeholder: SharedString,
     pub(crate) redownload_task: SharedString,
     pub(crate) copy_url: SharedString,
+    /// 复制下载地址后的成功提示。
+    pub(crate) url_copied: SharedString,
     pub(crate) move_to_queue: SharedString,
+    /// 右键「详情」：在停靠面板中查看。
+    pub(crate) detail: SharedString,
+    /// 详情面板头部「在独立窗口打开」。
     pub(crate) open_in_window: SharedString,
     pub(crate) group_pause_all: SharedString,
     pub(crate) group_resume_all: SharedString,
@@ -179,8 +184,10 @@ impl DownloadStrings {
             rename_task_placeholder: shared(translator.text("renameTaskPlaceholder")),
             redownload_task: shared(translator.text("redownloadTask")),
             copy_url: shared(translator.text("copyUrl")),
+            url_copied: shared(translator.text("urlCopied")),
             move_to_queue: shared(translator.text("moveToQueueAction")),
-            open_in_window: shared(translator.text("detail")),
+            detail: shared(translator.text("detail")),
+            open_in_window: shared(translator.text("menuOpenInWindow")),
             group_pause_all: shared(translator.text("groupPauseAll")),
             group_resume_all: shared(translator.text("groupResumeAll")),
             group_retry_failed: shared(translator.text("groupRetryFailed")),

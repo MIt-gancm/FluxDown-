@@ -402,6 +402,14 @@ impl SettingsRow {
             || self.keywords.iter().any(hit)
     }
 
+    /// 除标题外参与搜索的文本：描述、帮助说明、关键词。
+    pub(crate) fn search_terms(&self) -> impl Iterator<Item = &SharedString> {
+        self.description
+            .iter()
+            .chain(self.help.iter())
+            .chain(self.keywords.iter())
+    }
+
     /// Flutter `_AdaptiveSections._weightOf` 的行权重。
     fn layout_weight(&self) -> f32 {
         self.weight.unwrap_or(if self.full.is_some() {
@@ -829,6 +837,15 @@ impl SettingsSection {
         self.rows.is_empty()
     }
 
+    /// 小节标题（搜索索引用作面包屑与补充文本）。
+    pub(crate) fn heading(&self) -> Option<&SharedString> {
+        self.title.as_ref()
+    }
+
+    pub(crate) fn rows(&self) -> &[SettingsRow] {
+        &self.rows
+    }
+
     fn filtered(&self, query: &str) -> Option<Self> {
         let title_hit = !query.is_empty()
             && (self
@@ -959,6 +976,11 @@ impl SettingsTab {
         self
     }
 
+    /// 本 Tab 的分组（注入整页视图的 Tab 为空）。
+    pub(crate) fn section_list(&self) -> &[SettingsSection] {
+        &self.sections
+    }
+
     fn filtered(&self, query: &str) -> Option<Self> {
         if self.view.is_some() {
             return (query.is_empty() || self.label.to_lowercase().contains(query))
@@ -1076,6 +1098,10 @@ impl SettingsPage {
 
     pub(crate) fn nav_icon(&self) -> Icon {
         self.icon.clone()
+    }
+
+    pub(crate) fn tabs(&self) -> &[SettingsTab] {
+        &self.tabs
     }
 
     /// 按查询过滤；无命中返回 `None`（分类在搜索结果中隐藏）。

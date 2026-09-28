@@ -25,11 +25,12 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
-    Disableable as _, Icon,
+    Disableable as _, Icon, WindowExt as _,
     button::{Button, ButtonVariants as _},
     chart::AreaChart,
     h_flex,
     input::{InputState, NumberInput},
+    notification::Notification,
     v_flex,
 };
 
@@ -546,13 +547,14 @@ impl TaskDetailView {
         .detach();
     }
 
-    fn copy_link(&mut self, cx: &mut Context<Self>) {
+    fn copy_link(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(row) = self.store.get(&RowKey::Local(self.task_id.clone())) else {
             return;
         };
         let url = row.share_url().to_owned();
         drop(row);
         cx.write_to_clipboard(ClipboardItem::new_string(url));
+        window.push_notification(Notification::success(self.strings.url_copied.clone()), cx);
     }
 
     fn save_seed_limits(&mut self, cx: &mut Context<Self>) {
@@ -1007,7 +1009,7 @@ impl TaskDetailView {
                     .control(cx)
                     .icon(FluxIcon::Copy)
                     .label(self.strings.copy_url.clone())
-                    .on_click(cx.listener(|this, _, _, cx| this.copy_link(cx))),
+                    .on_click(cx.listener(|this, _, window, cx| this.copy_link(window, cx))),
             ),
         )
         .into_any_element()

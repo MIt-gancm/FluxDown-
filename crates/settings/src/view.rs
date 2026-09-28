@@ -11,8 +11,8 @@ use fluxdown_ui_components::{
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyView, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
-    Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
+    AnyView, App, AppContext as _, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon,
@@ -21,6 +21,7 @@ use gpui_component::{
     v_flex,
 };
 
+use crate::search::SettingsTarget;
 use crate::sections::{
     self, SectionContext, about, api, appearance, bt, doctor, download, ed2k, general, notify,
     proxy,
@@ -118,34 +119,27 @@ impl SettingsView {
             translator: &translator,
             translator_entity: &self.translator,
         };
-        vec![
-            general::page(&ctx, &self.slots.activity_bar, cx),
-            sections::slot_page(
-                &ctx,
-                "account",
-                "settingsCatAccount",
-                "settingsCatAccountDesc",
-                FluxIcon::User,
-                self.slots.account.clone(),
-            ),
-            appearance::page(&ctx, cx),
-            download::page(&ctx, cx),
-            bt::page(&ctx, cx),
-            ed2k::page(&ctx, cx),
-            proxy::page(&ctx, cx),
-            api::page(&ctx, cx),
-            notify::page(&ctx, cx),
-            sections::slot_page(
-                &ctx,
-                "extensions",
-                "settingsCatExtensions",
-                "settingsCatExtensionsDesc",
-                FluxIcon::Package,
-                self.slots.extensions.clone(),
-            ),
-            doctor::page(&ctx, cx),
-            about::page(&ctx, cx),
-        ]
+        build_pages(
+            &ctx,
+            &self.slots.activity_bar,
+            self.slots.account.clone(),
+            self.slots.extensions.clone(),
+            cx,
+        )
+    }
+
+    /// 定位到设置项：切到目标分类与子 Tab；指向具体行时以行标题填入搜索框筛出该行，
+    /// 指向分类 / Tab 时清空搜索。
+    pub fn reveal(&mut self, target: &SettingsTarget, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = SharedString::from(target.page);
+        if !target.tab.is_empty() {
+            self.tab_by_page
+                .insert(SharedString::from(target.page), target.tab);
+        }
+        let query = target.row.clone().unwrap_or_default();
+        self.search
+            .update(cx, |search, cx| search.set_value(query, window, cx));
+        cx.notify();
     }
 
     fn render_nav_item(&self, page: &SettingsPage, cx: &mut Context<Self>) -> impl IntoElement {
@@ -305,6 +299,44 @@ impl SettingsView {
                     .child(page.render_tab(tab_id, content_width, window, cx)),
             )
     }
+}
+
+/// 全部设置分类页（设置窗口渲染与搜索索引共用同一份构建）。
+pub(crate) fn build_pages(
+    ctx: &SectionContext,
+    activity_bar: &[ActivityBarToggle],
+    account: Option<AnyView>,
+    extensions: Option<AnyView>,
+    cx: &mut App,
+) -> Vec<SettingsPage> {
+    vec![
+        general::page(ctx, activity_bar, cx),
+        sections::slot_page(
+            ctx,
+            "account",
+            "settingsCatAccount",
+            "settingsCatAccountDesc",
+            FluxIcon::User,
+            account,
+        ),
+        appearance::page(ctx, cx),
+        download::page(ctx, cx),
+        bt::page(ctx, cx),
+        ed2k::page(ctx, cx),
+        proxy::page(ctx, cx),
+        api::page(ctx, cx),
+        notify::page(ctx, cx),
+        sections::slot_page(
+            ctx,
+            "extensions",
+            "settingsCatExtensions",
+            "settingsCatExtensionsDesc",
+            FluxIcon::Package,
+            extensions,
+        ),
+        doctor::page(ctx, cx),
+        about::page(ctx, cx),
+    ]
 }
 
 impl Render for SettingsView {

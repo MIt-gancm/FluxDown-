@@ -3075,6 +3075,7 @@ dependencies = [
  "directories",
  "fluxdown_protocol",
  "fluxdown_ui_account",
+ "fluxdown_ui_command_palette",
  "fluxdown_ui_components",
  "fluxdown_ui_downloads",
  "fluxdown_ui_extensions",
@@ -3098,6 +3099,21 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "winresource",
+]
+
+[[package]]
+name = "fluxdown_ui_command_palette"
+version = "0.1.0"
+dependencies = [
+ "fluxdown_ui_components",
+ "fluxdown_ui_i18n",
+ "fluxdown_ui_theme",
+ "gpui-base",
+ "gpui-component",
+ "gpui-pre",
+ "pinyin",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -7708,6 +7724,12 @@ name = "pin-utils"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
+
+[[package]]
+name = "pinyin"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e225f595052d9c46045755be4b8d7950b6d9f3c33e0c0b74ba58f11bbfa8c64b"
 
 [[package]]
 name = "piper"

@@ -8,8 +8,8 @@ use gpui_component::{GlobalState, WindowExt as _, menu::AppMenuBar};
 use crate::{
     actions::{
         About, BringAllToFront, CheckUpdate, CloseWindow, Hide, HideOthers, MinimizeWindow,
-        OpenLogsFolder, OpenSettings, OpenWebsite, Quit, ShowAll, ShowMainWindow, ToggleFullScreen,
-        ZoomWindow,
+        OpenLogsFolder, OpenSettings, OpenWebsite, Quit, ShowAll, ShowMainWindow,
+        ToggleCommandPalette, ToggleFullScreen, ZoomWindow,
     },
     app::Desktop,
     windows::{WindowKey, WindowRegistry, confirm_active_tasks},
@@ -35,6 +35,7 @@ pub fn bind_keys(cx: &mut App) {
     let mut bindings = vec![
         KeyBinding::new(&format!("{p}-n"), dl::NewDownload, None),
         KeyBinding::new(&format!("{p}-,"), OpenSettings, None),
+        KeyBinding::new(&format!("{p}-k"), ToggleCommandPalette, None),
         KeyBinding::new(&format!("{p}-f"), dl::FocusSearch, dl_ctx),
         KeyBinding::new(&format!("{p}-a"), dl::SelectAllTasks, dl_ctx),
         KeyBinding::new("delete", dl::DeleteSelected, dl_ctx),
@@ -64,6 +65,7 @@ pub fn bind_keys(cx: &mut App) {
         ]);
     }
     cx.bind_keys(bindings);
+    fluxdown_ui_command_palette::bind_keys(cx);
 }
 
 fn t(translator: &Translator, key: &str) -> SharedString {
@@ -214,6 +216,7 @@ pub fn install_global_actions(cx: &mut App) {
     cx.on_action(|_: &CheckUpdate, cx| check_update(cx));
     cx.on_action(|_: &OpenLogsFolder, cx| open_logs_folder(cx));
     cx.on_action(|_: &About, cx| show_about(cx));
+    cx.on_action(|_: &ToggleCommandPalette, cx| crate::command_palette::toggle(cx));
 }
 
 /// 全局动作里操作活动窗口必须 defer：键盘触发时正处于该窗口自己的 update 栈内，

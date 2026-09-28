@@ -21,6 +21,8 @@ actions!(
         Hide,
         HideOthers,
         ShowAll,
-        BringAllToFront
+        BringAllToFront,
+        /// 打开 / 关闭全局命令面板（⌘K / Ctrl+K）。
+        ToggleCommandPalette
     ]
 );

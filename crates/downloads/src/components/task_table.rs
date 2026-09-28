@@ -316,7 +316,8 @@ pub(crate) enum MenuEntry {
     Separator,
     Delete,
     DeleteWithFiles,
-    OpenInWindow,
+    /// 在主窗口停靠详情面板中查看（独立窗口经面板头部「在独立窗口打开」）。
+    ShowDetail,
 }
 
 /// 纯函数：按选中任务集合的事实计算应显示的右键菜单项。
@@ -382,7 +383,7 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
     items.push(MenuEntry::Delete);
     items.push(MenuEntry::DeleteWithFiles);
     if selection.iter().any(|task| task.is_local) {
-        items.push(MenuEntry::OpenInWindow);
+        items.push(MenuEntry::ShowDetail);
     }
     items
 }
@@ -1119,6 +1120,24 @@ impl DownloadTableDelegate {
         keys
     }
 
+    /// 恰好选中一个任务时返回它（停靠详情面板跟随选中用；O(1)，表格高频通知下可放心调用）。
+    pub(crate) fn single_selected_key(&self) -> Option<&RowKey> {
+        if self.selected_tasks.len() == 1 {
+            self.selected_tasks.iter().next()
+        } else {
+            None
+        }
+    }
+
+    /// 「详情」要展示的本地任务：优先选区锚点（右键 / 最后点击的行），否则按序第一个本地选中项。
+    pub(crate) fn detail_candidate(&self) -> Option<RowKey> {
+        self.selection_anchor
+            .as_ref()
+            .filter(|key| key.is_local() && self.selected_tasks.contains(*key))
+            .cloned()
+            .or_else(|| self.selected_keys().into_iter().find(RowKey::is_local))
+    }
+
     /// 选中集合投影（选择条 / 工具栏）：只统计仍存在于 store 的选中任务
     /// （已删除任务不算），完整遍历以得到数量与各类可用性。
     pub(crate) fn selection_summary(&self) -> SelectionSummary {
@@ -1742,10 +1761,10 @@ impl DownloadTableDelegate {
                 FluxIcon::Trash2,
                 Box::new(crate::actions::DeleteSelectedWithFiles),
             ),
-            MenuEntry::OpenInWindow => menu.menu_with_icon(
-                self.strings.open_in_window.clone(),
-                FluxIcon::AppWindow,
-                Box::new(crate::actions::OpenSelectedInWindow),
+            MenuEntry::ShowDetail => menu.menu_with_icon(
+                self.strings.detail.clone(),
+                FluxIcon::PanelRight,
+                Box::new(crate::actions::ShowSelectedDetail),
             ),
         }
     }
@@ -1822,7 +1841,7 @@ impl DownloadTableDelegate {
             group_id,
             DownloadView::group_open_folder,
         ));
-        menu = menu.item(group_menu_item(
+        menu = menu.item(group_menu_item_windowed(
             self.strings.group_copy_source_link.clone(),
             FluxIcon::Copy,
             host,
@@ -2976,7 +2995,7 @@ mod context_menu_tests {
                 MenuEntry::Separator,
                 MenuEntry::Delete,
                 MenuEntry::DeleteWithFiles,
-                MenuEntry::OpenInWindow,
+                MenuEntry::ShowDetail,
             ]
         );
     }
@@ -2987,7 +3006,7 @@ mod context_menu_tests {
         // 消失；要求全体本地的项（打开文件/目录/移动队列/重下载）因远程任务
         // 不满足而消失；resume 因两者都不满足「非完成非下载中」而消失；pause
         // 因远程任务处于下载中而显示（存在语义）；复制链接/删除类始终显示；
-        // 「独立窗口打开」因存在本地任务而显示。
+        // 「详情」因存在本地任务而显示。
         let selection = [
             task(true, TaskState::Completed),
             task(false, TaskState::Downloading),
@@ -3001,7 +3020,7 @@ mod context_menu_tests {
                 MenuEntry::Separator,
                 MenuEntry::Delete,
                 MenuEntry::DeleteWithFiles,
-                MenuEntry::OpenInWindow,
+                MenuEntry::ShowDetail,
             ]
         );
     }

@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 directories = "6"
 fluxdown_protocol = { version = "0.1.0", path = "../../native/protocol" }
+fluxdown_ui_command_palette = { version = "0.1.0", path = "../command_palette" }
 fluxdown_ui_account = { version = "0.1.0", path = "../account" }
 fluxdown_ui_downloads = { path = "../downloads" }
 fluxdown_ui_extensions = { version = "0.1.0", path = "../extensions" }

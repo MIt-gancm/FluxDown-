@@ -4,10 +4,9 @@ use std::{rc::Rc, sync::Arc};
 
 use fluxdown_ui_components::FluxIcon;
 use fluxdown_ui_downloads::{DownloadHostActions, DownloadView};
-use fluxdown_ui_i18n::keys;
 use fluxdown_ui_rss::RssView;
 use fluxdown_ui_settings::WebhookView;
-use fluxdown_ui_shell::{RouteId, ShellAction, ShellRoute, ShellView, main_window_options};
+use fluxdown_ui_shell::{ShellAction, ShellRoute, ShellView, main_window_options};
 use fluxdown_ui_theme::{active_theme, toggle_theme};
 use gpui::{App, AppContext as _, Window, WindowHandle, px, size};
 use gpui_component::{Icon, Root};
@@ -65,10 +64,10 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
             match entry {
                 ActivityEntry::Downloads => routes.push(
                     ShellRoute::new(
-                        RouteId::new("downloads"),
+                        crate::activity::DOWNLOADS_ROUTE,
                         button_id,
                         "activity-downloads-tooltip",
-                        keys::MOBILE_NAV_DOWNLOADS,
+                        entry.label_key(),
                         Icon::new(FluxIcon::Download),
                         downloads.clone().into(),
                     )
@@ -77,10 +76,10 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                 ),
                 ActivityEntry::Rss => routes.push(
                     ShellRoute::new(
-                        RouteId::new("rss"),
+                        crate::activity::RSS_ROUTE,
                         button_id,
                         "activity-rss-tooltip",
-                        "sidebarRss",
+                        entry.label_key(),
                         Icon::new(FluxIcon::Rss),
                         rss.clone().into(),
                     )
@@ -88,10 +87,10 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                 ),
                 ActivityEntry::Webhooks => routes.push(
                     ShellRoute::new(
-                        RouteId::new("webhooks"),
+                        crate::activity::WEBHOOKS_ROUTE,
                         button_id,
                         "activity-webhooks-tooltip",
-                        "webhookNavTitle",
+                        entry.label_key(),
                         Icon::new(FluxIcon::Webhook),
                         webhooks.clone().into(),
                     )
@@ -101,7 +100,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                     ShellAction::with_dynamic_icon(
                         button_id,
                         "activity-theme-tooltip",
-                        "activityThemeToggle",
+                        entry.label_key(),
                         |cx| {
                             if active_theme(cx).mode().is_dark() {
                                 Icon::new(FluxIcon::Sun)
@@ -117,7 +116,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                     ShellAction::new(
                         button_id,
                         "activity-settings-tooltip",
-                        keys::SETTINGS,
+                        entry.label_key(),
                         Icon::new(FluxIcon::Settings),
                         move |_, cx| crate::windows::settings::open(cx),
                     )

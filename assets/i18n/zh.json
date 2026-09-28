@@ -1898,5 +1898,11 @@
   "showActivityWebhooksDesc": "在活动栏显示 Webhook 入口",
   "showActivityTheme": "主题切换",
   "showActivityThemeDesc": "在活动栏底部显示明暗主题切换按钮",
-  "activityThemeToggle": "切换主题"
+  "activityThemeToggle": "切换主题",
+  "commandPalettePlaceholder": "搜索功能与设置…",
+  "commandPaletteNoResults": "没有匹配的功能或设置",
+  "commandPaletteGoTo": "前往{page}",
+  "commandPalettePauseAllAliases": "全部停止",
+  "commandPaletteResumeAllAliases": "全部开始|全部启动|全部继续",
+  "commandPaletteQuitAliases": "退出应用|关闭程序"
 }

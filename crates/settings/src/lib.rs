@@ -4,6 +4,7 @@
 //! 全部读写经 [`SettingsPort`] 注入的单一 agent 会话，导入主题经 [`ThemeLibrary`] 存取本机文件。
 
 mod port;
+mod search;
 mod sections;
 mod store;
 mod theme_library;
@@ -12,6 +13,7 @@ mod view;
 mod webhook_view;
 
 pub use port::{PortFuture, SettingsPort, StoredTheme, ThemeInfo, ThemeLibrary};
+pub use search::{SettingsSearchEntry, SettingsTarget, search_index};
 pub use store::{SettingsError, SettingsErrorKind, SettingsStore};
 pub use theme_library::install_theme_library;
 pub use view::{ActivityBarToggle, SettingsContentSlots, SettingsView};

@@ -1898,5 +1898,11 @@
   "showActivityWebhooksDesc": "Show the Webhooks entry in the activity bar",
   "showActivityTheme": "Theme toggle",
   "showActivityThemeDesc": "Show the light/dark toggle at the bottom of the activity bar",
-  "activityThemeToggle": "Toggle theme"
+  "activityThemeToggle": "Toggle theme",
+  "commandPalettePlaceholder": "Search commands and settings…",
+  "commandPaletteNoResults": "No matching commands or settings",
+  "commandPaletteGoTo": "Go to {page}",
+  "commandPalettePauseAllAliases": "Stop all",
+  "commandPaletteResumeAllAliases": "Start all|Continue all",
+  "commandPaletteQuitAliases": "Exit|Close app"
 }

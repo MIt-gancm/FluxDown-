@@ -20,6 +20,8 @@ actions!(
         OpenSelected,
         RevealSelected,
         OpenSelectedInWindow,
+        /// 在停靠详情面板中查看选中任务（右键「详情」）。
+        ShowSelectedDetail,
         CopySelectedUrl,
         RenameSelected,
         RedownloadSelected,

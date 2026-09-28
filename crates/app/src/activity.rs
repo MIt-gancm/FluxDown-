@@ -7,8 +7,13 @@
 use std::collections::BTreeMap;
 
 use fluxdown_ui_settings::ActivityBarToggle;
-use fluxdown_ui_shell::ShellView;
+use fluxdown_ui_shell::{RouteId, ShellView};
 use gpui::Context;
+
+/// 主窗口路由标识：主窗口装配与命令面板导航共用。
+pub(crate) const DOWNLOADS_ROUTE: RouteId = RouteId::new("downloads");
+pub(crate) const RSS_ROUTE: RouteId = RouteId::new("rss");
+pub(crate) const WEBHOOKS_ROUTE: RouteId = RouteId::new("webhooks");
 
 /// 活动栏条目，按自上而下顺序（路由在上，动作在下）。
 ///
@@ -40,6 +45,27 @@ impl ActivityEntry {
             Self::Webhooks => "activity-webhooks",
             Self::Theme => "activity-theme",
             Self::Settings => "activity-settings",
+        }
+    }
+
+    /// 活动栏按钮与命令面板共用的标题文案键。
+    pub(crate) const fn label_key(self) -> &'static str {
+        match self {
+            Self::Downloads => fluxdown_ui_i18n::keys::MOBILE_NAV_DOWNLOADS,
+            Self::Rss => "sidebarRss",
+            Self::Webhooks => "webhookNavTitle",
+            Self::Theme => "activityThemeToggle",
+            Self::Settings => fluxdown_ui_i18n::keys::SETTINGS,
+        }
+    }
+
+    /// 路由条目的 shell 路由标识；动作条目为 `None`。
+    pub(crate) const fn route(self) -> Option<RouteId> {
+        match self {
+            Self::Downloads => Some(DOWNLOADS_ROUTE),
+            Self::Rss => Some(RSS_ROUTE),
+            Self::Webhooks => Some(WEBHOOKS_ROUTE),
+            Self::Theme | Self::Settings => None,
         }
     }
 
