@@ -103,7 +103,6 @@ pub(super) fn open_editor(
         dialog
             .title(dialog_title(title.clone(), cx))
             .w(px(640.))
-            .margin_top(px(32.))
             .overlay_closable(false)
             .keyboard(false)
             .close_button(false)
