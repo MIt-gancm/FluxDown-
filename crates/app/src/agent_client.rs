@@ -158,8 +158,12 @@ async fn run_client(
                     }
                 }
             }
-            Err(ConnectError::Refused) => {
-                if bootstrap.ensure_running(&config.rpc_url).await.is_err()
+            Err(error @ (ConnectError::NoBearer | ConnectError::Refused)) => {
+                let probe_listener = matches!(error, ConnectError::NoBearer);
+                if bootstrap
+                    .ensure_running(&config.rpc_url, probe_listener)
+                    .await
+                    .is_err()
                     && events.send(AgentClientEvent::Stale).await.is_err()
                 {
                     return;
@@ -227,10 +231,10 @@ async fn request_shutdown(config: &AgentClientConfig) -> bool {
 async fn open_socket(config: &AgentClientConfig) -> Result<Socket, ConnectError> {
     let bearer = tokio::fs::read_to_string(&config.bearer_path)
         .await
-        .map_err(|_| ConnectError::Refused)?;
+        .map_err(|_| ConnectError::NoBearer)?;
     let bearer = bearer.trim();
     if bearer.is_empty() {
-        return Err(ConnectError::Refused);
+        return Err(ConnectError::NoBearer);
     }
     let mut request = config
         .rpc_url
@@ -463,6 +467,9 @@ fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> Conne
 }
 
 enum ConnectError {
+    /// 本机还没有可用 bearer：agent 未启动，或已监听但仍在初始化。
+    NoBearer,
+    /// 连接 agent 端口被拒：此刻确定无人监听。
     Refused,
     Transient,
     /// 对端协议版本不兼容：可尝试让旧 agent 退出后由 bootstrap 拉起同级新版本。
