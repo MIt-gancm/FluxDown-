@@ -68,10 +68,14 @@ impl IconControlExt for Button {
 // 字号 / 高度由实例样式覆盖（gpui-component 在根节点 `refine_style`，覆盖有效）。
 // 高度必须走 `Styled::h`：`Input` 自带的同名 `h()` 只作用于多行输入，单行会被
 // 静默忽略而退回 `Size::Medium` 的 2rem（26px），比同行按钮 / 下拉矮一截。
+// 纵向内边距必须清零：gpui-component 0.7 的 `Medium` 单行自带上下各 8px，
+// 28px 外框扣掉 16px 内边距与 2px 描边只剩 10px 内容区，而单行文本元素固定占
+// 1.25rem 行高，文字 / 占位符上下被裁。外框本身 `items_center`，清零后行盒居中。
 impl ControlExt for Input {
     fn control(self, cx: &App) -> Self {
         let theme = active_theme(cx);
         Styled::h(self.with_size(Size::Medium), theme.density().control)
+            .py_0()
             .text_size(theme.tokens().typography.sm.size)
     }
 }
