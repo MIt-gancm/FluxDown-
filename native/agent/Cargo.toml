@@ -50,7 +50,11 @@ x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 notify-rust = "4.11"
 
 [target.'cfg(windows)'.dependencies]
+# ShellExecuteW("open")：open/reveal 回退的标准「打开」调用（见 platform/mod.rs）
+# Win32_UI_Shell_Common：SHParseDisplayName / SHOpenFolderAndSelectItems（ITEMIDLIST 类型，见 platform/mod.rs）
+# 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容
 winreg = "0.55"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
