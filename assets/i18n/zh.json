@@ -1618,7 +1618,6 @@
   "showSidebarRssDesc": "在侧边栏显示 RSS 订阅区块",
   "rssSidebarEmptyHint": "还没有订阅 —— 点 + 粘贴一个 feed 链接。",
   "rssAddSource": "新建订阅",
-  "rssPageDescription": "集中查看订阅更新，挑选条目并管理自动下载。",
   "rssSubscriptions": "订阅源",
   "rssUnreadCount": "{n} 条未读",
   "rssSelectedCount": "已选 {n} 项",

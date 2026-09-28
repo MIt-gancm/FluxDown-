@@ -2196,7 +2196,6 @@ class S {
   String get showSidebarRssDesc => _r('showSidebarRssDesc');
   String get rssSidebarEmptyHint => _r('rssSidebarEmptyHint');
   String get rssAddSource => _r('rssAddSource');
-  String get rssPageDescription => _r('rssPageDescription');
   String get rssSubscriptions => _r('rssSubscriptions');
   String rssUnreadCount(int n) => _r('rssUnreadCount', {'n': n});
   String rssSelectedCount(int n) => _r('rssSelectedCount', {'n': n});

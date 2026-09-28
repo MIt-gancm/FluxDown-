@@ -18,10 +18,11 @@ use gpui::{
     uniform_list,
 };
 use gpui_component::{
-    Disableable as _, Icon, WindowExt as _,
+    Disableable as _, Icon, ResizableState, WindowExt as _,
     button::{Button, ButtonVariants as _},
-    h_flex,
+    h_flex, h_resizable,
     input::{Input, InputEvent, InputState},
+    resizable_panel,
     scroll::ScrollableElement as _,
     tooltip::Tooltip,
     v_flex,
@@ -32,8 +33,11 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-/// 订阅源列宽。
-const SOURCE_COLUMN_WIDTH: Pixels = px(240.);
+/// 订阅源侧栏默认宽度。
+const SOURCE_COLUMN_WIDTH: f32 = 240.;
+/// 订阅源侧栏可拖拽的宽度范围。
+const SOURCE_COLUMN_MIN_WIDTH: f32 = 176.;
+const SOURCE_COLUMN_MAX_WIDTH: f32 = 400.;
 /// 条目行高（标题 + 元信息 + 可选过滤原因三行）。
 const ITEM_ROW_HEIGHT: Pixels = px(64.);
 /// 条目状态列宽。
@@ -51,6 +55,10 @@ pub struct RssView {
     last_error: Option<String>,
     feedback: Option<String>,
     load_error: bool,
+    /// 侧栏 | 条目区拆分状态；侧栏宽度由用户拖拽决定。
+    split_state: Entity<ResizableState>,
+    split_state_initialized: bool,
+    sidebar_width: f32,
 }
 
 impl RssView {
@@ -80,6 +88,9 @@ impl RssView {
             last_error: None,
             feedback: None,
             load_error: false,
+            split_state: cx.new(|_| ResizableState::default()),
+            split_state_initialized: false,
+            sidebar_width: SOURCE_COLUMN_WIDTH,
         }
     }
 
@@ -860,6 +871,18 @@ impl Render for RssView {
                 input.set_placeholder(placeholder, window, cx);
             });
         }
+        // 首次测得条目区宽度后把剩余空间交给条目区，侧栏保持设定宽度。
+        let main_measured = self
+            .split_state
+            .read(cx)
+            .sizes()
+            .get(1)
+            .is_some_and(|size| *size > px(1.));
+        if !self.split_state_initialized && main_measured {
+            self.split_state
+                .update(cx, |state, cx| state.reset_panel(1, cx));
+            self.split_state_initialized = true;
+        }
         let theme = active_theme(cx);
         let tokens = theme.tokens().clone();
         let extended = theme.extended().clone();
@@ -898,18 +921,16 @@ impl Render for RssView {
             .map(|item| item.guid.clone())
             .collect();
         let side = v_flex()
-            .w(SOURCE_COLUMN_WIDTH)
-            .flex_none()
-            .h_full()
+            .size_full()
             .min_h_0()
             .bg(extended.colors.chrome)
-            .border_r(extended.stroke.thin)
-            .border_color(extended.colors.hairline)
             .child(
                 h_flex()
+                    .flex_none()
                     .items_center()
-                    .justify_between()
-                    .px(tokens.spacing.lg)
+                    .gap(tokens.spacing.xs)
+                    .pl(tokens.spacing.lg)
+                    .pr(tokens.spacing.sm)
                     .pt(tokens.spacing.md)
                     .pb(tokens.spacing.sm)
                     .child(
@@ -922,6 +943,16 @@ impl Render for RssView {
                     )
                     .child(caption_number(
                         self.controller.sources.len().to_string(),
+                        cx,
+                    ))
+                    .child(div().flex_1())
+                    .child(Self::tool_button(
+                        "rss-add-source",
+                        self.t("rssAddSource", cx),
+                        FluxIcon::Plus,
+                        false,
+                        stale,
+                        |this, window, cx| this.open_editor(None, window, cx),
                         cx,
                     )),
             )
@@ -950,11 +981,52 @@ impl Render for RssView {
                     .overflow_y_scrollbar(),
             );
         let mut main = v_flex()
-            .flex_1()
+            .size_full()
             .min_w_0()
             .min_h_0()
-            .h_full()
-            .bg(colors.surface);
+            .bg(colors.surface)
+            .when_some(self.last_error.clone(), |page, error| {
+                page.child(
+                    div()
+                        .flex_none()
+                        .px(tokens.spacing.lg)
+                        .py(tokens.spacing.xs + tokens.spacing.xxs)
+                        .bg(colors.destructive.opacity(0.08))
+                        .text_size(xs.size)
+                        .line_height(xs.line_height)
+                        .text_color(colors.destructive)
+                        .child(error),
+                )
+            })
+            .when_some(self.feedback.clone(), |page, feedback| {
+                page.child(
+                    h_flex()
+                        .flex_none()
+                        .items_center()
+                        .px(tokens.spacing.lg)
+                        .py(tokens.spacing.xxs)
+                        .gap(tokens.spacing.md)
+                        .bg(colors.accent)
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(xs.size)
+                                .line_height(xs.line_height)
+                                .text_color(colors.foreground)
+                                .child(feedback),
+                        )
+                        .child(
+                            Button::new("rss-dismiss-feedback")
+                                .ghost()
+                                .label(self.t("close", cx))
+                                .control(cx)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.feedback = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            });
         if let Some(source) = source {
             let status = self.status_line(&source, cx);
             let title = SharedString::from(display_name(&source));
@@ -1292,43 +1364,10 @@ impl Render for RssView {
                 );
             }
         } else {
-            main = main.child(self.render_empty_keys("rssAddSource", "rssSidebarEmptyHint", cx));
-        }
-        v_flex()
-            .size_full()
-            .bg(colors.surface)
-            .child(
-                h_flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_between()
-                    .gap(tokens.spacing.md)
-                    .px(tokens.spacing.lg)
-                    .py(tokens.spacing.md)
-                    .border_b(extended.stroke.thin)
-                    .border_color(extended.colors.hairline)
+            main = main.child(
+                self.render_empty_keys("rssAddSource", "rssSidebarEmptyHint", cx)
                     .child(
-                        v_flex()
-                            .min_w_0()
-                            .gap(tokens.spacing.xxs)
-                            .child(
-                                div()
-                                    .text_size(extended.title.size)
-                                    .line_height(extended.title.line_height)
-                                    .font_weight(extended.title.weight)
-                                    .text_color(colors.foreground)
-                                    .child(self.t("rssSubscriptions", cx)),
-                            )
-                            .child(
-                                div()
-                                    .text_size(xs.size)
-                                    .line_height(xs.line_height)
-                                    .text_color(colors.muted_foreground)
-                                    .child(self.t("rssPageDescription", cx)),
-                            ),
-                    )
-                    .child(
-                        Button::new("rss-add-source")
+                        Button::new("rss-empty-add-source")
                             .primary()
                             .icon(FluxIcon::Plus)
                             .label(self.t("rssAddSource", cx))
@@ -1338,49 +1377,26 @@ impl Render for RssView {
                                 this.open_editor(None, window, cx)
                             })),
                     ),
+            );
+        }
+        h_resizable("rss-content")
+            .with_state(&self.split_state)
+            .on_resize(cx.listener(|this, state: &Entity<ResizableState>, _, cx| {
+                state.update(cx, |state, cx| state.reset_panel(1, cx));
+                if let Some(width) = state.read(cx).sizes().first().copied() {
+                    let width = f32::from(width);
+                    if width > 0. {
+                        this.sidebar_width = width;
+                    }
+                }
+            }))
+            .child(
+                resizable_panel()
+                    .size(px(self.sidebar_width))
+                    .flex_none()
+                    .size_range(px(SOURCE_COLUMN_MIN_WIDTH)..px(SOURCE_COLUMN_MAX_WIDTH))
+                    .child(side),
             )
-            .when_some(self.last_error.clone(), |page, error| {
-                page.child(
-                    div()
-                        .flex_none()
-                        .px(tokens.spacing.lg)
-                        .py(tokens.spacing.xs + tokens.spacing.xxs)
-                        .bg(colors.destructive.opacity(0.08))
-                        .text_size(xs.size)
-                        .line_height(xs.line_height)
-                        .text_color(colors.destructive)
-                        .child(error),
-                )
-            })
-            .when_some(self.feedback.clone(), |page, feedback| {
-                page.child(
-                    h_flex()
-                        .flex_none()
-                        .items_center()
-                        .px(tokens.spacing.lg)
-                        .py(tokens.spacing.xxs)
-                        .gap(tokens.spacing.md)
-                        .bg(colors.accent)
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(xs.size)
-                                .line_height(xs.line_height)
-                                .text_color(colors.foreground)
-                                .child(feedback),
-                        )
-                        .child(
-                            Button::new("rss-dismiss-feedback")
-                                .ghost()
-                                .label(self.t("close", cx))
-                                .control(cx)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.feedback = None;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
-            .child(h_flex().flex_1().min_h_0().child(side).child(main))
+            .child(resizable_panel().child(main))
     }
 }

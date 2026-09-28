@@ -1618,7 +1618,6 @@
   "showSidebarRssDesc": "Show the RSS subscriptions section in the sidebar",
   "rssSidebarEmptyHint": "No subscriptions yet — click + and paste a feed URL.",
   "rssAddSource": "New subscription",
-  "rssPageDescription": "Collect updates, choose items, and manage automatic downloads.",
   "rssSubscriptions": "Subscriptions",
   "rssUnreadCount": "{n} unread",
   "rssSelectedCount": "{n} selected",
