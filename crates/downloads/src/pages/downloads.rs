@@ -17,7 +17,7 @@ use crate::{
     },
     components::{
         task_table::{DownloadTableDelegate, SelectionSummary, TableFilter, ToolbarCommand},
-        title_bar::DownloadTitleBar,
+        title_bar::{DownloadTitleBar, left_edge_probe},
     },
     controller::{DownloadsCommand, DownloadsController, DownloadsPort},
     model::{
@@ -33,8 +33,8 @@ use fluxdown_ui_components::{ControlExt as _, FluxIcon};
 use fluxdown_ui_i18n::Translator;
 use gpui::{
     App, AppContext as _, ClipboardItem, Context, Entity, ExternalPaths, FocusHandle, FontWeight,
-    InteractiveElement as _, IntoElement, ParentElement, PathPromptOptions, Render, SharedString,
-    Styled, Window, div, prelude::FluentBuilder as _, px,
+    InteractiveElement as _, IntoElement, ParentElement, PathPromptOptions, Pixels, Render,
+    SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon, ResizableState, WindowExt as _, h_flex, h_resizable,
@@ -121,6 +121,8 @@ pub struct DownloadView {
     pub(crate) detail_resizable_state: Entity<ResizableState>,
     /// 上次渲染时的选中投影；表格选中变化时与之比较，变了才重绘本页（浮动选择条）。
     pub(crate) selection_summary: Cell<SelectionSummary>,
+    /// 内容区（侧栏右侧）左缘的窗口横坐标；顶栏插槽据此把「新建」主按钮与内容区左对齐。
+    pub(crate) content_left: Pixels,
 }
 
 impl DownloadView {
@@ -204,6 +206,7 @@ impl DownloadView {
             detail: None,
             detail_resizable_state: cx.new(|_| ResizableState::default()),
             selection_summary: Cell::new(SelectionSummary::default()),
+            content_left: px(0.),
         }
     }
 
@@ -1483,11 +1486,17 @@ impl DownloadView {
 
         // 侧栏 | 内容的结构线由 resizable 把手绘制（主题已映射为 hairline），这里不再画边框。
         div()
+            .relative()
             .size_full()
             .min_w_0()
             .min_h_0()
             .bg(surface)
             .child(body)
+            .child(left_edge_probe(
+                cx.weak_entity(),
+                |view| view.content_left,
+                |view, left| view.content_left = left,
+            ))
             .into_any_element()
     }
 

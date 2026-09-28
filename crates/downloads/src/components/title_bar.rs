@@ -1,4 +1,4 @@
-//! 下载页挂到 shell 统一顶栏的插槽：搜索框、「视图」选项菜单、「新建」主按钮。
+//! 下载页挂到 shell 统一顶栏的插槽：「新建」主按钮（与内容区左缘对齐）、搜索框、「视图」选项菜单。
 //!
 //! 插槽是独立实体（shell 在标题栏里渲染它，不在 [`DownloadView`] 的元素树内），
 //! 通过弱引用把操作转发给下载页；视图偏好的改写沿用 `mutate_prefs` 的重算与防抖持久化。
@@ -12,7 +12,7 @@ use gpui::{
     Anchor, AnyElement, App, AppContext as _, Context, Div, ElementId, Entity, FocusHandle,
     Focusable as _, FontWeight, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    WeakEntity, Window, div, prelude::FluentBuilder as _, px,
+    WeakEntity, Window, canvas, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Icon, Sizable as _, Size,
@@ -134,6 +134,8 @@ pub struct DownloadTitleBar {
     table_state: Entity<TableState<DownloadTableDelegate>>,
     /// 「视图」弹层当前分页。
     view_menu_page: ViewMenuPage,
+    /// 插槽自身左缘的窗口横坐标（上一帧 prepaint 测得），与下载页 `content_left` 相减得前导留白。
+    slot_left: Pixels,
 }
 
 impl DownloadTitleBar {
@@ -152,6 +154,7 @@ impl DownloadTitleBar {
             search_focus: cx.focus_handle(),
             table_state,
             view_menu_page: ViewMenuPage::default(),
+            slot_left: px(0.),
         }
     }
 
@@ -283,19 +286,27 @@ impl Render for DownloadTitleBar {
         let new_label =
             SharedString::from(self.translator.read(cx).text(keys::NEW_DOWNLOAD).to_owned());
         let view = self.view.clone();
+        // 主按钮左缘 = 内容区左缘 + 一档留白（由 flex gap 提供）；未测得前 /
+        // 顶栏前导区（交通灯、应用菜单）更宽时贴插槽左缘。
+        let content_left = self
+            .view
+            .upgrade()
+            .map_or(px(0.), |view| view.read(cx).content_left);
+        let leading = if content_left > px(0.) {
+            (content_left - self.slot_left).max(px(0.))
+        } else {
+            px(0.)
+        };
+        let title_bar = cx.entity().downgrade();
 
         h_flex()
+            .relative()
             .size_full()
             .min_w_0()
             .items_center()
-            .justify_end()
             .gap(spacing.sm)
-            .child(
-                interactive(self.render_search(window, cx))
-                    .flex_shrink(1.)
-                    .min_w(SEARCH_MIN_WIDTH),
-            )
-            .child(interactive(self.render_view_menu(cx)))
+            // 前导留白可在窄窗口下先于搜索框收缩；空白处保持窗口拖拽。
+            .child(div().flex_shrink(1.).min_w_0().w(leading))
             .child(interactive(
                 Button::new("download-create")
                     .primary()
@@ -306,7 +317,50 @@ impl Render for DownloadTitleBar {
                         let _ = view.update(cx, |view, cx| view.open_new_download(window, cx));
                     }),
             ))
+            .child(div().flex_1().min_w_0())
+            .child(
+                interactive(self.render_search(window, cx))
+                    .flex_shrink(1.)
+                    .min_w(SEARCH_MIN_WIDTH),
+            )
+            .child(interactive(self.render_view_menu(cx)))
+            .child(left_edge_probe(
+                title_bar,
+                |title_bar| title_bar.slot_left,
+                |title_bar, left| title_bar.slot_left = left,
+            ))
     }
+}
+
+/// 测量父元素左缘的窗口横坐标，变化时写回 `entity` 并重绘（下一帧生效）。
+///
+/// 父元素须 `relative()`；测量层显式 `inset_0()` 铺满父元素——只写 `size_full()` 的
+/// 绝对定位层会落在静态位置（`ElementExt::on_prepaint` 即如此），原点偏离父元素。
+pub(crate) fn left_edge_probe<T: 'static>(
+    entity: WeakEntity<T>,
+    get: fn(&T) -> Pixels,
+    set: fn(&mut T, Pixels),
+) -> impl IntoElement {
+    canvas(
+        move |bounds, window, cx| {
+            let left = bounds.origin.x;
+            let changed = entity
+                .upgrade()
+                .is_some_and(|entity| get(entity.read(cx)) != left);
+            if !changed {
+                return;
+            }
+            window.defer(cx, move |_, cx| {
+                let _ = entity.update(cx, |entity, cx| {
+                    set(entity, left);
+                    cx.notify();
+                });
+            });
+        },
+        |_, (), _, _| {},
+    )
+    .absolute()
+    .inset_0()
 }
 
 /// 视图菜单共用的样式快照（颜色与尺寸均取自已缩放的 token）。
