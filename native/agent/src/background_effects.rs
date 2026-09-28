@@ -1,7 +1,6 @@
 //! 下载完成通知与活动下载期间的系统保持唤醒。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,12 +35,12 @@ struct PendingCompletions {
 }
 
 impl BackgroundEffects {
-    /// `data_dir`：agent 数据目录（通知图标落盘位置）。
+    /// `notifier`：与网关共用的系统通知投递器。
     #[must_use]
-    pub fn new(events: AgentEventHub, data_dir: PathBuf) -> Self {
+    pub fn new(events: AgentEventHub, notifier: Arc<Notifier>) -> Self {
         Self {
             events,
-            notifier: Arc::new(Notifier::new(data_dir)),
+            notifier,
             #[cfg(feature = "desktop")]
             translator: match fluxdown_ui_i18n::I18nCatalog::load_embedded() {
                 Ok(catalog) => {
@@ -156,7 +155,7 @@ impl PendingCompletions {
 }
 
 /// 界面语言偏好（与托盘同源：`general.locale`，`system` / 缺省 = 跟随系统）。
-fn locale_preference(snapshot: &AgentSnapshot) -> Option<String> {
+pub(crate) fn locale_preference(snapshot: &AgentSnapshot) -> Option<String> {
     snapshot
         .preferences
         .values

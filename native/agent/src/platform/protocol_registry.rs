@@ -235,8 +235,10 @@ mod inner {
     use std::path::Path;
 
     use super::UrlScheme;
-    use crate::platform::macos_cf::{CFStringRef, CfOwned, cf_string, cf_to_string};
-    use crate::platform::{PlatformError, host_bundle_id};
+    use crate::platform::macos_cf::{
+        CFArrayRef, CFStringRef, CfOwned, cf_string, cf_string_array, cf_to_string,
+    };
+    use crate::platform::{PlatformError, host_bundle_id, successor_handler};
 
     #[link(name = "CoreServices", kind = "framework")]
     unsafe extern "C" {
@@ -245,6 +247,7 @@ mod inner {
             url_scheme: CFStringRef,
             handler_bundle_id: CFStringRef,
         ) -> i32;
+        fn LSCopyAllHandlersForURLScheme(url_scheme: CFStringRef) -> CFArrayRef;
     }
 
     pub fn supported(_desktop: Option<&Path>) -> bool {
@@ -283,11 +286,16 @@ mod inner {
         Ok(())
     }
 
-    /// 把 `proto` 交还系统默认。
+    /// 把 `proto` 移交给另一个已安装的候选程序；仅在当前由我们持有时执行，
+    /// 不覆盖其他客户端的选择。
     ///
-    /// Launch Services 没有“取消”原语；设置空 bundle id 即释放 scheme。仅在
-    /// 当前由我们持有时执行，不覆盖其他客户端的选择。
+    /// Launch Services 没有“取消”原语，设空 bundle id 会回落到剩余候选——FluxDown 是唯一
+    /// 候选时仍是 FluxDown。因此显式挑选另一个候选；没有候选时保持现状，由
+    /// `<scheme>_assoc_user_disabled` 在捕获入口拦截系统交来的链接。
     pub fn unregister(proto: UrlScheme, desktop: Option<&Path>) -> Result<(), PlatformError> {
+        let Some(mine) = host_bundle_id() else {
+            return Ok(());
+        };
         if !is_registered(proto, desktop) {
             tracing::info!(
                 scheme = proto.scheme,
@@ -296,15 +304,24 @@ mod inner {
             return Ok(());
         }
         let scheme = cf_string(proto.scheme)?;
-        let empty = cf_string("")?;
-        // SAFETY: 两个 CFStringRef 在调用期间存活。
-        let status = unsafe { LSSetDefaultHandlerForURLScheme(scheme.raw(), empty.raw()) };
+        // SAFETY: `scheme.raw()` 是有效 CFStringRef；返回的数组引用归我们所有，由 `CfOwned` 释放。
+        let candidates = CfOwned::new(unsafe { LSCopyAllHandlersForURLScheme(scheme.raw()) });
+        let Some(successor) = successor_handler(cf_string_array(&candidates), &mine) else {
+            tracing::info!(
+                scheme = proto.scheme,
+                "no other handler installed; FluxDown stays the system default"
+            );
+            return Ok(());
+        };
+        let id = cf_string(&successor)?;
+        // SAFETY: 两个 CFStringRef 在调用期间存活；函数不接管所有权。
+        let status = unsafe { LSSetDefaultHandlerForURLScheme(scheme.raw(), id.raw()) };
         if status != 0 {
             return Err(PlatformError::Failed(format!(
-                "LSSetDefaultHandlerForURLScheme (clear) failed (OSStatus={status})"
+                "LSSetDefaultHandlerForURLScheme (hand over) failed (OSStatus={status})"
             )));
         }
-        tracing::info!(scheme = proto.scheme, "removed URL protocol registration");
+        tracing::info!(scheme = proto.scheme, successor, "handed URL protocol over");
         Ok(())
     }
 }

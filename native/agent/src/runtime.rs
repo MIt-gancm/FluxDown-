@@ -134,12 +134,12 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
     let power = Arc::new(PowerService::new(events.clone()));
     let power_task = tokio::spawn(power.clone().run(cancel.clone()));
     let event_task = spawn_daemon_projection(daemon_events, events.clone(), cancel.clone());
+    let notifier = Arc::new(crate::notification::Notifier::new(
+        paths.agent_data_dir.clone(),
+    ));
     let effects_task = tokio::spawn(
-        crate::background_effects::BackgroundEffects::new(
-            events.clone(),
-            paths.agent_data_dir.clone(),
-        )
-        .run(cancel.clone()),
+        crate::background_effects::BackgroundEffects::new(events.clone(), notifier.clone())
+            .run(cancel.clone()),
     );
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state));
@@ -262,6 +262,7 @@ pub async fn run(cancel: CancellationToken, host: ShellHost) -> AgentResult {
             shell: shell.clone(),
             power: power.clone(),
             lifecycle: lifecycle.clone(),
+            notifier,
         },
     ));
     let bearer = load_or_create_bearer(

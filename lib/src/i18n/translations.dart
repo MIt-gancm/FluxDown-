@@ -901,6 +901,7 @@ class S {
   String get ed2kLinkAssociationDesc => _r('ed2kLinkAssociationDesc');
   String get magnetLinkAssociation => _r('magnetLinkAssociation');
   String get magnetLinkAssociationDesc => _r('magnetLinkAssociationDesc');
+  String get associationOffIgnored => _r('associationOffIgnored');
   String get torrentAssocDialogTitle => _r('torrentAssocDialogTitle');
   String get torrentAssocDialogDesc => _r('torrentAssocDialogDesc');
   String get notifyOnComplete => _r('notifyOnComplete');
@@ -2461,6 +2462,7 @@ class S {
   String get doctorHintCheckFirewall => _r('doctorHintCheckFirewall');
   String get doctorHintEnableProtocol => _r('doctorHintEnableProtocol');
   String get doctorHintProtocolClaimed => _r('doctorHintProtocolClaimed');
+  String get doctorHintAssociationOff => _r('doctorHintAssociationOff');
   String get doctorHintCheckDisk => _r('doctorHintCheckDisk');
   String get doctorActionReregister => _r('doctorActionReregister');
   String get doctorActionUseThisInstall => _r('doctorActionUseThisInstall');
@@ -2510,6 +2512,7 @@ class S {
     'check_firewall' => doctorHintCheckFirewall,
     'enable_protocol' => doctorHintEnableProtocol,
     'protocol_claimed' => doctorHintProtocolClaimed,
+    'association_off' => doctorHintAssociationOff,
     'check_disk' => doctorHintCheckDisk,
     _ => code,
   };

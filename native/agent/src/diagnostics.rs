@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use fluxdown_protocol::capture_link::OpenAssociation;
 use fluxdown_protocol::{
-    DiagnosticCheckDto, DiagnosticLevel, DiagnosticRepairParams, DiagnosticsReportDto,
-    LogExportParams, LogExportResult, LogPathsDto, PlatformIntegrationDto,
+    AgentSnapshot, DiagnosticCheckDto, DiagnosticLevel, DiagnosticRepairParams,
+    DiagnosticsReportDto, LogExportParams, LogExportResult, LogPathsDto, PlatformIntegrationDto,
 };
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -39,6 +40,8 @@ const HINT_RESTART_APP: &str = "restart_app";
 const HINT_ENABLE_LOCAL_SERVER: &str = "enable_local_server";
 const HINT_CHECK_FIREWALL: &str = "check_firewall";
 const HINT_ENABLE_PROTOCOL: &str = "enable_protocol";
+/// 用户已在设置中关闭该关联，但系统里没有其他可接手的程序（macOS 回落到 FluxDown）。
+const HINT_ASSOCIATION_OFF: &str = "association_off";
 const HINT_CHECK_DISK: &str = "check_disk";
 
 /// 修复动作；UI 映射 `doctorAction{Camel}`，并作为 `repair` 的 `action`。
@@ -97,7 +100,8 @@ impl DiagnosticsService {
     pub async fn run(&self) -> Result<DiagnosticsReportDto, DiagnosticsError> {
         let gateway = self.state.lock().await.gateway.clone();
         let data_dir = self.store.data_dir().to_path_buf();
-        let sync_probe = tokio::task::spawn_blocking(move || probe_sync(&data_dir))
+        let opted_out = self.events.inspect(opted_out_associations);
+        let sync_probe = tokio::task::spawn_blocking(move || probe_sync(&data_dir, &opted_out))
             .await
             .map_err(join_error)?;
         let daemon = self.probe_daemon().await;
@@ -412,10 +416,10 @@ struct SyncProbe {
     log_dir: DiagnosticCheckDto,
 }
 
-fn probe_sync(data_dir: &Path) -> SyncProbe {
+fn probe_sync(data_dir: &Path, opted_out: &[OpenAssociation]) -> SyncProbe {
     SyncProbe {
         nmh: nmh_checks(&crate::nmh::registry::diagnose()),
-        shell: shell_checks(&crate::platform::integration_status()),
+        shell: shell_checks(&crate::platform::integration_status(), opted_out),
         log_dir: probe_log_dir(data_dir),
     }
 }
@@ -578,11 +582,58 @@ fn manifest_check(chromium: &str, firefox: &str) -> DiagnosticCheckDto {
     }
 }
 
+/// 用户在设置中手动关闭的关联（`OpenAssociation::opt_out_pref_key` 为 `true`）。
+fn opted_out_associations(snapshot: &AgentSnapshot) -> Vec<OpenAssociation> {
+    [
+        OpenAssociation::Torrent,
+        OpenAssociation::Magnet,
+        OpenAssociation::Ed2k,
+    ]
+    .into_iter()
+    .filter(|association| {
+        snapshot
+            .preferences
+            .values
+            .get(association.opt_out_pref_key())
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    })
+    .collect()
+}
+
+/// 用户已关闭的关联：按意图报告，不提供「立即注册」（绕过设置页会与 opt-out 偏好矛盾）。
+/// 系统仍指向 FluxDown 说明没有其他候选可接手，报 info 解释 FluxDown 会忽略这些打开请求。
+fn opted_out_check(id: &str, target: &str, still_registered: bool) -> DiagnosticCheckDto {
+    if still_registered {
+        check(
+            id,
+            target,
+            DiagnosticLevel::Info,
+            "turned off in settings; no other handler installed, FluxDown ignores these opens"
+                .to_owned(),
+            HINT_ASSOCIATION_OFF,
+            None,
+        )
+    } else {
+        check(
+            id,
+            target,
+            DiagnosticLevel::Ok,
+            "turned off in settings".to_owned(),
+            "",
+            None,
+        )
+    }
+}
+
 /// `url_protocol`×3 与 `torrent_association`。
 ///
 /// `fluxdown://` 是深链入口，缺失报 warn；`magnet`/`ed2k`/`.torrent` 是可选项，只报 info，
-/// 否则用户会习惯性忽略整页。
-fn shell_checks(integration: &PlatformIntegrationDto) -> Vec<DiagnosticCheckDto> {
+/// 否则用户会习惯性忽略整页。用户已在设置中关闭的关联按 [`opted_out_check`] 报告。
+fn shell_checks(
+    integration: &PlatformIntegrationDto,
+    opted_out: &[OpenAssociation],
+) -> Vec<DiagnosticCheckDto> {
     let mut checks = Vec::with_capacity(URL_SCHEMES.len() + 1);
     for scheme in URL_SCHEMES {
         let registered = integration
@@ -590,6 +641,17 @@ fn shell_checks(integration: &PlatformIntegrationDto) -> Vec<DiagnosticCheckDto>
             .get(scheme)
             .copied()
             .unwrap_or(false);
+        let association = match scheme {
+            "magnet" => Some(OpenAssociation::Magnet),
+            "ed2k" => Some(OpenAssociation::Ed2k),
+            _ => None,
+        };
+        if integration.url_protocol_supported
+            && association.is_some_and(|association| opted_out.contains(&association))
+        {
+            checks.push(opted_out_check(CHECK_URL_PROTOCOL, scheme, registered));
+            continue;
+        }
         let (level, detail, hint, repair) = if !integration.url_protocol_supported {
             (
                 DiagnosticLevel::Info,
@@ -636,6 +698,12 @@ fn shell_checks(integration: &PlatformIntegrationDto) -> Vec<DiagnosticCheckDto>
             "not supported on this platform".to_owned(),
             "",
             None,
+        )
+    } else if opted_out.contains(&OpenAssociation::Torrent) {
+        opted_out_check(
+            CHECK_TORRENT_ASSOCIATION,
+            "",
+            integration.torrent_associated,
         )
     } else if integration.torrent_associated {
         check(
@@ -907,14 +975,16 @@ pub enum DiagnosticsError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use fluxdown_protocol::{DiagnosticLevel, PlatformIntegrationDto};
+    use fluxdown_protocol::capture_link::OpenAssociation;
+    use fluxdown_protocol::{AgentSnapshot, DiagnosticLevel, PlatformIntegrationDto};
+    use serde_json::json;
 
     use super::{
         ACTION_ENABLE_SERVICE, ACTION_OPEN_LOG_DIR, ACTION_REGISTER, ACTION_REREGISTER,
-        ACTION_USE_THIS_INSTALL, HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER, HINT_ENABLE_PROTOCOL,
-        HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP, HINT_REREGISTER_NMH, TARGET_TORRENT,
-        daemon_export_url, daemon_log_dir, manifest_check, nmh_checks, probe_local_server,
-        probe_log_dir, relay_check, shell_checks,
+        ACTION_USE_THIS_INSTALL, HINT_ASSOCIATION_OFF, HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER,
+        HINT_ENABLE_PROTOCOL, HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP, HINT_REREGISTER_NMH,
+        TARGET_TORRENT, daemon_export_url, daemon_log_dir, manifest_check, nmh_checks,
+        opted_out_associations, probe_local_server, probe_log_dir, relay_check, shell_checks,
     };
     use crate::nmh::registry::{NmhDiagnosis, NmhTarget, RelayOwner};
 
@@ -1029,7 +1099,7 @@ mod tests {
             ]),
             ..PlatformIntegrationDto::default()
         };
-        let checks = shell_checks(&integration);
+        let checks = shell_checks(&integration, &[]);
         assert_eq!(checks.len(), 4);
         let fluxdown = &checks[0];
         assert_eq!(fluxdown.id, "url_protocol");
@@ -1058,12 +1128,58 @@ mod tests {
 
         integration.url_protocol_supported = false;
         integration.file_association_supported = false;
-        let checks = shell_checks(&integration);
+        let checks = shell_checks(&integration, &[OpenAssociation::Magnet]);
         assert!(checks.iter().all(|c| c.level == DiagnosticLevel::Info));
         assert!(
             checks
                 .iter()
                 .all(|c| c.repair.is_none() && c.hint.is_empty())
+        );
+    }
+
+    #[test]
+    fn opted_out_associations_report_user_intent_without_register_repair() {
+        let integration = PlatformIntegrationDto {
+            url_protocol_supported: true,
+            file_association_supported: true,
+            // ed2k / .torrent：系统无其他候选，仍指向 FluxDown；magnet 已移交他人。
+            torrent_associated: true,
+            url_protocols: BTreeMap::from([
+                ("fluxdown".to_owned(), true),
+                ("magnet".to_owned(), false),
+                ("ed2k".to_owned(), true),
+            ]),
+            ..PlatformIntegrationDto::default()
+        };
+        let checks = shell_checks(
+            &integration,
+            &[
+                OpenAssociation::Torrent,
+                OpenAssociation::Magnet,
+                OpenAssociation::Ed2k,
+            ],
+        );
+        assert!(checks.iter().all(|c| c.repair.is_none()));
+        assert_eq!(checks[0].level, DiagnosticLevel::Ok);
+        let magnet = &checks[1];
+        assert_eq!(magnet.level, DiagnosticLevel::Ok);
+        assert!(magnet.hint.is_empty());
+        for sticky in [&checks[2], &checks[3]] {
+            assert_eq!(sticky.level, DiagnosticLevel::Info);
+            assert_eq!(sticky.hint, HINT_ASSOCIATION_OFF);
+        }
+    }
+
+    #[test]
+    fn only_true_opt_out_preferences_count() {
+        let mut snapshot = AgentSnapshot::default();
+        snapshot.preferences.values.extend([
+            ("ed2k_assoc_user_disabled".to_owned(), json!(true)),
+            ("magnet_assoc_user_disabled".to_owned(), json!(false)),
+        ]);
+        assert_eq!(
+            opted_out_associations(&snapshot),
+            vec![OpenAssociation::Ed2k]
         );
     }
 

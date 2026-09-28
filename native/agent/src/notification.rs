@@ -216,12 +216,54 @@ pub fn english_text(key: &str, count: Option<usize>) -> String {
         "downloadCompleted" => "Download Complete",
         "batchDownloadCompleted" => "{count} Downloads Complete",
         "andMoreFiles" => "and {count} more",
+        "torrentFileAssociation" => "Associate .torrent Files",
+        "magnetLinkAssociation" => "Take Over Magnet Links",
+        "ed2kLinkAssociation" => "Associate ed2k Links",
+        "associationOffIgnored" => {
+            "This association is turned off in Settings, so FluxDown did not add a download."
+        }
         other => other,
     };
     count.map_or_else(
         || template.to_owned(),
         |count| template.replace("{count}", &count.to_string()),
     )
+}
+
+/// 按界面语言取通知文案：desktop 构建首次使用时加载 en / zh 基线目录；headless 构建或
+/// 目录加载失败时回退 [`english_text`]。
+#[derive(Default)]
+pub struct NoticeText {
+    #[cfg(feature = "desktop")]
+    catalog: std::sync::OnceLock<Option<std::sync::Arc<fluxdown_ui_i18n::I18nCatalog>>>,
+}
+
+impl NoticeText {
+    /// `locale`：界面语言偏好（`None` = 跟随系统）。
+    #[cfg(feature = "desktop")]
+    #[must_use]
+    pub fn text(&self, key: &str, locale: Option<&str>) -> String {
+        let catalog = self.catalog.get_or_init(|| {
+            fluxdown_ui_i18n::I18nCatalog::load_embedded()
+                .map(std::sync::Arc::new)
+                .map_err(|error| {
+                    tracing::warn!(error = %error, "notification translations unavailable");
+                })
+                .ok()
+        });
+        let Some(catalog) = catalog else {
+            return english_text(key, None);
+        };
+        let locale = locale.map_or_else(fluxdown_ui_i18n::system_locale, str::to_owned);
+        catalog.translator(&locale).text(key).to_owned()
+    }
+
+    /// headless 构建不带文案目录：固定英文。
+    #[cfg(not(feature = "desktop"))]
+    #[must_use]
+    pub fn text(&self, key: &str, _locale: Option<&str>) -> String {
+        english_text(key, None)
+    }
 }
 
 #[cfg(test)]

@@ -435,17 +435,24 @@ async fn call_daemon(daemon: &DaemonClient, method_name: &str) {
     }
 }
 
-/// 与桌面进程处理系统交来的链接一致：`.torrent` 文件与可捕获链接都静默建任务。
+/// 与桌面进程处理系统交来的链接一致：`.torrent` 文件与可捕获链接都静默建任务，并声明来源
+/// 关联（[`OpenAssociation`]），已被用户关闭的关联由网关拦截。
+///
+/// [`OpenAssociation`]: fluxdown_protocol::capture_link::OpenAssociation
 async fn submit_opened_urls(gateway: &crate::gateway::GatewayService, urls: Vec<String>) {
     use fluxdown_protocol::capture_link::{
-        is_capture_url, normalize_capture_url, torrent_file_path,
+        OpenAssociation, is_capture_url, normalize_capture_url, torrent_file_path,
     };
     for url in urls {
         let result = if let Some(path) = torrent_file_path(&url) {
             gateway
                 .dispatch_local(
                     method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
-                    serde_json::json!({ "path": path.display().to_string(), "silent": true }),
+                    serde_json::json!({
+                        "path": path.display().to_string(),
+                        "silent": true,
+                        "association": OpenAssociation::Torrent,
+                    }),
                 )
                 .await
         } else if is_capture_url(&url) {
@@ -454,7 +461,8 @@ async fn submit_opened_urls(gateway: &crate::gateway::GatewayService, urls: Vec<
                     method::AGENT_CAPTURE_SUBMIT,
                     serde_json::json!({
                         "request": { "url": normalize_capture_url(&url) },
-                        "silent": true
+                        "silent": true,
+                        "association": OpenAssociation::of_url(&url),
                     }),
                 )
                 .await

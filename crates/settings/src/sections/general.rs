@@ -1,5 +1,6 @@
 //! 通用：启动与托盘、系统集成、侧边栏与活动栏可见性、自定义分类。
 
+use fluxdown_protocol::capture_link::OpenAssociation;
 use fluxdown_protocol::{PlatformIntegrationDto, ShellStatusDto, TrayUnavailableReason};
 use fluxdown_ui_components::FluxIcon;
 use gpui::App;
@@ -208,18 +209,19 @@ fn integration_supported(ctx: &SectionContext, kind: IntegrationKind, cx: &App) 
     })
 }
 
-/// 用户手动关闭关联时持久化的 opt-out 键（与 Flutter 设置同名）。
+/// 用户手动关闭关联时持久化的 opt-out 键（与 Flutter 设置、agent 捕获拦截同一键）。
 ///
-/// macOS Launch Services 没有「无默认处理程序」：FluxDown 是唯一候选时，清空
-/// 默认处理程序后系统仍回落到 FluxDown，探测值恒为 true。opt-out 让用户的
-/// 「关闭」压过探测值，否则开关会被立即顶回开启。
+/// macOS Launch Services 没有「无默认处理程序」：FluxDown 是唯一候选时，关闭后系统仍
+/// 回落到 FluxDown，探测值恒为 true。opt-out 让用户的「关闭」压过探测值，否则开关会被
+/// 立即顶回开启；agent 也据此拦截系统交来的链接 / 文件。
 fn opt_out_key(kind: IntegrationKind) -> Option<&'static str> {
-    match kind {
-        IntegrationKind::Autostart => None,
-        IntegrationKind::Torrent => Some("torrent_assoc_user_disabled"),
-        IntegrationKind::Scheme("magnet") => Some("magnet_assoc_user_disabled"),
-        IntegrationKind::Scheme(_) => Some("ed2k_assoc_user_disabled"),
-    }
+    let association = match kind {
+        IntegrationKind::Autostart => return None,
+        IntegrationKind::Torrent => OpenAssociation::Torrent,
+        IntegrationKind::Scheme("magnet") => OpenAssociation::Magnet,
+        IntegrationKind::Scheme(_) => OpenAssociation::Ed2k,
+    };
+    Some(association.opt_out_pref_key())
 }
 
 /// 开关显示值：系统探测为已关联，且用户未手动关闭。
@@ -300,22 +302,5 @@ mod tests {
             IntegrationKind::Scheme("magnet"),
             false
         ));
-    }
-
-    #[test]
-    fn each_association_has_its_own_opt_out_key() {
-        assert_eq!(opt_out_key(IntegrationKind::Autostart), None);
-        assert_eq!(
-            opt_out_key(IntegrationKind::Torrent),
-            Some("torrent_assoc_user_disabled")
-        );
-        assert_eq!(
-            opt_out_key(IntegrationKind::Scheme("magnet")),
-            Some("magnet_assoc_user_disabled")
-        );
-        assert_eq!(
-            opt_out_key(IntegrationKind::Scheme("ed2k")),
-            Some("ed2k_assoc_user_disabled")
-        );
     }
 }

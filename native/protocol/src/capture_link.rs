@@ -100,6 +100,64 @@ pub fn percent_decode(value: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| value.to_owned())
 }
 
+/// 用户可在设置中关闭的「默认打开方式」关联：系统把 `.torrent` 文件、`magnet:` 或
+/// `ed2k://` 链接交给 FluxDown 时，它们的去留受对应 opt-out 偏好约束。
+///
+/// wire 形态为小写名（`"torrent"` / `"magnet"` / `"ed2k"`），作为
+/// `agent.capture.submit` / `agent.capture.submitTorrentFile` 的 `association` 参数，
+/// 标记该请求来自系统默认处理程序。
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OpenAssociation {
+    Torrent,
+    Magnet,
+    Ed2k,
+}
+
+impl OpenAssociation {
+    /// 系统交来的原始链接所属关联；`fluxdown:` 深链与普通直链不属于可关闭的关联。
+    /// 须在 [`normalize_capture_url`] 之前判定：深链解码出的 `magnet:` 不受 magnet
+    /// 关联开关约束。
+    ///
+    /// ```
+    /// use fluxdown_protocol::capture_link::OpenAssociation;
+    /// assert_eq!(
+    ///     OpenAssociation::of_url("MAGNET:?xt=urn:btih:abc"),
+    ///     Some(OpenAssociation::Magnet)
+    /// );
+    /// assert_eq!(OpenAssociation::of_url("fluxdown:magnet:?xt=urn:btih:abc"), None);
+    /// ```
+    #[must_use]
+    pub fn of_url(value: &str) -> Option<Self> {
+        let lower = value.to_ascii_lowercase();
+        if lower.starts_with("magnet:") {
+            Some(Self::Magnet)
+        } else if lower.starts_with("ed2k://") {
+            Some(Self::Ed2k)
+        } else {
+            None
+        }
+    }
+
+    /// 用户在设置中手动关闭该关联时持久化的设备本地偏好键（布尔，`true` = 已关闭）。
+    ///
+    /// ```
+    /// use fluxdown_protocol::capture_link::OpenAssociation;
+    /// assert_eq!(
+    ///     OpenAssociation::Torrent.opt_out_pref_key(),
+    ///     "torrent_assoc_user_disabled"
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn opt_out_pref_key(self) -> &'static str {
+        match self {
+            Self::Torrent => "torrent_assoc_user_disabled",
+            Self::Magnet => "magnet_assoc_user_disabled",
+            Self::Ed2k => "ed2k_assoc_user_disabled",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -553,18 +553,28 @@ fn apply_activity_bar_preferences(values: &BTreeMap<String, serde_json::Value>, 
     });
 }
 
-/// 外部链接 / `.torrent` 文件 → agent 捕获入口的 RPC 列表。
+/// 系统交来的外部链接 / `.torrent` 文件 → agent 捕获入口的 RPC 列表。声明来源关联
+/// （[`OpenAssociation`]）：用户已在设置中关闭的关联由 agent 拦截，不建任务。
+///
+/// [`OpenAssociation`]: fluxdown_protocol::capture_link::OpenAssociation
 fn capture_calls(
     client: &Arc<AgentClient>,
     urls: Vec<String>,
     files: Vec<std::path::PathBuf>,
 ) -> Vec<(String, crate::agent_client::AgentFuture<serde_json::Value>)> {
+    use fluxdown_protocol::capture_link::{OpenAssociation, normalize_capture_url};
     let mut calls = Vec::with_capacity(urls.len() + files.len());
     for url in urls {
-        let url = fluxdown_protocol::capture_link::normalize_capture_url(&url);
+        // 关联按原始 scheme 判定：`fluxdown:` 深链解码出的 `magnet:` 不受 magnet 开关约束。
+        let association = OpenAssociation::of_url(&url);
+        let url = normalize_capture_url(&url);
         let future = client.call::<serde_json::Value, serde_json::Value>(
             fluxdown_protocol::method::AGENT_CAPTURE_SUBMIT,
-            Some(serde_json::json!({ "request": { "url": url }, "silent": true })),
+            Some(serde_json::json!({
+                "request": { "url": url },
+                "silent": true,
+                "association": association,
+            })),
         );
         calls.push((url, future));
     }
@@ -572,7 +582,11 @@ fn capture_calls(
         let path = file.display().to_string();
         let future = client.call::<serde_json::Value, serde_json::Value>(
             fluxdown_protocol::method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
-            Some(serde_json::json!({ "path": path, "silent": true })),
+            Some(serde_json::json!({
+                "path": path,
+                "silent": true,
+                "association": OpenAssociation::Torrent,
+            })),
         );
         calls.push((path, future));
     }

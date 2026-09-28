@@ -101,6 +101,17 @@ fn host_id_from(own: String, in_helper: bool) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// 释放关联时的接手程序：候选中第一个不是 FluxDown（`mine`）的 bundle id。
+///
+/// Launch Services 没有「无默认处理程序」状态，设空 bundle id 只会让系统回落到剩余候选；
+/// FluxDown 是唯一候选时返回 `None`，此时系统层面无法让出，由关联 opt-out 在捕获入口拦截。
+#[cfg(target_os = "macos")]
+fn successor_handler(candidates: Vec<String>, mine: &str) -> Option<String> {
+    candidates
+        .into_iter()
+        .find(|id| !id.is_empty() && !id.eq_ignore_ascii_case(mine))
+}
+
 /// 引擎下载中临时文件后缀（`fluxdown_engine::downloader::TEMP_EXT`）；agent 不依赖引擎，
 /// 此处镜像同一字面量。
 const DOWNLOADING_SUFFIX: &str = ".fdownloading";
@@ -473,6 +484,28 @@ mod tests {
         );
         assert_eq!(host_id_from("com.fluxdown.app".to_owned(), true), None);
         assert_eq!(host_id_from(".agent".to_owned(), true), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_hands_over_to_first_other_candidate_only() {
+        let mine = "com.fluxdown.app";
+        assert_eq!(
+            successor_handler(
+                vec![
+                    "COM.FLUXDOWN.APP".to_owned(),
+                    String::new(),
+                    "org.qbittorrent.qBittorrent".to_owned(),
+                    "org.transmissionbt.Transmission".to_owned(),
+                ],
+                mine,
+            )
+            .as_deref(),
+            Some("org.qbittorrent.qBittorrent")
+        );
+        // 唯一候选是自己：Launch Services 无处可让。
+        assert_eq!(successor_handler(vec![mine.to_owned()], mine), None);
+        assert_eq!(successor_handler(Vec::new(), mine), None);
     }
 
     #[test]

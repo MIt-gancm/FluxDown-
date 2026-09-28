@@ -37,11 +37,12 @@ use crate::update::{UpdateError, UpdateService};
 /// daemon `/blobs/*` 请求体上限（与 `fluxdown_daemon::http::REQUEST_BODY_LIMIT` 一致）。
 const BLOB_UPLOAD_LIMIT: u64 = 4 * 1024 * 1024;
 
-/// 网关依赖的本机外壳服务：UI 在线计数 / 驻留、完成后关机、进程生命周期。
+/// 网关依赖的本机外壳服务：UI 在线计数 / 驻留、完成后关机、进程生命周期、系统通知。
 pub struct GatewayShell {
     pub shell: Arc<ShellState>,
     pub power: Arc<PowerService>,
     pub lifecycle: Arc<Lifecycle>,
+    pub notifier: Arc<crate::notification::Notifier>,
 }
 
 pub struct GatewayService {
@@ -60,6 +61,7 @@ pub struct GatewayService {
     api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
     api_token: fluxdown_api::auth::TokenCell,
     hello: ServiceHello,
+    open_associations: crate::open_association::OpenAssociationGuard,
     local: GatewayShell,
 }
 
@@ -86,6 +88,10 @@ impl GatewayService {
         api_token: fluxdown_api::auth::TokenCell,
         local: GatewayShell,
     ) -> Self {
+        let open_associations = crate::open_association::OpenAssociationGuard::new(
+            events.clone(),
+            Arc::clone(&local.notifier),
+        );
         Self {
             daemon,
             events,
@@ -114,6 +120,7 @@ impl GatewayService {
                     method::CAPABILITY_AGENT_DEVICE_LINK.to_owned(),
                 ],
             ),
+            open_associations,
             local,
         }
     }
@@ -669,6 +676,9 @@ impl GatewayService {
         &self,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcErrorData> {
+        if self.open_associations.intercept(&params)? {
+            return Ok(ignored_capture());
+        }
         let request_value = params
             .get("request")
             .cloned()
@@ -708,6 +718,9 @@ impl GatewayService {
         &self,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcErrorData> {
+        if self.open_associations.intercept(&params)? {
+            return Ok(ignored_capture());
+        }
         let path = PathBuf::from(required_string(&params, "path")?);
         let silent = params
             .get("silent")
@@ -995,6 +1008,11 @@ async fn platform_blocking<T: Send + 'static>(
         .await
         .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))?
         .map_err(platform_error_data)
+}
+
+/// 系统交来的链接 / 文件因关联已关闭而未建任务。
+fn ignored_capture() -> serde_json::Value {
+    serde_json::json!({ "ignored": true })
 }
 
 /// 应用系统集成变更后返回最新 `PlatformIntegrationDto`。
@@ -1473,6 +1491,7 @@ mod tests {
                     )),
                     dir.clone(),
                 )),
+                notifier: Arc::new(crate::notification::Notifier::new(dir.clone())),
             };
             let daemon_config = crate::daemon_client::DaemonClientConfig {
                 rpc_url: "ws://127.0.0.1:9/rpc".to_owned(),
