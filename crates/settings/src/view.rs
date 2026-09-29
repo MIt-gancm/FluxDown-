@@ -117,7 +117,6 @@ impl SettingsView {
         let ctx = SectionContext {
             store: &self.store,
             translator: &translator,
-            translator_entity: &self.translator,
         };
         build_pages(
             &ctx,

@@ -48,13 +48,13 @@ pub fn search_index(
     cx: &mut App,
 ) -> Vec<SettingsSearchEntry> {
     let current = translator.read(cx).clone();
-    let mut entries = flatten(&pages_for(&current, translator, store, activity_bar, cx));
+    let mut entries = flatten(&pages_for(&current, store, activity_bar, cx));
     if current.locale() == "en" {
         return entries;
     }
     let mut english = current;
     english.set_locale("en");
-    let english = flatten(&pages_for(&english, translator, store, activity_bar, cx));
+    let english = flatten(&pages_for(&english, store, activity_bar, cx));
     // 两次构建读同一份设置状态，结构应逐项一致；不一致（构建期间状态变化）时放弃别名。
     let aligned = english.len() == entries.len()
         && english.iter().zip(&entries).all(|(en, local)| {
@@ -73,16 +73,11 @@ pub fn search_index(
 
 fn pages_for(
     translator: &Translator,
-    translator_entity: &Entity<Translator>,
     store: &Entity<SettingsStore>,
     activity_bar: &[ActivityBarToggle],
     cx: &mut App,
 ) -> Vec<SettingsPage> {
-    let ctx = SectionContext {
-        store,
-        translator,
-        translator_entity,
-    };
+    let ctx = SectionContext { store, translator };
     build_pages(&ctx, activity_bar, None, None, cx)
 }
 

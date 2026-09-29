@@ -23,6 +23,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use crate::preference_writes::PreferenceWrites;
 use crate::service_bootstrap::ServiceBootstrap;
 
 pub type AgentFuture<T> = Pin<Box<dyn Future<Output = Result<T, RpcErrorData>> + Send + 'static>>;
@@ -139,6 +140,10 @@ async fn run_client(
                 attempt = 0;
                 link_log.connected();
                 let cursor = (snapshot.epoch.clone(), snapshot.sequence);
+                let preferences_revision = match &snapshot.body {
+                    SnapshotBody::Agent(body) => body.preferences.revision,
+                    SnapshotBody::Daemon(_) => 0,
+                };
                 if events
                     .send(AgentClientEvent::Snapshot(Box::new(snapshot)))
                     .await
@@ -146,7 +151,16 @@ async fn run_client(
                 {
                     return;
                 }
-                match run_connected(socket, &mut commands, &events, cursor, buffered).await {
+                match run_connected(
+                    socket,
+                    &mut commands,
+                    &events,
+                    cursor,
+                    buffered,
+                    PreferenceWrites::new(preferences_revision),
+                )
+                .await
+                {
                     Ok(SessionEnd::ClientDropped) => return,
                     Ok(SessionEnd::ServiceQuit) => {
                         log::info!("agent closed the connection with service-quit (full shutdown)");
@@ -368,12 +382,14 @@ async fn run_connected(
     events: &mpsc::Sender<AgentClientEvent>,
     snapshot_cursor: (String, u64),
     buffered: Vec<EventFrame>,
+    mut preference_writes: PreferenceWrites,
 ) -> Result<SessionEnd, ()> {
     let mut next_id = 10_i64;
     let mut pending = HashMap::<i64, oneshot::Sender<Result<Value, RpcErrorData>>>::new();
     let mut cursor = snapshot_cursor;
-    for frame in buffered {
+    for mut frame in buffered {
         if frame.epoch == cursor.0 {
+            preference_writes.overlay_frame(&mut frame);
             forward_event(frame, &mut cursor, events).await?;
         }
     }
@@ -383,6 +399,7 @@ async fn run_connected(
                 let Some(command) = command else { return Ok(SessionEnd::ClientDropped); };
                 let id = next_id;
                 next_id = next_id.saturating_add(1);
+                preference_writes.stage(id, &command.method, command.params.as_ref());
                 let request = RpcRequest::new(RequestId::Integer(id), command.method, command.params);
                 let text = serde_json::to_string(&request).map_err(|_| ())?;
                 pending.insert(id, command.ack);
@@ -406,24 +423,27 @@ async fn run_connected(
                     && notification.method == method::SERVICE_EVENT
                 {
                     let Some(params) = notification.params else { break; };
-                    let Ok(frame) = serde_json::from_value::<EventFrame>(params) else { break; };
+                    let Ok(mut frame) = serde_json::from_value::<EventFrame>(params) else { break; };
+                    preference_writes.overlay_frame(&mut frame);
                     forward_event(frame, &mut cursor, events).await?;
                     continue;
                 }
                 let response = serde_json::from_str::<RpcResponse>(&text).map_err(|_| ())?;
                 match response {
                     RpcResponse::Success(success) => {
-                        if let RequestId::Integer(id) = success.id
-                            && let Some(ack) = pending.remove(&id)
-                        {
-                            let _ = ack.send(Ok(success.result));
+                        if let RequestId::Integer(id) = success.id {
+                            preference_writes.settle(id, Some(&success.result));
+                            if let Some(ack) = pending.remove(&id) {
+                                let _ = ack.send(Ok(success.result));
+                            }
                         }
                     }
                     RpcResponse::Failure(failure) => {
-                        if let Some(RequestId::Integer(id)) = failure.id
-                            && let Some(ack) = pending.remove(&id)
-                        {
-                            let _ = ack.send(Err(failure.error.data.unwrap_or_else(internal_error)));
+                        if let Some(RequestId::Integer(id)) = failure.id {
+                            preference_writes.settle(id, None);
+                            if let Some(ack) = pending.remove(&id) {
+                                let _ = ack.send(Err(failure.error.data.unwrap_or_else(internal_error)));
+                            }
                         }
                     }
                 }

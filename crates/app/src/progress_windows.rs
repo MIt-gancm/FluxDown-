@@ -134,7 +134,7 @@ pub fn set_completion_override(cx: &mut App, task_id: &str, value: bool) {
 }
 
 fn prefs(cx: &App) -> ProgressWindowPrefs {
-    ProgressWindowPrefs::from_preferences(&Desktop::global(cx).preferences)
+    ProgressWindowPrefs::from_preferences(Desktop::preferences(cx))
 }
 
 fn on_event(event: &ServiceEvent, cx: &mut App) {

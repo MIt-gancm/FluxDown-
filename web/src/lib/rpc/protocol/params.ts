@@ -314,6 +314,12 @@ export interface PreferencesPatchParams {
   sync?: boolean;
 }
 
+/** `agent.preferences.patch` 结果：`revision` 为本次写入落定后的偏好版本。 */
+export interface PreferencesPatchResult {
+  ok: boolean;
+  revision: number;
+}
+
 export interface PowerArmParams {
   /** 全部任务完成后再等待的秒数（0 = 立即）。 */
   delaySecs: number;

@@ -12,7 +12,6 @@ use fluxdown_ui_downloads::actions as dl;
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_settings::{SettingsTarget, search_index};
 use fluxdown_ui_shell::RouteId;
-use fluxdown_ui_theme::toggle_theme;
 use gpui::{Action, App, SharedString, Window};
 use gpui_component::{Icon, WindowExt as _};
 
@@ -20,7 +19,7 @@ use crate::{
     actions::{About, CheckUpdate, OpenLogsFolder, OpenSettings, OpenWebsite, Quit},
     activity::{ActivityEntry, DOWNLOADS_ROUTE},
     app::Desktop,
-    windows::{WindowKey, WindowRegistry, patch_local_preference},
+    windows::{WindowKey, WindowRegistry},
 };
 
 /// 设备本地偏好：面板条目使用记录（见 [`UsageStats`]）。
@@ -74,24 +73,11 @@ fn build_config(translator: &Translator, cx: &mut App) -> PaletteConfig {
     let mut items = commands(&labels, cx);
     items.extend(settings_items(&labels, cx));
 
-    let desktop = Desktop::global(cx);
-    let usage = UsageStats::from_value(desktop.preferences.get(USAGE_PREF_KEY));
-    let client = desktop.client.clone();
+    let usage = UsageStats::from_value(Desktop::preferences(cx).get(USAGE_PREF_KEY));
     PaletteConfig {
         items,
         usage,
-        on_usage: Rc::new(move |usage, cx| {
-            let value = usage.to_value();
-            // 本地先折叠：偏好回流前再次打开面板也能看到最新排序。
-            Desktop::global_mut(cx)
-                .preferences
-                .insert(USAGE_PREF_KEY.to_owned(), value.clone());
-            let client = client.clone();
-            cx.spawn(async move |_| {
-                let _ = patch_local_preference(&client, USAGE_PREF_KEY, value).await;
-            })
-            .detach();
-        }),
+        on_usage: Rc::new(|usage, cx| Desktop::set_pref(cx, USAGE_PREF_KEY, usage.to_value())),
     }
 }
 
@@ -271,7 +257,7 @@ fn commands(labels: &Labels, cx: &App) -> Vec<PaletteItem> {
                 "cmd.toggle_theme",
                 label_key,
                 FluxIcon::Palette,
-                toggle_theme,
+                crate::activity::toggle_theme,
             )),
             ActivityEntry::Settings => items.push(
                 labels

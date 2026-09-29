@@ -1,14 +1,15 @@
 //! 外观：语言、明暗模式、主题（内置 + 已导入，含导入 / 导出 / 删除）、强调色、界面缩放。
 //!
-//! 每个控件同时写入偏好（走 `agent.preferences.patch`）并立即通过主题 crate 生效；
-//! 偏好快照回流时 app 调用 `fluxdown_ui_theme::apply_appearance_preferences` 幂等对齐。
+//! 控件只写偏好（走 `agent.preferences.patch`），不直接改主题 / 语言：app 观察设置存储的偏好
+//! 视图（含未回执的本地编辑），经 `fluxdown_ui_theme::apply_appearance_preferences` 与语言切换
+//! 统一投影。直接改内存状态会在存储只读（未连接）时与偏好脱节，并被下一次快照回弹。
 
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{
     AccentScheme, AppearancePreferences, BuiltinThemeId, COLOR_SCHEME_KEY, CUSTOM_COLOR_KEY,
     ColorTokens, DARK_THEME_KEY, ExportMode, ExtendedTokens, LIGHT_THEME_KEY, THEME_MODE_KEY,
     ThemeMode, ThemePreference, ThemeSelection, UI_SCALE_KEY, UI_SCALE_PERCENTS, active_theme,
-    argb_color, color_argb, foreground_for, set_appearance, set_theme_preference, set_ui_scale,
+    argb_color, color_argb, foreground_for, normalize_ui_scale_percent,
 };
 use gpui::{
     Anchor, App, AppContext as _, Entity, Hsla, InteractiveElement as _, IntoElement as _,
@@ -27,12 +28,12 @@ use gpui_component::{
 };
 
 use super::SectionContext;
+use crate::store::SettingsStore;
 use crate::theme_library::{
     self, ImportError, ImportOutcome, delete_theme, diagnostic_counts, export_document,
     export_file_name, import_text, register_imported,
 };
 use crate::ui::{Control, SettingsPage, SettingsSection, meta_text, row_button};
-use crate::{component_locale, store::SettingsStore};
 use fluxdown_ui_components::{ButtonVariant, ControlExt as _, FluxIcon};
 
 /// 主题画廊（Flutter `_ThemeActions` 的「更多主题」同一地址）。
@@ -90,24 +91,12 @@ fn language_field(ctx: &SectionContext) -> Control {
     }));
     let store = ctx.store();
     let set_store = ctx.store();
-    let translator = ctx.translator_entity.clone();
     Control::dropdown(
         options,
         move |cx: &App| SharedString::from(store.read(cx).pref_str(LOCALE_KEY, "system")),
         move |value: SharedString, cx: &mut App| {
             set_store.update(cx, |store, cx| {
                 store.set_pref_str(LOCALE_KEY, value.to_string(), cx)
-            });
-            let target = if value.as_ref() == "system" {
-                fluxdown_ui_i18n::system_locale()
-            } else {
-                value.to_string()
-            };
-            translator.update(cx, |translator, cx| {
-                if translator.set_locale(&target) {
-                    gpui_component::set_locale(component_locale(translator.locale()));
-                    cx.notify();
-                }
             });
         },
     )
@@ -122,19 +111,12 @@ fn theme_mode_field(ctx: &SectionContext) -> Control {
     let store = ctx.store();
     Control::dropdown(
         options,
-        move |cx: &App| {
-            SharedString::from(match active_theme(cx).preference() {
-                ThemePreference::System => "system",
-                ThemePreference::Light => "light",
-                ThemePreference::Dark => "dark",
-            })
-        },
+        move |cx: &App| SharedString::from(active_theme(cx).preference().wire_name()),
         move |value: SharedString, cx: &mut App| {
             let preference = theme_preference(&value);
             store.update(cx, |store, cx| {
-                store.set_pref_str(THEME_MODE_KEY, value.to_string(), cx)
+                store.set_pref_str(THEME_MODE_KEY, preference.wire_name(), cx)
             });
-            set_theme_preference(preference, None, cx);
         },
     )
 }
@@ -265,18 +247,14 @@ fn slot_key(mode: ThemeMode) -> &'static str {
     }
 }
 
-/// 把当前明暗槽位切到 `selection` 并写偏好（`builtin:<name>` / `custom:<id>`）。
+/// 把当前明暗槽位切到 `selection`：写偏好（`builtin:<name>` / `custom:<id>`）。
 fn select_theme(selection: ThemeSelection, store: &Entity<SettingsStore>, cx: &mut App) {
-    let mut appearance = active_theme(cx).appearance().clone();
     let mode = active_theme(cx).mode();
-    if *appearance.theme(mode) == selection {
+    if *active_theme(cx).appearance().theme(mode) == selection {
         return;
     }
-    let value = selection.pref_value();
-    appearance.set_theme(mode, selection);
-    set_appearance(appearance, None, cx);
     store.update(cx, |store, cx| {
-        store.set_pref_str(slot_key(mode), value, cx)
+        store.set_pref_str(slot_key(mode), selection.pref_value(), cx)
     });
 }
 
@@ -295,19 +273,15 @@ fn delete_custom_theme(
         );
         return;
     }
-    let mut appearance = active_theme(cx).appearance().clone();
     let fallback: Vec<ThemeMode> = [ThemeMode::Dark, ThemeMode::Light]
         .into_iter()
-        .filter(|mode| appearance.theme(*mode).custom_id() == Some(id))
+        .filter(|mode| active_theme(cx).appearance().theme(*mode).custom_id() == Some(id))
         .collect();
-    for mode in &fallback {
-        appearance.set_builtin_theme(*mode, BuiltinThemeId::default_for(*mode));
-    }
     if !fallback.is_empty() {
-        set_appearance(appearance.clone(), None, cx);
         store.update(cx, |store, cx| {
             for mode in fallback {
-                store.set_pref_str(slot_key(mode), appearance.theme(mode).pref_value(), cx);
+                let builtin = ThemeSelection::Builtin(BuiltinThemeId::default_for(mode));
+                store.set_pref_str(slot_key(mode), builtin.pref_value(), cx);
             }
         });
     }
@@ -748,12 +722,9 @@ fn color_dot(
                     this.hover(move |style| style.border_color(colors.muted_foreground))
                 })
                 .on_click(move |_, _, cx| {
-                    let mut appearance = active_theme(cx).appearance().clone();
-                    if appearance.color_scheme == scheme {
+                    if active_theme(cx).appearance().color_scheme == scheme {
                         return;
                     }
-                    appearance.color_scheme = scheme;
-                    set_appearance(appearance, None, cx);
                     store.update(cx, |store, cx| {
                         store.set_pref_str(COLOR_SCHEME_KEY, scheme.wire_name(), cx);
                     });
@@ -790,12 +761,10 @@ fn custom_color_picker(
                         return;
                     }
                     slot.last_synced = argb;
-                    let mut appearance = active_theme(cx).appearance().clone();
-                    appearance.color_scheme = AccentScheme::Custom;
-                    appearance.custom_color = argb;
-                    set_appearance(appearance, None, cx);
-                    // 云同步目录（Flutter `Color.toARGB32()`）约定整数 ARGB。
+                    // 自定义色只在 `color_scheme == custom` 时生效：两键一起写，否则偏好里仍是旧方案，
+                    // 投影会把强调色回退。云同步目录（Flutter `Color.toARGB32()`）约定整数 ARGB。
                     store.update(cx, |store, cx| {
+                        store.set_pref_str(COLOR_SCHEME_KEY, AccentScheme::Custom.wire_name(), cx);
                         store.set_pref_i64(CUSTOM_COLOR_KEY, i64::from(argb), cx);
                     });
                 },
@@ -846,8 +815,9 @@ fn ui_scale_field(ctx: &SectionContext) -> Control {
             let Ok(percent) = value.parse::<u16>() else {
                 return;
             };
-            set_ui_scale(percent, cx);
-            let scale = active_theme(cx).appearance().ui_scale_pref_value();
+            let mut appearance = active_theme(cx).appearance().clone();
+            appearance.ui_scale_percent = normalize_ui_scale_percent(percent);
+            let scale = appearance.ui_scale_pref_value();
             store.update(cx, |store, cx| {
                 store.set_pref(UI_SCALE_KEY, serde_json::Value::from(scale), cx);
             });

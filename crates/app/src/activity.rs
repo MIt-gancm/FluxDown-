@@ -8,7 +8,10 @@ use std::collections::BTreeMap;
 
 use fluxdown_ui_settings::ActivityBarToggle;
 use fluxdown_ui_shell::{RouteId, ShellView};
-use gpui::Context;
+use fluxdown_ui_theme::{THEME_MODE_KEY, ThemePreference, active_theme};
+use gpui::{App, Context, Window};
+
+use crate::app::Desktop;
 
 /// 主窗口路由标识：主窗口装配与命令面板导航共用。
 pub(crate) const DOWNLOADS_ROUTE: RouteId = RouteId::new("downloads");
@@ -116,4 +119,15 @@ pub(crate) fn apply_visibility(
             .unwrap_or(true);
         shell.set_entry_visible(entry.button_id(), visible, cx);
     }
+}
+
+/// 活动栏 / 命令面板的明暗切换：只写 [`THEME_MODE_KEY`]，换肤由偏好投影统一完成——
+/// 直接改内存主题会在下一次偏好快照 / 事件回流时被旧偏好覆盖。
+pub(crate) fn toggle_theme(_window: &mut Window, cx: &mut App) {
+    let target = if active_theme(cx).mode().is_dark() {
+        ThemePreference::Light
+    } else {
+        ThemePreference::Dark
+    };
+    Desktop::set_pref(cx, THEME_MODE_KEY, target.wire_name().into());
 }

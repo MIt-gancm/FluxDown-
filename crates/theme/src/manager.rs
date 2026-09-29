@@ -9,7 +9,7 @@ use serde_json::Value;
 use crate::{
     AppearancePreferences, BuiltinThemeId, ComponentTokens, DensityTokens, Diagnostic,
     ExtendedTokens, ResolveOptions, ResolvedTheme, SemanticThemeTokens, ThemeDocument,
-    ThemeSelection, normalize_ui_scale_percent, resolve_with,
+    ThemeSelection, resolve_with,
 };
 
 /// 用户主题偏好；`System` 在每次安装时解析当前系统明暗模式。
@@ -23,6 +23,16 @@ pub enum ThemePreference {
 }
 
 impl ThemePreference {
+    /// 偏好 wire 值（[`THEME_MODE_KEY`](crate::THEME_MODE_KEY)）。
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
     fn resolve(self, cx: &App) -> ThemeMode {
         match self {
             Self::System => cx.window_appearance().into(),
@@ -221,7 +231,7 @@ pub fn active_theme(cx: &App) -> &FluxThemeState {
 /// 把一个主题文件同时装入亮暗两个槽位并同步到 gpui-component 与 gpui-base。
 ///
 /// 其余外观选项（强调色、缩放）沿用当前状态；未初始化时取默认值。之后的
-/// [`set_appearance`] 在主题槽位与强调色不变时继续沿用该文件。
+/// [`apply_appearance_preferences`] 在主题槽位与强调色不变时继续沿用该文件。
 pub fn install_document(
     document: Arc<ThemeDocument>,
     preference: ThemePreference,
@@ -239,11 +249,13 @@ pub fn install_document(
 
 /// 应用一组外观选项。主题槽位/强调色未变时沿用当前文件（含通过
 /// [`install_document`] 装入的文件），否则按槽位选择重新取文件。
-pub fn set_appearance(
-    appearance: AppearancePreferences,
-    window: Option<&mut Window>,
-    cx: &mut App,
-) {
+///
+/// 界面缩放：GPUI 只有逐窗口的 rem 尺寸；gpui-component 的 `Root` 每帧把 `Theme::font_size`
+/// 写入窗口 rem，因此缩放排版/间距/圆角 token 即驱动所有窗口，无需逐窗口 `set_rem_size`。
+///
+/// 不对外公开：外观是偏好的纯投影，只经 [`apply_appearance_preferences`] 修改。界面若绕过偏好
+/// 直接改外观，下一次偏好快照 / 事件回流就会把它改回去。
+fn set_appearance(appearance: AppearancePreferences, window: Option<&mut Window>, cx: &mut App) {
     let documents = match cx.try_global::<FluxThemeState>() {
         Some(state) if state.appearance.same_palette(&appearance) => state.documents.clone(),
         _ => selection_documents(&appearance, cx),
@@ -265,42 +277,12 @@ pub fn apply_appearance_preferences(values: &BTreeMap<String, Value>, cx: &mut A
     set_appearance(appearance, None, cx);
 }
 
-/// 保留当前主题定义，仅切换明暗偏好。
-pub fn set_theme_preference(
-    preference: ThemePreference,
-    window: Option<&mut Window>,
-    cx: &mut App,
-) {
-    let mut appearance = active_theme(cx).appearance.clone();
-    appearance.theme_mode = preference;
-    set_appearance(appearance, window, cx);
-}
-
-/// 设置界面缩放百分比（限制到 80 ~ 150，按 10 取整）。
-///
-/// GPUI 只有逐窗口的 rem 尺寸；gpui-component 的 `Root` 每帧把
-/// `Theme::font_size` 写入窗口 rem，因此这里通过缩放排版/间距/圆角 token
-/// 驱动所有窗口，无需逐窗口调用 `set_rem_size`。
-pub fn set_ui_scale(percent: u16, cx: &mut App) {
-    let mut appearance = active_theme(cx).appearance.clone();
-    appearance.ui_scale_percent = normalize_ui_scale_percent(percent);
-    set_appearance(appearance, None, cx);
-}
-
-/// 在亮/暗两种显式模式间切换。
-pub fn toggle_theme(window: &mut Window, cx: &mut App) {
-    let preference = if active_theme(cx).mode().is_dark() {
-        ThemePreference::Light
-    } else {
-        ThemePreference::Dark
-    };
-    set_theme_preference(preference, Some(window), cx);
-}
-
-/// 系统外观变化时刷新 `System` 偏好；显式亮/暗偏好保持不变。
+/// 系统外观变化时按当前偏好重新解析 `System`；显式亮/暗偏好保持不变。
 pub fn sync_system_theme(window: &mut Window, cx: &mut App) {
-    if active_theme(cx).preference() == ThemePreference::System {
-        set_theme_preference(ThemePreference::System, Some(window), cx);
+    let state = active_theme(cx);
+    if state.preference() == ThemePreference::System {
+        let appearance = state.appearance.clone();
+        set_appearance(appearance, Some(window), cx);
     }
 }
 

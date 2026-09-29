@@ -43,6 +43,7 @@ import type {
   PowerArmParams,
   PowerArmResult,
   PreferencesPatchParams,
+  PreferencesPatchResult,
   RandomOriginIdResult,
   ReferralCreateCodeParams,
   ReferralDeleteCodeParams,
@@ -130,7 +131,8 @@ const device = {
 };
 
 const preferences = {
-  patch: (params: PreferencesPatchParams) => call<OkResult>(METHOD.AGENT_PREFERENCES_PATCH, params),
+  patch: (params: PreferencesPatchParams) =>
+    call<PreferencesPatchResult>(METHOD.AGENT_PREFERENCES_PATCH, params),
 };
 
 const sync = {

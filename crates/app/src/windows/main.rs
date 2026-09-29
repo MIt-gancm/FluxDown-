@@ -7,12 +7,12 @@ use fluxdown_ui_downloads::{DownloadHostActions, DownloadView};
 use fluxdown_ui_rss::RssView;
 use fluxdown_ui_settings::WebhookView;
 use fluxdown_ui_shell::{ShellAction, ShellRoute, ShellView, main_window_options};
-use fluxdown_ui_theme::{active_theme, toggle_theme};
+use fluxdown_ui_theme::active_theme;
 use gpui::{App, AppContext as _, Window, WindowHandle, px, size};
 use gpui_component::{Icon, Root};
 
 use crate::{
-    activity::ActivityEntry,
+    activity::{self, ActivityEntry},
     app::Desktop,
     capability_ports::AgentRssPort,
     downloads_port::AgentDownloadsPort,
@@ -108,7 +108,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                                 Icon::new(FluxIcon::Moon)
                             }
                         },
-                        toggle_theme,
+                        activity::toggle_theme,
                     )
                     .optional(optional),
                 ),
@@ -126,9 +126,9 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
         }
         let shell =
             cx.new(|cx| ShellView::new(translator.clone(), routes, actions, Some(menu_bar), cx));
-        let preferences = Desktop::global(cx).preferences.clone();
         shell.update(cx, |shell, cx| {
-            crate::activity::apply_visibility(shell, &preferences, cx);
+            let preferences = Desktop::preferences(cx).clone();
+            activity::apply_visibility(shell, &preferences, cx);
         });
 
         let settings_for_categories = settings_store.clone();

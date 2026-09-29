@@ -713,6 +713,7 @@ impl GatewayService {
             .get("sync")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
+        let mut revision = 0_u64;
         for (key, value) in values {
             // JSON null = 恢复默认（墓碑）：本机移除该偏好 / daemon 键回到默认，并把删除同步给云端。
             let deleted = value.is_null();
@@ -725,9 +726,9 @@ impl GatewayService {
                     .set_local_preference(key.clone(), value.clone(), deleted)
                     .await
             };
-            result.map_err(sync_error_data)?;
+            revision = revision.max(result.map_err(sync_error_data)?);
         }
-        Ok(serde_json::json!({ "ok": true }))
+        to_value(fluxdown_protocol::AgentPreferencesPatchResult { ok: true, revision })
     }
 
     async fn capture_submit(

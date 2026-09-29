@@ -85,8 +85,6 @@ pub(crate) struct Desktop {
     pub main_shell: Option<WeakEntity<ShellView>>,
     /// 设置窗口内的设置页（窗口关闭后失效）：命令面板据此定位设置项。
     pub settings_view: Option<WeakEntity<SettingsView>>,
-    /// 最新偏好（快照 + `PreferencesChanged` 折叠）。
-    pub preferences: BTreeMap<String, serde_json::Value>,
     /// 最新运行时统计（关窗 / 退出提示用）。
     pub runtime_stats: DaemonRuntimeStatsDto,
     /// agent 托盘可用性与驻留策略：决定关闭主窗口是只退出界面还是完全退出。
@@ -110,8 +108,20 @@ impl Desktop {
         Self::global(cx).runtime_stats.active_tasks
     }
 
+    /// 当前偏好：`SettingsStore` 的读视图（agent 快照 / 事件 + 本进程尚未回执的本地写入）。
+    pub fn preferences(cx: &App) -> &BTreeMap<String, serde_json::Value> {
+        Self::global(cx).settings_store.read(cx).preferences()
+    }
+
     pub fn pref(cx: &App, key: &str) -> Option<serde_json::Value> {
-        Self::global(cx).preferences.get(key).cloned()
+        Self::preferences(cx).get(key).cloned()
+    }
+
+    /// 写偏好：界面状态由偏好派生，任何改动偏好派生状态的入口都只写这里，
+    /// 由 [`observe_preferences`] 统一投影，避免「内存已改、偏好未写」被下一次快照回弹。
+    pub fn set_pref(cx: &mut App, key: &str, value: serde_json::Value) {
+        let store = Self::global(cx).settings_store.clone();
+        store.update(cx, |store, cx| store.set_pref(key, value, cx));
     }
 }
 
@@ -242,31 +252,25 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             main_downloads: None,
             main_shell: None,
             settings_view: None,
-            preferences: BTreeMap::new(),
             runtime_stats: DaemonRuntimeStatsDto::default(),
             shell: ShellStatusDto::default(),
             quitting: false,
         });
 
-        // 会话 → 偏好 / 运行时统计折叠进 Desktop；外观与语言随偏好变化。
+        // 会话 → 运行时统计 / 外壳状态折叠进 Desktop。偏好不在此处理：`SettingsStore` 已订阅同一
+        // 会话并叠加本地未回执编辑，外观与语言只从它投影（见 `observe_preferences`）。
+        observe_preferences(cx);
         cx.subscribe(&session, |_, signal, cx| match signal {
             SessionSignal::Snapshot(snapshot) => {
                 if let Some(body) = crate::session::agent_body(snapshot) {
-                    let values = body.preferences.values.clone();
                     let stats = body.daemon.runtime_stats.clone();
                     let shell = body.shell.clone();
                     let desktop = Desktop::global_mut(cx);
-                    desktop.preferences = values;
                     desktop.runtime_stats = stats;
                     desktop.shell = shell;
-                    apply_preferences(cx);
                 }
             }
             SessionSignal::Event(frame) => match &frame.event {
-                ServiceEvent::Agent(AgentEvent::PreferencesChanged(prefs)) => {
-                    Desktop::global_mut(cx).preferences = prefs.values.clone();
-                    apply_preferences(cx);
-                }
                 ServiceEvent::Agent(AgentEvent::ShellChanged(shell)) => {
                     Desktop::global_mut(cx).shell = shell.clone();
                 }
@@ -534,12 +538,27 @@ fn after_first_snapshot(cx: &mut App, run: fn(&mut App)) {
     }));
 }
 
-/// 偏好快照 → 全局外观与语言。每次快照/偏好事件都幂等应用。
-fn apply_preferences(cx: &mut App) {
-    let values = Desktop::global(cx).preferences.clone();
+/// 偏好 → 全局外观、活动栏与语言。唯一的投影入口：主题 / 语言等由偏好派生的全局状态只在这里
+/// 修改，界面控件只写偏好（[`Desktop::set_pref`] / `SettingsStore::set_pref`）。偏好视图含本地
+/// 未回执编辑，快照或无关键的事件回流都不会把刚做的改动回弹。
+fn observe_preferences(cx: &mut App) {
+    let store = Desktop::global(cx).settings_store.clone();
+    let mut applied = BTreeMap::new();
+    cx.observe(&store, move |store, cx| {
+        let values = store.read(cx).preferences();
+        if *values == applied {
+            return;
+        }
+        applied.clone_from(values);
+        apply_preferences(&applied, cx);
+    })
+    .detach();
+}
+
+fn apply_preferences(values: &BTreeMap<String, serde_json::Value>, cx: &mut App) {
     let translator = Desktop::global(cx).translator.clone();
-    fluxdown_ui_theme::apply_appearance_preferences(&values, cx);
-    apply_activity_bar_preferences(&values, cx);
+    fluxdown_ui_theme::apply_appearance_preferences(values, cx);
+    apply_activity_bar_preferences(values, cx);
     if let Some(locale) = values
         .get("general.locale")
         .and_then(serde_json::Value::as_str)

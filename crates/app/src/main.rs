@@ -19,6 +19,7 @@ mod lifecycle;
 mod logging;
 mod menus;
 mod power;
+mod preference_writes;
 mod progress_windows;
 mod service_bootstrap;
 mod session;

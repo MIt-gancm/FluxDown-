@@ -59,7 +59,6 @@ impl Render for WebhookView {
         let ctx = SectionContext {
             store: &self.store,
             translator: &translator,
-            translator_entity: &self.translator,
         };
         let sections = [
             webhook::endpoints_group(&ctx, cx),

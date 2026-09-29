@@ -660,12 +660,14 @@ impl SyncService {
     ///
     /// 目录外键（设备本地偏好）与本机专属键：只在本机生效（写偏好 / 应用到 daemon），不产生同步条目。
     /// `deleted = true` 是墓碑（恢复默认）：本机移除该偏好 / daemon 键回到默认值，并把删除同步给云端。
+    ///
+    /// 返回写入落定后的偏好 revision（只落 daemon 的键不改变 revision，返回当前值）。
     pub async fn mark_local(
         &self,
         key: String,
         value: Value,
         deleted: bool,
-    ) -> Result<(), SyncError> {
+    ) -> Result<u64, SyncError> {
         let Some(spec) = setting_spec(&key).filter(|spec| spec.owner != SyncOwner::Excluded) else {
             return self.set_local_preference(key, value, deleted).await;
         };
@@ -691,7 +693,7 @@ impl SyncService {
             )]))
             .await?;
         }
-        {
+        let revision = {
             let mut state = self.state.lock().await;
             if matches!(spec.owner, SyncOwner::Agent | SyncOwner::Preferences) {
                 if deleted {
@@ -708,7 +710,8 @@ impl SyncService {
                 entry.dirty = true;
             }
             state.refresh_sync_projection();
-        }
+            state.preferences.revision
+        };
         self.persist().await?;
         let (preferences, status) = {
             let state = self.state.lock().await;
@@ -718,16 +721,16 @@ impl SyncService {
             .publish(AgentEvent::PreferencesChanged(preferences));
         self.events.publish(AgentEvent::SyncChanged(status));
         self.wake.notify_one();
-        Ok(())
+        Ok(revision)
     }
 
-    /// 只写本机偏好，不进入同步（设备本地偏好、目录外键）。
+    /// 只写本机偏好，不进入同步（设备本地偏好、目录外键）；返回写入后的偏好 revision。
     pub async fn set_local_preference(
         &self,
         key: String,
         value: Value,
         deleted: bool,
-    ) -> Result<(), SyncError> {
+    ) -> Result<u64, SyncError> {
         let preferences = {
             let mut state = self.state.lock().await;
             if deleted {
@@ -738,10 +741,11 @@ impl SyncService {
             state.preferences.revision = state.preferences.revision.saturating_add(1);
             state.preferences.clone()
         };
+        let revision = preferences.revision;
         self.persist().await?;
         self.events
             .publish(AgentEvent::PreferencesChanged(preferences));
-        Ok(())
+        Ok(revision)
     }
 }
 
@@ -1975,6 +1979,43 @@ mod tests {
             .cloned()
             .expect("tombstone pushed");
         assert_eq!(item["deleted"], true);
+        harness.finish().await;
+    }
+
+    /// 客户端靠写入返回的 revision 判断在途写入何时被事件确认：返回值必须恰好是携带
+    /// 本次写入的 `PreferencesChanged` 的 revision，且严格单调。
+    #[tokio::test]
+    async fn preference_writes_return_the_revision_of_the_event_that_carries_them() {
+        let harness = Harness::new("write_revision", |_| {}).await;
+        let (mut events, _) = harness.service.events.subscribe_and_snapshot();
+        let mut next_preferences = async || loop {
+            let frame = events.recv().await.expect("event");
+            if let fluxdown_protocol::ServiceEvent::Agent(
+                fluxdown_protocol::AgentEvent::PreferencesChanged(prefs),
+            ) = frame.event
+            {
+                return prefs;
+            }
+        };
+
+        let synced = harness
+            .service
+            .mark_local("general.locale".to_owned(), json!("zh"), false)
+            .await
+            .expect("synced write");
+        let event = next_preferences().await;
+        assert_eq!(event.revision, synced);
+        assert_eq!(event.values["general.locale"], json!("zh"));
+
+        let local = harness
+            .service
+            .set_local_preference("desktop.window.main".to_owned(), json!({ "w": 1 }), false)
+            .await
+            .expect("local write");
+        assert!(local > synced);
+        let event = next_preferences().await;
+        assert_eq!(event.revision, local);
+        assert_eq!(event.values["desktop.window.main"], json!({ "w": 1 }));
         harness.finish().await;
     }
 }

@@ -30,11 +30,10 @@ use gpui_component::Icon;
 use crate::store::SettingsStore;
 use crate::ui::{Control, SettingsPage, SettingsRow, SettingsSection, SettingsTab, meta_text};
 
-/// 分区构建上下文：存储实体 + 当前语言的翻译快照 + 翻译实体 + app 注入的内容槽。
+/// 分区构建上下文：存储实体 + 当前语言的翻译快照。
 pub(crate) struct SectionContext<'a> {
     pub store: &'a Entity<SettingsStore>,
     pub translator: &'a Translator,
-    pub translator_entity: &'a Entity<Translator>,
 }
 
 impl SectionContext<'_> {

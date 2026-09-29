@@ -761,6 +761,18 @@ pub struct AgentPreferencesDto {
     pub values: BTreeMap<String, Value>,
 }
 
+/// `agent.preferences.patch` 的结果。
+///
+/// `revision` 是本次写入落定后的偏好版本：此后携带 `revision` 不低于它的
+/// `PreferencesChanged` / 快照必然已包含本次写入。响应与事件在同一连接上不保证先后，
+/// 客户端据此判断在途写入何时被确认，而不是在收到响应时立即放手。
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPreferencesPatchResult {
+    pub ok: bool,
+    pub revision: u64,
+}
+
 /// 等待官方 UI 确认的外部捕获请求。
 ///
 /// 不含 cookie / header / 请求体原文（这些只留在 agent 的捕获事务里，确认时由 agent

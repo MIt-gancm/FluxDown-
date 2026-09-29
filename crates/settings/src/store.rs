@@ -462,6 +462,14 @@ impl SettingsStore {
 
     // ───────────────────────── agent 偏好 ─────────────────────────
 
+    /// 全部偏好：agent 快照 / 事件，再盖上本进程尚未回执的本地编辑。
+    ///
+    /// 这是 UI 进程内偏好的唯一读视图：由偏好派生的全局状态（主题、语言、活动栏）只从这里
+    /// 投影，偏好写入也只经 [`Self::set_pref`]，二者因此不会互相回弹。
+    #[must_use]
+    pub fn preferences(&self) -> &BTreeMap<String, Value> {
+        &self.preferences.values
+    }
     #[must_use]
     pub fn pref(&self, key: &str) -> Option<&Value> {
         self.preferences.values.get(key)
