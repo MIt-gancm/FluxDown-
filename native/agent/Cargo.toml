@@ -28,6 +28,7 @@ hkdf = "0.12"
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
 keepawake = "0.6"
 mdns-sd = "0.20.2"
+mimalloc = "0.1.52"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "stream"] }

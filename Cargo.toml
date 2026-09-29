@@ -61,30 +61,17 @@ opt-level = 3
 opt-level = 3
 
 [profile.release]
-# 移除全部符号（含符号表），最大化减小体积
-strip = true
-# 为体积优化代码生成（默认 opt-level=3 偏向速度，"z" 最激进压缩体积）
-opt-level = "z"
-# Full LTO：跨 crate 死代码消除/内联最彻底，二进制最小（编译更慢）
+# 全部 release 产物（GPUI 桌面端、agent、fluxdownd、CLI、hub cdylib、nmh/updater、
+# Docker/NAS 包）共用本 profile，统一按运行期性能优先：opt-level=3 + fat LTO +
+# 单 codegen 单元，换取最佳吞吐/延迟，代价是产物体积和编译时间。
+# 不再用 "z"：它关闭循环向量化、压低内联阈值，BT 数据面（DH768 2.46 vs 1.60 ms）、
+# 哈希/校验、GPUI 布局等热路径都会明显变慢；体积收益对下载器不划算。
+opt-level = 3
+# Full LTO：跨 crate 内联 + 死代码消除最彻底，同时利于速度与体积
 lto = "fat"
-# 单一 codegen 单元，配合 LTO 进一步减小体积（牺牲并行编译速度）
+# 单一 codegen 单元：给 LLVM 完整优化视野（牺牲并行编译速度）
 codegen-units = 1
+# 移除全部符号：不影响运行期性能，只减小分发体积
+strip = true
 # 注意：不设 panic = "abort" —— engine 的 download_manager 依赖 catch_unwind
 # 恢复 task panic（见 AGENTS.md），abort 会让 panic 直接终止进程。
-
-# 例外：BT 热路径按速度优化。fat LTO 下 per-package opt-level 仍生效（实测 DH768
-# 2.46→1.60 ms）；loopback 每 GB CPU 4.46→4.06 s（-9%），代价约 +0.5 MB/产物。
-[profile.release.package.librqbit]
-opt-level = 3
-
-[profile.release.package.librqbit-core]
-opt-level = 3
-
-[profile.release.package.librqbit-peer-protocol]
-opt-level = 3
-
-[profile.release.package.librqbit-buffers]
-opt-level = 3
-
-[profile.release.package.librqbit-bencode]
-opt-level = 3

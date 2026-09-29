@@ -1,2 +1,8 @@
 [alias]
 desktop-dev = "run --quiet -p fluxdown-desktop-dev --"
+
+# x86_64 发布基线提到 x86-64-v2（SSE4.2/POPCNT/SSSE3/CMPXCHG16B）：2009 年后的
+# Intel/AMD、Win11 最低要求、主流 NAS（含 Celeron J/N 系列）全部满足。不上 v3（AVX2），
+# 部分 Atom/Celeron NAS 与老 Pentium 不支持，会直接 SIGILL。aarch64 维持默认 armv8-a。
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "target-cpu=x86-64-v2"]

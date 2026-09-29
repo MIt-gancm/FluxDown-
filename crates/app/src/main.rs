@@ -26,6 +26,10 @@ mod windows;
 
 use std::process::ExitCode;
 
+/// mimalloc 全局分配器：GPUI 每帧大量小对象分配，吞吐与碎片均优于系统默认分配器。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> ExitCode {
     exit_code(app::run())
 }

@@ -43,6 +43,8 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac
 COPY Cargo.toml Cargo.lock ./
+# .cargo/config.toml 带 x86_64 的 target-cpu=x86-64-v2 发布基线，必须与 CI 产物一致。
+COPY .cargo/ .cargo/
 # cargo 解析 workspace 时要读全部成员的 manifest，包括桌面开发工具。
 COPY native/ native/
 COPY crates/ crates/

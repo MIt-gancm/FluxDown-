@@ -12,6 +12,10 @@ use fluxdown_cli::format::{
 };
 use fluxdown_protocol::daemon::{CreateTaskRequest, RssSourceDto};
 
+/// mimalloc 全局分配器：`--local` 内嵌引擎时吞吐与内存碎片均优于 musl/glibc 默认分配器。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod local;
 
 /// 默认服务基址（本机 API 服务，仅监听 127.0.0.1）。
