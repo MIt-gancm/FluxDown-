@@ -32,6 +32,10 @@ pub struct DaemonSupervisor {
     stopped: AtomicBool,
     /// 追加给 daemon 子进程的环境变量（如 server 模式生效的演示 URL）。
     extra_env: Vec<(String, String)>,
+    /// daemon 子进程 stderr 的落盘文件；未设置或打开失败时丢弃。
+    stderr_log: Option<PathBuf>,
+    /// stderr 日志打开失败只告警一次。
+    stderr_log_warned: AtomicBool,
 }
 
 impl DaemonSupervisor {
@@ -42,6 +46,8 @@ impl DaemonSupervisor {
             bind_addr,
             stopped: AtomicBool::new(false),
             extra_env: Vec::new(),
+            stderr_log: None,
+            stderr_log_warned: AtomicBool::new(false),
         }
     }
 
@@ -49,6 +55,13 @@ impl DaemonSupervisor {
     #[must_use]
     pub fn with_extra_env(mut self, env: Vec<(String, String)>) -> Self {
         self.extra_env = env;
+        self
+    }
+
+    /// 把 daemon 的 stderr 追加到该文件（启动失败、panic 的唯一证据）；已超过 1 MiB 则截断重写。
+    #[must_use]
+    pub fn with_stderr_log(mut self, path: PathBuf) -> Self {
+        self.stderr_log = Some(path);
         self
     }
 
@@ -77,18 +90,33 @@ impl DaemonSupervisor {
             .envs(self.extra_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(self.open_stderr_log());
         detach_background_process(&mut command);
         let mut child = tokio::process::Command::from(command)
             .spawn()
             .map_err(|error| SupervisorError::Spawn(format!("{error:#}")))?;
+        let spawned_at = std::time::Instant::now();
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
+        tracing::info!(
+            executable = %executable.display(),
+            generation,
+            pid = child.id(),
+            "spawned fluxdownd"
+        );
         state.running = true;
         let supervisor_state = self.state.clone();
         state.reapers.push(tokio::spawn(async move {
             match child.wait().await {
-                Ok(status) => tracing::info!(%status, "supervised fluxdownd exited"),
+                Ok(status) if status.success() => {
+                    tracing::info!(%status, generation, "supervised fluxdownd exited");
+                }
+                Ok(status) => tracing::warn!(
+                    %status,
+                    generation,
+                    uptime_secs = spawned_at.elapsed().as_secs_f64(),
+                    "supervised fluxdownd exited abnormally"
+                ),
                 Err(error) => tracing::warn!(error = %error, "failed to reap fluxdownd"),
             }
             let mut state = supervisor_state.lock().await;
@@ -99,6 +127,37 @@ impl DaemonSupervisor {
         Ok(Some(generation))
     }
 }
+
+impl DaemonSupervisor {
+    fn open_stderr_log(&self) -> Stdio {
+        let Some(path) = &self.stderr_log else {
+            return Stdio::null();
+        };
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true);
+        let oversized = std::fs::metadata(path).is_ok_and(|meta| meta.len() > STDERR_LOG_MAX_BYTES);
+        if oversized {
+            options.write(true).truncate(true);
+        } else {
+            options.append(true);
+        }
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        match options.open(path) {
+            Ok(file) => Stdio::from(file),
+            Err(error) => {
+                if !self.stderr_log_warned.swap(true, Ordering::AcqRel) {
+                    tracing::warn!(path = %path.display(), error = %error, "cannot open fluxdownd stderr log; discarding daemon stderr");
+                }
+                Stdio::null()
+            }
+        }
+    }
+}
+
+/// daemon stderr 日志超过该大小时在下次拉起前截断。
+const STDERR_LOG_MAX_BYTES: u64 = 1024 * 1024;
 
 fn daemon_executable() -> Result<PathBuf, std::io::Error> {
     if let Some(path) = std::env::var_os("FLUXDOWN_DAEMON_BIN") {

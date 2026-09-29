@@ -19,6 +19,7 @@ base64 = "0.22"
 directories = "6"
 fluxdown_api = { version = "0.1.0", path = "../api" }
 fluxdown_link = { version = "0.1.0", path = "../link" }
+fluxdown_logfile = { version = "0.1.0", path = "../logfile" }
 fluxdown_protocol = { path = "../protocol" }
 fluxdown_ui_i18n = { version = "0.1.0", path = "../../crates/i18n", optional = true }
 fs2 = "0.4.3"

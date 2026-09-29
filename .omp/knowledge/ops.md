@@ -14,6 +14,13 @@ Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm
 - 导出：设置「关于」→ ZIP（纯 Dart 标准库，零依赖）。
 - GPUI 任务「日志」另走引擎数据库中的结构化活动历史（`engine/task_activity.rs`、`db.rs`），不是全局滚动文本文件：源端时间、跨重启 ID、查询分页与实时通知配合。当前保留七天且全库最多五万条，两者先到先清理；页面显示保留截断。同步事件入有界队列，持久化失败不广播成功记录，队列溢出/失败形成显式 `journal_overflow` 缺口；关机冲刷有界，不能因日志数据库不可用永久挂住。
 
+**GPUI 桌面链路（desktop / agent / daemon）**——与上面的 Flutter/引擎滚动日志分开：
+- `fluxdownd`：沿用引擎 `logger`（`<engine 数据目录>/logs/fluxdown_*.log`）；`main` 返回错误时带完整错误链落盘。
+- `fluxdown-desktop` 与 `fluxdown-agent`（非 `--server`）：共用 `native/logfile`（`fluxdown_logfile`，零依赖），写 `<agent 数据目录>/logs/{desktop,agent}.log`。单文件 2MB 轮转为 `.log.1`（只留一份，每进程 ≤4MB）；每个文件开头有会话头（版本、exe、参数形态、平台、`SESSIONNAME`/显示协议、`GPUI_*`/`ZED_*` 原值、其余 `FLUXDOWN_*` 只记名字），轮转后重写；同一消息（数字归一）每 60s 只落 10 条，其余汇总成 `[suppressed N repeats over Ts]`；UTC 时间戳；panic 带回溯。
+- desktop 收 `log` 门面：`fluxdown*` 与 `gpui*`（含显卡选择、D3D 特性级别、DirectComposition、设备丢失、draw 失败）按 `FLUXDOWN_LOG_LEVEL`（缺省 info），第三方只收 warn+；另记窗口打开参数、首个窗口 GPU 规格（软件渲染告警）、首帧耗时 / 10s 无首帧告警、UI 线程心跳看门狗（停摆 10/60/300s 告警，macOS 因 App Nap 不启用）、agent 连接状态迁移与 agent 进程拉起/退出。启动参数只记开关与位置参数个数，不记链接。
+- agent 收 `tracing`：`RUST_LOG` 非空时原样生效，否则 `warn` + 第一方 crate 按 `FLUXDOWN_LOG_LEVEL`；daemon 子进程 stderr 追加到同目录 `fluxdownd.stderr.log`（超 1MB 截断），拉起 / 非零退出（含存活时长）记入 `agent.log`。`--server` 模式仍是 stderr tracing。
+- Doctor 的日志目录检查、「打开日志目录」、日志导出都指向 `<agent 数据目录>/logs`（`log_export::agent_log_dir`）。
+
 ---
 
 ## 发布与 CI（`.github/workflows/release.yml`）

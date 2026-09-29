@@ -135,7 +135,14 @@ impl WindowRegistry {
             registry.open.remove(&key);
             registry.ids.remove(&handle.window_id());
         }
-        match cx.open_window(crate::app_icon::window_options(options), build) {
+        let label = format!("{key:?}");
+        let opened_at = std::time::Instant::now();
+        let options = crate::app_icon::window_options(options);
+        let result = cx.open_window(options, move |window, cx| {
+            crate::logging::observe_new_window(label, opened_at, window, cx);
+            build(window, cx)
+        });
+        match result {
             Ok(handle) => {
                 let any: AnyWindowHandle = handle.into();
                 let registry = cx.global_mut::<Self>();
@@ -144,7 +151,7 @@ impl WindowRegistry {
                 Some(handle)
             }
             Err(error) => {
-                eprintln!("failed to open FluxDown window: {error:#}");
+                log::error!("failed to open FluxDown window {key:?}: {error:#}");
                 None
             }
         }

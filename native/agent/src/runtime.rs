@@ -118,7 +118,14 @@ pub(crate) async fn run_with(
         .and_then(|config| config.effective_demo_url(bound))
         .map(|url| vec![("FLUXDOWN_DEMO_URL".to_owned(), url)])
         .unwrap_or_default();
-    let supervisor = Arc::new(DaemonSupervisor::new(daemon_address).with_extra_env(daemon_env));
+    let supervisor = Arc::new(
+        DaemonSupervisor::new(daemon_address)
+            .with_extra_env(daemon_env)
+            .with_stderr_log(
+                crate::log_export::agent_log_dir(&paths.agent_data_dir)
+                    .join("fluxdownd.stderr.log"),
+            ),
+    );
     let daemon_bearer = load_daemon_bearer(&paths, &supervisor).await?;
     let daemon_config = DaemonClientConfig {
         rpc_url: paths.daemon_rpc_url.clone(),
@@ -748,14 +755,7 @@ struct AgentPaths {
 
 impl AgentPaths {
     fn resolve() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let project = directories::ProjectDirs::from("dev", "zerx", "FluxDown")
-            .ok_or("could not resolve application data directory")?;
-        let root = std::env::var_os("FLUXDOWN_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| project.data_dir().to_owned());
-        let agent_data_dir = std::env::var_os("FLUXDOWN_AGENT_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("agent"));
+        let agent_data_dir = resolve_agent_data_dir()?;
         // daemon 的 bearer 与进程租约落在 engine 数据目录（`fluxdown_engine::data_dir::resolve_data_dir`），
         // 与 agent 自己的 ProjectDirs 根不同；未显式指定时必须按同一规则推导，否则永远等不到 token。
         let daemon_data_dir = std::env::var_os("FLUXDOWN_DATA_DIR")
@@ -773,6 +773,22 @@ impl AgentPaths {
             daemon_rpc_url,
         })
     }
+}
+
+/// agent 数据目录：`FLUXDOWN_AGENT_DATA_DIR`，否则 `<FLUXDOWN_DATA_DIR 或 ProjectDirs 数据目录>/agent`。
+/// 日志初始化与运行期装配共用，避免两处目录漂移。
+pub fn resolve_agent_data_dir() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(dir) = std::env::var_os("FLUXDOWN_AGENT_DATA_DIR") {
+        return Ok(PathBuf::from(dir));
+    }
+    let root = match std::env::var_os("FLUXDOWN_DATA_DIR") {
+        Some(root) => PathBuf::from(root),
+        None => directories::ProjectDirs::from("dev", "zerx", "FluxDown")
+            .ok_or("could not resolve application data directory")?
+            .data_dir()
+            .to_owned(),
+    };
+    Ok(root.join("agent"))
 }
 
 /// 镜像 `fluxdown_engine::data_dir::resolve_data_dir_inner` 的默认目录（agent 不依赖 engine）。

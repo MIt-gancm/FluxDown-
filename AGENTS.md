@@ -133,6 +133,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - `fluxdown_daemon`：`fluxdownd` 纯下载核心；独占 engine/下载 DB，拥有任务、队列、组、下载设置、RSS、插件、Webhook 与选择。
 - `fluxdown_agent`：`fluxdown-agent` 官方 UI Gateway 与 FluxCloud owner；拥有 Token、设备身份、同步、远程任务、捕获与兼容 API，只经 protocol RPC 调 daemon。
 - `fluxdown_link`（`native/link`）：局域网直连 L1 协议（身份 / 配对 SAS / mDNS / 直连传输 / 地址解析），持久化经 `LinkStorage` trait 注入；agent 为生产宿主，引擎仅保留 `DbLinkStorage` 给 Flutter hub。零引擎、零数据库、零 UI 依赖。
+- `fluxdown_logfile`（`native/logfile`）：desktop 与 agent 共用的诊断日志文件（轮转 + 重复限流 + panic hook），零第三方依赖；`log` / `tracing` 适配留在各宿主。细节见 `.omp/knowledge/ops.md`「日志系统」。
 - **feature 门控**：`plugins`、`components`（默认关；desktop/server 开，mobile/CLI 关）。**关插件时下载主链路零行为变化**（注入 no-op `PluginManager`）。
 
 **编译期陷阱**

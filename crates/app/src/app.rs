@@ -128,8 +128,14 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
     let _instance_lock =
         match acquire_or_activate(&instance_dir, &endpoint, &message, launch.activate_existing)? {
             LaunchDisposition::Primary(lock) => lock,
-            LaunchDisposition::Activated => return Ok(RunOutcome::Completed),
-            LaunchDisposition::NoPrimary => return Ok(RunOutcome::NoPrimary),
+            LaunchDisposition::Activated => {
+                log::info!("another desktop instance is primary; request forwarded, exiting");
+                return Ok(RunOutcome::Completed);
+            }
+            LaunchDisposition::NoPrimary => {
+                log::info!("--activate-existing without a primary instance; exiting");
+                return Ok(RunOutcome::NoPrimary);
+            }
         };
     let (activate_tx, mut activate_rx) = mpsc::channel::<ActivationRequest>(16);
     // Unix sockets can bind before Tokio starts, so parallel starters are queued immediately.
@@ -184,18 +190,19 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             Cow::Borrowed(MI_SANS_MEDIUM),
             Cow::Borrowed(MI_SANS_SEMIBOLD),
         ]) {
-            eprintln!("failed to load FluxDown UI fonts: {error:#}");
+            log::error!("failed to load FluxDown UI fonts: {error:#}");
             return;
         }
 
         gpui_component::init(cx);
+        crate::logging::install_ui_watchdog(cx);
         crate::app_icon::install();
         fluxdown_ui_theme::init(cx);
         // 导入主题须在首个偏好快照前注册，`custom:<id>` 偏好才能直接命中；
         // 库内缺失的 id 由主题 crate 回退到该槽位的内置默认主题。
         let theme_library = FsThemeLibrary::new(app_data_dir().join("themes"));
         for failure in fluxdown_ui_settings::install_theme_library(Arc::new(theme_library), cx) {
-            eprintln!("failed to load imported theme: {failure}");
+            log::warn!("failed to load imported theme: {failure}");
         }
         gpui_component::set_locale(&locale);
         let translator = cx.new(|_| translator);
@@ -278,7 +285,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
                 _ => {}
             },
             SessionSignal::Fatal(error) => {
-                eprintln!("fatal FluxDown agent error: {:?}", error.code);
+                log::error!("fatal FluxDown agent error: {:?}", error.code);
             }
             SessionSignal::ServiceStopped => crate::lifecycle::service_stopped(cx),
             SessionSignal::Stale => {}
@@ -569,7 +576,10 @@ fn capture_calls(
     client: &Arc<AgentClient>,
     urls: Vec<String>,
     files: Vec<std::path::PathBuf>,
-) -> Vec<(String, crate::agent_client::AgentFuture<serde_json::Value>)> {
+) -> Vec<(
+    &'static str,
+    crate::agent_client::AgentFuture<serde_json::Value>,
+)> {
     use fluxdown_protocol::capture_link::{OpenAssociation, normalize_capture_url};
     let mut calls = Vec::with_capacity(urls.len() + files.len());
     for url in urls {
@@ -584,7 +594,7 @@ fn capture_calls(
                 "association": association,
             })),
         );
-        calls.push((url, future));
+        calls.push(("link", future));
     }
     for file in files {
         let path = file.display().to_string();
@@ -596,7 +606,7 @@ fn capture_calls(
                 "association": OpenAssociation::Torrent,
             })),
         );
-        calls.push((path, future));
+        calls.push(("torrent file", future));
     }
     calls
 }
@@ -614,9 +624,9 @@ pub(crate) fn submit_captures_detached(
     }
     let calls = capture_calls(client, urls, files);
     client.spawn_background(async move {
-        for (source, future) in calls {
+        for (kind, future) in calls {
             if let Err(error) = future.await {
-                eprintln!("failed to submit {source}: {:?}", error.code);
+                log::warn!("failed to submit captured {kind}: {:?}", error.code);
             }
         }
         let _ = done.send(());
@@ -624,28 +634,61 @@ pub(crate) fn submit_captures_detached(
     finished
 }
 
-/// 桌面数据根目录：与 agent 同一规则（`FLUXDOWN_DATA_DIR` 优先，否则与 agent token 同一
-/// ProjectDirs 数据目录）。
-fn app_data_dir() -> std::path::PathBuf {
-    if let Some(path) = env::var_os("FLUXDOWN_DATA_DIR") {
-        return path.into();
+/// 桌面侧推导的 agent 路径；规则与 `fluxdown_agent::runtime::resolve_agent_data_dir` 一致，
+/// 否则设了 `FLUXDOWN_DATA_DIR` 时界面会去另一个目录找 bearer，永远连不上自己拉起的 agent。
+#[derive(Debug, PartialEq, Eq)]
+struct DesktopPaths {
+    /// 数据根：`FLUXDOWN_DATA_DIR`，否则 ProjectDirs 数据目录。
+    data_root: std::path::PathBuf,
+    /// `FLUXDOWN_AGENT_DATA_DIR`，否则 `<数据根>/agent`。
+    agent_data_dir: std::path::PathBuf,
+    /// `FLUXDOWN_AGENT_TOKEN_FILE`，否则 `<agent 数据目录>/agent.token`。
+    agent_token: std::path::PathBuf,
+}
+
+impl DesktopPaths {
+    fn from_env() -> Self {
+        Self::resolve(
+            |name| env::var_os(name),
+            directories::ProjectDirs::from("dev", "zerx", "FluxDown")
+                .map(|project| project.data_dir().to_owned()),
+        )
     }
-    directories::ProjectDirs::from("dev", "zerx", "FluxDown")
-        .map_or_else(std::path::PathBuf::new, |project| {
-            project.data_dir().to_owned()
-        })
+
+    fn resolve(
+        lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+        project_data_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        let data_root = lookup("FLUXDOWN_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .or(project_data_dir)
+            .unwrap_or_default();
+        let agent_data_dir = lookup("FLUXDOWN_AGENT_DATA_DIR")
+            .map_or_else(|| data_root.join("agent"), std::path::PathBuf::from);
+        let agent_token = lookup("FLUXDOWN_AGENT_TOKEN_FILE").map_or_else(
+            || agent_data_dir.join("agent.token"),
+            std::path::PathBuf::from,
+        );
+        Self {
+            data_root,
+            agent_data_dir,
+            agent_token,
+        }
+    }
+}
+
+/// 桌面数据根目录（导入主题等）。
+fn app_data_dir() -> std::path::PathBuf {
+    DesktopPaths::from_env().data_root
+}
+
+/// agent 数据目录；诊断日志写在其下 `logs/`。
+pub(crate) fn agent_data_dir() -> std::path::PathBuf {
+    DesktopPaths::from_env().agent_data_dir
 }
 
 fn agent_token_path() -> std::path::PathBuf {
-    if let Some(path) = env::var_os("FLUXDOWN_AGENT_TOKEN_FILE") {
-        return path.into();
-    }
-    if let Some(path) = env::var_os("FLUXDOWN_AGENT_DATA_DIR") {
-        return std::path::PathBuf::from(path).join("agent.token");
-    }
-    directories::ProjectDirs::from("dev", "zerx", "FluxDown")
-        .map(|project| project.data_dir().join("agent").join("agent.token"))
-        .unwrap_or_else(|| std::path::PathBuf::from("agent.token"))
+    DesktopPaths::from_env().agent_token
 }
 
 #[cfg(test)]
@@ -654,6 +697,56 @@ mod tests {
 
     fn test_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("fluxdown-app-{label}-{}", std::process::id()))
+    }
+
+    #[test]
+    fn paths_follow_the_agent_resolution_rules() {
+        use std::path::PathBuf;
+
+        let project = Some(PathBuf::from("/project"));
+        let resolve = |vars: &[(&str, &str)]| {
+            let vars: Vec<(String, String)> = vars
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            DesktopPaths::resolve(
+                |name| {
+                    vars.iter()
+                        .find(|(key, _)| key == name)
+                        .map(|(_, value)| value.into())
+                },
+                project.clone(),
+            )
+        };
+
+        let defaults = resolve(&[]);
+        assert_eq!(
+            defaults.agent_token,
+            PathBuf::from("/project/agent/agent.token")
+        );
+
+        // 只设数据根：token 必须跟着 agent 落到 `<root>/agent`（曾经仍读 ProjectDirs）。
+        let rooted = resolve(&[("FLUXDOWN_DATA_DIR", "/root")]);
+        assert_eq!(rooted.data_root, PathBuf::from("/root"));
+        assert_eq!(rooted.agent_data_dir, PathBuf::from("/root/agent"));
+        assert_eq!(rooted.agent_token, PathBuf::from("/root/agent/agent.token"));
+
+        let agent_dir = resolve(&[
+            ("FLUXDOWN_DATA_DIR", "/root"),
+            ("FLUXDOWN_AGENT_DATA_DIR", "/agent-state"),
+        ]);
+        assert_eq!(agent_dir.data_root, PathBuf::from("/root"));
+        assert_eq!(
+            agent_dir.agent_token,
+            PathBuf::from("/agent-state/agent.token")
+        );
+
+        let token_file = resolve(&[
+            ("FLUXDOWN_AGENT_DATA_DIR", "/agent-state"),
+            ("FLUXDOWN_AGENT_TOKEN_FILE", "/secrets/token"),
+        ]);
+        assert_eq!(token_file.agent_data_dir, PathBuf::from("/agent-state"));
+        assert_eq!(token_file.agent_token, PathBuf::from("/secrets/token"));
     }
 
     #[test]

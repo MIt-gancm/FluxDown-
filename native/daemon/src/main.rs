@@ -16,7 +16,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         shutdown_signal().await;
         signal_cancel.cancel();
     });
-    fluxdown_daemon::runtime::run(cancel).await
+    let result = fluxdown_daemon::runtime::run(cancel).await;
+    if let Err(error) = &result {
+        let mut chain = error.to_string();
+        let mut source = error.source();
+        while let Some(cause) = source {
+            chain.push_str(": ");
+            chain.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        tracing::error!(error = %chain, "fluxdownd exited with error");
+    }
+    result
 }
 
 #[cfg(unix)]

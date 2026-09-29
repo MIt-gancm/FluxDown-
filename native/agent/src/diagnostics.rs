@@ -182,7 +182,10 @@ impl DiagnosticsService {
     /// agent 与 daemon 的日志目录；daemon 不可达时其目录为空串。
     pub async fn log_paths(&self) -> LogPathsDto {
         let describe = self.daemon_describe().await;
-        crate::log_export::log_paths(self.store.data_dir(), daemon_log_dir(describe.as_ref()))
+        crate::log_export::log_paths(
+            &crate::log_export::agent_log_dir(self.store.data_dir()),
+            daemon_log_dir(describe.as_ref()),
+        )
     }
 
     /// 打包 agent 摘要、Doctor 报告、daemon 快照与两侧日志到 `.zip`。
@@ -224,7 +227,8 @@ impl DiagnosticsService {
             }
         }
 
-        for (name, bytes) in crate::log_export::collect_log_files(self.store.data_dir()).await {
+        let agent_logs = crate::log_export::agent_log_dir(self.store.data_dir());
+        for (name, bytes) in crate::log_export::collect_log_files(&agent_logs).await {
             zip.add(&format!("agent/logs/{name}"), &bytes);
         }
         if let Some(dir) = daemon_log_dir(describe.as_ref()) {
@@ -420,7 +424,7 @@ fn probe_sync(data_dir: &Path, opted_out: &[OpenAssociation]) -> SyncProbe {
     SyncProbe {
         nmh: nmh_checks(&crate::nmh::registry::diagnose()),
         shell: shell_checks(&crate::platform::integration_status(), opted_out),
-        log_dir: probe_log_dir(data_dir),
+        log_dir: probe_log_dir(&crate::log_export::agent_log_dir(data_dir)),
     }
 }
 

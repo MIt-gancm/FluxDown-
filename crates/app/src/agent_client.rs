@@ -5,7 +5,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
@@ -132,10 +132,12 @@ async fn run_client(
     let mut attempt = 0_usize;
     // 每个桌面进程只尝试替换一次协议不兼容的 agent，避免同目录二进制错配时反复互杀。
     let mut replaced_incompatible = false;
+    let mut link_log = ConnectionLog::default();
     loop {
         match connect(&config).await {
             Ok((socket, snapshot, buffered)) => {
                 attempt = 0;
+                link_log.connected();
                 let cursor = (snapshot.epoch.clone(), snapshot.sequence);
                 if events
                     .send(AgentClientEvent::Snapshot(Box::new(snapshot)))
@@ -147,11 +149,13 @@ async fn run_client(
                 match run_connected(socket, &mut commands, &events, cursor, buffered).await {
                     Ok(SessionEnd::ClientDropped) => return,
                     Ok(SessionEnd::ServiceQuit) => {
+                        log::info!("agent closed the connection with service-quit (full shutdown)");
                         bootstrap.stop();
                         let _ = events.send(AgentClientEvent::ServiceStopped).await;
                         return;
                     }
                     Err(()) => {
+                        log::warn!("agent connection lost; reconnecting");
                         if events.send(AgentClientEvent::Stale).await.is_err() {
                             return;
                         }
@@ -160,17 +164,20 @@ async fn run_client(
             }
             Err(error @ (ConnectError::NoBearer | ConnectError::Refused)) => {
                 let probe_listener = matches!(error, ConnectError::NoBearer);
-                if bootstrap
+                link_log.failed(&error);
+                if let Err(bootstrap_error) = bootstrap
                     .ensure_running(&config.rpc_url, probe_listener)
                     .await
-                    .is_err()
-                    && events.send(AgentClientEvent::Stale).await.is_err()
                 {
-                    return;
+                    log::warn!("could not start fluxdown-agent: {bootstrap_error}");
+                    if events.send(AgentClientEvent::Stale).await.is_err() {
+                        return;
+                    }
                 }
             }
             Err(ConnectError::Incompatible) if !replaced_incompatible => {
                 replaced_incompatible = true;
+                log::warn!("running agent speaks an incompatible protocol; asking it to shut down");
                 if request_shutdown(&config).await {
                     // 旧 agent 关停 daemon 后退出；连接被拒时由 bootstrap 拉起同级新版本。
                     crate::service_bootstrap::wait_until_stopped(
@@ -181,18 +188,22 @@ async fn run_client(
                     attempt = 0;
                     continue;
                 }
+                log::error!("incompatible agent refused to shut down; giving up");
                 let _ = events.send(AgentClientEvent::Fatal(protocol_error())).await;
                 return;
             }
             Err(ConnectError::Incompatible) => {
+                log::error!("agent protocol still incompatible after replacement; giving up");
                 let _ = events.send(AgentClientEvent::Fatal(protocol_error())).await;
                 return;
             }
             Err(ConnectError::Fatal(error)) => {
+                log::error!("fatal agent connection error: {:?}", error.code);
                 let _ = events.send(AgentClientEvent::Fatal(error)).await;
                 return;
             }
-            Err(ConnectError::Transient) => {
+            Err(error @ ConnectError::Transient(_)) => {
+                link_log.failed(&error);
                 if events.send(AgentClientEvent::Stale).await.is_err() {
                     return;
                 }
@@ -200,6 +211,52 @@ async fn run_client(
         }
         tokio::time::sleep(retry_delay(attempt)).await;
         attempt = attempt.saturating_add(1);
+    }
+}
+
+/// 连接诊断：只记状态迁移（失败原因变化、恢复连接）与按 2 的幂递增的持续失败提醒，
+/// 不逐次记录 100ms 一次的快速重试。
+#[derive(Default)]
+struct ConnectionLog {
+    failures: u64,
+    since: Option<Instant>,
+    last_reason: String,
+}
+
+impl ConnectionLog {
+    fn failed(&mut self, error: &ConnectError) {
+        self.failures = self.failures.saturating_add(1);
+        let since = *self.since.get_or_insert_with(Instant::now);
+        let reason = error.describe();
+        // 冷启动期间「尚无 bearer / 端口未监听」是预期状态，只作 info。
+        let expected = matches!(error, ConnectError::NoBearer | ConnectError::Refused);
+        if reason != self.last_reason {
+            if expected {
+                log::info!("agent not reachable yet: {reason}");
+            } else {
+                log::warn!("agent connection attempt failed: {reason}");
+            }
+            self.last_reason = reason;
+        } else if self.failures >= 16 && self.failures.is_power_of_two() {
+            log::warn!(
+                "agent still unreachable after {} attempts over {}s: {reason}",
+                self.failures,
+                since.elapsed().as_secs()
+            );
+        }
+    }
+
+    fn connected(&mut self) {
+        match self.since.take() {
+            Some(since) => log::info!(
+                "connected to agent after {} failed attempts ({}ms)",
+                self.failures,
+                since.elapsed().as_millis()
+            ),
+            None => log::info!("connected to agent"),
+        }
+        self.failures = 0;
+        self.last_reason.clear();
     }
 }
 
@@ -408,13 +465,15 @@ async fn call_on_socket(
     buffered: &mut Vec<EventFrame>,
 ) -> Result<Value, ConnectError> {
     let request = RpcRequest::new(RequestId::Integer(id), method_name, params);
-    let text = serde_json::to_string(&request).map_err(|_| ConnectError::Transient)?;
+    let text = serde_json::to_string(&request)
+        .map_err(|error| ConnectError::Transient(format!("encode {method_name}: {error}")))?;
     socket
         .send(Message::Text(text.into()))
         .await
-        .map_err(|_| ConnectError::Transient)?;
+        .map_err(|error| ConnectError::Transient(format!("send {method_name}: {error}")))?;
     while let Some(message) = socket.next().await {
-        let message = message.map_err(|_| ConnectError::Transient)?;
+        let message = message
+            .map_err(|error| ConnectError::Transient(format!("receive {method_name}: {error}")))?;
         let Message::Text(text) = message else {
             continue;
         };
@@ -427,13 +486,16 @@ async fn call_on_socket(
             let frame = serde_json::from_value::<EventFrame>(params)
                 .map_err(|_| ConnectError::Fatal(protocol_error()))?;
             if buffered.len() >= 1024 {
-                return Err(ConnectError::Transient);
+                return Err(ConnectError::Transient(format!(
+                    "event backlog overflow during {method_name}"
+                )));
             }
             buffered.push(frame);
             continue;
         }
-        let response =
-            serde_json::from_str::<RpcResponse>(&text).map_err(|_| ConnectError::Transient)?;
+        let response = serde_json::from_str::<RpcResponse>(&text).map_err(|_| {
+            ConnectError::Transient(format!("unexpected frame during {method_name}"))
+        })?;
         match response {
             RpcResponse::Success(success) if success.id == RequestId::Integer(id) => {
                 return Ok(success.result);
@@ -446,7 +508,9 @@ async fn call_on_socket(
             _ => {}
         }
     }
-    Err(ConnectError::Transient)
+    Err(ConnectError::Transient(format!(
+        "connection closed during {method_name}"
+    )))
 }
 
 fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> ConnectError {
@@ -462,7 +526,7 @@ fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> Conne
         tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401 => {
             ConnectError::Fatal(RpcErrorData::new(ApplicationErrorCode::Unauthorized, false))
         }
-        _ => ConnectError::Transient,
+        _ => ConnectError::Transient(format!("connect: {error}")),
     }
 }
 
@@ -471,10 +535,26 @@ enum ConnectError {
     NoBearer,
     /// 连接 agent 端口被拒：此刻确定无人监听。
     Refused,
-    Transient,
+    /// 握手 / 传输失败，携带诊断原因。
+    Transient(String),
     /// 对端协议版本不兼容：可尝试让旧 agent 退出后由 bootstrap 拉起同级新版本。
     Incompatible,
     Fatal(RpcErrorData),
+}
+
+impl ConnectError {
+    /// 连接诊断日志用的原因描述。
+    fn describe(&self) -> String {
+        match self {
+            Self::NoBearer => {
+                "no bearer token yet (agent not started or still initializing)".to_owned()
+            }
+            Self::Refused => "connection refused (agent not listening)".to_owned(),
+            Self::Transient(reason) => reason.clone(),
+            Self::Incompatible => "incompatible protocol version".to_owned(),
+            Self::Fatal(error) => format!("fatal: {:?}", error.code),
+        }
+    }
 }
 
 fn validate_url(url: &str) -> Result<(), AgentClientError> {

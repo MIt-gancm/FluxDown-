@@ -1,0 +1,245 @@
+//! 桌面（非 `--server`）模式的诊断日志：把 agent 的 `tracing` 事件与 panic 落盘到
+//! `<agent_data_dir>/logs/agent.log`（有界轮转、去重限流，见 `fluxdown_logfile`）。
+//!
+//! GUI 子系统没有 stderr，不装订阅者时所有事件都会丢失。
+
+use std::fmt::Write as _;
+use std::io;
+
+use fluxdown_logfile::Level;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
+
+use crate::runtime::AgentResult;
+
+/// 一等公民 crate：默认按用户级别输出；第三方（hyper / reqwest / tungstenite / axum）只保留 warn+。
+const FIRST_PARTY_TARGETS: [&str; 4] = [
+    "fluxdown_agent",
+    "fluxdown_link",
+    "fluxdown_api",
+    "fluxdown_protocol",
+];
+
+/// 初始化桌面模式日志；失败（目录不可写等）时静默返回，GUI 进程没有可报错的 stderr。
+pub fn init_desktop() {
+    let Ok(agent_data_dir) = crate::runtime::resolve_agent_data_dir() else {
+        return;
+    };
+    let dir = crate::log_export::agent_log_dir(&agent_data_dir);
+    let header = build_header(&agent_data_dir);
+    if fluxdown_logfile::init_global(&dir, "agent", header).is_err() {
+        return;
+    }
+    fluxdown_logfile::install_panic_hook();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_level(false)
+        .with_target(true)
+        .with_writer(LogFileWriter)
+        .with_env_filter(build_filter())
+        .finish();
+    // 已有全局订阅者时保持原样。
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+/// 进程结束前调用：失败时把完整错误链写入日志，并输出被限流吞掉的重复条目摘要。
+/// 日志未初始化时不做任何事。
+pub fn finish(result: &AgentResult) {
+    let Some(log) = fluxdown_logfile::global() else {
+        return;
+    };
+    if let Err(error) = result {
+        log.log_unthrottled(
+            Level::Error,
+            &format!("agent exited with error: {}", error_chain(error.as_ref())),
+        );
+    }
+    log.flush_suppressed();
+}
+
+fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let _ = write!(text, ": {cause}");
+        source = cause.source();
+    }
+    text
+}
+
+fn build_filter() -> EnvFilter {
+    if let Ok(raw) = std::env::var("RUST_LOG")
+        && !raw.trim().is_empty()
+    {
+        return EnvFilter::new(raw);
+    }
+    let level = std::env::var("FLUXDOWN_LOG_LEVEL")
+        .ok()
+        .and_then(|value| Level::parse(&value))
+        .unwrap_or(Level::Info);
+    EnvFilter::new(default_directives(level))
+}
+
+fn default_directives(level: Level) -> String {
+    let name = match level {
+        Level::Error => return "error".to_owned(),
+        Level::Warn => "warn",
+        Level::Info => "info",
+        Level::Debug => "debug",
+        Level::Trace => "trace",
+    };
+    let mut directives = String::from("warn");
+    for target in FIRST_PARTY_TARGETS {
+        let _ = write!(directives, ",{target}={name}");
+    }
+    directives
+}
+
+fn build_header(agent_data_dir: &std::path::Path) -> String {
+    let mut header = String::new();
+    let mut line = |key: &str, value: String| {
+        let _ = writeln!(header, "  {key}: {value}");
+    };
+    line("version", env!("CARGO_PKG_VERSION").to_owned());
+    let exe = std::env::current_exe();
+    line(
+        "exe",
+        exe.as_ref().map_or_else(
+            |error| format!("<unknown: {error}>"),
+            |p| p.display().to_string(),
+        ),
+    );
+    line(
+        "args",
+        std::env::args().skip(1).collect::<Vec<_>>().join(" "),
+    );
+    line(
+        "os/arch",
+        format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+    );
+    line("agent data dir", agent_data_dir.display().to_string());
+    line(
+        "engine data dir",
+        crate::runtime::engine_data_dir().display().to_string(),
+    );
+    #[cfg(windows)]
+    {
+        let portable = exe
+            .as_ref()
+            .ok()
+            .and_then(|exe| exe.parent().map(|dir| dir.join("portable").exists()))
+            .unwrap_or(false);
+        line("portable marker", portable.to_string());
+        line(
+            "SESSIONNAME",
+            std::env::var("SESSIONNAME").unwrap_or_else(|_| "<unset>".to_owned()),
+        );
+    }
+    for key in ["RUST_LOG", "FLUXDOWN_LOG_LEVEL"] {
+        line(
+            &format!("env {key}"),
+            std::env::var(key).unwrap_or_else(|_| "<unset>".to_owned()),
+        );
+    }
+    // 其余 FLUXDOWN_* 只记名字：值可能是访问密钥等机密。
+    let mut names: Vec<String> = std::env::vars_os()
+        .filter_map(|(name, _)| name.into_string().ok())
+        .filter(|name| name.starts_with("FLUXDOWN_") && name != "FLUXDOWN_LOG_LEVEL")
+        .collect();
+    names.sort();
+    for name in names {
+        line(&format!("env {name}"), "<set>".to_owned());
+    }
+    header
+}
+
+/// `tracing` → `LogFile` 适配：每个事件一个 writer，Drop 时整条转发。
+#[derive(Clone, Copy)]
+struct LogFileWriter;
+
+struct EventWriter {
+    level: Level,
+    buf: Vec<u8>,
+}
+
+impl<'a> MakeWriter<'a> for LogFileWriter {
+    type Writer = EventWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        EventWriter {
+            level: Level::Info,
+            buf: Vec::new(),
+        }
+    }
+
+    fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
+        let level = match *meta.level() {
+            tracing::Level::ERROR => Level::Error,
+            tracing::Level::WARN => Level::Warn,
+            tracing::Level::INFO => Level::Info,
+            tracing::Level::DEBUG => Level::Debug,
+            tracing::Level::TRACE => Level::Trace,
+        };
+        EventWriter {
+            level,
+            buf: Vec::new(),
+        }
+    }
+}
+
+impl io::Write for EventWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for EventWriter {
+    fn drop(&mut self) {
+        let text = String::from_utf8_lossy(&self.buf);
+        let text = text.trim_end();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(log) = fluxdown_logfile::global() {
+            log.log(self.level, text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_filter_keeps_third_party_quiet() {
+        assert_eq!(
+            default_directives(Level::Info),
+            "warn,fluxdown_agent=info,fluxdown_link=info,fluxdown_api=info,fluxdown_protocol=info"
+        );
+        assert_eq!(default_directives(Level::Error), "error");
+    }
+
+    #[test]
+    fn error_chain_walks_sources() {
+        #[derive(Debug)]
+        struct Outer(io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("outer")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = Outer(io::Error::other("inner"));
+        assert_eq!(error_chain(&error), "outer: inner");
+    }
+}

@@ -14,6 +14,18 @@ use tokio::sync::{mpsc, oneshot};
 
 const ACKNOWLEDGEMENT: &[u8] = b"ok\n";
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// 激活端点连续故障的首次退避；每次翻倍，封顶 [`LISTENER_RETRY_MAX`]。
+const LISTENER_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(50);
+const LISTENER_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 第 `failures` 次（从 1 起）连续故障后的等待：accept / connect / 建实例失败时如果立即重试，
+/// 持续性错误（句柄耗尽、实例损坏）会让监听任务空转占满一个核。
+fn listener_retry_delay(failures: u32) -> std::time::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    LISTENER_RETRY_BASE
+        .saturating_mul(1_u32 << doublings)
+        .min(LISTENER_RETRY_MAX)
+}
 
 /// 次实例 → 主实例的一次请求。
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,17 +171,28 @@ impl Listener {
     #[cfg(unix)]
     async fn listen_unix(&mut self, tx: mpsc::Sender<ActivationRequest>) {
         let Ok(listener) = self.listener.try_clone() else {
-            eprintln!("FluxDown desktop activation socket unavailable");
+            log::error!("desktop activation socket unavailable: clone failed");
             return;
         };
-        let Ok(listener) = tokio::net::UnixListener::from_std(listener) else {
-            eprintln!("FluxDown desktop activation socket unavailable");
-            return;
+        let listener = match tokio::net::UnixListener::from_std(listener) {
+            Ok(listener) => listener,
+            Err(error) => {
+                log::error!("desktop activation socket unavailable: {error}");
+                return;
+            }
         };
+        let mut failures = 0_u32;
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                continue;
+            let (stream, _) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    failures = failures.saturating_add(1);
+                    log::warn!("desktop activation accept failed: {error}");
+                    tokio::time::sleep(listener_retry_delay(failures)).await;
+                    continue;
+                }
             };
+            failures = 0;
             let tx = tx.clone();
             tokio::spawn(async move {
                 receive_and_ack_unix(stream, tx).await;
@@ -179,23 +202,43 @@ impl Listener {
 
     #[cfg(windows)]
     async fn listen_windows(&mut self, tx: mpsc::Sender<ActivationRequest>) {
-        use tokio::net::windows::named_pipe::ServerOptions;
-
+        let mut failures = 0_u32;
         loop {
-            if self.server.connect().await.is_err() {
+            if let Err(error) = self.server.connect().await {
+                failures = failures.saturating_add(1);
+                log::warn!("desktop activation pipe connect failed: {error}");
+                // 同一实例再 connect 会以同一错误立即返回：换新实例（先建后弃，管道名始终有
+                // 实例在，并发启动者不会看到 NotFound），并按连续失败次数退避。
+                self.server = create_pipe_instance(&self.name).await;
+                tokio::time::sleep(listener_retry_delay(failures)).await;
                 continue;
             }
-            let connected = std::mem::replace(
-                &mut self.server,
-                match ServerOptions::new().create(&self.name) {
-                    Ok(next) => next,
-                    Err(_) => return,
-                },
-            );
+            failures = 0;
+            let next = create_pipe_instance(&self.name).await;
+            let connected = std::mem::replace(&mut self.server, next);
             let tx = tx.clone();
             tokio::spawn(async move {
                 receive_and_ack_windows(connected, tx).await;
             });
+        }
+    }
+}
+
+/// 创建下一个管道实例；失败时退避重试而不是放弃，否则主实例此后再也收不到激活请求，
+/// 次实例只能等到超时报错。
+#[cfg(windows)]
+async fn create_pipe_instance(name: &str) -> tokio::net::windows::named_pipe::NamedPipeServer {
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    let mut failures = 0_u32;
+    loop {
+        match ServerOptions::new().create(name) {
+            Ok(server) => return server,
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                log::warn!("desktop activation pipe instance could not be created: {error}");
+                tokio::time::sleep(listener_retry_delay(failures)).await;
+            }
         }
     }
 }
@@ -348,7 +391,19 @@ async fn receive_and_ack_windows(
 mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use super::{ActivateMessage, Endpoint, Listener, SendError, send_to_primary};
+    use super::{
+        ActivateMessage, Endpoint, LISTENER_RETRY_MAX, Listener, SendError, listener_retry_delay,
+        send_to_primary,
+    };
+
+    #[test]
+    fn listener_backoff_doubles_and_is_capped() {
+        assert_eq!(listener_retry_delay(1), Duration::from_millis(50));
+        assert_eq!(listener_retry_delay(2), Duration::from_millis(100));
+        assert_eq!(listener_retry_delay(7), Duration::from_millis(3_200));
+        assert_eq!(listener_retry_delay(8), LISTENER_RETRY_MAX);
+        assert_eq!(listener_retry_delay(u32::MAX), LISTENER_RETRY_MAX);
+    }
 
     fn test_dir(label: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()

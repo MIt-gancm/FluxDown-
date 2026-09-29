@@ -32,6 +32,12 @@ pub fn resolve_target(target_path: &str) -> PathBuf {
     path
 }
 
+/// agent 侧诊断日志目录（`agent.log` / `desktop.log` / `fluxdownd.stderr.log`）。
+#[must_use]
+pub fn agent_log_dir(agent_data_dir: &Path) -> PathBuf {
+    agent_data_dir.join("logs")
+}
+
 /// 日志目录信息；daemon 目录未知时为空串。
 #[must_use]
 pub fn log_paths(agent_dir: &Path, daemon_log_dir: Option<&str>) -> LogPathsDto {

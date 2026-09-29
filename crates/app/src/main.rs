@@ -16,6 +16,7 @@ mod downloads_port;
 mod instance_ipc;
 mod launch;
 mod lifecycle;
+mod logging;
 mod menus;
 mod power;
 mod progress_windows;
@@ -32,7 +33,15 @@ use std::process::ExitCode;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> ExitCode {
-    exit_code(app::run())
+    logging::init();
+    let result = app::run();
+    logging::finish(
+        result
+            .as_ref()
+            .err()
+            .map(|error| error as &dyn std::error::Error),
+    );
+    exit_code(result)
 }
 
 fn exit_code(result: Result<app::RunOutcome, app::AppError>) -> ExitCode {

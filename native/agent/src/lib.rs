@@ -22,6 +22,7 @@ pub mod gateway;
 pub mod lifecycle;
 pub mod link;
 pub mod log_export;
+pub mod logging;
 pub mod nmh;
 pub mod notification;
 mod open_association;

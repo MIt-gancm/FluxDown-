@@ -67,16 +67,34 @@ impl ServiceBootstrap {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        let program = command.get_program().to_string_lossy().into_owned();
         let mut child = tokio::process::Command::from(command)
             .spawn()
-            .map_err(|error| BootstrapError::Spawn(format!("{error:#}")))?;
+            .map_err(|error| BootstrapError::Spawn(format!("{program}: {error:#}")))?;
         state.generation = state.generation.saturating_add(1);
         let generation = state.generation;
         state.running = true;
         self.spawned.store(true, Ordering::Release);
+        log::info!(
+            "spawned fluxdown-agent {program} (generation {generation}, pid {:?})",
+            child.id()
+        );
+        let spawned_at = std::time::Instant::now();
         let bootstrap_state = self.state.clone();
         state.reapers.push(tokio::spawn(async move {
-            let _ = child.wait().await;
+            // agent 常驻、与界面解耦，通常比界面活得久；先于界面退出（崩溃、锁冲突）才会记到。
+            // macOS 经 `open -g` 拉起时这里等的是 `open` 本身，立即成功退出属正常。
+            match child.wait().await {
+                Ok(status) if status.success() => log::info!(
+                    "fluxdown-agent (generation {generation}) exited after {}s",
+                    spawned_at.elapsed().as_secs()
+                ),
+                Ok(status) => log::warn!(
+                    "fluxdown-agent (generation {generation}) exited with {status} after {}s",
+                    spawned_at.elapsed().as_secs()
+                ),
+                Err(error) => log::warn!("failed to reap fluxdown-agent: {error}"),
+            }
             let mut state = bootstrap_state.lock().await;
             if state.generation == generation {
                 state.running = false;

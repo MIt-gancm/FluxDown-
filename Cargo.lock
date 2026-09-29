@@ -2860,6 +2860,7 @@ dependencies = [
  "directories",
  "fluxdown_api",
  "fluxdown_link",
+ "fluxdown_logfile",
  "fluxdown_protocol",
  "fluxdown_ui_i18n",
  "fs2",
@@ -3033,6 +3034,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxdown_logfile"
+version = "0.1.0"
+
+[[package]]
 name = "fluxdown_nmh"
 version = "0.1.0"
 dependencies = [
@@ -3094,6 +3099,7 @@ name = "fluxdown_ui_app"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "fluxdown_logfile",
  "fluxdown_protocol",
  "fluxdown_ui_account",
  "fluxdown_ui_command_palette",
@@ -3111,6 +3117,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "image",
+ "log",
  "mimalloc",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
