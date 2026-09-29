@@ -50,12 +50,26 @@ import type {
   ReferralValidateParams,
   RegisterParams,
   RegisterVerifyParams,
+  LinkAddressParams,
+  LinkApproveParams,
+  LinkDeviceInfo,
+  LinkDeviceParams,
+  LinkDiscoveredPeer,
+  LinkDiscoveryParams,
+  LinkDispatchParams,
+  LinkDispatchResult,
+  LinkPairBeginParams,
+  LinkPairBeginResponse,
+  LinkPairFinishParams,
+  LinkPairFinishResponse,
+  LinkPairingCodeDto,
   RemoteCommandParams,
   RemoteDispatchParams,
   RemoteDispatchResult,
   RemoteTaskDto,
   SendCodeParams,
   SendNewEmailCodeParams,
+  SyncLocalOnlyParams,
   SyncStatusDto,
   TtlResult,
   UpdateCheckParams,
@@ -124,6 +138,27 @@ const sync = {
   enable: () => call<OkResult>(METHOD.AGENT_SYNC_ENABLE),
   disable: () => call<OkResult>(METHOD.AGENT_SYNC_DISABLE),
   now: () => call<OkResult>(METHOD.AGENT_SYNC_NOW),
+  /** 把同步目录键设为本设备专属 / 恢复同步。 */
+  setLocalOnly: (params: SyncLocalOnlyParams) =>
+    call<SyncStatusDto>(METHOD.AGENT_SYNC_SET_LOCAL_ONLY, params),
+};
+
+const link = {
+  /** 展示本机配对码并开始广播。 */
+  pairingCode: () => call<LinkPairingCodeDto>(METHOD.AGENT_LINK_PAIRING_CODE),
+  stopPairing: () => call<OkResult>(METHOD.AGENT_LINK_STOP_PAIRING),
+  discoverySet: (params: LinkDiscoveryParams) =>
+    call<OkResult>(METHOD.AGENT_LINK_DISCOVERY_SET, params),
+  probe: (params: LinkAddressParams) => call<LinkDiscoveredPeer>(METHOD.AGENT_LINK_PROBE, params),
+  pairBegin: (params: LinkPairBeginParams) =>
+    call<LinkPairBeginResponse>(METHOD.AGENT_LINK_PAIR_BEGIN, params),
+  pairFinish: (params: LinkPairFinishParams) =>
+    call<LinkPairFinishResponse>(METHOD.AGENT_LINK_PAIR_FINISH, params),
+  approve: (params: LinkApproveParams) => call<OkResult>(METHOD.AGENT_LINK_APPROVE, params),
+  remove: (params: LinkDeviceParams) => call<OkResult>(METHOD.AGENT_LINK_REMOVE, params),
+  refresh: () => call<LinkDeviceInfo[]>(METHOD.AGENT_LINK_REFRESH),
+  dispatch: (params: LinkDispatchParams) =>
+    call<LinkDispatchResult>(METHOD.AGENT_LINK_DISPATCH, params),
 };
 
 const remote = {
@@ -196,6 +231,7 @@ export const agent = {
   device,
   preferences,
   sync,
+  link,
   remote,
   plan,
   order,

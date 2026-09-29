@@ -4,6 +4,7 @@
 
 import { Outlet, useLocation } from '@tanstack/react-router'
 import { useT } from '../i18n'
+import { AccountGuards } from './AccountGuards'
 import { ActivityRail } from './ActivityRail'
 import { BottomTabBar } from './BottomTabBar'
 import { ConnectionBanner, ConnectionDot } from './ConnectionStatus'
@@ -32,6 +33,7 @@ export function AppShell() {
           </main>
         </div>
         <BottomTabBar />
+        <AccountGuards />
       </div>
     </TitleBarSlotProvider>
   )

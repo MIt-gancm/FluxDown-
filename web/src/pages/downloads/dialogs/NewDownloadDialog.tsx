@@ -11,7 +11,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import { useT } from '../../../i18n'
 import { LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, call, describeUploadError, errorMessage, rpc, rpcStore, useAgent, useConfigValues, useDaemon } from '../../../lib/rpc'
-import type { AgentSnapshot, PendingCaptureDto, QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
+import type { AgentSnapshot, CloudDevice, LinkDeviceInfo, PendingCaptureDto, QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
 import { Button, Dialog, DialogFooter, FieldError, FieldHint, FieldLabel, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, Select, Spinner, Switch, Textarea, toast } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
 import { FsPickerDialog } from './FsPickerDialog'
@@ -24,6 +24,9 @@ import { SplitButton } from './SplitButton'
 import { capturesShown, closeNewDownload } from './store'
 import type { NewDownloadSession } from './store'
 import { isTorrentFile, submitTorrentFiles } from './torrents'
+import { accountErrorKey } from '../../settings/sections/account/errorText'
+import { buildRemoteTargets, checkRemoteSaveDir, LOCAL_TARGET, linkDispatchParams, pathExample, remoteDispatchParams, summarizeDispatch } from './target'
+import type { RemoteTarget } from './target'
 import { queueLabel } from './utils'
 
 /** resolvePreview 探测超时（对齐桌面端 90s）：超时 / 异常 / 空清单 / error 均静默回退直接建任务。 */
@@ -32,6 +35,8 @@ const SITE_AUTH_LOOKUP_DEBOUNCE_MS = 250
 
 const EMPTY_CAPTURES: readonly PendingCaptureDto[] = []
 const EMPTY_QUEUES: readonly QueueDto[] = []
+const EMPTY_CLOUD: readonly CloudDevice[] = []
+const EMPTY_LINKED: readonly LinkDeviceInfo[] = []
 
 interface FormContext {
   saveDir: string
@@ -66,6 +71,13 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const manualProxy = useMemo(() => manualProxyUrl(config), [config])
   const queues = useDaemon((daemon) => [...daemon.queues].sort((a, b) => a.position - b.position), EMPTY_QUEUES, (a, b) => a.length === b.length && a.every((item, index) => item === b[index]))
   const pendingCaptures = useAgent((snapshot) => snapshot.pendingCaptures, EMPTY_CAPTURES)
+  const cloudDevices = useAgent((snapshot) => snapshot.cloudDevices, EMPTY_CLOUD)
+  const linkedDevices = useAgent((snapshot) => snapshot.linkedDevices, EMPTY_LINKED)
+  const remoteTargets = useMemo(() => buildRemoteTargets(cloudDevices, linkedDevices), [cloudDevices, linkedDevices])
+  const [targetValue, setTargetValue] = useState(LOCAL_TARGET)
+  // 目标设备消失（登出 / 解除配对）时回落到本服务器。
+  const target: RemoteTarget | null = remoteTargets.find((item) => item.value === targetValue) ?? null
+  const [remoteSaveDir, setRemoteSaveDir] = useState('')
 
   const [text, setText] = useState(() => session.initialUrls.join('\n'))
   const [captures, setCaptures] = useState<PendingCaptureDto[]>([])
@@ -101,7 +113,8 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
   const batch = count > 1
   const allMagnet = count > 0 && entries.every((entry) => isMagnetUrl(entry.url))
   const busy = phase !== 'idle' || busyFiles
-  const canSubmit = !busy && count > 0 && saveDir.trim() !== ''
+  const remoteDirCheck = target ? checkRemoteSaveDir(remoteSaveDir, target.pathStyle) : 'ok'
+  const canSubmit = !busy && count > 0 && (target ? remoteDirCheck === 'ok' : saveDir.trim() !== '')
 
   // ── 外部捕获并入表单 ──
   const capturesRef = useRef<PendingCaptureDto[]>([])
@@ -250,8 +263,41 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
     void rpc.agent.preferences.patch({ values: { 'download.last_save_dir': dir }, sync: false }).catch(() => undefined)
   }
 
+  /** 逐条下发到云账号设备 / 已配对设备；成功的从文本框移除，失败的保留并逐条显示原因。 */
+  const submitRemote = async (remote: RemoteTarget) => {
+    setFailures([])
+    setPhase('submitting')
+    const renamed = entries.length === 1 ? rename.trim() : ''
+    const results = await Promise.allSettled(
+      entries.map((entry) => {
+        const input = { url: entry.url, fileName: renamed !== '' ? renamed : entry.fileName }
+        return remote.kind === 'cloud'
+          ? rpc.agent.remote.dispatch(remoteDispatchParams(remote.id, input, remoteSaveDir))
+          : rpc.agent.link.dispatch(linkDispatchParams(remote.id, input, remoteSaveDir))
+      }),
+    )
+    const summary = summarizeDispatch(results)
+    if (summary.failed === 0) {
+      toast.key(remote.online ? 'downloadToDispatched' : 'downloadToDispatchedOffline', 'success', { count: summary.ok, device: remote.name })
+      closeNewDownload()
+      return
+    }
+    const failed: { entry: UrlEntry; key: string }[] = []
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') failed.push({ entry: entries[index], key: accountErrorKey(result.reason) })
+    })
+    if (summary.ok > 0) toast.key('downloadToPartial', 'warning', { ok: summary.ok, failed: summary.failed, device: remote.name })
+    setText(failed.map((item) => entryToText(item.entry)).join('\n'))
+    setFailures(failed.map((item) => ({ url: item.entry.url, message: t(item.key) })))
+    setPhase('idle')
+  }
+
   const submit = async (later: boolean, queueOverride?: string) => {
     if (!canSubmit) return
+    if (target) {
+      await submitRemote(target)
+      return
+    }
     setFailures([])
     const options = draftOptions(later, queueOverride)
     const requests = buildRequests(entries, options)
@@ -448,7 +494,12 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
               <Button variant="outline" className="mobile:hidden" disabled={phase === 'submitting'} onClick={closeNewDownload}>
                 {t('cancel')}
               </Button>
-              <SplitButton
+              {target ? (
+                <Button variant="primary" disabled={!canSubmit} loading={phase === 'submitting'} onClick={() => void submit(false)}>
+                  {startLabel}
+                </Button>
+              ) : null}
+              {target ? null : <SplitButton
                 label={t('downloadLater')}
                 tooltip={laterQueue ? t('laterIntoQueueTooltip', { name: queueLabel(t, laterQueue) }) : undefined}
                 disabled={!canSubmit}
@@ -456,8 +507,8 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
                 menuTitle={t('downloadLater')}
                 menuLabel={t('downloadLater')}
                 onClick={() => void submit(true)}
-              />
-              <SplitButton
+              />}
+              {target ? null : <SplitButton
                 variant="primary"
                 label={startLabel}
                 tooltip={startQueue ? t('startIntoQueueTooltip', { name: queueLabel(t, startQueue) }) : undefined}
@@ -467,7 +518,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
                 menuTitle={t('startDownload')}
                 menuLabel={t('startDownload')}
                 onClick={() => void submit(false)}
-              />
+              />}
             </DialogFooter>
           )
         }
@@ -503,7 +554,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
               </FieldError>
             ))}
             <div className="flex flex-wrap gap-2">
-              <Button variant="ghost" icon={FolderOpen} disabled={busy} onClick={() => torrentInput.current?.click()}>
+              <Button variant="ghost" icon={FolderOpen} disabled={busy || target !== null} onClick={() => torrentInput.current?.click()}>
                 {t('openTorrentFile')}
               </Button>
               <Button variant="ghost" icon={FileText} disabled={busy} onClick={() => txtInput.current?.click()}>
@@ -514,17 +565,67 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
             </div>
           </div>
 
-          {/* 保存目录 */}
-          <FormField label={t('saveDir')} htmlFor="new-download-save-dir">
-            <InputWithAction
-              input={<Input id="new-download-save-dir" value={saveDir} placeholder={t('selectSaveDir')} spellCheck={false} onChange={(event) => setSaveDir(event.target.value)} />}
-              action={
-                <Button icon={FolderOpen} onClick={() => setPickerOpen(true)}>
-                  {t('browse')}
-                </Button>
-              }
-            />
-          </FormField>
+          {/* 下载到：本服务器 / 云账号其他设备 / 已配对设备 */}
+          {remoteTargets.length > 0 ? (
+            <FormField
+              label={t('downloadTo')}
+              htmlFor="new-download-target"
+              hint={target ? (target.online ? t('downloadToRemoteOptionsIgnored') : `${t('downloadToOfflineHint')} ${t('downloadToRemoteOptionsIgnored')}`) : t('downloadToHint')}
+            >
+              <Select
+                id="new-download-target"
+                value={target ? target.value : LOCAL_TARGET}
+                options={[
+                  { value: LOCAL_TARGET, label: t('webDownloadToServer') },
+                  ...remoteTargets.map((item) => ({
+                    value: item.value,
+                    label: `${item.name} · ${item.kind === 'link' ? `${t('deviceLocalTag')} · ` : ''}${item.online ? t('deviceOnline') : t('deviceOffline')}`,
+                  })),
+                ]}
+                aria-label={t('downloadTo')}
+                onValueChange={setTargetValue}
+              />
+            </FormField>
+          ) : null}
+
+          {/* 保存目录：本服务器用服务端目录选择器；远端为目标设备路径（空 = 目标默认目录） */}
+          {target ? (
+            <FormField
+              label={t('saveDir')}
+              htmlFor="new-download-save-dir"
+              hint={t('downloadToRemoteDirHint')}
+              {...(remoteDirCheck === 'notAbsolute' ? { error: t('downloadToPathInvalid', { example: pathExample(target.pathStyle) }) } : {})}
+            >
+              <InputWithAction
+                input={
+                  <Input
+                    id="new-download-save-dir"
+                    value={remoteSaveDir}
+                    placeholder={target.defaultSaveDir ? t('downloadToRemoteDirDefault', { dir: target.defaultSaveDir }) : t('downloadToRemoteDirUseDefault')}
+                    spellCheck={false}
+                    invalid={remoteDirCheck !== 'ok'}
+                    onChange={(event) => setRemoteSaveDir(event.target.value)}
+                  />
+                }
+                action={
+                  <Button icon={FolderOpen} disabled title={t('downloadToRemoteBrowseDisabled')}>
+                    {t('browse')}
+                  </Button>
+                }
+              />
+            </FormField>
+          ) : (
+            <FormField label={t('saveDir')} htmlFor="new-download-save-dir">
+              <InputWithAction
+                input={<Input id="new-download-save-dir" value={saveDir} placeholder={t('selectSaveDir')} spellCheck={false} onChange={(event) => setSaveDir(event.target.value)} />}
+                action={
+                  <Button icon={FolderOpen} onClick={() => setPickerOpen(true)}>
+                    {t('browse')}
+                  </Button>
+                }
+              />
+            </FormField>
+          )}
 
           {/* 文件名 | 线程数：批量隐藏文件名，全磁力隐藏线程数 */}
           {!batch || !allMagnet ? (

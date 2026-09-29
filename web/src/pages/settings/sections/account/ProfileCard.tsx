@@ -5,7 +5,7 @@ import { Check, Copy, Pencil, RefreshCw } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { copyText } from '../../../../lib/copy'
-import { RpcError, rpc } from '../../../../lib/rpc'
+import { rpc } from '../../../../lib/rpc'
 import type { AgentSessionDto } from '../../../../lib/rpc'
 import { Button, Card, ConfirmFooter, Dialog, FieldError, FieldHint, Form, FormField, Icon, Input, Tooltip, toast } from '../../../../ui'
 import { accountErrorKey } from './errorText'
@@ -117,8 +117,9 @@ export function OriginIdDialog({ onClose }: { onClose: () => void }) {
       onClose()
     } catch (error) {
       setBusy(false)
-      const code = error instanceof RpcError ? error.appCode : undefined
-      setErrorKey(code === 'conflict' ? 'accountOriginIdErrorTaken' : code === 'unsupported' ? 'accountOriginIdErrorNotAllowed' : accountErrorKey(error))
+      // agent 没有 Origin ID 专属 reason（云端 code 落入通用映射），「已被占用 / 无权限」由提交前的
+      // checkOriginId 判定，这里只按 reason / code 显示通用文案。
+      setErrorKey(accountErrorKey(error))
     }
   }
 

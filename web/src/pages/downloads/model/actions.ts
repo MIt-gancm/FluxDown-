@@ -31,8 +31,11 @@ async function guardedAll(jobs: readonly (() => Promise<unknown>)[]): Promise<bo
   return true
 }
 
-function remoteCommand(view: DownloadTaskView, action: RemoteCommandParams['action']) {
-  return () => rpc.agent.remote.command({ taskId: view.taskId, action })
+function remoteCommand(view: DownloadTaskView, action: RemoteCommandParams['action'], deleteFiles = false) {
+  return () =>
+    rpc.agent.remote.command(
+      action === 'delete' ? { taskId: view.taskId, action, deleteFiles } : { taskId: view.taskId, action },
+    )
 }
 
 export function pauseViews(views: readonly DownloadTaskView[]): Promise<boolean> {
@@ -60,7 +63,7 @@ export function deleteViews(views: readonly DownloadTaskView[], deleteFiles: boo
     views.map((view) =>
       view.source === 'local'
         ? () => rpc.daemon.task.delete({ taskId: view.taskId, deleteFiles })
-        : remoteCommand(view, 'delete'),
+        : remoteCommand(view, 'delete', deleteFiles),
     ),
   )
 }

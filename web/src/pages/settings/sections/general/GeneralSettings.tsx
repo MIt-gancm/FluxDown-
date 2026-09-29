@@ -12,7 +12,8 @@ function SidebarDevicesRow() {
   const t = useT()
   const raw = usePrefRaw('ui.show_sidebar_devices')
   const loggedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
-  const checked = typeof raw === 'boolean' ? raw : loggedIn
+  const hasLinked = useAgent((snapshot) => snapshot.linkedDevices.length > 0, false)
+  const checked = typeof raw === 'boolean' ? raw : loggedIn || hasLinked
   return (
     <SettingsRow title={t('showSidebarDevice')} description={t('showSidebarDeviceDesc')} compact>
       <Switch checked={checked} onCheckedChange={(next) => setPref('ui.show_sidebar_devices', next)} aria-label={t('showSidebarDevice')} />

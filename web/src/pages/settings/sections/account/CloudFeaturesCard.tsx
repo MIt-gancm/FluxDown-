@@ -6,12 +6,38 @@ import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
 import type { CloudDevice, SyncStatusDto } from '../../../../lib/rpc'
 import { Badge, Button, Card, Icon, Switch, Tooltip, toast } from '../../../../ui'
-import { accountErrorKey } from './errorText'
+import { otherDevices } from '../../../downloads/model/devices'
+import { accountErrorKey, REASON_KEYS } from './errorText'
+import { SYNC_GROUPS, syncGroupState, syncPhase, toggleGroupParams } from './syncGroups'
+import type { SyncGroup, SyncGroupState } from './syncGroups'
 
 function RowIcon({ icon }: { icon: LucideIcon }) {
   return (
     <div className="flex size-control shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground coarse:size-11">
       <Icon icon={icon} />
+    </div>
+  )
+}
+
+function formatTime(unixMs: number): string {
+  const date = new Date(unixMs)
+  return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
+}
+
+/** 同步失败 / 暂停原因：优先按 reason 本地化，缺失回退原始诊断文本。 */
+function useSyncReasonText(sync: SyncStatusDto): string {
+  const t = useT()
+  const key = sync.lastErrorReason ? REASON_KEYS[sync.lastErrorReason] : undefined
+  return key ? t(key) : (sync.lastError ?? '')
+}
+
+function ScopeRow({ group, state, disabled, onToggle }: { group: SyncGroup; state: SyncGroupState; disabled: boolean; onToggle: () => void }) {
+  const t = useT()
+  return (
+    <div className="flex items-center gap-3 px-3 py-2 pl-14">
+      <div className="min-w-0 flex-1 text-sm text-foreground">{t(group.labelKey)}</div>
+      {state === 'mixed' ? <Badge>{t('syncScopeMixed')}</Badge> : null}
+      <Switch checked={state === 'sync'} disabled={disabled} onCheckedChange={onToggle} aria-label={t(group.labelKey)} />
     </div>
   )
 }
@@ -29,14 +55,23 @@ export function CloudFeaturesCard({
 }) {
   const t = useT()
   const active = loggedIn && sync.enabled
+  const phase = syncPhase(sync)
+  const reasonText = useSyncReasonText(sync)
   const subtitle = !active
     ? t('cloudSyncDesc')
-    : sync.lastError
-      ? t('cloudSyncStatusError', { reason: sync.lastError })
-      : sync.dirtyKeys.length > 0
-        ? t('cloudSyncStatusSyncing')
-        : t('cloudSyncStatusSynced')
-  const online = devices.filter((device) => device.isOnline).length
+    : phase === 'halted'
+      ? t('cloudSyncStatusHalted', { reason: reasonText })
+      : phase === 'error'
+        ? t('cloudSyncStatusError', { reason: reasonText })
+        : phase === 'connecting'
+          ? t('cloudSyncStatusConnecting')
+          : phase === 'syncing'
+            ? t('cloudSyncStatusSyncing')
+            : sync.lastSyncedAtUnixMs
+              ? t('cloudSyncStatusSyncedAt', { time: formatTime(sync.lastSyncedAtUnixMs) })
+              : t('cloudSyncStatusSynced')
+  const online = otherDevices(devices).filter((device) => device.isOnline).length
+  const localOnlyKeys = sync.localOnlyKeys ?? []
 
   const run = async (action: () => Promise<unknown>) => {
     try {
@@ -59,7 +94,7 @@ export function CloudFeaturesCard({
           <RowIcon icon={RefreshCw} />
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">
             <div className="text-sm font-medium text-foreground">{t('cloudSyncTitle')}</div>
-            <div className="text-xs text-muted-foreground">{subtitle}</div>
+            <div className={phase === 'halted' || phase === 'error' ? 'text-xs text-warning' : 'text-xs text-muted-foreground'}>{subtitle}</div>
           </div>
           {active ? (
             <Button disabled={disabled} onClick={() => void run(() => rpc.agent.sync.now())}>
@@ -72,6 +107,26 @@ export function CloudFeaturesCard({
             </span>
           </Tooltip>
         </div>
+        {active ? (
+          <div className="flex flex-col py-1">
+            <div className="flex flex-col gap-0.5 px-3 py-1 pl-14">
+              <div className="text-xs font-medium text-foreground">{t('syncScopeTitle')}</div>
+              <div className="text-xs text-muted-foreground">{t('syncScopeDesc')}</div>
+            </div>
+            {SYNC_GROUPS.map((group) => {
+              const state = syncGroupState(group, localOnlyKeys)
+              return (
+                <ScopeRow
+                  key={group.id}
+                  group={group}
+                  state={state}
+                  disabled={disabled}
+                  onToggle={() => void run(() => rpc.agent.sync.setLocalOnly(toggleGroupParams(group, state)))}
+                />
+              )
+            })}
+          </div>
+        ) : null}
         <div className="flex items-center gap-3 px-3 py-2">
           <RowIcon icon={Network} />
           <div className="flex min-w-0 flex-1 flex-col gap-0.5">

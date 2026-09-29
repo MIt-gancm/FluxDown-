@@ -9,6 +9,7 @@ import {
   CirclePause,
   Cpu,
   Globe,
+  Plus,
   Layers,
   Rows3,
   Settings,
@@ -19,11 +20,12 @@ import type { ReactNode } from 'react'
 import { useT } from '../../../i18n'
 import { categoryIconByKey } from '../../../lib/category-icons'
 import { cn } from '../../../lib/cn'
-import { LATER_QUEUE_ID, MAIN_QUEUE_ID, rpc, usePref, usePrefBool } from '../../../lib/rpc'
+import { LATER_QUEUE_ID, MAIN_QUEUE_ID, rpc, useAgent, usePref, usePrefBool } from '../../../lib/rpc'
 import type { CustomCategoryDto, QueueDto } from '../../../lib/rpc'
 import { ContextMenuArea, Icon, confirmDialog, toast } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
 import { openQueueManager } from '../dialogs'
+import { otherDevices } from '../model/devices'
 import { LOCAL_DEVICE, SIDEBAR_SECTION_PREFS, STATUS_FILTERS, filterMatches, sameSelection } from '../model/filters'
 import type { DownloadFilter, DownloadStatusFilter, SidebarSelection } from '../model/filters'
 import { categoryLabel, useDownloads } from '../state'
@@ -174,10 +176,11 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   const showStatus = usePrefBool(SIDEBAR_SECTION_PREFS.status, true)
   const showQueues = usePrefBool(SIDEBAR_SECTION_PREFS.queues, true)
   const showCategory = usePrefBool(SIDEBAR_SECTION_PREFS.category, true)
+  const loggedIn = useAgent((snapshot) => snapshot.session !== null && snapshot.session !== undefined, false)
   const devicesPref = usePref<unknown>(SIDEBAR_SECTION_PREFS.devices)
   // 设备区三态：显式设置按值；未设置时有任何设备才显示。
   const showDevices =
-    typeof devicesPref === 'boolean' ? devicesPref : cloudDevices.length > 0 || linkedDevices.length > 0
+    typeof devicesPref === 'boolean' ? devicesPref : loggedIn || linkedDevices.length > 0
 
   const categoryEntries = useMemo<CustomCategoryDto[]>(
     () => categories.visible().map((rule) => rule.dto).filter((dto) => dto.builtinType !== 'all'),
@@ -199,7 +202,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         bump(queueCounts, view.queueId)
         bump(deviceCounts, LOCAL_DEVICE)
       } else {
-        bump(deviceCounts, view.fromDevice)
+        bump(deviceCounts, view.toDevice)
       }
       for (const filter of filters) {
         if (filterMatches(filter, view, categories)) bump(filterCounts, `${filter.status}|${filter.category ?? ''}`)
@@ -266,11 +269,23 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     return entries
   }
 
-  const devices: { id: string; label: string }[] = [
-    { id: LOCAL_DEVICE, label: t('thisDevice') },
-    ...cloudDevices.map((device) => ({ id: device.deviceId, label: device.name || device.deviceId })),
-    ...linkedDevices.map((device) => ({ id: device.fingerprint, label: device.name || device.fingerprint })),
+  const devices: { id: string; label: string; online: boolean }[] = [
+    { id: LOCAL_DEVICE, label: t('thisDevice'), online: true },
+    ...otherDevices(cloudDevices).map((device) => ({
+      id: device.deviceId,
+      label: device.name || device.deviceId,
+      online: device.isOnline,
+    })),
+    ...linkedDevices.map((device) => ({
+      id: device.fingerprint,
+      label: device.name || device.fingerprint,
+      online: device.online,
+    })),
   ]
+  const openAddDevice = () => {
+    onNavigate?.()
+    void navigate({ to: '/settings/$category', params: { category: 'account' } })
+  }
 
   const sections: ReactNode[] = []
 
@@ -414,10 +429,18 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                 label={device.label}
                 icon={device.id === LOCAL_DEVICE ? Cpu : Globe}
                 count={counts.deviceCounts.get(device.id) ?? 0}
+                dot={device.online && device.id !== LOCAL_DEVICE}
                 onClick={() => select(selection)}
               />
             )
           })}
+          <NavRow
+            selected={false}
+            label={t('addDeviceEntry')}
+            icon={Plus}
+            count={0}
+            onClick={openAddDevice}
+          />
         </Collapse>
       </div>,
     )

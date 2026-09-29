@@ -2,10 +2,11 @@
 // 全部为服务端输出，字段均必带（`Option<T>` → `T | null`）。
 
 import type { JsonValue } from './common';
+import type { ErrorReason } from './error';
 
 // ── 账号 ──
 
-export type CloudUserStatus = 'active' | 'disabled' | 'pending';
+export type CloudUserStatus = 'active' | 'disabled' | 'pending' | 'unknown';
 
 /** FluxCloud 用户公开资料。 */
 export interface CloudUser {
@@ -87,6 +88,55 @@ export interface CloudDevice {
   appVersion: string | null;
   isOnline: boolean;
   isCurrent: boolean;
+  /** 设备自报的默认下载目录（目标设备本地路径）。 */
+  defaultSaveDir?: string | null;
+  /** 设备自报的路径风格；缺失时按 platform 推断（见 `effectivePathStyle`）。 */
+  pathStyle?: PathStyle | null;
+}
+
+/** 设备本地文件路径的书写风格。 */
+export type PathStyle = 'windows' | 'posix' | 'unknown';
+
+/** 按平台名推断路径风格（对应 Rust `PathStyle::from_platform`）。 */
+export function pathStyleFromPlatform(platform: string | null | undefined): PathStyle | null {
+  switch ((platform ?? '').trim().toLowerCase()) {
+    case 'windows':
+    case 'win32':
+      return 'windows';
+    case 'macos':
+    case 'darwin':
+    case 'linux':
+    case 'android':
+    case 'ios':
+    case 'freebsd':
+    case 'openbsd':
+    case 'netbsd':
+      return 'posix';
+    default:
+      return null;
+  }
+}
+
+/** 设备自报风格，未上报（或 unknown）时按平台推断（对应 Rust `effective_path_style`）。 */
+export function effectivePathStyle(device: {
+  pathStyle?: PathStyle | null;
+  platform?: string | null;
+}): PathStyle | null {
+  if (device.pathStyle && device.pathStyle !== 'unknown') return device.pathStyle;
+  return pathStyleFromPlatform(device.platform);
+}
+
+/** `path` 是否为该风格下的绝对路径（对应 Rust `PathStyle::is_absolute`）。 */
+export function isAbsolutePath(style: PathStyle, path: string): boolean {
+  const p = path.trim();
+  switch (style) {
+    case 'windows':
+      return /^[A-Za-z]:[\\/]/.test(p) || p.startsWith('\\\\');
+    case 'posix':
+      return p.startsWith('/');
+    default:
+      return false;
+  }
 }
 
 /** 无 token 的本地会话视图。 */
@@ -192,7 +242,7 @@ export interface CloudReferralValidateResult {
 
 // ── 跨设备任务 ──
 
-/** 远端任务状态；未识别的值 Rust 端回退为 `pending`。 */
+/** 远端任务状态；未识别的值 Rust 端解析为 `unknown`（不接单、不控制）。 */
 export type RemoteTaskStatus =
   | 'accepted'
   | 'downloading'
@@ -200,7 +250,8 @@ export type RemoteTaskStatus =
   | 'completed'
   | 'failed'
   | 'canceled'
-  | 'pending';
+  | 'pending'
+  | 'unknown';
 
 export interface RemoteTaskDto {
   id: string;
@@ -228,6 +279,54 @@ export interface LinkDeviceInfo {
   online: boolean;
   pairedAt: number;
   lastSeenAt: number;
+  /** 对端自报的默认下载目录；旧版对端省略。 */
+  defaultSaveDir?: string;
+  pathStyle?: PathStyle;
+}
+
+/** 局域网发现的对端（`agent.link.probe` 结果 / `linkDiscoveredChanged`）。 */
+export interface LinkDiscoveredPeer {
+  fingerprint?: string;
+  name: string;
+  platform?: string;
+  host: string;
+  port: number;
+  appVersion?: string;
+  /** `mdns` | `manual`。 */
+  source: string;
+}
+
+/** 等待本机确认的入站局域网配对请求。 */
+export interface LinkPairingRequestDto {
+  sessionId: string;
+  peerName: string;
+  peerFingerprint: string;
+  peerPlatform?: string | null;
+  /** 双方肉眼核对的短认证串。 */
+  sas: string;
+  expiresAtUnixMs: number;
+}
+
+/** 本机当前展示的局域网配对码。 */
+export interface LinkPairingCodeDto {
+  code: string;
+  expiresAtUnixMs: number;
+  /** 空数组 = 网关仅监听 127.0.0.1，需开启局域网访问。 */
+  addresses: string[];
+  fingerprint: string;
+  deviceName: string;
+}
+
+export interface LinkPairBeginResponse {
+  token: string;
+  sas: string;
+  peerName: string;
+  peerFingerprint: string;
+}
+
+export interface LinkPairFinishResponse {
+  paired: boolean;
+  device?: LinkDeviceInfo;
 }
 
 // ── 网关 / 外壳 / 电源 / 同步 / 偏好 ──
@@ -269,6 +368,14 @@ export interface SyncStatusDto {
   revision: number;
   dirtyKeys: string[];
   lastError: string | null;
+  lastErrorReason?: ErrorReason | null;
+  /** 同步事件流已连通。 */
+  connected?: boolean;
+  /** 不可自动恢复的错误（设备超限/未受信任）暂停重试。 */
+  halted?: boolean;
+  lastSyncedAtUnixMs?: number | null;
+  /** 本设备不参与云同步的同步目录键。 */
+  localOnlyKeys?: string[];
 }
 
 /**

@@ -39,7 +39,7 @@ function healthLabelKey(health: LinkHealth): string {
     case 'reconnecting':
       return 'webReconnecting'
     case 'daemonOffline':
-      return 'localServiceDisconnected'
+      return 'webDaemonOffline'
     case 'stopped':
       return 'webServiceStopped'
     case 'incompatible':

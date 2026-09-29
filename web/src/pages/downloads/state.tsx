@@ -16,6 +16,7 @@ import {
   useTasks,
 } from '../../lib/rpc'
 import type {
+  AgentSessionDto,
   CloudDevice,
   DaemonRuntimeStatsDto,
   GroupDto,
@@ -26,6 +27,7 @@ import type {
   TaskRuntimeDto,
 } from '../../lib/rpc'
 import { CategoryIndex, categoriesFromPreference } from './model/categories'
+import { currentDeviceId, visibleRemoteTasks } from './model/devices'
 import { filterMatches, LOCAL_DEVICE, SELECTION_ALL } from './model/filters'
 import type { SidebarSelection } from './model/filters'
 import { useLiveSpeeds } from './model/liveSpeeds'
@@ -159,6 +161,7 @@ const selectGroups = (daemon: { groups: GroupDto[] }) => daemon.groups
 const selectStats = (daemon: { runtimeStats: DaemonRuntimeStatsDto }) => daemon.runtimeStats
 const selectRemote = (snapshot: { remoteTasks: RemoteTaskDto[] }) => snapshot.remoteTasks
 const selectDaemonConnected = (snapshot: { daemonConnected: boolean }) => snapshot.daemonConnected
+const selectSession = (snapshot: { session: AgentSessionDto | null }) => snapshot.session
 const selectCloud = (snapshot: { cloudDevices: CloudDevice[] }) => snapshot.cloudDevices
 const selectLinked = (snapshot: { linkedDevices: LinkDeviceInfo[] }) => snapshot.linkedDevices
 
@@ -246,6 +249,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const runtimeStats = useDaemon(selectStats, EMPTY_STATS, shallowEqual)
   const remoteTasks = useAgent(selectRemote, EMPTY_REMOTE as RemoteTaskDto[])
   const daemonConnected = useAgent(selectDaemonConnected, false)
+  const session = useAgent(selectSession, null)
   const cloudDevices = useAgent(selectCloud, EMPTY_CLOUD as CloudDevice[])
   const linkedDevices = useAgent(selectLinked, EMPTY_LINKED as LinkDeviceInfo[])
   const categoriesPref = usePref<unknown>('custom_categories')
@@ -296,7 +300,11 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     return views
   }, [tasks, live, boostedId, runtimes, connected])
 
-  const remoteViews = useMemo(() => remoteTasks.map(buildRemoteView), [remoteTasks])
+  const currentId = useMemo(() => currentDeviceId(session, cloudDevices), [session, cloudDevices])
+  const remoteViews = useMemo(
+    () => visibleRemoteTasks(remoteTasks, currentId).map(buildRemoteView),
+    [remoteTasks, currentId],
+  )
   const views = useMemo(() => [...localViews, ...remoteViews], [localViews, remoteViews])
   const byKey = useMemo(() => new Map(views.map((view) => [view.key, view])), [views])
 
@@ -343,16 +351,6 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     }))
   }, [groups, localViews])
 
-  // 远程任务来源设备匹配：设备 id / 指纹 → 别名集合。
-  const deviceAliases = useMemo(() => {
-    const aliases = new Map<string, string[]>()
-    for (const device of cloudDevices) aliases.set(device.deviceId, [...(aliases.get(device.deviceId) ?? []), device.id])
-    for (const device of linkedDevices) {
-      aliases.set(device.fingerprint, [...(aliases.get(device.fingerprint) ?? []), device.name])
-    }
-    return aliases
-  }, [cloudDevices, linkedDevices])
-
   const normalizedQuery = useMemo(() => query.trim().toLowerCase(), [query])
 
   // 筛选 + 搜索 + 排序 + 分组
@@ -366,10 +364,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
         case 'device': {
           const device = sidebarSelection.deviceId
           if (device === LOCAL_DEVICE) return view.source === 'local'
-          return (
-            view.source === 'remote' &&
-            (view.fromDevice === device || (deviceAliases.get(device)?.includes(view.fromDevice) ?? false))
-          )
+          return view.source === 'remote' && view.toDevice === device
         }
       }
     }
@@ -454,7 +449,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
       }
     }
     return { rows: out, visibleKeys: keys, matchingKeys: matchingSet }
-  }, [views, sidebarSelection, categories, deviceAliases, normalizedQuery, prefs, queues, groupNames, t])
+  }, [views, sidebarSelection, categories, normalizedQuery, prefs, queues, groupNames, t])
 
   // 选中集只保留当前筛选 + 搜索下仍在视图内的任务（折叠分组内的仍属于当前视图）。
   useEffect(() => {

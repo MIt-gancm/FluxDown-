@@ -6,12 +6,15 @@ import type {
   CloudDevice,
   GatewayStatusDto,
   LinkDeviceInfo,
+  LinkDiscoveredPeer,
+  LinkPairingRequestDto,
   PendingCaptureDto,
   PowerStatusDto,
   RemoteTaskDto,
   ShellStatusDto,
   SyncStatusDto,
 } from './agent';
+import type { ErrorReason } from './error';
 import type { DaemonConfigSnapshot, DaemonRuntimeStatsDto } from './config';
 import type { ComponentStatusDto, PluginDto } from './plugin';
 import type { GroupDto, QueueDto, QueuePositionDto } from './queue';
@@ -54,6 +57,8 @@ export interface AgentSnapshot {
   linkedDevices: LinkDeviceInfo[];
   remoteTasks: RemoteTaskDto[];
   pendingCaptures: PendingCaptureDto[];
+  linkPairingRequests?: LinkPairingRequestDto[];
+  linkDiscovered?: LinkDiscoveredPeer[];
   shell: ShellStatusDto;
   power: PowerStatusDto;
 }
@@ -95,12 +100,16 @@ export type AgentEvent =
   | { type: 'daemon'; data: DaemonEvent }
   | { type: 'daemonSnapshotReplaced'; data: DaemonSnapshot }
   | { type: 'daemonConnectionChanged'; data: boolean }
+  /** 会话被撤销（一次性通知，不进快照；随后是 `sessionChanged(null)`；主动登出 / 删本设备不发）。 */
+  | { type: 'sessionRevoked'; data: ErrorReason }
   | { type: 'sessionChanged'; data: AgentSessionDto | null }
   | { type: 'syncChanged'; data: SyncStatusDto }
   | { type: 'preferencesChanged'; data: AgentPreferencesDto }
   | { type: 'gatewayChanged'; data: GatewayStatusDto }
   | { type: 'cloudDevicesChanged'; data: CloudDevice[] }
   | { type: 'linkedDevicesChanged'; data: LinkDeviceInfo[] }
+  | { type: 'linkPairingRequestsChanged'; data: LinkPairingRequestDto[] }
+  | { type: 'linkDiscoveredChanged'; data: LinkDiscoveredPeer[] }
   | { type: 'remoteTasksChanged'; data: RemoteTaskDto[] }
   | { type: 'pendingCapturesChanged'; data: PendingCaptureDto[] }
   | { type: 'shellChanged'; data: ShellStatusDto }

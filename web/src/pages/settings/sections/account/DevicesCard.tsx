@@ -1,6 +1,6 @@
-// 受信任设备（GPUI devices.rs）：列表 + 重试；Web 额外提供重命名 / 删除（agent.device.*）。
+// 受信任设备（GPUI devices.rs）：列表 + 重试 + 详情 / 重命名 / 删除（agent.device.*；删除当前设备 = 登出）。
 
-import { Pencil, RefreshCw, Trash2 } from 'lucide-react'
+import { Info, Pencil, RefreshCw, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
@@ -57,9 +57,41 @@ function RenameDialog({ device, onClose }: { device: CloudDevice; onClose: () =>
   )
 }
 
+function formatDate(value: string): string {
+  return Number.isNaN(Date.parse(value)) ? '—' : new Date(value).toLocaleString()
+}
+
+function DetailDialog({ device, onClose }: { device: CloudDevice; onClose: () => void }) {
+  const t = useT()
+  const platformKey = device.platform ? PLATFORM_KEYS[device.platform.toLowerCase()] : undefined
+  const rows: [string, string][] = [
+    [t('accountDeviceFieldPlatform'), platformKey ? t(platformKey) : (device.platform ?? '—')],
+    [t('accountDeviceFieldAppVersion'), device.appVersion ?? '—'],
+    [t('accountDeviceFieldLastIp'), device.lastIp ?? '—'],
+    [t('accountDeviceFieldCreatedAt'), formatDate(device.createdAt)],
+    [t('accountDeviceFieldLastSeenAt'), formatDate(device.lastSeenAt)],
+    [t('accountDeviceFieldOnline'), device.isOnline ? t('deviceOnline') : t('deviceOffline')],
+    [t('accountDeviceFieldId'), device.deviceId],
+  ]
+  if (device.defaultSaveDir) rows.push([t('accountDeviceFieldSaveDir'), device.defaultSaveDir])
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()} title={device.name || t('accountDeviceDetailTitle')} description={t('accountDeviceDetailTitle')} footer={<ConfirmFooter okLabel={t('close')} cancelLabel={null} onCancel={onClose} onOk={onClose} />}>
+      <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+        {rows.map(([label, value]) => (
+          <div key={label} className="contents">
+            <dt className="text-muted-foreground">{label}</dt>
+            <dd className="min-w-0 break-all text-foreground">{value}</dd>
+          </div>
+        ))}
+      </dl>
+    </Dialog>
+  )
+}
+
 function DeviceRow({ device, disabled }: { device: CloudDevice; disabled: boolean }) {
   const t = useT()
   const [renaming, setRenaming] = useState(false)
+  const [detail, setDetail] = useState(false)
   const platformKey = device.platform ? PLATFORM_KEYS[device.platform.toLowerCase()] : undefined
   const platform = platformKey ? t(platformKey) : (device.platform ?? '')
   const lastSeen = Number.isNaN(Date.parse(device.lastSeenAt)) ? '' : new Date(device.lastSeenAt).toLocaleString()
@@ -94,6 +126,9 @@ function DeviceRow({ device, disabled }: { device: CloudDevice; disabled: boolea
         {meta ? <div className="truncate text-xs text-muted-foreground">{meta}</div> : null}
       </div>
       <div className="flex shrink-0 items-center gap-0.5">
+        <Button variant="ghost" iconOnly aria-label={t('accountDeviceDetailTitle')} title={t('accountDeviceDetailTitle')} className="text-muted-foreground hover:text-foreground" onClick={() => setDetail(true)}>
+          <Icon icon={Info} size="md" />
+        </Button>
         <Button variant="ghost" iconOnly aria-label={t('accountDeviceRenameTitle')} title={t('accountDeviceRenameTitle')} className="text-muted-foreground hover:text-foreground" disabled={disabled} onClick={() => setRenaming(true)}>
           <Icon icon={Pencil} size="md" />
         </Button>
@@ -109,6 +144,7 @@ function DeviceRow({ device, disabled }: { device: CloudDevice; disabled: boolea
           <Icon icon={Trash2} size="md" />
         </Button>
       </div>
+      {detail ? <DetailDialog device={device} onClose={() => setDetail(false)} /> : null}
       {renaming ? <RenameDialog device={device} onClose={() => setRenaming(false)} /> : null}
     </div>
   )

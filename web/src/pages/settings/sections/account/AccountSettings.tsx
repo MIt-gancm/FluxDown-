@@ -5,17 +5,19 @@ import { CircleUser } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../../i18n'
 import { useAgent, useConnection } from '../../../../lib/rpc'
-import type { CloudDevice } from '../../../../lib/rpc'
+import type { CloudDevice, LinkDeviceInfo, SyncStatusDto } from '../../../../lib/rpc'
 import { Button, Card } from '../../../../ui'
 import { SettingsPage } from '../../kit'
 import { CloudFeaturesCard } from './CloudFeaturesCard'
 import { DevicesCard } from './DevicesCard'
+import { PairedDevicesCard } from './PairedDevicesCard'
 import { LoginDialog, RegisterDialog } from './AuthDialogs'
 import { ProfileCard } from './ProfileCard'
 import { SecurityCard } from './SecurityCard'
 
 const NO_DEVICES: readonly CloudDevice[] = []
-const NO_SYNC = { enabled: false, revision: 0, dirtyKeys: [], lastError: null }
+const NO_LINKED: readonly LinkDeviceInfo[] = []
+const NO_SYNC: SyncStatusDto = { enabled: false, revision: 0, dirtyKeys: [], lastError: null }
 
 function HeroCard({ disabled }: { disabled: boolean }) {
   const t = useT()
@@ -45,6 +47,7 @@ export function AccountSettings() {
   const t = useT()
   const session = useAgent((snapshot) => snapshot.session, null)
   const devices = useAgent((snapshot) => snapshot.cloudDevices, NO_DEVICES)
+  const linked = useAgent((snapshot) => snapshot.linkedDevices, NO_LINKED)
   const sync = useAgent((snapshot) => snapshot.sync, NO_SYNC)
   const disabled = useConnection().phase !== 'ready'
 
@@ -53,6 +56,7 @@ export function AccountSettings() {
       {session ? <ProfileCard session={session} disabled={disabled} /> : <HeroCard disabled={disabled} />}
       {session ? <SecurityCard session={session} disabled={disabled} /> : null}
       {session ? <DevicesCard devices={devices} disabled={disabled} /> : null}
+      <PairedDevicesCard devices={linked} disabled={disabled} />
       <CloudFeaturesCard loggedIn={session !== null} sync={sync} devices={devices} disabled={disabled} />
     </SettingsPage>
   )

@@ -1,6 +1,7 @@
 // 各方法的 params / 非 DTO 结果类型（按 wire 名归类）。
 // daemon 端的 id 参数在服务端带别名（`id` / `taskId` / `queueId` / `groupId` 等价），这里统一用语义名。
 
+import type { RemoteTaskDto } from './agent';
 import type { JsonValue } from './common';
 import type { ComponentKind, ComponentStatusDto } from './plugin';
 import type { ServiceHello } from './rpc';
@@ -325,25 +326,72 @@ export interface PowerArmResult {
 // ── agent.remote ──
 
 export interface RemoteDispatchParams {
-  /** 目标设备 ID（`CloudDevice.deviceId`）；等于本机时直接建本地任务。 */
+  /** 目标设备 ID（`CloudDevice.deviceId`）。 */
   toDevice: string;
   url: string;
   fileName?: string;
+  /** 省略 = 目标设备默认目录；给出时须为目标路径风格的绝对路径。 */
   saveDir?: string;
 }
 
-/**
- * 本机目标返回 `{ taskId }`；远端目标返回 FluxCloud 原样响应（结构未固定），
- * 之后以 `remoteTasksChanged` 事件 / `agent.remote.list` 为准。
- */
-export type RemoteDispatchResult = { taskId?: string } & Record<string, unknown>;
+export interface RemoteDispatchResult {
+  task: RemoteTaskDto;
+}
 
 export interface RemoteCommandParams {
   taskId: string;
-  /** `pause` / `resume` / `delete` / `cancel`。 */
   action: 'pause' | 'resume' | 'delete' | 'cancel';
-  /** 去重 ID，缺省 `taskId:action`。 */
+  /** 幂等键；省略时 agent 生成。 */
   commandId?: string;
+  /** 仅 `delete`：目标设备同时删除已下载文件。 */
+  deleteFiles?: boolean;
+}
+
+export interface SyncLocalOnlyParams {
+  keys: string[];
+  localOnly: boolean;
+}
+
+// ── agent.link ──
+
+export interface LinkDiscoveryParams {
+  enabled: boolean;
+}
+
+/** 接受 `host`、`host:port`、`http(s)://host[:port][/base]`。 */
+export interface LinkAddressParams {
+  address: string;
+}
+
+export interface LinkPairBeginParams {
+  address: string;
+  code: string;
+}
+
+export interface LinkPairFinishParams {
+  token: string;
+  accept: boolean;
+}
+
+export interface LinkApproveParams {
+  sessionId: string;
+  accept: boolean;
+}
+
+export interface LinkDeviceParams {
+  fingerprint: string;
+}
+
+export interface LinkDispatchParams {
+  fingerprint: string;
+  url: string;
+  fileName?: string;
+  /** 省略 = 目标设备默认目录。 */
+  saveDir?: string;
+}
+
+export interface LinkDispatchResult {
+  taskId: string;
 }
 
 // ── agent.plan / order / referral ──

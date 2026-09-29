@@ -263,7 +263,10 @@ export function applyAgentEvent(snapshot: AgentSnapshot, event: AgentEvent): Age
         daemon: event.data ? snapshot.daemon : { ...snapshot.daemon, taskRuntime: {} },
       }
     case 'sessionChanged':
-      return { ...snapshot, session: event.data }
+      // 会话结束后账号维度投影随之失效（对应 Rust apply_agent_event）。
+      return event.data === null
+        ? { ...snapshot, session: null, cloudDevices: [], remoteTasks: [] }
+        : { ...snapshot, session: event.data }
     case 'syncChanged':
       return { ...snapshot, sync: event.data }
     case 'preferencesChanged':
@@ -274,6 +277,10 @@ export function applyAgentEvent(snapshot: AgentSnapshot, event: AgentEvent): Age
       return { ...snapshot, cloudDevices: event.data }
     case 'linkedDevicesChanged':
       return { ...snapshot, linkedDevices: event.data }
+    case 'linkPairingRequestsChanged':
+      return { ...snapshot, linkPairingRequests: event.data }
+    case 'linkDiscoveredChanged':
+      return { ...snapshot, linkDiscovered: event.data }
     case 'remoteTasksChanged':
       return { ...snapshot, remoteTasks: event.data }
     case 'pendingCapturesChanged':
@@ -283,6 +290,7 @@ export function applyAgentEvent(snapshot: AgentSnapshot, event: AgentEvent): Age
     case 'powerChanged':
       return { ...snapshot, power: event.data }
     case 'captureTasksStarted':
+    case 'sessionRevoked':
       return snapshot
   }
 }

@@ -73,8 +73,8 @@ export interface DownloadTaskView {
   seedingStatus: number
   uploadedBytes: number
   boosted: boolean
-  /** 远程任务来源设备 id（本地任务为空）。 */
-  fromDevice: string
+  /** 远程任务目标设备 id（本地任务为空）。 */
+  toDevice: string
   /** 本地任务原始 DTO（详情 / 重新下载需要）；远程任务为 undefined。 */
   dto: TaskDto | undefined
 }
@@ -173,6 +173,7 @@ const REMOTE_STATUS: Record<RemoteTaskDto['status'], number> = {
   completed: 3,
   failed: 4,
   canceled: 4,
+  unknown: 0,
 }
 
 function secs(value: string): number {
@@ -228,7 +229,7 @@ export function buildLocalView(
     seedingStatus: task.seedingStatus,
     uploadedBytes: task.uploadedBytes,
     boosted,
-    fromDevice: '',
+    toDevice: '',
     dto: task,
   }
 }
@@ -266,7 +267,7 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     seedingStatus: 0,
     uploadedBytes: 0,
     boosted: false,
-    fromDevice: task.fromDevice,
+    toDevice: task.toDevice,
     dto: undefined,
   }
 }
