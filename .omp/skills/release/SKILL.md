@@ -10,8 +10,8 @@ description: >-
 # FluxDown 发布与版本查看
 
 FluxDown 用 **SemVer 预发布后缀**区分双渠道：**稳定版 `vX.Y.Z`**、**预览版 `vX.Y.Z-rc.N`**。
-推送 `v*` tag 会**立即触发 GitHub Actions 全平台发布流水线（不可逆）**，同一次 push 自动派生
-各组件 tag。本 skill 覆盖两件事：**发布前校验版本可用** + **快速查看已有版本**。
+推送 `v*` tag 会**立即触发 GitHub Actions 全平台发布流水线（不可逆）**，本次全部组件发布到**同一个**
+`vX.Y.Z` release。本 skill 覆盖三件事：**发布前校验版本可用** + **快速查看已有版本** + **失败组件补发**。
 
 > 红线（`.omp/RULES.md`）：**未经用户明确要求，禁止 `git commit` / `push` / tag**。
 > 本 skill 的推送命令仅在用户明确要求发布时执行。
@@ -25,8 +25,10 @@ git tag -l 'v[0-9]*' --sort=-v:refname | head
 git tag -l 'v[0-9]*' --sort=-v:refname | grep -v -- '-rc' | head
 # 仅预览版（预发布 -rc）
 git tag -l 'v[0-9]*-rc*' --sort=-v:refname | head
-# 各组件线最新稳定一个（组件前缀本身含 '-'，故用 '-rc' 判别预发布）
-for p in v server-v cli-v mobile-v extension-v; do \
+# 某个 release 已完整发布的组件（统一 release 以 SHA256SUMS-<组件>.txt 哨兵为准）
+gh release view "$V" --json assets -q '.assets[].name' | grep '^SHA256SUMS-'
+# 历史组件线（拆分时代，已不再新建）最新稳定一个
+for p in server-v cli-v mobile-v extension-v; do \
   echo "$p -> $(git tag -l "${p}[0-9]*" --sort=-v:refname | grep -v -- '-rc' | head -1)"; done
 # 已发布 release（含 prerelease 标记，需 gh 已登录该私有仓库）
 gh release list --limit 20
@@ -41,9 +43,9 @@ gh release list --limit 20
 | 稳定版 | `vX.Y.Z` | `stable` | false | true | 客户端 / web / 移动 / NAS / 扩展 全部 |
 | 预览版 | `vX.Y.Z-rc.N` | `main` | true | false | 客户端 / web / 移动 / NAS，**不含浏览器扩展** |
 
-- 组件线（`server-v*` / `cli-v*` / `mobile-v*` / `extension-v*`）由同一次 `v*` push 按目录 diff 自动派生，`make_latest:false`。预览 push 同步给组件打 `-rc.N` 并标 prerelease。
-- **扩展发布后无法改版本号**，故 `-rc` tag 跳过 `build-extension`/`release-extension`。
-- 判据全在 `.github/workflows/release.yml`：`prerelease/make_latest = contains(github.ref_name, '-')`；Flutter `--build-name` 用剥后缀的 `CLEAN_VERSION`，`APP_VERSION` 保留完整版号。
+- 同一次 `v*` push 按目录 diff 决定本次打包哪些组件（app / server / cli / mobile / extension），产物全部上传到这一个 `vX.Y.Z` release；未改动的组件不重建，官网自动沿用它上一个完整版本。历史上的 `server-v*` / `cli-v*` / `mobile-v*` / `extension-v*` 组件 release 不再新建，官网仍兼容读取。
+- **扩展发布后无法改版本号**，故 `-rc` tag 跳过 `build-extension`（`changes` 判定 extension=false）。
+- latest：`publish-release` 只在「稳定版 + 桌面端完整 + 最高稳定版本」时标记；Flutter `--build-name` 用剥后缀的 `CLEAN_VERSION`，`APP_VERSION` 保留完整版号。
 - **分支模型**：`main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）；`stable` 只经合并/cherry-pick `main` 前进。稳定发布前 `git log stable --not main` 必须为空。
 - **CI 分支守卫**（`changes` job 首步）：tag 提交必须在对应分支上——`vX.Y.Z` ∈ `origin/stable`、`vX.Y.Z-rc.N` ∈ `origin/main`，否则整条流水线立即失败（`git merge-base --is-ancestor` 判定）。
 
@@ -80,6 +82,22 @@ git push origin "$V"
 # 观察流水线
 gh run watch
 ```
+
+## 4b. 组件打包失败 → 补发（不重跑其余组件）
+
+某组件失败时其余组件照常发布，`publish-release` 以失败结束并在 job summary 列出缺失组件与补发命令。
+
+```bash
+# 偶发失败（源码无需改动）：在该运行页点 “Re-run failed jobs”，或
+gh run rerun <run-id> --failed
+# 需改代码/打包脚本：修复先合入发布分支（稳定版 = stable，预览版 = main），再补发该组件
+gh workflow run release.yml --ref main -f tag="$V" -f component=mobile            # 源码 = tag 本身
+gh workflow run release.yml --ref main -f tag="$V" -f component=mobile -f source_ref=stable   # 源码含修复
+```
+
+- `component`：`app` / `extension` / `server` / `cli` / `mobile`，或 `changed`（按该 tag 的变更检测补发全部应发组件）。
+- `source_ref` 必须包含该 tag 且在发布分支上；版本号、预发布标记恒取 tag。产物以 `--clobber` 覆盖同名资产，旧清单里不再产出的资产会被删除。
+- 补发属于 CI 触发，等同发布动作：仅在用户明确要求时执行。
 
 ## 5. 各渠道发布后可见性（自检预期）
 

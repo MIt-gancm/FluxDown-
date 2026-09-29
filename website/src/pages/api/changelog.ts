@@ -28,6 +28,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
+import { stripReleaseHeader } from "@/lib/release-assets";
 
 export const prerender = false;
 
@@ -179,10 +180,10 @@ async function getCachedReleases(
   if (!all) {
     const raw = await fetchAllGitHubReleases();
 
-    // 只保留 v* 客户端 release（含预览预发布）；extension-v* / website-v*
-    // 组件 release 不属于 App 更新日志（且其 tag 无法按 semver 解析）。
-    // 但 server-v* / mobile-v* / cli-v* 是同一次发版按组件拆出的伴生 release
-    // （版本号与 App tag 一致），其资产（含 NAS 套件与 APK）合并进对应
+    // 只保留 v* release（含预览预发布）；extension-v* / website-v* 组件 release
+    // 不属于 App 更新日志（且其 tag 无法按 semver 解析）。当前一个 vX.Y.Z release
+    // 即承载全部组件资产；历史拆分时代的 server-v* / mobile-v* / cli-v* 伴生
+    // release（版本号与 App tag 一致）仍把资产（含 NAS 套件与 APK）合并进对应
     // App 条目一起展示。
     const companions = new Map<string, GitHubRelease[]>();
     for (const r of raw) {
@@ -215,7 +216,7 @@ async function getCachedReleases(
         tag: r.tag_name,
         version: r.tag_name.replace(/^v/, ""),
         published_at: r.published_at,
-        body: r.body || "",
+        body: stripReleaseHeader(r.body || ""),
         prerelease: r.prerelease,
         assets: [
           ...toAssets(r),

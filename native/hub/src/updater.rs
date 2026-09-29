@@ -147,8 +147,8 @@ struct AssetInfo {
     download_url: String,
 }
 
-/// Android：`/api/release` 顶层 `mobile` 字段（独立 mobile-v* 版本线）。
-/// `mobile` 为 `null` 表示尚无移动端 release —— 视为已是最新，而非错误。
+/// Android：`/api/release` 顶层 `mobile` 字段（官网按「完整包含 APK 的最新 release」
+/// 选取，可能与桌面 `version` 不同）。`mobile` 为 `null` 表示尚无移动端 release —— 视为已是最新，而非错误。
 #[cfg(target_os = "android")]
 #[derive(Deserialize)]
 struct MobileReleaseEnvelope {
@@ -501,8 +501,8 @@ async fn check_inner(current_version: &str, channel: &str) -> Result<(), UpdateE
     Ok(())
 }
 
-/// Android 检查：解析 `/api/release` 顶层 `mobile` 字段（独立 mobile-v* 版本线，
-/// 与桌面 `version` 无关）。`mobile == null`（尚无移动端 release）→ 已是最新。
+/// Android 检查：解析 `/api/release` 顶层 `mobile` 字段（移动端独立选取，与桌面
+/// `version` 无关）。`mobile == null`（尚无移动端 release）→ 已是最新。
 #[cfg(target_os = "android")]
 async fn check_inner(current_version: &str, channel: &str) -> Result<(), UpdateError> {
     let client = Client::new();
@@ -524,7 +524,7 @@ async fn check_inner(current_version: &str, channel: &str) -> Result<(), UpdateE
     let envelope: MobileReleaseEnvelope = resp.json().await?;
 
     let Some(mobile) = envelope.mobile else {
-        // 尚无 mobile-v* release —— 视为已是最新版本。
+        // 尚无移动端 release —— 视为已是最新版本。
         UpdateCheckResult {
             has_update: false,
             latest_version: current_version.to_string(),

@@ -16,7 +16,7 @@
  *   version: "1.0.0",
  *   published_at: "2025-01-01T00:00:00Z",
  *   total_downloads: 12345,
- *   extension_version: "0.2.3",   // 浏览器扩展版本（取自 extension-v* tag），无扩展 release 时为 undefined
+ *   extension_version: "0.2.3",   // 浏览器扩展版本（取自所在 release 的 tag），无扩展 release 时为 undefined
  *   assets: {
  *     setup: { name, size, download_url },
  *     portable: { name, size, download_url },
@@ -25,7 +25,7 @@
  *   },
  *   server: {
  *     version: "0.1.51",
- *     tag: "server-v0.1.51",
+ *     tag: "v0.1.51",  // 统一 release 为 vX.Y.Z；历史拆分 release 为 server-vX.Y.Z
  *     assets: { windows_x64, windows_arm64, linux_x64, linux_arm64, macos_x64, macos_arm64,
  *               openwrt_x64, openwrt_arm64, openwrt_luci, qnap_x64, qnap_arm64,
  *               synology_dsm7_x64, synology_dsm7_arm64, synology_dsm6_x64, synology_dsm6_arm64 }
@@ -39,6 +39,13 @@ import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
 import { withBase } from "@/lib/base";
+import {
+  desktopAssets,
+  pickComponentRelease,
+  releaseVersion,
+  type GitHubAsset,
+  type GitHubRelease,
+} from "@/lib/release-assets";
 
 export const prerender = false;
 
@@ -51,85 +58,6 @@ const CACHE_TTL = 12 * 60 * 60 * 1000;
 // flux-down 桶累计下载（B 类 GET 操作 58,320）。两个旧渠道均不再产生新增量，
 // 因此作为固定基数叠加到当前仓库的动态下载量之上。
 const DOWNLOADS_BASELINE = 55_318 + 58_320;
-
-interface GitHubAsset {
-  name: string;
-  size: number;
-  download_count: number;
-  url: string; // API URL, 需要 token 才能下载
-  browser_download_url: string;
-}
-
-interface GitHubRelease {
-  tag_name: string;
-  name: string;
-  published_at: string;
-  draft: boolean;
-  prerelease: boolean;
-  assets: GitHubAsset[];
-}
-
-/**
- * SemVer 2.0 精度比较两个 release tag（去组件前缀后），a>b 时返回 >0。
- * 处理 frontier 的 `-rc.N` 预发布后缀——普通数字切分会误判。
- */
-function cmpReleaseTag(a: string, b: string): number {
-  const norm = (t: string) =>
-    t.replace(/^(cli|mobile|server|extension|website)-/, "").replace(/^v/, "");
-  const [ca, pa = ""] = norm(a).split("-", 2);
-  const [cb, pb = ""] = norm(b).split("-", 2);
-  const na = ca.split(".").map((s) => Number.parseInt(s, 10) || 0);
-  const nb = cb.split(".").map((s) => Number.parseInt(s, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    const d = (na[i] ?? 0) - (nb[i] ?? 0);
-    if (d !== 0) return d;
-  }
-  // core 相等：无预发布 > 有预发布（SemVer 2.0 §11.3）
-  if (!pa && !pb) return 0;
-  if (!pa) return 1;
-  if (!pb) return -1;
-  const ida = pa.split(".");
-  const idb = pb.split(".");
-  for (let i = 0; i < Math.max(ida.length, idb.length); i++) {
-    const x = ida[i];
-    const y = idb[i];
-    if (x === undefined) return -1;
-    if (y === undefined) return 1;
-    const xn = /^\d+$/.test(x);
-    const yn = /^\d+$/.test(y);
-    if (xn && yn) {
-      const d = Number.parseInt(x, 10) - Number.parseInt(y, 10);
-      if (d !== 0) return d;
-    } else if (xn !== yn) {
-      return xn ? -1 : 1; // 数字标识符 < 字母数字标识符
-    } else if (x !== y) {
-      return x < y ? -1 : 1;
-    }
-  }
-  return 0;
-}
-
-/**
- * 从候选池挑选匹配 `re` 且含目标资产的 release。
- * stable 保留 GitHub created_at 倒序的首个匹配（与旧行为一致）；
- * frontier 取 SemVer 最大，避免旧版本线上发布时间更晚的 hotfix 盖过更高的预发布。
- */
-function pickRelease(
-  pool: GitHubRelease[],
-  re: RegExp,
-  wanted: (a: GitHubAsset) => boolean,
-  frontier: boolean,
-): GitHubRelease | undefined {
-  const matches = pool.filter(
-    (r) => re.test(r.tag_name) && r.assets.some(wanted),
-  );
-  if (!frontier) return matches[0];
-  return matches.reduce<GitHubRelease | undefined>(
-    (best, r) =>
-      best && cmpReleaseTag(best.tag_name, r.tag_name) >= 0 ? best : r,
-    undefined,
-  );
-}
 
 export const GET: APIRoute = async ({ url }) => {
   // 渠道：缺省 stable（官网/存量客户端不带 channel 参数 → 永远稳定版）；
@@ -199,22 +127,15 @@ export const GET: APIRoute = async ({ url }) => {
     // 移动端、服务器与 CLI 均按渠道选取（预发布 tag 会打包这四类组件，
     // 组件无改动时不重建 → frontier 取 SemVer 最大自然回落稳定版）；
     // 唯浏览器扩展恒取稳定版——商店版本号不可回退，预发布 tag 不打包扩展。
+    // 每个组件独立选取「完整包含该组件」的最新 release（统一 vX.Y.Z release
+    // 或历史组件 release，见 lib/release-assets.ts）：某组件本次打包失败时
+    // 自然回落到它上一个完整版本，不会拿到半套资产。
     const appPool = includePrerelease
       ? releases.filter((r) => !r.draft)
       : published;
-    const appTagRe = includePrerelease
-      ? /^v\d+\.\d+\.\d+(-[\w.]+)?$/
-      : /^v\d+\.\d+\.\d+$/;
 
-    // 桌面客户端 release：严格三段式(stable)或带预发布后缀(frontier) tag，
-    // 且含 Windows 安装包；frontier 取 SemVer 最大，防止旧线 hotfix 盖过 RC。
-    const latest = pickRelease(
-      appPool,
-      appTagRe,
-      (a) =>
-        a.name.endsWith("-setup.exe") || a.name.endsWith("-portable.zip"),
-      includePrerelease,
-    );
+    // 桌面客户端 release：frontier 取 SemVer 最大，防止旧线 hotfix 盖过 RC。
+    const latest = pickComponentRelease(appPool, "app", includePrerelease);
 
     if (!latest) {
       return new Response(
@@ -223,73 +144,34 @@ export const GET: APIRoute = async ({ url }) => {
       );
     }
 
-    const version = latest.tag_name.replace(/^v/, "");
+    const version = releaseVersion(latest.tag_name);
     // frontier 的 latest 是 prerelease，资产必须带 tag 定位（/api/download 的
     // 无 tag "最新"路径只认稳定版）；stable 保持无 tag（官网下载与旧行为一致）。
     const appTag = includePrerelease ? latest.tag_name : undefined;
 
-    // 浏览器扩展 release：优先最新的独立 extension-v* release（版本号取自 tag），
-    // 回退到任何含扩展资产的 release（旧版本扩展资产与客户端合并在同一 release 中）
-    const extensionRelease =
-      published.find((r) => /^extension-v\d+\.\d+\.\d+$/.test(r.tag_name)) ??
-      published.find((r) =>
-        r.assets.some(
-          (a) =>
-            a.name.endsWith("-chrome.zip") ||
-            a.name.endsWith("-extension.zip") ||
-            a.name.endsWith("-firefox.xpi"),
-        ),
-      );
+    const extensionRelease = pickComponentRelease(published, "extension", false);
+    const serverRelease = pickComponentRelease(appPool, "server", includePrerelease);
+    const cliRelease = pickComponentRelease(appPool, "cli", includePrerelease);
+    const mobileRelease = pickComponentRelease(appPool, "mobile", includePrerelease);
 
-    // FluxDown Server release：独立 server-v* release（headless Web 服务器）
-    const serverRe = includePrerelease
-      ? /^server-v\d+\.\d+\.\d+(-[\w.]+)?$/
-      : /^server-v\d+\.\d+\.\d+$/;
-    const serverRelease = pickRelease(
-      appPool,
-      serverRe,
-      (a) => a.name.startsWith("FluxDown-Server-"),
-      includePrerelease,
-    );
-
-    // FluxDown CLI release：独立 cli-v* release（命令行客户端 fluxdown）
-    const cliRe = includePrerelease
-      ? /^cli-v\d+\.\d+\.\d+(-[\w.]+)?$/
-      : /^cli-v\d+\.\d+\.\d+$/;
-    const cliRelease = pickRelease(
-      appPool,
-      cliRe,
-      (a) => a.name.startsWith("FluxDown-CLI-"),
-      includePrerelease,
-    );
-
-    // FluxDown 移动端 release：独立 mobile-v* release（Android APK）
-    const mobileRe = includePrerelease
-      ? /^mobile-v\d+\.\d+\.\d+(-[\w.]+)?$/
-      : /^mobile-v\d+\.\d+\.\d+$/;
-    const mobileRelease = pickRelease(
-      appPool,
-      mobileRe,
-      (a) => a.name.includes("-android-"),
-      includePrerelease,
-    );
-
+    // 统一 release 同时含服务器/CLI 的同后缀压缩包，桌面资产只在过滤后的集合里匹配
+    const appAssets = desktopAssets(latest);
     // 匹配资产文件（兼容旧命名：-windows-setup.exe / 新命名：-windows-x64-setup.exe）
-    const setupAsset = latest.assets.find(
+    const setupAsset = appAssets.find(
       (a) =>
         a.name.endsWith("-windows-x64-setup.exe") ||
         a.name.endsWith("-windows-setup.exe"),
     );
-    const portableAsset = latest.assets.find(
+    const portableAsset = appAssets.find(
       (a) =>
         a.name.endsWith("-windows-x64-portable.zip") ||
         a.name.endsWith("-windows-portable.zip"),
     );
     // ARM64 资产（仅新版 Release 包含）
-    const setupArm64Asset = latest.assets.find((a) =>
+    const setupArm64Asset = appAssets.find((a) =>
       a.name.endsWith("-windows-arm64-setup.exe"),
     );
-    const portableArm64Asset = latest.assets.find((a) =>
+    const portableArm64Asset = appAssets.find((a) =>
       a.name.endsWith("-windows-arm64-portable.zip"),
     );
     const extensionAsset = extensionRelease?.assets.find(
@@ -299,43 +181,37 @@ export const GET: APIRoute = async ({ url }) => {
     const firefoxExtensionAsset = extensionRelease?.assets.find((a) =>
       a.name.endsWith("-firefox.xpi"),
     );
-    // 扩展版本号：优先从 extension-v* tag 提取；旧版合并 release 则从资产名解析
+    // 扩展版本号 = 所在 release 的版本（统一 vX.Y.Z / 历史 extension-vX.Y.Z / 更早的合并 release）
     const extensionVersion = extensionRelease
-      ? /^extension-v(\d+\.\d+\.\d+)$/.exec(extensionRelease.tag_name)?.[1] ??
-        /^FluxDown-(\d+\.\d+\.\d+)-(?:chrome|extension)\.zip$/.exec(
-          extensionAsset?.name ?? "",
-        )?.[1] ??
-        /^FluxDown-(\d+\.\d+\.\d+)-firefox\.xpi$/.exec(
-          firefoxExtensionAsset?.name ?? "",
-        )?.[1]
+      ? releaseVersion(extensionRelease.tag_name)
       : undefined;
     // macOS 资产
-    const macosDmgArm64Asset = latest.assets.find((a) =>
+    const macosDmgArm64Asset = appAssets.find((a) =>
       a.name.endsWith("-macos-arm64.dmg"),
     );
-    const macosDmgX64Asset = latest.assets.find((a) =>
+    const macosDmgX64Asset = appAssets.find((a) =>
       a.name.endsWith("-macos-x64.dmg"),
     );
-    const macosTarballArm64Asset = latest.assets.find((a) =>
+    const macosTarballArm64Asset = appAssets.find((a) =>
       a.name.endsWith("-macos-arm64.tar.gz"),
     );
-    const macosTarballX64Asset = latest.assets.find((a) =>
+    const macosTarballX64Asset = appAssets.find((a) =>
       a.name.endsWith("-macos-x64.tar.gz"),
     );
     // Linux 资产
-    const linuxAppImageAsset = latest.assets.find((a) =>
+    const linuxAppImageAsset = appAssets.find((a) =>
       a.name.endsWith("-linux-x64.AppImage"),
     );
-    const linuxDebAsset = latest.assets.find((a) =>
+    const linuxDebAsset = appAssets.find((a) =>
       a.name.endsWith("-linux-x64.deb"),
     );
-    const linuxArchAsset = latest.assets.find((a) =>
+    const linuxArchAsset = appAssets.find((a) =>
       a.name.endsWith("-linux-x64.pkg.tar.zst"),
     );
-    const linuxTarballAsset = latest.assets.find((a) =>
+    const linuxTarballAsset = appAssets.find((a) =>
       a.name.endsWith("-linux-x64.tar.gz"),
     );
-    // FluxDown Server 资产（独立 server-v* release，命名：FluxDown-Server-<ver>-<os>-<arch>.<ext>）
+    // FluxDown Server 资产（命名：FluxDown-Server-<ver>-<os>-<arch>.<ext>）
     const findServerAsset = (suffix: string) =>
       serverRelease?.assets.find(
         (a) =>
@@ -439,7 +315,7 @@ export const GET: APIRoute = async ({ url }) => {
       },
       server: serverRelease
         ? {
-            version: serverRelease.tag_name.replace(/^server-v/, ""),
+            version: releaseVersion(serverRelease.tag_name),
             tag: serverRelease.tag_name,
             assets: {
               windows_x64: formatAsset(
@@ -507,7 +383,7 @@ export const GET: APIRoute = async ({ url }) => {
         : null,
       cli: cliRelease
         ? {
-            version: cliRelease.tag_name.replace(/^cli-v/, ""),
+            version: releaseVersion(cliRelease.tag_name),
             tag: cliRelease.tag_name,
             assets: {
               windows_x64: formatAsset(cliWindowsX64Asset, cliRelease.tag_name),
@@ -524,7 +400,7 @@ export const GET: APIRoute = async ({ url }) => {
         : null,
       mobile: mobileRelease
         ? {
-            version: mobileRelease.tag_name.replace(/^mobile-v/, ""),
+            version: releaseVersion(mobileRelease.tag_name),
             tag: mobileRelease.tag_name,
             assets: {
               android_arm64: formatAsset(mobileArm64Asset, mobileRelease.tag_name),

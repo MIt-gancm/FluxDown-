@@ -95,8 +95,8 @@ async function fetchReleaseByTag(tag: string): Promise<GitHubRelease | null> {
 
 /**
  * 获取包含指定 asset 的最新正式 release（非 draft、非 prerelease）。
- * Release 已按组件拆分（v* / extension-v* / website-v*），列表首个 release
- * 不一定包含请求的文件，须按 asset 名定位。
+ * 统一 vX.Y.Z release 与历史组件 release（extension-v* / server-v* …）并存，
+ * 列表首个 release 不一定包含请求的文件，须按 asset 名定位。
  */
 async function fetchLatestReleaseWithAsset(
   filename: string,

@@ -1,0 +1,82 @@
+# 把一个组件的产物上传到统一的 vX.Y.Z GitHub Release（release.yml 各 upload-* job 共用）
+#
+# 完成哨兵契约（官网 website*/src/lib/release-assets.ts 依赖，改动须同步）：
+#   每个组件最后上传 SHA256SUMS-<组件>.txt；官网只把「有哨兵」的组件视为已发布。
+# 顺序：记录并删除旧哨兵 → 上传产物（--clobber 覆盖同名）→ 删除旧哨兵清单里本次
+# 不再产出的资产 → 上传新哨兵。上传中途失败不会暴露半套资产；补发期间官网自动
+# 回落到该组件上一个完整版本。
+#
+# 哨兵留在 dir 中，随后的 OSS 同步会一并上传。
+name: Upload component to release
+description: 上传组件产物与 SHA256SUMS-<组件>.txt 完成哨兵到 vX.Y.Z release（幂等，可重复补发）
+
+inputs:
+  tag:
+    description: 目标 release tag（vX.Y.Z / vX.Y.Z-rc.N，release 须已存在，可为草稿）
+    required: true
+  component:
+    description: 组件名（app / extension / server / cli / mobile）
+    required: true
+  dir:
+    description: 本地产物目录
+    required: false
+    default: release-assets
+  github-token:
+    description: 具备 contents:write 的 token
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Upload assets and completion sentinel
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ github.repository }}
+        TAG: ${{ inputs.tag }}
+        COMPONENT: ${{ inputs.component }}
+        DIR: ${{ inputs.dir }}
+      run: |
+        set -euo pipefail
+        case "$COMPONENT" in app|extension|server|cli|mobile) ;; *)
+          echo "::error::unknown component '$COMPONENT'"; exit 1 ;;
+        esac
+        SENTINEL="SHA256SUMS-${COMPONENT}.txt"
+        cd "$DIR"
+
+        mapfile -t FILES < <(find . -maxdepth 1 -type f ! -name 'SHA256SUMS*' -printf '%f\n' | LC_ALL=C sort)
+        if [ "${#FILES[@]}" -eq 0 ]; then
+          echo "::error::no assets found in ${DIR}/"
+          exit 1
+        fi
+        sha256sum "${FILES[@]}" > "$SENTINEL"
+        echo "── ${SENTINEL} ──"
+        cat "$SENTINEL"
+
+        retry() {
+          for i in 1 2 3; do
+            "$@" && return 0
+            [ "$i" = 3 ] && return 1
+            echo "⚠️  attempt $i failed, retrying in 15s..."; sleep 15
+          done
+        }
+
+        # 上一版清单：先记下再删哨兵，后面据此清理本次不再产出的旧资产
+        OLD_SUMS="${RUNNER_TEMP}/old-${SENTINEL}"
+        OLD_NAMES=()
+        if gh release download "$TAG" -p "$SENTINEL" -O "$OLD_SUMS" --clobber 2>/dev/null; then
+          mapfile -t OLD_NAMES < <(awk '{print $2}' "$OLD_SUMS")
+          retry gh release delete-asset "$TAG" "$SENTINEL" -y
+        fi
+
+        retry gh release upload "$TAG" "${FILES[@]}" --clobber
+
+        for old in "${OLD_NAMES[@]}"; do
+          if ! printf '%s\n' "${FILES[@]}" | grep -qxF "$old"; then
+            echo "🗑️  removing stale asset ${old}"
+            gh release delete-asset "$TAG" "$old" -y || echo "::warning::failed to delete stale asset ${old}"
+          fi
+        done
+
+        retry gh release upload "$TAG" "$SENTINEL" --clobber
+        echo "✅ ${COMPONENT}: ${#FILES[@]} asset(s) uploaded to ${TAG}"

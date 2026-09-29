@@ -1,4 +1,4 @@
-# 生成面向用户的双语 release notes（5 个 release job 共用）
+# 生成面向用户的双语 release notes（release.yml 的 prepare-release job 使用）
 #
 # 流水线：git-cliff 出「原始素材」→ 采集 commit 正文 + 变更文件统计作为上下文
 #        → Claude 改写为面向用户的双语发布说明 → 校验标记，失败回退 cliff 原文。

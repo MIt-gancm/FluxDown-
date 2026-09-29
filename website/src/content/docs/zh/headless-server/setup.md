@@ -3,7 +3,7 @@ title: 服务器部署
 description: 从源码构建并运行 headless FluxDown 服务器(fluxdown-agent --server + fluxdownd),了解全部环境变量并安全地对外暴露。
 section: headless-server
 order: 1
-sourceHash: "1449d3d3dd1b"
+sourceHash: "a0394e43854a"
 ---
 
 headless 服务器 = `fluxdown-agent --server` 加上同级的 `fluxdownd` 下载守护进程:没有桌面界面、托盘或文件关联。它把同一套 Rust 引擎(HTTP/HTTPS、FTP、BitTorrent、HLS、DASH)通过编译进 `fluxdown-agent` 的 Web 界面和 JSON-RPC 端点(`/rpc`,与桌面客户端同一协议)暴露出来,因此你可以把它跑在 NAS、家庭服务器或 VPS 上,在浏览器里远程管理下载。发行版是**同一目录下的两个二进制**——`fluxdown-agent`(内嵌 Web 界面)与 `fluxdownd`。请把它们放在同一目录:agent 会把 `fluxdownd` 作为子进程拉起,并在收到 `SIGTERM`/`SIGINT` 时一并关停它。
@@ -198,7 +198,7 @@ sudo journalctl -u fluxdown-server -f
 
 ## 从旧版 `fluxdown-server` 升级
 
-旧版发行物是单个 `fluxdown-server` 二进制。现在的服务器发行物(`server-v*` tag、`fluxdown-server` Docker 镜像、`FluxDown-Server-*` 压缩包/NAS 套件,名称均不变)改为 `fluxdown-agent` + `fluxdownd`。
+旧版发行物是单个 `fluxdown-server` 二进制。现在的服务器发行物(`fluxdown-server` Docker 镜像、`FluxDown-Server-*` 压缩包/NAS 套件,名称均不变;现随常规 `vX.Y.Z` GitHub release 发布,更早版本在 `server-v*` release)改为 `fluxdown-agent` + `fluxdownd`。
 
 - **数据与设置不变**:沿用同一数据卷 / `FLUXDOWN_DATA_DIR`;`FLUXDOWN_BIND`、`FLUXDOWN_DATA_DIR`、`FLUXDOWN_SAVE_DIR`、`FLUXDOWN_DATABASE_URL`、`FLUXDOWN_TOKEN`、`FLUXDOWN_TOKEN_FORCE`、`FLUXDOWN_WEBROOT`、`FLUXDOWN_LANG`、`FLUXDOWN_DEMO*` 名称与含义都不变,已有访问密钥会沿用。
 - **修改启动命令**:`fluxdown-server` → `fluxdown-agent --server`(两个二进制放同一目录)。Docker 镜像与群晖 / QNAP / OpenWrt 套件已代为处理,原地升级即可。

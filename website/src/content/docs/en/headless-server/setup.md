@@ -197,7 +197,7 @@ Then open `http://<host>:17800/` in a browser and complete the Initialize FluxDo
 
 ## Upgrading from the legacy `fluxdown-server`
 
-Earlier releases shipped a single `fluxdown-server` binary. Server releases (`server-v*` tags, the `fluxdown-server` Docker image, and the `FluxDown-Server-*` archives/NAS packages keep their names) now ship `fluxdown-agent` + `fluxdownd` instead.
+Earlier releases shipped a single `fluxdown-server` binary. Server releases (the `fluxdown-server` Docker image and the `FluxDown-Server-*` archives/NAS packages keep their names; they are now attached to the regular `vX.Y.Z` GitHub release, older versions live under `server-v*`) now ship `fluxdown-agent` + `fluxdownd` instead.
 
 - **Same data, same settings**: keep the same data volume / `FLUXDOWN_DATA_DIR`; `FLUXDOWN_BIND`, `FLUXDOWN_DATA_DIR`, `FLUXDOWN_SAVE_DIR`, `FLUXDOWN_DATABASE_URL`, `FLUXDOWN_TOKEN`, `FLUXDOWN_TOKEN_FORCE`, `FLUXDOWN_WEBROOT`, `FLUXDOWN_LANG`, `FLUXDOWN_DEMO*` keep their names and meaning. Your existing access key carries over.
 - **Change the start command**: `fluxdown-server` → `fluxdown-agent --server` (both binaries in one directory). The Docker image, Synology / QNAP / OpenWrt packages already do this for you — just upgrade in place.

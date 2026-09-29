@@ -13,8 +13,8 @@ const FIREFOX_STORE = 'https://addons.mozilla.org/firefox/addon/fluxdown/'
 const EDGE_STORE = 'https://microsoftedge.microsoft.com/addons/search/FluxDown'
 const DONATE = 'https://fluxdown.zerx.dev/sponsor'
 const WEBSITE = 'https://fluxdown.zerx.dev'
-/** headless 服务端独立 tag `server-v*`。 */
-const SERVER_RELEASES = 'https://github.com/zerx-lab/FluxDown/releases?q=server-v'
+/** 服务端资产随统一的 `vX.Y.Z` release 发布（更早版本在 `server-v*` release）。 */
+const SERVER_RELEASES = 'https://github.com/zerx-lab/FluxDown/releases'
 
 const LOG_MAX_MIN = 1
 const LOG_MAX_MAX = 1024
