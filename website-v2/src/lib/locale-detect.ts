@@ -1,6 +1,6 @@
 /**
- * 服务端 Accept-Language 解析,判定规则与客户端 detectLocale(src/lib/i18n.ts)对齐:
- * 按 q 权重顺序遍历,zh 前缀 → zh,en 前缀 → en,否则回退 en。
+ * 服务端 Accept-Language 解析,判定规则与 Layout.astro 首帧内联脚本的浏览器语言判定对齐:
+ * 按优先级顺序遍历,zh 前缀 → zh,en 前缀 → en,都不匹配回退 en。
  */
 export function parseAcceptLanguage(header: string | null): "en" | "zh" {
   if (!header) return "en";

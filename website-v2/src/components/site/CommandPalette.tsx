@@ -10,6 +10,7 @@ import type { Lang } from "@/i18n/config";
 import { searchDocs, type SearchDoc } from "@/lib/docs-search";
 import { GITHUB_URL } from "@/lib/site-nav";
 import { withBase } from "@/lib/base";
+import { rememberLocale } from "@/lib/locale-pref";
 
 interface PaletteLink {
   label: string;
@@ -104,7 +105,10 @@ export default function CommandPalette({ lang, links, altLangHref }: Props) {
         group: "actions",
         label: t.switchLang,
         icon: <Languages size={15} strokeWidth={1.75} />,
-        run: () => go(altLangHref),
+        run: () => {
+          rememberLocale(lang === "en" ? "zh" : "en");
+          go(altLangHref);
+        },
       },
       {
         id: "action:github",

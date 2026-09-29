@@ -4,6 +4,9 @@
  *
  * - 语言由页面显式传入(URL 决定);hreflang 默认按当前路径生成 en/zh 双向簇,
  *   docs 等自有语言结构的页面传 `alternates` 覆盖,无变体页面传 `alternates={[]}`。
+ * - 无前缀(英文)页面是「自动语言」入口:首帧前按用户显式选择 → 浏览器/系统语言
+ *   判定,偏好中文则 replace 到 /zh/ 对应页。/zh/ 与 docs 是显式语言 URL,不跳;
+ *   爬虫不跳(英文页保持可索引)。
  * - `chrome={false}` 用于需要整屏自管的工具页(只保留 <head> 与主题)。
  */
 import "../styles/global.css";
@@ -71,6 +74,9 @@ const paletteLinks = [
     href: href(link.path, lang),
   })),
 ];
+
+// 仅默认 hreflang 簇的英文页参与自动语言;自带 alternates 的页面(docs / 404 / 工具页)语言由 URL 固定。
+const autoZhHref = lang === "en" && Astro.props.alternates === undefined ? switchLang(normalizedPath, "zh") : null;
 ---
 
 <!doctype html>
@@ -121,6 +127,32 @@ const paletteLinks = [
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={ogImage} />
 
+    {
+      autoZhHref && (
+        <!-- 自动语言:键名与 src/lib/locale-pref.ts 的 LOCALE_KEY 一致;判定规则与 lib/locale-detect.ts 对齐 -->
+        <script is:inline define:vars={{ zhHref: autoZhHref }}>
+          (function () {
+            var pref = null;
+            try { pref = localStorage.getItem("fluxdown-locale"); } catch (e) {}
+            if (pref !== "en" && pref !== "zh") {
+              var m = document.cookie.match(/(?:^|;\s*)fluxdown-locale=(en|zh)(?:;|$)/);
+              pref = m ? m[1] : null;
+            }
+            if (!pref) {
+              if (/bot|crawl|spider|slurp|lighthouse|headless/i.test(navigator.userAgent)) return;
+              var langs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ""];
+              for (var i = 0; i < langs.length && !pref; i++) {
+                var tag = String(langs[i]).toLowerCase();
+                if (tag.indexOf("zh") === 0) pref = "zh";
+                else if (tag.indexOf("en") === 0) pref = "en";
+              }
+            }
+            if (pref === "zh") location.replace(zhHref + location.search + location.hash);
+          })();
+        </script>
+      )
+    }
+
     <script is:inline type="application/ld+json" set:html={JSON.stringify(buildGraph(jsonLdNodes))} />
     <slot name="head" />
   </head>
@@ -150,6 +182,19 @@ const paletteLinks = [
 
     <script>
       import "../scripts/motion.ts";
+      import { isLang } from "../i18n/config";
+      import { rememberLocale } from "../lib/locale-pref";
+
+      // 语言切换器(Header / Footer 的 [data-lang-switch])点击即记为显式选择,之后不再按浏览器语言自动跳转。
+      document.addEventListener(
+        "click",
+        (event) => {
+          const target = event.target instanceof Element ? event.target.closest("[data-lang-switch]") : null;
+          const lang = target?.getAttribute("data-lang-switch");
+          if (isLang(lang)) rememberLocale(lang);
+        },
+        true,
+      );
     </script>
     <!--
       LangBot 客服机器人组件(全站)。走同域代理 /api/langbot-widget.js:上游脚本注入的

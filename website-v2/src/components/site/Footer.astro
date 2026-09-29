@@ -116,6 +116,7 @@ const columns = [
           <a
             href={switchLang(Astro.url.pathname, l)}
             hreflang={l}
+            data-lang-switch={l}
             class:list={["footer-lang", l === lang && "is-current"]}
             aria-current={l === lang ? "true" : undefined}
           >

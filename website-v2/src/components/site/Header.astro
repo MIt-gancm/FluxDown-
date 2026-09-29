@@ -117,7 +117,7 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
       <a href={GITHUB_URL} class="icon-btn hidden sm:inline-grid" aria-label={t.nav.github} target="_blank" rel="noopener">
         <BrandIcon name="github" size={16} />
       </a>
-      <a href={otherHref} class="icon-btn hidden sm:inline-grid" hreflang={other} aria-label={LANG_LABEL[other]} title={LANG_LABEL[other]}>
+      <a href={otherHref} class="icon-btn hidden sm:inline-grid" hreflang={other} data-lang-switch={other} aria-label={LANG_LABEL[other]} title={LANG_LABEL[other]}>
         <span class="mono text-[11.5px] font-semibold">{other === "zh" ? "中" : "EN"}</span>
       </a>
       <button type="button" class="icon-btn" data-theme-toggle aria-label={t.theme.toggle}>
@@ -165,7 +165,7 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
       ))
     }
     <div class="mt-8 flex items-center gap-2 border-t border-line pt-6">
-      <a href={otherHref} class="btn btn-secondary btn-sm" hreflang={other}>
+      <a href={otherHref} class="btn btn-secondary btn-sm" hreflang={other} data-lang-switch={other}>
         <Languages size={14} strokeWidth={1.75} />
         {LANG_LABEL[other]}
       </a>

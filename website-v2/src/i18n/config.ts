@@ -2,7 +2,9 @@
  * 站点语言契约(单一事实源)。
  *
  * - en 位于根路径(`/download`),zh 位于 `/zh` 前缀(`/zh/download`)。
- * - 每个页面都由服务端按 URL 直出目标语言;客户端不做语言探测或切换重渲染。
+ * - 每个页面都由服务端按 URL 直出目标语言;客户端不做切换重渲染。
+ * - 无前缀 URL 同时是「自动语言」入口:Layout.astro 首帧前按显式选择(lib/locale-pref.ts)
+ *   → 浏览器/系统语言判定,偏好中文则跳到 `/zh` 对应页;`DEFAULT_LANG` 只是无法判定时的回退。
  * - `astro.config.mjs` 的 `langPair()` 与本文件同契约(config 无法 import TS,双处注释互指)。
  */
 
