@@ -2,6 +2,7 @@
 
 mod components;
 mod controller;
+mod market;
 mod pages;
 mod ui;
 

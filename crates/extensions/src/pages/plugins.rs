@@ -1,7 +1,7 @@
-//! 插件子页：已安装插件管理（启用 / 设置 / 卸载）+ 安装区（zip / 开发目录）
+//! 插件子页：已安装插件管理（启用 / 设置 / 更新 / 卸载）+ 安装区（zip / 开发目录）
 //! + 插件市场浏览与安装。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use fluxdown_protocol::{InstalledPlugin, MarketEntryDto, PluginDto};
 use fluxdown_ui_components::{
@@ -30,11 +30,16 @@ use crate::{
     ExtensionsTab, ExtensionsView,
     components::{
         plugin_auth::PluginAuthDialog,
-        plugin_detail::{PluginDetail, open_plugin_detail, yanked_label},
+        plugin_detail::{PluginDetail, open_plugin_detail, permission_label, yanked_label},
         plugin_settings::PluginSettingsForm,
     },
     controller::{COMPONENT_KINDS, component_wire_name},
-    error_text, ui,
+    error_text,
+    market::{
+        MarketAction, filter_market, installed_version_yanked, latest_per_plugin, market_action,
+        permissions_to_confirm,
+    },
+    ui,
 };
 
 /// 市场列表每次展开的条数。
@@ -44,6 +49,7 @@ pub const MARKET_PAGE_SIZE: usize = 50;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PluginOp {
     Install,
+    Update,
     Uninstall,
     SetEnabled,
 }
@@ -75,10 +81,13 @@ pub(crate) struct MarketUi {
     pub requested: bool,
     pub loading: bool,
     pub error: Option<String>,
+    /// 索引原始条目（每插件每版本一条）；用于查询已安装版本的撤回标记。
     pub entries: Vec<MarketEntryDto>,
+    /// 每插件一条：引擎实际会安装的版本（见 [`latest_per_plugin`]）。
+    pub catalog: Vec<MarketEntryDto>,
     pub search: Option<Entity<InputState>>,
     pub limit: usize,
-    /// 安装在途的市场插件 id。
+    /// 安装 / 更新在途的市场插件 id。
     pub pending: HashSet<String>,
 }
 
@@ -89,30 +98,12 @@ impl Default for MarketUi {
             loading: false,
             error: None,
             entries: Vec::new(),
+            catalog: Vec::new(),
             search: None,
             limit: MARKET_PAGE_SIZE,
             pending: HashSet::new(),
         }
     }
-}
-
-/// 市场条目关键字过滤：名称 / id / 描述 / 作者 / 标签任一命中（大小写不敏感）。
-pub fn filter_market<'a>(entries: &'a [MarketEntryDto], query: &str) -> Vec<&'a MarketEntryDto> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return entries.iter().collect();
-    }
-    let hit = |value: &str| value.to_lowercase().contains(&query);
-    entries
-        .iter()
-        .filter(|entry| {
-            hit(&entry.name)
-                || hit(&entry.plugin_id)
-                || hit(&entry.description)
-                || hit(&entry.author)
-                || entry.tags.iter().any(|tag| hit(tag))
-        })
-        .collect()
 }
 
 impl ExtensionsView {
@@ -140,18 +131,29 @@ impl ExtensionsView {
         } = frame;
 
         let plugins = self.controller.plugins();
+        let market = &self.plugins.market;
+        let catalog_by_id = market
+            .catalog
+            .iter()
+            .map(|entry| (entry.plugin_id.as_str(), entry))
+            .collect::<HashMap<_, _>>();
         let installed = plugins
             .iter()
             .enumerate()
             .map(|(index, plugin)| {
-                self.render_plugin_row(index, plugin, frame, cx)
+                let update = catalog_by_id
+                    .get(plugin.identity.as_str())
+                    .copied()
+                    .filter(|entry| market_action(entry, Some(plugin)) == MarketAction::Update);
+                let yanked = installed_version_yanked(&market.entries, plugin);
+                self.render_plugin_row(index, plugin, update, yanked, frame, cx)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let installed_ids = plugins
+        let installed_by_id = plugins
             .iter()
-            .map(|plugin| plugin.identity.as_str())
-            .collect::<HashSet<_>>();
+            .map(|plugin| (plugin.identity.as_str(), plugin))
+            .collect::<HashMap<_, _>>();
 
         v_flex()
             .w_full()
@@ -225,7 +227,7 @@ impl ExtensionsView {
                         frame,
                     )),
             )
-            .child(self.render_market(&search, &query, &installed_ids, frame, cx))
+            .child(self.render_market(&search, &query, &installed_by_id, frame, cx))
     }
 
     fn ensure_market_search(
@@ -334,6 +336,8 @@ impl ExtensionsView {
         &self,
         index: usize,
         plugin: &PluginDto,
+        update: Option<&MarketEntryDto>,
+        yanked: Option<&str>,
         frame: Frame<'_>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -368,6 +372,22 @@ impl ExtensionsView {
                 ui::tone_pill(
                     translator.text("pluginDisabledCircuitBreaker").to_owned(),
                     destructive,
+                    frame,
+                )
+            }),
+            yanked
+                .and_then(|yanked| yanked_label(translator, yanked))
+                .map(|label| {
+                    ui::tone_pill(
+                        translator.text_with("pluginInstalledVersionYanked", &[("label", &label)]),
+                        destructive,
+                        frame,
+                    )
+                }),
+            update.map(|entry| {
+                ui::tone_pill(
+                    translator.text_with("pluginUpdateAvailable", &[("version", &entry.version)]),
+                    frame.extended.colors.info,
                     frame,
                 )
             }),
@@ -422,6 +442,29 @@ impl ExtensionsView {
                         )
                     }),
             )
+            .when_some(update, |this, entry| {
+                let pending = self.plugins.market.pending.contains(&entry.plugin_id);
+                let entry = entry.clone();
+                this.child(
+                    Button::new(("plugin-update", index))
+                        .outline()
+                        .control(cx)
+                        .label(
+                            translator
+                                .text(if pending {
+                                    "marketUpdatingButton"
+                                } else {
+                                    "marketUpdateButton"
+                                })
+                                .to_owned(),
+                        )
+                        .loading(pending)
+                        .disabled(busy || pending)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.request_market_install(entry.clone(), window, cx);
+                        })),
+                )
+            })
             .child(
                 Button::new(("plugin-detail", index))
                     .ghost()
@@ -502,7 +545,7 @@ impl ExtensionsView {
         &self,
         search: &Entity<InputState>,
         query: &str,
-        installed_ids: &HashSet<&str>,
+        installed_by_id: &HashMap<&str, &PluginDto>,
         frame: Frame<'_>,
         cx: &Context<Self>,
     ) -> impl IntoElement {
@@ -525,7 +568,7 @@ impl ExtensionsView {
                 frame,
             ));
         }
-        if market.entries.is_empty() {
+        if market.catalog.is_empty() {
             return root.child(ui::empty_state(
                 FluxIcon::Package,
                 translator.text("marketEmpty").to_owned(),
@@ -544,7 +587,7 @@ impl ExtensionsView {
                 )
                 .cleanable(true),
         );
-        let filtered = filter_market(&market.entries, query);
+        let filtered = filter_market(&market.catalog, query);
         if filtered.is_empty() {
             return root.child(ui::empty_state(
                 FluxIcon::Search,
@@ -559,9 +602,10 @@ impl ExtensionsView {
             .take(market.limit)
             .enumerate()
             .map(|(index, entry)| {
-                let installed = installed_ids.contains(entry.plugin_id.as_str());
+                let installed = installed_by_id.get(entry.plugin_id.as_str()).copied();
+                let action = market_action(entry, installed);
                 let pending = market.pending.contains(&entry.plugin_id);
-                self.render_market_row(index, entry, installed, pending, frame, cx)
+                self.render_market_row(index, entry, action, pending, frame, cx)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -591,7 +635,7 @@ impl ExtensionsView {
         &self,
         index: usize,
         entry: &MarketEntryDto,
-        installed: bool,
+        action: MarketAction,
         pending: bool,
         frame: Frame<'_>,
         cx: &Context<Self>,
@@ -610,15 +654,17 @@ impl ExtensionsView {
         let yanked = yanked_label(translator, &entry.yanked);
         let detail = PluginDetail::from_market(entry, translator);
         let detail_translator = translator.clone();
-        let plugin_id = entry.plugin_id.clone();
-        let install_label = if installed {
-            translator.text("marketInstalledButton")
-        } else if pending {
-            translator.text("marketInstallingButton")
-        } else {
-            translator.text("marketInstallButton")
-        }
-        .to_owned();
+        let install_key = match (action, pending) {
+            (MarketAction::Install, false) => "marketInstallButton",
+            (MarketAction::Install, true) => "marketInstallingButton",
+            (MarketAction::Update, false) => "marketUpdateButton",
+            (MarketAction::Update, true) => "marketUpdatingButton",
+            (MarketAction::Installed, _) => "marketInstalledButton",
+            (MarketAction::Unavailable, _) => "marketUnavailableButton",
+        };
+        let install_label = translator.text(install_key).to_owned();
+        let actionable = matches!(action, MarketAction::Install | MarketAction::Update);
+        let target = entry.clone();
         list_row(frame)
             .child(
                 v_flex()
@@ -674,9 +720,9 @@ impl ExtensionsView {
                     .control(cx)
                     .label(install_label)
                     .loading(pending)
-                    .disabled(installed || pending || stale)
+                    .disabled(!actionable || pending || stale)
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.install_market_plugin(plugin_id.clone(), window, cx);
+                        this.request_market_install(target.clone(), window, cx);
                     })),
             )
     }
@@ -708,6 +754,7 @@ impl ExtensionsView {
                     })
                 }) {
                     Ok(entries) => {
+                        market.catalog = latest_per_plugin(&entries);
                         market.entries = entries;
                         market.error = None;
                         market.limit = MARKET_PAGE_SIZE;
@@ -807,21 +854,113 @@ impl ExtensionsView {
         .detach();
     }
 
-    fn install_market_plugin(
+    /// 市场安装 / 更新入口：新装需确认条目声明的全部权限，更新只确认新增权限；
+    /// 无需确认时直接执行。
+    fn request_market_install(
+        &mut self,
+        entry: MarketEntryDto,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.plugins.market.pending.contains(&entry.plugin_id) {
+            return;
+        }
+        let installed = self.controller.plugin(&entry.plugin_id);
+        let op = if installed.is_some() {
+            PluginOp::Update
+        } else {
+            PluginOp::Install
+        };
+        let permissions = permissions_to_confirm(&entry, installed);
+        if permissions.is_empty() {
+            self.start_market_install(entry.plugin_id, op, window, cx);
+        } else {
+            self.confirm_market_permissions(entry, op, &permissions, window, cx);
+        }
+    }
+
+    fn confirm_market_permissions(
+        &self,
+        entry: MarketEntryDto,
+        op: PluginOp,
+        permissions: &[String],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let translator = self.translator.read(cx);
+        let name = if entry.name.is_empty() {
+            entry.plugin_id.clone()
+        } else {
+            entry.name.clone()
+        };
+        let (title_key, body_key, ok_key) = if op == PluginOp::Update {
+            (
+                "pluginPermConfirmUpdateTitle",
+                "pluginPermConfirmUpdateBody",
+                "pluginPermConfirmUpdateOk",
+            )
+        } else {
+            (
+                "pluginPermConfirmInstallTitle",
+                "pluginPermConfirmInstallBody",
+                "pluginPermConfirmInstallOk",
+            )
+        };
+        let lines = permissions
+            .iter()
+            .map(|permission| {
+                let (label, desc) = permission_label(translator, permission);
+                format!("• {label} — {desc}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let title = SharedString::from(translator.text_with(title_key, &[("name", &name)]));
+        let body = SharedString::from(format!(
+            "{}\n{lines}",
+            translator.text_with(body_key, &[("version", &entry.version)])
+        ));
+        let ok = SharedString::from(translator.text(ok_key).to_owned());
+        let cancel = SharedString::from(translator.text("cancel").to_owned());
+        let view = cx.entity().downgrade();
+        let plugin_id = entry.plugin_id;
+        window.open_alert_dialog(cx, move |alert, _, cx| {
+            let view = view.clone();
+            let plugin_id = plugin_id.clone();
+            alert
+                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+                .description(body.clone())
+                .footer(fluxdown_ui_components::dialog_footer(
+                    Some(cancel.clone()),
+                    ok.clone(),
+                    fluxdown_ui_components::DialogIntent::Confirm,
+                    cx,
+                ))
+                .on_ok(move |_, window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.start_market_install(plugin_id.clone(), op, window, cx);
+                    });
+                    true
+                })
+        });
+    }
+
+    fn start_market_install(
         &mut self,
         plugin_id: String,
+        op: PluginOp,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.plugins.market.pending.insert(plugin_id.clone()) {
             return;
         }
+        cx.notify();
         let future = self.controller.market_install(plugin_id.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.plugins.market.pending.remove(&plugin_id);
-                this.finish_plugin_op(PluginOp::Install, result, window, cx);
+                this.finish_plugin_op(op, result, window, cx);
                 cx.notify();
             });
         })
@@ -861,8 +1000,13 @@ impl ExtensionsView {
     ) {
         let translator = self.translator.read(cx);
         match (op, result) {
-            (PluginOp::Install, Ok(value)) => {
-                let message = translator.text("pluginOpInstallSuccess").to_owned();
+            (op @ (PluginOp::Install | PluginOp::Update), Ok(value)) => {
+                let key = if op == PluginOp::Update {
+                    "pluginOpUpdateSuccess"
+                } else {
+                    "pluginOpInstallSuccess"
+                };
+                let message = translator.text(key).to_owned();
                 let missing = serde_json::from_value::<InstalledPlugin>(value)
                     .map(|installed| installed.missing_components)
                     .unwrap_or_default();
@@ -880,6 +1024,7 @@ impl ExtensionsView {
                 let detail = error_text(translator, &error);
                 let key = match op {
                     PluginOp::Install => "pluginOpInstallFailed",
+                    PluginOp::Update => "pluginOpUpdateFailed",
                     PluginOp::Uninstall => "pluginOpUninstallFailed",
                     PluginOp::SetEnabled => "pluginOpEnabledFailed",
                 };
@@ -1087,64 +1232,4 @@ fn list_row(frame: Frame<'_>) -> Div {
         .px(frame.tokens.spacing.md)
         .py(frame.tokens.spacing.sm)
         .hover(move |style| style.bg(hover))
-}
-
-#[cfg(test)]
-mod tests {
-    use fluxdown_protocol::MarketEntryDto;
-
-    use super::filter_market;
-
-    fn entry(
-        id: &str,
-        name: &str,
-        description: &str,
-        author: &str,
-        tags: &[&str],
-    ) -> MarketEntryDto {
-        MarketEntryDto {
-            plugin_id: id.to_owned(),
-            version: "1.0.0".to_owned(),
-            sequence: 1,
-            content_hash: String::new(),
-            min_app_version: String::new(),
-            name: name.to_owned(),
-            description: description.to_owned(),
-            author: author.to_owned(),
-            homepage: String::new(),
-            mirrors: Vec::new(),
-            publish_time: String::new(),
-            yanked: String::new(),
-            tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
-            permissions: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn empty_query_keeps_everything() {
-        let entries = [
-            entry("a", "Alpha", "", "", &[]),
-            entry("b", "Beta", "", "", &[]),
-        ];
-        assert_eq!(filter_market(&entries, "   ").len(), 2);
-    }
-
-    #[test]
-    fn query_matches_any_field_case_insensitively() {
-        let entries = [
-            entry("video.dl", "Video", "grabs videos", "Ann", &["media"]),
-            entry("other", "Other", "misc", "Bob", &["tools"]),
-        ];
-        let ids = |query: &str| {
-            filter_market(&entries, query)
-                .into_iter()
-                .map(|entry| entry.plugin_id.as_str())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(ids("VIDEO"), vec!["video.dl"]);
-        assert_eq!(ids("bob"), vec!["other"]);
-        assert_eq!(ids("media"), vec!["video.dl"]);
-        assert_eq!(ids("grabs"), vec!["video.dl"]);
-        assert!(ids("nothing").is_empty());
-    }
 }
