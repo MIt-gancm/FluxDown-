@@ -5,6 +5,7 @@
 import type { Lang } from "@/i18n/config";
 import { href } from "@/i18n/routing";
 import { normalizeFluxThemeJson, type FluxThemeJson } from "@/lib/theme-builder";
+import { withBase } from "@/lib/base";
 
 export const THEMES_REPO = "zerx-lab/fluxdown-themes";
 export const THEMES_REPO_URL = `https://github.com/${THEMES_REPO}`;
@@ -41,7 +42,7 @@ export interface ThemeIndex {
 
 /** 仓库相对路径 → 同源代理 URL。 */
 export function themeAssetUrl(path: string): string {
-  return `/api/themes/${path}`;
+  return withBase(`/api/themes/${path}`);
 }
 
 const VARIANT_ORDER = ["dark", "light"];

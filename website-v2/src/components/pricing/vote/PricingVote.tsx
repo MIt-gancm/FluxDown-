@@ -5,6 +5,7 @@ import { pricingVote } from "@/i18n/messages/pricingVote";
 import { BrandIcon } from "@/components/icons/brand";
 import PollCard, { type Plan } from "./PollCard";
 import Discussion, { Avatar, type PollComment, type Viewer } from "./Discussion";
+import { withBase } from "@/lib/base";
 
 interface PricingData {
   results: Record<Plan, Record<string, number>>;
@@ -39,7 +40,7 @@ export default function PricingVote({ lang, loginUrl, logoutUrl }: Props) {
       setAuthError(true);
       window.history.replaceState(null, "", window.location.pathname);
     }
-    fetch("/api/pricing-vote")
+    fetch(withBase("/api/pricing-vote"))
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
@@ -59,7 +60,7 @@ export default function PricingVote({ lang, loginUrl, logoutUrl }: Props) {
     setSubmitting(plan);
     setStatus(null);
     try {
-      const res = await fetch("/api/pricing-vote", {
+      const res = await fetch(withBase("/api/pricing-vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "vote", plan, option }),

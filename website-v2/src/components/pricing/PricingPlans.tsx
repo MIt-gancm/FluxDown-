@@ -7,6 +7,7 @@ import { formatDate, formatMinor } from "@/components/pay/money";
 import { PlanBadge, PlanRibbon } from "./PlanBadge";
 import WebPurchase from "./WebPurchase";
 import type { CloudPlan } from "./types";
+import { withBase } from "@/lib/base";
 
 interface Props {
   lang: Lang;
@@ -35,7 +36,7 @@ export default function PricingPlans({ lang, downloadHref, sourceHref }: Props) 
 
   useEffect(() => {
     let alive = true;
-    fetch("/api/cloud/plans")
+    fetch(withBase("/api/cloud/plans"))
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();

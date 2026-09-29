@@ -8,6 +8,7 @@ import Layout from "@/layouts/Layout.astro";
 import PageHeader from "@/components/site/PageHeader.astro";
 import { langStaticPaths, resolveLang } from "@/i18n/routing";
 import { docs } from "@/i18n/messages/docs";
+import { withBase } from "@/lib/base";
 
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
@@ -41,7 +42,7 @@ const tokens = [
 ].join(";");
 
 const config = {
-  url: "/openapi.json",
+  url: withBase("/openapi.json"),
   theme: "none",
   layout: "modern",
   hideDarkModeToggle: true,
@@ -54,11 +55,11 @@ const config = {
 
 <Layout lang={lang} title={t.title} description={t.description}>
   <PageHeader eyebrow={t.eyebrow} title={t.heading} lede={t.lede}>
-    <a href="/openapi.json" class="btn btn-secondary" target="_blank" rel="noopener">
+    <a href={withBase("/openapi.json")} class="btn btn-secondary" target="_blank" rel="noopener">
       <FileJson size={15} strokeWidth={1.75} aria-hidden="true" />
       <span class="mono text-[13px]">{t.spec}</span>
     </a>
-    <a href={`/docs/${lang}/api/overview/`} class="btn btn-ghost">
+    <a href={withBase(`/docs/${lang}/api/overview/`)} class="btn btn-ghost">
       <BookOpen size={15} strokeWidth={1.75} aria-hidden="true" />
       {t.guide}
     </a>
@@ -70,7 +71,7 @@ const config = {
       <p class="api-ref-status" data-status role="status">{t.loading}</p>
       <p class="api-ref-status" data-failed hidden role="alert">
         {t.failed}
-        <a href="/openapi.json" class="link">{t.failedCta}</a>
+        <a href={withBase("/openapi.json")} class="link">{t.failedCta}</a>
       </p>
     </div>
   </section>

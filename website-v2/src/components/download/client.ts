@@ -9,6 +9,7 @@
 import { download } from "@/i18n/messages/download";
 import type { Lang } from "@/i18n/config";
 import { formatSize, pickPath, versionAnchor, type ReleaseAsset, type ReleaseInfo } from "@/lib/release-format";
+import { withBase } from "@/lib/base";
 
 type Channel = "stable" | "frontier";
 type Os = "windows" | "macos" | "linux" | "android" | "ios";
@@ -55,7 +56,7 @@ async function detectPlatform(): Promise<Platform> {
 function init(root: HTMLElement) {
   const lang = (root.dataset.lang === "zh" ? "zh" : "en") as Lang;
   const t = download[lang];
-  const changelogHref = root.dataset.changelog ?? "/changelog/";
+  const changelogHref = root.dataset.changelog ?? withBase("/changelog/");
   const githubUrl = root.dataset.github ?? "";
   const dateFormat = new Intl.DateTimeFormat(lang === "zh" ? "zh-CN" : "en-US", {
     year: "numeric",
@@ -81,7 +82,7 @@ function init(root: HTMLElement) {
   function fetchRelease(ch: Channel): Promise<ReleaseInfo> {
     let pending = cache.get(ch);
     if (!pending) {
-      pending = fetch(ch === "frontier" ? "/api/release?channel=frontier" : "/api/release").then((res) => {
+      pending = fetch(withBase(ch === "frontier" ? "/api/release?channel=frontier" : "/api/release")).then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json() as Promise<ReleaseInfo>;
       });
@@ -331,7 +332,7 @@ function init(root: HTMLElement) {
       label.textContent = t.subscribe.loading;
       say("");
       try {
-        const res = await fetch("/api/subscribe", {
+        const res = await fetch(withBase("/api/subscribe"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: email.value.trim(), platform: select.value }),

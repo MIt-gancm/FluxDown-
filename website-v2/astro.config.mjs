@@ -29,6 +29,40 @@ const BUILD_TIME = new Date().toISOString();
 // config 无法 import TS 模块,双处以注释互指)。docs 自带 /docs/<lang>/ 结构,不走此映射。
 const SITE = "https://fluxdown.zerx.dev";
 
+// 站点挂载前缀:根部署留空;预览部署到子路径时构建期注入(如 SITE_BASE=/v2,见 Dockerfile)。
+// 运行期代码经 import.meta.env.BASE_URL 读取(src/lib/base.ts),与这里同源。
+const BASE = (process.env.SITE_BASE ?? "").replace(/\/+$/, "");
+
+/**
+ * 去掉挂载前缀,得到站点路径(与 src/lib/base.ts 的 stripBase 同契约)。
+ * @param {string} pathname
+ */
+function stripBase(pathname) {
+  if (!BASE) return pathname;
+  if (pathname === BASE) return "/";
+  return pathname.startsWith(`${BASE}/`) ? pathname.slice(BASE.length) : pathname;
+}
+
+/**
+ * Markdown 正文里的站内绝对链接(`/docs/...`、`/docs/img.png`)补挂载前缀。
+ * 只在子路径部署时启用;根部署零改动。
+ */
+function rehypeBaseLinks() {
+  /** @param {any} node */
+  const visit = (node) => {
+    if (node.type === "element" && node.properties) {
+      for (const attr of ["href", "src"]) {
+        const value = node.properties[attr];
+        if (typeof value === "string" && value.startsWith("/") && !value.startsWith("//")) {
+          node.properties[attr] = `${BASE}${value}`;
+        }
+      }
+    }
+    if (Array.isArray(node.children)) node.children.forEach(visit);
+  };
+  return visit;
+}
+
 /**
  * 页面路径 → [enPath, zhPath];docs/api 返回 null(不生成 hreflang 簇)。
  * @param {string} pathname
@@ -42,13 +76,14 @@ function langPair(pathname) {
 
 // https://astro.com/docs/en/guides/environment-variables/
 export default defineConfig({
-  site: "https://fluxdown.zerx.dev",
+  site: SITE,
+  base: BASE || "/",
   adapter: node({ mode: "standalone" }),
   integrations: [
     react(),
     sitemap({
       filter: (page) => {
-        const path = new URL(page).pathname.replace(/\/$/, "");
+        const path = stripBase(new URL(page).pathname).replace(/\/$/, "");
         return !docsFallbackPathnames.has(path) && !noindexPathnames.has(path);
       },
       // Bing/IndexNow 依赖 ISO8601 lastmod 做 freshness 判定。SSG 页无天然 mtime,
@@ -56,14 +91,14 @@ export default defineConfig({
       // hreflang 簇(xhtml:link);首页 changefreq/priority 最高。
       serialize: (item) => {
         item.lastmod = BUILD_TIME;
-        const pathname = new URL(item.url).pathname;
+        const pathname = stripBase(new URL(item.url).pathname);
         const pair = langPair(pathname);
         if (pair) {
           const [en, zh] = pair;
           item.links = [
-            { url: `${SITE}${en}`, lang: "en" },
-            { url: `${SITE}${zh}`, lang: "zh" },
-            { url: `${SITE}${en}`, lang: "x-default" },
+            { url: `${SITE}${BASE}${en}`, lang: "en" },
+            { url: `${SITE}${BASE}${zh}`, lang: "zh" },
+            { url: `${SITE}${BASE}${en}`, lang: "x-default" },
           ];
         }
         if (pathname === "/" || pathname === "/zh/") {
@@ -76,6 +111,7 @@ export default defineConfig({
   ],
 
   markdown: {
+    rehypePlugins: BASE ? [rehypeBaseLinks] : [],
     shikiConfig: {
       // 双主题输出 --shiki-light/--shiki-dark CSS 变量,
       // 由 global.css 中锚定 html.light 的桥接规则决定实际展示(站内主题机制,非 prefers-color-scheme)
@@ -91,7 +127,7 @@ export default defineConfig({
 
   // 日文站点已下线(v2 仅 en + zh);旧链接永久跳转到英文首页。
   redirects: {
-    "/ja": { status: 301, destination: "/" },
+    "/ja": { status: 301, destination: `${BASE}/` },
   },
 
   prefetch: { prefetchAll: false, defaultStrategy: "hover" },

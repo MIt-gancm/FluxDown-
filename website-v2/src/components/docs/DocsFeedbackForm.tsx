@@ -5,6 +5,7 @@ import { useId, useState, type SubmitEvent } from "react";
 import { Check, MessageSquareText } from "lucide-react";
 import type { Lang } from "@/i18n/config";
 import { docs } from "@/i18n/messages/docs";
+import { withBase } from "@/lib/base";
 
 interface Props {
   pagePath: string;
@@ -26,7 +27,7 @@ export default function DocsFeedbackForm({ pagePath, lang }: Props) {
     if (!description || status === "sending") return;
     setStatus("sending");
     try {
-      const res = await fetch("/api/feedback", {
+      const res = await fetch(withBase("/api/feedback"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -3,6 +3,7 @@ import { ArrowUpRight } from "lucide-react";
 import type { Lang } from "@/i18n/config";
 import { sponsor } from "@/i18n/messages/sponsor";
 import { SPONSOR_WALL_URL, fmtCents, fmtWallDate, type WallSponsor } from "./wall";
+import { withBase } from "@/lib/base";
 
 /** Latest sponsors from the GitHub wall: top 3 by amount as "special thanks", the rest newest first. */
 export default function SponsorWall({ lang }: { lang: Lang }) {
@@ -11,7 +12,7 @@ export default function SponsorWall({ lang }: { lang: Lang }) {
 
   useEffect(() => {
     let alive = true;
-    fetch("/api/sponsor/list")
+    fetch(withBase("/api/sponsor/list"))
       .then((r) => (r.ok ? r.json() : null))
       .then((d: { sponsors?: WallSponsor[] } | null) => {
         if (alive) setSponsors(Array.isArray(d?.sponsors) ? d.sponsors : []);

@@ -15,6 +15,7 @@ import {
 import { GridFill, SearchField, SkeletonGrid, StateMessage } from "./MarketUI";
 import { PluginCard } from "./PluginCard";
 import { PluginDetail } from "./PluginDetail";
+import { withBase } from "@/lib/base";
 
 export default function PluginMarket({ lang }: { lang: Lang }) {
   const t = markets[lang];
@@ -25,7 +26,7 @@ export default function PluginMarket({ lang }: { lang: Lang }) {
   const [selected, setSelected] = useState<PluginGroup | null>(null);
 
   useEffect(() => {
-    fetch("/api/plugins/index.json")
+    fetch(withBase("/api/plugins/index.json"))
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
       .then((data: MarketIndex) => setGroups(groupPlugins(data.entries ?? [])))
       .catch(() => setError(true));

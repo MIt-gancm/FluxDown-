@@ -6,7 +6,7 @@ import { BrandIcon } from "@/components/icons/brand";
 import { changelog } from "@/i18n/messages/changelog";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
 import { GITHUB_URL } from "@/lib/site-nav";
-import { SITE_URL } from "@/lib/seo";
+import { SITE_ORIGIN } from "@/lib/seo";
 
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
@@ -16,8 +16,8 @@ const jsonLdNodes = [
   {
     "@type": "BreadcrumbList",
     itemListElement: [
-      { "@type": "ListItem", position: 1, name: "FluxDown", item: `${SITE_URL}${href("/", lang)}` },
-      { "@type": "ListItem", position: 2, name: t.eyebrow, item: `${SITE_URL}${href("/changelog", lang)}` },
+      { "@type": "ListItem", position: 1, name: "FluxDown", item: `${SITE_ORIGIN}${href("/", lang)}` },
+      { "@type": "ListItem", position: 2, name: t.eyebrow, item: `${SITE_ORIGIN}${href("/changelog", lang)}` },
     ],
   },
 ];

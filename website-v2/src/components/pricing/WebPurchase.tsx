@@ -6,6 +6,7 @@ import Dialog from "@/components/pay/Dialog";
 import { QrTile, WechatBadge } from "@/components/pay/WechatQr";
 import { formatMinor } from "@/components/pay/money";
 import type { PlanBrief } from "./types";
+import { withBase } from "@/lib/base";
 
 /** Web purchase from a plan card: account lookup → confirm → WeChat QR → poll until paid. */
 
@@ -87,7 +88,7 @@ export default function WebPurchase({ plan, lang }: { plan: PlanBrief; lang: Lan
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/cloud/order-lookup", {
+      const res = await fetch(withBase("/api/cloud/order-lookup"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account: trimmed }),
@@ -109,7 +110,7 @@ export default function WebPurchase({ plan, lang }: { plan: PlanBrief; lang: Lan
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/cloud/order", {
+      const res = await fetch(withBase("/api/cloud/order"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account: account.trim(), planCode: plan.code }),
@@ -130,7 +131,7 @@ export default function WebPurchase({ plan, lang }: { plan: PlanBrief; lang: Lan
   // Poll the order every 3 s: paid → success; expired/failed → back to confirm with an error.
   useEffect(() => {
     if (step !== "pay" || !order) return;
-    const query = `/api/cloud/order?orderNo=${encodeURIComponent(order.orderNo)}&account=${encodeURIComponent(account.trim())}`;
+    const query = withBase(`/api/cloud/order?orderNo=${encodeURIComponent(order.orderNo)}&account=${encodeURIComponent(account.trim())}`);
     const timer = window.setInterval(async () => {
       try {
         const res = await fetch(query);

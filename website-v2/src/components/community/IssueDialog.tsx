@@ -26,6 +26,7 @@ import { feedback } from "@/i18n/messages/feedback";
 import { cn } from "@/lib/utils";
 import { renderMarkdown } from "./markdown";
 import { LabelChip, Notice, Placeholder, Spinner, StateBadge, formatDate, timeAgo, type IssueState } from "./shared";
+import { withBase } from "@/lib/base";
 
 interface Reactions {
   "+1": number;
@@ -158,7 +159,7 @@ export default function IssueDialog({
       }
       setError("");
       try {
-        const res = await fetch(`/api/issues/${num}`);
+        const res = await fetch(withBase(`/api/issues/${num}`));
         if (res.status === 404) {
           setError(t.issue.notFound);
           return;
@@ -194,7 +195,7 @@ export default function IssueDialog({
     setReplyStatus("sending");
     setReplyError("");
     try {
-      const res = await fetch(`/api/issues/${issueNumber}/comments`, {
+      const res = await fetch(withBase(`/api/issues/${issueNumber}/comments`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body }),

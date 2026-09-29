@@ -6,6 +6,7 @@
 import type { DocsNavGroup } from "@/lib/docs-nav";
 import type { Lang } from "@/i18n/config";
 import { docs } from "@/i18n/messages/docs";
+import { withBase } from "@/lib/base";
 
 interface Props {
   groups: DocsNavGroup[];
@@ -30,7 +31,7 @@ const current = currentPath.endsWith("/") ? currentPath : `${currentPath}/`;
           {group.items.map((item) => (
             <li>
               <a
-                href={item.href}
+                href={withBase(item.href)}
                 class="docs-nav-link"
                 aria-current={item.href === current ? "page" : undefined}
               >

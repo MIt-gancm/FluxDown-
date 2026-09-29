@@ -28,6 +28,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
+import { withBase } from "@/lib/base";
 
 export const prerender = false;
 
@@ -201,7 +202,7 @@ async function getCachedReleases(
           name: a.name,
           size: a.size,
           // 通过我们自己的代理端点下载，携带 tag 参数定位到对应版本
-          download_url: `/api/download/${encodeURIComponent(a.name)}?tag=${encodeURIComponent(r.tag_name)}`,
+          download_url: withBase(`/api/download/${encodeURIComponent(a.name)}?tag=${encodeURIComponent(r.tag_name)}`),
         }));
 
     all = raw

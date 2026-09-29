@@ -9,6 +9,7 @@ import { changelog } from "@/i18n/messages/changelog";
 import { versionAnchor, type ChangelogRelease } from "@/lib/release-format";
 import { GITHUB_URL } from "@/lib/site-nav";
 import ReleaseEntry from "./ReleaseEntry";
+import { withBase } from "@/lib/base";
 
 type Channel = "stable" | "frontier";
 const PER_PAGE = 15;
@@ -46,7 +47,7 @@ export default function ChangelogTimeline({ lang }: { lang: Lang }) {
     const id = ++requestRef.current;
     setStatus(p === 1 ? "loading" : "more");
     try {
-      const res = await fetch(`/api/changelog?page=${p}&per_page=${PER_PAGE}&channel=${ch}`);
+      const res = await fetch(withBase(`/api/changelog?page=${p}&per_page=${PER_PAGE}&channel=${ch}`));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = (await res.json()) as PageData;
       if (id !== requestRef.current) return;

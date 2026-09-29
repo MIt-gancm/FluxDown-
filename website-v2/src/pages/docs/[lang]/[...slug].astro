@@ -19,6 +19,7 @@ import { buildDocsNav, type DocsLang } from "@/lib/docs-nav";
 import { getFallbackSlugs } from "@/lib/docs-fallback";
 import { docsSourceHash } from "@/lib/docs-hash";
 import { docs } from "@/i18n/messages/docs";
+import { withBase } from "@/lib/base";
 
 export const prerender = true;
 
@@ -82,7 +83,7 @@ const section = groups.find((g) => g.id === entry.data.section);
 
     <div id="docs-drawer" class="docs-drawer" popover>
       <div class="docs-drawer-head">
-        <a href={`/docs/${lang}/`} class="eyebrow">{t.docs}</a>
+        <a href={withBase(`/docs/${lang}/`)} class="eyebrow">{t.docs}</a>
         <button
           type="button"
           class="btn btn-ghost btn-sm !px-2"
@@ -118,8 +119,8 @@ const section = groups.find((g) => g.id === entry.data.section);
         >
           <nav aria-label={t.breadcrumb} class="docs-crumbs" lang={lang === "zh" ? "zh-CN" : "en"}>
             <ol>
-              <li><a href={`/docs/${lang}/`}>{t.docs}</a></li>
-              {section && <li><a href={`/docs/${lang}/#${section.id}`}>{section.label}</a></li>}
+              <li><a href={withBase(`/docs/${lang}/`)}>{t.docs}</a></li>
+              {section && <li><a href={withBase(`/docs/${lang}/#${section.id}`)}>{section.label}</a></li>}
               <li><span aria-current="page">{entry.data.title}</span></li>
             </ol>
           </nav>

@@ -8,6 +8,7 @@ import type { Lang } from "@/i18n/config";
 import { polls } from "@/i18n/messages/polls";
 import { cn } from "@/lib/utils";
 import { Placeholder } from "./shared";
+import { withBase } from "@/lib/base";
 
 interface Logo {
   id: string;
@@ -41,7 +42,7 @@ export default function LogoResults({ lang }: { lang: Lang }) {
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    fetch("/api/logo-vote")
+    fetch(withBase("/api/logo-vote"))
       .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
       .then((json: unknown) => {
         const list = Array.isArray(json) ? json : (json as { logos?: unknown })?.logos;
@@ -81,7 +82,7 @@ export default function LogoResults({ lang }: { lang: Lang }) {
       <ol className="cells grid-cols-1 min-[480px]:grid-cols-2 md:grid-cols-3 lg:grid-cols-4">
         {logos.map((logo, i) => {
           const rank = i + 1;
-          const src = logo.isBuiltin ? `/logos/${logo.filename}` : (logo.imageUrl ?? null);
+          const src = logo.isBuiltin ? withBase(`/logos/${logo.filename}`) : (logo.imageUrl ?? null);
           return (
             <li key={logo.id} data-reveal style={{ "--d": Math.min(i, 8) } as CSSProperties} className={cn("group cm-logo", rank === 1 && "is-top")}>
               <div className="cm-checker relative grid h-44 place-items-center overflow-hidden border-b border-line">

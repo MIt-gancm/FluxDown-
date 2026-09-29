@@ -10,6 +10,7 @@ import { alphaOf, num, rgba, tokenAttrs } from "./tokens";
 import { PREVIEW_TASKS } from "./preview-data";
 import { DownloadsView, type DownloadsState } from "./DownloadsView";
 import { SettingsView } from "./SettingsView";
+import { withBase } from "@/lib/base";
 
 type MockMessages = ThemeBuilderMessages["mock"];
 
@@ -89,7 +90,7 @@ export function PreviewWindow({
       {/* 标题栏 */}
       <div className="flex h-10 shrink-0 items-center gap-3 border-b pl-3" style={{ borderColor: border }} {...tokenAttrs("colors.surface.surface1", "colors.border.default")}>
         <div className="flex shrink-0 items-center gap-2">
-          <img src="/logo.svg" alt="" className="h-4 w-4" />
+          <img src={withBase("/logo.svg")} alt="" className="h-4 w-4" />
           <span className="text-[12px] font-semibold">
             <span style={{ color: rgba(theme, "colors.accent.color") }} {...tokenAttrs("colors.accent.color")}>
               Flux

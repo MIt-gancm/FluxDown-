@@ -6,6 +6,7 @@ import { ArrowLeft, ArrowRight, History, Languages, SquarePen } from "lucide-rea
 import type { DocsNavItem } from "@/lib/docs-nav";
 import type { Lang } from "@/i18n/config";
 import { docs } from "@/i18n/messages/docs";
+import { withBase } from "@/lib/base";
 
 interface Props {
   prev: DocsNavItem | null;
@@ -44,7 +45,7 @@ const t = docs[lang];
     (prev || next) && (
       <nav class="docs-pager cells" aria-label={t.pagination}>
         {prev ? (
-          <a href={prev.href} rel="prev" class="docs-pager-link spot">
+          <a href={withBase(prev.href)} rel="prev" class="docs-pager-link spot">
             <span class="eyebrow-plain">
               <ArrowLeft size={12} aria-hidden="true" />
               {t.prev}
@@ -55,7 +56,7 @@ const t = docs[lang];
           <span class="docs-pager-empty" aria-hidden="true" />
         )}
         {next ? (
-          <a href={next.href} rel="next" class="docs-pager-link docs-pager-next spot">
+          <a href={withBase(next.href)} rel="next" class="docs-pager-link docs-pager-next spot">
             <span class="eyebrow-plain">
               {t.next}
               <ArrowRight size={12} aria-hidden="true" />

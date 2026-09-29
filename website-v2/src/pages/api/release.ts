@@ -38,6 +38,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
+import { withBase } from "@/lib/base";
 
 export const prerender = false;
 
@@ -396,8 +397,8 @@ export const GET: APIRoute = async ({ url }) => {
         // 使用我们自己的代理下载端点，避免前端直接访问 GitHub；
         // 资产不在最新客户端 release 中时（如独立扩展 release）带 tag 定位
         download_url: tag
-          ? `/api/download/${asset.name}?tag=${encodeURIComponent(tag)}`
-          : `/api/download/${asset.name}`,
+          ? withBase(`/api/download/${asset.name}?tag=${encodeURIComponent(tag)}`)
+          : withBase(`/api/download/${asset.name}`),
       };
     };
 

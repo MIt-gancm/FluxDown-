@@ -7,6 +7,7 @@ import { BrandIcon } from "@/components/icons/brand";
 import { download } from "@/i18n/messages/download";
 import type { Lang } from "@/i18n/config";
 import { GITHUB_URL } from "@/lib/site-nav";
+import { withBase } from "@/lib/base";
 
 interface Props {
   lang: Lang;
@@ -15,8 +16,8 @@ const { lang } = Astro.props;
 const t = download[lang];
 const fallback = `${GITHUB_URL}/releases`;
 const title = t.server.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif">$1</span>');
-const setupGuide = `/docs/${lang}/headless-server/setup/`;
-const dockerGuide = `/docs/${lang}/headless-server/docker/`;
+const setupGuide = withBase(`/docs/${lang}/headless-server/setup/`);
+const dockerGuide = withBase(`/docs/${lang}/headless-server/docker/`);
 
 const IMAGE = "ghcr.io/zerx-lab/fluxdown-server:latest";
 const RUN = `docker run -d --name fluxdown-server \\

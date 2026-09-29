@@ -7,6 +7,7 @@
 import type { APIRoute, GetStaticPaths } from "astro";
 import { getCollection } from "astro:content";
 import { buildDocsNav, type DocsLang } from "../../lib/docs-nav";
+import { withBase } from "@/lib/base";
 
 export const prerender = true;
 
@@ -48,7 +49,7 @@ export const GET: APIRoute = async ({ params }) => {
     );
     return {
       slug,
-      href: `/docs/${lang}/${slug}/`,
+      href: withBase(`/docs/${lang}/${slug}/`),
       title: titleBySlug.get(slug) ?? entry.data.title,
       section: e.data.section,
       description: entry.data.description ?? "",

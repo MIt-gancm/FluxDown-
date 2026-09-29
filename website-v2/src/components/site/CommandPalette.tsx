@@ -9,6 +9,7 @@ import { common } from "@/i18n/messages/common";
 import type { Lang } from "@/i18n/config";
 import { searchDocs, type SearchDoc } from "@/lib/docs-search";
 import { GITHUB_URL } from "@/lib/site-nav";
+import { withBase } from "@/lib/base";
 
 interface PaletteLink {
   label: string;
@@ -47,7 +48,7 @@ export default function CommandPalette({ lang, links, altLangHref }: Props) {
     dialog.showModal();
     requestAnimationFrame(() => inputRef.current?.focus());
     if (!docs) {
-      fetch(`/docs/search-${lang}.json`)
+      fetch(withBase(`/docs/search-${lang}.json`))
         .then((res) => (res.ok ? res.json() : []))
         .then((data: SearchDoc[]) => setDocs(data))
         .catch(() => setDocs([]));

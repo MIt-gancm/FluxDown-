@@ -5,6 +5,7 @@ import PageHeader from "@/components/site/PageHeader.astro";
 import PricingVote from "@/components/pricing/vote/PricingVote";
 import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
 import { pricingVote } from "@/i18n/messages/pricingVote";
+import { withBase } from "@/lib/base";
 
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
@@ -26,8 +27,8 @@ const returnTo = encodeURIComponent(href("/pricing/vote", lang));
     <PricingVote
       client:load
       lang={lang}
-      loginUrl={`/api/auth/github?returnTo=${returnTo}`}
-      logoutUrl={`/api/auth/logout?returnTo=${returnTo}`}
+      loginUrl={withBase(`/api/auth/github?returnTo=${returnTo}`)}
+      logoutUrl={withBase(`/api/auth/logout?returnTo=${returnTo}`)}
     />
     <div class="rule"></div>
   </div>

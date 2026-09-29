@@ -6,6 +6,7 @@
 import { X } from "lucide-react";
 import { common } from "../../i18n/messages/common";
 import type { Lang } from "../../i18n/config";
+import { withBase } from "@/lib/base";
 
 interface Props {
   lang: Lang;
@@ -23,8 +24,8 @@ const { lang } = Astro.props;
       playsinline
       controls
       preload="none"
-      poster={`/film/fluxdown-film-${lang}.jpg`}
-      data-src={`/film/fluxdown-film-${lang}.mp4`}></video>
+      poster={withBase(`/film/fluxdown-film-${lang}.jpg`)}
+      data-src={withBase(`/film/fluxdown-film-${lang}.mp4`)}></video>
   </div>
 </dialog>
 

@@ -5,6 +5,7 @@ import { sponsor } from "@/i18n/messages/sponsor";
 import Dialog from "@/components/pay/Dialog";
 import { QrTile, WechatBadge } from "@/components/pay/WechatQr";
 import { SPONSOR_WALL_URL } from "./wall";
+import { withBase } from "@/lib/base";
 
 /**
  * Pay-what-you-want sponsorship (zerx pay gateway):
@@ -63,7 +64,7 @@ export default function WechatSponsor({ lang }: { lang: Lang }) {
           return;
         }
         try {
-          const res = await fetch(`/api/pay/status?outTradeNo=${encodeURIComponent(outTradeNo)}`);
+          const res = await fetch(withBase(`/api/pay/status?outTradeNo=${encodeURIComponent(outTradeNo)}`));
           if (res.ok) {
             const data = (await res.json()) as { paid?: boolean };
             if (data.paid) {
@@ -71,7 +72,7 @@ export default function WechatSponsor({ lang }: { lang: Lang }) {
               // Anonymous sponsors are recorded too (server falls back to a default name).
               // Fire-and-forget: the thank-you screen never waits on GitHub.
               setWallQueued(true);
-              void fetch("/api/sponsor/wall", {
+              void fetch(withBase("/api/sponsor/wall"), {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
@@ -100,7 +101,7 @@ export default function WechatSponsor({ lang }: { lang: Lang }) {
     setWallQueued(false);
     setPay({ phase: "creating" });
     try {
-      const res = await fetch("/api/pay/create", {
+      const res = await fetch(withBase("/api/pay/create"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ amountCents: Math.round(amountYuan * 100), subject: "Support FluxDown" }),

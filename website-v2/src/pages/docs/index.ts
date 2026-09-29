@@ -4,6 +4,7 @@
  */
 import type { APIRoute } from "astro";
 import { parseAcceptLanguage } from "@/lib/locale-detect";
+import { withBase } from "@/lib/base";
 
 export const prerender = false;
 
@@ -11,5 +12,5 @@ export const GET: APIRoute = ({ cookies, request, redirect }) => {
   const cookie = cookies.get("fluxdown-locale")?.value;
   const lang =
     cookie === "zh" || cookie === "en" ? cookie : parseAcceptLanguage(request.headers.get("accept-language"));
-  return redirect(`/docs/${lang}/`, 302);
+  return redirect(withBase(`/docs/${lang}/`), 302);
 };

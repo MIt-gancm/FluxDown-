@@ -10,6 +10,7 @@ import { feedback } from "@/i18n/messages/feedback";
 import { roadmap } from "@/i18n/messages/roadmap";
 import { cn } from "@/lib/utils";
 import { Notice, Placeholder, Spinner, formatDate } from "./shared";
+import { withBase } from "@/lib/base";
 
 interface Feature {
   id: number;
@@ -86,7 +87,7 @@ export default function FeatureVote({ lang, onOpen }: { lang: Lang; onOpen: (n: 
   }, []);
 
   const refetch = useCallback(async (bust = false) => {
-    const res = await fetch(bust ? `/api/feature-vote?t=${Date.now()}` : "/api/feature-vote");
+    const res = await fetch(withBase(bust ? `/api/feature-vote?t=${Date.now()}` : "/api/feature-vote"));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const fresh = (await res.json()) as FeatureList;
     setData(fresh);
@@ -121,7 +122,7 @@ export default function FeatureVote({ lang, onOpen }: { lang: Lang; onOpen: (n: 
     setVoted((ids) => flip(ids, !had));
     let ok = false;
     try {
-      const res = await fetch("/api/feature-vote", {
+      const res = await fetch(withBase("/api/feature-vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: had ? "unvote" : "vote", featureId: feature.id }),
@@ -147,7 +148,7 @@ export default function FeatureVote({ lang, onOpen }: { lang: Lang; onOpen: (n: 
     if (!trimmed || proposing) return;
     setProposing(true);
     try {
-      const res = await fetch("/api/feature-vote", {
+      const res = await fetch(withBase("/api/feature-vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "propose", title: trimmed, description: desc.trim() }),

@@ -4,6 +4,7 @@ import type { Lang } from "@/i18n/config";
 import { pricingVote } from "@/i18n/messages/pricingVote";
 import { BrandIcon } from "@/components/icons/brand";
 import { formatDate } from "@/components/pay/money";
+import { withBase } from "@/lib/base";
 
 export interface PollComment {
   login: string;
@@ -48,7 +49,7 @@ export default function Discussion({ lang, viewer, comments, issueUrl, loginUrl,
     setPosting(true);
     setStatus(null);
     try {
-      const res = await fetch("/api/pricing-vote", {
+      const res = await fetch(withBase("/api/pricing-vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "comment", message: trimmed }),

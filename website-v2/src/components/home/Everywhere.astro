@@ -6,6 +6,7 @@ import { Code } from "astro:components";
 import { ArrowUpRight } from "lucide-react";
 import { home } from "../../i18n/messages/home";
 import type { Lang } from "../../i18n/config";
+import { withBase } from "@/lib/base";
 
 interface Props {
   lang: Lang;
@@ -136,7 +137,7 @@ fluxdown add https://example.com/file.zip --local`,
             </div>
             <aside class="ev-note">
               <p class="text-[14.5px] leading-relaxed text-muted">{t.notes[tab.id]}</p>
-              <a href={`/docs/${lang}/${tab.doc}/`} class="link inline-flex items-center gap-1 text-[13.5px]">
+              <a href={withBase(`/docs/${lang}/${tab.doc}/`)} class="link inline-flex items-center gap-1 text-[13.5px]">
                 docs/{tab.doc}
                 <ArrowUpRight size={13} strokeWidth={2} />
               </a>

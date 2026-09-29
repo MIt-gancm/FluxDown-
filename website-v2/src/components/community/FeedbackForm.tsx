@@ -9,6 +9,7 @@ import type { Lang } from "@/i18n/config";
 import { feedback } from "@/i18n/messages/feedback";
 import { cn } from "@/lib/utils";
 import { Notice, Spinner } from "./shared";
+import { withBase } from "@/lib/base";
 
 type FeedbackType = "feature" | "bug" | "other";
 
@@ -99,7 +100,7 @@ export default function FeedbackForm({ lang, onSuccess }: { lang: Lang; onSucces
     setStatus("submitting");
     setErrorMsg("");
     try {
-      const res = await fetch("/api/feedback", {
+      const res = await fetch(withBase("/api/feedback"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

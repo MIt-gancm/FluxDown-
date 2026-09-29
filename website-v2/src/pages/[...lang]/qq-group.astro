@@ -6,6 +6,7 @@ import JoinSteps from "@/components/community/JoinSteps.astro";
 import { BrandIcon } from "@/components/icons/brand";
 import { langStaticPaths, resolveLang } from "@/i18n/routing";
 import { groups } from "@/i18n/messages/groups";
+import { withBase } from "@/lib/base";
 
 export const getStaticPaths = langStaticPaths;
 const lang = resolveLang(Astro.params.lang);
@@ -22,7 +23,7 @@ const QQ_GROUP_NUMBER = "832143651";
         <figure class="fig w-full max-w-[320px]" data-reveal>
           <figcaption class="fig-bar"><span>fig. 01</span><span>{t.figCaption}</span></figcaption>
           <div class="grid place-items-center bg-white p-5">
-            <img src="/qq-group.png" alt={t.qrAlt} width="371" height="368" class="aspect-square w-full max-w-[240px]" />
+            <img src={withBase("/qq-group.png")} alt={t.qrAlt} width="371" height="368" class="aspect-square w-full max-w-[240px]" />
           </div>
         </figure>
       </div>

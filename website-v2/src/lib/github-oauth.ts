@@ -10,6 +10,7 @@ import {
   GITHUB_OAUTH_CLIENT_ID,
   GITHUB_OAUTH_CLIENT_SECRET,
 } from "astro:env/server";
+import { withBase } from "@/lib/base";
 
 export const SESSION_COOKIE = "fluxdown_gh_session";
 export const STATE_COOKIE = "fluxdown_gh_oauth_state";
@@ -41,7 +42,7 @@ export function oauthClientSecret(): string {
  */
 export function oauthCallbackUrl(url: URL, site: URL | undefined): string {
   const origin = import.meta.env.PROD && site ? site.origin : url.origin;
-  return `${origin}/api/auth/github/callback`;
+  return `${origin}${withBase("/api/auth/github/callback")}`;
 }
 
 export function randomState(): string {
@@ -105,5 +106,5 @@ export function clearSession(cookies: AstroCookies): void {
 /** returnTo 只允许站内相对路径，防开放跳转 */
 export function safeReturnTo(raw: string | null): string {
   if (raw && raw.startsWith("/") && !raw.startsWith("//")) return raw;
-  return "/pricing";
+  return withBase("/pricing/");
 }

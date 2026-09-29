@@ -10,6 +10,7 @@ import { BrandIcon } from "@/components/icons/brand";
 import { SECTION_ICONS, docsAlternates, docsRepoTree } from "@/components/docs/meta";
 import { buildDocsNav, type DocsLang } from "@/lib/docs-nav";
 import { docs } from "@/i18n/messages/docs";
+import { withBase } from "@/lib/base";
 
 export const prerender = true;
 
@@ -40,7 +41,7 @@ const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif"
         <h1 class="h2" data-reveal set:html={titleHtml} />
         <p class="lede max-w-[58ch]" data-reveal style="--d:1">{t.index.lede}</p>
         <div class="flex flex-wrap gap-3" data-reveal style="--d:2">
-          <a href={firstPage} class="btn btn-primary">
+          <a href={withBase(firstPage)} class="btn btn-primary">
             {t.index.start}
             <ArrowRight size={15} aria-hidden="true" />
           </a>
@@ -76,7 +77,7 @@ const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif"
               <ul class="docs-card-links">
                 {group.items.map((item) => (
                   <li>
-                    <a href={item.href}>
+                    <a href={withBase(item.href)}>
                       <span>{item.title}</span>
                       {item.fallback && (
                         <span class="docs-card-tag" title={t.nav.untranslatedTitle}>
@@ -104,11 +105,11 @@ const titleHtml = t.index.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif"
         <p class="mt-3 text-[15px] leading-relaxed text-muted">{t.index.communityBody}</p>
       </div>
       <div class="flex shrink-0 flex-wrap gap-3">
-        <a href={`/docs/${lang}/contributing/translations/`} class="btn btn-secondary">
+        <a href={withBase(`/docs/${lang}/contributing/translations/`)} class="btn btn-secondary">
           {t.index.translate}
           <ArrowUpRight size={14} aria-hidden="true" />
         </a>
-        <a href={`/docs/${lang}/contributing/docs/`} class="btn btn-ghost">
+        <a href={withBase(`/docs/${lang}/contributing/docs/`)} class="btn btn-ghost">
           {t.index.guide}
           <ArrowRight size={14} aria-hidden="true" />
         </a>

@@ -13,6 +13,7 @@ import { SECTIONS } from "@/lib/docs-nav";
 import type { Lang } from "@/i18n/config";
 import { docs as messages } from "@/i18n/messages/docs";
 import { cn } from "@/lib/utils";
+import { withBase } from "@/lib/base";
 
 interface Props {
   lang: Lang;
@@ -27,7 +28,7 @@ const indexCache = new Map<Lang, Promise<SearchDoc[]>>();
 function loadIndex(lang: Lang): Promise<SearchDoc[]> {
   let pending = indexCache.get(lang);
   if (!pending) {
-    pending = fetch(`/docs/search-${lang}.json`).then((res) => {
+    pending = fetch(withBase(`/docs/search-${lang}.json`)).then((res) => {
       if (!res.ok) throw new Error(String(res.status));
       return res.json() as Promise<SearchDoc[]>;
     });

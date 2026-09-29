@@ -8,6 +8,7 @@ import type { Lang } from "@/i18n/config";
 import { polls } from "@/i18n/messages/polls";
 import { cn } from "@/lib/utils";
 import { Notice, Placeholder, Spinner } from "./shared";
+import { withBase } from "@/lib/base";
 
 type Option = "wechat" | "qq" | "official-account";
 
@@ -34,7 +35,7 @@ export default function PlatformPoll({ lang }: { lang: Lang }) {
     } catch {
       // localStorage 不可用
     }
-    fetch("/api/vote")
+    fetch(withBase("/api/vote"))
       .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
       .then(setResults)
       .catch(() => setLoadError(true));
@@ -45,7 +46,7 @@ export default function PlatformPoll({ lang }: { lang: Lang }) {
     setSubmitting(option);
     setFlash(null);
     try {
-      const res = await fetch("/api/vote", {
+      const res = await fetch(withBase("/api/vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ option }),

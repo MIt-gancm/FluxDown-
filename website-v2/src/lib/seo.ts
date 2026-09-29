@@ -9,8 +9,12 @@
  *
  * 用法:`buildGraph()` 生成首页/全站实体图;`buildSoftwareOffer()` 复用软件报价片段。
  */
+import { BASE } from "@/lib/base";
 
-export const SITE_URL = "https://fluxdown.zerx.dev";
+/** 站点源(不含挂载前缀);与已带前缀的路径(`href()` / `Astro.url.pathname`)拼接用它。 */
+export const SITE_ORIGIN = "https://fluxdown.zerx.dev";
+/** 站点根 URL(含挂载前缀);与无前缀的站点路径拼接用它。 */
+export const SITE_URL = `${SITE_ORIGIN}${BASE}`;
 export const SITE_NAME = "FluxDown";
 
 /** 稳定的实体 @id 锚点(URI fragment 形式,全站唯一且不随页面变化)。 */

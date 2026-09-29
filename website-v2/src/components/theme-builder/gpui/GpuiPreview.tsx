@@ -47,6 +47,7 @@ import type { ThemeBuilderMessages } from "@/i18n/messages/themeBuilder";
 import { cn } from "@/lib/utils";
 import { tokenAttrs } from "../tokens";
 import { cssVariables, v } from "./model";
+import { withBase } from "@/lib/base";
 
 type PreviewMessages = ThemeBuilderMessages["gpuiMock"];
 
@@ -423,7 +424,7 @@ export function GpuiPreview({
         {...tokenAttrs("density.titleBar", "colors.chrome", "colors.hairline", "stroke.thin")}
       >
         <div className="flex shrink-0 items-center" style={{ gap: v("spacing.sm") }}>
-          <img src="/logo.svg" alt="" className="h-4 w-4" />
+          <img src={withBase("/logo.svg")} alt="" className="h-4 w-4" />
           <span style={{ ...text("sm"), fontWeight: v("typography.title.weight") }}>FluxDown</span>
         </div>
         <div className="flex min-w-0 flex-1 justify-center">

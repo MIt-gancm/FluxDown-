@@ -5,6 +5,7 @@ import type { Lang } from "@/i18n/config";
 import { feedback } from "@/i18n/messages/feedback";
 import { roadmap } from "@/i18n/messages/roadmap";
 import { LabelChip, Placeholder, formatDate } from "./shared";
+import { withBase } from "@/lib/base";
 
 type Status = "planned" | "in-progress" | "done";
 
@@ -40,7 +41,7 @@ export default function Roadmap({ lang, onOpen }: { lang: Lang; onOpen: (n: numb
   const [error, setError] = useState(false);
 
   useEffect(() => {
-    fetch("/api/roadmap")
+    fetch(withBase("/api/roadmap"))
       .then((r) => (r.ok ? (r.json() as Promise<RoadmapData>) : Promise.reject(r.status)))
       .then(setData)
       .catch(() => setError(true));

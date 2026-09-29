@@ -36,10 +36,11 @@ const stats = [
 </section>
 
 <script>
+  import { withBase } from "@/lib/base";
   import { observeAll } from "../../scripts/motion";
   const el = document.querySelector<HTMLElement>('[data-stat="downloads"]');
   if (el) {
-    fetch("/api/release")
+    fetch(withBase("/api/release"))
       .then((res) => (res.ok ? res.json() : null))
       .then((data: { total_downloads?: number } | null) => {
         const total = data?.total_downloads;

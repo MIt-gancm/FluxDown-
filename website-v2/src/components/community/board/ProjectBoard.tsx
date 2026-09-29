@@ -10,6 +10,7 @@ import { Placeholder, Tabs } from "../shared";
 import BoardColumns from "./BoardColumns";
 import BoardTable from "./BoardTable";
 import { matchesFilter, matchesSearch, type BoardData } from "./model";
+import { withBase } from "@/lib/base";
 
 export default function ProjectBoard({ lang, onOpen }: { lang: Lang; onOpen: (n: number) => void }) {
   const t = feedback[lang].board;
@@ -21,7 +22,7 @@ export default function ProjectBoard({ lang, onOpen }: { lang: Lang; onOpen: (n:
   const timer = useRef<number>(undefined);
 
   useEffect(() => {
-    fetch("/api/project-board")
+    fetch(withBase("/api/project-board"))
       .then((r) => (r.ok ? (r.json() as Promise<BoardData>) : Promise.reject(r.status)))
       .then(setData)
       .catch(() => setError(true));

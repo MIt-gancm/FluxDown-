@@ -6,6 +6,7 @@ import { BrandIcon } from "@/components/icons/brand";
 import { download } from "@/i18n/messages/download";
 import type { Lang } from "@/i18n/config";
 import { GITHUB_URL } from "@/lib/site-nav";
+import { withBase } from "@/lib/base";
 
 interface Props {
   lang: Lang;
@@ -36,7 +37,7 @@ const android: RowSpec[] = [
   <div class="cells tools">
     <AssetGroup lang={lang} id="cli" title={t.cli.title} desc={t.cli.desc} versionPath="cli.version" fallback={fallback} rows={cli}>
       <Fragment slot="icon"><SquareTerminal size={16} strokeWidth={1.75} /></Fragment>
-      <a class="link mt-auto self-start text-[13px]" href={`/docs/${lang}/api/cli/`}>{t.cli.docs}</a>
+      <a class="link mt-auto self-start text-[13px]" href={withBase(`/docs/${lang}/api/cli/`)}>{t.cli.docs}</a>
     </AssetGroup>
     <AssetGroup lang={lang} id="android" os="android" title={t.android.title} desc={t.android.desc} versionPath="mobile.version" fallback={fallback} rows={android} notifyHref="#subscribe">
       <Fragment slot="icon"><BrandIcon name="android" size={16} /></Fragment>
