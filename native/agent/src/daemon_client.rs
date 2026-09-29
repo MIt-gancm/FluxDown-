@@ -236,6 +236,27 @@ impl DaemonClient {
             cancel: CancellationToken::new(),
         }
     }
+
+    /// 已连接的客户端：记录每次调用的方法与参数并回 `{}`，供断言 agent 发给 daemon 的命令。
+    pub(crate) fn recording() -> (Self, Arc<tokio::sync::Mutex<Vec<(String, Option<Value>)>>>) {
+        let (commands, mut receiver) = mpsc::channel::<ClientCommand>(16);
+        let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        tokio::spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                sink.lock().await.push((command.method, command.params));
+                let _ = command.ack.send(Ok(Value::Object(serde_json::Map::new())));
+            }
+        });
+        let client = Self {
+            commands,
+            connected: Arc::new(AtomicBool::new(true)),
+            settled: Arc::new(AtomicBool::new(true)),
+            ready: Arc::new(Notify::new()),
+            cancel: CancellationToken::new(),
+        };
+        (client, calls)
+    }
 }
 
 /// 本进程刚拉起、仍存活但尚未监听的 daemon 按短间隔轮询（约 10s）：冷启动 daemon 通常

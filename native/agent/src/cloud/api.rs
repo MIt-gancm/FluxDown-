@@ -60,16 +60,6 @@ impl CloudApi {
             .await
     }
 
-    /// `DELETE /tasks/{id}`：删除终态远程任务记录（非终态 409 `task_state_conflict`）。
-    pub async fn delete_remote_task(&self, id: &str) -> Result<Value, CloudError> {
-        self.authed(
-            Method::DELETE,
-            &format!("/api/v1/tasks/{}", encode(id)),
-            None::<&Value>,
-        )
-        .await
-    }
-
     pub async fn dispatch_remote<P: Serialize>(&self, body: &P) -> Result<Value, CloudError> {
         self.authed(Method::POST, "/api/v1/tasks/dispatch", Some(body))
             .await

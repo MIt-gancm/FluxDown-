@@ -56,7 +56,7 @@ impl DispatchSummary {
 
 /// 远程任务行是否可以执行该动作。云端状态未知（旧客户端不认识的新状态）的任务不控制；
 /// 暂停只适用于未结束且未暂停的任务，继续只适用于已暂停的任务，删除对任何已知状态有效
-/// （终态删除记录，进行中通知目标设备删除）。
+/// （云端直接删除记录，目标设备据此删除其本地任务，不要求目标在线）。
 #[must_use]
 pub(crate) fn remote_action_applies(status: RemoteTaskStatus, action: RemoteCommandAction) -> bool {
     match (status, action) {

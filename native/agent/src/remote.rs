@@ -10,7 +10,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fluxdown_protocol::{
     AgentEvent, CloudDevice, CreateTaskRequest, DaemonCreateTaskParams, DaemonEvent, ErrorReason,
@@ -92,6 +92,9 @@ struct Runtime {
     confirmed_commands: BoundedIds,
     /// daemon 任务的实时速度（快照不携带，取自 `TaskProgress` 事件）。
     local_speeds: HashMap<String, i64>,
+    /// 本进程内建立绑定的时刻。快照请求发出之后才建立的绑定不能凭「快照里没有」判定记录已删除
+    /// （任务可能在该快照之后才下发）；没有条目 = 启动前持久化的旧绑定。
+    bound_at: HashMap<String, Instant>,
 }
 
 pub struct RemoteTaskService {
@@ -339,7 +342,13 @@ impl RemoteTaskService {
         {
             "task.dispatch" | "task.status" => {
                 let task = serde_json::from_value::<RemoteTaskDto>(event)?;
+                let canceled_here = task.status == RemoteTaskStatus::Canceled
+                    && task.to_device == self.local_device_id().await;
+                let remote_id = task.id.clone();
                 self.upsert_task(task).await?;
+                if canceled_here {
+                    self.discard_local_task(&remote_id).await;
+                }
                 self.rebuild_bindings().await;
                 self.accept_pending_dispatches().await;
             }
@@ -365,7 +374,7 @@ impl RemoteTaskService {
                 }
             }
             "task.removed" => {
-                // 某台设备删除了终态任务记录：从投影移除（同时解除可能残留的绑定）。
+                // 记录被删除（任意状态）：从投影移除；本设备正在执行它时删除本机任务。
                 if let Some(id) = event.get("taskId").and_then(Value::as_str) {
                     let mut tasks = self.tasks().await;
                     let before = tasks.len();
@@ -373,7 +382,7 @@ impl RemoteTaskService {
                     if tasks.len() != before {
                         self.replace_tasks(tasks, true).await?;
                     }
-                    self.remove_binding(id).await;
+                    self.discard_local_task(id).await;
                 }
             }
             "presence" | "device.updated" => {
@@ -442,6 +451,11 @@ impl RemoteTaskService {
             .await
             .remote_bindings
             .insert(remote_id.to_owned(), local_id.to_owned());
+        self.runtime
+            .lock()
+            .await
+            .bound_at
+            .insert(remote_id.to_owned(), Instant::now());
         if let Err(error) = self.store.persist(&self.state).await {
             tracing::warn!(error = %error, "persisting remote task binding failed");
         }
@@ -455,16 +469,58 @@ impl RemoteTaskService {
             .remote_bindings
             .remove(remote_id)
             .is_some();
+        self.runtime.lock().await.bound_at.remove(remote_id);
         if removed && let Err(error) = self.store.persist(&self.state).await {
             tracing::warn!(error = %error, "persisting remote task binding removal failed");
         }
+    }
+
+    /// 已有绑定，或按 URL / 文件名重建出的绑定（未接单 / 已终态的任务不会被重建）。
+    async fn resolve_binding(&self, remote_id: &str) -> Option<String> {
+        if let Some(local_id) = self.binding(remote_id).await {
+            return Some(local_id);
+        }
+        self.rebuild_bindings().await;
+        self.binding(remote_id).await
+    }
+
+    /// 云端已取消 / 删除本设备执行的任务：删除绑定的本机 daemon 任务并解除绑定。
+    ///
+    /// 保留已下载文件——目标离线期间发起端的 `deleteFiles` 选择送不到这里；本机已完成的任务不动。
+    /// daemon 暂时不可用时保留绑定，由下一次状态上报（404 / 409）或快照对照重试。
+    async fn discard_local_task(&self, remote_id: &str) {
+        let Some(local_id) = self.binding(remote_id).await else {
+            return;
+        };
+        // daemon 状态 3 = 已完成。
+        let completed = daemon_tasks(&self.events)
+            .iter()
+            .any(|task| task.task_id == local_id && task.status == 3);
+        if !completed {
+            tracing::info!(task = %remote_id, local = %local_id, "remote task was canceled or deleted in FluxCloud; removing the local task");
+            if let Err(error) = self
+                .daemon_task_call(
+                    fluxdown_protocol::method::DAEMON_TASK_DELETE,
+                    &local_id,
+                    false,
+                )
+                .await
+            {
+                if error.code == fluxdown_protocol::ApplicationErrorCode::Unavailable {
+                    tracing::warn!(task = %remote_id, "daemon is unavailable; will retry removing the local task");
+                    return;
+                }
+                tracing::warn!(task = %remote_id, error = ?error, "removing the local task of a canceled remote task failed");
+            }
+        }
+        self.remove_binding(remote_id).await;
     }
 
     async fn rebuild_bindings(&self) {
         let local_device = self.local_device_id().await;
         let local_tasks = daemon_tasks(&self.events);
         let remote_tasks = self.tasks().await;
-        let mut added = false;
+        let mut newly_bound = Vec::new();
         {
             let mut state = self.state.lock().await;
             let mut claimed = state
@@ -495,11 +551,21 @@ impl RemoteTaskService {
                         .remote_bindings
                         .insert(remote.id.clone(), local.task_id.clone());
                     claimed.insert(local.task_id.clone());
-                    added = true;
+                    newly_bound.push(remote.id.clone());
                 }
             }
         }
-        if added && let Err(error) = self.store.persist(&self.state).await {
+        if newly_bound.is_empty() {
+            return;
+        }
+        {
+            let now = Instant::now();
+            let mut runtime = self.runtime.lock().await;
+            for remote_id in newly_bound {
+                runtime.bound_at.insert(remote_id, now);
+            }
+        }
+        if let Err(error) = self.store.persist(&self.state).await {
             tracing::warn!(error = %error, "persisting rebuilt remote task bindings failed");
         }
     }
@@ -561,10 +627,14 @@ impl RemoteTaskService {
                             .reported_statuses
                             .insert(task.id.clone(), RemoteTaskStatus::Accepted);
                     }
-                    // 云端已不认识这个任务：解除绑定，本机任务保留给用户处理。
-                    Err(error) if matches!(error.status, Some(404)) => {
+                    // 接单期间记录已被删除：删除刚建的本机任务。
+                    Err(error) if error.status == Some(404) => {
                         tracing::info!(task = %task.id, "accepted task no longer exists in FluxCloud");
-                        self.remove_binding(&task.id).await;
+                        self.discard_local_task(&task.id).await;
+                    }
+                    // 接单期间已被取消。
+                    Err(error) if error.status == Some(409) => {
+                        self.resolve_status_conflict(&task.id).await;
                     }
                     // 其余失败：下一轮进度上报会带上真实状态。
                     Err(error) => {
@@ -744,9 +814,15 @@ impl RemoteTaskService {
                 self.resolve_status_conflict(remote_id).await;
                 Ok(())
             }
-            Err(error) if matches!(error.status, Some(403 | 404)) => {
-                // 云端已删除该任务 / 本设备不是它的目标：解除绑定，不再上报。
-                tracing::info!(task = %remote_id, status = ?error.status, "remote task no longer accepts reports from this device");
+            Err(error) if error.status == Some(404) => {
+                // 云端已删除该任务（离线期间被删除等）：删除本机任务并解除绑定。
+                tracing::info!(task = %remote_id, "remote task no longer exists in FluxCloud");
+                self.discard_local_task(remote_id).await;
+                Ok(())
+            }
+            Err(error) if error.status == Some(403) => {
+                // 本设备不是它的目标：解除绑定，不再上报。
+                tracing::info!(task = %remote_id, "remote task no longer accepts reports from this device");
                 self.remove_binding(remote_id).await;
                 Ok(())
             }
@@ -754,8 +830,8 @@ impl RemoteTaskService {
         }
     }
 
-    /// 上报状态遭遇 409：云端已经把任务终态化（例如目标离线期间被发起端取消）。
-    /// 云端为 `canceled` 时取消本机 daemon 任务（保留已下载文件），并解除绑定。
+    /// 上报状态遭遇 409：云端已经把任务终态化（例如被发起端取消）。云端为 `canceled` 或记录已
+    /// 不存在时删除本机任务（保留已下载文件），其余终态只解除绑定。
     async fn resolve_status_conflict(&self, remote_id: &str) {
         if let Err(error) = self.refresh_snapshot().await {
             tracing::warn!(task = %remote_id, error = %error, "refreshing tasks after a status conflict failed");
@@ -766,22 +842,11 @@ impl RemoteTaskService {
             .into_iter()
             .find(|task| task.id == remote_id)
             .map(|task| task.status);
-        if matches!(cloud_status, Some(RemoteTaskStatus::Canceled) | None)
-            && let Some(local_id) = self.binding(remote_id).await
-        {
-            tracing::info!(task = %remote_id, local = %local_id, "remote task was canceled in FluxCloud; removing the local task");
-            if let Err(error) = self
-                .daemon_task_call(
-                    fluxdown_protocol::method::DAEMON_TASK_DELETE,
-                    &local_id,
-                    false,
-                )
-                .await
-            {
-                tracing::warn!(task = %remote_id, error = ?error, "removing the local task of a canceled remote task failed");
-            }
+        if matches!(cloud_status, Some(RemoteTaskStatus::Canceled) | None) {
+            self.discard_local_task(remote_id).await;
+        } else {
+            self.remove_binding(remote_id).await;
         }
-        self.remove_binding(remote_id).await;
         // 之后不再重复上报同一状态。
         self.runtime.lock().await.reported_statuses.insert(
             remote_id.to_owned(),
@@ -790,27 +855,84 @@ impl RemoteTaskService {
     }
 
     /// 首次或重连后用完整 `/tasks/remote` 快照替换投影。
+    ///
+    /// 执行端同时据快照收敛本机任务：云端已 `canceled`，或快照请求发出前就已绑定、快照里却没有
+    /// （记录已被删除；云端快照从不截断未终态任务）的，删除本机任务——目标离线期间被取消 / 删除的
+    /// 任务在重连时收敛，不会继续在后台下载。
     pub async fn refresh_snapshot(&self) -> Result<Vec<RemoteTaskDto>, RemoteError> {
+        let requested_at = Instant::now();
         let value = self.cloud.remote_tasks().await?;
         let tasks = parse_task_list(&value);
-        let merged = self.apply_missing_grace(tasks).await;
-        {
+        let (stale, deleted) = self.stale_bindings(&tasks, requested_at).await;
+        for remote_id in &stale {
+            self.discard_local_task(remote_id).await;
+        }
+        let mut merged = self.apply_missing_grace(tasks).await;
+        merged.retain(|task| !deleted.contains(&task.id));
+        let bound = {
             let mut state = self.state.lock().await;
             state.remote_tasks.clone_from(&merged);
-            // 已终态 / 已被云端删除的任务不再需要绑定。
+            // 已终态 / 已被云端删除的任务不再需要绑定；本机任务删除失败（daemon 暂不可用）的保留重试。
             let live = merged
                 .iter()
                 .filter(|task| !task.status.is_terminal())
                 .map(|task| task.id.as_str())
+                .chain(stale.iter().map(String::as_str))
                 .collect::<HashSet<_>>();
             state
                 .remote_bindings
                 .retain(|remote_id, _| live.contains(remote_id.as_str()));
-        }
+            state
+                .remote_bindings
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>()
+        };
+        self.runtime
+            .lock()
+            .await
+            .bound_at
+            .retain(|remote_id, _| bound.contains(remote_id));
         self.store.persist(&self.state).await?;
         self.events
             .publish(AgentEvent::RemoteTasksChanged(merged.clone()));
         Ok(merged)
+    }
+
+    /// 快照对照本机绑定：返回（需要删除本机任务的绑定，其中记录已被删除的那部分）。
+    /// 快照请求发出之后才建立的绑定不凭缺失判定——任务可能在该快照之后才下发。
+    async fn stale_bindings(
+        &self,
+        snapshot: &[RemoteTaskDto],
+        requested_at: Instant,
+    ) -> (Vec<String>, HashSet<String>) {
+        let bound = self
+            .state
+            .lock()
+            .await
+            .remote_bindings
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let runtime = self.runtime.lock().await;
+        let mut stale = Vec::new();
+        let mut deleted = HashSet::new();
+        for remote_id in bound {
+            match snapshot.iter().find(|task| task.id == remote_id) {
+                Some(task) if task.status == RemoteTaskStatus::Canceled => stale.push(remote_id),
+                Some(_) => {}
+                None if runtime
+                    .bound_at
+                    .get(&remote_id)
+                    .is_none_or(|bound_at| *bound_at < requested_at) =>
+                {
+                    deleted.insert(remote_id.clone());
+                    stale.push(remote_id);
+                }
+                None => {}
+            }
+        }
+        (stale, deleted)
     }
 
     pub async fn local_device_id(&self) -> String {
@@ -895,8 +1017,10 @@ impl RemoteTaskService {
 
     /// 远程任务控制。
     ///
-    /// - 目标是本机：映射到 daemon（cancel 不删文件，delete 按 `delete_files`）并上报 `canceled`；
-    /// - 目标是其他设备：`delete` 对终态任务删除云端记录，其余动作经云端下发；
+    /// - pause / resume：目标是本机时直接映射到 daemon；否则经云端转发（目标离线时云端 409）。
+    /// - cancel / delete：目标是本机且已接单时先处理本机任务（delete 按 `delete_files`），再交给云端
+    ///   落库。云端不依赖目标在线判定：cancel 置 `canceled`，delete 删除任何状态的记录；执行端据
+    ///   持久态收敛本机任务。delete 成功后立即从投影移除该行。
     /// - `command_id` 缺省生成唯一值，同一动作可重复下发；相同 id 只执行一次。
     pub async fn command(&self, params: RemoteCommandParams) -> Result<(), RemoteError> {
         let command_id = params
@@ -922,38 +1046,45 @@ impl RemoteTaskService {
         if task.status == RemoteTaskStatus::Unknown {
             return Err(RemoteError::TaskUnavailable(task.id));
         }
-        let local_device = self.local_device_id().await;
-        if task.to_device == local_device {
-            self.execute_local_command(IncomingCommand {
-                task_id: task.id.clone(),
-                action: params.action,
-                command_id: command_id.clone(),
-                delete_files: params.delete_files,
-            })
-            .await?;
-            return Ok(());
-        }
-        if params.action == RemoteCommandAction::Delete && task.status.is_terminal() {
-            match self.cloud.delete_remote_task(&task.id).await {
-                Ok(_) => {}
-                // 已经被删除：目标达成。
-                Err(error) if error.status == Some(404) => {}
-                Err(error) => return Err(RemoteError::Cloud(error)),
+        let local_target = task.to_device == self.local_device_id().await;
+        let local_command = IncomingCommand {
+            task_id: task.id.clone(),
+            action: params.action,
+            command_id: command_id.clone(),
+            delete_files: params.delete_files,
+        };
+        match params.action {
+            RemoteCommandAction::Pause | RemoteCommandAction::Resume if local_target => {
+                return self.execute_local_command(local_command).await;
             }
+            // 同一个 command id 已记入去重窗口：云端回显给本机的 `task.command` 不会再执行一次。
+            RemoteCommandAction::Cancel | RemoteCommandAction::Delete if local_target => {
+                self.execute_local_command(local_command).await?;
+            }
+            _ => {}
+        }
+        let sent = self
+            .cloud
+            .command_remote(
+                &task.id,
+                &json!({
+                    "action": action_wire(params.action),
+                    "commandId": command_id,
+                    "deleteFiles": params.delete_files,
+                }),
+            )
+            .await;
+        match sent {
+            Ok(_) => {}
+            // 记录已被别的设备删除：删除的目标已达成。
+            Err(error)
+                if params.action == RemoteCommandAction::Delete && error.status == Some(404) => {}
+            Err(error) => return Err(RemoteError::Cloud(error)),
+        }
+        if params.action == RemoteCommandAction::Delete {
             let mut tasks = self.tasks().await;
             tasks.retain(|existing| existing.id != task.id);
             self.replace_tasks(tasks, true).await?;
-        } else {
-            self.cloud
-                .command_remote(
-                    &task.id,
-                    &json!({
-                        "action": action_wire(params.action),
-                        "commandId": command_id,
-                        "deleteFiles": params.delete_files,
-                    }),
-                )
-                .await?;
         }
         self.runtime
             .lock()
@@ -963,7 +1094,9 @@ impl RemoteTaskService {
         Ok(())
     }
 
-    /// 执行端：把云端命令映射到本机 daemon；命令 id 只在执行成功后记入去重窗口。
+    /// 执行端：把命令映射到本机 daemon；命令 id 只在执行成功后记入去重窗口。
+    /// cancel / delete 遇到没有本机任务的远程任务（尚未接单 / 已处理过）直接成功：
+    /// 云端记录由指令发起方落库，这里没有要删的东西。
     async fn execute_local_command(&self, command: IncomingCommand) -> Result<(), RemoteError> {
         if self
             .runtime
@@ -974,40 +1107,55 @@ impl RemoteTaskService {
         {
             return Ok(());
         }
-        let mut local_id = self.binding(&command.task_id).await;
-        if local_id.is_none() {
-            self.rebuild_bindings().await;
-            local_id = self.binding(&command.task_id).await;
-        }
-        let Some(local_id) = local_id else {
-            return Err(RemoteError::Protocol(format!(
-                "no local task is bound to remote task {}",
-                command.task_id
-            )));
-        };
-        let (method, delete_files) = match command.action {
-            RemoteCommandAction::Pause => (fluxdown_protocol::method::DAEMON_TASK_PAUSE, false),
-            RemoteCommandAction::Resume => (fluxdown_protocol::method::DAEMON_TASK_RESUME, false),
-            RemoteCommandAction::Cancel => (fluxdown_protocol::method::DAEMON_TASK_DELETE, false),
-            RemoteCommandAction::Delete => (
-                fluxdown_protocol::method::DAEMON_TASK_DELETE,
-                command.delete_files,
-            ),
-        };
-        self.daemon_task_call(method, &local_id, delete_files)
-            .await
-            .map_err(RemoteError::Daemon)?;
-        if matches!(
+        let finalizes = matches!(
             command.action,
             RemoteCommandAction::Cancel | RemoteCommandAction::Delete
-        ) {
-            if let Err(error) = self
-                .report_status_if_changed(&command.task_id, RemoteTaskStatus::Canceled, None, None)
-                .await
-            {
-                tracing::warn!(task = %command.task_id, error = %error, "reporting canceled status failed");
+        );
+        match self.resolve_binding(&command.task_id).await {
+            Some(local_id) => {
+                let (method, delete_files) = match command.action {
+                    RemoteCommandAction::Pause => {
+                        (fluxdown_protocol::method::DAEMON_TASK_PAUSE, false)
+                    }
+                    RemoteCommandAction::Resume => {
+                        (fluxdown_protocol::method::DAEMON_TASK_RESUME, false)
+                    }
+                    RemoteCommandAction::Cancel => {
+                        (fluxdown_protocol::method::DAEMON_TASK_DELETE, false)
+                    }
+                    RemoteCommandAction::Delete => (
+                        fluxdown_protocol::method::DAEMON_TASK_DELETE,
+                        command.delete_files,
+                    ),
+                };
+                self.daemon_task_call(method, &local_id, delete_files)
+                    .await
+                    .map_err(RemoteError::Daemon)?;
+                if finalizes {
+                    // 先解绑再上报：记录已被删除时上报得到 404，不会再去删一次本机任务。
+                    self.remove_binding(&command.task_id).await;
+                    if let Err(error) = self
+                        .report_status_if_changed(
+                            &command.task_id,
+                            RemoteTaskStatus::Canceled,
+                            None,
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(task = %command.task_id, error = %error, "reporting canceled status failed");
+                    }
+                }
             }
-            self.remove_binding(&command.task_id).await;
+            None if finalizes => {
+                tracing::debug!(task = %command.task_id, "no local task to remove for this remote task");
+            }
+            None => {
+                return Err(RemoteError::Protocol(format!(
+                    "no local task is bound to remote task {}",
+                    command.task_id
+                )));
+            }
         }
         self.runtime
             .lock()
@@ -1389,7 +1537,7 @@ mod tests {
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode, header};
     use axum::response::IntoResponse;
-    use axum::routing::{delete, get, post};
+    use axum::routing::{get, post};
     use fluxdown_protocol::{
         CloudDevice, PathStyle, RemoteCommandAction, RemoteCommandParams, RemoteDispatchParams,
         RemoteTaskDto, RemoteTaskStatus, TaskDto,
@@ -1651,7 +1799,6 @@ mod tests {
         presence: AtomicUsize,
         commands: Mutex<Vec<Value>>,
         statuses: Mutex<Vec<(String, Value)>>,
-        deletes: Mutex<Vec<String>>,
     }
 
     async fn mock_remote_snapshot(State(state): State<Arc<RemoteMockState>>) -> impl IntoResponse {
@@ -1701,19 +1848,15 @@ mod tests {
         StatusCode::NO_CONTENT
     }
 
-    async fn mock_delete(
-        State(state): State<Arc<RemoteMockState>>,
-        axum::extract::Path(id): axum::extract::Path<String>,
-    ) -> impl IntoResponse {
-        state.deletes.lock().await.push(id);
-        StatusCode::NO_CONTENT
-    }
+    type DaemonCalls = Arc<Mutex<Vec<(String, Option<Value>)>>>;
 
     struct Harness {
         service: Arc<RemoteTaskService>,
         state: Arc<Mutex<AgentState>>,
         store: Arc<StateStore>,
         mock: Arc<RemoteMockState>,
+        /// 发给 daemon 的调用（仅 [`Harness::with_daemon`]；其余 harness 的 daemon 永远未连接）。
+        daemon_calls: DaemonCalls,
         dir: std::path::PathBuf,
     }
 
@@ -1722,12 +1865,29 @@ mod tests {
             label: &str,
             app: impl FnOnce(Router<Arc<RemoteMockState>>) -> Router<Arc<RemoteMockState>>,
         ) -> Self {
-            Self::with_idle_timeout(label, None, app).await
+            Self::build(label, None, false, app).await
+        }
+
+        /// daemon 已连接：调用被记录并成功返回。
+        async fn with_daemon(
+            label: &str,
+            app: impl FnOnce(Router<Arc<RemoteMockState>>) -> Router<Arc<RemoteMockState>>,
+        ) -> Self {
+            Self::build(label, None, true, app).await
         }
 
         async fn with_idle_timeout(
             label: &str,
             idle_timeout: Option<std::time::Duration>,
+            app: impl FnOnce(Router<Arc<RemoteMockState>>) -> Router<Arc<RemoteMockState>>,
+        ) -> Self {
+            Self::build(label, idle_timeout, false, app).await
+        }
+
+        async fn build(
+            label: &str,
+            idle_timeout: Option<std::time::Duration>,
+            daemon_connected: bool,
             app: impl FnOnce(Router<Arc<RemoteMockState>>) -> Router<Arc<RemoteMockState>>,
         ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1772,9 +1932,17 @@ mod tests {
                 .expect("remote cloud client")
                 .with_events(events.clone()),
             );
+            let (daemon, daemon_calls) = if daemon_connected {
+                crate::daemon_client::DaemonClient::recording()
+            } else {
+                (
+                    crate::daemon_client::DaemonClient::disconnected(),
+                    DaemonCalls::default(),
+                )
+            };
             let mut service = RemoteTaskService::new(
                 cloud,
-                Arc::new(crate::daemon_client::DaemonClient::disconnected()),
+                Arc::new(daemon),
                 events,
                 state.clone(),
                 store.clone(),
@@ -1788,6 +1956,7 @@ mod tests {
                 state,
                 store,
                 mock,
+                daemon_calls,
                 dir,
             }
         }
@@ -2016,7 +2185,6 @@ mod tests {
         router
             .route("/api/v1/tasks/{id}/command", post(mock_command))
             .route("/api/v1/tasks/{id}/status", post(mock_status))
-            .route("/api/v1/tasks/{id}", delete(mock_delete))
     }
 
     async fn seed_remote_task(harness: &Harness, status: &str) {
@@ -2072,40 +2240,306 @@ mod tests {
         harness.finish().await;
     }
 
-    #[tokio::test]
-    async fn delete_removes_terminal_records_and_sends_cloud_delete_with_files_flag_otherwise() {
-        let harness = Harness::new("delete", command_mock).await;
-        seed_remote_task(&harness, "completed").await;
-        harness
-            .service
-            .command(RemoteCommandParams {
-                task_id: "r1".to_owned(),
-                action: RemoteCommandAction::Delete,
-                command_id: None,
-                delete_files: true,
-            })
-            .await
-            .expect("delete terminal task");
-        assert_eq!(*harness.mock.deletes.lock().await, ["r1"]);
-        assert!(harness.service.tasks().await.is_empty());
-        assert!(harness.mock.commands.lock().await.is_empty());
+    fn local_task(task_id: &str, status: i32) -> TaskDto {
+        serde_json::from_value(json!({
+            "taskId": task_id, "url": "https://example.com/a", "fileName": "a.bin",
+            "saveDir": "/tmp", "status": status, "downloadedBytes": 0, "totalBytes": 0,
+            "errorMessage": "", "createdAt": "1", "proxyUrl": "", "queueId": "main", "checksum": ""
+        }))
+        .expect("local task")
+    }
 
-        seed_remote_task(&harness, "downloading").await;
+    fn seed_daemon_tasks(harness: &Harness, tasks: Vec<TaskDto>) {
         harness
             .service
-            .command(RemoteCommandParams {
-                task_id: "r1".to_owned(),
-                action: RemoteCommandAction::Delete,
-                command_id: None,
-                delete_files: true,
-            })
+            .events
+            .replace_daemon_snapshot(fluxdown_protocol::DaemonSnapshot {
+                tasks,
+                ..Default::default()
+            });
+    }
+
+    async fn bind(harness: &Harness, remote_id: &str, local_id: &str) {
+        harness
+            .state
+            .lock()
             .await
-            .expect("delete active task");
+            .remote_bindings
+            .insert(remote_id.to_owned(), local_id.to_owned());
+    }
+
+    async fn bound_remote_ids(harness: &Harness) -> Vec<String> {
+        let mut ids = harness
+            .state
+            .lock()
+            .await
+            .remote_bindings
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+
+    /// daemon 收到的删除调用：(本机任务 id, deleteFiles)，按任务 id 排序。
+    async fn daemon_deletes(harness: &Harness) -> Vec<(String, bool)> {
+        let mut deletes = harness
+            .daemon_calls
+            .lock()
+            .await
+            .iter()
+            .filter(|(method, _)| method == fluxdown_protocol::method::DAEMON_TASK_DELETE)
+            .map(|(_, params)| {
+                let params = params.clone().unwrap_or_default();
+                (
+                    params["taskId"].as_str().unwrap_or_default().to_owned(),
+                    params["deleteFiles"].as_bool().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        deletes.sort();
+        deletes
+    }
+
+    fn delete_params(command_id: Option<&str>) -> RemoteCommandParams {
+        RemoteCommandParams {
+            task_id: "r1".to_owned(),
+            action: RemoteCommandAction::Delete,
+            command_id: command_id.map(str::to_owned),
+            delete_files: true,
+        }
+    }
+
+    async fn not_found() -> impl IntoResponse {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"code": "not_found", "message": "gone"})),
+        )
+    }
+
+    #[tokio::test]
+    async fn delete_goes_through_the_cloud_command_for_any_status_and_drops_the_row_at_once() {
+        let harness = Harness::new("delete", command_mock).await;
+        for status in ["completed", "pending"] {
+            seed_remote_task(&harness, status).await;
+            harness
+                .service
+                .command(delete_params(None))
+                .await
+                .expect(status);
+            assert!(harness.service.tasks().await.is_empty(), "{status}");
+        }
+        let commands = harness.mock.commands.lock().await.clone();
+        assert_eq!(commands.len(), 2);
+        assert!(
+            commands
+                .iter()
+                .all(|command| command["action"] == "delete" && command["deleteFiles"] == true)
+        );
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_record_another_device_already_removed_still_succeeds() {
+        let harness = Harness::new("delete_gone", |router| {
+            router.route("/api/v1/tasks/{id}/command", post(not_found))
+        })
+        .await;
+        seed_remote_task(&harness, "downloading").await;
+        let pause = harness
+            .service
+            .command(RemoteCommandParams {
+                action: RemoteCommandAction::Pause,
+                delete_files: false,
+                ..delete_params(None)
+            })
+            .await;
+        assert!(matches!(pause, Err(RemoteError::Cloud(_))));
+        harness
+            .service
+            .command(delete_params(None))
+            .await
+            .expect("an already deleted record counts as deleted");
+        assert!(harness.service.tasks().await.is_empty());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn deleting_a_task_this_device_runs_honours_delete_files_and_ignores_the_echoed_command()
+    {
+        let harness = Harness::with_daemon("local_delete", command_mock).await;
+        seed_daemon_tasks(&harness, vec![local_task("l1", 1)]);
+        harness
+            .state
+            .lock()
+            .await
+            .remote_tasks
+            .push(remote_task(json!({
+                "id": "r1", "toDevice": "device-1", "fromDevice": "device-2", "status": "downloading"
+            })));
+        bind(&harness, "r1", "l1").await;
+
+        harness
+            .service
+            .command(delete_params(Some("c1")))
+            .await
+            .expect("delete own task");
+        assert_eq!(daemon_deletes(&harness).await, [("l1".to_owned(), true)]);
         let commands = harness.mock.commands.lock().await.clone();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["action"], "delete");
-        assert_eq!(commands[0]["deleteFiles"], true);
-        assert_eq!(harness.mock.deletes.lock().await.len(), 1);
+        let statuses = harness.mock.statuses.lock().await.clone();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].1["status"], "canceled");
+        assert!(harness.service.tasks().await.is_empty());
+        assert!(bound_remote_ids(&harness).await.is_empty());
+
+        // 云端把同一条指令回显给本机：去重，不再触碰 daemon。
+        harness
+            .service
+            .apply_remote_event(json!({
+                "type": "task.command", "taskId": "r1", "toDevice": "device-1",
+                "action": "delete", "commandId": "c1", "deleteFiles": true
+            }))
+            .await
+            .expect("echoed command");
+        assert_eq!(daemon_deletes(&harness).await.len(), 1);
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_for_a_task_not_yet_accepted_succeeds_without_touching_the_daemon() {
+        let harness = Harness::with_daemon("pending_cancel", command_mock).await;
+        harness
+            .state
+            .lock()
+            .await
+            .remote_tasks
+            .push(remote_task(json!({
+                "id": "r1", "toDevice": "device-1", "fromDevice": "device-2",
+                "url": "https://example.com/a", "status": "pending"
+            })));
+        seed_daemon_tasks(&harness, vec![local_task("unrelated", 1)]);
+        harness
+            .service
+            .apply_remote_event(json!({
+                "type": "task.command", "taskId": "r1", "toDevice": "device-1", "action": "cancel"
+            }))
+            .await
+            .expect("nothing to cancel locally");
+        assert!(harness.daemon_calls.lock().await.is_empty());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_task_this_device_runs_is_removed_locally_when_the_cloud_cancels_or_deletes_it() {
+        let harness = Harness::with_daemon("executor_events", command_mock).await;
+        seed_daemon_tasks(
+            &harness,
+            vec![
+                local_task("l1", 1),
+                local_task("l2", 2),
+                local_task("l3", 3),
+            ],
+        );
+        bind(&harness, "r1", "l1").await;
+        bind(&harness, "r2", "l2").await;
+        bind(&harness, "r3", "l3").await;
+
+        for event in [
+            json!({"type": "task.status", "id": "r1", "toDevice": "device-1",
+                   "fromDevice": "device-2", "status": "canceled"}),
+            json!({"type": "task.removed", "taskId": "r2"}),
+            // 本机已下载完成的任务被删除记录：文件与本机任务都保留。
+            json!({"type": "task.removed", "taskId": "r3"}),
+        ] {
+            harness
+                .service
+                .apply_remote_event(event)
+                .await
+                .expect("apply event");
+        }
+        assert_eq!(
+            daemon_deletes(&harness).await,
+            [("l1".to_owned(), false), ("l2".to_owned(), false)]
+        );
+        assert!(bound_remote_ids(&harness).await.is_empty());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_status_report_rejected_with_404_removes_the_local_task() {
+        let harness = Harness::with_daemon("report_gone", |router| {
+            router.route("/api/v1/tasks/{id}/status", post(not_found))
+        })
+        .await;
+        seed_daemon_tasks(&harness, vec![local_task("l1", 1)]);
+        bind(&harness, "r1", "l1").await;
+        harness
+            .service
+            .report_status_if_changed("r1", RemoteTaskStatus::Downloading, None, None)
+            .await
+            .expect("a deleted record is not a report failure");
+        assert_eq!(daemon_deletes(&harness).await, [("l1".to_owned(), false)]);
+        assert!(bound_remote_ids(&harness).await.is_empty());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_snapshot_removes_local_tasks_canceled_or_deleted_while_offline() {
+        async fn snapshot() -> impl IntoResponse {
+            axum::Json(json!({"tasks": [
+                {"id": "r-canceled", "toDevice": "device-1", "fromDevice": "device-2", "status": "canceled"},
+                {"id": "r-live", "toDevice": "device-1", "fromDevice": "device-2", "status": "downloading"}
+            ]}))
+        }
+        let harness = Harness::with_daemon("executor_snapshot", |router| {
+            router.route("/api/v1/tasks/remote", get(snapshot))
+        })
+        .await;
+        seed_daemon_tasks(
+            &harness,
+            vec![
+                local_task("l1", 1),
+                local_task("l2", 1),
+                local_task("l3", 1),
+                local_task("l4", 0),
+            ],
+        );
+        {
+            let mut state = harness.state.lock().await;
+            for id in ["r-deleted", "r-fresh"] {
+                state.remote_tasks.push(remote_task(json!({
+                    "id": id, "toDevice": "device-1", "fromDevice": "device-2", "status": "downloading"
+                })));
+            }
+        }
+        bind(&harness, "r-canceled", "l1").await;
+        bind(&harness, "r-deleted", "l2").await;
+        bind(&harness, "r-live", "l3").await;
+        bind(&harness, "r-fresh", "l4").await;
+        // r-fresh 在快照请求发出之后才下发并接单：快照里没有它不代表记录被删除。
+        harness.service.runtime.lock().await.bound_at.insert(
+            "r-fresh".to_owned(),
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        );
+
+        let merged = harness
+            .service
+            .refresh_snapshot()
+            .await
+            .expect("refresh snapshot");
+        assert_eq!(
+            daemon_deletes(&harness).await,
+            [("l1".to_owned(), false), ("l2".to_owned(), false)]
+        );
+        assert_eq!(bound_remote_ids(&harness).await, ["r-fresh", "r-live"]);
+        let mut ids = merged
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["r-canceled", "r-fresh", "r-live"]);
         harness.finish().await;
     }
 

@@ -483,9 +483,10 @@ pub struct RemoteDispatchResult {
 pub enum RemoteCommandAction {
     Pause,
     Resume,
-    /// 取消任务（目标设备删除其本地任务，保留已下载文件）。
+    /// 取消任务：云端直接置 `canceled`（不依赖目标在线），目标设备删除其本地任务、保留已下载文件。
     Cancel,
-    /// 取消任务并让目标设备删除其本地任务；`delete_files` 决定是否同时删文件。
+    /// 删除任务：云端直接删除记录（任何状态，不依赖目标在线）；目标设备删除其本地任务，
+    /// 在线收到指令时按 `delete_files` 决定是否同时删文件，离线期间被删则保留文件。
     Delete,
 }
 
