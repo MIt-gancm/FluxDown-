@@ -2,9 +2,10 @@
 /**
  * 首页首屏:汇聚线稿(多源 → 一个文件)+ 粒子数据流 + 标题 + 下载 CTA + GPUI 客户端实时复刻。
  * 线稿与粒子共用 hero-geometry 的通道几何;粒子的交互见 flux-field.ts。
- * 主按钮文案在客户端按系统改写为「下载 macOS 版」等,链接统一指向 /download/(那里做架构精确匹配)。
+ * 主按钮文案在客户端按系统改写为「下载 macOS 版」等,链接统一指向 /download/(那里做架构精确匹配);
+ * 「更多版本」下拉直达下载页各平台锚点,底部入口进入全部下载。
  */
-import { ArrowRight, Play } from "lucide-react";
+import { ArrowRight, ChevronDown, Play, Puzzle, Terminal } from "lucide-react";
 import AppReplica from "./AppReplica.astro";
 import { CHANNELS, FOCUS, VIEW, channelPath } from "./hero-geometry";
 import { BrandIcon } from "../icons/brand";
@@ -26,6 +27,17 @@ const osLabels = {
   win: actions.downloadFor("Windows"),
   linux: actions.downloadFor("Linux"),
 };
+
+// 锚点与 src/components/download/* 各分区 id 一致
+const versions = [
+  { id: "windows", brand: "windows", label: t.moreItems.windows, hint: "x64 · ARM64" },
+  { id: "macos", brand: "apple", label: t.moreItems.macos, hint: "Apple Silicon · Intel" },
+  { id: "linux", brand: "linux", label: t.moreItems.linux, hint: "AppImage · deb · Arch" },
+  { id: "server", brand: "docker", label: t.moreItems.server, hint: "Docker · NAS" },
+  { id: "android", brand: "android", label: t.moreItems.android, hint: "APK" },
+  { id: "cli", icon: Terminal, label: t.moreItems.cli, hint: "CLI" },
+  { id: "extension", icon: Puzzle, label: t.moreItems.extension, hint: "Chrome · Edge · Firefox" },
+] as const;
 ---
 
 <section class="frame hero">
@@ -53,11 +65,39 @@ const osLabels = {
       <p class="lede mx-auto max-w-[60ch]" data-reveal style="--d:2">{t.lede}</p>
 
       <div class="flex flex-wrap items-center justify-center gap-3" data-reveal style="--d:3">
-        <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-magnetic data-hero-download data-labels={JSON.stringify(osLabels)}>
+        <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-hero-download data-labels={JSON.stringify(osLabels)}>
           <span data-hero-download-label>{actions.download}</span>
           <span class="kbd">D</span>
         </a>
-        <a href={GITHUB_URL} class="btn btn-ticks btn-lg" data-magnetic target="_blank" rel="noopener">
+        <div class="hero-more" data-hero-more>
+          <button type="button" class="btn btn-secondary btn-lg" aria-haspopup="true" aria-expanded="false" aria-controls="hero-more-panel" data-hero-more-toggle>
+            {t.more}
+            <ChevronDown size={15} strokeWidth={2} className="hero-more-caret" />
+          </button>
+          <div class="hero-more-panel" id="hero-more-panel">
+            <div class="hero-more-title mono">{t.moreTitle}</div>
+            <div class="hero-more-grid">
+              {
+                versions.map((v) => (
+                  <a href={href(`/download#${v.id}`, lang)} class="hero-more-item">
+                    <span class="hero-more-icon">
+                      {"brand" in v ? <BrandIcon name={v.brand} size={14} /> : <v.icon size={15} strokeWidth={1.75} />}
+                    </span>
+                    <span class="min-w-0 text-left">
+                      <span class="block text-[13.5px] font-medium text-fg">{v.label}</span>
+                      <span class="mono block truncate text-[11px] text-subtle">{v.hint}</span>
+                    </span>
+                  </a>
+                ))
+              }
+            </div>
+            <a href={href("/download", lang)} class="hero-more-all">
+              {t.moreAll}
+              <ArrowRight size={14} strokeWidth={2} />
+            </a>
+          </div>
+        </div>
+        <a href={GITHUB_URL} class="btn btn-ticks btn-lg" target="_blank" rel="noopener">
           <BrandIcon name="github" size={15} />
           {t.secondary}
         </a>
@@ -109,6 +149,28 @@ const osLabels = {
     if (os && labels[os]) label.textContent = labels[os];
   }
 
+  // 「更多版本」下拉:点击开合,外部点击 / Esc 关闭
+  const more = document.querySelector<HTMLElement>("[data-hero-more]");
+  const toggle = more?.querySelector<HTMLButtonElement>("[data-hero-more-toggle]");
+  if (more && toggle) {
+    const setOpen = (open: boolean) => {
+      more.toggleAttribute("data-open", open);
+      toggle.setAttribute("aria-expanded", String(open));
+    };
+    toggle.addEventListener("click", () => setOpen(!more.hasAttribute("data-open")));
+    document.addEventListener("click", (event) => {
+      if (more.hasAttribute("data-open") && !more.contains(event.target as Node)) setOpen(false);
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key !== "Escape" || !more.hasAttribute("data-open")) return;
+      setOpen(false);
+      toggle.focus();
+    });
+    more.addEventListener("focusout", (event) => {
+      if (!more.contains(event.relatedTarget as Node | null)) setOpen(false);
+    });
+  }
+
   const head = document.querySelector<HTMLElement>(".hero-head");
   const canvas = head?.querySelector<HTMLCanvasElement>("[data-flux]");
   if (head && canvas) {
@@ -128,6 +190,8 @@ const osLabels = {
   }
   .hero-head {
     position: relative;
+    /* 高于下方复刻窗口:「更多版本」面板向下展开时覆盖在窗口之上 */
+    z-index: 1;
     padding-top: clamp(56px, 9vw, 112px);
     padding-bottom: clamp(56px, 8vw, 96px);
   }
@@ -301,6 +365,108 @@ const osLabels = {
     100% {
       background-position: -30% 0;
     }
+  }
+  .hero-more {
+    position: relative;
+  }
+  .hero-more-caret {
+    opacity: 0.6;
+    transition: transform 200ms var(--ease-out);
+  }
+  .hero-more[data-open] .hero-more-caret {
+    transform: rotate(180deg);
+  }
+  .hero-more-panel {
+    position: absolute;
+    left: 50%;
+    top: calc(100% + 10px);
+    z-index: 20;
+    width: min(440px, calc(100vw - 32px));
+    padding: 6px;
+    border-radius: 14px;
+    text-align: left;
+    background: var(--bg-elev);
+    box-shadow:
+      0 0 0 1px var(--line),
+      var(--shadow-float);
+    opacity: 0;
+    visibility: hidden;
+    transform: translate(-50%, -6px) scale(0.985);
+    transform-origin: 50% 0;
+    transition:
+      opacity 160ms,
+      transform 240ms var(--ease-out),
+      visibility 0s 240ms;
+  }
+  .hero-more[data-open] .hero-more-panel {
+    opacity: 1;
+    visibility: visible;
+    transform: translate(-50%, 0);
+    transition-delay: 0s;
+  }
+  .hero-more-title {
+    padding: 8px 10px 6px;
+    font-size: 10.5px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fg-subtle);
+  }
+  .hero-more-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px;
+  }
+  .hero-more-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    padding: 8px 10px;
+    border-radius: 9px;
+    transition: background-color 140ms;
+  }
+  .hero-more-item:hover,
+  .hero-more-item:focus-visible {
+    background: var(--bg-sunken);
+  }
+  .hero-more-icon {
+    display: grid;
+    flex: none;
+    place-items: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    color: var(--fg-muted);
+    background: var(--bg-elev);
+    box-shadow:
+      0 0 0 1px var(--line-strong) inset,
+      0 1px 2px oklch(0 0 0 / 0.04);
+    transition: color 140ms;
+  }
+  .hero-more-item:hover .hero-more-icon {
+    color: var(--accent-ink);
+  }
+  .hero-more-all {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 6px;
+    padding: 11px 12px;
+    border-radius: 9px;
+    font-size: 13.5px;
+    font-weight: 520;
+    color: var(--accent-ink);
+    background: var(--accent-soft);
+    transition: background-color 140ms;
+  }
+  .hero-more-all:hover {
+    background: color-mix(in oklch, var(--accent-soft) 70%, var(--accent) 12%);
+  }
+  .hero-more-all :global(svg) {
+    transition: transform 200ms var(--ease-out);
+  }
+  .hero-more-all:hover :global(svg) {
+    transform: translateX(3px);
   }
   .hero-figure {
     position: relative;

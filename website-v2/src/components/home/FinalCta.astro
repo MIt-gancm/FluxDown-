@@ -28,11 +28,11 @@ const title = t.title.replace(/<em>(.*?)<\/em>/g, '<span class="serif accent-gra
       <h2 class="display max-w-[16ch] !text-[clamp(2.4rem,5.6vw,4.6rem)]" data-reveal set:html={title} />
       <p class="lede" data-reveal style="--d:1">{t.lede}</p>
       <div class="flex flex-wrap items-center justify-center gap-3" data-reveal style="--d:2">
-        <a href={href("/download", lang)} class="btn btn-primary btn-lg" data-magnetic>
+        <a href={href("/download", lang)} class="btn btn-primary btn-lg">
           {common[lang].actions.download}
           <span class="kbd">D</span>
         </a>
-        <a href={withBase(`/docs/${lang}/`)} class="btn btn-secondary btn-lg" data-magnetic>
+        <a href={withBase(`/docs/${lang}/`)} class="btn btn-secondary btn-lg">
           <BookOpen size={15} strokeWidth={1.75} />
           {t.docs}
         </a>

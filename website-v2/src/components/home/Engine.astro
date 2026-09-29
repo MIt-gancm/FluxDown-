@@ -1,6 +1,7 @@
 ---
 /**
  * 01 · 引擎:动态分段可视化(segment-sim 模拟 segment_coordinator 的爬升 + 对半拆分接管)。
+ * 分段条上叠一层粒子(seg-sparks):写入头火花、拆分迸发、悬停探针。
  */
 import { RotateCcw } from "lucide-react";
 import { home } from "../../i18n/messages/home";
@@ -22,7 +23,7 @@ const MAX = 16;
       <span class="eyebrow" data-scramble>{t.eyebrow}</span>
       <h2 class="h2" data-reveal set:html={title} />
       <p class="lede" data-reveal style="--d:1">{t.lede}</p>
-      <dl class="mt-2 grid gap-px overflow-hidden rounded-[10px] border border-line bg-line sm:grid-cols-2 grid-cols-1" data-reveal style="--d:2">
+      <dl class="mt-2 grid gap-px overflow-hidden rounded-[10px] border border-line bg-line sm:grid-cols-2 grid-cols-1" data-reveal style="--d:2" data-circuit>
         {
           t.points.map((p, i) => (
             <div class="flex flex-col gap-1.5 bg-bg p-5">
@@ -63,9 +64,12 @@ const MAX = 16;
           </div>
         </div>
 
-        <div class="seg-bar" data-seg-bar>
-          <div class="seg-layer" data-seg-layer></div>
-          <div class="seg-marks" data-seg-marks></div>
+        <div class="seg-track">
+          <div class="seg-bar" data-seg-bar>
+            <div class="seg-layer" data-seg-layer></div>
+            <div class="seg-marks" data-seg-marks></div>
+          </div>
+          <canvas class="seg-sparks" aria-hidden="true" data-seg-sparks></canvas>
         </div>
         <div class="mono -mt-3 flex justify-between text-[10.5px] text-subtle">
           <span>0x0</span>
@@ -95,6 +99,8 @@ const MAX = 16;
 </section>
 
 <script>
+  import { mountStage } from "../../scripts/particle-stage";
+  import { SegSparks } from "./seg-sparks";
   import { SegmentSim, formatBytes } from "./segment-sim";
 
   const MB = 1024 * 1024;
@@ -198,6 +204,9 @@ const MAX = 16;
       restart();
       play();
     });
+    const bar = root.querySelector<HTMLElement>("[data-seg-bar]");
+    const sparks = root.querySelector<HTMLCanvasElement>("[data-seg-sparks]");
+    if (bar && sparks) mountStage(sparks, root, new SegSparks(() => sim, bar, sparks));
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
       for (let i = 0; i < 420; i++) sim.step(STEP);
       render(true);
@@ -225,6 +234,18 @@ const MAX = 16;
     .seg-replay:hover {
       color: var(--fg);
       background: var(--bg-inset);
+    }
+    .seg-track {
+      position: relative;
+    }
+    /* 粒子层四周出血:上方留出探针标签,两侧与下方给火花余量 */
+    .seg-sparks {
+      position: absolute;
+      left: -8px;
+      top: -22px;
+      width: calc(100% + 16px);
+      height: calc(100% + 32px);
+      pointer-events: none;
     }
     .seg-bar {
       position: relative;

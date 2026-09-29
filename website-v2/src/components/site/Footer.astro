@@ -98,8 +98,9 @@ const columns = [
     }
   </div>
 
-  <div class="wordmark spot" aria-hidden="true">
-    <span>FluxDown</span>
+  <div class="wordmark spot" aria-hidden="true" data-wordmark>
+    <span data-wordmark-text>FluxDown</span>
+    <canvas class="wordmark-canvas" data-wordmark-canvas></canvas>
   </div>
 
   <div
@@ -132,6 +133,22 @@ const columns = [
     </div>
   </div>
 </footer>
+
+<script>
+  import { mountStage } from "../../scripts/particle-stage";
+  import { WordmarkField } from "./wordmark-field";
+
+  // 粒子字标:挂载后隐藏描边文字(保留排版供采样定位);字体就绪后重采一次
+  const host = document.querySelector<HTMLElement>("[data-wordmark]");
+  const text = host?.querySelector<HTMLElement>("[data-wordmark-text]");
+  const canvas = host?.querySelector<HTMLCanvasElement>("[data-wordmark-canvas]");
+  if (host && text && canvas) {
+    const field = new WordmarkField(text, canvas);
+    host.classList.add("is-particles");
+    mountStage(canvas, host, field);
+    void document.fonts.ready.then(() => field.sample());
+  }
+</script>
 
 <style is:global>
   @layer components {
@@ -185,6 +202,20 @@ const columns = [
       -webkit-background-clip: text;
       background-clip: text;
       mask-image: linear-gradient(to bottom, #000 35%, transparent 100%);
+    }
+    .wordmark-canvas {
+      display: none;
+    }
+    .wordmark.is-particles .wordmark-canvas {
+      position: absolute;
+      inset: 0;
+      display: block;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    .wordmark.is-particles span {
+      visibility: hidden;
     }
     .wordmark.spot::after {
       display: none;

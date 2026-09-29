@@ -21,7 +21,7 @@ const stats = [
   <div class="flex items-center justify-center py-4">
     <span class="eyebrow" data-scramble>{t.eyebrow}</span>
   </div>
-  <div class="cells grid-cols-2 border-t border-line md:grid-cols-4">
+  <div class="cells grid-cols-2 border-t border-line md:grid-cols-4" data-circuit>
     {
       stats.map((stat, i) => (
         <div class="cell spot spot-edge flex flex-col gap-2" data-reveal style={`--d:${i}`}>

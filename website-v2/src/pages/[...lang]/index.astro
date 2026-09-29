@@ -36,3 +36,10 @@ const t = home[lang];
   <FinalCta lang={lang} />
   <FilmModal lang={lang} />
 </Layout>
+
+<script>
+  import { mountCircuits } from "@/components/home/grid-circuit";
+
+  // 首页各 1px 缝隙网格(一览 / 引擎要点 / 原生要点 / 扩展)上的电路粒子层
+  mountCircuits();
+</script>

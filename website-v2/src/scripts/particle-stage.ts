@@ -16,6 +16,8 @@ export interface Palette {
   cyan: Rgb;
   fg: Rgb;
   subtle: Rgb;
+  /** 页面底色:场景需要遮挡(实心平面)时使用,不参与 StrokeBatch 合批 */
+  bg: Rgb;
   dark: boolean;
 }
 
@@ -122,6 +124,7 @@ function resolvePalette(): Palette {
     cyan: resolveColor("--cyan", [48, 184, 212]),
     fg: resolveColor("--fg", dark ? [242, 243, 246] : [24, 26, 32]),
     subtle: resolveColor("--fg-subtle", dark ? [118, 122, 133] : [136, 139, 148]),
+    bg: resolveColor("--bg", dark ? [12, 13, 16] : [250, 250, 251]),
     dark,
   };
 }

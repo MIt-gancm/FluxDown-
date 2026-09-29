@@ -6,7 +6,6 @@
  * - `[data-count]`          数字滚动到目标值(data-count="113638")
  * - `.rule`                 首次进入视口加 `.is-in`:扫描光 + 准星锁定(样式见 global.css)
  * - `.spot`                 指针聚光(写入 --mx / --my;`.spot-edge` 同时点亮边框)
- * - `[data-magnetic]`       按钮磁吸:指针在元素上时写入 --mag-x / --mag-y,离开后弹回
  * - `[data-theme-toggle]`   主题切换,支持时以点击点为圆心做 view transition 揭示
  * - 键盘:`D` 跳下载页,`⌘K` / `Ctrl+K` / `/` 打开命令面板(派发 `palette:open`)
  */
@@ -100,48 +99,6 @@ document.addEventListener(
   },
   { passive: true },
 );
-
-/* ── Magnetic ───────────────────────────────────────────── */
-if (!reduced && window.matchMedia("(hover: hover) and (pointer: fine)").matches) {
-  const MAG_PULL = 0.22;
-  const MAG_MAX = 8;
-  let magnet: HTMLElement | null = null;
-  let magX = 0;
-  let magY = 0;
-  const release = () => {
-    if (!magnet) return;
-    magnet.removeAttribute("data-magnet-active");
-    magnet.style.removeProperty("--mag-x");
-    magnet.style.removeProperty("--mag-y");
-    magnet = null;
-    magX = magY = 0;
-  };
-  document.addEventListener(
-    "pointermove",
-    (event) => {
-      if (event.pointerType !== "mouse") return;
-      const el = (event.target as Element | null)?.closest<HTMLElement>("[data-magnetic]") ?? null;
-      if (el !== magnet) release();
-      if (!el) return;
-      if (!magnet) {
-        magnet = el;
-        el.setAttribute("data-magnet-active", "");
-      }
-      // 以未位移时的中心为基准,避免元素跟随指针后产生反馈漂移
-      const rect = el.getBoundingClientRect();
-      const cx = rect.left + rect.width / 2 - magX;
-      const cy = rect.top + rect.height / 2 - magY;
-      magX = Math.max(-MAG_MAX, Math.min(MAG_MAX, (event.clientX - cx) * MAG_PULL));
-      magY = Math.max(-MAG_MAX, Math.min(MAG_MAX, (event.clientY - cy) * MAG_PULL));
-      el.style.setProperty("--mag-x", `${magX.toFixed(2)}px`);
-      el.style.setProperty("--mag-y", `${magY.toFixed(2)}px`);
-    },
-    { passive: true },
-  );
-  document.addEventListener("pointerout", (event) => {
-    if (!event.relatedTarget) release();
-  });
-}
 
 /* ── Theme toggle ───────────────────────────────────────── */
 function applyTheme(next: "light" | "dark") {
