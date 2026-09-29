@@ -7,10 +7,12 @@
 
 use std::{collections::HashSet, rc::Rc, sync::Arc};
 
-use fluxdown_protocol::{AgentEvent, CaptureResolveParams, PendingCaptureDto, ServiceEvent};
+use fluxdown_protocol::{
+    AgentEvent, CaptureResolveParams, CloudDevice, LinkDeviceInfo, PendingCaptureDto, ServiceEvent,
+};
 use fluxdown_ui_downloads::{
     DownloadsCommand, DownloadsPort, NewDownloadContext, NewDownloadSubmission, NewDownloadView,
-    new_download_context_from_snapshot,
+    SubmitNotice, new_download_context_from_snapshot, new_download_targets, run_submission,
 };
 use fluxdown_ui_i18n::keys;
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
@@ -29,11 +31,14 @@ const NEW_DOWNLOAD_WINDOW_SIZE: gpui::Size<gpui::Pixels> = size(px(640.), px(530
 const NEW_DOWNLOAD_WINDOW_MIN_SIZE: gpui::Size<gpui::Pixels> = size(px(560.), px(440.));
 
 /// 外部捕获派发状态：当前表单 + 已交给表单的事务（agent 移除前不重复追加，
-/// 关窗忽略后也不会因列表尚未刷新而重开）。
+/// 关窗忽略后也不会因列表尚未刷新而重开）；另缓存设备名册，随事件推给已打开的表单
+///（事件处理时会话实体正在更新，不能回读它）。
 #[derive(Default)]
 struct CaptureDispatch {
     form: Option<WeakEntity<NewDownloadView>>,
     handed: HashSet<String>,
+    cloud_devices: Vec<CloudDevice>,
+    linked_devices: Vec<LinkDeviceInfo>,
 }
 
 impl Global for CaptureDispatch {}
@@ -71,27 +76,75 @@ pub fn open(cx: &mut App, context: NewDownloadContext) {
 pub fn install_captures(cx: &mut App) {
     cx.set_global(CaptureDispatch::default());
     let session = Desktop::global(cx).session.clone();
-    let pending = session
-        .read(cx)
-        .agent_snapshot()
-        .map(|body| body.pending_captures.clone());
-    if let Some(pending) = pending {
+    let initial = session.read(cx).agent_snapshot().map(|body| {
+        (
+            body.cloud_devices.clone(),
+            body.linked_devices.clone(),
+            body.pending_captures.clone(),
+        )
+    });
+    if let Some((cloud, linked, pending)) = initial {
+        cache_devices(cx, &cloud, &linked);
         sync_captures(cx, &pending);
     }
     cx.subscribe(&session, |_, signal, cx| match signal {
         SessionSignal::Snapshot(snapshot) => {
             if let Some(body) = agent_body(snapshot) {
+                cache_devices(cx, &body.cloud_devices, &body.linked_devices);
+                sync_targets(cx);
                 sync_captures(cx, &body.pending_captures);
             }
         }
-        SessionSignal::Event(frame) => {
-            if let ServiceEvent::Agent(AgentEvent::PendingCapturesChanged(pending)) = &frame.event {
+        SessionSignal::Event(frame) => match &frame.event {
+            ServiceEvent::Agent(AgentEvent::PendingCapturesChanged(pending)) => {
                 sync_captures(cx, pending);
             }
-        }
+            ServiceEvent::Agent(AgentEvent::CloudDevicesChanged(devices)) => {
+                cx.global_mut::<CaptureDispatch>()
+                    .cloud_devices
+                    .clone_from(devices);
+                sync_targets(cx);
+            }
+            ServiceEvent::Agent(AgentEvent::LinkedDevicesChanged(devices)) => {
+                cx.global_mut::<CaptureDispatch>()
+                    .linked_devices
+                    .clone_from(devices);
+                sync_targets(cx);
+            }
+            // 会话结束：账号设备名册随之失效（已配对设备与账号无关，保留）。
+            ServiceEvent::Agent(AgentEvent::SessionChanged(session)) if session.is_none() => {
+                cx.global_mut::<CaptureDispatch>().cloud_devices.clear();
+                sync_targets(cx);
+            }
+            _ => {}
+        },
         SessionSignal::Stale | SessionSignal::Fatal(_) | SessionSignal::ServiceStopped => {}
     })
     .detach();
+}
+
+fn cache_devices(cx: &mut App, cloud: &[CloudDevice], linked: &[LinkDeviceInfo]) {
+    let dispatch = cx.global_mut::<CaptureDispatch>();
+    dispatch.cloud_devices = cloud.to_vec();
+    dispatch.linked_devices = linked.to_vec();
+}
+
+/// 把最新设备名册（在线状态 / 默认目录 / 设备增减）推给已打开的新建下载表单。
+fn sync_targets(cx: &mut App) {
+    let (form, targets) = {
+        let dispatch = cx.global::<CaptureDispatch>();
+        (
+            dispatch.form.as_ref().and_then(WeakEntity::upgrade),
+            new_download_targets(&dispatch.cloud_devices, &dispatch.linked_devices),
+        )
+    };
+    let (Some(form), Some(handle)) = (form, WindowRegistry::handle(cx, &WindowKey::NewDownload))
+    else {
+        return;
+    };
+    let _ = handle.update(cx, |_, window, cx| {
+        form.update(cx, |form, cx| form.set_targets(targets, window, cx));
+    });
 }
 
 /// 对齐 agent 的待确认列表：已消失的事务从表单移除（链接行保留为普通链接），新事务追加
@@ -220,59 +273,55 @@ fn ignore_captures(captures: Vec<PendingCaptureDto>, port: &AgentDownloadsPort, 
 }
 
 /// 执行提交：有主窗口时经下载页（失败进横幅），否则直接走 agent 端口；完成后在主窗口
-/// toast。界面退出前等提交送达（外部捕获拉起的界面没有主窗口，关表单即最后一个窗口）。
-fn submit(submission: NewDownloadSubmission, port: &AgentDownloadsPort, cx: &mut App) {
+/// toast（成功 / 失败 / 下发汇总文案由下载能力按 `reason` 生成）。界面退出前等提交送达
+///（外部捕获拉起的界面没有主窗口，关表单即最后一个窗口）。
+fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx: &mut App) {
     let main = Desktop::global(cx)
         .main_downloads
         .as_ref()
         .and_then(WeakEntity::upgrade);
-    let created = match main {
+    let translator = Desktop::global(cx).translator.clone();
+    let notice = match main {
         Some(downloads) => downloads.update(cx, |downloads, cx| {
             downloads.create_download(submission, cx)
         }),
         None => {
-            let remember = submission
-                .remember_save_dir_command()
-                .map(|command| port.execute(command));
             let starts_immediately = submission.starts_immediately();
-            let commands = submission
-                .into_commands()
-                .into_iter()
-                .map(|command| port.execute(command))
-                .collect::<Vec<_>>();
+            let port = Arc::clone(port);
+            let translator = translator.clone();
             cx.spawn(async move |cx| {
-                if let Some(remember) = remember {
-                    let _ = remember.await;
-                }
-                let mut ok = true;
-                let mut created = Vec::new();
-                for command in commands {
-                    match command.await {
-                        Ok(result) => created.extend(result.created_task_ids()),
-                        Err(_) => ok = false,
-                    }
-                }
+                let report = run_submission(submission, move |command| port.execute(command)).await;
                 // 与主窗口下载页同一规则：恰好一个任务立即开始才弹进度窗口。
-                if let ([task_id], true) = (created.as_slice(), starts_immediately) {
+                if let ([task_id], true) = (report.created_task_ids(), starts_immediately) {
                     let task_id = task_id.clone();
                     cx.update(|cx| crate::progress_windows::user_started(task_id, cx));
                 }
-                ok
+                cx.update(|cx| report.notice(translator.read(cx)))
             })
         }
     };
-    let translator = Desktop::global(cx).translator.clone();
     let task = cx.spawn(async move |cx| {
-        let ok = created.await;
+        let SubmitNotice { ok, message } = notice.await;
         cx.update(|cx| {
             let Some(main) = WindowRegistry::handle(cx, &WindowKey::Main) else {
                 return;
             };
             let translator = translator.read(cx);
-            let notification = if ok {
-                Notification::from(translator.text("taskCreatedToast").to_owned())
+            let message = if message.is_empty() {
+                translator
+                    .text(if ok {
+                        "taskCreatedToast"
+                    } else {
+                        "localServiceActionFailed"
+                    })
+                    .to_owned()
             } else {
-                Notification::error(translator.text("localServiceActionFailed").to_owned())
+                message
+            };
+            let notification = if ok {
+                Notification::from(message)
+            } else {
+                Notification::error(message)
             };
             let _ = main.update(cx, |_, window, cx| {
                 window.push_notification(notification, cx)

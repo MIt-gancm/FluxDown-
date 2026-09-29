@@ -154,7 +154,10 @@ fn sidebar_section(ctx: &SectionContext) -> SettingsSection {
         ))
 }
 
-/// `ui.show_sidebar_devices` 三态：未设置 = 登录后自动显示。开关显示有效值。
+/// `ui.show_sidebar_devices` 三态：未设置 = 有其他设备（云账号其他设备 / 已配对设备）时
+/// 自动显示，与侧栏的判定一致。开关显示有效值。
+///
+/// 该键不在云同步目录内：写入走设备本地路径（`sync:false`），隐藏设备区只影响本机。
 fn show_sidebar_device_field(ctx: &SectionContext) -> Control {
     let get = ctx.store();
     let set = ctx.store();
@@ -164,7 +167,7 @@ fn show_sidebar_device_field(ctx: &SectionContext) -> Control {
             store
                 .pref("ui.show_sidebar_devices")
                 .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| store.session().is_some())
+                .unwrap_or_else(|| store.has_other_devices())
         },
         move |value, cx: &mut App| {
             set.update(cx, |store, cx| {

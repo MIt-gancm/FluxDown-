@@ -1,0 +1,477 @@
+//! 云设备管理对话框：重命名、删除确认（删本机 = 登出）、详情、管理全部（带搜索）。
+//!
+//! 全部以 `Entity<AccountHost>` 为入口，可从设置窗口的账户页或任何窗口打开。
+
+use fluxdown_protocol::{CloudDevice, LinkDeviceInfo, LinkDeviceParams};
+use fluxdown_ui_components::{
+    ControlExt as _, DialogIntent, dialog_footer, dialog_title, field_error, field_hint, form,
+    form_field,
+};
+use fluxdown_ui_theme::active_theme;
+use gpui::{
+    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
+    Window, div, prelude::FluentBuilder as _, px,
+};
+use gpui_component::{
+    Disableable as _, WindowExt as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::{Input, InputEvent, InputState},
+    notification::Notification,
+    v_flex,
+};
+
+use crate::device_list::{filtered, format_timestamp, normalize_device_name, platform_label_key};
+use crate::errors::{ErrorContext, error_text};
+use crate::host::AccountHost;
+use crate::pages::devices::device_row;
+use crate::{AccountCommand, t, t_with};
+
+fn translated(host: &Entity<AccountHost>, key: &str, cx: &App) -> SharedString {
+    t(host.read(cx).translator().read(cx), key)
+}
+
+// ───────────────────────── 重命名 ─────────────────────────
+
+struct RenameDialog {
+    host: Entity<AccountHost>,
+    device_id: String,
+    input: Entity<InputState>,
+    busy: bool,
+    error: Option<SharedString>,
+}
+
+pub(crate) fn open_rename(
+    host: &Entity<AccountHost>,
+    device: &CloudDevice,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let title = translated(host, "accountDeviceRenameTitle", cx);
+    let name = SharedString::from(device.name.clone());
+    let device_id = device.id.clone();
+    let host = host.clone();
+    let view = cx.new(|cx| {
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
+        cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut RenameDialog, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit(window, cx);
+                }
+            },
+        )
+        .detach();
+        RenameDialog {
+            host,
+            device_id,
+            input,
+            busy: false,
+            error: None,
+        }
+    });
+    let input = view.read(cx).input.clone();
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let view = view.clone();
+        dialog
+            .title(dialog_title(title.clone(), cx))
+            .w(px(440.))
+            .content(move |content, _, _| content.child(view.clone()))
+    });
+    input.update(cx, |input, cx| input.focus(window, cx));
+}
+
+impl RenameDialog {
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let raw = self.input.read(cx).value().to_string();
+        let Some(name) = normalize_device_name(&raw) else {
+            self.error = Some(translated(&self.host, "accountDeviceRenameInvalid", cx));
+            cx.notify();
+            return;
+        };
+        self.busy = true;
+        self.error = None;
+        cx.notify();
+        let future = self.host.read(cx).port().execute(AccountCommand::Device {
+            method: fluxdown_protocol::method::AGENT_DEVICE_RENAME,
+            params: serde_json::json!({ "id": self.device_id, "name": name }),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.busy = false;
+                match result {
+                    Ok(_) => window.close_dialog(cx),
+                    Err(error) => {
+                        this.error = Some(error_text(
+                            this.host.read(cx).translator().read(cx),
+                            &error,
+                            ErrorContext::General,
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+}
+
+impl Render for RenameDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = active_theme(cx).tokens().clone();
+        v_flex()
+            .w_full()
+            .gap(tokens.spacing.lg)
+            .child(form(cx).child(form_field(
+                translated(&self.host, "accountFieldDeviceName", cx),
+                Input::new(&self.input).control(cx).w_full(),
+                None,
+                cx,
+            )))
+            .when_some(self.error.clone(), |column, error| {
+                column.child(field_error(error, cx))
+            })
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_end()
+                    .gap(tokens.spacing.sm)
+                    .child(
+                        Button::new("account-device-rename-cancel")
+                            .outline()
+                            .label(translated(&self.host, "cancel", cx))
+                            .control(cx)
+                            .disabled(self.busy)
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("account-device-rename-submit")
+                            .primary()
+                            .label(translated(&self.host, "confirm", cx))
+                            .control(cx)
+                            .loading(self.busy)
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.submit(window, cx);
+                            })),
+                    ),
+            )
+    }
+}
+
+// ───────────────────────── 删除 ─────────────────────────
+
+/// 删除确认；删除本机设备需额外警告（确认后会立即登出）。
+pub(crate) fn confirm_delete(
+    host: &Entity<AccountHost>,
+    device: &CloudDevice,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let title = translated(host, "accountDeviceDeleteConfirmTitle", cx);
+    let mut description = translated(host, "accountDeviceDeleteConfirmDesc", cx).to_string();
+    if device.is_current {
+        description.push_str("\n\n");
+        description.push_str(&translated(host, "accountDeviceDeleteCurrentWarning", cx));
+    }
+    let description = SharedString::from(description);
+    let ok = translated(host, "accountDeviceDeleteAction", cx);
+    let cancel = translated(host, "cancel", cx);
+    let host = host.clone();
+    let device_id = device.id.clone();
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let host = host.clone();
+        let device_id = device_id.clone();
+        alert
+            .title(dialog_title(title.clone(), cx))
+            .description(description.clone())
+            .footer(dialog_footer(
+                Some(cancel.clone()),
+                ok.clone(),
+                DialogIntent::Destructive,
+                cx,
+            ))
+            .on_ok(move |_, window, cx| {
+                let future = host.update(cx, |host, _| host.delete_device(&device_id));
+                let host = host.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        let result = future.await;
+                        let _ = cx.update(|window, cx| {
+                            if let Err(error) = result {
+                                let message = error_text(
+                                    host.read(cx).translator().read(cx),
+                                    &error,
+                                    ErrorContext::General,
+                                );
+                                window.push_notification(Notification::error(message), cx);
+                            }
+                        });
+                    })
+                    .detach();
+                true
+            })
+    });
+}
+
+/// 解除局域网配对确认。
+pub(crate) fn confirm_unpair(
+    host: &Entity<AccountHost>,
+    device: &LinkDeviceInfo,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let translator = host.read(cx).translator().read(cx).clone();
+    let title = t(&translator, "linkedDeviceRemoveTitle");
+    let description = t_with(
+        &translator,
+        "linkedDeviceRemoveDesc",
+        &[("name", &device.name)],
+    );
+    let ok = t(&translator, "linkedDeviceRemove");
+    let cancel = t(&translator, "cancel");
+    let host = host.clone();
+    let fingerprint = device.fingerprint.clone();
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let host = host.clone();
+        let fingerprint = fingerprint.clone();
+        alert
+            .title(dialog_title(title.clone(), cx))
+            .description(description.clone())
+            .footer(dialog_footer(
+                Some(cancel.clone()),
+                ok.clone(),
+                DialogIntent::Destructive,
+                cx,
+            ))
+            .on_ok(move |_, window, cx| {
+                let params = serde_json::to_value(LinkDeviceParams {
+                    fingerprint: fingerprint.clone(),
+                })
+                .unwrap_or_default();
+                let future = host.read(cx).port().execute(AccountCommand::Link {
+                    method: fluxdown_protocol::method::AGENT_LINK_REMOVE,
+                    params,
+                });
+                let host = host.clone();
+                window
+                    .spawn(cx, async move |cx| {
+                        if let Err(error) = future.await {
+                            let _ = cx.update(|window, cx| {
+                                let message = error_text(
+                                    host.read(cx).translator().read(cx),
+                                    &error,
+                                    ErrorContext::Pairing,
+                                );
+                                window.push_notification(Notification::error(message), cx);
+                            });
+                        }
+                    })
+                    .detach();
+                true
+            })
+    });
+}
+
+// ───────────────────────── 详情 ─────────────────────────
+
+pub(crate) fn open_detail(
+    host: &Entity<AccountHost>,
+    device: &CloudDevice,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let translator = host.read(cx).translator().read(cx).clone();
+    let title = t(&translator, "accountDeviceDetailTitle");
+    let platform = device.platform.clone().unwrap_or_default();
+    let platform_text = platform_label_key(&platform)
+        .map_or_else(|| platform.clone(), |key| t(&translator, key).to_string());
+    let mut rows: Vec<(SharedString, String)> = vec![
+        (
+            t(&translator, "accountDeviceFieldOnline"),
+            t(
+                &translator,
+                if device.is_online {
+                    "deviceOnline"
+                } else {
+                    "deviceOffline"
+                },
+            )
+            .to_string(),
+        ),
+        (t(&translator, "accountDeviceFieldPlatform"), platform_text),
+        (
+            t(&translator, "accountDeviceFieldAppVersion"),
+            device.app_version.clone().unwrap_or_default(),
+        ),
+        (
+            t(&translator, "accountDeviceFieldLastIp"),
+            device.last_ip.clone().unwrap_or_default(),
+        ),
+        (
+            t(&translator, "accountDeviceFieldCreatedAt"),
+            format_timestamp(&device.created_at),
+        ),
+        (
+            t(&translator, "accountDeviceFieldLastSeenAt"),
+            format_timestamp(&device.last_seen_at),
+        ),
+    ];
+    if let Some(dir) = device
+        .default_save_dir
+        .as_deref()
+        .filter(|dir| !dir.is_empty())
+    {
+        rows.push((t(&translator, "accountDeviceFieldSaveDir"), dir.to_owned()));
+    }
+    rows.push((
+        t(&translator, "accountDeviceFieldId"),
+        device.device_id.clone(),
+    ));
+    let name = device.name.clone();
+    let close = t(&translator, "close");
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let rows = rows.clone();
+        let name = name.clone();
+        let close = close.clone();
+        dialog
+            .title(dialog_title(title.clone(), cx))
+            .w(px(480.))
+            .content(move |content, _, cx| {
+                let tokens = active_theme(cx).tokens().clone();
+                content.child(
+                    v_flex()
+                        .w_full()
+                        .gap(tokens.spacing.sm)
+                        .child(
+                            div()
+                                .text_size(tokens.typography.sm.size)
+                                .line_height(tokens.typography.sm.line_height)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(tokens.colors.foreground)
+                                .child(name.clone()),
+                        )
+                        .children(rows.iter().filter(|(_, value)| !value.is_empty()).map(
+                            |(label, value)| {
+                                h_flex()
+                                    .w_full()
+                                    .items_start()
+                                    .justify_between()
+                                    .gap(tokens.spacing.lg)
+                                    .child(field_hint(label.clone(), cx))
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(tokens.typography.xs.size)
+                                            .line_height(tokens.typography.xs.line_height)
+                                            .text_color(tokens.colors.foreground)
+                                            .child(value.clone()),
+                                    )
+                            },
+                        )),
+                )
+            })
+            .footer(dialog_footer(
+                None,
+                close.clone(),
+                DialogIntent::Confirm,
+                cx,
+            ))
+    });
+}
+
+// ───────────────────────── 管理全部 ─────────────────────────
+
+struct ManageAllDialog {
+    host: Entity<AccountHost>,
+    search: Entity<InputState>,
+}
+
+pub(crate) fn open_manage_all(host: &Entity<AccountHost>, window: &mut Window, cx: &mut App) {
+    let title = translated(host, "accountDevicesManageAllTitle", cx);
+    let placeholder = translated(host, "accountDevicesSearchHint", cx);
+    let host = host.clone();
+    let view = cx.new(|cx| {
+        cx.observe(&host, |_, _, cx| cx.notify()).detach();
+        let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
+        cx.subscribe(&search, |_, _, event, cx| {
+            if matches!(event, InputEvent::Change) {
+                cx.notify();
+            }
+        })
+        .detach();
+        ManageAllDialog { host, search }
+    });
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let view = view.clone();
+        dialog
+            .title(dialog_title(title.clone(), cx))
+            .w(px(600.))
+            .content(move |content, _, _| content.child(view.clone()))
+    });
+}
+
+impl Render for ManageAllDialog {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = active_theme(cx).tokens().clone();
+        let query = self.search.read(cx).value().to_string();
+        let devices = filtered(self.host.read(cx).controller.devices(), &query);
+        let translator = self.host.read(cx).translator().read(cx).clone();
+        let empty = devices.is_empty();
+        let no_results = t(&translator, "accountDevicesSearchNoResults");
+        let count = self.host.read(cx).controller.devices().len();
+        let hint = t_with(
+            &translator,
+            "accountDevicesManageAll",
+            &[("count", &count.to_string())],
+        );
+        let rows: Vec<_> = devices
+            .iter()
+            .enumerate()
+            .map(|(index, device)| {
+                device_row(
+                    &self.host,
+                    "account-devices-all",
+                    device,
+                    index > 0,
+                    &translator,
+                    cx,
+                )
+            })
+            .collect();
+        v_flex()
+            .w_full()
+            .gap(tokens.spacing.md)
+            .child(Input::new(&self.search).control(cx).w_full())
+            .child(field_hint(hint, cx))
+            .child(
+                div()
+                    .id("account-devices-all-scroll")
+                    .w_full()
+                    .max_h(px(380.))
+                    .overflow_y_scroll()
+                    .child(if empty {
+                        div()
+                            .w_full()
+                            .py(tokens.spacing.lg)
+                            .flex()
+                            .justify_center()
+                            .child(field_hint(no_results, cx))
+                            .into_any_element()
+                    } else {
+                        fluxdown_ui_components::card(cx)
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .children(rows)
+                            .into_any_element()
+                    }),
+            )
+    }
+}

@@ -4,6 +4,7 @@ use std::{
     rc::Rc,
 };
 
+use fluxdown_protocol::{RemoteCommandAction, RemoteCommandParams, RemoteTaskStatus};
 use fluxdown_ui_components::{CheckState, FluxIcon, check_mark, tabular_numbers};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -26,11 +27,13 @@ use crate::{
     controller::DownloadsCommand,
     model::{
         CategoryIndex, DownloadFilter, DownloadTaskView, RowId, RowKey, SidebarSelection, TaskKind,
-        TaskProtocol, TaskSource, TaskState, TaskStore, format_bytes,
+        TaskProtocol, TaskSource, TaskState, TaskStore,
+        dispatch::DispatchSummary,
+        format_bytes,
         view_prefs::{DateBucket, SortDir, ViewGroupBy, ViewPrefs, ViewSortKey, state_group_key},
     },
     pages::downloads::DownloadView,
-    strings::DownloadStrings,
+    strings::{DownloadStrings, error_text},
 };
 
 /// 固定左侧选择列宽（含表格左侧留白）：平时显示文件类型图标，行悬停 / 已选中 /
@@ -287,6 +290,8 @@ impl From<&SidebarSelection> for TableFilter {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TaskMenuFacts {
     pub(crate) is_local: bool,
+    /// 任务可被控制（暂停 / 继续 / 删除）。远程任务云端状态未知时为 `false`。
+    pub(crate) controllable: bool,
     pub(crate) state: TaskState,
     pub(crate) boosted: bool,
     /// `url` 是否为 BT 哨兵值 `torrent-file://…`（不可重新下载）。
@@ -330,16 +335,14 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
         return Vec::new();
     }
     let mut items = Vec::new();
-    if selection
-        .iter()
-        .any(|task| !matches!(task.state, TaskState::Completed | TaskState::Downloading))
-    {
+    if selection.iter().any(|task| {
+        task.controllable && !matches!(task.state, TaskState::Completed | TaskState::Downloading)
+    }) {
         items.push(MenuEntry::Resume);
     }
-    if selection
-        .iter()
-        .any(|task| matches!(task.state, TaskState::Downloading | TaskState::Pending))
-    {
+    if selection.iter().any(|task| {
+        task.controllable && matches!(task.state, TaskState::Downloading | TaskState::Pending)
+    }) {
         items.push(MenuEntry::Pause);
     }
     if let [only] = selection {
@@ -380,8 +383,10 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
         items.push(MenuEntry::MoveToQueue);
     }
     items.push(MenuEntry::Separator);
-    items.push(MenuEntry::Delete);
-    items.push(MenuEntry::DeleteWithFiles);
+    if selection.iter().any(|task| task.controllable) {
+        items.push(MenuEntry::Delete);
+        items.push(MenuEntry::DeleteWithFiles);
+    }
     if selection.iter().any(|task| task.is_local) {
         items.push(MenuEntry::ShowDetail);
     }
@@ -442,8 +447,8 @@ pub(crate) struct DownloadTableDelegate {
     queue_names: Vec<(String, String)>,
     /// group_id → 名称。
     group_names: HashMap<String, String>,
-    /// 远程任务来源设备匹配用：设备 id / 指纹 → 别名集合。
-    device_aliases: HashMap<String, Vec<String>>,
+    /// 远程任务目标设备显示名：设备 id / 指纹 → 已消歧的名称。
+    device_names: HashMap<String, String>,
     /// 表格容器宽（`render_download_table` 在 prepaint 测得、帧外写入）；0 = 尚未测得。
     viewport_width: f32,
     /// 最近一次交给表格的文件名列宽（`column()` 写入）；与期望值不同才需 refresh。
@@ -480,7 +485,7 @@ impl DownloadTableDelegate {
             prefs: ViewPrefs::default(),
             queue_names: Vec::new(),
             group_names: HashMap::new(),
-            device_aliases: HashMap::new(),
+            device_names: HashMap::new(),
             viewport_width: 0.,
             applied_file_width: Cell::new(0.),
             columns_dirty: false,
@@ -526,9 +531,9 @@ impl DownloadTableDelegate {
         }
     }
 
-    pub(crate) fn set_device_aliases(&mut self, aliases: HashMap<String, Vec<String>>) {
-        if self.device_aliases != aliases {
-            self.device_aliases = aliases;
+    pub(crate) fn set_device_names(&mut self, names: HashMap<String, String>) {
+        if self.device_names != names {
+            self.device_names = names;
             self.view_dirty = true;
         }
     }
@@ -767,18 +772,7 @@ impl DownloadTableDelegate {
             TableFilter::Queue(queue_id) => {
                 task.source == TaskSource::Local && task.queue_id == *queue_id
             }
-            TableFilter::Device(device) => {
-                if device == SidebarSelection::LOCAL_DEVICE {
-                    task.source == TaskSource::Local
-                } else {
-                    task.source == TaskSource::Remote
-                        && (task.from_device == *device
-                            || self
-                                .device_aliases
-                                .get(device)
-                                .is_some_and(|aliases| aliases.contains(&task.from_device)))
-                }
-            }
+            TableFilter::Device(device) => SidebarSelection::device_matches(device, task),
             TableFilter::Group(group_id) => task.group_id == *group_id,
         }
     }
@@ -1195,6 +1189,12 @@ impl DownloadTableDelegate {
 
     /// 状态列主文案：下载中显示「速度 · 剩余时间」（只显示已知部分），其余为状态名。
     fn status_label(&self, task: &DownloadTaskView) -> SharedString {
+        match task.remote_status {
+            // 取消的远程任务不是「失败」；云端新增的未知状态不冒充任何已知状态。
+            Some(RemoteTaskStatus::Canceled) => return self.strings.status_canceled.clone(),
+            Some(RemoteTaskStatus::Unknown) => return SharedString::from("—"),
+            _ => {}
+        }
         if task.state != TaskState::Downloading {
             return self.strings.state_label(task.state);
         }
@@ -1491,7 +1491,15 @@ impl DownloadTableDelegate {
     /// 显示。底色与行悬停一致（选中时叠加选中色），点击不改变选中。
     fn render_row_actions(&self, task: &DownloadTaskView, cx: &App) -> Option<AnyElement> {
         let host = self.host.as_ref()?;
-        let mut actions = row_actions(task.state, task.key.is_local()).peekable();
+        let is_local = task.key.is_local();
+        let mut actions = row_actions(task.state, is_local)
+            .filter(|action| {
+                is_local
+                    || action
+                        .remote_action()
+                        .is_some_and(|remote| task.remote_can(remote))
+            })
+            .peekable();
         actions.peek()?;
         let theme = active_theme(cx);
         let tokens = theme.tokens();
@@ -1522,10 +1530,16 @@ impl DownloadTableDelegate {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
-                    let Some(command) = task_command(&key, action.command()) else {
-                        return;
-                    };
-                    let _ = host.update(cx, |view, cx| view.execute_commands(vec![command], cx));
+                    let _ = host.update(cx, |view, cx| {
+                        let command = view
+                            .controller
+                            .store()
+                            .get(&key)
+                            .and_then(|row| task_command(&row, action.command()));
+                        if let Some(command) = command {
+                            view.execute_commands(vec![command], cx);
+                        }
+                    });
                 })
                 .child(Icon::new(icon).size(extended.icon.md))
         });
@@ -1657,6 +1671,7 @@ impl DownloadTableDelegate {
         let row = self.store.get(key)?;
         Some(TaskMenuFacts {
             is_local: key.is_local(),
+            controllable: row.remote_status != Some(RemoteTaskStatus::Unknown),
             state: row.state,
             boosted: row.boosted,
             is_torrent_sentinel: row.url.starts_with("torrent-file://"),
@@ -2208,11 +2223,18 @@ impl TableDelegate for DownloadTableDelegate {
                 meta_cell(task.source_site().to_owned(), muted, false, cx)
             }
             DownloadColumnKind::Queue => {
-                let name = self
-                    .queue_names
-                    .iter()
-                    .find(|(id, _)| *id == task.queue_id)
-                    .map_or_else(|| task.queue_id.clone(), |(_, name)| name.clone());
+                // 远程任务没有本机队列：这一列显示它所在的目标设备。
+                let name = if task.source == TaskSource::Remote {
+                    self.device_names
+                        .get(&task.to_device)
+                        .cloned()
+                        .unwrap_or_else(|| task.to_device.clone())
+                } else {
+                    self.queue_names
+                        .iter()
+                        .find(|(id, _)| *id == task.queue_id)
+                        .map_or_else(|| task.queue_id.clone(), |(_, name)| name.clone())
+                };
                 meta_cell(name, muted, false, cx)
             }
         };
@@ -2322,6 +2344,15 @@ impl RowAction {
         }
     }
 
+    /// 远程任务上对应的云端动作（打开 / 显示没有远程对应）。
+    fn remote_action(self) -> Option<RemoteCommandAction> {
+        match self {
+            Self::Pause => Some(RemoteCommandAction::Pause),
+            Self::Resume | Self::Retry => Some(RemoteCommandAction::Resume),
+            Self::Open | Self::Reveal => None,
+        }
+    }
+
     fn id(self) -> &'static str {
         match self {
             Self::Pause => "download-row-action-pause",
@@ -2334,12 +2365,13 @@ impl RowAction {
 }
 
 /// 行悬停操作集合：下载中 / 排队 → 暂停；暂停 → 继续；失败 → 重试；完成 → 打开
-/// 文件（仅本地）；本地任务再加「在文件夹中显示」。远程任务只给可用操作。
+/// 文件（仅本地）；本地任务再加「在文件夹中显示」。远程任务只给可用操作：已结束的远程
+/// 任务（失败 / 取消 / 完成）不能「继续」——云端只接受暂停中任务的继续。
 pub(crate) fn row_actions(state: TaskState, is_local: bool) -> impl Iterator<Item = RowAction> {
     let primary = match state {
         TaskState::Downloading | TaskState::Pending => Some(RowAction::Pause),
         TaskState::Paused => Some(RowAction::Resume),
-        TaskState::Failed => Some(RowAction::Retry),
+        TaskState::Failed => is_local.then_some(RowAction::Retry),
         TaskState::Completed => is_local.then_some(RowAction::Open),
     };
     primary
@@ -2347,24 +2379,29 @@ pub(crate) fn row_actions(state: TaskState, is_local: bool) -> impl Iterator<Ite
         .chain(is_local.then_some(RowAction::Reveal))
 }
 
-/// 单任务命令：远程任务只有暂停 / 继续 / 删除经 `agent.remote.command` 转发，
-/// 打开 / 显示没有本机文件（返回 `None`）；全局命令不属于单任务。
-fn task_command(key: &RowKey, action: ToolbarCommand) -> Option<DownloadsCommand> {
-    let task_id = key.task_id().to_owned();
-    if !key.is_local() {
+/// 单任务命令：本地任务走 daemon；远程任务只有暂停 / 继续 / 删除经 `agent.remote.command`
+/// 转发，且仅限云端状态允许该动作的任务（状态未知的任务不控制）。打开 / 显示没有本机
+/// 文件、全局命令不属于单任务，返回 `None`。
+fn task_command(row: &DownloadTaskView, action: ToolbarCommand) -> Option<DownloadsCommand> {
+    let task_id = row.key.task_id().to_owned();
+    if !row.key.is_local() {
         let remote_action = match action {
-            ToolbarCommand::Resume => "resume",
-            ToolbarCommand::Pause => "pause",
-            ToolbarCommand::Delete => "delete",
+            ToolbarCommand::Resume => RemoteCommandAction::Resume,
+            ToolbarCommand::Pause => RemoteCommandAction::Pause,
+            ToolbarCommand::Delete => RemoteCommandAction::Delete,
             ToolbarCommand::Open
             | ToolbarCommand::Reveal
             | ToolbarCommand::PauseAll
             | ToolbarCommand::ResumeAll => return None,
         };
-        return Some(DownloadsCommand::RemoteCommand(serde_json::json!({
-            "taskId": task_id,
-            "action": remote_action,
-        })));
+        return row
+            .remote_can(remote_action)
+            .then_some(DownloadsCommand::RemoteCommand(RemoteCommandParams {
+                task_id,
+                action: remote_action,
+                command_id: None,
+                delete_files: false,
+            }));
     }
     Some(match action {
         ToolbarCommand::Resume => DownloadsCommand::Resume { task_id },
@@ -2510,26 +2547,55 @@ impl DownloadView {
         action: ToolbarCommand,
         cx: &Context<Self>,
     ) -> Vec<DownloadsCommand> {
+        let store = self.controller.store();
+        let commands_for = |keys: Vec<RowKey>| -> Vec<DownloadsCommand> {
+            keys.iter()
+                .filter_map(|key| {
+                    let row = store.get(key)?;
+                    task_command(&row, action)
+                })
+                .collect()
+        };
         match action {
             ToolbarCommand::PauseAll => vec![DownloadsCommand::PauseAll],
             ToolbarCommand::ResumeAll => vec![DownloadsCommand::ResumeAll],
-            ToolbarCommand::Open => self
-                .table_state
-                .read(cx)
-                .delegate()
-                .openable_selected_keys()
-                .iter()
-                .filter_map(|key| task_command(key, action))
-                .collect(),
-            _ => self
-                .table_state
-                .read(cx)
-                .delegate()
-                .selected_keys()
-                .iter()
-                .filter_map(|key| task_command(key, action))
-                .collect(),
+            ToolbarCommand::Open => commands_for(
+                self.table_state
+                    .read(cx)
+                    .delegate()
+                    .openable_selected_keys(),
+            ),
+            _ => commands_for(self.table_state.read(cx).delegate().selected_keys()),
         }
+    }
+
+    /// 「删除」命令：本地走 daemon（`delete_files` 决定是否删文件）；远程任务经
+    /// `agent.remote.command`（`delete_files` 同样透传给目标设备），状态未知的任务不删。
+    pub(crate) fn delete_commands(
+        &self,
+        keys: &[RowKey],
+        delete_files: bool,
+    ) -> Vec<DownloadsCommand> {
+        let store = self.controller.store();
+        keys.iter()
+            .filter_map(|key| {
+                if key.is_local() {
+                    return Some(DownloadsCommand::Delete {
+                        task_id: key.task_id().to_owned(),
+                        delete_files,
+                    });
+                }
+                let row = store.get(key)?;
+                row.remote_can(RemoteCommandAction::Delete).then(|| {
+                    DownloadsCommand::RemoteCommand(RemoteCommandParams {
+                        task_id: key.task_id().to_owned(),
+                        action: RemoteCommandAction::Delete,
+                        command_id: None,
+                        delete_files,
+                    })
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn execute_toolbar(&mut self, action: ToolbarCommand, cx: &mut Context<Self>) {
@@ -2537,8 +2603,9 @@ impl DownloadView {
         self.execute_commands(commands, cx);
     }
 
-    /// 逐条执行；任一失败在页面横幅提示。只含一条单任务「继续」/「重新下载」时，成功后
-    /// 通知宿主这是一次交互式开始（批量选择不逐个弹进度窗口）。
+    /// 逐条执行；任一失败在页面横幅提示（按错误 `reason` 给出原因，同一批里先失败的
+    /// 错误一直保留，后完成的成功不会冲掉它）。只含一条单任务「继续」/「重新下载」时，
+    /// 成功后通知宿主这是一次交互式开始（批量选择不逐个弹进度窗口）。
     pub(crate) fn execute_commands(
         &mut self,
         commands: Vec<DownloadsCommand>,
@@ -2549,14 +2616,18 @@ impl DownloadView {
             [DownloadsCommand::Redownload(request, _)] if !request.start_paused => Some(None),
             _ => None,
         };
+        let batch = Rc::new(std::cell::RefCell::new(DispatchSummary::default()));
         for command in commands {
             let future = self.controller.execute(command);
             let interactive_start = interactive_start.clone();
+            let batch = Rc::clone(&batch);
             cx.spawn(async move |this, cx| {
                 let result = future.await;
-                let failed = result.is_err();
+                batch.borrow_mut().record(&result);
                 let _ = this.update(cx, |this, cx| {
-                    this.last_error = failed.then(|| this.strings.action_failed.clone());
+                    this.last_error = batch.borrow().first_error.as_ref().map(|error| {
+                        SharedString::from(error_text(this.translator.read(cx), error))
+                    });
                     if let (Ok(result), Some(resumed)) = (&result, interactive_start) {
                         // 继续：原任务 ID；重新下载：响应里的新任务 ID。
                         let started =
@@ -2583,8 +2654,8 @@ mod tests {
     use gpui::Modifiers;
 
     use super::{
-        DownloadColumnKind, DownloadTableDelegate, RowAction, SelectionSummary, VisibleRow,
-        percent_label, row_actions,
+        DownloadColumnKind, DownloadTableDelegate, DownloadsCommand, RowAction, SelectionSummary,
+        ToolbarCommand, VisibleRow, percent_label, row_actions, task_command,
     };
     use crate::{
         model::{
@@ -2945,8 +3016,39 @@ mod tests {
             actions(TaskState::Completed, true),
             [RowAction::Open, RowAction::Reveal]
         );
-        // 远程已完成任务没有本机文件：无任何行操作。
+        // 远程已完成任务没有本机文件：无任何行操作；远程失败 / 取消的任务不能「继续」。
         assert!(actions(TaskState::Completed, false).is_empty());
+        assert!(actions(TaskState::Failed, false).is_empty());
+    }
+
+    #[test]
+    fn remote_task_commands_carry_typed_params_and_skip_uncontrollable_rows() {
+        use fluxdown_protocol::{RemoteCommandAction, RemoteTaskDto};
+        let row = |status: &str| {
+            let dto = serde_json::from_value::<RemoteTaskDto>(serde_json::json!({
+                "id": "r1", "toDevice": "dev-b", "url": "https://example.com/a", "status": status
+            }))
+            .expect("remote task");
+            DownloadTaskView::remote(&dto)
+        };
+        let Some(DownloadsCommand::RemoteCommand(params)) =
+            task_command(&row("paused"), ToolbarCommand::Resume)
+        else {
+            panic!("paused remote task must resume through remote.command");
+        };
+        assert_eq!(params.task_id, "r1");
+        assert_eq!(params.action, RemoteCommandAction::Resume);
+        assert!(!params.delete_files);
+        // 状态不允许 / 未知 / 无远程对应的动作：不发命令。
+        assert!(task_command(&row("completed"), ToolbarCommand::Pause).is_none());
+        assert!(task_command(&row("paused"), ToolbarCommand::Pause).is_none());
+        assert!(task_command(&row("brandNewState"), ToolbarCommand::Delete).is_none());
+        assert!(task_command(&row("downloading"), ToolbarCommand::Reveal).is_none());
+        assert!(matches!(
+            task_command(&row("completed"), ToolbarCommand::Delete),
+            Some(DownloadsCommand::RemoteCommand(params))
+                if params.action == RemoteCommandAction::Delete
+        ));
     }
 
     #[test]
@@ -2967,6 +3069,7 @@ mod context_menu_tests {
     fn task(is_local: bool, state: TaskState) -> TaskMenuFacts {
         TaskMenuFacts {
             is_local,
+            controllable: true,
             state,
             boosted: false,
             is_torrent_sentinel: false,
@@ -2977,6 +3080,27 @@ mod context_menu_tests {
     #[test]
     fn empty_selection_has_no_menu_items() {
         assert!(context_menu_items(&[]).is_empty());
+    }
+
+    #[test]
+    fn uncontrollable_remote_task_offers_no_control_entries() {
+        let mut unknown = task(false, TaskState::Pending);
+        unknown.controllable = false;
+        let items = context_menu_items(&[unknown]);
+        assert!(items.contains(&MenuEntry::CopyUrl));
+        for entry in [
+            MenuEntry::Pause,
+            MenuEntry::Resume,
+            MenuEntry::Delete,
+            MenuEntry::DeleteWithFiles,
+        ] {
+            assert!(!items.contains(&entry), "{entry:?}");
+        }
+        // 与可控任务混选时，控制项仍可用（不可控的行在命令层被跳过）。
+        let mut unknown = task(false, TaskState::Pending);
+        unknown.controllable = false;
+        let mixed = context_menu_items(&[unknown, task(false, TaskState::Paused)]);
+        assert!(mixed.contains(&MenuEntry::Delete));
     }
 
     #[test]

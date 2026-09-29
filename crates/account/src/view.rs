@@ -4,11 +4,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_protocol::{AgentSnapshot, CloudEndpointDto, ServiceEvent, method};
+use fluxdown_protocol::{CloudEndpointDto, method};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AppContext as _, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render,
+    App, AppContext as _, ClipboardItem, Context, Entity, IntoElement, ParentElement, Render,
     SharedString, Styled, Subscription, Window, div, px,
 };
 use gpui_component::WindowExt as _;
@@ -16,6 +16,8 @@ use gpui_component::input::{InputEvent, InputState};
 use gpui_component::notification::Notification;
 
 use crate::controller::AccountController;
+use crate::errors::{ErrorContext, error_text};
+use crate::host::{AccountHost, AccountHostEvent};
 use crate::pages;
 use crate::{AccountCommand, AccountPort, PortFuture};
 
@@ -28,7 +30,7 @@ const SERVER_ADDRESS_VISIBLE: bool = cfg!(debug_assertions);
 
 pub struct AccountView {
     translator: Entity<Translator>,
-    pub(crate) controller: AccountController,
+    host: Entity<AccountHost>,
     last_error: Option<SharedString>,
     origin_id_copied: bool,
     /// agent 回报的 FluxCloud 地址；`None` 表示未加载或正式构建不查询。
@@ -41,17 +43,27 @@ pub struct AccountView {
     cloud_refreshing: bool,
     /// 设备卡片「重试」在途：同上，两者互不影响。
     devices_refreshing: bool,
+    /// 已配对设备「刷新」在途。
+    linked_refreshing: bool,
     _endpoint_subscription: Subscription,
+    _host_subscription: Subscription,
 }
 
 impl AccountView {
     pub fn new(
         translator: Entity<Translator>,
-        port: Arc<dyn AccountPort>,
+        host: Entity<AccountHost>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
+        cx.observe(&host, |_, _, cx| cx.notify()).detach();
+        let _host_subscription = cx.subscribe(&host, |this, _, event, cx| {
+            if matches!(event, AccountHostEvent::SnapshotReplaced) {
+                this.last_error = None;
+                this.load_endpoint(cx);
+            }
+        });
         let endpoint_input = cx.new(|cx| InputState::new(window, cx));
         let _endpoint_subscription =
             cx.subscribe_in(&endpoint_input, window, |this, input, event, window, cx| {
@@ -61,8 +73,8 @@ impl AccountView {
                 }
             });
         let mut this = Self {
-            controller: AccountController::new(port),
             translator,
+            host,
             last_error: None,
             origin_id_copied: false,
             endpoint: None,
@@ -71,37 +83,27 @@ impl AccountView {
             endpoint_busy: false,
             cloud_refreshing: false,
             devices_refreshing: false,
+            linked_refreshing: false,
             _endpoint_subscription,
+            _host_subscription,
         };
         this.load_endpoint(cx);
         this
     }
 
-    pub fn replace_snapshot(&mut self, snapshot: &AgentSnapshot, cx: &mut Context<Self>) {
-        self.last_error = None;
-        self.controller.replace_snapshot(snapshot);
-        self.load_endpoint(cx);
-        cx.notify();
+    pub(crate) fn controller<'a>(&self, cx: &'a App) -> &'a AccountController {
+        &self.host.read(cx).controller
     }
 
-    pub fn apply_event(&mut self, event: &ServiceEvent, cx: &mut Context<Self>) {
-        self.controller.apply_event(event);
-        cx.notify();
-    }
-
-    pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
-        self.last_error = Some(crate::t(
-            self.translator.read(cx),
-            "localServiceDisconnected",
-        ));
-        self.controller.mark_stale();
-        cx.notify();
+    pub(crate) fn port(&self, cx: &App) -> Arc<dyn AccountPort> {
+        self.host.read(cx).port()
     }
 
     /// 通用「发起命令 → 失败提示」；成功结果由快照/事件驱动的重渲染呈现。
     pub(crate) fn spawn_action(
         &mut self,
         future: PortFuture<serde_json::Value>,
+        context: ErrorContext,
         cx: &mut Context<Self>,
     ) {
         self.last_error = None;
@@ -110,7 +112,45 @@ impl AccountView {
             let result = future.await;
             let _ = this.update(cx, |this, cx| {
                 if let Err(error) = result {
-                    this.last_error = Some(crate::error_text(this.translator.read(cx), &error));
+                    this.last_error = Some(error_text(this.translator.read(cx), &error, context));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 登出：用户主动结束会话，agent 不发撤销提示。
+    pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
+        let future = self.port(cx).execute(AccountCommand::Auth {
+            method: method::AGENT_AUTH_LOGOUT,
+            params: serde_json::json!({}),
+        });
+        self.spawn_action(future, ErrorContext::General, cx);
+    }
+
+    /// 已配对设备「刷新」：探测在线状态；结果经 `LinkedDevicesChanged` 回流。
+    pub(crate) fn refresh_linked(&mut self, cx: &mut Context<Self>) {
+        if self.linked_refreshing {
+            return;
+        }
+        let future = self.port(cx).execute(AccountCommand::Link {
+            method: method::AGENT_LINK_REFRESH,
+            params: serde_json::json!({}),
+        });
+        self.linked_refreshing = true;
+        self.last_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let _ = this.update(cx, |this, cx| {
+                this.linked_refreshing = false;
+                if let Err(error) = result {
+                    this.last_error = Some(error_text(
+                        this.translator.read(cx),
+                        &error,
+                        ErrorContext::Pairing,
+                    ));
                 }
                 cx.notify();
             });
@@ -140,7 +180,7 @@ impl AccountView {
         if self.cloud_refreshing {
             return;
         }
-        let port = self.controller.port();
+        let port = self.port(cx);
         let profile = port.execute(AccountCommand::Auth {
             method: method::AGENT_AUTH_REFRESH_PROFILE,
             params: serde_json::json!({}),
@@ -170,7 +210,7 @@ impl AccountView {
         if self.devices_refreshing {
             return;
         }
-        let future = self.controller.port().execute(AccountCommand::Device {
+        let future = self.port(cx).execute(AccountCommand::Device {
             method: method::AGENT_DEVICE_LIST,
             params: serde_json::json!({}),
         });
@@ -202,7 +242,7 @@ impl AccountView {
                 cx,
             ),
             Err(error) => {
-                let message = crate::error_text(translator, &error);
+                let message = error_text(translator, &error, ErrorContext::General);
                 self.last_error = Some(message.clone());
                 window.push_notification(Notification::error(message), cx);
             }
@@ -215,13 +255,10 @@ impl AccountView {
         if !SERVER_ADDRESS_VISIBLE {
             return;
         }
-        let future = self
-            .controller
-            .port()
-            .execute(AccountCommand::CloudEndpoint {
-                method: method::AGENT_CLOUD_ENDPOINT_GET,
-                params: serde_json::json!({}),
-            });
+        let future = self.port(cx).execute(AccountCommand::CloudEndpoint {
+            method: method::AGENT_CLOUD_ENDPOINT_GET,
+            params: serde_json::json!({}),
+        });
         cx.spawn(async move |this, cx| {
             let Ok(value) = future.await else {
                 return;
@@ -269,13 +306,10 @@ impl AccountView {
         }
         self.endpoint_busy = true;
         cx.notify();
-        let future = self
-            .controller
-            .port()
-            .execute(AccountCommand::CloudEndpoint {
-                method: method::AGENT_CLOUD_ENDPOINT_SET,
-                params: serde_json::json!({ "baseUrl": base_url }),
-            });
+        let future = self.port(cx).execute(AccountCommand::CloudEndpoint {
+            method: method::AGENT_CLOUD_ENDPOINT_SET,
+            params: serde_json::json!({ "baseUrl": base_url }),
+        });
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
             let _ = this.update_in(cx, |this, window, cx| {
@@ -305,7 +339,7 @@ impl AccountView {
                         {
                             crate::t(translator, "accountServerAddressInvalid")
                         } else {
-                            crate::error_text(translator, &error)
+                            error_text(translator, &error, ErrorContext::General)
                         };
                         window.push_notification(Notification::error(message), cx);
                         if let Some(endpoint) = &this.endpoint {
@@ -341,13 +375,24 @@ impl Render for AccountView {
         self.sync_endpoint_input(window, cx);
         let translator = self.translator.read(cx).clone();
         let tokens = active_theme(cx).tokens().clone();
-        let disabled = self.controller.is_stale();
-        let session = self.controller.session().cloned();
-        let devices = self.controller.devices().to_vec();
-        let sync = self.controller.sync_status().clone();
-        let last_error = self.last_error.clone();
+        let (disabled, session, devices, linked, sync) = {
+            let controller = self.controller(cx);
+            (
+                controller.is_stale(),
+                controller.session().cloned(),
+                controller.devices().to_vec(),
+                controller.linked_devices().to_vec(),
+                controller.sync_status().clone(),
+            )
+        };
+        // 连接断开时只读并提示；恢复后由快照清除。
+        let last_error = if disabled {
+            Some(crate::t(&translator, "localServiceDisconnected"))
+        } else {
+            self.last_error.clone()
+        };
         let origin_id_copied = self.origin_id_copied;
-        let port = self.controller.port();
+        let port = self.port(cx);
         let server_address = self
             .endpoint
             .as_ref()
@@ -386,18 +431,24 @@ impl Render for AccountView {
         };
 
         let logged_in = session.is_some();
-        if let Some(session) = session {
-            column = column
-                .child(pages::security::render(&translator, &tokens, &session, cx))
-                .child(pages::devices::render(
-                    &translator,
-                    &tokens,
-                    &devices,
-                    disabled,
-                    self.devices_refreshing,
-                    cx,
-                ));
+        if let Some(session) = &session {
+            column = column.child(pages::security::render(&translator, &tokens, session, cx));
         }
+        // 已配对设备与账号无关：未登录也能管理；云设备仅登录后显示。
+        column = column.child(pages::devices::render(
+            &translator,
+            &tokens,
+            &pages::devices::DevicesState {
+                host: &self.host,
+                devices: &devices,
+                linked: &linked,
+                logged_in,
+                disabled,
+                refreshing: self.devices_refreshing,
+                linked_refreshing: self.linked_refreshing,
+            },
+            cx,
+        ));
         column = column.child(pages::cloud_features::render(
             &translator,
             &tokens,

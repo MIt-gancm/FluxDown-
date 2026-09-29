@@ -16,6 +16,7 @@ use gpui_component::{
     h_flex,
     menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem},
     scroll::ScrollableElement as _,
+    tooltip::Tooltip,
     v_flex,
 };
 
@@ -23,7 +24,7 @@ use crate::{
     controller::DownloadsCommand,
     model::{
         DownloadFilter, DownloadStatusFilter, SidebarSection, SidebarSelection, StatusFolderMotion,
-        TaskSource,
+        devices::{DeviceKind, devices_section_visible},
     },
     pages::downloads::DownloadView,
 };
@@ -129,13 +130,15 @@ impl DownloadView {
                 menu.item(
                     PopupMenuItem::new(hide_label.clone()).on_click(move |_, _window, cx| {
                         let _ = this.update(cx, |this, cx| {
-                            this.execute_commands(
-                                vec![DownloadsCommand::SetSyncedPreference {
-                                    key: section.visibility_pref(),
-                                    value: serde_json::Value::Bool(false),
-                                }],
-                                cx,
-                            );
+                            let (key, value) =
+                                (section.visibility_pref(), serde_json::Value::Bool(false));
+                            // 设备区是否显示只对本机有意义：写设备本地偏好，不同步到其他设备。
+                            let command = if section.visibility_syncs() {
+                                DownloadsCommand::SetSyncedPreference { key, value }
+                            } else {
+                                DownloadsCommand::SetLocalPreference { key, value }
+                            };
+                            this.execute_commands(vec![command], cx);
                         });
                     }),
                 )
@@ -246,22 +249,13 @@ impl DownloadView {
             .count_in_queue(queue_id)
     }
 
-    /// 设备计数：本机计所有本地任务；其余按远程任务来源设备 id / 指纹精确匹配。
+    /// 设备计数：与表格筛选同一规则（[`SidebarSelection::device_matches`]）——本机计所有
+    /// 本地任务；具体设备按远程任务的目标设备计；「全部设备」= 本地 + 远程。
     fn device_count(&self, device_id: &str, cx: &Context<Self>) -> usize {
-        if device_id == SidebarSelection::LOCAL_DEVICE {
-            self.table_state
-                .read(cx)
-                .delegate()
-                .count_where(|task| task.source == TaskSource::Local)
-        } else {
-            let device_id = device_id.to_owned();
-            self.table_state
-                .read(cx)
-                .delegate()
-                .count_where(move |task| {
-                    task.source == TaskSource::Remote && task.from_device == device_id
-                })
-        }
+        self.table_state
+            .read(cx)
+            .delegate()
+            .count_where(|task| SidebarSelection::device_matches(device_id, task))
     }
 
     /// 状态项：图标位在悬停时换成分类展开箭头（点击箭头只切换展开，Notion / Linear
@@ -777,7 +771,41 @@ impl DownloadView {
             )
     }
 
-    /// 设备区：本机 + 云设备 + 已配对设备；远程任务按来源设备 id / 指纹计数。
+    /// 「添加设备」按钮：随设备区标题悬停出现；点击交给宿主（app 打开账号 / 配对对话框）。
+    fn add_device_button(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let open_add_device = self.host.open_add_device.clone()?;
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let icon_size = extended.icon.sm;
+        let nav_hover = extended.colors.nav_hover;
+        let hover_foreground = tokens.colors.foreground;
+        let tooltip = self.strings.add_device.clone();
+        Some(
+            div()
+                .id("download-device-add")
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(icon_size + tokens.spacing.xs * 2.)
+                .rounded(tokens.radius.sm)
+                .cursor_pointer()
+                .text_color(tokens.colors.muted_foreground)
+                .hover(move |style| style.bg(nav_hover).text_color(hover_foreground))
+                .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    open_add_device(window, cx);
+                })
+                .child(Icon::new(FluxIcon::Plus).size(icon_size))
+                .into_any_element(),
+        )
+    }
+
+    /// 设备区：（有其他设备时）全部设备 + 本机 + 账号其他设备 + 已配对设备。云设备排除本机
+    /// （名册包含请求设备自身）；在线状态用圆点；同名设备已追加短码；远程任务按目标设备计数。
     fn render_devices_section(
         &self,
         first: bool,
@@ -787,41 +815,46 @@ impl DownloadView {
         let open_amount = self.section_open_amount(SidebarSection::Devices, window, cx);
         let theme = active_theme(cx);
         let icon_size = theme.extended().icon.lg;
-        let mut entries: Vec<(String, SharedString)> = vec![(
+        let online_color = theme.extended().colors.success;
+        let offline_color = theme.extended().colors.text_tertiary;
+        let others = self.controller.other_devices();
+        let mut rows: Vec<(String, SharedString, FluxIcon, Option<Hsla>)> = Vec::new();
+        if !others.is_empty() {
+            rows.push((
+                SidebarSelection::ALL_DEVICES.to_owned(),
+                self.strings.all_devices.clone(),
+                FluxIcon::Layers,
+                None,
+            ));
+        }
+        rows.push((
             SidebarSelection::LOCAL_DEVICE.to_owned(),
             self.strings.this_device.clone(),
-        )];
-        entries.extend(self.controller.cloud_devices().iter().map(|device| {
-            let name = if device.name.is_empty() {
-                device.device_id.clone()
-            } else {
-                device.name.clone()
+            FluxIcon::Cpu,
+            None,
+        ));
+        rows.extend(others.into_iter().map(|device| {
+            let icon = match device.kind {
+                DeviceKind::Cloud => FluxIcon::Globe,
+                DeviceKind::Paired => FluxIcon::Network,
             };
-            (device.device_id.clone(), SharedString::from(name))
+            let dot = if device.online {
+                online_color
+            } else {
+                offline_color
+            };
+            (device.id, SharedString::from(device.label), icon, Some(dot))
         }));
-        entries.extend(self.controller.linked_devices().iter().map(|device| {
-            let name = if device.name.is_empty() {
-                device.fingerprint.clone()
-            } else {
-                device.name.clone()
-            };
-            (device.fingerprint.clone(), SharedString::from(name))
-        }));
-        let count = entries.len() as f32;
-        let mut items = Vec::with_capacity(entries.len());
-        for (id, label) in entries {
-            let icon = if id == SidebarSelection::LOCAL_DEVICE {
-                FluxIcon::Cpu
-            } else {
-                FluxIcon::Globe
-            };
+        let count = rows.len() as f32;
+        let mut items = Vec::with_capacity(rows.len());
+        for (id, label, icon, dot) in rows {
             let task_count = self.device_count(&id, cx);
             items.push(self.nav_item(
                 format!("download-nav-device-{id}"),
                 SidebarSelection::Device(id),
                 label,
                 Icon::new(icon).size(icon_size),
-                (task_count, None),
+                (task_count, dot),
                 cx,
             ));
         }
@@ -831,7 +864,7 @@ impl DownloadView {
                 self.strings.sidebar_devices.clone(),
                 SidebarSection::Devices,
                 open_amount,
-                None,
+                self.add_device_button(cx),
                 cx,
             ))
             .child(
@@ -843,19 +876,16 @@ impl DownloadView {
             )
     }
 
-    /// 分区可见性：设备区三态（偏好显式设置则按值，未设置时按「是否有任何设备」
-    /// 判定，与 Flutter 桌面端 `showSidebarDeviceEffective` 同语义）；其余分区
-    /// 二态，默认显示。
+    /// 分区可见性：设备区三态（偏好显式设置则按值，未设置时按「是否存在其他设备」判定——
+    /// 账号里只有本机一台不算）；其余分区二态，默认显示。
     fn section_visible(&self, section: SidebarSection) -> bool {
         match section {
-            SidebarSection::Devices => self
-                .controller
-                .preference(section.visibility_pref())
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or_else(|| {
-                    !self.controller.cloud_devices().is_empty()
-                        || !self.controller.linked_devices().is_empty()
-                }),
+            SidebarSection::Devices => devices_section_visible(
+                self.controller
+                    .preference(section.visibility_pref())
+                    .and_then(serde_json::Value::as_bool),
+                self.controller.other_devices().len(),
+            ),
             _ => self
                 .controller
                 .preference_bool(section.visibility_pref(), true),

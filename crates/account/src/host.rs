@@ -1,0 +1,147 @@
+//! 跨窗口共享的账户状态：一个会话消费者，设置窗口的账户页、「添加设备」对话框、
+//! 入站配对确认框都读同一份数据；需要窗口的一次性提示（会话被结束、入站配对请求）
+//! 以事件抛给 app，由 app 选窗口展示。
+
+use std::sync::Arc;
+
+use fluxdown_protocol::{
+    AgentEvent, AgentSnapshot, ErrorReason, LinkPairingRequestDto, ServiceEvent,
+};
+use fluxdown_ui_i18n::Translator;
+use gpui::{Context, Entity, EventEmitter, SharedString};
+
+use crate::controller::AccountController;
+use crate::{AccountCommand, AccountPort, PortFuture};
+
+/// 需要 app 在某个窗口里展示的一次性提示。
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AccountHostEvent {
+    /// 收到新的入站配对请求（`session_id`）：应弹出确认框。
+    PairingRequested(String),
+    /// 会话被非用户主动结束（agent 的 `SessionRevoked`）：应给出一次性提示；
+    /// 提示尚未展示前原因保留在 [`AccountHost::take_pending_revocation`]。
+    SessionRevoked(ErrorReason),
+    /// 收到连接后的全量快照（账户页据此清除旧错误）。
+    SnapshotReplaced,
+}
+
+pub struct AccountHost {
+    translator: Entity<Translator>,
+    pub(crate) controller: AccountController,
+    /// 已收到、尚未有窗口展示的撤销原因（两个承载窗口都没开时保留，下次打开主窗口补弹一次）。
+    pending_revocation: Option<ErrorReason>,
+}
+
+impl EventEmitter<AccountHostEvent> for AccountHost {}
+
+impl AccountHost {
+    pub fn new(
+        translator: Entity<Translator>,
+        port: Arc<dyn AccountPort>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&translator, |_, _, cx| cx.notify()).detach();
+        Self {
+            translator,
+            controller: AccountController::new(port),
+            pending_revocation: None,
+        }
+    }
+
+    pub fn replace_snapshot(&mut self, snapshot: &AgentSnapshot, cx: &mut Context<Self>) {
+        let transition = self.controller.replace_snapshot(snapshot);
+        cx.emit(AccountHostEvent::SnapshotReplaced);
+        self.emit_transition(transition, cx);
+        cx.notify();
+    }
+
+    pub fn apply_event(&mut self, event: &ServiceEvent, cx: &mut Context<Self>) {
+        // 重新登录后，此前未展示的撤销提示作废。
+        if matches!(
+            event,
+            ServiceEvent::Agent(AgentEvent::SessionChanged(session)) if session.is_some()
+        ) {
+            self.pending_revocation = None;
+        }
+        let transition = self.controller.apply_event(event);
+        self.emit_transition(transition, cx);
+        cx.notify();
+    }
+
+    pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
+        self.controller.mark_stale();
+        cx.notify();
+    }
+
+    fn emit_transition(
+        &mut self,
+        transition: crate::controller::Transition,
+        cx: &mut Context<Self>,
+    ) {
+        for id in transition.new_pairing_requests {
+            cx.emit(AccountHostEvent::PairingRequested(id));
+        }
+        if let Some(reason) = transition.session_revoked {
+            self.pending_revocation = Some(reason);
+            cx.emit(AccountHostEvent::SessionRevoked(reason));
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn translator(&self) -> &Entity<Translator> {
+        &self.translator
+    }
+
+    #[must_use]
+    pub(crate) fn port(&self) -> Arc<dyn AccountPort> {
+        self.controller.port()
+    }
+
+    /// 仍在等待确认的入站请求（已被对端取消 / 过期后为 `None`）。
+    #[must_use]
+    pub fn pairing_request(&self, session_id: &str) -> Option<LinkPairingRequestDto> {
+        self.controller
+            .pairing_requests()
+            .iter()
+            .find(|request| request.session_id == session_id)
+            .cloned()
+    }
+
+    /// 当前全部待确认的入站请求 ID（app 在窗口就绪后补弹启动前已存在的请求）。
+    #[must_use]
+    pub fn pending_pairing_requests(&self) -> Vec<String> {
+        self.controller
+            .pairing_requests()
+            .iter()
+            .map(|request| request.session_id.clone())
+            .collect()
+    }
+
+    /// 取走尚未展示的撤销原因（展示时调用；无窗口可展示时不调用，原因留待补弹）。
+    pub fn take_pending_revocation(&mut self) -> Option<ErrorReason> {
+        self.pending_revocation.take()
+    }
+
+    /// 尚未展示的撤销原因（只读）。
+    #[must_use]
+    pub fn pending_revocation(&self) -> Option<ErrorReason> {
+        self.pending_revocation
+    }
+
+    /// 一次性「登录已结束」提示文案。
+    #[must_use]
+    pub fn session_revoked_message(&self, reason: ErrorReason, cx: &gpui::App) -> SharedString {
+        crate::t(
+            self.translator.read(cx),
+            crate::errors::session_revoked_key(reason),
+        )
+    }
+
+    /// 删除云设备（删除本机设备时 agent 随后清会话，不发撤销提示）。
+    pub(crate) fn delete_device(&mut self, device_id: &str) -> PortFuture<serde_json::Value> {
+        self.controller.port().execute(AccountCommand::Device {
+            method: fluxdown_protocol::method::AGENT_DEVICE_DELETE,
+            params: serde_json::json!({ "id": device_id }),
+        })
+    }
+}

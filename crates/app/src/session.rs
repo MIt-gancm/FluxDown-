@@ -266,7 +266,7 @@ forward_consumer!(
     fluxdown_ui_downloads::GroupDetailView,
     fluxdown_ui_downloads::ProgressWindowView,
     fluxdown_ui_settings::SettingsStore,
-    fluxdown_ui_account::AccountView,
+    fluxdown_ui_account::AccountHost,
     fluxdown_ui_rss::RssView,
     fluxdown_ui_extensions::ExtensionsView,
 );

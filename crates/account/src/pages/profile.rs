@@ -17,8 +17,8 @@ use gpui::{
 use gpui_component::{Icon, Sizable as _, h_flex, spinner::Spinner, tooltip::Tooltip, v_flex};
 
 use crate::assets::{CLOUD_ICON_PATH, CROWN_ICON_PATH, REFRESH_ICON_PATH};
+use crate::t;
 use crate::view::AccountView;
-use crate::{AccountCommand, t};
 
 /// 与 Flutter 的 `withValues(alpha: 0.12)` 一致的浅底透明度。
 const TINT_ALPHA: f32 = 0.12;
@@ -179,11 +179,7 @@ pub(crate) fn render(
                     button("account-logout", logout_label, ButtonVariant::Secondary, cx)
                         .disabled(disabled)
                         .on_click(cx.listener(move |view, _: &ClickEvent, _, cx| {
-                            let future = view.controller.port().execute(AccountCommand::Auth {
-                                method: fluxdown_protocol::method::AGENT_AUTH_LOGOUT,
-                                params: serde_json::json!({}),
-                            });
-                            view.spawn_action(future, cx);
+                            view.sign_out(cx);
                         })),
                 ),
         );

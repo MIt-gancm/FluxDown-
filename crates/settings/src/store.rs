@@ -76,6 +76,9 @@ pub struct SettingsStore {
     components: Vec<ComponentStatusDto>,
     webhook_deliveries: Vec<WebhookDeliveryDto>,
     session: Option<fluxdown_protocol::AgentSessionDto>,
+    /// 云账号下除本机外的设备数 / 已配对局域网设备数：侧栏设备区「未设置时自动显示」的依据。
+    other_cloud_devices: usize,
+    linked_devices: usize,
     daemon_connected: bool,
     stale: bool,
 
@@ -125,6 +128,8 @@ impl SettingsStore {
             components: Vec::new(),
             webhook_deliveries: Vec::new(),
             session: None,
+            other_cloud_devices: 0,
+            linked_devices: 0,
             daemon_connected: false,
             stale: true,
             pending_daemon: BTreeMap::new(),
@@ -164,6 +169,8 @@ impl SettingsStore {
         self.webhook_deliveries
             .clone_from(&snapshot.daemon.webhook_deliveries);
         self.session.clone_from(&snapshot.session);
+        self.other_cloud_devices = other_device_count(&snapshot.cloud_devices);
+        self.linked_devices = snapshot.linked_devices.len();
         self.daemon_connected = snapshot.daemon_connected;
         self.stale = false;
         self.overlay_local_edits();
@@ -202,7 +209,17 @@ impl SettingsStore {
                 self.overlay_local_edits();
             }
             AgentEvent::SyncChanged(sync) => self.sync.clone_from(sync),
-            AgentEvent::SessionChanged(session) => self.session.clone_from(session.as_ref()),
+            AgentEvent::SessionChanged(session) => {
+                self.session.clone_from(session.as_ref());
+                if session.is_none() {
+                    // 账号维度的设备随会话结束失效。
+                    self.other_cloud_devices = 0;
+                }
+            }
+            AgentEvent::CloudDevicesChanged(devices) => {
+                self.other_cloud_devices = other_device_count(devices);
+            }
+            AgentEvent::LinkedDevicesChanged(devices) => self.linked_devices = devices.len(),
             AgentEvent::DaemonSnapshotReplaced(snapshot) => {
                 self.daemon.clone_from(&snapshot.config);
                 self.queues.clone_from(&snapshot.queues);
@@ -268,6 +285,12 @@ impl SettingsStore {
     #[must_use]
     pub fn sync_status(&self) -> &SyncStatusDto {
         &self.sync
+    }
+
+    /// 是否存在「其他设备」（云账号的其他设备或已配对的局域网设备）。
+    #[must_use]
+    pub fn has_other_devices(&self) -> bool {
+        self.other_cloud_devices > 0 || self.linked_devices > 0
     }
     #[must_use]
     pub fn session(&self) -> Option<&fluxdown_protocol::AgentSessionDto> {
@@ -468,22 +491,19 @@ impl SettingsStore {
             self.set_error(SettingsErrorKind::Disconnected, "", cx);
             return;
         }
-        let synced = match setting_spec(key) {
-            Some(spec) => {
-                if let Err(error) = fluxdown_protocol::validate_value(spec.key, &value) {
-                    self.set_error(SettingsErrorKind::InvalidArgument, error, cx);
-                    return;
-                }
-                if spec.owner == SettingOwner::Daemon {
-                    // daemon 键的读侧是 daemon 快照；写侧仍经同步链路。
-                    if let Ok(wire) = value_to_daemon_config(spec, &value) {
-                        self.daemon.values.insert(spec.storage_key.to_owned(), wire);
-                    }
-                }
-                spec.owner != SettingOwner::Excluded
+        let synced = preference_is_synced(key);
+        if let Some(spec) = setting_spec(key) {
+            if let Err(error) = fluxdown_protocol::validate_value(spec.key, &value) {
+                self.set_error(SettingsErrorKind::InvalidArgument, error, cx);
+                return;
             }
-            None => false,
-        };
+            if spec.owner == SettingOwner::Daemon {
+                // daemon 键的读侧是 daemon 快照；写侧仍经同步链路。
+                if let Ok(wire) = value_to_daemon_config(spec, &value) {
+                    self.daemon.values.insert(spec.storage_key.to_owned(), wire);
+                }
+            }
+        }
         if self.preferences.values.get(key) == Some(&value) {
             return;
         }
@@ -954,6 +974,16 @@ impl SettingsStore {
     }
 }
 
+/// 偏好写入是否进入云同步：只有同步目录内（且未被排除）的键才上云；
+/// 窗口边界、侧栏设备区显隐等设备本地键一律 `sync:false`。
+fn preference_is_synced(key: &str) -> bool {
+    setting_spec(key).is_some_and(|spec| spec.owner != SettingOwner::Excluded)
+}
+
+fn other_device_count(devices: &[fluxdown_protocol::CloudDevice]) -> usize {
+    devices.iter().filter(|device| !device.is_current).count()
+}
+
 /// daemon wire 字符串 → 云同步目录键的 JSON 值。
 fn daemon_string_to_json(spec_key: &str, wire: &str) -> Value {
     match setting_value_kind(spec_key) {
@@ -967,5 +997,23 @@ fn daemon_string_to_json(spec_key: &str, wire: &str) -> Value {
             .and_then(serde_json::Number::from_f64)
             .map_or(Value::Null, Value::Number),
         fluxdown_protocol::SettingValueKind::String => Value::String(wire.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preference_is_synced;
+
+    #[test]
+    fn catalog_keys_sync_and_device_local_keys_do_not() {
+        // 侧栏设备区显隐、窗口边界是设备本地偏好，不得随账号同步到其他设备。
+        assert!(!preference_is_synced("ui.show_sidebar_devices"));
+        assert!(!preference_is_synced("desktop.window.main"));
+        assert!(!preference_is_synced("unknown.key"));
+        // 同步目录内的键（含自定义分类与带每机属性的 BT / ED2K 开关）走同步链路，
+        // 由「在此设备同步的范围」按需设为本机专属。
+        assert!(preference_is_synced("appearance.theme_mode"));
+        assert!(preference_is_synced("bt.enable_dht"));
+        assert!(preference_is_synced("custom_categories"));
     }
 }

@@ -97,6 +97,9 @@ pub(crate) struct DownloadStrings {
     pub(crate) sidebar_status: SharedString,
     pub(crate) sidebar_devices: SharedString,
     pub(crate) this_device: SharedString,
+    pub(crate) all_devices: SharedString,
+    pub(crate) add_device: SharedString,
+    pub(crate) status_canceled: SharedString,
     pub(crate) add_category: SharedString,
     pub(crate) edit_category: SharedString,
     pub(crate) hide_section: SharedString,
@@ -202,6 +205,9 @@ impl DownloadStrings {
             sidebar_status: shared(translator.text(keys::SIDEBAR_STATUS)),
             sidebar_devices: shared(translator.text("deviceSection")),
             this_device: shared(translator.text("thisDevice")),
+            all_devices: shared(translator.text("allDevices")),
+            add_device: shared(translator.text("addDeviceEntry")),
+            status_canceled: shared(translator.text("statusCanceled")),
             add_category: shared(translator.text("addCategory")),
             edit_category: shared(translator.text("editCategory")),
             hide_section: shared(translator.text("hideSection")),
@@ -383,6 +389,24 @@ pub(crate) struct NewDownloadStrings {
     start_tooltip: SharedString,
     pub(crate) main_queue: SharedString,
     pub(crate) later_queue: SharedString,
+    pub(crate) download_to: SharedString,
+    pub(crate) download_to_hint: SharedString,
+    pub(crate) this_device: SharedString,
+    pub(crate) device_online: SharedString,
+    pub(crate) device_offline: SharedString,
+    pub(crate) device_lan_tag: SharedString,
+    pub(crate) target_offline_hint: SharedString,
+    pub(crate) target_paired_offline_hint: SharedString,
+    pub(crate) remote_options_hint: SharedString,
+    pub(crate) remote_dir_hint: SharedString,
+    remote_dir_default: SharedString,
+    pub(crate) remote_dir_use_default: SharedString,
+    path_invalid: SharedString,
+    dispatched: SharedString,
+    dispatched_offline: SharedString,
+    dispatch_partial: SharedString,
+    pub(crate) dispatch_failed: SharedString,
+    pub(crate) created: SharedString,
 }
 
 impl NewDownloadStrings {
@@ -453,6 +477,24 @@ impl NewDownloadStrings {
             start_tooltip: shared(translator.text("startIntoQueueTooltip")),
             main_queue: shared(translator.text(keys::MAIN_QUEUE)),
             later_queue: shared(translator.text(keys::LATER_QUEUE)),
+            download_to: shared(translator.text("downloadTo")),
+            download_to_hint: shared(translator.text("downloadToHint")),
+            this_device: shared(translator.text("thisDevice")),
+            device_online: shared(translator.text("deviceOnline")),
+            device_offline: shared(translator.text("deviceOffline")),
+            device_lan_tag: shared(translator.text("deviceLocalTag")),
+            target_offline_hint: shared(translator.text("downloadToOfflineHint")),
+            target_paired_offline_hint: shared(translator.text("errReasonPeerOffline")),
+            remote_options_hint: shared(translator.text("downloadToRemoteOptionsIgnored")),
+            remote_dir_hint: shared(translator.text("downloadToRemoteDirHint")),
+            remote_dir_default: shared(translator.text("downloadToRemoteDirDefault")),
+            remote_dir_use_default: shared(translator.text("downloadToRemoteDirUseDefault")),
+            path_invalid: shared(translator.text("downloadToPathInvalid")),
+            dispatched: shared(translator.text("downloadToDispatched")),
+            dispatched_offline: shared(translator.text("downloadToDispatchedOffline")),
+            dispatch_partial: shared(translator.text("downloadToPartial")),
+            dispatch_failed: shared(translator.text("dispatchFailed")),
+            created: shared(translator.text("taskCreatedToast")),
         }
     }
 
@@ -493,6 +535,81 @@ impl NewDownloadStrings {
             _ => shared(name),
         }
     }
+
+    /// 远端保存目录输入框占位：目标设备自报的默认目录（无则「目标设备默认目录」）。
+    pub(crate) fn remote_dir_placeholder(&self, default_dir: Option<&str>) -> SharedString {
+        match default_dir {
+            Some(dir) => SharedString::from(self.remote_dir_default.replace("{dir}", dir)),
+            None => self.remote_dir_use_default.clone(),
+        }
+    }
+
+    /// 保存目录不是目标路径风格的绝对路径时的错误提示（带该风格的示例）。
+    pub(crate) fn path_invalid_text(
+        &self,
+        style: Option<fluxdown_protocol::PathStyle>,
+    ) -> SharedString {
+        let example = match style {
+            Some(fluxdown_protocol::PathStyle::Windows) => r"C:\Downloads",
+            _ => "/home/user/Downloads",
+        };
+        SharedString::from(self.path_invalid.replace("{example}", example))
+    }
+
+    /// 下发成功提示；目标离线（云设备）时说明上线后才执行。
+    pub(crate) fn format_dispatched(&self, count: usize, device: &str, offline: bool) -> String {
+        let template = if offline {
+            &self.dispatched_offline
+        } else {
+            &self.dispatched
+        };
+        template
+            .replace("{count}", &count.to_string())
+            .replace("{device}", device)
+    }
+
+    /// 部分成功 / 部分失败提示。
+    pub(crate) fn format_partial(&self, ok: usize, failed: usize, device: &str) -> String {
+        self.dispatch_partial
+            .replace("{ok}", &ok.to_string())
+            .replace("{failed}", &failed.to_string())
+            .replace("{device}", device)
+    }
+}
+
+/// agent 端口不透传服务端 message：优先按 `reason` 给出可操作文案，缺失再按码回退。
+pub(crate) fn error_text(
+    translator: &Translator,
+    error: &fluxdown_protocol::RpcErrorData,
+) -> String {
+    use fluxdown_protocol::{ApplicationErrorCode, ErrorReason};
+    let reason_key = error.reason.and_then(|reason| match reason {
+        ErrorReason::TargetDeviceOffline => Some("errReasonTargetDeviceOffline"),
+        ErrorReason::TaskStateConflict => Some("errReasonTaskStateConflict"),
+        ErrorReason::TaskDeviceMismatch => Some("errReasonTaskDeviceMismatch"),
+        ErrorReason::SaveDirUnavailable => Some("errReasonSaveDirUnavailable"),
+        ErrorReason::CloudUnreachable => Some("accountErrorNetwork"),
+        ErrorReason::SessionExpired => Some("errReasonSessionExpired"),
+        ErrorReason::DeviceUntrusted => Some("accountSessionRevokedUntrusted"),
+        ErrorReason::PeerNotPaired => Some("errReasonPeerNotPaired"),
+        ErrorReason::PeerOffline => Some("errReasonPeerOffline"),
+        _ => None,
+    });
+    let key = reason_key.unwrap_or(match error.code {
+        ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout => {
+            "localServiceDisconnected"
+        }
+        ApplicationErrorCode::InvalidArgument | ApplicationErrorCode::NotFound => {
+            "localServiceInvalidArgument"
+        }
+        ApplicationErrorCode::Conflict => "localServiceConflict",
+        ApplicationErrorCode::Unsupported => "settingsUnsupportedOnPlatform",
+        ApplicationErrorCode::ProtocolIncompatible
+        | ApplicationErrorCode::Unauthorized
+        | ApplicationErrorCode::Cancelled
+        | ApplicationErrorCode::Internal => "localServiceActionFailed",
+    });
+    translator.text(key).to_owned()
 }
 
 fn shared(value: &str) -> SharedString {

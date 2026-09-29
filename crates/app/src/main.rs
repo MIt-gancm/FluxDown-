@@ -2,6 +2,7 @@
 // 发布构建为 GUI 子系统：双击 / 由 agent 拉起时不弹控制台窗口。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod account_host;
 mod account_port;
 mod actions;
 mod activity;

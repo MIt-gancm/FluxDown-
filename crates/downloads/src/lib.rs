@@ -9,12 +9,15 @@ mod controller;
 mod model;
 mod pages;
 mod strings;
+mod submission;
 
 pub use components::title_bar::DownloadTitleBar;
 pub use controller::{
-    DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult, LAST_SAVE_DIR_PREF,
-    PortFuture, QueueFields, REMEMBER_LAST_SAVE_DIR_PREF, SeedLimits,
+    DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult,
+    LAST_DOWNLOAD_TARGET_PREF, LAST_SAVE_DIR_PREF, PortFuture, QueueFields,
+    REMEMBER_LAST_SAVE_DIR_PREF, SeedLimits,
 };
+pub use model::devices::{DeviceEntry, DeviceKind, DispatchTarget};
 pub use model::progress_window::{
     COMPLETION_WINDOW_PREF, PROGRESS_WINDOW_PREF, ProgressWindowEffect, ProgressWindowPrefs,
     ProgressWindowTracker,
@@ -27,3 +30,4 @@ pub use pages::progress_window::*;
 pub use pages::queue_manager::*;
 pub use pages::selection::*;
 pub use pages::task_detail::*;
+pub use submission::*;

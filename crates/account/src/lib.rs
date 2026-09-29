@@ -5,20 +5,28 @@
 
 mod assets;
 mod controller;
+mod device_list;
 mod dialogs;
+mod errors;
+mod host;
+mod link;
 mod pages;
+mod sync_scope;
 mod ui;
+mod verification;
 mod view;
 
 use std::future::Future;
 use std::pin::Pin;
 
-use fluxdown_protocol::ApplicationErrorCode;
 use fluxdown_ui_i18n::Translator;
 use gpui::SharedString;
 
 pub use assets::{AccountAssets, CLOUD_ICON_PATH, CROWN_ICON_PATH};
 pub use controller::AccountController;
+pub use dialogs::add_device::open as open_add_device;
+pub use dialogs::pairing_prompt::open as open_pairing_prompt;
+pub use host::{AccountHost, AccountHostEvent};
 pub use view::AccountView;
 
 pub type PortFuture<T> =
@@ -54,6 +62,11 @@ pub enum AccountCommand {
         method: &'static str,
         params: serde_json::Value,
     },
+    /// 局域网直连配对与已配对设备（`agent.link.*`）。
+    Link {
+        method: &'static str,
+        params: serde_json::Value,
+    },
     /// FluxCloud 服务地址读取/覆盖（`agent.cloud.endpoint*`，仅调试构建可改）。
     CloudEndpoint {
         method: &'static str,
@@ -77,27 +90,4 @@ pub(crate) fn t_with(
     arguments: &[(&str, &str)],
 ) -> SharedString {
     SharedString::from(translator.text_with(key, arguments))
-}
-
-/// agent 端口只回传错误码（服务端 message 不透传），按码映射通用文案；
-/// 与 `fluxdown_ui_extensions::error_text` 同一约定。
-pub(crate) fn error_text(
-    translator: &Translator,
-    error: &fluxdown_protocol::RpcErrorData,
-) -> SharedString {
-    let key = match error.code {
-        ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout => {
-            "localServiceDisconnected"
-        }
-        ApplicationErrorCode::InvalidArgument | ApplicationErrorCode::NotFound => {
-            "localServiceInvalidArgument"
-        }
-        ApplicationErrorCode::Conflict => "localServiceConflict",
-        ApplicationErrorCode::Unsupported => "settingsUnsupportedOnPlatform",
-        ApplicationErrorCode::ProtocolIncompatible
-        | ApplicationErrorCode::Unauthorized
-        | ApplicationErrorCode::Cancelled
-        | ApplicationErrorCode::Internal => "localServiceActionFailed",
-    };
-    t(translator, key)
 }

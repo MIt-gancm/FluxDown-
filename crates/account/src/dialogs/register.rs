@@ -1,5 +1,6 @@
-//! 注册对话框：邮箱 + 密码 + 可选昵称；完成后转入邮箱验证码步骤，
-//! 与 Flutter `_showRegisterDialog` / 注册验证屏幕语义对齐。
+//! 注册对话框：邮箱 + 密码 + 可选昵称；完成后转入邮箱验证码步骤（有效期倒计时、
+//! 重新发送、返回），与 Flutter `_showRegisterDialog` / 注册验证屏幕语义对齐。
+//! 登录时服务端报告「注册未完成」会经 [`open_resume`] 直接进入验证步骤。
 
 use std::sync::Arc;
 
@@ -14,11 +15,14 @@ use gpui_component::{
     Disableable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputContentType, InputState},
+    input::{Input, InputContentType, InputEvent, InputState},
     v_flex,
 };
 
-use crate::{AccountCommand, AccountPort, error_text, t, t_with};
+use crate::dialogs::code_step;
+use crate::errors::{ErrorContext, error_text};
+use crate::verification::{CodeChallenge, spawn_ticker};
+use crate::{AccountCommand, AccountPort, t, t_with};
 
 pub(crate) struct RegisterDialog {
     translator: Entity<Translator>,
@@ -28,7 +32,11 @@ pub(crate) struct RegisterDialog {
     nickname_input: Entity<InputState>,
     code_input: Entity<InputState>,
     verification_required: bool,
+    challenge: Option<CodeChallenge>,
+    /// 验证码计时器代际：新一轮验证码 / 返回时作废旧计时器。
+    challenge_generation: u64,
     busy: bool,
+    resending: bool,
     error: Option<SharedString>,
 }
 
@@ -52,6 +60,34 @@ pub(crate) fn open(
     email_input.update(cx, |input, cx| input.focus(window, cx));
 }
 
+/// 登录发现注册未完成：打开注册对话框并立即用同一组邮箱 / 密码重新注册（云端重发验证码），
+/// 进入验证步骤。
+pub(crate) fn open_resume(
+    translator: Entity<Translator>,
+    port: Arc<dyn AccountPort>,
+    email: String,
+    password: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let title = t(translator.read(cx), "accountRegisterDialogTitle");
+    let view = cx.new(|cx| RegisterDialog::new(translator, port, window, cx));
+    view.update(cx, |this, cx| {
+        this.email_input
+            .update(cx, |input, cx| input.set_value(email, window, cx));
+        this.password_input
+            .update(cx, |input, cx| input.set_value(password, window, cx));
+        this.submit_register(window, cx);
+    });
+    window.open_dialog(cx, move |dialog, _, cx| {
+        let view = view.clone();
+        dialog
+            .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
+            .w(px(520.))
+            .content(move |content, _, _| content.child(view.clone()))
+    });
+}
+
 impl RegisterDialog {
     fn new(
         translator: Entity<Translator>,
@@ -63,20 +99,39 @@ impl RegisterDialog {
         let password_placeholder = t(translator.read(cx), "accountPasswordHint");
         let nickname_placeholder = t(translator.read(cx), "accountNicknamePlaceholder");
         let code_placeholder = t(translator.read(cx), "accountCodePlaceholder");
+        let email_input = cx.new(|cx| InputState::new(window, cx).placeholder(email_placeholder));
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(password_placeholder)
+        });
+        let nickname_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(nickname_placeholder));
+        let code_input = cx.new(|cx| InputState::new(window, cx).placeholder(code_placeholder));
+        for input in [&email_input, &password_input, &nickname_input, &code_input] {
+            cx.subscribe_in(input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    if this.verification_required {
+                        this.submit_verify(window, cx);
+                    } else {
+                        this.submit_register(window, cx);
+                    }
+                }
+            })
+            .detach();
+        }
         Self {
             translator,
             port,
-            email_input: cx.new(|cx| InputState::new(window, cx).placeholder(email_placeholder)),
-            password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .masked(true)
-                    .placeholder(password_placeholder)
-            }),
-            nickname_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(nickname_placeholder)),
-            code_input: cx.new(|cx| InputState::new(window, cx).placeholder(code_placeholder)),
+            email_input,
+            password_input,
+            nickname_input,
+            code_input,
             verification_required: false,
+            challenge: None,
+            challenge_generation: 0,
             busy: false,
+            resending: false,
             error: None,
         }
     }
@@ -89,23 +144,32 @@ impl RegisterDialog {
         self.email_input.read(cx).value().trim().to_owned()
     }
 
-    fn submit_register(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy {
-            return;
-        }
+    fn register_params(&self, cx: &App) -> Option<serde_json::Value> {
         let email = self.email(cx);
         let password = self.password_input.read(cx).value().to_string();
         let nickname = self.nickname_input.read(cx).value().trim().to_owned();
         if email.is_empty() || password.is_empty() {
-            return;
+            return None;
         }
         let mut params = serde_json::json!({"email": email, "password": password});
         if !nickname.is_empty() {
             params["nickname"] = serde_json::Value::String(nickname);
         }
+        Some(params)
+    }
+
+    fn submit_register(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(params) = self.register_params(cx) else {
+            return;
+        };
         self.run(
             fluxdown_protocol::method::AGENT_AUTH_REGISTER,
             params,
+            ErrorContext::Register,
+            false,
             window,
             cx,
         );
@@ -124,19 +188,84 @@ impl RegisterDialog {
         self.run(
             fluxdown_protocol::method::AGENT_AUTH_REGISTER_VERIFY,
             params,
+            ErrorContext::Code,
+            false,
             window,
             cx,
         );
+    }
+
+    /// 重新发送验证码：以同一组信息再次注册（云端在限频窗口内沿用原验证步骤）。
+    fn resend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.resending {
+            return;
+        }
+        let Some(params) = self.register_params(cx) else {
+            return;
+        };
+        self.run(
+            fluxdown_protocol::method::AGENT_AUTH_REGISTER,
+            params,
+            ErrorContext::Register,
+            true,
+            window,
+            cx,
+        );
+    }
+
+    fn start_challenge(
+        &mut self,
+        challenge: CodeChallenge,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.verification_required = true;
+        self.challenge = Some(challenge);
+        self.challenge_generation = self.challenge_generation.wrapping_add(1);
+        let generation = self.challenge_generation;
+        spawn_ticker(window, cx, move |this: &mut Self, _, cx| {
+            if this.challenge_generation != generation {
+                return false;
+            }
+            let Some(challenge) = this.challenge.as_mut() else {
+                return false;
+            };
+            if challenge.tick() {
+                cx.notify();
+            }
+            !challenge.is_idle()
+        });
+        self.code_input
+            .update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.verification_required = false;
+        self.challenge = None;
+        self.challenge_generation = self.challenge_generation.wrapping_add(1);
+        self.error = None;
+        self.code_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
     }
 
     fn run(
         &mut self,
         method: &'static str,
         params: serde_json::Value,
+        context: ErrorContext,
+        resend: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.busy = true;
+        if resend {
+            self.resending = true;
+        } else {
+            self.busy = true;
+        }
         self.error = None;
         cx.notify();
         let future = self.port.execute(AccountCommand::Auth { method, params });
@@ -144,6 +273,7 @@ impl RegisterDialog {
             let result = future.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
+                this.resending = false;
                 match result {
                     Ok(value) => {
                         match serde_json::from_value::<fluxdown_protocol::AgentLoginResult>(value) {
@@ -152,12 +282,15 @@ impl RegisterDialog {
                             }
                             Ok(
                                 fluxdown_protocol::AgentLoginResult::DeviceVerificationRequired {
-                                    ..
+                                    ttl_seconds,
+                                    will_replace_devices,
                                 },
                             ) => {
-                                this.verification_required = true;
-                                this.code_input
-                                    .update(cx, |input, cx| input.focus(window, cx));
+                                this.start_challenge(
+                                    CodeChallenge::new(ttl_seconds, will_replace_devices),
+                                    window,
+                                    cx,
+                                );
                             }
                             Err(_) => {
                                 this.error = Some(this.t("accountErrorUnknown", cx));
@@ -165,7 +298,7 @@ impl RegisterDialog {
                         }
                     }
                     Err(error) => {
-                        this.error = Some(error_text(this.translator.read(cx), &error));
+                        this.error = Some(error_text(this.translator.read(cx), &error, context));
                     }
                 }
                 cx.notify();
@@ -180,34 +313,51 @@ impl RegisterDialog {
         } else {
             self.t("accountRegister", cx)
         };
-        // 底栏右对齐：取消(outline) 在左、主操作(primary) 在右，统一控件高度。
+        // 底栏：返回(ghost) 靠左；取消(outline) 在左、主操作(primary) 在右并右对齐。
+        let verifying = self.verification_required;
         h_flex()
             .w_full()
             .pt(active_theme(cx).tokens().spacing.sm)
-            .justify_end()
+            .justify_between()
             .gap(active_theme(cx).tokens().spacing.sm)
+            .child(div().when(verifying, |this| {
+                this.child(
+                    Button::new("account-register-back")
+                        .ghost()
+                        .label(self.t("back", cx))
+                        .control(cx)
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.back(window, cx);
+                        })),
+                )
+            }))
             .child(
-                Button::new("account-register-cancel")
-                    .outline()
-                    .label(self.t("cancel", cx))
-                    .control(cx)
-                    .disabled(self.busy)
-                    .on_click(|_, window, cx| window.close_dialog(cx)),
-            )
-            .child(
-                Button::new("account-register-submit")
-                    .primary()
-                    .label(submit_label)
-                    .control(cx)
-                    .loading(self.busy)
-                    .disabled(self.busy)
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        if this.verification_required {
-                            this.submit_verify(window, cx);
-                        } else {
-                            this.submit_register(window, cx);
-                        }
-                    })),
+                h_flex()
+                    .gap(active_theme(cx).tokens().spacing.sm)
+                    .child(
+                        Button::new("account-register-cancel")
+                            .outline()
+                            .label(self.t("cancel", cx))
+                            .control(cx)
+                            .disabled(self.busy)
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("account-register-submit")
+                            .primary()
+                            .label(submit_label)
+                            .control(cx)
+                            .loading(self.busy)
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                if this.verification_required {
+                                    this.submit_verify(window, cx);
+                                } else {
+                                    this.submit_register(window, cx);
+                                }
+                            })),
+                    ),
             )
     }
 }
@@ -215,9 +365,10 @@ impl RegisterDialog {
 impl Render for RegisterDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = active_theme(cx).tokens().clone();
+        let translator = self.translator.read(cx).clone();
         let body = if self.verification_required {
             let subtitle = t_with(
-                self.translator.read(cx),
+                &translator,
                 "accountRegisterVerifySubtitle",
                 &[("email", &self.email(cx))],
             );
@@ -241,6 +392,16 @@ impl Render for RegisterDialog {
                     None,
                     cx,
                 ))
+                .when_some(self.challenge, |form, challenge| {
+                    form.child(code_step::render::<Self>(
+                        "account-register-resend",
+                        &translator,
+                        &challenge,
+                        self.resending,
+                        |this, window, cx| this.resend(window, cx),
+                        cx,
+                    ))
+                })
         } else {
             form(cx)
                 .child(form_field(

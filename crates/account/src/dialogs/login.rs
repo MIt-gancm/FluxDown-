@@ -1,9 +1,12 @@
-//! 登录对话框：账号 + 密码；设备验证码在需要时替换为独立的验证步骤，
-//! 与 Flutter `_showLoginDialog` / 新设备验证屏幕语义对齐。
+//! 登录对话框：密码 / 邮箱验证码两种方式；新设备需要设备验证时切换到验证步骤
+//! （替换设备提示、有效期倒计时、重新发送、返回）。与 Flutter `_showLoginDialog` 语义对齐。
 
 use std::sync::Arc;
 
-use fluxdown_ui_components::{ControlExt as _, field_error, field_hint, form, form_field};
+use fluxdown_protocol::{AgentLoginResult, RpcErrorData, method};
+use fluxdown_ui_components::{
+    ControlExt as _, field_error, field_hint, form, form_field, input_with_action, segmented_tabs,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -14,21 +17,68 @@ use gpui_component::{
     Disableable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    input::{Input, InputContentType, InputState},
+    input::{Input, InputContentType, InputEvent, InputState},
     v_flex,
 };
 
-use crate::{AccountCommand, AccountPort, error_text, t};
+use crate::dialogs::{code_step, register};
+use crate::errors::{ErrorContext, error_text, is_registration_incomplete};
+use crate::verification::{CodeChallenge, spawn_ticker};
+use crate::{AccountCommand, AccountPort, PortFuture, t};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoginMethod {
+    Password,
+    Code,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Step {
+    Credentials,
+    DeviceVerify,
+}
 
 pub(crate) struct LoginDialog {
     translator: Entity<Translator>,
     port: Arc<dyn AccountPort>,
+    method: LoginMethod,
+    step: Step,
     account_input: Entity<InputState>,
     password_input: Entity<InputState>,
+    email_input: Entity<InputState>,
     code_input: Entity<InputState>,
-    verification_required: bool,
+    challenge: Option<CodeChallenge>,
+    /// 验证码计时器代际：新一轮验证码 / 返回时作废旧计时器。
+    challenge_generation: u64,
     busy: bool,
+    resending: bool,
     error: Option<SharedString>,
+}
+
+/// 登录请求返回后的走向。
+enum Outcome {
+    LoggedIn,
+    Verify(CodeChallenge),
+    Invalid,
+}
+
+fn parse_outcome(value: serde_json::Value) -> Outcome {
+    match serde_json::from_value::<AgentLoginResult>(value) {
+        Ok(AgentLoginResult::Ok { .. }) => Outcome::LoggedIn,
+        Ok(AgentLoginResult::DeviceVerificationRequired {
+            ttl_seconds,
+            will_replace_devices,
+        }) => Outcome::Verify(CodeChallenge::new(ttl_seconds, will_replace_devices)),
+        Err(_) => Outcome::Invalid,
+    }
+}
+
+/// `agent.auth.sendCode` 返回 `{ttlSeconds}`。
+fn parse_send_code(value: &serde_json::Value) -> Option<CodeChallenge> {
+    value
+        .get("ttlSeconds")
+        .and_then(serde_json::Value::as_u64)
+        .map(|ttl| CodeChallenge::new(ttl, false))
 }
 
 /// 打开登录对话框；聚焦账号输入框。
@@ -60,20 +110,38 @@ impl LoginDialog {
     ) -> Self {
         let account_placeholder = t(translator.read(cx), "accountLoginAccountPlaceholder");
         let password_placeholder = t(translator.read(cx), "accountPasswordPlaceholder");
+        let email_placeholder = t(translator.read(cx), "accountEmailPlaceholder");
         let code_placeholder = t(translator.read(cx), "accountCodePlaceholder");
+        let account_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(account_placeholder));
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(password_placeholder)
+        });
+        let email_input = cx.new(|cx| InputState::new(window, cx).placeholder(email_placeholder));
+        let code_input = cx.new(|cx| InputState::new(window, cx).placeholder(code_placeholder));
+        for input in [&account_input, &password_input, &email_input, &code_input] {
+            cx.subscribe_in(input, window, |this, _, event, window, cx| {
+                if matches!(event, InputEvent::PressEnter { .. }) {
+                    this.submit(window, cx);
+                }
+            })
+            .detach();
+        }
         Self {
             translator,
             port,
-            account_input: cx
-                .new(|cx| InputState::new(window, cx).placeholder(account_placeholder)),
-            password_input: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .masked(true)
-                    .placeholder(password_placeholder)
-            }),
-            code_input: cx.new(|cx| InputState::new(window, cx).placeholder(code_placeholder)),
-            verification_required: false,
+            method: LoginMethod::Password,
+            step: Step::Credentials,
+            account_input,
+            password_input,
+            email_input,
+            code_input,
+            challenge: None,
+            challenge_generation: 0,
             busy: false,
+            resending: false,
             error: None,
         }
     }
@@ -82,57 +150,155 @@ impl LoginDialog {
         t(self.translator.read(cx), key)
     }
 
+    fn fail(&mut self, error: &RpcErrorData, context: ErrorContext, cx: &App) {
+        self.error = Some(error_text(self.translator.read(cx), error, context));
+    }
+
+    fn select_method(&mut self, method: LoginMethod, cx: &mut Context<Self>) {
+        if self.busy || self.method == method || self.step != Step::Credentials {
+            return;
+        }
+        self.method = method;
+        self.error = None;
+        cx.notify();
+    }
+
+    /// 开始新一轮验证码：重置计时并起一个新的秒级计时器。
+    fn start_challenge(
+        &mut self,
+        challenge: CodeChallenge,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.challenge = Some(challenge);
+        self.challenge_generation = self.challenge_generation.wrapping_add(1);
+        let generation = self.challenge_generation;
+        spawn_ticker(window, cx, move |this: &mut Self, _, cx| {
+            if this.challenge_generation != generation {
+                return false;
+            }
+            let Some(challenge) = this.challenge.as_mut() else {
+                return false;
+            };
+            if challenge.tick() {
+                cx.notify();
+            }
+            !challenge.is_idle()
+        });
+        self.code_input
+            .update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.step = Step::Credentials;
+        self.challenge = None;
+        self.challenge_generation = self.challenge_generation.wrapping_add(1);
+        self.error = None;
+        self.code_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        cx.notify();
+    }
+
+    fn credentials(&self, cx: &App) -> (String, String) {
+        (
+            self.account_input.read(cx).value().trim().to_owned(),
+            self.password_input.read(cx).value().to_string(),
+        )
+    }
+
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
-        let verify = self.verification_required;
-        let account = self.account_input.read(cx).value().trim().to_owned();
-        let password = self.password_input.read(cx).value().to_string();
         let code = self.code_input.read(cx).value().trim().to_owned();
-        if account.is_empty() || password.is_empty() || (verify && code.is_empty()) {
-            return;
+        match (self.method, self.step) {
+            (LoginMethod::Password, Step::Credentials) => {
+                let (account, password) = self.credentials(cx);
+                if account.is_empty() || password.is_empty() {
+                    return;
+                }
+                let future = self.port.execute(AccountCommand::Auth {
+                    method: method::AGENT_AUTH_LOGIN,
+                    params: serde_json::json!({"account": account, "password": password}),
+                });
+                self.run(
+                    future,
+                    ErrorContext::Login,
+                    Some((account, password)),
+                    window,
+                    cx,
+                );
+            }
+            (LoginMethod::Password, Step::DeviceVerify) => {
+                let (account, password) = self.credentials(cx);
+                if code.is_empty() {
+                    return;
+                }
+                let future = self.port.execute(AccountCommand::Auth {
+                    method: method::AGENT_AUTH_LOGIN_VERIFY,
+                    params: serde_json::json!({
+                        "account": account, "password": password, "code": code
+                    }),
+                });
+                self.run(future, ErrorContext::Code, None, window, cx);
+            }
+            (LoginMethod::Code, _) => {
+                let email = self.email_input.read(cx).value().trim().to_owned();
+                if email.is_empty() || code.is_empty() {
+                    return;
+                }
+                let future = self.port.execute(AccountCommand::Auth {
+                    method: method::AGENT_AUTH_VERIFY_CODE,
+                    params: serde_json::json!({"email": email, "code": code}),
+                });
+                self.run(future, ErrorContext::Code, None, window, cx);
+            }
         }
-        let params = if verify {
-            serde_json::json!({"account": account, "password": password, "code": code})
-        } else {
-            serde_json::json!({"account": account, "password": password})
-        };
-        let method = if verify {
-            fluxdown_protocol::method::AGENT_AUTH_LOGIN_VERIFY
-        } else {
-            fluxdown_protocol::method::AGENT_AUTH_LOGIN
-        };
+    }
+
+    /// 发起登录类请求并按结果推进：成功关窗 / 进入设备验证 / 显示错误。
+    /// `resume` 为密码登录的账号与密码：服务端报告「注册未完成」时据此转入注册验证。
+    fn run(
+        &mut self,
+        future: PortFuture<serde_json::Value>,
+        context: ErrorContext,
+        resume: Option<(String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.busy = true;
         self.error = None;
         cx.notify();
-        let future = self.port.execute(AccountCommand::Auth { method, params });
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
-                    Ok(value) => {
-                        match serde_json::from_value::<fluxdown_protocol::AgentLoginResult>(value) {
-                            Ok(fluxdown_protocol::AgentLoginResult::Ok { .. }) => {
-                                window.close_dialog(cx);
-                            }
-                            Ok(
-                                fluxdown_protocol::AgentLoginResult::DeviceVerificationRequired {
-                                    ..
-                                },
-                            ) => {
-                                this.verification_required = true;
-                                this.code_input
-                                    .update(cx, |input, cx| input.focus(window, cx));
-                            }
-                            Err(_) => {
-                                this.error = Some(this.t("accountErrorUnknown", cx));
-                            }
+                    Ok(value) => match parse_outcome(value) {
+                        Outcome::LoggedIn => window.close_dialog(cx),
+                        Outcome::Verify(challenge) => {
+                            this.step = Step::DeviceVerify;
+                            this.start_challenge(challenge, window, cx);
                         }
-                    }
+                        Outcome::Invalid => {
+                            this.error = Some(this.t("accountErrorUnknown", cx));
+                        }
+                    },
                     Err(error) => {
-                        this.error = Some(error_text(this.translator.read(cx), &error));
+                        if let Some((email, password)) =
+                            resume.filter(|_| is_registration_incomplete(&error))
+                        {
+                            // 注册没有完成验证：转到注册验证步骤（重发验证码）。
+                            let translator = this.translator.clone();
+                            let port = this.port.clone();
+                            window.close_dialog(cx);
+                            register::open_resume(translator, port, email, password, window, cx);
+                        } else {
+                            this.fail(&error, context, cx);
+                        }
                     }
                 }
                 cx.notify();
@@ -141,89 +307,259 @@ impl LoginDialog {
         .detach();
     }
 
+    /// 重新发送验证码：设备验证重新登录（云端限频窗口内会沿用原验证步骤），
+    /// 邮箱验证码登录重新 `sendCode`。
+    fn resend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.resending {
+            return;
+        }
+        let (future, context) = match (self.method, self.step) {
+            (LoginMethod::Password, Step::DeviceVerify) => {
+                let (account, password) = self.credentials(cx);
+                (
+                    self.port.execute(AccountCommand::Auth {
+                        method: method::AGENT_AUTH_LOGIN,
+                        params: serde_json::json!({"account": account, "password": password}),
+                    }),
+                    ErrorContext::Login,
+                )
+            }
+            (LoginMethod::Code, _) => {
+                let email = self.email_input.read(cx).value().trim().to_owned();
+                if email.is_empty() {
+                    return;
+                }
+                (
+                    self.port.execute(AccountCommand::Auth {
+                        method: method::AGENT_AUTH_SEND_CODE,
+                        params: serde_json::json!({"email": email}),
+                    }),
+                    ErrorContext::Login,
+                )
+            }
+            (LoginMethod::Password, Step::Credentials) => return,
+        };
+        let is_send_code = self.method == LoginMethod::Code;
+        self.resending = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.resending = false;
+                match result {
+                    Ok(value) if is_send_code => match parse_send_code(&value) {
+                        Some(challenge) => this.start_challenge(challenge, window, cx),
+                        None => this.error = Some(this.t("accountErrorUnknown", cx)),
+                    },
+                    Ok(value) => match parse_outcome(value) {
+                        Outcome::LoggedIn => window.close_dialog(cx),
+                        Outcome::Verify(challenge) => this.start_challenge(challenge, window, cx),
+                        Outcome::Invalid => {
+                            this.error = Some(this.t("accountErrorUnknown", cx));
+                        }
+                    },
+                    Err(error) => this.fail(&error, context, cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let submit_label = if self.verification_required {
-            self.t("confirm", cx)
+        let verifying = self.step == Step::DeviceVerify;
+        let submit_label = if verifying {
+            self.t("accountVerifySubmit", cx)
         } else {
             self.t("accountLogin", cx)
         };
-        // 底栏右对齐：取消(outline) 在左、主操作(primary) 在右，统一控件高度。
+        // 底栏：返回(ghost) 靠左；取消(outline) 在左、主操作(primary) 在右并右对齐。
         h_flex()
             .w_full()
             .pt(active_theme(cx).tokens().spacing.sm)
-            .justify_end()
+            .justify_between()
             .gap(active_theme(cx).tokens().spacing.sm)
+            .child(div().when(verifying, |this| {
+                this.child(
+                    Button::new("account-login-back")
+                        .ghost()
+                        .label(self.t("back", cx))
+                        .control(cx)
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.back(window, cx);
+                        })),
+                )
+            }))
             .child(
-                Button::new("account-login-cancel")
-                    .outline()
-                    .label(self.t("cancel", cx))
-                    .control(cx)
-                    .disabled(self.busy)
-                    .on_click(|_, window, cx| window.close_dialog(cx)),
+                h_flex()
+                    .gap(active_theme(cx).tokens().spacing.sm)
+                    .child(
+                        Button::new("account-login-cancel")
+                            .outline()
+                            .label(self.t("cancel", cx))
+                            .control(cx)
+                            .disabled(self.busy)
+                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                    )
+                    .child(
+                        Button::new("account-login-submit")
+                            .primary()
+                            .label(submit_label)
+                            .control(cx)
+                            .loading(self.busy)
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.submit(window, cx);
+                            })),
+                    ),
             )
+    }
+
+    fn render_device_verify(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let tokens = active_theme(cx).tokens().clone();
+        let translator = self.translator.read(cx).clone();
+        let account = self.account_input.read(cx).value().trim().to_owned();
+        let subtitle = if account.contains('@') {
+            crate::t_with(
+                &translator,
+                "accountDeviceVerifySubtitle",
+                &[("email", &account)],
+            )
+        } else {
+            t(&translator, "accountDeviceVerifySubtitleGeneric")
+        };
+        let challenge = self.challenge;
+        form(cx)
             .child(
-                Button::new("account-login-submit")
-                    .primary()
-                    .label(submit_label)
-                    .control(cx)
-                    .loading(self.busy)
-                    .disabled(self.busy)
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.submit(window, cx);
-                    })),
+                v_flex()
+                    .gap(tokens.spacing.xxs)
+                    .child(
+                        div()
+                            .text_size(tokens.typography.sm.size)
+                            .line_height(tokens.typography.sm.line_height)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(tokens.colors.foreground)
+                            .child(t(&translator, "accountDeviceVerifyTitle")),
+                    )
+                    .child(field_hint(subtitle, cx)),
             )
+            .child(form_field(
+                t(&translator, "accountFieldCode"),
+                Input::new(&self.code_input).control(cx).w_full(),
+                None,
+                cx,
+            ))
+            .when_some(challenge, |form, challenge| {
+                form.child(code_step::render::<Self>(
+                    "account-login-resend",
+                    &translator,
+                    &challenge,
+                    self.resending,
+                    |this, window, cx| this.resend(window, cx),
+                    cx,
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn render_code_login(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let translator = self.translator.read(cx).clone();
+        let email_empty = self.email_input.read(cx).value().trim().is_empty();
+        let challenge = self.challenge;
+        // 发送按钮：冷却中显示剩余秒数；未发送 / 可重发时可点。
+        let (send_label, send_enabled) = match &challenge {
+            Some(challenge) => (
+                code_step::resend_label(&translator, challenge),
+                challenge.can_resend(),
+            ),
+            None => (t(&translator, "accountSendCode"), true),
+        };
+        form(cx)
+            .child(form_field(
+                t(&translator, "accountEmailPlaceholder"),
+                Input::new(&self.email_input).control(cx).w_full(),
+                None,
+                cx,
+            ))
+            .child(form_field(
+                t(&translator, "accountFieldCode"),
+                input_with_action(
+                    Input::new(&self.code_input).control(cx).w_full(),
+                    Button::new("account-login-send-code")
+                        .outline()
+                        .label(send_label)
+                        .control(cx)
+                        .loading(self.resending)
+                        .disabled(!send_enabled || self.resending || self.busy || email_empty)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.resend(window, cx);
+                        })),
+                    cx,
+                ),
+                challenge
+                    .as_ref()
+                    .map(|challenge| code_step::countdown_text(&translator, challenge)),
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn render_password_login(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        form(cx)
+            .child(form_field(
+                self.t("accountFieldAccount", cx),
+                Input::new(&self.account_input).control(cx).w_full(),
+                None,
+                cx,
+            ))
+            .child(form_field(
+                self.t("accountPasswordPlaceholder", cx),
+                Input::new(&self.password_input)
+                    .control(cx)
+                    .w_full()
+                    .content_type(InputContentType::Password)
+                    .mask_toggle(),
+                None,
+                cx,
+            ))
+            .into_any_element()
     }
 }
 
 impl Render for LoginDialog {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = active_theme(cx).tokens().clone();
-        let body = if self.verification_required {
-            form(cx)
-                .child(
-                    v_flex()
-                        .gap(tokens.spacing.xxs)
-                        .child(
-                            div()
-                                .text_size(tokens.typography.sm.size)
-                                .line_height(tokens.typography.sm.line_height)
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(tokens.colors.foreground)
-                                .child(self.t("accountDeviceVerifyTitle", cx)),
-                        )
-                        .child(field_hint(
-                            self.t("accountDeviceVerifySubtitleGeneric", cx),
-                            cx,
-                        )),
-                )
-                .child(form_field(
-                    self.t("accountFieldCode", cx),
-                    Input::new(&self.code_input).control(cx).w_full(),
-                    None,
-                    cx,
-                ))
-        } else {
-            form(cx)
-                .child(form_field(
-                    self.t("accountFieldAccount", cx),
-                    Input::new(&self.account_input).control(cx).w_full(),
-                    None,
-                    cx,
-                ))
-                .child(form_field(
-                    self.t("accountPasswordPlaceholder", cx),
-                    Input::new(&self.password_input)
-                        .control(cx)
-                        .w_full()
-                        .content_type(InputContentType::Password)
-                        .mask_toggle(),
-                    None,
-                    cx,
-                ))
+        let body = match (self.step, self.method) {
+            (Step::DeviceVerify, _) => self.render_device_verify(cx),
+            (Step::Credentials, LoginMethod::Password) => self.render_password_login(cx),
+            (Step::Credentials, LoginMethod::Code) => self.render_code_login(cx),
         };
+        let tabs = (self.step == Step::Credentials).then(|| {
+            let view = cx.entity();
+            segmented_tabs(
+                "account-login-tabs",
+                [
+                    self.t("accountLoginTabPassword", cx),
+                    self.t("accountLoginTabCode", cx),
+                ],
+                usize::from(self.method == LoginMethod::Code),
+                move |index, _, cx| {
+                    let method = if index == 0 {
+                        LoginMethod::Password
+                    } else {
+                        LoginMethod::Code
+                    };
+                    view.update(cx, |this, cx| this.select_method(method, cx));
+                },
+                cx,
+            )
+        });
         v_flex()
             .w_full()
             .gap(tokens.spacing.lg)
+            .when_some(tabs, |column, tabs| column.child(tabs))
             .child(body)
             .when_some(self.error.clone(), |column, error| {
                 column.child(field_error(error, cx))

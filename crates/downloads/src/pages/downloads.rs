@@ -25,9 +25,10 @@ use crate::{
         StatusFolderMotion, TaskState,
         view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewGroupBy, ViewPrefs},
     },
-    pages::new_download::{NewDownloadContext, NewDownloadSubmission, build_new_download_context},
+    pages::new_download::{NewDownloadContext, build_new_download_context},
     pages::task_detail::TaskDetailView,
     strings::DownloadStrings,
+    submission::{NewDownloadSubmission, SubmitNotice, run_submission},
 };
 use fluxdown_ui_components::{ControlExt as _, FluxIcon};
 use fluxdown_ui_i18n::Translator;
@@ -88,6 +89,8 @@ pub struct DownloadHostActions {
     pub open_task_window: Option<IdOpener>,
     pub open_group_window: Option<IdOpener>,
     pub open_queue_manager: Option<PlainOpener>,
+    /// 侧栏「设备」区标题上的「添加设备」入口；`None` 时不显示按钮。
+    pub open_add_device: Option<PlainOpener>,
     /// `Some(id)` 编辑现有分类，`None` 新建。
     pub open_category_editor: Option<CategoryEditorOpener>,
     /// 完成后关机的只读状态投影（`None` = Resident 未装配）。
@@ -270,6 +273,7 @@ impl DownloadView {
             controller.preferences(),
             controller.queues(),
             selected_queue,
+            controller.other_devices(),
         )
     }
 
@@ -292,49 +296,41 @@ impl DownloadView {
         self.open_new_download_with(Vec::new(), window, cx);
     }
 
-    /// 按表单提交创建任务 / 确认外部捕获；对话框确认后由宿主调用。
+    /// 按表单提交创建任务 / 确认外部捕获 / 下发到其他设备；对话框确认后由宿主调用。
     ///
-    /// 命令逐条执行，任一失败即在页面横幅提示；同时把本次保存目录记入本机偏好（无条件
-    /// 记录，开关开启后立即生效）。返回的 future 在全部完成后给出是否全部成功。
+    /// 命令逐条执行，任一失败即在页面横幅提示（按错误 `reason` 给出原因）；同时把本次
+    /// 保存目录 / 下载目标记入本机偏好（尽力而为）。返回的 task 在全部完成后给出汇总提示。
     pub fn create_download(
         &mut self,
         submission: NewDownloadSubmission,
         cx: &mut Context<Self>,
-    ) -> gpui::Task<bool> {
+    ) -> gpui::Task<SubmitNotice> {
         if self.controller.is_stale() {
-            return gpui::Task::ready(false);
-        }
-        if let Some(remember) = submission.remember_save_dir_command() {
-            // 记录目录是尽力而为：失败不影响任务创建，也不进横幅。
-            let remember = self.controller.execute(remember);
-            cx.background_spawn(async move {
-                let _ = remember.await;
-            })
-            .detach();
+            return gpui::Task::ready(SubmitNotice {
+                ok: false,
+                message: self.strings.disconnected.to_string(),
+            });
         }
         let starts_immediately = submission.starts_immediately();
-        let futures = submission
-            .into_commands()
-            .into_iter()
-            .map(|command| self.controller.execute(command))
-            .collect::<Vec<_>>();
+        let port = Arc::clone(&self.port);
         cx.spawn(async move |this, cx| {
-            let mut failed = false;
-            let mut created = Vec::new();
-            for future in futures {
-                match future.await {
-                    Ok(result) => created.extend(result.created_task_ids()),
-                    Err(_) => failed = true,
-                }
-            }
-            let _ = this.update(cx, |this, cx| {
-                this.last_error = failed.then(|| this.strings.action_failed.clone());
+            let report = run_submission(submission, move |command| port.execute(command)).await;
+            let fallback = SubmitNotice {
+                ok: !report.failed(),
+                message: String::new(),
+            };
+            this.update(cx, |this, cx| {
+                let notice = report.notice(this.translator.read(cx));
+                this.last_error = report
+                    .failed()
+                    .then(|| SharedString::from(notice.message.clone()));
                 if starts_immediately {
-                    this.notify_user_started(&created, cx);
+                    this.notify_user_started(report.created_task_ids(), cx);
                 }
                 cx.notify();
-            });
-            !failed
+                notice
+            })
+            .unwrap_or(fallback)
         })
     }
 
@@ -354,7 +350,7 @@ impl DownloadView {
         if let Some(detail) = self.detail.clone() {
             detail.update(cx, |detail, cx| detail.replace_snapshot(snapshot, cx));
         }
-        self.reconcile_queue_selection();
+        self.reconcile_sidebar_selection();
         self.last_error = (!snapshot.daemon_connected).then(|| self.strings.disconnected.clone());
         self.load_view_prefs(cx);
         self.sync_delegate_context(cx);
@@ -387,9 +383,12 @@ impl DownloadView {
                         fluxdown_protocol::DaemonEvent::QueuesChanged(_)
                             | fluxdown_protocol::DaemonEvent::SnapshotReplaced(_)
                     ) | fluxdown_protocol::AgentEvent::DaemonSnapshotReplaced(_)
+                        | fluxdown_protocol::AgentEvent::CloudDevicesChanged(_)
+                        | fluxdown_protocol::AgentEvent::LinkedDevicesChanged(_)
+                        | fluxdown_protocol::AgentEvent::SessionChanged(_)
                 )
             ) {
-                self.reconcile_queue_selection();
+                self.reconcile_sidebar_selection();
             }
             self.sync_delegate_context(cx);
             self.refresh_tasks(cx);
@@ -399,16 +398,31 @@ impl DownloadView {
         }
     }
 
-    /// 队列删除/daemon 快照更替后，不能继续筛选已不存在的队列。
-    fn reconcile_queue_selection(&mut self) {
-        if let SidebarSelection::Queue(queue_id) = &self.selected_item
-            && !self
-                .controller
-                .queues()
-                .iter()
-                .any(|queue| &queue.queue_id == queue_id)
-        {
-            self.selected_item = SidebarSelection::Download(DownloadFilter::ALL);
+    /// 队列删除 / 设备消失（登出、被移除、解除配对）/ daemon 快照更替后，不能继续筛选
+    /// 已不存在的队列或设备。
+    fn reconcile_sidebar_selection(&mut self) {
+        match &self.selected_item {
+            SidebarSelection::Queue(queue_id)
+                if !self
+                    .controller
+                    .queues()
+                    .iter()
+                    .any(|queue| &queue.queue_id == queue_id) =>
+            {
+                self.selected_item = SidebarSelection::Download(DownloadFilter::ALL);
+            }
+            SidebarSelection::Device(id)
+                if id != SidebarSelection::LOCAL_DEVICE
+                    && id != SidebarSelection::ALL_DEVICES
+                    && !self
+                        .controller
+                        .other_devices()
+                        .iter()
+                        .any(|device| device.id == *id) =>
+            {
+                self.selected_item = SidebarSelection::Download(DownloadFilter::ALL);
+            }
+            _ => {}
         }
     }
 
@@ -454,7 +468,7 @@ impl DownloadView {
         });
     }
 
-    /// 队列名 / 组名 / 分类 / 设备别名同步进表格代理（只在变化时触发重算）。
+    /// 队列名 / 组名 / 分类 / 设备名同步进表格代理（只在变化时触发重算）。
     fn sync_delegate_context(&mut self, cx: &mut Context<Self>) {
         let queues: Vec<(String, String)> = self
             .controller
@@ -468,19 +482,12 @@ impl DownloadView {
             .iter()
             .map(|group| (group.group_id.clone(), group.name.clone()))
             .collect();
-        let mut aliases: HashMap<String, Vec<String>> = HashMap::new();
-        for device in self.controller.cloud_devices() {
-            aliases
-                .entry(device.device_id.clone())
-                .or_default()
-                .push(device.id.clone());
-        }
-        for device in self.controller.linked_devices() {
-            aliases
-                .entry(device.fingerprint.clone())
-                .or_default()
-                .push(device.name.clone());
-        }
+        let devices: HashMap<String, String> = self
+            .controller
+            .other_devices()
+            .into_iter()
+            .map(|device| (device.id, device.label))
+            .collect();
         let categories = Rc::clone(self.controller.categories());
         if let Some(detail) = self.detail.clone() {
             detail.update(cx, |detail, cx| detail.set_queue_names(queues.clone(), cx));
@@ -489,7 +496,7 @@ impl DownloadView {
             let delegate = table.delegate_mut();
             delegate.set_queue_names(queues);
             delegate.set_group_names(groups);
-            delegate.set_device_aliases(aliases);
+            delegate.set_device_names(devices);
             delegate.set_categories(categories);
         });
     }
@@ -1200,24 +1207,10 @@ impl DownloadView {
                     cx,
                 ))
                 .on_ok(move |_, _, cx| {
-                    let commands: Vec<DownloadsCommand> = keys
-                        .iter()
-                        .map(|key| {
-                            if key.is_local() {
-                                DownloadsCommand::Delete {
-                                    task_id: key.task_id().to_owned(),
-                                    delete_files: true,
-                                }
-                            } else {
-                                DownloadsCommand::RemoteCommand(serde_json::json!({
-                                    "taskId": key.task_id(),
-                                    "action": "delete",
-                                    "deleteFiles": true,
-                                }))
-                            }
-                        })
-                        .collect();
-                    let _ = this.update(cx, |this, cx| this.execute_commands(commands, cx));
+                    let _ = this.update(cx, |this, cx| {
+                        let commands = this.delete_commands(&keys, true);
+                        this.execute_commands(commands, cx);
+                    });
                     true
                 })
         });

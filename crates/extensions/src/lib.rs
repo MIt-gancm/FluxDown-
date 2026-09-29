@@ -164,7 +164,8 @@ pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> Strin
         ErrorReason::PluginDownloadFailed => Some("pluginErrorDownloadFailed"),
         ErrorReason::PluginPackageTooLarge => Some("pluginErrorPackageTooLarge"),
         ErrorReason::PluginPackageInvalid => Some("pluginErrorPackageInvalid"),
-        ErrorReason::Unknown => None,
+        // 账户 / 远程任务 / 局域网配对等其他能力的原因不在插件页展示，退回按码的通用文案。
+        _ => None,
     });
     let key = reason_key.unwrap_or(match error.code {
         ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout => {

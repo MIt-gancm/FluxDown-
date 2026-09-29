@@ -1,4 +1,8 @@
-//! 登录 / 注册对话框：与 `_showLoginDialog` / `_showRegisterDialog` 语义对齐。
+//! 账户相关对话框：登录 / 注册、云设备管理、添加设备（直连配对）、入站配对确认。
 
+pub(crate) mod add_device;
+pub(crate) mod code_step;
+pub(crate) mod device;
 pub(crate) mod login;
+pub(crate) mod pairing_prompt;
 pub(crate) mod register;

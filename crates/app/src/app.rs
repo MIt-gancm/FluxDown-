@@ -12,6 +12,7 @@ use std::{
 use fluxdown_protocol::{
     AgentEvent, DaemonEvent, DaemonRuntimeStatsDto, ServiceEvent, ShellStatusDto,
 };
+use fluxdown_ui_account::AccountHost;
 use fluxdown_ui_downloads::DownloadView;
 use fluxdown_ui_i18n::{I18nCatalog, I18nError, Translator, system_locale};
 use fluxdown_ui_settings::{SettingsStore, SettingsView, component_locale};
@@ -76,6 +77,8 @@ pub(crate) struct Desktop {
     pub session: Entity<AgentSession>,
     pub client: Arc<AgentClient>,
     pub settings_store: Entity<SettingsStore>,
+    /// 账户 / 设备 / 局域网配对状态：设置页与「添加设备」对话框共享。
+    pub account_host: Entity<AccountHost>,
     pub menu_bar: Entity<AppMenuBar>,
     /// 主窗口内的下载页（主窗口关闭后失效）。
     pub main_downloads: Option<WeakEntity<DownloadView>>,
@@ -203,6 +206,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         let settings_store =
             cx.new(|_| SettingsStore::new(Arc::new(AgentSettingsPort::new(agent_client.clone()))));
         attach(&session, &settings_store, cx);
+        let account_host = crate::account_host::install(&translator, &session, &agent_client, cx);
         let quit_store = settings_store.clone();
         cx.on_app_quit(move |cx| {
             let calls = quit_store.update(cx, |store, _| store.drain_pending_calls());
@@ -226,6 +230,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             session: session.clone(),
             client: agent_client.clone(),
             settings_store,
+            account_host,
             menu_bar,
             main_downloads: None,
             main_shell: None,

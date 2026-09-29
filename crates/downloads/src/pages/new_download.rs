@@ -8,7 +8,6 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    path::PathBuf,
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -16,21 +15,25 @@ use std::{
 
 use crate::{
     controller::{
-        DownloadsCommand, DownloadsPort, DownloadsResult, LAST_SAVE_DIR_PREF,
-        REMEMBER_LAST_SAVE_DIR_PREF,
+        DownloadsCommand, DownloadsPort, DownloadsResult, LAST_DOWNLOAD_TARGET_PREF,
+        LAST_SAVE_DIR_PREF, REMEMBER_LAST_SAVE_DIR_PREF,
     },
-    model::new_download::{
-        DEFAULT_HASH_ALGORITHM, DraftOptions, HASH_ALGORITHMS, MAX_THREADS, ProxyChoice,
-        THREAD_PRESETS, ThreadChoice, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UrlEntry,
-        append_entries, build_requests, capture_entry, checksum_spec, custom_segments,
-        detect_ua_preset, manual_proxy_url, merge_imported, parse_entries, ua_preset_keys,
-        ua_preset_value,
+    model::{
+        devices::{DeviceEntry, DeviceKind, DispatchTarget, other_devices},
+        dispatch::{RemoteDirCheck, check_remote_save_dir},
+        new_download::{
+            DEFAULT_HASH_ALGORITHM, DraftOptions, HASH_ALGORITHMS, MAX_THREADS, ProxyChoice,
+            THREAD_PRESETS, ThreadChoice, UA_PRESET_CUSTOM, UA_PRESET_DEFAULT, UrlEntry,
+            append_entries, build_requests, capture_entry, checksum_spec, custom_segments,
+            detect_ua_preset, manual_proxy_url, merge_imported, parse_entries, ua_preset_keys,
+            ua_preset_value,
+        },
     },
     strings::NewDownloadStrings,
+    submission::{CapturedTask, NewDownloadSubmission, RemoteItem, RemoteSubmission},
 };
 use fluxdown_protocol::{
-    AgentSnapshot, CaptureResolveParams, CreateTaskRequest, PendingCaptureDto, QueueDto,
-    SiteAuthCredentialDto,
+    AgentSnapshot, CloudDevice, LinkDeviceInfo, PendingCaptureDto, QueueDto, SiteAuthCredentialDto,
 };
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, IconControlExt as _, field_error, field_hint, field_label, form,
@@ -86,6 +89,10 @@ pub struct NewDownloadContext {
     pub manual_proxy_url: String,
     /// 预填链接（拖放）。
     pub initial_urls: Vec<String>,
+    /// 「下载到」候选：账号其他设备 + 已配对设备（本机始终可选，不在其中）；空 = 不显示选择器。
+    pub targets: Vec<DeviceEntry>,
+    /// 「下载到」初值：设备本地偏好里上次的目标（目标已不存在则为本机）。
+    pub target: DispatchTarget,
 }
 
 /// 从 agent 快照投影「新建下载」环境（无主窗口时的外部捕获确认、菜单入口共用规则）。
@@ -97,7 +104,15 @@ pub fn new_download_context_from_snapshot(snapshot: &AgentSnapshot) -> NewDownlo
         &snapshot.preferences.values,
         &snapshot.daemon.queues,
         None,
+        new_download_targets(&snapshot.cloud_devices, &snapshot.linked_devices),
     )
+}
+
+/// 「下载到」候选设备（云账号其他设备 + 已配对设备；名册里的本机、重复 id 已剔除，同名
+/// 设备已追加短码）。
+#[must_use]
+pub fn new_download_targets(cloud: &[CloudDevice], linked: &[LinkDeviceInfo]) -> Vec<DeviceEntry> {
+    other_devices(cloud, linked)
 }
 
 /// 与 Dart 一致：偏好 `remember_last_save_dir` 开启且有记录时沿用上次目录，否则用全局
@@ -109,6 +124,7 @@ pub(crate) fn build_new_download_context(
     preferences: &BTreeMap<String, serde_json::Value>,
     queues: &[QueueDto],
     selected_queue: Option<&str>,
+    targets: Vec<DeviceEntry>,
 ) -> NewDownloadContext {
     let config_str = |key: &str| config.get(key).map_or("", |value| value.trim());
     let remember = preferences
@@ -140,6 +156,15 @@ pub(crate) fn build_new_download_context(
     } else {
         config_str("default_segments").parse::<i32>().unwrap_or(0)
     };
+    let target = preferences
+        .get(LAST_DOWNLOAD_TARGET_PREF)
+        .and_then(serde_json::Value::as_str)
+        .and_then(DispatchTarget::from_pref)
+        .filter(|target| {
+            *target == DispatchTarget::Local
+                || targets.iter().any(|entry| entry.target() == *target)
+        })
+        .unwrap_or_default();
     NewDownloadContext {
         save_dir: save_dir.to_owned(),
         queue_id: queue_id.to_owned(),
@@ -153,87 +178,8 @@ pub(crate) fn build_new_download_context(
             .collect(),
         manual_proxy_url: manual_proxy_url(config),
         initial_urls: Vec::new(),
-    }
-}
-
-/// 外部捕获条目的确认：事务 id + 表单产出的建任务参数。
-#[derive(Clone, Debug)]
-pub struct CapturedTask {
-    pub transaction_id: String,
-    pub request: CreateTaskRequest,
-}
-
-/// 表单确认后的提交内容。
-#[derive(Clone, Debug)]
-pub enum NewDownloadSubmission {
-    /// 每条链接一个请求，共享表单选项：普通链接逐条 `daemon.task.create`，
-    /// 外部捕获条目逐条 `agent.capture.resolve` 确认。
-    Tasks {
-        tasks: Vec<CreateTaskRequest>,
-        captures: Vec<CapturedTask>,
-    },
-    /// 本机 `.torrent` 文件，交给 agent 读取上传。
-    TorrentFiles(Vec<PathBuf>),
-}
-
-impl NewDownloadSubmission {
-    /// 提交后任务立即开始（非「稍后下载」）；本机种子文件由 agent 直接开始。
-    #[must_use]
-    pub fn starts_immediately(&self) -> bool {
-        match self {
-            Self::Tasks { tasks, captures } => tasks
-                .iter()
-                .chain(captures.iter().map(|capture| &capture.request))
-                .all(|request| !request.start_paused),
-            Self::TorrentFiles(_) => true,
-        }
-    }
-
-    /// 「上次保存目录」偏好写入（尽力而为，失败不影响建任务）。
-    #[must_use]
-    pub fn remember_save_dir_command(&self) -> Option<DownloadsCommand> {
-        let Self::Tasks { tasks, captures } = self else {
-            return None;
-        };
-        let save_dir = tasks
-            .first()
-            .or_else(|| captures.first().map(|capture| &capture.request))?
-            .save_dir
-            .clone();
-        Some(DownloadsCommand::SetLocalPreference {
-            key: LAST_SAVE_DIR_PREF,
-            value: serde_json::Value::String(save_dir),
-        })
-    }
-
-    /// 建任务 / 确认捕获 / 上传种子的端口命令，逐条执行。
-    #[must_use]
-    pub fn into_commands(self) -> Vec<DownloadsCommand> {
-        match self {
-            Self::Tasks { tasks, captures } => tasks
-                .into_iter()
-                .map(|request| {
-                    DownloadsCommand::Create(Box::new(fluxdown_protocol::DaemonCreateTaskParams {
-                        request,
-                        torrent_blob_id: None,
-                        unattended: false,
-                    }))
-                })
-                .chain(captures.into_iter().map(|capture| {
-                    DownloadsCommand::CaptureResolve(Box::new(CaptureResolveParams {
-                        transaction_id: capture.transaction_id,
-                        accepted: true,
-                        request: Some(capture.request),
-                    }))
-                }))
-                .collect(),
-            Self::TorrentFiles(paths) => paths
-                .iter()
-                .map(|path| DownloadsCommand::SubmitTorrentFile {
-                    path: path.display().to_string(),
-                })
-                .collect(),
-        }
+        targets,
+        target,
     }
 }
 
@@ -290,6 +236,11 @@ pub struct NewDownloadView {
     headers: Vec<HeaderRow>,
     header_seq: usize,
     picking: bool,
+    /// 「下载到」当前目标；非本机时必然存在于 `context.targets`（设备消失即回退本机）。
+    target: DispatchTarget,
+    /// 远端保存目录（与本机 `save_dir` 各自保留，来回切换目标不互相覆盖）；
+    /// 空 = 使用目标设备默认目录。
+    remote_save_dir: Entity<InputState>,
 }
 
 impl NewDownloadView {
@@ -334,6 +285,25 @@ impl NewDownloadView {
         let rename = cx
             .new(|cx| InputState::new(window, cx).placeholder(strings.rename_placeholder.clone()));
         urls.update(cx, |input, cx| input.focus(window, cx));
+        let target = if context
+            .targets
+            .iter()
+            .any(|entry| entry.target() == context.target)
+        {
+            context.target.clone()
+        } else {
+            DispatchTarget::Local
+        };
+        let remote_placeholder = context
+            .targets
+            .iter()
+            .find(|entry| entry.target() == target)
+            .map_or_else(
+                || strings.remote_dir_placeholder(None),
+                |entry| strings.remote_dir_placeholder(entry.default_save_dir.as_deref()),
+            );
+        let remote_save_dir =
+            cx.new(|cx| InputState::new(window, cx).placeholder(remote_placeholder));
 
         let mut this = Self {
             threads: ThreadChoice::from_segments(context.segments),
@@ -363,6 +333,8 @@ impl NewDownloadView {
             headers: Vec::new(),
             header_seq: 0,
             picking: false,
+            target,
+            remote_save_dir,
         };
         this.refresh_entries(window, cx);
         this.subscribe_inputs(&translator, window, cx);
@@ -402,7 +374,12 @@ impl NewDownloadView {
             },
         )
         .detach();
-        for input in [&self.save_dir, &self.custom_threads, &self.rename] {
+        for input in [
+            &self.save_dir,
+            &self.remote_save_dir,
+            &self.custom_threads,
+            &self.rename,
+        ] {
             cx.subscribe_in(
                 input,
                 window,
@@ -617,10 +594,94 @@ impl NewDownloadView {
             })
     }
 
+    /// 当前远端目标；本机为 `None`。
+    fn target_entry(&self) -> Option<&DeviceEntry> {
+        match &self.target {
+            DispatchTarget::Local => None,
+            target => self
+                .context
+                .targets
+                .iter()
+                .find(|entry| entry.target() == *target),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        self.target_entry().is_some()
+    }
+
+    /// 远端保存目录输入按目标路径风格的校验。
+    fn remote_dir_check(&self, entry: &DeviceEntry, cx: &App) -> RemoteDirCheck {
+        check_remote_save_dir(&self.remote_save_dir.read(cx).value(), entry.path_style)
+    }
+
     fn can_submit(&self, cx: &App) -> bool {
-        !self.picking
-            && !self.entries.is_empty()
-            && !self.save_dir.read(cx).value().trim().is_empty()
+        if self.picking || self.entries.is_empty() {
+            return false;
+        }
+        match self.target_entry() {
+            Some(entry) => self.remote_dir_check(entry, cx) != RemoteDirCheck::Invalid,
+            None => !self.save_dir.read(cx).value().trim().is_empty(),
+        }
+    }
+
+    fn target_label(&self, entry: &DeviceEntry) -> SharedString {
+        let status = if entry.online {
+            &self.strings.device_online
+        } else {
+            &self.strings.device_offline
+        };
+        match entry.kind {
+            DeviceKind::Cloud => SharedString::from(format!("{} · {status}", entry.label)),
+            DeviceKind::Paired => SharedString::from(format!(
+                "{} · {} · {status}",
+                entry.label, self.strings.device_lan_tag
+            )),
+        }
+    }
+
+    /// 切换「下载到」目标：远端保存目录占位随目标默认目录刷新。
+    fn set_target(&mut self, target: DispatchTarget, window: &mut Window, cx: &mut Context<Self>) {
+        if target != DispatchTarget::Local
+            && !self
+                .context
+                .targets
+                .iter()
+                .any(|entry| entry.target() == target)
+        {
+            return;
+        }
+        self.target = target;
+        self.refresh_remote_placeholder(window, cx);
+        cx.notify();
+    }
+
+    fn refresh_remote_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = self.strings.remote_dir_placeholder(
+            self.target_entry()
+                .and_then(|entry| entry.default_save_dir.as_deref()),
+        );
+        self.remote_save_dir.update(cx, |input, cx| {
+            input.set_placeholder(placeholder, window, cx)
+        });
+    }
+
+    /// 宿主推送最新的设备名册（在线状态 / 默认目录 / 增减设备）。当前目标已消失则回退本机。
+    pub fn set_targets(
+        &mut self,
+        targets: Vec<DeviceEntry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.context.targets == targets {
+            return;
+        }
+        self.context.targets = targets;
+        if self.target != DispatchTarget::Local && self.target_entry().is_none() {
+            self.target = DispatchTarget::Local;
+        }
+        self.refresh_remote_placeholder(window, cx);
+        cx.notify();
     }
 
     fn segments(&self, cx: &App) -> i32 {
@@ -681,6 +742,13 @@ impl NewDownloadView {
         cx: &mut Context<Self>,
     ) {
         if !self.can_submit(cx) {
+            return;
+        }
+        // 远端目标没有队列 / 稍后下载：只有立即开始一条路径。
+        if let Some(entry) = self.target_entry().cloned() {
+            if !later && queue_override.is_none() {
+                self.submit_remote(&entry, window, cx);
+            }
             return;
         }
         let options = self.draft_options(later, queue_override, cx);
@@ -795,8 +863,56 @@ impl NewDownloadView {
         .detach();
     }
 
+    /// 下发到其他设备：每条链接一次下发，目录空 = 目标设备默认目录；已随下发处理的外部
+    /// 捕获从表单摘出（宿主忽略 agent 里对应的待确认事务）。
+    fn submit_remote(&mut self, entry: &DeviceEntry, window: &mut Window, cx: &mut Context<Self>) {
+        let save_dir = match self.remote_dir_check(entry, cx) {
+            RemoteDirCheck::Invalid => return,
+            RemoteDirCheck::UseDefault => None,
+            RemoteDirCheck::Explicit(dir) => Some(dir),
+        };
+        let single = self.entries.len() == 1;
+        let rename = self.rename.read(cx).value().trim().to_owned();
+        let items = self
+            .entries
+            .iter()
+            .map(|item| RemoteItem {
+                url: item.url.clone(),
+                file_name: if single && !rename.is_empty() {
+                    Some(rename.clone())
+                } else {
+                    Some(item.file_name.clone()).filter(|name| !name.is_empty())
+                },
+            })
+            .collect::<Vec<_>>();
+        let mut captures = Vec::new();
+        for item in &items {
+            if let Some(index) = self
+                .captures
+                .iter()
+                .position(|capture| capture.url == item.url)
+            {
+                captures.push(self.captures.remove(index).transaction_id);
+            }
+        }
+        (self.on_submit)(
+            NewDownloadSubmission::Remote(RemoteSubmission {
+                target: entry.target(),
+                device_label: entry.label.clone(),
+                target_offline: entry.kind == DeviceKind::Cloud && !entry.online,
+                items,
+                save_dir,
+                captures,
+            }),
+            window,
+            cx,
+        );
+        window.remove_window();
+    }
+
     fn pick_save_dir(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picking {
+        // 系统目录选择器只能选本机目录；远端目录靠输入。
+        if self.picking || self.is_remote() {
             return;
         }
         self.picking = true;
@@ -1056,7 +1172,7 @@ impl NewDownloadView {
             .when(has_text && count == 0, |this| {
                 this.child(field_error(self.strings.no_valid_url.clone(), cx))
             })
-            .when(!self.captures.is_empty(), |this| {
+            .when(!self.captures.is_empty() && !self.is_remote(), |this| {
                 this.child(field_hint(self.strings.capture_context_hint.clone(), cx))
             })
             .child(
@@ -1068,7 +1184,7 @@ impl NewDownloadView {
                             .icon(FluxIcon::FolderOpen)
                             .label(self.strings.open_torrent.clone())
                             .control(cx)
-                            .disabled(self.picking)
+                            .disabled(self.picking || self.is_remote())
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.pick_torrent_files(window, cx);
                             })),
@@ -1087,7 +1203,80 @@ impl NewDownloadView {
             )
     }
 
+    /// 「下载到」目标选择：本机 / 云设备 / 已配对设备；没有其他设备时不显示。
+    fn render_target(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.context.targets.is_empty() {
+            return None;
+        }
+        let mut options = vec![(
+            DispatchTarget::Local,
+            self.strings.this_device.clone(),
+            false,
+        )];
+        options.extend(
+            self.context
+                .targets
+                .iter()
+                .map(|entry| (entry.target(), self.target_label(entry), false)),
+        );
+        let dropdown = self.dropdown(
+            "new-download-target",
+            None,
+            self.target.clone(),
+            options,
+            |this, target, window, cx| this.set_target(target, window, cx),
+            cx,
+        );
+        let hint = match self.target_entry() {
+            None => self.strings.download_to_hint.clone(),
+            Some(entry) => {
+                let offline = match (entry.online, entry.kind) {
+                    (true, _) => None,
+                    (false, DeviceKind::Cloud) => Some(&self.strings.target_offline_hint),
+                    (false, DeviceKind::Paired) => Some(&self.strings.target_paired_offline_hint),
+                };
+                match offline {
+                    Some(offline) => SharedString::from(format!(
+                        "{offline} {}",
+                        self.strings.remote_options_hint
+                    )),
+                    None => self.strings.remote_options_hint.clone(),
+                }
+            }
+        };
+        Some(form_field(
+            self.strings.download_to.clone(),
+            dropdown,
+            Some(hint),
+            cx,
+        ))
+    }
+
     fn render_save_dir(&self, cx: &mut Context<Self>) -> Div {
+        if let Some(entry) = self.target_entry() {
+            let invalid = self.remote_dir_check(entry, cx) == RemoteDirCheck::Invalid;
+            let field = form_field(
+                self.strings.save_dir.clone(),
+                input_with_action(
+                    Input::new(&self.remote_save_dir).control(cx).w_full(),
+                    Button::new("new-download-browse")
+                        .outline()
+                        .icon(FluxIcon::FolderOpen)
+                        .label(self.strings.browse.clone())
+                        .control(cx)
+                        .disabled(true),
+                    cx,
+                ),
+                (!invalid).then(|| self.strings.remote_dir_hint.clone()),
+                cx,
+            );
+            return field.when(invalid, |this| {
+                this.child(field_error(
+                    self.strings.path_invalid_text(entry.path_style),
+                    cx,
+                ))
+            });
+        }
         form_field(
             self.strings.save_dir.clone(),
             input_with_action(
@@ -1161,7 +1350,8 @@ impl NewDownloadView {
                 .into_any_element(),
             );
         }
-        if !self.all_magnet() {
+        // 分段数只对本机下载有意义；下发只带链接 / 文件名 / 保存目录。
+        if !self.all_magnet() && !self.is_remote() {
             fields.push(self.render_threads(cx).into_any_element());
         }
         (!fields.is_empty()).then(|| form_row(fields, cx))
@@ -1451,9 +1641,10 @@ impl NewDownloadView {
             .pt(tokens.spacing.xs)
             .pb(tokens.spacing.lg)
             .child(self.render_urls(cx))
+            .children(self.render_target(cx))
             .child(self.render_save_dir(cx))
             .children(self.render_name_threads(cx))
-            .child(self.render_advanced(cx))
+            .children((!self.is_remote()).then(|| self.render_advanced(cx)))
     }
 
     fn render_footer(&self, cx: &mut Context<Self>) -> Div {
@@ -1482,38 +1673,53 @@ impl NewDownloadView {
                     .control(cx)
                     .on_click(|_, window, _| window.remove_window()),
             )
-            .child(
-                DropdownButton::new("new-download-later")
-                    .outline()
-                    .with_size(split_size)
-                    .disabled(!enabled)
-                    .button(
-                        Button::new("new-download-later-main")
-                            .label(self.strings.download_later.clone())
-                            .control(cx)
-                            .tooltip(self.strings.format_later_tooltip(&later_queue))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.submit(true, None, window, cx);
-                            })),
-                    )
-                    .dropdown_menu_with_anchor(Anchor::TopRight, self.queue_menu(true, cx)),
-            )
-            .child(
-                DropdownButton::new("new-download-start")
-                    .primary()
-                    .with_size(split_size)
-                    .disabled(!enabled)
-                    .button(
-                        Button::new("new-download-start-main")
-                            .label(self.strings.format_start(self.entries.len()))
-                            .control(cx)
-                            .tooltip(self.strings.format_start_tooltip(&start_queue))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.submit(false, None, window, cx);
-                            })),
-                    )
-                    .dropdown_menu_with_anchor(Anchor::TopRight, self.queue_menu(false, cx)),
-            )
+            .children(if self.is_remote() {
+                // 下发只有「立即开始」：没有队列，也没有稍后下载。
+                vec![
+                    Button::new("new-download-start-remote")
+                        .primary()
+                        .label(self.strings.format_start(self.entries.len()))
+                        .control(cx)
+                        .disabled(!enabled)
+                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.submit(false, None, window, cx);
+                        }))
+                        .into_any_element(),
+                ]
+            } else {
+                vec![
+                    DropdownButton::new("new-download-later")
+                        .outline()
+                        .with_size(split_size)
+                        .disabled(!enabled)
+                        .button(
+                            Button::new("new-download-later-main")
+                                .label(self.strings.download_later.clone())
+                                .control(cx)
+                                .tooltip(self.strings.format_later_tooltip(&later_queue))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.submit(true, None, window, cx);
+                                })),
+                        )
+                        .dropdown_menu_with_anchor(Anchor::TopRight, self.queue_menu(true, cx))
+                        .into_any_element(),
+                    DropdownButton::new("new-download-start")
+                        .primary()
+                        .with_size(split_size)
+                        .disabled(!enabled)
+                        .button(
+                            Button::new("new-download-start-main")
+                                .label(self.strings.format_start(self.entries.len()))
+                                .control(cx)
+                                .tooltip(self.strings.format_start_tooltip(&start_queue))
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.submit(false, None, window, cx);
+                                })),
+                        )
+                        .dropdown_menu_with_anchor(Anchor::TopRight, self.queue_menu(false, cx))
+                        .into_any_element(),
+                ]
+            })
     }
 }
 

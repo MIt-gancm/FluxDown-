@@ -1,4 +1,6 @@
 pub(crate) mod categories;
+pub(crate) mod devices;
+pub(crate) mod dispatch;
 pub(crate) mod new_download;
 pub(crate) mod progress_window;
 pub(crate) mod shutdown;
@@ -143,13 +145,19 @@ pub(crate) enum SidebarSection {
 impl SidebarSection {
     pub(crate) const ALL: [Self; 3] = [Self::Status, Self::Queues, Self::Devices];
 
-    /// 分区可见性偏好键（`sync:true`，与其余 `ui.*` 同规则）。
+    /// 分区可见性偏好键。设备区偏好只对本机有意义（每台设备各自决定是否显示），写设备本地
+    /// 偏好；其余分区沿用云同步目录里的 `ui.show_sidebar_*`。
     pub(crate) fn visibility_pref(self) -> &'static str {
         match self {
             Self::Status => "ui.show_sidebar_status",
             Self::Queues => "ui.show_sidebar_queues",
             Self::Devices => "ui.show_sidebar_devices",
         }
+    }
+
+    /// 可见性偏好是否随云同步（设备区为设备本地）。
+    pub(crate) fn visibility_syncs(self) -> bool {
+        !matches!(self, Self::Devices)
     }
 }
 
@@ -158,12 +166,24 @@ impl SidebarSection {
 pub(crate) enum SidebarSelection {
     Download(DownloadFilter),
     Queue(String),
-    /// `"local"` = 本机，其余为云设备 id / 配对设备指纹。
+    /// `"local"` = 本机，`"all"` = 全部设备，其余为云设备 id / 配对设备指纹。
     Device(String),
 }
 
 impl SidebarSelection {
     pub(crate) const LOCAL_DEVICE: &'static str = "local";
+    pub(crate) const ALL_DEVICES: &'static str = "all";
+
+    /// 设备项的行筛选（表格与侧栏计数共用，保证数字与表格行数一致）：
+    /// 本机 = 全部本地任务；全部设备 = 本地 + 远程；其余 = 目标设备是它的远程任务
+    /// （`to_device`，即任务实际下载的设备；`from_device` 只是发起者）。
+    pub(crate) fn device_matches(device: &str, task: &DownloadTaskView) -> bool {
+        match device {
+            Self::LOCAL_DEVICE => task.source == TaskSource::Local,
+            Self::ALL_DEVICES => true,
+            id => task.source == TaskSource::Remote && task.to_device == id,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -295,8 +315,11 @@ pub(crate) struct DownloadTaskView {
     pub(crate) seeding_status: i32,
     pub(crate) uploaded_bytes: i64,
     pub(crate) boosted: bool,
-    /// 远程任务来源设备 id（本地任务为空）。
-    pub(crate) from_device: String,
+    /// 远程任务的目标设备 id（`CloudDevice::device_id`；本地任务为空）。
+    pub(crate) to_device: String,
+    /// 远程任务的云端原始状态（本地任务为 `None`）；`Canceled` / `Unknown` 无法用
+    /// [`TaskState`] 精确表达，行文案与可控性据此判断。
+    pub(crate) remote_status: Option<fluxdown_protocol::RemoteTaskStatus>,
 }
 
 impl DownloadTaskView {
@@ -342,7 +365,8 @@ impl DownloadTaskView {
             task.created_at.parse().unwrap_or_default(),
             match task.status {
                 fluxdown_protocol::RemoteTaskStatus::Pending
-                | fluxdown_protocol::RemoteTaskStatus::Accepted => 0,
+                | fluxdown_protocol::RemoteTaskStatus::Accepted
+                | fluxdown_protocol::RemoteTaskStatus::Unknown => 0,
                 fluxdown_protocol::RemoteTaskStatus::Downloading => 1,
                 fluxdown_protocol::RemoteTaskStatus::Paused => 2,
                 fluxdown_protocol::RemoteTaskStatus::Completed => 3,
@@ -353,7 +377,8 @@ impl DownloadTaskView {
         );
         view.save_dir = task.save_dir.clone().unwrap_or_default();
         view.error_message = task.error.clone().unwrap_or_default();
-        view.from_device.clone_from(&task.from_device);
+        view.to_device.clone_from(&task.to_device);
+        view.remote_status = Some(task.status);
         view
     }
 
@@ -423,8 +448,15 @@ impl DownloadTaskView {
             seeding_status: 0,
             uploaded_bytes: 0,
             boosted: false,
-            from_device: String::new(),
+            to_device: String::new(),
+            remote_status: None,
         }
+    }
+
+    /// 远程任务能否执行该动作（本地任务恒为 `false`：走 daemon 命令）。
+    pub(crate) fn remote_can(&self, action: fluxdown_protocol::RemoteCommandAction) -> bool {
+        self.remote_status
+            .is_some_and(|status| dispatch::remote_action_applies(status, action))
     }
 
     /// 「复制链接」用：`origin_url` 优先，空则回退 `url`（torrent 任务的 `url` 是哨兵）。
@@ -515,7 +547,9 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{DownloadTaskView, RowKey, TaskProtocol, TaskSource, TaskState, url_host};
+    use super::{
+        DownloadTaskView, RowKey, SidebarSelection, TaskProtocol, TaskSource, TaskState, url_host,
+    };
 
     #[test]
     fn local_and_remote_wire_tasks_project_without_placeholders() {
@@ -546,6 +580,20 @@ mod tests {
         assert_eq!(remote.source, TaskSource::Remote);
         assert_eq!(remote.state, TaskState::Paused);
 
+        let targeted = serde_json::from_value::<fluxdown_protocol::RemoteTaskDto>(json!({
+            "id":"remote-2","fromDevice":"dev-a","toDevice":"dev-b","url":"https://example.com/c",
+            "fileName":null,"status":"someFutureStatus","downloadedBytes":0
+        }))
+        .expect("remote task with unknown status");
+        let targeted = DownloadTaskView::remote(&targeted);
+        assert_eq!(targeted.to_device, "dev-b");
+        assert!(targeted.name.is_empty());
+        assert_eq!(targeted.state, TaskState::Pending);
+        // 云端新状态：不可控制（包括删除）。
+        assert!(!targeted.remote_can(fluxdown_protocol::RemoteCommandAction::Pause));
+        assert!(!targeted.remote_can(fluxdown_protocol::RemoteCommandAction::Delete));
+        assert!(remote.remote_can(fluxdown_protocol::RemoteCommandAction::Resume));
+
         let probing = serde_json::from_value::<fluxdown_protocol::TaskDto>(json!({
             "taskId":"local-2","url":"magnet:?xt=urn:btih:abc","fileName":"",
             "saveDir":"/tmp","status":0,"downloadedBytes":0,"totalBytes":0,
@@ -556,6 +604,46 @@ mod tests {
         assert!(probing.metadata_pending);
         assert!(probing.name.is_empty());
         assert_eq!(probing.protocol, TaskProtocol::Bt);
+    }
+
+    #[test]
+    fn device_filter_matches_target_device_not_sender() {
+        let remote = |id: &str, from: &str, to: &str| {
+            let dto = serde_json::from_value::<fluxdown_protocol::RemoteTaskDto>(json!({
+                "id": id, "fromDevice": from, "toDevice": to, "url": "https://example.com/a",
+                "status": "downloading"
+            }))
+            .expect("remote task");
+            DownloadTaskView::remote(&dto)
+        };
+        let local = serde_json::from_value::<fluxdown_protocol::TaskDto>(json!({
+            "taskId":"l1","url":"https://example.com/l","fileName":"l.bin","saveDir":"/tmp",
+            "status":1,"downloadedBytes":0,"totalBytes":1,"errorMessage":"","createdAt":"1",
+            "proxyUrl":"","queueId":"main","checksum":""
+        }))
+        .expect("local task");
+        let local = DownloadTaskView::local(&local, None, false);
+        // Windows(dev-a) 把任务下发给 mac(dev-b)：选 mac 应看到它，选发起者 Windows 不应看到。
+        let sent = remote("r1", "dev-a", "dev-b");
+        assert!(SidebarSelection::device_matches("dev-b", &sent));
+        assert!(!SidebarSelection::device_matches("dev-a", &sent));
+        assert!(!SidebarSelection::device_matches(
+            SidebarSelection::LOCAL_DEVICE,
+            &sent
+        ));
+        assert!(SidebarSelection::device_matches(
+            SidebarSelection::ALL_DEVICES,
+            &sent
+        ));
+        assert!(SidebarSelection::device_matches(
+            SidebarSelection::LOCAL_DEVICE,
+            &local
+        ));
+        assert!(SidebarSelection::device_matches(
+            SidebarSelection::ALL_DEVICES,
+            &local
+        ));
+        assert!(!SidebarSelection::device_matches("dev-b", &local));
     }
 
     #[test]

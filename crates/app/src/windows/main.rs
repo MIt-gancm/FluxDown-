@@ -45,7 +45,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
         cx,
     ));
 
-    WindowRegistry::open_or_focus(cx, WindowKey::Main, options, move |window, cx| {
+    let handle = WindowRegistry::open_or_focus(cx, WindowKey::Main, options, move |window, cx| {
         let downloads_port = Arc::new(AgentDownloadsPort::new(client.clone()));
         let downloads =
             cx.new(|cx| DownloadView::new(translator.clone(), downloads_port, window, cx));
@@ -149,6 +149,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
                 open_queue_manager: Some(Rc::new(|_, cx| {
                     crate::windows::queue_manager::open(cx);
                 })),
+                open_add_device: Some(Rc::new(crate::account_host::open_add_device_dialog)),
                 open_category_editor: Some(Rc::new(move |id, window, cx| {
                     let translator = translator_for_categories.read(cx).clone();
                     fluxdown_ui_settings::open_category_editor(
@@ -177,7 +178,12 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
         WindowRegistry::persist_bounds(&WindowKey::Main, client, &root, window, cx);
         install_close_policy(window, cx);
         root
-    })
+    });
+    if handle.is_some() {
+        // 启动前就已存在的入站配对请求：窗口就绪后补弹。
+        cx.defer(crate::account_host::replay_pending);
+    }
+    handle
 }
 
 /// 关闭策略：原生关闭按钮（`windowShouldClose:`）与 ⌘W 共用一份判定。

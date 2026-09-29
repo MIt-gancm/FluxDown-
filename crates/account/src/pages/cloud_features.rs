@@ -1,18 +1,21 @@
 //! 云功能分组：配置同步开关（真实读写 `agent.sync.*`）+ 多设备协同状态行
 //! （无独立开关，登录后自动可用，展示当前在线设备数）。
 
-use fluxdown_protocol::{CloudDevice, SyncStatusDto};
-use fluxdown_ui_components::{FluxIcon, card, tabular_numbers};
+use fluxdown_protocol::{CloudDevice, SyncLocalOnlyParams, SyncStatusDto};
+use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, card, tabular_numbers};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{SemanticThemeTokens, active_theme};
 use gpui::{
-    App, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
+    App, ClickEvent, Context, FontWeight, InteractiveElement as _, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
 };
 use gpui_component::{
     Disableable as _, Icon, IconNamed, h_flex, switch::Switch, tooltip::Tooltip, v_flex,
 };
 
+use crate::errors::{ErrorContext, sync_reason_key};
+use crate::link::now_unix_ms;
+use crate::sync_scope::{SyncPhase, can_sync_now, relative_time, sync_groups, sync_phase};
 use crate::view::AccountView;
 use crate::{AccountCommand, t, t_with, ui};
 
@@ -41,6 +44,10 @@ pub(crate) fn render(
                 .child(config_sync_row(
                     translator, tokens, logged_in, sync, disabled, cx,
                 ))
+                .when(logged_in && sync.enabled, |card| {
+                    card.child(ui::row_divider(cx))
+                        .child(scope_block(translator, tokens, sync, disabled, cx))
+                })
                 .child(ui::row_divider(cx))
                 .child(multi_device_row(translator, tokens, logged_in, devices, cx)),
         )
@@ -91,6 +98,40 @@ fn row_text(
         )
 }
 
+fn sync_subtitle(translator: &Translator, phase: SyncPhase) -> SharedString {
+    match phase {
+        SyncPhase::Disabled => t(translator, "cloudSyncDesc"),
+        SyncPhase::Halted(reason) => {
+            let reason = t(translator, sync_reason_key(reason));
+            t_with(
+                translator,
+                "cloudSyncStatusHalted",
+                &[("reason", reason.as_ref())],
+            )
+        }
+        SyncPhase::Failed(reason) => {
+            let reason = t(translator, sync_reason_key(reason));
+            t_with(
+                translator,
+                "cloudSyncStatusError",
+                &[("reason", reason.as_ref())],
+            )
+        }
+        SyncPhase::Connecting => t(translator, "cloudSyncStatusConnecting"),
+        SyncPhase::Syncing => t(translator, "cloudSyncStatusSyncing"),
+        SyncPhase::Synced(None) => t(translator, "cloudSyncStatusSynced"),
+        SyncPhase::Synced(Some(at)) => {
+            let (key, count) = relative_time(now_unix_ms(), at);
+            let time = t_with(translator, key, &[("n", &count.to_string())]);
+            t_with(
+                translator,
+                "cloudSyncStatusSyncedAt",
+                &[("time", time.as_ref())],
+            )
+        }
+    }
+}
+
 fn config_sync_row(
     translator: &Translator,
     tokens: &SemanticThemeTokens,
@@ -100,19 +141,12 @@ fn config_sync_row(
     cx: &mut Context<AccountView>,
 ) -> impl IntoElement {
     let title = t(translator, "cloudSyncTitle");
-    let active = logged_in && sync.enabled;
-    let subtitle: SharedString = if !active {
-        t(translator, "cloudSyncDesc")
-    } else if let Some(error) = sync.last_error.as_deref().filter(|error| !error.is_empty()) {
-        t_with(translator, "cloudSyncStatusError", &[("reason", error)])
-    } else if !sync.dirty_keys.is_empty() {
-        t(translator, "cloudSyncStatusSyncing")
-    } else {
-        t(translator, "cloudSyncStatusSynced")
-    };
+    let phase = sync_phase(logged_in, sync);
+    let subtitle = sync_subtitle(translator, phase);
     let login_required_label = t(translator, "cloudSyncLoginRequired");
     let checked = sync.enabled;
     let switch_disabled = disabled || !logged_in;
+    let sync_now_enabled = !disabled && can_sync_now(logged_in, sync);
 
     let switch = Switch::new("account-sync-enable")
         .checked(checked)
@@ -123,11 +157,11 @@ fn config_sync_row(
             } else {
                 fluxdown_protocol::method::AGENT_SYNC_DISABLE
             };
-            let future = view.controller.port().execute(AccountCommand::Sync {
+            let future = view.port(cx).execute(AccountCommand::Sync {
                 method,
                 params: serde_json::json!({}),
             });
-            view.spawn_action(future, cx);
+            view.spawn_action(future, ErrorContext::Sync, cx);
         }));
 
     h_flex()
@@ -138,6 +172,24 @@ fn config_sync_row(
         .py(tokens.spacing.sm)
         .child(row_icon(tokens, FluxIcon::RotateCw, cx))
         .child(row_text(tokens, title, subtitle))
+        .when(logged_in && sync.enabled, |this| {
+            this.child(
+                button(
+                    "account-sync-now",
+                    t(translator, "cloudSyncNow"),
+                    ButtonVariant::Secondary,
+                    cx,
+                )
+                .disabled(!sync_now_enabled)
+                .on_click(cx.listener(|view, _: &ClickEvent, _, cx| {
+                    let future = view.port(cx).execute(AccountCommand::Sync {
+                        method: fluxdown_protocol::method::AGENT_SYNC_NOW,
+                        params: serde_json::json!({}),
+                    });
+                    view.spawn_action(future, ErrorContext::Sync, cx);
+                })),
+            )
+        })
         .child(if logged_in {
             switch.into_any_element()
         } else {
@@ -151,6 +203,92 @@ fn config_sync_row(
         })
 }
 
+/// 「在此设备同步的范围」：按键前缀分组的开关；关闭的组只留在本设备。
+fn scope_block(
+    translator: &Translator,
+    tokens: &SemanticThemeTokens,
+    sync: &SyncStatusDto,
+    disabled: bool,
+    cx: &mut Context<AccountView>,
+) -> impl IntoElement {
+    let groups = sync_groups(&sync.local_only_keys);
+    let rows: Vec<_> = groups
+        .iter()
+        .enumerate()
+        .map(|(index, state)| {
+            let group = state.group;
+            let mixed = state.is_partial().then(|| t(translator, "syncScopeMixed"));
+            h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(tokens.spacing.md)
+                .child(
+                    v_flex()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(tokens.typography.sm.size)
+                                .line_height(tokens.typography.sm.line_height)
+                                .text_color(tokens.colors.foreground)
+                                .child(t(translator, group.label_key())),
+                        )
+                        .when_some(mixed, |column, mixed| {
+                            column.child(
+                                div()
+                                    .text_size(tokens.typography.xs.size)
+                                    .line_height(tokens.typography.xs.line_height)
+                                    .text_color(tokens.colors.muted_foreground)
+                                    .child(mixed),
+                            )
+                        }),
+                )
+                .child(
+                    Switch::new(("account-sync-scope", index))
+                        .checked(state.all_synced())
+                        .disabled(disabled)
+                        .on_click(cx.listener(move |view, checked: &bool, _, cx| {
+                            let local_only_keys =
+                                view.controller(cx).sync_status().local_only_keys.clone();
+                            let Some(state) = sync_groups(&local_only_keys)
+                                .into_iter()
+                                .find(|state| state.group == group)
+                            else {
+                                return;
+                            };
+                            // 打开 = 参与同步（取消本机专属）；关闭 = 仅本机。
+                            let make_local_only = !*checked;
+                            let keys = state.keys_to_change(&local_only_keys, make_local_only);
+                            if keys.is_empty() {
+                                return;
+                            }
+                            let params = serde_json::to_value(SyncLocalOnlyParams {
+                                keys,
+                                local_only: make_local_only,
+                            })
+                            .unwrap_or_default();
+                            let future = view.port(cx).execute(AccountCommand::Sync {
+                                method: fluxdown_protocol::method::AGENT_SYNC_SET_LOCAL_ONLY,
+                                params,
+                            });
+                            view.spawn_action(future, ErrorContext::Sync, cx);
+                        })),
+                )
+        })
+        .collect();
+    v_flex()
+        .w_full()
+        .gap(tokens.spacing.sm)
+        .px(tokens.spacing.md)
+        .py(tokens.spacing.sm)
+        .child(ui::group_heading(
+            t(translator, "syncScopeTitle"),
+            Some(t(translator, "syncScopeDesc")),
+            cx,
+        ))
+        .children(rows)
+}
+
 fn multi_device_row(
     translator: &Translator,
     tokens: &SemanticThemeTokens,
@@ -160,7 +298,10 @@ fn multi_device_row(
 ) -> impl IntoElement {
     let title = t(translator, "multiDeviceTitle");
     let desc = t(translator, "multiDeviceDesc");
-    let online_count = devices.iter().filter(|device| device.is_online).count();
+    let online_count = devices
+        .iter()
+        .filter(|device| device.is_online && !device.is_current)
+        .count();
     let caption = active_theme(cx).extended().caption;
 
     h_flex()

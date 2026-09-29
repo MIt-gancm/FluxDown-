@@ -26,6 +26,7 @@ impl AccountPort for AgentAccountPort {
             | AccountCommand::Order { method, params }
             | AccountCommand::Referral { method, params }
             | AccountCommand::Sync { method, params }
+            | AccountCommand::Link { method, params }
             | AccountCommand::CloudEndpoint { method, params } => (method, params),
         };
         client.call(method, Some(params))
