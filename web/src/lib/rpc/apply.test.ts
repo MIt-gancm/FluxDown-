@@ -1,0 +1,75 @@
+import { describe, expect, test } from 'bun:test'
+import { applyAgentEvent, applyDaemonEvent } from './apply'
+import type { AgentSnapshot, DaemonSnapshot, TaskDto, TaskRuntimeDto } from './protocol'
+
+function task(taskId: string, status: number): TaskDto {
+  return { taskId, status, fileName: 'a.bin', saveDir: '/d', url: 'http://x/a', downloadedBytes: 0, totalBytes: 10, errorMessage: '' } as unknown as TaskDto
+}
+
+function runtime(taskId: string, sampleSequence: number, active = 2): TaskRuntimeDto {
+  return {
+    taskId,
+    sampleSequence,
+    totalBytes: 10,
+    activeTransfers: active,
+    segments: [{ index: 0, startByte: 0, endByte: 9, downloadedBytes: 1, active: true }],
+  } as unknown as TaskRuntimeDto
+}
+
+function daemon(tasks: TaskDto[], taskRuntime: Record<string, TaskRuntimeDto> = {}): DaemonSnapshot {
+  return { tasks, taskRuntime, pendingSelections: [], rssItemRevisions: {}, priority: [], plugins: [] } as unknown as DaemonSnapshot
+}
+
+describe('apply daemon events', () => {
+  test('过期采样被丢弃；分段沿用上次；非活跃任务清零活跃读数', () => {
+    let snap = daemon([task('t', 1)], { t: runtime('t', 5) })
+    const stale = applyDaemonEvent(snap, { type: 'taskRuntimeChanged', data: runtime('t', 5, 9) })
+    expect(stale).toBe(snap)
+
+    const empty = { ...runtime('t', 6, 3), segments: [] }
+    snap = applyDaemonEvent(snap, { type: 'taskRuntimeChanged', data: empty })
+    expect(snap.taskRuntime.t?.segments.length).toBe(1)
+    expect(snap.taskRuntime.t?.activeTransfers).toBe(3)
+
+    snap = applyDaemonEvent(snap, { type: 'taskChanged', data: task('t', 2) })
+    expect(snap.taskRuntime.t?.activeTransfers).toBe(0)
+    expect(snap.taskRuntime.t?.segments[0]?.active).toBe(false)
+  })
+
+  test('未知任务的采样被忽略', () => {
+    const snap = daemon([])
+    expect(applyDaemonEvent(snap, { type: 'taskRuntimeChanged', data: runtime('x', 1) })).toBe(snap)
+  })
+
+  test('engine taskProgress：status 4 + deleted 删除任务；否则只覆盖非空字符串字段', () => {
+    const base = daemon([task('t', 1)], { t: runtime('t', 1) })
+    const msg = {
+      type: 'taskProgress', taskId: 't', status: 1, downloadedBytes: 5, totalBytes: 10, speed: 0, fileName: '',
+      saveDir: '', uploadSpeed: 0, url: '', errorMessage: '', uploadedBytes: 0, seedingStatus: 0, seedingMessage: '', seedingTimeSecs: 0,
+    } as const
+    const progressed = applyDaemonEvent(base, { type: 'engine', data: msg })
+    expect(progressed.tasks[0]?.fileName).toBe('a.bin')
+    expect(progressed.tasks[0]?.downloadedBytes).toBe(5)
+
+    const deleted = applyDaemonEvent(base, { type: 'engine', data: { ...msg, status: 4, errorMessage: 'deleted' } })
+    expect(deleted.tasks.length).toBe(0)
+    expect(deleted.taskRuntime.t).toBeUndefined()
+  })
+
+  test('selectionPending 按 requestId 去重，selectionResolved 移除', () => {
+    const req = (requestId: string) => ({ requestId, taskId: 't' }) as never
+    let snap = daemon([])
+    snap = applyDaemonEvent(snap, { type: 'selectionPending', data: req('r1') })
+    snap = applyDaemonEvent(snap, { type: 'selectionPending', data: req('r1') })
+    expect(snap.pendingSelections.length).toBe(1)
+    snap = applyDaemonEvent(snap, { type: 'selectionResolved', data: { requestId: 'r1' } })
+    expect(snap.pendingSelections.length).toBe(0)
+  })
+
+  test('daemonConnectionChanged(false) 清空 taskRuntime', () => {
+    const snap = { daemon: daemon([task('t', 1)], { t: runtime('t', 1) }), daemonConnected: true } as unknown as AgentSnapshot
+    const next = applyAgentEvent(snap, { type: 'daemonConnectionChanged', data: false })
+    expect(next.daemonConnected).toBe(false)
+    expect(Object.keys(next.daemon.taskRuntime).length).toBe(0)
+  })
+})

@@ -1,0 +1,125 @@
+// 队列与任务组 DTO。
+
+/** 命名队列。 */
+export interface QueueDto {
+  queueId: string;
+  name: string;
+  /** 限速 KB/s，0 = 不限速。 */
+  speedLimitKbps: number;
+  /** 上传限速 KB/s，0 = 不限速。 */
+  uploadLimitKbps: number;
+  /** 并发上限，0 = 跟随全局。 */
+  maxConcurrent: number;
+  defaultSaveDir: string;
+  position: number;
+  defaultSegments: number;
+  defaultUserAgent: string;
+  /** 停止的队列不自动启动其中任务。 */
+  isRunning: boolean;
+  scheduleEnabled: boolean;
+  /** 每日定时启动 `HH:MM`（空 = 不定时启动）。 */
+  scheduleStart: string;
+  /** 每日定时停止 `HH:MM`（空 = 不定时停止）。 */
+  scheduleStop: string;
+  /** 星期位掩码：bit0 = 周一 … bit6 = 周日；127 = 每天。 */
+  scheduleDays: number;
+}
+
+/** 任务在队列中的位置。 */
+export interface QueuePositionDto {
+  taskId: string;
+  /** 1-based，0 = 不在队列中。 */
+  position: number;
+}
+
+/** 创建/更新队列的字段（更新时同时需要 `queueId`）。除 `name` 外可省略。 */
+export interface QueueInput {
+  name: string;
+  speedLimitKbps?: number;
+  uploadLimitKbps?: number;
+  maxConcurrent?: number;
+  defaultSaveDir?: string;
+  defaultSegments?: number;
+  defaultUserAgent?: string;
+}
+
+/** 任务组。 */
+export interface GroupDto {
+  groupId: string;
+  name: string;
+  /** 原始分享/清单链接。 */
+  sourceUrl: string;
+  /** 组根目录。 */
+  saveDir: string;
+  /** Unix 秒级时间戳（字符串）。 */
+  createdAt: string;
+}
+
+/** 创建任务组的单个成员条目。 */
+export interface GroupItemRequest {
+  /** `<itemId>` 或 `<itemId>@<variantId>`。 */
+  resolverItem: string;
+  fileName: string;
+  /** 相对组根目录的子路径（空 = 组根）。 */
+  relPath?: string;
+  /** 已知大小（字节，0 = 未知）。 */
+  size?: number;
+}
+
+/** 创建任务组请求；`items` 不可为空。 */
+export interface CreateGroupRequest {
+  sourceUrl?: string;
+  /** 空 = 组根目录直接用 `saveDir`。 */
+  groupName?: string;
+  saveDir?: string;
+  queueId?: string;
+  segments?: number;
+  cookies?: string;
+  referrer?: string;
+  userAgent?: string;
+  proxyUrl?: string;
+  extraHeaders?: Record<string, string>;
+  ignoreTlsErrors?: boolean;
+  startPaused?: boolean;
+  items: GroupItemRequest[];
+}
+
+export interface CreateGroupResponse {
+  groupId: string;
+}
+
+/** 前置预解析请求（只读，不建任务）。 */
+export interface ResolvePreviewRequest {
+  url: string;
+  cookies?: string;
+  referrer?: string;
+  userAgent?: string;
+  extraHeaders?: Record<string, string>;
+}
+
+/** 预解析清单的单个规格（画质/格式）。 */
+export interface PreviewVariantDto {
+  id: string;
+  label: string;
+  /** 字节，0 = 未知。 */
+  size: number;
+}
+
+export interface PreviewItemDto {
+  /** 建组时拼进 `resolverItem`。 */
+  id: string;
+  name: string;
+  /** 相对组根目录的子路径（空 = 根）。 */
+  path: string;
+  /** 字节，0 = 未知。 */
+  size: number;
+  variants: PreviewVariantDto[];
+}
+
+/** `items` 与 `error` 均为空 = 插件未返回清单（回退普通建任务）；`error` 非空 = 预解析失败。 */
+export interface ResolvePreviewResponse {
+  name: string;
+  sourceUrl: string;
+  error: string;
+  items: PreviewItemDto[];
+}

@@ -1,0 +1,288 @@
+// 事件应用：`native/protocol/src/event.rs` 的 `apply_agent_event` / `apply_daemon_event` /
+// `apply_engine_message` 逐条移植。全部为不可变更新（返回新对象，未变化的分支保持引用不变），
+// 以便 React 选择器按引用比较。
+
+import type {
+  AgentEvent,
+  AgentSnapshot,
+  DaemonEvent,
+  DaemonSnapshot,
+  TaskDto,
+  TaskRuntimeDto,
+  WsServerMsg,
+} from './protocol'
+
+/** 状态 1（下载中）/ 5（准备中）以外的任务视为不活跃。 */
+function isActiveStatus(status: number): boolean {
+  return status === 1 || status === 5
+}
+
+function withoutKey<V>(record: Readonly<Record<string, V>>, key: string): Record<string, V> {
+  if (!(key in record)) return record as Record<string, V>
+  const next = { ...record }
+  delete next[key]
+  return next
+}
+
+/** 清零传输活跃读数（对应 Rust `clear_active_runtime`）。 */
+function clearActiveRuntime(snapshot: DaemonSnapshot, taskId: string): DaemonSnapshot {
+  const runtime = snapshot.taskRuntime[taskId]
+  if (!runtime) return snapshot
+  const cleared: TaskRuntimeDto = {
+    ...runtime,
+    activeTransfers: 0,
+    connectedPeers: 0,
+    segments: runtime.segments.map((segment) => ({ ...segment, active: false })),
+  }
+  return { ...snapshot, taskRuntime: { ...snapshot.taskRuntime, [taskId]: cleared } }
+}
+
+function updateTask(
+  snapshot: DaemonSnapshot,
+  taskId: string,
+  update: (task: TaskDto) => TaskDto,
+): DaemonSnapshot {
+  const index = snapshot.tasks.findIndex((task) => task.taskId === taskId)
+  if (index < 0) return snapshot
+  const tasks = snapshot.tasks.slice()
+  tasks[index] = update(snapshot.tasks[index] as TaskDto)
+  return { ...snapshot, tasks }
+}
+
+/** 采样序号不落后且任务存在时返回任务状态（对应 Rust `accepted_runtime_status`）。 */
+export function acceptedRuntimeStatus(snapshot: DaemonSnapshot, runtime: TaskRuntimeDto): number | null {
+  const previous = snapshot.taskRuntime[runtime.taskId]
+  if (previous && previous.sampleSequence !== 0 && runtime.sampleSequence <= previous.sampleSequence) {
+    return null
+  }
+  const task = snapshot.tasks.find((item) => item.taskId === runtime.taskId)
+  return task ? task.status : null
+}
+
+function applyEngineMessage(snapshot: DaemonSnapshot, message: WsServerMsg): DaemonSnapshot {
+  switch (message.type) {
+    case 'tasksSnapshot': {
+      const ids = new Set(message.tasks.map((task) => task.taskId))
+      const taskRuntime: Record<string, TaskRuntimeDto> = {}
+      for (const [id, runtime] of Object.entries(snapshot.taskRuntime)) {
+        if (ids.has(id)) taskRuntime[id] = runtime
+      }
+      let next: DaemonSnapshot = { ...snapshot, tasks: message.tasks, taskRuntime }
+      for (const task of message.tasks) {
+        if (!isActiveStatus(task.status)) next = clearActiveRuntime(next, task.taskId)
+      }
+      return next
+    }
+    case 'taskProgress': {
+      if (message.status === 4 && message.errorMessage === 'deleted') {
+        return {
+          ...snapshot,
+          taskRuntime: withoutKey(snapshot.taskRuntime, message.taskId),
+          tasks: snapshot.tasks.filter((task) => task.taskId !== message.taskId),
+        }
+      }
+      let next = snapshot
+      if (!isActiveStatus(message.status)) next = clearActiveRuntime(next, message.taskId)
+      return updateTask(next, message.taskId, (task) => ({
+        ...task,
+        status: message.status,
+        downloadedBytes: message.downloadedBytes,
+        totalBytes: message.totalBytes,
+        fileName: message.fileName !== '' ? message.fileName : task.fileName,
+        saveDir: message.saveDir !== '' ? message.saveDir : task.saveDir,
+        url: message.url !== '' ? message.url : task.url,
+        errorMessage: message.errorMessage,
+        uploadedBytes: message.uploadedBytes,
+        seedingStatus: message.seedingStatus,
+        seedingMessage: message.seedingMessage,
+        seedingTimeSecs: message.seedingTimeSecs,
+      }))
+    }
+    case 'segmentProgress': {
+      const task = snapshot.tasks.find((item) => item.taskId === message.taskId)
+      if (!task) return snapshot
+      const inactive = !isActiveStatus(task.status)
+      const existing = snapshot.taskRuntime[message.taskId]
+      // 真实传输采样存在时不得被持久几何覆盖（对应 Rust 注释）。
+      if (existing && existing.sampleSequence !== 0) return snapshot
+      const base: TaskRuntimeDto = existing ?? {
+        taskId: message.taskId,
+        sampleSequence: 0,
+        totalBytes: 0,
+        segments: [],
+        activeTransfers: inactive ? 0 : null,
+      }
+      const runtime: TaskRuntimeDto = {
+        ...base,
+        totalBytes: message.totalBytes,
+        segments: message.segments.map((segment) => ({
+          index: segment.index,
+          startByte: segment.startByte,
+          endByte: segment.endByte,
+          downloadedBytes: segment.downloadedBytes,
+          active: inactive ? false : null,
+        })),
+      }
+      return { ...snapshot, taskRuntime: { ...snapshot.taskRuntime, [message.taskId]: runtime } }
+    }
+    case 'taskMetaProbed':
+      return updateTask(snapshot, message.taskId, (task) => ({
+        ...task,
+        fileName: message.fileName !== '' ? message.fileName : task.fileName,
+        totalBytes: message.totalBytes,
+      }))
+    case 'taskQueueChanged':
+      return updateTask(snapshot, message.taskId, (task) => ({ ...task, queueId: message.queueId }))
+    case 'taskRouteChanged':
+      return updateTask(snapshot, message.taskId, (task) => ({ ...task, autoRoute: message.route }))
+    case 'queuesChanged':
+      return { ...snapshot, queues: message.queues }
+    case 'queuePositionsChanged':
+      return { ...snapshot, queuePositions: message.positions }
+    case 'groupsChanged':
+      return { ...snapshot, groups: message.groups }
+    case 'rssSourcesChanged':
+      return { ...snapshot, rssSources: message.sources }
+    case 'rssItemsChanged':
+      return {
+        ...snapshot,
+        rssItemRevisions: {
+          ...snapshot.rssItemRevisions,
+          [message.sourceId]: (snapshot.rssItemRevisions[message.sourceId] ?? 0) + 1,
+        },
+      }
+    case 'webhookDeliveriesChanged':
+      return { ...snapshot, webhookDeliveries: message.deliveries }
+    case 'fileMissingChanged': {
+      let next = snapshot
+      for (const update of message.updates) {
+        next = updateTask(next, update.taskId, (task) => ({ ...task, fileMissing: update.missing }))
+      }
+      return next
+    }
+    case 'priorityTaskChanged':
+      return { ...snapshot, priority: message.priorityTaskId !== '' ? [message.priorityTaskId] : [] }
+    case 'pluginAutoDisabled': {
+      const index = snapshot.plugins.findIndex((plugin) => plugin.identity === message.identity)
+      if (index < 0) return snapshot
+      const plugins = snapshot.plugins.slice()
+      plugins[index] = { ...(snapshot.plugins[index] as (typeof plugins)[number]), enabled: false, disabledReason: message.reason }
+      return { ...snapshot, plugins }
+    }
+    default:
+      return snapshot
+  }
+}
+
+export function applyDaemonEvent(snapshot: DaemonSnapshot, event: DaemonEvent): DaemonSnapshot {
+  switch (event.type) {
+    case 'taskRuntimeChanged': {
+      const status = acceptedRuntimeStatus(snapshot, event.data)
+      if (status === null) return snapshot
+      const inactive = !isActiveStatus(status)
+      const previous = snapshot.taskRuntime[event.data.taskId]
+      let runtime: TaskRuntimeDto = event.data
+      if (runtime.segments.length === 0 && previous) runtime = { ...runtime, segments: previous.segments }
+      if (inactive) {
+        runtime = {
+          ...runtime,
+          activeTransfers: 0,
+          segments: runtime.segments.map((segment) => ({ ...segment, active: false })),
+        }
+      }
+      return { ...snapshot, taskRuntime: { ...snapshot.taskRuntime, [runtime.taskId]: runtime } }
+    }
+    case 'taskActivityAdded':
+      return snapshot
+    case 'snapshotReplaced':
+      return event.data
+    case 'engine':
+      return applyEngineMessage(snapshot, event.data)
+    case 'taskChanged': {
+      const task = event.data
+      const exists = snapshot.tasks.some((item) => item.taskId === task.taskId)
+      let next: DaemonSnapshot = exists
+        ? updateTask(snapshot, task.taskId, () => task)
+        : { ...snapshot, tasks: [...snapshot.tasks, task] }
+      if (!isActiveStatus(task.status)) next = clearActiveRuntime(next, task.taskId)
+      return next
+    }
+    case 'taskDeleted':
+      return {
+        ...snapshot,
+        tasks: snapshot.tasks.filter((task) => task.taskId !== event.data.taskId),
+        taskRuntime: withoutKey(snapshot.taskRuntime, event.data.taskId),
+      }
+    case 'queuesChanged':
+      return { ...snapshot, queues: event.data }
+    case 'groupsChanged':
+      return { ...snapshot, groups: event.data }
+    case 'configChanged':
+      return { ...snapshot, config: event.data }
+    case 'rssChanged':
+      return {
+        ...snapshot,
+        rssItemRevisions: { ...snapshot.rssItemRevisions, [event.data.sourceId]: event.data.itemRevision },
+      }
+    case 'pluginsChanged':
+      return { ...snapshot, plugins: event.data }
+    case 'componentsChanged':
+      return { ...snapshot, components: event.data }
+    case 'webhooksChanged':
+      return { ...snapshot, webhookDeliveries: event.data }
+    case 'runtimeStatsChanged':
+      return { ...snapshot, runtimeStats: event.data }
+    case 'selectionPending':
+      return {
+        ...snapshot,
+        pendingSelections: [
+          ...snapshot.pendingSelections.filter((item) => item.requestId !== event.data.requestId),
+          event.data,
+        ],
+      }
+    case 'selectionResolved':
+      return {
+        ...snapshot,
+        pendingSelections: snapshot.pendingSelections.filter((item) => item.requestId !== event.data.requestId),
+      }
+  }
+}
+
+export function applyAgentEvent(snapshot: AgentSnapshot, event: AgentEvent): AgentSnapshot {
+  switch (event.type) {
+    case 'daemon': {
+      const daemon = applyDaemonEvent(snapshot.daemon, event.data)
+      return daemon === snapshot.daemon ? snapshot : { ...snapshot, daemon }
+    }
+    case 'daemonSnapshotReplaced':
+      return { ...snapshot, daemon: event.data }
+    case 'daemonConnectionChanged':
+      return {
+        ...snapshot,
+        daemonConnected: event.data,
+        daemon: event.data ? snapshot.daemon : { ...snapshot.daemon, taskRuntime: {} },
+      }
+    case 'sessionChanged':
+      return { ...snapshot, session: event.data }
+    case 'syncChanged':
+      return { ...snapshot, sync: event.data }
+    case 'preferencesChanged':
+      return { ...snapshot, preferences: event.data }
+    case 'gatewayChanged':
+      return { ...snapshot, gateway: event.data }
+    case 'cloudDevicesChanged':
+      return { ...snapshot, cloudDevices: event.data }
+    case 'linkedDevicesChanged':
+      return { ...snapshot, linkedDevices: event.data }
+    case 'remoteTasksChanged':
+      return { ...snapshot, remoteTasks: event.data }
+    case 'pendingCapturesChanged':
+      return { ...snapshot, pendingCaptures: event.data }
+    case 'shellChanged':
+      return { ...snapshot, shell: event.data }
+    case 'powerChanged':
+      return { ...snapshot, power: event.data }
+    case 'captureTasksStarted':
+      return snapshot
+  }
+}

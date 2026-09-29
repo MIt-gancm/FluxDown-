@@ -1,0 +1,211 @@
+// 任务相关 DTO（daemon.rs TaskDto / CreateTaskRequest、task_activity.rs）。
+
+/** `TaskDto.status` 取值。 */
+export const TASK_STATUS = {
+  pending: 0,
+  downloading: 1,
+  paused: 2,
+  completed: 3,
+  error: 4,
+  preparing: 5,
+} as const;
+export type TaskStatus = (typeof TASK_STATUS)[keyof typeof TASK_STATUS];
+
+/** `TaskDto.seedingStatus` 取值：2..7 均为停止原因，具体见 `seedingMessage`。 */
+export const SEEDING_STATUS = {
+  none: 0,
+  seeding: 1,
+  ratioReached: 2,
+  timeReached: 3,
+  userStopped: 4,
+  taskDeleted: 5,
+  sessionReleased: 6,
+  inactiveStopped: 7,
+  /** 排队等待做种槽位。 */
+  queued: 8,
+} as const;
+
+/** 任务级做种限制哨兵（分享率为千分比，1500 = 1.5）。 */
+export const SEED_LIMIT_INHERIT = -2; // 跟随全局
+export const SEED_LIMIT_UNLIMITED = -1; // 不限制（0 也视同不限制）
+
+/** 任务信息。 */
+export interface TaskDto {
+  taskId: string;
+  url: string;
+  fileName: string;
+  saveDir: string;
+  /** 0 待处理 / 1 下载中 / 2 已暂停 / 3 已完成 / 4 出错 / 5 准备中，见 {@link TASK_STATUS}。 */
+  status: number;
+  downloadedBytes: number;
+  totalBytes: number;
+  errorMessage: string;
+  /** Unix 秒级时间戳（字符串）。 */
+  createdAt: string;
+  /** 单任务代理 URL（空 = 使用全局代理）。 */
+  proxyUrl: string;
+  /** 命名队列 ID（空 = 默认队列）。 */
+  queueId: string;
+  /** `algo=hexhash`，空 = 跳过校验。 */
+  checksum: string;
+  ignoreTlsErrors: boolean;
+  /** 已完成任务的目标文件是否已被删除/移动。 */
+  fileMissing: boolean;
+  /** 下载完成时刻 Unix 秒（字符串，空 = 尚未完成）。 */
+  completedAt: string;
+  /** 浏览器扩展捕获的来源页面 URL（空 = 无）。 */
+  referrer: string;
+  /** 所属任务组 ID（空 = 不属于任何组）。 */
+  groupId: string;
+  /** 由哪条 RSS 订阅自动创建（空 = 非 RSS 来源）。 */
+  rssSourceId: string;
+  /** 展示用原始来源链接（空 = 用 `url`）；`.torrent` 任务的 `url` 是 `torrent-file://local` 哨兵。 */
+  originUrl: string;
+  /** ProxyMode=Auto 的最终链路标签：`direct` / `proxy:cached` 等（空 = 非 Auto 模式）。 */
+  autoRoute: string;
+  /** 队列内启动顺序（0 = 未显式排序）。 */
+  queueOrder: number;
+  /** BT 已上传字节数（非 BT 恒 0）。 */
+  uploadedBytes: number;
+  /** 下载完成时刻的已上传字节数（做种后分享率基准）。 */
+  uploadedAtCompletion: number;
+  /** 见 {@link SEEDING_STATUS}。 */
+  seedingStatus: number;
+  seedingMessage: string;
+  /** 累计做种秒数。 */
+  seedingTimeSecs: number;
+  /** 总分享率上限（千分比）；-2 跟随全局，-1 不限制，>=0 自定义。 */
+  seedRatioLimitMilli: number;
+  /** 做种后分享率上限（千分比），哨兵同上。 */
+  seedPostRatioLimitMilli: number;
+  /** 做种时长上限（分钟），哨兵同上。 */
+  seedTimeLimitMinutes: number;
+  /** 不活跃做种时长上限（分钟），哨兵同上。 */
+  seedInactiveTimeLimitMinutes: number;
+}
+
+/** 文件字节区间进度；`active` 未知（null）时不要推断其传输状态。 */
+export interface TaskSegmentDto {
+  index: number;
+  startByte: number;
+  endByte: number;
+  downloadedBytes: number;
+  active: boolean | null;
+}
+
+/** 任务最新传输采样；活跃传输数不是 socket 数、配置上限或分段数。 */
+export interface TaskRuntimeDto {
+  taskId: string;
+  sampledAtMs: number;
+  /** 源端单调采样序号；0 仅供旧客户端回退，不参与过期判定。 */
+  sampleSequence: number;
+  activeTransfers: number | null;
+  connectedPeers: number | null;
+  parallelismLimit: number | null;
+  totalBytes: number;
+  segments: TaskSegmentDto[];
+}
+
+/** 持久任务事件（`daemon.task.activity` 条目 / `taskActivityAdded` 事件）。 */
+export interface TaskActivityDto {
+  /** 同一数据库内单调递增。 */
+  id: number;
+  taskId: string;
+  timestampMs: number;
+  kind: string;
+  message: string;
+  status: number | null;
+}
+
+/** `daemon.task.activity` 参数：默认最近一页；`beforeId` 向前翻页，`afterId` 断线补齐，二者互斥。 */
+export interface TaskActivityQuery {
+  taskId: string;
+  beforeId?: number | null;
+  afterId?: number | null;
+  /** 0 / 缺省 = 服务端默认值；服务端另设硬上限。 */
+  limit?: number;
+}
+
+/** 页内按 ID 升序；`truncated` 表示历史已被清理。 */
+export interface TaskActivityPage {
+  entries: TaskActivityDto[];
+  hasMore: boolean;
+  oldestId: number | null;
+  newestId: number | null;
+  truncated: boolean;
+}
+
+/** 浏览器原始请求体（form-POST 触发的下载）。 */
+export type RequestBody =
+  | { kind: 'formData'; fields: Record<string, string[]> }
+  /** 已序列化的 url-encoded 字符串，直接作为 body。 */
+  | { kind: 'urlencoded'; raw: string }
+  /** base64 二进制 body。 */
+  | { kind: 'raw'; bytesB64: string; contentType?: string | null };
+
+/** 创建任务请求（直接建任务，不经确认框）。除 `url` 外全部可省略。 */
+export interface CreateTaskRequest {
+  /** 使用 `torrentB64`/`torrentBlobId` 时允许为空占位。 */
+  url: string;
+  /** 空 = 从 URL / Content-Disposition 推断。 */
+  fileName?: string;
+  /** 空 = 全局默认保存目录。 */
+  saveDir?: string;
+  /** 0 = 由 segment_advisor 按文件大小决定。 */
+  segments?: number;
+  cookies?: string;
+  referrer?: string;
+  proxyUrl?: string;
+  /** 空 = 全局 User-Agent。 */
+  userAgent?: string;
+  /** 命名队列 ID（空 = 默认队列）。 */
+  queueId?: string;
+  /** `algo=hexhash`。 */
+  checksum?: string;
+  ignoreTlsErrors?: boolean;
+  headers?: Record<string, string> | null;
+  /** base64 编码的 .torrent 内容。 */
+  torrentB64?: string | null;
+  method?: string | null;
+  body?: RequestBody | null;
+  /** 音频轨 URL：非空 = 视频轨+音频轨分别下载后 mux。 */
+  audioUrl?: string | null;
+  /** 稍后下载：建任务后以 paused 落库。 */
+  startPaused?: boolean;
+  /** HTTP Basic 用户名，非空时注入 Authorization 头。 */
+  httpUser?: string;
+  httpPassword?: string;
+  /** 为该站点保存凭据（`httpUser` 非空时有意义）。 */
+  saveSiteAuth?: boolean;
+}
+
+/** `daemon.task.create` 参数。 */
+export interface DaemonCreateTaskParams {
+  request: CreateTaskRequest;
+  /** 一次性 blob 引用（与 `request.torrentB64` 互斥）。 */
+  torrentBlobId?: string | null;
+  unattended?: boolean;
+}
+
+/** `daemon.task.create` 结果。 */
+export interface CreatedTask {
+  taskId: string;
+}
+
+/** `agent.capture.submit` 的外部下载请求载荷（DownloadRequest）。除 `url` 外全部可省略。 */
+export interface DownloadRequest {
+  /** 多行 = 批量（按换行拆成多条）。 */
+  url: string;
+  filename?: string;
+  /** 空 = 由宿主按分类匹配 / 默认目录决定。 */
+  saveDir?: string;
+  referrer?: string;
+  cookies?: string;
+  headers?: Record<string, string> | null;
+  /** >0 已知大小；-1 未知但确认是下载资源（跳过 probe）；0/null 正常 probe。 */
+  fileSize?: number | null;
+  mimeType?: string | null;
+  method?: string | null;
+  body?: RequestBody | null;
+  audioUrl?: string | null;
+}

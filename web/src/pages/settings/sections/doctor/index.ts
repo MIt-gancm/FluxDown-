@@ -1,0 +1,1 @@
+export { DoctorSettings } from './DoctorSettings'

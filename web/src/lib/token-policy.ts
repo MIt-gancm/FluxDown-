@@ -1,8 +1,8 @@
-// 访问密钥（管理 token）策略 —— Rust 侧 `native/server/src/config.rs`
-// `validate_access_key` / `generate_access_key` 的逐条镜像。
+// 访问密钥（= agent server 模式的 gateway user token）策略 —— Rust 侧
+// `native/agent/src/server_mode.rs::validate_access_key` 的逐条镜像。
 //
 // 两侧必须一致：前端放行、后端拒收 = 首次运行向导直接卡死在「按了没反应」。
-// 改任一侧都要同步改另一侧（后端单测 `access_key_tests` 覆盖同一组用例）。
+// 改任一侧都要同步改另一侧（后端单测覆盖同一组用例）。
 
 /** 最短长度，与 Rust `ACCESS_KEY_MIN_LEN` 一致。 */
 export const ACCESS_KEY_MIN_LEN = 8

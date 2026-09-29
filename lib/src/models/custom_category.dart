@@ -25,7 +25,7 @@ String sanitizeCategoryDirName(String label) {
 /// [baseDir] 为空、或 [label] 净化后为空时返回 ''（调用方跳过该分类）。
 /// [separator] 仅供测试注入，默认取当前平台分隔符。
 ///
-/// Web 侧必须给出同样的结果，镜像实现见 `web/src/lib/categories.ts` 的
+/// Web 侧必须给出同样的结果，镜像实现见 `web/src/lib/category-dir.ts` 的
 /// `categoryDirUnder`；两端改一处就要改另一处，否则同一台机器上桌面与 Web
 /// 一键出来的目录会不一致。
 String categoryDirUnder(String baseDir, String label, {String? separator}) {
@@ -125,7 +125,7 @@ class CustomCategory {
   /// 分类显示名：内置分类用 i18n 文案，自定义分类用用户设置的名称。
   ///
   /// 内置文案不只是标签：「一键分类目录」拿它当目录名（[categoryDirUnder]），
-  /// Web 侧 `web/src/lib/categories.ts` 的 BUILTIN_LABEL 必须逐字一致，
+  /// Web 侧共用 `assets/i18n` 的同一批内置分类键，显示名必须逐字一致，
   /// 否则两端会在同一台机器上建出两套目录。
   String displayName(S s) {
     if (!isBuiltin) return name;

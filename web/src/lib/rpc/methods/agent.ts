@@ -1,0 +1,207 @@
+// agent.* 方法：每个包装器接收与 wire 完全一致的 params 对象，返回 wire 结果。
+// 仅限 Web 可用的方法（不含读写宿主机路径的 platform.* / installFile / exportLogs 等）。
+
+import { call } from '../client';
+import { METHOD } from '../protocol';
+import type {
+  AgentLoginResult,
+  AgentSessionDto,
+  CaptureResolveParams,
+  CaptureResolveResult,
+  CaptureSubmitParams,
+  CaptureSubmitResult,
+  ChangeEmailParams,
+  ChangeNicknameParams,
+  ChangeOriginIdParams,
+  CheckOriginIdParams,
+  CloudDevice,
+  CloudOrder,
+  CloudPlan,
+  CloudProfile,
+  CloudReferralCode,
+  CloudReferralCodesResult,
+  CloudReferralRecordsResult,
+  CloudReferralSummary,
+  CloudReferralValidateResult,
+  DeviceIdParams,
+  DeviceRenameParams,
+  DiagnosticRepairParams,
+  DiagnosticsReportDto,
+  GatewayPatchParams,
+  GatewayRevealTokenResult,
+  GatewayStatusDto,
+  JsonValue,
+  LoginParams,
+  LoginVerifyParams,
+  LogPathsDto,
+  OkResult,
+  OrderCreateParams,
+  OrderGetParams,
+  OriginIdCheckResult,
+  PageParams,
+  PendingCaptureDto,
+  PowerArmParams,
+  PowerArmResult,
+  PreferencesPatchParams,
+  RandomOriginIdResult,
+  ReferralCreateCodeParams,
+  ReferralDeleteCodeParams,
+  ReferralListRecordsParams,
+  ReferralValidateParams,
+  RegisterParams,
+  RegisterVerifyParams,
+  RemoteCommandParams,
+  RemoteDispatchParams,
+  RemoteDispatchResult,
+  RemoteTaskDto,
+  SendCodeParams,
+  SendNewEmailCodeParams,
+  SyncStatusDto,
+  TtlResult,
+  UpdateCheckParams,
+  UpdateCheckResultDto,
+  VerifyCodeParams,
+} from '../protocol';
+
+const session = {
+  /** 当前会话；未登录为 null。 */
+  get: () => call<AgentSessionDto | null>(METHOD.AGENT_SESSION_GET),
+};
+
+const auth = {
+  /** 发码并建 pending 用户；结果一般为 `deviceVerificationRequired`（`ttlSeconds` 为验证码有效期）。 */
+  register: (params: RegisterParams) => call<AgentLoginResult>(METHOD.AGENT_AUTH_REGISTER, params),
+  registerVerify: (params: RegisterVerifyParams) =>
+    call<AgentLoginResult>(METHOD.AGENT_AUTH_REGISTER_VERIFY, params),
+  login: (params: LoginParams) => call<AgentLoginResult>(METHOD.AGENT_AUTH_LOGIN, params),
+  /** 新设备验证码登录，重新校验密码并消费验证码。 */
+  loginVerify: (params: LoginVerifyParams) =>
+    call<AgentLoginResult>(METHOD.AGENT_AUTH_LOGIN_VERIFY, params),
+  sendCode: (params: SendCodeParams) => call<TtlResult>(METHOD.AGENT_AUTH_SEND_CODE, params),
+  verifyCode: (params: VerifyCodeParams) =>
+    call<AgentLoginResult>(METHOD.AGENT_AUTH_VERIFY_CODE, params),
+  logout: () => call<OkResult>(METHOD.AGENT_AUTH_LOGOUT),
+  refreshProfile: () => call<CloudProfile>(METHOD.AGENT_AUTH_REFRESH_PROFILE),
+};
+
+const profile = {
+  sendEmailCode: () => call<TtlResult>(METHOD.AGENT_PROFILE_SEND_EMAIL_CODE),
+  sendNewEmailCode: (params: SendNewEmailCodeParams) =>
+    call<TtlResult>(METHOD.AGENT_PROFILE_SEND_NEW_EMAIL_CODE, params),
+  changeEmail: (params: ChangeEmailParams) =>
+    call<CloudProfile>(METHOD.AGENT_PROFILE_CHANGE_EMAIL, params),
+  randomOriginId: () => call<RandomOriginIdResult>(METHOD.AGENT_PROFILE_RANDOM_ORIGIN_ID),
+  checkOriginId: (params: CheckOriginIdParams) =>
+    call<OriginIdCheckResult>(METHOD.AGENT_PROFILE_CHECK_ORIGIN_ID, params),
+  changeOriginId: (params: ChangeOriginIdParams) =>
+    call<CloudProfile>(METHOD.AGENT_PROFILE_CHANGE_ORIGIN_ID, params),
+  changeNickname: (params: ChangeNicknameParams) =>
+    call<CloudProfile>(METHOD.AGENT_PROFILE_CHANGE_NICKNAME, params),
+};
+
+const gateway = {
+  get: () => call<GatewayStatusDto>(METHOD.AGENT_GATEWAY_GET),
+  patch: (params: GatewayPatchParams) =>
+    call<GatewayStatusDto>(METHOD.AGENT_GATEWAY_PATCH, params),
+  /** 展示/复制用户 token；未配置为空串。 */
+  revealToken: () => call<GatewayRevealTokenResult>(METHOD.AGENT_GATEWAY_REVEAL_TOKEN),
+};
+
+const device = {
+  /** FluxCloud 原样响应 `{ devices }`，同时会刷新快照中的 cloudDevices。 */
+  list: () => call<{ devices: CloudDevice[] }>(METHOD.AGENT_DEVICE_LIST),
+  rename: (params: DeviceRenameParams) => call<CloudDevice>(METHOD.AGENT_DEVICE_RENAME, params),
+  /** FluxCloud 原样响应（结构未固定）；删除当前设备会同时清除本机会话。 */
+  delete: (params: DeviceIdParams) => call<JsonValue>(METHOD.AGENT_DEVICE_DELETE, params),
+};
+
+const preferences = {
+  patch: (params: PreferencesPatchParams) => call<OkResult>(METHOD.AGENT_PREFERENCES_PATCH, params),
+};
+
+const sync = {
+  get: () => call<SyncStatusDto>(METHOD.AGENT_SYNC_GET),
+  enable: () => call<OkResult>(METHOD.AGENT_SYNC_ENABLE),
+  disable: () => call<OkResult>(METHOD.AGENT_SYNC_DISABLE),
+  now: () => call<OkResult>(METHOD.AGENT_SYNC_NOW),
+};
+
+const remote = {
+  list: () => call<RemoteTaskDto[]>(METHOD.AGENT_REMOTE_LIST),
+  dispatch: (params: RemoteDispatchParams) =>
+    call<RemoteDispatchResult>(METHOD.AGENT_REMOTE_DISPATCH, params),
+  command: (params: RemoteCommandParams) => call<OkResult>(METHOD.AGENT_REMOTE_COMMAND, params),
+};
+
+const plan = {
+  /** 公开套餐目录（含下架但仍展示的套餐）。 */
+  list: () => call<CloudPlan[]>(METHOD.AGENT_PLAN_LIST),
+};
+
+const order = {
+  create: (params: OrderCreateParams) => call<CloudOrder>(METHOD.AGENT_ORDER_CREATE, params),
+  get: (params: OrderGetParams) => call<CloudOrder>(METHOD.AGENT_ORDER_GET, params),
+  /** 本人订单，创建时间倒序，最多 20 条。 */
+  list: () => call<CloudOrder[]>(METHOD.AGENT_ORDER_LIST),
+};
+
+const referral = {
+  summary: () => call<CloudReferralSummary>(METHOD.AGENT_REFERRAL_SUMMARY),
+  listCodes: (params?: PageParams) =>
+    call<CloudReferralCodesResult>(METHOD.AGENT_REFERRAL_LIST_CODES, params),
+  createCode: (params?: ReferralCreateCodeParams) =>
+    call<CloudReferralCode>(METHOD.AGENT_REFERRAL_CREATE_CODE, params),
+  /** FluxCloud 原样响应（结构未固定）。 */
+  deleteCode: (params: ReferralDeleteCodeParams) =>
+    call<JsonValue>(METHOD.AGENT_REFERRAL_DELETE_CODE, params),
+  listRecords: (params?: ReferralListRecordsParams) =>
+    call<CloudReferralRecordsResult>(METHOD.AGENT_REFERRAL_LIST_RECORDS, params),
+  validate: (params: ReferralValidateParams) =>
+    call<CloudReferralValidateResult>(METHOD.AGENT_REFERRAL_VALIDATE, params),
+};
+
+const capture = {
+  submit: (params: CaptureSubmitParams) =>
+    call<CaptureSubmitResult>(METHOD.AGENT_CAPTURE_SUBMIT, params),
+  /** 等待确认的外部捕获队列。 */
+  list: () => call<PendingCaptureDto[]>(METHOD.AGENT_CAPTURE_LIST),
+  resolve: (params: CaptureResolveParams) =>
+    call<CaptureResolveResult>(METHOD.AGENT_CAPTURE_RESOLVE, params),
+};
+
+const diagnostics = {
+  run: () => call<DiagnosticsReportDto>(METHOD.AGENT_DIAGNOSTICS_RUN),
+  /** 成功返回 `{ ok: true }` 或所转发 daemon RPC 的结果（`refreshTrackers` 等）。 */
+  repair: (params: DiagnosticRepairParams) =>
+    call<JsonValue>(METHOD.AGENT_DIAGNOSTICS_REPAIR, params),
+  logPaths: () => call<LogPathsDto>(METHOD.AGENT_DIAGNOSTICS_LOG_PATHS),
+};
+
+const update = {
+  check: (params?: UpdateCheckParams) =>
+    call<UpdateCheckResultDto>(METHOD.AGENT_UPDATE_CHECK, params),
+};
+
+const power = {
+  /** 完成后关机；无活跃任务时被拒绝（invalidArgument）。 */
+  arm: (params: PowerArmParams) => call<PowerArmResult>(METHOD.AGENT_POWER_ARM, params),
+  disarm: () => call<OkResult>(METHOD.AGENT_POWER_DISARM),
+};
+
+export const agent = {
+  session,
+  auth,
+  profile,
+  gateway,
+  device,
+  preferences,
+  sync,
+  remote,
+  plan,
+  order,
+  referral,
+  capture,
+  diagnostics,
+  update,
+  power,
+};

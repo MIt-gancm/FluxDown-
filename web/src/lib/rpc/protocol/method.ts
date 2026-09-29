@@ -1,0 +1,198 @@
+// 方法名与能力标识（native/protocol/src/method.rs）。
+
+/** wire 方法名；键与 Rust 常量名一致。 */
+export const METHOD = {
+  SYSTEM_HELLO: 'system.hello',
+  SYSTEM_PING: 'system.ping',
+  SYSTEM_SNAPSHOT: 'system.snapshot',
+  /** 允许作为连接首帧（握手前）调用。 */
+  SYSTEM_SHUTDOWN: 'system.shutdown',
+
+  DAEMON_TASK_LIST: 'daemon.task.list',
+  DAEMON_TASK_GET: 'daemon.task.get',
+  DAEMON_TASK_ACTIVITY: 'daemon.task.activity',
+  DAEMON_TASK_CREATE: 'daemon.task.create',
+  DAEMON_TASK_PAUSE: 'daemon.task.pause',
+  DAEMON_TASK_RESUME: 'daemon.task.resume',
+  DAEMON_TASK_RENAME: 'daemon.task.rename',
+  DAEMON_TASK_CHANGE_URL: 'daemon.task.changeUrl',
+  DAEMON_TASK_DELETE: 'daemon.task.delete',
+  DAEMON_TASK_PAUSE_ALL: 'daemon.task.pauseAll',
+  DAEMON_TASK_RESUME_ALL: 'daemon.task.resumeAll',
+  DAEMON_TASK_RESCAN: 'daemon.task.rescan',
+  DAEMON_TASK_SET_SEED_LIMITS: 'daemon.task.setSeedLimits',
+
+  DAEMON_QUEUE_LIST: 'daemon.queue.list',
+  DAEMON_QUEUE_CREATE: 'daemon.queue.create',
+  DAEMON_QUEUE_UPDATE: 'daemon.queue.update',
+  DAEMON_QUEUE_DELETE: 'daemon.queue.delete',
+  DAEMON_QUEUE_START: 'daemon.queue.start',
+  DAEMON_QUEUE_STOP: 'daemon.queue.stop',
+  DAEMON_QUEUE_SCHEDULE: 'daemon.queue.schedule',
+  DAEMON_QUEUE_REORDER: 'daemon.queue.reorder',
+  DAEMON_QUEUE_MOVE_TASK: 'daemon.queue.moveTask',
+  DAEMON_QUEUE_BOOST: 'daemon.queue.boost',
+
+  DAEMON_GROUP_LIST: 'daemon.group.list',
+  DAEMON_GROUP_RESOLVE_PREVIEW: 'daemon.group.resolvePreview',
+  DAEMON_GROUP_CREATE: 'daemon.group.create',
+  DAEMON_GROUP_PAUSE: 'daemon.group.pause',
+  DAEMON_GROUP_RESUME: 'daemon.group.resume',
+  DAEMON_GROUP_DELETE: 'daemon.group.delete',
+
+  DAEMON_CONFIG_GET: 'daemon.config.get',
+  DAEMON_CONFIG_PATCH: 'daemon.config.patch',
+  DAEMON_CONFIG_PROXY_TEST: 'daemon.config.proxyTest',
+  DAEMON_CONFIG_CONN_POLICY: 'daemon.config.connPolicy',
+  DAEMON_CONFIG_CLEAR_CONN_POLICY: 'daemon.config.clearConnPolicy',
+  DAEMON_CONFIG_SYSTEM_PROXY: 'daemon.config.systemProxy',
+  DAEMON_SITE_AUTH_LIST: 'daemon.siteAuth.list',
+  DAEMON_SITE_AUTH_DELETE: 'daemon.siteAuth.delete',
+  /** 结果含明文密码；`site` 服务端会归一化。 */
+  DAEMON_SITE_AUTH_GET: 'daemon.siteAuth.get',
+  DAEMON_SITE_AUTH_SAVE: 'daemon.siteAuth.save',
+  DAEMON_SITE_AUTH_CLEAR: 'daemon.siteAuth.clear',
+  /** 结果含明文密码，仅供本机官方 UI 表单回填。 */
+  DAEMON_SITE_AUTH_MATCH: 'daemon.siteAuth.match',
+  DAEMON_RUNTIME_STATS: 'daemon.runtime.stats',
+  DAEMON_FS_LIST: 'daemon.fs.list',
+
+  DAEMON_RSS_LIST_SOURCES: 'daemon.rss.listSources',
+  DAEMON_RSS_GET_ITEMS: 'daemon.rss.getItems',
+  DAEMON_RSS_CREATE_SOURCE: 'daemon.rss.createSource',
+  DAEMON_RSS_UPDATE_SOURCE: 'daemon.rss.updateSource',
+  DAEMON_RSS_DELETE_SOURCE: 'daemon.rss.deleteSource',
+  DAEMON_RSS_REFRESH_SOURCE: 'daemon.rss.refreshSource',
+  DAEMON_RSS_ITEM_ACTION: 'daemon.rss.itemAction',
+  DAEMON_RSS_VALIDATE: 'daemon.rss.validate',
+
+  DAEMON_PLUGIN_LIST: 'daemon.plugin.list',
+  DAEMON_PLUGIN_AUTH: 'daemon.plugin.auth',
+  DAEMON_PLUGIN_SET_ENABLED: 'daemon.plugin.setEnabled',
+  DAEMON_PLUGIN_UPDATE_SETTINGS: 'daemon.plugin.updateSettings',
+  DAEMON_PLUGIN_INSTALL: 'daemon.plugin.install',
+  DAEMON_PLUGIN_INSTALL_DEV: 'daemon.plugin.installDev',
+  DAEMON_PLUGIN_UNINSTALL: 'daemon.plugin.uninstall',
+  DAEMON_PLUGIN_MARKET_LIST: 'daemon.plugin.marketList',
+  DAEMON_PLUGIN_MARKET_INSTALL: 'daemon.plugin.marketInstall',
+  DAEMON_PLUGIN_IGNORE_RETRY: 'daemon.plugin.ignoreRetry',
+  DAEMON_COMPONENT_GET: 'daemon.component.get',
+  DAEMON_COMPONENT_LIST_VERSIONS: 'daemon.component.listVersions',
+  DAEMON_COMPONENT_INSTALL: 'daemon.component.install',
+  DAEMON_COMPONENT_UNINSTALL: 'daemon.component.uninstall',
+
+  DAEMON_SELECTION_SUBSCRIBE: 'daemon.selection.subscribe',
+  DAEMON_SELECTION_UNSUBSCRIBE: 'daemon.selection.unsubscribe',
+  DAEMON_SELECTION_RESOLVE: 'daemon.selection.resolve',
+
+  DAEMON_WEBHOOK_GET: 'daemon.webhook.get',
+  DAEMON_WEBHOOK_CLEAR_DELIVERIES: 'daemon.webhook.clearDeliveries',
+  DAEMON_WEBHOOK_SIMULATE: 'daemon.webhook.simulate',
+  DAEMON_WEBHOOK_TEST: 'daemon.webhook.test',
+  // 以下 agent 专用边界方法，Web 不使用：仅为与 ALL_METHODS 对齐而保留。
+  DAEMON_CDN_REPORTS_PEEK: 'daemon.cdnReports.peek',
+  DAEMON_CDN_REPORTS_ACK: 'daemon.cdnReports.ack',
+  DAEMON_CDN_CONFIG_APPLY: 'daemon.cdnConfig.apply',
+
+  DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH: 'daemon.bt.trackerSubscription.refresh',
+  DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH: 'daemon.ed2k.serverSubscription.refresh',
+  DAEMON_DIAGNOSTICS_DESCRIBE: 'daemon.diagnostics.describe',
+  DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT: 'daemon.diagnostics.prepareLogExport',
+  DAEMON_MIGRATION_LINK_EXPORT: 'daemon.migration.linkExport',
+  DAEMON_MIGRATION_LINK_ACK: 'daemon.migration.linkAck',
+  DAEMON_MIGRATION_GATEWAY_EXPORT: 'daemon.migration.gatewayExport',
+  DAEMON_MIGRATION_GATEWAY_ACK: 'daemon.migration.gatewayAck',
+
+  AGENT_SESSION_GET: 'agent.session.get',
+  AGENT_AUTH_REGISTER: 'agent.auth.register',
+  AGENT_AUTH_REGISTER_VERIFY: 'agent.auth.registerVerify',
+  AGENT_AUTH_LOGIN: 'agent.auth.login',
+  AGENT_AUTH_LOGIN_VERIFY: 'agent.auth.loginVerify',
+  AGENT_AUTH_SEND_CODE: 'agent.auth.sendCode',
+  AGENT_AUTH_VERIFY_CODE: 'agent.auth.verifyCode',
+  AGENT_AUTH_LOGOUT: 'agent.auth.logout',
+  AGENT_AUTH_REFRESH_PROFILE: 'agent.auth.refreshProfile',
+  AGENT_PROFILE_SEND_EMAIL_CODE: 'agent.profile.sendEmailCode',
+  AGENT_PROFILE_SEND_NEW_EMAIL_CODE: 'agent.profile.sendNewEmailCode',
+  AGENT_PROFILE_CHANGE_EMAIL: 'agent.profile.changeEmail',
+  AGENT_PROFILE_RANDOM_ORIGIN_ID: 'agent.profile.randomOriginId',
+  AGENT_PROFILE_CHECK_ORIGIN_ID: 'agent.profile.checkOriginId',
+  AGENT_PROFILE_CHANGE_ORIGIN_ID: 'agent.profile.changeOriginId',
+  AGENT_PROFILE_CHANGE_NICKNAME: 'agent.profile.changeNickname',
+
+  AGENT_GATEWAY_GET: 'agent.gateway.get',
+  AGENT_GATEWAY_PATCH: 'agent.gateway.patch',
+  AGENT_GATEWAY_REVEAL_TOKEN: 'agent.gateway.revealToken',
+  AGENT_DEVICE_LIST: 'agent.device.list',
+  AGENT_DEVICE_RENAME: 'agent.device.rename',
+  AGENT_DEVICE_DELETE: 'agent.device.delete',
+  AGENT_PREFERENCES_PATCH: 'agent.preferences.patch',
+  AGENT_SYNC_GET: 'agent.sync.get',
+  AGENT_SYNC_ENABLE: 'agent.sync.enable',
+  AGENT_SYNC_DISABLE: 'agent.sync.disable',
+  AGENT_SYNC_NOW: 'agent.sync.now',
+  AGENT_CLOUD_ENDPOINT_GET: 'agent.cloud.endpointGet',
+  AGENT_CLOUD_ENDPOINT_SET: 'agent.cloud.endpointSet',
+  AGENT_REMOTE_LIST: 'agent.remote.list',
+  AGENT_REMOTE_DISPATCH: 'agent.remote.dispatch',
+  AGENT_REMOTE_COMMAND: 'agent.remote.command',
+
+  AGENT_PLAN_LIST: 'agent.plan.list',
+  AGENT_ORDER_CREATE: 'agent.order.create',
+  AGENT_ORDER_GET: 'agent.order.get',
+  AGENT_ORDER_LIST: 'agent.order.list',
+  AGENT_REFERRAL_SUMMARY: 'agent.referral.summary',
+  AGENT_REFERRAL_LIST_CODES: 'agent.referral.listCodes',
+  AGENT_REFERRAL_CREATE_CODE: 'agent.referral.createCode',
+  AGENT_REFERRAL_DELETE_CODE: 'agent.referral.deleteCode',
+  AGENT_REFERRAL_LIST_RECORDS: 'agent.referral.listRecords',
+  AGENT_REFERRAL_VALIDATE: 'agent.referral.validate',
+
+  // 以下方法读写宿主机路径 / 桌面集成，Web 不使用。
+  AGENT_PLATFORM_OPEN_TASK: 'agent.platform.openTask',
+  AGENT_PLATFORM_REVEAL_TASK: 'agent.platform.revealTask',
+  AGENT_PLATFORM_OPEN_PATH: 'agent.platform.openPath',
+  AGENT_PLATFORM_INTEGRATION_GET: 'agent.platform.integrationGet',
+  AGENT_PLATFORM_SET_AUTOSTART: 'agent.platform.setAutostart',
+  AGENT_PLATFORM_SET_FILE_ASSOCIATION: 'agent.platform.setFileAssociation',
+  AGENT_PLATFORM_SET_URL_PROTOCOL: 'agent.platform.setUrlProtocol',
+  AGENT_CAPTURE_SUBMIT: 'agent.capture.submit',
+  AGENT_CAPTURE_SUBMIT_TORRENT_FILE: 'agent.capture.submitTorrentFile',
+  AGENT_CAPTURE_LIST: 'agent.capture.list',
+  AGENT_CAPTURE_RESOLVE: 'agent.capture.resolve',
+  AGENT_PLUGIN_INSTALL_FILE: 'agent.plugin.installFile',
+  AGENT_DIAGNOSTICS_RUN: 'agent.diagnostics.run',
+  AGENT_DIAGNOSTICS_REPAIR: 'agent.diagnostics.repair',
+  AGENT_DIAGNOSTICS_LOG_PATHS: 'agent.diagnostics.logPaths',
+  AGENT_DIAGNOSTICS_EXPORT_LOGS: 'agent.diagnostics.exportLogs',
+  AGENT_UPDATE_CHECK: 'agent.update.check',
+  /** 完成后关机；无活跃任务时拒绝（invalidArgument）。 */
+  AGENT_POWER_ARM: 'agent.power.arm',
+  AGENT_POWER_DISARM: 'agent.power.disarm',
+
+  /** 服务端推送通知，params 为 EventFrame。 */
+  SERVICE_EVENT: 'service.event',
+} as const;
+
+export type MethodName = (typeof METHOD)[keyof typeof METHOD];
+
+export const CAPABILITY_DAEMON_TASKS = 'daemon.tasks';
+export const CAPABILITY_DAEMON_QUEUES = 'daemon.queues';
+export const CAPABILITY_DAEMON_GROUPS = 'daemon.groups';
+export const CAPABILITY_DAEMON_CONFIG = 'daemon.config';
+export const CAPABILITY_DAEMON_RSS = 'daemon.rss';
+export const CAPABILITY_DAEMON_PLUGINS = 'daemon.plugins';
+export const CAPABILITY_DAEMON_COMPONENTS = 'daemon.components';
+export const CAPABILITY_DAEMON_WEBHOOKS = 'daemon.webhooks';
+export const CAPABILITY_DAEMON_SELECTIONS = 'daemon.selections';
+export const CAPABILITY_DAEMON_FILES = 'daemon.files';
+export const CAPABILITY_AGENT_GATEWAY = 'agent.gateway';
+export const CAPABILITY_AGENT_AUTH = 'agent.auth';
+export const CAPABILITY_AGENT_SYNC = 'agent.sync';
+export const CAPABILITY_AGENT_REMOTE_TASKS = 'agent.remoteTasks';
+export const CAPABILITY_AGENT_BILLING = 'agent.billing';
+export const CAPABILITY_AGENT_REFERRALS = 'agent.referrals';
+export const CAPABILITY_AGENT_DEVICE_LINK = 'agent.deviceLink';
+export const CAPABILITY_AGENT_EXTERNAL_CAPTURE = 'agent.externalCapture';
+/** 客户端能力：可处理交互选择（HLS/BT/变体），放入握手 capabilities。 */
+export const CAPABILITY_CLIENT_SELECTIONS = 'client.selections';

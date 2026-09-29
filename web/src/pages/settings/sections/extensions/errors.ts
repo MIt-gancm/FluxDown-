@@ -1,0 +1,39 @@
+// 扩展页的错误文案映射（与 GPUI `error_text` 一致）。
+
+import type { TFunction } from '../../../../i18n'
+import { RpcError, describeUploadError } from '../../../../lib/rpc'
+import type { ErrorReason } from '../../../../lib/rpc'
+
+const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
+  marketUnreachable: 'pluginErrorMarketUnreachable',
+  marketIndexInvalid: 'pluginErrorMarketIndexInvalid',
+  marketIndexRollback: 'pluginErrorMarketIndexRollback',
+  pluginNotInMarket: 'pluginErrorNotInMarket',
+  pluginYanked: 'pluginErrorYanked',
+  pluginDownloadFailed: 'pluginErrorDownloadFailed',
+  pluginPackageTooLarge: 'pluginErrorPackageTooLarge',
+  pluginPackageInvalid: 'pluginErrorPackageInvalid',
+}
+
+/**
+ * agent 端口不透传服务端 message：有细分原因时按原因给出可操作文案，否则按码映射通用文案。
+ * 非 RPC 错误（上传失败等）直接展示其消息。
+ */
+export function extensionErrorText(t: TFunction, error: unknown): string {
+  if (!(error instanceof RpcError)) return describeUploadError(error)
+  const reason = error.reason
+  const reasonKey = reason ? REASON_KEYS[reason] : undefined
+  if (reasonKey) return t(reasonKey)
+  // unavailable / timeout 与其余码同走通用文案（`localServiceDisconnected` 带倒计时占位符，不适合行内错误）。
+  switch (error.appCode) {
+    case 'invalidArgument':
+    case 'notFound':
+      return t('localServiceInvalidArgument')
+    case 'conflict':
+      return t('localServiceConflict')
+    case 'unsupported':
+      return t('settingsUnsupportedOnPlatform')
+    default:
+      return t('localServiceActionFailed')
+  }
+}

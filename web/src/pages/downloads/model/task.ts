@@ -1,0 +1,321 @@
+// 下载页任务行投影（移植 crates/downloads/src/model/mod.rs 的 DownloadTaskView）。
+// 本地任务来自 daemon 快照 + 引擎 taskProgress 的实时速度；远程任务来自 agent.remoteTasks。
+
+import type { RemoteTaskDto, TaskDto, TaskRuntimeDto } from '../../../lib/rpc'
+
+export type TaskState = 'pending' | 'downloading' | 'paused' | 'completed' | 'failed'
+
+/** 智能排序优先级：下载中 > 等待 > 暂停 > 失败 > 完成。 */
+export const SMART_RANK: Record<TaskState, number> = {
+  downloading: 0,
+  pending: 1,
+  paused: 2,
+  failed: 3,
+  completed: 4,
+}
+
+export type TaskProtocol = 'http' | 'bt' | 'ed2k' | 'ftp' | 'hls'
+
+export const PROTOCOL_LABEL: Record<TaskProtocol, string> = {
+  http: 'HTTP',
+  bt: 'BT',
+  ed2k: 'ED2K',
+  ftp: 'FTP',
+  hls: 'HLS',
+}
+
+export type TaskKind = 'application' | 'diskImage' | 'mobile' | 'video' | 'audio' | 'document' | 'image' | 'archive' | 'other'
+
+export type TaskSource = 'local' | 'remote'
+
+/** 稳定行身份：`l:<taskId>`（本地）/ `r:<taskId>`（远程）。选中集合与详情用它。 */
+export type RowKey = string
+
+export const localKey = (taskId: string): RowKey => `l:${taskId}`
+export const remoteKey = (taskId: string): RowKey => `r:${taskId}`
+export const isLocalKey = (key: RowKey): boolean => key.startsWith('l:')
+export const taskIdOfKey = (key: RowKey): string => key.slice(2)
+
+/** 引擎/daemon 插件系统失败任务的错误消息前缀。 */
+export const PLUGIN_ERROR_PREFIX = '[插件]'
+
+export interface DownloadTaskView {
+  key: RowKey
+  source: TaskSource
+  taskId: string
+  queueId: string
+  name: string
+  sizeBytes: number
+  downloadedBytes: number
+  /** 字节/秒；未收到实时采样为 null。 */
+  speed: number | null
+  runtime: TaskRuntimeDto | undefined
+  /** daemon 连接就绪（快照未过期）。 */
+  runtimeConnected: boolean
+  etaSeconds: number | null
+  createdAtSecs: number
+  completedAtSecs: number
+  kind: TaskKind
+  protocol: TaskProtocol
+  /** 0..1。 */
+  progress: number
+  state: TaskState
+  /** 文件名尚未解析（元数据加载中）。 */
+  metadataPending: boolean
+  url: string
+  originUrl: string
+  site: string
+  referrer: string
+  saveDir: string
+  groupId: string
+  errorMessage: string
+  fileMissing: boolean
+  seedingStatus: number
+  uploadedBytes: number
+  boosted: boolean
+  /** 远程任务来源设备 id（本地任务为空）。 */
+  fromDevice: string
+  /** 本地任务原始 DTO（详情 / 重新下载需要）；远程任务为 undefined。 */
+  dto: TaskDto | undefined
+}
+
+/** URL host（不含端口 / 凭据）；非 URL 返回空串。 */
+export function urlHost(url: string): string {
+  const split = url.indexOf('://')
+  if (split < 0) return ''
+  const rest = url.slice(split + 3)
+  const authority = rest.split(/[/?#]/, 1)[0] ?? ''
+  const at = authority.lastIndexOf('@')
+  const host = at >= 0 ? authority.slice(at + 1) : authority
+  if (host.startsWith('[')) {
+    const end = host.indexOf(']')
+    return end >= 0 ? host.slice(1, end) : host
+  }
+  const colon = host.indexOf(':')
+  return colon >= 0 ? host.slice(0, colon) : host
+}
+
+export function detectProtocol(url: string, fileName: string): TaskProtocol {
+  const lower = url.toLowerCase()
+  if (lower.startsWith('magnet:') || lower.startsWith('torrent-file://')) return 'bt'
+  if (lower.startsWith('ed2k://')) return 'ed2k'
+  if (lower.startsWith('ftp://') || lower.startsWith('ftps://')) return 'ftp'
+  if (lower.includes('.m3u8') || lower.includes('.mpd') || fileName.endsWith('.m3u8')) return 'hls'
+  return 'http'
+}
+
+const KIND_BY_EXTENSION: Record<string, TaskKind> = {
+  exe: 'application',
+  msi: 'application',
+  appimage: 'application',
+  apk: 'mobile',
+  ipa: 'mobile',
+  iso: 'diskImage',
+  dmg: 'diskImage',
+  zip: 'archive',
+  rar: 'archive',
+  '7z': 'archive',
+  tar: 'archive',
+  gz: 'archive',
+  mp4: 'video',
+  mkv: 'video',
+  webm: 'video',
+  avi: 'video',
+  mp3: 'audio',
+  flac: 'audio',
+  wav: 'audio',
+  m4a: 'audio',
+  pdf: 'document',
+  doc: 'document',
+  docx: 'document',
+  txt: 'document',
+  png: 'image',
+  jpg: 'image',
+  jpeg: 'image',
+  gif: 'image',
+  webp: 'image',
+}
+
+/** 文件扩展名（小写，无点）。 */
+export function extensionOf(name: string): string | null {
+  const dot = name.lastIndexOf('.')
+  if (dot < 0) return null
+  const ext = name.slice(dot + 1).toLowerCase()
+  return ext === '' || ext.includes('/') ? null : ext
+}
+
+export function taskKindOf(name: string): TaskKind {
+  const ext = extensionOf(name)
+  return (ext && KIND_BY_EXTENSION[ext]) || 'other'
+}
+
+export function stateOfStatus(status: number): TaskState {
+  switch (status) {
+    case 0:
+    case 5:
+      return 'pending'
+    case 1:
+      return 'downloading'
+    case 2:
+      return 'paused'
+    case 3:
+      return 'completed'
+    default:
+      return 'failed'
+  }
+}
+
+const REMOTE_STATUS: Record<RemoteTaskDto['status'], number> = {
+  pending: 0,
+  accepted: 0,
+  downloading: 1,
+  paused: 2,
+  completed: 3,
+  failed: 4,
+  canceled: 4,
+}
+
+function secs(value: string): number {
+  const parsed = Number.parseInt(value, 10)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function compute(name: string, totalBytes: number, downloadedBytes: number, speed: number | null) {
+  const sizeBytes = Math.max(0, totalBytes)
+  const downloaded = Math.max(0, downloadedBytes)
+  const progress = sizeBytes === 0 ? 0 : Math.min(1, Math.max(0, downloaded / sizeBytes))
+  const etaSeconds =
+    speed !== null && speed > 0 && downloaded < sizeBytes ? Math.floor((sizeBytes - downloaded) / speed) : null
+  return { sizeBytes, downloaded, progress, etaSeconds, name }
+}
+
+export function buildLocalView(
+  task: TaskDto,
+  speed: number | null,
+  boosted: boolean,
+  runtime: TaskRuntimeDto | undefined,
+  runtimeConnected: boolean,
+): DownloadTaskView {
+  const live = speed === null ? null : Math.max(0, speed)
+  const base = compute(task.fileName, task.totalBytes, task.downloadedBytes, live)
+  return {
+    key: localKey(task.taskId),
+    source: 'local',
+    taskId: task.taskId,
+    queueId: task.queueId,
+    name: task.fileName,
+    sizeBytes: base.sizeBytes,
+    downloadedBytes: base.downloaded,
+    speed: live,
+    runtime,
+    runtimeConnected,
+    etaSeconds: base.etaSeconds,
+    createdAtSecs: secs(task.createdAt),
+    completedAtSecs: secs(task.completedAt),
+    kind: taskKindOf(task.fileName),
+    protocol: detectProtocol(task.url, task.fileName),
+    progress: base.progress,
+    state: stateOfStatus(task.status),
+    metadataPending: task.fileName.trim() === '',
+    url: task.url,
+    originUrl: task.originUrl,
+    site: urlHost(task.url),
+    referrer: task.referrer,
+    saveDir: task.saveDir,
+    groupId: task.groupId,
+    errorMessage: task.errorMessage,
+    fileMissing: task.fileMissing,
+    seedingStatus: task.seedingStatus,
+    uploadedBytes: task.uploadedBytes,
+    boosted,
+    fromDevice: '',
+    dto: task,
+  }
+}
+
+export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
+  const speed = Math.max(0, task.speed)
+  const base = compute(task.fileName, task.totalBytes ?? 0, task.downloadedBytes, speed)
+  return {
+    key: remoteKey(task.id),
+    source: 'remote',
+    taskId: task.id,
+    queueId: '',
+    name: task.fileName,
+    sizeBytes: base.sizeBytes,
+    downloadedBytes: base.downloaded,
+    speed,
+    runtime: undefined,
+    runtimeConnected: false,
+    etaSeconds: base.etaSeconds,
+    createdAtSecs: secs(task.createdAt),
+    completedAtSecs: 0,
+    kind: taskKindOf(task.fileName),
+    protocol: detectProtocol(task.url, task.fileName),
+    progress: base.progress,
+    state: stateOfStatus(REMOTE_STATUS[task.status] ?? 0),
+    metadataPending: task.fileName.trim() === '',
+    url: task.url,
+    originUrl: '',
+    site: urlHost(task.url),
+    referrer: '',
+    saveDir: task.saveDir ?? '',
+    groupId: '',
+    errorMessage: task.error ?? '',
+    fileMissing: false,
+    seedingStatus: 0,
+    uploadedBytes: 0,
+    boosted: false,
+    fromDevice: task.fromDevice,
+    dto: undefined,
+  }
+}
+
+/** 「复制链接」用：originUrl 优先，空则回退 url（torrent 任务的 url 是哨兵）。 */
+export function shareUrl(view: DownloadTaskView): string {
+  return view.originUrl === '' ? view.url : view.originUrl
+}
+
+/** 来源站点：referrer host 为主，空则 url host。 */
+export function sourceSite(view: DownloadTaskView): string {
+  const host = urlHost(view.referrer)
+  return host === '' ? view.site : host
+}
+
+/** 本地任务实时并发连接数（远程 / 未连接为 null）。 */
+export function activeTransfers(view: DownloadTaskView): number | null {
+  if (!view.runtimeConnected || view.source !== 'local') return null
+  if (view.state !== 'downloading') return 0
+  return view.runtime?.activeTransfers ?? null
+}
+
+/** 字节 → `1.5 MB`（与 GPUI `format_bytes` 一致：B/KB/MB/GB，1 位小数）。 */
+export function formatBytes(bytes: number): string {
+  const units = ['B', 'KB', 'MB', 'GB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit + 1 < units.length) {
+    value /= 1024
+    unit += 1
+  }
+  return unit === 0 ? `${Math.floor(bytes)} B` : `${value.toFixed(1)} ${units[unit]}`
+}
+
+/** 完整本地时间 `YYYY-MM-DD HH:MM:SS`（Unix 秒）。 */
+export function formatDateTime(timestampSecs: number): string {
+  if (!timestampSecs || timestampSecs <= 0) return '—'
+  const date = new Date(timestampSecs * 1000)
+  if (Number.isNaN(date.getTime())) return '—'
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
+/** 超过一天的剩余时间估算不可信，不显示。 */
+export const MAX_ETA_SECS = 86_400
+
+/** 整数百分比（向下取整；0~1% 显示 `<1%`）。 */
+export function percentLabel(progress: number): string {
+  const percent = Math.min(1, Math.max(0, progress)) * 100
+  if (percent > 0 && percent < 1) return '<1%'
+  return `${Math.floor(percent)}%`
+}

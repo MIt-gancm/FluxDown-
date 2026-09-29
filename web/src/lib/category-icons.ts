@@ -1,0 +1,91 @@
+// 分类图标：持久化的 `CustomCategoryDto.icon` 名 → lucide 图标（镜像 crates/components `category_icon`）。
+
+import {
+  Archive,
+  Bookmark,
+  Box,
+  Code,
+  Cpu,
+  Database,
+  Disc,
+  File,
+  FileText,
+  Film,
+  Folders,
+  Gamepad2,
+  Globe,
+  HardDrive,
+  Image,
+  Library,
+  Music,
+  Package2,
+  Pen,
+  Printer,
+  Smartphone,
+  Subtitles,
+  Type,
+  Zap,
+} from 'lucide-react'
+import type { LucideIcon } from 'lucide-react'
+
+const ICONS: Readonly<Record<string, LucideIcon>> = {
+  folders: Folders,
+  film: Film,
+  music: Music,
+  fileText: FileText,
+  image: Image,
+  archive: Archive,
+  file: File,
+  code: Code,
+  database: Database,
+  gamepad: Gamepad2,
+  globe: Globe,
+  bookmark: Bookmark,
+  box: Box,
+  cpu: Cpu,
+  disc: Disc,
+  font: Type,
+  hardDrive: HardDrive,
+  library: Library,
+  package2: Package2,
+  pen: Pen,
+  printer: Printer,
+  smartphone: Smartphone,
+  subtitles: Subtitles,
+  type: Type,
+  zap: Zap,
+}
+
+/** 图标选择器候选（wire 值，顺序即网格顺序；与 category_dialog.rs `CATEGORY_ICONS` 一致）。 */
+export const CATEGORY_ICON_KEYS: readonly string[] = [
+  'folders',
+  'film',
+  'music',
+  'fileText',
+  'image',
+  'archive',
+  'file',
+  'code',
+  'database',
+  'gamepad',
+  'globe',
+  'bookmark',
+  'box',
+  'cpu',
+  'disc',
+  'font',
+  'hardDrive',
+  'library',
+  'package2',
+  'pen',
+  'printer',
+  'smartphone',
+  'subtitles',
+  'type',
+  'zap',
+]
+
+/** 未知图标名退回通用文件图标。 */
+export function categoryIconByKey(key: string): LucideIcon {
+  return ICONS[key] ?? File
+}

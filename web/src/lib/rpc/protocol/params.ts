@@ -1,0 +1,425 @@
+// 各方法的 params / 非 DTO 结果类型（按 wire 名归类）。
+// daemon 端的 id 参数在服务端带别名（`id` / `taskId` / `queueId` / `groupId` 等价），这里统一用语义名。
+
+import type { JsonValue } from './common';
+import type { ComponentKind, ComponentStatusDto } from './plugin';
+import type { ServiceHello } from './rpc';
+import type { CreateTaskRequest, DownloadRequest } from './task';
+
+// ── daemon.task ──
+
+export interface TaskIdParams {
+  taskId: string;
+}
+
+export interface TaskRenameParams {
+  taskId: string;
+  /** 不含路径分隔符；引擎侧校验非法字符与状态。 */
+  fileName: string;
+}
+
+export interface TaskChangeUrlParams {
+  taskId: string;
+  /** 新下载地址（http(s)/ftp，或待解封装的 `thunder://` 链接）。 */
+  url: string;
+}
+
+export interface TaskDeleteParams {
+  taskId: string;
+  /** 同时删除磁盘文件，缺省 false。 */
+  deleteFiles?: boolean;
+}
+
+/** `daemon.task.setSeedLimits` 全部字段必填；哨兵见 `SEED_LIMIT_INHERIT` / `SEED_LIMIT_UNLIMITED`。 */
+export interface SetSeedLimitsParams {
+  taskId: string;
+  /** 总分享率上限（千分比）。 */
+  ratioLimitMilli: number;
+  /** 做种后分享率上限（千分比）。 */
+  postRatioLimitMilli: number;
+  seedTimeLimitMinutes: number;
+  inactiveTimeLimitMinutes: number;
+  /** 任务级做种上传限速（B/s，0 = 不限），下次 torrent add 时生效。 */
+  uploadLimitBps: number;
+}
+
+// ── daemon.queue / daemon.group ──
+
+export interface QueueIdParams {
+  queueId: string;
+}
+
+export interface QueueUpdateParams {
+  queueId: string;
+  name: string;
+  speedLimitKbps?: number;
+  uploadLimitKbps?: number;
+  maxConcurrent?: number;
+  defaultSaveDir?: string;
+  defaultSegments?: number;
+  defaultUserAgent?: string;
+}
+
+export interface QueueScheduleParams {
+  queueId: string;
+  enabled: boolean;
+  /** `HH:MM`，空 = 不定时启动。 */
+  startTime?: string;
+  /** `HH:MM`，空 = 不定时停止。 */
+  stopTime?: string;
+  /** 星期位掩码（bit0 = 周一 … bit6 = 周日）；0 / 缺省 = 每天。 */
+  days?: number;
+}
+
+export interface QueueReorderParams {
+  queueId: string;
+  /** 队列内任务的完整新顺序。 */
+  taskIds: string[];
+}
+
+export interface QueueMoveTaskParams {
+  taskId: string;
+  /** 空 = 默认队列。 */
+  queueId?: string;
+}
+
+export interface GroupIdParams {
+  groupId: string;
+}
+
+export interface GroupDeleteParams {
+  groupId: string;
+  deleteFiles?: boolean;
+}
+
+// ── daemon.config / siteAuth / fs ──
+
+export interface SiteAuthDeleteParams {
+  /** `host` 或 `host:port`。 */
+  site: string;
+}
+
+export interface SiteAuthMatchParams {
+  /** 下载链接；按其站点键匹配。 */
+  url: string;
+}
+
+export interface SiteAuthGetParams {
+  /** `host` / `host:port` 或完整 URL，服务端归一化后查询；无匹配结果为 null。 */
+  site: string;
+}
+
+/** `daemon.siteAuth.save`：`user` 不可为空；返回脱敏后的 `SiteAuthEntryDto`。 */
+export interface SiteAuthSaveParams {
+  site: string;
+  user: string;
+  pass: string;
+}
+
+export interface FsListParams {
+  /** 空 / 省略 = 默认保存目录。 */
+  path?: string;
+}
+
+// ── daemon.rss ──
+
+export interface RssSourceIdParams {
+  sourceId: string;
+}
+
+export interface RssItemActionParams {
+  sourceId: string;
+  /** `action = "readAll"` 时忽略。 */
+  guid?: string;
+  /** `download`（绕过规则强制下载） / `ignore` / `readAll`。 */
+  action: 'download' | 'ignore' | 'readAll';
+}
+
+/** `daemon.rss.createSource` 结果。 */
+export interface RssCreateResult {
+  sourceId: string;
+}
+
+// ── daemon.plugin / component ──
+
+export interface PluginIdentityParams {
+  identity: string;
+}
+
+export interface PluginSetEnabledParams {
+  identity: string;
+  enabled: boolean;
+}
+
+export interface PluginUpdateSettingsParams {
+  identity: string;
+  /** 设置键 → 字符串值。 */
+  entries: Record<string, string>;
+}
+
+/** `daemon.plugin.install`：`blobId` 是先经 daemon blob 上传端点得到的一次性引用。 */
+export interface PluginInstallParams {
+  blobId: string;
+}
+
+export interface PluginInstallDevParams {
+  /** daemon 所在主机上的插件目录路径。 */
+  dirPath: string;
+}
+
+export interface PluginMarketInstallParams {
+  pluginId: string;
+}
+
+export interface ComponentParams {
+  component: ComponentKind;
+}
+
+export interface ComponentInstallParams {
+  component: ComponentKind;
+  /** 钉住版本；省略 = 最新稳定版。 */
+  version?: string | null;
+}
+
+// ── daemon.diagnostics ──
+
+/** `daemon.diagnostics.describe` 结果。 */
+export interface DaemonDiagnosticsDescribe {
+  service: ServiceHello;
+  /** 任务 / 队列 / 任务组数量。 */
+  tasks: number;
+  queues: number;
+  groups: number;
+  configRevision: number;
+  logDir: string;
+  components: ComponentStatusDto[];
+}
+
+/** `daemon.diagnostics.prepareLogExport` 结果：一次性 blob 引用，经 blob 下载端点取回。 */
+export interface PrepareLogExportResult {
+  exportId: string;
+}
+
+// ── agent.auth / profile ──
+
+export interface RegisterParams {
+  email: string;
+  password: string;
+  nickname?: string;
+}
+
+export interface RegisterVerifyParams {
+  email: string;
+  code: string;
+}
+
+/** `account` 接受邮箱或纯数字 Origin ID。 */
+export interface LoginParams {
+  account: string;
+  password: string;
+}
+
+export interface LoginVerifyParams {
+  account: string;
+  password: string;
+  code: string;
+}
+
+export interface SendCodeParams {
+  email: string;
+}
+
+/** 验证码登录；邮箱不存在则自动注册（此时 `nickname` 生效）。 */
+export interface VerifyCodeParams {
+  email: string;
+  code: string;
+  nickname?: string;
+}
+
+/** 发送验证码类方法的结果。 */
+export interface TtlResult {
+  ttlSeconds: number;
+}
+
+export interface SendNewEmailCodeParams {
+  /** 新邮箱。 */
+  email: string;
+  /** 原邮箱收到的验证码。 */
+  code: string;
+}
+
+export interface ChangeEmailParams {
+  email: string;
+  oldCode: string;
+  newCode: string;
+}
+
+export interface RandomOriginIdResult {
+  originId: number;
+}
+
+export interface CheckOriginIdParams {
+  value: number;
+}
+
+export interface ChangeOriginIdParams {
+  /** >= 10000 的整数，全局仅可成功一次。 */
+  originId: number;
+}
+
+export interface ChangeNicknameParams {
+  /** 1-32 字符（服务端 trim 后校验）。 */
+  nickname: string;
+}
+
+// ── agent.gateway / device / preferences / power ──
+
+export interface GatewayRevealTokenResult {
+  /** 未配置为空串。 */
+  userToken: string;
+}
+
+/**
+ * `agent.gateway.patch` 参数（原子）。`apiEnabled` / `mcpEnabled` 由关转开且 token 仍为空时
+ * 服务端自动生成 token；显式清空 token（且本次未开启上述开关）时服务端同时关闭二者。
+ */
+export interface GatewayPatchParams {
+  takeoverEnabled?: boolean;
+  jsonrpcEnabled?: boolean;
+  apiEnabled?: boolean;
+  mcpEnabled?: boolean;
+  corsEnabled?: boolean;
+  lanEnabled?: boolean;
+  /** 空串 = 清除用户 token；省略 = 保持。 */
+  userToken?: string;
+  /** true 生成新的随机 token（优先于 `userToken`）。 */
+  regenerateUserToken?: boolean;
+}
+
+export interface DeviceRenameParams {
+  /** `CloudDevice.id`（不是 deviceId）。 */
+  id: string;
+  /** 1-64 字符。 */
+  name: string;
+}
+
+export interface DeviceIdParams {
+  id: string;
+}
+
+export interface PreferencesPatchParams {
+  values: Record<string, JsonValue>;
+  /** 是否参与云同步，缺省 true；false 仅写本机偏好。 */
+  sync?: boolean;
+}
+
+export interface PowerArmParams {
+  /** 全部任务完成后再等待的秒数（0 = 立即）。 */
+  delaySecs: number;
+}
+
+export interface PowerArmResult {
+  armed: boolean;
+}
+
+// ── agent.remote ──
+
+export interface RemoteDispatchParams {
+  /** 目标设备 ID（`CloudDevice.deviceId`）；等于本机时直接建本地任务。 */
+  toDevice: string;
+  url: string;
+  fileName?: string;
+  saveDir?: string;
+}
+
+/**
+ * 本机目标返回 `{ taskId }`；远端目标返回 FluxCloud 原样响应（结构未固定），
+ * 之后以 `remoteTasksChanged` 事件 / `agent.remote.list` 为准。
+ */
+export type RemoteDispatchResult = { taskId?: string } & Record<string, unknown>;
+
+export interface RemoteCommandParams {
+  taskId: string;
+  /** `pause` / `resume` / `delete` / `cancel`。 */
+  action: 'pause' | 'resume' | 'delete' | 'cancel';
+  /** 去重 ID，缺省 `taskId:action`。 */
+  commandId?: string;
+}
+
+// ── agent.plan / order / referral ──
+
+export interface OrderCreateParams {
+  planCode: string;
+  deviceId?: string;
+  referralCode?: string;
+}
+
+export interface OrderGetParams {
+  orderNo: string;
+}
+
+export interface PageParams {
+  /** 从 1 开始，缺省 1。 */
+  page?: number;
+  /** 1..=100，缺省 20。 */
+  pageSize?: number;
+}
+
+export interface ReferralListRecordsParams extends PageParams {
+  /** 按买家昵称/邮箱子串过滤。 */
+  search?: string;
+}
+
+export interface ReferralCreateCodeParams {
+  /** 空 / 省略 = 服务端随机生成 8 位。 */
+  code?: string;
+}
+
+export interface ReferralDeleteCodeParams {
+  id: string;
+}
+
+export interface ReferralValidateParams {
+  code: string;
+  planCode: string;
+}
+
+// ── agent.capture ──
+
+/** 声明请求来自系统默认处理程序的关联；用户已在设置中关闭该关联时请求被忽略。 */
+export type OpenAssociation = 'torrent' | 'magnet' | 'ed2k';
+
+export interface CaptureSubmitParams {
+  /** 外部下载请求。 */
+  request: DownloadRequest;
+  /** true = 直接建任务；缺省 false = 恒排入确认队列。 */
+  silent?: boolean;
+  association?: OpenAssociation;
+}
+
+/**
+ * `agent.capture.submit` 结果三选一：
+ * `{ taskIds }` 直接建成（批量中途失败则整个调用报错，已建成的任务仍保留）、
+ * `{ transactionIds }` 已排入确认队列、`{ ignored: true }` 关联被关闭而忽略。
+ */
+export type CaptureSubmitResult =
+  | { taskIds: (string | null)[] }
+  | { transactionIds: string[] }
+  | { ignored: true };
+
+export interface CaptureResolveParams {
+  transactionId: string;
+  accepted: boolean;
+  /** 确认时表单产出的建任务参数；省略 = 按捕获原请求建任务。 */
+  request?: CreateTaskRequest | null;
+}
+
+/** 拒绝时 `{ accepted: false }`；接受时为 `daemon.task.create` 的 `{ taskId }`。 */
+export type CaptureResolveResult = { accepted: false } | { taskId: string };
+
+// ── agent.update ──
+
+export interface UpdateCheckParams {
+  /** `stable` | `frontier`；省略取偏好 `general.update_channel`。 */
+  channel?: 'stable' | 'frontier' | null;
+}
