@@ -41,10 +41,10 @@ use std::time::Duration;
 use fluxdown_engine::auth::is_sensitive_config_key;
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec, ResolvePreviewOutcome};
-#[cfg(hub_link)]
-use fluxdown_engine::link::{DiscoveredPeer, DiscoveryKind, LinkError, WireHello};
 #[cfg(hub_plugins)]
 use fluxdown_engine::plugin::{MarketClient, PluginManager};
+#[cfg(hub_link)]
+use fluxdown_link::{DiscoveredPeer, DiscoveryKind, LinkError, PeerAddress, WireHello};
 #[cfg(hub_link)]
 use fluxdown_protocol::daemon::{
     LinkAuth, LinkCodeResponse, LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse,
@@ -212,7 +212,7 @@ pub struct HubApiHost {
     data_dir: PathBuf,
     /// 本地设备互联管理器（桌面 `hub_link`；`None` = mDNS 关闭）。
     #[cfg(hub_link)]
-    link: Option<Arc<fluxdown_engine::link::LinkManager>>,
+    link: Option<Arc<fluxdown_link::LinkManager>>,
 }
 
 impl HubApiHost {
@@ -229,7 +229,7 @@ impl HubApiHost {
         task_events_tx: broadcast::Sender<TaskEvent>,
         #[cfg(hub_plugins)] plugin_manager: Option<Arc<PluginManager>>,
         data_dir: PathBuf,
-        #[cfg(hub_link)] link: Option<Arc<fluxdown_engine::link::LinkManager>>,
+        #[cfg(hub_link)] link: Option<Arc<fluxdown_link::LinkManager>>,
     ) -> Self {
         Self {
             db,
@@ -1054,7 +1054,8 @@ impl ApiHost for HubApiHost {
     #[cfg(hub_link)]
     async fn link_probe(&self, host: &str, port: u16) -> Result<LinkDiscoveredPeer, ApiError> {
         let link = self.link.as_ref().ok_or_else(link_disabled)?;
-        link.probe(host, port)
+        let address = PeerAddress::from_host_port(host, port).map_err(map_link_err)?;
+        link.probe(&address)
             .await
             .map(link_discovered_dto)
             .map_err(map_link_err)
@@ -1068,8 +1069,9 @@ impl ApiHost for HubApiHost {
         code: &str,
     ) -> Result<LinkPairBeginResponse, ApiError> {
         let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        let address = PeerAddress::from_host_port(host, port).map_err(map_link_err)?;
         let result = link
-            .begin_pairing(host, port, code)
+            .begin_pairing(&address, code)
             .await
             .map_err(map_link_err)?;
         Ok(LinkPairBeginResponse {
@@ -1102,6 +1104,8 @@ impl ApiHost for HubApiHost {
             online,
             paired_at: record.paired_at,
             last_seen_at: record.last_seen_at,
+            default_save_dir: None,
+            path_style: None,
         }))
     }
 
@@ -1127,6 +1131,8 @@ impl ApiHost for HubApiHost {
                 online: on,
                 paired_at: r.paired_at,
                 last_seen_at: r.last_seen_at,
+                default_save_dir: None,
+                path_style: None,
             })
             .collect())
     }
@@ -1201,10 +1207,8 @@ fn link_opt_str(s: String) -> Option<String> {
 /// 引擎 [`PairConfirmOutcome`] → API [`LinkPairConfirmOutcome`]。两者字段一致但分属
 /// 两个 crate（`fluxdown_api` 不依赖引擎的可选 link 模块），这里做一次显式搬运。
 #[cfg(hub_link)]
-fn map_confirm_outcome(
-    outcome: fluxdown_engine::link::PairConfirmOutcome,
-) -> LinkPairConfirmOutcome {
-    use fluxdown_engine::link::PairConfirmOutcome as E;
+fn map_confirm_outcome(outcome: fluxdown_link::PairConfirmOutcome) -> LinkPairConfirmOutcome {
+    use fluxdown_link::PairConfirmOutcome as E;
     match outcome {
         E::Paired => LinkPairConfirmOutcome::Paired,
         E::Declined => LinkPairConfirmOutcome::Declined,
@@ -1217,7 +1221,7 @@ fn map_confirm_outcome(
 #[cfg(hub_link)]
 fn map_link_err(e: LinkError) -> ApiError {
     match e {
-        LinkError::Unauthorized => ApiError::Unauthorized,
+        LinkError::Unauthorized | LinkError::NotPaired => ApiError::Unauthorized,
         LinkError::InvalidCode
         | LinkError::BadSignature
         | LinkError::BadPayload(_)
@@ -1226,7 +1230,8 @@ fn map_link_err(e: LinkError) -> ApiError {
         | LinkError::Throttled
         | LinkError::RejectedByPeer
         | LinkError::PairingTimeout
-        | LinkError::IdentityMismatch(_) => ApiError::BadRequest(e.to_string()),
+        | LinkError::IdentityMismatch(_)
+        | LinkError::NotFluxDown(_) => ApiError::BadRequest(e.to_string()),
         LinkError::Unreachable | LinkError::Unavailable => ApiError::Unavailable,
         other => ApiError::Internal(other.to_string()),
     }

@@ -12,9 +12,6 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use super::crypto::fingerprint;
 
-/// 引擎 `config` 表中持久化身份私钥 seed 的键名。
-pub const IDENTITY_CONFIG_KEY: &str = "link.identity_secret";
-
 /// 本机设备互联身份。
 #[derive(Clone)]
 pub struct LinkIdentity {

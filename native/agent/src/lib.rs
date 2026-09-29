@@ -14,6 +14,8 @@ pub mod clipboard_watch;
 pub mod cloud;
 pub mod daemon_client;
 mod demo;
+mod device_identity;
+pub mod device_meta;
 pub mod diagnostics;
 pub mod event_hub;
 pub mod gateway;

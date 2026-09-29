@@ -48,9 +48,19 @@ pub enum LinkError {
     #[error("peer unreachable")]
     Unreachable,
 
+    /// 拨通的地址不是 FluxDown 服务（非 JSON / 非 FluxDown 错误体 / 重定向 / HTML 等），
+    /// 典型场景：反代把请求转给了别的服务、协议（http/https）或端口填错。
+    /// 与「配对码错误」严格区分——它说明对端根本没有处理这次配对请求。
+    #[error("endpoint is not a FluxDown service: {0}")]
+    NotFluxDown(String),
+
+    /// 目标设备未配对（本机名册里没有该指纹）。
+    #[error("peer is not paired")]
+    NotPaired,
+
     /// 底层持久化错误。
     #[error("link store error: {0}")]
-    Store(#[from] crate::db::DbError),
+    Store(String),
 
     /// 网络 / IO 错误（探测、HTTP 请求、mDNS）。
     #[error("link io error: {0}")]

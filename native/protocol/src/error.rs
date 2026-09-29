@@ -57,6 +57,60 @@ pub enum ErrorReason {
     PluginPackageTooLarge,
     /// 插件包 / 插件目录未通过 manifest、脚本或版本门槛校验。
     PluginPackageInvalid,
+    /// FluxCloud：账号或密码错误。
+    InvalidCredentials,
+    /// FluxCloud：邮箱验证码错误或已过期。
+    InvalidVerificationCode,
+    /// FluxCloud：请求过于频繁（发码 / 登录 / 校验限流）。
+    RateLimited,
+    /// FluxCloud：邮箱已被注册。
+    EmailTaken,
+    /// FluxCloud：账号已被停用。
+    AccountDisabled,
+    /// FluxCloud：服务端关闭了注册。
+    RegistrationClosed,
+    /// FluxCloud：账号注册未完成（需先完成邮箱验证）。
+    RegistrationIncomplete,
+    /// FluxCloud：服务端未配置邮件发送，无法下发验证码。
+    MailNotConfigured,
+    /// FluxCloud：账号设备数已达套餐上限。
+    DeviceLimit,
+    /// FluxCloud：参与配置同步的设备数已达套餐上限。
+    SyncDeviceLimit,
+    /// FluxCloud：本设备不在账号的受信任设备中（已被移除 / 被替换）。
+    DeviceUntrusted,
+    /// FluxCloud：登录会话已失效（被撤销 / 刷新令牌过期）。
+    SessionExpired,
+    /// FluxCloud：无法连接云服务（网络 / DNS / TLS / 代理）。
+    CloudUnreachable,
+    /// 远程任务：目标设备当前离线，指令无法送达。
+    TargetDeviceOffline,
+    /// 远程任务：任务当前状态不允许该操作（如已结束）。
+    TaskStateConflict,
+    /// 远程任务：只有目标设备可以上报该任务状态。
+    TaskDeviceMismatch,
+    /// 保存目录在目标设备上不可用（路径风格不符 / 非绝对路径 / 无法创建）。
+    SaveDirUnavailable,
+    /// 局域网配对：配对码错误或已过期。
+    PairingCodeInvalid,
+    /// 局域网配对：配对会话不存在或已过期。
+    PairingSessionExpired,
+    /// 局域网配对：无法连接对端地址。
+    PairingPeerUnreachable,
+    /// 局域网配对：对端地址不是 FluxDown 服务（如反代返回了非 FluxDown 响应、协议 / 端口不符）。
+    PairingNotFluxDown,
+    /// 局域网配对：失败次数过多，对端暂时拒绝配对请求。
+    PairingThrottled,
+    /// 局域网配对：对端拒绝了配对。
+    PairingRejected,
+    /// 局域网配对：对端身份签名校验失败。
+    PairingSignatureInvalid,
+    /// 局域网配对：不能与自身配对。
+    PairingSelf,
+    /// 局域网互联：目标设备未配对或已解除配对。
+    PeerNotPaired,
+    /// 局域网互联：已配对设备当前不可达。
+    PeerOffline,
     /// 对端发送了本端不认识的原因。
     #[serde(other)]
     Unknown,

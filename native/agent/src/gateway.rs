@@ -27,6 +27,7 @@ use crate::daemon_client::DaemonClient;
 use crate::diagnostics::{DiagnosticsError, DiagnosticsService};
 use crate::event_hub::AgentEventHub;
 use crate::lifecycle::Lifecycle;
+use crate::link::LinkService;
 use crate::platform::PlatformError;
 use crate::power::PowerService;
 use crate::remote::{RemoteError, RemoteTaskService};
@@ -65,6 +66,7 @@ pub struct GatewayService {
     open_associations: crate::open_association::OpenAssociationGuard,
     local: GatewayShell,
     server_mode: bool,
+    link: Option<Arc<LinkService>>,
 }
 
 impl GatewayService {
@@ -125,6 +127,7 @@ impl GatewayService {
             open_associations,
             local,
             server_mode: false,
+            link: None,
         }
     }
 
@@ -132,6 +135,13 @@ impl GatewayService {
     #[must_use]
     pub fn with_server_mode(mut self, enabled: bool) -> Self {
         self.server_mode = enabled;
+        self
+    }
+
+    /// 装配局域网直连服务（`agent.link.*`）。
+    #[must_use]
+    pub fn with_link(mut self, link: Arc<LinkService>) -> Self {
+        self.link = Some(link);
         self
     }
 
@@ -167,7 +177,7 @@ impl GatewayService {
         match request.method.as_str() {
             method::SYSTEM_PING => Ok(serde_json::json!({ "ok": true })),
             method::SYSTEM_SNAPSHOT => serde_json::to_value(self.events.snapshot())
-                .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false)),
+                .map_err(|error| internal_error("system snapshot", error)),
             method::SYSTEM_SHUTDOWN => {
                 self.local.lifecycle.request_quit();
                 Ok(serde_json::json!({ "ok": true }))
@@ -191,7 +201,7 @@ impl GatewayService {
                     fluxdown_protocol::SnapshotBody::Daemon(_) => None,
                 };
                 serde_json::to_value(session)
-                    .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
+                    .map_err(|error| internal_error("agent session", error))
             }
             method::AGENT_GATEWAY_GET => {
                 let snapshot = self.events.snapshot();
@@ -200,7 +210,7 @@ impl GatewayService {
                     fluxdown_protocol::SnapshotBody::Daemon(_) => Default::default(),
                 };
                 serde_json::to_value(gateway)
-                    .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
+                    .map_err(|error| internal_error("gateway status", error))
             }
             method::AGENT_GATEWAY_PATCH => {
                 self.gateway_patch(params_or_empty(request.params)).await
@@ -348,11 +358,19 @@ impl GatewayService {
                 self.preferences_patch(params_or_empty(request.params))
                     .await
             }
-            method::AGENT_SYNC_GET => serde_json::to_value(self.sync.status().await)
-                .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false)),
+            method::AGENT_SYNC_GET => to_value(self.sync.status().await),
             method::AGENT_SYNC_ENABLE => sync_value(self.sync.set_enabled(true).await),
             method::AGENT_SYNC_DISABLE => sync_value(self.sync.set_enabled(false).await),
             method::AGENT_SYNC_NOW => sync_value(self.sync.sync_now().await),
+            method::AGENT_SYNC_SET_LOCAL_ONLY => {
+                let params =
+                    parse_params::<fluxdown_protocol::SyncLocalOnlyParams>(request.params)?;
+                self.sync
+                    .set_local_only(&params.keys, params.local_only)
+                    .await
+                    .map_err(sync_error_data)
+                    .and_then(to_value)
+            }
             method::AGENT_CLOUD_ENDPOINT_GET => to_value(self.cloud.endpoint()),
             method::AGENT_CLOUD_ENDPOINT_SET => {
                 let params =
@@ -361,11 +379,34 @@ impl GatewayService {
             }
             method::AGENT_REMOTE_LIST => remote_value(self.remote.refresh_snapshot().await),
             method::AGENT_REMOTE_DISPATCH => {
-                self.remote_dispatch(params_or_empty(request.params)).await
+                let params =
+                    parse_params::<fluxdown_protocol::RemoteDispatchParams>(request.params)?;
+                remote_value(self.remote.dispatch(params).await)
             }
             method::AGENT_REMOTE_COMMAND => {
-                self.remote_command(params_or_empty(request.params)).await
+                let params =
+                    parse_params::<fluxdown_protocol::RemoteCommandParams>(request.params)?;
+                remote_value(
+                    self.remote
+                        .command(params)
+                        .await
+                        .map(|()| serde_json::json!({ "ok": true })),
+                )
             }
+            method::AGENT_LINK_PAIRING_CODE
+            | method::AGENT_LINK_STOP_PAIRING
+            | method::AGENT_LINK_DISCOVERY_SET
+            | method::AGENT_LINK_PROBE
+            | method::AGENT_LINK_PAIR_BEGIN
+            | method::AGENT_LINK_PAIR_FINISH
+            | method::AGENT_LINK_APPROVE
+            | method::AGENT_LINK_REMOVE
+            | method::AGENT_LINK_REFRESH
+            | method::AGENT_LINK_DISPATCH => match &self.link {
+                Some(link) => link.rpc(&request.method, request.params).await,
+                // 互联服务未装配（如精简测试网关）：明确报不支持，不做假成功。
+                None => Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false)),
+            },
             method::AGENT_CAPTURE_SUBMIT => {
                 self.capture_submit(params_or_empty(request.params)).await
             }
@@ -374,7 +415,7 @@ impl GatewayService {
                     .await
             }
             method::AGENT_CAPTURE_LIST => serde_json::to_value(self.capture.list().await)
-                .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false)),
+                .map_err(|error| internal_error("capture list", error)),
             method::AGENT_CAPTURE_RESOLVE => {
                 self.capture_resolve(params_or_empty(request.params)).await
             }
@@ -531,7 +572,7 @@ impl GatewayService {
         self.store
             .save(&state)
             .await
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))?;
+            .map_err(|error| internal_error("agent state", error))?;
         drop(state);
         self.api_switches.update(
             gateway.takeover_enabled,
@@ -545,8 +586,7 @@ impl GatewayService {
             .publish(fluxdown_protocol::AgentEvent::GatewayChanged(
                 gateway.clone(),
             ));
-        serde_json::to_value(gateway)
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
+        serde_json::to_value(gateway).map_err(|error| internal_error("gateway status", error))
     }
 
     async fn device_list(&self) -> Result<serde_json::Value, RpcErrorData> {
@@ -577,7 +617,12 @@ impl GatewayService {
             .await
             .map_err(cloud_error_data)?;
         let updated = serde_json::from_value::<fluxdown_protocol::CloudDevice>(value.clone())
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))?;
+            .map_err(|error| internal_error("device rename response", error))?;
+        if updated.is_current
+            && let Err(error) = self.cloud.set_device_name(&updated.name).await
+        {
+            tracing::warn!(error = %error, "persisting the renamed local device name failed");
+        }
         let mut devices = agent_snapshot(&self.events)?.cloud_devices;
         if let Some(existing) = devices.iter_mut().find(|device| device.id == updated.id) {
             existing.clone_from(&updated);
@@ -669,24 +714,18 @@ impl GatewayService {
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(true);
         for (key, value) in values {
+            // JSON null = 恢复默认（墓碑）：本机移除该偏好 / daemon 键回到默认，并把删除同步给云端。
+            let deleted = value.is_null();
             let result = if sync {
                 self.sync
-                    .mark_local(key.clone(), value.clone(), false)
+                    .mark_local(key.clone(), value.clone(), deleted)
                     .await
             } else {
                 self.sync
-                    .set_local_preference(key.clone(), value.clone(), false)
+                    .set_local_preference(key.clone(), value.clone(), deleted)
                     .await
             };
-            result.map_err(|error| match error {
-                crate::sync::SyncError::Daemon(error) => error,
-                crate::sync::SyncError::Cloud(error) => {
-                    RpcErrorData::new(ApplicationErrorCode::Unavailable, error.retryable)
-                }
-                crate::sync::SyncError::Protocol(_) | crate::sync::SyncError::State(_) => {
-                    RpcErrorData::new(ApplicationErrorCode::Internal, false)
-                }
-            })?;
+            result.map_err(sync_error_data)?;
         }
         Ok(serde_json::json!({ "ok": true }))
     }
@@ -702,9 +741,11 @@ impl GatewayService {
             .get("request")
             .cloned()
             .unwrap_or_else(|| params.clone());
-        let request =
-            serde_json::from_value::<fluxdown_protocol::DownloadRequest>(request_value)
-                .map_err(|_| RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false))?;
+        let request = serde_json::from_value::<fluxdown_protocol::DownloadRequest>(request_value)
+            .map_err(|error| {
+            tracing::debug!(error = %error, "rejected capture request");
+            RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+        })?;
         // 本机调用方：`silent=true`（系统打开链接 / 拖入）直接建任务；否则（剪贴板监听）
         // 恒请用户确认。外部接管走 HTTP / NMH，由 `CaptureOrigin::External` 按免打扰偏好分流。
         let silent = params
@@ -724,7 +765,10 @@ impl GatewayService {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcErrorData> {
         let params = serde_json::from_value::<fluxdown_protocol::CaptureResolveParams>(params)
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false))?;
+            .map_err(|error| {
+                tracing::debug!(error = %error, "rejected capture resolve params");
+                RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+            })?;
         capture_value(
             self.capture
                 .resolve(&params.transaction_id, params.accepted, params.request)
@@ -837,57 +881,7 @@ impl GatewayService {
         };
         result
             .map(|()| serde_json::json!({ "ok": true }))
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
-    }
-
-    async fn remote_dispatch(
-        &self,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcErrorData> {
-        let to_device = required_string(&params, "toDevice")?;
-        let url = required_string(&params, "url")?;
-        let file_name = params
-            .get("fileName")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let save_dir = params
-            .get("saveDir")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned);
-        let local_device = self.remote.local_device_id().await;
-        remote_value(
-            self.remote
-                .dispatch(&to_device, &local_device, url, file_name, save_dir)
-                .await,
-        )
-    }
-
-    async fn remote_command(
-        &self,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, RpcErrorData> {
-        let task_id = required_string(&params, "taskId")?;
-        let action = required_string(&params, "action")?;
-        let command_id = params
-            .get("commandId")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| format!("{task_id}:{action}"));
-        let task = self
-            .remote
-            .tasks()
-            .await
-            .into_iter()
-            .find(|task| task.id == task_id)
-            .ok_or_else(|| RpcErrorData::new(ApplicationErrorCode::NotFound, false))?;
-        let local_device = self.remote.local_device_id().await;
-        remote_value(
-            self.remote
-                .command(command_id, &task, &local_device, &action)
-                .await
-                .map(|()| serde_json::json!({ "ok": true })),
-        )
+            .map_err(|error| internal_error("open/reveal task", error))
     }
 
     async fn ui_connected(&self) {
@@ -960,16 +954,16 @@ fn cloud_devices_from_value(
         .or_else(|| value.get("value"))
         .unwrap_or(value)
         .clone();
-    serde_json::from_value(devices)
-        .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
+    serde_json::from_value(devices).map_err(|error| internal_error("cloud device list", error))
 }
 
 fn capture_value<T: serde::Serialize>(
     result: Result<T, CaptureError>,
 ) -> Result<serde_json::Value, RpcErrorData> {
     match result {
-        Ok(value) => serde_json::to_value(value)
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false)),
+        Ok(value) => {
+            serde_json::to_value(value).map_err(|error| internal_error("capture result", error))
+        }
         Err(CaptureError::Full) => Err(RpcErrorData::new(ApplicationErrorCode::Unavailable, true)),
         Err(CaptureError::NotFound) => {
             Err(RpcErrorData::new(ApplicationErrorCode::NotFound, false))
@@ -1001,13 +995,20 @@ fn diagnostics_value<T>(result: Result<T, DiagnosticsError>) -> Result<T, RpcErr
 fn parse_params<T: serde::de::DeserializeOwned>(
     params: Option<serde_json::Value>,
 ) -> Result<T, RpcErrorData> {
-    serde_json::from_value(params_or_empty(params))
-        .map_err(|_| RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false))
+    serde_json::from_value(params_or_empty(params)).map_err(|error| {
+        tracing::debug!(error = %error, "rejected RPC params");
+        RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+    })
+}
+
+/// 序列化失败 / 云端响应畸形是 agent 自身或云端的问题：记录根因，对外折叠成 `Internal`。
+fn internal_error(context: &str, error: impl std::fmt::Display) -> RpcErrorData {
+    tracing::error!(context, error = %error, "agent RPC internal error");
+    RpcErrorData::new(ApplicationErrorCode::Internal, false)
 }
 
 fn to_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, RpcErrorData> {
-    serde_json::to_value(value)
-        .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
+    serde_json::to_value(value).map_err(|error| internal_error("serialize RPC result", error))
 }
 
 /// 在阻塞线程上执行同步 OS 集成调用。
@@ -1016,7 +1017,7 @@ async fn platform_blocking<T: Send + 'static>(
 ) -> Result<T, RpcErrorData> {
     tokio::task::spawn_blocking(action)
         .await
-        .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))?
+        .map_err(|error| internal_error("platform task join", error))?
         .map_err(platform_error_data)
 }
 
@@ -1051,15 +1052,16 @@ fn platform_error_data(error: PlatformError) -> RpcErrorData {
 
 /// 读取待上传的本机文件；必须是存在的普通文件且不超过 daemon 请求体上限。
 async fn read_upload_file(path: &Path) -> Result<Vec<u8>, RpcErrorData> {
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|_| invalid_field("path"))?;
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| {
+        tracing::debug!(path = %path.display(), error = %error, "upload file is not readable");
+        invalid_field("path")
+    })?;
     if !metadata.is_file() || metadata.len() > BLOB_UPLOAD_LIMIT {
         return Err(invalid_field("path"));
     }
     tokio::fs::read(path)
         .await
-        .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
+        .map_err(|error| internal_error("read upload file", error))
 }
 
 fn blob_value(result: Result<String, BlobError>) -> Result<String, RpcErrorData> {
@@ -1101,24 +1103,33 @@ pub(crate) fn ensure_forced_auth_token(
 fn remote_value<T: serde::Serialize>(
     result: Result<T, RemoteError>,
 ) -> Result<serde_json::Value, RpcErrorData> {
-    match result {
-        Ok(value) => serde_json::to_value(value)
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false)),
-        Err(RemoteError::Daemon(error)) => Err(error),
-        Err(RemoteError::Cloud(error)) if error.status == Some(401) => {
-            Err(RpcErrorData::new(ApplicationErrorCode::Unauthorized, false))
+    result.map_err(remote_error_data).and_then(to_value)
+}
+
+fn remote_error_data(error: RemoteError) -> RpcErrorData {
+    match error {
+        RemoteError::Daemon(error) => error,
+        RemoteError::Cloud(error) => cloud_error_data(error),
+        RemoteError::NotFound(_) => RpcErrorData::new(ApplicationErrorCode::NotFound, false),
+        RemoteError::TaskUnavailable(_) => RpcErrorData::new(ApplicationErrorCode::Conflict, false)
+            .with_reason(fluxdown_protocol::ErrorReason::TaskStateConflict),
+        RemoteError::InvalidArgument {
+            field,
+            reason,
+            message,
+        } => {
+            tracing::debug!(field, %message, "remote RPC argument rejected");
+            let mut data = invalid_field(field);
+            data.reason = reason;
+            data
         }
-        Err(RemoteError::Cloud(error)) => Err(RpcErrorData::new(
-            ApplicationErrorCode::Unavailable,
-            error.retryable,
-        )),
-        Err(RemoteError::InvalidAction(_)) | Err(RemoteError::Json(_)) => Err(RpcErrorData::new(
-            ApplicationErrorCode::InvalidArgument,
-            false,
-        )),
-        Err(RemoteError::State(_)) | Err(RemoteError::Protocol(_)) => {
-            Err(RpcErrorData::new(ApplicationErrorCode::Internal, false))
+        RemoteError::InvalidAction(action) => {
+            tracing::debug!(%action, "unknown remote task action");
+            invalid_field("action")
         }
+        RemoteError::Json(error) => internal_error("remote task response", error),
+        RemoteError::State(error) => internal_error("agent state", error),
+        RemoteError::Protocol(message) => internal_error("remote task protocol", message),
     }
 }
 
@@ -1129,25 +1140,18 @@ fn params_or_empty(params: Option<serde_json::Value>) -> serde_json::Value {
 fn cloud_value<T: serde::Serialize>(
     result: Result<T, CloudError>,
 ) -> Result<serde_json::Value, RpcErrorData> {
-    result.map_err(cloud_error_data).and_then(|value| {
-        serde_json::to_value(value)
-            .map_err(|_| RpcErrorData::new(ApplicationErrorCode::Internal, false))
-    })
+    result.map_err(cloud_error_data).and_then(to_value)
 }
 
+/// 云端错误 → RPC 错误（`reason` 承载云端错误码的细分含义，契约 §3）。原始消息只进日志。
 fn cloud_error_data(error: CloudError) -> RpcErrorData {
-    let code = match (error.status, error.code.as_deref()) {
-        (Some(401 | 403), _) => ApplicationErrorCode::Unauthorized,
-        (Some(404), _) => ApplicationErrorCode::NotFound,
-        (Some(409), _) => ApplicationErrorCode::Conflict,
-        (Some(400 | 422), _) | (_, Some("invalidArgument")) => {
-            ApplicationErrorCode::InvalidArgument
-        }
-        (_, Some("unsupported")) => ApplicationErrorCode::Unsupported,
-        _ if error.retryable => ApplicationErrorCode::Unavailable,
-        _ => ApplicationErrorCode::Internal,
-    };
-    RpcErrorData::new(code, error.retryable)
+    tracing::debug!(
+        status = ?error.status,
+        code = ?error.code,
+        message = %error.message,
+        "FluxCloud request failed"
+    );
+    error.to_rpc_error()
 }
 
 fn sync_value(
@@ -1155,18 +1159,27 @@ fn sync_value(
 ) -> Result<serde_json::Value, RpcErrorData> {
     result
         .map(|()| serde_json::json!({ "ok": true }))
-        .map_err(|error| match error {
-            crate::sync::SyncError::Daemon(error) => error,
-            crate::sync::SyncError::Cloud(error) if error.status == Some(401) => {
-                RpcErrorData::new(ApplicationErrorCode::Unauthorized, false)
-            }
-            crate::sync::SyncError::Cloud(error) => {
-                RpcErrorData::new(ApplicationErrorCode::Unavailable, error.retryable)
-            }
-            crate::sync::SyncError::Protocol(_) | crate::sync::SyncError::State(_) => {
-                RpcErrorData::new(ApplicationErrorCode::Internal, false)
-            }
-        })
+        .map_err(sync_error_data)
+}
+
+fn sync_error_data(error: crate::sync::SyncError) -> RpcErrorData {
+    use crate::sync::SyncError;
+    match error {
+        SyncError::Cloud(error) => cloud_error_data(error),
+        SyncError::Daemon(error) => error,
+        SyncError::InvalidValue(message) => {
+            tracing::debug!(%message, "rejected synced preference value");
+            RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+        }
+        SyncError::UnknownKey(key) => {
+            tracing::debug!(%key, "rejected a key outside the sync catalog");
+            invalid_field("keys")
+        }
+        SyncError::Disabled => RpcErrorData::new(ApplicationErrorCode::Conflict, false),
+        SyncError::AccountChanged => RpcErrorData::new(ApplicationErrorCode::Unavailable, true),
+        SyncError::Protocol(message) => internal_error("config sync protocol", message),
+        SyncError::State(error) => internal_error("agent state", error),
+    }
 }
 
 #[derive(Clone)]
@@ -1278,6 +1291,10 @@ async fn run_socket(
     let mut ready = false;
     let mut ui_client = false;
     let mut events = None;
+    // 请求按「通道」并发处理：同一通道内严格按到达顺序，慢的云端 RPC 不再阻塞事件转发
+    // 与 daemon 命令（否则事件积压溢出广播容量 → 4009 event-gap 重连）。
+    let mut lanes: Option<RequestLanes> = None;
+    let mut responses: Option<tokio::sync::mpsc::Receiver<RpcResponse>> = None;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -1319,6 +1336,9 @@ async fn run_socket(
                             if ui_client { service.ui_connected().await; }
                             let (receiver, _) = service.events.subscribe_and_snapshot();
                             events = Some(receiver);
+                            let (response_tx, response_rx) = tokio::sync::mpsc::channel(RESPONSE_QUEUE);
+                            lanes = Some(RequestLanes::spawn(&service, response_tx));
+                            responses = Some(response_rx);
                             let result = match serde_json::to_value(&service.hello) {
                                 Ok(result) => result,
                                 Err(_) => break,
@@ -1332,7 +1352,12 @@ async fn run_socket(
                     }
                     continue;
                 }
-                if send_response(&mut socket, service.call(request).await).await.is_err() { break; }
+                if let Some(lanes) = &lanes
+                    && let Some(rejected) = lanes.submit(request)
+                    && send_response(&mut socket, rejected).await.is_err()
+                {
+                    break;
+                }
             }
             event = receive_event(&mut events), if events.is_some() => {
                 match event {
@@ -1347,6 +1372,13 @@ async fn run_socket(
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            response = receive_response(&mut responses), if responses.is_some() => {
+                if let Some(response) = response
+                    && send_response(&mut socket, response).await.is_err()
+                {
+                    break;
                 }
             }
         }
@@ -1370,6 +1402,112 @@ async fn receive_event(
     match receiver {
         Some(receiver) => receiver.recv().await,
         None => std::future::pending().await,
+    }
+}
+
+async fn receive_response(
+    receiver: &mut Option<tokio::sync::mpsc::Receiver<RpcResponse>>,
+) -> Option<RpcResponse> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// 单个连接上待写回的响应队列容量。
+const RESPONSE_QUEUE: usize = 256;
+/// 每个通道待处理请求上限；超出立即以可重试的 `Unavailable` 拒绝，而不是阻塞整个连接。
+const LANE_QUEUE: usize = 128;
+
+/// 请求通道：同一通道内串行（保持命令顺序），不同通道并发。
+#[derive(Clone, Copy)]
+enum Lane {
+    /// FluxCloud / 网络往返（登录、设备、同步、远程任务、账单、更新检查）。
+    Cloud,
+    /// 透传给 daemon 的下载命令。
+    Daemon,
+    /// 其余本机操作。
+    Local,
+}
+
+fn lane_for(method_name: &str) -> Lane {
+    if method_name.starts_with("daemon.") {
+        return Lane::Daemon;
+    }
+    const CLOUD_PREFIXES: [&str; 9] = [
+        "agent.auth.",
+        "agent.profile.",
+        "agent.device.",
+        "agent.plan.",
+        "agent.order.",
+        "agent.referral.",
+        "agent.remote.",
+        "agent.sync.",
+        "agent.update.",
+    ];
+    if CLOUD_PREFIXES
+        .iter()
+        .any(|prefix| method_name.starts_with(prefix))
+    {
+        Lane::Cloud
+    } else {
+        Lane::Local
+    }
+}
+
+struct RequestLanes {
+    cloud: tokio::sync::mpsc::Sender<RpcRequest>,
+    daemon: tokio::sync::mpsc::Sender<RpcRequest>,
+    local: tokio::sync::mpsc::Sender<RpcRequest>,
+}
+
+impl RequestLanes {
+    fn spawn(
+        service: &Arc<GatewayService>,
+        responses: tokio::sync::mpsc::Sender<RpcResponse>,
+    ) -> Self {
+        let start = || {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<RpcRequest>(LANE_QUEUE);
+            let service = Arc::clone(service);
+            let responses = responses.clone();
+            tokio::spawn(async move {
+                while let Some(request) = receiver.recv().await {
+                    let response = service.call(request).await;
+                    if responses.send(response).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            sender
+        };
+        Self {
+            cloud: start(),
+            daemon: start(),
+            local: start(),
+        }
+    }
+
+    /// 提交请求；队列已满 / 通道已终止时返回应立即发回的失败响应。
+    fn submit(&self, request: RpcRequest) -> Option<RpcResponse> {
+        let sender = match lane_for(&request.method) {
+            Lane::Cloud => &self.cloud,
+            Lane::Daemon => &self.daemon,
+            Lane::Local => &self.local,
+        };
+        let id = request.id.clone();
+        match sender.try_send(request) {
+            Ok(()) => None,
+            Err(error) => {
+                tracing::warn!(error = %error, "RPC request lane rejected a request");
+                Some(RpcResponse::failure(
+                    id,
+                    RpcErrorObject::application(
+                        "agent RPC failed",
+                        RpcErrorData::new(ApplicationErrorCode::Unavailable, true),
+                    ),
+                ))
+            }
+        }
     }
 }
 
@@ -1550,6 +1688,14 @@ mod tests {
                 crate::update::UpdateService::new(env!("CARGO_PKG_VERSION"))
                     .expect("update service"),
             );
+            let link = crate::link::LinkService::new(crate::link::LinkServiceParts {
+                events: events.clone(),
+                state: state.clone(),
+                store: store.clone(),
+                tasks: Arc::new(crate::link::DaemonTaskCreator::new(daemon.clone())),
+                bound: "127.0.0.1:0".parse().expect("test link address"),
+                server_mode: false,
+            });
             let service = GatewayService::new(
                 daemon,
                 events,
@@ -1566,7 +1712,8 @@ mod tests {
                 api_switches,
                 api_token.clone(),
                 local,
-            );
+            )
+            .with_link(link);
             Self {
                 service,
                 state,

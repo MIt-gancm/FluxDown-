@@ -42,7 +42,8 @@ macro_rules! spec {
     };
 }
 
-/// 与 `lib/src/services/cloud/sync_catalog.dart` 对应的键，外加 GPUI 活动栏专属的 `ui.show_activity_*`，共 54 个。
+/// 与 `lib/src/services/cloud/sync_catalog.dart` 对应的键，外加 GPUI 专属的 `ui.show_activity_*` 与
+/// `custom_categories`（自定义分类，推送时剥离各设备不同的 `saveDir`；Flutter 拉到未知键会忽略），共 55 个。
 pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("appearance.theme_mode", Preferences),
     spec!("appearance.dark_theme", Preferences),
@@ -126,6 +127,7 @@ pub const SYNC_SETTING_SPECS: &[SettingSpec] = &[
     spec!("ed2k.server_list", Daemon, "ed2k_server_list"),
     spec!("ed2k.server_sub_enabled", Daemon, "ed2k_server_sub_enabled"),
     spec!("ed2k.server_sub_urls", Daemon, "ed2k_server_sub_urls"),
+    spec!("custom_categories", Preferences),
 ];
 
 #[must_use]
@@ -147,6 +149,9 @@ pub fn setting_value_kind(key: &str) -> SettingValueKind {
 }
 
 pub fn validate_value(key: &str, value: &Value) -> Result<(), String> {
+    if key == "custom_categories" {
+        return validate_custom_categories(value);
+    }
     if boolean_key(key) {
         return value
             .as_bool()
@@ -221,6 +226,27 @@ pub fn daemon_config_to_value(spec: &SettingSpec, value: &str) -> Result<Value, 
             .ok_or_else(|| format!("{} has invalid float config", spec.key));
     }
     Ok(Value::String(value.to_owned()))
+}
+
+/// `custom_categories` 的线上形态：分类对象数组，或与 Flutter 偏好同形的 JSON 数组字符串。
+fn validate_custom_categories(value: &Value) -> Result<(), String> {
+    let parsed;
+    let list = match value {
+        Value::Array(list) => list,
+        Value::String(text) => {
+            parsed = serde_json::from_str::<Value>(text)
+                .map_err(|error| format!("custom_categories is not valid JSON: {error}"))?;
+            parsed
+                .as_array()
+                .ok_or_else(|| "custom_categories must be a JSON array".to_owned())?
+        }
+        _ => return Err("custom_categories must be an array".to_owned()),
+    };
+    if list.iter().all(Value::is_object) {
+        Ok(())
+    } else {
+        Err("custom_categories entries must be objects".to_owned())
+    }
 }
 
 fn boolean_key(key: &str) -> bool {
@@ -302,19 +328,21 @@ mod tests {
 
     #[test]
     fn catalog_has_exact_unique_flutter_count_and_namespaced_daemon_mapping() {
-        assert_eq!(SYNC_SETTING_SPECS.len(), 54);
+        assert_eq!(SYNC_SETTING_SPECS.len(), 55);
         assert_eq!(
             SYNC_SETTING_SPECS
                 .iter()
                 .map(|spec| spec.key)
                 .collect::<HashSet<_>>()
                 .len(),
-            54
+            55
         );
         let spec = setting_spec("download.max_concurrent_tasks").expect("download spec");
         assert_eq!(spec.owner, SettingOwner::Daemon);
         assert_eq!(spec.storage_key, "max_concurrent_tasks");
         assert!(setting_spec("ui.show_sidebar_status").is_some());
+        // 侧栏「设备区」显隐是设备本地偏好，永不入目录。
+        assert!(setting_spec("ui.show_sidebar_devices").is_none());
     }
 
     #[test]
@@ -331,5 +359,16 @@ mod tests {
         assert!(validate_value("appearance.custom_color", &json!(u32::MAX)).is_ok());
         assert!(validate_value("appearance.custom_color", &json!(-1)).is_err());
         assert!(validate_value("appearance.custom_color", &json!("ff112233")).is_err());
+    }
+
+    #[test]
+    fn custom_categories_accepts_object_array_or_flutter_json_string_only() {
+        assert!(validate_value("custom_categories", &json!([{"id": "a"}])).is_ok());
+        assert!(validate_value("custom_categories", &json!([])).is_ok());
+        assert!(validate_value("custom_categories", &json!(r#"[{"id":"a"}]"#)).is_ok());
+        assert!(validate_value("custom_categories", &json!("not json")).is_err());
+        assert!(validate_value("custom_categories", &json!(r#"{"id":"a"}"#)).is_err());
+        assert!(validate_value("custom_categories", &json!([1, 2])).is_err());
+        assert!(validate_value("custom_categories", &json!(true)).is_err());
     }
 }

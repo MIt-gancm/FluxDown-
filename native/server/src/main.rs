@@ -310,16 +310,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "FluxDown Server".to_string());
-        let self_info = fluxdown_engine::link::SelfInfo {
+        let self_info = fluxdown_link::SelfInfo {
             name: self_name,
             platform: Some("server".to_string()),
             app_version: Some(SERVER_VERSION.to_string()),
         };
-        let (link_tx, mut link_rx) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(64);
-        match fluxdown_engine::link::LinkManager::load(
-            db_handle.clone(),
+        let (link_tx, mut link_rx) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(64);
+        match fluxdown_link::LinkManager::load(
+            std::sync::Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_handle.clone())),
             self_info,
-            api_port,
+            fluxdown_link::LinkOptions::reachable(api_port),
             link_tx,
         )
         .await
@@ -340,8 +340,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 tokio::spawn(async move {
                     while let Some(ev) = link_rx.recv().await {
                         match ev {
-                            fluxdown_engine::link::LinkEngineEvent::Discovered(_) => {}
-                            fluxdown_engine::link::LinkEngineEvent::Paired(r) => {
+                            fluxdown_link::LinkEngineEvent::Discovered(_) => {}
+                            fluxdown_link::LinkEngineEvent::Paired(r) => {
                                 log_info!(
                                     "[server] paired device: {} ({})",
                                     r.name,
@@ -349,17 +349,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                                 ws_hub.broadcast(&WsServerMsg::LinkDevicesChanged {});
                             }
-                            fluxdown_engine::link::LinkEngineEvent::Unpaired(_) => {
+                            fluxdown_link::LinkEngineEvent::Unpaired(_) => {
                                 ws_hub.broadcast(&WsServerMsg::LinkDevicesChanged {});
                             }
-                            fluxdown_engine::link::LinkEngineEvent::Error(m) => {
+                            fluxdown_link::LinkEngineEvent::Error(m) => {
                                 log_info!("[server] link error: {}", m);
                             }
-                            fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
+                            fluxdown_link::LinkEngineEvent::IncomingPairing {
                                 session_id,
                                 sas,
                                 peer_name,
                                 peer_platform,
+                                ..
                             } => {
                                 ws_hub.broadcast(&WsServerMsg::LinkIncomingPairing {
                                     session_id,

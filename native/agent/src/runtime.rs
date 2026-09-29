@@ -90,7 +90,7 @@ pub(crate) async fn run_with(
         Err(error) => return Err(error.into()),
     };
     let mut state = store.load().await?;
-    initialize_device_identity(&mut state, &store, server_config).await?;
+    initialize_device_identity(&mut state, &store, server_config, &paths.daemon_data_dir).await?;
 
     // 先绑定 UI Gateway：实际端口进入状态与快照，后续 Doctor/兼容 API 都据此探测。
     // server 模式只由 `FLUXDOWN_BIND` 决定（允许非回环，不看 `lan_enabled`）。
@@ -177,6 +177,17 @@ pub(crate) async fn run_with(
     );
 
     let shared_state = Arc::new(tokio::sync::Mutex::new(state));
+    // 局域网直连（L1）：先建服务，legacy 迁移完成后由 readiness 任务 `start`；
+    // 桌面默认只监听回环时 `bound` 让它自动关闭广播 / 回连地址自报。
+    let link = crate::link::LinkService::new(crate::link::LinkServiceParts {
+        events: events.clone(),
+        state: shared_state.clone(),
+        store: store.clone(),
+        tasks: Arc::new(crate::link::DaemonTaskCreator::new(daemon.clone())),
+        bound,
+        server_mode: server.is_some(),
+    });
+    let link_task = tokio::spawn(link.clone().run(cancel.clone()));
     let analytics_task = tokio::spawn(
         crate::analytics::AnalyticsWorker::new(shared_state.clone(), store.clone())?
             .run(cancel.clone()),
@@ -214,13 +225,14 @@ pub(crate) async fn run_with(
         api_token: api_token.clone(),
         cancel: cancel.clone(),
         server: bootstrap,
+        link: link.clone(),
     }));
     let shared_state_for_server = shared_state.clone();
     let cloud_client = crate::cloud::CloudClient::new(
-        std::env::var("FLUXCLOUD_BASE_URL")
-            .ok()
-            .or_else(|| option_env!("FLUXCLOUD_BASE_URL").map(str::to_owned))
-            .unwrap_or_else(|| "http://127.0.0.1:8720".to_owned()),
+        fluxcloud_base_url(
+            std::env::var("FLUXCLOUD_BASE_URL").ok(),
+            option_env!("FLUXCLOUD_BASE_URL"),
+        ),
         shared_state.clone(),
         store.clone(),
     )?
@@ -247,6 +259,13 @@ pub(crate) async fn run_with(
         store.clone(),
     ));
     let remote_task = tokio::spawn(remote.clone().run(cancel.clone()));
+    let device_meta_task = tokio::spawn(
+        Arc::new(crate::device_meta::DeviceMetaService::new(
+            cloud_api.clone(),
+            events.clone(),
+        ))
+        .run(cancel.clone()),
+    );
     let cdn_task = tokio::spawn(
         crate::cdn_worker::CdnWorker::new(
             cloud_api.clone(),
@@ -318,7 +337,8 @@ pub(crate) async fn run_with(
                 notifier,
             },
         )
-        .with_server_mode(server.is_some()),
+        .with_server_mode(server.is_some())
+        .with_link(link.clone()),
     );
     let bearer = load_or_create_bearer(
         store.data_dir(),
@@ -372,6 +392,7 @@ pub(crate) async fn run_with(
         events,
         capture,
         blobs.clone(),
+        link.clone(),
         server_config.and_then(|config| config.language.clone()),
     ));
     let (result, nmh_completed): (Result<(), Box<dyn std::error::Error + Send + Sync>>, bool) = tokio::select! {
@@ -403,6 +424,8 @@ pub(crate) async fn run_with(
     let _ = cdn_task.await;
     let _ = sync_task.await;
     let _ = remote_task.await;
+    let _ = link_task.await;
+    let _ = device_meta_task.await;
     let _ = effects_task.await;
     let _ = analytics_task.await;
     let _ = power_task.await;
@@ -427,6 +450,7 @@ struct DaemonReadiness {
     api_token: fluxdown_api::auth::TokenCell,
     cancel: CancellationToken,
     server: Option<ServerBootstrap>,
+    link: Arc<crate::link::LinkService>,
 }
 
 /// server 模式在 daemon 就绪后的一次性引导：预置密钥策略 + 就绪信号。
@@ -447,16 +471,25 @@ async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
         api_token,
         cancel,
         server,
+        link,
     } = readiness;
     let work = async {
-        daemon
-            .wait_ready(Duration::from_secs(30))
-            .await
-            .map_err(|error| {
-                std::io::Error::other(format!("daemon startup failed: {:?}", error.code))
-            })?;
+        // 慢盘 / NAS 冷启动可能远超 30s：daemon 客户端自己持续重连，这里持续等待并周期性
+        // 报告状态；只有 agent 退出（信号 / daemon 致命错误 → cancel）才结束等待。
+        let started = std::time::Instant::now();
+        while daemon.wait_ready(DAEMON_READY_POLL).await.is_err() {
+            tracing::warn!(
+                waited_secs = started.elapsed().as_secs(),
+                "fluxdownd is not ready yet; still waiting"
+            );
+        }
         let fresh = state.lock().await.gateway_migration_revision.is_none();
         crate::link::migrate_legacy_state(&daemon, &state, &store, &events).await?;
+        // 迁移可能写入 daemon 时代的身份与名册：互联必须在它之后才加载 / 生成身份。
+        // 失败只影响局域网互联（`agent.link.*` 报 Unavailable），不拖垮下载与云功能。
+        if let Err(error) = link.start().await {
+            tracing::warn!(error = %error, "device link could not start");
+        }
         if let Some(server) = &server {
             let mut state = state.lock().await;
             if crate::server_mode::apply_bootstrap(&mut state, fresh, &server.seed) {
@@ -538,15 +571,42 @@ fn spawn_daemon_projection(
     })
 }
 
+/// 每轮等待 daemon 就绪的时长；超时只记录状态并继续等待。
+const DAEMON_READY_POLL: Duration = Duration::from_secs(30);
+
+/// FluxCloud 服务地址：运行期环境变量 > 构建期注入 > 本地默认。空串（CI 未配置 secret 时传入）视为未设置。
+fn fluxcloud_base_url(runtime: Option<String>, build_time: Option<&str>) -> String {
+    runtime
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| {
+            build_time
+                .filter(|url| !url.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "http://127.0.0.1:8720".to_owned())
+}
+
 async fn initialize_device_identity(
     state: &mut AgentState,
     store: &StateStore,
     server: Option<&crate::server_mode::ServerConfig>,
+    engine_data_dir: &Path,
 ) -> Result<(), crate::state::StateError> {
     let mut changed = false;
     let first_run = state.device_id.is_empty();
     if first_run {
-        state.device_id = uuid::Uuid::new_v4().to_string();
+        // 沿用 Flutter 时代的 `cloud_device_id`（同一台机器迁移到 GPUI 后云端仍视为同一设备，
+        // 不多占设备名额）；找不到才生成新的。headless 实例不继承同机桌面安装版的身份。
+        match crate::device_identity::load_flutter_identity(engine_data_dir, server.is_none()).await
+        {
+            Some(legacy) => {
+                state.device_id = legacy.device_id;
+                if let Some(name) = legacy.device_name {
+                    state.device_name = name;
+                }
+            }
+            None => state.device_id = uuid::Uuid::new_v4().to_string(),
+        }
         // server 模式的兼容 API 分组在 daemon 迁移完成后由 `server_mode::apply_bootstrap` 决定。
         if server.is_none() {
             state.gateway.takeover_enabled = true;
@@ -559,10 +619,7 @@ async fn initialize_device_identity(
         (1..=64).contains(&length)
     };
     if !valid_name {
-        state.device_name = std::env::var("HOSTNAME")
-            .ok()
-            .filter(|name| (1..=64).contains(&name.trim().chars().count()))
-            .unwrap_or_else(|| "FluxDown".to_owned());
+        state.device_name = crate::device_identity::detect_device_name().await;
         changed = true;
     }
     if state.platform.is_empty() {
@@ -575,8 +632,14 @@ async fn initialize_device_identity(
             || credentials.session.is_none()
     }) {
         state.credentials = None;
+        // 凭证被判定无效：账号维度状态（同步水位 / 脏键 / 远程任务）随之隔离。
+        state.bind_account(None);
         changed = true;
     }
+    // 升级前的状态没有 `account_uid`：已登录时归属当前会话账号。
+    let before = state.account_uid.clone();
+    state.adopt_session_account();
+    changed |= state.account_uid != before;
     if changed {
         store.save(state).await?;
     }

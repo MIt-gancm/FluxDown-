@@ -52,6 +52,12 @@ pub struct AgentSnapshot {
     pub linked_devices: Vec<LinkDeviceInfo>,
     pub remote_tasks: Vec<RemoteTaskDto>,
     pub pending_captures: Vec<PendingCaptureDto>,
+    /// 等待本机确认的入站局域网配对请求。
+    #[serde(default)]
+    pub link_pairing_requests: Vec<crate::LinkPairingRequestDto>,
+    /// 局域网发现开启期间看到的未配对 / 已配对 FluxDown 设备。
+    #[serde(default)]
+    pub link_discovered: Vec<crate::LinkDiscoveredPeer>,
     #[serde(default)]
     pub shell: ShellStatusDto,
     #[serde(default)]
@@ -131,6 +137,8 @@ pub enum AgentEvent {
     GatewayChanged(GatewayStatusDto),
     CloudDevicesChanged(Vec<CloudDevice>),
     LinkedDevicesChanged(Vec<LinkDeviceInfo>),
+    LinkPairingRequestsChanged(Vec<crate::LinkPairingRequestDto>),
+    LinkDiscoveredChanged(Vec<crate::LinkDiscoveredPeer>),
     RemoteTasksChanged(Vec<RemoteTaskDto>),
     PendingCapturesChanged(Vec<PendingCaptureDto>),
     ShellChanged(ShellStatusDto),
@@ -138,6 +146,10 @@ pub enum AgentEvent {
     /// 外部捕获未经确认直接建成的任务（免打扰下载 / 系统打开链接 / 拖入）。一次性通知，
     /// 不进快照；官方 UI 据此为单任务弹出进度窗口。失败条目不在列表中。
     CaptureTasksStarted(Vec<String>),
+    /// 会话被非用户主动地结束（设备被移除 / 被替换 → `deviceUntrusted`；令牌失效或被管理员撤销 →
+    /// `sessionExpired`；账号停用 → `accountDisabled`）。一次性通知，不进快照；紧随其后会有
+    /// `SessionChanged(None)`。用户主动登出 / 删除本设备不发送。
+    SessionRevoked(crate::ErrorReason),
 }
 
 /// `service.event` notification 的事件主体。
@@ -170,19 +182,30 @@ pub fn apply_agent_event(snapshot: &mut AgentSnapshot, event: &AgentEvent) {
                 snapshot.daemon.task_runtime.clear();
             }
         }
-        AgentEvent::SessionChanged(session) => snapshot.session.clone_from(session.as_ref()),
+        AgentEvent::SessionChanged(session) => {
+            snapshot.session.clone_from(session.as_ref());
+            // 会话结束（登出 / 被撤销）后账号维度的投影随之失效，不留旧账号的设备与任务。
+            if snapshot.session.is_none() {
+                snapshot.cloud_devices.clear();
+                snapshot.remote_tasks.clear();
+            }
+        }
         AgentEvent::SyncChanged(sync) => snapshot.sync.clone_from(sync),
         AgentEvent::PreferencesChanged(preferences) => snapshot.preferences.clone_from(preferences),
         AgentEvent::GatewayChanged(gateway) => snapshot.gateway.clone_from(gateway),
         AgentEvent::CloudDevicesChanged(devices) => snapshot.cloud_devices.clone_from(devices),
         AgentEvent::LinkedDevicesChanged(devices) => snapshot.linked_devices.clone_from(devices),
+        AgentEvent::LinkPairingRequestsChanged(requests) => {
+            snapshot.link_pairing_requests.clone_from(requests);
+        }
+        AgentEvent::LinkDiscoveredChanged(peers) => snapshot.link_discovered.clone_from(peers),
         AgentEvent::RemoteTasksChanged(tasks) => snapshot.remote_tasks.clone_from(tasks),
         AgentEvent::PendingCapturesChanged(captures) => {
             snapshot.pending_captures.clone_from(captures)
         }
         AgentEvent::ShellChanged(shell) => snapshot.shell.clone_from(shell),
         AgentEvent::PowerChanged(power) => snapshot.power = *power,
-        AgentEvent::CaptureTasksStarted(_) => {}
+        AgentEvent::CaptureTasksStarted(_) | AgentEvent::SessionRevoked(_) => {}
     }
 }
 

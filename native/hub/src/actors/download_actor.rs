@@ -841,18 +841,18 @@ pub async fn run(
     // 桌面在本地互联中主要充当**发起方**（发现并添加 NAS/服务器等局域网可达设备）；
     // 事件（发现/配对进度/名册）经 LinkEvent 信号回流 Dart。
     #[cfg(hub_link)]
-    let link_mgr: Option<Arc<fluxdown_engine::link::LinkManager>> = {
+    let link_mgr: Option<Arc<fluxdown_link::LinkManager>> = {
         let self_name = std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .ok()
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "FluxDown".to_string());
-        let self_info = fluxdown_engine::link::SelfInfo {
+        let self_info = fluxdown_link::SelfInfo {
             name: self_name,
             platform: Some(std::env::consts::OS.to_string()),
             app_version: None,
         };
-        let (link_tx, mut link_rx) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(64);
+        let (link_tx, mut link_rx) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(64);
         // api_port = 本机 API 端口（供自报候选/mDNS 广播），从 config 读，回退 17800。
         let api_port = engine
             .db
@@ -862,10 +862,10 @@ pub async fn run(
             .flatten()
             .and_then(|v| v.trim().parse::<u16>().ok())
             .unwrap_or(17800);
-        match fluxdown_engine::link::LinkManager::load(
-            engine.db.clone(),
+        match fluxdown_link::LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(engine.db.clone())),
             self_info,
-            api_port,
+            fluxdown_link::LinkOptions::reachable(api_port),
             link_tx,
         )
         .await
@@ -3464,9 +3464,20 @@ fn opt(s: &str) -> Option<&str> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Flutter UI 仍只传 host + port（行为不变）：转成互联层的结构化地址。
+#[cfg(hub_link)]
+fn link_peer_address(
+    host: &str,
+    port: i32,
+) -> Result<fluxdown_link::PeerAddress, fluxdown_link::LinkError> {
+    let port = u16::try_from(port)
+        .map_err(|_| fluxdown_link::LinkError::BadPayload(format!("invalid port: {port}")))?;
+    fluxdown_link::PeerAddress::from_host_port(host.trim(), port)
+}
+
 /// 汇总本机名册（含并发在线探测）并以 `LinkEvent{kind:"devices"}` 推给 Dart。
 #[cfg(hub_link)]
-async fn emit_link_devices(link: &fluxdown_engine::link::LinkManager) {
+async fn emit_link_devices(link: &fluxdown_link::LinkManager) {
     use rinf::RustSignal;
     let records = link.list_devices().await.unwrap_or_default();
     // 整体超时兜底：单次探测虽有自限时（DirectTransport 3s），但那是**当前唯一**
@@ -3494,11 +3505,11 @@ async fn emit_link_devices(link: &fluxdown_engine::link::LinkManager) {
     ev.send_signal_to_dart();
 }
 
-/// 把引擎侧 [`LinkEngineEvent`](fluxdown_engine::link::LinkEngineEvent) 转成
+/// 把互联侧 [`LinkEngineEvent`](fluxdown_link::LinkEngineEvent) 转成
 /// Dart 信号（发现/配对成功/解除配对/错误）。
 #[cfg(hub_link)]
-fn emit_link_engine_event(ev: fluxdown_engine::link::LinkEngineEvent) {
-    use fluxdown_engine::link::{DiscoveryKind, LinkEngineEvent as E};
+fn emit_link_engine_event(ev: fluxdown_link::LinkEngineEvent) {
+    use fluxdown_link::{DiscoveryKind, LinkEngineEvent as E};
     use rinf::RustSignal;
     match ev {
         E::Discovered(p) => {
@@ -3539,6 +3550,7 @@ fn emit_link_engine_event(ev: fluxdown_engine::link::LinkEngineEvent) {
             sas,
             peer_name,
             peer_platform,
+            ..
         } => {
             let mut e = link_event_base("incomingPairing");
             e.session_id = session_id;
@@ -3554,7 +3566,7 @@ fn emit_link_engine_event(ev: fluxdown_engine::link::LinkEngineEvent) {
 #[cfg(hub_link)]
 async fn handle_link_command(
     msg: crate::signals::LinkCommand,
-    link: Arc<fluxdown_engine::link::LinkManager>,
+    link: Arc<fluxdown_link::LinkManager>,
 ) {
     use rinf::RustSignal;
     let emit_err = |m: String| {
@@ -3578,15 +3590,22 @@ async fn handle_link_command(
             }
         }
         "stopDiscovery" => link.stop_discovery(),
-        "probe" => match link.probe(&msg.host, msg.port as u16).await {
-            Ok(p) => emit_link_engine_event(fluxdown_engine::link::LinkEngineEvent::Discovered(p)),
+        "probe" => match link_peer_address(&msg.host, msg.port) {
+            Ok(address) => match link.probe(&address).await {
+                Ok(p) => emit_link_engine_event(fluxdown_link::LinkEngineEvent::Discovered(p)),
+                Err(e) => emit_err(e.to_string()),
+            },
             Err(e) => emit_err(e.to_string()),
         },
         "beginPairing" => {
-            match link
-                .begin_pairing(&msg.host, msg.port as u16, &msg.code)
-                .await
-            {
+            let address = match link_peer_address(&msg.host, msg.port) {
+                Ok(address) => address,
+                Err(e) => {
+                    emit_err(e.to_string());
+                    return;
+                }
+            };
+            match link.begin_pairing(&address, &msg.code).await {
                 Ok(r) => {
                     let mut e = link_event_base("pairingChallenge");
                     e.token = r.token;

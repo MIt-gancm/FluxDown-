@@ -61,19 +61,9 @@ impl CloudAuthService {
         self.authenticate("/api/v1/auth/code/verify", request).await
     }
 
+    /// 退出：服务端吊销 + 本地清除由 [`CloudClient::logout`] 在刷新锁内完成。
     pub async fn logout(&self) -> Result<(), CloudError> {
-        let refresh_token = self.client.refresh_token().await?;
-        let remote: Result<Value, CloudError> = self
-            .client
-            .authenticated(
-                Method::POST,
-                "/api/v1/auth/logout",
-                Some(&serde_json::json!({ "refreshToken": refresh_token })),
-            )
-            .await;
-        // `clear_session` 自身投影 `SessionChanged(None)`。
-        self.client.clear_session().await?;
-        remote.map(|_| ())
+        self.client.logout().await
     }
 
     /// 与 Flutter `CloudClient._withDeviceInfo` 对齐：认证类请求体必须携带
@@ -136,6 +126,7 @@ impl CloudError {
             code: Some("invalidResponse".to_owned()),
             message,
             retryable: false,
+            unreachable: false,
         }
     }
 }

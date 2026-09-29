@@ -40,9 +40,10 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use super::crypto::{derive_link_key, derive_sas, fingerprint};
 use super::error::{LinkError, LinkResult};
 use super::identity::LinkIdentity;
-use super::types::{PeerCandidate, PeerRecord, TransportKind};
-/// 配对码有效期。
-const CODE_TTL: Duration = Duration::from_secs(120);
+use super::types::{PeerCandidate, PeerInfo, PeerRecord, TransportKind};
+/// 配对码有效期（秒）。宿主向用户展示倒计时 / 计算过期时刻时引用它，避免手写字面量漂移。
+pub const CODE_TTL_SECS: u64 = 120;
+const CODE_TTL: Duration = Duration::from_secs(CODE_TTL_SECS);
 /// confirm 会话有效期（hello 之后必须尽快核对 SAS 并确认）。
 ///
 /// 反向约束：必须严格大于 `LOCAL_DECISION_TIMEOUT`——两者共享同一个锚点
@@ -89,7 +90,9 @@ const UNKNOWN_SOURCE_KEY: &str = "unknown";
 /// 还在傻等一个不会再来的决策。必须严格小于 `SESSION_TTL`（见该常量上方
 /// 反向约束注释），否则 `prune_sessions` 会在决策窗口关闭前就把仍在等待
 /// 用户决策的会话剪掉。
-const LOCAL_DECISION_TIMEOUT: Duration = Duration::from_secs(60);
+/// 响应方用户核验窗口（秒）：从 hello 抵达时刻起算，超时后 confirm 一律 `PairingTimeout`。
+pub const DECISION_WINDOW_SECS: u64 = 60;
+const LOCAL_DECISION_TIMEOUT: Duration = Duration::from_secs(DECISION_WINDOW_SECS);
 
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
@@ -340,6 +343,13 @@ impl PairingResponder {
         code
     }
 
+    /// 立即作废当前展示的配对码（用户关闭配对界面 / 主动停止配对时调用）。
+    pub fn revoke_codes(&self) {
+        if let Ok(mut codes) = self.codes.lock() {
+            codes.clear();
+        }
+    }
+
     /// 处理 `hello`：节流检查 → 校验码 → ECDH → 验发起方签名 → 建会话 → 签自身握手。
     /// `source`：请求来源地址，用于按来源分桶节流（见 [`failure_bucket_key`]）；
     /// 宿主层拿不到时传 `None`，仍会计入固定的 `UNKNOWN_SOURCE_KEY` 桶。
@@ -574,6 +584,7 @@ impl PairingResponder {
             candidates,
             paired_at: now,
             last_seen_at: now,
+            info: PeerInfo::default(),
         }))
     }
 
@@ -712,6 +723,7 @@ impl PairingInitiator {
             }],
             paired_at: now,
             last_seen_at: now,
+            info: PeerInfo::default(),
         })
     }
 }

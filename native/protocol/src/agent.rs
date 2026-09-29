@@ -14,6 +14,9 @@ pub enum CloudUserStatus {
     Active,
     Disabled,
     Pending,
+    /// 云端新增、本端不认识的状态。
+    #[serde(other)]
+    Unknown,
 }
 
 /// FluxCloud 用户公开资料。
@@ -163,6 +166,78 @@ pub struct CloudDevice {
     pub is_online: bool,
     #[serde(default)]
     pub is_current: bool,
+    /// 设备自报的默认下载目录（目标设备本地路径；远程下发不填保存目录时使用它）。
+    #[serde(default)]
+    pub default_save_dir: Option<String>,
+    /// 设备自报的本地路径风格；`None` = 旧版客户端未上报（可按 `platform` 推断）。
+    #[serde(default)]
+    pub path_style: Option<PathStyle>,
+}
+
+/// 设备本地文件路径的书写风格，决定远程下发时保存目录的合法形态。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum PathStyle {
+    /// `C:\dir` / `\\server\share`。
+    Windows,
+    /// `/dir`。
+    Posix,
+    /// 对端发送了本端不认识的风格。
+    #[serde(other)]
+    Unknown,
+}
+
+impl PathStyle {
+    /// 本进程所在平台的路径风格。
+    #[must_use]
+    pub const fn current() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::Posix
+        }
+    }
+
+    /// 按设备平台名（`windows` / `macos` / `linux` / `android` / `ios` / `web` …）推断。
+    #[must_use]
+    pub fn from_platform(platform: &str) -> Option<Self> {
+        match platform.trim().to_ascii_lowercase().as_str() {
+            "windows" | "win32" => Some(Self::Windows),
+            "macos" | "darwin" | "linux" | "android" | "ios" | "freebsd" | "openbsd" | "netbsd" => {
+                Some(Self::Posix)
+            }
+            _ => None,
+        }
+    }
+
+    /// `path` 是否为该风格下的绝对路径。
+    #[must_use]
+    pub fn is_absolute(self, path: &str) -> bool {
+        let path = path.trim();
+        match self {
+            Self::Windows => {
+                let bytes = path.as_bytes();
+                let drive = bytes.len() >= 3
+                    && bytes[0].is_ascii_alphabetic()
+                    && bytes[1] == b':'
+                    && matches!(bytes[2], b'\\' | b'/');
+                drive || path.starts_with("\\\\")
+            }
+            Self::Posix => path.starts_with('/'),
+            Self::Unknown => false,
+        }
+    }
+}
+
+impl CloudDevice {
+    /// 设备自报的路径风格；旧版客户端未上报时按平台推断。
+    #[must_use]
+    pub fn effective_path_style(&self) -> Option<PathStyle> {
+        self.path_style
+            .filter(|style| *style != PathStyle::Unknown)
+            .or_else(|| self.platform.as_deref().and_then(PathStyle::from_platform))
+    }
 }
 
 /// 无 access/refresh token 的本地会话视图。
@@ -331,8 +406,10 @@ pub enum RemoteTaskStatus {
     Failed,
     Canceled,
     #[default]
-    #[serde(other)]
     Pending,
+    /// 云端新增、本端不认识的状态；不参与接单与控制。
+    #[serde(other)]
+    Unknown,
 }
 
 /// 跨设备任务的 UI 投影。
@@ -348,7 +425,8 @@ pub struct RemoteTaskDto {
     #[serde(default)]
     pub url: String,
     pub save_dir: Option<String>,
-    #[serde(default)]
+    /// 云端对未指定文件名的任务回 `null`，按空串处理。
+    #[serde(default, deserialize_with = "null_as_default")]
     pub file_name: String,
     #[serde(default)]
     pub status: RemoteTaskStatus,
@@ -364,6 +442,66 @@ pub struct RemoteTaskDto {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+}
+
+fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// `agent.remote.dispatch` 参数：经 FluxCloud 把下载下发到本账号另一台受信任设备。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDispatchParams {
+    /// 目标设备的 `CloudDevice::device_id`。
+    pub to_device: String,
+    pub url: String,
+    /// 空 / 省略 = 由目标设备按 URL 推断。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// 目标设备上的保存目录；省略 = 目标设备的默认下载目录。必须符合目标设备的路径风格。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_dir: Option<String>,
+}
+
+/// `agent.remote.dispatch` 结果。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDispatchResult {
+    pub task: RemoteTaskDto,
+}
+
+/// 远程任务控制动作。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub enum RemoteCommandAction {
+    Pause,
+    Resume,
+    /// 取消任务（目标设备删除其本地任务，保留已下载文件）。
+    Cancel,
+    /// 取消任务并让目标设备删除其本地任务；`delete_files` 决定是否同时删文件。
+    Delete,
+}
+
+/// `agent.remote.command` 参数。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteCommandParams {
+    pub task_id: String,
+    pub action: RemoteCommandAction,
+    /// 幂等键；省略时 agent 生成唯一值（同一动作可重复下发）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_id: Option<String>,
+    /// 仅 `Delete`：目标设备同时删除已下载文件。
+    #[serde(default)]
+    pub delete_files: bool,
 }
 
 /// UI Gateway 运行状态；永远不携带 token 文本。
@@ -465,7 +603,133 @@ pub struct SyncStatusDto {
     pub enabled: bool,
     pub revision: u64,
     pub dirty_keys: Vec<String>,
+    /// 诊断用原始错误文本（UI 优先按 `last_error_reason` 展示本地化文案）。
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub last_error_reason: Option<crate::ErrorReason>,
+    /// 同步事件流当前已连通。
+    #[serde(default)]
+    pub connected: bool,
+    /// 因不可自动恢复的错误（设备超限 / 设备未受信任）暂停自动重试，需用户处理后重新启用。
+    #[serde(default)]
+    pub halted: bool,
+    /// 最近一次成功完成拉取 + 推送的时间。
+    #[serde(default)]
+    pub last_synced_at_unix_ms: Option<i64>,
+    /// 本设备不参与云同步的同步目录键（设备本地，不上云）。
+    #[serde(default)]
+    pub local_only_keys: Vec<String>,
+}
+
+/// `agent.sync.setLocalOnly` 参数：把一组同步目录键设为本设备专属（不推送、不接收云端值）或恢复同步。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SyncLocalOnlyParams {
+    pub keys: Vec<String>,
+    pub local_only: bool,
+}
+
+/// 等待本机确认的入站局域网配对请求（对端已输入本机配对码）。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairingRequestDto {
+    pub session_id: String,
+    pub peer_name: String,
+    pub peer_fingerprint: String,
+    #[serde(default)]
+    pub peer_platform: Option<String>,
+    /// 双方肉眼核对的短认证串。
+    pub sas: String,
+    pub expires_at_unix_ms: i64,
+}
+
+/// 本机当前展示的局域网配对码（供对端输入）。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairingCodeDto {
+    pub code: String,
+    pub expires_at_unix_ms: i64,
+    /// 本机可被对端直连的地址（`http(s)://host:port`），供对端手动输入。
+    pub addresses: Vec<String>,
+    pub fingerprint: String,
+    pub device_name: String,
+}
+
+/// `agent.link.discovery.set` 参数。
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkDiscoveryParams {
+    pub enabled: bool,
+}
+
+/// `agent.link.probe` 参数。`address` 接受 `host`、`host:port`、`http(s)://host[:port][/base]`；
+/// 未写协议时按 `http`，未写端口时 `http` 用 17800、`https` 用 443。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkAddressParams {
+    pub address: String,
+}
+
+/// `agent.link.pairBegin` 参数（地址规则同 [`LinkAddressParams`]）。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairBeginParams {
+    pub address: String,
+    pub code: String,
+}
+
+/// `agent.link.pairFinish` 参数：发起端核对 SAS 后确认 / 放弃。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairFinishParams {
+    pub token: String,
+    pub accept: bool,
+}
+
+/// `agent.link.approve` 参数：响应端对入站配对请求的决定。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkApproveParams {
+    pub session_id: String,
+    pub accept: bool,
+}
+
+/// `agent.link.remove` / `agent.link.rename` 的设备定位参数。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkDeviceParams {
+    pub fingerprint: String,
+}
+
+/// `agent.link.dispatch` 参数：把下载直接下发到已配对的局域网设备。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkDispatchParams {
+    pub fingerprint: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    /// 目标设备上的保存目录；省略 = 目标设备默认下载目录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_dir: Option<String>,
+}
+
+/// `agent.link.dispatch` 结果：目标设备上新建任务的 ID。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkDispatchResult {
+    pub task_id: String,
 }
 
 /// FluxCloud 服务地址；`editable=false`（正式构建）时 `base_url` 恒等于 `default_base_url`。
@@ -911,5 +1175,53 @@ mod cloud_profile_tests {
             profile.current_plan.as_ref().map(|plan| plan.code.as_str()),
             Some("founder")
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_dto_tests {
+    use serde_json::json;
+
+    use super::{PathStyle, RemoteTaskDto, RemoteTaskStatus};
+
+    /// FluxCloud 对未指定文件名的任务回 `"fileName": null`；解析失败会让整批远程任务同步停摆。
+    #[test]
+    fn remote_task_accepts_null_file_name_and_unknown_status() {
+        let task: RemoteTaskDto = serde_json::from_value(json!({
+            "id": "t1",
+            "fromDevice": "a",
+            "toDevice": "b",
+            "url": "https://example.com/a.bin",
+            "saveDir": null,
+            "fileName": null,
+            "status": "archived",
+            "totalBytes": null,
+            "downloadedBytes": 0,
+            "speed": 0,
+            "progress": 0.0,
+            "error": null,
+            "createdAt": "2026-09-29T00:00:00Z",
+            "updatedAt": "2026-09-29T00:00:00Z"
+        }))
+        .expect("null fileName must parse");
+        assert_eq!(task.file_name, "");
+        assert_eq!(task.status, RemoteTaskStatus::Unknown);
+    }
+
+    #[test]
+    fn path_style_absolute_rules() {
+        assert!(PathStyle::Windows.is_absolute(r"C:\Downloads"));
+        assert!(PathStyle::Windows.is_absolute("d:/data"));
+        assert!(PathStyle::Windows.is_absolute(r"\\nas\share"));
+        assert!(!PathStyle::Windows.is_absolute("/mnt/data"));
+        assert!(!PathStyle::Windows.is_absolute("Downloads"));
+        assert!(PathStyle::Posix.is_absolute("/mnt/Download"));
+        assert!(!PathStyle::Posix.is_absolute(r"E:\download"));
+        assert_eq!(PathStyle::from_platform("macos"), Some(PathStyle::Posix));
+        assert_eq!(
+            PathStyle::from_platform("windows"),
+            Some(PathStyle::Windows)
+        );
+        assert_eq!(PathStyle::from_platform("web"), None);
     }
 }

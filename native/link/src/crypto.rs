@@ -24,7 +24,7 @@ pub const LINK_AUTH_SKEW_SECS: i64 = 120;
 /// # Examples
 ///
 /// ```
-/// use fluxdown_engine::link::crypto::fingerprint;
+/// use fluxdown_link::crypto::fingerprint;
 /// let fp = fingerprint(&[0u8; 32]);
 /// assert_eq!(fp.len(), 64);
 /// ```
@@ -42,7 +42,7 @@ pub fn fingerprint(public_key: &[u8]) -> String {
 /// # Examples
 ///
 /// ```
-/// use fluxdown_engine::link::crypto::derive_sas;
+/// use fluxdown_link::crypto::derive_sas;
 /// let z = [7u8; 32];
 /// let a = [1u8; 32];
 /// let b = [2u8; 32];
@@ -76,7 +76,7 @@ pub fn derive_sas(z: &[u8], pub_a: &[u8; 32], pub_b: &[u8; 32]) -> String {
 /// # Examples
 ///
 /// ```
-/// use fluxdown_engine::link::crypto::derive_link_key;
+/// use fluxdown_link::crypto::derive_link_key;
 /// let k = derive_link_key(&[9u8; 32]);
 /// assert_eq!(k.len(), 32);
 /// ```
@@ -101,7 +101,7 @@ pub fn derive_link_key(z: &[u8]) -> Vec<u8> {
 /// # Examples
 ///
 /// ```
-/// use fluxdown_engine::link::crypto::derive_link_aead_key;
+/// use fluxdown_link::crypto::derive_link_aead_key;
 /// let k = derive_link_aead_key(&[6u8; 32]);
 /// assert_eq!(k.len(), 32);
 /// ```
@@ -128,7 +128,7 @@ pub fn derive_link_aead_key(link_secret: &[u8]) -> [u8; 32] {
 /// # Examples
 ///
 /// ```
-/// use fluxdown_engine::link::crypto::{open_link_body, seal_link_body};
+/// use fluxdown_link::crypto::{open_link_body, seal_link_body};
 /// let key = [1u8; 32];
 /// let sealed = seal_link_body(&key, b"hello");
 /// assert_eq!(open_link_body(&key, &sealed).as_deref(), Some(b"hello".as_slice()));
@@ -179,7 +179,7 @@ pub fn open_link_body(key: &[u8; 32], sealed: &[u8]) -> Option<Vec<u8>> {
 /// # Examples
 ///
 /// ```
-/// use fluxdown_engine::link::crypto::{link_auth_tag, verify_link_auth_tag};
+/// use fluxdown_link::crypto::{link_auth_tag, verify_link_auth_tag};
 /// let key = [3u8; 32];
 /// let body = b"{}";
 /// let tag = link_auth_tag(&key, "POST", "/api/v1/link/tasks", 1000, "abc", body);

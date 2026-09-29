@@ -713,6 +713,31 @@
         ]
       }
     },
+    "/api/v1/link/info": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "已配对设备经已认证链路交换设备信息（默认下载目录 / 路径风格）。",
+        "description": "数据面：已配对设备交换设备信息（默认下载目录 / 路径风格）。**无 management token**，鉴权靠 `X-FluxLink-*` 头（同 `/api/v1/link/tasks`）。请求体与响应体都是 AEAD 密文（`application/octet-stream`）；旧版对端没有该端点（404）。",
+        "operationId": "api_link_info",
+        "responses": {
+          "200": {
+            "description": "用链路密钥加密的本机信息（二进制）"
+          },
+          "401": {
+            "description": "缺少/无效链路鉴权头",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/link/pair/approve": {
       "post": {
         "tags": [
@@ -3679,6 +3704,13 @@
           "lastSeenAt"
         ],
         "properties": {
+          "defaultSaveDir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "对端自报的默认下载目录（经已认证链路获取；旧版对端为 `None`）。"
+          },
           "fingerprint": {
             "type": "string"
           },
@@ -3696,6 +3728,17 @@
           "pairedAt": {
             "type": "integer",
             "format": "int64"
+          },
+          "pathStyle": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PathStyle",
+                "description": "对端自报的路径风格（旧版对端为 `None`，可按 `platform` 推断）。"
+              }
+            ]
           },
           "platform": {
             "type": [
@@ -4129,6 +4172,15 @@
             "type": "string"
           }
         }
+      },
+      "PathStyle": {
+        "type": "string",
+        "description": "设备本地文件路径的书写风格，决定远程下发时保存目录的合法形态。",
+        "enum": [
+          "windows",
+          "posix",
+          "unknown"
+        ]
       },
       "PluginAuthRequest": {
         "type": "object",
@@ -4939,7 +4991,7 @@
       },
       "SiteAuthCredentialDto": {
         "type": "object",
-        "description": "单站点 HTTP Basic 凭据详情；仅由受保护的定向查询返回（`GET\n/api/v1/site-auth/{site}`，须管理 token）。`pass` 是明文密码，不脱敏\n——保留是为了编辑表单可以回填原值；只应用于「打开编辑对话框」这类需要\n原文的场景，不要在列表/日志里回显（L-1；列表接口 [`SiteAuthEntryDto`]\n本就不含 `pass`）。",
+        "description": "单站点 HTTP Basic 凭据详情；仅由受保护的定向查询返回（`GET\n/api/v1/site-auth/{site}`，须管理 token；本机 RPC `daemon.siteAuth.match`）。\n`pass` 是明文密码，不脱敏——保留是为了表单可以回填原值；只应用于编辑对话框 /\n新建下载认证框这类需要原文的场景，不要在列表/日志里回显（L-1；列表接口\n[`SiteAuthEntryDto`] 本就不含 `pass`）。",
         "required": [
           "site",
           "user",

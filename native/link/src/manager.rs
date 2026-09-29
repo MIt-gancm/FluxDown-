@@ -1,14 +1,16 @@
 //! [`LinkManager`] —— 设备互联子系统门面。
 //!
-//! 聚合身份、名册存储、配对协议（响应方 + 发起方）、mDNS 发现、可扩展传输栈，
-//! 供宿主（hub 桌面 / headless server）驱动。宿主只跟本门面 + 一个事件通道打交道。
+//! 聚合身份、名册存储（[`LinkStorage`]）、配对协议（响应方 + 发起方）、mDNS 发现、
+//! 可扩展传输栈，供宿主（hub 桌面 / headless server / agent）驱动。宿主只跟本门面 +
+//! 一个事件通道打交道。
 //!
 //! # 角色
 //! - **响应方**（被添加设备）：生成配对码、处理 `hello`/`confirm`、mDNS 广播。
 //! - **发起方**（正在添加设备）：mDNS 浏览、`begin_pairing`（发 hello、算 SAS）、
 //!   `confirm_pairing`（发 confirm、落库）。
 //! - **数据面**：`dispatch`（把下载下发给已配对设备，先 AEAD 加密再走传输栈）、
-//!   `authorize`（校验入站链路请求的 HMAC 鉴权并解密）。
+//!   `authorize`（校验入站链路请求的 HMAC 鉴权并解密）、`exchange_peer_info`
+//!   （经已认证链路交换默认目录 / 路径风格）。
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -18,18 +20,24 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use tokio::sync::mpsc;
 
+use super::address::PeerAddress;
 use super::crypto::{
     LINK_AUTH_SKEW_SECS, derive_link_aead_key, link_auth_tag, open_link_body, seal_link_body,
     verify_link_auth_tag,
 };
 use super::discovery::{self, MdnsAdvertiser, MdnsBrowser};
 use super::error::{LinkError, LinkResult};
-use super::identity::{IDENTITY_CONFIG_KEY, LinkIdentity};
+use super::identity::LinkIdentity;
 use super::pairing::{HelloRequest, HelloResponse, PairingInitiator, PairingResponder, SelfInfo};
-use super::store::LinkStore;
+use super::storage::LinkStorage;
 use super::transport::TransportStack;
-use super::types::{DiscoveredPeer, PeerCandidate, PeerRecord, TransportKind};
-use crate::db::Db;
+use super::types::{DiscoveredPeer, PeerCandidate, PeerInfo, PeerRecord, TransportKind};
+use super::wire::{self, classify_failure, read_json_object, send_failure};
+
+/// 数据面：经已认证链路交换设备信息的路径（与 `fluxdown_api::routes::API_LINK_INFO` 一致）。
+pub const LINK_INFO_PATH: &str = "/api/v1/link/info";
+/// 数据面：下发下载任务的路径（与 `fluxdown_api::routes::API_LINK_TASKS` 一致）。
+pub const LINK_TASKS_PATH: &str = "/api/v1/link/tasks";
 
 /// 引擎侧设备互联事件（宿主消费：hub 转 rinf 信号，server 可广播 WS）。
 #[derive(Debug, Clone)]
@@ -46,6 +54,8 @@ pub enum LinkEngineEvent {
         sas: String,
         peer_name: String,
         peer_platform: Option<String>,
+        /// 发起方 Ed25519 身份指纹（设备 ID）。
+        peer_fingerprint: String,
     },
     /// 子系统错误（供 UI 提示）。
     Error(String),
@@ -130,20 +140,45 @@ const MAX_DIRECT_CANDIDATES: usize = 4;
 struct PendingInit {
     initiator: PairingInitiator,
     session_id: String,
-    peer_host: String,
-    peer_port: u16,
+    peer: PeerAddress,
     created: std::time::Instant,
+}
+
+/// [`LinkManager`] 的宿主相关选项。
+#[derive(Debug, Clone, Copy)]
+pub struct LinkOptions {
+    /// 本机 fluxdown API 端口（mDNS 广播 + 自报候选用）。
+    pub api_port: u16,
+    /// 本机 API 是否可被局域网内其它设备访问。`false`（如桌面 agent 默认只监听
+    /// 127.0.0.1）时不做 mDNS 广播、配对时也不向对端自报回连地址——那些地址对端
+    /// 根本连不上。
+    pub reachable: bool,
+    /// 是否允许 mDNS 广播（`FLUXDOWN_MDNS=off` 的开关）。`false` 时仍可用配对码 +
+    /// 手动地址配对，只是不在局域网内广播本机。
+    pub advertise: bool,
+}
+
+impl LinkOptions {
+    /// 局域网可达且允许广播（hub / 旧 server 的既有行为）。
+    #[must_use]
+    pub fn reachable(api_port: u16) -> Self {
+        Self {
+            api_port,
+            reachable: true,
+            advertise: true,
+        }
+    }
 }
 
 /// 设备互联门面。宿主持 `Arc<LinkManager>`。
 pub struct LinkManager {
     identity: LinkIdentity,
     self_info: SelfInfo,
-    store: LinkStore,
+    store: Arc<dyn LinkStorage>,
     responder: PairingResponder,
     transport: TransportStack,
     client: reqwest::Client,
-    api_port: u16,
+    options: LinkOptions,
     events: mpsc::Sender<LinkEngineEvent>,
     advertiser: Mutex<Option<MdnsAdvertiser>>,
     browser: Mutex<Option<MdnsBrowser>>,
@@ -164,30 +199,25 @@ pub struct LinkManager {
 }
 
 impl LinkManager {
-    /// 从引擎数据库加载（或首次生成并持久化）本机身份，构造门面。
-    ///
-    /// `api_port` = 本机 fluxdown API 端口（mDNS 广播 + 自报候选用）。
+    /// 从存储加载（或首次生成并持久化）本机身份，构造门面。
     pub async fn load(
-        db: Db,
+        storage: Arc<dyn LinkStorage>,
         self_info: SelfInfo,
-        api_port: u16,
+        options: LinkOptions,
         events: mpsc::Sender<LinkEngineEvent>,
     ) -> LinkResult<Arc<Self>> {
-        let identity = Self::load_or_create_identity(&db).await?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let identity = Self::load_or_create_identity(storage.as_ref()).await?;
+        let client = wire::http_client();
         let responder = PairingResponder::new(identity.clone(), self_info.clone());
         let transport = TransportStack::direct_only(client.clone());
         let mgr = Arc::new(Self {
             identity,
             self_info,
-            store: LinkStore::new(db),
+            store: storage,
             responder,
             transport,
             client,
-            api_port,
+            options,
             events,
             advertiser: Mutex::new(None),
             browser: Mutex::new(None),
@@ -224,16 +254,12 @@ impl LinkManager {
         });
     }
 
-    async fn load_or_create_identity(db: &Db) -> LinkResult<LinkIdentity> {
-        if let Some(b64) = db.get_config(IDENTITY_CONFIG_KEY).await?
-            && let Ok(bytes) = B64.decode(b64.trim())
-            && let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice())
-        {
+    async fn load_or_create_identity(storage: &dyn LinkStorage) -> LinkResult<LinkIdentity> {
+        if let Some(seed) = storage.load_identity_seed().await? {
             return Ok(LinkIdentity::from_secret_bytes(&seed));
         }
         let identity = LinkIdentity::generate();
-        db.set_config(IDENTITY_CONFIG_KEY, &B64.encode(identity.secret_bytes()))
-            .await?;
+        storage.save_identity_seed(&identity.secret_bytes()).await?;
         Ok(identity)
     }
 
@@ -350,14 +376,19 @@ impl LinkManager {
             sas,
             peer_name: req.name.clone(),
             peer_platform: req.platform.clone(),
+            peer_fingerprint: super::crypto::fingerprint(&req.initiator_id_pub),
         };
         tokio::spawn(async move {
             let _ = tx.send(event).await;
         });
     }
 
-    /// 确保 mDNS 广播运行（幂等）。失败仅记 Error 事件，不阻断配对（手动地址可兜底）。
+    /// 确保 mDNS 广播运行（幂等）。本机 API 局域网不可达（[`LinkOptions::reachable`]
+    /// 为 `false`）时不广播。失败仅记 Error 事件，不阻断配对（手动地址可兜底）。
     fn ensure_advertising(&self) {
+        if !self.options.reachable || !self.options.advertise {
+            return;
+        }
         let mut guard = match self.advertiser.lock() {
             Ok(g) => g,
             Err(_) => return,
@@ -366,7 +397,7 @@ impl LinkManager {
             return;
         }
         match MdnsAdvertiser::start(
-            self.api_port,
+            self.options.api_port,
             self.identity.fingerprint(),
             &self.self_info.name,
             self.self_info.platform.as_deref(),
@@ -399,6 +430,11 @@ impl LinkManager {
         }
     }
 
+    /// 停止配对：立即作废当前配对码并停止 mDNS 广播。
+    pub fn stop_pairing(&self) {
+        self.responder.revoke_codes();
+        self.stop_advertising();
+    }
     // ── 发现（发起方侧）───────────────────────────────────────────────────
 
     /// 开始 mDNS 浏览：发现的设备经事件通道以 `Discovered` 汇出，并同步去重
@@ -431,9 +467,12 @@ impl LinkManager {
                 if let Some(fp) = peer.fingerprint.as_deref()
                     && let Ok(Some(record)) = store.get(fp).await
                 {
+                    let Ok(address) = PeerAddress::from_host_port(&peer.host, peer.port) else {
+                        continue;
+                    };
                     let fresh = PeerCandidate {
                         kind: TransportKind::Direct,
-                        address: format!("{}:{}", peer.host, peer.port),
+                        address: address.to_candidate(),
                     };
                     // 保留旧候选作回退，只把新地址去重后放到首位（优先试
                     // 新的，试不通还有旧的）——mDNS 地址来自 `pick_best_v4`
@@ -487,22 +526,25 @@ impl LinkManager {
     }
 
     /// 手动地址探测（mDNS 失效兜底）：`/ping` 一台设备，返回其信息（不配对）。
-    pub async fn probe(&self, host: &str, port: u16) -> LinkResult<DiscoveredPeer> {
-        discovery::probe(&self.client, host, port).await
+    pub async fn probe(&self, address: &PeerAddress) -> LinkResult<DiscoveredPeer> {
+        discovery::probe(&self.client, address).await
     }
 
     // ── 配对（发起方侧）───────────────────────────────────────────────────
 
-    /// 发起配对：向 `host:port` 发送 `hello`（带配对码），返回 `(token, sas, 对端名)`。
+    /// 发起配对：向 `address` 发送 `hello`（带配对码），返回 `(token, sas, 对端名)`。
     /// UI 展示 SAS 供用户与对端核对，随后调 [`confirm_pairing`]。
+    ///
+    /// 错误语义（见 [`crate::wire`]）：网络失败 → [`LinkError::Io`]；对端（或其反代）返回
+    /// 非 FluxDown 的 4xx / 重定向 / HTML → [`LinkError::NotFluxDown`]；只有对端 FluxDown
+    /// 明确回了「配对码无效」才是 [`LinkError::InvalidCode`]。
     pub async fn begin_pairing(
         &self,
-        host: &str,
-        port: u16,
+        address: &PeerAddress,
         code: &str,
     ) -> LinkResult<BeginPairingResult> {
         let mut initiator = PairingInitiator::new(self.identity.clone());
-        let addrs = discovery::local_direct_addrs(host, self.api_port);
+        let addrs = self.self_addrs_towards(address).await;
         let hello = initiator.build_hello(code, &self.self_info, addrs);
 
         let body = serde_json::json!({
@@ -515,34 +557,21 @@ impl LinkManager {
             "appVersion": hello.app_version.clone().unwrap_or_default(),
             "initiatorAddrs": hello.initiator_addrs,
         });
-        let url = format!("http://{host}:{port}/api/v1/link/pair/hello");
         let resp = self
             .client
-            .post(&url)
+            .post(address.url("/api/v1/link/pair/hello"))
             .json(&body)
             .timeout(std::time::Duration::from_secs(8))
             .send()
             .await
-            .map_err(|e| LinkError::Io(e.to_string()))?;
-        // 对端的 4xx 携带了它真正的拒绝理由（错码 / 已被节流 / 自配对 / 坏签名）。
-        // 此前这里把任何 400 都改写成 InvalidCode，把「猜码过多，已节流」伪装成
-        // 「配对码错误」——用户会对着一个其实正确的码一遍遍重试。改为按稳定契约串
-        // 还原对端语义，还原不出来才退回 InvalidCode。
-        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
-            let detail: serde_json::Value = resp.json().await.unwrap_or_default();
-            let message = detail.get("message").and_then(|v| v.as_str()).unwrap_or("");
-            return Err(LinkError::from_wire_message(message).unwrap_or(LinkError::InvalidCode));
-        }
+            .map_err(|e| send_failure(&e))?;
         if !resp.status().is_success() {
-            return Err(LinkError::Unreachable);
+            return Err(classify_failure(resp).await);
         }
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| LinkError::Io(e.to_string()))?;
+        let json = read_json_object(resp).await?;
         let hello_resp = parse_hello_response(&json)?;
 
-        let responder_addr = format!("{host}:{port}");
+        let responder_addr = address.to_candidate();
         let sas = initiator.on_hello_response(&hello_resp, &responder_addr)?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let peer_name = hello_resp.name.clone();
@@ -559,8 +588,7 @@ impl LinkManager {
                 PendingInit {
                     initiator,
                     session_id: hello_resp.session_id.clone(),
-                    peer_host: host.to_string(),
-                    peer_port: port,
+                    peer: address.clone(),
                     created: std::time::Instant::now(),
                 },
             );
@@ -571,6 +599,28 @@ impl LinkManager {
             peer_name,
             peer_fingerprint: super::crypto::fingerprint(&hello_resp.responder_id_pub),
         })
+    }
+
+    /// 本机朝向 `peer` 的可回连地址（`initiatorAddrs`，供对端存为回连候选）。本机 API
+    /// 局域网不可达、或对端是 https 站点（多半是公网反代，回连无意义）时为空。
+    async fn self_addrs_towards(&self, peer: &PeerAddress) -> Vec<String> {
+        if !self.options.reachable || peer.is_https() {
+            return Vec::new();
+        }
+        let host = peer.host();
+        let ip_text = if host.parse::<IpAddr>().is_ok() {
+            host.to_string()
+        } else {
+            // 域名先解析成 IP（下面的出站网卡探测需要 IP）。
+            match tokio::net::lookup_host((host, peer.port())).await {
+                Ok(mut resolved) => resolved
+                    .next()
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
+        };
+        discovery::local_direct_addrs(&ip_text, self.options.api_port)
     }
 
     /// SAS 核对后确认/拒绝配对。`accept=true` 且对端确认成功 → 落库 + 广播 Paired。
@@ -594,13 +644,9 @@ impl LinkManager {
             return Err(LinkError::SessionExpired);
         }
         let body = serde_json::json!({ "sessionId": pending.session_id, "confirm": accept });
-        let url = format!(
-            "http://{}:{}/api/v1/link/pair/confirm",
-            pending.peer_host, pending.peer_port
-        );
         let resp = self
             .client
-            .post(&url)
+            .post(pending.peer.url("/api/v1/link/pair/confirm"))
             .json(&body)
             // 对端响应方现在要等本机用户在 confirm 阶段核验 SAS 并点击批准/
             // 拒绝（PairingResponder::handle_confirm 等待用户决策，上限
@@ -609,17 +655,14 @@ impl LinkManager {
             .timeout(std::time::Duration::from_secs(70))
             .send()
             .await
-            .map_err(|e| LinkError::Io(e.to_string()))?;
+            .map_err(|e| send_failure(&e))?;
         if !resp.status().is_success() {
-            return Err(LinkError::SessionExpired);
+            return Err(classify_failure(resp).await);
         }
         if !accept {
             return Ok(None);
         }
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| LinkError::Io(e.to_string()))?;
+        let json = read_json_object(resp).await?;
         // 对端 confirm 响应体 `{"success":true,"paired":<bool>,"reason":<"rejected"|
         // "timeout"|null>}`。对端用户拒绝与核验超时都是**协议正常终局**，对端以 2xx +
         // `paired=false` 返回（而非 4xx），否则这里的非 2xx 分支会把它们一律压成
@@ -651,6 +694,11 @@ impl LinkManager {
         self.store.list().await
     }
 
+    /// 按指纹读取单台已配对设备。
+    pub async fn get_device(&self, fingerprint: &str) -> LinkResult<Option<PeerRecord>> {
+        self.store.get(fingerprint).await
+    }
+
     /// 解除配对（删除设备），广播 Unpaired。
     pub async fn remove_device(&self, fingerprint: &str) -> LinkResult<bool> {
         let removed = self.store.remove(fingerprint).await?;
@@ -673,7 +721,12 @@ impl LinkManager {
                 let _ = self.store.touch(fingerprint, now_unix()).await;
                 true
             }
-            Err(_) => false,
+            Err(LinkError::Unreachable) => false,
+            Err(error) => {
+                // 身份不符等：不是「暂时离线」，需要留下线索。
+                tracing::warn!(fingerprint, error = %error, "linked device probe rejected");
+                false
+            }
         }
     }
 
@@ -694,50 +747,31 @@ impl LinkManager {
             .store
             .get(fingerprint)
             .await?
-            .ok_or(LinkError::Unauthorized)?;
+            .ok_or(LinkError::NotPaired)?;
         let conn = self.transport.connect(&record).await?;
-        let path = "/api/v1/link/tasks";
-        let ts = now_unix();
-        let nonce = uuid::Uuid::new_v4().simple().to_string();
         // 明文序列化**一次**，加密**一次**——同一份密文字节既用于 HMAC 也
         // 用于发送，保证签名覆盖的字节与对端收到并校验的字节完全一致
         // （Option 空值序列化为 ""，非 null，否则响应方 `LinkTaskRequest`
-        // (非 Option String) 反序列化会 400）。encrypt-then-MAC：先加密、
-        // 再对密文算 HMAC；对端必须按同一顺序校验（先验 HMAC 再解密），
-        // 否则攻击者能在密文没被认证前就篡改，让对端白白解密一次。
+        // (非 Option String) 反序列化会 400）。
         let body_json = serde_json::json!({
             "url": url,
             "saveDir": save_dir.unwrap_or_default(),
             "fileName": file_name.unwrap_or_default(),
         });
         let plaintext = serde_json::to_vec(&body_json).unwrap_or_default();
-        let aead_key = derive_link_aead_key(&record.link_secret);
-        let sealed = seal_link_body(&aead_key, &plaintext);
-        let tag = link_auth_tag(&record.link_secret, "POST", path, ts, &nonce, &sealed);
         let resp = self
-            .client
-            .post(format!("{}{}", conn.base_url, path))
-            .header("X-FluxLink-Device", self.identity.fingerprint())
-            .header("X-FluxLink-Ts", ts.to_string())
-            .header("X-FluxLink-Nonce", nonce)
-            .header("X-FluxLink-Auth", tag)
-            .header("X-FluxLink-Enc", "v1")
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(sealed)
-            .timeout(std::time::Duration::from_secs(15))
-            .send()
-            .await
-            .map_err(|e| LinkError::Io(e.to_string()))?;
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(LinkError::Unauthorized);
-        }
+            .post_sealed(
+                &record,
+                &conn.base_url,
+                LINK_TASKS_PATH,
+                &plaintext,
+                std::time::Duration::from_secs(15),
+            )
+            .await?;
         if !resp.status().is_success() {
-            return Err(LinkError::Io(format!("dispatch failed: {}", resp.status())));
+            return Err(classify_failure(resp).await);
         }
-        let json: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| LinkError::Io(e.to_string()))?;
+        let json = read_json_object(resp).await?;
         let task_id = json
             .get("taskId")
             .and_then(|v| v.as_str())
@@ -746,6 +780,103 @@ impl LinkManager {
             .to_string();
         let _ = self.store.touch(fingerprint, now_unix()).await;
         Ok(task_id)
+    }
+
+    /// 数据面出站请求：对明文 AEAD 加密（[`derive_link_aead_key`] + [`seal_link_body`]），
+    /// 再用每对独立链路密钥对**密文**做 HMAC 鉴权（encrypt-then-MAC），POST 到
+    /// `{base_url}{path}`。对端必须按同一顺序校验（先验 HMAC 再解密），否则攻击者能在
+    /// 密文没被认证前就篡改，让对端白白解密一次。
+    async fn post_sealed(
+        &self,
+        record: &PeerRecord,
+        base_url: &str,
+        path: &str,
+        plaintext: &[u8],
+        timeout: std::time::Duration,
+    ) -> LinkResult<reqwest::Response> {
+        let ts = now_unix();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let aead_key = derive_link_aead_key(&record.link_secret);
+        let sealed = seal_link_body(&aead_key, plaintext);
+        let tag = link_auth_tag(&record.link_secret, "POST", path, ts, &nonce, &sealed);
+        self.client
+            .post(format!("{base_url}{path}"))
+            .header("X-FluxLink-Device", self.identity.fingerprint())
+            .header("X-FluxLink-Ts", ts.to_string())
+            .header("X-FluxLink-Nonce", nonce)
+            .header("X-FluxLink-Auth", tag)
+            .header("X-FluxLink-Enc", "v1")
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(sealed)
+            .timeout(timeout)
+            .send()
+            .await
+            .map_err(|e| send_failure(&e))
+    }
+
+    /// 经已认证链路与对端**交换设备信息**（默认下载目录 / 路径风格）：本机信息 `mine`
+    /// 随请求发给对端（对端据此更新它名册里的本机信息），对端信息随响应回来并写入本机名册。
+    ///
+    /// 请求与响应体都是 AEAD 密文：对端信息无法被局域网嗅探，也无法被中间人伪造。
+    /// 对端不认识该端点（旧版 Flutter hub / 旧 server）→ `Ok(None)`，调用方按「未知」处理。
+    pub async fn exchange_peer_info(
+        &self,
+        fingerprint: &str,
+        mine: &PeerInfo,
+    ) -> LinkResult<Option<PeerInfo>> {
+        let record = self
+            .store
+            .get(fingerprint)
+            .await?
+            .ok_or(LinkError::NotPaired)?;
+        let conn = self.transport.connect(&record).await?;
+        let resp = self
+            .post_sealed(
+                &record,
+                &conn.base_url,
+                LINK_INFO_PATH,
+                &encode_peer_info(mine),
+                std::time::Duration::from_secs(8),
+            )
+            .await?;
+        let status = resp.status();
+        if matches!(status.as_u16(), 404 | 405 | 501) {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(classify_failure(resp).await);
+        }
+        let sealed = resp.bytes().await.map_err(|e| send_failure(&e))?;
+        let aead_key = derive_link_aead_key(&record.link_secret);
+        let Some(info) =
+            open_link_body(&aead_key, &sealed).and_then(|plaintext| decode_peer_info(&plaintext))
+        else {
+            // 不是本链路密钥加密的合法信息包（对端是别的服务 / 旧版本兜底页）。
+            tracing::debug!(fingerprint, "peer info response could not be opened");
+            return Ok(None);
+        };
+        let _ = self.store.set_peer_info(fingerprint, &info).await;
+        let _ = self.store.touch(fingerprint, now_unix()).await;
+        Ok(Some(info))
+    }
+
+    /// 响应端处理已通过 [`Self::authorize`] 的 `POST /api/v1/link/info`：记下请求方自报信息，
+    /// 返回用链路密钥加密的本机信息 `mine`（响应体，`application/octet-stream`）。
+    pub async fn answer_peer_info(
+        &self,
+        request: &LinkRequest,
+        mine: &PeerInfo,
+    ) -> LinkResult<Vec<u8>> {
+        let record = self
+            .store
+            .get(&request.device)
+            .await?
+            .ok_or(LinkError::Unauthorized)?;
+        if let Some(theirs) = decode_peer_info(&request.body) {
+            let _ = self.store.set_peer_info(&request.device, &theirs).await;
+        }
+        let aead_key = derive_link_aead_key(&record.link_secret);
+        Ok(seal_link_body(&aead_key, &encode_peer_info(mine)))
     }
 
     /// 校验入站链路数据面请求：时间戳时窗 → 取设备记录 → 验 HMAC（覆盖
@@ -871,8 +1002,10 @@ fn parse_hello_response(json: &serde_json::Value) -> LinkResult<HelloResponse> {
             .map(str::to_string)
     };
     Ok(HelloResponse {
+        // 没有 sessionId 说明对端根本不是（或不是同版本的）FluxDown 响应方——
+        // 比如反代把请求转给了别的 JSON 服务。
         session_id: get_str("sessionId")
-            .ok_or_else(|| LinkError::BadPayload("missing sessionId".into()))?,
+            .ok_or_else(|| LinkError::NotFluxDown("hello response has no sessionId".into()))?,
         responder_eph_pub: b64_to_array::<32>(json, "responderEphPub")?,
         responder_id_pub: b64_to_array::<32>(json, "responderIdPub")?,
         responder_sig: b64_to_array::<64>(json, "responderSig")?,
@@ -916,27 +1049,62 @@ fn decode_b64_array<const N: usize>(s: &str) -> LinkResult<[u8; N]> {
     <[u8; N]>::try_from(bytes.as_slice()).map_err(|_| LinkError::BadPayload("bad length".into()))
 }
 
+/// 一个字符串字段的长度上限（对端自报值一律不信任，超限即丢弃）。
+const PEER_INFO_MAX_DIR_LEN: usize = 1024;
+
+/// 对端信息的线上形式（加密前的明文 JSON）：`{"v":1,"defaultSaveDir":…,"pathStyle":…}`。
+fn encode_peer_info(info: &PeerInfo) -> Vec<u8> {
+    let mut json = serde_json::json!({ "v": 1 });
+    if let Some(dir) = &info.default_save_dir {
+        json["defaultSaveDir"] = serde_json::Value::String(dir.clone());
+    }
+    if let Some(style) = &info.path_style {
+        json["pathStyle"] = serde_json::Value::String(style.clone());
+    }
+    serde_json::to_vec(&json).unwrap_or_default()
+}
+
+/// 解析对端信息；不是 v1 信息包（含请求方反射回来的其它数据面明文）→ `None`。
+/// 字段一律做长度 / 取值收敛：目录 ≤ 1024 字节且无 NUL，风格只认 `windows` / `posix`。
+fn decode_peer_info(plaintext: &[u8]) -> Option<PeerInfo> {
+    let json: serde_json::Value = serde_json::from_slice(plaintext).ok()?;
+    if json.get("v").and_then(serde_json::Value::as_i64) != Some(1) {
+        return None;
+    }
+    let default_save_dir = json
+        .get("defaultSaveDir")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty() && dir.len() <= PEER_INFO_MAX_DIR_LEN && !dir.contains('\0'))
+        .map(str::to_owned);
+    let path_style = json
+        .get("pathStyle")
+        .and_then(serde_json::Value::as_str)
+        .filter(|style| matches!(*style, "windows" | "posix"))
+        .map(str::to_owned);
+    Some(PeerInfo {
+        default_save_dir,
+        path_style,
+    })
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::link::crypto::{derive_link_aead_key, link_auth_tag, seal_link_body};
+    use crate::crypto::{derive_link_aead_key, link_auth_tag, seal_link_body};
+    use crate::storage::memory::MemoryLinkStorage;
 
     async fn mgr_with_device(secret: Vec<u8>) -> (Arc<LinkManager>, String) {
-        let url = format!(
-            "sqlite:file:linkmgr_{}?mode=memory&cache=shared",
-            uuid::Uuid::new_v4().simple()
-        );
-        let db = Db::connect(&url).await.unwrap();
         let (tx, _rx) = mpsc::channel(8);
         let mgr = LinkManager::load(
-            db,
+            Arc::new(MemoryLinkStorage::default()),
             SelfInfo {
                 name: "me".into(),
                 platform: None,
                 app_version: None,
             },
-            17800,
+            LinkOptions::reachable(17800),
             tx,
         )
         .await
@@ -952,6 +1120,7 @@ mod tests {
                 candidates: vec![],
                 paired_at: 0,
                 last_seen_at: 0,
+                info: PeerInfo::default(),
             })
             .await
             .unwrap();

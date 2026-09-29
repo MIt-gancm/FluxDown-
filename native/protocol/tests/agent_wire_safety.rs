@@ -1,6 +1,6 @@
 use fluxdown_protocol::{
     AgentLoginResult, AgentSessionDto, CloudDevice, CloudUser, CloudUserStatus, Entitlements,
-    GatewayPatchParams, RemoteTaskStatus,
+    GatewayPatchParams,
 };
 use serde_json::json;
 
@@ -31,6 +31,8 @@ fn session() -> AgentSessionDto {
             app_version: Some("1.0.0".to_owned()),
             is_online: true,
             is_current: true,
+            default_save_dir: None,
+            path_style: None,
         },
     }
 }
@@ -73,13 +75,6 @@ fn entitlement_unknown_fields_roundtrip_losslessly() -> Result<(), serde_json::E
     });
     let entitlements = serde_json::from_value::<Entitlements>(input.clone())?;
     assert_eq!(serde_json::to_value(entitlements)?, input);
-    Ok(())
-}
-
-#[test]
-fn unknown_remote_status_falls_back_to_pending() -> Result<(), serde_json::Error> {
-    let status = serde_json::from_value::<RemoteTaskStatus>(json!("futureState"))?;
-    assert_eq!(status, RemoteTaskStatus::Pending);
     Ok(())
 }
 

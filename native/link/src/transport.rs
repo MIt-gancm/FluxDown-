@@ -12,14 +12,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use super::address::PeerAddress;
 use super::error::LinkError;
 use super::types::{PeerRecord, TransportKind};
 
 /// 拨通一台已配对设备后得到的连接句柄。
 ///
-/// v1 Direct 下 `base_url` 即对端 fluxdown API 的 `http://ip:port`；未来 iroh/relay
-/// 变体会把加密隧道封装为一个本地转发的 `base_url`，**数据面调度层只认 base_url**，
-/// 因此新增传输方式对上层零改动。
+/// v1 Direct 下 `base_url` 即对端 fluxdown API 基址（`http(s)://host[:port][/base]`）；
+/// 未来 iroh/relay 变体会把加密隧道封装为一个本地转发的 `base_url`，**数据面调度层只认
+/// base_url**，因此新增传输方式对上层零改动。
 #[derive(Debug, Clone)]
 pub struct PeerConn {
     /// 对端 fluxdown API 基址（不含尾斜杠）。
@@ -42,17 +43,18 @@ pub trait Transport: Send + Sync {
     async fn connect(&self, peer: &PeerRecord) -> Result<PeerConn, LinkError>;
 }
 
-/// 网络可达直连（v1 唯一传输）：拨号首个 Direct 候选 `ip:port` 并 `/ping` 探活。
+/// 网络可达直连（v1 唯一传输）：拨号 Direct 候选（`ip:port` 或完整 URL）并 `/ping` 探活。
 ///
-/// **不使用任何 NAT 穿透**——仅适用于双方网络互相可达（同局域网 / 已配端口转发）。
-/// 跨网穿透留给未来的 iroh/relay 传输。
+/// **不使用任何 NAT 穿透**——仅适用于双方网络互相可达（同局域网 / 已配端口转发 /
+/// 公网反代）。跨网穿透留给未来的 iroh/relay 传输。
 pub struct DirectTransport {
     client: reqwest::Client,
     probe_timeout: Duration,
 }
 
 impl DirectTransport {
-    /// 用给定 HTTP 客户端构造（客户端应配 `.no_proxy()`，回环/局域网直连不走代理）。
+    /// 用给定 HTTP 客户端构造（客户端应配 `.no_proxy()` 且不跟随重定向，见
+    /// [`crate::wire::http_client`]）。
     #[must_use]
     pub fn new(client: reqwest::Client) -> Self {
         Self {
@@ -75,28 +77,56 @@ impl Transport for DirectTransport {
     async fn connect(&self, peer: &PeerRecord) -> Result<PeerConn, LinkError> {
         // 依次尝试全部 Direct 候选而非只试第一个：候选列表现在可能同时
         // 保留 mDNS 新发现的地址（未探测、纯启发式排序，见
-        // `crate::link::discovery::pick_best_v4` 文档）与配对时验证过的
+        // `crate::discovery::pick_best_v4` 文档）与配对时验证过的
         // 旧地址——只试首个会让一次误选直接判死本该可达的设备。任一候选
         // 连通即返回；全部候选都失败才 `Unreachable`。
+        //
+        // 每个候选失败的**根因**（DNS / 连接被拒 / TLS / 非 2xx / 非 JSON）都记进日志，
+        // 不再被 `continue` 吞掉——「设备显示离线」时才有线索可查。
         for candidate in peer
             .candidates
             .iter()
             .filter(|c| c.kind == TransportKind::Direct)
         {
             let addr = candidate.address.as_str();
-            let base_url = format!("http://{addr}");
+            let address = match PeerAddress::parse(addr) {
+                Ok(address) => address,
+                Err(error) => {
+                    tracing::debug!(
+                        fingerprint = %peer.fingerprint,
+                        candidate = addr,
+                        error = %error,
+                        "skipping unparsable link candidate"
+                    );
+                    continue;
+                }
+            };
             // 直连以 /ping 探活判定可达；失败即视为该候选不可达，试下一个。
-            let ping = format!("{base_url}/ping");
-            let Ok(resp) = self
+            let resp = match self
                 .client
-                .get(&ping)
+                .get(address.url("/ping"))
                 .timeout(self.probe_timeout)
                 .send()
                 .await
-            else {
-                continue;
+            {
+                Ok(resp) => resp,
+                Err(error) => {
+                    tracing::debug!(
+                        fingerprint = %peer.fingerprint,
+                        candidate = addr,
+                        error = %super::wire::error_chain(&error),
+                        "link candidate probe failed"
+                    );
+                    continue;
+                }
             };
             if !resp.status().is_success() {
+                tracing::debug!(
+                    fingerprint = %peer.fingerprint,
+                    candidate = addr,
+                    status = %resp.status(),
+                    "link candidate /ping returned a non-success status"
+                );
                 continue;
             }
             // TOFU 身份复核（`PeerRecord::identity_pub` 文档承诺的「后续
@@ -107,12 +137,21 @@ impl Transport for DirectTransport {
             // 立即上抛终止整条尝试链，不能继续试其它候选——否则攻击者能
             // 靠混入一个抢答的候选，把本该立即中止的身份冒充错误悄悄
             // 降级成一次普通的「不可达，换个候选」。
-            let Ok(body) = resp.json::<serde_json::Value>().await else {
-                continue;
+            let body = match resp.json::<serde_json::Value>().await {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::debug!(
+                        fingerprint = %peer.fingerprint,
+                        candidate = addr,
+                        error = %super::wire::error_chain(&error),
+                        "link candidate /ping body is not JSON"
+                    );
+                    continue;
+                }
             };
             verify_ping_identity(&body, &peer.fingerprint, addr)?;
             return Ok(PeerConn {
-                base_url,
+                base_url: address.base_url(),
                 kind: TransportKind::Direct,
             });
         }
@@ -189,7 +228,7 @@ impl TransportStack {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::link::types::{PeerCandidate, PeerRecord};
+    use crate::types::{PeerCandidate, PeerInfo, PeerRecord};
 
     fn peer_with(candidates: Vec<PeerCandidate>) -> PeerRecord {
         PeerRecord {
@@ -201,6 +240,7 @@ mod tests {
             candidates,
             paired_at: 0,
             last_seen_at: 0,
+            info: PeerInfo::default(),
         }
     }
 

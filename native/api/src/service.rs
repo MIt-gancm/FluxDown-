@@ -392,10 +392,11 @@ pub trait ApiHost: Send + Sync {
 
     /// 处理入站配对 `hello`（无 token 鉴权，由一次性配对码守卫）。
     ///
-    /// `source`：发起方的真实客户端地址（HTTP 层从 `ConnectInfo` 提取，取不到传
-    /// `None`）；透传给引擎侧节流器做按来源分桶计数，而非全局计数——避免一个
-    /// 恶意源的失败尝试连坐封锁同网段内所有正常用户的配对。局域网直连场景不
-    /// 解析 `X-Forwarded-For`（本功能设计上不支持反代部署）。
+    /// `source`：发起方的真实客户端地址（HTTP 层提取：默认取 `ConnectInfo` 的对端 IP；
+    /// 仅当对端是 [`ApiHost::link_trusted_proxy`] 认可的反代时才采信
+    /// `X-Forwarded-For` / `X-Real-IP`，取不到传 `None`）；透传给节流器做按来源
+    /// 分桶计数，而非全局计数——避免一个恶意源的失败尝试连坐封锁同网段内所有正常
+    /// 用户的配对，也避免反代后所有请求落进同一个桶。
     async fn link_pair_hello(
         &self,
         req: LinkPairHelloRequest,
@@ -430,6 +431,21 @@ pub trait ApiHost: Send + Sync {
     async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<String, ApiError> {
         let _ = (auth, body);
         Err(link_unsupported())
+    }
+
+    /// 已配对设备经已认证链路交换设备信息：校验 `auth`（同 [`ApiHost::link_create_task`]），
+    /// 记下请求方自报信息，返回用链路密钥加密的本机信息（响应体原样二进制回给对端）。
+    /// 默认不支持（旧版宿主没有该端点，对端按「未知」处理）。
+    async fn link_peer_info(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        let _ = (auth, body);
+        Err(link_unsupported())
+    }
+
+    /// `peer` 是否是可信反向代理：是则 [`ApiHost::link_pair_hello`] 的来源地址取
+    /// `X-Forwarded-For` / `X-Real-IP`。默认只信回环（同机反代）；明确配置了反代地址
+    /// 的宿主（如 Docker 桥接网络里的 nginx）覆盖它。
+    fn link_trusted_proxy(&self, peer: std::net::IpAddr) -> bool {
+        peer.is_loopback()
     }
 
     /// 生成一次性配对码（供 headless 设备经 web/CLI 出示）。默认不支持。

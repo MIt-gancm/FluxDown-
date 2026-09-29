@@ -13,7 +13,7 @@
 //! 安全模型详见 [`crate::auth`] 模块文档。
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -358,7 +358,8 @@ fn register_core(state: AppState) -> Router<AppState> {
     router = router
         .route(routes::API_LINK_PAIR_HELLO, post(api_link_pair_hello))
         .route(routes::API_LINK_PAIR_CONFIRM, post(api_link_pair_confirm))
-        .route(routes::API_LINK_TASKS, post(api_link_create_task));
+        .route(routes::API_LINK_TASKS, post(api_link_create_task))
+        .route(routes::API_LINK_INFO, post(api_link_info));
     if state.config.route_registered(RouteGroup::Management) {
         router = router
             .route(routes::API_INFO, get(api_info))
@@ -556,7 +557,10 @@ async fn route_group_guard(
     } else if path.starts_with(routes::API_PREFIX)
         && !matches!(
             path,
-            routes::API_LINK_PAIR_HELLO | routes::API_LINK_PAIR_CONFIRM | routes::API_LINK_TASKS
+            routes::API_LINK_PAIR_HELLO
+                | routes::API_LINK_PAIR_CONFIRM
+                | routes::API_LINK_TASKS
+                | routes::API_LINK_INFO
         )
     {
         Some(RouteGroup::Management)
@@ -671,14 +675,17 @@ pub(crate) async fn api_link_pair_hello(
     // 在某个 serve 站点没挂 `into_make_service_with_connect_info` 时会直接拒绝请求，
     // 把「忘配置」放大成「配对功能整体不可用」；而 axum 0.8 的 `Option<ConnectInfo<_>>`
     // 并不满足 `OptionalFromRequestParts`，无法直接写成可选提取器。拿不到就传 None，
-    // 引擎侧节流器落 "unknown" 分桶，不阻断主流程。
+    // 节流器落 "unknown" 分桶，不阻断主流程。
     //
-    // 取的是 TCP 层真实对端地址，不解析 `X-Forwarded-For`——本功能面向局域网直连，
-    // 反代场景不在设计内，仓库里也没有解析 XFF 的既有惯例，引入反而给伪造来源留后门。
-    let source = parts
+    // 来源默认取 TCP 层真实对端地址；只有对端是宿主明确认可的反代（默认仅回环）时才采信
+    // `X-Forwarded-For` / `X-Real-IP`——否则任何局域网主机都能伪造来源绕开单来源节流，
+    // 而反代后的所有请求又会因为都来自反代地址而共用一个桶。
+    let peer = parts
         .extensions
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ConnectInfo(addr)| addr.ip());
+    let source =
+        effective_link_source(peer, &parts.headers, |ip| state.host.link_trusted_proxy(ip));
     match state.host.link_pair_hello(req, source).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => e.into_response(),
@@ -748,6 +755,83 @@ pub(crate) async fn api_link_create_task(
         Ok(task_id) => Json(CreatedTask { task_id }).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// 从 `X-FluxLink-*` 头取链路鉴权凭据；缺少设备指纹或标签返回 `None`。
+fn link_auth_from_headers(headers: &HeaderMap) -> Option<LinkAuth> {
+    let h = |k: &str| headers.get(k).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let auth = LinkAuth {
+        device: h("x-fluxlink-device").to_string(),
+        ts: h("x-fluxlink-ts").parse::<i64>().unwrap_or(0),
+        nonce: h("x-fluxlink-nonce").to_string(),
+        tag: h("x-fluxlink-auth").to_string(),
+        enc: h("x-fluxlink-enc").to_string(),
+    };
+    if auth.device.is_empty() || auth.tag.is_empty() {
+        None
+    } else {
+        Some(auth)
+    }
+}
+
+/// 已配对设备经已认证链路交换设备信息（默认下载目录 / 路径风格）。
+#[utoipa::path(post, path = "/api/v1/link/info", tag = "link",
+    description = "数据面：已配对设备交换设备信息（默认下载目录 / 路径风格）。**无 management token**，鉴权靠 `X-FluxLink-*` 头（同 `/api/v1/link/tasks`）。请求体与响应体都是 AEAD 密文（`application/octet-stream`）；旧版对端没有该端点（404）。",
+    responses(
+        (status = 200, description = "用链路密钥加密的本机信息（二进制）"),
+        (status = 401, description = "缺少/无效链路鉴权头", body = fluxdown_protocol::daemon::ResultMessage),
+    )
+)]
+pub(crate) async fn api_link_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(auth) = link_auth_from_headers(&headers) else {
+        return result_response(StatusCode::UNAUTHORIZED, false, "missing link auth headers");
+    };
+    match state.host.link_peer_info(auth, body.to_vec()).await {
+        Ok(sealed) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            sealed,
+        )
+            .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// 配对 `hello` 的节流来源：默认是 TCP 层对端地址；对端被 `trusted` 判定为反向代理时，
+/// 改取转发头里的真实客户端——`X-Forwarded-For` 从右往左跳过可信反代自己追加的跳数，
+/// 第一个非可信 IP 即客户端（最左值由客户端自报，可伪造，不取）；没有 XFF 时取
+/// `X-Real-IP`；都没有回落到对端本身。拿不到对端地址返回 `None`。
+fn effective_link_source(
+    peer: Option<IpAddr>,
+    headers: &HeaderMap,
+    trusted: impl Fn(IpAddr) -> bool,
+) -> Option<IpAddr> {
+    let peer = peer?;
+    if !trusted(peer) {
+        return Some(peer);
+    }
+    let header_text = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(chain) = header_text("x-forwarded-for") {
+        for hop in chain.rsplit(',') {
+            if let Ok(ip) = hop.trim().parse::<IpAddr>()
+                && !trusted(ip)
+            {
+                return Some(ip);
+            }
+        }
+    }
+    if let Some(real) = header_text("x-real-ip")
+        && let Ok(ip) = real.trim().parse::<IpAddr>()
+    {
+        return Some(ip);
+    }
+    Some(peer)
 }
 
 /// 生成一次性配对码（**需 management token**）。供 web/CLI 让 headless 设备出示。
@@ -2417,6 +2501,55 @@ async fn openapi_spec() -> Response {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, HeaderValue::from_str(value).unwrap());
+        }
+        map
+    }
+
+    #[test]
+    fn link_source_ignores_forwarded_headers_from_untrusted_peers() {
+        // 局域网主机伪造 XFF 不能改变节流来源。
+        let peer: IpAddr = "192.168.1.9".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "10.9.9.9")]);
+        assert_eq!(
+            effective_link_source(Some(peer), &h, |ip| ip.is_loopback()),
+            Some(peer)
+        );
+    }
+
+    #[test]
+    fn link_source_uses_forwarded_client_behind_trusted_proxy() {
+        let proxy: IpAddr = "127.0.0.1".parse().unwrap();
+        let client: IpAddr = "203.0.113.7".parse().unwrap();
+        let h = headers(&[("x-forwarded-for", "198.51.100.1, 203.0.113.7")]);
+        // 取最靠近可信反代的一跳（右起第一个非可信 IP），而不是客户端可伪造的最左值。
+        assert_eq!(
+            effective_link_source(Some(proxy), &h, |ip| ip.is_loopback()),
+            Some(client)
+        );
+        // 反代自己追加的可信跳数被跳过。
+        let chain = headers(&[("x-forwarded-for", "203.0.113.7, 10.0.0.2")]);
+        assert_eq!(
+            effective_link_source(Some(proxy), &chain, |ip| ip.is_loopback()
+                || ip == "10.0.0.2".parse::<IpAddr>().unwrap()),
+            Some(client)
+        );
+        // x-real-ip 兜底；都没有则回落到对端本身。
+        let real = headers(&[("x-real-ip", "203.0.113.7")]);
+        assert_eq!(
+            effective_link_source(Some(proxy), &real, |ip| ip.is_loopback()),
+            Some(client)
+        );
+        assert_eq!(
+            effective_link_source(Some(proxy), &HeaderMap::new(), |ip| ip.is_loopback()),
+            Some(proxy)
+        );
+        assert_eq!(effective_link_source(None, &h, |_| true), None);
+    }
 
     #[test]
     fn from_config_map_reads_all_keys_including_new_subswitches() {

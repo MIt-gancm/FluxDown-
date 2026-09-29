@@ -9,6 +9,9 @@ use fluxdown_protocol::{
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+/// 广播队列容量（每个订阅者独立滞后判定）。
+const EVENT_CAPACITY: usize = 8192;
+
 struct AgentEventState {
     epoch: String,
     sequence: u64,
@@ -25,7 +28,9 @@ pub struct AgentEventHub {
 impl AgentEventHub {
     #[must_use]
     pub fn new(snapshot: AgentSnapshot) -> Self {
-        let (events, _) = broadcast::channel(1024);
+        // 慢连接（网络 RPC 在途 / 网络抖动）期间事件会在广播队列里排队；容量溢出会让该连接
+        // 以 4009 event-gap 断线重连并重拉快照。任务进度事件较密，留足余量。
+        let (events, _) = broadcast::channel(EVENT_CAPACITY);
         Self {
             state: Arc::new(Mutex::new(AgentEventState {
                 epoch: Uuid::new_v4().to_string(),

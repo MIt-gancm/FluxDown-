@@ -1,18 +1,32 @@
-//! daemon legacy 设备链接身份的一次性导入与 agent 私有信任状态。
+//! 局域网设备互联（L1）与 daemon legacy 数据的一次性导入。
+//!
+//! - [`LinkService`]（`link/service.rs`）：装配 `fluxdown_link::LinkManager`，实现响应端路由、
+//!   发现 / 配对 / 下发 / 在线探测与全部 `agent.link.*` 方法。
+//! - [`AgentLinkStorage`]（`link/storage.rs`）：本机身份与已配对名册落在 agent 私有状态文件。
+//! - 本文件：旧宿主（daemon）里的身份 / 名册 / UI Gateway 设置只在首次启动时迁入一次。
+
+mod service;
+mod storage;
+#[cfg(test)]
+mod tests;
 
 use std::sync::Arc;
 
-use base64::Engine as _;
-use ed25519_dalek::SigningKey;
 use fluxdown_protocol::{
-    AgentEvent, GatewayMigrationExport, LinkDeviceInfo, LinkMigrationExport, MigrationAckParams,
+    AgentEvent, GatewayMigrationExport, LinkMigrationExport, MigrationAckParams,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::daemon_client::DaemonClient;
 use crate::event_hub::AgentEventHub;
 use crate::state::{AgentState, StateStore};
+
+pub use service::{
+    DaemonTaskCreator, ErrorContext, LinkOpError, LinkService, LinkServiceParts, LinkTaskCreator,
+    lan_base_urls, resolve_receive_dir, rpc_error, rpc_value,
+};
+pub use storage::{AgentLinkStorage, device_info, public_devices};
 
 pub async fn migrate_legacy_state(
     daemon: &DaemonClient,
@@ -24,6 +38,8 @@ pub async fn migrate_legacy_state(
     migrate_gateway(daemon, state, store, events).await
 }
 
+/// 导入 daemon 时代的设备身份与已配对名册。daemon 里没有身份（全新安装）时什么都不写：
+/// 身份由 [`LinkService::start`] 在迁移完成后首次生成，避免与迁移互相覆盖。
 async fn migrate_link(
     daemon: &DaemonClient,
     state: &Arc<Mutex<AgentState>>,
@@ -42,18 +58,13 @@ async fn migrate_link(
     let export = match export {
         Ok(export) => export,
         Err(error) if error.code == fluxdown_protocol::ApplicationErrorCode::NotFound => {
-            ensure_identity(state, store).await?;
             return Ok(());
         }
         Err(error) => return Err(LinkMigrationError::Daemon(error)),
     };
     {
         let mut state = state.lock().await;
-        state.link_identity = if export.identity.is_null() {
-            Some(generate_identity())
-        } else {
-            Some(export.identity)
-        };
+        state.link_identity = (!export.identity.is_null()).then_some(export.identity);
         state.linked_devices = export.roster;
         state.link_migration_revision = Some(export.revision);
         store.save(&state).await?;
@@ -116,52 +127,6 @@ async fn migrate_gateway(
         .await
         .map_err(LinkMigrationError::Daemon)?;
     Ok(())
-}
-
-async fn ensure_identity(
-    state: &Arc<Mutex<AgentState>>,
-    store: &StateStore,
-) -> Result<(), LinkMigrationError> {
-    let mut state = state.lock().await;
-    if state.link_identity.is_none() {
-        state.link_identity = Some(generate_identity());
-        store.save(&state).await?;
-    }
-    Ok(())
-}
-
-fn generate_identity() -> Value {
-    let secret = rand::random::<[u8; 32]>();
-    let signing = SigningKey::from_bytes(&secret);
-    json!({
-        "secretB64": base64::engine::general_purpose::STANDARD.encode(secret),
-        "publicB64": base64::engine::general_purpose::STANDARD.encode(signing.verifying_key().to_bytes()),
-    })
-}
-
-#[must_use]
-pub fn public_devices(state: &AgentState) -> Vec<LinkDeviceInfo> {
-    state
-        .linked_devices
-        .iter()
-        .filter_map(|value| {
-            Some(LinkDeviceInfo {
-                fingerprint: value.get("fingerprint")?.as_str()?.to_owned(),
-                name: value
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                platform: value
-                    .get("platform")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                online: false,
-                paired_at: value.get("pairedAt").and_then(Value::as_i64).unwrap_or(0),
-                last_seen_at: value.get("lastSeenAt").and_then(Value::as_i64).unwrap_or(0),
-            })
-        })
-        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]

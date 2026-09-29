@@ -1163,6 +1163,12 @@ pub struct LinkDeviceInfo {
     pub online: bool,
     pub paired_at: i64,
     pub last_seen_at: i64,
+    /// 对端自报的默认下载目录（经已认证链路获取；旧版对端为 `None`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_save_dir: Option<String>,
+    /// 对端自报的路径风格（旧版对端为 `None`，可按 `platform` 推断）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_style: Option<crate::agent::PathStyle>,
 }
 
 /// 发现快照响应（`GET /api/v1/link/discovered`）。

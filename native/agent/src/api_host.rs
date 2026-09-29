@@ -2,10 +2,10 @@
 //!
 //! 兼容 API（`/api/v1/*`、`/jsonrpc`、`/mcp`）与官方客户端共用同一个 daemon：这里不持有
 //! 任何下载事实，只做 wire 适配（错误码映射、DTO 组装、aria2 通知事件源）。设备互联
-//! （配对 / 发现 / 下发）在 agent 与 daemon 里都没有实现，相应方法沿用 trait 的
-//! 「不支持」默认实现，不做假成功。
+//! （配对 / 发现 / 下发 / 数据面路由）委托给 [`LinkService`]，不在这里持有状态。
 
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
@@ -14,11 +14,13 @@ use fluxdown_protocol::method;
 use fluxdown_protocol::{
     ApplicationErrorCode, ChangeTaskUrlParams, CreateGroupRequest, CreateGroupResponse,
     CreateTaskRequest, DaemonConfigPatch, DaemonCreateTaskParams, DownloadRequest, GroupDto,
-    InstallPluginDevRequest, InstalledPlugin, LinkDeviceInfo, MarketEntryDto, MarketInstallRequest,
-    PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto, ResolvePreviewRequest,
-    ResolvePreviewResponse, RpcErrorObject, RssItemActionRequest, RssItemDto, RssSourceDto,
-    RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto, SiteAuthEntryDto,
-    SiteAuthGetParams, SiteAuthSaveRequest, TaskDto,
+    InstallPluginDevRequest, InstalledPlugin, LinkAuth, LinkCodeResponse, LinkDeviceInfo,
+    LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome, LinkPairConfirmRequest,
+    LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo, MarketEntryDto,
+    MarketInstallRequest, PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto,
+    ResolvePreviewRequest, ResolvePreviewResponse, RpcErrorObject, RssItemActionRequest,
+    RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto,
+    SiteAuthEntryDto, SiteAuthGetParams, SiteAuthSaveRequest, TaskDto,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -28,6 +30,7 @@ use tokio::sync::broadcast;
 use crate::capture::{BlobError, BlobKind, CaptureError, CaptureService, DaemonBlobClient};
 use crate::daemon_client::DaemonClient;
 use crate::event_hub::AgentEventHub;
+use crate::link::LinkService;
 use crate::task_events::TaskEventHub;
 
 pub struct AgentApiHost {
@@ -35,6 +38,7 @@ pub struct AgentApiHost {
     events: AgentEventHub,
     capture: Arc<CaptureService>,
     blobs: Arc<DaemonBlobClient>,
+    link: Arc<LinkService>,
     task_events: TaskEventHub,
     /// `/ping` 的 `language` 回退值（server 模式的 `FLUXDOWN_LANG`，已归一化为 en/zh）。
     default_language: Option<String>,
@@ -51,6 +55,7 @@ impl AgentApiHost {
         events: AgentEventHub,
         capture: Arc<CaptureService>,
         blobs: Arc<DaemonBlobClient>,
+        link: Arc<LinkService>,
         default_language: Option<String>,
     ) -> Self {
         let task_events = TaskEventHub::spawn(&events);
@@ -59,6 +64,7 @@ impl AgentApiHost {
             events,
             capture,
             blobs,
+            link,
             task_events,
             default_language,
             missing_components: Mutex::new(HashMap::new()),
@@ -497,15 +503,98 @@ impl ApiHost for AgentApiHost {
         self.rpc(method::DAEMON_RSS_VALIDATE, request).await
     }
 
-    // -- 设备互联：agent/daemon 均无配对、发现、下发实现 --
-    //
-    // 仅 `link_devices` 有真实数据源：agent 持有的已迁移设备名册（`linked_devices`，
-    // 只读，`online` 恒为 false）。其余方法沿用 trait 默认的 `link_unsupported`。
+    // -- 设备互联（局域网直连 L1）：全部交给 `LinkService` --
+
+    async fn link_ping_info(&self) -> Option<LinkPingInfo> {
+        self.link.api_ping_info()
+    }
+
+    async fn link_pair_hello(
+        &self,
+        req: LinkPairHelloRequest,
+        source: Option<IpAddr>,
+    ) -> Result<LinkPairHelloResponse, ApiError> {
+        self.link.api_pair_hello(req, source).await
+    }
+
+    async fn link_pair_confirm(
+        &self,
+        req: LinkPairConfirmRequest,
+    ) -> Result<LinkPairConfirmOutcome, ApiError> {
+        self.link.api_pair_confirm(req).await
+    }
+
+    async fn link_approve_incoming(&self, session_id: &str, accept: bool) -> Result<(), ApiError> {
+        self.link.api_approve(session_id, accept)
+    }
+
+    async fn link_create_task(&self, auth: LinkAuth, body: Vec<u8>) -> Result<String, ApiError> {
+        self.link.api_create_task(auth, body).await
+    }
+
+    async fn link_peer_info(&self, auth: LinkAuth, body: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        self.link.api_peer_info(auth, body).await
+    }
+
+    fn link_trusted_proxy(&self, peer: IpAddr) -> bool {
+        self.link.trusted_proxy(peer)
+    }
+
+    async fn link_generate_code(&self) -> Result<LinkCodeResponse, ApiError> {
+        self.link.api_generate_code()
+    }
+
+    async fn link_stop_advertising(&self) -> Result<(), ApiError> {
+        self.link.api_stop_advertising()
+    }
+
+    async fn link_discovery(&self, start: bool) -> Result<(), ApiError> {
+        self.link.api_discovery(start)
+    }
+
+    async fn link_discovered(&self) -> Result<Vec<LinkDiscoveredPeer>, ApiError> {
+        self.link.api_discovered()
+    }
+
+    async fn link_probe(&self, host: &str, port: u16) -> Result<LinkDiscoveredPeer, ApiError> {
+        self.link.api_probe(host, port).await
+    }
+
+    async fn link_pair_begin(
+        &self,
+        host: &str,
+        port: u16,
+        code: &str,
+    ) -> Result<LinkPairBeginResponse, ApiError> {
+        self.link.api_pair_begin(host, port, code).await
+    }
+
+    async fn link_pair_finish(
+        &self,
+        token: &str,
+        accept: bool,
+    ) -> Result<Option<LinkDeviceInfo>, ApiError> {
+        self.link.api_pair_finish(token, accept).await
+    }
 
     async fn link_devices(&self) -> Result<Vec<LinkDeviceInfo>, ApiError> {
-        Ok(self
-            .events
-            .inspect(|snapshot| snapshot.linked_devices.clone()))
+        self.link.api_devices().await
+    }
+
+    async fn link_remove_device(&self, fingerprint: &str) -> Result<bool, ApiError> {
+        self.link.api_remove_device(fingerprint).await
+    }
+
+    async fn link_dispatch(
+        &self,
+        fingerprint: &str,
+        url: &str,
+        save_dir: Option<&str>,
+        file_name: Option<&str>,
+    ) -> Result<String, ApiError> {
+        self.link
+            .api_dispatch(fingerprint, url, save_dir, file_name)
+            .await
     }
 }
 
@@ -516,7 +605,7 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// daemon JSON-RPC 错误 → 兼容 API 错误。业务消息原样保留，客户端据此做 i18n / 诊断。
-fn object_error(error: RpcErrorObject) -> ApiError {
+pub(crate) fn object_error(error: RpcErrorObject) -> ApiError {
     let message = error.message;
     match error.data.map(|data| data.code) {
         Some(ApplicationErrorCode::Unauthorized) => ApiError::Unauthorized,

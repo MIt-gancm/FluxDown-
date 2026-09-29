@@ -16,22 +16,17 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.22"
-chacha20poly1305 = "0.10"
 directories = "6"
-ed25519-dalek = "3.0.0"
 fluxdown_api = { version = "0.1.0", path = "../api" }
+fluxdown_link = { version = "0.1.0", path = "../link" }
 fluxdown_protocol = { path = "../protocol" }
 fluxdown_ui_i18n = { version = "0.1.0", path = "../../crates/i18n", optional = true }
 fs2 = "0.4.3"
 futures-util = "0.3.32"
-hkdf = "0.12"
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
 keepawake = "0.6"
-mdns-sd = "0.20.2"
 mimalloc = "0.1.52"
-rand = "0.9"
 regex = "1"
-reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1"
 tao = { version = "0.37", default-features = false, optional = true }
@@ -43,14 +38,20 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 tray-icon = { version = "0.24.2", default-features = false, features = ["gtk"], optional = true }
 uuid = { version = "1.23.4", features = ["v4", "serde"] }
-x25519-dalek = { version = "3", features = ["static_secrets", "zeroize"] }
 
 # macOS 通知经系统 osascript 投递（见 src/notification.rs）：notify-rust 的 macOS 后端走
 # 已被新版系统拒收的 NSUserNotification，只在 Windows / Linux 使用。
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4.11"
 
+# TLS 后端按平台区分（对齐 engine）：Windows 用系统 Schannel（reqwest 默认 native-tls）；
+# 其余平台用 rustls，native roots 保留本地 CA，bundled WebPKI roots 作公共 CA 兜底——
+# NAS / 精简发行版的系统根证书缺失时 FluxCloud HTTPS 也不会全部 UnknownIssuer。
+[target.'cfg(not(windows))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "charset", "http2", "system-proxy", "macos-system-configuration", "rustls-tls-native-roots", "rustls-tls-webpki-roots"] }
+
 [target.'cfg(windows)'.dependencies]
+reqwest = { version = "0.12", features = ["json", "stream"] }
 # ShellExecuteW("open")：open/reveal 回退的标准「打开」调用（见 platform/mod.rs）
 # Win32_UI_Shell_Common：SHParseDisplayName / SHOpenFolderAndSelectItems（ITEMIDLIST 类型，见 platform/mod.rs）
 # 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容

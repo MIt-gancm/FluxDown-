@@ -23,8 +23,10 @@ use std::time::Duration;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 
+use super::address::PeerAddress;
 use super::error::{LinkError, LinkResult};
 use super::types::{DiscoveredPeer, DiscoveryKind};
+use super::wire::{classify_failure, read_json_object, send_failure};
 
 /// FluxDown 局域网服务类型（DNS-SD）。
 pub const SERVICE_TYPE: &str = "_fluxdown._tcp.local.";
@@ -160,7 +162,7 @@ fn resolved_to_peer(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
 /// **启发式，可能选错**：这只是「多个网段里挑一个最可能通」的经验排序，
 /// 从未实际探测任何一个候选地址的可达性（不发包、不比对指纹）。调用方
 /// ——尤其是刷新**已配对设备**回连候选的路径（见
-/// `crate::link::manager::LinkManager::start_discovery`）——必须把这里
+/// `crate::manager::LinkManager::start_discovery`）——必须把这里
 /// 选出的地址当作「值得优先一试」而非「确认可达」，保留原有候选作为
 /// 回退，不能直接覆盖掉配对时验证过的旧地址。
 #[must_use]
@@ -188,23 +190,28 @@ fn pick_best_v4(addrs: &[Ipv4Addr]) -> Option<Ipv4Addr> {
         .copied()
 }
 
-/// 手动地址探测：GET `http://host:port/ping`，解析设备身份/名称/平台/版本。
-/// 供「本地配对」的「手动输入地址」兜底路径（Docker bridge / AP 隔离等 mDNS 失效场景）。
-pub async fn probe(client: &reqwest::Client, host: &str, port: u16) -> LinkResult<DiscoveredPeer> {
-    let url = format!("http://{host}:{port}/ping");
+/// 手动地址探测：GET `{base}/ping`，解析设备身份/名称/平台/版本。
+/// 供「本地配对」的「手动输入地址」兜底路径（Docker bridge / AP 隔离等 mDNS 失效场景），
+/// 地址可以是 https / 域名 / 带反代子路径（见 [`PeerAddress`]）。
+///
+/// 错误语义：网络失败 → [`LinkError::Io`]（带完整根因）；对端（或反代）返回的不是
+/// FluxDown `/ping` 应答 → [`LinkError::NotFluxDown`]。
+pub async fn probe(client: &reqwest::Client, address: &PeerAddress) -> LinkResult<DiscoveredPeer> {
     let resp = client
-        .get(&url)
+        .get(address.url("/ping"))
         .timeout(Duration::from_secs(3))
         .send()
         .await
-        .map_err(|e| LinkError::Io(e.to_string()))?;
+        .map_err(|e| send_failure(&e))?;
     if !resp.status().is_success() {
-        return Err(LinkError::Unreachable);
+        return Err(classify_failure(resp).await);
     }
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| LinkError::Io(e.to_string()))?;
+    let json = read_json_object(resp).await?;
+    if json.get("app").and_then(|v| v.as_str()) != Some("FluxDown") {
+        return Err(LinkError::NotFluxDown(
+            "/ping response is not from FluxDown".into(),
+        ));
+    }
     let get = |k: &str| {
         json.get(k)
             .and_then(|v| v.as_str())
@@ -213,10 +220,10 @@ pub async fn probe(client: &reqwest::Client, host: &str, port: u16) -> LinkResul
     };
     Ok(DiscoveredPeer {
         fingerprint: get("linkFingerprint"),
-        name: get("linkName").unwrap_or_else(|| host.to_string()),
+        name: get("linkName").unwrap_or_else(|| address.host().to_string()),
         platform: get("linkPlatform"),
-        host: host.to_string(),
-        port,
+        host: address.host().to_string(),
+        port: address.port(),
         app_version: get("version"),
         kind: DiscoveryKind::Manual,
     })
@@ -244,7 +251,10 @@ pub fn local_direct_addrs(peer_host: &str, api_port: u16) -> Vec<String> {
         return Vec::new();
     }
     match sock.local_addr() {
-        Ok(local) => vec![format!("{}:{}", local.ip(), api_port)],
+        Ok(local) => vec![match local.ip() {
+            IpAddr::V4(ip) => format!("{ip}:{api_port}"),
+            IpAddr::V6(ip) => format!("[{ip}]:{api_port}"),
+        }],
         Err(_) => Vec::new(),
     }
 }

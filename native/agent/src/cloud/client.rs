@@ -7,11 +7,13 @@
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use fluxdown_protocol::{AgentEvent, CloudEndpointDto};
+use fluxdown_protocol::{
+    AgentEvent, ApplicationErrorCode, CloudEndpointDto, ErrorReason, RpcErrorData,
+};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use super::models::{AuthResponse, CloudErrorBody, RefreshRequest};
@@ -20,6 +22,9 @@ use crate::state::{AgentState, CloudCredentials, StateStore};
 
 /// 是否允许运行期覆盖 FluxCloud 地址；与 Flutter `kDebugMode` 门控一致。
 const ENDPOINT_EDITABLE: bool = cfg!(debug_assertions);
+
+/// 云端连接的 TCP keepalive 探测间隔。
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct CloudClient {
@@ -46,13 +51,17 @@ impl CloudClient {
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(15))
             .pool_idle_timeout(Duration::from_secs(15))
+            .tcp_keepalive(Some(TCP_KEEPALIVE))
             .build()
-            .map_err(|error| CloudError::transport(error.to_string()))?;
+            .map_err(|error| CloudError::local(format!("cloud HTTP client: {error:#}")))?;
+        // SSE 长连接：TCP keepalive 让内核尽早发现半开连接（合盖唤醒 / NAT 静默断流），
+        // 与应用层空闲看门狗互为补充。
         let stream_http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .pool_idle_timeout(Duration::from_secs(90))
+            .tcp_keepalive(Some(TCP_KEEPALIVE))
             .build()
-            .map_err(|error| CloudError::transport(error.to_string()))?;
+            .map_err(|error| CloudError::local(format!("cloud stream client: {error:#}")))?;
         let default_base_url = normalize_base_url(&base_url);
         Ok(Self {
             base_url: Arc::new(RwLock::new(default_base_url.clone())),
@@ -117,11 +126,11 @@ impl CloudClient {
         {
             let mut state = self.state.lock().await;
             state.cloud_base_url_override.clone_from(&next);
-            self.store
-                .save(&state)
-                .await
-                .map_err(|error| CloudError::transport(error.to_string()))?;
         }
+        self.store
+            .persist(&self.state)
+            .await
+            .map_err(CloudError::from_state)?;
         self.swap_base_url(next.unwrap_or_else(|| self.default_base_url.clone()));
         Ok(self.endpoint())
     }
@@ -198,27 +207,72 @@ impl CloudClient {
         if current != attempted {
             return Ok(current);
         }
-        self.refresh_session().await
+        self.refresh_session(true).await
     }
 
-    /// 显式登录/注册成功后，先原子持久化令牌轮换再返回无令牌会话。
+    /// 显式登录/注册成功后，先原子持久化令牌轮换再返回无令牌会话；
+    /// 同时把账号维度的状态（同步水位 / 脏键 / 远程任务）切换到该账号。
     pub(crate) async fn persist_auth(
         &self,
         auth: AuthResponse,
     ) -> Result<fluxdown_protocol::AgentSessionDto, CloudError> {
         let session = auth.session();
-        let mut state = self.state.lock().await;
-        state.credentials = Some(CloudCredentials {
-            access_token: auth.access_token,
-            refresh_token: auth.refresh_token,
-            expires_at_unix: now_unix().saturating_add(auth.expires_in),
-            session: Some(session.clone()),
-        });
+        let switched = {
+            let mut state = self.state.lock().await;
+            state.credentials = Some(CloudCredentials {
+                access_token: auth.access_token,
+                refresh_token: auth.refresh_token,
+                expires_at_unix: now_unix().saturating_add(auth.expires_in),
+                session: Some(session.clone()),
+            });
+            state
+                .bind_account(Some(&session.user.id))
+                .then(|| state.sync.clone())
+        };
         self.store
-            .save(&state)
+            .persist(&self.state)
             .await
-            .map_err(|error| CloudError::transport(error.to_string()))?;
+            .map_err(CloudError::from_state)?;
+        // 换号 / 首次登录：账号维度的投影（旧账号的设备、远程任务、同步状态）立即清空。
+        if let (Some(sync), Some(events)) = (switched, &self.events) {
+            events.publish(AgentEvent::RemoteTasksChanged(Vec::new()));
+            events.publish(AgentEvent::CloudDevicesChanged(Vec::new()));
+            events.publish(AgentEvent::SyncChanged(sync));
+        }
         Ok(session)
+    }
+
+    /// 刷新成功后落盘轮换出的令牌；只在凭证仍是被刷新的那一份时写入，
+    /// 登出 / 撤销期间完成的刷新结果不得让会话复活。
+    async fn persist_refreshed(
+        &self,
+        auth: AuthResponse,
+        rotated_from: &str,
+    ) -> Result<String, CloudError> {
+        let access_token = auth.access_token.clone();
+        {
+            let mut state = self.state.lock().await;
+            match state.credentials.as_ref() {
+                None => return Err(CloudError::unauthorized()),
+                // 期间已重新登录：沿用新凭证，丢弃过期副本的刷新结果。
+                Some(current) if current.refresh_token != rotated_from => {
+                    return Ok(current.access_token.clone());
+                }
+                Some(_) => {}
+            }
+            let session = auth.session();
+            state.credentials = Some(CloudCredentials {
+                access_token: auth.access_token,
+                refresh_token: auth.refresh_token,
+                expires_at_unix: now_unix().saturating_add(auth.expires_in),
+                session: Some(session),
+            });
+        }
+        self.store
+            .persist(&self.state)
+            .await
+            .map_err(CloudError::from_state)?;
+        Ok(access_token)
     }
 
     /// 资料修改成功后更新无令牌会话并原子持久化。
@@ -226,41 +280,152 @@ impl CloudClient {
         &self,
         profile: fluxdown_protocol::CloudProfile,
     ) -> Result<fluxdown_protocol::AgentSessionDto, CloudError> {
-        let mut state = self.state.lock().await;
-        let session = state
-            .credentials
-            .as_mut()
-            .and_then(|credentials| credentials.session.as_mut())
-            .ok_or_else(CloudError::unauthorized)?;
-        session.user = profile.user;
-        session.entitlements = profile.entitlements;
-        session.current_plan = profile.current_plan;
-        let updated = session.clone();
+        let updated = {
+            let mut state = self.state.lock().await;
+            let session = state
+                .credentials
+                .as_mut()
+                .and_then(|credentials| credentials.session.as_mut())
+                .ok_or_else(CloudError::unauthorized)?;
+            session.user = profile.user;
+            session.entitlements = profile.entitlements;
+            session.current_plan = profile.current_plan;
+            session.clone()
+        };
         self.store
-            .save(&state)
+            .persist(&self.state)
             .await
-            .map_err(|error| CloudError::transport(error.to_string()))?;
+            .map_err(CloudError::from_state)?;
         Ok(updated)
     }
 
-    /// 清除完整会话（显式退出 / 刷新令牌被拒 / 远端撤销）并投影 `SessionChanged(None)`。
-    pub async fn clear_session(&self) -> Result<(), CloudError> {
+    /// 当前登录账号 id；未登录为 `None`。
+    pub(crate) async fn current_user_id(&self) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .credentials
+            .as_ref()
+            .and_then(|credentials| credentials.session.as_ref())
+            .map(|session| session.user.id.clone())
+    }
+
+    /// 更新本机设备名（`state.device_name`，供请求头与后续登录使用）。
+    pub(crate) async fn set_device_name(&self, name: &str) -> Result<(), CloudError> {
         {
             let mut state = self.state.lock().await;
+            if state.device_name == name {
+                return Ok(());
+            }
+            name.clone_into(&mut state.device_name);
+        }
+        self.store
+            .persist(&self.state)
+            .await
+            .map_err(CloudError::from_state)
+    }
+
+    /// 清除完整会话（显式退出 / 用户删除本设备）并投影账号维度的清空事件；不发 `SessionRevoked`。
+    /// 与进行中的令牌刷新互斥：刷新结果不会在清除之后复活会话。
+    pub async fn clear_session(&self) -> Result<(), CloudError> {
+        let _guard = self.refresh.lock().await;
+        self.clear_session_locked(None).await
+    }
+
+    /// 非用户主动结束会话（云端撤销 / 设备被移除 / 令牌被拒）：先发一次性 `SessionRevoked(reason)`，
+    /// 再走与 [`Self::clear_session`] 相同的清理。已经登出时不重复通知。
+    pub async fn revoke_session(&self, reason: ErrorReason) -> Result<(), CloudError> {
+        let _guard = self.refresh.lock().await;
+        let announce = self.state.lock().await.credentials.is_some();
+        self.clear_session_locked(announce.then_some(reason)).await
+    }
+
+    /// 调用方必须持有 `self.refresh` 锁。清空凭证、账号维度状态（同步水位 / 脏键按账号暂存、
+    /// 远程任务与接单绑定丢弃），先投影事件再报告落盘错误，保证 UI 与内存状态一致。
+    /// `revoked` 为 `Some` 时先于 `SessionChanged(None)` 发布 `SessionRevoked`。
+    async fn clear_session_locked(&self, revoked: Option<ErrorReason>) -> Result<(), CloudError> {
+        let sync = {
+            let mut state = self.state.lock().await;
             state.credentials = None;
-            self.store
-                .save(&state)
-                .await
-                .map_err(|error| CloudError::transport(error.to_string()))?;
-        }
+            state.bind_account(None);
+            state.sync.clone()
+        };
+        let saved = self.store.persist(&self.state).await;
         if let Some(events) = &self.events {
+            if let Some(reason) = revoked {
+                events.publish(AgentEvent::SessionRevoked(reason));
+            }
             events.publish(AgentEvent::SessionChanged(Box::new(None)));
+            events.publish(AgentEvent::RemoteTasksChanged(Vec::new()));
+            events.publish(AgentEvent::CloudDevicesChanged(Vec::new()));
+            events.publish(AgentEvent::SyncChanged(sync));
         }
-        Ok(())
+        saved.map_err(CloudError::from_state)
+    }
+
+    /// 退出登录：持有刷新锁完成「服务端吊销 + 本地清除」，避免与刷新竞态导致会话复活。
+    /// 服务端吊销失败也会清除本地会话，并把吊销错误返回给调用方。
+    pub async fn logout(&self) -> Result<(), CloudError> {
+        let _guard = self.refresh.lock().await;
+        let (access_token, refresh_token) = {
+            let state = self.state.lock().await;
+            let credentials = state
+                .credentials
+                .as_ref()
+                .filter(|credentials| !credentials.refresh_token.is_empty())
+                .ok_or_else(CloudError::unauthorized)?;
+            (
+                credentials.access_token.clone(),
+                credentials.refresh_token.clone(),
+            )
+        };
+        let remote = self.revoke_on_server(&access_token, &refresh_token).await;
+        // 吊销途中刷新令牌被拒时会话已被清除，不重复清理 / 通知。
+        if self.state.lock().await.credentials.is_some() {
+            self.clear_session_locked(None).await?;
+        }
+        remote
+    }
+
+    /// 调用方必须持有 `self.refresh` 锁：access 过期时先刷新再吊销。
+    async fn revoke_on_server(
+        &self,
+        access_token: &str,
+        refresh_token: &str,
+    ) -> Result<(), CloudError> {
+        let body = json!({ "refreshToken": refresh_token });
+        let response = self
+            .send_once(
+                Method::POST,
+                "/api/v1/auth/logout",
+                Some(body.clone()),
+                Some(access_token),
+            )
+            .await?;
+        let response = if response.status() == StatusCode::UNAUTHORIZED {
+            match self.refresh_session(false).await {
+                Ok(fresh) => {
+                    self.send_once(
+                        Method::POST,
+                        "/api/v1/auth/logout",
+                        Some(body),
+                        Some(&fresh),
+                    )
+                    .await?
+                }
+                // 刷新令牌已被服务端拒绝：会话在服务端本就失效，无需再吊销。
+                Err(error) if error.status == Some(401) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        } else {
+            response
+        };
+        decode::<Value>(response).await.map(|_| ())
     }
 
     /// 调用方必须持有 `self.refresh` 锁。
-    async fn refresh_session(&self) -> Result<String, CloudError> {
+    /// `announce`：刷新令牌被拒导致清会话时是否发布 `SessionRevoked`（登出流程里为 `false`）。
+    async fn refresh_session(&self, announce: bool) -> Result<String, CloudError> {
         let refresh_token = {
             let state = self.state.lock().await;
             state
@@ -287,17 +452,29 @@ impl CloudClient {
             response.status(),
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
         ) {
-            return self.reject_refresh_token(&refresh_token).await;
+            // 403 携带具体原因（账号停用 / 设备被移除）：清除会话后原样上报，不折叠成「登录过期」。
+            let rejection = if response.status() == StatusCode::FORBIDDEN {
+                Some(response_error(response).await)
+            } else {
+                None
+            };
+            return self
+                .reject_refresh_token(&refresh_token, rejection, announce)
+                .await;
         }
         let auth = decode::<AuthResponse>(response).await?;
-        let access_token = auth.access_token.clone();
-        self.persist_auth(auth).await?;
-        Ok(access_token)
+        self.persist_refreshed(auth, &refresh_token).await
     }
 
     /// 服务端拒绝了 `rejected`：仅当它仍是当前凭证时才登出；期间凭证已被替换
     /// （并发刷新 / 重新登录）说明被拒的只是过期副本，沿用当前 access token。
-    async fn reject_refresh_token(&self, rejected: &str) -> Result<String, CloudError> {
+    /// 调用方必须持有 `self.refresh` 锁。
+    async fn reject_refresh_token(
+        &self,
+        rejected: &str,
+        rejection: Option<CloudError>,
+        announce: bool,
+    ) -> Result<String, CloudError> {
         let current = {
             let state = self.state.lock().await;
             state.credentials.as_ref().map(|credentials| {
@@ -309,9 +486,11 @@ impl CloudClient {
         };
         match current {
             Some((refresh, access)) if refresh != rejected && !access.is_empty() => Ok(access),
-            _ => {
-                self.clear_session().await?;
-                Err(CloudError::unauthorized())
+            other => {
+                let error = rejection.unwrap_or_else(CloudError::unauthorized);
+                let revoked = (announce && other.is_some()).then(|| revocation_reason(&error));
+                self.clear_session_locked(revoked).await?;
+                Err(error)
             }
         }
     }
@@ -323,16 +502,6 @@ impl CloudClient {
             .credentials
             .as_ref()
             .map(|credentials| credentials.access_token.clone())
-            .filter(|token| !token.is_empty())
-            .ok_or_else(CloudError::unauthorized)
-    }
-
-    pub(crate) async fn refresh_token(&self) -> Result<String, CloudError> {
-        let state = self.state.lock().await;
-        state
-            .credentials
-            .as_ref()
-            .map(|credentials| credentials.refresh_token.clone())
             .filter(|token| !token.is_empty())
             .ok_or_else(CloudError::unauthorized)
     }
@@ -377,7 +546,7 @@ impl CloudClient {
             .header("X-FluxDown-Version", env!("CARGO_PKG_VERSION"))
             .send()
             .await
-            .map_err(|error| CloudError::transport(error_chain(&error)))
+            .map_err(|error| CloudError::network(error_chain(&error)))
     }
 
     async fn send_once(
@@ -404,7 +573,15 @@ impl CloudClient {
         request
             .send()
             .await
-            .map_err(|error| CloudError::transport(error_chain(&error)))
+            .map_err(|error| CloudError::network(error_chain(&error)))
+    }
+}
+
+/// 令牌被拒导致清会话时通知 UI 的原因：账号停用 / 设备被移除保留，其余一律是会话过期。
+fn revocation_reason(error: &CloudError) -> ErrorReason {
+    match error.reason() {
+        Some(reason @ (ErrorReason::AccountDisabled | ErrorReason::DeviceUntrusted)) => reason,
+        _ => ErrorReason::SessionExpired,
     }
 }
 
@@ -416,29 +593,74 @@ async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response
     }
 }
 
+/// 非 2xx 响应转 [`CloudError`]：优先解析 `{code, message}`；正文不是约定 JSON
+/// （反代 / 网关 HTML、限流页）时保留状态码与正文片段，便于定位。
 async fn response_error(response: reqwest::Response) -> CloudError {
     let status = response.status();
     let retryable = status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS;
-    let body = response.json::<CloudErrorBody>().await.ok();
-    CloudError {
-        status: Some(status.as_u16()),
-        code: body.as_ref().and_then(|body| body.code.clone()),
-        message: body
-            .and_then(|body| body.message)
-            .unwrap_or_else(|| format!("FluxCloud HTTP {status}")),
-        retryable,
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::debug!(%status, error = %error_chain(&error), "FluxCloud error body unreadable");
+            Default::default()
+        }
+    };
+    error_from_body(status.as_u16(), retryable, &bytes)
+}
+
+fn error_from_body(status: u16, retryable: bool, body: &[u8]) -> CloudError {
+    match serde_json::from_slice::<CloudErrorBody>(body) {
+        Ok(parsed) if parsed.code.is_some() || parsed.message.is_some() => CloudError {
+            status: Some(status),
+            message: parsed
+                .message
+                .clone()
+                .unwrap_or_else(|| format!("FluxCloud HTTP {status}")),
+            code: parsed.code,
+            retryable,
+            unreachable: false,
+        },
+        _ => {
+            let text = String::from_utf8_lossy(body);
+            let snippet = text.trim().chars().take(200).collect::<String>();
+            tracing::debug!(status, body = %snippet, "FluxCloud error body is not {{code, message}} JSON");
+            CloudError {
+                status: Some(status),
+                code: None,
+                message: if snippet.is_empty() {
+                    format!("FluxCloud HTTP {status}")
+                } else {
+                    format!("FluxCloud HTTP {status}: {snippet}")
+                },
+                retryable,
+                unreachable: false,
+            }
+        }
     }
 }
 
 async fn decode<R: DeserializeOwned>(response: reqwest::Response) -> Result<R, CloudError> {
     let status = response.status();
-    if status.is_success() {
-        return response
-            .json::<R>()
-            .await
-            .map_err(|error| CloudError::transport(error_chain(&error)));
+    if !status.is_success() {
+        return Err(response_error(response).await);
     }
-    Err(response_error(response).await)
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| CloudError::network(error_chain(&error)))?;
+    // 204 / 空正文（如 presence 心跳）按 JSON null 解码。
+    let parsed = if bytes.is_empty() {
+        serde_json::from_value::<R>(Value::Null)
+    } else {
+        serde_json::from_slice::<R>(&bytes)
+    };
+    parsed.map_err(|error| {
+        let mut invalid = CloudError::invalid_response(format!(
+            "FluxCloud HTTP {status}: response body could not be decoded: {error:#}"
+        ));
+        invalid.status = Some(status.as_u16());
+        invalid
+    })
 }
 
 /// reqwest 的 `Display`（含 `{:#}`）只输出最外层「error sending request for url」，
@@ -489,15 +711,18 @@ pub struct CloudError {
     pub code: Option<String>,
     pub message: String,
     pub retryable: bool,
+    /// 网络 / TLS / DNS / 超时：请求没能到达云端或响应没能读完。
+    pub unreachable: bool,
 }
 
 impl CloudError {
-    fn unauthorized() -> Self {
+    pub(crate) fn unauthorized() -> Self {
         Self {
             status: Some(401),
             code: Some("unauthorized".to_owned()),
             message: "authentication required".to_owned(),
             retryable: false,
+            unreachable: false,
         }
     }
 
@@ -507,16 +732,34 @@ impl CloudError {
             code: Some("unsupported".to_owned()),
             message: "FluxCloud endpoint is fixed in release builds".to_owned(),
             retryable: false,
+            unreachable: false,
         }
     }
 
-    fn transport(message: String) -> Self {
+    /// 网络层失败（可重试）。
+    pub(crate) fn network(message: String) -> Self {
         Self {
             status: None,
             code: None,
             message,
             retryable: true,
+            unreachable: true,
         }
+    }
+
+    /// 本机失败（构建 HTTP 客户端 / 落盘）：与云端无关，重试没有意义。
+    pub(crate) fn local(message: String) -> Self {
+        Self {
+            status: None,
+            code: Some("internal".to_owned()),
+            message,
+            retryable: false,
+            unreachable: false,
+        }
+    }
+
+    pub(crate) fn from_state(error: crate::state::StateError) -> Self {
+        Self::local(format!("agent state persistence failed: {error:#}"))
     }
 
     fn invalid(message: String) -> Self {
@@ -525,6 +768,86 @@ impl CloudError {
             code: Some("invalidArgument".to_owned()),
             message,
             retryable: false,
+            unreachable: false,
+        }
+    }
+
+    /// 云端错误码 / HTTP 状态 → 稳定的细分原因（契约 §3）。网络类失败为 `cloudUnreachable`。
+    #[must_use]
+    pub fn reason(&self) -> Option<ErrorReason> {
+        if self.unreachable {
+            return Some(ErrorReason::CloudUnreachable);
+        }
+        let by_code = match self.code.as_deref() {
+            Some("invalid_credentials") => Some(ErrorReason::InvalidCredentials),
+            Some("invalid_code") => Some(ErrorReason::InvalidVerificationCode),
+            Some("rate_limited") => Some(ErrorReason::RateLimited),
+            Some("email_taken") => Some(ErrorReason::EmailTaken),
+            Some("account_disabled") => Some(ErrorReason::AccountDisabled),
+            Some("registration_closed") => Some(ErrorReason::RegistrationClosed),
+            Some("registration_incomplete") => Some(ErrorReason::RegistrationIncomplete),
+            Some("mail_not_configured") => Some(ErrorReason::MailNotConfigured),
+            Some("device_limit") => Some(ErrorReason::DeviceLimit),
+            Some("sync_device_limit") => Some(ErrorReason::SyncDeviceLimit),
+            Some("sync_device_untrusted") => Some(ErrorReason::DeviceUntrusted),
+            Some("unauthorized") => Some(ErrorReason::SessionExpired),
+            Some("target_device_offline") => Some(ErrorReason::TargetDeviceOffline),
+            Some("task_state_conflict") => Some(ErrorReason::TaskStateConflict),
+            Some("task_device_mismatch") => Some(ErrorReason::TaskDeviceMismatch),
+            _ => None,
+        };
+        by_code.or(match self.status {
+            Some(401) => Some(ErrorReason::SessionExpired),
+            Some(429) => Some(ErrorReason::RateLimited),
+            _ => None,
+        })
+    }
+
+    /// 本机 RPC 错误：`reason` 让客户端给出可操作的本地化文案；`code` 供未识别原因时回退。
+    #[must_use]
+    pub fn to_rpc_error(&self) -> RpcErrorData {
+        let reason = self.reason();
+        let (code, retryable) = match reason {
+            Some(
+                ErrorReason::InvalidCredentials
+                | ErrorReason::AccountDisabled
+                | ErrorReason::DeviceUntrusted
+                | ErrorReason::SessionExpired,
+            ) => (ApplicationErrorCode::Unauthorized, false),
+            Some(ErrorReason::InvalidVerificationCode) => {
+                (ApplicationErrorCode::InvalidArgument, false)
+            }
+            Some(ErrorReason::RateLimited) => (ApplicationErrorCode::Unavailable, true),
+            Some(
+                ErrorReason::EmailTaken
+                | ErrorReason::RegistrationIncomplete
+                | ErrorReason::DeviceLimit
+                | ErrorReason::SyncDeviceLimit
+                | ErrorReason::TaskStateConflict
+                | ErrorReason::TaskDeviceMismatch,
+            ) => (ApplicationErrorCode::Conflict, false),
+            Some(ErrorReason::RegistrationClosed) => (ApplicationErrorCode::Unsupported, false),
+            Some(ErrorReason::MailNotConfigured) => (ApplicationErrorCode::Unavailable, false),
+            Some(ErrorReason::CloudUnreachable | ErrorReason::TargetDeviceOffline) => {
+                (ApplicationErrorCode::Unavailable, true)
+            }
+            _ => {
+                let code = match (self.status, self.code.as_deref()) {
+                    (Some(404), _) => ApplicationErrorCode::NotFound,
+                    (Some(400 | 422), _) | (_, Some("invalidArgument" | "validation_error")) => {
+                        ApplicationErrorCode::InvalidArgument
+                    }
+                    (_, Some("unsupported")) => ApplicationErrorCode::Unsupported,
+                    _ if self.retryable => ApplicationErrorCode::Unavailable,
+                    _ => ApplicationErrorCode::Internal,
+                };
+                (code, self.retryable)
+            }
+        };
+        let data = RpcErrorData::new(code, retryable);
+        match reason {
+            Some(reason) => data.with_reason(reason),
+            None => data,
         }
     }
 }
@@ -904,5 +1227,478 @@ mod tests {
         drop(state);
         drop(store);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    // ───────────────────────── 错误 reason 映射 ─────────────────────────
+
+    fn cloud_error(status: u16, code: &str) -> super::CloudError {
+        super::error_from_body(
+            status,
+            status >= 500 || status == 429,
+            json!({ "code": code, "message": "m" })
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
+    #[test]
+    fn cloud_error_codes_map_to_reasons_and_application_codes() {
+        use fluxdown_protocol::{ApplicationErrorCode as Code, ErrorReason as Reason};
+        let table = [
+            (
+                401,
+                "invalid_credentials",
+                Reason::InvalidCredentials,
+                Code::Unauthorized,
+            ),
+            (
+                400,
+                "invalid_code",
+                Reason::InvalidVerificationCode,
+                Code::InvalidArgument,
+            ),
+            (429, "rate_limited", Reason::RateLimited, Code::Unavailable),
+            (409, "email_taken", Reason::EmailTaken, Code::Conflict),
+            (
+                403,
+                "account_disabled",
+                Reason::AccountDisabled,
+                Code::Unauthorized,
+            ),
+            (
+                403,
+                "registration_closed",
+                Reason::RegistrationClosed,
+                Code::Unsupported,
+            ),
+            (
+                403,
+                "registration_incomplete",
+                Reason::RegistrationIncomplete,
+                Code::Conflict,
+            ),
+            (
+                503,
+                "mail_not_configured",
+                Reason::MailNotConfigured,
+                Code::Unavailable,
+            ),
+            (403, "device_limit", Reason::DeviceLimit, Code::Conflict),
+            (
+                403,
+                "sync_device_limit",
+                Reason::SyncDeviceLimit,
+                Code::Conflict,
+            ),
+            (
+                403,
+                "sync_device_untrusted",
+                Reason::DeviceUntrusted,
+                Code::Unauthorized,
+            ),
+            (
+                401,
+                "unauthorized",
+                Reason::SessionExpired,
+                Code::Unauthorized,
+            ),
+            (
+                409,
+                "target_device_offline",
+                Reason::TargetDeviceOffline,
+                Code::Unavailable,
+            ),
+            (
+                409,
+                "task_state_conflict",
+                Reason::TaskStateConflict,
+                Code::Conflict,
+            ),
+            (
+                403,
+                "task_device_mismatch",
+                Reason::TaskDeviceMismatch,
+                Code::Conflict,
+            ),
+        ];
+        for (status, code, reason, application) in table {
+            let data = cloud_error(status, code).to_rpc_error();
+            assert_eq!(data.reason, Some(reason), "{code}");
+            assert_eq!(data.code, application, "{code}");
+        }
+        // 403 不再一律折叠成 Unauthorized：未识别的 403 保持 Internal，没有伪造的 reason。
+        let unknown = cloud_error(403, "something_new").to_rpc_error();
+        assert_eq!(unknown.reason, None);
+        assert_eq!(unknown.code, Code::Internal);
+        // 无 code 的 401（旧云端 / 网关）仍是登录过期。
+        let bare = super::error_from_body(401, false, b"");
+        assert_eq!(bare.to_rpc_error().reason, Some(Reason::SessionExpired));
+        // 404 / 校验错误保持按状态码回退。
+        assert_eq!(
+            cloud_error(404, "not_found").to_rpc_error().code,
+            Code::NotFound
+        );
+        assert_eq!(
+            cloud_error(422, "validation_error").to_rpc_error().code,
+            Code::InvalidArgument
+        );
+    }
+
+    #[test]
+    fn rate_limited_and_unreachable_are_retryable_but_credential_errors_are_not() {
+        assert!(cloud_error(429, "rate_limited").to_rpc_error().retryable);
+        assert!(
+            !cloud_error(401, "invalid_credentials")
+                .to_rpc_error()
+                .retryable
+        );
+        let network = super::CloudError::network("dns failure".to_owned());
+        let data = network.to_rpc_error();
+        assert_eq!(
+            data.reason,
+            Some(fluxdown_protocol::ErrorReason::CloudUnreachable)
+        );
+        assert!(data.retryable);
+    }
+
+    #[test]
+    fn non_json_error_bodies_keep_the_status_and_a_body_snippet() {
+        let error = super::error_from_body(
+            502,
+            true,
+            b"<html><body>Bad Gateway from nginx</body></html>",
+        );
+        assert_eq!(error.status, Some(502));
+        assert_eq!(error.code, None);
+        assert!(error.message.contains("502"));
+        assert!(error.message.contains("Bad Gateway from nginx"));
+        assert!(error.retryable);
+        assert!(!error.unreachable);
+        // 空正文只保留状态码。
+        assert_eq!(
+            super::error_from_body(500, true, b"").message,
+            "FluxCloud HTTP 500"
+        );
+    }
+
+    async fn temp_client(
+        label: &str,
+        base_url: String,
+        credentials: Option<CloudCredentials>,
+    ) -> (
+        CloudClient,
+        Arc<Mutex<AgentState>>,
+        Arc<StateStore>,
+        std::path::PathBuf,
+    ) {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_cloud_{label}_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(StateStore::open(dir.clone()).await.expect("state store"));
+        let session = credentials
+            .as_ref()
+            .and_then(|credentials| credentials.session.clone());
+        let state = Arc::new(Mutex::new(AgentState {
+            device_id: "device1".to_owned(),
+            account_uid: session.map(|session| session.user.id),
+            credentials,
+            ..AgentState::default()
+        }));
+        let client =
+            CloudClient::new(base_url, state.clone(), store.clone()).expect("cloud client");
+        (client, state, store, dir)
+    }
+
+    #[tokio::test]
+    async fn unreachable_cloud_is_a_retryable_network_error_with_a_reason() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let address = listener.local_addr().expect("address");
+        drop(listener);
+        let (client, _state, store, dir) =
+            temp_client("unreachable", format!("http://{address}"), None).await;
+        let error = client
+            .public::<Value, Value>(reqwest::Method::GET, "/api/v1/plans/catalog", None)
+            .await
+            .expect_err("closed port");
+        assert!(error.unreachable);
+        assert_eq!(
+            error.to_rpc_error().reason,
+            Some(fluxdown_protocol::ErrorReason::CloudUnreachable)
+        );
+        drop(client);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    fn session_of(user_id: &str) -> fluxdown_protocol::AgentSessionDto {
+        serde_json::from_value(json!({
+            "user": { "id": user_id, "email": "user@example.com" },
+            "device": { "id": "row1", "deviceId": "device1" }
+        }))
+        .expect("session dto")
+    }
+
+    fn credentials_of(user_id: &str, refresh: &str) -> CloudCredentials {
+        CloudCredentials {
+            access_token: "old-access".to_owned(),
+            refresh_token: refresh.to_owned(),
+            expires_at_unix: 0,
+            session: Some(session_of(user_id)),
+        }
+    }
+
+    async fn slow_refresh() -> Response {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        axum::Json(json!({
+            "accessToken": "new-access",
+            "refreshToken": "new-refresh",
+            "expiresIn": 3600,
+            "user": { "id": "u1", "email": "user@example.com" },
+            "device": { "id": "row1", "deviceId": "device1" }
+        }))
+        .into_response()
+    }
+
+    /// 登出与进行中的刷新互斥：刷新的结果不能在登出之后把会话「复活」。
+    #[tokio::test]
+    async fn a_refresh_finishing_after_logout_cannot_resurrect_the_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock cloud");
+        let address = listener.local_addr().expect("address");
+        let app = Router::new()
+            .route("/api/v1/test", get(protected))
+            .route("/api/v1/auth/refresh", post(slow_refresh))
+            .route(
+                "/api/v1/auth/logout",
+                post(|| async { StatusCode::NO_CONTENT }),
+            );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (client, state, store, dir) = temp_client(
+            "logout_race",
+            format!("http://{address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        let request = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .authenticated::<Value, Value>(reqwest::Method::GET, "/api/v1/test", None)
+                    .await
+            })
+        };
+        // 让请求先拿到刷新锁，再登出。
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let _ = client.logout().await;
+        let _ = request.await.expect("join request");
+        assert!(state.lock().await.credentials.is_none(), "logout wins");
+        assert!(store.load().await.expect("reload").credentials.is_none());
+        drop(client);
+        drop(state);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    /// 登出 / 撤销清理账号维度状态：同步数据按账号暂存、远程任务与绑定丢弃，并推送清空事件。
+    #[tokio::test]
+    async fn clearing_the_session_isolates_account_state_and_projects_empty_lists() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock cloud");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, Router::new()).await;
+        });
+        let (client, state, store, dir) = temp_client(
+            "clear_scope",
+            format!("http://{address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        let events = crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot {
+            session: Some(session_of("u1")),
+            remote_tasks: vec![serde_json::from_value(json!({"id": "r1"})).expect("task")],
+            cloud_devices: vec![
+                serde_json::from_value(json!({"id": "1", "deviceId": "d"})).expect("device"),
+            ],
+            ..fluxdown_protocol::AgentSnapshot::default()
+        });
+        let client = client.with_events(events.clone());
+        {
+            let mut state = state.lock().await;
+            state.sync.revision = 33;
+            state.sync_entries.insert(
+                "general.locale".to_owned(),
+                crate::state::PersistedSyncEntry {
+                    value: json!("zh"),
+                    version: 1,
+                    dirty: true,
+                    deleted: false,
+                },
+            );
+            state
+                .remote_bindings
+                .insert("r1".to_owned(), "t1".to_owned());
+        }
+        client.clear_session().await.expect("clear");
+        {
+            let state = state.lock().await;
+            assert!(state.credentials.is_none());
+            assert_eq!(state.sync.revision, 0);
+            assert!(state.sync_entries.is_empty());
+            assert!(state.sync.dirty_keys.is_empty());
+            assert!(state.remote_bindings.is_empty());
+            assert_eq!(state.sync_stash["u1"].revision, 33);
+        }
+        let fluxdown_protocol::SnapshotBody::Agent(snapshot) = events.snapshot().body else {
+            panic!("agent snapshot expected");
+        };
+        assert!(snapshot.session.is_none());
+        assert!(snapshot.remote_tasks.is_empty());
+        assert!(snapshot.cloud_devices.is_empty());
+        drop(client);
+        drop(state);
+        drop(store);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    fn recorded_session_events(
+        receiver: &mut tokio::sync::broadcast::Receiver<fluxdown_protocol::EventFrame>,
+    ) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(frame) = receiver.try_recv() {
+            if let fluxdown_protocol::ServiceEvent::Agent(event) = frame.event {
+                match event {
+                    fluxdown_protocol::AgentEvent::SessionRevoked(reason) => {
+                        seen.push(format!("revoked:{reason:?}"));
+                    }
+                    fluxdown_protocol::AgentEvent::SessionChanged(session) => {
+                        seen.push(format!("session:{}", session.is_some()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        seen
+    }
+
+    async fn forbidden_refresh() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"code": "account_disabled", "message": "disabled"})),
+        )
+            .into_response()
+    }
+
+    /// 用户主动登出不发 `SessionRevoked`（即使登出途中 access 过期、刷新令牌又被拒）；
+    /// 刷新令牌被拒导致的清会话才是「被动」结束：401 → sessionExpired，403 account_disabled → accountDisabled。
+    #[tokio::test]
+    async fn only_involuntary_session_endings_publish_session_revoked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock cloud");
+        let address = listener.local_addr().expect("address");
+        let app = Router::new()
+            .route("/api/v1/test", get(protected))
+            .route(
+                "/api/v1/auth/logout",
+                post(|| async { StatusCode::UNAUTHORIZED }),
+            )
+            .route("/api/v1/auth/refresh", post(reject_refresh));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        // 用户登出：access 过期 → 刷新被拒，仍然不是「被撤销」。
+        let (client, _state, store, dir) = temp_client(
+            "logout_silent",
+            format!("http://{address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        let events =
+            crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let client = client.with_events(events.clone());
+        let (mut receiver, _) = events.subscribe_and_snapshot();
+        let _ = client.logout().await;
+        assert_eq!(recorded_session_events(&mut receiver), ["session:false"]);
+
+        // 普通请求遇到刷新令牌被拒（401）→ sessionExpired，且先于 SessionChanged(None)。
+        let (client, _state2, store2, dir2) = temp_client(
+            "refresh_rejected",
+            format!("http://{address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        let events =
+            crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let client = client.with_events(events.clone());
+        let (mut receiver, _) = events.subscribe_and_snapshot();
+        let _ = client
+            .authenticated::<Value, Value>(reqwest::Method::GET, "/api/v1/test", None)
+            .await
+            .expect_err("rejected refresh");
+        assert_eq!(
+            recorded_session_events(&mut receiver),
+            ["revoked:SessionExpired", "session:false"]
+        );
+
+        // 403 account_disabled → accountDisabled。
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind disabled mock");
+        let disabled_address = listener.local_addr().expect("address");
+        let app = Router::new()
+            .route("/api/v1/test", get(protected))
+            .route("/api/v1/auth/refresh", post(forbidden_refresh));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (client, _state3, store3, dir3) = temp_client(
+            "account_disabled",
+            format!("http://{disabled_address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        let events =
+            crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let client = client.with_events(events.clone());
+        let (mut receiver, _) = events.subscribe_and_snapshot();
+        let error = client
+            .authenticated::<Value, Value>(reqwest::Method::GET, "/api/v1/test", None)
+            .await
+            .expect_err("disabled account");
+        assert_eq!(error.code.as_deref(), Some("account_disabled"));
+        assert_eq!(
+            recorded_session_events(&mut receiver),
+            ["revoked:AccountDisabled", "session:false"]
+        );
+
+        // 用户主动 clear_session（删除本设备）同样不发。
+        let (client, _state4, store4, dir4) = temp_client(
+            "explicit_clear",
+            format!("http://{address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        let events =
+            crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
+        let client = client.with_events(events.clone());
+        let (mut receiver, _) = events.subscribe_and_snapshot();
+        client.clear_session().await.expect("explicit clear");
+        assert_eq!(recorded_session_events(&mut receiver), ["session:false"]);
+
+        drop(store);
+        drop(store2);
+        drop(store3);
+        drop(store4);
+        for dir in [dir, dir2, dir3, dir4] {
+            let _ = tokio::fs::remove_dir_all(dir).await;
+        }
     }
 }

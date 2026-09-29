@@ -21,9 +21,11 @@ use fluxdown_api::service::{ApiError, ApiHost, LiveSpeed, TaskEvent};
 use fluxdown_engine::auth::is_sensitive_config_key;
 use fluxdown_engine::db::Db;
 use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec};
-use fluxdown_engine::link::{DiscoveredPeer, DiscoveryKind, LinkError, LinkManager, WireHello};
 use fluxdown_engine::plugin::{MarketClient, PluginManager};
 use fluxdown_engine::rss::MAX_ITEMS_PER_SOURCE;
+use fluxdown_link::{
+    DiscoveredPeer, DiscoveryKind, LinkError, LinkManager, PeerAddress, WireHello,
+};
 use fluxdown_protocol::daemon::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
     LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
@@ -996,7 +998,8 @@ impl ApiHost for ServerApiHost {
 
     async fn link_probe(&self, host: &str, port: u16) -> Result<LinkDiscoveredPeer, ApiError> {
         let link = self.link.as_ref().ok_or_else(link_disabled)?;
-        link.probe(host, port)
+        let address = PeerAddress::from_host_port(host, port).map_err(map_link_err)?;
+        link.probe(&address)
             .await
             .map(link_discovered_dto)
             .map_err(map_link_err)
@@ -1009,8 +1012,9 @@ impl ApiHost for ServerApiHost {
         code: &str,
     ) -> Result<LinkPairBeginResponse, ApiError> {
         let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        let address = PeerAddress::from_host_port(host, port).map_err(map_link_err)?;
         let result = link
-            .begin_pairing(host, port, code)
+            .begin_pairing(&address, code)
             .await
             .map_err(map_link_err)?;
         Ok(LinkPairBeginResponse {
@@ -1042,6 +1046,8 @@ impl ApiHost for ServerApiHost {
             online,
             paired_at: record.paired_at,
             last_seen_at: record.last_seen_at,
+            default_save_dir: None,
+            path_style: None,
         }))
     }
 
@@ -1066,6 +1072,8 @@ impl ApiHost for ServerApiHost {
                 online: on,
                 paired_at: r.paired_at,
                 last_seen_at: r.last_seen_at,
+                default_save_dir: None,
+                path_style: None,
             })
             .collect())
     }
@@ -1120,10 +1128,8 @@ fn opt_str(s: String) -> Option<String> {
 
 /// 引擎 [`PairConfirmOutcome`] → API [`LinkPairConfirmOutcome`]。两者字段一致但分属
 /// 两个 crate（`fluxdown_api` 不依赖引擎的可选 link 模块），这里做一次显式搬运。
-fn map_confirm_outcome(
-    outcome: fluxdown_engine::link::PairConfirmOutcome,
-) -> LinkPairConfirmOutcome {
-    use fluxdown_engine::link::PairConfirmOutcome as E;
+fn map_confirm_outcome(outcome: fluxdown_link::PairConfirmOutcome) -> LinkPairConfirmOutcome {
+    use fluxdown_link::PairConfirmOutcome as E;
     match outcome {
         E::Paired => LinkPairConfirmOutcome::Paired,
         E::Declined => LinkPairConfirmOutcome::Declined,
@@ -1135,7 +1141,7 @@ fn map_confirm_outcome(
 /// [`LinkError`] → [`ApiError`] 映射（决定 HTTP 状态码）。
 fn map_link_err(e: LinkError) -> ApiError {
     match e {
-        LinkError::Unauthorized => ApiError::Unauthorized,
+        LinkError::Unauthorized | LinkError::NotPaired => ApiError::Unauthorized,
         LinkError::InvalidCode
         | LinkError::BadSignature
         | LinkError::BadPayload(_)
@@ -1144,7 +1150,8 @@ fn map_link_err(e: LinkError) -> ApiError {
         | LinkError::Throttled
         | LinkError::RejectedByPeer
         | LinkError::PairingTimeout
-        | LinkError::IdentityMismatch(_) => ApiError::BadRequest(e.to_string()),
+        | LinkError::IdentityMismatch(_)
+        | LinkError::NotFluxDown(_) => ApiError::BadRequest(e.to_string()),
         LinkError::Unreachable | LinkError::Unavailable => ApiError::Unavailable,
         other => ApiError::Internal(other.to_string()),
     }
@@ -1432,8 +1439,8 @@ mod tests {
             );
             Db::connect(&url).await.expect("mem db")
         }
-        fn info(name: &str) -> fluxdown_engine::link::SelfInfo {
-            fluxdown_engine::link::SelfInfo {
+        fn info(name: &str) -> fluxdown_link::SelfInfo {
+            fluxdown_link::SelfInfo {
                 name: name.to_string(),
                 platform: Some("linux".to_string()),
                 app_version: None,
@@ -1442,10 +1449,15 @@ mod tests {
 
         // 响应方（被添加设备）+ 真实 HTTP 服务器。
         let db_r = mem_db("resp").await;
-        let (tx_r, rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
-        let responder = LinkManager::load(db_r.clone(), info("NAS"), 17800, tx_r)
-            .await
-            .expect("responder link");
+        let (tx_r, rx_r) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(16);
+        let responder = LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_r.clone())),
+            info("NAS"),
+            fluxdown_link::LinkOptions::reachable(17800),
+            tx_r,
+        )
+        .await
+        .expect("responder link");
         let code = responder.generate_code();
 
         let (cmd_tx, _cmd_rx) = mpsc::channel(1);
@@ -1476,10 +1488,15 @@ mod tests {
 
         // 发起方（添加设备）。
         let db_i = mem_db("init").await;
-        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
-        let initiator = LinkManager::load(db_i, info("Laptop"), 0, tx_i)
-            .await
-            .expect("initiator link");
+        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(16);
+        let initiator = LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_i)),
+            info("Laptop"),
+            fluxdown_link::LinkOptions::reachable(0),
+            tx_i,
+        )
+        .await
+        .expect("initiator link");
 
         // 配对现在是**双边确认**：响应方收到 hello 后会广播 IncomingPairing，其本机
         // 用户必须核对 SAS 再批准，发起方的 confirm 请求在此期间挂起。测试里用一个
@@ -1488,10 +1505,7 @@ mod tests {
         tokio::spawn(async move {
             let mut rx = rx_r;
             while let Some(ev) = rx.recv().await {
-                if let fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
-                    session_id, ..
-                } = ev
-                {
+                if let fluxdown_link::LinkEngineEvent::IncomingPairing { session_id, .. } = ev {
                     let _ = approver.approve_incoming(&session_id, true);
                 }
             }
@@ -1499,7 +1513,10 @@ mod tests {
 
         // begin（发 hello）→ confirm（发 confirm），全程真实 HTTP。
         let begin = initiator
-            .begin_pairing("127.0.0.1", addr.port(), &code)
+            .begin_pairing(
+                &fluxdown_link::PeerAddress::from_host_port("127.0.0.1", addr.port()).unwrap(),
+                &code,
+            )
             .await
             .expect("begin pairing");
         assert_eq!(begin.peer_name, "NAS");
@@ -1522,7 +1539,10 @@ mod tests {
 
         // 错误配对码经 HTTP 被拒。
         let bad = initiator
-            .begin_pairing("127.0.0.1", addr.port(), "000000")
+            .begin_pairing(
+                &fluxdown_link::PeerAddress::from_host_port("127.0.0.1", addr.port()).unwrap(),
+                "000000",
+            )
             .await;
         assert!(bad.is_err());
     }
@@ -1545,8 +1565,8 @@ mod tests {
             );
             Db::connect(&url).await.expect("mem db")
         }
-        fn info(name: &str) -> fluxdown_engine::link::SelfInfo {
-            fluxdown_engine::link::SelfInfo {
+        fn info(name: &str) -> fluxdown_link::SelfInfo {
+            fluxdown_link::SelfInfo {
                 name: name.to_string(),
                 platform: Some("linux".to_string()),
                 app_version: None,
@@ -1589,10 +1609,15 @@ mod tests {
         // 响应方：真实 HTTP 服务器，承载既有数据面端点（pair/hello、pair/confirm，
         // 无 token 鉴权）——发起方管理面 handler 内部会向它发真实 HTTP 请求。
         let db_r = mem_db("resp").await;
-        let (tx_r, rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
-        let responder = LinkManager::load(db_r.clone(), info("NAS"), 17800, tx_r)
-            .await
-            .expect("responder link");
+        let (tx_r, rx_r) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(16);
+        let responder = LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_r.clone())),
+            info("NAS"),
+            fluxdown_link::LinkOptions::reachable(17800),
+            tx_r,
+        )
+        .await
+        .expect("responder link");
         let code = responder.generate_code();
         // 双边确认：后台任务扮演响应方「核对 SAS 后点了确认」的用户，否则发起方的
         // finish 会一直挂到 60s 决策窗口耗尽并拿到 PairingTimeout。
@@ -1600,10 +1625,7 @@ mod tests {
         tokio::spawn(async move {
             let mut rx = rx_r;
             while let Some(ev) = rx.recv().await {
-                if let fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
-                    session_id, ..
-                } = ev
-                {
+                if let fluxdown_link::LinkEngineEvent::IncomingPairing { session_id, .. } = ev {
                     let _ = approver.approve_incoming(&session_id, true);
                 }
             }
@@ -1613,10 +1635,15 @@ mod tests {
         // 发起方：本测试实际驱动的对象——经其新管理面路由完成 begin/finish/
         // devices/delete，而非直调引擎方法。
         let db_i = mem_db("init").await;
-        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
-        let initiator = LinkManager::load(db_i.clone(), info("Laptop"), 0, tx_i)
-            .await
-            .expect("initiator link");
+        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(16);
+        let initiator = LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_i.clone())),
+            info("Laptop"),
+            fluxdown_link::LinkOptions::reachable(0),
+            tx_i,
+        )
+        .await
+        .expect("initiator link");
         let token = "mgmt-secret";
         let addr_i = spawn_management(initiator, db_i, token).await;
 
@@ -1732,8 +1759,8 @@ mod tests {
             );
             Db::connect(&url).await.expect("mem db")
         }
-        fn info(name: &str) -> fluxdown_engine::link::SelfInfo {
-            fluxdown_engine::link::SelfInfo {
+        fn info(name: &str) -> fluxdown_link::SelfInfo {
+            fluxdown_link::SelfInfo {
                 name: name.to_string(),
                 platform: Some("linux".to_string()),
                 app_version: None,
@@ -1741,10 +1768,15 @@ mod tests {
         }
 
         let db_r = mem_db("resp").await;
-        let (tx_r, rx_r) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
-        let responder = LinkManager::load(db_r.clone(), info("NAS"), 17800, tx_r)
-            .await
-            .expect("responder link");
+        let (tx_r, rx_r) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(16);
+        let responder = LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_r.clone())),
+            info("NAS"),
+            fluxdown_link::LinkOptions::reachable(17800),
+            tx_r,
+        )
+        .await
+        .expect("responder link");
         let code = responder.generate_code();
 
         // 后台任务扮演「核对 SAS 发现不一致、点了拒绝」的响应方用户。
@@ -1752,10 +1784,7 @@ mod tests {
         tokio::spawn(async move {
             let mut rx = rx_r;
             while let Some(ev) = rx.recv().await {
-                if let fluxdown_engine::link::LinkEngineEvent::IncomingPairing {
-                    session_id, ..
-                } = ev
-                {
+                if let fluxdown_link::LinkEngineEvent::IncomingPairing { session_id, .. } = ev {
                     let _ = rejecter.approve_incoming(&session_id, false);
                 }
             }
@@ -1788,13 +1817,21 @@ mod tests {
         });
 
         let db_i = mem_db("init").await;
-        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_engine::link::LinkEngineEvent>(16);
-        let initiator = LinkManager::load(db_i, info("Laptop"), 0, tx_i)
-            .await
-            .expect("initiator link");
+        let (tx_i, _rx_i) = mpsc::channel::<fluxdown_link::LinkEngineEvent>(16);
+        let initiator = LinkManager::load(
+            Arc::new(fluxdown_engine::link::DbLinkStorage::new(db_i)),
+            info("Laptop"),
+            fluxdown_link::LinkOptions::reachable(0),
+            tx_i,
+        )
+        .await
+        .expect("initiator link");
 
         let begin = initiator
-            .begin_pairing("127.0.0.1", addr.port(), &code)
+            .begin_pairing(
+                &fluxdown_link::PeerAddress::from_host_port("127.0.0.1", addr.port()).unwrap(),
+                &code,
+            )
             .await
             .expect("begin pairing");
         let err = initiator
@@ -1802,7 +1839,7 @@ mod tests {
             .await
             .expect_err("responder rejected, confirm must fail");
         assert!(
-            matches!(err, fluxdown_engine::link::LinkError::RejectedByPeer),
+            matches!(err, fluxdown_link::LinkError::RejectedByPeer),
             "期望 RejectedByPeer，实际 {err:?}"
         );
 
