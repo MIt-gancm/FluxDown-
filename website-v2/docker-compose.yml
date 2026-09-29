@@ -1,14 +1,20 @@
-name: fluxdown
+# 与 website/（v1，project=fluxdown，容器 fluxdown-website，端口 4321）并行部署，
+# project / 镜像 / 容器名 / 宿主端口都必须与 v1 区分，否则会互相覆盖。
+# 反代：https://fluxdown.zerx.dev/v2/ → 127.0.0.1:4322（保留 /v2 前缀，不要剥掉）。
+name: fluxdown-v2
 services:
   website:
     build:
       context: .
       dockerfile: Dockerfile
-    image: fluxdown-website:latest
-    container_name: fluxdown-website
+      args:
+        # 站点挂载前缀（构建期固化进产物）；切为根部署时设 SITE_BASE= 空串
+        SITE_BASE: ${SITE_BASE-/v2}
+    image: fluxdown-website-v2:latest
+    container_name: fluxdown-website-v2
     restart: unless-stopped
     ports:
-      - "4321:4321"
+      - "4322:4321"
     environment:
       - NODE_ENV=production
       - HOST=0.0.0.0
@@ -27,7 +33,7 @@ services:
       - .env
     healthcheck:
       # busybox wget 会先解析 localhost 到 ::1，而 node 只监听 IPv4，必须用 127.0.0.1
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4321/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4321${SITE_BASE-/v2}/"]
       interval: 30s
       timeout: 10s
       retries: 3

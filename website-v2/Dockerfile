@@ -17,7 +17,9 @@ COPY . .
 # 构建时不需要 .env，环境变量在运行时注入
 # 但 Astro 在构建时会读取 import.meta.env 中的公开变量（PUBLIC_ 前缀）
 # 本项目所有 env 变量均为服务端运行时变量，构建时无需注入
-RUN npm run build
+# 唯一例外：站点挂载前缀（astro base）构建期固化，空串 = 根部署，/v2 = 子路径部署
+ARG SITE_BASE=""
+RUN SITE_BASE="${SITE_BASE}" npm run build
 
 # ─────────────────────────────────────────────
 # Stage 2: Production

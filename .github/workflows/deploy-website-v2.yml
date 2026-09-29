@@ -1,15 +1,17 @@
-name: Deploy Website
+name: Deploy Website v2
 
-# 仅当 main 分支（开发分支）上 website/ 目录有变更时触发，
-# 通过 SSH 登录服务器执行 deploy.sh 重建并重启容器。
+# 仅当 main 分支（开发分支）上 website-v2/ 目录有变更时触发，
+# 通过 SSH 登录服务器执行 website-v2/deploy.sh 重建并重启容器
+# （https://fluxdown.zerx.dev/v2/ → 127.0.0.1:4322）。
 on:
   push:
     branches: [main]
     paths:
-      - "website/**"
+      - "website-v2/**"
+      - ".github/workflows/deploy-website-v2.yml"
   workflow_dispatch: {} # 允许在 Actions 页面手动触发
 
-# 与 deploy-website-v2.yml 同组：两者共用服务器上同一个仓库检出（fetch + reset），必须串行
+# 与 deploy-website.yml 同组：两者共用服务器上同一个仓库检出（fetch + reset），必须串行
 concurrency:
   group: deploy-website
   cancel-in-progress: false # 部署不可中途取消，排队执行
@@ -26,6 +28,7 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script_stop: true
+          # DEPLOY_PATH 指向服务器上的 website/，website-v2/ 是它的同级目录
           script: |
-            cd ${{ secrets.DEPLOY_PATH }}
+            cd ${{ secrets.DEPLOY_PATH }}/../website-v2
             bash deploy.sh
