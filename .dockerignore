@@ -3,6 +3,7 @@
 *
 !Cargo.toml
 !Cargo.lock
+!.cargo
 !native
 !crates
 !scripts
@@ -10,5 +11,7 @@ scripts/*
 !scripts/desktop-dev
 !web
 !docker
+!assets/i18n
+!website-v2/src/lib/gpui-theme
 web/node_modules
 web/dist
