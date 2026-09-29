@@ -31,6 +31,7 @@ use crate::platform::PlatformError;
 use crate::power::PowerService;
 use crate::remote::{RemoteError, RemoteTaskService};
 use crate::shell::ShellState;
+use crate::server_mode::ServerHandle;
 use crate::sync::SyncService;
 use crate::update::{UpdateError, UpdateService};
 
@@ -63,6 +64,7 @@ pub struct GatewayService {
     hello: ServiceHello,
     open_associations: crate::open_association::OpenAssociationGuard,
     local: GatewayShell,
+    server_mode: bool,
 }
 
 impl GatewayService {
@@ -122,7 +124,15 @@ impl GatewayService {
             ),
             open_associations,
             local,
+            server_mode: false,
         }
+    }
+
+    /// server 模式：`agent.platform.*` 返回 Unsupported，网关令牌须符合访问密钥策略。
+    #[must_use]
+    pub fn with_server_mode(mut self, enabled: bool) -> Self {
+        self.server_mode = enabled;
+        self
     }
 
     async fn call(&self, request: RpcRequest) -> RpcResponse {
@@ -150,6 +160,10 @@ impl GatewayService {
     }
 
     async fn dispatch(&self, request: RpcRequest) -> Result<serde_json::Value, RpcErrorData> {
+        // 桌面专属集成（打开 / 定位文件、开机自启、文件与协议关联）在 headless 宿主不存在。
+        if self.server_mode && request.method.starts_with("agent.platform.") {
+            return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
+        }
         match request.method.as_str() {
             method::SYSTEM_PING => Ok(serde_json::json!({ "ok": true })),
             method::SYSTEM_SNAPSHOT => serde_json::to_value(self.events.snapshot())
@@ -466,6 +480,16 @@ impl GatewayService {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, RpcErrorData> {
         let patch = parse_params::<fluxdown_protocol::GatewayPatchParams>(Some(params))?;
+        // server 模式的密钥同时是首次设置的开关：空值会把服务重新暴露给匿名 setup，
+        // 不合规的值会让 Web 登录页拒绝自己。二者都在这里拒绝。
+        if self.server_mode
+            && patch
+                .user_token
+                .as_deref()
+                .is_some_and(|token| crate::server_mode::validate_access_key(token).is_err())
+        {
+            return Err(invalid_field("userToken"));
+        }
         let mut state = self.state.lock().await;
         let api_was_enabled = state.gateway.api_enabled;
         let mcp_was_enabled = state.gateway.mcp_enabled;
@@ -1150,9 +1174,11 @@ struct GatewayState {
     service: Arc<GatewayService>,
     bearer: Arc<str>,
     cancel: CancellationToken,
+    /// server 模式：浏览器鉴权与访问密钥；桌面形态为 `None`。
+    server: Option<Arc<ServerHandle>>,
 }
 
-/// 在同一 loopback listener 合并兼容 API 与官方 `/rpc`。
+/// 在同一 listener 合并兼容 API 与官方 `/rpc`；server 模式再合并初始化 / 文件面 / SPA。
 pub async fn serve(
     listener: TcpListener,
     service: Arc<GatewayService>,
@@ -1160,16 +1186,23 @@ pub async fn serve(
     api_config: fluxdown_api::server::ApiServerConfig,
     bearer: String,
     cancel: CancellationToken,
+    server: Option<Arc<ServerHandle>>,
 ) -> Result<(), std::io::Error> {
     let state = GatewayState {
         service,
         bearer: Arc::from(bearer),
         cancel: cancel.clone(),
+        server: server.clone(),
     };
     let rpc = Router::new()
         .route("/rpc", get(rpc_upgrade))
         .with_state(state);
     let app = fluxdown_api::server::api_router(api_host, api_config).merge(rpc);
+    // SPA fallback 只在 server 模式挂载，且 API / `/rpc` 路由优先。
+    let app = match server {
+        Some(server) => app.merge(crate::server_mode::router(server)),
+        None => app,
+    };
     axum::serve(listener, app)
         .with_graceful_shutdown(cancel.cancelled_owned())
         .await
@@ -1215,9 +1248,25 @@ async fn rpc_upgrade(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !authorized(&headers, &state.bearer) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
+    let upgrade = match state.server.as_deref() {
+        Some(server) => {
+            if let Err(status) = crate::server_mode::authorize_rpc(
+                &headers,
+                &state.bearer,
+                server.access_key(),
+            ) {
+                return status.into_response();
+            }
+            // 浏览器经子协议携带密钥：必须回显 `fluxdown.rpc.v1`，否则浏览器会断开握手。
+            upgrade.protocols([crate::server_mode::RPC_SUBPROTOCOL])
+        }
+        None => {
+            if !authorized(&headers, &state.bearer) {
+                return StatusCode::UNAUTHORIZED.into_response();
+            }
+            upgrade
+        }
+    };
     upgrade
         .on_upgrade(move |socket| run_socket(socket, state.service, state.cancel))
         .into_response()
@@ -1766,6 +1815,50 @@ mod tests {
                 panic!("{method_name} fell through agent dispatch");
             }
         }
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn server_mode_disables_platform_methods_and_guards_the_access_key() {
+        let mut harness = TestGateway::new("server_mode").await;
+        harness.service = harness.service.with_server_mode(true);
+
+        for method_name in [
+            fluxdown_protocol::method::AGENT_PLATFORM_OPEN_TASK,
+            fluxdown_protocol::method::AGENT_PLATFORM_INTEGRATION_GET,
+            fluxdown_protocol::method::AGENT_PLATFORM_SET_AUTOSTART,
+        ] {
+            let response = harness.call(method_name, serde_json::json!({})).await;
+            let RpcResponse::Failure(failure) = response else {
+                panic!("{method_name} must be rejected in server mode");
+            };
+            assert_eq!(
+                failure.error.data.map(|data| data.code),
+                Some(ApplicationErrorCode::Unsupported),
+                "{method_name}"
+            );
+        }
+
+        // 清空 / 不合规的密钥会重新打开匿名 setup 或让 Web 登录页拒绝自己：一律拒绝。
+        for token in ["", "short", "letters-only-key"] {
+            let response = harness
+                .call(
+                    fluxdown_protocol::method::AGENT_GATEWAY_PATCH,
+                    serde_json::json!({ "userToken": token }),
+                )
+                .await;
+            assert!(
+                matches!(response, RpcResponse::Failure(_)),
+                "{token:?} must be rejected"
+            );
+        }
+        assert_eq!(harness.user_token().await, "");
+
+        let accepted = harness
+            .patch_gateway(serde_json::json!({ "userToken": "flux2026abc" }))
+            .await;
+        assert_eq!(accepted["userTokenConfigured"], true);
+        assert_eq!(harness.user_token().await, "flux2026abc");
         harness.finish().await;
     }
 }

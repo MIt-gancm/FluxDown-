@@ -13,6 +13,7 @@ pub mod cdn_worker;
 pub mod clipboard_watch;
 pub mod cloud;
 pub mod daemon_client;
+mod demo;
 pub mod diagnostics;
 pub mod event_hub;
 pub mod gateway;
@@ -26,11 +27,14 @@ pub mod platform;
 pub mod power;
 pub mod remote;
 pub mod runtime;
+pub mod server_mode;
 pub mod shell;
 pub mod state;
 pub mod supervisor;
 pub mod sync;
+mod task_events;
 pub mod update;
+mod web_assets;
 
 use fluxdown_protocol::{ServiceHello, ServiceRole};
 

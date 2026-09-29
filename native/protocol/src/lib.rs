@@ -32,7 +32,8 @@ pub use agent::{
 };
 pub use daemon::{
     ApiInfo, BtFileDto, CdnConfigApplyParams, CdnNodeDto, CdnReportAckParams, CdnReportLeaseDto,
-    ComponentFfmpegStatus, ComponentInstallParams, ComponentKind, ComponentParams,
+    ChangeTaskUrlParams, ComponentFfmpegStatus, ComponentInstallParams, ComponentKind,
+    ComponentParams,
     ComponentStatusDto, ComponentVersions, ComponentYtdlpStatus, ConnPolicySummaryDto,
     CreateGroupRequest, CreateGroupResponse, CreateQueueRequest, CreateTaskRequest, CreatedTask,
     DaemonConfigPatch, DaemonConfigSnapshot, DaemonCreateTaskParams, DaemonRuntimeStatsDto,
@@ -52,7 +53,8 @@ pub use daemon::{
     RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse,
     SegmentDetailDto, SelectionKind, SelectionOutcome, SelectionRequestDto, SelectionResolutionDto,
     SetPluginEnabledRequest, SettingFieldDto, SettingOptionDto, SetupRequest, SetupStatusResponse,
-    SiteAuthCredentialDto, SiteAuthDeleteParams, SiteAuthEntryDto, SiteAuthMatchParams,
+    SiteAuthCredentialDto, SiteAuthDeleteParams, SiteAuthEntryDto, SiteAuthGetParams,
+    SiteAuthMatchParams, SiteAuthSaveRequest,
     StatsResponse, SystemProxyDto, TaskDto, TokenResponse, TrackerSubRefreshResponse,
     UpdateQueueRequest, WebhookDeliveriesResponse, WebhookDeliveryDto, WebhookPresetDto,
     WebhookSimulateResponse, WebhookTestRequest, WebhookTestResponse, WsClientMsg, WsServerMsg,

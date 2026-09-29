@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use crate::actor::{ActorCallError, ActorError, ActorOperation, ActorResult, DaemonActorHandle};
 use crate::blob_store::{BlobKind, BlobStore};
+use crate::config::demo_allows;
 use crate::event_hub::DaemonEventHub;
 use crate::selection::DaemonSelection;
 
@@ -43,6 +44,7 @@ pub struct DaemonService {
     #[cfg(feature = "components")]
     ytdlp_installing: AtomicBool,
     actor: DaemonActorHandle,
+    demo_url: Option<String>,
 }
 
 impl DaemonService {
@@ -78,7 +80,15 @@ impl DaemonService {
             #[cfg(feature = "components")]
             ytdlp_installing: AtomicBool::new(false),
             actor,
+            demo_url: None,
         }
+    }
+
+    /// 启用演示模式：任务 / 任务组创建只放行 `demo_url`（见 [`demo_allows`]）。
+    #[must_use]
+    pub fn with_demo_url(mut self, demo_url: Option<String>) -> Self {
+        self.demo_url = demo_url;
+        self
     }
 
     #[must_use]
@@ -213,6 +223,14 @@ impl DaemonService {
                 })
                 .await
             }
+            method::DAEMON_TASK_CHANGE_URL => {
+                let params = parse_params::<fluxdown_protocol::ChangeTaskUrlParams>(params)?;
+                self.execute_unit(ActorOperation::ChangeTaskUrl {
+                    task_id: params.task_id,
+                    url: params.url,
+                })
+                .await
+            }
             method::DAEMON_TASK_DELETE => {
                 let params = parse_params::<DeleteParams>(params)?;
                 self.execute_unit(ActorOperation::DeleteTask {
@@ -342,6 +360,7 @@ impl DaemonService {
             }
             method::DAEMON_GROUP_CREATE => {
                 let request = parse_params::<CreateGroupRequest>(params)?;
+                self.demo_guard(&request.source_url)?;
                 let spec = self.group_spec(request);
                 match self
                     .actor
@@ -457,11 +476,52 @@ impl DaemonService {
             }
             method::DAEMON_SITE_AUTH_DELETE => {
                 let params = parse_params::<SiteAuthDeleteParams>(params)?;
-                if params.site.trim().is_empty() {
-                    return Err(invalid_argument("site", "site is required"));
-                }
-                self.site_auth_operation(ActorOperation::SiteAuthDelete { site: params.site })
+                let site = crate::actor::normalize_site(&params.site)
+                    .ok_or_else(|| invalid_argument("site", "invalid site"))?;
+                self.site_auth_operation(ActorOperation::SiteAuthDelete { site })
                     .await
+            }
+            method::DAEMON_SITE_AUTH_GET => {
+                let params = parse_params::<fluxdown_protocol::SiteAuthGetParams>(params)?;
+                let site = crate::actor::normalize_site(&params.site)
+                    .ok_or_else(|| invalid_argument("site", "invalid site"))?;
+                let json = self
+                    .db
+                    .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?
+                    .unwrap_or_default();
+                to_value(
+                    fluxdown_engine::site_auth::parse_store(&json)
+                        .remove(&site)
+                        .map(|credential| SiteAuthCredentialDto {
+                            site,
+                            user: credential.user,
+                            pass: credential.pass,
+                        }),
+                )
+            }
+            method::DAEMON_SITE_AUTH_SAVE => {
+                let request = parse_params::<fluxdown_protocol::SiteAuthSaveRequest>(params)?;
+                let site = crate::actor::normalize_site(&request.site)
+                    .ok_or_else(|| invalid_argument("site", "invalid site"))?;
+                let user = request.user.trim().to_owned();
+                if user.is_empty() {
+                    return Err(invalid_argument("user", "user is required"));
+                }
+                match self
+                    .actor
+                    .execute(ActorOperation::SiteAuthSave {
+                        site,
+                        user,
+                        pass: request.pass,
+                    })
+                    .await
+                {
+                    Ok(ActorResult::SiteAuthEntry(entry)) => to_value(entry),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
             }
             method::DAEMON_SITE_AUTH_CLEAR => {
                 self.site_auth_operation(ActorOperation::SiteAuthClear)
@@ -993,6 +1053,7 @@ impl DaemonService {
 
     async fn create_task(&self, params: Option<Value>) -> Result<Value, RpcErrorObject> {
         let params = parse_params::<DaemonCreateTaskParams>(params)?;
+        self.demo_guard(&params.request.url)?;
         if params.torrent_blob_id.is_some() && params.request.torrent_b64.is_some() {
             return Err(invalid_argument(
                 "torrentBlobId",
@@ -1098,6 +1159,18 @@ impl DaemonService {
         match self.events.snapshot().body {
             SnapshotBody::Daemon(snapshot) => *snapshot,
             SnapshotBody::Agent(_) => unreachable!("daemon event hub returned agent snapshot"),
+        }
+    }
+
+    /// 演示模式守卫：仅放行指定 URL（所有任务 / 任务组创建入口共用）。
+    fn demo_guard(&self, url: &str) -> Result<(), RpcErrorObject> {
+        if demo_allows(self.demo_url.as_deref(), url) {
+            Ok(())
+        } else {
+            Err(invalid_argument(
+                "url",
+                "demo mode: only the designated demo file can be downloaded",
+            ))
         }
     }
 

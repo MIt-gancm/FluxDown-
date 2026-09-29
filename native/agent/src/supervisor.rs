@@ -30,6 +30,8 @@ pub struct DaemonSupervisor {
     bind_addr: SocketAddr,
     /// 完全退出流程中置位：此后连接拒绝不再拉起 daemon。
     stopped: AtomicBool,
+    /// 追加给 daemon 子进程的环境变量（如 server 模式生效的演示 URL）。
+    extra_env: Vec<(String, String)>,
 }
 
 impl DaemonSupervisor {
@@ -39,7 +41,15 @@ impl DaemonSupervisor {
             state: Arc::new(Mutex::new(SupervisorState::default())),
             bind_addr,
             stopped: AtomicBool::new(false),
+            extra_env: Vec::new(),
         }
+    }
+
+    /// 给拉起的 daemon 追加环境变量（覆盖继承的同名变量）。
+    #[must_use]
+    pub fn with_extra_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.extra_env = env;
+        self
     }
 
     /// 永久停止监管（不可恢复）：随后的 [`Self::ensure_running`] 均为空操作。
@@ -64,6 +74,7 @@ impl DaemonSupervisor {
         let mut command = std::process::Command::new(&executable);
         command
             .env("FLUXDOWN_DAEMON_BIND", self.bind_addr.to_string())
+            .envs(self.extra_env.iter().cloned())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());

@@ -15,6 +15,8 @@ pub const DAEMON_TASK_CREATE: &str = "daemon.task.create";
 pub const DAEMON_TASK_PAUSE: &str = "daemon.task.pause";
 pub const DAEMON_TASK_RESUME: &str = "daemon.task.resume";
 pub const DAEMON_TASK_RENAME: &str = "daemon.task.rename";
+/// 更换任务下载源地址（`{taskId, url}`，语义同旧 `PUT /api/v1/tasks/{id}/url`）。
+pub const DAEMON_TASK_CHANGE_URL: &str = "daemon.task.changeUrl";
 pub const DAEMON_TASK_DELETE: &str = "daemon.task.delete";
 pub const DAEMON_TASK_PAUSE_ALL: &str = "daemon.task.pauseAll";
 pub const DAEMON_TASK_RESUME_ALL: &str = "daemon.task.resumeAll";
@@ -47,6 +49,10 @@ pub const DAEMON_CONFIG_CLEAR_CONN_POLICY: &str = "daemon.config.clearConnPolicy
 pub const DAEMON_CONFIG_SYSTEM_PROXY: &str = "daemon.config.systemProxy";
 pub const DAEMON_SITE_AUTH_LIST: &str = "daemon.siteAuth.list";
 pub const DAEMON_SITE_AUTH_DELETE: &str = "daemon.siteAuth.delete";
+/// 读取单站点凭据详情（含明文密码；站点键会先按 `host` / `host:port` 归一化）。
+pub const DAEMON_SITE_AUTH_GET: &str = "daemon.siteAuth.get";
+/// 保存单站点 HTTP Basic 凭据，返回脱敏后的 `SiteAuthEntryDto`。
+pub const DAEMON_SITE_AUTH_SAVE: &str = "daemon.siteAuth.save";
 pub const DAEMON_SITE_AUTH_CLEAR: &str = "daemon.siteAuth.clear";
 /// 按下载链接匹配已保存的站点凭据（含明文密码，仅供本机官方 UI 表单回填）。
 pub const DAEMON_SITE_AUTH_MATCH: &str = "daemon.siteAuth.match";
@@ -204,6 +210,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_PAUSE,
     DAEMON_TASK_RESUME,
     DAEMON_TASK_RENAME,
+    DAEMON_TASK_CHANGE_URL,
     DAEMON_TASK_DELETE,
     DAEMON_TASK_PAUSE_ALL,
     DAEMON_TASK_RESUME_ALL,
@@ -233,6 +240,8 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_CONFIG_SYSTEM_PROXY,
     DAEMON_SITE_AUTH_LIST,
     DAEMON_SITE_AUTH_DELETE,
+    DAEMON_SITE_AUTH_GET,
+    DAEMON_SITE_AUTH_SAVE,
     DAEMON_SITE_AUTH_CLEAR,
     DAEMON_SITE_AUTH_MATCH,
     DAEMON_RUNTIME_STATS,

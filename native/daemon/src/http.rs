@@ -166,20 +166,46 @@ async fn download_task_file(
         Ok(metadata) => metadata.len(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let safe_name = task.file_name.replace(['\r', '\n', '"'], "_");
+    let disposition = attachment_disposition(&task.file_name);
     match Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/octet-stream")
         .header(header::CONTENT_LENGTH, length)
-        .header(
-            header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{safe_name}\""),
-        )
+        .header(header::CONTENT_DISPOSITION, disposition)
         .body(Body::from_stream(ReaderStream::new(file)))
     {
         Ok(response) => response,
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
+}
+
+/// `attachment` 头：ASCII 回退 `filename` + RFC 5987 `filename*`（UTF-8 百分号编码），
+/// 浏览器优先取后者，非 ASCII 文件名不再乱码。
+fn attachment_disposition(file_name: &str) -> String {
+    let fallback: String = file_name
+        .chars()
+        .map(|c| {
+            if (c.is_ascii_graphic() && !matches!(c, '"' | '\\' | '%')) || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut encoded = String::with_capacity(file_name.len());
+    for byte in file_name.bytes() {
+        if byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+            )
+        {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}")
 }
 
 async fn download_export(
@@ -354,7 +380,18 @@ async fn set_private_file_permissions(_path: &Path) -> Result<(), std::io::Error
 mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
-    use super::authorized;
+    use super::{attachment_disposition, authorized};
+
+    #[test]
+    fn attachment_disposition_carries_utf8_name_and_safe_ascii_fallback() {
+        assert_eq!(
+            attachment_disposition("报告 v1.zip"),
+            "attachment; filename=\"__ v1.zip\"; filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v1.zip"
+        );
+        let quoted = attachment_disposition("a\"b\r\n%.bin");
+        assert!(quoted.starts_with("attachment; filename=\"a_b___.bin\""));
+        assert!(quoted.ends_with("filename*=UTF-8''a%22b%0D%0A%25.bin"));
+    }
 
     #[test]
     fn bearer_auth_requires_exact_header_token() {

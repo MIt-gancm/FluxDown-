@@ -40,6 +40,10 @@ pub enum ActorOperation {
         task_id: String,
         file_name: String,
     },
+    ChangeTaskUrl {
+        task_id: String,
+        url: String,
+    },
     DeleteTask {
         task_id: String,
         delete_files: bool,
@@ -115,6 +119,11 @@ pub enum ActorOperation {
     ClearConnPolicy,
     SiteAuthDelete {
         site: String,
+    },
+    SiteAuthSave {
+        site: String,
+        user: String,
+        pass: String,
     },
     SiteAuthClear,
     CdnReportsPeek,
@@ -196,6 +205,7 @@ pub enum ActorResult {
     Config(fluxdown_protocol::DaemonConfigSnapshot),
     ConnPolicy(fluxdown_protocol::ConnPolicySummaryDto),
     SiteAuth(Vec<fluxdown_protocol::SiteAuthEntryDto>),
+    SiteAuthEntry(fluxdown_protocol::SiteAuthEntryDto),
     CdnLease(Option<fluxdown_protocol::CdnReportLeaseDto>),
     TrackerRefresh(fluxdown_protocol::TrackerSubRefreshResponse),
     Ed2kRefresh(fluxdown_protocol::Ed2kServerSubRefreshResponse),
@@ -638,6 +648,11 @@ async fn execute_operation(
             .rename_task(&task_id, &file_name)
             .await
             .map_err(ActorError::Operation)?,
+        ActorOperation::ChangeTaskUrl { task_id, url } => engine
+            .manager
+            .change_task_url(&task_id, &url)
+            .await
+            .map_err(ActorError::Operation)?,
         ActorOperation::DeleteTask {
             task_id,
             delete_files,
@@ -769,6 +784,11 @@ async fn execute_operation(
         ActorOperation::SiteAuthDelete { site } => {
             return Ok(ActorResult::SiteAuth(
                 delete_site_auth(&engine.db, &site).await?,
+            ));
+        }
+        ActorOperation::SiteAuthSave { site, user, pass } => {
+            return Ok(ActorResult::SiteAuthEntry(
+                upsert_site_auth(&engine.db, site, user, pass).await?,
             ));
         }
         ActorOperation::SiteAuthClear => {
@@ -1303,6 +1323,42 @@ pub fn site_auth_entries(
         .collect()
 }
 
+/// 站点键归一化：完整 URL 直接取 `site_key`，裸 `host` / `host:port` 补 `https://` 再取；
+/// 非 http(s) 或无法解析返回 `None`（旧 headless 宿主 `normalize_site` 的收紧版：带 scheme 的
+/// 输入不再套 `https://` 二次解析，避免 `ftp://host` 被误当成站点 `ftp`）。
+pub fn normalize_site(input: &str) -> Option<String> {
+    let input = input.trim();
+    let direct = fluxdown_engine::site_auth::site_key(input);
+    if input.contains("://") {
+        return direct;
+    }
+    direct.or_else(|| fluxdown_engine::site_auth::site_key(&format!("https://{input}")))
+}
+
+/// 新增或覆盖单站点凭据；`site` 必须已归一化，`user` 必须已去空白且非空。
+async fn upsert_site_auth(
+    db: &fluxdown_engine::db::Db,
+    site: String,
+    user: String,
+    pass: String,
+) -> Result<fluxdown_protocol::SiteAuthEntryDto, ActorError> {
+    let json = db
+        .get_config(fluxdown_engine::site_auth::SITE_AUTH_CONFIG_KEY)
+        .await
+        .map_err(|error| ActorError::Operation(format!("{error:#}")))?
+        .unwrap_or_default();
+    let mut store = fluxdown_engine::site_auth::parse_store(&json);
+    store.insert(
+        site.clone(),
+        fluxdown_engine::site_auth::SiteCredential {
+            user: user.clone(),
+            pass,
+        },
+    );
+    save_site_auth(db, &store).await?;
+    Ok(fluxdown_protocol::SiteAuthEntryDto { site, user })
+}
+
 /// 请求未指定队列时套用设置项 `default_queue_id`（与 Flutter 新建对话框
 /// 预选默认队列同义）；默认队列为空或已被删除时保持空串，由引擎归入
 /// 内置主队列。
@@ -1625,6 +1681,57 @@ mod tests {
                 .as_deref(),
             Some("{}")
         );
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[test]
+    fn normalize_site_accepts_bare_hosts_ports_and_urls_but_rejects_other_schemes() {
+        assert_eq!(super::normalize_site("Example.COM").as_deref(), Some("example.com"));
+        assert_eq!(
+            super::normalize_site(" example.com:8443 ").as_deref(),
+            Some("example.com:8443")
+        );
+        assert_eq!(
+            super::normalize_site("https://example.com:443/a.bin").as_deref(),
+            Some("example.com")
+        );
+        assert_eq!(super::normalize_site("ftp://example.com/a.bin"), None);
+        assert_eq!(super::normalize_site(""), None);
+    }
+
+    #[tokio::test]
+    async fn upsert_site_auth_overwrites_same_site_and_keeps_other_entries() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_daemon_site_auth_upsert_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await.expect("create dir");
+        let db = fluxdown_engine::db::Db::open(&dir).await.expect("open db");
+
+        let first = super::upsert_site_auth(&db, "a.example".into(), "alice".into(), "p1".into())
+            .await
+            .expect("insert");
+        assert_eq!((first.site.as_str(), first.user.as_str()), ("a.example", "alice"));
+        super::upsert_site_auth(&db, "b.example".into(), "bob".into(), "p2".into())
+            .await
+            .expect("insert second");
+        super::upsert_site_auth(&db, "a.example".into(), "alice2".into(), "p3".into())
+            .await
+            .expect("overwrite");
+
+        let json = db
+            .get_config(SITE_AUTH_CONFIG_KEY)
+            .await
+            .expect("read store")
+            .unwrap_or_default();
+        let store = fluxdown_engine::site_auth::parse_store(&json);
+        assert_eq!(store.len(), 2);
+        assert_eq!(store["a.example"].user, "alice2");
+        assert_eq!(store["a.example"].pass, "p3");
+        assert_eq!(store["b.example"].pass, "p2");
 
         drop(db);
         let _ = tokio::fs::remove_dir_all(dir).await;

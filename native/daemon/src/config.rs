@@ -18,6 +18,10 @@ pub struct DaemonConfig {
     pub data_dir_override: Option<PathBuf>,
     pub database_url: Option<String>,
     pub token_file_override: Option<PathBuf>,
+    /// `FLUXDOWN_SAVE_DIR`：仅在库中 `default_save_dir` 尚未设置时播种（见 `init_default_config`）。
+    pub save_dir_seed: Option<String>,
+    /// 演示模式：`Some(url)` 时任务 / 任务组创建只放行该 URL（trim 后精确比较）。
+    pub demo_url: Option<String>,
 }
 
 /// daemon 配置错误。
@@ -53,8 +57,70 @@ impl DaemonConfig {
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
             token_file_override: std::env::var_os("FLUXDOWN_DAEMON_TOKEN_FILE").map(PathBuf::from),
+            save_dir_seed: std::env::var("FLUXDOWN_SAVE_DIR")
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty()),
+            demo_url: demo_url_from_env(),
         })
     }
+}
+
+/// 演示模式 URL：`FLUXDOWN_DEMO_URL` 优先；否则 `FLUXDOWN_DEMO` 为真值时用内置演示文件
+/// （`http://127.0.0.1:<FLUXDOWN_BIND 端口>/demo/file`，由 agent 的 `/demo/file` 托管）。
+fn demo_url_from_env() -> Option<String> {
+    let url = std::env::var("FLUXDOWN_DEMO_URL")
+        .ok()
+        .as_deref()
+        .and_then(parse_demo_url);
+    url.or_else(|| {
+        std::env::var("FLUXDOWN_DEMO")
+            .is_ok_and(|value| flag_truthy(&value))
+            .then(|| {
+                let bind = std::env::var("FLUXDOWN_BIND").unwrap_or_default();
+                builtin_demo_url(&bind)
+            })
+    })
+}
+
+/// 归一化 `FLUXDOWN_DEMO_URL`：去掉首尾空白与误带的包裹引号（Windows cmd 的
+/// `set X="v" && …` 会把引号和尾部空格一并写进值），归一化后为空视为未开启。
+fn parse_demo_url(raw: &str) -> Option<String> {
+    let mut value = raw.trim();
+    for quote in ['"', '\''] {
+        if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
+            value = value[1..value.len() - 1].trim();
+        }
+    }
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn flag_truthy(value: &str) -> bool {
+    matches!(
+        value
+            .trim()
+            .trim_matches(['"', '\''])
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// 内置演示 URL：回环访问同进程组托管的 `/demo/file`，端口取 `bind` 末段，缺省 17800。
+fn builtin_demo_url(bind: &str) -> String {
+    let port = bind
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok())
+        .unwrap_or(17800);
+    format!("http://127.0.0.1:{port}/demo/file")
+}
+
+/// 演示模式守卫：`demo_url` 已设置且请求 URL 与之不符时返回 `false`（trim 后精确比较，
+/// 前缀 / 追加查询串不放行；空 URL 的种子任务在演示模式下同样拒绝）。
+#[must_use]
+pub fn demo_allows(demo_url: Option<&str>, url: &str) -> bool {
+    demo_url.is_none_or(|allowed| url.trim() == allowed)
 }
 
 /// 校验并规范化客户端可写的 daemon 设置（键表与值域唯一来源：
@@ -280,5 +346,44 @@ mod tests {
         assert!(!public.contains_key("site_auth_credentials"));
         assert!(!public.contains_key("daemon_config_revision"));
         assert!(!public.contains_key("daemon_migration_link_acked"));
+    }
+}
+
+#[cfg(test)]
+mod demo_tests {
+    use super::{builtin_demo_url, demo_allows, parse_demo_url};
+
+    const DEMO: &str = "https://example.com/demo.bin";
+
+    #[test]
+    fn demo_url_strips_whitespace_and_wrapping_quotes() {
+        let want = Some(DEMO.to_owned());
+        assert_eq!(parse_demo_url(DEMO), want);
+        assert_eq!(parse_demo_url("\"https://example.com/demo.bin\" "), want);
+        assert_eq!(parse_demo_url("'https://example.com/demo.bin'"), want);
+        assert_eq!(parse_demo_url("  "), None);
+        assert_eq!(parse_demo_url("\"\""), None);
+    }
+
+    #[test]
+    fn builtin_demo_url_uses_bind_port_over_loopback() {
+        assert_eq!(builtin_demo_url("0.0.0.0:17800"), "http://127.0.0.1:17800/demo/file");
+        assert_eq!(builtin_demo_url("[::]:9000"), "http://127.0.0.1:9000/demo/file");
+        assert_eq!(builtin_demo_url(""), "http://127.0.0.1:17800/demo/file");
+    }
+
+    #[test]
+    fn demo_guard_is_exact_match_after_trim() {
+        assert!(demo_allows(None, "https://evil.example/anything.iso"));
+        assert!(demo_allows(Some(DEMO), DEMO));
+        assert!(demo_allows(Some(DEMO), &format!("  {DEMO}\n")));
+        for url in [
+            "https://example.com/other.bin",
+            "https://example.com/demo.bin?x=1",
+            "https://example.com/demo.bin/../secret",
+            "",
+        ] {
+            assert!(!demo_allows(Some(DEMO), url), "{url:?} must be rejected");
+        }
     }
 }

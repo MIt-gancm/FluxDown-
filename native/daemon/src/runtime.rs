@@ -50,11 +50,12 @@ pub async fn run(
     };
 
     let (boot_db, write_guard) = open_database(&process_config, &data_dir).await?;
-    let default_save_dir = fluxdown_engine::user_dirs::download_dir_or_cwd();
-    boot_db.init_default_config(&default_save_dir).await?;
-    let all_config = boot_db.get_all_config().await?;
-
-    let snapshot = initial_snapshot(&boot_db, &all_config).await?;
+    // `FLUXDOWN_SAVE_DIR` 只作为首次播种值：库中已有 `default_save_dir` 时以库为准。
+    let default_save_dir = process_config
+        .save_dir_seed
+        .clone()
+        .unwrap_or_else(fluxdown_engine::user_dirs::download_dir_or_cwd);
+    let (all_config, snapshot) = bootstrap_database(&boot_db, &default_save_dir).await?;
     let events = DaemonEventHub::new(snapshot, 1024);
     let selections = DaemonSelection::new(events.clone());
     let sink: Arc<dyn EventSink> = Arc::new(DaemonEngineEventSink(events.clone()));
@@ -130,18 +131,21 @@ pub async fn run(
         load_or_create_bearer(&data_dir, process_config.token_file_override.as_deref()).await?;
     let blobs = Arc::new(BlobStore::open(data_dir.join("daemon-blobs")).await?);
     let hello = crate::service_hello(uuid::Uuid::new_v4().to_string(), runtime_capabilities(true));
-    let service = Arc::new(DaemonService::new(
-        hello,
-        events,
-        selections,
-        blobs.clone(),
-        actor.clone(),
-        service_db,
-        #[cfg(any(feature = "plugins", feature = "components"))]
-        service_data_dir,
-        #[cfg(feature = "plugins")]
-        service_plugin_manager,
-    ));
+    let service = Arc::new(
+        DaemonService::new(
+            hello,
+            events,
+            selections,
+            blobs.clone(),
+            actor.clone(),
+            service_db,
+            #[cfg(any(feature = "plugins", feature = "components"))]
+            service_data_dir,
+            #[cfg(feature = "plugins")]
+            service_plugin_manager,
+        )
+        .with_demo_url(process_config.demo_url.clone()),
+    );
     service
         .initialize_dynamic_projection()
         .await
@@ -220,6 +224,23 @@ async fn open_database(
         Some(url) => Db::connect_exclusive(url, data_dir).await,
         None => Db::open_exclusive(data_dir).await,
     }
+}
+
+/// 播种默认配置与内置队列后读取配置与初始快照。
+///
+/// 初始快照只在此处从库读取一次，后续靠引擎事件增量更新；而引擎启动时不会
+/// 广播队列列表，所以 `main` / `later` 必须在读快照**之前**播种，否则全新
+/// 数据目录的首次启动会给客户端一个空队列列表（`default_queue_id` 同理）。
+/// `Engine::from_db` 内的二次播种由 `builtin_queues_seeded` 守卫为空操作。
+async fn bootstrap_database(
+    db: &Db,
+    default_save_dir: &str,
+) -> Result<(HashMap<String, String>, DaemonSnapshot), fluxdown_engine::db::DbError> {
+    db.init_default_config(default_save_dir).await?;
+    db.seed_builtin_queues().await?;
+    let config = db.get_all_config().await?;
+    let snapshot = initial_snapshot(db, &config).await?;
+    Ok((config, snapshot))
 }
 
 async fn initial_snapshot(
@@ -447,4 +468,51 @@ fn config_enabled(config: &HashMap<String, String>, key: &str, default: bool) ->
         .get(key)
         .map(|value| matches!(value.as_str(), "true" | "1"))
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::bootstrap_database;
+
+    #[tokio::test]
+    async fn fresh_database_snapshot_contains_builtin_queues() {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_daemon_runtime_{}_{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("create runtime test dir");
+        let db = fluxdown_engine::db::Db::open(&dir)
+            .await
+            .expect("open runtime test db");
+
+        let (_config, snapshot) = bootstrap_database(&db, "/tmp")
+            .await
+            .expect("bootstrap fresh db");
+
+        let ids: Vec<&str> = snapshot
+            .queues
+            .iter()
+            .map(|queue| queue.queue_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                fluxdown_protocol::MAIN_QUEUE_ID,
+                fluxdown_protocol::LATER_QUEUE_ID
+            ]
+        );
+        assert_eq!(
+            snapshot
+                .config
+                .values
+                .get("default_queue_id")
+                .map(String::as_str),
+            Some(fluxdown_protocol::MAIN_QUEUE_ID)
+        );
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
 }

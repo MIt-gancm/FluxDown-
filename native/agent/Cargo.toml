@@ -71,3 +71,8 @@ desktop = [
     "dep:fluxdown_ui_i18n",
     "dep:gtk",
 ]
+
+# server 模式的 Web UI：构建期把 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`）内嵌进二进制，
+# 见 build.rs / src/web_assets.rs。未启用时 `--server` 仍可用 `FLUXDOWN_WEBROOT` 磁盘托管，
+# 否则对前端请求回 503 提示页。
+web-ui = []

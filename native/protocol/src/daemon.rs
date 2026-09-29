@@ -679,6 +679,16 @@ pub struct ChangeTaskUrlRequest {
     pub url: String,
 }
 
+/// `daemon.task.changeUrl` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeTaskUrlParams {
+    pub task_id: String,
+    /// 新下载地址（http(s)/ftp，或待解封装的 `thunder://` 链接）。
+    pub url: String,
+}
+
 /// 设置插件启用状态请求体。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1745,6 +1755,15 @@ pub struct SiteAuthSaveRequest {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct SiteAuthDeleteParams {
+    pub site: String,
+}
+
+/// `daemon.siteAuth.get` 参数：`site` 可写 `host` / `host:port` 或完整 URL，服务端归一化后查询；
+/// 结果为 [`SiteAuthCredentialDto`] 或 `null`。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct SiteAuthGetParams {
     pub site: String,
 }
 
