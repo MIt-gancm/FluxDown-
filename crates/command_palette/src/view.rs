@@ -202,11 +202,13 @@ pub fn open(window: &mut Window, cx: &mut App, translator: &Translator, config: 
             .close_button(false)
             .on_close(move |_, _, cx| mark_closed(id, cx))
             .content(move |content, _, _| {
-                content.child(
+                // 设计高度固定；窗口矮于面板时随对话框收缩，列表自带滚动。
+                content.min_h_0().child(
                     div()
                         .key_context(KEY_CONTEXT)
                         .w_full()
                         .h(px(PALETTE_LIST_HEIGHT))
+                        .min_h_0()
                         .child(
                             List::new(&list)
                                 .search_placeholder(placeholder.clone())

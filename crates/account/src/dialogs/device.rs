@@ -4,14 +4,13 @@
 
 use fluxdown_protocol::{CloudDevice, LinkDeviceInfo, LinkDeviceParams};
 use fluxdown_ui_components::{
-    ControlExt as _, DialogIntent, dialog_footer, dialog_title, field_error, field_hint, form,
-    form_field,
+    ControlExt as _, DialogIntent, dialog_footer, dialog_scroll_body, dialog_title, field_error,
+    field_hint, form, form_field,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement as _, Styled,
-    Window, div, prelude::FluentBuilder as _, px,
+    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, IntoElement, ParentElement,
+    Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, WindowExt as _,
@@ -345,7 +344,9 @@ pub(crate) fn open_detail(
             .w(px(480.))
             .content(move |content, _, cx| {
                 let tokens = active_theme(cx).tokens().clone();
-                content.child(
+                content.min_h_0().child(dialog_scroll_body(
+                    "account-device-detail-body",
+                    None,
                     v_flex()
                         .w_full()
                         .gap(tokens.spacing.sm)
@@ -375,7 +376,8 @@ pub(crate) fn open_detail(
                                     )
                             },
                         )),
-                )
+                    cx,
+                ))
             })
             .footer(dialog_footer(
                 None,
@@ -413,7 +415,7 @@ pub(crate) fn open_manage_all(host: &Entity<AccountHost>, window: &mut Window, c
         dialog
             .title(dialog_title(title.clone(), cx))
             .w(px(600.))
-            .content(move |content, _, _| content.child(view.clone()))
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
 }
 
@@ -447,31 +449,30 @@ impl Render for ManageAllDialog {
             .collect();
         v_flex()
             .w_full()
+            .min_h_0()
             .gap(tokens.spacing.md)
             .child(Input::new(&self.search).control(cx).w_full())
             .child(field_hint(hint, cx))
-            .child(
-                div()
-                    .id("account-devices-all-scroll")
-                    .w_full()
-                    .max_h(px(380.))
-                    .overflow_y_scroll()
-                    .child(if empty {
-                        div()
-                            .w_full()
-                            .py(tokens.spacing.lg)
-                            .flex()
-                            .justify_center()
-                            .child(field_hint(no_results, cx))
-                            .into_any_element()
-                    } else {
-                        fluxdown_ui_components::card(cx)
-                            .w_full()
-                            .flex()
-                            .flex_col()
-                            .children(rows)
-                            .into_any_element()
-                    }),
-            )
+            .child(dialog_scroll_body(
+                "account-devices-all-scroll",
+                Some(px(380.)),
+                if empty {
+                    div()
+                        .w_full()
+                        .py(tokens.spacing.lg)
+                        .flex()
+                        .justify_center()
+                        .child(field_hint(no_results, cx))
+                        .into_any_element()
+                } else {
+                    fluxdown_ui_components::card(cx)
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .children(rows)
+                        .into_any_element()
+                },
+                cx,
+            ))
     }
 }

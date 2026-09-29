@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use fluxdown_protocol::{AgentLoginResult, RpcErrorData, method};
 use fluxdown_ui_components::{
-    ControlExt as _, field_error, field_hint, form, form_field, input_with_action, segmented_tabs,
+    ControlExt as _, dialog_scroll_body, field_error, field_hint, form, form_field,
+    input_with_action, segmented_tabs,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -96,7 +97,7 @@ pub(crate) fn open(
         dialog
             .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
             .w(px(520.))
-            .content(move |content, _, _| content.child(view.clone()))
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
     account_input.update(cx, |input, cx| input.focus(window, cx));
 }
@@ -558,9 +559,10 @@ impl Render for LoginDialog {
         });
         v_flex()
             .w_full()
+            .min_h_0()
             .gap(tokens.spacing.lg)
             .when_some(tabs, |column, tabs| column.child(tabs))
-            .child(body)
+            .child(dialog_scroll_body("account-login-body", None, body, cx))
             .when_some(self.error.clone(), |column, error| {
                 column.child(field_error(error, cx))
             })

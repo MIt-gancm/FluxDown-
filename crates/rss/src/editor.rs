@@ -6,8 +6,8 @@ use fluxdown_protocol::{
     QueueDto, RpcErrorData, RssSourceDto, RssValidateRequest, RssValidateResponse, method,
 };
 use fluxdown_ui_components::{
-    ControlExt as _, FluxIcon, card, dialog_title, field_error, field_hint, form, form_field,
-    form_row, input_with_action, option_group, option_row, segmented_tabs,
+    ControlExt as _, FluxIcon, card, dialog_scroll_body, dialog_title, field_error, field_hint,
+    form, form_field, form_row, input_with_action, option_group, option_row, segmented_tabs,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
@@ -22,7 +22,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu as _, PopupMenuItem},
-    scroll::ScrollableElement as _,
     switch::Switch,
     v_flex,
 };
@@ -106,7 +105,7 @@ pub(super) fn open_editor(
             .overlay_closable(false)
             .keyboard(false)
             .close_button(false)
-            .content(move |content, _, _| content.child(editor.clone()))
+            .content(move |content, _, _| content.min_h_0().child(editor.clone()))
     });
     url.update(cx, |input, cx| input.focus(window, cx));
 }
@@ -898,18 +897,18 @@ impl Render for Editor {
                         cx.listener(|this, _: &ClickEvent, window, cx| this.save(window, cx)),
                     ),
             );
-        // 内容区高度随内容伸缩，超出上限时纵向滚动；标签条左对齐、与内容间隔 spacing.lg。
+        // 内容区高度随内容伸缩，超出上限或窗口高度时纵向滚动；标签条、错误行、底栏常驻可见。
         v_flex()
             .w_full()
+            .min_h_0()
             .gap(tokens.spacing.lg)
             .child(h_flex().child(self.render_tabs(cx)))
-            .child(
-                div()
-                    .max_h(px(460.))
-                    .w_full()
-                    .overflow_y_scrollbar()
-                    .child(body),
-            )
+            .child(dialog_scroll_body(
+                "rss-editor-body",
+                Some(px(460.)),
+                body,
+                cx,
+            ))
             .when_some(self.error.clone(), |root, error| {
                 root.child(field_error(SharedString::from(error), cx))
             })

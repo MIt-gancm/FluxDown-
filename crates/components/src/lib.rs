@@ -9,8 +9,9 @@ mod kit;
 pub use icons::{ComponentAssets, FluxIcon, category_icon};
 pub use kit::{
     ControlExt, DIALOG_PRIMARY_KEY_CONTEXT, DialogIntent, IconControlExt, caption_number,
-    check_row, dialog_footer, dialog_title, field_error, field_hint, field_label, form, form_field,
-    form_gap, form_row, input_with_action, option_group, option_row, segmented_tabs,
+    check_row, dialog_footer, dialog_scroll_body, dialog_title, field_error, field_hint,
+    field_label, form, form_field, form_gap, form_row, input_with_action, option_group, option_row,
+    segmented_tabs,
 };
 
 use fluxdown_ui_theme::active_theme;

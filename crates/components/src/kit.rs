@@ -24,6 +24,7 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     dialog::{DialogAction, DialogClose, DialogFooter},
     input::{Input, NumberInput},
+    scroll::ScrollableElement as _,
 };
 
 use crate::{CheckState, check_mark, tabular_numbers};
@@ -310,6 +311,36 @@ pub fn dialog_title(text: impl Into<SharedString>, cx: &App) -> Div {
         .font_weight(title.weight)
         .text_color(theme.tokens().colors.foreground)
         .child(text.into())
+}
+
+/// 对话框正文滚动区：正文高过窗口（或 `max_height` 设计上限）时纵向滚动，标题 / 底栏保持可见。
+/// 所有对话框共用。
+///
+/// gpui-component 的 `DialogContent` 是 `flex_1` 却保留内容最小高度，内容超出窗口时只会被对话框
+/// 裁剪、永远滚不动。用法：`.content(|content, ..| content.min_h_0().child(…))`；若中间隔着视图根，
+/// 视图根也要 `min_h_0()`。可变高度的正文放进本滚动区，错误行、按钮行作为兄弟节点放在外面。
+///
+/// 上限只能加在滚动元素外层：直接给 `overflow_y_scrollbar` 元素设 `max_h` 时内部滚动区按内容高度
+/// 排版，滚不到底。四周留 `spacing.xxs` 给输入框聚焦环（负外边距抵消，正文与标题仍左右对齐）。
+pub fn dialog_scroll_body(
+    id: impl Into<ElementId>,
+    max_height: Option<Pixels>,
+    body: impl IntoElement,
+    cx: &App,
+) -> Div {
+    let inset = active_theme(cx).tokens().spacing.xxs;
+    div()
+        .flex()
+        .flex_col()
+        .min_h_0()
+        .mx(-inset)
+        .when_some(max_height, |this, max_height| this.max_h(max_height))
+        .child(
+            div()
+                .overflow_y_scrollbar()
+                .id(id)
+                .child(div().p(inset).child(body)),
+        )
 }
 
 // ── 表单原语 ─────────────────────────────────────────────────────────────

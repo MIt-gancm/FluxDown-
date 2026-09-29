@@ -12,7 +12,9 @@
 
 use std::rc::Rc;
 
-use fluxdown_ui_components::{ButtonVariant, ControlExt as _, FluxIcon, card, dialog_title};
+use fluxdown_ui_components::{
+    ButtonVariant, ControlExt as _, FluxIcon, card, dialog_scroll_body, dialog_title,
+};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     Anchor, AnyElement, App, AppContext as _, Div, ElementId, FontWeight, InteractiveElement as _,
@@ -25,7 +27,6 @@ use gpui_component::{
     h_flex,
     input::{Input, InputEvent, InputState, NumberInput, NumberInputEvent, StepAction},
     menu::{DropdownMenu as _, PopupMenuItem},
-    scroll::ScrollableElement as _,
     switch::Switch,
     tooltip::Tooltip,
     v_flex,
@@ -343,14 +344,16 @@ fn open_explain_dialog(explain: Explain, window: &mut Window, cx: &mut App) {
                         )
                 });
                 content
-                    .child(
+                    .min_h_0()
+                    .child(dialog_scroll_body(
+                        "settings-explain-body",
+                        Some(px(460.)),
                         v_flex()
                             .w_full()
-                            .max_h(px(460.))
                             .gap(tokens.spacing.md)
-                            .overflow_y_scrollbar()
                             .children(paragraphs),
-                    )
+                        cx,
+                    ))
                     .child(
                         dialog_footer(
                             None,

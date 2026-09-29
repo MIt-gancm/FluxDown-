@@ -1203,7 +1203,7 @@ impl ExtensionsView {
                     dialog_for_cancel.update(cx, |this, cx| this.cancel_session(cx));
                     true
                 })
-                .content(move |content, _, _| content.child(dialog_for_content.clone()))
+                .content(move |content, _, _| content.min_h_0().child(dialog_for_content.clone()))
         });
     }
 }

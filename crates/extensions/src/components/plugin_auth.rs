@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fluxdown_protocol::{PluginAuthResponse, RpcErrorData};
-use fluxdown_ui_components::{ControlExt as _, FluxIcon, field_error, form, form_field};
+use fluxdown_ui_components::{
+    ControlExt as _, FluxIcon, dialog_scroll_body, field_error, form, form_field,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::prelude::FluentBuilder as _;
@@ -387,7 +389,7 @@ impl Render for PluginAuthDialog {
         };
         let challenge = self.challenge.clone();
         let challenge_type_label = self.challenge_type.clone().unwrap_or_default();
-        v_flex()
+        let body = v_flex()
             .w_full()
             .gap(tokens.spacing.lg)
             .child(
@@ -466,7 +468,13 @@ impl Render for PluginAuthDialog {
                             )
                         }),
                 )
-            })
+            });
+        // 表单与挑战（二维码）可能高过窗口：正文滚动，错误行与底栏常驻可见。
+        v_flex()
+            .w_full()
+            .min_h_0()
+            .gap(tokens.spacing.lg)
+            .child(dialog_scroll_body("plugin-auth-body", None, body, cx))
             .when_some(self.message.clone(), |this, message| {
                 this.child(field_error(message, cx))
             })

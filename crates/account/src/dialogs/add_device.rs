@@ -8,8 +8,8 @@ use fluxdown_protocol::{
     LinkPairFinishResponse, LinkPairingCodeDto, method,
 };
 use fluxdown_ui_components::{
-    ControlExt as _, field_error, field_hint, field_label, form_field, input_with_action,
-    segmented_tabs, tabular_numbers,
+    ControlExt as _, dialog_scroll_body, field_error, field_hint, field_label, form_field,
+    input_with_action, segmented_tabs, tabular_numbers,
 };
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -68,7 +68,7 @@ pub fn open(host: &Entity<AccountHost>, window: &mut Window, cx: &mut App) {
         dialog
             .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
             .w(px(560.))
-            .content(move |content, _, _| content.child(view.clone()))
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
             .on_close(move |_, _, cx| {
                 closing.update(cx, |this, cx| this.shutdown(cx));
             })
@@ -787,6 +787,7 @@ impl Render for AddDeviceDialog {
         };
         v_flex()
             .w_full()
+            .min_h_0()
             .gap(tokens.spacing.lg)
             .child(segmented_tabs(
                 "add-device-tabs",
@@ -802,13 +803,11 @@ impl Render for AddDeviceDialog {
                 },
                 cx,
             ))
-            .child(
-                div()
-                    .id("add-device-body")
-                    .w_full()
-                    .max_h(px(460.))
-                    .overflow_y_scroll()
-                    .child(body),
-            )
+            .child(dialog_scroll_body(
+                "add-device-body",
+                Some(px(460.)),
+                body,
+                cx,
+            ))
     }
 }

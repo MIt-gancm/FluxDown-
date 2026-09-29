@@ -2,8 +2,8 @@
 //! `lib/src/widgets/category_edit_dialog.dart` 逐条对齐。
 
 use fluxdown_ui_components::{
-    ControlExt as _, DialogIntent, category_icon, dialog_title, field_error, form, form_field,
-    input_with_action, segmented_tabs,
+    ControlExt as _, DialogIntent, category_icon, dialog_scroll_body, dialog_title, field_error,
+    form, form_field, input_with_action, segmented_tabs,
 };
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::{CONTROL_HEIGHT, active_theme};
@@ -17,7 +17,6 @@ use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     input::{Input, InputState},
-    scroll::ScrollableElement as _,
 };
 
 use super::categories::{CategoryEntry, read_categories, write_categories};
@@ -145,7 +144,7 @@ pub(crate) fn open(
         dialog
             .title(dialog_title(title.clone(), cx))
             .w(px(520.))
-            .content(move |content, _, _| content.child(view.clone()))
+            .content(move |content, _, _| content.min_h_0().child(view.clone()))
     });
     name.update(cx, |input, cx| input.focus(window, cx));
 }
@@ -567,14 +566,14 @@ impl Render for CategoryDialog {
             .flex()
             .flex_col()
             .w_full()
+            .min_h_0()
             .gap(tokens.spacing.lg)
-            .child(
-                div()
-                    .w_full()
-                    .max_h(px(480.))
-                    .overflow_y_scrollbar()
-                    .child(body),
-            )
+            .child(dialog_scroll_body(
+                "category-dialog-body",
+                Some(px(480.)),
+                body,
+                cx,
+            ))
             .when_some(self.error.clone(), |this, error| {
                 this.child(field_error(error, cx))
             })

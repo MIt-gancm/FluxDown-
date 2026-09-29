@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use fluxdown_protocol::{MarketEntryDto, PluginDto};
-use fluxdown_ui_components::tabular_numbers;
+use fluxdown_ui_components::{dialog_scroll_body, tabular_numbers};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{App, FontWeight, IntoElement, ParentElement, SharedString, Styled, Window, div, px};
@@ -115,7 +115,14 @@ pub fn open_plugin_detail(
                 cx,
             ))
             .w(px(480.))
-            .content(move |root, _, cx| root.child(render_detail(&detail, &translator, cx)))
+            .content(move |root, _, cx| {
+                root.min_h_0().child(dialog_scroll_body(
+                    "plugin-detail-body",
+                    None,
+                    render_detail(&detail, &translator, cx),
+                    cx,
+                ))
+            })
     });
 }
 
