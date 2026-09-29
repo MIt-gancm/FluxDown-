@@ -180,7 +180,7 @@ end;
 
 { Extract the quoted executable path from a `"<exe>" "%1"`-style
   shell\open\command value (the format written by the agent,
-  native/agent/src/platform/{protocol_registry,file_association}.rs). }
+  native/agent/src/platform/protocol_registry.rs and file_association.rs). }
 function ExtractQuotedExe(const Command: String): String;
 var
   FirstQuote, SecondQuote: Integer;
