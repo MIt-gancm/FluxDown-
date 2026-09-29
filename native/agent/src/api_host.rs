@@ -14,11 +14,11 @@ use fluxdown_protocol::method;
 use fluxdown_protocol::{
     ApplicationErrorCode, ChangeTaskUrlParams, CreateGroupRequest, CreateGroupResponse,
     CreateTaskRequest, DaemonConfigPatch, DaemonCreateTaskParams, DownloadRequest, GroupDto,
-    InstallPluginDevRequest, InstalledPlugin, LinkDeviceInfo, MarketEntryDto,
-    MarketInstallRequest, PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto,
-    ResolvePreviewRequest, ResolvePreviewResponse, RpcErrorObject, RssItemActionRequest,
-    RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto,
-    SiteAuthEntryDto, SiteAuthGetParams, SiteAuthSaveRequest, TaskDto,
+    InstallPluginDevRequest, InstalledPlugin, LinkDeviceInfo, MarketEntryDto, MarketInstallRequest,
+    PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto, ResolvePreviewRequest,
+    ResolvePreviewResponse, RpcErrorObject, RssItemActionRequest, RssItemDto, RssSourceDto,
+    RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto, SiteAuthEntryDto,
+    SiteAuthGetParams, SiteAuthSaveRequest, TaskDto,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -114,7 +114,9 @@ impl AgentApiHost {
 #[async_trait]
 impl ApiHost for AgentApiHost {
     async fn list_tasks(&self) -> Result<Vec<TaskDto>, ApiError> {
-        Ok(self.events.inspect(|snapshot| snapshot.daemon.tasks.clone()))
+        Ok(self
+            .events
+            .inspect(|snapshot| snapshot.daemon.tasks.clone()))
     }
 
     async fn get_task(&self, task_id: &str) -> Result<Option<TaskDto>, ApiError> {
@@ -201,7 +203,9 @@ impl ApiHost for AgentApiHost {
     }
 
     async fn list_queues(&self) -> Result<Vec<QueueDto>, ApiError> {
-        Ok(self.events.inspect(|snapshot| snapshot.daemon.queues.clone()))
+        Ok(self
+            .events
+            .inspect(|snapshot| snapshot.daemon.queues.clone()))
     }
 
     async fn submit_external(&self, request: DownloadRequest) -> Result<(), ApiError> {
@@ -233,7 +237,9 @@ impl ApiHost for AgentApiHost {
 
     async fn apply_config(&self, changes: HashMap<String, String>) -> Result<(), ApiError> {
         let values: BTreeMap<String, String> = changes.into_iter().collect();
-        let mut revision = self.events.inspect(|snapshot| snapshot.daemon.config.revision);
+        let mut revision = self
+            .events
+            .inspect(|snapshot| snapshot.daemon.config.revision);
         // 投影可能落后于 daemon：遇到版本冲突时用 daemon 报告的当前版本重试一次。
         for attempt in 0..2 {
             let result = self
@@ -306,8 +312,11 @@ impl ApiHost for AgentApiHost {
     }
 
     async fn uninstall_plugin(&self, identity: &str) -> Result<(), ApiError> {
-        self.unit(method::DAEMON_PLUGIN_UNINSTALL, json!({ "identity": identity }))
-            .await
+        self.unit(
+            method::DAEMON_PLUGIN_UNINSTALL,
+            json!({ "identity": identity }),
+        )
+        .await
     }
 
     async fn update_plugin_settings(
@@ -342,12 +351,16 @@ impl ApiHost for AgentApiHost {
     async fn install_plugin_dev(&self, dir_path: String) -> Result<String, ApiError> {
         let params = serde_json::to_value(InstallPluginDevRequest { dir_path })
             .map_err(|error| ApiError::Internal(error.to_string()))?;
-        self.installed(method::DAEMON_PLUGIN_INSTALL_DEV, params).await
+        self.installed(method::DAEMON_PLUGIN_INSTALL_DEV, params)
+            .await
     }
 
     async fn ignore_plugin_retry(&self, task_id: &str) -> Result<(), ApiError> {
-        self.unit(method::DAEMON_PLUGIN_IGNORE_RETRY, json!({ "taskId": task_id }))
-            .await
+        self.unit(
+            method::DAEMON_PLUGIN_IGNORE_RETRY,
+            json!({ "taskId": task_id }),
+        )
+        .await
     }
 
     async fn market_list(&self) -> Result<Vec<MarketEntryDto>, ApiError> {
@@ -375,7 +388,8 @@ impl ApiHost for AgentApiHost {
         &self,
         request: ResolvePreviewRequest,
     ) -> Result<ResolvePreviewResponse, ApiError> {
-        self.rpc(method::DAEMON_GROUP_RESOLVE_PREVIEW, request).await
+        self.rpc(method::DAEMON_GROUP_RESOLVE_PREVIEW, request)
+            .await
     }
 
     async fn create_task_group(&self, request: CreateGroupRequest) -> Result<String, ApiError> {
@@ -384,7 +398,9 @@ impl ApiHost for AgentApiHost {
     }
 
     async fn list_groups(&self) -> Result<Vec<GroupDto>, ApiError> {
-        Ok(self.events.inspect(|snapshot| snapshot.daemon.groups.clone()))
+        Ok(self
+            .events
+            .inspect(|snapshot| snapshot.daemon.groups.clone()))
     }
 
     async fn group_pause(&self, group_id: &str) -> Result<(), ApiError> {
@@ -451,8 +467,11 @@ impl ApiHost for AgentApiHost {
     }
 
     async fn list_rss_items(&self, source_id: &str) -> Result<Vec<RssItemDto>, ApiError> {
-        self.rpc(method::DAEMON_RSS_GET_ITEMS, json!({ "sourceId": source_id }))
-            .await
+        self.rpc(
+            method::DAEMON_RSS_GET_ITEMS,
+            json!({ "sourceId": source_id }),
+        )
+        .await
     }
 
     async fn rss_item_action(
@@ -583,9 +602,7 @@ mod tests {
     use fluxdown_api::service::ApiError;
     use fluxdown_protocol::{ApplicationErrorCode, RpcErrorData, RpcErrorObject};
 
-    use super::{
-        RenameCodes, blob_error, conflict_revision, engine_code_error, object_error,
-    };
+    use super::{RenameCodes, blob_error, conflict_revision, engine_code_error, object_error};
     use crate::capture::BlobError;
 
     fn internal(message: &str) -> RpcErrorObject {
@@ -601,7 +618,10 @@ mod tests {
         assert!(matches!(map("not-found"), ApiError::NotFound));
         assert!(matches!(map("invalid-name"), ApiError::BadRequest(m) if m == "invalid-name"));
         for code in ["task-active", "bt-unsupported", "target-exists"] {
-            assert!(matches!(map(code), ApiError::Conflict(m) if m == code), "{code}");
+            assert!(
+                matches!(map(code), ApiError::Conflict(m) if m == code),
+                "{code}"
+            );
         }
         // 引擎 IO / DB 错误不属稳定码：按 Internal 透传原文。
         assert!(matches!(map("rename: denied"), ApiError::Internal(m) if m == "rename: denied"));
@@ -621,10 +641,16 @@ mod tests {
             "protocol-unsupported",
             "protocol-mismatch",
         ] {
-            assert!(matches!(map(code), ApiError::Conflict(m) if m == code), "{code}");
+            assert!(
+                matches!(map(code), ApiError::Conflict(m) if m == code),
+                "{code}"
+            );
         }
         assert!(matches!(map("invalid-name"), ApiError::Internal(_)));
-        assert!(matches!(map("thunder decode failed"), ApiError::Internal(_)));
+        assert!(matches!(
+            map("thunder decode failed"),
+            ApiError::Internal(_)
+        ));
     }
 
     #[test]
@@ -635,15 +661,31 @@ mod tests {
                 RpcErrorData::new(code, false),
             ))
         };
-        assert!(matches!(with(ApplicationErrorCode::Unauthorized), ApiError::Unauthorized));
-        assert!(matches!(with(ApplicationErrorCode::NotFound), ApiError::NotFound));
-        assert!(matches!(with(ApplicationErrorCode::Conflict), ApiError::Conflict(m) if m == "detail"));
+        assert!(matches!(
+            with(ApplicationErrorCode::Unauthorized),
+            ApiError::Unauthorized
+        ));
+        assert!(matches!(
+            with(ApplicationErrorCode::NotFound),
+            ApiError::NotFound
+        ));
+        assert!(
+            matches!(with(ApplicationErrorCode::Conflict), ApiError::Conflict(m) if m == "detail")
+        );
         assert!(
             matches!(with(ApplicationErrorCode::InvalidArgument), ApiError::BadRequest(m) if m == "detail")
         );
-        assert!(matches!(with(ApplicationErrorCode::Unavailable), ApiError::Unavailable));
-        assert!(matches!(with(ApplicationErrorCode::Timeout), ApiError::Unavailable));
-        assert!(matches!(with(ApplicationErrorCode::Unsupported), ApiError::Internal(m) if m == "detail"));
+        assert!(matches!(
+            with(ApplicationErrorCode::Unavailable),
+            ApiError::Unavailable
+        ));
+        assert!(matches!(
+            with(ApplicationErrorCode::Timeout),
+            ApiError::Unavailable
+        ));
+        assert!(
+            matches!(with(ApplicationErrorCode::Unsupported), ApiError::Internal(m) if m == "detail")
+        );
         // 无应用错误详情（协议级错误）→ Internal。
         let bare = RpcErrorObject {
             code: -32601,
@@ -662,15 +704,30 @@ mod tests {
             Some(9)
         );
         data.code = ApplicationErrorCode::InvalidArgument;
-        assert_eq!(conflict_revision(&RpcErrorObject::application("c", data)), None);
+        assert_eq!(
+            conflict_revision(&RpcErrorObject::application("c", data)),
+            None
+        );
         assert_eq!(conflict_revision(&internal("x")), None);
     }
 
     #[test]
     fn plugin_blob_rejections_are_client_errors_other_failures_are_internal() {
-        assert!(matches!(blob_error(BlobError::Status(413)), ApiError::BadRequest(_)));
-        assert!(matches!(blob_error(BlobError::Status(400)), ApiError::BadRequest(_)));
-        assert!(matches!(blob_error(BlobError::Status(500)), ApiError::Internal(_)));
-        assert!(matches!(blob_error(BlobError::Decode), ApiError::Internal(_)));
+        assert!(matches!(
+            blob_error(BlobError::Status(413)),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            blob_error(BlobError::Status(400)),
+            ApiError::BadRequest(_)
+        ));
+        assert!(matches!(
+            blob_error(BlobError::Status(500)),
+            ApiError::Internal(_)
+        ));
+        assert!(matches!(
+            blob_error(BlobError::Decode),
+            ApiError::Internal(_)
+        ));
     }
 }

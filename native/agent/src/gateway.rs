@@ -30,8 +30,8 @@ use crate::lifecycle::Lifecycle;
 use crate::platform::PlatformError;
 use crate::power::PowerService;
 use crate::remote::{RemoteError, RemoteTaskService};
-use crate::shell::ShellState;
 use crate::server_mode::ServerHandle;
+use crate::shell::ShellState;
 use crate::sync::SyncService;
 use crate::update::{UpdateError, UpdateService};
 
@@ -1250,11 +1250,9 @@ async fn rpc_upgrade(
 ) -> Response {
     let upgrade = match state.server.as_deref() {
         Some(server) => {
-            if let Err(status) = crate::server_mode::authorize_rpc(
-                &headers,
-                &state.bearer,
-                server.access_key(),
-            ) {
+            if let Err(status) =
+                crate::server_mode::authorize_rpc(&headers, &state.bearer, server.access_key())
+            {
                 return status.into_response();
             }
             // 浏览器经子协议携带密钥：必须回显 `fluxdown.rpc.v1`，否则浏览器会断开握手。

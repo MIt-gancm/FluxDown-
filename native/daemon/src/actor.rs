@@ -1688,7 +1688,10 @@ mod tests {
 
     #[test]
     fn normalize_site_accepts_bare_hosts_ports_and_urls_but_rejects_other_schemes() {
-        assert_eq!(super::normalize_site("Example.COM").as_deref(), Some("example.com"));
+        assert_eq!(
+            super::normalize_site("Example.COM").as_deref(),
+            Some("example.com")
+        );
         assert_eq!(
             super::normalize_site(" example.com:8443 ").as_deref(),
             Some("example.com:8443")
@@ -1714,7 +1717,10 @@ mod tests {
         let first = super::upsert_site_auth(&db, "a.example".into(), "alice".into(), "p1".into())
             .await
             .expect("insert");
-        assert_eq!((first.site.as_str(), first.user.as_str()), ("a.example", "alice"));
+        assert_eq!(
+            (first.site.as_str(), first.user.as_str()),
+            ("a.example", "alice")
+        );
         super::upsert_site_auth(&db, "b.example".into(), "bob".into(), "p2".into())
             .await
             .expect("insert second");

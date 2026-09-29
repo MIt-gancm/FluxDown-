@@ -8,8 +8,7 @@ use std::time::Duration;
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
     ApplicationErrorCode, EventFrame, RequestId, RpcErrorData, RpcErrorObject, RpcNotification,
-    RpcRequest,
-    RpcResponse, ServiceHello, ServiceRole, Snapshot, SnapshotBody,
+    RpcRequest, RpcResponse, ServiceHello, ServiceRole, Snapshot, SnapshotBody,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;

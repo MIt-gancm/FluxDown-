@@ -154,7 +154,9 @@ impl Tracker {
                 .collect(),
             DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => self.reconcile(tasks),
             DaemonEvent::TaskChanged(task) => self.task_changed(task).into_iter().collect(),
-            DaemonEvent::TaskDeleted { task_id } => self.task_deleted(task_id).into_iter().collect(),
+            DaemonEvent::TaskDeleted { task_id } => {
+                self.task_deleted(task_id).into_iter().collect()
+            }
             DaemonEvent::SnapshotReplaced(snapshot) => self.replace(&snapshot.tasks),
             _ => Vec::new(),
         }
@@ -249,9 +251,7 @@ mod tests {
     use std::time::Duration;
 
     use fluxdown_api::service::TaskEventKind;
-    use fluxdown_protocol::{
-        AgentSnapshot, DaemonEvent, DaemonSnapshot, TaskDto, WsServerMsg,
-    };
+    use fluxdown_protocol::{AgentSnapshot, DaemonEvent, DaemonSnapshot, TaskDto, WsServerMsg};
 
     use super::{TaskEventHub, Tracker};
     use crate::event_hub::AgentEventHub;
@@ -322,17 +322,38 @@ mod tests {
     fn progress_lifecycle_follows_shared_transition_rules_and_dedupes() {
         let mut tracker = Tracker::default();
         let mut run = |event: DaemonEvent| kinds(&tracker.apply(&event));
-        assert_eq!(run(progress("t", 1, 10)), [("t".to_owned(), TaskEventKind::Start)]);
-        assert!(run(progress("t", 1, 20)).is_empty(), "same status must not repeat");
-        assert_eq!(run(progress("t", 2, 0)), [("t".to_owned(), TaskEventKind::Pause)]);
-        assert_eq!(run(progress("t", 1, 5)), [("t".to_owned(), TaskEventKind::Start)]);
-        assert_eq!(run(progress("t", 3, 0)), [("t".to_owned(), TaskEventKind::Complete)]);
+        assert_eq!(
+            run(progress("t", 1, 10)),
+            [("t".to_owned(), TaskEventKind::Start)]
+        );
+        assert!(
+            run(progress("t", 1, 20)).is_empty(),
+            "same status must not repeat"
+        );
+        assert_eq!(
+            run(progress("t", 2, 0)),
+            [("t".to_owned(), TaskEventKind::Pause)]
+        );
+        assert_eq!(
+            run(progress("t", 1, 5)),
+            [("t".to_owned(), TaskEventKind::Start)]
+        );
+        assert_eq!(
+            run(progress("t", 3, 0)),
+            [("t".to_owned(), TaskEventKind::Complete)]
+        );
         assert!(
             run(progress("t", 1, 5)).is_empty(),
             "completed is a terminal GID state: no second Start"
         );
-        assert_eq!(run(progress("e", 1, 5)), [("e".to_owned(), TaskEventKind::Start)]);
-        assert_eq!(run(progress("e", 4, 0)), [("e".to_owned(), TaskEventKind::Error)]);
+        assert_eq!(
+            run(progress("e", 1, 5)),
+            [("e".to_owned(), TaskEventKind::Start)]
+        );
+        assert_eq!(
+            run(progress("e", 4, 0)),
+            [("e".to_owned(), TaskEventKind::Error)]
+        );
     }
 
     #[test]
@@ -393,7 +414,11 @@ mod tests {
         let mut tracker = Tracker::default();
         tracker.apply(&progress("t", 1, 1));
         // 过期快照仍把任务标成 pending：不得把已知前态往回冲。
-        assert!(tracker.apply(&snapshot_event(vec![task("t", 0)])).is_empty());
+        assert!(
+            tracker
+                .apply(&snapshot_event(vec![task("t", 0)]))
+                .is_empty()
+        );
         assert_eq!(
             kinds(&tracker.apply(&progress("t", 2, 0))),
             [("t".to_owned(), TaskEventKind::Pause)]
@@ -501,11 +526,17 @@ mod tests {
         hub.apply_daemon_event(progress("live", 1, 42));
         hub.apply_daemon_event(progress("old", 1, 9));
         let event = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await??;
-        assert_eq!((event.task_id.as_str(), event.kind), ("old", TaskEventKind::Start));
+        assert_eq!(
+            (event.task_id.as_str(), event.kind),
+            ("old", TaskEventKind::Start)
+        );
 
         hub.apply_daemon_event(progress("old", 3, 0));
         let event = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await??;
-        assert_eq!((event.task_id.as_str(), event.kind), ("old", TaskEventKind::Complete));
+        assert_eq!(
+            (event.task_id.as_str(), event.kind),
+            ("old", TaskEventKind::Complete)
+        );
 
         let speeds = task_hub.live_speeds();
         assert_eq!(speeds.get("live").map(|s| s.download_bps), Some(42));

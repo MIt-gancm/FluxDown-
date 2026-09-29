@@ -367,8 +367,14 @@ mod demo_tests {
 
     #[test]
     fn builtin_demo_url_uses_bind_port_over_loopback() {
-        assert_eq!(builtin_demo_url("0.0.0.0:17800"), "http://127.0.0.1:17800/demo/file");
-        assert_eq!(builtin_demo_url("[::]:9000"), "http://127.0.0.1:9000/demo/file");
+        assert_eq!(
+            builtin_demo_url("0.0.0.0:17800"),
+            "http://127.0.0.1:17800/demo/file"
+        );
+        assert_eq!(
+            builtin_demo_url("[::]:9000"),
+            "http://127.0.0.1:9000/demo/file"
+        );
         assert_eq!(builtin_demo_url(""), "http://127.0.0.1:17800/demo/file");
     }
 

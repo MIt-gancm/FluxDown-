@@ -114,7 +114,10 @@ impl ServerConfig {
             .and_then(|value| match validate_access_key(&value) {
                 Ok(()) => Some(value),
                 Err(reason) => {
-                    tracing::warn!(reason, "FLUXDOWN_TOKEN does not meet the access key policy; ignored");
+                    tracing::warn!(
+                        reason,
+                        "FLUXDOWN_TOKEN does not meet the access key policy; ignored"
+                    );
                     None
                 }
             });
@@ -542,13 +545,7 @@ impl DaemonHttp {
             }
             Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
-        let upstream = match self
-            .client
-            .get(url)
-            .bearer_auth(&self.bearer)
-            .send()
-            .await
-        {
+        let upstream = match self.client.get(url).bearer_auth(&self.bearer).send().await {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(error = %error, "daemon file proxy request failed");
@@ -580,8 +577,7 @@ impl DaemonHttp {
             header::CONTENT_LENGTH,
             header::CONTENT_DISPOSITION,
         ] {
-            if let Some(value) = forced(&name).or_else(|| upstream.headers().get(&name).cloned())
-            {
+            if let Some(value) = forced(&name).or_else(|| upstream.headers().get(&name).cloned()) {
                 builder = builder.header(name, value);
             }
         }
@@ -660,7 +656,10 @@ struct SetupBody {
     token: String,
 }
 
-async fn setup_submit(State(handle): State<Arc<ServerHandle>>, body: axum::body::Bytes) -> Response {
+async fn setup_submit(
+    State(handle): State<Arc<ServerHandle>>,
+    body: axum::body::Bytes,
+) -> Response {
     if !handle.wait_ready().await {
         return starting_response();
     }
@@ -700,7 +699,14 @@ async fn upload_torrent(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    upload_blob(&handle, BlobKind::Torrent, &headers, query.token.as_deref(), body).await
+    upload_blob(
+        &handle,
+        BlobKind::Torrent,
+        &headers,
+        query.token.as_deref(),
+        body,
+    )
+    .await
 }
 
 async fn upload_plugin(
@@ -709,7 +715,14 @@ async fn upload_plugin(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    upload_blob(&handle, BlobKind::Plugin, &headers, query.token.as_deref(), body).await
+    upload_blob(
+        &handle,
+        BlobKind::Plugin,
+        &headers,
+        query.token.as_deref(),
+        body,
+    )
+    .await
 }
 
 async fn upload_blob(
@@ -894,7 +907,10 @@ mod tests {
             "192.168.1.10:9000"
         );
         assert_eq!(
-            config_from(&[("FLUXDOWN_BIND", "[::]:17800")]).unwrap().bind.port(),
+            config_from(&[("FLUXDOWN_BIND", "[::]:17800")])
+                .unwrap()
+                .bind
+                .port(),
             17800
         );
         assert!(config_from(&[("FLUXDOWN_BIND", "not-an-address")]).is_err());
@@ -959,7 +975,10 @@ mod tests {
     }
 
     fn token_protocol(token: &str) -> String {
-        format!("{TOKEN_SUBPROTOCOL_PREFIX}{}", URL_SAFE_NO_PAD.encode(token))
+        format!(
+            "{TOKEN_SUBPROTOCOL_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(token)
+        )
     }
 
     #[test]
@@ -986,7 +1005,10 @@ mod tests {
             None
         );
         let bad = format!("{RPC_SUBPROTOCOL}, {TOKEN_SUBPROTOCOL_PREFIX}!!!");
-        assert_eq!(subprotocol_token(&headers(&[("sec-websocket-protocol", &bad)])), None);
+        assert_eq!(
+            subprotocol_token(&headers(&[("sec-websocket-protocol", &bad)])),
+            None
+        );
     }
 
     #[test]
@@ -1006,7 +1028,11 @@ mod tests {
         );
         let protocols = format!("{RPC_SUBPROTOCOL}, {}", token_protocol("flux2026"));
         assert_eq!(
-            authorize_rpc(&headers(&[("sec-websocket-protocol", &protocols)]), agent, &key),
+            authorize_rpc(
+                &headers(&[("sec-websocket-protocol", &protocols)]),
+                agent,
+                &key
+            ),
             Ok(())
         );
         let wrong = format!("{RPC_SUBPROTOCOL}, {}", token_protocol("flux2027"));
@@ -1021,7 +1047,11 @@ mod tests {
         let key = TokenCell::new("");
         let empty = format!("{RPC_SUBPROTOCOL}, {TOKEN_SUBPROTOCOL_PREFIX}");
         assert_eq!(
-            authorize_rpc(&headers(&[("sec-websocket-protocol", &empty)]), "agent", &key),
+            authorize_rpc(
+                &headers(&[("sec-websocket-protocol", &empty)]),
+                "agent",
+                &key
+            ),
             Err(StatusCode::UNAUTHORIZED)
         );
         assert_eq!(
@@ -1033,13 +1063,22 @@ mod tests {
     #[test]
     fn origin_must_match_host_when_present() {
         assert!(origin_allowed(&HeaderMap::new()));
-        let same = headers(&[("origin", "http://nas.local:17800"), ("host", "nas.local:17800")]);
+        let same = headers(&[
+            ("origin", "http://nas.local:17800"),
+            ("host", "nas.local:17800"),
+        ]);
         assert!(origin_allowed(&same));
         let case = headers(&[("origin", "https://NAS.local"), ("host", "nas.LOCAL")]);
         assert!(origin_allowed(&case));
-        let cross = headers(&[("origin", "https://evil.example"), ("host", "nas.local:17800")]);
+        let cross = headers(&[
+            ("origin", "https://evil.example"),
+            ("host", "nas.local:17800"),
+        ]);
         assert!(!origin_allowed(&cross));
-        let port = headers(&[("origin", "http://nas.local:1"), ("host", "nas.local:17800")]);
+        let port = headers(&[
+            ("origin", "http://nas.local:1"),
+            ("host", "nas.local:17800"),
+        ]);
         assert!(!origin_allowed(&port));
         let null = headers(&[("origin", "null"), ("host", "nas.local")]);
         assert!(!origin_allowed(&null));
@@ -1207,7 +1246,10 @@ mod tests {
             .json()
             .await
             .unwrap();
-        assert_eq!(status, serde_json::json!({ "setupRequired": true, "minLength": 8 }));
+        assert_eq!(
+            status,
+            serde_json::json!({ "setupRequired": true, "minLength": 8 })
+        );
 
         let post = |body: &str| {
             client
@@ -1239,7 +1281,10 @@ mod tests {
         let again = post(r#"{"token":"other2026"}"#).await.unwrap();
         assert_eq!(again.status(), 409);
         let again: serde_json::Value = again.json().await.unwrap();
-        assert_eq!(again, serde_json::json!({ "error": "setup already completed" }));
+        assert_eq!(
+            again,
+            serde_json::json!({ "error": "setup already completed" })
+        );
         assert_eq!(&*harness.handle.access_key().get(), "flux2026");
 
         let status: serde_json::Value = client
@@ -1289,7 +1334,11 @@ mod tests {
             let denied = client.get(format!("{logs}{query}")).send().await.unwrap();
             assert_eq!(denied.status(), 401, "{query}");
         }
-        let ok = client.get(format!("{logs}?token=flux2026")).send().await.unwrap();
+        let ok = client
+            .get(format!("{logs}?token=flux2026"))
+            .send()
+            .await
+            .unwrap();
         assert_eq!(ok.status(), 200);
         assert_eq!(ok.headers()[header::CONTENT_TYPE], "application/zip");
         assert!(ok.bytes().await.unwrap().starts_with(b"PK"));

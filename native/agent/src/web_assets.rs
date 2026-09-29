@@ -68,11 +68,7 @@ pub(crate) async fn handler(method: Method, uri: Uri, headers: HeaderMap) -> Res
 /// `FLUXDOWN_WEBROOT` 磁盘托管：语义与嵌入托管一致（GET/HEAD、目录 `index.html`、
 /// 未命中回退 `index.html`），但不做 ETag/缓存分档——磁盘覆盖用于自定义 / 调试前端，
 /// 一律 `no-cache`。目录缺失或缺 `index.html` 时回 503 提示页。
-pub(crate) async fn disk_handler(
-    root: std::path::PathBuf,
-    method: Method,
-    uri: Uri,
-) -> Response {
+pub(crate) async fn disk_handler(root: std::path::PathBuf, method: Method, uri: Uri) -> Response {
     if !matches!(method, Method::GET | Method::HEAD) {
         return (
             StatusCode::METHOD_NOT_ALLOWED,
@@ -86,7 +82,10 @@ pub(crate) async fn disk_handler(
         Ok(meta) if meta.is_file() => candidate,
         Ok(meta) if meta.is_dir() => {
             let nested = candidate.join(INDEX);
-            if tokio::fs::metadata(&nested).await.is_ok_and(|m| m.is_file()) {
+            if tokio::fs::metadata(&nested)
+                .await
+                .is_ok_and(|m| m.is_file())
+            {
                 nested
             } else {
                 index

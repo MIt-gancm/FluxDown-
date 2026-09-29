@@ -15,8 +15,8 @@ use crate::event_hub::AgentEventHub;
 use crate::gateway::{GatewayService, GatewayShell, load_or_create_bearer};
 use crate::lifecycle::Lifecycle;
 use crate::power::PowerService;
-use crate::shell::{ShellHost, ShellServices, ShellState};
 use crate::server_mode::{ServerHandle, ServerHandleParts, ServerRuntime, TokenSeed};
+use crate::shell::{ShellHost, ShellServices, ShellState};
 use crate::state::{AgentState, StateError, StateStore};
 use crate::supervisor::DaemonSupervisor;
 
@@ -266,7 +266,9 @@ pub(crate) async fn run_with(
         // 占位任务永不完成，退出时 abort。
         tokio::spawn(std::future::pending::<Result<(), std::io::Error>>())
     } else {
-        tokio::spawn(crate::nmh::NmhService::new(daemon.clone(), capture.clone()).run(cancel.clone()))
+        tokio::spawn(
+            crate::nmh::NmhService::new(daemon.clone(), capture.clone()).run(cancel.clone()),
+        )
     };
     // 浏览器扩展靠 NMH 注册找到中继：启动时按归属规则自愈，不与并存的另一份 FluxDown 互相覆盖。
     if server.is_none() {
