@@ -23,6 +23,7 @@ use crate::{
     model::{
         DownloadFilter, DownloadStatusFilter, RowKey, SidebarSection, SidebarSelection,
         StatusFolderMotion, TaskState,
+        file_rescan::{RescanDecision, RescanThrottle},
         view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewGroupBy, ViewPrefs},
     },
     pages::new_download::{NewDownloadContext, build_new_download_context},
@@ -144,6 +145,8 @@ pub struct DownloadView {
     pub(crate) selection_summary: Cell<SelectionSummary>,
     /// 内容区（侧栏右侧）左缘的窗口横坐标；顶栏插槽据此把「新建」主按钮与内容区左对齐。
     pub(crate) content_left: Pixels,
+    /// 文件跟踪重扫节流（主窗口获焦触发）。
+    file_rescan: RescanThrottle,
 }
 
 impl DownloadView {
@@ -209,6 +212,13 @@ impl DownloadView {
             }
         })
         .detach();
+        // 文件跟踪：主窗口获焦时用户可能刚在文件管理器里删除 / 移走了已完成任务的文件。
+        cx.observe_window_activation(window, |this, window, cx| {
+            if window.is_window_active() {
+                this.request_file_rescan(cx);
+            }
+        })
+        .detach();
 
         Self {
             controller,
@@ -241,6 +251,7 @@ impl DownloadView {
             detail_resizable_state: cx.new(|_| ResizableState::default()),
             selection_summary: Cell::new(SelectionSummary::default()),
             content_left: px(0.),
+            file_rescan: RescanThrottle::default(),
         }
     }
 
@@ -559,7 +570,7 @@ impl DownloadView {
         &mut self,
         table_state: &Entity<TableState<DownloadTableDelegate>>,
         event: &TableEvent,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
@@ -577,26 +588,6 @@ impl DownloadView {
                     }
                 });
             }
-            TableEvent::DoubleClickedRow(row_ix) => {
-                let Some(key) = table_state.read(cx).delegate().row_key_at(*row_ix) else {
-                    return;
-                };
-                let completed = self
-                    .controller
-                    .store()
-                    .get(&key)
-                    .is_some_and(|row| row.state == TaskState::Completed);
-                if completed && key.is_local() {
-                    self.execute_commands(
-                        vec![DownloadsCommand::OpenTask {
-                            task_id: key.task_id().to_owned(),
-                        }],
-                        cx,
-                    );
-                } else {
-                    self.open_detail_for(key, window, cx);
-                }
-            }
             TableEvent::ColumnWidthsChanged(widths) => {
                 table_state.update(cx, |table, _| {
                     table.delegate_mut().sync_column_widths(widths);
@@ -610,7 +601,7 @@ impl DownloadView {
         }
     }
 
-    /// 打开停靠详情面板并切换到该任务（双击未完成行、右键「详情」）。
+    /// 打开停靠详情面板并切换到该任务（双击无法直接打开文件的行、右键「详情」）。
     pub(crate) fn open_detail_for(
         &mut self,
         key: RowKey,
@@ -624,6 +615,76 @@ impl DownloadView {
         if !self.table_state.read(cx).delegate().prefs().detail_open {
             self.mutate_prefs(|prefs| prefs.detail_open = true, cx);
         }
+    }
+
+    /// 双击任务行：已完成且文件仍在下载目录 → 用系统默认程序打开；其余（含文件已被删除
+    /// / 移走的已完成任务）→ 停靠详情面板查看。文件已被标记丢失时顺带重扫，文件移回后
+    /// 标记自愈。远程任务没有本机文件与详情，双击无动作。
+    pub(crate) fn activate_row(
+        &mut self,
+        key: RowKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !key.is_local() {
+            return;
+        }
+        let Some((openable, missing)) = self
+            .controller
+            .store()
+            .get(&key)
+            .map(|row| (row.has_local_file(), row.is_file_missing()))
+        else {
+            return;
+        };
+        if openable {
+            self.execute_commands(
+                vec![DownloadsCommand::OpenTask {
+                    task_id: key.task_id().to_owned(),
+                }],
+                cx,
+            );
+            return;
+        }
+        if missing {
+            self.rescan_files_now(cx);
+        }
+        self.open_detail_for(key, window, cx);
+    }
+
+    /// 可合并的文件跟踪重扫（获焦触发），见 [`RescanThrottle`]。
+    fn request_file_rescan(&mut self, cx: &mut Context<Self>) {
+        match self.file_rescan.request(Instant::now()) {
+            RescanDecision::Now => self.send_file_rescan(cx),
+            RescanDecision::After(delay) => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.file_rescan.trailing_fired(Instant::now());
+                        this.send_file_rescan(cx);
+                    });
+                })
+                .detach();
+            }
+            RescanDecision::Coalesced => {}
+        }
+    }
+
+    /// 立即重扫：打开 / 拖出时发现文件已不在，行上的丢失标记要尽快跟上磁盘现状。
+    pub(crate) fn rescan_files_now(&mut self, cx: &mut Context<Self>) {
+        self.file_rescan.record_immediate(Instant::now());
+        self.send_file_rescan(cx);
+    }
+
+    /// 结果经 `fileMissingChanged` 事件回流；失败（daemon 断开）不打扰用户，daemon 自身
+    /// 的定时扫描兜底。不走 `execute_commands`，以免清掉页面横幅上的真实错误。
+    fn send_file_rescan(&self, cx: &mut Context<Self>) {
+        let future = self.controller.execute(DownloadsCommand::RescanFiles);
+        cx.background_executor()
+            .spawn(async move {
+                let _ = future.await;
+            })
+            .detach();
     }
 
     /// 让停靠详情面板承载该任务（面板视图按需创建）；已是该任务时不做事。

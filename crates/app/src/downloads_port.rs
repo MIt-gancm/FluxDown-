@@ -182,6 +182,7 @@ impl DownloadsPort for AgentDownloadsPort {
                     method::AGENT_PLATFORM_REVEAL_TASK,
                     json!({ "taskId": task_id }),
                 ),
+                DownloadsCommand::RescanFiles => (method::DAEMON_TASK_RESCAN, json!({})),
                 DownloadsCommand::SubmitTorrentFile { path } => (
                     method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
                     json!({ "path": path, "silent": true }),

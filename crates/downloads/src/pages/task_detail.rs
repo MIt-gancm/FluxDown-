@@ -39,7 +39,7 @@ use activity::ActivityFeed;
 use crate::{
     components::{
         segment_progress::render_segment_progress,
-        task_table::{progress_bar_color, progress_track_color, status_color},
+        task_table::{progress_bar_color, progress_track_color, task_status_color},
     },
     controller::{
         DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult, SeedLimits,
@@ -904,8 +904,8 @@ impl TaskDetailView {
                     this.child(detail_row(
                         self.t(cx, "infoStatus"),
                         div()
-                            .text_color(status_color(row.state, cx))
-                            .child(self.strings.state_label(row.state)),
+                            .text_color(task_status_color(&row, cx))
+                            .child(self.strings.task_state_label(&row)),
                         cx,
                     ))
                     .when(row.size_bytes > 0, |this| {

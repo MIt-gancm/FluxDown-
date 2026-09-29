@@ -24,6 +24,7 @@ use gpui_component::{
 };
 
 use crate::{
+    components::task_drag::DraggedTasks,
     controller::DownloadsCommand,
     model::{
         CategoryIndex, DownloadFilter, DownloadTaskView, RowId, RowKey, SidebarSelection, TaskKind,
@@ -299,6 +300,8 @@ pub(crate) struct TaskMenuFacts {
     /// 失败态且错误消息带插件重试前缀（与
     /// `lib/src/widgets/task_list_item.dart` 的 `_pluginErrorPrefix` 同源）。
     pub(crate) is_plugin_retry_error: bool,
+    /// 已完成但产物已不在下载目录（文件跟踪扫描结果）。
+    pub(crate) file_missing: bool,
 }
 
 /// 引擎/daemon 插件系统失败任务的错误消息前缀。
@@ -359,7 +362,7 @@ pub(crate) fn context_menu_items(selection: &[TaskMenuFacts]) -> Vec<MenuEntry> 
     }
     if selection
         .iter()
-        .all(|task| task.is_local && task.state == TaskState::Completed)
+        .all(|task| task.is_local && task.state == TaskState::Completed && !task.file_missing)
     {
         items.push(MenuEntry::OpenFile);
     }
@@ -1144,7 +1147,7 @@ impl DownloadTableDelegate {
             summary.count += 1;
             summary.any = true;
             summary.any_local |= key.is_local();
-            any_unopenable |= !is_openable(key, row.state);
+            any_unopenable |= !row.has_local_file();
             match row.state {
                 TaskState::Downloading | TaskState::Pending => summary.any_active = true,
                 TaskState::Paused | TaskState::Failed => summary.any_resumable = true,
@@ -1155,14 +1158,30 @@ impl DownloadTableDelegate {
         summary
     }
 
-    /// 选中任务里仍存在且可打开文件的 key（本地 + 已完成）。
+    /// 选中任务里仍存在且可打开文件的 key（本地 + 已完成 + 文件仍在下载目录）。
     fn openable_selected_keys(&self) -> Vec<RowKey> {
         self.selected_keys()
             .into_iter()
-            .filter(|key| {
-                self.store
-                    .get(key)
-                    .is_some_and(|row| is_openable(key, row.state))
+            .filter(|key| self.store.get(key).is_some_and(|row| row.has_local_file()))
+            .collect()
+    }
+
+    /// 拖出到系统文件管理器的本机路径：锚点行在选区内时带上整个选区，否则只拖锚点行；
+    /// 只取本地、已完成且未被判定丢失的任务（磁盘现状由拖出时再探测）。
+    pub(crate) fn drag_paths(&self, anchor: &RowKey) -> Vec<std::path::PathBuf> {
+        let keys = if self.selected_tasks.contains(anchor) {
+            self.selected_keys()
+        } else {
+            vec![anchor.clone()]
+        };
+        keys.iter()
+            .filter_map(|key| {
+                let row = self.store.get(key)?;
+                if row.has_local_file() {
+                    row.local_file_path()
+                } else {
+                    None
+                }
             })
             .collect()
     }
@@ -1196,7 +1215,7 @@ impl DownloadTableDelegate {
             _ => {}
         }
         if task.state != TaskState::Downloading {
-            return self.strings.state_label(task.state);
+            return self.strings.task_state_label(task);
         }
         let speed = task
             .speed_bytes_per_second
@@ -1351,7 +1370,12 @@ impl DownloadTableDelegate {
         } else {
             (
                 SharedString::from(task.name.clone()),
-                tokens.colors.foreground,
+                // 文件已不在下载目录：文件名退为次要色，与状态列「文件已删除」呼应。
+                if task.is_file_missing() {
+                    tokens.colors.muted_foreground
+                } else {
+                    tokens.colors.foreground
+                },
             )
         };
         let meta = (self.prefs.density.two_line() && !task.metadata_pending).then(|| {
@@ -1420,7 +1444,7 @@ impl DownloadTableDelegate {
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_color(status_color(task.state, cx))
+                    .text_color(task_status_color(task, cx))
                     .child(self.status_label(task)),
             )
             .when_some(detail.filter(|_| two_line), |this, detail| {
@@ -1492,7 +1516,7 @@ impl DownloadTableDelegate {
     fn render_row_actions(&self, task: &DownloadTaskView, cx: &App) -> Option<AnyElement> {
         let host = self.host.as_ref()?;
         let is_local = task.key.is_local();
-        let mut actions = row_actions(task.state, is_local)
+        let mut actions = row_actions(task.state, is_local, task.file_missing)
             .filter(|action| {
                 is_local
                     || action
@@ -1677,6 +1701,7 @@ impl DownloadTableDelegate {
             is_torrent_sentinel: row.url.starts_with("torrent-file://"),
             is_plugin_retry_error: row.state == TaskState::Failed
                 && row.error_message.starts_with(PLUGIN_ERROR_PREFIX),
+            file_missing: row.is_file_missing(),
         })
     }
 
@@ -2115,7 +2140,12 @@ impl TableDelegate for DownloadTableDelegate {
         let Some(VisibleRow::Task(id)) = self.visible.get(row_ix).cloned() else {
             return div().id(("download-group-row", row_ix)).h(row_height);
         };
-        let Some(key) = self.store.row(id).map(|row| row.key.clone()) else {
+        let Some((key, drag_visual)) = self.store.row(id).map(|row| {
+            let drag_visual = row
+                .has_local_file()
+                .then(|| (kind_icon(row.kind), SharedString::from(row.name.clone())));
+            (row.key.clone(), drag_visual)
+        }) else {
             return div().id(("download-task-row", row_ix)).h(row_height);
         };
         let selected = self.selected_tasks.contains(&key);
@@ -2123,6 +2153,27 @@ impl TableDelegate for DownloadTableDelegate {
             theme.tokens().colors.accent,
             theme.components().task_row_radius,
         );
+        // 已完成且文件仍在下载目录的行可按住拖到系统文件管理器 / 桌面。
+        let dragged = drag_visual.map(|(icon, name)| DraggedTasks {
+            anchor: key.clone(),
+            icon,
+            name,
+            table: cx.weak_entity(),
+            host: self.host.clone(),
+        });
+        // 双击：已完成打开文件，其余打开详情。独立于选择监听注册（普通闭包，不占用表格
+        // 实体），这样 DownloadView 处理时可以自由读写表格状态。
+        let activate = self.host.clone().map(|host| {
+            let key = key.clone();
+            move |event: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let modifiers = event.modifiers();
+                if event.click_count() != 2 || modifiers.secondary() || modifiers.shift {
+                    return;
+                }
+                let key = key.clone();
+                let _ = host.update(cx, |view, cx| view.activate_row(key, window, cx));
+            }
+        });
 
         div()
             .id(("download-task-row", row_ix))
@@ -2147,6 +2198,13 @@ impl TableDelegate for DownloadTableDelegate {
                     .select_task(key.clone(), event.modifiers());
                 cx.notify();
             }))
+            .when_some(activate, |this, activate| this.on_click(activate))
+            .when_some(dragged, |this, dragged| {
+                this.on_drag(dragged, |dragged, click_offset, _, cx| {
+                    dragged.preview(click_offset, cx)
+                })
+                .external_drag_payload(|dragged: &DraggedTasks, _, cx| dragged.external_payload(cx))
+            })
     }
 
     fn render_td(
@@ -2306,7 +2364,8 @@ pub(crate) enum ToolbarCommand {
 /// 选中集合投影（选择条 / 工具栏 / 快捷键）：只统计仍存在于 store 的选中任务。
 /// - `count`：选中数量；`any`：是否有选中（删除 / 取消选择）。
 /// - `any_local`：含本地任务（在文件夹中显示；远程任务没有本机文件）。
-/// - `all_openable`：全部为本地已完成任务（打开文件；未完成的产物尚不存在）。
+/// - `all_openable`：全部为本地已完成且文件仍在下载目录的任务（打开文件；未完成的产物
+///   尚不存在，被删除 / 移走的已找不到）。
 /// - `any_active`：含下载中 / 排队（暂停）；`any_resumable`：含暂停 / 失败（继续）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SelectionSummary {
@@ -2316,11 +2375,6 @@ pub(crate) struct SelectionSummary {
     pub(crate) all_openable: bool,
     pub(crate) any_active: bool,
     pub(crate) any_resumable: bool,
-}
-
-/// 只有本地已完成任务有可打开的最终文件；下载中 / 暂停时磁盘上只有 `.fdownloading`。
-fn is_openable(key: &RowKey, state: TaskState) -> bool {
-    key.is_local() && state == TaskState::Completed
 }
 
 /// 行悬停操作；执行时映射为 [`ToolbarCommand`]，与工具栏 / 右键菜单同一命令路径。
@@ -2365,14 +2419,19 @@ impl RowAction {
 }
 
 /// 行悬停操作集合：下载中 / 排队 → 暂停；暂停 → 继续；失败 → 重试；完成 → 打开
-/// 文件（仅本地）；本地任务再加「在文件夹中显示」。远程任务只给可用操作：已结束的远程
-/// 任务（失败 / 取消 / 完成）不能「继续」——云端只接受暂停中任务的继续。
-pub(crate) fn row_actions(state: TaskState, is_local: bool) -> impl Iterator<Item = RowAction> {
+/// 文件（仅本地，且文件仍在下载目录）；本地任务再加「在文件夹中显示」。远程任务只给
+/// 可用操作：已结束的远程任务（失败 / 取消 / 完成）不能「继续」——云端只接受暂停中
+/// 任务的继续。
+pub(crate) fn row_actions(
+    state: TaskState,
+    is_local: bool,
+    file_missing: bool,
+) -> impl Iterator<Item = RowAction> {
     let primary = match state {
         TaskState::Downloading | TaskState::Pending => Some(RowAction::Pause),
         TaskState::Paused => Some(RowAction::Resume),
         TaskState::Failed => is_local.then_some(RowAction::Retry),
-        TaskState::Completed => is_local.then_some(RowAction::Open),
+        TaskState::Completed => (is_local && !file_missing).then_some(RowAction::Open),
     };
     primary
         .into_iter()
@@ -2459,6 +2518,15 @@ pub(crate) fn status_color(state: TaskState, cx: &App) -> Hsla {
         TaskState::Paused => colors.status_paused,
         TaskState::Pending => colors.status_queued,
         TaskState::Completed => colors.status_completed,
+    }
+}
+
+/// 行级状态色：已完成但文件已不在下载目录时取 `warning`，其余同 [`status_color`]。
+pub(crate) fn task_status_color(task: &DownloadTaskView, cx: &App) -> Hsla {
+    if task.is_file_missing() {
+        active_theme(cx).extended().colors.warning
+    } else {
+        status_color(task.state, cx)
     }
 }
 
@@ -2618,6 +2686,8 @@ impl DownloadView {
         };
         let batch = Rc::new(std::cell::RefCell::new(DispatchSummary::default()));
         for command in commands {
+            // 打开失败多半是文件已被删除 / 移走：立即重扫，让行上的丢失标记跟上磁盘现状。
+            let rescan_on_failure = matches!(command, DownloadsCommand::OpenTask { .. });
             let future = self.controller.execute(command);
             let interactive_start = interactive_start.clone();
             let batch = Rc::clone(&batch);
@@ -2625,6 +2695,9 @@ impl DownloadView {
                 let result = future.await;
                 batch.borrow_mut().record(&result);
                 let _ = this.update(cx, |this, cx| {
+                    if rescan_on_failure && result.is_err() {
+                        this.rescan_files_now(cx);
+                    }
                     this.last_error = batch.borrow().first_error.as_ref().map(|error| {
                         SharedString::from(error_text(this.translator.read(cx), error))
                     });
@@ -2666,6 +2739,14 @@ mod tests {
     };
 
     fn delegate(statuses: &[i32]) -> Result<DownloadTableDelegate, I18nError> {
+        delegate_with_missing(statuses, &[])
+    }
+
+    /// `missing` 中的下标对应任务带 `fileMissing: true`（文件跟踪判定产物已不在磁盘）。
+    fn delegate_with_missing(
+        statuses: &[i32],
+        missing: &[usize],
+    ) -> Result<DownloadTableDelegate, I18nError> {
         let catalog = std::sync::Arc::new(I18nCatalog::load_embedded()?);
         let strings = DownloadStrings::from_translator(&catalog.translator("en"));
         let store = Rc::new(TaskStore::default());
@@ -2686,7 +2767,8 @@ mod tests {
                         "createdAt": format!("{}", 100 - index),
                         "proxyUrl": "",
                         "queueId": "main",
-                        "checksum": ""
+                        "checksum": "",
+                        "fileMissing": missing.contains(&index)
                     }))
                     .expect("task");
                 DownloadTaskView::local(&task, None, false)
@@ -2775,6 +2857,52 @@ mod tests {
         assert_eq!(
             delegate.openable_selected_keys(),
             [RowKey::Local("t0".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn missing_files_are_neither_openable_nor_draggable() -> Result<(), I18nError> {
+        // t0 已完成、t1 已完成但文件已被删除 / 移走、t2 已暂停。
+        let mut delegate = delegate_with_missing(&[3, 3, 2], &[1])?;
+        delegate.selected_tasks.insert(RowKey::Local("t1".into()));
+        assert!(!delegate.selection_summary().all_openable);
+        assert!(delegate.openable_selected_keys().is_empty());
+        assert!(delegate.drag_paths(&RowKey::Local("t1".into())).is_empty());
+
+        delegate.selected_tasks.insert(RowKey::Local("t0".into()));
+        assert_eq!(
+            delegate.openable_selected_keys(),
+            [RowKey::Local("t0".into())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn drag_carries_selection_only_when_anchor_is_selected() -> Result<(), I18nError> {
+        // t0 / t1 / t3 已完成、t2 已暂停；t3 文件已丢失。
+        let mut delegate = delegate_with_missing(&[3, 3, 2, 3], &[3])?;
+        let path = |name: &str| std::path::Path::new("/tmp").join(name);
+
+        // 未选中时拖任意行：只拖该行。
+        assert_eq!(
+            delegate.drag_paths(&RowKey::Local("t1".into())),
+            [path("f1.bin")]
+        );
+
+        // 从选区内拖起：带上整个选区里仍可拖出的文件（跳过未完成与已丢失）。
+        delegate.select_all_tasks();
+        assert_eq!(
+            delegate.drag_paths(&RowKey::Local("t1".into())),
+            [path("f0.bin"), path("f1.bin")]
+        );
+
+        // 从选区外的行拖起：选区不参与。
+        delegate.selected_tasks.clear();
+        delegate.selected_tasks.insert(RowKey::Local("t0".into()));
+        assert_eq!(
+            delegate.drag_paths(&RowKey::Local("t1".into())),
+            [path("f1.bin")]
         );
         Ok(())
     }
@@ -3002,7 +3130,7 @@ mod tests {
 
     #[test]
     fn row_actions_offer_only_available_operations() {
-        let actions = |state, local| row_actions(state, local).collect::<Vec<_>>();
+        let actions = |state, local| row_actions(state, local, false).collect::<Vec<_>>();
         assert_eq!(
             actions(TaskState::Downloading, true),
             [RowAction::Pause, RowAction::Reveal]
@@ -3019,6 +3147,11 @@ mod tests {
         // 远程已完成任务没有本机文件：无任何行操作；远程失败 / 取消的任务不能「继续」。
         assert!(actions(TaskState::Completed, false).is_empty());
         assert!(actions(TaskState::Failed, false).is_empty());
+        // 文件已被删除 / 移走的已完成任务：不给「打开」，仍可「在文件夹中显示」。
+        assert_eq!(
+            row_actions(TaskState::Completed, true, true).collect::<Vec<_>>(),
+            [RowAction::Reveal]
+        );
     }
 
     #[test]
@@ -3074,6 +3207,7 @@ mod context_menu_tests {
             boosted: false,
             is_torrent_sentinel: false,
             is_plugin_retry_error: false,
+            file_missing: false,
         }
     }
 
@@ -3183,6 +3317,21 @@ mod context_menu_tests {
 
         let not_boosted = task(true, TaskState::Downloading);
         assert!(context_menu_items(&[not_boosted]).contains(&MenuEntry::Boost));
+    }
+
+    #[test]
+    fn missing_file_hides_open_file_but_keeps_folder_and_redownload() {
+        let mut missing = task(true, TaskState::Completed);
+        missing.file_missing = true;
+        let items = context_menu_items(&[missing]);
+        assert!(!items.contains(&MenuEntry::OpenFile));
+        assert!(items.contains(&MenuEntry::OpenFolder));
+        assert!(items.contains(&MenuEntry::Redownload));
+        // 与可打开的任务混选：「打开文件」要求全体成立。
+        assert!(
+            !context_menu_items(&[task(true, TaskState::Completed), missing])
+                .contains(&MenuEntry::OpenFile)
+        );
     }
 
     #[test]

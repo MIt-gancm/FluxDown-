@@ -1,6 +1,7 @@
 pub(crate) mod categories;
 pub(crate) mod devices;
 pub(crate) mod dispatch;
+pub(crate) mod file_rescan;
 pub(crate) mod new_download;
 pub(crate) mod progress_window;
 pub(crate) mod shutdown;
@@ -457,6 +458,22 @@ impl DownloadTaskView {
     pub(crate) fn remote_can(&self, action: fluxdown_protocol::RemoteCommandAction) -> bool {
         self.remote_status
             .is_some_and(|status| dispatch::remote_action_applies(status, action))
+    }
+
+    /// 已完成但文件跟踪扫描判定产物已不在下载目录（被删除或移走）。
+    pub(crate) fn is_file_missing(&self) -> bool {
+        self.state == TaskState::Completed && self.file_missing
+    }
+
+    /// 本机最终产物可被打开 / 拖出：本地、已完成且文件仍在下载目录。
+    pub(crate) fn has_local_file(&self) -> bool {
+        self.key.is_local() && self.state == TaskState::Completed && !self.file_missing
+    }
+
+    /// 本机最终产物路径（`save_dir/name`）；远程任务或文件名未知时为 `None`。
+    pub(crate) fn local_file_path(&self) -> Option<std::path::PathBuf> {
+        (self.key.is_local() && !self.name.is_empty())
+            .then(|| std::path::Path::new(&self.save_dir).join(&self.name))
     }
 
     /// 「复制链接」用：`origin_url` 优先，空则回退 `url`（torrent 任务的 `url` 是哨兵）。

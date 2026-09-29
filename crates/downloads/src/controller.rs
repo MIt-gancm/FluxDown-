@@ -144,6 +144,9 @@ pub enum DownloadsCommand {
     RevealTask {
         task_id: String,
     },
+    /// 重扫已完成任务的产物是否仍在下载目录（`daemon.task.rescan`，结果经
+    /// `fileMissingChanged` 事件回流）。
+    RescanFiles,
     /// 本机 `.torrent` 文件：agent 读取、上传 blob 后按捕获路径建任务。
     SubmitTorrentFile {
         path: String,
@@ -644,6 +647,21 @@ impl DownloadsController {
                 self.rebuild_row(ix);
                 true
             }
+            DaemonEvent::Engine(WsServerMsg::FileMissingChanged { updates }) => {
+                let mut changed = false;
+                for update in updates {
+                    let Some(ix) = self.store.find_local(&update.task_id) else {
+                        continue;
+                    };
+                    if self.local[ix].file_missing == update.missing {
+                        continue;
+                    }
+                    self.local[ix].file_missing = update.missing;
+                    self.rebuild_row(ix);
+                    changed = true;
+                }
+                changed
+            }
             _ => false,
         }
     }
@@ -854,6 +872,45 @@ mod tests {
         assert_eq!(rows[0].speed_bytes_per_second, Some(1024));
         assert_eq!(rows[0].eta_seconds, Some(3));
         assert_eq!(rows[0].progress, 0.25);
+    }
+
+    #[test]
+    fn file_missing_changes_patch_completed_rows_and_self_heal() {
+        let mut controller = DownloadsController::new(Arc::new(NullPort));
+        let mut done = task("done");
+        done.status = 3;
+        done.file_name = "done.bin".to_owned();
+        controller.local.push(done);
+        controller.rebuild_all();
+        assert!(controller.store().local()[0].has_local_file());
+
+        let missing = |missing: bool| {
+            DaemonEvent::Engine(WsServerMsg::FileMissingChanged {
+                updates: vec![
+                    fluxdown_protocol::FileMissingUpdateDto {
+                        task_id: "done".to_owned(),
+                        missing,
+                    },
+                    // 已不在列表里的任务：忽略。
+                    fluxdown_protocol::FileMissingUpdateDto {
+                        task_id: "gone".to_owned(),
+                        missing: true,
+                    },
+                ],
+            })
+        };
+        assert!(controller.apply_daemon_event(&missing(true)));
+        {
+            let rows = controller.store().local();
+            assert!(rows[0].is_file_missing());
+            assert!(!rows[0].has_local_file());
+        }
+        // 重复上报同一状态不算变化，不触发重绘。
+        assert!(!controller.apply_daemon_event(&missing(true)));
+
+        // 文件移回原目录：标记翻回，行重新可打开 / 拖出。
+        assert!(controller.apply_daemon_event(&missing(false)));
+        assert!(controller.store().local()[0].has_local_file());
     }
 
     #[test]

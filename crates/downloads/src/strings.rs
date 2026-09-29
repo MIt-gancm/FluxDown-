@@ -100,6 +100,7 @@ pub(crate) struct DownloadStrings {
     pub(crate) all_devices: SharedString,
     pub(crate) add_device: SharedString,
     pub(crate) status_canceled: SharedString,
+    pub(crate) status_file_missing: SharedString,
     pub(crate) add_category: SharedString,
     pub(crate) edit_category: SharedString,
     pub(crate) hide_section: SharedString,
@@ -208,6 +209,7 @@ impl DownloadStrings {
             all_devices: shared(translator.text("allDevices")),
             add_device: shared(translator.text("addDeviceEntry")),
             status_canceled: shared(translator.text("statusCanceled")),
+            status_file_missing: shared(translator.text("statusFileMissing")),
             add_category: shared(translator.text("addCategory")),
             edit_category: shared(translator.text("editCategory")),
             hide_section: shared(translator.text("hideSection")),
@@ -266,6 +268,15 @@ impl DownloadStrings {
             crate::model::TaskState::Paused => self.status_paused.clone(),
             crate::model::TaskState::Completed => self.status_completed.clone(),
             crate::model::TaskState::Failed => self.status_error.clone(),
+        }
+    }
+
+    /// 行级状态名：已完成但产物已不在下载目录时显示「文件已删除」。
+    pub(crate) fn task_state_label(&self, task: &crate::model::DownloadTaskView) -> SharedString {
+        if task.is_file_missing() {
+            self.status_file_missing.clone()
+        } else {
+            self.state_label(task.state)
         }
     }
 
