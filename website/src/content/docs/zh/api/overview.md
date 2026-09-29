@@ -9,7 +9,7 @@ sourceHash: "618afb3e9283"
 FluxDown 内置一套小型 HTTP API,供浏览器扩展、油猴脚本、aria2 客户端与自动化工具使用,存在于两个地方:
 
 - **桌面客户端**,地址 `http://127.0.0.1:17800`(端口可配置,地址硬编码为回环,永远不会暴露在网络上)。管理 API 分组默认关闭,其余分组默认开启;具体见桌面客户端的本机 API 设置。
-- **[headless 服务器](/docs/zh/headless-server/setup/)**,地址取决于 `FLUXDOWN_BIND` 的设置(默认 `0.0.0.0:17800`——刻意监听网络接口,因为远程管理正是它存在的意义)。管理 API 在这里恒开,并且在桌面客户端已有的端点之外额外挂载了几个 headless 专属端点(队列、配置、文件取回、WebSocket、服务器文件系统浏览)。
+- **[headless 服务器](/docs/zh/headless-server/setup/)**,地址取决于 `FLUXDOWN_BIND` 的设置(默认 `0.0.0.0:17800`——刻意监听网络接口,因为远程管理正是它存在的意义)。服务器即 `fluxdown-agent --server`(连同同级的 `fluxdownd`);下表的兼容分组从首次启动就开启。其余管理功能由内置 Web 界面经 agent 的 `/rpc` JSON-RPC 端点完成——与桌面客户端同一协议。
 
 两者共用同一套路由常量、请求/响应 JSON 契约与鉴权规则——区别只在于哪些路由组被启用,以及由哪个宿主实现。
 
@@ -25,7 +25,7 @@ FluxDown 内置一套小型 HTTP API,供浏览器扩展、油猴脚本、aria2 �
 
 管理分组开启时,`GET /api/v1/openapi.json`(无鉴权,纯接口描述不含数据)始终可用。
 
-headless 服务器额外把这些端点挂在 `/api/v1/*` 下,是桌面客户端没有的:`GET /api/v1/ws`(WebSocket)、`GET/PUT /api/v1/config`、`POST/PUT/DELETE /api/v1/queues[/{id}]`、`POST /api/v1/queues/{id}/start|stop`(在运行/停止两态间切换队列——停止会暂停队列内任务并将其排除在自动启动之外)、`PUT /api/v1/queues/{id}/schedule`(每日启停时刻 + 星期位掩码)、`PUT /api/v1/queues/{id}/order`(持久化队列内任务启动顺序)、`PUT /api/v1/tasks/{id}/queue`、`PUT /api/v1/tasks/{id}/boost`、`GET /api/v1/tasks/{id}/file`、`GET /api/v1/fs/list`、`POST /api/v1/proxy/test`、`POST /api/v1/token/regenerate`、`GET /api/v1/stats`。这些端点遵循与管理 API 相同的鉴权规则,例外是 `/ws` 与 `/tasks/{id}/file`(浏览器发起的请求无法自定义请求头,改用 `?token=` 查询参数)以及 `/openapi.json`/`/docs`(无鉴权)。
+旧版 headless 服务器(`fluxdown-server`)还额外提供过一批扩展 REST 路由——`/api/v1/config`、队列增删改与 start/stop/schedule/order、`/api/v1/stats`、`/api/v1/fs/list`、组件、webhook、日志、`/api/v1/ws`、`/api/v1/token/regenerate`。**在 `fluxdown-agent --server` 上它们已不存在**:请用内置 Web 界面管理这些内容,或直接对 `/rpc` 说 JSON-RPC。服务器另外提供两个免鉴权的引导路由 `GET /api/v1/setup/status` 与 `POST /api/v1/setup`(仅在尚未设置访问密钥时接受),供首次运行向导使用。
 
 ## 鉴权方式
 
@@ -36,7 +36,8 @@ headless 服务器额外把这些端点挂在 `/api/v1/*` 下,是桌面客户端
 | 脚本接管 | `X-FluxDown-Token` 头(仅在配置了 token 时才校验;token 为空即该分组不鉴权)。无论是否配置 token,都必须带 `X-FluxDown-Client` 头——靠 CORS 挡住任意网页脚本的门禁。 |
 | aria2 兼容 RPC | `X-FluxDown-Token` 头,**或** aria2 自己的约定——在 JSON-RPC 调用的 `params[0]` 里传 `token:xxx`。 |
 | 管理 API(`/api/v1/*`) | `Authorization: Bearer <token>` **或** `X-FluxDown-Token` 头。未配置 token 时该分组的一切请求都会被拒绝(403)——这组端点不能在无鉴权状态下运行。 |
-| `/api/v1/ws`、`/api/v1/tasks/{id}/file` | `?token=<token>` 查询参数(浏览器的导航跳转/WebSocket 升级无法自定义请求头)。 |
+| `/rpc`(WebSocket) | `Authorization: Bearer <token>`;浏览器则用 `Sec-WebSocket-Protocol: fluxdown.rpc.v1, fluxdown.token.<base64url(token)>` 子协议。带 `Origin` 头的请求必须与 `Host` 同源。 |
+| `/api/web/files/tasks/{id}`、`/api/web/exports/{id}` | `Authorization: Bearer <token>` 或 `?token=<token>` 查询参数(浏览器的导航跳转无法自定义请求头)。 |
 
 所有 token 校验都使用常量时间比较,避免时序侧信道。
 
@@ -167,4 +168,4 @@ fluxdown://download?url=<percent 编码的 URL>&filename=<可选文件名>
 ## 交互式文档
 
 - 本站的 [`/api-docs`](/api-docs) 渲染完整的 OpenAPI 3.1 规范(由真实路由 handler 生成),带在线试调用界面,覆盖两种宿主共有的路由。
-- 运行中的 headless 服务器还会自己提供实时的合并版规范(核心路由 + 服务器专属扩展路由):`/api/v1/docs`(Scalar 界面)与 `/api/v1/openapi.json`(原始 JSON)——始终与你正在运行的那个版本保持一致。
+- 运行中的服务器还会自己提供实时规范:`/api/v1/openapi.json`(原始 JSON)——始终与你正在运行的那个版本保持一致。

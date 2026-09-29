@@ -1,7 +1,7 @@
 # FluxDown — AI 工作契约（核心）
 
 多协议下载管理器（IDM 的免费替代）。官网 <https://fluxdown.zerx.dev>，版本号以 `pubspec.yaml` 为准。
-**一套 Rust 下载引擎 `fluxdown_engine` + 多宿主 + 多客户端**：当前默认 PC/移动 App 仍是 Flutter；GPUI 包 `fluxdown_ui_app` 已接入 `fluxdown-desktop → fluxdown-agent → fluxdownd → fluxdown_engine` 三进程本机链路。另有 headless Web 服务器、CLI、WXT 浏览器扩展、Tampermonkey 用户脚本、JS 插件系统、内置 MCP/REST/aria2 API、React Web SPA。FFI 框架 [Rinf 8.10](https://rinf.cunarist.org)（bincode 信号）**仅** Flutter App（`hub` crate）用到；`native/server`/`hub` 在 Flutter 完成独立切换前继续作为 legacy 生产宿主。
+**一套 Rust 下载引擎 `fluxdown_engine` + 多宿主 + 多客户端**：当前默认 PC/移动 App 仍是 Flutter；GPUI 包 `fluxdown_ui_app` 已接入 `fluxdown-desktop → fluxdown-agent → fluxdownd → fluxdown_engine` 三进程本机链路。NAS/服务器端 = `fluxdown-agent --server` + `fluxdownd`（托管 React Web SPA，SPA 走 agent `/rpc`）。另有 CLI、WXT 浏览器扩展、Tampermonkey 用户脚本、JS 插件系统、内置 MCP/REST/aria2 API。FFI 框架 [Rinf 8.10](https://rinf.cunarist.org)（bincode 信号）**仅** Flutter App（`hub` crate）用到；`hub` 在 Flutter 完成独立切换前继续作为 legacy 生产宿主；`native/server` 已冻结（不再构建/发布，待新链路发版验证后删除）。
 
 ---
 
@@ -14,7 +14,7 @@
 |---|---|
 | 架构全图、顶层目录树（哪个目录管什么） | `.omp/knowledge/README.md` |
 | 状态码 / DB 表与字段语义、6 种协议、引擎子系统（auto_proxy、RSS、segment_coordinator…）、插件系统、受管组件 | `.omp/knowledge/engine.md` |
-| HTTP API 路由组与鉴权、hub / cli / nmh / updater、headless server env 与扩展路由 | `.omp/knowledge/hosts-and-api.md` |
+| HTTP API 路由组与鉴权、hub / cli / nmh / updater、headless server（agent `--server`）env 与路由 | `.omp/knowledge/hosts-and-api.md` |
 | Flutter 与 GPUI 前端（主题 token、云同步、widgets 族、移动端、GPUI 迁移层）、扩展、用户脚本、Web SPA、官网 | `.omp/knowledge/clients.md` |
 | 日志系统细节、发布流水线矩阵、设计文档实现状态（已实现 vs 仅设计，含命名歧义澄清） | `.omp/knowledge/ops.md` |
 | **「要加 X 改哪里」全表 —— 动手前先查这张** | `.omp/knowledge/extension-points.md` |
@@ -43,7 +43,7 @@
 | HTTP 契约 | `native/api/src/types.rs`（wire，camelCase）+ `routes.rs`（路径常量）；规范文件 `website/public/openapi.json` |
 | 本机服务协议基线 | `native/protocol`：daemon / agent 角色、版本握手与后续 JSON-RPC wire 的唯一共享层 |
 | Rust↔Dart 信号 | `native/hub/src/signals/mod.rs`；Dart 侧 `lib/src/bindings/` 由 `rinf gen` 生成，**勿手改** |
-| headless env / 访问密钥策略 | `native/server/src/config.rs`（`validate_access_key`） |
+| headless env / 访问密钥策略 | `native/agent/src/server_mode.rs`（`ServerConfig::from_lookup`、`validate_access_key`） |
 | i18n 基线 | `assets/i18n/{en,zh}.json` + `lib/src/i18n/translations.dart` |
 
 ---
@@ -77,7 +77,7 @@ flutter analyze                       # Dart 静态分析
 # ── 测试（按 crate/过滤，不要 --workspace）──
 cargo nextest run -p fluxdown_engine <filter>   # 引擎单测（协议/分段/DB）
 cargo test -p fluxdown_api            # HTTP API（axum/aria2/MCP/OpenAPI 漂移守卫）
-cargo test -p fluxdown_server         # headless server（WS/actor/扩展路由）
+cargo test -p fluxdown_agent          # agent（Gateway / server 模式 / 兼容 API）；server 模式带 SPA：--features web-ui
 cargo test -p fluxdown_cli            # CLI（退出码/尺寸解析 doctest）
 flutter test                          # Dart 测试
 PG_TEST_URL=postgres://postgres:pw@localhost/postgres cargo test -p fluxdown_engine -- --ignored pg_smoke
@@ -87,12 +87,12 @@ cargo test -p fluxdown_engine --features plugins,components --test plugin_ytdlp 
 cargo check -p fluxdown_engine        # 不带 feature：验证 mobile 关插件时主链路零变化
 
 # ── 各宿主/客户端运行 ──
-cargo run -p fluxdown_server          # headless 服务器（env 见 .omp/knowledge/hosts-and-api.md）
+cargo build -p fluxdown_daemon && cargo run -p fluxdown_agent --features web-ui -- --server   # headless 服务器（fluxdownd 须与 agent 同目录；env 见 .omp/knowledge/hosts-and-api.md）
 cargo run -p fluxdown_cli -- ping     # CLI 探活（子命令同上文件）
 cargo run -p fluxdown_cli -- add <url> --local   # B 模式：内嵌引擎独立下载
 
 # ── 前端/官网/扩展 ──
-cd web && bun run dev                 # Web SPA localhost:5173（/api 代理到 :17800）；bun run build → web/dist
+cd web && bun run dev                 # Web SPA localhost:5173（/rpc、/api、/ping、/demo 代理到 :17800 的 agent --server）；bun run build → web/dist
 cd website && npm run dev             # 官网 Astro localhost:4321
 cd fluxDown && npm run dev            # 扩展开发（Chrome）；dev:firefox / build / zip
 
@@ -114,8 +114,8 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `HostSelection` | `engine/src/selection.rs` | 引擎→宿主（请求决策） | HLS 画质 / BT 文件 / 插件 variant 选择（tristate：用户选/超时默认/无 selector 短路） |
 | `ApiHost` | `native/api/src/service.rs` | 客户端→引擎（HTTP 契约） | REST/aria2/MCP 的能力面；必需方法 + 可默认降级方法 |
 
-- 当前两个生产宿主仍是 `hub`（App，actor=`download_actor.rs`）与 `server`（headless，actor=`actor.rs`）；`fluxdown_api` 只依赖 `&dyn ApiHost`，同一套 HTTP 面服务任意宿主。CLI 双模式：默认 HTTP 连宿主，`add --local` 内嵌引擎。
-- **迁移目标**：`native/daemon` 成为可独立运行的纯下载核心，`native/agent` 常驻承载账户/云同步/设备协同、官方 UI Gateway 与系统外壳（托盘、关闭 UI 后的驻留策略；GPUI 界面进程本身不驻留）；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 进入废弃路径，任何新实现不得依赖它。
+- 当前生产宿主：`hub`（Flutter App，actor=`download_actor.rs`）与 `fluxdown-agent --server` + `fluxdownd`（headless/NAS）；`fluxdown_api` 只依赖 `&dyn ApiHost`，同一套 HTTP 面服务任意宿主（agent 侧为 `AgentApiHost`，转发 daemon RPC）。CLI 双模式：默认 HTTP 连宿主，`add --local` 内嵌引擎。
+- **迁移目标**：`native/daemon` 成为可独立运行的纯下载核心，`native/agent` 常驻承载账户/云同步/设备协同、官方 UI Gateway 与系统外壳（托盘、关闭 UI 后的驻留策略；GPUI 界面进程本身不驻留）；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 已冻结：不构建、不发布、不接收任何改动，新实现不得依赖它。
 - **并发模型**：current_thread tokio actor 串行化写；每个下载 spawn 独立 task + CancellationToken；插件 resolve 永不阻塞 actor（off-actor spawn + 通道回流）。
 - 客户端捕获三条并行前端进同一本机 RPC（`:17800/download`）：扩展、用户脚本、桌面确认框。
 
@@ -138,7 +138,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - `download_actor.rs` 主 `tokio::select!` **已占满 tokio 64 分支硬上限**，再加一条即编译错误。新增任何 Dart 信号 / 定时节拍 / 回流通道**都不许往主循环加分支**——并进既有 `AuxSignal` 合并泵（两个后台 spawn 把消息合流进单条 `aux_tx`，主循环只有一条 `aux_rx.recv()`）。
 - rquickjs（`engine/Cargo.toml`）：禁止叠加 `rust-alloc`/`allocator`（会让 `set_memory_limit` 静默失效）；必带 `parallel`（`AsyncRuntime`/`AsyncContext` 的 Send/Sync 依赖它）。
 - `profile.release` **不**设 `panic="abort"`——`download_manager` 靠 `catch_unwind` 恢复 task panic。
-- **`fluxdown_server` 的 Web UI 是编译期内嵌的**：`native/server/build.rs` 把 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`）整棵目录递归全量 `include_bytes!` 进二进制（不按扩展名筛选，新增文件/新建子目录下次编译自动进包）。改了前端**必须先 `cd web && bun run build` 再重编服务器**才能看到；产物是单二进制，不再有同级 `web/` 目录，`FLUXDOWN_WEBROOT` 降级为可选的磁盘覆盖。构建时目录缺失只 warning + 运行期 503 提示页，不会让编译失败。
+- **headless 的 Web UI 是编译期内嵌的**：`fluxdown_agent` 的 `web-ui` feature 下 `native/agent/build.rs` 把 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`）整棵目录递归全量 `include_bytes!` 进二进制，只在 `--server` 模式挂为 SPA fallback。改了前端**必须先 `cd web && bun run build` 再重编 agent**才能看到；`FLUXDOWN_WEBROOT` 是可选的磁盘覆盖。构建时目录缺失只 warning + 运行期 503 提示页。Web 构建经 Vite 别名引用仓库根的 `assets/i18n` 与 `website-v2/src/lib/gpui-theme`，打包上下文必须包含这两处。
 
 **运行期不变式**
 - 两个宿主 actor **都必须** drain `resolve_rx`（off-actor 插件解析回流）与 `plugin_retry_rx`，否则命中 resolver 的下载永久挂起。
@@ -159,17 +159,17 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 
 | 改这里 | 必须同步 |
 |---|---|
-| `engine/src/rss/filter.rs` | `lib/src/models/rss_filter.dart` + `web/src/lib/rss-filter.ts`（三份逐条对齐；预览与实际下载不一致会直接摧毁功能可信度） |
+| `engine/src/rss/filter.rs` | `lib/src/models/rss_filter.dart` + `web/src/pages/rss/filter.ts`（三份逐条对齐，`filter.test.ts` 复用 Rust 用例；预览与实际下载不一致会直接摧毁功能可信度） |
 | `crates/theme` 的 token 注册表 / 解析 / 迁移 / 导出（`registry.rs`、`resolve.rs`、`migrate.rs`、`document.rs`、`flutter.rs`） | 重跑 `cargo run -p fluxdown_ui_theme --example gen_theme_registry` → `website-v2/src/lib/gpui-theme/registry.json` + `website-v2/public/schemas/gpui-theme.v2.json` + fixtures `*.resolved.json`；`website-v2/src/lib/gpui-theme/*.ts` 逐项对齐并过 `cd website-v2 && bun test tests`。token **只加不改**，改名只走声明式 rename 迁移，已发布 fixtures 永不删除 |
-| `server/src/config.rs::validate_access_key` | `web/src/lib/token-policy.ts` |
+| `agent/src/server_mode.rs::validate_access_key` | `web/src/lib/token-policy.ts` |
 | `engine/src/data_dir.rs` | `lib/src/services/platform_utils.dart` 的 `KNOWN_ITEMS` |
 | `engine/src/webhook.rs` 的 `WebhookEventKind` | Dart `WebhookEvents.all` + TS `WEBHOOK_EVENTS`，**三处 wire 名逐字一致** |
 | `native/nmh/src/main.rs::log_path`（中继自身的诊断日志，在 App 日志目录之外） | `native/hub/src/diagnostics.rs::nmh_log_path`（Doctor 读同一文件的尾部）；改路径必须同步，否则 Doctor 只会报「无日志」 |
 | `hub/src/signals/mod.rs` | `rinf gen` → `download_actor` 的 `AuxSignal` 泵 → Dart 侧 `rustSignalStream` 监听 |
 | `native/api` 契约 | 重跑 `gen_openapi` 覆盖 `website/public/openapi.json` |
-| 任一 UI 文案 | 只补 **en + zh 基线对**：App `assets/i18n/{en,zh}.json` + `translations.dart` getter；`web/src/lib/locales/{en,zh}.json`；`website/src/lib/locales/{en,zh-CN}.json`；`fluxDown/utils/locales/{en,zh-CN}.ts`。社区语言（`ja` 等）由 Weblate 维护，**不碰**（运行时键级回退英文）。**`assets/i18n` 同时被 `crates/*`（GPUI，`ctx.t("key")` 运行时查键）嵌入**：Flutter 侧删键前先 `grep crates/`，`lib/` 无引用不等于死键 |
-| web 设置项 / 对话框字段归属 | **基准 = 桌面**：同一功能在两端的分类归属与分区排序必须一致（桌面 `settings_page.dart` 分类 ↔ web 分区组件 GeneralSettings/DownloadSettings/ProxySettings…）。双端并行开发时归属分类要写成一份共享契约，禁止两份各自措辞 |
-| 「一键分类目录」的目录名推导 | `lib/src/models/custom_category.dart` 的 `sanitizeCategoryDirName` / `categoryDirUnder` ↔ `web/src/lib/categories.ts` 同名函数（含分隔符归一）；**且内置分类显示名两端逐字一致**（App `assets/i18n` 的 `categoryVideo/...` ↔ web `type.video/...`），否则同一台机器上桌面与 Web 会各建一套目录（`Document` vs `Documents`） |
+| 任一 UI 文案 | 只补 **en + zh 基线对**：App/GPUI/Web SPA 共用 `assets/i18n/{en,zh}.json`（Flutter 另补 `translations.dart` getter；Web 经 `web/src/i18n` 按同一 camelCase 键查表）；`website/src/lib/locales/{en,zh-CN}.json`；`fluxDown/utils/locales/{en,zh-CN}.ts`。社区语言（`ja` 等）由 Weblate 维护，**不碰**（运行时键级回退英文）。**`assets/i18n` 同时被 `crates/*`（GPUI）与 `web/` 引用**：删键前先 `grep crates/ web/src`，`lib/` 无引用不等于死键 |
+| web 设置项 / 对话框字段归属 | **基准 = GPUI 桌面客户端**：Web 设置分类与字段顺序、对话框分区对齐 `crates/settings` / `crates/downloads`（`web/src/pages/settings/categories.ts` ↔ `crates/settings/src/view.rs::build_pages`）。桌面专属项（托盘、自启、关联、剪贴板、打开文件/所在目录、进度窗口）在 Web 省略，其余不得各自措辞或另立分类 |
+| 「一键分类目录」的目录名推导 | `lib/src/models/custom_category.dart` 的 `sanitizeCategoryDirName` / `categoryDirUnder` ↔ `web/src/lib/category-dir.ts` 同名函数（含分隔符归一）；**且内置分类显示名两端逐字一致**（App/GPUI/Web 共用 `assets/i18n` 的 `categoryVideo/...` 键，勿在 Web 另起译文），否则同一台机器上桌面与 Web 会各建一套目录（`Document` vs `Documents`） |
 | 开机自启语义（`lib/src/services/autostart_service.dart`） | `native/agent/src/platform/autostart.rs`：「已启用」都要尊重系统级禁用（Windows `StartupApproved`、XDG `Hidden` / `X-GNOME-Autostart-enabled`），启动时自动迁移只改启动目标、**绝不**改系统启用状态；细节见 `.omp/knowledge/clients.md`「开机自启」 |
 
 ---

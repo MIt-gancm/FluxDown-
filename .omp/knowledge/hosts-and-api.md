@@ -7,7 +7,7 @@
 
 ## HTTP API（`native/api`，`fluxdown_api`）
 
-一个端口（桌面默认 17800 **仅 127.0.0.1**；server 默认 `0.0.0.0:17800`）、一个 axum 服务器，多组按配置独立启停的路由。`local_server_*` 配置变更时 actor 热重启监听（优雅停机 + 重绑，20×100ms 重试竞态）。
+一个端口（桌面默认 17800 **仅 127.0.0.1**；headless `fluxdown-agent --server` 默认 `0.0.0.0:17800`）、一个 axum 服务器，多组按配置独立启停的路由。Flutter hub 宿主：`local_server_*` 配置变更时 actor 热重启监听（优雅停机 + 重绑，20×100ms 重试竞态）；agent 宿主：开关经 `agent.gateway.patch` 热更新（`ApiRuntimeSwitches` + `TokenCell`），监听地址下次启动生效。
 
 | 路由组 | 端点 | 开关（config 键） | 鉴权 |
 |---|---|---|---|
@@ -34,7 +34,7 @@
 > ⚠️ **`download_actor.rs` 的主 `tokio::select!` 已占满 tokio 的 64 分支硬上限**（`tokio/src/macros/select.rs` 的 `count_field!` 最后一格是 `_63`），再加一条就是编译错误 `up to 64 branches supported`。
 > **新增任何 Dart 信号 / 定时节拍 / 回流通道都不许往主循环加分支**，一律并进既有的「辅助信号合并转发」：两个后台 `tokio::spawn` 泵（任务组 5 信号 / RSS 8 信号 + 60s 节拍 + 引擎回流）把消息合流进同一条 `aux_tx`，主循环只有一条 `Some(aux) = aux_rx.recv()`。照 `enum AuxSignal { Group(..), Rss(..) }` 加变体即可。
 
-### `native/server`（headless，`fluxdown_server`）→ 见本文「Headless 服务器」
+### `native/server`（`fluxdown_server`）：**已冻结**，不构建、不发布、不接收改动；headless 由 `fluxdown-agent --server` + `fluxdownd` 承担 → 见本文「Headless 服务器」
 
 ### `native/cli`（`fluxdown_cli`，二进制 `fluxdown`）
 aria2c 风格。命令：ping/info/add(get)/list(ls)/status(stat)/pause/resume/rm/pause-all/resume-all/queue/watch/**config**(set/unset/get/list/path)。
@@ -61,18 +61,15 @@ aria2c 风格。命令：ping/info/add(get)/list(ls)/status(stat)/pause/resume/r
 - 桌面 `fluxdown-desktop`：`--minimized`（由 agent 自启拉起）打开最小化主窗口；无参数普通启动时，若本进程拉起了 agent（服务冷启动）就等首个快照（≤5s，不按 800ms 连接宽限）：`start_minimized_to_tray` 开启且托盘可见则不开窗、只退出界面，否则开窗；agent 已驻留时直接开窗（用户在打开应用，否则 Dock / 开始菜单再也打不开主窗口）；`--capture` 只开确认窗口（外部捕获 → 新建下载窗口，引擎选择 → 选择窗口）；`--progress-task <id>` 由 agent 为静默建成的单任务拉起，首个快照后弹该任务的进度窗口；`magnet:/ed2k:/fluxdown:/http(s)` 参数与 `.torrent` 路径交 agent 建任务；单实例锁 `desktop.lock`（agent 数据目录同级），次实例转发后退出。
 ---
 
-## Headless 服务器（`native/server`）
+## Headless 服务器（`fluxdown-agent --server` + `fluxdownd`）
 
-组装：Engine（feature plugins+components）+ `EngineEventSink`/`WsHostSelection`（都包 `WsHub`）+ actor + `api_router`（core）`.merge(extra_router).merge(demo_router?).fallback(SPA)`。
+入口 `native/agent/src/main.rs` 的 `--server` → `server_mode::run_blocking` → `runtime::run_with(.., Some(ServerRuntime))`。agent 在同目录拉起 `fluxdownd`（`supervisor.rs`，继承环境 + `with_extra_env` 追加 `FLUXDOWN_DEMO_URL`），经 loopback `ws://127.0.0.1:17801/rpc` 调 daemon。Gateway listener = `fluxdown_api::server::api_router(AgentApiHost)` + `/rpc` + `server_mode::router`（setup / `/api/web/*` / demo / SPA fallback）。
 
-**Web UI 编译期内嵌（单二进制）**：`native/server/build.rs` 把 `FLUXDOWN_EMBED_WEBROOT`（缺省仓库 `web/dist`）**整棵目录递归全量** `include_bytes!` 进二进制——不按扩展名/文件名筛选，新增任何文件（含新建子目录、未知类型）下次编译自动进包，删除自动出包（每个文件 + 根目录都登记 `rerun-if-changed`）。运行期由 `web_assets.rs` 托管：内容哈希强 ETag + `If-None-Match` 304；缓存分档**由事实推导而非文件名清单**——`text/html` 一律 no-cache（多入口同样生效），文件名带 Rollup 内容哈希的 immutable 一年（与所在目录无关，`assetsDir` 改名不受影响），其余短缓存 + ETag 回源；未命中回 `index.html` 保 SPA 路由；不支持 Range。`content_type()` 那张扩展名表**只决定响应头、不决定是否嵌入**，表里没有的类型照嵌不误，只按 `application/octet-stream` 兜底并在构建期打 `cargo::warning`。前端改了**必须先 `cd web && bun run build` 再重编服务器**才可见。构建时目录缺失不报错，只生成空表 + warning，运行期给 503 自解释页（API/WS 不受影响）。
+- **env**（`server_mode.rs::ServerConfig::from_lookup`）：`FLUXDOWN_BIND`（默认 `0.0.0.0:17800`，允许非回环，不看 `lan_enabled`）、`FLUXDOWN_TOKEN` + `FLUXDOWN_TOKEN_FORCE`（预置访问密钥；FORCE 每次启动覆盖；不过 `validate_access_key` 则忽略并告警）、`FLUXDOWN_WEBROOT`（可选磁盘覆盖）、`FLUXDOWN_LANG`（`/ping.language` 回退）、`FLUXDOWN_DEMO`/`FLUXDOWN_DEMO_URL`。daemon 读：`FLUXDOWN_DATA_DIR`（引擎数据根；agent 状态在 `<root>/agent`）、`FLUXDOWN_DATABASE_URL`（`sqlite:`/`postgres://`）、`FLUXDOWN_SAVE_DIR`（仅 `default_save_dir` 未设置时播种）、`FLUXDOWN_DEMO_URL`（`daemon.task.create` / `daemon.group.create` 精确匹配守卫）。`FLUXDOWN_MDNS` / `FLUXDOWN_LINK_NAME` 旧变量**不生效**：新架构没有 LAN 设备互联实现（`link/*` 兼容路由返回 500）。
+- **访问密钥** = `AgentState.gateway_user_token`（热更新 `TokenCell`，兼容 API 与 Web 共用）。策略单一事实源 `server_mode.rs::validate_access_key`（ASCII 可见字符、8–128 位、字母+数字），Web 镜像 `web/src/lib/token-policy.ts`；server 模式下 `agent.gateway.patch.userToken` 不能写空/弱密钥（否则匿名 setup 重新打开）。旧 server 数据目录的 `local_server_token` 与开关由 `link::migrate_legacy_state` 导入，无需手工迁移。全新安装首次运行开启 takeover/jsonrpc/api/mcp 分组。
+- **路由**（server 模式专有）：免鉴权 `GET /api/v1/setup/status` → `{setupRequired,minLength}`、`POST /api/v1/setup {token}`（仅密钥为空时，已设 409；daemon 就绪 + 迁移完成前 503）；`/rpc` 浏览器鉴权 = 子协议 `fluxdown.rpc.v1` + `fluxdown.token.<base64url 无 padding>`（Bearer 也接受 agent.token 或访问密钥），带 `Origin` 时须与 `Host`（或 `X-Forwarded-Host` 首段）同源否则 403；浏览器文件面（Bearer 或 `?token=`）：`POST /api/web/blobs/{torrents,plugins}`（转发 daemon blob，4 MiB）、`GET /api/web/files/tasks/{id}`（流式转发已完成文件）、`GET /api/web/exports/{id}`（daemon 诊断 JSON）、`GET /api/web/logs/export`（日志 zip）；演示模式 `GET|HEAD /demo/file`（64 MiB 确定性流、Range、1 MiB/s）。其余 GET/HEAD → SPA。
+- **Web UI 内嵌**：`web-ui` feature 下 `native/agent/build.rs` 递归嵌入 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`），`web_assets.rs` 托管（强 ETag + 304；HTML no-cache、Rollup 哈希文件名 immutable 一年、其余短缓存；未命中回 `index.html`；无 Range；未嵌入 503 自解释页）。改前端须先 `cd web && bun run build` 再重编 agent。
+- **进程语义**：server 模式不启 NMH / 不做自启迁移 / 不注册关联，`agent.platform.*` 返回 Unsupported；SIGTERM/SIGINT 走 `Lifecycle::request_quit`（先关停 daemon 再退出，二次信号强制退出）；stderr tracing（`RUST_LOG`）。Docker 用 tini 做 PID 1。Windows 发布构建带 `windows_subsystem = "windows"`，`--server` 无控制台输出。
+- **兼容 API**：`AgentApiHost`（`api_host.rs`）转发 daemon RPC 实现 `ApiHost` 全部核心方法（任务/组/RSS/插件/市场/站点凭据/aria2 WS 通知经 `task_events.rs`）；旧 server 独有的扩展 REST（`/api/v1/config`、队列增删改、stats、fs/list、components、webhooks、logs、token/regenerate、`/api/v1/ws`）已**废弃**，管理面只走 `/rpc`。
 
-- **env**（`config.rs`）：`FLUXDOWN_DATA_DIR`、`FLUXDOWN_DATABASE_URL`（`sqlite:`/`postgres:`）、`FLUXDOWN_BIND`（默认 `0.0.0.0:17800`——**注意非回环**，与桌面不同）、`FLUXDOWN_SAVE_DIR`（首次启动播种 `default_save_dir`，库中已有则不覆盖；群晖 spk 用它传向导选定的共享文件夹）、`FLUXDOWN_WEBROOT`（**可选**覆盖：改从该磁盘目录托管 SPA；缺省用内嵌产物，**不再隐式探测 exe 同级 `./web`**——旧版残留目录会让升级后的服务器配上过期前端）、`FLUXDOWN_TOKEN`（预置访问密钥，仅库中无密钥时采纳）、`FLUXDOWN_DEMO`/`FLUXDOWN_DEMO_URL`、`FLUXDOWN_LANG`、`FLUXDOWN_LOG_LEVEL`。
-- **访问密钥（`local_server_token`）是热更新的**：`fluxdown_api::auth::TokenCell` 由核心路由与 `routes_ext` 共享，首次设置 / 设置页改写 / `token/regenerate` 三条路径**立即生效，无需重启**（NAS 用户没有「重启容器」这一步）。密钥策略单一事实源 = `config.rs::validate_access_key`（ASCII 可见字符、8–128 位、字母+数字），Web 端镜像在 `web/src/lib/token-policy.ts`，**改一侧必须同步另一侧**；headless 侧禁止把密钥清空（`PUT /api/v1/config` 写空返回 400）。
-- `actor.rs`：`run_actor` 独占 Engine，**必须** drain resolve_rx/plugin_retry_rx；`ActorCmd` 是 HTTP→引擎写路径（含 `ApplyConfig` live-apply 镜像桌面 SaveConfig）。live-apply 覆盖并发/限速/保存目录/CDN/UA/重试/代理/BT 全组 + **ED2K 订阅与 Kad nodes.dat 后台刷新** + `log_max_size_mb`（直接调 `logger::set_max_total_bytes`）；`ed2k_listen_port`/`ed2k_enable_upnp`/`ed2k_server_list` 由下载时现读，故意无分支。`main.rs` 启动时按 `ed2k_server_sub_startup_plan`（纯函数，缓存版本落后即清缓存）+ nodes.dat 24h 陈旧判定各后台刷新一次，镜像桌面 `download_actor`。
-- `ws_hub.rs`：broadcast + `EngineEventSink`（EngineEvent→WS JSON）+ `WsHostSelection`（HLS/BT/variant 经 WS 往返，BT 60s 兜底）+ 维护 prev-state 表映射 aria2 WS 事件源。
-- `routes_ext.rs`：管理 token 保护（config get/put、queues CRUD+启停/定时/排序、task 移队+boost、fs_list、proxy_test、token/regenerate、stats、logs、bt tracker-sub refresh、**ed2k server-sub refresh**（`POST /api/v1/ed2k/server-sub/refresh` → `Ed2kServerSubRefreshResponse`）、**component ffmpeg/ytdlp status/versions/install/uninstall**）；开放（`?token=` query，浏览器不能设头）：`GET /api/v1/ws`、`tasks/{id}/file` 流式取回、logs/export、openapi.json、Scalar `/docs`；**完全无鉴权**：`GET /api/v1/setup/status` + `POST /api/v1/setup`（首次运行向导，仅在密钥未设定时可写，设过即 409）。
-- `analytics.rs`（**新**）：仅两条匿名部署遥测（`app_installed` 一次 + `app_active` 每日，`analytics_enabled` 门控），**绝不**采集下载/任务信息；匿名 device_id 存 config；`FLUXDOWN_ANALYTICS=off`/空 key 关。
-- `demo.rs`（**新**）：`GET /demo/file` 确定性生成 64MiB 字节流（不落盘/不联网，支持 HEAD+Range，1MiB/s 限速），演练真实探测/分段/续传路径；仅 `FLUXDOWN_DEMO*` 设置时挂载。
-
-**分发目标**（单个 server 二进制 + `FLUXDOWN_*` env，产物不含 `web/` 目录）：Docker（ghcr.io，amd64+arm64）、群晖 SPK、QNAP QPKG、OpenWrt IPK+LuCI、Unraid CA 模板、CasaOS、Scoop（`bucket/`）、Windows 安装器。脚本在 `packaging/`、`promotion/`、`docker/`。
+**分发目标**（`fluxdown-agent` + `fluxdownd` 同目录，入口 `fluxdown-agent --server`，镜像名仍 `ghcr.io/zerx-lab/fluxdown-server`、tag `server-v*`）：Docker（amd64+arm64）、群晖 SPK、QNAP QPKG、OpenWrt IPK+LuCI、Unraid CA 模板、CasaOS。脚本在 `packaging/`、`promotion/`、`docker/`。

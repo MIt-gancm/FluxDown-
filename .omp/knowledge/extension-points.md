@@ -14,10 +14,10 @@
 | **新增插件工具面** | `runtime.rs` 加 Spec/Outcome/Availability（禁 rquickjs 类型）；`HostContext` 加门；`bridge.rs` 实现（semaphore + 牢笼）；`manifest` 加 permission |
 | **插件通用认证** | `engine/src/auth.rs` 保存受控 `AuthProfile`；`manifest.permissions` 声明 `auth`；插件经 `flux.auth.save/get/remove` 管理登录结果，`flux.fetch({authRef})` 或插件+站点默认引用自动注入 Cookie/Bearer/Header |
 | **新增 Dart↔Rust 信号** | `hub/src/signals/mod.rs` 定义（`DartSignal`/`RustSignal`/`SignalPiece`）→ `rinf gen` → **并进 `download_actor` 的 `AuxSignal` 合并泵**（主 `select!` 已满 64 分支硬上限，绝不能加新分支，见 AGENTS.md「crate 边界与硬不变式」）→ Dart 端 `XxxSignal.rustSignalStream` 监听 |
-| **新增 RSS 过滤规则** | `engine/src/rss/filter.rs` 改判定 + 补单测 → **同步** `lib/src/models/rss_filter.dart` 与 `web/src/lib/rss-filter.ts` 两份镜像（预览与实际下载不一致会直接摧毁功能可信度）→ 三 Tab 对话框加控件 + i18n |
+| **新增 RSS 过滤规则** | `engine/src/rss/filter.rs` 改判定 + 补单测 → **同步** `lib/src/models/rss_filter.dart` 与 `web/src/pages/rss/filter.ts` 两份镜像（预览与实际下载不一致会直接摧毁功能可信度）→ 三 Tab 对话框加控件 + i18n |
 | **新增订阅 provider** | 插件 manifest 加 `subscriptions:[{providerId,entry,timeoutMs}]`，脚本实现 `globalThis.subscribe(ctx)` 并返回规范化条目 → `PluginManager` 动态路由到 `subscription::SubscriptionProvider` → 公共调度负责退避/去重/过滤/落库/建任务（`Engine::initialize` 经 `set_fallback_provider` 挂载路由，宿主无需接线）；订阅级「代理 / User-Agent」只对内置 `rss` provider 生效，插件请求走 `flux.fetch` 的全局出口 |
-| **新增 HTTP 能力** | 扩 `ApiHost`（带默认 impl 保持现有宿主可编译）+ `api/server.rs` handler + `routes.rs` 常量；两宿主（hub `api_host.rs` / server `host.rs`）按需 override；跑 `gen_openapi` 重生成 |
-| **新增本机 RPC 能力** | `native/protocol` 先加唯一 method/DTO/event/error → owner 进程（下载事实进 daemon actor；账户/云/UI Gateway 进 agent）实现 → `crates/app` 单会话 adapter 映射到 capability-local port；二进制 body 留专用鉴权 HTTP 端点 |
+| **新增 HTTP 能力** | 扩 `ApiHost`（带默认 impl 保持现有宿主可编译）+ `api/server.rs` handler + `routes.rs` 常量；两宿主（hub `api_host.rs` / agent `native/agent/src/api_host.rs`，转发 daemon RPC）按需 override；跑 `gen_openapi` 重生成。`native/server` 已冻结不再跟进 |
+| **新增本机 RPC 能力** | `native/protocol` 先加唯一 method/DTO/event/error → owner 进程（下载事实进 daemon actor；账户/云/UI Gateway 进 agent）实现 → `crates/app` 单会话 adapter 映射到 capability-local port；Web SPA 在 `web/src/lib/rpc/protocol/`（TS wire 镜像）+ `methods/` 补包装、事件语义改 `apply.ts`；二进制 body 留专用鉴权 HTTP 端点（headless 浏览器面 `/api/web/*` 在 `native/agent/src/server_mode.rs`） |
 | **新增 aria2 方法** | `aria2.rs` `METHOD_NAMES` + `jsonrpc.rs` dispatch | 
 | **新增 MCP 工具** | `mcp.rs` tool_definitions + call_tool |
 | **新增引擎事件** | `events.rs` 的 `EngineEvent` + `EventSink`；legacy `rinf_sink`/`ws_hub` 接线；本机链路在 `native/daemon/src/event_hub.rs` 映射规范 `DaemonEvent`，同步 daemon/agent 快照投影与 GPUI 消费者（含重连快照），验证真实 sink 广播，避免仅更新快照而已有窗口漏刷 |
@@ -28,8 +28,8 @@
 | **新增 Flutter 主题预设/度量** | `flux_theme_tokens.dart` 加 `BuiltinThemeId`+工厂+`builtinThemes` 项 / `flux_metric_tokens.dart` 加 clamped 字段 + `app_metrics.dart` 暴露 |
 | **新增 GPUI 主题/基础组件** | `crates/theme` 改完整亮暗 `SemanticThemeTokens`（Base 新 token 必须同步两份）→ `crates/components` 只从 `active_theme().tokens()` 取值；文案仍只改共享 `assets/i18n/{en,zh}.json`，`crates/i18n/build.rs` 自动嵌入 |
 | **新增 GPUI capability / 设置分区** | 状态/命令/多页面满足拆 crate 条件时在 `crates/<capability>` 定义本地 port/controller/view；只依赖 `fluxdown_protocol` 和 UI 基础层 → `crates/app` 注入同一个 `Arc<AgentClient>` adapter 与有序 snapshot/event 流；shell 只收内容槽。设置页 = gpui-component `Settings` DSL：`crates/settings/src/sections/<page>.rs::page(&SectionContext, cx) -> SettingPage`，状态经 `Entity<SettingsStore>`（防抖合并写回、乐观覆盖、冲突重试），自定义控件用 `SettingField::render` + `window.use_keyed_state`，对话框走 `window.open_dialog`（shell 已渲染 dialog/sheet/notification 层） |
-| **新增 NAS/分发目标** | `packaging/<target>/build_*.sh` 复用（**单个** server 二进制 + `FLUXDOWN_*`；Web UI 已编译期内嵌，别再往包里塞 `web/` 目录）布局 → 接入 release.yml `build-server-nas-packages` |
+| **新增 NAS/分发目标** | `packaging/<target>/build_*.sh` 复用（`fluxdown-agent` + `fluxdownd` 同目录、入口 `fluxdown-agent --server` + `FLUXDOWN_*`；Web UI 已编译期内嵌，别再往包里塞 `web/` 目录）布局 → 接入 release.yml `build-server-nas-packages` |
 | **新增发布组件** | `changes` job 加路径→输出映射 + 一对 `build-*`/`release-*` job（各自组件 tag） |
 | **新增文档页** | `content/docs/{en,zh}/<section>/<page>.md`（section 加进 `content.config` 枚举，zh 跑 `docs:hash`） |
 | **新增自更新平台策略** | `fluxdown_updater` Action + `hub/updater.rs` |
-| **新增 UI 文案** | 只补 **en + zh 基线对**：App `assets/i18n/{en,zh}.json` + `lib/src/i18n/translations.dart` 加 getter；web `web/src/lib/locales/{en,zh}.json`；官网 `website/src/lib/locales/{en,zh-CN}.json`；扩展 `fluxDown/utils/locales/{zh-CN,en}.ts`（`MessageKey` 由 zh-CN 推导）。**社区语言（`ja.json` 等）不碰**——Weblate 维护，运行时键级回退英文 |
+| **新增 UI 文案** | 只补 **en + zh 基线对**：App/GPUI/Web SPA 共用 `assets/i18n/{en,zh}.json`（Flutter 另在 `lib/src/i18n/translations.dart` 加 getter）；官网 `website/src/lib/locales/{en,zh-CN}.json`；扩展 `fluxDown/utils/locales/{zh-CN,en}.ts`（`MessageKey` 由 zh-CN 推导）。**社区语言（`ja.json` 等）不碰**——Weblate 维护，运行时键级回退英文 |

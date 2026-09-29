@@ -6,9 +6,9 @@ order: 2
 sourceHash: "73f1d8f25d48"
 ---
 
-运行 headless 服务器最快的方式是使用预编译 Docker 镜像——无需 Cargo 构建，也无需单独构建 Web 界面。镜像内置了服务器二进制和 Web 界面，全部通过一个端口（`17800`）暴露，并把数据库、日志和访问密钥持久化到卷。
+运行 headless 服务器最快的方式是使用预编译 Docker 镜像——无需 Cargo 构建，也无需单独构建 Web 界面。镜像内置 `fluxdown-agent`（内嵌 Web 界面）与 `fluxdownd`，由 `tini` 作为 PID 1 拉起（agent 以子进程启动 daemon，`docker stop` 时一并关停），全部通过一个端口（`17800`）暴露，并把数据库、日志和访问密钥持久化到卷。
 
-镜像：`ghcr.io/zerx-lab/fluxdown-server`（标签：具体版本如 `0.1.54`，或 `latest`）。
+镜像：`ghcr.io/zerx-lab/fluxdown-server`（标签：具体版本如 `0.1.54`，或 `latest`）。镜像名不变；入口现为 `tini -- fluxdown-agent --server`。
 
 > 为了部署可复现，建议钉具体版本标签而非 `latest`。
 
@@ -24,10 +24,10 @@ docker run -d \
   ghcr.io/zerx-lab/fluxdown-server:latest
 ```
 
-- `/data` 存放数据库、日志和访问密钥——请放在持久化卷上。
+- `/data` 存放数据库、日志和访问密钥——请放在持久化卷上。从旧镜像升级时沿用同一个卷即可：数据与访问密钥都会保留。
 - `/root/Downloads` 是容器内的默认下载目录（`HOME=/root`）；绑定到你希望写入文件的宿主机路径。
 
-首次访问 `http://<host>:17800/` 时，Web 界面会进入初始化向导，由你自行设置访问密钥（至少 8 位，须同时包含字母和数字）。用该密钥登录 Web 界面，以及为管理 API 和 MCP 端点鉴权（`Authorization: Bearer <token>`）。
+首次访问 `http://<host>:17800/` 时，Web 界面会进入初始化向导，由你自行设置访问密钥（至少 8 位，须同时包含字母和数字）。用该密钥登录 Web 界面，以及为 HTTP API、MCP 端点（`Authorization: Bearer <token>`）和 `/rpc` JSON-RPC 端点鉴权。
 
 在 docker-compose 或其它编排场景中，可用 `FLUXDOWN_TOKEN` 预置密钥并跳过向导。仅在实例尚未设置过密钥时生效；若还设置了 `FLUXDOWN_TOKEN_FORCE=1`，则每次重启都会用它覆盖库中已存的密钥（见[环境变量](/docs/zh/headless-server/setup/#环境变量)）：
 
@@ -117,7 +117,7 @@ Unraid Community Applications 模板见 [zerx-lab/unraid-templates](https://gith
 
 ### 升级与卸载
 
-升级即手动安装更新版本的 `.spk` 覆盖安装——`var` 里的数据库、访问密钥与设置全部保留。在套件中心卸载会停止服务并移除套件。
+升级即手动安装更新版本的 `.spk` 覆盖安装——`var` 里的数据库、访问密钥与设置全部保留。套件现在包含 `fluxdown-agent` + `fluxdownd`（启动脚本运行 `fluxdown-agent --server`，日志文件仍为 `var/fluxdown-server.log`）。在套件中心卸载会停止服务并移除套件。
 
 ## 安全地对外暴露
 

@@ -10,7 +10,7 @@
 > **"Downloads, Supercharged."**（下载，全面加速。）
 
 - **核心价值主张**: Rust 驱动的高速多协议下载，永久免费，零广告，零追踪（仅两条匿名部署遥测，可关），本地优先，无需账号即可全功能使用。
-- **平台矩阵（已发布）**: Windows / macOS / Linux 桌面 App、Android App、headless Web 服务器（Docker/群晖/QNAP/OpenWrt/Unraid/CasaOS）、CLI（`fluxdown`）、浏览器扩展、用户脚本。iOS 代码存在但无发布 job。
+- **平台矩阵（已发布）**: Windows / macOS / Linux 桌面 App、Android App、headless Web 服务器（`fluxdown-agent --server` + `fluxdownd`；Docker/群晖/QNAP/OpenWrt/Unraid/CasaOS）、CLI（`fluxdown`）、浏览器扩展、用户脚本。iOS 代码存在但无发布 job。
 - **可选云能力（FluxCloud）**: 登录账号后跨设备**配置同步**（客户端已落地，见 `clients.md`「Flutter 前端架构」）；下载本身永远本地，账号非必需。
 
 ---
@@ -49,7 +49,7 @@ flowchart TB
   end
   subgraph hosts[宿主 impl 三 trait]
     hub[hub: 桌面/移动 App<br/>唯一 rinf FFI]
-    srv[server: headless<br/>axum + WS + SPA]
+    srv[agent --server + fluxdownd<br/>headless：Gateway + /rpc + SPA]
   end
   api[fluxdown_api<br/>ApiHost 契约 + HTTP 面]
   eng[fluxdown_engine<br/>协议/分段/DB/队列/组/插件]
@@ -64,7 +64,7 @@ flowchart TB
 
 **要点**：
 - `fluxdown_api` 只依赖 `&dyn ApiHost`，不碰引擎——同一套 HTTP 面（脚本接管 + aria2 JSON-RPC（POST 与 WS）+ MCP + `/api/v1` 管理 + OpenAPI）可服务任意宿主。
-- 两个生产宿主：`hub`（App，actor=`download_actor.rs`）、`server`（headless，actor=`actor.rs`）。两者的 actor **都必须** drain `resolve_rx`（off-actor 插件解析回流）与 `plugin_retry_rx`，否则命中 resolver 的下载会永久挂起。
+- 两个生产宿主：`hub`（App，actor=`download_actor.rs`）与 headless `fluxdown-agent --server`（`AgentApiHost` 转发 `fluxdownd` 的 JSON-RPC；daemon 的 `actor.rs` 独占引擎）。持有引擎的 actor **都必须** drain `resolve_rx`（off-actor 插件解析回流）与 `plugin_retry_rx`，否则命中 resolver 的下载会永久挂起。`native/server` 已冻结。
 - 客户端捕获有三条并行前端进同一本机 RPC（`:17800/download`）：扩展（webRequest+downloads 全拦截）、用户脚本（页面态 `GM_xmlhttpRequest` 回退）、桌面确认框。
 - **并发模型**: current_thread tokio actor 串行化写；每个下载 spawn 独立 task + CancellationToken；插件 resolve 永不阻塞 actor（off-actor spawn + 通道回流）。
 
@@ -97,7 +97,7 @@ flowchart TB
 - `native/daemon` 是 aria2c 式纯下载核心目标：下载任务、下载设置、RSS、插件和下载事件归它；账户与云同步永不进入该边界。
 - `native/agent` 是可选但常驻的官方客户端后端：独占 FluxCloud Token、配置同步、设备协同和远程任务状态机；官方 UI 默认只连接 agent。
 - `native/protocol` 是 daemon、agent、GPUI/WASM/CLI 共享的 wire 层；目前已落地服务角色与版本握手，JSON-RPC 方法/事件随实际迁移补充，禁止提前建立第二套 DTO。
-- 当前生产路径仍是 `hub` / `server`；迁移完成前不得把目标图误报为已运行。`native/server` 只保留旧 headless 路径，不接收新架构功能。
+- 当前生产路径：Flutter App 仍走 `hub`；GPUI 桌面与 headless/NAS 已走 agent + daemon（headless 见 `hosts-and-api.md`「Headless 服务器」）。`native/server` 已冻结（不构建/不发布/不改），待新链路发版验证后删除。
 
 ---
 
@@ -127,7 +127,7 @@ FluxDown/
 │   ├── protocol/       `fluxdown_protocol`：daemon / agent / 客户端共享的传输无关协议基线
 │   ├── daemon/         `fluxdown_daemon`：纯下载常驻核心边界（运行链路迁移中）
 │   ├── agent/          `fluxdown_agent`：云功能与官方 UI Gateway 边界（运行链路迁移中）
-│   ├── server/         `fluxdown_server`：headless Web 服务器——见 `hosts-and-api.md`「Headless 服务器」
+│   ├── server/         `fluxdown_server`：**已冻结**的旧 headless 宿主（不构建/不发布），由 `agent --server` + `daemon` 取代
 │   ├── hub/            rinf FFI 适配层（唯一碰 rinf）——见 `hosts-and-api.md`「宿主与客户端 crate」
 │   ├── cli/            `fluxdown_cli`：二进制 `fluxdown`——见 `hosts-and-api.md`「宿主与客户端 crate」
 │   ├── nmh/            Native Messaging Host 中继二进制

@@ -109,11 +109,13 @@ SharedPreferences 门面，**便携模式**（`portable` 标记）写 `<exe>/por
 
 ## Web SPA（`web/`）
 
-React 19 + Vite 8 + TanStack（Router/Query/Table/Virtual/Form）+ Tailwind v4 + Radix + bun + oxlint + react-compiler。`bun run build` → `web/dist`，由 `fluxdown_server` **编译期内嵌**进二进制托管（SPA fallback→index.html；`FLUXDOWN_WEBROOT` 可覆盖成磁盘目录，见 hosts-and-api.md）——改了前端要重编服务器才生效。路由：`/login`、`/`（TasksScreen）、`/settings`（token 门禁，401→清凭据→/login）。`src/lib`：`api.ts`（typed REST）、`ws.ts`（可重连 WS live store）、`cloud/`（L2 云同步 client）、`i18n`、`task-group`、`manifest-selection`、`view-prefs`、`theme`、`format`。
+React 19 + Vite 8 + TanStack Router + Tailwind v4 + Radix + bun + oxlint。`bun run build` → `web/dist`，由 `fluxdown-agent --server`（`web-ui` feature）**编译期内嵌**托管（SPA fallback；`FLUXDOWN_WEBROOT` 可覆盖，见 hosts-and-api.md「Headless 服务器」）——改了前端要重编 agent 才生效。dev：`bun run dev` 代理 `/rpc`(ws)/`/api`/`/ping`/`/demo` → :17800（`changeOrigin:false`，agent 校验 Origin 同源）。
 
-**双端信息架构对齐（硬约束）**：同一功能在 web 与桌面 App 的**归属位置必须一致，基准 = 桌面**——设置项跟随桌面 `settings_page.dart` 的分类（web 设置分区组件与桌面侧边栏分类一一对应：GeneralSettings↔通用、DownloadSettings↔下载、ProxySettings↔代理…），对话框字段的分区/排序跟随桌面对应对话框。给双端并行开发（含 subagent 派发）写任务时，**归属分类/排序必须写成一份共享契约**（明确"桌面 X 分类 + web 对应分区组件"），禁止两份各自措辞留给执行者解读。交付前自查：桌面截图里该功能在哪个菜单，web 就必须在哪个菜单。
-
-**设置页布局**（`web/src/routes/settings.tsx` + `design.css` 的「设置」段）：左导航分类 = general/account/appearance/download/bt/**ed2k**/proxy/security/notify/extensions/about（与桌面侧边栏同序）。正文结构 `.settings-body`（滚动容器，高度确定）→ `.settings-cols`（**多列容器，高度必须自适应**——两者不能合并，否则 `column-count` 会按视口高度分列并横向溢出）。≥1200px 两列、≥1900px 三列的瀑布式排布：`.set-group` / `.set-section`（小标题+卡片+同组脚注的整体，`break-inside: avoid`）是列内元素，其余直接子元素（分区标题/说明/宽面板）`column-span: all` 整行铺满，超宽卡片显式加 `.set-wide`。异步卡片的 loading 态要与加载完成后**行数、title/desc 一致**（见 `ComponentsSettings`），否则首屏到货会重新均衡列高造成抖动。
+- **传输**：`src/lib/rpc/` 是唯一数据面——agent `/rpc` JSON-RPC（子协议鉴权 `fluxdown.rpc.v1` + `fluxdown.token.<b64url>`，hello 声明 `client.selections`）→ `system.snapshot` → `service.event` 按 epoch/sequence 增量应用（`apply.ts` 移植 `native/protocol/src/event.rs`；断档/4009 重同步，`service-quit` 不重连）。`protocol/` 为 wire TS 镜像，`methods/` 提供 `rpc.<system|daemon|agent>.<group>.<method>`，`hooks.ts` 选择器；`http.ts` 管 `/api/web/*`（blob 上传、已完成文件下载、日志 zip）。不再有 REST 管理面或 `/api/v1/ws`。云账户/同步全部走 agent（`agent.auth.*`/`agent.sync.*`），Web 不直连 FluxCloud。
+- **登录**：`src/lib/access`（访问密钥存储 + 免鉴权探针）、`pages/auth`（登录 + 首次运行向导 `/api/v1/setup{,/status}`）；`lib/token-policy.ts` 镜像 agent `validate_access_key`。
+- **文案/主题**：`src/i18n` 直读 `assets/i18n/{en,zh}.json`（与 GPUI/Flutter 同键，语义同 `crates/i18n`；语言 = 偏好 `general.locale` > `/ping.language` > 浏览器）；`src/theme` 经 Vite 别名复用 `website-v2/src/lib/gpui-theme` 解析 GPUI token → `--fx-*` CSS 变量（偏好 `appearance.*`、`ui_scale`）。
+- **UI 对齐 GPUI（基准 = GPUI 桌面客户端）**：`src/shell` = 48px 活动栏（下载/RSS/Webhook + 主题/设置，`ui.show_activity_*`）+ 40px 标题栏插槽（`TitleBarSlot`）；`src/ui` 镜像 `crates/components/src/kit.rs`。页面：`pages/downloads`（侧栏状态文件夹内嵌分类/队列/设备、表格列与排序、选择条、详情四 tab、状态栏；视图偏好 `desktop.downloads.view` 同 GPUI 形状；`dialogs/` = 新建下载/选择/队列管理/任务组/改名换源/服务端目录选择）、`pages/rss`、`pages/webhooks`、`pages/settings`（`categories.ts` ↔ `crates/settings/src/view.rs::build_pages`，Web 无 notify 分类）。桌面专属（托盘/自启/关联/剪贴板/打开文件→改浏览器下载/进度窗口/主题库导入导出/完成后关机）省略。
+- **移动端**（<=820px）：活动栏变底部标签栏（安全区、44px 触摸目标），侧栏/详情变 Sheet，表格变卡片行（点按/长按 ActionMenu），Dialog 全屏，Popover 变底部 Sheet；断点工具类 `mobile:`/`narrow:`/`coarse:`。
 
 ---
 

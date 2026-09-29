@@ -47,7 +47,7 @@ With batch management on, every row gets a checkbox, and a bar appears with **Se
 
 Selecting a task opens the detail panel:
 
-- **General** — progress, downloaded/total size, speed, thread (segment) count, download URL (with copy button), save path on the server, protocol and queue, creation time. For a **completed** task the primary action is **"Save to local"** (streams the file from the server to your browser via `/api/v1/tasks/{id}/file`); for any other task the primary action is **"Boost"** (pauses other tasks to free bandwidth for this one). Delete is always available and asks for confirmation.
+- **General** — progress, downloaded/total size, speed, thread (segment) count, download URL (with copy button), save path on the server, protocol and queue, creation time. For a **completed** task the primary action is **"Save to local"** (streams the file from the server to your browser via `/api/web/files/tasks/{id}`); for any other task the primary action is **"Boost"** (pauses other tasks to free bandwidth for this one). Delete is always available and asks for confirmation.
 - **Segments** — the same per-segment progress visualization as the desktop app, including the live split animation when the engine proactively splits a slow segment.
 - **Queue** — move the task between named queues.
 - **Log** — recent events for this task.
@@ -85,7 +85,7 @@ These dialogs only appear while you have the Web UI open and connected — if yo
 
 ## Retrieving finished files
 
-The server keeps completed files on its own filesystem. To pull one down to your local machine, use **Save to local** from the detail panel or the context menu — it streams the file through `GET /api/v1/tasks/{id}/file` as a normal browser download (with a `Content-Disposition: attachment` header and the original filename), authenticated via a token query parameter since browser-initiated downloads can't set custom headers.
+The server keeps completed files on its own filesystem. To pull one down to your local machine, use **Save to local** from the detail panel or the context menu — it streams the file through `GET /api/web/files/tasks/{id}` as a normal browser download (with a `Content-Disposition: attachment` header and the original filename), authenticated via a token query parameter since browser-initiated downloads can't set custom headers.
 
 ## Settings
 

@@ -3,7 +3,7 @@ description: FluxDown 多语言只以英文 + 简体中文为开发基线，其�
 condition:
   - 'assets/i18n/*.json'
   - 'lib/src/i18n/*.dart'
-  - 'web/src/lib/locales/*'
+  - 'web/src/i18n/*'
   - 'website/src/lib/locales/*'
   - 'fluxDown/utils/locales/*'
 interruptMode: never
@@ -11,12 +11,11 @@ interruptMode: never
 
 你正在改 FluxDown 的翻译文件。**语言完成度只按 en + zh 两条基线判定**，其余语言（ja 及未来任何新增语言）一律**不检查、不阻塞、不由 AI 补**。
 
-## 四个 i18n 面各自的基线对（缺一不可，多的不管）
+## 三个 i18n 文件面各自的基线对（缺一不可，多的不管）
 
 | 面 | 基线文件 | 备注 |
 |---|---|---|
-| App（Flutter，桌面+移动+popup） | `assets/i18n/en.json` + `assets/i18n/zh.json` | 键契约同时体现在 `lib/src/i18n/translations.dart` 的 `S` getter |
-| Web SPA | `web/src/lib/locales/en.json` + `zh.json` | `Messages` 类型由 `en.json` 推导 |
+| App（Flutter 桌面+移动+popup）+ GPUI（`crates/*`）+ Web SPA（`web/`） | `assets/i18n/en.json` + `assets/i18n/zh.json` | 三端共用同一 camelCase 键：Flutter 另在 `lib/src/i18n/translations.dart` 加 `S` getter；GPUI `ctx.t("key")`；Web `useT()`（`web/src/i18n`，Vite 别名直引该目录）。删键前 `grep crates/ web/src lib/` |
 | 官网 | `website/src/lib/locales/en.json` + `zh-CN.json` | 中文文件名是 `zh-CN.json`（代码里映射为 `zh`）；`ja.json` 是社区语言 |
 | 浏览器扩展 | `fluxDown/utils/locales/zh-CN.ts` + `en.ts` | 反过来：`MessageKey` 类型由 **`zh-CN.ts`** 推导，`en.ts` 是 `Record<MessageKey, string>`，少一个键直接 tsc 报错 |
 
@@ -36,4 +35,4 @@ interruptMode: never
 node -e "const a=require('./assets/i18n/en.json'),b=require('./assets/i18n/zh.json');const A=Object.keys(a),B=Object.keys(b);console.log('zh 缺/空:',A.filter(k=>!(k in b)||!b[k]));console.log('zh 多余:',B.filter(k=>!(k in a)))"
 ```
 
-把路径换成 `web/src/lib/locales/{en,zh}.json`、`website/src/lib/locales/{en,zh-CN}.json` 即可复用；扩展侧由 `tsc` 把关，跑 `cd fluxDown && npx tsc --noEmit` 或直接看 IDE 报错。**只对基线对跑这个检查，别拿社区语言文件跑。**
+把路径换成 `website/src/lib/locales/{en,zh-CN}.json` 即可复用；扩展侧由 `tsc` 把关，跑 `cd fluxDown && npx tsc --noEmit` 或直接看 IDE 报错。**只对基线对跑这个检查，别拿社区语言文件跑。**

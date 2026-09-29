@@ -8,7 +8,7 @@ order: 1
 FluxDown ships a small HTTP API — used by browser extensions, userscripts, aria2 clients, and automation — built into two places:
 
 - **The desktop app**, on `http://127.0.0.1:17800` (port configurable, address hardcoded to loopback: it is never reachable from the network). It's off by default for the management group and on by default for the other groups; see the desktop client's local API settings.
-- **The [headless server](/docs/en/headless-server/setup/)**, on whatever address `FLUXDOWN_BIND` is set to (`0.0.0.0:17800` by default — reachable over the network by design, since remote management is the point). The management API is always enabled there, and it adds a handful of server-specific endpoints (queues, config, file retrieval, WebSocket, filesystem browsing) beyond what the desktop app exposes.
+- **The [headless server](/docs/en/headless-server/setup/)**, on whatever address `FLUXDOWN_BIND` is set to (`0.0.0.0:17800` by default — reachable over the network by design, since remote management is the point). The server is `fluxdown-agent --server` (with its sibling `fluxdownd`); the compatibility groups below are enabled from the first start. Its Web UI manages everything else over the agent's `/rpc` JSON-RPC endpoint — the same protocol the desktop client speaks.
 
 Both share the same underlying route constants, request/response JSON contracts, and auth rules — only which routes are enabled, and what host implements them, differs.
 
@@ -24,7 +24,7 @@ Both share the same underlying route constants, request/response JSON contracts,
 
 `GET /api/v1/openapi.json` (no auth — it's a pure interface description with no data) is available whenever the management group is enabled.
 
-On the headless server specifically, `/api/v1/*` also includes extra routes not present on the desktop app: `GET /api/v1/ws` (WebSocket), `GET/PUT /api/v1/config`, `POST/PUT/DELETE /api/v1/queues[/{id}]`, `POST /api/v1/queues/{id}/start|stop` (flip a queue between running and stopped — stopping pauses its tasks and excludes them from auto-start), `PUT /api/v1/queues/{id}/schedule` (daily start/stop times plus a weekday mask), `PUT /api/v1/queues/{id}/order` (persist the in-queue task start order), `PUT /api/v1/tasks/{id}/queue`, `PUT /api/v1/tasks/{id}/boost`, `GET /api/v1/tasks/{id}/file`, `GET /api/v1/fs/list`, `POST /api/v1/proxy/test`, `POST /api/v1/token/regenerate`, and `GET /api/v1/stats`. These follow the same token rules as the rest of the management group, except `/ws` and `/tasks/{id}/file` (browser-initiated requests can't set custom headers, so both take `?token=` as a query parameter instead) and `/openapi.json`/`/docs` (unauthenticated).
+The old headless server (`fluxdown-server`) additionally exposed extension REST routes — `/api/v1/config`, queue create/update/delete and start/stop/schedule/order, `/api/v1/stats`, `/api/v1/fs/list`, components, webhooks, logs, `/api/v1/ws`, and `/api/v1/token/regenerate`. **They no longer exist** on `fluxdown-agent --server`: manage those things from the built-in Web UI, or speak JSON-RPC to `/rpc` directly. The server also offers two unauthenticated bootstrap routes, `GET /api/v1/setup/status` and `POST /api/v1/setup` (only accepted while no access key is set), used by the first-run wizard.
 
 ## Authentication
 
@@ -35,7 +35,8 @@ There is one configured token (`local_server_token`); how it must be presented d
 | Script takeover | `X-FluxDown-Token` header (only if a token is configured — empty token means the group is unauthenticated). The `X-FluxDown-Client` header is always required regardless of token, as a CORS-based gate against arbitrary web pages. |
 | aria2-compatible RPC | `X-FluxDown-Token` header, **or** aria2's own convention of passing `token:xxx` as `params[0]` in the JSON-RPC call. |
 | Management API (`/api/v1/*`) | `Authorization: Bearer <token>` **or** `X-FluxDown-Token` header. If no token is configured, every management request is rejected (403) — this group cannot run unauthenticated. |
-| `/api/v1/ws`, `/api/v1/tasks/{id}/file` | `?token=<token>` query parameter (browser navigation/WebSocket upgrades can't set custom headers). |
+| `/rpc` (WebSocket) | `Authorization: Bearer <token>`, or — for browsers — the `Sec-WebSocket-Protocol: fluxdown.rpc.v1, fluxdown.token.<base64url(token)>` sub-protocol. Requests carrying an `Origin` header must be same-origin with `Host`. |
+| `/api/web/files/tasks/{id}`, `/api/web/exports/{id}` | `Authorization: Bearer <token>` or `?token=<token>` query parameter (browser navigation can't set custom headers). |
 
 Constant-time comparison is used everywhere a token is checked, to avoid timing side-channels.
 
@@ -166,4 +167,4 @@ Note the protocol carries no cookies, headers, or credentials — the receiving 
 ## Interactive documentation
 
 - [`/api-docs`](/api-docs) on this site renders the full OpenAPI 3.1 spec (generated from the actual route handlers) with a try-it-out UI, for the routes common to both hosts.
-- A running headless server also serves its own live, merged spec (core + server-specific extension routes) at `/api/v1/docs` (Scalar UI) and `/api/v1/openapi.json` (raw JSON) — always in sync with the exact build you're running.
+- A running server also serves its own live spec at `/api/v1/openapi.json` (raw JSON) — always in sync with the exact build you're running.
