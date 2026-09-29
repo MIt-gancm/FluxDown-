@@ -472,15 +472,17 @@ impl ShellView {
         }
         let theme = active_theme(cx);
         let spacing = theme.tokens().spacing;
-        let chrome = theme.extended().colors.chrome;
-        // 与侧栏同为 chrome 底，二者之间不画分隔线。
+        let extended = theme.extended();
+        // 与侧栏同为 chrome 底，靠右侧 hairline 结构线分界（与侧栏|内容的 resizable 把手同色同粗）。
         Some(
             v_flex()
                 .h_full()
                 .w(ACTIVITY_RAIL_WIDTH)
                 .flex_none()
                 .justify_between()
-                .bg(chrome)
+                .bg(extended.colors.chrome)
+                .border_r(extended.stroke.thin)
+                .border_color(extended.colors.hairline)
                 .pt(spacing.sm)
                 .pb(spacing.sm)
                 .child(self.route_buttons(cx))
