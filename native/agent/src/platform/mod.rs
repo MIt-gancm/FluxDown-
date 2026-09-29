@@ -262,7 +262,13 @@ pub fn migrate_legacy_autostart() -> Result<(), PlatformError> {
     autostart::retarget(&agent)
 }
 
+/// 自启条目指向的可执行文件。AppImage 运行时 `current_exe` 是每次启动都不同的临时挂载点
+/// （`/tmp/.mount_*`），改为指向 AppImage 文件本身；其 `AppRun` 把 `--autostart` 转交 agent。
 fn agent_executable() -> Result<PathBuf, PlatformError> {
+    #[cfg(target_os = "linux")]
+    if let Some(appimage) = std::env::var_os("APPIMAGE").filter(|path| !path.is_empty()) {
+        return Ok(PathBuf::from(appimage));
+    }
     Ok(std::env::current_exe()?)
 }
 

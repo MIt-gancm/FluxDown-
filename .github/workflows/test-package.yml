@@ -1,5 +1,8 @@
 name: Manual Client Test Packages
 
+# 手动出测试包（不发 Release）。桌面端 = GPUI，打包逻辑与 release.yml 相同
+# （Windows 未签名 Inno 安装器 + 便携 zip；Linux scripts/package_gpui_linux.sh；
+# macOS scripts/package_gpui_macos.sh，测试包为 ad-hoc 签名、不公证）。
 on:
   workflow_dispatch:
     inputs:
@@ -13,6 +16,19 @@ on:
         required: true
         default: 0.0.0
         type: string
+      target:
+        description: 要打包的平台
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - windows-x64
+          - windows-arm64
+          - linux
+          - macos
+          - android
+          - extension
 
 permissions:
   contents: read
@@ -42,173 +58,128 @@ jobs:
   build-windows:
     name: Test Windows (${{ matrix.arch }})
     needs: version
+    if: inputs.target == 'all' || startsWith(inputs.target, 'windows')
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arch: x64
-            runner: windows-latest
-          - arch: arm64
-            runner: windows-11-arm
+        include: ${{ fromJSON(inputs.target == 'windows-x64' && '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"}]' || inputs.target == 'windows-arm64' && '[{"arch":"arm64","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc"}]' || '[{"arch":"x64","runner":"windows-latest","target":"x86_64-pc-windows-msvc"},{"arch":"arm64","runner":"windows-11-arm","target":"aarch64-pc-windows-msvc"}]') }}
+    env:
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
     steps:
+
       - name: Checkout selected ref
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
-          fetch-depth: 0
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
 
       - name: Cache Rust
-        uses: actions/cache@v4
+        uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: manual-test-rust-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: manual-test-rust-${{ runner.os }}-${{ matrix.arch }}-
+          key: gpui-${{ matrix.target }}
+          cache-on-failure: true
 
-      - name: Cache Rinf CLI
-        id: cache-rinf
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/rinf.exe
-          key: manual-test-rinf-${{ runner.os }}-${{ matrix.arch }}-8.9.0
-
-      - name: Setup Flutter x64
-        if: matrix.arch == 'x64'
-        uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-          cache: true
-
-      - name: Setup Flutter ARM64
-        if: matrix.arch == 'arm64'
-        shell: bash
-        run: |
-          git clone https://github.com/flutter/flutter.git -b stable --depth 1 "$USERPROFILE/flutter"
-          echo "$USERPROFILE/flutter/bin" >> "$GITHUB_PATH"
-
-      - name: Cache Flutter ARM64
-        if: matrix.arch == 'arm64'
-        uses: actions/cache@v4
-        with:
-          path: ~/flutter/bin/cache
-          key: manual-test-flutter-arm64-stable
-
-      - name: Install dependencies and generate bindings
+      - name: Build desktop, agent, daemon and browser relay
         shell: bash
         env:
-          CARGO_HTTP_MULTIPLEXING: "false"
-          CARGO_NET_RETRY: "10"
+          FLUXCLOUD_BASE_URL_SECRET: ${{ secrets.FLUXCLOUD_BASE_URL }}
         run: |
-          flutter precache --windows
-          flutter pub get
-          if [ "${{ steps.cache-rinf.outputs.cache-hit }}" != "true" ]; then cargo install rinf_cli@8.9.0; fi
-          rinf gen
+          if [ -n "$FLUXCLOUD_BASE_URL_SECRET" ]; then export FLUXCLOUD_BASE_URL="$FLUXCLOUD_BASE_URL_SECRET"; fi
+          cargo build --locked --release --target ${{ matrix.target }} \
+            -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon -p fluxdown_nmh \
+            --features fluxdown_agent/desktop --bins
 
-      - name: Build Flutter Windows app
-        run: flutter build windows --release --build-name=${{ needs.version.outputs.clean_version }} --build-number=1 --dart-define=APP_VERSION=${{ needs.version.outputs.version }}
-
-      - name: Normalize ARM64 output
-        if: matrix.arch == 'arm64'
+      - name: Stage binaries with MSVC CRT
         shell: pwsh
         run: |
-          if ((Test-Path "build\windows\x64") -and -not (Test-Path "build\windows\arm64")) {
-            Rename-Item -Path "build\windows\x64" -NewName "arm64"
+          $stage = "build\gpui\windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          foreach ($bin in "fluxdown-desktop", "fluxdown-agent", "fluxdownd", "fluxdown_nmh") {
+            Copy-Item "target\${{ matrix.target }}\release\$bin.exe" $stage
           }
-
-      - name: Bundle MSVC CRT
-        shell: pwsh
-        run: |
-          $release = "build\windows\${{ matrix.arch }}\runner\Release"
-          $bytes = [System.IO.File]::ReadAllBytes("$release\flux_down.exe")
-          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
-          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
-          $archDir = switch ($machine) { 0x8664 { 'x64' } 0xAA64 { 'arm64' } default { throw "Unexpected PE machine" } }
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
           $vsRoot = & $vswhere -latest -products * -property installationPath
-          $crtDir = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\$archDir\Microsoft.VC1*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
-          Copy-Item "$($crtDir.FullName)\msvcp140*.dll", "$($crtDir.FullName)\vcruntime140*.dll" $release -Force
+          $crtDir = Get-ChildItem "$vsRoot\VC\Redist\MSVC\*\${{ matrix.arch }}\Microsoft.VC1*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+          if (-not $crtDir) { throw "MSVC CRT redist for ${{ matrix.arch }} not found" }
+          Copy-Item "$($crtDir.FullName)\msvcp140*.dll", "$($crtDir.FullName)\vcruntime140*.dll" $stage -Force
 
       - name: Build unsigned installer
         shell: pwsh
         run: |
           if (-not (Get-Command iscc -ErrorAction SilentlyContinue)) {
-            choco install innosetup -y --no-progress
-            echo "C:\Program Files (x86)\Inno Setup 6" | Out-File -FilePath $env:GITHUB_PATH -Append
+            if (-not (Test-Path "C:\Program Files (x86)\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+            $env:PATH = "C:\Program Files (x86)\Inno Setup 6;$env:PATH"
           }
           Copy-Item "installer\windows\ChineseSimplified.isl" "C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl" -Force
-          iscc /DMyAppVersion=${{ needs.version.outputs.clean_version }} /DMyAppArch=${{ matrix.arch }} installer\windows\setup.iss
+          iscc /DMyAppVersion=${{ needs.version.outputs.version }} /DMyAppArch=${{ matrix.arch }} "/DMySourceDir=$PWD\build\gpui\windows-${{ matrix.arch }}" installer\windows\setup.iss
 
       - name: Create portable package
         shell: pwsh
         run: |
-          New-Item -Path "build\windows\${{ matrix.arch }}\runner\Release\portable" -ItemType File -Force | Out-Null
-          New-Item -Path build\installer -ItemType Directory -Force | Out-Null
-          Compress-Archive -Path "build\windows\${{ matrix.arch }}\runner\Release\*" -DestinationPath "build\installer\FluxDown-${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}-portable.zip"
+          $portable = "build\gpui\portable-${{ matrix.arch }}"
+          Copy-Item "build\gpui\windows-${{ matrix.arch }}" $portable -Recurse
+          New-Item -Path "$portable\portable" -ItemType File -Force | Out-Null
+          Copy-Item "$portable\fluxdown-desktop.exe" "$portable\flux_down.exe"
+          Compress-Archive -Path "$portable\*" -DestinationPath "build\installer\FluxDown-${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}-portable.zip"
 
       - name: Upload Windows test artifacts
         uses: actions/upload-artifact@v4
         with:
           name: manual-windows-${{ matrix.arch }}-${{ github.run_number }}
           path: |
-            build/installer/FluxDown-*.exe
+            build/installer/FluxDown-*-setup.exe
             build/installer/FluxDown-*-portable.zip
           if-no-files-found: error
 
   build-linux:
     name: Test Linux x64
     needs: version
+    if: inputs.target == 'all' || inputs.target == 'linux'
     runs-on: ubuntu-22.04
+    env:
+      CARGO_HTTP_MULTIPLEXING: "false"
+      CARGO_NET_RETRY: "10"
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
       - name: Install system dependencies
-        run: sudo apt-get update -y && sudo apt-get install -y cmake ninja-build clang pkg-config libgtk-3-dev libnotify-dev libsecret-1-dev patchelf libfuse2 zstd
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            clang cmake pkg-config zstd libfuse2 \
+            libasound2-dev libfontconfig-dev libfreetype-dev libglib2.0-dev \
+            libwayland-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libvulkan-dev libzstd-dev libdbus-1-dev \
+            libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
         with:
-          channel: stable
-          cache: true
-      - name: Build app
-        shell: bash
-        env:
-          CARGO_HTTP_MULTIPLEXING: "false"
-          CARGO_NET_RETRY: "10"
+          key: gpui-x86_64-unknown-linux-gnu
+          cache-on-failure: true
+      - name: Build desktop, agent, daemon and browser relay
         run: |
-          flutter precache --linux
-          flutter pub get
-          cargo install rinf_cli@8.9.0
-          rinf gen
-          flutter build linux --release --build-name=${{ needs.version.outputs.clean_version }} --build-number=1 --dart-define=APP_VERSION=${{ needs.version.outputs.version }}
+          cargo build --locked --release \
+            -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon -p fluxdown_nmh \
+            --features fluxdown_agent/desktop --bins
       - name: Package Linux artifacts
-        shell: bash
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          BIN_DIR: target/release
+          OUT_DIR: build/installer
         run: |
-          set -e
-          VERSION=${{ needs.version.outputs.version }}
-          BUNDLE=build/linux/x64/release/bundle
-          mkdir -p build/installer
-          mkdir -p "FluxDown-${VERSION}-linux-x64"
-          cp -a "$BUNDLE/." "FluxDown-${VERSION}-linux-x64/"
-          tar -czf "build/installer/FluxDown-${VERSION}-linux-x64.tar.gz" "FluxDown-${VERSION}-linux-x64"
-          rm -rf "FluxDown-${VERSION}-linux-x64"
-          mkdir -p AppDir
-          cp -a "$BUNDLE/." AppDir/
-          cp linux/com.fluxdown.app.desktop AppDir/
-          cp assets/logo/fluxdown_logo.png AppDir/com.fluxdown.app.png
-          printf '#!/bin/bash\nHERE="$(dirname "$(readlink -f "${0}")")"\nexport LD_LIBRARY_PATH="${HERE}/lib:${LD_LIBRARY_PATH:-}"\nexec "${HERE}/flux_down" "$@"\n' > AppDir/AppRun
-          chmod +x AppDir/AppRun
-          wget -qO appimagetool.AppImage https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
-          chmod +x appimagetool.AppImage
-          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool.AppImage AppDir "build/installer/FluxDown-${VERSION}-linux-x64.AppImage"
+          wget -qO "$RUNNER_TEMP/appimagetool" https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x "$RUNNER_TEMP/appimagetool"
+          APPIMAGETOOL="$RUNNER_TEMP/appimagetool" scripts/package_gpui_linux.sh
       - name: Upload Linux test artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -219,6 +190,7 @@ jobs:
   build-macos:
     name: Test macOS (${{ matrix.arch }})
     needs: version
+    if: inputs.target == 'all' || inputs.target == 'macos'
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -226,8 +198,10 @@ jobs:
         include:
           - arch: x64
             runner: macos-15-intel
+            script_arch: x86_64
           - arch: arm64
             runner: macos-15
+            script_arch: arm64
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@v4
@@ -237,40 +211,31 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
         with:
-          channel: stable
-          cache: true
-      - name: Build app
-        shell: bash
-        run: |
-          flutter precache --macos
-          flutter pub get
-          cargo install rinf_cli@8.9.0
-          rinf gen
-          flutter build macos --release --build-name=${{ needs.version.outputs.clean_version }} --build-number=1 --dart-define=APP_VERSION=${{ needs.version.outputs.version }}
-      - name: Package macOS artifacts
-        run: |
-          VERSION=${{ needs.version.outputs.version }}
-          APP_PATH=build/macos/Build/Products/Release/FluxDown.app
-          mkdir -p build/installer dmg_src
-          cp -R "$APP_PATH" "FluxDown-${VERSION}-macos-${{ matrix.arch }}"
-          tar -czf "build/installer/FluxDown-${VERSION}-macos-${{ matrix.arch }}.tar.gz" "FluxDown-${VERSION}-macos-${{ matrix.arch }}"
-          rm -rf "FluxDown-${VERSION}-macos-${{ matrix.arch }}"
-          cp -R "$APP_PATH" dmg_src/
-          brew install create-dmg
-          create-dmg --volname "FluxDown ${VERSION}" --window-size 660 400 --icon "FluxDown.app" 160 185 --app-drop-link 500 185 --no-internet-enable "build/installer/FluxDown-${VERSION}-macos-${{ matrix.arch }}.dmg" dmg_src/ || hdiutil create -volname "FluxDown ${VERSION}" -srcfolder dmg_src -ov -format UDZO "build/installer/FluxDown-${VERSION}-macos-${{ matrix.arch }}.dmg"
+          key: gpui-macos-${{ matrix.arch }}
+          cache-on-failure: true
+      - name: Build and package (ad-hoc signed)
+        env:
+          ARCHS: ${{ matrix.script_arch }}
+          VERSION: ${{ needs.version.outputs.version }}
+          ARTIFACT_PREFIX: FluxDown-${{ needs.version.outputs.version }}-macos-${{ matrix.arch }}
+          OUT_DIR: ${{ github.workspace }}/build/installer
+        run: scripts/package_gpui_macos.sh
       - name: Upload macOS test artifacts
         uses: actions/upload-artifact@v4
         with:
           name: manual-macos-${{ matrix.arch }}-${{ github.run_number }}
-          path: build/installer/*
+          path: |
+            build/installer/*.dmg
+            build/installer/*.tar.gz
           if-no-files-found: error
 
   build-android:
     name: Test Android APK
     needs: version
+    if: inputs.target == 'all' || inputs.target == 'android'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout selected ref
@@ -328,6 +293,7 @@ jobs:
   build-extension:
     name: Test Browser Extensions
     needs: version
+    if: inputs.target == 'all' || inputs.target == 'extension'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout selected ref

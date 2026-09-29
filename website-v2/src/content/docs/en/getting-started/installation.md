@@ -20,7 +20,7 @@ FluxDown ships full-featured native builds for Windows, macOS, and Linux. Every 
 Grab a build from the [download page](/#download). Two options, both offered for x64 and ARM64:
 
 - **Installer** — `FluxDown-<version>-setup.exe`. Runs the standard Inno Setup wizard and installs for the current user only (no admin rights required). During setup you can optionally check boxes to create a desktop shortcut, launch FluxDown at system startup, and associate `.torrent` files with FluxDown — all unchecked by default.
-- **Portable** — `FluxDown-<version>-windows-<arch>-portable.zip`. Extract anywhere and run `flux_down.exe`. Nothing is written outside the extracted folder except whatever you opt into at first launch.
+- **Portable** — `FluxDown-<version>-windows-<arch>-portable.zip`. Extract anywhere and run `fluxdown-desktop.exe`. Keep all files in the same folder — the desktop app starts `fluxdown-agent.exe` and `fluxdownd.exe` next to it. Nothing is written outside the extracted folder except whatever you opt into at first launch.
 
 The build isn't code-signed, so Windows SmartScreen may flag it as coming from an "unknown publisher" the first time you run it. Click **More info → Run anyway** to continue.
 

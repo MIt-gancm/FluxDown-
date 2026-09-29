@@ -50,15 +50,16 @@ fn is_no_launch_action(action: &str) -> bool {
 const PIPE_NAME: &str = r"\\.\pipe\fluxdown";
 
 /// Cold-launch candidates, in priority order, searched next to the NMH
-/// binary. The Flutter app comes first because it is the shipped default
-/// client; `fluxdown-agent` (GPUI stack) is only a fallback for installs
-/// without the Flutter executable. Both may sit in the same bundle directory.
+/// binary. `fluxdown-agent` (GPUI stack, the shipped desktop client) comes
+/// first: an install upgraded from the Flutter client may still hold a stale
+/// Flutter executable, which must never win (it would take `engine.lock` away
+/// from `fluxdownd`). Flutter-only dev builds fall through to it.
 #[cfg(windows)]
-const APP_EXE_CANDIDATES: &[&str] = &["flux_down.exe", "fluxdown-agent.exe"];
+const APP_EXE_CANDIDATES: &[&str] = &["fluxdown-agent.exe", "flux_down.exe"];
 #[cfg(target_os = "macos")]
-const APP_EXE_CANDIDATES: &[&str] = &["FluxDown", "flux_down", "fluxdown-agent"];
+const APP_EXE_CANDIDATES: &[&str] = &["fluxdown-agent", "FluxDown", "flux_down"];
 #[cfg(all(not(windows), not(target_os = "macos")))]
-const APP_EXE_CANDIDATES: &[&str] = &["flux_down", "fluxdown-agent"];
+const APP_EXE_CANDIDATES: &[&str] = &["fluxdown-agent", "flux_down"];
 
 /// Maximum time (ms) to wait for the App to start and create its pipe.
 const APP_LAUNCH_TIMEOUT_MS: u64 = 10_000;
@@ -844,11 +845,11 @@ mod tests {
         );
     }
 
-    /// The Flutter app and `fluxdown-agent` ship side by side in one bundle;
-    /// cold launch must pick the Flutter app while it exists and only fall
-    /// back to the agent when it does not.
+    /// An install upgraded from the Flutter client can keep a stale Flutter
+    /// executable next to `fluxdown-agent`; cold launch must pick the agent
+    /// whenever it exists and only fall back to Flutter when it does not.
     #[test]
-    fn cold_launch_prefers_flutter_app_over_agent() {
+    fn cold_launch_prefers_agent_over_stale_flutter_app() {
         let dir = std::env::temp_dir().join(format!(
             "fluxdown-nmh-launch-{}-{}",
             std::process::id(),
@@ -858,20 +859,20 @@ mod tests {
                 .unwrap_or_default()
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let agent = APP_EXE_CANDIDATES[APP_EXE_CANDIDATES.len() - 1];
-        let flutter = APP_EXE_CANDIDATES[0];
+        let agent = APP_EXE_CANDIDATES[0];
+        let flutter = APP_EXE_CANDIDATES[APP_EXE_CANDIDATES.len() - 1];
         assert!(agent.starts_with("fluxdown-agent"));
-
-        std::fs::write(dir.join(agent), b"").expect("agent stub");
-        assert_eq!(
-            first_existing(&dir, APP_EXE_CANDIDATES),
-            Some(dir.join(agent))
-        );
 
         std::fs::write(dir.join(flutter), b"").expect("flutter stub");
         assert_eq!(
             first_existing(&dir, APP_EXE_CANDIDATES),
             Some(dir.join(flutter))
+        );
+
+        std::fs::write(dir.join(agent), b"").expect("agent stub");
+        assert_eq!(
+            first_existing(&dir, APP_EXE_CANDIDATES),
+            Some(dir.join(agent))
         );
 
         let _ = std::fs::remove_dir_all(&dir);

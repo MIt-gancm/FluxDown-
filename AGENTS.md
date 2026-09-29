@@ -149,7 +149,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - **BT 判定只认 `magnet:` 与 `torrent-file://` 哨兵**。HTTP 的 `.torrent` 直链不会走 BT，会被当普通文件下回一个种子文件；要变成真下载必须先抓字节再以 `NewTaskSpec::torrent_file_bytes` 建任务（RSS 就是这么做的）。
 - **「复制链接」类 UI 一律读 `origin_url`，空则回退 `url`**（torrent 任务的 `url` 是哨兵）——Dart `DownloadTask.shareUrl` / web `taskShareUrl()`。
 - **RSS 是无人值守链路**：任何「需要用户点一下才能继续」的东西都是 bug。建任务即落全选 + `unattended=1`（否则启动时会弹 N 次文件选择框）；`create_task` 内部自发建任务必须补 `load_and_send_all_tasks()`（`TaskProgress` 不带 `queue_id`）；手动「重新下载」对**任何**状态放行。
-- **一个 data_dir 同时只有一个引擎写入者**：`Db::open_exclusive` / `connect_exclusive` 持 `<data_dir>/engine.lock`（PG 另加 advisory lock），第二个打开者得 `DbError::WriterLeaseHeld`。hub 对它做有界重试（同进程二次 isolate 交接），CLI `--local` 直接报「App 正在运行」退出；**Flutter 包内的 `fluxdown_nmh` 冷启动必须优先拉 Flutter 本体**，否则 agent→fluxdownd 抢锁后 Flutter 引擎静默失效。
+- **一个 data_dir 同时只有一个引擎写入者**：`Db::open_exclusive` / `connect_exclusive` 持 `<data_dir>/engine.lock`（PG 另加 advisory lock），第二个打开者得 `DbError::WriterLeaseHeld`。hub 对它做有界重试（同进程二次 isolate 交接），CLI `--local` 直接报「App 正在运行」退出；**`fluxdown_nmh` 冷启动优先拉 `fluxdown-agent`**（桌面发行物已是 GPUI；从 Flutter 升级的目录可能残留 `flux_down`，若它先起会抢走锁让 fluxdownd 失效），Flutter 可执行仅作无 agent 时的兜底。
 - 引擎学习/遥测类 config 键（`cdn_node_health`、`auto_route_health`、`cdn_pending_reports`、`domain_conn_caps`）**UI 不读写**。
 - **遥测只有两条匿名部署事件**（`app_installed` 一次 + `app_active` 每日，`analytics_enabled` 门控），**绝不**采集下载/任务信息——不要新增遥测点。
 - 命名歧义：`tracker_subscription.rs` / `ed2k/server_subscription.rs` 是 BT tracker 列表 / ED2K `server.met` 订阅，与 `rss/` 的 feed 订阅无关；官网 `api/webhooks/github` 是 GitHub 接收器，与 `engine/src/webhook.rs` 的任务事件推送无关。
@@ -181,7 +181,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - **git 写操作的门槛是「用户授权」**：用户在本会话要求过（含 `/commit`、「提交」「推一下」「发版」）→ 视为已授权，核对前置条件后**直接做完**，不再征询；用户没要求、你自己想顺手做 → 停手先问。授权按动作粒度计（提交 ≠ 推送，打 tag ≠ 发布）。
 - **分支模型**：`main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）。日常一律在 `main`；`stable` 只经合并/cherry-pick `main` 前进；hotfix 直进 `stable` 必须**同回合**同步回 `main`。一致性判据 `git log stable --not main` **恒为空**。
 - **tag**：稳定 `vX.Y.Z` 只从 `stable`，预览 `vX.Y.Z-rc.N` 只从 `main`；CI 有分支守卫，打错分支整条流水线失败。推送 `v*` tag **立即触发全平台发布，不可逆**。
-- 流水线是**组件变更检测**式（`changes` job diff `PREV..TAG` 映射路径→`app`/`extension`/`server`/`mobile`/`cli`）；`website/*`、`docs/*`、`*.md` 不触发构建。矩阵细节见 `.omp/knowledge/ops.md`。
+- 流水线是**组件变更检测 + 统一 release** 式（`changes` job diff `PREV..TAG` 映射路径→`app`/`extension`/`server`/`mobile`/`cli`，全部上传到同一个 `vX.Y.Z` release；组件互不阻断，失败组件经 `workflow_dispatch` 补发，可用 `source_ref` 带修复）；`website/*`、`docs/*`、`*.md` 不触发构建。矩阵与补发细节见 `.omp/knowledge/ops.md`。
 
 ---
 

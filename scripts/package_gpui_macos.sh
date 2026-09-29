@@ -15,6 +15,9 @@
 #   APPLE_API_KEY_PATH + APPLE_API_KEY_ID + APPLE_API_ISSUER_ID   提供时执行公证与 staple
 #   FLUXCLOUD_BASE_URL     透传给 agent 编译期（见 native/agent/src/runtime.rs）
 #   OUT_DIR                默认 build/gpui-macos
+#   VERSION                产物版本（默认取 pubspec.yaml；release 传 tag 版本，可带 -rc.N）
+#   ARTIFACT_PREFIX        产物名前缀（默认 FluxDown-GPUI-$VERSION-macos-<suffix>；release 传
+#                          FluxDown-$VERSION-macos-<x64|arm64>），生成 <prefix>.dmg 与 <prefix>.tar.gz
 set -euo pipefail
 
 REPO=$(cd "$(dirname "$0")/.." && pwd)
@@ -28,8 +31,9 @@ HELPER_NAME=FluxDownAgent.app
 # GPUI 上游最低支持 10.15.7；Apple Silicon 由系统限定为 11.0 起。
 MIN_X86=10.15.7
 MIN_ARM=11.0
-VERSION=$(sed -nE 's/^version: *([^+]+).*/\1/p' pubspec.yaml | head -1)
-BINS=(fluxdown-desktop fluxdown-agent fluxdownd)
+VERSION=${VERSION:-$(sed -nE 's/^version: *([^+]+).*/\1/p' pubspec.yaml | head -1)}
+# Info.plist 版本号只接受数字点分，去掉预发布后缀
+PLIST_VERSION=${VERSION%%-*}
 
 triple_of() {
   case "$1" in
@@ -47,7 +51,7 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
     triple=$(triple_of "$arch")
     echo "== build $triple (min macOS $(min_of "$arch"))"
     MACOSX_DEPLOYMENT_TARGET=$(min_of "$arch") cargo build --locked --release --target "$triple" \
-      -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon \
+      -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon -p fluxdown_nmh \
       --features fluxdown_agent/desktop --bins
   done
 fi
@@ -83,6 +87,8 @@ place() {
 place fluxdown-desktop "$APP/Contents/MacOS/fluxdown-desktop"
 place fluxdown-agent "$HELPER/Contents/MacOS/fluxdown-agent"
 place fluxdownd "$HELPER/Contents/MacOS/fluxdownd"
+# 浏览器扩展中继：agent 在自身可执行文件同目录查找（native/agent/src/nmh.rs::find_nmh_exe）
+place fluxdown_nmh "$HELPER/Contents/MacOS/fluxdown_nmh"
 
 # ── 图标 ──
 ICONSET="$WORK/AppIcon.iconset"
@@ -103,8 +109,8 @@ plutil -replace CFBundleExecutable -string fluxdown-desktop "$PL"
 plutil -replace CFBundleIconFile -string AppIcon "$PL"
 plutil -replace CFBundleIdentifier -string "$HOST_ID" "$PL"
 plutil -replace CFBundleName -string FluxDown "$PL"
-plutil -replace CFBundleShortVersionString -string "$VERSION" "$PL"
-plutil -replace CFBundleVersion -string "$VERSION" "$PL"
+plutil -replace CFBundleShortVersionString -string "$PLIST_VERSION" "$PL"
+plutil -replace CFBundleVersion -string "$PLIST_VERSION" "$PL"
 plutil -replace LSMinimumSystemVersion -string "$LSMIN" "$PL"
 plutil -replace NSHumanReadableCopyright -string "Copyright © 2026 FluxDown" "$PL"
 plutil -replace NSHighResolutionCapable -bool true "$PL"
@@ -178,6 +184,7 @@ sign() { codesign --force ${SIGN_ARGS[@]+"${SIGN_ARGS[@]}"} -s "$IDENTITY" "$@";
 
 echo "== sign ($IDENTITY)"
 sign -i "$HOST_ID.daemon" "$HELPER/Contents/MacOS/fluxdownd"
+sign -i "$HOST_ID.nmh" "$HELPER/Contents/MacOS/fluxdown_nmh"
 sign "$HELPER/Contents/MacOS/fluxdown-agent"
 sign "$HELPER"
 sign "$APP/Contents/MacOS/fluxdown-desktop"
@@ -185,7 +192,8 @@ sign "$APP"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
 # ── DMG ──
-DMG="$OUT_DIR/FluxDown-GPUI-$VERSION-macos-$SUFFIX.dmg"
+PREFIX=${ARTIFACT_PREFIX:-"FluxDown-GPUI-$VERSION-macos-$SUFFIX"}
+DMG="$OUT_DIR/$PREFIX.dmg"
 rm -f "$DMG"
 ln -s /Applications "$WORK/dmg_src/Applications"
 hdiutil create -quiet -volname "FluxDown $VERSION" -srcfolder "$WORK/dmg_src" -ov -format UDZO "$DMG"
@@ -203,6 +211,15 @@ if [ -n "${APPLE_API_KEY_PATH:-}" ]; then
   xcrun stapler staple "$DMG"
   xcrun stapler validate "$DMG"
   spctl -a -t open --context context:primary-signature -vv "$DMG"
+  # DMG 的公证票据覆盖其中 .app 的 cdhash：再给 .app 本体 staple，便携 tar.gz 离线也能过 Gatekeeper
+  xcrun stapler staple "$APP"
+  spctl -a -t exec -vv "$APP"
 fi
+
+# ── 便携 tar.gz（自动更新的 DMG 缺失回退；解压得 <prefix>/FluxDown.app）──
+rm -rf "${WORK:?}/$PREFIX"
+mkdir -p "$WORK/$PREFIX"
+ditto "$APP" "$WORK/$PREFIX/FluxDown.app"
+tar -C "$WORK" -czf "$OUT_DIR/$PREFIX.tar.gz" "$PREFIX"
 
 echo "DONE $DMG"

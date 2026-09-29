@@ -1,10 +1,18 @@
-; FluxDown Windows Installer Script (Inno Setup)
+; FluxDown Windows Installer Script (Inno Setup) — GPUI desktop client
 ; This script is used by GitHub Actions to build the installer.
+;
+; Layout: fluxdown-desktop.exe (UI) + fluxdown-agent.exe (resident gateway / tray)
+; + fluxdownd.exe (download daemon) + fluxdown_nmh.exe (browser relay) + MSVC CRT,
+; all in {app}. AppId / install dir / output name are unchanged from the Flutter
+; client, so the Flutter auto-updater (`setup.exe /SILENT`) upgrades in place.
 
 #define MyAppName "FluxDown"
 #define MyAppPublisher "FluxDown"
-#define MyAppURL "https://github.com/user/x_down"
-#define MyAppExeName "flux_down.exe"
+#define MyAppURL "https://fluxdown.zerx.dev"
+#define MyAppExeName "fluxdown-desktop.exe"
+#define MyAgentExeName "fluxdown-agent.exe"
+; Former Flutter executable, removed on upgrade
+#define LegacyExeName "flux_down.exe"
 
 ; Version is passed from CI via /DMyAppVersion=x.y.z
 #ifndef MyAppVersion
@@ -14,6 +22,11 @@
 ; Architecture is passed from CI via /DMyAppArch=x64 or /DMyAppArch=arm64
 #ifndef MyAppArch
   #define MyAppArch "x64"
+#endif
+
+; Staged GPUI binaries, passed from CI via /DMySourceDir=<abs path>
+#ifndef MySourceDir
+  #define MySourceDir "..\..\build\gpui\windows-" + MyAppArch
 #endif
 
 [Setup]
@@ -68,9 +81,17 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "launchonstartup"; Description: "{cm:LaunchOnStartup}"; GroupDescription: "{cm:OtherTasks}"; Flags: unchecked
 Name: "torrentassoc"; Description: "{cm:TorrentAssoc}"; GroupDescription: "{cm:FileAssociations}"; Flags: unchecked
 
+[InstallDelete]
+; Upgrading from the Flutter client: drop its executable, engine DLL, plugin DLLs and
+; asset bundle. A stale flux_down.exe would otherwise be relaunchable and fight
+; fluxdownd for engine.lock. Runs before [Files], so the CRT DLLs are reinstalled.
+Type: files; Name: "{app}\{#LegacyExeName}"
+Type: files; Name: "{app}\fluxdown_updater.exe"
+Type: files; Name: "{app}\*.dll"
+Type: filesandordirs; Name: "{app}\data"
+
 [Files]
-; Install all files from the Flutter build output
-Source: "..\..\build\windows\{#MyAppArch}\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MySourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
@@ -85,7 +106,9 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 Filename: "{app}\{#MyAppExeName}"; Flags: nowait skipifdoesntexist skipifnotsilent runasoriginaluser
 
 [Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAppExeName}"" --silentStart"; Flags: uninsdeletevalue; Tasks: launchonstartup
+; Autostart launches the resident agent (tray), same value the agent writes itself
+; (native/agent/src/platform/autostart.rs).
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#MyAppName}"; ValueData: """{app}\{#MyAgentExeName}"" --autostart"; Flags: uninsdeletevalue; Tasks: launchonstartup
 
 ; .torrent file association
 Root: HKCU; Subkey: "Software\Classes\.torrent"; ValueType: string; ValueData: "FluxDown.TorrentFile"; Flags: uninsdeletekey; Tasks: torrentassoc
@@ -94,14 +117,14 @@ Root: HKCU; Subkey: "Software\Classes\FluxDown.TorrentFile\DefaultIcon"; ValueTy
 Root: HKCU; Subkey: "Software\Classes\FluxDown.TorrentFile\shell\open\command"; ValueType: string; ValueData: """{app}\{#MyAppExeName}"" ""%1"""; Flags: uninsdeletekey; Tasks: torrentassoc
 
 [UninstallDelete]
-; 删除 KvStore 落盘文件（含匿名统计设备 ID / 首装标记 / 窗口状态等本地偏好）。
+; 删除 Flutter 客户端时代的 KvStore 落盘文件（升级自 Flutter 的安装里可能仍存在）。
 ; 语义：卸载后重装 = 生成新设备 ID = 统计为新安装；升级/覆盖安装不触发本节，ID 保留。
-; 路径 = shared_preferences_windows：%APPDATA%\<CompanyName>\<ProductName>（Runner.rc 均为 FluxDown）。
+; 路径 = shared_preferences_windows：%APPDATA%\<CompanyName>\<ProductName>。
 Type: files; Name: "{userappdata}\FluxDown\FluxDown\shared_preferences.json"
 Type: dirifempty; Name: "{userappdata}\FluxDown\FluxDown"
 Type: dirifempty; Name: "{userappdata}\FluxDown"
 
-; NMH manifest JSON files written at runtime by native/hub/src/nmh_registry.rs
+; NMH manifest JSON files written at runtime by the agent (native/agent/src/nmh.rs)
 ; into the per-user data dir (never installed via [Files], so the standard
 ; uninstall never learns about them and leaves them on disk). The {app}
 ; entries cover manifests left behind by older releases that wrote them next
@@ -123,8 +146,9 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  { Force-kill flux_down.exe as a fallback in case Restart Manager fails }
-  Exec('taskkill', '/f /im {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  { Force-kill every FluxDown process as a fallback in case Restart Manager
+    fails: the resident agent/daemon/relay keep their exes locked otherwise. }
+  Exec('taskkill', '/f /im {#MyAppExeName} /im {#MyAgentExeName} /im fluxdownd.exe /im fluxdown_nmh.exe /im {#LegacyExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   { Upgrade installs must overwrite the previous uninstaller; a stray
     read-only attribute on it makes CreateFile fail with access denied.
     Clear the attribute up-front (no-op when the files do not exist). }
@@ -134,9 +158,29 @@ begin
   Sleep(500);
 end;
 
+{ Upgrading from the Flutter client: an enabled autostart Run value still points
+  at the removed flux_down.exe. Keep the user's choice by retargeting it to the
+  agent (the form the agent itself writes). }
+procedure MigrateLegacyAutostart;
+var
+  Command: String;
+begin
+  if not RegQueryStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}', Command) then
+    Exit;
+  if Pos(Lowercase(ExpandConstant('{app}\{#LegacyExeName}')), Lowercase(Command)) > 0 then
+    RegWriteStringValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}',
+      '"' + ExpandConstant('{app}\{#MyAgentExeName}') + '" --autostart');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    MigrateLegacyAutostart;
+end;
+
 { Extract the quoted executable path from a `"<exe>" "%1"`-style
-  shell\open\command value (the format written by
-  native/hub/src/protocol_registry.rs::register and nmh_registry.rs). }
+  shell\open\command value (the format written by the agent,
+  native/agent/src/platform/{protocol_registry,file_association}.rs). }
 function ExtractQuotedExe(const Command: String): String;
 var
   FirstQuote, SecondQuote: Integer;
@@ -150,7 +194,7 @@ begin
 end;
 
 { Remove a URL scheme handler (fluxdown:// / ed2k:// / magnet:) registered at runtime by
-  native/hub/src/protocol_registry.rs. These keys live under
+  native/agent/src/platform/protocol_registry.rs. These keys live under
   HKCU\Software\Classes\<scheme> and are never declared in [Registry] — the
   standard uninstall never removes them, and Windows tries to relaunch the
   deleted exe whenever a matching link is opened. Only removes the key if it
@@ -169,7 +213,7 @@ begin
 end;
 
 { Remove the `.torrent` file association registered at runtime by
-  native/hub/src/file_association.rs (toggled from the app's settings page,
+  native/agent/src/platform/file_association.rs (toggled from the app's settings page,
   独立于 install-time 的 torrentassoc task — that task's [Registry] entries
   carry uninsdeletekey, but a runtime-written association is invisible to the
   uninstall log). Only removes the ProgID tree if its shell\open\command
@@ -192,13 +236,11 @@ begin
   RegDeleteKeyIncludingSubkeys(HKCU, 'Software\Classes\FluxDown.TorrentFile');
 end;
 
-{ Remove the autostart Run value written at runtime by the launch_at_startup
-  plugin (lib/main.dart — value name "FluxDown", data `"<exe>" --silentStart`).
-  The app migrates even the installer-written task entry to this runtime form
-  on first launch (lib/main.dart, "legacy/installer autostart entry"
-  migration), so after any app run the uninstall log no longer matches the
-  value and uninsdeletevalue alone cannot be relied on. Only removes the
-  value if it still points at this install's exe. }
+{ Remove the autostart Run value written at runtime by the agent
+  (native/agent/src/platform/autostart.rs — value name "FluxDown", data
+  `"<fluxdown-agent.exe>" --autostart`). A runtime-written value is invisible to
+  the uninstall log, so uninsdeletevalue alone cannot be relied on. Only removes
+  the value if it still points at this install's agent. }
 procedure RemoveAutostartRunValue;
 var
   Command, RegisteredExe, AppExe: String;
@@ -214,7 +256,7 @@ begin
     if Pos(' --', RegisteredExe) > 0 then
       RegisteredExe := Trim(Copy(RegisteredExe, 1, Pos(' --', RegisteredExe) - 1));
   end;
-  AppExe := ExpandConstant('{app}\{#MyAppExeName}');
+  AppExe := ExpandConstant('{app}\{#MyAgentExeName}');
   if (RegisteredExe <> '') and (CompareText(RegisteredExe, AppExe) = 0) then
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', '{#MyAppName}');
 end;
@@ -224,7 +266,7 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     { Chrome/Edge/Firefox Native Messaging Host registrations written at
-      runtime by native/hub/src/nmh_registry.rs. Never declared in the
+      runtime by the agent (native/agent/src/nmh.rs). Never declared in the
       Registry section (the app writes them directly via winreg on every startup),
       so the standard uninstall never removes them. `com.fluxdown.nmh` is
       FluxDown-specific, safe to remove unconditionally. }
