@@ -41,14 +41,14 @@ start_server() {
 	FLUXDOWN_DATA_DIR="$VAR_DIR" \
 	FLUXDOWN_BIND="0.0.0.0:17800" \
 	FLUXDOWN_SAVE_DIR="$(resolve_share_dir)" \
-		"$TARGET_DIR/bin/fluxdown-server" >> "$LOG_FILE" 2>&1 &
+		"$TARGET_DIR/bin/fluxdown-agent" --server >> "$LOG_FILE" 2>&1 &
 	echo $! > "$PID_FILE"
 }
 
 stop_server() {
 	if [ -f "$PID_FILE" ]; then
 		kill "$(cat "$PID_FILE")" 2>/dev/null
-		# 最多等 10s 优雅退出
+		# SIGTERM → agent 优雅退出并关停 fluxdownd；最多等 10s
 		i=0
 		while is_running && [ "$i" -lt 10 ]; do
 			sleep 1

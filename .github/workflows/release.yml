@@ -39,7 +39,8 @@ jobs:
   # ── 前置 Job: 检测上一个版本 tag → 当前 tag 之间哪些组件目录有变更 ──
   # 规则：
   #   fluxDown/**            → 浏览器扩展（extension）
-  #   web/**、native/server/** → headless 服务器（server，Docker 镜像 + 多平台二进制）
+  #   web/**、native/{agent,daemon,protocol,engine-protocol,api}/** → headless 服务器（server，Docker 镜像 + 多平台二进制）
+  #   native/server/**       → 已冻结的旧 headless 宿主，不再触发任何构建
   #   native/engine/**       → 桌面客户端 + 服务器 + 移动端（共享下载引擎）
   #   docker/**              → 服务器（部署文件变更需重发镜像）
   #   android/**、lib/src/mobile/** → 移动端资产（Android APK）
@@ -133,13 +134,16 @@ jobs:
               case "$f" in
                 fluxDown/*)          EXTENSION=true ;;
                 web/*)               SERVER=true ;;
-                native/server/*)     SERVER=true ;;
+                # 旧 headless 宿主 native/server 已冻结，不再触发任何组件
+                native/server/*) ;;
                 native/cli/*)        CLI=true ;;
                 native/api/*)        APP=true; SERVER=true; CLI=true ;;
                 native/protocol/*)   APP=true; SERVER=true; CLI=true ;;
                 native/engine-protocol/*) APP=true; SERVER=true ;;
-                # GPUI 客户端（crates/*）与 daemon/agent 暂不随 tag 发布，不触发任何组件
-                native/daemon/*|native/agent/*|crates/*) ;;
+                # 服务器 = fluxdown-agent --server + fluxdownd
+                native/daemon/*|native/agent/*) SERVER=true ;;
+                # GPUI 客户端（crates/*）暂不随 tag 发布，不触发任何组件
+                crates/*) ;;
                 native/engine/*)     APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
                 Cargo.toml|Cargo.lock) APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
                 docker/*)            SERVER=true ;;
@@ -149,6 +153,9 @@ jobs:
                 # 其余共享 Dart 代码（models/i18n/theme/bindings…）同时影响桌面端与移动端
                 lib/*)               APP=true; MOBILE=true ;;
                 pubspec.yaml|pubspec.lock) APP=true; MOBILE=true ;;
+                # Web SPA 构建期引用共享文案与 GPUI 主题解析器（web/vite.config.ts 别名）
+                assets/i18n/*)       APP=true; MOBILE=true; SERVER=true ;;
+                website-v2/src/lib/gpui-theme/*) SERVER=true ;;
                 website/*)  ;;
                 docs/*|*.md) ;;
                 *)          APP=true ;;
@@ -1430,8 +1437,6 @@ jobs:
       - name: Build web SPA
         working-directory: web
         run: bun run build
-        env:
-          VITE_FLUXCLOUD_BASE_URL: ${{ secrets.FLUXCLOUD_BASE_URL }}
 
       - name: Upload webroot artifact
         uses: actions/upload-artifact@v4
@@ -1446,8 +1451,9 @@ jobs:
   #   macos   → arm64 runner 原生编译 + 交叉编译 x64（Apple SDK 双架构开箱即用）
   # 不提供 x86(32位)：macOS/Win11 已无 32 位，Linux i686 无实际需求；
   # 如需 armv7（老 NAS/树莓派 32 位）可后续用 cross-rs 追加 matrix 项。
-  # 打包布局：单文件 fluxdown-server(.exe)——Web SPA 由 native/server/build.rs
-  # 在编译期经 FLUXDOWN_EMBED_WEBROOT 嵌进二进制，产物不再附带 web/ 目录。
+  # 打包布局：fluxdown-agent(.exe) + fluxdownd(.exe) 同目录——Web SPA 由 fluxdown_agent
+  # （feature web-ui）在编译期经 FLUXDOWN_EMBED_WEBROOT 嵌进 agent，产物不附带 web/ 目录。
+  # 运行：fluxdown-agent --server（agent 拉起同级 fluxdownd）。
   build-server-binaries:
     name: Build Server (${{ matrix.platform }})
     needs: [changes, verify-engine, build-web]
@@ -1518,13 +1524,15 @@ jobs:
           name: server-webroot
           path: webroot
 
-      # FLUXDOWN_SERVER_VERSION：编译期注入 tag 版本号（/ping、stats、OpenAPI 显示）
-      - name: Build server binary
+      # 版本号 = crate 版本（无编译期版本注入）
+      - name: Build server binaries (agent + daemon)
         env:
-          FLUXDOWN_SERVER_VERSION: ${{ steps.version.outputs.VERSION }}
           FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
+          FLUXCLOUD_BASE_URL: ${{ secrets.FLUXCLOUD_BASE_URL }}
           FLUXDOWN_EMBED_WEBROOT: ${{ github.workspace }}/webroot
-        run: cargo build --release --locked -p fluxdown_server --target ${{ matrix.target }}
+        run: |
+          cargo build --release --locked -p fluxdown_agent --features web-ui --target ${{ matrix.target }}
+          cargo build --release --locked -p fluxdown_daemon --target ${{ matrix.target }}
 
       - name: Package (tar.gz)
         if: runner.os != 'Windows'
@@ -1533,17 +1541,18 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           PKG="fluxdown-server-${VERSION}-${{ matrix.platform }}"
           mkdir -p "build/server/${PKG}" release-assets
-          cp "target/${{ matrix.target }}/release/fluxdown-server" "build/server/${PKG}/"
+          cp "target/${{ matrix.target }}/release/fluxdown-agent" "target/${{ matrix.target }}/release/fluxdownd" "build/server/${PKG}/"
           tar -C build/server -czf "release-assets/FluxDown-Server-${VERSION}-${{ matrix.platform }}.tar.gz" "${PKG}"
           ls -la release-assets/
 
-      # ── SignPath 签名: fluxdown-server.exe（打包前签名，zip 内即为已签名二进制）──
+      # ── SignPath 签名: fluxdown-agent.exe + fluxdownd.exe（打包前签名，zip 内即为已签名二进制）──
       - name: Collect unsigned server executable
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path build\signing\unsigned | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\fluxdown-server.exe" "build\signing\unsigned\"
+          Copy-Item "target\${{ matrix.target }}\release\fluxdown-agent.exe" "build\signing\unsigned\"
+          Copy-Item "target\${{ matrix.target }}\release\fluxdownd.exe" "build\signing\unsigned\"
 
       - name: Upload unsigned server executable
         if: runner.os == 'Windows'
@@ -1571,7 +1580,9 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "build\signing\signed\fluxdown-server.exe" "target\${{ matrix.target }}\release\fluxdown-server.exe" -Force
+          foreach ($exe in "fluxdown-agent.exe", "fluxdownd.exe") {
+            Copy-Item "build\signing\signed\$exe" "target\${{ matrix.target }}\release\$exe" -Force
+          }
 
       - name: Package (zip)
         if: runner.os == 'Windows'
@@ -1580,7 +1591,8 @@ jobs:
           $Version = "${{ steps.version.outputs.VERSION }}"
           $Pkg = "fluxdown-server-$Version-${{ matrix.platform }}"
           New-Item -ItemType Directory -Force -Path "build\server\$Pkg", "release-assets" | Out-Null
-          Copy-Item "target\${{ matrix.target }}\release\fluxdown-server.exe" "build\server\$Pkg\"
+          Copy-Item "target\${{ matrix.target }}\release\fluxdown-agent.exe" "build\server\$Pkg\"
+          Copy-Item "target\${{ matrix.target }}\release\fluxdownd.exe" "build\server\$Pkg\"
           Compress-Archive -Path "build\server\$Pkg" -DestinationPath "release-assets\FluxDown-Server-$Version-${{ matrix.platform }}.zip"
           Get-ChildItem release-assets
 
@@ -1646,8 +1658,8 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$X64/fluxdown-server" x86_64 release-assets
-          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$A64/fluxdown-server" \
+          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$X64" x86_64 release-assets
+          ./packaging/openwrt/build_ipk.sh server "$VERSION" "$A64" \
             aarch64_generic,aarch64_cortex-a53,aarch64_cortex-a72,aarch64_cortex-a76 release-assets
           ./packaging/openwrt/build_ipk.sh luci "$VERSION" release-assets
 
@@ -1656,9 +1668,9 @@ jobs:
           VERSION=${{ steps.version.outputs.VERSION }}
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
-          ./packaging/qnap/build_qpkg.sh "$VERSION" x86_64 "$X64/fluxdown-server" \
+          ./packaging/qnap/build_qpkg.sh "$VERSION" x86_64 "$X64" \
             "release-assets/FluxDown-Server-${VERSION}-qnap-x64.qpkg"
-          ./packaging/qnap/build_qpkg.sh "$VERSION" arm_64 "$A64/fluxdown-server" \
+          ./packaging/qnap/build_qpkg.sh "$VERSION" arm_64 "$A64" \
             "release-assets/FluxDown-Server-${VERSION}-qnap-arm64.qpkg"
 
       - name: Build Synology spk
@@ -1667,9 +1679,9 @@ jobs:
           X64="extracted/fluxdown-server-${VERSION}-linux-x64"
           A64="extracted/fluxdown-server-${VERSION}-linux-arm64"
           for dsm in dsm7 dsm6; do
-            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" x86_64 "$X64/fluxdown-server" \
+            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" x86_64 "$X64" \
               "release-assets/FluxDown-Server-${VERSION}-synology-${dsm}-x64.spk"
-            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" armv8 "$A64/fluxdown-server" \
+            ./packaging/synology/build_spk.sh "$VERSION" "$dsm" armv8 "$A64" \
               "release-assets/FluxDown-Server-${VERSION}-synology-${dsm}-arm64.spk"
           done
 
@@ -1875,9 +1887,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            FLUXDOWN_SERVER_VERSION=${{ steps.version.outputs.VERSION }}
             FLUXDOWN_ANALYTICS_APP_KEY=${{ secrets.ANALYTICS_APP_KEY }}
-            VITE_FLUXCLOUD_BASE_URL=${{ secrets.FLUXCLOUD_BASE_URL }}
+            FLUXCLOUD_BASE_URL=${{ secrets.FLUXCLOUD_BASE_URL }}
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 
@@ -2034,7 +2045,7 @@ jobs:
         with:
           component: Headless 服务器（含 Web 控制台）
           fallback-title: Server Release v${{ steps.version.outputs.VERSION }}
-          paths: native/server/** web/** native/engine/** native/api/** docker/** packaging/**
+          paths: native/agent/** native/daemon/** native/protocol/** native/engine-protocol/** web/** native/engine/** native/api/** docker/** packaging/**
           tag: ${{ needs.changes.outputs.tag }}
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
@@ -2058,11 +2069,11 @@ jobs:
           | QNAP NAS（QTS x86_64 / ARM64） | \`FluxDown-Server-${VERSION}-qnap-{x64,arm64}.qpkg\` |
           | 群晖 NAS（DSM 7 / DSM 6，x86_64 / ARM64） | \`FluxDown-Server-${VERSION}-synology-{dsm7,dsm6}-{x64,arm64}.spk\` |
 
-          解压后直接运行 \`fluxdown-server\`（Windows 为 \`fluxdown-server.exe\`），浏览器访问 \`http://127.0.0.1:17800\`。
-          **单文件分发**：Web 控制台已编译进二进制，包内只有可执行文件本身，无需附带任何静态资源目录。
+          解压后运行 \`fluxdown-agent --server\`（Windows 为 \`fluxdown-agent.exe --server\`），浏览器访问 \`http://127.0.0.1:17800\`。
+          **包内两个可执行文件必须放在同一目录**：\`fluxdown-agent\`（含 Web 控制台，已编译进二进制）与 \`fluxdownd\`（下载 daemon，由 agent 自动拉起、退出时一并关停），无需附带任何静态资源目录。
           首次启动请在浏览器里完成「初始化 FluxDown Server」向导设置访问密钥（无人值守部署可用 \`FLUXDOWN_TOKEN\` 预置）。文件校验见 \`SHA256SUMS.txt\`。
 
-          **OpenWrt**：\`opkg install fluxdown-server_*.ipk luci-app-fluxdown_*.ipk\`，LuCI「服务 → FluxDown」页管理，Web 界面在 \`http://路由器IP:17800\`。二进制含完整 Web UI（约 30MB），需 overlay 空间充足的软路由设备。
+          **OpenWrt**：\`opkg install fluxdown-server_*.ipk luci-app-fluxdown_*.ipk\`，LuCI「服务 → FluxDown」页管理，Web 界面在 \`http://路由器IP:17800\`。agent 二进制含完整 Web UI，另附 fluxdownd，需 overlay 空间充足的软路由设备。
           **QNAP**：App Center → 手动安装 \`.qpkg\`（需在设置中允许安装未经验证的应用），装完点应用图标直达 Web 界面。
           **群晖**：套件中心 → 手动安装 \`.spk\`（需在「设置 → 信任来源」允许任何发行者）。DSM 7.x 装 \`dsm7\` 包（以套件专属用户运行），DSM 6.x 装 \`dsm6\` 包；Intel/AMD 机型选 x64，ARM 机型（rtd1296/rtd1619b 等）选 arm64。装完在套件中心点「打开」直达 Web 界面（端口 17800）。
 

@@ -5,7 +5,7 @@
 
 /*
  * luci-app-fluxdown — 服务开关/监听地址/数据目录配置 + Web 界面跳转。
- * 完整下载管理界面由 fluxdown-server 自带的 React SPA 提供，
+ * 完整下载管理界面由 fluxdown-agent 自带的 React SPA 提供，
  * LuCI 侧只做服务管理，不重复实现 UI。
  */
 

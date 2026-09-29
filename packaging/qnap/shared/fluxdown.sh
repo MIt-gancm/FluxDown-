@@ -22,14 +22,14 @@ start() {
 	mkdir -p "$QPKG_ROOT/data"
 	FLUXDOWN_DATA_DIR="$QPKG_ROOT/data" \
 	FLUXDOWN_BIND="0.0.0.0:17800" \
-		"$QPKG_ROOT/fluxdown-server" >> "$QPKG_ROOT/data/server.log" 2>&1 &
+		"$QPKG_ROOT/fluxdown-agent" --server >> "$QPKG_ROOT/data/server.log" 2>&1 &
 	echo $! > "$PIDFILE"
 }
 
 stop() {
 	if [ -f "$PIDFILE" ]; then
 		kill "$(cat "$PIDFILE")" 2>/dev/null
-		# 最多等 10s 优雅退出
+		# SIGTERM → agent 优雅退出并关停 fluxdownd；最多等 10s
 		i=0
 		while is_running && [ $i -lt 10 ]; do
 			sleep 1

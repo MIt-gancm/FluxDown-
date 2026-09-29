@@ -3,7 +3,8 @@
 # ipk = tar.gz(debian-binary + control.tar.gz + data.tar.gz)，OpenWrt opkg 标准外层格式。
 #
 # 用法：
-#   build_ipk.sh server <version> <binary> <arch,arch,...> <out_dir>
+#   build_ipk.sh server <version> <bindir> <arch,arch,...> <out_dir>
+#     <bindir> 目录内须同时含 fluxdown-agent 与 fluxdownd 两个二进制
 #   build_ipk.sh luci   <version> <out_dir>
 #
 # server 子命令对同一份载荷按 arch 列表出多个 ipk（aarch64 子架构 opkg 严格校验，
@@ -27,9 +28,12 @@ make_ipk() {
 }
 
 build_server() {
-	# 二进制自带 Web UI（编译期内嵌），载荷里没有 webroot 目录。
-	VERSION=$1 BIN=$2 ARCHES=$3 OUTDIR=$4
-	[ -f "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
+	# fluxdown-agent 自带 Web UI（编译期内嵌），载荷里没有 webroot 目录；
+	# fluxdownd 必须与 agent 同目录（agent 按同级路径拉起 daemon）。
+	VERSION=$1 BINDIR=$2 ARCHES=$3 OUTDIR=$4
+	for b in fluxdown-agent fluxdownd; do
+		[ -f "$BINDIR/$b" ] || { echo "binary not found: $BINDIR/$b" >&2; exit 1; }
+	done
 	mkdir -p "$OUTDIR"
 
 	work=$(mktemp -d)
@@ -38,8 +42,8 @@ build_server() {
 	# ── data 载荷（各 arch 共用） ──
 	data="$work/data"
 	mkdir -p "$data/usr/bin" "$data/etc/init.d" "$data/etc/config"
-	cp "$BIN" "$data/usr/bin/fluxdown-server"
-	chmod 755 "$data/usr/bin/fluxdown-server"
+	cp "$BINDIR/fluxdown-agent" "$BINDIR/fluxdownd" "$data/usr/bin/"
+	chmod 755 "$data/usr/bin/fluxdown-agent" "$data/usr/bin/fluxdownd"
 	cp "$SCRIPT_DIR/files/fluxdown.init" "$data/etc/init.d/fluxdown"
 	chmod 755 "$data/etc/init.d/fluxdown"
 	cp "$SCRIPT_DIR/files/fluxdown.config" "$data/etc/config/fluxdown"
@@ -134,7 +138,7 @@ build_luci() {
 cmd=${1:-}
 case "$cmd" in
 	server)
-		[ $# -eq 5 ] || { echo "usage: $0 server <version> <binary> <arches> <outdir>" >&2; exit 2; }
+		[ $# -eq 5 ] || { echo "usage: $0 server <version> <bindir> <arches> <outdir>" >&2; exit 2; }
 		build_server "$2" "$3" "$4" "$5"
 		;;
 	luci)

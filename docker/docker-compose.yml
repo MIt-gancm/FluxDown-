@@ -1,4 +1,5 @@
-# FluxDown Server 部署（Web UI + REST API + WebSocket 实时推送）
+# FluxDown Server 部署（fluxdown-agent --server + fluxdownd；Web UI + /rpc JSON-RPC + 兼容 HTTP API）
+# 容器由 tini 作 PID 1 启动，沿用旧版同一个 fluxdown-data 卷即可原地升级。
 #
 # 启动：docker compose up -d
 # 首次访问 http://<宿主机>:17800/ 会进入初始化向导，自行设置访问密钥

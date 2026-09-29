@@ -2,7 +2,8 @@
 # 纯脚本手打群晖 SPK（无需官方 toolkit / chroot 环境，做法同 SynoCommunity spksrc）。
 # .spk = 顶层 tar（INFO + package.tgz + scripts/ + conf/ + 图标），仅在 Linux CI 上运行。
 #
-# 用法：build_spk.sh <version> <dsm6|dsm7> <x86_64|armv8> <binary> <out_spk_path>
+# 用法：build_spk.sh <version> <dsm6|dsm7> <x86_64|armv8> <bindir> <out_spk_path>
+#   bindir: 含 fluxdown-agent 与 fluxdownd 两个二进制的目录
 #   dsm7: os_min_ver=7.0，conf/privilege 以套件专属用户运行（DSM 7 禁止 root）
 #   dsm6: os_min_ver=6.0 + os_max_ver=7.0 上界，root 运行（DSM 6 默认）
 #   arch 为群晖架构家族值（官方 Appendix A）：x86_64 覆盖全部 Intel/AMD 机型，
@@ -11,14 +12,16 @@
 # 前置：imagemagick（convert）用于从 assets/logo/fluxdown_logo.png 生成套件图标。
 set -eu
 
-[ $# -eq 5 ] || { echo "usage: $0 <version> <dsm6|dsm7> <x86_64|armv8> <binary> <out_spk>" >&2; exit 2; }
-VERSION=$1 DSM=$2 ARCH=$3 BIN=$4 OUT=$5
+[ $# -eq 5 ] || { echo "usage: $0 <version> <dsm6|dsm7> <x86_64|armv8> <bindir> <out_spk>" >&2; exit 2; }
+VERSION=$1 DSM=$2 ARCH=$3 BINDIR=$4 OUT=$5
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../.." && pwd)
 LOGO="$REPO_ROOT/assets/logo/fluxdown_logo.png"
 
-[ -f "$BIN" ] || { echo "binary not found: $BIN" >&2; exit 1; }
+for b in fluxdown-agent fluxdownd; do
+	[ -f "$BINDIR/$b" ] || { echo "binary not found: $BINDIR/$b" >&2; exit 1; }
+done
 command -v convert >/dev/null || { echo "imagemagick 'convert' not in PATH" >&2; exit 1; }
 
 case "$DSM" in
@@ -49,10 +52,10 @@ trap 'rm -rf "$work"' EXIT
 stage="$work/stage"
 payload="$work/payload"
 
-# ── package.tgz 载荷：bin/fluxdown-server（Web UI 已编译期内嵌，无 web/ 目录）──
+# ── package.tgz 载荷：bin/fluxdown-agent + bin/fluxdownd（同目录；Web UI 已编译期内嵌进 agent，无 web/ 目录）──
 mkdir -p "$payload/bin"
-cp "$BIN" "$payload/bin/fluxdown-server"
-chmod 755 "$payload/bin/fluxdown-server"
+cp "$BINDIR/fluxdown-agent" "$BINDIR/fluxdownd" "$payload/bin/"
+chmod 755 "$payload/bin/fluxdown-agent" "$payload/bin/fluxdownd"
 
 # ── ui/：DSM 桌面应用入口。官方要求该目录在 package.tgz 内（安装后位于
 #    /var/packages/FluxDown/target/ui），DSM 依 INFO 的 dsmuidir 将其软链到
