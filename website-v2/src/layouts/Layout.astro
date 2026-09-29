@@ -127,31 +127,29 @@ const autoZhHref = lang === "en" && Astro.props.alternates === undefined ? switc
     <meta name="twitter:description" content={description} />
     <meta name="twitter:image" content={ogImage} />
 
-    {
-      autoZhHref && (
-        <!-- 自动语言:键名与 src/lib/locale-pref.ts 的 LOCALE_KEY 一致;判定规则与 lib/locale-detect.ts 对齐 -->
-        <script is:inline define:vars={{ zhHref: autoZhHref }}>
-          (function () {
-            var pref = null;
-            try { pref = localStorage.getItem("fluxdown-locale"); } catch (e) {}
-            if (pref !== "en" && pref !== "zh") {
-              var m = document.cookie.match(/(?:^|;\s*)fluxdown-locale=(en|zh)(?:;|$)/);
-              pref = m ? m[1] : null;
-            }
-            if (!pref) {
-              if (/bot|crawl|spider|slurp|lighthouse|headless/i.test(navigator.userAgent)) return;
-              var langs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ""];
-              for (var i = 0; i < langs.length && !pref; i++) {
-                var tag = String(langs[i]).toLowerCase();
-                if (tag.indexOf("zh") === 0) pref = "zh";
-                else if (tag.indexOf("en") === 0) pref = "en";
-              }
-            }
-            if (pref === "zh") location.replace(zhHref + location.search + location.hash);
-          })();
-        </script>
-      )
-    }
+    <!-- 自动语言:键名与 src/lib/locale-pref.ts 的 LOCALE_KEY 一致;判定规则与 lib/locale-detect.ts 对齐。
+         zhHref 为 null 的页面(显式语言 URL)直接跳过。 -->
+    <script is:inline define:vars={{ zhHref: autoZhHref }}>
+      (function () {
+        if (!zhHref) return;
+        var pref = null;
+        try { pref = localStorage.getItem("fluxdown-locale"); } catch (e) {}
+        if (pref !== "en" && pref !== "zh") {
+          var m = document.cookie.match(/(?:^|;\s*)fluxdown-locale=(en|zh)(?:;|$)/);
+          pref = m ? m[1] : null;
+        }
+        if (!pref) {
+          if (/bot|crawl|spider|slurp|lighthouse|headless/i.test(navigator.userAgent)) return;
+          var langs = navigator.languages && navigator.languages.length ? navigator.languages : [navigator.language || ""];
+          for (var i = 0; i < langs.length && !pref; i++) {
+            var tag = String(langs[i]).toLowerCase();
+            if (tag.indexOf("zh") === 0) pref = "zh";
+            else if (tag.indexOf("en") === 0) pref = "en";
+          }
+        }
+        if (pref === "zh") location.replace(zhHref + location.search + location.hash);
+      })();
+    </script>
 
     <script is:inline type="application/ld+json" set:html={JSON.stringify(buildGraph(jsonLdNodes))} />
     <slot name="head" />
