@@ -2,7 +2,7 @@
 
 仅收录 AGENTS.md 未覆盖的硬约束（其余规范见项目根 AGENTS.md，已自动加载）：
 
-- UI 目标消歧：未来 PC 客户端将从 Flutter 迁移到 GPUI。用户明确说“GPUI 项目”或“GPUI UI”才修改 `crates/app`（包 `fluxdown_ui_app`）及 `crates/{i18n,theme,components,shell}`；未明确指定 GPUI 的“FluxDown UI/PC 客户端/UI 层”一律仍指当前默认 Flutter `lib/`。
+- UI 维护重心（用户 2026-09-29 决定）：PC 客户端主力维护 GPUI（`crates/*` 包 `fluxdown_ui_*` + `native/{agent,daemon,protocol}` 链路；headless Web SPA `web/` 同走 agent `/rpc`）。Flutter `lib/` 的 UI 侧修复与新功能**暂停**：不再为 Flutter 补 UI 功能或修 UI 问题，只保证共享协议/引擎改动不破坏其现有运行（wire 兼容）。未指明目标的“FluxDown UI/PC 客户端/UI 层”默认指 GPUI；用户明确点名 Flutter 才改 `lib/`。
 - 禁止未经用户明确要求执行 git commit / push / tag；推送 v* tag 会直接触发 GitHub Actions 全平台发布流水线，属不可逆操作。
 - 分支模型：`main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）。日常开发一律在 `main`；禁止直接向 `stable` 提交功能。
 - `stable` 只能通过合并 `main`（或从 `main` cherry-pick）前进；hotfix 若直接进 `stable`，必须同回合同步回 `main`。

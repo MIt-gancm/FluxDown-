@@ -44,7 +44,7 @@ Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm
 
 避免混淆——**已实现** vs **仅设计**：
 - **已实现**：多文件任务组（`multi-file-task-group-design.md`）、插件系统 + 去中心化市场（`fluxdown-plugin-marketplace-plan.md` 等）。
-- **部分实现（客户端 + agent）**：多设备协作 / FluxCloud 配置同步（`multi-device-collab-design.md`）——Flutter `lib/src/services/cloud/` 与 `native/agent`（云同步/远程任务，GPUI 与 headless Web SPA 经 `/rpc` 使用）已落地，对接**外部 L2 relay**；打洞/E2E 仍设计阶段；LAN 设备互联（配对/mDNS）在新架构未实现。
+- **部分实现（客户端 + agent）**：多设备协作 / FluxCloud 配置同步（`multi-device-collab-design.md`）——Flutter `lib/src/services/cloud/` 与 `native/agent`（云同步 / 远程任务 / 设备元数据，GPUI 与 headless Web SPA 经 `/rpc` 使用）已落地；LAN 设备互联 L1（配对 / mDNS / 直连下发）已在 agent 实现（协议 crate `native/link`）；L2 跨网发现 / 打洞 / 中继与 E2E 仍在设计阶段（FluxCloud 无对应端点）。
 - **仅设计（无引擎/服务器代码）**：浏览器扩展嗅探规则市场（`sniff-rule-market-design.md`——云端锚定 FluxCloud，扩展侧 `sniff-engine.ts` + FluxCloud `sniff_packs` 表均未落地；文档含三轮对抗评审记录与逐条打折清单）。
 - **已实现（全端）**：RSS 订阅自动下载（`rss-subscription-design.md`，issue #97）——引擎 `native/engine/src/rss/`、REST `/api/v1/rss/*`、WS `rssSourcesChanged`/`rssItemsChanged`、hub 信号、桌面 UI（侧边栏区块 + 条目流 + 三 Tab 对话框 + 两步向导）、web SPA 同构、CLI `fluxdown rss`、MCP `rss_list`/`rss_add`/`rss_remove`。
 - **已实现（免费层，全宿主）**：webhook 任务事件通知（`webhook-notification-design.md`）——引擎 `native/engine/src/webhook.rs`（6 事件 × 8 预设 + 占位符模板 + HMAC 签名 + 环形投递日志）、daemon RPC `daemon.webhook.{get,test,simulate,clearDeliveries}`、hub 信号、GPUI/Web「Webhook」页。端点表就是 config 键 `webhook.endpoints`，桌面 / headless / CLI `--local` 共享。**付费托管 Relay（设计 §6）未实现**，客户端无任何 relay 代码。

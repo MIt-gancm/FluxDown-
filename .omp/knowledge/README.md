@@ -97,6 +97,7 @@ flowchart TB
 - `native/daemon` 是 aria2c 式纯下载核心目标：下载任务、下载设置、RSS、插件和下载事件归它；账户与云同步永不进入该边界。
 - `native/agent` 是可选但常驻的官方客户端后端：独占 FluxCloud Token、配置同步、设备协同和远程任务状态机；官方 UI 默认只连接 agent。
 - `native/protocol` 是 daemon、agent、GPUI/WASM/CLI 共享的 wire 层；目前已落地服务角色与版本握手，JSON-RPC 方法/事件随实际迁移补充，禁止提前建立第二套 DTO。
+- `native/link`（`fluxdown_link`）是局域网直连（L1）协议本体：身份、配对（SAS）、mDNS 发现、直连传输、地址解析（`http(s)://host[:port][/base]`），持久化经 `LinkStorage` trait 注入——agent 用自身状态文件，引擎的 `link::DbLinkStorage` 只服务 Flutter hub / 冻结的 `native/server`。不依赖引擎、数据库或 UI。
 - 当前生产路径：Flutter App 仍走 `hub`；GPUI 桌面与 headless/NAS 已走 agent + daemon（headless 见 `hosts-and-api.md`「Headless 服务器」）。`native/server` 已冻结（不构建/不发布/不改），待新链路发版验证后删除。
 
 ---
@@ -127,6 +128,7 @@ FluxDown/
 │   ├── protocol/       `fluxdown_protocol`：daemon / agent / 客户端共享的传输无关协议基线
 │   ├── daemon/         `fluxdown_daemon`：纯下载常驻核心边界（运行链路迁移中）
 │   ├── agent/          `fluxdown_agent`：云功能与官方 UI Gateway 边界（运行链路迁移中）
+│   ├── link/           `fluxdown_link`：局域网直连 L1 协议（配对 / mDNS / 直连传输），agent 与 hub 共用
 │   ├── server/         `fluxdown_server`：**已冻结**的旧 headless 宿主（不构建/不发布），由 `agent --server` + `daemon` 取代
 │   ├── hub/            rinf FFI 适配层（唯一碰 rinf）——见 `hosts-and-api.md`「宿主与客户端 crate」
 │   ├── cli/            `fluxdown_cli`：二进制 `fluxdown`——见 `hosts-and-api.md`「宿主与客户端 crate」
