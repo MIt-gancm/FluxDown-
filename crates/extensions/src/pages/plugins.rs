@@ -1002,7 +1002,8 @@ impl ExtensionsView {
                 .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .w(px(560.))
                 .overlay_closable(!is_saving)
-                .content(move |content, _, _| content.child(form_for_content.clone()))
+                // min_h_0：窗口矮于对话框时让内容区收缩，交给表单内部滚动。
+                .content(move |content, _, _| content.min_h_0().child(form_for_content.clone()))
                 .footer(
                     DialogFooter::new()
                         .gap(active_theme(cx).tokens().spacing.sm)

@@ -497,11 +497,15 @@ impl Render for PluginSettingsForm {
             body = body.child(option_group(toggles, cx));
         }
         // 内容区随内容伸缩，超出上限时纵向滚动；内边距给输入框聚焦环留出空间。
-        div()
-            .w_full()
-            .max_h(px(460.))
-            .overflow_y_scrollbar()
-            .child(div().p(tokens.spacing.xxs).child(body))
+        // 上限必须放在外层 flex 容器上：Scrollable 内部滚动区是 size_full，只有作为
+        // 被 max_h 约束的 flex 子项才能拿到确定高度，直接在滚动元素上设 max_h
+        // 会让滚动区撑到内容高度、只被裁剪而永不滚动。min_h_0 让窗口较矮时继续收缩。
+        v_flex().w_full().min_h_0().max_h(px(460.)).child(
+            div()
+                .w_full()
+                .overflow_y_scrollbar()
+                .child(div().p(tokens.spacing.xxs).child(body)),
+        )
     }
 }
 
