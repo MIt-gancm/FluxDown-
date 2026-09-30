@@ -302,6 +302,8 @@ fn is_profile_config_key(key: &str) -> bool {
 pub fn is_sensitive_config_key(key: &str) -> bool {
     key == AUTH_PROFILES_CONFIG_KEY
         || key == crate::site_auth::SITE_AUTH_CONFIG_KEY
+        // 互联设备身份私钥 seed（`link::IDENTITY_CONFIG_KEY`），link 命名空间整体不对外。
+        || key.starts_with("link.")
         || is_profile_config_key(key)
 }
 
@@ -404,6 +406,7 @@ mod tests {
         assert!(is_sensitive_config_key(AUTH_PROFILES_CONFIG_KEY));
         assert!(is_sensitive_config_key("site_auth_credentials"));
         assert!(is_sensitive_config_key("plugin.a@b.auth.https://x.com"));
+        assert!(is_sensitive_config_key("link.identity_secret"));
         assert!(!is_sensitive_config_key("plugin.a@b.enabled"));
         assert!(!is_sensitive_config_key("plugin.dev.a@b"));
     }

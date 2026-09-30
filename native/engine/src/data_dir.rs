@@ -26,7 +26,8 @@
 //! - SQLite 三件套（`flux_down.db` / `-wal` / `-shm`）作为原子组迁移，
 //!   WAL 持有未 checkpoint 的事务，绝不与主库分离；
 //! - 失败的条目原地保留并记录到 `<portable_data>/migration_errors.log`
-//!   （GUI 进程无可见 stderr），下次启动自动重试。
+//!   （GUI 进程无可见 stderr），下次启动自动重试；主库 rename 失败时额外写
+//!   `.db_migration_pending` 哨兵，下次启动将本进程自建的空库备份后重试整组。
 
 use std::path::{Path, PathBuf};
 
@@ -191,6 +192,10 @@ const DB_FILE: &str = "flux_down.db";
 const DB_WAL: &str = "flux_down.db-wal";
 #[cfg(any(target_os = "windows", test))]
 const DB_SHM: &str = "flux_down.db-shm";
+/// 主库 rename 失败时写在新目录的哨兵：本进程随后会自建空库，
+/// 下次启动凭它识别「新库是空壳」并重试迁移。
+#[cfg(any(target_os = "windows", test))]
+const DB_MIGRATION_PENDING: &str = ".db_migration_pending";
 
 /// 独立迁移项（不含 DB 三件套——那组走 [`migrate_db_group`] 原子迁移）。
 // KEEP IN SYNC with lib/src/services/platform_utils.dart knownItems
@@ -244,10 +249,15 @@ fn migrate_portable_layout(old_root: &Path, new_dir: &Path) -> Vec<String> {
         failures.push(format!("创建目录失败 {}: {e}", new_dir.display()));
         return failures;
     }
+    let pending = new_dir.join(DB_MIGRATION_PENDING).exists();
     migrate_db_group(old_root, new_dir, &mut failures);
     for name in KNOWN_ITEMS {
         let old_path = old_root.join(name);
         let new_path = new_dir.join(name);
+        if pending && old_path.exists() {
+            // 主库迁移失败那次启动里引擎预建的空目录；remove_dir 只删空目录，非空则保留。
+            let _ = std::fs::remove_dir(&new_path);
+        }
         if old_path.exists()
             && !new_path.exists()
             && let Err(e) = std::fs::rename(&old_path, &new_path)
@@ -258,6 +268,9 @@ fn migrate_portable_layout(old_root: &Path, new_dir: &Path) -> Vec<String> {
                 new_path.display()
             ));
         }
+    }
+    if failures.is_empty() {
+        let _ = std::fs::remove_file(new_dir.join(DB_MIGRATION_PENDING));
     }
     failures
 }
@@ -275,8 +288,20 @@ fn migrate_portable_layout(old_root: &Path, new_dir: &Path) -> Vec<String> {
 fn migrate_db_group(old_root: &Path, new_dir: &Path, failures: &mut Vec<String>) {
     let old_db = old_root.join(DB_FILE);
     let new_db = new_dir.join(DB_FILE);
-    if !old_db.exists() || new_db.exists() {
+    let pending = new_dir.join(DB_MIGRATION_PENDING).exists();
+    if !old_db.exists() {
         return;
+    }
+    if new_db.exists() {
+        // 新库存在且无哨兵 → 已迁移（或用户在新布局下使用过），绝不覆盖。
+        // 有哨兵 → 新库是上次主库 rename 失败后本进程自建的空库，备份后重试。
+        if !pending {
+            return;
+        }
+        if let Err(e) = backup_fresh_db(new_dir) {
+            failures.push(e);
+            return;
+        }
     }
     if let Err(e) = std::fs::rename(&old_db, &new_db) {
         failures.push(format!(
@@ -284,6 +309,8 @@ fn migrate_db_group(old_root: &Path, new_dir: &Path, failures: &mut Vec<String>)
             old_db.display(),
             new_db.display()
         ));
+        // 引擎随后会在新目录自建空库；哨兵让下次启动识别并重试。
+        let _ = std::fs::write(new_dir.join(DB_MIGRATION_PENDING), b"");
         return;
     }
     let old_wal = old_root.join(DB_WAL);
@@ -304,6 +331,7 @@ fn migrate_db_group(old_root: &Path, new_dir: &Path, failures: &mut Vec<String>)
                 old_db.display()
             ));
         }
+        let _ = std::fs::write(new_dir.join(DB_MIGRATION_PENDING), b"");
         return;
     }
     let old_shm = old_root.join(DB_SHM);
@@ -318,6 +346,23 @@ fn migrate_db_group(old_root: &Path, new_dir: &Path, failures: &mut Vec<String>)
             new_shm.display()
         ));
     }
+}
+
+/// 把本进程在迁移失败后新建的空库三件套改名备份，给旧库让位。
+/// 备份而非删除：万一新库里已有用户数据也不会丢。
+#[cfg(any(target_os = "windows", test))]
+fn backup_fresh_db(new_dir: &Path) -> Result<(), String> {
+    let ts = chrono::Local::now().format("%Y%m%d%H%M%S");
+    for name in [DB_FILE, DB_WAL, DB_SHM] {
+        let src = new_dir.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = new_dir.join(format!("{name}.pre_migration_{ts}"));
+        std::fs::rename(&src, &dst)
+            .map_err(|e| format!("备份新库失败 {} → {}: {e}", src.display(), dst.display()))?;
+    }
+    Ok(())
 }
 
 /// 迁移失败信息落盘：`<new_dir>/migration_errors.log`（追加）。
@@ -469,6 +514,26 @@ mod tests {
         assert!(root.join(DB_FILE).exists());
         assert!(root.join(DB_WAL).exists());
         assert!(!new_dir.join(DB_WAL).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn fresh_db_left_by_failed_rename_is_replaced_on_retry() {
+        let root = fresh_root("retry_sentinel");
+        let new_dir = root.join("portable_data");
+        write(&root.join(DB_FILE), "old-db");
+        write(&root.join("settings.json"), "old-settings");
+        // 上次启动：主库 rename 失败 → 哨兵，引擎随后自建空库与空目录。
+        write(&new_dir.join(super::DB_MIGRATION_PENDING), "");
+        write(&new_dir.join(DB_FILE), "empty-db");
+        fs::create_dir_all(new_dir.join("plugins")).unwrap();
+        fs::create_dir_all(root.join("plugins")).unwrap();
+        write(&root.join("plugins").join("a.js"), "x");
+        let failures = migrate_portable_layout(&root, &new_dir);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(fs::read_to_string(new_dir.join(DB_FILE)).unwrap(), "old-db");
+        assert!(new_dir.join("plugins").join("a.js").exists());
+        assert!(!new_dir.join(super::DB_MIGRATION_PENDING).exists());
         let _ = fs::remove_dir_all(&root);
     }
 

@@ -33,7 +33,6 @@ use sha2::Sha256;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::db::{Db, WebhookDeliveryRow};
-use crate::downloader;
 use crate::events::{EngineEvent, EventSink};
 use crate::logger::log_info;
 use crate::proxy_config::ProxyConfig;
@@ -63,6 +62,8 @@ const MAX_ATTEMPTS: u32 = 4;
 const RETRY_BASE_SECS: u64 = 2;
 /// 出站全局并发上限。
 const MAX_CONCURRENT_DELIVERIES: usize = 4;
+/// 遵守 `Retry-After` 时的等待上限。
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// 日志里请求/响应体的截断长度（字符）。
 const MAX_LOG_BODY: usize = 2000;
 /// 日志变化推给宿主的最小间隔。千级批量任务完成时每条投递都推一份 100 条
@@ -947,12 +948,11 @@ impl WebhookDispatcher {
 }
 
 fn build_clients(proxy_config: &ProxyConfig) -> Clients {
-    // UA 传空 → downloader 用内置 `FluxDown/<version>`（设计要求的固定 UA）。
-    let direct = downloader::build_client(&ProxyConfig::default(), "").unwrap_or_else(|e| {
+    let direct = build_webhook_client(&ProxyConfig::default()).unwrap_or_else(|e| {
         log_info!("[webhook] direct client build failed, using default: {e}");
         Client::new()
     });
-    let proxied = downloader::build_client(proxy_config, "").unwrap_or_else(|e| {
+    let proxied = build_webhook_client(proxy_config).unwrap_or_else(|e| {
         log_info!("[webhook] proxied client build failed, falling back to direct: {e}");
         direct.clone()
     });
@@ -1227,8 +1227,8 @@ impl Inner {
             .join("\n");
 
         // ---- 出站限流（同端点保序由调用方的 worker 队列保证）----
-        let permit = self.sema.clone().acquire_owned().await;
-        if permit.is_err() {
+        // 许可只在单次请求期间持有，退避 sleep 期间释放，避免离线端点占满全局并发。
+        if self.sema.is_closed() {
             record.error = "webhook dispatcher shut down".to_string();
             return record;
         }
@@ -1248,6 +1248,10 @@ impl Inner {
         let started = std::time::Instant::now();
         for attempt in 1..=max_attempts {
             record.attempts = attempt as i32;
+            let Ok(permit) = self.sema.clone().acquire_owned().await else {
+                record.error = "webhook dispatcher shut down".to_string();
+                break;
+            };
             let mut req = client
                 .post(&target_url)
                 .timeout(REQUEST_TIMEOUT)
@@ -1255,21 +1259,48 @@ impl Inner {
             for (k, v) in &headers {
                 req = req.header(k, v);
             }
-            match req.send().await {
+            let mut retry_after: Option<Duration> = None;
+            let result = req.send().await;
+            let outcome = match result {
                 Ok(resp) => {
                     let status = resp.status();
                     record.status_code = status.as_u16() as i32;
+                    if !status.is_success() {
+                        retry_after = resp
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(parse_retry_after);
+                    }
+                    let location = if status.is_redirection() {
+                        resp.headers()
+                            .get(reqwest::header::LOCATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|l| url_host(l).unwrap_or_default())
+                    } else {
+                        None
+                    };
                     let text = resp.text().await.unwrap_or_default();
                     record.response_body = truncate(&text, MAX_LOG_BODY);
                     if status.is_success() {
                         record.success = true;
                         record.error = String::new();
-                        break;
-                    }
-                    record.error = format!("HTTP {}", status.as_u16());
-                    // 4xx = 配置错误，重试只会刷日志。
-                    if status.is_client_error() {
-                        break;
+                        true
+                    } else if status.is_redirection() {
+                        record.error = match location {
+                            Some(host) if !host.is_empty() => format!(
+                                "HTTP {} redirect to {host} not followed; set the final URL",
+                                status.as_u16()
+                            ),
+                            _ => format!(
+                                "HTTP {} redirect not followed; set the final URL",
+                                status.as_u16()
+                            ),
+                        };
+                        true
+                    } else {
+                        record.error = format!("HTTP {}", status.as_u16());
+                        !is_retryable_status(status)
                     }
                 }
                 Err(e) => {
@@ -1277,13 +1308,21 @@ impl Inner {
                     record.error = if e.is_timeout() {
                         "request timed out".to_string()
                     } else {
-                        e.to_string()
+                        // reqwest 的错误文本带完整 URL（可能含令牌），URL 已单独记录在 record。
+                        e.without_url().to_string()
                     };
+                    false
                 }
+            };
+            drop(permit);
+            if outcome {
+                break;
             }
             if attempt < max_attempts {
-                let delay = RETRY_BASE_SECS.saturating_mul(1u64 << (attempt - 1));
-                tokio::time::sleep(Duration::from_secs(delay)).await;
+                let backoff =
+                    Duration::from_secs(RETRY_BASE_SECS.saturating_mul(1u64 << (attempt - 1)));
+                let delay = retry_after.map_or(backoff, |ra| ra.min(MAX_RETRY_AFTER));
+                tokio::time::sleep(delay).await;
             }
         }
         record.latency_ms = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
@@ -1292,16 +1331,72 @@ impl Inner {
         }
         if !record.success {
             log_info!(
-                "[webhook] delivery failed: endpoint={} event={} attempts={} status={} error={}",
+                "[webhook] delivery failed: endpoint={} host={} event={} attempts={} status={} error={}",
                 record.endpoint_name,
+                url_host(&target_url).unwrap_or_default(),
                 record.event,
                 record.attempts,
                 record.status_code,
-                record.error
+                crate::logger::sanitize_log_str(&record.error)
             );
         }
         record
     }
+}
+
+/// 408/429 是暂时性失败，值得重试；其余 4xx 是配置错误。
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    !status.is_client_error() || status.as_u16() == 408 || status.as_u16() == 429
+}
+
+/// 解析 `Retry-After` 的秒数形式；HTTP-date 形式忽略，回退指数退避。
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    value.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+/// 只取 host，日志里不出现路径/query 中的密钥。
+fn url_host(url: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+}
+
+/// webhook 专用 client：不跟随重定向，避免 https→http 降级或跨主机时
+/// 把签名与自定义令牌头转发出去；也不启用 cookie。
+fn build_webhook_client(proxy_config: &ProxyConfig) -> Result<Client, reqwest::Error> {
+    use crate::proxy_config::{ProxyMode, detect_system_proxy};
+    let mut builder = Client::builder()
+        .user_agent(format!("FluxDown/{}", env!("FLUXDOWN_APP_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(15));
+    let manual = |cfg: &ProxyConfig| -> Option<reqwest::Proxy> {
+        let url = cfg.to_proxy_url()?;
+        let mut proxy = reqwest::Proxy::all(&url).ok()?;
+        if !cfg.username.is_empty() {
+            proxy = proxy.basic_auth(&cfg.username, &cfg.password);
+        }
+        if !cfg.no_proxy_list.is_empty() {
+            proxy = proxy.no_proxy(reqwest::NoProxy::from_string(
+                &crate::proxy_config::normalize_no_proxy(&cfg.no_proxy_list),
+            ));
+        }
+        Some(proxy)
+    };
+    builder = match proxy_config.mode {
+        ProxyMode::Manual => match manual(proxy_config) {
+            Some(p) => builder.proxy(p),
+            None => builder.no_proxy(),
+        },
+        ProxyMode::System => match detect_system_proxy() {
+            Ok(Some(sys)) => match manual(&sys) {
+                Some(p) => builder.proxy(p),
+                None => builder.no_proxy(),
+            },
+            _ => builder.no_proxy(),
+        },
+        ProxyMode::None | ProxyMode::Auto => builder.no_proxy(),
+    };
+    builder.build()
 }
 
 /// `{event.summary}` 的默认取值——一行人类可读摘要。
@@ -1613,6 +1708,53 @@ mod tests {
             mask_header_value("Content-Type", "application/json"),
             "application/json"
         );
+    }
+
+    #[test]
+    fn rate_limit_and_timeout_are_retryable_other_4xx_are_not() {
+        use reqwest::StatusCode;
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_retryable_status(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_only() {
+        assert_eq!(parse_retry_after(" 7 "), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+    }
+
+    #[test]
+    fn url_host_drops_path_and_query_secrets() {
+        assert_eq!(
+            url_host("https://api.telegram.org/bot1:SECRET/send?token=x").as_deref(),
+            Some("api.telegram.org")
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_is_not_followed_and_not_retried() {
+        let server = spawn_mock("HTTP/1.1 302 Found");
+        let d = dispatcher();
+        let record = d
+            .inner
+            .deliver(
+                &EndpointSpec {
+                    id: "e302".to_string(),
+                    url: format!("http://{}/hook", server.addr),
+                    allow_http: true,
+                    ..Default::default()
+                },
+                &WebhookEvent::sample(),
+                MAX_ATTEMPTS,
+            )
+            .await;
+        assert!(!record.success);
+        assert_eq!(record.status_code, 302);
+        assert_eq!(record.attempts, 1);
+        assert!(record.error.contains("redirect"), "{}", record.error);
     }
 
     // ---- 投递语义（真实 HTTP，最小 mock 服务器） ----
