@@ -84,12 +84,16 @@ pub fn parse_ftp_url(url: &str) -> Result<FtpUrl, DownloadError> {
         return Err(DownloadError::Other("not an FTP URL".to_string()));
     };
 
-    // Use rfind to handle passwords containing literal '@' characters.
-    // E.g. ftp://user:p@ss@host/file → userinfo="user:p@ss", hostpath="host/file"
-    let (userinfo, hostpath) = if let Some(at_pos) = stripped.rfind('@') {
-        (&stripped[..at_pos], &stripped[at_pos + 1..])
+    // authority 以第一个 '/' 为界：路径/文件名里的 '@'（如 icon@2x.png）不属于 userinfo。
+    // authority 内用 rfind 兼容密码里的裸 '@'（ftp://user:p@ss@host/file）。
+    let (authority, path_part) = match stripped.find('/') {
+        Some(slash) => (&stripped[..slash], &stripped[slash..]),
+        None => (stripped, "/"),
+    };
+    let (userinfo, hostport) = if let Some(at_pos) = authority.rfind('@') {
+        (&authority[..at_pos], &authority[at_pos + 1..])
     } else {
-        ("", stripped)
+        ("", authority)
     };
 
     let (username, password) = if userinfo.is_empty() {
@@ -102,12 +106,17 @@ pub fn parse_ftp_url(url: &str) -> Result<FtpUrl, DownloadError> {
     } else {
         (url_decode(userinfo), String::new())
     };
+    let path = url_decode(path_part);
 
-    let (hostport, path) = if let Some(slash) = hostpath.find('/') {
-        (&hostpath[..slash], &hostpath[slash..])
-    } else {
-        (hostpath, "/")
-    };
+    // 解码结果会原样拼进 FTP 命令行；CR/LF/NUL 会切断命令边界，一律拒绝。
+    if [&username, &password, &path]
+        .iter()
+        .any(|s| s.contains(['\r', '\n', '\0']))
+    {
+        return Err(DownloadError::Other(
+            "FTP URL contains control characters".to_string(),
+        ));
+    }
 
     let (host, port) = if let Some(colon) = hostport.rfind(':') {
         let port_str = &hostport[colon + 1..];
@@ -128,8 +137,24 @@ pub fn parse_ftp_url(url: &str) -> Result<FtpUrl, DownloadError> {
         port,
         username,
         password,
-        path: url_decode(path),
+        path,
     })
+}
+
+/// 日志用：去掉 FTP URL 的 userinfo（含密码）。
+fn redact_ftp_url(url: &str) -> String {
+    let Some(rest) = url
+        .get(..6)
+        .filter(|p| p.eq_ignore_ascii_case("ftp://"))
+        .map(|_| &url[6..])
+    else {
+        return url.to_string();
+    };
+    let auth_end = rest.find('/').unwrap_or(rest.len());
+    match rest[..auth_end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..6], &rest[at + 1..]),
+        None => url.to_string(),
+    }
 }
 
 /// 将单个十六进制字符（ASCII）转换为 0..=15 的 nibble 值。
@@ -191,6 +216,61 @@ const FTP_DATA_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// 无限挂起。
 const FTP_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn set_control_timeouts(tcp: &std::net::TcpStream) {
+    let _ = tcp.set_read_timeout(Some(FTP_CONTROL_READ_TIMEOUT));
+    let _ = tcp.set_write_timeout(Some(FTP_CONTROL_READ_TIMEOUT));
+}
+
+/// no_proxy 匹配（逗号/分号分隔）：`*`、精确主机、域后缀（`.x` / `*.x` / `x`）、
+/// 精确 IP 与 CIDR，语义对齐 reqwest::NoProxy。
+fn host_matches_no_proxy(host: &str, list: &str) -> bool {
+    use std::net::IpAddr;
+    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
+    let host_ip = host.parse::<IpAddr>().ok();
+    for raw in list.split([',', ';']) {
+        let entry = raw.trim().to_ascii_lowercase();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry == "*" {
+            return true;
+        }
+        if let Some((net, bits)) = entry.split_once('/')
+            && let (Ok(net), Ok(bits), Some(ip)) =
+                (net.parse::<IpAddr>(), bits.parse::<u32>(), host_ip)
+        {
+            let in_net = match (net, ip) {
+                (IpAddr::V4(n), IpAddr::V4(h)) if bits <= 32 => {
+                    let mask = if bits == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - bits)
+                    };
+                    u32::from(n) & mask == u32::from(h) & mask
+                }
+                (IpAddr::V6(n), IpAddr::V6(h)) if bits <= 128 => {
+                    let mask = if bits == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - bits)
+                    };
+                    u128::from(n) & mask == u128::from(h) & mask
+                }
+                _ => false,
+            };
+            if in_net {
+                return true;
+            }
+            continue;
+        }
+        let suffix = entry.trim_start_matches("*.").trim_start_matches('.');
+        if host == suffix || host.ends_with(&format!(".{suffix}")) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Connect to an FTP server, optionally through a proxy.
 ///
 /// Proxy modes:
@@ -205,8 +285,14 @@ fn ftp_connect_sync_with_proxy(
 ) -> Result<FtpStream, DownloadError> {
     let timeout = Duration::from_secs(30);
 
+    // 与 HTTP 路径一致：命中 no_proxy 的主机直连。
     let should_proxy = proxy
-        .map(|p| p.is_active() && !p.host.is_empty() && p.port > 0)
+        .map(|p| {
+            p.is_active()
+                && !p.host.is_empty()
+                && p.port > 0
+                && !host_matches_no_proxy(&ftp_url.host, &p.no_proxy_list)
+        })
         .unwrap_or(false);
 
     let default_proxy = ProxyConfig::default();
@@ -223,6 +309,8 @@ fn ftp_connect_sync_with_proxy(
 
         // Establish a TCP connection through the proxy
         let tcp = proxy_config::proxy_connect_sync(proxy, &ftp_url.host, ftp_url.port, timeout)?;
+        // 代理握手完成后超时会被清除，这里重新设置，保证欢迎语/登录可超时。
+        set_control_timeouts(&tcp);
 
         // Build FtpStream from the pre-established (proxied) TCP connection
         let mut ftp = FtpStream::connect_with_stream(tcp)
@@ -253,23 +341,61 @@ fn ftp_connect_sync_with_proxy(
         ftp
     } else {
         // Direct connection (no proxy)
-        let addr = format!("{}:{}", ftp_url.host, ftp_url.port);
-
-        let sock_addr: std::net::SocketAddr = addr.parse().or_else(|_| {
+        // 依次尝试所有解析出的地址（双栈下首选地址不通时回落到另一族），并在读
+        // 220 欢迎语之前就设好控制连接超时，避免静默服务器无限阻塞登录/探测。
+        let addrs: Vec<std::net::SocketAddr> = {
             use std::net::ToSocketAddrs;
-            addr.to_socket_addrs()
+            (ftp_url.host.as_str(), ftp_url.port)
+                .to_socket_addrs()
                 .map_err(|e| DownloadError::Other(format!("DNS resolve error: {}", e)))?
-                .next()
-                .ok_or_else(|| DownloadError::Other("DNS returned no addresses".to_string()))
+                .collect()
+        };
+        if addrs.is_empty() {
+            return Err(DownloadError::Other(
+                "DNS returned no addresses".to_string(),
+            ));
+        }
+        let mut last_err = None;
+        let mut tcp = None;
+        for sock_addr in addrs {
+            match std::net::TcpStream::connect_timeout(&sock_addr, timeout) {
+                Ok(s) => {
+                    tcp = Some(s);
+                    break;
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        let tcp = tcp.ok_or_else(|| {
+            DownloadError::Other(format!(
+                "FTP connect error: {}",
+                last_err.map(|e| e.to_string()).unwrap_or_default()
+            ))
         })?;
-
-        let mut ftp = FtpStream::connect_timeout(sock_addr, timeout)
+        set_control_timeouts(&tcp);
+        let mut ftp = FtpStream::connect_with_stream(tcp)
             .map_err(|e| DownloadError::Other(format!("FTP connect error: {}", e)))?;
+        // IPv6 控制连接上 PASV 只能返回 IPv4 地址，服务器通常直接拒绝；RFC 2428 的
+        // EPSV 只返回端口，与下面的 NAT 容忍（复用控制主机）天然契合。
+        if ftp
+            .get_ref()
+            .peer_addr()
+            .map(|a| a.is_ipv6())
+            .unwrap_or(false)
+        {
+            ftp.set_mode(suppaftp::Mode::ExtendedPassive);
+        }
         // NAT 容忍：很多 NAT 后的 FTP 服务器在 PASV 227 响应里报告私网/不可路由
         // IP（如 192.168.x.x）。开启该开关后 suppaftp 忽略 PASV 自报 IP，复用控制
         // 连接的主机 + PASV 端口建立数据连接，对齐标准客户端行为（代理路径已在
         // 上面的 passive_stream_builder 中做了等价处理；此处覆盖直连路径）。
         ftp.set_passive_nat_workaround(true);
+        // 默认 builder 用无超时的 TcpStream::connect；换成带连接超时的版本，防止数据
+        // 连接被防火墙静默丢包时线程长时间卡在 connect。
+        ftp = ftp.passive_stream_builder(move |data_addr: std::net::SocketAddr| {
+            std::net::TcpStream::connect_timeout(&data_addr, timeout)
+                .map_err(suppaftp::FtpError::ConnectionError)
+        });
         ftp
     };
 
@@ -509,11 +635,18 @@ fn verify_ftp_rest_honoured_sync(
 
     let mut ftp = ftp_connect_sync_with_proxy(ftp_url, proxy).ok()?;
 
-    if ftp.resume_transfer(probe_offset).is_err() {
-        // 服务器对 REST 直接报错：不确定（可能是瞬时故障，也可能真的不支持 REST，
-        // 但此处不据此降级，交由实际下载阶段的重试/完整性核对兜底）。
+    if let Err(e) = ftp.resume_transfer(probe_offset) {
         let _ = ftp.quit();
-        return None;
+        // 500–504（命令未实现/参数错误）是服务器对 REST 的确定性拒绝：多段每段都要
+        // REST，必败，降级单流。其它错误（网络、421 等）可能是瞬时故障，不确定。
+        return match e {
+            suppaftp::FtpError::UnexpectedResponse(ref r)
+                if (500..=504).contains(&r.status.code()) =>
+            {
+                Some(false)
+            }
+            _ => None,
+        };
     }
 
     let mut data_stream = match ftp.retr_as_stream(&ftp_url.path) {
@@ -701,7 +834,11 @@ async fn compute_ftp_segments(p: &DownloadParams, info: &FileInfo) -> i32 {
 }
 
 async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
-    log_info!("[ftp-download] task {} starting, url={}", p.task_id, p.url);
+    log_info!(
+        "[ftp-download] task {} starting, url={}",
+        p.task_id,
+        redact_ftp_url(&p.url)
+    );
 
     // Transition to status=5 (preparing) — probing FTP server, resolving file info
     let _ = p.db.update_task_status(&p.task_id, 5, "").await;
@@ -719,7 +856,11 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         })
         .await;
 
-    let info = resolve_ftp_file_info(&p.url, &p.proxy_config).await?;
+    // 探测期间的暂停/删除要立即生效，不能等阻塞线程里的握手超时。
+    let info = tokio::select! {
+        _ = p.cancel_token.cancelled() => return Err(DownloadError::Cancelled),
+        r = resolve_ftp_file_info(&p.url, &p.proxy_config) => r?,
+    };
     log_info!(
         "[ftp-download] task {} resolved: name={}, size={}, range={}",
         p.task_id,
@@ -728,10 +869,12 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         info.supports_range
     );
 
+    // p.file_name 来自外部（aria2 out、云端下发、接管请求等），与 HTTP/HLS 一致地清洗，
+    // 否则 save_dir.join 可被 `..`/绝对路径带出保存目录。
     let auto_name = if p.file_name.is_empty() {
         info.file_name.clone()
     } else {
-        p.file_name.clone()
+        sanitize_filename(&p.file_name)
     };
 
     let save_dir = PathBuf::from(&p.save_dir);
@@ -1018,6 +1161,8 @@ async fn run_ftp_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// 服务器明确拒绝 REST 时 reader 返回的错误前缀，写端据此清空临时文件从头重下。
+const REST_REJECTED_MSG: &str = "FTP REST rejected by server";
 
 /// Maximum consecutive read timeouts before aborting the FTP reader.
 /// Prevents infinite retry loops when set_read_timeout silently fails
@@ -1095,6 +1240,7 @@ async fn ftp_download_single(
         let resume_offset = if resume { existing_len } else { 0 };
         let proxy = proxy_config.clone();
         let tracker_reader = tracker.clone();
+        let size_known = total_bytes > 0;
 
         tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
             let proxy_opt = if proxy.is_active() {
@@ -1105,8 +1251,15 @@ async fn ftp_download_single(
             let mut ftp = ftp_connect_sync_with_proxy(&ftp_url, proxy_opt)?;
 
             if resume_offset > 0 {
-                ftp.resume_transfer(resume_offset as usize)
-                    .map_err(|e| DownloadError::Other(format!("FTP REST error: {}", e)))?;
+                ftp.resume_transfer(resume_offset as usize).map_err(|e| {
+                    if let suppaftp::FtpError::UnexpectedResponse(r) = &e
+                        && (500..=504).contains(&r.status.code())
+                    {
+                        DownloadError::Other(format!("{REST_REJECTED_MSG}: {e}"))
+                    } else {
+                        DownloadError::Other(format!("FTP REST error: {}", e))
+                    }
+                })?;
             }
 
             let mut data_stream = ftp
@@ -1182,7 +1335,18 @@ async fn ftp_download_single(
                 {
                     log_info!("[ftp] 控制连接 set_read_timeout 失败: {}", e);
                 }
-                let _ = ftp.finalize_retr_stream(data_stream);
+                match ftp.finalize_retr_stream(data_stream) {
+                    Ok(()) => {}
+                    // 大小未知时没有任何其它完整性核对手段，收尾应答异常（426/451、
+                    // 超时等）意味着传输可能被截断，必须作为失败重试。
+                    Err(e) if !size_known => {
+                        let _ = ftp.quit();
+                        return Err(DownloadError::Other(format!(
+                            "FTP transfer did not complete cleanly: {e}"
+                        )));
+                    }
+                    Err(_) => {}
+                }
             }
             let _ = ftp.quit();
             Ok(())
@@ -1304,9 +1468,17 @@ async fn ftp_download_single(
     let reader_result = ftp_reader
         .await
         .map_err(|e| DownloadError::Other(format!("FTP reader join error: {}", e)))?;
-    reader_result?;
-
-    Ok(())
+    match reader_result {
+        Err(DownloadError::Other(m)) if m.starts_with(REST_REJECTED_MSG) => {
+            // 服务器明确拒绝 REST：续传永远不会成功。清空临时文件和进度，让重试从 0
+            // 开始（此时不再发 REST）。
+            drop(file);
+            File::create(&dest).await?;
+            let _ = db.update_task_progress(&task_id, 0).await;
+            Err(DownloadError::Other(m))
+        }
+        other => other,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,11 +1638,17 @@ async fn ftp_download_multi_segment(
         let sink = sink.clone();
 
         let handle = tokio::spawn(async move {
-            // Acquire permit before opening FTP connection
-            let _permit = match sem.acquire().await {
-                Ok(p) => p,
-                Err(_) => return Err(DownloadError::Cancelled),
+            // 排队中的段遇到取消要立即退出，否则每个排队段都会先完整握手再发现已取消。
+            let _permit = tokio::select! {
+                _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
+                p = sem.acquire() => match p {
+                    Ok(p) => p,
+                    Err(_) => return Err(DownloadError::Cancelled),
+                },
             };
+            if cancel.is_cancelled() {
+                return Err(DownloadError::Cancelled);
+            }
             ftp_do_segment_with_retry(
                 &task_id,
                 seg_idx,
@@ -1642,7 +1820,9 @@ async fn ftp_do_segment(
     spawn_gen: i64,
 ) -> Result<(), DownloadError> {
     let bytes_needed = (seg_end - actual_start + 1) as u64;
-
+    if cancel.is_cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
     let cancelled = Arc::new(AtomicBool::new(false));
     let cancelled_writer = cancelled.clone();
 
@@ -1793,6 +1973,8 @@ async fn ftp_do_segment(
         .await?;
 
     let mut seg_downloaded = actual_start - seg_start;
+    // 已确认落盘（flush+sync_data 成功）的段内字节数；错误/取消路径只能落这个值。
+    let mut durable_downloaded = seg_downloaded;
     let mut last_report = std::time::Instant::now();
     let mut last_db_save = std::time::Instant::now();
 
@@ -1800,16 +1982,20 @@ async fn ftp_do_segment(
         tokio::select! {
             _ = cancel.cancelled() => {
                 cancelled_writer.store(true, Ordering::SeqCst);
-                // flush 用 best-effort: 即便失败也要继续落库段进度并清理 reader,否则 ?
-                // 会以 Io 错误绕过这些清理,且重试包装器会因非 Cancelled 而错误重试。
-                let _ = file.flush().await;
+                // 只有 flush+sync 都成功才能把 seg_downloaded 落库；失败则退回已
+                // 持久化水位，避免 DB 领先磁盘。
+                let flushed = file.flush().await.is_ok()
+                    && file.get_ref().sync_data().await.is_ok();
+                if flushed {
+                    durable_downloaded = seg_downloaded;
+                }
                 if let Ok(mut states) = seg_states.lock()
                     && let Some(s) = states.iter_mut().find(|s| s.index == seg_idx) {
-                        s.downloaded_bytes = seg_downloaded;
+                        s.downloaded_bytes = durable_downloaded;
                     }
                 let _ = db
                     .update_segment_progress_bounded(
-                        task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
+                        task_id, seg_idx, durable_downloaded, seg_start, spawn_gen,
                     )
                     .await;
                 cancel_watcher.abort();
@@ -1837,21 +2023,17 @@ async fn ftp_do_segment(
                             offset = end;
                         }
 
-                        // 写失败时，先持久化已完整记账的 seg_downloaded（不含本段
-                        // 部分写入字节），再向上传播错误。否则错误会直接经 `?`
-                        // 冒泡，跳过函数末尾的 update_segment_progress，使 DB 偏移
-                        // 落后于真实进度；重试时按陈旧偏移续传虽因字节相同不致损坏，
-                        // 但会让 DB 求和完整性核对出现不一致。这里不 flush 本段
-                        // 部分写入字节，避免磁盘超前于 DB；下次以 DB 偏移 REST 续传
-                        // 时会重新 seek 到 actual_start 覆盖写，幂等且安全。
                         if let Some(e) = write_err {
+                            // 只落已 fsync 的水位：seg_downloaded 里最多约两个缓冲区的
+                            // 字节已记账但可能从未落盘，落库会让续传在预分配文件里留下
+                            // 全 0 空洞。
                             if let Ok(mut states) = seg_states.lock()
                                 && let Some(s) = states.iter_mut().find(|s| s.index == seg_idx) {
-                                    s.downloaded_bytes = seg_downloaded;
+                                    s.downloaded_bytes = durable_downloaded;
                                 }
                             let _ = db
                                 .update_segment_progress_bounded(
-                                    task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
+                                    task_id, seg_idx, durable_downloaded, seg_start, spawn_gen,
                                 )
                                 .await;
                             cancelled_writer.store(true, Ordering::SeqCst);
@@ -1909,6 +2091,7 @@ async fn ftp_do_segment(
                             let sync_ok = file.flush().await.is_ok()
                                 && file.get_ref().sync_data().await.is_ok();
                             if sync_ok {
+                                durable_downloaded = seg_downloaded;
                                 let _ = db
                                     .update_segment_progress_bounded(
                                         task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
@@ -2416,5 +2599,56 @@ mod tests {
             "BUG: DB integrity check passes but disk file is corrupted/empty — \
              current code does not verify disk file size for multi-segment FTP"
         );
+    }
+
+    #[test]
+    fn parse_ftp_url_at_in_path_is_not_userinfo() {
+        let u = parse_ftp_url("ftp://ftp.example.com/pub/icon@2x.png")
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(u.host, "ftp.example.com");
+        assert_eq!(u.username, "anonymous");
+        assert_eq!(u.path, "/pub/icon@2x.png");
+
+        let u =
+            parse_ftp_url("ftp://u:p@ss@host:2121/dir/a@b.txt").unwrap_or_else(|_| unreachable!());
+        assert_eq!(u.host, "host");
+        assert_eq!(u.port, 2121);
+        assert_eq!(u.username, "u");
+        assert_eq!(u.password, "p@ss");
+        assert_eq!(u.path, "/dir/a@b.txt");
+    }
+
+    #[test]
+    fn parse_ftp_url_rejects_control_chars() {
+        assert!(parse_ftp_url("ftp://h/%0D%0ADELE%20x").is_err());
+        assert!(parse_ftp_url("ftp://h/a%00b").is_err());
+        assert!(parse_ftp_url("ftp://u%0D%0ASITE:p@h/f").is_err());
+        assert!(parse_ftp_url("ftp://u:p%0Aq@h/f").is_err());
+        assert!(parse_ftp_url("ftp://u:p@h/f%20g").is_ok());
+    }
+
+    #[test]
+    fn redact_ftp_url_strips_userinfo_only() {
+        assert_eq!(
+            super::redact_ftp_url("ftp://user:p@ss@host:21/dir/a@b.txt"),
+            "ftp://host:21/dir/a@b.txt"
+        );
+        assert_eq!(
+            super::redact_ftp_url("ftp://host/icon@2x.png"),
+            "ftp://host/icon@2x.png"
+        );
+    }
+
+    #[test]
+    fn no_proxy_matching() {
+        use super::host_matches_no_proxy as m;
+        assert!(m("nas.local", "*.local"));
+        assert!(m("nas.local", ".local, other"));
+        assert!(m("192.168.1.5", "192.168.0.0/16"));
+        assert!(m("localhost", "localhost;x"));
+        assert!(m("anything", "*"));
+        assert!(!m("example.com", "*.local,192.168.0.0/16"));
+        assert!(!m("notlocal", ".local"));
+        assert!(!m("10.0.0.1", "192.168.0.0/16"));
     }
 }
