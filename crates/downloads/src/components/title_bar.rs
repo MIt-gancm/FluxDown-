@@ -690,7 +690,7 @@ fn sort_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<AnyE
                     SharedString::from(format!("download-view-sort-{sort_key:?}")),
                     menu_text(menu, sort_key_key(sort_key), cx),
                     current_key == sort_key,
-                    move |cx| update_prefs(&view, move |prefs| prefs.sort_key = sort_key, cx),
+                    move |cx| update_prefs(&view, move |prefs| prefs.select_sort_key(sort_key), cx),
                 )
                 .into_any_element()
         })

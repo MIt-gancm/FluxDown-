@@ -109,6 +109,14 @@ impl ViewSortKey {
         Self::CYCLE[(ix + 1) % Self::CYCLE.len()]
     }
 
+    /// 首次选中该键时的方向：名称 A→Z，其余（含智能）从大到小。
+    pub(crate) fn default_dir(self) -> SortDir {
+        match self {
+            Self::Name => SortDir::Asc,
+            _ => SortDir::Desc,
+        }
+    }
+
     /// 排序值随每次进度节拍变化的键（速度 / 进度）：重排需要限频，否则列表持续跳动。
     pub(crate) fn is_live(self) -> bool {
         matches!(self, Self::Progress | Self::Speed)
@@ -224,7 +232,15 @@ impl ViewPrefs {
     }
 
     pub(crate) fn cycle_sort(&mut self) {
-        self.sort_key = self.sort_key.next();
+        self.select_sort_key(self.sort_key.next());
+    }
+
+    /// 选择排序键；键真正变化时方向重置为该键的默认方向（与 web / 表头一致）。
+    pub(crate) fn select_sort_key(&mut self, key: ViewSortKey) {
+        if self.sort_key != key {
+            self.sort_key = key;
+            self.sort_dir = key.default_dir();
+        }
     }
 
     pub(crate) fn is_group_collapsed(&self, key: &str) -> bool {
@@ -439,6 +455,24 @@ mod tests {
         rows.iter()
             .map(|row| row.key.task_id().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn selecting_sort_key_resets_direction_only_when_key_changes() {
+        let mut prefs = ViewPrefs::default();
+        prefs.select_sort_key(ViewSortKey::Name);
+        assert_eq!(
+            (prefs.sort_key, prefs.sort_dir),
+            (ViewSortKey::Name, SortDir::Asc)
+        );
+        prefs.sort_dir = SortDir::Desc;
+        prefs.select_sort_key(ViewSortKey::Name);
+        assert_eq!(prefs.sort_dir, SortDir::Desc);
+        prefs.select_sort_key(ViewSortKey::Size);
+        assert_eq!(
+            (prefs.sort_key, prefs.sort_dir),
+            (ViewSortKey::Size, SortDir::Desc)
+        );
     }
 
     #[test]

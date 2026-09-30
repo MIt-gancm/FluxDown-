@@ -650,7 +650,9 @@ impl DownloadsController {
                     if !file_name.is_empty() {
                         task.file_name.clone_from(file_name);
                     }
-                    task.total_bytes = *total_bytes;
+                    if *total_bytes > 0 {
+                        task.total_bytes = *total_bytes;
+                    }
                 }
                 self.rebuild_row(ix);
                 true
@@ -908,6 +910,17 @@ mod tests {
             assert_eq!(rows[0].name, "resolved.bin");
             assert_eq!(rows[0].size_bytes, 4096);
             assert!(!rows[0].metadata_pending);
+        }
+
+        controller.apply_daemon_event(&DaemonEvent::Engine(WsServerMsg::TaskMetaProbed {
+            task_id: "task-1".to_owned(),
+            file_name: String::new(),
+            total_bytes: 0,
+        }));
+        {
+            let rows = controller.store().local();
+            assert_eq!(rows[0].name, "resolved.bin");
+            assert_eq!(rows[0].size_bytes, 4096);
         }
 
         controller.apply_daemon_event(&DaemonEvent::Engine(WsServerMsg::TaskProgress {

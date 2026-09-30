@@ -398,6 +398,7 @@ impl DownloadView {
                         | fluxdown_protocol::AgentEvent::CloudDevicesChanged(_)
                         | fluxdown_protocol::AgentEvent::LinkedDevicesChanged(_)
                         | fluxdown_protocol::AgentEvent::SessionChanged(_)
+                        | fluxdown_protocol::AgentEvent::PreferencesChanged(_)
                 )
             ) {
                 self.reconcile_sidebar_selection();
@@ -422,6 +423,18 @@ impl DownloadView {
                     .any(|queue| &queue.queue_id == queue_id) =>
             {
                 self.selected_item = SidebarSelection::Download(DownloadFilter::ALL);
+            }
+            SidebarSelection::Download(DownloadFilter {
+                status,
+                category: Some(category),
+            }) if !self.controller.categories().rules().is_empty()
+                && !self
+                    .controller
+                    .categories()
+                    .visible()
+                    .any(|rule| rule.dto.id == *category) =>
+            {
+                self.selected_item = SidebarSelection::Download(DownloadFilter::status(*status));
             }
             SidebarSelection::Device(id)
                 if id != SidebarSelection::LOCAL_DEVICE

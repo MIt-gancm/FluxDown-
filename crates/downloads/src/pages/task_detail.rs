@@ -395,7 +395,12 @@ impl TaskDetailView {
             self.runtime = None;
             self.last_error = Some(self.strings.disconnected.clone());
         }
-        self.refresh_from_store(cx);
+        if snapshot.daemon_connected {
+            self.refresh_from_store(cx);
+        } else {
+            // 服务未就绪的空快照不代表任务已删除；等 daemon 已连接的快照再判定。
+            cx.notify();
+        }
         self.fetch_activity(cx);
     }
 
@@ -1239,7 +1244,7 @@ impl TaskDetailView {
                             cx,
                         ))
                     })
-                    .when_some(connected_peers, |this, count| {
+                    .when_some(connected_peers.filter(|_| self.is_bt()), |this, count| {
                         this.child(detail_row(
                             self.t(cx, "detailConnectedPeers"),
                             SharedString::from(count.to_string()),
@@ -1589,9 +1594,12 @@ impl TaskDetailView {
         if let (Some(oldest), Some(newest)) = (oldest, newest) {
             content = content.child(
                 note(
-                    SharedString::from(format!(
-                        "{}: #{oldest}–#{newest}",
-                        self.t(cx, "detailActivityRetainedRange")
+                    SharedString::from(self.translator.read(cx).text_with(
+                        "detailActivityRetainedRange",
+                        &[
+                            ("oldest", &format!("#{oldest}")),
+                            ("newest", &format!("#{newest}")),
+                        ],
                     )),
                     tokens.colors.muted_foreground,
                 )

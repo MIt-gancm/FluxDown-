@@ -1677,8 +1677,15 @@ impl DownloadTableDelegate {
                 });
         let key = key.to_owned();
         let on_click = cx.listener(move |table, _: &ClickEvent, _, cx| {
-            table.delegate_mut().toggle_group_collapsed(&key);
-            table.delegate_mut().refresh_view();
+            let delegate = table.delegate_mut();
+            delegate.toggle_group_collapsed(&key);
+            delegate.refresh_view();
+            // 折叠记忆随视图偏好持久化；表格实体此刻正被更新，放到帧外调用。
+            if let Some(host) = delegate.host.clone() {
+                cx.defer(move |cx| {
+                    let _ = host.update(cx, |view, cx| view.schedule_persist_prefs(cx));
+                });
+            }
             table.refresh(cx);
             cx.notify();
         });

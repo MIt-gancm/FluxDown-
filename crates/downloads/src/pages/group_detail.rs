@@ -161,7 +161,7 @@ impl GroupDetailView {
             .child(
                 v_flex()
                     .child(detail_row(
-                        self.t(cx, "groupDetailSubtitle"),
+                        self.t(cx, "groupMemberOfLabel"),
                         div().font_features(tabular_numbers()).child(status),
                         cx,
                     ))

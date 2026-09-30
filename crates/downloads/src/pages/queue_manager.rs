@@ -179,12 +179,21 @@ impl QueueForm {
     }
 }
 
+/// 新建队列后待补发的定时设置。
+struct PendingSchedule {
+    known_ids: Vec<String>,
+    start_time: String,
+    stop_time: String,
+    days: i32,
+}
+
 /// 队列管理页面；实现 [`crate::session`]（app 侧）期望的三方法供 `attach` 驱动。
 pub struct QueueManagerView {
     translator: Entity<Translator>,
     port: Arc<dyn DownloadsPort>,
     queues: Vec<QueueDto>,
     form: Option<QueueForm>,
+    pending_schedule: Option<PendingSchedule>,
     error: Option<SharedString>,
     stale: bool,
 }
@@ -203,6 +212,7 @@ impl QueueManagerView {
             port,
             queues: Vec::new(),
             form: None,
+            pending_schedule: None,
             error: None,
             stale: true,
         }
@@ -218,6 +228,7 @@ impl QueueManagerView {
         match event {
             ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::QueuesChanged(queues))) => {
                 self.absorb_queues(queues.clone());
+                self.flush_pending_schedule(cx);
                 cx.notify();
             }
             ServiceEvent::Agent(AgentEvent::DaemonSnapshotReplaced(snapshot))
@@ -236,7 +247,35 @@ impl QueueManagerView {
 
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {
         self.stale = true;
+        self.pending_schedule = None;
         cx.notify();
+    }
+
+    fn flush_pending_schedule(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = &self.pending_schedule else {
+            return;
+        };
+        let Some(queue_id) = self
+            .queues
+            .iter()
+            .find(|queue| !pending.known_ids.contains(&queue.queue_id))
+            .map(|queue| queue.queue_id.clone())
+        else {
+            return;
+        };
+        let Some(pending) = self.pending_schedule.take() else {
+            return;
+        };
+        self.run_command(
+            DownloadsCommand::QueueSchedule {
+                queue_id,
+                enabled: true,
+                start_time: pending.start_time,
+                stop_time: pending.stop_time,
+                days: pending.days,
+            },
+            cx,
+        );
     }
 
     fn absorb_queues(&mut self, mut queues: Vec<QueueDto>) {
@@ -371,6 +410,16 @@ impl QueueManagerView {
                 );
             }
             None => {
+                if schedule_enabled {
+                    // QueueCreate 不带定时字段也不返回 id：记下创建前的队列集合，
+                    // 等队列列表回流后取新出现的那个再补发定时（与 web 一致）。
+                    self.pending_schedule = Some(PendingSchedule {
+                        known_ids: self.queues.iter().map(|q| q.queue_id.clone()).collect(),
+                        start_time: start,
+                        stop_time: stop,
+                        days: schedule_days,
+                    });
+                }
                 self.run_command(DownloadsCommand::QueueCreate(fields), cx);
                 self.form = None;
             }

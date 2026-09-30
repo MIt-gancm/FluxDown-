@@ -530,13 +530,17 @@ impl DownloadView {
         v_flex()
             .w_full()
             .child(self.status_item(status, open_amount, category_count > 0., cx))
-            .child(
-                div()
+            .child({
+                let mut body = div()
                     .w_full()
                     .overflow_hidden()
-                    .h(active_theme(cx).density().nav_row * (category_count * open_amount))
-                    .child(self.render_categories(status, cx)),
-            )
+                    .h(active_theme(cx).density().nav_row * (category_count * open_amount));
+                // 折叠时高度为 0，不必为看不见的分类子项逐个扫描任务计数。
+                if open_amount > 0. {
+                    body = body.child(self.render_categories(status, cx));
+                }
+                body
+            })
     }
 
     /// 状态区：全部 / 下载中 / 已完成 / 失败 / 暂停 五个状态项，各自可展开显示分类子项。

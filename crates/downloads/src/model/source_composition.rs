@@ -129,7 +129,8 @@ pub(crate) fn format_percent(fraction: f64) -> String {
     } else if fraction < 0.001 {
         "<0.1%".to_owned()
     } else {
-        format!("{:.1}%", fraction * 100.)
+        // JS toFixed(1) 对恰好半档向上取整，Rust 的 {:.1} 是就近偶数，先手动 round 对齐 web。
+        format!("{:.1}%", (fraction * 1000.).round() / 10.)
     }
 }
 
@@ -139,6 +140,13 @@ mod tests {
 
     fn rows(c: &SourceComposition) -> Vec<(SourceKind, u64)> {
         c.slices.iter().map(|s| (s.kind, s.bytes)).collect()
+    }
+
+    #[test]
+    fn format_percent_rounds_half_up_like_web() {
+        assert_eq!(format_percent(0.0625), "6.3%");
+        assert_eq!(format_percent(0.3125), "31.3%");
+        assert_eq!(format_percent(0.0004), "<0.1%");
     }
 
     #[test]

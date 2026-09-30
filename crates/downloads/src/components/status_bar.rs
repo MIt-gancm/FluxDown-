@@ -151,11 +151,20 @@ struct NumberPrompt {
     confirm_label: SharedString,
 }
 
+/// 弹窗输入解析：空白、非数字或小于 `min` 都视为无效，避免误当成 0 触发副作用。
+fn parse_number_input(text: &str, min: i64) -> Option<i64> {
+    text.trim()
+        .parse::<i64>()
+        .ok()
+        .filter(|value| *value >= min)
+}
+
 /// 单个数字输入确认弹窗：标题 → 表单字段（标签 + 带单位输入框 + 可选说明）→ 底栏。
 fn open_number_prompt(
     window: &mut Window,
     cx: &mut App,
     prompt: NumberPrompt,
+    min: i64,
     on_confirm: NumberConfirm,
 ) {
     let input = cx.new(|cx| InputState::new(window, cx));
@@ -187,13 +196,10 @@ fn open_number_prompt(
                 cx,
             ))
             .on_ok(move |_, _, cx| {
-                let value = ok_input
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .parse::<i64>()
-                    .unwrap_or(0)
-                    .max(0);
+                let text = ok_input.read(cx).value().to_string();
+                let Some(value) = parse_number_input(&text, min) else {
+                    return false;
+                };
                 on_confirm(value, cx);
                 true
             })
@@ -204,13 +210,22 @@ fn open_number_prompt(
 impl DownloadView {
     /// 状态栏冲突 / 失败提示复用现有横幅字段（`last_error`），不新增 `DownloadStrings`。
     fn execute_config_patch(&mut self, key: &'static str, value: i64, cx: &mut Context<Self>) {
-        let mut values = BTreeMap::new();
-        values.insert(key.to_owned(), value.to_string());
-        let expected_revision = self.controller.config_revision();
-        let future = self.controller.execute(DownloadsCommand::PatchConfig {
-            values,
-            expected_revision,
-        });
+        // 下载限速属于云同步目录（download.speed_limit_bytes）：必须走偏好写入链路，
+        // 直写 daemon 配置不会被标记为本地改动，之后会被云端旧值覆盖。
+        let command = if key == "speed_limit_bytes" {
+            DownloadsCommand::SetSyncedPreference {
+                key: "download.speed_limit_bytes",
+                value: serde_json::Value::from(value),
+            }
+        } else {
+            let mut values = BTreeMap::new();
+            values.insert(key.to_owned(), value.to_string());
+            DownloadsCommand::PatchConfig {
+                values,
+                expected_revision: self.controller.config_revision(),
+            }
+        };
+        let future = self.controller.execute(command);
         let conflict_message = SharedString::from(
             self.translator
                 .read(cx)
@@ -320,6 +335,7 @@ impl DownloadView {
                                     window,
                                     cx,
                                     prompt.clone(),
+                                    0,
                                     Rc::new(move |kb, cx| {
                                         apply_speed_limit(
                                             view.clone(),
@@ -450,11 +466,11 @@ impl DownloadView {
                                     window,
                                     cx,
                                     prompt.clone(),
+                                    // 0 分钟等同立即关机，「立即」是独立菜单项；自定义必须 ≥ 1。
+                                    1,
                                     Rc::new(move |minutes, cx| {
                                         shutdown(
-                                            ShutdownRequest::ArmAfter(minutes_to_duration(
-                                                minutes.max(0),
-                                            )),
+                                            ShutdownRequest::ArmAfter(minutes_to_duration(minutes)),
                                             cx,
                                         );
                                         spawn_shutdown_ticker(view.clone(), cx);
@@ -606,7 +622,20 @@ impl DownloadView {
 mod tests {
     use std::time::Duration;
 
-    use super::{format_countdown, kb_to_bytes, mb_to_bytes, minutes_to_duration};
+    use super::{
+        format_countdown, kb_to_bytes, mb_to_bytes, minutes_to_duration, parse_number_input,
+    };
+
+    #[test]
+    fn number_input_rejects_blank_garbage_and_below_minimum() {
+        assert_eq!(parse_number_input(" 15 ", 1), Some(15));
+        assert_eq!(parse_number_input("", 1), None);
+        assert_eq!(parse_number_input("abc", 1), None);
+        assert_eq!(parse_number_input("-5", 1), None);
+        assert_eq!(parse_number_input("0", 1), None);
+        assert_eq!(parse_number_input("0", 0), Some(0));
+        assert_eq!(parse_number_input("", 0), None);
+    }
 
     #[test]
     fn mb_preset_converts_to_bytes_per_second() {

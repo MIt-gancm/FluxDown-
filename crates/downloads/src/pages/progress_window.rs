@@ -185,6 +185,12 @@ impl ProgressWindowView {
     pub fn replace_snapshot(&mut self, snapshot: &AgentSnapshot, cx: &mut Context<Self>) {
         self.controller.replace_snapshot(snapshot);
         self.last_error = (!snapshot.daemon_connected).then(|| self.strings.disconnected.clone());
+        if !snapshot.daemon_connected {
+            // 服务未就绪的空快照不代表任务已删除；等 daemon 已连接的快照再判定。
+            self.runtime = None;
+            cx.notify();
+            return;
+        }
         self.refresh(cx);
     }
 

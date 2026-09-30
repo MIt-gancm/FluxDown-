@@ -131,7 +131,15 @@ impl SelectionView {
         ((self.request.deadline_unix_ms - now) / 1000).max(0)
     }
 
+    /// 引擎把空 BT 选择回退为全部文件，所以全不选时不允许确认（与 web 一致）。
+    fn can_confirm(&self) -> bool {
+        !matches!(&self.state, SelectionState::Bt { selected, .. } if selected.is_empty())
+    }
+
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_confirm() {
+            return;
+        }
         let outcome = match &self.state {
             SelectionState::Hls { selected, .. } => SelectionOutcome::Hls { index: *selected },
             SelectionState::Bt { selected, .. } => SelectionOutcome::Bt {
@@ -522,7 +530,7 @@ impl SelectionView {
                             .primary()
                             .control(cx)
                             .label(confirm_label)
-                            .disabled(self.submitting)
+                            .disabled(self.submitting || !self.can_confirm())
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 this.confirm(window, cx);
                             })),
