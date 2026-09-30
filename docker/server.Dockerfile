@@ -49,6 +49,8 @@ COPY .cargo/ .cargo/
 COPY native/ native/
 COPY crates/ crates/
 COPY scripts/desktop-dev/ scripts/desktop-dev/
+# notification.rs 在 Linux 上 include_bytes! 应用图标。
+COPY assets/logo/ assets/logo/
 # Web SPA 在编译期由 fluxdown_agent（feature web-ui）按 FLUXDOWN_EMBED_WEBROOT
 # 嵌入二进制（运行时层不再有 web/ 目录，也无需 FLUXDOWN_WEBROOT）。
 COPY --from=web /src/web/dist /webroot

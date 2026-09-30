@@ -87,6 +87,7 @@ jobs:
       prerelease: ${{ steps.resolve.outputs.prerelease }}
       prev: ${{ steps.resolve.outputs.prev }}
       source: ${{ steps.resolve.outputs.source }}
+      is_highest_stable: ${{ steps.resolve.outputs.is_highest_stable }}
       source_is_tag: ${{ steps.resolve.outputs.source_is_tag }}
     steps:
       - name: Checkout repository
@@ -177,6 +178,9 @@ jobs:
             echo "version=${TAG#v}"
             echo "prerelease=$PRERELEASE"
             echo "prev=$PREV"
+            # 与 release_publish.py 的 is_highest_stable 同规则：仅最高稳定版可推 Docker latest
+            HIGHEST=$(git tag --list 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            if [ "$PRERELEASE" != true ] && [ "$HIGHEST" = "$TAG" ]; then echo "is_highest_stable=true"; else echo "is_highest_stable=false"; fi
             echo "source=$SOURCE_SHA"
             if [ "$SOURCE_SHA" = "$TAG_SHA" ]; then echo "source_is_tag=true"; else echo "source_is_tag=false"; fi
           } >> "$GITHUB_OUTPUT"
@@ -223,9 +227,10 @@ jobs:
                 # 旧 headless 宿主 native/server 已冻结，不再触发任何组件
                 native/server/*) ;;
                 native/cli/*)        CLI=true ;;
-                native/api/*)        APP=true; SERVER=true; CLI=true ;;
-                native/protocol/*)   APP=true; SERVER=true; CLI=true ;;
-                native/engine-protocol/*) APP=true; SERVER=true ;;
+                native/api/*)        APP=true; SERVER=true; CLI=true; MOBILE=true ;;
+                native/protocol/*)   APP=true; SERVER=true; CLI=true; MOBILE=true ;;
+                # hub（Android）在所有目标上无条件依赖 engine-protocol
+                native/engine-protocol/*) APP=true; SERVER=true; MOBILE=true ;;
                 # 服务器 = fluxdown-agent --server + fluxdownd；桌面 = fluxdown-desktop + 同一对进程
                 native/daemon/*|native/agent/*) APP=true; SERVER=true ;;
                 native/link/*)       APP=true; SERVER=true; MOBILE=true ;;
@@ -235,7 +240,8 @@ jobs:
                 # GPUI 桌面客户端
                 crates/*)            APP=true ;;
                 native/engine/*)     APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
-                Cargo.toml|Cargo.lock) APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
+                Cargo.toml|Cargo.lock|.cargo/*) APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;
+                .dockerignore)       SERVER=true ;;
                 docker/*)            SERVER=true ;;
                 packaging/*|installer/*) APP=true; SERVER=true ;;
                 android/*)           MOBILE=true ;;
@@ -1510,7 +1516,7 @@ jobs:
           images: ghcr.io/${{ github.repository_owner }}/fluxdown-server
           tags: |
             type=raw,value=${{ steps.version.outputs.VERSION }}
-            type=raw,value=latest,enable=${{ !contains(needs.changes.outputs.tag, '-') }}
+            type=raw,value=latest,enable=${{ needs.changes.outputs.is_highest_stable == 'true' }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6

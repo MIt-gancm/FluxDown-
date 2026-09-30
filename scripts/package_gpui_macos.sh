@@ -158,8 +158,15 @@ plutil -lint "$HPL"
 
 # ── 签名：由内到外，Hardened Runtime + 时间戳 ──
 KC=
+ORIG_KCS=()
 SIGN_ARGS=()
-cleanup() { [ -n "$KC" ] && security delete-keychain "$KC" 2>/dev/null || true; }
+cleanup() {
+  # 先恢复用户搜索列表再删除临时钥匙串，避免残留指向已删除文件的条目。
+  if [ ${#ORIG_KCS[@]} -gt 0 ]; then
+    security list-keychains -d user -s "${ORIG_KCS[@]}" 2>/dev/null || true
+  fi
+  if [ -n "$KC" ]; then security delete-keychain "$KC" 2>/dev/null || true; fi
+}
 trap cleanup EXIT
 if [ -n "${MACOS_CERT_P12_PATH:-}" ]; then
   KC="$WORK/signing.keychain-db"
@@ -168,7 +175,14 @@ if [ -n "${MACOS_CERT_P12_PATH:-}" ]; then
   security set-keychain-settings "$KC"
   security unlock-keychain -p "$KC_PASS" "$KC"
   security import "$MACOS_CERT_P12_PATH" -k "$KC" -P "${MACOS_CERT_PASSWORD:?MACOS_CERT_PASSWORD required}" -T /usr/bin/codesign >/dev/null
-  security set-key-partition-list -S apple-tool:,apple: -s -k "$KC_PASS" "$KC" >/dev/null
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KC_PASS" "$KC" >/dev/null
+  # codesign 的证书链与私钥访问走用户搜索列表，临时钥匙串必须在其中。
+  while IFS= read -r line; do
+    line=${line//\"/}
+    line=${line#"${line%%[![:space:]]*}"}
+    [ -n "$line" ] && ORIG_KCS+=("$line")
+  done < <(security list-keychains -d user)
+  security list-keychains -d user -s "$KC" ${ORIG_KCS[@]+"${ORIG_KCS[@]}"}
   IDENTITY=$(security find-identity -v -p codesigning "$KC" | sed -nE 's/.*"(Developer ID Application: [^"]+)".*/\1/p' | head -1)
   [ -n "$IDENTITY" ] || { echo "no Developer ID Application identity in p12" >&2; exit 1; }
   SIGN_ARGS=(--keychain "$KC" --timestamp --options runtime)

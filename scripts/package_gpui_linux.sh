@@ -94,16 +94,30 @@ stage_root() {
   ln -s /opt/fluxdown/fluxdown-agent "$root/usr/bin/fluxdown-agent"
   install -m 0644 "$DESKTOP_FILE" "$root/usr/share/applications/com.fluxdown.app.desktop"
   install -m 0644 "$ICON" "$root/usr/share/icons/hicolor/256x256/apps/com.fluxdown.app.png"
+  # Flutter 版自启条目（~/.config/autostart/FluxDown.desktop）固定执行 /opt/fluxdown/flux_down --silentStart；
+  # 包升级会删除旧文件，保留转发器让旧条目继续生效（--silentStart 等价于 agent 的 --autostart）。
+  cat >"$root/opt/fluxdown/flux_down" <<'FWD'
+#!/bin/sh
+dir="$(dirname "$(readlink -f "$0")")"
+if [ "$1" = "--silentStart" ]; then
+  shift
+  exec "$dir/fluxdown-agent" --autostart "$@"
+fi
+exec "$dir/fluxdown-desktop" "$@"
+FWD
+  chmod 0755 "$root/opt/fluxdown/flux_down"
 }
 
 # ── deb ──
+# dpkg 以 '~' 表示预发布（0.5.0~rc.2 < 0.5.0）；'-' 会被当成 Debian revision 而排在正式版之后。
+DEB_VERSION=${VERSION/-/'~'}
 DEB="$WORK/deb"
 stage_root "$DEB"
 mkdir -p "$DEB/DEBIAN"
 INSTALLED_KB=$(du -sk "$DEB/opt" "$DEB/usr" | awk '{s+=$1} END {print s}')
 cat >"$DEB/DEBIAN/control" <<EOF
 Package: fluxdown
-Version: ${VERSION}
+Version: ${VERSION/-/\~}
 Architecture: amd64
 Maintainer: FluxDown Team <contact@fluxdown.app>
 Homepage: https://fluxdown.zerx.dev

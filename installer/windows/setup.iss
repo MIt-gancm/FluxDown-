@@ -50,6 +50,7 @@ WizardStyle=modern
 ArchitecturesAllowed=arm64
 ArchitecturesInstallIn64BitMode=arm64
 #else
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 #endif
 ; 始终每用户安装：{autopf} → %LOCALAPPDATA%\Programs\FluxDown，从不请求 UAC。
@@ -340,6 +341,25 @@ begin
     WriteProtocolHandler('magnet', 'URL:Magnet Link', Desktop);
 end;
 
+{ Upgrading from the Flutter client: .torrent association and URL protocol handlers
+  still point at the removed flux_down.exe. Retarget only entries that name this
+  install's old exe, so other programs' registrations stay untouched. }
+procedure MigrateLegacyIntegrations;
+var
+  OldExe, NewExe: String;
+begin
+  OldExe := ExpandConstant('{app}\{#LegacyExeName}');
+  NewExe := ExpandConstant('{app}\{#MyAppExeName}');
+  if TorrentAssociationTargets(OldExe) then
+    WriteTorrentAssociation(NewExe);
+  if ProtocolHandlerTargets('fluxdown', OldExe) then
+    WriteProtocolHandler('fluxdown', 'URL:FluxDown Protocol', NewExe);
+  if ProtocolHandlerTargets('ed2k', OldExe) then
+    WriteProtocolHandler('ed2k', 'URL:ed2k Protocol', NewExe);
+  if ProtocolHandlerTargets('magnet', OldExe) then
+    WriteProtocolHandler('magnet', 'URL:Magnet Link', NewExe);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
@@ -363,6 +383,7 @@ begin
   if CurStep = ssPostInstall then
   begin
     MigrateLegacyAutostart;
+    MigrateLegacyIntegrations;
     RestoreLegacyIntegrations;
   end;
 end;
