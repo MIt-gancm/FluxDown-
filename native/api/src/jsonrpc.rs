@@ -100,7 +100,7 @@ async fn dispatch_rpc_call(
     // 即使 token 缺失/错误也照常返回名单；但 token 前缀（若存在）仍按约定剥离。
     if method == "system.listMethods" || method == "system.listNotifications" {
         let arr = strip_token_prefix(params.as_array().cloned().unwrap_or_default());
-        return dispatch_method(method, &arr, &id, host).await;
+        return dispatch_method(method, &arr, &id, host, config_token.is_empty()).await;
     }
 
     // aria2 行为对齐：`system.multicall` 信封本身不鉴权（token 由每个
@@ -118,7 +118,7 @@ async fn dispatch_rpc_call(
         Some(a) => strip_token_prefix(a.clone()),
         None => return rpc_err(&id, 1, "params must be an array"),
     };
-    dispatch_method(method, &arr, &id, host).await
+    dispatch_method(method, &arr, &id, host, config_token.is_empty()).await
 }
 
 /// 剥离 aria2 约定的 `token:xxx` 前缀参数（若第 0 个元素是这样的字符串）。
@@ -134,7 +134,13 @@ fn strip_token_prefix(mut arr: Vec<Value>) -> Vec<Value> {
 
 /// 派发单个 aria2 方法（不含 `system.multicall`——由 [`dispatch_rpc_call`]
 /// 提前拦截，避免异步递归；也避免嵌套 multicall 误入本函数）。
-async fn dispatch_method(method: &str, arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
+async fn dispatch_method(
+    method: &str,
+    arr: &[Value],
+    id: &Value,
+    host: &dyn ApiHost,
+    token_empty: bool,
+) -> Value {
     match method {
         // ---- 真实实现：经 &dyn ApiHost -------------------------------
         "aria2.addUri" => add_uri(arr, id, host).await,
@@ -152,7 +158,7 @@ async fn dispatch_method(method: &str, arr: &[Value], id: &Value, host: &dyn Api
         "aria2.getFiles" => get_files(arr, id, host).await,
         "aria2.getOption" => get_option(arr, id, host).await,
         "aria2.getGlobalOption" => get_global_option(id, host).await,
-        "aria2.changeGlobalOption" => change_global_option(arr, id, host).await,
+        "aria2.changeGlobalOption" => change_global_option(arr, id, host, token_empty).await,
         "aria2.getGlobalStat" => get_global_stat(id, host).await,
         "aria2.purgeDownloadResult" => purge_download_result(id, host).await,
         "aria2.removeDownloadResult" => remove_download_result(arr, id, host).await,
@@ -216,7 +222,14 @@ async fn system_multicall(
             continue;
         }
         let inner_params = strip_token_prefix(inner.as_array().cloned().unwrap_or_default());
-        let resp = dispatch_method(method, &inner_params, &Value::Null, host).await;
+        let resp = dispatch_method(
+            method,
+            &inner_params,
+            &Value::Null,
+            host,
+            config_token.is_empty(),
+        )
+        .await;
         if let Some(result) = resp.get("result") {
             results.push(json!([result]));
         } else {
@@ -475,7 +488,12 @@ async fn get_global_option(id: &Value, host: &dyn ApiHost) -> Value {
 
 /// `aria2.changeGlobalOption`：`params = [options]`。映射表之外的键
 /// 静默忽略；映射结果为空时直接返回 `"OK"`（不打扰宿主）。
-async fn change_global_option(arr: &[Value], id: &Value, host: &dyn ApiHost) -> Value {
+async fn change_global_option(
+    arr: &[Value],
+    id: &Value,
+    host: &dyn ApiHost,
+    token_empty: bool,
+) -> Value {
     let options = match arr.first() {
         None => return rpc_err(id, 1, &aria2::err_missing_param(0)),
         Some(v) => match v.as_object() {
@@ -483,6 +501,10 @@ async fn change_global_option(arr: &[Value], id: &Value, host: &dyn ApiHost) -> 
             None => return rpc_err(id, 1, &aria2::err_wrong_type_param(0)),
         },
     };
+    // 无 token 时任何能触达端口的调用方都可改默认保存目录，等同于任意目录写入入口。
+    if token_empty && options.contains_key("dir") {
+        return rpc_err(id, 1, "changing dir requires an rpc token");
+    }
     let changes = match aria2::map_change_global_options(options) {
         Ok(c) => c,
         Err(e) => return rpc_err(id, 1, &e),

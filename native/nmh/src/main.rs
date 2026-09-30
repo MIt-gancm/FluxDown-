@@ -528,14 +528,29 @@ fn launch_app(app_exe: &Path) -> bool {
     use std::os::windows::process::CommandExt;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
     const CREATE_NO_WINDOW: u32 = 0x08000000;
+    // Firefox 把 NMH 放进会在 NMH 退出时终止整个 Job 的 Job object；
+    // 不脱离则冷启动的 agent / daemon 会随 NMH 一起被杀。
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x01000000;
+    const ERROR_ACCESS_DENIED: i32 = 5;
 
-    std::process::Command::new(app_exe)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-        .spawn()
-        .is_ok()
+    let spawn = |flags: u32| {
+        std::process::Command::new(app_exe)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    let base = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    match spawn(base | CREATE_BREAKAWAY_FROM_JOB) {
+        Ok(_) => true,
+        // 所在 Job 不允许脱离（Chrome / 企业策略 / 沙箱）：退化为随浏览器生命周期。
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED) => {
+            log("launch: job does not allow breakaway; app will follow the browser's job lifetime");
+            spawn(base).is_ok()
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(not(windows))]

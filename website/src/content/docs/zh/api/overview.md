@@ -43,17 +43,17 @@ FluxDown 内置一套小型 HTTP API,供浏览器扩展、油猴脚本、aria2 �
 
 ### 跨域(CORS)
 
-服务默认对任何请求都**不返回** `Access-Control-Allow-Origin`,网页里的跨域 `fetch()` 会在预检阶段被浏览器拦下——这正是"脚本接管必须带 `X-FluxDown-Client` 头"能挡住任意网页的原因(油猴脚本走 `GM_xmlhttpRequest`,不受 CORS 约束)。
+服务默认对任何请求都**不返回** `Access-Control-Allow-Origin`,带自定义头的跨域 `fetch()`(如 `/download*` 要求的 `X-FluxDown-Client`)会在预检阶段被浏览器拦下(油猴脚本走 `GM_xmlhttpRequest`,不受 CORS 约束)。但 `/jsonrpc` 的 `text/plain` POST 与 WebSocket 不触发预检,因此服务端还会校验 `Origin`:在 `/jsonrpc`(POST 与 WS 升级)和 `/download*` 上,带 `Origin` 头的请求只放行浏览器扩展(`chrome-extension://`、`moz-extension://`、`safari-web-extension://`)与同源请求,其余返回 403;不带 `Origin` 的非浏览器客户端(油猴 `GM_xmlhttpRequest`、CLI、aria2 客户端)不受影响。桌面端仅回环监听时还会要求 `Host` 为 `127.0.0.1` / `localhost` / `[::1]`,防止 DNS 重绑定。
 
-设置里的**允许任意网页跨域访问(CORS)**(`local_server_cors_allow_all`,默认关)可以放弃这道防线:开启后预检与真实响应都带 `Access-Control-Allow-Origin: *`,预检额外带 `Access-Control-Allow-Private-Network: true`,等价于 aria2 的 `--rpc-allow-origin-all`。用途是让那些"用浏览器 `fetch` 探测 aria2 服务"的网站能识别到 FluxDown;代价是任意网页都能探测本机端口并提交下载链接。此时仍生效的防护:桌面端接管/aria2 提交会弹确认框,管理 API 与 MCP 仍强制校验 token。
+设置里的**允许任意网页跨域访问(CORS)**(`local_server_cors_allow_all`,默认关)可以放弃这道防线:开启后预检与真实响应都带 `Access-Control-Allow-Origin: *`,预检额外带 `Access-Control-Allow-Private-Network: true`,等价于 aria2 的 `--rpc-allow-origin-all`,同时 `Origin` 门禁也随之放开。用途是让那些"用浏览器 `fetch` 探测 aria2 服务"的网站能识别到 FluxDown;代价是任意网页都能探测本机端口并提交下载链接。此时仍生效的防护:管理 API 与 MCP 仍强制校验 token;aria2 入口**不会**弹确认框,建议同时设置 token(token 为空时 `aria2.changeGlobalOption` 会拒绝修改 `dir`)。
 
 ## 接管 / aria2 与管理 API 的语义区别
 
-`POST /download`、`/download/batch` 与 `aria2.addUri` 都汇入同一条"外部下载"通道。**在桌面客户端上**,这条通道会在真正下载前弹出确认框——前提假设是某个浏览器扩展或不可信网页上的油猴脚本在替用户发起请求,所以需要人工确认。**在 headless 服务器上**没有界面可以弹确认框,同样的入口会直接创建任务,与管理 API 行为一致。
+`POST /download`、`/download/batch` 汇入"外部下载"通道:**在桌面客户端上**会在真正下载前弹出确认框(用户开启免打扰下载后则静默建任务);**在 headless 服务器上**没有界面可以弹确认框,会直接创建任务。`aria2.addUri` / `aria2.addTorrent` **不经过确认通道**,在所有宿主上都直接创建任务,与管理 API 一致——它们的防护来自 `Origin` 门禁与可选 token,而不是确认框。
 
 `POST /api/v1/tasks`(管理 API)在两种宿主上都是**直接创建任务、不弹确认框**——它假设调用方是已经通过鉴权的可信自动化客户端,而不是经由油猴脚本代为发起的不可信网页。
 
-简单说:桌面客户端上接管/aria2 入口会先问,管理 API 不问;headless 服务器上没人能问,所以都不问。
+简单说:只有脚本接管入口在桌面客户端上会先问;aria2 与管理 API 都不问。请给 aria2 入口配置 token(尤其在开启 CORS 或局域网访问时)。
 
 ## curl 示例
 

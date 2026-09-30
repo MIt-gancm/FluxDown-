@@ -33,8 +33,12 @@ use axum::extract::ws::{Message, WebSocket};
 use tokio::sync::broadcast;
 
 use crate::aria2;
+use crate::auth::TokenCell;
 use crate::jsonrpc::handle_jsonrpc;
 use crate::service::{ApiHost, TaskEvent};
+
+/// 已建连会话检查开关 / token 变更的周期（空闲连接也要能被踢掉）。
+const SESSION_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// 跑一个 WS 会话直到断开（`Close` 帧 / 读错误 / 广播端全部关闭）。
 ///
@@ -43,15 +47,29 @@ use crate::service::{ApiHost, TaskEvent};
 pub(crate) async fn run_session(
     mut socket: WebSocket,
     host: &dyn ApiHost,
-    config_token: &str,
+    token: &TokenCell,
+    jsonrpc_enabled: impl Fn() -> bool,
     mut events: Option<broadcast::Receiver<TaskEvent>>,
 ) {
+    let initial_token = token.get();
+    let mut recheck = tokio::time::interval(SESSION_RECHECK_INTERVAL);
+    recheck.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            _ = recheck.tick() => {
+                if !session_still_valid(jsonrpc_enabled(), token, &initial_token) {
+                    let _ = socket.send(Message::Close(None)).await;
+                    break;
+                }
+            }
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        let resp = respond_to_text(host, config_token, text.as_str()).await;
+                        if !session_still_valid(jsonrpc_enabled(), token, &initial_token) {
+                            let _ = socket.send(Message::Close(None)).await;
+                            break;
+                        }
+                        let resp = respond_to_text(host, &token.get(), text.as_str()).await;
                         if socket.send(Message::Text(resp.into())).await.is_err() {
                             break;
                         }
@@ -77,6 +95,12 @@ pub(crate) async fn run_session(
             }
         }
     }
+}
+
+/// 已建连会话是否仍被允许：开关被关闭或 token 被改写（轮换 / 首次设置）后
+/// 必须断开，否则升级时的旧授权状态会永久有效。
+fn session_still_valid(jsonrpc_enabled: bool, token: &TokenCell, initial_token: &str) -> bool {
+    jsonrpc_enabled && *token.get() == *initial_token
 }
 
 /// 从任务事件订阅拉取下一条事件；未订阅（`None`）时永久挂起，让
@@ -112,6 +136,16 @@ mod tests {
 
     use super::*;
     use crate::service::{ApiError, TaskEventKind};
+
+    #[test]
+    fn session_is_dropped_when_switch_off_or_token_changes() {
+        let cell = TokenCell::new("old");
+        let initial = cell.get();
+        assert!(session_still_valid(true, &cell, &initial));
+        assert!(!session_still_valid(false, &cell, &initial));
+        cell.set("new");
+        assert!(!session_still_valid(true, &cell, &initial));
+    }
     use fluxdown_protocol::daemon::{CreateTaskRequest, DownloadRequest, QueueDto, TaskDto};
 
     /// `respond_to_text` 专用的最小 `ApiHost`：只关心 `create_task` 是否被

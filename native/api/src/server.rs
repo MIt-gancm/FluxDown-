@@ -109,6 +109,11 @@ pub struct ApiServerConfig {
     /// 的本地网络访问门禁），等价于 aria2 的 `--rpc-allow-origin-all`——
     /// 把「aria2 RPC 探活」写死成浏览器 `fetch` 的网站需要它才能识别本机服务。
     pub cors_allow_all: bool,
+    /// 仅监听回环时校验 `Host` 头属于 127.0.0.1 / localhost / [::1]，防 DNS 重绑定
+    /// （默认 false）。经 [`spawn_api_server`] 启动的桌面宿主在 `lan_enabled == false`
+    /// 时自动视为开启；经 [`api_router`] 复用核心路由的宿主（agent / 服务器）需要自行
+    /// 在「确定只监听回环」时置 true，局域网 / 服务器模式保持 false。
+    pub enforce_loopback_host: bool,
     /// agent 使用的热切换路由开关；普通宿主为 `None`，维持静态注册行为。
     pub runtime_switches: Option<Arc<ApiRuntimeSwitches>>,
     /// 宿主应用版本号（`/ping`、`/api/v1/info` 返回）。
@@ -190,6 +195,7 @@ impl ApiServerConfig {
             mcp_enabled: flag("local_server_mcp_enabled", false),
             lan_enabled: flag("local_server_lan_enabled", false),
             cors_allow_all: flag("local_server_cors_allow_all", false),
+            enforce_loopback_host: false,
             runtime_switches: None,
             app_version: app_version.to_string(),
         }
@@ -455,6 +461,13 @@ fn build_router(state: AppState) -> Router {
     router
         .fallback(unknown_endpoint)
         .layer(middleware::from_fn_with_state(
+            BrowserGuardState {
+                enforce_host: state.config.enforce_loopback_host || !state.config.lan_enabled,
+                state: state.clone(),
+            },
+            browser_origin_guard,
+        ))
+        .layer(middleware::from_fn_with_state(
             state.clone(),
             cors_and_preflight,
         ))
@@ -478,6 +491,13 @@ pub fn api_router(host: Arc<dyn ApiHost>, config: ApiServerConfig) -> Router {
         config: Arc::new(config),
     };
     register_core(state.clone())
+        .layer(middleware::from_fn_with_state(
+            BrowserGuardState {
+                enforce_host: state.config.enforce_loopback_host,
+                state: state.clone(),
+            },
+            browser_origin_guard,
+        ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             cors_and_preflight,
@@ -540,6 +560,88 @@ async fn cors_and_preflight(
             .insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, WILDCARD);
     }
     resp
+}
+
+/// 浏览器来源门禁的状态：`enforce_host` 仅在桌面回环监听时为真。
+#[derive(Clone)]
+struct BrowserGuardState {
+    state: AppState,
+    enforce_host: bool,
+}
+
+/// 浏览器扩展页面的 Origin 前缀（扩展自带 host 权限，不受网页同源策略约束）。
+const EXTENSION_ORIGIN_PREFIXES: [&str; 3] = [
+    "chrome-extension://",
+    "moz-extension://",
+    "safari-web-extension://",
+];
+
+/// 去掉 `host[:port]` 的端口，支持 `[::1]:port`。
+fn host_without_port(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split_once(']').map_or(authority, |(ip, _)| ip);
+    }
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+}
+
+/// `Host` 头是否指向本机回环（127.0.0.1 / localhost / [::1]）。
+fn host_is_loopback(host: &str) -> bool {
+    let name = host_without_port(host);
+    name.eq_ignore_ascii_case("localhost") || name == "127.0.0.1" || name == "::1"
+}
+
+/// 带 `Origin` 的请求是否来自允许的调用方：扩展源，或与本服务同源
+/// （`Origin` 的 authority 等于 `Host`，例如内置页面）。其余网页一律视为跨站。
+fn origin_allowed_for_local(origin: &str, host: Option<&str>) -> bool {
+    if EXTENSION_ORIGIN_PREFIXES
+        .iter()
+        .any(|prefix| origin.starts_with(prefix))
+    {
+        return true;
+    }
+    let Some(host) = host else {
+        return false;
+    };
+    origin
+        .split_once("://")
+        .is_some_and(|(_, authority)| authority.eq_ignore_ascii_case(host))
+}
+
+/// 是否是受浏览器来源门禁保护的端点（aria2 入口与接管入口）。
+fn is_browser_guarded_path(path: &str) -> bool {
+    path == routes::JSONRPC || path == routes::DOWNLOAD || path == routes::DOWNLOAD_BATCH
+}
+
+/// 浏览器来源门禁：
+/// - 桌面仅回环监听时，`Host` 必须是回环名（防 DNS 重绑定把域名解析到 127.0.0.1）。
+/// - `/jsonrpc`（POST 与 WS 升级）和 `/download*` 上，带 `Origin` 的请求只放行扩展源与同源；
+///   `text/plain` 简单请求与 WebSocket 不受 CORS 预检约束，只能靠这里拦。
+///   用户显式开启 `cors_allow_all` 即放弃该防线。不带 `Origin` 的非浏览器客户端不受影响。
+async fn browser_origin_guard(
+    State(guard): State<BrowserGuardState>,
+    req: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let headers = req.headers();
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    if guard.enforce_host && !host.as_deref().is_some_and(host_is_loopback) {
+        return result_response(StatusCode::FORBIDDEN, false, "Forbidden host");
+    }
+    if is_browser_guarded_path(req.uri().path())
+        && !guard.state.config.cors_enabled()
+        && let Some(origin) = headers.get(header::ORIGIN)
+    {
+        let allowed = origin
+            .to_str()
+            .is_ok_and(|origin| origin_allowed_for_local(origin, host.as_deref()));
+        if !allowed {
+            return result_response(StatusCode::FORBIDDEN, false, "Forbidden origin");
+        }
+    }
+    next.run(req).await
 }
 
 async fn route_group_guard(
@@ -1310,8 +1412,15 @@ pub(crate) async fn jsonrpc(
 pub(crate) async fn jsonrpc_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| async move {
         let events = state.host.subscribe_task_events();
-        let token = state.config.token.get();
-        run_session(socket, state.host.as_ref(), &token, events).await;
+        let config = state.config.clone();
+        run_session(
+            socket,
+            state.host.as_ref(),
+            &config.token,
+            || config.route_enabled(RouteGroup::JsonRpc),
+            events,
+        )
+        .await;
     })
 }
 
@@ -1439,8 +1548,16 @@ pub(crate) async fn api_create_task(
             );
         }
     };
-    if req.url.trim().is_empty() {
-        return result_response(StatusCode::BAD_REQUEST, false, "url is required");
+    let has_torrent = req
+        .torrent_b64
+        .as_deref()
+        .is_some_and(|b| !b.trim().is_empty());
+    if req.url.trim().is_empty() && !has_torrent {
+        return result_response(
+            StatusCode::BAD_REQUEST,
+            false,
+            "url or torrentB64 is required",
+        );
     }
     match state.host.create_task(req).await {
         Ok(task_id) => Json(CreatedTask { task_id }).into_response(),
@@ -2185,9 +2302,6 @@ pub(crate) async fn api_validate_rss_feed(
 // 插件系统管理端点（/api/v1/plugins*，全强制 token）
 // ---------------------------------------------------------------------------
 
-/// 插件 zip 上传上限（10MB）。
-const MAX_PLUGIN_ZIP: usize = 10 * 1024 * 1024;
-
 /// 列出全部已安装插件。
 #[utoipa::path(get, path = "/api/v1/plugins", tag = "plugins",
     responses(
@@ -2209,7 +2323,7 @@ pub(crate) async fn api_list_plugins(
     }
 }
 
-/// 从 zip 安装插件（≤10MB）。
+/// 从 zip 安装插件（≤4MB，受全局请求体上限约束）。
 #[utoipa::path(post, path = "/api/v1/plugins/install", tag = "plugins",
     responses(
         (status = 200, description = "安装成功", body = fluxdown_protocol::daemon::InstalledPlugin),
@@ -2225,13 +2339,6 @@ pub(crate) async fn api_install_plugin(
 ) -> Response {
     if let Err(resp) = guard(&state, &headers) {
         return *resp;
-    }
-    if body.len() > MAX_PLUGIN_ZIP {
-        return result_response(
-            StatusCode::BAD_REQUEST,
-            false,
-            "plugin zip too large (>10MB)",
-        );
     }
     match state.host.install_plugin_zip(body.to_vec()).await {
         Ok(identity) => installed_response(&state, identity).await,

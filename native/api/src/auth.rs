@@ -3,12 +3,18 @@
 //! ## 安全模型（继承自原 http_takeover 模块，逐条保留）
 //!
 //! 1. **仅监听 `127.0.0.1`**（硬编码，永不监听 `0.0.0.0`），外网不可达。
-//! 2. **自定义请求头门禁**：变更类接管端点 `/download`、`/download/batch` 要求
-//!    请求带 `X-FluxDown-Client` 头。恶意网页用 `fetch()` 跨域携带自定义头会触发
-//!    CORS 预检（OPTIONS），而本服务**不返回** `Access-Control-Allow-Origin`，
-//!    预检失败 → 浏览器拦截真实请求。油猴 `GM_xmlhttpRequest` 不受 CORS 约束、
-//!    可自由设置该头，故脚本正常工作、恶意网页被挡。**用户可显式开启
-//!    `local_server_cors_allow_all` 放弃这道防线**（默认关；见
+//! 2. **浏览器来源门禁**：变更类接管端点 `/download`、`/download/batch` 要求
+//!    请求带 `X-FluxDown-Client` 头，恶意网页跨域携带自定义头会触发 CORS 预检
+//!    （OPTIONS），而本服务**不返回** `Access-Control-Allow-Origin`，预检失败 →
+//!    浏览器拦截真实请求。但 `/jsonrpc` 的 `text/plain` POST 是 CORS 简单请求、
+//!    WebSocket 也不受 CORS 约束，预检挡不住它们，因此 `/jsonrpc`（POST 与 WS
+//!    升级）与 `/download*` 额外在服务端校验 `Origin`：带 `Origin` 的请求仅放行
+//!    浏览器扩展源（`chrome-extension://` / `moz-extension://` /
+//!    `safari-web-extension://`）与同源请求，其余一律 403；不带 `Origin` 的非
+//!    浏览器客户端（油猴 `GM_xmlhttpRequest`、CLI、aria2 客户端）不受影响。
+//!    桌面仅回环监听时还校验 `Host` 属于 `127.0.0.1` / `localhost` / `[::1]`，
+//!    防 DNS 重绑定；局域网 / 服务器模式不做 Host 限制。**用户可显式开启
+//!    `local_server_cors_allow_all` 放弃来源门禁**（默认关；见
 //!    `ApiServerConfig::cors_allow_all`）——那些把「aria2 探活」写死成浏览器
 //!    `fetch` 的网站需要它，代价是任意网页都能探测并提交下载，此时只剩
 //!    第 4/5/6 条防护。
@@ -18,8 +24,10 @@
 //!    `X-FluxDown-Token` 头，常量时间比较，作纵深防御。
 //! 5. **管理 API 强制 token**：`/api/v1/*` 在 token 为空时一律拒绝（403），
 //!    非空时要求 `Authorization: Bearer <token>` 或 `X-FluxDown-Token` 匹配。
-//! 6. **最终安全网**：接管/aria2 入口的下载都会在 FluxDown 中弹出确认框，
-//!    杜绝静默下载；管理 API 由强制 token 保护。
+//! 6. **最终安全网**：仅脚本接管入口（`/download*`）的下载会在 FluxDown 中
+//!    弹出确认框；aria2 `/jsonrpc` 与管理 API 直接建任务、**不弹确认框**，
+//!    分别由第 2 条的来源门禁与第 4/5 条的 token 保护；token 为空时
+//!    `aria2.changeGlobalOption` 拒绝修改 `dir`。
 //!
 //! ## token 的存放形态
 //!

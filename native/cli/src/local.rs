@@ -8,7 +8,6 @@
 //! BT 下全部文件）；进度经 [`progress_reporter`] 排空并落 DB（不排空会因通道背压卡死）。
 
 use std::collections::HashSet;
-use std::path::Path;
 use std::sync::Arc;
 
 use fluxdown_cli::client::ClientError;
@@ -19,7 +18,7 @@ use fluxdown_engine::db::{Db, DbError};
 use fluxdown_engine::download_manager::{NewTaskSpec, progress_reporter};
 use fluxdown_engine::events::EventSink;
 use fluxdown_engine::proxy_config::ProxyConfig;
-use fluxdown_engine::{Engine, EngineConfig, EngineError, NoopSelection, NoopSink};
+use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
 
 use crate::AddArgs;
 
@@ -51,10 +50,21 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
         ));
     }
 
-    // 2) 数据目录 + 落盘目录（优先级：-d > 共享库 default_save_dir 配置 > 当前工作目录）。
+    // 2) 数据目录 + 写入者租约 + 落盘目录（优先级：-d > 共享库 default_save_dir 配置 > 当前工作目录）。
+    //    必须先取得租约再打开库：Db::open 会在运行中的 App/daemon 的库上执行 schema 初始化。
     let data_dir =
         resolve_data_dir(None).map_err(|e| ClientError::new(e.to_string(), ExitCode::Unknown))?;
-    let save_dir = resolve_save_dir(args.dir.clone(), &data_dir).await?;
+    let (db, write_guard) = Db::open_exclusive(&data_dir).await.map_err(|e| match e {
+        DbError::WriterLeaseHeld(lock_path) => ClientError::new(
+            format!(
+                "data dir is in use by another FluxDown engine (lock: {lock_path}). \
+                 Quit the running app / daemon / server first, or drop --local to talk to it over HTTP."
+            ),
+            ExitCode::BadRequest,
+        ),
+        other => ClientError::new(other.to_string(), ExitCode::Unknown),
+    })?;
+    let save_dir = resolve_save_dir(args.dir.clone(), &db).await?;
 
     // 3) 构造引擎（NoopSink/NoopSelection：无 UI 交互，HLS 取最高码率、BT 全下）。
     let sink: Arc<dyn EventSink> = Arc::new(NoopSink);
@@ -70,18 +80,9 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
         data_dir_override: None,
         database_url: None,
     };
-    let mut engine = Engine::new(cfg, sink.clone(), Arc::new(NoopSelection))
+    let mut engine = Engine::from_db(cfg, db, write_guard, sink.clone(), Arc::new(NoopSelection))
         .await
-        .map_err(|e| match e {
-            EngineError::Db(DbError::WriterLeaseHeld(lock_path)) => ClientError::new(
-                format!(
-                    "data dir is in use by another FluxDown engine (lock: {lock_path}). \
-                     Quit the running app / daemon / server first, or drop --local to talk to it over HTTP."
-                ),
-                ExitCode::BadRequest,
-            ),
-            other => ClientError::new(other.to_string(), ExitCode::Unknown),
-        })?;
+        .map_err(|e| ClientError::new(e.to_string(), ExitCode::Unknown))?;
 
     // 排空进度通道：段协调器每 ~200ms 阻塞 send，通道满（容量 8192）会卡死下载。
     // 复刻 server/hub 的 progress_reporter 接线（顺带把 downloaded_bytes 落 DB）。
@@ -98,6 +99,7 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
         .ok_or_else(|| ClientError::new("engine done channel unavailable", ExitCode::Unknown))?;
 
     // 4) 逐 URL 建任务；仅成功者（create_task 返 Some）进入等待集合。
+    let multi = urls.len() > 1;
     let mut created_ids: Vec<String> = Vec::with_capacity(urls.len());
     let mut first_err: Option<ClientError> = None;
     for url in &urls {
@@ -106,7 +108,11 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
             .create_task(NewTaskSpec {
                 url: url.clone(),
                 save_dir: save_dir.clone(),
-                file_name: args.out.clone().unwrap_or_default(),
+                file_name: if multi {
+                    String::new()
+                } else {
+                    args.out.clone().unwrap_or_default()
+                },
                 segments: args.segments.unwrap_or(0),
                 cookies: args.cookies.clone().unwrap_or_default(),
                 referrer: args.referrer.clone().unwrap_or_default(),
@@ -197,14 +203,11 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
 /// 解析落盘目录：`-d` > 共享库 `default_save_dir` 配置（与 App/server 一致）> 当前工作目录。
 ///
 /// 引擎对空 `save_dir` 无回退（直接 `PathBuf::from`），故 CLI 侧显式解析一个非空目录。
-async fn resolve_save_dir(dir_arg: Option<String>, data_dir: &Path) -> Result<String, ClientError> {
+/// `db` 必须是已持有写入者租约的句柄，避免在别的引擎正在使用的库上执行 schema 初始化。
+async fn resolve_save_dir(dir_arg: Option<String>, db: &Db) -> Result<String, ClientError> {
     let mut save_dir = dir_arg.unwrap_or_default();
     if save_dir.trim().is_empty() {
-        // boot_db 仅用于读共享库配置（与 server 引导同法；双池 SQLite WAL 安全）。
-        let boot_db = Db::open(data_dir)
-            .await
-            .map_err(|e| ClientError::new(e.to_string(), ExitCode::Unknown))?;
-        save_dir = boot_db
+        save_dir = db
             .get_config("default_save_dir")
             .await
             .ok()

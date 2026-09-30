@@ -601,13 +601,13 @@ async fn cmd_list(client: &ApiClient, a: ListArgs, json: bool) -> Result<(), Cli
         return Ok(());
     }
     println!(
-        "{:<10}  {:<12}  {:>7}  {:>11}  NAME",
+        "{:<36}  {:<12}  {:>7}  {:>11}  NAME",
         "ID", "STATUS", "PROG", "SIZE"
     );
     for t in &tasks {
         println!(
-            "{:<10}  {:<12}  {:>7}  {:>11}  {}",
-            truncate(&t.task_id, 10),
+            "{:<36}  {:<12}  {:>7}  {:>11}  {}",
+            t.task_id,
             status_name(t.status),
             percent(t.downloaded_bytes, t.total_bytes),
             human_bytes(t.total_bytes),
@@ -702,7 +702,7 @@ async fn cmd_queue(client: &ApiClient, json: bool) -> Result<(), ClientError> {
         };
         println!(
             "{:<16}  {:<20}  {:>8}  {:>10}  {:>10}  {:>8}  {:<11}",
-            truncate(&q.queue_id, 16),
+            q.queue_id,
             truncate(&q.name, 20),
             state,
             limit,
@@ -746,7 +746,7 @@ async fn cmd_rss_list(client: &ApiClient, json: bool) -> Result<(), ClientError>
         return Ok(());
     }
     println!(
-        "{:<16}  {:<32}  {:>6}  {:>6}  STATE",
+        "{:<36}  {:<32}  {:>6}  {:>6}  STATE",
         "ID", "NAME", "EVERY", "UNREAD"
     );
     for s in &sources {
@@ -758,8 +758,8 @@ async fn cmd_rss_list(client: &ApiClient, json: bool) -> Result<(), ClientError>
             fluxdown_engine::rss::model::DEFAULT_INTERVAL_MINUTES
         };
         println!(
-            "{:<16}  {:<32}  {:>6}  {:>6}  {}",
-            truncate(&s.source_id, 16),
+            "{:<36}  {:<32}  {:>6}  {:>6}  {}",
+            s.source_id,
             truncate(if s.name.is_empty() { &s.url } else { &s.name }, 32),
             format!("{minutes}m"),
             s.unread_count,
@@ -886,7 +886,7 @@ async fn cmd_watch(client: &ApiClient, a: WatchArgs) -> Result<(), ClientError> 
             return Ok(());
         }
         println!(
-            "{:<10}  {:<12}  {:>7}  {:>11}  NAME",
+            "{:<36}  {:<12}  {:>7}  {:>11}  NAME",
             "ID", "STATUS", "PROG", "SIZE"
         );
         let mut all_done = true;
@@ -895,8 +895,8 @@ async fn cmd_watch(client: &ApiClient, a: WatchArgs) -> Result<(), ClientError> 
                 all_done = false;
             }
             println!(
-                "{:<10}  {:<12}  {:>7}  {:>11}  {}",
-                truncate(&t.task_id, 10),
+                "{:<36}  {:<12}  {:>7}  {:>11}  {}",
+                t.task_id,
                 status_name(t.status),
                 percent(t.downloaded_bytes, t.total_bytes),
                 human_bytes(t.total_bytes),

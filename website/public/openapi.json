@@ -1265,7 +1265,7 @@
         "tags": [
           "plugins"
         ],
-        "summary": "从 zip 安装插件（≤10MB）。",
+        "summary": "从 zip 安装插件（≤4MB，受全局请求体上限约束）。",
         "operationId": "api_install_plugin",
         "responses": {
           "200": {

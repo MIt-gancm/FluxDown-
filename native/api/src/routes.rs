@@ -55,7 +55,7 @@ pub const API_SITE_AUTH_SITE: &str = "/api/v1/site-auth/{site}";
 
 /// 插件集合（GET 列表）。
 pub const API_PLUGINS: &str = "/api/v1/plugins";
-/// 安装插件（POST zip bytes，≤10MB）。
+/// 安装插件（POST zip bytes，≤4MB，受全局请求体上限约束）。
 pub const API_PLUGINS_INSTALL: &str = "/api/v1/plugins/install";
 /// 安装 dev 插件（POST {dirPath}）。
 pub const API_PLUGINS_INSTALL_DEV: &str = "/api/v1/plugins/install-dev";

@@ -116,7 +116,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "download_list",
-            "description": "List download tasks with their progress, speed, size and status. Returns `{ tasks, count }`. Call this first to discover task IDs before using any per-task tool.",
+            "description": "List download tasks with their progress, size and status. Returns `{ tasks, count }`. Call this first to discover task IDs before using any per-task tool.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
