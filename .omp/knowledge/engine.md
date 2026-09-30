@@ -71,7 +71,8 @@
   免 VDL 零填充写放大）。完成期全量重哈希只在 fastresume 污点时执行（add 时
   存在既有 `.bitv` / 经缓存句柄跨暂停恢复 / 完成重试）；无污点任务的 have-bits
   全部有磁盘依据（全量初检读盘 / Live 写盘后读回校验），完成即时。
-- **ED2K**：eDonkey2000 纯 leech。源发现 = 服务器 `GETSOURCES`（手动 `ed2k_server_list` + 订阅 `server.met` 缓存）+ Kad DHT 兜底 + UPnP-IGD 争 HighID + LowID 回调中继。逐块 MD4 + hashset 自校验（违规拉黑 peer）；分块 MD4 root hash（PART_SIZE=9.28MB，幻影尾处理）。进程级共享 `Ed2kClient` 持久服务器会话。
+- **ED2K**：eDonkey2000 纯 leech。源发现 = 服务器 `GETSOURCES`（手动 `ed2k_server_list` + 订阅 `server.met` 缓存）+ Kad DHT 兜底 + UPnP-IGD 争 HighID + LowID 回调中继。逐块 MD4 + hashset 自校验（违规拉黑 peer）；分块 MD4 root hash（PART_SIZE=9.28MB，幻影尾处理）。进程级共享 `Ed2kClient` 持久服务器会话：读循环处理 IDCHANGE/EOF；`OP_CALLBACK_FAIL` 不带 client_id，按服务器顺序立即失败最早的待决回调；有活跃 ED2K 任务时断线后台重连（1→30s 指数退避封顶），无活跃任务不重连，不发协议外心跳。链接大小上限 256 GiB；建块/预分配前做磁盘余量预检（不足即失败、不建文件与块行）。块状态以内存快照为准供 200ms 上报读取，DB 只在启动恢复与终验坏块时全量读；块完成按批事务落库，且数据 `sync_data` 与 hashset 落库先于 verified 标记提交。
+- **HTTP 临时文件独占**：多段与单流写临时文件前按规范化路径（Windows 忽略大小写）取进程内 RAII 独占；同一下载运行的嵌套调用与 worker 共享，另一任务撞同一路径时以 `DownloadError::Io(WouldBlock)` 失败进入错误态，不截断/覆盖对方数据，占用方结束后可重试。
 
 ### 引擎子系统（一句话职责）
 - `download_manager.rs`（~7300 行）：任务生命周期、并发、队列（内置 + 命名，启停/每日定时边沿触发/顺序）、任务组、自动重试、协议分发、off-actor 插件解析插桩、速度平滑（EMA α=0.4，1s 采样窗）、WAL checkpoint。

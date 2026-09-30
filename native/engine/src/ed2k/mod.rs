@@ -116,9 +116,135 @@ const KAD_FIND_TIMEOUT: Duration = Duration::from_secs(45);
 /// 旁路进度上报周期。
 const PROGRESS_TICK: Duration = Duration::from_millis(200);
 
+/// 块完成标记在数据同步并提交数据库之后发布给内存快照。
+struct BlockSnapshot {
+    verified: Vec<bool>,
+    verified_bytes: i64,
+}
+
+impl BlockSnapshot {
+    fn from_rows(total: u64, part_size: u64, rows: &[(u64, i64, i64, i64)]) -> Self {
+        let mut snapshot = Self {
+            verified: vec![false; hash::part_count(total, part_size) as usize],
+            verified_bytes: 0,
+        };
+        for &(index, state, _, _) in rows {
+            if state == BLOCK_VERIFIED {
+                snapshot.set_verified(index, true, total, part_size);
+            }
+        }
+        snapshot
+    }
+
+    fn set_verified(&mut self, index: u64, verified: bool, total: u64, part_size: u64) {
+        if let Some(old) = self.verified.get_mut(index as usize)
+            && *old != verified
+        {
+            let (start, end) = hash::part_span(index, total, part_size);
+            let bytes = (end - start) as i64;
+            self.verified_bytes += if verified { bytes } else { -bytes };
+            *old = verified;
+        }
+    }
+
+    fn pending(&self) -> VecDeque<u64> {
+        self.verified
+            .iter()
+            .enumerate()
+            .filter_map(|(index, verified)| (!*verified).then_some(index as u64))
+            .collect()
+    }
+}
+
+fn check_download_space(available: Option<u64>, required: u64) -> Result<(), DownloadError> {
+    if required != 0
+        && let Some(available) = available
+        && available < required.saturating_add(crate::disk_space::PRECHECK_MARGIN)
+    {
+        return Err(DownloadError::Ed2k(format!(
+            "insufficient disk space for ED2K download: need {required}B + {}B safety margin, have {available}B",
+            crate::disk_space::PRECHECK_MARGIN
+        )));
+    }
+    Ok(())
+}
+
+async fn persist_verified_blocks(
+    db: &crate::db::Db,
+    task_id: &str,
+    temp: &Path,
+    blocks: &[(u64, i64, i64, bool)],
+    hashset: Option<&[[u8; 16]]>,
+) -> Result<(), DownloadError> {
+    // 数据先持久化，恢复时才能信任随后提交的 verified 标记。
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(temp)
+        .await
+        .map_err(DownloadError::Io)?;
+    file.sync_data().await.map_err(DownloadError::Io)?;
+    if let Some(hashset) = hashset {
+        let blob: Vec<u8> = hashset.iter().flatten().copied().collect();
+        db.save_ed2k_hashset(task_id, &blob).await?;
+    }
+    db.update_ed2k_blocks(task_id, blocks).await?;
+    Ok(())
+}
+
+fn remaining_disk_bytes(total: u64, verified: u64, allocated: Option<u64>) -> u64 {
+    total.saturating_sub(verified.max(allocated.unwrap_or(0)))
+}
+
+async fn prepare_temp_and_blocks(
+    db: &crate::db::Db,
+    task_id: &str,
+    temp: &Path,
+    total_bytes: u64,
+    part_size: u64,
+    available: Option<u64>,
+) -> Result<BlockSnapshot, DownloadError> {
+    let temp_ok = matches!(tokio::fs::metadata(temp).await, Ok(m) if m.len() == total_bytes);
+    let resume_rows = if temp_ok {
+        db.load_ed2k_blocks(task_id).await?
+    } else {
+        Vec::new()
+    };
+    let snapshot = BlockSnapshot::from_rows(total_bytes, part_size, &resume_rows);
+    // 已分配空间可以原地复用；查询失败时只抵扣可靠的已校验块。
+    let allocated =
+        if temp_ok && available.is_some() && snapshot.verified_bytes as u64 != total_bytes {
+            let temp = temp.to_path_buf();
+            let query = tokio::task::spawn_blocking(move || {
+                let file = std::fs::File::open(temp).ok()?;
+                fs2::FileExt::allocated_size(&file).ok()
+            });
+            match tokio::time::timeout(Duration::from_secs(3), query).await {
+                Ok(Ok(bytes)) => bytes,
+                _ => None,
+            }
+        } else {
+            None
+        };
+    check_download_space(
+        available,
+        remaining_disk_bytes(total_bytes, snapshot.verified_bytes as u64, allocated),
+    )?;
+    if !temp_ok {
+        // 先清除旧标记，再重建文件，避免中途退出留下指向空洞的 verified 状态。
+        db.reset_ed2k_blocks(task_id).await?;
+        let file = tokio::fs::File::create(temp)
+            .await
+            .map_err(DownloadError::Io)?;
+        file.set_len(total_bytes).await.map_err(DownloadError::Io)?;
+    }
+    db.init_ed2k_blocks(task_id, hash::part_count(total_bytes, part_size))
+        .await?;
+    Ok(snapshot)
+}
+
 /// ED2K 下载编排入口（签名同 `run_ftp_download`：接受 [`DownloadParams`] 单参）。
 ///
-/// 流程：解析链接 → 预分配 temp → 加载/初始化块状态 → 起旁路进度任务 →
+/// 流程：解析链接 → 磁盘余量预检 → 恢复/初始化块快照 → 起旁路进度任务 →
 /// 外层调度状态机（找源 / 并发拉块 / 逐块 MD4 / 完整性拉黑）→ 终验读盘
 /// 重算锚定 root → `sync_all`+`rename`。旁路进度任务在任一退出路径 `abort()`。
 pub async fn run_ed2k_download(params: DownloadParams) {
@@ -192,7 +318,6 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
     let total_bytes = link.total_bytes;
     let part_size = hash::PART_SIZE;
     let large_file = total_bytes > hash::OLD_MAX_FILE_SIZE;
-    let block_count = hash::part_count(total_bytes, part_size);
     let is_single = hash::is_single_block(total_bytes, part_size);
     let task_id = params.task_id.clone();
 
@@ -220,27 +345,19 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
     }
     let temp_path = save_dir.join(format!("{file_name}{}", crate::downloader::TEMP_EXT));
 
-    let temp_ok = matches!(
-        tokio::fs::metadata(&temp_path).await,
-        Ok(m) if m.len() == total_bytes
-    );
-    if temp_ok {
-        params.db.init_ed2k_blocks(&task_id, block_count).await?;
-    } else {
-        output::ensure_parent(&temp_path).await?;
-        let file = tokio::fs::File::create(&temp_path)
-            .await
-            .map_err(DownloadError::Io)?;
-        file.set_len(total_bytes).await.map_err(DownloadError::Io)?;
-        drop(file);
-        params.db.init_ed2k_blocks(&task_id, block_count).await?;
-        for i in 0..block_count {
-            params
-                .db
-                .update_ed2k_block(&task_id, i, BLOCK_MISSING, 0, false)
-                .await?;
-        }
-    }
+    output::ensure_parent(&temp_path).await?;
+    let available = crate::disk_space::available_space_checked(save_dir.to_path_buf()).await;
+    let blocks = Arc::new(StdMutex::new(
+        prepare_temp_and_blocks(
+            &params.db,
+            &task_id,
+            &temp_path,
+            total_bytes,
+            part_size,
+            available,
+        )
+        .await?,
+    ));
 
     if total_bytes == 0 {
         if link.root_hash != hash::MD4_EMPTY {
@@ -309,7 +426,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
     let connected = TransferTracker::new();
     let concurrency_limit = Arc::new(AtomicU32::new(0));
     let progress_guard = AbortOnDrop(spawn_progress_reporter(ProgressReporterContext {
-        db: params.db.clone(),
+        blocks: Arc::clone(&blocks),
         progress_tx: params.progress_tx.clone(),
         task_id: task_id.clone(),
         total_bytes,
@@ -354,6 +471,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
         enable_upnp,
         enable_kad,
     });
+    let _active_task = client.begin_task();
     // Kad bootstrap 节点（nodes.dat，base64 缓存，由 hub 后台刷新）。
     let nodes_dat: Vec<u8> = if enable_kad {
         use base64::Engine as _;
@@ -377,21 +495,21 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
     let mut strikes: HashMap<u64, u32> = HashMap::new();
     let mut finalize_retries: u32 = 0;
     let mut round_robin: usize = 0;
+    let mut hashset_persisted = false;
 
     let outcome: Result<i64, DownloadError> = 'outer: loop {
-        let blocks = match params.db.load_ed2k_blocks(&task_id).await {
-            Ok(b) => b,
-            Err(e) => break 'outer Err(e.into()),
+        let mut pending = match blocks.lock() {
+            Ok(snapshot) => snapshot.pending(),
+            Err(_) => break 'outer Err(DownloadError::Ed2k("block snapshot lock poisoned".into())),
         };
-        let mut pending: VecDeque<u64> = blocks
-            .iter()
-            .filter(|(_, state, _, _)| *state != BLOCK_VERIFIED)
-            .map(|(idx, _, _, _)| *idx)
-            .collect();
         if pending.is_empty() {
             match finalize_and_verify(&params.db, &task_id, &temp_path, &link, part_size).await {
                 Ok(()) => break 'outer Ok(total_bytes as i64),
                 Err(DownloadError::Ed2kIntegrity(_)) if finalize_retries < FINALIZE_MAX_RETRIES => {
+                    let rows = params.db.load_ed2k_blocks(&task_id).await?;
+                    *blocks.lock().map_err(|_| {
+                        DownloadError::Ed2k("block snapshot lock poisoned".into())
+                    })? = BlockSnapshot::from_rows(total_bytes, part_size, &rows);
                     finalize_retries += 1;
                     if let Err(journal_error) = crate::task_activity::record(&params.db, params.sink.as_ref(), &task_id, "retry", format!("ED2K 完整性校验失败，重下坏块（第 {finalize_retries}/{FINALIZE_MAX_RETRIES} 轮）"), None).await {
                         crate::log_error!("[task-activity] failed to persist retry: {}", journal_error);
@@ -409,8 +527,10 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
         let concurrency = ed2k_concurrency(params.segment_count, pending.len());
         concurrency_limit.store(concurrency as u32, Ordering::Relaxed);
         let mut join: JoinSet<BlockJoinResult> = JoinSet::new();
+        let mut ready = Vec::with_capacity(concurrency);
+        let mut updates = Vec::with_capacity(concurrency);
 
-        let inner: Result<(), DownloadError> = loop {
+        let inner: Result<(), DownloadError> = 'download: loop {
             if params.cancel_token.is_cancelled() {
                 break Err(DownloadError::Cancelled);
             }
@@ -612,44 +732,75 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                 () = params.cancel_token.cancelled() => break Err(DownloadError::Cancelled),
                 j = join.join_next() => j,
             };
-            if let Some(joined) = joined_next {
-                let (bi, src, res) = match joined {
-                    Ok(v) => v,
-                    Err(_) => continue,
+            let Some(joined) = joined_next else { continue };
+            // 不额外等待时间窗：合并此刻已完成的块，立即同步数据并提交。
+            ready.extend(
+                std::iter::once(joined)
+                    .chain(std::iter::from_fn(|| join.try_join_next()))
+                    .filter_map(Result::ok)
+                    .map(|(index, source, result)| {
+                        let checked = result.map(|md4| {
+                            if is_single {
+                                md4 == link.root_hash
+                            } else {
+                                hashset_cache
+                                    .get()
+                                    .and_then(|hashes| hashes.get(index as usize))
+                                    == Some(&md4)
+                            }
+                        });
+                        (index, source, checked)
+                    }),
+            );
+            updates.clear();
+            updates.extend(ready.iter().filter_map(|(index, _, result)| {
+                if matches!(result, Ok(true)) {
+                    let (start, end) = hash::part_span(*index, total_bytes, part_size);
+                    Some((*index, BLOCK_VERIFIED, (end - start) as i64, false))
+                } else {
+                    None
+                }
+            }));
+            if !updates.is_empty() {
+                let hashset = if is_single || hashset_persisted {
+                    None
+                } else {
+                    hashset_cache.get().map(Vec::as_slice)
                 };
-                // Old partial bytes are not a live connection and are not safe resume state.
+                if let Err(error) =
+                    persist_verified_blocks(&params.db, &task_id, &temp_path, &updates, hashset)
+                        .await
+                {
+                    break Err(error);
+                }
+                hashset_persisted = true;
+                match blocks.lock() {
+                    Ok(mut snapshot) => {
+                        for &(index, _, _, _) in &updates {
+                            snapshot.set_verified(index, true, total_bytes, part_size);
+                        }
+                    }
+                    Err(_) => {
+                        break Err(DownloadError::Ed2k("block snapshot lock poisoned".into()));
+                    }
+                }
+            }
+            for (bi, src, res) in ready.drain(..) {
+                // 未校验的部分字节不作为恢复状态。
                 if let Ok(mut map) = progress.lock() {
                     map.remove(&bi);
                 }
                 match res {
-                    Ok(md4) => {
-                        let ok = if is_single {
-                            md4 == link.root_hash
-                        } else {
-                            hashset_cache.get().and_then(|h| h.get(bi as usize)) == Some(&md4)
-                        };
-                        if ok {
-                            let (bs, be) = hash::part_span(bi, total_bytes, part_size);
-                            let _ = params
-                                .db
-                                .update_ed2k_block(
-                                    &task_id,
-                                    bi,
-                                    BLOCK_VERIFIED,
-                                    (be - bs) as i64,
-                                    false,
-                                )
-                                .await;
-                            if !is_single && let Some(h) = hashset_cache.get() {
-                                let blob: Vec<u8> = h.iter().flatten().copied().collect();
-                                let _ = params.db.save_ed2k_hashset(&task_id, &blob).await;
-                            }
-                        } else {
+                    Ok(ok) => {
+                        if !ok {
                             // 块 MD4 不匹配 = 投毒/损坏 → 拉黑该源，块重下。
-                            let _ = params
+                            if let Err(error) = params
                                 .db
-                                .update_ed2k_block(&task_id, bi, BLOCK_MISSING, 0, true)
-                                .await;
+                                .update_ed2k_blocks(&task_id, &[(bi, BLOCK_MISSING, 0, true)])
+                                .await
+                            {
+                                break 'download Err(error.into());
+                            }
                             pending.push_back(bi);
                             if strikes.get(&bi).copied().unwrap_or(0) + 1 < BLOCK_MAX_RETRIES
                                 && let Err(journal_error) = crate::task_activity::record(
@@ -670,7 +821,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                             *strikes.entry(bi).or_insert(0) += 1;
                             integrity_bl.insert(src);
                             if strikes.get(&bi).copied().unwrap_or(0) >= BLOCK_MAX_RETRIES {
-                                break Err(DownloadError::Ed2kIntegrity(format!(
+                                break 'download Err(DownloadError::Ed2kIntegrity(format!(
                                     "block {bi} irrecoverable after {BLOCK_MAX_RETRIES} tries"
                                 )));
                             }
@@ -678,12 +829,9 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                     }
                     Err(source) => {
                         if matches!(source, DownloadError::Cancelled) {
-                            break Err(DownloadError::Cancelled);
+                            break 'download Err(DownloadError::Cancelled);
                         }
-                        let _ = params
-                            .db
-                            .update_ed2k_block(&task_id, bi, BLOCK_MISSING, 0, false)
-                            .await;
+                        // 未校验的部分数据不作为恢复状态，不重复写入 missing。
                         pending.push_back(bi);
                         // 对端位图声明缺该块：只对（源, 块）退避，不牵连其它块，
                         // 也不刷重试日志。
@@ -786,8 +934,7 @@ async fn persist_final_name(
     }
 }
 
-/// 进度旁路任务的 RAII 守卫：无论外层 future 正常返回、出错、panic 还是被
-/// `abort()`，drop 时都终止旁路任务，避免为已删除的任务继续查库并上报。
+/// 进度旁路任务的 RAII 守卫：任何退出路径都终止内存快照上报。
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -824,12 +971,40 @@ fn pick_source(
     None
 }
 
-/// 旁路进度任务：周期读 progress 快照 + 块状态计数，上报 [`ProgressUpdate`]。
-///
-/// 取锁窄作用域（`lock→clone→释放`），锁释放后才 `.await` DB，Future 保持 `Send`。
-/// 返回的 `JoinHandle` 须交给 [`AbortOnDrop`]，保证任何退出路径都会终止它。
+/// 旁路进度任务：只读内存快照，保留完整分段 wire 以兼容现有客户端。
+/// 锁释放后再发送，Future 保持 Send。
+/// 已校验块优先于残留的实时字节，避免完成交接时重复计数。
+fn snapshot_progress(
+    blocks: &BlockSnapshot,
+    live: &HashMap<u64, i64>,
+    total_bytes: u64,
+    part_size: u64,
+    tracker: &TransferTracker,
+) -> (i64, Vec<SegmentProgressInfo>) {
+    let mut downloaded = blocks.verified_bytes;
+    let mut details = Vec::with_capacity(blocks.verified.len());
+    for (index, verified) in blocks.verified.iter().enumerate() {
+        let (start, end) = hash::part_span(index as u64, total_bytes, part_size);
+        let bytes = if *verified {
+            (end - start) as i64
+        } else {
+            let bytes = live.get(&(index as u64)).copied().unwrap_or(0);
+            downloaded += bytes;
+            bytes
+        };
+        details.push(SegmentProgressInfo {
+            index: index as i32,
+            start_byte: start as i64,
+            end_byte: end as i64 - 1,
+            downloaded_bytes: bytes,
+            active: Some(tracker.is_active(index as i32)),
+        });
+    }
+    (downloaded, details)
+}
+
 struct ProgressReporterContext {
-    db: crate::db::Db,
+    blocks: Arc<StdMutex<BlockSnapshot>>,
     progress_tx: tokio::sync::mpsc::Sender<ProgressUpdate>,
     task_id: String,
     total_bytes: u64,
@@ -843,7 +1018,7 @@ struct ProgressReporterContext {
 fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let ProgressReporterContext {
-            db,
+            blocks,
             progress_tx,
             task_id,
             total_bytes,
@@ -857,36 +1032,13 @@ fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::Joi
             tokio::time::sleep(PROGRESS_TICK).await;
             let sample_sequence = crate::transfer_activity::next_sample_sequence();
             let sampled_at_ms = chrono::Utc::now().timestamp_millis();
-            let snapshot: Vec<(u64, i64)> = {
-                let Ok(g) = progress.lock() else { continue };
-                g.iter().map(|(k, v)| (*k, *v)).collect()
-            };
-            let Ok(blocks) = db.load_ed2k_blocks(&task_id).await else {
-                continue;
-            };
-            let mut downloaded: i64 = 0;
-            let mut segment_details = Vec::new();
-            for (idx, state, _dl, _rt) in &blocks {
-                let (bs, be) = hash::part_span(*idx, total_bytes, part_size);
-                let block_len = (be - bs) as i64;
-                let live = if *state == BLOCK_VERIFIED {
-                    block_len
-                } else {
-                    snapshot
-                        .iter()
-                        .find(|(k, _)| k == idx)
-                        .map(|(_, v)| *v)
-                        .unwrap_or(0)
+            let (downloaded, segment_details) = {
+                let Ok(snapshot) = blocks.lock() else {
+                    continue;
                 };
-                downloaded += live;
-                segment_details.push(SegmentProgressInfo {
-                    index: *idx as i32,
-                    start_byte: bs as i64,
-                    end_byte: be as i64 - 1,
-                    downloaded_bytes: live,
-                    active: Some(tracker.is_active(*idx as i32)),
-                });
-            }
+                let Ok(live) = progress.lock() else { continue };
+                snapshot_progress(&snapshot, &live, total_bytes, part_size, &tracker)
+            };
             let runtime = TaskRuntime {
                 task_id: task_id.clone(),
                 sampled_at_ms,
@@ -992,15 +1144,15 @@ pub async fn finalize_and_verify(
     }
     let db_hashes: Vec<[u8; 16]> = blob.as_chunks::<16>().0.to_vec();
 
-    let mut bad = false;
-    for (i, (disk, expected)) in disk_hashes.iter().zip(db_hashes.iter()).enumerate() {
-        if disk != expected {
-            db.update_ed2k_block(task_id, i as u64, BLOCK_MISSING, 0, false)
-                .await?;
-            bad = true;
-        }
-    }
-    if bad {
+    let bad: Vec<_> = disk_hashes
+        .iter()
+        .zip(db_hashes.iter())
+        .enumerate()
+        .filter(|(_, (disk, expected))| disk != expected)
+        .map(|(index, _)| (index as u64, BLOCK_MISSING, 0, false))
+        .collect();
+    if !bad.is_empty() {
+        db.update_ed2k_blocks(task_id, &bad).await?;
         return Err(DownloadError::Ed2kIntegrity(
             "disk block hash mismatch".into(),
         ));
@@ -1012,10 +1164,7 @@ pub async fn finalize_and_verify(
         part_size,
     ));
     if root != link.root_hash {
-        for i in 0..part_count {
-            db.update_ed2k_block(task_id, i, BLOCK_MISSING, 0, false)
-                .await?;
-        }
+        db.reset_ed2k_blocks(task_id).await?;
         return Err(DownloadError::Ed2kIntegrity(
             "recomputed root mismatch (corrupt hashset table?)".into(),
         ));
@@ -2086,5 +2235,224 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ed2k_space_reservation_reuses_allocated_temp_bytes() {
+        assert_eq!(super::remaining_disk_bytes(100, 30, None), 70);
+        assert_eq!(super::remaining_disk_bytes(100, 30, Some(80)), 20);
+        assert_eq!(super::remaining_disk_bytes(100, 30, Some(100)), 0);
+        assert_eq!(super::remaining_disk_bytes(100, 80, Some(30)), 20);
+        assert_eq!(super::remaining_disk_bytes(100, 30, Some(128)), 0);
+    }
+
+    #[test]
+    fn ed2k_disk_precheck_covers_margin_and_unknown_space() {
+        let required = 1024;
+        let threshold = required + crate::disk_space::PRECHECK_MARGIN;
+        assert!(super::check_download_space(Some(threshold - 1), required).is_err());
+        assert!(super::check_download_space(Some(threshold), required).is_ok());
+        assert!(super::check_download_space(None, required).is_ok());
+        assert!(super::check_download_space(Some(0), 0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn ed2k_disk_shortage_creates_neither_temp_nor_block_rows() {
+        let (db, dir) = open_it_db("space_gate").await;
+        let task_id = "space-gate";
+        let total = hash::MAX_FILE_SIZE;
+        insert_it_task(&db, task_id, total).await;
+        let temp = dir.join("large.part");
+        let result =
+            super::prepare_temp_and_blocks(&db, task_id, &temp, total, hash::PART_SIZE, Some(0))
+                .await;
+        assert!(matches!(result, Err(DownloadError::Ed2k(_))));
+        assert_eq!(
+            tokio::fs::metadata(&temp)
+                .await
+                .expect_err("no temp file")
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert!(
+            db.load_ed2k_blocks(task_id)
+                .await
+                .expect("load blocks")
+                .is_empty()
+        );
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn ed2k_resume_snapshot_skips_durable_blocks_and_resets_recreated_temp() {
+        let (db, dir) = open_it_db("resume_snapshot").await;
+        let task_id = "resume-snapshot";
+        let part_size = 32;
+        let total = 65;
+        insert_it_task(&db, task_id, total).await;
+        let temp = dir.join("resume.part");
+        super::prepare_temp_and_blocks(&db, task_id, &temp, total, part_size, None)
+            .await
+            .expect("prepare");
+        let data = vec![7u8; total as usize];
+        tokio::fs::write(&temp, &data).await.expect("write data");
+        let hashes = [
+            hash::hash_part(&data[..32]),
+            hash::hash_part(&data[32..64]),
+            hash::hash_part(&data[64..]),
+        ];
+        super::persist_verified_blocks(
+            &db,
+            task_id,
+            &temp,
+            &[
+                (0, BLOCK_VERIFIED, 32, false),
+                (2, BLOCK_VERIFIED, 1, false),
+            ],
+            Some(&hashes),
+        )
+        .await
+        .expect("commit verified");
+        let restored = super::prepare_temp_and_blocks(
+            &db,
+            task_id,
+            &temp,
+            total,
+            part_size,
+            Some(32 + crate::disk_space::PRECHECK_MARGIN),
+        )
+        .await
+        .expect("resume using remaining space");
+        assert_eq!(restored.verified_bytes, 33);
+        assert_eq!(restored.pending().into_iter().collect::<Vec<_>>(), vec![1]);
+        let blob = db
+            .load_ed2k_hashset(task_id)
+            .await
+            .expect("hashset")
+            .expect("present");
+        assert_eq!(blob.as_chunks::<16>().0, &hashes);
+
+        tokio::fs::write(&temp, b"invalid-size")
+            .await
+            .expect("replace temp");
+        let reset = super::prepare_temp_and_blocks(&db, task_id, &temp, total, part_size, None)
+            .await
+            .expect("recreate");
+        assert_eq!(reset.verified_bytes, 0);
+        assert_eq!(
+            reset.pending().into_iter().collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(
+            db.load_ed2k_blocks(task_id)
+                .await
+                .expect("reset rows")
+                .iter()
+                .all(|(_, state, bytes, _)| *state == BLOCK_MISSING && *bytes == 0)
+        );
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn ed2k_sync_failure_never_persists_verified_markers() {
+        let (db, dir) = open_it_db("sync_order").await;
+        let task_id = "sync-order";
+        insert_it_task(&db, task_id, 32).await;
+        db.init_ed2k_blocks(task_id, 1).await.expect("init");
+        let result = super::persist_verified_blocks(
+            &db,
+            task_id,
+            &dir.join("missing.part"),
+            &[(0, BLOCK_VERIFIED, 32, false)],
+            Some(&[[7u8; 16]]),
+        )
+        .await;
+        assert!(matches!(result, Err(DownloadError::Io(_))));
+        assert_eq!(
+            db.load_ed2k_blocks(task_id).await.expect("blocks"),
+            vec![(0, BLOCK_MISSING, 0, 0)]
+        );
+        assert!(
+            db.load_ed2k_hashset(task_id)
+                .await
+                .expect("hashset")
+                .is_none()
+        );
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn ed2k_reporter_samples_memory_through_completion_and_invalidation() {
+        let total_bytes = 35;
+        let part_size = 32;
+        let blocks = Arc::new(StdMutex::new(super::BlockSnapshot::from_rows(
+            total_bytes,
+            part_size,
+            &[(0, BLOCK_VERIFIED, 32, 0), (1, BLOCK_MISSING, 2, 0)],
+        )));
+        let progress = empty_progress();
+        progress.lock().expect("progress").insert(1, 2);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let guard = super::AbortOnDrop(super::spawn_progress_reporter(
+            super::ProgressReporterContext {
+                blocks: Arc::clone(&blocks),
+                progress_tx: tx,
+                task_id: "memory-only".into(),
+                total_bytes,
+                part_size,
+                progress: Arc::clone(&progress),
+                tracker: crate::transfer_activity::TransferTracker::new(),
+                connected: crate::transfer_activity::TransferTracker::new(),
+                concurrency_limit: Arc::new(AtomicU32::new(2)),
+            },
+        ));
+        let sample = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("first sample")
+            .expect("sample");
+        assert_eq!(sample.downloaded_bytes, 34);
+        let details = sample.segment_details.expect("segments");
+        assert_eq!(
+            (
+                details[1].start_byte,
+                details[1].end_byte,
+                details[1].downloaded_bytes
+            ),
+            (32, 34, 2)
+        );
+        blocks
+            .lock()
+            .expect("blocks")
+            .set_verified(1, true, total_bytes, part_size);
+        let sample = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("complete sample")
+            .expect("sample");
+        assert_eq!(
+            sample.downloaded_bytes, 35,
+            "live bytes must not double-count completed blocks"
+        );
+        blocks
+            .lock()
+            .expect("blocks")
+            .set_verified(0, false, total_bytes, part_size);
+        let sample = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("invalidated sample")
+            .expect("sample");
+        assert_eq!(sample.downloaded_bytes, 3);
+        assert_eq!(
+            blocks
+                .lock()
+                .expect("blocks")
+                .pending()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        drop(guard);
     }
 }

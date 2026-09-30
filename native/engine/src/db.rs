@@ -2780,22 +2780,37 @@ impl Db {
     // ED2K blocks / hashset
     // -----------------------------------------------------------------------
 
-    /// Initialise all block rows (state=0 missing) for an ed2k task.
-    /// Idempotent per (task_id, block_index) via ON CONFLICT DO NOTHING.
+    /// Initialise missing block rows in bounded batches without overwriting resume state.
     pub async fn init_ed2k_blocks(&self, task_id: &str, block_count: u64) -> Result<(), DbError> {
         let mut tx = self.pool.begin().await?;
-        for i in 0..block_count {
-            sqlx::query(
-                "INSERT INTO ed2k_blocks (task_id, block_index, state, downloaded_bytes, retry_count)
-                 VALUES ($1, $2, 0, 0, 0)
-                 ON CONFLICT (task_id, block_index) DO NOTHING",
-            )
-            .bind(task_id)
-            .bind(i as i64)
-            .execute(&mut *tx)
-            .await?;
+        let mut first = 0_u64;
+        while first < block_count {
+            let end = first.saturating_add(256).min(block_count);
+            let values = (0..end - first)
+                .map(|i| format!("(${}, ${}, 0, 0, 0)", i * 2 + 1, i * 2 + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "INSERT INTO ed2k_blocks (task_id, block_index, state, downloaded_bytes, retry_count) VALUES {values}
+                 ON CONFLICT (task_id, block_index) DO NOTHING"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for i in first..end {
+                query = query.bind(task_id).bind(i as i64);
+            }
+            query.execute(&mut *tx).await?;
+            first = end;
         }
         tx.commit().await?;
+        Ok(())
+    }
+
+    /// Invalidated temp data must not retain verified block markers.
+    pub async fn reset_ed2k_blocks(&self, task_id: &str) -> Result<(), DbError> {
+        sqlx::query("UPDATE ed2k_blocks SET state = 0, downloaded_bytes = 0 WHERE task_id = $1")
+            .bind(task_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -2835,20 +2850,56 @@ impl Db {
         downloaded_bytes: i64,
         bump_retry: bool,
     ) -> Result<(), DbError> {
-        let sql = if bump_retry {
-            "UPDATE ed2k_blocks SET state = $1, downloaded_bytes = $2, retry_count = retry_count + 1
-             WHERE task_id = $3 AND block_index = $4"
-        } else {
-            "UPDATE ed2k_blocks SET state = $1, downloaded_bytes = $2
-             WHERE task_id = $3 AND block_index = $4"
-        };
-        sqlx::query(sql)
-            .bind(state)
-            .bind(downloaded_bytes)
-            .bind(task_id)
-            .bind(block_index as i64)
-            .execute(&self.pool)
-            .await?;
+        self.update_ed2k_blocks(
+            task_id,
+            &[(block_index, state, downloaded_bytes, bump_retry)],
+        )
+        .await
+    }
+
+    /// Commit changed blocks together; retry increments apply once per supplied row.
+    pub async fn update_ed2k_blocks(
+        &self,
+        task_id: &str,
+        blocks: &[(u64, i64, i64, bool)],
+    ) -> Result<(), DbError> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.pool.begin().await?;
+        for chunk in blocks.chunks(128) {
+            let values = (0..chunk.len())
+                .map(|i| {
+                    let p = i * 5;
+                    format!(
+                        "(${}, ${}, ${}, ${}, ${})",
+                        p + 1,
+                        p + 2,
+                        p + 3,
+                        p + 4,
+                        p + 5
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "INSERT INTO ed2k_blocks (task_id, block_index, state, downloaded_bytes, retry_count) VALUES {values}
+                 ON CONFLICT (task_id, block_index) DO UPDATE SET state = excluded.state,
+                 downloaded_bytes = excluded.downloaded_bytes,
+                 retry_count = ed2k_blocks.retry_count + excluded.retry_count"
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for &(index, state, bytes, bump_retry) in chunk {
+                query = query
+                    .bind(task_id)
+                    .bind(index as i64)
+                    .bind(state)
+                    .bind(bytes)
+                    .bind(i64::from(bump_retry));
+            }
+            query.execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -6361,6 +6412,71 @@ mod tests {
         let blocks = db.load_ed2k_blocks("e2").await.expect("load");
         assert_eq!(blocks[0], (0, 3, 100, 0), "verified, retry 未变");
         assert_eq!(blocks[1], (1, 0, 0, 2), "retry_count 自增两次");
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn ed2k_batches_preserve_resume_state_across_reopen() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "e-batch").await;
+        db.init_ed2k_blocks("e-batch", 300).await.expect("init");
+        let updates: Vec<_> = (0..300)
+            .map(|index| {
+                if index == 299 {
+                    (index, 0, 0, true)
+                } else {
+                    (index, 3, 1000 + index as i64, false)
+                }
+            })
+            .collect();
+        db.update_ed2k_blocks("e-batch", &updates)
+            .await
+            .expect("batch");
+        db.init_ed2k_blocks("e-batch", 302)
+            .await
+            .expect("idempotent init");
+        db.pool.close().await;
+        let reopened = Db::open(&dir).await.expect("reopen");
+        let rows = reopened.load_ed2k_blocks("e-batch").await.expect("load");
+        assert_eq!(rows[0], (0, 3, 1000, 0));
+        assert_eq!(rows[127], (127, 3, 1127, 0));
+        assert_eq!(rows[128], (128, 3, 1128, 0));
+        assert_eq!(rows[255], (255, 3, 1255, 0));
+        assert_eq!(rows[256], (256, 3, 1256, 0));
+        assert_eq!(rows[299], (299, 0, 0, 1));
+        assert_eq!(rows[300], (300, 0, 0, 0));
+        assert_eq!(rows[301], (301, 0, 0, 0));
+        reopened.reset_ed2k_blocks("e-batch").await.expect("reset");
+        let rows = reopened
+            .load_ed2k_blocks("e-batch")
+            .await
+            .expect("load reset");
+        assert!(
+            rows.iter()
+                .all(|(_, state, bytes, _)| *state == 0 && *bytes == 0)
+        );
+        assert_eq!(rows[299].3, 1, "reset preserves retry history");
+        close_test_db(&reopened, dir).await;
+    }
+
+    #[tokio::test]
+    async fn ed2k_batch_failure_rolls_back_earlier_chunks() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "e-rollback").await;
+        db.init_ed2k_blocks("e-rollback", 129).await.expect("init");
+        sqlx::query(
+            "CREATE TRIGGER reject_ed2k_update BEFORE UPDATE ON ed2k_blocks
+            WHEN NEW.block_index = 128 BEGIN SELECT RAISE(FAIL, 'reject update'); END",
+        )
+        .execute(&db.pool)
+        .await
+        .expect("trigger");
+        let updates: Vec<_> = (0..129).map(|index| (index, 3, 100, false)).collect();
+        assert!(db.update_ed2k_blocks("e-rollback", &updates).await.is_err());
+        let rows = db.load_ed2k_blocks("e-rollback").await.expect("load");
+        assert_eq!(rows[0], (0, 0, 0, 0));
+        assert_eq!(rows[127], (127, 0, 0, 0));
+        assert_eq!(rows[128], (128, 0, 0, 0));
         close_test_db(&db, dir).await;
     }
 

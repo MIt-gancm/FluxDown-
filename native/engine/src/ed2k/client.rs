@@ -20,22 +20,22 @@
 //! [`Source::LowId`]：NAT 后 peer，需经服务器 `OP_CALLBACKREQUEST` 请求其回连；
 //! 回连的入站流在监听器里按 `client_id` 匹配后交回等待方。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, oneshot};
+use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinSet;
 
 use crate::downloader::DownloadError;
 use crate::ed2k::proto::{
-    self, Ed2kMessage, LOWID_THRESHOLD, MAX_SERVER_FRAME, OP_CALLBACKREQUEST, OP_GETSOURCES,
-    OP_HELLO, OP_HELLOANSWER, OP_LOGINREQUEST,
+    self, Ed2kMessage, LOWID_THRESHOLD, MAX_SERVER_FRAME, OP_CALLBACK_FAIL, OP_CALLBACKREQUEST,
+    OP_GETSOURCES, OP_HELLO, OP_HELLOANSWER, OP_LOGINREQUEST,
 };
 use crate::ed2k::server::{
     PeerAddr, build_getsources_payload, build_login_payload, id_to_ipv4, read_until_found_sources,
@@ -43,9 +43,10 @@ use crate::ed2k::server::{
 };
 use crate::logger::{log_error, log_info};
 
-/// 服务器会话保活间隔（无查询时定期发一次 GETSOURCES 心跳靠调用驱动，
-/// 这里仅用于重连节流）。
+/// 单次服务器登录超时。
 const SERVER_CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+const RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// 入站 callback 等待超时。
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -85,8 +86,42 @@ pub struct ClientConfig {
     pub enable_kad: bool,
 }
 
-/// 待处理的 LowID callback：`client_id → 送回入站流的 oneshot`。
-type PendingCallbacks = Arc<StdMutex<HashMap<u32, oneshot::Sender<TcpStream>>>>;
+/// 队列顺序与服务器写入顺序一致；失败包不携带 client_id。
+struct PendingCallback {
+    id: u32,
+    token: u64,
+    session: u64,
+    sender: oneshot::Sender<Result<TcpStream, DownloadError>>,
+}
+
+type PendingCallbacks = Arc<StdMutex<VecDeque<PendingCallback>>>;
+
+struct CallbackRegistration<'a> {
+    pending: &'a PendingCallbacks,
+    token: u64,
+}
+
+impl Drop for CallbackRegistration<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.retain(|entry| entry.token != self.token);
+        }
+    }
+}
+
+/// 活跃任务的生命周期决定后台重连是否运行。
+pub(crate) struct ActiveTask(Arc<Ed2kClient>);
+
+impl Drop for ActiveTask {
+    fn drop(&mut self) {
+        self.0.active_tasks.fetch_sub(1, Ordering::AcqRel);
+        self.0.session_changed.notify_one();
+    }
+}
+
+fn next_reconnect_delay(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(RECONNECT_MAX_DELAY)
+}
 
 /// 进程级共享 eD2K 客户端。
 pub struct Ed2kClient {
@@ -97,8 +132,14 @@ pub struct Ed2kClient {
     listen_port: AtomicU32,
     /// 持久服务器连接（写端；读循环独占，故用 async mutex 串行化发送）。
     server_tx: AsyncMutex<Option<OwnedWriteHalf>>,
+    /// 串行化惰性登录与后台登录，防止会话互相覆盖。
+    server_connect: AsyncMutex<()>,
     /// 当前服务器会话代号；读循环退出时只清理自己那一代。
     session_gen: AtomicU64,
+    callback_token: AtomicU64,
+    active_tasks: AtomicU32,
+    reconnect_started: AtomicBool,
+    session_changed: Notify,
     /// 待匹配的入站 callback。
     pending: PendingCallbacks,
     /// 已连通的服务器地址（重连/日志用）。
@@ -121,8 +162,13 @@ impl Ed2kClient {
             client_id: AtomicU32::new(0),
             listen_port: AtomicU32::new(0),
             server_tx: AsyncMutex::new(None),
+            server_connect: AsyncMutex::new(()),
             session_gen: AtomicU64::new(0),
-            pending: Arc::new(StdMutex::new(HashMap::new())),
+            callback_token: AtomicU64::new(0),
+            active_tasks: AtomicU32::new(0),
+            reconnect_started: AtomicBool::new(false),
+            session_changed: Notify::new(),
+            pending: Arc::new(StdMutex::new(VecDeque::new())),
             connected_server: StdMutex::new(None),
             upnp: StdMutex::new(None),
         }
@@ -133,6 +179,78 @@ impl Ed2kClient {
         if let Ok(mut g) = self.config.lock() {
             *g = config;
         }
+        self.session_changed.notify_one();
+    }
+
+    pub(crate) fn begin_task(self: &Arc<Self>) -> ActiveTask {
+        self.active_tasks.fetch_add(1, Ordering::AcqRel);
+        if !self.reconnect_started.swap(true, Ordering::AcqRel) {
+            let this = Arc::clone(self);
+            tokio::spawn(async move { this.run_reconnector().await });
+        }
+        self.session_changed.notify_one();
+        ActiveTask(Arc::clone(self))
+    }
+
+    async fn run_reconnector(self: Arc<Self>) {
+        let mut delay = RECONNECT_INITIAL_DELAY;
+        let mut retry_at = tokio::time::Instant::now();
+        loop {
+            let changed = self.session_changed.notified();
+            if self.active_tasks.load(Ordering::Acquire) == 0 {
+                delay = RECONNECT_INITIAL_DELAY;
+                retry_at = tokio::time::Instant::now();
+                changed.await;
+                continue;
+            }
+            if self.server_tx.lock().await.is_some() {
+                delay = RECONNECT_INITIAL_DELAY;
+                retry_at = tokio::time::Instant::now() + delay;
+                changed.await;
+                continue;
+            }
+            if tokio::time::Instant::now() < retry_at {
+                tokio::select! {
+                    () = changed => {},
+                    () = tokio::time::sleep_until(retry_at) => {},
+                }
+                continue;
+            }
+            tokio::select! {
+                biased;
+                () = changed => {},
+                result = self.ensure_server_session() => {
+                    retry_at = tokio::time::Instant::now() + delay;
+                    delay = if result.is_err() {
+                        next_reconnect_delay(delay)
+                    } else {
+                        RECONNECT_INITIAL_DELAY
+                    };
+                }
+            }
+        }
+    }
+
+    fn fail_callbacks(&self, session: u64, oldest_only: bool, message: &str) {
+        if let Ok(mut pending) = self.pending.lock() {
+            while let Some(pos) = pending.iter().position(|entry| entry.session == session) {
+                if let Some(entry) = pending.remove(pos) {
+                    let _ = entry.sender.send(Err(DownloadError::Ed2k(message.into())));
+                }
+                if oldest_only {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn clear_session(&self, session: u64) {
+        self.client_id.store(0, Ordering::Relaxed);
+        if let Ok(mut server) = self.connected_server.lock() {
+            *server = None;
+        }
+        self.fail_callbacks(session, false, "server session disconnected");
+        self.session_changed.notify_one();
     }
 
     /// 本机是否已取得 HighID（可被动接收入站连接）。
@@ -217,46 +335,38 @@ impl Ed2kClient {
     /// 无服务器会话 / 超时 / socket 失败 → [`DownloadError`]。
     async fn request_callback(&self, low_id: u32) -> Result<TcpStream, DownloadError> {
         let (tx, rx) = oneshot::channel();
-        {
-            let mut g = self
-                .pending
-                .lock()
-                .map_err(|_| DownloadError::Ed2k("pending lock poisoned".into()))?;
-            g.insert(low_id, tx);
-        }
-        // 发 callback 请求到服务器。
-        let write_result = {
-            let mut guard = self.server_tx.lock().await;
-            match guard.as_mut() {
-                Some(stream) => {
-                    let frame = proto::frame(OP_CALLBACKREQUEST, &low_id.to_le_bytes());
-                    let r = stream.write_all(&frame).await;
-                    if r.is_err() {
-                        // 写失败 = 会话已死：丢弃，下次找源时重新登录。
-                        *guard = None;
-                        self.client_id.store(0, Ordering::Relaxed);
-                    }
-                    r.map_err(DownloadError::Io)
-                }
-                None => Err(DownloadError::Ed2k("no server session for callback".into())),
-            }
+        let token = self.callback_token.fetch_add(1, Ordering::Relaxed);
+        let _registration = CallbackRegistration {
+            pending: &self.pending,
+            token,
         };
-        if let Err(e) = write_result {
-            if let Ok(mut g) = self.pending.lock() {
-                g.remove(&low_id);
+        // 同一把写锁下入队并发送，失败包按服务器处理顺序匹配。
+        {
+            let mut guard = self.server_tx.lock().await;
+            let session = self.session_gen.load(Ordering::Relaxed);
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| DownloadError::Ed2k("no server session for callback".into()))?;
+            self.pending
+                .lock()
+                .map_err(|_| DownloadError::Ed2k("pending lock poisoned".into()))?
+                .push_back(PendingCallback {
+                    id: low_id,
+                    token,
+                    session,
+                    sender: tx,
+                });
+            let frame = proto::frame(OP_CALLBACKREQUEST, &low_id.to_le_bytes());
+            if let Err(error) = stream.write_all(&frame).await {
+                *guard = None;
+                self.clear_session(session);
+                return Err(DownloadError::Io(error));
             }
-            return Err(e);
         }
         match tokio::time::timeout(CALLBACK_TIMEOUT, rx).await {
-            Ok(Ok(stream)) => Ok(stream),
+            Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(DownloadError::Ed2k("callback sender dropped".into())),
-            Err(_) => {
-                // 清理超时的待处理项。
-                if let Ok(mut g) = self.pending.lock() {
-                    g.remove(&low_id);
-                }
-                Err(DownloadError::Ed2k("callback timed out".into()))
-            }
+            Err(_) => Err(DownloadError::Ed2k("callback timed out".into())),
         }
     }
 
@@ -292,6 +402,7 @@ impl Ed2kClient {
     ///
     /// 全部服务器登录失败 → [`DownloadError::Ed2k`]。
     pub async fn ensure_server_session(self: &Arc<Self>) -> Result<(), DownloadError> {
+        let _connecting = self.server_connect.lock().await;
         {
             let guard = self.server_tx.lock().await;
             if guard.is_some() {
@@ -320,11 +431,15 @@ impl Ed2kClient {
             .await
             {
                 Ok(Ok((stream, client_id))) => {
+                    let (reader, writer) = stream.into_split();
+                    let mut guard = self.server_tx.lock().await;
                     let session = self.session_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                    *guard = Some(writer);
                     self.client_id.store(client_id, Ordering::Relaxed);
                     if let Ok(mut g) = self.connected_server.lock() {
                         *g = Some(server.clone());
                     }
+                    drop(guard);
                     log_info!(
                         "[ed2k-client] server session up: {} (client_id={:#x}, {})",
                         server,
@@ -335,9 +450,8 @@ impl Ed2kClient {
                             "LowID"
                         }
                     );
-                    let (reader, writer) = stream.into_split();
-                    *self.server_tx.lock().await = Some(writer);
                     self.spawn_server_reader(reader, session);
+                    self.session_changed.notify_one();
                     return Ok(());
                 }
                 Ok(Err(e)) => log_info!("[ed2k-client] login {} failed: {}", server, e),
@@ -347,18 +461,21 @@ impl Ed2kClient {
         Err(DownloadError::Ed2k("all ed2k server logins failed".into()))
     }
 
-    /// 启动服务器读循环：消费服务器推送（IDCHANGE 更新本机 ID），读到 EOF/错误
-    /// 即清空会话，使下一次 [`Ed2kClient::ensure_server_session`] 重新登录，
-    /// LowID callback 不再写入死连接。
+    /// 消费 IDCHANGE 与 CALLBACK_FAIL；断线时唤醒等待方和活跃任务重连器。
     fn spawn_server_reader(self: &Arc<Self>, mut reader: OwnedReadHalf, session: u64) {
         let this = Arc::clone(self);
         tokio::spawn(async move {
             loop {
                 match proto::read_frame(&mut reader, MAX_SERVER_FRAME).await {
                     Ok((proto_byte, opcode, payload)) => {
-                        if let Ok(Ed2kMessage::IdChange { client_id }) =
+                        let guard = this.server_tx.lock().await;
+                        if this.session_gen.load(Ordering::Relaxed) != session || guard.is_none() {
+                            break;
+                        }
+                        if proto_byte == proto::PROTO_EDONKEY && opcode == OP_CALLBACK_FAIL {
+                            this.fail_callbacks(session, true, "server rejected callback request");
+                        } else if let Ok(Ed2kMessage::IdChange { client_id }) =
                             proto::dispatch(proto_byte, opcode, &payload, false)
-                            && this.session_gen.load(Ordering::Relaxed) == session
                         {
                             this.client_id.store(client_id, Ordering::Relaxed);
                         }
@@ -372,10 +489,7 @@ impl Ed2kClient {
             let mut guard = this.server_tx.lock().await;
             if this.session_gen.load(Ordering::Relaxed) == session {
                 *guard = None;
-                this.client_id.store(0, Ordering::Relaxed);
-                if let Ok(mut g) = this.connected_server.lock() {
-                    *g = None;
-                }
+                this.clear_session(session);
             }
         });
     }
@@ -478,9 +592,12 @@ async fn handle_inbound(
 
     let client_id = parse_hello_client_id(proto_byte, opcode, &payload);
     if let Some(id) = client_id {
-        let waiter = pending.lock().ok().and_then(|mut g| g.remove(&id));
-        if let Some(tx) = waiter {
-            let _ = tx.send(stream);
+        let waiter = pending.lock().ok().and_then(|mut queue| {
+            let pos = queue.iter().position(|entry| entry.id == id)?;
+            queue.remove(pos)
+        });
+        if let Some(entry) = waiter {
+            let _ = entry.sender.send(Ok(stream));
             return Ok(());
         }
     }
@@ -569,4 +686,206 @@ fn parse_hostport(s: &str) -> Option<(String, u16)> {
         return None;
     }
     Some((host.to_string(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::{
+        ClientConfig, Ed2kClient, RECONNECT_INITIAL_DELAY, RECONNECT_MAX_DELAY,
+        next_reconnect_delay,
+    };
+    use crate::ed2k::proto::{
+        self, MAX_SERVER_FRAME, OP_CALLBACK_FAIL, OP_CALLBACKREQUEST, OP_IDCHANGE, OP_LOGINREQUEST,
+        OP_REJECT,
+    };
+
+    async fn read_opcode(stream: &mut TcpStream) -> u8 {
+        let (_, opcode, _) = tokio::time::timeout(
+            Duration::from_secs(2),
+            proto::read_frame(stream, MAX_SERVER_FRAME),
+        )
+        .await
+        .expect("read timeout")
+        .expect("read frame");
+        opcode
+    }
+
+    async fn wait_for_id(client: &Ed2kClient, expected: u32) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.client_id.load(Ordering::Relaxed) != expected {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("client ID transition");
+    }
+
+    #[tokio::test]
+    async fn callback_fail_wakes_oldest_request_without_client_id() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let connection = TcpStream::connect(listener.local_addr().expect("address"))
+            .await
+            .expect("connect");
+        let (mut server, _) = listener.accept().await.expect("accept");
+        let client = Arc::new(Ed2kClient::new());
+        let (reader, writer) = connection.into_split();
+        client.session_gen.store(1, Ordering::Relaxed);
+        *client.server_tx.lock().await = Some(writer);
+        client.spawn_server_reader(reader, 1);
+
+        let first_client = Arc::clone(&client);
+        let first = tokio::spawn(async move { first_client.request_callback(7).await });
+        assert_eq!(read_opcode(&mut server).await, OP_CALLBACKREQUEST);
+        let second_client = Arc::clone(&client);
+        // 同一源的并发请求也必须独立保留，不能覆盖更早的等待方。
+        let second = tokio::spawn(async move { second_client.request_callback(7).await });
+        assert_eq!(read_opcode(&mut server).await, OP_CALLBACKREQUEST);
+        server
+            .write_all(&proto::frame(OP_CALLBACK_FAIL, &[]))
+            .await
+            .expect("failure frame");
+        let result = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("immediate failure")
+            .expect("join");
+        assert!(matches!(
+            result,
+            Err(crate::downloader::DownloadError::Ed2k(_))
+        ));
+        assert!(
+            !second.is_finished(),
+            "one failure only consumes the oldest request"
+        );
+        server
+            .write_all(&proto::frame(OP_CALLBACK_FAIL, &[]))
+            .await
+            .expect("second failure");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), second)
+                .await
+                .expect("second wake")
+                .expect("join")
+                .is_err()
+        );
+        assert!(client.pending.lock().expect("pending").is_empty());
+        let cancelled_client = Arc::clone(&client);
+        let cancelled = tokio::spawn(async move { cancelled_client.request_callback(7).await });
+        assert_eq!(read_opcode(&mut server).await, OP_CALLBACKREQUEST);
+        cancelled.abort();
+        assert!(cancelled.await.expect_err("cancelled join").is_cancelled());
+        let next_client = Arc::clone(&client);
+        let next = tokio::spawn(async move { next_client.request_callback(9).await });
+        assert_eq!(read_opcode(&mut server).await, OP_CALLBACKREQUEST);
+        server
+            .write_all(&proto::frame(OP_CALLBACK_FAIL, &[]))
+            .await
+            .expect("failure after cancellation");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), next)
+                .await
+                .expect("next wake")
+                .expect("join")
+                .is_err()
+        );
+        assert!(client.pending.lock().expect("pending").is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_session_reconnects_only_while_task_is_active() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = Arc::new(Ed2kClient::new());
+        client.listen_port.store(4662, Ordering::Relaxed);
+        client.configure(ClientConfig {
+            servers: vec![listener.local_addr().expect("address").to_string()],
+            ..ClientConfig::default()
+        });
+        let active = client.begin_task();
+        let (mut first, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("first login")
+            .expect("accept");
+        assert_eq!(read_opcode(&mut first).await, OP_LOGINREQUEST);
+        let id = 0x0100_0001u32;
+        first
+            .write_all(&proto::frame(OP_IDCHANGE, &id.to_le_bytes()))
+            .await
+            .expect("ID frame");
+        wait_for_id(&client, id).await;
+        drop(first);
+
+        let (mut second, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("automatic reconnect")
+            .expect("accept");
+        assert_eq!(read_opcode(&mut second).await, OP_LOGINREQUEST);
+        second
+            .write_all(&proto::frame(OP_IDCHANGE, &id.to_le_bytes()))
+            .await
+            .expect("ID frame");
+        wait_for_id(&client, id).await;
+        drop(active);
+        drop(second);
+        wait_for_id(&client, 0).await;
+        assert!(
+            tokio::time::timeout(
+                RECONNECT_INITIAL_DELAY + Duration::from_millis(300),
+                listener.accept()
+            )
+            .await
+            .is_err(),
+            "idle client must not reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_login_waits_before_background_retry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let client = Arc::new(Ed2kClient::new());
+        client.listen_port.store(4662, Ordering::Relaxed);
+        client.configure(ClientConfig {
+            servers: vec![listener.local_addr().expect("address").to_string()],
+            ..ClientConfig::default()
+        });
+        let active = client.begin_task();
+        let (mut first, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("first login")
+            .expect("accept");
+        assert_eq!(read_opcode(&mut first).await, OP_LOGINREQUEST);
+        first
+            .write_all(&proto::frame(OP_REJECT, &[]))
+            .await
+            .expect("reject");
+        drop(first);
+        assert!(
+            tokio::time::timeout(RECONNECT_INITIAL_DELAY / 2, listener.accept())
+                .await
+                .is_err(),
+            "login failure must back off"
+        );
+        let (mut second, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("retry login")
+            .expect("accept");
+        assert_eq!(read_opcode(&mut second).await, OP_LOGINREQUEST);
+        drop(active);
+        drop(second);
+    }
+
+    #[test]
+    fn reconnect_backoff_is_exponential_and_capped() {
+        let mut delay = RECONNECT_INITIAL_DELAY;
+        for expected in [2, 4, 8, 16, 30, 30] {
+            delay = next_reconnect_delay(delay);
+            assert_eq!(delay, Duration::from_secs(expected));
+        }
+        assert_eq!(next_reconnect_delay(Duration::MAX), RECONNECT_MAX_DELAY);
+    }
 }
