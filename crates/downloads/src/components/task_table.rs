@@ -1563,13 +1563,13 @@ impl DownloadTableDelegate {
     }
 
     /// 行悬停操作（最后一个可见列右端浮层）：暂停 / 继续 / 重试 / 打开 + 在文件夹中
-    /// 显示；舒适密度且停靠详情面板未打开时再加「详情」（面板打开后单击行即切换详情，
-    /// 按钮多余；紧凑密度保持浮层短，少遮挡最后一列）。底色与行悬停一致（选中时叠加
-    /// 选中色），除「详情」外点击不改变选中。
+    /// 显示；停靠详情面板未打开时再加「详情」（面板打开后单击行即切换详情，按钮多余），
+    /// 舒适与紧凑密度一致。底色与行悬停一致（选中时叠加选中色），除「详情」外点击不
+    /// 改变选中。
     fn render_row_actions(&self, task: &DownloadTaskView, cx: &App) -> Option<AnyElement> {
         let host = self.host.as_ref()?;
         let is_local = task.key.is_local();
-        let with_detail = self.prefs.density.two_line() && !self.prefs.detail_open;
+        let with_detail = !self.prefs.detail_open;
         let mut actions = row_actions(task.state, is_local, task.file_missing, with_detail)
             .filter(|action| {
                 is_local
