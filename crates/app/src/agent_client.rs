@@ -35,6 +35,8 @@ pub enum AgentClientEvent {
     Snapshot(Box<Snapshot>),
     Event(Box<EventFrame>),
     Stale,
+    /// 本进程刚拉起了 agent（后台服务冷启动）：首个快照要等 agent 装配完成。
+    ServiceStarting,
     Fatal(RpcErrorData),
     /// agent 执行了完全退出（`system.shutdown`）：不再重连，界面随之退出。
     ServiceStopped,
@@ -179,13 +181,25 @@ async fn run_client(
             Err(error @ (ConnectError::NoBearer | ConnectError::Refused)) => {
                 let probe_listener = matches!(error, ConnectError::NoBearer);
                 link_log.failed(&error);
-                if let Err(bootstrap_error) = bootstrap
+                match bootstrap
                     .ensure_running(&config.rpc_url, probe_listener)
                     .await
                 {
-                    log::warn!("could not start fluxdown-agent: {bootstrap_error}");
-                    if events.send(AgentClientEvent::Stale).await.is_err() {
-                        return;
+                    Ok(true) => {
+                        if events
+                            .send(AgentClientEvent::ServiceStarting)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(bootstrap_error) => {
+                        log::warn!("could not start fluxdown-agent: {bootstrap_error}");
+                        if events.send(AgentClientEvent::Stale).await.is_err() {
+                            return;
+                        }
                     }
                 }
             }
@@ -317,7 +331,13 @@ async fn open_socket(config: &AgentClientConfig) -> Result<Socket, ConnectError>
     request
         .headers_mut()
         .insert(header::AUTHORIZATION, authorization);
-    let (socket, _) = tokio_tungstenite::connect_async(request)
+    // 先自行完成 TCP 连接：回环端口无人监听时按超时判定，不等 Windows 约 2s 的拒绝。
+    let stream = match crate::service_bootstrap::connect_listener(&config.rpc_url).await {
+        Ok(Some(stream)) => stream,
+        Ok(None) => return Err(ConnectError::Refused),
+        Err(error) => return Err(ConnectError::Transient(format!("connect: {error}"))),
+    };
+    let (socket, _) = tokio_tungstenite::client_async(request, MaybeTlsStream::Plain(stream))
         .await
         .map_err(classify_connect_error)?;
     Ok(socket)
@@ -535,18 +555,10 @@ async fn call_on_socket(
 
 fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> ConnectError {
     match &error {
-        tokio_tungstenite::tungstenite::Error::Io(io)
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            ConnectError::Refused
-        }
         tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401 => {
             ConnectError::Fatal(RpcErrorData::new(ApplicationErrorCode::Unauthorized, false))
         }
-        _ => ConnectError::Transient(format!("connect: {error}")),
+        _ => ConnectError::Transient(format!("handshake: {error}")),
     }
 }
 

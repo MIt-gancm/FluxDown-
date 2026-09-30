@@ -19,6 +19,7 @@ pub mod device_meta;
 pub mod diagnostics;
 pub mod event_hub;
 pub mod gateway;
+mod http_client;
 pub mod lifecycle;
 pub mod link;
 pub mod log_export;

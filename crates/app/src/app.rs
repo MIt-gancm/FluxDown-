@@ -40,8 +40,6 @@ const EVENT_BATCH: usize = 256;
 /// 次实例等待刚启动主实例的 IPC 端点就绪、或等待旧主实例释放锁的最长时间。
 const ACTIVATION_RETRY_TIMEOUT: Duration = Duration::from_secs(5);
 const ACTIVATION_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-/// 冷启动服务时等首个快照决定是否只留托盘的上限；到期仍未拿到快照就开窗（显示连接态）。
-const COLD_LAUNCH_DECISION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 桌面入口完成后的进程语义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -365,7 +363,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             return;
         }
         // 连接在 GPUI 初始化前已开始：热启动时首个快照几乎与事件循环同时到达，等它到了再开窗，
-        // 首帧就是完整数据、主题与语言，不闪「正在连接」；冷启动（需拉起后台）最多等连接宽限。
+        // 首帧就是完整数据、主题与语言，不闪「正在连接」；冷启动（需拉起后台）等到会话宽限到期。
         after_session_settled(cx, crate::windows::main::reveal);
     });
 
@@ -426,65 +424,30 @@ fn open_main_minimized(cx: &mut App) {
     }
 }
 
-/// 普通启动的开窗判定。
+/// 普通启动的开窗判定：会话就绪（快照、宽限到期或致命错误）后执行。
 ///
-/// - agent 已在运行（本进程没拉起它）：与其他启动一样，会话就绪（快照或连接宽限到期）即开窗。
-/// - 本进程冷启动了 agent：不按连接宽限开窗（冷启动必然超过宽限），等首个快照读偏好——
-///   agent 在 daemon 就绪前就已带偏好与外壳状态提供快照。偏好开启且托盘可见时不开窗、
-///   只退出界面，托盘由 agent 驻留；致命错误或 [`COLD_LAUNCH_DECISION_TIMEOUT`] 到期仍开窗。
+/// - agent 已在运行（本进程没拉起它）：与其他启动一样直接开窗。
+/// - 本进程冷启动了 agent：会话对首个快照放宽宽限（见 `session::COLD_START_GRACE`），这里据
+///   首个快照读偏好——agent 在 daemon 就绪前就已带偏好与外壳状态提供快照。偏好开启且托盘
+///   可见时不开窗、只退出界面，托盘由 agent 驻留；致命错误或宽限到期仍开窗。
 fn decide_plain_launch(bootstrap: Arc<ServiceBootstrap>, cx: &mut App) {
-    let session = Desktop::global(cx).session.clone();
-    if let Some(snapshot) = session.read(cx).latest().cloned() {
-        finish_plain_launch(bootstrap.spawned_agent(), Some(&snapshot), cx);
-        return;
-    }
-    let subscription = std::rc::Rc::new(std::cell::RefCell::new(None));
-    let holder = std::rc::Rc::clone(&subscription);
-    let signal_bootstrap = bootstrap.clone();
-    *subscription.borrow_mut() = Some(cx.subscribe(&session, move |_, signal, cx| {
-        let cold = signal_bootstrap.spawned_agent();
-        let decided = match signal {
-            SessionSignal::Snapshot(_) | SessionSignal::Fatal(_) => true,
-            // 冷启动时连接宽限到期是预期的，继续等快照。
-            SessionSignal::Stale => !cold,
-            _ => false,
-        };
-        if decided && holder.borrow_mut().take().is_some() {
-            let snapshot = match signal {
-                SessionSignal::Snapshot(snapshot) => Some(snapshot.as_ref()),
-                _ => None,
-            };
-            finish_plain_launch(cold, snapshot, cx);
+    after_session_settled(cx, move |cx| {
+        let snapshot = Desktop::global(cx).session.read(cx).latest().cloned();
+        let tray_only = bootstrap.spawned_agent()
+            && snapshot
+                .as_deref()
+                .and_then(crate::session::agent_body)
+                .is_some_and(launch::start_in_tray);
+        if tray_only {
+            crate::lifecycle::quit_ui(cx);
+        } else {
+            crate::windows::main::reveal(cx);
         }
-    }));
-    let timeout_holder = subscription;
-    cx.spawn(async move |cx| {
-        cx.background_executor()
-            .timer(COLD_LAUNCH_DECISION_TIMEOUT)
-            .await;
-        cx.update(|cx| {
-            if timeout_holder.borrow_mut().take().is_some() {
-                crate::windows::main::reveal(cx);
-            }
-        });
-    })
-    .detach();
-}
-
-fn finish_plain_launch(cold: bool, snapshot: Option<&fluxdown_protocol::Snapshot>, cx: &mut App) {
-    let tray_only = cold
-        && snapshot
-            .and_then(crate::session::agent_body)
-            .is_some_and(launch::start_in_tray);
-    if tray_only {
-        crate::lifecycle::quit_ui(cx);
-    } else {
-        crate::windows::main::reveal(cx);
-    }
+    });
 }
 
 /// 会话已就绪（拿到快照或已确认离线）立即执行，否则等到就绪后执行一次。
-fn after_session_settled(cx: &mut App, run: fn(&mut App)) {
+fn after_session_settled(cx: &mut App, run: impl FnOnce(&mut App) + 'static) {
     let session = Desktop::global(cx).session.clone();
     if session.read(cx).is_settled() {
         run(cx);
@@ -492,11 +455,13 @@ fn after_session_settled(cx: &mut App, run: fn(&mut App)) {
     }
     let subscription = std::rc::Rc::new(std::cell::RefCell::new(None));
     let holder = std::rc::Rc::clone(&subscription);
+    let mut run = Some(run);
     *subscription.borrow_mut() = Some(cx.subscribe(&session, move |_, signal, cx| {
         if matches!(
             signal,
             SessionSignal::Snapshot(_) | SessionSignal::Stale | SessionSignal::Fatal(_)
         ) && holder.borrow_mut().take().is_some()
+            && let Some(run) = run.take()
         {
             run(cx);
         }

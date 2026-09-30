@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 
 use super::models::{AuthResponse, CloudErrorBody, RefreshRequest};
 use crate::event_hub::AgentEventHub;
+use crate::http_client::LazyHttpClient;
 use crate::state::{AgentState, CloudCredentials, StateStore};
 
 /// 是否允许运行期覆盖 FluxCloud 地址；与 Flutter `kDebugMode` 门控一致。
@@ -30,8 +31,8 @@ const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 pub struct CloudClient {
     default_base_url: String,
     base_url: Arc<RwLock<String>>,
-    http: reqwest::Client,
-    stream_http: reqwest::Client,
+    http: Arc<LazyHttpClient>,
+    stream_http: Arc<LazyHttpClient>,
     state: Arc<Mutex<AgentState>>,
     store: Arc<StateStore>,
     refresh: Arc<Mutex<()>>,
@@ -47,27 +48,27 @@ impl CloudClient {
         store: Arc<StateStore>,
     ) -> Result<Self, CloudError> {
         validate_base_url(&base_url)?;
-        let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(15))
-            .pool_idle_timeout(Duration::from_secs(15))
-            .tcp_keepalive(Some(TCP_KEEPALIVE))
-            .build()
-            .map_err(|error| CloudError::local(format!("cloud HTTP client: {error:#}")))?;
+        let http = LazyHttpClient::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(15))
+                .pool_idle_timeout(Duration::from_secs(15))
+                .tcp_keepalive(Some(TCP_KEEPALIVE))
+        });
         // SSE 长连接：TCP keepalive 让内核尽早发现半开连接（合盖唤醒 / NAT 静默断流），
         // 与应用层空闲看门狗互为补充。
-        let stream_http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .pool_idle_timeout(Duration::from_secs(90))
-            .tcp_keepalive(Some(TCP_KEEPALIVE))
-            .build()
-            .map_err(|error| CloudError::local(format!("cloud stream client: {error:#}")))?;
+        let stream_http = LazyHttpClient::new(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Some(TCP_KEEPALIVE))
+        });
         let default_base_url = normalize_base_url(&base_url);
         Ok(Self {
             base_url: Arc::new(RwLock::new(default_base_url.clone())),
             default_base_url,
-            http,
-            stream_http,
+            http: Arc::new(http),
+            stream_http: Arc::new(stream_http),
             state,
             store,
             refresh: Arc::new(Mutex::new(())),
@@ -536,7 +537,12 @@ impl CloudClient {
         bearer: &str,
     ) -> Result<reqwest::Response, CloudError> {
         let (device_id, device_name, platform) = self.device_identity().await;
-        self.stream_http
+        let client = self
+            .stream_http
+            .get()
+            .await
+            .map_err(|error| CloudError::local(format!("cloud stream client: {error:#}")))?;
+        client
             .get(format!("{}{}", self.current_base_url(), path))
             .bearer_auth(bearer)
             .header("Accept", "text/event-stream")
@@ -557,8 +563,12 @@ impl CloudClient {
         bearer: Option<&str>,
     ) -> Result<reqwest::Response, CloudError> {
         let (device_id, device_name, platform) = self.device_identity().await;
-        let mut request = self
+        let client = self
             .http
+            .get()
+            .await
+            .map_err(|error| CloudError::local(format!("cloud HTTP client: {error:#}")))?;
+        let mut request = client
             .request(method, format!("{}{}", self.current_base_url(), path))
             .header("X-FluxDown-Device-Id", device_id)
             .header("X-FluxDown-Device-Name", device_name)

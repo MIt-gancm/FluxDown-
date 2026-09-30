@@ -867,7 +867,7 @@ impl GatewayService {
             Err(UpdateError::Http(_) | UpdateError::Status(_)) => {
                 Err(RpcErrorData::new(ApplicationErrorCode::Unavailable, true))
             }
-            Err(UpdateError::Decode(_)) => {
+            Err(UpdateError::Client(_) | UpdateError::Decode(_)) => {
                 Err(RpcErrorData::new(ApplicationErrorCode::Internal, false))
             }
         }
@@ -1704,10 +1704,7 @@ mod tests {
                 api_switches.clone(),
                 api_token.clone(),
             ));
-            let update = Arc::new(
-                crate::update::UpdateService::new(env!("CARGO_PKG_VERSION"))
-                    .expect("update service"),
-            );
+            let update = Arc::new(crate::update::UpdateService::new(env!("CARGO_PKG_VERSION")));
             let link = crate::link::LinkService::new(crate::link::LinkServiceParts {
                 events: events.clone(),
                 state: state.clone(),

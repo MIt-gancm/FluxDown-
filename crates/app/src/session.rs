@@ -5,7 +5,8 @@
 //!
 //! 连接态对视图有宽限：启动时首个快照、断线后的重连快照只要在 [`OFFLINE_NOTICE_GRACE`]
 //! 内到达，视图就不会进入「正在连接」只读态（期间发出的命令由客户端排队，重连后送达）。
-//! 超过宽限仍未连上才广播 [`SessionSignal::Stale`]。
+//! 本进程冷启动了后台服务时，首个快照的宽限放宽到 [`COLD_START_GRACE`]。超过宽限仍未连上才
+//! 广播 [`SessionSignal::Stale`]。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,9 +19,12 @@ use gpui::{App, Context, Entity, EventEmitter};
 
 use crate::agent_client::{AgentClient, AgentClientEvent};
 
-/// 断线（含启动时尚未连上）多久仍未恢复才告知视图。本机回环重连与热启动首个快照都远低于
-/// 此值；冷启动（需拉起 agent 与 daemon）超过它时才显示连接态。
+/// 断线（含启动时尚未连上）多久仍未恢复才告知视图。本机回环重连与热启动首个快照都远低于此值。
 const OFFLINE_NOTICE_GRACE: Duration = Duration::from_millis(800);
+/// 本进程拉起了 agent 时首个快照的宽限：拉起 agent 并完成装配通常在 1s 内，但落在
+/// [`OFFLINE_NOTICE_GRACE`] 附近；界面在此期间不开窗 / 不显示连接态，而不是先闪「正在连接」。
+/// 到期仍未连上才按离线呈现。
+const COLD_START_GRACE: Duration = Duration::from_secs(5);
 
 /// 会话向订阅者广播的信号。
 pub enum SessionSignal {
@@ -46,6 +50,8 @@ pub struct AgentSession {
     offline_notified: bool,
     /// 宽限计时器代际：新快照到达即作废在途计时。
     offline_generation: u64,
+    /// 冷启动宽限已启用过：agent 反复拉起失败时不无限顺延离线告知。
+    cold_start_grace_armed: bool,
 }
 
 impl EventEmitter<SessionSignal> for AgentSession {}
@@ -59,8 +65,9 @@ impl AgentSession {
             stale: true,
             offline_notified: false,
             offline_generation: 0,
+            cold_start_grace_armed: false,
         };
-        session.schedule_offline_notice(cx);
+        session.schedule_offline_notice(OFFLINE_NOTICE_GRACE, cx);
         session
     }
 
@@ -108,6 +115,17 @@ impl AgentSession {
                     }
                 }
                 AgentClientEvent::Stale => self.go_stale(cx),
+                // 冷启动的首连：尚未拿到过快照、也未宣告离线时放宽一次宽限（重连期间的重新拉起
+                // 不放宽；反复拉起也只放宽一次）。
+                AgentClientEvent::ServiceStarting => {
+                    if self.latest.is_none()
+                        && !self.offline_notified
+                        && !self.cold_start_grace_armed
+                    {
+                        self.cold_start_grace_armed = true;
+                        self.schedule_offline_notice(COLD_START_GRACE, cx);
+                    }
+                }
                 AgentClientEvent::Fatal(error) => {
                     self.notify_offline_now();
                     cx.emit(SessionSignal::Fatal(error));
@@ -127,14 +145,15 @@ impl AgentSession {
             return;
         }
         self.stale = true;
-        self.schedule_offline_notice(cx);
+        self.schedule_offline_notice(OFFLINE_NOTICE_GRACE, cx);
     }
 
-    fn schedule_offline_notice(&mut self, cx: &mut Context<Self>) {
+    /// 重新计时离线告知：作废在途计时，`grace` 后仍未恢复才广播 [`SessionSignal::Stale`]。
+    fn schedule_offline_notice(&mut self, grace: Duration, cx: &mut Context<Self>) {
         self.offline_generation = self.offline_generation.wrapping_add(1);
         let generation = self.offline_generation;
         cx.spawn(async move |session, cx| {
-            cx.background_executor().timer(OFFLINE_NOTICE_GRACE).await;
+            cx.background_executor().timer(grace).await;
             let _ = session.update(cx, |session, cx| {
                 if session.stale
                     && !session.offline_notified

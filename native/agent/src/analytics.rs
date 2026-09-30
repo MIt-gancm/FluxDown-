@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::http_client::LazyHttpClient;
 use crate::state::{AgentState, StateStore};
 
 const BAKED_APP_KEY: &str = match option_env!("FLUXDOWN_ANALYTICS_APP_KEY") {
@@ -18,16 +19,14 @@ const DEFAULT_ENDPOINT: &str =
 pub struct AnalyticsWorker {
     state: Arc<Mutex<AgentState>>,
     store: Arc<StateStore>,
-    client: reqwest::Client,
+    client: LazyHttpClient,
     endpoint: String,
     app_key: String,
 }
 
 impl AnalyticsWorker {
-    pub fn new(
-        state: Arc<Mutex<AgentState>>,
-        store: Arc<StateStore>,
-    ) -> Result<Self, reqwest::Error> {
+    #[must_use]
+    pub fn new(state: Arc<Mutex<AgentState>>, store: Arc<StateStore>) -> Self {
         let endpoint = std::env::var("FLUXDOWN_ANALYTICS_ENDPOINT")
             .ok()
             .filter(|value| !value.trim().is_empty())
@@ -36,15 +35,15 @@ impl AnalyticsWorker {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| BAKED_APP_KEY.to_owned());
-        Ok(Self {
+        Self {
             state,
             store,
-            client: reqwest::Client::builder()
-                .timeout(Duration::from_secs(15))
-                .build()?,
+            client: LazyHttpClient::new(|| {
+                reqwest::Client::builder().timeout(Duration::from_secs(15))
+            }),
             endpoint,
             app_key,
-        })
+        }
     }
 
     pub async fn run(self, cancel: CancellationToken) {
@@ -117,8 +116,14 @@ impl AnalyticsWorker {
                 "props": {"edition": "desktop-agent"},
             }]
         });
-        match self
-            .client
+        let client = match self.client.get().await {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(error = %error, event_name, "analytics client unavailable");
+                return false;
+            }
+        };
+        match client
             .post(&self.endpoint)
             .header("App-Key", &self.app_key)
             .json(&payload)

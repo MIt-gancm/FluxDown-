@@ -196,7 +196,7 @@ pub(crate) async fn run_with(
     });
     let link_task = tokio::spawn(link.clone().run(cancel.clone()));
     let analytics_task = tokio::spawn(
-        crate::analytics::AnalyticsWorker::new(shared_state.clone(), store.clone())?
+        crate::analytics::AnalyticsWorker::new(shared_state.clone(), store.clone())
             .run(cancel.clone()),
     );
     let (api_config, api_switches, api_token) = {
@@ -317,9 +317,7 @@ pub(crate) async fn run_with(
         api_switches.clone(),
         api_token.clone(),
     ));
-    let update = Arc::new(crate::update::UpdateService::new(env!(
-        "CARGO_PKG_VERSION"
-    ))?);
+    let update = Arc::new(crate::update::UpdateService::new(env!("CARGO_PKG_VERSION")));
     let cloud = Arc::new(cloud_api);
     let gateway_service = Arc::new(
         GatewayService::new(

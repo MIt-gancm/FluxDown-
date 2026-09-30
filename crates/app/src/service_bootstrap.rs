@@ -44,23 +44,23 @@ impl ServiceBootstrap {
         self.spawned.load(Ordering::Acquire)
     }
 
-    /// 仅由 connection-refused/no-listener 路径调用。
+    /// 仅由 connection-refused/no-listener 路径调用；返回本次是否新拉起了 agent。
     ///
     /// `probe_listener` 为 true（本机尚无 bearer）时先探测目标端口：另一桌面进程或直接启动的
     /// agent 可能已监听、只是还没写出 bearer，此时拉起的子进程会立即因独占锁退出。连接已被
-    /// 拒绝时此刻确定无人监听，跳过探测直接拉起，省掉 Windows 上约 2s 的拒绝等待。
+    /// 拒绝时此刻确定无人监听，跳过探测直接拉起。
     pub async fn ensure_running(
         &self,
         rpc_url: &str,
         probe_listener: bool,
-    ) -> Result<(), BootstrapError> {
+    ) -> Result<bool, BootstrapError> {
         let mut state = self.state.lock().await;
         state.reapers.retain(|task| !task.is_finished());
         if state.running || self.stopped.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
         if probe_listener && agent_is_listening(rpc_url).await? {
-            return Ok(());
+            return Ok(false);
         }
         let mut command = agent_command()?;
         command
@@ -100,32 +100,36 @@ impl ServiceBootstrap {
                 state.running = false;
             }
         }));
-        Ok(())
+        Ok(true)
     }
 }
 
-/// 探测 agent 监听端口的超时。Windows 连接回环上未监听的端口时，收到 RST 后内核还会重传
-/// SYN（约 0.5s + 1s），`connect` 要约 2s 才返回 `ConnectionRefused`；超时必须明显大于这段
-/// 时间，否则「无人监听」会被误判为探测失败而永远不拉起 agent。已监听时回环握手是亚毫秒级。
-const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// 回环上连接 agent 端口的上限。端口在监听时握手由内核即时完成（亚毫秒级，不依赖 agent 是否已
+/// 开始 accept）；Windows 对未监听的回环端口收到 RST 后还会重传 SYN（约 0.5s + 1s），`connect`
+/// 要约 2s 才返回 `ConnectionRefused`。超时即按「无人监听」处理，冷启动不再白等这 2s；极端负载
+/// 下的误判只会多拉起一个因 agent 数据目录独占锁立即退出的进程。
+const LOOPBACK_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
-async fn agent_is_listening(rpc_url: &str) -> Result<bool, BootstrapError> {
+/// 连接 agent 监听端口；`Ok(None)` 表示此刻无人监听（被拒或超时）。
+pub(crate) async fn connect_listener(rpc_url: &str) -> Result<Option<TcpStream>, BootstrapError> {
     let target = agent_socket_target(rpc_url)?;
-    match tokio::time::timeout(PROBE_TIMEOUT, TcpStream::connect(target)).await {
-        Ok(Ok(_)) => Ok(true),
+    match tokio::time::timeout(LOOPBACK_CONNECT_TIMEOUT, TcpStream::connect(target)).await {
+        Ok(Ok(stream)) => Ok(Some(stream)),
         Ok(Err(error))
             if matches!(
                 error.kind(),
                 std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
             ) =>
         {
-            Ok(false)
+            Ok(None)
         }
         Ok(Err(error)) => Err(BootstrapError::Probe(error.to_string())),
-        Err(_) => Err(BootstrapError::Probe(
-            "agent listener probe timed out".to_owned(),
-        )),
+        Err(_) => Ok(None),
     }
+}
+
+async fn agent_is_listening(rpc_url: &str) -> Result<bool, BootstrapError> {
+    Ok(connect_listener(rpc_url).await?.is_some())
 }
 
 /// 等被替换的旧 agent 关闭监听（关停 daemon 后退出）；超时后交回重连循环自愈。
@@ -240,13 +244,34 @@ pub enum BootstrapError {
 }
 #[cfg(test)]
 mod tests {
-    use super::agent_socket_target;
+    use super::{agent_socket_target, connect_listener};
 
     #[test]
     fn listener_probe_formats_ipv6_authority_once() {
         assert_eq!(
             agent_socket_target("ws://[::1]:17800/rpc").expect("IPv6 target"),
             "[::1]:17800"
+        );
+    }
+
+    /// 冷启动时 agent 先绑定端口、装配完才开始 accept：已绑定但尚未 accept 的端口必须算「在监听」，
+    /// 否则桌面会在装配期间重复拉起 agent；端口释放后必须立即判为无人监听。
+    #[tokio::test]
+    async fn bound_port_counts_as_listening_before_accept_and_not_after_close() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let url = format!("ws://{}/rpc", listener.local_addr().expect("local addr"));
+        assert!(
+            connect_listener(&url)
+                .await
+                .expect("probe bound port")
+                .is_some()
+        );
+        drop(listener);
+        assert!(
+            connect_listener(&url)
+                .await
+                .expect("probe released port")
+                .is_none()
         );
     }
 }

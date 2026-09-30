@@ -514,7 +514,9 @@ impl DaemonHttp {
         base_url.set_path("");
         base_url.set_query(None);
         base_url.set_fragment(None);
+        // 只连本机回环 daemon：跳过系统根证书加载（见 `DaemonBlobClient::new`）。
         let client = reqwest::Client::builder()
+            .tls_built_in_root_certs(false)
             .connect_timeout(Duration::from_secs(5))
             .build()?;
         Ok(Self {
