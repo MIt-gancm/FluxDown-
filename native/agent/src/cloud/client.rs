@@ -549,7 +549,7 @@ impl CloudClient {
             .header("X-FluxDown-Device-Id", device_id)
             .header("X-FluxDown-Device-Name", device_name)
             .header("X-FluxDown-Platform", platform)
-            .header("X-FluxDown-Version", env!("CARGO_PKG_VERSION"))
+            .header("X-FluxDown-Version", fluxdown_protocol::APP_VERSION)
             .send()
             .await
             .map_err(|error| CloudError::network(error_chain(&error)))
@@ -573,7 +573,7 @@ impl CloudClient {
             .header("X-FluxDown-Device-Id", device_id)
             .header("X-FluxDown-Device-Name", device_name)
             .header("X-FluxDown-Platform", platform)
-            .header("X-FluxDown-Version", env!("CARGO_PKG_VERSION"));
+            .header("X-FluxDown-Version", fluxdown_protocol::APP_VERSION);
         if let Some(token) = bearer {
             request = request.bearer_auth(token);
         }

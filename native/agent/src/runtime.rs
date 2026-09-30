@@ -118,19 +118,15 @@ pub(crate) async fn run_with(
         .and_then(|config| config.effective_demo_url(bound))
         .map(|url| vec![("FLUXDOWN_DEMO_URL".to_owned(), url)])
         .unwrap_or_default();
+    let daemon_stderr_log =
+        crate::log_export::agent_log_dir(&paths.agent_data_dir).join("fluxdownd.stderr.log");
     let supervisor = Arc::new(
         DaemonSupervisor::new(daemon_address)
             .with_extra_env(daemon_env)
-            .with_stderr_log(
-                crate::log_export::agent_log_dir(&paths.agent_data_dir)
-                    .join("fluxdownd.stderr.log"),
-            ),
+            .with_stderr_log(daemon_stderr_log.clone()),
     );
     let daemon_bearer = load_daemon_bearer(&paths, &supervisor, &cancel).await?;
-    let daemon_config = DaemonClientConfig {
-        rpc_url: paths.daemon_rpc_url.clone(),
-        bearer: daemon_bearer,
-    };
+    let daemon_config = DaemonClientConfig::new(paths.daemon_rpc_url.clone(), daemon_bearer);
     let (daemon, daemon_events) =
         DaemonClient::start(daemon_config.clone(), supervisor.clone(), cancel.clone())?;
     let daemon = Arc::new(daemon);
@@ -157,7 +153,7 @@ pub(crate) async fn run_with(
         Lifecycle::new(
             cancel.clone(),
             daemon.clone(),
-            supervisor,
+            supervisor.clone(),
             paths.daemon_data_dir.clone(),
         )
         .with_shutdown_config(daemon_config.clone()),
@@ -203,7 +199,12 @@ pub(crate) async fn run_with(
             .run(cancel.clone()),
     );
     let (api_config, api_switches, api_token) = {
-        let state = shared_state.lock().await;
+        let mut state = shared_state.lock().await;
+        // 局域网 / CORS 放开且 takeover 或 aria2 开启时，空 token 等于对外匿名开放：启动即补齐。
+        // server 模式的空密钥表示尚未完成首次设置，由兼容 API 自身拒绝，不能自动补。
+        if server.is_none() && crate::gateway::ensure_exposed_auth_token(&mut state) {
+            store.save(&state).await?;
+        }
         // legacy Gateway 设置（含用户令牌）尚未从 daemon 迁入时，空令牌意味着兼容 API 不鉴权：
         // 迁移完成前兼容面全部关闭，由 readiness 任务按迁移后的状态开启。
         let migrated = state.gateway_migration_revision.is_some();
@@ -218,6 +219,7 @@ pub(crate) async fn run_with(
         // 监听地址在启动时按 `lan_enabled` 固定（运行期切换下次启动生效），Host 校验与之同步；
         // server 模式可监听非回环地址，LAN 模式本就对外开放，均不强制。
         config.enforce_loopback_host = server.is_none() && !state.gateway.lan_enabled;
+        config.require_token = server.is_some();
         let token = config.token.clone();
         (config, switches, token)
     };
@@ -325,16 +327,21 @@ pub(crate) async fn run_with(
             Err(error) => tracing::warn!(error = %error, "NMH auto-registration failed"),
         });
     }
-    let diagnostics = Arc::new(crate::diagnostics::DiagnosticsService::new(
-        daemon.clone(),
-        daemon_config.clone(),
-        events.clone(),
-        shared_state.clone(),
-        store.clone(),
-        api_switches.clone(),
-        api_token.clone(),
+    let diagnostics = Arc::new(
+        crate::diagnostics::DiagnosticsService::new(
+            daemon.clone(),
+            daemon_config.clone(),
+            events.clone(),
+            shared_state.clone(),
+            store.clone(),
+            api_switches.clone(),
+            api_token.clone(),
+        )
+        .with_daemon_startup(supervisor.clone(), daemon_stderr_log),
+    );
+    let update = Arc::new(crate::update::UpdateService::new(
+        fluxdown_protocol::APP_VERSION,
     ));
-    let update = Arc::new(crate::update::UpdateService::new(env!("CARGO_PKG_VERSION")));
     let cloud = Arc::new(cloud_api);
     let gateway_service = Arc::new(
         GatewayService::new(
@@ -506,6 +513,15 @@ async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
         if let Some(server) = &server {
             let mut state = state.lock().await;
             if crate::server_mode::apply_bootstrap(&mut state, fresh, &server.seed) {
+                store.save(&state).await?;
+                events.publish(fluxdown_protocol::AgentEvent::GatewayChanged(
+                    state.gateway.clone(),
+                ));
+            }
+        } else {
+            // 迁移可能带入 CORS 放开与接管 / aria2 开关：对外暴露面必须有 token。
+            let mut state = state.lock().await;
+            if crate::gateway::ensure_exposed_auth_token(&mut state) {
                 store.save(&state).await?;
                 events.publish(fluxdown_protocol::AgentEvent::GatewayChanged(
                     state.gateway.clone(),
@@ -740,7 +756,7 @@ fn compatibility_api_config(state: &AgentState) -> fluxdown_api::server::ApiServ
             state.gateway.port.to_string(),
         ),
     ]);
-    fluxdown_api::server::ApiServerConfig::from_config_map(&config, env!("CARGO_PKG_VERSION"))
+    fluxdown_api::server::ApiServerConfig::from_config_map(&config, fluxdown_protocol::APP_VERSION)
 }
 
 /// UI Gateway 监听地址：`FLUXDOWN_AGENT_BIND` 覆盖时必须是回环；否则按持久化的

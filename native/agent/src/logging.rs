@@ -101,7 +101,7 @@ fn build_header(agent_data_dir: &std::path::Path) -> String {
     let mut line = |key: &str, value: String| {
         let _ = writeln!(header, "  {key}: {value}");
     };
-    line("version", env!("CARGO_PKG_VERSION").to_owned());
+    line("version", fluxdown_protocol::APP_VERSION.to_owned());
     let exe = std::env::current_exe();
     line(
         "exe",

@@ -21,7 +21,8 @@
 //! 3. **JSON-RPC 合法性门禁**：`/jsonrpc` 不校验 `Content-Type`（与真实 aria2
 //!    一致），以「请求体能否解析为合法 JSON-RPC」为准入门槛。
 //! 4. **可选 token**（`local_server_token` 非空时启用）：请求需带匹配的
-//!    `X-FluxDown-Token` 头，常量时间比较，作纵深防御。
+//!    `X-FluxDown-Token` 头，常量时间比较，作纵深防御。token 为空时桌面宿主不鉴权；
+//!    headless 服务器（`ApiServerConfig::require_token`）则一律 403，首次设置完成前不开放。
 //! 5. **管理 API 强制 token**：`/api/v1/*` 在 token 为空时一律拒绝（403），
 //!    非空时要求 `Authorization: Bearer <token>` 或 `X-FluxDown-Token` 匹配。
 //! 6. **最终安全网**：仅脚本接管入口（`/download*`）的下载会在 FluxDown 中

@@ -89,7 +89,7 @@ impl CloudAuthService {
             }
             map.insert(
                 "appVersion".to_owned(),
-                Value::String(env!("CARGO_PKG_VERSION").to_owned()),
+                Value::String(fluxdown_protocol::APP_VERSION.to_owned()),
             );
         }
         let value: Value = self.client.public(Method::POST, path, Some(&body)).await?;

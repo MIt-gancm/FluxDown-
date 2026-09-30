@@ -575,6 +575,9 @@ impl GatewayService {
             state.gateway.user_token_configured = !state.gateway_user_token.trim().is_empty();
         }
         ensure_forced_auth_token(&mut state, api_was_enabled, mcp_was_enabled);
+        if !self.server_mode {
+            ensure_exposed_auth_token(&mut state);
+        }
         // 本次显式清空 token 且没有同时开启强制鉴权开关（否则上一步已补 token）：
         // 管理 API / MCP 空 token 会拒绝全部请求，随清空一并关闭，保持「开关开 ⇒ 有 token」。
         if token_set_explicitly && state.gateway_user_token.trim().is_empty() {
@@ -791,7 +794,8 @@ impl GatewayService {
         )
     }
 
-    /// 读取本机 `.torrent`，上传 daemon blob 后走捕获路径建任务。
+    /// 读取本机 `.torrent`，上传 daemon blob 后走捕获路径建任务。`silent=false`（用户主动选择）
+    /// 不静默：由 daemon 发 BT 文件选择请求；`saveDir` / `queueId` / `startPaused` 缺省维持旧行为。
     async fn capture_submit_torrent_file(
         &self,
         params: serde_json::Value,
@@ -799,11 +803,11 @@ impl GatewayService {
         if self.open_associations.intercept(&params)? {
             return Ok(ignored_capture());
         }
-        let path = PathBuf::from(required_string(&params, "path")?);
-        let silent = params
-            .get("silent")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        // 缺失 / 空路径先按字段报错，其余参数再整体解析。
+        required_string(&params, "path")?;
+        let params =
+            parse_params::<fluxdown_protocol::agent::CaptureSubmitTorrentFileParams>(Some(params))?;
+        let path = PathBuf::from(&params.path);
         let bytes = read_upload_file(&path).await?;
         let blob_id = blob_value(self.blobs.upload(BlobKind::Torrent, bytes).await)?;
         let file_name = path
@@ -817,7 +821,10 @@ impl GatewayService {
         let request = fluxdown_protocol::DownloadRequest {
             url: format!("torrent-file://{file_name}"),
             filename,
-            save_dir: String::new(),
+            save_dir: params
+                .save_dir
+                .filter(|dir| !dir.trim().is_empty())
+                .unwrap_or_default(),
             referrer: String::new(),
             cookies: String::new(),
             headers: None,
@@ -827,7 +834,12 @@ impl GatewayService {
             body: None,
             audio_url: None,
         };
-        capture_value(self.capture.create_torrent(request, blob_id, silent).await)
+        let options = crate::capture::TorrentCreateOptions {
+            unattended: params.silent,
+            queue_id: params.queue_id.filter(|id| !id.trim().is_empty()),
+            start_paused: params.start_paused.unwrap_or(false),
+        };
+        capture_value(self.capture.create_torrent(request, blob_id, options).await)
     }
 
     /// 读取本机插件包，上传 daemon blob 后转 `daemon.plugin.install`。
@@ -1113,6 +1125,21 @@ pub(crate) fn ensure_forced_auth_token(
         state.gateway_user_token = generate_user_token();
         state.gateway.user_token_configured = true;
     }
+}
+
+/// 对外暴露面必须有 token：局域网监听或 CORS 放开，且接管 / aria2 兼容端点任一开启时，
+/// 空 token 等于向同网段 / 任意网页匿名开放（这两个端点空 token 不鉴权）。缺 token 时生成
+/// 随机 token，返回是否发生了改动；已有 token 一律保留。server 模式的空密钥表示尚未完成
+/// 首次设置，由兼容 API 自身拒绝，调用方不得对它调用本函数。
+pub(crate) fn ensure_exposed_auth_token(state: &mut crate::state::AgentState) -> bool {
+    let exposed = (state.gateway.lan_enabled || state.gateway.cors_enabled)
+        && (state.gateway.takeover_enabled || state.gateway.jsonrpc_enabled);
+    if exposed && state.gateway_user_token.trim().is_empty() {
+        state.gateway_user_token = generate_user_token();
+        state.gateway.user_token_configured = true;
+        return true;
+    }
+    false
 }
 
 fn remote_value<T: serde::Serialize>(
@@ -1464,8 +1491,12 @@ fn server_mode_denies(request: &RpcRequest) -> bool {
 enum Lane {
     /// FluxCloud / 网络往返（登录、设备、同步、远程任务、账单、更新检查）。
     Cloud,
-    /// 透传给 daemon 的下载命令。
+    /// 透传给 daemon 的下载命令与设置写入，同通道串行以保持命令顺序。
     Daemon,
+    /// 透传给 daemon 的长耗时方法（组件安装、插件市场、连通性测试等，清单见
+    /// `fluxdown_protocol::method::SLOW_DAEMON_METHODS`）：daemon 本就按请求并发处理，
+    /// 这里同样并发下发，不堵住普通 daemon 命令，也不被彼此堵住。
+    DaemonSlow,
     /// 其余本机操作。
     Local,
     /// 系统文件图标：列表首屏会一次发出一批，单独成道，不拖慢打开文件等本机操作。
@@ -1476,7 +1507,11 @@ enum Lane {
 
 fn lane_for(method_name: &str) -> Lane {
     if method_name.starts_with("daemon.") {
-        return Lane::Daemon;
+        return if fluxdown_protocol::method::is_slow_daemon_method(method_name) {
+            Lane::DaemonSlow
+        } else {
+            Lane::Daemon
+        };
     }
     if method_name == fluxdown_protocol::method::AGENT_PLATFORM_FILE_ICON {
         return Lane::Icon;
@@ -1509,10 +1544,14 @@ fn lane_for(method_name: &str) -> Lane {
 struct RequestLanes {
     cloud: tokio::sync::mpsc::Sender<RpcRequest>,
     daemon: tokio::sync::mpsc::Sender<RpcRequest>,
+    daemon_slow: tokio::sync::mpsc::Sender<RpcRequest>,
     local: tokio::sync::mpsc::Sender<RpcRequest>,
     icon: tokio::sync::mpsc::Sender<RpcRequest>,
     slow: tokio::sync::mpsc::Sender<RpcRequest>,
 }
+
+/// 单条连接同时在途的 daemon 慢调用上限（daemon 侧每连接上限为 16，留出余量）。
+const DAEMON_SLOW_CONCURRENCY: usize = 8;
 
 impl RequestLanes {
     fn spawn(
@@ -1533,9 +1572,32 @@ impl RequestLanes {
             });
             sender
         };
+        let start_concurrent = || {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel::<RpcRequest>(LANE_QUEUE);
+            let service = Arc::clone(service);
+            let responses = responses.clone();
+            let permits = Arc::new(tokio::sync::Semaphore::new(DAEMON_SLOW_CONCURRENCY));
+            tokio::spawn(async move {
+                while let Some(request) = receiver.recv().await {
+                    let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                        break;
+                    };
+                    let service = Arc::clone(&service);
+                    let responses = responses.clone();
+                    tokio::spawn(async move {
+                        let response = service.call(request).await;
+                        drop(permit);
+                        // 连接已关闭时响应无处可发，丢弃即可。
+                        let _ = responses.send(response).await;
+                    });
+                }
+            });
+            sender
+        };
         Self {
             cloud: start(),
             daemon: start(),
+            daemon_slow: start_concurrent(),
             local: start(),
             icon: start(),
             slow: start(),
@@ -1547,6 +1609,7 @@ impl RequestLanes {
         let sender = match lane_for(&request.method) {
             Lane::Cloud => &self.cloud,
             Lane::Daemon => &self.daemon,
+            Lane::DaemonSlow => &self.daemon_slow,
             Lane::Local => &self.local,
             Lane::Icon => &self.icon,
             Lane::Slow => &self.slow,
@@ -1611,8 +1674,8 @@ mod tests {
     };
 
     use super::{
-        GatewayService, GatewayShell, Lane, authorized, lane_for, load_or_create_bearer,
-        server_mode_denies,
+        GatewayService, GatewayShell, Lane, authorized, ensure_exposed_auth_token, lane_for,
+        load_or_create_bearer, server_mode_denies,
     };
     #[tokio::test]
     async fn service_bearer_is_exact_stable_and_private() {
@@ -1724,10 +1787,10 @@ mod tests {
                 )),
                 notifier: Arc::new(crate::notification::Notifier::new(dir.clone())),
             };
-            let daemon_config = crate::daemon_client::DaemonClientConfig {
-                rpc_url: "ws://127.0.0.1:9/rpc".to_owned(),
-                bearer: String::new(),
-            };
+            let daemon_config = crate::daemon_client::DaemonClientConfig::new(
+                "ws://127.0.0.1:9/rpc",
+                String::new(),
+            );
             let blobs = Arc::new(
                 crate::capture::DaemonBlobClient::new(&daemon_config).expect("blob client"),
             );
@@ -1744,7 +1807,9 @@ mod tests {
                 api_switches.clone(),
                 api_token.clone(),
             ));
-            let update = Arc::new(crate::update::UpdateService::new(env!("CARGO_PKG_VERSION")));
+            let update = Arc::new(crate::update::UpdateService::new(
+                fluxdown_protocol::APP_VERSION,
+            ));
             let link = crate::link::LinkService::new(crate::link::LinkServiceParts {
                 events: events.clone(),
                 state: state.clone(),
@@ -1959,6 +2024,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exposing_compat_endpoints_to_lan_or_cors_requires_a_token() {
+        let harness = TestGateway::new("gateway_exposed_token").await;
+
+        // 只开局域网、兼容端点全关：不必有 token。
+        let result = harness
+            .patch_gateway(serde_json::json!({
+                "takeoverEnabled": false,
+                "jsonrpcEnabled": false,
+                "lanEnabled": true
+            }))
+            .await;
+        assert_eq!(result["userTokenConfigured"], serde_json::json!(false));
+        assert!(harness.user_token().await.is_empty());
+
+        // 兼容端点在局域网下开启：补 token 并同步到运行期。
+        let result = harness
+            .patch_gateway(serde_json::json!({ "jsonrpcEnabled": true }))
+            .await;
+        assert_eq!(result["userTokenConfigured"], serde_json::json!(true));
+        let generated = harness.user_token().await;
+        assert_eq!(generated.len(), 64);
+        assert_eq!(&*harness.api_token.get(), generated);
+        let persisted = harness.store.load().await.expect("reload state");
+        assert_eq!(persisted.gateway_user_token, generated);
+
+        // 暴露面仍在时显式清空 token：重新补一个，不会回到匿名开放。
+        harness
+            .patch_gateway(serde_json::json!({ "userToken": "" }))
+            .await;
+        let refilled = harness.user_token().await;
+        assert_eq!(refilled.len(), 64);
+        assert_ne!(refilled, generated);
+
+        // 同一请求关掉暴露面并清空 token：尊重清空。
+        let result = harness
+            .patch_gateway(serde_json::json!({ "lanEnabled": false, "userToken": "" }))
+            .await;
+        assert_eq!(result["userTokenConfigured"], serde_json::json!(false));
+        assert!(harness.user_token().await.is_empty());
+
+        // CORS 放开同理。
+        let result = harness
+            .patch_gateway(serde_json::json!({ "corsEnabled": true }))
+            .await;
+        assert_eq!(result["userTokenConfigured"], serde_json::json!(true));
+        assert_eq!(harness.user_token().await.len(), 64);
+        harness.finish().await;
+    }
+
+    #[test]
+    fn exposed_token_is_only_generated_for_exposed_compat_endpoints() {
+        let mut state = crate::state::AgentState::default();
+        state.gateway.cors_enabled = true;
+        state.gateway.takeover_enabled = false;
+        state.gateway.jsonrpc_enabled = false;
+        assert!(!ensure_exposed_auth_token(&mut state));
+        state.gateway.takeover_enabled = true;
+        assert!(ensure_exposed_auth_token(&mut state));
+        let token = state.gateway_user_token.clone();
+        assert_eq!(token.len(), 64);
+        assert!(state.gateway.user_token_configured);
+        assert!(!ensure_exposed_auth_token(&mut state));
+        assert_eq!(state.gateway_user_token, token);
+    }
+
+    #[tokio::test]
     async fn file_backed_methods_reject_missing_or_non_regular_paths() {
         let harness = TestGateway::new("file_paths").await;
         for method_name in [
@@ -2049,6 +2180,21 @@ mod tests {
         assert!(matches!(lane_for("agent.link.pairFinish"), Lane::Slow));
         assert!(matches!(lane_for("agent.diagnostics.run"), Lane::Slow));
         assert!(matches!(lane_for("system.ping"), Lane::Local));
+    }
+
+    #[test]
+    fn slow_daemon_methods_leave_the_ordered_daemon_lane() {
+        for name in fluxdown_protocol::method::SLOW_DAEMON_METHODS {
+            assert!(matches!(lane_for(name), Lane::DaemonSlow), "{name}");
+        }
+        for name in [
+            fluxdown_protocol::method::DAEMON_TASK_PAUSE,
+            fluxdown_protocol::method::DAEMON_TASK_RESUME,
+            fluxdown_protocol::method::DAEMON_TASK_CREATE,
+            fluxdown_protocol::method::DAEMON_CONFIG_PATCH,
+        ] {
+            assert!(matches!(lane_for(name), Lane::Daemon), "{name}");
+        }
     }
 
     #[tokio::test]

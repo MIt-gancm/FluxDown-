@@ -6,6 +6,7 @@
 //! a no-op on non-Windows targets.
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=FLUXDOWN_APP_VERSION");
     #[cfg(windows)]
     embed_version_info();
 }
@@ -29,8 +30,12 @@ fn embed_version_info() {
         "LegalCopyright",
         "Copyright (C) 2026 FluxDown. All rights reserved.",
     );
-    res.set("FileVersion", env!("CARGO_PKG_VERSION"));
-    res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
+    let version = std::env::var("FLUXDOWN_APP_VERSION")
+        .ok()
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_owned());
+    res.set("FileVersion", &version);
+    res.set("ProductVersion", &version);
     if let Err(e) = res.compile() {
         // Don't fail the build on resource-compiler issues; just warn so the
         // binary still links (only the version block is missing).

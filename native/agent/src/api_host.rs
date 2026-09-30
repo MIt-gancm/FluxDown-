@@ -16,11 +16,11 @@ use fluxdown_protocol::{
     CreateTaskRequest, DaemonConfigPatch, DaemonCreateTaskParams, DownloadRequest, GroupDto,
     InstallPluginDevRequest, InstalledPlugin, LinkAuth, LinkCodeResponse, LinkDeviceInfo,
     LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome, LinkPairConfirmRequest,
-    LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo, MarketEntryDto,
-    MarketInstallRequest, PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto,
-    ResolvePreviewRequest, ResolvePreviewResponse, RpcErrorObject, RssItemActionRequest,
-    RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto,
-    SiteAuthEntryDto, SiteAuthGetParams, SiteAuthSaveRequest, TaskDto,
+    LinkPairHelloRequest, LinkPairHelloResponse, LinkPairRevealRequest, LinkPairRevealResponse,
+    LinkPingInfo, MarketEntryDto, MarketInstallRequest, PluginAuthRequest, PluginAuthResponse,
+    PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse, RpcErrorObject,
+    RssItemActionRequest, RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse,
+    SiteAuthCredentialDto, SiteAuthEntryDto, SiteAuthGetParams, SiteAuthSaveRequest, TaskDto,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -144,6 +144,7 @@ impl ApiHost for AgentApiHost {
                     request,
                     torrent_blob_id: None,
                     unattended: false,
+                    hint_file_size: None,
                 },
             )
             .await?;
@@ -376,6 +377,7 @@ impl ApiHost for AgentApiHost {
     async fn market_install(&self, plugin_id: &str) -> Result<String, ApiError> {
         let params = serde_json::to_value(MarketInstallRequest {
             plugin_id: plugin_id.to_owned(),
+            version: None,
         })
         .map_err(|error| ApiError::Internal(error.to_string()))?;
         self.installed(method::DAEMON_PLUGIN_MARKET_INSTALL, params)
@@ -515,6 +517,13 @@ impl ApiHost for AgentApiHost {
         source: Option<IpAddr>,
     ) -> Result<LinkPairHelloResponse, ApiError> {
         self.link.api_pair_hello(req, source).await
+    }
+
+    async fn link_pair_reveal(
+        &self,
+        req: LinkPairRevealRequest,
+    ) -> Result<LinkPairRevealResponse, ApiError> {
+        self.link.api_pair_reveal(req).await
     }
 
     async fn link_pair_confirm(

@@ -1,6 +1,6 @@
 //! 局域网直连的端到端测试：两个进程内 `LinkService`（各自独立的状态文件）经**真实 HTTP**
-//! （`fluxdown_api::server::api_router` + 回环端口）完成 probe → hello → SAS → confirm →
-//! 信息交换 → 下发；另用裸 TCP 服务模拟反代返回的非 FluxDown 响应。
+//! （`fluxdown_api::server::api_router` + 回环端口）完成 probe → hello → reveal → SAS → confirm →
+//! 信息交换 → 下发；另用裸 TCP 服务模拟反代返回的非 FluxDown 响应、旧版对端与冒充设备的代理。
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -17,7 +17,8 @@ use fluxdown_link::{LinkError, PeerAddress};
 use fluxdown_protocol::{
     AgentSnapshot, CreateTaskRequest, DaemonConfigSnapshot, DaemonSnapshot, DownloadRequest,
     ErrorReason, LinkAuth, LinkPairConfirmOutcome, LinkPairConfirmRequest, LinkPairHelloRequest,
-    LinkPairHelloResponse, LinkPingInfo, PathStyle, QueueDto, TaskDto,
+    LinkPairHelloResponse, LinkPairRevealRequest, LinkPairRevealResponse, LinkPingInfo, PathStyle,
+    QueueDto, TaskDto,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -102,6 +103,12 @@ impl ApiHost for LinkOnlyHost {
         source: Option<IpAddr>,
     ) -> Result<LinkPairHelloResponse, ApiError> {
         self.link.api_pair_hello(req, source).await
+    }
+    async fn link_pair_reveal(
+        &self,
+        req: LinkPairRevealRequest,
+    ) -> Result<LinkPairRevealResponse, ApiError> {
+        self.link.api_pair_reveal(req).await
     }
     async fn link_pair_confirm(
         &self,
@@ -267,7 +274,8 @@ async fn pair(responder: &Node, initiator: &Node) {
 }
 
 /// 裸 TCP「反代」：对任何请求回固定的 HTTP 响应，并记录首行请求行。
-async fn raw_server(response: &'static str) -> (SocketAddr, Arc<StdMutex<Vec<String>>>) {
+async fn raw_server(response: impl Into<String>) -> (SocketAddr, Arc<StdMutex<Vec<String>>>) {
+    let response: Arc<str> = Arc::from(response.into());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let request_lines = Arc::new(StdMutex::new(Vec::new()));
@@ -278,6 +286,7 @@ async fn raw_server(response: &'static str) -> (SocketAddr, Arc<StdMutex<Vec<Str
                 break;
             };
             let recorded = recorded.clone();
+            let response = response.clone();
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 8192];
                 let read = socket.read(&mut buffer).await.unwrap_or(0);
@@ -291,6 +300,76 @@ async fn raw_server(response: &'static str) -> (SocketAddr, Arc<StdMutex<Vec<Str
         }
     });
     (addr, request_lines)
+}
+
+/// 带 JSON 体的固定 HTTP 响应（供 [`raw_server`] 使用；`Content-Length` 自动计算）。
+fn http_json(status_line: &str, body: &str) -> String {
+    format!(
+        "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// 裸 TCP 冒充代理：`GET /ping` 由它自己应答并声称设备指纹是 `spoofed_fingerprint`，
+/// 其余连接原样转发给 `upstream`——等价于网络上的中间人在发现阶段之后换了一台设备。
+async fn spoofing_proxy(upstream: SocketAddr, spoofed_fingerprint: String) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                break;
+            };
+            let fingerprint = spoofed_fingerprint.clone();
+            tokio::spawn(async move {
+                let mut first = [0u8; 16];
+                let Ok(read) = client.peek(&mut first).await else {
+                    return;
+                };
+                if first[..read].starts_with(b"GET /ping") {
+                    let mut request = vec![0u8; 4096];
+                    let _ = client.read(&mut request).await;
+                    let body = serde_json::json!({
+                        "success": true,
+                        "app": "FluxDown",
+                        "version": "9.9.9",
+                        "message": "pong",
+                        "linkFingerprint": fingerprint,
+                        "linkName": "spoofed",
+                    })
+                    .to_string();
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = client.write_all(response.as_bytes()).await;
+                    let _ = client.shutdown().await;
+                    return;
+                }
+                let Ok(mut server) = tokio::net::TcpStream::connect(upstream).await else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+            });
+        }
+    });
+    addr
+}
+
+/// 直接对 `addr` 发一条 JSON POST，返回 `(状态码, JSON 响应体)`。
+async fn raw_post(addr: SocketAddr, path: &str, body: &str) -> (u16, serde_json::Value) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let text = String::from_utf8(response).unwrap();
+    let status: u16 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    (status, serde_json::from_str(body).unwrap())
 }
 
 const NGINX_400: &str = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/html\r\nContent-Length: 61\r\nConnection: close\r\n\r\n<html><body>The plain HTTP request was sent to HTTPS</body></html>";
@@ -500,6 +579,121 @@ async fn wrong_code_is_reported_as_invalid_code_not_as_a_network_problem() {
         rpc_error(&error, ErrorContext::Pairing).reason,
         Some(ErrorReason::PairingCodeInvalid)
     );
+}
+
+#[tokio::test]
+async fn pairing_aborts_before_reveal_when_peer_identity_differs_from_the_probed_one() {
+    // 发现阶段（/ping）看到该地址是设备 F；握手时地址上出示的身份却是另一台设备：
+    // 发起方必须在揭示临时公钥之前就终止，响应方不会弹出任何待核对的入站配对。
+    let responder = Node::start("nas").await;
+    let initiator = Node::start("laptop").await;
+    let spoofed = "f".repeat(64);
+    let proxy = spoofing_proxy(responder.addr, spoofed.clone())
+        .await
+        .to_string();
+
+    let probed = initiator.service.probe(&proxy).await.unwrap();
+    assert_eq!(probed.fingerprint.as_deref(), Some(spoofed.as_str()));
+
+    let code = responder.service.pairing_code().await.unwrap();
+    let error = initiator
+        .service
+        .pair_begin(&proxy, &code.code)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LinkOpError::Link(LinkError::IdentityMismatch(_))),
+        "{error:?}"
+    );
+    assert_eq!(
+        rpc_error(&error, ErrorContext::Pairing).reason,
+        Some(ErrorReason::PairingSignatureInvalid)
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        responder
+            .events
+            .inspect(|snapshot| snapshot.link_pairing_requests.is_empty()),
+        "no SAS may be shown on the responder before the initiator reveals"
+    );
+    assert!(
+        initiator
+            .events
+            .inspect(|snapshot| snapshot.linked_devices.is_empty())
+    );
+}
+
+#[tokio::test]
+async fn old_protocol_peers_are_rejected_with_an_explicit_version_error() {
+    let initiator = Node::start("laptop").await;
+
+    // 旧版响应方：看不懂新 hello，以「invalid link hello payload」拒绝。
+    let rejection = http_json(
+        "400 Bad Request",
+        r#"{"success":false,"message":"invalid link hello payload: missing field `initiatorEphPub` at line 1 column 120"}"#,
+    );
+    let (addr, _) = raw_server(rejection).await;
+    let error = initiator
+        .service
+        .pair_begin(&addr.to_string(), "123456")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LinkOpError::Link(LinkError::UnsupportedVersion)),
+        "{error:?}"
+    );
+    let data = rpc_error(&error, ErrorContext::Pairing);
+    assert_eq!(data.code, fluxdown_protocol::ApplicationErrorCode::Conflict);
+    assert!(!data.retryable);
+    assert_eq!(
+        data.reason,
+        Some(fluxdown_protocol::ErrorReason::PairingVersionMismatch)
+    );
+
+    // 旧版响应方的 hello 回复：带明文 SAS 与自己的签名、没有 protocolVersion。
+    let legacy_reply = http_json(
+        "200 OK",
+        r#"{"sessionId":"s","responderEphPub":"AA","responderIdPub":"AA","responderSig":"AA","name":"old-nas","sas":"123456"}"#,
+    );
+    let (addr, _) = raw_server(legacy_reply).await;
+    let error = initiator
+        .service
+        .pair_begin(&addr.to_string(), "123456")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, LinkOpError::Link(LinkError::UnsupportedVersion)),
+        "{error:?}"
+    );
+
+    // 旧版发起方的 hello（带临时公钥明文、没有 protocolVersion / 承诺）：响应方以版本
+    // 不兼容拒绝，且不消耗配对码。
+    let responder = Node::start("nas").await;
+    let code = responder.service.pairing_code().await.unwrap();
+    let legacy_hello = serde_json::json!({
+        "code": code.code,
+        "initiatorEphPub": "AAAA",
+        "initiatorIdPub": "AAAA",
+        "initiatorSig": "AAAA",
+        "name": "old",
+        "platform": "",
+        "appVersion": "",
+        "initiatorAddrs": [],
+    })
+    .to_string();
+    let (status, body) = raw_post(responder.addr, "/api/v1/link/pair/hello", &legacy_hello).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["success"], false);
+    let message = body["message"].as_str().unwrap();
+    assert!(matches!(
+        LinkError::from_wire_message(message),
+        Some(LinkError::UnsupportedVersion)
+    ));
+    initiator
+        .service
+        .pair_begin(&responder.address(), &code.code)
+        .await
+        .expect("the pairing code must survive a version-mismatched hello");
 }
 
 #[tokio::test]

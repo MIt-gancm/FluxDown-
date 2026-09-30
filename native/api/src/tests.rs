@@ -423,6 +423,7 @@ fn sample_task(id: &str, status: i32) -> TaskDto {
         seed_post_ratio_limit_milli: -2,
         seed_time_limit_minutes: -2,
         seed_inactive_time_limit_minutes: -2,
+        seed_upload_limit_bps: 0,
     }
 }
 
@@ -2214,6 +2215,72 @@ async fn ws_session_closes_when_token_rotates() {
         closed.is_ok(),
         "WS session must be dropped after the token changes"
     );
+}
+
+#[tokio::test]
+async fn require_token_rejects_takeover_and_jsonrpc_until_a_token_exists() {
+    let cell = crate::auth::TokenCell::new("");
+    let shared = cell.clone();
+    let server = TestServer::start(MockHost::new(), move |config| {
+        config.token = shared;
+        config.require_token = true;
+    })
+    .await;
+
+    let jsonrpc = server
+        .send(&request(
+            "POST",
+            routes::JSONRPC,
+            &[],
+            &jsonrpc_version_body(),
+        ))
+        .await;
+    assert_eq!(jsonrpc.status, 403);
+    assert_eq!(jsonrpc.json()["message"], server::SETUP_REQUIRED_MESSAGE);
+    let takeover = server
+        .send(&request(
+            "POST",
+            routes::DOWNLOAD,
+            &[("X-FluxDown-Client", "script")],
+            r#"{"url":"https://a.com/f.zip","filename":"f.zip"}"#,
+        ))
+        .await;
+    assert_eq!(takeover.status, 403);
+    assert_eq!(takeover.json()["message"], server::SETUP_REQUIRED_MESSAGE);
+    assert!(
+        server.ws_connect_err().await.is_err(),
+        "WS upgrade must be refused before the access key is set"
+    );
+    assert_eq!(
+        server
+            .send(&request("GET", routes::PING, &[], ""))
+            .await
+            .status,
+        200
+    );
+
+    cell.set("flux2026");
+    let denied = server
+        .send(&request(
+            "POST",
+            routes::JSONRPC,
+            &[],
+            &jsonrpc_version_body(),
+        ))
+        .await;
+    assert_eq!(denied.status, 200);
+    assert_eq!(denied.json()["error"]["message"], "Unauthorized");
+    let allowed = server
+        .send(&request(
+            "POST",
+            routes::JSONRPC,
+            &[("X-FluxDown-Token", "flux2026")],
+            &jsonrpc_version_body(),
+        ))
+        .await;
+    assert_eq!(allowed.status, 200);
+    assert!(allowed.json().get("error").is_none(), "{}", allowed.body);
+    assert!(server.ws_connect_err().await.is_ok());
 }
 
 // ---------------------------------------------------------------------------

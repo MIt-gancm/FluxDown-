@@ -42,8 +42,8 @@ use fluxdown_protocol::daemon::{
     LinkAuth, LinkDeviceTaskRequest, LinkDevicesResponse, LinkDiscoveredResponse,
     LinkDiscoveryRequest, LinkOkResponse, LinkPairApproveRequest, LinkPairBeginRequest,
     LinkPairConfirmRequest, LinkPairFinishRequest, LinkPairFinishResponse, LinkPairHelloRequest,
-    LinkProbeRequest, ResolvePreviewRequest, RssItemActionRequest, RssSourceDto,
-    RssValidateRequest, SiteAuthCredentialDto, SiteAuthEntryDto, SiteAuthSaveRequest,
+    LinkPairRevealRequest, LinkProbeRequest, ResolvePreviewRequest, RssItemActionRequest,
+    RssSourceDto, RssValidateRequest, SiteAuthCredentialDto, SiteAuthEntryDto, SiteAuthSaveRequest,
 };
 
 /// 请求体大小上限：4 MB（足够容纳批量 URL 列表）。
@@ -52,6 +52,9 @@ const MAX_BODY_SIZE: usize = 4 * 1024 * 1024;
 const BIND_RETRIES: u32 = 20;
 /// 每次重绑重试间隔。
 const BIND_RETRY_DELAY: Duration = Duration::from_millis(100);
+/// 访问密钥尚未设置（[`ApiServerConfig::require_token`]）时 takeover / jsonrpc 的拒绝消息，
+/// 调用方据此区分「需先完成首次设置」与「token 错误」。
+pub const SETUP_REQUIRED_MESSAGE: &str = "setup required: set the access key first";
 /// `Allow` / `Access-Control-Allow-Methods` 的方法全集。
 const ALLOWED_METHODS: &str = "GET, POST, PUT, DELETE, OPTIONS";
 /// `Access-Control-Allow-Origin` / `-Allow-Headers` 的通配值（仅在
@@ -114,6 +117,10 @@ pub struct ApiServerConfig {
     /// 时自动视为开启；经 [`api_router`] 复用核心路由的宿主（agent / 服务器）需要自行
     /// 在「确定只监听回环」时置 true，局域网 / 服务器模式保持 false。
     pub enforce_loopback_host: bool,
+    /// 访问密钥为空时 takeover（`/download*`）与 aria2 兼容（`/jsonrpc`，POST 与 WS）一律
+    /// 403 [`SETUP_REQUIRED_MESSAGE`]（默认 false：桌面宿主空 token = 不鉴权）。headless
+    /// 服务器置 true：首次设置完成前不向 `0.0.0.0` 匿名开放；密钥写入后按开关生效。
+    pub require_token: bool,
     /// agent 使用的热切换路由开关；普通宿主为 `None`，维持静态注册行为。
     pub runtime_switches: Option<Arc<ApiRuntimeSwitches>>,
     /// 宿主应用版本号（`/ping`、`/api/v1/info` 返回）。
@@ -196,6 +203,7 @@ impl ApiServerConfig {
             lan_enabled: flag("local_server_lan_enabled", false),
             cors_allow_all: flag("local_server_cors_allow_all", false),
             enforce_loopback_host: false,
+            require_token: false,
             runtime_switches: None,
             app_version: app_version.to_string(),
         }
@@ -363,6 +371,7 @@ fn register_core(state: AppState) -> Router<AppState> {
     // 每对独立链路 HMAC 守卫），故与 /ping 同级恒注册，不进 management 分组。
     router = router
         .route(routes::API_LINK_PAIR_HELLO, post(api_link_pair_hello))
+        .route(routes::API_LINK_PAIR_REVEAL, post(api_link_pair_reveal))
         .route(routes::API_LINK_PAIR_CONFIRM, post(api_link_pair_confirm))
         .route(routes::API_LINK_TASKS, post(api_link_create_task))
         .route(routes::API_LINK_INFO, post(api_link_info));
@@ -660,6 +669,7 @@ async fn route_group_guard(
         && !matches!(
             path,
             routes::API_LINK_PAIR_HELLO
+                | routes::API_LINK_PAIR_REVEAL
                 | routes::API_LINK_PAIR_CONFIRM
                 | routes::API_LINK_TASKS
                 | routes::API_LINK_INFO
@@ -671,6 +681,12 @@ async fn route_group_guard(
     };
     if group.is_some_and(|group| !state.config.route_enabled(group)) {
         return unknown_endpoint().await;
+    }
+    if state.config.require_token
+        && matches!(group, Some(RouteGroup::Takeover | RouteGroup::JsonRpc))
+        && state.config.token.is_empty()
+    {
+        return result_response(StatusCode::FORBIDDEN, false, SETUP_REQUIRED_MESSAGE);
     }
     next.run(req).await
 }
@@ -751,11 +767,11 @@ pub(crate) async fn ping(State(state): State<AppState>) -> Response {
 
 /// 处理配对 `hello`（发起方 → 本机）。
 #[utoipa::path(post, path = "/api/v1/link/pair/hello", tag = "link",
-    description = "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。",
+    description = "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。请求只携带发起方临时公钥与随机数的承诺；响应方回出本次会话全新的临时公钥与随机数（不含 SAS）。`protocolVersion` 与响应方不一致（含旧版发起方）一律以版本不兼容拒绝。",
     request_body = LinkPairHelloRequest,
     responses(
-        (status = 200, description = "响应方临时公钥 + SAS 材料", body = fluxdown_protocol::daemon::LinkPairHelloResponse),
-        (status = 400, description = "配对码错误/过期/已用，或载荷非法", body = fluxdown_protocol::daemon::ResultMessage),
+        (status = 200, description = "响应方本次会话的临时公钥与随机数", body = fluxdown_protocol::daemon::LinkPairHelloResponse),
+        (status = 400, description = "配对码错误/过期/已用、协议版本不兼容，或载荷非法", body = fluxdown_protocol::daemon::ResultMessage),
     )
 )]
 pub(crate) async fn api_link_pair_hello(
@@ -794,9 +810,35 @@ pub(crate) async fn api_link_pair_hello(
     }
 }
 
+/// 处理配对 `reveal`（发起方揭示 hello 里承诺的临时公钥）。
+#[utoipa::path(post, path = "/api/v1/link/pair/reveal", tag = "link",
+    description = "配对握手第二步（发起方 → 响应方）：揭示 `pair/hello` 里承诺过的临时公钥与随机数，响应方核对承诺后返回对完整握手转录的身份签名。**无 token 鉴权**：由 `pair/hello` 建立的 sessionId 与公钥承诺守卫，承诺不符即作废会话。",
+    request_body = LinkPairRevealRequest,
+    responses(
+        (status = 200, description = "响应方对完整转录的签名", body = fluxdown_protocol::daemon::LinkPairRevealResponse),
+        (status = 400, description = "会话不存在/已过期、承诺不符，或载荷非法", body = fluxdown_protocol::daemon::ResultMessage),
+    )
+)]
+pub(crate) async fn api_link_pair_reveal(State(state): State<AppState>, body: Bytes) -> Response {
+    let req: LinkPairRevealRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return result_response(
+                StatusCode::BAD_REQUEST,
+                false,
+                &format!("invalid link reveal payload: {e}"),
+            );
+        }
+    };
+    match state.host.link_pair_reveal(req).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
 /// 处理配对 `confirm`（SAS 核对后确认/拒绝）。
 #[utoipa::path(post, path = "/api/v1/link/pair/confirm", tag = "link",
-    description = "配对第二步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立的 sessionId 守卫）。**无 token 鉴权**。",
+    description = "配对第三步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立、pair/reveal 揭示后的 sessionId 守卫；未揭示的会话上 confirm=true 属协议违规）。**无 token 鉴权**。",
     request_body = LinkPairConfirmRequest,
     responses(
         (status = 200, description = "`{success,paired,reason}`"),
@@ -2180,11 +2222,12 @@ pub(crate) async fn api_delete_rss_source(
 }
 
 /// 立即抓取一个订阅。抓取异步派发，本端点只表示「已受理」，结果走
-/// `rssSourcesChanged` / `rssItemsChanged` 事件。
+/// `rssSourcesChanged` / `rssItemsChanged` 事件；该订阅已在抓取时同样视为成功，
+/// 仅订阅不存在返回 404。
 #[utoipa::path(post, path = "/api/v1/rss/{id}/refresh", tag = "rss",
     params(("id" = String, Path, description = "订阅 ID（UUID）")),
     responses(
-        (status = 200, description = "已派发抓取", body = fluxdown_protocol::daemon::ResultMessage),
+        (status = 200, description = "已受理（已派发抓取；该订阅已在抓取时同样视为成功）", body = fluxdown_protocol::daemon::ResultMessage),
         (status = 404, description = "订阅不存在", body = fluxdown_protocol::daemon::ResultMessage),
         (status = 401, description = "token 无效", body = fluxdown_protocol::daemon::ResultMessage),
     ),

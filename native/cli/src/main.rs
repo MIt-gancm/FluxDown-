@@ -26,7 +26,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
 /// FluxDown 命令行下载客户端。
 #[derive(Debug, Parser)]
-#[command(name = "fluxdown", version, about, long_about = None)]
+#[command(name = "fluxdown", version = fluxdown_protocol::APP_VERSION, about, long_about = None)]
 struct Cli {
     /// 服务基址（默认 http://127.0.0.1:17800）。
     #[arg(long, global = true, env = "FLUXDOWN_URL")]

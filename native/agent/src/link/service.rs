@@ -1,8 +1,9 @@
 //! 局域网直连（L1）服务：把 `fluxdown_link::LinkManager` 装配进 agent。
 //!
 //! 职责：
-//! - **响应端**：兼容 API 的 `/ping`（`linkFingerprint`）、`pair/hello`、`pair/confirm`、
-//!   数据面 `link/tasks` 与 `link/info`；入站配对请求进快照 / 事件，由 `agent.link.approve` 决定；
+//! - **响应端**：兼容 API 的 `/ping`（`linkFingerprint`）、`pair/hello`、`pair/reveal`、
+//!   `pair/confirm`、数据面 `link/tasks` 与 `link/info`；入站配对请求（揭示被受理后）进快照 /
+//!   事件，由 `agent.link.approve` 决定；
 //!   接单时按契约做目录回退（非本机风格绝对路径 → 本机默认目录；带目录建任务失败 → 去掉目录重试）。
 //! - **发起端**：mDNS 发现（`LinkDiscoveredChanged`）、手动地址探测、配对（SAS 由 UI 核对）、
 //!   解除配对、在线探测（`LinkDeviceInfo.online` 真实值）、下发任务、经已认证链路交换
@@ -23,7 +24,7 @@ use fluxdown_api::service::{ApiError, link_unsupported};
 use fluxdown_link::pairing::{CODE_TTL_SECS, DECISION_WINDOW_SECS};
 use fluxdown_link::{
     DiscoveredPeer, DiscoveryKind, LinkEngineEvent, LinkError, LinkManager, LinkOptions,
-    LinkResult, PairConfirmOutcome, PeerAddress, PeerInfo, SelfInfo, WireHello,
+    LinkResult, PairConfirmOutcome, PeerAddress, PeerInfo, SelfInfo, WireHello, WireReveal,
 };
 use fluxdown_protocol::{
     AgentEvent, ApplicationErrorCode, CreateTaskRequest, DaemonCreateTaskParams, ErrorReason,
@@ -31,8 +32,8 @@ use fluxdown_protocol::{
     LinkDeviceParams, LinkDiscoveredPeer, LinkDiscoveryParams, LinkDispatchParams,
     LinkDispatchResult, LinkPairBeginParams, LinkPairBeginResponse, LinkPairConfirmOutcome,
     LinkPairConfirmRequest, LinkPairFinishParams, LinkPairFinishResponse, LinkPairHelloRequest,
-    LinkPairHelloResponse, LinkPairingCodeDto, LinkPairingRequestDto, LinkPingInfo,
-    LinkTaskRequest, PathStyle, RpcErrorData, method,
+    LinkPairHelloResponse, LinkPairRevealRequest, LinkPairRevealResponse, LinkPairingCodeDto,
+    LinkPairingRequestDto, LinkPingInfo, LinkTaskRequest, PathStyle, RpcErrorData, method,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -93,6 +94,7 @@ impl LinkTaskCreator for DaemonTaskCreator {
                     torrent_blob_id: None,
                     // 对端下发的任务没有人在本机确认选择框：全选文件直接开始。
                     unattended: true,
+                    hint_file_size: None,
                 }),
             )
             .await
@@ -194,9 +196,26 @@ pub fn rpc_error(error: &LinkOpError, context: ErrorContext) -> RpcErrorData {
                 false,
                 Some(ErrorReason::PairingNotFluxDown),
             ),
+            // 配对阶段：地址上出示的身份与发现指纹不符，按身份校验失败提示；
+            // 已配对设备上：拨通的不是那台设备，按离线处理。
             LinkError::IdentityMismatch(_) => {
-                (Code::Conflict, false, Some(ErrorReason::PeerOffline))
+                let reason = if context == ErrorContext::Pairing {
+                    ErrorReason::PairingSignatureInvalid
+                } else {
+                    ErrorReason::PeerOffline
+                };
+                (Code::Conflict, false, Some(reason))
             }
+            LinkError::CommitmentMismatch => (
+                Code::InvalidArgument,
+                false,
+                Some(ErrorReason::PairingSignatureInvalid),
+            ),
+            LinkError::UnsupportedVersion => (
+                Code::Conflict,
+                false,
+                Some(ErrorReason::PairingVersionMismatch),
+            ),
             LinkError::Unauthorized => {
                 (Code::Unauthorized, false, Some(ErrorReason::PeerNotPaired))
             }
@@ -245,6 +264,8 @@ fn api_error(error: LinkError) -> ApiError {
         | LinkError::RejectedByPeer
         | LinkError::PairingTimeout
         | LinkError::IdentityMismatch(_)
+        | LinkError::CommitmentMismatch
+        | LinkError::UnsupportedVersion
         | LinkError::NotFluxDown(_) => ApiError::BadRequest(error.to_string()),
         LinkError::Unreachable | LinkError::Unavailable => ApiError::Unavailable,
         LinkError::Io(_) | LinkError::Store(_) => ApiError::Internal(error.to_string()),
@@ -490,7 +511,7 @@ impl LinkService {
             } else {
                 std::env::consts::OS.to_owned()
             }),
-            app_version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            app_version: Some(fluxdown_protocol::APP_VERSION.to_owned()),
         };
         let options = LinkOptions {
             api_port: self.bound.port(),
@@ -1006,9 +1027,10 @@ impl LinkService {
     ) -> Result<LinkPairHelloResponse, ApiError> {
         let manager = self.api_manager()?;
         let wire = WireHello {
+            protocol_version: req.protocol_version,
             code: req.code,
-            initiator_eph_pub: req.initiator_eph_pub,
             initiator_id_pub: req.initiator_id_pub,
+            initiator_commit: req.initiator_commit,
             initiator_sig: req.initiator_sig,
             name: req.name,
             platform: non_empty(req.platform),
@@ -1017,14 +1039,31 @@ impl LinkService {
         };
         let resp = manager.pair_hello_wire(wire, source).map_err(api_error)?;
         Ok(LinkPairHelloResponse {
+            protocol_version: resp.protocol_version,
             session_id: resp.session_id,
             responder_eph_pub: resp.responder_eph_pub,
+            responder_nonce: resp.responder_nonce,
             responder_id_pub: resp.responder_id_pub,
-            responder_sig: resp.responder_sig,
             name: resp.name,
             platform: resp.platform.unwrap_or_default(),
             app_version: resp.app_version.unwrap_or_default(),
-            sas: resp.sas,
+        })
+    }
+
+    pub async fn api_pair_reveal(
+        &self,
+        req: LinkPairRevealRequest,
+    ) -> Result<LinkPairRevealResponse, ApiError> {
+        let manager = self.api_manager()?;
+        let resp = manager
+            .pair_reveal_wire(WireReveal {
+                session_id: req.session_id,
+                initiator_eph_pub: req.initiator_eph_pub,
+                initiator_nonce: req.initiator_nonce,
+            })
+            .map_err(api_error)?;
+        Ok(LinkPairRevealResponse {
+            responder_sig: resp.responder_sig,
         })
     }
 

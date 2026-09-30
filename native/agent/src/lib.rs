@@ -51,7 +51,7 @@ pub fn service_hello(instance_id: impl Into<String>, capabilities: Vec<String>) 
     ServiceHello::new(
         ServiceRole::Agent,
         SERVICE_NAME,
-        env!("CARGO_PKG_VERSION"),
+        fluxdown_protocol::APP_VERSION,
         instance_id,
         capabilities,
     )

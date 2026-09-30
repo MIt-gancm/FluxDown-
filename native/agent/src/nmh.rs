@@ -308,12 +308,19 @@ where
 
 #[cfg(unix)]
 async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let path = unix_socket_path();
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
+    let path = unix_socket_path().ok_or_else(endpoint_unavailable)?;
+    let dir = path.parent().ok_or_else(endpoint_unavailable)?;
+    // 0700 目录：其它用户无法进入、连接或抢占 socket 路径；属主不是当前用户时 chmod 失败，
+    // 端点直接不可用而不是退回共享位置。
+    tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .await?;
+    tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    let owner_uid = tokio::fs::metadata(dir).await?.uid();
     if tokio::fs::try_exists(&path).await? {
         match tokio::net::UnixStream::connect(&path).await {
             Ok(_) => {
@@ -344,6 +351,11 @@ async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<()
                         continue;
                     }
                 };
+                // 0700 目录之外的纵深防御：对端 uid 必须等于 socket 目录属主（本进程用户）。
+                if !stream.peer_cred().is_ok_and(|cred| cred.uid() == owner_uid) {
+                    tracing::warn!("NMH socket rejected a connection from another user");
+                    continue;
+                }
                 let service = service.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_stream(stream, service).await {
@@ -355,42 +367,38 @@ async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<()
     }
 }
 
-#[cfg(target_os = "linux")]
-fn unix_socket_path() -> std::path::PathBuf {
-    std::env::var_os("HOME").map_or_else(
-        || std::path::PathBuf::from("/tmp/fluxdown.sock"),
-        |home| std::path::PathBuf::from(home).join(".local/share/fluxdown/fluxdown.sock"),
-    )
+/// Unix IPC socket：`<数据目录>/ipc/fluxdown.sock`，`ipc` 是仅当前用户可进入的 0700 目录。
+/// 数据目录刻意放在 home 下：宿主与 Flatpak/Snap 沙箱都可达（`$XDG_RUNTIME_DIR` 在沙箱内会被
+/// 重映射）。中继（`native/nmh/src/main.rs` 的 `socket_path_under`）独立推导同一路径，
+/// 两侧测试用同一组字面量钉住。
+#[cfg(any(unix, test))]
+fn socket_path_under(home: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "macos")]
+    let data_dir = home
+        .join("Library")
+        .join("Application Support")
+        .join("fluxdown");
+    #[cfg(not(target_os = "macos"))]
+    let data_dir = home.join(".local").join("share").join("fluxdown");
+    data_dir.join("ipc").join("fluxdown.sock")
 }
 
-#[cfg(target_os = "macos")]
-fn unix_socket_path() -> std::path::PathBuf {
-    std::env::var_os("HOME").map_or_else(
-        || std::path::PathBuf::from("/tmp/fluxdown.sock"),
-        |home| {
-            std::path::PathBuf::from(home)
-                .join("Library/Application Support/fluxdown/fluxdown.sock")
-        },
-    )
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn unix_socket_path() -> std::path::PathBuf {
-    std::env::var_os("XDG_RUNTIME_DIR").map_or_else(
-        || std::path::PathBuf::from("/tmp/fluxdown.sock"),
-        |dir| std::path::PathBuf::from(dir).join("fluxdown.sock"),
-    )
+/// 无 home 目录时没有端点（不回退到任何共享目录）。
+#[cfg(unix)]
+fn unix_socket_path() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|dirs| socket_path_under(dirs.home_dir()))
 }
 
 #[cfg(windows)]
 async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<(), std::io::Error> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
+    let pipe_name = pipe_name().ok_or_else(endpoint_unavailable)?;
     let mut first = true;
     loop {
         let server = ServerOptions::new()
             .first_pipe_instance(first)
-            .create(PIPE_NAME)?;
+            .create(&pipe_name)?;
         first = false;
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -412,33 +420,72 @@ async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<()
     }
 }
 
-/// 中继拨号的 IPC 端点（unix socket 路径或命名管道名）。
+/// 中继拨号的 IPC 端点（unix socket 路径或命名管道名）；无法确定当前用户时为 `unavailable`。
 #[must_use]
 pub fn ipc_endpoint() -> String {
     #[cfg(unix)]
     {
-        unix_socket_path().display().to_string()
+        unix_socket_path().map_or_else(
+            || "unavailable".to_owned(),
+            |path| path.display().to_string(),
+        )
     }
     #[cfg(windows)]
     {
-        PIPE_NAME.to_owned()
+        pipe_name().unwrap_or_else(|| "unavailable".to_owned())
     }
 }
 
+/// Windows Named Pipe for the current account: `\\.\pipe\fluxdown-<account>`。账户名转小写后，
+/// `[a-z0-9]` 之外的每个字节编码为 `_xx`（下划线本身也编码），不同账户不会落到同一管道。
+/// 中继（`native/nmh/src/main.rs` 的 `pipe_name_for`）独立推导同一名字，两侧测试用同一组字面量钉住。
+#[cfg(any(windows, test))]
+fn pipe_name_for(user: &str) -> Option<String> {
+    if user.is_empty() {
+        return None;
+    }
+    let mut name = String::from(r"\\.\pipe\fluxdown-");
+    for byte in user.to_lowercase().bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("_{byte:02x}"));
+        }
+    }
+    Some(name)
+}
+
 #[cfg(windows)]
-const PIPE_NAME: &str = r"\\.\pipe\fluxdown";
+fn pipe_name() -> Option<String> {
+    std::env::var("USERNAME")
+        .ok()
+        .and_then(|user| pipe_name_for(&user))
+}
 
 /// 以中继的长度帧协议向本进程 IPC 端点发送 `ping`，成功返回 `pong` 载荷。
 pub async fn probe_ipc(timeout: std::time::Duration) -> Result<String, std::io::Error> {
     tokio::time::timeout(timeout, async {
         #[cfg(unix)]
-        let stream = tokio::net::UnixStream::connect(unix_socket_path()).await?;
+        let stream = {
+            let path = unix_socket_path().ok_or_else(endpoint_unavailable)?;
+            tokio::net::UnixStream::connect(path).await?
+        };
         #[cfg(windows)]
-        let stream = tokio::net::windows::named_pipe::ClientOptions::new().open(PIPE_NAME)?;
+        let stream = {
+            let name = pipe_name().ok_or_else(endpoint_unavailable)?;
+            tokio::net::windows::named_pipe::ClientOptions::new().open(name)?
+        };
         ping_stream(stream).await
     })
     .await
     .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "IPC ping timed out"))?
+}
+
+fn endpoint_unavailable() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "native messaging IPC endpoint is unavailable (no home directory / account name)",
+    )
 }
 
 async fn ping_stream<S>(mut stream: S) -> Result<String, std::io::Error>
@@ -1551,9 +1598,55 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        MAX_BATCH_ITEMS, NmhService, PipeMessage, handle_stream, ping_stream, select_task_briefs,
+        MAX_BATCH_ITEMS, NmhService, PipeMessage, handle_stream, ping_stream, pipe_name_for,
+        select_task_briefs, socket_path_under,
     };
 
+    /// 与 `native/nmh/src/main.rs` 的 `unix_socket_lives_in_a_private_per_user_ipc_dir`
+    /// 使用同一组字面量：agent 与中继各自推导端点，必须算出同一路径。
+    #[test]
+    fn unix_socket_lives_in_a_private_per_user_ipc_dir() {
+        let (home, expected) = if cfg!(target_os = "macos") {
+            (
+                "/Users/alice",
+                "/Users/alice/Library/Application Support/fluxdown/ipc/fluxdown.sock",
+            )
+        } else {
+            (
+                "/home/alice",
+                "/home/alice/.local/share/fluxdown/ipc/fluxdown.sock",
+            )
+        };
+        assert_eq!(
+            socket_path_under(std::path::Path::new(home)),
+            std::path::PathBuf::from(expected)
+        );
+    }
+
+    /// 与 `native/nmh/src/main.rs` 的 `pipe_name_is_per_user_and_injective` 使用同一组字面量。
+    #[test]
+    fn pipe_name_is_per_user_and_injective() {
+        assert_eq!(
+            pipe_name_for("Alice Smith").as_deref(),
+            Some(r"\\.\pipe\fluxdown-alice_20smith")
+        );
+        assert_eq!(
+            pipe_name_for("a_b"),
+            Some(r"\\.\pipe\fluxdown-a_5fb".to_owned())
+        );
+        assert_eq!(
+            pipe_name_for("a b"),
+            Some(r"\\.\pipe\fluxdown-a_20b".to_owned())
+        );
+        assert_eq!(
+            pipe_name_for("张三").as_deref(),
+            Some(r"\\.\pipe\fluxdown-_e5_bc_a0_e4_b8_89")
+        );
+        assert_eq!(pipe_name_for(""), None);
+        assert_ne!(pipe_name_for("alice"), pipe_name_for("bob"));
+        // Windows 账户名不区分大小写。
+        assert_eq!(pipe_name_for("ALICE"), pipe_name_for("alice"));
+    }
     #[test]
     fn task_panel_reports_live_download_speed() {
         let task = |id: &str| -> fluxdown_protocol::TaskDto {

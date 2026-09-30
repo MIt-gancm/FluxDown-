@@ -3,12 +3,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
+use fluxdown_protocol::handshake::{
+    AuthChallengeParams, AuthChallengeResult, AuthProveParams, SYSTEM_AUTH_CHALLENGE,
+    SYSTEM_AUTH_PROVE, client_proof, http_credential, verify_server_proof,
+};
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
-    ApplicationErrorCode, EventFrame, RequestId, RpcErrorData, RpcErrorObject, RpcNotification,
-    RpcRequest, RpcResponse, ServiceHello, ServiceRole, Snapshot, SnapshotBody,
+    ApplicationErrorCode, EventFrame, METHOD_NOT_FOUND_CODE, RequestId, RpcErrorData,
+    RpcErrorObject, RpcNotification, RpcRequest, RpcResponse, ServiceHello, ServiceRole, Snapshot,
+    SnapshotBody,
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -18,9 +24,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::tungstenite::http::{HeaderValue, header};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::supervisor::DaemonSupervisor;
 
@@ -30,10 +36,27 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 #[derive(Clone)]
 pub struct DaemonClientConfig {
     pub rpc_url: String,
-    pub bearer: String,
+    /// `daemon.token` 的内容：只用于握手 MAC 的密钥，永不发送，也不当作 HTTP 凭据。
+    token: Arc<str>,
+    http: HttpSession,
 }
 
 impl DaemonClientConfig {
+    #[must_use]
+    pub fn new(rpc_url: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            rpc_url: rpc_url.into(),
+            token: Arc::from(token.into()),
+            http: HttpSession::default(),
+        }
+    }
+
+    /// 与本配置的 daemon 连接绑定的 HTTP 凭据句柄（`/blobs`、`/files`、`/exports` 用）。
+    #[must_use]
+    pub fn http_session(&self) -> HttpSession {
+        self.http.clone()
+    }
+
     /// 拒绝非 loopback daemon URL。
     pub fn validate(&self) -> Result<(), DaemonClientError> {
         let url = reqwest::Url::parse(&self.rpc_url)
@@ -52,6 +75,40 @@ impl DaemonClientConfig {
                 "daemon URL must be loopback".to_owned(),
             ))
         }
+    }
+}
+
+/// daemon 专用 HTTP 端点使用的会话级凭据。
+///
+/// 只在 WebSocket 握手证实对端持有 `daemon.token` 之后才存在，随连接断开而撤销；
+/// 没有会话时为 `None`，调用方必须当作 daemon 不可用，而不是退回长期 token。
+#[derive(Clone, Default)]
+pub struct HttpSession {
+    credential: Arc<RwLock<Option<String>>>,
+}
+
+impl HttpSession {
+    /// 当前会话的 HTTP 凭据。
+    #[must_use]
+    pub fn credential(&self) -> Option<String> {
+        self.credential
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn install(&self, credential: String) {
+        *self
+            .credential
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = Some(credential);
+    }
+
+    fn clear(&self) {
+        *self
+            .credential
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -267,6 +324,14 @@ const STARTUP_POLL_ATTEMPTS: usize = 200;
 /// daemon 启动即崩溃循环时的重拉间隔：避免每 ≤30s 完整初始化一次引擎。
 const CRASH_LOOP_RETRY_SECS: u64 = 120;
 
+/// 握手阶段的请求 ID（连接建立后的调用从 10 起）。
+const AUTH_CHALLENGE_REQUEST_ID: i64 = 1;
+const AUTH_PROVE_REQUEST_ID: i64 = 2;
+const HELLO_REQUEST_ID: i64 = 3;
+const SNAPSHOT_REQUEST_ID: i64 = 4;
+/// 已认证后、`system.hello` 之前的 `system.shutdown`。
+const SHUTDOWN_REQUEST_ID: i64 = 3;
+
 async fn run_client(
     config: DaemonClientConfig,
     supervisor: Arc<DaemonSupervisor>,
@@ -282,6 +347,8 @@ async fn run_client(
     let mut startup_polls = 0_usize;
     // 每个 agent 进程只尝试替换一次协议不兼容的 daemon，避免同目录二进制错配时反复互杀。
     let mut replaced_incompatible = false;
+    // 被旧版 daemon（或冒充者）占着端口时已尝试结束同名进程的次数，见 `LEGACY_REPLACE_ATTEMPTS`。
+    let mut legacy_attempts = 0_u32;
     loop {
         match connect(&config).await {
             Ok((socket, snapshot, buffered)) => {
@@ -298,6 +365,7 @@ async fn run_client(
                     .is_err()
                 {
                     connected.store(false, Ordering::Release);
+                    config.http.clear();
                     return;
                 }
                 if run_connected(socket, &mut commands, &events, snapshot_cursor, buffered)
@@ -307,6 +375,7 @@ async fn run_client(
                     let _ = events.send(DaemonClientEvent::Stale).await;
                 }
                 connected.store(false, Ordering::Release);
+                config.http.clear();
                 fail_queued_commands(&mut commands);
             }
             Err(ConnectError::Refused) => match supervisor.ensure_running().await {
@@ -349,6 +418,39 @@ async fn run_client(
                 connected.store(false, Ordering::Release);
                 return;
             }
+            Err(ConnectError::LegacyPeer) => match next_legacy_step(legacy_attempts) {
+                LegacyStep::Replace => {
+                    legacy_attempts += 1;
+                    tracing::warn!(
+                        attempt = legacy_attempts,
+                        "the process on the daemon port does not speak the challenge-response handshake (legacy fluxdownd); no credentials are sent to it, stopping the stale fluxdownd instead"
+                    );
+                    let stopped = supervisor.terminate_stale_daemon().await;
+                    if stopped > 0 {
+                        tracing::info!(
+                            stopped,
+                            "signalled stale fluxdownd; waiting for it to release the port"
+                        );
+                        wait_until_stopped(&config, Duration::from_secs(30)).await;
+                        attempt = 0;
+                        continue;
+                    }
+                    tracing::warn!(
+                        "no stale fluxdownd process could be identified; retrying with backoff"
+                    );
+                }
+                LegacyStep::GiveUp => {
+                    tracing::error!(
+                        attempts = legacy_attempts,
+                        "the daemon port is still held by a process that does not speak the handshake; stop the old fluxdownd manually and restart FluxDown"
+                    );
+                    let _ = events
+                        .send(DaemonClientEvent::Fatal(protocol_error()))
+                        .await;
+                    connected.store(false, Ordering::Release);
+                    return;
+                }
+            },
             Err(ConnectError::Fatal(error)) => {
                 let _ = events.send(DaemonClientEvent::Fatal(error)).await;
                 connected.store(false, Ordering::Release);
@@ -379,36 +481,105 @@ fn fail_queued_commands(commands: &mut mpsc::Receiver<ClientCommand>) {
 }
 
 async fn open_socket(config: &DaemonClientConfig) -> Result<Socket, ConnectError> {
-    let mut request = config
+    // 升级请求不带任何凭据：对端在证明持有 token 之前，agent 不交出任何可复用的东西。
+    let request = config
         .rpc_url
         .clone()
         .into_client_request()
         .map_err(|error| ConnectError::Fatal(invalid_argument(error.to_string())))?;
-    let authorization = HeaderValue::from_str(&format!("Bearer {}", config.bearer))
-        .map_err(|error| ConnectError::Fatal(invalid_argument(error.to_string())))?;
-    request
-        .headers_mut()
-        .insert(header::AUTHORIZATION, authorization);
     let (socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(classify_connect_error)?;
     Ok(socket)
 }
 
-/// 握手前 `system.shutdown`：只有支持该首帧的 daemon（v4 起）会受理。
+/// 双向挑战应答：先校验 daemon 对 token 持有权的证明，通过后才提交自己的证明。
+/// 返回本会话派生出的 HTTP 凭据（从不经 WebSocket 传输）。`token` 本身不会离开本进程。
+async fn authenticate(
+    socket: &mut Socket,
+    token: &str,
+    buffered: &mut Vec<EventFrame>,
+) -> Result<String, ConnectError> {
+    let client_nonce = fresh_nonce();
+    let params = serde_json::to_value(AuthChallengeParams {
+        client_nonce: client_nonce.clone(),
+    })
+    .map_err(|error| ConnectError::Transient(error.to_string()))?;
+    let challenge = call_on_socket(
+        socket,
+        AUTH_CHALLENGE_REQUEST_ID,
+        SYSTEM_AUTH_CHALLENGE,
+        Some(params),
+        buffered,
+    )
+    .await
+    .map_err(|error| match error {
+        ConnectError::Fatal(data) if is_unrecognized_handshake(&data) => ConnectError::LegacyPeer,
+        other => other,
+    })?;
+    let challenge = serde_json::from_value::<AuthChallengeResult>(challenge)
+        .map_err(|_| ConnectError::Fatal(protocol_error()))?;
+    if !verify_server_proof(
+        token,
+        &client_nonce,
+        &challenge.server_nonce,
+        &challenge.server_proof,
+    ) {
+        tracing::error!(
+            "the process on the daemon port could not prove it holds daemon.token; refusing to authenticate"
+        );
+        return Err(ConnectError::Fatal(unauthorized_error()));
+    }
+    let (Some(proof), Some(credential)) = (
+        client_proof(token, &client_nonce, &challenge.server_nonce),
+        http_credential(token, &client_nonce, &challenge.server_nonce),
+    ) else {
+        return Err(ConnectError::Fatal(protocol_error()));
+    };
+    let params = serde_json::to_value(AuthProveParams {
+        client_proof: proof,
+    })
+    .map_err(|error| ConnectError::Transient(error.to_string()))?;
+    call_on_socket(
+        socket,
+        AUTH_PROVE_REQUEST_ID,
+        SYSTEM_AUTH_PROVE,
+        Some(params),
+        buffered,
+    )
+    .await?;
+    Ok(credential)
+}
+
+fn describe_connect_error(error: ConnectError) -> String {
+    match error {
+        ConnectError::Fatal(data) => format!("{:?}", data.code),
+        ConnectError::Transient(message) => message,
+        ConnectError::Refused | ConnectError::Incompatible => "daemon unreachable".to_owned(),
+        ConnectError::LegacyPeer => "legacy daemon".to_owned(),
+    }
+}
+
+/// 已认证后、`system.hello` 之前的 `system.shutdown`：daemon 只在握手通过后受理，
+/// 协议版本不兼容的新旧进程替换与完全退出都走这里。
 pub(crate) async fn request_shutdown(config: &DaemonClientConfig) -> Result<(), String> {
     let mut socket = open_socket(config)
         .await
         .map_err(|_| "daemon unreachable".to_owned())?;
     let mut buffered = Vec::new();
-    call_on_socket(&mut socket, 1, method::SYSTEM_SHUTDOWN, None, &mut buffered)
+    authenticate(&mut socket, &config.token, &mut buffered)
         .await
-        .map(|_| ())
-        .map_err(|error| match error {
-            ConnectError::Fatal(data) => format!("{:?}", data.code),
-            ConnectError::Transient(message) => message,
-            ConnectError::Refused | ConnectError::Incompatible => "daemon unreachable".to_owned(),
-        })
+        .map_err(describe_connect_error)?;
+    call_on_socket(
+        &mut socket,
+        SHUTDOWN_REQUEST_ID,
+        method::SYSTEM_SHUTDOWN,
+        None,
+        &mut buffered,
+    )
+    .await
+    .map(|_| ())
+    .map_err(describe_connect_error)
 }
 
 /// 等旧 daemon 关闭监听（连接被拒）；超时后交回重连循环自愈。
@@ -432,14 +603,27 @@ async fn wait_until_stopped(config: &DaemonClientConfig, timeout: Duration) {
     }
 }
 
+/// 建立到 daemon 的已认证、已握手连接；任何一步失败都撤销会话 HTTP 凭据。
 async fn connect(
+    config: &DaemonClientConfig,
+) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
+    let result = establish(config).await;
+    if result.is_err() {
+        config.http.clear();
+    }
+    result
+}
+
+async fn establish(
     config: &DaemonClientConfig,
 ) -> Result<(Socket, Snapshot, Vec<EventFrame>), ConnectError> {
     let mut socket = open_socket(config).await?;
     let mut buffered = Vec::new();
+    let credential = authenticate(&mut socket, &config.token, &mut buffered).await?;
+    config.http.install(credential);
     let hello = serde_json::json!({
         "clientName": "fluxdown-agent",
-        "clientVersion": env!("CARGO_PKG_VERSION"),
+        "clientVersion": fluxdown_protocol::APP_VERSION,
         "minProtocolVersion": fluxdown_protocol::MIN_PROTOCOL_VERSION,
         "maxProtocolVersion": fluxdown_protocol::PROTOCOL_VERSION,
         "requestedRole": "daemon",
@@ -447,7 +631,7 @@ async fn connect(
     });
     let hello_value = call_on_socket(
         &mut socket,
-        1,
+        HELLO_REQUEST_ID,
         method::SYSTEM_HELLO,
         Some(hello),
         &mut buffered,
@@ -467,8 +651,14 @@ async fn connect(
     if service.protocol_version != fluxdown_protocol::PROTOCOL_VERSION {
         return Err(ConnectError::Incompatible);
     }
-    let snapshot_value =
-        call_on_socket(&mut socket, 2, method::SYSTEM_SNAPSHOT, None, &mut buffered).await?;
+    let snapshot_value = call_on_socket(
+        &mut socket,
+        SNAPSHOT_REQUEST_ID,
+        method::SYSTEM_SNAPSHOT,
+        None,
+        &mut buffered,
+    )
+    .await?;
     let snapshot = serde_json::from_value::<Snapshot>(snapshot_value)
         .map_err(|_| ConnectError::Fatal(protocol_error()))?;
     if !matches!(snapshot.body, SnapshotBody::Daemon(_)) {
@@ -603,9 +793,16 @@ async fn call_on_socket(
                 return Ok(success.result);
             }
             RpcResponse::Failure(failure) if failure.id == Some(RequestId::Integer(id)) => {
-                return Err(ConnectError::Fatal(
-                    failure.error.data.unwrap_or_else(internal_error),
-                ));
+                // method-not-found 不带应用错误详情：归一为 `Unsupported`，调用方据此识别
+                // 「对端不认识这个方法」。
+                let data = failure.error.data.unwrap_or_else(|| {
+                    if failure.error.code == METHOD_NOT_FOUND_CODE {
+                        RpcErrorData::new(ApplicationErrorCode::Unsupported, false)
+                    } else {
+                        internal_error()
+                    }
+                });
+                return Err(ConnectError::Fatal(data));
             }
             _ => {}
         }
@@ -623,10 +820,39 @@ fn classify_connect_error(error: tokio_tungstenite::tungstenite::Error) -> Conne
         {
             ConnectError::Refused
         }
+        // agent 的升级请求不带任何凭据：只有仍要求升级头 Bearer 的旧版 daemon（或根本不是
+        // fluxdownd 的进程）会回 401。无论哪种，都不会拿到 token。
         tokio_tungstenite::tungstenite::Error::Http(response) if response.status() == 401 => {
-            ConnectError::Fatal(RpcErrorData::new(ApplicationErrorCode::Unauthorized, false))
+            ConnectError::LegacyPeer
         }
         _ => ConnectError::Transient(format!("{error:#}")),
+    }
+}
+
+/// 对端是否不认识挑战方法：旧版 daemon 的首帧门禁只认 `system.hello`，对其它方法回
+/// 「`method` 字段无效」；更旧 / 其它实现回 method-not-found（已归一为 `Unsupported`）。
+fn is_unrecognized_handshake(data: &RpcErrorData) -> bool {
+    data.code == ApplicationErrorCode::Unsupported
+        || (data.code == ApplicationErrorCode::InvalidArgument
+            && data.field.as_deref() == Some("method"))
+}
+
+/// 每个 agent 进程最多尝试结束旧 daemon 的次数：之后仍被旧 daemon（或冒充者）占着端口就
+/// 停止并报协议不兼容，避免反复互杀。
+const LEGACY_REPLACE_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum LegacyStep {
+    /// 结束占着端口的旧 daemon，随后由监管拉起同版本 daemon。
+    Replace,
+    GiveUp,
+}
+
+fn next_legacy_step(attempts_so_far: u32) -> LegacyStep {
+    if attempts_so_far < LEGACY_REPLACE_ATTEMPTS {
+        LegacyStep::Replace
+    } else {
+        LegacyStep::GiveUp
     }
 }
 
@@ -635,6 +861,9 @@ enum ConnectError {
     Transient(String),
     /// 对端协议版本不兼容：可尝试让旧进程退出后由监管拉起同版本 daemon。
     Incompatible,
+    /// 对端是不认识挑战应答握手的旧版 daemon（或冒充者）：不得向它发送 token，只能结束
+    /// 同名旧进程后由监管拉起新 daemon。
+    LegacyPeer,
     Fatal(RpcErrorData),
 }
 
@@ -661,13 +890,33 @@ fn protocol_error() -> RpcErrorData {
     RpcErrorData::new(ApplicationErrorCode::ProtocolIncompatible, false)
 }
 
+fn unauthorized_error() -> RpcErrorData {
+    RpcErrorData::new(ApplicationErrorCode::Unauthorized, false)
+}
+
+/// 每次握手一组新的 256 位随机数（两个 v4 UUID 的 244 位随机部分，十六进制 64 字符）。
+fn fresh_nonce() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
+}
+
 fn invalid_argument(_message: String) -> RpcErrorData {
     RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
 }
 
 #[cfg(test)]
 mod tests {
-    use fluxdown_protocol::ApplicationErrorCode;
+    use std::sync::Arc;
+
+    use fluxdown_protocol::handshake::{
+        AuthChallengeParams, AuthChallengeResult, AuthProveParams, SYSTEM_AUTH_CHALLENGE,
+        SYSTEM_AUTH_PROVE, http_credential, server_proof, verify_client_proof,
+    };
+    use fluxdown_protocol::{
+        ApplicationErrorCode, METHOD_NOT_FOUND_CODE, RpcErrorData, RpcErrorObject, RpcRequest,
+        RpcResponse, method,
+    };
+    use serde_json::json;
+    use tokio_tungstenite::tungstenite::Message;
 
     use super::DaemonClient;
 
@@ -761,14 +1010,88 @@ mod tests {
         assert_eq!(error.code, ApplicationErrorCode::Unavailable);
     }
 
+    const TOKEN: &str = "agent-daemon-client-test-token";
+
+    type ServerSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    async fn read_request(ws: &mut ServerSocket) -> RpcRequest {
+        use futures_util::StreamExt;
+        loop {
+            let message = ws.next().await.expect("client frame").expect("frame ok");
+            if let Message::Text(text) = message {
+                return serde_json::from_str(&text).expect("json-rpc request");
+            }
+        }
+    }
+
+    async fn send_response(ws: &mut ServerSocket, response: RpcResponse) {
+        use futures_util::SinkExt;
+        ws.send(Message::Text(
+            serde_json::to_string(&response).unwrap().into(),
+        ))
+        .await
+        .unwrap();
+    }
+
+    fn fresh_server_nonce() -> String {
+        format!(
+            "{}{}",
+            uuid::Uuid::new_v4().simple(),
+            uuid::Uuid::new_v4().simple()
+        )
+    }
+
+    /// daemon 一侧的握手：持有 `token`，先证明自己，再校验客户端。返回 (clientNonce, serverNonce)。
+    async fn daemon_handshake(ws: &mut ServerSocket, token: &str) -> (String, String) {
+        let challenge = read_request(ws).await;
+        assert_eq!(challenge.method, SYSTEM_AUTH_CHALLENGE);
+        let params: AuthChallengeParams =
+            serde_json::from_value(challenge.params.expect("challenge params")).unwrap();
+        let server_nonce = fresh_server_nonce();
+        let proof = server_proof(token, &params.client_nonce, &server_nonce).expect("proof");
+        send_response(
+            ws,
+            RpcResponse::success(
+                challenge.id,
+                serde_json::to_value(AuthChallengeResult {
+                    server_nonce: server_nonce.clone(),
+                    server_proof: proof,
+                })
+                .unwrap(),
+            ),
+        )
+        .await;
+        let prove = read_request(ws).await;
+        assert_eq!(prove.method, SYSTEM_AUTH_PROVE);
+        let proved: AuthProveParams =
+            serde_json::from_value(prove.params.expect("prove params")).unwrap();
+        assert!(verify_client_proof(
+            token,
+            &params.client_nonce,
+            &server_nonce,
+            &proved.client_proof
+        ));
+        send_response(
+            ws,
+            RpcResponse::success(prove.id, json!({ "authenticated": true })),
+        )
+        .await;
+        (params.client_nonce, server_nonce)
+    }
+
+    async fn loopback_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/rpc", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
     #[tokio::test]
     async fn handshake_buffers_notifications_filters_old_frames_and_reconnects_after_gap() {
         use fluxdown_protocol::{
-            DaemonEvent, DaemonSnapshot, EventFrame, RequestId, RpcNotification, RpcResponse,
-            ServiceEvent, ServiceHello, ServiceRole, Snapshot, SnapshotBody, TaskRuntimeDto,
+            DaemonEvent, DaemonSnapshot, EventFrame, RpcNotification, ServiceEvent, ServiceHello,
+            ServiceRole, Snapshot, SnapshotBody, TaskRuntimeDto,
         };
-        use futures_util::{SinkExt, StreamExt};
-        use tokio_tungstenite::tungstenite::Message;
+        use futures_util::SinkExt;
 
         fn notification(epoch: &str, sequence: u64) -> Message {
             let frame = EventFrame {
@@ -795,23 +1118,21 @@ mod tests {
         ) {
             let (tcp, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            ws.next().await.expect("hello request").unwrap();
+            daemon_handshake(&mut ws, TOKEN).await;
+            let hello_request = read_request(&mut ws).await;
+            assert_eq!(hello_request.method, method::SYSTEM_HELLO);
             if gap {
                 ws.send(notification("previous", 3)).await.unwrap();
             }
             let hello =
                 ServiceHello::new(ServiceRole::Daemon, "daemon", "test", "instance", vec![]);
-            ws.send(Message::Text(
-                serde_json::to_string(&RpcResponse::success(
-                    RequestId::Integer(1),
-                    serde_json::to_value(hello).unwrap(),
-                ))
-                .unwrap()
-                .into(),
-            ))
-            .await
-            .unwrap();
-            ws.next().await.expect("snapshot request").unwrap();
+            send_response(
+                &mut ws,
+                RpcResponse::success(hello_request.id, serde_json::to_value(hello).unwrap()),
+            )
+            .await;
+            let snapshot_request = read_request(&mut ws).await;
+            assert_eq!(snapshot_request.method, method::SYSTEM_SNAPSHOT);
             ws.send(notification(epoch, sequence.saturating_sub(1)))
                 .await
                 .unwrap();
@@ -821,16 +1142,11 @@ mod tests {
                 sequence,
                 body: SnapshotBody::Daemon(Box::new(DaemonSnapshot::default())),
             };
-            ws.send(Message::Text(
-                serde_json::to_string(&RpcResponse::success(
-                    RequestId::Integer(2),
-                    serde_json::to_value(snapshot).unwrap(),
-                ))
-                .unwrap()
-                .into(),
-            ))
-            .await
-            .unwrap();
+            send_response(
+                &mut ws,
+                RpcResponse::success(snapshot_request.id, serde_json::to_value(snapshot).unwrap()),
+            )
+            .await;
             if gap {
                 ws.send(notification(epoch, sequence + 2)).await.unwrap();
                 ws.send(notification(epoch, sequence + 4)).await.unwrap();
@@ -839,21 +1155,21 @@ mod tests {
         }
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("ws://{}/rpc", listener.local_addr().unwrap());
+            let (listener, url) = loopback_listener().await;
             let server = tokio::spawn(async move {
                 serve_once(&listener, "a", 5, true).await;
                 serve_once(&listener, "b", 20, false).await;
             });
-            let config = super::DaemonClientConfig {
-                rpc_url: url,
-                bearer: "test".into(),
-            };
+            let config = super::DaemonClientConfig::new(url, TOKEN);
             let (tx, mut rx) = tokio::sync::mpsc::channel(16);
             let (command_tx, mut commands) = tokio::sync::mpsc::channel(1);
             let (socket, snapshot, buffered) = super::connect(&config)
                 .await
                 .unwrap_or_else(|_| panic!("connect"));
+            assert!(
+                config.http_session().credential().is_some(),
+                "an authenticated session carries an HTTP credential"
+            );
             assert_eq!((snapshot.epoch.as_str(), snapshot.sequence), ("a", 5));
             assert!(
                 super::run_connected(
@@ -901,5 +1217,465 @@ mod tests {
         })
         .await
         .expect("websocket handshake and recovery");
+    }
+
+    /// 插件设置保存失败时 daemon 以 `field` 标出出错的设置项；经 agent 转发给界面时必须原样保留。
+    #[tokio::test]
+    async fn daemon_error_keeps_field_and_reason_when_forwarded() {
+        use fluxdown_protocol::{
+            DaemonSnapshot, ErrorReason, RpcErrorData, ServiceHello, ServiceRole, Snapshot,
+            SnapshotBody,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (listener, url) = loopback_listener().await;
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                daemon_handshake(&mut ws, TOKEN).await;
+                let hello = read_request(&mut ws).await;
+                let reply =
+                    ServiceHello::new(ServiceRole::Daemon, "daemon", "test", "instance", vec![]);
+                send_response(
+                    &mut ws,
+                    RpcResponse::success(hello.id, serde_json::to_value(reply).unwrap()),
+                )
+                .await;
+                let snapshot_request = read_request(&mut ws).await;
+                let snapshot = Snapshot {
+                    epoch: "e".into(),
+                    sequence: 1,
+                    body: SnapshotBody::Daemon(Box::new(DaemonSnapshot::default())),
+                };
+                send_response(
+                    &mut ws,
+                    RpcResponse::success(
+                        snapshot_request.id,
+                        serde_json::to_value(snapshot).unwrap(),
+                    ),
+                )
+                .await;
+                let call = read_request(&mut ws).await;
+                assert_eq!(call.method, method::DAEMON_PLUGIN_UPDATE_SETTINGS);
+                send_response(
+                    &mut ws,
+                    RpcResponse::failure(
+                        call.id,
+                        RpcErrorObject::application(
+                            "invalid setting",
+                            RpcErrorData {
+                                field: Some("maxItems".to_owned()),
+                                reason: Some(ErrorReason::PluginPackageInvalid),
+                                ..RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+                            },
+                        ),
+                    ),
+                )
+                .await;
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            let (socket, snapshot, buffered) = super::connect(&config)
+                .await
+                .unwrap_or_else(|_| panic!("connect"));
+            let (tx, _rx) = tokio::sync::mpsc::channel(16);
+            let (command_tx, mut commands) = tokio::sync::mpsc::channel(1);
+            let runner = tokio::spawn(async move {
+                super::run_connected(
+                    socket,
+                    &mut commands,
+                    &tx,
+                    (snapshot.epoch, snapshot.sequence),
+                    buffered,
+                )
+                .await
+            });
+            let (ack, response) = tokio::sync::oneshot::channel();
+            command_tx
+                .send(super::ClientCommand {
+                    method: method::DAEMON_PLUGIN_UPDATE_SETTINGS.to_owned(),
+                    params: Some(json!({ "pluginId": "p", "entries": {} })),
+                    ack,
+                })
+                .await
+                .unwrap();
+            let error = response.await.unwrap().unwrap_err();
+            let data = error.data.expect("application error data");
+            assert_eq!(data.code, ApplicationErrorCode::InvalidArgument);
+            assert_eq!(data.field.as_deref(), Some("maxItems"));
+            assert_eq!(data.reason, Some(ErrorReason::PluginPackageInvalid));
+            drop(command_tx);
+            let _ = runner.await;
+            server.await.unwrap();
+        })
+        .await
+        .expect("daemon error forwarding");
+    }
+
+    #[tokio::test]
+    async fn authentication_derives_the_session_credential_from_a_daemon_that_proves_the_token() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (listener, url) = loopback_listener().await;
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                daemon_handshake(&mut ws, TOKEN).await
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            let mut socket = super::open_socket(&config)
+                .await
+                .unwrap_or_else(|_| panic!("open"));
+            let mut buffered = Vec::new();
+            let credential = super::authenticate(&mut socket, TOKEN, &mut buffered)
+                .await
+                .unwrap_or_else(|_| panic!("handshake"));
+            let (client_nonce, server_nonce) = server.await.unwrap();
+            assert_eq!(
+                Some(credential),
+                http_credential(TOKEN, &client_nonce, &server_nonce)
+            );
+        })
+        .await
+        .expect("handshake completes");
+    }
+
+    #[tokio::test]
+    async fn impostor_daemon_learns_no_credential_and_never_sees_the_token() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (listener, url) = loopback_listener().await;
+            let upgrade_headers = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let frames = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+            let server = tokio::spawn({
+                let upgrade_headers = upgrade_headers.clone();
+                let frames = frames.clone();
+                async move {
+                    // 一次给 `connect`，一次给 `request_shutdown`：两条路径都不能漏凭据。
+                    for _ in 0..2 {
+                        let (tcp, _) = listener.accept().await.unwrap();
+                        let headers = upgrade_headers.clone();
+                        let mut ws = tokio_tungstenite::accept_hdr_async(
+                            tcp,
+                            move |request: &Request, response: Response| {
+                                for (name, value) in request.headers() {
+                                    headers.lock().unwrap().push(format!(
+                                        "{name}: {}",
+                                        value.to_str().unwrap_or_default()
+                                    ));
+                                }
+                                Ok(response)
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        let challenge = read_request(&mut ws).await;
+                        frames
+                            .lock()
+                            .unwrap()
+                            .push(serde_json::to_string(&challenge).unwrap());
+                        let params: AuthChallengeParams =
+                            serde_json::from_value(challenge.params.expect("params")).unwrap();
+                        // 冒充者不知道 token，只能拿猜测值算证明。
+                        let server_nonce = fresh_server_nonce();
+                        let forged = server_proof(
+                            "a-guess-of-the-token",
+                            &params.client_nonce,
+                            &server_nonce,
+                        )
+                        .unwrap();
+                        send_response(
+                            &mut ws,
+                            RpcResponse::success(
+                                challenge.id,
+                                serde_json::to_value(AuthChallengeResult {
+                                    server_nonce,
+                                    server_proof: forged,
+                                })
+                                .unwrap(),
+                            ),
+                        )
+                        .await;
+                        // 客户端若继续发帧，全部记录下来。
+                        while let Ok(Some(Ok(message))) =
+                            tokio::time::timeout(std::time::Duration::from_millis(300), ws.next())
+                                .await
+                        {
+                            if let Message::Text(text) = message {
+                                frames.lock().unwrap().push(text.to_string());
+                            }
+                        }
+                    }
+                }
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            let Err(super::ConnectError::Fatal(data)) = super::connect(&config).await else {
+                panic!("an endpoint that cannot prove the token must be rejected");
+            };
+            assert_eq!(data.code, ApplicationErrorCode::Unauthorized);
+            assert!(config.http_session().credential().is_none());
+            assert!(super::request_shutdown(&config).await.is_err());
+            server.await.unwrap();
+
+            let frames = frames.lock().unwrap();
+            assert_eq!(
+                frames.len(),
+                2,
+                "only the challenges reach the impostor: {frames:?}"
+            );
+            for frame in frames.iter() {
+                assert!(frame.contains(SYSTEM_AUTH_CHALLENGE), "{frame}");
+                assert!(!frame.contains(TOKEN), "{frame}");
+                assert!(!frame.contains("clientProof"), "{frame}");
+                assert!(!frame.contains(method::SYSTEM_SHUTDOWN), "{frame}");
+            }
+            let headers = upgrade_headers.lock().unwrap();
+            assert!(
+                !headers
+                    .iter()
+                    .any(|header| header.to_ascii_lowercase().starts_with("authorization")),
+                "{headers:?}"
+            );
+            assert!(!headers.iter().any(|header| header.contains(TOKEN)));
+        })
+        .await
+        .expect("impostor is rejected without leaking credentials");
+    }
+
+    #[tokio::test]
+    async fn daemon_proof_recorded_from_another_session_is_not_accepted() {
+        use futures_util::StreamExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (listener, url) = loopback_listener().await;
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (client_nonce, server_nonce) = daemon_handshake(&mut ws, TOKEN).await;
+                let recorded = server_proof(TOKEN, &client_nonce, &server_nonce).unwrap();
+
+                // 第二条连接：攻击者回放录下来的（serverNonce, serverProof），客户端的新随机数不同。
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let challenge = read_request(&mut ws).await;
+                send_response(
+                    &mut ws,
+                    RpcResponse::success(
+                        challenge.id,
+                        serde_json::to_value(AuthChallengeResult {
+                            server_nonce,
+                            server_proof: recorded,
+                        })
+                        .unwrap(),
+                    ),
+                )
+                .await;
+                let mut later_frames = 0;
+                while let Ok(Some(Ok(_))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(300), ws.next()).await
+                {
+                    later_frames += 1;
+                }
+                later_frames
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            let mut buffered = Vec::new();
+            let mut first = super::open_socket(&config)
+                .await
+                .unwrap_or_else(|_| panic!("open first"));
+            assert!(
+                super::authenticate(&mut first, TOKEN, &mut buffered)
+                    .await
+                    .is_ok()
+            );
+            let mut second = super::open_socket(&config)
+                .await
+                .unwrap_or_else(|_| panic!("open second"));
+            let Err(super::ConnectError::Fatal(data)) =
+                super::authenticate(&mut second, TOKEN, &mut buffered).await
+            else {
+                panic!("replayed proof must be rejected");
+            };
+            assert_eq!(data.code, ApplicationErrorCode::Unauthorized);
+            assert_eq!(
+                server.await.unwrap(),
+                0,
+                "no client proof after a bad server proof"
+            );
+        })
+        .await
+        .expect("replay is rejected");
+    }
+
+    #[tokio::test]
+    async fn shutdown_request_is_sent_only_after_the_daemon_is_authenticated() {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (listener, url) = loopback_listener().await;
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                daemon_handshake(&mut ws, TOKEN).await;
+                let shutdown = read_request(&mut ws).await;
+                send_response(
+                    &mut ws,
+                    RpcResponse::success(shutdown.id, json!({ "ok": true })),
+                )
+                .await;
+                shutdown.method
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            assert!(super::request_shutdown(&config).await.is_ok());
+            assert_eq!(server.await.unwrap(), method::SYSTEM_SHUTDOWN);
+        })
+        .await
+        .expect("shutdown after handshake");
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_rejecting_the_upgrade_is_identified_without_sending_credentials() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (listener, url) = loopback_listener().await;
+            let server = tokio::spawn(async move {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = tcp.read(&mut chunk).await.unwrap();
+                    assert!(
+                        read > 0,
+                        "client closed before finishing the upgrade request"
+                    );
+                    received.extend_from_slice(&chunk[..read]);
+                }
+                tcp.write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                String::from_utf8_lossy(&received).to_ascii_lowercase()
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            let Err(super::ConnectError::LegacyPeer) = super::connect(&config).await else {
+                panic!("an upgrade rejected with 401 marks a legacy daemon");
+            };
+            let request = server.await.unwrap();
+            assert!(!request.contains("authorization"), "{request}");
+            assert!(!request.contains(TOKEN), "{request}");
+            assert!(config.http_session().credential().is_none());
+        })
+        .await
+        .expect("legacy daemon is identified");
+    }
+
+    #[tokio::test]
+    async fn daemon_that_does_not_know_the_handshake_is_identified_as_legacy() {
+        use futures_util::StreamExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let (listener, url) = loopback_listener().await;
+            let server = tokio::spawn(async move {
+                let mut methods = Vec::new();
+                for error in [
+                    // 旧版 daemon 的首帧门禁：只认 hello，对其它方法回「method 字段无效」。
+                    RpcErrorObject::application(
+                        "hello rejected",
+                        RpcErrorData {
+                            field: Some("method".to_owned()),
+                            ..RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+                        },
+                    ),
+                    RpcErrorObject {
+                        code: METHOD_NOT_FOUND_CODE,
+                        message: "method not found".to_owned(),
+                        data: None,
+                    },
+                ] {
+                    let (tcp, _) = listener.accept().await.unwrap();
+                    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    let challenge = read_request(&mut ws).await;
+                    methods.push(challenge.method);
+                    send_response(&mut ws, RpcResponse::failure(challenge.id, error)).await;
+                    while let Ok(Some(Ok(message))) =
+                        tokio::time::timeout(std::time::Duration::from_millis(200), ws.next()).await
+                    {
+                        if let Message::Text(text) = message {
+                            methods.push(text.to_string());
+                        }
+                    }
+                }
+                methods
+            });
+            let config = super::DaemonClientConfig::new(url, TOKEN);
+            for _ in 0..2 {
+                let Err(super::ConnectError::LegacyPeer) = super::connect(&config).await else {
+                    panic!("a peer that does not know the challenge is a legacy daemon");
+                };
+            }
+            // 对端只看到过挑战，没有任何证明、token 或后续帧。
+            assert_eq!(
+                server.await.unwrap(),
+                vec![SYSTEM_AUTH_CHALLENGE, SYSTEM_AUTH_CHALLENGE]
+            );
+            assert!(config.http_session().credential().is_none());
+        })
+        .await
+        .expect("unrecognized handshake is identified");
+    }
+
+    #[test]
+    fn legacy_peer_detection_is_narrow_and_replacement_is_bounded() {
+        use tokio_tungstenite::tungstenite::{Error, http::Response};
+
+        let rejected = |status: u16| {
+            Error::Http(Box::new(
+                Response::builder().status(status).body(None).unwrap(),
+            ))
+        };
+        assert!(matches!(
+            super::classify_connect_error(rejected(401)),
+            super::ConnectError::LegacyPeer
+        ));
+        for status in [403, 404, 500, 503] {
+            assert!(
+                matches!(
+                    super::classify_connect_error(rejected(status)),
+                    super::ConnectError::Transient(_)
+                ),
+                "{status}"
+            );
+        }
+
+        let field = |field: &str| RpcErrorData {
+            field: Some(field.to_owned()),
+            ..RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
+        };
+        assert!(super::is_unrecognized_handshake(&field("method")));
+        assert!(super::is_unrecognized_handshake(&RpcErrorData::new(
+            ApplicationErrorCode::Unsupported,
+            false
+        )));
+        // 本版 daemon 自己的拒绝（坏随机数 / 证明不符）不是旧版 daemon。
+        assert!(!super::is_unrecognized_handshake(&field("clientNonce")));
+        assert!(!super::is_unrecognized_handshake(&RpcErrorData::new(
+            ApplicationErrorCode::Unauthorized,
+            false
+        )));
+        assert!(!super::is_unrecognized_handshake(&RpcErrorData::new(
+            ApplicationErrorCode::InvalidArgument,
+            false
+        )));
+
+        for attempts in 0..super::LEGACY_REPLACE_ATTEMPTS {
+            assert_eq!(
+                super::next_legacy_step(attempts),
+                super::LegacyStep::Replace
+            );
+        }
+        assert_eq!(
+            super::next_legacy_step(super::LEGACY_REPLACE_ATTEMPTS),
+            super::LegacyStep::GiveUp
+        );
     }
 }

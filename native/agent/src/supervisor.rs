@@ -141,7 +141,13 @@ impl DaemonSupervisor {
     /// 子进程是否处于「启动即崩溃」循环（连续快速异常退出）；调用方据此拉长重拉间隔。
     #[must_use]
     pub fn in_crash_loop(&self) -> bool {
-        self.crash_streak.load(Ordering::Acquire) >= CRASH_LOOP_THRESHOLD
+        self.crash_streak() >= CRASH_LOOP_THRESHOLD
+    }
+
+    /// 当前连续快速异常退出次数（成功连上 daemon 后清零）。
+    #[must_use]
+    pub fn crash_streak(&self) -> u32 {
+        self.crash_streak.load(Ordering::Acquire)
     }
 
     /// 已成功连上 daemon：之前的快速失败不再算数。
@@ -223,6 +229,140 @@ fn detach_background_process(command: &mut std::process::Command) {
 
 #[cfg(not(any(windows, unix)))]
 fn detach_background_process(_command: &mut std::process::Command) {}
+
+/// 新 agent 遇到旧版 daemon 占着端口（既不能与它握手，也绝不能向它发送 token）时的善后：
+/// 结束当前用户名下的旧 `fluxdownd`，随后由 [`DaemonSupervisor::ensure_running`] 拉起同版本 daemon。
+impl DaemonSupervisor {
+    /// 结束占着 daemon 端口的旧版 `fluxdownd`；返回被发出终止信号的进程数。
+    /// 已停止监管或认不出目标进程时为 0。
+    pub async fn terminate_stale_daemon(&self) -> usize {
+        if self.stopped.load(Ordering::Acquire) {
+            return 0;
+        }
+        terminate_stale_listener(self.bind_addr.port()).await
+    }
+}
+
+const DAEMON_PROCESS_NAME: &str = "fluxdownd";
+/// 单次调用系统进程工具（lsof / ps / kill / pkill / taskkill）的时限。
+const PROCESS_TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 进程名（Unix `ps -o comm=` 可能带目录，Windows 带 `.exe`）是否为 daemon。
+#[cfg(any(unix, test))]
+fn is_daemon_process(comm: &str) -> bool {
+    let name = comm.trim().rsplit(['/', '\\']).next().unwrap_or_default();
+    name.strip_suffix(".exe").unwrap_or(name) == DAEMON_PROCESS_NAME
+}
+
+/// 解析 `lsof -t` 的输出（每行一个 PID）。
+#[cfg(any(unix, test))]
+fn parse_listener_pids(output: &str) -> Vec<u32> {
+    let mut pids: Vec<u32> = output
+        .lines()
+        .filter_map(|line| line.trim().parse().ok())
+        .collect();
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// `taskkill` 参数：只结束当前用户（`DOMAIN\user`）名下的 `fluxdownd.exe`；用户名未知时
+/// 不给参数，宁可不结束也不误伤别的会话。
+#[cfg(any(windows, test))]
+fn taskkill_args(domain: Option<&str>, user: Option<&str>) -> Option<Vec<String>> {
+    let user = user.filter(|user| !user.is_empty())?;
+    let account = match domain.filter(|domain| !domain.is_empty()) {
+        Some(domain) => format!("{domain}\\{user}"),
+        None => user.to_owned(),
+    };
+    Some(vec![
+        "/F".to_owned(),
+        "/IM".to_owned(),
+        format!("{DAEMON_PROCESS_NAME}.exe"),
+        "/FI".to_owned(),
+        format!("USERNAME eq {account}"),
+    ])
+}
+
+fn tool_command(program: &str, args: &[&str]) -> tokio::process::Command {
+    let mut command = std::process::Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+    no_console_window(&mut command);
+    tokio::process::Command::from(command)
+}
+
+#[cfg(unix)]
+async fn tool_stdout(program: &str, args: &[&str]) -> Option<String> {
+    let output = tokio::time::timeout(PROCESS_TOOL_TIMEOUT, tool_command(program, args).output())
+        .await
+        .ok()?
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+async fn tool_succeeds(program: &str, args: &[&str]) -> bool {
+    let mut command = tool_command(program, args);
+    command.stdout(Stdio::null());
+    matches!(
+        tokio::time::timeout(PROCESS_TOOL_TIMEOUT, command.status()).await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+/// 按监听端口定位 PID 并确认进程名是 `fluxdownd` 后发 SIGTERM（旧 daemon 会优雅收尾）；
+/// 没有 lsof 或认不出监听者时，退回按名字结束当前用户有权结束的同名进程。
+#[cfg(unix)]
+async fn terminate_stale_listener(port: u16) -> usize {
+    let port_filter = format!("-iTCP:{port}");
+    let mut listeners = Vec::new();
+    if let Some(listing) = tool_stdout("lsof", &["-nP", &port_filter, "-sTCP:LISTEN", "-t"]).await {
+        listeners = parse_listener_pids(&listing);
+    }
+    if listeners.is_empty() {
+        return usize::from(tool_succeeds("pkill", &["-TERM", "-x", DAEMON_PROCESS_NAME]).await);
+    }
+    let mut signalled = 0;
+    for pid in listeners {
+        let pid = pid.to_string();
+        let named_daemon = tool_stdout("ps", &["-p", &pid, "-o", "comm="])
+            .await
+            .is_some_and(|name| is_daemon_process(&name));
+        // 监听者不是 fluxdownd：不是该善后的对象，不碰。
+        if named_daemon && tool_succeeds("kill", &["-TERM", &pid]).await {
+            signalled += 1;
+        }
+    }
+    signalled
+}
+
+#[cfg(windows)]
+async fn terminate_stale_listener(_port: u16) -> usize {
+    let domain = std::env::var("USERDOMAIN").ok();
+    let user = std::env::var("USERNAME").ok();
+    let Some(args) = taskkill_args(domain.as_deref(), user.as_deref()) else {
+        return 0;
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    usize::from(tool_succeeds("taskkill", &args).await)
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn terminate_stale_listener(_port: u16) -> usize {
+    0
+}
+
+#[cfg(windows)]
+fn no_console_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(0x0800_0000);
+}
+
+#[cfg(not(windows))]
+fn no_console_window(_command: &mut std::process::Command) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,5 +377,56 @@ mod tests {
         assert_eq!(streak, CRASH_LOOP_THRESHOLD);
         assert_eq!(next_crash_streak(streak, false, Duration::from_secs(60)), 0);
         assert_eq!(next_crash_streak(streak, true, Duration::from_secs(1)), 0);
+    }
+
+    #[test]
+    fn daemon_process_names_are_recognised_across_platform_spellings() {
+        for name in [
+            "fluxdownd",
+            " fluxdownd\n",
+            "/Applications/FluxDown.app/Contents/MacOS/fluxdownd",
+            "/opt/Flux Down/fluxdownd",
+            "fluxdownd.exe",
+            "C:\\Program Files\\FluxDown\\fluxdownd.exe",
+        ] {
+            assert!(is_daemon_process(name), "{name:?}");
+        }
+        for name in [
+            "",
+            "fluxdown-agent",
+            "fluxdownd-helper",
+            "sleep",
+            "/usr/bin/fluxdown",
+        ] {
+            assert!(!is_daemon_process(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn listener_pids_are_parsed_and_deduplicated() {
+        assert_eq!(parse_listener_pids("123\n456\n123\n"), vec![123, 456]);
+        assert_eq!(parse_listener_pids("\nnot-a-pid\n 789 \n"), vec![789]);
+        assert!(parse_listener_pids("").is_empty());
+    }
+
+    #[test]
+    fn taskkill_is_scoped_to_the_current_user_or_refused() {
+        assert_eq!(
+            taskkill_args(Some("WORKGROUP"), Some("zero")),
+            Some(vec![
+                "/F".to_owned(),
+                "/IM".to_owned(),
+                "fluxdownd.exe".to_owned(),
+                "/FI".to_owned(),
+                "USERNAME eq WORKGROUP\\zero".to_owned(),
+            ])
+        );
+        assert_eq!(
+            taskkill_args(None, Some("zero")).map(|args| args[4].clone()),
+            Some("USERNAME eq zero".to_owned())
+        );
+        // 用户名未知：宁可不结束也不能不带用户过滤。
+        assert_eq!(taskkill_args(Some("WORKGROUP"), None), None);
+        assert_eq!(taskkill_args(Some("WORKGROUP"), Some("")), None);
     }
 }

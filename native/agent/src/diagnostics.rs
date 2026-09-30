@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use crate::daemon_client::{DaemonClient, DaemonClientConfig};
 use crate::event_hub::AgentEventHub;
 use crate::state::{AgentState, StateStore};
+use crate::supervisor::DaemonSupervisor;
 
 /// 检查项 id；UI 据此映射 `doctorCheck{Camel}` 文案与修复按钮。
 const CHECK_NMH_BINARY: &str = "nmh_binary";
@@ -31,6 +32,7 @@ const CHECK_DAEMON: &str = "daemon";
 const CHECK_URL_PROTOCOL: &str = "url_protocol";
 const CHECK_TORRENT_ASSOCIATION: &str = "torrent_association";
 const CHECK_LOG_DIR: &str = "log_dir";
+const CHECK_DAEMON_STARTUP: &str = "daemon_startup";
 
 /// 提示码；UI 映射 `doctorHint{Camel}`。
 const HINT_REINSTALL_APP: &str = "reinstall_app";
@@ -43,6 +45,8 @@ const HINT_ENABLE_PROTOCOL: &str = "enable_protocol";
 /// 用户已在设置中关闭该关联，但系统里没有其他可接手的程序（macOS 回落到 FluxDown）。
 const HINT_ASSOCIATION_OFF: &str = "association_off";
 const HINT_CHECK_DISK: &str = "check_disk";
+/// daemon 反复启动即退出（端口无法监听、初始化失败）；详情带 stderr 摘要。
+const HINT_DAEMON_STARTUP_FAILED: &str = "daemon_startup_failed";
 
 /// 修复动作；UI 映射 `doctorAction{Camel}`，并作为 `repair` 的 `action`。
 pub const ACTION_REREGISTER: &str = "reregister";
@@ -72,6 +76,13 @@ pub struct DiagnosticsService {
     store: Arc<StateStore>,
     api_switches: Arc<fluxdown_api::server::ApiRuntimeSwitches>,
     api_token: fluxdown_api::auth::TokenCell,
+    /// daemon 拉起监管与其 stderr 落盘文件；未接线（精简宿主 / 测试）时不产出启动检查。
+    startup: Option<DaemonStartupProbe>,
+}
+
+struct DaemonStartupProbe {
+    supervisor: Arc<DaemonSupervisor>,
+    stderr_log: PathBuf,
 }
 
 impl DiagnosticsService {
@@ -93,7 +104,22 @@ impl DiagnosticsService {
             store,
             api_switches,
             api_token,
+            startup: None,
         }
+    }
+
+    /// 接入 daemon 监管：Doctor 据此暴露「启动即崩溃 / 无法监听」的崩溃循环与 stderr 摘要。
+    #[must_use]
+    pub fn with_daemon_startup(
+        mut self,
+        supervisor: Arc<DaemonSupervisor>,
+        stderr_log: PathBuf,
+    ) -> Self {
+        self.startup = Some(DaemonStartupProbe {
+            supervisor,
+            stderr_log,
+        });
+        self
     }
 
     /// 运行全部探测并生成报告。
@@ -107,11 +133,15 @@ impl DiagnosticsService {
         let daemon = self.probe_daemon().await;
         let listener = probe_listener(gateway.port).await;
         let local_server = probe_local_server(&gateway).await;
+        let daemon_startup = self.probe_daemon_startup().await;
 
         let mut checks = sync_probe.nmh;
         checks.push(listener);
         checks.push(local_server);
         checks.push(daemon.check);
+        if let Some(check) = daemon_startup {
+            checks.push(check);
+        }
         checks.extend(sync_probe.shell);
         checks.push(sync_probe.log_dir);
 
@@ -123,7 +153,7 @@ impl DiagnosticsService {
 
         Ok(DiagnosticsReportDto {
             generated_at_unix_ms: unix_ms(),
-            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            app_version: fluxdown_protocol::APP_VERSION.to_owned(),
             platform: format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             agent_data_dir: self.store.data_dir().display().to_string(),
             daemon_connected: daemon.connected,
@@ -232,7 +262,10 @@ impl DiagnosticsService {
             ),
         }
         match self.fetch_daemon_export().await {
-            Ok(bytes) => zip.add("daemon/snapshot.json", &bytes),
+            Ok(bytes) => zip.add(
+                "daemon/snapshot.json",
+                &crate::log_export::sanitize_json_export(&bytes),
+            ),
             Err(error) => {
                 tracing::warn!(error = %error, "daemon log export unavailable");
                 zip.add(
@@ -242,19 +275,29 @@ impl DiagnosticsService {
             }
         }
 
+        // 日志里会出现请求 URL、代理与 Webhook 错误等：所有文本日志按共享规则脱敏后再打包。
         let agent_logs = crate::log_export::agent_log_dir(self.store.data_dir());
         for (name, bytes) in crate::log_export::collect_log_files(&agent_logs).await {
-            zip.add(&format!("agent/logs/{name}"), &bytes);
+            zip.add(
+                &format!("agent/logs/{name}"),
+                &crate::log_export::sanitize_text(&bytes),
+            );
         }
         if let Some(dir) = daemon_log_dir(describe.as_ref()) {
             for (name, bytes) in crate::log_export::collect_log_files(Path::new(dir)).await {
-                zip.add(&format!("daemon/logs/{name}"), &bytes);
+                zip.add(
+                    &format!("daemon/logs/{name}"),
+                    &crate::log_export::sanitize_text(&bytes),
+                );
             }
         }
         if let Some(path) = crate::log_export::nmh_relay_log_path()
             && let Some(bytes) = crate::log_export::read_tail(&path, NMH_LOG_EXPORT_BYTES).await
         {
-            zip.add("nmh/fluxdown_nmh.log", &bytes);
+            zip.add(
+                "nmh/fluxdown_nmh.log",
+                &crate::log_export::sanitize_text(&bytes),
+            );
         }
 
         let bytes = zip.finish();
@@ -333,6 +376,24 @@ impl DiagnosticsService {
         }
     }
 
+    /// daemon 启动检查：崩溃循环状态来自监管器，摘要来自 `fluxdownd.stderr.log` 末尾。
+    async fn probe_daemon_startup(&self) -> Option<DiagnosticCheckDto> {
+        let startup = self.startup.as_ref()?;
+        let streak = startup.supervisor.crash_streak();
+        let looping = startup.supervisor.in_crash_loop();
+        let stderr = if looping {
+            crate::log_export::read_tail(&startup.stderr_log, STARTUP_STDERR_TAIL_BYTES)
+                .await
+                .map(|bytes| {
+                    String::from_utf8_lossy(&crate::log_export::sanitize_text(&bytes)).into_owned()
+                })
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        Some(daemon_startup_check(streak, looping, &stderr))
+    }
+
     /// 与 `agent.gateway.patch` 同一条路径：持久化 → 运行时开关 → 广播 `GatewayChanged`。
     async fn enable_service(&self) -> Result<(), DiagnosticsError> {
         let mut state = self.state.lock().await;
@@ -361,7 +422,7 @@ impl DiagnosticsService {
     async fn agent_summary(&self) -> Value {
         let state = self.state.lock().await;
         json!({
-            "appVersion": env!("CARGO_PKG_VERSION"),
+            "appVersion": fluxdown_protocol::APP_VERSION,
             "platform": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
             "dataDir": self.store.data_dir().display().to_string(),
             "daemonRpcUrl": self.daemon_config.rpc_url,
@@ -403,9 +464,17 @@ impl DiagnosticsService {
             .timeout(DAEMON_TIMEOUT)
             .build()
             .map_err(|error| DiagnosticsError::Export(error.to_string()))?;
+        // 会话级凭据只在已认证的 daemon 连接上存在；没有会话就是 daemon 不可用，不退回长期 token。
+        let credential = self
+            .daemon_config
+            .http_session()
+            .credential()
+            .ok_or_else(|| {
+                DiagnosticsError::Export("daemon session is not established".to_owned())
+            })?;
         let response = client
             .get(url)
-            .bearer_auth(&self.daemon_config.bearer)
+            .bearer_auth(credential)
             .send()
             .await
             .map_err(|error| DiagnosticsError::Export(error.to_string()))?;
@@ -441,6 +510,52 @@ fn probe_sync(data_dir: &Path, opted_out: &[OpenAssociation]) -> SyncProbe {
         shell: shell_checks(&crate::platform::integration_status(), opted_out),
         log_dir: probe_log_dir(&crate::log_export::agent_log_dir(data_dir)),
     }
+}
+
+/// 崩溃循环检查详情里保留的 daemon stderr 末尾行数。
+const STARTUP_STDERR_LINES: usize = 8;
+/// 读取 stderr 日志末尾的字节数。
+const STARTUP_STDERR_TAIL_BYTES: u64 = 4 * 1024;
+
+/// `daemon_startup`：daemon 子进程是否在「启动即崩溃」的循环里（端口无法监听、引擎初始化
+/// 失败等）。循环中时详情带 `fluxdownd.stderr.log` 的末尾摘要（已脱敏）。
+fn daemon_startup_check(
+    crash_streak: u32,
+    in_crash_loop: bool,
+    stderr: &str,
+) -> DiagnosticCheckDto {
+    if !in_crash_loop {
+        return check(
+            CHECK_DAEMON_STARTUP,
+            "",
+            DiagnosticLevel::Ok,
+            "fluxdownd is not crash-looping".to_owned(),
+            "",
+            None,
+        );
+    }
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let tail = &lines[lines.len().saturating_sub(STARTUP_STDERR_LINES)..];
+    let mut detail = format!(
+        "fluxdownd exited abnormally {crash_streak} times in a row right after launch \
+         (local port unavailable or startup failure); see fluxdownd.stderr.log"
+    );
+    for line in tail {
+        detail.push('\n');
+        detail.push_str(line);
+    }
+    check(
+        CHECK_DAEMON_STARTUP,
+        "",
+        DiagnosticLevel::Error,
+        detail,
+        HINT_DAEMON_STARTUP_FAILED,
+        None,
+    )
 }
 
 fn check(
@@ -1010,10 +1125,11 @@ mod tests {
 
     use super::{
         ACTION_ENABLE_SERVICE, ACTION_OPEN_LOG_DIR, ACTION_REGISTER, ACTION_REREGISTER,
-        ACTION_USE_THIS_INSTALL, HINT_ASSOCIATION_OFF, HINT_CHECK_DISK, HINT_ENABLE_LOCAL_SERVER,
-        HINT_ENABLE_PROTOCOL, HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP, HINT_REREGISTER_NMH,
-        TARGET_TORRENT, daemon_export_url, daemon_log_dir, manifest_check, nmh_checks,
-        opted_out_associations, probe_local_server, probe_log_dir, relay_check, shell_checks,
+        ACTION_USE_THIS_INSTALL, HINT_ASSOCIATION_OFF, HINT_CHECK_DISK, HINT_DAEMON_STARTUP_FAILED,
+        HINT_ENABLE_LOCAL_SERVER, HINT_ENABLE_PROTOCOL, HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP,
+        HINT_REREGISTER_NMH, STARTUP_STDERR_LINES, TARGET_TORRENT, daemon_export_url,
+        daemon_log_dir, daemon_startup_check, manifest_check, nmh_checks, opted_out_associations,
+        probe_local_server, probe_log_dir, relay_check, shell_checks,
     };
     use crate::nmh::registry::{NmhDiagnosis, NmhTarget, RelayOwner};
 
@@ -1029,6 +1145,34 @@ mod tests {
                 "manifest file missing".to_owned()
             },
         }
+    }
+
+    #[test]
+    fn daemon_startup_check_surfaces_crash_loop_with_a_bounded_stderr_tail() {
+        let ok = daemon_startup_check(0, false, "");
+        assert_eq!(ok.id, "daemon_startup");
+        assert_eq!(ok.level, DiagnosticLevel::Ok);
+        assert!(ok.hint.is_empty());
+
+        let stderr = (1..=30)
+            .map(|line| format!("startup line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let failing = daemon_startup_check(4, true, &stderr);
+        assert_eq!(failing.level, DiagnosticLevel::Error);
+        assert_eq!(failing.hint, HINT_DAEMON_STARTUP_FAILED);
+        assert!(failing.detail.contains("4"), "{}", failing.detail);
+        assert!(failing.detail.contains("startup line 30"));
+        assert!(!failing.detail.contains("startup line 1\n"));
+        assert!(
+            failing.detail.lines().count() <= STARTUP_STDERR_LINES + 2,
+            "{}",
+            failing.detail
+        );
+
+        // 崩溃循环但还没有任何 stderr：仍然报错，只是没有摘要。
+        let silent = daemon_startup_check(3, true, "  \n");
+        assert_eq!(silent.level, DiagnosticLevel::Error);
     }
 
     #[test]

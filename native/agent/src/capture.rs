@@ -39,6 +39,16 @@ pub enum CaptureOrigin {
     Prompt,
 }
 
+/// 本机 `.torrent` 建任务的附加选项；默认 = 静默全选、daemon 默认队列、立即开始。
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TorrentCreateOptions {
+    /// true：全选文件不弹选择框；false：由 daemon 发 BT 文件选择请求。
+    pub unattended: bool,
+    /// 目标队列（`None` = daemon 默认队列）。
+    pub queue_id: Option<String>,
+    pub start_paused: bool,
+}
+
 /// 外部接管的静默策略；由偏好现算，改动即生效。
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ExternalPolicy {
@@ -152,7 +162,7 @@ impl CaptureService {
         for request in requests {
             let mut create = captured_create_request(request);
             if let Some(dir) = fallback_save_dir {
-                fill_if_blank(&mut create.save_dir, dir.to_owned());
+                fill_if_blank(&mut create.request.save_dir, dir.to_owned());
             }
             let created = match self.create(create, None, unattended).await {
                 Ok(created) => created,
@@ -199,20 +209,22 @@ impl CaptureService {
         Ok(json!({ "transactionIds": transaction_ids }))
     }
 
-    /// 用户选定的本机 `.torrent`（已上传为 daemon blob）直接建任务；
-    /// `unattended` 为 true 时全选文件不弹选择框。
+    /// 用户选定的本机 `.torrent`（已上传为 daemon blob）直接建任务；`options.unattended`
+    /// 为 true 时全选文件不弹选择框，否则由 daemon 发 BT 文件选择请求。保存目录取
+    /// `request.save_dir`（空 = daemon 默认），队列与暂停取 `options`。
     pub async fn create_torrent(
         &self,
         request: DownloadRequest,
         torrent_blob_id: String,
-        unattended: bool,
+        options: TorrentCreateOptions,
     ) -> Result<Value, CaptureError> {
-        self.create(
-            captured_create_request(request),
-            Some(torrent_blob_id),
-            unattended,
-        )
-        .await
+        let mut spec = captured_create_request(request);
+        if let Some(queue_id) = options.queue_id {
+            spec.request.queue_id = queue_id;
+        }
+        spec.request.start_paused = options.start_paused;
+        self.create(spec, Some(torrent_blob_id), options.unattended)
+            .await
     }
 
     pub async fn list(&self) -> Vec<PendingCaptureDto> {
@@ -244,16 +256,16 @@ impl CaptureService {
         if !accepted {
             return Ok(json!({ "accepted": false }));
         }
-        let request = match confirmed {
+        let spec = match confirmed {
             Some(confirmed) => merge_confirmed_request(transaction.request, confirmed),
             None => captured_create_request(transaction.request),
         };
-        self.create(request, None, false).await
+        self.create(spec, None, false).await
     }
 
     async fn create(
         &self,
-        request: CreateTaskRequest,
+        spec: CaptureCreate,
         torrent_blob_id: Option<String>,
         unattended: bool,
     ) -> Result<Value, CaptureError> {
@@ -261,9 +273,10 @@ impl CaptureService {
             .call(
                 fluxdown_protocol::method::DAEMON_TASK_CREATE,
                 Some(DaemonCreateTaskParams {
-                    request,
+                    request: spec.request,
                     torrent_blob_id,
                     unattended,
+                    hint_file_size: spec.hint_file_size,
                 }),
             )
             .await
@@ -350,29 +363,40 @@ fn split_batch(request: DownloadRequest) -> Vec<DownloadRequest> {
         .collect()
 }
 
+/// 建任务请求 + 捕获方声明的文件大小提示（`hintFileSize` 不在 `CreateTaskRequest` 内）。
+struct CaptureCreate {
+    request: CreateTaskRequest,
+    /// 仅 >0 才有意义：daemon 据此跳过一次性 URL 的探测请求。
+    hint_file_size: Option<i64>,
+}
+
 /// 按捕获原请求建任务（静默提交 / 未带表单结果的确认）；队列与分段走 daemon 默认。
-fn captured_create_request(request: DownloadRequest) -> CreateTaskRequest {
-    CreateTaskRequest {
-        url: request.url,
-        file_name: request.filename,
-        save_dir: request.save_dir,
-        segments: 0,
-        cookies: request.cookies,
-        referrer: request.referrer,
-        proxy_url: String::new(),
-        user_agent: String::new(),
-        queue_id: String::new(),
-        checksum: String::new(),
-        ignore_tls_errors: false,
-        headers: request.headers,
-        torrent_b64: None,
-        method: request.method,
-        body: request.body,
-        audio_url: request.audio_url,
-        start_paused: false,
-        http_user: String::new(),
-        http_password: String::new(),
-        save_site_auth: false,
+fn captured_create_request(request: DownloadRequest) -> CaptureCreate {
+    let hint_file_size = request.file_size.filter(|size| *size > 0);
+    CaptureCreate {
+        request: CreateTaskRequest {
+            url: request.url,
+            file_name: request.filename,
+            save_dir: request.save_dir,
+            segments: 0,
+            cookies: request.cookies,
+            referrer: request.referrer,
+            proxy_url: String::new(),
+            user_agent: String::new(),
+            queue_id: String::new(),
+            checksum: String::new(),
+            ignore_tls_errors: false,
+            headers: request.headers,
+            torrent_b64: None,
+            method: request.method,
+            body: request.body,
+            audio_url: request.audio_url,
+            start_paused: false,
+            http_user: String::new(),
+            http_password: String::new(),
+            save_site_auth: false,
+        },
+        hint_file_size,
     }
 }
 
@@ -385,8 +409,11 @@ fn captured_create_request(request: DownloadRequest) -> CreateTaskRequest {
 fn merge_confirmed_request(
     captured: DownloadRequest,
     mut confirmed: CreateTaskRequest,
-) -> CreateTaskRequest {
-    let base = captured_create_request(captured);
+) -> CaptureCreate {
+    let CaptureCreate {
+        request: base,
+        hint_file_size,
+    } = captured_create_request(captured);
     confirmed.url = base.url;
     confirmed.method = base.method;
     confirmed.body = base.body;
@@ -405,7 +432,10 @@ fn merge_confirmed_request(
         headers.insert(name, value);
     }
     confirmed.headers = (!headers.is_empty()).then_some(headers);
-    confirmed
+    CaptureCreate {
+        request: confirmed,
+        hint_file_size,
+    }
 }
 
 fn fill_if_blank(target: &mut String, fallback: String) {
@@ -438,10 +468,11 @@ pub enum CaptureError {
 
 /// daemon 专用二进制上传端点（`POST /blobs/{torrents|plugins}`）的客户端。
 ///
-/// 与 RPC 共用 daemon 的 bearer；base URL 由 RPC URL 换成 http(s) 并去掉路径。
+/// 鉴权用 daemon 在已认证 WebSocket 会话上派生的会话级 HTTP 凭据，不使用长期 token；
+/// base URL 由 RPC URL 换成 http(s) 并去掉路径。
 pub struct DaemonBlobClient {
     base_url: reqwest::Url,
-    bearer: String,
+    session: crate::daemon_client::HttpSession,
     http: reqwest::Client,
 }
 
@@ -480,14 +511,14 @@ impl DaemonBlobClient {
         // 位于 Gateway 开始服务前的装配路径上）。
         let http = reqwest::Client::builder()
             .tls_built_in_root_certs(false)
-            // 回环 daemon 不能经环境 / 系统代理转发，否则 bearer 与文件字节会离开本机。
+            // 回环 daemon 不能经环境 / 系统代理转发，否则会话凭据与文件字节会离开本机。
             .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
         Ok(Self {
             base_url,
-            bearer: config.bearer.clone(),
+            session: config.http_session(),
             http,
         })
     }
@@ -498,10 +529,15 @@ impl DaemonBlobClient {
             .base_url
             .join(kind.path())
             .map_err(|error| BlobError::Url(error.to_string()))?;
+        // 没有已认证的 daemon 会话（未连上 / 已断开）时没有可用凭据：按 daemon 不可用处理，
+        // 绝不退回长期 token。
+        let Some(credential) = self.session.credential() else {
+            return Err(BlobError::Status(503));
+        };
         let response = self
             .http
             .post(url)
-            .bearer_auth(&self.bearer)
+            .bearer_auth(credential)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes)
             .send()
@@ -539,8 +575,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CaptureOrigin, CaptureService, DownloadRequest, ExternalPolicy, merge_confirmed_request,
-        pending_capture_dto, split_batch, with_category_dir,
+        CaptureOrigin, CaptureService, DownloadRequest, ExternalPolicy, captured_create_request,
+        merge_confirmed_request, pending_capture_dto, split_batch, with_category_dir,
     };
 
     fn preferences(
@@ -695,6 +731,30 @@ mod tests {
     }
 
     #[test]
+    fn declared_file_size_becomes_a_create_hint_only_when_positive() {
+        let with_size = |size: Option<i64>| DownloadRequest {
+            file_size: size,
+            ..captured()
+        };
+        assert_eq!(
+            captured_create_request(with_size(Some(4096))).hint_file_size,
+            Some(4096)
+        );
+        // 未知（-1 / 0 / 缺省）不提示，daemon 照常探测。
+        for size in [Some(-1), Some(0), None] {
+            assert_eq!(
+                captured_create_request(with_size(size)).hint_file_size,
+                None
+            );
+        }
+        // 表单确认沿用捕获方声明的大小。
+        let merged = merge_confirmed_request(with_size(Some(4096)), form(json!({ "url": "" })));
+        assert_eq!(merged.hint_file_size, Some(4096));
+        let merged = merge_confirmed_request(with_size(None), form(json!({ "url": "" })));
+        assert_eq!(merged.hint_file_size, None);
+    }
+
+    #[test]
     fn blank_form_keeps_captured_context_and_form_choices() {
         let merged = merge_confirmed_request(
             captured(),
@@ -704,7 +764,8 @@ mod tests {
                 "segments": 8,
                 "startPaused": true,
             })),
-        );
+        )
+        .request;
         assert_eq!(merged.url, "https://example.com/a.bin");
         assert_eq!(merged.file_name, "a.bin");
         assert_eq!(merged.save_dir, "/captured");
@@ -745,7 +806,8 @@ mod tests {
                 "httpPassword": "secret",
                 "saveSiteAuth": true,
             })),
-        );
+        )
+        .request;
         assert_eq!(merged.file_name, "renamed.bin");
         assert_eq!(merged.save_dir, "/chosen");
         assert_eq!(merged.cookies, "sid=2");
@@ -769,5 +831,83 @@ mod tests {
             headers.get("Authorization").map(String::as_str),
             Some("Basic YTpi")
         );
+    }
+
+    /// 读到请求头结束与整个请求体为止，返回头部文本（小写化便于断言）。
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt;
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.expect("read request");
+            assert!(read > 0, "client closed before finishing the request");
+            received.extend_from_slice(&chunk[..read]);
+            let Some(head_end) = received.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&received[..head_end]).to_ascii_lowercase();
+            let body_len = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if received.len() >= head_end + 4 + body_len {
+                return head;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn blob_upload_needs_a_daemon_session_and_authenticates_with_its_credential() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake daemon");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let head = read_http_request(&mut stream).await;
+            let body = br#"{"blobId":"blob-1"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("respond");
+            stream.write_all(body).await.expect("respond body");
+            head
+        });
+        let config = crate::daemon_client::DaemonClientConfig::new(
+            format!("ws://{address}/rpc"),
+            "long-lived-daemon-token",
+        );
+        let client = super::DaemonBlobClient::new(&config).expect("blob client");
+
+        // 还没有已认证会话：不发任何请求（服务端尚未被连接），更不会退回长期 token。
+        let error = client
+            .upload(super::BlobKind::Torrent, vec![1, 2, 3])
+            .await
+            .expect_err("no session yet");
+        assert!(matches!(error, super::BlobError::Status(503)), "{error}");
+        assert!(!server.is_finished());
+
+        config
+            .http_session()
+            .install("session-credential".to_owned());
+        let blob_id = client
+            .upload(super::BlobKind::Torrent, vec![1, 2, 3])
+            .await
+            .expect("upload with session credential");
+        assert_eq!(blob_id, "blob-1");
+        let head = server.await.expect("server");
+        assert!(
+            head.contains("authorization: bearer session-credential"),
+            "{head}"
+        );
+        assert!(!head.contains("long-lived-daemon-token"), "{head}");
     }
 }

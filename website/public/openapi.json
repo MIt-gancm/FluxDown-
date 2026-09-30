@@ -874,7 +874,7 @@
           "link"
         ],
         "summary": "处理配对 `confirm`（SAS 核对后确认/拒绝）。",
-        "description": "配对第二步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立的 sessionId 守卫）。**无 token 鉴权**。",
+        "description": "配对第三步：核对 SAS 后确认/拒绝（响应方内部会话，由 pair/hello 建立、pair/reveal 揭示后的 sessionId 守卫；未揭示的会话上 confirm=true 属协议违规）。**无 token 鉴权**。",
         "operationId": "api_link_pair_confirm",
         "requestBody": {
           "content": {
@@ -969,7 +969,7 @@
           "link"
         ],
         "summary": "处理配对 `hello`（发起方 → 本机）。",
-        "description": "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。",
+        "description": "配对握手第一步（发起方 → 响应方）。**无 token 鉴权**：由响应方 UI 展示的一次性配对码守卫，重复/过期码拒绝。请求只携带发起方临时公钥与随机数的承诺；响应方回出本次会话全新的临时公钥与随机数（不含 SAS）。`protocolVersion` 与响应方不一致（含旧版发起方）一律以版本不兼容拒绝。",
         "operationId": "api_link_pair_hello",
         "requestBody": {
           "content": {
@@ -983,7 +983,7 @@
         },
         "responses": {
           "200": {
-            "description": "响应方临时公钥 + SAS 材料",
+            "description": "响应方本次会话的临时公钥与随机数",
             "content": {
               "application/json": {
                 "schema": {
@@ -993,7 +993,49 @@
             }
           },
           "400": {
-            "description": "配对码错误/过期/已用，或载荷非法",
+            "description": "配对码错误/过期/已用、协议版本不兼容，或载荷非法",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ResultMessage"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/link/pair/reveal": {
+      "post": {
+        "tags": [
+          "link"
+        ],
+        "summary": "处理配对 `reveal`（发起方揭示 hello 里承诺的临时公钥）。",
+        "description": "配对握手第二步（发起方 → 响应方）：揭示 `pair/hello` 里承诺过的临时公钥与随机数，响应方核对承诺后返回对完整握手转录的身份签名。**无 token 鉴权**：由 `pair/hello` 建立的 sessionId 与公钥承诺守卫，承诺不符即作废会话。",
+        "operationId": "api_link_pair_reveal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkPairRevealRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "响应方对完整转录的签名",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkPairRevealResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "会话不存在/已过期、承诺不符，或载荷非法",
             "content": {
               "application/json": {
                 "schema": {
@@ -2146,7 +2188,7 @@
         "tags": [
           "rss"
         ],
-        "summary": "立即抓取一个订阅。抓取异步派发，本端点只表示「已受理」，结果走\n`rssSourcesChanged` / `rssItemsChanged` 事件。",
+        "summary": "立即抓取一个订阅。抓取异步派发，本端点只表示「已受理」，结果走\n`rssSourcesChanged` / `rssItemsChanged` 事件；该订阅已在抓取时同样视为成功，\n仅订阅不存在返回 404。",
         "operationId": "api_refresh_rss_source",
         "parameters": [
           {
@@ -2161,7 +2203,7 @@
         ],
         "responses": {
           "200": {
-            "description": "已派发抓取",
+            "description": "已受理（已派发抓取；该订阅已在抓取时同样视为成功）",
             "content": {
               "application/json": {
                 "schema": {
@@ -3992,10 +4034,9 @@
       },
       "LinkPairHelloRequest": {
         "type": "object",
-        "description": "配对 `hello` 请求（发起方 → 响应方）。全部密钥/签名字段为 base64。",
+        "description": "配对 `hello` 请求（发起方 → 响应方）。全部密钥/签名字段为 base64。\n\n配对协议版本 2：发起方在这一步只交出临时公钥与随机数的**承诺**，临时公钥本身\n要等响应方回出自己的临时值之后才在 `pair/reveal` 里揭示。",
         "required": [
           "code",
-          "initiatorEphPub",
           "initiatorIdPub",
           "initiatorSig",
           "name"
@@ -4016,9 +4057,9 @@
             },
             "description": "发起方自报可达候选地址（`ip:port`），供响应方存为回连候选。"
           },
-          "initiatorEphPub": {
+          "initiatorCommit": {
             "type": "string",
-            "description": "发起方临时 X25519 公钥（base64）。"
+            "description": "发起方临时 X25519 公钥与随机数的承诺 `sha256(eph_pub || nonce)`（base64）。"
           },
           "initiatorIdPub": {
             "type": "string",
@@ -4026,7 +4067,7 @@
           },
           "initiatorSig": {
             "type": "string",
-            "description": "发起方对握手转录的 Ed25519 签名（base64）。"
+            "description": "发起方对 hello（码、身份公钥、承诺、自报信息）的 Ed25519 签名（base64）。"
           },
           "name": {
             "type": "string",
@@ -4035,19 +4076,25 @@
           "platform": {
             "type": "string",
             "description": "发起方平台。"
+          },
+          "protocolVersion": {
+            "type": "integer",
+            "format": "int32",
+            "description": "发起方的配对协议版本。旧版发起方没有这个字段（按 0 处理），与响应方版本不一致\n一律以版本不兼容拒绝。",
+            "minimum": 0
           }
         }
       },
       "LinkPairHelloResponse": {
         "type": "object",
-        "description": "配对 `hello` 回复（响应方 → 发起方）。",
+        "description": "配对 `hello` 回复（响应方 → 发起方）：本次会话全新的临时公钥与随机数。不含 SAS\n与签名——响应方此刻还看不到发起方的临时公钥，两者都在 `pair/reveal` 之后才产生。",
         "required": [
+          "protocolVersion",
           "sessionId",
           "responderEphPub",
+          "responderNonce",
           "responderIdPub",
-          "responderSig",
-          "name",
-          "sas"
+          "name"
         ],
         "properties": {
           "appVersion": {
@@ -4059,21 +4106,61 @@
           "platform": {
             "type": "string"
           },
+          "protocolVersion": {
+            "type": "integer",
+            "format": "int32",
+            "description": "响应方的配对协议版本。",
+            "minimum": 0
+          },
           "responderEphPub": {
-            "type": "string"
+            "type": "string",
+            "description": "响应方本次会话的临时 X25519 公钥（base64）。"
           },
           "responderIdPub": {
             "type": "string"
           },
-          "responderSig": {
-            "type": "string"
-          },
-          "sas": {
+          "responderNonce": {
             "type": "string",
-            "description": "供响应方本地展示的 SAS（应与发起方计算一致）。"
+            "description": "响应方本次会话的随机数（base64）。"
           },
           "sessionId": {
             "type": "string"
+          }
+        }
+      },
+      "LinkPairRevealRequest": {
+        "type": "object",
+        "description": "配对 `reveal` 请求（发起方 → 响应方）：揭示 `hello` 里承诺过的临时公钥与随机数。",
+        "required": [
+          "sessionId",
+          "initiatorEphPub",
+          "initiatorNonce"
+        ],
+        "properties": {
+          "initiatorEphPub": {
+            "type": "string",
+            "description": "发起方临时 X25519 公钥（base64）。"
+          },
+          "initiatorNonce": {
+            "type": "string",
+            "description": "发起方随机数（base64）。"
+          },
+          "sessionId": {
+            "type": "string",
+            "description": "`pair/hello` 回复里的会话 id。"
+          }
+        }
+      },
+      "LinkPairRevealResponse": {
+        "type": "object",
+        "description": "配对 `reveal` 回复（响应方 → 发起方）：响应方对完整握手转录的 Ed25519 签名。SAS\n不上线，两端各自在本机屏幕上展示。",
+        "required": [
+          "responderSig"
+        ],
+        "properties": {
+          "responderSig": {
+            "type": "string",
+            "description": "响应方对完整转录的 Ed25519 签名（base64）。"
           }
         }
       },
@@ -4170,6 +4257,13 @@
         "properties": {
           "pluginId": {
             "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "用户确认权限时看到的版本；最新可装版本与之不一致时拒绝安装（`Conflict`），\n由客户端刷新目录后重新确认。缺省 = 不钉版本。"
           }
         }
       },
@@ -5150,6 +5244,11 @@
             "format": "int64",
             "description": "任务级做种时长上限（分钟）。哨兵语义同上。"
           },
+          "seedUploadLimitBps": {
+            "type": "integer",
+            "format": "int64",
+            "description": "任务级做种上传限速（字节/秒），0 = 未设置（跟随全局）。"
+          },
           "seedingMessage": {
             "type": "string",
             "description": "做种状态辅助说明（如停止原因，空 = 无）。"
@@ -5264,7 +5363,7 @@
     },
     {
       "name": "link",
-      "description": "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"
+      "description": "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/reveal`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"
     }
   ]
 }

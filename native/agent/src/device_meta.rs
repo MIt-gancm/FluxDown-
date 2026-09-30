@@ -96,7 +96,7 @@ impl DeviceMetaService {
         DeviceMeta {
             default_save_dir: effective_default_dir(configured.as_deref(), os_download_dir),
             path_style: PathStyle::current(),
-            app_version: env!("CARGO_PKG_VERSION"),
+            app_version: fluxdown_protocol::APP_VERSION,
         }
     }
 
@@ -273,7 +273,7 @@ mod tests {
 
         let first = reports_reach(&reports, 1).await;
         assert_eq!(first[0]["defaultSaveDir"], "/srv/first");
-        assert_eq!(first[0]["appVersion"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(first[0]["appVersion"], fluxdown_protocol::APP_VERSION);
         assert!(matches!(
             first[0]["pathStyle"].as_str(),
             Some("windows" | "posix")

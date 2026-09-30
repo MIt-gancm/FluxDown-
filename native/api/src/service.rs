@@ -12,11 +12,11 @@ use async_trait::async_trait;
 use fluxdown_protocol::daemon::{
     CreateGroupRequest, CreateTaskRequest, DownloadRequest, GroupDto, LinkAuth, LinkCodeResponse,
     LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse, LinkPairConfirmOutcome,
-    LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPingInfo,
-    MarketEntryDto, PluginAuthRequest, PluginAuthResponse, PluginDto, QueueDto,
-    ResolvePreviewRequest, ResolvePreviewResponse, RssItemActionRequest, RssItemDto, RssSourceDto,
-    RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto, SiteAuthEntryDto,
-    SiteAuthSaveRequest, TaskDto,
+    LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse, LinkPairRevealRequest,
+    LinkPairRevealResponse, LinkPingInfo, MarketEntryDto, PluginAuthRequest, PluginAuthResponse,
+    PluginDto, QueueDto, ResolvePreviewRequest, ResolvePreviewResponse, RssItemActionRequest,
+    RssItemDto, RssSourceDto, RssValidateRequest, RssValidateResponse, SiteAuthCredentialDto,
+    SiteAuthEntryDto, SiteAuthSaveRequest, TaskDto,
 };
 
 /// 404 fallback 响应的 message —— 请求命中了未注册的路由（例如管理 API 分组
@@ -350,7 +350,8 @@ pub trait ApiHost: Send + Sync {
         Err(rss_unsupported())
     }
 
-    /// 立即抓取一个订阅（异步派发，立即返回）。
+    /// 立即抓取一个订阅（异步派发，立即返回）。订阅正在抓取时视为成功（本次抓取即为结果），
+    /// 仅订阅不存在返回 [`ApiError::NotFound`]。
     async fn refresh_rss_source(&self, source_id: &str) -> Result<(), ApiError> {
         let _ = source_id;
         Err(rss_unsupported())
@@ -406,7 +407,18 @@ pub trait ApiHost: Send + Sync {
         Err(link_unsupported())
     }
 
-    /// 处理入站配对 `confirm`（SAS 核对后确认/拒绝）。
+    /// 处理入站配对 `reveal`（无 token 鉴权，由 `link_pair_hello` 建立的会话 id 与发起方
+    /// 先前的公钥承诺守卫）：发起方揭示临时公钥与随机数，宿主核对后返回响应方对完整握手
+    /// 转录的签名，并向本机用户展示 SAS。
+    async fn link_pair_reveal(
+        &self,
+        req: LinkPairRevealRequest,
+    ) -> Result<LinkPairRevealResponse, ApiError> {
+        let _ = req;
+        Err(link_unsupported())
+    }
+
+    /// 处理入站配对 `confirm`（SAS 核对后确认/拒绝）。只有已揭示的会话才能 `confirm=true`。
     ///
     /// 返回 [`LinkPairConfirmOutcome`]：本机用户拒绝、核验超时都是**协议正常终局**，
     /// 必须以 2xx + `paired=false` + 判别串回给发起方，而不是压成 4xx——否则发起方

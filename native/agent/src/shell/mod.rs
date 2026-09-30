@@ -512,8 +512,10 @@ fn should_idle_exit(
 
 fn snapshot_is_idle(snapshot: &AgentSnapshot) -> bool {
     let stats = &snapshot.daemon.runtime_stats;
+    // 自动重试间隙的任务在任务表里是失败状态，只在 `retry_pending_tasks` 里可见。
     stats.active_tasks == 0
         && stats.pending_tasks == 0
+        && stats.retry_pending_tasks == 0
         && snapshot.pending_captures.is_empty()
         && snapshot.daemon.pending_selections.is_empty()
         && snapshot.power.armed_delay_secs.is_none()
@@ -575,6 +577,9 @@ mod tests {
         snapshot.daemon.runtime_stats.pending_tasks = 1;
         assert!(!snapshot_is_idle(&snapshot));
         snapshot.daemon.runtime_stats.pending_tasks = 0;
+        snapshot.daemon.runtime_stats.retry_pending_tasks = 1;
+        assert!(!snapshot_is_idle(&snapshot));
+        snapshot.daemon.runtime_stats.retry_pending_tasks = 0;
         snapshot.power.armed_delay_secs = Some(0);
         assert!(!snapshot_is_idle(&snapshot));
     }

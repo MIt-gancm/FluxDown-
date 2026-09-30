@@ -233,7 +233,9 @@ pub struct TokenSeed {
 /// daemon 首次就绪并完成 legacy 迁移后应用 server 模式的状态引导；返回状态是否被改动。
 ///
 /// - `fresh`（迁移前尚无网关迁移修订）且密钥仍为空：这是全新安装，开启兼容 API 分组
-///   （takeover、jsonrpc、api、mcp）。迁移导入了旧 server 的密钥则保持其既有开关；
+///   （takeover、jsonrpc、api、mcp）。密钥为空期间 takeover / jsonrpc 由兼容 API 的
+///   `require_token` 门禁一律拒绝（api / mcp 本就拒绝空 token），首次设置完成后按开关生效。
+///   迁移导入了旧 server 的密钥则保持其既有开关；
 /// - 预置密钥：密钥为空时采纳；`force` 时每次启动都覆盖。
 #[must_use]
 pub fn apply_bootstrap(state: &mut AgentState, fresh: bool, seed: &TokenSeed) -> bool {
@@ -623,9 +625,10 @@ impl ServerHandle {
 }
 
 /// daemon loopback HTTP 的流式转发客户端（无整体超时：大文件下载可以很久）。
+/// 鉴权用已认证 WebSocket 会话派生的会话级凭据，见 `DaemonClientConfig::http_session`。
 struct DaemonHttp {
     base_url: reqwest::Url,
-    bearer: String,
+    session: crate::daemon_client::HttpSession,
     client: reqwest::Client,
 }
 
@@ -652,7 +655,7 @@ impl DaemonHttp {
             .build()?;
         Ok(Self {
             base_url,
-            bearer: config.bearer.clone(),
+            session: config.http_session(),
             client,
         })
     }
@@ -678,7 +681,11 @@ impl DaemonHttp {
             }
             Err(()) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
-        let upstream = match self.client.get(url).bearer_auth(&self.bearer).send().await {
+        // 没有已认证的 daemon 会话时 daemon 视为不可用，绝不退回长期 token。
+        let Some(credential) = self.session.credential() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let upstream = match self.client.get(url).bearer_auth(credential).send().await {
             Ok(response) => response,
             Err(error) => {
                 tracing::warn!(error = %error, "daemon file proxy request failed");
@@ -1308,10 +1315,7 @@ mod tests {
                 ..AgentState::default()
             }));
             let (ready, ready_rx) = tokio::sync::watch::channel(true);
-            let daemon = DaemonClientConfig {
-                rpc_url: "ws://127.0.0.1:9/rpc".to_owned(),
-                bearer: "daemon-bearer".to_owned(),
-            };
+            let daemon = DaemonClientConfig::new("ws://127.0.0.1:9/rpc", "daemon-token");
             let handle = Arc::new(
                 ServerHandle::new(ServerHandleParts {
                     token: TokenCell::new(token),
@@ -1322,10 +1326,7 @@ mod tests {
                     blobs: Arc::new(DaemonBlobClient::new(&daemon).unwrap()),
                     diagnostics: Arc::new(crate::diagnostics::DiagnosticsService::new(
                         Arc::new(crate::daemon_client::DaemonClient::disconnected()),
-                        DaemonClientConfig {
-                            rpc_url: "ws://127.0.0.1:9/rpc".to_owned(),
-                            bearer: String::new(),
-                        },
+                        DaemonClientConfig::new("ws://127.0.0.1:9/rpc", String::new()),
                         AgentEventHub::new(AgentSnapshot::default()),
                         state.clone(),
                         store.clone(),
@@ -1462,14 +1463,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(empty.status(), 401, "{path}");
-            // 凭据正确但 daemon 不可达：网关错误，而不是放行或挂起。
+            // 凭据正确但 daemon 未连接：返回 503，而不是放行或挂起。
             let bearer = client
                 .get(format!("{base}{path}"))
                 .bearer_auth("flux2026")
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(bearer.status(), 502, "{path}");
+            assert_eq!(bearer.status(), 503, "{path}");
         }
         let logs = format!("{base}/api/web/logs/export");
         assert_eq!(client.get(&logs).send().await.unwrap().status(), 401);

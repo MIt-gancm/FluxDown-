@@ -3,10 +3,13 @@
 //! agent 没有归档 crate，这里手写 ZIP（无压缩，方法 0），只需要 CRC-32 与固定头部，
 //! 任何系统解压器都能直接打开；日志文本本身不压缩换取零依赖。
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fluxdown_protocol::{LogExportResult, LogPathsDto};
+use regex::Regex;
 
 /// 单个日志文件上限；超过时只保留末尾，避免失控日志撑爆内存与导出包。
 const MAX_LOG_FILE_BYTES: u64 = 32 * 1024 * 1024;
@@ -290,9 +293,154 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// 对导出的文本逐条套用共享脱敏规则（`fluxdown_logfile::SANITIZE_PATTERNS`，单一来源）；
+/// 非 UTF-8 字节按有损解码，不会因编码问题跳过脱敏。
+#[must_use]
+pub fn sanitize_text(bytes: &[u8]) -> Vec<u8> {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    for (regex, replacement) in sanitize_rules() {
+        if let Cow::Owned(next) = regex.replace_all(&text, *replacement) {
+            text = next;
+        }
+    }
+    text.into_bytes()
+}
+
+/// 编译一次并缓存；模式是编译期常量，编译失败属于规则表缺陷，测试会钉住条数一致。
+static SANITIZE_RULES: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
+    fluxdown_logfile::SANITIZE_PATTERNS
+        .iter()
+        .filter_map(|(pattern, replacement)| match Regex::new(pattern) {
+            Ok(regex) => Some((regex, *replacement)),
+            Err(error) => {
+                tracing::error!(pattern, error = %error, "log sanitize rule does not compile");
+                None
+            }
+        })
+        .collect()
+});
+
+fn sanitize_rules() -> &'static [(Regex, &'static str)] {
+    &SANITIZE_RULES
+}
+
+/// daemon 快照等 JSON 导出：先按键名抹掉密钥类值（代理账号密码、Webhook 端点及其签名密钥 /
+/// 自定义头、任何名字含 password / secret / token 的字段），再套用文本规则；解析失败时只做
+/// 文本脱敏。
+#[must_use]
+pub fn sanitize_json_export(bytes: &[u8]) -> Vec<u8> {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return sanitize_text(bytes);
+    };
+    redact_secret_values(&mut value);
+    match serde_json::to_vec_pretty(&value) {
+        Ok(redacted) => sanitize_text(&redacted),
+        Err(_) => sanitize_text(bytes),
+    }
+}
+
+const REDACTED_VALUE: &str = "***";
+
+fn is_secret_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "proxy_username" | "proxy_password" | "webhook.endpoints"
+    ) || ["password", "secret", "token", "authorization", "cookie"]
+        .iter()
+        .any(|needle| key.contains(needle))
+}
+
+fn redact_secret_values(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_secret_key(key) {
+                    *child = serde_json::Value::String(REDACTED_VALUE.to_owned());
+                } else {
+                    redact_secret_values(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_secret_values),
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ZipWriter, civil_from_days, crc32, is_log_name, resolve_target};
+    use super::{
+        ZipWriter, civil_from_days, crc32, is_log_name, resolve_target, sanitize_json_export,
+        sanitize_rules, sanitize_text,
+    };
+
+    #[test]
+    fn every_shared_sanitize_pattern_compiles_into_a_rule() {
+        assert_eq!(
+            sanitize_rules().len(),
+            fluxdown_logfile::SANITIZE_PATTERNS.len()
+        );
+    }
+
+    #[test]
+    fn log_text_loses_credentials_tokens_and_user_names() {
+        let log = "webhook failed: https://api.telegram.org/bot123456:AAH-secret_token/sendMessage\n\
+                   gotify POST https://push.example.com/message?token=abc123&x=1\n\
+                   proxy http://user:hunter2@proxy.local:8080 via /home/alice/.config\n\
+                   Cookie: sid=abcdef\nAuthorization: Bearer topsecret\n\
+                   C:\\Users\\Bob\\AppData\\fluxdown\n";
+        let cleaned = String::from_utf8(sanitize_text(log.as_bytes())).expect("utf8");
+        for leaked in [
+            "AAH-secret_token",
+            "abc123",
+            "hunter2",
+            "alice",
+            "sid=abcdef",
+            "topsecret",
+            "Bob",
+        ] {
+            assert!(!cleaned.contains(leaked), "{leaked} leaked: {cleaned}");
+        }
+        // 排障需要的主机与错误上下文保留。
+        assert!(cleaned.contains("api.telegram.org"));
+        assert!(cleaned.contains("push.example.com"));
+        assert!(cleaned.contains("proxy.local:8080"));
+    }
+
+    #[test]
+    fn daemon_snapshot_export_masks_secret_config_but_keeps_the_rest() {
+        let snapshot = serde_json::json!({
+            "config": {
+                "revision": 7,
+                "values": {
+                    "proxy_username": "alice",
+                    "proxy_password": "hunter2",
+                    "proxy_url": "http://127.0.0.1:7890",
+                    "webhook.endpoints":
+                        "[{\"url\":\"https://hooks.example.com/x\",\"signSecret\":\"s3cr3t\"}]",
+                    "max_concurrent_downloads": "3",
+                }
+            },
+            "tasks": [{ "id": "t1", "signSecret": "s3cr3t", "url": "https://h.example/f" }],
+        });
+        let raw = serde_json::to_vec(&snapshot).expect("serialize snapshot");
+        let cleaned = sanitize_json_export(&raw);
+        let text = String::from_utf8(cleaned.clone()).expect("utf8");
+        for leaked in ["alice", "hunter2", "s3cr3t", "hooks.example.com"] {
+            assert!(!text.contains(leaked), "{leaked} leaked: {text}");
+        }
+        let value: serde_json::Value = serde_json::from_slice(&cleaned).expect("still JSON");
+        assert_eq!(value["config"]["revision"], 7);
+        assert_eq!(
+            value["config"]["values"]["proxy_url"],
+            "http://127.0.0.1:7890"
+        );
+        assert_eq!(value["config"]["values"]["max_concurrent_downloads"], "3");
+        assert_eq!(value["tasks"][0]["url"], "https://h.example/f");
+        // 无法解析的导出内容也按文本规则兜底。
+        let broken = sanitize_json_export(b"not json: https://u:pw@host/x");
+        assert!(!String::from_utf8_lossy(&broken).contains(":pw@"));
+    }
 
     #[test]
     fn crc32_matches_reference_vector() {

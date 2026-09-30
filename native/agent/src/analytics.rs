@@ -116,7 +116,7 @@ impl AnalyticsWorker {
                 "systemProps": {
                     "osName": os_name(),
                     "osVersion": std::env::consts::ARCH,
-                    "appVersion": env!("CARGO_PKG_VERSION"),
+                    "appVersion": fluxdown_protocol::APP_VERSION,
                     "locale": "",
                     "isDebug": cfg!(debug_assertions),
                 },

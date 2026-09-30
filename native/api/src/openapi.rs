@@ -70,6 +70,7 @@ use utoipa::{Modify, OpenApi};
         crate::server::api_market_list,
         crate::server::api_market_install,
         crate::server::api_link_pair_hello,
+        crate::server::api_link_pair_reveal,
         crate::server::api_link_pair_confirm,
         crate::server::api_link_create_task,
         crate::server::api_link_info,
@@ -94,7 +95,7 @@ use utoipa::{Modify, OpenApi};
         (name = "groups", description = "任务组与前置预解析（多文件任务组；强制 token）"),
         (name = "plugins", description = "插件系统（安装/启停/设置/卸载；强制 token）"),
         (name = "rss", description = "RSS 订阅自动下载（订阅 CRUD / 条目流 / 手动操作 / feed 验证；强制 token）"),
-        (name = "link", description = "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"),
+        (name = "link", description = "设备互联（配对/发现/数据面下发；`pair/hello`·`pair/reveal`·`pair/confirm`·`link/tasks` 无 token，由一次性码/会话/链路 HMAC 守卫，其余强制 management token）"),
     ),
     modifiers(&SecurityAddon)
 )]
@@ -187,6 +188,7 @@ mod tests {
             routes::API_MARKET,
             routes::API_MARKET_INSTALL,
             routes::API_LINK_PAIR_HELLO,
+            routes::API_LINK_PAIR_REVEAL,
             routes::API_LINK_PAIR_CONFIRM,
             routes::API_LINK_TASKS,
             routes::API_LINK_INFO,
