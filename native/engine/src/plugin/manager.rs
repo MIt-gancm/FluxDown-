@@ -278,6 +278,11 @@ impl PluginManager {
         self.runtime.spawn_handle()
     }
 
+    /// 宿主并发上限变化时同步 resolve 并发容量（见 [`ScriptRuntime::set_resolve_capacity`]）。
+    pub fn set_resolve_capacity(&self, max_concurrent: usize) {
+        self.runtime.set_resolve_capacity(max_concurrent);
+    }
+
     /// 扫描根目录 + `plugin.dev.*` 键，解析并加载全部插件。
     pub async fn load_all(&self) {
         let _serial = self.load_lock.lock().await;
@@ -1406,7 +1411,10 @@ impl PluginManager {
         for (key, value) in entries {
             let field = manifest.settings.iter().find(|f| &f.key == key);
             let Some(field) = field else {
-                return Err(PluginError::InvalidOutput(format!("未知设置项 '{key}'")));
+                return Err(PluginError::InvalidSetting {
+                    key: key.clone(),
+                    message: format!("未知设置项 '{key}'"),
+                });
             };
             self.validate_value(field, value)?;
         }
@@ -1422,7 +1430,12 @@ impl PluginManager {
 
     /// 单设置项校验（类型/required/pattern/min-max/select/toggle）。
     fn validate_value(&self, field: &SettingField, value: &str) -> Result<(), PluginError> {
-        let bad = |m: String| Err(PluginError::InvalidOutput(m));
+        let bad = |m: String| {
+            Err(PluginError::InvalidSetting {
+                key: field.key.clone(),
+                message: m,
+            })
+        };
         match field.ty {
             SettingType::Boolean => {
                 if value != "true" && value != "false" {
@@ -1434,8 +1447,9 @@ impl PluginManager {
                     .parse::<f64>()
                     .ok()
                     .filter(|v| v.is_finite())
-                    .ok_or_else(|| {
-                        PluginError::InvalidOutput(format!("'{}' 不是有效数字", field.key))
+                    .ok_or_else(|| PluginError::InvalidSetting {
+                        key: field.key.clone(),
+                        message: format!("'{}' 不是有效数字", field.key),
                     })?;
                 if let Some(lo) = field.min
                     && v < lo
@@ -1834,6 +1848,7 @@ fn validate_subscription_item(item: SubscriptionOutputItem) -> Result<ParsedItem
         title: item.title,
         link: item.link,
         enclosure_url: item.enclosure_url,
+        enclosure_type: String::new(),
         resolver_item: item.resolver_item,
         enclosure_length: item.enclosure_length,
         pub_date: item.pub_date,

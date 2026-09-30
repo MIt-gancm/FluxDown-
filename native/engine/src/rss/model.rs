@@ -214,6 +214,10 @@ pub struct RssItemInfo {
     pub link: String,
     /// enclosure 直链（Mikan 即 `.torrent`；空 = 回退 `link`）。
     pub enclosure_url: String,
+    /// 下载目标（enclosure / media:content，无 enclosure 时为回退链接）声明的 MIME 类型，
+    /// 小写、不含参数（空 = feed 没声明）。引擎内部使用，据此识别无 `.torrent` 扩展名的
+    /// 种子直链（`application/x-bittorrent`）。
+    pub enclosure_type: String,
     /// 可选二段解析标识；非空时下载地址使用 `link`，由 resolver 获取精确资源。
     pub resolver_item: String,
     /// enclosure 声明大小（字节，0 = 未知）。

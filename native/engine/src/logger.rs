@@ -816,38 +816,14 @@ fn list_log_files_in(dir: &std::path::Path) -> Vec<LogFileMeta> {
 
 static SANITIZE_RULES: std::sync::LazyLock<Vec<(regex::Regex, &'static str)>> =
     std::sync::LazyLock::new(|| {
-        [
-            (r"(?i)([\w+.-]+://)[^:/\s@]+:[^@\s]+@", "$1***@"),
-            // Telegram bot 令牌在路径里：/bot<id>:<token>/
-            (r"(?i)(/bot)\d+:[\w-]+", "$1[REDACTED]"),
-            // 令牌/密钥类 query 参数，无论值长短。
-            (
-                r"(?i)([?&](?:[\w.-]*(?:token|key|secret|password|passwd|pwd|sig|signature|auth|credential)[\w.-]*)=)[^&\s,)\]}>]+",
-                "$1[REDACTED]",
-            ),
-            (
-                r#"(?i)(https?://[^?\s]{3,})\?[^\s,)\]}>"]{50,}"#,
-                "$1?[QUERY_REDACTED]",
-            ),
-            (r"(?i)(cookie\b[^:\r\n]*:\s*)\S+", "$1[REDACTED]"),
-            (
-                r"(?i)(authorization\b[^:\r\n]*:\s*)(?:\S+\s+)?\S+",
-                "$1[REDACTED]",
-            ),
-            (
-                r"(?i)(proxy[_\s]?(?:password|username)\s*[=:]\s*)\S+",
-                "$1[REDACTED]",
-            ),
-            (r"/home/[^/\s]+/", "/home/***/"),
-            (r"(?i)([A-Z]:\\users\\)[^\\\s]+\\", "$1***\\"),
-        ]
-        .into_iter()
-        .map(|(pattern, replacement)| {
-            let regex = regex::Regex::new(pattern)
-                .unwrap_or_else(|error| panic!("invalid log sanitization regex: {error}"));
-            (regex, replacement)
-        })
-        .collect()
+        fluxdown_logfile::SANITIZE_PATTERNS
+            .iter()
+            .map(|&(pattern, replacement)| {
+                let regex = regex::Regex::new(pattern)
+                    .unwrap_or_else(|error| panic!("invalid log sanitization regex: {error}"));
+                (regex, replacement)
+            })
+            .collect()
     });
 
 /// 对日志文本脱敏（URL userinfo、令牌路径/query、Cookie、Authorization、用户目录）。

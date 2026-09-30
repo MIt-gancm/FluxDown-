@@ -345,6 +345,10 @@ pub enum PluginError {
     /// 指定标识没有 dev 登记（只有 dev 插件支持重新加载）。
     #[error("不是开发模式插件: {0}")]
     NotDevPlugin(String),
+    /// 某个设置项的值不合法（类型/范围/选项/pattern）或设置键不存在；`key` 供宿主把
+    /// 错误归因到具体字段，`message` 是面向用户的原因。
+    #[error("{message}")]
+    InvalidSetting { key: String, message: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -564,6 +568,11 @@ pub trait ScriptRuntime: Send + Sync {
 
     /// 用 JS `RegExp` 测试 `value` 是否匹配 `pattern`；pattern 非法时返回 false。
     fn regex_test(&self, pattern: &str, value: &str) -> bool;
+
+    /// 宿主并发上限变化时同步 resolve/subscription 的并发容量（实际容量
+    /// `max(max_concurrent, 内部 worker 数)`）。上限放大后，新增并发槽里的插件
+    /// 解析任务才不会因拿不到 permit 而 `Overloaded`。
+    fn set_resolve_capacity(&self, max_concurrent: usize);
 
     /// 调用 `globalThis.resolve(ctx)`。返回 `Ok(None)` = 放行不改写。
     /// `settings_json` 为 manager 预构建的**类型化**只读设置 JSON 对象字符串

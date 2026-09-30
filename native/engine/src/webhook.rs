@@ -30,7 +30,7 @@ use hmac::{Mac, SimpleHmac};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, Semaphore};
 
 use crate::db::{Db, WebhookDeliveryRow};
 use crate::events::{EngineEvent, EventSink};
@@ -62,6 +62,11 @@ const MAX_ATTEMPTS: u32 = 4;
 const RETRY_BASE_SECS: u64 = 2;
 /// 出站全局并发上限。
 const MAX_CONCURRENT_DELIVERIES: usize = 4;
+
+/// 单个端点待投递队列的上限。端点离线时队列只会积压，满了丢**最旧**的一条
+/// （过期通知价值最低），丢弃以一条汇总记录的形式出现在投递日志里。
+const MAX_QUEUED_JOBS_PER_ENDPOINT: usize = 256;
+
 /// 遵守 `Retry-After` 时的等待上限。
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(30);
 /// 日志里请求/响应体的截断长度（字符）。
@@ -732,18 +737,108 @@ struct Job {
     event: Arc<WebhookEvent>,
 }
 
+/// 队列满时被丢弃的投递的汇总（由 worker 下次取活前写进投递日志）。
+struct DroppedJobs {
+    count: u32,
+    /// 最近一条被丢弃投递所属的端点与事件。
+    spec: EndpointSpec,
+    event: &'static str,
+}
+
+#[derive(Default)]
+struct QueueState {
+    jobs: VecDeque<Job>,
+    dropped: Option<DroppedJobs>,
+    closed: bool,
+}
+
+/// worker 下一步该做的事。
+enum QueueStep {
+    Deliver(Job),
+    ReportDropped(DroppedJobs),
+    Closed,
+}
+
+/// 单个端点的有界 FIFO 投递队列。
+///
+/// 入队在 `emit` 里同步完成，**同端点的顺序在入队那一刻就定死了**；队列满时丢
+/// 最旧的一条并累计到 [`DroppedJobs`]，`emit` 永远不阻塞。
+struct EndpointQueue {
+    state: StdMutex<QueueState>,
+    wake: Notify,
+}
+
+impl EndpointQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: StdMutex::new(QueueState::default()),
+            wake: Notify::new(),
+        })
+    }
+
+    fn push(&self, job: Job) {
+        if let Ok(mut guard) = self.state.lock() {
+            let state = &mut *guard;
+            if state.jobs.len() >= MAX_QUEUED_JOBS_PER_ENDPOINT
+                && let Some(old) = state.jobs.pop_front()
+            {
+                let event = old.event.kind.wire();
+                match &mut state.dropped {
+                    Some(dropped) => {
+                        dropped.count = dropped.count.saturating_add(1);
+                        dropped.spec = old.spec;
+                        dropped.event = event;
+                    }
+                    None => {
+                        state.dropped = Some(DroppedJobs {
+                            count: 1,
+                            spec: old.spec,
+                            event,
+                        });
+                    }
+                }
+            }
+            state.jobs.push_back(job);
+        }
+        self.wake.notify_one();
+    }
+
+    /// 关闭队列（dispatcher 释放时），唤醒 worker 让其退出。
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+        self.wake.notify_one();
+    }
+
+    /// 取下一步；队列为空且未关闭时返回 `None`（worker 应等待唤醒）。
+    /// 先汇报丢弃，再投递，保证日志里的丢弃记录不会被一直忙碌的 worker 饿住。
+    fn take(&self) -> Option<QueueStep> {
+        let Ok(mut state) = self.state.lock() else {
+            return Some(QueueStep::Closed);
+        };
+        if state.closed {
+            return Some(QueueStep::Closed);
+        }
+        if let Some(dropped) = state.dropped.take() {
+            return Some(QueueStep::ReportDropped(dropped));
+        }
+        state.jobs.pop_front().map(QueueStep::Deliver)
+    }
+}
+
 struct Inner {
     endpoints: StdRwLock<Vec<EndpointSpec>>,
     log: StdMutex<VecDeque<WebhookDelivery>>,
     clients: StdRwLock<Arc<Clients>>,
-    /// 同端点串行队列：`endpoint_id → 该端点 worker 的入口`。
+    /// 同端点串行队列：`endpoint_id → 该端点的有界队列`。
     ///
-    /// **顺序在 `emit` 里同步 `send` 的那一刻就定死了**，与后续调度无关。
+    /// **顺序在 `emit` 里同步入队的那一刻就定死了**，与后续调度无关。
     /// 早先的实现是「每条事件 spawn 一个任务 + 端点级 async Mutex」——在
     /// 多线程 runtime（headless server 的 `#[tokio::main]`）上，两个任务抢锁
     /// 的先后是真随机的，实测出现过 `queue.drained` 抢在 `task.completed`
     /// 前面送达。串行 ≠ 保序，这里必须是队列。
-    workers: StdMutex<HashMap<String, mpsc::UnboundedSender<Job>>>,
+    workers: StdMutex<HashMap<String, Arc<EndpointQueue>>>,
     sema: Arc<Semaphore>,
     instance: InstanceInfo,
     /// 有无启用端点的快速判据，避免每次事件都拿读锁。
@@ -922,8 +1017,8 @@ impl WebhookDispatcher {
         let dispatched = targets.len();
         let event = Arc::new(event);
         for spec in targets {
-            let tx = self.inner.worker_for(&spec.id);
-            let _ = tx.send(Job {
+            let queue = self.inner.worker_for(&spec.id);
+            queue.push(Job {
                 spec,
                 event: event.clone(),
             });
@@ -962,15 +1057,75 @@ fn build_clients(proxy_config: &ProxyConfig) -> Clients {
 /// 端点 worker：从队列里逐条取，串行投递。队列的 FIFO 语义就是投递保序的
 /// 全部实现——worker 里没有任何锁。
 ///
-/// dispatcher 释放后（`Weak::upgrade` 失败）自行退出。
-fn spawn_worker(inner: std::sync::Weak<Inner>, mut rx: mpsc::UnboundedReceiver<Job>) {
+/// dispatcher 释放后（队列被 `Inner::drop` 关闭或 `Weak::upgrade` 失败）自行退出。
+fn spawn_worker(inner: std::sync::Weak<Inner>, queue: Arc<EndpointQueue>) {
     tokio::spawn(async move {
-        while let Some(job) = rx.recv().await {
+        loop {
+            let Some(step) = queue.take() else {
+                queue.wake.notified().await;
+                continue;
+            };
             let Some(inner) = inner.upgrade() else { break };
-            let record = inner.deliver(&job.spec, &job.event, MAX_ATTEMPTS).await;
-            inner.push_log(record);
+            match step {
+                QueueStep::Closed => break,
+                QueueStep::ReportDropped(dropped) => {
+                    inner.push_log(dropped_record(&dropped));
+                }
+                QueueStep::Deliver(job) => {
+                    let record = inner
+                        .deliver_impl(&job.spec, &job.event, MAX_ATTEMPTS, true)
+                        .await;
+                    inner.push_log(record);
+                }
+            }
         }
     });
+}
+
+/// 队列满丢弃的汇总投递记录（失败、0 次尝试）。
+fn dropped_record(dropped: &DroppedJobs) -> WebhookDelivery {
+    let spec = &dropped.spec;
+    let url = if spec.preset() == Preset::Ntfy {
+        ntfy_endpoint(spec.url.trim()).0
+    } else {
+        spec.url.trim().to_string()
+    };
+    log_info!(
+        "[webhook] endpoint={} queue full, dropped {} oldest pending delivery(ies)",
+        spec.display_name(),
+        dropped.count
+    );
+    WebhookDelivery {
+        delivery_id: uuid::Uuid::new_v4().to_string(),
+        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+        event: dropped.event.to_string(),
+        endpoint_id: spec.id.clone(),
+        endpoint_name: spec.display_name(),
+        url,
+        request_headers: String::new(),
+        request_body: String::new(),
+        status_code: 0,
+        response_body: String::new(),
+        latency_ms: 0,
+        attempts: 0,
+        success: false,
+        error: format!(
+            "dropped {} queued delivery(ies): endpoint queue full (limit {MAX_QUEUED_JOBS_PER_ENDPOINT}), oldest discarded",
+            dropped.count
+        ),
+    }
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        let map = self
+            .workers
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for queue in map.values() {
+            queue.close();
+        }
+    }
 }
 
 impl Inner {
@@ -1070,23 +1225,23 @@ impl Inner {
         self.sink.read().ok().and_then(|s| s.clone())
     }
 
-    /// 取（必要时惰性创建）某端点的投递 worker。
+    /// 取（必要时惰性创建）某端点的投递队列并起 worker。
     ///
-    /// worker 持 `Weak<Inner>`：`Inner` 持有 sender，worker 若持强引用就是
+    /// worker 持 `Weak<Inner>`：`Inner` 持有队列，worker 若持强引用就是
     /// 引用环，dispatcher 永远不会释放。
-    fn worker_for(self: &Arc<Self>, id: &str) -> mpsc::UnboundedSender<Job> {
-        let (tx, rx) = mpsc::unbounded_channel::<Job>();
+    fn worker_for(self: &Arc<Self>, id: &str) -> Arc<EndpointQueue> {
+        let queue = EndpointQueue::new();
         let Ok(mut map) = self.workers.lock() else {
             // 锁中毒：退化为一次性 worker，宁可乱序也不丢事件。
-            spawn_worker(Arc::downgrade(self), rx);
-            return tx;
+            spawn_worker(Arc::downgrade(self), queue.clone());
+            return queue;
         };
         if let Some(existing) = map.get(id) {
             return existing.clone();
         }
-        spawn_worker(Arc::downgrade(self), rx);
-        map.insert(id.to_string(), tx.clone());
-        tx
+        spawn_worker(Arc::downgrade(self), queue.clone());
+        map.insert(id.to_string(), queue.clone());
+        queue
     }
 
     fn vars(&self, event: &WebhookEvent, ntfy_topic: &str) -> Vars {
@@ -1140,12 +1295,34 @@ impl Inner {
         body.to_string()
     }
 
-    /// 投递一条事件到一个端点，含重试。返回投递记录（成败都返回）。
+    /// 投递一条事件到一个端点，含重试，不复查端点表（「发送测试」的草稿端点不在表里）。
     async fn deliver(
         &self,
         spec: &EndpointSpec,
         event: &WebhookEvent,
         max_attempts: u32,
+    ) -> WebhookDelivery {
+        self.deliver_impl(spec, event, max_attempts, false).await
+    }
+
+    /// 端点当前是否仍在端点表里且启用。
+    fn endpoint_active(&self, id: &str) -> bool {
+        self.endpoints
+            .read()
+            .map(|list| list.iter().any(|e| e.id == id && e.enabled))
+            .unwrap_or(false)
+    }
+
+    /// 投递一条事件到一个端点，含重试。返回投递记录（成败都返回）。
+    ///
+    /// `recheck_endpoint` 为真时，**每次尝试前**重新确认端点仍存在且启用：
+    /// 排队/退避期间被删除或停用的端点不再收到请求。
+    async fn deliver_impl(
+        &self,
+        spec: &EndpointSpec,
+        event: &WebhookEvent,
+        max_attempts: u32,
+        recheck_endpoint: bool,
     ) -> WebhookDelivery {
         let delivery_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now();
@@ -1247,6 +1424,10 @@ impl Inner {
 
         let started = std::time::Instant::now();
         for attempt in 1..=max_attempts {
+            if recheck_endpoint && !self.endpoint_active(&spec.id) {
+                record.error = "endpoint removed or disabled; delivery cancelled".to_string();
+                break;
+            }
             record.attempts = attempt as i32;
             let Ok(permit) = self.sema.clone().acquire_owned().await else {
                 record.error = "webhook dispatcher shut down".to_string();
@@ -2101,6 +2282,83 @@ mod tests {
             seen.as_slice(),
             order.map(|k| k.wire().to_string()),
             "同端点投递必须保序"
+        );
+        Ok(())
+    }
+
+    /// 离线端点的队列有界：满了丢最旧的，丢弃汇总先于后续投递被取出，
+    /// 其余投递仍按入队顺序。
+    #[test]
+    fn endpoint_queue_drops_oldest_when_full_and_reports_it() {
+        let queue = EndpointQueue::new();
+        let extra = 3;
+        for i in 0..(MAX_QUEUED_JOBS_PER_ENDPOINT + extra) {
+            queue.push(Job {
+                spec: EndpointSpec::default(),
+                event: Arc::new(WebhookEvent::task(
+                    WebhookEventKind::TaskCompleted,
+                    WebhookTask::default(),
+                    i.to_string(),
+                    String::new(),
+                )),
+            });
+        }
+        let Some(QueueStep::ReportDropped(dropped)) = queue.take() else {
+            panic!("dropped summary must come first");
+        };
+        assert_eq!(dropped.count as usize, extra);
+        let mut delivered = Vec::new();
+        while let Some(QueueStep::Deliver(job)) = queue.take() {
+            delivered.push(job.event.queue_id.clone());
+        }
+        assert_eq!(delivered.len(), MAX_QUEUED_JOBS_PER_ENDPOINT);
+        assert_eq!(delivered.first().map(String::as_str), Some("3"));
+        let expected_last = (MAX_QUEUED_JOBS_PER_ENDPOINT + extra - 1).to_string();
+        assert_eq!(delivered.last(), Some(&expected_last));
+    }
+
+    /// 退避期间端点被删除：下一次尝试前复查，不再发请求，记录里写明取消原因。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn removed_endpoint_cancels_pending_retry() -> Result<(), String> {
+        let server = spawn_mock("HTTP/1.1 503 Service Unavailable");
+        let d = dispatcher();
+        d.reload_endpoints(&format!(
+            r#"[{{"id":"gone","name":"mock","url":"http://{}/h","enabled":true,"allowHttp":true,
+                 "events":["task.completed"]}}]"#,
+            server.addr
+        ));
+        d.emit(WebhookEvent::task(
+            WebhookEventKind::TaskCompleted,
+            WebhookTask::default(),
+            "main".to_string(),
+            "Main".to_string(),
+        ));
+        for _ in 0..100 {
+            if server.hits.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        d.reload_endpoints("[]");
+        for _ in 0..250 {
+            if !d.deliveries().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let log = d.deliveries();
+        let record = log.first().ok_or("no delivery record")?;
+        assert_eq!(
+            server.hits.load(Ordering::SeqCst),
+            1,
+            "no request after removal"
+        );
+        assert_eq!(record.attempts, 1);
+        assert!(!record.success);
+        assert!(
+            record.error.contains("removed or disabled"),
+            "error: {}",
+            record.error
         );
         Ok(())
     }

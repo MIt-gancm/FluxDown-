@@ -55,6 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 fs2 = "0.4.3"
+fluxdown_logfile = { version = "0.1.0", path = "../logfile" }
 
 [target."cfg(windows)".dependencies]
 librqbit = { version = "9", default-features = false, features = ["default-tls"] }

@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use fluxdown_engine::bt_downloader::BtConfig;
 use fluxdown_engine::proxy_config::ProxyConfig;
+use fluxdown_engine::rss::RssRefreshOutcome;
 use fluxdown_engine::rss::model::{RssItemStatus, RssSourceInfo};
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
 
@@ -251,7 +252,10 @@ async fn rss_pipeline_seeds_then_downloads_only_matching_new_items() {
     );
 
     // ── 第二轮：手动刷新（绕开 due 判定）→ 只下新增且命中规则的那一条 ──
-    assert!(engine.manager.refresh_rss_source(&source_id));
+    assert_eq!(
+        engine.manager.refresh_rss_source(&source_id),
+        RssRefreshOutcome::Started
+    );
     drain_one_rss_event(&mut engine, &mut rss_rx).await;
 
     assert_eq!(feed_hits.load(Ordering::SeqCst), 2);
@@ -293,7 +297,10 @@ async fn rss_pipeline_seeds_then_downloads_only_matching_new_items() {
     );
 
     // ── 第三轮：feed 内容没变 → 不重复建任务 ─────────────────────────
-    assert!(engine.manager.refresh_rss_source(&source_id));
+    assert_eq!(
+        engine.manager.refresh_rss_source(&source_id),
+        RssRefreshOutcome::Started
+    );
     drain_one_rss_event(&mut engine, &mut rss_rx).await;
     assert_eq!(
         engine.db.load_all_tasks().await.expect("tasks").len(),
@@ -463,7 +470,10 @@ async fn torrent_enclosures_become_real_bt_tasks_without_a_bogus_size_hint() {
     assert!(engine.db.load_all_tasks().await.expect("tasks").is_empty());
 
     // 第二轮：BT 条目出现 → 先抓 feed（回流一次），再抓 .torrent（再回流一次）。
-    assert!(engine.manager.refresh_rss_source(&source_id));
+    assert_eq!(
+        engine.manager.refresh_rss_source(&source_id),
+        RssRefreshOutcome::Started
+    );
     drain_one_rss_event(&mut engine, &mut rss_rx).await; // Fetched
     assert!(
         engine.db.load_all_tasks().await.expect("tasks").is_empty(),
@@ -520,5 +530,45 @@ async fn torrent_enclosures_become_real_bt_tasks_without_a_bogus_size_hint() {
     assert_eq!(item.status, RssItemStatus::Downloaded);
     assert_eq!(item.task_id, task.task_id);
 
+    let _ = tokio::fs::remove_dir_all(&work).await;
+}
+
+/// 「立即抓取」撞上在途抓取是幂等成功（AlreadyRunning），只有订阅不存在才是 NotFound。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refresh_while_fetching_is_idempotent_and_unknown_source_is_not_found() {
+    let work = std::env::temp_dir().join(format!("fluxdown-rss-refresh-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let (port, _feed_hits) = spawn_feed_server(|host| vec![FEED_ROUND1.replace("HOST", host)]);
+    let mut engine = make_engine(&work).await;
+    let mut rss_rx = engine.manager.rss.take_event_rx().expect("rss receiver");
+    let source_id = engine
+        .manager
+        .rss
+        .create_source(RssSourceInfo {
+            url: format!("http://127.0.0.1:{port}/feed.xml"),
+            start_paused: true,
+            ..Default::default()
+        })
+        .await
+        .expect("subscribe");
+
+    assert_eq!(
+        engine.manager.refresh_rss_source(&source_id),
+        RssRefreshOutcome::Started
+    );
+    assert_eq!(
+        engine.manager.refresh_rss_source(&source_id),
+        RssRefreshOutcome::AlreadyRunning
+    );
+    assert_eq!(
+        engine.manager.refresh_rss_source("no-such-source"),
+        RssRefreshOutcome::NotFound
+    );
+    drain_one_rss_event(&mut engine, &mut rss_rx).await;
+    // 抓取回流后在途标记解除，可再次派发。
+    assert_eq!(
+        engine.manager.refresh_rss_source(&source_id),
+        RssRefreshOutcome::Started
+    );
     let _ = tokio::fs::remove_dir_all(&work).await;
 }

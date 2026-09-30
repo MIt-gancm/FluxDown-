@@ -577,3 +577,39 @@ async fn fission_over_threshold_pauses_all_members_without_downloading() {
 
     let _ = tokio::fs::remove_dir_all(&work).await;
 }
+
+/// 设置校验失败携带失败字段的 key（含未知键），宿主据此把错误归因到具体字段。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_settings_rejects_with_field_key() {
+    use fluxdown_engine::plugin::PluginError;
+
+    let work = std::env::temp_dir().join(format!("fluxdown-setting-key-{}", uuid_like()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir work");
+    let plugin_src = work.join("plugin_src");
+    write_manifest_plugin(&plugin_src).await;
+    let engine = Engine::new(
+        engine_config(&work),
+        Arc::new(NoopSink),
+        Arc::new(NoopSelection),
+    )
+    .await
+    .expect("engine");
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+    pm.install_from_dir(&plugin_src).await.expect("install");
+
+    let err = pm
+        .update_settings(
+            "test@multiresolver",
+            &[
+                ("target".to_string(), "http://x/".to_string()),
+                ("noSuchKey".to_string(), "1".to_string()),
+            ],
+        )
+        .await
+        .expect_err("unknown key must be rejected");
+    assert!(
+        matches!(&err, PluginError::InvalidSetting { key, .. } if key == "noSuchKey"),
+        "got {err:?}"
+    );
+    let _ = tokio::fs::remove_dir_all(&work).await;
+}

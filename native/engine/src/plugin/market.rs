@@ -51,6 +51,8 @@ pub enum MarketError {
     Yanked(String),
     #[error("所有镜像下载失败")]
     AllMirrorsFailed,
+    #[error("市场最新版本已变化: 确认的是 {expected}，当前为 {actual}")]
+    VersionChanged { expected: String, actual: String },
     #[error(transparent)]
     Plugin(#[from] PluginError),
 }
@@ -324,12 +326,21 @@ impl MarketClient {
     }
 
     /// 便捷：按 plugin_id 安装最新版（拉索引 → 找最新 → 安装）。
-    pub async fn install_latest(&self, plugin_id: &str) -> Result<String, MarketError> {
+    ///
+    /// `expected_version` 是调用方（UI 权限确认对话框）展示并确认过的版本：
+    /// 与当前最新可装版本不一致时返回 [`MarketError::VersionChanged`] 且**不安装**，
+    /// 让调用方刷新目录后重新确认权限，避免「确认的是旧版声明，装上的是新版」。
+    pub async fn install_latest(
+        &self,
+        plugin_id: &str,
+        expected_version: Option<&str>,
+    ) -> Result<String, MarketError> {
         let idx = self.fetch_index().await?;
         let entry = self
             .latest_entry(&idx, plugin_id)
             .ok_or_else(|| MarketError::NotFound(plugin_id.to_string()))?
             .clone();
+        check_expected_version(expected_version, &entry.version)?;
         self.install_entry(&entry, false).await
     }
 
@@ -348,6 +359,17 @@ impl MarketClient {
                     .collect()
             })
             .unwrap_or_default()
+    }
+}
+
+/// 调用方确认过的版本必须与当前最新可装版本一致；未指定（旧客户端）不校验。
+fn check_expected_version(expected: Option<&str>, actual: &str) -> Result<(), MarketError> {
+    match expected {
+        Some(expected) if expected != actual => Err(MarketError::VersionChanged {
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -393,7 +415,23 @@ fn parsed_url_allowed(parsed: &url::Url) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::{MarketEntry, MarketIndex, mirror_url_allowed, sha256_hex};
+    use super::{
+        MarketEntry, MarketError, MarketIndex, check_expected_version, mirror_url_allowed,
+        sha256_hex,
+    };
+
+    /// 确认过的版本与最新不一致必须拒绝；一致或未指定放行。
+    #[test]
+    fn expected_version_pin_rejects_changed_latest() {
+        assert!(check_expected_version(Some("1.2.0"), "1.2.0").is_ok());
+        assert!(check_expected_version(None, "9.9.9").is_ok());
+        let err = check_expected_version(Some("1.2.0"), "1.3.0").expect_err("changed");
+        assert!(matches!(
+            err,
+            MarketError::VersionChanged { ref expected, ref actual }
+                if expected == "1.2.0" && actual == "1.3.0"
+        ));
+    }
 
     #[test]
     fn mirror_whitelist_rejects_http_and_nonroutable_ip() {

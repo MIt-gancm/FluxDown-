@@ -46,7 +46,7 @@ mod multipath;
 use crate::cdn::NodePool;
 use crate::db::Db;
 use crate::downloader::{
-    DownloadError, ProgressUpdate, SegmentProgressInfo, is_range_not_satisfiable,
+    DownloadError, ProgressUpdate, SegmentProgressInfo, is_disk_full, is_range_not_satisfiable,
     is_server_rejection,
 };
 use crate::events::{EngineEvent, EventSink};
@@ -3568,10 +3568,16 @@ async fn truncate_stale_tail(dest: &Path, target_len: u64) -> Result<(), Downloa
 /// 平台策略：
 /// - Linux:   fallocate(2) 分配真实磁盘块（不写零，近乎瞬时），避免
 ///   set_len()/ftruncate 稀疏文件导致的碎片化和延迟 ENOSPC。
-/// - Windows: SetFileInformationByHandle(FileAllocationInfo) 预分配 NTFS 物理簇
-///   （连续优先），提前检测磁盘空间不足；再 SetEndOfFile 设置逻辑大小。
+/// - Windows: 先给文件打 NTFS sparse 标记（[`crate::bt_sparse::mark_sparse`]）再
+///   SetEndOfFile 设置逻辑大小：非 sparse 文件在高偏移首次写入时 NTFS 会按
+///   valid-data-length 语义同步零填充 `[VDL, offset)`，多段 worker 各自从
+///   `k·N/n` 起写会造成数量级的写放大与周期性掉速。代价是磁盘不足不再于预分配
+///   阶段暴露，而是在写入时以 ENOSPC/`ERROR_DISK_FULL` 上报（致命、不重试）。
+///   打标记失败（FAT32/exFAT/网络盘等）才退回 FileAllocationInfo 物理预分配。
 /// - 其它:    回退 set_len()。
 async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), DownloadError> {
+    #[cfg(target_os = "windows")]
+    let dest_owned = dest.to_path_buf();
     let file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -3618,6 +3624,15 @@ async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), Downlo
     {
         let std_file = file.into_std().await;
         tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
+            // Step 0: sparse 标记必须先于任何 set_len / 写入。失败只记日志，
+            // 退回下方的物理预分配。
+            let sparse = match crate::bt_sparse::mark_sparse(&dest_owned) {
+                Ok(()) => true,
+                Err(e) => {
+                    log_info!("[coordinator] FSCTL_SET_SPARSE 失败，退回物理预分配: {}", e);
+                    false
+                }
+            };
             use std::os::windows::io::AsRawHandle;
             // FILE_ALLOCATION_INFO: 单字段 AllocationSize (LARGE_INTEGER = i64)
             #[repr(C)]
@@ -3625,26 +3640,27 @@ async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), Downlo
                 allocation_size: i64,
             }
             let handle = std_file.as_raw_handle();
-            // Step 1: 预分配 NTFS 物理簇——立即保留磁盘空间（连续簇优先），
-            // 磁盘不足时提前报错（等效 Linux fallocate 的 ENOSPC 检测），
-            // 减少多段随机写时的 NTFS 碎片化。
-            let info = FileAllocInfo {
-                allocation_size: target_len as i64,
-            };
-            let ret = unsafe {
-                windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
-                    handle,
-                    windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
-                    &info as *const _ as *const core::ffi::c_void,
-                    std::mem::size_of::<FileAllocInfo>() as u32,
-                )
-            };
-            if ret == 0 {
-                // FAT32/exFAT/网络驱动器等不支持时仅记录日志，不中断
-                log_info!(
-                    "[coordinator] SetFileInformationByHandle(FileAllocationInfo) 失败: {}",
-                    std::io::Error::last_os_error()
-                );
+            // Step 1: sparse 不可用时预分配 NTFS 物理簇——立即保留磁盘空间
+            // （连续簇优先），磁盘不足时提前报错，减少多段随机写的碎片化。
+            if !sparse {
+                let info = FileAllocInfo {
+                    allocation_size: target_len as i64,
+                };
+                let ret = unsafe {
+                    windows_sys::Win32::Storage::FileSystem::SetFileInformationByHandle(
+                        handle,
+                        windows_sys::Win32::Storage::FileSystem::FileAllocationInfo,
+                        &info as *const _ as *const core::ffi::c_void,
+                        std::mem::size_of::<FileAllocInfo>() as u32,
+                    )
+                };
+                if ret == 0 {
+                    // FAT32/exFAT/网络驱动器等不支持时仅记录日志，不中断
+                    log_info!(
+                        "[coordinator] SetFileInformationByHandle(FileAllocationInfo) 失败: {}",
+                        std::io::Error::last_os_error()
+                    );
+                }
             }
             // Step 2: 设置逻辑 EOF——后续 seek+write 依赖此值
             std_file.set_len(target_len)?;
@@ -4750,6 +4766,16 @@ async fn do_segment_with_retry(
             Err(e @ DownloadError::RangeNotSupported(_))
                 if total_downloaded.load(Ordering::Relaxed) == 0 =>
             {
+                return Err(e);
+            }
+            // 本地磁盘写满：腾出空间前不会自愈，退避重试只会空烧预算。立即作为
+            // 致命错误上抛（任务级自动重试的瞬时错误白名单也不含它）。
+            Err(e) if is_disk_full(&e) => {
+                log_info!(
+                    "[segment-retry] task {} seg {} 本地磁盘空间不足，跳过重试直接上报",
+                    task_id,
+                    seg_idx
+                );
                 return Err(e);
             }
             // BUG-HTTP-416-RETRY-EXHAUST：416 Range Not Satisfiable 是服务器对

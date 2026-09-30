@@ -129,6 +129,21 @@ pub(crate) fn is_server_rejection(e: &DownloadError) -> bool {
     }
 }
 
+/// 检测下载错误是否为本地磁盘写满 / 配额耗尽（ENOSPC、`ERROR_DISK_FULL`、EDQUOT）。
+///
+/// 这类错误在用户腾出空间之前不会自愈，段级退避重试只会空烧预算并拖慢失败上报；
+/// 调用方应立即把它作为致命错误上抛。
+pub(crate) fn is_disk_full(e: &DownloadError) -> bool {
+    matches!(
+        e,
+        DownloadError::Io(io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            )
+    )
+}
+
 /// 检测下载错误是否为 HTTP 416 Range Not Satisfiable。
 ///
 /// BUG-HTTP-416-RETRY-EXHAUST：服务器对当前 Range 明确拒绝（典型于续传偏移
@@ -1393,7 +1408,7 @@ async fn resolve_file_info_once(
             log_info!(
                 "[resolve] HEAD failed: status={}, url={}, cookies_len={}",
                 r.status(),
-                r.url(),
+                crate::logger::sanitize_log_str(r.url().as_str()),
                 cookies.len()
             );
             None
@@ -1429,7 +1444,7 @@ async fn resolve_file_info_once(
             log_info!(
                 "[resolve] GET failed: status={}, url={}, cookies_len={}",
                 r.status(),
-                r.url(),
+                crate::logger::sanitize_log_str(r.url().as_str()),
                 cookies.len()
             );
             None
@@ -1552,7 +1567,7 @@ async fn resolve_file_info_once(
     let file_name = extract_filename(&headers, url, final_url.as_str());
     log_info!(
         "[resolve] url={} → name={}, size={}, range={}, ct={}",
-        url,
+        crate::logger::sanitize_log_str(url),
         file_name,
         total_bytes,
         supports_range,
@@ -1707,7 +1722,7 @@ async fn resolve_file_info_plain_get_fallback(
             log_info!(
                 "[resolve] plain GET fallback also failed: status={}, url={}",
                 r.status(),
-                r.url()
+                crate::logger::sanitize_log_str(r.url().as_str())
             );
             return Err(DownloadError::Other(format_probe_failure(
                 head_status_desc,
@@ -1820,7 +1835,7 @@ async fn resolve_file_info_non_get(
     log_info!(
         "[resolve-non-get] method={} url={} body_present={}",
         spec.method,
-        url,
+        crate::logger::sanitize_log_str(url),
         spec.body.is_some()
     );
 
@@ -2567,6 +2582,60 @@ pub(crate) async fn claim_rename(src: &Path, dst: &Path) -> std::io::Result<()> 
     }
 }
 
+/// 完成期占名改名:把 `src` 以不覆盖语义落到 `save_dir/name`,返回实际落盘的文件名。
+///
+/// 基于 [`claim_rename`] 的 `create_new` 占名。占名冲突(`AlreadyExists`)时:
+/// `allow_overwrite`(config `file_exists_behavior` == "overwrite")对原名且不在
+/// 兄弟任务预订名 `avoid`(小写)内的普通旧文件,删除后重试一次;其余情况重新 dedup
+/// 换名(避开 `avoid`)。连续 5 次冲突视为目录被持续抢占,报错并保留 `src`。
+/// 调用方须在返回名与 `name` 不同时同步任务的 file_name。
+pub(crate) async fn claim_final_name(
+    src: &Path,
+    save_dir: &Path,
+    name: &str,
+    allow_overwrite: bool,
+    avoid: &std::collections::HashSet<String>,
+) -> Result<String, DownloadError> {
+    let mut chosen = name.to_string();
+    let mut overwrite_attempted = false;
+    let mut attempt = 0u32;
+    loop {
+        let dst = save_dir.join(&chosen);
+        match claim_rename(src, &dst).await {
+            Ok(()) => return Ok(chosen),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt > 5 {
+                    return Err(DownloadError::Io(e));
+                }
+                if allow_overwrite
+                    && !overwrite_attempted
+                    && chosen == name
+                    && !avoid.contains(&chosen.to_lowercase())
+                {
+                    overwrite_attempted = true;
+                    let is_dir = tokio::fs::metadata(&dst)
+                        .await
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if !is_dir && tokio::fs::remove_file(&dst).await.is_ok() {
+                        continue;
+                    }
+                }
+                chosen = dedup_filename(
+                    save_dir,
+                    name,
+                    &std::collections::HashSet::new(),
+                    avoid,
+                    false,
+                )
+                .await;
+            }
+            Err(e) => return Err(DownloadError::Io(e)),
+        }
+    }
+}
+
 /// Buffer size for `BufWriter` wrapping file I/O during downloads.
 /// 256 KB reduces the frequency of syscalls compared to the default 8 KB,
 /// significantly improving throughput especially with many concurrent segments.
@@ -2912,7 +2981,11 @@ async fn compute_segments_with_advisor(p: &DownloadParams, info: &FileInfo) -> i
 /// 阶段因目标名被占用而改名时为 `Some(新名)`,调用方须经完成信号上报
 /// (progress_reporter 对非空 file_name 锁存,空串 = 不变)。
 async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>), DownloadError> {
-    log_info!("[download] task {} starting, url={}", p.task_id, p.url);
+    log_info!(
+        "[download] task {} starting, url={}",
+        p.task_id,
+        crate::logger::sanitize_log_str(&p.url)
+    );
     // 恢复任务进入 preparing 时保留已落库进度，避免 UI 在真正发出续传
     // Range 前短暂显示为 0。后续 status=1 继续复用同一基线，不重复查库。
     let (resume_downloaded, resume_total) = if p.is_resume {
@@ -6962,6 +7035,87 @@ mod tests {
         assert_eq!(tokio::fs::read(&src).await.unwrap_or_default(), b"incoming");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn claim_final_name_dedups_instead_of_overwriting() {
+        let dir = std::env::temp_dir().join("fluxdown_test_claim_final_dedup");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let src = dir.join("a.ts.fdownloading");
+        let _ = tokio::fs::write(&src, b"incoming").await;
+        let _ = tokio::fs::write(dir.join("a.ts"), b"original").await;
+
+        let chosen =
+            super::claim_final_name(&src, &dir, "a.ts", false, &std::collections::HashSet::new())
+                .await;
+
+        assert_eq!(chosen.ok().as_deref(), Some("a (1).ts"));
+        assert_eq!(
+            tokio::fs::read(dir.join("a.ts")).await.unwrap_or_default(),
+            b"original"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.join("a (1).ts"))
+                .await
+                .unwrap_or_default(),
+            b"incoming"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn claim_final_name_overwrite_replaces_only_the_original_name() {
+        let dir = std::env::temp_dir().join("fluxdown_test_claim_final_overwrite");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let src = dir.join("a.ts.fdownloading");
+        let _ = tokio::fs::write(&src, b"incoming").await;
+        let _ = tokio::fs::write(dir.join("a.ts"), b"original").await;
+
+        let chosen =
+            super::claim_final_name(&src, &dir, "a.ts", true, &std::collections::HashSet::new())
+                .await;
+
+        assert_eq!(chosen.ok().as_deref(), Some("a.ts"));
+        assert_eq!(
+            tokio::fs::read(dir.join("a.ts")).await.unwrap_or_default(),
+            b"incoming"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn claim_final_name_overwrite_never_touches_a_sibling_reserved_name() {
+        let dir = std::env::temp_dir().join("fluxdown_test_claim_final_reserved");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let src = dir.join("a.ts.fdownloading");
+        let _ = tokio::fs::write(&src, b"incoming").await;
+        let _ = tokio::fs::write(dir.join("a.ts"), b"sibling").await;
+        let avoid: std::collections::HashSet<String> = ["a.ts".to_string()].into();
+
+        let chosen = super::claim_final_name(&src, &dir, "a.ts", true, &avoid).await;
+
+        assert_eq!(chosen.ok().as_deref(), Some("a (1).ts"));
+        assert_eq!(
+            tokio::fs::read(dir.join("a.ts")).await.unwrap_or_default(),
+            b"sibling"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn disk_full_is_recognised_and_other_errors_are_not() {
+        use super::{DownloadError, is_disk_full};
+        let io = |kind| DownloadError::Io(std::io::Error::from(kind));
+        assert!(is_disk_full(&io(std::io::ErrorKind::StorageFull)));
+        assert!(is_disk_full(&io(std::io::ErrorKind::QuotaExceeded)));
+        assert!(!is_disk_full(&io(std::io::ErrorKind::ConnectionReset)));
+        assert!(!is_disk_full(&DownloadError::Other(
+            "disk full".to_string()
+        )));
+        assert!(!is_disk_full(&DownloadError::Cancelled));
     }
 
     #[tokio::test]

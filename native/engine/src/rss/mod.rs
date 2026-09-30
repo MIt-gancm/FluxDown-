@@ -63,6 +63,22 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_TORRENT_BYTES: usize = 4 * 1024 * 1024;
 /// 首轮抓取的历史条目所带的原因码。
 pub const REASON_SEED_SKIPPED: &str = "seed_skipped";
+/// 种子抓取失败时写入条目 `reason` 的稳定码（条目保持 New，派发时排后并进入退避）。
+pub const REASON_TORRENT_FETCH_FAILED: &str = "torrent_fetch_failed";
+/// 种子抓取失败后首次退避时长（秒），此后每次失败翻倍。
+const TORRENT_RETRY_BASE_SECS: i64 = 600;
+/// 种子抓取退避时长上限（秒）。
+const TORRENT_RETRY_MAX_SECS: i64 = 24 * 60 * 60;
+/// 种子的标准 MIME 类型。
+const TORRENT_MIME: &str = "application/x-bittorrent";
+
+/// 第 `failures` 次连续抓取失败后的退避秒数：`base × 2^(failures-1)`，封顶 24 小时。
+pub(crate) fn torrent_retry_delay_secs(failures: i64) -> i64 {
+    let shift = u32::try_from((failures - 1).clamp(0, 30)).unwrap_or(0);
+    TORRENT_RETRY_BASE_SECS
+        .saturating_mul(1i64 << shift)
+        .min(TORRENT_RETRY_MAX_SECS)
+}
 
 /// off-actor 抓取的回流结果。
 #[derive(Debug)]
@@ -88,6 +104,17 @@ pub struct RssValidateOutcome {
     pub items: Vec<RssItemInfo>,
     /// 失败原因（空 = 验证通过）。
     pub error: String,
+}
+
+/// 「立即抓取」的派发结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RssRefreshOutcome {
+    /// 已派发一次新的抓取。
+    Started,
+    /// 该订阅已有抓取在途——幂等，结果会经正常回流到达，无需重复触发。
+    AlreadyRunning,
+    /// 订阅不存在。
+    NotFound,
 }
 
 /// off-actor worker 回流到 actor 的两类结果。
@@ -152,6 +179,9 @@ pub struct RssDownloadPlan {
     pub size_hint: i64,
     /// 该订阅是否开启「自动下载时通知」。
     pub notify: bool,
+    /// 下载目标声明的 MIME 类型（小写、不含参数；空 = 未声明，或二段解析条目）。
+    /// `application/x-bittorrent` 视为种子，不要求 URL 带 `.torrent` 扩展名。
+    pub enclosure_type: String,
 }
 
 impl RssDownloadPlan {
@@ -175,10 +205,20 @@ impl RssDownloadPlan {
     /// // magnet 由引擎既有五路分派直接处理，不走种子抓取
     /// assert!(!plan("magnet:?xt=urn:btih:deadbeef").is_torrent_file());
     /// assert!(!plan("https://cdn.example/ep01.mp4").is_torrent_file());
+    /// // PT / Jackett 的无扩展名下载链接：靠 feed 声明的 MIME 识别
+    /// let typed = RssDownloadPlan {
+    ///     url: "https://pt.example/download?id=1".to_string(),
+    ///     enclosure_type: "application/x-bittorrent".to_string(),
+    ///     ..Default::default()
+    /// };
+    /// assert!(typed.is_torrent_file());
     /// ```
     #[must_use]
     pub fn is_torrent_file(&self) -> bool {
-        url_looks_like_torrent(&self.url)
+        if crate::bt_downloader::is_magnet_url(&self.url) {
+            return false;
+        }
+        self.enclosure_type == TORRENT_MIME || url_looks_like_torrent(&self.url)
     }
 }
 
@@ -423,13 +463,22 @@ impl RssManager {
 
     /// 立即抓取一个订阅（侧边栏「立即刷新」/ REST `POST /rss/{id}/refresh`）。
     ///
-    /// 忽略 due 判定但仍尊重 `in_flight`——连点刷新不该并发打同一个站点。
-    pub fn refresh_now(&mut self, source_id: &str, proxy: &ProxyConfig, global_ua: &str) -> bool {
-        if self.in_flight.contains(source_id) || self.source(source_id).is_none() {
-            return false;
+    /// 忽略 due 判定但仍尊重 `in_flight`——连点刷新不该并发打同一个站点，
+    /// 此时返回 [`RssRefreshOutcome::AlreadyRunning`]（幂等，不是错误）。
+    pub fn refresh_now(
+        &mut self,
+        source_id: &str,
+        proxy: &ProxyConfig,
+        global_ua: &str,
+    ) -> RssRefreshOutcome {
+        if self.source(source_id).is_none() {
+            return RssRefreshOutcome::NotFound;
+        }
+        if self.in_flight.contains(source_id) {
+            return RssRefreshOutcome::AlreadyRunning;
         }
         self.dispatch_fetch(source_id, unix_now(), proxy, global_ua);
-        true
+        RssRefreshOutcome::Started
     }
 
     fn dispatch_fetch(&mut self, source_id: &str, now: i64, proxy: &ProxyConfig, global_ua: &str) {
@@ -833,7 +882,7 @@ impl RssManager {
         // seeding 这一轮被突然灌下去）。
         let plans = if source.auto_download && !first_round {
             self.db
-                .rss_dispatchable_items(&source.source_id, source.max_per_fetch)
+                .rss_dispatchable_items(&source.source_id, source.max_per_fetch, now)
                 .await
                 .unwrap_or_default()
                 .iter()
@@ -868,6 +917,39 @@ impl RssManager {
             .await
         {
             log_error!("[rss] mark downloaded failed: {}", e);
+        }
+        self.clear_item_backoff(source_id, guid).await;
+    }
+
+    /// 种子抓取失败：条目保持 New 并带失败码，指数退避到期后才再参与自动派发
+    /// （手动下载不受退避限制）。
+    pub async fn record_torrent_failure(&self, source_id: &str, guid: &str) {
+        match self
+            .db
+            .record_rss_fetch_failure(
+                source_id,
+                guid,
+                REASON_TORRENT_FETCH_FAILED,
+                unix_now(),
+                torrent_retry_delay_secs,
+            )
+            .await
+        {
+            Ok(failures) => log_info!(
+                "[rss] torrent fetch failure #{} for {}/{}, next auto attempt in {}s",
+                failures,
+                source_id,
+                guid,
+                torrent_retry_delay_secs(failures)
+            ),
+            Err(e) => log_error!("[rss] record torrent failure failed: {}", e),
+        }
+    }
+
+    /// 清零条目的种子抓取失败计数与退避（建任务成功或用户手动下载时）。
+    pub async fn clear_item_backoff(&self, source_id: &str, guid: &str) {
+        if let Err(e) = self.db.clear_rss_item_backoff(source_id, guid).await {
+            log_error!("[rss] clear item backoff failed: {}", e);
         }
     }
 
@@ -1004,6 +1086,7 @@ fn item_from_parsed(source_id: &str, parsed: &parser::ParsedItem, fetched_at: i6
         title: parsed.title.clone(),
         link: parsed.link.clone(),
         enclosure_url: parsed.enclosure_url.clone(),
+        enclosure_type: parsed.enclosure_type.clone(),
         resolver_item: parsed.resolver_item.clone(),
         enclosure_length: parsed.enclosure_length,
         pub_date: parsed.pub_date,
@@ -1034,6 +1117,12 @@ fn plan_for(source: &RssSourceInfo, item: &RssItemInfo) -> RssDownloadPlan {
             String::new()
         },
         size_hint: item.enclosure_length,
+        // 二段解析条目的下载地址是页面链接，enclosure 的类型与它无关。
+        enclosure_type: if item.resolver_item.is_empty() {
+            item.enclosure_type.clone()
+        } else {
+            String::new()
+        },
         notify: source.notify_on_download,
     }
 }
@@ -1192,7 +1281,7 @@ mod tests {
     use super::{
         MAX_BACKOFF_SECS, due_sources, effective_interval_secs, feed_origin,
         fetch_with_auto_failover, plan_for, rule_of, runtime_reset_on_update,
-        url_looks_like_torrent,
+        torrent_retry_delay_secs, url_looks_like_torrent,
     };
     use crate::proxy_config::{ProxyConfig, ProxyMode};
     use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
@@ -1364,6 +1453,7 @@ mod tests {
             title: title.to_string(),
             link: format!("https://feed.test/item/{guid}"),
             enclosure_url: format!("https://feed.test/dl/{guid}.torrent"),
+            enclosure_type: String::new(),
             resolver_item: String::new(),
             enclosure_length: size,
             pub_date,
@@ -1841,6 +1931,41 @@ mod tests {
         ));
         assert!(!url_looks_like_torrent("magnet:?xt=urn:btih:deadbeef"));
         assert!(!url_looks_like_torrent("https://cdn.example/ep01.mp4"));
+    }
+
+    /// feed 声明 `application/x-bittorrent` 即视为种子（无扩展名的 PT 链接也是），
+    /// 二段解析条目的下载地址是页面链接，不受 enclosure 类型影响。
+    #[test]
+    fn declared_torrent_mime_marks_plan_as_torrent() {
+        let s = RssSourceInfo::default();
+        let item = RssItemInfo {
+            guid: "g".to_string(),
+            enclosure_url: "https://pt.example/dl?id=7".to_string(),
+            enclosure_type: "application/x-bittorrent".to_string(),
+            ..Default::default()
+        };
+        assert!(plan_for(&s, &item).is_torrent_file());
+
+        let untyped = RssItemInfo {
+            enclosure_type: String::new(),
+            ..item.clone()
+        };
+        assert!(!plan_for(&s, &untyped).is_torrent_file());
+
+        let resolver = RssItemInfo {
+            link: "https://site.example/page/7".to_string(),
+            resolver_item: "ep:7".to_string(),
+            ..item
+        };
+        assert!(!plan_for(&s, &resolver).is_torrent_file());
+    }
+
+    #[test]
+    fn torrent_retry_delay_doubles_and_is_capped() {
+        assert_eq!(torrent_retry_delay_secs(1), 600);
+        assert_eq!(torrent_retry_delay_secs(2), 1200);
+        assert_eq!(torrent_retry_delay_secs(3), 2400);
+        assert_eq!(torrent_retry_delay_secs(40), 24 * 60 * 60);
     }
 
     #[test]

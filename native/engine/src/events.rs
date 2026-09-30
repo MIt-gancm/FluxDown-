@@ -268,6 +268,12 @@ pub enum EngineEvent {
     /// 时拉一次」。dispatcher 侧已按 500ms 节流 + 尾随补发。
     /// hub → `WebhookDeliveriesDelta` 信号；server → WS `webhookDeliveriesChanged`。
     WebhookDeliveriesChanged(Vec<crate::webhook::WebhookDelivery>),
+
+    /// 「等待自动重试」的任务数变化——自动重试 / 备用链路切换 / 插件 `requestRetry`
+    /// 已排程、尚未回流重新派发的任务集合大小。这些任务在数据库里仍是 `status=4`，
+    /// 宿主的活跃/排队计数看不到它们；据此判断「全部完成」类的联动（完成后关机、
+    /// 空闲退出）时必须把它们算作仍有工作。数值不变时不发。
+    RetryPendingChanged { count: u32 },
 }
 
 /// 引擎事件的接收端,由宿主实现并注入 [`crate::Engine`]。

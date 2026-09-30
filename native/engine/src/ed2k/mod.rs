@@ -1025,10 +1025,9 @@ pub async fn finalize_and_verify(
 
 /// 完成落盘：`sync_all` + 原子占名 rename temp→final，返回实际落盘的文件名。
 ///
-/// 用 [`crate::downloader::claim_rename`]（`create_new` 占名）而不是直接
-/// `rename`：后者在 Unix/Windows 都是替换语义，会静默覆盖同名旧文件。
-/// 占名冲突时：overwrite 模式对原名删除旧文件后重试一次；其余情况重新 dedup
-/// 换名（避开兄弟任务已预订的 `avoid`）。
+/// 占名语义见 [`crate::downloader::claim_final_name`]：不覆盖同名旧文件，
+/// overwrite 模式只对原名删除旧文件后重试一次，其余重新 dedup 换名（避开
+/// 兄弟任务已预订的 `avoid`）。
 async fn finalize_rename(
     temp: &Path,
     save_dir: &Path,
@@ -1039,44 +1038,7 @@ async fn finalize_rename(
     if let Ok(file) = tokio::fs::File::open(temp).await {
         let _ = file.sync_all().await;
     }
-    let mut chosen = name.to_string();
-    let mut overwrite_attempted = false;
-    let mut attempt = 0u32;
-    loop {
-        let dst = save_dir.join(&chosen);
-        match crate::downloader::claim_rename(temp, &dst).await {
-            Ok(()) => return Ok(chosen),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                attempt += 1;
-                if attempt > 5 {
-                    return Err(DownloadError::Io(e));
-                }
-                if allow_overwrite
-                    && !overwrite_attempted
-                    && chosen == name
-                    && !avoid.contains(&chosen.to_lowercase())
-                {
-                    overwrite_attempted = true;
-                    let is_dir = tokio::fs::metadata(&dst)
-                        .await
-                        .map(|m| m.is_dir())
-                        .unwrap_or(false);
-                    if !is_dir && tokio::fs::remove_file(&dst).await.is_ok() {
-                        continue;
-                    }
-                }
-                chosen = crate::downloader::dedup_filename(
-                    save_dir,
-                    name,
-                    &HashSet::new(),
-                    avoid,
-                    false,
-                )
-                .await;
-            }
-            Err(e) => return Err(DownloadError::Io(e)),
-        }
-    }
+    crate::downloader::claim_final_name(temp, save_dir, name, allow_overwrite, avoid).await
 }
 
 /// 确定本任务使用的文件名：manager 传入的名字（已 dedup / 用户自定义 / 已预订临时路径）

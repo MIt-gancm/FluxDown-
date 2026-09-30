@@ -9,6 +9,7 @@
 //!
 //! 零第三方依赖：`log` / `tracing` 适配器由各宿主自己实现，本 crate 只负责落盘策略。
 
+mod sanitize;
 mod throttle;
 mod time;
 
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+pub use sanitize::SANITIZE_PATTERNS;
 pub use time::utc_timestamp;
 
 use throttle::{Decision, Summary, Throttle};

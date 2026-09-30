@@ -19,10 +19,12 @@
 //! - Progress reporting via ProgressUpdate channel (writer-side, so byte counts
 //!   never double-count under concurrency)
 //! - Per-segment retry with exponential backoff
+//! - 变体 AUDIO 组带独立 URI(EXT-X-MEDIA)时并行下载音轨,收尾用 ffmpeg 流复制
+//!   与视频 mux;ffmpeg 不可用时只出视频并记录 warning 活动
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -33,9 +35,12 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, OnceCell, OwnedSemaphorePermit, Semaphore, mpsc};
 
+use crate::dash_downloader::{
+    build_audio_path, effective_ffmpeg, ffmpeg_copy_to_mp4, ffmpeg_usable,
+};
 use crate::downloader::{
-    DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, ProgressUpdate, TEMP_EXT, dedup_filename,
-    extract_from_url, sanitize_filename,
+    DB_SAVE_INTERVAL_SECS, DownloadError, DownloadParams, ProgressUpdate, TEMP_EXT,
+    claim_final_name, dedup_filename, extract_from_url, sanitize_filename,
 };
 use crate::events::EventSink;
 use crate::logger::log_info;
@@ -1212,6 +1217,14 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         .as_deref()
         .and_then(parse_checkpoint_variant);
     let confirmed_hls = saved_checkpoint.is_some();
+    // ffmpeg 可用性决定两件事:有独立音轨时是否下载并 mux,以及收尾 TS→MP4 是否走
+    // 流复制(不可用才退回内存转换)。
+    let ffmpeg: Option<PathBuf> = {
+        let candidate = effective_ffmpeg(p);
+        ffmpeg_usable(candidate)
+            .await
+            .then(|| candidate.to_path_buf())
+    };
 
     // Parse the M3U8 playlist
     let root_ctx = HlsRequestCtx {
@@ -1233,7 +1246,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // 鉴权 cookie 导致 403/401。直接 media 路径下 media_playlist_url==p.url,
     // 行为不变。
     let mut abandon_resume = false;
-    let (segments, media_sequence, media_playlist_url, is_fmp4, chosen_variant, live) =
+    let (segments, media_sequence, media_playlist_url, is_fmp4, chosen_variant, live, audio_uri) =
         match content {
             M3u8Content::Master { variants } => {
                 let saved_match = saved_variant
@@ -1288,28 +1301,37 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 let selected_uri = variant.uri.clone();
                 let chosen = VariantId::of(variant);
 
-                if variant.audio_uri.is_some() && saved_idx == 0 {
-                    crate::log_warn!(
-                        "[hls-download] task {} variant uses a separate EXT-X-MEDIA audio rendition; \
-                         only the video stream is downloaded",
-                        p.task_id
-                    );
-                    if let Err(journal_error) = crate::task_activity::record(
-                        &p.db,
-                        p.sink.as_ref(),
-                        &p.task_id,
-                        "warning",
-                        "该 HLS 流的音频是独立音轨（EXT-X-MEDIA），当前仅下载视频流，输出文件可能没有声音",
-                        None,
-                    )
-                    .await
-                    {
-                        crate::log_error!(
-                            "[task-activity] failed to persist warning: {}",
-                            journal_error
-                        );
+                // 变体的 AUDIO 组带独立 URI 时需要 ffmpeg 把音轨 mux 进视频;
+                // 不可用就只下载视频流并留下 warning 活动,避免静默产出无声文件。
+                let audio_uri = match variant.audio_uri.as_deref() {
+                    Some(uri) if ffmpeg.is_some() => Some(uri.to_owned()),
+                    Some(_) => {
+                        if saved_idx == 0 {
+                            crate::log_warn!(
+                                "[hls-download] task {} variant uses a separate EXT-X-MEDIA audio rendition \
+                                 but ffmpeg is unavailable; only the video stream is downloaded",
+                                p.task_id
+                            );
+                            if let Err(journal_error) = crate::task_activity::record(
+                                &p.db,
+                                p.sink.as_ref(),
+                                &p.task_id,
+                                "warning",
+                                "该 HLS 流的音频是独立音轨（EXT-X-MEDIA），需要 ffmpeg 才能合并；当前未检测到可用的 ffmpeg，仅下载视频流，输出文件可能没有声音",
+                                None,
+                            )
+                            .await
+                            {
+                                crate::log_error!(
+                                    "[task-activity] failed to persist warning: {}",
+                                    journal_error
+                                );
+                            }
+                        }
+                        None
                     }
-                }
+                    None => None,
+                };
 
                 // 所选 variant 可能指向与 p.url 不同源的 CDN:ctx 对 Cookie 与凭据类
                 // 请求头都按同源过滤,不会把原站点的会话/鉴权令牌带给第三方。
@@ -1332,6 +1354,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                         has_map,
                         Some(chosen),
                         live,
+                        audio_uri,
                     ),
                     M3u8Content::Master { .. } => {
                         return Err(DownloadError::Other(
@@ -1346,7 +1369,15 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 media_sequence,
                 has_map,
                 live,
-            } => (segments, media_sequence, p.url.clone(), has_map, None, live),
+            } => (
+                segments,
+                media_sequence,
+                p.url.clone(),
+                has_map,
+                None,
+                live,
+                None,
+            ),
         };
 
     if live {
@@ -1354,6 +1385,36 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             "暂不支持直播或未结束的 HLS 流（播放列表缺少 EXT-X-ENDLIST）".to_string(),
         ));
     }
+
+    // 独立音轨的播放列表在创建任何文件之前解析:拿不到音轨就是真实失败,不能
+    // 静默退化成无声输出。音轨与视频同为点播时长,直播音轨一并拒绝。
+    let audio_playlist: Option<(String, Vec<HlsSegment>, u64, bool)> = match audio_uri {
+        Some(uri) => match parse_m3u8(&p.client, &uri, &root_ctx, &p.cancel_token)
+            .await
+            .map_err(reject_not_hls)?
+        {
+            M3u8Content::Media {
+                segments: audio_segments,
+                media_sequence: audio_sequence,
+                has_map,
+                live: audio_live,
+                ..
+            } => {
+                if audio_live {
+                    return Err(DownloadError::Other(
+                        "HLS 独立音轨播放列表缺少 EXT-X-ENDLIST，无法下载".to_string(),
+                    ));
+                }
+                Some((uri, audio_segments, audio_sequence, has_map))
+            }
+            M3u8Content::Master { .. } => {
+                return Err(DownloadError::Other(
+                    "nested master playlist not supported".to_string(),
+                ));
+            }
+        },
+        None => None,
+    };
 
     let segment_count = segments.len();
     log_info!(
@@ -1415,6 +1476,24 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
 
     let dest_path = save_dir.join(&actual_name);
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
+
+    // 独立音轨的临时文件紧邻视频:`<stem>.audio.m4a.fdownloading`(与 DASH 音轨
+    // sidecar 同名约定,任务删除时按同一规则清理)。
+    let audio_track: Option<AudioTrack> = audio_playlist.map(
+        |(playlist_url, audio_segments, audio_sequence, _)| AudioTrack {
+            tag: audio_track_tag(&playlist_url),
+            playlist_url,
+            segments: audio_segments,
+            media_sequence: audio_sequence,
+            temp_path: PathBuf::from(format!(
+                "{}{}",
+                build_audio_path(&dest_path).display(),
+                TEMP_EXT
+            )),
+            resume_key: audio_resume_key(&p.task_id),
+        },
+    );
+    let audio_temp_path = audio_track.as_ref().map(|t| t.temp_path.clone());
 
     // Ensure parent directory exists
     output::ensure_parent(&temp_path).await?;
@@ -1590,6 +1669,9 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // Segments can stay in the body for longer than a completed writer chunk.
     // Sample independently, including while no byte geometry is available.
     let reported_bytes = Arc::new(AtomicI64::new(downloaded_bytes));
+    // 独立音轨已写入的字节数(含续传前缀),与视频字节一起汇总为任务进度。
+    let audio_written = Arc::new(AtomicI64::new(0));
+    let sample_audio = Arc::clone(&audio_written);
     let sample_tracker = tracker.clone();
     let sample_bytes = Arc::clone(&reported_bytes);
     let sample_tx = p.progress_tx.clone();
@@ -1602,7 +1684,8 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             if sample_tx
                 .send(ProgressUpdate {
                     task_id: sample_task.clone(),
-                    downloaded_bytes: sample_bytes.load(Ordering::Relaxed),
+                    downloaded_bytes: sample_bytes.load(Ordering::Relaxed)
+                        + sample_audio.load(Ordering::Relaxed),
                     total_bytes: 0,
                     status: 1,
                     runtime: Some(hls_runtime(&sample_task, &sample_tracker, sample_limit)),
@@ -1622,44 +1705,63 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         referrer: &p.referrer,
         extra_headers: &p.extra_headers,
     };
-    let mut map_bytes: HashMap<MapKey, Vec<u8>> = HashMap::new();
-    if is_fmp4 {
-        let mut seen: std::collections::HashSet<MapKey> = std::collections::HashSet::new();
-        for seg in segments.iter().skip(first_idx) {
-            let Some(m) = &seg.map else { continue };
-            let map_key = (m.uri.clone(), m.byte_range);
-            if !seen.insert(map_key.clone()) {
-                continue;
+    let map_bytes: HashMap<MapKey, Vec<u8>> = if is_fmp4 {
+        match prefetch_init_segments(
+            &p.client,
+            &segments,
+            first_idx,
+            &seg_ctx,
+            &p.cancel_token,
+            &p.task_id,
+            &tracker,
+            &p.db,
+            p.sink.as_ref(),
+        )
+        .await
+        {
+            Ok(maps) => maps,
+            Err(e) => {
+                sampler.abort();
+                return Err(e);
             }
-            let init_data = match download_segment_with_retry(
-                &p.client,
-                &m.uri,
-                m.byte_range,
-                &seg_ctx,
-                &p.cancel_token,
-                &p.task_id,
-                usize::MAX,
-                &tracker,
-                &p.db,
-                p.sink.as_ref(),
-            )
-            .await
-            {
-                Ok(data) => data,
-                Err(e) => {
-                    sampler.abort();
-                    return Err(e);
-                }
-            };
-            log_info!(
-                "[hls-download] task {} fetched init segment {} ({} bytes)",
-                p.task_id,
-                m.uri,
-                init_data.len()
-            );
-            map_bytes.insert(map_key, init_data);
         }
-    }
+    } else {
+        HashMap::new()
+    };
+
+    // 独立音轨与视频并行下载。音轨出现真实错误时取消整个任务(视频 writer 随之
+    // 以取消退出,收尾处用音轨的错误替换);用户取消/暂停时两边都以取消结束。
+    let audio_handle: Option<tokio::task::JoinHandle<Result<i64, DownloadError>>> = audio_track
+        .map(|track| {
+            let run = AudioRun {
+                track,
+                client: p.client.clone(),
+                cookies: p.cookies.clone(),
+                referrer: p.referrer.clone(),
+                extra_headers: p.extra_headers.clone(),
+                header_origin_url: p.url.clone(),
+                cancel: p.cancel_token.child_token(),
+                task_id: p.task_id.clone(),
+                db: p.db.clone(),
+                sink: p.sink.clone(),
+                speed_limiter: p.speed_limiter.clone(),
+                key_cache: key_cache.clone(),
+                tracker: tracker.clone(),
+                written: Arc::clone(&audio_written),
+                segment_limit: p.segment_count,
+                is_resume: p.is_resume,
+            };
+            let parent = p.cancel_token.clone();
+            tokio::spawn(async move {
+                let result = run_audio_track(run).await;
+                if let Err(e) = &result
+                    && !matches!(e, DownloadError::Cancelled)
+                {
+                    parent.cancel();
+                }
+                result
+            })
+        });
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     // 许可由 dispatcher 按 seg_idx 顺序获取,并随下载结果一起送回 writer,写盘后
@@ -1669,24 +1771,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // Channel 容量 == concurrency:未释放的许可数不超过它,结果入队从不阻塞。
     let (result_tx, mut result_rx) = mpsc::channel::<SegmentOutcome>(concurrency.max(1));
 
-    let jobs: Vec<SegmentJob> = segments
-        .iter()
-        .enumerate()
-        .skip(first_idx)
-        .map(|(idx, segment)| SegmentJob {
-            idx,
-            uri: segment.uri.clone(),
-            byte_range: segment.byte_range,
-            // Extract only the encryption fields needed to decrypt this segment.
-            key_info: segment.key.as_ref().and_then(|k| {
-                if k.method == HlsKeyMethod::Aes128 && !k.uri.is_empty() {
-                    Some((k.uri.clone(), k.iv.clone()))
-                } else {
-                    None
-                }
-            }),
-        })
-        .collect();
+    let jobs: Vec<SegmentJob> = segment_jobs(&segments, first_idx);
     let shared = Arc::new(SegmentShared {
         client: p.client.clone(),
         cookies: p.cookies.clone(),
@@ -1862,15 +1947,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                     );
                 }
                 p.cancel_token.cancel();
-                // 磁盘空间不足(ENOSPC, errno 28 / ErrorKind::StorageFull)给出
-                // 明确提示,便于用户区分"磁盘满"与普通 IO 错误。
-                if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
-                    fatal_error = Some(DownloadError::Other(
-                        "磁盘空间不足，请清理磁盘后重试".to_string(),
-                    ));
-                } else {
-                    fatal_error = Some(DownloadError::Io(e));
-                }
+                fatal_error = Some(write_failure(e));
                 break 'writer;
             }
 
@@ -1905,7 +1982,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                     .progress_tx
                     .send(ProgressUpdate {
                         task_id: p.task_id.clone(),
-                        downloaded_bytes,
+                        downloaded_bytes: downloaded_bytes + audio_written.load(Ordering::Relaxed),
                         total_bytes: 0, // unknown for HLS
                         status: 1,
                         error_message: String::new(),
@@ -1921,8 +1998,11 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             // DB persistence (every DB_SAVE_INTERVAL_SECS)
             if last_db_save.elapsed().as_secs() >= DB_SAVE_INTERVAL_SECS {
                 let _ =
-                    p.db.update_task_progress(&p.task_id, downloaded_bytes)
-                        .await;
+                    p.db.update_task_progress(
+                        &p.task_id,
+                        downloaded_bytes + audio_written.load(Ordering::Relaxed),
+                    )
+                    .await;
                 last_db_save = std::time::Instant::now();
             }
 
@@ -1950,15 +2030,43 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // this is a no-op.
     drop(result_rx);
     let _ = dispatcher.await;
+    // 音轨在采样器停止之前收尾:视频先完成时,音轨剩余进度仍要持续上报。
+    let audio_result = match audio_handle {
+        Some(handle) => Some(handle.await.unwrap_or_else(|e| {
+            Err(DownloadError::Other(format!(
+                "HLS audio track task failed: {e}"
+            )))
+        })),
+        None => None,
+    };
     sampler.abort();
+    let mut audio_bytes = 0i64;
+    match audio_result {
+        Some(Ok(n)) => audio_bytes = n,
+        Some(Err(DownloadError::Cancelled)) => {
+            if fatal_error.is_none() {
+                fatal_error = Some(DownloadError::Cancelled);
+            }
+        }
+        // 音轨的真实错误触发了任务级取消,视频侧只会看到 Cancelled:以音轨错误为准。
+        Some(Err(e)) => {
+            if matches!(fatal_error, None | Some(DownloadError::Cancelled)) {
+                fatal_error = Some(e);
+            }
+        }
+        None => {}
+    }
 
     if let Some(err) = fatal_error {
         // Persist whatever fully-written prefix we have so a later resume can
         // continue from there (matches the sequential cancel path).
         let _ = file.flush().await;
         let _ =
-            p.db.update_task_progress(&p.task_id, downloaded_bytes)
-                .await;
+            p.db.update_task_progress(
+                &p.task_id,
+                downloaded_bytes + audio_written.load(Ordering::Relaxed),
+            )
+            .await;
         return Err(err);
     }
 
@@ -1966,23 +2074,143 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     drop(file);
 
     // Save final progress
-    let _ =
-        p.db.update_task_progress(&p.task_id, downloaded_bytes)
-            .await;
+    let total_written = downloaded_bytes + audio_bytes;
+    let _ = p.db.update_task_progress(&p.task_id, total_written).await;
+
+    // 独立音轨:两份 temp 直接 ffmpeg 流复制成 mp4,产物取代 .ts 输出。mux 过程中
+    // 暂停/取消时 temp 与两个续传检查点原样保留,恢复后只需重做 mux。
+    if let Some(audio_temp) = audio_temp_path.as_deref()
+        && let Some(ffmpeg_bin) = ffmpeg.as_deref()
+    {
+        match mux_video_audio(
+            p,
+            &temp_path,
+            audio_temp,
+            &actual_name,
+            total_written,
+            ffmpeg_bin,
+            &resume_seg_key,
+        )
+        .await
+        {
+            Ok((mp4_path, mp4_size)) => {
+                log_info!(
+                    "[hls-download] task {} video+audio muxed into {}",
+                    p.task_id,
+                    mp4_path.display()
+                );
+                let mp4_file_name = mp4_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("output.mp4")
+                    .to_string();
+                let _ = p
+                    .progress_tx
+                    .send(ProgressUpdate {
+                        task_id: p.task_id.clone(),
+                        downloaded_bytes: mp4_size,
+                        total_bytes: mp4_size,
+                        status: 3,
+                        error_message: String::new(),
+                        file_name: mp4_file_name,
+                        segment_details: None,
+                        ..Default::default()
+                    })
+                    .await;
+                return Ok(mp4_size);
+            }
+            Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            Err(e) => {
+                // 合并失败:退回仅视频输出,音轨保留为 sidecar 并留下 warning 活动。
+                let sidecar = build_audio_path(&dest_path);
+                let moved = tokio::fs::rename(audio_temp, &sidecar).await.is_ok();
+                crate::log_warn!(
+                    "[hls-download] task {} audio/video mux failed: {}; keeping video only",
+                    p.task_id,
+                    e
+                );
+                let message = if moved {
+                    format!(
+                        "音频轨与视频合并失败（{e}），输出仅含视频；音频轨已保存为 {}",
+                        sidecar.display()
+                    )
+                } else {
+                    format!("音频轨与视频合并失败（{e}），输出仅含视频，输出文件可能没有声音")
+                };
+                if let Err(journal_error) = crate::task_activity::record(
+                    &p.db,
+                    p.sink.as_ref(),
+                    &p.task_id,
+                    "warning",
+                    message,
+                    None,
+                )
+                .await
+                {
+                    crate::log_error!(
+                        "[task-activity] failed to persist warning: {}",
+                        journal_error
+                    );
+                }
+                let _ = p.db.delete_config(&audio_resume_key(&p.task_id)).await;
+            }
+        }
+    }
 
     // Clean up HLS resume marker on successful completion
     let _ = p.db.delete_config(&resume_seg_key).await;
 
-    tokio::fs::rename(&temp_path, &dest_path)
-        .await
-        .map_err(|e| {
-            DownloadError::Other(format!(
-                "failed to rename {} -> {}: {}",
-                temp_path.display(),
-                dest_path.display(),
+    // 完成期占名:与 HTTP/ED2K 相同的 create_new 不覆盖语义。原名被占用时
+    // dedup 换名(overwrite 策略只对原名删除旧文件),并把最终文件名写回 DB。
+    let avoid = sibling_avoid(p).await;
+    let chosen = claim_final_name(
+        &temp_path,
+        &save_dir,
+        &actual_name,
+        p.allow_overwrite,
+        &avoid,
+    )
+    .await
+    .map_err(|e| {
+        DownloadError::Other(format!(
+            "failed to rename {} -> {}: {}",
+            temp_path.display(),
+            dest_path.display(),
+            e
+        ))
+    })?;
+    let dest_path = if chosen == actual_name {
+        dest_path
+    } else {
+        log_info!(
+            "[hls-download] task {} destination '{}' is taken; finalized as '{}'",
+            p.task_id,
+            actual_name,
+            chosen
+        );
+        if let Err(e) = p.db.set_task_file_name(&p.task_id, &chosen).await {
+            log_info!(
+                "[hls-download] task {} failed to persist renamed file '{}': {}",
+                p.task_id,
+                chosen,
                 e
-            ))
-        })?;
+            );
+        }
+        let _ = p
+            .progress_tx
+            .send(ProgressUpdate {
+                task_id: p.task_id.clone(),
+                downloaded_bytes,
+                total_bytes: 0,
+                status: 1,
+                error_message: String::new(),
+                file_name: chosen.clone(),
+                segment_details: None,
+                ..Default::default()
+            })
+            .await;
+        save_dir.join(&chosen)
+    };
 
     log_info!(
         "[hls-download] task {} renamed {} -> {}",
@@ -1991,10 +2219,18 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         dest_path.display()
     );
 
-    // 非 fMP4:TS→MP4 转换;fMP4/CMAF(#682):内容已是分片 MP4,只走占名协议
-    // 把 `.ts` 改名成 `.mp4`。两者失败都保留 `.ts` 并按原名完成。
-    if let Some(mp4_path) =
-        remux_ts_to_mp4(&dest_path, &p.task_id, p.allow_overwrite, is_fmp4).await
+    // 非 fMP4:TS→MP4 转换(ffmpeg 可用时流复制,否则内存转换);fMP4/CMAF(#682):
+    // 内容已是分片 MP4,只走占名协议把 `.ts` 改名成 `.mp4`。两者失败都保留 `.ts`
+    // 并按原名完成。
+    if let Some(mp4_path) = remux_ts_to_mp4(
+        &dest_path,
+        &p.task_id,
+        p.allow_overwrite,
+        is_fmp4,
+        ffmpeg.as_deref(),
+        &p.cancel_token,
+    )
+    .await
     {
         let mp4_file_name = mp4_path
             .file_name()
@@ -2054,8 +2290,9 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
 // TS → MP4 remux (best-effort)
 // ---------------------------------------------------------------------------
 
-/// ts2mp4 会在内存里同时持有整份 TS 与多份中间产物(峰值为文件体积的数倍),
-/// 上限收紧到 192MB 以避免低内存设备在收尾阶段 OOM;超限时保留 .ts。
+/// 内存转换兜底(ffmpeg 不可用或失败时)的体积上限。ts2mp4 会在内存里同时持有整份
+/// TS 与多份中间产物(峰值为文件体积的数倍),收紧到 192MB 以避免低内存设备在收尾
+/// 阶段 OOM;超限时保留 .ts。ffmpeg 流复制不读入内存,不受此限。
 const MAX_REMUX_BYTES: u64 = 192 * 1024 * 1024;
 
 /// remux 需要 dest 卷至少还有 `file_len`(mp4 产物 ≈ ts 体积,仅重封装
@@ -2077,11 +2314,16 @@ fn remux_space_ok(avail: Option<u64>, file_len: u64) -> bool {
 /// `is_fmp4`(#682):播放列表带 EXT-X-MAP,`.ts` 里装的已经是分片 MP4
 /// (ftyp+moov+[moof+mdat]*),不做 TS→MP4 转换,跳过体积/空间预检,只按同一
 /// 套 dedup + 原子占名协议把文件改名为 `.mp4`;失败同样保留 `.ts`。
+///
+/// `ffmpeg = Some`:TS→MP4 优先走 ffmpeg 流复制(`-c copy`,不把整文件读进内存);
+/// 取消时保留 `.ts`;ffmpeg 执行失败才退回内存 ts2mp4,并受 [`MAX_REMUX_BYTES`] 限制。
 async fn remux_ts_to_mp4(
     ts_path: &std::path::Path,
     task_id: &str,
     allow_overwrite: bool,
     is_fmp4: bool,
+    ffmpeg: Option<&std::path::Path>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Option<PathBuf> {
     let ext = ts_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !ext.eq_ignore_ascii_case("ts") {
@@ -2092,15 +2334,6 @@ async fn remux_ts_to_mp4(
         Ok(m) => m.len(),
         Err(_) => return None,
     };
-    if !is_fmp4 && file_len > MAX_REMUX_BYTES {
-        log_info!(
-            "[hls] task {} skipping TS→MP4 remux: file is {} bytes (limit {}), keeping .ts",
-            task_id,
-            file_len,
-            MAX_REMUX_BYTES
-        );
-        return None;
-    }
 
     let parent = ts_path.parent()?;
 
@@ -2137,10 +2370,36 @@ async fn remux_ts_to_mp4(
     let mp4_tmp = mp4_path.with_extension("mp4.tmp");
     let mp4_tmp_inner = mp4_tmp.clone();
 
+    let mut ffmpeg_done = false;
+    if !is_fmp4 && let Some(ffmpeg_bin) = ffmpeg {
+        match ffmpeg_copy_to_mp4(ts_path, None, &mp4_tmp, file_len, cancel, ffmpeg_bin).await {
+            Ok(()) => ffmpeg_done = true,
+            Err(DownloadError::Cancelled) => return None,
+            Err(e) => {
+                log_info!(
+                    "[hls] task {} ffmpeg remux failed: {}, falling back to in-memory remux",
+                    task_id,
+                    e
+                );
+            }
+        }
+    }
+    if !is_fmp4 && !ffmpeg_done && file_len > MAX_REMUX_BYTES {
+        log_info!(
+            "[hls] task {} skipping TS→MP4 remux: file is {} bytes (limit {}), keeping .ts",
+            task_id,
+            file_len,
+            MAX_REMUX_BYTES
+        );
+        return None;
+    }
+
     match tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
         // fMP4:待改名的源就是 .ts 本身;否则转换产物先落 tmp。
         let src = if is_fmp4 {
             ts_owned.clone()
+        } else if ffmpeg_done {
+            mp4_tmp_inner.clone()
         } else {
             let ts_data = std::fs::read(&ts_owned)?;
             let mp4_data = ts2mp4::convert_ts_to_mp4(&ts_data)?;
@@ -2222,6 +2481,513 @@ async fn remux_ts_to_mp4(
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// 独立音轨(EXT-X-MEDIA)
+// ---------------------------------------------------------------------------
+
+/// 音轨并发上限:音频分片小而密,不需要与视频同量级的连接数。
+const AUDIO_TRACK_MAX_CONCURRENCY: usize = 4;
+
+/// 音轨续传检查点的任务级 config 键。格式同视频检查点
+/// (`idx:bytes:media_sequence:<音轨标识>`)。
+fn audio_resume_key(task_id: &str) -> String {
+    format!("hls_audio_resume_{task_id}")
+}
+
+/// 音轨标识:去 query 的 playlist path(签名 token 会过期,不能按完整 URI 比较),
+/// 续传时据此确认磁盘上的前缀属于同一条音轨。
+fn audio_track_tag(playlist_url: &str) -> String {
+    VariantId::of(&HlsVariant {
+        bandwidth: 0,
+        resolution: None,
+        uri: playlist_url.to_owned(),
+        audio_uri: None,
+    })
+    .encode()
+}
+
+/// 段写盘失败 → 任务错误。磁盘满给出明确提示,便于用户区分"磁盘满"与普通 IO 错误。
+fn write_failure(e: std::io::Error) -> DownloadError {
+    if e.kind() == std::io::ErrorKind::StorageFull || e.raw_os_error() == Some(28) {
+        DownloadError::Other("磁盘空间不足，请清理磁盘后重试".to_string())
+    } else {
+        DownloadError::Io(e)
+    }
+}
+
+/// 同目录其它未完成任务已登记的文件名(小写),占名换名时避开它们。
+async fn sibling_avoid(p: &DownloadParams) -> std::collections::HashSet<String> {
+    p.db.list_active_sibling_file_names(&p.save_dir, &p.task_id)
+        .await
+        .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
+        .unwrap_or_default()
+}
+
+/// 从 `first_idx` 起为每个尚未落盘的段生成下载任务。
+fn segment_jobs(segments: &[HlsSegment], first_idx: usize) -> Vec<SegmentJob> {
+    segments
+        .iter()
+        .enumerate()
+        .skip(first_idx)
+        .map(|(idx, segment)| SegmentJob {
+            idx,
+            uri: segment.uri.clone(),
+            byte_range: segment.byte_range,
+            // Extract only the encryption fields needed to decrypt this segment.
+            key_info: segment.key.as_ref().and_then(|k| {
+                if k.method == HlsKeyMethod::Aes128 && !k.uri.is_empty() {
+                    Some((k.uri.clone(), k.iv.clone()))
+                } else {
+                    None
+                }
+            }),
+        })
+        .collect()
+}
+
+/// 顺序预取 `first_idx..` 剩余段用到的每个不同 EXT-X-MAP 初始化段字节。
+///
+/// 已落盘前缀对应的 init 段字节已经在磁盘上,无需重新下载。复用
+/// `download_segment_with_retry`(与媒体段相同的重试/退避/Range 路径),`seg_idx`
+/// 传 `usize::MAX` 仅用于失败时的日志诊断。
+#[allow(clippy::too_many_arguments)]
+async fn prefetch_init_segments(
+    client: &Client,
+    segments: &[HlsSegment],
+    first_idx: usize,
+    ctx: &HlsRequestCtx<'_>,
+    cancel: &tokio_util::sync::CancellationToken,
+    task_id: &str,
+    tracker: &TransferTracker,
+    db: &crate::db::Db,
+    sink: &dyn EventSink,
+) -> Result<HashMap<MapKey, Vec<u8>>, DownloadError> {
+    let mut map_bytes: HashMap<MapKey, Vec<u8>> = HashMap::new();
+    for seg in segments.iter().skip(first_idx) {
+        let Some(m) = &seg.map else { continue };
+        let map_key = (m.uri.clone(), m.byte_range);
+        if map_bytes.contains_key(&map_key) {
+            continue;
+        }
+        let init_data = download_segment_with_retry(
+            client,
+            &m.uri,
+            m.byte_range,
+            ctx,
+            cancel,
+            task_id,
+            usize::MAX,
+            tracker,
+            db,
+            sink,
+        )
+        .await?;
+        log_info!(
+            "[hls-download] task {} fetched init segment {} ({} bytes)",
+            task_id,
+            m.uri,
+            init_data.len()
+        );
+        map_bytes.insert(map_key, init_data);
+    }
+    Ok(map_bytes)
+}
+
+/// 解析完成、待下载的独立音轨。
+struct AudioTrack {
+    segments: Vec<HlsSegment>,
+    media_sequence: u64,
+    playlist_url: String,
+    temp_path: PathBuf,
+    resume_key: String,
+    tag: String,
+}
+
+/// 音轨下载所需的全部句柄(拥有所有权,供 `tokio::spawn`)。
+struct AudioRun {
+    track: AudioTrack,
+    client: Client,
+    cookies: String,
+    referrer: String,
+    extra_headers: HashMap<String, String>,
+    /// 用户提交的清单 URL:凭据类请求头只属于它的源站。
+    header_origin_url: String,
+    /// 任务取消令牌的子令牌:音轨自身失败时只停音轨,由调用方决定是否升级为任务取消。
+    cancel: tokio_util::sync::CancellationToken,
+    task_id: String,
+    db: crate::db::Db,
+    sink: Arc<dyn EventSink>,
+    speed_limiter: crate::speed_limiter::SpeedLimiter,
+    key_cache: KeyCache,
+    tracker: TransferTracker,
+    /// 音轨已落盘字节数(含续传前缀),调用方据此汇总任务进度。
+    written: Arc<AtomicI64>,
+    segment_limit: i32,
+    is_resume: bool,
+}
+
+/// 下载并落盘一条独立音轨,返回音轨总字节数。
+///
+/// 与视频共用段下载 / 解密 / 重试 / 限速路径;单一有序 writer 保证落盘顺序,
+/// 检查点按已完整落盘的连续前缀推进,因此暂停 / 重启后可从同一字节边界续传。
+async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
+    let AudioRun {
+        track,
+        client,
+        cookies,
+        referrer,
+        extra_headers,
+        header_origin_url,
+        cancel,
+        task_id,
+        db,
+        sink,
+        speed_limiter,
+        key_cache,
+        tracker,
+        written,
+        segment_limit,
+        is_resume,
+    } = run;
+    let segment_count = track.segments.len();
+
+    let saved = if is_resume {
+        db.get_config(&track.resume_key).await.ok().flatten()
+    } else {
+        let _ = db.delete_config(&track.resume_key).await;
+        None
+    };
+    let (saved_idx, saved_bytes, saved_seq) = saved
+        .as_deref()
+        .map(parse_resume_checkpoint)
+        .unwrap_or((0, 0, None));
+    let same_rendition = saved
+        .as_deref()
+        .and_then(parse_checkpoint_variant)
+        .is_some_and(|v| v.encode() == track.tag);
+    // 与视频相同:无显式 IV 的加密段其 IV 依赖 media_sequence,漂移则放弃续传。
+    let uses_computed_iv = track.segments.iter().any(|s| {
+        s.key
+            .as_ref()
+            .is_some_and(|k| k.method == HlsKeyMethod::Aes128 && k.iv.is_none())
+    });
+    let media_seq_changed = match saved_seq {
+        Some(prev) => prev != track.media_sequence,
+        None => uses_computed_iv,
+    };
+    output::ensure_parent(&track.temp_path).await?;
+    let file_size = tokio::fs::metadata(&track.temp_path)
+        .await
+        .map(|m| m.len() as i64)
+        .unwrap_or(0);
+    let (mut file, first_idx, mut written_bytes) = if resume_is_usable(
+        saved_idx,
+        saved_bytes,
+        file_size,
+        segment_count,
+        media_seq_changed,
+        !same_rendition,
+    ) {
+        let safe_size = saved_bytes.min(file_size);
+        if safe_size < file_size {
+            let truncate_file = OpenOptions::new()
+                .write(true)
+                .open(&track.temp_path)
+                .await?;
+            truncate_file.set_len(safe_size as u64).await?;
+        }
+        log_info!(
+            "[hls-download] task {} resuming audio track from segment {} ({} bytes)",
+            task_id,
+            saved_idx,
+            safe_size
+        );
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&track.temp_path)
+            .await?;
+        (f, saved_idx, safe_size)
+    } else {
+        (File::create(&track.temp_path).await?, 0usize, 0i64)
+    };
+    written.store(written_bytes, Ordering::Relaxed);
+    if first_idx == 0 {
+        let _ = db
+            .set_config(
+                &track.resume_key,
+                &format_resume_checkpoint(0, 0, track.media_sequence, Some(&track.tag)),
+            )
+            .await;
+    }
+
+    let remaining = segment_count.saturating_sub(first_idx);
+    if remaining == 0 {
+        file.flush().await?;
+        return Ok(written_bytes);
+    }
+    let concurrency = hls_concurrency(segment_limit, remaining).min(AUDIO_TRACK_MAX_CONCURRENCY);
+    log_info!(
+        "[hls-download] task {} downloading {} audio segment(s) with concurrency {}",
+        task_id,
+        remaining,
+        concurrency
+    );
+
+    let seg_ctx = HlsRequestCtx {
+        cookies: &cookies,
+        cookie_base_url: &track.playlist_url,
+        header_origin_url: &header_origin_url,
+        referrer: &referrer,
+        extra_headers: &extra_headers,
+    };
+    let map_bytes = prefetch_init_segments(
+        &client,
+        &track.segments,
+        first_idx,
+        &seg_ctx,
+        &cancel,
+        &task_id,
+        &tracker,
+        &db,
+        sink.as_ref(),
+    )
+    .await?;
+
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let (result_tx, mut result_rx) = mpsc::channel::<SegmentOutcome>(concurrency);
+    let shared = Arc::new(SegmentShared {
+        client: client.clone(),
+        cookies: cookies.clone(),
+        playlist_url: track.playlist_url.clone(),
+        header_origin_url: header_origin_url.clone(),
+        referrer: referrer.clone(),
+        extra_headers: extra_headers.clone(),
+        cancel: cancel.clone(),
+        task_id: task_id.clone(),
+        key_cache,
+        media_sequence: track.media_sequence,
+        tracker: tracker.clone(),
+        db: db.clone(),
+        sink: sink.clone(),
+    });
+    let dispatcher = tokio::spawn(dispatch_segments(
+        segment_jobs(&track.segments, first_idx),
+        shared,
+        semaphore,
+        result_tx,
+    ));
+
+    let mut pending: BTreeMap<usize, (Vec<u8>, OwnedSemaphorePermit)> = BTreeMap::new();
+    let mut next_to_write = first_idx;
+    let mut fatal: Option<DownloadError> = None;
+    let mut last_written_map: Option<MapKey> = if first_idx == 0 {
+        None
+    } else {
+        track
+            .segments
+            .get(first_idx - 1)
+            .and_then(|s| s.map.as_ref())
+            .map(|m| (m.uri.clone(), m.byte_range))
+    };
+
+    'writer: while next_to_write < segment_count {
+        if cancel.is_cancelled() {
+            fatal = Some(DownloadError::Cancelled);
+            break;
+        }
+        while !pending.contains_key(&next_to_write) {
+            match result_rx.recv().await {
+                Some((idx, Ok(data), permit)) => {
+                    pending.insert(idx, (data, permit));
+                }
+                Some((idx, Err(e), _permit)) => {
+                    log_info!(
+                        "[hls-download] task {} audio segment {} failed: {}",
+                        task_id,
+                        idx,
+                        e
+                    );
+                    cancel.cancel();
+                    fatal = Some(e);
+                    break 'writer;
+                }
+                None => {
+                    fatal = Some(if cancel.is_cancelled() {
+                        DownloadError::Cancelled
+                    } else {
+                        DownloadError::Other(format!(
+                            "HLS audio segment workers exited unexpectedly before segment {}",
+                            next_to_write
+                        ))
+                    });
+                    break 'writer;
+                }
+            }
+        }
+
+        while let Some((data, _permit)) = pending.remove(&next_to_write) {
+            let seg_idx = next_to_write;
+            if cancel.is_cancelled() {
+                fatal = Some(DownloadError::Cancelled);
+                break 'writer;
+            }
+
+            let current_map_key = track.segments[seg_idx]
+                .map
+                .as_ref()
+                .map(|m| (m.uri.clone(), m.byte_range));
+            let init_chunk: Option<&[u8]> =
+                if should_write_init(last_written_map.as_ref(), current_map_key.as_ref()) {
+                    match current_map_key.as_ref().and_then(|k| map_bytes.get(k)) {
+                        Some(init) => Some(init.as_slice()),
+                        None => {
+                            fatal = Some(DownloadError::Other(format!(
+                                "internal error: audio init segment for {:?} was not prefetched",
+                                current_map_key
+                            )));
+                            break 'writer;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+            // 写入失败时整体回退到本次迭代之前的长度,不留半截数据污染续传。
+            let start_pos = written_bytes;
+            let mut chunk_total: i64 = 0;
+            let mut write_result: Result<(), std::io::Error> = Ok(());
+            'chunks: for chunk in init_chunk
+                .into_iter()
+                .chain(std::iter::once(data.as_slice()))
+            {
+                let mut offset = 0usize;
+                while offset < chunk.len() {
+                    let allowed = speed_limiter.consume((chunk.len() - offset) as u64).await;
+                    let end = offset + allowed as usize;
+                    if let Err(e) = file.write_all(&chunk[offset..end]).await {
+                        write_result = Err(e);
+                        break 'chunks;
+                    }
+                    offset = end;
+                }
+                chunk_total += chunk.len() as i64;
+            }
+            if let Err(e) = write_result {
+                if let Err(trunc_err) = file.set_len(start_pos as u64).await {
+                    log_info!(
+                        "[hls] task {} audio segment {} rollback set_len({}) failed: {}",
+                        task_id,
+                        seg_idx,
+                        start_pos,
+                        trunc_err
+                    );
+                }
+                cancel.cancel();
+                fatal = Some(write_failure(e));
+                break 'writer;
+            }
+
+            if init_chunk.is_some() {
+                last_written_map = current_map_key;
+            }
+            written_bytes += chunk_total;
+            written.store(written_bytes, Ordering::Relaxed);
+            next_to_write += 1;
+            let _ = db
+                .set_config(
+                    &track.resume_key,
+                    &format_resume_checkpoint(
+                        next_to_write,
+                        written_bytes,
+                        track.media_sequence,
+                        Some(&track.tag),
+                    ),
+                )
+                .await;
+        }
+    }
+
+    if fatal.is_some() {
+        cancel.cancel();
+    }
+    // 先关闭接收端再等 dispatcher:出错/取消路径上 writer 已停止 recv,
+    // 卡在 `send` 的生产者需要接收端关闭才能退出。
+    drop(result_rx);
+    let _ = dispatcher.await;
+    match fatal {
+        Some(e) => {
+            let _ = file.flush().await;
+            Err(e)
+        }
+        None => {
+            file.flush().await?;
+            Ok(written_bytes)
+        }
+    }
+}
+
+/// 把视频与音轨的 temp 文件用 ffmpeg 流复制封装成 mp4,占名落盘后清理两份 temp 与
+/// 续传检查点,返回 `(mp4 路径, mp4 字节数)`。
+///
+/// 产物先写 `<name>.mp4.fdownloading`,再按 [`claim_final_name`] 的不覆盖语义占名。
+/// 失败或取消时两份 temp 原样保留,由调用方回退(仅视频)或续传。
+async fn mux_video_audio(
+    p: &DownloadParams,
+    video_temp: &Path,
+    audio_temp: &Path,
+    actual_name: &str,
+    expected_bytes: i64,
+    ffmpeg: &Path,
+    video_resume_key: &str,
+) -> Result<(PathBuf, i64), DownloadError> {
+    let save_dir = Path::new(&p.save_dir);
+    let stem = Path::new(actual_name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    let desired = format!("{stem}.mp4");
+    let mux_tmp = save_dir.join(format!("{desired}{TEMP_EXT}"));
+    ffmpeg_copy_to_mp4(
+        video_temp,
+        Some(audio_temp),
+        &mux_tmp,
+        expected_bytes.max(0) as u64,
+        &p.cancel_token,
+        ffmpeg,
+    )
+    .await?;
+
+    let avoid = sibling_avoid(p).await;
+    let chosen =
+        match claim_final_name(&mux_tmp, save_dir, &desired, p.allow_overwrite, &avoid).await {
+            Ok(name) => name,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&mux_tmp).await;
+                return Err(e);
+            }
+        };
+    let mp4_path = save_dir.join(&chosen);
+    let mp4_size = tokio::fs::metadata(&mp4_path)
+        .await
+        .ok()
+        .and_then(|m| i64::try_from(m.len()).ok())
+        .unwrap_or(expected_bytes);
+    if let Err(e) =
+        p.db.update_task_file_info(&p.task_id, &chosen, mp4_size)
+            .await
+    {
+        // 任务记录仍指向 .ts,删除任务时不会清理这份 mp4:立即移除,temp 保留供重试。
+        let _ = tokio::fs::remove_file(&mp4_path).await;
+        return Err(DownloadError::Db(e));
+    }
+    let _ = tokio::fs::remove_file(video_temp).await;
+    let _ = tokio::fs::remove_file(audio_temp).await;
+    let _ = p.db.delete_config(video_resume_key).await;
+    let _ = p.db.delete_config(&audio_resume_key(&p.task_id)).await;
+    Ok((mp4_path, mp4_size))
 }
 
 // ---------------------------------------------------------------------------
@@ -3356,5 +4122,372 @@ v360.m3u8\n\
         let message = stalled_segment_error(false).await?;
         assert!(message.contains("stalled"), "{message}");
         Ok(())
+    }
+
+    #[test]
+    fn audio_track_tag_ignores_signed_query() {
+        assert_eq!(
+            super::audio_track_tag("https://cdn.example.com/a/en.m3u8?token=aaa&exp=1"),
+            super::audio_track_tag("https://cdn.example.com/a/en.m3u8?token=bbb&exp=2")
+        );
+        assert_ne!(
+            super::audio_track_tag("https://cdn.example.com/a/en.m3u8"),
+            super::audio_track_tag("https://cdn.example.com/a/fr.m3u8")
+        );
+    }
+
+    #[test]
+    fn write_failure_reports_full_disk_as_actionable_error() {
+        let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        match super::write_failure(full) {
+            DownloadError::Other(message) => assert!(message.contains("磁盘空间不足")),
+            other => panic!("expected Other, got {other}"),
+        }
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(super::write_failure(denied), DownloadError::Io(_)));
+    }
+
+    /// 按路径返回固定 body 的服务器(404 兜底),记录收到的请求路径。
+    async fn static_server(
+        routes: Vec<(&'static str, Vec<u8>)>,
+    ) -> Result<
+        (
+            std::net::SocketAddr,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        ),
+        std::io::Error,
+    > {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let served = std::sync::Arc::clone(&hits);
+        let routes = std::sync::Arc::new(routes);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let routes = std::sync::Arc::clone(&routes);
+                let served = std::sync::Arc::clone(&served);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let Ok(n) = socket.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    let path = request
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_owned();
+                    if let Ok(mut hits) = served.lock() {
+                        hits.push(path.clone());
+                    }
+                    let body = routes
+                        .iter()
+                        .find(|(route, _)| *route == path)
+                        .map(|(_, body)| body.clone());
+                    let response = match body {
+                        Some(body) => {
+                            let mut response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            response.extend(body);
+                            response
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    };
+                    let _ = socket.write_all(&response).await;
+                });
+            }
+        });
+        Ok((address, hits))
+    }
+
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_hls_{tag}_{}_{nanos}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    const AUDIO_SEGMENTS: [&[u8]; 3] = [b"AAAA-0000", b"BBBB-1111-22", b"CCCC-3"];
+
+    /// 以固定的 3 段音轨跑一次 `run_audio_track`,返回 `(总字节, 进度原子值)`。
+    async fn run_audio_fixture(
+        address: std::net::SocketAddr,
+        temp_path: &std::path::Path,
+        db: &crate::db::Db,
+        is_resume: bool,
+    ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        let playlist_url = format!("http://{address}/audio/index.m3u8");
+        let segments = (0..AUDIO_SEGMENTS.len())
+            .map(|i| super::HlsSegment {
+                uri: format!("http://{address}/audio/seg{i}.ts"),
+                duration: 1.0,
+                key: None,
+                byte_range: None,
+                discontinuity: false,
+                map: None,
+            })
+            .collect();
+        let written = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+        let run = super::AudioRun {
+            track: super::AudioTrack {
+                segments,
+                media_sequence: 0,
+                playlist_url: playlist_url.clone(),
+                temp_path: temp_path.to_path_buf(),
+                resume_key: super::audio_resume_key("t-audio"),
+                tag: super::audio_track_tag(&playlist_url),
+            },
+            client: reqwest::Client::builder().no_proxy().build()?,
+            cookies: String::new(),
+            referrer: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            header_origin_url: playlist_url,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            task_id: "t-audio".to_owned(),
+            db: db.clone(),
+            sink: std::sync::Arc::new(crate::NoopSink),
+            speed_limiter: crate::speed_limiter::SpeedLimiter::new(0),
+            key_cache: std::sync::Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            tracker: super::TransferTracker::new(),
+            written: std::sync::Arc::clone(&written),
+            segment_limit: 2,
+            is_resume,
+        };
+        let total = super::run_audio_track(run).await?;
+        Ok((total, written.load(std::sync::atomic::Ordering::Relaxed)))
+    }
+
+    fn audio_routes() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("/audio/seg0.ts", AUDIO_SEGMENTS[0].to_vec()),
+            ("/audio/seg1.ts", AUDIO_SEGMENTS[1].to_vec()),
+            ("/audio/seg2.ts", AUDIO_SEGMENTS[2].to_vec()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn audio_track_is_written_in_order_with_progress()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, hits) = static_server(audio_routes()).await?;
+        let dir = scratch_dir("audio_order");
+        let temp = dir.join("clip.audio.m4a.fdownloading");
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+
+        let (total, progress) = run_audio_fixture(address, &temp, &db, false).await?;
+
+        let expected: Vec<u8> = AUDIO_SEGMENTS.concat();
+        assert_eq!(std::fs::read(&temp)?, expected);
+        assert_eq!(total, expected.len() as i64);
+        assert_eq!(progress, expected.len() as i64);
+        assert_eq!(hits.lock().map(|h| h.len()).unwrap_or_default(), 3);
+        let checkpoint = db
+            .get_config(&super::audio_resume_key("t-audio"))
+            .await?
+            .unwrap_or_default();
+        assert!(
+            checkpoint.starts_with(&format!("3:{}:0:", expected.len())),
+            "{checkpoint}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audio_track_resumes_from_checkpoint_and_drops_partial_tail()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, hits) = static_server(audio_routes()).await?;
+        let dir = scratch_dir("audio_resume");
+        let temp = dir.join("clip.audio.m4a.fdownloading");
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+
+        // 前两段已完整落盘,第三段写了半截垃圾(崩溃残留)。
+        let prefix: Vec<u8> = AUDIO_SEGMENTS[..2].concat();
+        let mut on_disk = prefix.clone();
+        on_disk.extend_from_slice(b"CC");
+        std::fs::write(&temp, &on_disk)?;
+        let playlist_url = format!("http://{address}/audio/index.m3u8");
+        db.set_config(
+            &super::audio_resume_key("t-audio"),
+            &super::format_resume_checkpoint(
+                2,
+                prefix.len() as i64,
+                0,
+                Some(&super::audio_track_tag(&playlist_url)),
+            ),
+        )
+        .await?;
+
+        let (total, _) = run_audio_fixture(address, &temp, &db, true).await?;
+
+        let expected: Vec<u8> = AUDIO_SEGMENTS.concat();
+        assert_eq!(std::fs::read(&temp)?, expected);
+        assert_eq!(total, expected.len() as i64);
+        let requested = hits.lock().map(|h| h.clone()).unwrap_or_default();
+        assert_eq!(requested, vec!["/audio/seg2.ts".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn audio_track_restarts_when_checkpoint_belongs_to_another_rendition()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, hits) = static_server(audio_routes()).await?;
+        let dir = scratch_dir("audio_other");
+        let temp = dir.join("clip.audio.m4a.fdownloading");
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+
+        let prefix: Vec<u8> = AUDIO_SEGMENTS[..2].concat();
+        std::fs::write(&temp, &prefix)?;
+        db.set_config(
+            &super::audio_resume_key("t-audio"),
+            &super::format_resume_checkpoint(
+                2,
+                prefix.len() as i64,
+                0,
+                Some(&super::audio_track_tag("https://other.example.com/fr.m3u8")),
+            ),
+        )
+        .await?;
+
+        let (total, _) = run_audio_fixture(address, &temp, &db, true).await?;
+
+        // 磁盘前缀属于另一条音轨:不能拼接,必须整条重下。
+        let expected: Vec<u8> = AUDIO_SEGMENTS.concat();
+        assert_eq!(std::fs::read(&temp)?, expected);
+        assert_eq!(total, expected.len() as i64);
+        assert_eq!(hits.lock().map(|h| h.len()).unwrap_or_default(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unusable_ffmpeg_is_not_reported_available() {
+        assert!(
+            !crate::dash_downloader::ffmpeg_usable(std::path::Path::new(
+                "/nonexistent/dir/ffmpeg-does-not-exist"
+            ))
+            .await
+        );
+    }
+
+    /// 用 `FLUXDOWN_TEST_FFMPEG` 指向的真实 ffmpeg 生成 1 秒测试 TS;未设置返回 `None`
+    /// (CI 无 ffmpeg 时跳过真实执行)。
+    fn ffmpeg_fixture(
+        dir: &std::path::Path,
+        name: &str,
+        streams: &[&str],
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let ffmpeg = std::path::PathBuf::from(std::env::var("FLUXDOWN_TEST_FFMPEG").ok()?);
+        let out = dir.join(name);
+        let mut cmd = std::process::Command::new(&ffmpeg);
+        cmd.args(["-y", "-loglevel", "error"]);
+        for stream in streams {
+            match *stream {
+                "video" => {
+                    cmd.args(["-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=1"]);
+                }
+                _ => {
+                    cmd.args(["-f", "lavfi", "-i", "sine=frequency=440:duration=1"]);
+                }
+            }
+        }
+        for (i, stream) in streams.iter().enumerate() {
+            let codec = if *stream == "video" { "-c:v" } else { "-c:a" };
+            let name = if *stream == "video" { "mpeg4" } else { "aac" };
+            cmd.args(["-map", &format!("{i}"), codec, name]);
+        }
+        let status = cmd.args(["-f", "mpegts"]).arg(&out).status().ok()?;
+        status.success().then_some((ffmpeg, out))
+    }
+
+    fn probe_streams(ffmpeg: &std::path::Path, file: &std::path::Path) -> String {
+        let output = std::process::Command::new(ffmpeg)
+            .arg("-i")
+            .arg(file)
+            .output();
+        output
+            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn remux_streams_ts_into_mp4_when_ffmpeg_is_available() {
+        let dir = scratch_dir("remux_ffmpeg");
+        let Some((ffmpeg, ts)) = ffmpeg_fixture(&dir, "clip.ts", &["video", "audio"]) else {
+            eprintln!("[skip] 未设置 FLUXDOWN_TEST_FFMPEG，跳过真实 ffmpeg remux");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let mp4 =
+            super::remux_ts_to_mp4(&ts, "t", false, false, Some(ffmpeg.as_path()), &cancel).await;
+
+        let Some(mp4) = mp4 else {
+            panic!("ffmpeg remux must produce an mp4");
+        };
+        let Ok(bytes) = std::fs::read(&mp4) else {
+            panic!("read mp4");
+        };
+        assert_eq!(&bytes[4..8], b"ftyp");
+        assert!(ts.exists(), "remux 不删除源 .ts,由调用方在落库后清理");
+        let probe = probe_streams(&ffmpeg, &mp4);
+        assert!(
+            probe.contains("Video:") && probe.contains("Audio:"),
+            "{probe}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_copy_merges_separate_audio_into_video() {
+        let dir = scratch_dir("mux_ffmpeg");
+        let Some((ffmpeg, video)) = ffmpeg_fixture(&dir, "video.ts", &["video"]) else {
+            eprintln!("[skip] 未设置 FLUXDOWN_TEST_FFMPEG，跳过真实 ffmpeg mux");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let Some((_, audio)) = ffmpeg_fixture(&dir, "audio.ts", &["audio"]) else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let out = dir.join("merged.mp4.fdownloading");
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let result = crate::dash_downloader::ffmpeg_copy_to_mp4(
+            &video,
+            Some(audio.as_path()),
+            &out,
+            1024,
+            &cancel,
+            &ffmpeg,
+        )
+        .await;
+
+        assert!(result.is_ok(), "{result:?}");
+        let Ok(bytes) = std::fs::read(&out) else {
+            panic!("read merged");
+        };
+        assert_eq!(&bytes[4..8], b"ftyp");
+        let probe = probe_streams(&ffmpeg, &out);
+        assert!(
+            probe.contains("Video:") && probe.contains("Audio:"),
+            "{probe}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

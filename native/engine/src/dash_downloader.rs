@@ -136,6 +136,12 @@ pub async fn run_dash_download(params: DownloadParams) {
                     &db_error,
                 );
             }
+            // 完成期改名可能让最终文件名偏离起飞时的名字（占名冲突换名），
+            // 以 DB 为准随完成信号上报（空串 = 保持原名）。
+            let final_file_name = match params.db.load_task_by_id(&params.task_id).await {
+                Ok(Some(t)) => t.file_name,
+                _ => String::new(),
+            };
             let _ = params
                 .progress_tx
                 .send(ProgressUpdate {
@@ -144,7 +150,7 @@ pub async fn run_dash_download(params: DownloadParams) {
                     total_bytes: total,
                     status: 3,
                     error_message: String::new(),
-                    file_name: String::new(),
+                    file_name: final_file_name,
                     segment_details: None,
                     ..Default::default()
                 })
@@ -193,8 +199,107 @@ pub async fn run_dash_download(params: DownloadParams) {
 }
 
 /// mux 使用的 ffmpeg 路径：manager 解析注入的组件路径，缺省回退 PATH 名。
-fn effective_ffmpeg(p: &DownloadParams) -> &Path {
+pub(crate) fn effective_ffmpeg(p: &DownloadParams) -> &Path {
     p.ffmpeg_path.as_deref().unwrap_or(Path::new("ffmpeg"))
+}
+
+/// `ffmpeg -version` 能在 5 秒内正常退出即视为可用。
+///
+/// 用于在下载开始前决定是否值得下载独立音轨 / 走 ffmpeg 流复制——可用性在
+/// 收尾阶段才暴露会白白浪费整条音轨的流量。
+pub(crate) async fn ffmpeg_usable(ffmpeg: &Path) -> bool {
+    let mut cmd = tokio::process::Command::new(ffmpeg);
+    crate::proc::no_console_window(&mut cmd);
+    let run = cmd
+        .arg("-version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .status();
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), run).await,
+        Ok(Ok(status)) if status.success()
+    )
+}
+
+/// ffmpeg 流复制（`-c copy`，不转码）封装 mp4，写到 `output`。
+///
+/// - `audio = Some`：取 `video` 的首个视频流与 `audio` 的首个音频流；
+/// - `audio = None`：取 `video` 的全部视频与音频流（丢弃 TS 里 ffmpeg mp4 muxer
+///   不支持的 data/字幕流）。
+///
+/// 输出格式显式指定为 mp4，`output` 可以使用任意临时扩展名。失败或取消时清理
+/// `output`。`expected_bytes` 为产物预估大小，用于 ENOSPC 预检：mux 期间输入与
+/// 产物并存，峰值 ≈ 2x，空间不足时提前返回 Err，由调用方走各自的降级路径。
+pub(crate) async fn ffmpeg_copy_to_mp4(
+    video: &Path,
+    audio: Option<&Path>,
+    output: &Path,
+    expected_bytes: u64,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    ffmpeg: &Path,
+) -> Result<(), DownloadError> {
+    use tokio::process::Command;
+
+    // ENOSPC 预检:None(网络盘/超时,无法探测)乐观放行——预检是优化,
+    // 安全网是下方既有的 ffmpeg 失败清理路径。
+    if let Some(parent) = output.parent() {
+        let avail = crate::disk_space::available_space_checked(parent.to_path_buf()).await;
+        if let Some(a) = avail
+            && a < expected_bytes.saturating_add(crate::disk_space::PRECHECK_MARGIN)
+        {
+            return Err(DownloadError::Other(format!(
+                "insufficient disk space for mux: need ~{expected_bytes}B + margin, have {a}B"
+            )));
+        }
+    }
+
+    let mut cmd = Command::new(ffmpeg);
+    crate::proc::no_console_window(&mut cmd);
+    cmd.arg("-y").arg("-i").arg(video);
+    if let Some(audio) = audio {
+        cmd.arg("-i").arg(audio);
+        cmd.args(["-map", "0:v:0", "-map", "1:a:0"]);
+    } else {
+        cmd.args(["-map", "0:v?", "-map", "0:a?"]);
+    }
+    // `.kill_on_drop(true)` ensures if we're cancelled (select! drops the
+    // future), the child process is killed automatically.
+    let output_fut = cmd
+        .args(["-c", "copy", "-movflags", "+faststart", "-f", "mp4"])
+        .arg(output)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .output();
+
+    let result: std::process::Output = tokio::select! {
+        _ = cancel_token.cancelled() => {
+            // The future is dropped here; kill_on_drop ensures the child is killed.
+            let _ = tokio::fs::remove_file(output).await;
+            return Err(DownloadError::Cancelled);
+        }
+        o = output_fut => match o {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(output).await;
+                return Err(DownloadError::Other(format!("failed to run ffmpeg: {e}")));
+            }
+        },
+    };
+
+    if !result.status.success() {
+        let _ = tokio::fs::remove_file(output).await;
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        return Err(DownloadError::Other(format!(
+            "ffmpeg exited with {}: {}",
+            result.status,
+            stderr.chars().take(500).collect::<String>()
+        )));
+    }
+    Ok(())
 }
 
 /// Attempt to mux separate audio and video files into a single MP4 using ffmpeg.
@@ -218,75 +323,17 @@ async fn mux_audio_video(
     cancel_token: &tokio_util::sync::CancellationToken,
     ffmpeg: &Path,
 ) -> Result<(), DownloadError> {
-    use tokio::process::Command;
-
     // Build a temporary output path to avoid overwriting the video while muxing
     let muxed_tmp = video_path.with_extension("muxed.mp4");
-
-    // ENOSPC 预检:None(网络盘/超时,无法探测)乐观放行——预检是优化,
-    // 安全网是下方既有的 ffmpeg 失败清理路径。
-    if let Some(parent) = video_path.parent() {
-        let avail = crate::disk_space::available_space_checked(parent.to_path_buf()).await;
-        if let Some(a) = avail
-            && a < expected_bytes.saturating_add(crate::disk_space::PRECHECK_MARGIN)
-        {
-            return Err(DownloadError::Other(format!(
-                "insufficient disk space for mux: need ~{expected_bytes}B + margin, have {a}B"
-            )));
-        }
-    }
-
-    let video_str = video_path.to_string_lossy().to_string();
-    let audio_str = audio_path.to_string_lossy().to_string();
-    let muxed_str = muxed_tmp.to_string_lossy().to_string();
-
-    // Spawn ffmpeg with -c copy (stream copy, no re-encoding).
-    // `.kill_on_drop(true)` ensures if we're cancelled (select! drops the
-    // future), the child process is killed automatically.
-    let mut cmd = Command::new(ffmpeg);
-    crate::proc::no_console_window(&mut cmd);
-    let output_fut = cmd
-        .args([
-            "-y", // overwrite output without asking
-            "-i",
-            &video_str,
-            "-i",
-            &audio_str,
-            "-map",
-            "0:v:0", // select first video stream from first input
-            "-map",
-            "1:a:0", // select first audio stream from second input
-            "-c",
-            "copy", // stream copy, no re-encoding
-            "-movflags",
-            "+faststart", // web-optimized MP4
-            &muxed_str,
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .output();
-
-    let output: std::process::Output = tokio::select! {
-        _ = cancel_token.cancelled() => {
-            // The future is dropped here; kill_on_drop ensures the child is killed.
-            // Clean up the partial muxed temp file.
-            let _ = tokio::fs::remove_file(&muxed_tmp).await;
-            return Err(DownloadError::Cancelled);
-        }
-        o = output_fut => o.map_err(|e| DownloadError::Other(format!("failed to run ffmpeg: {}", e)))?,
-    };
-
-    if !output.status.success() {
-        // Clean up the partial muxed file
-        let _ = tokio::fs::remove_file(&muxed_tmp).await;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(DownloadError::Other(format!(
-            "ffmpeg exited with {}: {}",
-            output.status,
-            stderr.chars().take(500).collect::<String>()
-        )));
-    }
+    ffmpeg_copy_to_mp4(
+        video_path,
+        Some(audio_path),
+        &muxed_tmp,
+        expected_bytes,
+        cancel_token,
+        ffmpeg,
+    )
+    .await?;
 
     // Replace the original video-only file with the muxed version
     if let Err(e) = tokio::fs::rename(&muxed_tmp, video_path).await {
@@ -461,7 +508,7 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         geometry: Vec::new(),
     };
 
-    let video_bytes = download_track(
+    let (video_bytes, dest_path) = download_track(
         p,
         &p.url,
         &video_init,
@@ -469,6 +516,7 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         &dest_path,
         &mut progress_state,
         Some(DashTrack::Video),
+        DashTrack::Video,
     )
     .await?;
 
@@ -505,10 +553,11 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
                     &audio_path,
                     &mut progress_state,
                     Some(DashTrack::Audio),
+                    DashTrack::Audio,
                 )
                 .await
                 {
-                    Ok(bytes) => bytes,
+                    Ok((bytes, _)) => bytes,
                     Err(e) => {
                         // 音频轨失败/暂停时保留其 .fdownloading 与检查点供续传;
                         // 不要在此删除最终 audio_path——rename 未发生时它尚不存在,
@@ -623,17 +672,20 @@ async fn download_track_best_effort(
     url: &str,
     single_segs: &[DashSegment],
     dest_path: &Path,
+    role: DashTrack,
     track_len: Option<i64>,
     progress_base: i64,
     pair_total: i64,
     progress_state: &mut ProgressState,
-) -> Result<i64, DownloadError> {
+) -> Result<(i64, PathBuf), DownloadError> {
     if let Some(len) = track_len
         && len > MULTI_SEGMENT_TRACK_THRESHOLD
         && p.spec.is_get_like()
     {
-        match download_track_coordinated(p, url, dest_path, len, progress_base, pair_total).await {
-            Ok(n) => return Ok(n),
+        match download_track_coordinated(p, url, dest_path, role, len, progress_base, pair_total)
+            .await
+        {
+            Ok(done) => return Ok(done),
             // 与 HTTP 路径相同的三类"多段不可行"错误 → 清理多段残留（段行 +
             // 预分配临时文件）后回退单流；其余错误（取消/IO/磁盘满等）原样上抛
             // ——取消时段行与临时文件由 coordinated 路径【保留】以支持真续传。
@@ -678,7 +730,17 @@ async fn download_track_best_effort(
         // 非 GET 的画质切换残留），防止暂停/重启时渲染陈旧分布。
         let _ = p.db.delete_segments(&p.task_id).await;
     }
-    download_track(p, url, &None, single_segs, dest_path, progress_state, None).await
+    download_track(
+        p,
+        url,
+        &None,
+        single_segs,
+        dest_path,
+        progress_state,
+        None,
+        role,
+    )
+    .await
 }
 
 /// 用 segment_coordinator 多段并发下载一条完整轨道（IDM 式动态分段 + 分布图）。
@@ -699,10 +761,11 @@ async fn download_track_coordinated(
     p: &DownloadParams,
     url: &str,
     dest_path: &Path,
+    role: DashTrack,
     track_len: i64,
     progress_base: i64,
     pair_total: i64,
-) -> Result<i64, DownloadError> {
+) -> Result<(i64, PathBuf), DownloadError> {
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
 
     let seg_count = if p.segment_count > 0 {
@@ -772,14 +835,85 @@ async fn download_track_coordinated(
         Ok(final_total) => {
             // 本轨完成：段行使命结束，清掉（下一轨/完成态不再引用）。
             let _ = p.db.delete_segments(&p.task_id).await;
-            tokio::fs::rename(&temp_path, dest_path).await?;
-            Ok(final_total)
+            let final_path = finalize_track_rename(p, &temp_path, dest_path, role).await?;
+            Ok((final_total, final_path))
         }
         // 取消 = 暂停：保留段行 + 临时文件，resume 经 coordinator
         // resume-from-rows 真续传（ephemeral 直链过期无妨——resume 重新
         // resolve 拿新 URL，字节区间对同一内容仍有效）。
         Err(e) => Err(e),
     }
+}
+
+/// 轨道完成落盘：`temp` → `dest`，返回实际落盘路径。
+///
+/// - 视频轨是对外可见的最终文件：按 [`crate::downloader::claim_final_name`] 的
+///   `create_new` 占名不覆盖同名旧文件；原名被占时 dedup 换名并把新文件名写回 DB
+///   （完成信号随后上报）。`allow_overwrite`（覆盖策略）或 `is_resume`（原名上的
+///   文件是本任务续传遗留）时对原名删除旧文件后重试一次。
+/// - 音频轨是内部 sidecar（`build_audio_path`），归属本任务：替换遗留同名文件。
+async fn finalize_track_rename(
+    p: &DownloadParams,
+    temp: &Path,
+    dest: &Path,
+    role: DashTrack,
+) -> Result<PathBuf, DownloadError> {
+    let rename_failed = |e: std::io::Error| {
+        DownloadError::Other(format!(
+            "failed to rename {} -> {}: {}",
+            temp.display(),
+            dest.display(),
+            e
+        ))
+    };
+    if role == DashTrack::Audio {
+        if tokio::fs::metadata(dest).await.is_ok() {
+            let _ = tokio::fs::remove_file(dest).await;
+        }
+        crate::downloader::claim_rename(temp, dest)
+            .await
+            .map_err(rename_failed)?;
+        return Ok(dest.to_path_buf());
+    }
+
+    let (Some(save_dir), Some(name)) = (dest.parent(), dest.file_name().and_then(|n| n.to_str()))
+    else {
+        return Err(DownloadError::Other(format!(
+            "invalid destination path: {}",
+            dest.display()
+        )));
+    };
+    let avoid: std::collections::HashSet<String> =
+        p.db.list_active_sibling_file_names(&p.save_dir, &p.task_id)
+            .await
+            .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
+            .unwrap_or_default();
+    let chosen = crate::downloader::claim_final_name(
+        temp,
+        save_dir,
+        name,
+        p.allow_overwrite || p.is_resume,
+        &avoid,
+    )
+    .await?;
+    if chosen == name {
+        return Ok(dest.to_path_buf());
+    }
+    log_info!(
+        "[dash-download] task {} destination '{}' is taken; finalized as '{}'",
+        p.task_id,
+        name,
+        chosen
+    );
+    if let Err(e) = p.db.set_task_file_name(&p.task_id, &chosen).await {
+        log_info!(
+            "[dash-download] task {} failed to persist renamed file '{}': {}",
+            p.task_id,
+            chosen,
+            e
+        );
+    }
+    Ok(save_dir.join(chosen))
 }
 
 /// 离散音视频轨对下载旁路：`p.url` 为视频轨、`audio_url` 为音频轨，两条均为
@@ -897,7 +1031,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
         None => false,
     };
 
-    let video_bytes = if video_done {
+    let (video_bytes, dest_path) = if video_done {
         let v = video_len.unwrap_or(0);
         log_info!(
             "[dash-download] task {} video track already complete ({} bytes) — skipping",
@@ -924,13 +1058,14 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
                 ..Default::default()
             })
             .await;
-        v
+        (v, dest_path)
     } else {
         download_track_best_effort(
             p,
             &p.url,
             &video_seg,
             &dest_path,
+            DashTrack::Video,
             video_len,
             0,
             total_bytes,
@@ -979,12 +1114,14 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
             audio_url,
             &audio_seg,
             &audio_path,
+            DashTrack::Audio,
             audio_len,
             video_bytes,
             total_bytes,
             &mut progress_state,
         )
         .await?
+        .0
     };
     // 终态校准：任务级总大小 = 两轨实际字节合计。coordinator 的任务级写入已被
     // owns_task_total=false 门控，此处是唯一权威落点——同时兜住「探测失败、
@@ -1941,6 +2078,7 @@ fn segments_fingerprint(init_seg: &Option<DashSegment>, media_segs: &[DashSegmen
 
 /// `resume_track = Some(_)`(MPD 路径)时按段持久化检查点,暂停/出错后保留
 /// 临时文件供续传;`None`(轨对单流回退)保持出错即清理的旧行为。
+#[allow(clippy::too_many_arguments)]
 async fn download_track(
     p: &DownloadParams,
     reference_url: &str,
@@ -1949,7 +2087,8 @@ async fn download_track(
     dest_path: &Path,
     progress_state: &mut ProgressState,
     resume_track: Option<DashTrack>,
-) -> Result<i64, DownloadError> {
+    role: DashTrack,
+) -> Result<(i64, PathBuf), DownloadError> {
     // 薄包装: 计算临时文件路径;无检查点的轨道在内部任意错误路径(取消/分段
     // 失败/flush/rename)退出后统一 best-effort 异步清理 .fdownloading 临时文件,
     // 避免泄漏。带检查点的轨道保留它:检查点只记录已完整落盘的段,续传时
@@ -1964,6 +2103,7 @@ async fn download_track(
         &temp_path,
         progress_state,
         resume_track,
+        role,
     )
     .await;
     if result.is_err() && resume_track.is_none() {
@@ -1982,7 +2122,8 @@ async fn download_track_inner(
     temp_path: &Path,
     progress_state: &mut ProgressState,
     resume_track: Option<DashTrack>,
-) -> Result<i64, DownloadError> {
+    role: DashTrack,
+) -> Result<(i64, PathBuf), DownloadError> {
     output::ensure_parent(temp_path).await?;
 
     let fingerprint = segments_fingerprint(init_seg, media_segs);
@@ -2007,7 +2148,7 @@ async fn download_track_inner(
                     .and_then(|m| i64::try_from(m.len()).ok());
                 if on_disk == Some(*bytes) {
                     progress_state.downloaded_bytes += *bytes;
-                    return Ok(*bytes);
+                    return Ok((*bytes, dest_path.to_path_buf()));
                 }
             }
             Some(TrackProgress::Partial {
@@ -2149,18 +2290,7 @@ async fn download_track_inner(
     file.flush().await?;
     drop(file);
 
-    if tokio::fs::metadata(dest_path).await.is_ok() {
-        let _ = tokio::fs::remove_file(dest_path).await;
-    }
-
-    tokio::fs::rename(temp_path, dest_path).await.map_err(|e| {
-        DownloadError::Other(format!(
-            "failed to rename {} -> {}: {}",
-            temp_path.display(),
-            dest_path.display(),
-            e
-        ))
-    })?;
+    let final_path = finalize_track_rename(p, temp_path, dest_path, role).await?;
 
     if let Some(track) = resume_track {
         checkpoint.set(
@@ -2173,7 +2303,7 @@ async fn download_track_inner(
         save_dash_checkpoint(p, &checkpoint).await;
     }
 
-    Ok(total_track)
+    Ok((total_track, final_path))
 }
 
 #[allow(clippy::too_many_arguments)]

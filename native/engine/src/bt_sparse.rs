@@ -14,6 +14,7 @@
 //! 无害的 sparse 属性；同卷 rename 保留该属性，跨卷 copy 落成普通文件。
 //!
 //! ext4 / APFS 的 `set_len` 天然稀疏，非 Windows 平台不编译本模块。
+//! `mark_sparse` 同时供 HTTP 多段下载预分配临时文件时复用（同一 VDL 机制）。
 //!
 //! 代价与取舍：sparse 文件放弃了「预分配即占位」带来的两个次要收益——
 //! 提前暴露 ENOSPC（改为写入时逐 piece 暴露，librqbit 按致命错误处理，
@@ -137,7 +138,7 @@ impl TorrentStorage for SparseFsStorage {
 ///
 /// `FSCTL_SET_SPARSE` 不带输入缓冲区即「置位」。属性是文件级持久标记：
 /// 之后的 `set_len` 扩展不预留簇，任意偏移写入没有 VDL 零填充。
-fn mark_sparse(path: &Path) -> std::io::Result<()> {
+pub(crate) fn mark_sparse(path: &Path) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
     use windows_sys::Win32::System::IO::DeviceIoControl;

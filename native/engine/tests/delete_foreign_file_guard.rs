@@ -185,3 +185,113 @@ async fn restart_never_started_task_keeps_foreign_file() {
     assert_eq!(content, FOREIGN_CONTENT);
     let _ = tokio::fs::remove_dir_all(&work).await;
 }
+
+/// 两条任务的 `file_name` 指向同一磁盘名：删除其中已完成的一条（含文件）时，
+/// 不得带走另一条任务登记的同名文件；另一条删除后该文件才归它自己处置。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_files_keeps_file_named_by_another_task() {
+    let work = std::env::temp_dir().join(format!("fluxdown-delguard-shared-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let save_dir = work.to_string_lossy().into_owned();
+    let shared = work.join("e.bin");
+    tokio::fs::write(&shared, b"claimed by two tasks")
+        .await
+        .expect("seed file");
+
+    let mut engine = make_engine(&work).await;
+    let completed = create_later_task(&mut engine, &save_dir, "e.bin").await;
+    let other = create_later_task(&mut engine, &save_dir, "e.bin").await;
+    for id in [&completed, &other] {
+        let row = engine
+            .db
+            .load_task_by_id(id)
+            .await
+            .expect("db")
+            .expect("row");
+        assert_eq!(row.file_name, "e.bin", "precondition: names must collide");
+    }
+    engine
+        .db
+        .update_task_status(&completed, 3, "")
+        .await
+        .expect("mark completed");
+
+    engine.manager.delete_task(&completed, true).await;
+    assert!(
+        shared.exists(),
+        "file still named by another task must survive"
+    );
+
+    // 批量删除同一批内的两条同名任务：都在本批内，文件归它们，照常清除。
+    let third = create_later_task(&mut engine, &save_dir, "e.bin").await;
+    engine
+        .db
+        .update_task_status(&third, 3, "")
+        .await
+        .expect("mark completed");
+    engine
+        .manager
+        .delete_tasks_batch(&[other, third], true)
+        .await;
+    assert!(
+        !shared.exists(),
+        "file named only by deleted tasks is removed with delete_files=true"
+    );
+    let _ = tokio::fs::remove_dir_all(&work).await;
+}
+
+/// HLS 任务的独立音轨 sidecar（`<stem>.audio.m4a`）及其 `.fdownloading` 临时文件，
+/// 与断点 config 行一起在「删除任务并删除文件」时被清理。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_files_removes_hls_audio_sidecar_and_checkpoints() {
+    let work = std::env::temp_dir().join(format!("fluxdown-delguard-hls-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let save_dir = work.to_string_lossy().into_owned();
+    let video = work.join("show.ts");
+    let audio = work.join("show.audio.m4a");
+    let audio_temp = work.join("show.audio.m4a.fdownloading");
+    for path in [&video, &audio, &audio_temp] {
+        tokio::fs::write(path, b"x").await.expect("seed file");
+    }
+
+    let mut engine = make_engine(&work).await;
+    let id = engine
+        .manager
+        .create_task(NewTaskSpec {
+            url: "http://127.0.0.1:1/show.m3u8".to_string(),
+            save_dir: save_dir.clone(),
+            file_name: "show.ts".to_string(),
+            start_paused: true,
+            ..Default::default()
+        })
+        .await
+        .expect("create hls task");
+    engine
+        .db
+        .update_task_status(&id, 3, "")
+        .await
+        .expect("mark completed");
+    engine
+        .db
+        .set_config(&format!("hls_resume_{id}"), "{}")
+        .await
+        .expect("video checkpoint");
+    engine
+        .db
+        .set_config(&format!("hls_audio_resume_{id}"), "{}")
+        .await
+        .expect("audio checkpoint");
+
+    engine.manager.delete_task(&id, true).await;
+
+    assert!(!video.exists(), "video product must be removed");
+    assert!(!audio.exists(), "hls audio sidecar must be removed");
+    assert!(!audio_temp.exists(), "hls audio temp must be removed");
+    for key in [format!("hls_resume_{id}"), format!("hls_audio_resume_{id}")] {
+        assert!(
+            engine.db.get_config(&key).await.expect("config").is_none(),
+            "{key} must be cleaned with the task"
+        );
+    }
+    let _ = tokio::fs::remove_dir_all(&work).await;
+}

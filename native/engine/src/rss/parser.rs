@@ -38,6 +38,9 @@ pub struct ParsedItem {
     pub link: String,
     /// enclosure 直链（`.torrent`/媒体直链；空 = 无 enclosure）。
     pub enclosure_url: String,
+    /// 下载目标声明的 MIME 类型（小写、不含参数；空 = 未声明）。来源优先级同
+    /// enclosure 直链：enclosure / media:content，其次是回退链接的 `type`。
+    pub enclosure_type: String,
     /// 可选二段解析标识；非空时由核心把条目 link 交给对应 resolver。
     pub resolver_item: String,
     /// enclosure 声明大小（字节，0 = 未知）。
@@ -142,7 +145,7 @@ pub fn parse_feed(bytes: &[u8]) -> Result<ParsedFeed, String> {
 }
 
 fn map_entry(entry: &Entry) -> ParsedItem {
-    let (enclosure_url, enclosure_length) = extract_enclosure(entry);
+    let (enclosure_url, enclosure_length, enclosure_mime) = extract_enclosure(entry);
     let link = entry
         .links
         .iter()
@@ -165,11 +168,26 @@ fn map_entry(entry: &Entry) -> ParsedItem {
         Some(_) => sha256_hex(&title),
     };
 
+    let enclosure_type = if enclosure_url.is_empty() {
+        // 没有 enclosure 时下载回退到条目链接：声明在该链接上的类型才是目标类型。
+        entry
+            .links
+            .iter()
+            .find(|l| l.rel.as_deref() != Some("enclosure"))
+            .or_else(|| entry.links.first())
+            .and_then(|l| l.media_type.as_deref())
+            .map(normalize_mime)
+            .unwrap_or_default()
+    } else {
+        enclosure_mime
+    };
+
     ParsedItem {
         guid,
         title,
         link,
         enclosure_url,
+        enclosure_type,
         resolver_item: String::new(),
         enclosure_length,
         pub_date: entry
@@ -333,12 +351,12 @@ fn local_timestamp(naive: NaiveDateTime) -> i64 {
         .unwrap_or(0)
 }
 
-/// 取 enclosure 直链与大小。
+/// 取 enclosure 直链、大小与声明的 MIME 类型。
 ///
 /// 两种来源都要覆盖：
 /// - RSS 2.0 的 `<enclosure>` 被 feed-rs 归一成 media RSS 的 `MediaContent`；
-/// - Atom 用 `<link rel="enclosure" length="…">`。
-fn extract_enclosure(entry: &Entry) -> (String, i64) {
+/// - Atom 用 `<link rel="enclosure" length="…" type="…">`。
+fn extract_enclosure(entry: &Entry) -> (String, i64, String) {
     if let Some(content) = entry
         .media
         .iter()
@@ -349,6 +367,11 @@ fn extract_enclosure(entry: &Entry) -> (String, i64) {
         return (
             url.to_string(),
             content.size.unwrap_or(0).min(i64::MAX as u64) as i64,
+            content
+                .content_type
+                .as_ref()
+                .map(|m| normalize_mime(m.as_ref()))
+                .unwrap_or_default(),
         );
     }
     entry
@@ -359,9 +382,22 @@ fn extract_enclosure(entry: &Entry) -> (String, i64) {
             (
                 l.href.clone(),
                 l.length.unwrap_or(0).min(i64::MAX as u64) as i64,
+                l.media_type
+                    .as_deref()
+                    .map(normalize_mime)
+                    .unwrap_or_default(),
             )
         })
         .unwrap_or_default()
+}
+
+/// MIME 规整：去参数（`; charset=…`）、去空白、转小写。
+fn normalize_mime(raw: &str) -> String {
+    raw.split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
 }
 
 fn sha256_hex(input: &str) -> String {
@@ -502,6 +538,37 @@ mod tests {
         let b = parse_feed(xml.as_bytes()).unwrap();
         assert_eq!(a.items[0].guid, b.items[0].guid);
         assert!(!a.items[0].guid.is_empty());
+    }
+
+    #[test]
+    fn enclosure_mime_is_extracted_lowercased_without_parameters() {
+        // RSS 2.0 <enclosure>（PT 站形态：URL 不带 .torrent）、Atom rel=enclosure 链接、
+        // 以及无 enclosure 时回退链接上声明的类型。
+        let rss = r#"<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>
+<item><guid>a</guid><title>pt</title><link>https://pt.test/details?id=1</link>
+<enclosure url="https://pt.test/download.php?id=1" length="1" type="Application/X-BitTorrent; charset=utf-8"/></item>
+<item><guid>b</guid><title>plain</title><link>https://x.test/page</link>
+<enclosure url="https://x.test/a.mp4" length="1" type="video/mp4"/></item>
+<item><guid>c</guid><title>none</title><link>https://x.test/none</link></item>
+</channel></rss>"#;
+        let feed = parse_feed(rss.as_bytes()).unwrap();
+        assert_eq!(feed.items[0].enclosure_type, "application/x-bittorrent");
+        assert_eq!(feed.items[1].enclosure_type, "video/mp4");
+        assert_eq!(feed.items[2].enclosure_type, "");
+
+        let atom = r#"<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"><title>t</title><id>urn:x</id>
+<entry><id>urn:e1</id><title>e1</title>
+<link rel="alternate" href="https://pt.test/details/1"/>
+<link rel="enclosure" href="https://pt.test/dl/1" length="10" type="application/x-bittorrent"/>
+</entry>
+<entry><id>urn:e2</id><title>e2</title>
+<link href="https://pt.test/dl/2" type="application/x-bittorrent"/>
+</entry></feed>"#;
+        let feed = parse_feed(atom.as_bytes()).unwrap();
+        assert_eq!(feed.items[0].enclosure_type, "application/x-bittorrent");
+        assert_eq!(feed.items[1].enclosure_type, "application/x-bittorrent");
+        assert!(feed.items[1].enclosure_url.is_empty());
     }
 
     #[test]

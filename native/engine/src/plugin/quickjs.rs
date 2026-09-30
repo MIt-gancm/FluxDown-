@@ -60,8 +60,13 @@ pub struct QuickJsScriptRuntime {
     runtime: Option<tokio::runtime::Runtime>,
     /// runtime 的 handle（cheap clone，供 `spawn_handle` 恒可用，与 runtime 生命周期同步）。
     handle: tokio::runtime::Handle,
-    /// resolve/subscription 共用信号量：固定容量 `max(启动时 max_concurrent, workers)`。
+    /// resolve/subscription 共用信号量：容量 `max(max_concurrent, workers)`，随宿主并发上限
+    /// 经 [`ScriptRuntime::set_resolve_capacity`] 同步调整。
     resolve_sema: Arc<Semaphore>,
+    /// `resolve_sema` 当前的目标容量（调整时据此算增减量）。
+    resolve_cap: std::sync::Mutex<usize>,
+    /// 专用 runtime 的 worker 数（resolve 容量下界）。
+    workers: usize,
     /// hook 平面信号量：容量 = workers；`try_acquire` 失败即丢。
     hook_sema: Arc<Semaphore>,
     /// 外部工具（ffmpeg/yt-dlp）授权插件的钩子平面：钩子可跑到 30 分钟级，不能与
@@ -102,6 +107,8 @@ impl QuickJsScriptRuntime {
             runtime: Some(runtime),
             handle,
             resolve_sema: Arc::new(Semaphore::new(resolve_cap)),
+            resolve_cap: std::sync::Mutex::new(resolve_cap),
+            workers,
             hook_sema: Arc::new(Semaphore::new(workers.max(1))),
             ext_hook_sema: Arc::new(Semaphore::new(workers.max(1))),
             ext_hook_waiters: Arc::new(AtomicUsize::new(0)),
@@ -286,6 +293,35 @@ impl ScriptRuntime for QuickJsScriptRuntime {
         Self::eval_bool(&format!(
             "(function(){{ try {{ return new RegExp({plit}).test({vlit}); }} catch(e) {{ return false; }} }})()"
         ))
+    }
+
+    fn set_resolve_capacity(&self, max_concurrent: usize) {
+        let target = max_concurrent.max(self.workers).max(1);
+        let mut current = self
+            .resolve_cap
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if target > *current {
+            self.resolve_sema.add_permits(target - *current);
+        } else if target < *current {
+            let shrink = *current - target;
+            // 空闲 permit 立即回收；仍被在途 resolve 占用的部分，由后台任务在其归还后
+            // 逐个吞掉，容量最终收敛到目标值而不打断在途任务。
+            let forgotten = self.resolve_sema.forget_permits(shrink);
+            let debt = shrink - forgotten;
+            if debt > 0 {
+                let sema = self.resolve_sema.clone();
+                self.handle.spawn(async move {
+                    for _ in 0..debt {
+                        match sema.clone().acquire_owned().await {
+                            Ok(permit) => permit.forget(),
+                            Err(_) => break,
+                        }
+                    }
+                });
+            }
+        }
+        *current = target;
     }
 
     async fn invoke_resolve(
@@ -1516,5 +1552,28 @@ mod tests {
         )
         .await;
         assert_eq!(r.url, "object:function:function:function:function");
+    }
+
+    /// 回归：宿主运行期放大/缩小并发上限，resolve 信号量容量随之同步
+    /// （否则放大后超出启动容量的解析任务只能 3s 后 `Overloaded`）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_capacity_follows_host_concurrency() {
+        let rt = QuickJsScriptRuntime::new(1).expect("runtime");
+        let base = rt.resolve_sema.available_permits();
+        let raised = base + 2;
+        rt.set_resolve_capacity(raised);
+        assert_eq!(rt.resolve_sema.available_permits(), raised);
+
+        // 全部 permit 在途时缩容：无空闲可回收，欠下的部分在归还后被吞掉。
+        let held = rt
+            .resolve_sema
+            .clone()
+            .acquire_many_owned(raised as u32)
+            .await
+            .expect("permits");
+        rt.set_resolve_capacity(base);
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(rt.resolve_sema.available_permits(), base);
     }
 }

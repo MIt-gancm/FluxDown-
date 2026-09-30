@@ -283,17 +283,32 @@ fn ftp_connect_sync_with_proxy(
     ftp_url: &FtpUrl,
     proxy: Option<&ProxyConfig>,
 ) -> Result<FtpStream, DownloadError> {
-    let timeout = Duration::from_secs(30);
+    ftp_connect_sync(ftp_url, proxy, false)
+}
 
-    // 与 HTTP 路径一致：命中 no_proxy 的主机直连。
-    let should_proxy = proxy
+/// 本次连接是否经代理隧道（命中 no_proxy 的主机直连，不算）。
+fn connects_via_proxy(ftp_url: &FtpUrl, proxy: Option<&ProxyConfig>) -> bool {
+    proxy
         .map(|p| {
             p.is_active()
                 && !p.host.is_empty()
                 && p.port > 0
                 && !host_matches_no_proxy(&ftp_url.host, &p.no_proxy_list)
         })
-        .unwrap_or(false);
+        .unwrap_or(false)
+}
+
+/// [`ftp_connect_sync_with_proxy`] 的完整版：`prefer_epsv` 让直连的数据通道从
+/// 一开始就走 EPSV（IPv6 控制连接本就强制 EPSV；代理路径不受影响）。
+fn ftp_connect_sync(
+    ftp_url: &FtpUrl,
+    proxy: Option<&ProxyConfig>,
+    prefer_epsv: bool,
+) -> Result<FtpStream, DownloadError> {
+    let timeout = Duration::from_secs(30);
+
+    // 与 HTTP 路径一致：命中 no_proxy 的主机直连。
+    let should_proxy = connects_via_proxy(ftp_url, proxy);
 
     let default_proxy = ProxyConfig::default();
     let mut stream = if should_proxy {
@@ -377,11 +392,12 @@ fn ftp_connect_sync_with_proxy(
             .map_err(|e| DownloadError::Other(format!("FTP connect error: {}", e)))?;
         // IPv6 控制连接上 PASV 只能返回 IPv4 地址，服务器通常直接拒绝；RFC 2428 的
         // EPSV 只返回端口，与下面的 NAT 容忍（复用控制主机）天然契合。
-        if ftp
-            .get_ref()
-            .peer_addr()
-            .map(|a| a.is_ipv6())
-            .unwrap_or(false)
+        if prefer_epsv
+            || ftp
+                .get_ref()
+                .peer_addr()
+                .map(|a| a.is_ipv6())
+                .unwrap_or(false)
         {
             ftp.set_mode(suppaftp::Mode::ExtendedPassive);
         }
@@ -407,6 +423,64 @@ fn ftp_connect_sync_with_proxy(
         .transfer_type(FileType::Binary)
         .map_err(|e| DownloadError::Other(format!("FTP set binary mode error: {}", e)))?;
 
+    Ok(stream)
+}
+
+/// 被动模式建立阶段的失败（PASV 应答错误 / 数据连接建立失败），而非 RETR 本身被拒
+/// （450/550 等）。只有前者值得换 EPSV 再试。
+fn is_passive_setup_failure(e: &suppaftp::FtpError) -> bool {
+    match e {
+        suppaftp::FtpError::ConnectionError(_) | suppaftp::FtpError::BadResponse => true,
+        suppaftp::FtpError::UnexpectedResponse(r) => {
+            matches!(r.status.code(), 425 | 500..=504 | 522)
+        }
+        _ => false,
+    }
+}
+
+/// 打开一条数据通道（`open` 通常是 `retr_as_stream`）。
+///
+/// IPv4 控制连接上的 PASV 路径失败（应答错误或数据连接建立失败）时，丢弃这条
+/// 控制连接（数据命令可能已发出，应答流已不同步），重连后改用 EPSV 再试一次，
+/// 成功则 `ftp` 替换为新连接。`rest_offset` 在新连接上重新发 REST。
+///
+/// 代理路径保持原样不回退：数据连接经代理隧道由 `passive_stream_builder` 建立，
+/// EPSV 只换应答格式，解决不了隧道本身的可达性。IPv6 控制连接本就强制 EPSV。
+fn open_data_with_epsv_fallback<R>(
+    ftp: &mut FtpStream,
+    ftp_url: &FtpUrl,
+    proxy: Option<&ProxyConfig>,
+    rest_offset: Option<usize>,
+    open: impl Fn(&mut FtpStream) -> suppaftp::FtpResult<R>,
+) -> suppaftp::FtpResult<R> {
+    let first = match open(ftp) {
+        Ok(stream) => return Ok(stream),
+        Err(e) => e,
+    };
+    let ipv4_control = ftp
+        .get_ref()
+        .peer_addr()
+        .map(|a| a.is_ipv4())
+        .unwrap_or(false);
+    if connects_via_proxy(ftp_url, proxy) || !ipv4_control || !is_passive_setup_failure(&first) {
+        return Err(first);
+    }
+    log_info!(
+        "[ftp-connect] PASV data channel failed ({}), retrying with EPSV on a fresh control connection",
+        first
+    );
+    let mut fresh = match ftp_connect_sync(ftp_url, proxy, true) {
+        Ok(f) => f,
+        Err(e) => {
+            log_info!("[ftp-connect] EPSV reconnect failed: {}", e);
+            return Err(first);
+        }
+    };
+    if let Some(offset) = rest_offset {
+        fresh.resume_transfer(offset)?;
+    }
+    let stream = open(&mut fresh)?;
+    *ftp = fresh;
     Ok(stream)
 }
 
@@ -539,13 +613,16 @@ pub async fn probe_ftp_bandwidth(
 
         let start = std::time::Instant::now();
 
-        let mut data_stream = match ftp.retr_as_stream(&ftp_url.path) {
-            Ok(s) => s,
-            Err(_) => {
-                let _ = ftp.quit();
-                return None;
-            }
-        };
+        let mut data_stream =
+            match open_data_with_epsv_fallback(&mut ftp, &ftp_url, proxy_opt, None, |f| {
+                f.retr_as_stream(&ftp_url.path)
+            }) {
+                Ok(s) => s,
+                Err(_) => {
+                    let _ = ftp.quit();
+                    return None;
+                }
+            };
 
         // Set read timeout on data connection to prevent indefinite blocking.
         data_stream
@@ -649,13 +726,16 @@ fn verify_ftp_rest_honoured_sync(
         };
     }
 
-    let mut data_stream = match ftp.retr_as_stream(&ftp_url.path) {
-        Ok(s) => s,
-        Err(_) => {
-            let _ = ftp.quit();
-            return None;
-        }
-    };
+    let mut data_stream =
+        match open_data_with_epsv_fallback(&mut ftp, ftp_url, proxy, Some(probe_offset), |f| {
+            f.retr_as_stream(&ftp_url.path)
+        }) {
+            Ok(s) => s,
+            Err(_) => {
+                let _ = ftp.quit();
+                return None;
+            }
+        };
 
     data_stream
         .get_ref()
@@ -1262,9 +1342,14 @@ async fn ftp_download_single(
                 })?;
             }
 
-            let mut data_stream = ftp
-                .retr_as_stream(&ftp_url.path)
-                .map_err(|e| DownloadError::Other(format!("FTP RETR error: {}", e)))?;
+            let mut data_stream = open_data_with_epsv_fallback(
+                &mut ftp,
+                &ftp_url,
+                proxy_opt,
+                (resume_offset > 0).then_some(resume_offset as usize),
+                |f| f.retr_as_stream(&ftp_url.path),
+            )
+            .map_err(|e| DownloadError::Other(format!("FTP RETR error: {}", e)))?;
 
             // Set read timeout so cancellation eventually unblocks this thread.
             if let Err(e) = data_stream
@@ -1858,7 +1943,14 @@ async fn ftp_do_segment(
                 DownloadError::Other(format!("FTP REST error (seg {}): {}", seg_idx, e))
             })?;
 
-            let mut data_stream = ftp.retr_as_stream(&ftp_url.path).map_err(|e| {
+            let mut data_stream = open_data_with_epsv_fallback(
+                &mut ftp,
+                &ftp_url,
+                proxy_opt,
+                Some(actual_start as usize),
+                |f| f.retr_as_stream(&ftp_url.path),
+            )
+            .map_err(|e| {
                 DownloadError::Other(format!("FTP RETR error (seg {}): {}", seg_idx, e))
             })?;
 
@@ -2650,5 +2742,192 @@ mod tests {
         assert!(!m("example.com", "*.local,192.168.0.0/16"));
         assert!(!m("notlocal", ".local"));
         assert!(!m("10.0.0.1", "192.168.0.0/16"));
+    }
+
+    #[test]
+    fn passive_setup_failures_are_distinguished_from_rejected_retr() {
+        use suppaftp::{FtpError, Status, types::Response};
+        let reply =
+            |code: u32| FtpError::UnexpectedResponse(Response::new(Status::from(code), vec![]));
+        assert!(super::is_passive_setup_failure(&reply(502)));
+        assert!(super::is_passive_setup_failure(&reply(500)));
+        assert!(super::is_passive_setup_failure(&reply(425)));
+        assert!(super::is_passive_setup_failure(&FtpError::ConnectionError(
+            std::io::Error::from(std::io::ErrorKind::TimedOut)
+        )));
+        assert!(super::is_passive_setup_failure(&FtpError::BadResponse));
+        // RETR 本身被拒（文件不存在/无权限）换 EPSV 也无济于事。
+        assert!(!super::is_passive_setup_failure(&reply(550)));
+        assert!(!super::is_passive_setup_failure(&reply(450)));
+    }
+
+    #[test]
+    fn no_proxy_hit_counts_as_direct_connection() {
+        use crate::proxy_config::{ProxyConfig, ProxyMode, ProxyType};
+        let url = super::FtpUrl {
+            host: "nas.local".to_string(),
+            port: 21,
+            username: String::new(),
+            password: String::new(),
+            path: "/f".to_string(),
+        };
+        let proxy = ProxyConfig {
+            mode: ProxyMode::Manual,
+            proxy_type: ProxyType::Socks5,
+            host: "127.0.0.1".to_string(),
+            port: 1080,
+            username: String::new(),
+            password: String::new(),
+            no_proxy_list: "*.local".to_string(),
+        };
+        assert!(!super::connects_via_proxy(&url, Some(&proxy)));
+        let remote = super::FtpUrl {
+            host: "ftp.example.com".to_string(),
+            ..url
+        };
+        assert!(super::connects_via_proxy(&remote, Some(&proxy)));
+        assert!(!super::connects_via_proxy(&remote, None));
+    }
+
+    /// 最小 FTP 服务器:`refuse_pasv` 时 PASV 回 502(只支持 EPSV);`reject_retr` 时
+    /// RETR 回 550。返回 `(控制端口, 控制连接数, 收到的命令)`。
+    #[allow(clippy::type_complexity)]
+    fn spawn_fake_ftp(
+        refuse_pasv: bool,
+        reject_retr: bool,
+        payload: &'static [u8],
+    ) -> std::io::Result<(
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    )> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let commands = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let (conn_count, seen) = (Arc::clone(&connections), Arc::clone(&commands));
+        std::thread::spawn(move || {
+            for control in listener.incoming() {
+                let Ok(control) = control else { return };
+                conn_count.fetch_add(1, Ordering::SeqCst);
+                let seen = Arc::clone(&seen);
+                std::thread::spawn(move || {
+                    let Ok(reader_half) = control.try_clone() else {
+                        return;
+                    };
+                    let mut reader = BufReader::new(reader_half);
+                    let mut control = control;
+                    let mut data_listener: Option<TcpListener> = None;
+                    let _ = control.write_all(b"220 ready\r\n");
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let command = line.trim().to_string();
+                        if let Ok(mut seen) = seen.lock() {
+                            seen.push(command.clone());
+                        }
+                        let verb = command.split_whitespace().next().unwrap_or("");
+                        let reply: String = match verb {
+                            "USER" => "331 need password\r\n".to_string(),
+                            "PASS" => "230 logged in\r\n".to_string(),
+                            "TYPE" => "200 binary\r\n".to_string(),
+                            "REST" => "350 restarting\r\n".to_string(),
+                            "PASV" if refuse_pasv => "502 PASV not implemented\r\n".to_string(),
+                            "PASV" | "EPSV" => {
+                                let Ok(data) = TcpListener::bind(("127.0.0.1", 0)) else {
+                                    return;
+                                };
+                                let data_port =
+                                    data.local_addr().map(|a| a.port()).unwrap_or_default();
+                                data_listener = Some(data);
+                                if verb == "PASV" {
+                                    format!(
+                                        "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                                        data_port >> 8,
+                                        data_port & 0xff
+                                    )
+                                } else {
+                                    format!(
+                                        "229 Entering Extended Passive Mode (|||{data_port}|)\r\n"
+                                    )
+                                }
+                            }
+                            "RETR" if reject_retr => "550 no such file\r\n".to_string(),
+                            "RETR" => {
+                                let _ = control.write_all(b"150 opening data connection\r\n");
+                                if let Some(data) = data_listener.take()
+                                    && let Ok((mut stream, _)) = data.accept()
+                                {
+                                    let _ = stream.write_all(payload);
+                                }
+                                "226 transfer complete\r\n".to_string()
+                            }
+                            "QUIT" => {
+                                let _ = control.write_all(b"221 bye\r\n");
+                                return;
+                            }
+                            _ => "502 not implemented\r\n".to_string(),
+                        };
+                        let _ = control.write_all(reply.as_bytes());
+                    }
+                });
+            }
+        });
+        Ok((port, connections, commands))
+    }
+
+    fn fake_ftp_url(port: u16) -> super::FtpUrl {
+        super::FtpUrl {
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "u".to_string(),
+            password: "p".to_string(),
+            path: "/file.bin".to_string(),
+        }
+    }
+
+    #[test]
+    fn retr_falls_back_to_epsv_when_pasv_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        const PAYLOAD: &[u8] = b"epsv-fallback-payload";
+        let (port, connections, commands) = spawn_fake_ftp(true, false, PAYLOAD)?;
+        let url = fake_ftp_url(port);
+        let mut ftp = super::ftp_connect_sync_with_proxy(&url, None)?;
+
+        let mut stream = super::open_data_with_epsv_fallback(&mut ftp, &url, None, Some(5), |f| {
+            f.retr_as_stream(&url.path)
+        })?;
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received)?;
+
+        assert_eq!(received, PAYLOAD);
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        let seen = commands.lock().map(|c| c.clone()).unwrap_or_default();
+        assert!(seen.iter().any(|c| c == "PASV"), "{seen:?}");
+        assert!(seen.iter().any(|c| c == "EPSV"), "{seen:?}");
+        // 新连接上要重新发 REST，断点偏移不能丢。
+        assert!(seen.iter().any(|c| c == "REST 5"), "{seen:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn retr_rejection_does_not_trigger_epsv_fallback() -> Result<(), Box<dyn std::error::Error>> {
+        let (port, connections, commands) = spawn_fake_ftp(false, true, b"")?;
+        let url = fake_ftp_url(port);
+        let mut ftp = super::ftp_connect_sync_with_proxy(&url, None)?;
+
+        let result = super::open_data_with_epsv_fallback(&mut ftp, &url, None, None, |f| {
+            f.retr_as_stream(&url.path)
+        });
+
+        assert!(result.is_err());
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        let seen = commands.lock().map(|c| c.clone()).unwrap_or_default();
+        assert!(!seen.iter().any(|c| c == "EPSV"), "{seen:?}");
+        Ok(())
     }
 }

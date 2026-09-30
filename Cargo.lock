@@ -2967,6 +2967,7 @@ dependencies = [
  "feed-rs",
  "flate2",
  "fluxdown_link",
+ "fluxdown_logfile",
  "fs2",
  "futures-util",
  "hex 0.4.3",
@@ -3088,6 +3089,7 @@ dependencies = [
 name = "fluxdown_ui_account"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "fluxdown_protocol",
  "fluxdown_ui_components",
  "fluxdown_ui_i18n",
@@ -3193,6 +3195,7 @@ name = "fluxdown_ui_i18n"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sys-locale",
  "thiserror 2.0.18",
 ]
 

@@ -227,6 +227,9 @@ CREATE TABLE IF NOT EXISTS rss_items (
     task_id TEXT NOT NULL DEFAULT '',
     episode_key TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
+    enclosure_type TEXT NOT NULL DEFAULT '',
+    fetch_failures INTEGER NOT NULL DEFAULT 0,
+    retry_after INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (source_id, guid),
     FOREIGN KEY (source_id) REFERENCES rss_sources(id) ON DELETE CASCADE
 );
@@ -424,6 +427,9 @@ CREATE TABLE IF NOT EXISTS rss_items (
     task_id TEXT NOT NULL DEFAULT '',
     episode_key TEXT NOT NULL DEFAULT '',
     reason TEXT NOT NULL DEFAULT '',
+    enclosure_type TEXT NOT NULL DEFAULT '',
+    fetch_failures BIGINT NOT NULL DEFAULT 0,
+    retry_after BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (source_id, guid),
     FOREIGN KEY (source_id) REFERENCES rss_sources(id) ON DELETE CASCADE
 );
@@ -925,6 +931,12 @@ impl Db {
         self.add_column_if_missing("rss_sources", "provider_config", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.add_column_if_missing("rss_items", "resolver_item", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("rss_items", "enclosure_type", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.add_column_if_missing("rss_items", "fetch_failures", "BIGINT NOT NULL DEFAULT 0")
+            .await?;
+        self.add_column_if_missing("rss_items", "retry_after", "BIGINT NOT NULL DEFAULT 0")
             .await?;
         self.add_column_if_missing("tasks", "proxy_url", "TEXT NOT NULL DEFAULT ''")
             .await?;
@@ -1532,6 +1544,44 @@ impl Db {
         Ok(total)
     }
 
+    /// 做种 tick 的批量落库：单事务内累加各任务的上传增量、写入做种时长快照，
+    /// 返回有增量的任务更新后的累计上传字节。N 个做种者一轮只付一次提交代价。
+    pub async fn apply_seeding_tick(
+        &self,
+        uploaded_deltas: &[(String, i64)],
+        seeding_times: &[(String, i64)],
+    ) -> Result<Vec<(String, i64)>, DbError> {
+        if uploaded_deltas.is_empty() && seeding_times.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut totals = Vec::with_capacity(uploaded_deltas.len());
+        for (id, delta) in uploaded_deltas {
+            sqlx::query("UPDATE tasks SET uploaded_bytes = uploaded_bytes + $1 WHERE id = $2")
+                .bind(*delta)
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+            let total: Option<i64> =
+                sqlx::query_scalar("SELECT uploaded_bytes FROM tasks WHERE id = $1")
+                    .bind(id.as_str())
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            if let Some(total) = total {
+                totals.push((id.clone(), total));
+            }
+        }
+        for (id, secs) in seeding_times {
+            sqlx::query("UPDATE tasks SET seeding_time_secs = $1 WHERE id = $2")
+                .bind(*secs)
+                .bind(id.as_str())
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(totals)
+    }
+
     /// 激活做种状态并记录做种起始时间（unix 秒）。
     pub async fn set_task_seeding_active(
         &self,
@@ -1927,10 +1977,12 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         // 任务级 config 行(完成幂等哨兵 bt_completion_top_<id>、HLS 断点
-        // hls_resume_<id>)随任务一并清理,防孤儿行累积。
-        sqlx::query("DELETE FROM config WHERE key IN ($1, $2)")
+        // hls_resume_<id> 与独立音轨断点 hls_audio_resume_<id>)随任务一并清理,
+        // 防孤儿行累积。
+        sqlx::query("DELETE FROM config WHERE key IN ($1, $2, $3)")
             .bind(format!("bt_completion_top_{id}"))
             .bind(format!("hls_resume_{id}"))
+            .bind(format!("hls_audio_resume_{id}"))
             .execute(&mut *tx)
             .await?;
         // 已下载条目变为已读，而非 New：否则下一轮抓取会自动重新派发。
@@ -1978,15 +2030,15 @@ impl Db {
                 query.execute(&mut *tx).await?;
             }
 
-            // 任务级 config 行(哨兵/HLS 断点)随任务清理,防孤儿行累积。
+            // 任务级 config 行(哨兵/HLS 视频与音轨断点)随任务清理,防孤儿行累积。
             for id in chunk {
-                sqlx::query("DELETE FROM config WHERE key IN ($1, $2)")
+                sqlx::query("DELETE FROM config WHERE key IN ($1, $2, $3)")
                     .bind(format!("bt_completion_top_{id}"))
                     .bind(format!("hls_resume_{id}"))
+                    .bind(format!("hls_audio_resume_{id}"))
                     .execute(&mut *tx)
                     .await?;
             }
-            // 与单任务删除保持同样的已读语义；返回本块实际改变的源。
             let rss_sql = format!(
                 "UPDATE rss_items SET status = CASE WHEN status = {downloaded} THEN {ignored} ELSE status END, task_id = '' WHERE task_id IN ({placeholders}) RETURNING source_id",
                 downloaded = RssItemStatus::Downloaded.as_i32(),
@@ -2550,6 +2602,27 @@ impl Db {
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             out.push(row.try_get("file_name")?);
+        }
+        Ok(out)
+    }
+
+    /// 把 `save_dir` 下 `file_name` 登记为自己产物名的全部任务 id。
+    ///
+    /// 删除任务文件前用来确认该名字没有同时属于别的任务：两条任务的 `file_name`
+    /// 指向同一磁盘名时，删除其一不得带走对方的产物。
+    pub async fn list_task_ids_by_file(
+        &self,
+        save_dir: &str,
+        file_name: &str,
+    ) -> Result<Vec<String>, DbError> {
+        let rows = sqlx::query("SELECT id FROM tasks WHERE save_dir = $1 AND file_name = $2")
+            .bind(save_dir)
+            .bind(file_name)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            out.push(row.try_get("id")?);
         }
         Ok(out)
     }
@@ -3984,23 +4057,27 @@ impl Db {
         Ok(next as i32)
     }
 
-    /// 一个订阅中**待派发**的条目：`status = New`，按发布时间**从旧到新**取
-    /// 前 `limit` 条。
+    /// 一个订阅中**待派发**的条目：`status = New` 且不在种子抓取退避期内
+    /// （`retry_after <= now`），按发布时间**从旧到新**取前 `limit` 条。
     ///
     /// 从旧到新是刻意的：单轮上限（`max_per_fetch`）把超额条目留在 New 状态
     /// 等下一轮，若按新→旧取，积压的老条目会被后来的新条目永久插队饿死。
+    /// 带失败码的条目排在没失败过的条目之后，退避到期重试的坏条目不会占住队首。
     pub async fn rss_dispatchable_items(
         &self,
         source_id: &str,
         limit: i32,
+        now: i64,
     ) -> Result<Vec<RssItemInfo>, DbError> {
         let rows = sqlx::query(
-            "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
-             status, task_id, episode_key, resolver_item, reason FROM rss_items WHERE source_id = $1 AND status = 0 \
+            "SELECT source_id, guid, title, link, enclosure_url, enclosure_type, enclosure_length, pub_date, fetched_at, \
+             status, task_id, episode_key, resolver_item, reason FROM rss_items \
+             WHERE source_id = $1 AND status = 0 AND retry_after <= $3 \
              ORDER BY CASE WHEN reason = '' THEN 0 ELSE 1 END ASC, pub_date ASC, fetched_at ASC, guid ASC LIMIT $2",
         )
         .bind(source_id)
         .bind(limit.max(1))
+        .bind(now)
         .fetch_all(&self.pool)
         .await?;
         rows.iter()
@@ -4016,7 +4093,7 @@ impl Db {
         limit: i32,
     ) -> Result<Vec<RssItemInfo>, DbError> {
         let rows = sqlx::query(
-            "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
+            "SELECT source_id, guid, title, link, enclosure_url, enclosure_type, enclosure_length, pub_date, fetched_at, \
              status, task_id, episode_key, resolver_item, reason FROM rss_items WHERE source_id = $1 \
              ORDER BY pub_date DESC, fetched_at DESC, guid ASC LIMIT $2",
         )
@@ -4037,7 +4114,7 @@ impl Db {
         guid: &str,
     ) -> Result<Option<RssItemInfo>, DbError> {
         let items = sqlx::query(
-            "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
+            "SELECT source_id, guid, title, link, enclosure_url, enclosure_type, enclosure_length, pub_date, fetched_at, \
              status, task_id, episode_key, resolver_item, reason FROM rss_items WHERE source_id = $1 AND guid = $2",
         )
         .bind(source_id)
@@ -4087,9 +4164,9 @@ impl Db {
         let mut inserted = 0u64;
         for item in items {
             let r = sqlx::query(
-                "INSERT INTO rss_items (source_id, guid, title, link, enclosure_url, resolver_item, enclosure_length, \
-                 pub_date, fetched_at, status, task_id, episode_key, reason) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                "INSERT INTO rss_items (source_id, guid, title, link, enclosure_url, enclosure_type, resolver_item, \
+                 enclosure_length, pub_date, fetched_at, status, task_id, episode_key, reason) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
                  ON CONFLICT (source_id, guid) DO NOTHING",
             )
             .bind(&item.source_id)
@@ -4097,6 +4174,7 @@ impl Db {
             .bind(&item.title)
             .bind(&item.link)
             .bind(&item.enclosure_url)
+            .bind(&item.enclosure_type)
             .bind(&item.resolver_item)
             .bind(item.enclosure_length)
             .bind(item.pub_date)
@@ -4189,6 +4267,54 @@ impl Db {
         .bind(status.as_i32())
         .bind(reason)
         .bind(task_id)
+        .bind(source_id)
+        .bind(guid)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 记一次种子抓取失败：条目保持 `New`、写入失败码，失败计数 +1，并按
+    /// `delay_for(新计数)` 秒设置下次允许自动派发的时刻（指数退避）。返回新计数。
+    pub async fn record_rss_fetch_failure(
+        &self,
+        source_id: &str,
+        guid: &str,
+        reason: &str,
+        now: i64,
+        delay_for: fn(i64) -> i64,
+    ) -> Result<i64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let previous: Option<i64> = sqlx::query_scalar(
+            "SELECT fetch_failures FROM rss_items WHERE source_id = $1 AND guid = $2",
+        )
+        .bind(source_id)
+        .bind(guid)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let failures = previous.unwrap_or(0).saturating_add(1);
+        sqlx::query(
+            "UPDATE rss_items SET status = $1, reason = $2, fetch_failures = $3, retry_after = $4 \
+             WHERE source_id = $5 AND guid = $6",
+        )
+        .bind(RssItemStatus::New.as_i32())
+        .bind(reason)
+        .bind(failures)
+        .bind(now.saturating_add(delay_for(failures)))
+        .bind(source_id)
+        .bind(guid)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(failures)
+    }
+
+    /// 清零条目的种子抓取失败计数与退避（抓取成功建出任务，或用户手动下载）。
+    pub async fn clear_rss_item_backoff(&self, source_id: &str, guid: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE rss_items SET fetch_failures = 0, retry_after = 0 \
+             WHERE source_id = $1 AND guid = $2 AND (fetch_failures <> 0 OR retry_after <> 0)",
+        )
         .bind(source_id)
         .bind(guid)
         .execute(&self.pool)
@@ -4445,6 +4571,7 @@ fn rss_item_from_row(row: &AnyRow) -> Result<RssItemInfo, sqlx::Error> {
         link: row.try_get("link").unwrap_or_default(),
         enclosure_url: row.try_get("enclosure_url").unwrap_or_default(),
         resolver_item: row.try_get("resolver_item").unwrap_or_default(),
+        enclosure_type: row.try_get("enclosure_type").unwrap_or_default(),
         enclosure_length: row.try_get("enclosure_length").unwrap_or(0),
         pub_date: row.try_get("pub_date").unwrap_or(0),
         fetched_at: row.try_get("fetched_at").unwrap_or(0),
@@ -5408,6 +5535,80 @@ mod tests {
         close_test_db(&db, dir).await;
     }
 
+    // 种子抓取失败进入指数退避：退避期内不参与自动派发，到期后回到派发队列并排在
+    // 没失败过的条目之后；清零（成功/手动下载）后立即恢复。
+    #[tokio::test]
+    async fn rss_fetch_failure_backs_off_dispatch_until_due() {
+        let (db, dir) = open_test_db().await;
+        db.insert_rss_source(&crate::rss::model::RssSourceInfo {
+            source_id: "s1".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect("insert source");
+        let item = |guid: &str, pub_date: i64| crate::rss::model::RssItemInfo {
+            source_id: "s1".to_string(),
+            guid: guid.to_string(),
+            pub_date,
+            ..Default::default()
+        };
+        db.insert_rss_items(&[item("bad", 1), item("fresh", 2)])
+            .await
+            .expect("insert items");
+        let ids = |items: Vec<crate::rss::model::RssItemInfo>| -> Vec<String> {
+            items.into_iter().map(|i| i.guid).collect()
+        };
+        let now = 1_000_000;
+
+        assert_eq!(
+            ids(db.rss_dispatchable_items("s1", 10, now).await.expect("q")),
+            vec!["bad", "fresh"]
+        );
+
+        let failures = db
+            .record_rss_fetch_failure("s1", "bad", "torrent_fetch_failed", now, |n| 100 * n)
+            .await
+            .expect("record failure");
+        assert_eq!(failures, 1);
+        assert_eq!(
+            ids(db
+                .rss_dispatchable_items("s1", 10, now + 50)
+                .await
+                .expect("q")),
+            vec!["fresh"],
+            "item in backoff must not be dispatched"
+        );
+        assert_eq!(
+            ids(db
+                .rss_dispatchable_items("s1", 10, now + 100)
+                .await
+                .expect("q")),
+            vec!["fresh", "bad"],
+            "due item returns behind items that never failed"
+        );
+
+        let failures = db
+            .record_rss_fetch_failure("s1", "bad", "torrent_fetch_failed", now, |n| 100 * n)
+            .await
+            .expect("record failure");
+        assert_eq!(failures, 2);
+        assert_eq!(
+            ids(db
+                .rss_dispatchable_items("s1", 10, now + 150)
+                .await
+                .expect("q")),
+            vec!["fresh"],
+            "second failure doubles the backoff"
+        );
+
+        db.clear_rss_item_backoff("s1", "bad").await.expect("clear");
+        assert_eq!(
+            ids(db.rss_dispatchable_items("s1", 10, now).await.expect("q")),
+            vec!["fresh", "bad"]
+        );
+        close_test_db(&db, dir).await;
+    }
+
     #[tokio::test]
     async fn task_artifacts_roundtrip_and_cascade() {
         let (db, dir) = open_test_db().await;
@@ -5807,6 +6008,34 @@ mod tests {
             task.total_bytes, stored,
             "total_bytes must remain unchanged"
         );
+
+        close_test_db(&db, dir).await;
+    }
+
+    /// 做种 tick 批量落库：上传增量累加到各任务、做种时长整体写入，返回累计值。
+    #[tokio::test]
+    async fn apply_seeding_tick_accumulates_uploads_and_times_in_one_call() {
+        let (db, dir) = open_test_db().await;
+        insert_task_with_size(&db, "s1", 100).await;
+        insert_task_with_size(&db, "s2", 100).await;
+        db.add_task_uploaded_bytes("s1", 50)
+            .await
+            .expect("seed upload");
+
+        let totals = db
+            .apply_seeding_tick(
+                &[("s1".to_string(), 25), ("ghost".to_string(), 9)],
+                &[("s1".to_string(), 600), ("s2".to_string(), 30)],
+            )
+            .await
+            .expect("tick");
+
+        // 不存在的任务不产出累计值；已有任务在原累计上叠加。
+        assert_eq!(totals, vec![("s1".to_string(), 75)]);
+        let s1 = db.load_task_by_id("s1").await.expect("load").expect("s1");
+        let s2 = db.load_task_by_id("s2").await.expect("load").expect("s2");
+        assert_eq!((s1.uploaded_bytes, s1.seeding_time_secs), (75, 600));
+        assert_eq!((s2.uploaded_bytes, s2.seeding_time_secs), (0, 30));
 
         close_test_db(&db, dir).await;
     }
