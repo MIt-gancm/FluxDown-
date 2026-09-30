@@ -8,6 +8,8 @@ pub mod blob_store;
 pub mod config;
 pub mod event_hub;
 pub mod http;
+pub mod log_redact;
+pub mod private_fs;
 pub mod rpc;
 pub mod runtime;
 pub mod selection;

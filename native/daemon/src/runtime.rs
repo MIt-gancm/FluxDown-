@@ -48,6 +48,9 @@ pub async fn run(
             return Ok(());
         }
     };
+    if let Err(error) = crate::private_fs::secure_data_dir(&data_dir).await {
+        tracing::warn!(error = %error, "failed to restrict data directory permissions");
+    }
 
     let (boot_db, write_guard) = open_database(&process_config, &data_dir).await?;
     // `FLUXDOWN_SAVE_DIR` 只作为首次播种值：库中已有 `default_save_dir` 时以库为准。
@@ -154,13 +157,37 @@ pub async fn run(
     tracing::info!(address = %process_config.bind_addr, "fluxdownd control plane listening");
 
     let sweep_task = spawn_blob_sweeper(blobs.clone(), cancel.clone());
-    let result = serve(listener, service, bearer, cancel.clone()).await;
-    let _ = tokio::time::timeout(Duration::from_secs(10), actor.shutdown()).await;
+    let serve_fut = serve(listener, service, bearer, cancel.clone());
+    tokio::pin!(serve_fut);
+    // actor 任务一旦意外结束，daemon 只剩只读快照可用（写操作全部 Unavailable）；
+    // 此时主动退出，交给上层 supervisor 重拉进程。
+    let mut actor_finished = false;
+    let result = tokio::select! {
+        result = &mut serve_fut => result,
+        joined = &mut actor_task => {
+            actor_finished = true;
+            if cancel.is_cancelled() {
+                serve_fut.await
+            } else {
+                match joined {
+                    Ok(()) => tracing::error!("daemon actor exited unexpectedly"),
+                    Err(error) => tracing::error!(%error, "daemon actor task failed"),
+                }
+                cancel.cancel();
+                let _ = serve_fut.await;
+                Err(std::io::Error::other("daemon actor stopped unexpectedly"))
+            }
+        }
+    };
+    if !actor_finished {
+        let _ = tokio::time::timeout(Duration::from_secs(10), actor.shutdown()).await;
+    }
     cancel.cancel();
     let _ = sweep_task.await;
-    if tokio::time::timeout(Duration::from_secs(10), &mut actor_task)
-        .await
-        .is_err()
+    if !actor_finished
+        && tokio::time::timeout(Duration::from_secs(10), &mut actor_task)
+            .await
+            .is_err()
     {
         actor_task.abort();
         let _ = actor_task.await;

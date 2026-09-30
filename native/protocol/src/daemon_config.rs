@@ -322,6 +322,14 @@ pub fn normalize_daemon_config_value(key: &str, value: &str) -> Result<String, D
                 Err(invalid(format!("must be one of {}", allowed.join(", "))))
             }
         }
+        DaemonConfigKind::Text if key == "global_user_agent" => {
+            let trimmed = value.trim();
+            // 与 HTTP HeaderValue 规则一致：可见字符、空格与制表符；拒绝控制字符。
+            if trimmed.bytes().any(|b| (b < 32 && b != b'\t') || b == 127) {
+                return Err(invalid("must not contain control characters".to_owned()));
+            }
+            Ok(trimmed.to_owned())
+        }
         DaemonConfigKind::Text => Ok(value.trim().to_owned()),
     }
 }
@@ -372,6 +380,21 @@ mod tests {
             }
             normalize_daemon_config_value(field.key, field.default)
                 .unwrap_or_else(|error| panic!("{}: {error}", field.key));
+        }
+    }
+
+    #[test]
+    fn global_user_agent_rejects_control_characters() {
+        assert_eq!(
+            normalize_daemon_config_value("global_user_agent", "  Mozilla/5.0\t(X) 中文 ")
+                .as_deref(),
+            Ok("Mozilla/5.0\t(X) 中文")
+        );
+        for bad in ["a\nb", "a\rb", "a\u{1}b", "a\u{7f}b"] {
+            assert!(
+                normalize_daemon_config_value("global_user_agent", bad).is_err(),
+                "{bad:?}"
+            );
         }
     }
 

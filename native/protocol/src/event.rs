@@ -310,9 +310,11 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
     match message {
         WsServerMsg::TasksSnapshot { tasks } => {
             snapshot.tasks.clone_from(tasks);
+            let live: std::collections::HashSet<&str> =
+                tasks.iter().map(|task| task.task_id.as_str()).collect();
             snapshot
                 .task_runtime
-                .retain(|id, _| tasks.iter().any(|task| task.task_id == *id));
+                .retain(|id, _| live.contains(id.as_str()));
             for task in tasks {
                 if !matches!(task.status, 1 | 5) {
                     clear_active_runtime(snapshot, &task.task_id);

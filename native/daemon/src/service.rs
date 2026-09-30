@@ -225,6 +225,7 @@ impl DaemonService {
             }
             method::DAEMON_TASK_CHANGE_URL => {
                 let params = parse_params::<fluxdown_protocol::ChangeTaskUrlParams>(params)?;
+                self.demo_guard(&params.url)?;
                 self.execute_unit(ActorOperation::ChangeTaskUrl {
                     task_id: params.task_id,
                     url: params.url,
@@ -361,6 +362,9 @@ impl DaemonService {
             method::DAEMON_GROUP_CREATE => {
                 let request = parse_params::<CreateGroupRequest>(params)?;
                 self.demo_guard(&request.source_url)?;
+                if !request.items.is_empty() {
+                    self.demo_forbid("group items")?;
+                }
                 let spec = self.group_spec(request);
                 match self
                     .actor
@@ -564,6 +568,7 @@ impl DaemonService {
                 to_value(items)
             }
             method::DAEMON_RSS_CREATE_SOURCE => {
+                self.demo_forbid("RSS sources")?;
                 let source = parse_params::<fluxdown_protocol::RssSourceDto>(params)?;
                 match self
                     .actor
@@ -582,6 +587,7 @@ impl DaemonService {
                 }
             }
             method::DAEMON_RSS_UPDATE_SOURCE => {
+                self.demo_forbid("RSS sources")?;
                 let source = parse_params::<fluxdown_protocol::RssSourceDto>(params)?;
                 let source_id = source.source_id.clone();
                 if source_id.trim().is_empty() {
@@ -982,7 +988,10 @@ impl DaemonService {
                 }))
             }
             method::DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT => {
-                let snapshot = self.events.snapshot();
+                let mut snapshot = self.events.snapshot();
+                if let SnapshotBody::Daemon(body) = &mut snapshot.body {
+                    crate::log_redact::redact_snapshot(body);
+                }
                 let bytes = serde_json::to_vec(&snapshot)
                     .map_err(|error| internal_error(error.to_string()))?;
                 let export_id = self
@@ -1069,6 +1078,12 @@ impl DaemonService {
     async fn create_task(&self, params: Option<Value>) -> Result<Value, RpcErrorObject> {
         let params = parse_params::<DaemonCreateTaskParams>(params)?;
         self.demo_guard(&params.request.url)?;
+        if params.torrent_blob_id.is_some()
+            || params.request.torrent_b64.is_some()
+            || params.request.audio_url.is_some()
+        {
+            self.demo_forbid("torrent / audio attachments")?;
+        }
         if params.torrent_blob_id.is_some() && params.request.torrent_b64.is_some() {
             return Err(invalid_argument(
                 "torrentBlobId",
@@ -1186,6 +1201,15 @@ impl DaemonService {
                 "url",
                 "demo mode: only the designated demo file can be downloaded",
             ))
+        }
+    }
+
+    /// 演示模式下整体禁用的入口（RSS 自动下载、外部附件等会绕过 URL 守卫）。
+    fn demo_forbid(&self, what: &str) -> Result<(), RpcErrorObject> {
+        if self.demo_url.is_some() {
+            Err(unsupported_error(&format!("demo mode: {what} is disabled")))
+        } else {
+            Ok(())
         }
     }
 
@@ -1948,7 +1972,7 @@ mod tests {
 
     #[test]
     fn site_auth_match_uses_engine_site_key_including_non_default_port() {
-        let store = r#"{"example.com":{"user":"u","pass":"p"},"example.com:8443":{"user":"alt","pass":"q"}}"#;
+        let store = r#"{"https://example.com":{"user":"u","pass":"p"},"https://example.com:8443":{"user":"alt","pass":"q"}}"#;
         let matched = match_site_auth(store, "https://EXAMPLE.com/files/a.bin?x=1")
             .expect("default port matches bare host");
         assert_eq!(
@@ -1957,12 +1981,16 @@ mod tests {
                 matched.user.as_str(),
                 matched.pass.as_str()
             ),
-            ("example.com", "u", "p")
+            ("https://example.com", "u", "p")
         );
         let alt = match_site_auth(store, "https://example.com:8443/a.bin")
             .expect("explicit non-default port matches host:port");
         assert_eq!(alt.user, "alt");
         assert!(match_site_auth(store, "https://other.example.com/a.bin").is_none());
+        assert!(
+            match_site_auth(store, "http://example.com/a.bin").is_none(),
+            "https 凭据不得套用到同 host 的 http 请求"
+        );
         assert!(match_site_auth(store, "magnet:?xt=urn:btih:abc").is_none());
         assert!(match_site_auth("not json", "https://example.com/a.bin").is_none());
     }

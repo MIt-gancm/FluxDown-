@@ -2127,31 +2127,33 @@ pub async fn run(
                     "[actor] proxy test: type={}, host={}, port={}",
                     msg.proxy_type, msg.proxy_host, msg.proxy_port,
                 );
-                // `Engine::test_proxy_connection` 内部就是纯 async I/O(reqwest),
-                // 本身从不阻塞 current_thread runtime,无需外部 tokio::spawn 隔离。
-                let result = engine.test_proxy_connection(
-                    &msg.proxy_type,
-                    &msg.proxy_host,
-                    &msg.proxy_port,
-                    &msg.proxy_username,
-                    &msg.proxy_password,
-                ).await;
-                match result {
-                    Ok(latency_ms) => {
-                        ProxyTestResult {
-                            success: true,
-                            latency_ms,
-                            error_message: String::new(),
-                        }.send_signal_to_dart();
+                // 最长数十秒的网络往返且不依赖引擎状态：放到 actor 之外,
+                // 否则 select! 分支体 await 期间整个下载循环停摆。
+                tokio::spawn(async move {
+                    let result = fluxdown_engine::proxy_config::test_proxy_connection(
+                        &msg.proxy_type,
+                        &msg.proxy_host,
+                        &msg.proxy_port,
+                        &msg.proxy_username,
+                        &msg.proxy_password,
+                    ).await;
+                    match result {
+                        Ok(latency_ms) => {
+                            ProxyTestResult {
+                                success: true,
+                                latency_ms,
+                                error_message: String::new(),
+                            }.send_signal_to_dart();
+                        }
+                        Err(e) => {
+                            ProxyTestResult {
+                                success: false,
+                                latency_ms: 0,
+                                error_message: e.to_string(),
+                            }.send_signal_to_dart();
+                        }
                     }
-                    Err(e) => {
-                        ProxyTestResult {
-                            success: false,
-                            latency_ms: 0,
-                            error_message: e.to_string(),
-                        }.send_signal_to_dart();
-                    }
-                }
+                });
             }
             // --- BT file selection ---
             Some(signal) = select_bt_files_recv.recv() => {
@@ -3559,6 +3561,8 @@ fn emit_link_engine_event(ev: fluxdown_link::LinkEngineEvent) {
             e.platform = peer_platform.unwrap_or_default();
             e.send_signal_to_dart();
         }
+        // Dart 侧没有「入站配对撤销」信号：确认框仍按自身超时关闭。
+        E::IncomingCancelled { .. } => {}
     }
 }
 

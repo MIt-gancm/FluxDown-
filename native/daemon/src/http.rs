@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
 use axum::extract::{Path as AxumPath, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -71,6 +71,10 @@ pub async fn load_or_create_bearer(
     if let Ok(existing) = tokio::fs::read_to_string(&path).await {
         let token = existing.trim();
         if !token.is_empty() {
+            // 便携模式下旧版本创建的 token 可能仍继承宽松 ACL，每次启动重新收紧。
+            if let Err(error) = set_private_file_permissions(&path).await {
+                tracing::warn!(error = %error, "failed to restrict daemon token permissions");
+            }
             return Ok(token.to_owned());
         }
     }
@@ -108,29 +112,30 @@ async fn rpc_upgrade(
 async fn upload_torrent(
     State(state): State<HttpState>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
-    upload_blob(&state, &headers, BlobKind::Torrent, &body).await
+    upload_blob(&state, &headers, BlobKind::Torrent, body).await
 }
 
-async fn upload_plugin(
-    State(state): State<HttpState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    upload_blob(&state, &headers, BlobKind::Plugin, &body).await
+async fn upload_plugin(State(state): State<HttpState>, headers: HeaderMap, body: Body) -> Response {
+    upload_blob(&state, &headers, BlobKind::Plugin, body).await
 }
 
+/// 先鉴权再读取请求体：未授权请求不会让 daemon 缓冲最多 4 MiB。
 async fn upload_blob(
     state: &HttpState,
     headers: &HeaderMap,
     kind: BlobKind,
-    body: &[u8],
+    body: Body,
 ) -> Response {
     if !authorized(headers, &state.bearer) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    match state.service.blobs().put(kind, body).await {
+    let body = match axum::body::to_bytes(body, REQUEST_BODY_LIMIT).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    match state.service.blobs().put(kind, &body).await {
         Ok(blob_id) => axum::Json(serde_json::json!({ "blobId": blob_id })).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -162,10 +167,16 @@ async fn download_task_file(
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
-    let length = match file.metadata().await {
-        Ok(metadata) => metadata.len(),
+    let metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    // 多文件 BT 任务落盘为目录；对目录 open 在 Unix 上会成功，但读取必然失败，
+    // 需在发出 200 头之前明确拒绝。
+    if !metadata.is_file() {
+        return StatusCode::CONFLICT.into_response();
+    }
+    let length = metadata.len();
     let disposition = attachment_disposition(&task.file_name);
     match Response::builder()
         .status(StatusCode::OK)
@@ -361,8 +372,8 @@ async fn set_private_dir_permissions(path: &Path) -> Result<(), std::io::Error> 
 }
 
 #[cfg(not(unix))]
-async fn set_private_dir_permissions(_path: &Path) -> Result<(), std::io::Error> {
-    Ok(())
+async fn set_private_dir_permissions(path: &Path) -> Result<(), std::io::Error> {
+    crate::private_fs::restrict_to_current_user(path, true).await
 }
 
 #[cfg(unix)]
@@ -372,8 +383,8 @@ async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error>
 }
 
 #[cfg(not(unix))]
-async fn set_private_file_permissions(_path: &Path) -> Result<(), std::io::Error> {
-    Ok(())
+async fn set_private_file_permissions(path: &Path) -> Result<(), std::io::Error> {
+    crate::private_fs::restrict_to_current_user(path, false).await
 }
 
 #[cfg(test)]

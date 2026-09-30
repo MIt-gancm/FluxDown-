@@ -556,6 +556,28 @@ async fn dispatch_operation(
                 let _ = ack.send(Ok(ActorResult::RssValidation(Box::new(future.await))));
             });
         }
+        ActorOperation::TestProxy {
+            proxy_type,
+            host,
+            port,
+            username,
+            password,
+        } => {
+            // 连通性测试最长数十秒且不依赖引擎状态，不能占用 actor 循环。
+            tokio::spawn(async move {
+                let result = fluxdown_engine::proxy_config::test_proxy_connection(
+                    &proxy_type,
+                    &host,
+                    &port,
+                    &username,
+                    &password,
+                )
+                .await
+                .map(ActorResult::ProxyLatency)
+                .map_err(|error| ActorError::Operation(format!("{error:#}")));
+                let _ = ack.send(result);
+            });
+        }
         ActorOperation::WebhookTest { endpoint_json } => {
             let dispatcher = engine.manager.webhook();
             tokio::spawn(async move {
@@ -756,19 +778,6 @@ async fn execute_operation(
             engine.manager.move_task_to_queue(task_id, queue_id).await
         }
         ActorOperation::Boost { task_id } => engine.manager.set_priority_task(task_id).await,
-        ActorOperation::TestProxy {
-            proxy_type,
-            host,
-            port,
-            username,
-            password,
-        } => {
-            let latency = engine
-                .test_proxy_connection(&proxy_type, &host, &port, &username, &password)
-                .await
-                .map_err(|error| ActorError::Operation(format!("{error:#}")))?;
-            return Ok(ActorResult::ProxyLatency(latency));
-        }
         ActorOperation::PatchConfig {
             expected_revision,
             values,
@@ -886,7 +895,8 @@ async fn execute_operation(
         | ActorOperation::RefreshEd2kServerSubscription
         | ActorOperation::RefreshEd2kNodes
         | ActorOperation::RssValidate { .. }
-        | ActorOperation::WebhookTest { .. } => unreachable!("handled off actor"),
+        | ActorOperation::WebhookTest { .. }
+        | ActorOperation::TestProxy { .. } => unreachable!("handled off actor"),
         ActorOperation::WebhookDeliveries => {
             return Ok(ActorResult::WebhookDeliveries(engine.webhook_deliveries()));
         }
@@ -1217,9 +1227,18 @@ async fn patch_config(
             .iter()
             .map(|(key, value)| (key.clone(), value.clone())),
     );
-    if values.keys().any(|key| key.starts_with("proxy_")) {
+    if values
+        .keys()
+        .any(|key| key.starts_with("proxy_") || key == "global_user_agent")
+    {
+        // 与引擎实际应用时一致地构建 client：非法代理或 UA（HeaderValue 规则）
+        // 必须在提交前被拒绝，否则毒值落库后会导致下次启动失败。
         let proxy = fluxdown_engine::proxy_config::ProxyConfig::from_config_map(&merged);
-        fluxdown_engine::downloader::build_client(&proxy, "")
+        let user_agent = merged
+            .get("global_user_agent")
+            .map(String::as_str)
+            .unwrap_or_default();
+        fluxdown_engine::downloader::build_client(&proxy, user_agent)
             .map_err(|error| ActorError::InvalidArgument(format!("{error:#}")))?;
     }
     let revision = engine
@@ -1232,7 +1251,9 @@ async fn patch_config(
             }
             other => ActorError::Operation(format!("{other:#}")),
         })?;
-    apply_live_config(engine, &merged, values.keys()).await?;
+    // DB 与 revision 已提交：即便在线应用失败，也必须广播已提交快照，
+    // 否则 hub 快照与 DB revision 分叉，后续 patch 会一直冲突。
+    let applied = apply_live_config(engine, &merged, values.keys()).await;
     let snapshot = fluxdown_protocol::DaemonConfigSnapshot {
         revision,
         values: crate::config::public_config_values(&merged),
@@ -1240,6 +1261,7 @@ async fn patch_config(
     events.publish(fluxdown_protocol::DaemonEvent::ConfigChanged(
         snapshot.clone(),
     ));
+    applied?;
     Ok(snapshot)
 }
 
@@ -1638,14 +1660,14 @@ mod tests {
         let (db, dir) = open_db().await;
         let store = BTreeMap::from([
             (
-                "a.example".to_owned(),
+                "https://a.example".to_owned(),
                 SiteCredential {
                     user: "alice".to_owned(),
                     pass: "s3cret".to_owned(),
                 },
             ),
             (
-                "b.example:8443".to_owned(),
+                "https://b.example:8443".to_owned(),
                 SiteCredential {
                     user: "bob".to_owned(),
                     pass: "hunter2".to_owned(),
@@ -1656,17 +1678,17 @@ mod tests {
             .await
             .expect("seed credentials");
 
-        let after_delete = delete_site_auth(&db, "a.example")
+        let after_delete = delete_site_auth(&db, "https://a.example")
             .await
             .expect("delete known site");
         assert_eq!(after_delete.len(), 1);
-        assert_eq!(after_delete[0].site, "b.example:8443");
+        assert_eq!(after_delete[0].site, "https://b.example:8443");
         assert_eq!(after_delete[0].user, "bob");
         let json = serde_json::to_string(&after_delete).expect("serialize dto");
         assert!(!json.contains("hunter2"), "password must not leak: {json}");
 
         assert!(matches!(
-            delete_site_auth(&db, "a.example").await,
+            delete_site_auth(&db, "https://a.example").await,
             Err(ActorError::NotFound)
         ));
 
@@ -1690,15 +1712,19 @@ mod tests {
     fn normalize_site_accepts_bare_hosts_ports_and_urls_but_rejects_other_schemes() {
         assert_eq!(
             super::normalize_site("Example.COM").as_deref(),
-            Some("example.com")
+            Some("https://example.com")
         );
         assert_eq!(
             super::normalize_site(" example.com:8443 ").as_deref(),
-            Some("example.com:8443")
+            Some("https://example.com:8443")
         );
         assert_eq!(
             super::normalize_site("https://example.com:443/a.bin").as_deref(),
-            Some("example.com")
+            Some("https://example.com")
+        );
+        assert_eq!(
+            super::normalize_site("http://nas.local:8080/a.bin").as_deref(),
+            Some("http://nas.local:8080")
         );
         assert_eq!(super::normalize_site("ftp://example.com/a.bin"), None);
         assert_eq!(super::normalize_site(""), None);
@@ -1714,19 +1740,25 @@ mod tests {
         tokio::fs::create_dir_all(&dir).await.expect("create dir");
         let db = fluxdown_engine::db::Db::open(&dir).await.expect("open db");
 
-        let first = super::upsert_site_auth(&db, "a.example".into(), "alice".into(), "p1".into())
-            .await
-            .expect("insert");
+        let first =
+            super::upsert_site_auth(&db, "https://a.example".into(), "alice".into(), "p1".into())
+                .await
+                .expect("insert");
         assert_eq!(
             (first.site.as_str(), first.user.as_str()),
-            ("a.example", "alice")
+            ("https://a.example", "alice")
         );
-        super::upsert_site_auth(&db, "b.example".into(), "bob".into(), "p2".into())
+        super::upsert_site_auth(&db, "https://b.example".into(), "bob".into(), "p2".into())
             .await
             .expect("insert second");
-        super::upsert_site_auth(&db, "a.example".into(), "alice2".into(), "p3".into())
-            .await
-            .expect("overwrite");
+        super::upsert_site_auth(
+            &db,
+            "https://a.example".into(),
+            "alice2".into(),
+            "p3".into(),
+        )
+        .await
+        .expect("overwrite");
 
         let json = db
             .get_config(SITE_AUTH_CONFIG_KEY)
@@ -1735,9 +1767,9 @@ mod tests {
             .unwrap_or_default();
         let store = fluxdown_engine::site_auth::parse_store(&json);
         assert_eq!(store.len(), 2);
-        assert_eq!(store["a.example"].user, "alice2");
-        assert_eq!(store["a.example"].pass, "p3");
-        assert_eq!(store["b.example"].pass, "p2");
+        assert_eq!(store["https://a.example"].user, "alice2");
+        assert_eq!(store["https://a.example"].pass, "p3");
+        assert_eq!(store["https://b.example"].pass, "p2");
 
         drop(db);
         let _ = tokio::fs::remove_dir_all(dir).await;
