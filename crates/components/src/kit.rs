@@ -147,6 +147,11 @@ pub fn segmented_tabs(
                             .hover(move |style| style.text_color(colors.foreground))
                     }
                 })
+                .border_1()
+                .border_color(gpui::transparent_black())
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(move |style| style.border_color(colors.ring))
                 .on_click(move |_, window, cx| on_select(index, window, cx))
                 .child(label)
         }))
@@ -163,6 +168,7 @@ pub fn check_row(
     let theme = active_theme(cx);
     let tokens = theme.tokens();
     let hover = theme.extended().colors.row_hover;
+    let ring = tokens.colors.ring;
     div()
         .id(id)
         .flex()
@@ -174,7 +180,13 @@ pub fn check_row(
         .cursor_pointer()
         .text_size(tokens.typography.sm.size)
         .text_color(tokens.colors.foreground)
+        .border_1()
+        .border_color(gpui::transparent_black())
         .hover(move |style| style.bg(hover))
+        // gpui 对获得焦点的可点击元素把 Enter / Space 转成点击，这里只需可聚焦并给出焦点环。
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(move |style| style.border_color(ring))
         .on_click(move |_, window, cx| on_toggle(!checked, window, cx))
         .child(check_mark(
             if checked {

@@ -64,8 +64,11 @@ impl AccountHost {
             self.pending_revocation = None;
         }
         let transition = self.controller.apply_event(event);
+        let changed = transition.changed;
         self.emit_transition(transition, cx);
-        cx.notify();
+        if changed {
+            cx.notify();
+        }
     }
 
     pub fn mark_stale(&mut self, cx: &mut Context<Self>) {

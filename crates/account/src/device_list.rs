@@ -73,6 +73,10 @@ pub(crate) fn platform_label_key(platform: &str) -> Option<&'static str> {
 }
 
 /// ISO-8601 → `YYYY-MM-DD HH:MM`；无法识别时原样返回（空串保持为空）。
+///
+/// 带 `Z` 或 `±HH:MM` 偏移的时间按偏移换算到 UTC 并标注 `UTC`，避免把非 UTC 的偏移值
+/// 当作同一时区直接截断；没有时区信息的值只截断。账户 crate 没有时区数据库，
+/// 无法换算到本地时区，所以明确标注基准时区。
 pub(crate) fn format_timestamp(raw: &str) -> String {
     let raw = raw.trim();
     let bytes = raw.as_bytes();
@@ -81,12 +85,77 @@ pub(crate) fn format_timestamp(raw: &str) -> String {
         && bytes[7] == b'-'
         && matches!(bytes[10], b'T' | b' ')
         && bytes[13] == b':';
-    if looks_iso {
-        raw.get(..16)
-            .map_or_else(|| raw.to_owned(), |head| head.replacen('T', " ", 1))
-    } else {
-        raw.to_owned()
+    if !looks_iso {
+        return raw.to_owned();
     }
+    if let Some(utc) = to_utc_minutes(raw) {
+        return utc;
+    }
+    raw.get(..16)
+        .map_or_else(|| raw.to_owned(), |head| head.replacen('T', " ", 1))
+}
+
+/// 解析带时区的 ISO-8601，返回 `YYYY-MM-DD HH:MM UTC`；无时区或解析失败返回 `None`。
+fn to_utc_minutes(raw: &str) -> Option<String> {
+    let field = |range: std::ops::Range<usize>| -> Option<i64> { raw.get(range)?.parse().ok() };
+    let (year, month, day) = (field(0..4)?, field(5..7)?, field(8..10)?);
+    let (hour, minute) = (field(11..13)?, field(14..16)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 {
+        return None;
+    }
+    // 跳过可选的秒与小数部分，定位时区后缀。
+    let rest = raw.get(16..)?;
+    let zone_start = rest.find(['Z', 'z', '+', '-'])?;
+    let zone = &rest[zone_start..];
+    let offset_minutes = if zone.eq_ignore_ascii_case("z") {
+        0
+    } else {
+        let sign = if zone.starts_with('-') { -1 } else { 1 };
+        let digits = zone.get(1..)?;
+        let (oh, om) = match digits.len() {
+            5 if digits.as_bytes()[2] == b':' => (digits.get(..2)?, digits.get(3..)?),
+            4 => (digits.get(..2)?, digits.get(2..)?),
+            _ => return None,
+        };
+        let (oh, om): (i64, i64) = (oh.parse().ok()?, om.parse().ok()?);
+        if oh > 23 || om > 59 {
+            return None;
+        }
+        sign * (oh * 60 + om)
+    };
+    let local_minutes = days_from_civil(year, month, day) * 1440 + hour * 60 + minute;
+    let utc = local_minutes - offset_minutes;
+    let days = utc.div_euclid(1440);
+    let in_day = utc.rem_euclid(1440);
+    let (y, m, d) = civil_from_days(days);
+    Some(format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        in_day / 60,
+        in_day % 60
+    ))
+}
+
+/// 公历日期 → 自 1970-01-01 起的天数（Howard Hinnant 算法）。
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
 }
 
 #[cfg(test)]
@@ -166,8 +235,19 @@ mod tests {
 
     #[test]
     fn timestamps_are_shortened_only_when_iso() {
-        assert_eq!(format_timestamp("2026-09-29T06:37:48Z"), "2026-09-29 06:37");
+        assert_eq!(
+            format_timestamp("2026-09-29T06:37:48Z"),
+            "2026-09-29 06:37 UTC"
+        );
         assert_eq!(format_timestamp("2026-09-29 06:37:48"), "2026-09-29 06:37");
+        assert_eq!(
+            format_timestamp("2026-09-29T06:37:48+08:00"),
+            "2026-09-28 22:37 UTC"
+        );
+        assert_eq!(
+            format_timestamp("2026-12-31T23:30:00.123-05:30"),
+            "2027-01-01 05:00 UTC"
+        );
         assert_eq!(format_timestamp("yesterday"), "yesterday");
         assert_eq!(format_timestamp(""), "");
     }

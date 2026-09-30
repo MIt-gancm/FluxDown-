@@ -202,16 +202,19 @@ impl Scorer {
                         );
                     }
                     for reading in &unit.readings {
-                        let bytes = reading.as_bytes();
+                        // 读音含非 ASCII 的 ü，必须按字符而不是字节比较。
+                        let reading_len = reading.chars().count();
                         let mut taken = 0;
                         let mut gained = bonus;
-                        while taken < bytes.len()
-                            && consumed + taken < len
-                            && term[consumed + taken] == char::from(bytes[taken])
-                        {
+                        for reading_char in reading.chars() {
+                            if consumed + taken >= len
+                                || !reading_char_matches(term[consumed + taken], reading_char)
+                            {
+                                break;
+                            }
                             taken += 1;
                             gained += SCORE_MATCH;
-                            let full = if taken == bytes.len() {
+                            let full = if taken == reading_len {
                                 BONUS_FULL_SYLLABLE
                             } else {
                                 0
@@ -235,6 +238,11 @@ fn relax(slot: &mut i32, value: i32) {
     if value > *slot {
         *slot = value;
     }
+}
+
+/// 拼音输入习惯用 `v`（或 `u`）代替 `ü`（lv / nv / lue）。
+fn reading_char_matches(typed: char, reading: char) -> bool {
+    typed == reading || (reading == 'ü' && matches!(typed, 'v' | 'u'))
 }
 
 fn lowercase(ch: char) -> char {
@@ -272,6 +280,20 @@ mod tests {
             assert!(score(query, &pause_all).is_some(), "{query} should match");
         }
         assert!(score("qbzx", &pause_all).is_none());
+    }
+
+    #[test]
+    fn u_umlaut_syllables_match_v_and_u_spellings() {
+        let emule = item("电驴下载", &[], &[]);
+        for query in ["dianlv", "dianlu", "dianlvxiazai", "dlxz"] {
+            assert!(score(query, &emule).is_some(), "{query} should match");
+        }
+        let policy = item("策略", &[], &[]);
+        for query in ["celve", "celue"] {
+            assert!(score(query, &policy).is_some(), "{query} should match");
+        }
+        assert!(score("nv", &item("女", &[], &[])).is_some());
+        assert!(score("dianla", &emule).is_none());
     }
 
     #[test]

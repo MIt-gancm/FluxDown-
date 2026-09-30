@@ -7,14 +7,15 @@ use fluxdown_protocol::{LinkApproveParams, LinkPairingRequestDto, method};
 use fluxdown_ui_components::{ControlExt as _, field_error, field_hint};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, IntoElement, ParentElement,
-    Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
+    App, AppContext as _, ClickEvent, Context, Entity, FontWeight, Global, IntoElement,
+    ParentElement, Render, SharedString, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{
     Disableable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     h_flex, v_flex,
 };
+use std::collections::VecDeque;
 
 use crate::errors::{ErrorContext, error_text};
 use crate::host::AccountHost;
@@ -32,11 +33,36 @@ struct PairingPrompt {
     error: Option<SharedString>,
 }
 
-/// 为入站请求 `session_id` 打开确认框；请求已经不在快照里则什么也不做。
+/// 同一时刻只显示一个确认框：gpui-component 的 `close_dialog` 只能弹出栈顶，
+/// 多个请求并存时无法按句柄关闭指定弹窗，所以其余请求排队，前一个关闭后再依次打开。
+#[derive(Default)]
+struct PromptQueue {
+    active: Option<String>,
+    waiting: VecDeque<String>,
+}
+
+impl Global for PromptQueue {}
+
+/// 为入站请求 `session_id` 打开确认框（已有确认框时排队）；请求已经不在快照里则什么也不做。
 pub fn open(host: &Entity<AccountHost>, session_id: &str, window: &mut Window, cx: &mut App) {
+    if host.read(cx).pairing_request(session_id).is_none() {
+        return;
+    }
+    let queue = cx.default_global::<PromptQueue>();
+    if queue.active.is_some() {
+        if !queue.waiting.iter().any(|id| id == session_id) {
+            queue.waiting.push_back(session_id.to_owned());
+        }
+        return;
+    }
+    open_now(host, session_id, window, cx);
+}
+
+fn open_now(host: &Entity<AccountHost>, session_id: &str, window: &mut Window, cx: &mut App) {
     let Some(request) = host.read(cx).pairing_request(session_id) else {
         return;
     };
+    cx.default_global::<PromptQueue>().active = Some(session_id.to_owned());
     let title = t(host.read(cx).translator().read(cx), "incomingPairingTitle");
     let view = cx.new(|cx| PairingPrompt::new(host.clone(), request, window, cx));
     window.open_dialog(cx, move |dialog, _, cx| {
@@ -63,8 +89,7 @@ impl PairingPrompt {
         // 请求从快照消失（对端取消 / 过期 / 已处理）→ 关闭确认框。
         cx.observe_in(&host, window, move |this, host, window, cx| {
             if host.read(cx).pairing_request(&session_id).is_none() {
-                this.answered = true;
-                window.close_dialog(cx);
+                this.finish(window, cx);
             }
         })
         .detach();
@@ -91,6 +116,22 @@ impl PairingPrompt {
         t(self.host.read(cx).translator().read(cx), key)
     }
 
+    /// 关闭自己的确认框并轮到队列里的下一个请求；幂等。
+    fn finish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.answered {
+            return;
+        }
+        self.answered = true;
+        window.close_dialog(cx);
+        cx.default_global::<PromptQueue>().active = None;
+        while let Some(next) = cx.default_global::<PromptQueue>().waiting.pop_front() {
+            open_now(&self.host, &next, window, cx);
+            if cx.default_global::<PromptQueue>().active.is_some() {
+                break;
+            }
+        }
+    }
+
     fn respond(&mut self, accept: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy || self.answered {
             return;
@@ -113,8 +154,7 @@ impl PairingPrompt {
                 this.busy = false;
                 match result {
                     Ok(_) => {
-                        this.answered = true;
-                        window.close_dialog(cx);
+                        this.finish(window, cx);
                     }
                     Err(error) => {
                         this.error = Some(error_text(

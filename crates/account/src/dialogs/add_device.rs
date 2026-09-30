@@ -55,6 +55,7 @@ struct AddDeviceDialog {
     error: Option<SharedString>,
     selected_address: Option<String>,
     closed: bool,
+    seen_incoming: usize,
 }
 
 /// 打开「添加设备」对话框。已登录时默认停在「账号」页，否则直接进「直连配对」。
@@ -80,9 +81,19 @@ impl AddDeviceDialog {
         let translator = host.read(cx).translator().clone();
         let address_placeholder = SharedString::from("192.168.1.20:17800");
         let code_placeholder = t(translator.read(cx), "localPairingCodePlaceholder");
-        cx.observe(&host, |_, _, cx| cx.notify()).detach();
+        cx.observe(&host, |this, host, cx| {
+            // 对端输入本机码后码即被 agent 消耗；出现新的入站请求时换新码，避免界面仍展示已失效的旧码。
+            let incoming = host.read(cx).pending_pairing_requests().len();
+            if incoming > this.seen_incoming && this.direct_started && !this.closed {
+                this.refresh_own_code(cx);
+            }
+            this.seen_incoming = incoming;
+            cx.notify();
+        })
+        .detach();
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
         let logged_in = host.read(cx).controller.session().is_some();
+        let seen_incoming = host.read(cx).pending_pairing_requests().len();
         let mut this = Self {
             host,
             tab: if logged_in { Tab::Account } else { Tab::Direct },
@@ -97,6 +108,7 @@ impl AddDeviceDialog {
             error: None,
             selected_address: None,
             closed: false,
+            seen_incoming,
         };
         spawn_ticker(window, cx, |this: &mut Self, _, cx| {
             if this.closed {
@@ -432,6 +444,7 @@ impl AddDeviceDialog {
                             .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                                 let translator = this.host.read(cx).translator().clone();
                                 let port = this.host.read(cx).port();
+                                this.shutdown(cx);
                                 window.close_dialog(cx);
                                 crate::dialogs::login::open(translator, port, window, cx);
                             })),
@@ -748,7 +761,10 @@ impl AddDeviceDialog {
                             .primary()
                             .label(self.t("close", cx))
                             .control(cx)
-                            .on_click(|_, window, cx| window.close_dialog(cx)),
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.shutdown(cx);
+                                window.close_dialog(cx);
+                            })),
                     ),
                 )
                 .into_any_element(),

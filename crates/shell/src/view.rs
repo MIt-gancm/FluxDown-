@@ -139,6 +139,8 @@ impl ShellAction {
 pub struct AuxiliaryWindowView {
     _translator: Entity<Translator>,
     title: SharedString,
+    /// 已写入 OS 窗口标题的默认标题；与 `title` 不同说明语言切换后需要同步。
+    os_title: SharedString,
     /// 宿主设置的动态标题（如任务文件名）；存在时优先于按语言刷新的默认标题。
     title_override: Option<SharedString>,
     content: AnyView,
@@ -160,6 +162,7 @@ impl AuxiliaryWindowView {
         .detach();
         Self {
             _translator: translator,
+            os_title: title.clone(),
             title,
             title_override: None,
             content,
@@ -169,6 +172,10 @@ impl AuxiliaryWindowView {
     /// 以动态文本覆盖标题（传 `None` 恢复按语言键显示的默认标题）。
     pub fn set_title(&mut self, title: Option<SharedString>, cx: &mut Context<Self>) {
         if self.title_override != title {
+            if title.is_none() {
+                // 宿主自己写过 OS 标题；恢复默认时需要重新同步。
+                self.os_title = SharedString::default();
+            }
             self.title_override = title;
             cx.notify();
         }
@@ -217,7 +224,12 @@ impl AuxiliaryWindowView {
 }
 
 impl Render for AuxiliaryWindowView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 构造时拿不到 Window：语言切换后在渲染期把默认标题同步到 OS 窗口标题。
+        if self.title_override.is_none() && self.os_title != self.title {
+            window.set_window_title(&self.title);
+            self.os_title = self.title.clone();
+        }
         let colors = active_theme(cx).tokens().colors;
         v_flex()
             .size_full()

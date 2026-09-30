@@ -45,6 +45,10 @@ pub struct AccountView {
     devices_refreshing: bool,
     /// 已配对设备「刷新」在途。
     linked_refreshing: bool,
+    /// 「退出登录」在途：按钮置灰并拒绝重入。
+    signing_out: bool,
+    /// 上次观察到的登录态，用于在切换时清掉旧错误。
+    had_session: bool,
     _endpoint_subscription: Subscription,
     _host_subscription: Subscription,
 }
@@ -57,7 +61,17 @@ impl AccountView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
-        cx.observe(&host, |_, _, cx| cx.notify()).detach();
+        let had_session = host.read(cx).controller.session().is_some();
+        cx.observe(&host, |this, host, cx| {
+            // 会话登入/登出切换后，上一状态遗留的错误不再适用。
+            let has_session = host.read(cx).controller.session().is_some();
+            if has_session != this.had_session {
+                this.had_session = has_session;
+                this.last_error = None;
+            }
+            cx.notify();
+        })
+        .detach();
         let _host_subscription = cx.subscribe(&host, |this, _, event, cx| {
             if matches!(event, AccountHostEvent::SnapshotReplaced) {
                 this.last_error = None;
@@ -84,6 +98,8 @@ impl AccountView {
             cloud_refreshing: false,
             devices_refreshing: false,
             linked_refreshing: false,
+            signing_out: false,
+            had_session,
             _endpoint_subscription,
             _host_subscription,
         };
@@ -122,11 +138,35 @@ impl AccountView {
 
     /// 登出：用户主动结束会话，agent 不发撤销提示。
     pub(crate) fn sign_out(&mut self, cx: &mut Context<Self>) {
+        if self.signing_out {
+            return;
+        }
         let future = self.port(cx).execute(AccountCommand::Auth {
             method: method::AGENT_AUTH_LOGOUT,
             params: serde_json::json!({}),
         });
-        self.spawn_action(future, ErrorContext::General, cx);
+        self.signing_out = true;
+        self.last_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = future.await;
+            let _ = this.update(cx, |this, cx| {
+                this.signing_out = false;
+                // agent 先清本地会话再回报吊销失败（如离线）；本机已退出时该错误只会误导。
+                let signed_out = this.controller(cx).session().is_none();
+                if let Err(error) = result
+                    && !signed_out
+                {
+                    this.last_error = Some(error_text(
+                        this.translator.read(cx),
+                        &error,
+                        ErrorContext::General,
+                    ));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// 已配对设备「刷新」：探测在线状态；结果经 `LinkedDevicesChanged` 回流。
@@ -422,7 +462,7 @@ impl Render for AccountView {
                 session,
                 pages::profile::ProfileState {
                     copied: origin_id_copied,
-                    disabled,
+                    disabled: disabled || self.signing_out,
                     refreshing: self.cloud_refreshing,
                     last_error,
                 },

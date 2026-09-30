@@ -18,6 +18,8 @@ pub(crate) struct Transition {
     pub new_pairing_requests: Vec<String>,
     /// agent 通知会话被非用户主动结束（`deviceUntrusted` / `sessionExpired` / `accountDisabled`）。
     pub session_revoked: Option<ErrorReason>,
+    /// 账户相关状态是否发生变化；无关的服务事件（下载进度等）为 `false`，宿主据此跳过重渲染。
+    pub changed: bool,
 }
 
 pub struct AccountController {
@@ -64,6 +66,7 @@ impl AccountController {
         Transition {
             new_pairing_requests: self.take_new_requests(),
             session_revoked: None,
+            changed: true,
         }
     }
 
@@ -74,6 +77,7 @@ impl AccountController {
         let mut transition = Transition::default();
         match event {
             AgentEvent::SessionChanged(session) => {
+                transition.changed = true;
                 self.session.clone_from(session.as_ref());
                 if self.session.is_none() {
                     // 会话结束后账号维度的数据随之失效，不留旧账号的设备。
@@ -81,16 +85,35 @@ impl AccountController {
                 }
             }
             // agent 只在非用户主动结束时发送（登出 / 删除本机设备不发）。
-            AgentEvent::SessionRevoked(reason) => transition.session_revoked = Some(*reason),
-            AgentEvent::CloudDevicesChanged(devices) => self.devices.clone_from(devices),
-            AgentEvent::SyncChanged(status) => self.sync = status.clone(),
-            AgentEvent::LinkedDevicesChanged(devices) => self.linked.clone_from(devices),
-            AgentEvent::LinkDiscoveredChanged(peers) => self.discovered.clone_from(peers),
+            AgentEvent::SessionRevoked(reason) => {
+                transition.changed = true;
+                transition.session_revoked = Some(*reason);
+            }
+            AgentEvent::CloudDevicesChanged(devices) => {
+                transition.changed = true;
+                self.devices.clone_from(devices);
+            }
+            AgentEvent::SyncChanged(status) => {
+                transition.changed = true;
+                self.sync = status.clone();
+            }
+            AgentEvent::LinkedDevicesChanged(devices) => {
+                transition.changed = true;
+                self.linked.clone_from(devices);
+            }
+            AgentEvent::LinkDiscoveredChanged(peers) => {
+                transition.changed = true;
+                self.discovered.clone_from(peers);
+            }
             AgentEvent::LinkPairingRequestsChanged(requests) => {
+                transition.changed = true;
                 self.pairing_requests.clone_from(requests);
                 transition.new_pairing_requests = self.take_new_requests();
             }
-            AgentEvent::GatewayChanged(gateway) => self.lan_enabled = gateway.lan_enabled,
+            AgentEvent::GatewayChanged(gateway) => {
+                transition.changed = true;
+                self.lan_enabled = gateway.lan_enabled;
+            }
             _ => {}
         }
         transition
@@ -333,5 +356,18 @@ mod tests {
             },
         )));
         assert!(controller.lan_enabled());
+    }
+
+    #[test]
+    fn only_account_events_report_change() {
+        let mut controller = controller();
+        assert!(controller.apply_event(&session_changed(None)).changed);
+        // 下载进度等与账户无关的事件不应唤醒账户视图。
+        let unrelated = ServiceEvent::Daemon(fluxdown_protocol::DaemonEvent::TaskDeleted {
+            task_id: "t".to_owned(),
+        });
+        assert!(!controller.apply_event(&unrelated).changed);
+        let unrelated = ServiceEvent::Agent(AgentEvent::DaemonConnectionChanged(true));
+        assert!(!controller.apply_event(&unrelated).changed);
     }
 }
