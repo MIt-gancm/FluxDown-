@@ -109,6 +109,8 @@ pub struct TaskDetailView {
     seed_time_limit: Entity<InputState>,
     seed_inactive_limit: Entity<InputState>,
     seed_upload_limit: Entity<InputState>,
+    /// 错误信息复制按钮的反馈代次；非零 = 显示「已复制」勾选态，定时回落时比对代次防连点提前复位。
+    error_copied: u32,
 }
 
 impl EventEmitter<TaskDetailEvent> for TaskDetailView {}
@@ -216,6 +218,7 @@ impl TaskDetailView {
             seed_time_limit,
             seed_inactive_limit,
             seed_upload_limit,
+            error_copied: 0,
         };
         Self::spawn_speed_ticker(cx);
         this
@@ -253,6 +256,7 @@ impl TaskDetailView {
         self.speed_history.clear();
         self.runtime = None;
         self.closed = false;
+        self.error_copied = 0;
         self.fetch_activity(cx);
         cx.notify();
     }
@@ -555,6 +559,33 @@ impl TaskDetailView {
         drop(row);
         cx.write_to_clipboard(ClipboardItem::new_string(url));
         window.push_notification(Notification::success(self.strings.url_copied.clone()), cx);
+    }
+
+    fn copy_error(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.store.get(&RowKey::Local(self.task_id.clone())) else {
+            return;
+        };
+        let message = row.error_message.clone();
+        drop(row);
+        if message.is_empty() {
+            return;
+        }
+        cx.write_to_clipboard(ClipboardItem::new_string(message));
+        let generation = self.error_copied.wrapping_add(1).max(1);
+        self.error_copied = generation;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.error_copied == generation {
+                    this.error_copied = 0;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn save_seed_limits(&mut self, cx: &mut Context<Self>) {
@@ -980,11 +1011,43 @@ impl TaskDetailView {
             ));
         }
         if !row.error_message.is_empty() {
+            let copied = self.error_copied != 0;
+            let success = active_theme(cx).extended().colors.success;
+            let tooltip = self.t(
+                cx,
+                if copied {
+                    "detailErrorCopied"
+                } else {
+                    "detailCopyError"
+                },
+            );
             list = list.child(detail_row(
                 self.t(cx, "infoError"),
-                div()
-                    .text_color(tokens.colors.destructive)
-                    .child(SharedString::from(row.error_message.clone())),
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_start()
+                    .gap(tokens.spacing.sm)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(tokens.colors.destructive)
+                            .child(SharedString::from(row.error_message.clone())),
+                    )
+                    .child(
+                        Button::new("detail-copy-error")
+                            .ghost()
+                            .control_icon(cx)
+                            .icon(if copied {
+                                FluxIcon::Check
+                            } else {
+                                FluxIcon::Copy
+                            })
+                            .when(copied, |this| this.text_color(success))
+                            .tooltip(tooltip)
+                            .on_click(cx.listener(|this, _, _, cx| this.copy_error(cx))),
+                    ),
                 cx,
             ));
         }

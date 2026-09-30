@@ -2399,6 +2399,8 @@ class S {
   String get webhookRegenerate => _r('webhookRegenerate');
   String get webhookCopy => _r('webhookCopy');
   String get webhookCopied => _r('webhookCopied');
+  String get detailCopyError => _r('detailCopyError');
+  String get detailErrorCopied => _r('detailErrorCopied');
   String get webhookFieldAllowHttp => _r('webhookFieldAllowHttp');
   String get webhookAllowHttpDesc => _r('webhookAllowHttpDesc');
   String get webhookFieldUseProxy => _r('webhookFieldUseProxy');
