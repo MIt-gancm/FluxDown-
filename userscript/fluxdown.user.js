@@ -89,13 +89,159 @@
   function base() { return `http://127.0.0.1:${CFG.port}`; }
 
   // ==========================================================================
+  // 多语言（按浏览器语言在中英间切换）
+  // ==========================================================================
+
+  const LANG = /^zh/i.test((typeof navigator !== 'undefined' && navigator.language) || '') ? 'zh' : 'en';
+  const STR = {
+    zh: {
+      sent: '已发送到 FluxDown：{0}',
+      errToken: 'FluxDown 拒绝请求：Token 缺失或错误',
+      errTakeoverOff: 'FluxDown 未开启浏览器脚本接管',
+      errQueueFull: 'FluxDown 待确认队列已满',
+      errHttp: 'FluxDown 返回异常状态 {0}',
+      errNoResponse: 'FluxDown 响应超时，请查看桌面端确认是否已收到',
+      errOffline: 'FluxDown 未运行',
+      sfxFallback: '，已交回浏览器下载',
+      sfxNoFallback: '，下载未发送',
+      fabTitle: 'FluxDown 资源面板',
+      panelTitle: 'FluxDown 嗅探资源',
+      refresh: '刷新',
+      clear: '清空',
+      sendAll: '全部发送',
+      pageLinks: '本页链接',
+      emptyList: '暂无嗅探到的资源<br>播放视频或刷新页面以重新嗅探',
+      download: '下载',
+      noSniffed: '没有可发送的资源',
+      sentN: '已发送 {0} 个资源到 FluxDown',
+      noLinks: '本页未发现可下载链接',
+      sentLinks: '已发送本页 {0} 个链接到 FluxDown',
+      sendFail: '发送失败，请确认 FluxDown 在运行',
+      batchFull: 'FluxDown 待确认队列已满，已发送 {0}/{1} 个，请先处理桌面端确认框后重试',
+      batchPartial: '发送中断，已发送 {0}/{1} 个',
+      menuTakeoverOn: '✅ 下载接管：开（点击切换）',
+      menuTakeoverOff: '⛔ 下载接管：关（点击切换）',
+      takeoverOn: '下载接管已开启',
+      takeoverOff: '下载接管已关闭',
+      menuSnifferOn: '🎬 媒体嗅探：开（点击切换）',
+      menuSnifferOff: '⛔ 媒体嗅探：关（点击切换）',
+      snifferOn: '媒体嗅探已开启',
+      snifferOff: '媒体嗅探已关闭',
+      menuPanel: '📂 显示/隐藏 资源面板',
+      menuAllLinks: '⬇ 下载本页全部链接',
+      menuPort: '🔌 设置端口（当前 {0}）',
+      promptPort: 'FluxDown RPC 端口（与设置页一致，默认 17800）：',
+      portSet: '端口已设为 {0}',
+      portBad: '端口无效',
+      menuToken: '🔑 设置 Token（可选）',
+      promptToken: 'FluxDown RPC 授权密钥（在 FluxDown 设置页生成，可留空）：',
+      tokenSaved: 'Token 已保存',
+      menuTest: '🩺 测试连接',
+      testing: '正在测试…',
+      connected: '已连接 FluxDown（{0}）',
+      cannotConnect: '无法连接 {0}，请确认 FluxDown 已启动且 RPC 服务已开启',
+    },
+    en: {
+      sent: 'Sent to FluxDown: {0}',
+      errToken: 'FluxDown rejected the request: missing or wrong token',
+      errTakeoverOff: 'FluxDown browser-script capture is turned off',
+      errQueueFull: 'FluxDown confirmation queue is full',
+      errHttp: 'FluxDown returned status {0}',
+      errNoResponse: 'FluxDown did not respond in time; check the desktop app to see if it was received',
+      errOffline: 'FluxDown is not running',
+      sfxFallback: '; handed back to the browser',
+      sfxNoFallback: '; download not sent',
+      fabTitle: 'FluxDown resource panel',
+      panelTitle: 'FluxDown sniffed resources',
+      refresh: 'Refresh',
+      clear: 'Clear',
+      sendAll: 'Send all',
+      pageLinks: 'Page links',
+      emptyList: 'No resources sniffed yet<br>Play a video or reload the page to sniff again',
+      download: 'Download',
+      noSniffed: 'No resources to send',
+      sentN: 'Sent {0} resources to FluxDown',
+      noLinks: 'No downloadable links found on this page',
+      sentLinks: 'Sent {0} links from this page to FluxDown',
+      sendFail: 'Send failed; make sure FluxDown is running',
+      batchFull: 'FluxDown confirmation queue is full; sent {0}/{1}. Handle the pending prompts in the desktop app and retry',
+      batchPartial: 'Sending interrupted; sent {0}/{1}',
+      menuTakeoverOn: '✅ Download capture: ON (click to toggle)',
+      menuTakeoverOff: '⛔ Download capture: OFF (click to toggle)',
+      takeoverOn: 'Download capture enabled',
+      takeoverOff: 'Download capture disabled',
+      menuSnifferOn: '🎬 Media sniffer: ON (click to toggle)',
+      menuSnifferOff: '⛔ Media sniffer: OFF (click to toggle)',
+      snifferOn: 'Media sniffer enabled',
+      snifferOff: 'Media sniffer disabled',
+      menuPanel: '📂 Show/hide resource panel',
+      menuAllLinks: '⬇ Download all links on this page',
+      menuPort: '🔌 Set port (current {0})',
+      promptPort: 'FluxDown RPC port (same as in Settings, default 17800):',
+      portSet: 'Port set to {0}',
+      portBad: 'Invalid port',
+      menuToken: '🔑 Set token (optional)',
+      promptToken: 'FluxDown RPC token (generated in FluxDown Settings, may be empty):',
+      tokenSaved: 'Token saved',
+      menuTest: '🩺 Test connection',
+      testing: 'Testing…',
+      connected: 'Connected to FluxDown ({0})',
+      cannotConnect: 'Cannot reach {0}; make sure FluxDown is running with the RPC service enabled',
+    },
+  };
+  function t(key) {
+    const args = arguments;
+    const s = STR[LANG][key] || STR.en[key] || key;
+    return s.replace(/\{(\d)\}/g, (_m, i) => String(args[Number(i) + 1]));
+  }
+
+  // 只接管 http(s) 与 magnet；blob:/data:/javascript: 等一律交还浏览器。
+  function isTakeoverScheme(url) {
+    try {
+      const p = new URL(url, location.href).protocol;
+      return p === 'http:' || p === 'https:' || p === 'magnet:';
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // FluxDown 自带 Web UI 的页面（同端口）不接管，否则会劫持它自己的文件下载/日志导出。
+  function isSelfPage() {
+    try {
+      return (location.hostname === '127.0.0.1' || location.hostname === 'localhost') &&
+        String(location.port) === String(CFG.port);
+    } catch (_) {
+      return false;
+    }
+  }
+  function active() { return CFG.enabled && !isSelfPage(); }
+
+  // document.cookie 只附带给与当前页面同站（同主机或其子域）的目标，避免泄露给第三方主机。
+  function cookiesFor(url) {
+    try {
+      const u = new URL(url, location.href);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+      const h = u.hostname.toLowerCase();
+      const p = location.hostname.toLowerCase();
+      if (h === p || h.endsWith('.' + p)) return document.cookie || '';
+    } catch (_) { /* */ }
+    return '';
+  }
+  function cookiesForAll(urls) {
+    const first = cookiesFor(urls[0]);
+    return first && urls.every((u) => cookiesFor(u)) ? first : '';
+  }
+
+  // ==========================================================================
   // 可下载资源识别
   // ==========================================================================
 
   // 点击拦截的目标扩展名（视频/音频/压缩包/安装包/文档/镜像/种子等大文件）。
+  // 刻意不含 ts/img/bin/dat/csv：它们常是源码页（如 GitHub 的 index.ts）或普通数据页，
+  // 会误拦截页面导航。
   const DOWNLOADABLE_EXTS = new Set([
     // 视频
-    'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', 'mpg', 'mpeg', 'rmvb', 'ts',
+    'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', 'mpg', 'mpeg', 'rmvb',
     // 音频
     'mp3', 'flac', 'aac', 'wav', 'ogg', 'wma', 'ape', 'm4a', 'opus',
     // 压缩包
@@ -103,11 +249,11 @@
     // 安装包/可执行
     'exe', 'msi', 'dmg', 'pkg', 'deb', 'rpm', 'appimage', 'apk', 'xapk',
     // 文档
-    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'epub', 'csv',
+    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'epub',
     // 镜像
-    'iso', 'img', 'vmdk',
+    'iso', 'vmdk',
     // 其它大文件
-    'bin', 'dat', 'torrent',
+    'torrent',
   ]);
 
   // 明确排除的网页资源扩展名（避免误拦截）。
@@ -214,10 +360,8 @@
 
   // 链接是否「看起来可下载」（用于点击拦截判断）。
   function looksDownloadable(url) {
-    let protocol = '';
-    try { protocol = new URL(url, location.href).protocol; } catch (_) { return false; }
-    if (protocol === 'magnet:') return true;
-    if (protocol !== 'http:' && protocol !== 'https:') return false;
+    if (!isTakeoverScheme(url)) return false;
+    if (/^magnet:/i.test(url)) return true;
     const ext = extOf(url);
     if (!ext) return false;
     if (EXCLUDE_EXTS.has(ext)) return false;
@@ -257,16 +401,24 @@
     return h;
   }
 
+  // 最近一次 /ping 结果：已知离线时程序化 click/open 直接放行原生行为。
+  let lastPing = { alive: null, ts: 0 };
   async function ping() {
+    let alive = false;
     try {
       const r = await gmRequest({ method: 'GET', url: `${base()}/ping`, timeout: 1500 });
-      return r.status >= 200 && r.status < 300;
+      alive = r.status >= 200 && r.status < 300;
     } catch (_) {
-      return false;
+      alive = false;
     }
+    lastPing = { alive, ts: Date.now() };
+    return alive;
+  }
+  function knownOffline() {
+    return lastPing.alive === false && Date.now() - lastPing.ts < 30000;
   }
 
-  // 把单个下载请求发给 FluxDown。返回 true 表示已被接受。
+  // 把单个下载请求发给 FluxDown。status>0 表示收到了明确的 HTTP 响应；0 表示网络错误/超时。
   async function sendDownload(payload) {
     try {
       const r = await gmRequest({
@@ -277,16 +429,18 @@
       });
       const ok = r.status >= 200 && r.status < 300;
       if (!ok) console.warn('[FluxDown] send failed:', r.status, r.responseText);
-      return ok;
+      else lastPing = { alive: true, ts: Date.now() };
+      return { ok, status: r.status };
     } catch (e) {
       console.warn('[FluxDown] send error:', e);
-      return false;
+      return { ok: false, status: 0 };
     }
   }
 
-  // 批量下载（单次请求，url 由 FluxDown 端按换行拆分，用户只需确认一次）。
-  async function sendBatch(urls, shared) {
-    if (!urls.length) return false;
+  // 服务端待确认队列上限为 64，单批不超过它以免整批被拒。
+  const BATCH_CHUNK = 50;
+
+  async function sendBatch(urls) {
     try {
       const r = await gmRequest({
         method: 'POST',
@@ -294,15 +448,27 @@
         headers: authHeaders(),
         data: JSON.stringify({
           urls,
-          referrer: (shared && shared.referrer) || location.href,
-          cookies: (shared && shared.cookies) || document.cookie || '',
+          referrer: location.href,
+          cookies: cookiesForAll(urls),
         }),
       });
-      return r.status >= 200 && r.status < 300;
+      return { ok: r.status >= 200 && r.status < 300, status: r.status };
     } catch (e) {
       console.warn('[FluxDown] batch error:', e);
-      return false;
+      return { ok: false, status: 0 };
     }
+  }
+
+  // 分批发送；遇到失败即停止。返回已成功发送的条数与最后一次失败状态码。
+  async function sendBatchChunked(urls) {
+    let sent = 0;
+    for (let i = 0; i < urls.length; i += BATCH_CHUNK) {
+      const chunk = urls.slice(i, i + BATCH_CHUNK);
+      const r = await sendBatch(chunk);
+      if (!r.ok) return { sent, status: r.status };
+      sent += chunk.length;
+    }
+    return { sent, status: 200 };
   }
 
   // 构造一次下载的标准 payload。
@@ -312,8 +478,8 @@
       url,
       filename: opts.filename || '',
       referrer: opts.referrer || location.href,
-      // 仅能拿到非 httpOnly Cookie；够覆盖多数场景。
-      cookies: document.cookie || '',
+      // 仅能拿到非 httpOnly Cookie，且只附带给同站目标。
+      cookies: cookiesFor(url),
       fileSize: typeof opts.fileSize === 'number' ? opts.fileSize : undefined,
       mimeType: opts.mimeType || undefined,
     };
@@ -322,20 +488,35 @@
   // 发送 + 用户反馈 + 失败回退。
   async function takeover(url, opts) {
     opts = opts || {};
-    const ok = await sendDownload(buildPayload(url, opts));
-    if (ok) {
-      toast(`已发送到 FluxDown：${opts.filename || filenameOf(url) || url}`);
-    } else {
-      // 失败：确认 App 是否在线，决定是否回退浏览器下载。
-      const alive = await ping();
-      if (alive) {
-        toast('FluxDown 收到请求（响应异常），请查看桌面端', true);
-      } else {
-        toast('FluxDown 未运行，已交回浏览器下载', true);
-        if (opts.allowFallback) browserFallback(url, opts.filename);
-      }
+    const res = await sendDownload(buildPayload(url, opts));
+    if (res.ok) {
+      toast(t('sent', opts.filename || filenameOf(url) || url));
+      return true;
     }
-    return ok;
+    let reason;
+    let fallback;
+    if (res.status > 0) {
+      // 明确的非 2xx：服务端一定没有受理，直接回退。
+      fallback = true;
+      if (res.status === 401 || res.status === 403) reason = t('errToken');
+      else if (res.status === 404) reason = t('errTakeoverOff');
+      else if (res.status === 503) reason = t('errQueueFull');
+      else reason = t('errHttp', res.status);
+    } else if (await ping()) {
+      // 超时但服务在线：可能稍后才受理，只提示不回退以免重复下载。
+      toast(t('errNoResponse'), true);
+      return false;
+    } else {
+      fallback = true;
+      reason = t('errOffline');
+    }
+    const doFallback = fallback && opts.allowFallback;
+    toast(reason + t(doFallback ? 'sfxFallback' : 'sfxNoFallback'), true);
+    if (doFallback) {
+      if (opts.fallback) opts.fallback();
+      else browserFallback(url, opts.filename);
+    }
+    return false;
   }
 
   // ==========================================================================
@@ -382,7 +563,7 @@
 
   // 用户点击（捕获阶段，先于浏览器默认行为）。
   document.addEventListener('click', function (ev) {
-    if (!CFG.enabled) return;
+    if (!active()) return;
     if (bypassPressed(ev)) return; // 修饰键放行
     const a = ev.target && ev.target.closest
       ? ev.target.closest('a[href]')
@@ -391,7 +572,7 @@
     if (a.hasAttribute('data-fluxdown-skip')) return;
 
     const href = a.href;
-    if (!href || isBypassed(href)) return;
+    if (!href || !isTakeoverScheme(href) || isBypassed(href)) return;
 
     const hasDownloadAttr = a.hasAttribute('download');
     if (!hasDownloadAttr && !looksDownloadable(href)) return;
@@ -411,11 +592,13 @@
     const origClick = W.HTMLAnchorElement.prototype.click;
     W.HTMLAnchorElement.prototype.click = function () {
       try {
-        if (CFG.enabled && !this.hasAttribute('data-fluxdown-skip')) {
+        if (active() && !knownOffline() && !this.hasAttribute('data-fluxdown-skip')) {
           const href = this.href;
-          if (href && !isBypassed(href) && (this.hasAttribute('download') || looksDownloadable(href))) {
-            takeover(href, { filename: this.getAttribute('download') || '', allowFallback: false });
-            return; // 拦截，不执行原生 click
+          // blob:/data: 等协议必须在此同步放行：页面常在 click() 后立即 revoke。
+          if (href && isTakeoverScheme(href) && !isBypassed(href) &&
+              (this.hasAttribute('download') || looksDownloadable(href))) {
+            takeover(href, { filename: this.getAttribute('download') || '', allowFallback: true });
+            return; // 拦截，不执行原生 click；失败时由 browserFallback 重放
           }
         }
       } catch (_) { /* */ }
@@ -428,8 +611,12 @@
     const origOpen = W.open;
     W.open = function (url) {
       try {
-        if (CFG.enabled && typeof url === 'string' && url && !isBypassed(url) && looksDownloadable(url)) {
-          takeover(url, { allowFallback: false });
+        if (active() && !knownOffline() && typeof url === 'string' && url && !isBypassed(url) &&
+            isTakeoverScheme(url) && looksDownloadable(url)) {
+          const args = arguments;
+          const self = this;
+          // 失败时重放原 window.open（用户手势可能已过期，浏览器可能拦截弹窗）。
+          takeover(url, { allowFallback: true, fallback: () => origOpen.apply(self, args) });
           return null;
         }
       } catch (_) { /* */ }
@@ -685,7 +872,7 @@
 
     fabEl = document.createElement('div');
     fabEl.className = 'fab';
-    fabEl.title = 'FluxDown 资源面板';
+    fabEl.title = t('fabTitle');
     fabEl.innerHTML = '⬇<span class="badge"></span>';
     badgeEl = fabEl.querySelector('.badge');
     fabEl.addEventListener('click', togglePanel);
@@ -695,17 +882,17 @@
     panelEl.className = 'panel';
     panelEl.innerHTML = `
       <div class="hd">
-        <span>FluxDown 嗅探资源</span>
+        <span>${t('panelTitle')}</span>
         <span class="acts">
-          <button data-act="refresh">刷新</button>
-          <button data-act="clear">清空</button>
+          <button data-act="refresh">${t('refresh')}</button>
+          <button data-act="clear">${t('clear')}</button>
           <button data-act="close">×</button>
         </span>
       </div>
       <div class="list"></div>
       <div class="ft">
-        <button data-act="all" class="primary">全部发送</button>
-        <button data-act="links">本页链接</button>
+        <button data-act="all" class="primary">${t('sendAll')}</button>
+        <button data-act="links">${t('pageLinks')}</button>
       </div>`;
     listEl = panelEl.querySelector('.list');
     panelEl.querySelector('[data-act="close"]').addEventListener('click', togglePanel);
@@ -734,7 +921,7 @@
   function renderList() {
     if (!listEl) return;
     if (!sniffed.length) {
-      listEl.innerHTML = '<div class="empty">暂无嗅探到的资源<br>播放视频或刷新页面以重新嗅探</div>';
+      listEl.innerHTML = `<div class="empty">${t('emptyList')}</div>`;
       return;
     }
     listEl.innerHTML = '';
@@ -747,7 +934,7 @@
       item.innerHTML = `
         <div class="ic">${label}</div>
         <div class="meta"><div class="nm"></div><div class="sub"></div></div>
-        <button class="dl">下载</button>`;
+        <button class="dl">${t('download')}</button>`;
       item.querySelector('.nm').textContent = name;
       item.querySelector('.sub').textContent = sub;
       item.querySelector('.dl').addEventListener('click', () => {
@@ -764,22 +951,29 @@
   }
 
   async function sendAllSniffed() {
-    if (!sniffed.length) { toast('没有可发送的资源', true); return; }
+    if (!sniffed.length) { toast(t('noSniffed'), true); return; }
     const urls = sniffed.map((r) => r.url);
-    const ok = await sendBatch(urls);
-    toast(ok ? `已发送 ${urls.length} 个资源到 FluxDown` : '发送失败，请确认 FluxDown 在运行', !ok);
+    const res = await sendBatchChunked(urls);
+    reportBatch(res, urls.length, 'sentN');
+  }
+
+  function reportBatch(res, total, okKey) {
+    if (res.sent === total) toast(t(okKey, total));
+    else if (res.status === 503) toast(t('batchFull', res.sent, total), true);
+    else if (res.sent > 0) toast(t('batchPartial', res.sent, total), true);
+    else toast(t('sendFail'), true);
   }
 
   async function downloadAllLinks() {
     const set = new Set();
     document.querySelectorAll('a[href]').forEach((a) => {
       const href = a.href;
-      if (href && (looksDownloadable(href) || a.hasAttribute('download'))) set.add(href);
+      if (href && isTakeoverScheme(href) && (looksDownloadable(href) || a.hasAttribute('download'))) set.add(href);
     });
     const urls = [...set];
-    if (!urls.length) { toast('本页未发现可下载链接', true); return; }
-    const ok = await sendBatch(urls);
-    toast(ok ? `已发送本页 ${urls.length} 个链接到 FluxDown` : '发送失败，请确认 FluxDown 在运行', !ok);
+    if (!urls.length) { toast(t('noLinks'), true); return; }
+    const res = await sendBatchChunked(urls);
+    reportBatch(res, urls.length, 'sentLinks');
   }
 
   // 轻量 toast（优先页面内 Shadow DOM，失败回退 GM_notification）。
@@ -812,34 +1006,34 @@
       try { menuIds.push(GM_registerMenuCommand(caption, fn)); } catch (_) { /* */ }
     };
 
-    add(`${CFG.enabled ? '✅' : '⛔'} 下载接管：${CFG.enabled ? '开' : '关'}（点击切换）`, () => {
+    add(t(CFG.enabled ? 'menuTakeoverOn' : 'menuTakeoverOff'), () => {
       CFG.enabled = !CFG.enabled;
-      toast(`下载接管已${CFG.enabled ? '开启' : '关闭'}`);
+      toast(t(CFG.enabled ? 'takeoverOn' : 'takeoverOff'));
       registerMenu();
     });
-    add(`${CFG.sniffer ? '🎬' : '⛔'} 媒体嗅探：${CFG.sniffer ? '开' : '关'}（点击切换）`, () => {
+    add(t(CFG.sniffer ? 'menuSnifferOn' : 'menuSnifferOff'), () => {
       CFG.sniffer = !CFG.sniffer;
-      toast(`媒体嗅探已${CFG.sniffer ? '开启' : '关闭'}`);
+      toast(t(CFG.sniffer ? 'snifferOn' : 'snifferOff'));
       registerMenu();
     });
-    add('📂 显示/隐藏 资源面板', () => togglePanel());
-    add('⬇ 下载本页全部链接', () => downloadAllLinks());
-    add(`🔌 设置端口（当前 ${CFG.port}）`, () => {
-      const p = prompt('FluxDown RPC 端口（与设置页一致，默认 17800）：', String(CFG.port));
+    add(t('menuPanel'), () => togglePanel());
+    add(t('menuAllLinks'), () => downloadAllLinks());
+    add(t('menuPort', CFG.port), () => {
+      const p = prompt(t('promptPort'), String(CFG.port));
       if (p !== null) {
         const n = parseInt(p.trim(), 10);
-        if (n >= 1 && n <= 65535) { CFG.port = n; toast(`端口已设为 ${n}`); registerMenu(); }
-        else toast('端口无效', true);
+        if (n >= 1 && n <= 65535) { CFG.port = n; toast(t('portSet', n)); registerMenu(); }
+        else toast(t('portBad'), true);
       }
     });
-    add('🔑 设置 Token（可选）', () => {
-      const t = prompt('FluxDown RPC 授权密钥（在 FluxDown 设置页生成，可留空）：', CFG.token);
-      if (t !== null) { CFG.token = t.trim(); toast('Token 已保存'); }
+    add(t('menuToken'), () => {
+      const tk = prompt(t('promptToken'), CFG.token);
+      if (tk !== null) { CFG.token = tk.trim(); toast(t('tokenSaved')); }
     });
-    add('🩺 测试连接', async () => {
-      toast('正在测试…');
+    add(t('menuTest'), async () => {
+      toast(t('testing'));
       const ok = await ping();
-      toast(ok ? `已连接 FluxDown（${base()}）` : `无法连接 ${base()}，请确认 FluxDown 已启动且 RPC 服务已开启`, !ok);
+      toast(ok ? t('connected', base()) : t('cannotConnect', base()), !ok);
     });
   }
 
