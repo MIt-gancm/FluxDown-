@@ -1631,7 +1631,8 @@ mod tests {
         let cancel = CancellationToken::new();
         let worker = tokio::spawn(harness.service.clone().run(cancel.clone()));
         let mock = harness.mock.clone();
-        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        // 断开后按真实的 `RETRY_DELAYS[0]`（5s）退避重连；超时须留足余量，避免慢 CI 偶发超时。
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
             while mock.pulls.load(Ordering::SeqCst) < 2 || mock.events.load(Ordering::SeqCst) < 2 {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1739,7 +1740,9 @@ mod tests {
             "no automatic retry while halted"
         );
 
-        // 用户重新启用后恢复。
+        // 用户重新启用后恢复。SSE 保持长连接：否则 `connected` 只在发完即断的一瞬为真，
+        // 10ms 轮询可能错过，下一次重连又落在退避之后而超时。
+        harness.mock.hold_open.store(true, Ordering::SeqCst);
         *harness.mock.pull_status.lock().await = None;
         harness.service.set_enabled(true).await.expect("re-enable");
         harness
