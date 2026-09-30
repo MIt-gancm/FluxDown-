@@ -137,6 +137,11 @@ final _epTokens = RegExp(
   caseSensitive: false,
 );
 final _noise = RegExp(r'[\s/～~]+');
+final _dateTail = RegExp(r'\d{4}(-\d{2})?$');
+
+/// `pos` 处的 `-` 前面是否紧贴 `YYYY` 或 `YYYY-MM`（即处于 ISO 日期中）。
+bool _dashIsDatePart(String title, int pos) =>
+    _dateTail.hasMatch(title.substring(0, pos));
 
 /// 从标题提取 `<归一番名>#<集号>`；识别失败返回 null = 放行。
 String? rssEpisodeKey(String title) {
@@ -147,9 +152,12 @@ String? rssEpisodeKey(String title) {
     (_dashEp, 1),
     (_cjkEp, 1),
   ]) {
-    final m = re.firstMatch(title);
-    if (m == null) continue;
-    episode = int.tryParse(m.group(group) ?? '');
+    for (final m in re.allMatches(title)) {
+      // `2025-09-27` 里的 `-09` / `-27` 是日期分量，不是集号。
+      if (identical(re, _dashEp) && _dashIsDatePart(title, m.start)) continue;
+      episode = int.tryParse(m.group(group) ?? '');
+      if (episode != null) break;
+    }
     if (episode != null) break;
   }
   if (episode == null) return null;

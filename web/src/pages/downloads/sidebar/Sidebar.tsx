@@ -22,12 +22,14 @@ import { categoryIconByKey } from '../../../lib/category-icons'
 import { cn } from '../../../lib/cn'
 import { LATER_QUEUE_ID, MAIN_QUEUE_ID, rpc, useAgent, usePref, usePrefBool } from '../../../lib/rpc'
 import type { CustomCategoryDto, QueueDto } from '../../../lib/rpc'
-import { ContextMenuArea, Icon, confirmDialog, toast } from '../../../ui'
+import { ContextMenuArea, Icon, confirmDialog } from '../../../ui'
+import { toastRpcError } from '../model/errors'
 import type { MenuEntry } from '../../../ui'
 import { openQueueManager } from '../dialogs'
 import { otherDevices } from '../model/devices'
 import { LOCAL_DEVICE, SIDEBAR_SECTION_PREFS, STATUS_FILTERS, filterMatches, sameSelection } from '../model/filters'
 import type { DownloadFilter, DownloadStatusFilter, SidebarSelection } from '../model/filters'
+import type { DownloadTaskView } from '../model/task'
 import { categoryLabel, useDownloads } from '../state'
 
 type Section = 'status' | 'queues' | 'devices'
@@ -58,7 +60,21 @@ const ROW =
   'flex h-nav-row coarse:min-h-touch w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-sm outline-none focus-visible:ring-1 focus-visible:ring-primary'
 
 function hideSection(key: string) {
-  rpc.agent.preferences.patch({ values: { [key]: false } }).catch((error: unknown) => toast.error(error))
+  rpc.agent.preferences.patch({ values: { [key]: false } }).catch(toastRpcError)
+}
+
+/** 仅在计数相关字段（与进度无关）变化时才换新数组引用；进度帧沿用旧引用。 */
+function useStableViews(views: readonly DownloadTaskView[]): readonly DownloadTaskView[] {
+  const signature = views
+    .map((view) => `${view.key}|${view.state}|${view.queueId}|${view.toDevice}|${view.name}|${view.url}|${view.saveDir}`)
+    .join('\n')
+  const [stable, setStable] = useState(views)
+  const [seen, setSeen] = useState(signature)
+  if (seen !== signature) {
+    setSeen(signature)
+    setStable(views)
+  }
+  return stable
 }
 
 /** 可折叠容器（CSS grid 行高过渡，对应 GPUI 折叠动画）。 */
@@ -187,7 +203,11 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     [categories],
   )
 
+  // 计数只取决于与进度无关的字段；进度帧每帧产出新的 views 数组，这里在签名不变时沿用
+  // 上一个数组引用，使下面的 useMemo 不按帧对全部任务 × 全部过滤器重算。
+  const stableViews = useStableViews(views)
   const counts = useMemo(() => {
+    const views = stableViews
     const filterCounts = new Map<string, number>()
     const queueCounts = new Map<string, number>()
     const deviceCounts = new Map<string, number>()
@@ -209,7 +229,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
       }
     }
     return { filterCounts, queueCounts, deviceCounts }
-  }, [views, categories, categoryEntries])
+  }, [stableViews, categories, categoryEntries])
 
   const filterCount = (filter: DownloadFilter) => counts.filterCounts.get(`${filter.status}|${filter.category ?? ''}`) ?? 0
 
@@ -237,7 +257,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 
   const queueMenu = (queue: QueueDto): MenuEntry[] => {
     const run = (action: 'start' | 'stop') => () => {
-      rpc.daemon.queue[action]({ queueId: queue.queueId }).catch((error: unknown) => toast.error(error))
+      rpc.daemon.queue[action]({ queueId: queue.queueId }).catch(toastRpcError)
     }
     const entries: MenuEntry[] = [
       queue.isRunning
@@ -260,7 +280,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
               intent: 'destructive',
               okLabel: t('delete'),
             }).then((ok) => {
-              if (ok) rpc.daemon.queue.delete({ queueId: queue.queueId }).catch((error: unknown) => toast.error(error))
+              if (ok) rpc.daemon.queue.delete({ queueId: queue.queueId }).catch(toastRpcError)
             })
           },
         },

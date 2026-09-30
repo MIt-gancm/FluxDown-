@@ -2,6 +2,7 @@
 // 由偏好 `custom_categories` 构建，按扩展名 / 正则把任务归类。
 
 import type { CustomCategoryDto } from '../../../lib/rpc'
+import { compileEngineRegex } from '../../rss/filter'
 import { extensionOf } from './task'
 import type { DownloadTaskView } from './task'
 
@@ -88,14 +89,8 @@ export class CategoryIndex {
       if (dto.builtinType === 'all') return { dto, matcher: { type: 'all' } }
       if (dto.builtinType === 'other') return { dto, matcher: { type: 'other' } }
       if (dto.matchMode === 'regex') {
-        let regex: RegExp | null = null
-        if (dto.regexPattern !== '') {
-          try {
-            regex = new RegExp(dto.regexPattern, 'i')
-          } catch {
-            regex = null
-          }
-        }
+        // 与 agent（Rust regex）同语义；Rust 不支持的写法（环视、反向引用）编译失败 → 不匹配。
+        const regex = dto.regexPattern === '' ? null : compileEngineRegex(dto.regexPattern)
         return { dto, matcher: { type: 'regex', regex } }
       }
       return {

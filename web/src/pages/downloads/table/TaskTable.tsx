@@ -9,7 +9,7 @@ import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
 import { Checkbox, ContextMenuArea, Icon, Tooltip } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
-import { downloadViewsFiles, pauseViews, resumeViews } from '../model/actions'
+import { downloadViewsFiles, isDownloadable, pauseViews, remoteCan, resumeViews } from '../model/actions'
 import { notePointerActivity } from '../model/rowOrder'
 import { formatBytes, formatDateTime, MAX_ETA_SECS, PROTOCOL_LABEL, sourceSite } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
@@ -144,16 +144,16 @@ function RowActions({ view, labels, selected }: { view: DownloadTaskView; labels
   switch (view.state) {
     case 'downloading':
     case 'pending':
-      buttons.push({ key: 'pause', label: labels.pause, icon: Pause, run: () => void pauseViews([view]) })
+      if (remoteCan(view, 'pause')) buttons.push({ key: 'pause', label: labels.pause, icon: Pause, run: () => void pauseViews([view]) })
       break
     case 'paused':
-      buttons.push({ key: 'resume', label: labels.resume, icon: Play, run: () => void resumeViews([view]) })
+      if (remoteCan(view, 'resume')) buttons.push({ key: 'resume', label: labels.resume, icon: Play, run: () => void resumeViews([view]) })
       break
     case 'failed':
-      buttons.push({ key: 'retry', label: labels.resume, icon: RotateCw, run: () => void resumeViews([view]) })
+      if (remoteCan(view, 'resume')) buttons.push({ key: 'retry', label: labels.resume, icon: RotateCw, run: () => void resumeViews([view]) })
       break
     case 'completed':
-      if (view.source === 'local') {
+      if (isDownloadable(view)) {
         buttons.push({ key: 'download', label: labels.download, icon: Download, run: () => downloadViewsFiles([view]) })
       }
       break
@@ -329,7 +329,7 @@ export function TaskTable() {
   )
   const onDoubleClick = useCallback(
     (view: DownloadTaskView) => {
-      if (view.source === 'local' && view.state === 'completed') downloadViewsFiles([view])
+      if (isDownloadable(view)) downloadViewsFiles([view])
       else if (view.source === 'local') ctx.showDetail(view.taskId)
     },
     [ctx],

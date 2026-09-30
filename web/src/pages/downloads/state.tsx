@@ -31,6 +31,7 @@ import { CategoryIndex, categoriesFromPreference } from './model/categories'
 import { currentDeviceId, visibleRemoteTasks } from './model/devices'
 import { filterMatches, LOCAL_DEVICE, SELECTION_ALL } from './model/filters'
 import type { SidebarSelection } from './model/filters'
+import { isDownloadable, remoteCan } from './model/actions'
 import { useLiveSpeeds } from './model/liveSpeeds'
 import { isDynamicSortKey } from './model/rowOrder'
 import { buildLocalView, buildRemoteView, isLocalKey, sourceSite, STATE_RANK } from './model/task'
@@ -572,9 +573,9 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     let allDownloadable = selectedViews.length > 0
     for (const view of selectedViews) {
       anyLocal ||= view.source === 'local'
-      if (view.state === 'downloading' || view.state === 'pending') anyActive = true
-      else if (view.state === 'paused' || view.state === 'failed') anyResumable = true
-      if (!(view.source === 'local' && view.state === 'completed')) allDownloadable = false
+      if (view.state === 'downloading' || view.state === 'pending') anyActive ||= remoteCan(view, 'pause')
+      else if (view.state === 'paused' || view.state === 'failed') anyResumable ||= remoteCan(view, 'resume')
+      if (!isDownloadable(view)) allDownloadable = false
     }
     return {
       count: selectedViews.length,

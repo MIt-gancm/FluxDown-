@@ -344,11 +344,34 @@ pub fn episode_key(title: &str) -> Option<String> {
     ]
     .into_iter()
     .find_map(|(re, group)| {
-        let caps = re?.captures(title)?;
-        caps.get(group)?.as_str().parse::<u32>().ok()
+        re?.captures_iter(title).find_map(|caps| {
+            // `2025-09-27` 里的 `-09` / `-27` 是日期分量，不是集号。
+            if group == 1
+                && caps
+                    .get(0)
+                    .is_some_and(|m| dash_is_date_part(title, m.start()))
+            {
+                return None;
+            }
+            caps.get(group)?.as_str().parse::<u32>().ok()
+        })
     })?;
 
     Some(format!("{}#{episode}", normalized_series(title)))
+}
+
+/// `pos` 处的 `-` 前面是否紧贴 `YYYY` 或 `YYYY-MM`（即处于 ISO 日期中）。
+fn dash_is_date_part(title: &str, pos: usize) -> bool {
+    let before = title.as_bytes().get(..pos).unwrap_or_default();
+    let digits_at_end =
+        |b: &[u8], n: usize| b.len() >= n && b[b.len() - n..].iter().all(u8::is_ascii_digit);
+    if digits_at_end(before, 4) {
+        return true;
+    }
+    digits_at_end(before, 2)
+        && before.len() >= 3
+        && before[before.len() - 3] == b'-'
+        && digits_at_end(&before[..before.len() - 3], 4)
 }
 
 /// 归一番名（[`episode_key`] 的前半段，单独抽出便于单测与复用）。
@@ -533,6 +556,15 @@ mod tests {
         let sakura = episode_key("[桜都字幕组] 幼女战记 2 - 02 [720P][简体内嵌]");
         assert_eq!(ani, sakura);
         assert!(ani.unwrap().ends_with("#2"));
+    }
+
+    #[test]
+    fn episode_key_ignores_iso_date_components() {
+        assert_eq!(episode_key("Daily Show 2025-09-27 1080p"), None);
+        assert_eq!(episode_key("Daily Show 2025-09 1080p"), None);
+        assert!(
+            episode_key("Daily Show 2025-09-27 - 12 1080p").is_some_and(|k| k.ends_with("#12"))
+        );
     }
 
     #[test]

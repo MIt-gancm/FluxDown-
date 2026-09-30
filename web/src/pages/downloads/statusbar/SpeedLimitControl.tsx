@@ -3,8 +3,9 @@ import type { LucideIcon } from 'lucide-react'
 import { useState } from 'react'
 import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
-import { RpcError, rpc, rpcStore, useConfigValue } from '../../../lib/rpc'
-import { Button, Icon, Input, Popover, toast, Tooltip } from '../../../ui'
+import { useConfigValue } from '../../../lib/rpc'
+import { Button, Icon, Input, Popover, Tooltip } from '../../../ui'
+import { setDaemonNumber } from '../../settings/kit/writeStore'
 import { formatBytes } from '../model/task'
 
 /** 限速预设（MB/s），同 GPUI `SPEED_PRESETS_MB`。 */
@@ -12,30 +13,9 @@ const SPEED_PRESETS_MB = [1, 5, 10, 50]
 const mbToBytes = (mb: number) => mb * 1_048_576
 const kbToBytes = (kb: number) => Math.max(0, kb) * 1024
 
-const readRevision = (): number => rpcStore.peek().snapshot?.daemon.config.revision ?? 0
-
-/** 写限速配置（字节/秒）；revision 冲突时用新 revision 重试一次。 */
-async function patchLimit(key: string, bytes: number): Promise<void> {
-  const values = { [key]: String(bytes) }
-  let revision = readRevision()
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      await rpc.daemon.config.patch({ expectedRevision: revision, values })
-      return
-    } catch (err) {
-      if (err instanceof RpcError && err.is('conflict')) {
-        if (attempt === 0) {
-          revision = err.revision ?? readRevision()
-          continue
-        }
-        toast.key('localServiceConflict', 'error')
-        return
-      }
-      toast.error(err)
-      return
-    }
-  }
-}
+// 写入与设置页同一路径（writeStore.setDaemonNumber）：`speed_limit_bytes` 映射到云同步键
+// `download.speed_limit_bytes`，经 agent.preferences.patch 落盘并参与云同步；
+// 仅本机生效的 `upload_limit_bytes` 走 daemon.config.patch。
 
 export function SpeedLimitControl({
   icon,
@@ -66,7 +46,7 @@ export function SpeedLimitControl({
       disabled={disabled}
       onClick={() => {
         close()
-        void patchLimit(configKey, bytes)
+        setDaemonNumber(configKey, bytes)
       }}
       className="flex h-control w-full items-center gap-2 rounded-sm px-2 text-left text-sm hover:bg-nav-hover disabled:opacity-50 coarse:min-h-touch"
     >
@@ -79,7 +59,7 @@ export function SpeedLimitControl({
     const kb = Number.parseInt(custom, 10)
     if (!Number.isFinite(kb)) return
     close()
-    void patchLimit(configKey, kbToBytes(kb))
+    setDaemonNumber(configKey, kbToBytes(kb))
   }
 
   return (

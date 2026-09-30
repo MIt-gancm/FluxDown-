@@ -6,7 +6,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { useT } from '../../../i18n'
 import { LATER_QUEUE_ID, MAIN_QUEUE_ID, TASK_STATUS, rpc, useAgent, useDaemon, useTasks } from '../../../lib/rpc'
 import type { QueueDto, TaskDto } from '../../../lib/rpc'
-import { Button, Checkbox, Dialog, DialogFooter, FieldError, FieldHint, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, SectionHeader, Select, Switch, confirmDialog, toast, useIsMobile } from '../../../ui'
+import { Button, Checkbox, Dialog, DialogFooter, FieldError, FieldHint, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, SectionHeader, Select, Switch, confirmDialog, useIsMobile } from '../../../ui'
+import { toastRpcError } from '../model/errors'
 import { cn } from '../../../lib/cn'
 import { FsPickerDialog } from './FsPickerDialog'
 import { closeQueueManager } from './store'
@@ -207,11 +208,14 @@ function QueueEditor({
   const running = queue?.isRunning ?? true
   const title = queue === null ? t('createQueueAction') : queueLabel(t, queue)
 
-  const run = async (action: () => Promise<unknown>) => {
+  /** 成功返回 true；失败已弹 toast 并返回 false，调用方据此决定是否继续后续状态迁移。 */
+  const run = async (action: () => Promise<unknown>): Promise<boolean> => {
     try {
       await action()
+      return true
     } catch (err) {
-      toast.error(err, t('localServiceActionFailed'))
+      toastRpcError(err)
+      return false
     }
   }
 
@@ -253,7 +257,7 @@ function QueueEditor({
         onSaved(createdId)
       }
     } catch (err) {
-      toast.error(err, t('localServiceActionFailed'))
+      toastRpcError(err)
     } finally {
       setPending(false)
     }
@@ -268,8 +272,7 @@ function QueueEditor({
       intent: 'destructive',
     })
     if (!ok) return
-    await run(() => rpc.daemon.queue.delete({ queueId: queue.queueId }))
-    onDeleted()
+    if (await run(() => rpc.daemon.queue.delete({ queueId: queue.queueId }))) onDeleted()
   }
 
   const weekdays = t('weekdaysShort').split(',')
@@ -438,7 +441,7 @@ function PendingOrder({ queue }: { queue: QueueDto }) {
     try {
       await rpc.daemon.queue.reorder({ queueId: queue.queueId, taskIds: order })
     } catch (err) {
-      toast.error(err, t('localServiceActionFailed'))
+      toastRpcError(err)
     }
   }
   return (

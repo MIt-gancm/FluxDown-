@@ -9,7 +9,8 @@ import { useT } from '../../../i18n'
 import { rpc } from '../../../lib/rpc'
 import type { QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
 import { LATER_QUEUE_ID } from '../../../lib/rpc'
-import { ActionMenu, Button, Checkbox, Dialog, DialogFooter, FieldHint, FormField, Icon, Input, InputWithAction, toast } from '../../../ui'
+import { ActionMenu, Button, Checkbox, Dialog, DialogFooter, FieldHint, FormField, Icon, Input, InputWithAction } from '../../../ui'
+import { toastRpcError } from '../model/errors'
 import type { MenuEntry } from '../../../ui'
 import { cn } from '../../../lib/cn'
 import { FsPickerDialog } from './FsPickerDialog'
@@ -116,7 +117,7 @@ export function ManifestSelectDialog({
       })
       onCreated()
     } catch (error) {
-      toast.error(error, t('localServiceActionFailed'))
+      toastRpcError(error)
       setSubmitting(false)
     }
   }

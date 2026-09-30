@@ -91,11 +91,13 @@ export function formatSize(bytes: number): string {
 // 智能剧集去重
 // ---------------------------------------------------------------------------
 
-const SEASON_EP = /s(\d+)e(\d+)/iu
+const SEASON_EP = /s(\d+)e(\d+)/giu
 // 季号限 1-2 位、集号限 1-3 位：`1920x1080` 这类分辨率不再被误判。
-const CROSS_EP = new RegExp(`${NOT_AFTER_WORD}(\\d{1,2})x(\\d{1,3})${NOT_BEFORE_WORD}`, 'u')
-const DASH_EP = new RegExp(`-\\s*(\\d{2,3})${NOT_BEFORE_WORD}`, 'u')
-const CJK_EP = /第\s*(\d+)\s*[话話集]/u
+const CROSS_EP = new RegExp(`${NOT_AFTER_WORD}(\\d{1,2})x(\\d{1,3})${NOT_BEFORE_WORD}`, 'gu')
+const DASH_EP = new RegExp(`-\\s*(\\d{2,3})${NOT_BEFORE_WORD}`, 'gu')
+// `2025-09-27` 里的 `-09` / `-27` 是日期分量，不是集号：`-` 紧贴 YYYY 或 YYYY-MM 时跳过。
+const DATE_TAIL = /\d{4}(?:-\d{2})?$/
+const CJK_EP = /第\s*(\d+)\s*[话話集]/gu
 /** Rust 侧集号解析为 u32，溢出即换下一个匹配器——此处照同样的门槛放行。 */
 const U32_MAX = 4_294_967_295
 
@@ -125,11 +127,12 @@ export function normalizedSeries(title: string): string {
  *  识别失败返回 null = 放行（宁可重复不可漏下）。 */
 export function episodeKey(title: string): string | null {
   for (const [re, group] of EPISODE_MATCHERS) {
-    const caps = re.exec(title)
-    if (!caps) continue
-    const episode = Number.parseInt(caps[group], 10)
-    if (!Number.isFinite(episode) || episode > U32_MAX) continue
-    return `${normalizedSeries(title)}#${episode}`
+    for (const caps of title.matchAll(re)) {
+      if (re === DASH_EP && DATE_TAIL.test(title.slice(0, caps.index))) continue
+      const episode = Number.parseInt(caps[group], 10)
+      if (!Number.isFinite(episode) || episode > U32_MAX) continue
+      return `${normalizedSeries(title)}#${episode}`
+    }
   }
   return null
 }
@@ -157,17 +160,122 @@ type Matcher =
   /** 外层 = `|` 分隔的或项，内层 = 空格分隔的与项（全小写）。 */
   | { kind: 'keywords'; alts: string[][] }
 
+// 用户正则：引擎用 Rust `regex`（`(?i)` 前缀、Unicode 感知、无环视/反向引用），
+// 预览用 JS RegExp。这里把 Rust 语义翻译过去：Rust 会编译失败的构造（环视、反向
+// 引用）同样判无效；`\w` `\b` `\d` 按 Unicode 还原；`(?P<name>` 改写为 JS 命名组；
+// 开头的 `(?ims-)` 标志组折算进 RegExp flags。返回 null = 引擎同样会编译失败
+// （或无法在 JS 中等价表达），调用方按「非法正则放行」处理。
+const WORD_INNER = '\\p{Alphabetic}\\p{M}\\p{Nd}\\p{Pc}\\p{Join_Control}'
+const WORD_BOUNDARY = `(?:(?<=${WORD_CHAR})(?!${WORD_CHAR})|(?<!${WORD_CHAR})(?=${WORD_CHAR}))`
+const NOT_WORD_BOUNDARY = `(?:(?<=${WORD_CHAR})(?=${WORD_CHAR})|(?<!${WORD_CHAR})(?!${WORD_CHAR}))`
+// Rust 的 `\p{X}` 依次按二元属性 / 通用类别 / 脚本解析；JS u 模式不认裸脚本名，
+// 故先试原名，再试 `Script=X`；都不合法即 Rust 同样会拒绝。
+function resolveUnicodeProperty(name: string): string | null {
+  const trimmed = name.trim()
+  if (trimmed === '') return null
+  const titled = trimmed.charAt(0).toUpperCase() + trimmed.slice(1).toLowerCase()
+  for (const candidate of [trimmed, `Script=${trimmed}`, `Script=${titled}`]) {
+    try {
+      new RegExp(`\\p{${candidate}}`, 'u')
+      return candidate
+    } catch {
+      // 换下一个候选
+    }
+  }
+  return null
+}
+
+
+export function compileEngineRegex(source: string): RegExp | null {
+  const flags = new Set(['i', 'u'])
+  let i = 0
+  const lead = /^\(\?([a-zA-Z-]+)\)/.exec(source)
+  if (lead) {
+    let on = true
+    for (const c of lead[1]) {
+      if (c === '-') on = false
+      else if (c === 'i' || c === 's' || c === 'm') {
+        if (on) flags.add(c)
+        else flags.delete(c)
+      } else return null
+    }
+    i = lead[0].length
+  }
+  let out = ''
+  let inClass = false
+  while (i < source.length) {
+    const ch = source[i]
+    if (ch === '\\') {
+      const next = source[i + 1]
+      if (next === undefined) return null
+      i += 2
+      if (!inClass && ((next >= '1' && next <= '9') || (next === 'k' && source[i] === '<'))) return null
+      if (next === 'p' || next === 'P') {
+        let name: string
+        if (source[i] === '{') {
+          const end = source.indexOf('}', i)
+          if (end < 0) return null
+          name = source.slice(i + 1, end)
+          i = end + 1
+        } else if (source[i] !== undefined) {
+          name = source[i]
+          i += 1
+        } else return null
+        const resolved = resolveUnicodeProperty(name)
+        if (resolved === null) return null
+        out += `\\${next}{${resolved}}`
+        continue
+      }
+      if (next === 'b' && !inClass) out += WORD_BOUNDARY
+      else if (next === 'B' && !inClass) out += NOT_WORD_BOUNDARY
+      else if (next === 'w') out += inClass ? WORD_INNER : `[${WORD_INNER}]`
+      else if (next === 'W' && !inClass) out += `[^${WORD_INNER}]`
+      else if (next === 'd') out += '\\p{Nd}'
+      else if (next === 'D') out += '\\P{Nd}'
+      else out += ch + next
+      continue
+    }
+    if (inClass) {
+      if (ch === ']') inClass = false
+      out += ch
+      i += 1
+      continue
+    }
+    if (ch === '[') {
+      inClass = true
+      out += ch
+      i += 1
+      continue
+    }
+    if (ch === '(' && source[i + 1] === '?') {
+      const rest = source.slice(i + 2, i + 4)
+      if (rest[0] === '=' || rest[0] === '!' || rest === '<=' || rest === '<!') return null
+      if (rest[0] === 'P' && rest[1] === '<') {
+        out += '(?<'
+        i += 4
+        continue
+      }
+      // 非开头的内联标志（`(?i)` / `(?i:`）无法在 JS 中等价表达。
+      if (/^[a-zA-Z-]$/.test(rest[0] ?? '')) return null
+    }
+    out += ch
+    i += 1
+  }
+  try {
+    return new RegExp(out, [...flags].join(''))
+  } catch {
+    return null
+  }
+}
+
 function buildMatcher(expr: string, useRegex: boolean): Matcher {
   const text = expr.trim()
   if (!text) return { kind: 'any' }
   if (useRegex) {
     // 非法正则一律放行：用户写错时宁可多下，也不静默漏下（qBittorrent
     // episodeFilter 写错即静默失配是明确的反面教训）。
-    try {
-      return { kind: 'regex', re: new RegExp(text, 'i') }
-    } catch {
-      return { kind: 'any' }
-    }
+    const re = compileEngineRegex(text)
+    return re ? { kind: 'regex', re } : { kind: 'any' }
   }
   return {
     kind: 'keywords',

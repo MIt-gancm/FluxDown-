@@ -51,4 +51,26 @@ describe('rss filter parity with engine', () => {
     expect(verdictOf(evaluate(on, '[VCB] 合集 A', 0, none))).toBe('accepted')
     expect(verdictOf(evaluate(on, '[VCB] 合集 A', 0, none))).toBe('accepted')
   })
+
+  test('智能剧集：ISO 日期分量不当集号（与 Rust 同例）', () => {
+    expect(episodeKey('Daily Show 2025-09-27 1080p')).toBeNull()
+    expect(episodeKey('Daily Show 2025-09 1080p')).toBeNull()
+    expect(episodeKey('Daily Show 2025-09-27 - 12 1080p')?.endsWith('#12')).toBe(true)
+  })
+
+  test('用户正则：Rust 不支持的构造判无效（放行），Unicode 语义对齐', () => {
+    // 环视：Rust 编译失败 → Matcher::Any，全部放行。
+    expect(verdictOf(evaluate(rule({ include: '^(?!.*720p).*1080p', useRegex: true }), 'x 720p 1080p', 0, new Set()))).toBe('accepted')
+    expect(verdictOf(evaluate(rule({ include: '(a)\\1', useRegex: true }), 'zzz', 0, new Set()))).toBe('accepted')
+    // 开头内联标志：Rust 生效。
+    expect(verdictOf(evaluate(rule({ exclude: '(?-i)RAW', useRegex: true }), 'a raw b', 0, new Set()))).toBe('accepted')
+    expect(verdictOf(evaluate(rule({ exclude: '(?-i)RAW', useRegex: true }), 'a RAW b', 0, new Set()))).toBe('excluded')
+    // \p{Han}：Rust 按字符类匹配。
+    expect(verdictOf(evaluate(rule({ include: '\\p{Han}', useRegex: true }), '幼女战记', 0, new Set()))).toBe('accepted')
+    expect(verdictOf(evaluate(rule({ include: '\\p{Han}', useRegex: true }), 'abc', 0, new Set()))).toBe('not_included')
+    // \b 是 Unicode 感知的：「记」与 S 之间不构成边界。
+    const b = rule({ include: '\\bS01E02\\b', useRegex: true })
+    expect(verdictOf(evaluate(b, '[X]幼女战记S01E02[1080P]', 0, new Set()))).toBe('not_included')
+    expect(verdictOf(evaluate(b, '[X] S01E02 [1080P]', 0, new Set()))).toBe('accepted')
+  })
 })

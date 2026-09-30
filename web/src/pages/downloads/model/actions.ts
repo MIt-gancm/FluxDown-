@@ -7,6 +7,7 @@ import { t } from '../../../i18n'
 import { downloadTaskFile, rpc } from '../../../lib/rpc'
 import type { CreateTaskRequest, RemoteCommandParams } from '../../../lib/rpc'
 import { confirmDialog, toast } from '../../../ui'
+import { toastRpcError } from './errors'
 import { PLUGIN_ERROR_PREFIX, shareUrl } from './task'
 import type { DownloadTaskView } from './task'
 
@@ -15,7 +16,7 @@ async function guarded(work: () => Promise<unknown>): Promise<boolean> {
     await work()
     return true
   } catch (error) {
-    toast.error(error)
+    toastRpcError(error)
     return false
   }
 }
@@ -25,10 +26,32 @@ async function guardedAll(jobs: readonly (() => Promise<unknown>)[]): Promise<bo
   const results = await Promise.allSettled(jobs.map((job) => job()))
   const failed = results.find((result) => result.status === 'rejected')
   if (failed && failed.status === 'rejected') {
-    toast.error(failed.reason)
+    toastRpcError(failed.reason)
     return false
   }
   return true
+}
+
+/**
+ * 远程任务的云端命令是否适用（镜像 crates/downloads/src/model/dispatch.rs
+ * `remote_action_applies`）：状态未知一律不控制；Pause 只对进行中，Resume 只对已暂停；
+ * Delete 对任何已知状态成立。本地任务恒为 true。
+ */
+export function remoteCan(view: DownloadTaskView, action: RemoteCommandParams['action']): boolean {
+  if (view.source === 'local') return true
+  switch (view.remoteStatus) {
+    case null:
+    case 'unknown':
+      return false
+    case 'pending':
+    case 'accepted':
+    case 'downloading':
+      return action === 'pause' || action === 'cancel' || action === 'delete'
+    case 'paused':
+      return action === 'resume' || action === 'cancel' || action === 'delete'
+    default:
+      return action === 'delete'
+  }
 }
 
 function remoteCommand(view: DownloadTaskView, action: RemoteCommandParams['action'], deleteFiles = false) {
@@ -40,18 +63,22 @@ function remoteCommand(view: DownloadTaskView, action: RemoteCommandParams['acti
 
 export function pauseViews(views: readonly DownloadTaskView[]): Promise<boolean> {
   return guardedAll(
-    views.map((view) =>
-      view.source === 'local' ? () => rpc.daemon.task.pause({ taskId: view.taskId }) : remoteCommand(view, 'pause'),
-    ),
+    views
+      .filter((view) => remoteCan(view, 'pause'))
+      .map((view) =>
+        view.source === 'local' ? () => rpc.daemon.task.pause({ taskId: view.taskId }) : remoteCommand(view, 'pause'),
+      ),
   )
 }
 
 /** 继续（失败任务同为 resume，UI 上叫重试）。 */
 export function resumeViews(views: readonly DownloadTaskView[]): Promise<boolean> {
   return guardedAll(
-    views.map((view) =>
-      view.source === 'local' ? () => rpc.daemon.task.resume({ taskId: view.taskId }) : remoteCommand(view, 'resume'),
-    ),
+    views
+      .filter((view) => remoteCan(view, 'resume'))
+      .map((view) =>
+        view.source === 'local' ? () => rpc.daemon.task.resume({ taskId: view.taskId }) : remoteCommand(view, 'resume'),
+      ),
   )
 }
 
@@ -60,11 +87,13 @@ export const resumeAll = () => guarded(() => rpc.daemon.task.resumeAll())
 
 export function deleteViews(views: readonly DownloadTaskView[], deleteFiles: boolean): Promise<boolean> {
   return guardedAll(
-    views.map((view) =>
-      view.source === 'local'
-        ? () => rpc.daemon.task.delete({ taskId: view.taskId, deleteFiles })
-        : remoteCommand(view, 'delete', deleteFiles),
-    ),
+    views
+      .filter((view) => remoteCan(view, 'delete'))
+      .map((view) =>
+        view.source === 'local'
+          ? () => rpc.daemon.task.delete({ taskId: view.taskId, deleteFiles })
+          : remoteCommand(view, 'delete', deleteFiles),
+      ),
   )
 }
 
@@ -151,8 +180,9 @@ export function copyUrls(views: readonly DownloadTaskView[]): void {
   toast.key('urlCopied', 'success')
 }
 
-/** 只有本地已完成任务有可下载的最终文件。 */
-export const isDownloadable = (view: DownloadTaskView): boolean => view.source === 'local' && view.state === 'completed'
+/** 只有本地已完成且文件仍在磁盘上的任务有可下载的最终文件。 */
+export const isDownloadable = (view: DownloadTaskView): boolean =>
+  view.source === 'local' && view.state === 'completed' && !view.fileMissing
 
 /** 浏览器下载已完成文件（替代 GPUI 的「打开文件」）；多文件间隔触发以免被浏览器合并拦截。 */
 export function downloadViewsFiles(views: readonly DownloadTaskView[]): void {

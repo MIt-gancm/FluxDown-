@@ -83,6 +83,8 @@ export interface DownloadTaskView {
   nameFold: string
   /** 远程任务目标设备 id（本地任务为空）。 */
   toDevice: string
+  /** 远程任务的云端状态（云端命令是否可用的门控依据）；本地任务为 null。 */
+  remoteStatus: RemoteTaskDto['status'] | null
   /** 本地任务原始 DTO（详情 / 重新下载需要）；远程任务为 undefined。 */
   dto: TaskDto | undefined
 }
@@ -250,6 +252,7 @@ export function buildLocalView(
     queuePosition,
     nameFold: task.fileName.toLowerCase(),
     toDevice: '',
+    remoteStatus: null,
     dto: task,
   }
 }
@@ -292,6 +295,7 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     queuePosition: 0,
     nameFold: task.fileName.toLowerCase(),
     toDevice: task.toDevice,
+    remoteStatus: task.status,
     dto: undefined,
   }
 }

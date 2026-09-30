@@ -27,11 +27,13 @@ import {
   deleteGroup,
   deleteViews,
   downloadViewsFiles,
+  isDownloadable,
   isPluginRetryError,
   moveViewsToQueue,
   pauseGroup,
   pauseViews,
   redownloadViews,
+  remoteCan,
   resumeGroup,
   resumeViews,
   retryFailedInGroup,
@@ -58,10 +60,10 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail }: TaskM
   const only = views.length === 1 ? views[0] : undefined
   const allLocal = views.every((view) => view.source === 'local')
 
-  if (views.some((view) => view.state !== 'completed' && view.state !== 'downloading')) {
+  if (views.some((view) => view.state !== 'completed' && view.state !== 'downloading' && remoteCan(view, 'resume'))) {
     entries.push({ type: 'item', key: 'resume', label: t('resume'), icon: Play, onSelect: () => void resumeViews(views) })
   }
-  if (views.some((view) => view.state === 'downloading' || view.state === 'pending')) {
+  if (views.some((view) => (view.state === 'downloading' || view.state === 'pending') && remoteCan(view, 'pause'))) {
     entries.push({ type: 'item', key: 'pause', label: t('pause'), icon: Pause, onSelect: () => void pauseViews(views) })
   }
   if (only) {
@@ -84,7 +86,7 @@ export function buildTaskMenu({ t, views, queues, queueName, showDetail }: TaskM
       })
     }
   }
-  if (views.every((view) => view.source === 'local' && view.state === 'completed')) {
+  if (views.every(isDownloadable)) {
     entries.push({
       type: 'item',
       key: 'download-file',

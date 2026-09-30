@@ -325,7 +325,8 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
             sourceUrl: single.url,
             base: {
               saveDir: options.saveDir,
-              queueId: options.queueId,
+              // 「稍后下载」触发的清单：主按钮仍是「开始下载」，必须落到开始队列而非稍后队列。
+              queueId: later ? context.queueId : options.queueId,
               segments: options.segments,
               cookies: options.cookies,
               userAgent: options.userAgent,

@@ -6,6 +6,7 @@ import { useT } from '../../../i18n'
 import { TASK_STATUS, downloadTaskFile, rpc, useDaemon, useTasks } from '../../../lib/rpc'
 import type { GroupDto, TaskDto } from '../../../lib/rpc'
 import { ActionMenu, Badge, Button, Dialog, EmptyState, Icon, ProgressBar, SectionHeader, Tooltip, confirmDialog, toast } from '../../../ui'
+import { toastRpcError } from '../model/errors'
 import type { MenuEntry } from '../../../ui'
 import { closeGroupDetail } from './store'
 import { formatBytes } from './utils'
@@ -75,7 +76,7 @@ function Overview({ group, summary }: { group: GroupDto; summary: GroupSummary }
     try {
       await action()
     } catch (error) {
-      toast.error(error, t('localServiceActionFailed'))
+      toastRpcError(error)
     }
   }
 
@@ -235,7 +236,7 @@ function MemberRow({ task }: { task: TaskDto }) {
     try {
       await action()
     } catch (error) {
-      toast.error(error, t('localServiceActionFailed'))
+      toastRpcError(error)
     }
   }
 
