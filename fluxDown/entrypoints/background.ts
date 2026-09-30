@@ -50,12 +50,8 @@ import type {
   BatchDownloadItem,
   TaskBrief,
 } from "@/utils/native-messaging";
-import {
-  REMOTE_SETTINGS_KEY,
-  loadSettings,
-  persistSettings,
-  shouldIntercept,
-} from "@/utils/settings";
+import { REMOTE_SETTINGS_KEY } from "@/utils/remote-settings";
+import { loadSettings, persistSettings, shouldIntercept } from "@/utils/settings";
 import type { DownloadItemInfo } from "@/utils/settings";
 import { cancelBeforeFilenameResolution } from "@/utils/download-cancellation";
 import { initI18n, t } from "@/utils/i18n";

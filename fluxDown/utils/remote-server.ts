@@ -150,6 +150,7 @@ export async function remoteSendBatchDownloadRequest(
  */
 export async function remotePing(
   cfg: RemoteServerConfig,
+  signal?: AbortSignal,
 ): Promise<RemotePingResult> {
   if (!cfg.remoteUrl) {
     return { success: false, message: "remote_not_configured" };
@@ -159,7 +160,7 @@ export async function remotePing(
   try {
     resp = await fetch(`${cfg.remoteUrl}/ping`, {
       method: "GET",
-      signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+      signal: signal ?? AbortSignal.timeout(PING_TIMEOUT_MS),
     });
   } catch (err) {
     return { success: false, message: `remote_unreachable: ${String(err)}` };
@@ -194,7 +195,9 @@ export async function remotePing(
 export async function remoteVerify(
   cfg: RemoteServerConfig,
 ): Promise<RemotePingResult> {
-  const ping = await remotePing(cfg);
+  // 两步验证共用 4 秒截止时间，自动补验不会叠加两个完整的网络超时。
+  const signal = AbortSignal.timeout(PING_TIMEOUT_MS);
+  const ping = await remotePing(cfg, signal);
   if (!ping.success) return ping;
 
   let resp: Response;
@@ -202,7 +205,7 @@ export async function remoteVerify(
     resp = await fetch(`${cfg.remoteUrl}/api/v1/info`, {
       method: "GET",
       headers: buildHeaders(cfg),
-      signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+      signal,
     });
   } catch (err) {
     return { success: false, message: `remote_unreachable: ${String(err)}` };

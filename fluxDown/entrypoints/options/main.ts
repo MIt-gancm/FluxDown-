@@ -9,9 +9,9 @@
  *   - 远程服务器：地址 / 访问令牌 / 连接验证
  * popup 只保留高频开关（拦截开关、模式选择等）。
  *
- * 「测试连接」使用 remoteVerify（/ping 探活 + /api/v1/info 鉴权校验），
- * 通过后写入 settings.remoteVerified=true —— popup 的 fallback/always
- * 模式选项以此解锁；url/token 任何变更由 saveSettings 自动复位为未验证。
+ * 「测试连接」通过 verifyRemoteSettings 执行探活与鉴权校验，
+ * 成功后保存当前地址/token 的验证指纹，popup 的 fallback/always 模式选项以此解锁；
+ * url/token 任何变更都会让旧指纹失效。
  *
  * 支持 hash 直达面板：options.html#remote → 打开「远程服务器」。
  */
@@ -28,11 +28,11 @@ import {
 import {
   loadSettings,
   saveSettings,
+  verifyRemoteSettings,
   BUILTIN_EXTENSIONS,
   normalizeExtension,
   DEFAULT_SETTINGS,
 } from '@/utils/settings';
-import { remoteVerify } from '@/utils/remote-server';
 import { normalizeDomain } from '@/utils/domain-exclusion';
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
@@ -269,7 +269,7 @@ async function renderVerifyState() {
   verifyStateHint.textContent = settings.remoteVerified
     ? t('options.verifiedState')
     : t('options.unverifiedState');
-  updateRemoteModeGate(settings.remoteVerified === true);
+  updateRemoteModeGate(Boolean(settings.remoteVerified));
 }
 
 // 服务器地址（失焦保存；saveSettings 内部去除尾部斜杠并复位 remoteVerified）
@@ -294,7 +294,7 @@ remoteModeSelect.addEventListener('change', async () => {
   refreshRemoteModeDesc();
 });
 
-// 测试连接：探活 + 鉴权校验，结果写入 remoteVerified
+// 测试连接：探活 + 鉴权校验，只有本机成功验证的当前连接才能写入指纹
 remoteTestBtn.addEventListener('click', async () => {
   const remoteUrl = remoteUrlInput.value.trim().replace(/\/+$/, '');
   const remoteToken = remoteTokenInput.value;
@@ -308,7 +308,7 @@ remoteTestBtn.addEventListener('click', async () => {
   try {
     // 先落盘输入值（可能尚未触发 change），再验证
     await saveSettings({ remoteUrl, remoteToken });
-    const result = await remoteVerify({ remoteUrl, remoteToken });
+    const result = await verifyRemoteSettings({ remoteUrl, remoteToken });
     if (result.success) {
       const msg = t('remote.testSuccess', {
         app: result.app || 'FluxDown',
@@ -316,18 +316,15 @@ remoteTestBtn.addEventListener('click', async () => {
       });
       remoteTestResult.textContent = msg;
       showToast(msg, 'success');
-      await saveSettings({ remoteVerified: true });
     } else {
       const msg = remoteTestErrorMessage(result.message);
       remoteTestResult.textContent = msg;
       showToast(msg, 'error');
-      await saveSettings({ remoteVerified: false });
     }
   } catch (e) {
     const msg = t('remote.testFailed', { message: String(e) });
     remoteTestResult.textContent = msg;
     showToast(msg, 'error');
-    await saveSettings({ remoteVerified: false });
   } finally {
     remoteTestBtn.disabled = false;
   }

@@ -4,6 +4,9 @@
 
 import { browser } from "wxt/browser";
 import { isDomainExcluded, normalizeDomainList } from "./domain-exclusion";
+import { RemoteSettingsStore } from "./remote-settings";
+import type { RemoteSettings } from "./remote-settings";
+import type { RemotePingResult, RemoteServerConfig } from "./remote-server";
 
 /**
  * 拦截模式：
@@ -75,11 +78,11 @@ export interface FluxDownSettings {
   /** 远程 fluxdown_server 鉴权 token */
   remoteToken: string;
   /**
-   * 远程配置是否已通过「测试连接」验证（含 token 鉴权校验）。
+   * 本机已通过连接验证的 remoteUrl/remoteToken 的 SHA-256 指纹。
    * 仅验证通过后 UI 才允许选择 fallback/always 模式；
-   * remoteUrl/remoteToken 任一变更时自动复位为 false。
+   * 读取时指纹不匹配即视为未验证，空串表示未验证。
    */
-  remoteVerified: boolean;
+  remoteVerified: string;
 
   // === 自定义协议 ===
 
@@ -227,19 +230,13 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   remoteMode: "off",
   remoteUrl: "",
   remoteToken: "",
-  remoteVerified: false,
+  remoteVerified: "",
 
   // 自定义协议
   enableFluxdownProtocol: false,
 };
 
-/** 远程下载源配置独立存放在 storage.local：访问密钥与目标地址不应随浏览器账号同步。 */
-export const REMOTE_SETTINGS_KEY = "remoteSettings";
-
-type RemoteSettings = Pick<
-  FluxDownSettings,
-  "remoteMode" | "remoteUrl" | "remoteToken" | "remoteVerified"
->;
+const remoteSettingsStore = new RemoteSettingsStore(browser.storage.local);
 
 function pickRemote(s: FluxDownSettings): RemoteSettings {
   return {
@@ -261,7 +258,7 @@ function omitRemote(s: FluxDownSettings): Partial<FluxDownSettings> {
   return rest;
 }
 
-function hasRemoteFields(s: Partial<FluxDownSettings>): boolean {
+function hasRemoteFields(s: object): boolean {
   return (
     "remoteMode" in s ||
     "remoteUrl" in s ||
@@ -274,34 +271,29 @@ function hasRemoteFields(s: Partial<FluxDownSettings>): boolean {
  * 加载设置
  */
 export async function loadSettings(): Promise<FluxDownSettings> {
-  const [syncResult, localResult] = await Promise.all([
-    browser.storage.sync.get("settings"),
-    browser.storage.local.get(REMOTE_SETTINGS_KEY),
-  ]);
+  const syncResult = await browser.storage.sync.get("settings");
   const stored = syncResult?.settings as
-    | Partial<FluxDownSettings>
+    | (Partial<Omit<FluxDownSettings, "remoteVerified">> & {
+        remoteVerified?: string | boolean;
+      })
     | undefined;
-  let remote = localResult?.[REMOTE_SETTINGS_KEY] as
-    | Partial<RemoteSettings>
-    | undefined;
+  const hasLegacyRemote = stored && hasRemoteFields(stored);
+  const remote = await remoteSettingsStore.load(
+    hasLegacyRemote ? stored : undefined,
+  );
 
-  // 迁移：旧版把远程配置放在 storage.sync。本机尚无 local 副本时采用 sync 中的
-  // 值；无论是否采用，都从 sync 删除，且此后以 local 为准，同步来的远程字段不再生效。
-  if (stored && hasRemoteFields(stored)) {
-    const legacy = { ...DEFAULT_SETTINGS, ...stored };
-    if (!remote) {
-      remote = pickRemote(legacy);
-      await browser.storage.local.set({ [REMOTE_SETTINGS_KEY]: remote });
-    }
+  // 迁移：本机尚无 local 副本时只采用 sync 中的地址、模式与密钥，不采用验证结论。
+  // 无论是否采用，都从 sync 删除远程字段，此后以 local 为准。
+  if (hasLegacyRemote) {
     await browser.storage.sync.set({
-      settings: omitRemote(legacy),
+      settings: omitRemote({ ...DEFAULT_SETTINGS, ...stored, remoteVerified: "" }),
     });
   }
 
   const merged: FluxDownSettings = {
     ...DEFAULT_SETTINGS,
     ...(stored ?? {}),
-    ...(remote ?? {}),
+    ...remote,
   };
   // 迁移：旧版"仅扩展名"模式的设置项已移除，归一化为智能模式，
   // 否则 popup 下拉框（已无该选项）会显示空白、拦截逻辑走废弃分支。
@@ -326,7 +318,7 @@ export async function persistSettings(
     !previous ||
     JSON.stringify(pickRemote(previous)) !== JSON.stringify(nextRemote)
   ) {
-    await browser.storage.local.set({ [REMOTE_SETTINGS_KEY]: nextRemote });
+    await remoteSettingsStore.persist(nextRemote);
   }
 }
 
@@ -342,14 +334,29 @@ export async function saveSettings(
   if (merged.remoteUrl) {
     merged.remoteUrl = merged.remoteUrl.replace(/\/+$/, "");
   }
-  // 远程连接信息变更 → 旧的验证结论失效，除非本次调用显式给出新结论。
+  // 远程连接信息变更后必须重新验证，普通设置写入不能给新连接授予验证指纹。
   const remoteChanged =
     merged.remoteUrl !== current.remoteUrl ||
     merged.remoteToken !== current.remoteToken;
-  if (remoteChanged && !("remoteVerified" in settings)) {
-    merged.remoteVerified = false;
+  if (remoteChanged) {
+    merged.remoteVerified = "";
   }
   await persistSettings(merged, current);
+}
+
+/** 本机测试当前连接，只有实际成功且凭据未变时才落盘验证指纹。 */
+export async function verifyRemoteSettings(
+  config: RemoteServerConfig,
+): Promise<RemotePingResult> {
+  return remoteSettingsStore.verify(config);
+}
+
+/** 投递需要远程时自动补验；失败后节流，避免每次捕获都等待远端超时。 */
+export async function ensureRemoteSettingsVerified(
+  settings: FluxDownSettings,
+): Promise<FluxDownSettings> {
+  const remote = await remoteSettingsStore.ensureVerified(pickRemote(settings));
+  return { ...settings, ...remote };
 }
 
 /**

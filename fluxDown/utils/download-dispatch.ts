@@ -16,14 +16,14 @@
  *     明确拒绝的请求（如参数非法）无意义地在远程重试一遍。可用性探测取
  *     "NMH ping 或 remote ping 任一成功"。
  *
- * remoteUrl 未配置（空字符串）时，无论 remoteMode 是什么，远程通道一律视为
- * 不可用、路由退化为 "off"——避免用户切到 fallback/always 但忘填地址时，
- * 下载请求静默发往一个不存在的地址而失败。
+ * remoteUrl 未配置或当前地址/token 未验证时，远程通道视为不可用，路由退化为
+ * "off"。需要远程且凭据齐全时先自动补验；失败后 30 秒内不重复等待网络超时，
+ * 仅本次退回桌面通道，保留所选远程模式以便连接恢复后自动继续投递。
  *
  * === 设置读取策略：缓存 + storage.onChanged 失效 ===
  *
  * 与 background.ts 自身的设置缓存策略一致：缓存永不主动过期，只在
- * chrome.storage.sync 的 settings 变化时失效，重新按需读取。
+ * storage.sync 的 settings 或 storage.local 的远程配置变化时失效。
  *
  * 选择缓存而非"每次读取"的关键原因是 warmupNativeHost：它是同步触发的
  * fire-and-forget 优化（见 native-messaging.ts 对应函数文档），调用后必须
@@ -48,7 +48,8 @@ import {
   remotePing,
 } from "./remote-server";
 import type { RemoteServerConfig } from "./remote-server";
-import { REMOTE_SETTINGS_KEY, loadSettings } from "./settings";
+import { REMOTE_SETTINGS_KEY } from "./remote-settings";
+import { loadSettings, ensureRemoteSettingsVerified } from "./settings";
 import type { FluxDownSettings, RemoteMode } from "./settings";
 
 // NMH 侧代表"不可达"（连接层/瞬态失败）而非 App 业务拒绝的 message 集合，
@@ -92,8 +93,8 @@ export function isUnreachableFailure(response: ApiResponse): boolean {
 let _settingsCache: FluxDownSettings | null = null;
 
 async function getRoutingSettings(): Promise<FluxDownSettings> {
-  if (_settingsCache) return _settingsCache;
-  _settingsCache = await loadSettings();
+  const settings = _settingsCache ?? await loadSettings();
+  _settingsCache = await ensureRemoteSettingsVerified(settings);
   return _settingsCache;
 }
 
@@ -123,7 +124,7 @@ function stamp(response: ApiResponse, channel: "local" | "remote"): ApiResponse 
 
 function toRoutingConfig(settings: FluxDownSettings): RoutingConfig {
   return {
-    mode: settings.remoteMode,
+    mode: settings.remoteVerified ? settings.remoteMode : "off",
     remote: {
       remoteUrl: settings.remoteUrl?.trim() ?? "",
       remoteToken: settings.remoteToken ?? "",

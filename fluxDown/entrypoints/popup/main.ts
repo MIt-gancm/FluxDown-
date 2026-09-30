@@ -1516,7 +1516,7 @@ async function init() {
   notifyLocalToggle.checked = settings.notifyLocalTask === true;
   notifyRemoteToggle.checked = settings.notifyRemoteTask !== false;
   remoteModeSelect.value = settings.remoteMode || 'off';
-  updateRemoteModeGate(settings.remoteVerified === true);
+  updateRemoteModeGate(Boolean(settings.remoteVerified));
 
   // 统计（数据已随批量读取取回）
   await loadStats(
