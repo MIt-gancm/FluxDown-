@@ -10,30 +10,45 @@ name: Release
 #   - 偶发失败（源码无需改动）：本次运行页 “Re-run failed jobs”，只重跑失败组件与收尾 job。
 #   - 需要改代码 / 改打包脚本：修复合入发布分支后 workflow_dispatch 补发该组件，
 #     source_ref 指向包含修复的分支或提交；产物以原 tag 的版本号上传到同一个 release。
+# 演练（rehearsal=true，仅手动触发）：以「尚不存在」的 tag 跑完整条流水线——分支守卫、变更检测、
+#   引擎门禁、全部构建 / 签名 / 公证 / 打包、发布说明、校验和与 release 头部预览、OSS 与商店凭据探活；
+#   不建 release、不上传资产、不推 Docker 镜像、不提交商店、不清理 artifact。构建源码 = --ref 所指提交
+#   （workflow 文件与源码同一提交，与 tag 推送一致）。副作用步骤一律以 rehearsal == 'false' 放行（失败即关闭）。
+#   gh workflow run release.yml --ref main -f rehearsal=true -f tag=vX.Y.Z-rc.N -f component=all
+run-name: >-
+  ${{ inputs.rehearsal && format('Release 演练 {0}（不发布）', inputs.tag)
+  || (github.event_name == 'workflow_dispatch' && format('Release 补发 {0} · {1}', inputs.tag, inputs.component))
+  || format('Release {0}', github.ref_name) }}
 on:
   push:
     tags:
       - "v*"
   workflow_dispatch:
     inputs:
+      rehearsal:
+        description: "演练：tag 须尚不存在，完整构建 / 签名 / 打包但不发布任何东西（source_ref 须留空）"
+        required: false
+        default: false
+        type: boolean
       tag:
-        description: "已存在的发布 tag（例如 v0.4.8 / v0.5.0-rc.1）"
+        description: "补发：已存在的发布 tag（例如 v0.4.8 / v0.5.0-rc.1）；演练：要模拟的、尚不存在的 tag"
         required: true
         type: string
       component:
-        description: "要补发的组件；changed = 按该 tag 的变更检测补发全部应发组件"
+        description: "要补发 / 演练的组件；changed = 按该 tag 的变更检测；all = 全部组件（仅演练）"
         required: true
         default: mobile
         type: choice
         options:
           - changed
+          - all
           - app
           - extension
           - server
           - cli
           - mobile
       source_ref:
-        description: "构建源码（分支 / 提交，须包含该 tag 且在发布分支上）；留空 = tag 本身"
+        description: "补发的构建源码（分支 / 提交，须包含该 tag 且在发布分支上）；留空 = tag 本身。演练不接受此项"
         required: false
         default: ""
         type: string
@@ -44,8 +59,9 @@ permissions:
   actions: write # 允许在 release job 末尾删除旧 artifact（避免 500MB 配额耗尽）
 
 # 同一 tag 串行：补发与原流水线（或两次补发）不会并发改同一个 release。
+# 演练单独成组：不与同名 tag 的真实发布互相排队。
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: ${{ inputs.rehearsal && 'rehearsal' || 'release' }}-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 # Windows 产物暂不代码签名（SignPath 开源项目审核未通过；不使用测试证书），
@@ -89,6 +105,7 @@ jobs:
       source: ${{ steps.resolve.outputs.source }}
       is_highest_stable: ${{ steps.resolve.outputs.is_highest_stable }}
       source_is_tag: ${{ steps.resolve.outputs.source_is_tag }}
+      rehearsal: ${{ steps.resolve.outputs.rehearsal }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -98,17 +115,24 @@ jobs:
 
       # tag 来源统一出口：push 取 refs/tags/*，手动补发取输入并校验 tag 真实存在。
       # 构建源码 source：默认 = tag 提交；补发可指定包含修复的分支/提交。
+      # 演练：tag 必须尚不存在，在本 runner 内把它作为「本地未推送」tag 打在 --ref 提交上，
+      # 之后的分支守卫、基线、变更 diff、is_highest_stable 与 tag 推送走同一套逻辑。
+      # 模式互斥：勾了演练却填了已有 tag、或忘勾演练而填了未来 tag，都会在此报错，不会静默走错模式。
       - name: Resolve release tag and build source
         id: resolve
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_SOURCE: ${{ inputs.source_ref }}
+          INPUT_COMPONENT: ${{ inputs.component }}
+          INPUT_REHEARSAL: ${{ inputs.rehearsal }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
+          REHEARSAL=false
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             TAG="$INPUT_TAG"
+            if [ "$INPUT_REHEARSAL" = "true" ]; then REHEARSAL=true; fi
           else
             TAG="${GITHUB_REF#refs/tags/}"
           fi
@@ -116,18 +140,36 @@ jobs:
             echo "::error::非法发布 tag '${TAG}'"
             exit 1
           fi
-          if ! TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
-            echo "::error::Tag ${TAG} 不存在"
-            exit 1
-          fi
-
-          # 拆分时代（server-v* / mobile-v* … 各自一个 release）的旧 vX.Y.Z release 只含桌面端且没有
-          # 完成哨兵；往里补组件会让官网把它当统一 release、判桌面端缺失。旧版本不接受补发。
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            ASSETS=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
-            if [ -n "$ASSETS" ] && ! grep -Eq '^SHA256SUMS-[a-z]+\.txt$' <<< "$ASSETS"; then
-              echo "::error::${TAG} 是组件拆分时代的旧 release，不支持补发到统一 release"
+          if [ "$REHEARSAL" = true ]; then
+            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+              echo "::error::演练 tag ${TAG} 已存在；演练只能模拟尚未发布的 tag（补发请取消勾选 rehearsal）"
               exit 1
+            fi
+            if [ -n "$INPUT_SOURCE" ]; then
+              echo "::error::演练不接受 source_ref：构建源码即 --ref 所指提交（与 workflow 文件同一提交）"
+              exit 1
+            fi
+            TAG_SHA="$GITHUB_SHA"
+            git tag "$TAG" "$TAG_SHA"
+            echo "::notice::演练：本地 tag ${TAG} → ${TAG_SHA}（不推送）"
+          else
+            if [ "$INPUT_COMPONENT" = "all" ]; then
+              echo "::error::component=all 仅用于演练；补发请选具体组件或 changed"
+              exit 1
+            fi
+            if ! TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+              echo "::error::Tag ${TAG} 不存在（要演练未发布的 tag 请勾选 rehearsal）"
+              exit 1
+            fi
+
+            # 拆分时代（server-v* / mobile-v* … 各自一个 release）的旧 vX.Y.Z release 只含桌面端且没有
+            # 完成哨兵；往里补组件会让官网把它当统一 release、判桌面端缺失。旧版本不接受补发。
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              ASSETS=$(gh release view "$TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
+              if [ -n "$ASSETS" ] && ! grep -Eq '^SHA256SUMS-[a-z]+\.txt$' <<< "$ASSETS"; then
+                echo "::error::${TAG} 是组件拆分时代的旧 release，不支持补发到统一 release"
+                exit 1
+              fi
             fi
           fi
 
@@ -141,7 +183,7 @@ jobs:
           if git merge-base --is-ancestor "$TAG_SHA" "origin/$BRANCH"; then
             echo "::notice::Tag $TAG is on origin/$BRANCH — OK"
           else
-            echo "::error::Tag $TAG is NOT on origin/$BRANCH（稳定版须从 stable 打，预览版 -rc.N 须从 main 打）"
+            echo "::error::Tag $TAG is NOT on origin/${BRANCH}（稳定版须从 stable 打，预览版 -rc.N 须从 main 打）"
             exit 1
           fi
 
@@ -183,8 +225,10 @@ jobs:
             if [ "$PRERELEASE" != true ] && [ "$HIGHEST" = "$TAG" ]; then echo "is_highest_stable=true"; else echo "is_highest_stable=false"; fi
             echo "source=$SOURCE_SHA"
             if [ "$SOURCE_SHA" = "$TAG_SHA" ]; then echo "source_is_tag=true"; else echo "source_is_tag=false"; fi
+            # 下游副作用步骤只在 rehearsal == 'false' 时执行：输出缺失 / 异常一律视为演练（失败即关闭）
+            echo "rehearsal=$REHEARSAL"
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::Release tag: $TAG · build source: $SOURCE_SHA · baseline: ${PREV:-<none>}"
+          echo "::notice::Release tag: $TAG · build source: $SOURCE_SHA · baseline: ${PREV:-<none>} · rehearsal: $REHEARSAL"
 
       - name: Detect changes since previous version tag
         id: detect
@@ -192,19 +236,25 @@ jobs:
         run: |
           TAG="${{ steps.resolve.outputs.tag }}"
           COMPONENT="${{ inputs.component }}"
+          REHEARSAL="${{ steps.resolve.outputs.rehearsal }}"
 
-          # 手动补发单个组件：只开启被选中的组件，跳过目录 diff 检测；
-          # 构建源码不是 tag 本身（带了修复）时补跑引擎门禁。
+          # 手动补发 / 演练指定组件：只开启被选中的组件（all = 全部，仅演练），跳过目录 diff 检测；
+          # 构建源码不是 tag 本身（带了修复）时补跑引擎门禁；演练恒跑引擎门禁（扩展单组件除外）。
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$COMPONENT" != "changed" ]; then
             ENGINE=false
-            if [ "${{ steps.resolve.outputs.source_is_tag }}" != "true" ] && [ "$COMPONENT" != "extension" ]; then
+            if { [ "${{ steps.resolve.outputs.source_is_tag }}" != "true" ] || [ "$REHEARSAL" = true ]; } \
+              && [ "$COMPONENT" != "extension" ]; then
               ENGINE=true
             fi
             for c in app extension server mobile cli; do
-              if [ "$c" = "$COMPONENT" ]; then echo "$c=true"; else echo "$c=false"; fi
+              if [ "$COMPONENT" = all ] || [ "$c" = "$COMPONENT" ]; then echo "$c=true"; else echo "$c=false"; fi
             done >> "$GITHUB_OUTPUT"
             { echo "engine=$ENGINE"; echo "any=true"; } >> "$GITHUB_OUTPUT"
-            echo "::notice::Manual re-release of component ${COMPONENT} for ${TAG}"
+            if [ "$REHEARSAL" = true ]; then
+              echo "::notice::Rehearsal of component ${COMPONENT} for ${TAG}"
+            else
+              echo "::notice::Manual re-release of component ${COMPONENT} for ${TAG}"
+            fi
             exit 0
           fi
 
@@ -494,6 +544,8 @@ jobs:
     needs: changes
     # extension 与其他组件同一套变更判定；预览版只打包附到 release，商店推送 / AMO 签名步骤
     # 均以 prerelease != 'true' 门控（商店版本号不可回退，预览包不得占用稳定版的版本号）。
+    # 演练同样不碰商店（AMO listed / unlisted 都会永久占用版本号）：Firefox 出未签名包 + web-ext lint，
+    # 稳定版演练另做三家商店凭据只读探活。
     if: needs.changes.outputs.extension == 'true'
 
     steps:
@@ -539,11 +591,11 @@ jobs:
           zip -r ../../build/extension/FluxDown-${VERSION}-chrome.zip chrome-mv3/
           ls -la ../../build/extension/
 
-      # 预览版：Firefox 只出未签名包（manifest 位于 zip 根，可经 about:debugging 临时加载，或在
+      # 预览版 / 演练：Firefox 只出未签名包（manifest 位于 zip 根，可经 about:debugging 临时加载，或在
       # Developer Edition / Nightly 关闭签名校验后安装）。不走 AMO：unlisted 签名同样占用 AMO
       # 版本号，预览版的 X.Y.Z.1 会与稳定版冲突，稳定版补签时会下载到预览构建。
       - name: Package Firefox extension (preview, unsigned)
-        if: needs.changes.outputs.prerelease == 'true'
+        if: needs.changes.outputs.prerelease == 'true' || needs.changes.outputs.rehearsal != 'false'
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
           cd fluxDown/.output/firefox-mv2
@@ -553,6 +605,11 @@ jobs:
         if: needs.changes.outputs.prerelease != 'true'
         run: npm install -g web-ext
 
+      # 演练代替 AMO 签名的本地校验：lint 出 error 即失败（AMO 提交时的同类校验会拒收）。
+      - name: Lint Firefox extension (rehearsal)
+        if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal != 'false'
+        run: web-ext lint --source-dir fluxDown/.output/firefox-mv2
+
       # ── Firefox 双版本策略（仅稳定版）：AMO 市场用 X.Y.Z（与 tag 一致），GitHub Release XPI 用 X.Y.Z.1
       #    两个版本号不同，彻底避免同版本号重复提交冲突。
       #    X.Y.Z   → --channel=listed  → AMO 公开市场，等待人工审核
@@ -560,7 +617,7 @@ jobs:
 
       # Step 1: 提交 AMO 市场版本（X.Y.Z），continue-on-error 不阻塞 Release
       - name: Submit Firefox to AMO marketplace (listed, vX.Y.Z)
-        if: needs.changes.outputs.prerelease != 'true'
+        if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal == 'false'
         continue-on-error: true
         run: |
           web-ext sign \
@@ -574,7 +631,7 @@ jobs:
       # Step 2: 将 manifest 版本改为 X.Y.Z.1，unlisted 签名产出 GitHub Release 用 XPI
       # AMO 服务端有时返回 500，continue-on-error 避免阻断整个 Release
       - name: Sign Firefox extension for GitHub Release (unlisted, vX.Y.Z.1)
-        if: needs.changes.outputs.prerelease != 'true'
+        if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal == 'false'
         continue-on-error: true
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
@@ -641,7 +698,7 @@ jobs:
       # ⚠️  Refresh Token 在 Google OAuth 同意屏幕处于 Testing 模式时 7 天过期。
       #    发布前必须将同意屏幕切换到 Production，再重新走一次 OAuth 流程获取长期 token。
       - name: Publish Chrome extension to Web Store
-        if: needs.changes.outputs.prerelease != 'true'
+        if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal == 'false'
         continue-on-error: true
         env:
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
@@ -704,7 +761,7 @@ jobs:
       # 因此上传前解包剔除 key 重新打一个 Edge 专用 zip。API v1.1：ApiKey 鉴权。
       # ⚠️  API key 每 72 天过期，过期后需在 Partner Center → Publish API 重新生成并更新 EDGE_API_KEY secret。
       - name: Publish Edge extension to Edge Add-ons
-        if: needs.changes.outputs.prerelease != 'true'
+        if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal == 'false'
         continue-on-error: true
         env:
           EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
@@ -767,11 +824,79 @@ jobs:
         with:
           overwrite: true
           name: browser-extension-firefox
-          # 稳定版：AMO 签名的 .xpi；预览版：未签名 .zip
+          # 稳定版：AMO 签名的 .xpi；预览版 / 演练：未签名 .zip
           path: |
             build/extension/FluxDown-*-firefox.xpi
             build/extension/FluxDown-*-firefox-unsigned.zip
           if-no-files-found: warn
+
+      # 演练（仅稳定版）：三家商店凭据只读探活，任一失败即让本 job 失败——真实发布里商店步骤是
+      # continue-on-error，凭据过期只会静默漏推。放在 artifact 上传之后，探活失败不丢安装包。
+      #   AMO：JWT 读版本列表，并确认 X.Y.Z / X.Y.Z.1 未被占用（占用则真实提交必失败）
+      #   Chrome：refresh_token 换 access_token 后读取商店条目（DRAFT 投影，只读）
+      #   Edge：以不存在的 operation ID 查询上传状态——401/403 = ApiKey 失效，404 = 鉴权通过
+      - name: Probe store credentials (rehearsal)
+        if: needs.changes.outputs.prerelease != 'true' && needs.changes.outputs.rehearsal != 'false'
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          AMO_ISSUER: ${{ secrets.AMO_JWT_ISSUER }}
+          AMO_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+          CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
+          CHROME_CLIENT_SECRET: ${{ secrets.CHROME_CLIENT_SECRET }}
+          CHROME_REFRESH_TOKEN: ${{ secrets.CHROME_REFRESH_TOKEN }}
+          EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
+          EDGE_API_KEY: ${{ secrets.EDGE_API_KEY }}
+          EDGE_PRODUCT_ID: ${{ secrets.EDGE_PRODUCT_ID }}
+        run: |
+          set -uo pipefail
+          FAIL=0
+
+          _amo_jwt() {
+            local iat exp header payload sig
+            iat=$(date +%s); exp=$((iat + 300))
+            header=$(printf '{"alg":"HS256","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
+            payload=$(printf '{"iss":"%s","jti":"%s","iat":%s,"exp":%s}' \
+              "$AMO_ISSUER" "$iat" "$iat" "$exp" | base64 -w0 | tr '+/' '-_' | tr -d '=')
+            sig=$(printf '%s.%s' "$header" "$payload" \
+              | openssl dgst -sha256 -hmac "$AMO_SECRET" -binary | base64 -w0 | tr '+/' '-_' | tr -d '=')
+            printf '%s.%s.%s' "$header" "$payload" "$sig"
+          }
+          if [ -z "$AMO_ISSUER" ] || [ -z "$AMO_SECRET" ]; then
+            echo "::error::AMO_JWT_ISSUER / AMO_JWT_SECRET 未配置"; FAIL=1
+          elif VERS=$(curl -sf -H "Authorization: JWT $(_amo_jwt)" \
+              "https://addons.mozilla.org/api/v5/addons/addon/fluxdown%40fluxdown.app/versions/?filter=all_with_unlisted"); then
+            TAKEN=$(printf '%s' "$VERS" | python3 -c "import sys,json;v=sys.argv[1];d=json.load(sys.stdin);print(' '.join(x['version'] for x in d.get('results') or [] if x.get('version') in (v, v+'.1')))" "$VERSION")
+            if [ -n "$TAKEN" ]; then
+              echo "::error::AMO 已存在版本 ${TAKEN}，真实发布的 AMO 提交会失败"; FAIL=1
+            else
+              echo "✅ AMO 凭据有效，${VERSION} / ${VERSION}.1 未被占用"
+            fi
+          else
+            echo "::error::AMO 凭据探活失败"; FAIL=1
+          fi
+
+          if ACCESS_TOKEN=$(curl -sf -X POST https://oauth2.googleapis.com/token \
+                -d "client_id=${CHROME_CLIENT_ID}" \
+                -d "client_secret=${CHROME_CLIENT_SECRET}" \
+                -d "refresh_token=${CHROME_REFRESH_TOKEN}" \
+                -d "grant_type=refresh_token" \
+                | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])") \
+            && ITEM=$(curl -sf -H "Authorization: Bearer ${ACCESS_TOKEN}" -H "x-goog-api-version: 2" \
+                "https://www.googleapis.com/chromewebstore/v1.1/items/meleenglfggcmcajknpeeeiobnpfmahc?projection=DRAFT"); then
+            echo "✅ Chrome Web Store 凭据有效：$(printf '%s' "$ITEM" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('id'), 'uploadState=%s' % d.get('uploadState'))")"
+          else
+            echo "::error::Chrome Web Store 凭据探活失败（refresh token 过期 / OAuth 同意屏幕仍为 Testing / 无权限）"; FAIL=1
+          fi
+
+          CODE=$(curl -sS -o /dev/null -w '%{http_code}' \
+            -H "Authorization: ApiKey ${EDGE_API_KEY}" -H "X-ClientID: ${EDGE_CLIENT_ID}" \
+            "https://api.addons.microsoftedge.microsoft.com/v1/products/${EDGE_PRODUCT_ID}/submissions/draft/package/operations/00000000-0000-0000-0000-000000000000") || CODE=000
+          case "$CODE" in
+            401|403|000) echo "::error::Edge Add-ons 凭据探活失败（HTTP ${CODE}；EDGE_API_KEY 每 72 天过期）"; FAIL=1 ;;
+            *) echo "✅ Edge Add-ons ApiKey 被接受（HTTP ${CODE}）" ;;
+          esac
+
+          exit "$FAIL"
 
   # ── 并行 Job 3: GPUI 桌面客户端 Linux x64：tar.gz / AppImage / deb / Arch ──
   # ubuntu-22.04 构建（glibc 2.35 基线，兼容面与 Flutter 时代一致）；打包逻辑与运行期布局
@@ -1476,6 +1601,7 @@ jobs:
   # ── 并行 Job 5c: Docker 镜像（linux/amd64 + linux/arm64，推 ghcr.io）──
   # linux 二进制 tarball 已由 build-server-binaries（musl 静态链接）产出，此处只推镜像。
   # Rust 编译在 Dockerfile 内按 TARGETARCH 交叉编译（不走 QEMU）；QEMU 仅用于 arm64 运行时层的 apt。
+  # 演练：照常登录 ghcr（验证凭据）并完整构建双架构镜像，但不推送。
   build-server-docker:
     name: Build Server (Docker)
     runs-on: ubuntu-latest
@@ -1491,7 +1617,7 @@ jobs:
       # 源码取 tag 本身的补发：仅 Docker 构建配置取本次 workflow 提交的修复（修打包不动源码）。
       # 指定了 source_ref 时修复已在源码里，不再覆盖。
       - name: Apply Docker build configuration for manual re-release
-        if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.source_is_tag == 'true'
+        if: github.event_name == 'workflow_dispatch' && needs.changes.outputs.source_is_tag == 'true' && needs.changes.outputs.rehearsal == 'false'
         env:
           WORKFLOW_SHA: ${{ github.sha }}
         run: |
@@ -1535,7 +1661,7 @@ jobs:
           context: .
           file: docker/server.Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ needs.changes.outputs.rehearsal == 'false' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
@@ -1549,6 +1675,7 @@ jobs:
   # 与构建并行；上传 job 只在草稿就绪后开始。
   # tag 推送：生成说明并写入（release 已存在时只刷新说明，不改草稿/发布状态）；
   # 手动补发：release 已存在则不动，缺失时以兜底标题新建草稿（说明可事后手改）。
+  # 演练：在本 runner 打本地 tag 后照常生成说明，写入 job summary 与 artifact，不建草稿。
   prepare-release:
     name: Prepare Release
     runs-on: ubuntu-latest
@@ -1568,8 +1695,14 @@ jobs:
           # 不检出 tag：本地 composite action（release-notes）从 workspace 加载，
           # 检出 tag 会跑成旧版本 action。历史与 tag 已由 fetch-depth:0 + fetch-tags 提供。
 
+      # 演练：release-notes 按 tag 取 git 区间，tag 尚不存在，打一个只在本 runner 内的本地 tag（不推送）
+      - name: Create local rehearsal tag
+        if: needs.changes.outputs.rehearsal != 'false'
+        run: git tag "$TAG" "${{ needs.changes.outputs.source }}"
+
       - name: Check existing release
         id: existing
+        if: needs.changes.outputs.rehearsal == 'false'
         run: |
           if gh release view "$TAG" --json isDraft >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
@@ -1579,7 +1712,7 @@ jobs:
 
       - name: Describe release scope
         id: scope
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || needs.changes.outputs.rehearsal != 'false'
         env:
           C_APP: ${{ needs.changes.outputs.app }}
           C_SERVER: ${{ needs.changes.outputs.server }}
@@ -1606,7 +1739,7 @@ jobs:
       # AI 撰写面向用户的双语 release notes（素材 = git-cliff + commit 正文 + 变更统计）
       # 实现见 .github/actions/release-notes/action.yml
       - name: Generate release notes
-        if: github.event_name == 'push'
+        if: github.event_name == 'push' || needs.changes.outputs.rehearsal != 'false'
         uses: ./.github/actions/release-notes
         with:
           component: FluxDown 统一发布，本次包含：${{ steps.scope.outputs.component }}
@@ -1616,6 +1749,7 @@ jobs:
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       - name: Create or update draft release
+        if: needs.changes.outputs.rehearsal == 'false'
         env:
           EXISTS: ${{ steps.existing.outputs.exists }}
         run: |
@@ -1637,9 +1771,29 @@ jobs:
             gh release create "$TAG" "${ARGS[@]}"
           fi
 
+      - name: Show rehearsal release notes
+        if: needs.changes.outputs.rehearsal != 'false'
+        run: |
+          {
+            echo "## 演练：${TAG} 发布说明预览（未创建 release）"
+            echo
+            cat RELEASE_NOTES.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload rehearsal release notes
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-release-notes
+          path: RELEASE_NOTES.md
+          if-no-files-found: error
+
   # ── Release Job 2: 各组件上传到统一 release（互不依赖，任一组件失败不影响其余）──
   # release-upload 最后上传 SHA256SUMS-<组件>.txt 完成哨兵；OSS 同步失败不阻断发布
   # （官网 /api/download 缺 OSS 对象时回退 GitHub）。
+  # 演练：release-upload / oss-upload 走 dry-run（只生成哨兵、只读探活 OSS，OSS 失败即报错），
+  # 哨兵存为 rehearsal-sums-<组件> artifact 供 publish-release 预览。
   upload-app:
     name: Upload Desktop App
     runs-on: ubuntu-latest
@@ -1676,14 +1830,25 @@ jobs:
           tag: ${{ needs.changes.outputs.tag }}
           component: app
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
+      - name: Keep rehearsal checksum sentinel
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-sums-app
+          path: release-assets/SHA256SUMS-app.txt
+          if-no-files-found: error
 
       - name: Upload release assets to OSS
-        continue-on-error: true
+        continue-on-error: ${{ needs.changes.outputs.rehearsal == 'false' }}
         uses: ./.github/actions/oss-upload
         with:
           tag: ${{ needs.changes.outputs.tag }}
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
   upload-extension:
     name: Upload Browser Extension
@@ -1707,14 +1872,25 @@ jobs:
           tag: ${{ needs.changes.outputs.tag }}
           component: extension
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
+      - name: Keep rehearsal checksum sentinel
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-sums-extension
+          path: release-assets/SHA256SUMS-extension.txt
+          if-no-files-found: error
 
       - name: Upload release assets to OSS
-        continue-on-error: true
+        continue-on-error: ${{ needs.changes.outputs.rehearsal == 'false' }}
         uses: ./.github/actions/oss-upload
         with:
           tag: ${{ needs.changes.outputs.tag }}
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
   # Docker 镜像直接推 ghcr（不是 release 资产），其失败由 publish-release 单独报告，不阻断二进制上传。
   upload-server:
@@ -1739,14 +1915,25 @@ jobs:
           tag: ${{ needs.changes.outputs.tag }}
           component: server
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
+      - name: Keep rehearsal checksum sentinel
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-sums-server
+          path: release-assets/SHA256SUMS-server.txt
+          if-no-files-found: error
 
       - name: Upload release assets to OSS
-        continue-on-error: true
+        continue-on-error: ${{ needs.changes.outputs.rehearsal == 'false' }}
         uses: ./.github/actions/oss-upload
         with:
           tag: ${{ needs.changes.outputs.tag }}
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
   upload-cli:
     name: Upload CLI
@@ -1770,14 +1957,25 @@ jobs:
           tag: ${{ needs.changes.outputs.tag }}
           component: cli
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
+      - name: Keep rehearsal checksum sentinel
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-sums-cli
+          path: release-assets/SHA256SUMS-cli.txt
+          if-no-files-found: error
 
       - name: Upload release assets to OSS
-        continue-on-error: true
+        continue-on-error: ${{ needs.changes.outputs.rehearsal == 'false' }}
         uses: ./.github/actions/oss-upload
         with:
           tag: ${{ needs.changes.outputs.tag }}
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
   upload-mobile:
     name: Upload Mobile
@@ -1801,19 +1999,32 @@ jobs:
           tag: ${{ needs.changes.outputs.tag }}
           component: mobile
           github-token: ${{ secrets.GITHUB_TOKEN }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
+
+      - name: Keep rehearsal checksum sentinel
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-sums-mobile
+          path: release-assets/SHA256SUMS-mobile.txt
+          if-no-files-found: error
 
       - name: Upload release assets to OSS
-        continue-on-error: true
+        continue-on-error: ${{ needs.changes.outputs.rehearsal == 'false' }}
         uses: ./.github/actions/oss-upload
         with:
           tag: ${{ needs.changes.outputs.tag }}
           access-key-id: ${{ secrets.OSS_ACCESS_KEY_ID }}
           access-key-secret: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+          dry-run: ${{ needs.changes.outputs.rehearsal != 'false' }}
 
   # ── Release Job 3: 收尾发布（tag 推送与补发都跑，幂等）──
   # 汇总 SHA256SUMS.txt、刷新说明头部（已发布组件 + 服务器/CLI 安装说明）、草稿转正、
   # 决定 latest（稳定版 + 桌面端完整 + 最高稳定版本）。有组件未完成时发布其余组件后
   # 以失败结束并在 job summary 给出补发命令。实现见 .github/scripts/release_publish.py。
+  # 演练：同一脚本以 --rehearsal-dir 读取本次的哨兵与说明 artifact，只产出总校验和、release 正文
+  # 与计划中的 gh 操作预览（rehearsal-release-preview），不调用任何 gh 写操作。
   publish-release:
     name: Publish Release
     runs-on: ubuntu-latest
@@ -1837,12 +2048,21 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Download rehearsal sentinels and notes
+        if: needs.changes.outputs.rehearsal != 'false'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rehearsal-*
+          path: rehearsal/
+          merge-multiple: true
+
       - name: Publish unified release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.changes.outputs.tag }}
           DOCKER_RESULT: ${{ needs.build-server-docker.result }}
+          REHEARSAL: ${{ needs.changes.outputs.rehearsal }}
           C_APP: ${{ needs.changes.outputs.app }}
           C_EXTENSION: ${{ needs.changes.outputs.extension }}
           C_SERVER: ${{ needs.changes.outputs.server }}
@@ -1854,18 +2074,32 @@ jobs:
             v="C_$c"
             if [ "${!v}" = true ]; then EXPECTED="${EXPECTED:+${EXPECTED},}${c,,}"; fi
           done
+          MODE=()
+          if [ "$REHEARSAL" != false ]; then MODE=(--rehearsal-dir rehearsal); fi
           python3 .github/scripts/release_publish.py \
-            --tag "$TAG" --expected "$EXPECTED" --docker-result "$DOCKER_RESULT"
+            --tag "$TAG" --expected "$EXPECTED" --docker-result "$DOCKER_RESULT" "${MODE[@]}"
+
+      - name: Upload rehearsal release preview
+        if: ${{ always() && needs.changes.outputs.rehearsal != 'false' }}
+        uses: actions/upload-artifact@v4
+        with:
+          overwrite: true
+          name: rehearsal-release-preview
+          path: |
+            rehearsal/SHA256SUMS.txt
+            rehearsal/release-body.md
+          if-no-files-found: warn
 
   # ── 最终 Job: 清理 GitHub Actions Artifact，仅保留当前 tag 这一组 ──
   # 原因：Free 账号 artifact 配额仅 500MB，每次 release 会上传 ~400MB
   # Release 资产已独立存储在 GitHub Release，artifact 只是 CI 中间产物可安全清理
   # always()：无论哪些组件被跳过/失败都执行清理，失败不阻断（continue-on-error）
+  # 演练不清理：它的 artifact 就是交付物（由下一次真实发布的清理回收）。
   cleanup-artifacts:
     name: Cleanup CI Artifacts
     runs-on: ubuntu-latest
     needs: [changes, publish-release]
-    if: ${{ always() && !cancelled() }}
+    if: ${{ always() && !cancelled() && needs.changes.outputs.rehearsal != 'true' }}
 
     steps:
       - name: Cleanup GitHub Actions artifacts (keep current tag + in-flight runs)

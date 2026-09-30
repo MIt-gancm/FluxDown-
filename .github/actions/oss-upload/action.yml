@@ -10,6 +10,7 @@
 #
 # 凭据只走 secrets（OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET）；未配置时整步跳过，
 # 不阻断 GitHub Release（官网自动回退 GitHub 直连）。
+# dry-run=true（release.yml 演练）：推导目标目录并用同一条 ls 只读探活凭据与 bucket 权限，不上传。
 name: Upload release assets to OSS
 description: 用 ossutil 把 release-assets/ 上传到阿里云 OSS 的 <prefix>/<版本>/<组件>/ 下
 
@@ -43,6 +44,10 @@ inputs:
     description: OSS region id
     required: false
     default: cn-beijing
+  dry-run:
+    description: "'true' = 只推导目标目录并只读列举，验证凭据，不上传"
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -69,6 +74,7 @@ runs:
         BASE: oss://${{ inputs.bucket }}/${{ inputs.prefix }}
         ENDPOINT: ${{ inputs.endpoint }}
         REGION: ${{ inputs.region }}
+        DRY_RUN: ${{ inputs.dry-run }}
       run: |
         set -euo pipefail
         if [ -z "$OSS_ACCESS_KEY_ID" ] || [ -z "$OSS_ACCESS_KEY_SECRET" ]; then
@@ -83,6 +89,15 @@ runs:
         case "$TAG" in *[!A-Za-z0-9._-]*) echo "::error::invalid tag '$TAG'"; exit 1 ;; esac
         DEST="$BASE/$VERSION/$COMPONENT/"
         LOCAL_COUNT=$(find "$DIR" -maxdepth 1 -type f | wc -l)
+
+        if [ "$DRY_RUN" != "false" ]; then
+          # 与下方上传后校验同一条 ls（不吞错误）：鉴权 / 权限 / endpoint 有误即失败
+          LISTING=$(ossutil ls -e "$ENDPOINT" --region "$REGION" "$DEST" --short-format)
+          EXISTING=$(printf '%s\n' "$LISTING" | grep -c "^oss://" || true)
+          echo "🧪 dry-run: ${LOCAL_COUNT} file(s) from ${DIR}/ → ${DEST}（未上传）；OSS 凭据有效，目标现有 ${EXISTING} 个对象"
+          exit 0
+        fi
+
         echo "Uploading ${LOCAL_COUNT} file(s) from ${DIR}/ → ${DEST}"
 
         # -f 覆盖：workflow_dispatch 补跑同 tag 时以新产物为准

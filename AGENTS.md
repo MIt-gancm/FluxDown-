@@ -189,7 +189,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - **分支模型**：`main` = 开发分支（超集 / 最新），`stable` = 稳定分支（子集）。日常一律在 `main`；`stable` 只经合并/cherry-pick `main` 前进；hotfix 直进 `stable` 必须**同回合**同步回 `main`。一致性判据 `git log stable --not main` **恒为空**。
 - **tag**：稳定 `vX.Y.Z` 只从 `stable`，预览 `vX.Y.Z-rc.N` 只从 `main`；CI 有分支守卫，打错分支整条流水线失败。推送 `v*` tag **立即触发全平台发布，不可逆**。
 - 主干门禁由 `.github/workflows/ci.yml` 承载：main push / pull_request 按变更触发 Rust fmt、排除冻结 server 的 workspace clippy、按 crate 分组 nextest，以及 Web SPA / 官网 / 扩展构建；不等发布 tag 才验证。
-- 发布流水线是**组件变更检测 + 统一 release** 式（`changes` job 映射路径→`app`/`extension`/`server`/`mobile`/`cli`，组件互不阻断，失败组件经 `workflow_dispatch` 补发）；矩阵与补发细节见 `.omp/knowledge/ops.md`。
+- 发布流水线是**组件变更检测 + 统一 release** 式（`changes` job 映射路径→`app`/`extension`/`server`/`mobile`/`cli`，组件互不阻断，失败组件经 `workflow_dispatch` 补发）；发版前可手动勾选 `rehearsal` 以尚不存在的 tag 演练整条流水线（全量构建 / 签名 / 公证 / 凭据探活，不建 release、不上传、不推镜像与商店）。矩阵、补发与演练细节见 `.omp/knowledge/ops.md`。
 
 ---
 

@@ -7,6 +7,7 @@
 # 回落到该组件上一个完整版本。
 #
 # 哨兵留在 dir 中，随后的 OSS 同步会一并上传。
+# dry-run=true（release.yml 演练）：只生成哨兵，不读写 release。
 name: Upload component to release
 description: 上传组件产物与 SHA256SUMS-<组件>.txt 完成哨兵到 vX.Y.Z release（幂等，可重复补发）
 
@@ -24,6 +25,10 @@ inputs:
   github-token:
     description: 具备 contents:write 的 token
     required: true
+  dry-run:
+    description: "'true' = 只在本地生成哨兵并打印，不调用任何 gh release 命令"
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -36,6 +41,7 @@ runs:
         TAG: ${{ inputs.tag }}
         COMPONENT: ${{ inputs.component }}
         DIR: ${{ inputs.dir }}
+        DRY_RUN: ${{ inputs.dry-run }}
       run: |
         set -euo pipefail
         case "$COMPONENT" in app|extension|server|cli|mobile) ;; *)
@@ -52,6 +58,11 @@ runs:
         sha256sum "${FILES[@]}" > "$SENTINEL"
         echo "── ${SENTINEL} ──"
         cat "$SENTINEL"
+
+        if [ "$DRY_RUN" != "false" ]; then
+          echo "🧪 dry-run: ${COMPONENT} ${#FILES[@]} asset(s) → ${TAG}（未上传）"
+          exit 0
+        fi
 
         retry() {
           for i in 1 2 3; do
