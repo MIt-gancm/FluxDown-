@@ -54,6 +54,7 @@ use crate::logger::{log_info, log_warn};
 use crate::model::SourceBytes;
 use crate::output;
 use crate::speed_limiter::SpeedLimiter;
+use crate::temp_file_guard::TempFileGuard;
 use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferGuard, TransferTracker};
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1329,7 @@ struct WorkerSpawnCtx {
     task_id: String,
     url: String,
     dest: PathBuf,
+    temp_file_guard: TempFileGuard,
     planned_total: Arc<AtomicI64>,
     size_is_estimate: bool,
     first_validators: Arc<StdMutex<Option<(String, String)>>>,
@@ -1365,6 +1367,7 @@ impl WorkerSpawnCtx {
             self.task_id.clone(),
             self.url.clone(),
             self.dest.clone(),
+            self.temp_file_guard.clone(),
             self.planned_total.clone(),
             self.size_is_estimate,
             self.first_validators.clone(),
@@ -1454,6 +1457,7 @@ pub async fn run_coordinated_download(
     // important for DASH multi-segment downloads, which reach preallocation
     // before the single-stream downloader's directory preparation.
     output::ensure_parent(dest).await?;
+    let temp_file_guard = TempFileGuard::acquire(dest, task_id).await?;
 
     // 段数钳制：保证每个新建分段至少覆盖 1 字节。build_fresh_segments 用
     // chunk = total_bytes / count；当 count > total_bytes 时 chunk=0，会生成大量
@@ -1749,7 +1753,7 @@ pub async fn run_coordinated_download(
     // 平台策略（fallocate / SetFileInformationByHandle / set_len 回退）见
     // preallocate_file_len——就地扩容（TrueSizeLarger）复用同一助手延长文件。
     truncate_stale_tail(dest, effective_total_bytes as u64).await?;
-    preallocate_file_len(dest, effective_total_bytes as u64).await?;
+    preallocate_file_len(dest, effective_total_bytes as u64, &temp_file_guard).await?;
 
     // ----- 3. Shared state for progress reporting ---------------------------
     let total_downloaded = Arc::new(AtomicI64::new(
@@ -1888,6 +1892,8 @@ pub async fn run_coordinated_download(
     // cancelled() 一个字节都下不了 → 任务永久卡死（历史致命 BUG）。用户主动取消时
     // cancel 主令牌，子令牌作为其 child 自动级联取消，workers 照常停止，语义不变。
     let worker_cancel = cancel_token.child_token();
+    // Unwinding or dropping the coordinator must stop detached body readers as well.
+    let _worker_cancel_on_drop = worker_cancel.clone().drop_guard();
 
     // 连接敏感 latch：workers 一旦观察到服务器对 Range 请求返回非 206（瞬时/持续 200），
     // 置位此标志。coordinator 据此停止【主动拆分】（见下方 proactive 定时分支）以降低
@@ -1921,6 +1927,7 @@ pub async fn run_coordinated_download(
         task_id: task_id.to_string(),
         url: url.to_string(),
         dest: dest.to_path_buf(),
+        temp_file_guard: temp_file_guard.clone(),
         planned_total: planned_total.clone(),
         size_is_estimate,
         first_validators: first_validators.clone(),
@@ -2278,7 +2285,7 @@ pub async fn run_coordinated_download(
                                 // 物理扩容临时文件（逻辑 EOF + 尽量物理分配）。
                                 // 失败（如 ENOSPC）是致命错误：停 workers 上报。
                                 if let Err(e) =
-                                    preallocate_file_len(dest, reported_total as u64).await
+                                    preallocate_file_len(dest, reported_total as u64, &temp_file_guard).await
                                 {
                                     log_info!(
                                         "[coordinator] task {} 就地扩容预分配失败: {}",
@@ -3575,7 +3582,12 @@ async fn truncate_stale_tail(dest: &Path, target_len: u64) -> Result<(), Downloa
 ///   阶段暴露，而是在写入时以 ENOSPC/`ERROR_DISK_FULL` 上报（致命、不重试）。
 ///   打标记失败（FAT32/exFAT/网络盘等）才退回 FileAllocationInfo 物理预分配。
 /// - 其它:    回退 set_len()。
-async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), DownloadError> {
+async fn preallocate_file_len(
+    dest: &Path,
+    target_len: u64,
+    temp_file_guard: &TempFileGuard,
+) -> Result<(), DownloadError> {
+    let temp_file_guard = temp_file_guard.clone();
     #[cfg(target_os = "windows")]
     let dest_owned = dest.to_path_buf();
     let file = OpenOptions::new()
@@ -3592,6 +3604,7 @@ async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), Downlo
     {
         let std_file = file.into_std().await;
         tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
+            let _temp_file_guard = temp_file_guard;
             use std::os::unix::io::AsRawFd;
             let fd = std_file.as_raw_fd();
             // fallocate(fd, 0, 0, len): 预分配 [0, len) 范围的磁盘块，
@@ -3624,6 +3637,7 @@ async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), Downlo
     {
         let std_file = file.into_std().await;
         tokio::task::spawn_blocking(move || -> Result<(), DownloadError> {
+            let _temp_file_guard = temp_file_guard;
             // Step 0: sparse 标记必须先于任何 set_len / 写入。失败只记日志，
             // 退回下方的物理预分配。
             let sparse = match crate::bt_sparse::mark_sparse(&dest_owned) {
@@ -3671,7 +3685,13 @@ async fn preallocate_file_len(dest: &Path, target_len: u64) -> Result<(), Downlo
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
-        file.set_len(target_len).await?;
+        let std_file = file.into_std().await;
+        tokio::task::spawn_blocking(move || {
+            let _temp_file_guard = temp_file_guard;
+            std_file.set_len(target_len)
+        })
+        .await
+        .map_err(|e| DownloadError::Other(format!("prealloc task panicked: {e}")))??;
     }
     Ok(())
 }
@@ -4433,6 +4453,7 @@ fn spawn_worker(
     task_id: String,
     url: String,
     dest: PathBuf,
+    temp_file_guard: TempFileGuard,
     planned_total: Arc<AtomicI64>,
     size_is_estimate: bool,
     first_validators: Arc<StdMutex<Option<(String, String)>>>,
@@ -4455,6 +4476,7 @@ fn spawn_worker(
     spawn_gen: i64,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let _temp_file_guard = temp_file_guard;
         // Worker loop: keep accepting assignments until the channel closes.
         while let Some(assignment) = assign_rx.recv().await {
             if cancel_token.is_cancelled() {
@@ -5701,6 +5723,82 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex as StdMutex};
+
+    #[tokio::test]
+    async fn coordinator_rejects_another_writer_before_truncating_stale_tail() {
+        use crate::cdn::NodePool;
+        use crate::downloader::RequestSpec;
+        use crate::events::{EngineEvent, EventSink};
+        use crate::speed_limiter::SpeedLimiter;
+        use crate::temp_file_guard::TempFileGuard;
+        use tokio_util::sync::CancellationToken;
+
+        struct NoopSink;
+        impl EventSink for NoopSink {
+            fn emit(&self, _event: EngineEvent) {}
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_coord_lock_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir).await.unwrap();
+        db.insert_task(
+            "second",
+            "http://127.0.0.1:1/f",
+            "f",
+            "",
+            1,
+            0,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .unwrap();
+        let dest = dir.join("f.fdownloading");
+        std::fs::write(&dest, b"existing partial data").unwrap();
+        let first = TempFileGuard::acquire(&dest, "first").await.unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+        let spec = RequestSpec {
+            method: reqwest::Method::GET,
+            cookies: String::new(),
+            referrer: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            body: None,
+        };
+        let result = super::run_coordinated_download(
+            "second",
+            "http://127.0.0.1:1/f",
+            &dest,
+            4,
+            false,
+            2,
+            NodePool::single(reqwest::Client::new()),
+            &db,
+            &tx,
+            &CancellationToken::new(),
+            &SpeedLimiter::new(0),
+            &spec,
+            &NoopSink,
+            "",
+            "",
+            super::ReportScope::whole_task(),
+            1,
+            false,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(DownloadError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing partial data");
+        assert!(db.load_segments("second").await.unwrap().is_empty());
+        drop(first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn make_seg(index: i32, start: i64, end: i64, downloaded: i64, state: SegState) -> LiveSegment {
         LiveSegment {

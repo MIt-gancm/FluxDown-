@@ -16,6 +16,7 @@ use crate::events::EventSink;
 use crate::logger::{log_info, log_warn};
 use crate::output;
 use crate::speed_limiter::SpeedLimiter;
+use crate::temp_file_guard::TempFileGuard;
 use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferTracker};
 
 // ---------------------------------------------------------------------------
@@ -3178,6 +3179,11 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     // 结果作为文件名；此时也不做 dedup（manager 应在 spawn 前确保 file_name
     // 已 dedup）。
     let actual_name = auto_name.clone();
+    let dest_path = save_dir.join(&actual_name);
+    let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
+    output::ensure_parent(&temp_path).await?;
+    // Keep ownership through mode changes, stale-data cleanup, verification and final rename.
+    let _temp_file_guard = TempFileGuard::acquire(&temp_path, &p.task_id).await?;
 
     // For resume tasks we must NOT blindly overwrite total_bytes with the
     // freshly-probed value.  CDN servers frequently return a slightly different
@@ -3303,10 +3309,6 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             ..Default::default()
         })
         .await;
-
-    let dest_path = save_dir.join(&actual_name);
-    // Chrome-style: write to a temporary file during download, rename on success.
-    let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
 
     // `size_is_estimate`：本次规划的 total 是否为【未经验证的估计值】，统一由
     // range_verified 门控（fresh 由 manager 决定，resume 读 DB）。true 的情形：
@@ -4157,6 +4159,8 @@ async fn download_single(
     expected_last_modified: &str,
     is_resume: bool,
 ) -> Result<SingleDownloadResult, DownloadError> {
+    output::ensure_parent(dest).await?;
+    let _temp_file_guard = TempFileGuard::acquire(dest, task_id).await?;
     let mut clean_boundary = false;
     let mut rounds: u64 = 0;
     loop {
@@ -4273,8 +4277,6 @@ async fn download_single_once(
     // 上一轮有界窗口干净 EOF 后的衔接请求：起点取实际文件末尾，不向下对齐。
     clean_boundary: bool,
 ) -> Result<SingleDownloadResult, DownloadError> {
-    output::ensure_parent(dest).await?;
-
     let physical_existing_len = match tokio::fs::metadata(dest).await {
         Ok(metadata) => i64::try_from(metadata.len()).map_err(|_| {
             DownloadError::Other(format!(
@@ -7151,6 +7153,7 @@ mod single_resume_tests {
     use crate::db::Db;
     use crate::events::{EngineEvent, EventSink};
     use crate::speed_limiter::SpeedLimiter;
+    use crate::temp_file_guard::TempFileGuard;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -7253,6 +7256,58 @@ mod single_resume_tests {
         let on_disk = std::fs::read(&dest).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         (res, on_disk)
+    }
+
+    #[tokio::test]
+    async fn single_stream_rejects_other_writer_and_retries_after_release() {
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_single_lock_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir).await.unwrap();
+        let dest = dir.join("f.bin.fdownloading");
+        std::fs::write(&dest, b"existing partial data").unwrap();
+        let first = TempFileGuard::acquire(&dest, "first").await.unwrap();
+        let port = spawn_http(|_| response("200 OK", "", b"finished download")).await;
+        let url = format!("http://127.0.0.1:{port}/f.bin");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+        let cancel = CancellationToken::new();
+        let limiter = SpeedLimiter::new(0);
+        let spec = RequestSpec {
+            method: reqwest::Method::GET,
+            cookies: String::new(),
+            referrer: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            body: None,
+        };
+        let attempt = || {
+            download_single(
+                "second", &url, &dest, 17, false, &client, &db, &NoopSink, &tx, &cancel, &limiter,
+                &spec, "f.bin", "", "", false,
+            )
+        };
+        assert!(matches!(
+            attempt().await,
+            Err(DownloadError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing partial data");
+        drop(first);
+        let paused = CancellationToken::new();
+        paused.cancel();
+        let paused_result = download_single(
+            "second", &url, &dest, 17, false, &client, &db, &NoopSink, &tx, &paused, &limiter,
+            &spec, "f.bin", "", "", false,
+        )
+        .await;
+        assert!(matches!(paused_result, Err(DownloadError::Cancelled)));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"existing partial data");
+        let after_pause = TempFileGuard::acquire(&dest, "first").await.unwrap();
+        drop(after_pause);
+        let second = TempFileGuard::acquire(&dest, "second").await.unwrap();
+        attempt().await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"finished download");
+        drop(second);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

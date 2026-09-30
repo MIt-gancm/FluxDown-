@@ -58,6 +58,7 @@ pub mod speed_limiter;
 /// 通用订阅 provider 接口（RSS 与插件订阅共用）。
 pub mod subscription;
 pub mod task_activity;
+mod temp_file_guard;
 /// `thunder://` 链接解析（迅雷专有 base64 封装：`AA<真实地址>ZZ`）。
 pub mod thunder;
 pub mod tracker_subscription;
