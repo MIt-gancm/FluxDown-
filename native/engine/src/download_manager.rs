@@ -1670,9 +1670,9 @@ pub struct DownloadManager {
     idle_file_scan: bool,
     /// Boost 模式当前优先任务 ID（内存级，重启清空）。None = 无优先任务。
     priority_task_id: Option<String>,
-    /// 因 Boost 模式自动暂停的任务 ID 集合（内存级，重启清空）。
-    /// 取消 Boost 时这些任务会自动恢复。
-    auto_paused_ids: HashSet<String>,
+    /// 因 Boost 模式自动暂停的任务 ID（内存级，重启清空），按暂停/恢复优先级有序、去重。
+    /// 取消 Boost 时这些任务按此顺序自动恢复。
+    auto_paused_ids: Vec<String>,
     /// 任务级自动重试：网络 stall / 瞬时错误导致任务失败后，延迟自动恢复。
     /// key = task_id，value = 已自动重试次数。
     /// 超过 `max_auto_retries` 后不再重试，保持 error 状态等用户手动恢复。
@@ -1834,7 +1834,7 @@ impl DownloadManager {
             missing_cleanup_rx: Some(missing_cleanup_rx),
             idle_file_scan: true,
             priority_task_id: None,
-            auto_paused_ids: HashSet::new(),
+            auto_paused_ids: Vec::new(),
             auto_retry_counts: HashMap::new(),
             max_auto_retries: DEFAULT_MAX_TASK_AUTO_RETRIES,
             auto_retry_delay_secs: DEFAULT_AUTO_RETRY_BASE_DELAY_SECS,
@@ -2896,9 +2896,15 @@ impl DownloadManager {
         // 让新 worker_cap 立即生效。全程在 current_thread actor 内串行，无竞态。
         // 静默暂停——这是实现细节，用户看到的是「改了线程数」，不是「暂停了」。
         if was_active {
-            self.pause_task_silent(task_id).await;
+            self.pause_task_keep_slot(task_id).await;
         }
-        self.db.update_task_segments(task_id, seg).await?;
+        if let Err(e) = self.db.update_task_segments(task_id, seg).await {
+            // 放弃恢复：补做暂停时被跳过的 drain，避免空槽位卡住排队任务。
+            if was_active {
+                self.drain_queue().await;
+            }
+            return Err(e);
+        }
         log_info!(
             "[manager] task {} 分段数已改为 {}（进度保留，was_active={}）",
             task_id,
@@ -3598,20 +3604,23 @@ impl DownloadManager {
         if queue_id.is_empty() {
             return true;
         }
+        // `max_concurrent <= 0` = unlimited (avoid `-1 as usize` wrapping).
         let queue_max = self
             .queues
             .get(queue_id)
-            .map(|q| q.max_concurrent as usize)
+            .map(|q| q.max_concurrent)
             .unwrap_or(0);
-        if queue_max == 0 {
+        if queue_max <= 0 {
             return true;
         }
+        // BT tasks bypass the queue entirely: they neither obey nor consume
+        // queue slots (same as `has_capacity`).
         let active_in_queue = self
             .active_tasks
             .values()
-            .filter(|e| e.queue_id.as_str() == queue_id)
+            .filter(|e| !e.is_bt && e.queue_id.as_str() == queue_id)
             .count();
-        active_in_queue < queue_max
+        active_in_queue < queue_max as usize
     }
 
     /// Return the appropriate speed limiter for a task in `queue_id`.
@@ -3745,14 +3754,17 @@ impl DownloadManager {
         let resume_after_pause = self.finish_pending_pause(task_id, generation).await;
 
         // A slot freed up — try to start queued tasks.
+        // 先处理飞行期间到达的 resume 请求：内部「暂停 + 立即恢复」流程（改分段数 /
+        // 重新下载）不在暂停时 drain，槽位必须先归还给它，否则会被排队头部抢走。
+        // 用户暂停的槽位在暂停时已 drain，此处 resume 会照常受容量门控。
         // SAFETY (current_thread): `remove` + `drain_queue` have no `.await` between
         // them at this point, so no other task can observe the partially-updated state.
         // If this code is ever ported to a multi-threaded runtime, a lock around
         // `active_tokens` modifications would be required.
-        self.drain_queue().await;
         if resume_after_pause {
             self.resume_task_inner(task_id).await;
         }
+        self.drain_queue().await;
 
         // ----- Auto-retry for retriable network errors ----------------------
         // 大文件下载因网络 stall、连接重置等瞬时错误失败后，自动延迟恢复，
@@ -6001,15 +6013,23 @@ impl DownloadManager {
     /// 必须走 [`Self::pause_task_silent`]——设计明确要求全局暂停不触发通知，
     /// 否则千级批量任务会给用户连发一屏推送。
     pub async fn pause_task(&mut self, task_id: &str) {
-        self.pause_task_inner(task_id, true).await;
+        self.pause_task_inner(task_id, true, true).await;
     }
 
     /// 内部/批量暂停：行为与 [`Self::pause_task`] 完全一致，只是不发 webhook。
     async fn pause_task_silent(&mut self, task_id: &str) {
-        self.pause_task_inner(task_id, false).await;
+        self.pause_task_inner(task_id, false, true).await;
     }
 
-    async fn pause_task_inner(&mut self, task_id: &str, notify: bool) {
+    /// 「暂停后立刻恢复」的内部流程（改分段数 / 重新下载）专用：静默暂停，
+    /// 但**不**把让出的槽位 drain 给排队头部，否则随后的 resume 只能挂起
+    /// `resume_requested`，待旧 spawn 收尾时已无容量而被挂到队尾。
+    /// 调用方必须随后调用 resume（其自身会 drain），或在放弃恢复时自行 drain。
+    async fn pause_task_keep_slot(&mut self, task_id: &str) {
+        self.pause_task_inner(task_id, false, false).await;
+    }
+
+    async fn pause_task_inner(&mut self, task_id: &str, notify: bool, drain_freed_slot: bool) {
         self.clear_pending_resolve(task_id);
         self.retry_scheduled.remove(task_id);
         // A repeated pause while the previous generation is still flushing is
@@ -6074,8 +6094,11 @@ impl DownloadManager {
                 }
             }
 
-            // A slot freed up — try to start queued tasks.
-            self.drain_queue().await;
+            // A slot freed up — try to start queued tasks (skipped when the caller
+            // is about to resume this very task and wants to keep the slot).
+            if drain_freed_slot {
+                self.drain_queue().await;
+            }
 
             // Boost 守卫：若用户手动暂停了当前优先任务，取消 Boost 并恢复其他任务
             if self.priority_task_id.as_deref() == Some(task_id) {
@@ -6220,7 +6243,7 @@ impl DownloadManager {
                 "[manager] restart_task {}: cancelling in-flight spawn first",
                 task_id
             );
-            self.pause_task_silent(task_id).await;
+            self.pause_task_keep_slot(task_id).await;
         }
 
         // 2. 磁盘清理（best-effort，NotFound 静默）。暂停之后重新读库，拿到
@@ -7533,7 +7556,7 @@ impl DownloadManager {
         // Bug 4 修复：被删除的任务从 auto_paused_ids 中移除，
         // 避免 clear_priority 之后徒劳地对已删除任务调用 resume_task，
         // 产生无意义的 DB 查询或错误日志。
-        self.auto_paused_ids.remove(task_id);
+        self.auto_paused_ids.retain(|id| id != task_id);
 
         // Boost 守卫：若优先任务被删除，取消 Boost 并恢复其他任务
         if self.priority_task_id.as_deref() == Some(task_id) {
@@ -7909,7 +7932,7 @@ impl DownloadManager {
         }
         // 7. Cleanup boost state.
         for tid in task_ids {
-            self.auto_paused_ids.remove(tid.as_str());
+            self.auto_paused_ids.retain(|id| id != tid.as_str());
             self.retry_scheduled.remove(tid.as_str());
             if self.priority_task_id.as_deref() == Some(tid.as_str()) {
                 self.clear_priority().await;
@@ -8569,6 +8592,8 @@ impl DownloadManager {
         }
         log_info!("[manager] updated queue: {}", queue_id);
         self.send_all_queues().await;
+        // 并发上限可能被调大：让被旧上限卡住的排队任务立即起跑。
+        self.drain_queue().await;
     }
 
     /// Delete a named queue (tasks move to the builtin main queue) and
@@ -8610,7 +8635,8 @@ impl DownloadManager {
         }
         // 位置事件更新待排任务的 queuePosition；全量任务快照是 queue_order
         // 已归零的权威来源，TaskQueueChanged 本身只包含归属 ID。
-        self.broadcast_queue_positions();
+        // 待排任务已迁回主队列，立即按主队列容量重新调度（drain 自带位置广播）。
+        self.drain_queue().await;
         self.send_tasks_snapshot().await;
         log_info!("[manager] deleted queue: {}", queue_id);
         self.send_all_queues().await;
@@ -9001,6 +9027,8 @@ impl DownloadManager {
         self.sink
             .emit(EngineEvent::TaskQueueChanged { task_id, queue_id });
         self.send_all_queues().await;
+        // 目标队列若有空位，排队中的任务（含刚移入的）应立即起跑。
+        self.drain_queue().await;
     }
 
     /// 启动队列：置运行态并按队列内顺序（`queue_order` → `created_at`）
@@ -9433,7 +9461,7 @@ impl DownloadManager {
         // 切换 boost 目标时，保留上一轮 boost 自动暂停的任务 ID，
         // 使它们在新 boost 结束时也能一并被恢复，避免永久卡在暂停状态。
         // 将新目标从集合中移除（它将被启动，不需要在结束时当作"恢复对象"）。
-        self.auto_paused_ids.remove(&task_id);
+        self.auto_paused_ids.retain(|id| id != &task_id);
         self.priority_task_id = None;
 
         // Step 1: If the target task is currently waiting in pending_queue, extract it
@@ -9443,15 +9471,11 @@ impl DownloadManager {
         //   b) drain_queue() called inside each pause_task() call below could promote
         //      a different queued task to active, causing it to immediately get paused again.
         // By removing the target first we guarantee it won't be touched by drain_queue.
-        let target_was_queued = self
+        let target_queued: Option<QueuedTask> = self
             .pending_queue
             .iter()
             .position(|q| q.task_id == task_id)
-            .map(|pos| {
-                self.pending_queue.remove(pos);
-                true
-            })
-            .unwrap_or(false);
+            .and_then(|pos| self.pending_queue.remove(pos));
 
         // Step 2: Auto-pause all currently active tasks (except the target itself,
         // which may already be downloading).
@@ -9463,8 +9487,18 @@ impl DownloadManager {
             .filter(|id| id.as_str() != task_id.as_str())
             .cloned()
             .collect();
+        // 先按恢复优先级登记暂停顺序：先前活跃的任务在前，排队任务按原 FIFO 在后。
+        // （暂停活跃任务时 drain_queue 会提拔排队头部，必须在此之前固定顺序。）
+        let queued_before: Vec<String> = self
+            .pending_queue
+            .iter()
+            .filter(|t| t.task_id != task_id.as_str())
+            .map(|t| t.task_id.clone())
+            .collect();
+        for id in active_ids.iter().chain(queued_before.iter()) {
+            self.record_auto_paused(id);
+        }
         for id in active_ids {
-            self.auto_paused_ids.insert(id.clone());
             self.pause_task_silent(&id).await;
         }
 
@@ -9476,7 +9510,7 @@ impl DownloadManager {
             .map(|t| t.task_id.clone())
             .collect();
         for id in queued_ids {
-            self.auto_paused_ids.insert(id.clone());
+            self.record_auto_paused(&id);
             self.pause_task_silent(&id).await;
         }
 
@@ -9485,11 +9519,11 @@ impl DownloadManager {
         let stray_active: Vec<String> = self
             .active_tasks
             .keys()
-            .filter(|id| id.as_str() != task_id.as_str() && !self.auto_paused_ids.contains(*id))
+            .filter(|id| id.as_str() != task_id.as_str())
             .cloned()
             .collect();
         for id in stray_active {
-            self.auto_paused_ids.insert(id.clone());
+            self.record_auto_paused(&id);
             self.pause_task_silent(&id).await;
         }
 
@@ -9502,12 +9536,16 @@ impl DownloadManager {
         if !self.active_tasks.contains_key(&task_id) {
             // Remove from auto_paused_ids so clear_priority won't try to resume
             // the task that's already running as priority.
-            self.auto_paused_ids.remove(&task_id);
-            if target_was_queued {
+            self.auto_paused_ids.retain(|id| id != &task_id);
+            if let Some(queued) = target_queued {
                 // Task was queued but never actually started (pending_queue slot) —
-                // call do_resume_task directly since we already verified capacity
-                // by pausing all other tasks above.
-                self.do_resume_task(&task_id).await;
+                // start it with its original request (method/body, webhook, plugin
+                // hooks) since all other tasks were paused above.
+                if queued.is_resume {
+                    self.do_resume_task(&task_id).await;
+                } else {
+                    self.do_start_task(queued).await;
+                }
             } else {
                 // Task was paused/error — use the full resume path.
                 self.resume_task(&task_id).await;
@@ -9539,10 +9577,18 @@ impl DownloadManager {
         });
     }
 
+    /// 登记一个被 Boost 自动暂停的任务；已登记的保持原有顺序（去重）。
+    fn record_auto_paused(&mut self, task_id: &str) {
+        if !self.auto_paused_ids.iter().any(|id| id == task_id) {
+            self.auto_paused_ids.push(task_id.to_owned());
+        }
+    }
+
     /// Cancel boost mode and resume all auto-paused tasks.
     async fn clear_priority(&mut self) {
         self.priority_task_id = None;
-        let to_resume: Vec<String> = self.auto_paused_ids.drain().collect();
+        // 按暂停顺序恢复：先前活跃的任务优先拿回槽位，其后是原 FIFO 顺序的排队任务。
+        let to_resume: Vec<String> = std::mem::take(&mut self.auto_paused_ids);
         log_info!(
             "[manager] boost cancelled, resuming {} tasks",
             to_resume.len()
@@ -11079,6 +11125,294 @@ mod tests {
             )),
             "newer running generation must stay visible"
         );
+    }
+
+    /// 调度测试用管理器：全局并发 `max_concurrent`，其余默认。
+    fn sched_manager(db: &Db, max_concurrent: usize) -> DownloadManager {
+        DownloadManager::new(
+            db.clone(),
+            DownloadManagerConfig {
+                max_concurrent,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: "/tmp".to_string(),
+                app_data_dir: String::new(),
+                data_dir: std::env::temp_dir(),
+                bt_config: BtConfig::default(),
+                proxy_config: ProxyConfig::default(),
+                user_agent: String::new(),
+            },
+            Arc::new(RecordingSink::new()),
+            Arc::new(crate::NoopSelection),
+        )
+        .expect("construct manager")
+    }
+
+    /// 在 `queue_id` 队列里插入一个 paused 任务（指向必然拒绝连接的本地端口）。
+    async fn insert_paused_task_in_queue(db: &Db, id: &str, queue_id: &str) {
+        db.insert_task(
+            id,
+            "http://127.0.0.1:1/file.bin",
+            "file.bin",
+            "/tmp",
+            1,
+            0,
+            "",
+            queue_id,
+            "",
+            0,
+        )
+        .await
+        .expect("insert task");
+        db.update_task_status(id, 2, "").await.expect("pause task");
+    }
+
+    /// 占一个并发槽的假活跃条目（带一个等待取消的 handle，模拟真实 spawn）。
+    fn occupy_slot(
+        mgr: &mut DownloadManager,
+        id: &str,
+        generation: u64,
+        queue_id: &str,
+        is_bt: bool,
+    ) {
+        let token = CancellationToken::new();
+        let waiter = token.clone();
+        let handle = tokio::spawn(async move {
+            waiter.cancelled().await;
+        });
+        mgr.active_tasks.insert(
+            id.to_string(),
+            ActiveTaskEntry {
+                token,
+                generation,
+                handle: Some(handle),
+                is_bt,
+                queue_id: queue_id.to_string(),
+            },
+        );
+    }
+
+    fn cancel_all_active(mgr: &DownloadManager) {
+        for entry in mgr.active_tasks.values() {
+            entry.token.cancel();
+        }
+    }
+
+    /// 调大队列并发上限必须立即放行被旧上限卡住的排队任务，
+    /// 而不是等到别的任务结束。
+    #[tokio::test]
+    async fn raising_queue_limit_starts_blocked_pending_task() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        db.insert_queue("work", "Work", 0, 0, 1, "", 2, 0, "")
+            .await
+            .expect("insert queue");
+        insert_paused_task_in_queue(&db, "p1", "work").await;
+        let mut mgr = sched_manager(&db, 8);
+        mgr.load_queues().await;
+        occupy_slot(&mut mgr, "occupier", 1, "work", false);
+
+        mgr.resume_task("p1").await;
+        assert_eq!(mgr.pending_queue.len(), 1, "队列已满，任务必须排队");
+
+        mgr.update_queue(
+            "work".into(),
+            "Work".into(),
+            0,
+            0,
+            2,
+            String::new(),
+            0,
+            String::new(),
+        )
+        .await;
+        assert!(mgr.pending_queue.is_empty(), "上限调大后应立即出队");
+        assert!(mgr.active_tasks.contains_key("p1"));
+        cancel_all_active(&mgr);
+    }
+
+    /// 把排队任务移入有空位的队列必须立即起跑。
+    #[tokio::test]
+    async fn moving_pending_task_into_free_queue_starts_it() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        for id in ["full", "free"] {
+            db.insert_queue(id, id, 0, 0, 1, "", 2, 0, "")
+                .await
+                .expect("insert queue");
+        }
+        insert_paused_task_in_queue(&db, "p1", "full").await;
+        let mut mgr = sched_manager(&db, 8);
+        mgr.load_queues().await;
+        occupy_slot(&mut mgr, "occupier", 1, "full", false);
+        mgr.resume_task("p1").await;
+        assert_eq!(mgr.pending_queue.len(), 1);
+
+        mgr.move_task_to_queue("p1".into(), "free".into()).await;
+        assert!(mgr.pending_queue.is_empty());
+        assert!(mgr.active_tasks.contains_key("p1"));
+        cancel_all_active(&mgr);
+    }
+
+    /// 删除队列后，迁回主队列的排队任务按主队列容量立即重新调度。
+    #[tokio::test]
+    async fn deleting_queue_reschedules_migrated_pending_task() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        db.insert_queue("work", "Work", 0, 0, 1, "", 2, 0, "")
+            .await
+            .expect("insert queue");
+        insert_paused_task_in_queue(&db, "p1", "work").await;
+        let mut mgr = sched_manager(&db, 8);
+        mgr.load_queues().await;
+        occupy_slot(&mut mgr, "occupier", 1, "work", false);
+        mgr.resume_task("p1").await;
+        assert_eq!(mgr.pending_queue.len(), 1);
+
+        mgr.delete_queue("work".into()).await;
+        assert!(
+            mgr.pending_queue.is_empty(),
+            "迁回无限制的主队列后应立即起跑"
+        );
+        assert!(mgr.active_tasks.contains_key("p1"));
+        cancel_all_active(&mgr);
+    }
+
+    /// `max_concurrent <= 0` 一律视为不限；BT 既不占用也不受队列槽位约束。
+    #[tokio::test]
+    async fn queue_capacity_ignores_bt_and_treats_non_positive_as_unlimited() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        db.insert_queue("neg", "neg", 0, 0, -1, "", 2, 0, "")
+            .await
+            .expect("insert queue");
+        db.insert_queue("one", "one", 0, 0, 1, "", 3, 0, "")
+            .await
+            .expect("insert queue");
+        let mut mgr = sched_manager(&db, 8);
+        mgr.load_queues().await;
+
+        occupy_slot(&mut mgr, "a", 1, "neg", false);
+        occupy_slot(&mut mgr, "b", 1, "neg", false);
+        assert!(mgr.has_queue_capacity("neg"), "负数上限 = 不限");
+
+        occupy_slot(&mut mgr, "bt", 1, "one", true);
+        assert!(mgr.has_queue_capacity("one"), "BT 不占用队列槽位");
+        occupy_slot(&mut mgr, "http", 1, "one", false);
+        assert!(!mgr.has_queue_capacity("one"), "HTTP 任务仍占用队列槽位");
+        cancel_all_active(&mgr);
+    }
+
+    /// 内部「暂停 + 立即恢复」（改分段数）必须保住槽位：旧下载器收尾时，
+    /// 任务自己恢复，而不是槽位被排队头部抢走、自己被挂到队尾。
+    #[tokio::test]
+    async fn changing_segments_keeps_slot_against_pending_head() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        insert_paused_task_in_queue(&db, "a", "").await;
+        db.update_task_status("a", 1, "").await.expect("active");
+        insert_paused_task_in_queue(&db, "b", "").await;
+        let mut mgr = sched_manager(&db, 1);
+        let _progress_rx = mgr.take_progress_rx().expect("progress receiver");
+        occupy_slot(&mut mgr, "a", 7, "", false);
+        mgr.resume_task("b").await;
+        assert_eq!(mgr.pending_queue.len(), 1, "b 在队列里等待唯一槽位");
+
+        let updated = mgr.set_task_segments("a", 4).await.expect("set segments");
+        assert!(updated);
+        assert_eq!(
+            mgr.pending_queue
+                .iter()
+                .map(|q| q.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"],
+            "暂停-恢复期间槽位不得被排队头部提前拿走"
+        );
+
+        mgr.on_task_done(&TaskDone {
+            task_id: "a".to_string(),
+            generation: 7,
+            reserved_temp_path: None,
+        })
+        .await;
+        assert!(
+            mgr.active_tasks.contains_key("a"),
+            "旧下载器退出后 a 必须自己恢复"
+        );
+        assert_eq!(
+            mgr.pending_queue
+                .iter()
+                .map(|q| q.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        cancel_all_active(&mgr);
+    }
+
+    /// 用户暂停仍然立即把槽位让给排队头部。
+    #[tokio::test]
+    async fn user_pause_still_frees_slot_immediately() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        insert_paused_task_in_queue(&db, "a", "").await;
+        db.update_task_status("a", 1, "").await.expect("active");
+        insert_paused_task_in_queue(&db, "b", "").await;
+        let mut mgr = sched_manager(&db, 1);
+        occupy_slot(&mut mgr, "a", 7, "", false);
+        mgr.resume_task("b").await;
+        assert_eq!(mgr.pending_queue.len(), 1);
+
+        mgr.pause_task("a").await;
+        assert!(mgr.pending_queue.is_empty());
+        assert!(mgr.active_tasks.contains_key("b"));
+        cancel_all_active(&mgr);
+    }
+
+    /// 取消 Boost 必须按暂停顺序恢复：先前活跃的先拿回槽位，
+    /// 其余按原顺序排队，而不是 HashSet 的随机顺序。
+    #[tokio::test]
+    async fn clear_priority_resumes_in_pause_order() {
+        let db = Db::connect("sqlite::memory:")
+            .await
+            .expect("connect mem db");
+        db.seed_builtin_queues().await.expect("seed");
+        let ids = ["t0", "t1", "t2", "t3", "t4", "t5"];
+        for id in ids {
+            insert_paused_task_in_queue(&db, id, "").await;
+        }
+        let mut mgr = sched_manager(&db, 1);
+        mgr.priority_task_id = Some("boosted".into());
+        for id in ids {
+            mgr.record_auto_paused(id);
+        }
+        mgr.record_auto_paused("t3"); // 重复登记不改变顺序、不重复
+
+        mgr.clear_priority().await;
+        assert!(
+            mgr.active_tasks.contains_key("t0"),
+            "最先暂停的任务先拿回槽位"
+        );
+        assert_eq!(
+            mgr.pending_queue
+                .iter()
+                .map(|q| q.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["t1", "t2", "t3", "t4", "t5"]
+        );
+        assert!(mgr.auto_paused_ids.is_empty());
+        cancel_all_active(&mgr);
     }
 
     /// 批量事件契约：批量恢复/暂停 N 个排队任务 = 常数条事件
