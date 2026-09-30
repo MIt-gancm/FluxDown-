@@ -51,6 +51,7 @@ use crate::downloader::{
 };
 use crate::events::{EngineEvent, EventSink};
 use crate::logger::{log_info, log_warn};
+use crate::model::SourceBytes;
 use crate::output;
 use crate::speed_limiter::SpeedLimiter;
 use crate::transfer_activity::{TaskRuntime, TaskSegment, TransferGuard, TransferTracker};
@@ -1241,8 +1242,54 @@ fn sampled_http_runtime(
                 active: s.active,
             })
             .collect(),
+        // 来源累计由持有节点池的调用方按需回填；这里不做归因。
+        source_bytes: None,
     };
     (snapshot, runtime)
+}
+
+/// 多路径池下本次运行的加速来源累计 + 已落库基数（供 `TaskRuntime.source_bytes`）。
+///
+/// 非多节点池（单直连）返回 `None`：该路径不做来源归因。`peak` 保持本次运行
+/// 累计单调不减——在途租约进度可能因段拆分 / 租约归还的瞬间口径差短暂回落，
+/// 单调化后 UI 与落库增量都不会抖动或重复计数。整池一次加锁，仅随既有周期 tick
+/// 调用，不进入逐块热路径。
+fn sample_run_source_bytes(
+    nodes: &NodePool,
+    segments: &mut BTreeMap<i32, LiveSegment>,
+    seg_states: &Arc<StdMutex<Vec<SegmentProgressInfo>>>,
+    base: SourceBytes,
+    peak: &mut SourceBytes,
+) -> Option<SourceBytes> {
+    if !nodes.is_multi() {
+        return None;
+    }
+    sync_downloaded_from_shared(segments, seg_states);
+    let run = nodes.source_bytes(&multipath::in_flight(nodes, segments));
+    *peak = peak.max(run);
+    Some(base.saturating_add(*peak))
+}
+
+/// 把本次运行新增的加速来源字节落库（`run` 为单调累计，`flushed` 为已落库部分）。
+/// 仅成功后推进 `flushed`，失败下一 tick 重试同一增量，绝不重复计数。
+async fn flush_source_bytes(
+    db: &Db,
+    task_id: &str,
+    spawn_gen: i64,
+    run: SourceBytes,
+    flushed: &mut SourceBytes,
+) {
+    let delta = run.saturating_sub(*flushed);
+    if delta.is_zero() {
+        return;
+    }
+    match db.add_task_source_bytes(task_id, spawn_gen, delta).await {
+        Ok(()) => *flushed = flushed.max(run),
+        Err(e) => log_info!(
+            "[coordinator] task {} source bytes flush failed (non-fatal): {e:#}",
+            task_id
+        ),
+    }
 }
 
 /// 本次 coordinator generation 中仍在读取 body 的已验证响应数。
@@ -1683,6 +1730,21 @@ pub async fn run_coordinated_download(
         }
     }
 
+    // 加速来源累计基数：必须在上面的进度复位之后读取（复位同时清零计数）。
+    // `source_flushed` 是本次运行已落库的部分，`source_peak` 是本次运行的单调累计。
+    let source_base = match db.load_task_source_bytes(task_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            log_info!(
+                "[coordinator] task {} load source bytes failed (counters restart from 0): {e:#}",
+                task_id
+            );
+            SourceBytes::default()
+        }
+    };
+    let mut source_peak = SourceBytes::default();
+    let mut source_flushed = SourceBytes::default();
+
     // ----- 2. Pre-allocate file to full size --------------------------------
     // 平台策略（fallocate / SetFileInformationByHandle / set_len 回退）见
     // preallocate_file_len——就地扩容（TrueSizeLarger）复用同一助手延长文件。
@@ -1917,7 +1979,7 @@ pub async fn run_coordinated_download(
                 let _ = h.await;
             }
         }
-        let (_, runtime) = sampled_http_runtime(
+        let (_, mut runtime) = sampled_http_runtime(
             task_id,
             if scope.total_override > 0 {
                 scope.total_override
@@ -1928,6 +1990,13 @@ pub async fn run_coordinated_download(
             &seg_states,
             scope,
             &generation_evidence.tracker,
+        );
+        runtime.source_bytes = sample_run_source_bytes(
+            &nodes,
+            &mut segments,
+            &seg_states,
+            source_base,
+            &mut source_peak,
         );
         sink.emit(EngineEvent::TaskRuntimeChanged(runtime));
         return Ok(effective_total_bytes);
@@ -3276,9 +3345,12 @@ pub async fn run_coordinated_download(
                 } else {
                     planned_total.load(Ordering::Relaxed)
                 };
-                let (snapshot, runtime) = sampled_http_runtime(
+                let (snapshot, mut runtime) = sampled_http_runtime(
                     task_id, report_total, worker_cap as u32, &seg_states, scope,
                     &generation_evidence.tracker,
+                );
+                runtime.source_bytes = sample_run_source_bytes(
+                    &nodes, &mut segments, &seg_states, source_base, &mut source_peak,
                 );
                 let _ = progress_tx
                     .send(ProgressUpdate {
@@ -3299,6 +3371,14 @@ pub async fn run_coordinated_download(
             // 抽干 worker 侧 durable 水位，过滤 Completed/未知段后一次事务批量写。
             // 完成写仍由 worker 覆盖 fsync 后立即落库，不经本通道。
             _ = db_flush_interval.tick() => {
+                if sample_run_source_bytes(
+                    &nodes, &mut segments, &seg_states, source_base, &mut source_peak,
+                )
+                .is_some()
+                {
+                    flush_source_bytes(db, task_id, spawn_gen, source_peak, &mut source_flushed)
+                        .await;
+                }
                 let rows = take_durable_progress_rows(&durable_progress, &segments);
                 if !rows.is_empty()
                     && let Err(e) = db
@@ -3323,7 +3403,7 @@ pub async fn run_coordinated_download(
         }
     }
     // Preserve range geometry after the last body reader leaves.
-    let (_, runtime) = sampled_http_runtime(
+    let (_, mut runtime) = sampled_http_runtime(
         task_id,
         if scope.total_override > 0 {
             scope.total_override
@@ -3334,6 +3414,13 @@ pub async fn run_coordinated_download(
         &seg_states,
         scope,
         &generation_evidence.tracker,
+    );
+    runtime.source_bytes = sample_run_source_bytes(
+        &nodes,
+        &mut segments,
+        &seg_states,
+        source_base,
+        &mut source_peak,
     );
     sink.emit(EngineEvent::TaskRuntimeChanged(runtime));
 
@@ -3360,6 +3447,9 @@ pub async fn run_coordinated_download(
             );
         }
     }
+
+    // 加速来源累计的最终增量（worker 已全部退出，在途租约已并入槽位回报）。
+    flush_source_bytes(db, task_id, spawn_gen, source_peak, &mut source_flushed).await;
 
     if let Some(err) = final_error {
         return Err(err);
@@ -3407,13 +3497,20 @@ pub async fn run_coordinated_download(
     } else {
         planned_total.load(Ordering::Relaxed)
     };
-    let (snapshot, runtime) = sampled_http_runtime(
+    let (snapshot, mut runtime) = sampled_http_runtime(
         task_id,
         report_total,
         worker_cap as u32,
         &seg_states,
         scope,
         &generation_evidence.tracker,
+    );
+    runtime.source_bytes = sample_run_source_bytes(
+        &nodes,
+        &mut segments,
+        &seg_states,
+        source_base,
+        &mut source_peak,
     );
     let _ = progress_tx
         .send(ProgressUpdate {
@@ -6770,6 +6867,134 @@ mod tests {
             count_domain_conn_policies(&format!("v1\nfresh.example\t1\t{now}")),
             0
         );
+    }
+
+    /// 来源累计的采样 / 落库：单直连池不归因；多路径池按在途 + 已回报累计，
+    /// 峰值单调（在途瞬时回落不抖动）；落库只写增量，重复 flush 不重复计数，
+    /// 被夺权的旧 spawn 写不进去。
+    #[tokio::test]
+    async fn source_bytes_sampling_is_monotonic_and_flushes_only_increments() {
+        use super::{flush_source_bytes, sample_run_source_bytes};
+        use crate::auto_proxy::{CandidateSource, RoutePath};
+        use crate::cdn::NodePool;
+        use crate::cdn::node_pool::LeaseRequest;
+        use crate::model::SourceBytes;
+        use tokio_util::sync::CancellationToken;
+
+        let dir = std::env::temp_dir().join(format!("fluxdown_srcb_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let db = crate::db::Db::open(&dir).await.expect("open db");
+        db.insert_task(
+            "t",
+            "http://example.com/f",
+            "f",
+            "/tmp",
+            1,
+            0,
+            "",
+            "",
+            "",
+            0,
+        )
+        .await
+        .expect("insert task");
+        db.set_segments_epoch("t", 7).await.expect("set epoch");
+
+        let mut segments = BTreeMap::new();
+        segments.insert(0, make_seg(0, 0, 9_999, 0, SegState::Active));
+        let seg_states = Arc::new(StdMutex::new(build_seg_state_vec(&segments)));
+        let set_progress = |bytes: i64| {
+            seg_states.lock().unwrap()[0].downloaded_bytes = bytes;
+        };
+        let base = SourceBytes {
+            cdn: 1,
+            proxy: 10,
+            nic: 100,
+        };
+        let mut peak = SourceBytes::default();
+
+        // 单直连池：该路径不做来源归因。
+        let single = NodePool::single(reqwest::Client::new());
+        assert_eq!(
+            sample_run_source_bytes(&single, &mut segments, &seg_states, base, &mut peak),
+            None
+        );
+
+        // 多路径池：槽位 1 = 已有先验的代理路径，实测更快 → 租约落在代理上。
+        let manual = RoutePath::Proxy(CandidateSource::ManualFields);
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(manual, reqwest::Client::new(), Some(1e6))],
+        );
+        pool.observe_window(&[(0, 1e3), (1, 1e6)]);
+        let lease = pool.lease_for(LeaseRequest {
+            seg_index: 0,
+            start_downloaded: 0,
+            bytes: i64::MAX,
+            allow_alternates: true,
+            cancel: CancellationToken::new(),
+        });
+        assert_eq!(lease.route(), manual);
+
+        // 在途 800 B 全部走代理；返回值 = 基数 + 本次运行累计。
+        set_progress(800);
+        let live = sample_run_source_bytes(&pool, &mut segments, &seg_states, base, &mut peak);
+        assert_eq!(
+            live,
+            Some(SourceBytes {
+                cdn: 1,
+                proxy: 810,
+                nic: 100
+            })
+        );
+        let mut flushed = SourceBytes::default();
+        flush_source_bytes(&db, "t", 7, peak, &mut flushed).await;
+        assert_eq!(flushed.proxy, 800);
+        assert_eq!(
+            db.load_task_source_bytes("t").await.expect("load").proxy,
+            800
+        );
+
+        // 在途口径瞬时回落：峰值不回退，落库无新增。
+        set_progress(300);
+        sample_run_source_bytes(&pool, &mut segments, &seg_states, base, &mut peak);
+        assert_eq!(peak.proxy, 800);
+        flush_source_bytes(&db, "t", 7, peak, &mut flushed).await;
+        assert_eq!(
+            db.load_task_source_bytes("t").await.expect("load").proxy,
+            800
+        );
+
+        // 租约结束回报 1200 B、在途清零后继续增长：只追加 400 B 增量。
+        pool.record_transfer(&lease, 1_200);
+        drop(lease);
+        sample_run_source_bytes(&pool, &mut segments, &seg_states, base, &mut peak);
+        assert_eq!(peak.proxy, 1_200);
+        flush_source_bytes(&db, "t", 7, peak, &mut flushed).await;
+        flush_source_bytes(&db, "t", 7, peak, &mut flushed).await;
+        assert_eq!(
+            db.load_task_source_bytes("t").await.expect("load"),
+            SourceBytes {
+                cdn: 0,
+                proxy: 1_200,
+                nic: 0
+            },
+            "repeated flush of the same cumulative value must not double count"
+        );
+
+        // 被新 spawn 夺权：旧 coordinator 的落库不生效。
+        db.set_segments_epoch("t", 8).await.expect("set epoch");
+        let mut stale_flushed = SourceBytes::default();
+        flush_source_bytes(&db, "t", 7, peak, &mut stale_flushed).await;
+        assert_eq!(
+            db.load_task_source_bytes("t").await.expect("load").proxy,
+            1_200
+        );
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

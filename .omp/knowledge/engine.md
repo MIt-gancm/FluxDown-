@@ -18,6 +18,7 @@
 
 **当前表（列以 db.rs 为准，此处仅索引）**：
 - `tasks`(id PK, url, file_name, save_dir, status, total/downloaded_bytes, segments, created_at, error_message, proxy_url, queue_id, checksum, ignore_tls_errors, bt_selected_files, bt_custom_name, orig_etag, orig_last_modified, audio_url, file_missing, `range_verified`（配额端点续传验证）, queue_order；迁移列：cookies, referrer, extra_headers, resolver_plugin_id, segments_epoch, completed_at, group_id, resolver_item, rss_source_id（RSS 溯源，空=非 RSS 来源）, `origin_url`（展示用真实来源；`.torrent` 任务的 `url` 是 `torrent-file://local` 哨兵，「复制链接」类 UI **一律**读它并空则回退 `url`——Dart `DownloadTask.shareUrl` / web `taskShareUrl()`）, `auto_route`（`ProxyMode::Auto` 的任务级最终链路，wire 标签见 `auto_proxy::route`；空=非 Auto）, `unattended`（无人值守创建标记，`NewTaskSpec::unattended_selection` 置位：RSS / 外部接管命中「免打扰跳过二次选择」config `silent_skip_selection`；start/resume 读它让 HLS/DASH 画质与插件变体静默取默认；BT 不读此列——建任务时已按「全选」写 bt_selected_files））
+  - 来源归因迁移列 `src_cdn_bytes` / `src_proxy_bytes` / `src_nic_bytes`（BIGINT）：coordinator 在既有 DB flush 节拍按 `NodePool::source_bytes` 把「多 CDN 钉定节点 / Auto 代理路径 / 多网卡链路」的增量以 `segments_epoch` 守卫累加；源站 = `downloaded_bytes` − 三者之和，P2P 协议由客户端整体归 P2P。任何把 `downloaded_bytes` 复位为 0 的写入同语句清零三列。实时值走 `TaskRuntimeDto.sourceBytes`（含在途），持久值走 `TaskDto.sourceBytes`；客户端详情常规页「来源构成」区块的切片算法 GPUI / Web 逐条镜像（见 AGENTS.md §5）。
 - `task_segments`(复合 PK task_id+segment_index；旧库遗留 id AUTOINCREMENT 不再读)
 - `task_groups`(id PK, name, source_url, save_dir, created_at)
 - `config`(key PK, value)——**所有设置键**都存这里

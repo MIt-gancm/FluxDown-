@@ -10,7 +10,7 @@ use sqlx::pool::PoolConnection;
 use sqlx::{AssertSqlSafe, Row};
 use thiserror::Error;
 
-use crate::model::{GroupInfo, MAIN_QUEUE_ID, QueueInfo, TaskInfo};
+use crate::model::{GroupInfo, MAIN_QUEUE_ID, QueueInfo, SourceBytes, TaskInfo};
 use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
 
 #[derive(Error, Debug)]
@@ -572,10 +572,15 @@ fn task_from_row(row: &AnyRow) -> Result<TaskInfo, sqlx::Error> {
         rss_source_id: row.try_get("rss_source_id").unwrap_or_default(),
         origin_url: row.try_get("origin_url").unwrap_or_default(),
         auto_route: row.try_get("auto_route").unwrap_or_default(),
+        source_bytes: SourceBytes {
+            cdn: row.try_get("src_cdn_bytes").unwrap_or_default(),
+            proxy: row.try_get("src_proxy_bytes").unwrap_or_default(),
+            nic: row.try_get("src_nic_bytes").unwrap_or_default(),
+        },
     })
 }
 
-const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, referrer, group_id, rss_source_id, origin_url, auto_route";
+const TASK_COLUMNS: &str = "id, url, file_name, save_dir, status, downloaded_bytes, total_bytes, error_message, created_at, proxy_url, queue_id, checksum, ignore_tls_errors, file_missing, completed_at, segments, queue_order, uploaded_bytes, uploaded_at_completion, seeding_status, seeding_message, seeding_time_secs, seed_ratio_limit_milli, seed_post_ratio_limit_milli, seed_time_limit_minutes, seed_inactive_time_limit_minutes, seed_upload_limit_bps, referrer, group_id, rss_source_id, origin_url, auto_route, src_cdn_bytes, src_proxy_bytes, src_nic_bytes";
 
 /// 文件跟踪扫描的最小任务投影（[`Db::load_file_tracking_rows`]）。扫描只需
 /// 要判定「目标路径是否被活跃任务占用」和「已完成任务的产物是否还在盘上」，
@@ -1042,6 +1047,15 @@ impl Db {
         // 覆盖一起折算成 librqbit 上传上限，见 download_manager。
         self.add_column_if_missing("queues", "upload_limit_kbps", "BIGINT NOT NULL DEFAULT 0")
             .await?;
+        // 加速来源累计字节（多 CDN / 智能代理 / 多网卡；源站 = 已下载 − 三者之和）。
+        // 与 `downloaded_bytes` 同步复位：见 `update_task_progress(_, 0)` /
+        // `delete_segments` / `reset_segments_progress`。
+        self.add_column_if_missing("tasks", "src_cdn_bytes", "BIGINT NOT NULL DEFAULT 0")
+            .await?;
+        self.add_column_if_missing("tasks", "src_proxy_bytes", "BIGINT NOT NULL DEFAULT 0")
+            .await?;
+        self.add_column_if_missing("tasks", "src_nic_bytes", "BIGINT NOT NULL DEFAULT 0")
+            .await?;
         Ok(())
     }
 
@@ -1194,16 +1208,66 @@ impl Db {
         }))
     }
 
+    /// 直接覆盖任务进度。`downloaded_bytes == 0` 表示进度复位（重下 / 清盘 /
+    /// 多段转单流），同一条语句内把加速来源累计一并清零。
     pub async fn update_task_progress(
         &self,
         id: &str,
         downloaded_bytes: i64,
     ) -> Result<(), DbError> {
-        sqlx::query("UPDATE tasks SET downloaded_bytes = $1 WHERE id = $2")
-            .bind(downloaded_bytes)
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE tasks SET downloaded_bytes = $1,
+                 src_cdn_bytes = CASE WHEN $2 = 0 THEN 0 ELSE src_cdn_bytes END,
+                 src_proxy_bytes = CASE WHEN $3 = 0 THEN 0 ELSE src_proxy_bytes END,
+                 src_nic_bytes = CASE WHEN $4 = 0 THEN 0 ELSE src_nic_bytes END
+             WHERE id = $5",
+        )
+        .bind(downloaded_bytes)
+        .bind(downloaded_bytes)
+        .bind(downloaded_bytes)
+        .bind(downloaded_bytes)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 读取任务持久化的加速来源累计字节；任务不存在按全 0 处理。
+    pub async fn load_task_source_bytes(&self, task_id: &str) -> Result<SourceBytes, DbError> {
+        let row = sqlx::query(
+            "SELECT src_cdn_bytes, src_proxy_bytes, src_nic_bytes FROM tasks WHERE id = $1",
+        )
+        .bind(task_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map_or_else(SourceBytes::default, |r| SourceBytes {
+            cdn: r.try_get("src_cdn_bytes").unwrap_or_default(),
+            proxy: r.try_get("src_proxy_bytes").unwrap_or_default(),
+            nic: r.try_get("src_nic_bytes").unwrap_or_default(),
+        }))
+    }
+
+    /// 累加本次运行新增的加速来源字节。用 `segments_epoch` 守卫：被更新 spawn
+    /// 夺权 / 复位后的旧 coordinator 迟到写入命中 0 行，不会复活已清零的计数。
+    pub async fn add_task_source_bytes(
+        &self,
+        task_id: &str,
+        epoch: i64,
+        delta: SourceBytes,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE tasks SET src_cdn_bytes = src_cdn_bytes + $1,
+                 src_proxy_bytes = src_proxy_bytes + $2,
+                 src_nic_bytes = src_nic_bytes + $3
+             WHERE id = $4 AND segments_epoch = $5",
+        )
+        .bind(delta.cdn)
+        .bind(delta.proxy)
+        .bind(delta.nic)
+        .bind(task_id)
+        .bind(epoch)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -2570,10 +2634,14 @@ impl Db {
             .execute(&mut *tx)
             .await?;
         // Also reset downloaded_bytes in the tasks table
-        sqlx::query("UPDATE tasks SET downloaded_bytes = 0 WHERE id = $1")
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE tasks SET downloaded_bytes = 0,
+                 src_cdn_bytes = 0, src_proxy_bytes = 0, src_nic_bytes = 0
+             WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2684,10 +2752,14 @@ impl Db {
             .bind(task_id)
             .execute(&self.pool)
             .await?;
-        sqlx::query("UPDATE tasks SET downloaded_bytes = 0 WHERE id = $1")
-            .bind(task_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE tasks SET downloaded_bytes = 0,
+                 src_cdn_bytes = 0, src_proxy_bytes = 0, src_nic_bytes = 0
+             WHERE id = $1",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -6534,6 +6606,103 @@ mod tests {
         assert_eq!(
             segs[1].downloaded_bytes, 1000,
             "start_byte-mismatched batch row must affect zero rows"
+        );
+
+        close_test_db(&db, dir).await;
+    }
+
+    /// 加速来源累计：多次增量累加、旧 epoch 迟到写入被拒、`load_task_by_id`
+    /// 与专用 getter 读到一致的值；进度复位（`update_task_progress(_, 0)` /
+    /// `reset_segments_progress` / `delete_segments`）同步清零，非 0 进度写入不动它。
+    #[tokio::test]
+    async fn task_source_bytes_accumulate_guard_epoch_and_reset_with_progress() {
+        let (db, dir) = open_test_db().await;
+        insert_task(&db, "src1").await;
+        db.set_segments_epoch("src1", 5).await.expect("set epoch");
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            SourceBytes::default()
+        );
+
+        let first = SourceBytes {
+            cdn: 100,
+            proxy: 20,
+            nic: 3,
+        };
+        let second = SourceBytes {
+            cdn: 50,
+            proxy: 0,
+            nic: 7,
+        };
+        db.add_task_source_bytes("src1", 5, first)
+            .await
+            .expect("first delta");
+        db.add_task_source_bytes("src1", 5, second)
+            .await
+            .expect("second delta");
+        let expected = first.saturating_add(second);
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            expected
+        );
+        let info = db
+            .load_task_by_id("src1")
+            .await
+            .expect("load task")
+            .expect("task exists");
+        assert_eq!(info.source_bytes, expected, "TaskInfo must round-trip");
+
+        // 被新 spawn 夺权后，旧 coordinator 迟到写入 0 行生效。
+        db.add_task_source_bytes("src1", 4, first)
+            .await
+            .expect("stale delta");
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            expected,
+            "stale-epoch delta must affect zero rows"
+        );
+
+        // 非 0 进度写入不清零计数。
+        db.update_task_progress("src1", 4096)
+            .await
+            .expect("progress");
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            expected
+        );
+
+        // 三条进度复位路径各自清零。
+        db.update_task_progress("src1", 0).await.expect("reset");
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            SourceBytes::default(),
+            "update_task_progress(_, 0) must clear counters"
+        );
+        db.add_task_source_bytes("src1", 5, first)
+            .await
+            .expect("delta");
+        db.reset_segments_progress("src1")
+            .await
+            .expect("reset segs");
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            SourceBytes::default(),
+            "reset_segments_progress must clear counters"
+        );
+        db.add_task_source_bytes("src1", 5, first)
+            .await
+            .expect("delta");
+        db.delete_segments("src1").await.expect("delete segs");
+        assert_eq!(
+            db.load_task_source_bytes("src1").await.expect("load"),
+            SourceBytes::default(),
+            "delete_segments must clear counters"
+        );
+
+        // 不存在的任务按全 0 处理。
+        assert_eq!(
+            db.load_task_source_bytes("missing").await.expect("load"),
+            SourceBytes::default()
         );
 
         close_test_db(&db, dir).await;

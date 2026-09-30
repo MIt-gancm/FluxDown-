@@ -29,6 +29,13 @@ export const SEEDING_STATUS = {
 export const SEED_LIMIT_INHERIT = -2; // 跟随全局
 export const SEED_LIMIT_UNLIMITED = -1; // 不限制（0 也视同不限制）
 
+/** 加速路径累计字节（仅 CDN 多节点 / Auto 代理候选 / 多网卡；源站字节 = 已下载 − 三者之和）。 */
+export interface TaskSourceBytesDto {
+  cdnBytes: number;
+  proxyBytes: number;
+  nicBytes: number;
+}
+
 /** 任务信息。 */
 export interface TaskDto {
   taskId: string;
@@ -82,6 +89,8 @@ export interface TaskDto {
   seedTimeLimitMinutes: number;
   /** 不活跃做种时长上限（分钟），哨兵同上。 */
   seedInactiveTimeLimitMinutes: number;
+  /** 持久化的加速路径字节（旧 daemon 不返回）。 */
+  sourceBytes?: TaskSourceBytesDto;
 }
 
 /** 文件字节区间进度；`active` 未知（null）时不要推断其传输状态。 */
@@ -104,6 +113,8 @@ export interface TaskRuntimeDto {
   parallelismLimit: number | null;
   totalBytes: number;
   segments: TaskSegmentDto[];
+  /** 实时累计（含在途）；null = 该协议/路径无归因。 */
+  sourceBytes?: TaskSourceBytesDto | null;
 }
 
 /** 持久任务事件（`daemon.task.activity` 条目 / `taskActivityAdded` 事件）。 */

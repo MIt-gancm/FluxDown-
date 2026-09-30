@@ -12499,6 +12499,7 @@ mod tests {
                 parallelism_limit: Some(8),
                 total_bytes: 100,
                 segments: vec![segment],
+                source_bytes: None,
             }),
             ..Default::default()
         })

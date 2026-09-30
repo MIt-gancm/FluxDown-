@@ -105,6 +105,57 @@ pub struct TaskInfo {
     /// `direct:pinned` / `proxy:cached` / `proxy:sampled` / `proxy:failover`；
     /// 空 = 非 Auto 模式或任务从未启动。
     pub auto_route: String,
+    /// 加速来源累计字节（跨运行累加，进度复位时随之清零）。源站字节 =
+    /// `downloaded_bytes` − 三者之和。
+    pub source_bytes: SourceBytes,
+}
+
+/// 按加速来源累计的已写入字节。
+///
+/// 只覆盖源站主链路之外的路径（多 CDN 钉定节点、Auto 代理候选链路、多网卡
+/// 链路）；源站字节不单独计数，由 `downloaded_bytes` 减去三者之和得到。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SourceBytes {
+    /// 多 CDN 钉定节点（额外源站 IP）。
+    pub cdn: i64,
+    /// `ProxyMode::Auto` 下走候选代理路径。
+    pub proxy: i64,
+    /// 多网卡聚合挂入的额外网卡链路。
+    pub nic: i64,
+}
+
+impl SourceBytes {
+    /// 三项均为 0。
+    pub fn is_zero(&self) -> bool {
+        self.cdn == 0 && self.proxy == 0 && self.nic == 0
+    }
+
+    /// 逐项饱和相加。
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            cdn: self.cdn.saturating_add(other.cdn),
+            proxy: self.proxy.saturating_add(other.proxy),
+            nic: self.nic.saturating_add(other.nic),
+        }
+    }
+
+    /// 逐项饱和相减（可能为负；调用方以「累计值 − 已落库值」使用，结果按 `max(0)` 截断）。
+    pub fn saturating_sub(self, other: Self) -> Self {
+        Self {
+            cdn: self.cdn.saturating_sub(other.cdn).max(0),
+            proxy: self.proxy.saturating_sub(other.proxy).max(0),
+            nic: self.nic.saturating_sub(other.nic).max(0),
+        }
+    }
+
+    /// 逐项取较大值。
+    pub fn max(self, other: Self) -> Self {
+        Self {
+            cdn: self.cdn.max(other.cdn),
+            proxy: self.proxy.max(other.proxy),
+            nic: self.nic.max(other.nic),
+        }
+    }
 }
 
 /// 命名队列元数据。字段对应 `hub::signals::QueueInfo`。

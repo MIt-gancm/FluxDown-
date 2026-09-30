@@ -49,6 +49,7 @@ use crate::db::Db;
 use crate::downloader::DownloadError;
 use crate::events::{EngineEvent, EventSink};
 use crate::logger::log_info;
+use crate::model::SourceBytes;
 use crate::multi_nic::LinkBinding;
 use crate::proxy_config::ProxyConfig;
 
@@ -1063,6 +1064,36 @@ impl NodePool {
         acc
     }
 
+    /// 加速来源累计字节（任务「来源构成」）：已结束租约的回报 + `live` 给出的
+    /// 在途进度，按槽位所属路径归类——代理路径 → `proxy`，网卡链路 → `nic`，
+    /// 直连钉定 IP → `cdn`；SYS / 无钉定的直连槽位是源站主链路，不计入
+    /// （源站字节 = 已下载 − 三者之和）。整池一次加锁，无逐块开销。
+    pub fn source_bytes(&self, live: &[(usize, u64)]) -> SourceBytes {
+        let Ok(inner) = self.inner.lock() else {
+            return SourceBytes::default();
+        };
+        let mut acc = SourceBytes::default();
+        let mut add = |slot: &NodeSlot, bytes: u64| {
+            let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+            let field = match (slot.route, slot.ip) {
+                (RoutePath::Proxy(_), _) => &mut acc.proxy,
+                (RoutePath::Link(_), _) => &mut acc.nic,
+                (RoutePath::Direct, Some(_)) => &mut acc.cdn,
+                (RoutePath::Direct, None) => return,
+            };
+            *field = field.saturating_add(bytes);
+        };
+        for slot in &inner.slots {
+            add(slot, slot.bytes_done);
+        }
+        for &(node_id, bytes) in live {
+            if let Some(slot) = inner.slots.get(node_id) {
+                add(slot, bytes);
+            }
+        }
+        acc
+    }
+
     /// 起飞路径之外的备选路径是否已被实际使用（承载过连接即算，不回退）。
     pub fn alternates_explored(&self) -> bool {
         let Ok(inner) = self.inner.lock() else {
@@ -1166,6 +1197,7 @@ mod tests {
     };
     use crate::auto_proxy::{CandidateSource, RoutePath};
     use crate::downloader::DownloadError;
+    use crate::model::SourceBytes;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::Arc;
     use std::time::Duration;
@@ -1478,6 +1510,49 @@ mod tests {
         assert!(bytes.contains(&(RoutePath::Direct, 10)));
         assert!(bytes.contains(&(MANUAL, 35)));
         assert!(pool.alternates_explored());
+    }
+
+    #[test]
+    fn source_bytes_classify_slots_by_path_kind() {
+        // SYS(0) + 钉定 CDN(1,2) + 代理路径 + 网卡链路。
+        let pool = test_pool(&[ip(2), ip(3)]);
+        pool.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(MANUAL, reqwest::Client::new(), None)],
+        );
+        pool.add_links(vec![(nic("en1", 2), reqwest::Client::new())]);
+        let manual = node_of(&pool, MANUAL);
+        let link = node_of(&pool, RoutePath::Link(2));
+        assert_eq!(pool.source_bytes(&[]), SourceBytes::default());
+
+        // 已结束租约回报：经 record_transfer 落到各槽位。
+        {
+            let mut inner = pool.inner.lock().unwrap();
+            inner.slots[0].bytes_done = 1_000; // SYS 源站：不计入
+            inner.slots[1].bytes_done = 200; // 钉定 CDN
+            inner.slots[manual].bytes_done = 30; // 代理
+            inner.slots[link].bytes_done = 4; // 网卡
+        }
+        assert_eq!(
+            pool.source_bytes(&[]),
+            SourceBytes {
+                cdn: 200,
+                proxy: 30,
+                nic: 4
+            }
+        );
+
+        // 在途进度叠加到对应槽位；SYS 在途仍是源站，不计入。
+        let bytes = pool.source_bytes(&[(0, 500), (1, 8), (2, 7), (manual, 5), (link, 6), (99, 9)]);
+        assert_eq!(
+            bytes,
+            SourceBytes {
+                cdn: 215,
+                proxy: 35,
+                nic: 10
+            }
+        );
     }
 
     #[test]

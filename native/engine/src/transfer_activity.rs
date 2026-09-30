@@ -33,6 +33,9 @@ pub struct TaskRuntime {
     pub parallelism_limit: Option<u32>,
     pub total_bytes: i64,
     pub segments: Vec<TaskSegment>,
+    /// Live cumulative accelerated-source bytes (persisted base + this run,
+    /// including in-flight); `None` = this protocol/path has no attribution.
+    pub source_bytes: Option<crate::model::SourceBytes>,
 }
 
 /// Count body reads, not worker slots, pending permits, or retry backoff.

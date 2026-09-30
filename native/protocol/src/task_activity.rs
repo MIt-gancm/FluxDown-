@@ -14,6 +14,25 @@ pub struct TaskSegmentDto {
     pub active: Option<bool>,
 }
 
+/// 任务按加速来源累计的已写入字节：跨运行累加，重下 / 清盘时随进度一并复位。
+///
+/// 只记录源站主链路之外的路径；源站字节 = `downloaded_bytes` − 三者之和
+/// （BT / ED2K 等 P2P 协议由客户端按协议整体归入 P2P）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSourceBytesDto {
+    /// 多 CDN 钉定节点（DoH / ECS 解析出的额外源站 IP）。
+    #[serde(default)]
+    pub cdn_bytes: i64,
+    /// `ProxyMode::Auto` 下经候选代理路径（系统代理或手动代理）。
+    #[serde(default)]
+    pub proxy_bytes: i64,
+    /// 多网卡聚合挂入的额外网卡链路。
+    #[serde(default)]
+    pub nic_bytes: i64,
+}
+
 /// 任务最新采样；活跃传输不是物理 socket、配置上限或分段数。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -29,6 +48,9 @@ pub struct TaskRuntimeDto {
     pub parallelism_limit: Option<u32>,
     pub total_bytes: i64,
     pub segments: Vec<TaskSegmentDto>,
+    /// 本次采样时的加速来源累计（含在途连接）；`None` = 该协议 / 路径不做来源归因。
+    #[serde(default)]
+    pub source_bytes: Option<TaskSourceBytesDto>,
 }
 
 /// 持久任务事件；ID 在同一个下载数据库内单调递增。

@@ -14,6 +14,7 @@ pub mod settings;
 pub mod task_activity;
 pub use task_activity::{
     TaskActivityDto, TaskActivityPage, TaskActivityQuery, TaskRuntimeDto, TaskSegmentDto,
+    TaskSourceBytesDto,
 };
 
 pub use agent::{

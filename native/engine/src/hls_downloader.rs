@@ -52,6 +52,7 @@ fn hls_runtime(task_id: &str, tracker: &TransferTracker, limit: u32) -> TaskRunt
         parallelism_limit: Some(limit),
         total_bytes: 0,
         segments: Vec::new(),
+        source_bytes: None,
     }
 }
 

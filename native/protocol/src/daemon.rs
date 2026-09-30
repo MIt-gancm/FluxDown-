@@ -342,6 +342,9 @@ pub struct TaskDto {
     /// 候选来源后缀 `:system`/`:manual`）；空 = 非 Auto 模式。
     #[serde(default)]
     pub auto_route: String,
+    /// 加速来源累计字节（多 CDN / 智能代理 / 多网卡）；源站 = 已下载 − 三者之和。
+    #[serde(default)]
+    pub source_bytes: crate::TaskSourceBytesDto,
     /// 队列内启动顺序（0 = 未显式排序，按创建时间；>0 = 显式顺序）。
     #[serde(default)]
     pub queue_order: i32,

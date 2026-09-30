@@ -7,17 +7,21 @@ import { AdvancedTab } from './AdvancedTab'
 import { GeneralTab } from './GeneralTab'
 import { LogTab } from './LogTab'
 import { SeedingTab } from './SeedingTab'
+import { SpeedTab } from './SpeedTab'
+import { useSpeedHistory } from './useSpeedHistory'
 import type { DownloadTaskView } from '../model/task'
 
-type DetailTab = 'general' | 'seeding' | 'log' | 'advanced'
+type DetailTab = 'general' | 'speed' | 'seeding' | 'log' | 'advanced'
 
 function TaskDetail({ view }: { view: DownloadTaskView }) {
   const t = useT()
   const [tab, setTab] = useState<DetailTab>('general')
   const isBt = view.protocol === 'bt'
   const active: DetailTab = tab === 'seeding' && !isBt ? 'general' : tab
+  const speedHistory = useSpeedHistory(view, active === 'speed')
   const items = [
     { value: 'general' as const, label: t('detailTabGeneral') },
+    { value: 'speed' as const, label: t('detailTabSpeed') },
     ...(isBt ? [{ value: 'seeding' as const, label: t('tabSeeding') }] : []),
     { value: 'log' as const, label: t('detailTabLog') },
     { value: 'advanced' as const, label: t('detailTabAdvanced') },
@@ -29,6 +33,7 @@ function TaskDetail({ view }: { view: DownloadTaskView }) {
       </div>
       <div className="min-h-0 flex-1 overflow-auto p-3">
         {active === 'general' ? <GeneralTab view={view} /> : null}
+        {active === 'speed' ? <SpeedTab view={view} history={speedHistory} /> : null}
         {active === 'seeding' ? <SeedingTab view={view} /> : null}
         {active === 'log' ? <LogTab taskId={view.taskId} /> : null}
         {active === 'advanced' ? <AdvancedTab view={view} /> : null}

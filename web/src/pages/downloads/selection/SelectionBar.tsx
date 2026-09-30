@@ -95,8 +95,9 @@ export function SelectionHeaderBar() {
 
 /** 移动端卡片布局（无表头）的底部浮动选择条：选中 ≥1 项时出现，承载批量操作。 */
 export function SelectionBar() {
-  const { summary } = useDownloads()
-  if (!summary.any) return null
+  const { summary, detailOpen } = useDownloads()
+  // 详情面板正展示唯一选中的任务时，不再显示批量条。
+  if (!summary.any || (detailOpen && summary.count === 1)) return null
 
   return (
     <div

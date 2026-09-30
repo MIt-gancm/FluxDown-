@@ -475,17 +475,7 @@ impl Multipath {
             crate::route_health::record_no_switch(&labeler.ctx.host, db);
             labeler.pinned = true;
         }
-        let in_flight: Vec<(usize, u64)> = nodes
-            .live_conns()
-            .iter()
-            .filter_map(|conn| {
-                let seg = segments.get(&conn.seg_index)?;
-                Some((
-                    conn.node_id,
-                    (seg.downloaded_bytes - conn.start_downloaded).max(0) as u64,
-                ))
-            })
-            .collect();
+        let in_flight = in_flight(nodes, segments);
         let label = labeler.desired(&nodes.route_bytes(&in_flight), nodes.alternates_explored());
         if label == labeler.published {
             return;
@@ -510,6 +500,25 @@ impl Multipath {
             crate::route_health::record_path_rate(&labeler.ctx.host, route, bps, db);
         }
     }
+}
+
+/// 在途租约的「槽位, 本次已传字节」：当前段进度 − 租约起点。喂 `route_bytes` /
+/// `source_bytes`；段已不在布局内的租约（拆分 / 完成瞬间）不计。
+pub(super) fn in_flight(
+    nodes: &NodePool,
+    segments: &BTreeMap<i32, LiveSegment>,
+) -> Vec<(usize, u64)> {
+    nodes
+        .live_conns()
+        .iter()
+        .filter_map(|conn| {
+            let seg = segments.get(&conn.seg_index)?;
+            Some((
+                conn.node_id,
+                (seg.downloaded_bytes - conn.start_downloaded).max(0) as u64,
+            ))
+        })
+        .collect()
 }
 
 #[cfg(test)]

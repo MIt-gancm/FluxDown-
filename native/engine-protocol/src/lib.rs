@@ -5,7 +5,7 @@
 use fluxdown_engine::downloader::CapturedRequestBody;
 use fluxdown_engine::model::{
     BtFileEntry, CdnNodeInfo, GroupInfo, HlsQualityOption, QueueInfo, QueuePosition,
-    ResolveVariantOption, SegmentDetail, TaskInfo,
+    ResolveVariantOption, SegmentDetail, SourceBytes, TaskInfo,
 };
 use fluxdown_engine::rss::model::{RssItemInfo, RssSourceInfo};
 use fluxdown_engine::webhook::{PresetInfo, WebhookDelivery};
@@ -33,6 +33,16 @@ pub fn request_body_to_engine(body: RequestBody) -> CapturedRequestBody {
     }
 }
 
+/// 将加速来源累计字节转换为 wire DTO。
+#[must_use]
+pub fn source_bytes_to_dto(bytes: SourceBytes) -> fluxdown_protocol::TaskSourceBytesDto {
+    fluxdown_protocol::TaskSourceBytesDto {
+        cdn_bytes: bytes.cdn,
+        proxy_bytes: bytes.proxy,
+        nic_bytes: bytes.nic,
+    }
+}
+
 /// 将引擎实际传输采样转换成 wire DTO，不推测未知并发。
 #[must_use]
 pub fn task_runtime_to_dto(
@@ -57,6 +67,7 @@ pub fn task_runtime_to_dto(
                 active: segment.active,
             })
             .collect(),
+        source_bytes: runtime.source_bytes.map(source_bytes_to_dto),
     }
 }
 
@@ -99,6 +110,7 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         rss_source_id: task.rss_source_id,
         origin_url: task.origin_url,
         auto_route: task.auto_route,
+        source_bytes: source_bytes_to_dto(task.source_bytes),
         queue_order: task.queue_order,
         uploaded_bytes: task.uploaded_bytes,
         uploaded_at_completion: task.uploaded_at_completion,

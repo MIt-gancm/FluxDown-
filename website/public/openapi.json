@@ -5164,6 +5164,10 @@
             "format": "int64",
             "description": "累计做种秒数（活跃做种期间累加；排队/暂停不计，非 BT 任务恒 0）。"
           },
+          "sourceBytes": {
+            "$ref": "#/components/schemas/TaskSourceBytesDto",
+            "description": "加速来源累计字节（多 CDN / 智能代理 / 多网卡）；源站 = 已下载 − 三者之和。"
+          },
           "status": {
             "type": "integer",
             "format": "int32",
@@ -5188,6 +5192,27 @@
           },
           "url": {
             "type": "string"
+          }
+        }
+      },
+      "TaskSourceBytesDto": {
+        "type": "object",
+        "description": "任务按加速来源累计的已写入字节：跨运行累加，重下 / 清盘时随进度一并复位。\n\n只记录源站主链路之外的路径；源站字节 = `downloaded_bytes` − 三者之和\n（BT / ED2K 等 P2P 协议由客户端按协议整体归入 P2P）。",
+        "properties": {
+          "cdnBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "多 CDN 钉定节点（DoH / ECS 解析出的额外源站 IP）。"
+          },
+          "nicBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "多网卡聚合挂入的额外网卡链路。"
+          },
+          "proxyBytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "`ProxyMode::Auto` 下经候选代理路径（系统代理或手动代理）。"
           }
         }
       }

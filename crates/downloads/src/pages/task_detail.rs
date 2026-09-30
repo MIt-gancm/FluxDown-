@@ -27,7 +27,7 @@ use gpui::{
 use gpui_component::{
     Disableable as _, Icon, WindowExt as _,
     button::{Button, ButtonVariants as _},
-    chart::AreaChart,
+    chart::{AreaChart, PieChart},
     h_flex,
     input::{InputState, NumberInput},
     notification::Notification,
@@ -44,13 +44,20 @@ use crate::{
     controller::{
         DownloadsCommand, DownloadsController, DownloadsPort, DownloadsResult, SeedLimits,
     },
-    model::{DownloadTaskView, RowKey, TaskProtocol, TaskState, TaskStore, format_bytes},
+    model::{
+        DownloadTaskView, RowKey, TaskProtocol, TaskState, TaskStore, format_bytes,
+        source_composition::{SourceKind, compose, format_percent},
+    },
     pages::downloads::DownloadHostActions,
     strings::DownloadStrings,
 };
 
 /// 速度曲线保留的采样点数（每秒一次）。
 const SPEED_HISTORY_CAPACITY: usize = 120;
+/// 常规页信息列的折行基准宽度：可用宽度容不下「信息列 + 来源构成」时来源换行。
+const GENERAL_INFO_MIN_WIDTH: f32 = 300.;
+/// 常规页「来源构成」区块宽度（环形图 140 + 图例）。
+const SOURCES_SECTION_WIDTH: f32 = 360.;
 /// `SeedLimits` 各字段的「跟随全局」哨兵（与 `native/protocol` 一致）。
 const SEED_LIMIT_FOLLOW_GLOBAL: i64 = -2;
 /// 键值表标签列宽：详情、做种、高级与任务组概览共用，保证值列左缘对齐。
@@ -72,6 +79,7 @@ pub enum DetailMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DetailTab {
     General,
+    Speed,
     Seeding,
     Log,
     Advanced,
@@ -625,8 +633,9 @@ impl TaskDetailView {
     fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let tokens = active_theme(cx).tokens().clone();
         let is_bt = self.is_bt();
-        let candidates: [(DetailTab, &'static str); 4] = [
+        let candidates: [(DetailTab, &'static str); 5] = [
             (DetailTab::General, "detailTabGeneral"),
+            (DetailTab::Speed, "detailTabSpeed"),
             (DetailTab::Seeding, "tabSeeding"),
             (DetailTab::Log, "detailTabLog"),
             (DetailTab::Advanced, "detailTabAdvanced"),
@@ -1065,7 +1074,7 @@ impl TaskDetailView {
                 cx,
             ));
         }
-        list.child(
+        let list = list.child(
             h_flex().gap(tokens.spacing.sm).pt(tokens.spacing.md).child(
                 Button::new("detail-copy-link")
                     .outline()
@@ -1074,8 +1083,338 @@ impl TaskDetailView {
                     .label(self.strings.copy_url.clone())
                     .on_click(cx.listener(|this, _, window, cx| this.copy_link(window, cx))),
             ),
+        );
+        // 响应式：宽度够（横向底部面板 / 宽窗口）时信息列与来源构成并排，
+        // 窄（右侧面板）时来源构成自动换到信息列下方——按实际可用宽度折行，
+        // 与停靠位置无关，独立任务窗口同样适用。
+        h_flex()
+            // wrap-reverse：折行时来源构成排到信息列上方（窄面板先看图表）；
+            // 反向交叉轴下 items_end 即顶端对齐，并排时两列仍顶对齐。
+            .flex_wrap_reverse()
+            .items_end()
+            .gap_x(tokens.spacing.xl)
+            .gap_y(tokens.spacing.lg)
+            .child(
+                list.flex_grow_1()
+                    .flex_shrink_1()
+                    .flex_basis(px(GENERAL_INFO_MIN_WIDTH))
+                    .min_w_0(),
+            )
+            .children(self.render_sources_section(cx))
+            .into_any_element()
+    }
+
+    /// 「速度」页：当前 / 近 2 分钟平均 / 近 2 分钟峰值三块统计 + 1 Hz 面积图 + 明细行。
+    fn render_speed(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
+        let Some(row) = self.store.get(&RowKey::Local(self.task_id.clone())) else {
+            return div().into_any_element();
+        };
+        let downloading = row.state == TaskState::Downloading;
+        let current = row
+            .speed_bytes_per_second
+            .filter(|_| downloading)
+            .unwrap_or(0);
+        let eta = row
+            .eta_seconds
+            .filter(|_| downloading)
+            .map(|seconds| self.strings.format_eta(seconds));
+        let active_transfers = row.active_transfers().filter(|_| downloading).map(|count| {
+            self.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.parallelism_limit)
+                .map_or_else(|| count.to_string(), |limit| format!("{count} / {limit}"))
+        });
+        let connected_peers = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.connected_peers);
+        drop(row);
+
+        let samples = self.speed_history.len() as u64;
+        let total: u64 = self.speed_history.iter().map(|(_, speed)| *speed).sum();
+        let average = total.checked_div(samples).unwrap_or(0);
+        let peak = self
+            .speed_history
+            .iter()
+            .map(|(_, speed)| *speed)
+            .max()
+            .unwrap_or(0);
+        let chart_points: Vec<(usize, f64)> = self
+            .speed_history
+            .iter()
+            .enumerate()
+            .map(|(index, (_, speed))| (index, *speed as f64))
+            .collect();
+        let has_chart = chart_points.len() > 1 && peak > 0;
+
+        let tile = |label: SharedString, value: u64, color: Hsla| {
+            v_flex()
+                .flex_1()
+                .min_w_0()
+                .gap(tokens.spacing.xs)
+                .p(tokens.spacing.sm)
+                .rounded(tokens.radius.sm)
+                .border_1()
+                .border_color(extended.colors.hairline)
+                .child(
+                    div()
+                        .text_size(tokens.typography.xs.size)
+                        .line_height(tokens.typography.xs.line_height)
+                        .text_color(tokens.colors.muted_foreground)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(tokens.typography.sm.size)
+                        .line_height(tokens.typography.sm.line_height)
+                        .font_weight(FontWeight::MEDIUM)
+                        .font_features(tabular_numbers())
+                        .text_color(color)
+                        .child(SharedString::from(format!("{}/s", format_bytes(value)))),
+                )
+        };
+
+        v_flex()
+            .gap(tokens.spacing.md)
+            .child(
+                h_flex()
+                    .gap(tokens.spacing.sm)
+                    .child(tile(
+                        self.t(cx, "infoSpeed"),
+                        current,
+                        tokens.colors.primary,
+                    ))
+                    .child(tile(
+                        self.t(cx, "speedAverageRecent"),
+                        average,
+                        tokens.colors.foreground,
+                    ))
+                    .child(tile(
+                        self.t(cx, "speedPeakRecent"),
+                        peak,
+                        tokens.colors.foreground,
+                    )),
+            )
+            .child(if has_chart {
+                div()
+                    .h(px(120.))
+                    .w_full()
+                    .child(
+                        AreaChart::new(chart_points)
+                            .x(|point: &(usize, f64)| SharedString::from(point.0.to_string()))
+                            .y(|point: &(usize, f64)| point.1)
+                            .stroke(tokens.colors.primary)
+                            .linear()
+                            .x_axis(false)
+                            .grid(false),
+                    )
+                    .into_any_element()
+            } else {
+                h_flex()
+                    .h(px(120.))
+                    .w_full()
+                    .items_center()
+                    .justify_center()
+                    .text_size(tokens.typography.xs.size)
+                    .line_height(tokens.typography.xs.line_height)
+                    .text_color(tokens.colors.muted_foreground)
+                    .child(self.t(cx, "speedChartEmpty"))
+                    .into_any_element()
+            })
+            .child(
+                v_flex()
+                    .when_some(eta, |this, eta| {
+                        this.child(detail_row(self.t(cx, "infoRemaining"), eta, cx))
+                    })
+                    .when_some(active_transfers, |this, count| {
+                        this.child(detail_row(
+                            self.t(cx, "detailActiveTransfers"),
+                            SharedString::from(count),
+                            cx,
+                        ))
+                    })
+                    .when_some(connected_peers, |this, count| {
+                        this.child(detail_row(
+                            self.t(cx, "detailConnectedPeers"),
+                            SharedString::from(count.to_string()),
+                            cx,
+                        ))
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// 常规页的「来源构成」区块：环形图 + 图例 + 一行摘要；尚无已下载字节时不渲染。
+    fn render_sources_section(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens().clone();
+        let extended = theme.extended().clone();
+        let row = self.store.get(&RowKey::Local(self.task_id.clone()))?;
+        let protocol = row.protocol;
+        let downloaded = row.downloaded_bytes;
+        drop(row);
+        let bytes = self
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.source_bytes)
+            .or_else(|| self.current_dto().map(|dto| dto.source_bytes))
+            .unwrap_or_default();
+        let composition = compose(
+            protocol,
+            i64::try_from(downloaded).unwrap_or(i64::MAX),
+            bytes.cdn_bytes,
+            bytes.proxy_bytes,
+            bytes.nic_bytes,
+        );
+        if composition.is_empty() {
+            return None;
+        }
+
+        // 主题没有第四种强调色：多网卡取 `info` 色相 +60°（蓝→紫），明度/饱和度
+        // 沿用主题值，亮暗主题都与源站的主色蓝区分开。
+        let nic_color = Hsla {
+            h: (extended.colors.info.h + 60. / 360.).fract(),
+            ..extended.colors.info
+        };
+        let color_of = |kind: SourceKind| -> Hsla {
+            match kind {
+                SourceKind::Origin | SourceKind::P2p => tokens.colors.primary,
+                SourceKind::Cdn => extended.colors.success,
+                SourceKind::Proxy => extended.colors.warning,
+                SourceKind::Nic => nic_color,
+            }
+        };
+        let arcs: Vec<(Hsla, f32)> = composition
+            .slices
+            .iter()
+            .filter(|slice| slice.bytes > 0)
+            .map(|slice| (color_of(slice.kind), slice.bytes as f32))
+            .collect();
+        // 单切片（100%）不留分隔缝，否则整环出现一道缺口。
+        let pad_angle = if arcs.len() > 1 { 0.02 } else { 0. };
+        let donut = div()
+            .relative()
+            .flex_none()
+            .size(px(140.))
+            .child(
+                PieChart::new(arcs)
+                    .value(|arc: &(Hsla, f32)| arc.1)
+                    .color(|arc: &(Hsla, f32)| arc.0)
+                    .outer_radius(66.)
+                    .inner_radius(46.)
+                    .pad_angle(pad_angle)
+                    .interactive(false),
+            )
+            .child(
+                v_flex()
+                    .absolute()
+                    .inset_0()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(tokens.typography.xs.size)
+                            .line_height(tokens.typography.xs.line_height)
+                            .text_color(tokens.colors.muted_foreground)
+                            .child(self.t(cx, "infoDownloaded")),
+                    )
+                    .child(
+                        div()
+                            .text_size(tokens.typography.sm.size)
+                            .line_height(tokens.typography.sm.line_height)
+                            .font_weight(FontWeight::MEDIUM)
+                            .font_features(tabular_numbers())
+                            .text_color(tokens.colors.foreground)
+                            .child(SharedString::from(format_bytes(composition.downloaded))),
+                    ),
+            );
+
+        let legend =
+            v_flex()
+                .flex_1()
+                .min_w(px(180.))
+                .children(composition.slices.iter().map(|slice| {
+                    h_flex()
+                        .items_center()
+                        .gap(tokens.spacing.sm)
+                        .py(tokens.spacing.xs)
+                        .text_size(tokens.typography.xs.size)
+                        .line_height(tokens.typography.xs.line_height)
+                        .font_features(tabular_numbers())
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(color_of(slice.kind)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_color(tokens.colors.foreground)
+                                .truncate()
+                                .child(self.t(cx, slice.kind.i18n_key())),
+                        )
+                        .child(div().text_color(tokens.colors.foreground).child(
+                            SharedString::from(format_percent(composition.fraction(slice.bytes))),
+                        ))
+                        .child(
+                            div()
+                                .min_w(px(64.))
+                                .text_right()
+                                .text_color(tokens.colors.muted_foreground)
+                                .child(SharedString::from(format_bytes(slice.bytes))),
+                        )
+                }));
+
+        let summary = if composition.p2p {
+            self.t(cx, "sourcesP2pHint")
+        } else if composition.accelerated_bytes > 0 {
+            let percent = format_percent(composition.accelerated_share());
+            SharedString::from(
+                self.translator
+                    .read(cx)
+                    .text_with("sourcesAccelShare", &[("percent", &percent)]),
+            )
+        } else {
+            self.t(cx, "sourcesNoAccel")
+        };
+
+        Some(
+            v_flex()
+                .flex_none()
+                .w(px(SOURCES_SECTION_WIDTH))
+                .max_w_full()
+                .gap(tokens.spacing.sm)
+                .child(
+                    div()
+                        .text_size(extended.caption.size)
+                        .line_height(extended.caption.line_height)
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(extended.colors.text_tertiary)
+                        .child(self.t(cx, "detailSourcesTitle")),
+                )
+                .child(
+                    h_flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(tokens.spacing.md)
+                        .child(donut)
+                        .child(legend),
+                )
+                .child(
+                    div()
+                        .text_size(tokens.typography.xs.size)
+                        .line_height(tokens.typography.xs.line_height)
+                        .text_color(tokens.colors.muted_foreground)
+                        .child(summary),
+                )
+                .into_any_element(),
         )
-        .into_any_element()
     }
 
     fn render_seeding(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1436,6 +1775,7 @@ impl gpui::Render for TaskDetailView {
                     .p(tokens.spacing.md)
                     .child(match self.tab {
                         DetailTab::General => self.render_general(cx),
+                        DetailTab::Speed => self.render_speed(cx),
                         DetailTab::Seeding => self.render_seeding(cx),
                         DetailTab::Log => self.render_log(cx),
                         DetailTab::Advanced => self.render_advanced(cx),

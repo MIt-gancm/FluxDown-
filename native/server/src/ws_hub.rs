@@ -1130,6 +1130,7 @@ mod tests {
             rss_source_id: String::new(),
             origin_url: String::new(),
             auto_route: String::new(),
+            source_bytes: fluxdown_engine::model::SourceBytes::default(),
         }]));
 
         let snap = hub.live_speeds_snapshot();
@@ -1194,6 +1195,7 @@ mod tests {
             rss_source_id: String::new(),
             origin_url: String::new(),
             auto_route: String::new(),
+            source_bytes: fluxdown_engine::model::SourceBytes::default(),
         }
     }
 

@@ -425,7 +425,7 @@ export function TaskTable() {
               />
             </div>
           </div>
-          {ctx.summary.any ? (
+          {ctx.summary.any && !(ctx.detailOpen && ctx.summary.count === 1) ? (
             <SelectionHeaderBar />
           ) : (
             <>

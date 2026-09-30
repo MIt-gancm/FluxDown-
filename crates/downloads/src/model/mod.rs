@@ -6,6 +6,7 @@ pub(crate) mod new_download;
 pub(crate) mod progress_window;
 pub(crate) mod row_order;
 pub(crate) mod shutdown;
+pub(crate) mod source_composition;
 pub(crate) mod store;
 pub(crate) mod view_prefs;
 

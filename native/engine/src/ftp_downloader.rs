@@ -59,6 +59,7 @@ fn ftp_runtime(
                 active: s.active,
             })
             .collect(),
+        source_bytes: None,
     }
 }
 

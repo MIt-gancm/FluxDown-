@@ -768,6 +768,7 @@ fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::Joi
                         active: s.active,
                     })
                     .collect(),
+                source_bytes: None,
             };
             let _ = progress_tx
                 .send(ProgressUpdate {

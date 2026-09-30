@@ -3945,6 +3945,7 @@ fn single_runtime(task_id: &str, downloaded: i64, total: i64, active: bool) -> T
         } else {
             Vec::new()
         },
+        source_bytes: None,
     }
 }
 

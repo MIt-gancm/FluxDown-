@@ -118,7 +118,10 @@ impl DownloadView {
     pub(crate) fn render_selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let selection = self.table_state.read(cx).delegate().selection_summary();
         self.selection_summary.set(selection);
-        if selection.count == 0 {
+        // 详情面板已打开且只选中一项时，面板本身就在展示该任务，不再叠加选择条。
+        let detail_shows_selection =
+            selection.count == 1 && self.table_state.read(cx).delegate().prefs().detail_open;
+        if selection.count == 0 || detail_shows_selection {
             return None;
         }
 

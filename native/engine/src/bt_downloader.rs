@@ -2666,6 +2666,7 @@ fn bt_runtime(
         parallelism_limit: None,
         total_bytes,
         segments: Vec::new(),
+        source_bytes: None,
     }
 }
 

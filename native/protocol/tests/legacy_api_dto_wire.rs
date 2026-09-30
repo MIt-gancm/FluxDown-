@@ -141,6 +141,7 @@ fn task_dto_serializes_camel_case_with_correct_values() {
         rss_source_id: String::new(),
         origin_url: String::new(),
         auto_route: String::new(),
+        source_bytes: Default::default(),
         queue_order: 7,
         uploaded_bytes: 42,
         uploaded_at_completion: 7,
