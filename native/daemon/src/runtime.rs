@@ -445,6 +445,9 @@ fn apply_manager_settings(engine: &mut Engine, config: &HashMap<String, String>)
             .get("file_missing_action")
             .is_some_and(|value| value == "delete"),
     );
+    engine
+        .manager
+        .set_idle_file_scan(bool_config(config, "idle_file_scan", false));
 }
 
 fn configured_save_dir(config: &HashMap<String, String>, fallback: String) -> String {

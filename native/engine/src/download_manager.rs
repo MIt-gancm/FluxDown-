@@ -13,8 +13,9 @@ use uuid::Uuid;
 
 use crate::bt_downloader::{self, BtConfig, BtDownloadParams, SharedBtSession, TorrentSource};
 use crate::bt_seeding::{
-    SEEDING_QUEUED_MESSAGE, SEEDING_STATUS_ACTIVE, SEEDING_STATUS_QUEUED, SeedLimitOverrides,
-    SeedingLimitConfig, SeedingRegistration, SeedingStopReason, SeedingUploadSnapshot,
+    SEED_TIME_FALLBACK_PERSIST_INTERVAL, SEEDING_QUEUED_MESSAGE, SEEDING_STATUS_ACTIVE,
+    SEEDING_STATUS_QUEUED, SeedLimitOverrides, SeedingLimitConfig, SeedingRegistration,
+    SeedingStopReason, SeedingUploadSnapshot, seed_times_persist_due,
 };
 use crate::dash_downloader;
 use crate::db::Db;
@@ -143,8 +144,14 @@ const DEFAULT_AUTO_RETRY_BASE_DELAY_SECS: u64 = 5;
 /// 既保留递增退避避免对故障源猛冲，又保证无限模式下仍会稳定地持续尝试。
 const MAX_AUTO_RETRY_DELAY_SECS: u64 = 300;
 
-/// 做种时长落库的最小间隔（秒）。
-const SEED_TIME_PERSIST_INTERVAL_SECS: u64 = 30;
+/// BT 会话仅因「暂停中的未完成任务」而保活时的空闲宽限。
+///
+/// 保留会话让暂停任务的恢复只是 unpause（零校验、秒级）；但会话存活意味着 DHT
+/// 心跳、tracker 重连等定时器常驻，NAS 上会一直唤醒休眠的硬盘。暂停通常是
+/// 「晚点再继续」，故给 15 分钟宽限：期间恢复仍保持秒级；超时后释放会话，
+/// 恢复走既有重建路径（`ensure_bt_session` + add_torrent + fastresume）。
+/// 宽限从会话「除暂停任务外再无保活来源」那一刻起算，任何 BT 活动都会重置。
+const BT_SESSION_PAUSED_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// `invalidate_bt_session` 在关停前等待 inflight `add_torrent` 任务归零的
 /// 总上限。BT 监听端口由这些 detached 任务持有的 `Arc<Session>` 绑定，
@@ -156,6 +163,101 @@ const INVALIDATE_INFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// 200ms 足够细以快速响应归零，又不会空耗 CPU。
 const INVALIDATE_INFLIGHT_POLL_INTERVAL: std::time::Duration =
     std::time::Duration::from_millis(200);
+
+/// [`decide_bt_session_release`] 的输入：当前各 BT 会话保活来源是否存在。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BtSessionHolds {
+    /// 有 BT 任务正在下载。
+    active_download: bool,
+    /// 有做种者（含排队中的）。
+    seeders: bool,
+    /// pending 队列里有 BT URL 任务。
+    queued: bool,
+    /// 仍有 detached `add_torrent` 在途。
+    inflight_add: bool,
+    /// 存在暂停中（或初检中带延迟暂停）的未完成 torrent，持有恢复态。
+    paused_incomplete: bool,
+}
+
+/// 硬保活来源：只要存在就不能释放会话，也不计入暂停宽限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BtSessionKeep {
+    ActiveDownload,
+    Seeders,
+    QueuedTask,
+    InflightAdd,
+}
+
+impl BtSessionHolds {
+    /// 第一个命中的硬保活来源（不含暂停任务）。
+    fn busy_reason(self) -> Option<BtSessionKeep> {
+        if self.active_download {
+            Some(BtSessionKeep::ActiveDownload)
+        } else if self.seeders {
+            Some(BtSessionKeep::Seeders)
+        } else if self.queued {
+            Some(BtSessionKeep::QueuedTask)
+        } else if self.inflight_add {
+            Some(BtSessionKeep::InflightAdd)
+        } else {
+            None
+        }
+    }
+}
+
+/// [`decide_bt_session_release`] 的判定结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BtSessionVerdict {
+    /// 有硬保活来源，会话必须保留。
+    Keep(BtSessionKeep),
+    /// 仅因暂停任务保活，仍在宽限内。`just_armed` 表示本次判定刚起算宽限。
+    KeepPausedGrace {
+        just_armed: bool,
+        remaining: std::time::Duration,
+    },
+    /// 可以释放。`after_paused_grace` 为 `true` 表示是暂停宽限到期后的释放；
+    /// `false` 表示根本没有任何保活来源。
+    Release { after_paused_grace: bool },
+}
+
+/// BT 会话释放判定（纯函数，时间注入便于测试）。
+///
+/// `paused_idle_since` 是「会话仅因暂停中的未完成任务而保活」的空闲起点：
+/// - 存在任何硬保活来源（下载/做种/排队/在途 add）→ 清除起点并保留会话，因此
+///   期间的任何 BT 活动都会让下一次空闲重新起算完整宽限；
+/// - 只剩暂停任务 → 首次观察时起算，`now - 起点 >= grace` 才释放；
+/// - 什么都不剩 → 立即释放（沿用原语义）。
+fn decide_bt_session_release(
+    holds: BtSessionHolds,
+    paused_idle_since: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    grace: std::time::Duration,
+) -> BtSessionVerdict {
+    if let Some(reason) = holds.busy_reason() {
+        *paused_idle_since = None;
+        return BtSessionVerdict::Keep(reason);
+    }
+    if !holds.paused_incomplete {
+        *paused_idle_since = None;
+        return BtSessionVerdict::Release {
+            after_paused_grace: false,
+        };
+    }
+    let just_armed = paused_idle_since.is_none();
+    let since = *paused_idle_since.get_or_insert(now);
+    let idle = now.saturating_duration_since(since);
+    if idle >= grace {
+        *paused_idle_since = None;
+        BtSessionVerdict::Release {
+            after_paused_grace: true,
+        }
+    } else {
+        BtSessionVerdict::KeepPausedGrace {
+            just_armed,
+            remaining: grace - idle,
+        }
+    }
+}
 
 /// 从错误信息里提取 reqwest 的 HTTP 状态码。匹配 reqwest 的固定措辞
 /// `HTTP status client/server error (NNN ...)`（大小写不敏感查找 `http status`
@@ -1768,8 +1870,13 @@ pub struct DownloadManager {
     /// key = task_id，value = 已自动重试次数。
     /// 超过 `max_auto_retries` 后不再重试，保持 error 状态等用户手动恢复。
     auto_retry_counts: HashMap<String, u32>,
-    /// 上次落库做种时长的 unix 秒（`persist_seed_times` 节流用）。
-    last_seed_time_persist: std::sync::atomic::AtomicU64,
+    /// 上次落库做种时长的时刻（单调时钟）。`account_seeding_tick` 据此判定兜底
+    /// 落库是否到点，见 [`seed_times_persist_due`]。
+    last_seed_time_persist: Mutex<std::time::Instant>,
+    /// BT 会话进入「仅因暂停中的未完成任务而保活」空闲期的起点（内存级）。
+    /// `None` = 不在该空闲期。超过 [`BT_SESSION_PAUSED_IDLE_GRACE`] 后释放会话，
+    /// 见 [`decide_bt_session_release`]。
+    bt_paused_idle_since: Option<std::time::Instant>,
     /// System 代理模式下按系统代理指纹缓存的全局 client（见 `global_client`）。
     system_client: std::sync::Mutex<Option<(String, Client)>>,
     /// 用户可配的最大自动重试次数（config `max_auto_retries`）。
@@ -1962,7 +2069,8 @@ impl DownloadManager {
             occupied_queues: HashSet::new(),
             retry_scheduled: HashMap::new(),
             retry_pending_reported: 0,
-            last_seed_time_persist: std::sync::atomic::AtomicU64::new(0),
+            last_seed_time_persist: Mutex::new(std::time::Instant::now()),
+            bt_paused_idle_since: None,
             system_client: std::sync::Mutex::new(None),
             #[cfg(feature = "plugins")]
             plugin_manager: None,
@@ -3239,6 +3347,9 @@ impl DownloadManager {
     /// because `SharedBtSession::new` internally calls `Runtime::block_on`,
     /// which cannot be invoked from within an existing tokio runtime.
     async fn ensure_bt_session(&mut self) -> Result<(), downloader::DownloadError> {
+        // 任何经此入口的 BT 活动（新下载 / 恢复 / 重新挂载做种）都结束「仅暂停
+        // 任务保活」的空闲期，下一次空闲重新起算完整宽限。
+        self.bt_paused_idle_since = None;
         if self.bt_session.is_none() {
             let speed_limit = self.speed_limiter.limit();
             let upload_limit = self.upload_limit_bps;
@@ -3278,10 +3389,14 @@ impl DownloadManager {
     /// Periodically drive the seeding lifecycle:
     /// 1. rebalance active seeders against `seed_max_active`（promote/demote），
     /// 2. persist upload deltas and emit live upload stats,
-    /// 3. persist cumulative seeding time,
-    /// 4. stop seeders that reached the configured limits.
+    /// 3. accumulate seeding time in memory — it reaches the DB only alongside
+    ///    upload deltas, on seeding state transitions / shutdown, or via the
+    ///    30-minute fallback (see [`seed_times_persist_due`]),
+    /// 4. stop seeders that reached the configured limits,
+    /// 5. release the BT session once only paused incomplete tasks have held
+    ///    it for [`BT_SESSION_PAUSED_IDLE_GRACE`].
     ///
-    /// This is a cheap no-op when no BT session exists or nothing seeds.
+    /// This is a cheap no-op (zero I/O) when no BT session exists or nothing seeds.
     pub async fn tick_seeding_evaluation(&mut self) {
         self.reconcile_seeding_slots().await;
         let rows = self.account_seeding_tick().await;
@@ -3345,6 +3460,8 @@ impl DownloadManager {
         if had_stops {
             self.reconcile_seeding_slots().await;
         }
+        // 会话空闲宽限的周期复查点：复用本 tick，不新增宿主的 select 分支。
+        self.recheck_bt_session_paused_grace().await;
     }
 
     /// Rebalance active seeders against `seed_max_active`: promote queued
@@ -3412,29 +3529,57 @@ impl DownloadManager {
         }
     }
 
-    /// 做种时长账本是否到了落库时机（按 [`SEED_TIME_PERSIST_INTERVAL_SECS`] 节流），
-    /// 到点时顺带登记本次落库时刻。求值 tick 只有 5s 一次，异常退出最多多丢一个
-    /// 节流间隔的累计时长。
-    fn seed_times_due(&self) -> bool {
-        let now = chrono::Local::now().timestamp().max(0) as u64;
-        let last = self
+    /// 本 tick 是否该把做种时长快照一并落库：有上传增量（同事务顺带写）或距上次
+    /// 落库满 [`SEED_TIME_FALLBACK_PERSIST_INTERVAL`]。纯判定见
+    /// [`seed_times_persist_due`]；落库时刻由写库成功后的
+    /// [`Self::mark_seed_times_persisted`] 登记，写库失败时下个 tick 会重试。
+    fn seed_times_due(&self, has_upload_delta: bool) -> bool {
+        let last = *self
             .last_seed_time_persist
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if now.saturating_sub(last) < SEED_TIME_PERSIST_INTERVAL_SECS {
-            return false;
-        }
-        self.last_seed_time_persist
-            .store(now, std::sync::atomic::Ordering::Relaxed);
-        true
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        seed_times_persist_due(
+            has_upload_delta,
+            std::time::Instant::now(),
+            last,
+            SEED_TIME_FALLBACK_PERSIST_INTERVAL,
+        )
     }
 
-    /// 做种 tick 的统计与落库：所有活动做种者的上传增量（以及到点的做种时长快照）
-    /// 合并为**一个事务**写库，做种者的任务行用**一次批量读取**取回，随后为每个
-    /// 做种者发一条带实时上传速率的进度事件。
+    /// 登记做种时长刚刚落库（重置兜底计时）。
+    fn mark_seed_times_persisted(&self) {
+        *self
+            .last_seed_time_persist
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();
+    }
+
+    /// 正常关机结算：把所有活动做种者的内存累计做种时长落库。做种时长平时不按
+    /// 固定周期落库（见 [`SEED_TIME_FALLBACK_PERSIST_INTERVAL`]），关机是除状态迁移
+    /// 外最后的落库机会；崩溃/断电最多丢失一个兜底间隔的累计。
+    async fn flush_seed_times(&self) {
+        let Some(bt) = &self.bt_session else {
+            return;
+        };
+        let times = bt.seeding_manager().seed_time_snapshot().await;
+        if times.is_empty() {
+            return;
+        }
+        match self.db.apply_seeding_tick(&[], &times).await {
+            Ok(_) => self.mark_seed_times_persisted(),
+            Err(e) => log_info!("[manager] shutdown: persist seeding times error: {}", e),
+        }
+    }
+
+    /// 做种 tick 的统计与落库：所有活动做种者的上传增量合并为**一个事务**写库，
+    /// 做种时长快照仅在本轮本来就要写库或兜底到点时顺带写入同一事务；做种者的
+    /// 任务行用**一次批量读取**取回，随后为每个做种者发一条带实时上传速率与
+    /// 内存实时做种时长的进度事件。
     ///
     /// 上传累计用增量法，`tasks.uploaded_bytes` 在 librqbit 计数复位（暂停/恢复或
     /// 会话重建）后仍然正确；零增量不写库，但事件照发，上传速率归零能同步到 UI。
-    /// 返回的任务行已折入本轮写入的累计上传/做种时长，供限额求值直接使用。
+    /// 零上传且未到兜底点时整个 tick 不产生 DB 写（NAS 上休眠的 HDD 不被唤醒）。
+    /// 返回的任务行已折入本轮写入的累计上传与内存实时做种时长，供限额求值直接使用。
     async fn account_seeding_tick(&self) -> HashMap<String, TaskInfo> {
         let Some(ref bt) = self.bt_session else {
             return HashMap::new();
@@ -3483,17 +3628,22 @@ impl DownloadManager {
             .filter(|(_, delta, _)| *delta != 0)
             .map(|(id, delta, _)| (id.clone(), *delta))
             .collect();
-        let times: Vec<(String, i64)> = if self.seed_times_due() {
-            seeding_mgr.seed_time_snapshot().await
-        } else {
-            Vec::new()
-        };
-        let persisted = match self.db.apply_seeding_tick(&deltas, &times).await {
+        // 实时累计做种时长取内存值（`SeedingEntry` 里的墙钟累计）：UI 进度事件与
+        // 限额求值都读这份，不依赖落库频率；DB 行里的值只是上次落库时的快照。
+        let time_snapshot = seeding_mgr.seed_time_snapshot().await;
+        for (id, secs) in &time_snapshot {
+            if let Some(row) = rows.get_mut(id) {
+                row.seeding_time_secs = *secs;
+            }
+        }
+        // 时长只在「本 tick 本来就要写上传增量」或兜底到点时落库；零上传的空闲
+        // 做种既无增量也未到点，`apply_seeding_tick` 对空输入直接返回、不碰 DB。
+        let persist_times = self.seed_times_due(!deltas.is_empty());
+        let times: &[(String, i64)] = if persist_times { &time_snapshot } else { &[] };
+        let persisted = match self.db.apply_seeding_tick(&deltas, times).await {
             Ok(totals) => {
-                for (id, secs) in &times {
-                    if let Some(row) = rows.get_mut(id) {
-                        row.seeding_time_secs = *secs;
-                    }
+                if persist_times {
+                    self.mark_seed_times_persisted();
                 }
                 for (id, total) in totals {
                     if let Some(row) = rows.get_mut(&id) {
@@ -4301,55 +4451,116 @@ impl DownloadManager {
     /// Shuts down the multi-threaded librqbit runtime (DHT, UPnP, tracker
     /// connections) to eliminate idle CPU overhead.  The session is re-created
     /// transparently on the next BT download via `ensure_bt_session`.
+    ///
+    /// 仅因「暂停中的未完成任务」保活时不立即释放：拆会话连带丢句柄缓存与
+    /// swarm/tracker/DHT 状态，恢复就要付「重建会话 + add_torrent + fastresume
+    /// 采样校验 + peer 冷启动」的全额成本；保留会话则恢复只是 unpause。但永久
+    /// 保活会让 DHT 等定时器常驻、唤醒 NAS 上休眠的硬盘，所以只给
+    /// [`BT_SESSION_PAUSED_IDLE_GRACE`] 宽限，到期由
+    /// [`Self::recheck_bt_session_paused_grace`]（挂在做种求值 tick 上）释放。
+    /// 已完成任务不计入本判定（做种由 `has_seeders` 保活，做种关闭的完成任务不
+    /// 钉住会话），因此全部 BT 任务终态化后会话仍会立即按既有路径释放。
     async fn maybe_release_bt_session(&mut self) {
+        self.release_bt_session_if_idle(false).await;
+    }
+
+    /// 宽限复查点：仅当已进入「仅暂停任务保活」的空闲期时才复查，未进入时
+    /// （含无会话）是纯内存的 `Option` 判断，零 I/O。只负责宽限到期后的释放——
+    /// 其余释放时机仍由各事件驱动路径上的 [`Self::maybe_release_bt_session`] 决定。
+    async fn recheck_bt_session_paused_grace(&mut self) {
+        if self.bt_paused_idle_since.is_none() {
+            return;
+        }
+        self.release_bt_session_if_idle(true).await;
+    }
+
+    /// 收集 [`decide_bt_session_release`] 所需的保活来源。按代价由低到高短路：
+    /// 已有硬保活来源时不再计算后续项（尤其是要遍历句柄取 stats 的
+    /// `has_paused_incomplete`）。
+    async fn bt_session_holds(&self) -> BtSessionHolds {
+        let mut holds = BtSessionHolds {
+            active_download: self.active_tasks.values().any(|e| e.is_bt),
+            ..BtSessionHolds::default()
+        };
+        let Some(bt) = &self.bt_session else {
+            return holds;
+        };
+        if holds.busy_reason().is_none() {
+            holds.seeders = bt.has_seeders().await;
+        }
+        if holds.busy_reason().is_none() {
+            // BT tasks bypass the pending queue, so the queue guard is purely
+            // defensive in case the invariant changes in the future.
+            holds.queued = self.pending_queue.iter().any(|q| is_bt_url(&q.url));
+            // Detached `add_torrent` tasks hold an `Arc<Session>` that keeps the
+            // BT listening port bound; creating a new session while the old port
+            // is in use causes the next BT download to fail immediately.
+            holds.inflight_add = bt.has_inflight_adds();
+        }
+        if holds.busy_reason().is_none() {
+            holds.paused_incomplete = bt.has_paused_incomplete().await;
+        }
+        holds
+    }
+
+    /// [`Self::maybe_release_bt_session`] / [`Self::recheck_bt_session_paused_grace`]
+    /// 的共同实现。`periodic` 为 `true` 时来自 5s tick：不刷日志（日志落盘会成为
+    /// 空闲期的周期写），且仅在暂停宽限到期时才释放。
+    async fn release_bt_session_if_idle(&mut self, periodic: bool) {
         if self.bt_session.is_none() {
+            self.bt_paused_idle_since = None;
             return;
         }
-        // Keep the session alive if any BT tasks are actively downloading.
-        if self.active_tasks.values().any(|e| e.is_bt) {
-            return;
+        let holds = self.bt_session_holds().await;
+        let verdict = decide_bt_session_release(
+            holds,
+            &mut self.bt_paused_idle_since,
+            std::time::Instant::now(),
+            BT_SESSION_PAUSED_IDLE_GRACE,
+        );
+        match verdict {
+            BtSessionVerdict::Keep(reason) => {
+                if !periodic {
+                    match reason {
+                        BtSessionKeep::Seeders => {
+                            log_info!("[manager] deferring BT session release — seeders active");
+                        }
+                        BtSessionKeep::InflightAdd => log_info!(
+                            "[manager] deferring BT session release — detached add_torrent still in flight"
+                        ),
+                        BtSessionKeep::ActiveDownload | BtSessionKeep::QueuedTask => {}
+                    }
+                }
+                return;
+            }
+            BtSessionVerdict::KeepPausedGrace {
+                just_armed,
+                remaining,
+            } => {
+                if just_armed || !periodic {
+                    log_info!(
+                        "[manager] deferring BT session release — paused BT task(s) hold resume state ({}s idle grace left)",
+                        remaining.as_secs()
+                    );
+                }
+                return;
+            }
+            BtSessionVerdict::Release { after_paused_grace } => {
+                if after_paused_grace {
+                    log_info!(
+                        "[manager] only paused BT task(s) held the BT session for {}s — releasing BT session",
+                        BT_SESSION_PAUSED_IDLE_GRACE.as_secs()
+                    );
+                } else if periodic {
+                    // 周期复查不负责「无任何保活来源」的释放，交事件驱动路径。
+                    return;
+                } else {
+                    log_info!(
+                        "[manager] no BT task holds live or resume state — releasing BT session"
+                    );
+                }
+            }
         }
-        // Keep the session alive if any completed torrents are still seeding.
-        if let Some(ref bt) = self.bt_session
-            && bt.has_seeders().await
-        {
-            log_info!("[manager] deferring BT session release — seeders active");
-            return;
-        }
-        // Keep the session alive while any incomplete torrent sits paused with
-        // a cached handle.  拆会话连带丢句柄缓存与 swarm/tracker/DHT 状态，
-        // 恢复就要付「重建会话 + add_torrent + fastresume 采样校验 + peer
-        // 冷启动」的全额成本（数据越大越久）；保留会话则恢复只是
-        // unpause（Paused→Live，零校验、秒级）。空闲代价仅为 DHT 心跳与
-        // 停车的 runtime 线程；已完成任务不计入本判定（做种由上面的
-        // has_seeders 保活，做种关闭的完成任务不钉住会话），因此全部
-        // BT 任务终态化后会话仍会按既有路径释放。
-        if let Some(ref bt) = self.bt_session
-            && bt.has_paused_incomplete().await
-        {
-            log_info!(
-                "[manager] deferring BT session release — paused BT task(s) hold resume state"
-            );
-            return;
-        }
-        // BT tasks bypass the pending queue, so this guard is purely
-        // defensive in case the invariant changes in the future.
-        if self.pending_queue.iter().any(|q| is_bt_url(&q.url)) {
-            return;
-        }
-        // Keep the session alive while any detached `add_torrent` task is
-        // still running.  Those tasks hold an `Arc<Session>` that keeps the
-        // BT listening port bound; creating a new session while the old port
-        // is in use causes the next BT download to fail immediately.
-        if let Some(ref bt) = self.bt_session
-            && bt.has_inflight_adds()
-        {
-            log_info!(
-                "[manager] deferring BT session release — detached add_torrent still in flight"
-            );
-            return;
-        }
-        log_info!("[manager] no BT task holds live or resume state — releasing BT session");
         // Shut down on a background thread (same pattern as Drop) to avoid
         // blocking the actor loop while the librqbit runtime winds down.
         if let Some(bt) = self.bt_session.take() {
@@ -8449,6 +8660,8 @@ impl DownloadManager {
                 .await;
             return true;
         };
+        // 恢复做种也是 BT 活动：结束「仅暂停任务保活」的空闲期。
+        self.bt_paused_idle_since = None;
         let Some(handle) = bt.cached_handle(task_id).await else {
             // 重启后句柄丢失：从磁盘已有数据重新挂载（初检可能耗时数分钟，
             // 不能阻塞 actor），期间以排队做种态提示校验中。
@@ -8922,6 +9135,8 @@ impl DownloadManager {
 
     /// 取消所有在途任务并等待下载 task 与 BT/DHT 持久化退出。
     pub async fn shutdown(&mut self) {
+        // 做种时长平时只在状态迁移/顺带写/30 分钟兜底时落库，正常关机在此结算。
+        self.flush_seed_times().await;
         let mut handles = Vec::new();
         for (_task_id, entry) in self.active_tasks.drain() {
             entry.token.cancel();
@@ -9809,8 +10024,10 @@ impl DownloadManager {
             // 条目状态刚被改写为「已下载」，重播一次条目流让 UI 立即反映，
             // 并把合批通知标题挂在同一条事件上（宿主弹一条通知，不是 N 条）。
             self.rss.broadcast_items(&source_id, notified).await;
-            self.rss.broadcast_sources().await;
         }
+        // 不论是否通知都重读一次未读计数：无变化的后续拉取只推内存镜像，
+        // 这里不刷新的话 badge 会一直计入已转为下载的条目。
+        self.rss.broadcast_sources().await;
     }
 
     /// `.torrent` 字节到手 → 建**真正的 BT 任务**（见
@@ -13861,5 +14078,134 @@ mod tests {
             vec![("q".to_string(), false)],
             "start == stop resolves to stop"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // decide_bt_session_release — 暂停任务保活宽限
+    // -----------------------------------------------------------------------
+
+    const GRACE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+    fn paused_only() -> BtSessionHolds {
+        BtSessionHolds {
+            paused_incomplete: true,
+            ..BtSessionHolds::default()
+        }
+    }
+
+    #[test]
+    fn paused_only_session_is_kept_for_grace_then_released() {
+        let t0 = std::time::Instant::now();
+        let mut since = None;
+
+        // 首次观察起算宽限，不释放。
+        let first = decide_bt_session_release(paused_only(), &mut since, t0, GRACE);
+        assert!(matches!(
+            first,
+            BtSessionVerdict::KeepPausedGrace {
+                just_armed: true,
+                ..
+            }
+        ));
+        assert_eq!(since, Some(t0));
+
+        // 宽限内：仍保留，起点不动，剩余时间递减。
+        let mid = t0 + GRACE - std::time::Duration::from_secs(1);
+        match decide_bt_session_release(paused_only(), &mut since, mid, GRACE) {
+            BtSessionVerdict::KeepPausedGrace {
+                just_armed,
+                remaining,
+            } => {
+                assert!(!just_armed);
+                assert_eq!(remaining, std::time::Duration::from_secs(1));
+            }
+            other => panic!("expected grace keep, got {other:?}"),
+        }
+        assert_eq!(since, Some(t0));
+
+        // 到期：释放，并清掉起点。
+        assert_eq!(
+            decide_bt_session_release(paused_only(), &mut since, t0 + GRACE, GRACE),
+            BtSessionVerdict::Release {
+                after_paused_grace: true
+            }
+        );
+        assert_eq!(since, None);
+    }
+
+    #[test]
+    fn bt_activity_keeps_session_and_resets_grace() {
+        let t0 = std::time::Instant::now();
+        let busy_cases = [
+            (
+                BtSessionHolds {
+                    active_download: true,
+                    ..paused_only()
+                },
+                BtSessionKeep::ActiveDownload,
+            ),
+            (
+                BtSessionHolds {
+                    seeders: true,
+                    ..paused_only()
+                },
+                BtSessionKeep::Seeders,
+            ),
+            (
+                BtSessionHolds {
+                    queued: true,
+                    ..paused_only()
+                },
+                BtSessionKeep::QueuedTask,
+            ),
+            (
+                BtSessionHolds {
+                    inflight_add: true,
+                    ..paused_only()
+                },
+                BtSessionKeep::InflightAdd,
+            ),
+        ];
+        for (holds, reason) in busy_cases {
+            // 已经空闲了很久（宽限早已超时）时出现 BT 活动：不能释放，且起点被清。
+            let mut since = Some(t0);
+            let verdict = decide_bt_session_release(holds, &mut since, t0 + GRACE * 4, GRACE);
+            assert_eq!(verdict, BtSessionVerdict::Keep(reason));
+            assert_eq!(since, None, "{reason:?} must clear the idle start");
+        }
+
+        // 活动结束后重新暂停：宽限从头起算，而不是沿用旧起点立即释放。
+        let mut since = Some(t0);
+        let _ = decide_bt_session_release(
+            BtSessionHolds {
+                active_download: true,
+                ..BtSessionHolds::default()
+            },
+            &mut since,
+            t0 + GRACE * 2,
+            GRACE,
+        );
+        let repaused = t0 + GRACE * 2 + std::time::Duration::from_secs(10);
+        assert!(matches!(
+            decide_bt_session_release(paused_only(), &mut since, repaused, GRACE),
+            BtSessionVerdict::KeepPausedGrace {
+                just_armed: true,
+                ..
+            }
+        ));
+        assert_eq!(since, Some(repaused));
+    }
+
+    #[test]
+    fn session_without_any_hold_is_released_immediately() {
+        let t0 = std::time::Instant::now();
+        let mut since = Some(t0);
+        assert_eq!(
+            decide_bt_session_release(BtSessionHolds::default(), &mut since, t0, GRACE),
+            BtSessionVerdict::Release {
+                after_paused_grace: false
+            }
+        );
+        assert_eq!(since, None);
     }
 }

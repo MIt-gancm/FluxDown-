@@ -261,6 +261,14 @@ fn hex_val(b: u8) -> Option<u8> {
 /// long-running `spawn_blocking` work (completion moves, full re-verification).
 const BT_MAX_BLOCKING_THREADS: usize = 64;
 
+/// DHT 路由表（`dht.json`）的落盘间隔。
+///
+/// librqbit 默认每 60s 重写一次 `dht.json`（临时文件 + rename）。路由表只是
+/// 加速下次引导的缓存，丢几十分钟的增量无关紧要；但 60s 周期写盘会让 NAS
+/// 上休眠的 HDD 在会话存活期间永远无法休眠。拉长到 30 分钟，与做种时长的兜底
+/// 落库周期同量级。
+const DHT_PERSIST_DUMP_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
 /// Well-known public trackers used to accelerate peer discovery for magnet
 /// links that ship without `tr=` parameters.
 ///
@@ -687,7 +695,7 @@ impl SharedBtSession {
                 ]),
                 persistence: Some(librqbit::dht::DhtPersistenceConfig {
                     config_filename: Some(dht_config_path.clone()),
-                    ..Default::default()
+                    dump_interval: Some(DHT_PERSIST_DUMP_INTERVAL),
                 }),
                 ..Default::default()
             }),
@@ -1158,7 +1166,8 @@ impl SharedBtSession {
     /// 就得重走 add_torrent + fastresume 采样校验 + peer swarm 冷启动；保留
     /// 会话则恢复只是 unpause（Paused→Live，零校验、秒级）。已完成的
     /// torrent 不计入——做种由 `has_seeders` 单独保活，做种关闭的完成任务
-    /// 不应钉住会话。
+    /// 不应钉住会话。保活并非永久：download_manager 只在该来源独占的空闲期内
+    /// 保留会话（15 分钟宽限），超时后释放，恢复走完整重建路径。
     pub async fn has_paused_incomplete(&self) -> bool {
         let handles: Vec<BtHandle> = self.handles.lock().await.values().cloned().collect();
         handles.iter().any(|h| {

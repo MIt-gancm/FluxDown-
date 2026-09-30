@@ -318,7 +318,7 @@ export function SourceEditor({
             <Input value={form.name} placeholder={t('rssNameHint')} onChange={(event) => patch({ name: event.target.value })} />
           </FormField>
           <FormRow>
-            <FormField label={t('rssIntervalLabel')}>
+            <FormField label={t('rssIntervalLabel')} hint={t('rssIntervalHint')}>
               <Select value={String(form.interval)} options={intervalOptions} onValueChange={(value) => patch({ interval: Number(value) })} />
             </FormField>
             <FormField label={t('rssQueueLabel')}>

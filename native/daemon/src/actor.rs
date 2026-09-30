@@ -192,6 +192,8 @@ pub enum ActorOperation {
         guid: String,
         action: String,
     },
+    /// 订阅列表：重读库（未读计数）并叠加内存运行态（上次检查时间等只在内存前进）。
+    RssListSources,
     RssValidate {
         url: String,
         cookies: String,
@@ -224,6 +226,7 @@ pub enum ActorResult {
     #[cfg(feature = "plugins")]
     ResolvePreview(ResolvePreviewOutcome),
     RssValidation(Box<RssValidateOutcome>),
+    RssSources(Vec<RssSourceInfo>),
     WebhookDeliveries(Vec<fluxdown_engine::webhook::WebhookDelivery>),
     WebhookSimulation(usize),
     WebhookTest(Box<fluxdown_engine::webhook::WebhookDelivery>),
@@ -437,7 +440,12 @@ async fn run_actor(
                 engine.manager.delete_tasks_batch(&ids, false).await;
                 engine.manager.send_tasks_snapshot().await;
             }
-            _ = file_scan.tick() => engine.manager.spawn_file_scan(),
+            _ = file_scan.tick() => {
+                // 完全空闲且 idle_file_scan 关闭时跳过，避免周期性唤醒 NAS 硬盘。
+                if engine.manager.should_run_idle_scan() {
+                    engine.manager.spawn_file_scan();
+                }
+            }
             _ = queue_schedule.tick() => engine.manager.tick_queue_schedules().await,
             _ = rss_poll.tick() => engine.manager.tick_rss_sources(),
             event = receive_rss_event(&mut rss_events), if rss_events.is_some() => {
@@ -887,6 +895,12 @@ async fn execute_operation(
         }
         #[cfg(feature = "plugins")]
         ActorOperation::ResolvePreview { .. } => unreachable!("handled off actor"),
+        ActorOperation::RssListSources => {
+            engine.manager.rss.load().await;
+            return Ok(ActorResult::RssSources(
+                engine.manager.rss.sources().to_vec(),
+            ));
+        }
         ActorOperation::RssCreate { source } => {
             let id = engine
                 .manager
@@ -1180,10 +1194,9 @@ fn now_unix_secs() -> i64 {
 async fn cdn_reports_peek(engine: &mut Engine) -> Result<ActorResult, ActorError> {
     if let Some(raw) = engine
         .db
-        .get_config("cdn_report_lease")
+        .peek_cdn_report_lease()
         .await
         .map_err(|error| ActorError::Operation(format!("{error:#}")))?
-        .filter(|value| !value.trim().is_empty())
     {
         let lease = serde_json::from_str::<fluxdown_protocol::CdnReportLeaseDto>(&raw)
             .map_err(|error| ActorError::Operation(format!("{error:#}")))?;
@@ -1233,6 +1246,20 @@ async fn apply_cdn_config(
             "unsupported CDN config key: {key}"
         )));
     }
+    // 只写与当前值不同的键：未变化时不产生任何 DB 写（避免空闲周期 fsync 唤醒硬盘）。
+    let current = engine
+        .db
+        .get_all_config()
+        .await
+        .map_err(|error| ActorError::Operation(format!("{error:#}")))?;
+    let changed: BTreeMap<String, String> = values
+        .into_iter()
+        .filter(|(key, value)| current.get(key) != Some(value))
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let values = changed;
     engine
         .db
         .set_config_batch_atomic(&values)
@@ -1546,6 +1573,12 @@ async fn apply_live_config<'a>(
         engine.manager.set_missing_file_auto_delete(
             all.get("file_missing_action")
                 .is_some_and(|value| value == "delete"),
+        );
+    }
+    if keys.contains(&"idle_file_scan") {
+        engine.manager.set_idle_file_scan(
+            all.get("idle_file_scan")
+                .is_some_and(|value| value == "true" || value == "1"),
         );
     }
     if keys.contains(&"global_user_agent")

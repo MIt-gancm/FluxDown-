@@ -116,6 +116,8 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
         DaemonConfigKind::Enum(FILE_MISSING_ACTIONS),
         "keep",
     ),
+    // 空闲（无活动/排队任务）时是否仍执行周期性文件跟踪扫描；默认关闭以免唤醒 NAS 硬盘。
+    field("idle_file_scan", DaemonConfigKind::Bool, "false"),
     field("global_user_agent", DaemonConfigKind::Text, ""),
     field("default_queue_id", DaemonConfigKind::Text, ""),
     field("domain_conn_caps", DaemonConfigKind::ReadOnly, ""),

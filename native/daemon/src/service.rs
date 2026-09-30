@@ -564,15 +564,16 @@ impl DaemonService {
                 to_value(match_site_auth(&json, &params.url))
             }
             method::DAEMON_RSS_LIST_SOURCES => {
-                let sources = self
-                    .db
-                    .load_all_rss_sources()
-                    .await
-                    .map_err(|error| internal_error(format!("{error:#}")))?
-                    .into_iter()
-                    .map(fluxdown_engine_protocol::rss_source_info_to_dto)
-                    .collect::<Vec<_>>();
-                to_value(sources)
+                match self.actor.execute(ActorOperation::RssListSources).await {
+                    Ok(ActorResult::RssSources(sources)) => to_value(
+                        sources
+                            .into_iter()
+                            .map(fluxdown_engine_protocol::rss_source_info_to_dto)
+                            .collect::<Vec<_>>(),
+                    ),
+                    Ok(_) => Err(internal_error("unexpected actor result".to_owned())),
+                    Err(error) => Err(actor_error(error)),
+                }
             }
             method::DAEMON_RSS_GET_ITEMS => {
                 let params = parse_params::<RssSourceIdParams>(params)?;

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fs2::FileExt;
 use sqlx::Any;
@@ -568,6 +569,8 @@ fn acquire_engine_file_lease(data_dir: &Path) -> Result<EngineWriteGuard, DbErro
 pub struct Db {
     pool: sqlx::AnyPool,
     backend: Backend,
+    /// CDN 上传租约已知为空的内存缓存，空闲 peek 据此免读数据库。
+    cdn_lease_known_empty: Arc<AtomicBool>,
     activity_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -898,8 +901,16 @@ impl Db {
         } else {
             5
         };
-        let pool = AnyPoolOptions::new()
-            .max_connections(max_connections)
+        let mut options = AnyPoolOptions::new().max_connections(max_connections);
+        if backend == Backend::Sqlite {
+            // 常驻一条连接且不回收：最后一条连接关闭会触发 checkpoint 并删除
+            // -wal/-shm，之后下次查询重建，空闲时周期性唤醒 NAS 硬盘。
+            options = options
+                .min_connections(1)
+                .idle_timeout(None)
+                .max_lifetime(None);
+        }
+        let pool = options
             .after_connect(|conn, _meta| {
                 Box::pin(async move {
                     if conn.backend_name() == "SQLite" {
@@ -914,6 +925,7 @@ impl Db {
             pool,
             backend,
             activity_lock: Arc::new(tokio::sync::Mutex::new(())),
+            cdn_lease_known_empty: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -2492,6 +2504,7 @@ impl Db {
 
     /// 返回现有 CDN 上传租约，或原子写入新租约并清空旧 pending 快照。
     pub async fn lease_cdn_reports(&self, lease_json: &str) -> Result<String, DbError> {
+        self.cdn_lease_known_empty.store(false, Ordering::Release);
         let mut transaction = self.begin_write().await?;
         let existing: Option<String> =
             sqlx::query_scalar("SELECT value FROM config WHERE key = 'cdn_report_lease'")
@@ -2543,7 +2556,23 @@ impl Db {
             .execute(&mut *transaction)
             .await?;
         transaction.commit().await?;
+        self.cdn_lease_known_empty.store(true, Ordering::Release);
         Ok(true)
+    }
+
+    /// 读取当前 CDN 上传租约；已知为空时直接返回 None，不触碰数据库。
+    pub async fn peek_cdn_report_lease(&self) -> Result<Option<String>, DbError> {
+        if self.cdn_lease_known_empty.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let lease = self
+            .get_config("cdn_report_lease")
+            .await?
+            .filter(|value| !value.trim().is_empty());
+        if lease.is_none() {
+            self.cdn_lease_known_empty.store(true, Ordering::Release);
+        }
+        Ok(lease)
     }
 
     /// Delete a config entry by key.
@@ -2672,9 +2701,9 @@ impl Db {
             // 仅标记 file_missing）；"delete" = 扫描到文件消失后自动删除任务记录。
             ("file_missing_action", "keep"),
             // 空闲（无活跃/排队任务）时是否仍执行周期性文件跟踪扫描：
-            // "1" = 照常扫描（默认，现状）；"0" = 完全空闲期跳过定时扫描，
-            // 避免不必要地唤醒 NAS/网络盘；窗口聚焦、手动重扫不受影响。
-            ("idle_file_scan", "1"),
+            // "0" = 完全空闲期跳过定时扫描（默认，避免唤醒 NAS 休眠硬盘）；
+            // "1"/"true" = 照常扫描。窗口聚焦、手动重扫不受影响。
+            ("idle_file_scan", "0"),
             // 自动重试：-1=无限，0=关闭，1..10=次数。延迟（秒）固定基值×已重试次数。
             ("max_auto_retries", "3"),
             ("auto_retry_delay_secs", "5"),
@@ -2753,6 +2782,30 @@ impl Db {
             .execute(&self.pool)
             .await?;
         }
+        self.migrate_idle_file_scan_default_off().await
+    }
+
+    /// 一次性迁移：`idle_file_scan` 曾以 "1" 播种却从未被 daemon 读取/暴露，
+    /// 现默认改为关闭。仅在迁移标记首次写入成功时把遗留的 "1"/"true" 改为 "0"，
+    /// 此后用户自行设置的值不再被覆盖。标记与改值在同一事务。
+    async fn migrate_idle_file_scan_default_off(&self) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let marked = sqlx::query(
+            "INSERT INTO config (key, value) VALUES ('migration_idle_file_scan_off', '1')
+             ON CONFLICT (key) DO NOTHING",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if marked > 0 {
+            sqlx::query(
+                "UPDATE config SET value = '0'
+                 WHERE key = 'idle_file_scan' AND value IN ('1', 'true')",
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -7387,6 +7440,57 @@ mod tests {
         assert_eq!(
             db.get_config("cdn_report_lease").await.expect("read"),
             Some(String::new())
+        );
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn peek_cdn_lease_caches_empty_and_tracks_lease_changes() {
+        let (db, dir) = open_test_db().await;
+        assert_eq!(db.peek_cdn_report_lease().await.expect("peek"), None);
+        // 已缓存为空：即便绕过 Db API 直接写库，peek 也不再读库。
+        db.set_config("cdn_report_lease", "{\"batchId\":\"x\"}")
+            .await
+            .expect("raw write");
+        assert_eq!(db.peek_cdn_report_lease().await.expect("cached"), None);
+        // 经 lease API 写入后缓存失效。
+        db.set_config("cdn_report_lease", "").await.expect("reset");
+        let lease = r#"{"batchId":"b1","samples":[]}"#;
+        db.lease_cdn_reports(lease).await.expect("lease");
+        assert_eq!(
+            db.peek_cdn_report_lease().await.expect("peek"),
+            Some(lease.to_owned())
+        );
+        assert!(db.ack_cdn_report_lease("b1").await.expect("ack"));
+        assert_eq!(db.peek_cdn_report_lease().await.expect("peek"), None);
+        close_test_db(&db, dir).await;
+    }
+
+    #[tokio::test]
+    async fn idle_file_scan_legacy_seed_migrates_once() {
+        let (db, dir) = open_test_db().await;
+        // 新库：默认关闭。
+        db.init_default_config("/tmp").await.expect("init");
+        assert_eq!(
+            db.get_config("idle_file_scan").await.expect("read"),
+            Some("0".to_owned())
+        );
+        // 模拟旧库：值为 "1" 且尚无迁移标记。
+        db.delete_config("migration_idle_file_scan_off")
+            .await
+            .expect("drop marker");
+        db.set_config("idle_file_scan", "1").await.expect("legacy");
+        db.init_default_config("/tmp").await.expect("migrate");
+        assert_eq!(
+            db.get_config("idle_file_scan").await.expect("read"),
+            Some("0".to_owned())
+        );
+        // 迁移后用户自行开启，再次启动不得被改回。
+        db.set_config("idle_file_scan", "true").await.expect("user");
+        db.init_default_config("/tmp").await.expect("restart");
+        assert_eq!(
+            db.get_config("idle_file_scan").await.expect("read"),
+            Some("true".to_owned())
         );
         close_test_db(&db, dir).await;
     }

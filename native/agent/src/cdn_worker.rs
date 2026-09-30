@@ -124,6 +124,10 @@ impl CdnWorker {
     }
 
     async fn upload_reports(&self) -> Result<(), WorkerError> {
+        // 云端上报接口需要登录；未登录时不触达 daemon（避免空闲周期性读库）。
+        if !self.cloud.is_authenticated().await {
+            return Ok(());
+        }
         let lease: Option<CdnReportLeaseDto> = self
             .daemon
             .call::<Value, Option<CdnReportLeaseDto>>(

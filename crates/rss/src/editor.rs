@@ -694,7 +694,7 @@ impl Editor {
                 },
                 cx,
             ),
-            None,
+            Some(self.t("rssIntervalHint", cx)),
             cx,
         );
         let queue_field = form_field(

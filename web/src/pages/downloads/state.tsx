@@ -28,6 +28,7 @@ import type {
   TaskRuntimeDto,
 } from '../../lib/rpc'
 import { CategoryIndex, categoriesFromPreference } from './model/categories'
+import { RescanThrottle } from '../../lib/rescanThrottle'
 import { currentDeviceId, visibleRemoteTasks } from './model/devices'
 import { filterMatches, LOCAL_DEVICE, SELECTION_ALL } from './model/filters'
 import type { SidebarSelection } from './model/filters'
@@ -265,6 +266,37 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const phase = useConnection().phase
   const live = useLiveSpeeds()
   const connected = phase === 'ready' && daemonConnected
+
+  // 页面可见 / 连接就绪时重扫已完成文件（daemon 空闲不再定时扫描）；节流镜像 GPUI RescanThrottle。
+  const rescanThrottle = useRef(new RescanThrottle())
+  const rescanTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    if (!connected) return
+    const fire = () => {
+      rpc.daemon.task.rescan().catch(() => {})
+    }
+    const request = () => {
+      if (document.visibilityState !== 'visible') return
+      const decision = rescanThrottle.current.request(Date.now())
+      if (decision.kind === 'now') fire()
+      else if (decision.kind === 'after') {
+        rescanTimer.current = setTimeout(() => {
+          rescanTimer.current = null
+          rescanThrottle.current.trailingFired(Date.now())
+          fire()
+        }, decision.delayMs)
+      }
+    }
+    request()
+    document.addEventListener('visibilitychange', request)
+    return () => document.removeEventListener('visibilitychange', request)
+  }, [connected])
+  useEffect(
+    () => () => {
+      if (rescanTimer.current !== null) clearTimeout(rescanTimer.current)
+    },
+    [],
+  )
 
   const { prefs, updatePrefs } = useViewPrefsState()
   const [sidebarSelection, setSidebarSelectionState] = useState<SidebarSelection>(SELECTION_ALL)

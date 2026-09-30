@@ -136,6 +136,11 @@ fn behavior_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
             ctx.daemon_enum_dropdown("file_missing_action", "fileMissing"),
         ))
         .row(ctx.item(
+            "idleFileScan",
+            Some("idleFileScanDesc"),
+            ctx.daemon_switch("idle_file_scan"),
+        ))
+        .row(ctx.item(
             "defaultQueueSetting",
             Some("defaultQueueSettingDesc"),
             default_queue_control(ctx, cx),

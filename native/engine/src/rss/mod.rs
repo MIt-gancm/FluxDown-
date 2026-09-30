@@ -292,9 +292,18 @@ impl RssManager {
 
     /// 从 DB 装载全部订阅到内存镜像。由 [`crate::Engine::new`] 调用，宿主无需
     /// 记得这一步。
+    ///
+    /// 重新装载时，已在内存里的订阅其**运行态列**（抓取时间戳 / 错误 / 退避 /
+    /// 首轮标记）以内存为准：无语义变化的抓取只更新内存不落库（见
+    /// [`RssManager::record_runtime`]），DB 里的运行态可能偏旧，直接覆盖会把
+    /// due 判定回退成「立刻再抓一次」。其余字段（用户可编辑列、未读数）以 DB
+    /// 为准。
     pub async fn load(&mut self) {
         match self.db.load_all_rss_sources().await {
-            Ok(sources) => self.sources = sources,
+            Ok(mut fresh) => {
+                merge_runtime_from_memory(&mut fresh, &self.sources);
+                self.sources = fresh;
+            }
             Err(e) => log_error!("[rss] failed to load sources: {}", e),
         }
     }
@@ -317,6 +326,11 @@ impl RssManager {
     /// 广播订阅列表（含未读计数，重新读库以刷新 badge）。
     pub async fn broadcast_sources(&mut self) {
         self.load().await;
+        self.emit_sources_snapshot();
+    }
+
+    /// 直接用内存镜像推订阅列表快照，不读库。
+    fn emit_sources_snapshot(&self) {
         self.sink
             .emit(EngineEvent::RssSourcesChanged(self.sources.clone()));
     }
@@ -380,12 +394,14 @@ impl RssManager {
             // 让下一次 tick 立即重抓（与新建路径一致）。
             self.persist_runtime(
                 &source.source_id,
-                0,
-                old.last_success_at,
-                "",
-                0,
-                seeded,
-                &source.name,
+                &RuntimeUpdate {
+                    last_fetch_at: 0,
+                    last_success_at: old.last_success_at,
+                    last_error: String::new(),
+                    fail_count: 0,
+                    seeded,
+                    name: source.name.clone(),
+                },
             )
             .await;
         }
@@ -754,17 +770,24 @@ impl RssManager {
                 source.display_name(),
                 outcome.error
             );
-            self.persist_runtime(
-                &source.source_id,
-                now,
-                source.last_success_at,
-                &outcome.error,
-                fail_count,
-                source.seeded,
-                &source.name,
-            )
-            .await;
-            self.broadcast_sources().await;
+            let persisted = self
+                .record_runtime(
+                    &source.source_id,
+                    RuntimeUpdate {
+                        last_fetch_at: now,
+                        last_success_at: source.last_success_at,
+                        last_error: outcome.error.clone(),
+                        fail_count,
+                        seeded: source.seeded,
+                        name: source.name.clone(),
+                    },
+                )
+                .await;
+            if persisted {
+                self.broadcast_sources().await;
+            } else {
+                self.emit_sources_snapshot();
+            }
             return Vec::new();
         }
 
@@ -860,10 +883,12 @@ impl RssManager {
         if let Err(e) = self.db.insert_rss_items(&rows).await {
             log_error!("[rss] persist items failed: {}", e);
         }
-        if let Err(e) = self
-            .db
-            .prune_rss_items(&source.source_id, MAX_ITEMS_PER_SOURCE)
-            .await
+        // 没有新条目就不会超量，省掉一次空 DELETE（仍要扫 rss_items 索引）。
+        if fresh > 0
+            && let Err(e) = self
+                .db
+                .prune_rss_items(&source.source_id, MAX_ITEMS_PER_SOURCE)
+                .await
         {
             log_error!("[rss] prune items failed: {}", e);
         }
@@ -874,7 +899,18 @@ impl RssManager {
         } else {
             source.name.clone()
         };
-        self.persist_runtime(&source.source_id, now, now, "", 0, true, &name)
+        let persisted = self
+            .record_runtime(
+                &source.source_id,
+                RuntimeUpdate {
+                    last_fetch_at: now,
+                    last_success_at: now,
+                    last_error: String::new(),
+                    fail_count: 0,
+                    seeded: true,
+                    name,
+                },
+            )
             .await;
 
         // 派发：`New` 状态的条目按发布时间从旧到新取，单轮不超过上限。
@@ -905,7 +941,14 @@ impl RssManager {
         if fresh > 0 || backfilled > 0 || resolver_backfilled > 0 || !plans.is_empty() {
             self.broadcast_items(&source.source_id, Vec::new()).await;
         }
-        self.broadcast_sources().await;
+        if persisted || fresh > 0 || backfilled > 0 || resolver_backfilled > 0 || !plans.is_empty()
+        {
+            self.broadcast_sources().await;
+        } else {
+            // 纯时间戳前进：DB 没动，未读数也没变，直接从内存镜像推快照，
+            // 既让 UI「上次检查」前进，又不必为此重读库。
+            self.emit_sources_snapshot();
+        }
         plans
     }
 
@@ -953,39 +996,99 @@ impl RssManager {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn persist_runtime(
-        &mut self,
-        source_id: &str,
-        last_fetch_at: i64,
-        last_success_at: i64,
-        last_error: &str,
-        fail_count: i32,
-        seeded: bool,
-        name: &str,
-    ) {
+    /// 回写运行态并同步内存镜像（无条件落库）。用于编辑订阅后的重置等
+    /// 必须让 DB 立即反映的场景；抓取回流走 [`Self::record_runtime`]。
+    async fn persist_runtime(&mut self, source_id: &str, update: &RuntimeUpdate) {
         if let Err(e) = self
             .db
             .set_rss_source_runtime(
                 source_id,
-                last_fetch_at,
-                last_success_at,
-                last_error,
-                fail_count,
-                seeded,
-                name,
+                update.last_fetch_at,
+                update.last_success_at,
+                &update.last_error,
+                update.fail_count,
+                update.seeded,
+                &update.name,
             )
             .await
         {
             log_error!("[rss] persist runtime failed: {}", e);
         }
+        self.apply_runtime_to_memory(source_id, update);
+    }
+
+    /// 抓取回流的运行态回写：**仅语义变化时落库**，纯时间戳前进只更新内存。
+    ///
+    /// NAS 空闲静默：定时拉取若没有新条目、错误/退避/名称/首轮标记都没变，
+    /// 每次只会把 `last_fetch_at`/`last_success_at` 往前推——为此写一次
+    /// SQLite（WAL 回写会唤醒休眠硬盘）毫无收益。内存镜像始终是最新值
+    /// （due 判定与 UI「上次检查」都读它，见 [`RssManager::load`] 的合并），
+    /// 下次有语义变化的落库会把累计的时间戳一并带上。
+    ///
+    /// 代价：进程重启后 DB 里的时间戳可能偏旧，该源会被判定为到期并立即多
+    /// 拉一次，然后恢复正常节奏——可接受。
+    ///
+    /// 返回是否真的写了库。
+    async fn record_runtime(&mut self, source_id: &str, update: RuntimeUpdate) -> bool {
+        let needs_persist = self
+            .source(source_id)
+            .is_none_or(|old| runtime_needs_persist(old, &update));
+        if needs_persist {
+            self.persist_runtime(source_id, &update).await;
+        } else {
+            self.apply_runtime_to_memory(source_id, &update);
+        }
+        needs_persist
+    }
+
+    fn apply_runtime_to_memory(&mut self, source_id: &str, update: &RuntimeUpdate) {
         if let Some(s) = self.sources.iter_mut().find(|s| s.source_id == source_id) {
-            s.last_fetch_at = last_fetch_at;
-            s.last_success_at = last_success_at;
-            s.last_error = last_error.to_string();
-            s.fail_count = fail_count;
-            s.seeded = seeded;
-            s.name = name.to_string();
+            s.last_fetch_at = update.last_fetch_at;
+            s.last_success_at = update.last_success_at;
+            s.last_error.clone_from(&update.last_error);
+            s.fail_count = update.fail_count;
+            s.seeded = update.seeded;
+            s.name.clone_from(&update.name);
+        }
+    }
+}
+
+/// 一次抓取/重置后要回写的运行态列（对应 `rss_sources` 的运行列）。
+struct RuntimeUpdate {
+    last_fetch_at: i64,
+    last_success_at: i64,
+    last_error: String,
+    fail_count: i32,
+    seeded: bool,
+    name: String,
+}
+
+/// 运行态回写是否有「语义变化」需要落库（纯函数）。
+///
+/// 不算语义变化的：`last_fetch_at`/`last_success_at` 前进（仅影响 due 判定与
+/// UI 显示，内存里始终保持最新）；`fail_count` 增长但生效退避间隔不变（已
+/// 封顶，或用户配置间隔本就高于封顶）——退避行为重启前后等价，只是重启后
+/// UI 上的「连续失败 n 次」可能比内存里少。
+/// 算变化的：错误文本、首轮标记、订阅名、生效退避间隔。
+fn runtime_needs_persist(old: &RssSourceInfo, update: &RuntimeUpdate) -> bool {
+    if old.last_error != update.last_error || old.seeded != update.seeded || old.name != update.name
+    {
+        return true;
+    }
+    let mut next = old.clone();
+    next.fail_count = update.fail_count;
+    effective_interval_secs(old) != effective_interval_secs(&next)
+}
+
+/// 把内存镜像里的运行态列覆盖到刚从 DB 装载的订阅上（按 `source_id` 匹配）。
+fn merge_runtime_from_memory(fresh: &mut [RssSourceInfo], memory: &[RssSourceInfo]) {
+    for s in fresh {
+        if let Some(mem) = memory.iter().find(|m| m.source_id == s.source_id) {
+            s.last_fetch_at = mem.last_fetch_at;
+            s.last_success_at = mem.last_success_at;
+            s.last_error.clone_from(&mem.last_error);
+            s.fail_count = mem.fail_count;
+            s.seeded = mem.seeded;
         }
     }
 }
@@ -1279,12 +1382,119 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{
-        MAX_BACKOFF_SECS, due_sources, effective_interval_secs, feed_origin,
-        fetch_with_auto_failover, plan_for, rule_of, runtime_reset_on_update,
-        torrent_retry_delay_secs, url_looks_like_torrent,
+        MAX_BACKOFF_SECS, RuntimeUpdate, due_sources, effective_interval_secs, feed_origin,
+        fetch_with_auto_failover, plan_for, rule_of, runtime_needs_persist,
+        runtime_reset_on_update, torrent_retry_delay_secs, url_looks_like_torrent,
     };
     use crate::proxy_config::{ProxyConfig, ProxyMode};
     use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
+
+    fn mem_source(fail_count: i32, last_error: &str) -> RssSourceInfo {
+        RssSourceInfo {
+            source_id: "s1".to_string(),
+            name: "feed".to_string(),
+            interval_minutes: 30,
+            seeded: true,
+            fail_count,
+            last_error: last_error.to_string(),
+            last_fetch_at: 100,
+            last_success_at: 100,
+            ..Default::default()
+        }
+    }
+
+    fn update_of(old: &RssSourceInfo) -> RuntimeUpdate {
+        RuntimeUpdate {
+            last_fetch_at: old.last_fetch_at + 1800,
+            last_success_at: old.last_success_at + 1800,
+            last_error: old.last_error.clone(),
+            fail_count: old.fail_count,
+            seeded: old.seeded,
+            name: old.name.clone(),
+        }
+    }
+
+    #[test]
+    fn healthy_refetch_with_only_timestamps_advancing_is_not_persisted() {
+        let old = mem_source(0, "");
+        assert!(!runtime_needs_persist(&old, &update_of(&old)));
+    }
+
+    #[test]
+    fn semantic_runtime_changes_are_persisted() {
+        let healthy = mem_source(0, "");
+
+        let mut u = update_of(&healthy);
+        u.last_error = "HTTP 500".to_string();
+        u.fail_count = 1;
+        assert!(runtime_needs_persist(&healthy, &u), "first failure");
+
+        let mut u = update_of(&healthy);
+        u.seeded = false;
+        assert!(runtime_needs_persist(&healthy, &u), "seeded flag flipped");
+
+        let mut u = update_of(&healthy);
+        u.name = "renamed by feed title".to_string();
+        assert!(runtime_needs_persist(&healthy, &u), "name backfilled");
+
+        let failing = mem_source(2, "HTTP 500");
+        let mut u = update_of(&failing);
+        u.last_error.clear();
+        u.fail_count = 0;
+        assert!(runtime_needs_persist(&failing, &u), "recovery clears error");
+
+        let mut u = update_of(&failing);
+        u.last_error = "timeout".to_string();
+        assert!(runtime_needs_persist(&failing, &u), "different error text");
+
+        let mut u = update_of(&failing);
+        u.fail_count = 3;
+        assert!(
+            runtime_needs_persist(&failing, &u),
+            "backoff interval still growing (2 -> 3 failures)"
+        );
+    }
+
+    #[test]
+    fn repeated_identical_failure_at_backoff_cap_is_not_persisted() {
+        // 30min × 2^4 = 8h 已越过 6h 封顶：再失败只是计数增长，退避间隔不变。
+        let capped = mem_source(4, "HTTP 500");
+        let mut u = update_of(&capped);
+        u.fail_count = 5;
+        assert!(!runtime_needs_persist(&capped, &u));
+
+        // 用户配置的间隔本就高于封顶（24h）：任何失败计数增长都不改变间隔。
+        let mut slow = mem_source(1, "HTTP 500");
+        slow.interval_minutes = 24 * 60;
+        let mut u = update_of(&slow);
+        u.fail_count = 2;
+        assert!(!runtime_needs_persist(&slow, &u));
+    }
+
+    #[test]
+    fn reload_keeps_in_memory_runtime_but_takes_user_fields_from_db() {
+        // DB 里的运行态偏旧（无语义变化的抓取没落库），用户字段已被编辑。
+        let mut db_row = mem_source(0, "");
+        db_row.last_fetch_at = 10;
+        db_row.last_success_at = 10;
+        db_row.name = "edited name".to_string();
+        db_row.unread_count = 7;
+        let mut fresh = vec![db_row, source("other", 30, 5)];
+
+        let mut mem = mem_source(3, "HTTP 500");
+        mem.last_fetch_at = 9_999;
+        mem.last_success_at = 8_888;
+        super::merge_runtime_from_memory(&mut fresh, &[mem]);
+
+        assert_eq!(fresh[0].last_fetch_at, 9_999);
+        assert_eq!(fresh[0].last_success_at, 8_888);
+        assert_eq!(fresh[0].fail_count, 3);
+        assert_eq!(fresh[0].last_error, "HTTP 500");
+        assert_eq!(fresh[0].name, "edited name");
+        assert_eq!(fresh[0].unread_count, 7);
+        // 内存里没有的订阅（新建）保持 DB 值。
+        assert_eq!(fresh[1].last_fetch_at, 5);
+    }
 
     fn source(id: &str, interval: i32, last_fetch: i64) -> RssSourceInfo {
         RssSourceInfo {

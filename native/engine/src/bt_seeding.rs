@@ -7,7 +7,10 @@
 //!
 //! 做种时长跨暂停/重启**累计**：每个做种者以落库的累计秒数为基线
 //! （`seed_time_base_secs`），叠加本次激活以来的墙钟时长；排队/暂停
-//! 期间不计时。
+//! 期间不计时。累计值以内存为准（限额判定、进度事件都读内存），落库只在
+//! 状态迁移、正常关机、顺带写（本 tick 本来就要写上传增量）与
+//! [`SEED_TIME_FALLBACK_PERSIST_INTERVAL`] 兜底时发生，见
+//! [`seed_times_persist_due`]。
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -31,6 +34,35 @@ pub const SEEDING_QUEUED_MESSAGE: &str = "queued for seeding";
 
 /// Interval between periodic evaluations of BT seeding ratio/time limits.
 pub const SEEDING_EVAL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 做种时长的兜底落库间隔。
+///
+/// 做种时长在内存里按墙钟累计，限额判定与 UI 进度事件直接读内存值，不依赖
+/// 落库频率。落库只发生在：
+/// 1. 本 tick 本来就要写库（有上传增量）时顺带写时长快照；
+/// 2. 做种状态迁移（停止/达限/降级/暂停/删除/会话释放）与正常关机时结算；
+/// 3. 兜底——距上次落库满本间隔。
+///
+/// 零上传的纯做种空闲期因此不产生周期性 DB 写：Linux 下即使不 fsync 的写也会被
+/// 内核回写（约 30s），足以唤醒 NAS 上休眠的 HDD。代价是崩溃/断电最多丢失本间隔
+/// 内的累计做种时长。
+pub(crate) const SEED_TIME_FALLBACK_PERSIST_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// 本 tick 是否要把做种时长快照一并落库（纯函数，时间注入便于测试）。
+///
+/// - `has_upload_delta`：本 tick 已有上传增量要写库——同一事务顺带写时长，不增加
+///   额外的提交；
+/// - 否则仅当距 `last_persist` 满 `fallback` 时兜底写一次。
+///
+/// 用单调时钟 `Instant`：墙钟回拨/NTP 校时不会让兜底写被无限推迟。
+pub(crate) fn seed_times_persist_due(
+    has_upload_delta: bool,
+    now: Instant,
+    last_persist: Instant,
+    fallback: Duration,
+) -> bool {
+    has_upload_delta || now.saturating_duration_since(last_persist) >= fallback
+}
 
 /// Reason why a seeding entry was stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -985,5 +1017,26 @@ mod tests {
             .await;
         // 空管理器无做种者——纯覆盖解析已在上面断言；此处仅验证签名可用。
         assert!(stops.is_empty());
+    }
+
+    #[test]
+    fn seed_times_persist_only_with_upload_delta_or_after_fallback() {
+        let t0 = Instant::now();
+        let fallback = SEED_TIME_FALLBACK_PERSIST_INTERVAL;
+        // 零上传、兜底间隔内：不写（纯做种空闲期零 DB 写）。
+        assert!(!seed_times_persist_due(false, t0, t0, fallback));
+        let just_before = t0 + fallback - Duration::from_secs(1);
+        assert!(!seed_times_persist_due(false, just_before, t0, fallback));
+        // 满兜底间隔：写一次。
+        assert!(seed_times_persist_due(false, t0 + fallback, t0, fallback));
+        // 有上传增量：本 tick 本来就要写库，顺带写时长，不受间隔限制。
+        assert!(seed_times_persist_due(true, t0, t0, fallback));
+        // last_persist 晚于 now（时钟读数乱序）按「未到期」处理，不 panic。
+        assert!(!seed_times_persist_due(
+            false,
+            t0,
+            t0 + Duration::from_secs(5),
+            fallback
+        ));
     }
 }

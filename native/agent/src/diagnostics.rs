@@ -34,6 +34,8 @@ const CHECK_URL_PROTOCOL: &str = "url_protocol";
 const CHECK_TORRENT_ASSOCIATION: &str = "torrent_association";
 const CHECK_LOG_DIR: &str = "log_dir";
 const CHECK_DAEMON_STARTUP: &str = "daemon_startup";
+/// 空闲时仍会周期性访问硬盘的来源（做种、RSS 定时抓取、空闲文件扫描）。
+const CHECK_DISK_SLEEP: &str = "disk_sleep";
 
 /// 提示码；UI 映射 `doctorHint{Camel}`。
 const HINT_REINSTALL_APP: &str = "reinstall_app";
@@ -48,6 +50,8 @@ const HINT_ASSOCIATION_OFF: &str = "association_off";
 const HINT_CHECK_DISK: &str = "check_disk";
 /// daemon 反复启动即退出（端口无法监听、初始化失败）；详情带 stderr 摘要。
 const HINT_DAEMON_STARTUP_FAILED: &str = "daemon_startup_failed";
+/// 存在阻止硬盘休眠的来源；详情逐项列出数量与间隔。
+const HINT_DISK_SLEEP_BLOCKERS: &str = "disk_sleep_blockers";
 
 /// 修复动作；UI 映射 `doctorAction{Camel}`，并作为 `repair` 的 `action`。
 pub const ACTION_REREGISTER: &str = "reregister";
@@ -128,6 +132,7 @@ impl DiagnosticsService {
         let gateway = self.state.lock().await.gateway.clone();
         let data_dir = self.store.data_dir().to_path_buf();
         let opted_out = self.events.inspect(opted_out_associations);
+        let disk_sleep = self.events.inspect(disk_sleep_blockers);
         let sync_probe = tokio::task::spawn_blocking(move || probe_sync(&data_dir, &opted_out))
             .await
             .map_err(join_error)?;
@@ -142,6 +147,9 @@ impl DiagnosticsService {
         checks.push(daemon.check);
         if let Some(check) = daemon_startup {
             checks.push(check);
+        }
+        if let Some(blockers) = disk_sleep {
+            checks.push(disk_sleep_check(&blockers));
         }
         checks.extend(sync_probe.shell);
         checks.push(sync_probe.log_dir);
@@ -551,6 +559,106 @@ fn daemon_startup_check(
         DiagnosticLevel::Error,
         detail,
         HINT_DAEMON_STARTUP_FAILED,
+        None,
+    )
+}
+
+/// 无 RSS 间隔（`0`）时引擎使用的默认抓取间隔（分钟），与 engine `DEFAULT_INTERVAL_MINUTES` 一致。
+const RSS_DEFAULT_INTERVAL_MINUTES: i64 = 30;
+
+/// 会在空闲时唤醒硬盘的来源汇总；全部取自 agent 已缓存的 daemon 快照，探测本身零磁盘访问。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskSleepBlockers {
+    /// `seeding_status == 1`（做种中）的任务数；排队等待做种槽的不计。
+    seeding_tasks: usize,
+    /// 启用的 RSS 源数量。
+    rss_sources: usize,
+    /// 启用的 RSS 源里最短的配置抓取间隔（分钟）。
+    shortest_rss_minutes: Option<i64>,
+    /// 空闲时是否仍周期性扫描已完成任务的文件。
+    idle_file_scan: bool,
+}
+
+impl DiskSleepBlockers {
+    fn any(&self) -> bool {
+        self.seeding_tasks > 0 || self.rss_sources > 0 || self.idle_file_scan
+    }
+}
+
+/// 从 agent 快照收集阻碍项；daemon 未连接时快照里的任务/RSS 已过期，不产出该检查。
+fn disk_sleep_blockers(snapshot: &AgentSnapshot) -> Option<DiskSleepBlockers> {
+    if !snapshot.daemon_connected {
+        return None;
+    }
+    let daemon = &snapshot.daemon;
+    let enabled_intervals = daemon
+        .rss_sources
+        .iter()
+        .filter(|source| source.enabled)
+        .map(|source| match i64::from(source.interval_minutes) {
+            minutes if minutes > 0 => minutes,
+            _ => RSS_DEFAULT_INTERVAL_MINUTES,
+        });
+    let idle_file_scan = daemon
+        .config
+        .values
+        .get("idle_file_scan")
+        .map_or_else(
+            || fluxdown_protocol::daemon_config_default("idle_file_scan"),
+            String::as_str,
+        )
+        .trim()
+        .to_ascii_lowercase();
+    Some(DiskSleepBlockers {
+        seeding_tasks: daemon
+            .tasks
+            .iter()
+            .filter(|task| task.seeding_status == 1)
+            .count(),
+        rss_sources: enabled_intervals.clone().count(),
+        shortest_rss_minutes: enabled_intervals.min(),
+        idle_file_scan: matches!(idle_file_scan.as_str(), "true" | "1"),
+    })
+}
+
+/// `disk_sleep`：列出会让 NAS 硬盘无法休眠的来源。这些都是用户主动启用的功能而非故障，
+/// 所以有阻碍项时只报 info（不计入「需要关注」），无阻碍项报 ok。
+fn disk_sleep_check(blockers: &DiskSleepBlockers) -> DiagnosticCheckDto {
+    if !blockers.any() {
+        return check(
+            CHECK_DISK_SLEEP,
+            "",
+            DiagnosticLevel::Ok,
+            "No seeding tasks, enabled RSS sources or idle file scan: \
+             the daemon does not touch the disk while idle"
+                .to_owned(),
+            "",
+            None,
+        );
+    }
+    let mut items = Vec::with_capacity(3);
+    if blockers.seeding_tasks > 0 {
+        items.push(format!("seeding tasks: {}", blockers.seeding_tasks));
+    }
+    if blockers.rss_sources > 0 {
+        let mut item = format!("enabled RSS sources: {}", blockers.rss_sources);
+        if let Some(minutes) = blockers.shortest_rss_minutes {
+            item.push_str(&format!(" (shortest interval {minutes} min)"));
+        }
+        items.push(item);
+    }
+    if blockers.idle_file_scan {
+        items.push("idle file scan: on".to_owned());
+    }
+    check(
+        CHECK_DISK_SLEEP,
+        "",
+        DiagnosticLevel::Info,
+        format!(
+            "Active while idle and may keep the disk awake — {}",
+            items.join("; ")
+        ),
+        HINT_DISK_SLEEP_BLOCKERS,
         None,
     )
 }
@@ -1124,11 +1232,12 @@ mod tests {
 
     use super::{
         ACTION_ENABLE_SERVICE, ACTION_OPEN_LOG_DIR, ACTION_REGISTER, ACTION_REREGISTER,
-        ACTION_USE_THIS_INSTALL, HINT_ASSOCIATION_OFF, HINT_CHECK_DISK, HINT_DAEMON_STARTUP_FAILED,
-        HINT_ENABLE_LOCAL_SERVER, HINT_ENABLE_PROTOCOL, HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP,
-        HINT_REREGISTER_NMH, STARTUP_STDERR_LINES, TARGET_TORRENT, daemon_export_url,
-        daemon_log_dir, daemon_startup_check, manifest_check, nmh_checks, opted_out_associations,
-        probe_local_server, probe_log_dir, relay_check, shell_checks,
+        ACTION_USE_THIS_INSTALL, DiskSleepBlockers, HINT_ASSOCIATION_OFF, HINT_CHECK_DISK,
+        HINT_DAEMON_STARTUP_FAILED, HINT_DISK_SLEEP_BLOCKERS, HINT_ENABLE_LOCAL_SERVER,
+        HINT_ENABLE_PROTOCOL, HINT_NMH_OTHER_INSTALL, HINT_REINSTALL_APP, HINT_REREGISTER_NMH,
+        STARTUP_STDERR_LINES, TARGET_TORRENT, daemon_export_url, daemon_log_dir,
+        daemon_startup_check, disk_sleep_blockers, disk_sleep_check, manifest_check, nmh_checks,
+        opted_out_associations, probe_local_server, probe_log_dir, relay_check, shell_checks,
     };
     use crate::nmh::registry::{NmhDiagnosis, NmhTarget, RelayOwner};
 
@@ -1144,6 +1253,151 @@ mod tests {
                 "manifest file missing".to_owned()
             },
         }
+    }
+
+    fn snapshot_with(
+        connected: bool,
+        seeding_statuses: &[i32],
+        rss: &[(bool, i32)],
+        idle_scan: Option<&str>,
+    ) -> Result<AgentSnapshot, serde_json::Error> {
+        let mut snapshot = AgentSnapshot {
+            daemon_connected: connected,
+            ..AgentSnapshot::default()
+        };
+        for (index, status) in seeding_statuses.iter().enumerate() {
+            snapshot.daemon.tasks.push(serde_json::from_value(json!({
+                "taskId": format!("t{index}"),
+                "url": "magnet:?xt=urn:btih:x",
+                "fileName": "f",
+                "saveDir": "/tmp",
+                "status": 3,
+                "downloadedBytes": 1,
+                "totalBytes": 1,
+                "errorMessage": "",
+                "createdAt": "1",
+                "proxyUrl": "",
+                "queueId": "",
+                "checksum": "",
+                "seedingStatus": status,
+            }))?);
+        }
+        for (enabled, minutes) in rss {
+            snapshot
+                .daemon
+                .rss_sources
+                .push(serde_json::from_value(json!({
+                    "url": "https://feed.test/rss",
+                    "enabled": enabled,
+                    "intervalMinutes": minutes,
+                }))?);
+        }
+        if let Some(value) = idle_scan {
+            snapshot
+                .daemon
+                .config
+                .values
+                .insert("idle_file_scan".to_owned(), value.to_owned());
+        }
+        Ok(snapshot)
+    }
+
+    #[test]
+    fn disk_sleep_blockers_count_only_active_seeding_and_enabled_rss()
+    -> Result<(), serde_json::Error> {
+        // 1=做种中；8=排队等待做种槽、2=达分享率停止，均不访问磁盘；禁用的 RSS 源不计。
+        // 间隔 0 落回引擎默认 30 分钟。
+        let snapshot = snapshot_with(
+            true,
+            &[1, 1, 8, 2, 0],
+            &[(true, 0), (true, 15), (false, 1)],
+            None,
+        )?;
+        assert_eq!(
+            disk_sleep_blockers(&snapshot),
+            Some(DiskSleepBlockers {
+                seeding_tasks: 2,
+                rss_sources: 2,
+                shortest_rss_minutes: Some(15),
+                idle_file_scan: false,
+            })
+        );
+        let defaulted = snapshot_with(true, &[], &[(true, 0)], None)?;
+        assert_eq!(
+            disk_sleep_blockers(&defaulted).and_then(|b| b.shortest_rss_minutes),
+            Some(30)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disk_sleep_idle_scan_accepts_bool_spellings_and_defaults_off()
+    -> Result<(), serde_json::Error> {
+        for (raw, expected) in [
+            (Some("true"), true),
+            (Some("1"), true),
+            (Some("TRUE"), true),
+            (Some("false"), false),
+            (Some("0"), false),
+            (None, false),
+        ] {
+            let snapshot = snapshot_with(true, &[], &[], raw)?;
+            assert_eq!(
+                disk_sleep_blockers(&snapshot).map(|b| b.idle_file_scan),
+                Some(expected),
+                "idle_file_scan={raw:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disk_sleep_is_skipped_while_daemon_is_disconnected() -> Result<(), serde_json::Error> {
+        // 断线时快照里的任务 / RSS 是过期数据，不能据此下结论。
+        let snapshot = snapshot_with(false, &[1], &[(true, 5)], Some("1"))?;
+        assert_eq!(disk_sleep_blockers(&snapshot), None);
+        Ok(())
+    }
+
+    #[test]
+    fn disk_sleep_check_is_ok_when_idle_and_info_listing_every_blocker() {
+        let quiet = disk_sleep_check(&DiskSleepBlockers {
+            seeding_tasks: 0,
+            rss_sources: 0,
+            shortest_rss_minutes: None,
+            idle_file_scan: false,
+        });
+        assert_eq!(quiet.id, "disk_sleep");
+        assert_eq!(quiet.level, DiagnosticLevel::Ok);
+        assert!(quiet.hint.is_empty());
+        assert!(quiet.repair.is_none());
+
+        let busy = disk_sleep_check(&DiskSleepBlockers {
+            seeding_tasks: 3,
+            rss_sources: 2,
+            shortest_rss_minutes: Some(10),
+            idle_file_scan: true,
+        });
+        assert_eq!(busy.level, DiagnosticLevel::Info);
+        assert_eq!(busy.hint, HINT_DISK_SLEEP_BLOCKERS);
+        assert!(busy.repair.is_none());
+        for needle in [
+            "seeding tasks: 3",
+            "enabled RSS sources: 2",
+            "shortest interval 10 min",
+            "idle file scan: on",
+        ] {
+            assert!(busy.detail.contains(needle), "{needle} in {}", busy.detail);
+        }
+
+        let only_seeding = disk_sleep_check(&DiskSleepBlockers {
+            seeding_tasks: 1,
+            rss_sources: 0,
+            shortest_rss_minutes: None,
+            idle_file_scan: false,
+        });
+        assert!(!only_seeding.detail.contains("RSS"));
+        assert!(!only_seeding.detail.contains("idle file scan"));
     }
 
     #[test]
