@@ -1746,6 +1746,8 @@ jobs:
           fallback-title: Release ${{ needs.changes.outputs.tag }}
           tag: ${{ needs.changes.outputs.tag }}
           since: ${{ needs.changes.outputs.prev }}
+          # 演练：tag 只在本 runner 本地，git-cliff 的 GitHub 元数据查询改用已推送的源码提交
+          end-ref: ${{ needs.changes.outputs.rehearsal != 'false' && needs.changes.outputs.source || '' }}
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       - name: Create or update draft release

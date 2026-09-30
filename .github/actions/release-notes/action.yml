@@ -31,6 +31,10 @@ inputs:
     description: 变更基线 tag（release.yml changes job 的 prev：稳定版 = 上一个稳定版，预览版 = 上一个版本 tag）；留空 = 首个版本，取全部历史
     required: false
     default: ""
+  end-ref:
+    description: 区间终点（留空 = tag）。release.yml 演练传源码提交 SHA：演练 tag 只存在于 runner 本地，git-cliff 的 GitHub 元数据查询按区间终点请求远端，本地 tag 会 404
+    required: false
+    default: ""
   claude-token:
     description: CLAUDE_CODE_OAUTH_TOKEN
     required: true
@@ -52,9 +56,11 @@ runs:
         set -f  # 本步先关 glob，避免 ** 在这里被展开
         TAG="${{ inputs.tag }}"
         [ -n "$TAG" ] || TAG="${GITHUB_REF#refs/tags/}"
+        END="${{ inputs.end-ref }}"
+        [ -n "$END" ] || END="$TAG"
         SINCE="${{ inputs.since }}"
         ARGS="--strip header"
-        if [ -n "$SINCE" ]; then ARGS="$ARGS ${SINCE}..${TAG}"; else ARGS="$ARGS --latest"; fi
+        if [ -n "$SINCE" ]; then ARGS="$ARGS ${SINCE}..${END}"; else ARGS="$ARGS --latest"; fi
         for p in ${{ inputs.paths }}; do
           # 引号是「字面量」：git-cliff-action 会把 args 裸插进自己的 shell 命令行
           # （run.sh --config=... ${{ inputs.args }}），不带引号的 ** 会在那边被展开成本地路径。
