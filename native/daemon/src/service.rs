@@ -13,10 +13,10 @@ use fluxdown_engine::log_info;
 use fluxdown_protocol::method;
 use fluxdown_protocol::{
     ApplicationErrorCode, CdnConfigApplyParams, CdnReportAckParams, CreateGroupRequest,
-    CreateQueueRequest, DaemonConfigPatch, DaemonCreateTaskParams, MigrationAckParams,
-    RpcErrorData, RpcErrorObject, RpcRequest, RpcResponse, SelectionResolutionDto, ServiceHello,
-    SiteAuthCredentialDto, SiteAuthDeleteParams, SiteAuthMatchParams, SnapshotBody,
-    TaskActivityQuery,
+    CreateQueueRequest, DaemonConfigPatch, DaemonCreateTaskParams, DaemonDeleteTasksParams,
+    DaemonTaskIdsParams, MigrationAckParams, RpcErrorData, RpcErrorObject, RpcRequest, RpcResponse,
+    SelectionResolutionDto, ServiceHello, SiteAuthCredentialDto, SiteAuthDeleteParams,
+    SiteAuthMatchParams, SnapshotBody, TaskActivityQuery,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -252,6 +252,28 @@ impl DaemonService {
                     seed_time_limit_minutes: params.seed_time_limit_minutes,
                     inactive_time_limit_minutes: params.inactive_time_limit_minutes,
                     upload_limit_bps: params.upload_limit_bps,
+                })
+                .await
+            }
+            method::DAEMON_TASK_PAUSE_MANY => {
+                let params = parse_params::<DaemonTaskIdsParams>(params)?;
+                self.execute_unit(ActorOperation::PauseTasks {
+                    task_ids: params.task_ids,
+                })
+                .await
+            }
+            method::DAEMON_TASK_RESUME_MANY => {
+                let params = parse_params::<DaemonTaskIdsParams>(params)?;
+                self.execute_unit(ActorOperation::ResumeTasks {
+                    task_ids: params.task_ids,
+                })
+                .await
+            }
+            method::DAEMON_TASK_DELETE_MANY => {
+                let params = parse_params::<DaemonDeleteTasksParams>(params)?;
+                self.execute_unit(ActorOperation::DeleteTasks {
+                    task_ids: params.task_ids,
+                    delete_files: params.delete_files,
                 })
                 .await
             }
@@ -710,7 +732,12 @@ impl DaemonService {
                 self.plugin_manager()?
                     .update_settings(&params.identity, &entries)
                     .await
-                    .map_err(|error| invalid_argument("entries", &error.to_string()))?;
+                    .map_err(|error| match error {
+                        fluxdown_engine::plugin::PluginError::InvalidSetting { key, message } => {
+                            invalid_argument(&key, &message)
+                        }
+                        other => invalid_argument("entries", &other.to_string()),
+                    })?;
                 self.publish_plugins().await?;
                 Ok(json!({ "ok": true }))
             }
@@ -799,7 +826,7 @@ impl DaemonService {
                 let identity = self
                     .market_client()
                     .await?
-                    .install_latest(&request.plugin_id)
+                    .install_latest(&request.plugin_id, request.version.as_deref())
                     .await
                     .map_err(|error| market_error(&error))?;
                 let missing_components = self.plugin_missing_components(&identity).await;
@@ -1109,7 +1136,7 @@ impl DaemonService {
             .execute(ActorOperation::CreateTask {
                 request: Box::new(params.request),
                 torrent_file_bytes: bytes,
-                hint_file_size: 0,
+                hint_file_size: params.hint_file_size.filter(|size| *size > 0).unwrap_or(0),
                 unattended: params.unattended,
             })
             .await;
@@ -1546,6 +1573,7 @@ impl DaemonService {
             )
             .unwrap_or(u32::MAX),
             total_download_bps: snapshot.runtime_stats.total_download_bps,
+            retry_pending_tasks: snapshot.runtime_stats.retry_pending_tasks,
             total_upload_bps: snapshot.runtime_stats.total_upload_bps,
             disk_free_bytes: fluxdown_engine::disk_space::available_space_checked(
                 std::path::PathBuf::from(&save_dir),
@@ -1910,6 +1938,11 @@ fn market_error(error: &fluxdown_engine::plugin::MarketError) -> RpcErrorObject 
             ApplicationErrorCode::Conflict,
             false,
             ErrorReason::PluginYanked,
+        ),
+        MarketError::VersionChanged { .. } => (
+            ApplicationErrorCode::Conflict,
+            false,
+            ErrorReason::MarketVersionChanged,
         ),
         MarketError::AllMirrorsFailed | MarketError::HashMismatch { .. } => (
             ApplicationErrorCode::Unavailable,

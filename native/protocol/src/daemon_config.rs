@@ -238,6 +238,15 @@ pub const DAEMON_CONFIG_FIELDS: &[DaemonConfigField] = &[
     // ── 受管组件手动路径（空 = 自动解析）──
     field("component.ffmpeg.path", DaemonConfigKind::Text, ""),
     field("component.ytdlp.path", DaemonConfigKind::Text, ""),
+    // 组件下载镜像基址（空 = 直连 GitHub）；只接受 https。
+    field("component_mirror_base", DaemonConfigKind::Text, ""),
+    // ── 日志 ──
+    // 日志目录总大小上限（MB），daemon 启动与每次配置提交后应用到引擎 logger。
+    field(
+        "log_max_size_mb",
+        DaemonConfigKind::Integer { min: 1, max: 1024 },
+        "10",
+    ),
 ];
 
 /// 校验失败原因。
@@ -322,6 +331,9 @@ pub fn normalize_daemon_config_value(key: &str, value: &str) -> Result<String, D
                 Err(invalid(format!("must be one of {}", allowed.join(", "))))
             }
         }
+        DaemonConfigKind::Text if key == "component_mirror_base" => {
+            normalize_mirror_base(value).map_err(invalid)
+        }
         DaemonConfigKind::Text if key == "global_user_agent" => {
             let trimmed = value.trim();
             // 与 HTTP HeaderValue 规则一致：可见字符、空格与制表符；拒绝控制字符。
@@ -332,6 +344,39 @@ pub fn normalize_daemon_config_value(key: &str, value: &str) -> Result<String, D
         }
         DaemonConfigKind::Text => Ok(value.trim().to_owned()),
     }
+}
+
+/// 组件镜像基址：空串表示直连；非空必须是 `https://host[/path]`，不带查询 / 片段 /
+/// 空白（基址会与 GitHub 路径直接拼接）。末尾 `/` 被去掉。
+fn normalize_mirror_base(value: &str) -> Result<String, String> {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        return Err("must not contain whitespace or control characters".to_owned());
+    }
+    let scheme_len = "https://".len();
+    let Some(scheme) = trimmed.get(..scheme_len) else {
+        return Err("must start with https://".to_owned());
+    };
+    if !scheme.eq_ignore_ascii_case("https://") {
+        return Err("must start with https://".to_owned());
+    }
+    let rest = trimmed.get(scheme_len..).unwrap_or_default();
+    if rest.contains(['?', '#']) {
+        return Err("must not contain a query string or fragment".to_owned());
+    }
+    let authority = rest.split('/').next().unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or_default();
+    let host = host_port.split(':').next().unwrap_or_default();
+    if host.is_empty() {
+        return Err("must include a host".to_owned());
+    }
+    Ok(format!("https://{rest}"))
 }
 
 /// 校验并规范化一整个 patch；任一键失败即整体失败。
@@ -411,5 +456,42 @@ mod tests {
             normalize_daemon_config_value("proxy_mode", " manual ").as_deref(),
             Ok("manual")
         );
+    }
+
+    #[test]
+    fn component_mirror_base_only_accepts_https() {
+        let normalize = |value: &str| normalize_daemon_config_value("component_mirror_base", value);
+        assert_eq!(normalize("").as_deref(), Ok(""));
+        assert_eq!(normalize("  ").as_deref(), Ok(""));
+        assert_eq!(
+            normalize(" HTTPS://gh.example.com/proxy/ ").as_deref(),
+            Ok("https://gh.example.com/proxy")
+        );
+        for bad in [
+            "http://gh.example.com",
+            "gh.example.com",
+            "ftp://gh.example.com",
+            "https://",
+            "https:///path",
+            "https://gh.example.com/a b",
+            "https://gh.example.com/?x=1",
+            "https://gh.example.com/#frag",
+        ] {
+            assert!(normalize(bad).is_err(), "{bad:?} must be rejected");
+        }
+        let Err(DaemonConfigError::InvalidValue { field, .. }) = normalize("http://x.test") else {
+            panic!("http mirror must be an invalid-value error");
+        };
+        assert_eq!(field, "component_mirror_base");
+    }
+
+    #[test]
+    fn log_max_size_is_bounded_in_megabytes() {
+        assert_eq!(
+            normalize_daemon_config_value("log_max_size_mb", " 64 ").as_deref(),
+            Ok("64")
+        );
+        assert!(normalize_daemon_config_value("log_max_size_mb", "0").is_err());
+        assert!(normalize_daemon_config_value("log_max_size_mb", "1025").is_err());
     }
 }

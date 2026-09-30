@@ -15,6 +15,13 @@ pub const PROTOCOL_VERSION: u32 = 6;
 pub const MIN_PROTOCOL_VERSION: u32 = 6;
 /// 服务收到 `system.shutdown` 而退出时的 WebSocket 关闭原因：客户端据此停止重连与重拉。
 pub const CLOSE_REASON_SERVICE_QUIT: &str = "service-quit";
+/// 产品版本：发布流水线经 `FLUXDOWN_APP_VERSION` 注入 tag 版本，本地构建回退到本 crate 的
+/// `CARGO_PKG_VERSION`。daemon / agent 对外自报版本、更新检查与诊断都以它为准，
+/// 各 crate 自己的 `Cargo.toml` 版本不代表产品版本。
+pub const APP_VERSION: &str = match option_env!("FLUXDOWN_APP_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 /// 本机服务在 FluxDown 架构中的职责。
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

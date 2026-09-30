@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -14,38 +15,51 @@ use axum::routing::{get, post};
 use fluxdown_protocol::{CLOSE_REASON_SERVICE_QUIT, EventFrame, RpcNotification};
 use futures_util::StreamExt;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast};
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::blob_store::BlobKind;
-use crate::rpc::RpcSession;
+use crate::rpc::{DaemonAuth, MAX_SLOW_CALLS, RpcSession, SessionReply, SlowCalls, Step};
 use crate::service::DaemonService;
 
 const REQUEST_BODY_LIMIT: usize = 4 * 1024 * 1024;
+/// WebSocket 单条消息上限：握手前任何对端都能发帧，不能沿用库默认的 64 MiB。
+const WS_MESSAGE_LIMIT: usize = 16 * 1024 * 1024;
+/// 握手帧只有几百字节；认证前超过该长度的帧直接断开。
+const PRE_AUTH_FRAME_LIMIT: usize = 4 * 1024;
+/// 握手必须在该时限内完成，未认证连接不得长期占着名额。
+const AUTH_DEADLINE: Duration = Duration::from_secs(10);
+/// 同时处于握手阶段（尚未认证）的连接上限。
+const MAX_PENDING_AUTH: usize = 16;
 
 #[derive(Clone)]
 struct HttpState {
     service: Arc<DaemonService>,
-    bearer: Arc<str>,
+    auth: Arc<DaemonAuth>,
     cancel: CancellationToken,
     /// 由 `system.shutdown` 触发的退出：各连接以 [`CLOSE_REASON_SERVICE_QUIT`] 关闭。
     quit_requested: Arc<AtomicBool>,
+    pending_auth: Arc<Semaphore>,
 }
 
 /// 启动 daemon HTTP 服务直到取消或 listener 失败。
+///
+/// `token` 是 agent 与 daemon 共享的长期密钥：新版 agent 只用它做 WebSocket 握手证明、
+/// HTTP 端点用已握手会话派生出的凭据；旧版 agent 的静态 Bearer 仍被接受（见 [`DaemonAuth`]）。
 pub async fn serve(
     listener: TcpListener,
     service: Arc<DaemonService>,
-    bearer: String,
+    token: String,
     cancel: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let state = HttpState {
         service,
-        bearer: Arc::from(bearer),
+        auth: Arc::new(DaemonAuth::new(token)),
         cancel: cancel.clone(),
         quit_requested: Arc::new(AtomicBool::new(false)),
+        pending_auth: Arc::new(Semaphore::new(MAX_PENDING_AUTH)),
     };
     let app = Router::new()
         .route("/rpc", get(rpc_upgrade))
@@ -60,8 +74,8 @@ pub async fn serve(
         .await
 }
 
-/// 加载或创建 daemon bearer token 文件。
-pub async fn load_or_create_bearer(
+/// 加载或创建 daemon token 文件。
+pub async fn load_or_create_token(
     data_dir: &Path,
     override_path: Option<&Path>,
 ) -> Result<String, std::io::Error> {
@@ -96,16 +110,31 @@ pub async fn load_or_create_bearer(
     Ok(token)
 }
 
+/// 升级头不带凭据时，身份证明在升级后的 `system.auth.*` 握手里完成，握手通过之前连接只能走
+/// 握手帧。仍在升级头带静态 Bearer 的旧版 agent 只要 token 有效就直接视为已认证（无效 401）。
 async fn rpc_upgrade(
     State(state): State<HttpState>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    if !authorized(&headers, &state.bearer) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    // 浏览器页面发起的 WebSocket 必带 Origin，agent 客户端从不发送：拒绝跨站页面占握手名额。
+    if headers.contains_key(header::ORIGIN) {
+        return StatusCode::FORBIDDEN.into_response();
     }
+    let (permit, bearer_authenticated) = if headers.contains_key(header::AUTHORIZATION) {
+        if !bearer_token(&headers).is_some_and(|presented| state.auth.accepts_token(presented)) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        (None, true)
+    } else {
+        let Ok(permit) = state.pending_auth.clone().try_acquire_owned() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        (Some(permit), false)
+    };
     upgrade
-        .on_upgrade(move |socket| run_socket(socket, state))
+        .max_message_size(WS_MESSAGE_LIMIT)
+        .on_upgrade(move |socket| run_socket(socket, state, permit, bearer_authenticated))
         .into_response()
 }
 
@@ -128,7 +157,7 @@ async fn upload_blob(
     kind: BlobKind,
     body: Body,
 ) -> Response {
-    if !authorized(headers, &state.bearer) {
+    if !authorized(headers, &state.auth) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let body = match axum::body::to_bytes(body, REQUEST_BODY_LIMIT).await {
@@ -150,7 +179,7 @@ async fn download_task_file(
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Response {
-    if !authorized(&headers, &state.bearer) {
+    if !authorized(&headers, &state.auth) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let Some(task) = state.service.task(&task_id) else {
@@ -224,7 +253,7 @@ async fn download_export(
     headers: HeaderMap,
     AxumPath(export_id): AxumPath<String>,
 ) -> Response {
-    if !authorized(&headers, &state.bearer) {
+    if !authorized(&headers, &state.auth) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
     let bytes = match state.service.blobs().read(&export_id, BlobKind::Logs).await {
@@ -243,15 +272,29 @@ async fn download_export(
     (StatusCode::OK, bytes).into_response()
 }
 
-async fn run_socket(mut socket: WebSocket, state: HttpState) {
+/// 单条 WebSocket 连接的主循环：握手 / 内联调用 / 慢调用响应 / 事件推送都在这里统一
+/// 读写 socket。慢方法在后台执行，响应经 [`SlowCalls`] 回到本循环再写出，事件分支因此
+/// 不会被长调用饿住（否则广播缓冲溢出、连接以 4009 被关闭）。
+async fn run_socket(
+    mut socket: WebSocket,
+    state: HttpState,
+    mut auth_permit: Option<OwnedSemaphorePermit>,
+    bearer_authenticated: bool,
+) {
     let HttpState {
         service,
         cancel,
         quit_requested,
+        auth,
         ..
     } = state;
-    let mut session = RpcSession::new(service.clone());
+    let mut session = RpcSession::new(service.clone(), auth, bearer_authenticated);
+    // 握手名额：认证通过即释放；期间受 `AUTH_DEADLINE` 约束。带有效静态 Bearer 升级的
+    // 旧版 agent 没有名额，也不受握手时限约束。
+    let auth_deadline = tokio::time::sleep(AUTH_DEADLINE);
+    tokio::pin!(auth_deadline);
     let mut events = None;
+    let mut slow = SlowCalls::new(MAX_SLOW_CALLS);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -266,20 +309,53 @@ async fn run_socket(mut socket: WebSocket, state: HttpState) {
                 }))).await;
                 break;
             }
+            _ = &mut auth_deadline, if auth_permit.is_some() => {
+                let _ = socket.send(Message::Close(Some(CloseFrame {
+                    code: 1008,
+                    reason: "auth-timeout".into(),
+                }))).await;
+                break;
+            }
             incoming = socket.next() => {
                 let Some(Ok(message)) = incoming else { break; };
                 match message {
                     Message::Text(text) => {
-                        let reply = session.handle_text(&text).await;
+                        if !session.is_authenticated() && text.len() > PRE_AUTH_FRAME_LIMIT {
+                            let _ = socket.send(Message::Close(Some(CloseFrame {
+                                code: 1009,
+                                reason: "frame too large before authentication".into(),
+                            }))).await;
+                            break;
+                        }
+                        let reply = match session.accept(&text) {
+                            Step::Reply(reply) => reply,
+                            Step::Call(call) if call.is_slow() => {
+                                match slow.spawn(call.id(), call.run()) {
+                                    Ok(()) => continue,
+                                    Err(rejection) => SessionReply::reply(*rejection),
+                                }
+                            }
+                            Step::Call(call) => SessionReply::reply(call.run().await),
+                        };
                         if reply.became_ready {
                             let (receiver, _) = service.events().subscribe_and_snapshot();
                             events = Some(receiver);
+                        }
+                        if session.is_authenticated() {
+                            auth_permit = None;
                         }
                         let Ok(json) = serde_json::to_string(&reply.response) else { break; };
                         if socket.send(Message::Text(json.into())).await.is_err() { break; }
                         if reply.shutdown_requested {
                             quit_requested.store(true, Ordering::Release);
                             cancel.cancel();
+                        }
+                        if reply.close {
+                            let _ = socket.send(Message::Close(Some(CloseFrame {
+                                code: 1008,
+                                reason: "unauthorized".into(),
+                            }))).await;
+                            break;
                         }
                     }
                     Message::Close(_) => break,
@@ -311,8 +387,15 @@ async fn run_socket(mut socket: WebSocket, state: HttpState) {
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            finished = slow.next(), if !slow.is_empty() => {
+                let Some(response) = finished else { continue; };
+                let Ok(json) = serde_json::to_string(&response) else { break; };
+                if socket.send(Message::Text(json.into())).await.is_err() { break; }
+            }
         }
     }
+    // 先中止在途调用，再释放连接所有权的选择订阅。
+    drop(slow);
     session.disconnect();
 }
 
@@ -335,26 +418,17 @@ async fn send_event(socket: &mut WebSocket, frame: EventFrame) -> Result<(), ()>
         .map_err(|_| ())
 }
 
-fn authorized(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(value) = headers.get(header::AUTHORIZATION) else {
-        return false;
-    };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    value
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
         .strip_prefix("Bearer ")
-        .is_some_and(|token| constant_time_eq(token.as_bytes(), expected.as_bytes()))
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
+/// HTTP 端点的 `Authorization: Bearer`：某个存活会话的 HTTP 凭据，或旧版 agent 的静态 token。
+fn authorized(headers: &HeaderMap, auth: &DaemonAuth) -> bool {
+    bearer_token(headers).is_some_and(|credential| auth.authorizes_http(credential))
 }
 
 fn temporary_path(path: &Path) -> PathBuf {
@@ -392,6 +466,7 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, header};
 
     use super::{attachment_disposition, authorized};
+    use crate::rpc::DaemonAuth;
 
     #[test]
     fn attachment_disposition_carries_utf8_name_and_safe_ascii_fallback() {
@@ -405,18 +480,21 @@ mod tests {
     }
 
     #[test]
-    fn bearer_auth_requires_exact_header_token() {
+    fn http_endpoints_accept_live_session_credentials_and_the_legacy_static_token() {
+        let auth = DaemonAuth::new("long-lived-token");
+        auth.register_http("connection", "session-credential".to_owned());
         let mut headers = HeaderMap::new();
-        assert!(!authorized(&headers, "secret"));
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer wrong"),
-        );
-        assert!(!authorized(&headers, "secret"));
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer secret"),
-        );
-        assert!(authorized(&headers, "secret"));
+        assert!(!authorized(&headers, &auth));
+        for (value, accepted) in [
+            ("Bearer session-credential", true),
+            // 旧版 agent 仍发送静态 token：daemon 作为校验方继续接受。
+            ("Bearer long-lived-token", true),
+            ("Bearer wrong", false),
+            ("session-credential", false),
+            ("Basic long-lived-token", false),
+        ] {
+            headers.insert(header::AUTHORIZATION, HeaderValue::from_static(value));
+            assert_eq!(authorized(&headers, &auth), accepted, "{value}");
+        }
     }
 }

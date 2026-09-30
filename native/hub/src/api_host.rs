@@ -44,12 +44,12 @@ use fluxdown_engine::download_manager::{CreateGroupSpec, GroupItemSpec, ResolveP
 #[cfg(hub_plugins)]
 use fluxdown_engine::plugin::{MarketClient, PluginManager};
 #[cfg(hub_link)]
-use fluxdown_link::{DiscoveredPeer, DiscoveryKind, LinkError, PeerAddress, WireHello};
+use fluxdown_link::{DiscoveredPeer, DiscoveryKind, LinkError, PeerAddress, WireHello, WireReveal};
 #[cfg(hub_link)]
 use fluxdown_protocol::daemon::{
     LinkAuth, LinkCodeResponse, LinkDeviceInfo, LinkDiscoveredPeer, LinkPairBeginResponse,
     LinkPairConfirmOutcome, LinkPairConfirmRequest, LinkPairHelloRequest, LinkPairHelloResponse,
-    LinkPingInfo, LinkTaskRequest,
+    LinkPairRevealRequest, LinkPairRevealResponse, LinkPingInfo, LinkTaskRequest,
 };
 #[cfg(hub_plugins)]
 use fluxdown_protocol::daemon::{MarketEntryDto, PluginAuthRequest, PluginAuthResponse, PluginDto};
@@ -652,7 +652,7 @@ impl ApiHost for HubApiHost {
     async fn market_install(&self, plugin_id: &str) -> Result<String, ApiError> {
         let client = self.market_client().await?;
         client
-            .install_latest(plugin_id)
+            .install_latest(plugin_id, None)
             .await
             .map_err(|e| ApiError::BadRequest(e.to_string()))
     }
@@ -943,9 +943,10 @@ impl ApiHost for HubApiHost {
     ) -> Result<LinkPairHelloResponse, ApiError> {
         let link = self.link.as_ref().ok_or_else(link_disabled)?;
         let wire = WireHello {
+            protocol_version: req.protocol_version,
             code: req.code,
-            initiator_eph_pub: req.initiator_eph_pub,
             initiator_id_pub: req.initiator_id_pub,
+            initiator_commit: req.initiator_commit,
             initiator_sig: req.initiator_sig,
             name: req.name,
             platform: link_opt_str(req.platform),
@@ -954,14 +955,32 @@ impl ApiHost for HubApiHost {
         };
         let resp = link.pair_hello_wire(wire, source).map_err(map_link_err)?;
         Ok(LinkPairHelloResponse {
+            protocol_version: resp.protocol_version,
             session_id: resp.session_id,
             responder_eph_pub: resp.responder_eph_pub,
+            responder_nonce: resp.responder_nonce,
             responder_id_pub: resp.responder_id_pub,
-            responder_sig: resp.responder_sig,
             name: resp.name,
             platform: resp.platform.unwrap_or_default(),
             app_version: resp.app_version.unwrap_or_default(),
-            sas: resp.sas,
+        })
+    }
+
+    #[cfg(hub_link)]
+    async fn link_pair_reveal(
+        &self,
+        req: LinkPairRevealRequest,
+    ) -> Result<LinkPairRevealResponse, ApiError> {
+        let link = self.link.as_ref().ok_or_else(link_disabled)?;
+        let resp = link
+            .pair_reveal_wire(WireReveal {
+                session_id: req.session_id,
+                initiator_eph_pub: req.initiator_eph_pub,
+                initiator_nonce: req.initiator_nonce,
+            })
+            .map_err(map_link_err)?;
+        Ok(LinkPairRevealResponse {
+            responder_sig: resp.responder_sig,
         })
     }
 
@@ -1231,6 +1250,8 @@ fn map_link_err(e: LinkError) -> ApiError {
         | LinkError::RejectedByPeer
         | LinkError::PairingTimeout
         | LinkError::IdentityMismatch(_)
+        | LinkError::CommitmentMismatch
+        | LinkError::UnsupportedVersion
         | LinkError::NotFluxDown(_) => ApiError::BadRequest(e.to_string()),
         LinkError::Unreachable | LinkError::Unavailable => ApiError::Unavailable,
         other => ApiError::Internal(other.to_string()),

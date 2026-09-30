@@ -26,7 +26,7 @@ pub fn service_hello(instance_id: impl Into<String>, capabilities: Vec<String>) 
     ServiceHello::new(
         ServiceRole::Daemon,
         SERVICE_NAME,
-        env!("CARGO_PKG_VERSION"),
+        fluxdown_protocol::APP_VERSION,
         instance_id,
         capabilities,
     )
@@ -44,6 +44,7 @@ mod tests {
 
         assert_eq!(hello.role, ServiceRole::Daemon);
         assert_eq!(hello.service_name, SERVICE_NAME);
+        assert_eq!(hello.service_version, fluxdown_protocol::APP_VERSION);
         assert_eq!(hello.protocol_version, PROTOCOL_VERSION);
         assert_eq!(hello.instance_id, "daemon-instance");
     }

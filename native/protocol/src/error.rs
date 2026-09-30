@@ -57,6 +57,8 @@ pub enum ErrorReason {
     PluginPackageTooLarge,
     /// 插件包 / 插件目录未通过 manifest、脚本或版本门槛校验。
     PluginPackageInvalid,
+    /// 市场安装：最新可装版本与用户确认时看到的版本不一致（需刷新目录后重新确认权限）。
+    MarketVersionChanged,
     /// FluxCloud：账号或密码错误。
     InvalidCredentials,
     /// FluxCloud：邮箱验证码错误或已过期。
@@ -107,6 +109,8 @@ pub enum ErrorReason {
     PairingSignatureInvalid,
     /// 局域网配对：不能与自身配对。
     PairingSelf,
+    /// 局域网配对：对端配对协议版本不兼容（含旧版对端），两端需升级到同一版本。
+    PairingVersionMismatch,
     /// 局域网互联：目标设备未配对或已解除配对。
     PeerNotPaired,
     /// 局域网互联：已配对设备当前不可达。

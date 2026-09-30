@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fluxdown_engine::db::{Db, EngineWriteGuard};
+use fluxdown_engine::db::{Db, DbError, EngineWriteGuard};
 use fluxdown_engine::download_manager;
 use fluxdown_engine::events::EventSink;
 use fluxdown_engine::proxy_config::ProxyConfig;
@@ -22,7 +22,7 @@ use crate::actor::PluginEvent;
 use crate::blob_store::BlobStore;
 use crate::config::{DaemonConfig, bt_config_from_map};
 use crate::event_hub::{DaemonEngineEventSink, DaemonEventHub};
-use crate::http::{load_or_create_bearer, serve};
+use crate::http::{load_or_create_token, serve};
 use crate::selection::DaemonSelection;
 use crate::service::DaemonService;
 
@@ -88,6 +88,8 @@ pub async fn run(
     )
     .await?;
     apply_manager_settings(&mut engine, &all_config);
+    // 引擎随后被 actor 独占：先取走租约句柄，供下面的心跳在引擎之外校验。
+    let lease_guard = engine.write_guard();
 
     let activity_journal = engine.activity_journal();
     let progress_task = engine.manager.take_progress_rx().map(|progress| {
@@ -130,8 +132,8 @@ pub async fn run(
         }
     });
 
-    let bearer =
-        load_or_create_bearer(&data_dir, process_config.token_file_override.as_deref()).await?;
+    let token =
+        load_or_create_token(&data_dir, process_config.token_file_override.as_deref()).await?;
     let blobs = Arc::new(BlobStore::open(data_dir.join("daemon-blobs")).await?);
     let hello = crate::service_hello(uuid::Uuid::new_v4().to_string(), runtime_capabilities(true));
     let service = Arc::new(
@@ -157,11 +159,14 @@ pub async fn run(
     tracing::info!(address = %process_config.bind_addr, "fluxdownd control plane listening");
 
     let sweep_task = spawn_blob_sweeper(blobs.clone(), cancel.clone());
-    let serve_fut = serve(listener, service, bearer, cancel.clone());
+    let mut lease_task = spawn_lease_monitor(lease_guard, cancel.clone());
+    let serve_fut = serve(listener, service, token, cancel.clone());
     tokio::pin!(serve_fut);
     // actor 任务一旦意外结束，daemon 只剩只读快照可用（写操作全部 Unavailable）；
     // 此时主动退出，交给上层 supervisor 重拉进程。
     let mut actor_finished = false;
+    let mut lease_finished = false;
+    let mut lease_lost = false;
     let result = tokio::select! {
         result = &mut serve_fut => result,
         joined = &mut actor_task => {
@@ -178,12 +183,49 @@ pub async fn run(
                 Err(std::io::Error::other("daemon actor stopped unexpectedly"))
             }
         }
+        // 监控只会在取消或租约确认丢失时结束。
+        lease = &mut lease_task => {
+            lease_finished = true;
+            if cancel.is_cancelled() {
+                serve_fut.await
+            } else {
+                lease_lost = true;
+                match lease {
+                    Ok(Err(error)) => {
+                        tracing::error!(error = %error, "engine writer lease lost; shutting down");
+                    }
+                    Ok(Ok(())) => {
+                        tracing::error!("engine writer lease monitor exited unexpectedly; shutting down");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "engine writer lease monitor failed; shutting down");
+                    }
+                }
+                cancel.cancel();
+                let _ = serve_fut.await;
+                Err(std::io::Error::other("engine writer lease lost"))
+            }
+        }
     };
+    if lease_lost {
+        // 租约已被他人夺走：常规停机会写库（暂停任务、冲刷进度与活动日志），可能踩到新的
+        // 写入者，所以放弃收尾直接退出，由上层 supervisor 重拉进程。
+        actor_task.abort();
+        if let Some(progress_task) = &progress_task {
+            progress_task.abort();
+        }
+        startup_maintenance_task.abort();
+        sweep_task.abort();
+        return result.map_err(Into::into);
+    }
     if !actor_finished {
         let _ = tokio::time::timeout(Duration::from_secs(10), actor.shutdown()).await;
     }
     cancel.cancel();
     let _ = sweep_task.await;
+    if !lease_finished {
+        let _ = lease_task.await;
+    }
     if !actor_finished
         && tokio::time::timeout(Duration::from_secs(10), &mut actor_task)
             .await
@@ -459,6 +501,69 @@ fn spawn_blob_sweeper(
     })
 }
 
+/// 引擎写入者租约的心跳间隔：PostgreSQL advisory lock 的寿命等于持锁连接的寿命，
+/// 连接被中间设备静默断开后必须在有限时间内发现。
+const LEASE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// 单次校验失败（多半是网络抖动）后的重试间隔与总尝试次数。
+const LEASE_RETRY_DELAY: Duration = Duration::from_secs(3);
+const LEASE_CHECK_ATTEMPTS: u32 = 3;
+
+fn spawn_lease_monitor(
+    guard: Arc<EngineWriteGuard>,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<Result<(), DbError>> {
+    tokio::spawn(monitor_writer_lease(
+        move || {
+            let guard = guard.clone();
+            async move { guard.verify_lease().await }
+        },
+        cancel,
+        LEASE_CHECK_INTERVAL,
+        LEASE_RETRY_DELAY,
+        LEASE_CHECK_ATTEMPTS,
+    ))
+}
+
+/// 每隔 `interval` 调用一次 `verify`，直到取消。
+///
+/// 租约被别的会话确认夺走（`WriterLeaseHeld`）立即返回错误；其它失败先按 `retry_delay`
+/// 重试，连续 `attempts` 次都失败才视为租约已丢失——持锁连接已断时每次都会失败，
+/// 而网络抖动不应该让整个 daemon 退出。
+async fn monitor_writer_lease<F, Fut>(
+    verify: F,
+    cancel: CancellationToken,
+    interval: Duration,
+    retry_delay: Duration,
+    attempts: u32,
+) -> Result<(), DbError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<(), DbError>>,
+{
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return Ok(()),
+            () = tokio::time::sleep(interval) => {}
+        }
+        let mut attempt = 1;
+        loop {
+            match verify().await {
+                Ok(()) => break,
+                Err(error @ DbError::WriterLeaseHeld(_)) => return Err(error),
+                Err(error) if attempt >= attempts => return Err(error),
+                Err(error) => {
+                    tracing::warn!(attempt, error = %error, "engine writer lease check failed; retrying");
+                    attempt += 1;
+                    tokio::select! {
+                        () = cancel.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(retry_delay) => {}
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// 只宣称已完成初始化的能力。
 #[must_use]
 pub fn runtime_capabilities(engine_initialized: bool) -> Vec<String> {
@@ -499,7 +604,14 @@ fn config_enabled(config: &HashMap<String, String>, key: &str, default: bool) ->
 
 #[cfg(test)]
 mod tests {
-    use super::bootstrap_database;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use fluxdown_engine::db::DbError;
+    use tokio_util::sync::CancellationToken;
+
+    use super::{bootstrap_database, monitor_writer_lease};
 
     #[tokio::test]
     async fn fresh_database_snapshot_contains_builtin_queues() {
@@ -541,5 +653,96 @@ mod tests {
         );
         drop(db);
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    /// 租约校验探针：按脚本依次返回结果，脚本耗尽后恒成功；同时记录被调用次数。
+    fn scripted(
+        script: Vec<Result<(), DbError>>,
+    ) -> (
+        impl Fn() -> std::future::Ready<Result<(), DbError>>,
+        Arc<AtomicUsize>,
+    ) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(std::sync::Mutex::new(std::collections::VecDeque::from(
+            script,
+        )));
+        let counter = calls.clone();
+        let verify = move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let next = script
+                .lock()
+                .ok()
+                .and_then(|mut script| script.pop_front())
+                .unwrap_or(Ok(()));
+            std::future::ready(next)
+        };
+        (verify, calls)
+    }
+
+    fn transient() -> DbError {
+        DbError::Io(std::io::Error::other("connection reset"))
+    }
+
+    const TICK: Duration = Duration::from_millis(5);
+
+    #[tokio::test]
+    async fn lease_monitor_keeps_running_until_cancelled_while_the_lease_holds() {
+        let (verify, calls) = scripted(Vec::new());
+        let cancel = CancellationToken::new();
+        let monitor = tokio::spawn(monitor_writer_lease(verify, cancel.clone(), TICK, TICK, 3));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!monitor.is_finished());
+        assert!(
+            calls.load(Ordering::SeqCst) >= 2,
+            "lease is checked periodically"
+        );
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), monitor)
+            .await
+            .expect("monitor stops on cancel")
+            .expect("monitor task");
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn lease_held_by_another_session_is_fatal_without_retrying() {
+        let (verify, calls) = scripted(vec![Err(DbError::WriterLeaseHeld("pg".to_owned()))]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            monitor_writer_lease(verify, CancellationToken::new(), TICK, TICK, 3),
+        )
+        .await
+        .expect("monitor reports the loss");
+        assert!(matches!(result, Err(DbError::WriterLeaseHeld(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_check_failures_recover_but_persistent_ones_are_fatal() {
+        // 两次瞬时失败后恢复：不误杀。
+        let (verify, calls) = scripted(vec![Err(transient()), Err(transient())]);
+        let cancel = CancellationToken::new();
+        let monitor = tokio::spawn(monitor_writer_lease(verify, cancel.clone(), TICK, TICK, 3));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!monitor.is_finished(), "recovered monitor keeps running");
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+        cancel.cancel();
+        let _ = monitor.await;
+
+        // 连续 `attempts` 次都失败：连接已不可用，租约视为丢失。
+        let (verify, calls) = scripted(vec![
+            Err(transient()),
+            Err(transient()),
+            Err(transient()),
+            Err(transient()),
+        ]);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            monitor_writer_lease(verify, CancellationToken::new(), TICK, TICK, 3),
+        )
+        .await
+        .expect("monitor gives up");
+        assert!(matches!(result, Err(DbError::Io(_))));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 }

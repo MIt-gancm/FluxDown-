@@ -4,13 +4,18 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use fluxdown_protocol::{
-    DaemonEvent, SelectionKind, SelectionOutcome, SelectionRequestDto, SelectionResolutionDto,
+    DaemonEvent, EventFrame, SelectionKind, SelectionOutcome, SelectionRequestDto,
+    SelectionResolutionDto, ServiceEvent, SnapshotBody, TaskDto, WsServerMsg,
 };
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use crate::event_hub::DaemonEventHub;
 
 const RESOLVED_HISTORY_LIMIT: usize = 1024;
+
+/// 任务表里的「已暂停」状态。
+const TASK_STATUS_PAUSED: i32 = 2;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum SelectionType {
@@ -198,6 +203,113 @@ impl DaemonSelection {
             self.events
                 .publish(DaemonEvent::SelectionResolved { request_id });
         }
+    }
+
+    /// 撤销某任务所有待处理的选择（任务已暂停 / 删除，继续等待用户只会弹出无主的对话框）。
+    ///
+    /// Bt / Variant 以「取消」答复引擎；HLS 没有取消语义，采用默认值。随后广播
+    /// `SelectionResolved`，迟到的客户端答复得到 conflict。返回撤销条数。
+    pub fn cancel_task(&self, task_id: &str) -> usize {
+        self.cancel_matching(|pending_task| pending_task == task_id)
+    }
+
+    /// 撤销所属任务在 `tasks` 中已不存在或处于暂停状态的待处理选择。
+    fn cancel_for_tasks(&self, tasks: &[TaskDto]) {
+        if lock_or_recover(&self.state).pending.is_empty() {
+            return;
+        }
+        let statuses: HashMap<&str, i32> = tasks
+            .iter()
+            .map(|task| (task.task_id.as_str(), task.status))
+            .collect();
+        self.cancel_matching(|task_id| {
+            statuses
+                .get(task_id)
+                .is_none_or(|status| *status == TASK_STATUS_PAUSED)
+        });
+    }
+
+    fn cancel_matching(&self, mut matches: impl FnMut(&str) -> bool) -> usize {
+        let cancelled = {
+            let mut state = lock_or_recover(&self.state);
+            let ids: Vec<String> = state
+                .pending
+                .iter()
+                .filter(|(_, pending)| matches(&pending.task_id))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let mut cancelled = Vec::with_capacity(ids.len());
+            for id in ids {
+                let Some(selection) = state.pending.remove(&id) else {
+                    continue;
+                };
+                let outcome = match selection.kind {
+                    SelectionType::Hls => selection.default_choice,
+                    SelectionType::Bt | SelectionType::Variant => SelectionOutcome::Cancelled,
+                };
+                let _ = selection.sender.send(outcome);
+                remember_resolved(&mut state.resolved, id.clone());
+                cancelled.push(id);
+            }
+            cancelled
+        };
+        let count = cancelled.len();
+        for request_id in cancelled {
+            self.events
+                .publish(DaemonEvent::SelectionResolved { request_id });
+        }
+        count
+    }
+
+    /// 事件帧里任务被暂停 / 删除时撤销该任务的待处理选择。
+    fn observe_frame(&self, frame: &EventFrame) {
+        let ServiceEvent::Daemon(event) = &frame.event else {
+            return;
+        };
+        match event {
+            DaemonEvent::TaskDeleted { task_id } => {
+                self.cancel_task(task_id);
+            }
+            DaemonEvent::TaskChanged(task) if task.status == TASK_STATUS_PAUSED => {
+                self.cancel_task(&task.task_id);
+            }
+            DaemonEvent::Engine(WsServerMsg::TaskProgress {
+                task_id,
+                status,
+                error_message,
+                ..
+            }) if *status == TASK_STATUS_PAUSED || (*status == 4 && error_message == "deleted") => {
+                self.cancel_task(task_id);
+            }
+            DaemonEvent::Engine(WsServerMsg::TasksSnapshot { tasks }) => {
+                self.cancel_for_tasks(tasks);
+            }
+            DaemonEvent::SnapshotReplaced(snapshot) => self.cancel_for_tasks(&snapshot.tasks),
+            _ => {}
+        }
+    }
+
+    /// 后台监听任务事件：任务暂停 / 删除即撤销其待处理选择。事件通道滞后时按当前
+    /// 投影整体复核一次。`cancel` 触发后退出。
+    pub fn spawn_task_watcher(&self, cancel: CancellationToken) {
+        let selection = self.clone();
+        let mut receiver = self.events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    frame = receiver.recv() => match frame {
+                        Ok(frame) => selection.observe_frame(&frame),
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if let SnapshotBody::Daemon(body) = selection.events.snapshot().body {
+                                selection.cancel_for_tasks(&body.tasks);
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                }
+            }
+        });
     }
 }
 
@@ -490,5 +602,137 @@ mod tests {
             receiver.await.expect("default result"),
             SelectionOutcome::Hls { index: 0 }
         );
+    }
+
+    fn variant_request(id: &str, task_id: &str) -> SelectionRequestDto {
+        SelectionRequestDto {
+            request_id: id.to_owned(),
+            task_id: task_id.to_owned(),
+            kind: SelectionKind::Variant {
+                options: Vec::new(),
+            },
+            default_choice: SelectionOutcome::Variant { index: 1 },
+            deadline_unix_ms: i64::MAX,
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_task_replies_cancelled_and_ignores_other_tasks() {
+        let manager = manager();
+        manager.subscribe("connection-1".to_owned());
+        let SelectionWait::Pending(doomed) = manager.begin(variant_request("v1", "gone")) else {
+            panic!("subscribed request did not wait");
+        };
+        let SelectionWait::Pending(kept) = manager.begin(variant_request("v2", "alive")) else {
+            panic!("subscribed request did not wait");
+        };
+        let SelectionWait::Pending(hls) = manager.begin(SelectionRequestDto {
+            task_id: "gone".to_owned(),
+            ..hls_request("h1")
+        }) else {
+            panic!("subscribed request did not wait");
+        };
+        assert_eq!(manager.cancel_task("gone"), 2);
+        assert_eq!(
+            doomed.await.expect("cancel reply"),
+            SelectionOutcome::Cancelled
+        );
+        assert_eq!(
+            hls.await.expect("hls falls back to default"),
+            SelectionOutcome::Hls { index: 0 }
+        );
+        assert!(matches!(
+            manager.resolve(SelectionResolutionDto {
+                request_id: "v1".to_owned(),
+                outcome: SelectionOutcome::Variant { index: 0 },
+            }),
+            Err(SelectionError::Conflict)
+        ));
+        manager
+            .resolve(SelectionResolutionDto {
+                request_id: "v2".to_owned(),
+                outcome: SelectionOutcome::Variant { index: 0 },
+            })
+            .expect("unrelated task keeps its selection");
+        assert_eq!(
+            kept.await.expect("user reply"),
+            SelectionOutcome::Variant { index: 0 }
+        );
+    }
+
+    #[tokio::test]
+    async fn task_events_revoke_selections_of_paused_or_deleted_tasks() {
+        use fluxdown_protocol::{EventFrame, ServiceEvent, WsServerMsg};
+
+        let manager = manager();
+        manager.subscribe("connection-1".to_owned());
+        let frame = |event| EventFrame {
+            epoch: "e".to_owned(),
+            sequence: 1,
+            event: ServiceEvent::Daemon(event),
+        };
+        let progress = |task_id: &str, status: i32, error_message: &str| {
+            frame(fluxdown_protocol::DaemonEvent::Engine(
+                WsServerMsg::TaskProgress {
+                    task_id: task_id.to_owned(),
+                    status,
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    speed: 0,
+                    upload_speed: 0,
+                    file_name: String::new(),
+                    save_dir: String::new(),
+                    url: String::new(),
+                    error_message: error_message.to_owned(),
+                    uploaded_bytes: 0,
+                    seeding_status: 0,
+                    seeding_message: String::new(),
+                    seeding_time_secs: 0,
+                },
+            ))
+        };
+        let SelectionWait::Pending(running) = manager.begin(variant_request("a", "running")) else {
+            panic!("subscribed request did not wait");
+        };
+        let SelectionWait::Pending(paused) = manager.begin(variant_request("b", "paused")) else {
+            panic!("subscribed request did not wait");
+        };
+        let SelectionWait::Pending(deleted) = manager.begin(variant_request("c", "deleted")) else {
+            panic!("subscribed request did not wait");
+        };
+        manager.observe_frame(&progress("running", 5, ""));
+        manager.observe_frame(&progress("paused", 2, ""));
+        manager.observe_frame(&progress("deleted", 4, "deleted"));
+        assert_eq!(paused.await.expect("paused"), SelectionOutcome::Cancelled);
+        assert_eq!(deleted.await.expect("deleted"), SelectionOutcome::Cancelled);
+        manager
+            .resolve(SelectionResolutionDto {
+                request_id: "a".to_owned(),
+                outcome: SelectionOutcome::Variant { index: 0 },
+            })
+            .expect("running task keeps its selection");
+        assert_eq!(
+            running.await.expect("running"),
+            SelectionOutcome::Variant { index: 0 }
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_drops_selections_of_missing_tasks() {
+        use fluxdown_protocol::{EventFrame, ServiceEvent, WsServerMsg};
+
+        let manager = manager();
+        manager.subscribe("connection-1".to_owned());
+        let SelectionWait::Pending(orphan) = manager.begin(variant_request("o", "orphan")) else {
+            panic!("subscribed request did not wait");
+        };
+        manager.observe_frame(&EventFrame {
+            epoch: "e".to_owned(),
+            sequence: 1,
+            event: ServiceEvent::Daemon(fluxdown_protocol::DaemonEvent::Engine(
+                WsServerMsg::TasksSnapshot { tasks: Vec::new() },
+            )),
+        });
+        assert_eq!(orphan.await.expect("orphan"), SelectionOutcome::Cancelled);
     }
 }

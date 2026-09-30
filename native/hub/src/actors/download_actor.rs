@@ -2446,7 +2446,7 @@ pub async fn run(
                                     let db = engine.db.clone();
                                     let data_dir = engine.data_dir.clone();
                                     tokio::spawn(async move {
-                                        let result = client.install_latest(&plugin_id).await;
+                                        let result = client.install_latest(&plugin_id, None).await;
                                         let (ok, identity, message) = match result {
                                             Ok(identity) => (true, identity, String::new()),
                                             Err(e) => (false, plugin_id.clone(), e.to_string()),
@@ -2943,7 +2943,7 @@ async fn handle_api_command(
         ApiCommand::PauseAll { ack } => {
             // pending(0) / downloading(1) / preparing(5) 均可暂停。
             let ids = task_ids_by_status(&engine.db, &[0, 1, 5]).await;
-            engine.manager.batch_pause(&ids).await;
+            engine.manager.batch_pause_all(&ids).await;
             let _ = ack.send(());
         }
         ApiCommand::ContinueAll { ack } => {
@@ -3043,7 +3043,10 @@ async fn handle_api_command(
         }
         ApiCommand::RssRefresh { source_id, ack } => {
             // 同步派发：抓取本身在 off-actor worker 里跑，结果经 `rss_rx` 回流。
-            let ok = engine.manager.refresh_rss_source(&source_id);
+            let ok = !matches!(
+                engine.manager.refresh_rss_source(&source_id),
+                fluxdown_engine::rss::RssRefreshOutcome::NotFound
+            );
             let _ = ack.send(ok);
         }
         ApiCommand::RssItemAction {

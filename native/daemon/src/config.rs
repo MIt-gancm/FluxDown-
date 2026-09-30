@@ -328,6 +328,27 @@ mod tests {
     }
 
     #[test]
+    fn component_mirror_base_patch_rejects_plain_http_with_field_name() {
+        let insecure = BTreeMap::from([(
+            "component_mirror_base".to_owned(),
+            "http://gh-proxy.example.com".to_owned(),
+        )]);
+        assert!(matches!(
+            validate_config_patch(&insecure),
+            Err(ConfigError::InvalidValue { field, .. }) if field == "component_mirror_base"
+        ));
+        let secure = BTreeMap::from([(
+            "component_mirror_base".to_owned(),
+            "https://gh-proxy.example.com/".to_owned(),
+        )]);
+        let normalized = validate_config_patch(&secure).expect("https mirror accepted");
+        assert_eq!(
+            normalized["component_mirror_base"],
+            "https://gh-proxy.example.com"
+        );
+    }
+
+    #[test]
     fn public_projection_keeps_read_only_keys_and_hides_private_ones() {
         let all = HashMap::from([
             ("max_concurrent_tasks".to_owned(), "5".to_owned()),

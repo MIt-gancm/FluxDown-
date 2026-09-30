@@ -16,6 +16,18 @@ pub enum LinkError {
     #[error("peer identity signature verification failed")]
     BadSignature,
 
+    /// 发起方揭示的临时公钥/随机数与其 hello 里先行发出的承诺不符——握手被篡改
+    /// 或发起方不守协议，会话随即作废。
+    #[error("pairing commitment does not match the revealed values")]
+    CommitmentMismatch,
+
+    /// 对端配对协议版本与本机不兼容。配对只认当前协议版本，不做降级：旧版对端
+    /// 没有临时公钥承诺，任何兼容分支都会让握手退回可被中间人操纵 SAS 的形态。
+    #[error(
+        "unsupported link pairing protocol version; update both devices to the same FluxDown release"
+    )]
+    UnsupportedVersion,
+
     /// 双端持有同一身份（共享同一引擎数据库的进程互相配对）——设备不能与自己配对。
     #[error("cannot pair a device with itself (both ends share the same link identity)")]
     SelfPairing,
@@ -89,6 +101,12 @@ impl LinkError {
             "pairing code invalid or expired" => Some(Self::InvalidCode),
             "pairing session not found or expired" => Some(Self::SessionExpired),
             "peer identity signature verification failed" => Some(Self::BadSignature),
+            "pairing commitment does not match the revealed values" => {
+                Some(Self::CommitmentMismatch)
+            }
+            "unsupported link pairing protocol version; update both devices to the same FluxDown release" => {
+                Some(Self::UnsupportedVersion)
+            }
             "cannot pair a device with itself (both ends share the same link identity)" => {
                 Some(Self::SelfPairing)
             }

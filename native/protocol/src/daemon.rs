@@ -90,6 +90,11 @@ pub struct DaemonRuntimeStatsDto {
     pub total_upload_bps: i64,
     pub disk_free_bytes: Option<u64>,
     pub save_dir: String,
+    /// 「等待自动重试」的任务数：自动重试 / 备用链路 / 插件重试已排程、尚未重新派发。
+    /// 这些任务在任务表里仍是失败状态，`activeTasks` / `pendingTasks` 看不到它们；
+    /// 「完成后关机」「空闲退出」等联动必须把它们算作仍有工作。
+    #[serde(default)]
+    pub retry_pending_tasks: u32,
 }
 
 /// daemon 托管组件标识。
@@ -138,6 +143,30 @@ pub struct DaemonCreateTaskParams {
     pub torrent_blob_id: Option<String>,
     #[serde(default)]
     pub unattended: bool,
+    /// 调用方已知的文件大小（字节，`>0` 才生效；缺省 / 非正数 = 未知）。
+    /// 浏览器扩展对一次性 URL 已拿到 Content-Length 时透传，引擎据此创建任务。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint_file_size: Option<i64>,
+}
+
+/// 批量任务操作参数（`daemon.task.pauseMany` / `daemon.task.resumeMany`）。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonTaskIdsParams {
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+}
+
+/// `daemon.task.deleteMany` 参数。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonDeleteTasksParams {
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    #[serde(default)]
+    pub delete_files: bool,
 }
 
 /// CDN 样本的持久化租约。
@@ -377,6 +406,9 @@ pub struct TaskDto {
     /// 任务级不活跃做种时长上限（分钟）。哨兵语义同上。
     #[serde(default = "default_seed_limit_inherit")]
     pub seed_inactive_time_limit_minutes: i64,
+    /// 任务级做种上传限速（字节/秒），0 = 未设置（跟随全局）。
+    #[serde(default)]
+    pub seed_upload_limit_bps: i64,
 }
 
 /// 命名队列信息（`GET /api/v1/queues` 响应）。
@@ -751,6 +783,10 @@ pub struct MarketEntryDto {
 #[serde(rename_all = "camelCase")]
 pub struct MarketInstallRequest {
     pub plugin_id: String,
+    /// 用户确认权限时看到的版本；最新可装版本与之不一致时拒绝安装（`Conflict`），
+    /// 由客户端刷新目录后重新确认。缺省 = 不钉版本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -930,17 +966,25 @@ pub struct LinkPingInfo {
 }
 
 /// 配对 `hello` 请求（发起方 → 响应方）。全部密钥/签名字段为 base64。
+///
+/// 配对协议版本 2：发起方在这一步只交出临时公钥与随机数的**承诺**，临时公钥本身
+/// 要等响应方回出自己的临时值之后才在 `pair/reveal` 里揭示。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkPairHelloRequest {
+    /// 发起方的配对协议版本。旧版发起方没有这个字段（按 0 处理），与响应方版本不一致
+    /// 一律以版本不兼容拒绝。
+    #[serde(default)]
+    pub protocol_version: u32,
     /// 一次性配对码（响应方 UI 展示、用户手输）。
     pub code: String,
-    /// 发起方临时 X25519 公钥（base64）。
-    pub initiator_eph_pub: String,
     /// 发起方 Ed25519 身份公钥（base64）。
     pub initiator_id_pub: String,
-    /// 发起方对握手转录的 Ed25519 签名（base64）。
+    /// 发起方临时 X25519 公钥与随机数的承诺 `sha256(eph_pub || nonce)`（base64）。
+    #[serde(default)]
+    pub initiator_commit: String,
+    /// 发起方对 hello（码、身份公钥、承诺、自报信息）的 Ed25519 签名（base64）。
     pub initiator_sig: String,
     /// 发起方展示名。
     pub name: String,
@@ -955,22 +999,48 @@ pub struct LinkPairHelloRequest {
     pub initiator_addrs: Vec<String>,
 }
 
-/// 配对 `hello` 回复（响应方 → 发起方）。
+/// 配对 `hello` 回复（响应方 → 发起方）：本次会话全新的临时公钥与随机数。不含 SAS
+/// 与签名——响应方此刻还看不到发起方的临时公钥，两者都在 `pair/reveal` 之后才产生。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct LinkPairHelloResponse {
+    /// 响应方的配对协议版本。
+    pub protocol_version: u32,
     pub session_id: String,
+    /// 响应方本次会话的临时 X25519 公钥（base64）。
     pub responder_eph_pub: String,
+    /// 响应方本次会话的随机数（base64）。
+    pub responder_nonce: String,
     pub responder_id_pub: String,
-    pub responder_sig: String,
     pub name: String,
     #[serde(default)]
     pub platform: String,
     #[serde(default)]
     pub app_version: String,
-    /// 供响应方本地展示的 SAS（应与发起方计算一致）。
-    pub sas: String,
+}
+
+/// 配对 `reveal` 请求（发起方 → 响应方）：揭示 `hello` 里承诺过的临时公钥与随机数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairRevealRequest {
+    /// `pair/hello` 回复里的会话 id。
+    pub session_id: String,
+    /// 发起方临时 X25519 公钥（base64）。
+    pub initiator_eph_pub: String,
+    /// 发起方随机数（base64）。
+    pub initiator_nonce: String,
+}
+
+/// 配对 `reveal` 回复（响应方 → 发起方）：响应方对完整握手转录的 Ed25519 签名。SAS
+/// 不上线，两端各自在本机屏幕上展示。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct LinkPairRevealResponse {
+    /// 响应方对完整转录的 Ed25519 签名（base64）。
+    pub responder_sig: String,
 }
 
 /// 配对 `confirm` 请求：SAS 核对后确认/拒绝。

@@ -829,6 +829,27 @@ pub struct CaptureResolveParams {
     pub request: Option<crate::daemon::CreateTaskRequest>,
 }
 
+/// `agent.capture.submitTorrentFile` 参数。
+///
+/// `silent=true`（系统打开 / 关联启动）全选文件直接建任务；`silent=false`（用户主动选择）
+/// 由 daemon 发 BT 文件选择请求。`saveDir` / `queueId` / `startPaused` 缺省维持旧行为
+/// （daemon 默认目录 / 默认队列 / 立即开始），新建下载表单入口携带表单值。
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureSubmitTorrentFileParams {
+    /// 本机 `.torrent` 路径。
+    pub path: String,
+    #[serde(default)]
+    pub silent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub save_dir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_paused: Option<bool>,
+}
+
 /// 桌面系统集成状态（开机自启、`.torrent` 关联、URL scheme 注册）。
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -1148,7 +1169,7 @@ impl CustomCategoryDto {
 mod capture_dto_tests {
     use serde_json::json;
 
-    use super::{CaptureResolveParams, PendingCaptureDto};
+    use super::{CaptureResolveParams, CaptureSubmitTorrentFileParams, PendingCaptureDto};
 
     #[test]
     fn resolve_params_without_request_field_deserializes() {
@@ -1160,6 +1181,37 @@ mod capture_dto_tests {
         assert_eq!(params.transaction_id, "tx-1");
         assert!(params.accepted);
         assert!(params.request.is_none());
+    }
+
+    #[test]
+    fn torrent_file_params_keep_legacy_shape_and_carry_form_options() {
+        let legacy: CaptureSubmitTorrentFileParams = serde_json::from_value(json!({
+            "path": "/tmp/a.torrent",
+            "silent": true,
+            "association": "torrent",
+        }))
+        .expect("legacy caller without form options");
+        assert!(legacy.silent);
+        assert_eq!(legacy.save_dir, None);
+        assert_eq!(legacy.queue_id, None);
+        assert_eq!(legacy.start_paused, None);
+        assert_eq!(
+            serde_json::to_value(&legacy).expect("serialize"),
+            json!({ "path": "/tmp/a.torrent", "silent": true })
+        );
+
+        let form: CaptureSubmitTorrentFileParams = serde_json::from_value(json!({
+            "path": "/tmp/a.torrent",
+            "silent": false,
+            "saveDir": "/data",
+            "queueId": "q1",
+            "startPaused": true,
+        }))
+        .expect("form caller");
+        assert!(!form.silent);
+        assert_eq!(form.save_dir.as_deref(), Some("/data"));
+        assert_eq!(form.queue_id.as_deref(), Some("q1"));
+        assert_eq!(form.start_paused, Some(true));
     }
 
     #[test]

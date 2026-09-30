@@ -1,5 +1,5 @@
-//! 设备互联加密原语：指纹、SAS 短认证串、链路密钥派生、数据面 HMAC 鉴权 +
-//! AEAD 加密。
+//! 设备互联加密原语：指纹、临时公钥承诺、SAS 短认证串、链路密钥派生、数据面 HMAC
+//! 鉴权 + AEAD 加密。
 //!
 //! 全部基于已在引擎中的 `sha2 0.10`（digest 0.10）+ `hkdf 0.12` + `hmac 0.12`，
 //! 三者 digest 版本一致，避免类型 trait bound 冲突；数据面 body 加密另加
@@ -34,57 +34,92 @@ pub fn fingerprint(public_key: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// 从 X25519 ECDH 共享密钥 `z` + 双方临时公钥派生 6 位 SAS。
+/// 计算发起方临时公钥 + 随机数的承诺：`sha256(域分隔串 || eph_pub || nonce)`。
 ///
-/// 两端公钥排序后拼接（顺序无关），确保 initiator 与 responder 计算出**相同** SAS。
-/// 中间人会与两端各自建立不同的 `z` → 两端 SAS 不一致 → 用户肉眼核对即可发现。
+/// 配对握手里发起方先发承诺、响应方回出自己的临时公钥之后发起方才揭示
+/// `eph_pub`/`nonce`（响应方用 [`verify_eph_commitment`] 复核）。承诺把发起方的
+/// 临时密钥在响应方亮出自己的值之前钉死——中间人无法在看到一端的值之后再为另一端
+/// 挑选能凑出相同 SAS 的临时密钥。
+///
+/// # Examples
+///
+/// ```
+/// use fluxdown_link::crypto::{eph_commitment, verify_eph_commitment};
+/// let (eph, nonce) = ([1u8; 32], [2u8; 32]);
+/// let c = eph_commitment(&eph, &nonce);
+/// assert!(verify_eph_commitment(&c, &eph, &nonce));
+/// assert!(!verify_eph_commitment(&c, &[9u8; 32], &nonce));
+/// ```
+#[must_use]
+pub fn eph_commitment(eph_pub: &[u8; 32], nonce: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"fluxdown-link-commit-v2");
+    hasher.update(eph_pub);
+    hasher.update(nonce);
+    hasher.finalize().into()
+}
+
+/// 常量时间校验承诺是否对应给定的临时公钥与随机数。
+#[must_use]
+pub fn verify_eph_commitment(commitment: &[u8; 32], eph_pub: &[u8; 32], nonce: &[u8; 32]) -> bool {
+    ct_eq(commitment, &eph_commitment(eph_pub, nonce))
+}
+
+/// 配对转录摘要：对整段握手转录字节取 `sha256`。SAS 与链路密钥都以它作为
+/// HKDF 的 info，转录里任意一个字段（身份公钥、临时公钥、随机数、配对码、自报信息）
+/// 不同，两端派生出的 SAS 与密钥就不同。
+#[must_use]
+pub fn hash_transcript(transcript: &[u8]) -> [u8; 32] {
+    Sha256::digest(transcript).into()
+}
+
+/// 从 X25519 ECDH 共享密钥 `z` + 完整握手转录摘要派生 6 位 SAS。
+///
+/// 转录按角色（发起方/响应方）有序，两端从各自持有的同一份转录得到同一摘要，
+/// 因而算出**相同** SAS。中间人与两端各自建立的 `z` 与转录都不同 → 两端 SAS 不一致
+/// → 用户肉眼核对即可发现；临时公钥承诺保证中间人无法事后凑出相同 SAS。
 ///
 /// # Examples
 ///
 /// ```
 /// use fluxdown_link::crypto::derive_sas;
 /// let z = [7u8; 32];
-/// let a = [1u8; 32];
-/// let b = [2u8; 32];
-/// // 顺序无关：交换 a/b 得到同一 SAS。
-/// assert_eq!(derive_sas(&z, &a, &b), derive_sas(&z, &b, &a));
-/// assert_eq!(derive_sas(&z, &a, &b).len(), 6);
+/// let transcript = [1u8; 32];
+/// assert_eq!(derive_sas(&z, &transcript), derive_sas(&z, &transcript));
+/// assert_ne!(derive_sas(&z, &transcript), derive_sas(&z, &[2u8; 32]));
+/// assert_eq!(derive_sas(&z, &transcript).len(), 6);
 /// ```
 #[must_use]
-pub fn derive_sas(z: &[u8], pub_a: &[u8; 32], pub_b: &[u8; 32]) -> String {
-    let (lo, hi) = if pub_a <= pub_b {
-        (pub_a, pub_b)
-    } else {
-        (pub_b, pub_a)
-    };
-    let mut info = Vec::with_capacity(64);
-    info.extend_from_slice(lo);
-    info.extend_from_slice(hi);
-
-    let hk = Hkdf::<Sha256>::new(Some(b"fluxdown-link-sas-v1"), z);
+pub fn derive_sas(z: &[u8], transcript_hash: &[u8; 32]) -> String {
+    let hk = Hkdf::<Sha256>::new(Some(b"fluxdown-link-sas-v2"), z);
     let mut okm = [0u8; 4];
     // 长度固定 4 字节 << 255*32，expand 不会失败；仍显式处理错误不 unwrap。
-    if hk.expand(&info, &mut okm).is_err() {
+    if hk.expand(transcript_hash, &mut okm).is_err() {
         return "000000".to_string();
     }
     let n = u32::from_be_bytes(okm) % SAS_MODULO;
     format!("{n:0width$}", width = SAS_DIGITS as usize)
 }
 
-/// 从 ECDH 共享密钥派生**每对设备独立**的 32 字节链路密钥（数据面 HMAC 用）。
+/// 从 ECDH 共享密钥 + 完整握手转录摘要派生**每对设备独立**的 32 字节链路密钥
+/// （数据面 HMAC 用）。
 ///
 /// # Examples
 ///
 /// ```
 /// use fluxdown_link::crypto::derive_link_key;
-/// let k = derive_link_key(&[9u8; 32]);
+/// let k = derive_link_key(&[9u8; 32], &[1u8; 32]);
 /// assert_eq!(k.len(), 32);
+/// assert_ne!(k, derive_link_key(&[9u8; 32], &[2u8; 32]));
 /// ```
 #[must_use]
-pub fn derive_link_key(z: &[u8]) -> Vec<u8> {
-    let hk = Hkdf::<Sha256>::new(Some(b"fluxdown-link-key-salt-v1"), z);
+pub fn derive_link_key(z: &[u8], transcript_hash: &[u8; 32]) -> Vec<u8> {
+    let hk = Hkdf::<Sha256>::new(Some(b"fluxdown-link-key-salt-v2"), z);
+    let mut info = Vec::with_capacity(20 + transcript_hash.len());
+    info.extend_from_slice(b"fluxdown-link-key-v2");
+    info.extend_from_slice(transcript_hash);
     let mut okm = [0u8; 32];
-    if hk.expand(b"fluxdown-link-key-v1", &mut okm).is_err() {
+    if hk.expand(&info, &mut okm).is_err() {
         return z.to_vec();
     }
     okm.to_vec()
@@ -92,8 +127,8 @@ pub fn derive_link_key(z: &[u8]) -> Vec<u8> {
 
 /// 从每对设备独立的 `link_secret` 派生数据面 AEAD 加密密钥。
 ///
-/// **域分隔**：HKDF salt/info 标签与 [`derive_sas`]（`"fluxdown-link-sas-v1"`）、
-/// [`derive_link_key`]（`"fluxdown-link-key-salt-v1"`/`"fluxdown-link-key-v1"`）
+/// **域分隔**：HKDF salt/info 标签与 [`derive_sas`]（`"fluxdown-link-sas-v2"`）、
+/// [`derive_link_key`]（`"fluxdown-link-key-salt-v2"`/`"fluxdown-link-key-v2"`）
 /// 均不同——AEAD 加密密钥绝不能等于 HMAC 鉴权用的 `link_secret` 本身或与
 /// SAS 相关，否则一把密钥材料挪作多用途，任一用途的密码学分析结果都可能
 /// 波及其余用途。
@@ -248,32 +283,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sas_is_order_independent_and_six_digits() {
+    fn sas_is_six_digits_and_deterministic() {
         let z = [42u8; 32];
-        let a = [1u8; 32];
-        let b = [200u8; 32];
-        let s1 = derive_sas(&z, &a, &b);
-        let s2 = derive_sas(&z, &b, &a);
-        assert_eq!(s1, s2);
+        let transcript = [1u8; 32];
+        let s1 = derive_sas(&z, &transcript);
+        assert_eq!(s1, derive_sas(&z, &transcript));
         assert_eq!(s1.len(), 6);
         assert!(s1.chars().all(|c| c.is_ascii_digit()));
     }
 
     #[test]
-    fn different_shared_secret_yields_different_sas() {
-        // 中间人场景：两端 z 不同 → SAS 不同（用户可发现）。
-        let a = [1u8; 32];
-        let b = [2u8; 32];
+    fn sas_depends_on_shared_secret_and_transcript() {
+        // 中间人场景：两端 z 或转录不同 → SAS 不同（用户可发现）。
+        let t = [1u8; 32];
+        assert_ne!(derive_sas(&[7u8; 32], &t), derive_sas(&[9u8; 32], &t));
         assert_ne!(
-            derive_sas(&[7u8; 32], &a, &b),
-            derive_sas(&[9u8; 32], &a, &b)
+            derive_sas(&[7u8; 32], &[1u8; 32]),
+            derive_sas(&[7u8; 32], &[2u8; 32])
         );
     }
 
     #[test]
-    fn link_key_deterministic_per_secret() {
-        assert_eq!(derive_link_key(&[5u8; 32]), derive_link_key(&[5u8; 32]));
-        assert_ne!(derive_link_key(&[5u8; 32]), derive_link_key(&[6u8; 32]));
+    fn link_key_depends_on_shared_secret_and_transcript() {
+        let t = [3u8; 32];
+        assert_eq!(
+            derive_link_key(&[5u8; 32], &t),
+            derive_link_key(&[5u8; 32], &t)
+        );
+        assert_ne!(
+            derive_link_key(&[5u8; 32], &t),
+            derive_link_key(&[6u8; 32], &t)
+        );
+        assert_ne!(
+            derive_link_key(&[5u8; 32], &[3u8; 32]),
+            derive_link_key(&[5u8; 32], &[4u8; 32])
+        );
+    }
+
+    #[test]
+    fn commitment_binds_both_ephemeral_key_and_nonce() {
+        let (eph, nonce) = ([1u8; 32], [2u8; 32]);
+        let commitment = eph_commitment(&eph, &nonce);
+        assert!(verify_eph_commitment(&commitment, &eph, &nonce));
+        assert!(!verify_eph_commitment(&commitment, &[9u8; 32], &nonce));
+        assert!(!verify_eph_commitment(&commitment, &eph, &[9u8; 32]));
+        let mut flipped = commitment;
+        flipped[31] ^= 1;
+        assert!(!verify_eph_commitment(&flipped, &eph, &nonce));
     }
 
     #[test]
@@ -392,12 +448,11 @@ mod tests {
         // 输出就必然不同。纯回归测试——防止未来有人手滑复制了已有标签，导致
         // AEAD 密钥能被 SAS / 握手期链路密钥反推，破坏域分隔。
         let secret = [77u8; 32];
-        let pub_a = [1u8; 32];
-        let pub_b = [2u8; 32];
+        let transcript = [1u8; 32];
 
         let aead_key = derive_link_aead_key(&secret);
-        let link_key = derive_link_key(&secret);
-        let sas = derive_sas(&secret, &pub_a, &pub_b);
+        let link_key = derive_link_key(&secret, &transcript);
+        let sas = derive_sas(&secret, &transcript);
 
         assert_ne!(aead_key.as_slice(), link_key.as_slice());
         assert_ne!(aead_key.as_slice(), sas.as_bytes());

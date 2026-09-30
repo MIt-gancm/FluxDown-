@@ -152,6 +152,7 @@ fn task_dto_serializes_camel_case_with_correct_values() {
         seed_post_ratio_limit_milli: -2,
         seed_time_limit_minutes: -2,
         seed_inactive_time_limit_minutes: -2,
+        seed_upload_limit_bps: 0,
     };
     let v = serde_json::to_value(&dto).unwrap();
     assert_eq!(v["taskId"], "t1");

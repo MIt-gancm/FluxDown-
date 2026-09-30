@@ -121,6 +121,7 @@ pub fn task_info_to_dto(task: TaskInfo) -> TaskDto {
         seed_post_ratio_limit_milli: task.seed_post_ratio_limit_milli,
         seed_time_limit_minutes: task.seed_time_limit_minutes,
         seed_inactive_time_limit_minutes: task.seed_inactive_time_limit_minutes,
+        seed_upload_limit_bps: task.seed_upload_limit_bps,
     }
 }
 

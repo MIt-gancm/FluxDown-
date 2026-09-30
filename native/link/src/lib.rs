@@ -7,7 +7,7 @@
 //! - [`identity`]：Ed25519 本机身份（设备 ID = 公钥指纹，TOFU 固定）。
 //! - [`address`]：对端地址模型（http/https、域名、反代 base path）。
 //! - [`discovery`]：发现层：mDNS 广播/浏览 + 手动地址 `/ping` 探测。
-//! - [`pairing`]：配对协议（一次性码 + X25519 ECDH + SAS + 身份签名）。
+//! - [`pairing`]：配对协议（一次性码 + 临时公钥承诺-揭示 + X25519 ECDH + SAS + 身份签名）。
 //! - [`transport`]：**数据面传输 seam** —— Direct(v1) / 未来 iroh、relay 插拔。
 //! - [`storage`]：持久化 trait（身份种子 + 已配对设备名册）。
 //! - [`crypto`]：指纹 / SAS / 链路密钥 / HMAC 鉴权原语。
@@ -29,9 +29,12 @@ pub use error::{LinkError, LinkResult};
 pub use identity::LinkIdentity;
 pub use manager::{
     BeginPairingResult, LinkEngineEvent, LinkManager, LinkOptions, LinkRequest, PairConfirmOutcome,
-    WireHello, WireHelloResponse,
+    WireHello, WireHelloResponse, WireReveal, WireRevealResponse,
 };
-pub use pairing::{HelloRequest, HelloResponse, PairingInitiator, PairingResponder, SelfInfo};
+pub use pairing::{
+    HelloRequest, HelloResponse, PAIRING_PROTOCOL_VERSION, PairingInitiator, PairingResponder,
+    RevealAccepted, RevealRequest, RevealResponse, SelfInfo,
+};
 pub use storage::LinkStorage;
 pub use transport::{DirectTransport, PeerConn, Transport, TransportStack};
 pub use types::{

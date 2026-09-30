@@ -28,7 +28,10 @@ use super::crypto::{
 use super::discovery::{self, MdnsAdvertiser, MdnsBrowser};
 use super::error::{LinkError, LinkResult};
 use super::identity::LinkIdentity;
-use super::pairing::{HelloRequest, HelloResponse, PairingInitiator, PairingResponder, SelfInfo};
+use super::pairing::{
+    HelloRequest, HelloResponse, PAIRING_PROTOCOL_VERSION, PairingInitiator, PairingResponder,
+    RevealRequest, RevealResponse, SelfInfo,
+};
 use super::storage::LinkStorage;
 use super::transport::TransportStack;
 use super::types::{DiscoveredPeer, PeerCandidate, PeerInfo, PeerRecord, TransportKind};
@@ -130,6 +133,13 @@ fn upsert_discovered(snapshot: &mut Vec<DiscoveredPeer>, peer: DiscoveredPeer) {
 /// 底），因此提升为具名常量集中定义，未来两端 TTL 一起改，不会各自漂移。
 const PENDING_INIT_TTL: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// 手动探测（`/ping`）得到的设备指纹的保留时长：配对时用来校验对端出示的身份，
+/// 过久的探测结果不再可信（设备可能已换身份）。
+const PROBED_FINGERPRINT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// 探测指纹表的条数上限，超出时淘汰最旧的一条，保证内存占用有界。
+const MAX_PROBED_FINGERPRINTS: usize = 64;
+
 /// 已配对设备 Direct 候选端点集合的总数上限。mDNS 重新发现命中已配对
 /// 指纹时会把新地址去重后插到候选表首位、旧候选整体保留作回退（见
 /// `LinkManager::start_discovery` 的转发任务），若不设上限，设备长期
@@ -202,6 +212,10 @@ pub struct LinkManager {
     /// 只在拨号时排在已验证候选之后；认证请求经它成功后才由
     /// [`Self::promote_hinted`] 写入名册。每个已配对指纹至多一条，天然有界。
     hinted: Arc<Mutex<HashMap<String, PeerCandidate>>>,
+    /// 手动探测（`/ping`）得到的设备指纹（`PeerAddress::base_url` → 指纹 + 记录时刻）。
+    /// 与 [`Self::discovered`] 一起，是发起方配对时比对对端身份的“发现指纹”来源，见
+    /// [`Self::known_fingerprints`]。带 TTL 与条数上限。
+    probed: Mutex<HashMap<String, (String, std::time::Instant)>>,
 }
 
 impl LinkManager {
@@ -231,6 +245,7 @@ impl LinkManager {
             seen_nonces: Mutex::new(Vec::new()),
             discovered: Arc::new(Mutex::new(Vec::new())),
             hinted: Arc::new(Mutex::new(HashMap::new())),
+            probed: Mutex::new(HashMap::new()),
         });
         Self::spawn_gc(&mgr);
         Ok(mgr)
@@ -296,30 +311,27 @@ impl LinkManager {
         self.responder.generate_code()
     }
 
-    /// 处理入站 `hello`（HTTP 层解码 base64 后调用）。`source`：请求来源
-    /// 地址，直接透传给 [`PairingResponder::handle_hello`] 做按来源分桶
-    /// 节流；拿不到时传 `None`。
-    pub fn pair_hello(
-        &self,
-        req: HelloRequest,
-        source: Option<IpAddr>,
-    ) -> LinkResult<HelloResponse> {
-        let resp = self.responder.handle_hello(&req, source)?;
-        self.emit_incoming_pairing(resp.session_id.clone(), resp.sas.clone(), &req);
-        Ok(resp)
-    }
-
     /// 处理入站 `hello`（wire 形式，base64 编解码全在引擎内完成，宿主纯字段搬运）。
-    /// `source`：请求来源地址，同 [`Self::pair_hello`]。
+    /// `source`：请求来源地址，直接透传给 [`PairingResponder::handle_hello`] 做按来源
+    /// 分桶节流；拿不到时传 `None`。
+    ///
+    /// 这一步只回出本次会话的临时公钥与随机数：响应方此刻还看不到发起方的临时公钥，
+    /// 没有 SAS，也不会广播 `IncomingPairing`——见 [`Self::pair_reveal_wire`]。
     pub fn pair_hello_wire(
         &self,
         w: WireHello,
         source: Option<IpAddr>,
     ) -> LinkResult<WireHelloResponse> {
+        // 版本门禁先于字段解码：旧版发起方的 hello 没有 `initiatorCommit` 等新字段，
+        // 先解码只会得到含糊的「载荷非法」，而不是明确的版本不兼容。
+        if w.protocol_version != PAIRING_PROTOCOL_VERSION {
+            return Err(LinkError::UnsupportedVersion);
+        }
         let req = HelloRequest {
+            protocol_version: w.protocol_version,
             code: w.code,
-            initiator_eph_pub: decode_b64_array::<32>(&w.initiator_eph_pub)?,
             initiator_id_pub: decode_b64_array::<32>(&w.initiator_id_pub)?,
+            initiator_commit: decode_b64_array::<32>(&w.initiator_commit)?,
             initiator_sig: decode_b64_array::<64>(&w.initiator_sig)?,
             name: w.name,
             platform: w.platform,
@@ -327,16 +339,37 @@ impl LinkManager {
             initiator_addrs: w.initiator_addrs,
         };
         let resp = self.responder.handle_hello(&req, source)?;
-        self.emit_incoming_pairing(resp.session_id.clone(), resp.sas.clone(), &req);
         Ok(WireHelloResponse {
+            protocol_version: resp.protocol_version,
             session_id: resp.session_id,
             responder_eph_pub: B64.encode(resp.responder_eph_pub),
+            responder_nonce: B64.encode(resp.responder_nonce),
             responder_id_pub: B64.encode(resp.responder_id_pub),
-            responder_sig: B64.encode(resp.responder_sig),
             name: resp.name,
             platform: resp.platform,
             app_version: resp.app_version,
-            sas: resp.sas,
+        })
+    }
+
+    /// 处理入站 `reveal`（wire 形式）：核对承诺、算出 SAS，随后向宿主广播
+    /// `IncomingPairing`（本机用户从这一刻起核对 SAS），并把响应方对完整转录的签名回给
+    /// 发起方。回复里不含 SAS——SAS 只在两端各自的屏幕上展示。
+    pub fn pair_reveal_wire(&self, w: WireReveal) -> LinkResult<WireRevealResponse> {
+        let req = RevealRequest {
+            session_id: w.session_id,
+            initiator_eph_pub: decode_b64_array::<32>(&w.initiator_eph_pub)?,
+            initiator_nonce: decode_b64_array::<32>(&w.initiator_nonce)?,
+        };
+        let accepted = self.responder.handle_reveal(&req)?;
+        self.emit_incoming_pairing(
+            req.session_id,
+            accepted.sas,
+            accepted.peer_name,
+            accepted.peer_platform,
+            &accepted.peer_id_pub,
+        );
+        Ok(WireRevealResponse {
+            responder_sig: B64.encode(accepted.response.responder_sig),
         })
     }
 
@@ -382,17 +415,24 @@ impl LinkManager {
     }
 
     /// 后台广播「有入站配对待核对」事件。`events` 是 async `mpsc::Sender`，
-    /// 本方法的调用方 `pair_hello`/`pair_hello_wire` 都是同步 fn，沿用
+    /// 本方法的调用方 `pair_reveal_wire` 是同步 fn，沿用
     /// [`Self::ensure_advertising`] 已有的 `tokio::spawn` 写法把发送挪到
-    /// 后台，不阻塞 hello 的返回路径。
-    fn emit_incoming_pairing(&self, session_id: String, sas: String, req: &HelloRequest) {
+    /// 后台，不阻塞 reveal 的返回路径。
+    fn emit_incoming_pairing(
+        &self,
+        session_id: String,
+        sas: String,
+        peer_name: String,
+        peer_platform: Option<String>,
+        peer_id_pub: &[u8; 32],
+    ) {
         let tx = self.events.clone();
         let event = LinkEngineEvent::IncomingPairing {
             session_id,
             sas,
-            peer_name: req.name.clone(),
-            peer_platform: req.platform.clone(),
-            peer_fingerprint: super::crypto::fingerprint(&req.initiator_id_pub),
+            peer_name,
+            peer_platform,
+            peer_fingerprint: super::crypto::fingerprint(peer_id_pub),
         };
         tokio::spawn(async move {
             let _ = tx.send(event).await;
@@ -531,15 +571,66 @@ impl LinkManager {
             .unwrap_or_default()
     }
 
-    /// 手动地址探测（mDNS 失效兜底）：`/ping` 一台设备，返回其信息（不配对）。
+    /// 手动地址探测（mDNS 失效兜底）：`/ping` 一台设备，返回其信息（不配对）。探测到的
+    /// 设备指纹会被记住一小段时间，随后对同一地址发起配对时用来校验对端身份。
     pub async fn probe(&self, address: &PeerAddress) -> LinkResult<DiscoveredPeer> {
-        discovery::probe(&self.client, address).await
+        let peer = discovery::probe(&self.client, address).await?;
+        if let Some(fingerprint) = &peer.fingerprint {
+            self.remember_probe(address, fingerprint);
+        }
+        Ok(peer)
+    }
+
+    /// 记住一次探测得到的指纹；先剪掉过期项，满员时淘汰最旧的一条。
+    fn remember_probe(&self, address: &PeerAddress, fingerprint: &str) {
+        let Ok(mut probed) = self.probed.lock() else {
+            return;
+        };
+        probed.retain(|_, (_, at)| at.elapsed() < PROBED_FINGERPRINT_TTL);
+        let key = address.base_url();
+        if probed.len() >= MAX_PROBED_FINGERPRINTS
+            && !probed.contains_key(&key)
+            && let Some(oldest) = probed
+                .iter()
+                .min_by_key(|(_, (_, at))| *at)
+                .map(|(k, _)| k.clone())
+        {
+            probed.remove(&oldest);
+        }
+        probed.insert(key, (fingerprint.to_string(), std::time::Instant::now()));
+    }
+
+    /// 发起方已知的、`address` 上设备的指纹：mDNS 发现快照里落在该地址的条目，加上最近
+    /// 一次对该地址手动探测得到的指纹。配对握手里响应方出示的身份必须命中其中之一；
+    /// 没有任何发现记录（直接输入地址配对）时返回空，不做这项比对。
+    fn known_fingerprints(&self, address: &PeerAddress) -> Vec<String> {
+        let base = address.base_url();
+        let mut known = Vec::new();
+        if let Ok(probed) = self.probed.lock()
+            && let Some((fingerprint, at)) = probed.get(&base)
+            && at.elapsed() < PROBED_FINGERPRINT_TTL
+        {
+            known.push(fingerprint.clone());
+        }
+        if let Ok(snapshot) = self.discovered.lock() {
+            known.extend(snapshot.iter().filter_map(|peer| {
+                let fingerprint = peer.fingerprint.as_ref()?;
+                let peer_address = PeerAddress::from_host_port(&peer.host, peer.port).ok()?;
+                (peer_address.base_url() == base).then(|| fingerprint.clone())
+            }));
+        }
+        known
     }
 
     // ── 配对（发起方侧）───────────────────────────────────────────────────
 
-    /// 发起配对：向 `address` 发送 `hello`（带配对码），返回 `(token, sas, 对端名)`。
-    /// UI 展示 SAS 供用户与对端核对，随后调 [`confirm_pairing`]。
+    /// 发起配对：向 `address` 依次发送 `hello`（带配对码与临时公钥承诺）和 `reveal`
+    /// （揭示临时公钥），返回 `(token, sas, 对端名)`。UI 展示 SAS 供用户与对端核对，
+    /// 随后调 [`confirm_pairing`]。
+    ///
+    /// 发起方已知该地址上设备的发现指纹（mDNS 快照或最近一次手动探测）时，对端出示的
+    /// 身份必须与之一致，否则 [`LinkError::IdentityMismatch`]——此时还没有揭示临时
+    /// 公钥。对端配对协议版本不符（含旧版对端）→ [`LinkError::UnsupportedVersion`]。
     ///
     /// 错误语义（见 [`crate::wire`]）：网络失败 → [`LinkError::Io`]；对端（或其反代）返回
     /// 非 FluxDown 的 4xx / 重定向 / HTML → [`LinkError::NotFluxDown`]；只有对端 FluxDown
@@ -554,31 +645,37 @@ impl LinkManager {
         let hello = initiator.build_hello(code, &self.self_info, addrs);
 
         let body = serde_json::json!({
+            "protocolVersion": hello.protocol_version,
             "code": hello.code,
-            "initiatorEphPub": B64.encode(hello.initiator_eph_pub),
             "initiatorIdPub": B64.encode(hello.initiator_id_pub),
+            "initiatorCommit": B64.encode(hello.initiator_commit),
             "initiatorSig": B64.encode(hello.initiator_sig),
             "name": hello.name,
             "platform": hello.platform.clone().unwrap_or_default(),
             "appVersion": hello.app_version.clone().unwrap_or_default(),
             "initiatorAddrs": hello.initiator_addrs,
         });
-        let resp = self
-            .client
-            .post(address.url("/api/v1/link/pair/hello"))
-            .json(&body)
-            .timeout(std::time::Duration::from_secs(8))
-            .send()
+        let json = self
+            .post_pairing_step(address, "/api/v1/link/pair/hello", &body)
             .await
-            .map_err(|e| send_failure(&e))?;
-        if !resp.status().is_success() {
-            return Err(classify_failure(resp).await);
-        }
-        let json = read_json_object(resp).await?;
+            .map_err(hello_rejection)?;
         let hello_resp = parse_hello_response(&json)?;
 
         let responder_addr = address.to_candidate();
-        let sas = initiator.on_hello_response(&hello_resp, &responder_addr)?;
+        let known = self.known_fingerprints(address);
+        let reveal = initiator.on_hello_response(&hello_resp, &responder_addr, &known)?;
+
+        let body = serde_json::json!({
+            "sessionId": reveal.session_id,
+            "initiatorEphPub": B64.encode(reveal.initiator_eph_pub),
+            "initiatorNonce": B64.encode(reveal.initiator_nonce),
+        });
+        let json = self
+            .post_pairing_step(address, "/api/v1/link/pair/reveal", &body)
+            .await?;
+        let reveal_resp = parse_reveal_response(&json)?;
+        let sas = initiator.on_reveal_response(&reveal_resp)?;
+
         let token = uuid::Uuid::new_v4().simple().to_string();
         let peer_name = hello_resp.name.clone();
         if let Ok(mut pending) = self.pending.lock() {
@@ -605,6 +702,28 @@ impl LinkManager {
             peer_name,
             peer_fingerprint: super::crypto::fingerprint(&hello_resp.responder_id_pub),
         })
+    }
+
+    /// 向对端的配对端点 POST 一步握手消息（`hello` / `reveal`），返回成功响应的 JSON
+    /// 对象；失败按 [`crate::wire`] 的规则分类。
+    async fn post_pairing_step(
+        &self,
+        address: &PeerAddress,
+        path: &str,
+        body: &serde_json::Value,
+    ) -> LinkResult<serde_json::Value> {
+        let resp = self
+            .client
+            .post(address.url(path))
+            .json(body)
+            .timeout(std::time::Duration::from_secs(8))
+            .send()
+            .await
+            .map_err(|e| send_failure(&e))?;
+        if !resp.status().is_success() {
+            return Err(classify_failure(resp).await);
+        }
+        read_json_object(resp).await
     }
 
     /// 本机朝向 `peer` 的可回连地址（`initiatorAddrs`，供对端存为回连候选）。本机 API
@@ -995,8 +1114,8 @@ impl LinkManager {
 
     /// 剪枝全部「只靠恰好又发生一次同类调用才顺带清理」的过期状态：
     /// `pending`（本机发起、SAS 核对/confirm 未完成的待确认会话）、
-    /// `seen_nonces`（数据面防重放时窗），并转发给响应方剪枝其
-    /// `codes`/`sessions`。由 [`Self::spawn_gc`] 每 60s 调用一次；半途
+    /// `seen_nonces`（数据面防重放时窗）、`probed`（手动探测指纹），并转发给响应方
+    /// 剪枝其 `codes`/`sessions`。由 [`Self::spawn_gc`] 每 60s 调用一次；半途
     /// 放弃的配对与过期 nonce 记录此前会一直驻留到进程重启才被回收。
     pub fn prune_expired(&self) {
         if let Ok(mut pending) = self.pending.lock() {
@@ -1005,6 +1124,9 @@ impl LinkManager {
         if let Ok(mut seen) = self.seen_nonces.lock() {
             let now = now_unix();
             seen.retain(|(_, seen_ts)| now - *seen_ts <= LINK_AUTH_SKEW_SECS);
+        }
+        if let Ok(mut probed) = self.probed.lock() {
+            probed.retain(|_, (_, at)| at.elapsed() < PROBED_FINGERPRINT_TTL);
         }
         self.responder.prune_expired();
     }
@@ -1045,6 +1167,22 @@ fn b64_to_array<const N: usize>(json: &serde_json::Value, key: &str) -> LinkResu
         .map_err(|_| LinkError::BadPayload(format!("bad length {key}")))
 }
 
+/// 旧版响应方把本端按新协议构造的 `hello` 当成无法解析的载荷拒绝时返回的 message 前缀
+/// （`invalid link hello payload: …`，由 API 层的 hello 处理器生成）。本端发出的 hello
+/// 恒为良构，所以这类拒绝只可能意味着对端不认识新协议。
+const HELLO_PAYLOAD_REJECTION_PREFIX: &str = "invalid link hello payload";
+
+/// 把对端对 `hello` 的拒绝归类：旧版响应方的载荷拒绝 → [`LinkError::UnsupportedVersion`]，
+/// 其余错误原样返回。
+fn hello_rejection(error: LinkError) -> LinkError {
+    match error {
+        LinkError::BadPayload(message) if message.starts_with(HELLO_PAYLOAD_REJECTION_PREFIX) => {
+            LinkError::UnsupportedVersion
+        }
+        other => other,
+    }
+}
+
 fn parse_hello_response(json: &serde_json::Value) -> LinkResult<HelloResponse> {
     let get_str = |k: &str| {
         json.get(k)
@@ -1052,27 +1190,45 @@ fn parse_hello_response(json: &serde_json::Value) -> LinkResult<HelloResponse> {
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    // 没有 sessionId 说明对端根本不是 FluxDown 响应方——比如反代把请求转给了别的
+    // JSON 服务。
+    let session_id = get_str("sessionId")
+        .ok_or_else(|| LinkError::NotFluxDown("hello response has no sessionId".into()))?;
+    // 版本先于其它字段校验：旧版响应方的回复没有 protocolVersion（还带着明文 SAS 与
+    // 它自己的签名），不能按新协议去解读。
+    let protocol_version = json
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .unwrap_or(0);
+    if protocol_version != PAIRING_PROTOCOL_VERSION {
+        return Err(LinkError::UnsupportedVersion);
+    }
     Ok(HelloResponse {
-        // 没有 sessionId 说明对端根本不是（或不是同版本的）FluxDown 响应方——
-        // 比如反代把请求转给了别的 JSON 服务。
-        session_id: get_str("sessionId")
-            .ok_or_else(|| LinkError::NotFluxDown("hello response has no sessionId".into()))?,
+        protocol_version,
+        session_id,
         responder_eph_pub: b64_to_array::<32>(json, "responderEphPub")?,
+        responder_nonce: b64_to_array::<32>(json, "responderNonce")?,
         responder_id_pub: b64_to_array::<32>(json, "responderIdPub")?,
-        responder_sig: b64_to_array::<64>(json, "responderSig")?,
         name: get_str("name").unwrap_or_default(),
         platform: get_str("platform"),
         app_version: get_str("appVersion"),
-        sas: get_str("sas").unwrap_or_default(),
+    })
+}
+
+fn parse_reveal_response(json: &serde_json::Value) -> LinkResult<RevealResponse> {
+    Ok(RevealResponse {
+        responder_sig: b64_to_array::<64>(json, "responderSig")?,
     })
 }
 
 /// 入站 `hello` 的 wire 形式（base64 字符串字段），供 HTTP 宿主纯字段搬运。
 #[derive(Debug, Clone)]
 pub struct WireHello {
+    pub protocol_version: u32,
     pub code: String,
-    pub initiator_eph_pub: String,
     pub initiator_id_pub: String,
+    pub initiator_commit: String,
     pub initiator_sig: String,
     pub name: String,
     pub platform: Option<String>,
@@ -1083,14 +1239,28 @@ pub struct WireHello {
 /// 出站 `hello` 回复的 wire 形式（base64 字符串字段）。
 #[derive(Debug, Clone)]
 pub struct WireHelloResponse {
+    pub protocol_version: u32,
     pub session_id: String,
     pub responder_eph_pub: String,
+    pub responder_nonce: String,
     pub responder_id_pub: String,
-    pub responder_sig: String,
     pub name: String,
     pub platform: Option<String>,
     pub app_version: Option<String>,
-    pub sas: String,
+}
+
+/// 入站 `reveal` 的 wire 形式（base64 字符串字段）。
+#[derive(Debug, Clone)]
+pub struct WireReveal {
+    pub session_id: String,
+    pub initiator_eph_pub: String,
+    pub initiator_nonce: String,
+}
+
+/// 出站 `reveal` 回复的 wire 形式：响应方对完整转录的签名（base64）。
+#[derive(Debug, Clone)]
+pub struct WireRevealResponse {
+    pub responder_sig: String,
 }
 
 fn decode_b64_array<const N: usize>(s: &str) -> LinkResult<[u8; N]> {
@@ -1154,6 +1324,7 @@ mod tests {
     use super::*;
     use crate::crypto::{derive_link_aead_key, link_auth_tag, seal_link_body};
     use crate::storage::memory::MemoryLinkStorage;
+    use crate::types::DiscoveryKind;
 
     async fn mgr_with_device(secret: Vec<u8>) -> (Arc<LinkManager>, String) {
         let (tx, _rx) = mpsc::channel(8);
@@ -1341,5 +1512,248 @@ mod tests {
             stored.candidates,
             vec![direct("10.0.0.9:17800"), direct("10.0.0.2:17800")]
         );
+    }
+
+    fn wire_hello(hello: &HelloRequest) -> WireHello {
+        WireHello {
+            protocol_version: hello.protocol_version,
+            code: hello.code.clone(),
+            initiator_id_pub: B64.encode(hello.initiator_id_pub),
+            initiator_commit: B64.encode(hello.initiator_commit),
+            initiator_sig: B64.encode(hello.initiator_sig),
+            name: hello.name.clone(),
+            platform: hello.platform.clone(),
+            app_version: hello.app_version.clone(),
+            initiator_addrs: hello.initiator_addrs.clone(),
+        }
+    }
+
+    async fn responder_mgr() -> (Arc<LinkManager>, mpsc::Receiver<LinkEngineEvent>) {
+        let (tx, rx) = mpsc::channel(8);
+        let mgr = LinkManager::load(
+            Arc::new(MemoryLinkStorage::default()),
+            SelfInfo {
+                name: "nas".into(),
+                platform: Some("linux".into()),
+                app_version: None,
+            },
+            LinkOptions {
+                api_port: 17800,
+                reachable: false,
+                advertise: false,
+            },
+            tx,
+        )
+        .await
+        .unwrap();
+        (mgr, rx)
+    }
+
+    #[tokio::test]
+    async fn incoming_pairing_is_announced_only_after_reveal_with_the_shared_sas() {
+        // 响应方在 hello 阶段还看不到发起方的临时公钥，没有 SAS 可展示：入站配对请求
+        // 只在 reveal 被受理之后才广播，且广播的 SAS 与发起方算出的一致。
+        let (mgr, mut events) = responder_mgr().await;
+        let code = mgr.generate_code();
+        let initiator_id = LinkIdentity::generate();
+        let mut initiator = PairingInitiator::new(initiator_id.clone());
+        let hello = initiator.build_hello(
+            &code,
+            &SelfInfo {
+                name: "laptop".into(),
+                platform: Some("macos".into()),
+                app_version: None,
+            },
+            vec![],
+        );
+
+        let resp = mgr.pair_hello_wire(wire_hello(&hello), None).unwrap();
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err(), "hello alone must not announce");
+
+        // 发起方按对端 JSON 的形状解析 hello 回复（与 begin_pairing 同一条解析路径）。
+        let json = serde_json::json!({
+            "protocolVersion": resp.protocol_version,
+            "sessionId": resp.session_id,
+            "responderEphPub": resp.responder_eph_pub,
+            "responderNonce": resp.responder_nonce,
+            "responderIdPub": resp.responder_id_pub,
+            "name": resp.name,
+            "platform": resp.platform,
+            "appVersion": resp.app_version,
+        });
+        let hello_resp = parse_hello_response(&json).unwrap();
+        let reveal = initiator
+            .on_hello_response(&hello_resp, "10.0.0.1:17800", &[])
+            .unwrap();
+        let revealed = mgr
+            .pair_reveal_wire(WireReveal {
+                session_id: reveal.session_id.clone(),
+                initiator_eph_pub: B64.encode(reveal.initiator_eph_pub),
+                initiator_nonce: B64.encode(reveal.initiator_nonce),
+            })
+            .unwrap();
+        let reveal_resp =
+            parse_reveal_response(&serde_json::json!({ "responderSig": revealed.responder_sig }))
+                .unwrap();
+        let initiator_sas = initiator.on_reveal_response(&reveal_resp).unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            LinkEngineEvent::IncomingPairing {
+                session_id,
+                sas,
+                peer_name,
+                peer_fingerprint,
+                ..
+            } => {
+                assert_eq!(session_id, hello_resp.session_id);
+                assert_eq!(sas, initiator_sas);
+                assert_eq!(peer_name, "laptop");
+                assert_eq!(peer_fingerprint, initiator_id.fingerprint());
+            }
+            other => panic!("expected IncomingPairing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_from_other_protocol_version_is_rejected_before_field_decoding() {
+        // 旧版发起方的 hello 没有新字段（解码后是空串）：要得到明确的版本不兼容，
+        // 而不是含糊的载荷非法。
+        let (mgr, _events) = responder_mgr().await;
+        let code = mgr.generate_code();
+        let stale = WireHello {
+            protocol_version: 0,
+            code: code.clone(),
+            initiator_id_pub: String::new(),
+            initiator_commit: String::new(),
+            initiator_sig: String::new(),
+            name: "old".into(),
+            platform: None,
+            app_version: None,
+            initiator_addrs: vec![],
+        };
+        assert!(matches!(
+            mgr.pair_hello_wire(stale, None),
+            Err(LinkError::UnsupportedVersion)
+        ));
+    }
+
+    #[test]
+    fn legacy_peer_replies_are_reported_as_unsupported_version() {
+        // 旧版响应方的 hello 回复：有 sessionId、明文 SAS 与自己的签名，没有 protocolVersion。
+        let legacy = serde_json::json!({
+            "sessionId": "abc",
+            "responderEphPub": B64.encode([1u8; 32]),
+            "responderIdPub": B64.encode([2u8; 32]),
+            "responderSig": B64.encode([3u8; 64]),
+            "name": "old-nas",
+            "sas": "123456",
+        });
+        assert!(matches!(
+            parse_hello_response(&legacy),
+            Err(LinkError::UnsupportedVersion)
+        ));
+        // 根本不是 FluxDown 的 JSON 仍是 NotFluxDown，不被误判成版本问题。
+        assert!(matches!(
+            parse_hello_response(&serde_json::json!({ "ok": true })),
+            Err(LinkError::NotFluxDown(_))
+        ));
+
+        // 旧版响应方会把新 hello 当作无法解析的载荷拒绝。
+        let rejected = LinkError::BadPayload(
+            "invalid link hello payload: missing field `initiatorEphPub` at line 1 column 80"
+                .into(),
+        );
+        assert!(matches!(
+            hello_rejection(rejected),
+            LinkError::UnsupportedVersion
+        ));
+        assert!(matches!(
+            hello_rejection(LinkError::InvalidCode),
+            LinkError::InvalidCode
+        ));
+        assert!(matches!(
+            hello_rejection(LinkError::BadPayload("unrelated".into())),
+            LinkError::BadPayload(_)
+        ));
+    }
+
+    #[test]
+    fn new_pairing_errors_round_trip_through_the_wire_message_contract() {
+        // 发起方只看得到对端的 HTTP message：新错误必须能被还原，而不是一律变成含糊的载荷错误。
+        for error in [LinkError::UnsupportedVersion, LinkError::CommitmentMismatch] {
+            let restored = LinkError::from_wire_message(&error.to_string());
+            assert_eq!(
+                restored.map(|e| std::mem::discriminant(&e)),
+                Some(std::mem::discriminant(&error))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn known_fingerprints_cover_probe_and_discovery_for_that_address_only() {
+        let (mgr, _events) = responder_mgr().await;
+        let addr = PeerAddress::parse("10.0.0.2:17800").unwrap();
+        let elsewhere = PeerAddress::parse("10.0.0.3:17800").unwrap();
+        assert!(mgr.known_fingerprints(&addr).is_empty());
+
+        mgr.remember_probe(&addr, "fp-probed");
+        let peer = |fingerprint: Option<&str>, host: &str| DiscoveredPeer {
+            fingerprint: fingerprint.map(str::to_string),
+            name: "peer".into(),
+            platform: None,
+            host: host.into(),
+            port: 17800,
+            app_version: None,
+            kind: DiscoveryKind::Mdns,
+        };
+        {
+            let mut snapshot = mgr.discovered.lock().unwrap();
+            snapshot.push(peer(Some("fp-mdns"), "10.0.0.2"));
+            // 没有指纹的条目与其它地址的条目都不提供这个地址的指纹。
+            snapshot.push(peer(None, "10.0.0.2"));
+            snapshot.push(peer(Some("fp-other"), "10.0.0.3"));
+        }
+
+        let mut known = mgr.known_fingerprints(&addr);
+        known.sort();
+        assert_eq!(known, vec!["fp-mdns".to_string(), "fp-probed".to_string()]);
+        let mut elsewhere_known = mgr.known_fingerprints(&elsewhere);
+        elsewhere_known.sort();
+        assert_eq!(elsewhere_known, vec!["fp-other".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn probed_fingerprints_are_bounded_and_expire() {
+        let (mgr, _events) = responder_mgr().await;
+        for i in 0..(MAX_PROBED_FINGERPRINTS + 8) {
+            let addr = PeerAddress::parse(&format!("10.1.0.{}:17800", i + 1)).unwrap();
+            mgr.remember_probe(&addr, &format!("fp-{i}"));
+        }
+        assert_eq!(mgr.probed.lock().unwrap().len(), MAX_PROBED_FINGERPRINTS);
+        // 满员淘汰的是最旧的，最新的仍在。
+        let newest =
+            PeerAddress::parse(&format!("10.1.0.{}:17800", MAX_PROBED_FINGERPRINTS + 8)).unwrap();
+        assert_eq!(
+            mgr.known_fingerprints(&newest),
+            vec![format!("fp-{}", MAX_PROBED_FINGERPRINTS + 7)]
+        );
+
+        // 过期的探测结果不再参与比对，并被后台剪枝回收。
+        let Some(expired_at) = std::time::Instant::now()
+            .checked_sub(PROBED_FINGERPRINT_TTL + std::time::Duration::from_secs(1))
+        else {
+            return;
+        };
+        for (_, at) in mgr.probed.lock().unwrap().values_mut() {
+            *at = expired_at;
+        }
+        assert!(mgr.known_fingerprints(&newest).is_empty());
+        mgr.prune_expired();
+        assert!(mgr.probed.lock().unwrap().is_empty());
     }
 }

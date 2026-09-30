@@ -51,6 +51,16 @@ pub enum ActorOperation {
     PauseAll,
     ResumeAll,
     RescanFiles,
+    PauseTasks {
+        task_ids: Vec<String>,
+    },
+    ResumeTasks {
+        task_ids: Vec<String>,
+    },
+    DeleteTasks {
+        task_ids: Vec<String>,
+        delete_files: bool,
+    },
     SetTaskSeedLimits {
         task_id: String,
         ratio_limit_milli: i64,
@@ -335,6 +345,7 @@ pub fn spawn_actor(
     let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
     let (maintenance_tx, maintenance_rx) = mpsc::unbounded_channel();
     let handle = DaemonActorHandle { commands };
+    selections.spawn_task_watcher(cancel.clone());
     let task = tokio::spawn(run_actor(
         engine,
         command_rx,
@@ -364,6 +375,10 @@ async fn run_actor(
 ) {
     engine.manager.load_queues().await;
     engine.manager.load_and_send_all_tasks().await;
+    publish_webhook_history(&engine, &events);
+    if let Ok(config) = engine.db.get_all_config().await {
+        apply_log_limit(&config);
+    }
     let mut rss_events = engine.manager.rss.take_event_rx();
 
     let mut file_scan = tokio::time::interval(Duration::from_secs(300));
@@ -420,7 +435,7 @@ async fn run_actor(
             }
             Some(ids) = receivers.missing_cleanup.recv() => {
                 engine.manager.delete_tasks_batch(&ids, false).await;
-                engine.manager.load_and_send_all_tasks().await;
+                engine.manager.send_tasks_snapshot().await;
             }
             _ = file_scan.tick() => engine.manager.spawn_file_scan(),
             _ = queue_schedule.tick() => engine.manager.tick_queue_schedules().await,
@@ -660,7 +675,7 @@ async fn execute_operation(
                 })
                 .await
                 .ok_or_else(|| ActorError::Operation("failed to persist task".to_owned()))?;
-            engine.manager.load_and_send_all_tasks().await;
+            engine.manager.send_tasks_snapshot().await;
             return Ok(ActorResult::Created(task_id));
         }
         ActorOperation::PauseTask { task_id } => engine.manager.pause_task(&task_id).await,
@@ -680,11 +695,29 @@ async fn execute_operation(
             delete_files,
         } => {
             engine.manager.delete_task(&task_id, delete_files).await;
-            engine.manager.load_and_send_all_tasks().await;
+            engine.manager.send_tasks_snapshot().await;
         }
         ActorOperation::PauseAll => {
             let ids = task_ids_by_status(&engine.db, &[0, 1, 5]).await?;
+            engine.manager.batch_pause_all(&ids).await;
+        }
+        ActorOperation::PauseTasks { task_ids } => {
+            let ids = existing_task_ids(&engine.db, task_ids).await?;
             engine.manager.batch_pause(&ids).await;
+        }
+        ActorOperation::ResumeTasks { task_ids } => {
+            let ids = existing_task_ids(&engine.db, task_ids).await?;
+            engine.manager.batch_resume(&ids).await;
+        }
+        ActorOperation::DeleteTasks {
+            task_ids,
+            delete_files,
+        } => {
+            let ids = existing_task_ids(&engine.db, task_ids).await?;
+            if !ids.is_empty() {
+                engine.manager.delete_tasks_batch(&ids, delete_files).await;
+                engine.manager.send_tasks_snapshot().await;
+            }
         }
         ActorOperation::ResumeAll => {
             engine.manager.resume_all_eligible().await;
@@ -850,7 +883,7 @@ async fn execute_operation(
             delete_files,
         } => {
             engine.manager.delete_group(&group_id, delete_files).await;
-            engine.manager.load_and_send_all_tasks().await;
+            engine.manager.send_tasks_snapshot().await;
         }
         #[cfg(feature = "plugins")]
         ActorOperation::ResolvePreview { .. } => unreachable!("handled off actor"),
@@ -873,9 +906,12 @@ async fn execute_operation(
             ));
         }
         ActorOperation::RssRefresh { source_id } => {
-            return Ok(ActorResult::Boolean(
+            use fluxdown_engine::rss::RssRefreshOutcome;
+            // 已在抓取中同样算成功：结果稍后经 RSS 事件到达，只有订阅不存在才是 NotFound。
+            return Ok(ActorResult::Boolean(!matches!(
                 engine.manager.refresh_rss_source(&source_id),
-            ));
+                RssRefreshOutcome::NotFound
+            )));
         }
         ActorOperation::RssItemAction {
             source_id,
@@ -900,7 +936,10 @@ async fn execute_operation(
         ActorOperation::WebhookDeliveries => {
             return Ok(ActorResult::WebhookDeliveries(engine.webhook_deliveries()));
         }
-        ActorOperation::WebhookClear => engine.clear_webhook_deliveries().await,
+        ActorOperation::WebhookClear => {
+            engine.clear_webhook_deliveries().await;
+            events.publish(fluxdown_protocol::DaemonEvent::WebhooksCleared);
+        }
         ActorOperation::WebhookSimulate => {
             return Ok(ActorResult::WebhookSimulation(
                 engine.simulate_webhook_event(),
@@ -1550,6 +1589,9 @@ async fn apply_live_config<'a>(
     {
         engine.manager.set_webhook_endpoints(value);
     }
+    if keys.contains(&"log_max_size_mb") {
+        apply_log_limit(all);
+    }
     Ok(())
 }
 
@@ -1560,6 +1602,57 @@ fn decode_torrent_b64(value: Option<&str>) -> Result<Vec<u8>, ActorError> {
             .map_err(|error| ActorError::InvalidArgument(format!("invalid torrentB64: {error}"))),
         _ => Ok(Vec::new()),
     }
+}
+
+/// 把持久化的日志大小上限（MB，缺省 / 非法 = 目录默认值）应用到引擎 logger。
+fn apply_log_limit(config: &HashMap<String, String>) {
+    fluxdown_engine::logger::set_max_total_bytes(log_limit_bytes(config));
+}
+
+fn log_limit_bytes(config: &HashMap<String, String>) -> u64 {
+    const KEY: &str = "log_max_size_mb";
+    let default_mb = fluxdown_protocol::daemon_config_default(KEY)
+        .parse::<u64>()
+        .unwrap_or(10);
+    let mb = config
+        .get(KEY)
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|mb| (1..=1024).contains(mb))
+        .unwrap_or(default_mb);
+    mb * 1024 * 1024
+}
+
+/// 把引擎持久化的投递历史并入 daemon 投影（合并语义，不覆盖启动后已到达的增量）。
+fn publish_webhook_history(engine: &Engine, events: &crate::event_hub::DaemonEventHub) {
+    let history: Vec<_> = engine
+        .webhook_deliveries()
+        .into_iter()
+        .map(fluxdown_engine_protocol::webhook_delivery_to_dto)
+        .collect();
+    if !history.is_empty() {
+        events.publish(fluxdown_protocol::DaemonEvent::WebhooksChanged(history));
+    }
+}
+
+/// 去重并剔除不存在的任务 id（批量接口「未知 id 忽略」）。
+async fn existing_task_ids(
+    db: &fluxdown_engine::db::Db,
+    mut task_ids: Vec<String>,
+) -> Result<Vec<String>, ActorError> {
+    let mut seen = std::collections::HashSet::new();
+    task_ids.retain(|id| seen.insert(id.clone()));
+    if task_ids.is_empty() {
+        return Ok(task_ids);
+    }
+    let known: std::collections::HashSet<String> = db
+        .load_tasks_by_ids(&task_ids)
+        .await
+        .map_err(|error| ActorError::Operation(format!("{error:#}")))?
+        .into_iter()
+        .map(|task| task.task_id)
+        .collect();
+    task_ids.retain(|id| known.contains(id));
+    Ok(task_ids)
 }
 
 async fn task_ids_by_status(
@@ -1773,5 +1866,49 @@ mod tests {
 
         drop(db);
         let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[tokio::test]
+    async fn batch_ids_are_deduplicated_and_unknown_ids_dropped() {
+        let (db, dir) = open_db().await;
+        db.init_default_config("/tmp").await.expect("seed config");
+        db.seed_builtin_queues().await.expect("seed queues");
+        for id in ["t1", "t2"] {
+            db.insert_task(id, "https://example.com/a", id, "/tmp", 1, 0, "", "", "", 2)
+                .await
+                .expect("insert task");
+        }
+
+        let ids =
+            super::existing_task_ids(&db, ["t2", "ghost", "t1", "t2"].map(str::to_owned).to_vec())
+                .await
+                .expect("filter ids");
+        assert_eq!(ids, ["t2", "t1"]);
+        assert!(
+            super::existing_task_ids(&db, Vec::new())
+                .await
+                .expect("empty list")
+                .is_empty()
+        );
+
+        drop(db);
+        let _ = tokio::fs::remove_dir_all(dir).await;
+    }
+
+    #[test]
+    fn log_limit_falls_back_to_catalog_default_for_missing_or_invalid_values() {
+        let limit = |value: Option<&str>| {
+            let config = value
+                .map(|v| {
+                    std::collections::HashMap::from([("log_max_size_mb".to_owned(), v.to_owned())])
+                })
+                .unwrap_or_default();
+            super::log_limit_bytes(&config)
+        };
+        assert_eq!(limit(Some("64")), 64 * 1024 * 1024);
+        assert_eq!(limit(Some(" 1024 ")), 1024 * 1024 * 1024);
+        for fallback in [None, Some("0"), Some("1025"), Some("abc"), Some("-3")] {
+            assert_eq!(limit(fallback), 10 * 1024 * 1024, "{fallback:?}");
+        }
     }
 }

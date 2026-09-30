@@ -1,6 +1,6 @@
 //! 可重放事件帧与全量快照契约。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -34,6 +34,81 @@ pub struct DaemonSnapshot {
     pub priority: Vec<String>,
     pub runtime_stats: DaemonRuntimeStatsDto,
     pub pending_selections: Vec<SelectionRequestDto>,
+    /// `tasks` 的 task_id → 下标缓存，让逐帧进度 / 分段事件的任务定位保持 O(1)。
+    /// 不参与序列化；克隆后为空，首次命中后惰性重建。构造快照时用 `..Default::default()` 填充。
+    #[serde(skip)]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub task_index: TaskIndex,
+}
+
+/// [`DaemonSnapshot::tasks`] 的下标缓存（内容不对外开放）。命中必须回读校验，缓存失效时
+/// 退回线性扫描。
+#[derive(Debug, Default)]
+pub struct TaskIndex(HashMap<String, usize>);
+
+impl Clone for TaskIndex {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl DaemonSnapshot {
+    /// 任务在 `tasks` 中的下标。缓存命中且回读一致时 O(1)；否则线性扫描。
+    fn task_position(&self, task_id: &str) -> Option<usize> {
+        if let Some(&index) = self.task_index.0.get(task_id)
+            && self
+                .tasks
+                .get(index)
+                .is_some_and(|task| task.task_id == task_id)
+        {
+            return Some(index);
+        }
+        self.tasks.iter().position(|task| task.task_id == task_id)
+    }
+
+    /// [`Self::task_position`] 的可变版本：线性扫描命中说明缓存已过期（调用方直接改过
+    /// `tasks`），顺手重建。
+    fn locate_task(&mut self, task_id: &str) -> Option<usize> {
+        if let Some(&index) = self.task_index.0.get(task_id)
+            && self
+                .tasks
+                .get(index)
+                .is_some_and(|task| task.task_id == task_id)
+        {
+            return Some(index);
+        }
+        let index = self.tasks.iter().position(|task| task.task_id == task_id)?;
+        self.reindex_tasks();
+        Some(index)
+    }
+
+    fn task_mut(&mut self, task_id: &str) -> Option<&mut TaskDto> {
+        let index = self.locate_task(task_id)?;
+        self.tasks.get_mut(index)
+    }
+
+    fn reindex_tasks(&mut self) {
+        self.task_index.0.clear();
+        self.task_index.0.reserve(self.tasks.len());
+        for (index, task) in self.tasks.iter().enumerate() {
+            self.task_index.0.insert(task.task_id.clone(), index);
+        }
+    }
+
+    fn push_task(&mut self, task: TaskDto) {
+        self.task_index
+            .0
+            .insert(task.task_id.clone(), self.tasks.len());
+        self.tasks.push(task);
+    }
+
+    fn remove_task(&mut self, task_id: &str) {
+        let before = self.tasks.len();
+        self.tasks.retain(|task| task.task_id != task_id);
+        if self.tasks.len() != before {
+            self.reindex_tasks();
+        }
+    }
 }
 
 /// agent 的完整物化投影。下载事实只来自嵌套 daemon 快照。
@@ -110,7 +185,12 @@ pub enum DaemonEvent {
     },
     PluginsChanged(Vec<PluginDto>),
     ComponentsChanged(Vec<ComponentStatusDto>),
+    /// 投递日志增量：按 `deliveryId` 合并进 `webhookDeliveries`（上限
+    /// [`WEBHOOK_DELIVERY_LIMIT`]，按 `timestampMs` 降序）。空增量不改变列表；
+    /// 清空走 [`DaemonEvent::WebhooksCleared`]。
     WebhooksChanged(Vec<WebhookDeliveryDto>),
+    /// 投递日志被显式清空。
+    WebhooksCleared,
     RuntimeStatsChanged(DaemonRuntimeStatsDto),
     SelectionPending(SelectionRequestDto),
     SelectionResolved {
@@ -225,9 +305,8 @@ pub fn accepted_runtime_status(
         return None;
     }
     snapshot
-        .tasks
-        .iter()
-        .find(|task| task.task_id == runtime.task_id)
+        .task_position(&runtime.task_id)
+        .and_then(|index| snapshot.tasks.get(index))
         .map(|task| task.status)
 }
 
@@ -258,21 +337,17 @@ pub fn apply_daemon_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
         DaemonEvent::SnapshotReplaced(replacement) => snapshot.clone_from(replacement),
         DaemonEvent::Engine(message) => apply_engine_message(snapshot, message),
         DaemonEvent::TaskChanged(task) => {
-            if let Some(existing) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|item| item.task_id == task.task_id)
-            {
+            if let Some(existing) = snapshot.task_mut(&task.task_id) {
                 existing.clone_from(task);
             } else {
-                snapshot.tasks.push(task.clone());
+                snapshot.push_task(task.clone());
             }
             if !matches!(task.status, 1 | 5) {
                 clear_active_runtime(snapshot, &task.task_id);
             }
         }
         DaemonEvent::TaskDeleted { task_id } => {
-            snapshot.tasks.retain(|task| task.task_id != *task_id);
+            snapshot.remove_task(task_id);
             snapshot.task_runtime.remove(task_id);
         }
         DaemonEvent::QueuesChanged(queues) => snapshot.queues.clone_from(queues),
@@ -289,8 +364,9 @@ pub fn apply_daemon_event(snapshot: &mut DaemonSnapshot, event: &DaemonEvent) {
         DaemonEvent::PluginsChanged(plugins) => snapshot.plugins.clone_from(plugins),
         DaemonEvent::ComponentsChanged(components) => snapshot.components.clone_from(components),
         DaemonEvent::WebhooksChanged(deliveries) => {
-            snapshot.webhook_deliveries.clone_from(deliveries)
+            merge_webhook_deliveries(&mut snapshot.webhook_deliveries, deliveries);
         }
+        DaemonEvent::WebhooksCleared => snapshot.webhook_deliveries.clear(),
         DaemonEvent::RuntimeStatsChanged(stats) => snapshot.runtime_stats.clone_from(stats),
         DaemonEvent::SelectionPending(request) => {
             snapshot
@@ -310,6 +386,7 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
     match message {
         WsServerMsg::TasksSnapshot { tasks } => {
             snapshot.tasks.clone_from(tasks);
+            snapshot.reindex_tasks();
             let live: std::collections::HashSet<&str> =
                 tasks.iter().map(|task| task.task_id.as_str()).collect();
             snapshot
@@ -338,17 +415,13 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
         } => {
             if *status == 4 && error_message == "deleted" {
                 snapshot.task_runtime.remove(task_id);
-                snapshot.tasks.retain(|task| task.task_id != *task_id);
+                snapshot.remove_task(task_id);
                 return;
             }
             if !matches!(*status, 1 | 5) {
                 clear_active_runtime(snapshot, task_id);
             }
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
+            if let Some(task) = snapshot.task_mut(task_id) {
                 task.status = *status;
                 task.downloaded_bytes = *downloaded_bytes;
                 task.total_bytes = *total_bytes;
@@ -374,10 +447,10 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
             segments,
             ..
         } => {
-            let Some(task) = snapshot.tasks.iter().find(|task| task.task_id == *task_id) else {
+            let Some(status) = snapshot.task_mut(task_id).map(|task| task.status) else {
                 return;
             };
-            let inactive = !matches!(task.status, 1 | 5);
+            let inactive = !matches!(status, 1 | 5);
             let runtime = snapshot
                 .task_runtime
                 .entry(task_id.clone())
@@ -406,11 +479,7 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
             file_name,
             total_bytes,
         } => {
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
+            if let Some(task) = snapshot.task_mut(task_id) {
                 if !file_name.is_empty() {
                     task.file_name.clone_from(file_name);
                 }
@@ -418,20 +487,12 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
             }
         }
         WsServerMsg::TaskQueueChanged { task_id, queue_id } => {
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
+            if let Some(task) = snapshot.task_mut(task_id) {
                 task.queue_id.clone_from(queue_id);
             }
         }
         WsServerMsg::TaskRouteChanged { task_id, route } => {
-            if let Some(task) = snapshot
-                .tasks
-                .iter_mut()
-                .find(|task| task.task_id == *task_id)
-            {
+            if let Some(task) = snapshot.task_mut(task_id) {
                 task.auto_route.clone_from(route);
             }
         }
@@ -449,15 +510,11 @@ fn apply_engine_message(snapshot: &mut DaemonSnapshot, message: &WsServerMsg) {
             *revision = revision.saturating_add(1);
         }
         WsServerMsg::WebhookDeliveriesChanged { deliveries } => {
-            snapshot.webhook_deliveries.clone_from(deliveries);
+            merge_webhook_deliveries(&mut snapshot.webhook_deliveries, deliveries);
         }
         WsServerMsg::FileMissingChanged { updates } => {
             for update in updates {
-                if let Some(task) = snapshot
-                    .tasks
-                    .iter_mut()
-                    .find(|task| task.task_id == update.task_id)
-                {
+                if let Some(task) = snapshot.task_mut(&update.task_id) {
                     task.file_missing = update.missing;
                 }
             }
@@ -492,6 +549,29 @@ fn clear_active_runtime(snapshot: &mut DaemonSnapshot, task_id: &str) {
             segment.active = Some(false);
         }
     }
+}
+
+/// 投递日志保留上限（与引擎内存环一致）。
+pub const WEBHOOK_DELIVERY_LIMIT: usize = 1000;
+
+/// 把一批投递记录按 `deliveryId` 合并进列表：同 id 以增量为准，结果按 `timestampMs`
+/// 降序并截到 [`WEBHOOK_DELIVERY_LIMIT`]。增量为空时列表不变——清空由
+/// [`DaemonEvent::WebhooksCleared`] 显式表达。
+pub fn merge_webhook_deliveries(
+    current: &mut Vec<WebhookDeliveryDto>,
+    delta: &[WebhookDeliveryDto],
+) {
+    if delta.is_empty() {
+        return;
+    }
+    let incoming: std::collections::HashSet<&str> = delta
+        .iter()
+        .map(|delivery| delivery.delivery_id.as_str())
+        .collect();
+    current.retain(|delivery| !incoming.contains(delivery.delivery_id.as_str()));
+    current.extend(delta.iter().cloned());
+    current.sort_by_key(|delivery| std::cmp::Reverse(delivery.timestamp_ms));
+    current.truncate(WEBHOOK_DELIVERY_LIMIT);
 }
 
 #[cfg(test)]
@@ -672,6 +752,152 @@ mod tests {
             snapshot.task_runtime.is_empty(),
             "late sample must not resurrect deleted task"
         );
+        Ok(())
+    }
+
+    fn sample_task(id: &str, status: i32) -> Result<super::TaskDto, serde_json::Error> {
+        serde_json::from_value(json!({
+            "taskId": id, "url": "https://example.com/t", "fileName": id, "saveDir": "/tmp",
+            "status": status, "downloadedBytes": 0, "totalBytes": 100, "errorMessage": "",
+            "createdAt": "1", "proxyUrl": "", "queueId": "main", "checksum": ""
+        }))
+    }
+
+    fn sample_delivery(
+        id: &str,
+        timestamp_ms: i64,
+    ) -> Result<super::WebhookDeliveryDto, serde_json::Error> {
+        serde_json::from_value(json!({
+            "deliveryId": id, "timestampMs": timestamp_ms, "event": "task.completed",
+            "endpointId": "e", "endpointName": "e", "url": "https://example.com/hook",
+            "requestHeaders": "", "requestBody": "", "statusCode": 200, "responseBody": "",
+            "latencyMs": 1, "attempts": 1, "success": true, "error": ""
+        }))
+    }
+
+    #[test]
+    fn webhook_delta_merges_by_delivery_id_and_keeps_newest_first() -> Result<(), serde_json::Error>
+    {
+        let mut snapshot = super::DaemonSnapshot::default();
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::WebhooksChanged(vec![
+                sample_delivery("b", 20)?,
+                sample_delivery("a", 10)?,
+            ]),
+        );
+        let mut retried = sample_delivery("a", 30)?;
+        retried.success = false;
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::WebhooksChanged(vec![retried, sample_delivery("c", 15)?]),
+        );
+        let ids: Vec<&str> = snapshot
+            .webhook_deliveries
+            .iter()
+            .map(|delivery| delivery.delivery_id.as_str())
+            .collect();
+        assert_eq!(ids, ["a", "b", "c"]);
+        assert!(
+            !snapshot.webhook_deliveries[0].success,
+            "same id takes the delta version"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_webhook_delta_keeps_history_and_only_cleared_event_empties_it()
+    -> Result<(), serde_json::Error> {
+        let mut snapshot = super::DaemonSnapshot::default();
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::WebhooksChanged(vec![sample_delivery("a", 1)?]),
+        );
+        super::apply_daemon_event(&mut snapshot, &DaemonEvent::WebhooksChanged(Vec::new()));
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::Engine(super::WsServerMsg::WebhookDeliveriesChanged {
+                deliveries: Vec::new(),
+            }),
+        );
+        assert_eq!(snapshot.webhook_deliveries.len(), 1);
+        super::apply_daemon_event(&mut snapshot, &DaemonEvent::WebhooksCleared);
+        assert!(snapshot.webhook_deliveries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn webhook_history_is_capped_at_the_limit_dropping_oldest() -> Result<(), serde_json::Error> {
+        let mut snapshot = super::DaemonSnapshot::default();
+        let total = i64::try_from(super::WEBHOOK_DELIVERY_LIMIT).unwrap_or(1000) + 5;
+        for chunk_start in (0..total).step_by(100) {
+            let delta = (chunk_start..(chunk_start + 100).min(total))
+                .rev()
+                .map(|n| sample_delivery(&format!("d{n}"), n))
+                .collect::<Result<Vec<_>, _>>()?;
+            super::apply_daemon_event(&mut snapshot, &DaemonEvent::WebhooksChanged(delta));
+        }
+        assert_eq!(
+            snapshot.webhook_deliveries.len(),
+            super::WEBHOOK_DELIVERY_LIMIT
+        );
+        assert_eq!(snapshot.webhook_deliveries[0].timestamp_ms, total - 1);
+        assert_eq!(
+            snapshot.webhook_deliveries.last().map(|d| d.timestamp_ms),
+            Some(5)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn task_lookup_survives_direct_task_list_edits() -> Result<(), serde_json::Error> {
+        let mut snapshot = super::DaemonSnapshot::default();
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::Engine(super::WsServerMsg::TasksSnapshot {
+                tasks: vec![
+                    sample_task("a", 2)?,
+                    sample_task("b", 2)?,
+                    sample_task("c", 2)?,
+                ],
+            }),
+        );
+        // 调用方绕过事件直接改了列表顺序：缓存必须自愈而不是指错任务。
+        snapshot.tasks.remove(0);
+        snapshot.tasks.push(sample_task("d", 1)?);
+        for id in ["b", "c", "d"] {
+            super::apply_daemon_event(
+                &mut snapshot,
+                &DaemonEvent::Engine(super::WsServerMsg::TaskMetaProbed {
+                    task_id: id.into(),
+                    file_name: format!("{id}.bin"),
+                    total_bytes: 7,
+                }),
+            );
+        }
+        let names: Vec<&str> = snapshot
+            .tasks
+            .iter()
+            .map(|t| t.file_name.as_str())
+            .collect();
+        assert_eq!(names, ["b.bin", "c.bin", "d.bin"]);
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::TaskDeleted {
+                task_id: "b".into(),
+            },
+        );
+        super::apply_daemon_event(
+            &mut snapshot,
+            &DaemonEvent::Engine(super::WsServerMsg::TaskMetaProbed {
+                task_id: "d".into(),
+                file_name: "d2.bin".into(),
+                total_bytes: 9,
+            }),
+        );
+        assert_eq!(snapshot.tasks.len(), 2);
+        assert_eq!(snapshot.tasks[1].file_name, "d2.bin");
+        assert_eq!(snapshot.tasks[1].total_bytes, 9);
         Ok(())
     }
 }

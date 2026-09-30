@@ -22,6 +22,11 @@ pub const DAEMON_TASK_PAUSE_ALL: &str = "daemon.task.pauseAll";
 pub const DAEMON_TASK_RESUME_ALL: &str = "daemon.task.resumeAll";
 pub const DAEMON_TASK_RESCAN: &str = "daemon.task.rescan";
 pub const DAEMON_TASK_SET_SEED_LIMITS: &str = "daemon.task.setSeedLimits";
+/// 批量暂停 / 恢复（`{taskIds}`）：整批只推一次任务快照；未知 id 忽略，空列表为空操作。
+pub const DAEMON_TASK_PAUSE_MANY: &str = "daemon.task.pauseMany";
+pub const DAEMON_TASK_RESUME_MANY: &str = "daemon.task.resumeMany";
+/// 批量删除（`{taskIds, deleteFiles}`）：语义同批量暂停。
+pub const DAEMON_TASK_DELETE_MANY: &str = "daemon.task.deleteMany";
 
 pub const DAEMON_QUEUE_LIST: &str = "daemon.queue.list";
 pub const DAEMON_QUEUE_CREATE: &str = "daemon.queue.create";
@@ -242,6 +247,9 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_TASK_RESUME_ALL,
     DAEMON_TASK_RESCAN,
     DAEMON_TASK_SET_SEED_LIMITS,
+    DAEMON_TASK_PAUSE_MANY,
+    DAEMON_TASK_RESUME_MANY,
+    DAEMON_TASK_DELETE_MANY,
     DAEMON_QUEUE_LIST,
     DAEMON_QUEUE_CREATE,
     DAEMON_QUEUE_UPDATE,
@@ -388,6 +396,31 @@ pub const ALL_METHODS: &[&str] = &[
     AGENT_POWER_DISARM,
     SERVICE_EVENT,
 ];
+
+/// 会等待网络、下载或外部 IO 的 daemon 方法。daemon 对这些方法按请求并发处理，
+/// agent 网关也把它们放到独立于普通 daemon 命令的通道，避免长耗时调用堵住暂停/恢复/设置写入。
+pub const SLOW_DAEMON_METHODS: &[&str] = &[
+    DAEMON_COMPONENT_LIST_VERSIONS,
+    DAEMON_COMPONENT_INSTALL,
+    DAEMON_PLUGIN_AUTH,
+    DAEMON_PLUGIN_INSTALL,
+    DAEMON_PLUGIN_INSTALL_DEV,
+    DAEMON_PLUGIN_MARKET_LIST,
+    DAEMON_PLUGIN_MARKET_INSTALL,
+    DAEMON_GROUP_RESOLVE_PREVIEW,
+    DAEMON_RSS_VALIDATE,
+    DAEMON_CONFIG_PROXY_TEST,
+    DAEMON_WEBHOOK_TEST,
+    DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
+    DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
+    DAEMON_FS_LIST,
+];
+
+/// 是否属于 [`SLOW_DAEMON_METHODS`]。
+#[must_use]
+pub fn is_slow_daemon_method(method_name: &str) -> bool {
+    SLOW_DAEMON_METHODS.contains(&method_name)
+}
 
 /// 规范DAEMON_CAPABILITIES。
 pub const DAEMON_CAPABILITIES: &[&str] = &[
