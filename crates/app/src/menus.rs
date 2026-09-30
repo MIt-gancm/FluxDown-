@@ -303,22 +303,9 @@ fn check_update(cx: &mut App) {
 }
 
 fn open_logs_folder(cx: &mut App) {
-    let client = Desktop::global(cx).client.clone();
-    let future = client.call::<(), fluxdown_protocol::LogPathsDto>(
-        fluxdown_protocol::method::AGENT_DIAGNOSTICS_LOG_PATHS,
-        None,
-    );
-    cx.spawn(async move |cx| {
-        if let Ok(paths) = future.await {
-            let dir = if paths.agent_log_dir.is_empty() {
-                paths.daemon_log_dir
-            } else {
-                paths.agent_log_dir
-            };
-            cx.update(|cx| cx.reveal_path(std::path::Path::new(&dir)));
-        }
-    })
-    .detach();
+    // 桌面端自身日志目录本地已知；agent 不可达时日志入口恰是最需要的。
+    let dir = crate::app::agent_data_dir().join("logs");
+    cx.reveal_path(&dir);
 }
 
 fn show_about(cx: &mut App) {

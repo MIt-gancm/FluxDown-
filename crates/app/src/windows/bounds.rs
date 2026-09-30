@@ -224,13 +224,20 @@ fn display_uuid(display: &dyn PlatformDisplay) -> Option<String> {
     display.uuid().ok().map(|uuid| uuid.to_string())
 }
 
+/// Windows 上最小化时 `window_bounds()` 按还原矩形报告 `Windowed`，
+/// 而平台的最大化标志在最小化后仍保持，两者任一为真都应记为最大化。
+fn resolve_maximized(bounds_maximized: bool, platform_maximized: bool) -> bool {
+    bounds_maximized || platform_maximized
+}
+
 /// 当前窗口边界的记录值：记位置的窗口含最大化状态（全屏按最大化记）与所在显示器，
 /// 只记尺寸的窗口取还原尺寸。
 fn capture(which: RememberedWindow, window: &Window, cx: &App) -> Value {
-    let (rect, maximized) = match window.window_bounds() {
+    let (rect, bounds_maximized) = match window.window_bounds() {
         WindowBounds::Windowed(rect) => (rect, false),
         WindowBounds::Maximized(rect) | WindowBounds::Fullscreen(rect) => (rect, true),
     };
+    let maximized = resolve_maximized(bounds_maximized, window.is_maximized());
     if !which.remembers_position() {
         return size_value(rect.size);
     }
@@ -300,7 +307,18 @@ mod tests {
     use gpui::{Bounds, point, px, size};
     use serde_json::json;
 
-    use super::{StoredFrame, fit_size, frame_value, frame_visible, parse_frame, parse_size};
+    use super::{
+        StoredFrame, fit_size, frame_value, frame_visible, parse_frame, parse_size,
+        resolve_maximized,
+    };
+
+    #[test]
+    fn minimized_maximized_window_keeps_maximized() {
+        // Windows 上最小化的窗口边界报告为 Windowed，但窗口仍带最大化样式。
+        assert!(resolve_maximized(false, true));
+        assert!(resolve_maximized(true, false));
+        assert!(!resolve_maximized(false, false));
+    }
 
     fn rect(x: f32, y: f32, w: f32, h: f32) -> Bounds<gpui::Pixels> {
         Bounds {

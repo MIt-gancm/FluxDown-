@@ -103,20 +103,27 @@ impl SendError {
         matches!(
             self,
             Self::Io(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::NotFound
-                        | io::ErrorKind::ConnectionRefused
-                        | io::ErrorKind::ConnectionAborted
-                        | io::ErrorKind::ConnectionReset
-                        | io::ErrorKind::NotConnected
-                        | io::ErrorKind::BrokenPipe
-                        | io::ErrorKind::WouldBlock
-                        | io::ErrorKind::TimedOut
-                        | io::ErrorKind::UnexpectedEof
-                )
+                if is_pipe_busy(error)
+                    || matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound
+                            | io::ErrorKind::ConnectionRefused
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::NotConnected
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::UnexpectedEof
+                    )
         )
     }
+}
+
+/// 管道实例全被占用（ERROR_PIPE_BUSY）：std 不给它专属 kind，且连接尚未建立，重试是安全的。
+fn is_pipe_busy(error: &io::Error) -> bool {
+    const ERROR_PIPE_BUSY: i32 = 231;
+    cfg!(windows) && error.raw_os_error() == Some(ERROR_PIPE_BUSY)
 }
 
 /// 已绑定的主实例激活端点。端点在完整 UI 初始化前建立，以便内核排队并发启动的请求。
@@ -481,6 +488,13 @@ mod tests {
         let error =
             send_to_primary(&endpoint, &ActivateMessage::default()).expect_err("no listener");
         assert!(matches!(error, SendError::Io(_)));
+        assert!(error.is_retryable());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_busy_is_retryable() {
+        let error = SendError::Io(io::Error::from_raw_os_error(231));
         assert!(error.is_retryable());
     }
 

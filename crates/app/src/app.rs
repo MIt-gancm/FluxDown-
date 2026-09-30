@@ -622,7 +622,7 @@ pub(crate) fn submit_captures_detached(
 /// 否则设了 `FLUXDOWN_DATA_DIR` 时界面会去另一个目录找 bearer，永远连不上自己拉起的 agent。
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopPaths {
-    /// 数据根：`FLUXDOWN_DATA_DIR`，否则 ProjectDirs 数据目录。
+    /// 数据根：`FLUXDOWN_DATA_DIR`，否则（Windows 便携版）`<exe>/portable_data`，否则 ProjectDirs 数据目录。
     data_root: std::path::PathBuf,
     /// `FLUXDOWN_AGENT_DATA_DIR`，否则 `<数据根>/agent`。
     agent_data_dir: std::path::PathBuf,
@@ -634,6 +634,7 @@ impl DesktopPaths {
     fn from_env() -> Self {
         Self::resolve(
             |name| env::var_os(name),
+            portable_data_dir(),
             directories::ProjectDirs::from("dev", "zerx", "FluxDown")
                 .map(|project| project.data_dir().to_owned()),
         )
@@ -641,10 +642,12 @@ impl DesktopPaths {
 
     fn resolve(
         lookup: impl Fn(&str) -> Option<std::ffi::OsString>,
+        portable_data_dir: Option<std::path::PathBuf>,
         project_data_dir: Option<std::path::PathBuf>,
     ) -> Self {
         let data_root = lookup("FLUXDOWN_DATA_DIR")
             .map(std::path::PathBuf::from)
+            .or(portable_data_dir)
             .or(project_data_dir)
             .unwrap_or_default();
         let agent_data_dir = lookup("FLUXDOWN_AGENT_DATA_DIR")
@@ -659,6 +662,23 @@ impl DesktopPaths {
             agent_token,
         }
     }
+}
+
+/// Windows 便携版：`<exe>/portable` 标记存在时数据在 `<exe>/portable_data`（与 agent 同判定）。
+#[cfg(windows)]
+fn portable_data_dir() -> Option<std::path::PathBuf> {
+    let exe_dir = env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))?;
+    exe_dir
+        .join("portable")
+        .exists()
+        .then(|| exe_dir.join("portable_data"))
+}
+
+#[cfg(not(windows))]
+fn portable_data_dir() -> Option<std::path::PathBuf> {
+    None
 }
 
 /// 桌面数据根目录（导入主题等）。
@@ -699,6 +719,7 @@ mod tests {
                         .find(|(key, _)| key == name)
                         .map(|(_, value)| value.into())
                 },
+                None,
                 project.clone(),
             )
         };
@@ -731,6 +752,29 @@ mod tests {
         ]);
         assert_eq!(token_file.agent_data_dir, PathBuf::from("/agent-state"));
         assert_eq!(token_file.agent_token, PathBuf::from("/secrets/token"));
+    }
+
+    #[test]
+    fn portable_data_precedes_project_dirs_but_not_env() {
+        use std::path::PathBuf;
+
+        let portable = Some(PathBuf::from("/exe/portable_data"));
+        let project = Some(PathBuf::from("/project"));
+        let paths = DesktopPaths::resolve(|_| None, portable.clone(), project.clone());
+        assert_eq!(
+            paths.agent_data_dir,
+            PathBuf::from("/exe/portable_data/agent")
+        );
+        assert_eq!(
+            paths.agent_token,
+            PathBuf::from("/exe/portable_data/agent/agent.token")
+        );
+        let env_root = DesktopPaths::resolve(
+            |name| (name == "FLUXDOWN_DATA_DIR").then(|| "/root".into()),
+            portable,
+            project,
+        );
+        assert_eq!(env_root.agent_data_dir, PathBuf::from("/root/agent"));
     }
 
     #[test]

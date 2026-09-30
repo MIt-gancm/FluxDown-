@@ -314,8 +314,17 @@ fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx:
     let task = cx.spawn(async move |cx| {
         let SubmitNotice { ok, message } = notice.await;
         cx.update(|cx| {
-            let Some(main) = WindowRegistry::handle(cx, &WindowKey::Main) else {
-                return;
+            let main = match WindowRegistry::handle(cx, &WindowKey::Main) {
+                Some(main) => main,
+                // 成功时静默结束；失败则打开主窗口承载错误提示，否则用户无从得知。
+                None if ok => return,
+                None => {
+                    crate::windows::main::reveal(cx);
+                    let Some(main) = WindowRegistry::handle(cx, &WindowKey::Main) else {
+                        return;
+                    };
+                    main
+                }
             };
             let translator = translator.read(cx);
             let message = if message.is_empty() {
