@@ -846,27 +846,49 @@ pub(crate) fn render_number(
                     }),
                     cx.subscribe_in(&state, window, {
                         move |slot: &mut NumberSlot, state, event: &InputEvent, window, cx| {
-                            if !matches!(event, InputEvent::Change) {
-                                return;
-                            }
                             let text = state.read(cx).value();
-                            let Ok(parsed) = text.parse::<f64>() else {
-                                return;
-                            };
-                            let clamped = parsed.clamp(min, max);
-                            if (clamped - slot.current).abs() < f64::EPSILON {
-                                return;
-                            }
-                            slot.current = clamped;
-                            set(clamped, cx);
-                            if (clamped - parsed).abs() >= f64::EPSILON {
-                                state.update(cx, |state, cx| {
-                                    state.set_value(
-                                        SharedString::from(format_number(clamped)),
-                                        window,
-                                        cx,
-                                    );
-                                });
+                            let rewrite =
+                                |value: f64,
+                                 state: &gpui::Entity<InputState>,
+                                 window: &mut Window,
+                                 cx: &mut gpui::Context<NumberSlot>| {
+                                    state.update(cx, |state, cx| {
+                                        state.set_value(
+                                            SharedString::from(format_number(value)),
+                                            window,
+                                            cx,
+                                        );
+                                    });
+                                };
+                            match event {
+                                InputEvent::Blur => {
+                                    // 空串 / 单个 `-` 等中间态在失焦时回显当前值。
+                                    let parses_to_current = text.parse::<f64>().is_ok_and(|v| {
+                                        v.is_finite() && (v - slot.current).abs() < f64::EPSILON
+                                    });
+                                    if !parses_to_current {
+                                        rewrite(slot.current, state, window, cx);
+                                    }
+                                }
+                                InputEvent::Change => {
+                                    // 不可解析的中间态（空串、`-`）不打断输入，留待失焦。
+                                    let Ok(parsed) = text.parse::<f64>() else {
+                                        return;
+                                    };
+                                    if !parsed.is_finite() {
+                                        return;
+                                    }
+                                    let clamped = parsed.clamp(min, max);
+                                    if (clamped - slot.current).abs() >= f64::EPSILON {
+                                        slot.current = clamped;
+                                        set(clamped, cx);
+                                    }
+                                    // 可解析但越界 / 与规范写法不同（如 `0`→min、粘贴 5000→max）：改写为钳制值。
+                                    if (clamped - parsed).abs() >= f64::EPSILON {
+                                        rewrite(clamped, state, window, cx);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }),

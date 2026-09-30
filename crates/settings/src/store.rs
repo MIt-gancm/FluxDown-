@@ -89,6 +89,9 @@ pub struct SettingsStore {
     /// 已编辑、尚未发送的偏好；`bool` = 是否进入云同步。
     pending_prefs: BTreeMap<String, (Value, bool)>,
     inflight_prefs: BTreeMap<String, (Value, bool)>,
+    /// 编辑前最后一次服务端确认值，写回失败时用于回滚（`None` = 当时不存在）。
+    baseline_daemon: BTreeMap<String, Option<String>>,
+    baseline_prefs: BTreeMap<String, Option<Value>>,
     flush_scheduled: bool,
     flush_inflight: bool,
     conflict_retries: u8,
@@ -136,6 +139,8 @@ impl SettingsStore {
             inflight_daemon: BTreeMap::new(),
             pending_prefs: BTreeMap::new(),
             inflight_prefs: BTreeMap::new(),
+            baseline_daemon: BTreeMap::new(),
+            baseline_prefs: BTreeMap::new(),
             flush_scheduled: false,
             flush_inflight: false,
             conflict_retries: 0,
@@ -185,6 +190,7 @@ impl SettingsStore {
         match event {
             AgentEvent::Daemon(DaemonEvent::ConfigChanged(config)) => {
                 self.daemon.clone_from(config);
+                self.refresh_daemon_baselines();
                 self.overlay_local_edits();
             }
             AgentEvent::Daemon(DaemonEvent::QueuesChanged(queues)) => {
@@ -206,6 +212,7 @@ impl SettingsStore {
             AgentEvent::ShellChanged(shell) => self.shell.clone_from(shell),
             AgentEvent::PreferencesChanged(preferences) => {
                 self.preferences.clone_from(preferences);
+                self.refresh_pref_baselines();
                 self.overlay_local_edits();
             }
             AgentEvent::SyncChanged(sync) => self.sync.clone_from(sync),
@@ -222,6 +229,7 @@ impl SettingsStore {
             AgentEvent::LinkedDevicesChanged(devices) => self.linked_devices = devices.len(),
             AgentEvent::DaemonSnapshotReplaced(snapshot) => {
                 self.daemon.clone_from(&snapshot.config);
+                self.refresh_daemon_baselines();
                 self.queues.clone_from(&snapshot.queues);
                 self.plugins.clone_from(&snapshot.plugins);
                 self.components.clone_from(&snapshot.components);
@@ -249,6 +257,103 @@ impl SettingsStore {
         cx.notify();
     }
 
+    /// 记录编辑前的服务端值（仅首次；回执 / 回滚 / 新快照前保持不变）。
+    /// `pref_key` 为空串表示不涉及偏好。
+    fn capture_baselines(&mut self, pref_key: &str, daemon_key: Option<&str>) {
+        if !pref_key.is_empty() && !self.baseline_prefs.contains_key(pref_key) {
+            let old = self.preferences.values.get(pref_key).cloned();
+            self.baseline_prefs.insert(pref_key.to_owned(), old);
+        }
+        if let Some(key) = daemon_key
+            && !self.baseline_daemon.contains_key(key)
+        {
+            let old = self.daemon.values.get(key).cloned();
+            self.baseline_daemon.insert(key.to_owned(), old);
+        }
+    }
+
+    /// 新的服务端 daemon 配置到达：基线跟随服务端值。
+    fn refresh_daemon_baselines(&mut self) {
+        for (key, old) in &mut self.baseline_daemon {
+            *old = self.daemon.values.get(key).cloned();
+        }
+    }
+
+    /// 新的服务端偏好到达：基线跟随服务端值。
+    fn refresh_pref_baselines(&mut self) {
+        for (key, old) in &mut self.baseline_prefs {
+            *old = self.preferences.values.get(key).cloned();
+        }
+    }
+
+    /// 写回成功：已回执且无更新编辑的键不再需要基线。
+    fn settle_inflight(&mut self) {
+        let daemon = std::mem::take(&mut self.inflight_daemon);
+        for key in daemon
+            .keys()
+            .filter(|k| !self.pending_daemon.contains_key(*k))
+        {
+            self.baseline_daemon.remove(key);
+        }
+        let prefs = std::mem::take(&mut self.inflight_prefs);
+        for key in prefs
+            .keys()
+            .filter(|k| !self.pending_prefs.contains_key(*k))
+        {
+            self.baseline_prefs.remove(key);
+            if let Some(spec) = setting_spec(key).filter(|s| s.owner == SettingOwner::Daemon) {
+                self.baseline_daemon.remove(spec.storage_key);
+            }
+        }
+    }
+
+    /// 写回失败：把在途键恢复为编辑前的服务端值（已有更新的待发送编辑则保留）。
+    fn rollback_inflight(&mut self) {
+        let daemon = std::mem::take(&mut self.inflight_daemon);
+        for key in daemon.into_keys() {
+            if !self.pending_daemon.contains_key(&key) {
+                Self::restore(
+                    &mut self.daemon.values,
+                    &key,
+                    self.baseline_daemon.remove(&key),
+                );
+            }
+        }
+        let prefs = std::mem::take(&mut self.inflight_prefs);
+        for key in prefs.into_keys() {
+            if self.pending_prefs.contains_key(&key) {
+                continue;
+            }
+            let old = self.baseline_prefs.remove(&key);
+            match old {
+                Some(Some(value)) => {
+                    self.preferences.values.insert(key.clone(), value);
+                }
+                Some(None) => {
+                    self.preferences.values.remove(&key);
+                }
+                None => {}
+            }
+            if let Some(spec) = setting_spec(&key).filter(|s| s.owner == SettingOwner::Daemon) {
+                let old = self.baseline_daemon.remove(spec.storage_key);
+                Self::restore(&mut self.daemon.values, spec.storage_key, old);
+            }
+        }
+        self.conflict_retries = 0;
+    }
+
+    fn restore(values: &mut BTreeMap<String, String>, key: &str, old: Option<Option<String>>) {
+        match old {
+            Some(Some(value)) => {
+                values.insert(key.to_owned(), value);
+            }
+            Some(None) => {
+                values.remove(key);
+            }
+            None => {}
+        }
+    }
+
     /// 服务端快照到达时把尚未回执的本地编辑重新盖上去，避免输入框回跳。
     fn overlay_local_edits(&mut self) {
         for (key, value) in self
@@ -260,6 +365,12 @@ impl SettingsStore {
         }
         for (key, (value, _)) in self.inflight_prefs.iter().chain(self.pending_prefs.iter()) {
             self.preferences.values.insert(key.clone(), value.clone());
+            // daemon 拥有的键读侧是 daemon 快照，同样要盖回去。
+            if let Some(spec) = setting_spec(key).filter(|s| s.owner == SettingOwner::Daemon)
+                && let Ok(wire) = value_to_daemon_config(spec, value)
+            {
+                self.daemon.values.insert(spec.storage_key.to_owned(), wire);
+            }
         }
     }
 
@@ -435,13 +546,18 @@ impl SettingsStore {
         if self.daemon.values.get(key) == Some(&normalized) {
             return;
         }
+        let spec = fluxdown_protocol::SYNC_SETTING_SPECS
+            .iter()
+            .find(|spec| spec.owner == SettingOwner::Daemon && spec.storage_key == key);
+        if let Some(spec) = spec {
+            self.capture_baselines(spec.key, Some(key));
+        } else {
+            self.capture_baselines("", Some(key));
+        }
         self.daemon
             .values
             .insert(key.to_owned(), normalized.clone());
-        if let Some(spec) = fluxdown_protocol::SYNC_SETTING_SPECS
-            .iter()
-            .find(|spec| spec.owner == SettingOwner::Daemon && spec.storage_key == key)
-        {
+        if let Some(spec) = spec {
             let json = daemon_string_to_json(spec.key, &normalized);
             self.pending_prefs.insert(spec.key.to_owned(), (json, true));
         } else {
@@ -508,6 +624,9 @@ impl SettingsStore {
             if spec.owner == SettingOwner::Daemon {
                 // daemon 键的读侧是 daemon 快照；写侧仍经同步链路。
                 if let Ok(wire) = value_to_daemon_config(spec, &value) {
+                    if self.preferences.values.get(key) != Some(&value) {
+                        self.capture_baselines(key, Some(spec.storage_key));
+                    }
                     self.daemon.values.insert(spec.storage_key.to_owned(), wire);
                 }
             }
@@ -515,6 +634,7 @@ impl SettingsStore {
         if self.preferences.values.get(key) == Some(&value) {
             return;
         }
+        self.capture_baselines(key, None);
         self.preferences
             .values
             .insert(key.to_owned(), value.clone());
@@ -885,8 +1005,7 @@ impl SettingsStore {
                     this.flush_inflight = false;
                     match first_error {
                         None => {
-                            this.inflight_daemon.clear();
-                            this.inflight_prefs.clear();
+                            this.settle_inflight();
                             this.conflict_retries = 0;
                             if this.last_error.as_ref().is_some_and(|error| {
                                 error.kind != SettingsErrorKind::InvalidArgument
@@ -910,8 +1029,7 @@ impl SettingsStore {
                             this.schedule_flush(cx);
                         }
                         Some(error) => {
-                            this.inflight_daemon.clear();
-                            this.inflight_prefs.clear();
+                            this.rollback_inflight();
                             this.conflict_retries = 0;
                             this.last_error = Some(SettingsError {
                                 kind: SettingsErrorKind::from_rpc(&error),
@@ -1010,7 +1128,85 @@ fn daemon_string_to_json(spec_key: &str, wire: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::preference_is_synced;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use super::{SettingsStore, preference_is_synced};
+    use crate::port::{PortFuture, SettingsPort};
+
+    struct NullPort;
+
+    impl SettingsPort for NullPort {
+        fn call(
+            &self,
+            _method: &'static str,
+            _params: serde_json::Value,
+        ) -> PortFuture<serde_json::Value> {
+            Box::pin(async { Ok(serde_json::Value::Null) })
+        }
+    }
+
+    const PREF: &str = "download.max_concurrent_tasks";
+    const WIRE: &str = "max_concurrent_tasks";
+
+    fn store_with_server_value(server: &str) -> SettingsStore {
+        let mut store = SettingsStore::new(Arc::new(NullPort));
+        store
+            .daemon
+            .values
+            .insert(WIRE.to_owned(), server.to_owned());
+        store
+    }
+
+    fn wire(store: &SettingsStore) -> Option<&str> {
+        store.daemon.values.get(WIRE).map(String::as_str)
+    }
+
+    #[test]
+    fn pending_daemon_owned_pref_survives_daemon_snapshot_replacement() {
+        let mut store = store_with_server_value("3");
+        store.capture_baselines(PREF, Some(WIRE));
+        store.daemon.values.insert(WIRE.to_owned(), "8".to_owned());
+        store
+            .pending_prefs
+            .insert(PREF.to_owned(), (json!(8), true));
+
+        // 服务端快照（仍是旧值）整体替换 daemon 后重放本地编辑。
+        store.daemon.values.insert(WIRE.to_owned(), "3".to_owned());
+        store.overlay_local_edits();
+        assert_eq!(wire(&store), Some("8"));
+    }
+
+    #[test]
+    fn failed_writeback_restores_server_value() {
+        let mut store = store_with_server_value("3");
+        store.capture_baselines(PREF, Some(WIRE));
+        store.daemon.values.insert(WIRE.to_owned(), "8".to_owned());
+        store
+            .inflight_prefs
+            .insert(PREF.to_owned(), (json!(8), true));
+
+        store.rollback_inflight();
+        assert_eq!(wire(&store), Some("3"));
+        assert!(store.inflight_prefs.is_empty());
+    }
+
+    #[test]
+    fn failed_writeback_keeps_newer_pending_edit() {
+        let mut store = store_with_server_value("3");
+        store.capture_baselines(PREF, Some(WIRE));
+        store.daemon.values.insert(WIRE.to_owned(), "9".to_owned());
+        store
+            .inflight_prefs
+            .insert(PREF.to_owned(), (json!(8), true));
+        store
+            .pending_prefs
+            .insert(PREF.to_owned(), (json!(9), true));
+
+        store.rollback_inflight();
+        assert_eq!(wire(&store), Some("9"));
+    }
 
     #[test]
     fn catalog_keys_sync_and_device_local_keys_do_not() {
