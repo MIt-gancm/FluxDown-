@@ -21,6 +21,9 @@ pub(crate) struct TaskStore {
     /// 本地 task_id → `local` 下标。
     index: RefCell<HashMap<String, usize>>,
     generation: Cell<u64>,
+    /// 行集合 / 下标布局变化计数（增删、整表换成不同的行）。只改行内容时不变，
+    /// 表格据此判断 [`RowId`] 是否仍指向同一任务、能否沿用上次的行顺序。
+    structure: Cell<u64>,
 }
 
 impl TaskStore {
@@ -63,24 +66,46 @@ impl TaskStore {
         self.generation.get()
     }
 
+    pub(crate) fn structure_generation(&self) -> u64 {
+        self.structure.get()
+    }
+
     fn bump(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
     }
 
-    pub(crate) fn replace_local(&self, rows: Vec<DownloadTaskView>) {
-        let index = rows
-            .iter()
-            .enumerate()
-            .map(|(ix, row)| (row.key.task_id().to_owned(), ix))
-            .collect();
-        *self.index.borrow_mut() = index;
-        *self.local.borrow_mut() = rows;
+    fn bump_structure(&self) {
+        self.structure.set(self.structure.get().wrapping_add(1));
         self.bump();
     }
 
+    /// 整表替换；行 key 与顺序不变时（快照 / 重连重建）只算内容变化。
+    pub(crate) fn replace_local(&self, rows: Vec<DownloadTaskView>) {
+        let same_rows = same_row_keys(&self.local.borrow(), &rows);
+        if !same_rows {
+            let index = rows
+                .iter()
+                .enumerate()
+                .map(|(ix, row)| (row.key.task_id().to_owned(), ix))
+                .collect();
+            *self.index.borrow_mut() = index;
+        }
+        *self.local.borrow_mut() = rows;
+        if same_rows {
+            self.bump();
+        } else {
+            self.bump_structure();
+        }
+    }
+
     pub(crate) fn replace_remote(&self, rows: Vec<DownloadTaskView>) {
+        let same_rows = same_row_keys(&self.remote.borrow(), &rows);
         *self.remote.borrow_mut() = rows;
-        self.bump();
+        if same_rows {
+            self.bump();
+        } else {
+            self.bump_structure();
+        }
     }
 
     /// 覆盖单行（下标必须已存在）。
@@ -98,7 +123,7 @@ impl TaskStore {
             .borrow_mut()
             .insert(row.key.task_id().to_owned(), ix);
         rows.push(row);
-        self.bump();
+        self.bump_structure();
         ix
     }
 
@@ -114,6 +139,10 @@ impl TaskStore {
         if let Some(moved) = rows.get(ix) {
             index.insert(moved.key.task_id().to_owned(), ix);
         }
-        self.bump();
+        self.bump_structure();
     }
+}
+
+fn same_row_keys(current: &[DownloadTaskView], next: &[DownloadTaskView]) -> bool {
+    current.len() == next.len() && current.iter().zip(next).all(|(a, b)| a.key == b.key)
 }

@@ -45,6 +45,7 @@ const SORT_KEY_KEY: Record<ViewSortKey, string> = {
   size: 'viewSortSize',
   progress: 'viewSortProgress',
   speed: 'viewSortSpeed',
+  status: 'viewSortStatus',
 }
 
 const SORT_DIRS: readonly { value: SortDir; labelKey: string }[] = [

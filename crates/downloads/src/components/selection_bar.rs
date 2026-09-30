@@ -1,4 +1,5 @@
-//! 表格区域底部的浮动选择条：选中 ≥1 项时出现，承载批量操作。
+//! 表头选择条：选中 ≥1 项时覆盖全选框右侧的列头，承载批量操作；取消选择后恢复列名。
+//! 不遮挡任何任务行，紧挨刚点过的复选框，鼠标移动距离最短。
 
 use fluxdown_ui_components::{
     FluxIcon, IconControlExt as _, tabular_numbers, toolbar_action_button,
@@ -16,10 +17,10 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
-use crate::{components::task_table::ToolbarCommand, pages::downloads::DownloadView};
-
-/// 选择条卡片高度。
-const SELECTION_BAR_HEIGHT: gpui::Pixels = px(36.);
+use crate::{
+    components::task_table::{SELECTION_COLUMN_WIDTH, TABLE_HEADER_HEIGHT, ToolbarCommand},
+    pages::downloads::DownloadView,
+};
 
 impl DownloadView {
     /// chrome 风格图标按钮 + 悬浮提示；`on_click` 在下载页上下文执行。
@@ -112,7 +113,8 @@ impl DownloadView {
             .into_any_element()
     }
 
-    /// 浮动选择条；无选中时返回 `None`。
+    /// 表头选择条（覆盖在表格容器顶部、选择列右侧）；无选中时返回 `None`。
+    /// 覆盖期间列头的排序 / 拖宽被 `occlude` 拦下，全选框仍可用。
     pub(crate) fn render_selection_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let selection = self.table_state.read(cx).delegate().selection_summary();
         self.selection_summary.set(selection);
@@ -123,10 +125,8 @@ impl DownloadView {
         let theme = active_theme(cx);
         let tokens = theme.tokens();
         let spacing = tokens.spacing;
-        let radius = tokens.radius.lg;
         let surface = tokens.colors.surface;
         let foreground = tokens.colors.foreground;
-        let shadow = tokens.shadow.md.clone();
         let text_size = tokens.typography.xs.size;
         let line_height = tokens.typography.xs.line_height;
         let hairline = theme.extended().colors.hairline;
@@ -201,42 +201,33 @@ impl DownloadView {
         );
 
         Some(
-            div()
+            h_flex()
+                .id("download-selection-bar")
+                .occlude()
                 .absolute()
-                .left_0()
+                .top_0()
+                .left(px(SELECTION_COLUMN_WIDTH))
                 .right_0()
-                .bottom(spacing.lg)
-                .flex()
-                .justify_center()
+                // 留出表头底部分隔线。
+                .h(px(TABLE_HEADER_HEIGHT) - stroke)
+                .pl(spacing.sm)
+                .gap(spacing.xxs)
+                .items_center()
+                .bg(surface)
                 .child(
-                    h_flex()
-                        .id("download-selection-bar")
-                        .occlude()
-                        .h(SELECTION_BAR_HEIGHT)
-                        .px(spacing.sm)
-                        .gap(spacing.xxs)
-                        .items_center()
-                        .bg(surface)
-                        .border(stroke)
-                        .border_color(hairline)
-                        .rounded(radius)
-                        .shadow(shadow)
-                        .child(
-                            div()
-                                .flex_none()
-                                .px(spacing.xs)
-                                .whitespace_nowrap()
-                                .text_size(text_size)
-                                .line_height(line_height)
-                                .font_features(tabular_numbers())
-                                .text_color(foreground)
-                                .child(count_label),
-                        )
-                        .child(separator())
-                        .children(actions)
-                        .child(separator())
-                        .child(clear),
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_size(text_size)
+                        .line_height(line_height)
+                        .font_features(tabular_numbers())
+                        .text_color(foreground)
+                        .child(count_label),
                 )
+                .child(separator())
+                .children(actions)
+                .child(separator())
+                .child(clear)
                 .into_any_element(),
         )
     }

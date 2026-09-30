@@ -25,7 +25,9 @@ Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm
 
 ## 发布与 CI（`.github/workflows/release.yml`）
 
-**组件变更检测 + 统一 release** 流水线，`v*` tag 触发。`changes` job diff `PREV..TAG` 映射路径→输出（`app`/`extension`/`server`/`mobile`/`cli`；预览 tag 恒不含 extension），首个 tag 全量构建；同时解析构建源码 `source`（默认 = tag 提交）。**分支守卫**：稳定 `vX.Y.Z` 必须是 `origin/stable` 祖先；预览 `vX.Y.Z-rc.N` 必须在 `origin/main`；否则整条失败。同一 tag 的运行由 `concurrency` 串行。
+**组件变更检测 + 统一 release** 流水线，`v*` tag 触发。`changes` job diff `PREV..TAG` 映射路径→输出（`app`/`extension`/`server`/`mobile`/`cli`），首个 tag 全量构建；**基线 `PREV`**：稳定 `vX.Y.Z` 取上一个稳定版（`git describe --exclude 'v*-*'`，跳过其间全部 `-rc.N`，rc 阶段改过的组件都进稳定版），预览取上一个任意 `v*` tag；同一基线经 `changes.outputs.prev` 传给 release notes（稳定版 git-cliff 以 `GIT_CLIFF__GIT__IGNORE_TAGS` 忽略 rc tag，说明覆盖整个 rc 周期）。同时解析构建源码 `source`（默认 = tag 提交）。**分支守卫**：稳定 `vX.Y.Z` 必须是 `origin/stable` 祖先；预览 `vX.Y.Z-rc.N` 必须在 `origin/main`；否则整条失败。同一 tag 的运行由 `concurrency` 串行。
+
+**浏览器扩展**与其他组件同一套变更判定：预览 tag 有变动只打包附到 release（Chrome zip + `FluxDown-<版本>-firefox-unsigned.zip`，manifest `version` 由 WXT 去掉预发布后缀、Chrome 带 `version_name`），**不推 Chrome/Edge 商店、不走 AMO 签名**（unlisted 签名也占 AMO 版本号，会与稳定版 `X.Y.Z.1` 冲突）；稳定 tag 有变动才打包 + 推三家商店 + AMO 签名 XPI。官网 `/api/release` 的扩展恒取稳定版。
 
 **一个 tag 一个 release**：`prepare-release` 生成双语说明并建草稿 `vX.Y.Z`（预览标 prerelease）→ 各 `build-*` 并行 → `upload-<组件>` 经 `.github/actions/release-upload` 上传产物（`--clobber`），**最后**上传完成哨兵 `SHA256SUMS-<组件>.txt`（补发时先删旧哨兵、清掉旧清单里不再产出的资产）→ `publish-release`（`.github/scripts/release_publish.py`，`always()`）合并哨兵为 `SHA256SUMS.txt`、刷新说明头部（`<!-- fluxdown:release:begin … end -->`：已发布组件清单 + 服务器/CLI 安装说明，位于双语标记之前）、草稿转正；**latest 仅给「稳定版 + 桌面端完整 + 最高稳定版本」**。组件互不阻断：某组件失败只跳过它的 upload，其余照常发布，publish 以失败结束并在 job summary 列出补发命令；Server Docker 直推 ghcr、不阻断二进制上传，失败单独报告。官网 `/api/release` 只认有哨兵的组件（`website*/src/lib/release-assets.ts`，两站逐字一致），缺失组件回落到它上一个完整版本；`/api/changelog` 剥掉说明头部。历史拆分时代的 `server-v*`/`cli-v*`/`mobile-v*`/`extension-v*` release 仍被官网兼容识别，不再新建。
 

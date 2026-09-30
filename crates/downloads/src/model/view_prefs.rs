@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 use chrono::{Datelike, Local, NaiveDate, TimeZone};
 use fluxdown_ui_theme::DensityTokens;
 use gpui::Pixels;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{DownloadTaskView, TaskState};
 
@@ -78,6 +78,7 @@ impl ViewGroupBy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ViewSortKey {
+    /// 默认排序：状态优先级，再按添加时间新→旧。
     #[default]
     Smart,
     Created,
@@ -85,16 +86,19 @@ pub(crate) enum ViewSortKey {
     Size,
     Progress,
     Speed,
+    /// 按状态优先级排序，可升降序（「状态」列表头）。
+    Status,
 }
 
 impl ViewSortKey {
-    const CYCLE: [Self; 6] = [
+    const CYCLE: [Self; 7] = [
         Self::Smart,
         Self::Created,
         Self::Name,
         Self::Size,
         Self::Progress,
         Self::Speed,
+        Self::Status,
     ];
 
     pub(crate) fn next(self) -> Self {
@@ -103,6 +107,11 @@ impl ViewSortKey {
             .position(|item| *item == self)
             .unwrap_or(0);
         Self::CYCLE[(ix + 1) % Self::CYCLE.len()]
+    }
+
+    /// 排序值随每次进度节拍变化的键（速度 / 进度）：重排需要限频，否则列表持续跳动。
+    pub(crate) fn is_live(self) -> bool {
+        matches!(self, Self::Progress | Self::Speed)
     }
 }
 
@@ -140,8 +149,7 @@ pub(crate) struct ColumnPref {
     pub(crate) width: f32,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) struct ViewPrefs {
     pub(crate) density: ViewDensity,
     pub(crate) group_by: ViewGroupBy,
@@ -177,8 +185,30 @@ impl Default for ViewPrefs {
 }
 
 impl ViewPrefs {
+    /// 逐字段容错：某个字段缺失或取值未知（例如新版本写入的排序键）只让该字段回到默认值，
+    /// 不连带重置列宽、分组等其他偏好；非对象返回默认值。
     pub(crate) fn from_value(value: &serde_json::Value) -> Self {
-        serde_json::from_value(value.clone()).unwrap_or_default()
+        let mut prefs = Self::default();
+        let Some(map) = value.as_object() else {
+            return prefs;
+        };
+        read_field(map, "density", &mut prefs.density);
+        read_field(map, "group_by", &mut prefs.group_by);
+        read_field(map, "sort_key", &mut prefs.sort_key);
+        read_field(map, "sort_dir", &mut prefs.sort_dir);
+        if let Some(serde_json::Value::Array(items)) = map.get("columns") {
+            prefs.columns = items
+                .iter()
+                .filter_map(|item| ColumnPref::deserialize(item).ok())
+                .collect();
+        }
+        read_field(map, "file_name_width", &mut prefs.file_name_width);
+        read_field(map, "detail_placement", &mut prefs.detail_placement);
+        read_field(map, "detail_open", &mut prefs.detail_open);
+        read_field(map, "detail_size", &mut prefs.detail_size);
+        read_field(map, "sidebar_width", &mut prefs.sidebar_width);
+        read_field(map, "collapsed_groups", &mut prefs.collapsed_groups);
+        prefs
     }
 
     pub(crate) fn to_value(&self) -> serde_json::Value {
@@ -209,19 +239,13 @@ impl ViewPrefs {
         }
     }
 
-    /// 排序比较：`Smart` = 状态优先级再创建时间倒序；其他键按 `sort_dir`。
+    /// 排序比较。`Smart` 见 [`compare_smart`]（忽略 `sort_dir`）；其他键按 `sort_dir`，
+    /// 同值时回落到添加顺序（新→旧）。
     pub(crate) fn compare(&self, left: &DownloadTaskView, right: &DownloadTaskView) -> Ordering {
         let ordering = match self.sort_key {
-            ViewSortKey::Smart => {
-                return left
-                    .state
-                    .smart_rank()
-                    .cmp(&right.state.smart_rank())
-                    .then_with(|| right.created_at_secs.cmp(&left.created_at_secs))
-                    .then_with(|| left.key.cmp(&right.key));
-            }
+            ViewSortKey::Smart => return compare_smart(left, right),
             ViewSortKey::Created => left.created_at_secs.cmp(&right.created_at_secs),
-            ViewSortKey::Name => left.name.to_lowercase().cmp(&right.name.to_lowercase()),
+            ViewSortKey::Name => natural_cmp(&left.name_fold, &right.name_fold),
             ViewSortKey::Size => left.size_bytes.cmp(&right.size_bytes),
             ViewSortKey::Progress => left
                 .progress
@@ -231,13 +255,104 @@ impl ViewPrefs {
                 .speed_bytes_per_second
                 .unwrap_or(0)
                 .cmp(&right.speed_bytes_per_second.unwrap_or(0)),
+            ViewSortKey::Status => left.state.status_rank().cmp(&right.state.status_rank()),
         };
         let ordering = match self.sort_dir {
             SortDir::Asc => ordering,
             SortDir::Desc => ordering.reverse(),
         };
-        ordering.then_with(|| left.key.cmp(&right.key))
+        ordering
+            .then_with(|| added_order(right, left))
+            .then_with(|| left.key.cmp(&right.key))
     }
+}
+
+fn read_field<T: DeserializeOwned>(
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    slot: &mut T,
+) {
+    if let Some(value) = map.get(key).and_then(|value| T::deserialize(value).ok()) {
+        *slot = value;
+    }
+}
+
+/// 智能排序档位：优先下载 → 活跃（下载中 / 准备中）→ 排队 → 失败 → 暂停 → 完成。
+fn smart_tier(task: &DownloadTaskView) -> u8 {
+    match task.state {
+        TaskState::Downloading | TaskState::Pending if task.boosted => 0,
+        TaskState::Downloading => 1,
+        TaskState::Pending if task.preparing => 1,
+        TaskState::Pending => 2,
+        TaskState::Failed => 3,
+        TaskState::Paused => 4,
+        TaskState::Completed => 5,
+    }
+}
+
+/// 添加顺序（旧→新）：`created_at` 只精确到秒，同一秒批量添加时用队列插入序定先后。
+fn added_order(left: &DownloadTaskView, right: &DownloadTaskView) -> Ordering {
+    left.created_at_secs
+        .cmp(&right.created_at_secs)
+        .then_with(|| left.queue_order.cmp(&right.queue_order))
+}
+
+/// 引擎待启动顺序；不在队列中的（位置 0）排在所有已知位置之后。
+fn queue_slot(task: &DownloadTaskView) -> u32 {
+    if task.queue_position == 0 {
+        u32::MAX
+    } else {
+        task.queue_position
+    }
+}
+
+/// 智能排序：先按 [`smart_tier`]；活跃档按添加顺序正序（新任务接在末尾，不把其他行往下推），
+/// 排队档按引擎实际启动顺序，其余历史档按添加顺序倒序（最新在前）。
+fn compare_smart(left: &DownloadTaskView, right: &DownloadTaskView) -> Ordering {
+    let tier = smart_tier(left);
+    tier.cmp(&smart_tier(right))
+        .then_with(|| match tier {
+            0 | 1 => added_order(left, right),
+            2 => queue_slot(left)
+                .cmp(&queue_slot(right))
+                .then_with(|| added_order(left, right)),
+            _ => added_order(right, left),
+        })
+        .then_with(|| left.key.cmp(&right.key))
+}
+
+/// 自然序：连续 ASCII 数字段按数值比较（`ep2 < ep10`），其余按字节比较；
+/// 各段都相等时由原始字符串定序（`a01` 与 `a1` 不相等）。不分配内存。
+pub(crate) fn natural_cmp(left: &str, right: &str) -> Ordering {
+    let (mut a, mut b) = (left, right);
+    while let (Some(a_first), Some(b_first)) = (a.bytes().next(), b.bytes().next()) {
+        let (a_run, a_rest) = split_run(a, a_first.is_ascii_digit());
+        let (b_run, b_rest) = split_run(b, b_first.is_ascii_digit());
+        let ordering = if a_first.is_ascii_digit() && b_first.is_ascii_digit() {
+            let a_digits = a_run.trim_start_matches('0');
+            let b_digits = b_run.trim_start_matches('0');
+            a_digits
+                .len()
+                .cmp(&b_digits.len())
+                .then_with(|| a_digits.cmp(b_digits))
+        } else {
+            a_run.cmp(b_run)
+        };
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+        (a, b) = (a_rest, b_rest);
+    }
+    a.len().cmp(&b.len()).then_with(|| left.cmp(right))
+}
+
+/// 切出开头的一段（全数字或全非数字）。ASCII 数字是单字节字符，切点必在字符边界上。
+fn split_run(value: &str, digits: bool) -> (&str, &str) {
+    let end = value
+        .bytes()
+        .position(|byte| byte.is_ascii_digit() != digits)
+        .unwrap_or(value.len());
+    value.split_at(end)
 }
 
 /// 日期分组桶（基于本地日期）。
@@ -302,7 +417,11 @@ pub(crate) fn state_group_key(state: TaskState) -> &'static str {
 mod tests {
     use chrono::{Local, NaiveDate, TimeZone};
 
-    use super::{DateBucket, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey};
+    use std::cmp::Ordering;
+
+    use super::{
+        DateBucket, SortDir, ViewDensity, ViewGroupBy, ViewPrefs, ViewSortKey, natural_cmp,
+    };
     use crate::model::DownloadTaskView;
 
     fn task(id: &str, status: i32, created: &str, size: i64) -> DownloadTaskView {
@@ -313,6 +432,13 @@ mod tests {
         }))
         .expect("task");
         DownloadTaskView::local(&dto, None, false)
+    }
+
+    fn sorted_ids(prefs: &ViewPrefs, mut rows: Vec<DownloadTaskView>) -> Vec<String> {
+        rows.sort_by(|a, b| prefs.compare(a, b));
+        rows.iter()
+            .map(|row| row.key.task_id().to_owned())
+            .collect()
     }
 
     #[test]
@@ -333,24 +459,125 @@ mod tests {
             ViewPrefs::from_value(&serde_json::json!("garbage")),
             ViewPrefs::default()
         );
+        // 未知取值（例如新版本写入的排序键）只回退该字段，其余偏好保留。
+        let future = ViewPrefs::from_value(&serde_json::json!({
+            "density":"compact","sort_key":"future_key","sidebar_width":240.0,
+            "columns":[{"key":"size","visible":false,"width":90.0},{"bogus":true}]
+        }));
+        assert_eq!(future.sort_key, ViewSortKey::Smart);
+        assert_eq!(future.density, ViewDensity::Compact);
+        assert_eq!(future.sidebar_width, 240.);
+        assert_eq!(future.columns.len(), 1);
     }
 
     #[test]
-    fn smart_sort_ranks_active_first_then_newest() {
-        let prefs = ViewPrefs::default();
-        let mut rows = vec![
-            task("done", 3, "50", 1),
-            task("old-dl", 1, "10", 1),
-            task("new-dl", 1, "20", 1),
-            task("paused", 2, "30", 1),
+    fn smart_sort_lists_work_in_execution_order_then_history_newest_first() {
+        let with = |id: &str, status: i32, created: &str, edit: fn(&mut DownloadTaskView)| {
+            let mut row = task(id, status, created, 1);
+            edit(&mut row);
+            row
+        };
+        let rows = vec![
+            task("done-old", 3, "50", 1),
+            task("done-new", 3, "60", 1),
+            // 优先下载标记残留在已完成任务上不影响历史档。
+            with("done-boosted", 3, "55", |row| row.boosted = true),
+            task("paused", 2, "70", 1),
             task("failed", 4, "40", 1),
-            task("pending", 0, "5", 1),
+            task("dl-new", 1, "30", 1),
+            task("dl-old", 1, "15", 1),
+            task("preparing", 5, "35", 1),
+            with("queued-2", 0, "10", |row| row.queue_position = 2),
+            with("queued-1", 0, "20", |row| row.queue_position = 1),
+            task("queued-unknown", 0, "5", 1),
+            with("boosted", 0, "90", |row| row.boosted = true),
         ];
-        rows.sort_by(|a, b| prefs.compare(a, b));
-        let order: Vec<&str> = rows.iter().map(|row| row.key.task_id()).collect();
         assert_eq!(
-            order,
-            ["new-dl", "old-dl", "pending", "paused", "failed", "done"]
+            sorted_ids(&ViewPrefs::default(), rows),
+            [
+                "boosted",
+                "dl-old",
+                "dl-new",
+                "preparing",
+                "queued-1",
+                "queued-2",
+                "queued-unknown",
+                "failed",
+                "paused",
+                "done-new",
+                "done-boosted",
+                "done-old",
+            ]
+        );
+    }
+
+    #[test]
+    fn same_second_batch_follows_insertion_order_not_task_id() {
+        let batch = |id: &str, status: i32, queue_order: i32| {
+            let mut row = task(id, status, "100", 1);
+            row.queue_order = queue_order;
+            row
+        };
+        let prefs = ViewPrefs::default();
+        // 历史档最新在前：后插入的（queue_order 大）在上。
+        assert_eq!(
+            sorted_ids(
+                &prefs,
+                vec![batch("x", 3, 1), batch("z", 3, 3), batch("y", 3, 2)]
+            ),
+            ["z", "y", "x"]
+        );
+        // 活跃档按添加正序。
+        assert_eq!(
+            sorted_ids(&prefs, vec![batch("a", 1, 2), batch("z", 1, 1)]),
+            ["z", "a"]
+        );
+        // 显式列排序同值时同样回落到添加顺序（新→旧）。
+        let by_size = ViewPrefs {
+            sort_key: ViewSortKey::Size,
+            ..ViewPrefs::default()
+        };
+        assert_eq!(
+            sorted_ids(&by_size, vec![batch("x", 3, 1), batch("y", 3, 2)]),
+            ["y", "x"]
+        );
+    }
+
+    #[test]
+    fn name_sort_is_natural_and_case_insensitive() {
+        let prefs = ViewPrefs {
+            sort_key: ViewSortKey::Name,
+            sort_dir: SortDir::Asc,
+            ..ViewPrefs::default()
+        };
+        let rows = ["Ep10", "ep2", "EP1", "ep02b"]
+            .into_iter()
+            .map(|id| task(id, 3, "1", 1))
+            .collect();
+        assert_eq!(sorted_ids(&prefs, rows), ["EP1", "ep2", "ep02b", "Ep10"]);
+        assert_eq!(natural_cmp("file9", "file10"), Ordering::Less);
+        assert_eq!(natural_cmp("a", "a1"), Ordering::Less);
+        assert_ne!(natural_cmp("a01", "a1"), Ordering::Equal);
+        assert_eq!(natural_cmp("视频2", "视频10"), Ordering::Less);
+    }
+
+    #[test]
+    fn status_sort_puts_failed_before_paused() {
+        let prefs = ViewPrefs {
+            sort_key: ViewSortKey::Status,
+            sort_dir: SortDir::Asc,
+            ..ViewPrefs::default()
+        };
+        let rows = vec![
+            task("completed", 3, "1", 1),
+            task("paused", 2, "1", 1),
+            task("failed", 4, "1", 1),
+            task("pending", 0, "1", 1),
+            task("downloading", 1, "1", 1),
+        ];
+        assert_eq!(
+            sorted_ids(&prefs, rows),
+            ["downloading", "pending", "failed", "paused", "completed"]
         );
     }
 

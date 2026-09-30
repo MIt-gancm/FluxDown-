@@ -440,6 +440,17 @@ impl GatewayService {
                 .await
                 .map(|()| serde_json::json!({ "ok": true }))
             }
+            method::AGENT_PLATFORM_FILE_ICON => {
+                use base64::Engine as _;
+
+                let params =
+                    parse_params::<fluxdown_protocol::PlatformFileIconParams>(request.params)?;
+                let png =
+                    platform_blocking(move || crate::platform::file_icon_png(&params)).await?;
+                to_value(fluxdown_protocol::PlatformFileIconDto {
+                    png: base64::engine::general_purpose::STANDARD.encode(png),
+                })
+            }
             method::AGENT_PLATFORM_INTEGRATION_GET => {
                 platform_blocking(|| Ok(crate::platform::integration_status()))
                     .await
@@ -1429,11 +1440,16 @@ enum Lane {
     Daemon,
     /// 其余本机操作。
     Local,
+    /// 系统文件图标：列表首屏会一次发出一批，单独成道，不拖慢打开文件等本机操作。
+    Icon,
 }
 
 fn lane_for(method_name: &str) -> Lane {
     if method_name.starts_with("daemon.") {
         return Lane::Daemon;
+    }
+    if method_name == fluxdown_protocol::method::AGENT_PLATFORM_FILE_ICON {
+        return Lane::Icon;
     }
     const CLOUD_PREFIXES: [&str; 9] = [
         "agent.auth.",
@@ -1460,6 +1476,7 @@ struct RequestLanes {
     cloud: tokio::sync::mpsc::Sender<RpcRequest>,
     daemon: tokio::sync::mpsc::Sender<RpcRequest>,
     local: tokio::sync::mpsc::Sender<RpcRequest>,
+    icon: tokio::sync::mpsc::Sender<RpcRequest>,
 }
 
 impl RequestLanes {
@@ -1485,6 +1502,7 @@ impl RequestLanes {
             cloud: start(),
             daemon: start(),
             local: start(),
+            icon: start(),
         }
     }
 
@@ -1494,6 +1512,7 @@ impl RequestLanes {
             Lane::Cloud => &self.cloud,
             Lane::Daemon => &self.daemon,
             Lane::Local => &self.local,
+            Lane::Icon => &self.icon,
         };
         let id = request.id.clone();
         match sender.try_send(request) {

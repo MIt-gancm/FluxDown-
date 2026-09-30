@@ -5,12 +5,12 @@ import type { RemoteTaskDto, TaskDto, TaskRuntimeDto } from '../../../lib/rpc'
 
 export type TaskState = 'pending' | 'downloading' | 'paused' | 'completed' | 'failed'
 
-/** 智能排序优先级：下载中 > 等待 > 暂停 > 失败 > 完成。 */
-export const SMART_RANK: Record<TaskState, number> = {
+/** 状态优先级（智能排序档位之外的 `status` 排序键与「按状态分组」的组顺序共用）：失败排在暂停前，因为失败需要处理。 */
+export const STATE_RANK: Record<TaskState, number> = {
   downloading: 0,
   pending: 1,
-  paused: 2,
-  failed: 3,
+  failed: 2,
+  paused: 3,
   completed: 4,
 }
 
@@ -73,6 +73,14 @@ export interface DownloadTaskView {
   seedingStatus: number
   uploadedBytes: number
   boosted: boolean
+  /** 本地任务引擎原始 status == 5（准备中）；智能排序把它与下载中放进同一档。 */
+  preparing: boolean
+  /** 队列内插入序（每队列 MAX+1，用来打破同一秒批量添加的平局）；远程任务为 0。 */
+  queueOrder: number
+  /** 引擎队列位置（1-based；0 = 未知 / 不在队列）。 */
+  queuePosition: number
+  /** 大小写折叠后的名称，自然序比较用（建行时预计算，比较器内不分配）。 */
+  nameFold: string
   /** 远程任务目标设备 id（本地任务为空）。 */
   toDevice: string
   /** 本地任务原始 DTO（详情 / 重新下载需要）；远程任务为 undefined。 */
@@ -176,9 +184,16 @@ const REMOTE_STATUS: Record<RemoteTaskDto['status'], number> = {
   unknown: 0,
 }
 
-function secs(value: string): number {
-  const parsed = Number.parseInt(value, 10)
-  return Number.isFinite(parsed) ? parsed : 0
+/**
+ * 时间戳 → Unix 秒：本地任务是 Unix 秒字符串，远程任务（FluxCloud `DateTime<Utc>`）是 RFC3339；
+ * 纯数字串按数值，否则按日期解析，都失败为 0。
+ */
+export function parseTimestampSecs(value: string): number {
+  const text = value.trim()
+  if (text === '') return 0
+  if (/^\d+$/.test(text)) return Number(text)
+  const ms = Date.parse(text)
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : 0
 }
 
 function compute(name: string, totalBytes: number, downloadedBytes: number, speed: number | null) {
@@ -194,6 +209,7 @@ export function buildLocalView(
   task: TaskDto,
   speed: number | null,
   boosted: boolean,
+  queuePosition: number,
   runtime: TaskRuntimeDto | undefined,
   runtimeConnected: boolean,
 ): DownloadTaskView {
@@ -211,8 +227,8 @@ export function buildLocalView(
     runtime,
     runtimeConnected,
     etaSeconds: base.etaSeconds,
-    createdAtSecs: secs(task.createdAt),
-    completedAtSecs: secs(task.completedAt),
+    createdAtSecs: parseTimestampSecs(task.createdAt),
+    completedAtSecs: parseTimestampSecs(task.completedAt),
     kind: taskKindOf(task.fileName),
     protocol: detectProtocol(task.url, task.fileName),
     progress: base.progress,
@@ -229,6 +245,10 @@ export function buildLocalView(
     seedingStatus: task.seedingStatus,
     uploadedBytes: task.uploadedBytes,
     boosted,
+    preparing: task.status === 5,
+    queueOrder: task.queueOrder,
+    queuePosition,
+    nameFold: task.fileName.toLowerCase(),
     toDevice: '',
     dto: task,
   }
@@ -249,7 +269,7 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     runtime: undefined,
     runtimeConnected: false,
     etaSeconds: base.etaSeconds,
-    createdAtSecs: secs(task.createdAt),
+    createdAtSecs: parseTimestampSecs(task.createdAt),
     completedAtSecs: 0,
     kind: taskKindOf(task.fileName),
     protocol: detectProtocol(task.url, task.fileName),
@@ -267,6 +287,10 @@ export function buildRemoteView(task: RemoteTaskDto): DownloadTaskView {
     seedingStatus: 0,
     uploadedBytes: 0,
     boosted: false,
+    preparing: false,
+    queueOrder: 0,
+    queuePosition: 0,
+    nameFold: task.fileName.toLowerCase(),
     toDevice: task.toDevice,
     dto: undefined,
   }

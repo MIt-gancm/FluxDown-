@@ -151,6 +151,8 @@ pub enum DownloadsCommand {
     SubmitTorrentFile {
         path: String,
     },
+    /// 系统文件管理器为该文件显示的图标（`agent.platform.fileIcon`，结果为 PNG）。
+    FileIcon(fluxdown_protocol::PlatformFileIconParams),
     /// 设备本地偏好写入（`sync:false`，不进云同步）。
     SetLocalPreference {
         key: &'static str,
@@ -167,6 +169,8 @@ pub enum DownloadsResult {
     Unit,
     Value(serde_json::Value),
     TaskActivity(TaskActivityPage),
+    /// `FileIcon` 的 PNG 字节。
+    FileIcon(Vec<u8>),
 }
 
 impl DownloadsResult {
@@ -219,6 +223,8 @@ pub struct DownloadsController {
     live_speeds: HashMap<String, i64>,
     task_runtime: BTreeMap<String, Rc<TaskRuntimeDto>>,
     boosted: Option<String>,
+    /// 引擎待启动队列位置（task_id → 1 起的位置）；智能排序的排队档按它排列。
+    queue_positions: HashMap<String, u32>,
     queues: Vec<QueueDto>,
     groups: Vec<GroupDto>,
     group_summaries: Vec<GroupSummary>,
@@ -246,6 +252,7 @@ impl DownloadsController {
             live_speeds: HashMap::new(),
             task_runtime: BTreeMap::new(),
             boosted: None,
+            queue_positions: HashMap::new(),
             queues: Vec::new(),
             groups: Vec::new(),
             group_summaries: Vec::new(),
@@ -501,6 +508,7 @@ impl DownloadsController {
             }
         }
         self.boosted = snapshot.priority.first().cloned();
+        self.queue_positions = queue_position_map(&snapshot.queue_positions);
     }
 
     fn apply_daemon_event(&mut self, event: &DaemonEvent) -> bool {
@@ -647,6 +655,42 @@ impl DownloadsController {
                 self.rebuild_row(ix);
                 true
             }
+            DaemonEvent::Engine(WsServerMsg::QueuePositionsChanged { positions }) => {
+                let next = queue_position_map(positions);
+                let changed: Vec<usize> = self
+                    .queue_positions
+                    .keys()
+                    .chain(
+                        next.keys()
+                            .filter(|task_id| !self.queue_positions.contains_key(*task_id)),
+                    )
+                    .filter(|task_id| self.queue_positions.get(*task_id) != next.get(*task_id))
+                    .filter_map(|task_id| self.store.find_local(task_id))
+                    .collect();
+                self.queue_positions = next;
+                for &ix in &changed {
+                    self.rebuild_row(ix);
+                }
+                !changed.is_empty()
+            }
+            DaemonEvent::Engine(WsServerMsg::PriorityTaskChanged {
+                priority_task_id, ..
+            }) => {
+                let next = (!priority_task_id.is_empty()).then(|| priority_task_id.clone());
+                if self.boosted == next {
+                    return false;
+                }
+                let previous = std::mem::replace(&mut self.boosted, next.clone());
+                let rows: Vec<usize> = [previous, next]
+                    .iter()
+                    .flatten()
+                    .filter_map(|task_id| self.store.find_local(task_id))
+                    .collect();
+                for ix in rows {
+                    self.rebuild_row(ix);
+                }
+                true
+            }
             DaemonEvent::Engine(WsServerMsg::FileMissingChanged { updates }) => {
                 let mut changed = false;
                 for update in updates {
@@ -673,6 +717,11 @@ impl DownloadsController {
             self.boosted.as_deref() == Some(task.task_id.as_str()),
         );
         view.runtime = self.task_runtime.get(&task.task_id).cloned();
+        view.queue_position = self
+            .queue_positions
+            .get(&task.task_id)
+            .copied()
+            .unwrap_or(0);
         view.runtime_connected = !self.stale;
         view
     }
@@ -732,6 +781,16 @@ impl DownloadsController {
             self.store.set_local(ix, view);
         }
     }
+}
+
+fn queue_position_map(positions: &[fluxdown_protocol::QueuePositionDto]) -> HashMap<String, u32> {
+    positions
+        .iter()
+        .filter_map(|entry| {
+            let position = u32::try_from(entry.position).ok().filter(|p| *p > 0)?;
+            Some((entry.task_id.clone(), position))
+        })
+        .collect()
 }
 
 fn compute_group_summaries(groups: &[GroupDto], rows: &[DownloadTaskView]) -> Vec<GroupSummary> {

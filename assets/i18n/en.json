@@ -189,6 +189,7 @@
   "viewSortSize": "Size",
   "viewSortProgress": "Progress",
   "viewSortSpeed": "Speed",
+  "viewSortStatus": "Status",
   "viewSortAscending": "Ascending",
   "viewSortDescending": "Descending",
   "viewMenuLabel": "View",

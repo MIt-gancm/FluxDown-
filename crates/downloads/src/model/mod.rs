@@ -4,6 +4,7 @@ pub(crate) mod dispatch;
 pub(crate) mod file_rescan;
 pub(crate) mod new_download;
 pub(crate) mod progress_window;
+pub(crate) mod row_order;
 pub(crate) mod shutdown;
 pub(crate) mod store;
 pub(crate) mod view_prefs;
@@ -13,6 +14,7 @@ use std::rc::Rc;
 pub(crate) use store::{RowId, TaskStore};
 
 use fluxdown_protocol::TaskRuntimeDto;
+use gpui::SharedString;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DownloadStatusFilter {
@@ -197,13 +199,14 @@ pub(crate) enum TaskState {
 }
 
 impl TaskState {
-    /// 智能排序优先级：下载中 > 等待 > 暂停 > 失败 > 完成。
-    pub(crate) fn smart_rank(self) -> u8 {
+    /// 状态优先级（「状态」列排序、按状态分组的组顺序）：
+    /// 下载中 > 等待 > 失败 > 暂停 > 完成。失败排在暂停前：失败需要用户处理，暂停是主动操作。
+    pub(crate) fn status_rank(self) -> u8 {
         match self {
             Self::Downloading => 0,
             Self::Pending => 1,
-            Self::Paused => 2,
-            Self::Failed => 3,
+            Self::Failed => 2,
+            Self::Paused => 3,
             Self::Completed => 4,
         }
     }
@@ -290,6 +293,11 @@ pub(crate) struct DownloadTaskView {
     pub(crate) source: TaskSource,
     pub(crate) queue_id: String,
     pub(crate) name: String,
+    /// 大小写折叠后的名称：建行时算一次，名称排序 / 搜索不再逐次分配。
+    pub(crate) name_fold: String,
+    /// 小写扩展名（无点；空 = 无扩展名）：建行时算一次，分类匹配 / 系统图标键在渲染热路径
+    /// 上不再逐次分配。
+    pub(crate) file_extension: SharedString,
     pub(crate) size: String,
     pub(crate) size_bytes: u64,
     pub(crate) downloaded_bytes: u64,
@@ -304,6 +312,12 @@ pub(crate) struct DownloadTaskView {
     pub(crate) progress: f32,
     pub(crate) progress_label: String,
     pub(crate) state: TaskState,
+    /// 引擎原始 status 为 5（准备中：探测 / 解析 / 分配），已占并发名额，智能排序归入活跃档。
+    pub(crate) preparing: bool,
+    /// 队列内插入序（`TaskDto::queue_order`，每队列 MAX+1）；打破同一秒批量添加的平局。
+    pub(crate) queue_order: i32,
+    /// 引擎待启动队列中的位置（1 起；0 = 不在队列中）。
+    pub(crate) queue_position: u32,
     pub(crate) metadata_pending: bool,
     pub(crate) url: String,
     pub(crate) origin_url: String,
@@ -337,11 +351,12 @@ impl DownloadTaskView {
             task.total_bytes,
             task.downloaded_bytes,
             speed.map(|value| value.max(0) as u64),
-            task.created_at.parse().unwrap_or_default(),
+            parse_timestamp_secs(&task.created_at),
             task.status,
             &task.url,
         );
-        view.completed_at_secs = task.completed_at.parse().unwrap_or_default();
+        view.completed_at_secs = parse_timestamp_secs(&task.completed_at);
+        view.queue_order = task.queue_order;
         view.origin_url.clone_from(&task.origin_url);
         view.referrer.clone_from(&task.referrer);
         view.save_dir.clone_from(&task.save_dir);
@@ -363,7 +378,7 @@ impl DownloadTaskView {
             task.total_bytes.unwrap_or_default(),
             task.downloaded_bytes,
             Some(task.speed.max(0) as u64),
-            task.created_at.parse().unwrap_or_default(),
+            parse_timestamp_secs(&task.created_at),
             match task.status {
                 fluxdown_protocol::RemoteTaskStatus::Pending
                 | fluxdown_protocol::RemoteTaskStatus::Accepted
@@ -418,6 +433,8 @@ impl DownloadTaskView {
             queue_id,
             kind,
             protocol,
+            name_fold: name.to_lowercase(),
+            file_extension: file_extension(&name),
             name,
             size: format_bytes(size_bytes),
             size_bytes,
@@ -437,6 +454,9 @@ impl DownloadTaskView {
                 3 => TaskState::Completed,
                 _ => TaskState::Failed,
             },
+            preparing: status == 5,
+            queue_order: 0,
+            queue_position: 0,
             metadata_pending,
             site: url_host(url).to_owned(),
             url: url.to_owned(),
@@ -492,11 +512,8 @@ impl DownloadTaskView {
     }
 
     /// 文件扩展名（小写，无点）。
-    pub(crate) fn extension(&self) -> Option<String> {
-        self.name
-            .rsplit_once('.')
-            .map(|(_, extension)| extension.to_ascii_lowercase())
-            .filter(|extension| !extension.is_empty() && !extension.contains('/'))
+    pub(crate) fn extension(&self) -> Option<&str> {
+        (!self.file_extension.is_empty()).then_some(self.file_extension.as_ref())
     }
 
     pub(crate) fn active_transfers(&self) -> Option<u32> {
@@ -526,6 +543,24 @@ pub(crate) fn url_host(url: &str) -> &str {
     } else {
         host.split_once(':').map_or(host, |(host, _)| host)
     }
+}
+
+/// 任务时间戳 → Unix 秒。本地任务是秒级数字串，远程任务（FluxCloud）是 RFC3339；
+/// 两者都解析失败时为 0（界面按「未知」处理）。
+pub(crate) fn parse_timestamp_secs(value: &str) -> i64 {
+    let value = value.trim();
+    value.parse().unwrap_or_else(|_| {
+        chrono::DateTime::parse_from_rfc3339(value).map_or(0, |time| time.timestamp())
+    })
+}
+
+/// 小写扩展名：最后一个 `.` 之后的部分；为空或含 `/`（点在目录名里）时视为没有扩展名。
+fn file_extension(name: &str) -> SharedString {
+    name.rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .filter(|extension| !extension.is_empty() && !extension.contains('/'))
+        .map(SharedString::from)
+        .unwrap_or_default()
 }
 
 fn task_kind(name: &str) -> TaskKind {
@@ -668,5 +703,20 @@ mod tests {
         assert_eq!(url_host("https://u:p@host.example:443/x"), "host.example");
         assert_eq!(url_host("http://[::1]:80/"), "::1");
         assert_eq!(url_host("magnet:?xt=abc"), "");
+    }
+
+    #[test]
+    fn remote_rfc3339_and_local_unix_timestamps_share_one_timeline() {
+        let remote = serde_json::from_value::<fluxdown_protocol::RemoteTaskDto>(json!({
+            "id":"r1","url":"https://example.com/a","status":"completed",
+            "downloadedBytes":0,"createdAt":"2026-09-28T13:40:00.123456Z"
+        }))
+        .expect("remote task");
+        assert_eq!(
+            DownloadTaskView::remote(&remote).created_at_secs,
+            1_790_602_800
+        );
+        assert_eq!(super::parse_timestamp_secs("1790602800"), 1_790_602_800);
+        assert_eq!(super::parse_timestamp_secs("not a time"), 0);
     }
 }

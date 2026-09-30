@@ -1,19 +1,19 @@
 // 下载页视图偏好（移植 crates/downloads/src/model/view_prefs.rs）。
 // 全局单套、设备本地（`sync:false`），偏好键 `desktop.downloads.view`，JSON 形状与 GPUI 一致（snake_case）。
 
-import { SMART_RANK } from './task'
+import { STATE_RANK } from './task'
 import type { DownloadTaskView, TaskState } from './task'
 
 export const VIEW_PREFS_KEY = 'desktop.downloads.view'
 
 export type ViewDensity = 'comfortable' | 'compact'
 export type ViewGroupBy = 'none' | 'status' | 'date' | 'type' | 'queue' | 'site' | 'group'
-export type ViewSortKey = 'smart' | 'created' | 'name' | 'size' | 'progress' | 'speed'
+export type ViewSortKey = 'smart' | 'created' | 'name' | 'size' | 'progress' | 'speed' | 'status'
 export type SortDir = 'asc' | 'desc'
 export type DetailPlacement = 'bottom' | 'right'
 
 export const GROUP_BY_OPTIONS: readonly ViewGroupBy[] = ['none', 'status', 'date', 'type', 'queue', 'site', 'group']
-export const SORT_KEY_OPTIONS: readonly ViewSortKey[] = ['smart', 'created', 'name', 'size', 'progress', 'speed']
+export const SORT_KEY_OPTIONS: readonly ViewSortKey[] = ['smart', 'created', 'name', 'size', 'progress', 'speed', 'status']
 
 export type ColumnKind =
   | 'file_name'
@@ -89,14 +89,14 @@ export const FILE_NAME_MAX_WIDTH = 1600
 /** 数字列：单元格与表头右对齐。 */
 export const NUMERIC_COLUMNS = new Set<ColumnKind>(['size', 'speed', 'eta', 'created'])
 
-/** 点击表头切换到的排序键；「状态」列回到智能排序。 */
+/** 点击表头切换到的排序键（「智能排序」不对应任何列）；「状态」列按状态优先级排序。 */
 export const COLUMN_SORT_KEY: Partial<Record<ColumnKind, ViewSortKey>> = {
   file_name: 'name',
   progress: 'progress',
   size: 'size',
   speed: 'speed',
   created: 'created',
-  status: 'smart',
+  status: 'status',
 }
 
 export interface ColumnPref {
@@ -221,41 +221,155 @@ export function toColumnPrefs(columns: readonly ResolvedColumn[]): ColumnPref[] 
   return columns.map((column) => ({ key: column.kind, visible: column.visible, width: column.width }))
 }
 
-/** 首次切到该列排序时的方向：名称 A→Z，数值类从大到新。 */
+/** 排序键首次选中时的方向：名称 A→Z，数值类从大到新。 */
 export function defaultSortDir(key: ViewSortKey): SortDir {
   return key === 'name' ? 'asc' : 'desc'
 }
 
-/** 排序比较：`smart` = 状态优先级再创建时间倒序；其他键按 `sort_dir`。 */
-export function compareViews(prefs: ViewPrefs, left: DownloadTaskView, right: DownloadTaskView): number {
-  const tie = left.key < right.key ? -1 : left.key > right.key ? 1 : 0
-  if (prefs.sort_key === 'smart') {
-    return (
-      SMART_RANK[left.state] - SMART_RANK[right.state] || right.createdAtSecs - left.createdAtSecs || tie
-    )
+/**
+ * 表头点击三档循环：列的默认方向 → 反方向 → 回到智能排序（`sort_dir` 置回 desc）。
+ * 切到别的列从该列默认方向开始。
+ */
+export function nextHeaderSort(current: ViewPrefs, key: ViewSortKey): ViewPrefs {
+  const initial = defaultSortDir(key)
+  if (current.sort_key !== key) return { ...current, sort_key: key, sort_dir: initial }
+  if (current.sort_dir === initial) return { ...current, sort_dir: initial === 'asc' ? 'desc' : 'asc' }
+  return { ...current, sort_key: 'smart', sort_dir: 'desc' }
+}
+
+const NO_POSITION = Number.MAX_SAFE_INTEGER
+
+/**
+ * 智能排序档位：
+ * 0 优先下载（boosted 且 下载中/排队）→ 1 下载中或准备中 → 2 排队 → 3 失败 → 4 暂停 → 5 已完成。
+ */
+export function smartTier(view: DownloadTaskView): number {
+  const active = view.state === 'downloading' || view.state === 'pending'
+  if (view.boosted && active) return 0
+  if (view.state === 'downloading' || (view.state === 'pending' && view.preparing)) return 1
+  switch (view.state) {
+    case 'pending':
+      return 2
+    case 'failed':
+      return 3
+    case 'paused':
+      return 4
+    default:
+      return 5
   }
+}
+
+const keyOrder = (left: DownloadTaskView, right: DownloadTaskView): number =>
+  left.key < right.key ? -1 : left.key > right.key ? 1 : 0
+
+/** 添加顺序正序：先加的在前。`createdAtSecs` → `queueOrder`（打破同一秒批量添加）→ key。 */
+function addedAsc(left: DownloadTaskView, right: DownloadTaskView): number {
+  return left.createdAtSecs - right.createdAtSecs || left.queueOrder - right.queueOrder || keyOrder(left, right)
+}
+
+/** 添加顺序倒序：最新在前（key 仍升序，保证全序）。 */
+function addedDesc(left: DownloadTaskView, right: DownloadTaskView): number {
+  return right.createdAtSecs - left.createdAtSecs || right.queueOrder - left.queueOrder || keyOrder(left, right)
+}
+
+const isDigit = (code: number): boolean => code >= 48 && code <= 57
+
+/** 逐码元比较 `a[from, aEnd)` 与 `b[bFrom, bEnd)`；前缀相同则短者在前。不分配。 */
+function compareRange(a: string, aFrom: number, aEnd: number, b: string, bFrom: number, bEnd: number): number {
+  const length = Math.min(aEnd - aFrom, bEnd - bFrom)
+  for (let k = 0; k < length; k++) {
+    const diff = a.charCodeAt(aFrom + k) - b.charCodeAt(bFrom + k)
+    if (diff !== 0) return diff < 0 ? -1 : 1
+  }
+  return aEnd - aFrom === bEnd - bFrom ? 0 : aEnd - aFrom < bEnd - bFrom ? -1 : 1
+}
+
+/**
+ * 自然序：切成连续 ASCII 数字段 / 非数字段交替比较。两边都是数字段时去前导 0，先比长度再逐字符；
+ * 否则按普通字符串比较该段；一边先耗尽则短者在前。全部相等返回 0（调用方再用原始串定序）。
+ * 入参应是已大小写折叠的名称。
+ */
+export function compareNatural(a: string, b: string): number {
+  let i = 0
+  let j = 0
+  while (i < a.length && j < b.length) {
+    const aDigit = isDigit(a.charCodeAt(i))
+    const bDigit = isDigit(b.charCodeAt(j))
+    let iEnd = i + 1
+    while (iEnd < a.length && isDigit(a.charCodeAt(iEnd)) === aDigit) iEnd++
+    let jEnd = j + 1
+    while (jEnd < b.length && isDigit(b.charCodeAt(jEnd)) === bDigit) jEnd++
+    let order: number
+    if (aDigit && bDigit) {
+      let iStart = i
+      while (iStart < iEnd && a.charCodeAt(iStart) === 48) iStart++
+      let jStart = j
+      while (jStart < jEnd && b.charCodeAt(jStart) === 48) jStart++
+      const aLength = iEnd - iStart
+      const bLength = jEnd - jStart
+      order = aLength !== bLength ? (aLength < bLength ? -1 : 1) : compareRange(a, iStart, iEnd, b, jStart, jEnd)
+    } else {
+      order = compareRange(a, i, iEnd, b, j, jEnd)
+    }
+    if (order !== 0) return order
+    i = iEnd
+    j = jEnd
+  }
+  if (i < a.length) return 1
+  if (j < b.length) return -1
+  return 0
+}
+
+function compareNames(left: DownloadTaskView, right: DownloadTaskView): number {
+  const natural = compareNatural(left.nameFold, right.nameFold)
+  if (natural !== 0) return natural
+  // 与 GPUI `natural_cmp` 一致：各段等价（如 `a01` / `a1`）时按折叠后的原串定序。
+  return left.nameFold < right.nameFold ? -1 : left.nameFold > right.nameFold ? 1 : 0
+}
+
+/** 智能排序：先档位；档内 0/1 添加顺序正序，2 按引擎队列位置（未知在后）再添加正序，3/4/5 添加顺序倒序。 */
+function compareSmart(left: DownloadTaskView, right: DownloadTaskView): number {
+  const tier = smartTier(left)
+  const diff = tier - smartTier(right)
+  if (diff !== 0) return diff
+  if (tier <= 1) return addedAsc(left, right)
+  if (tier === 2) {
+    const l = left.queuePosition > 0 ? left.queuePosition : NO_POSITION
+    const r = right.queuePosition > 0 ? right.queuePosition : NO_POSITION
+    return l === r ? addedAsc(left, right) : l < r ? -1 : 1
+  }
+  return addedDesc(left, right)
+}
+
+/**
+ * 排序比较（与 GPUI `view_prefs.rs` 一致）：
+ * - `smart` 忽略 `sort_dir`，见 `smartTier` 与档内顺序；
+ * - 其他键主键按 `sort_dir`（`status` 用 `STATE_RANK`，`name` 用自然序），相等回落「添加顺序倒序」。
+ */
+export function compareViews(prefs: ViewPrefs, left: DownloadTaskView, right: DownloadTaskView): number {
+  if (prefs.sort_key === 'smart') return compareSmart(left, right)
   let order = 0
   switch (prefs.sort_key) {
     case 'created':
       order = left.createdAtSecs - right.createdAtSecs
       break
-    case 'name': {
-      const a = left.name.toLowerCase()
-      const b = right.name.toLowerCase()
-      order = a < b ? -1 : a > b ? 1 : 0
+    case 'name':
+      order = compareNames(left, right)
       break
-    }
     case 'size':
       order = left.sizeBytes - right.sizeBytes
       break
     case 'progress':
       order = left.progress - right.progress
       break
+    case 'status':
+      order = STATE_RANK[left.state] - STATE_RANK[right.state]
+      break
     case 'speed':
       order = (left.speed ?? 0) - (right.speed ?? 0)
       break
   }
-  return (prefs.sort_dir === 'asc' ? order : -order) || tie
+  return (prefs.sort_dir === 'asc' ? order : -order) || addedDesc(left, right)
 }
 
 /** 日期分组桶（本地日期）。顺序即分组顺序。 */

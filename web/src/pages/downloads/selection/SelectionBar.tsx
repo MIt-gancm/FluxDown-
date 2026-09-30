@@ -9,11 +9,25 @@ import { useDownloads } from '../state'
 
 const BTN =
   'inline-flex h-control min-w-control shrink-0 items-center justify-center gap-1 rounded-md px-1.5 text-sm text-foreground hover:bg-nav-hover active:bg-nav-selected disabled:pointer-events-none disabled:opacity-50 mobile:min-h-touch mobile:min-w-touch'
+/** 表头内联变体：按钮不超过表头行高（28px）。 */
+const BTN_INLINE = 'h-6 min-w-6'
 
-function Action({ label, onClick, disabled, children }: { label: string; onClick?: () => void; disabled?: boolean; children: ReactNode }) {
+function Action({
+  label,
+  onClick,
+  disabled,
+  className,
+  children,
+}: {
+  label: string
+  onClick?: () => void
+  disabled?: boolean
+  className?: string
+  children: ReactNode
+}) {
   return (
     <Tooltip content={label} side="top">
-      <button type="button" aria-label={label} disabled={disabled} onClick={onClick} className={BTN}>
+      <button type="button" aria-label={label} disabled={disabled} onClick={onClick} className={cn(BTN, className)}>
         {children}
       </button>
     </Tooltip>
@@ -22,16 +36,67 @@ function Action({ label, onClick, disabled, children }: { label: string; onClick
 
 const Sep = () => <span className="mx-1 h-4 w-px shrink-0 bg-hairline" />
 
-/** 表格区域底部浮动选择条：选中 ≥1 项时出现，承载批量操作。 */
-export function SelectionBar() {
+/** 批量操作内容（已选 N 项 | 操作 | ×），浮动条与表头覆盖条共用；`inline` 时按钮收紧到表头行高。 */
+function SelectionActions({ inline }: { inline?: boolean }) {
   const t = useT()
   const { summary, selectedViews, clearSelection } = useDownloads()
-  if (!summary.any) return null
+  const btn = inline ? BTN_INLINE : undefined
 
   const deleteEntries: MenuEntry[] = [
     { type: 'item', key: 'delete-task', label: t('deleteTask'), icon: Trash2, onSelect: () => void deleteViews(selectedViews, false) },
     { type: 'item', key: 'delete-files', label: t('deleteTaskAndFile'), icon: Trash2, onSelect: () => void confirmDeleteWithFiles(selectedViews) },
   ]
+
+  return (
+    <>
+      <span className="shrink-0 whitespace-nowrap px-1 tabular-nums text-foreground">{t('selectedCount', { n: summary.count })}</span>
+      <Sep />
+      {summary.anyResumable && (
+        <Action label={t('resume')} className={btn} onClick={() => void resumeViews(selectedViews)}>
+          <Icon icon={Play} size="md" />
+        </Action>
+      )}
+      {summary.anyActive && (
+        <Action label={t('pause')} className={btn} onClick={() => void pauseViews(selectedViews)}>
+          <Icon icon={Pause} size="md" />
+        </Action>
+      )}
+      {summary.anyLocal && (
+        <Action label={t('webDownloadFile')} className={btn} disabled={!summary.allDownloadable} onClick={() => downloadViewsFiles(selectedViews)}>
+          <Icon icon={Download} size="md" />
+        </Action>
+      )}
+      <ActionMenu
+        title={t('delete')}
+        align="start"
+        entries={deleteEntries}
+        trigger={
+          <button type="button" aria-label={t('delete')} className={cn(BTN, btn, 'text-destructive')}>
+            <Icon icon={Trash2} size="md" />
+          </button>
+        }
+      />
+      <Sep />
+      <Action label={t('deselectAll')} className={btn} onClick={clearSelection}>
+        <Icon icon={X} size="md" />
+      </Action>
+    </>
+  )
+}
+
+/** 桌面表头覆盖条：铺满表头选择列右侧，与表头同底色、无边框/阴影；由 TaskTable 在选中 ≥1 项时替换列标题。 */
+export function SelectionHeaderBar() {
+  return (
+    <div role="toolbar" className="flex h-full min-w-0 flex-1 items-center gap-0.5 overflow-x-auto bg-surface pr-2 text-xs [scrollbar-width:none]">
+      <SelectionActions inline />
+    </div>
+  )
+}
+
+/** 移动端卡片布局（无表头）的底部浮动选择条：选中 ≥1 项时出现，承载批量操作。 */
+export function SelectionBar() {
+  const { summary } = useDownloads()
+  if (!summary.any) return null
 
   return (
     <div
@@ -41,37 +106,7 @@ export function SelectionBar() {
         'mobile:fixed mobile:bottom-[calc(var(--fx-bottom-bar,0px)+0.5rem)] mobile:h-12 mobile:px-1.5',
       )}
     >
-      <span className="shrink-0 whitespace-nowrap px-1 tabular-nums text-foreground">{t('selectedCount', { n: summary.count })}</span>
-      <Sep />
-      {summary.anyResumable && (
-        <Action label={t('resume')} onClick={() => void resumeViews(selectedViews)}>
-          <Icon icon={Play} size="md" />
-        </Action>
-      )}
-      {summary.anyActive && (
-        <Action label={t('pause')} onClick={() => void pauseViews(selectedViews)}>
-          <Icon icon={Pause} size="md" />
-        </Action>
-      )}
-      {summary.anyLocal && (
-        <Action label={t('webDownloadFile')} disabled={!summary.allDownloadable} onClick={() => downloadViewsFiles(selectedViews)}>
-          <Icon icon={Download} size="md" />
-        </Action>
-      )}
-      <ActionMenu
-        title={t('delete')}
-        align="start"
-        entries={deleteEntries}
-        trigger={
-          <button type="button" aria-label={t('delete')} className={cn(BTN, 'text-destructive')}>
-            <Icon icon={Trash2} size="md" />
-          </button>
-        }
-      />
-      <Sep />
-      <Action label={t('deselectAll')} onClick={clearSelection}>
-        <Icon icon={X} size="md" />
-      </Action>
+      <SelectionActions />
     </div>
   )
 }

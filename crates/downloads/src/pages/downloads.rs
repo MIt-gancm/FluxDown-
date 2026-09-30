@@ -159,6 +159,7 @@ impl DownloadView {
     ) -> Self {
         let strings = DownloadStrings::from_translator(translator.read(cx));
         let controller = DownloadsController::new(Arc::clone(&port));
+        crate::components::file_icon::install_port(&port, cx);
         let store = Rc::clone(controller.store());
         let focus_handle = cx.focus_handle();
         let table_state = cx.new(|cx| {
@@ -615,6 +616,23 @@ impl DownloadView {
         if !self.table_state.read(cx).delegate().prefs().detail_open {
             self.mutate_prefs(|prefs| prefs.detail_open = true, cx);
         }
+    }
+
+    /// 行尾「详情」按钮：像普通单击一样只选中该行（停靠面板跟随单选，先选中才不会被
+    /// 跟随逻辑切回旧选中项），再打开详情面板。
+    pub(crate) fn show_row_detail(
+        &mut self,
+        key: RowKey,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.table_state.update(cx, |table, cx| {
+            table
+                .delegate_mut()
+                .select_task(key.clone(), gpui::Modifiers::default());
+            cx.notify();
+        });
+        self.open_detail_for(key, window, cx);
     }
 
     /// 双击任务行：已完成且文件仍在下载目录 → 用系统默认程序打开；其余（含文件已被删除
@@ -1576,23 +1594,16 @@ impl DownloadView {
             .last_error
             .clone()
             .map(|error| self.render_error_strip(error, cx));
-        let table = self.render_table(cx);
-        let selection_bar = self.render_selection_bar(cx);
+        // 选择条覆盖在表格容器顶部的表头上，不遮挡任务行。
+        let table = self
+            .render_table(cx)
+            .children(self.render_selection_bar(cx));
         let content = v_flex()
             .size_full()
             .min_w_0()
             .min_h_0()
             .children(error_strip)
-            .child(
-                // 表格区域：浮动选择条相对它底部居中定位。
-                v_flex()
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(table)
-                    .children(selection_bar),
-            );
+            .child(v_flex().flex_1().min_w_0().min_h_0().child(table));
 
         let body: gpui::AnyElement = if prefs.detail_open {
             let panel = self.render_detail_panel(cx);

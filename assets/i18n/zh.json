@@ -189,6 +189,7 @@
   "viewSortSize": "大小",
   "viewSortProgress": "进度",
   "viewSortSpeed": "速度",
+  "viewSortStatus": "状态",
   "viewSortAscending": "升序",
   "viewSortDescending": "降序",
   "viewMenuLabel": "视图",

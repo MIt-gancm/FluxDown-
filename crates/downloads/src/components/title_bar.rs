@@ -84,13 +84,14 @@ const GROUP_OPTIONS: [ViewGroupBy; 7] = [
     ViewGroupBy::Group,
 ];
 
-const SORT_OPTIONS: [ViewSortKey; 6] = [
+const SORT_OPTIONS: [ViewSortKey; 7] = [
     ViewSortKey::Smart,
     ViewSortKey::Created,
     ViewSortKey::Name,
     ViewSortKey::Size,
     ViewSortKey::Progress,
     ViewSortKey::Speed,
+    ViewSortKey::Status,
 ];
 
 fn group_by_key(group_by: ViewGroupBy) -> &'static str {
@@ -113,12 +114,15 @@ fn sort_key_key(sort_key: ViewSortKey) -> &'static str {
         ViewSortKey::Size => "viewSortSize",
         ViewSortKey::Progress => "viewSortProgress",
         ViewSortKey::Speed => "viewSortSpeed",
+        ViewSortKey::Status => "viewSortStatus",
     }
 }
 
 /// 顶栏内可交互元素的包裹：拦截左键按下冒泡，避免触发标题栏的窗口拖拽 / 双击缩放。
+/// 包裹本身是 flex 容器：调用方放开收缩时，子元素的 `flex_shrink` / `min_w` 才能生效。
 fn interactive(child: impl IntoElement) -> Div {
     div()
+        .flex()
         .flex_none()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
         .child(child)
@@ -298,15 +302,14 @@ impl Render for DownloadTitleBar {
             px(0.)
         };
         let title_bar = cx.entity().downgrade();
-
         h_flex()
             .relative()
             .size_full()
             .min_w_0()
             .items_center()
             .gap(spacing.sm)
-            // 前导留白可在窄窗口下先于搜索框收缩；空白处保持窗口拖拽。
-            .child(div().flex_shrink(1.).min_w_0().w(leading))
+            // 前导留白远先于搜索框收缩（高收缩权重）；空白处保持窗口拖拽。
+            .child(div().flex_shrink(100.).min_w_0().w(leading))
             .child(interactive(
                 Button::new("download-create")
                     .primary()

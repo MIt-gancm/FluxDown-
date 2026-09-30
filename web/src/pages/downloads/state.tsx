@@ -23,6 +23,7 @@ import type {
   JsonValue,
   LinkDeviceInfo,
   QueueDto,
+  QueuePositionDto,
   RemoteTaskDto,
   TaskRuntimeDto,
 } from '../../lib/rpc'
@@ -31,8 +32,10 @@ import { currentDeviceId, visibleRemoteTasks } from './model/devices'
 import { filterMatches, LOCAL_DEVICE, SELECTION_ALL } from './model/filters'
 import type { SidebarSelection } from './model/filters'
 import { useLiveSpeeds } from './model/liveSpeeds'
-import { buildLocalView, buildRemoteView, isLocalKey, sourceSite } from './model/task'
+import { isDynamicSortKey } from './model/rowOrder'
+import { buildLocalView, buildRemoteView, isLocalKey, sourceSite, STATE_RANK } from './model/task'
 import type { DownloadTaskView, RowKey } from './model/task'
+import { useStableRowOrder } from './model/useStableRowOrder'
 import { compareViews, dateBucketOf, DATE_BUCKET_ORDER, matchesQuery, parseViewPrefs, VIEW_PREFS_KEY } from './model/viewPrefs'
 import type { ViewPrefs } from './model/viewPrefs'
 
@@ -140,6 +143,7 @@ const EMPTY_RUNTIME: Readonly<Record<string, TaskRuntimeDto>> = {}
 const EMPTY_PRIORITY: readonly string[] = []
 const EMPTY_REMOTE: readonly RemoteTaskDto[] = []
 const EMPTY_QUEUES: readonly QueueDto[] = []
+const EMPTY_QUEUE_POSITIONS: readonly QueuePositionDto[] = []
 const EMPTY_GROUPS: readonly GroupDto[] = []
 const EMPTY_CLOUD: readonly CloudDevice[] = []
 const EMPTY_LINKED: readonly LinkDeviceInfo[] = []
@@ -156,6 +160,7 @@ const PREFS_DEBOUNCE_MS = 300
 
 const selectRuntime = (daemon: { taskRuntime: Record<string, TaskRuntimeDto> }) => daemon.taskRuntime
 const selectPriority = (daemon: { priority: string[] }) => daemon.priority
+const selectQueuePositions = (daemon: { queuePositions: QueuePositionDto[] }) => daemon.queuePositions
 const selectQueues = (daemon: { queues: QueueDto[] }) => daemon.queues
 const selectGroups = (daemon: { groups: GroupDto[] }) => daemon.groups
 const selectStats = (daemon: { runtimeStats: DaemonRuntimeStatsDto }) => daemon.runtimeStats
@@ -232,6 +237,7 @@ interface CachedView {
   task: object
   speed: number | null
   boosted: boolean
+  queuePosition: number
   runtime: TaskRuntimeDto | undefined
   connected: boolean
   view: DownloadTaskView
@@ -244,6 +250,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   const tasks = useTasks()
   const runtimes = useDaemon(selectRuntime, EMPTY_RUNTIME)
   const priority = useDaemon(selectPriority, EMPTY_PRIORITY as string[])
+  const queuePositions = useDaemon(selectQueuePositions, EMPTY_QUEUE_POSITIONS as QueuePositionDto[])
   const queues = useDaemon(selectQueues, EMPTY_QUEUES as QueueDto[])
   const groups = useDaemon(selectGroups, EMPTY_GROUPS as GroupDto[])
   const runtimeStats = useDaemon(selectStats, EMPTY_STATS, shallowEqual)
@@ -273,12 +280,17 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
   // 本地行：复用缓存
   const cache = useRef(new Map<string, CachedView>())
   const boostedId = priority[0] ?? null
+  const positionById = useMemo(
+    () => new Map(queuePositions.map((entry) => [entry.taskId, entry.position])),
+    [queuePositions],
+  )
   const localViews = useMemo(() => {
     const previous = cache.current
     const next = new Map<string, CachedView>()
     const views = tasks.map((task) => {
       const speed = live.download[task.taskId] ?? null
       const boosted = boostedId === task.taskId
+      const queuePosition = positionById.get(task.taskId) ?? 0
       const runtime = runtimes[task.taskId]
       const hit = previous.get(task.taskId)
       if (
@@ -286,19 +298,20 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
         hit.task === task &&
         hit.speed === speed &&
         hit.boosted === boosted &&
+        hit.queuePosition === queuePosition &&
         hit.runtime === runtime &&
         hit.connected === connected
       ) {
         next.set(task.taskId, hit)
         return hit.view
       }
-      const view = buildLocalView(task, speed, boosted, runtime, connected)
-      next.set(task.taskId, { task, speed, boosted, runtime, connected, view })
+      const view = buildLocalView(task, speed, boosted, queuePosition, runtime, connected)
+      next.set(task.taskId, { task, speed, boosted, queuePosition, runtime, connected, view })
       return view
     })
     cache.current = next
     return views
-  }, [tasks, live, boostedId, runtimes, connected])
+  }, [tasks, live, boostedId, positionById, runtimes, connected])
 
   const currentId = useMemo(() => currentDeviceId(session, cloudDevices), [session, cloudDevices])
   const remoteViews = useMemo(
@@ -353,8 +366,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
 
   const normalizedQuery = useMemo(() => query.trim().toLowerCase(), [query])
 
-  // 筛选 + 搜索 + 排序 + 分组
-  const { rows, visibleKeys, matchingKeys } = useMemo(() => {
+  // 筛选 + 搜索
+  const matching = useMemo(() => {
     const matchesSelection = (view: DownloadTaskView): boolean => {
       switch (sidebarSelection.kind) {
         case 'download':
@@ -368,13 +381,24 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
         }
       }
     }
-    const matching = views.filter((view) => matchesSelection(view) && matchesQuery(view, normalizedQuery))
-    const sorted = matching.slice().sort((a, b) => compareViews(prefs, a, b))
-    const matchingSet = new Set(matching.map((view) => view.key))
+    return views.filter((view) => matchesSelection(view) && matchesQuery(view, normalizedQuery))
+  }, [views, sidebarSelection, categories, normalizedQuery])
+  const matchingKeys = useMemo(() => new Set(matching.map((view) => view.key)), [matching])
 
+  // 排序 + 行顺序稳定（保持期内仅内容变化不改变已有行的相对顺序，见 model/rowOrder.ts）
+  const sorted = useMemo(() => matching.slice().sort((a, b) => compareViews(prefs, a, b)), [matching, prefs])
+  const ordered = useStableRowOrder(
+    sorted,
+    views,
+    [sidebarSelection, normalizedQuery, categories, prefs.sort_key, prefs.sort_dir],
+    isDynamicSortKey(prefs.sort_key),
+  )
+
+  // 分组
+  const { rows, visibleKeys } = useMemo(() => {
     const taskRow = (view: DownloadTaskView): VisibleRow => ({ type: 'task', key: view.key, view })
     if (prefs.group_by === 'none') {
-      return { rows: sorted.map(taskRow), visibleKeys: sorted.map((view) => view.key), matchingKeys: matchingSet }
+      return { rows: ordered.map(taskRow), visibleKeys: ordered.map((view) => view.key) }
     }
 
     interface Bucket {
@@ -387,7 +411,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
     const bucketOf = (view: DownloadTaskView): Omit<Bucket, 'views'> => {
       switch (prefs.group_by) {
         case 'status':
-          return { key: `status:${view.state}`, label: stateLabel(t, view.state), order: stateOrder(view.state) }
+          return { key: `status:${view.state}`, label: stateLabel(t, view.state), order: STATE_RANK[view.state] }
         case 'date': {
           const bucket = dateBucketOf(view.createdAtSecs)
           return { key: `date:${bucket}`, label: t(DATE_LABEL_KEY[bucket]), order: DATE_BUCKET_ORDER[bucket] }
@@ -428,7 +452,7 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
           return { key: '', label: '', order: 0 }
       }
     }
-    for (const view of sorted) {
+    for (const view of ordered) {
       const info = bucketOf(view)
       const existing = buckets.find((bucket) => bucket.key === info.key)
       if (existing) existing.views.push(view)
@@ -448,8 +472,8 @@ export function DownloadsProvider({ children }: { children: ReactNode }) {
         }
       }
     }
-    return { rows: out, visibleKeys: keys, matchingKeys: matchingSet }
-  }, [views, sidebarSelection, categories, normalizedQuery, prefs, queues, groupNames, t])
+    return { rows: out, visibleKeys: keys }
+  }, [ordered, prefs, queues, groupNames, categories, t])
 
   // 选中集只保留当前筛选 + 搜索下仍在视图内的任务（折叠分组内的仍属于当前视图）。
   useEffect(() => {
@@ -674,9 +698,6 @@ const DATE_LABEL_KEY = {
   this_month: 'thisMonth',
   older: 'older',
 } as const
-
-const STATE_ORDER: Record<string, number> = { downloading: 0, pending: 1, paused: 2, failed: 3, completed: 4 }
-const stateOrder = (state: string): number => STATE_ORDER[state] ?? 9
 
 const STATE_LABEL_KEY = {
   pending: 'statusPending',

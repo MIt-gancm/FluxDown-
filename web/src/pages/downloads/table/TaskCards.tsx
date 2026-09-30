@@ -8,6 +8,7 @@ import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
 import { ActionMenu, Checkbox, ContextMenuArea, Icon } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
+import { notePointerActivity } from '../model/rowOrder'
 import { formatBytes, percentLabel, sourceSite } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import { useDownloads } from '../state'
@@ -138,7 +139,14 @@ export function TaskCards() {
   if (rows.length === 0) return <TaskEmpty />
 
   return (
-    <div ref={scrollRef} className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-surface pb-24">
+    <div
+      ref={scrollRef}
+      onTouchStart={() => notePointerActivity()}
+      onTouchMove={() => notePointerActivity()}
+      onWheel={() => notePointerActivity()}
+      onContextMenu={() => notePointerActivity()}
+      className="h-full min-h-0 overflow-y-auto overflow-x-hidden bg-surface pb-24"
+    >
       <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
         {virtualizer.getVirtualItems().map((item) => {
           const row = rows[item.index]

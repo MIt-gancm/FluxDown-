@@ -873,6 +873,36 @@ pub struct PlatformOpenPathParams {
     pub reveal: bool,
 }
 
+/// 按文件（而非扩展名）取图标的扩展名（小写）：图标内嵌在文件自身里。其余类型的图标只由
+/// 扩展名关联决定，调用方按扩展名缓存即可。`.lnk` / `.url` 故意不在内：它们的图标路径可以
+/// 指向远程共享，按文件解析会向外发起认证。
+pub const FILE_ICON_PER_FILE_EXTENSIONS: &[&str] = &["exe", "ico"];
+
+/// `agent.platform.fileIcon` 参数。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformFileIconParams {
+    /// 不带点的扩展名（大小写不敏感）；空 = 无扩展名的普通文件。
+    #[serde(default)]
+    pub extension: String,
+    /// 本机文件绝对路径。只在扩展名属于 [`FILE_ICON_PER_FILE_EXTENSIONS`] 且文件存在时按文件
+    /// 取图标，否则按扩展名取。
+    #[serde(default)]
+    pub path: Option<String>,
+    /// 目标边长（物理像素），agent 限制在 16..=256。
+    pub size: u32,
+}
+
+/// `agent.platform.fileIcon` 结果。
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "camelCase")]
+pub struct PlatformFileIconDto {
+    /// `size`×`size` 的 PNG，base64 编码。
+    pub png: String,
+}
+
 /// Doctor 检查项级别。
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

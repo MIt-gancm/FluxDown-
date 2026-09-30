@@ -1,5 +1,5 @@
 //! agent 桌面系统集成：任务文件打开/定位、官方桌面进程唤起、开机自启、
-//! `.torrent` 关联与 URL scheme 注册。
+//! `.torrent` 关联与 URL scheme 注册、系统文件图标提取（见 [`file_icon_png`]）。
 //!
 //! 关联与 URL scheme 的注册目标是官方桌面程序：Windows 指向同级
 //! `fluxdown-desktop.exe`，macOS 指向外层 `FluxDown.app` bundle（见
@@ -14,6 +14,7 @@
 
 mod autostart;
 mod file_association;
+mod file_icon;
 #[cfg(target_os = "macos")]
 mod macos_cf;
 mod protocol_registry;
@@ -22,6 +23,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use fluxdown_protocol::PlatformIntegrationDto;
+
+pub use file_icon::file_icon_png;
 
 /// 两次「为待确认交互拉起桌面程序」之间的最小间隔：断线重连抖动也不重复拉起。
 pub const PROMPT_LAUNCH_COOLDOWN_MS: i64 = 10_000;

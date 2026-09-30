@@ -2870,6 +2870,9 @@ dependencies = [
  "keepawake",
  "mimalloc",
  "notify-rust",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-foundation 0.3.2",
  "regex",
  "reqwest 0.12.28",
  "serde",
@@ -3098,6 +3101,7 @@ dependencies = [
 name = "fluxdown_ui_app"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "directories",
  "fluxdown_logfile",
  "fluxdown_protocol",

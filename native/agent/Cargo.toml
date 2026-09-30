@@ -55,12 +55,20 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # ShellExecuteW("open")：open/reveal 回退的标准「打开」调用（见 platform/mod.rs）
 # Win32_UI_Shell_Common：SHParseDisplayName / SHOpenFolderAndSelectItems（ITEMIDLIST 类型，见 platform/mod.rs）
+# Win32_UI_Controls / Win32_Graphics_Gdi / Win32_Storage_FileSystem：系统文件图标提取
+# （SHGetFileInfoW / ImageList_GetIcon / GetDIBits，见 platform/file_icon.rs）
 # 固定 0.59：0.61 引入 windows-link(raw-dylib)，与 cdylib 构建在 CI 上不兼容
 winreg = "0.55"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = { version = "0.18", optional = true }
+
+# 系统文件图标（NSWorkspace → NSBitmapImageRep → PNG，见 platform/file_icon.rs），随 `desktop` 启用。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", optional = true }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSGraphics"], optional = true }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSData", "NSDictionary", "NSGeometry"], optional = true }
 
 [features]
 # 桌面外壳集成：托盘（tao 事件循环 + tray-icon）、剪贴板监听、托盘文案 i18n。
@@ -73,6 +81,9 @@ desktop = [
     "dep:arboard",
     "dep:fluxdown_ui_i18n",
     "dep:gtk",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:objc2-foundation",
 ]
 
 # server 模式的 Web UI：构建期把 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`）内嵌进二进制，

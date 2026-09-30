@@ -79,7 +79,7 @@ impl CategoryIndex {
             Matcher::Other => false,
             Matcher::Extensions(extensions) => task
                 .extension()
-                .is_some_and(|extension| extensions.contains(&extension)),
+                .is_some_and(|extension| extensions.contains(extension)),
             Matcher::Regex(regex) => regex
                 .as_ref()
                 .is_some_and(|regex| regex.is_match(&task.name)),

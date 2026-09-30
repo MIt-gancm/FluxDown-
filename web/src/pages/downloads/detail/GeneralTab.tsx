@@ -1,4 +1,5 @@
-import { Copy, Download } from 'lucide-react'
+import { useEffect, useRef, useState } from 'react'
+import { Check, Copy, Download } from 'lucide-react'
 import { useT } from '../../../i18n'
 import { Button, Icon, Tooltip } from '../../../ui'
 import { copyText } from '../../../lib/copy'
@@ -22,6 +23,31 @@ function formatEta(t: ReturnType<typeof useT>, seconds: number): string {
   if (seconds < 60) return t('etaSeconds', { n: String(seconds) })
   if (seconds < 3600) return t('etaMinutes', { n: String(Math.floor(seconds / 60)) })
   return t('etaHours', { n: (seconds / 3600).toFixed(1) })
+}
+
+function CopyErrorButton({ message }: { message: string }) {
+  const t = useT()
+  const [copied, setCopied] = useState(false)
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined)
+  useEffect(() => () => clearTimeout(timer.current), [])
+  const label = copied ? t('detailErrorCopied') : t('detailCopyError')
+  return (
+    <Tooltip content={label}>
+      <Button
+        variant="ghost"
+        iconOnly
+        aria-label={label}
+        onClick={() => {
+          copyText(message)
+          setCopied(true)
+          clearTimeout(timer.current)
+          timer.current = setTimeout(() => setCopied(false), 1500)
+        }}
+      >
+        <Icon icon={copied ? Check : Copy} />
+      </Button>
+    </Tooltip>
+  )
 }
 
 export function GeneralTab({ view }: { view: DownloadTaskView }) {
@@ -76,7 +102,10 @@ export function GeneralTab({ view }: { view: DownloadTaskView }) {
       {dto?.ignoreTlsErrors ? <DetailRow label={t('taskIgnoreTlsErrors')}>✓</DetailRow> : null}
       {view.errorMessage !== '' ? (
         <DetailRow label={t('infoError')}>
-          <span className="text-destructive">{view.errorMessage}</span>
+          <div className="flex items-center gap-1">
+            <span className="min-w-0 flex-1 break-all text-destructive">{view.errorMessage}</span>
+            <CopyErrorButton message={view.errorMessage} />
+          </div>
         </DetailRow>
       ) : null}
       {view.groupId !== '' ? (

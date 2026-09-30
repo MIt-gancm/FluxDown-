@@ -1,1 +1,1 @@
-export { SelectionBar } from './SelectionBar'
+export { SelectionBar, SelectionHeaderBar } from './SelectionBar'

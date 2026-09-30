@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use base64::Engine as _;
 use fluxdown_protocol::method;
 use fluxdown_ui_downloads::{DownloadsCommand, DownloadsPort, DownloadsResult, PortFuture};
 use serde_json::{Value, json};
@@ -39,6 +40,15 @@ impl DownloadsPort for AgentDownloadsPort {
                         .call(method::DAEMON_TASK_ACTIVITY, Some(query))
                         .await?;
                     return Ok(DownloadsResult::TaskActivity(page));
+                }
+                DownloadsCommand::FileIcon(params) => {
+                    let icon: fluxdown_protocol::PlatformFileIconDto = client
+                        .call(method::AGENT_PLATFORM_FILE_ICON, Some(params))
+                        .await?;
+                    let png = base64::engine::general_purpose::STANDARD
+                        .decode(icon.png)
+                        .map_err(|_| internal_error())?;
+                    return Ok(DownloadsResult::FileIcon(png));
                 }
                 DownloadsCommand::Create(params) => {
                     (method::DAEMON_TASK_CREATE, serialize(params)?)
@@ -207,10 +217,9 @@ impl DownloadsPort for AgentDownloadsPort {
 }
 
 fn serialize<T: serde::Serialize>(value: T) -> Result<Value, fluxdown_protocol::RpcErrorData> {
-    serde_json::to_value(value).map_err(|_| {
-        fluxdown_protocol::RpcErrorData::new(
-            fluxdown_protocol::ApplicationErrorCode::Internal,
-            false,
-        )
-    })
+    serde_json::to_value(value).map_err(|_| internal_error())
+}
+
+fn internal_error() -> fluxdown_protocol::RpcErrorData {
+    fluxdown_protocol::RpcErrorData::new(fluxdown_protocol::ApplicationErrorCode::Internal, false)
 }

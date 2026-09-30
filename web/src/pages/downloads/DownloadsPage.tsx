@@ -139,7 +139,7 @@ function DownloadsBody() {
   const main = (
     <div className="relative min-h-0 min-w-0 flex-1">
       {table}
-      <SelectionBar />
+      {mobile ? <SelectionBar /> : null}
     </div>
   )
 

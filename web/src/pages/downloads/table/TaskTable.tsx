@@ -10,15 +10,16 @@ import { cn } from '../../../lib/cn'
 import { Checkbox, ContextMenuArea, Icon, Tooltip } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
 import { downloadViewsFiles, pauseViews, resumeViews } from '../model/actions'
+import { notePointerActivity } from '../model/rowOrder'
 import { formatBytes, formatDateTime, MAX_ETA_SECS, PROTOCOL_LABEL, sourceSite } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import {
   COLUMN_LABEL_KEY,
   COLUMN_SORT_KEY,
-  defaultSortDir,
   FILE_NAME_MAX_WIDTH,
   MAX_COLUMN_WIDTH,
   MIN_WIDTH,
+  nextHeaderSort,
   NUMERIC_COLUMNS,
   resolveColumns,
   toColumnPrefs,
@@ -30,6 +31,7 @@ import { FileCell, KindGlyph, ProgressCell, StatusCell } from './cells'
 import { formatEta } from './text'
 import type { Translate } from './text'
 import { buildGroupMenu, buildTaskMenu } from './menus'
+import { SelectionHeaderBar } from '../selection'
 import { TaskEmpty } from './TaskEmpty'
 
 /** 固定左侧选择列宽（含左侧留白）。 */
@@ -350,13 +352,7 @@ export function TaskTable() {
   const toggleSort = (kind: ColumnKind) => {
     const key = COLUMN_SORT_KEY[kind]
     if (!key) return
-    ctx.updatePrefs((current) => {
-      if (current.sort_key === key) {
-        if (key === 'smart') return current
-        return { ...current, sort_dir: current.sort_dir === 'asc' ? 'desc' : 'asc' }
-      }
-      return { ...current, sort_key: key, sort_dir: defaultSortDir(key) }
-    })
+    ctx.updatePrefs((current) => nextHeaderSort(current, key))
   }
 
   const startResize = (event: React.PointerEvent, column: LayoutColumn) => {
@@ -403,7 +399,14 @@ export function TaskTable() {
   if (rows.length === 0) return <TaskEmpty />
 
   return (
-    <div ref={scrollRef} className="relative h-full min-h-0 overflow-auto bg-surface">
+    <div
+      ref={scrollRef}
+      onMouseMove={() => notePointerActivity()}
+      onMouseDown={() => notePointerActivity()}
+      onWheel={() => notePointerActivity()}
+      onContextMenu={() => notePointerActivity()}
+      className="relative h-full min-h-0 overflow-auto bg-surface"
+    >
       <div style={{ minWidth: totalMinWidth }}>
         <div
           role="row"
@@ -422,50 +425,56 @@ export function TaskTable() {
               />
             </div>
           </div>
-          {columns.map((column) => {
-            const sortKey = COLUMN_SORT_KEY[column.kind]
-            const active = sortKey !== undefined && sortKey === prefs.sort_key && sortKey !== 'smart'
-            const numeric = NUMERIC_COLUMNS.has(column.kind)
-            const arrow = active ? (
-              <Icon icon={prefs.sort_dir === 'asc' ? ArrowUp : ArrowDown} size="sm" />
-            ) : null
-            return (
-              <div
-                key={column.kind}
-                draggable
-                onDragStart={(event) => {
-                  setDragKind(column.kind)
-                  event.dataTransfer.effectAllowed = 'move'
-                }}
-                onDragOver={(event) => dragKind && event.preventDefault()}
-                onDrop={() => {
-                  if (dragKind) moveColumn(dragKind, column.kind)
-                  setDragKind(null)
-                }}
-                onDragEnd={() => setDragKind(null)}
-                onClick={() => toggleSort(column.kind)}
-                className={cn(
-                  'group/th relative flex min-w-0 shrink-0 items-center gap-0.5 text-xs font-medium text-text-tertiary',
-                  numeric && 'justify-end',
-                  sortKey && 'cursor-pointer',
-                )}
-                style={{ ...cellStyle(column), paddingInline: CELL_PADDING_X }}
-              >
-                {numeric ? arrow : null}
-                <span className="min-w-0 truncate">{t(COLUMN_LABEL_KEY[column.kind])}</span>
-                {numeric ? null : arrow}
-                <div
-                  role="separator"
-                  onPointerDown={(event) => startResize(event, column)}
-                  onClick={(event) => event.stopPropagation()}
-                  className="absolute inset-y-0 right-0 flex w-2 cursor-col-resize items-center justify-center"
-                >
-                  <div className="h-3.5 w-px bg-hairline group-hover/th:h-full group-hover/th:bg-border" />
-                </div>
-              </div>
-            )
-          })}
-          <div style={{ width: TRAILING_GUTTER }} className="shrink-0" />
+          {ctx.summary.any ? (
+            <SelectionHeaderBar />
+          ) : (
+            <>
+              {columns.map((column) => {
+                const sortKey = COLUMN_SORT_KEY[column.kind]
+                const active = sortKey !== undefined && sortKey === prefs.sort_key
+                const numeric = NUMERIC_COLUMNS.has(column.kind)
+                const arrow = active ? (
+                  <Icon icon={prefs.sort_dir === 'asc' ? ArrowUp : ArrowDown} size="sm" />
+                ) : null
+                return (
+                  <div
+                    key={column.kind}
+                    draggable
+                    onDragStart={(event) => {
+                      setDragKind(column.kind)
+                      event.dataTransfer.effectAllowed = 'move'
+                    }}
+                    onDragOver={(event) => dragKind && event.preventDefault()}
+                    onDrop={() => {
+                      if (dragKind) moveColumn(dragKind, column.kind)
+                      setDragKind(null)
+                    }}
+                    onDragEnd={() => setDragKind(null)}
+                    onClick={() => toggleSort(column.kind)}
+                    className={cn(
+                      'group/th relative flex min-w-0 shrink-0 items-center gap-0.5 text-xs font-medium text-text-tertiary',
+                      numeric && 'justify-end',
+                      sortKey && 'cursor-pointer',
+                    )}
+                    style={{ ...cellStyle(column), paddingInline: CELL_PADDING_X }}
+                  >
+                    {numeric ? arrow : null}
+                    <span className="min-w-0 truncate">{t(COLUMN_LABEL_KEY[column.kind])}</span>
+                    {numeric ? null : arrow}
+                    <div
+                      role="separator"
+                      onPointerDown={(event) => startResize(event, column)}
+                      onClick={(event) => event.stopPropagation()}
+                      className="absolute inset-y-0 right-0 flex w-2 cursor-col-resize items-center justify-center"
+                    >
+                      <div className="h-3.5 w-px bg-hairline group-hover/th:h-full group-hover/th:bg-border" />
+                    </div>
+                  </div>
+                )
+              })}
+              <div style={{ width: TRAILING_GUTTER }} className="shrink-0" />
+            </>
+          )}
         </div>
         <div className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
           {virtualizer.getVirtualItems().map((item) => {

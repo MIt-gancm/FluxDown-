@@ -155,6 +155,7 @@ fn canonical_method_literals_are_exact_and_unique() {
         "agent.platform.setAutostart",
         "agent.platform.setFileAssociation",
         "agent.platform.setUrlProtocol",
+        "agent.platform.fileIcon",
         "agent.capture.submit",
         "agent.capture.submitTorrentFile",
         "agent.capture.list",

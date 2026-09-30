@@ -26,6 +26,7 @@ use gpui_component::{
 
 use crate::{
     components::{
+        file_icon::{SystemFileIcon, system_file_icon},
         segment_progress::render_segment_progress,
         task_table::{kind_icon, progress_bar_color, progress_track_color, status_color},
     },
@@ -41,8 +42,10 @@ pub const PROGRESS_WINDOW_INITIAL_HEIGHT: f32 = 340.;
 
 /// 进度条高度：比任务表更醒目。
 const BAR_HEIGHT: f32 = 8.;
-/// 文件类型图标底块边长。
+/// 文件图标位边长：回退的类型图标带底块，系统图标不加底块、在此位置内居中。
 const ICON_TILE: f32 = 40.;
+/// 系统文件图标边长（图标自带留白，四周再留 4px）。
+const SYSTEM_ICON: f32 = 32.;
 /// 完成视图的状态角标边长。
 const BADGE: f32 = 18.;
 /// 分段列表最大高度，超出后内部滚动。
@@ -290,23 +293,32 @@ impl ProgressWindowView {
 
     // ---- 渲染 ----
 
-    fn render_icon_tile(kind_icon: FluxIcon, cx: &App) -> gpui::Div {
-        let theme = active_theme(cx);
-        let tokens = theme.tokens();
-        let extended = theme.extended();
-        div()
+    /// 文件图标位：系统图标直接显示；请求中留空（避免先闪一下类型图标）；取不到时回退为
+    /// 底块 + 按类型的图标。
+    fn render_icon_tile(row: &DownloadTaskView, window: &mut Window, cx: &mut App) -> AnyElement {
+        let tile = div()
             .flex_none()
             .size(px(ICON_TILE))
             .flex()
             .items_center()
-            .justify_center()
-            .rounded(tokens.radius.lg)
-            .bg(extended.colors.nav_hover)
-            .child(
-                Icon::new(kind_icon)
-                    .size(extended.icon.lg)
-                    .text_color(tokens.colors.muted_foreground),
-            )
+            .justify_center();
+        match system_file_icon(row, px(SYSTEM_ICON), window, cx) {
+            SystemFileIcon::Ready(icon) => tile.child(icon).into_any_element(),
+            SystemFileIcon::Loading => tile.into_any_element(),
+            SystemFileIcon::Unavailable => {
+                let theme = active_theme(cx);
+                let tokens = theme.tokens();
+                let extended = theme.extended();
+                tile.rounded(tokens.radius.lg)
+                    .bg(extended.colors.nav_hover)
+                    .child(
+                        Icon::new(kind_icon(row.kind))
+                            .size(extended.icon.lg)
+                            .text_color(tokens.colors.muted_foreground),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 
     fn render_title(name: SharedString, cx: &App) -> gpui::Div {
@@ -323,6 +335,7 @@ impl ProgressWindowView {
     fn render_progress(
         &self,
         row: &DownloadTaskView,
+        icon: AnyElement,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -412,7 +425,7 @@ impl ProgressWindowView {
                     .gap(tokens.spacing.md)
                     .px(tokens.spacing.lg)
                     .pt(tokens.spacing.lg)
-                    .child(Self::render_icon_tile(kind_icon(row.kind), cx))
+                    .child(icon)
                     .child(
                         v_flex()
                             .flex_1()
@@ -823,7 +836,12 @@ impl ProgressWindowView {
             .bg(theme.extended().colors.chrome)
     }
 
-    fn render_completed(&self, row: &DownloadTaskView, cx: &mut Context<Self>) -> AnyElement {
+    fn render_completed(
+        &self,
+        row: &DownloadTaskView,
+        icon: AnyElement,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = active_theme(cx);
         let tokens = theme.tokens().clone();
         let extended = theme.extended().clone();
@@ -865,29 +883,25 @@ impl ProgressWindowView {
                     .px(tokens.spacing.lg)
                     .pt(tokens.spacing.lg)
                     .child(
-                        div()
-                            .relative()
-                            .flex_none()
-                            .child(Self::render_icon_tile(kind_icon(row.kind), cx))
-                            .child(
-                                div()
-                                    .absolute()
-                                    .right(px(-BADGE / 4.))
-                                    .bottom(px(-BADGE / 4.))
-                                    .size(px(BADGE))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .border(extended.stroke.strong)
-                                    .border_color(tokens.colors.surface)
-                                    .bg(badge_color)
-                                    .child(
-                                        Icon::new(badge_icon)
-                                            .size(px(10.))
-                                            .text_color(tokens.colors.surface),
-                                    ),
-                            ),
+                        div().relative().flex_none().child(icon).child(
+                            div()
+                                .absolute()
+                                .right(px(-BADGE / 4.))
+                                .bottom(px(-BADGE / 4.))
+                                .size(px(BADGE))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .border(extended.stroke.strong)
+                                .border_color(tokens.colors.surface)
+                                .bg(badge_color)
+                                .child(
+                                    Icon::new(badge_icon)
+                                        .size(px(10.))
+                                        .text_color(tokens.colors.surface),
+                                ),
+                        ),
                     )
                     .child(
                         v_flex()
@@ -965,11 +979,13 @@ impl gpui::Render for ProgressWindowView {
         let content = match self.row() {
             Some(row) if row.state == TaskState::Completed => {
                 let row = row.clone();
-                self.render_completed(&row, cx)
+                let icon = Self::render_icon_tile(&row, window, cx);
+                self.render_completed(&row, icon, cx)
             }
             Some(row) => {
                 let row = row.clone();
-                self.render_progress(&row, window, cx)
+                let icon = Self::render_icon_tile(&row, window, cx);
+                self.render_progress(&row, icon, window, cx)
             }
             None => div().into_any_element(),
         };
