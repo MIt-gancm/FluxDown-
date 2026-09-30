@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback } from "react";
 import type { ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
@@ -207,7 +208,7 @@ export default function RoadmapSection() {
   const openDetail = useCallback((id: number) => setDetailIssue(id), []);
 
   useEffect(() => {
-    fetch("/api/roadmap")
+    fetch(withBase("/api/roadmap"))
       .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
       .then((fresh: RoadmapData) => setData(fresh))
       .catch(() => setLoadError(true))

@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { motion } from "framer-motion";
 import { ArrowLeft, Terminal, Shield, AlertTriangle, CheckCircle2, Copy } from "lucide-react";
 import { useLocale } from "@/lib/i18n";
@@ -75,7 +76,7 @@ export default function MacosGatekeeperPage() {
           className="mb-8"
         >
           <a
-            href="/#download"
+            href={withBase("/#download")}
             className="inline-flex items-center gap-2 text-sm text-dark-text-muted hover:text-brand-sky transition-colors"
           >
             <ArrowLeft className="w-4 h-4" />
@@ -250,7 +251,7 @@ export default function MacosGatekeeperPage() {
             className="flex justify-center pt-4 pb-8"
           >
             <a
-              href="/#download"
+              href={withBase("/#download")}
               className="inline-flex items-center gap-2 rounded-lg bg-brand-blue px-6 py-2.5 text-sm font-semibold text-white hover:bg-brand-blue/90 transition-colors shadow-lg shadow-brand-blue/20"
             >
               <ArrowLeft className="w-4 h-4" />

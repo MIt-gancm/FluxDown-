@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -29,7 +30,7 @@ interface MarketIndex {
 
 /** 仓库相对路径 → 同源代理 URL（服务端中转 raw.githubusercontent.com，大陆可达 + CDN 缓存） */
 function rawUrl(path: string): string {
-  return `/api/themes/${path}`;
+  return withBase(`/api/themes/${path}`);
 }
 
 /** 拉取 JSON 并触发浏览器下载（raw 无 Content-Disposition，走 blob） */

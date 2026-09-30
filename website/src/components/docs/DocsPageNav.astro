@@ -1,4 +1,5 @@
 ---
+import { withBase } from "@/lib/base";
 /**
  * 文档页脚导航(零水合静态组件):
  * 编辑此页 / 本页历史与贡献者 / 帮我们翻译(仅回退页)+ 上一页/下一页。
@@ -52,7 +53,7 @@ const metaLink =
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
         {prev ? (
           <a
-            href={prev.href}
+            href={withBase(prev.href)}
             class="group rounded-lg border border-dark-border p-4 transition-colors hover:border-brand-sky/40"
           >
             <div class="text-xs text-dark-text-muted">← {t.prev}</div>
@@ -65,7 +66,7 @@ const metaLink =
         )}
         {next && (
           <a
-            href={next.href}
+            href={withBase(next.href)}
             class="group rounded-lg border border-dark-border p-4 text-right transition-colors hover:border-brand-sky/40"
           >
             <div class="text-xs text-dark-text-muted">{t.next} →</div>

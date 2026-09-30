@@ -4,6 +4,7 @@
  * 数据来源:懒加载 `/docs/search-{lang}.json`(构建期预渲染索引),
  * 在浏览器内经 searchDocs 做模糊 + 全文匹配。快捷键 ⌘/Ctrl+K 唤起,↑↓ 选择,Enter 跳转,Esc 关闭。
  */
+import { withBase } from "@/lib/base";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { searchDocs, type SearchDoc, type SearchResult } from "../../lib/docs-search";
 import { SECTIONS, type DocsLang } from "../../lib/docs-nav";
@@ -42,7 +43,7 @@ export default function DocsSearch({ lang }: Props) {
     if (docs || loading) return;
     setLoading(true);
     try {
-      const res = await fetch(`/docs/search-${lang}.json`);
+      const res = await fetch(withBase(`/docs/search-${lang}.json`));
       if (res.ok) setDocs((await res.json()) as SearchDoc[]);
     } catch {
       /* 网络失败:保持空索引,展示无结果 */
@@ -84,7 +85,7 @@ export default function DocsSearch({ lang }: Props) {
   useEffect(() => setActive(0), [query]);
 
   const go = useCallback((r: SearchResult | undefined) => {
-    if (r) window.location.href = r.doc.href;
+    if (r) window.location.href = withBase(r.doc.href);
   }, []);
 
   const onKeyDown = (e: React.KeyboardEvent) => {

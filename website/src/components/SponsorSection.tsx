@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useRef, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Heart, Loader2, CheckCircle2, X, RefreshCw, Copy, Check, CreditCard, Coins } from "lucide-react";
@@ -189,7 +190,7 @@ export default function SponsorSection({
   const [sponsors, setSponsors] = useState<WallSponsor[]>([]);
   useEffect(() => {
     let alive = true;
-    fetch("/api/sponsor/list")
+    fetch(withBase("/api/sponsor/list"))
       .then((r) => (r.ok ? r.json() : null))
       .then((d: { sponsors?: WallSponsor[] } | null) => {
         if (alive && Array.isArray(d?.sponsors)) setSponsors(d.sponsors);
@@ -236,7 +237,7 @@ export default function SponsorSection({
     const n = wallInfo.current.name.trim();
     const m = wallInfo.current.message.trim();
     setWallQueued(true);
-    void fetch("/api/sponsor/wall", {
+    void fetch(withBase("/api/sponsor/wall"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ outTradeNo, name: n, message: m }),
@@ -253,7 +254,7 @@ export default function SponsorSection({
         }
         try {
           const res = await fetch(
-            `/api/pay/status?outTradeNo=${encodeURIComponent(outTradeNo)}`,
+            withBase(`/api/pay/status?outTradeNo=${encodeURIComponent(outTradeNo)}`),
           );
           if (res.ok) {
             const data = (await res.json()) as { paid?: boolean };
@@ -279,7 +280,7 @@ export default function SponsorSection({
     setWallQueued(false);
     setPay({ phase: "creating" });
     try {
-      const res = await fetch("/api/pay/create", {
+      const res = await fetch(withBase("/api/pay/create"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

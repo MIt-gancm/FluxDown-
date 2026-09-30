@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useRef, useCallback, type ComponentType } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -222,7 +223,9 @@ export default function DownloadSection() {
     let cancelled = false;
     setLoading(true);
     fetch(
-      channel === "frontier" ? "/api/release?channel=frontier" : "/api/release",
+      withBase(
+        channel === "frontier" ? "/api/release?channel=frontier" : "/api/release",
+      ),
     )
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -273,7 +276,7 @@ export default function DownloadSection() {
       if (!subscribeEmail.trim()) return;
       setSubscribeStatus("loading");
       try {
-        const res = await fetch("/api/subscribe", {
+        const res = await fetch(withBase("/api/subscribe"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ email: subscribeEmail.trim(), platform }),
@@ -448,7 +451,7 @@ export default function DownloadSection() {
       icon: SiLinux,
       arch: "x64",
       iconBg: "bg-white ring-1 ring-black/10",
-      iconImg: "/brand/tux.svg",
+      iconImg: withBase("/brand/tux.svg"),
       available: hasLinuxAssets,
       primary: hasLinuxAssets,
       badge: hasLinuxAssets ? t("dl.availableNow") : t("dl.comingSoon"),
@@ -491,7 +494,7 @@ export default function DownloadSection() {
       available: hasServerAssets,
       primary: false,
       badge: hasServerAssets ? t("dl.availableNow") : t("dl.comingSoon"),
-      iconImg: "/logo.svg",
+      iconImg: withBase("/logo.svg"),
       iconImgFull: true,
       version: release?.server?.version,
       setup: serverAssets?.windows_x64 ?? null,
@@ -1077,7 +1080,7 @@ export default function DownloadSection() {
                             {/* macOS 「已损坏」提示 */}
                             {p.key === "macos" && (
                               <a
-                                href="/macos-gatekeeper"
+                                href={withBase("/macos-gatekeeper")}
                                 className="inline-flex items-center gap-1.5 rounded-lg border border-amber-500/50 bg-amber-500/15 px-3 py-2 text-[10px] text-dark-text hover:bg-amber-500/25 hover:border-amber-500/70 transition-colors self-start"
                               >
                                 <AlertTriangle className="w-3 h-3 flex-shrink-0 text-amber-500 shrink-0" />
@@ -1095,8 +1098,8 @@ export default function DownloadSection() {
                               <a
                                 href={
                                   p.key === "synology"
-                                    ? `/docs/${locale}/headless-server/docker/`
-                                    : `/docs/${locale}/headless-server/setup/`
+                                    ? withBase(`/docs/${locale}/headless-server/docker/`)
+                                    : withBase(`/docs/${locale}/headless-server/setup/`)
                                 }
                                 className="inline-flex items-center gap-1 text-[10px] text-dark-text-muted hover:text-brand-blue underline underline-offset-2 transition-colors self-start"
                               >
@@ -1107,7 +1110,7 @@ export default function DownloadSection() {
                             {/* CLI 文档链接 */}
                             {p.key === "cli" && (
                               <a
-                                href={`/docs/${locale}/api/cli/`}
+                                href={withBase(`/docs/${locale}/api/cli/`)}
                                 className="inline-flex items-center gap-1 text-[10px] text-dark-text-muted hover:text-brand-blue underline underline-offset-2 transition-colors self-start"
                               >
                                 {t("dl.cliGuide")}

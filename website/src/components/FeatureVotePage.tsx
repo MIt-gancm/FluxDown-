@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -105,7 +106,7 @@ export default function FeatureVotePage() {
   }, []);
 
   const refetch = useCallback(async (bustCache = false) => {
-    const url = bustCache ? `/api/feature-vote?t=${Date.now()}` : "/api/feature-vote";
+    const url = withBase(bustCache ? `/api/feature-vote?t=${Date.now()}` : "/api/feature-vote");
     const res = await fetch(url);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const fresh: FeatureListData = await res.json();
@@ -150,7 +151,7 @@ export default function FeatureVotePage() {
       saveVotedIds(nextIds);
 
       try {
-        const res = await fetch("/api/feature-vote", {
+        const res = await fetch(withBase("/api/feature-vote"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action, featureId: feature.id }),
@@ -200,7 +201,7 @@ export default function FeatureVotePage() {
     if (!title || proposing) return;
     setProposing(true);
     try {
-      const res = await fetch("/api/feature-vote", {
+      const res = await fetch(withBase("/api/feature-vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { HelpCircle, ChevronDown } from "lucide-react";
@@ -106,7 +107,7 @@ export default function FaqSection() {
         >
           <p className="text-sm text-dark-text-secondary">
             {t("faq.moreQuestions")}{" "}
-            <a href="/feedback" className="text-brand-blue hover:underline">
+            <a href={withBase("/feedback")} className="text-brand-blue hover:underline">
               {t("faq.contactUs")}
             </a>
           </p>

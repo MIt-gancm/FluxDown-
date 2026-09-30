@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -82,7 +83,7 @@ export default function VotePage() {
       // localStorage unavailable
     }
 
-    fetch("/api/vote")
+    fetch(withBase("/api/vote"))
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
@@ -99,7 +100,7 @@ export default function VotePage() {
     setStatusMsg(null);
 
     try {
-      const res = await fetch("/api/vote", {
+      const res = await fetch(withBase("/api/vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ option }),

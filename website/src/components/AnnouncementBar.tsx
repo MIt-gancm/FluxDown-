@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -102,7 +103,7 @@ export default function AnnouncementBar() {
             {current.link && (
               <div className="mt-3 flex justify-end">
                 <a
-                  href={current.link}
+                  href={withBase(current.link)}
                   onClick={handleDismiss}
                   className="inline-flex items-center gap-1.5 rounded-lg bg-gradient-to-r from-brand-sky to-brand-cyan px-3.5 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition-opacity"
                 >

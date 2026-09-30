@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { motion, AnimatePresence } from "framer-motion";
 import { MousePointerClick, Radio, Filter, Moon, Inbox, Settings, Video, Image as ImageIcon, Music, Download } from "lucide-react";
 import { DotBackground } from "@/components/ui/grid-background";
@@ -190,7 +191,7 @@ export default function ExtensionSection() {
                   }}
                   transition={{ duration: 0.15 }}
                 >
-                  <img src="/logo.svg" alt="" className="w-4 h-4" />
+                  <img src={withBase("/logo.svg")} alt="" className="w-4 h-4" />
                 </motion.div>
               </div>
 
@@ -208,7 +209,7 @@ export default function ExtensionSection() {
                       {/* Header: logo + lang/theme/status */}
                       <div className="flex items-center justify-between">
                         <div className="flex items-center gap-2">
-                          <img src="/logo.svg" alt="" className="w-6 h-6" />
+                          <img src={withBase("/logo.svg")} alt="" className="w-6 h-6" />
                           <span className="text-sm font-semibold">
                             <span className="text-brand-sky">Flux</span>
                             <span className="text-dark-text">Down</span>

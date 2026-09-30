@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
 import type { Messages } from "@/lib/locales";
@@ -34,7 +35,7 @@ export default function PricingWhyPage() {
           transition={{ duration: 0.5 }}
         >
           <a
-            href="/pricing"
+            href={withBase("/pricing")}
             className="inline-flex items-center gap-1.5 text-sm text-dark-text-secondary hover:text-brand-sky transition-colors"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -133,7 +134,7 @@ export default function PricingWhyPage() {
               {t("pricing.why.s4p1")}
             </p>
             <a
-              href="/pricing"
+              href={withBase("/pricing")}
               className="mt-6 inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-brand-sky to-brand-cyan px-5 py-2.5 text-sm font-semibold text-white hover:opacity-90 transition-opacity"
             >
               {t("pricing.why.cta")}

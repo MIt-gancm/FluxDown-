@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { cn, GITHUB_REPO_URL } from "@/lib/utils";
@@ -102,7 +103,7 @@ function NavDropdownMenu({
               {dropdown.items.map((item) => (
                 <a
                   key={item.link}
-                  href={item.link}
+                  href={withBase(item.link)}
                   onClick={() => setOpen(false)}
                   className="flex items-center gap-2.5 px-4 py-2 text-xs font-medium text-dark-text-secondary hover:text-dark-text hover:bg-dark-surface2/80 transition-colors duration-150"
                 >
@@ -510,8 +511,8 @@ export function FloatingNavbar({ className }: { className?: string }) {
             </button>
 
             {/* Logo */}
-            <a href="/" className="flex items-center gap-2 px-3 py-1">
-              <img src="/logo.svg" alt="FluxDown" className="h-6 w-6" />
+            <a href={withBase("/")} className="flex items-center gap-2 px-3 py-1">
+              <img src={withBase("/logo.svg")} alt="FluxDown" className="h-6 w-6" />
               <span className="text-sm font-semibold tracking-tight hidden sm:inline">
                 <span className="text-brand-sky">Flux</span>
                 <span className="text-dark-text">Down</span>
@@ -525,7 +526,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
             {directLinks.map((item) => (
               <a
                 key={item.link}
-                href={item.link}
+                href={withBase(item.link)}
                 target={item.external ? "_blank" : undefined}
                 rel={item.external ? "noopener noreferrer" : undefined}
                 className="hidden sm:inline-block text-xs font-medium text-dark-text-secondary hover:text-dark-text px-3 py-1.5 rounded-full hover:bg-dark-surface3/50 transition-all duration-200"
@@ -542,7 +543,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
 
             {/* 赞助链接（带爱心图标） */}
             <a
-              href="/sponsor"
+              href={withBase("/sponsor")}
               className="hidden sm:inline-flex items-center gap-1 text-xs font-medium text-dark-text-secondary hover:text-pink-400 px-3 py-1.5 rounded-full hover:bg-pink-500/10 transition-all duration-200"
             >
               <svg
@@ -692,7 +693,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
 
             {/* CTA 下载按钮 */}
             <a
-              href="/#download"
+              href={withBase("/#download")}
               className="hidden sm:inline-flex items-center gap-1.5 rounded-full bg-brand-blue px-4 py-1.5 text-xs font-semibold text-white hover:bg-brand-blue/90 transition-colors"
             >
               <svg
@@ -736,7 +737,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
                       {group.items.map((item) => (
                         <a
                           key={item.link}
-                          href={item.link}
+                          href={withBase(item.link)}
                           target={
                             "external" in item && item.external
                               ? "_blank"
@@ -769,7 +770,7 @@ export function FloatingNavbar({ className }: { className?: string }) {
 
                   {/* 移动端 CTA 下载按钮 */}
                   <a
-                    href="/#download"
+                    href={withBase("/#download")}
                     onClick={() => setMobileOpen(false)}
                     className="flex items-center justify-center gap-2 rounded-xl bg-brand-blue px-4 py-2.5 text-sm font-semibold text-white hover:bg-brand-blue/90 transition-colors"
                   >

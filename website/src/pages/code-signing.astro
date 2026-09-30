@@ -1,4 +1,5 @@
 ---
+import { withBase } from "@/lib/base";
 import Layout from "../layouts/Layout.astro";
 import { FloatingNavbar } from "../components/ui/floating-navbar";
 import Footer from "../components/Footer";
@@ -64,7 +65,7 @@ import Footer from "../components/Footer";
           <div>
             <h2 class="text-xl font-semibold text-dark-text mb-3">Other platforms</h2>
             <ul class="list-disc pl-5 space-y-1.5">
-              <li>macOS: artifacts are currently unsigned; users should obtain artifacts only from the official GitHub Releases page. See <a href="/macos-gatekeeper/" class="text-brand-sky hover:underline">macOS Gatekeeper instructions</a>.</li>
+              <li>macOS: artifacts are currently unsigned; users should obtain artifacts only from the official GitHub Releases page. See <a href={withBase("/macos-gatekeeper/")} class="text-brand-sky hover:underline">macOS Gatekeeper instructions</a>.</li>
               <li>Linux: artifacts (AppImage / deb / Arch / portable) are currently not cryptographically signed; obtain them only from the official GitHub Releases page.</li>
             </ul>
           </div>
@@ -75,7 +76,7 @@ import Footer from "../components/Footer";
               FluxDown does not transfer any information to other networked systems unless
               specifically requested by the user or the person installing or operating it
               (e.g. checking for updates on GitHub Releases). See the full
-              <a href="/privacy/" class="text-brand-sky hover:underline">Privacy Policy</a>.
+              <a href={withBase("/privacy/")} class="text-brand-sky hover:underline">Privacy Policy</a>.
             </p>
           </div>
         </div>

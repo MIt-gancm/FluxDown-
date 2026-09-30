@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -160,7 +161,7 @@ export default function FeedbackListSection({
         if (label) params.set("label", label);
         if (q) params.set("q", q);
 
-        const res = await fetch(`/api/issues?${params}`);
+        const res = await fetch(withBase(`/api/issues?${params}`));
         if (!res.ok) {
           throw new Error(`HTTP ${res.status}`);
         }

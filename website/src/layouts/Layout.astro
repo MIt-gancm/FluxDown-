@@ -1,6 +1,7 @@
 ---
+import { BASE, withBase } from "@/lib/base";
 import "../styles/global.css";
-import { SITE_URL, OG_IMAGE_URL, OG_IMAGE_WIDTH, OG_IMAGE_HEIGHT, buildGraph } from "../lib/seo";
+import { SITE_ORIGIN, OG_IMAGE_URL, OG_IMAGE_WIDTH, OG_IMAGE_HEIGHT, buildGraph } from "../lib/seo";
 import { setSSRLocale } from "../lib/i18n";
 
 interface Props {
@@ -22,18 +23,22 @@ const {
   lang = "en",
   ogLocale = "en_US",
   alternates,
-  noindex = false,
+  noindex: pageNoindex = false,
   jsonLdNodes = [],
 } = Astro.props;
 
 // canonical 统一带尾斜杠(与 sitemap / Astro 默认输出一致),消除 /faq 与 /faq/ 的信号分裂。
 // 显式传入的 canonicalUrl 优先;否则由 pathname 规范化推导。
+// 挂在子路径下的旧站(如 /v1)整站 noindex,避免与根部署重复收录。
+const noindex = pageNoindex || BASE !== "";
+
+// Astro.url.pathname 已含挂载前缀,只拼站点源。
 const normalizedPath =
   Astro.url.pathname === "/"
     ? "/"
     : Astro.url.pathname.replace(/\/$/, "") + "/";
 const resolvedCanonical =
-  canonicalUrl ?? (normalizedPath === "/" ? SITE_URL + "/" : `${SITE_URL}${normalizedPath}`);
+  canonicalUrl ?? (normalizedPath === "/" ? SITE_ORIGIN + "/" : `${SITE_ORIGIN}${normalizedPath}`);
 
 // lang 是否由调用方显式传入(区分默认值与显式指定,决定是否输出 data-fixed-lang)
 const isLangExplicit = Astro.props.lang !== undefined;
@@ -50,9 +55,9 @@ const ogImageUrl = OG_IMAGE_URL;
 <html lang={lang} class="fluxdown-loading" data-fixed-lang={isLangExplicit ? true : undefined}>
   <head>
     <meta charset="utf-8" />
-    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
-    <link rel="icon" type="image/x-icon" href="/favicon.ico" sizes="32x32" />
-    <link rel="apple-touch-icon" href="/logo.png" />
+    <link rel="icon" type="image/svg+xml" href={withBase("/logo.svg")} />
+    <link rel="icon" type="image/x-icon" href={withBase("/favicon.ico")} sizes="32x32" />
+    <link rel="apple-touch-icon" href={withBase("/logo.png")} />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content={description} />
     <meta name="theme-color" content="#0a0a0b" media="(prefers-color-scheme: dark)" />
@@ -183,6 +188,6 @@ const ogImageUrl = OG_IMAGE_URL;
       走同域代理 /api/langbot-widget.js:上游脚本注入的 baseUrl 是 http://127.0.0.1:5300,
       直连会让所有 API/WS/logo 请求打到访客本机。代理只重写地址,其余原样透传。
     -->
-    <script is:inline defer data-title="FD助手" src="/api/langbot-widget.js"></script>
+    <script is:inline defer data-title="FD助手" src={withBase("/api/langbot-widget.js")}></script>
   </body>
 </html>

@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -186,7 +187,7 @@ function LogoCard({
   const [imgError, setImgError] = useState(false);
 
   const imageUrl = logo.isBuiltin
-    ? `/logos/${logo.filename}`
+    ? withBase(`/logos/${logo.filename}`)
     : (logo.imageUrl ?? null);
 
   const isTop1 = rank === 1;
@@ -365,7 +366,7 @@ export default function LogoVotePage() {
     setLoadError(false);
     if (showLoading) setLoading(true);
     try {
-      const res = await fetch("/api/logo-vote");
+      const res = await fetch(withBase("/api/logo-vote"));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       console.log("[LogoVotePage] raw response:", json);
@@ -418,7 +419,7 @@ export default function LogoVotePage() {
       setStatusMsg(null);
 
       try {
-        const res = await fetch("/api/logo-vote", {
+        const res = await fetch(withBase("/api/logo-vote"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -531,7 +532,7 @@ export default function LogoVotePage() {
         formData.append("submitterName", submitName.trim());
       if (submitDesc.trim()) formData.append("description", submitDesc.trim());
 
-      const res = await fetch("/api/logo-submit", {
+      const res = await fetch(withBase("/api/logo-submit"), {
         method: "POST",
         body: formData,
       });

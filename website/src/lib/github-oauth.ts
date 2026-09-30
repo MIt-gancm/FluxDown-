@@ -4,6 +4,7 @@
  * 无 scope 授权：只取公开身份（id/login/avatar），不索取任何仓库权限。
  * 会话 = HMAC-SHA256 签名的 HttpOnly cookie（无服务端存储，重启不失效）。
  */
+import { withBase } from "@/lib/base";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { AstroCookies } from "astro";
 import {
@@ -43,7 +44,7 @@ export function oauthClientSecret(): string {
  */
 export function oauthCallbackUrl(url: URL, site: URL | undefined): string {
   const origin = import.meta.env.PROD && site ? site.origin : url.origin;
-  return `${origin}/api/auth/github/callback`;
+  return `${origin}${withBase("/api/auth/github/callback")}`;
 }
 
 export function randomState(): string {
@@ -106,6 +107,6 @@ export function clearSession(cookies: AstroCookies): void {
 
 /** returnTo 只允许站内相对路径，防开放跳转 */
 export function safeReturnTo(raw: string | null): string {
-  if (isSafeLocalPath(raw)) return raw;
-  return "/pricing";
+  if (isSafeLocalPath(raw)) return withBase(raw);
+  return withBase("/pricing");
 }

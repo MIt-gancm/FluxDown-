@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useMemo, useRef } from "react";
 import { motion } from "framer-motion";
 import {
@@ -1094,7 +1095,7 @@ export default function ProjectBoardSection({
   };
 
   useEffect(() => {
-    fetch("/api/project-board")
+    fetch(withBase("/api/project-board"))
       .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
       .then(setData)
       .catch(() => setError(t("board.error")))

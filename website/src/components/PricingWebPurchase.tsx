@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { QRCodeSVG } from "qrcode.react";
@@ -120,7 +121,7 @@ export default function WebPurchase({ plan }: { plan: PlanBrief }) {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/cloud/order-lookup", {
+      const res = await fetch(withBase("/api/cloud/order-lookup"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account: trimmed }),
@@ -142,7 +143,7 @@ export default function WebPurchase({ plan }: { plan: PlanBrief }) {
     setBusy(true);
     setError(null);
     try {
-      const res = await fetch("/api/cloud/order", {
+      const res = await fetch(withBase("/api/cloud/order"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account: account.trim(), planCode: plan.code }),
@@ -166,7 +167,9 @@ export default function WebPurchase({ plan }: { plan: PlanBrief }) {
     const tick = async () => {
       try {
         const res = await fetch(
-          `/api/cloud/order?orderNo=${encodeURIComponent(order.orderNo)}&account=${encodeURIComponent(account.trim())}`,
+          withBase(
+            `/api/cloud/order?orderNo=${encodeURIComponent(order.orderNo)}&account=${encodeURIComponent(account.trim())}`,
+          ),
         );
         if (!res.ok) return; // 瞬时失败/限频：静默等下一轮
         const fresh = (await res.json()) as WebOrder;

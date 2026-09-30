@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -108,7 +109,7 @@ export default function CommunityFloat() {
 
                   {/* Icon button */}
                   <a
-                    href={item.href}
+                    href={withBase(item.href)}
                     target={item.external ? "_blank" : undefined}
                     rel={item.external ? "noopener noreferrer" : undefined}
                     onClick={(event) => {

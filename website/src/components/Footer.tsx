@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect } from "react";
 import { useLocale } from "@/lib/i18n";
 import { GITHUB_REPO_URL } from "@/lib/utils";
@@ -25,9 +26,9 @@ export default function Footer() {
         <div className="grid grid-cols-2 gap-10 sm:grid-cols-6 lg:grid-cols-12">
           {/* Brand column */}
           <div className="col-span-2 sm:col-span-6 lg:col-span-4">
-            <a href="/" className="inline-flex items-center gap-2.5 group">
+            <a href={withBase("/")} className="inline-flex items-center gap-2.5 group">
               <img
-                src="/logo.svg"
+                src={withBase("/logo.svg")}
                 alt="FluxDown"
                 className="h-8 w-8 transition-transform duration-300 group-hover:scale-110"
               />
@@ -91,7 +92,7 @@ export default function Footer() {
               ].map(({ href, label }) => (
                 <li key={href}>
                   <a
-                    href={href}
+                    href={withBase(href)}
                     className="text-[13px] text-dark-text-secondary hover:text-brand-sky transition-colors duration-200"
                   >
                     {label}
@@ -121,7 +122,7 @@ export default function Footer() {
               ].map(({ href, label, external }, i) => (
                 <li key={`${href}-${i}`}>
                   <a
-                    href={href}
+                    href={withBase(href)}
                     className="text-[13px] text-dark-text-secondary hover:text-brand-sky transition-colors duration-200"
                     {...(external
                       ? { target: "_blank", rel: "noopener noreferrer" }
@@ -150,7 +151,7 @@ export default function Footer() {
               ].map(({ href, label }) => (
                 <li key={href}>
                   <a
-                    href={href}
+                    href={withBase(href)}
                     className="text-[13px] text-dark-text-secondary hover:text-brand-sky transition-colors duration-200"
                   >
                     {label}
@@ -173,7 +174,7 @@ export default function Footer() {
               ].map(({ href, label }) => (
                 <li key={href}>
                   <a
-                    href={href}
+                    href={withBase(href)}
                     className="text-[13px] text-dark-text-secondary hover:text-brand-sky transition-colors duration-200"
                   >
                     {label}

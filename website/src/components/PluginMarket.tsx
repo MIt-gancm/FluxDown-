@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -41,7 +42,7 @@ interface PluginGroup {
 
 /** 仓库相对路径 → 同源代理 URL（服务端中转 raw.githubusercontent.com，大陆可达 + CDN 缓存）。 */
 function proxyUrl(path: string): string {
-  return `/api/plugins/${path}`;
+  return withBase(`/api/plugins/${path}`);
 }
 
 /** 每插件的提交历史深链——Git 是 Merkle DAG，逐版本变更可独立追踪。 */

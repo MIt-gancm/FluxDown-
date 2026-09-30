@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useCallback } from "react";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -63,7 +64,7 @@ export default function QQGroupPage() {
             <div className="relative flex flex-col items-center gap-6">
               <div className="rounded-xl border border-dark-border bg-white p-3 shadow-lg shadow-black/10">
                 <img
-                  src="/qq-group.png"
+                  src={withBase("/qq-group.png")}
                   alt="QQ Group QR Code"
                   className="w-48 h-48 sm:w-56 sm:h-56 object-contain"
                 />

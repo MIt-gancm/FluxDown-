@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, MouseEvent as ReactMouseEvent } from "react";
 import type { CSSProperties, ReactNode } from "react";
@@ -1515,7 +1516,7 @@ function PreviewPanel({
           {...tokenAttrs("colors.surface.surface1", "colors.border.default")}
         >
           <div className="flex items-center gap-2">
-            <img src="/logo.svg" alt="" className="h-4 w-4 rounded" />
+            <img src={withBase("/logo.svg")} alt="" className="h-4 w-4 rounded" />
             <span className="text-[12px] font-semibold">
               <span style={{ color: rgbaFromTheme(theme, "colors.accent.color") }} {...tokenAttrs("colors.accent.color")}>Flux</span>
               <span style={{ color: rgbaFromTheme(theme, "colors.text.primary") }} {...tokenAttrs("colors.text.primary")}>Down</span>

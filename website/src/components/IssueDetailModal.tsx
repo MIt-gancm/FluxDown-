@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
@@ -342,7 +343,7 @@ export default function IssueDetailModal({
       setData(null);
 
       try {
-        const res = await fetch(`/api/issues/${num}`);
+        const res = await fetch(withBase(`/api/issues/${num}`));
         if (!res.ok) {
           if (res.status === 404) {
             setError(t("issueDetail.notFound"));
@@ -377,7 +378,7 @@ export default function IssueDetailModal({
     setReplyError("");
 
     try {
-      const res = await fetch(`/api/issues/${issueNumber}/comments`, {
+      const res = await fetch(withBase(`/api/issues/${issueNumber}/comments`), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body: replyBody.trim() }),

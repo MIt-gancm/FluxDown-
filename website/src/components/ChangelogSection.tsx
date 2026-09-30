@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback, useRef } from "react";
 import type { Messages } from "@/lib/locales";
 import { motion, AnimatePresence } from "framer-motion";
@@ -687,7 +688,7 @@ export default function ChangelogSection() {
 
       try {
         const res = await fetch(
-          `/api/changelog?page=${p}&per_page=${PER_PAGE}&channel=${ch}`,
+          withBase(`/api/changelog?page=${p}&per_page=${PER_PAGE}&channel=${ch}`),
         );
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();

@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect } from "react";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -202,7 +203,7 @@ export default function PricingPage() {
 
   useEffect(() => {
     // FluxCloud 动态套餐目录：失败静默降级为静态占位卡片。
-    fetch("/api/cloud/plans")
+    fetch(withBase("/api/cloud/plans"))
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
@@ -240,7 +241,7 @@ export default function PricingPage() {
             {t("pricing.subtitle")}
           </p>
           <a
-            href="/pricing/why"
+            href={withBase("/pricing/why")}
             className="mt-5 inline-flex items-center gap-1.5 text-sm font-medium text-brand-sky hover:text-brand-cyan transition-colors"
           >
             {t("pricing.whyLink")}
@@ -467,7 +468,7 @@ export default function PricingPage() {
               </p>
             </div>
             <a
-              href="/pricing/vote"
+              href={withBase("/pricing/vote")}
               className="shrink-0 inline-flex items-center gap-1.5 rounded-lg border border-dark-border px-4 py-2 text-sm font-medium text-dark-text hover:border-brand-sky/50 hover:text-brand-sky transition-colors"
             >
               {t("pricing.voteCtaLink")}

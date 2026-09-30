@@ -2,6 +2,7 @@
  * 文档页反馈表单(client:visible):文字建议 → POST /api/feedback(type: "docs")。
  * 文案按页面语言(URL 段)内联双语,不依赖全站 useLocale(docs 页语言由 URL 决定)。
  */
+import { withBase } from "@/lib/base";
 import { useState } from "react";
 import type { FormEvent } from "react";
 
@@ -36,7 +37,7 @@ export default function DocsFeedbackForm({ pagePath, lang }: Props) {
     if (!description || status === "sending") return;
     setStatus("sending");
     try {
-      const res = await fetch("/api/feedback", {
+      const res = await fetch(withBase("/api/feedback"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
 import { ANNOUNCEMENTS } from "@/lib/announcements";
@@ -52,7 +53,7 @@ export default function AnnouncementsPage() {
               transition={{ duration: 0.4, delay: 0.05 * i }}
             >
               <a
-                href={item.link || "#"}
+                href={item.link ? withBase(item.link) : "#"}
                 className={`group block rounded-xl border overflow-hidden transition-all duration-300 ${
                   item.active
                     ? "border-dark-border hover:border-dark-text-muted hover:shadow-lg hover:shadow-black/10"

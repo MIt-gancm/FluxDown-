@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { MessageSquarePlus, Lightbulb, Bug, MessageCircle, Send, Loader2, CheckCircle2, AlertCircle, MonitorSmartphone } from "lucide-react";
@@ -75,7 +76,7 @@ export default function FeedbackSection({ onSuccess }: FeedbackSectionProps) {
     setErrorMsg("");
 
     try {
-      const res = await fetch("/api/feedback", {
+      const res = await fetch(withBase("/api/feedback"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

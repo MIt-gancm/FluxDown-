@@ -1,4 +1,5 @@
 ---
+import { withBase } from "@/lib/base";
 /**
  * 文档正文页(全部静态预渲染)。
  * 路由规则(设计决策 D3/D4):以 en 集合为 slug 全集 × {en, zh};
@@ -66,8 +67,8 @@ const { groups, flat } = buildDocsNav(all, lang);
 const { Content, headings } = await render(entry);
 
 const site = Astro.site ?? new URL("https://fluxdown.zerx.dev");
-const enUrl = new URL(`/docs/en/${slugPath}/`, site).href;
-const zhUrl = new URL(`/docs/zh/${slugPath}/`, site).href;
+const enUrl = new URL(withBase(`/docs/en/${slugPath}/`), site).href;
+const zhUrl = new URL(withBase(`/docs/zh/${slugPath}/`), site).href;
 // hreflang(D4):仅当 zh 真实存在译文时互链;回退页自身不输出任何 alternate
 const alternates = fallback
   ? []
@@ -97,7 +98,7 @@ const translateUrl = fallback
   : undefined;
 
 const pagePath = `/docs/${lang}/${slugPath}/`;
-const altHref = zh ? `/docs/en/${slugPath}/` : `/docs/zh/${slugPath}/`;
+const altHref = withBase(zh ? `/docs/en/${slugPath}/` : `/docs/zh/${slugPath}/`);
 const sectionLabel = groups.find((g) => g.id === entry.data.section)?.label;
 ---
 

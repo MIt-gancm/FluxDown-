@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { motion, AnimatePresence } from "framer-motion";
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { GridBackground } from "@/components/ui/grid-background";
@@ -545,7 +546,7 @@ export default function HeroSection() {
           ? ("linux" as const)
           : ("windows" as const);
     setHeroOS(os);
-    fetch("/api/release")
+    fetch(withBase("/api/release"))
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (!data) return;
@@ -865,7 +866,7 @@ export default function HeroSection() {
                 style={{ gap: "6px" }}
               >
                 <img
-                  src="/logo.svg"
+                  src={withBase("/logo.svg")}
                   alt=""
                   style={{ width: "18px", height: "18px", borderRadius: "4px" }}
                 />

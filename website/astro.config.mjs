@@ -28,15 +28,50 @@ const HOME_SITEMAP_LINKS = [
   { url: `${SITE}/`, lang: "x-default" },
 ];
 
+// 站点挂载前缀:根部署留空;旧站挂子路径时构建期注入(如 SITE_BASE=/v1,见 Dockerfile)。
+// 运行期代码经 import.meta.env.BASE_URL 读取(src/lib/base.ts),与这里同源。
+const BASE = (process.env.SITE_BASE ?? "").replace(/\/+$/, "");
+
+/**
+ * 去掉挂载前缀,得到站点路径(与 src/lib/base.ts 的 stripBase 同契约)。
+ * @param {string} pathname
+ */
+function stripBase(pathname) {
+  if (!BASE) return pathname;
+  if (pathname === BASE) return "/";
+  return pathname.startsWith(`${BASE}/`) ? pathname.slice(BASE.length) : pathname;
+}
+
+/**
+ * Markdown 正文里的站内绝对链接(`/docs/...`、`/docs/img.png`)补挂载前缀。
+ * 只在子路径部署时启用;根部署零改动。
+ */
+function rehypeBaseLinks() {
+  /** @param {any} node */
+  const visit = (node) => {
+    if (node.type === "element" && node.properties) {
+      for (const attr of ["href", "src"]) {
+        const value = node.properties[attr];
+        if (typeof value === "string" && value.startsWith("/") && !value.startsWith("//")) {
+          node.properties[attr] = `${BASE}${value}`;
+        }
+      }
+    }
+    if (Array.isArray(node.children)) node.children.forEach(visit);
+  };
+  return visit;
+}
+
 // https://astro.com/docs/en/guides/environment-variables/
 export default defineConfig({
   site: "https://fluxdown.zerx.dev",
+  base: BASE || "/",
   adapter: node({ mode: "standalone" }),
   integrations: [
     react(),
     sitemap({
       filter: (page) => {
-        const path = new URL(page).pathname.replace(/\/$/, "");
+        const path = stripBase(new URL(page).pathname).replace(/\/$/, "");
         return !docsFallbackPathnames.has(path) && !noindexPathnames.has(path);
       },
       // Bing/IndexNow 依赖 ISO8601 lastmod 做 freshness 判定。SSG 页无天然 mtime,
@@ -44,9 +79,9 @@ export default defineConfig({
       // 作为辅助信号:首页最高,其余默认。
       serialize: (item) => {
         item.lastmod = BUILD_TIME;
-        const pathname = new URL(item.url).pathname;
+        const pathname = stripBase(new URL(item.url).pathname);
         if (HOME_VARIANT_PATHS.has(pathname)) {
-          item.links = HOME_SITEMAP_LINKS;
+          item.links = HOME_SITEMAP_LINKS.map((l) => ({ ...l, url: l.url.replace(SITE, `${SITE}${BASE}`) }));
           item.changefreq = ChangeFreqEnum.WEEKLY;
           item.priority = pathname === "/" ? 1.0 : 0.9;
         }
@@ -56,6 +91,7 @@ export default defineConfig({
   ],
 
   markdown: {
+    rehypePlugins: BASE ? [rehypeBaseLinks] : [],
     shikiConfig: {
       // 双主题输出 --shiki-light/--shiki-dark CSS 变量,
       // 由 global.css 中锚定 html.light 的桥接规则决定实际展示(站内主题机制,非 prefers-color-scheme)

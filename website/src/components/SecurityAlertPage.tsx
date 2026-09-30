@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
 import type { Messages } from "@/lib/locales";
@@ -106,7 +107,7 @@ export default function SecurityAlertPage() {
             </p>
             <div className="mt-6 flex flex-wrap gap-3">
               <a
-                href="/#download"
+                href={withBase("/#download")}
                 className="inline-flex items-center gap-2 rounded-lg bg-gradient-to-r from-brand-sky to-brand-cyan px-5 py-2.5 text-sm font-semibold text-white hover:opacity-90 transition-opacity"
               >
                 {t("securityAlert.downloadCta")}

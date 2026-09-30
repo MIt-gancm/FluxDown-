@@ -1,4 +1,5 @@
 ---
+import { BASE, withBase } from "@/lib/base";
 /**
  * 文档索引页(静态预渲染,en/zh 各一条路由)。
  * 布局:2026 bento 风格 —— hero 渐变大标题 + 跨尺寸分区拼贴 + 社区共建条,
@@ -23,8 +24,8 @@ const all = await getCollection("docs");
 const { groups } = buildDocsNav(all, lang);
 
 const site = Astro.site ?? new URL("https://fluxdown.zerx.dev");
-const enUrl = new URL("/docs/en/", site).href;
-const zhUrl = new URL("/docs/zh/", site).href;
+const enUrl = new URL(withBase("/docs/en/"), site).href;
+const zhUrl = new URL(withBase("/docs/zh/"), site).href;
 const alternates = [
   { lang: "en", href: enUrl },
   { lang: "zh", href: zhUrl },
@@ -116,7 +117,7 @@ const SECTION_META: Record<
         </p>
         <div class="mt-7 flex flex-wrap items-center gap-3">
           <a
-            href={`/docs/${lang}/getting-started/installation/`}
+            href={withBase(`/docs/${lang}/getting-started/installation/`)}
             class="group inline-flex items-center gap-2 rounded-full bg-gradient-to-r from-brand-sky to-brand-cyan px-5 py-2.5 text-sm font-semibold text-white shadow-lg shadow-brand-sky/20 transition-transform hover:scale-[1.03] active:scale-[0.98]"
           >
             {zh ? "快速开始" : "Get started"}
@@ -182,7 +183,7 @@ const SECTION_META: Record<
                   {g.items.map((item) => (
                     <li>
                       <a
-                        href={item.href}
+                        href={withBase(item.href)}
                         class="group/link flex items-center justify-between rounded-lg px-2.5 py-1.5 text-sm text-dark-text-secondary transition-colors hover:bg-dark-surface2 hover:text-brand-sky"
                       >
                         <span>
@@ -222,13 +223,13 @@ const SECTION_META: Record<
         </div>
         <div class="flex shrink-0 flex-wrap gap-3">
           <a
-            href={`/docs/${lang}/contributing/translations/`}
+            href={withBase(`/docs/${lang}/contributing/translations/`)}
             class="rounded-full border border-brand-sky/30 bg-brand-sky/10 px-4 py-2 text-sm font-medium text-brand-sky transition-colors hover:bg-brand-sky/20"
           >
             {zh ? "参与翻译 →" : "Translate FluxDown →"}
           </a>
           <a
-            href={`/docs/${lang}/contributing/docs/`}
+            href={withBase(`/docs/${lang}/contributing/docs/`)}
             class="rounded-full border border-dark-border bg-dark-surface2/60 px-4 py-2 text-sm font-medium text-dark-text-secondary transition-colors hover:text-dark-text"
           >
             {zh ? "贡献指南 →" : "Contribution guide →"}
@@ -240,11 +241,11 @@ const SECTION_META: Record<
   <Footer client:load />
 
   <!-- 语言切换(navbar 岛)在 docs 下改为路由跳转而非原地换文案(设计决策 B2) -->
-  <script is:inline define:vars={{ pageLang: lang }}>
+  <script is:inline define:vars={{ pageLang: lang, docsBase: BASE }}>
     window.addEventListener("locale-change", function (e) {
       var target = e.detail && e.detail.locale;
       if (target && target !== pageLang) {
-        location.href = "/docs/" + target + "/";
+        location.href = docsBase + "/docs/" + target + "/";
       }
     });
   </script>

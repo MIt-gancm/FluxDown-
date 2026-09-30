@@ -1,3 +1,4 @@
+import { withBase } from "@/lib/base";
 import { useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import { useLocale } from "@/lib/i18n";
@@ -21,8 +22,8 @@ interface PricingData {
   loginEnabled: boolean;
 }
 
-const LOGIN_URL = "/api/auth/github?returnTo=/pricing/vote";
-const LOGOUT_URL = "/api/auth/logout?returnTo=/pricing/vote";
+const LOGIN_URL = withBase("/api/auth/github?returnTo=/pricing/vote");
+const LOGOUT_URL = withBase("/api/auth/logout?returnTo=/pricing/vote");
 
 const POLL_PLANS: { key: Plan; accent: string }[] = [
   { key: "lifetime", accent: "#38bdf8" },
@@ -82,7 +83,7 @@ export default function PricingVotePage() {
       // no window
     }
 
-    fetch("/api/pricing-vote")
+    fetch(withBase("/api/pricing-vote"))
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
@@ -106,7 +107,7 @@ export default function PricingVotePage() {
       setStatusMsg(null);
 
       try {
-        const res = await fetch("/api/pricing-vote", {
+        const res = await fetch(withBase("/api/pricing-vote"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ action: "vote", plan, option }),
@@ -175,7 +176,7 @@ export default function PricingVotePage() {
     setCommentMsg(null);
 
     try {
-      const res = await fetch("/api/pricing-vote", {
+      const res = await fetch(withBase("/api/pricing-vote"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ action: "comment", message: trimmed }),
@@ -228,7 +229,7 @@ export default function PricingVotePage() {
           className="text-center mb-10 sm:mb-12"
         >
           <a
-            href="/pricing"
+            href={withBase("/pricing")}
             className="inline-flex items-center gap-1.5 text-sm text-dark-text-muted hover:text-dark-text transition-colors mb-6"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
