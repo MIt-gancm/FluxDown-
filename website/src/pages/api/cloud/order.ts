@@ -8,6 +8,7 @@
 
 import type { APIRoute } from "astro";
 import { cloudBase, forwardJson } from "@/lib/cloud-proxy";
+import { getClientIp } from "@/lib/client-ip";
 
 export const prerender = false;
 
@@ -19,13 +20,13 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Forwarded-For": clientAddress,
+      "X-Forwarded-For": getClientIp(request, clientAddress),
     },
     body,
   });
 };
 
-export const GET: APIRoute = async ({ url, clientAddress }) => {
+export const GET: APIRoute = async ({ url, request, clientAddress }) => {
   const base = cloudBase();
   if (!base) return new Response("Not Configured", { status: 502 });
   const orderNo = url.searchParams.get("orderNo") ?? "";
@@ -39,6 +40,6 @@ export const GET: APIRoute = async ({ url, clientAddress }) => {
   const target = `${base}/api/v1/orders/web/${encodeURIComponent(orderNo)}?account=${encodeURIComponent(account)}`;
   return forwardJson(target, {
     method: "GET",
-    headers: { "X-Forwarded-For": clientAddress },
+    headers: { "X-Forwarded-For": getClientIp(request, clientAddress) },
   });
 };

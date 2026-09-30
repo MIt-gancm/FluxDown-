@@ -1,5 +1,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { getClientIp } from "@/lib/client-ip";
+import { filterTrustedRecords } from "@/lib/gh-owner";
 
 export const prerender = false;
 
@@ -92,7 +94,11 @@ async function findOrCreateIssue(): Promise<number> {
 
 interface GitHubComment {
   body: string;
+  user?: { login?: string | null } | null;
 }
+
+// 记录评论的固定首行；其他评论（含第三方伪造）不参与统计。
+const RECORD_HEADINGS = ["### Vote"] as const;
 
 async function fetchAllComments(issueNumber: number): Promise<GitHubComment[]> {
   const all: GitHubComment[] = [];
@@ -115,7 +121,7 @@ async function fetchAllComments(issueNumber: number): Promise<GitHubComment[]> {
     page++;
   }
 
-  return all;
+  return filterTrustedRecords(all, RECORD_HEADINGS);
 }
 
 function parseVoteFromComment(body: string): VoteComment | null {
@@ -198,7 +204,7 @@ export const GET: APIRoute = async () => {
 };
 
 export const POST: APIRoute = async ({ request, clientAddress }) => {
-  const ip = clientAddress || "unknown";
+  const ip = getClientIp(request, clientAddress);
 
   if (isRateLimited(ip)) {
     return new Response(JSON.stringify({ error: "Too many requests" }), {

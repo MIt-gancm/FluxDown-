@@ -20,6 +20,7 @@
 
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { getCached, setCached } from "@/lib/api-cache";
 import { ossConfigured, presignOssUrl, releaseObjectKey } from "@/lib/oss";
 
 export const prerender = false;
@@ -45,17 +46,20 @@ const GITHUB_HEADERS: Record<string, string> = {
   ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
 };
 
-// ── OSS 探测缓存：对象一经上传不可变，命中缓存 1h；未命中/不可达 60s 后重探 ──
+// ── OSS 探测缓存：命中缓存 1h；未命中/不可达/大小不符 60s 后重探 ──
+// 补发（同 tag 重新打包）会覆盖 GitHub 资产，而 OSS 上传失败时旧对象仍在，
+// 所以「存在」必须连同大小一并核对，缓存键也带上期望大小。
 const ossProbeCache = new Map<string, { until: number; present: boolean }>();
 const OSS_PROBE_HIT_TTL = 60 * 60 * 1000;
 const OSS_PROBE_MISS_TTL = 60 * 1000;
 /** 预签名下载 URL 有效期（秒）。 */
 const OSS_URL_TTL_SEC = 60 * 60;
 
-/** OSS 是否持有该对象（预签名 HEAD，带缓存与 2.5s 超时）；任何失败视为未持有。 */
-async function ossHasAsset(key: string): Promise<boolean> {
+/** OSS 是否持有与 GitHub 资产大小一致的对象（预签名 HEAD，带缓存与 2.5s 超时）；任何失败视为未持有。 */
+async function ossHasAsset(key: string, expectedSize: number): Promise<boolean> {
   const now = Date.now();
-  const cached = ossProbeCache.get(key);
+  const cacheKey = `${key}#${expectedSize}`;
+  const cached = ossProbeCache.get(cacheKey);
   if (cached && now < cached.until) return cached.present;
   let present = false;
   try {
@@ -63,34 +67,59 @@ async function ossHasAsset(key: string): Promise<boolean> {
       method: "HEAD",
       signal: AbortSignal.timeout(2500),
     });
-    present = res.ok;
+    const len = Number(res.headers.get("content-length"));
+    present = res.ok && Number.isFinite(len) && len === expectedSize;
   } catch {
     // OSS 不可达 → false，调用方回退 GitHub
   }
-  ossProbeCache.set(key, {
+  ossProbeCache.set(cacheKey, {
     until: now + (present ? OSS_PROBE_HIT_TTL : OSS_PROBE_MISS_TTL),
     present,
   });
   return present;
 }
 
+// ── GitHub release 查询缓存：下载与自更新每个分段都会打到本路由，不能每次回源 ──
+const RELEASE_CACHE_TTL = 2 * 60 * 1000;
+const GITHUB_TIMEOUT_MS = 8000;
+const inflight = new Map<string, Promise<unknown>>();
+
+/** 成功结果缓存（webhook 的 bustApiCaches 会清掉）并合并并发回源；失败不缓存。 */
+async function cachedLookup<T>(key: string, load: () => Promise<T>): Promise<T> {
+  const hit = getCached<{ v: T }>(key, RELEASE_CACHE_TTL);
+  if (hit) return hit.v;
+  let p = inflight.get(key) as Promise<T> | undefined;
+  if (!p) {
+    p = load()
+      .then((v) => {
+        setCached(key, { v });
+        return v;
+      })
+      .finally(() => inflight.delete(key));
+    inflight.set(key, p);
+  }
+  return p;
+}
+
 /**
  * 通过 tag 名称获取指定 release。
  * GitHub API: GET /repos/{owner}/{repo}/releases/tags/{tag}
  */
-async function fetchReleaseByTag(tag: string): Promise<GitHubRelease | null> {
-  const res = await fetch(
-    `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${encodeURIComponent(tag)}`,
-    { headers: GITHUB_HEADERS },
-  );
+function fetchReleaseByTag(tag: string): Promise<GitHubRelease | null> {
+  return cachedLookup(`download:tag:${tag}`, async () => {
+    const res = await fetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${encodeURIComponent(tag)}`,
+      { headers: GITHUB_HEADERS, signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS) },
+    );
 
-  if (res.status === 404) return null;
+    if (res.status === 404) return null;
 
-  if (!res.ok) {
-    throw new Error(`GitHub API error ${res.status}: ${await res.text()}`);
-  }
+    if (!res.ok) {
+      throw new Error(`GitHub API error ${res.status}: ${await res.text()}`);
+    }
 
-  return res.json() as Promise<GitHubRelease>;
+    return (await res.json()) as GitHubRelease;
+  });
 }
 
 /**
@@ -101,16 +130,18 @@ async function fetchReleaseByTag(tag: string): Promise<GitHubRelease | null> {
 async function fetchLatestReleaseWithAsset(
   filename: string,
 ): Promise<GitHubRelease | null> {
-  const res = await fetch(
-    `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30`,
-    { headers: GITHUB_HEADERS },
-  );
+  const releases = await cachedLookup("download:releases", async () => {
+    const res = await fetch(
+      `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=30`,
+      { headers: GITHUB_HEADERS, signal: AbortSignal.timeout(GITHUB_TIMEOUT_MS) },
+    );
 
-  if (!res.ok) {
-    throw new Error(`GitHub API error ${res.status}: ${await res.text()}`);
-  }
+    if (!res.ok) {
+      throw new Error(`GitHub API error ${res.status}: ${await res.text()}`);
+    }
 
-  const releases: GitHubRelease[] = await res.json();
+    return (await res.json()) as GitHubRelease[];
+  });
   return (
     releases.find(
       (r) =>
@@ -198,7 +229,7 @@ export const GET: APIRoute = async ({ params, url }) => {
     // ── 3. 优先 OSS，缺失/不可达回退 GitHub；?source=github 强制直连 ──
     if (url.searchParams.get("source") !== "github" && ossConfigured) {
       const key = releaseObjectKey(release.tag_name, filename);
-      if (await ossHasAsset(key)) {
+      if (await ossHasAsset(key, asset.size)) {
         return redirectTo(presignOssUrl("GET", key, OSS_URL_TTL_SEC), "oss");
       }
     }

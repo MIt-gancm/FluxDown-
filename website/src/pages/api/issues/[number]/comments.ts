@@ -16,6 +16,7 @@
 
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { getClientIp } from "@/lib/client-ip";
 
 export const prerender = false;
 
@@ -49,7 +50,7 @@ setInterval(() => {
 // ── Handler ──
 
 export const POST: APIRoute = async ({ params, request, clientAddress }) => {
-  const ip = clientAddress || "unknown";
+  const ip = getClientIp(request, clientAddress);
 
   // 速率限制
   if (isRateLimited(ip)) {

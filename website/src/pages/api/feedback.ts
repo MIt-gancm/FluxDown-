@@ -23,6 +23,7 @@
 
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { getClientIp } from "@/lib/client-ip";
 
 export const prerender = false;
 
@@ -73,7 +74,7 @@ const TYPE_EMOJI: Record<string, string> = {
 
 export const POST: APIRoute = async ({ request, clientAddress }) => {
   // Astro SSR 的 clientAddress 由适配器（Vercel）从底层正确解析
-  const ip = clientAddress || "unknown";
+  const ip = getClientIp(request, clientAddress);
 
   // 速率限制
   if (isRateLimited(ip)) {

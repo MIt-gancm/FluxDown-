@@ -19,6 +19,10 @@ import {
   SPONSOR_WALL_ISSUE,
 } from "astro:env/server";
 
+import { getTokenOwnerLogin } from "@/lib/gh-owner";
+import type { RecordComment } from "@/lib/record-filter";
+import { parseSponsorComment, type ParsedSponsor, type WallSponsor } from "@/lib/sponsor-record";
+
 export const prerender = false;
 
 const JSON_HEADERS = {
@@ -29,60 +33,7 @@ const JSON_HEADERS = {
 const LATEST_COUNT = 20;
 const CACHE_TTL = 5 * 60_000;
 
-export interface WallSponsor {
-  name: string;
-  avatar: string | null;
-  amountCents: number;
-  date: string; // YYYY-MM-DD (sponsor time, Asia/Shanghai)
-  message: string | null; // sponsor blockquote message, if any
-}
-
-interface ParsedSponsor extends WallSponsor {
-  ts: number; // epoch ms for ordering
-}
-
-// ---------- Comment parsing ----------
-
-const HEADING_RE =
-  /^###\s+(?:<img[^>]*src="([^"]+)"[^>]*>\s*)?💖\s*(.+?)\s*$/m;
-const AMOUNT_RE = /`¥\s*([\d.]+)`/;
-const DATE_RE = /·\s*(\d{4}-\d{2}-\d{2})/;
-
-function parseComment(c: {
-  body?: string;
-  created_at?: string;
-}): ParsedSponsor | null {
-  const body = c.body ?? "";
-  const heading = body.match(HEADING_RE);
-  if (!heading) return null;
-
-  const name = (heading[2] ?? "").replace(/\u200b/g, "").trim();
-  if (!name) return null;
-
-  const amountRaw = body.match(AMOUNT_RE)?.[1];
-  const amountCents = amountRaw ? Math.round(parseFloat(amountRaw) * 100) : 0;
-
-  // Message = the blockquote lines the wall writer emits between heading and
-  // the `¥amount · date` footer (each prefixed with "> ").
-  const message =
-    body
-      .split("\n")
-      .filter((l) => /^>\s?/.test(l))
-      .map((l) => l.replace(/^>\s?/, ""))
-      .join("\n")
-      .trim() || null;
-
-  const createdAt = c.created_at ?? "";
-  const date = body.match(DATE_RE)?.[1] ?? createdAt.slice(0, 10);
-  // 赞助日期（迁移评论的 created_at 是迁移时间，正文日期才是真实时间）；
-  // 同日多笔用评论时间细分先后。
-  const dayTs = Date.parse(date);
-  const ts = Number.isFinite(dayTs)
-    ? dayTs + ((Date.parse(createdAt) || 0) % 86_400_000)
-    : Date.parse(createdAt) || 0;
-
-  return { name, avatar: heading[1] ?? null, amountCents, date, message, ts };
-}
+export type { WallSponsor };
 
 // ---------- Cache ----------
 
@@ -90,6 +41,11 @@ let cache: { sponsors: WallSponsor[]; expiry: number } | null = null;
 
 async function fetchSponsors(): Promise<WallSponsor[]> {
   const all: ParsedSponsor[] = [];
+  const owner = (await getTokenOwnerLogin()).toLowerCase();
+  // 只信任 token 持有者（本站 / 迁移脚本）发出的评论；首行格式由 parseSponsorComment 校验。
+  const trusted = (c: RecordComment) =>
+    c.user?.login?.toLowerCase() === owner &&
+    !(c.body ?? "").includes("Website visitor reply");
   // 名录量级很小；最多翻 3 页（300 条）足够覆盖「最新 20」。
   for (let page = 1; page <= 3; page += 1) {
     const res = await fetch(
@@ -105,12 +61,12 @@ async function fetchSponsors(): Promise<WallSponsor[]> {
     if (!res.ok) {
       throw new Error(`GitHub ${res.status}`);
     }
-    const comments = (await res.json()) as {
-      body?: string;
+    const comments = (await res.json()) as (RecordComment & {
       created_at?: string;
-    }[];
+    })[];
     for (const c of comments) {
-      const parsed = parseComment(c);
+      if (!trusted(c)) continue;
+      const parsed = parseSponsorComment(c as { body?: string; created_at?: string });
       if (parsed) all.push(parsed);
     }
     if (comments.length < 100) break;

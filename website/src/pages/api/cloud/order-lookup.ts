@@ -5,6 +5,7 @@
 
 import type { APIRoute } from "astro";
 import { cloudBase, forwardJson } from "@/lib/cloud-proxy";
+import { getClientIp } from "@/lib/client-ip";
 
 export const prerender = false;
 
@@ -16,7 +17,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Forwarded-For": clientAddress,
+      "X-Forwarded-For": getClientIp(request, clientAddress),
     },
     body,
   });

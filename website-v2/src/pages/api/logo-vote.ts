@@ -1,5 +1,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { getClientIp } from "@/lib/client-ip";
+import { filterTrustedRecords } from "@/lib/gh-owner";
 
 export const prerender = false;
 
@@ -98,6 +100,7 @@ interface GHIssue {
 interface GHComment {
   id: number;
   body: string;
+  user?: { login?: string | null } | null;
 }
 
 /** Fetch with simple retry (up to 3 attempts, 500 ms back-off). */
@@ -120,6 +123,9 @@ async function fetchWithRetry(
   }
   throw lastErr;
 }
+
+// 记录评论的固定首行；其他评论（含第三方伪造）不参与统计。
+const RECORD_HEADINGS = ["### Logo Vote Record"] as const;
 
 /**
  * Fetch ALL comments for an issue (handles pagination), with retry.
@@ -145,30 +151,54 @@ async function fetchAllComments(issueNumber: number): Promise<GHComment[]> {
     if (batch.length < 100) break;
     page++;
   }
-  return all;
+  return filterTrustedRecords(all, RECORD_HEADINGS);
+}
+
+const VOTES_ISSUE_LABEL = "logo-vote-records";
+
+/** 列表请求失败抛错：落到「新建」分支会再造一个同名 issue。 */
+async function listOpenIssues(query: string): Promise<GHIssue[]> {
+  const res = await fetchWithRetry(
+    `https://api.github.com/repos/${GITHUB_REPO}/issues?${query}`,
+    { headers: ghHeaders() },
+  );
+  if (!res.ok) throw new Error(`Failed to list votes issues: ${res.status}`);
+  const issues: GHIssue[] = await res.json();
+  if (!Array.isArray(issues)) throw new Error("Failed to list votes issues");
+  return issues;
 }
 
 /**
- * Find the single votes-tracking issue by title.
- * Returns null if not found (caller decides whether to create).
+ * Find the single votes-tracking issue: by label first, then (for records
+ * created before the label existed) by title, labelling what it finds.
+ * Returns null only when the lookup succeeded and nothing exists.
  */
 async function findVotesIssue(): Promise<number | null> {
-  // Search open issues page by page (max 2 pages = 200 issues)
-  for (let page = 1; page <= 2; page++) {
-    let res: Response;
-    try {
-      res = await fetchWithRetry(
-        `https://api.github.com/repos/${GITHUB_REPO}/issues?state=open&per_page=100&page=${page}`,
-        { headers: ghHeaders() },
-      );
-    } catch {
-      return null;
+  const labeled = await listOpenIssues(
+    `labels=${VOTES_ISSUE_LABEL}&state=open&per_page=1`,
+  );
+  if (labeled.length > 0) return labeled[0].number;
+
+  for (let page = 1; page <= 10; page++) {
+    const issues = await listOpenIssues(`state=open&per_page=100&page=${page}`);
+    const found = issues.find(
+      (i) => i.title === VOTES_ISSUE_TITLE && !(i as { pull_request?: unknown }).pull_request,
+    );
+    if (found) {
+      try {
+        await fetchWithRetry(
+          `https://api.github.com/repos/${GITHUB_REPO}/issues/${found.number}/labels`,
+          {
+            method: "POST",
+            headers: ghHeaders(),
+            body: JSON.stringify({ labels: [VOTES_ISSUE_LABEL] }),
+          },
+        );
+      } catch {
+        // 补标签失败不影响本次读取
+      }
+      return found.number;
     }
-    if (!res.ok) return null;
-    const issues: GHIssue[] = await res.json();
-    if (!Array.isArray(issues)) return null;
-    const found = issues.find((i) => i.title === VOTES_ISSUE_TITLE);
-    if (found) return found.number;
     if (issues.length < 100) break;
   }
   return null;
@@ -193,7 +223,7 @@ async function findOrCreateVotesIssue(): Promise<number> {
           "Each comment is a JSON record: `{ logoId, ip, action, date }`.",
           "**Do not close or rename this issue.**",
         ].join("\n"),
-        // No labels — avoids 422 when label doesn't exist in repo
+        labels: [VOTES_ISSUE_LABEL],
       }),
     },
   );
@@ -418,7 +448,7 @@ export const GET: APIRoute = async () => {
   try {
     // Run both lookups in parallel to minimize wall-clock time
     const [votesIssueNumber, submissionIssues] = await Promise.all([
-      findVotesIssue().catch(() => null),
+      findVotesIssue(),
       fetchSubmissionIssues().catch(() => [] as GHIssue[]),
     ]);
 
@@ -486,7 +516,7 @@ export const POST: APIRoute = async ({ request, clientAddress }) => {
     return json({ error: "Voting has ended" }, 403);
   }
 
-  const ip = clientAddress || "unknown";
+  const ip = getClientIp(request, clientAddress);
 
   if (!GITHUB_TOKEN) {
     return json({ error: "Server misconfigured" }, 500);

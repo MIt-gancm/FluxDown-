@@ -21,6 +21,8 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 
+import { getClientIp } from "@/lib/client-ip";
+
 export const prerender = false;
 
 // ── 类型 ──
@@ -109,6 +111,7 @@ async function fetchIssuesByLabel(
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
       },
+      signal: AbortSignal.timeout(10_000),
     });
 
     if (!res.ok) {
@@ -176,8 +179,54 @@ function truncateBody(body: string | null, maxLen: number = 200): string {
   return desc.slice(0, maxLen) + "...";
 }
 
-/** 获取经过过滤的 issue 列表（实时，无缓存） */
-async function fetchFilteredIssues(state: string): Promise<FilteredIssue[]> {
+// 每次请求都全量分页拉取 GitHub 会让匿名请求耗尽共享 token 的配额，
+// 所以按 state 缓存 60s（失败不缓存），并合并并发回源。
+const ISSUES_CACHE_TTL = 60_000;
+const issuesCache = new Map<string, { at: number; data: FilteredIssue[] }>();
+const issuesInflight = new Map<string, Promise<FilteredIssue[]>>();
+
+function fetchFilteredIssues(state: string): Promise<FilteredIssue[]> {
+  const hit = issuesCache.get(state);
+  if (hit && Date.now() - hit.at < ISSUES_CACHE_TTL) {
+    return Promise.resolve(hit.data);
+  }
+  let p = issuesInflight.get(state);
+  if (!p) {
+    p = loadFilteredIssues(state)
+      .then((data) => {
+        issuesCache.set(state, { at: Date.now(), data });
+        return data;
+      })
+      .finally(() => issuesInflight.delete(state));
+    issuesInflight.set(state, p);
+  }
+  return p;
+}
+
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW = 60_000;
+const RATE_LIMIT_MAX = 60;
+
+function isRateLimited(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > RATE_LIMIT_MAX;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of rateLimitMap) {
+    if (now > v.resetAt) rateLimitMap.delete(k);
+  }
+}, 5 * 60_000);
+
+/** 获取经过过滤的 issue 列表 */
+async function loadFilteredIssues(state: string): Promise<FilteredIssue[]> {
   const raw = await fetchAllFeedbackIssues(state);
 
   return (
@@ -216,7 +265,14 @@ async function fetchFilteredIssues(state: string): Promise<FilteredIssue[]> {
   );
 }
 
-export const GET: APIRoute = async ({ url }) => {
+export const GET: APIRoute = async ({ url, request, clientAddress }) => {
+  if (isRateLimited(getClientIp(request, clientAddress))) {
+    return new Response(JSON.stringify({ error: "Too many requests" }), {
+      status: 429,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
   const stateParam = url.searchParams.get("state")?.trim() || "all";
   const labelParam = url.searchParams.get("label")?.trim() || "";
   const query = url.searchParams.get("q")?.trim() || "";

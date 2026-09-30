@@ -12,6 +12,8 @@ import {
 } from "astro:env/server";
 import { withBase } from "@/lib/base";
 
+import { isSafeLocalPath } from "@/lib/return-to";
+
 export const SESSION_COOKIE = "fluxdown_gh_session";
 export const STATE_COOKIE = "fluxdown_gh_oauth_state";
 
@@ -105,6 +107,6 @@ export function clearSession(cookies: AstroCookies): void {
 
 /** returnTo 只允许站内相对路径，防开放跳转 */
 export function safeReturnTo(raw: string | null): string {
-  if (raw && raw.startsWith("/") && !raw.startsWith("//")) return raw;
+  if (isSafeLocalPath(raw)) return raw;
   return withBase("/pricing/");
 }

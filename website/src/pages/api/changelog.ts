@@ -7,7 +7,7 @@
  * Query params:
  *   page     - 页码，从 1 开始，默认 1
  *   per_page - 每页条数，默认 10，最大 100
- *   since    - 可选，起始版本号（含），如 "v0.0.2" 或 "0.0.2"
+ *   since    - 可选，起始版本号（不含，仅返回严格更新的版本），如 "v0.0.2" 或 "0.0.2"
  *   channel  - 可选，更新渠道：stable（默认，仅稳定版 vX.Y.Z）
  *              或 frontier（仅预览预发布版 vX.Y.Z-rc.N）
  *
@@ -28,7 +28,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
 import { getCached, setCached } from "../../lib/api-cache";
-import { stripReleaseHeader } from "@/lib/release-assets";
+import { cmpReleaseTag, stripReleaseHeader } from "@/lib/release-assets";
 
 export const prerender = false;
 
@@ -69,31 +69,6 @@ interface FilteredRelease {
   /** 是否为预览预发布版（GitHub prerelease，tag 形如 vX.Y.Z-rc.N） */
   prerelease: boolean;
   assets: ReleaseAsset[];
-}
-
-/** 将 tag 转为可比较的版本数组，如 "v0.0.3" / "cli-v0.0.3" → [0, 0, 3] */
-function parseVersion(tag: string): number[] {
-  return tag
-    // 去掉组件前缀（cli- / mobile- / server- / extension- / website-）再去掉 v
-    .replace(/^(cli|mobile|server|extension|website)-/, "")
-    .replace(/^v/, "")
-    .split(".")
-    .map((s) => {
-      const n = parseInt(s, 10);
-      return isNaN(n) ? 0 : n;
-    });
-}
-
-/** 比较两个版本：a >= b 返回 true */
-function versionGte(a: number[], b: number[]): boolean {
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i++) {
-    const va = a[i] ?? 0;
-    const vb = b[i] ?? 0;
-    if (va > vb) return true;
-    if (va < vb) return false;
-  }
-  return true;
 }
 
 /** 解析 GitHub Link header 中的 next URL */
@@ -229,15 +204,17 @@ async function getCachedReleases(
     setCached(CACHE_KEY, all);
   }
 
-  // 渠道切分：稳定版 tab 只看正式版，预览版 tab 只看 rc 预发布
-  let releases = all.filter((r) =>
-    channel === "frontier" ? r.prerelease : !r.prerelease,
-  );
-
+  // 带 since 的查询是客户端「更新说明」：候选池与 /api/release 一致（frontier 含正式版），
+  // 只保留严格新于 since 的版本，按 SemVer 比较（-rc 低于同号正式版）。
+  // 不带 since 的官网 changelog 页保持分 tab 语义：稳定版只看正式版，预览版只看 rc 预发布。
+  let releases: FilteredRelease[];
   if (since) {
-    const sinceVer = parseVersion(since);
-    releases = releases.filter((r) =>
-      versionGte(parseVersion(r.tag), sinceVer),
+    releases = all
+      .filter((r) => channel === "frontier" || !r.prerelease)
+      .filter((r) => cmpReleaseTag(r.tag, since) > 0);
+  } else {
+    releases = all.filter((r) =>
+      channel === "frontier" ? r.prerelease : !r.prerelease,
     );
   }
 

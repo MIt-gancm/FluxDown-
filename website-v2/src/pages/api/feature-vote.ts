@@ -1,5 +1,7 @@
 import type { APIRoute } from "astro";
 import { GITHUB_TOKEN, GITHUB_REPO } from "astro:env/server";
+import { getClientIp } from "@/lib/client-ip";
+import { filterTrustedRecords } from "@/lib/gh-owner";
 
 export const prerender = false;
 
@@ -57,6 +59,7 @@ interface GHIssue {
 interface GHComment {
   id: number;
   body: string;
+  user?: { login?: string | null } | null;
 }
 
 function labelNames(issue: GHIssue): string[] {
@@ -83,6 +86,9 @@ async function fetchWithRetry(
   throw lastErr;
 }
 
+// 记录评论的固定首行；其他评论（含第三方伪造）不参与统计。
+const RECORD_HEADINGS = ["### Feature Vote Record"] as const;
+
 /**
  * Fetch comments for an issue (paginated, capped at 10 pages = 1000 records
  * to bound worst-case API usage). Returns [] on error.
@@ -107,7 +113,7 @@ async function fetchAllComments(issueNumber: number): Promise<GHComment[]> {
     if (batch.length < 100) break;
     page++;
   }
-  return all;
+  return filterTrustedRecords(all, RECORD_HEADINGS);
 }
 
 /**
@@ -157,33 +163,74 @@ function isRateLimitedResponse(res: Response): boolean {
   );
 }
 
-// The tracking issue never moves once discovered — cache its number for the
-// lifetime of the serverless instance to save up to 3 list calls per request.
-let votesIssueNumberCache: number | null = null;
+// 记录 issue 用协作者才能加的标签定位：按创建时间翻页找标题会在 open issue 增多后
+// 落出窗口而重复新建，已有投票随之丢失。
+const VOTES_ISSUE_LABEL = "feature-vote-records";
 
-/** Find or lazily create the single votes-tracking issue. */
-async function findOrCreateVotesIssue(): Promise<number> {
-  if (votesIssueNumberCache !== null) return votesIssueNumberCache;
-  // Search open issues for the tracking issue by exact title.
-  for (let page = 1; page <= 3; page++) {
-    let res: Response;
-    try {
-      res = await fetchWithRetry(
-        `https://api.github.com/repos/${GITHUB_REPO}/issues?state=open&per_page=100&page=${page}`,
-        { headers: ghHeaders() },
+// 记录 issue 一旦确定不再变化，进程内缓存（升序；最后一个是写入目标）。
+let votesIssueNumbersCache: number[] | null = null;
+
+/** 列表请求失败必须抛错：落到「新建」分支会再造一个同名 issue。 */
+async function listIssuesPage(query: string): Promise<GHIssue[]> {
+  const res = await fetchWithRetry(
+    `https://api.github.com/repos/${GITHUB_REPO}/issues?${query}`,
+    { headers: ghHeaders() },
+  );
+  if (!res.ok) {
+    throw new Error(`Failed to list votes issues: ${res.status}`);
+  }
+  const issues: GHIssue[] = await res.json();
+  if (!Array.isArray(issues)) throw new Error("Failed to list votes issues");
+  return issues.filter((i) => !i.pull_request);
+}
+
+/**
+ * 所有记录 issue（升序）。历史上因重复新建可能有多个，读取时合并，
+ * 逐 IP 「最后一次操作生效」的重放在按序合并后语义不变。
+ */
+async function findOrCreateVotesIssues(): Promise<number[]> {
+  if (votesIssueNumbersCache !== null) return votesIssueNumbersCache;
+
+  const labeled: GHIssue[] = [];
+  for (let page = 1; page <= 5; page++) {
+    const batch = await listIssuesPage(
+      `labels=${VOTES_ISSUE_LABEL}&state=open&per_page=100&page=${page}`,
+    );
+    labeled.push(...batch);
+    if (batch.length < 100) break;
+  }
+
+  if (labeled.length === 0) {
+    // 迁移：旧记录 issue 尚未打标签，按标题找出（含历史重复）并补标签。
+    const legacy: GHIssue[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const batch = await listIssuesPage(
+        `state=open&per_page=100&page=${page}`,
       );
-    } catch {
-      break;
+      legacy.push(...batch.filter((i) => i.title === VOTES_ISSUE_TITLE));
+      if (batch.length < 100) break;
     }
-    if (!res.ok) break;
-    const issues: GHIssue[] = await res.json();
-    if (!Array.isArray(issues)) break;
-    const hit = issues.find((i) => i.title === VOTES_ISSUE_TITLE);
-    if (hit) {
-      votesIssueNumberCache = hit.number;
-      return hit.number;
+    for (const i of legacy) {
+      try {
+        await fetchWithRetry(
+          `https://api.github.com/repos/${GITHUB_REPO}/issues/${i.number}/labels`,
+          {
+            method: "POST",
+            headers: ghHeaders(),
+            body: JSON.stringify({ labels: [VOTES_ISSUE_LABEL] }),
+          },
+        );
+      } catch {
+        // 补标签失败不影响本次读取；下次冷启动会再按标题找到
+      }
     }
-    if (issues.length < 100) break;
+    labeled.push(...legacy);
+  }
+
+  if (labeled.length > 0) {
+    const numbers = labeled.map((i) => i.number).sort((a, b) => a - b);
+    votesIssueNumbersCache = numbers;
+    return numbers;
   }
 
   const res = await fetchWithRetry(
@@ -200,6 +247,7 @@ async function findOrCreateVotesIssue(): Promise<number> {
           "Each comment is a JSON record: `{ featureId, ip, action, date }`.",
           "**Do not close or rename this issue.**",
         ].join("\n"),
+        labels: [VOTES_ISSUE_LABEL],
       }),
     },
   );
@@ -209,8 +257,14 @@ async function findOrCreateVotesIssue(): Promise<number> {
     throw new Error(`Failed to create votes issue: ${res.status} ${text}`);
   }
   const created: GHIssue = await res.json();
-  votesIssueNumberCache = created.number;
-  return created.number;
+  votesIssueNumbersCache = [created.number];
+  return votesIssueNumbersCache;
+}
+
+/** 写入目标：最新的记录 issue。 */
+async function findOrCreateVotesIssue(): Promise<number> {
+  const numbers = await findOrCreateVotesIssues();
+  return numbers[numbers.length - 1];
 }
 
 // ─────────────────────────────────────────────
@@ -285,8 +339,10 @@ async function loadVoteRecords(): Promise<VoteRecord[]> {
   if (recordsCache && Date.now() - recordsCache.timestamp < CACHE_TTL) {
     return recordsCache.records;
   }
-  const votesIssueNumber = await findOrCreateVotesIssue();
-  const comments = await fetchAllComments(votesIssueNumber);
+  const issueNumbers = await findOrCreateVotesIssues();
+  const comments = (
+    await Promise.all(issueNumbers.map((n) => fetchAllComments(n)))
+  ).flat();
   const records = comments
     .map((c) => parseVoteComment(c.body))
     .filter((r): r is VoteRecord => r !== null);
@@ -494,7 +550,7 @@ export const GET: APIRoute = async () => {
 // ─────────────────────────────────────────────
 
 export const POST: APIRoute = async ({ request, clientAddress }) => {
-  const ip = clientAddress || "unknown";
+  const ip = getClientIp(request, clientAddress);
 
   if (!GITHUB_TOKEN) {
     return json({ error: "Server misconfigured" }, 500);
@@ -605,7 +661,7 @@ async function handleVote(
       if (commentRes.status === 404) {
         // Tracking issue vanished (deleted/transferred) — drop the cached
         // number so the next attempt re-discovers or re-creates it.
-        votesIssueNumberCache = null;
+        votesIssueNumbersCache = null;
         recordsCache = null;
       }
       if (isRateLimitedResponse(commentRes)) {

@@ -24,6 +24,7 @@ import {
   claimWallPost,
   releaseWallPost,
 } from "@/lib/pay";
+import { getClientIp } from "@/lib/client-ip";
 
 export const prerender = false;
 
@@ -62,6 +63,7 @@ setInterval(() => {
 function cleanName(raw: unknown): string {
   if (typeof raw !== "string") return "";
   return raw
+    .replace(/[`¥·#<>]/g, "")
     .replace(/\s+/g, " ")
     .replace(/@/g, "@\u200b")
     .trim()
@@ -93,7 +95,7 @@ function err(status: number, message: string): Response {
 // ---------- Handler ----------
 
 export const POST: APIRoute = async ({ request, clientAddress }) => {
-  const ip = clientAddress || "unknown";
+  const ip = getClientIp(request, clientAddress);
   if (isRateLimited(ip)) {
     return err(429, "Too many requests");
   }
