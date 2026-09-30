@@ -1,6 +1,6 @@
 /**
  * 文档中心共享常量:源码仓库路径、hreflang 簇、分区图标。
- * 文档源文件在 GitHub 上位于 `website/src/content/docs/<lang>/<slug>.md`。
+ * 文档源文件在 GitHub 上位于 `website-v2/src/content/docs/<lang>/<slug>.md`。
  */
 import {
   Braces,
@@ -17,7 +17,7 @@ import { SITE_URL } from "@/lib/seo";
 import { GITHUB_URL } from "@/lib/site-nav";
 import type { SectionId } from "@/lib/docs-nav";
 
-const DOCS_SOURCE = "website/src/content/docs";
+const DOCS_SOURCE = "website-v2/src/content/docs";
 
 export const SECTION_ICONS: Record<SectionId, LucideIcon> = {
   "getting-started": Rocket,

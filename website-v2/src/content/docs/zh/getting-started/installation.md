@@ -3,7 +3,7 @@ title: 安装
 description: 在 Windows、macOS 或 Linux 上安装 FluxDown,完成首次启动配置。
 section: getting-started
 order: 1
-sourceHash: "e43ecbaa51d1"
+sourceHash: "0286acf9dcec"
 ---
 
 FluxDown 为 Windows、macOS、Linux 三大平台提供完整的原生构建,每个安装包内置相同的 Rust 下载引擎与相同的界面——没有"精简版",也不需要注册账号。
@@ -20,7 +20,7 @@ FluxDown 为 Windows、macOS、Linux 三大平台提供完整的原生构建,每
 
 从[下载页](/#download)获取安装包,x64 和 ARM64 均提供以下两种形式:
 
-- **安装版** —— `FluxDown-<版本号>-setup.exe`。标准 Inno Setup 安装向导,仅为当前用户安装(无需管理员权限)。安装过程中可勾选创建桌面快捷方式、开机自动启动、将 `.torrent` 文件关联到 FluxDown——三项默认均不勾选。
+- **安装版** —— `FluxDown-<版本号>-setup.exe`。标准 Inno Setup 安装向导,仅为当前用户安装到 `%LOCALAPPDATA%\Programs\FluxDown`,安装、更新都无需管理员权限;浏览器扩展(Native Messaging)、链接协议、`.torrent` 关联、开机自启也都只写当前用户的注册表。安装过程中可勾选创建桌面快捷方式、开机自动启动、将 `.torrent` 文件关联到 FluxDown——三项默认均不勾选。旧版本若曾选择「为所有用户安装」(装在 `Program Files`),新安装程序会提示并请求**一次**管理员权限卸载旧副本,已开启的自启、关联与链接协议会自动改指新位置,下载任务与设置保留。
 - **便携版** —— `FluxDown-<版本号>-windows-<架构>-portable.zip`。解压到任意目录后运行 `fluxdown-desktop.exe` 即可;请保持所有文件在同一目录——桌面程序会拉起同目录的 `fluxdown-agent.exe` 与 `fluxdownd.exe`。除首次启动时你主动选择的项目外,不会在解压目录之外写入任何内容。
 
 安装包未做代码签名,首次运行时 Windows SmartScreen 可能提示"未知发布者"。点击**更多信息 → 仍要运行**即可继续。

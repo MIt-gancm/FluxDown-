@@ -12,8 +12,8 @@
 #     所以「是否需要重建」按 website-v2/ 子树哈希判断，而不是比对 HEAD
 #   - 子树未变且容器在运行时快速退出，幂等可重复跑
 #   - 失败立即中止，不会留下半启动状态
-#   - 挂载前缀 SITE_BASE 默认 /v2（与 docker-compose.yml 的默认值一致）；
-#     切为根部署时设 SITE_BASE= （空串）
+#   - 挂载前缀 SITE_BASE 默认空串 = 根部署（与 docker-compose.yml 的默认值一致）；
+#     子路径部署时设 SITE_BASE=/xxx
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -24,7 +24,7 @@ REPO_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
 SUBDIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-prefix)"
 SUBDIR="${SUBDIR%/}"
 BRANCH="${DEPLOY_BRANCH:-main}"
-export SITE_BASE="${SITE_BASE-/v2}"
+export SITE_BASE="${SITE_BASE-}"
 # 部署戳放在 .git 内：不进构建上下文、不会被 reset 清掉、不会被误提交
 STAMP="$(git -C "${REPO_DIR}" rev-parse --absolute-git-dir)/fluxdown-${SUBDIR}.deployed"
 

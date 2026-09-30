@@ -1,6 +1,7 @@
-# 与 website/（v1，project=fluxdown，容器 fluxdown-website，端口 4321）并行部署，
+# 主站：与 website/（v1 旧站，project=fluxdown，容器 fluxdown-website，宿主端口 4321）并行部署，
 # project / 镜像 / 容器名 / 宿主端口都必须与 v1 区分，否则会互相覆盖。
-# 反代：https://fluxdown.zerx.dev/v2/ → 127.0.0.1:4322（保留 /v2 前缀，不要剥掉）。
+# 反代：https://fluxdown.zerx.dev/ → 127.0.0.1:4322（根部署）；/v2/ 旧预览地址由反代 301 到根。
+# 宿主端口沿用预览期分配、不与 v1 对调：两条部署流水线执行顺序不定，对调会让先部署的一方撞端口。
 name: fluxdown-v2
 services:
   website:
@@ -8,8 +9,8 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # 站点挂载前缀（构建期固化进产物）；切为根部署时设 SITE_BASE= 空串
-        SITE_BASE: ${SITE_BASE-/v2}
+        # 站点挂载前缀（构建期固化进产物）；默认空串 = 根部署，子路径部署时设 SITE_BASE=/xxx
+        SITE_BASE: ${SITE_BASE-}
     image: fluxdown-website-v2:latest
     container_name: fluxdown-website-v2
     restart: unless-stopped
@@ -33,7 +34,7 @@ services:
       - .env
     healthcheck:
       # busybox wget 会先解析 localhost 到 ::1，而 node 只监听 IPv4，必须用 127.0.0.1
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4321${SITE_BASE-/v2}/"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4321${SITE_BASE-}/"]
       interval: 30s
       timeout: 10s
       retries: 3

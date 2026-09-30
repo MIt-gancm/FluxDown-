@@ -1,7 +1,8 @@
 name: Deploy Website
 
 # 仅当 main 分支（开发分支）上 website/ 目录有变更时触发，
-# 通过 SSH 登录服务器执行 deploy.sh 重建并重启容器。
+# 通过 SSH 登录服务器执行 deploy.sh 重建并重启旧站容器
+# （旧站存档：https://fluxdown.zerx.dev/v1/ → 127.0.0.1:4321）。
 on:
   push:
     branches: [main]
