@@ -11,6 +11,7 @@ Once the server is running (see [Server Setup](/docs/en/headless-server/setup/))
 
 The login screen asks for a **server address** (pre-filled with the current origin — leave it as-is unless you're pointing at a different host) and an **access token**. On first run — when the server has not set a key yet — the page becomes an initialization wizard: set and confirm an access key (you can also generate one at random). Once a key exists, you get the normal sign-in form. The token is the key you chose during initialization, or the one shown under **Settings → Security & Access** (see [Server Setup](/docs/en/headless-server/setup/)).
 
+The Web UI manages downloads over the agent's `/rpc` WebSocket JSON-RPC, not aria2 `/jsonrpc`. Before first setup, `/download*` and `/jsonrpc` (POST/WS) return 403: set the key before using takeover or aria2. The initialization page and setup endpoints remain reachable. Browser `/rpc` connections carrying Origin must be same-origin with the service; the CORS exemption does not remove that check.
 Checking **"Remember this device"** stores the token in `localStorage` (persists across browser restarts); leaving it unchecked stores it in `sessionStorage` (cleared when the tab closes). Nothing is ever sent anywhere except to the server itself.
 
 
@@ -43,6 +44,7 @@ Status tabs (**All / Downloading / Completed / Paused / Error**) sit above the l
 
 With batch management on, every row gets a checkbox, and a bar appears with **Select all**, a running "N selected" count, and **Pause / Resume / Delete** buttons that act on the whole selection at once. Deleting from here does not delete files on disk (use the detail panel's per-task delete-with-files option for that). Click **Done** to exit batch mode.
 
+Bulk pause, resume, and delete for local tasks send the whole ID set in one `daemon.task.pauseMany`, `resumeMany`, or `deleteMany` call. The daemon deduplicates IDs, ignores unknown IDs, and publishes a consolidated task snapshot after the batch. This does not send a top-level JSON array to `/rpc`.
 ### Task detail panel
 
 Selecting a task opens the detail panel:
@@ -70,7 +72,7 @@ The **New download** dialog accepts one or more URLs (one per line — HTTP, FTP
 | User-Agent | Global default or one of a few presets. |
 | Advanced (collapsible) | Cookies, Referrer, a per-task proxy URL, and a Checksum (`algo=hexhash`, verified after the download completes). |
 
-Two buttons submit the form: **Start Download** creates the task(s) and starts them right away, while **Download Later** creates them in a paused state parked in the built-in **Download Later** queue (start them individually or start that queue when you're ready). Submitting here creates tasks directly through the management API — there is no confirmation prompt, since you're already inside a trusted, authenticated session.
+Two buttons submit the form: **Start Download** creates the task(s) and starts them right away, while **Download Later** creates them in a paused state parked in the built-in **Download Later** queue (start them individually or start that queue when you're ready). Submitting here creates tasks directly through the agent's `/rpc` (`daemon.task.create`) — there is no confirmation prompt, since you're already inside a trusted, authenticated session.
 
 <!-- TODO(screenshot): new-download dialog with the advanced options panel expanded -->
 

@@ -28,7 +28,7 @@
 - `ed2k_hashset`(task_id PK, hashes BLOB)
 - `task_artifacts`(复合 PK task_id+file_name；追踪 sidecar/产物文件供清理)
 - `rss_sources`(id PK, `provider_id`/`provider_config`（订阅 provider 适配器与其不透明配置，旧数据默认 `rss`/空）, url, name, enabled, auto_download, start_paused, queue_id, save_dir, interval_minutes, include/exclude_pattern, use_regex, smart_episode, size_min/max_bytes, send_referer, notify_on_download, max_per_fetch, cookies, user_agent, proxy_url, last_fetch_at, last_success_at, last_error, fail_count, `seeded`（首轮是否已完成）, position)
-- `rss_items`(复合 PK source_id+guid, title, link, enclosure_url/length, `resolver_item`（插件二段解析标识，空 = 普通直链）, pub_date, fetched_at, status 0..5, task_id 回链, episode_key, reason 原因码；`ON DELETE CASCADE` 于 rss_sources)
+- `rss_items`(复合 PK source_id+guid, title, link, enclosure_url/length/type（声明的下载目标 MIME）, `resolver_item`（插件二段解析标识，空 = 普通直链）, pub_date, fetched_at, status 0..5, task_id 回链, episode_key, reason 原因码；`fetch_failures` / `retry_after` 持久化种子抓取失败退避；`ON DELETE CASCADE` 于 rss_sources)
 
 **内置队列**: `main`（主）/`later`（稍后下载），播种于 `Engine::new`，不可删/改名；存量 `queue_id=''` 迁入 `main`。删除命名队列后，任务归属、排队位置与持久排序都要同步：`TaskQueueChanged` 只带归属，`QueuePositionsChanged` 只带待排位置，`TasksSnapshot` 才是 `queue_order` 归零后的权威来源。
 
@@ -49,6 +49,8 @@
 | **DASH / 音视频轨合并** | `is_dash_url` 或有 `audio_url` | `run_dash_download` | `dash_downloader.rs` |
 | **ED2K（仅下载）** | `ed2k::link::is_ed2k_url` | `ed2k::run_ed2k_download` | `ed2k/`（mod,link,proto,hash,server,peer,client,server_subscription,upnp,kad/） |
 
+- **HLS 独立音轨与封装**：master 变体的 AUDIO 组若有 `EXT-X-MEDIA` 独立 URI，`external_audio_uri` 优先选 `DEFAULT=YES` 音轨。开跑前探测可用 ffmpeg；可用时音轨与视频并行下载，各自保留续传检查点，进度汇总两轨字节，收尾经 `mux_video_audio` + `dash_downloader::ffmpeg_copy_to_mp4` 以 `-c copy`（不转码）封装 MP4。音轨下载的真实错误会取消整任务；ffmpeg 不可用时仅下载视频并写 warning 活动，mux 失败则保留视频、尝试另存音轨 sidecar 并写 warning；mux 取消保留两轨临时文件与检查点供恢复。
+- **HLS TS→MP4**：`remux_ts_to_mp4` 优先用同一 ffmpeg 流复制入口，不整文件读入内存，也不受内存转换的 192MiB 上限约束；无 ffmpeg 或执行失败才尝试有上限的 `ts2mp4` 内存转换，空间不足 / 转换失败保留 TS，取消不触发内存兜底。`EXT-X-MAP` 的 fMP4 输出不做 TS 转换，只按占名规则改名为 MP4。
 - BT 任务绕过 pending 队列，且**不计入** http/ftp 并发计数（`max_concurrent`）。
 - **BT 判定只认 `magnet:` 与 `torrent-file://` 哨兵**（`is_bt_url`）。HTTP 的
   `.torrent` **直链不会走 BT**——会被当普通文件下回来一个种子文件。要让直链
@@ -86,7 +88,15 @@
 - `data_dir.rs`：数据目录解析（Windows 便携 `<exe>/portable_data` via `portable` 标记 vs 安装 `%LOCALAPPDATA%`；Linux XDG；macOS App Support；Android files dir）+ 旧版迁移。**Dart 侧 `services/platform_utils.dart` 的 KNOWN_ITEMS 必须与此同步。**
 - `logger.rs`：全局文件日志宏 `log_info!`/`log_error!`（`#[macro_export]`，`$crate` 前缀跨 crate 安全；每文件顶显式 `use`）。与 Dart `LogService` 写同一文件。
 - `model.rs`/`events.rs`/`selection.rs`：领域类型 / `EngineEvent`（`#[non_exhaustive]`）+ `EventSink` / `HostSelection`。
-- `rss/`（`model`/`parser`/`filter`/`mod`）：订阅自动下载。`RssManager` 挂在 `DownloadManager.rss` 上；宿主只提供 60s 节拍（`tick_rss_sources()`）与回流 drain（`on_rss_event()`），抓取 off-actor，建任务仍收敛到 `create_task`。`subscription::SubscriptionProvider` 是 RSS 与插件订阅共用的 provider 分支：内置 `rss` provider 保持原流程；插件在 manifest 的 `subscriptions` 声明 `providerId` + `entry`，由 `PluginManager` 动态路由到 `globalThis.subscribe(ctx)`，返回规范化 `ParsedFeed`，并可通过 `flux.fetch` 请求平台接口。provider 不负责调度、退避、去重、过滤、落库或建任务。三层去重：guid → 单轮上限（超额留 `New` 下轮从旧到新续派）→ 智能剧集去重（识别失败即放行）。失败指数退避封顶 6h，**不自动停用订阅**。`filter.rs` 是纯函数单测主战场，**Dart/TS 各有一份逐条对齐的镜像**（`lib/src/models/rss_filter.dart`、`web/src/lib/rss-filter.ts`）供规则预览用——改任一侧必须同步三处。
+- `site_auth.rs`：站点 HTTP Basic 凭据存于设备本地 config `site_auth_credentials`。`site_key` 仅支持 HTTP/HTTPS，键为 `scheme://host[:port]`（host 小写、默认端口省略），HTTP 与 HTTPS 隔离；`parse_store` 读取旧 `host` / `host:port` 键时补 `https://`，同站点新旧键并存以新键优先。`download_manager::apply_site_auth` 把凭据注入任务 `extra_headers`，显式用户名/密码优先；无显式凭据且已有 Authorization 时不覆盖。
+- `webhook.rs`：`WebhookDispatcher::emit` 同步筛选端点并入队，网络 IO 在端点 worker，失败不影响下载状态。每端点一个有界 FIFO（待投递上限 256），保留事件按 `emit` 入队顺序串行发送；满队列丢最旧待投递项并累计丢弃数，worker 优先写汇总失败投递记录（0 次尝试），不是每条事件派生一个等待任务。全局出站并发 4；dispatcher 释放时关闭队列、唤醒 worker 退出。
+- `rss/`（`model`/`parser`/`filter`/`mod`）：订阅自动下载。`RssManager` 挂在 `DownloadManager.rss` 上；宿主只提供 60s 节拍（`tick_rss_sources()`）与回流 drain（`on_rss_event()`），抓取 off-actor，建任务仍收敛到 `create_task`。`subscription::SubscriptionProvider` 是 RSS 与插件订阅共用的 provider 分支：内置 `rss` provider 保持原流程；插件在 manifest 的 `subscriptions` 声明 `providerId` + `entry`，由 `PluginManager` 动态路由到 `globalThis.subscribe(ctx)`，返回规范化 `ParsedFeed`，并可通过 `flux.fetch` 请求平台接口。provider 不负责调度、退避、去重、过滤、落库或建任务。三层去重：guid → 单轮上限（超额留 `New` 下轮从旧到新续派）→ 智能剧集去重（识别失败即放行）。
+
+  **两层失败退避不能混为一谈**：订阅 feed 抓取按 `effective_interval_secs` 使用「配置间隔 × `2^fail_count`」，封顶 6h 但绝不短于配置间隔，成功清零，**不自动停用订阅**。条目的种子抓取失败由 `record_torrent_failure` 保持 `New` 并写 `torrent_fetch_failed`，退避为 `600s × 2^(fetch_failures-1)`、封顶 24h；`rss_items.fetch_failures` / `retry_after` 落库，重启不丢退避。`db::rss_dispatchable_items` 仅选到期条目，未失败条目优先，避免失效种子长期占住 `max_per_fetch`；建任务成功或用户手动下载清零条目退避，手动下载不受其限制。
+
+  **enclosure MIME 参与种子识别**：`parser::extract_enclosure` / `map_entry` 保存下载目标声明的 `enclosure_type`（RSS enclosure / media:content、Atom enclosure link；没有 enclosure 时取回退链接的 type），去参数、去空白并转小写。`application/x-bittorrent` 即使 URL 没有扩展名也走「先抓种子字节 → 建 BT 任务」，不只看 URL 形态；magnet 不走种子抓取，二段 resolver 条目的计划不沿用 enclosure MIME。
+
+  `filter.rs` 是纯函数单测主战场，**Dart/TS 各有一份逐条对齐的镜像**（`lib/src/models/rss_filter.dart`、`web/src/pages/rss/filter.ts`）供规则预览用——改任一侧必须同步三处。
 
   **「无人值守」是 RSS 的核心不变式**——订阅可能半夜抓到 5 集,任何需要用户点一下才能继续的东西都是 bug:① BT 条目建任务时 `NewTaskSpec.unattended_selection=true`,**在启动前**把「已确认全部文件」落库(`save_bt_selected_files(id, &[], true)`)并落 `tasks.unattended=1`(HLS/变体选择也静默),否则 `do_start_task` 会走 `HostSelection` 弹 5 次文件选择框,而用户点「取消」后条目已被标记「已下载」,状态就撒谎了;② `create_task` 内部自发建任务不经过 Dart 的建任务路径,**必须显式补发** `load_and_send_all_tasks()`——`TaskProgress` 信号不带 `queue_id`,不补发的话新任务在 UI 里不属于任何队列;③ 手动「重新下载」对**任何**状态(含已下载)都放行,挡住重下没有任何好处,只会逼用户去别处找种子。
 
@@ -124,8 +134,10 @@
     直接走宿主兜底删除凭据（M-3）；`poll` 回包省略 `challenge`/`challengeType` 时客户端
     保留上一帧。
   - `flux.ffmpeg`/`flux.ffprobe`（`permissions:["ffmpeg"]`）：近乎全量 argv，**封网 + 封越牢路径**（拒 URL scheme/绝对路径/`..`），牢笼 = 产物目录（仅 onDone 类有产物钩子可用），sema=2，300s/1800s 超时。
-  - `flux.ytdlp`（`permissions:["ytdlp"]`）：**放行 URL/网络**（本职抓站），封危险开关（`--exec`/`--config-location`/`--plugin-dirs`/`--ffmpeg-location`/`--batch-file`…），bridge 自持 per-plugin scratch 牢笼，宿主注入 `--ffmpeg-location`（受管 ffmpeg 不在 PATH）+ `--cache-dir` 收进牢笼。resolve + 全 hook 可用。
+  - `flux.ytdlp`（`permissions:["ytdlp"]`）：允许网络抓站，但参数走 `bridge::ytdlp_option_kind` **白名单**，不是危险开关黑名单。只接受列出的完整长选项（带值选项可用 `--name=value`）和独立短选项，拒绝长选项缩写、合并 / 紧贴值的短选项、未知开关及参数数量不匹配；位置参数仅允许 HTTP/HTTPS URL。路径型参数（含 `-o` / `-P` 的类型前缀与 `--print-to-file` 的目标文件）必须是牢笼内相对路径，拒绝绝对路径、盘符、`..`、家目录 / 环境变量展开；`--js-runtimes` 只收裸运行时名，不收可执行路径。执行 / 配置 / 插件加载、浏览器 / netrc 凭据、任意下载器 / 后处理参数等能力不在允许表内。宿主注入 `--ignore-config`、可信 `--ffmpeg-location`（插件不能覆盖）和牢笼内 `--cache-dir`；resolve + 全 hook 可用。
   - `flux.fs`：per-plugin 通用临时文件读写（扁平安全名 + 单文件 8MB/总量 64MB/文件数 100 上限 + unix 0600），取代"每种输入给工具加类型化字段"的反模式。
+
+**插件工作区**：`bridge::plugin_workspace` 统一生成 `<data_dir>/plugins-work/<encoded_id>/`，供 `flux.fs`、`flux.ytdlp` 的牢笼 / cwd 及卸载清理共用（yt-dlp 可另选牢笼内安全 subdir）。identity 按字节作无碰撞编码：`[A-Za-z0-9-]` 原样保留，其余字节一律写成 `_XX`（两位小写十六进制），包括 `_` → `_5f`、`@` → `_40`、`.` → `_2e`；不能用「特殊字符统一替换成下划线」的有碰撞目录名。
 
 **模块**：`auth`（受控认证档案存储、站点绑定、过期判断和请求注入）、`manifest`（校验器 + subscription/provider 声明 + `permissions`⊆{auth,ffmpeg,ytdlp} + `auth.entry`）、`semver`、`runtime`（**无 rquickjs 类型**——可换 deno_core；含 Spec/Outcome 跨界结构 + `HostContext`）、`quickjs`（v1 唯一 impl，rquickjs 限在此文件；memory_limit + interrupt + timeout 三重兜底 + 连续 3 次熔断）、`bridge`（网络出口 SSRF 守卫 + flux.* 面）、`manager`（`RwLock<Arc<Vec>>` 整表原子替换，含 `authenticate` 登录入口 + 动态订阅路由）、`dependencies`（权限→组件依赖：ffmpeg→[ffmpeg]，ytdlp→[ytdlp,ffmpeg]，**提醒式非阻断**）、`install`（.fxplug zip：zip-slip + 压缩炸弹防护 + 单层剥壳）、`market`（去中心化市场：Git 版本化联邦索引 `zerx-lab/fluxdown-plugin-index`、内容寻址 `contentHash=sha256(zip)`、多源 failover、per-index sequence 防回滚；v1 无作者签名，schema 预留）。
 

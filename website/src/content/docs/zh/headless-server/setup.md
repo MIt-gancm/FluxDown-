@@ -3,7 +3,7 @@ title: 服务器部署
 description: 从源码构建并运行 headless FluxDown 服务器(fluxdown-agent --server + fluxdownd),了解全部环境变量并安全地对外暴露。
 section: headless-server
 order: 1
-sourceHash: "a0394e43854a"
+sourceHash: "e16e0ec39ab1"
 ---
 
 headless 服务器 = `fluxdown-agent --server` 加上同级的 `fluxdownd` 下载守护进程:没有桌面界面、托盘或文件关联。它把同一套 Rust 引擎(HTTP/HTTPS、FTP、BitTorrent、HLS、DASH)通过编译进 `fluxdown-agent` 的 Web 界面和 JSON-RPC 端点(`/rpc`,与桌面客户端同一协议)暴露出来,因此你可以把它跑在 NAS、家庭服务器或 VPS 上,在浏览器里远程管理下载。发行版是**同一目录下的两个二进制**——`fluxdown-agent`(内嵌 Web 界面)与 `fluxdownd`。请把它们放在同一目录:agent 会把 `fluxdownd` 作为子进程拉起,并在收到 `SIGTERM`/`SIGINT` 时一并关停它。
@@ -88,7 +88,7 @@ FLUXDOWN_DATA_DIR=/srv/fluxdown/data \
 
 ## 首次运行:在 Web 界面设置访问密钥
 
-server 模式下,兼容 API 分组(takeover、aria2 JSON-RPC、管理 API、MCP)从首次启动就开启(CORS 默认关闭),监听地址只由 `FLUXDOWN_BIND` 决定。首次启动时,若尚未存有访问密钥,服务器进入**待设置**状态:需鉴权的端点拒绝请求,Web SPA 仍可访问,以便你在浏览器里完成初始化(`GET /api/v1/setup/status` 会返回 `setupRequired`)。
+全新安装默认开启兼容 API 分组（接管、aria2、管理 API、MCP），CORS 默认关闭，监听地址只由 `FLUXDOWN_BIND` 决定。访问密钥未设置时，`/download`、`/download/batch` 与 `/jsonrpc`（POST/WS 升级）返回 HTTP 403（`setup required: set the access key first`），管理 API 与 MCP 同样拒绝空密钥；因此首次设置前不能使用 aria2 或脚本接管。Web 页面与首次设置接口仍可访问，`GET /api/v1/setup/status` 报告 `setupRequired`（启动就绪前可能返回 503）。headless 不会套用桌面 LAN/CORS 的自动补 token 策略。
 
 打开 `http://<server-ip>:17800/`。登录页会变成**初始化 FluxDown Server**向导(不是普通登录框):填写访问密钥并确认,可点按钮随机生成,可勾选「记住此设备」,保存后立即登录进主界面——无需重启服务器。
 
@@ -110,13 +110,13 @@ server 模式下,兼容 API 分组(takeover、aria2 JSON-RPC、管理 API、MCP)
 若要跳过向导(docker-compose、Kubernetes、CI),用 `FLUXDOWN_TOKEN` 预置密钥。仅当库中还没有密钥时才会采纳:
 
 ```bash
-FLUXDOWN_TOKEN='your-strong-key-here' ./fluxdown-agent --server
+FLUXDOWN_TOKEN='replace-with-strong-key-2026' ./fluxdown-agent --server
 ```
 
 若要让环境变量始终生效——即使有人在 Web 界面改过密钥——再加上 `FLUXDOWN_TOKEN_FORCE=1`:
 
 ```bash
-FLUXDOWN_TOKEN='your-strong-key-here' FLUXDOWN_TOKEN_FORCE=1 ./fluxdown-agent --server
+FLUXDOWN_TOKEN='replace-with-strong-key-2026' FLUXDOWN_TOKEN_FORCE=1 ./fluxdown-agent --server
 ```
 
 ### 安全提示
@@ -142,7 +142,7 @@ FLUXDOWN_DATABASE_URL=postgres://fluxdown:password@localhost/fluxdown \
 
 ## 安全地对外暴露(反向代理与 TLS)
 
-`FLUXDOWN_BIND` 默认是 `0.0.0.0:17800`——监听所有网络接口,这与桌面客户端本机 API 硬编码只绑 `127.0.0.1` 不同。这是 headless 场景的刻意设计,但意味着**网络边界的安全由你负责**:
+`FLUXDOWN_BIND` 默认是 `0.0.0.0:17800`，监听所有网络接口；桌面则默认只绑回环，但可显式开启 LAN。headless 不受桌面 LAN 开关控制，**网络边界由部署者负责**：
 
 - 管理访问密钥是互联网与"完全远程控制你的服务器"(创建/删除下载、取回任意已完成文件)之间唯一的屏障。把它当 root 密码对待:不要分享、不要打进日志,一旦怀疑泄露就重新生成。
 - 如果服务器需要在可信局域网之外访问,把它放在反向代理(nginx、Caddy、Traefik)之后终结 TLS,只对外暴露 HTTPS。Web 界面会把密钥放在 WebSocket 子协议头里(文件下载时放在查询字符串里),明文 HTTP 下会被网络路径上的任何人看到。

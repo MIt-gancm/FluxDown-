@@ -29,6 +29,7 @@ docker run -d \
 
 首次访问 `http://<host>:17800/` 时，Web 界面会进入初始化向导，由你自行设置访问密钥（至少 8 位，须同时包含字母和数字）。用该密钥登录 Web 界面，以及为 HTTP API、MCP 端点（`Authorization: Bearer <token>`）和 `/rpc` JSON-RPC 端点鉴权。
 
+首次设置完成前 `/download`、`/download/batch` 与 `/jsonrpc`（POST/WS 升级）返回 HTTP 403（`setup required: set the access key first`）；aria2 客户端和脚本接管不可用。Web 初始化页面与 setup 接口仍可访问，保存合规密钥后无需重启即可按开关使用兼容 API。
 在 docker-compose 或其它编排场景中，可用 `FLUXDOWN_TOKEN` 预置密钥并跳过向导。仅在实例尚未设置过密钥时生效；若还设置了 `FLUXDOWN_TOKEN_FORCE=1`，则每次重启都会用它覆盖库中已存的密钥（见[环境变量](/docs/zh/headless-server/setup/#环境变量)）：
 
 ```bash
@@ -36,7 +37,7 @@ docker run -d \
   --name fluxdown-server \
   --restart unless-stopped \
   -p 17800:17800 \
-  -e FLUXDOWN_TOKEN=your-secure-key-here \
+  -e FLUXDOWN_TOKEN=replace-with-strong-key-2026 \
   -v fluxdown-data:/data \
   -v /path/to/downloads:/root/Downloads \
   ghcr.io/zerx-lab/fluxdown-server:latest
@@ -56,7 +57,7 @@ services:
       - fluxdown-data:/data
       - ./downloads:/root/Downloads
     # environment:
-    #   FLUXDOWN_TOKEN: your-secure-key-here   # 可选：预置访问密钥，跳过初始化向导
+    #   FLUXDOWN_TOKEN: replace-with-strong-key-2026   # 可选：预置访问密钥，跳过初始化向导
     #   FLUXDOWN_LANG: zh
     #   FLUXDOWN_DATABASE_URL: postgres://user:pass@host:5432/fluxdown
 

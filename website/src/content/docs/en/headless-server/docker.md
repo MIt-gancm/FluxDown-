@@ -28,6 +28,7 @@ docker run -d \
 
 On first visit to `http://<host>:17800/`, the Web UI opens an initialization wizard where you set the access key yourself (at least 8 characters, must include both letters and digits). Use that key to sign in to the Web UI and to authenticate the HTTP API, MCP endpoint (`Authorization: Bearer <token>`) and the `/rpc` JSON-RPC endpoint.
 
+Before first setup completes, `/download`, `/download/batch`, and `/jsonrpc` (POST/WS upgrade) return HTTP 403 (`setup required: set the access key first`); aria2 clients and script takeover are unavailable. The Web setup page and setup endpoints remain reachable. Saving a valid key makes compatibility APIs available according to their switches, without restarting.
 For docker-compose or other orchestration, you can pre-set the key with `FLUXDOWN_TOKEN` and skip the wizard. It only takes effect when the instance has not set a key yet, unless you also set `FLUXDOWN_TOKEN_FORCE=1`, which makes it override the stored key on every restart (see [Environment variables](/docs/en/headless-server/setup/#environment-variables)):
 
 ```bash
@@ -35,7 +36,7 @@ docker run -d \
   --name fluxdown-server \
   --restart unless-stopped \
   -p 17800:17800 \
-  -e FLUXDOWN_TOKEN=your-secure-key-here \
+  -e FLUXDOWN_TOKEN=replace-with-strong-key-2026 \
   -v fluxdown-data:/data \
   -v /path/to/downloads:/root/Downloads \
   ghcr.io/zerx-lab/fluxdown-server:latest
@@ -55,7 +56,7 @@ services:
       - fluxdown-data:/data
       - ./downloads:/root/Downloads
     # environment:
-    #   FLUXDOWN_TOKEN: your-secure-key-here   # optional: preset access key, skips the init wizard
+    #   FLUXDOWN_TOKEN: replace-with-strong-key-2026   # optional: preset access key, skips the init wizard
     #   FLUXDOWN_LANG: zh
     #   FLUXDOWN_DATABASE_URL: postgres://user:pass@host:5432/fluxdown
 

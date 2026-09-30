@@ -108,7 +108,7 @@ Proxy settings apply to HTTP/HTTPS/FTP/eD2K downloads only — BitTorrent downlo
 
 ## API Service
 
-A local-only HTTP API (127.0.0.1) used by the browser extension, aria2-compatible tools, and automation scripts.
+The desktop HTTP service defaults to `127.0.0.1:17800`. GPUI can enable LAN access (binding `0.0.0.0` on the next start) or allow cross-origin access from any website (CORS, default off). If LAN/CORS and takeover/aria2 are enabled, an empty access token is generated and persisted automatically; existing tokens are retained. Configure external tools with it. Headless instead keeps an empty key as pending first setup, without auto-generation.
 
 | Setting | Purpose | Default |
 |---|---|---|
@@ -118,6 +118,8 @@ A local-only HTTP API (127.0.0.1) used by the browser extension, aria2-compatibl
 | Browser Script Takeover | Lets the FluxDown userscript take over browser downloads at `http://127.0.0.1:<port>`. Includes a button to copy the userscript. | On |
 | aria2 RPC Compatible | Implements the aria2 JSON-RPC protocol (`addUri`, `getVersion`, `getGlobalStat`, `multicall`, …) at `/jsonrpc`, for "send to aria2" scripts or clients like AriaNg. | On |
 | Management API | An HTTP API for querying and controlling tasks at `/api/v1`, for MCP servers and automation scripts. Always requires the access token. | Off |
+| LAN access | Explicitly binds `0.0.0.0` on the next start; exposing takeover/aria2 fills an empty token automatically. | Off |
+| Allow cross-origin access from any website (CORS) | Lifts the compatibility Origin gate for browser probing and token-authenticated calls; token and loopback Host checks remain. aria2 has no confirmation dialog. | Off |
 
 See the [API documentation](/api-docs) for the full endpoint reference.
 

@@ -7,23 +7,27 @@
 
 ## 日志系统
 
-Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm [Tag] message`。
+**Flutter / 引擎滚动日志**：Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm [Tag] message`；这不是 GPUI 界面与 agent 的日志格式。
 - 目录：Windows exe 同级 `logs/`；Linux `~/.local/share/fluxdown/logs/`。文件名 `fluxdown_YYYY-MM-DD.log`，单卷 2MB 分卷，总量超 `log_max_size_mb`（默认 10MB）从最旧删，保留 7 天。
 - Dart：`import '../services/log_service.dart'; logInfo(_tag, msg); logError(...)`。
 - Rust：`use crate::logger::log_info; log_info!("[mod] ...")`（Rust 2024 无 `#[macro_use]`，每文件显式 use）。
 - 导出：设置「关于」→ ZIP（纯 Dart 标准库，零依赖）。
 - GPUI 任务「日志」另走引擎数据库中的结构化活动历史（`engine/task_activity.rs`、`db.rs`），不是全局滚动文本文件：源端时间、跨重启 ID、查询分页与实时通知配合。当前保留七天且全库最多五万条，两者先到先清理；页面显示保留截断。同步事件入有界队列，持久化失败不广播成功记录，队列溢出/失败形成显式 `journal_overflow` 缺口；关机冲刷有界，不能因日志数据库不可用永久挂住。
 
-**GPUI 桌面链路（desktop / agent / daemon）**——与上面的 Flutter/引擎滚动日志分开：
-- `fluxdownd`：沿用引擎 `logger`（`<engine 数据目录>/logs/fluxdown_*.log`）；`main` 返回错误时带完整错误链落盘。
+**GPUI 桌面链路（desktop / agent / daemon）**——desktop / agent 文本日志独立，daemon 沿用引擎滚动日志：
+- `fluxdownd`：沿用引擎 `logger`（`<engine 数据目录>/logs/fluxdown_*.log`）；`main` 返回错误时带完整错误链落盘。目录总大小上限是 **daemon 配置键** `log_max_size_mb`，唯一类型/范围/默认值目录在 `native/protocol/src/daemon_config.rs`（整数 1–1024 MB，默认 10）；`native/daemon/src/actor.rs::{apply_log_limit,log_limit_bytes}` 在启动加载及该键提交后应用，缺失/非法持久值回退默认。它不控制 desktop / agent 的固定 2MB 单文件轮转。
 - `fluxdown-desktop` 与 `fluxdown-agent`（非 `--server`）：共用 `native/logfile`（`fluxdown_logfile`，零依赖），写 `<agent 数据目录>/logs/{desktop,agent}.log`。单文件 2MB 轮转为 `.log.1`（只留一份，每进程 ≤4MB）；每个文件开头有会话头（版本、exe、参数形态、平台、`SESSIONNAME`/显示协议、`GPUI_*`/`ZED_*` 原值、其余 `FLUXDOWN_*` 只记名字），轮转后重写；同一消息（数字归一）每 60s 只落 10 条，其余汇总成 `[suppressed N repeats over Ts]`；UTC 时间戳；panic 带回溯。
 - desktop 收 `log` 门面：`fluxdown*` 与 `gpui*`（含显卡选择、D3D 特性级别、DirectComposition、设备丢失、draw 失败）按 `FLUXDOWN_LOG_LEVEL`（缺省 info），第三方只收 warn+；另记窗口打开参数、首个窗口 GPU 规格（软件渲染告警）、首帧耗时 / 10s 无首帧告警、UI 线程心跳看门狗（停摆 10/60/300s 告警，macOS 因 App Nap 不启用）、agent 连接状态迁移与 agent 进程拉起/退出。启动参数只记开关与位置参数个数，不记链接。
 - agent 收 `tracing`：`RUST_LOG` 非空时原样生效，否则 `warn` + 第一方 crate 按 `FLUXDOWN_LOG_LEVEL`；daemon 子进程 stderr 追加到同目录 `fluxdownd.stderr.log`（超 1MB 截断），拉起 / 非零退出（含存活时长）记入 `agent.log`。`--server` 模式仍是 stderr tracing。
 - Doctor 的日志目录检查、「打开日志目录」、日志导出都指向 `<agent 数据目录>/logs`（`log_export::agent_log_dir`）。
 
+**导出脱敏的唯一规则源**：`native/logfile/src/sanitize.rs::SANITIZE_PATTERNS`，由 `fluxdown_logfile::SANITIZE_PATTERNS` 导出；引擎 `logger::{sanitize_log_str,sanitize_log_bytes}` 与 agent `log_export::sanitize_text` 各自编译同一规则并按表顺序套用，不再维护两份正则。覆盖 URL userinfo、Telegram bot 路径令牌、敏感 query、超长 query、Cookie / Authorization、代理凭据与 Linux / Windows 用户目录；非 UTF-8 按有损解码后脱敏。规则用于导出，不代表原始落盘日志已脱敏；agent 的配置快照导出另先按结构清掉秘密字段（`sanitize_json_export`）。
+
 ---
 
 ## 发布与 CI（`.github/workflows/release.yml`）
+
+**主干 CI**（`.github/workflows/ci.yml`）：`main` push 与所有 pull request 触发，`paths-filter` 分别判定 Rust / Web SPA / 官网 v2 / 扩展，取消同分支或同 PR 的旧运行。Rust 门禁为 `cargo fmt --check` 与 `cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings`（冻结的 `native/server` 不进入门禁，含测试等全部 targets）；`clippy.toml` 只放行测试中的 unwrap / expect，其余 lint 与生产一致。nextest 按 engine / core / agent / GPUI 分组、显式 `-p`，不跑 workspace 测试。Web SPA 做 lint + test + build，官网 v2 当前做 test，扩展分别构建 Chrome 与 Firefox。它不发布资产，也不替代 release 的引擎专项门禁。
 
 **组件变更检测 + 统一 release** 流水线，`v*` tag 触发。`changes` job diff `PREV..TAG` 映射路径→输出（`app`/`extension`/`server`/`mobile`/`cli`），首个 tag 全量构建；**基线 `PREV`**：稳定 `vX.Y.Z` 取上一个稳定版（`git describe --exclude 'v*-*'`，跳过其间全部 `-rc.N`，rc 阶段改过的组件都进稳定版），预览取上一个任意 `v*` tag；同一基线经 `changes.outputs.prev` 传给 release notes（稳定版 git-cliff 以 `GIT_CLIFF__GIT__IGNORE_TAGS` 忽略 rc tag，说明覆盖整个 rc 周期）。同时解析构建源码 `source`（默认 = tag 提交）。**分支守卫**：稳定 `vX.Y.Z` 必须是 `origin/stable` 祖先；预览 `vX.Y.Z-rc.N` 必须在 `origin/main`；否则整条失败。同一 tag 的运行由 `concurrency` 串行。
 
@@ -35,13 +39,23 @@ Dart 与 Rust 两端写**同一目录同一文件**，统一格式 `HH:MM:SS.mmm
 
 路径→组件映射（要点）：`fluxDown/*`→extension；`web|docker/*`→server；`native/agent|native/daemon/*`→app+server；`crates/*`→app（GPUI 桌面）；`assets/i18n/*`→app+mobile+server；`website-v2/src/lib/gpui-theme/*`→server（Web SPA 构建期别名引用）；`packaging/*`→app+server；`native/server/*`（已冻结）→不构建；`native/cli/*`→cli；`native/api|native/protocol/*`→app+server+cli；`native/engine/*`→app+server+mobile+cli；`android|lib/*|pubspec.*|native/hub/*`→mobile（Flutter 只剩 Android）；`native/fluxdown_updater/*`→不构建；`website/*`/`docs/*`/`*.md`→不构建。
 
-构建矩阵：**桌面端 = GPUI**（`fluxdown-desktop` + `fluxdown-agent` + `fluxdownd` + `fluxdown_nmh` 四个可执行同目录，`--features fluxdown_agent/desktop`，必须 release profile），产物名与 Flutter 时代一致，旧 Flutter 客户端自动更新直接升级为 GPUI：Windows（x64+arm64，`installer/windows/setup.iss` 沿用 AppId 覆盖升级、`[InstallDelete]` 清掉 Flutter 残留、自启指向 `fluxdown-agent.exe --autostart`；便携 zip 带 `portable` 标记与 `flux_down.exe`=desktop 副本供 Flutter 更新器重启；**Windows 全部产物暂不签名**，SignPath 开源审核未过）、Linux x64（ubuntu-22.04，`scripts/package_gpui_linux.sh` 出 tar.gz/AppImage/deb/Arch；deb/Arch 装 `/opt/fluxdown` + `/usr/bin` 符号链接；AppImage 的 AppRun 把 `--autostart` 交给 agent，并等常驻 agent/daemon 退出后才返回以保持挂载；agent 在 AppImage 内把自启写成 `$APPIMAGE --autostart`；CI 装 deb 冒烟 + `ldd`）、macOS（x64 `macos-15-intel` / arm64 `macos-15` 分别构建，`scripts/package_gpui_macos.sh`：`FluxDown.app` + `Helpers/FluxDownAgent.app`（agent/daemon/nmh）→ Developer ID + Hardened Runtime 签名 → DMG → notarytool 公证 → DMG 与 .app 均 staple → tar.gz；缺签名 secrets 直接失败）；扩展（Chrome+Firefox，预发布 tag 不打包扩展）、Android（split-per-abi + universal APK，cargokit 编各 ABI cdylib）、Web SPA（一次复用）、server 多平台二进制（`fluxdown-agent`(web-ui) + `fluxdownd` 同包，入口 `fluxdown-agent --server`；musl 静态）、server NAS 包（OpenWrt/QNAP/群晖）、CLI 六平台、server Docker（ghcr.io `fluxdown-server`，tini 作 PID 1，QEMU arm64）。说明只在 tag 推送时生成一次：git-cliff（全仓）后经 Claude Code CLI 改写为中英双语（`<!-- fluxdown:lang:zh/en -->` 标记，失败回退原始 cliff）；补发不改已有说明。
+构建矩阵：**桌面端 = GPUI**（`fluxdown-desktop` + `fluxdown-agent` + `fluxdownd` + `fluxdown_nmh` 四个可执行，Windows/Linux 同目录、macOS 按 bundle 分层，`--features fluxdown_agent/desktop`，必须 release profile），产物名与 Flutter 时代一致，旧 Flutter 客户端自动更新直接升级为 GPUI：Windows（x64+arm64，`installer/windows/setup.iss` 沿用 AppId 覆盖升级、`[InstallDelete]` 清掉 Flutter 残留、自启指向 `fluxdown-agent.exe --autostart`；便携 zip 带 `portable` 标记与 `flux_down.exe`=desktop 副本供 Flutter 更新器重启；**Windows 全部产物暂不签名**，SignPath 开源审核未过）、Linux x64（ubuntu-22.04，`scripts/package_gpui_linux.sh` 出 tar.gz/AppImage/deb/Arch；deb/Arch 装 `/opt/fluxdown` + `/usr/bin` 符号链接；AppImage 的 AppRun 把 `--autostart` 交给 agent，并等常驻 agent/daemon 退出后才返回以保持挂载；agent 在 AppImage 内把自启写成 `$APPIMAGE --autostart`；CI 装 deb 冒烟 + `ldd`）、macOS（x64 `macos-15-intel` / arm64 `macos-15` 分别构建，`scripts/package_gpui_macos.sh`：`FluxDown.app` + `Helpers/FluxDownAgent.app`（agent/daemon/nmh）→ Developer ID + Hardened Runtime 签名 → DMG → notarytool 公证 → DMG 与 .app 均 staple → tar.gz；缺签名 secrets 直接失败）；扩展（Chrome+Firefox，预发布 tag 不打包扩展）、Android（split-per-abi + universal APK，cargokit 编各 ABI cdylib）、Web SPA（一次复用）、server 多平台二进制（`fluxdown-agent`(web-ui) + `fluxdownd` 同包，入口 `fluxdown-agent --server`；musl 静态）、server NAS 包（OpenWrt/QNAP/群晖）、CLI 六平台、server Docker（ghcr.io `fluxdown-server`，tini 作 PID 1，原生构建机交叉编译 arm64）。说明只在 tag 推送时生成一次：git-cliff（全仓）后经 Claude Code CLI 改写为中英双语（`<!-- fluxdown:lang:zh/en -->` 标记，失败回退原始 cliff）；补发不改已有说明。
+
+**CPU 基线**：`.cargo/config.toml` 的 x86_64 默认为桌面 `x86-64-v2`（SSE4.2 / POPCNT 等，不提升到 AVX2 / v3）。release 的 server（含 NAS 套件）与 CLI 构建，以及 `docker/server.Dockerfile` 的 amd64 构建，显式用 `RUSTFLAGS="-C target-cpu=x86-64"` 回退老服务器基线；aarch64 维持默认。`RUSTFLAGS` 整体替换 config 的 rustflags，向 config 添加其它 flag 时必须同步这些构建路径，不能只改桌面默认。
+
+**deb 预发布排序**：`scripts/package_gpui_linux.sh` 写入 control 的 `Version` 时把首个 `-` 换为 `~`，例如 `0.5.0-rc.2` → `0.5.0~rc.2`，使 rc 排在正式版之前；Release tag / 产物文件名仍保留 `-rc.N`，不能把 Debian revision 的 `-rc.N` 当成预发布。
 
 **Windows 安装模式**：`setup.iss` 只做每用户安装（`PrivilegesRequired=lowest`，**不开** `PrivilegesRequiredOverridesAllowed`——开了对话框后一旦选「为所有用户」，Inno 的 `UsePreviousPrivileges` 会让之后每次安装 / 静默更新都要 UAC），`{autopf}` = `%LOCALAPPDATA%\Programs\FluxDown`；运行期集成（NMH、URL 协议、`.torrent`、自启、AUMID）全在 HKCU / `%LOCALAPPDATA%\FluxDown`。检测到 HKLM 下的旧全体用户安装时，`RemoveLegacyAllUsersInstall` 提权一次跑其卸载器，并把卸载器删掉的 HKCU 自启 / `.torrent` / URL 协议改指新目录；NMH 由新 agent 启动时 `auto_register` 重注册。
 
+**NMH IPC 端点**：桌面安装按用户注册浏览器宿主；Unix 只用用户数据目录中的 `ipc/fluxdown.sock`（`ipc` 目录 0700），Windows 用编码账户名后的命名管道。agent（`native/agent/src/nmh.rs`）与中继（`native/nmh/src/main.rs`）独立推导同一路径/管道名；端点及权限细节见 `clients.md`「浏览器扩展」。
+
 **下载分发**：每个 upload job 在上传 GitHub Release 后经 `.github/actions/oss-upload`（固定版 ossutil 2.x）把 `release-assets/*` 同步到阿里云 OSS `oss://zerx-lab/FluxDownRelease/<版本>/<组件>/<文件>`；目录由 release tag 推导，统一 release 的全部组件都落在 `vX.Y.Z/app/`（历史目录名），历史组件 release 在 `v0.4.8/server/` 等（tag→路径规则在 `website*/src/lib/oss.ts::releaseObjectKey` 与 action bash 各一份，须同步。bucket 私有；secrets `OSS_ACCESS_KEY_ID`/`OSS_ACCESS_KEY_SECRET`，未配则跳过，`continue-on-error` 不阻断发布）。官网 `website/src/pages/api/download/[filename].ts` 优先做预签名 HEAD 探测后 302 到 1h 预签名 GET（V1 签名），OSS 缺失/不可达回退 GitHub CDN；`?source=github` 强制直连。不再有 CN 地域分流与 githubProxy 镜像。
 
-构建期注入：GPUI/agent 用 env `FLUXCLOUD_BASE_URL`（空则不导出）与 `FLUXDOWN_ANALYTICS_APP_KEY`；Android（Flutter）用 dart-define `APP_VERSION`、`FLUXCLOUD_BASE_URL`。
+**产品版本来源**：桌面 / server / CLI 的 Rust 发布构建统一从 `changes.outputs.version` 取 `v*` tag 去掉前缀 `v` 的版本（保留 `-rc.N`），经 env `FLUXDOWN_APP_VERSION` 注入；Docker 由 release 的同名 build arg 传入。GPUI 关于页、daemon / agent 自报版本与更新检查以 `native/protocol/src/rpc.rs::APP_VERSION`（`fluxdown_protocol::APP_VERSION`）为准；NMH 使用相同取值规则但不依赖 protocol。未注入或值为空时，protocol / NMH 回退各自的 `CARGO_PKG_VERSION`，不是正式产品版本。
+
+引擎另由 `native/engine/build.rs` 解析：非空 `FLUXDOWN_APP_VERSION`（trim） > 根 `pubspec.yaml` 的 `version:`（去掉 `+build`） > `1.0`，用于引擎 UA / webhook 等编译期版本。`pubspec.yaml` 是 Flutter 工程版本与本地引擎构建的回退来源（本地 macOS 打包脚本的默认 `VERSION` 也取它），**不再是 Rust 发行物的全局版本源**。Android 仍发布 Flutter：`--build-name` 取 tag 的数字基础版本、`--dart-define=APP_VERSION` 保留完整 tag 版本，`--build-number` 单独派生。
+
+其它构建期注入：GPUI/agent 用 env `FLUXCLOUD_BASE_URL`（空则不导出）与 `FLUXDOWN_ANALYTICS_APP_KEY`；Android（Flutter）用 dart-define `FLUXCLOUD_BASE_URL`。
 
 **macOS 签名/公证 secrets（已接入 release.yml 的 `build-macos`）**：分发走 DMG（Developer ID + notarytool），不上 Mac App Store。Team ID `KD4N89AAF5`（个人账户 Yunhua Qu）。`MACOS_CERT_P12_BASE64`（Developer ID Application 证书 + 私钥的 .p12，base64；证书 SHA1 `A14C6036…DAB3C`，2031-09-13 到期）、`MACOS_CERT_PASSWORD`（.p12 导出密码）、`APPLE_API_KEY_P8_BASE64`（App Store Connect 团队 API 密钥 .p8，base64，角色「开发者」）、`APPLE_API_KEY_ID`、`APPLE_API_ISSUER_ID`。公证用 `xcrun notarytool submit --key <p8> --key-id … --issuer …`，不用 Apple ID + App 专用密码。值只在 GitHub Secrets，**禁止**把 .p12/.p8/密码提交进仓库。
 

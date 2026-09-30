@@ -1,4 +1,4 @@
-# FluxDown internals · Flutter 前端 · 扩展 · 用户脚本 · Web SPA · 官网
+# FluxDown internals · GPUI 桌面 · Flutter 移动端/legacy · 扩展 · 用户脚本 · Web SPA · 官网
 
 > 本文件是 `FluxDown/AGENTS.md` 的深挖附录：只放**枚举性 / 可从源码复原**的细节，硬不变式与红线在 AGENTS.md。
 > 路径以 `FluxDown/` 为根（cwd=工作区根时前置 `FluxDown/`）。事实层以源码为准，文档给坐标。
@@ -6,6 +6,8 @@
 ---
 
 ## GPUI PC 客户端（`crates/`，三进程本机链路）
+
+**桌面发行物已是 GPUI**：Windows / macOS / Linux 发布 `fluxdown-desktop → fluxdown-agent → fluxdownd`，浏览器中继为 `fluxdown_nmh`（`.github/workflows/release.yml` 的桌面构建与 `scripts/package_gpui_{linux,macos}.sh`）。Android 发行物仍是 Flutter；`lib/` 的桌面代码仅保留 legacy / wire 兼容，不再代表当前 PC 发行物。GPUI 关于页与服务版本统一取 `fluxdown_protocol::APP_VERSION`：正式构建由 tag 注入 `FLUXDOWN_APP_VERSION`，本地回退及 `pubspec.yaml` 的角色见 `ops.md`「发布与 CI」。
 
 依赖方向固定为 `i18n` / `theme` → `components` → `shell` / capability crates → `app`。`app` 只做窗口与单一 agent 会话装配；capability 之间不互相依赖。
 
@@ -46,13 +48,15 @@
 - 详情日志：`pages/task_detail_activity.rs` 通过 capability port 查询 `daemon.task.activity`，与实时 `TaskActivityAdded` 按持久 ID 合并；支持最新页、加载更早、断线补齐及失败重试，切换任务/失联作废在途结果。时间取源端 `timestamp_ms`；保留截断与源端队列缺口明确展示。关闭重开不丢历史，不再使用 View 私有状态变化记录冒充引擎日志。
 - 运行链路：`fluxdown-desktop` 探活/单飞启动 `fluxdown-agent`；agent 探活/单飞启动 `fluxdownd`（Unix 下两级子进程都进独立进程组，终端 Ctrl-C 不连带后台）。关闭全部窗口是否终止后两者由 agent 驻留策略决定（`close_to_tray` 且托盘可用 → 驻留）。
 - 开发入口：根目录 `cargo desktop-dev`（`scripts/desktop-dev`，无额外依赖）序列化开发构建（agent 带 `--features fluxdown_agent/desktop`，托盘与剪贴板监听只在该 feature 下编译）；已有 UI 时只唤起，否则先构建三个二进制再启动。`--build-only` 不启动或激活窗口。后台保留常驻/复用语义，不强杀或热替换；运行代码变更需先退出对应进程（托盘「退出」即完全退出），详情见 `CONTRIBUTING.md`。
-- 三个二进制在 Windows/Linux app 包中为同级文件；macOS 包（`scripts/package_gpui_macos.sh`）为 `FluxDown.app/Contents/MacOS/fluxdown-desktop` + 辅助 bundle `Contents/Helpers/FluxDownAgent.app/Contents/MacOS/{fluxdown-agent,fluxdownd}`：辅助 bundle 声明 `LSUIElement`，常驻 agent 不占 Dock（同 bundle 平铺时 Launch Services 按外层 Info.plist 把 agent 登记为前台 App，Dock 出现第二个图标）；辅助 bundle id = 外层 id + `.agent`，agent 据此还原外层 `com.fluxdown.app` 注册 `.torrent` / URL scheme（`platform::host_bundle_id`），桌面经 `service_bootstrap::bundled_agent_app` 定位辅助 bundle 并以 `open -g` 经 Launch Services 启动（直接 spawn 会让 agent 成为桌面 App 的附属进程，桌面退出后 Dock 以 `exited-with-subordinates` 残留图标直到 agent 退出），agent 经 `platform::desktop_executable` 反查外层桌面程序；打包后系统打开链接 / 种子的事件由桌面程序接收。agent/daemon 使用独立 bearer 文件，云 Token 只保存在 agent 私有状态。
+- 发行包中的四个可执行（desktop / agent / daemon / NMH）在 Windows/Linux 为同级文件；macOS 包（`scripts/package_gpui_macos.sh`）为 `FluxDown.app/Contents/MacOS/fluxdown-desktop` + 辅助 bundle `Contents/Helpers/FluxDownAgent.app/Contents/MacOS/{fluxdown-agent,fluxdownd,fluxdown_nmh}`：辅助 bundle 声明 `LSUIElement`，常驻 agent 不占 Dock（同 bundle 平铺时 Launch Services 按外层 Info.plist 把 agent 登记为前台 App，Dock 出现第二个图标）；辅助 bundle id = 外层 id + `.agent`，agent 据此还原外层 `com.fluxdown.app` 注册 `.torrent` / URL scheme（`platform::host_bundle_id`），桌面经 `service_bootstrap::bundled_agent_app` 定位辅助 bundle 并以 `open -g` 经 Launch Services 启动（直接 spawn 会让 agent 成为桌面 App 的附属进程，桌面退出后 Dock 以 `exited-with-subordinates` 残留图标直到 agent 退出），agent 经 `platform::desktop_executable` 反查外层桌面程序；打包后系统打开链接 / 种子的事件由桌面程序接收。agent/daemon 使用独立 bearer 文件，云 Token 只保存在 agent 私有状态。
 - 关联开关（`.torrent` / `magnet:` / `ed2k://`）：关闭时 agent 把系统默认处理程序移交给另一个已安装候选（macOS `LSCopyAll*Handlers*` → `platform::successor_handler`）。Launch Services 没有「无默认处理程序」，FluxDown 是唯一候选时无法让出，故同时写设备本地 opt-out 偏好（`OpenAssociation::opt_out_pref_key`，与 Flutter 同键）：设置页显示值 = 探测值 && !opt-out；诊断页对已关闭关联按用户意图报告（已移交 = ok，仍回落 FluxDown = info + `association_off` 提示），且不提供「立即注册」；系统交来的链接 / 文件经 `agent.capture.submit*` 的 `association` 参数声明来源，关联已关闭时 agent 不建任务（返回 `{"ignored":true}`）并发系统通知。`fluxdown:` 深链、界面拖入、剪贴板、扩展捕获不带 `association`，不受约束。
 - GPUI 依赖走 crates.io 的 gpui-kit 发布版（`gpui-base` / `gpui-component` / `gpui-kit-assets` 同版本），`gpui` / `gpui_platform` 用 gpui-kit 该版本精确锁定的 `gpui-pre` 快照（`=` 版本，升级时照抄其 `Cargo.toml`；`gpui_platform` 必须开 `runtime_shaders`，否则缺 Metal Toolchain 的 macOS 构建失败）。窗口浮层（dialog/sheet/notification）由 `Root` 经 `gpui_component::init` 注册的插件自动托管，视图内不再手挂 layer。Base `ColorTokens.selection` 不是独立注册表 token，由 `runtime.rs::from_tokens` 从 `colors.textSelection` 投影。
 
 ---
 
 ## Flutter 前端架构（`lib/src`）
+
+本节描述 **Android 发行客户端及保留的 legacy 桌面实现**；旧桌面 widgets / popup / 托盘代码的坐标不是 GPUI 的开发入口。Flutter UI 修复与新功能暂停，共享引擎/协议改动只保持其既有 wire 兼容；PC UI 维护入口是上一节 `crates/`。移动发布 job 只构建 Android，iOS 工程存在但未发布。
 
 **状态管理**：ChangeNotifier + ListenableBuilder（无 Provider/Riverpod/Bloc），`_safeNotifyListeners()` 防已释放。Provider 统一模式：订阅 rinf 信号 + 单向 `sendSignalToRust` 写（`SettingsProvider`/`PluginProvider`/`ComponentController`/`download_controller`/…）。
 
@@ -104,8 +108,9 @@ SharedPreferences 门面，**便携模式**（`portable` 标记）写 `<exe>/por
 ## 浏览器扩展（`fluxDown/`）与用户脚本（`userscript/`）
 
 ### 扩展（WXT，Chrome + Firefox MV3）
-- **通信**：全平台走 NMH。扩展 →（stdin/stdout）→ `fluxdown_nmh` →（Windows Named Pipe / Linux-mac UDS）→ App。消息 = 4 字节 LE 长度 + JSON。action：`ping`（只探不拉起）/`download`/`batch_download`（换行 join 单确认，按 700KB+1000 条分块防 1MB 帧上限，旧 App 回退逐条）/`warmup`（本地应答重叠冷启动）。
+- **通信**：桌面发行链路全平台走 NMH：扩展 →（stdin/stdout）→ `fluxdown_nmh` →（Windows Named Pipe / Linux-mac UDS）→ `fluxdown-agent` → daemon；不再把 Flutter hub 当成 PC 发行宿主。消息 = 4 字节 LE 长度 + JSON。action：`ping`（只探不拉起）/`download`/`batch_download`（换行 join 单确认，按 700KB+1000 条分块防 1MB 帧上限，旧 App 回退逐条）/`warmup`（本地应答重叠冷启动）。
 - **三层拦截**：`onHeadersReceived`（缓存元数据 + Firefox `webRequestBlocking` cancel）→ `onDeterminingFilename`（Chrome 先发起 `downloads.cancel`，再调用 `suggest()` 释放文件名管线；取消成功才投递客户端）→ `onCreated+onChanged` 兜底 + 页面态 `fetch-interceptor.ts`。`suggest` 不支持 `cancel` 字段；取消失败保留原生下载，投递失败仍走既有浏览器回退。重定向下载以 `finalUrl` 为目标，原始 URL 保留用于请求事务缓存查找。
+- **IPC 用户隔离**：agent 与中继分别在 `native/agent/src/nmh.rs::{socket_path_under,pipe_name_for}` 和 `native/nmh/src/main.rs` 的同名函数独立推导同一端点，两侧须同步。Unix 唯一 socket 为用户 home 下固定数据目录的 `<data_dir>/ipc/fluxdown.sock`（Linux `<data_dir>` = `~/.local/share/fluxdown/`，macOS = `~/Library/Application Support/fluxdown/`），`ipc` 目录 0700、socket 0600，agent 额外校验对端 uid；Windows 用 `\\.\pipe\fluxdown-<account>`，`USERNAME` 转小写后逐字节编码 `[a-z0-9]` 之外的字符为 `_xx`（下划线也编码），避免账户名清洗碰撞。无法确定 home / 用户名时端点不可用；Unix 不走会在沙箱中重映射的 `XDG_RUNTIME_DIR`。
 - **资源嗅探**（`media-sniff.ts`）：视频/音频/HLS/DASH/大文件，按 tabId 分组 + badge。
 - Chrome ID 经 manifest key 钉住（匹配 NMH `allowed_origins`）；Alt+Shift+D 切换拦截；`Alt+Click` 15s 放行；声明零数据采集。
 

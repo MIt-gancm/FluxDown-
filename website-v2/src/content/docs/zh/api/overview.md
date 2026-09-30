@@ -3,56 +3,76 @@ title: API 总览
 description: FluxDown 的 HTTP API——五组路由、鉴权方式,以及它与 headless 服务器的关系。
 section: api
 order: 1
-sourceHash: "618afb3e9283"
+sourceHash: "7fc5e6bae5f1"
 ---
 
-FluxDown 内置一套小型 HTTP API,供浏览器扩展、油猴脚本、aria2 客户端与自动化工具使用,存在于两个地方:
+FluxDown 的 HTTP API 供扩展、用户脚本、aria2 客户端与自动化工具使用；不要把 aria2 的 `/jsonrpc` 与官方客户端的 `/rpc` 混为一谈。
 
-- **桌面客户端**,地址 `http://127.0.0.1:17800`(端口可配置,地址硬编码为回环,永远不会暴露在网络上)。管理 API 分组默认关闭,其余分组默认开启;具体见桌面客户端的本机 API 设置。
-- **[headless 服务器](/docs/zh/headless-server/setup/)**,地址取决于 `FLUXDOWN_BIND` 的设置(默认 `0.0.0.0:17800`——刻意监听网络接口,因为远程管理正是它存在的意义)。管理 API 在这里恒开,并且在桌面客户端已有的端点之外额外挂载了几个 headless 专属端点(队列、配置、文件取回、WebSocket、服务器文件系统浏览)。
-
-两者共用同一套路由常量、请求/响应 JSON 契约与鉴权规则——区别只在于哪些路由组被启用,以及由哪个宿主实现。
+- **桌面客户端**默认监听 `127.0.0.1:17800`。GPUI 的本地服务设置可开启局域网访问（`local_server_lan_enabled`），改为 `0.0.0.0`，下次启动生效；并非永远只监听回环。管理 API 与 MCP 默认关闭，脚本接管与 aria2 默认开启。
+- **[headless 服务器](/docs/zh/headless-server/setup/)**由同目录的 `fluxdown-agent --server` 与 `fluxdownd` 提供，监听地址只由 `FLUXDOWN_BIND` 决定（默认 `0.0.0.0:17800`）。全新安装默认开启兼容分组，但**未设置访问密钥不等于匿名开放**；Web 界面经 agent 的 `/rpc` 管理下载。
 
 ## 五组路由
 
 | 分组 | 端点 | 开关 | 鉴权 |
 |---|---|---|---|
 | 探活 | `GET /ping` | 总开关 | 无 |
-| 脚本接管 | `POST /download`、`POST /download/batch` | `local_server_takeover_enabled`(默认开) | 必须带 `X-FluxDown-Client` 头,外加可选 token |
-| aria2 兼容 RPC | `POST /jsonrpc`(`aria2.addUri`、`aria2.getVersion`、`aria2.getGlobalStat`、`system.multicall`、`system.listMethods`) | `local_server_jsonrpc_enabled`(默认开) | 可选 token |
-| 管理 API | `GET /api/v1/info`、`GET/POST /api/v1/tasks`、`GET/DELETE /api/v1/tasks/{id}`、`PUT /api/v1/tasks/{id}/pause\|continue`、`PUT /api/v1/tasks/pause\|continue`、`GET /api/v1/queues` | `local_server_api_enabled`(桌面默认关,headless 服务器恒开) | **强制** token |
-| MCP | `POST /mcp`(`initialize`、`tools/list`、`tools/call`、`ping`) | `local_server_mcp_enabled`(桌面默认关,headless 服务器恒开) | **强制** token(与管理 API 共用) |
+| 脚本接管 | `POST /download`、`POST /download/batch` | `local_server_takeover_enabled`（默认开） | 非空 `X-FluxDown-Client` 头；已配置 token 时必须携带 |
+| aria2 兼容 RPC | `POST /jsonrpc`、`GET /jsonrpc`（WebSocket） | `local_server_jsonrpc_enabled`（默认开） | 已配置 token 时逐调用校验（名单方法除外） |
+| 管理 API | `/api/v1/*`（任务、队列等） | `local_server_api_enabled`（桌面默认关，全新 headless 默认开） | **强制** token |
+| MCP | `POST /mcp` | `local_server_mcp_enabled`（桌面默认关，全新 headless 默认开） | **强制** token（与管理 API 共用） |
 
-管理分组开启时,`GET /api/v1/openapi.json`(无鉴权,纯接口描述不含数据)始终可用。
+headless 首次设置完成前，`/download`、`/download/batch` 与 `/jsonrpc`（POST 和 WS 升级）返回 **HTTP 403**，消息为 `setup required: set the access key first`，名单方法也不能绕过；管理 API 与 MCP 同样拒绝空密钥。Web 页面、探活与首次设置接口仍可访问（启动就绪前 setup 接口可能返回 503）。完成初始化或用合规的 `FLUXDOWN_TOKEN` 预置密钥后，兼容入口才按各自开关工作。
 
-headless 服务器额外把这些端点挂在 `/api/v1/*` 下,是桌面客户端没有的:`GET /api/v1/ws`(WebSocket)、`GET/PUT /api/v1/config`、`POST/PUT/DELETE /api/v1/queues[/{id}]`、`POST /api/v1/queues/{id}/start|stop`(在运行/停止两态间切换队列——停止会暂停队列内任务并将其排除在自动启动之外)、`PUT /api/v1/queues/{id}/schedule`(每日启停时刻 + 星期位掩码)、`PUT /api/v1/queues/{id}/order`(持久化队列内任务启动顺序)、`PUT /api/v1/tasks/{id}/queue`、`PUT /api/v1/tasks/{id}/boost`、`GET /api/v1/tasks/{id}/file`、`GET /api/v1/fs/list`、`POST /api/v1/proxy/test`、`POST /api/v1/token/regenerate`、`GET /api/v1/stats`。这些端点遵循与管理 API 相同的鉴权规则,例外是 `/ws` 与 `/tasks/{id}/file`(浏览器发起的请求无法自定义请求头,改用 `?token=` 查询参数)以及 `/openapi.json`/`/docs`(无鉴权)。
+管理分组开启时可取 `GET /api/v1/openapi.json`（免鉴权的纯接口描述）。旧 `fluxdown-server` 的扩展 REST（`/api/v1/config`、队列增删改、stats、fs/list、components、webhooks、logs、`/api/v1/ws`、`/api/v1/token/regenerate`）已不在新宿主提供；请使用 Web 界面或 `/rpc`。免鉴权的 `GET /api/v1/setup/status` 与 `POST /api/v1/setup` 仅负责首次初始化，后者只在密钥尚未设置时接受。
 
 ## 鉴权方式
 
-服务器只配置一个 token(`local_server_token`);具体怎么传取决于路由组:
+兼容 API 与 Web 共用用户访问密钥，agent 持久化在 `gateway_user_token`；从旧宿主迁移的 `local_server_token` 会导入它。这与内部的 `agent.token`、`daemon.token` 不是同一凭据。
 
 | 路由组 | 接受的形式 |
 |---|---|
-| 脚本接管 | `X-FluxDown-Token` 头(仅在配置了 token 时才校验;token 为空即该分组不鉴权)。无论是否配置 token,都必须带 `X-FluxDown-Client` 头——靠 CORS 挡住任意网页脚本的门禁。 |
-| aria2 兼容 RPC | `X-FluxDown-Token` 头,**或** aria2 自己的约定——在 JSON-RPC 调用的 `params[0]` 里传 `token:xxx`。 |
-| 管理 API(`/api/v1/*`) | `Authorization: Bearer <token>` **或** `X-FluxDown-Token` 头。未配置 token 时该分组的一切请求都会被拒绝(403)——这组端点不能在无鉴权状态下运行。 |
-| `/api/v1/ws`、`/api/v1/tasks/{id}/file` | `?token=<token>` 查询参数(浏览器的导航跳转/WebSocket 升级无法自定义请求头)。 |
+| 脚本接管 | `X-FluxDown-Token`；始终还需非空 `X-FluxDown-Client`。仅未对外暴露且未配置 token 的桌面场景可匿名使用，headless 空密钥一律拒绝。 |
+| aria2 兼容 RPC | POST 可用 `X-FluxDown-Token` 或 `params[0]="token:xxx"`；WS 每个调用只能在 params 中携带 token。`system.listMethods` / `system.listNotifications` 免逐调用 token 校验，但仍受来源与首次设置门禁。 |
+| 管理 API / MCP | `Authorization: Bearer <token>` 或 `X-FluxDown-Token`；空密钥返回 403。 |
+| agent `/rpc`（WebSocket） | Bearer；浏览器用 `Sec-WebSocket-Protocol: fluxdown.rpc.v1, fluxdown.token.<base64url(token)>`（无 padding）。带 Origin 的浏览器连接必须与服务同源。 |
+| headless `/api/web/files/tasks/{id}`、`/api/web/exports/{id}` | Bearer 或 `?token=<token>`，用于不能自定义请求头的浏览器文件下载。 |
 
-所有 token 校验都使用常量时间比较,避免时序侧信道。
+桌面开启 LAN 或 CORS、同时开启脚本接管或 aria2 时，agent 会为**空密钥自动生成并持久化随机 token**；已有密钥不覆盖，暴露面仍在时清空也会补回。启动与旧配置迁移后同样补齐。外部工具需同步配置该 token。headless 不自动补密钥，以免跳过首次设置向导。
 
-### 跨域(CORS)
+### 跨域与 Host 校验
 
-服务默认对任何请求都**不返回** `Access-Control-Allow-Origin`,带自定义头的跨域 `fetch()`(如 `/download*` 要求的 `X-FluxDown-Client`)会在预检阶段被浏览器拦下(油猴脚本走 `GM_xmlhttpRequest`,不受 CORS 约束)。但 `/jsonrpc` 的 `text/plain` POST 与 WebSocket 不触发预检,因此服务端还会校验 `Origin`:在 `/jsonrpc`(POST 与 WS 升级)和 `/download*` 上,带 `Origin` 头的请求只放行浏览器扩展(`chrome-extension://`、`moz-extension://`、`safari-web-extension://`)与同源请求,其余返回 403;不带 `Origin` 的非浏览器客户端(油猴 `GM_xmlhttpRequest`、CLI、aria2 客户端)不受影响。桌面端仅回环监听时还会要求 `Host` 为 `127.0.0.1` / `localhost` / `[::1]`,防止 DNS 重绑定。
+默认不返回 `Access-Control-Allow-Origin`。接管所需的自定义头会触发 CORS 预检；`/jsonrpc` 的简单 POST 与 WS 不触发预检，因此服务端还主动校验 Origin：`/jsonrpc`（POST/WS）和 `/download*` 只放行扩展源（`chrome-extension://`、`moz-extension://`、`safari-web-extension://`）或与 Host 同源的请求，其他浏览器跨源请求返回 403。不带 Origin 的 CLI、aria2 客户端和 `GM_xmlhttpRequest` 不受此来源门禁影响，仍须满足 token 要求。
 
-设置里的**允许任意网页跨域访问(CORS)**(`local_server_cors_allow_all`,默认关)可以放弃这道防线:开启后预检与真实响应都带 `Access-Control-Allow-Origin: *`,预检额外带 `Access-Control-Allow-Private-Network: true`,等价于 aria2 的 `--rpc-allow-origin-all`,同时 `Origin` 门禁也随之放开。用途是让那些"用浏览器 `fetch` 探测 aria2 服务"的网站能识别到 FluxDown;代价是任意网页都能探测本机端口并提交下载链接。此时仍生效的防护:管理 API 与 MCP 仍强制校验 token;aria2 入口**不会**弹确认框,建议同时设置 token(token 为空时 `aria2.changeGlobalOption` 会拒绝修改 `dir`)。
+桌面仅回环监听时，核心 API 的 Host 还必须为 `127.0.0.1`、`localhost` 或 `[::1]`（可带端口），防 DNS 重绑定；LAN/headless 模式不强制回环 Host。此限制不会因打开 CORS 而取消。
 
-## 接管 / aria2 与管理 API 的语义区别
+**允许任意网页跨域访问（CORS）**（`local_server_cors_allow_all`，默认关）会发出 `Access-Control-Allow-Origin: *`，预检额外允许私有网络访问并回显请求头，同时放开兼容入口的 Origin 门禁。代价是任意网页可探测本机服务，并在获得 token 后调用兼容入口；token 校验不会取消。aria2 与管理 API 直接建任务、不弹确认框，不能把桌面脚本接管的确认框视作普遍保护。
 
-`POST /download`、`/download/batch` 汇入"外部下载"通道:**在桌面客户端上**会在真正下载前弹出确认框(用户开启免打扰下载后则静默建任务);**在 headless 服务器上**没有界面可以弹确认框,会直接创建任务。`aria2.addUri` / `aria2.addTorrent` **不经过确认通道**,在所有宿主上都直接创建任务,与管理 API 一致——它们的防护来自 `Origin` 门禁与可选 token,而不是确认框。
+## 接管与直接建任务
 
-`POST /api/v1/tasks`(管理 API)在两种宿主上都是**直接创建任务、不弹确认框**——它假设调用方是已经通过鉴权的可信自动化客户端,而不是经由油猴脚本代为发起的不可信网页。
+`/download*` 进入外部下载流程：桌面可以弹确认框，也可按免打扰设置静默创建；headless 没有确认窗口，鉴权通过后直接创建。`aria2.addUri` / `aria2.addTorrent` 与管理 API `POST /api/v1/tasks` 始终直接建任务，不经过确认通道。**首次设置前 headless 接管和 aria2 都不可用**。
 
-简单说:只有脚本接管入口在桌面客户端上会先问;aria2 与管理 API 都不问。请给 aria2 入口配置 token(尤其在开启 CORS 或局域网访问时)。
+## 批量 RPC 与慢方法
+
+aria2 `/jsonrpc` 支持顶层 JSON 数组，按顺序执行并返回对应的响应数组；`system.multicall` 支持子调用集合。每个需鉴权的子调用都要在自己的 params 头部放 `token:xxx`（POST 也可共用有效 token 头），只在 multicall 外层放 token 不够；不允许嵌套 multicall。
+
+agent/daemon 的 `/rpc` 一帧只接受一个请求对象，不接受上述顶层数组；可发送多个不同 ID 的请求并按 ID 匹配响应。慢 daemon 方法由 `native/protocol/src/method.rs::SLOW_DAEMON_METHODS` 共享清单统一识别：daemon 有界并发处理，agent 放到独立慢通道，避免组件安装、网络探测等堵住暂停/恢复与设置写入；普通 daemon 命令仍按通道顺序执行。
+
+大量本地任务的批量操作应优先用单个 `daemon.task.pauseMany {taskIds}`、`daemon.task.resumeMany {taskIds}` 或 `daemon.task.deleteMany {taskIds, deleteFiles}`，而不是逐项并发提交单任务请求。daemon 去重并忽略不存在的 ID；空列表为空操作。整批处理后统一推任务快照，避免批量 UI 操作产生逐任务快照洪峰。
+## 内部 daemon ↔ agent 认证
+
+这不是外部 API 的登录方式。新版 agent 在不带凭据的 WS 升级后，以 `system.auth.challenge` / `system.auth.prove` 双向挑战应答先验证 daemon，再证明自己持有长期密钥，随后才发 `system.hello`；长期 `daemon.token` 不上线。blob、文件与导出 HTTP 请求只使用两端各自派生的会话 Bearer，连接断开即撤销；没有已认证会话不回退长期 token。
+
+daemon 仍接受旧常驻 agent 的有效静态 Bearer（WS 升级与 HTTP），用于二进制已升级但旧进程尚未退出的兼容窗口；新版 agent **不会**向旧 daemon 降级发送长期 token。此兼容不等于配对协议允许降级。
+
+## 局域网配对 v2
+
+配对使用一次性 6 位码（有效 120 秒）及双端 SAS 核对，不是分享用户 API token。握手必须依次经过 `/api/v1/link/pair/hello` → `/api/v1/link/pair/reveal` → `/api/v1/link/pair/confirm`：
+
+1. hello 带 `protocolVersion: 2` 与临时公钥/随机数的 SHA-256 **承诺**，不直接揭示发起方临时值；响应方先返回本次会话的临时值。
+2. reveal 揭示承诺中的值。核对承诺并验证完整转录的身份签名后，两端分别计算并展示 6 位 SAS；SAS 不作为字段在网络上传递。承诺不符或揭示超过 30 秒会作废会话，不能重放旧 reveal 或跳过此步 confirm。
+3. 双方用户肉眼核对 SAS 并批准，响应方才放行登记；配对码本身不提供抗中间人保证，不能略过 SAS 核对。
+
+两端协议版本必须严格相等，缺版本按 0 拒绝；**不兼容旧版无承诺握手，不做降级**。配对的 hello/reveal/confirm 不走管理用户 token 校验，而由一次性码、承诺、会话与本机批准保护；配对失败提示版本不兼容时应升级两端。
 
 ## curl 示例
 
@@ -167,4 +187,4 @@ fluxdown://download?url=<percent 编码的 URL>&filename=<可选文件名>
 ## 交互式文档
 
 - 本站的 [`/api-docs`](/api-docs) 渲染完整的 OpenAPI 3.1 规范(由真实路由 handler 生成),带在线试调用界面,覆盖两种宿主共有的路由。
-- 运行中的 headless 服务器还会自己提供实时的合并版规范(核心路由 + 服务器专属扩展路由):`/api/v1/docs`(Scalar 界面)与 `/api/v1/openapi.json`(原始 JSON)——始终与你正在运行的那个版本保持一致。
+- 运行中的服务器还会自己提供实时规范:`/api/v1/openapi.json`(原始 JSON)——始终与你正在运行的那个版本保持一致。

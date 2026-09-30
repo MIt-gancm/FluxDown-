@@ -87,7 +87,7 @@ FLUXDOWN_DATA_DIR=/srv/fluxdown/data \
 
 ## First run: set the access key in the Web UI
 
-The compatibility API groups (takeover, aria2 JSON-RPC, management API, MCP) are enabled from the first start in server mode (CORS stays off by default), and the listen address is decided only by `FLUXDOWN_BIND`. On first boot, if no access key is stored yet, the server enters a **pending setup** state: authenticated endpoints reject requests while the Web SPA stays reachable, so you can finish initialization in the browser (`GET /api/v1/setup/status` reports `setupRequired`).
+Fresh installations enable the compatibility API groups (takeover, aria2, management, MCP), with CORS off by default; only `FLUXDOWN_BIND` determines the listener. While no access key is set, `/download`, `/download/batch`, and `/jsonrpc` (POST/WS upgrade) return HTTP 403 (`setup required: set the access key first`); management and MCP also reject an empty key. aria2 and script takeover are therefore unavailable before first setup. The Web page and setup endpoints remain reachable; `GET /api/v1/setup/status` reports `setupRequired` (or 503 until startup is ready). Headless does not apply desktop LAN/CORS automatic token generation.
 
 Open `http://<server-ip>:17800/`. The login page becomes an **Initialize FluxDown Server** wizard (not a normal sign-in form): enter an access key, confirm it, optionally click the button to random-generate one, optionally check “Remember this device”, then save. You are signed into the main UI immediately — no server restart.
 
@@ -109,13 +109,13 @@ This flow (instead of “generate a token and print it once to stderr”) exists
 To skip the wizard (docker-compose, Kubernetes, CI), preset the key with `FLUXDOWN_TOKEN`. It is adopted only when the database still has no key:
 
 ```bash
-FLUXDOWN_TOKEN='your-strong-key-here' ./fluxdown-agent --server
+FLUXDOWN_TOKEN='replace-with-strong-key-2026' ./fluxdown-agent --server
 ```
 
 To instead force the environment variable to always win — even after someone changes the key from the Web UI — also set `FLUXDOWN_TOKEN_FORCE=1`:
 
 ```bash
-FLUXDOWN_TOKEN='your-strong-key-here' FLUXDOWN_TOKEN_FORCE=1 ./fluxdown-agent --server
+FLUXDOWN_TOKEN='replace-with-strong-key-2026' FLUXDOWN_TOKEN_FORCE=1 ./fluxdown-agent --server
 ```
 
 ### Security note
@@ -141,7 +141,7 @@ The connection string's scheme (`sqlite:` vs `postgres:`) selects the backend; b
 
 ## Exposing it safely (reverse proxy & TLS)
 
-`FLUXDOWN_BIND` defaults to `0.0.0.0:17800` — reachable on every network interface, unlike the desktop app's local API which is hardcoded to loopback only. That is intentional for headless use, but it means **you** are responsible for the network boundary:
+`FLUXDOWN_BIND` defaults to `0.0.0.0:17800`, listening on every interface. Desktop defaults to loopback but can explicitly enable LAN; headless does not use that desktop LAN switch. **The deployment owner is responsible for the network boundary**:
 
 - The management access key is the only thing standing between the internet and full remote control of your server (create/delete downloads, stream any completed file back). Treat it like a root password: don't share it, don't log it, rotate it if it may have leaked.
 - If the server is reachable beyond a trusted LAN, put it behind a reverse proxy (nginx, Caddy, Traefik) terminating TLS, and only expose HTTPS. The Web UI sends the key in a WebSocket sub-protocol header and, for file downloads, a query string; on plain HTTP that is visible to anyone on the network path.

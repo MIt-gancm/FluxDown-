@@ -4,7 +4,7 @@ condition: native/**
 interruptMode: never
 ---
 
-你正在修改 FluxDown Rust 本机核心或宿主。`native/{protocol,daemon,agent}` 已建立 crate 边界，但生产运行链路仍在迁移；不得把基础 crate 误报成已可运行服务。
+你正在修改 FluxDown Rust 本机核心或宿主。GPUI 桌面与 headless 已运行于 `native/{protocol,daemon,agent}` 链路；Flutter 的 legacy hub 仍须保持现有 wire 兼容。
 
 ## 固定分层
 
@@ -43,7 +43,8 @@ fluxdown-agent  ---- HTTPS/SSE ----> FluxCloud
 - Web 使用 HTTP + WebSocket；桌面初期复用同一传输，只有实测瓶颈后才增加 Windows Named Pipe / Unix Domain Socket。传输变化不得分叉方法、DTO、错误码或 UI 业务逻辑。
 - 二进制上传/下载、静态资源可走专用 HTTP endpoint；禁止为追求“全 JSON-RPC”把大文件普遍 Base64 化。
 - 新增 wire 类型先检查 `native/protocol` 与 `native/api/src/types.rs`，禁止创建同义 DTO；旧 API 迁移时必须一次性迁移调用方并删除旧路径。
-- 连接建立先做版本与 capability 握手；协议不兼容必须显式失败，不做静默降级或假回退。
+- daemon ↔ agent 先按 `native/protocol/src/handshake.rs` 双向挑战应答认证，再做版本与 capability 握手；新版 agent 校验服务端证明后才发客户端证明，不发送长期 token，专用 HTTP 使用会话派生凭据。daemon 保留旧 agent 静态 Bearer 校验兼容；协议不兼容必须显式失败。
+- 慢方法只维护 `fluxdown_protocol::method::SLOW_DAEMON_METHODS`，daemon 并发调度与 agent 独立通道共同消费，禁止另立清单。
 
 ## 依赖方向
 

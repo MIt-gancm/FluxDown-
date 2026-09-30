@@ -5,9 +5,9 @@ section: headless-server
 order: 2
 ---
 
-The fastest way to run the headless server is the prebuilt Docker image — no Cargo build, no separate Web UI build step. The image bundles the server binary and the Web UI, exposes everything on one port (`17800`), and persists its database, logs, and access key to a volume.
+The fastest way to run the headless server is the prebuilt Docker image — no Cargo build, no separate Web UI build step. The image bundles `fluxdown-agent` (Web UI embedded) and `fluxdownd`, runs them under `tini` (the agent starts the daemon as a child and shuts it down on `docker stop`), exposes everything on one port (`17800`), and persists its database, logs, and access key to a volume.
 
-Image: `ghcr.io/zerx-lab/fluxdown-server` (tags: a specific version like `0.1.54`, or `latest`).
+Image: `ghcr.io/zerx-lab/fluxdown-server` (tags: a specific version like `0.1.54`, or `latest`). The image name is unchanged; the entrypoint is now `tini -- fluxdown-agent --server`.
 
 > Prefer a pinned version tag over `latest` for reproducible deployments.
 
@@ -23,11 +23,12 @@ docker run -d \
   ghcr.io/zerx-lab/fluxdown-server:latest
 ```
 
-- `/data` holds the database, logs, and the access key — keep it on a persistent volume.
+- `/data` holds the database, logs, and the access key — keep it on a persistent volume. Upgrading from an older image? Reuse the same volume: the data and access key carry over.
 - `/root/Downloads` is the container's default download directory (`HOME=/root`); bind it to a host path you want files written to.
 
-On first visit to `http://<host>:17800/`, the Web UI opens an initialization wizard where you set the access key yourself (at least 8 characters, must include both letters and digits). Use that key to sign in to the Web UI and to authenticate the management API and MCP endpoint (`Authorization: Bearer <token>`).
+On first visit to `http://<host>:17800/`, the Web UI opens an initialization wizard where you set the access key yourself (at least 8 characters, must include both letters and digits). Use that key to sign in to the Web UI and to authenticate the HTTP API, MCP endpoint (`Authorization: Bearer <token>`) and the `/rpc` JSON-RPC endpoint.
 
+Before first setup completes, `/download`, `/download/batch`, and `/jsonrpc` (POST/WS upgrade) return HTTP 403 (`setup required: set the access key first`); aria2 clients and script takeover are unavailable. The Web setup page and setup endpoints remain reachable. Saving a valid key makes compatibility APIs available according to their switches, without restarting.
 For docker-compose or other orchestration, you can pre-set the key with `FLUXDOWN_TOKEN` and skip the wizard. It only takes effect when the instance has not set a key yet, unless you also set `FLUXDOWN_TOKEN_FORCE=1`, which makes it override the stored key on every restart (see [Environment variables](/docs/en/headless-server/setup/#environment-variables)):
 
 ```bash
@@ -35,7 +36,7 @@ docker run -d \
   --name fluxdown-server \
   --restart unless-stopped \
   -p 17800:17800 \
-  -e FLUXDOWN_TOKEN=your-secure-key-here \
+  -e FLUXDOWN_TOKEN=replace-with-strong-key-2026 \
   -v fluxdown-data:/data \
   -v /path/to/downloads:/root/Downloads \
   ghcr.io/zerx-lab/fluxdown-server:latest
@@ -55,7 +56,7 @@ services:
       - fluxdown-data:/data
       - ./downloads:/root/Downloads
     # environment:
-    #   FLUXDOWN_TOKEN: your-secure-key-here   # optional: preset access key, skips the init wizard
+    #   FLUXDOWN_TOKEN: replace-with-strong-key-2026   # optional: preset access key, skips the init wizard
     #   FLUXDOWN_LANG: zh
     #   FLUXDOWN_DATABASE_URL: postgres://user:pass@host:5432/fluxdown
 
@@ -116,7 +117,7 @@ On first open of the Web UI (`http://<NAS-IP>:17800`), the initialization wizard
 
 ### Upgrade and uninstall
 
-Upgrade by manually installing a newer `.spk` over the existing one — the database, access key, and settings in `var` are preserved. Uninstalling from Package Center stops the service and removes the package.
+Upgrade by manually installing a newer `.spk` over the existing one — the database, access key, and settings in `var` are preserved. The package now ships `fluxdown-agent` + `fluxdownd` (the start script runs `fluxdown-agent --server`; the log file is still `var/fluxdown-server.log`). Uninstalling from Package Center stops the service and removes the package.
 
 ## Exposing it safely
 

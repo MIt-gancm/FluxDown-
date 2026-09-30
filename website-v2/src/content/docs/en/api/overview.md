@@ -5,53 +5,73 @@ section: api
 order: 1
 ---
 
-FluxDown ships a small HTTP API — used by browser extensions, userscripts, aria2 clients, and automation — built into two places:
+FluxDown exposes an HTTP API for extensions, userscripts, aria2 clients, and automation. The aria2 `/jsonrpc` endpoint and the official clients' `/rpc` endpoint are different protocols.
 
-- **The desktop app**, on `http://127.0.0.1:17800` (port configurable, address hardcoded to loopback: it is never reachable from the network). It's off by default for the management group and on by default for the other groups; see the desktop client's local API settings.
-- **The [headless server](/docs/en/headless-server/setup/)**, on whatever address `FLUXDOWN_BIND` is set to (`0.0.0.0:17800` by default — reachable over the network by design, since remote management is the point). The management API is always enabled there, and it adds a handful of server-specific endpoints (queues, config, file retrieval, WebSocket, filesystem browsing) beyond what the desktop app exposes.
-
-Both share the same underlying route constants, request/response JSON contracts, and auth rules — only which routes are enabled, and what host implements them, differs.
+- **Desktop** listens on `127.0.0.1:17800` by default. GPUI's local-service settings can enable LAN access (`local_server_lan_enabled`), binding `0.0.0.0` on the next start; loopback is a default, not a hardcoded restriction. Management API and MCP default off; takeover and aria2 default on.
+- **The [headless server](/docs/en/headless-server/setup/)** is `fluxdown-agent --server` with a sibling `fluxdownd`. Only `FLUXDOWN_BIND` determines its listener (default `0.0.0.0:17800`). Compatibility groups default on for a fresh installation, but **an unset access key does not mean anonymous access**. The Web UI manages downloads over the agent's `/rpc`.
 
 ## Route groups
 
-| Group | Endpoints | Enabled by | Authentication |
+| Group | Endpoints | Switch | Authentication |
 |---|---|---|---|
-| Health check | `GET /ping` | always on | none |
-| Script takeover | `POST /download`, `POST /download/batch` | `local_server_takeover_enabled` (default on) | `X-FluxDown-Client` header required, plus an optional token |
-| aria2-compatible RPC | `POST /jsonrpc` (`aria2.addUri`, `aria2.getVersion`, `aria2.getGlobalStat`, `system.multicall`, `system.listMethods`) | `local_server_jsonrpc_enabled` (default on) | optional token |
-| Management API | `GET /api/v1/info`, `GET/POST /api/v1/tasks`, `GET/DELETE /api/v1/tasks/{id}`, `PUT /api/v1/tasks/{id}/pause\|continue`, `PUT /api/v1/tasks/pause\|continue`, `GET /api/v1/queues` | `local_server_api_enabled` (default off on desktop, always on for the headless server) | **required** token |
-| MCP | `POST /mcp` (`initialize`, `tools/list`, `tools/call`, `ping`) | `local_server_mcp_enabled` (default off on desktop, always on for the headless server) | **required** token (shared with the management API) |
+| Health | `GET /ping` | master switch | none |
+| Script takeover | `POST /download`, `POST /download/batch` | `local_server_takeover_enabled` (default on) | nonempty `X-FluxDown-Client`; token required when configured |
+| aria2 RPC | `POST /jsonrpc`, `GET /jsonrpc` (WebSocket) | `local_server_jsonrpc_enabled` (default on) | per-call token when configured, except method-list calls |
+| Management API | `/api/v1/*` (tasks, queues, etc.) | `local_server_api_enabled` (desktop off; fresh headless on) | **required** token |
+| MCP | `POST /mcp` | `local_server_mcp_enabled` (desktop off; fresh headless on) | **required** token, shared with management |
 
-`GET /api/v1/openapi.json` (no auth — it's a pure interface description with no data) is available whenever the management group is enabled.
+Before headless setup is complete, `/download`, `/download/batch`, and `/jsonrpc` (POST and WS upgrade) return **HTTP 403**, with `setup required: set the access key first`; method-list calls cannot bypass this gate. Management API and MCP also reject an empty key. The Web page, health check, and setup endpoints remain reachable (setup may return 503 until startup is ready). Initialize the key or preset a valid `FLUXDOWN_TOKEN` before using these compatibility endpoints; their individual switches still apply afterward.
 
-On the headless server specifically, `/api/v1/*` also includes extra routes not present on the desktop app: `GET /api/v1/ws` (WebSocket), `GET/PUT /api/v1/config`, `POST/PUT/DELETE /api/v1/queues[/{id}]`, `POST /api/v1/queues/{id}/start|stop` (flip a queue between running and stopped — stopping pauses its tasks and excludes them from auto-start), `PUT /api/v1/queues/{id}/schedule` (daily start/stop times plus a weekday mask), `PUT /api/v1/queues/{id}/order` (persist the in-queue task start order), `PUT /api/v1/tasks/{id}/queue`, `PUT /api/v1/tasks/{id}/boost`, `GET /api/v1/tasks/{id}/file`, `GET /api/v1/fs/list`, `POST /api/v1/proxy/test`, `POST /api/v1/token/regenerate`, and `GET /api/v1/stats`. These follow the same token rules as the rest of the management group, except `/ws` and `/tasks/{id}/file` (browser-initiated requests can't set custom headers, so both take `?token=` as a query parameter instead) and `/openapi.json`/`/docs` (unauthenticated).
+When management is enabled, `GET /api/v1/openapi.json` provides an unauthenticated interface description. The legacy `fluxdown-server` extension REST routes (`/api/v1/config`, queue CRUD, stats, fs/list, components, webhooks, logs, `/api/v1/ws`, and `/api/v1/token/regenerate`) are no longer offered by the new host: use the Web UI or `/rpc`. Unauthenticated `GET /api/v1/setup/status` and `POST /api/v1/setup` bootstrap the first key; the latter only accepts requests while no key is set.
 
 ## Authentication
 
-There is one configured token (`local_server_token`); how it must be presented depends on the route group:
+Compatibility APIs and the Web UI share a user access key, persisted by the agent as `gateway_user_token`. Legacy `local_server_token` values are imported during migration. This is distinct from internal `agent.token` and `daemon.token` credentials.
 
-| Route group | Accepted forms |
+| Group | Accepted forms |
 |---|---|
-| Script takeover | `X-FluxDown-Token` header (only if a token is configured — empty token means the group is unauthenticated). The `X-FluxDown-Client` header is always required regardless of token, as a CORS-based gate against arbitrary web pages. |
-| aria2-compatible RPC | `X-FluxDown-Token` header, **or** aria2's own convention of passing `token:xxx` as `params[0]` in the JSON-RPC call. |
-| Management API (`/api/v1/*`) | `Authorization: Bearer <token>` **or** `X-FluxDown-Token` header. If no token is configured, every management request is rejected (403) — this group cannot run unauthenticated. |
-| `/api/v1/ws`, `/api/v1/tasks/{id}/file` | `?token=<token>` query parameter (browser navigation/WebSocket upgrades can't set custom headers). |
+| Script takeover | `X-FluxDown-Token`, plus a nonempty `X-FluxDown-Client` in every case. Only unexposed desktop configurations without a token allow anonymous use; headless rejects an empty key. |
+| aria2 RPC | POST accepts `X-FluxDown-Token` or `params[0]="token:xxx"`; WS calls must carry the token in params. `system.listMethods` / `system.listNotifications` skip per-call token checks, not origin or first-setup gates. |
+| Management / MCP | `Authorization: Bearer <token>` or `X-FluxDown-Token`; an empty key returns 403. |
+| agent `/rpc` (WebSocket) | Bearer, or browser sub-protocols `fluxdown.rpc.v1, fluxdown.token.<base64url(token)>` (without padding). Browser connections carrying Origin must be same-origin with the service. |
+| headless `/api/web/files/tasks/{id}`, `/api/web/exports/{id}` | Bearer or `?token=<token>`, for browser downloads that cannot set custom headers. |
 
-Constant-time comparison is used everywhere a token is checked, to avoid timing side-channels.
+On desktop, enabling LAN or CORS while takeover or aria2 is enabled **automatically generates and persists a random token if the key is empty**. Existing keys are retained; clearing a key while that exposure remains generates another. Startup and legacy migration enforce the same rule. Configure external tools with this token. Headless deliberately does not auto-fill the key, preserving its first-setup wizard.
 
-### Cross-origin (CORS)
+### Cross-origin and Host validation
 
-By default the service returns **no** `Access-Control-Allow-Origin` on any request, so a cross-origin `fetch()` carrying a custom header (such as the `X-FluxDown-Client` required by `/download*`) is blocked at the preflight (userscripts use `GM_xmlhttpRequest`, which is not subject to CORS). A `text/plain` POST to `/jsonrpc` and a WebSocket do not trigger a preflight, so the server also checks `Origin`: on `/jsonrpc` (POST and WebSocket upgrade) and `/download*`, a request that carries an `Origin` header is only accepted from browser extensions (`chrome-extension://`, `moz-extension://`, `safari-web-extension://`) or the same origin, and is otherwise rejected with 403; non-browser clients that send no `Origin` (userscript `GM_xmlhttpRequest`, the CLI, aria2 clients) are unaffected. When the desktop app listens on loopback only, `Host` must also be `127.0.0.1` / `localhost` / `[::1]` to defeat DNS rebinding.
+No `Access-Control-Allow-Origin` is returned by default. Takeover's custom headers trigger a CORS preflight; simple POSTs and WS upgrades do not, so the server also checks Origin. On `/jsonrpc` (POST/WS) and `/download*`, only extension origins (`chrome-extension://`, `moz-extension://`, `safari-web-extension://`) and requests same-origin with Host are accepted; other browser cross-origin requests return 403. Clients sending no Origin, such as CLI, aria2 clients, and `GM_xmlhttpRequest`, are unaffected by this origin gate but still need the required token.
 
-The **Allow cross-origin access from any website (CORS)** setting (`local_server_cors_allow_all`, off by default) gives that barrier up: preflight and real responses both carry `Access-Control-Allow-Origin: *`, and the preflight additionally carries `Access-Control-Allow-Private-Network: true` — the equivalent of aria2's `--rpc-allow-origin-all` — and the `Origin` gate is lifted too. Its purpose is to let sites that probe for an aria2 service with a browser `fetch` detect FluxDown; the cost is that any web page can probe this port and submit download links. Still in effect: the management API and MCP still require the token; the aria2 endpoint does **not** raise a confirmation dialog, so set a token as well (with an empty token, `aria2.changeGlobalOption` refuses to change `dir`).
+For desktop loopback listeners, core API requests must also use Host `127.0.0.1`, `localhost`, or `[::1]` (an optional port is accepted), preventing DNS rebinding. LAN/headless listeners do not enforce a loopback Host. Enabling CORS does not remove this Host check.
 
-## Takeover/aria2 vs. management API: different semantics
+**Allow cross-origin access from any website (CORS)** (`local_server_cors_allow_all`, default off) returns `Access-Control-Allow-Origin: *`, permits private-network preflights, echoes requested headers, and lifts the compatibility endpoints' Origin gate. Any page can then probe the service and, if it obtains the token, invoke compatibility endpoints; token checks remain. aria2 and management create tasks directly without confirmation, so a desktop takeover dialog is not a universal safeguard.
 
-`POST /download` and `/download/batch` funnel into the "external download" path. **On the desktop app**, this pops a confirmation dialog before anything downloads (or creates the task silently if the user enabled do-not-disturb downloads). **On the headless server**, there's no UI to show a dialog, so the task is created directly. `aria2.addUri` / `aria2.addTorrent` **do not go through the confirmation path**: on every host they create the task directly, like the management API — their protection is the `Origin` gate and the optional token, not a dialog.
+## Takeover versus direct task creation
 
-`POST /api/v1/tasks` (management API) always creates the task directly, with no confirmation — on both hosts. It assumes the caller is an already-authenticated, trusted automation client, not an untrusted web page acting through a userscript.
+`/download*` uses the external-download flow: desktop may ask for confirmation or create silently under do-not-disturb settings; headless has no confirmation window and creates directly after authorization. `aria2.addUri` / `aria2.addTorrent` and management `POST /api/v1/tasks` always create directly, without that confirmation flow. **Headless takeover and aria2 are unavailable before first setup**.
 
-In short: only the takeover endpoints ask first, and only on the desktop app; aria2 and the management API never ask. Configure a token for the aria2 endpoint (especially when CORS or LAN access is enabled).
+## Batch RPC and slow methods
+
+aria2 `/jsonrpc` accepts a top-level JSON array, executing entries in order and returning corresponding responses; `system.multicall` accepts nested calls. Every authenticated child needs its own leading `token:xxx` param (POST can alternatively share a valid token header); a token only on the outer multicall envelope is insufficient. Nested multicall is forbidden.
+
+agent/daemon `/rpc` accepts one request object per frame, not that top-level array. Send separate requests with distinct IDs and match responses by ID for concurrent calls. Both use `native/protocol/src/method.rs::SLOW_DAEMON_METHODS`: daemon runs slow calls with bounded concurrency, and agent gives them an independent slow lane, keeping installs and network probes from blocking pause/resume or settings writes. Ordinary daemon commands retain their lane's ordering.
+
+For bulk local-task mutations, prefer one `daemon.task.pauseMany {taskIds}`, `daemon.task.resumeMany {taskIds}`, or `daemon.task.deleteMany {taskIds, deleteFiles}` call over many concurrent single-task requests. The daemon deduplicates IDs and ignores unknown ones; an empty list is a no-op. It emits a consolidated task snapshot after the batch rather than a per-task snapshot flood.
+## Internal daemon ↔ agent authentication
+
+This is not an external API login mechanism. After a credential-free WS upgrade, a new agent uses `system.auth.challenge` / `system.auth.prove` to verify the daemon and then prove possession of the shared long-term key, before `system.hello`. The long-term `daemon.token` is never transmitted. Blob, file, and export HTTP requests use a session Bearer derived independently by both parties and revoked on disconnect; no authenticated session means no fallback to the long-term token.
+
+The daemon still accepts valid static Bearers from an older resident agent, on WS upgrade and HTTP, for the window where binaries have been replaced but that process is still running. A new agent **never** downgrades by sending its long-term token to an old daemon. This compatibility does not permit pairing-protocol downgrade.
+
+## LAN pairing v2
+
+Pairing uses a single-use six-digit code (120-second lifetime) and a SAS comparison on both devices, not sharing the user API key. The required sequence is `/api/v1/link/pair/hello` → `/api/v1/link/pair/reveal` → `/api/v1/link/pair/confirm`:
+
+1. hello carries `protocolVersion: 2` and a SHA-256 **commitment** to the initiator's ephemeral key/nonce, not those values themselves. The responder returns its fresh ephemeral values first.
+2. reveal discloses the committed values. After commitment verification and validation of the identity signature over the full transcript, each device computes and displays its six-digit SAS locally; the SAS is not transmitted as a field. A mismatched commitment or reveal later than 30 seconds invalidates the session. An old reveal cannot be replayed, and confirm cannot skip this step.
+3. Users compare the SAS on both devices and approve before the responder permits registration. The code alone provides no protection against a man-in-the-middle; never skip SAS comparison.
+
+Protocol versions must match exactly; a missing version is treated as 0 and rejected. **The old, commitment-free handshake is incompatible and never used as a downgrade**. hello/reveal/confirm use the code, commitment, session, and local approval rather than the management user-token gate. Upgrade both devices if pairing reports a version mismatch.
 
 ## curl examples
 
@@ -166,4 +186,4 @@ Note the protocol carries no cookies, headers, or credentials — the receiving 
 ## Interactive documentation
 
 - [`/api-docs`](/api-docs) on this site renders the full OpenAPI 3.1 spec (generated from the actual route handlers) with a try-it-out UI, for the routes common to both hosts.
-- A running headless server also serves its own live, merged spec (core + server-specific extension routes) at `/api/v1/docs` (Scalar UI) and `/api/v1/openapi.json` (raw JSON) — always in sync with the exact build you're running.
+- A running server also serves its own live spec at `/api/v1/openapi.json` (raw JSON) — always in sync with the exact build you're running.
