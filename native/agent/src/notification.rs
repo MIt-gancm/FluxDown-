@@ -109,7 +109,7 @@ const OSASCRIPT: &str = "/usr/bin/osascript";
 /// `osascript` 参数：标题 / 正文经 `argv` 传入，不拼进脚本源码（文件名里的引号、反斜杠
 /// 不会破坏脚本，也无从注入）。标题在前且非空，osascript 在它之后停止解析选项，正文以
 /// `-` 开头也安全。
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 fn osascript_notification_args<'a>(title: &'a str, body: &'a str) -> [&'a str; 8] {
     [
         "-e",
