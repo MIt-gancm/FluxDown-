@@ -16,7 +16,7 @@ use fluxdown_ui_downloads::{
 };
 use fluxdown_ui_i18n::keys;
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
-use gpui::{App, AppContext as _, Bounds, Global, WeakEntity, WindowBounds, px, size};
+use gpui::{App, AppContext as _, Global, WeakEntity, px, size};
 use gpui_component::{Root, WindowExt as _, notification::Notification};
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
     downloads_port::AgentDownloadsPort,
     lifecycle,
     session::{SessionSignal, agent_body},
-    windows::{WindowKey, WindowRegistry},
+    windows::{RememberedWindow, WindowKey, WindowRegistry},
 };
 
 const NEW_DOWNLOAD_WINDOW_SIZE: gpui::Size<gpui::Pixels> = size(px(640.), px(530.));
@@ -202,17 +202,20 @@ fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCap
     let translator = desktop.translator.clone();
     let client = desktop.client.clone();
     let title = translator.read(cx).text(keys::NEW_DOWNLOAD).to_owned();
-    let display_id = WindowRegistry::main_display_id(cx);
-    let bounds = Bounds::centered(display_id, NEW_DOWNLOAD_WINDOW_SIZE, cx);
     let mut options = auxiliary_window_options(title);
-    options.display_id = display_id;
-    options.window_bounds = Some(WindowBounds::Windowed(bounds));
+    options.display_id = WindowRegistry::main_display_id(cx);
     options.window_min_size = Some(NEW_DOWNLOAD_WINDOW_MIN_SIZE);
     options.is_resizable = true;
+    WindowRegistry::restore_bounds(
+        RememberedWindow::NewDownload,
+        &mut options,
+        NEW_DOWNLOAD_WINDOW_SIZE,
+        cx,
+    );
 
     let handle =
         WindowRegistry::open_or_focus(cx, WindowKey::NewDownload, options, move |window, cx| {
-            let port = Arc::new(AgentDownloadsPort::new(client));
+            let port = Arc::new(AgentDownloadsPort::new(client.clone()));
             let submit_port = Arc::clone(&port);
             let on_submit = Rc::new(
                 move |submission, _window: &mut gpui::Window, cx: &mut App| {
@@ -241,7 +244,15 @@ fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCap
             let window_view = cx.new(|cx| {
                 AuxiliaryWindowView::new(translator, keys::NEW_DOWNLOAD, form.into(), cx)
             });
-            cx.new(|cx| Root::new(window_view, window, cx))
+            let root = cx.new(|cx| Root::new(window_view, window, cx));
+            WindowRegistry::persist_bounds(
+                RememberedWindow::NewDownload,
+                client,
+                &root,
+                window,
+                cx,
+            );
+            root
         });
     // 菜单入口与外部捕获都是需要用户立即处理的操作：macOS 后台时也要将窗口及应用置前。
     if let Some(handle) = handle {

@@ -14,7 +14,7 @@ use crate::{
     app::Desktop,
     capability_ports::AgentExtensionsPort,
     session::attach,
-    windows::{WindowKey, WindowRegistry},
+    windows::{RememberedWindow, WindowKey, WindowRegistry},
 };
 
 const SETTINGS_WINDOW_SIZE: gpui::Size<gpui::Pixels> = size(px(1240.), px(760.));
@@ -27,15 +27,14 @@ pub fn open(cx: &mut App) {
     let settings_store = desktop.settings_store.clone();
     let account_host = desktop.account_host.clone();
     let title = translator.read(cx).text(keys::SETTINGS).to_owned();
-    let stored = Desktop::pref(cx, "desktop.window.settings");
     let mut options = auxiliary_window_options(title);
-    options.window_bounds = Some(WindowRegistry::restore_bounds(
-        &WindowKey::Settings,
-        stored.as_ref(),
+    options.window_min_size = Some(size(px(1000.), px(600.)));
+    WindowRegistry::restore_bounds(
+        RememberedWindow::Settings,
+        &mut options,
         SETTINGS_WINDOW_SIZE,
         cx,
-    ));
-    options.window_min_size = Some(size(px(1000.), px(600.)));
+    );
 
     WindowRegistry::open_or_focus(cx, WindowKey::Settings, options, move |window, cx| {
         let extensions_port = Arc::new(AgentExtensionsPort::new(client.clone()));
@@ -60,7 +59,7 @@ pub fn open(cx: &mut App) {
         let window_view =
             cx.new(|cx| AuxiliaryWindowView::new(translator, keys::SETTINGS, settings.into(), cx));
         let root = cx.new(|cx| Root::new(window_view, window, cx));
-        WindowRegistry::persist_bounds(&WindowKey::Settings, client, &root, window, cx);
+        WindowRegistry::persist_bounds(RememberedWindow::Settings, client, &root, window, cx);
         root
     });
 }

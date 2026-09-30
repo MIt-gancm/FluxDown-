@@ -17,7 +17,7 @@ use crate::{
     capability_ports::AgentRssPort,
     downloads_port::AgentDownloadsPort,
     session::attach,
-    windows::{WindowKey, WindowRegistry, confirm_active_tasks},
+    windows::{RememberedWindow, WindowKey, WindowRegistry, confirm_active_tasks},
 };
 
 const MAIN_WINDOW_SIZE: gpui::Size<gpui::Pixels> = size(px(1120.), px(760.));
@@ -36,14 +36,8 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
     let client = desktop.client.clone();
     let settings_store = desktop.settings_store.clone();
     let menu_bar = desktop.menu_bar.clone();
-    let stored = Desktop::pref(cx, "desktop.window.main");
     let mut options = main_window_options();
-    options.window_bounds = Some(WindowRegistry::restore_bounds(
-        &WindowKey::Main,
-        stored.as_ref(),
-        MAIN_WINDOW_SIZE,
-        cx,
-    ));
+    WindowRegistry::restore_bounds(RememberedWindow::Main, &mut options, MAIN_WINDOW_SIZE, cx);
 
     let handle = WindowRegistry::open_or_focus(cx, WindowKey::Main, options, move |window, cx| {
         let downloads_port = Arc::new(AgentDownloadsPort::new(client.clone()));
@@ -175,7 +169,7 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
         }
 
         let root = cx.new(|cx| Root::new(shell, window, cx));
-        WindowRegistry::persist_bounds(&WindowKey::Main, client, &root, window, cx);
+        WindowRegistry::persist_bounds(RememberedWindow::Main, client, &root, window, cx);
         install_close_policy(window, cx);
         root
     });

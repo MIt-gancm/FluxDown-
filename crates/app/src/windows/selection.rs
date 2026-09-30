@@ -15,7 +15,7 @@ use crate::{
     app::Desktop,
     downloads_port::AgentDownloadsPort,
     session::{SessionSignal, agent_body},
-    windows::{WindowKey, WindowRegistry},
+    windows::{RememberedWindow, WindowKey, WindowRegistry},
 };
 
 const HLS_VARIANT_SIZE: gpui::Size<gpui::Pixels> = size(px(520.), px(440.));
@@ -88,10 +88,7 @@ fn open(cx: &mut App, request: SelectionRequestDto) {
         SelectionKind::Bt { .. } => "btFileSelectTitle",
         SelectionKind::Variant { .. } => "resolveVariantTitle",
     };
-    let window_size = match &request.kind {
-        SelectionKind::Bt { .. } => BT_SIZE,
-        _ => HLS_VARIANT_SIZE,
-    };
+    let is_bt = matches!(request.kind, SelectionKind::Bt { .. });
     let display_id = WindowRegistry::handle(cx, &WindowKey::Main)
         .and_then(|handle| {
             handle
@@ -100,13 +97,21 @@ fn open(cx: &mut App, request: SelectionRequestDto) {
                 .flatten()
         })
         .map(|display| display.id());
-    let bounds = Bounds::centered(display_id, window_size, cx);
     let mut options = auxiliary_window_options(translator.read(cx).text(title_key).to_owned());
     options.display_id = display_id;
-    options.window_bounds = Some(WindowBounds::Windowed(bounds));
     options.window_min_size = None;
     options.kind = WindowKind::Floating;
-    options.is_resizable = matches!(request.kind, SelectionKind::Bt { .. });
+    options.is_resizable = is_bt;
+    // 只有 BT 文件列表可调尺寸，记住用户调整后的尺寸；画质 / 变体选择固定尺寸。
+    if is_bt {
+        WindowRegistry::restore_bounds(RememberedWindow::BtSelection, &mut options, BT_SIZE, cx);
+    } else {
+        options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
+            display_id,
+            HLS_VARIANT_SIZE,
+            cx,
+        )));
+    }
 
     WindowRegistry::open_or_focus(cx, key, options, move |window, cx| {
         if !task_name.is_empty() {
@@ -125,7 +130,17 @@ fn open(cx: &mut App, request: SelectionRequestDto) {
         });
         let window_view = cx
             .new(|cx| AuxiliaryWindowView::new(translator.clone(), title_key, content.into(), cx));
-        cx.new(|cx| Root::new(window_view, window, cx))
+        let root = cx.new(|cx| Root::new(window_view, window, cx));
+        if is_bt {
+            WindowRegistry::persist_bounds(
+                RememberedWindow::BtSelection,
+                client,
+                &root,
+                window,
+                cx,
+            );
+        }
+        root
     });
 }
 

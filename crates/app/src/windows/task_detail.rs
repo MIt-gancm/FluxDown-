@@ -5,14 +5,14 @@ use std::{rc::Rc, sync::Arc};
 
 use fluxdown_ui_downloads::{DownloadHostActions, TaskDetailView};
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
-use gpui::{App, AppContext as _, Bounds, SharedString, WindowBounds, px, size};
+use gpui::{App, AppContext as _, SharedString, px, size};
 use gpui_component::Root;
 
 use crate::{
     app::Desktop,
     downloads_port::AgentDownloadsPort,
     session::attach,
-    windows::{WindowKey, WindowRegistry},
+    windows::{RememberedWindow, WindowKey, WindowRegistry},
 };
 
 const TASK_WINDOW_SIZE: gpui::Size<gpui::Pixels> = size(px(560.), px(420.));
@@ -28,11 +28,12 @@ pub fn open(cx: &mut App, task_id: String) {
 
     let mut options = auxiliary_window_options(placeholder_title);
     options.window_min_size = Some(TASK_WINDOW_MIN_SIZE);
-    options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(
-        None,
+    WindowRegistry::restore_bounds(
+        RememberedWindow::TaskDetail,
+        &mut options,
         TASK_WINDOW_SIZE,
         cx,
-    )));
+    );
 
     let key = WindowKey::TaskDetail(task_id.clone());
     WindowRegistry::open_or_focus(cx, key, options, move |window, cx| {
@@ -59,7 +60,7 @@ pub fn open(cx: &mut App, task_id: String) {
             AuxiliaryWindowView::new(translator.clone(), "detail", detail.clone().into(), cx)
         });
 
-        cx.new(|cx| {
+        let root = cx.new(|cx| {
             let root = Root::new(window_view.clone(), window, cx);
             cx.observe_in(&detail, window, move |_, detail, window, cx| {
                 let title = detail
@@ -79,6 +80,8 @@ pub fn open(cx: &mut App, task_id: String) {
             })
             .detach();
             root
-        })
+        });
+        WindowRegistry::persist_bounds(RememberedWindow::TaskDetail, client, &root, window, cx);
+        root
     });
 }
