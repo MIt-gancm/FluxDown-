@@ -83,7 +83,7 @@ impl DownloadView {
                             .size(icon_size)
                             .text_color(destructive),
                     )
-                    .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
+                    .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
                         menu.item(
                             PopupMenuItem::new(delete_task.clone())
                                 .icon(FluxIcon::Trash2)
