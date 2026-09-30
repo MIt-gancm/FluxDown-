@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -172,6 +172,9 @@ impl GatewayService {
     async fn dispatch(&self, request: RpcRequest) -> Result<serde_json::Value, RpcErrorData> {
         // 桌面专属集成（打开 / 定位文件、开机自启、文件与协议关联）在 headless 宿主不存在。
         if self.server_mode && request.method.starts_with("agent.platform.") {
+            return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
+        }
+        if self.server_mode && server_mode_denies(&request) {
             return Err(RpcErrorData::new(ApplicationErrorCode::Unsupported, false));
         }
         match request.method.as_str() {
@@ -1228,9 +1231,12 @@ pub async fn serve(
         Some(server) => app.merge(crate::server_mode::router(server)),
         None => app,
     };
-    axum::serve(listener, app)
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(cancel.cancelled_owned())
+    .await
 }
 
 pub async fn load_or_create_bearer(
@@ -1270,14 +1276,13 @@ pub async fn load_or_create_bearer(
 
 async fn rpc_upgrade(
     State(state): State<GatewayState>,
+    ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
     let upgrade = match state.server.as_deref() {
         Some(server) => {
-            if let Err(status) =
-                crate::server_mode::authorize_rpc(&headers, &state.bearer, server.access_key())
-            {
+            if let Err(status) = server.authorize_rpc_from(peer.ip(), &headers, &state.bearer) {
                 return status.into_response();
             }
             // 浏览器经子协议携带密钥：必须回显 `fluxdown.rpc.v1`，否则浏览器会断开握手。
@@ -1431,6 +1436,29 @@ const RESPONSE_QUEUE: usize = 256;
 /// 每个通道待处理请求上限；超出立即以可重试的 `Unavailable` 拒绝，而不是阻塞整个连接。
 const LANE_QUEUE: usize = 128;
 
+/// headless 宿主不提供桌面集成：打开路径、写注册表 / 关联的诊断动作，以及可写任意目标路径的日志导出。
+/// Web 的 Doctor 仍可用其余动作（刷新 tracker / ed2k 服务器等），日志导出走 `/api/web/logs/export`。
+fn server_mode_denies(request: &RpcRequest) -> bool {
+    match request.method.as_str() {
+        method::AGENT_DIAGNOSTICS_EXPORT_LOGS => true,
+        method::AGENT_DIAGNOSTICS_REPAIR => request
+            .params
+            .as_ref()
+            .and_then(|params| params.get("action"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|action| {
+                matches!(
+                    action,
+                    crate::diagnostics::ACTION_OPEN_LOG_DIR
+                        | crate::diagnostics::ACTION_REGISTER
+                        | crate::diagnostics::ACTION_REREGISTER
+                        | crate::diagnostics::ACTION_USE_THIS_INSTALL
+                )
+            }),
+        _ => false,
+    }
+}
+
 /// 请求通道：同一通道内串行（保持命令顺序），不同通道并发。
 #[derive(Clone, Copy)]
 enum Lane {
@@ -1442,6 +1470,8 @@ enum Lane {
     Local,
     /// 系统文件图标：列表首屏会一次发出一批，单独成道，不拖慢打开文件等本机操作。
     Icon,
+    /// 局域网配对 / 诊断：含最长约 70s 的对端等待或外部探测，单独成道，不堵住心跳与本机设置操作。
+    Slow,
 }
 
 fn lane_for(method_name: &str) -> Lane {
@@ -1467,6 +1497,10 @@ fn lane_for(method_name: &str) -> Lane {
         .any(|prefix| method_name.starts_with(prefix))
     {
         Lane::Cloud
+    } else if method_name.starts_with("agent.link.")
+        || method_name.starts_with("agent.diagnostics.")
+    {
+        Lane::Slow
     } else {
         Lane::Local
     }
@@ -1477,6 +1511,7 @@ struct RequestLanes {
     daemon: tokio::sync::mpsc::Sender<RpcRequest>,
     local: tokio::sync::mpsc::Sender<RpcRequest>,
     icon: tokio::sync::mpsc::Sender<RpcRequest>,
+    slow: tokio::sync::mpsc::Sender<RpcRequest>,
 }
 
 impl RequestLanes {
@@ -1503,6 +1538,7 @@ impl RequestLanes {
             daemon: start(),
             local: start(),
             icon: start(),
+            slow: start(),
         }
     }
 
@@ -1513,6 +1549,7 @@ impl RequestLanes {
             Lane::Daemon => &self.daemon,
             Lane::Local => &self.local,
             Lane::Icon => &self.icon,
+            Lane::Slow => &self.slow,
         };
         let id = request.id.clone();
         match sender.try_send(request) {
@@ -1573,7 +1610,10 @@ mod tests {
         AgentSnapshot, ApplicationErrorCode, RequestId, RpcRequest, RpcResponse,
     };
 
-    use super::{GatewayService, GatewayShell, authorized, load_or_create_bearer};
+    use super::{
+        GatewayService, GatewayShell, Lane, authorized, lane_for, load_or_create_bearer,
+        server_mode_denies,
+    };
     #[tokio::test]
     async fn service_bearer_is_exact_stable_and_private() {
         let dir = std::env::temp_dir().join(format!(
@@ -1978,6 +2018,37 @@ mod tests {
             }
         }
         harness.finish().await;
+    }
+
+    #[test]
+    fn server_mode_denies_desktop_diagnostics_but_keeps_web_doctor_actions() {
+        let request = |method_name: &str, params: serde_json::Value| {
+            RpcRequest::new(RequestId::Integer(1), method_name, Some(params))
+        };
+        let repair = fluxdown_protocol::method::AGENT_DIAGNOSTICS_REPAIR;
+        for action in ["open_log_dir", "register", "reregister", "use_this_install"] {
+            assert!(
+                server_mode_denies(&request(repair, serde_json::json!({ "action": action }))),
+                "{action}"
+            );
+        }
+        for action in ["refreshTrackers", "refreshEd2kServers"] {
+            assert!(
+                !server_mode_denies(&request(repair, serde_json::json!({ "action": action }))),
+                "{action}"
+            );
+        }
+        assert!(server_mode_denies(&request(
+            fluxdown_protocol::method::AGENT_DIAGNOSTICS_EXPORT_LOGS,
+            serde_json::json!({ "targetPath": "/tmp/x.zip" })
+        )));
+    }
+
+    #[test]
+    fn slow_network_methods_do_not_share_the_local_lane() {
+        assert!(matches!(lane_for("agent.link.pairFinish"), Lane::Slow));
+        assert!(matches!(lane_for("agent.diagnostics.run"), Lane::Slow));
+        assert!(matches!(lane_for("system.ping"), Lane::Local));
     }
 
     #[tokio::test]

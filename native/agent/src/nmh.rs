@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use fluxdown_api::service::LiveSpeed;
 use fluxdown_protocol::{DownloadRequest, TaskDto};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -13,6 +14,7 @@ use crate::daemon_client::DaemonClient;
 
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
 const MAX_BATCH_ITEMS: usize = 1000;
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
 const MAX_COMPLETED_TASKS: usize = 10;
 
 #[derive(Deserialize)]
@@ -98,12 +100,24 @@ impl PipeResponse {
 pub struct NmhService {
     daemon: Arc<DaemonClient>,
     capture: Arc<CaptureService>,
+    task_events: Option<crate::task_events::TaskEventHub>,
 }
 
 impl NmhService {
     #[must_use]
     pub fn new(daemon: Arc<DaemonClient>, capture: Arc<CaptureService>) -> Self {
-        Self { daemon, capture }
+        Self {
+            daemon,
+            capture,
+            task_events: None,
+        }
+    }
+
+    /// 注入实时速率来源；未注入时 `tasks` 应答的速度恒为 0。
+    #[must_use]
+    pub fn with_task_events(mut self, task_events: crate::task_events::TaskEventHub) -> Self {
+        self.task_events = Some(task_events);
+        self
     }
 
     pub async fn run(self, cancel: CancellationToken) -> Result<(), std::io::Error> {
@@ -151,16 +165,14 @@ impl NmhService {
             Err(error) => return PipeResponse::error(msg_id, error.to_string()),
         };
         let count = batch.items.len();
-        for request in batch.items {
-            if let Err(error) = self
-                .capture
-                .submit(request, crate::capture::CaptureOrigin::External)
-                .await
-            {
-                return PipeResponse::error(msg_id, error.to_string());
-            }
+        match self
+            .capture
+            .submit_many(batch.items, crate::capture::CaptureOrigin::External)
+            .await
+        {
+            Ok(_) => PipeResponse::ok(msg_id, format!("batch accepted ({count} items)")),
+            Err(error) => PipeResponse::error(msg_id, error.to_string()),
         }
-        PipeResponse::ok(msg_id, format!("batch accepted ({count} items)"))
     }
 
     async fn task_list(&self, msg_id: u64) -> PipeResponse {
@@ -172,7 +184,12 @@ impl NmhService {
             Ok(tasks) => tasks,
             Err(error) => return PipeResponse::error(msg_id, format!("{:?}", error.code)),
         };
-        PipeResponse::tasks(msg_id, select_task_briefs(tasks))
+        let speeds = self
+            .task_events
+            .as_ref()
+            .map(crate::task_events::TaskEventHub::live_speeds)
+            .unwrap_or_default();
+        PipeResponse::tasks(msg_id, select_task_briefs(tasks, &speeds))
     }
 
     async fn task_operation(&self, msg_id: u64, payload: Value) -> PipeResponse {
@@ -228,7 +245,10 @@ impl NmhService {
     }
 }
 
-fn select_task_briefs(tasks: Vec<TaskDto>) -> Vec<TaskBrief> {
+fn select_task_briefs(
+    tasks: Vec<TaskDto>,
+    speeds: &std::collections::HashMap<String, LiveSpeed>,
+) -> Vec<TaskBrief> {
     let (mut completed, active): (Vec<_>, Vec<_>) =
         tasks.into_iter().partition(|task| task.status == 3);
     completed
@@ -238,12 +258,14 @@ fn select_task_briefs(tasks: Vec<TaskDto>) -> Vec<TaskBrief> {
         .into_iter()
         .chain(completed)
         .map(|task| TaskBrief {
+            speed: speeds
+                .get(&task.task_id)
+                .map_or(0, |speed| speed.download_bps),
             task_id: task.task_id,
             file_name: task.file_name,
             status: task.status,
             downloaded_bytes: task.downloaded_bytes,
             total_bytes: task.total_bytes,
-            speed: 0,
             error_message: task.error_message,
             created_at: task.created_at,
         })
@@ -313,7 +335,15 @@ async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<()
                 return Ok(());
             }
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(error) => {
+                        // 瞬时 accept 错误（如 fd 耗尽）退避重试，不让 NMH 端点连带终止 agent。
+                        tracing::warn!(error = %error, "NMH socket accept failed");
+                        tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                        continue;
+                    }
+                };
                 let service = service.clone();
                 tokio::spawn(async move {
                     if let Err(error) = handle_stream(stream, service).await {
@@ -364,7 +394,14 @@ async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<()
         first = false;
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
-            connected = server.connect() => connected?,
+            connected = server.connect() => {
+                if let Err(error) = connected {
+                    // 单个客户端的握手失败不应让整个 NMH 端点（乃至 agent）退出。
+                    tracing::warn!(error = %error, "NMH pipe connect failed");
+                    tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
+            }
         }
         let service = service.clone();
         tokio::spawn(async move {
@@ -1517,6 +1554,30 @@ mod tests {
         MAX_BATCH_ITEMS, NmhService, PipeMessage, handle_stream, ping_stream, select_task_briefs,
     };
 
+    #[test]
+    fn task_panel_reports_live_download_speed() {
+        let task = |id: &str| -> fluxdown_protocol::TaskDto {
+            serde_json::from_value(json!({
+                "taskId": id, "url": "https://example.com/a", "fileName": "a",
+                "saveDir": "/tmp", "status": 1, "downloadedBytes": 1, "totalBytes": 2,
+                "errorMessage": "", "createdAt": "1", "proxyUrl": "", "queueId": "main",
+                "checksum": ""
+            }))
+            .expect("task")
+        };
+        let mut speeds = std::collections::HashMap::new();
+        speeds.insert(
+            "fast".to_owned(),
+            fluxdown_api::service::LiveSpeed {
+                download_bps: 4096,
+                upload_bps: 1,
+            },
+        );
+        let selected = select_task_briefs(vec![task("fast"), task("idle")], &speeds);
+        assert_eq!(selected[0].speed, 4096);
+        assert_eq!(selected[1].speed, 0);
+    }
+
     #[tokio::test]
     async fn ipc_ping_round_trips_through_frame_protocol() {
         let daemon = Arc::new(crate::daemon_client::DaemonClient::disconnected());
@@ -1563,7 +1624,7 @@ mod tests {
                 .expect("task")
             })
             .collect();
-        let selected = select_task_briefs(tasks);
+        let selected = select_task_briefs(tasks, &std::collections::HashMap::new());
         assert_eq!(selected.len(), 11);
         assert_eq!(selected[0].task_id, "task-0");
         assert_eq!(selected[1].task_id, "task-14");

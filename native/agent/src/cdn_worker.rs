@@ -1,6 +1,8 @@
 //! CDN 云端先验下发与 daemon 样本租约上传工作器。
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use fluxdown_protocol::{
@@ -40,6 +42,7 @@ impl CdnWorker {
         let mut config_tick = tokio::time::interval(CONFIG_INTERVAL);
         let mut report_tick = tokio::time::interval(REPORT_INTERVAL);
         let (mut events, _) = self.events.subscribe_and_snapshot();
+        let completion_upload_pending = Arc::new(AtomicBool::new(false));
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -56,9 +59,12 @@ impl CdnWorker {
                 event = events.recv() => {
                     if let Ok(frame) = event
                         && is_task_completion(&frame.event)
+                        && !completion_upload_pending.swap(true, Ordering::AcqRel)
                     {
+                        // 多个任务连续完成合并为一次延迟上报，避免重复领取同一租约。
                         let worker = self.clone();
                         let trigger_cancel = cancel.clone();
+                        let pending = Arc::clone(&completion_upload_pending);
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = trigger_cancel.cancelled() => {}
@@ -68,6 +74,7 @@ impl CdnWorker {
                                     }
                                 }
                             }
+                            pending.store(false, Ordering::Release);
                         });
                     }
                 }
@@ -158,11 +165,17 @@ impl Clone for CdnWorker {
     }
 }
 
+/// 只有真正的完成迁移才触发上报：做种中的任务每个评估周期都会发 `status=3` 进度帧
+/// （`seeding_status=1`），不能当作完成。
 fn is_task_completion(event: &ServiceEvent) -> bool {
     matches!(
         event,
         ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::Engine(
-            WsServerMsg::TaskProgress { status: 3, .. }
+            WsServerMsg::TaskProgress {
+                status: 3,
+                seeding_status: 0,
+                ..
+            }
         )))
     )
 }
@@ -184,4 +197,39 @@ pub enum WorkerError {
     Daemon(fluxdown_protocol::RpcErrorData),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+}
+
+#[cfg(test)]
+mod tests {
+    use fluxdown_protocol::{AgentEvent, DaemonEvent, ServiceEvent, WsServerMsg};
+
+    use super::is_task_completion;
+
+    fn progress(status: i32, seeding_status: i32) -> ServiceEvent {
+        ServiceEvent::Agent(AgentEvent::Daemon(DaemonEvent::Engine(
+            WsServerMsg::TaskProgress {
+                task_id: "t".to_owned(),
+                status,
+                downloaded_bytes: 0,
+                total_bytes: 0,
+                speed: 0,
+                upload_speed: 0,
+                file_name: String::new(),
+                save_dir: String::new(),
+                url: String::new(),
+                error_message: String::new(),
+                uploaded_bytes: 0,
+                seeding_status,
+                seeding_message: String::new(),
+                seeding_time_secs: 0,
+            },
+        )))
+    }
+
+    #[test]
+    fn seeding_progress_frames_are_not_completions() {
+        assert!(is_task_completion(&progress(3, 0)));
+        assert!(!is_task_completion(&progress(3, 1)));
+        assert!(!is_task_completion(&progress(1, 0)));
+    }
 }

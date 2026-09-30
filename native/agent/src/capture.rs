@@ -17,7 +17,8 @@ use crate::daemon_client::DaemonClient;
 use crate::event_hub::AgentEventHub;
 use crate::shell::ShellState;
 
-const CAPTURE_CAPACITY: usize = 64;
+/// 不小于 NMH 单批上限（1000），否则合法的整批多选会被确认队列整体拒绝。
+const CAPTURE_CAPACITY: usize = 1000;
 
 /// 「免打扰下载」：外部接管请求不弹确认，直接按默认设置建任务（设置页 `download.rs`）。
 pub(crate) const SILENT_DOWNLOAD_PREF: &str = "download.silent_download";
@@ -88,7 +89,7 @@ impl CaptureService {
         Self {
             daemon,
             events,
-            pending: Mutex::new(VecDeque::with_capacity(CAPTURE_CAPACITY)),
+            pending: Mutex::new(VecDeque::new()),
             shell,
         }
     }
@@ -103,7 +104,20 @@ impl CaptureService {
         request: DownloadRequest,
         origin: CaptureOrigin,
     ) -> Result<Value, CaptureError> {
-        let requests = split_batch(request);
+        self.submit_many(vec![request], origin).await
+    }
+
+    /// 多个请求作为一个整体按 [`submit`](Self::submit) 的规则分流：确认队列容量按整批检查，
+    /// 放不下时整批拒绝且不留下任何半入队的事务，入队后只发布一次队列变更。
+    pub async fn submit_many(
+        &self,
+        requests: Vec<DownloadRequest>,
+        origin: CaptureOrigin,
+    ) -> Result<Value, CaptureError> {
+        let requests = requests
+            .into_iter()
+            .flat_map(split_batch)
+            .collect::<Vec<_>>();
         if origin == CaptureOrigin::Direct {
             return self.create_all(requests, None, true).await;
         }
@@ -466,6 +480,8 @@ impl DaemonBlobClient {
         // 位于 Gateway 开始服务前的装配路径上）。
         let http = reqwest::Client::builder()
             .tls_built_in_root_certs(false)
+            // 回环 daemon 不能经环境 / 系统代理转发，否则 bearer 与文件字节会离开本机。
+            .no_proxy()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(60))
             .build()?;
@@ -582,6 +598,22 @@ mod tests {
         let result = capture.submit(captured(), CaptureOrigin::External).await;
         assert!(matches!(result, Err(super::CaptureError::Daemon(_))));
         assert!(capture.list().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_batch_is_rejected_whole_without_partial_enqueue() {
+        let capture = service(json!({}));
+        let too_many = (0..=super::CAPTURE_CAPACITY).map(|_| captured()).collect();
+        let result = capture.submit_many(too_many, CaptureOrigin::External).await;
+        assert!(matches!(result, Err(super::CaptureError::Full)));
+        assert!(capture.list().await.is_empty());
+
+        let fits = (0..super::CAPTURE_CAPACITY).map(|_| captured()).collect();
+        capture
+            .submit_many(fits, CaptureOrigin::External)
+            .await
+            .expect("whole batch fits");
+        assert_eq!(capture.list().await.len(), super::CAPTURE_CAPACITY);
     }
 
     #[test]
