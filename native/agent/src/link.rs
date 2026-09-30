@@ -24,7 +24,7 @@ use crate::state::{AgentState, StateStore};
 
 pub use service::{
     DaemonTaskCreator, ErrorContext, LinkOpError, LinkService, LinkServiceParts, LinkTaskCreator,
-    lan_base_urls, resolve_receive_dir, rpc_error, rpc_value,
+    lan_base_urls, resolve_receive_dir, rpc_error, rpc_value, valid_file_name,
 };
 pub use storage::{AgentLinkStorage, device_info, public_devices};
 

@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 
 use fluxdown_protocol::{
     AgentEvent, CloudDevice, CreateTaskRequest, DaemonCreateTaskParams, DaemonEvent, ErrorReason,
-    PathStyle, RemoteCommandAction, RemoteCommandParams, RemoteDispatchParams,
-    RemoteDispatchResult, RemoteTaskDto, RemoteTaskStatus, RpcErrorData, ServiceEvent, WsServerMsg,
+    RemoteCommandAction, RemoteCommandParams, RemoteDispatchParams, RemoteDispatchResult,
+    RemoteTaskDto, RemoteTaskStatus, RpcErrorData, ServiceEvent, WsServerMsg,
 };
 use futures_util::StreamExt;
 use serde_json::{Value, json};
@@ -26,9 +26,11 @@ use uuid::Uuid;
 use crate::cloud::{CloudApi, CloudError};
 use crate::daemon_client::DaemonClient;
 use crate::event_hub::AgentEventHub;
+use crate::link::{resolve_receive_dir, valid_file_name};
 use crate::state::{AgentState, StateStore};
 
 const MISSING_GRACE_ROUNDS: u8 = 3;
+const SSE_STABLE: Duration = Duration::from_secs(60);
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(75);
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -164,7 +166,7 @@ impl RemoteTaskService {
             let device_id = self.local_device_id().await;
             match self.cloud.remote_events(&device_id).await {
                 Ok(response) => {
-                    retry_attempt = 0;
+                    let connected_at = std::time::Instant::now();
                     if let Err(error) = self.cloud.ping_presence().await {
                         tracing::warn!(error = %error, "initial remote presence heartbeat failed");
                     }
@@ -184,6 +186,10 @@ impl RemoteTaskService {
                         }
                         Err(error) => {
                             tracing::warn!(error = %error, "remote task SSE disconnected");
+                            // 只有连接稳定存活过才清退避；秒断的 SSE 继续按档位放慢重连。
+                            if connected_at.elapsed() >= SSE_STABLE {
+                                retry_attempt = 0;
+                            }
                         }
                     }
                 }
@@ -293,6 +299,10 @@ impl RemoteTaskService {
                 } else {
                     runtime.local_speeds.remove(task_id);
                 }
+                false
+            }
+            AgentEvent::DaemonConnectionChanged(true) => {
+                self.runtime.lock().await.local_missing_rounds.clear();
                 false
             }
             AgentEvent::Daemon(DaemonEvent::TaskDeleted { task_id }) => {
@@ -493,9 +503,11 @@ impl RemoteTaskService {
             return;
         };
         // daemon 状态 3 = 已完成。
-        let completed = daemon_tasks(&self.events)
-            .iter()
-            .any(|task| task.task_id == local_id && task.status == 3);
+        let completed = daemon_tasks(&self.events).is_some_and(|tasks| {
+            tasks
+                .iter()
+                .any(|task| task.task_id == local_id && task.status == 3)
+        });
         if !completed {
             tracing::info!(task = %remote_id, local = %local_id, "remote task was canceled or deleted in FluxCloud; removing the local task");
             if let Err(error) = self
@@ -518,7 +530,9 @@ impl RemoteTaskService {
 
     async fn rebuild_bindings(&self) {
         let local_device = self.local_device_id().await;
-        let local_tasks = daemon_tasks(&self.events);
+        let Some(local_tasks) = daemon_tasks(&self.events) else {
+            return;
+        };
         let remote_tasks = self.tasks().await;
         let mut newly_bound = Vec::new();
         {
@@ -659,8 +673,14 @@ impl RemoteTaskService {
         save_dir: Option<String>,
     ) -> Result<String, CreateFailure> {
         let mut request = json!({ "url": task.url });
-        if !task.file_name.trim().is_empty() {
-            request["fileName"] = json!(task.file_name);
+        let file_name = task.file_name.trim();
+        if !file_name.is_empty() {
+            if !valid_file_name(file_name) {
+                return Err(CreateFailure::permanent(
+                    "dispatched file name is not a plain file name".to_owned(),
+                ));
+            }
+            request["fileName"] = json!(file_name);
         }
         if let Some(dir) = &save_dir {
             // daemon 不校验目录：先确认本机确实能用（能创建 / 已存在），否则交给上层去掉目录重试。
@@ -718,7 +738,10 @@ impl RemoteTaskService {
     }
 
     async fn report_local_progress(&self) -> Result<(), RemoteError> {
-        let local_tasks = daemon_tasks(&self.events);
+        // daemon 冷启动时快照为空：此时判定「本机任务消失」会把仍在下载的任务误报为 failed。
+        let Some(local_tasks) = daemon_tasks(&self.events) else {
+            return Ok(());
+        };
         let bindings = self.state.lock().await.remote_bindings.clone();
         let mut progress = Vec::new();
         for (remote_id, local_id) in bindings {
@@ -1282,17 +1305,10 @@ impl IncomingCommand {
     }
 }
 
-/// 接单时使用的保存目录：只接受本机路径风格下的绝对路径且不含 `..`；
-/// 其余（缺省 / 对端风格 / 相对路径）一律用本机默认目录。
+/// 接单时使用的保存目录：与局域网互联入口共用 [`resolve_receive_dir`]（本机风格绝对路径，
+/// 拒绝 `..`、UNC 与设备路径）；其余（缺省 / 对端风格 / 相对路径）一律用本机默认目录。
 fn accept_save_dir(requested: Option<&str>) -> Option<String> {
-    let dir = requested?.trim();
-    if dir.is_empty() || !PathStyle::current().is_absolute(dir) {
-        return None;
-    }
-    if dir.split(['/', '\\']).any(|segment| segment == "..") {
-        return None;
-    }
-    Some(dir.to_owned())
+    resolve_receive_dir(requested?)
 }
 
 /// 建任务失败；`transient` = daemon 暂时不可用（不是任务本身的问题，不应上报为失败）。
@@ -1407,10 +1423,13 @@ fn progress_item(remote_id: &str, downloaded: i64, total: i64, speed: i64) -> Va
     })
 }
 
-fn daemon_tasks(events: &AgentEventHub) -> Vec<fluxdown_protocol::TaskDto> {
+/// daemon 任务快照；daemon 未连接时为 `None`——此时空列表不代表「任务不存在」。
+fn daemon_tasks(events: &AgentEventHub) -> Option<Vec<fluxdown_protocol::TaskDto>> {
     match events.snapshot().body {
-        fluxdown_protocol::SnapshotBody::Agent(snapshot) => snapshot.daemon.tasks,
-        fluxdown_protocol::SnapshotBody::Daemon(_) => Vec::new(),
+        fluxdown_protocol::SnapshotBody::Agent(snapshot) if snapshot.daemon_connected => {
+            Some(snapshot.daemon.tasks)
+        }
+        _ => None,
     }
 }
 
@@ -1539,17 +1558,18 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
     use fluxdown_protocol::{
-        CloudDevice, PathStyle, RemoteCommandAction, RemoteCommandParams, RemoteDispatchParams,
-        RemoteTaskDto, RemoteTaskStatus, TaskDto,
+        AgentEvent, CloudDevice, PathStyle, RemoteCommandAction, RemoteCommandParams,
+        RemoteDispatchParams, RemoteTaskDto, RemoteTaskStatus, TaskDto,
     };
     use serde_json::{Value, json};
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        BoundedIds, CreateFailure, IncomingCommand, RemoteError, RemoteTaskService, SseEnd,
-        accept_save_dir, apply_progress_items, create_with_directory_fallback, local_status,
-        parse_task_list, progress_item, validate_target_save_dir,
+        BoundedIds, CreateFailure, IncomingCommand, MISSING_GRACE_ROUNDS, RemoteError,
+        RemoteTaskService, SseEnd, accept_save_dir, apply_progress_items,
+        create_with_directory_fallback, local_status, parse_task_list, progress_item,
+        validate_target_save_dir,
     };
     use crate::state::{AgentState, CloudCredentials, StateStore};
 
@@ -1662,6 +1682,29 @@ mod tests {
             );
             assert_eq!(accept_save_dir(Some(r"D:\Downloads")), None);
         }
+    }
+
+    #[test]
+    fn accept_directory_rejects_unc_and_device_paths() {
+        assert_eq!(accept_save_dir(Some(r"\\host\share\dl")), None);
+        assert_eq!(accept_save_dir(Some(r"\\?\C:\dl")), None);
+        assert_eq!(accept_save_dir(Some(r"\\.\pipe\x")), None);
+        assert_eq!(accept_save_dir(Some("//host/share")), None);
+    }
+
+    #[tokio::test]
+    async fn bound_tasks_are_not_failed_while_the_daemon_snapshot_is_unavailable() {
+        let harness = Harness::new("cold_start", |router| router).await;
+        bind(&harness, "r1", "l1").await;
+        for _ in 0..(MISSING_GRACE_ROUNDS + 2) {
+            harness
+                .service
+                .report_local_progress()
+                .await
+                .expect("progress round");
+        }
+        assert_eq!(bound_remote_ids(&harness).await, ["r1".to_owned()]);
+        harness.finish().await;
     }
 
     #[tokio::test]
@@ -2257,6 +2300,10 @@ mod tests {
                 tasks,
                 ..Default::default()
             });
+        harness
+            .service
+            .events
+            .publish(AgentEvent::DaemonConnectionChanged(true));
     }
 
     async fn bind(harness: &Harness, remote_id: &str, local_id: &str) {

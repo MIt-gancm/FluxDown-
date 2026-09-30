@@ -324,9 +324,38 @@ fn percent_decode(raw: &str) -> Option<Cow<'_, str>> {
     String::from_utf8(out).ok().map(Cow::Owned)
 }
 
+/// SPA 响应的安全头：禁止被嵌入其他站点（点击劫持）、禁止 MIME 嗅探、不外泄 Referer。
+pub(crate) fn with_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert(
+        "content-security-policy",
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{EmbeddedAsset, cache_control, etag_matches, is_content_hashed, percent_decode};
+    use super::{
+        EmbeddedAsset, cache_control, etag_matches, is_content_hashed, percent_decode,
+        with_security_headers,
+    };
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn spa_responses_forbid_framing_and_sniffing() {
+        let response = with_security_headers(axum::http::StatusCode::OK.into_response());
+        let headers = response.headers();
+        assert_eq!(headers["x-frame-options"], "DENY");
+        assert_eq!(headers["content-security-policy"], "frame-ancestors 'none'");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+    }
 
     fn asset(path: &'static str, content_type: &'static str) -> EmbeddedAsset {
         EmbeddedAsset {

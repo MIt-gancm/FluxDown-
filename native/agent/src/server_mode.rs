@@ -11,14 +11,15 @@
 //! 环境变量语义见 [`ServerConfig::from_lookup`]；`FLUXDOWN_DATA_DIR` /
 //! `FLUXDOWN_DATABASE_URL` / `FLUXDOWN_SAVE_DIR` 不在这里解析，由 daemon 从继承的环境读取。
 
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -390,6 +391,84 @@ pub fn origin_allowed(headers: &HeaderMap) -> bool {
     })
 }
 
+/// 按来源地址的访问密钥失败节流：窗口内失败达到上限即锁定到窗口结束。
+/// 回环来源不受限（本机反代会让所有外部请求都呈现为回环，限速只会变成全站锁定）。
+#[derive(Default)]
+struct AuthThrottle {
+    entries: std::sync::Mutex<HashMap<IpAddr, ThrottleEntry>>,
+}
+
+struct ThrottleEntry {
+    failures: u32,
+    window_start: std::time::Instant,
+}
+
+const THROTTLE_MAX_FAILURES: u32 = 10;
+const THROTTLE_WINDOW: Duration = Duration::from_secs(60);
+const THROTTLE_MAX_TRACKED: usize = 4096;
+
+impl AuthThrottle {
+    /// IPv6 按 /64 归并，避免攻击者靠同一前缀内的地址轮换绕过。
+    fn bucket(ip: IpAddr) -> IpAddr {
+        match ip {
+            IpAddr::V6(v6) => {
+                let mut octets = v6.octets();
+                octets[8..].fill(0);
+                IpAddr::V6(Ipv6Addr::from(octets))
+            }
+            other => other,
+        }
+    }
+
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, ThrottleEntry>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn is_locked(&self, peer: IpAddr, now: std::time::Instant) -> bool {
+        if peer.is_loopback() {
+            return false;
+        }
+        let mut entries = self.entries();
+        let bucket = Self::bucket(peer);
+        match entries.get(&bucket) {
+            Some(entry) if now.duration_since(entry.window_start) >= THROTTLE_WINDOW => {
+                entries.remove(&bucket);
+                false
+            }
+            Some(entry) => entry.failures >= THROTTLE_MAX_FAILURES,
+            None => false,
+        }
+    }
+
+    fn record_failure(&self, peer: IpAddr, now: std::time::Instant) {
+        if peer.is_loopback() {
+            return;
+        }
+        let mut entries = self.entries();
+        if entries.len() >= THROTTLE_MAX_TRACKED {
+            entries.retain(|_, entry| now.duration_since(entry.window_start) < THROTTLE_WINDOW);
+        }
+        if entries.len() >= THROTTLE_MAX_TRACKED {
+            return;
+        }
+        let entry = entries.entry(Self::bucket(peer)).or_insert(ThrottleEntry {
+            failures: 0,
+            window_start: now,
+        });
+        if now.duration_since(entry.window_start) >= THROTTLE_WINDOW {
+            entry.failures = 0;
+            entry.window_start = now;
+        }
+        entry.failures = entry.failures.saturating_add(1);
+    }
+
+    fn record_success(&self, peer: IpAddr) {
+        self.entries().remove(&Self::bucket(peer));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 运行期句柄与 HTTP 路由
 // ---------------------------------------------------------------------------
@@ -421,6 +500,7 @@ pub struct ServerHandle {
     daemon_http: DaemonHttp,
     webroot: Option<PathBuf>,
     demo: bool,
+    throttle: AuthThrottle,
 }
 
 /// 首次设置结果。
@@ -445,6 +525,7 @@ impl ServerHandle {
             blobs: parts.blobs,
             webroot: parts.webroot,
             demo: parts.demo,
+            throttle: AuthThrottle::default(),
         })
     }
 
@@ -486,9 +567,58 @@ impl ServerHandle {
     }
 
     /// `Authorization: Bearer <访问密钥>` 或 `?token=<访问密钥>`；空密钥永远拒绝。
-    fn browser_authorized(&self, headers: &HeaderMap, query_token: Option<&str>) -> bool {
-        bearer_token(headers).is_some_and(|presented| key_matches(&self.token, presented))
-            || query_token.is_some_and(|presented| key_matches(&self.token, presented))
+    /// 同一来源连续失败过多后进入锁定（429），锁定期内连正确密钥也不受理。
+    fn browser_authorized(
+        &self,
+        peer: IpAddr,
+        headers: &HeaderMap,
+        query_token: Option<&str>,
+    ) -> Result<(), StatusCode> {
+        let bearer = bearer_token(headers);
+        self.throttled_check(peer, bearer.is_some() || query_token.is_some(), |key| {
+            bearer.is_some_and(|presented| key_matches(key, presented))
+                || query_token.is_some_and(|presented| key_matches(key, presented))
+        })
+    }
+
+    /// `/rpc` 升级鉴权（带按来源失败节流）；网关应在有对端地址时用它取代 [`authorize_rpc`]。
+    pub fn authorize_rpc_from(
+        &self,
+        peer: IpAddr,
+        headers: &HeaderMap,
+        agent_bearer: &str,
+    ) -> Result<(), StatusCode> {
+        if !origin_allowed(headers) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        let presented = bearer_token(headers)
+            .map(str::to_owned)
+            .or_else(|| subprotocol_token(headers));
+        self.throttled_check(peer, presented.is_some(), |key| {
+            presented.as_deref().is_some_and(|presented| {
+                constant_time_eq(presented, agent_bearer) || key_matches(key, presented)
+            })
+        })
+    }
+
+    fn throttled_check(
+        &self,
+        peer: IpAddr,
+        credential_presented: bool,
+        matches: impl FnOnce(&TokenCell) -> bool,
+    ) -> Result<(), StatusCode> {
+        let now = std::time::Instant::now();
+        if self.throttle.is_locked(peer, now) {
+            return Err(StatusCode::TOO_MANY_REQUESTS);
+        }
+        if matches(&self.token) {
+            self.throttle.record_success(peer);
+            return Ok(());
+        }
+        if credential_presented {
+            self.throttle.record_failure(peer, now);
+        }
+        Err(StatusCode::UNAUTHORIZED)
     }
 }
 
@@ -516,6 +646,7 @@ impl DaemonHttp {
         base_url.set_fragment(None);
         // 只连本机回环 daemon：跳过系统根证书加载（见 `DaemonBlobClient::new`）。
         let client = reqwest::Client::builder()
+            .no_proxy()
             .tls_built_in_root_certs(false)
             .connect_timeout(Duration::from_secs(5))
             .build()?;
@@ -616,10 +747,11 @@ pub fn router(handle: Arc<ServerHandle>) -> Router {
     router.fallback(move |method: Method, uri: Uri, headers: HeaderMap| {
         let webroot = webroot.clone();
         async move {
-            match webroot {
+            let response = match webroot {
                 Some(root) => crate::web_assets::disk_handler(root, method, uri).await,
                 None => crate::web_assets::handler(method, uri, headers).await,
-            }
+            };
+            crate::web_assets::with_security_headers(response)
         }
     })
 }
@@ -697,6 +829,7 @@ async fn setup_submit(
 
 async fn upload_torrent(
     State(handle): State<Arc<ServerHandle>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<TokenQuery>,
     headers: HeaderMap,
     body: Body,
@@ -704,6 +837,7 @@ async fn upload_torrent(
     upload_blob(
         &handle,
         BlobKind::Torrent,
+        addr.ip(),
         &headers,
         query.token.as_deref(),
         body,
@@ -713,6 +847,7 @@ async fn upload_torrent(
 
 async fn upload_plugin(
     State(handle): State<Arc<ServerHandle>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<TokenQuery>,
     headers: HeaderMap,
     body: Body,
@@ -720,6 +855,7 @@ async fn upload_plugin(
     upload_blob(
         &handle,
         BlobKind::Plugin,
+        addr.ip(),
         &headers,
         query.token.as_deref(),
         body,
@@ -730,13 +866,14 @@ async fn upload_plugin(
 async fn upload_blob(
     handle: &ServerHandle,
     kind: BlobKind,
+    peer: IpAddr,
     headers: &HeaderMap,
     query_token: Option<&str>,
     body: Body,
 ) -> Response {
     // 先鉴权再读体：未授权请求不会让服务器缓冲 4 MiB。
-    if !handle.browser_authorized(headers, query_token) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = handle.browser_authorized(peer, headers, query_token) {
+        return status.into_response();
     }
     let Ok(bytes) = axum::body::to_bytes(body, BLOB_UPLOAD_LIMIT).await else {
         return StatusCode::PAYLOAD_TOO_LARGE.into_response();
@@ -753,12 +890,13 @@ async fn upload_blob(
 
 async fn download_task_file(
     State(handle): State<Arc<ServerHandle>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<TokenQuery>,
     headers: HeaderMap,
     AxumPath(task_id): AxumPath<String>,
 ) -> Response {
-    if !handle.browser_authorized(&headers, query.token.as_deref()) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = handle.browser_authorized(addr.ip(), &headers, query.token.as_deref()) {
+        return status.into_response();
     }
     // 文件名 / 长度 / 类型都由 daemon 给出（含 RFC 5987 `filename*`），原样透传。
     handle
@@ -769,12 +907,13 @@ async fn download_task_file(
 
 async fn download_export(
     State(handle): State<Arc<ServerHandle>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<TokenQuery>,
     headers: HeaderMap,
     AxumPath(export_id): AxumPath<String>,
 ) -> Response {
-    if !handle.browser_authorized(&headers, query.token.as_deref()) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = handle.browser_authorized(addr.ip(), &headers, query.token.as_deref()) {
+        return status.into_response();
     }
     // daemon 的日志导出是其诊断快照（JSON），响应头不带文件名：这里补上下载语义。
     handle
@@ -796,11 +935,12 @@ async fn download_export(
 /// 写到数据目录下的临时文件，读出后立即删除。
 async fn download_logs(
     State(handle): State<Arc<ServerHandle>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Query(query): Query<TokenQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !handle.browser_authorized(&headers, query.token.as_deref()) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = handle.browser_authorized(addr.ip(), &headers, query.token.as_deref()) {
+        return status.into_response();
     }
     let temp = handle
         .store
@@ -1212,7 +1352,8 @@ mod tests {
         async fn serve(&self) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
-            let app = router(self.handle.clone());
+            let app = router(self.handle.clone())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>();
             tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
@@ -1370,5 +1511,60 @@ mod tests {
         assert_eq!(pending.await.unwrap(), 200);
         drop(client);
         harness.finish().await;
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use std::net::IpAddr;
+    use std::time::{Duration, Instant};
+
+    use super::{AuthThrottle, THROTTLE_MAX_FAILURES, THROTTLE_WINDOW};
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap_or(IpAddr::from([0, 0, 0, 0]))
+    }
+
+    #[test]
+    fn repeated_failures_lock_the_source_until_the_window_ends() {
+        let throttle = AuthThrottle::default();
+        let peer = ip("203.0.113.7");
+        let start = Instant::now();
+        for _ in 0..THROTTLE_MAX_FAILURES {
+            assert!(!throttle.is_locked(peer, start));
+            throttle.record_failure(peer, start);
+        }
+        assert!(throttle.is_locked(peer, start + Duration::from_secs(1)));
+        assert!(!throttle.is_locked(ip("203.0.113.8"), start));
+        assert!(!throttle.is_locked(peer, start + THROTTLE_WINDOW));
+    }
+
+    #[test]
+    fn success_clears_failures_and_loopback_is_never_limited() {
+        let throttle = AuthThrottle::default();
+        let peer = ip("198.51.100.1");
+        let now = Instant::now();
+        for _ in 0..THROTTLE_MAX_FAILURES - 1 {
+            throttle.record_failure(peer, now);
+        }
+        throttle.record_success(peer);
+        throttle.record_failure(peer, now);
+        assert!(!throttle.is_locked(peer, now));
+
+        let local = ip("127.0.0.1");
+        for _ in 0..THROTTLE_MAX_FAILURES * 2 {
+            throttle.record_failure(local, now);
+        }
+        assert!(!throttle.is_locked(local, now));
+    }
+
+    #[test]
+    fn ipv6_addresses_share_a_64_bit_bucket() {
+        let throttle = AuthThrottle::default();
+        let now = Instant::now();
+        for last in 0..THROTTLE_MAX_FAILURES {
+            throttle.record_failure(ip(&format!("2001:db8:1:2::{last:x}")), now);
+        }
+        assert!(throttle.is_locked(ip("2001:db8:1:2:ffff::1"), now));
     }
 }

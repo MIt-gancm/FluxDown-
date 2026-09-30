@@ -642,6 +642,26 @@ fn receive_dir_only_accepts_local_style_absolute_paths() {
 }
 
 #[test]
+fn receive_dir_rejects_parent_segments_and_unc_or_device_paths() {
+    let local = local_abs_dir("x");
+    assert_eq!(resolve_receive_dir(&format!("{local}/../y")), None);
+    assert_eq!(resolve_receive_dir(r"\\host\share"), None);
+    assert_eq!(resolve_receive_dir(r"\\?\C:\x"), None);
+    assert_eq!(resolve_receive_dir("//host/share"), None);
+}
+
+#[test]
+fn remote_file_names_must_be_plain_and_not_reserved_device_names() {
+    assert!(super::valid_file_name("movie.mkv"));
+    assert!(!super::valid_file_name("a/b"));
+    assert!(!super::valid_file_name(".."));
+    assert!(!super::valid_file_name("CON"));
+    assert!(!super::valid_file_name("nul.txt"));
+    assert!(!super::valid_file_name("com1.log"));
+    assert!(super::valid_file_name("com10.log"));
+}
+
+#[test]
 fn advertised_addresses_follow_the_bound_interface() {
     // 桌面默认只监听回环：没有任何局域网可达地址。
     assert!(lan_base_urls("127.0.0.1:17800".parse().unwrap()).is_empty());

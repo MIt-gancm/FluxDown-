@@ -287,24 +287,61 @@ fn valid_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-fn valid_file_name(name: &str) -> bool {
+/// 远端（已配对设备 / 云端）下发的文件名：单一路径分量，且不是 Windows 保留设备名。
+#[must_use]
+pub fn valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_FILE_NAME_LEN
         && !name.contains(['/', '\\', '\0'])
         && name != "."
         && name != ".."
+        && !is_reserved_device_name(name)
+}
+
+fn is_reserved_device_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches([' ', '\t'])
+        .to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$" => true,
+        other => {
+            let digit = other
+                .strip_prefix("COM")
+                .or_else(|| other.strip_prefix("LPT"));
+            digit.is_some_and(|rest| {
+                let mut chars = rest.chars();
+                matches!(chars.next(), Some('1'..='9' | '¹' | '²' | '³')) && chars.next().is_none()
+            })
+        }
+    }
 }
 
 fn valid_save_dir(dir: &str) -> bool {
     dir.len() <= MAX_SAVE_DIR_LEN && !dir.contains('\0')
 }
 
-/// 接单目录：对端给的保存目录必须是**本机路径风格**的绝对路径才采用，否则（含空串）返回
-/// `None`，由 daemon 使用本机默认目录（例如 Windows 设备下发 `C:\Downloads` 给 macOS）。
+/// 目录不含 `..` 段，且不是 UNC / 设备命名空间路径（`\\host\share`、`\\?\`、`\\.\`）：
+/// 后者在 Windows 上创建目录会主动触发对外 SMB 认证。
+fn is_plain_local_dir(dir: &str) -> bool {
+    if dir.contains('\0') || dir.split(['/', '\\']).any(|segment| segment == "..") {
+        return false;
+    }
+    let mut chars = dir.chars();
+    let is_separator = |c: char| c == '/' || c == '\\';
+    !(chars.next().is_some_and(is_separator) && chars.next().is_some_and(is_separator))
+}
+
+/// 接单目录：对端给的保存目录必须是**本机路径风格**的绝对路径且通过 [`is_plain_local_dir`]
+/// 才采用，否则（含空串）返回 `None`，由 daemon 使用本机默认目录（例如 Windows 设备下发
+/// `C:\Downloads` 给 macOS）。云端接单与局域网互联共用这一规则。
 #[must_use]
 pub fn resolve_receive_dir(save_dir: &str) -> Option<String> {
     let dir = save_dir.trim();
-    (!dir.is_empty() && PathStyle::current().is_absolute(dir)).then(|| dir.to_owned())
+    (!dir.is_empty() && PathStyle::current().is_absolute(dir) && is_plain_local_dir(dir))
+        .then(|| dir.to_owned())
 }
 
 fn build_task_request(
@@ -534,6 +571,9 @@ impl LinkService {
                 LinkEngineEvent::Unpaired(fingerprint) => {
                     lock(&self.online).remove(&fingerprint);
                     self.publish_devices().await;
+                }
+                LinkEngineEvent::IncomingCancelled { session_id } => {
+                    self.drop_requests(|request| request.session_id == session_id);
                 }
                 LinkEngineEvent::IncomingPairing {
                     session_id,
@@ -798,21 +838,20 @@ impl LinkService {
         let records = manager.list_devices().await?;
         let before = self.devices().await;
         let probes = records.iter().map(|record| async move {
-            let online = manager.is_online(&record.fingerprint).await;
-            if online && (force_info || record.info == PeerInfo::default()) {
-                self.exchange_info(&record.fingerprint).await;
-            }
+            // 超时只判定这一台设备离线，不连累同轮里已经探测成功的其他设备。
+            let probe = async {
+                let online = manager.is_online(&record.fingerprint).await;
+                if online && (force_info || record.info == PeerInfo::default()) {
+                    self.exchange_info(&record.fingerprint).await;
+                }
+                online
+            };
+            let online = tokio::time::timeout(PROBE_ROUND_TIMEOUT, probe)
+                .await
+                .unwrap_or(false);
             (record.fingerprint.clone(), online)
         });
-        let results =
-            tokio::time::timeout(PROBE_ROUND_TIMEOUT, futures_util::future::join_all(probes))
-                .await
-                .unwrap_or_else(|_| {
-                    records
-                        .iter()
-                        .map(|record| (record.fingerprint.clone(), false))
-                        .collect()
-                });
+        let results = futures_util::future::join_all(probes).await;
         *lock(&self.online) = results.into_iter().collect();
         let after = self.devices().await;
         if force_info || roster_signature(&before) != roster_signature(&after) {
