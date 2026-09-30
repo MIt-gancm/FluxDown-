@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
 };
 
-use super::{DownloadTaskView, RowKey};
+use super::{DownloadTaskView, RowKey, view_prefs::ViewSortKey};
 
 /// 行在存储中的位置（随删除会变；跨帧身份用 [`RowKey`]）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -24,6 +24,10 @@ pub(crate) struct TaskStore {
     /// 行集合 / 下标布局变化计数（增删、整表换成不同的行）。只改行内容时不变，
     /// 表格据此判断 [`RowId`] 是否仍指向同一任务、能否沿用上次的行顺序。
     structure: Cell<u64>,
+    /// 可能改变筛选 / 搜索 / 分组的行字段；整表替换也使缓存失效。
+    view_fields: Cell<u64>,
+    /// 各排序键实际读取的值的变化计数，不保留任务或字符串副本。
+    sort_values: [Cell<u64>; ViewSortKey::CYCLE.len()],
 }
 
 impl TaskStore {
@@ -70,6 +74,21 @@ impl TaskStore {
         self.structure.get()
     }
 
+    pub(crate) fn view_fields_generation(&self) -> u64 {
+        self.view_fields.get()
+    }
+
+    pub(crate) fn sort_generation(&self, key: ViewSortKey) -> u64 {
+        ViewSortKey::CYCLE
+            .iter()
+            .position(|candidate| *candidate == key)
+            .map_or_else(|| self.generation(), |ix| self.sort_values[ix].get())
+    }
+
+    fn invalidate_view_fields(&self) {
+        self.view_fields.set(self.view_fields.get().wrapping_add(1));
+    }
+
     fn bump(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
     }
@@ -81,6 +100,7 @@ impl TaskStore {
 
     /// 整表替换；行 key 与顺序不变时（快照 / 重连重建）只算内容变化。
     pub(crate) fn replace_local(&self, rows: Vec<DownloadTaskView>) {
+        self.invalidate_view_fields();
         let same_rows = same_row_keys(&self.local.borrow(), &rows);
         if !same_rows {
             let index = rows
@@ -99,6 +119,7 @@ impl TaskStore {
     }
 
     pub(crate) fn replace_remote(&self, rows: Vec<DownloadTaskView>) {
+        self.invalidate_view_fields();
         let same_rows = same_row_keys(&self.remote.borrow(), &rows);
         *self.remote.borrow_mut() = rows;
         if same_rows {
@@ -111,6 +132,14 @@ impl TaskStore {
     /// 覆盖单行（下标必须已存在）。
     pub(crate) fn set_local(&self, ix: usize, row: DownloadTaskView) {
         if let Some(slot) = self.local.borrow_mut().get_mut(ix) {
+            if !same_view_fields(slot, &row) {
+                self.invalidate_view_fields();
+            }
+            for (key, generation) in ViewSortKey::CYCLE.iter().zip(&self.sort_values) {
+                if !key.same_value(slot, &row) {
+                    generation.set(generation.get().wrapping_add(1));
+                }
+            }
             *slot = row;
             self.bump();
         }
@@ -145,4 +174,23 @@ impl TaskStore {
 
 fn same_row_keys(current: &[DownloadTaskView], next: &[DownloadTaskView]) -> bool {
     current.len() == next.len() && current.iter().zip(next).all(|(a, b)| a.key == b.key)
+}
+
+/// 覆盖当前所有筛选、搜索与分组读取的字段；不确定当前视图是否受影响时保守地失效。
+fn same_view_fields(left: &DownloadTaskView, right: &DownloadTaskView) -> bool {
+    left.key == right.key
+        && left.state == right.state
+        && left.source == right.source
+        && left.queue_id == right.queue_id
+        && left.name == right.name
+        && left.name_fold == right.name_fold
+        && left.file_extension == right.file_extension
+        && left.url_fold == right.url_fold
+        && left.site_fold == right.site_fold
+        && left.site == right.site
+        && left.referrer == right.referrer
+        && left.protocol == right.protocol
+        && left.created_at_secs == right.created_at_secs
+        && left.group_id == right.group_id
+        && left.to_device == right.to_device
 }

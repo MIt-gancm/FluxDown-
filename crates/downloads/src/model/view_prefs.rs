@@ -91,7 +91,7 @@ pub(crate) enum ViewSortKey {
 }
 
 impl ViewSortKey {
-    const CYCLE: [Self; 7] = [
+    pub(super) const CYCLE: [Self; 7] = [
         Self::Smart,
         Self::Created,
         Self::Name,
@@ -120,6 +120,26 @@ impl ViewSortKey {
     /// 排序值随每次进度节拍变化的键（速度 / 进度）：重排需要限频，否则列表持续跳动。
     pub(crate) fn is_live(self) -> bool {
         matches!(self, Self::Progress | Self::Speed)
+    }
+
+    /// 比较器实际读取的值是否相同；所有排序都包含添加顺序与任务 key 的平局回退。
+    /// NaN 不视为相同，无法证明其与其他行的比较结果不变时重新排序。
+    pub(super) fn same_value(self, left: &DownloadTaskView, right: &DownloadTaskView) -> bool {
+        if left.key != right.key || added_order(left, right) != Ordering::Equal {
+            return false;
+        }
+        match self {
+            Self::Smart => compare_smart(left, right) == Ordering::Equal,
+            Self::Created => true,
+            Self::Name => left.name_fold == right.name_fold,
+            Self::Size => left.size_bytes == right.size_bytes,
+            Self::Progress => left.progress == right.progress,
+            Self::Speed => {
+                left.speed_bytes_per_second.unwrap_or(0)
+                    == right.speed_bytes_per_second.unwrap_or(0)
+            }
+            Self::Status => left.state.status_rank() == right.state.status_rank(),
+        }
     }
 }
 

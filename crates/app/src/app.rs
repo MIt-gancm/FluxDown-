@@ -619,8 +619,8 @@ pub(crate) fn submit_captures_detached(
     finished
 }
 
-/// 桌面侧推导的 agent 路径；规则与 `fluxdown_agent::runtime::resolve_agent_data_dir` 一致，
-/// 否则设了 `FLUXDOWN_DATA_DIR` 时界面会去另一个目录找 bearer，永远连不上自己拉起的 agent。
+/// 桌面侧推导的 agent 路径；镜像 `native/agent/src/runtime.rs` 的 `resolve_agent_data_dir`。
+/// 桌面端不依赖 agent crate，只解析路径；旧状态的便携迁移由 agent 独占处理。
 #[derive(Debug, PartialEq, Eq)]
 struct DesktopPaths {
     /// 数据根：`FLUXDOWN_DATA_DIR`，否则（Windows 便携版）`<exe>/portable_data`，否则 ProjectDirs 数据目录。
@@ -668,9 +668,13 @@ impl DesktopPaths {
 /// Windows 便携版：`<exe>/portable` 标记存在时数据在 `<exe>/portable_data`（与 agent 同判定）。
 #[cfg(windows)]
 fn portable_data_dir() -> Option<std::path::PathBuf> {
-    let exe_dir = env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))?;
+    portable_data_dir_for_exe(&env::current_exe().ok()?)
+}
+
+/// 标记使用 `exists()`，与 `native/agent/src/runtime.rs` 的 `portable_data_dir` 一致。
+#[cfg(any(windows, test))]
+fn portable_data_dir_for_exe(exe: &Path) -> Option<std::path::PathBuf> {
+    let exe_dir = exe.parent()?;
     exe_dir
         .join("portable")
         .exists()
@@ -772,10 +776,92 @@ mod tests {
         );
         let env_root = DesktopPaths::resolve(
             |name| (name == "FLUXDOWN_DATA_DIR").then(|| "/root".into()),
+            portable.clone(),
+            project.clone(),
+        );
+        assert_eq!(env_root.agent_data_dir, PathBuf::from("/root/agent"));
+        assert_eq!(
+            env_root.agent_token,
+            PathBuf::from("/root/agent/agent.token")
+        );
+
+        let env_agent = DesktopPaths::resolve(
+            |name| (name == "FLUXDOWN_AGENT_DATA_DIR").then(|| "/agent-state".into()),
+            portable.clone(),
+            project.clone(),
+        );
+        assert_eq!(env_agent.data_root, PathBuf::from("/exe/portable_data"));
+        assert_eq!(env_agent.agent_data_dir, PathBuf::from("/agent-state"));
+        assert_eq!(
+            env_agent.agent_token,
+            PathBuf::from("/agent-state/agent.token")
+        );
+
+        let env_all = DesktopPaths::resolve(
+            |name| match name {
+                "FLUXDOWN_DATA_DIR" => Some("/root".into()),
+                "FLUXDOWN_AGENT_DATA_DIR" => Some("/agent-state".into()),
+                "FLUXDOWN_AGENT_TOKEN_FILE" => Some("/secrets/token".into()),
+                _ => None,
+            },
             portable,
             project,
         );
-        assert_eq!(env_root.agent_data_dir, PathBuf::from("/root/agent"));
+        assert_eq!(env_all.data_root, PathBuf::from("/root"));
+        assert_eq!(env_all.agent_data_dir, PathBuf::from("/agent-state"));
+        assert_eq!(env_all.agent_token, PathBuf::from("/secrets/token"));
+    }
+
+    #[test]
+    fn missing_portable_marker_keeps_project_paths() {
+        let dir = test_dir("no-portable-marker");
+        let portable = dir.join("portable_data");
+        std::fs::create_dir_all(&portable).expect("create unmarked portable data directory");
+        let project = dir.join("project");
+        let paths = DesktopPaths::resolve(
+            |_| None,
+            portable_data_dir_for_exe(&dir.join("FluxDown.exe")),
+            Some(project.clone()),
+        );
+        assert_eq!(paths.data_root, project);
+        assert_eq!(paths.agent_data_dir, project.join("agent"));
+        assert_eq!(paths.agent_token, project.join("agent/agent.token"));
+        std::fs::remove_dir_all(dir).expect("remove unmarked fixture");
+    }
+
+    #[test]
+    fn portable_marker_selects_agent_paths_for_files_and_directories() {
+        let dir = test_dir("portable-marker");
+        let agent_dir = dir.join("portable_data/agent");
+        std::fs::create_dir_all(&agent_dir).expect("create portable agent directory");
+        std::fs::write(agent_dir.join("agent.token"), "portable-token")
+            .expect("write portable agent token");
+        let marker = dir.join("portable");
+        for directory_marker in [false, true] {
+            if directory_marker {
+                std::fs::create_dir(&marker).expect("create directory marker");
+            } else {
+                std::fs::write(&marker, "").expect("create file marker");
+            }
+            let paths = DesktopPaths::resolve(
+                |_| None,
+                portable_data_dir_for_exe(&dir.join("FluxDown.exe")),
+                Some(dir.join("project")),
+            );
+            assert_eq!(paths.data_root, dir.join("portable_data"));
+            assert_eq!(paths.agent_data_dir, agent_dir);
+            assert_eq!(paths.agent_token, agent_dir.join("agent.token"));
+            assert_eq!(
+                std::fs::read_to_string(&paths.agent_token).expect("read portable agent token"),
+                "portable-token"
+            );
+            if directory_marker {
+                std::fs::remove_dir(&marker).expect("remove directory marker");
+            } else {
+                std::fs::remove_file(&marker).expect("remove file marker");
+            }
+        }
+        std::fs::remove_dir_all(dir).expect("remove portable fixture");
     }
 
     #[test]

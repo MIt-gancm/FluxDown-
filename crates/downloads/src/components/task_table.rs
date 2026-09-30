@@ -481,6 +481,15 @@ pub(crate) struct DownloadTableDelegate {
     seen_generation: u64,
     /// 上次重算时存储的结构计数；未变说明只有行内容变化，可沿用上次的行顺序。
     seen_structure: u64,
+    /// 全量排序所得的分组前顺序，不是 RowOrder 保持期内显示的顺序。
+    sorted_rows: Vec<RowId>,
+    seen_sort_values: u64,
+    seen_view_fields: u64,
+    sorted_group_date: Option<chrono::NaiveDate>,
+    #[cfg(test)]
+    force_full_sort: bool,
+    #[cfg(test)]
+    full_sort_count: usize,
     view_dirty: bool,
     /// 行顺序稳定器：指针活动期间 / 动态排序键限频内推迟内容变化引起的重排。
     row_order: RowOrder,
@@ -527,6 +536,14 @@ impl DownloadTableDelegate {
             visible: Vec::new(),
             seen_generation: u64::MAX,
             seen_structure: u64::MAX,
+            sorted_rows: Vec::new(),
+            seen_sort_values: u64::MAX,
+            seen_view_fields: u64::MAX,
+            sorted_group_date: None,
+            #[cfg(test)]
+            force_full_sort: false,
+            #[cfg(test)]
+            full_sort_count: 0,
             view_dirty: true,
             row_order: RowOrder::default(),
             reorder_timer: None,
@@ -854,19 +871,54 @@ impl DownloadTableDelegate {
         let store = Rc::clone(&self.store);
         let local = store.local();
         let remote = store.remote();
-        let mut rows: Vec<(RowId, &DownloadTaskView)> = local
-            .iter()
-            .enumerate()
-            .map(|(ix, task)| (RowId::Local(ix), task))
-            .chain(
-                remote
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, task)| (RowId::Remote(ix), task)),
-            )
-            .filter(|(_, task)| self.matches_filter(task) && self.matches_query(task))
-            .collect();
-        rows.sort_by(|(_, left), (_, right)| self.prefs.compare(left, right));
+        let sort_values = store.sort_generation(self.prefs.sort_key);
+        let view_fields = store.view_fields_generation();
+        let group_date =
+            (self.prefs.group_by == ViewGroupBy::Date).then(|| chrono::Local::now().date_naive());
+        let reuse_sorted = content_only
+            && sort_values == self.seen_sort_values
+            && view_fields == self.seen_view_fields
+            && group_date == self.sorted_group_date;
+        #[cfg(test)]
+        let reuse_sorted = reuse_sorted && !self.force_full_sort;
+        let mut rows: Vec<(RowId, &DownloadTaskView)> = if reuse_sorted {
+            self.sorted_rows
+                .iter()
+                .filter_map(|&id| {
+                    let task = match id {
+                        RowId::Local(ix) => local.get(ix),
+                        RowId::Remote(ix) => remote.get(ix),
+                    };
+                    task.map(|task| (id, task))
+                })
+                .collect()
+        } else {
+            local
+                .iter()
+                .enumerate()
+                .map(|(ix, task)| (RowId::Local(ix), task))
+                .chain(
+                    remote
+                        .iter()
+                        .enumerate()
+                        .map(|(ix, task)| (RowId::Remote(ix), task)),
+                )
+                .filter(|(_, task)| self.matches_filter(task) && self.matches_query(task))
+                .collect()
+        };
+        if !reuse_sorted {
+            rows.sort_by(|(_, left), (_, right)| self.prefs.compare(left, right));
+            self.sorted_rows.clear();
+            self.sorted_rows.extend(rows.iter().map(|(id, _)| *id));
+            self.seen_sort_values = sort_values;
+            self.seen_view_fields = view_fields;
+            self.sorted_group_date = group_date;
+            #[cfg(test)]
+            {
+                self.full_sort_count += 1;
+            }
+        }
+        // 即使排序输入不变，也照常应用保持期：过期顺序和动态键的重排时钟必须一致。
         let live_key = self.prefs.sort_key.is_live();
         let rows = self.row_order.apply(rows, content_only, live_key, now);
 
@@ -2936,11 +2988,13 @@ mod tests {
 
     use super::{
         DownloadColumnKind, DownloadTableDelegate, DownloadsCommand, RowAction, SelectionSummary,
-        ToolbarCommand, VisibleRow, group_by_key, percent_label, row_actions, task_command,
+        TableFilter, ToolbarCommand, VisibleRow, group_by_key, percent_label, row_actions,
+        task_command,
     };
     use crate::{
         model::{
-            DownloadTaskView, RowKey, TaskState, TaskStore,
+            CategoryIndex, DownloadFilter, DownloadStatusFilter, DownloadTaskView, RowKey,
+            TaskSource, TaskState, TaskStore,
             view_prefs::{SortDir, ViewGroupBy, ViewPrefs, ViewSortKey},
         },
         strings::DownloadStrings,
@@ -3345,6 +3399,424 @@ mod tests {
         assert!(delegate.set_viewport_width(1400.));
         let _ = delegate.apply_file_name_width();
         assert!(!delegate.viewport_needs_sync(1400.));
+        Ok(())
+    }
+
+    fn paired_delegates(
+        statuses: &[i32],
+    ) -> Result<(DownloadTableDelegate, DownloadTableDelegate), I18nError> {
+        let seed = delegate(statuses)?;
+        let fast = DownloadTableDelegate::new(seed.strings.clone(), Rc::clone(&seed.store));
+        let mut full = DownloadTableDelegate::new(seed.strings.clone(), Rc::clone(&seed.store));
+        full.force_full_sort = true;
+        Ok((fast, full))
+    }
+
+    fn refresh_pair(
+        fast: &mut DownloadTableDelegate,
+        full: &mut DownloadTableDelegate,
+        now: Instant,
+    ) {
+        assert_eq!(fast.refresh_view_at(now), full.refresh_view_at(now));
+        assert_eq!(fast.visible, full.visible);
+        assert_eq!(fast.selected_tasks, full.selected_tasks);
+        assert_eq!(fast.selection_anchor, full.selection_anchor);
+        assert_eq!(fast.reorder_deadline(), full.reorder_deadline());
+    }
+
+    #[test]
+    fn unchanged_sort_values_match_full_sort_across_event_sequences() -> Result<(), I18nError> {
+        let sort_keys = [
+            ViewSortKey::Smart,
+            ViewSortKey::Created,
+            ViewSortKey::Name,
+            ViewSortKey::Size,
+            ViewSortKey::Progress,
+            ViewSortKey::Speed,
+            ViewSortKey::Status,
+        ];
+        let groupings = [
+            ViewGroupBy::None,
+            ViewGroupBy::Status,
+            ViewGroupBy::Date,
+            ViewGroupBy::Type,
+            ViewGroupBy::Queue,
+            ViewGroupBy::Site,
+            ViewGroupBy::Group,
+        ];
+        for sort_key in sort_keys {
+            for sort_dir in [SortDir::Asc, SortDir::Desc] {
+                for group_by in groupings {
+                    let (mut fast, mut full) = paired_delegates(&[1, 1, 0, 3, 2, 4])?;
+                    let template = fast.store.local()[0].clone();
+                    let mut remote = template.clone();
+                    remote.key = RowKey::Remote("remote".into());
+                    remote.source = TaskSource::Remote;
+                    remote.to_device = "device".into();
+                    fast.store.replace_remote(vec![remote]);
+                    let categories = Rc::new(CategoryIndex::from_dtos(
+                        fluxdown_protocol::CustomCategoryDto::builtin_defaults(),
+                    ));
+                    fast.set_categories(Rc::clone(&categories));
+                    full.set_categories(categories);
+                    let prefs = ViewPrefs {
+                        sort_key,
+                        sort_dir,
+                        group_by,
+                        ..ViewPrefs::default()
+                    };
+                    fast.set_prefs(prefs.clone());
+                    full.set_prefs(prefs);
+                    let start = Instant::now();
+                    refresh_pair(&mut fast, &mut full, start);
+                    fast.select_all_tasks();
+                    full.select_all_tasks();
+                    let mut random = 0xa076_1d64_78bd_642f_u64;
+                    for step in 1..=192 {
+                        random ^= random << 13;
+                        random ^= random >> 7;
+                        random ^= random << 17;
+                        let now = start + Duration::from_millis(step * 137);
+                        if let Some(deadline) = fast.reorder_deadline().filter(|at| *at <= now) {
+                            fast.view_dirty = true;
+                            full.view_dirty = true;
+                            refresh_pair(&mut fast, &mut full, deadline);
+                        }
+                        let count = fast.store.local().len();
+                        let ix = (random >> 32) as usize % count;
+                        let mut row = fast.store.local()[ix].clone();
+                        match random % 16 {
+                            0 => {
+                                row.downloaded_bytes += 1;
+                                row.progress = (random % 101) as f32 / 100.;
+                                fast.store.set_local(ix, row);
+                            }
+                            1 => {
+                                row.speed_bytes_per_second = Some(random % 500);
+                                fast.store.set_local(ix, row);
+                            }
+                            2 => {
+                                row.size_bytes = random % 200;
+                                fast.store.set_local(ix, row);
+                            }
+                            3 => {
+                                row.state = if row.state == TaskState::Completed {
+                                    TaskState::Downloading
+                                } else {
+                                    TaskState::Completed
+                                };
+                                fast.store.set_local(ix, row);
+                            }
+                            4 => {
+                                row.boosted = !row.boosted;
+                                row.preparing = !row.preparing;
+                                row.queue_position = (random % 5) as u32;
+                                fast.store.set_local(ix, row);
+                            }
+                            5 => {
+                                row.queue_order += 1;
+                                fast.store.set_local(ix, row);
+                            }
+                            6 => {
+                                row.name = format!("episode{}.zip", random % 12);
+                                row.name_fold = row.name.to_lowercase();
+                                row.file_extension = "zip".into();
+                                fast.store.set_local(ix, row);
+                            }
+                            7 => {
+                                row.queue_id = format!("queue{}", random % 3);
+                                row.group_id = format!("group{}", random % 2);
+                                row.referrer = format!("https://site{}.test/page", random % 4);
+                                fast.store.set_local(ix, row);
+                            }
+                            8 => {
+                                let query = if fast.query.is_empty() { "episode" } else { "" };
+                                fast.set_query(query);
+                                full.set_query(query);
+                            }
+                            9 => {
+                                if let Some(key) = fast.visible.iter().find_map(|row| match row {
+                                    VisibleRow::GroupHeader { key, .. } => Some(key.clone()),
+                                    VisibleRow::Task(_) => None,
+                                }) {
+                                    fast.toggle_group_collapsed(&key);
+                                    full.toggle_group_collapsed(&key);
+                                }
+                            }
+                            10 => {
+                                let mut rows = fast.store.local().to_vec();
+                                rows[ix].progress = (random % 101) as f32 / 100.;
+                                rows[ix].speed_bytes_per_second = Some(random % 500);
+                                fast.store.replace_local(rows);
+                                let rows = fast.store.remote().to_vec();
+                                fast.store.replace_remote(rows);
+                            }
+                            11 => {
+                                if count > 3 {
+                                    fast.store.swap_remove_local(ix);
+                                } else {
+                                    let mut added = template.clone();
+                                    added.key = RowKey::Local(format!("added{step}"));
+                                    fast.store.push_local(added);
+                                }
+                            }
+                            12 => {
+                                fast.row_order.note_interaction(now);
+                                full.row_order.note_interaction(now);
+                            }
+                            13 => {
+                                row.created_at_secs += 1;
+                                fast.store.set_local(ix, row);
+                            }
+                            14 => {
+                                let filter = match random >> 8 & 3 {
+                                    0 => TableFilter::Download(DownloadFilter::ALL),
+                                    1 => TableFilter::Download(DownloadFilter::status(
+                                        DownloadStatusFilter::Incomplete,
+                                    )),
+                                    2 => TableFilter::Queue("main".into()),
+                                    _ => TableFilter::Device("device".into()),
+                                };
+                                fast.set_filter(filter.clone());
+                                full.set_filter(filter);
+                            }
+                            _ => {
+                                row.runtime_connected = !row.runtime_connected;
+                                row.eta_seconds = Some(random % 600);
+                                fast.store.set_local(ix, row);
+                            }
+                        }
+                        refresh_pair(&mut fast, &mut full, now);
+                        if step % 19 == 0
+                            && let Some(key) = fast.visible_task_keys().first().cloned()
+                        {
+                            fast.select_task(key.clone(), Modifiers::default());
+                            full.select_task(key, Modifiers::default());
+                        }
+                    }
+                    assert!(fast.full_sort_count < full.full_sort_count);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cached_sorted_input_preserves_deferred_reorder_and_live_clock() -> Result<(), I18nError> {
+        for sort_key in [ViewSortKey::Speed, ViewSortKey::Progress] {
+            let (mut fast, mut full) = paired_delegates(&[1, 1])?;
+            let prefs = ViewPrefs {
+                sort_key,
+                ..ViewPrefs::default()
+            };
+            fast.set_prefs(prefs.clone());
+            full.set_prefs(prefs);
+            let now = Instant::now();
+            refresh_pair(&mut fast, &mut full, now);
+            let previous = fast.visible.clone();
+            let mut row = fast.store.local()[1].clone();
+            row.speed_bytes_per_second = Some(100);
+            row.progress = 0.8;
+            fast.store.set_local(1, row);
+            refresh_pair(&mut fast, &mut full, now + Duration::from_millis(100));
+            assert_eq!(fast.visible, previous);
+            let deadline = fast.reorder_deadline().expect("live sort deferred");
+            let sorts = fast.full_sort_count;
+            let mut row = fast.store.local()[1].clone();
+            row.eta_seconds = Some(3);
+            fast.store.set_local(1, row);
+            refresh_pair(&mut fast, &mut full, now + Duration::from_millis(200));
+            assert_eq!(fast.full_sort_count, sorts);
+            assert_eq!(fast.reorder_deadline(), Some(deadline));
+
+            let mut row = fast.store.local()[1].clone();
+            row.eta_seconds = Some(2);
+            fast.store.set_local(1, row);
+            refresh_pair(&mut fast, &mut full, deadline);
+            assert_eq!(fast.full_sort_count, sorts);
+            assert_eq!(
+                fast.visible_task_keys(),
+                [RowKey::Local("t1".into()), RowKey::Local("t0".into())]
+            );
+            assert_eq!(fast.reorder_deadline(), None);
+
+            let mut row = fast.store.local()[0].clone();
+            row.speed_bytes_per_second = Some(200);
+            row.progress = 0.9;
+            fast.store.set_local(0, row);
+            refresh_pair(&mut fast, &mut full, deadline + Duration::from_millis(100));
+            assert_eq!(
+                fast.visible_task_keys(),
+                [RowKey::Local("t1".into()), RowKey::Local("t0".into())]
+            );
+            assert_eq!(
+                fast.reorder_deadline(),
+                Some(deadline + Duration::from_secs(2))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn changed_sort_keys_and_tie_breakers_take_full_path() -> Result<(), I18nError> {
+        for sort_key in [
+            ViewSortKey::Smart,
+            ViewSortKey::Created,
+            ViewSortKey::Name,
+            ViewSortKey::Size,
+            ViewSortKey::Progress,
+            ViewSortKey::Speed,
+            ViewSortKey::Status,
+        ] {
+            let (mut fast, mut full) = paired_delegates(&[1, 1])?;
+            let prefs = ViewPrefs {
+                sort_key,
+                ..ViewPrefs::default()
+            };
+            fast.set_prefs(prefs.clone());
+            full.set_prefs(prefs);
+            let now = Instant::now();
+            refresh_pair(&mut fast, &mut full, now);
+            let sorts = fast.full_sort_count;
+            let mut row = fast.store.local()[0].clone();
+            row.eta_seconds = Some(10);
+            fast.store.set_local(0, row);
+            refresh_pair(&mut fast, &mut full, now + Duration::from_millis(10));
+            assert_eq!(fast.full_sort_count, sorts);
+            let mut row = fast.store.local()[0].clone();
+            match sort_key {
+                ViewSortKey::Smart => row.boosted = true,
+                ViewSortKey::Created => row.created_at_secs += 1,
+                ViewSortKey::Name => {
+                    row.name = "a.bin".into();
+                    row.name_fold = "a.bin".into();
+                }
+                ViewSortKey::Size => row.size_bytes += 1,
+                ViewSortKey::Progress => row.progress = 0.5,
+                ViewSortKey::Speed => row.speed_bytes_per_second = Some(10),
+                ViewSortKey::Status => row.state = TaskState::Completed,
+            }
+            fast.store.set_local(0, row);
+            refresh_pair(&mut fast, &mut full, now + Duration::from_millis(20));
+            assert_eq!(fast.full_sort_count, sorts + 1);
+            let mut row = fast.store.local()[0].clone();
+            row.queue_order += 1;
+            fast.store.set_local(0, row);
+            refresh_pair(&mut fast, &mut full, now + Duration::from_millis(30));
+            assert_eq!(fast.full_sort_count, sorts + 2);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_and_view_changes_invalidate_cached_sort() -> Result<(), I18nError> {
+        let (mut fast, mut full) = paired_delegates(&[1, 1, 3])?;
+        let now = Instant::now();
+        fast.set_prefs(ViewPrefs::default());
+        full.set_prefs(ViewPrefs::default());
+        refresh_pair(&mut fast, &mut full, now);
+        let mut expected = fast.full_sort_count;
+        let rows = fast.store.local().to_vec();
+        let structure = fast.store.structure_generation();
+        fast.store.replace_local(rows);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(10));
+        expected += 1;
+        assert_eq!(fast.full_sort_count, expected);
+        assert_eq!(fast.store.structure_generation(), structure);
+        fast.store.replace_remote(Vec::new());
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(20));
+        expected += 1;
+        assert_eq!(fast.full_sort_count, expected);
+        fast.prefs_mut().sort_key = ViewSortKey::Name;
+        full.prefs_mut().sort_key = ViewSortKey::Name;
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(30));
+        expected += 1;
+        assert_eq!(fast.full_sort_count, expected);
+        let categories = Rc::new(CategoryIndex::default());
+        fast.set_categories(Rc::clone(&categories));
+        full.set_categories(categories);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(40));
+        expected += 1;
+        assert_eq!(fast.full_sort_count, expected);
+        fast.select_all_tasks();
+        full.select_all_tasks();
+        fast.set_query("f0");
+        full.set_query("f0");
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(50));
+        expected += 1;
+        assert_eq!(fast.full_sort_count, expected);
+        assert_eq!(fast.selected_keys(), [RowKey::Local("t0".into())]);
+        let filter = TableFilter::Download(DownloadFilter::status(DownloadStatusFilter::Completed));
+        fast.set_filter(filter.clone());
+        full.set_filter(filter);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(60));
+        expected += 1;
+        assert_eq!(fast.full_sort_count, expected);
+        assert!(fast.selected_tasks.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn smart_sort_tracks_effective_tiers_and_queue_slots() -> Result<(), I18nError> {
+        let (mut fast, mut full) = paired_delegates(&[1, 0])?;
+        let now = Instant::now();
+        fast.set_prefs(ViewPrefs::default());
+        full.set_prefs(ViewPrefs::default());
+        refresh_pair(&mut fast, &mut full, now);
+        let sorts = fast.full_sort_count;
+        let mut active = fast.store.local()[0].clone();
+        active.queue_position = 9;
+        active.preparing = true;
+        fast.store.set_local(0, active);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(10));
+        assert_eq!(fast.full_sort_count, sorts);
+
+        let mut queued = fast.store.local()[1].clone();
+        queued.queue_position = 1;
+        fast.store.set_local(1, queued);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(20));
+        assert_eq!(fast.full_sort_count, sorts + 1);
+        let mut queued = fast.store.local()[1].clone();
+        queued.preparing = true;
+        fast.store.set_local(1, queued);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(30));
+        assert_eq!(fast.full_sort_count, sorts + 2);
+        let mut preparing = fast.store.local()[1].clone();
+        preparing.queue_position = 3;
+        fast.store.set_local(1, preparing);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(40));
+        assert_eq!(fast.full_sort_count, sorts + 2);
+        let mut preparing = fast.store.local()[1].clone();
+        preparing.boosted = true;
+        fast.store.set_local(1, preparing);
+        refresh_pair(&mut fast, &mut full, now + Duration::from_millis(50));
+        assert_eq!(fast.full_sort_count, sorts + 3);
+        Ok(())
+    }
+
+    #[test]
+    fn unordered_progress_values_conservatively_take_full_path() -> Result<(), I18nError> {
+        let (mut fast, mut full) = paired_delegates(&[1, 1])?;
+        let prefs = ViewPrefs {
+            sort_key: ViewSortKey::Progress,
+            ..ViewPrefs::default()
+        };
+        fast.set_prefs(prefs.clone());
+        full.set_prefs(prefs);
+        let now = Instant::now();
+        refresh_pair(&mut fast, &mut full, now);
+        let sorts = fast.full_sort_count;
+        for (step, progress) in [f32::NAN, f32::NAN, 0.5].into_iter().enumerate() {
+            let mut row = fast.store.local()[0].clone();
+            row.progress = progress;
+            fast.store.set_local(0, row);
+            refresh_pair(
+                &mut fast,
+                &mut full,
+                now + Duration::from_millis((step as u64 + 1) * 10),
+            );
+            assert_eq!(fast.full_sort_count, sorts + step + 1);
+        }
         Ok(())
     }
 
