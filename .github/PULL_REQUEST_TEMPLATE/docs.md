@@ -15,8 +15,8 @@
       This PR touches **exactly one page** (new or edited), with no unrelated changes
 - [ ] 内容为**纯 Markdown**，不包含内联 HTML 标签
       Content is **plain Markdown** — no inline HTML tags
-- [ ] 所有图片均 **<200KB**，且引用**本地路径** `website/public/docs/...`（不外链图床）
-      All images are **<200KB** and reference a **local path** under `website/public/docs/...` (no hotlinked images)
+- [ ] 所有图片均 **<200KB**，且引用**本地路径** `website-v2/public/docs/...`（不外链图床）
+      All images are **<200KB** and reference a **local path** under `website-v2/public/docs/...` (no hotlinked images)
 - [ ] 更大的资源（视频 / 高清大图）已联系维护者上传至 R2，未直接提交进仓库
       Larger assets (video / high-res images) were coordinated with a maintainer for R2 upload, not committed directly
 - [ ] 若为翻译 PR：已在本地运行 `npm run docs:hash <zh 文件相对路径>` 写入 `sourceHash`，或已在下方"翻译声明"中说明留空

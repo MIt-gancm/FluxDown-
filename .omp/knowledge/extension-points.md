@@ -37,6 +37,6 @@
 | **新增 GPUI capability / 设置分区** | 状态/命令/多页面满足拆 crate 条件时在 `crates/<capability>` 定义本地 port/controller/view；只依赖 `fluxdown_protocol` 和 UI 基础层 → `crates/app` 注入同一个 `Arc<AgentClient>` adapter 与有序 snapshot/event 流；shell 只收内容槽。设置页 = gpui-component `Settings` DSL：`crates/settings/src/sections/<page>.rs::page(&SectionContext, cx) -> SettingPage`，状态经 `Entity<SettingsStore>`（防抖合并写回、乐观覆盖、冲突重试），自定义控件用 `SettingField::render` + `window.use_keyed_state`，对话框走 `window.open_dialog`（shell 已渲染 dialog/sheet/notification 层） |
 | **新增 NAS/分发目标** | `packaging/<target>/build_*.sh` 复用（`fluxdown-agent` + `fluxdownd` 同目录、入口 `fluxdown-agent --server` + `FLUXDOWN_*`；Web UI 已编译期内嵌，别再往包里塞 `web/` 目录）布局 → 接入 release.yml `build-server-nas-packages` |
 | **新增发布组件** | `changes` job 加路径→输出映射 + 一对 `build-*`/`release-*` job（各自组件 tag） |
-| **新增文档页** | `content/docs/{en,zh}/<section>/<page>.md`（section 加进 `content.config` 枚举，zh 跑 `docs:hash`） |
+| **新增文档页** | `website-v2/src/content/docs/{en,zh}/<section>/<page>.md`（section 加进 `content.config` 枚举，zh 跑 `docs:hash`） |
 | **新增自更新平台策略** | `fluxdown_updater` Action + `hub/updater.rs` |
-| **新增 UI 文案** | 只补 **en + zh 基线对**：App/GPUI/Web SPA 共用 `assets/i18n/{en,zh}.json`（Flutter 另在 `lib/src/i18n/translations.dart` 加 getter）；官网 `website/src/lib/locales/{en,zh-CN}.json`；扩展 `fluxDown/utils/locales/{zh-CN,en}.ts`（`MessageKey` 由 zh-CN 推导）。**社区语言（`ja.json` 等）不碰**——Weblate 维护，运行时键级回退英文 |
+| **新增 UI 文案** | 只补 **en + zh 基线对**：App/GPUI/Web SPA 共用 `assets/i18n/{en,zh}.json`（Flutter 另在 `lib/src/i18n/translations.dart` 加 getter）；官网主站 `website-v2/src/i18n/messages/<ns>.ts` 的 `defineMessages({ en, zh })`；扩展 `fluxDown/utils/locales/{zh-CN,en}.ts`（`MessageKey` 由 zh-CN 推导）。**社区语言（`ja` 等）不碰**——Weblate 维护，运行时键级回退英文 |

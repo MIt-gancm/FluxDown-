@@ -131,9 +131,10 @@ React 19 + Vite 8 + TanStack Router + Tailwind v4 + Radix + bun + oxlint。`bun 
 
 ---
 
-## 官网（`website/`）
+## 官网（`website-v2/` 主站 · `website/` 旧站）
 
-Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+Docker）。营销 + 文档 + 社区 API 站，**不属于**下载栈。
-- **页面**：首页（多语言变体）、plugins、faq、themes/theme-builder、changelog、announcements、api-docs（Scalar over `public/openapi.json`）、sponsor/pay、vote、privacy/terms、feedback 等。`website/` 为旧站，**主题相关改动只进 `website-v2/`**：`/theme-builder` 有 Flutter | GPUI 目标切换（`?client=gpui`，`?market=themes/<id>/<file>.json` 直接导入），GPUI 编辑器数据驱动自 `src/lib/gpui-theme/registry.json`，TS 解析/resolve/导出与 Rust 逐项一致（`bun test tests` 对照 `crates/theme/tests/fixtures/*.resolved.json`）；主题市场 `index.json` 条目可选 `clients.gpui: {theme, screenshot?}`（文件平铺 `themes/<id>/`，代理白名单无需改）。
+Astro SSR（`@astrojs/node` standalone，**自托管**非 Vercel；`deploy.sh`+Docker，1Panel OpenResty 反代）。营销 + 文档 + 社区 API 站，**不属于**下载栈。
+- **部署**：`website-v2/` 是主站，根路径部署（`https://fluxdown.zerx.dev/` → 容器 `fluxdown-website-v2` `127.0.0.1:4322`，`SITE_BASE` 默认空）；`website/` 是只读旧站存档，挂 `/v1/`（容器 `fluxdown-website` `127.0.0.1:4321`，`SITE_BASE` 默认 `/v1`，反代保留前缀、整站 noindex、不提交 IndexNow）。挂载前缀构建期经 `SITE_BASE` 固化进 astro `base`，站内输出边界一律 `src/lib/base.ts::withBase`、读路径先 `stripBase`。旧 `/v2/*` 预览地址由反代 301 到根。新内容、文档、OpenAPI、图标只进 `website-v2/`。
+- **页面**：首页（多语言变体）、plugins、faq、themes/theme-builder、changelog、announcements、api-docs（Scalar over `public/openapi.json`）、sponsor/pay、vote、privacy/terms、feedback 等。**主题相关改动只进 `website-v2/`**：`/theme-builder` 有 Flutter | GPUI 目标切换（`?client=gpui`，`?market=themes/<id>/<file>.json` 直接导入），GPUI 编辑器数据驱动自 `src/lib/gpui-theme/registry.json`，TS 解析/resolve/导出与 Rust 逐项一致（`bun test tests` 对照 `crates/theme/tests/fixtures/*.resolved.json`）；主题市场 `index.json` 条目可选 `clients.gpui: {theme, screenshot?}`（文件平铺 `themes/<id>/`，代理白名单无需改）。
 - **`/docs` 双语内容集**：`src/content/docs/{en,zh}/<section>/<page>.md`（纯 Markdown，禁 MDX/HTML）；section 枚举见 `content.config`；zh 带 `sourceHash`（en 正文 sha256[:12]，`npm run docs:hash`）驱动过期横幅；en-only 页回退 en + `noindex` + 排除 sitemap（`docs-fallback.ts` 单源）。
 - **API 路由**（`src/pages/api/`）：feedback、changelog、release、plugins/themes/components 代理、sponsor/pay、vote、subscribe、issues、`webhooks/github`（**GitHub webhook 接收器**，HMAC——与任务事件 webhook 无关，见 `ops.md`「设计文档实现状态」）。

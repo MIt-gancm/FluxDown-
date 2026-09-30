@@ -47,11 +47,11 @@ Every documentation page has an "Edit this page" link that opens the GitHub web 
 
 ### 目录结构 / Directory Layout
 
-文档源文件位于 `website/src/content/docs/{en,zh}/`，按语言分目录，子目录与文件名一一对应：
-Documentation source files live under `website/src/content/docs/{en,zh}/`, one directory per language, with matching subdirectory/filename structure across languages:
+文档源文件位于 `website-v2/src/content/docs/{en,zh}/`，按语言分目录，子目录与文件名一一对应（`website/` 是 `/v1` 旧站存档，不再接收文档改动）：
+Documentation source files live under `website-v2/src/content/docs/{en,zh}/`, one directory per language, with matching subdirectory/filename structure across languages (`website/` is the archived `/v1` site and no longer accepts doc changes):
 
 ```text
-website/src/content/docs/
+website-v2/src/content/docs/
 ├── en/
 │   ├── getting-started/installation.md
 │   └── ...
@@ -77,8 +77,8 @@ Each file starts with a YAML frontmatter block:
 
 1. 在 `zh/` 下创建与 `en/` 对应路径同名的文件（每篇英文页面的"新建翻译"深链会自动引导到正确目录）。
    Create a file under `zh/` at the same relative path as its `en/` counterpart (the "New translation" deep link on each English page opens the correct target directory automatically).
-2. 翻译完成后，在 `website/` 目录下运行 `npm run docs:hash <zh 文件相对路径>`，自动写入 frontmatter 中的 `sourceHash` 字段。
-   After translating, run `npm run docs:hash <path to the zh file>` from the `website/` directory to write the `sourceHash` frontmatter field automatically.
+2. 翻译完成后，在 `website-v2/` 目录下运行 `npm run docs:hash <zh 文件相对路径>`，自动写入 frontmatter 中的 `sourceHash` 字段。
+   After translating, run `npm run docs:hash <path to the zh file>` from the `website-v2/` directory to write the `sourceHash` frontmatter field automatically.
 3. 无法本地运行脚本也没关系（例如仅使用网页编辑器）：在 PR 描述中说明留空，并勾选 "Allow edits from maintainers"，维护者会在合并前后补上。
    Can't run the script locally (e.g. web-editor-only contributions)? That's fine — note it in the PR description and enable "Allow edits from maintainers"; a maintainer will fill it in around merge time.
 4. 之后 en 原文更新导致 `sourceHash` 不再匹配时，zh 页面会自动显示"译文可能已过期"提示，但页面仍正常展示，不影响访问。

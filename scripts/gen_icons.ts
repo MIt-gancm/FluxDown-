@@ -38,7 +38,7 @@
  *     {16,32,48,128}.png  {16,32,48,128}-disabled.png
  *     fluxdown_logo.png (128×128)  fluxdown_logo.svg (副本)
  *
- *   website/public/
+ *   website-v2/public/（主站；website/ 为 /v1 旧站存档，不再更新）
  *     favicon.ico  favicon.svg  logo.png (1024×1024)  logo.svg (副本)
  */
 
@@ -519,9 +519,9 @@ async function main() {
   }
 
   // ──────────────────────────────────────────
-  // 7. 官网 — favicon + logo
+  // 7. 官网（主站 website-v2）— favicon + logo
   // ──────────────────────────────────────────
-  console.log("\n📁 website/public/");
+  console.log("\n📁 website-v2/public/");
   {
     // favicon.ico（多分辨率: 16, 32, 48）
     const faviconSizes = [16, 32, 48];
@@ -530,7 +530,7 @@ async function main() {
       faviconFrames.push({ size, data: await getCachedPng(size) });
     }
     const faviconIco = buildIco(faviconFrames);
-    await saveFile("website/public/favicon.ico", faviconIco);
+    await saveFile("website-v2/public/favicon.ico", faviconIco);
 
     // favicon.svg — 将 1024px PNG 嵌入 SVG（与现有格式一致）
     const logo1024 = await getCachedPng(1024);
@@ -541,14 +541,14 @@ async function main() {
       `</svg>`,
       "",
     ].join("\n");
-    await saveFile("website/public/favicon.svg", faviconSvg);
+    await saveFile("website-v2/public/favicon.svg", faviconSvg);
 
     // logo.png (1024×1024)
-    await saveFile("website/public/logo.png", logo1024);
+    await saveFile("website-v2/public/logo.png", logo1024);
 
     // logo.svg (复制源 SVG)
     const svgContent = readFileSync(SVG_SRC);
-    await saveFile("website/public/logo.svg", svgContent);
+    await saveFile("website-v2/public/logo.svg", svgContent);
 
     totalCount += 4;
   }

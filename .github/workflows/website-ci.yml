@@ -1,17 +1,17 @@
 name: Website CI
 
-# 仅当 PR 涉及文档子系统相关路径时触发：构建校验（content collection schema + 全量路由）
-# + 安全 lint（拒绝危险 scheme 链接与外链图片）。不做 website/** 全站门禁，
-# 维护者确认后可扩大触发范围（见文档系统设计方案 D9）。
+# 仅当 PR 涉及主站（website-v2/）文档子系统相关路径时触发：构建校验（content collection schema + 全量路由）
+# + 安全 lint（拒绝危险 scheme 链接与外链图片）。不做 website-v2/** 全站门禁（全站测试见 ci.yml），
+# 维护者确认后可扩大触发范围（见文档系统设计方案 D9）。website/ 是 /v1 旧站存档，不再设文档门禁。
 on:
   pull_request:
     paths:
-      - "website/src/content/**"
-      - "website/src/pages/docs/**"
-      - "website/src/components/docs/**"
-      - "website/src/content.config.ts"
-      - "website/astro.config.mjs"
-      - "website/src/lib/docs-*.ts"
+      - "website-v2/src/content/**"
+      - "website-v2/src/pages/docs/**"
+      - "website-v2/src/components/docs/**"
+      - "website-v2/src/content.config.ts"
+      - "website-v2/astro.config.mjs"
+      - "website-v2/src/lib/docs-*.ts"
 
 concurrency:
   group: website-ci-${{ github.event.pull_request.number }}
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: website
+        working-directory: website-v2
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

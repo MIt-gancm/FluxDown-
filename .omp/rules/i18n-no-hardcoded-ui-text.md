@@ -11,7 +11,7 @@ condition:
 globs:
   - 'lib/**/*.dart'
   - 'web/src/**/*.tsx'
-  - 'website/src/**/*.{tsx,astro}'
+  - 'website-v2/src/**/*.{tsx,astro}'
   - 'fluxDown/**/*.{ts,tsx,html}'
 repeatMode: after-gap
 repeatGap: 3
@@ -25,12 +25,12 @@ repeatGap: 3
 |---|---|
 | App（`lib/`） | `final s = S.of(locale);` → `Text(s.xxx)`；参数化 `s.xxx(name: v)` |
 | Web SPA（`web/`） | `const { t } = useI18n()` → `t('xxx')` |
-| 官网（`website/`） | `useI18n()` / `Messages` 键；Astro 侧取服务端 locale |
+| 官网（`website-v2/`） | `src/i18n/messages/<ns>.ts` 的 `defineMessages` 键；Astro 侧按页面 `lang` 取 `messages[lang]` |
 | 扩展（`fluxDown/`） | `t('section.key')`，或 HTML 上挂 `data-i18n="section.key"` |
 
 Dart 侧文案承载点不止 `Text()`——本规则覆盖：`Text(` / `SelectableText(` / `TextSpan(text:` / `Tooltip(message:`，以及**字符串直传**的命名参数 `label:`（菜单项）、`tooltip:`（`ShadIconButton`/`ShadTooltip`）、`hintText:`（输入框）、`placeholder:` / `title:` / `description:`（shadcn 多数场景传的是 `Text(...)` widget，内层照样命中）、`semanticLabel:`，以及 `String get xxx => '…'` 形式的展示名 getter。
 
-同一动作里把键补进**基线双语**：`en.json` + `zh.json`（官网 `zh-CN.json`，扩展 `zh-CN.ts` + `en.ts`）；App 端再去 `lib/src/i18n/translations.dart` 加 getter。**ja 等社区语言不要动**（Weblate 维护，运行时按键级回退英文）——细则见规则 `i18n-baseline-zh-en`。
+同一动作里把键补进**基线双语**：`en.json` + `zh.json`（官网 `defineMessages` 的 `en`/`zh`，扩展 `zh-CN.ts` + `en.ts`）；App 端再去 `lib/src/i18n/translations.dart` 加 getter。**ja 等社区语言不要动**（Weblate 维护，运行时按键级回退英文）——细则见规则 `i18n-baseline-zh-en`。
 
 **可以硬编码的例外**（命中本规则时若属于以下情形，说明一句继续即可）：
 
