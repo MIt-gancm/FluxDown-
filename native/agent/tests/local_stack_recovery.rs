@@ -118,7 +118,7 @@ async fn client_observes_daemon_stale_recovery_and_agent_restart_state_restorati
             && daemon_config_value(snapshot, "max_concurrent_tasks") == Some("9")
     })
     .await;
-    assert!(daemon_revision(&restored) >= revision + 1);
+    assert!(daemon_revision(&restored) > revision);
 
     drop(restarted_client);
     terminate_child(

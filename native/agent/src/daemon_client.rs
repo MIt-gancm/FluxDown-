@@ -279,6 +279,10 @@ impl Drop for SettleOnExit {
     }
 }
 
+/// 测试用记录客户端收到的 `(method, params)` 序列。
+#[cfg(test)]
+pub(crate) type RecordedCalls = Arc<tokio::sync::Mutex<Vec<(String, Option<Value>)>>>;
+
 #[cfg(test)]
 impl DaemonClient {
     /// 已断线（首次连接已有结论）的客户端：调用立即失败。
@@ -295,7 +299,7 @@ impl DaemonClient {
     }
 
     /// 已连接的客户端：记录每次调用的方法与参数并回 `{}`，供断言 agent 发给 daemon 的命令。
-    pub(crate) fn recording() -> (Self, Arc<tokio::sync::Mutex<Vec<(String, Option<Value>)>>>) {
+    pub(crate) fn recording() -> (Self, RecordedCalls) {
         let (commands, mut receiver) = mpsc::channel::<ClientCommand>(16);
         let calls = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let sink = calls.clone();
@@ -1088,8 +1092,8 @@ mod tests {
     #[tokio::test]
     async fn handshake_buffers_notifications_filters_old_frames_and_reconnects_after_gap() {
         use fluxdown_protocol::{
-            DaemonEvent, DaemonSnapshot, EventFrame, RpcNotification, ServiceEvent, ServiceHello,
-            ServiceRole, Snapshot, SnapshotBody, TaskRuntimeDto,
+            DaemonEvent, EventFrame, RpcNotification, ServiceEvent, ServiceHello, ServiceRole,
+            Snapshot, SnapshotBody, TaskRuntimeDto,
         };
         use futures_util::SinkExt;
 
@@ -1140,7 +1144,7 @@ mod tests {
             let snapshot = Snapshot {
                 epoch: epoch.into(),
                 sequence,
-                body: SnapshotBody::Daemon(Box::new(DaemonSnapshot::default())),
+                body: SnapshotBody::Daemon(Box::default()),
             };
             send_response(
                 &mut ws,
@@ -1223,8 +1227,7 @@ mod tests {
     #[tokio::test]
     async fn daemon_error_keeps_field_and_reason_when_forwarded() {
         use fluxdown_protocol::{
-            DaemonSnapshot, ErrorReason, RpcErrorData, ServiceHello, ServiceRole, Snapshot,
-            SnapshotBody,
+            ErrorReason, RpcErrorData, ServiceHello, ServiceRole, Snapshot, SnapshotBody,
         };
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1245,7 +1248,7 @@ mod tests {
                 let snapshot = Snapshot {
                     epoch: "e".into(),
                     sequence: 1,
-                    body: SnapshotBody::Daemon(Box::new(DaemonSnapshot::default())),
+                    body: SnapshotBody::Daemon(Box::default()),
                 };
                 send_response(
                     &mut ws,
@@ -1339,6 +1342,8 @@ mod tests {
     }
 
     #[tokio::test]
+    // tungstenite 的升级回调签名固定返回 `Result<Response, ErrorResponse>`。
+    #[allow(clippy::result_large_err)]
     async fn impostor_daemon_learns_no_credential_and_never_sees_the_token() {
         use futures_util::StreamExt;
         use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};

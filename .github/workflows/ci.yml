@@ -89,9 +89,10 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --check
 
-      # native/server 已冻结（不构建、不接收改动），不进门禁。
+      # native/server 已冻结（不构建、不接收改动），不进门禁。测试代码同样过 clippy：
+      # 测试里允许 unwrap/expect（clippy.toml），其余 lint 一视同仁。
       - name: cargo clippy
-        run: cargo clippy --workspace --exclude fluxdown_server -- -D warnings
+        run: cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings
 
   rust-test:
     name: Test (${{ matrix.name }})

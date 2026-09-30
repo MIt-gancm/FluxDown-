@@ -477,11 +477,13 @@ mod tests {
 
     #[test]
     fn prefs_round_trip_and_tolerate_unknown_fields() {
-        let mut prefs = ViewPrefs::default();
-        prefs.density = ViewDensity::Compact;
-        prefs.group_by = ViewGroupBy::Site;
-        prefs.sort_key = ViewSortKey::Size;
-        prefs.sort_dir = SortDir::Asc;
+        let mut prefs = ViewPrefs {
+            density: ViewDensity::Compact,
+            group_by: ViewGroupBy::Site,
+            sort_key: ViewSortKey::Size,
+            sort_dir: SortDir::Asc,
+            ..ViewPrefs::default()
+        };
         prefs.collapsed_groups.push("x".to_owned());
         let value = prefs.to_value();
         assert_eq!(ViewPrefs::from_value(&value), prefs);

@@ -12031,7 +12031,7 @@ mod tests {
 
         mgr.retry_scheduled.insert("a".into(), String::new());
         mgr.plugin_request_retry("a", 10_000).await;
-        assert!(mgr.auto_retry_counts.get("a").is_none());
+        assert!(!mgr.auto_retry_counts.contains_key("a"));
 
         mgr.retry_scheduled.clear();
         mgr.plugin_request_retry("a", 10_000).await;

@@ -170,7 +170,7 @@ mod tests {
         let mut tasks = Vec::new();
         for (index, name) in names.iter().enumerate() {
             for status in 0..5 {
-                let queue = if (index + status as usize) % 2 == 0 {
+                let queue = if (index + status as usize).is_multiple_of(2) {
                     "main"
                 } else {
                     "later"

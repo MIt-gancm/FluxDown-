@@ -218,7 +218,7 @@ mod tests {
         let runtime = TaskRuntimeDto {
             total_bytes: 10_000,
             segments: (0..10_000)
-                .map(|i| segment(i, i, i64::from(i % 2), i % 3 == 0))
+                .map(|i| segment(i, i, i % 2, i % 3 == 0))
                 .collect(),
             ..Default::default()
         };

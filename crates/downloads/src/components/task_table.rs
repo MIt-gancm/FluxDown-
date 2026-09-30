@@ -3163,8 +3163,10 @@ mod tests {
     #[test]
     fn grouping_inserts_headers_and_collapsing_hides_members() -> Result<(), I18nError> {
         let mut delegate = delegate(&[1, 3, 1, 3])?;
-        let mut prefs = ViewPrefs::default();
-        prefs.group_by = ViewGroupBy::Status;
+        let prefs = ViewPrefs {
+            group_by: ViewGroupBy::Status,
+            ..ViewPrefs::default()
+        };
         delegate.set_prefs(prefs);
         delegate.refresh_view();
         assert_eq!(delegate.visible.len(), 6);
@@ -3232,8 +3234,10 @@ mod tests {
     #[test]
     fn shift_range_selection_skips_group_headers() -> Result<(), I18nError> {
         let mut delegate = delegate(&[1, 3, 1, 3])?;
-        let mut prefs = ViewPrefs::default();
-        prefs.group_by = ViewGroupBy::Status;
+        let prefs = ViewPrefs {
+            group_by: ViewGroupBy::Status,
+            ..ViewPrefs::default()
+        };
         delegate.set_prefs(prefs);
         delegate.refresh_view();
         let first = delegate.row_key_at(1).expect("first task");

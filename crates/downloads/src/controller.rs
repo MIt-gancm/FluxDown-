@@ -1079,8 +1079,10 @@ mod tests {
     }
     #[test]
     fn late_snapshot_contains_segments_and_pausing_clears_active_without_erasing_bytes() {
-        let mut snapshot = fluxdown_protocol::AgentSnapshot::default();
-        snapshot.daemon_connected = true;
+        let mut snapshot = fluxdown_protocol::AgentSnapshot {
+            daemon_connected: true,
+            ..Default::default()
+        };
         let mut initial = task("t");
         initial.status = 1;
         initial.total_bytes = 100;
@@ -1136,8 +1138,10 @@ mod tests {
     }
     #[test]
     fn runtime_source_sequence_prevents_regression_and_paused_transfer_revival() {
-        let mut snapshot = fluxdown_protocol::AgentSnapshot::default();
-        snapshot.daemon_connected = true;
+        let mut snapshot = fluxdown_protocol::AgentSnapshot {
+            daemon_connected: true,
+            ..Default::default()
+        };
         let mut task = task("t");
         task.status = 1;
         snapshot.daemon.tasks.push(task.clone());
