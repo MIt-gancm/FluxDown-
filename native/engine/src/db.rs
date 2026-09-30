@@ -490,6 +490,35 @@ impl std::fmt::Debug for EngineWriteGuard {
     }
 }
 
+impl EngineWriteGuard {
+    /// 校验写入者租约仍然有效，供宿主定期心跳调用。
+    ///
+    /// PostgreSQL 的 advisory lock 寿命等于持锁连接的寿命；连接被 LB/NAT/主备切换
+    /// 断掉后，另一个实例即可拿到锁而本实例毫不知情。在持锁会话上重入加锁：
+    /// 连接已断则 SQL 直接报错，会话仍在则重入成功（随即解一次锁保持计数平衡）。
+    /// SQLite 后端的文件锁由内核随进程持有，无需校验。
+    pub async fn verify_lease(&self) -> Result<(), DbError> {
+        let Some(connection) = &self.postgres_connection else {
+            return Ok(());
+        };
+        let mut connection = connection.lock().await;
+        let still_held = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(POSTGRES_ENGINE_ADVISORY_LOCK)
+            .fetch_one(&mut **connection)
+            .await?;
+        if !still_held {
+            return Err(DbError::WriterLeaseHeld(
+                "PostgreSQL advisory lock lost".to_owned(),
+            ));
+        }
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(POSTGRES_ENGINE_ADVISORY_LOCK)
+            .execute(&mut **connection)
+            .await?;
+        Ok(())
+    }
+}
+
 impl Drop for EngineWriteGuard {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
@@ -513,7 +542,12 @@ fn acquire_engine_file_lease(data_dir: &Path) -> Result<EngineWriteGuard, DbErro
         .write(true)
         .open(&lock_path)?;
     if let Err(error) = file.try_lock_exclusive() {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        // Windows 上 fs2 返回 ERROR_LOCK_VIOLATION，std 不把它映射为 WouldBlock；
+        // 与 fs2 自身的争用错误码比较才能识别「已有写入者」。
+        let contended = error.kind() == std::io::ErrorKind::WouldBlock
+            || (error.raw_os_error().is_some()
+                && error.raw_os_error() == fs2::lock_contended_error().raw_os_error());
+        if contended {
             return Err(DbError::WriterLeaseHeld(lock_path.display().to_string()));
         }
         return Err(DbError::Io(error));
@@ -1656,7 +1690,7 @@ impl Db {
         probed_total_bytes: i64,
     ) -> Result<(i64, bool), DbError> {
         // 读-判-写放进同一事务，避免池化并发下的读写间隙。
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
 
         let stored_total: i64 = sqlx::query_scalar("SELECT total_bytes FROM tasks WHERE id = $1")
             .bind(id)
@@ -1753,13 +1787,36 @@ impl Db {
         Ok(())
     }
 
+    /// 先读后写事务的入口。SQLite 的 deferred 事务在 SELECT 之后升级为写锁时，
+    /// 若写锁被占或读快照已过期会立即返回 SQLITE_BUSY（不走 busy_timeout）；
+    /// `BEGIN IMMEDIATE` 在开始时就拿写锁，冲突时按 busy_timeout 等待。
+    /// PostgreSQL 的 READ COMMITTED 无此问题，沿用普通事务。
+    async fn begin_write(&self) -> Result<sqlx::Transaction<'static, Any>, sqlx::Error> {
+        match self.backend {
+            Backend::Sqlite => self.pool.begin_with("BEGIN IMMEDIATE").await,
+            Backend::Postgres => self.pool.begin().await,
+        }
+    }
+
     /// 启动时将所有 downloading(1)、pending(0)、preparing(5) 的任务矫正为 paused(2)
-    /// 因为重启后没有活跃的下载线程，这些任务实际上处于暂停状态
-    pub async fn reset_incomplete_tasks_to_paused(&self) -> Result<u64, DbError> {
-        let result = sqlx::query("UPDATE tasks SET status = 2 WHERE status IN (0, 1, 5)")
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected())
+    /// 因为重启后没有活跃的下载线程，这些任务实际上处于暂停状态。
+    /// 返回被矫正的任务 ID（按队列内顺序排列），供 `auto_resume_on_start` 恢复，
+    /// 避免把用户原本手动暂停的任务一并拉起。
+    pub async fn reset_incomplete_tasks_to_paused(&self) -> Result<Vec<String>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM tasks WHERE status IN (0, 1, 5) \
+             ORDER BY queue_order ASC, created_at ASC, id ASC",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        if !ids.is_empty() {
+            sqlx::query("UPDATE tasks SET status = 2 WHERE status IN (0, 1, 5)")
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(ids)
     }
 
     pub async fn load_all_tasks(&self) -> Result<Vec<TaskInfo>, DbError> {
@@ -2318,7 +2375,7 @@ impl Db {
         expected_revision: u64,
         values: &BTreeMap<String, String>,
     ) -> Result<u64, ConfigPatchError> {
-        let mut transaction = self.pool.begin().await.map_err(DbError::from)?;
+        let mut transaction = self.begin_write().await.map_err(DbError::from)?;
         let stored: Option<String> =
             sqlx::query_scalar("SELECT value FROM config WHERE key = 'daemon_config_revision'")
                 .fetch_optional(&mut *transaction)
@@ -2383,7 +2440,7 @@ impl Db {
 
     /// 返回现有 CDN 上传租约，或原子写入新租约并清空旧 pending 快照。
     pub async fn lease_cdn_reports(&self, lease_json: &str) -> Result<String, DbError> {
-        let mut transaction = self.pool.begin().await?;
+        let mut transaction = self.begin_write().await?;
         let existing: Option<String> =
             sqlx::query_scalar("SELECT value FROM config WHERE key = 'cdn_report_lease'")
                 .fetch_optional(&mut *transaction)
@@ -3517,7 +3574,7 @@ impl Db {
     /// （RAII：任何 `?` 早返回时 Drop 自动 ROLLBACK，母任务保持改写前状态，
     /// 调用方据此按 status=4 兜底，见 `on_resolve_ready`）。
     pub async fn fission_into_group(&self, spec: &FissionSpec) -> Result<(), DbError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.begin_write().await?;
         let row = sqlx::query(
             "SELECT url, proxy_url, queue_id, ignore_tls_errors, segments, resolver_plugin_id, \
              cookies, referrer, extra_headers, queue_order FROM tasks WHERE id = $1",
@@ -3940,7 +3997,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT source_id, guid, title, link, enclosure_url, enclosure_length, pub_date, fetched_at, \
              status, task_id, episode_key, resolver_item, reason FROM rss_items WHERE source_id = $1 AND status = 0 \
-             ORDER BY pub_date ASC, fetched_at ASC, guid ASC LIMIT $2",
+             ORDER BY CASE WHEN reason = '' THEN 0 ELSE 1 END ASC, pub_date ASC, fetched_at ASC, guid ASC LIMIT $2",
         )
         .bind(source_id)
         .bind(limit.max(1))

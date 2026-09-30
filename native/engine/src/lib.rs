@@ -31,6 +31,8 @@ pub mod hls_downloader;
 #[cfg(feature = "link")]
 pub mod link;
 pub mod logger;
+/// 下载来源标记（Windows Zone.Identifier / macOS quarantine）。
+pub mod mark_of_the_web;
 pub mod meta_prober;
 pub mod model;
 /// 多网卡聚合下载：网卡枚举、链路规划与出口绑定。
