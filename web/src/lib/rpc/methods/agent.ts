@@ -78,6 +78,9 @@ import type {
   VerifyCodeParams,
 } from '../protocol';
 
+/** 对端用户有 60s 决策窗口，服务端最长等待 70s。 */
+const PAIR_FINISH_TIMEOUT_MS = 75_000;
+
 const session = {
   /** 当前会话；未登录为 null。 */
   get: () => call<AgentSessionDto | null>(METHOD.AGENT_SESSION_GET),
@@ -155,7 +158,7 @@ const link = {
   pairBegin: (params: LinkPairBeginParams) =>
     call<LinkPairBeginResponse>(METHOD.AGENT_LINK_PAIR_BEGIN, params),
   pairFinish: (params: LinkPairFinishParams) =>
-    call<LinkPairFinishResponse>(METHOD.AGENT_LINK_PAIR_FINISH, params),
+    call<LinkPairFinishResponse>(METHOD.AGENT_LINK_PAIR_FINISH, params, { timeoutMs: PAIR_FINISH_TIMEOUT_MS }),
   approve: (params: LinkApproveParams) => call<OkResult>(METHOD.AGENT_LINK_APPROVE, params),
   remove: (params: LinkDeviceParams) => call<OkResult>(METHOD.AGENT_LINK_REMOVE, params),
   refresh: () => call<LinkDeviceInfo[]>(METHOD.AGENT_LINK_REFRESH),

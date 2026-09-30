@@ -4,13 +4,22 @@ import { CircleAlert, Info, Package, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
-import type { InstalledPlugin, MarketEntryDto } from '../../../../lib/rpc'
-import { Badge, Button, EmptyState, Icon, Input, Spinner } from '../../../../ui'
+import type { InstalledPlugin, MarketEntryDto, PluginDto } from '../../../../lib/rpc'
+import { Badge, Button, EmptyState, Icon, Input, Spinner, confirmDialog } from '../../../../ui'
 import { BlockTitle, ExtLink, IconButton, ListCard, ListRow } from './common'
 import { detailFromMarket } from './detail'
 import type { PluginDetail } from './detail'
 import { extensionErrorText } from './errors'
-import { MARKET_PAGE_SIZE, filterMarket, yankedLabelKey } from './logic'
+import {
+  MARKET_PAGE_SIZE,
+  filterMarket,
+  installedVersionYanked,
+  latestPerPlugin,
+  marketAction,
+  permissionKeys,
+  permissionsToConfirm,
+  yankedLabelKey,
+} from './logic'
 
 interface MarketState {
   loading: boolean
@@ -20,13 +29,13 @@ interface MarketState {
 
 export function MarketSection({
   stale,
-  installedIds,
+  plugins,
   onInstalled,
   onInstallFailed,
   onShowDetail,
 }: {
   stale: boolean
-  installedIds: ReadonlySet<string>
+  plugins: readonly PluginDto[]
   onInstalled: (result: InstalledPlugin) => void
   onInstallFailed: (error: unknown) => void
   onShowDetail: (detail: PluginDetail) => void
@@ -57,8 +66,24 @@ export function MarketSection({
     if (!requested.current && !stale) void loadRef.current()
   }, [stale])
 
-  const install = async (pluginId: string) => {
+  const install = async (entry: MarketEntryDto, installed: PluginDto | undefined) => {
+    const pluginId = entry.pluginId
     if (pending.has(pluginId)) return
+    const permissions = permissionsToConfirm(entry, installed)
+    if (permissions.length > 0) {
+      const updating = installed !== undefined
+      const lines = permissions.map((permission) => {
+        const keys = permissionKeys(permission)
+        return keys ? `${t(keys.name)} — ${t(keys.desc)}` : `${permission} — ${t('pluginPermUnknownDesc')}`
+      })
+      const name = entry.name === '' ? pluginId : entry.name
+      const ok = await confirmDialog({
+        title: t(updating ? 'pluginPermConfirmUpdateTitle' : 'pluginPermConfirmInstallTitle', { name }),
+        description: [t(updating ? 'pluginPermConfirmUpdateBody' : 'pluginPermConfirmInstallBody', { version: entry.version }), ...lines].join('\n'),
+        okLabel: t(updating ? 'pluginPermConfirmUpdateOk' : 'pluginPermConfirmInstallOk'),
+      })
+      if (!ok) return
+    }
     setPending((current) => new Set(current).add(pluginId))
     try {
       onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId }))
@@ -73,7 +98,9 @@ export function MarketSection({
     }
   }
 
-  const filtered = useMemo(() => filterMarket(market.entries, query), [market.entries, query])
+  const installedById = useMemo(() => new Map(plugins.map((plugin) => [plugin.identity, plugin])), [plugins])
+
+  const filtered = useMemo(() => filterMarket(latestPerPlugin(market.entries), query), [market.entries, query])
   const remaining = Math.max(0, filtered.length - limit)
 
   let body
@@ -123,9 +150,12 @@ export function MarketSection({
         ) : (
           <ListCard>
             {filtered.slice(0, limit).map((entry) => {
-              const installed = installedIds.has(entry.pluginId)
+              const installedPlugin = installedById.get(entry.pluginId)
+              const action = marketAction(entry, installedPlugin)
               const isPending = pending.has(entry.pluginId)
               const yankedKey = yankedLabelKey(entry.yanked)
+              const installedYanked = installedPlugin ? installedVersionYanked(market.entries, installedPlugin) : null
+              const installedYankedKey = installedYanked ? yankedLabelKey(installedYanked) : null
               return (
                 <ListRow
                   key={entry.pluginId}
@@ -136,6 +166,7 @@ export function MarketSection({
                         <span className="tabular text-xs text-muted-foreground">v{entry.version}</span>
                         {entry.author ? <span className="text-xs text-muted-foreground">{entry.author}</span> : null}
                         {yankedKey ? <Badge tone="destructive">{t(yankedKey)}</Badge> : null}
+                        {installedYankedKey ? <Badge tone="destructive">{t('pluginInstalledVersionYanked', { label: t(installedYankedKey) })}</Badge> : null}
                       </div>
                       {entry.homepage ? <ExtLink href={entry.homepage} /> : null}
                       {entry.description ? <div className="line-clamp-2 break-words text-xs text-muted-foreground">{entry.description}</div> : null}
@@ -144,8 +175,23 @@ export function MarketSection({
                   actions={
                     <>
                       <IconButton icon={Info} label={t('pluginDetailDescription')} onClick={() => onShowDetail(detailFromMarket(entry))} />
-                      <Button variant="outline" loading={isPending} disabled={installed || stale} onClick={() => void install(entry.pluginId)}>
-                        {installed ? t('marketInstalledButton') : isPending ? t('marketInstallingButton') : t('marketInstallButton')}
+                      <Button
+                        variant="outline"
+                        loading={isPending}
+                        disabled={action === 'installed' || action === 'unavailable' || stale}
+                        onClick={() => void install(entry, installedPlugin)}
+                      >
+                        {isPending
+                          ? t(action === 'update' ? 'marketUpdatingButton' : 'marketInstallingButton')
+                          : t(
+                              action === 'install'
+                                ? 'marketInstallButton'
+                                : action === 'update'
+                                  ? 'marketUpdateButton'
+                                  : action === 'installed'
+                                    ? 'marketInstalledButton'
+                                    : 'marketUnavailableButton',
+                            )}
                       </Button>
                     </>
                   }

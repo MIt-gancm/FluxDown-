@@ -7,7 +7,7 @@ import { useEffect } from 'react'
 import type { ReactNode } from 'react'
 import { I18nProvider, t } from './i18n'
 import { clearToken, getToken, useIsAuthenticated } from './lib/access'
-import { startConnection, stopConnection } from './lib/rpc/client'
+import { connectionToken, retryConnection, setConnectionToken, startConnection, stopConnection } from './lib/rpc/client'
 import { useConnection } from './lib/rpc/hooks'
 import { ThemeProvider } from './theme'
 import { ConfirmHost, ToastHost, TooltipProvider, toast } from './ui'
@@ -28,6 +28,13 @@ function ConnectionController() {
   useEffect(() => {
     if (!authenticated || onAuthPage) return
     if (connection.phase === 'unauthorized') {
+      // 存储里的密钥已被改过（本/其他标签轮换）：换用新值重连，而不是清掉它。
+      const stored = getToken()
+      if (stored !== '' && stored !== connectionToken()) {
+        setConnectionToken(stored)
+        retryConnection()
+        return
+      }
       clearToken()
       toast.warning(t('webAuthExpired'))
       void navigate({ to: '/login', replace: true })

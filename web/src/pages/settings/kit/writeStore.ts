@@ -33,7 +33,7 @@ export const SETTINGS_ERROR_KEYS: Readonly<Record<SettingsErrorKind, string>> = 
 // ── 云同步目录（镜像 native/protocol/src/settings.rs SYNC_SETTING_SPECS）──
 
 /** 偏好 / agent 所有、参与云同步的键。 */
-const SYNCED_PREF_KEYS: ReadonlySet<string> = new Set([
+export const SYNCED_PREF_KEYS: ReadonlySet<string> = new Set([
   'appearance.theme_mode',
   'appearance.dark_theme',
   'appearance.light_theme',
@@ -60,10 +60,11 @@ const SYNCED_PREF_KEYS: ReadonlySet<string> = new Set([
   'download.notify_on_complete',
   'download.silent_download',
   'download.keep_awake',
+  'custom_categories',
 ])
 
 /** daemon 存储键 → 云同步键（owner = Daemon 的条目）。 */
-const DAEMON_SYNC_KEYS: Readonly<Record<string, string>> = {
+export const DAEMON_SYNC_KEYS: Readonly<Record<string, string>> = {
   max_concurrent_tasks: 'download.max_concurrent_tasks',
   default_segments: 'download.default_segments',
   auto_max_connections: 'download.auto_max_connections',
@@ -152,12 +153,38 @@ function daemonWireToJson(specKey: string, wire: string): JsonValue {
 interface PendingPref {
   value: JsonValue
   synced: boolean
+  /** 同步类 daemon 键经偏好通道写回时，对应的 daemon 存储键与规范化 wire 值（用于清理其覆盖层）。 */
+  daemonKey?: string
+  daemonWire?: string
 }
 
 let overlayDaemon = new Map<string, string>()
+/** 写入时快照里该 daemon 键的值：快照之后偏离它且不等于覆盖值，说明被外部改动，覆盖层作废。 */
+let overlayBaseline = new Map<string, string | undefined>()
 let overlayPrefs = new Map<string, JsonValue>()
 let pendingDaemon = new Map<string, string>()
 let pendingPrefs = new Map<string, PendingPref>()
+
+/** 覆盖层是否仍有效；快照被外部改成别的值时返回 undefined（回落到快照）。 */
+export function resolveDaemonOverlay(
+  overlay: string | undefined,
+  baseline: string | undefined,
+  snapshot: string | undefined,
+): string | undefined {
+  if (overlay === undefined) return undefined
+  if (snapshot !== undefined && snapshot !== baseline && snapshot !== overlay) return undefined
+  return overlay
+}
+
+function dropDaemonOverlay(key: string): boolean {
+  overlayBaseline.delete(key)
+  return overlayDaemon.delete(key)
+}
+
+function rollbackPref(key: string, pending: PendingPref): void {
+  overlayPrefs.delete(key)
+  if (pending.daemonKey !== undefined) dropDaemonOverlay(pending.daemonKey)
+}
 let error: SettingsError | null = null
 let version = 0
 let scheduled: ReturnType<typeof setTimeout> | null = null
@@ -235,12 +262,15 @@ function dropOverlayLater(daemon: Map<string, string>, prefs: Map<string, Pendin
     let changed = false
     for (const [key, value] of daemon) {
       if (overlayDaemon.get(key) === value && !pendingDaemon.has(key)) {
-        overlayDaemon.delete(key)
-        changed = true
+        changed = dropDaemonOverlay(key) || changed
       }
     }
     for (const [key, pending] of prefs) {
-      if (overlayPrefs.get(key) === pending.value && !pendingPrefs.has(key)) {
+      if (pending.daemonKey !== undefined) {
+        if (overlayDaemon.get(pending.daemonKey) === pending.daemonWire && !pendingPrefs.has(key)) {
+          changed = dropDaemonOverlay(pending.daemonKey) || changed
+        }
+      } else if (overlayPrefs.get(key) === pending.value && !pendingPrefs.has(key)) {
         overlayPrefs.delete(key)
         changed = true
       }
@@ -263,8 +293,8 @@ async function flush(): Promise<void> {
   if (pendingDaemon.size === 0 && pendingPrefs.size === 0) return
   if (!isReady()) {
     // 只读：丢弃编辑并回滚覆盖层。
-    for (const key of pendingDaemon.keys()) overlayDaemon.delete(key)
-    for (const key of pendingPrefs.keys()) overlayPrefs.delete(key)
+    for (const key of pendingDaemon.keys()) dropDaemonOverlay(key)
+    for (const [key, pending] of pendingPrefs) rollbackPref(key, pending)
     pendingDaemon = new Map()
     pendingPrefs = new Map()
     setError('disconnected')
@@ -289,13 +319,18 @@ async function flush(): Promise<void> {
   let retry = false
   let failure: unknown = null
   const outcomes: Promise<void>[] = []
+  // 只对成功的子调用保留「稍后丢弃覆盖层」；失败的立即回滚，冲突重试的保持原样。
+  const okDaemon = new Map<string, string>()
+  const okPrefs = new Map<string, PendingPref>()
 
   if (daemonValues.size > 0) {
     const snapshotRevision = rpcStore.peek().snapshot?.daemon.config.revision ?? 0
     outcomes.push(
       rpc.daemon.config
         .patch({ expectedRevision: Math.max(snapshotRevision, revisionHint), values: Object.fromEntries(daemonValues) })
-        .then(() => undefined)
+        .then(() => {
+          for (const [key, value] of daemonValues) okDaemon.set(key, value)
+        })
         .catch((err: unknown) => {
           if (err instanceof RpcError && err.appCode === 'conflict' && conflictRetries < MAX_CONFLICT_RETRIES) {
             if (err.revision !== undefined) revisionHint = err.revision
@@ -304,7 +339,7 @@ async function flush(): Promise<void> {
             return
           }
           failure ??= err
-          for (const key of daemonValues.keys()) overlayDaemon.delete(key)
+          for (const key of daemonValues.keys()) dropDaemonOverlay(key)
         }),
     )
   }
@@ -313,7 +348,9 @@ async function flush(): Promise<void> {
     outcomes.push(
       rpc.agent.preferences
         .patch(sync ? { values: toValues(entries) } : { values: toValues(entries), sync: false })
-        .then(() => undefined)
+        .then(() => {
+          for (const [key, pending] of entries) okPrefs.set(key, pending)
+        })
         .catch((err: unknown) => {
           if (err instanceof RpcError && err.appCode === 'conflict' && conflictRetries < MAX_CONFLICT_RETRIES) {
             requeuePrefs(entries)
@@ -321,7 +358,7 @@ async function flush(): Promise<void> {
             return
           }
           failure ??= err
-          for (const [key] of entries) overlayPrefs.delete(key)
+          for (const [key, pending] of entries) rollbackPref(key, pending)
         }),
     )
   }
@@ -340,7 +377,7 @@ async function flush(): Promise<void> {
     conflictRetries = 0
     if (error !== null && error.kind !== 'invalidArgument') error = null
   }
-  if (failure === null) dropOverlayLater(daemonValues, prefValues)
+  dropOverlayLater(okDaemon, okPrefs)
   emit()
   if (pendingDaemon.size > 0 || pendingPrefs.size > 0) schedule(false)
 }
@@ -362,12 +399,27 @@ export function setDaemon(key: string, value: string): void {
     setError('invalidArgument', normalized.message)
     return
   }
-  const current = overlayDaemon.get(key) ?? rpcStore.peek().snapshot?.daemon.config.values[key] ?? daemonConfigField(key)?.default
-  if (current === normalized) return
+  const snapshotValue = rpcStore.peek().snapshot?.daemon.config.values[key]
+  const effective = resolveDaemonOverlay(overlayDaemon.get(key), overlayBaseline.get(key), snapshotValue)
+  const current = effective ?? snapshotValue ?? daemonConfigField(key)?.default
+  if (current === normalized) {
+    // 与当前显示值相同：丢弃可能已陈旧的覆盖层，避免它遮住之后的真实值。
+    if (overlayDaemon.has(key) && effective === undefined) {
+      dropDaemonOverlay(key)
+      emit()
+    }
+    return
+  }
   overlayDaemon.set(key, normalized)
+  overlayBaseline.set(key, snapshotValue)
   const specKey = DAEMON_SYNC_KEYS[key]
   if (specKey) {
-    pendingPrefs.set(specKey, { value: daemonWireToJson(specKey, normalized), synced: true })
+    pendingPrefs.set(specKey, {
+      value: daemonWireToJson(specKey, normalized),
+      synced: true,
+      daemonKey: key,
+      daemonWire: normalized,
+    })
   } else {
     pendingDaemon.set(key, normalized)
   }
@@ -399,12 +451,13 @@ export function setPref(key: string, value: JsonValue, options?: { immediate?: b
 /** daemon 配置值（wire 字符串）；缺省取目录默认值。 */
 export function useDaemonValue(key: string): string {
   const overlay = useSyncExternalStore(subscribe, () => overlayDaemon.get(key), () => undefined)
+  const baseline = useSyncExternalStore(subscribe, () => overlayBaseline.get(key), () => undefined)
   const snapshot = useSyncExternalStore(
     rpcStore.subscribe,
     () => rpcStore.getPublished().snapshot?.daemon.config.values[key],
     () => undefined,
   )
-  return overlay ?? snapshot ?? daemonConfigField(key)?.default ?? ''
+  return resolveDaemonOverlay(overlay, baseline, snapshot) ?? snapshot ?? daemonConfigField(key)?.default ?? ''
 }
 
 export function useDaemonBool(key: string): boolean {

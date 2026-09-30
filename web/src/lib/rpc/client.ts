@@ -91,6 +91,16 @@ class RpcConnection {
     this.open()
   }
 
+  /** 就地替换访问密钥（服务端轮换后）：不断开、不重拉快照，下次重连才用新值。 */
+  setToken(token: string): void {
+    if (this.token !== '' && token !== '') this.token = token
+  }
+
+  /** 当前连接使用的密钥（unauthorized 时用来与存储值比较）。 */
+  currentToken(): string {
+    return this.token
+  }
+
   /** 停止并清空状态（登出）。 */
   stop(): void {
     this.wanted = false
@@ -383,7 +393,12 @@ class RpcConnection {
     this.pingTimer = setInterval(() => {
       const generation = this.generation
       this.request('system.ping', undefined, PING_TIMEOUT_MS, false).catch(() => {
-        if (generation === this.generation) this.ws?.close(4000, 'ping-timeout')
+        if (generation !== this.generation) return
+        // 服务端同通道串行处理：有长耗时请求在途时 ping 排队属正常，不据此断线。
+        for (const pending of this.pending.values()) {
+          if (pending.method !== 'system.ping') return
+        }
+        this.ws?.close(4000, 'ping-timeout')
       })
     }, PING_INTERVAL_MS)
   }
@@ -452,6 +467,8 @@ class RpcConnection {
 const connection = new RpcConnection()
 
 export const startConnection = (token: string): void => connection.start(token)
+export const setConnectionToken = (token: string): void => connection.setToken(token)
+export const connectionToken = (): string => connection.currentToken()
 export const stopConnection = (): void => connection.stop()
 export const retryConnection = (): void => connection.retryNow()
 export const subscribeServiceEvents = (listener: EventListener): (() => void) => connection.subscribeEvents(listener)

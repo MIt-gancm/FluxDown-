@@ -88,11 +88,27 @@ function SessionRevokedNotice() {
   return null
 }
 
+/** BT 重复添加：占位任务已被引擎删除，提示用户已有任务（协议要求宿主提示）。 */
+function DuplicateTorrentNotice() {
+  useServiceEvents(
+    useCallback((frame: EventFrame) => {
+      const { event } = frame
+      if (event.service !== 'daemon' || event.event.type !== 'engine') return
+      const message = event.event.data
+      if (message.type !== 'duplicateTorrent') return
+      if (message.existingName === '') toast.key('duplicateTorrentToastUnnamed', 'warning')
+      else toast.key('duplicateTorrentToast', 'warning', { name: message.existingName })
+    }, []),
+  )
+  return null
+}
+
 export function AccountGuards() {
   return (
     <>
       <PairingRequestHost />
       <SessionRevokedNotice />
+      <DuplicateTorrentNotice />
     </>
   )
 }

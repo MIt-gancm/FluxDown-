@@ -56,6 +56,21 @@ describe('apply daemon events', () => {
     expect(deleted.taskRuntime.t).toBeUndefined()
   })
 
+  test('engine tasksSnapshot：剪除已消失任务；非活跃清零，活跃与已清零条目保持引用', () => {
+    const active = runtime('a', 1)
+    const cleared = { ...runtime('c', 1, 0), connectedPeers: 0, segments: [] } as unknown as TaskRuntimeDto
+    const base = daemon([], { a: active, b: runtime('b', 1), c: cleared, gone: runtime('gone', 1) })
+    const next = applyDaemonEvent(base, {
+      type: 'engine',
+      data: { type: 'tasksSnapshot', tasks: [task('a', 1), task('b', 2), task('c', 2)] },
+    } as never)
+    expect(next.taskRuntime.a).toBe(active)
+    expect(next.taskRuntime.c).toBe(cleared)
+    expect(next.taskRuntime.gone).toBeUndefined()
+    expect(next.taskRuntime.b?.activeTransfers).toBe(0)
+    expect(next.taskRuntime.b?.segments[0]?.active).toBe(false)
+  })
+
   test('selectionPending 按 requestId 去重，selectionResolved 移除', () => {
     const req = (requestId: string) => ({ requestId, taskId: 't' }) as never
     let snap = daemon([])

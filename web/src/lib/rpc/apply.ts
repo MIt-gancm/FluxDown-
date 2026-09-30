@@ -24,16 +24,31 @@ function withoutKey<V>(record: Readonly<Record<string, V>>, key: string): Record
   return next
 }
 
+/** 读数已清零时为 true，可复用原引用。 */
+function isRuntimeCleared(runtime: TaskRuntimeDto): boolean {
+  return (
+    runtime.activeTransfers === 0 &&
+    runtime.connectedPeers === 0 &&
+    runtime.segments.every((segment) => !segment.active)
+  )
+}
+
 /** 清零传输活跃读数（对应 Rust `clear_active_runtime`）。 */
-function clearActiveRuntime(snapshot: DaemonSnapshot, taskId: string): DaemonSnapshot {
-  const runtime = snapshot.taskRuntime[taskId]
-  if (!runtime) return snapshot
-  const cleared: TaskRuntimeDto = {
+function clearedRuntime(runtime: TaskRuntimeDto): TaskRuntimeDto {
+  if (isRuntimeCleared(runtime)) return runtime
+  return {
     ...runtime,
     activeTransfers: 0,
     connectedPeers: 0,
     segments: runtime.segments.map((segment) => ({ ...segment, active: false })),
   }
+}
+
+function clearActiveRuntime(snapshot: DaemonSnapshot, taskId: string): DaemonSnapshot {
+  const runtime = snapshot.taskRuntime[taskId]
+  if (!runtime) return snapshot
+  const cleared = clearedRuntime(runtime)
+  if (cleared === runtime) return snapshot
   return { ...snapshot, taskRuntime: { ...snapshot.taskRuntime, [taskId]: cleared } }
 }
 
@@ -62,16 +77,16 @@ export function acceptedRuntimeStatus(snapshot: DaemonSnapshot, runtime: TaskRun
 function applyEngineMessage(snapshot: DaemonSnapshot, message: WsServerMsg): DaemonSnapshot {
   switch (message.type) {
     case 'tasksSnapshot': {
-      const ids = new Set(message.tasks.map((task) => task.taskId))
+      // 单遍 O(N)：新 taskRuntime 只分配一次，不活跃任务就地写入清零值。
       const taskRuntime: Record<string, TaskRuntimeDto> = {}
+      const live = new Map<string, boolean>()
+      for (const task of message.tasks) live.set(task.taskId, isActiveStatus(task.status))
       for (const [id, runtime] of Object.entries(snapshot.taskRuntime)) {
-        if (ids.has(id)) taskRuntime[id] = runtime
+        const active = live.get(id)
+        if (active === undefined) continue
+        taskRuntime[id] = active ? runtime : clearedRuntime(runtime)
       }
-      let next: DaemonSnapshot = { ...snapshot, tasks: message.tasks, taskRuntime }
-      for (const task of message.tasks) {
-        if (!isActiveStatus(task.status)) next = clearActiveRuntime(next, task.taskId)
-      }
-      return next
+      return { ...snapshot, tasks: message.tasks, taskRuntime }
     }
     case 'taskProgress': {
       if (message.status === 4 && message.errorMessage === 'deleted') {

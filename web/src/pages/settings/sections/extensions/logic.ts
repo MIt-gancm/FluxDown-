@@ -1,7 +1,7 @@
 // 扩展设置的纯逻辑（无 React / 别名依赖，可被 bun test 直接加载）。
 // 语义与 crates/extensions（plugin_settings.rs / plugins.rs / plugin_auth.rs / managed_components.rs）逐条对齐。
 
-import type { MarketEntryDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
+import type { MarketEntryDto, PluginDto, SettingFieldDto } from '../../../../lib/rpc/protocol'
 
 // ── 插件设置校验 ────────────────────────────────────────────
 
@@ -67,6 +67,76 @@ export function filterMarket(entries: readonly MarketEntryDto[], query: string):
     (entry) =>
       hit(entry.name) || hit(entry.pluginId) || hit(entry.description) || hit(entry.author) || entry.tags.some(hit),
   )
+}
+
+/** 引擎只安装 `yanked === 'none'` 的条目。 */
+function installable(entry: MarketEntryDto): boolean {
+  return entry.yanked === 'none'
+}
+
+/**
+ * 每个插件一条（镜像 crates/extensions/src/market.rs `latest_per_plugin`）：优先最新可安装版本；
+ * 全部撤回时取 sequence 最大者（仅用于展示撤回标记）。顺序保持各插件在索引中首次出现的位置。
+ */
+export function latestPerPlugin(entries: readonly MarketEntryDto[]): MarketEntryDto[] {
+  const best = new Map<string, MarketEntryDto>()
+  for (const entry of entries) {
+    const current = best.get(entry.pluginId)
+    if (current === undefined) {
+      best.set(entry.pluginId, entry)
+      continue
+    }
+    const a = installable(entry)
+    const b = installable(current)
+    const better = a !== b ? a : entry.sequence > current.sequence
+    if (better) best.set(entry.pluginId, entry)
+  }
+  return [...best.values()]
+}
+
+/** `MAJOR.MINOR.PATCH`（可带前导 `v`，忽略预发布 / 构建后缀）；无法解析返回 null。 */
+function parseSemver(version: string): [number, number, number] | null {
+  const trimmed = version.trim()
+  const core = (trimmed.startsWith('v') ? trimmed.slice(1) : trimmed).split(/[-+]/)[0] ?? ''
+  const parts = core.split('.')
+  if (parts.length !== 3 || parts.some((part) => !/^\d+$/.test(part))) return null
+  return [Number(parts[0]), Number(parts[1]), Number(parts[2])]
+}
+
+/** `candidate` 严格新于 `current` 时为真；任一侧无法解析视为不可比较。 */
+export function versionNewer(candidate: string, current: string): boolean {
+  const a = parseSemver(candidate)
+  const b = parseSemver(current)
+  if (a === null || b === null) return false
+  for (let i = 0; i < 3; i += 1) {
+    const x = a[i] as number
+    const y = b[i] as number
+    if (x !== y) return x > y
+  }
+  return false
+}
+
+export type MarketAction = 'install' | 'update' | 'installed' | 'unavailable'
+
+/** 市场条目相对本机安装状态的动作；开发模式插件不被市场覆盖。 */
+export function marketAction(entry: MarketEntryDto, installed: PluginDto | undefined): MarketAction {
+  if (installed === undefined) return installable(entry) ? 'install' : 'unavailable'
+  if (!installed.devMode && installable(entry) && versionNewer(entry.version, installed.version)) return 'update'
+  return 'installed'
+}
+
+/** 需要用户确认的权限：新装取条目全部权限，更新只取已安装版本没有的新增权限。 */
+export function permissionsToConfirm(entry: MarketEntryDto, installed: PluginDto | undefined): string[] {
+  const granted = installed?.permissions ?? []
+  return entry.permissions.filter((permission) => !granted.includes(permission))
+}
+
+/** 已安装版本在市场中的撤回标记；未撤回或市场无此版本返回 null。 */
+export function installedVersionYanked(entries: readonly MarketEntryDto[], plugin: PluginDto): string | null {
+  if (plugin.devMode) return null
+  const hit = entries.find((entry) => entry.pluginId === plugin.identity && entry.version === plugin.version)
+  if (hit === undefined || hit.yanked === '' || hit.yanked === 'none') return null
+  return hit.yanked
 }
 
 /** 市场 `yanked` 标记 → i18n 键；空 / 未知值不展示。 */

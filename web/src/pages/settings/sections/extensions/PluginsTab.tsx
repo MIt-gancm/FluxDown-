@@ -134,7 +134,6 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
     }
   }
 
-  const installedIds = new Set(plugins.map((plugin) => plugin.identity))
   const zipLabel =
     zipPhase?.kind === 'uploading'
       ? t('webPluginUploading', { percent: Math.round(zipPhase.fraction * 100) })
@@ -219,7 +218,7 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
         </ListCard>
       )}
 
-      <MarketSection stale={stale} installedIds={installedIds} onInstalled={onInstalled} onInstallFailed={onInstallFailed} onShowDetail={setDetail} />
+      <MarketSection stale={stale} plugins={plugins} onInstalled={onInstalled} onInstallFailed={onInstallFailed} onShowDetail={setDetail} />
 
       <PluginDetailDialog detail={detail} onClose={() => setDetail(null)} />
       <PluginSettingsDialog plugin={settingsPlugin} onClose={() => setSettingsPlugin(null)} />

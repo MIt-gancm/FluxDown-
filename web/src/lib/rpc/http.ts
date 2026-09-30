@@ -68,6 +68,8 @@ export function triggerDownload(url: string): void {
   anchor.href = url
   anchor.rel = 'noopener'
   anchor.download = ''
+  // 用户脚本据此放行，避免从局域网 IP 访问时下载被劫持回 FluxDown 自身。
+  anchor.setAttribute('data-fluxdown-skip', '1')
   document.body.append(anchor)
   anchor.click()
   anchor.remove()
