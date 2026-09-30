@@ -264,6 +264,8 @@ impl DaemonClient {
 /// 只对同一个子进程代际生效；子进程退出后被重新拉起则回到指数退避，避免崩溃循环高频拉起。
 const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STARTUP_POLL_ATTEMPTS: usize = 200;
+/// daemon 启动即崩溃循环时的重拉间隔：避免每 ≤30s 完整初始化一次引擎。
+const CRASH_LOOP_RETRY_SECS: u64 = 120;
 
 async fn run_client(
     config: DaemonClientConfig,
@@ -284,6 +286,7 @@ async fn run_client(
         match connect(&config).await {
             Ok((socket, snapshot, buffered)) => {
                 attempt = 0;
+                supervisor.clear_crash_streak();
                 polled_child = None;
                 startup_polls = 0;
                 connected.store(true, Ordering::Release);
@@ -356,7 +359,14 @@ async fn run_client(
             }
         }
         connected.store(false, Ordering::Release);
-        let delay = backoff[attempt.min(backoff.len() - 1)];
+        let mut delay = backoff[attempt.min(backoff.len() - 1)];
+        if supervisor.in_crash_loop() {
+            delay = CRASH_LOOP_RETRY_SECS;
+            tracing::error!(
+                retry_secs = delay,
+                "fluxdownd keeps exiting right after launch (port 17801 unavailable or startup failure?); see fluxdownd.stderr.log"
+            );
+        }
         attempt = attempt.saturating_add(1);
         tokio::time::sleep(Duration::from_secs(delay)).await;
     }
@@ -386,7 +396,7 @@ async fn open_socket(config: &DaemonClientConfig) -> Result<Socket, ConnectError
 }
 
 /// 握手前 `system.shutdown`：只有支持该首帧的 daemon（v4 起）会受理。
-async fn request_shutdown(config: &DaemonClientConfig) -> Result<(), String> {
+pub(crate) async fn request_shutdown(config: &DaemonClientConfig) -> Result<(), String> {
     let mut socket = open_socket(config)
         .await
         .map_err(|_| "daemon unreachable".to_owned())?;

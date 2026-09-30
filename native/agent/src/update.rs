@@ -241,6 +241,27 @@ fn asset_keys() -> &'static [&'static str] {
     &[]
 }
 
+/// 下载地址只接受 https 且主机属于官方分发域：清单被篡改时也不会把用户带到任意 scheme / 主机。
+fn is_trusted_download_url(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" || !parsed.username().is_empty() || parsed.password().is_some() {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let under = |domain: &str| {
+        host == domain
+            || host
+                .strip_suffix(domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    };
+    under("zerx.dev") || under("github.com") || under("githubusercontent.com")
+}
+
 fn select_download_url(assets: &BTreeMap<String, Value>) -> Option<String> {
     asset_keys().iter().find_map(|key| {
         assets
@@ -249,6 +270,7 @@ fn select_download_url(assets: &BTreeMap<String, Value>) -> Option<String> {
             .and_then(Value::as_str)
             .filter(|url| !url.is_empty())
             .map(absolute_download_url)
+            .filter(|url| is_trusted_download_url(url))
     })
 }
 
@@ -376,12 +398,25 @@ mod tests {
         );
         assets.insert(
             keys[0].to_owned(),
-            json!({ "download_url": "https://cdn.example/first" }),
+            json!({ "download_url": "https://github.com/zerx-lab/FluxDown/releases/first" }),
         );
         assert_eq!(
             select_download_url(&assets).as_deref(),
-            Some("https://cdn.example/first")
+            Some("https://github.com/zerx-lab/FluxDown/releases/first")
         );
+    }
+
+    #[test]
+    fn untrusted_download_urls_are_rejected() {
+        use super::is_trusted_download_url as trusted;
+        assert!(trusted("https://fluxdown.zerx.dev/api/download/x"));
+        assert!(trusted("https://objects.githubusercontent.com/a"));
+        assert!(!trusted("http://fluxdown.zerx.dev/a"));
+        assert!(!trusted("file:///etc/passwd"));
+        assert!(!trusted("https://evilzerx.dev/a"));
+        assert!(!trusted("https://zerx.dev.evil.com/a"));
+        assert!(!trusted("https://user@fluxdown.zerx.dev/a"));
+        assert!(!trusted("\\\\host\\share\\a.exe"));
     }
 
     #[test]

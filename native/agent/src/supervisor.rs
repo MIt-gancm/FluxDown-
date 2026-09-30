@@ -36,6 +36,8 @@ pub struct DaemonSupervisor {
     stderr_log: Option<PathBuf>,
     /// stderr 日志打开失败只告警一次。
     stderr_log_warned: AtomicBool,
+    /// 连续快速异常退出次数（崩溃循环判定）。
+    crash_streak: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DaemonSupervisor {
@@ -48,6 +50,7 @@ impl DaemonSupervisor {
             extra_env: Vec::new(),
             stderr_log: None,
             stderr_log_warned: AtomicBool::new(false),
+            crash_streak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
     }
 
@@ -106,25 +109,57 @@ impl DaemonSupervisor {
         );
         state.running = true;
         let supervisor_state = self.state.clone();
+        let streak = self.crash_streak.clone();
         state.reapers.push(tokio::spawn(async move {
+            let mut success = false;
             match child.wait().await {
                 Ok(status) if status.success() => {
+                    success = true;
                     tracing::info!(%status, generation, "supervised fluxdownd exited");
                 }
                 Ok(status) => tracing::warn!(
                     %status,
                     generation,
                     uptime_secs = spawned_at.elapsed().as_secs_f64(),
-                    "supervised fluxdownd exited abnormally"
+                    "supervised fluxdownd exited abnormally; see fluxdownd.stderr.log"
                 ),
                 Err(error) => tracing::warn!(error = %error, "failed to reap fluxdownd"),
             }
+            let previous = streak.load(Ordering::Acquire);
+            streak.store(
+                next_crash_streak(previous, success, spawned_at.elapsed()),
+                Ordering::Release,
+            );
             let mut state = supervisor_state.lock().await;
             if state.generation == generation {
                 state.running = false;
             }
         }));
         Ok(Some(generation))
+    }
+
+    /// 子进程是否处于「启动即崩溃」循环（连续快速异常退出）；调用方据此拉长重拉间隔。
+    #[must_use]
+    pub fn in_crash_loop(&self) -> bool {
+        self.crash_streak.load(Ordering::Acquire) >= CRASH_LOOP_THRESHOLD
+    }
+
+    /// 已成功连上 daemon：之前的快速失败不再算数。
+    pub fn clear_crash_streak(&self) {
+        self.crash_streak.store(0, Ordering::Release);
+    }
+}
+
+/// 连续快速异常退出达到该次数即视为崩溃循环。
+const CRASH_LOOP_THRESHOLD: u32 = 3;
+/// 存活不足该时长的异常退出计入崩溃循环。
+const CRASH_FAST_EXIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn next_crash_streak(previous: u32, success: bool, uptime: std::time::Duration) -> u32 {
+    if success || uptime >= CRASH_FAST_EXIT {
+        0
+    } else {
+        previous.saturating_add(1)
     }
 }
 
@@ -188,3 +223,19 @@ fn detach_background_process(command: &mut std::process::Command) {
 
 #[cfg(not(any(windows, unix)))]
 fn detach_background_process(_command: &mut std::process::Command) {}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn fast_failures_accumulate_and_healthy_run_resets() {
+        let mut streak = 0;
+        for _ in 0..CRASH_LOOP_THRESHOLD {
+            streak = next_crash_streak(streak, false, Duration::from_secs(1));
+        }
+        assert_eq!(streak, CRASH_LOOP_THRESHOLD);
+        assert_eq!(next_crash_streak(streak, false, Duration::from_secs(60)), 0);
+        assert_eq!(next_crash_streak(streak, true, Duration::from_secs(1)), 0);
+    }
+}

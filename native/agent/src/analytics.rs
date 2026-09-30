@@ -64,8 +64,8 @@ impl AnalyticsWorker {
     }
 
     async fn report_once(&self) {
-        let (enabled, device_id, installed, last_day) = {
-            let state = self.state.lock().await;
+        let (enabled, analytics_id, installed, last_day) = {
+            let mut state = self.state.lock().await;
             let enabled = state
                 .preferences
                 .values
@@ -73,16 +73,23 @@ impl AnalyticsWorker {
                 .or_else(|| state.preferences.values.get("general.analytics_enabled"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
+            if enabled && state.analytics_id.is_empty() {
+                state.analytics_id = uuid::Uuid::new_v4().to_string();
+                if let Err(error) = self.store.save(&state).await {
+                    tracing::warn!(error = %error, "persisting analytics id failed");
+                }
+            }
             (
                 enabled,
-                state.device_id.clone(),
+                state.analytics_id.clone(),
                 state.analytics_install_reported,
                 state.analytics_last_active_day,
             )
         };
-        if !enabled || device_id.is_empty() {
+        if !enabled || analytics_id.is_empty() {
             return;
         }
+        let device_id = analytics_id;
         let mut install_reported = installed;
         if !installed && self.track("app_installed", &device_id).await {
             install_reported = true;

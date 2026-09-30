@@ -359,19 +359,22 @@ fn launch_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
 ///
 /// 与 hub `reveal_file.rs` 的 `platform_open_dir` 同一策略：优先直接调 Win32
 /// `ShellExecuteW`（"open" 默认 verb，双击的 API 本体，无 cmd 引号/元字符
-/// 解析风险）；失败才回退 `cmd /c start "" <path>`（start 内部同样走 open
-/// 关联；第一个空引号串是窗口标题，不能省）。
+/// 解析风险）；失败回退 `explorer.exe <path>`——同样按关联打开，且参数经标准 argv 引用
+/// 传递，不经 cmd 解析。只接受绝对路径，避免被 explorer 当成命令行开关。
 #[cfg(windows)]
 fn open_with_shell(path: &Path) -> Result<(), PlatformError> {
-    use std::os::windows::process::CommandExt;
-
     let text = path.to_string_lossy();
     if shell_execute_open(&text) {
         return Ok(());
     }
-    tracing::debug!("ShellExecuteW failed; falling back to cmd /c start");
-    let mut command = std::process::Command::new("cmd.exe");
-    command.raw_arg(format!(r#"/c start "" "{text}""#));
+    if !path.is_absolute() {
+        return Err(PlatformError::Failed(
+            "refusing to open a non-absolute path".to_owned(),
+        ));
+    }
+    tracing::debug!("ShellExecuteW failed; falling back to explorer.exe");
+    let mut command = std::process::Command::new("explorer.exe");
+    command.arg(path);
     set_no_console_window(&mut command);
     command.spawn()?;
     Ok(())

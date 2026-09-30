@@ -159,12 +159,27 @@ impl DiagnosticsService {
                 Ok(json!({ "ok": true }))
             }
             ACTION_OPEN_LOG_DIR => {
+                let data_dir = self.store.data_dir().to_path_buf();
                 let target = if params.target.trim().is_empty() {
-                    self.store.data_dir().to_path_buf()
+                    data_dir.clone()
                 } else {
                     PathBuf::from(params.target.trim())
                 };
-                spawn_blocking_platform(move || crate::platform::open_path(&target, false)).await?;
+                let paths = self.log_paths().await;
+                let mut allowed = vec![data_dir, PathBuf::from(paths.agent_log_dir)];
+                if !paths.daemon_log_dir.is_empty() {
+                    allowed.push(PathBuf::from(paths.daemon_log_dir));
+                }
+                spawn_blocking_platform(move || {
+                    if !is_within_any(&target, &allowed) {
+                        return Err(crate::platform::PlatformError::Failed(
+                            "open_log_dir target is outside the log and data directories"
+                                .to_owned(),
+                        ));
+                    }
+                    crate::platform::open_path(&target, false)
+                })
+                .await?;
                 Ok(json!({ "ok": true }))
             }
             ACTION_REFRESH_TRACKERS => {
@@ -898,6 +913,16 @@ async fn probe_local_server(gateway: &fluxdown_protocol::GatewayStatusDto) -> Di
     }
 }
 
+/// `target` 规范化（解析符号链接与 `..`）后是否落在任一允许目录之内；任一侧无法规范化视为否。
+fn is_within_any(target: &Path, allowed: &[PathBuf]) -> bool {
+    let Ok(target) = std::fs::canonicalize(target) else {
+        return false;
+    };
+    allowed
+        .iter()
+        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| target.starts_with(root)))
+}
+
 fn daemon_log_dir(describe: Option<&Value>) -> Option<&str> {
     describe?
         .get("logDir")
@@ -1185,6 +1210,24 @@ mod tests {
             opted_out_associations(&snapshot),
             vec![OpenAssociation::Ed2k]
         );
+    }
+
+    #[test]
+    fn open_log_dir_target_must_stay_inside_allowed_dirs() {
+        let root = std::env::temp_dir().join(format!("fluxdown_doctor_{}", uuid::Uuid::new_v4()));
+        let logs = root.join("logs");
+        let outside = root.join("other");
+        std::fs::create_dir_all(&logs).ok();
+        std::fs::create_dir_all(&outside).ok();
+        let allowed = vec![logs.clone()];
+        assert!(super::is_within_any(&logs, &allowed));
+        assert!(!super::is_within_any(&outside, &allowed));
+        assert!(!super::is_within_any(
+            &logs.join("..").join("other"),
+            &allowed
+        ));
+        assert!(!super::is_within_any(&root.join("missing"), &allowed));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

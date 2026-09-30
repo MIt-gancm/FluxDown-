@@ -10,7 +10,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::event_hub::AgentEventHub;
-use crate::notification::{Notifier, completion_text, english_text};
+use crate::notification::{Notifier, completion_text, english_text, rss_auto_download_text};
 
 /// 完成通知防抖：最后一次完成后静默这么久才合并发一条（同 Flutter `NotificationService`）。
 const NOTIFY_DEBOUNCE: Duration = Duration::from_millis(800);
@@ -56,7 +56,7 @@ impl BackgroundEffects {
 
     pub async fn run(mut self, cancel: CancellationToken) {
         let (mut receiver, snapshot) = self.events.subscribe_and_snapshot();
-        let mut awake = None;
+        let mut awake = AwakeState::default();
         let mut pending = PendingCompletions::default();
         let mut statuses = {
             let initial = agent_snapshot(snapshot);
@@ -82,6 +82,9 @@ impl BackgroundEffects {
                 event = receiver.recv() => {
                     match event {
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                            if let Ok(frame) = &event {
+                                self.notify_rss_auto_downloads(frame);
+                            }
                             // 每个进度帧都会走到这里：只在锁内提取所需字段，不克隆整份快照。
                             let (completed, should_hold, locale) = self.events.inspect(|snapshot| {
                                 let completed = take_new_completions(snapshot, &mut statuses);
@@ -102,6 +105,62 @@ impl BackgroundEffects {
                 }
             }
         }
+    }
+
+    /// 订阅开启「自动下载时通知」时，引擎把本轮自动建任务的标题放进 `notify_titles`；
+    /// 多 UI 连接也只在 agent 这一处发系统通知。受完成通知总开关约束。
+    fn notify_rss_auto_downloads(&mut self, frame: &fluxdown_protocol::EventFrame) {
+        let Some(titles) = rss_notify_titles(frame) else {
+            return;
+        };
+        let (enabled, locale) = self.events.inspect(|snapshot| {
+            (
+                preference_bool(
+                    snapshot,
+                    NOTIFY_ON_COMPLETE_PREF,
+                    NOTIFY_ON_COMPLETE_DEFAULT,
+                ),
+                locale_preference(snapshot),
+            )
+        });
+        if !enabled {
+            return;
+        }
+        let Some((title, body)) = self.rss_notice(titles, locale) else {
+            return;
+        };
+        let notifier = Arc::clone(&self.notifier);
+        tokio::task::spawn_blocking(move || notifier.show(&title, &body));
+    }
+
+    #[cfg(feature = "desktop")]
+    fn rss_notice(
+        &mut self,
+        titles: &[String],
+        locale: Option<String>,
+    ) -> Option<(String, String)> {
+        let Some(translator) = self.translator.as_mut() else {
+            return rss_auto_download_text(titles, english_text);
+        };
+        translator.set_locale(&locale.unwrap_or_else(fluxdown_ui_i18n::system_locale));
+        let translator = &*translator;
+        rss_auto_download_text(titles, |key, count| match count {
+            Some(count) => {
+                let count = count.to_string();
+                translator.text_with(key, &[("n", &count), ("count", &count)])
+            }
+            None => translator.text(key).to_owned(),
+        })
+    }
+
+    #[cfg(not(feature = "desktop"))]
+    #[allow(clippy::unused_self)]
+    fn rss_notice(
+        &mut self,
+        titles: &[String],
+        _locale: Option<String>,
+    ) -> Option<(String, String)> {
+        rss_auto_download_text(titles, english_text)
     }
 
     /// 把防抖中的完成合并成一条系统通知发出（发送阻塞，放进 blocking 线程）。
@@ -151,6 +210,18 @@ impl PendingCompletions {
         self.locale = locale;
         let started_at = *self.started_at.get_or_insert(now);
         self.flush_at = Some((now + NOTIFY_DEBOUNCE).min(started_at + NOTIFY_MAX_WAIT));
+    }
+}
+
+/// 本帧若是带非空 `notify_titles` 的 RSS 条目变更，返回这些标题。
+fn rss_notify_titles(frame: &fluxdown_protocol::EventFrame) -> Option<&[String]> {
+    use fluxdown_protocol::{DaemonEvent, ServiceEvent, WsServerMsg};
+    match &frame.event {
+        ServiceEvent::Daemon(DaemonEvent::Engine(WsServerMsg::RssItemsChanged {
+            notify_titles,
+            ..
+        })) if !notify_titles.is_empty() => Some(notify_titles),
+        _ => None,
     }
 }
 
@@ -214,8 +285,16 @@ fn should_keep_awake(snapshot: &AgentSnapshot) -> bool {
             .any(|task| matches!(task.status, 1 | 5))
 }
 
-async fn reconcile_awake(should_hold: bool, awake: &mut Option<keepawake::KeepAwake>) {
-    if should_hold && awake.is_none() {
+/// 保持唤醒状态：`failed` 记住本次「应持有」区间内的获取失败（无 logind 等环境），
+/// 在不再需要持有之前不重试，避免每个进度帧都新建连接并刷警告。
+#[derive(Default)]
+struct AwakeState {
+    guard: Option<keepawake::KeepAwake>,
+    failed: bool,
+}
+
+async fn reconcile_awake(should_hold: bool, awake: &mut AwakeState) {
+    if should_hold && awake.guard.is_none() && !awake.failed {
         match tokio::task::spawn_blocking(|| {
             keepawake::Builder::default()
                 .idle(true)
@@ -227,12 +306,19 @@ async fn reconcile_awake(should_hold: bool, awake: &mut Option<keepawake::KeepAw
         })
         .await
         {
-            Ok(Ok(guard)) => *awake = Some(guard),
-            Ok(Err(error)) => tracing::warn!(error = %error, "could not inhibit sleep"),
-            Err(error) => tracing::warn!(error = %error, "keep-awake worker failed"),
+            Ok(Ok(guard)) => awake.guard = Some(guard),
+            Ok(Err(error)) => {
+                awake.failed = true;
+                tracing::warn!(error = %error, "could not inhibit sleep");
+            }
+            Err(error) => {
+                awake.failed = true;
+                tracing::warn!(error = %error, "keep-awake worker failed");
+            }
         }
     } else if !should_hold {
-        *awake = None;
+        awake.guard = None;
+        awake.failed = false;
     }
 }
 

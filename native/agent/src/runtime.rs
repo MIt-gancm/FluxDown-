@@ -126,7 +126,7 @@ pub(crate) async fn run_with(
                     .join("fluxdownd.stderr.log"),
             ),
     );
-    let daemon_bearer = load_daemon_bearer(&paths, &supervisor).await?;
+    let daemon_bearer = load_daemon_bearer(&paths, &supervisor, &cancel).await?;
     let daemon_config = DaemonClientConfig {
         rpc_url: paths.daemon_rpc_url.clone(),
         bearer: daemon_bearer,
@@ -153,12 +153,15 @@ pub(crate) async fn run_with(
         ..AgentSnapshot::default()
     };
     let events = AgentEventHub::new(initial);
-    let lifecycle = Arc::new(Lifecycle::new(
-        cancel.clone(),
-        daemon.clone(),
-        supervisor,
-        paths.daemon_data_dir.clone(),
-    ));
+    let lifecycle = Arc::new(
+        Lifecycle::new(
+            cancel.clone(),
+            daemon.clone(),
+            supervisor,
+            paths.daemon_data_dir.clone(),
+        )
+        .with_shutdown_config(daemon_config.clone()),
+    );
     if let Some(server) = &server {
         // SIGTERM / SIGINT → 与 `system.shutdown` 同一条完全退出路径（先关停 daemon）。
         let quit = server.quit.clone();
@@ -211,7 +214,10 @@ pub(crate) async fn run_with(
             migrated && state.gateway.mcp_enabled,
             state.gateway.cors_enabled,
         ));
-        let config = compatibility_api_config(&state).with_runtime_switches(switches.clone());
+        let mut config = compatibility_api_config(&state).with_runtime_switches(switches.clone());
+        // 监听地址在启动时按 `lan_enabled` 固定（运行期切换下次启动生效），Host 校验与之同步；
+        // server 模式可监听非回环地址，LAN 模式本就对外开放，均不强制。
+        config.enforce_loopback_host = server.is_none() && !state.gateway.lan_enabled;
         let token = config.token.clone();
         (config, switches, token)
     };
@@ -287,14 +293,25 @@ pub(crate) async fn run_with(
         shell.clone(),
     ));
     let blobs = Arc::new(crate::capture::DaemonBlobClient::new(&daemon_config)?);
-    let mut nmh_task = if server.is_some() {
+    let nmh_task = if server.is_some() {
         // server 模式没有浏览器扩展中继：不启动 NMH IPC 也不注册 native messaging host；
         // 占位任务永不完成，退出时 abort。
         tokio::spawn(std::future::pending::<Result<(), std::io::Error>>())
     } else {
-        tokio::spawn(
-            crate::nmh::NmhService::new(daemon.clone(), capture.clone()).run(cancel.clone()),
-        )
+        // NMH 需要实时速度（扩展弹窗）：自持一个任务事件泵，与网关的泵互不依赖。
+        let task_events = crate::task_events::TaskEventHub::spawn(&events);
+        let nmh = crate::nmh::NmhService::new(daemon.clone(), capture.clone())
+            .with_task_events(task_events);
+        let nmh_cancel = cancel.clone();
+        tokio::spawn(async move {
+            let outcome = nmh.run(nmh_cancel.clone()).await;
+            if let Err(error) = &outcome {
+                tracing::warn!(error = %error, "NMH IPC service stopped; browser relay unavailable");
+            } else if !nmh_cancel.is_cancelled() {
+                tracing::warn!("NMH IPC service stopped unexpectedly; browser relay unavailable");
+            }
+            Ok(())
+        })
     };
     // 浏览器扩展靠 NMH 注册找到中继：启动时按归属规则自愈，不与并存的另一份 FluxDown 互相覆盖。
     if server.is_none() {
@@ -400,25 +417,18 @@ pub(crate) async fn run_with(
         link.clone(),
         server_config.and_then(|config| config.language.clone()),
     ));
-    let (result, nmh_completed): (Result<(), Box<dyn std::error::Error + Send + Sync>>, bool) = tokio::select! {
-        gateway = crate::gateway::serve(
-            listener,
-            gateway_service,
-            api_host,
-            api_config,
-            bearer,
-            cancel.clone(),
-            server_handle,
-        ) => (gateway.map_err(Into::into), false),
-        nmh = &mut nmh_task => {
-            let error = match nmh {
-                Ok(Ok(())) => std::io::Error::other("NMH IPC service stopped unexpectedly"),
-                Ok(Err(error)) => error,
-                Err(error) => std::io::Error::other(error.to_string()),
-            };
-            (Err(Box::new(error)), true)
-        }
-    };
+    // NMH 只服务浏览器扩展：其端点故障只记日志，不拖垮 agent；正常退出也不是故障。
+    let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = crate::gateway::serve(
+        listener,
+        gateway_service,
+        api_host,
+        api_config,
+        bearer,
+        cancel.clone(),
+        server_handle,
+    )
+    .await
+    .map_err(Into::into);
     cancel.cancel();
     // daemon 启动失败 / 迁移失败时 readiness 任务取消了 Gateway：以它的错误作为退出原因。
     let result = match (result, readiness_task.await) {
@@ -435,13 +445,11 @@ pub(crate) async fn run_with(
     let _ = analytics_task.await;
     let _ = power_task.await;
     let _ = shell_task.await;
-    if !nmh_completed {
-        if server.is_some() {
-            // server 模式的 NMH 占位任务永不自行结束。
-            nmh_task.abort();
-        }
-        let _ = nmh_task.await;
+    if server.is_some() {
+        // server 模式的 NMH 占位任务永不自行结束。
+        nmh_task.abort();
     }
+    let _ = nmh_task.await;
     result
 }
 
@@ -654,6 +662,7 @@ async fn initialize_device_identity(
 async fn load_daemon_bearer(
     paths: &AgentPaths,
     supervisor: &DaemonSupervisor,
+    cancel: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     if let Ok(token) = tokio::fs::read_to_string(&paths.daemon_token_file).await
         && !token.trim().is_empty()
@@ -670,15 +679,29 @@ async fn load_daemon_bearer(
         }
         Err(error) => return Err(error.into()),
     }
-    for _ in 0..100 {
+    // daemon 在迁移 / 慢盘冷启动后才写 token：与 await_daemon_ready 一致持续等待，直到取消。
+    const TICKS_PER_CHECK: u32 = 300;
+    let mut remaining = TICKS_PER_CHECK;
+    loop {
         if let Ok(token) = tokio::fs::read_to_string(&paths.daemon_token_file).await
             && !token.trim().is_empty()
         {
             return Ok(token.trim().to_owned());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::select! {
+            () = cancel.cancelled() => {
+                return Err("cancelled while waiting for the daemon token file".into());
+            }
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
+        }
+        remaining -= 1;
+        if remaining == 0 {
+            remaining = TICKS_PER_CHECK;
+            tracing::warn!("still waiting for the daemon token file");
+            // 子进程若已崩溃则重新拉起；仍存活的代际上是空操作。
+            supervisor.ensure_running().await?;
+        }
     }
-    Err("daemon token file was not created after supervised launch".into())
 }
 
 fn compatibility_api_config(state: &AgentState) -> fluxdown_api::server::ApiServerConfig {
@@ -779,14 +802,50 @@ pub fn resolve_agent_data_dir() -> Result<PathBuf, Box<dyn std::error::Error + S
     if let Some(dir) = std::env::var_os("FLUXDOWN_AGENT_DATA_DIR") {
         return Ok(PathBuf::from(dir));
     }
-    let root = match std::env::var_os("FLUXDOWN_DATA_DIR") {
-        Some(root) => PathBuf::from(root),
-        None => directories::ProjectDirs::from("dev", "zerx", "FluxDown")
+    let project_root = || -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(directories::ProjectDirs::from("dev", "zerx", "FluxDown")
             .ok_or("could not resolve application data directory")?
             .data_dir()
-            .to_owned(),
+            .to_owned())
     };
-    Ok(root.join("agent"))
+    if let Some(root) = std::env::var_os("FLUXDOWN_DATA_DIR") {
+        return Ok(PathBuf::from(root).join("agent"));
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(portable) = portable_data_dir() {
+        // 便携版与引擎 data_dir 同判定；旧版本把状态写在 ProjectDirs，首启迁移一次。
+        let target = portable.join("agent");
+        if let Ok(legacy) = project_root().map(|root| root.join("agent")) {
+            migrate_legacy_agent_state(&legacy, &target);
+        }
+        return Ok(target);
+    }
+    Ok(project_root()?.join("agent"))
+}
+
+/// `<exe>/portable` 标记存在时返回 `<exe>/portable_data`。
+#[cfg(target_os = "windows")]
+fn portable_data_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))?;
+    exe_dir
+        .join("portable")
+        .exists()
+        .then(|| exe_dir.join("portable_data"))
+}
+
+/// 目标无状态文件而旧位置有时复制 `agent-state.json`（登录态 / 设备身份）；失败不阻断启动。
+#[cfg(target_os = "windows")]
+fn migrate_legacy_agent_state(legacy: &Path, target: &Path) {
+    let name = "agent-state.json";
+    let (from, to) = (legacy.join(name), target.join(name));
+    if to.exists() || !from.is_file() {
+        return;
+    }
+    if std::fs::create_dir_all(target).is_ok() {
+        let _ = std::fs::copy(&from, &to);
+    }
 }
 
 /// 镜像 `fluxdown_engine::data_dir::resolve_data_dir_inner` 的默认目录（agent 不依赖 engine）。

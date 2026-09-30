@@ -209,11 +209,25 @@ pub fn completion_text(
     ))
 }
 
+/// RSS 自动下载通知文案（同 Flutter 首页 toast）：标题「RSS 自动新建了 N 个下载任务」，
+/// 正文为首个条目标题。
+pub fn rss_auto_download_text(
+    titles: &[String],
+    text: impl Fn(&str, Option<usize>) -> String,
+) -> Option<(String, String)> {
+    let first = titles.first()?;
+    Some((
+        text("rssAutoDownloadedToast", Some(titles.len())),
+        first.clone(),
+    ))
+}
+
 /// 英文基线文案（headless 构建没有文案目录 / 目录加载失败时）；与 `assets/i18n/en.json` 同文。
 #[must_use]
 pub fn english_text(key: &str, count: Option<usize>) -> String {
     let template = match key {
         "downloadCompleted" => "Download Complete",
+        "rssAutoDownloadedToast" => "RSS added {count} download(s)",
         "batchDownloadCompleted" => "{count} Downloads Complete",
         "andMoreFiles" => "and {count} more",
         "torrentFileAssociation" => "Associate .torrent Files",
@@ -268,7 +282,17 @@ impl NoticeText {
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_text, english_text as english};
+    use super::{completion_text, english_text as english, rss_auto_download_text};
+
+    #[test]
+    fn rss_auto_download_text_reports_count_and_first_title() {
+        assert_eq!(rss_auto_download_text(&[], english), None);
+        let titles = ["Ep 1".to_owned(), "Ep 2".to_owned()];
+        assert_eq!(
+            rss_auto_download_text(&titles, english),
+            Some(("RSS added 2 download(s)".to_owned(), "Ep 1".to_owned()))
+        );
+    }
 
     #[test]
     fn single_and_batch_completion_text_match_flutter_rules() {

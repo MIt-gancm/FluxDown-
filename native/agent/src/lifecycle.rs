@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon_client::DaemonClient;
+use crate::daemon_client::{DaemonClient, DaemonClientConfig};
 use crate::supervisor::DaemonSupervisor;
 
 /// 等 daemon 收尾（actor 关停、日志 flush）并释放 `daemon.lock` 的上限。
@@ -29,6 +29,7 @@ pub struct Lifecycle {
     daemon: Arc<DaemonClient>,
     supervisor: Arc<DaemonSupervisor>,
     daemon_data_dir: PathBuf,
+    shutdown_config: Option<DaemonClientConfig>,
 }
 
 impl Lifecycle {
@@ -45,7 +46,15 @@ impl Lifecycle {
             daemon,
             supervisor,
             daemon_data_dir,
+            shutdown_config: None,
         }
+    }
+
+    /// 提供握手前关停所需的连接配置，启用退出时的兜底路径。
+    #[must_use]
+    pub fn with_shutdown_config(mut self, config: DaemonClientConfig) -> Self {
+        self.shutdown_config = Some(config);
+        self
     }
 
     /// 是否处于完全退出流程（决定 UI 连接的关闭原因）。
@@ -75,10 +84,28 @@ impl Lifecycle {
             Ok(Ok(_)) => wait_daemon_released(&self.daemon_data_dir, DAEMON_EXIT_BUDGET).await,
             Ok(Err(error)) => {
                 tracing::warn!(code = ?error.code, "fluxdownd did not accept shutdown");
+                self.shutdown_before_handshake().await;
             }
-            Err(_) => tracing::warn!("fluxdownd shutdown request timed out"),
+            Err(_) => {
+                tracing::warn!("fluxdownd shutdown request timed out");
+                self.shutdown_before_handshake().await;
+            }
         }
         self.cancel.cancel();
+    }
+
+    /// 重连窗口 / 冷启动期间客户端连接不可用：走握手前 `system.shutdown` 兜底，
+    /// 否则退出后会留下无界面无托盘的孤儿 daemon。
+    async fn shutdown_before_handshake(&self) {
+        let Some(config) = &self.shutdown_config else {
+            return;
+        };
+        match crate::daemon_client::request_shutdown(config).await {
+            Ok(()) => wait_daemon_released(&self.daemon_data_dir, DAEMON_EXIT_BUDGET).await,
+            Err(error) => {
+                tracing::warn!(%error, "fallback fluxdownd shutdown was not accepted");
+            }
+        }
     }
 }
 

@@ -78,6 +78,8 @@ pub struct AgentState {
     pub gateway_migration_revision: Option<u64>,
     pub analytics_install_reported: bool,
     pub analytics_last_active_day: u64,
+    /// 匿名统计专用随机 ID；刻意与 FluxCloud `device_id` 分离，统计无法关联到账号 / 设备。
+    pub analytics_id: String,
     /// 调试构建下用户覆盖的 FluxCloud 地址；正式构建启动时忽略（锁定固定地址）。
     pub cloud_base_url_override: Option<String>,
 }
@@ -192,6 +194,14 @@ pub struct StateStore {
     acl_dir_ready: bool,
 }
 
+/// Windows 上锁争用是 `ERROR_LOCK_VIOLATION`，std 不把它映射为 `WouldBlock`。
+fn is_lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| fs2::lock_contended_error().raw_os_error() == Some(code))
+}
+
 impl StateStore {
     /// 打开状态目录并获取 `<data-dir>/agent.lock`。
     pub async fn open(data_dir: PathBuf) -> Result<Self, StateError> {
@@ -205,7 +215,7 @@ impl StateStore {
             .write(true)
             .open(lock_path)?;
         lock.try_lock_exclusive().map_err(|error| {
-            if error.kind() == std::io::ErrorKind::WouldBlock {
+            if is_lock_contended(&error) {
                 StateError::Locked
             } else {
                 StateError::Io(error)
@@ -486,6 +496,17 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::{AgentState, PersistedSyncEntry, StateError, StateStore};
+
+    #[test]
+    fn platform_lock_contention_error_is_recognized() {
+        assert!(super::is_lock_contended(&fs2::lock_contended_error()));
+        assert!(super::is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(!super::is_lock_contended(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+    }
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
