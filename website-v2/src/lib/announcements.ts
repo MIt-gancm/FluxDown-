@@ -35,6 +35,16 @@ export const OFFICIAL_SITES = ["https://www.fluxdown.com", "https://fluxdown.com
 
 export const ANNOUNCEMENTS: Announcement[] = [
   {
+    id: "gpui-client",
+    date: "2026-09-30",
+    active: true,
+    link: "/announcements/gpui-client",
+    text: {
+      en: "FluxDown 0.5.0 ships the native GPUI client — a note from the author on why the whole interface was rebuilt.",
+      zh: "FluxDown 0.5.0 原生 GPUI 客户端正式发布——作者来信:为什么我把整个界面从头重写了一遍。",
+    },
+  },
+  {
     id: "pricing-vote-open",
     date: "2026-07-29",
     active: true,

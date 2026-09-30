@@ -45,10 +45,12 @@ export const COMMUNITY_LINKS: NavLink[] = [
   { label: "announcements", desc: "announcementsDesc", path: "/announcements", icon: Megaphone },
   { label: "feedback", desc: "feedbackDesc", path: "/feedback", icon: MessageSquare },
   { label: "featureVote", desc: "featureVoteDesc", path: "/feature-vote", icon: Vote },
-  { label: "sponsor", desc: "sponsorDesc", path: "/sponsor", icon: Heart },
   { label: "telegram", desc: "telegramDesc", path: "/telegram-group", icon: Send },
   { label: "qq", desc: "qqDesc", path: "/qq-group", icon: Users },
 ];
+
+/** 赞助是一级导航(不进社区下拉),首页打开即可见。 */
+export const SPONSOR_LINK: NavLink = { label: "sponsor", path: "/sponsor", icon: Heart };
 
 /** 文档入口直接落到对应语言,避免 `/docs/` 的 302。 */
 export const docsPath = (lang: Lang) => `/docs/${lang}/`;

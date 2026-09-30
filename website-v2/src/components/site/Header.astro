@@ -9,7 +9,7 @@ import Logo from "./Logo.astro";
 import { common } from "../../i18n/messages/common";
 import { href, switchLang, stripLang } from "../../i18n/routing";
 import { LANG_LABEL, type Lang } from "../../i18n/config";
-import { COMMUNITY_LINKS, GITHUB_URL, PRODUCT_LINKS, docsPath } from "../../lib/site-nav";
+import { COMMUNITY_LINKS, GITHUB_URL, PRODUCT_LINKS, SPONSOR_LINK, docsPath } from "../../lib/site-nav";
 import { stripBase } from "@/lib/base";
 
 interface Props {
@@ -54,6 +54,11 @@ const flat = [
   { label: t.nav.pricing, href: href("/pricing", lang), active: path.startsWith("/pricing") },
   { label: t.nav.changelog, href: href("/changelog", lang), active: path.startsWith("/changelog") },
 ];
+const sponsor = {
+  label: t.nav[SPONSOR_LINK.label],
+  href: href(SPONSOR_LINK.path, lang),
+  active: path.startsWith(SPONSOR_LINK.path),
+};
 const isActive = (links: typeof PRODUCT_LINKS) =>
   links.some((l) => !l.path.includes("#") && path.startsWith(l.path));
 ---
@@ -131,6 +136,10 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
           </a>
         ))
       }
+      <a href={sponsor.href} class="nav-link nav-sponsor" data-active={sponsor.active || undefined}>
+        <SPONSOR_LINK.icon size={14} strokeWidth={2} className="nav-sponsor-icon" />
+        {sponsor.label}
+      </a>
     </nav>
 
     <div class="ml-auto flex items-center gap-1.5">
@@ -176,6 +185,10 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
         </a>
       ))
     }
+    <a href={sponsor.href} class="mobile-link">
+      <SPONSOR_LINK.icon size={16} strokeWidth={1.75} className="nav-sponsor-icon" />
+      {sponsor.label}
+    </a>
     {
       menus.map((menu) => (
         <div class="mt-6">
@@ -280,6 +293,14 @@ const isActive = (links: typeof PRODUCT_LINKS) =>
     }
     .nav-link:hover {
       background: var(--bg-inset);
+    }
+    .nav-sponsor-icon {
+      color: var(--danger);
+      transition: transform 240ms var(--ease-spring);
+    }
+    .nav-sponsor:hover .nav-sponsor-icon {
+      fill: currentColor;
+      transform: scale(1.12);
     }
     .nav-caret {
       opacity: 0.6;

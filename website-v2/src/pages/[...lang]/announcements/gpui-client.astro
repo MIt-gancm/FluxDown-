@@ -1,0 +1,191 @@
+---
+/**
+ * 公告长文:作者视角说明 0.5.0 为何用 GPUI 重写桌面界面、三进程架构与新界面带来的变化。
+ * 首页 Hero 徽标与公告列表(`src/lib/announcements.ts` 的 `gpui-client` 条目)都指向这里。
+ */
+import { ArrowRight, Heart, MessageSquare } from "lucide-react";
+import Layout from "@/layouts/Layout.astro";
+import PageHeader from "@/components/site/PageHeader.astro";
+import { langStaticPaths, resolveLang, href } from "@/i18n/routing";
+import { announcementGpui } from "@/i18n/messages/announcementGpui";
+
+export const getStaticPaths = langStaticPaths;
+const lang = resolveLang(Astro.params.lang);
+const t = announcementGpui[lang];
+---
+
+<Layout lang={lang} title={t.meta.title} description={t.meta.description}>
+  <PageHeader eyebrow={t.eyebrow} title={t.title} lede={t.intro}>
+    <a class="btn btn-primary" href={href("/download", lang)}>
+      {t.download}
+      <ArrowRight size={15} aria-hidden="true" />
+    </a>
+    <a class="btn btn-ticks" href={href("/changelog", lang)}>{t.changelog}</a>
+  </PageHeader>
+
+  <div class="frame">
+    <div class="section grid gap-12 lg:grid-cols-[220px_minmax(0,1fr)] lg:gap-16">
+      <nav aria-labelledby="gpui-toc" class="lg:sticky lg:top-[calc(var(--header-h)+32px)] lg:self-start">
+        <p id="gpui-toc" class="eyebrow-plain mb-4">{t.contents}</p>
+        <ol class="flex flex-col border-l border-line">
+          {
+            t.sections.map((s, i) => (
+              <li>
+                <a
+                  href={`#${s.id}`}
+                  class="-ml-px flex items-baseline gap-3 border-l border-transparent py-1.5 pl-4 text-sm text-muted transition-colors hover:border-accent hover:text-fg"
+                >
+                  <span class="num font-mono text-[11px] text-subtle">{String(i + 1).padStart(2, "0")}</span>
+                  {s.title}
+                </a>
+              </li>
+            ))
+          }
+        </ol>
+      </nav>
+
+      <article class="max-w-[72ch]">
+        <p class="mb-8 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-subtle">
+          <span class="font-medium text-fg">{t.byline}</span>
+          <span aria-hidden="true">·</span>
+          <time datetime="2026-09-30">{t.date}</time>
+        </p>
+
+        <figure class="mb-14 border border-line bg-sunken" data-reveal>
+          <figcaption class="eyebrow-plain border-b border-line px-5 py-3">{t.statsLabel}</figcaption>
+          <dl class="grid grid-cols-2 sm:grid-cols-4">
+            {
+              t.stats.map((s) => (
+                <div class="stat">
+                  <dt class="order-2 mt-1 text-[12.5px] leading-snug text-muted">{s.k}</dt>
+                  <dd class="num order-1 text-[26px] font-semibold tracking-tight text-fg">{s.v}</dd>
+                </div>
+              ))
+            }
+          </dl>
+        </figure>
+
+        {
+          t.sections.map((s, i) => (
+            <section id={s.id} aria-labelledby={`${s.id}-h`} class="scroll-mt-[calc(var(--header-h)+24px)] [&+&]:mt-16">
+              <p class="num mb-3 font-mono text-xs text-subtle">§ {String(i + 1).padStart(2, "0")}</p>
+              <h2 id={`${s.id}-h`} class="h3" data-reveal>
+                {s.title}
+              </h2>
+              {s.body.map((p) => (
+                <p class="mt-4 text-[15.5px] leading-[1.75] text-muted">{p}</p>
+              ))}
+
+              {s.id === "why" && (
+                <blockquote class="mt-8 border-l-2 border-accent py-1 pl-5 text-[17px] font-medium leading-[1.65] text-fg" data-reveal>
+                  {t.quote}
+                </blockquote>
+              )}
+
+              {s.id === "architecture" && (
+                <>
+                  <ol class="mt-8 flex flex-col border border-line" data-reveal>
+                    {t.layers.map((layer, n) => (
+                      <li class="layer">
+                        <span class="num font-mono text-[11px] text-subtle">{String(n + 1).padStart(2, "0")}</span>
+                        <div class="min-w-0">
+                          <p class="flex flex-wrap items-baseline gap-x-3">
+                            <code class="font-mono text-[13.5px] font-semibold text-fg">{layer.id}</code>
+                            <span class="text-[12.5px] text-accent-ink">{layer.role}</span>
+                          </p>
+                          <p class="mt-1 text-[14.5px] leading-[1.65] text-muted">{layer.desc}</p>
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                  <p class="mt-8 text-[15.5px] leading-[1.75] text-muted">{t.archAfter}</p>
+                </>
+              )}
+
+              {s.id === "interface" && (
+                <dl class="mt-8 grid gap-px border border-line bg-line sm:grid-cols-2" data-reveal>
+                  {t.features.map((f) => (
+                    <div class="bg-bg px-5 py-4">
+                      <dt class="text-[14.5px] font-semibold text-fg">{f.k}</dt>
+                      <dd class="mt-1.5 text-[14px] leading-[1.65] text-muted">{f.v}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+
+              {s.id === "beyond" && (
+                <dl class="mt-8 flex flex-col gap-5" data-reveal>
+                  {t.beyondItems.map((item) => (
+                    <div class="border-l-2 border-line pl-5">
+                      <dt class="text-[14.5px] font-semibold text-fg">{item.k}</dt>
+                      <dd class="mt-1 text-[15px] leading-[1.7] text-muted">{item.v}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+
+              {s.id === "upgrade" && (
+                <ul class="mt-4 flex list-disc flex-col gap-2 pl-5 text-[15px] leading-[1.7] text-muted marker:text-subtle">
+                  {t.upgradeItems.map((item) => (
+                    <li>{item}</li>
+                  ))}
+                </ul>
+              )}
+
+              {s.id === "thanks" && (
+                <>
+                  <p class="mt-8 text-[15.5px] font-medium text-fg">{t.signature}</p>
+                  <div class="mt-8 flex flex-wrap gap-3">
+                    <a class="btn btn-primary" href={href("/download", lang)}>
+                      {t.ctaDownload}
+                      <ArrowRight size={15} aria-hidden="true" />
+                    </a>
+                    <a class="btn btn-secondary" href={href("/feedback", lang)}>
+                      <MessageSquare size={15} aria-hidden="true" />
+                      {t.ctaFeedback}
+                    </a>
+                    <a class="btn btn-ticks" href={href("/sponsor", lang)}>
+                      <Heart size={15} aria-hidden="true" className="text-danger" />
+                      {t.ctaSponsor}
+                    </a>
+                  </div>
+                </>
+              )}
+            </section>
+          ))
+        }
+      </article>
+    </div>
+    <div class="rule"></div>
+  </div>
+</Layout>
+
+<style>
+  .stat {
+    display: flex;
+    flex-direction: column;
+    padding: 18px 20px;
+    border-color: var(--line);
+  }
+  .stat + .stat {
+    border-left-width: 1px;
+  }
+  @media (max-width: 639px) {
+    .stat:nth-child(3) {
+      border-left-width: 0;
+    }
+    .stat:nth-child(n + 3) {
+      border-top-width: 1px;
+    }
+  }
+  .layer {
+    display: grid;
+    grid-template-columns: 28px minmax(0, 1fr);
+    gap: 12px;
+    align-items: baseline;
+    padding: 16px 20px;
+  }
+  .layer + .layer {
+    border-top: 1px solid var(--line);
+  }
+</style>
