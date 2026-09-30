@@ -3,6 +3,7 @@
 //! 每个检查项是一次只读探测：NMH 中继/清单/浏览器注册、本进程 IPC 与网关监听、
 //! 兼容 HTTP API、daemon RPC、URL scheme 与 `.torrent` 关联、日志目录可写。
 //! 修复动作是显式的第二步（`repair`），探测本身从不改动系统。
+//! 打开日志目录仅接受已存在的 agent/daemon 日志目录或 agent 数据目录，不打开其中的文件。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -201,12 +202,12 @@ impl DiagnosticsService {
                     allowed.push(PathBuf::from(paths.daemon_log_dir));
                 }
                 spawn_blocking_platform(move || {
-                    if !is_within_any(&target, &allowed) {
-                        return Err(crate::platform::PlatformError::Failed(
-                            "open_log_dir target is outside the log and data directories"
+                    let target = resolve_log_dir_target(&target, &allowed).ok_or_else(|| {
+                        crate::platform::PlatformError::Failed(
+                            "open_log_dir target must be an existing log or data directory"
                                 .to_owned(),
-                        ));
-                    }
+                        )
+                    })?;
                     crate::platform::open_path(&target, false)
                 })
                 .await?;
@@ -238,12 +239,8 @@ impl DiagnosticsService {
         &self,
         params: &LogExportParams,
     ) -> Result<LogExportResult, DiagnosticsError> {
-        if params.target_path.trim().is_empty() {
-            return Err(DiagnosticsError::InvalidAction(
-                "exportLogs requires targetPath".to_owned(),
-            ));
-        }
-        let target = crate::log_export::resolve_target(&params.target_path);
+        let target = crate::log_export::resolve_target(&params.target_path)
+            .map_err(|message| DiagnosticsError::InvalidAction(message.to_owned()))?;
         let mut zip = crate::log_export::ZipWriter::new();
 
         let report = self.run().await?;
@@ -1028,14 +1025,16 @@ async fn probe_local_server(gateway: &fluxdown_protocol::GatewayStatusDto) -> Di
     }
 }
 
-/// `target` 规范化（解析符号链接与 `..`）后是否落在任一允许目录之内；任一侧无法规范化视为否。
-fn is_within_any(target: &Path, allowed: &[PathBuf]) -> bool {
-    let Ok(target) = std::fs::canonicalize(target) else {
-        return false;
-    };
+/// 解析符号链接与父目录引用后精确匹配已知目录；返回同一规范路径交给平台打开，拒绝文件与子目录。
+fn resolve_log_dir_target(target: &Path, allowed: &[PathBuf]) -> Option<PathBuf> {
+    let target = std::fs::canonicalize(target).ok()?;
+    if !target.is_dir() {
+        return None;
+    }
     allowed
         .iter()
-        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| target.starts_with(root)))
+        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| target == root))
+        .then_some(target)
 }
 
 fn daemon_log_dir(describe: Option<&Value>) -> Option<&str> {
@@ -1357,21 +1356,68 @@ mod tests {
     }
 
     #[test]
-    fn open_log_dir_target_must_stay_inside_allowed_dirs() {
+    fn open_log_dir_accepts_only_existing_known_directories() {
+        let root = std::env::temp_dir().join(format!("fluxdown_doctor_{}", uuid::Uuid::new_v4()));
+        let data = root.join("data");
+        let logs = data.join("logs");
+        let daemon_logs = root.join("daemon-logs");
+        let outside = root.join("other");
+        let child = logs.join("nested");
+        for dir in [&logs, &daemon_logs, &outside, &child] {
+            std::fs::create_dir_all(dir).expect("create diagnostic directories");
+        }
+        let executable = logs.join("downloaded-program");
+        std::fs::write(&executable, b"program").expect("create file inside logs");
+        let allowed = vec![data.clone(), logs.clone(), daemon_logs.clone()];
+        for dir in [&data, &logs, &daemon_logs] {
+            assert_eq!(
+                super::resolve_log_dir_target(dir, &allowed),
+                Some(std::fs::canonicalize(dir).expect("canonical directory"))
+            );
+        }
+        assert_eq!(
+            super::resolve_log_dir_target(&logs.join("..").join("logs"), &allowed),
+            Some(std::fs::canonicalize(&logs).expect("canonical logs"))
+        );
+        for rejected in [
+            outside,
+            child,
+            executable.clone(),
+            root.join("missing"),
+            logs.join("..").join("..").join("other"),
+        ] {
+            assert_eq!(
+                super::resolve_log_dir_target(&rejected, &allowed),
+                None,
+                "{}",
+                rejected.display()
+            );
+        }
+        assert_eq!(
+            super::resolve_log_dir_target(&executable, std::slice::from_ref(&executable)),
+            None
+        );
+        std::fs::remove_dir_all(root).expect("remove diagnostic directories");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_log_dir_resolves_aliases_without_allowing_symlink_escapes() {
         let root = std::env::temp_dir().join(format!("fluxdown_doctor_{}", uuid::Uuid::new_v4()));
         let logs = root.join("logs");
         let outside = root.join("other");
-        std::fs::create_dir_all(&logs).ok();
-        std::fs::create_dir_all(&outside).ok();
-        let allowed = vec![logs.clone()];
-        assert!(super::is_within_any(&logs, &allowed));
-        assert!(!super::is_within_any(&outside, &allowed));
-        assert!(!super::is_within_any(
-            &logs.join("..").join("other"),
-            &allowed
-        ));
-        assert!(!super::is_within_any(&root.join("missing"), &allowed));
-        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&logs).expect("create logs");
+        std::fs::create_dir_all(&outside).expect("create outside directory");
+        let alias = root.join("logs-alias");
+        let escape = logs.join("escape");
+        std::os::unix::fs::symlink(&logs, &alias).expect("alias logs");
+        std::os::unix::fs::symlink(&outside, &escape).expect("symlink outside directory");
+        assert_eq!(
+            super::resolve_log_dir_target(&alias, std::slice::from_ref(&logs)),
+            Some(std::fs::canonicalize(&logs).expect("canonical logs"))
+        );
+        assert_eq!(super::resolve_log_dir_target(&escape, &[logs]), None);
+        std::fs::remove_dir_all(root).expect("remove diagnostic directories");
     }
 
     #[test]

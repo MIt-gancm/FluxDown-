@@ -131,7 +131,7 @@ impl GatewayService {
         }
     }
 
-    /// server 模式：`agent.platform.*` 返回 Unsupported，网关令牌须符合访问密钥策略。
+    /// server 模式：桌面平台操作、宿主诊断修复与路径日志导出返回 Unsupported，令牌遵循访问密钥策略。
     #[must_use]
     pub fn with_server_mode(mut self, enabled: bool) -> Self {
         self.server_mode = enabled;
@@ -1675,7 +1675,7 @@ mod tests {
 
     use super::{
         GatewayService, GatewayShell, Lane, authorized, ensure_exposed_auth_token, lane_for,
-        load_or_create_bearer, server_mode_denies,
+        load_or_create_bearer,
     };
     #[tokio::test]
     async fn service_bearer_is_exact_stable_and_private() {
@@ -2151,28 +2151,135 @@ mod tests {
         harness.finish().await;
     }
 
-    #[test]
-    fn server_mode_denies_desktop_diagnostics_but_keeps_web_doctor_actions() {
-        let request = |method_name: &str, params: serde_json::Value| {
-            RpcRequest::new(RequestId::Integer(1), method_name, Some(params))
-        };
+    #[tokio::test]
+    async fn server_mode_rejects_host_diagnostics_and_keeps_web_repairs() {
+        let mut harness = TestGateway::new("server_diagnostics").await;
+        harness.service = harness.service.with_server_mode(true);
         let repair = fluxdown_protocol::method::AGENT_DIAGNOSTICS_REPAIR;
-        for action in ["open_log_dir", "register", "reregister", "use_this_install"] {
-            assert!(
-                server_mode_denies(&request(repair, serde_json::json!({ "action": action }))),
+        let target = harness.dir.join("chosen.zip");
+        tokio::fs::write(&target, b"existing archive")
+            .await
+            .expect("create protected archive");
+        let mut denied_repairs = vec![
+            serde_json::json!({
+                "action": crate::diagnostics::ACTION_OPEN_LOG_DIR,
+                "target": harness.dir.display().to_string(),
+            }),
+            serde_json::json!({ "action": crate::diagnostics::ACTION_REREGISTER }),
+            serde_json::json!({ "action": crate::diagnostics::ACTION_USE_THIS_INSTALL }),
+        ];
+        for association in ["fluxdown", "magnet", "ed2k", "torrent"] {
+            denied_repairs.push(serde_json::json!({
+                "action": crate::diagnostics::ACTION_REGISTER,
+                "target": association,
+            }));
+        }
+        for params in denied_repairs {
+            let response = harness.call(repair, params.clone()).await;
+            let RpcResponse::Failure(failure) = response else {
+                panic!("host repair must be rejected: {params}");
+            };
+            assert_eq!(
+                failure.error.data.map(|data| (data.code, data.retryable)),
+                Some((ApplicationErrorCode::Unsupported, false)),
+                "{params}"
+            );
+        }
+        for params in [
+            serde_json::json!({ "targetPath": target.display().to_string() }),
+            serde_json::json!({}),
+        ] {
+            let response = harness
+                .call(
+                    fluxdown_protocol::method::AGENT_DIAGNOSTICS_EXPORT_LOGS,
+                    params,
+                )
+                .await;
+            let RpcResponse::Failure(failure) = response else {
+                panic!("host log export must be rejected");
+            };
+            assert_eq!(
+                failure.error.data.map(|data| (data.code, data.retryable)),
+                Some((ApplicationErrorCode::Unsupported, false))
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(&target)
+                .await
+                .expect("read protected archive"),
+            b"existing archive"
+        );
+        for action in [
+            crate::diagnostics::ACTION_REFRESH_TRACKERS,
+            crate::diagnostics::ACTION_REFRESH_ED2K_SERVERS,
+        ] {
+            let response = harness
+                .call(repair, serde_json::json!({ "action": action }))
+                .await;
+            let RpcResponse::Failure(failure) = response else {
+                panic!("disconnected daemon must report unavailable");
+            };
+            assert_eq!(
+                failure.error.data.map(|data| (data.code, data.retryable)),
+                Some((ApplicationErrorCode::Unavailable, true)),
                 "{action}"
             );
         }
-        for action in ["refreshTrackers", "refreshEd2kServers"] {
-            assert!(
-                !server_mode_denies(&request(repair, serde_json::json!({ "action": action }))),
-                "{action}"
+        let enabled = harness
+            .call(
+                repair,
+                serde_json::json!({ "action": crate::diagnostics::ACTION_ENABLE_SERVICE }),
+            )
+            .await;
+        assert!(matches!(enabled, RpcResponse::Success(_)), "{enabled:?}");
+        assert!(
+            harness
+                .store
+                .load()
+                .await
+                .expect("reload state")
+                .gateway
+                .api_enabled
+        );
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn desktop_diagnostics_rejects_non_directory_open_targets() {
+        let harness = TestGateway::new("desktop_diagnostics").await;
+        let logs = harness.dir.join("logs");
+        let nested = logs.join("nested");
+        tokio::fs::create_dir_all(&nested)
+            .await
+            .expect("create log directories");
+        let file = logs.join("downloaded-program");
+        tokio::fs::write(&file, b"program")
+            .await
+            .expect("create file in logs");
+        for target in [file, nested, std::env::temp_dir(), logs.join("missing")] {
+            let response = harness
+                .call(
+                    fluxdown_protocol::method::AGENT_DIAGNOSTICS_REPAIR,
+                    serde_json::json!({
+                        "action": crate::diagnostics::ACTION_OPEN_LOG_DIR,
+                        "target": target.display().to_string(),
+                    }),
+                )
+                .await;
+            let RpcResponse::Failure(failure) = response else {
+                panic!(
+                    "non-log-directory target must be rejected: {}",
+                    target.display()
+                );
+            };
+            assert_eq!(
+                failure.error.data.map(|data| data.code),
+                Some(ApplicationErrorCode::Internal),
+                "{}",
+                target.display()
             );
         }
-        assert!(server_mode_denies(&request(
-            fluxdown_protocol::method::AGENT_DIAGNOSTICS_EXPORT_LOGS,
-            serde_json::json!({ "targetPath": "/tmp/x.zip" })
-        )));
+        harness.finish().await;
     }
 
     #[test]

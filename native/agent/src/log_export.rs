@@ -16,23 +16,88 @@ const MAX_LOG_FILE_BYTES: u64 = 32 * 1024 * 1024;
 /// 每个目录最多收集的日志文件数（按修改时间取最新）。
 const MAX_LOG_FILES_PER_DIR: usize = 20;
 
-/// 导出的目标路径：调用方给的扩展名不是 `.zip` 时改为 `.zip`，结果里回传真实路径。
-#[must_use]
-pub fn resolve_target(target_path: &str) -> PathBuf {
-    let mut path = PathBuf::from(target_path.trim());
+/// 保留调用方选择的文件与父目录；扩展名不是 .zip 时追加 .zip，拒绝目录、控制字符与设备路径。
+pub fn resolve_target(target_path: &str) -> Result<PathBuf, &'static str> {
+    if target_path.chars().any(char::is_control) {
+        return Err("exportLogs targetPath contains control characters");
+    }
+    let target_path = target_path.trim();
+    if target_path.is_empty() {
+        return Err("exportLogs requires targetPath");
+    }
+    if target_path
+        .rsplit(std::path::is_separator)
+        .next()
+        .is_some_and(|name| matches!(name, "" | "." | ".."))
+    {
+        return Err("exportLogs targetPath must name a file");
+    }
+    let mut path = PathBuf::from(target_path);
+    if path.file_name().is_none() {
+        return Err("exportLogs targetPath must name a file");
+    }
+    #[cfg(windows)]
+    for component in path.components() {
+        match component {
+            std::path::Component::Prefix(prefix) => {
+                if !path.has_root()
+                    || matches!(
+                        prefix.kind(),
+                        std::path::Prefix::DeviceNS(_) | std::path::Prefix::Verbatim(_)
+                    )
+                {
+                    return Err("exportLogs targetPath must be a filesystem file");
+                }
+            }
+            std::path::Component::Normal(name) => {
+                let name = name.to_str().ok_or("exportLogs targetPath is not UTF-8")?;
+                let stem = name
+                    .split('.')
+                    .next()
+                    .unwrap_or_default()
+                    .trim_end_matches(' ');
+                let device = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+                    .iter()
+                    .any(|device| stem.eq_ignore_ascii_case(device))
+                    || (stem.get(..3).is_some_and(|prefix| {
+                        prefix.eq_ignore_ascii_case("COM") || prefix.eq_ignore_ascii_case("LPT")
+                    }) && stem.get(3..).is_some_and(|suffix| {
+                        matches!(
+                            suffix,
+                            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                        )
+                    }));
+                if device
+                    || name.ends_with(' ')
+                    || name.ends_with('.')
+                    || name
+                        .chars()
+                        .any(|ch| matches!(ch, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+                {
+                    return Err("exportLogs targetPath must be a filesystem file");
+                }
+            }
+            _ => {}
+        }
+    }
+    if path.is_dir() {
+        return Err("exportLogs targetPath must name a file");
+    }
     let is_zip = path
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
     if !is_zip {
-        let stem = path
+        let name = path
             .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("fluxdown-logs")
-            .to_owned();
-        path.set_file_name(format!("{stem}.zip"));
+            .ok_or("exportLogs targetPath must name a file")?;
+        path.set_file_name(format!("{name}.zip"));
+        if path.is_dir() {
+            return Err("exportLogs targetPath must name a file");
+        }
     }
-    path
+    Ok(path)
 }
 
 /// agent 侧诊断日志目录（`agent.log` / `desktop.log` / `fluxdownd.stderr.log`）。
@@ -486,17 +551,111 @@ mod tests {
         assert!(is_log_name("app.log.3"));
         assert!(!is_log_name("app.log.bak"));
         assert!(!is_log_name("state.json"));
+        let root = std::env::temp_dir().join(format!("fluxdown_logs_{}", uuid::Uuid::new_v4()));
+        for (selected, exported) in [
+            ("out.txt", "out.txt.zip"),
+            ("out.ZIP", "out.ZIP"),
+            ("bundle", "bundle.zip"),
+        ] {
+            assert_eq!(
+                resolve_target(&root.join(selected).display().to_string()).expect("file target"),
+                root.join(exported)
+            );
+        }
+    }
+
+    #[test]
+    fn export_target_rejects_directory_and_non_file_inputs() {
+        let root = std::env::temp_dir().join(format!("fluxdown_logs_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("bundle.zip")).expect("create export directories");
+        assert!(resolve_target(&root.display().to_string()).is_err());
+        assert!(resolve_target(&root.join("bundle").display().to_string()).is_err());
+        for target in [
+            "",
+            "   ",
+            ".",
+            "..",
+            "/",
+            "missing/",
+            "missing/.",
+            "missing/..",
+            "archive\0.zip",
+            "archive\n.zip",
+        ] {
+            assert!(resolve_target(target).is_err(), "{target:?}");
+        }
+        std::fs::remove_dir_all(root).expect("remove export directories");
+    }
+
+    #[tokio::test]
+    async fn export_archive_writes_only_the_selected_file() {
+        let root = std::env::temp_dir().join(format!("fluxdown_logs_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("create export directory");
+        let chosen = root.join("logs & 名字 (oct).ZIP");
+        let neighbor = root.join("other.zip");
+        tokio::fs::write(&chosen, b"old archive")
+            .await
+            .expect("create old archive");
+        tokio::fs::write(&neighbor, b"unrelated file")
+            .await
+            .expect("create neighbor");
+        let target = resolve_target(&chosen.display().to_string()).expect("selected file");
+        assert_eq!(target, chosen);
+        let mut zip = ZipWriter::new();
+        zip.add("agent.log", b"log line\n");
+        let bytes = zip.finish();
+        let result = super::write_atomic(&target, &bytes)
+            .await
+            .expect("export archive");
+        assert_eq!(result.path, chosen.display().to_string());
+        assert_eq!(tokio::fs::read(&chosen).await.expect("read archive"), bytes);
         assert_eq!(
-            resolve_target("/tmp/out.txt").to_string_lossy(),
-            "/tmp/out.txt.zip"
+            tokio::fs::read(&neighbor).await.expect("read neighbor"),
+            b"unrelated file"
         );
-        assert_eq!(
-            resolve_target("/tmp/out.ZIP").to_string_lossy(),
-            "/tmp/out.ZIP"
-        );
-        assert_eq!(
-            resolve_target("/tmp/bundle").to_string_lossy(),
-            "/tmp/bundle.zip"
-        );
+        tokio::fs::remove_dir_all(root)
+            .await
+            .expect("remove export directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn export_target_rejects_windows_devices_and_alternate_streams() {
+        let root = std::env::temp_dir().join(format!("fluxdown_logs_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create export directory");
+        for name in [
+            "NUL.zip",
+            "NUL .zip",
+            "con.txt",
+            "COM1.zip",
+            "lpt¹.zip",
+            r"CON\archive.zip",
+            "archive.zip:stream",
+            r"alias.\archive.zip",
+        ] {
+            let target = root.join(name).display().to_string();
+            assert!(resolve_target(&target).is_err(), "{target:?}");
+        }
+        for target in [
+            r"C:archive.zip",
+            r"\\.\NUL",
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\archive.zip",
+        ] {
+            assert!(resolve_target(target).is_err(), "{target:?}");
+        }
+        for target in [
+            root.join("COM10.zip"),
+            std::fs::canonicalize(&root)
+                .expect("verbatim export directory")
+                .join("archive.zip"),
+        ] {
+            assert_eq!(
+                resolve_target(&target.display().to_string()).expect("filesystem file"),
+                target
+            );
+        }
+        std::fs::remove_dir_all(root).expect("remove export directory");
     }
 }
