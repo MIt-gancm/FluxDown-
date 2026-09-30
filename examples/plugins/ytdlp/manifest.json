@@ -38,7 +38,7 @@
         ]
       },
       "entry": "resolve.js",
-      "timeoutMs": 45000
+      "timeoutMs": 30000
     }
   ],
   "hooks": {
@@ -160,7 +160,7 @@
     {
       "key": "extraArgs",
       "title": "附加 yt-dlp 参数（高级）",
-      "description": "追加到 yt-dlp 解析命令的额外参数，空格分隔（如 --geo-bypass --extractor-args \"generic:impersonate\"）。用于释放 yt-dlp 高级能力。⚠ 出于安全，FluxDown 会拒绝 --exec / --downloader / --config-location / --load-info-json / --cookies-from-browser 等危险开关；--ffmpeg-location 由 FluxDown 自动注入，请勿手填。含空格的单个参数值请用引号包裹。",
+      "description": "追加到 yt-dlp 解析命令的额外参数，空格分隔（如 --geo-bypass --extractor-args \"generic:impersonate\"）。用于释放 yt-dlp 高级能力。⚠ 出于安全，FluxDown 只放行白名单内的规范长选项全名（不支持缩写与合并短选项），路径型选项的值只能是工作区内相对路径；--exec / --downloader / --config-location / --cookies-from-browser 等危险开关一律拒绝，被拒时错误信息会写出开关名。--ffmpeg-location 由 FluxDown 自动注入，请勿手填。含空格的单个参数值请用引号包裹。",
       "type": "string",
       "widget": "text",
       "default": ""

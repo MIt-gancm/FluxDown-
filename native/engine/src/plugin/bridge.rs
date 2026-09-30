@@ -86,20 +86,21 @@ const MAX_FS_FILES: usize = 100;
 /// flux.fs 文件名长度上限。
 const MAX_FS_NAME_LEN: usize = 255;
 
-/// 插件工作区目录：`<data_dir>/plugins-work/<sanitized_id>/`。flux.fs 与
+/// 插件工作区目录：`<data_dir>/plugins-work/<encoded_id>/`。flux.fs 与
 /// flux.ytdlp 共用同一根（cwd 对齐），使插件经 flux.fs 物化的输入文件正好落在
-/// 工具的工作目录里。`plugin_id` 经清洗（非 `[a-z0-9_-]` → `_`）成安全目录名。
-fn plugin_workspace(data_dir: &Path, plugin_id: &str) -> PathBuf {
-    let safe_id: String = plugin_id
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+/// 工具的工作目录里。目录名为 identity 的无碰撞编码：`[A-Za-z0-9-]` 原样保留，
+/// 其余字节（含 `_`、`@`、`.`）一律转义为 `_XX`（两位小写十六进制）；`_` 自身
+/// 必转义，故不同 identity 不会映射到同一目录。
+pub(super) fn plugin_workspace(data_dir: &Path, plugin_id: &str) -> PathBuf {
+    let mut safe_id = String::with_capacity(plugin_id.len());
+    for b in plugin_id.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' {
+            safe_id.push(b as char);
+        } else {
+            safe_id.push('_');
+            safe_id.push_str(&format!("{b:02x}"));
+        }
+    }
     data_dir.join("plugins-work").join(safe_id)
 }
 
@@ -393,10 +394,15 @@ fn build_guarded_client(
             attempt.follow()
         }));
 
-    if let Some(url) = proxy.resolve().to_proxy_url()
-        && let Ok(p) = reqwest::Proxy::all(&url)
-    {
-        builder = builder.proxy(p);
+    // 无显式代理时必须 no_proxy：否则 reqwest 会静默继承环境/系统代理，请求改由
+    // 代理解析主机名，GuardResolver 的 DNS 级内网过滤随之失效。
+    match proxy.resolve().to_proxy_url() {
+        Some(url) => {
+            if let Ok(p) = reqwest::Proxy::all(&url) {
+                builder = builder.proxy(p);
+            }
+        }
+        None => builder = builder.no_proxy(),
     }
 
     builder
@@ -810,6 +816,32 @@ impl PluginBridge for EngineBridge {
                 "recordArtifact: 非法产物文件名: {file_name:?}"
             )));
         }
+        // 产物必须是任务 save_dir 下已存在、且与任务主文件同 stem 起头的文件：
+        // 否则插件可把同目录任意无关文件登记为产物，随「删除任务并删除文件」被删。
+        let task = self
+            .db
+            .load_task_by_id(task_id)
+            .await
+            .map_err(|e| PluginError::Runtime(format!("recordArtifact 读取任务失败: {e}")))?
+            .ok_or_else(|| PluginError::Runtime("recordArtifact: 任务不存在".to_string()))?;
+        let stem = Path::new(&task.file_name)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if stem.is_empty() || !file_name.starts_with(stem) {
+            return Err(PluginError::Runtime(format!(
+                "recordArtifact: 产物须以任务文件名主干 '{stem}' 开头: {file_name:?}"
+            )));
+        }
+        let is_file = tokio::fs::metadata(Path::new(&task.save_dir).join(file_name))
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        if !is_file {
+            return Err(PluginError::Runtime(format!(
+                "recordArtifact: 产物文件不存在: {file_name:?}"
+            )));
+        }
         self.db
             .add_task_artifact(task_id, file_name)
             .await
@@ -879,6 +911,15 @@ impl PluginBridge for EngineBridge {
         })
     }
 
+    async fn remove_plugin_workspace(&self, plugin_id: &str) {
+        let dir = plugin_workspace(&self.data_dir, plugin_id);
+        if let Err(e) = tokio::fs::remove_dir_all(&dir).await
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log_info!("[plugin:{}] 清理工作区失败（已忽略）: {}", plugin_id, e);
+        }
+    }
+
     async fn run_ytdlp(
         &self,
         plugin_id: &str,
@@ -905,7 +946,7 @@ impl PluginBridge for EngineBridge {
         // yt-dlp 的合并（bestvideo+bestaudio）/抽音（-x）/remux/recode 等后处理依赖
         // ffmpeg。托管 ffmpeg 落在 <data_dir>/bin，不在 PATH，yt-dlp 默认找不到；这里
         // 解析生效 ffmpeg（manual→managed→system）并经 `--ffmpeg-location` 注入。插件
-        // 自带的 `--ffmpeg-location` 仍在黑名单中被拒（防指向任意二进制），宿主注入的
+        // 自带的 `--ffmpeg-location` 不在参数白名单内而被拒（防指向任意二进制），宿主注入的
         // 可信路径是唯一来源——两组件由此协同，且不放大攻击面。
         let ffmpeg = crate::components::resolve_ffmpeg(&self.db, &self.data_dir).await;
 
@@ -950,13 +991,16 @@ impl PluginBridge for EngineBridge {
             .unwrap_or(YTDLP_DEFAULT_TIMEOUT)
             .min(YTDLP_MAX_TIMEOUT);
 
-        // 5) 并发限流。
-        let _permit = self
-            .ytdlp_sema
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| PluginError::Runtime("yt-dlp semaphore closed".to_string()))?;
+        // 5) 并发限流。排队等待不计入脚本墙钟（见 `WallPause`），否则批量解析时
+        //    后排任务会把排队误判为插件超时并计入熔断。
+        let _permit = {
+            let _pause = spec.wall_pause.as_ref().map(|p| p.wait());
+            self.ytdlp_sema
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| PluginError::Runtime("yt-dlp semaphore closed".to_string()))?
+        };
 
         // 6) 启动。`--ignore-config` 前置注入（挡 ambient 配置里的 --exec 等）；
         //    stdin=null；kill_on_drop 保超时/取消时清进程。
@@ -1156,8 +1200,9 @@ async fn run_jailed_tool(
     })
 }
 
-/// 校验 ffmpeg 参数：仅封堵网络协议与越牢路径引用，其余（滤镜/编码器/复用器
-/// /元数据…）近乎全量放行。文件引用一律相对 cwd（牢笼根/subdir）。
+/// 校验 ffmpeg 参数：封堵网络协议、越牢路径引用，以及能绕过路径检查的二级语法
+/// （tee 复用器、带引号/转义的滤镜值、从文件读取选项/列表的开关）；其余
+/// （滤镜/编码器/元数据…）近乎全量放行。文件引用一律相对 cwd（牢笼根/subdir）。
 fn validate_ffmpeg_args(args: &[String]) -> Result<(), PluginError> {
     for a in args {
         if a.len() > MAX_FFMPEG_ARG_LEN {
@@ -1176,9 +1221,49 @@ fn validate_ffmpeg_args(args: &[String]) -> Result<(), PluginError> {
 }
 
 /// 单参数拒绝原因（`None` = 放行）。判定：绝对路径 / 盘符 / `..` / URL scheme /
-/// 协议前缀 / 内嵌绝对路径。除法（`30000/1001`）、流选择器（`0:a`/`-c:v`）、
-/// 滤镜分隔（`scale=1280:720`）等合法语法均放行。
+/// 协议前缀 / 内嵌绝对路径 / tee 与读文件类开关。除法（`30000/1001`）、流选择器
+/// （`0:a`/`-c:v`）、滤镜分隔（`scale=1280:720`）等合法语法均放行。
 fn arg_reject_reason(a: &str) -> Option<&'static str> {
+    if let Some(r) = ffmpeg_option_reject_reason(a) {
+        return Some(r);
+    }
+    if let Some(r) = ffmpeg_path_reject_reason(a) {
+        return Some(r);
+    }
+    // 滤镜语法允许用 `'`/`"`/`\` 转义包裹值（如 `movie='/abs'`、`C\:/x`），去掉
+    // 转义后再判一次，避免引号挡住 `=/` 之类的字面模式。
+    if a.contains(['\'', '"', '\\']) {
+        let plain: String = a
+            .chars()
+            .filter(|c| !matches!(c, '\'' | '"' | '\\'))
+            .collect();
+        if let Some(r) = ffmpeg_path_reject_reason(&plain) {
+            return Some(r);
+        }
+    }
+    None
+}
+
+/// tee 复用器（`|` 分隔的多输出可写任意路径）、协议白/黑名单覆盖、从文件读取
+/// 选项值或 concat 的 `-safe`：这些开关本身即越牢手段，整体拒绝。
+fn ffmpeg_option_reject_reason(a: &str) -> Option<&'static str> {
+    if a.eq_ignore_ascii_case("tee") {
+        return Some("tee 复用器");
+    }
+    if a.starts_with("-/") {
+        return Some("从文件读取选项值");
+    }
+    let name = a.strip_prefix('-')?;
+    let name = name.split(':').next().unwrap_or(name);
+    match name {
+        "safe" => Some("-safe"),
+        "protocol_whitelist" | "protocol_blacklist" => Some("协议白/黑名单覆盖"),
+        "filter_script" | "filter_complex_script" => Some("从文件读取滤镜图"),
+        _ => None,
+    }
+}
+
+fn ffmpeg_path_reject_reason(a: &str) -> Option<&'static str> {
     // 绝对路径 / 分隔符开头。
     if a.starts_with('/') || a.starts_with('\\') {
         return Some("绝对路径");
@@ -1214,6 +1299,16 @@ fn arg_reject_reason(a: &str) -> Option<&'static str> {
     if a.contains("=/") || a.contains("=\\") || a.contains(":/") || a.contains(":\\") {
         return Some("内嵌绝对路径");
     }
+    // 滤镜/多输出语法的分段：任一段以绝对路径或盘符起头（`a.mkv|/abs`、`[v]/abs`）。
+    for tok in a.split(['|', ',', ';', '[', ']']) {
+        let tb = tok.as_bytes();
+        if tok.starts_with('/') || tok.starts_with('\\') {
+            return Some("内嵌绝对路径");
+        }
+        if tb.len() >= 2 && tb[1] == b':' && tb[0].is_ascii_alphabetic() {
+            return Some("盘符路径");
+        }
+    }
     None
 }
 
@@ -1230,27 +1325,189 @@ fn truncate_utf8(bytes: &[u8], cap: usize) -> (String, bool) {
     (s[..end].to_string(), true)
 }
 
-/// 会执行外部程序 / 加载任意配置或插件 / 读浏览器凭据的 yt-dlp 开关黑名单
-/// （突破沙箱边界，一律拒绝）；另含 `--ffmpeg-location`——由宿主在 `run_ytdlp`
-/// 中权威注入，插件自带的一律拒绝，防止指向任意二进制。
-const YTDLP_BLOCKED_FLAGS: [&str; 13] = [
-    "--exec",
-    "--exec-before-download",
-    "--downloader",
-    "--external-downloader",
-    "--config-location",
-    "--config-locations",
-    "--plugin-dirs",
-    "--ffmpeg-location",
-    "--batch-file",
-    "-a",
-    "--load-info-json",
-    "--load-info",
-    "--cookies-from-browser",
+/// yt-dlp 选项的取值形态。白名单按「是否带值、带几个值」建表，才能分清选项值与
+/// 位置参数，并对路径型选项的值做牢笼校验。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum YtdlpOpt {
+    /// 不带值的开关。
+    Flag,
+    /// 带一个不含路径语义的值。
+    Value,
+    /// `--js-runtimes`：只允许裸运行时名（可执行路径由宿主/PATH 负责）。
+    JsRuntime,
+    /// 带一个牢笼内相对路径。
+    Path,
+    /// 带一个 `[TYPES:]PATH`（`-o` / `-P`）。
+    TypedPath,
+    /// `--print-to-file TEMPLATE FILE`（两个值，后者为路径）。
+    PrintToFile,
+}
+
+/// 仅规范长选项全名（禁缩写）与少数独立出现的短选项。凡会执行外部程序、加载
+/// 配置/插件、读浏览器或 netrc 凭据、给 ffmpeg/下载器注入任意参数、别名重定义
+/// 选项的开关（`--exec*` / `--netrc*` / `--use-postprocessor` / `--alias` /
+/// `--*-args` 的 postprocessor/downloader 变体 / `--config-*` / `--plugin-dirs` /
+/// `--load-info-json` / `--batch-file` / `--ffmpeg-location` …）均不在表内。
+/// `--ffmpeg-location` 由宿主权威注入。
+fn ytdlp_option_kind(name: &str) -> Option<YtdlpOpt> {
+    use YtdlpOpt::{Flag, JsRuntime, Path, PrintToFile, TypedPath, Value};
+    Some(match name {
+        "-J"
+        | "-j"
+        | "-q"
+        | "-v"
+        | "-s"
+        | "-x"
+        | "-F"
+        | "-i"
+        | "-4"
+        | "-6"
+        | "-k"
+        | "--version"
+        | "--dump-json"
+        | "--dump-single-json"
+        | "--simulate"
+        | "--skip-download"
+        | "--quiet"
+        | "--verbose"
+        | "--no-warnings"
+        | "--no-progress"
+        | "--ignore-errors"
+        | "--no-abort-on-error"
+        | "--no-playlist"
+        | "--yes-playlist"
+        | "--flat-playlist"
+        | "--no-flat-playlist"
+        | "--lazy-playlist"
+        | "--playlist-reverse"
+        | "--force-ipv4"
+        | "--force-ipv6"
+        | "--geo-bypass"
+        | "--no-geo-bypass"
+        | "--no-check-certificates"
+        | "--check-formats"
+        | "--list-formats"
+        | "--live-from-start"
+        | "--no-live-from-start"
+        | "--no-mtime"
+        | "--restrict-filenames"
+        | "--windows-filenames"
+        | "--no-cache-dir"
+        | "--extract-audio"
+        | "--keep-video"
+        | "--no-keep-video"
+        | "--write-info-json"
+        | "--write-description"
+        | "--write-thumbnail"
+        | "--write-subs"
+        | "--write-auto-subs"
+        | "--no-write-subs"
+        | "--embed-subs"
+        | "--embed-thumbnail"
+        | "--embed-metadata"
+        | "--embed-chapters"
+        | "--no-part"
+        | "--no-continue"
+        | "--no-js-runtimes"
+        | "--mark-watched"
+        | "--no-mark-watched"
+        | "--hls-prefer-native"
+        | "--hls-use-mpegts"
+        | "--no-hls-use-mpegts" => Flag,
+        "-f"
+        | "-S"
+        | "-N"
+        | "-r"
+        | "-R"
+        | "--format"
+        | "--format-sort"
+        | "--extractor-args"
+        | "--playlist-items"
+        | "--playlist-start"
+        | "--playlist-end"
+        | "--max-downloads"
+        | "--proxy"
+        | "--socket-timeout"
+        | "--source-address"
+        | "--geo-verification-proxy"
+        | "--geo-bypass-country"
+        | "--geo-bypass-ip-block"
+        | "--xff"
+        | "--user-agent"
+        | "--referer"
+        | "--add-header"
+        | "--sleep-interval"
+        | "--min-sleep-interval"
+        | "--max-sleep-interval"
+        | "--sleep-requests"
+        | "--sleep-subtitles"
+        | "--retries"
+        | "--extractor-retries"
+        | "--fragment-retries"
+        | "--file-access-retries"
+        | "--retry-sleep"
+        | "--concurrent-fragments"
+        | "--limit-rate"
+        | "--throttled-rate"
+        | "--http-chunk-size"
+        | "--buffer-size"
+        | "--min-filesize"
+        | "--max-filesize"
+        | "--date"
+        | "--datebefore"
+        | "--dateafter"
+        | "--match-filters"
+        | "--match-filter"
+        | "--age-limit"
+        | "--download-sections"
+        | "--merge-output-format"
+        | "--remux-video"
+        | "--recode-video"
+        | "--audio-format"
+        | "--audio-quality"
+        | "--sub-langs"
+        | "--sub-format"
+        | "--convert-subs"
+        | "--convert-thumbnails"
+        | "--impersonate"
+        | "--print"
+        | "--compat-options"
+        | "--video-password"
+        | "--username"
+        | "--password"
+        | "--twofactor"
+        | "--encoding"
+        | "--output-na-placeholder" => Value,
+        "--js-runtimes" => JsRuntime,
+        "--cookies" | "--cache-dir" | "--download-archive" => Path,
+        "-o" | "--output" | "-P" | "--paths" => TypedPath,
+        "--print-to-file" => PrintToFile,
+        _ => return None,
+    })
+}
+
+/// `-o`/`-P` 值可带的 `TYPE:` 前缀（yt-dlp 输出类型）。
+const YTDLP_PATH_TYPES: [&str; 16] = [
+    "home",
+    "temp",
+    "default",
+    "subtitle",
+    "thumbnail",
+    "description",
+    "annotation",
+    "infojson",
+    "link",
+    "pl_thumbnail",
+    "pl_description",
+    "pl_infojson",
+    "chapter",
+    "pl_video",
+    "pl_subtitle",
+    "pl_chapter",
 ];
 
-/// 校验 yt-dlp 参数：放行 URL（yt-dlp 本职），封越牢文件路径 + 封会执行外部
-/// 程序 / 加载任意配置或插件的开关。
+/// 校验 yt-dlp 参数：选项走白名单（见 [`ytdlp_option_kind`]），位置参数只允许
+/// http/https URL，路径型选项的值做牢笼校验。被拒时错误信息写出开关名。
 fn validate_ytdlp_args(args: &[String]) -> Result<(), PluginError> {
     for a in args {
         if a.len() > MAX_YTDLP_ARG_LEN {
@@ -1259,60 +1516,153 @@ fn validate_ytdlp_args(args: &[String]) -> Result<(), PluginError> {
         if a.contains('\0') {
             return Err(PluginError::InvalidOutput("yt-dlp 参数含 NUL".to_string()));
         }
-        if let Some(reason) = ytdlp_arg_reject_reason(a) {
-            return Err(PluginError::InvalidOutput(format!(
-                "yt-dlp 参数 '{a}' 被拒: {reason}"
-            )));
-        }
     }
-    Ok(())
+    match ytdlp_args_reject_reason(args) {
+        Some(reason) => Err(PluginError::InvalidOutput(format!(
+            "yt-dlp 参数被拒: {reason}"
+        ))),
+        None => Ok(()),
+    }
 }
 
-/// 单参数拒绝原因（`None` = 放行）。放行网络 URL；拒绝 `file:` 本地方案、危险
-/// 开关、绝对路径 / 盘符 / `..` / 内嵌绝对路径（`type:/abs` 形式的 `--paths`）。
-fn ytdlp_arg_reject_reason(a: &str) -> Option<&'static str> {
-    // 危险开关（含 `--flag=value` 形式，取 `=` 前的 flag 部分比较）。
-    let flag = a.split('=').next().unwrap_or(a);
-    if YTDLP_BLOCKED_FLAGS.contains(&flag) {
-        return Some("危险开关");
+/// 整条参数列表的拒绝原因（`None` = 放行）。
+fn ytdlp_args_reject_reason(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    let mut positional_only = false;
+    while let Some(a) = it.next() {
+        if positional_only || !a.starts_with('-') {
+            if let Some(r) = ytdlp_url_reject_reason(a) {
+                return Some(format!("位置参数 '{a}': {r}"));
+            }
+            continue;
+        }
+        if a == "--" {
+            positional_only = true;
+            continue;
+        }
+        // 长选项支持 `--name=value`；短选项只接受独立出现（`-fvalue` / `-Jq` 不在表内）。
+        let (name, inline) = if a.starts_with("--") {
+            match a.split_once('=') {
+                Some((n, v)) => (n, Some(v)),
+                None => (a.as_str(), None),
+            }
+        } else {
+            (a.as_str(), None)
+        };
+        let Some(kind) = ytdlp_option_kind(name) else {
+            return Some(format!("开关 '{name}' 不在允许列表内"));
+        };
+        if kind == YtdlpOpt::Flag {
+            if inline.is_some() {
+                return Some(format!("开关 '{name}' 不接受值"));
+            }
+            continue;
+        }
+        if kind == YtdlpOpt::PrintToFile && inline.is_some() {
+            return Some(format!("开关 '{name}' 需以两个独立参数给值"));
+        }
+        let Some(value) = inline.or_else(|| it.next().map(String::as_str)) else {
+            return Some(format!("开关 '{name}' 缺少值"));
+        };
+        let bad = match kind {
+            YtdlpOpt::Flag | YtdlpOpt::Value => None,
+            YtdlpOpt::JsRuntime => ytdlp_js_runtime_reject_reason(value),
+            YtdlpOpt::Path => ytdlp_path_reject_reason(value),
+            YtdlpOpt::TypedPath => ytdlp_path_reject_reason(strip_ytdlp_path_type(value)),
+            // 第一个值是输出模板（不落盘），第二个才是目标文件。
+            YtdlpOpt::PrintToFile => match it.next() {
+                Some(file) => ytdlp_path_reject_reason(file),
+                None => Some("缺少文件参数"),
+            },
+        };
+        if let Some(r) = bad {
+            return Some(format!("开关 '{name}' 的值被拒: {r}"));
+        }
     }
-    // file: 本地方案拒绝；其余 URL（http/https/ftp/rtmp/…）放行——yt-dlp 本职。
-    if a.to_ascii_lowercase().starts_with("file:") {
-        return Some("file: 本地方案");
+    None
+}
+
+fn ytdlp_url_reject_reason(a: &str) -> Option<&'static str> {
+    let lower = a.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        None
+    } else {
+        Some("位置参数只允许 http/https URL")
     }
-    if a.contains("://") {
-        return None;
+}
+
+fn ytdlp_js_runtime_reject_reason(v: &str) -> Option<&'static str> {
+    if !v.is_empty()
+        && v.bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b',' || c == b'_' || c == b'-')
+    {
+        None
+    } else {
+        Some("只允许不带路径的运行时名")
     }
-    // 非 URL：按路径校验。绝对路径 / 分隔符开头。
-    if a.starts_with('/') || a.starts_with('\\') {
+}
+
+fn strip_ytdlp_path_type(v: &str) -> &str {
+    match v.split_once(':') {
+        Some((ty, rest)) if YTDLP_PATH_TYPES.contains(&ty) => rest,
+        _ => v,
+    }
+}
+
+/// 路径型值拒绝原因：yt-dlp 会对路径做 `expandvars(expanduser())`，所以 `~` /
+/// `$VAR` / `%VAR%` 与绝对路径、盘符、`..` 一样能逃出牢笼。`%(title)s` 这类输出
+/// 模板字段不是环境变量形态，放行。
+fn ytdlp_path_reject_reason(v: &str) -> Option<&'static str> {
+    if v.starts_with('~') {
+        return Some("~ 家目录展开");
+    }
+    if v.contains('$') {
+        return Some("$ 变量展开");
+    }
+    if has_percent_env_var(v) {
+        return Some("%VAR% 变量展开");
+    }
+    if v.starts_with('/') || v.starts_with('\\') {
         return Some("绝对路径");
     }
-    // Windows 盘符：`X:` 结尾或 `X:/`、`X:\`（不误伤含单字符前缀的普通值如 `A:b`）。
-    let b = a.as_bytes();
-    if b.len() >= 2
-        && b[0].is_ascii_alphabetic()
-        && b[1] == b':'
-        && (b.len() == 2 || b[2] == b'/' || b[2] == b'\\')
-    {
+    let b = v.as_bytes();
+    if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
         return Some("盘符路径");
     }
-    // `..` 路径段（含内嵌 `foo/../bar`）。
-    if a.split(['/', '\\']).any(|seg| seg == "..") {
+    if v.split(['/', '\\']).any(|seg| seg == "..") {
         return Some(".. 越级");
     }
-    // 选项值内嵌的绝对路径（如 `--paths home:/abs`、`temp:C\:\x`）。
-    if a.contains(":/") || a.contains(":\\") {
+    if v.contains(":/") || v.contains(":\\") {
         return Some("内嵌绝对路径");
     }
     None
+}
+
+/// 是否含 `%NAME%` 形态（NAME 为 `[A-Za-z_][A-Za-z0-9_]*`）。
+fn has_percent_env_var(v: &str) -> bool {
+    let b = v.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 1 < b.len() && (b[i + 1].is_ascii_alphabetic() || b[i + 1] == b'_') {
+            let mut j = i + 1;
+            while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                j += 1;
+            }
+            if j < b.len() && b[j] == b'%' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         arg_reject_reason, collect_response_headers, is_globally_routable_unicast,
-        normalize_explicit_auth_ref, truncate_utf8, validate_ffmpeg_args, validate_ytdlp_args,
-        ytdlp_arg_reject_reason,
+        normalize_explicit_auth_ref, plugin_workspace, truncate_utf8, validate_ffmpeg_args,
+        validate_ytdlp_args, ytdlp_args_reject_reason,
     };
     use std::net::IpAddr;
 
@@ -1398,68 +1748,143 @@ mod tests {
         assert!(validate_ffmpeg_args(&["/abs".into()]).is_err());
     }
 
+    fn ytdlp_args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn ytdlp_args_accept_urls_and_relative() {
-        // URL（本职）、相对输出模板、格式选择器、含冒号的头部/路径类型前缀，均放行。
-        for a in [
-            "-J",
-            "--no-warnings",
-            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-            "http://example.com/a?x=1&y=2",
-            "-f",
-            "bestvideo+bestaudio/best",
-            "-o",
-            "%(title)s.%(ext)s",
-            "--paths",
-            "temp:sub",
-            "--add-header",
-            "Referer:https://site.example/",
-            "--add-header",
-            "A:b",
-            "--download-sections",
-            "*00:01:00-00:02:00",
-            "--merge-output-format",
-            "mp4",
+    fn ytdlp_args_accept_example_plugin_and_relative_paths() {
+        // examples/plugins/ytdlp 实际使用的参数集 + 相对输出模板/路径类型前缀。
+        for set in [
+            vec![
+                "-J",
+                "--no-warnings",
+                "--extractor-args",
+                "youtube:player_client=default,web_safari",
+                "-f",
+                "bestvideo+bestaudio/best",
+                "--playlist-items",
+                "2",
+                "--js-runtimes",
+                "node",
+                "--cookies",
+                "cookies.txt",
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            ],
+            vec![
+                "--no-playlist",
+                "--proxy=http://127.0.0.1:7890",
+                "http://example.com/a?x=1&y=2",
+            ],
+            vec!["-o", "%(title)s.%(ext)s", "--paths", "temp:sub"],
+            vec![
+                "--add-header",
+                "Referer:https://site.example/",
+                "--merge-output-format=mp4",
+            ],
+            vec!["--download-sections", "*00:01:00-00:02:00", "--version"],
+        ] {
+            assert_eq!(ytdlp_args_reject_reason(&ytdlp_args(&set)), None, "{set:?}");
+        }
+    }
+
+    #[test]
+    fn ytdlp_args_reject_non_whitelisted_switch_forms() {
+        // 类别：危险开关全名 / 长选项缩写 / 合并或紧贴值的短选项 / 别名 / 执行类。
+        for set in [
+            vec!["--exec", "x"],
+            vec!["--exec=x"],
+            vec!["--exec-before-download", "x"],
+            vec!["--config-loc", "x"],
+            vec!["--config-locations", "x"],
+            vec!["--plugin-d", "x"],
+            vec!["--external-down", "x"],
+            vec!["--batch-f", "x"],
+            vec!["-a", "x"],
+            vec!["-afile"],
+            vec!["-Jq"],
+            vec!["-fbest"],
+            vec!["--alias", "x"],
+            vec!["--netrc-cmd", "x"],
+            vec!["--use-postprocessor", "x"],
+            vec!["--postprocessor-args", "x"],
+            vec!["--ppa", "x"],
+            vec!["--ffmpeg-location", "x"],
+            vec!["--cookies-from-browser", "x"],
+            vec!["--load-info-json", "x"],
+            vec!["--no-warn"],
         ] {
             assert!(
-                ytdlp_arg_reject_reason(a).is_none(),
-                "'{a}' should be accepted, got {:?}",
-                ytdlp_arg_reject_reason(a)
+                ytdlp_args_reject_reason(&ytdlp_args(&set)).is_some(),
+                "{set:?} should be rejected"
             );
         }
     }
 
     #[test]
-    fn ytdlp_args_reject_dangerous_flags_and_escape() {
-        // 危险开关（执行外部程序/加载配置或插件/读浏览器凭据）+ 越牢路径，逐一拒绝。
-        for a in [
-            "--exec",
-            "--exec=rm -rf x",
-            "--exec-before-download",
-            "-a",
-            "--batch-file",
-            "--downloader",
-            "--external-downloader",
-            "--config-location",
-            "--config-locations",
-            "--plugin-dirs",
-            "--ffmpeg-location",
-            "--load-info-json",
-            "--load-info",
-            "--cookies-from-browser",
-            "/etc/passwd",
-            "\\\\server\\share",
-            "C:\\Windows\\system32",
-            "../secret",
-            "a/../../b",
-            "file:///etc/passwd",
-            "home:/abs/dir",
+    fn ytdlp_args_reject_arity_and_positional_violations() {
+        for set in [
+            vec!["-J=1"],
+            vec!["-f"],
+            vec!["--print-to-file", "%(id)s"],
+            vec!["/etc/passwd"],
+            vec!["file:///etc/passwd"],
+            vec!["ftp://example.com/x"],
+            vec!["--js-runtimes", "node:relative/bin"],
+            vec!["--", "rel.txt"],
         ] {
             assert!(
-                ytdlp_arg_reject_reason(a).is_some(),
-                "'{a}' should be rejected"
+                ytdlp_args_reject_reason(&ytdlp_args(&set)).is_some(),
+                "{set:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn ytdlp_args_jail_path_option_values() {
+        // 路径型选项的值：绝对 / 盘符 / `..` / 家目录 / 变量展开，以及把 `://` 夹在
+        // 路径里伪装 URL，一律拒绝；输出模板字段 `%(x)s` 不误伤。
+        for (opt, v) in [
+            ("-o", "/abs/%(title)s"),
+            ("-o", "~/x"),
+            ("-o", "$HOME/x"),
+            ("-o", "%APPDATA%\\x"),
+            ("-o", "../x"),
+            ("-o", "C:\\x"),
+            ("-o", "/abs://x"),
+            ("-P", "home:/abs"),
+            ("-P", "temp:~/x"),
+            ("--paths", "thumbnail:..\\x"),
+            ("--cookies", "/etc/x"),
+            ("--download-archive", "$X/a"),
+            ("--cache-dir", "~"),
+        ] {
+            assert!(
+                ytdlp_args_reject_reason(&ytdlp_args(&[opt, v])).is_some(),
+                "{opt} {v} should be rejected"
+            );
+        }
+        assert!(
+            ytdlp_args_reject_reason(&ytdlp_args(&["--print-to-file", "%(id)s", "/abs/x"]))
+                .is_some()
+        );
+        assert_eq!(
+            ytdlp_args_reject_reason(&ytdlp_args(&["-o", "%(title)s [%(id)s].%(ext)s"])),
+            None
+        );
+        assert_eq!(
+            ytdlp_args_reject_reason(&ytdlp_args(&["--print-to-file", "%(id)s", "ids.txt"])),
+            None
+        );
+    }
+
+    #[test]
+    fn ytdlp_rejection_names_the_switch() {
+        let err = validate_ytdlp_args(&["--exec".into(), "x".into()])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(err.contains("--exec"), "{err}");
     }
 
     #[test]
@@ -1467,6 +1892,44 @@ mod tests {
         assert!(validate_ytdlp_args(&["-J".into(), "https://x/y".into()]).is_ok());
         assert!(validate_ytdlp_args(&["bad\0name".into()]).is_err());
         assert!(validate_ytdlp_args(&["--exec".into()]).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_args_reject_tee_and_quoted_filter_paths() {
+        for a in [
+            "tee",
+            "out.mkv|/abs/x",
+            "[f=mp4]/abs/x",
+            "movie='/abs/x'",
+            "movie=C\\:/x",
+            "subtitles=\"/abs/x\"",
+            "-safe",
+            "-protocol_whitelist",
+            "-filter_script:v",
+            "-filter_complex_script",
+            "-/vf",
+        ] {
+            assert!(arg_reject_reason(a).is_some(), "'{a}' should be rejected");
+        }
+        // 相对路径的合法滤镜（含引号转义）不误伤。
+        assert!(arg_reject_reason("subtitles='sub.srt'").is_none());
+        assert!(arg_reject_reason("drawtext=text='hi there':x=10").is_none());
+        assert!(arg_reject_reason("join=map=0.0-FL|1.0-FR").is_none());
+    }
+
+    #[test]
+    fn plugin_workspace_is_collision_free() {
+        let root = std::path::Path::new("/d");
+        assert_ne!(
+            plugin_workspace(root, "a_b@c"),
+            plugin_workspace(root, "a@b_c")
+        );
+        assert_ne!(
+            plugin_workspace(root, "a_40b"),
+            plugin_workspace(root, "a@b")
+        );
+        let p = plugin_workspace(root, "../x@y");
+        assert_eq!(p.parent(), Some(root.join("plugins-work").as_path()));
     }
 
     #[test]

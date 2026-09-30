@@ -44,6 +44,7 @@ fn spec(args: &[&str]) -> YtdlpSpec {
         args: args.iter().map(|s| s.to_string()).collect(),
         subdir: None,
         timeout_ms: Some(30_000),
+        wall_pause: None,
     }
 }
 
@@ -115,10 +116,10 @@ async fn fs_roundtrip_in_workspace() {
         .await
         .expect("fs_write");
 
-    // 工作区 = <data_dir>/plugins-work/cookie_yt（与 run_ytdlp 的 cwd 同根）。
+    // 工作区 = <data_dir>/plugins-work/cookie_40yt（身份按字节无碰撞编码，与 run_ytdlp 的 cwd 同根）。
     let path = data_dir
         .join("plugins-work")
-        .join("cookie_yt")
+        .join("cookie_40yt")
         .join("cookies.txt");
     assert!(path.is_file(), "file must land in workspace: {path:?}");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), body);

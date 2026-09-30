@@ -79,10 +79,6 @@ impl InstallOutcome {
     pub(crate) fn identity(&self) -> &str {
         &self.identity
     }
-
-    pub(crate) fn has_backup(&self) -> bool {
-        self.backup.is_some()
-    }
 }
 
 fn install_staged_dir(

@@ -495,7 +495,7 @@ globalThis.resolve = async (ctx) => {
     await flux.fs.writeFile('cookies.txt', cookiesText);
     args.push('--cookies', 'cookies.txt');
   }
-  // 附加参数（高级）：追加到命令末尾（URL 之前）。FluxDown bridge 二次拦截危险开关。
+  // 附加参数（高级）：追加到命令末尾（URL 之前）。FluxDown bridge 按白名单校验（仅放行规范长选项全名）。
   var extra = parseExtraArgs(flux.settings.extraArgs);
   for (var ei = 0; ei < extra.length; ei++) args.push(extra[ei]);
   args.push(ctx.url);
@@ -515,7 +515,7 @@ globalThis.resolve = async (ctx) => {
   try {
     r = await flux.ytdlp.run({
       args: args,
-      timeoutMs: 40 * 1000,
+      timeoutMs: 25 * 1000,
     });
   } catch (e) {
     throw new Error('yt-dlp 调用异常: ' + String(e));
@@ -538,7 +538,7 @@ globalThis.resolve = async (ctx) => {
     }
   }
 
-  if (r.timedOut) throw new Error('yt-dlp 解析超时（40s）: ' + ctx.url);
+  if (r.timedOut) throw new Error('yt-dlp 解析超时（25s）: ' + ctx.url);
 
   // 关键：yt-dlp 遇 bot 风控时退出码可能为 0 但 stdout 输出 "null"/空。
   // 不能只看 r.code——须校验 stdout 为合法非空对象，否则给出友好错误。

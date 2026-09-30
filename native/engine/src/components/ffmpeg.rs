@@ -237,6 +237,11 @@ mod install {
 
     /// BtbN/FFmpeg-Builds latest Release 的 GitHub API 端点。
     const RELEASE_API: &str = "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest";
+    /// 资产与校验文件必须位于此上游 release 下载前缀内。
+    const UPSTREAM_DOWNLOAD_PREFIX: &str =
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/";
+    /// BtbN 每个 release 附带的 sha256sum 格式校验文件。
+    const CHECKSUM_ASSET: &str = "checksums.sha256";
 
     /// 可安装版本列表（解析自 latest Release 的资产名）。
     #[derive(Debug, Clone)]
@@ -328,20 +333,20 @@ mod install {
         let assets = release["assets"].as_array().unwrap_or(&empty);
 
         // 选定资产：钉住版本或最新稳定版。
-        let mut candidates: Vec<(String, &str)> = assets
+        let mut candidates: Vec<(String, &str, &str)> = assets
             .iter()
             .filter_map(|a| {
                 let name = a["name"].as_str()?;
                 let url = a["browser_download_url"].as_str()?;
                 let ver = parse_asset_version(name, plat)?;
-                Some((ver, url))
+                Some((ver, url, name))
             })
             .collect();
-        candidates.sort_by_key(|(v, _)| std::cmp::Reverse(version_key(v)));
-        let (chosen_ver, url) = match version {
+        candidates.sort_by_key(|(v, _, _)| std::cmp::Reverse(version_key(v)));
+        let (chosen_ver, url, asset_name) = match version {
             Some(want) => candidates
                 .iter()
-                .find(|(v, _)| v == want)
+                .find(|(v, _, _)| v == want)
                 .ok_or_else(|| ComponentError::NotFound(format!("version {want} ({plat})")))?,
             None => candidates
                 .first()
@@ -349,6 +354,19 @@ mod install {
         };
         let chosen_ver = chosen_ver.clone();
         let url = url.to_string();
+        let asset_name = asset_name.to_string();
+        let sums_url = assets
+            .iter()
+            .find(|a| a["name"].as_str() == Some(CHECKSUM_ASSET))
+            .and_then(|a| a["browser_download_url"].as_str())
+            .ok_or_else(|| ComponentError::NotFound(format!("asset {CHECKSUM_ASSET}")))?
+            .to_string();
+        // 版本 JSON 可能来自官网镜像或用户镜像：资产与校验文件都必须落在上游发布路径下。
+        super::super::require_upstream_asset_url(&url, UPSTREAM_DOWNLOAD_PREFIX)?;
+        super::super::require_upstream_asset_url(&sums_url, UPSTREAM_DOWNLOAD_PREFIX)?;
+        let expected_sha256 =
+            super::super::fetch_expected_sha256(client, &sums_url, &mirror_base, &asset_name)
+                .await?;
 
         // 流式下载到 bin/ 下的临时文件。
         let bin_dir = data_dir.join("bin");
@@ -361,25 +379,29 @@ mod install {
             "tar.xz"
         };
         let archive_path = bin_dir.join(format!("ffmpeg.download.{archive_ext}"));
-        super::super::download_to_file(client, &url, &mirror_base, &archive_path, progress).await?;
+        super::super::download_to_file(
+            client,
+            &url,
+            &mirror_base,
+            &archive_path,
+            &expected_sha256,
+            progress,
+        )
+        .await?;
 
-        // 解压出 `bin/ffmpeg[.exe]`（必需）+ `bin/ffprobe[.exe]`（best-effort）。
-        let extract_result = extract_binaries(&archive_path, &bin_dir).await;
+        // 先解压到暂存目录并探版，通过后才替换 `bin/ffmpeg[.exe]` 与 `bin/ffprobe[.exe]`：
+        // 解压/探版失败不碰原有托管二进制，也不会留下版本错配的 ffprobe。
+        let stage_dir = bin_dir.join("ffmpeg.stage.tmp");
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        tokio::fs::create_dir_all(&stage_dir)
+            .await
+            .map_err(|e| ComponentError::Io(e.to_string()))?;
+        let installed = stage_and_install(&archive_path, &stage_dir, &bin_dir).await;
         let _ = tokio::fs::remove_file(&archive_path).await;
-        extract_result?;
+        let _ = tokio::fs::remove_dir_all(&stage_dir).await;
+        installed?;
 
-        // 安装后验证：能跑 `-version` 才算成功。
         let target = managed_ffmpeg_path(data_dir);
-        let probed = super::probe_version(&target).await;
-        if probed.is_none() {
-            let _ = tokio::fs::remove_file(&target).await;
-            return Err(ComponentError::Verify(
-                "downloaded ffmpeg failed to run; this system may use musl libc \
-                 (e.g. Alpine/OpenWrt) which cannot run the official glibc build — \
-                 install ffmpeg via your system package manager and set a manual path"
-                    .to_string(),
-            ));
-        }
         db.set_config(CONFIG_FFMPEG_MANAGED_VERSION, &chosen_ver)
             .await
             .map_err(|e| ComponentError::Db(e.to_string()))?;
@@ -389,6 +411,39 @@ mod install {
             target.display()
         );
         Ok(super::ffmpeg_status(db, data_dir).await)
+    }
+
+    /// 解压到 `stage_dir`、探测暂存的 ffmpeg 可执行，然后把 ffmpeg（必需）与
+    /// ffprobe（若有）移入 `bin_dir`（同目录 rename，原子替换）。
+    async fn stage_and_install(
+        archive: &Path,
+        stage_dir: &Path,
+        bin_dir: &Path,
+    ) -> Result<(), ComponentError> {
+        extract_binaries(archive, stage_dir).await?;
+        let ffmpeg = super::ffmpeg_binary_name();
+        let ffprobe = super::ffprobe_binary_name();
+        if super::probe_version(&stage_dir.join(ffmpeg))
+            .await
+            .is_none()
+        {
+            return Err(ComponentError::Verify(
+                "downloaded ffmpeg failed to run; this system may use musl libc \
+                 (e.g. Alpine/OpenWrt) which cannot run the official glibc build — \
+                 install ffmpeg via your system package manager and set a manual path"
+                    .to_string(),
+            ));
+        }
+        for name in [ffmpeg, ffprobe] {
+            let staged = stage_dir.join(name);
+            if !staged.is_file() {
+                continue;
+            }
+            tokio::fs::rename(&staged, bin_dir.join(name))
+                .await
+                .map_err(|e| ComponentError::Io(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// 从归档提取 `bin/ffmpeg[.exe]`（必需）与 `bin/ffprobe[.exe]`（best-effort，

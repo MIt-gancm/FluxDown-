@@ -331,11 +331,11 @@ async fn write_slow_rewrite_plugin(dir: &std::path::Path, busy_ms: u64, match_ur
         .expect("write resolve.js");
 }
 
-/// 回归（Bug：resolve 窗口内 pause→resume 竞态）：stale 的 Start outcome 绝不能
-/// 消费掉新世代的 Resume pending 条目——否则 resume 被静默吞掉、任务卡死。
-/// 时序：create 触发 worker A（Start，忙等 300ms）→ pump 之前 pause+resume（产生
-/// worker B / 新世代 pending）→ 依次 pump 两个 outcome：A 必须被世代守卫丢弃，
-/// B 必须正常分派 resume 并完成下载。
+/// 回归（Bug：resolve 窗口内 pause→resume 竞态）：resume 必须被分派并完成下载，
+/// 不能被 stale 的 Start 吞掉。
+/// 时序：create 触发 worker A（Start，忙等 300ms）→ pump 之前 pause+resume：pause 取消
+/// A 的占位 token，A 直接丢弃、不回流；resume 触发 worker B（新世代），B 正常分派
+/// resume 并完成下载。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pause_resume_during_resolve_window_dispatches_resume() {
     let work = std::env::temp_dir().join(format!("fluxdown-plugin-race-{}", uuid_like()));
@@ -394,8 +394,8 @@ async fn pause_resume_during_resolve_window_dispatches_resume() {
         .expect("read result");
     assert_eq!(bytes, FILE_BODY);
     assert_eq!(
-        resolve_count, 2,
-        "应恰好两个 outcome：stale Start（丢弃）+ Resume（分派）"
+        resolve_count, 1,
+        "暂停已取消 Start worker（不回流），只剩 Resume 的一个 outcome"
     );
     let t = engine
         .db

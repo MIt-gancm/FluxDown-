@@ -455,6 +455,55 @@ pub struct YtdlpSpec {
     pub subdir: Option<String>,
     /// 本次调用超时（毫秒）。缺省取 bridge 默认值，并被 bridge 上限裁剪。
     pub timeout_ms: Option<u64>,
+    /// 宿主在 JS 边界注入（不来自插件 JSON）：排队等待 yt-dlp 并发槽的时间由此
+    /// 从脚本墙钟里扣除，避免排队被误判为插件自身超时。
+    #[serde(skip)]
+    pub wall_pause: Option<Arc<WallPause>>,
+}
+
+/// 累计「不应计入脚本墙钟」的排队等待时长（含进行中的等待）。
+#[derive(Debug, Default)]
+pub struct WallPause {
+    state: std::sync::Mutex<WallPauseState>,
+}
+
+#[derive(Debug, Default)]
+struct WallPauseState {
+    done: Duration,
+    waiting: usize,
+    since: Option<std::time::Instant>,
+}
+
+/// 一次排队等待的 RAII 守卫：drop 时结算（覆盖 future 被取消）。
+pub struct WallPauseGuard(Arc<WallPause>);
+
+impl WallPause {
+    pub fn wait(self: &Arc<Self>) -> WallPauseGuard {
+        let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if s.waiting == 0 {
+            s.since = Some(std::time::Instant::now());
+        }
+        s.waiting += 1;
+        WallPauseGuard(self.clone())
+    }
+
+    /// 已结算 + 进行中的等待总时长。
+    pub fn total(&self) -> Duration {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.done + s.since.map(|t| t.elapsed()).unwrap_or_default()
+    }
+}
+
+impl Drop for WallPauseGuard {
+    fn drop(&mut self) {
+        let mut s = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        s.waiting = s.waiting.saturating_sub(1);
+        if s.waiting == 0
+            && let Some(t) = s.since.take()
+        {
+            s.done += t.elapsed();
+        }
+    }
 }
 
 /// `flux.ytdlp.run(spec)` 的返回值。`stdout`/`stderr` 均按 bridge 上限截断。
@@ -718,6 +767,10 @@ pub trait PluginBridge: Send + Sync {
     ) -> Result<YtdlpOutcome, PluginError> {
         Err(PluginError::Runtime("此 bridge 不支持 yt-dlp".to_string()))
     }
+
+    /// 卸载插件时清理其 bridge 自持的 scratch 工作区（flux.fs / yt-dlp cwd）。
+    /// 默认无操作（无工作区的 bridge）。
+    async fn remove_plugin_workspace(&self, _plugin_id: &str) {}
 }
 
 #[cfg(test)]

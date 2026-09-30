@@ -122,12 +122,17 @@ const MAX_FXPLUG_BYTES: usize = 10 * 1024 * 1024;
 /// 索引 JSON 体积上限（流式截断防 OOM；真实索引远小于此，被投毒/损坏的源
 /// 可能返回任意大响应，`.text()` 全量缓冲会被撑爆）。
 const MAX_INDEX_BYTES: usize = 4 * 1024 * 1024;
+/// 包下载最多跟随的重定向跳数。
+const MAX_DOWNLOAD_REDIRECTS: usize = 5;
 
 /// 市场客户端。持有插件管理器（安装）与 Db（高水位持久化）。
 pub struct MarketClient {
     manager: std::sync::Arc<PluginManager>,
     db: Db,
     client: reqwest::Client,
+    /// 包下载专用：重定向逐跳复查 https 与字面量 IP 守卫（初始 URL 的
+    /// `mirror_url_allowed` 只管第一跳）。
+    download_client: reqwest::Client,
     sources: Vec<String>,
 }
 
@@ -146,10 +151,24 @@ impl MarketClient {
             .timeout(std::time::Duration::from_secs(20))
             .build()
             .unwrap_or_default();
+        let download_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= MAX_DOWNLOAD_REDIRECTS {
+                    return attempt.error("too many redirects");
+                }
+                if !parsed_url_allowed(attempt.url()) {
+                    return attempt.error("redirect target rejected by mirror guard");
+                }
+                attempt.follow()
+            }))
+            .build()
+            .unwrap_or_default();
         Self {
             manager,
             db,
             client,
+            download_client,
             sources,
         }
     }
@@ -279,11 +298,14 @@ impl MarketClient {
 
     async fn download_one(&self, url: &str) -> Result<Vec<u8>, MarketError> {
         let resp = self
-            .client
+            .download_client
             .get(url)
             .send()
             .await
             .map_err(|e| MarketError::Network(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(MarketError::Network(format!("HTTP {}", resp.status())));
+        }
         let mut stream_resp = resp;
         let mut buf = Vec::new();
         loop {
@@ -346,12 +368,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// hostname 不做 DNS 级过滤（自托管 LAN 索引经 hostname 仍可用，v1 取舍）；
 /// 完整性由 content_hash 钉住兜底，此守卫只挡最直接的内网探测形态。
 fn mirror_url_allowed(url: &str) -> bool {
-    if !url.starts_with("https://") {
-        return false;
-    }
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    parsed_url_allowed(&parsed)
+}
+
+/// 已解析 URL 的守卫（初始镜像与每一跳重定向共用）：https + 字面量 IP 可全局路由。
+fn parsed_url_allowed(parsed: &url::Url) -> bool {
+    if parsed.scheme() != "https" {
+        return false;
+    }
     if let Some(host) = parsed.host_str() {
         let trimmed = host.trim_matches(|c| c == '[' || c == ']');
         if let Ok(ip) = trimmed.parse::<std::net::IpAddr>()
