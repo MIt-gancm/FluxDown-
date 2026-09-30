@@ -52,7 +52,9 @@ concurrency:
 # 用户首次运行会看到 SmartScreen 提示。审核通过后在各 Windows 打包步骤前恢复签名。
 
 jobs:
-  # ── 前置 Job: 检测上一个版本 tag → 当前 tag 之间哪些组件目录有变更 ──
+  # ── 前置 Job: 检测变更基线 tag → 当前 tag 之间哪些组件目录有变更 ──
+  # 基线 PREV：稳定版 vX.Y.Z 对比上一个稳定版（跳过其间全部 -rc.N：rc 阶段改过的组件都要进稳定版，
+  #            扩展也要在稳定版推商店）；预览版 vX.Y.Z-rc.N 对比上一个任意版本 tag。
   # 规则：
   #   fluxDown/**            → 浏览器扩展（extension）
   #   web/**、native/{agent,daemon,protocol,engine-protocol,api}/** → headless 服务器（server，Docker 镜像 + 多平台二进制）；
@@ -66,7 +68,9 @@ jobs:
   #   website/**             → 官网（独立走 deploy-website.yml 部署，不发 release）
   #   docs/**、*.md          → 纯文档，不触发任何构建
   #   其余任何路径            → 桌面客户端（app）
-  # 找不到上一个 v* tag（首个版本）时全部视为有变更。
+  # 浏览器扩展与其他组件同一套判定：预览版有变动只打包附到 release、不推送各浏览器商店
+  # （商店版本号不可回退，Firefox 也不做 AMO 签名）；稳定版有变动才打包并推送商店。
+  # 找不到基线 tag（首个版本）时全部视为有变更。
   changes:
     name: Detect Changed Components
     runs-on: ubuntu-latest
@@ -80,6 +84,8 @@ jobs:
       any: ${{ steps.detect.outputs.any }}
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      prerelease: ${{ steps.resolve.outputs.prerelease }}
+      prev: ${{ steps.resolve.outputs.prev }}
       source: ${{ steps.resolve.outputs.source }}
       source_is_tag: ${{ steps.resolve.outputs.source_is_tag }}
     steps:
@@ -127,8 +133,8 @@ jobs:
           # 分支守卫：预览版 tag（vX.Y.Z-rc.N）必须打在 main 分支上，
           # 稳定版 tag（vX.Y.Z）必须打在 stable 分支上。打错分支整条流水线在此失败。
           case "$TAG" in
-            *-*) BRANCH=main ;;
-            *)   BRANCH=stable ;;
+            *-*) BRANCH=main; PRERELEASE=true ;;
+            *)   BRANCH=stable; PRERELEASE=false ;;
           esac
           git fetch origin "$BRANCH" --quiet
           if git merge-base --is-ancestor "$TAG_SHA" "origin/$BRANCH"; then
@@ -157,13 +163,24 @@ jobs:
             fi
           fi
 
+          # 变更基线（变更检测与 release notes 共用）：稳定版跳过 -rc.N 找上一个稳定版，
+          # 预览版取上一个任意版本 tag。--match 从头锚定，自动忽略 extension-v* / website-v*
+          # 等历史组件 tag。找不到（首个版本）时为空 = 全量。
+          if [ "$PRERELEASE" = true ]; then
+            PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
+          else
+            PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude 'v*-*' "${TAG}^" 2>/dev/null || true)
+          fi
+
           {
             echo "tag=$TAG"
             echo "version=${TAG#v}"
+            echo "prerelease=$PRERELEASE"
+            echo "prev=$PREV"
             echo "source=$SOURCE_SHA"
             if [ "$SOURCE_SHA" = "$TAG_SHA" ]; then echo "source_is_tag=true"; else echo "source_is_tag=false"; fi
           } >> "$GITHUB_OUTPUT"
-          echo "::notice::Release tag: $TAG · build source: $SOURCE_SHA"
+          echo "::notice::Release tag: $TAG · build source: $SOURCE_SHA · baseline: ${PREV:-<none>}"
 
       - name: Detect changes since previous version tag
         id: detect
@@ -175,10 +192,6 @@ jobs:
           # 手动补发单个组件：只开启被选中的组件，跳过目录 diff 检测；
           # 构建源码不是 tag 本身（带了修复）时补跑引擎门禁。
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$COMPONENT" != "changed" ]; then
-            if [ "$COMPONENT" = "extension" ] && [[ "$TAG" == *-* ]]; then
-              echo "::error::预览版 tag 不发布浏览器扩展（商店版本号不可回退）"
-              exit 1
-            fi
             ENGINE=false
             if [ "${{ steps.resolve.outputs.source_is_tag }}" != "true" ] && [ "$COMPONENT" != "extension" ]; then
               ENGINE=true
@@ -191,9 +204,7 @@ jobs:
             exit 0
           fi
 
-          # 只匹配 v0.1.2 形式的版本 tag（glob 从头锚定，
-          # 自动忽略 release 流程创建的 extension-v* / website-v* 组件 tag）
-          PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
+          PREV="${{ steps.resolve.outputs.prev }}"
 
           APP=false; EXTENSION=false; SERVER=false; MOBILE=false; CLI=false; ENGINE=false
           if [ -z "$PREV" ]; then
@@ -242,8 +253,6 @@ jobs:
             done <<< "$CHANGED"
           fi
 
-          # 浏览器扩展发布后无法更改版本号，故预发布（预览版）tag 不打包扩展。
-          case "$TAG" in *-*) EXTENSION=false ;; esac
           ANY=false
           if $APP || $EXTENSION || $SERVER || $MOBILE || $CLI; then ANY=true; fi
 
@@ -476,7 +485,8 @@ jobs:
     name: Build Browser Extension
     runs-on: ubuntu-latest
     needs: changes
-    # 预发布（预览版）tag 的 extension 恒为 false（changes job 判定：扩展发布后无法更改版本号）。
+    # extension 与其他组件同一套变更判定；预览版只打包附到 release，商店推送 / AMO 签名步骤
+    # 均以 prerelease != 'true' 门控（商店版本号不可回退，预览包不得占用稳定版的版本号）。
     if: needs.changes.outputs.extension == 'true'
 
     steps:
@@ -522,16 +532,28 @@ jobs:
           zip -r ../../build/extension/FluxDown-${VERSION}-chrome.zip chrome-mv3/
           ls -la ../../build/extension/
 
+      # 预览版：Firefox 只出未签名包（manifest 位于 zip 根，可经 about:debugging 临时加载，或在
+      # Developer Edition / Nightly 关闭签名校验后安装）。不走 AMO：unlisted 签名同样占用 AMO
+      # 版本号，预览版的 X.Y.Z.1 会与稳定版冲突，稳定版补签时会下载到预览构建。
+      - name: Package Firefox extension (preview, unsigned)
+        if: needs.changes.outputs.prerelease == 'true'
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          cd fluxDown/.output/firefox-mv2
+          zip -r "../../../build/extension/FluxDown-${VERSION}-firefox-unsigned.zip" .
+
       - name: Install web-ext
+        if: needs.changes.outputs.prerelease != 'true'
         run: npm install -g web-ext
 
-      # ── Firefox 双版本策略：AMO 市场用 X.Y.Z（与 tag 一致），GitHub Release XPI 用 X.Y.Z.1
+      # ── Firefox 双版本策略（仅稳定版）：AMO 市场用 X.Y.Z（与 tag 一致），GitHub Release XPI 用 X.Y.Z.1
       #    两个版本号不同，彻底避免同版本号重复提交冲突。
       #    X.Y.Z   → --channel=listed  → AMO 公开市场，等待人工审核
       #    X.Y.Z.1 → --channel=unlisted → 立即签名，XPI 附到 GitHub Release 供离线安装
 
       # Step 1: 提交 AMO 市场版本（X.Y.Z），continue-on-error 不阻塞 Release
       - name: Submit Firefox to AMO marketplace (listed, vX.Y.Z)
+        if: needs.changes.outputs.prerelease != 'true'
         continue-on-error: true
         run: |
           web-ext sign \
@@ -545,6 +567,7 @@ jobs:
       # Step 2: 将 manifest 版本改为 X.Y.Z.1，unlisted 签名产出 GitHub Release 用 XPI
       # AMO 服务端有时返回 500，continue-on-error 避免阻断整个 Release
       - name: Sign Firefox extension for GitHub Release (unlisted, vX.Y.Z.1)
+        if: needs.changes.outputs.prerelease != 'true'
         continue-on-error: true
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
@@ -607,10 +630,11 @@ jobs:
           path: build/extension/FluxDown-*-chrome.zip
           if-no-files-found: error
 
-      # ── Chrome Web Store 自动发布（需 CHROME_CLIENT_ID / CHROME_CLIENT_SECRET / CHROME_REFRESH_TOKEN）──
+      # ── Chrome Web Store 自动发布（仅稳定版；需 CHROME_CLIENT_ID / CHROME_CLIENT_SECRET / CHROME_REFRESH_TOKEN）──
       # ⚠️  Refresh Token 在 Google OAuth 同意屏幕处于 Testing 模式时 7 天过期。
       #    发布前必须将同意屏幕切换到 Production，再重新走一次 OAuth 流程获取长期 token。
       - name: Publish Chrome extension to Web Store
+        if: needs.changes.outputs.prerelease != 'true'
         continue-on-error: true
         env:
           CHROME_CLIENT_ID: ${{ secrets.CHROME_CLIENT_ID }}
@@ -666,13 +690,14 @@ jobs:
 
           echo "::notice::Chrome extension v${VERSION} submitted to Web Store review"
 
-      # ── Edge Add-ons 商店自动发布（需 EDGE_CLIENT_ID / EDGE_API_KEY / EDGE_PRODUCT_ID）──
+      # ── Edge Add-ons 商店自动发布（仅稳定版；需 EDGE_CLIENT_ID / EDGE_API_KEY / EDGE_PRODUCT_ID）──
       # Edge 复用 Chrome MV3 构建（同为 MV3），但 Edge 商店拒绝 manifest 含 key 字段的包
       # （PackageValidationError: "The manifest shouldn't contain the key field"），
       # 而 Chrome 侧载固定扩展 ID 依赖 key（见 fluxDown/wxt.config.ts），
       # 因此上传前解包剔除 key 重新打一个 Edge 专用 zip。API v1.1：ApiKey 鉴权。
       # ⚠️  API key 每 72 天过期，过期后需在 Partner Center → Publish API 重新生成并更新 EDGE_API_KEY secret。
       - name: Publish Edge extension to Edge Add-ons
+        if: needs.changes.outputs.prerelease != 'true'
         continue-on-error: true
         env:
           EDGE_CLIENT_ID: ${{ secrets.EDGE_CLIENT_ID }}
@@ -735,7 +760,10 @@ jobs:
         with:
           overwrite: true
           name: browser-extension-firefox
-          path: build/extension/FluxDown-*-firefox.xpi
+          # 稳定版：AMO 签名的 .xpi；预览版：未签名 .zip
+          path: |
+            build/extension/FluxDown-*-firefox.xpi
+            build/extension/FluxDown-*-firefox-unsigned.zip
           if-no-files-found: warn
 
   # ── 并行 Job 3: GPUI 桌面客户端 Linux x64：tar.gz / AppImage / deb / Arch ──
@@ -1540,6 +1568,7 @@ jobs:
           C_CLI: ${{ needs.changes.outputs.cli }}
           C_MOBILE: ${{ needs.changes.outputs.mobile }}
           C_EXTENSION: ${{ needs.changes.outputs.extension }}
+          PRERELEASE: ${{ needs.changes.outputs.prerelease }}
         run: |
           SCOPE=""
           add() { SCOPE="${SCOPE:+${SCOPE}、}$1"; }
@@ -1547,7 +1576,13 @@ jobs:
           if [ "$C_SERVER" = true ]; then add "Headless 服务器（含 Web 控制台 / Docker / NAS 套件）"; fi
           if [ "$C_CLI" = true ]; then add "命令行工具 CLI"; fi
           if [ "$C_MOBILE" = true ]; then add "Android 移动端"; fi
-          if [ "$C_EXTENSION" = true ]; then add "浏览器扩展（Chrome / Firefox / Edge）"; fi
+          if [ "$C_EXTENSION" = true ]; then
+            if [ "$PRERELEASE" = true ]; then
+              add "浏览器扩展预览包（Chrome / Edge 解压加载、Firefox 未签名，仅附于本 release，不推送商店）"
+            else
+              add "浏览器扩展（Chrome / Firefox / Edge）"
+            fi
+          fi
           echo "component=${SCOPE}" >> "$GITHUB_OUTPUT"
 
       # AI 撰写面向用户的双语 release notes（素材 = git-cliff + commit 正文 + 变更统计）
@@ -1559,6 +1594,7 @@ jobs:
           component: FluxDown 统一发布，本次包含：${{ steps.scope.outputs.component }}
           fallback-title: Release ${{ needs.changes.outputs.tag }}
           tag: ${{ needs.changes.outputs.tag }}
+          since: ${{ needs.changes.outputs.prev }}
           claude-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
 
       - name: Create or update draft release

@@ -27,6 +27,10 @@ inputs:
     description: 发布 tag（留空则取 GITHUB_REF；手动补跑时必须显式传入）
     required: false
     default: ""
+  since:
+    description: 变更基线 tag（release.yml changes job 的 prev：稳定版 = 上一个稳定版，预览版 = 上一个版本 tag）；留空 = 首个版本，取全部历史
+    required: false
+    default: ""
   claude-token:
     description: CLAUDE_CODE_OAUTH_TOKEN
     required: true
@@ -40,17 +44,28 @@ runs:
   using: composite
   steps:
     # ── 素材 1：git-cliff 的 Conventional Commits 聚合 ──
+    # 区间与变更检测同一基线 since..tag。稳定版区间内含 -rc.N tag，忽略它们以免被切成多个版本区块，
+    # 稳定版说明因此覆盖整个 rc 周期（rc 阶段的改动对稳定渠道用户都是新内容）。
     - name: Collect git-cliff summary
       shell: bash
       run: |
         set -f  # 本步先关 glob，避免 ** 在这里被展开
-        ARGS="--latest --strip header"
+        TAG="${{ inputs.tag }}"
+        [ -n "$TAG" ] || TAG="${GITHUB_REF#refs/tags/}"
+        SINCE="${{ inputs.since }}"
+        ARGS="--strip header"
+        if [ -n "$SINCE" ]; then ARGS="$ARGS ${SINCE}..${TAG}"; else ARGS="$ARGS --latest"; fi
         for p in ${{ inputs.paths }}; do
           # 引号是「字面量」：git-cliff-action 会把 args 裸插进自己的 shell 命令行
           # （run.sh --config=... ${{ inputs.args }}），不带引号的 ** 会在那边被展开成本地路径。
           ARGS="$ARGS --include-path \"$p\""
         done
         echo "CLIFF_ARGS=$ARGS" >> "$GITHUB_ENV"
+        case "$TAG" in
+          *-*) ;;
+          # git-cliff 的环境变量配置覆盖（cliff.toml 的 git.ignore_tags）
+          *) echo 'GIT_CLIFF__GIT__IGNORE_TAGS=^v[0-9]+\.[0-9]+\.[0-9]+-' >> "$GITHUB_ENV" ;;
+        esac
 
     - uses: orhun/git-cliff-action@v4
       with:
@@ -67,8 +82,8 @@ runs:
       run: |
         TAG="${{ inputs.tag }}"
         [ -n "$TAG" ] || TAG="${GITHUB_REF#refs/tags/}"
-        PREV=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${TAG}^" 2>/dev/null || true)
-        RANGE="${PREV:+${PREV}..}${TAG}"
+        SINCE="${{ inputs.since }}"
+        RANGE="${SINCE:+${SINCE}..}${TAG}"
         echo "Context range: ${RANGE}"
 
         set -f  # 同上：** 交给 git pathspec 解释，不能被 shell 先展开

@@ -126,7 +126,8 @@ export const GET: APIRoute = async ({ url }) => {
     // 渠道感知候选池：frontier 放行 prerelease（含稳定版）。桌面客户端、
     // 移动端、服务器与 CLI 均按渠道选取（预发布 tag 会打包这四类组件，
     // 组件无改动时不重建 → frontier 取 SemVer 最大自然回落稳定版）；
-    // 唯浏览器扩展恒取稳定版——商店版本号不可回退，预发布 tag 不打包扩展。
+    // 唯浏览器扩展恒取稳定版——商店版本号不可回退，预发布 tag 的扩展只是附在
+    // release 上的预览包（Firefox 未签名），不推商店，也不作为官网下载。
     // 每个组件独立选取「完整包含该组件」的最新 release（统一 vX.Y.Z release
     // 或历史组件 release，见 lib/release-assets.ts）：某组件本次打包失败时
     // 自然回落到它上一个完整版本，不会拿到半套资产。

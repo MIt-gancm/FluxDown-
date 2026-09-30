@@ -42,6 +42,7 @@ export const changelog = defineMessages({
       extension: "Extension",
       other: "Other",
       rpm: "RPM package",
+      unsigned: "unsigned",
     },
   },
   zh: {
@@ -82,6 +83,7 @@ export const changelog = defineMessages({
       extension: "扩展",
       other: "其他",
       rpm: "RPM 包",
+      unsigned: "未签名",
     },
   },
 });

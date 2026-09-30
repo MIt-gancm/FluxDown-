@@ -170,6 +170,7 @@ function classify(name: string, t: T): { group: string; sub: string } {
   if (/-linux-(x64|arm64)\.tar\.gz$/.test(n)) return { group: "Linux", sub: `${arch} ${t.asset.archive}` };
   if (n.endsWith("-chrome.zip") || n.endsWith("-extension.zip")) return { group: "extension", sub: "Chrome / Edge" };
   if (n.endsWith("-firefox.xpi")) return { group: "extension", sub: "Firefox" };
+  if (n.endsWith("-firefox-unsigned.zip")) return { group: "extension", sub: `Firefox ${t.asset.unsigned}` };
   return { group: "other", sub: name };
 }
 
