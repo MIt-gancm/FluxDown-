@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use fluxdown_protocol::{
-    QueueDto, RpcErrorData, RssSourceDto, RssValidateRequest, RssValidateResponse, method,
+    ApplicationErrorCode, QueueDto, RpcErrorData, RssSourceDto, RssValidateRequest,
+    RssValidateResponse, method,
 };
 use fluxdown_ui_components::{
     ControlExt as _, FluxIcon, card, dialog_scroll_body, dialog_title, field_error, field_hint,
@@ -309,7 +310,9 @@ impl Editor {
                         Ok(response) => this.error = Some(response.error),
                         Err(error) => this.error = Some(error.to_string()),
                     },
-                    Err(error) => this.error = Some(rpc_error(&error)),
+                    Err(error) => {
+                        this.error = Some(rpc_error(this.translator.read(cx), &error));
+                    }
                 }
                 cx.notify();
             });
@@ -440,7 +443,7 @@ impl Editor {
                 match result {
                     Ok(_) => window.close_dialog(cx),
                     Err(error) => {
-                        this.error = Some(rpc_error(&error));
+                        this.error = Some(rpc_error(this.translator.read(cx), &error));
                         cx.notify();
                     }
                 }
@@ -923,10 +926,22 @@ fn same_request(a: &RssValidateRequest, b: &RssValidateRequest) -> bool {
         && a.proxy_url == b.proxy_url
 }
 
-fn rpc_error(error: &RpcErrorData) -> String {
+fn rpc_error(translator: &Translator, error: &RpcErrorData) -> String {
+    // agent 端口不透传服务端 message：按错误码给本地化文案，字段错误附带字段名。
+    let key = match error.code {
+        ApplicationErrorCode::Unavailable | ApplicationErrorCode::Timeout => {
+            "localServiceDisconnected"
+        }
+        ApplicationErrorCode::InvalidArgument | ApplicationErrorCode::NotFound => {
+            "localServiceInvalidArgument"
+        }
+        ApplicationErrorCode::Conflict => "localServiceConflict",
+        _ => "localServiceActionFailed",
+    };
+    let text = translator.text(key);
     match &error.field {
-        Some(field) => format!("{:?}: {field}", error.code),
-        None => format!("{:?}", error.code),
+        Some(field) => format!("{text} ({field})"),
+        None => text.to_owned(),
     }
 }
 

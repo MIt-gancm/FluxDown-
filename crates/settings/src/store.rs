@@ -56,6 +56,17 @@ impl SettingsErrorKind {
     }
 }
 
+/// RPC 错误的本地化说明（agent 端口不透传服务端 message，只按错误码归类）。
+#[must_use]
+pub(crate) fn rpc_error_text(
+    translator: &fluxdown_ui_i18n::Translator,
+    error: &RpcErrorData,
+) -> String {
+    translator
+        .text(SettingsErrorKind::from_rpc(error).i18n_key())
+        .to_owned()
+}
+
 /// 一次设置写回的可展示错误。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SettingsError {
@@ -111,6 +122,8 @@ pub struct SettingsStore {
     last_notice: Option<&'static str>,
     /// 页面级临时值（测试结果等），不持久化、不发送。
     transient: BTreeMap<&'static str, Value>,
+    /// 渲染期按需加载的「本轮已尝试」标记，见 [`Self::begin_load`]。
+    load_attempts: BTreeSet<&'static str>,
     /// 网关状态变化 / 快照重建后置位：`transient("gateway_user_token")` 可能已过期，
     /// 下次展示时重新读取；发起读取时清除。
     gateway_token_stale: bool,
@@ -155,6 +168,7 @@ impl SettingsStore {
             last_error: None,
             last_notice: None,
             transient: BTreeMap::new(),
+            load_attempts: BTreeSet::new(),
             gateway_token_stale: true,
         }
     }
@@ -178,6 +192,7 @@ impl SettingsStore {
         self.linked_devices = snapshot.linked_devices.len();
         self.daemon_connected = snapshot.daemon_connected;
         self.stale = false;
+        self.load_attempts.clear();
         self.overlay_local_edits();
         self.last_error = None;
         cx.notify();
@@ -237,8 +252,14 @@ impl SettingsStore {
                     .clone_from(&snapshot.webhook_deliveries);
                 self.overlay_local_edits();
                 self.daemon_connected = true;
+                self.load_attempts.clear();
             }
-            AgentEvent::DaemonConnectionChanged(connected) => self.daemon_connected = *connected,
+            AgentEvent::DaemonConnectionChanged(connected) => {
+                self.daemon_connected = *connected;
+                if *connected {
+                    self.load_attempts.clear();
+                }
+            }
             _ => return,
         }
         cx.notify();
@@ -455,6 +476,15 @@ impl SettingsStore {
     #[must_use]
     pub fn gateway_token_needs_reveal(&self) -> bool {
         self.gateway_token_stale || !self.transient.contains_key("gateway_user_token")
+    }
+    /// 按需加载的「本轮已尝试」闸门：渲染期调用，返回 true 表示本轮首次，调用方随后发起加载。
+    /// 失败后不会在下一次重绘里重发，直到重连 / 新快照 / 重新打开设置窗口重置。
+    pub fn begin_load(&mut self, key: &'static str) -> bool {
+        self.load_attempts.insert(key)
+    }
+    /// 清除指定加载标记，使下次渲染重新加载（如设置窗口重新打开）。
+    pub fn reset_load(&mut self, key: &'static str) {
+        self.load_attempts.remove(key);
     }
     pub fn set_transient(&mut self, key: &'static str, value: Value, cx: &mut Context<Self>) {
         self.transient.insert(key, value);
@@ -1157,6 +1187,18 @@ mod tests {
             .values
             .insert(WIRE.to_owned(), server.to_owned());
         store
+    }
+
+    #[test]
+    fn load_gate_fires_once_until_reset() {
+        let mut store = SettingsStore::new(Arc::new(NullPort));
+        assert!(store.begin_load("connPolicy"));
+        // 失败后重绘不得再次发起。
+        assert!(!store.begin_load("connPolicy"));
+        assert!(store.begin_load("siteAuth"));
+        store.reset_load("connPolicy");
+        assert!(store.begin_load("connPolicy"));
+        assert!(!store.begin_load("siteAuth"));
     }
 
     fn wire(store: &SettingsStore) -> Option<&str> {

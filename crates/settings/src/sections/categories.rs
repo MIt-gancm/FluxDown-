@@ -1,6 +1,8 @@
 //! 自定义分类：模型（与 `lib/src/models/custom_category.dart` 同 JSON 形状）与列表分区。
 
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, category_icon};
+use fluxdown_ui_components::{
+    ButtonVariant, DialogIntent, FluxIcon, button, category_icon, dialog_title,
+};
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
@@ -8,7 +10,7 @@ use gpui::{
     SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _,
 };
-use gpui_component::{Icon, h_flex, v_flex};
+use gpui_component::{Icon, WindowExt as _, h_flex, v_flex};
 
 use super::{SectionContext, category_dialog};
 use crate::store::SettingsStore;
@@ -300,10 +302,44 @@ fn list_item(ctx: &SectionContext) -> SettingsRow {
                                 cx,
                             )
                             .disabled(disabled)
-                            .on_click(move |_, _, cx| {
-                                reset_store.update(cx, |store, cx| {
-                                    write_categories(store, CategoryEntry::builtin_defaults(), cx);
-                                });
+                            .on_click({
+                                let reset_translator = translator.clone();
+                                move |_, window, cx| {
+                                    let store = reset_store.clone();
+                                    let title = SharedString::from(
+                                        reset_translator.text("resetBuiltinCategories").to_owned(),
+                                    );
+                                    let description = SharedString::from(
+                                        reset_translator
+                                            .text("resetAllCategoriesConfirm")
+                                            .to_owned(),
+                                    );
+                                    let cancel = SharedString::from(
+                                        reset_translator.text("cancel").to_owned(),
+                                    );
+                                    window.open_alert_dialog(cx, move |alert, _, cx| {
+                                        let store = store.clone();
+                                        alert
+                                            .title(dialog_title(title.clone(), cx))
+                                            .description(description.clone())
+                                            .footer(fluxdown_ui_components::dialog_footer(
+                                                Some(cancel.clone()),
+                                                title.clone(),
+                                                DialogIntent::Destructive,
+                                                cx,
+                                            ))
+                                            .on_ok(move |_, _, cx| {
+                                                store.update(cx, |store, cx| {
+                                                    write_categories(
+                                                        store,
+                                                        CategoryEntry::builtin_defaults(),
+                                                        cx,
+                                                    );
+                                                });
+                                                true
+                                            })
+                                    });
+                                }
                             }),
                         )
                         .child(

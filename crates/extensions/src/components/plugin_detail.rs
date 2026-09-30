@@ -205,7 +205,7 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
     if !detail.author.is_empty() {
         content = content.child(info_row(text("pluginDetailAuthor"), detail.author.clone()));
     }
-    if !detail.homepage.is_empty() {
+    if ui::is_web_url(&detail.homepage) {
         content = content.child(
             h_flex()
                 .w_full()
@@ -219,6 +219,11 @@ fn render_detail(detail: &PluginDetail, translator: &Translator, cx: &App) -> im
                         .child(detail.homepage.clone()),
                 ),
         );
+    } else if !detail.homepage.is_empty() {
+        content = content.child(info_row(
+            text("pluginDetailHomepage"),
+            detail.homepage.clone(),
+        ));
     }
     if !detail.publish_time.is_empty() {
         content = content.child(info_row(

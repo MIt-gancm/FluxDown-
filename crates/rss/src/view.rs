@@ -2,8 +2,8 @@
 
 use crate::{RssController, RssPort, editor};
 use fluxdown_protocol::{
-    AgentEvent, AgentSnapshot, DaemonEvent, RssItemDto, RssSourceDto, ServiceEvent, WsServerMsg,
-    method,
+    AgentEvent, AgentSnapshot, ApplicationErrorCode, DaemonEvent, RssItemDto, RssSourceDto,
+    ServiceEvent, WsServerMsg, method,
 };
 use fluxdown_ui_components::{
     CheckState, ControlExt as _, FluxIcon, caption_number, check_mark, nav_icon_color,
@@ -225,10 +225,14 @@ impl RssView {
                     return;
                 }
                 this.controller.refresh_busy = false;
-                if result.is_err() {
-                    this.fail(cx);
-                } else {
-                    this.fetch_items(cx);
+                match &result {
+                    // daemon 对「已在抓取」与「订阅不存在」都回 NotFound：前者不是故障，
+                    // 后者会由 RssChanged 事件移除该源，这里都不报连接失败，只刷新条目。
+                    Err(error) if error.code == ApplicationErrorCode::NotFound => {
+                        this.fetch_items(cx);
+                    }
+                    Err(_) => this.fail(cx),
+                    Ok(_) => this.fetch_items(cx),
                 }
                 cx.notify();
             });

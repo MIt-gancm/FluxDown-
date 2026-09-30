@@ -31,7 +31,7 @@ use gpui_component::{
 use serde_json::{Value, json};
 
 use super::webhook::{EndpointSpec, WEBHOOK_EVENTS, read_endpoints, write_endpoints};
-use crate::store::SettingsStore;
+use crate::store::{SettingsStore, rpc_error_text};
 use crate::ui::dialog_footer;
 
 const PRESET_CUSTOM: &str = "custom";
@@ -590,7 +590,7 @@ impl WebhookDialog {
                 success: false,
                 text: SharedString::from(self.translator.text_with(
                     "webhookTestFail",
-                    &[("error", &format!("{:?}", error.code))],
+                    &[("error", &rpc_error_text(&self.translator, &error))],
                 )),
             },
         }

@@ -78,6 +78,8 @@ impl SettingsView {
     ) -> Self {
         cx.observe(&translator, |_, _, cx| cx.notify()).detach();
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // 站点凭据由新建任务等流程在窗口外写入且无事件推送：每次打开窗口重新加载一次。
+        store.update(cx, |store, _| store.reset_load("siteAuth"));
         let placeholder = translator.read(cx).text("settingsSearchHint").to_owned();
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(placeholder));
         cx.observe(&search, |_, _, cx| cx.notify()).detach();

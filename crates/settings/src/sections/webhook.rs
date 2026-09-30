@@ -12,7 +12,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 use super::{SectionContext, webhook_dialog};
-use crate::store::SettingsStore;
+use crate::store::{SettingsStore, rpc_error_text};
 use crate::ui::{
     SettingsRow, SettingsSection, body_text, empty_state, meta_text, row_button, row_danger_button,
     row_loading_button,
@@ -254,7 +254,10 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                                                 }
                                                 Err(error) => translator.text_with(
                                                     "webhookTestFail",
-                                                    &[("error", &format!("{:?}", error.code))],
+                                                    &[(
+                                                        "error",
+                                                        &rpc_error_text(&translator, &error),
+                                                    )],
                                                 ),
                                             };
                                             store.set_transient(
@@ -344,7 +347,7 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
         if deliveries.is_empty() {
             column = column.child(meta_text(cx).child(empty.clone()));
         }
-        for delivery in deliveries.iter().rev().take(50) {
+        for delivery in deliveries.iter().take(50) {
             let status = if delivery.success {
                 format!("{} · {}ms", delivery.status_code, delivery.latency_ms)
             } else if delivery.error.is_empty() {
@@ -451,7 +454,10 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
                                                 },
                                                 Err(error) => translator.text_with(
                                                     "webhookTestFail",
-                                                    &[("error", &format!("{:?}", error.code))],
+                                                    &[(
+                                                        "error",
+                                                        &rpc_error_text(&translator, &error),
+                                                    )],
                                                 ),
                                             };
                                             store.set_transient(

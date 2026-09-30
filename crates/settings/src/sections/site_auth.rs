@@ -9,13 +9,11 @@ use super::SectionContext;
 use crate::ui::{SettingsRow, SettingsSection, body_text, meta_text, row_loading_danger_button};
 
 pub(crate) fn group(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
-    if ctx.store.read(cx).site_auth().is_empty()
-        && ctx.store.read(cx).transient("site_auth_loaded").is_none()
+    if ctx
+        .store
+        .update(cx, |store, _| store.begin_load("siteAuth"))
     {
-        ctx.store.update(cx, |store, cx| {
-            store.set_transient("site_auth_loaded", serde_json::json!(true), cx);
-            store.load_site_auth(cx);
-        });
+        ctx.store.update(cx, |store, cx| store.load_site_auth(cx));
     }
     SettingsSection::new()
         .title(ctx.t("settingsSiteAuthTitle"))

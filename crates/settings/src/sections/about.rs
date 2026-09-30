@@ -82,10 +82,7 @@ fn check_update_control(ctx: &SectionContext) -> Control {
         let result = store.read(cx).update_check().cloned();
         let status = result.as_ref().map(|result| {
             if result.has_update {
-                translator.text_with(
-                    "updatePromptBody",
-                    &[("v", &result.latest_version), ("size", "")],
-                )
+                translator.text_with("newVersionFound", &[("v", &result.latest_version)])
             } else {
                 format!("{latest}: v{}", result.latest_version)
             }

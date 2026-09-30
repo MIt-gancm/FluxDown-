@@ -8,13 +8,16 @@ use gpui_component::{Icon, h_flex};
 use serde_json::json;
 
 use super::{SectionContext, site_auth};
+use crate::store::rpc_error_text;
 use crate::ui::{Control, SettingsPage, SettingsRow, SettingsSection, body_text, meta_text};
 
 pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
     let mode = ctx.store.read(cx).daemon_str("proxy_mode");
     if mode == "system"
         && ctx.store.read(cx).system_proxy().is_none()
-        && !ctx.store.read(cx).is_busy("systemProxy")
+        && ctx
+            .store
+            .update(cx, |store, _| store.begin_load("systemProxy"))
     {
         ctx.store
             .update(cx, |store, cx| store.load_system_proxy(cx));
@@ -291,7 +294,7 @@ fn test_control(ctx: &SectionContext, source: ProxyTestSource) -> Control {
                                         }
                                         Err(error) => translator.text_with(
                                             "proxyTestFailed",
-                                            &[("error", &format!("{:?}", error.code))],
+                                            &[("error", &rpc_error_text(&translator, &error))],
                                         ),
                                     };
                                     store.set_transient("proxy_test_result", json!(text), cx);

@@ -74,6 +74,21 @@ pub fn validate_field(field: &SettingFieldDto, raw: &str) -> Option<FieldError> 
     None
 }
 
+/// 实际发给引擎的值：引擎对数字按原串解析、对 select 要求成员、对 pattern 做正则匹配，
+/// 因此数字去掉首尾空白，可选且留空的这三类字段不上报（引擎会拒绝空串）。
+fn submit_value(field: &SettingFieldDto, raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if field.setting_type == "number" {
+        return (!trimmed.is_empty()).then(|| trimmed.to_owned());
+    }
+    let rejects_empty = field.pattern.is_some()
+        || (field.widget == "select" && !field.options.iter().any(|o| o.value.is_empty()));
+    if trimmed.is_empty() && !field.required && rejects_empty {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
 /// 去掉整数值的多余小数位（3.0 → "3"，3.5 → "3.5"）。
 pub fn trim_number(value: f64) -> String {
     if value == value.trunc() && value.abs() < 1e15 {
@@ -196,7 +211,9 @@ impl PluginSettingsForm {
             if let Some(error) = validate_field(field, &value) {
                 errors.insert(field.key.clone(), error);
             }
-            entries.insert(field.key.clone(), value);
+            if let Some(value) = submit_value(field, &value) {
+                entries.insert(field.key.clone(), value);
+            }
         }
         self.server_error = None;
         self.errors = errors;
@@ -513,7 +530,7 @@ impl Render for PluginSettingsForm {
 mod tests {
     use fluxdown_protocol::{SettingFieldDto, SettingOptionDto};
 
-    use super::{FieldError, trim_number, validate_field};
+    use super::{FieldError, submit_value, trim_number, validate_field};
 
     fn field(setting_type: &str, widget: &str) -> SettingFieldDto {
         SettingFieldDto {
@@ -575,5 +592,32 @@ mod tests {
         assert_eq!(trim_number(3.0), "3");
         assert_eq!(trim_number(3.5), "3.5");
         assert_eq!(trim_number(-2.0), "-2");
+    }
+
+    #[test]
+    fn submit_value_matches_what_the_engine_accepts() {
+        let number = field("number", "number");
+        assert_eq!(submit_value(&number, " 5 "), Some("5".to_owned()));
+        // 引擎对空串数字直接拒绝：可选且留空的数字字段不上报。
+        assert_eq!(submit_value(&number, "  "), None);
+        let mut select = field("string", "select");
+        select.options.push(SettingOptionDto {
+            value: "a".to_owned(),
+            label: "A".to_owned(),
+        });
+        assert_eq!(submit_value(&select, ""), None);
+        assert_eq!(submit_value(&select, "a"), Some("a".to_owned()));
+        let mut patterned = field("string", "text");
+        patterned.pattern = Some("^x+$".to_owned());
+        assert_eq!(submit_value(&patterned, ""), None);
+        // 普通文本保留原值（含首尾空白）。
+        assert_eq!(
+            submit_value(&field("string", "text"), " a "),
+            Some(" a ".to_owned())
+        );
+        assert_eq!(
+            submit_value(&field("string", "text"), ""),
+            Some(String::new())
+        );
     }
 }

@@ -125,6 +125,20 @@ pub fn permissions_to_confirm(
         .collect()
 }
 
+/// 用户确认权限之后市场索引又变化时，原确认是否仍覆盖将要安装的内容：
+/// 版本不变，且需确认的权限没有超出用户已确认的集合。
+pub fn confirmation_holds(
+    confirmed_version: &str,
+    confirmed_permissions: &[String],
+    latest: &MarketEntryDto,
+    installed: Option<&PluginDto>,
+) -> bool {
+    latest.version == confirmed_version
+        && permissions_to_confirm(latest, installed)
+            .iter()
+            .all(|permission| confirmed_permissions.contains(permission))
+}
+
 /// 已安装版本在市场中的撤回标记（`deprecated` / `vulnerable` / `malicious`）；未撤回或
 /// 市场无此版本返回 `None`。
 pub fn installed_version_yanked<'a>(
@@ -148,8 +162,8 @@ mod tests {
     use fluxdown_protocol::{MarketEntryDto, PluginDto};
 
     use super::{
-        MarketAction, filter_market, installed_version_yanked, latest_per_plugin, market_action,
-        permissions_to_confirm, version_newer,
+        MarketAction, confirmation_holds, filter_market, installed_version_yanked,
+        latest_per_plugin, market_action, permissions_to_confirm, version_newer,
     };
 
     fn entry(id: &str, version: &str, sequence: u64, yanked: &str) -> MarketEntryDto {
@@ -268,6 +282,27 @@ mod tests {
         );
         let full = plugin("a@x", "1.0.0", false, &["ffmpeg", "ytdlp"]);
         assert!(permissions_to_confirm(&latest, Some(&full)).is_empty());
+    }
+
+    #[test]
+    fn confirmation_breaks_on_new_version_or_extra_permission() {
+        let mut latest = entry("a@x", "1.2.0", 3, "none");
+        latest.permissions = vec!["ffmpeg".to_owned()];
+        let confirmed = vec!["ffmpeg".to_owned()];
+        assert!(confirmation_holds("1.2.0", &confirmed, &latest, None));
+        // 版本在确认后变了。
+        assert!(!confirmation_holds("1.1.0", &confirmed, &latest, None));
+        // 新版本多要了权限。
+        latest.permissions.push("ytdlp".to_owned());
+        assert!(!confirmation_holds("1.2.0", &confirmed, &latest, None));
+        // 已安装版本已授予的权限无需再确认。
+        let installed = plugin("a@x", "1.0.0", false, &["ytdlp"]);
+        assert!(confirmation_holds(
+            "1.2.0",
+            &confirmed,
+            &latest,
+            Some(&installed)
+        ));
     }
 
     #[test]

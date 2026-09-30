@@ -129,7 +129,7 @@ impl ExtensionsController {
         self.plugins.clone_from(&snapshot.daemon.plugins);
         self.components.clone_from(&snapshot.daemon.components);
         self.apply_config(&snapshot.daemon.config);
-        self.stale = false;
+        self.stale = !snapshot.daemon_connected;
     }
 
     /// 应用事件；组件安装进度 / 结果以信号形式回传给 view 处理。

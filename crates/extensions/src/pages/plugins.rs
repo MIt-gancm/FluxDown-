@@ -36,8 +36,8 @@ use crate::{
     controller::{COMPONENT_KINDS, component_wire_name},
     error_text,
     market::{
-        MarketAction, filter_market, installed_version_yanked, latest_per_plugin, market_action,
-        permissions_to_confirm,
+        MarketAction, confirmation_holds, filter_market, installed_version_yanked,
+        latest_per_plugin, market_action, permissions_to_confirm,
     },
     ui,
 };
@@ -93,6 +93,8 @@ pub(crate) struct MarketUi {
     pub limit: usize,
     /// 安装 / 更新在途的市场插件 id。
     pub pending: HashSet<String>,
+    /// 上次加载因断连失败；重连后重新加载一次。
+    pub retry_on_reconnect: bool,
 }
 
 impl Default for MarketUi {
@@ -106,6 +108,7 @@ impl Default for MarketUi {
             search: None,
             limit: MARKET_PAGE_SIZE,
             pending: HashSet::new(),
+            retry_on_reconnect: false,
         }
     }
 }
@@ -414,7 +417,7 @@ impl ExtensionsView {
                                 ui::meta_text(format!("v{}", plugin.version), frame)
                                     .font_features(tabular_numbers()),
                             )
-                            .when(!plugin.homepage.is_empty(), |this| {
+                            .when(ui::is_web_url(&plugin.homepage), |this| {
                                 this.child(
                                     Link::new(("plugin-homepage", index))
                                         .href(plugin.homepage.clone())
@@ -422,6 +425,10 @@ impl ExtensionsView {
                                         .child(plugin.homepage.clone()),
                                 )
                             })
+                            .when(
+                                !plugin.homepage.is_empty() && !ui::is_web_url(&plugin.homepage),
+                                |this| this.child(ui::meta_text(plugin.homepage.clone(), frame)),
+                            )
                             .children(badges.into_iter().flatten()),
                     )
                     .when(!plugin.description.is_empty(), |this| {
@@ -704,7 +711,7 @@ impl ExtensionsView {
                             .when(!entry.author.is_empty(), |this| {
                                 this.child(ui::meta_text(entry.author.clone(), frame))
                             })
-                            .when(!entry.homepage.is_empty(), |this| {
+                            .when(ui::is_web_url(&entry.homepage), |this| {
                                 this.child(
                                     Link::new(("market-homepage", index))
                                         .href(entry.homepage.clone())
@@ -712,6 +719,10 @@ impl ExtensionsView {
                                         .child(entry.homepage.clone()),
                                 )
                             })
+                            .when(
+                                !entry.homepage.is_empty() && !ui::is_web_url(&entry.homepage),
+                                |this| this.child(ui::meta_text(entry.homepage.clone(), frame)),
+                            )
                             .children(yanked.map(|label| {
                                 ui::tone_pill(label, tokens.colors.destructive, frame)
                             })),
@@ -748,7 +759,10 @@ impl ExtensionsView {
     }
 
     fn ensure_market_loaded(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.plugins.market.requested || self.controller.is_stale() {
+        if self.controller.is_stale() || self.plugins.market.loading {
+            return;
+        }
+        if self.plugins.market.requested && !self.plugins.market.retry_on_reconnect {
             return;
         }
         self.load_market(window, cx);
@@ -759,20 +773,14 @@ impl ExtensionsView {
         market.requested = true;
         market.loading = true;
         market.error = None;
+        market.retry_on_reconnect = false;
         let future = self.controller.market_list();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
             let _ = this.update(cx, |this, cx| {
                 let market = &mut this.plugins.market;
                 market.loading = false;
-                match result.and_then(|value| {
-                    serde_json::from_value::<Vec<MarketEntryDto>>(value).map_err(|_| {
-                        fluxdown_protocol::RpcErrorData::new(
-                            fluxdown_protocol::ApplicationErrorCode::ProtocolIncompatible,
-                            false,
-                        )
-                    })
-                }) {
+                match result.and_then(parse_market_entries) {
                     Ok(entries) => {
                         market.catalog = latest_per_plugin(&entries);
                         market.entries = entries;
@@ -780,6 +788,13 @@ impl ExtensionsView {
                         market.limit = MARKET_PAGE_SIZE;
                     }
                     Err(error) => {
+                        // 断连类失败：daemon 恢复后自动重试一次（其他失败保持手动刷新，避免重绘循环）。
+                        market.retry_on_reconnect = this.controller.is_stale()
+                            && matches!(
+                                error.code,
+                                fluxdown_protocol::ApplicationErrorCode::Unavailable
+                                    | fluxdown_protocol::ApplicationErrorCode::Timeout
+                            );
                         market.error = Some(error_text(this.translator.read(cx), &error));
                     }
                 }
@@ -874,29 +889,83 @@ impl ExtensionsView {
         .detach();
     }
 
-    /// 市场安装 / 更新入口：新装需确认条目声明的全部权限，更新只确认新增权限；
-    /// 无需确认时直接执行。
+    /// 市场安装 / 更新入口：daemon 会重新拉取索引并安装当时最新条目，因此先拉取最新索引，
+    /// 按最新条目确认权限（新装确认全部权限，更新只确认新增权限）；无需确认时直接执行。
     fn request_market_install(
         &mut self,
         entry: MarketEntryDto,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.plugins.market.pending.contains(&entry.plugin_id) {
+        if !self.plugins.market.pending.insert(entry.plugin_id.clone()) {
             return;
         }
-        let installed = self.controller.plugin(&entry.plugin_id);
-        let op = if installed.is_some() {
-            PluginOp::Update
-        } else {
-            PluginOp::Install
-        };
-        let permissions = permissions_to_confirm(&entry, installed);
-        if permissions.is_empty() {
-            self.start_market_install(entry.plugin_id, op, window, cx);
-        } else {
-            self.confirm_market_permissions(entry, op, &permissions, window, cx);
-        }
+        cx.notify();
+        self.recheck_market_install(entry.plugin_id, None, window, cx);
+    }
+
+    /// 重新拉取索引后继续安装流程。`confirmed` = 用户已确认过的（版本，权限）：
+    /// 仍覆盖最新条目才直接安装，否则按最新条目重新确认。`pending` 由调用方置位。
+    fn recheck_market_install(
+        &mut self,
+        plugin_id: String,
+        confirmed: Option<(String, Vec<String>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let future = self.controller.market_list();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = future.await.and_then(parse_market_entries);
+            let _ = this.update_in(cx, |this, window, cx| {
+                let op = if this.controller.plugin(&plugin_id).is_some() {
+                    PluginOp::Update
+                } else {
+                    PluginOp::Install
+                };
+                let entries = match result {
+                    Ok(entries) => entries,
+                    Err(error) => {
+                        this.plugins.market.pending.remove(&plugin_id);
+                        this.finish_plugin_op(op, Err(error), window, cx);
+                        cx.notify();
+                        return;
+                    }
+                };
+                let catalog = latest_per_plugin(&entries);
+                let latest = catalog.iter().find(|e| e.plugin_id == plugin_id).cloned();
+                let market = &mut this.plugins.market;
+                market.catalog = catalog;
+                market.entries = entries;
+                market.error = None;
+                let Some(latest) = latest else {
+                    market.pending.remove(&plugin_id);
+                    let error = fluxdown_protocol::RpcErrorData::new(
+                        fluxdown_protocol::ApplicationErrorCode::NotFound,
+                        false,
+                    )
+                    .with_reason(fluxdown_protocol::ErrorReason::PluginNotInMarket);
+                    this.finish_plugin_op(op, Err(error), window, cx);
+                    cx.notify();
+                    return;
+                };
+                let installed = this.controller.plugin(&plugin_id);
+                let permissions = permissions_to_confirm(&latest, installed);
+                let holds = match &confirmed {
+                    Some((version, granted)) => {
+                        confirmation_holds(version, granted, &latest, installed)
+                    }
+                    None => permissions.is_empty(),
+                };
+                if holds {
+                    this.start_market_install(plugin_id, op, window, cx);
+                } else {
+                    this.plugins.market.pending.remove(&plugin_id);
+                    this.confirm_market_permissions(latest, op, &permissions, window, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     fn confirm_market_permissions(
@@ -943,9 +1012,13 @@ impl ExtensionsView {
         let cancel = SharedString::from(translator.text("cancel").to_owned());
         let view = cx.entity().downgrade();
         let plugin_id = entry.plugin_id;
+        let version = entry.version;
+        let confirmed = permissions.to_vec();
         window.open_alert_dialog(cx, move |alert, _, cx| {
             let view = view.clone();
             let plugin_id = plugin_id.clone();
+            let version = version.clone();
+            let confirmed = confirmed.clone();
             alert
                 .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
                 .description(body.clone())
@@ -957,13 +1030,22 @@ impl ExtensionsView {
                 ))
                 .on_ok(move |_, window, cx| {
                     let _ = view.update(cx, |this, cx| {
-                        this.start_market_install(plugin_id.clone(), op, window, cx);
+                        // 确认后重新核对索引：daemon 安装的是当时最新条目。
+                        this.plugins.market.pending.insert(plugin_id.clone());
+                        cx.notify();
+                        this.recheck_market_install(
+                            plugin_id.clone(),
+                            Some((version.clone(), confirmed.clone())),
+                            window,
+                            cx,
+                        );
                     });
                     true
                 })
         });
     }
 
+    /// 调用方已把 `plugin_id` 放入 `pending`；安装结束（成功或失败）时移除。
     fn start_market_install(
         &mut self,
         plugin_id: String,
@@ -971,9 +1053,7 @@ impl ExtensionsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.plugins.market.pending.insert(plugin_id.clone()) {
-            return;
-        }
+        self.plugins.market.pending.insert(plugin_id.clone());
         cx.notify();
         let future = self.controller.market_install(plugin_id.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -1247,6 +1327,17 @@ impl ExtensionsView {
                 .content(move |content, _, _| content.min_h_0().child(dialog_for_content.clone()))
         });
     }
+}
+
+fn parse_market_entries(
+    value: serde_json::Value,
+) -> Result<Vec<MarketEntryDto>, fluxdown_protocol::RpcErrorData> {
+    serde_json::from_value::<Vec<MarketEntryDto>>(value).map_err(|_| {
+        fluxdown_protocol::RpcErrorData::new(
+            fluxdown_protocol::ApplicationErrorCode::ProtocolIncompatible,
+            false,
+        )
+    })
 }
 
 /// 列表卡片：一张 surface 卡片内纵向排列各行，行间 hairline 分隔（与下载表格同一「少线」风格）。

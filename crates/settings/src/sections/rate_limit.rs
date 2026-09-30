@@ -151,7 +151,7 @@ pub(crate) fn control(ctx: &SectionContext, key: &'static str, unit_key: &'stati
                 &get,
                 &set,
                 disabled,
-                &SharedString::from(format!("{row_key}-{}", unit.id())),
+                &SharedString::from(format!("{row_key}-{key}-{}", unit.id())),
                 false,
                 window,
                 cx,

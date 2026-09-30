@@ -102,8 +102,10 @@ fn textarea_field(
     Control::custom(
         move |disabled, row_key: &SharedString, window: &mut Window, cx: &mut App| {
             let current = store.read(cx).daemon_str(key);
-            let slot =
-                window.use_keyed_state(SharedString::from(format!("{row_key}-textarea")), cx, {
+            let slot = window.use_keyed_state(
+                SharedString::from(format!("{row_key}-{key}-textarea")),
+                cx,
+                {
                     let store = store.clone();
                     let current = current.clone();
                     let placeholder = placeholder.clone();
@@ -135,7 +137,8 @@ fn textarea_field(
                             _subscription,
                         }
                     }
-                });
+                },
+            );
             slot.update(cx, |slot, cx| {
                 if slot.last_synced != current {
                     let text = SharedString::from(format.to_editor(&current));

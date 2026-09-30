@@ -155,7 +155,8 @@ pub(crate) fn field(ctx: &SectionContext) -> Control {
             });
             let current = SharedString::from(current);
             slot.update(cx, |slot, cx| {
-                if slot.last_synced != current {
+                // daemon 对 Text 键 trim 归一化；按 trim 比较，避免逐字输入的尾随空格被回写抹掉。
+                if slot.last_synced.trim() != current.trim() {
                     slot.last_synced = current.clone();
                     slot.input
                         .update(cx, |input, cx| input.set_value(current.clone(), window, cx));

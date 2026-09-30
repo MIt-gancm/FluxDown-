@@ -164,3 +164,29 @@ pub(crate) fn empty_state(
         .child(title_text(title, frame).mt(tokens.spacing.xs))
         .children(desc.map(|desc| meta_text(desc, frame).text_center()))
 }
+
+/// 主页链接只对 http(s) 渲染为可点击链接：插件 manifest / 市场索引的 homepage 不可信，
+/// `file://`、自定义协议等交给系统打开会触发本地文件或协议处理器。
+pub(crate) fn is_web_url(url: &str) -> bool {
+    let Some((scheme, rest)) = url.trim().split_once("://") else {
+        return false;
+    };
+    (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+        && !rest.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_web_url;
+
+    #[test]
+    fn only_http_and_https_are_clickable() {
+        assert!(is_web_url("https://example.com/plugin"));
+        assert!(is_web_url("HTTP://example.com"));
+        assert!(!is_web_url("file:///etc/passwd"));
+        assert!(!is_web_url("javascript:alert(1)"));
+        assert!(!is_web_url("myapp://open"));
+        assert!(!is_web_url("https://"));
+        assert!(!is_web_url("example.com"));
+    }
+}

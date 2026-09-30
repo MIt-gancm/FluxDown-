@@ -76,11 +76,19 @@ fn service_section(ctx: &SectionContext, cx: &mut App) -> SettingsSection {
             )
             .keywords([copied.clone()]),
         )
-        .row(ctx.item(
-            "apiServiceLanEnable",
-            Some("apiServiceLanEnableDesc"),
-            gateway_switch(ctx, GatewayFlag::Lan),
-        ))
+        .row(
+            // agent 只在启动时按此开关绑定监听地址，切换后要重启本机服务才生效。
+            ctx.item(
+                "apiServiceLanEnable",
+                None,
+                gateway_switch(ctx, GatewayFlag::Lan),
+            )
+            .description(SharedString::from(format!(
+                "{} {}",
+                ctx.t("apiServiceLanEnableDesc"),
+                ctx.t("apiServiceLanRestartHint"),
+            ))),
+        )
         .row(ctx.item(
             "apiServiceToken",
             Some("apiServiceTokenDesc"),

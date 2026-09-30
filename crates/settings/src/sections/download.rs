@@ -9,7 +9,11 @@ use super::{SectionContext, rate_limit, user_agent};
 use crate::ui::{Control, Explain, SettingsPage, SettingsSection, body_text, meta_text};
 
 pub(crate) fn page(ctx: &SectionContext, cx: &mut App) -> SettingsPage {
-    if ctx.store.read(cx).conn_policy().is_none() && !ctx.store.read(cx).is_busy("connPolicy") {
+    if ctx.store.read(cx).conn_policy().is_none()
+        && ctx
+            .store
+            .update(cx, |store, _| store.begin_load("connPolicy"))
+    {
         ctx.store.update(cx, |store, cx| store.load_conn_policy(cx));
     }
     SettingsPage::new(

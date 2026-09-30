@@ -10,6 +10,7 @@
 //!   或数字 + 单位下拉）。
 //! - 列表行内操作（上移 / 下移 / 测试 / 删除…）同高：[`row_button`] / [`row_icon_button`] 只额外禁止被长文本挤压。
 
+use std::cell::RefCell;
 use std::rc::Rc;
 
 use fluxdown_ui_components::{
@@ -737,6 +738,8 @@ pub(crate) fn dropdown_button(
 
 struct InputSlot {
     state: gpui::Entity<InputState>,
+    /// 订阅回调读取的当前行 setter；每次 render 刷新，避免槽被别的行复用后写错键。
+    set: Rc<RefCell<Setter<SharedString>>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -758,20 +761,28 @@ fn render_input(
             let set = set.clone();
             move |window, cx| {
                 let state = cx.new(|cx| InputState::new(window, cx).default_value(value));
-                let subscription = cx.subscribe(&state, move |_, state, event: &InputEvent, cx| {
-                    if matches!(event, InputEvent::Change) {
-                        set(state.read(cx).value(), cx);
+                let shared = Rc::new(RefCell::new(set));
+                let subscription = cx.subscribe(&state, {
+                    let shared = shared.clone();
+                    move |_, state, event: &InputEvent, cx| {
+                        if matches!(event, InputEvent::Change) {
+                            let set = shared.borrow().clone();
+                            set(state.read(cx).value(), cx);
+                        }
                     }
                 });
                 InputSlot {
                     state,
+                    set: shared,
                     _subscriptions: vec![subscription],
                 }
             }
         },
     );
     slot.update(cx, |slot, cx| {
-        if slot.state.read(cx).value() != value {
+        *slot.set.borrow_mut() = set.clone();
+        // Text 类键 daemon 会 trim 归一化；按 trim 比较，避免逐字输入的空格被回写抹掉。
+        if slot.state.read(cx).value().trim() != value.trim() {
             slot.state.update(cx, |state, cx| {
                 state.set_value(value.clone(), window, cx);
             });
@@ -791,9 +802,19 @@ fn render_input(
         .into_any_element()
 }
 
+/// 订阅回调读取的当前行参数；每次 render 刷新，避免槽被别的行复用后写错键或用错钳制范围。
+#[derive(Clone)]
+struct NumberParams {
+    min: f64,
+    max: f64,
+    step: f64,
+    set: Setter<f64>,
+}
+
 struct NumberSlot {
     state: gpui::Entity<InputState>,
     current: f64,
+    params: Rc<RefCell<NumberParams>>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -815,18 +836,29 @@ pub(crate) fn render_number(
         ElementId::from(SharedString::from(format!("{key}-number"))),
         cx,
         {
-            let set = set.clone();
-            let step_set = set.clone();
+            let params = Rc::new(RefCell::new(NumberParams {
+                min,
+                max,
+                step,
+                set: set.clone(),
+            }));
             move |window, cx| {
                 let state =
                     cx.new(|cx| InputState::new(window, cx).default_value(format_number(value)));
                 let subscriptions = vec![
                     cx.subscribe_in(&state, window, {
+                        let params_step = params.clone();
                         move |slot: &mut NumberSlot, state, event: &NumberInputEvent, window, cx| {
                             let NumberInputEvent::Step(action) = event;
                             let Ok(current) = state.read(cx).value().parse::<f64>() else {
                                 return;
                             };
+                            let NumberParams {
+                                min,
+                                max,
+                                step,
+                                set,
+                            } = params_step.borrow().clone();
                             let next = if *action == StepAction::Increment {
                                 current + step
                             } else {
@@ -841,10 +873,11 @@ pub(crate) fn render_number(
                                 );
                             });
                             slot.current = next;
-                            step_set(next, cx);
+                            set(next, cx);
                         }
                     }),
                     cx.subscribe_in(&state, window, {
+                        let params_change = params.clone();
                         move |slot: &mut NumberSlot, state, event: &InputEvent, window, cx| {
                             let text = state.read(cx).value();
                             let rewrite =
@@ -878,6 +911,8 @@ pub(crate) fn render_number(
                                     if !parsed.is_finite() {
                                         return;
                                     }
+                                    let NumberParams { min, max, set, .. } =
+                                        params_change.borrow().clone();
                                     let clamped = parsed.clamp(min, max);
                                     if (clamped - slot.current).abs() >= f64::EPSILON {
                                         slot.current = clamped;
@@ -896,12 +931,19 @@ pub(crate) fn render_number(
                 NumberSlot {
                     state,
                     current: value,
+                    params,
                     _subscriptions: subscriptions,
                 }
             }
         },
     );
     slot.update(cx, |slot, cx| {
+        *slot.params.borrow_mut() = NumberParams {
+            min,
+            max,
+            step,
+            set: set.clone(),
+        };
         if (slot.current - value).abs() >= f64::EPSILON {
             slot.current = value;
             slot.state.update(cx, |state, cx| {
@@ -1034,6 +1076,10 @@ impl SettingsSection {
         let tokens = theme.tokens().clone();
         let extended = theme.extended().colors;
         let mut card = card(cx).flex().flex_col().w_full().overflow_hidden();
+        // 行 key 必须在行增减/搜索过滤后保持稳定：用小节标题 + 行标题（重名按出现序号区分），
+        // 否则输入槽会按位置下标被别的设置项复用。
+        let section_title: &str = self.title.as_deref().unwrap_or("");
+        let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for (row_index, row) in self.rows.iter().enumerate() {
             if row_index > 0 {
                 card = card.child(
@@ -1044,11 +1090,13 @@ impl SettingsSection {
                         .child(div().size_full().bg(extended.hairline)),
                 );
             }
-            card = card.child(row.render(
-                SharedString::from(format!("{key}-{index}-{row_index}")),
-                window,
-                cx,
+            let occurrence = seen.entry(&*row.title).or_insert(0);
+            let row_key = SharedString::from(format!(
+                "{key}-{index}-{section_title}-{}#{occurrence}",
+                row.title
             ));
+            *occurrence += 1;
+            card = card.child(row.render(row_key, window, cx));
         }
 
         let heading = (self.title.is_some() || self.subtitle.is_some()).then(|| {
