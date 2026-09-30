@@ -68,6 +68,7 @@ fn canonical_method_literals_are_exact_and_unique() {
         "daemon.plugin.updateSettings",
         "daemon.plugin.install",
         "daemon.plugin.installDev",
+        "daemon.plugin.reloadDev",
         "daemon.plugin.uninstall",
         "daemon.plugin.marketList",
         "daemon.plugin.marketInstall",

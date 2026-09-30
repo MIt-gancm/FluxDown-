@@ -52,6 +52,7 @@ pub enum PluginOp {
     Update,
     Uninstall,
     SetEnabled,
+    Reload,
 }
 
 pub(crate) struct PluginsUi {
@@ -61,6 +62,8 @@ pub(crate) struct PluginsUi {
     pub installing_dir: bool,
     /// 有写操作在途的插件标识（禁用其卡片上的控件）。
     pub busy: HashSet<String>,
+    /// 「重新加载」在途的 dev 插件（按钮显示转圈）；是 `busy` 的子集。
+    pub reloading: HashSet<String>,
     pub market: MarketUi,
 }
 
@@ -72,6 +75,7 @@ impl Default for PluginsUi {
             installing_file: false,
             installing_dir: false,
             busy: HashSet::new(),
+            reloading: HashSet::new(),
             market: MarketUi::default(),
         }
     }
@@ -462,6 +466,22 @@ impl ExtensionsView {
                         .disabled(busy || pending)
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.request_market_install(entry.clone(), window, cx);
+                        })),
+                )
+            })
+            .when(plugin.dev_mode, |this| {
+                let identity = identity.clone();
+                let reloading = self.plugins.reloading.contains(&plugin.identity);
+                this.child(
+                    Button::new(("plugin-reload", index))
+                        .ghost()
+                        .control_icon(cx)
+                        .icon(FluxIcon::RotateCw)
+                        .tooltip(translator.text("pluginReloadTooltip").to_owned())
+                        .loading(reloading)
+                        .disabled(busy)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.reload_plugin(identity.clone(), window, cx);
                         })),
                 )
             })
@@ -983,11 +1003,21 @@ impl ExtensionsView {
             let result = future.await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.plugins.busy.remove(&identity);
+                this.plugins.reloading.remove(&identity);
                 this.finish_plugin_op(op, result, window, cx);
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn reload_plugin(&mut self, identity: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.plugins.busy.contains(&identity) {
+            return;
+        }
+        self.plugins.reloading.insert(identity.clone());
+        let future = self.controller.reload_plugin_dev(identity.clone());
+        self.run_plugin_op(identity, PluginOp::Reload, future, window, cx);
     }
 
     /// 写操作结果的全局提示；安装成功且缺少基础组件时追加依赖提醒。
@@ -1019,6 +1049,16 @@ impl ExtensionsView {
                 let message = translator.text("pluginOpUninstallSuccess").to_owned();
                 self.toast_success(message, window, cx);
             }
+            (PluginOp::Reload, Ok(value)) => {
+                let message = translator.text("pluginOpReloadSuccess").to_owned();
+                let missing = serde_json::from_value::<InstalledPlugin>(value)
+                    .map(|installed| installed.missing_components)
+                    .unwrap_or_default();
+                self.toast_success(message, window, cx);
+                if !missing.is_empty() {
+                    self.show_missing_components(&missing, window, cx);
+                }
+            }
             (PluginOp::SetEnabled, Ok(_)) => {}
             (op, Err(error)) => {
                 let detail = error_text(translator, &error);
@@ -1027,6 +1067,7 @@ impl ExtensionsView {
                     PluginOp::Update => "pluginOpUpdateFailed",
                     PluginOp::Uninstall => "pluginOpUninstallFailed",
                     PluginOp::SetEnabled => "pluginOpEnabledFailed",
+                    PluginOp::Reload => "pluginOpReloadFailed",
                 };
                 let message = translator.text_with(key, &[("message", &detail)]);
                 self.toast_error(message, window, cx);

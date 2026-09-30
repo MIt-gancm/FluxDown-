@@ -748,6 +748,20 @@ impl DaemonService {
                 })
             }
             #[cfg(feature = "plugins")]
+            method::DAEMON_PLUGIN_RELOAD_DEV => {
+                let params = parse_params::<PluginIdentityParams>(params)?;
+                let result = self.plugin_manager()?.reload_dev(&params.identity).await;
+                // 失败也要广播：load_all 已刷新快照（加载失败原因 / 新 manifest），
+                // 列表必须与引擎一致。
+                self.publish_plugins().await?;
+                result.map_err(|error| plugin_package_error("identity", &error))?;
+                let missing_components = self.plugin_missing_components(&params.identity).await;
+                to_value(fluxdown_protocol::InstalledPlugin {
+                    identity: params.identity,
+                    missing_components,
+                })
+            }
+            #[cfg(feature = "plugins")]
             method::DAEMON_PLUGIN_UNINSTALL => {
                 let params = parse_params::<PluginIdentityParams>(params)?;
                 self.plugin_manager()?
@@ -809,6 +823,7 @@ impl DaemonService {
             | method::DAEMON_PLUGIN_UPDATE_SETTINGS
             | method::DAEMON_PLUGIN_INSTALL
             | method::DAEMON_PLUGIN_INSTALL_DEV
+            | method::DAEMON_PLUGIN_RELOAD_DEV
             | method::DAEMON_PLUGIN_UNINSTALL
             | method::DAEMON_PLUGIN_MARKET_LIST
             | method::DAEMON_PLUGIN_MARKET_INSTALL

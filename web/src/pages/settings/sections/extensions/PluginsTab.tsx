@@ -1,6 +1,6 @@
 // 插件子页：已安装插件管理（启用 / 设置 / 登录 / 卸载）+ 安装区（zip 上传 / 服务端开发目录）+ 插件市场。
 
-import { FolderOpen, Info, Package, Settings, Trash2 } from 'lucide-react'
+import { FolderOpen, Info, Package, RotateCw, Settings, Trash2 } from 'lucide-react'
 import { useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { METHOD, call, rpc, uploadBlob, useDaemon } from '../../../../lib/rpc'
@@ -91,6 +91,17 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
       }
     })
   }
+
+  const reload = (plugin: PluginDto) =>
+    withBusy(plugin.identity, async () => {
+      try {
+        const result = await rpc.daemon.plugin.reloadDev({ identity: plugin.identity })
+        toast.success(t('pluginOpReloadSuccess'))
+        if (result.missingComponents?.length) setMissing(result.missingComponents)
+      } catch (error) {
+        toast.error(t('pluginOpReloadFailed', { message: extensionErrorText(t, error) }))
+      }
+    })
 
   /** 浏览器选 zip → 上传 blob → `daemon.plugin.install {blobId}`。 */
   const installZip = async (file: File) => {
@@ -201,6 +212,7 @@ export function PluginsTab({ stale, onGoToComponents }: { stale: boolean; onGoTo
               onSettings={() => setSettingsPlugin(plugin)}
               onAuth={() => setAuthPlugin(plugin)}
               onUninstall={() => void uninstall(plugin)}
+              onReload={() => void reload(plugin)}
               onToggle={(enabled) => void setEnabled(plugin, enabled)}
             />
           ))}
@@ -247,6 +259,7 @@ function PluginRow({
   onSettings,
   onAuth,
   onUninstall,
+  onReload,
   onToggle,
 }: {
   plugin: PluginDto
@@ -255,6 +268,7 @@ function PluginRow({
   onSettings: () => void
   onAuth: () => void
   onUninstall: () => void
+  onReload: () => void
   onToggle: (enabled: boolean) => void
 }) {
   const t = useT()
@@ -279,6 +293,7 @@ function PluginRow({
       }
       actions={
         <>
+          {plugin.devMode ? <IconButton icon={RotateCw} label={t('pluginReloadTooltip')} onClick={onReload} disabled={disabled} /> : null}
           <IconButton icon={Info} label={t('pluginDetailDescription')} onClick={onDetail} />
           {!loadFailed && plugin.settings.length > 0 ? (
             <IconButton icon={Settings} label={t('pluginSettingsTooltip')} onClick={onSettings} disabled={disabled} />

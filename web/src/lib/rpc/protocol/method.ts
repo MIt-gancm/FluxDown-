@@ -72,6 +72,7 @@ export const METHOD = {
   DAEMON_PLUGIN_UPDATE_SETTINGS: 'daemon.plugin.updateSettings',
   DAEMON_PLUGIN_INSTALL: 'daemon.plugin.install',
   DAEMON_PLUGIN_INSTALL_DEV: 'daemon.plugin.installDev',
+  DAEMON_PLUGIN_RELOAD_DEV: 'daemon.plugin.reloadDev',
   DAEMON_PLUGIN_UNINSTALL: 'daemon.plugin.uninstall',
   DAEMON_PLUGIN_MARKET_LIST: 'daemon.plugin.marketList',
   DAEMON_PLUGIN_MARKET_INSTALL: 'daemon.plugin.marketInstall',

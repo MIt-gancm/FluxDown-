@@ -1098,6 +1098,37 @@ impl PluginManager {
         Ok(identity)
     }
 
+    /// 重新加载一个 dev 插件：重读 manifest 与全部入口源码并做与安装相同的
+    /// compile / pattern 校验。
+    ///
+    /// dev 插件的 JS 入口每次调用都按最新源码重读，但 manifest（名称 / 版本 /
+    /// 匹配规则 / 设置项 / 入口路径 / 权限）只在 [`Self::load_all`] 时解析，
+    /// 改了它就必须显式重载。与 [`Self::install_dev`] 不同：校验失败**保留**
+    /// dev 登记与启停状态（开发中的半成品不该被清掉），只把错误回报给调用方；
+    /// 之前加载失败的插件修好后经此恢复。
+    pub async fn reload_dev(&self, identity: &str) -> Result<(), PluginError> {
+        let registered = self
+            .db
+            .get_config(&format!("plugin.dev.{identity}"))
+            .await
+            .map_err(|e| PluginError::Runtime(e.to_string()))?
+            .is_some();
+        if !registered {
+            return Err(PluginError::NotDevPlugin(identity.to_string()));
+        }
+        self.load_all().await;
+        if let Some(failed) = self
+            .failed_plugins
+            .read()
+            .await
+            .iter()
+            .find(|p| p.identity == identity)
+        {
+            return Err(PluginError::LoadFailed(failed.error.clone()));
+        }
+        self.validate_loaded(identity).await
+    }
+
     async fn finish_install_outcome(
         &self,
         outcome: super::install::InstallOutcome,
@@ -1144,50 +1175,7 @@ impl PluginManager {
         // 任一校验失败由调用方回滚：升级恢复旧目录，新安装清理新目录，
         // 避免残留一个「已装但校验失败」且默认启用的插件。
         self.load_all().await;
-        let validation: Result<(), PluginError> = {
-            let snapshot = self.plugins.read().await.clone();
-            match snapshot.iter().find(|p| p.manifest.identity == identity) {
-                Some(p) => {
-                    let mut r = Ok(());
-                    if let Some(src) = p.resolver_source().await {
-                        r = self.runtime.check_compile(&src);
-                    }
-                    if r.is_ok()
-                        && let Some(src) = p.hooks_source().await
-                    {
-                        r = self.runtime.check_compile(&src);
-                    }
-                    if r.is_ok()
-                        && let Some(src) = p.auth_source().await
-                    {
-                        r = self.runtime.check_compile(&src);
-                    }
-                    if r.is_ok()
-                        && let Some(src) = p.subscription_source().await
-                    {
-                        r = self.runtime.check_compile(&src);
-                    }
-                    if r.is_ok() {
-                        for f in &p.manifest.settings {
-                            if let Some(pat) = &f.pattern
-                                && !self.runtime.regex_valid(pat)
-                            {
-                                r = Err(PluginError::ManifestInvalid(format!(
-                                    "setting '{}': pattern 非法（JS RegExp 编译失败）",
-                                    f.key
-                                )));
-                                break;
-                            }
-                        }
-                    }
-                    r
-                }
-                None => Err(PluginError::ManifestInvalid(
-                    "安装后未能加载插件（校验失败或版本门槛不满足）".to_string(),
-                )),
-            }
-        };
-        validation?;
+        self.validate_loaded(identity).await?;
 
         // enabled 写入规则：
         // - 新装（无 enabled 键）或熔断 → enabled=1, reason=None（升级即解熔断）
@@ -1198,6 +1186,38 @@ impl PluginManager {
         }
         // 最终重载让内存态与 config 一致。
         self.load_all().await;
+        Ok(())
+    }
+
+    /// 对当前快照中的插件做 compile / pattern 校验（不改任何状态）。
+    async fn validate_loaded(&self, identity: &str) -> Result<(), PluginError> {
+        let snapshot = self.plugins.read().await.clone();
+        let Some(p) = snapshot.iter().find(|p| p.manifest.identity == identity) else {
+            return Err(PluginError::ManifestInvalid(
+                "安装后未能加载插件（校验失败或版本门槛不满足）".to_string(),
+            ));
+        };
+        for src in [
+            p.resolver_source().await,
+            p.hooks_source().await,
+            p.auth_source().await,
+            p.subscription_source().await,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            self.runtime.check_compile(&src)?;
+        }
+        for f in &p.manifest.settings {
+            if let Some(pat) = &f.pattern
+                && !self.runtime.regex_valid(pat)
+            {
+                return Err(PluginError::ManifestInvalid(format!(
+                    "setting '{}': pattern 非法（JS RegExp 编译失败）",
+                    f.key
+                )));
+            }
+        }
         Ok(())
     }
 

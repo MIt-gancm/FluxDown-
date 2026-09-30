@@ -74,6 +74,8 @@ pub const DAEMON_PLUGIN_SET_ENABLED: &str = "daemon.plugin.setEnabled";
 pub const DAEMON_PLUGIN_UPDATE_SETTINGS: &str = "daemon.plugin.updateSettings";
 pub const DAEMON_PLUGIN_INSTALL: &str = "daemon.plugin.install";
 pub const DAEMON_PLUGIN_INSTALL_DEV: &str = "daemon.plugin.installDev";
+/// 重新加载 dev 插件（`{identity}`）：重读 manifest + 源码并校验，失败保留登记。
+pub const DAEMON_PLUGIN_RELOAD_DEV: &str = "daemon.plugin.reloadDev";
 pub const DAEMON_PLUGIN_UNINSTALL: &str = "daemon.plugin.uninstall";
 pub const DAEMON_PLUGIN_MARKET_LIST: &str = "daemon.plugin.marketList";
 pub const DAEMON_PLUGIN_MARKET_INSTALL: &str = "daemon.plugin.marketInstall";
@@ -282,6 +284,7 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_PLUGIN_UPDATE_SETTINGS,
     DAEMON_PLUGIN_INSTALL,
     DAEMON_PLUGIN_INSTALL_DEV,
+    DAEMON_PLUGIN_RELOAD_DEV,
     DAEMON_PLUGIN_UNINSTALL,
     DAEMON_PLUGIN_MARKET_LIST,
     DAEMON_PLUGIN_MARKET_INSTALL,

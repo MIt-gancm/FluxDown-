@@ -307,6 +307,14 @@ impl ExtensionsController {
         )
     }
 
+    /// 重新加载 dev 插件：重读 manifest 与源码并校验；失败保留 dev 登记。
+    pub fn reload_plugin_dev(&self, identity: String) -> PortFuture<serde_json::Value> {
+        self.call(
+            method::DAEMON_PLUGIN_RELOAD_DEV,
+            serde_json::json!({ "identity": identity }),
+        )
+    }
+
     pub fn market_list(&self) -> PortFuture<serde_json::Value> {
         self.call(method::DAEMON_PLUGIN_MARKET_LIST, serde_json::json!({}))
     }

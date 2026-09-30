@@ -195,6 +195,9 @@ const plugin = {
   /** 从 daemon 主机上的目录安装开发版插件。 */
   installDev: (params: PluginInstallDevParams) =>
     call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_INSTALL_DEV, params),
+  /** 重新加载开发版插件（重读 manifest 与源码并校验；失败保留登记）。 */
+  reloadDev: (params: PluginIdentityParams) =>
+    call<InstalledPlugin>(METHOD.DAEMON_PLUGIN_RELOAD_DEV, params),
   uninstall: (params: PluginIdentityParams) =>
     call<OkResult>(METHOD.DAEMON_PLUGIN_UNINSTALL, params),
   marketList: () => call<MarketEntryDto[]>(METHOD.DAEMON_PLUGIN_MARKET_LIST),

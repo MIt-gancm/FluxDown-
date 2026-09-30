@@ -1969,6 +1969,10 @@ class S {
       _r('pluginOpUninstallFailed', {'message': message});
   String pluginOpEnabledFailed(String message) =>
       _r('pluginOpEnabledFailed', {'message': message});
+  String get pluginReloadTooltip => _r('pluginReloadTooltip');
+  String get pluginOpReloadSuccess => _r('pluginOpReloadSuccess');
+  String pluginOpReloadFailed(String message) =>
+      _r('pluginOpReloadFailed', {'message': message});
   String pluginOpGenericFailed(String message) =>
       _r('pluginOpGenericFailed', {'message': message});
   String get pluginDepsMissingTitle => _r('pluginDepsMissingTitle');

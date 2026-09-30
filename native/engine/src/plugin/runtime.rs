@@ -339,6 +339,12 @@ pub enum PluginError {
     MissingRequiredSetting(String),
     #[error("插件运行时错误: {0}")]
     Runtime(String),
+    /// 插件目录 / dev 登记存在但加载失败；内容即加载诊断原文。
+    #[error("插件加载失败: {0}")]
+    LoadFailed(String),
+    /// 指定标识没有 dev 登记（只有 dev 插件支持重新加载）。
+    #[error("不是开发模式插件: {0}")]
+    NotDevPlugin(String),
 }
 
 // ---------------------------------------------------------------------------
