@@ -319,10 +319,15 @@ impl ExtensionsController {
         self.call(method::DAEMON_PLUGIN_MARKET_LIST, serde_json::json!({}))
     }
 
-    pub fn market_install(&self, plugin_id: String) -> PortFuture<serde_json::Value> {
+    /// `version` = 用户确认权限时看到的版本；市场最新版本已变化时 daemon 拒绝安装。
+    pub fn market_install(
+        &self,
+        plugin_id: String,
+        version: String,
+    ) -> PortFuture<serde_json::Value> {
         self.call(
             method::DAEMON_PLUGIN_MARKET_INSTALL,
-            serde_json::json!({ "pluginId": plugin_id }),
+            serde_json::json!({ "pluginId": plugin_id, "version": version }),
         )
     }
 

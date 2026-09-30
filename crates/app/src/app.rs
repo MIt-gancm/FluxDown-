@@ -339,6 +339,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         // 不依赖主窗口存在。
         crate::windows::selection::install(cx);
         crate::windows::new_download::install_captures(cx);
+        crate::plugin_notices::install(cx);
         crate::progress_windows::install(cx);
         if let Some(task_id) = launch.progress_task.clone() {
             // 须先于下方「无待确认即退出」登记：意图的界面保活会推迟那次退出。

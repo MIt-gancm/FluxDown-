@@ -4,6 +4,7 @@
 //! [`DownloadView`] 并作为路由内容注入 shell。
 
 pub mod actions;
+mod batch;
 mod components;
 mod controller;
 mod model;

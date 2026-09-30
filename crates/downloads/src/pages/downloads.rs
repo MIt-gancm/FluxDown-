@@ -24,6 +24,7 @@ use crate::{
         DownloadFilter, DownloadStatusFilter, RowKey, SidebarSection, SidebarSelection,
         StatusFolderMotion, TaskState,
         file_rescan::{RescanDecision, RescanThrottle},
+        refresh_gate::{RefreshGate, RefreshPlan, RefreshTrigger},
         view_prefs::{DetailPlacement, VIEW_PREFS_KEY, ViewGroupBy, ViewPrefs},
     },
     pages::new_download::{NewDownloadContext, build_new_download_context},
@@ -147,6 +148,10 @@ pub struct DownloadView {
     pub(crate) content_left: Pixels,
     /// 文件跟踪重扫节流（主窗口获焦触发）。
     file_rescan: RescanThrottle,
+    /// 事件驱动刷新的合并闸门（≤30Hz、同批事件一次刷新）。
+    refresh_gate: RefreshGate,
+    /// 上次刷新时存储的行布局计数；与当前不同说明行 ID 可能已指向别的任务。
+    refreshed_structure: u64,
 }
 
 impl DownloadView {
@@ -253,6 +258,8 @@ impl DownloadView {
             selection_summary: Cell::new(SelectionSummary::default()),
             content_left: px(0.),
             file_rescan: RescanThrottle::default(),
+            refresh_gate: RefreshGate::default(),
+            refreshed_structure: u64::MAX,
         }
     }
 
@@ -365,9 +372,7 @@ impl DownloadView {
         self.reconcile_sidebar_selection();
         self.last_error = (!snapshot.daemon_connected).then(|| self.strings.disconnected.clone());
         self.load_view_prefs(cx);
-        self.sync_delegate_context(cx);
-        self.refresh_tasks(cx);
-        self.sync_detail_panel(cx);
+        self.refresh_from_store(cx);
     }
 
     pub fn apply_event(&mut self, event: &fluxdown_protocol::ServiceEvent, cx: &mut Context<Self>) {
@@ -403,9 +408,7 @@ impl DownloadView {
             ) {
                 self.reconcile_sidebar_selection();
             }
-            self.sync_delegate_context(cx);
-            self.refresh_tasks(cx);
-            self.sync_detail_panel(cx);
+            self.schedule_table_refresh(cx);
         } else {
             cx.notify();
         }
@@ -556,6 +559,47 @@ impl DownloadView {
             }
         });
         cx.notify();
+    }
+
+    /// 任务 / 上下文变化后立即把存储同步进表格、侧栏与详情面板。
+    fn refresh_from_store(&mut self, cx: &mut Context<Self>) {
+        self.sync_delegate_context(cx);
+        self.refresh_tasks(cx);
+        self.sync_detail_panel(cx);
+        self.refreshed_structure = self.controller.store().structure_generation();
+        self.refresh_gate.flushed(Instant::now());
+    }
+
+    /// 事件使表格数据过期：按 [`RefreshGate`] 合并成一次刷新（同批事件之后、≤30Hz），
+    /// 而不是每条事件都全量重算可见行。
+    fn schedule_table_refresh(&mut self, cx: &mut Context<Self>) {
+        let structural = self.controller.store().structure_generation() != self.refreshed_structure;
+        match self.refresh_gate.mark(structural, Instant::now()) {
+            RefreshPlan::Nothing => {}
+            RefreshPlan::Deferred => {
+                let this = cx.weak_entity();
+                cx.defer(move |cx| {
+                    let _ = this.update(cx, |this, cx| {
+                        this.run_scheduled_refresh(RefreshTrigger::Deferred, cx);
+                    });
+                });
+            }
+            RefreshPlan::After(delay) => {
+                cx.spawn(async move |this, cx| {
+                    cx.background_executor().timer(delay).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.run_scheduled_refresh(RefreshTrigger::Timer, cx);
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn run_scheduled_refresh(&mut self, trigger: RefreshTrigger, cx: &mut Context<Self>) {
+        if self.refresh_gate.take(trigger, Instant::now()) {
+            self.refresh_from_store(cx);
+        }
     }
 
     pub(crate) fn select_sidebar_item(
@@ -1152,8 +1196,9 @@ impl DownloadView {
         }
     }
 
-    /// 拖放导入：`.torrent` 直接建任务；`.txt`/`.url`/`.list`（≤1MB）按行提取
-    /// 受支持的链接后打开新建下载窗口预填；其他文件类型提示不支持。
+    /// 拖放导入：`.torrent` 按用户主动打开处理（走 BT 文件选择后建任务）；
+    /// `.txt`/`.url`/`.list`（≤1MB）按行提取
+    /// 受支持的链接后打开新建下载窗口预填（窗口已开则追加进表单）；其他文件类型提示不支持。
     fn on_paths_dropped(
         &mut self,
         paths: &ExternalPaths,
@@ -1169,9 +1214,7 @@ impl DownloadView {
                 .and_then(|ext| ext.to_str())
                 .map(str::to_ascii_lowercase);
             match ext.as_deref() {
-                Some("torrent") => torrent_commands.push(DownloadsCommand::SubmitTorrentFile {
-                    path: path.display().to_string(),
-                }),
+                Some("torrent") => torrent_commands.push(DownloadsCommand::open_torrent_file(path)),
                 Some("txt" | "url" | "list") => match read_drop_text_file(path) {
                     Some(text) => urls.extend(parse_drop_urls(&text)),
                     None => unsupported = true,
@@ -1493,9 +1536,7 @@ impl DownloadView {
                         .and_then(|ext| ext.to_str())
                         .is_some_and(|ext| ext.eq_ignore_ascii_case("torrent"))
                 })
-                .map(|path| DownloadsCommand::SubmitTorrentFile {
-                    path: path.display().to_string(),
-                })
+                .map(|path| DownloadsCommand::open_torrent_file(&path))
                 .collect();
             let _ = this.update(cx, |this, cx| this.execute_commands(commands, cx));
         })

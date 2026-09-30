@@ -9,4 +9,5 @@ workspace = true
 
 [dependencies]
 serde_json.workspace = true
+sys-locale = "0.3.2"
 thiserror.workspace = true

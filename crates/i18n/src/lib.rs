@@ -256,23 +256,31 @@ impl Translator {
     }
 }
 
-/// 系统界面语言：`LC_ALL` → `LC_MESSAGES` → `LANG` 中第一个非空值，去掉编码后缀；
-/// `C` / `POSIX` 或都未设置时为 `en`。偏好 `general.locale` 为 `system` 时使用，桌面、
-/// 设置页与 agent 托盘共用同一推导，保证文案同语言。
+/// 系统界面语言：`LC_ALL` → `LC_MESSAGES` → `LANG` 中第一个非空值（去掉编码后缀）优先，
+/// 便于 Unix 用户显式覆盖；三者都未设置或为 `C` / `POSIX` 时回退系统 API
+/// （Windows、从 Finder 启动的 macOS），仍取不到为 `en`。偏好 `general.locale` 为
+/// `system` 时使用，桌面、设置页与 agent 托盘共用同一推导，保证文案同语言。
 #[must_use]
 pub fn system_locale() -> String {
+    resolve_system_locale(|key| std::env::var(key).ok(), sys_locale::get_locale)
+}
+
+fn resolve_system_locale(
+    env: impl Fn(&str) -> Option<String>,
+    system: impl FnOnce() -> Option<String>,
+) -> String {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .into_iter()
-        .filter_map(|key| std::env::var(key).ok())
+        .filter_map(env)
         .find(|value| !value.trim().is_empty())
-        .and_then(|value| {
-            value
-                .split('.')
-                .next()
-                .map(|locale| locale.trim().to_owned())
-        })
-        .filter(|locale| !locale.is_empty() && locale != "C" && locale != "POSIX")
+        .and_then(|value| clean_locale(&value))
+        .or_else(|| system().and_then(|value| clean_locale(&value)))
         .unwrap_or_else(|| "en".to_owned())
+}
+
+fn clean_locale(raw: &str) -> Option<String> {
+    let locale = raw.split('.').next()?.trim();
+    (!locale.is_empty() && locale != "C" && locale != "POSIX").then(|| locale.to_owned())
 }
 
 fn normalize_locale(locale: &str) -> String {
@@ -291,7 +299,39 @@ fn locale_rank(locale: &str) -> u8 {
 mod tests {
     use std::{collections::BTreeSet, sync::Arc};
 
-    use super::{I18nCatalog, I18nError};
+    use super::{I18nCatalog, I18nError, resolve_system_locale};
+
+    fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn system_locale_prefers_env_then_system_api() {
+        let sys = || Some("zh-Hans-CN".to_owned());
+        assert_eq!(
+            resolve_system_locale(env_of(&[("LANG", "fr_FR.UTF-8")]), sys),
+            "fr_FR"
+        );
+        assert_eq!(
+            resolve_system_locale(env_of(&[("LC_ALL", ""), ("LANG", "C")]), sys),
+            "zh-Hans-CN"
+        );
+        assert_eq!(resolve_system_locale(env_of(&[]), sys), "zh-Hans-CN");
+        assert_eq!(resolve_system_locale(env_of(&[]), || None), "en");
+    }
+
+    #[test]
+    fn system_locale_forms_normalize_to_zh() -> Result<(), I18nError> {
+        let catalog = I18nCatalog::load_embedded()?;
+        assert_eq!(catalog.resolve_locale("zh-Hans-CN"), "zh");
+        assert_eq!(catalog.resolve_locale("zh_CN"), "zh");
+        Ok(())
+    }
 
     #[test]
     fn resolves_exact_prefix_and_fallback_locales() -> Result<(), I18nError> {

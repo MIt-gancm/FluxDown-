@@ -198,6 +198,7 @@ fn sync_captures(cx: &mut App, pending: &[PendingCaptureDto]) {
 }
 
 fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCaptureDto>) {
+    let initial_urls = context.initial_urls.clone();
     let desktop = Desktop::global(cx);
     let translator = desktop.translator.clone();
     let client = desktop.client.clone();
@@ -260,7 +261,18 @@ fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCap
             crate::windows::bring_to_front(window, cx)
         });
     } else if let Some(handle) = WindowRegistry::handle(cx, &WindowKey::NewDownload) {
+        // 窗口已开：新建流程不会重建表单，拖入的链接追加进已有表单（去重、保留已输入内容）。
+        let form = cx
+            .global::<CaptureDispatch>()
+            .form
+            .as_ref()
+            .and_then(WeakEntity::upgrade);
         let _ = handle.update(cx, |_, window, cx| {
+            if let Some(form) = form
+                && !initial_urls.is_empty()
+            {
+                form.update(cx, |form, cx| form.append_urls(initial_urls, window, cx));
+            }
             crate::windows::bring_to_front(window, cx)
         });
     }

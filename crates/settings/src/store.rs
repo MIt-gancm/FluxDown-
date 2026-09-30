@@ -198,6 +198,17 @@ impl SettingsStore {
         cx.notify();
     }
 
+    /// 投递日志：增量按 deliveryId 合并；清空只由显式事件表达。
+    fn apply_webhook_event(&mut self, event: &DaemonEvent) {
+        match event {
+            DaemonEvent::WebhooksChanged(delta) => {
+                fluxdown_protocol::merge_webhook_deliveries(&mut self.webhook_deliveries, delta);
+            }
+            DaemonEvent::WebhooksCleared => self.webhook_deliveries.clear(),
+            _ => {}
+        }
+    }
+
     pub fn apply_event(&mut self, event: &ServiceEvent, cx: &mut Context<Self>) {
         let ServiceEvent::Agent(event) = event else {
             return;
@@ -217,9 +228,9 @@ impl SettingsStore {
             AgentEvent::Daemon(DaemonEvent::ComponentsChanged(components)) => {
                 self.components.clone_from(components)
             }
-            AgentEvent::Daemon(DaemonEvent::WebhooksChanged(deliveries)) => {
-                self.webhook_deliveries.clone_from(deliveries)
-            }
+            AgentEvent::Daemon(
+                event @ (DaemonEvent::WebhooksChanged(_) | DaemonEvent::WebhooksCleared),
+            ) => self.apply_webhook_event(event),
             AgentEvent::GatewayChanged(gateway) => {
                 self.gateway.clone_from(gateway);
                 self.gateway_token_stale = true;
@@ -1175,6 +1186,46 @@ mod tests {
         ) -> PortFuture<serde_json::Value> {
             Box::pin(async { Ok(serde_json::Value::Null) })
         }
+    }
+
+    fn delivery(id: &str, ts: i64) -> fluxdown_protocol::WebhookDeliveryDto {
+        fluxdown_protocol::WebhookDeliveryDto {
+            delivery_id: id.to_owned(),
+            timestamp_ms: ts,
+            event: String::new(),
+            endpoint_id: String::new(),
+            endpoint_name: String::new(),
+            url: String::new(),
+            request_headers: String::new(),
+            request_body: String::new(),
+            status_code: 200,
+            response_body: String::new(),
+            latency_ms: 0,
+            attempts: 1,
+            success: true,
+            error: String::new(),
+        }
+    }
+
+    #[test]
+    fn webhook_delta_merges_and_clear_is_explicit() {
+        use fluxdown_protocol::DaemonEvent;
+        let mut store = SettingsStore::new(Arc::new(NullPort));
+        store.apply_webhook_event(&DaemonEvent::WebhooksChanged(vec![
+            delivery("a", 1),
+            delivery("b", 2),
+        ]));
+        store.apply_webhook_event(&DaemonEvent::WebhooksChanged(vec![delivery("c", 3)]));
+        let ids: Vec<&str> = store
+            .webhook_deliveries()
+            .iter()
+            .map(|d| d.delivery_id.as_str())
+            .collect();
+        assert_eq!(ids, ["c", "b", "a"]);
+        store.apply_webhook_event(&DaemonEvent::WebhooksChanged(Vec::new()));
+        assert_eq!(store.webhook_deliveries().len(), 3);
+        store.apply_webhook_event(&DaemonEvent::WebhooksCleared);
+        assert!(store.webhook_deliveries().is_empty());
     }
 
     const PREF: &str = "download.max_concurrent_tasks";

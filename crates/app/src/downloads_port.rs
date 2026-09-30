@@ -70,6 +70,21 @@ impl DownloadsPort for AgentDownloadsPort {
                     method::DAEMON_TASK_DELETE,
                     json!({ "taskId": task_id, "deleteFiles": delete_files }),
                 ),
+                DownloadsCommand::PauseMany { task_ids } => (
+                    method::DAEMON_TASK_PAUSE_MANY,
+                    json!({ "taskIds": task_ids }),
+                ),
+                DownloadsCommand::ResumeMany { task_ids } => (
+                    method::DAEMON_TASK_RESUME_MANY,
+                    json!({ "taskIds": task_ids }),
+                ),
+                DownloadsCommand::DeleteMany {
+                    task_ids,
+                    delete_files,
+                } => (
+                    method::DAEMON_TASK_DELETE_MANY,
+                    json!({ "taskIds": task_ids, "deleteFiles": delete_files }),
+                ),
                 DownloadsCommand::PauseAll => (method::DAEMON_TASK_PAUSE_ALL, json!({})),
                 DownloadsCommand::ResumeAll => (method::DAEMON_TASK_RESUME_ALL, json!({})),
                 DownloadsCommand::IgnorePluginRetry { task_id } => (
@@ -92,6 +107,7 @@ impl DownloadsPort for AgentDownloadsPort {
                             request: *request,
                             torrent_blob_id: None,
                             unattended: false,
+                            hint_file_size: None,
                         })?,
                     )
                 }
@@ -193,9 +209,15 @@ impl DownloadsPort for AgentDownloadsPort {
                     json!({ "taskId": task_id }),
                 ),
                 DownloadsCommand::RescanFiles => (method::DAEMON_TASK_RESCAN, json!({})),
-                DownloadsCommand::SubmitTorrentFile { path } => (
+                DownloadsCommand::SubmitTorrentFile {
+                    path,
+                    silent,
+                    save_dir,
+                    queue_id,
+                    start_paused,
+                } => (
                     method::AGENT_CAPTURE_SUBMIT_TORRENT_FILE,
-                    json!({ "path": path, "silent": true }),
+                    torrent_file_params(path, silent, save_dir, queue_id, start_paused),
                 ),
                 DownloadsCommand::SetLocalPreference { key, value } => (
                     method::AGENT_PREFERENCES_PATCH,
@@ -222,4 +244,62 @@ fn serialize<T: serde::Serialize>(value: T) -> Result<Value, fluxdown_protocol::
 
 fn internal_error() -> fluxdown_protocol::RpcErrorData {
     fluxdown_protocol::RpcErrorData::new(fluxdown_protocol::ApplicationErrorCode::Internal, false)
+}
+
+/// `agent.capture.submitTorrentFile` 参数：`saveDir` / `queueId` / `startPaused` 仅在表单入口
+/// 携带，缺省时省略，agent 维持原有默认行为。
+fn torrent_file_params(
+    path: String,
+    silent: bool,
+    save_dir: Option<String>,
+    queue_id: Option<String>,
+    start_paused: Option<bool>,
+) -> Value {
+    let mut params = json!({ "path": path, "silent": silent });
+    if let Value::Object(map) = &mut params {
+        if let Some(save_dir) = save_dir {
+            map.insert("saveDir".to_owned(), Value::String(save_dir));
+        }
+        if let Some(queue_id) = queue_id {
+            map.insert("queueId".to_owned(), Value::String(queue_id));
+        }
+        if let Some(start_paused) = start_paused {
+            map.insert("startPaused".to_owned(), Value::Bool(start_paused));
+        }
+    }
+    params
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::torrent_file_params;
+
+    #[test]
+    fn user_initiated_torrent_carries_form_options() {
+        let params = torrent_file_params(
+            "/tmp/a.torrent".to_owned(),
+            false,
+            Some("/data".to_owned()),
+            Some("q1".to_owned()),
+            Some(true),
+        );
+        assert_eq!(
+            params,
+            json!({
+                "path": "/tmp/a.torrent",
+                "silent": false,
+                "saveDir": "/data",
+                "queueId": "q1",
+                "startPaused": true,
+            })
+        );
+    }
+
+    #[test]
+    fn torrent_without_form_options_omits_them() {
+        let params = torrent_file_params("/tmp/a.torrent".to_owned(), true, None, None, None);
+        assert_eq!(params, json!({ "path": "/tmp/a.torrent", "silent": true }));
+    }
 }

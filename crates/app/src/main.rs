@@ -18,6 +18,7 @@ mod launch;
 mod lifecycle;
 mod logging;
 mod menus;
+mod plugin_notices;
 mod power;
 mod preference_writes;
 mod progress_windows;

@@ -51,6 +51,14 @@ pub struct RemoteSubmission {
     pub captures: Vec<String>,
 }
 
+/// 表单里与种子文件相关的提交选项（种子文件本身不带这些）。空串 = 由 agent 用默认值。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TorrentFileOptions {
+    pub save_dir: String,
+    pub queue_id: String,
+    pub start_paused: bool,
+}
+
 /// 表单确认后的提交内容。
 #[derive(Clone, Debug)]
 pub enum NewDownloadSubmission {
@@ -60,8 +68,12 @@ pub enum NewDownloadSubmission {
         tasks: Vec<CreateTaskRequest>,
         captures: Vec<CapturedTask>,
     },
-    /// 本机 `.torrent` 文件，交给 agent 读取上传。
-    TorrentFiles(Vec<PathBuf>),
+    /// 本机 `.torrent` 文件，交给 agent 读取上传；用户主动打开，走 BT 文件选择，
+    /// 并带上表单当前的保存目录 / 队列 / 开始状态。
+    TorrentFiles {
+        paths: Vec<PathBuf>,
+        options: TorrentFileOptions,
+    },
     /// 逐条下发到云账号其他设备 / 已配对设备。
     Remote(RemoteSubmission),
 }
@@ -89,14 +101,15 @@ impl NewDownloadSubmission {
                 .iter()
                 .chain(captures.iter().map(|capture| &capture.request))
                 .all(|request| !request.start_paused),
-            Self::TorrentFiles(_) | Self::Remote(_) => true,
+            Self::TorrentFiles { options, .. } => !options.start_paused,
+            Self::Remote(_) => true,
         }
     }
 
     fn target(&self) -> DispatchTarget {
         match self {
             Self::Remote(remote) => remote.target.clone(),
-            Self::Tasks { .. } | Self::TorrentFiles(_) => DispatchTarget::Local,
+            Self::Tasks { .. } | Self::TorrentFiles { .. } => DispatchTarget::Local,
         }
     }
 
@@ -133,6 +146,7 @@ impl NewDownloadSubmission {
                                 request,
                                 torrent_blob_id: None,
                                 unattended: false,
+                                hint_file_size: None,
                             },
                         ))
                     })
@@ -147,11 +161,15 @@ impl NewDownloadSubmission {
                 best_effort,
                 remote: None,
             },
-            Self::TorrentFiles(paths) => SubmissionPlan {
+            Self::TorrentFiles { paths, options } => SubmissionPlan {
                 commands: paths
                     .iter()
                     .map(|path| DownloadsCommand::SubmitTorrentFile {
                         path: path.display().to_string(),
+                        silent: false,
+                        save_dir: Some(options.save_dir.clone()).filter(|dir| !dir.is_empty()),
+                        queue_id: Some(options.queue_id.clone()).filter(|id| !id.is_empty()),
+                        start_paused: Some(options.start_paused),
                     })
                     .collect(),
                 best_effort,
@@ -503,5 +521,60 @@ mod tests {
         assert!(!notice.ok);
         assert_eq!(notice.message, translator.text("localServiceDisconnected"));
         Ok(())
+    }
+
+    #[test]
+    fn torrent_files_are_user_initiated_and_carry_form_options() {
+        let plan = NewDownloadSubmission::TorrentFiles {
+            paths: vec![
+                PathBuf::from("/tmp/a.torrent"),
+                PathBuf::from("/tmp/b.torrent"),
+            ],
+            options: TorrentFileOptions {
+                save_dir: "/data/bt".to_owned(),
+                queue_id: "q1".to_owned(),
+                start_paused: true,
+            },
+        }
+        .plan();
+        assert_eq!(plan.commands.len(), 2);
+        for command in &plan.commands {
+            let DownloadsCommand::SubmitTorrentFile {
+                silent,
+                save_dir,
+                queue_id,
+                start_paused,
+                ..
+            } = command
+            else {
+                panic!("torrent files must use submitTorrentFile");
+            };
+            assert!(
+                !silent,
+                "user-initiated torrents must go through file selection"
+            );
+            assert_eq!(save_dir.as_deref(), Some("/data/bt"));
+            assert_eq!(queue_id.as_deref(), Some("q1"));
+            assert_eq!(*start_paused, Some(true));
+        }
+    }
+
+    #[test]
+    fn torrent_files_with_blank_form_options_defer_to_agent_defaults() {
+        let plan = NewDownloadSubmission::TorrentFiles {
+            paths: vec![PathBuf::from("/tmp/a.torrent")],
+            options: TorrentFileOptions::default(),
+        }
+        .plan();
+        let [
+            DownloadsCommand::SubmitTorrentFile {
+                save_dir, queue_id, ..
+            },
+        ] = plan.commands.as_slice()
+        else {
+            panic!("one torrent, one command");
+        };
+        assert_eq!(save_dir, &None);
+        assert_eq!(queue_id, &None);
     }
 }

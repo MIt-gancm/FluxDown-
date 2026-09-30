@@ -350,7 +350,7 @@ async fn connect(
     let mut buffered = Vec::new();
     let hello = serde_json::json!({
         "clientName": "fluxdown-desktop",
-        "clientVersion": env!("CARGO_PKG_VERSION"),
+        "clientVersion": fluxdown_protocol::APP_VERSION,
         "minProtocolVersion": fluxdown_protocol::MIN_PROTOCOL_VERSION,
         "maxProtocolVersion": fluxdown_protocol::PROTOCOL_VERSION,
         "requestedRole": "agent",

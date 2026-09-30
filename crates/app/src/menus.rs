@@ -346,7 +346,7 @@ fn show_about(cx: &mut App) {
                             fluxdown_ui_components::option_row(
                                 version_label.clone(),
                                 None,
-                                value(format!("v{}", env!("CARGO_PKG_VERSION"))),
+                                value(format!("v{}", fluxdown_protocol::APP_VERSION)),
                                 cx,
                             )
                             .into_any_element(),

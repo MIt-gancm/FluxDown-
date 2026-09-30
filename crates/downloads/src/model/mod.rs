@@ -1,9 +1,11 @@
 pub(crate) mod categories;
+pub(crate) mod counts;
 pub(crate) mod devices;
 pub(crate) mod dispatch;
 pub(crate) mod file_rescan;
 pub(crate) mod new_download;
 pub(crate) mod progress_window;
+pub(crate) mod refresh_gate;
 pub(crate) mod row_order;
 pub(crate) mod shutdown;
 pub(crate) mod source_composition;
@@ -323,6 +325,9 @@ pub(crate) struct DownloadTaskView {
     pub(crate) url: String,
     pub(crate) origin_url: String,
     pub(crate) site: String,
+    /// 大小写折叠后的链接 / 站点：建行时算一次，搜索不再逐行分配。
+    pub(crate) url_fold: String,
+    pub(crate) site_fold: String,
     pub(crate) referrer: String,
     pub(crate) save_dir: String,
     pub(crate) group_id: String,
@@ -461,6 +466,8 @@ impl DownloadTaskView {
             metadata_pending,
             site: url_host(url).to_owned(),
             url: url.to_owned(),
+            url_fold: url.to_lowercase(),
+            site_fold: url_host(url).to_lowercase(),
             origin_url: String::new(),
             referrer: String::new(),
             save_dir: String::new(),

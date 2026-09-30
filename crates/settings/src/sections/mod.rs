@@ -167,28 +167,6 @@ impl SectionContext<'_> {
         )
     }
 
-    pub(crate) fn pref_number(
-        &self,
-        key: &'static str,
-        default: i64,
-        min: i64,
-        max: i64,
-    ) -> Control {
-        let get = self.store();
-        let set = self.store();
-        Control::number(
-            min as f64,
-            max as f64,
-            1.0,
-            move |cx: &App| get.read(cx).pref_i64(key, default) as f64,
-            move |value, cx: &mut App| {
-                set.update(cx, |store, cx| {
-                    store.set_pref_i64(key, value.round() as i64, cx);
-                });
-            },
-        )
-    }
-
     pub(crate) fn pref_dropdown(
         &self,
         key: &'static str,

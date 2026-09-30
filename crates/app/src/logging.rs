@@ -161,7 +161,7 @@ const fn to_level(level: log::Level) -> Level {
 
 fn session_header() -> String {
     let mut lines = vec![
-        format!("  version: {}", env!("CARGO_PKG_VERSION")),
+        format!("  version: {}", fluxdown_protocol::APP_VERSION),
         format!(
             "  exe: {}",
             std::env::current_exe()

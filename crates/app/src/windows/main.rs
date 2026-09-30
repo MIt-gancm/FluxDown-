@@ -174,8 +174,9 @@ pub fn open(cx: &mut App) -> Option<WindowHandle<Root>> {
         root
     });
     if handle.is_some() {
-        // 启动前就已存在的入站配对请求：窗口就绪后补弹。
+        // 启动前就已存在的入站配对请求、窗口尚未就绪时跳过的插件熔断提示：窗口就绪后补弹。
         cx.defer(crate::account_host::replay_pending);
+        cx.defer(crate::plugin_notices::replay_pending);
     }
     handle
 }

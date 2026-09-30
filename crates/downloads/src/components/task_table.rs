@@ -1,6 +1,6 @@
 use std::{
-    cell::Cell,
-    collections::{HashMap, HashSet},
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet, VecDeque},
     rc::Rc,
     time::Instant,
 };
@@ -26,6 +26,7 @@ use gpui_component::{
 };
 
 use crate::{
+    batch::{MAX_IN_FLIGHT, coalesce_commands, retry_copy, retry_delay},
     components::{
         file_icon::{SystemFileIcon, system_file_icon},
         task_drag::DraggedTasks,
@@ -34,6 +35,7 @@ use crate::{
     model::{
         CategoryIndex, DownloadFilter, DownloadTaskView, RowId, RowKey, SidebarSelection, TaskKind,
         TaskProtocol, TaskSource, TaskState, TaskStore,
+        counts::SidebarCounts,
         dispatch::DispatchSummary,
         format_bytes,
         row_order::RowOrder,
@@ -275,6 +277,33 @@ struct GroupBucket {
     order: i64,
 }
 
+/// 上次计算的侧栏计数及其有效期键（存储 generation + 分类索引身份）。
+struct CountsCache {
+    generation: u64,
+    categories: Rc<CategoryIndex>,
+    counts: Rc<SidebarCounts>,
+}
+
+/// 按 key 分桶：桶顺序为 key 首次出现的顺序，桶元数据取首个成员的；用 key → 下标的
+/// 哈希表定位，分桶数很多时（如按站点分组）仍是线性。
+fn group_by_key<B, V>(
+    items: impl IntoIterator<Item = (B, V)>,
+    key_of: impl Fn(&B) -> &str,
+) -> Vec<(B, Vec<V>)> {
+    let mut index: HashMap<String, usize> = HashMap::new();
+    let mut groups: Vec<(B, Vec<V>)> = Vec::new();
+    for (bucket, value) in items {
+        match index.get(key_of(&bucket)) {
+            Some(&ix) => groups[ix].1.push(value),
+            None => {
+                index.insert(key_of(&bucket).to_owned(), groups.len());
+                groups.push((bucket, vec![value]));
+            }
+        }
+    }
+    groups
+}
+
 /// 侧栏选中项到表格筛选的投影。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TableFilter {
@@ -446,6 +475,8 @@ pub(crate) struct DownloadTableDelegate {
     pub(crate) columns: Vec<DownloadColumn>,
     store: Rc<TaskStore>,
     categories: Rc<CategoryIndex>,
+    /// 侧栏计数缓存（侧栏渲染经不可变引用读取，故内部可变）。
+    counts: RefCell<Option<CountsCache>>,
     visible: Vec<VisibleRow>,
     seen_generation: u64,
     /// 上次重算时存储的结构计数；未变说明只有行内容变化，可沿用上次的行顺序。
@@ -492,6 +523,7 @@ impl DownloadTableDelegate {
                 .collect(),
             store,
             categories: Rc::new(CategoryIndex::default()),
+            counts: RefCell::new(None),
             visible: Vec::new(),
             seen_generation: u64::MAX,
             seen_structure: u64::MAX,
@@ -803,8 +835,8 @@ impl DownloadTableDelegate {
             return true;
         }
         task.name_fold.contains(&self.query)
-            || task.url.to_lowercase().contains(&self.query)
-            || task.site.to_lowercase().contains(&self.query)
+            || task.url_fold.contains(&self.query)
+            || task.site_fold.contains(&self.query)
     }
 
     fn matches_filter(&self, task: &DownloadTaskView) -> bool {
@@ -845,17 +877,11 @@ impl DownloadTableDelegate {
                 .collect();
         }
 
-        let mut buckets: Vec<(GroupBucket, Vec<RowId>)> = Vec::new();
-        for (id, task) in rows {
-            let bucket = self.group_bucket(task);
-            match buckets
-                .iter_mut()
-                .find(|(existing, _)| existing.key == bucket.key)
-            {
-                Some((_, ids)) => ids.push(id),
-                None => buckets.push((bucket, vec![id])),
-            }
-        }
+        let mut buckets = group_by_key(
+            rows.into_iter()
+                .map(|(id, task)| (self.group_bucket(task), id)),
+            |bucket: &GroupBucket| bucket.key.as_str(),
+        );
         buckets.sort_by(|(left, _), (right, _)| {
             left.order
                 .cmp(&right.order)
@@ -987,32 +1013,41 @@ impl DownloadTableDelegate {
             .collect()
     }
 
-    pub(crate) fn count_matching(&self, filter: &DownloadFilter) -> usize {
+    /// 侧栏计数：按存储 generation 与分类索引缓存，一次扫描得出全部桶。
+    fn sidebar_counts(&self) -> Rc<SidebarCounts> {
+        let generation = self.store.generation();
+        let mut cache = self.counts.borrow_mut();
+        if let Some(cached) = cache.as_ref()
+            && cached.generation == generation
+            && Rc::ptr_eq(&cached.categories, &self.categories)
+        {
+            return Rc::clone(&cached.counts);
+        }
         let local = self.store.local();
         let remote = self.store.remote();
-        local
-            .iter()
-            .chain(remote.iter())
-            .filter(|task| filter.matches(task, &self.categories))
-            .count()
+        let counts = Rc::new(SidebarCounts::compute(
+            local.iter().chain(remote.iter()),
+            &self.categories,
+        ));
+        *cache = Some(CountsCache {
+            generation,
+            categories: Rc::clone(&self.categories),
+            counts: Rc::clone(&counts),
+        });
+        counts
     }
 
-    pub(crate) fn count_where(&self, predicate: impl Fn(&DownloadTaskView) -> bool) -> usize {
-        let local = self.store.local();
-        let remote = self.store.remote();
-        local
-            .iter()
-            .chain(remote.iter())
-            .filter(|t| predicate(t))
-            .count()
+    pub(crate) fn count_matching(&self, filter: &DownloadFilter) -> usize {
+        self.sidebar_counts().filter(filter)
     }
 
     pub(crate) fn count_in_queue(&self, queue_id: &str) -> usize {
-        self.store
-            .local()
-            .iter()
-            .filter(|task| task.queue_id == queue_id)
-            .count()
+        self.sidebar_counts().queue(queue_id)
+    }
+
+    /// 设备计数：与表格筛选同一规则（[`SidebarSelection::device_matches`]）。
+    pub(crate) fn count_device(&self, device_id: &str) -> usize {
+        self.sidebar_counts().device(device_id)
     }
 
     fn shown_columns_count(&self) -> usize {
@@ -2807,9 +2842,12 @@ impl DownloadView {
         self.execute_commands(commands, cx);
     }
 
-    /// 逐条执行；任一失败在页面横幅提示（按错误 `reason` 给出原因，同一批里先失败的
-    /// 错误一直保留，后完成的成功不会冲掉它）。只含一条单任务「继续」/「重新下载」时，
-    /// 成功后通知宿主这是一次交互式开始（批量选择不逐个弹进度窗口）。
+    /// 执行一批命令。同类多任务的暂停 / 继续 / 删除先合并成批量 RPC
+    /// （见 [`coalesce_commands`]），其余命令按 [`MAX_IN_FLIGHT`] 限制并发；幂等命令被
+    /// agent 以可重试的 `Unavailable` 拒绝时退避重试。任一失败在页面横幅提示（按错误
+    /// `reason` 给出原因，同一批里先失败的错误一直保留，后完成的成功不会冲掉它）。
+    /// 只含一条单任务「继续」/「重新下载」时，成功后通知宿主这是一次交互式开始
+    /// （批量选择不逐个弹进度窗口）。
     pub(crate) fn execute_commands(
         &mut self,
         commands: Vec<DownloadsCommand>,
@@ -2820,31 +2858,61 @@ impl DownloadView {
             [DownloadsCommand::Redownload(request, _)] if !request.start_paused => Some(None),
             _ => None,
         };
-        let batch = Rc::new(std::cell::RefCell::new(DispatchSummary::default()));
-        for command in commands {
-            // 打开失败多半是文件已被删除 / 移走：立即重扫，让行上的丢失标记跟上磁盘现状。
-            let rescan_on_failure = matches!(command, DownloadsCommand::OpenTask { .. });
-            let future = self.controller.execute(command);
-            let interactive_start = interactive_start.clone();
+        let queue = Rc::new(RefCell::new(VecDeque::from(coalesce_commands(commands))));
+        let batch = Rc::new(RefCell::new(DispatchSummary::default()));
+        let workers = queue.borrow().len().min(MAX_IN_FLIGHT);
+        for _ in 0..workers {
+            let queue = Rc::clone(&queue);
             let batch = Rc::clone(&batch);
+            let interactive_start = interactive_start.clone();
             cx.spawn(async move |this, cx| {
-                let result = future.await;
-                batch.borrow_mut().record(&result);
-                let _ = this.update(cx, |this, cx| {
-                    if rescan_on_failure && result.is_err() {
-                        this.rescan_files_now(cx);
-                    }
-                    this.last_error = batch.borrow().first_error.as_ref().map(|error| {
-                        SharedString::from(error_text(this.translator.read(cx), error))
+                loop {
+                    let Some(mut command) = queue.borrow_mut().pop_front() else {
+                        break;
+                    };
+                    // 打开失败多半是文件已被删除 / 移走：立即重扫，让行上的丢失标记跟上磁盘现状。
+                    let rescan_on_failure = matches!(command, DownloadsCommand::OpenTask { .. });
+                    let mut retries = 0_u32;
+                    let result = loop {
+                        let replay = retry_copy(&command);
+                        let Ok((future, stale)) = this.update(cx, |this, _| {
+                            (this.controller.execute(command), this.controller.is_stale())
+                        }) else {
+                            return;
+                        };
+                        let result = future.await;
+                        let wait = match (&result, replay) {
+                            (Err(error), Some(replay)) if !stale => {
+                                retry_delay(error, retries).map(|delay| (delay, replay))
+                            }
+                            _ => None,
+                        };
+                        let Some((delay, replay)) = wait else {
+                            break result;
+                        };
+                        cx.background_executor().timer(delay).await;
+                        command = replay;
+                        retries += 1;
+                    };
+                    batch.borrow_mut().record(&result);
+                    let interactive_start = interactive_start.clone();
+                    let batch = Rc::clone(&batch);
+                    let _ = this.update(cx, |this, cx| {
+                        if rescan_on_failure && result.is_err() {
+                            this.rescan_files_now(cx);
+                        }
+                        this.last_error = batch.borrow().first_error.as_ref().map(|error| {
+                            SharedString::from(error_text(this.translator.read(cx), error))
+                        });
+                        if let (Ok(result), Some(resumed)) = (&result, interactive_start) {
+                            // 继续：原任务 ID；重新下载：响应里的新任务 ID。
+                            let started =
+                                resumed.map_or_else(|| result.created_task_ids(), |id| vec![id]);
+                            this.notify_user_started(&started, cx);
+                        }
+                        cx.notify();
                     });
-                    if let (Ok(result), Some(resumed)) = (&result, interactive_start) {
-                        // 继续：原任务 ID；重新下载：响应里的新任务 ID。
-                        let started =
-                            resumed.map_or_else(|| result.created_task_ids(), |id| vec![id]);
-                        this.notify_user_started(&started, cx);
-                    }
-                    cx.notify();
-                });
+                }
             })
             .detach();
         }
@@ -2868,7 +2936,7 @@ mod tests {
 
     use super::{
         DownloadColumnKind, DownloadTableDelegate, DownloadsCommand, RowAction, SelectionSummary,
-        ToolbarCommand, VisibleRow, percent_label, row_actions, task_command,
+        ToolbarCommand, VisibleRow, group_by_key, percent_label, row_actions, task_command,
     };
     use crate::{
         model::{
@@ -3123,6 +3191,41 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn group_by_key_matches_linear_bucketing() {
+        // 交错重复的 key：桶顺序为首次出现顺序，成员保持原相对顺序。
+        let keys = ["b", "a", "b", "c", "a", "d", "b", "e", "c", "a"];
+        let items: Vec<(String, usize)> = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| ((*key).to_owned(), index))
+            .collect();
+        let mut expected: Vec<(String, Vec<usize>)> = Vec::new();
+        for (key, value) in items.iter().cloned() {
+            match expected.iter_mut().find(|(existing, _)| *existing == key) {
+                Some((_, members)) => members.push(value),
+                None => expected.push((key, vec![value])),
+            }
+        }
+        assert_eq!(group_by_key(items, |key: &String| key.as_str()), expected);
+    }
+
+    #[test]
+    fn search_matches_url_and_site_case_insensitively() -> Result<(), I18nError> {
+        // 文件名（f0.bin / f1.bin）不含查询词，命中只能来自链接 / 站点。
+        let mut delegate = delegate(&[1, 3])?;
+        delegate.set_query("EXAMPLE.com/FILE");
+        delegate.refresh_view();
+        assert_eq!(delegate.visible.len(), 2);
+        delegate.set_query("Example.COM");
+        delegate.refresh_view();
+        assert_eq!(delegate.visible.len(), 2);
+        delegate.set_query("other.org");
+        delegate.refresh_view();
+        assert!(delegate.visible.is_empty());
         Ok(())
     }
 

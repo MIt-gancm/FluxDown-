@@ -601,6 +601,7 @@ impl RssView {
             "too_small" => Some("rssReasonTooSmall"),
             "too_large" => Some("rssReasonTooLarge"),
             "dup_episode" => Some("rssReasonDupEpisode"),
+            "torrent_fetch_failed" => Some("rssReasonTorrentFetchFailed"),
             _ => None,
         };
         let date = date_text(item.pub_date);

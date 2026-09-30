@@ -97,6 +97,7 @@ fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&'static str
         ErrorReason::PairingRejected => "errReasonPairingRejected",
         ErrorReason::PairingSignatureInvalid => "errReasonPairingSignatureInvalid",
         ErrorReason::PairingSelf => "errReasonPairingSelf",
+        ErrorReason::PairingVersionMismatch => "errReasonPairingVersionMismatch",
         ErrorReason::PeerNotPaired => "errReasonPeerNotPaired",
         ErrorReason::PeerOffline => "errReasonPeerOffline",
         ErrorReason::TargetDeviceOffline => "errReasonTargetDeviceOffline",
@@ -112,6 +113,7 @@ fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&'static str
         | ErrorReason::PluginDownloadFailed
         | ErrorReason::PluginPackageTooLarge
         | ErrorReason::PluginPackageInvalid
+        | ErrorReason::MarketVersionChanged
         | ErrorReason::Unknown => return None,
     })
 }
@@ -338,6 +340,7 @@ mod tests {
             ErrorReason::PairingRejected,
             ErrorReason::PairingSignatureInvalid,
             ErrorReason::PairingSelf,
+            ErrorReason::PairingVersionMismatch,
             ErrorReason::PeerNotPaired,
             ErrorReason::PeerOffline,
             ErrorReason::TargetDeviceOffline,

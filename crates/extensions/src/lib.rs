@@ -57,8 +57,6 @@ pub struct ExtensionsView {
     controller: ExtensionsController,
     tab: ExtensionsTab,
     last_error: Option<String>,
-    /// 事件回调没有窗口，提示在下一帧渲染时经 `Window::defer` 投递。
-    pending_notices: Vec<String>,
     plugins: PluginsUi,
     components: [ComponentUi; 2],
 }
@@ -75,7 +73,6 @@ impl ExtensionsView {
             controller: ExtensionsController::new(port),
             tab: ExtensionsTab::Plugins,
             last_error: None,
-            pending_notices: Vec::new(),
             plugins: PluginsUi::default(),
             components: [ComponentUi::default(), ComponentUi::default()],
         }
@@ -107,13 +104,8 @@ impl ExtensionsView {
                     ui.installing = false;
                 }
             }
-            Some(ExtensionsSignal::PluginAutoDisabled { name }) => {
-                let notice = self
-                    .translator
-                    .read(cx)
-                    .text_with("pluginAutoDisabledToast", &[("name", &name)]);
-                self.pending_notices.push(notice);
-            }
+            // 熔断提示由 app 层全局弹出；本视图只刷新列表（控制器已更新本地状态）。
+            Some(ExtensionsSignal::PluginAutoDisabled { .. }) => {}
             None => {}
         }
         if !self.controller.is_stale() {
@@ -165,6 +157,7 @@ pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> Strin
         ErrorReason::PluginDownloadFailed => Some("pluginErrorDownloadFailed"),
         ErrorReason::PluginPackageTooLarge => Some("pluginErrorPackageTooLarge"),
         ErrorReason::PluginPackageInvalid => Some("pluginErrorPackageInvalid"),
+        ErrorReason::MarketVersionChanged => Some("pluginErrorMarketVersionChanged"),
         // 账户 / 远程任务 / 局域网配对等其他能力的原因不在插件页展示，退回按码的通用文案。
         _ => None,
     });
@@ -188,14 +181,6 @@ pub(crate) fn error_text(translator: &Translator, error: &RpcErrorData) -> Strin
 impl Render for ExtensionsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tab = self.tab;
-        if !self.pending_notices.is_empty() {
-            let notices = std::mem::take(&mut self.pending_notices);
-            window.defer(cx, move |window, cx| {
-                for notice in notices {
-                    window.push_notification(Notification::warning(notice), cx);
-                }
-            });
-        }
         let body = match tab {
             ExtensionsTab::Plugins => self.render_plugins(window, cx).into_any_element(),
             ExtensionsTab::Components => self.render_components(window, cx).into_any_element(),

@@ -957,7 +957,8 @@ impl ExtensionsView {
                     None => permissions.is_empty(),
                 };
                 if holds {
-                    this.start_market_install(plugin_id, op, window, cx);
+                    let version = latest.version.clone();
+                    this.start_market_install(plugin_id, version, op, window, cx);
                 } else {
                     this.plugins.market.pending.remove(&plugin_id);
                     this.confirm_market_permissions(latest, op, &permissions, window, cx);
@@ -1049,16 +1050,26 @@ impl ExtensionsView {
     fn start_market_install(
         &mut self,
         plugin_id: String,
+        version: String,
         op: PluginOp,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.plugins.market.pending.insert(plugin_id.clone());
         cx.notify();
-        let future = self.controller.market_install(plugin_id.clone());
+        let future = self.controller.market_install(plugin_id.clone(), version);
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
             let _ = this.update_in(cx, |this, window, cx| {
+                // 市场在确认之后发布了新版本：提示后刷新索引并按最新条目重新确认权限。
+                if let Err(error) = &result
+                    && error.reason == Some(fluxdown_protocol::ErrorReason::MarketVersionChanged)
+                {
+                    this.finish_plugin_op(op, result, window, cx);
+                    this.recheck_market_install(plugin_id, None, window, cx);
+                    cx.notify();
+                    return;
+                }
                 this.plugins.market.pending.remove(&plugin_id);
                 this.finish_plugin_op(op, result, window, cx);
                 cx.notify();

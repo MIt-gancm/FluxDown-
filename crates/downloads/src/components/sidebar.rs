@@ -252,10 +252,7 @@ impl DownloadView {
     /// 设备计数：与表格筛选同一规则（[`SidebarSelection::device_matches`]）——本机计所有
     /// 本地任务；具体设备按远程任务的目标设备计；「全部设备」= 本地 + 远程。
     fn device_count(&self, device_id: &str, cx: &Context<Self>) -> usize {
-        self.table_state
-            .read(cx)
-            .delegate()
-            .count_where(|task| SidebarSelection::device_matches(device_id, task))
+        self.table_state.read(cx).delegate().count_device(device_id)
     }
 
     /// 状态项：图标位在悬停时换成分类展开箭头（点击箭头只切换展开，Notion / Linear

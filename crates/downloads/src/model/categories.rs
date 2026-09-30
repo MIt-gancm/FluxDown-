@@ -109,6 +109,39 @@ impl CategoryIndex {
             .find(|rule| Self::rule_matches(rule, task))
             .map_or("builtin_other", |rule| rule.dto.id.as_str())
     }
+
+    /// 对任务命中的每个分类 id 调用一次 `emit`：与对每个不同 id 逐个调用 [`Self::matches`]
+    /// 等价（重复 id 只认首条规则；`other` 仅在没有任何具体分类命中时命中），但任务只
+    /// 对各规则求值一次，供一次扫描得出全部分类计数。
+    pub(crate) fn for_each_match<'a>(
+        &'a self,
+        task: &DownloadTaskView,
+        mut emit: impl FnMut(&'a str),
+    ) {
+        let mut specific_hit = false;
+        let mut other_ids: Vec<&'a str> = Vec::new();
+        for (index, rule) in self.rules.iter().enumerate() {
+            let is_other = matches!(rule.matcher, Matcher::Other);
+            let hit = !is_other && Self::rule_matches(rule, task);
+            specific_hit |= hit && !matches!(rule.matcher, Matcher::All);
+            let first_with_id = !self.rules[..index]
+                .iter()
+                .any(|earlier| earlier.dto.id == rule.dto.id);
+            if !first_with_id {
+                continue;
+            }
+            if is_other {
+                other_ids.push(&rule.dto.id);
+            } else if hit {
+                emit(&rule.dto.id);
+            }
+        }
+        if !specific_hit {
+            for id in other_ids {
+                emit(id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

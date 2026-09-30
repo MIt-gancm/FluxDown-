@@ -30,7 +30,9 @@ use crate::{
         },
     },
     strings::NewDownloadStrings,
-    submission::{CapturedTask, NewDownloadSubmission, RemoteItem, RemoteSubmission},
+    submission::{
+        CapturedTask, NewDownloadSubmission, RemoteItem, RemoteSubmission, TorrentFileOptions,
+    },
 };
 use fluxdown_protocol::{
     AgentSnapshot, CloudDevice, LinkDeviceInfo, PendingCaptureDto, QueueDto, SiteAuthCredentialDto,
@@ -205,7 +207,8 @@ struct AuthAutofill {
 
 /// 独立窗口承载的「新建下载」表单。
 ///
-/// 提交或取消都会关闭自身所在窗口；任务创建失败的提示由宿主展示。视图释放时仍未确认的
+/// 提交或取消都会关闭自身所在窗口（「打开种子文件」只提交种子：表单里还有待处理链接时
+/// 窗口保留，链接原样留在表单中）；任务创建失败的提示由宿主展示。视图释放时仍未确认的
 /// 外部捕获由宿主经 [`Self::take_captures`] 取走并忽略。
 pub struct NewDownloadView {
     strings: NewDownloadStrings,
@@ -461,6 +464,24 @@ impl NewDownloadView {
         self.urls
             .update(cx, |input, cx| input.set_value(text, window, cx));
         self.captures.extend(fresh);
+        self.refresh_entries(window, cx);
+    }
+
+    /// 宿主在窗口已打开时追加链接（如拖入链接文件）：原文逐字保留，已存在的 URL 跳过。
+    pub fn append_urls(&mut self, urls: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.urls.read(cx).value().to_string();
+        let text = append_entries(
+            &current,
+            urls.into_iter().map(|url| UrlEntry {
+                url,
+                ..UrlEntry::default()
+            }),
+        );
+        if text == current.trim_end() {
+            return;
+        }
+        self.urls
+            .update(cx, |input, cx| input.set_value(text, window, cx));
         self.refresh_entries(window, cx);
     }
 
@@ -797,8 +818,20 @@ impl NewDownloadView {
                 if paths.is_empty() {
                     return;
                 }
-                (this.on_submit)(NewDownloadSubmission::TorrentFiles(paths), window, cx);
-                window.remove_window();
+                let options = TorrentFileOptions {
+                    save_dir: this.save_dir.read(cx).value().trim().to_owned(),
+                    queue_id: this.context.queue_id.clone(),
+                    start_paused: false,
+                };
+                (this.on_submit)(
+                    NewDownloadSubmission::TorrentFiles { paths, options },
+                    window,
+                    cx,
+                );
+                // 只提交了种子：表单里尚未提交的链接留给用户继续处理，没有待处理链接才关窗。
+                if this.entries.is_empty() {
+                    window.remove_window();
+                }
             });
         })
         .detach();
