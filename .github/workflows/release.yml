@@ -406,6 +406,7 @@ jobs:
       - name: Build desktop, agent, daemon and browser relay
         shell: bash
         env:
+          FLUXDOWN_APP_VERSION: ${{ steps.version.outputs.VERSION }}
           FLUXCLOUD_BASE_URL_SECRET: ${{ secrets.FLUXCLOUD_BASE_URL }}
           FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
         run: |
@@ -811,6 +812,7 @@ jobs:
 
       - name: Build desktop, agent, daemon and browser relay
         env:
+          FLUXDOWN_APP_VERSION: ${{ needs.changes.outputs.version }}
           FLUXCLOUD_BASE_URL_SECRET: ${{ secrets.FLUXCLOUD_BASE_URL }}
           FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
         run: |
@@ -933,6 +935,7 @@ jobs:
         env:
           ARCHS: ${{ matrix.script_arch }}
           VERSION: ${{ needs.changes.outputs.version }}
+          FLUXDOWN_APP_VERSION: ${{ needs.changes.outputs.version }}
           ARTIFACT_PREFIX: FluxDown-${{ needs.changes.outputs.version }}-macos-${{ matrix.arch }}
           OUT_DIR: ${{ github.workspace }}/build/installer
           MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
@@ -1234,12 +1237,15 @@ jobs:
           name: server-webroot
           path: webroot
 
-      # 版本号 = crate 版本（无编译期版本注入）
+      # x86_64 目标使用基线 x86-64（RUSTFLAGS 整体替换 .cargo/config.toml 的 rustflags，
+      # 该文件当前只有 target-cpu 一项）；产品版本由 FLUXDOWN_APP_VERSION 注入。
       - name: Build server binaries (agent + daemon)
         env:
           FLUXDOWN_ANALYTICS_APP_KEY: ${{ secrets.ANALYTICS_APP_KEY }}
           FLUXCLOUD_BASE_URL: ${{ secrets.FLUXCLOUD_BASE_URL }}
           FLUXDOWN_EMBED_WEBROOT: ${{ github.workspace }}/webroot
+          FLUXDOWN_APP_VERSION: ${{ steps.version.outputs.VERSION }}
+          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
         run: |
           cargo build --release --locked -p fluxdown_agent --features web-ui --target ${{ matrix.target }}
           cargo build --release --locked -p fluxdown_daemon --target ${{ matrix.target }}
@@ -1430,7 +1436,12 @@ jobs:
           restore-keys: |
             cli-${{ matrix.platform }}-
 
+      # 服务器/NAS 常见的老 x86_64 CPU 不一定有 SSE4.2/POPCNT：x86_64 目标回退基线 x86-64
+      # （RUSTFLAGS 整体替换 .cargo/config.toml 的 rustflags，该文件当前只有 target-cpu 一项）。
       - name: Build CLI binary
+        env:
+          FLUXDOWN_APP_VERSION: ${{ steps.version.outputs.VERSION }}
+          RUSTFLAGS: ${{ startsWith(matrix.target, 'x86_64') && '-C target-cpu=x86-64' || '' }}
         run: cargo build --release --locked -p fluxdown_cli --target ${{ matrix.target }}
 
       - name: Package (tar.gz)
@@ -1530,6 +1541,7 @@ jobs:
           build-args: |
             FLUXDOWN_ANALYTICS_APP_KEY=${{ secrets.ANALYTICS_APP_KEY }}
             FLUXCLOUD_BASE_URL=${{ secrets.FLUXCLOUD_BASE_URL }}
+            FLUXDOWN_APP_VERSION=${{ steps.version.outputs.VERSION }}
           cache-from: type=gha,scope=server
           cache-to: type=gha,scope=server,mode=max
 

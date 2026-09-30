@@ -24,7 +24,7 @@ flutter build linux --release \
 
 # ── 2. Build NMH relay binary ──
 echo "[2/4] Building NMH relay binary..."
-cargo build --release -p fluxdown_nmh
+FLUXDOWN_APP_VERSION="$VERSION" cargo build --release -p fluxdown_nmh
 cp target/release/fluxdown_nmh "$BUNDLE_DIR/"
 chmod +x "$BUNDLE_DIR/fluxdown_nmh"
 

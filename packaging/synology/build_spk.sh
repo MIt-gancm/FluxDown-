@@ -6,7 +6,8 @@
 #   bindir: 含 fluxdown-agent 与 fluxdownd 两个二进制的目录
 #   dsm7: os_min_ver=7.0，conf/privilege 以套件专属用户运行（DSM 7 禁止 root）
 #   dsm6: os_min_ver=6.0 + os_max_ver=7.0 上界，root 运行（DSM 6 默认）
-#   arch 为群晖架构家族值（官方 Appendix A）：x86_64 覆盖全部 Intel/AMD 机型，
+#   arch 为群晖架构家族值（官方 Appendix A）：x86_64 覆盖全部 Intel/AMD 机型
+#   （二进制按基线 x86-64 编译，不要求 SSE4.2/POPCNT，老 Atom/AMD K10 机型可运行），
 #   armv8 覆盖 rtd1296/rtd1619b/armada37xx 等 ARM64 机型。
 #
 # 前置：imagemagick（convert）用于从 assets/logo/fluxdown_logo.png 生成套件图标。

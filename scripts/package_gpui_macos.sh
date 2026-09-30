@@ -50,7 +50,7 @@ if [ "${SKIP_BUILD:-0}" != 1 ]; then
   for arch in $ARCHS; do
     triple=$(triple_of "$arch")
     echo "== build $triple (min macOS $(min_of "$arch"))"
-    MACOSX_DEPLOYMENT_TARGET=$(min_of "$arch") cargo build --locked --release --target "$triple" \
+    FLUXDOWN_APP_VERSION="${FLUXDOWN_APP_VERSION:-$VERSION}" MACOSX_DEPLOYMENT_TARGET=$(min_of "$arch") cargo build --locked --release --target "$triple" \
       -p fluxdown_ui_app -p fluxdown_agent -p fluxdown_daemon -p fluxdown_nmh \
       --features fluxdown_agent/desktop --bins
   done

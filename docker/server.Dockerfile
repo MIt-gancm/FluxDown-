@@ -34,8 +34,8 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
     CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
     AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar
 RUN case "$TARGETARCH" in \
-      amd64) echo x86_64-unknown-linux-gnu > /rust-target ;; \
-      arm64) echo aarch64-unknown-linux-gnu > /rust-target \
+      amd64) echo x86_64-unknown-linux-gnu > /rust-target && echo '-C target-cpu=x86-64' > /rust-flags ;; \
+      arm64) echo aarch64-unknown-linux-gnu > /rust-target && : > /rust-flags \
         && rustup target add aarch64-unknown-linux-gnu \
         && apt-get update \
         && apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
@@ -43,7 +43,8 @@ RUN case "$TARGETARCH" in \
       *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac
 COPY Cargo.toml Cargo.lock ./
-# .cargo/config.toml 带 x86_64 的 target-cpu=x86-64-v2 发布基线，必须与 CI 产物一致。
+# .cargo/config.toml 的 x86-64-v2 只服务桌面产物；镜像面向 NAS/老服务器，amd64 用
+# RUSTFLAGS（整体替换 config 的 rustflags，该文件当前只有 target-cpu 一项）回退基线 x86-64。
 COPY .cargo/ .cargo/
 # cargo 解析 workspace 时要读全部成员的 manifest，包括桌面开发工具。
 COPY native/ native/
@@ -58,6 +59,9 @@ ENV FLUXDOWN_EMBED_WEBROOT=/webroot
 # 编译期匿名统计 App-Key 注入（空值 = 未注入，统计整体禁用）
 ARG FLUXDOWN_ANALYTICS_APP_KEY
 ENV FLUXDOWN_ANALYTICS_APP_KEY=$FLUXDOWN_ANALYTICS_APP_KEY
+# 产品版本（option_env!，发布流水线传 tag 版本；缺省回落 crate 版本）
+ARG FLUXDOWN_APP_VERSION
+ENV FLUXDOWN_APP_VERSION=$FLUXDOWN_APP_VERSION
 # FluxCloud base URL 编译期烘焙进 agent（option_env!；运行期 FLUXCLOUD_BASE_URL 可覆盖；缺省 127.0.0.1:8720）
 ARG FLUXCLOUD_BASE_URL
 ENV FLUXCLOUD_BASE_URL=$FLUXCLOUD_BASE_URL
@@ -67,8 +71,8 @@ ENV FLUXCLOUD_BASE_URL=$FLUXCLOUD_BASE_URL
 # → error: failed to unpack package）。sharing=locked 再兜住同架构重试的并发。
 RUN --mount=type=cache,id=fluxdown-cargo-registry-$TARGETARCH,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=fluxdown-cargo-target-$TARGETARCH,target=/src/target,sharing=locked \
-    cargo build --release --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
-    && cargo build --release --locked -p fluxdown_daemon --target "$(cat /rust-target)" \
+    RUSTFLAGS="$(cat /rust-flags)" cargo build --release --locked -p fluxdown_agent --features web-ui --target "$(cat /rust-target)" \
+    && RUSTFLAGS="$(cat /rust-flags)" cargo build --release --locked -p fluxdown_daemon --target "$(cat /rust-target)" \
     && cp "target/$(cat /rust-target)/release/fluxdown-agent" "target/$(cat /rust-target)/release/fluxdownd" /usr/local/bin/
 
 # ── Stage 3: 运行时（目标架构 debian-slim + ca-certificates，rustls 读系统根证书）──
