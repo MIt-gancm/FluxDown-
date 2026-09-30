@@ -7,6 +7,7 @@
 //! ed2k 链接会解析失败或产生垃圾 host。按 `|` 手工分段是唯一正确做法。
 
 use crate::downloader::{DownloadError, decode_bytes_utf8_or_gbk, sanitize_filename};
+use crate::ed2k::hash::MAX_FILE_SIZE;
 
 /// 一条已解析的 `ed2k://|file|...` 链接的核心字段。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +134,11 @@ pub fn parse_ed2k_link(url: &str) -> Result<Ed2kLink, DownloadError> {
     let total_bytes: u64 = parts[1]
         .parse()
         .map_err(|_| DownloadError::Ed2k(format!("ed2k link invalid size: {}", parts[1])))?;
+    if total_bytes > MAX_FILE_SIZE {
+        return Err(DownloadError::Ed2k(format!(
+            "ed2k link size {total_bytes} exceeds protocol maximum {MAX_FILE_SIZE}"
+        )));
+    }
 
     let hash_hex = parts[2];
     if hash_hex.len() != 32 {
@@ -184,6 +190,19 @@ mod tests {
         let a = parse_ed2k_link(VALID).unwrap();
         let b = parse_ed2k_link(VALID).unwrap();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn size_cap_is_protocol_maximum() {
+        let at_cap = "ed2k://|file|a|274877906944|00000000000000000000000000000000|/";
+        assert_eq!(
+            parse_ed2k_link(at_cap).unwrap().total_bytes,
+            274_877_906_944
+        );
+        let over = "ed2k://|file|a|274877906945|00000000000000000000000000000000|/";
+        assert!(parse_ed2k_link(over).is_err());
+        let huge = "ed2k://|file|x|10000000000000|00000000000000000000000000000000|/";
+        assert!(parse_ed2k_link(huge).is_err());
     }
 
     #[test]

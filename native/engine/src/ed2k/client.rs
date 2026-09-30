@@ -22,19 +22,20 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, oneshot};
 use tokio::task::JoinSet;
 
 use crate::downloader::DownloadError;
 use crate::ed2k::proto::{
-    self, LOWID_THRESHOLD, MAX_SERVER_FRAME, OP_CALLBACKREQUEST, OP_GETSOURCES, OP_HELLO,
-    OP_HELLOANSWER, OP_LOGINREQUEST,
+    self, Ed2kMessage, LOWID_THRESHOLD, MAX_SERVER_FRAME, OP_CALLBACKREQUEST, OP_GETSOURCES,
+    OP_HELLO, OP_HELLOANSWER, OP_LOGINREQUEST,
 };
 use crate::ed2k::server::{
     PeerAddr, build_getsources_payload, build_login_payload, id_to_ipv4, read_until_found_sources,
@@ -95,7 +96,9 @@ pub struct Ed2kClient {
     /// 本机实际监听端口（HighID 登录与 callback 中转都用它）。
     listen_port: AtomicU32,
     /// 持久服务器连接（写端；读循环独占，故用 async mutex 串行化发送）。
-    server_tx: AsyncMutex<Option<TcpStream>>,
+    server_tx: AsyncMutex<Option<OwnedWriteHalf>>,
+    /// 当前服务器会话代号；读循环退出时只清理自己那一代。
+    session_gen: AtomicU64,
     /// 待匹配的入站 callback。
     pending: PendingCallbacks,
     /// 已连通的服务器地址（重连/日志用）。
@@ -118,6 +121,7 @@ impl Ed2kClient {
             client_id: AtomicU32::new(0),
             listen_port: AtomicU32::new(0),
             server_tx: AsyncMutex::new(None),
+            session_gen: AtomicU64::new(0),
             pending: Arc::new(StdMutex::new(HashMap::new())),
             connected_server: StdMutex::new(None),
             upnp: StdMutex::new(None),
@@ -221,14 +225,27 @@ impl Ed2kClient {
             g.insert(low_id, tx);
         }
         // 发 callback 请求到服务器。
-        {
+        let write_result = {
             let mut guard = self.server_tx.lock().await;
-            let stream = guard
-                .as_mut()
-                .ok_or_else(|| DownloadError::Ed2k("no server session for callback".into()))?;
-            let payload = low_id.to_le_bytes();
-            let frame = proto::frame(OP_CALLBACKREQUEST, &payload);
-            stream.write_all(&frame).await.map_err(DownloadError::Io)?;
+            match guard.as_mut() {
+                Some(stream) => {
+                    let frame = proto::frame(OP_CALLBACKREQUEST, &low_id.to_le_bytes());
+                    let r = stream.write_all(&frame).await;
+                    if r.is_err() {
+                        // 写失败 = 会话已死：丢弃，下次找源时重新登录。
+                        *guard = None;
+                        self.client_id.store(0, Ordering::Relaxed);
+                    }
+                    r.map_err(DownloadError::Io)
+                }
+                None => Err(DownloadError::Ed2k("no server session for callback".into())),
+            }
+        };
+        if let Err(e) = write_result {
+            if let Ok(mut g) = self.pending.lock() {
+                g.remove(&low_id);
+            }
+            return Err(e);
         }
         match tokio::time::timeout(CALLBACK_TIMEOUT, rx).await {
             Ok(Ok(stream)) => Ok(stream),
@@ -303,6 +320,7 @@ impl Ed2kClient {
             .await
             {
                 Ok(Ok((stream, client_id))) => {
+                    let session = self.session_gen.fetch_add(1, Ordering::Relaxed) + 1;
                     self.client_id.store(client_id, Ordering::Relaxed);
                     if let Ok(mut g) = self.connected_server.lock() {
                         *g = Some(server.clone());
@@ -317,8 +335,9 @@ impl Ed2kClient {
                             "LowID"
                         }
                     );
-                    *self.server_tx.lock().await = Some(stream);
-                    self.spawn_server_reader();
+                    let (reader, writer) = stream.into_split();
+                    *self.server_tx.lock().await = Some(writer);
+                    self.spawn_server_reader(reader, session);
                     return Ok(());
                 }
                 Ok(Err(e)) => log_info!("[ed2k-client] login {} failed: {}", server, e),
@@ -328,18 +347,37 @@ impl Ed2kClient {
         Err(DownloadError::Ed2k("all ed2k server logins failed".into()))
     }
 
-    /// 启动服务器读循环：处理 IDCHANGE / CALLBACKREQUESTED / 推送源。
-    ///
-    /// 读循环需要独占读半边，但我们的 TcpStream 存在 `server_tx` 里供发送。
-    /// 为避免读写争用，读循环通过 `try_clone` 无法用于 tokio TcpStream，故
-    /// 这里改为：读循环持有 stream 的引用式访问由后续 Kad/session 重构接管。
-    /// 当前实现下 `find_sources` 是「发查询→读应答」的请求-响应式串行，
-    /// 读循环仅在空闲期处理服务器主动推送（CALLBACKREQUESTED）。
-    fn spawn_server_reader(self: &Arc<Self>) {
-        // 请求-响应式会话下，入站 callback 由监听器（run_listener）处理，
-        // 不需要独立的服务器读循环；服务器主动推送的 CALLBACKREQUESTED 仅在
-        // 我方 GETSOURCES 读应答窗口内被 read_until_* 跳过。占位以便后续
-        // 升级为全双工会话时接管。
+    /// 启动服务器读循环：消费服务器推送（IDCHANGE 更新本机 ID），读到 EOF/错误
+    /// 即清空会话，使下一次 [`Ed2kClient::ensure_server_session`] 重新登录，
+    /// LowID callback 不再写入死连接。
+    fn spawn_server_reader(self: &Arc<Self>, mut reader: OwnedReadHalf, session: u64) {
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                match proto::read_frame(&mut reader, MAX_SERVER_FRAME).await {
+                    Ok((proto_byte, opcode, payload)) => {
+                        if let Ok(Ed2kMessage::IdChange { client_id }) =
+                            proto::dispatch(proto_byte, opcode, &payload, false)
+                            && this.session_gen.load(Ordering::Relaxed) == session
+                        {
+                            this.client_id.store(client_id, Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        log_info!("[ed2k-client] server session closed: {}", e);
+                        break;
+                    }
+                }
+            }
+            let mut guard = this.server_tx.lock().await;
+            if this.session_gen.load(Ordering::Relaxed) == session {
+                *guard = None;
+                this.client_id.store(0, Ordering::Relaxed);
+                if let Ok(mut g) = this.connected_server.lock() {
+                    *g = None;
+                }
+            }
+        });
     }
 
     /// 通过持久会话查询某文件的源，保留 HighID 与 LowID 两类。

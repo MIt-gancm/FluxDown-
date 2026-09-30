@@ -48,6 +48,20 @@ const MAX_INFLIGHT: usize = 3;
 /// peer 帧 payload 上限：一个分片数据帧 = 头部 + 至多 BLOCK_SIZE 数据。
 const MAX_PEER_FRAME: u32 = (BLOCK_SIZE as u32) + 1024;
 
+/// 对端在 FILESTATUS 位图里声明不持有目标块时的错误文案；调度层据此只对
+/// （源, 块）退避，而不是把整个源拉入退避。
+pub(crate) const PEER_LACKS_BLOCK: &str = "peer does not hold requested block";
+
+/// 位图（LSB 优先）里是否持有第 `block` 块。空位图 = 持有整文件（`part_count==0`）。
+fn peer_has_block(bitfield: &[u8], block: u64) -> bool {
+    if bitfield.is_empty() {
+        return true;
+    }
+    bitfield
+        .get((block / 8) as usize)
+        .is_some_and(|byte| byte & (1 << (block % 8)) != 0)
+}
+
 /// 从单个 peer 下载单个块。
 ///
 /// - `hashset_cache`：多块文件共享，首个成功拉取并自验的任务填充；后续任务
@@ -152,14 +166,14 @@ pub(crate) async fn download_block_on_stream(
 ) -> Result<[u8; 16], DownloadError> {
     let (block_start, block_end) = hash::part_span(block_index, total_bytes, part_size);
     let block_len = block_end - block_start;
-    let is_single = hash::part_count(total_bytes, part_size) == 1;
+    let is_single = hash::is_single_block(total_bytes, part_size);
 
     // --- 握手 ---
     handshake(&mut stream, file_hash, cancel).await?;
 
     // --- 协商上传槽位：FileRequest→FileStatus→StartUpload→Accept ---
     // 关键修复：跳过此序列 peer 永不发数据（实网验证 3/5 源在补全后正常供数据）。
-    negotiate_upload_slot(&mut stream, file_hash, cancel).await?;
+    negotiate_upload_slot(&mut stream, file_hash, block_index, cancel).await?;
 
     // --- 多块：确保 hashset 已获取并自验（槽位已开，peer 照答 HashSetRequest）---
     if !is_single {
@@ -300,38 +314,52 @@ pub(crate) async fn download_block_on_stream(
     Ok(md4)
 }
 
-/// 握手：发合规 HELLO（含能力 tag + 尾部 server endpoint），收 HELLOANSWER。
+/// `CT_EMULE_MISCOPTIONS2` tag 名。
+const CT_EMULE_MISCOPTIONS2: u8 = 0xFE;
+/// MISCOPTIONS2 的 LargeFiles 位（bit4）。只声明 FluxDown 已实现的能力：
+/// 置其它位（ExtMultiPacket、CryptLayer 等）会让对端改发未处理的包。
+const MISCOPTIONS2_LARGE_FILES: u32 = 1 << 4;
+
+/// 构造 `OP_HELLO` 载荷（含能力 tag + 尾部 server endpoint）。
 ///
 /// eMule `OP_HELLO` 线格式：`hashlen(1=0x10) + user_hash(16) + client_id(4) +
-/// port(2) + tagCount(4) + tags + serverIP(4) + serverPort(2)`。缺尾部 6 字节
-/// server endpoint 或缺能力 tag，现代 peer 会视为畸形/异常客户端直接断开
-/// （实网验证：补全后 peer 正常回 HelloAnswer 并进入文件协商）。
-async fn handshake(
-    stream: &mut TcpStream,
-    _file_hash: &[u8; 16],
-    cancel: &CancellationToken,
-) -> Result<(), DownloadError> {
+/// port(2) + tagCount(4) + tags + serverIP(4) + serverPort(2)`。
+/// 未声明 LargeFiles 位的客户端会被 eMule 系对端视为不支持 >4GB 文件，
+/// 对 `OP_REQUESTFILENAME` 直接静默不回包。
+fn build_hello_payload() -> Vec<u8> {
     let mut user_hash = [0u8; 16];
     user_hash[5] = 14;
     user_hash[14] = 111;
-    // 能力 tag：名称 + eDonkey 版本 + eMule 版本（aMule 软件 id 3）。
+    // 能力 tag：名称 + eDonkey 版本 + eMule 版本（aMule 软件 id 3）+ MISCOPTIONS2。
     let name_tag = encode_peer_string_tag(0x01, "FluxDown");
     let ver_tag = encode_peer_u32_tag(0x11, 0x3C);
     let mule_ver: u32 = (3 << 24) | (1 << 7);
     let mule_tag = encode_peer_u32_tag(0xFB, mule_ver);
+    let misc2_tag = encode_peer_u32_tag(CT_EMULE_MISCOPTIONS2, MISCOPTIONS2_LARGE_FILES);
 
     let mut payload = Vec::new();
     payload.push(0x10);
     payload.extend_from_slice(&user_hash);
     payload.extend_from_slice(&0u32.to_le_bytes()); // client_id
     payload.extend_from_slice(&0u16.to_le_bytes()); // listen port（leech=0）
-    payload.extend_from_slice(&3u32.to_le_bytes()); // tagCount=3
+    payload.extend_from_slice(&4u32.to_le_bytes()); // tagCount=4
     payload.extend_from_slice(&name_tag);
     payload.extend_from_slice(&ver_tag);
     payload.extend_from_slice(&mule_tag);
+    payload.extend_from_slice(&misc2_tag);
     payload.extend_from_slice(&0u32.to_le_bytes()); // server IP
     payload.extend_from_slice(&0u16.to_le_bytes()); // server port
-    let frame = proto::frame(OP_HELLO, &payload);
+    payload
+}
+
+/// 握手：发合规 HELLO，收 HELLOANSWER。缺尾部 server endpoint 或缺能力 tag，
+/// 现代 peer 会视为畸形/异常客户端直接断开（实网验证）。
+async fn handshake(
+    stream: &mut TcpStream,
+    _file_hash: &[u8; 16],
+    cancel: &CancellationToken,
+) -> Result<(), DownloadError> {
+    let frame = proto::frame(OP_HELLO, &build_hello_payload());
     stream.write_all(&frame).await.map_err(DownloadError::Io)?;
 
     // 读一帧确认（HELLOANSWER 或其它）；stall 超时。
@@ -374,6 +402,7 @@ fn encode_peer_u32_tag(name: u8, value: u32) -> Vec<u8> {
 async fn negotiate_upload_slot(
     stream: &mut TcpStream,
     file_hash: &[u8; 16],
+    block_index: u64,
     cancel: &CancellationToken,
 ) -> Result<(), DownloadError> {
     // FileRequest（0x58）→ 期待 FileAnswer(0x59) / NoFile(0x48)。
@@ -386,13 +415,12 @@ async fn negotiate_upload_slot(
         if cancel.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
-        let (proto_byte, opcode, _payload) = tokio::time::timeout(
+        let (proto_byte, opcode, payload) = tokio::time::timeout(
             PEER_STALL_TIMEOUT,
             proto::read_frame(stream, MAX_PEER_FRAME),
         )
         .await
         .map_err(|_| DownloadError::Ed2k("upload negotiation stalled".into()))??;
-        let _ = proto_byte;
         match opcode {
             OP_FILEREQANSWER if !sent_status => {
                 // 对端持有文件 → 发 FileStatusRequest（SETREQFILEID 0x4F）。
@@ -405,7 +433,15 @@ async fn negotiate_upload_slot(
                 return Err(DownloadError::Ed2k("peer does not have this file".into()));
             }
             OP_FILESTATUS if !sent_start => {
-                // 拿到分片位图 → 发 StartUpload（0x54），入对端上传队列。
+                // 部分源只持有部分块：不持有目标块就别排队，否则对端静默不发数据，
+                // 白等 30s 后整个源被退避。
+                if let Ed2kMessage::FileStatus { bitfield, .. } =
+                    proto::dispatch(proto_byte, opcode, &payload, false)?
+                    && !peer_has_block(&bitfield, block_index)
+                {
+                    return Err(DownloadError::Ed2k(PEER_LACKS_BLOCK.into()));
+                }
+                // 发 StartUpload（0x54），入对端上传队列。
                 let su = proto::frame(OP_STARTUPLOADREQ, file_hash);
                 stream.write_all(&su).await.map_err(DownloadError::Io)?;
                 sent_start = true;
@@ -463,14 +499,16 @@ async fn ensure_hashset(
         if let Ed2kMessage::HashSetAnswer { part_hashes } =
             proto::dispatch(proto_byte, opcode, &payload, false)?
         {
-            // 投毒防御：用它校验任何块前先对 link root 自验。
-            if !hash::verify_hashset_root(&part_hashes, file_hash, total_bytes, part_size) {
+            // 投毒防御：用它校验任何块前先对 link root 自验；存储为 part_count 项。
+            let Some(normalized) =
+                hash::normalize_hashset(&part_hashes, file_hash, total_bytes, part_size)
+            else {
                 return Err(DownloadError::Ed2kIntegrity(
                     "hashset root mismatch (poison?)".into(),
                 ));
-            }
+            };
             // 幂等填充（多任务并发时首个赢，其余复用）。
-            let _ = hashset_cache.set(part_hashes);
+            let _ = hashset_cache.set(normalized);
             return Ok(());
         }
     }
@@ -653,6 +691,26 @@ fn interval_covered(received: &[(u64, u64)], s: u64, e: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{interval_covered, merge_intervals, received_covers, received_total};
+
+    #[test]
+    fn hello_declares_large_file_capability_only() {
+        let p = super::build_hello_payload();
+        // 1 + 16 + 4 + 2 之后是 tagCount。
+        assert_eq!(u32::from_le_bytes([p[23], p[24], p[25], p[26]]), 4);
+        let tag = super::encode_peer_u32_tag(0xFE, 1 << 4);
+        assert!(p.windows(tag.len()).any(|w| w == tag.as_slice()));
+    }
+
+    #[test]
+    fn peer_has_block_bitmap_semantics() {
+        use super::peer_has_block;
+        assert!(peer_has_block(&[], 12345), "空位图 = 整文件");
+        assert!(peer_has_block(&[0b0000_0101], 0));
+        assert!(!peer_has_block(&[0b0000_0101], 1));
+        assert!(peer_has_block(&[0b0000_0101], 2));
+        assert!(peer_has_block(&[0, 0b0000_0010], 9));
+        assert!(!peer_has_block(&[0xFF], 8), "位图长度不足 = 不持有");
+    }
 
     #[test]
     fn merge_adjacent_and_overlap() {

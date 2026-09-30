@@ -16,6 +16,8 @@ pub const PART_SIZE: u64 = 9_728_000;
 /// 32/64 位协议变体分界（约 4 GiB）。文件大小超过此值时 GETSOURCES 用
 /// 扩展格式、peer 用 `*_I64` opcode。值 = floor(u32::MAX / PART_SIZE) * PART_SIZE。
 pub const OLD_MAX_FILE_SIZE: u64 = 4_290_048_000;
+/// eD2K 协议允许的最大文件大小（256 GiB，eMule/aMule 的 `MAX_EMULE_FILE_SIZE`）。
+pub const MAX_FILE_SIZE: u64 = 0x40_0000_0000;
 /// eD2K 块请求粒度：180 KB。单次 `OP_REQUESTPARTS` 请求区间的上限。
 pub const BLOCK_SIZE: u64 = 184_320;
 
@@ -177,17 +179,52 @@ pub fn verify_hashset_root(
     total_size: u64,
     part_size: u64,
 ) -> bool {
-    if net_hashes.len() as u64 != part_count(total_size, part_size) {
-        return false;
+    normalize_hashset(net_hashes, expected_root, total_size, part_size).is_some()
+}
+
+/// 文件是否只含一个块且 root 即该块 MD4。
+///
+/// 大小恰为 `part_size` 时 root = MD4(块哈希 ‖ [`MD4_EMPTY`])，块 MD4 不等于 root，
+/// 必须走 hashset 路径，因此只有严格小于一块才算单块。
+#[must_use]
+pub fn is_single_block(total_size: u64, part_size: u64) -> bool {
+    total_size < part_size
+}
+
+/// 校验网络 hashset 并归一化为 `part_count` 个块哈希（内部存储格式）。
+///
+/// aMule/eMule 对恰为整数倍大小的文件会把末尾空块 [`MD4_EMPTY`] 一并发出
+/// （`part_count + 1` 项），其余实现只发 `part_count` 项；两种都接受，
+/// 且都必须与 `expected_root` 一致，否则返回 `None`。
+#[must_use]
+pub fn normalize_hashset(
+    net_hashes: &[[u8; 16]],
+    expected_root: &[u8; 16],
+    total_size: u64,
+    part_size: u64,
+) -> Option<Vec<[u8; 16]>> {
+    let pc = part_count(total_size, part_size) as usize;
+    let trimmed = if net_hashes.len() == pc + 1
+        && is_phantom_tail(total_size, part_size)
+        && net_hashes[pc] == MD4_EMPTY
+    {
+        &net_hashes[..pc]
+    } else {
+        net_hashes
+    };
+    if trimmed.len() != pc {
+        return None;
     }
-    &compute_root(&build_root_input(net_hashes, total_size, part_size)) == expected_root
+    (&compute_root(&build_root_input(trimmed, total_size, part_size)) == expected_root)
+        .then(|| trimmed.to_vec())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         BLOCK_SIZE, MD4_EMPTY, PART_SIZE, build_root_input, compute_root, hash_part,
-        is_phantom_tail, part_count, part_span, verify_hashset_root,
+        is_phantom_tail, is_single_block, normalize_hashset, part_count, part_span,
+        verify_hashset_root,
     };
 
     #[test]
@@ -280,6 +317,34 @@ mod tests {
             100,
             100
         ));
+    }
+
+    #[test]
+    fn normalize_hashset_accepts_trailing_empty_entry_on_multiples() {
+        let net = vec![hash_part(&[0u8; 100]), hash_part(&[1u8; 100])];
+        let root = compute_root(&build_root_input(&net, 200, 100));
+        let mut with_tail = net.clone();
+        with_tail.push(MD4_EMPTY);
+        assert_eq!(
+            normalize_hashset(&with_tail, &root, 200, 100),
+            Some(net.clone())
+        );
+        assert_eq!(normalize_hashset(&net, &root, 200, 100), Some(net));
+        // 末项不是空块哈希 → 拒绝。
+        let mut bogus = with_tail;
+        bogus[2] = [9u8; 16];
+        assert_eq!(normalize_hashset(&bogus, &root, 200, 100), None);
+    }
+
+    #[test]
+    fn exactly_one_part_is_not_single_block() {
+        assert!(is_single_block(99, 100));
+        assert!(!is_single_block(100, 100));
+        // 块 MD4 直接当 root 会失配，必须走 hashset 的 phantom 语义。
+        let h = hash_part(&[7u8; 100]);
+        let root = compute_root(&build_root_input(&[h], 100, 100));
+        assert_ne!(h, root);
+        assert!(verify_hashset_root(&[h], &root, 100, 100));
     }
 
     #[test]

@@ -125,7 +125,7 @@ pub async fn run_ed2k_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
     let result = run_ed2k_download_inner(&params).await;
     match result {
-        Ok(total) => {
+        Ok((total, final_name)) => {
             log_info!(
                 "[ed2k-download] task {} completed, total={}",
                 task_id_log,
@@ -146,7 +146,7 @@ pub async fn run_ed2k_download(params: DownloadParams) {
                     total_bytes: total,
                     status: 3,
                     error_message: String::new(),
-                    file_name: String::new(),
+                    file_name: final_name,
                     segment_details: None,
                     ..Default::default()
                 })
@@ -187,20 +187,38 @@ pub async fn run_ed2k_download(params: DownloadParams) {
 }
 
 /// 内层实现：返回下载总字节数或错误。
-async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, DownloadError> {
+async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String), DownloadError> {
     let link = parse_ed2k_link(&params.url)?;
     let total_bytes = link.total_bytes;
     let part_size = hash::PART_SIZE;
     let large_file = total_bytes > hash::OLD_MAX_FILE_SIZE;
     let block_count = hash::part_count(total_bytes, part_size);
-    let is_single = block_count == 1;
+    let is_single = hash::is_single_block(total_bytes, part_size);
     let task_id = params.task_id.clone();
 
     let _ = params.db.update_task_status(&task_id, 5, "").await;
 
     let save_dir = Path::new(&params.save_dir);
-    let final_path = save_dir.join(&link.file_name);
-    let temp_path = save_dir.join(format!("{}{}", link.file_name, crate::downloader::TEMP_EXT));
+    // manager 传入的名字已做 dedup / 用户自定义 / 预订临时路径，必须沿用，
+    // 否则同名文件会被覆盖且 DB 名与落盘名不一致。
+    let file_name = resolve_file_name(&params.file_name, &link.file_name);
+    if file_name != link.file_name {
+        let siblings: HashSet<String> = params
+            .db
+            .list_active_sibling_file_names(&params.save_dir, &task_id)
+            .await
+            .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
+            .unwrap_or_default();
+        adopt_legacy_temp(
+            save_dir,
+            &link.file_name,
+            &file_name,
+            total_bytes,
+            &siblings,
+        )
+        .await;
+    }
+    let temp_path = save_dir.join(format!("{file_name}{}", crate::downloader::TEMP_EXT));
 
     let temp_ok = matches!(
         tokio::fs::metadata(&temp_path).await,
@@ -230,8 +248,22 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                 "0-byte file root hash mismatch".into(),
             ));
         }
-        finalize_rename(&temp_path, &final_path).await?;
-        return Ok(0);
+        let avoid: HashSet<String> = params
+            .db
+            .list_active_sibling_file_names(&params.save_dir, &task_id)
+            .await
+            .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
+            .unwrap_or_default();
+        let final_name = finalize_rename(
+            &temp_path,
+            save_dir,
+            &file_name,
+            params.allow_overwrite,
+            &avoid,
+        )
+        .await?;
+        persist_final_name(params, &task_id, &file_name, &final_name, 0).await;
+        return Ok((0, final_name));
     }
 
     let _ = params
@@ -242,7 +274,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
             total_bytes: total_bytes as i64,
             status: 1,
             error_message: String::new(),
-            file_name: link.file_name.clone(),
+            file_name: file_name.clone(),
             segment_details: None,
             ..Default::default()
         })
@@ -276,7 +308,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
     let tracker = TransferTracker::new();
     let connected = TransferTracker::new();
     let concurrency_limit = Arc::new(AtomicU32::new(0));
-    let progress_handle = spawn_progress_reporter(ProgressReporterContext {
+    let progress_guard = AbortOnDrop(spawn_progress_reporter(ProgressReporterContext {
         db: params.db.clone(),
         progress_tx: params.progress_tx.clone(),
         task_id: task_id.clone(),
@@ -286,7 +318,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
         tracker: tracker.clone(),
         connected: connected.clone(),
         concurrency_limit: Arc::clone(&concurrency_limit),
-    });
+    }));
 
     let hashset_cache: Arc<OnceCell<Vec<[u8; 16]>>> = Arc::new(OnceCell::new());
     let client = shared_client();
@@ -340,6 +372,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
     let mut sources: Vec<Source> = Vec::new();
     let mut source_retries: u32 = 0;
     let mut backoff: HashSet<Source> = HashSet::new();
+    let mut lacks: HashSet<(Source, u64)> = HashSet::new();
     let mut integrity_bl: HashSet<Source> = HashSet::new();
     let mut strikes: HashMap<u64, u32> = HashMap::new();
     let mut finalize_retries: u32 = 0;
@@ -382,46 +415,69 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                 break Err(DownloadError::Cancelled);
             }
             while join.len() < concurrency && !pending.is_empty() {
-                match pick_source(&sources, &backoff, &integrity_bl, &mut round_robin) {
-                    Some(src) => {
-                        let Some(bi) = pending.pop_front() else { break };
-                        let file_hash = link.root_hash;
-                        let dest = temp_path.clone();
-                        let cancel = params.cancel_token.clone();
-                        let lim = params.speed_limiter.clone();
-                        let hc = Arc::clone(&hashset_cache);
-                        let pg = Arc::clone(&progress);
-                        let client = Arc::clone(&client);
-                        let tracker = tracker.clone();
-                        let connected = connected.clone();
-                        join.spawn(async move {
-                            // HighID 直连 / LowID 经服务器 callback 中转，拿到已连接流后拉块。
-                            let r = match client.connect_source(src).await {
-                                Ok(stream) => {
-                                    let _connection = connected.start(bi as i32);
-                                    download_block_on_stream(
-                                        stream,
-                                        &file_hash,
-                                        bi,
-                                        total_bytes,
-                                        part_size,
-                                        large_file,
-                                        &dest,
-                                        &cancel,
-                                        &lim,
-                                        &hc,
-                                        &pg,
-                                        &tracker,
-                                    )
-                                    .await
-                                }
-                                Err(e) => Err(e),
-                            };
-                            (bi, src, r)
+                // 在队列头部窗口内找第一个存在可用源的块：队首块可能只有被
+                // 声明缺该块的源，不应阻塞后面的块。
+                let picked =
+                    pending
+                        .iter()
+                        .take(PICK_WINDOW)
+                        .enumerate()
+                        .find_map(|(pos, &block)| {
+                            pick_source(
+                                &sources,
+                                &backoff,
+                                &integrity_bl,
+                                &lacks,
+                                block,
+                                &mut round_robin,
+                            )
+                            .map(|src| (pos, src))
                         });
-                    }
-                    None => break,
-                }
+                let Some((pos, src)) = picked else { break };
+                let Some(bi) = pending.remove(pos) else { break };
+                let file_hash = link.root_hash;
+                let dest = temp_path.clone();
+                let cancel = params.cancel_token.clone();
+                let lim = params.speed_limiter.clone();
+                let hc = Arc::clone(&hashset_cache);
+                let pg = Arc::clone(&progress);
+                let client = Arc::clone(&client);
+                let tracker = tracker.clone();
+                let connected = connected.clone();
+                join.spawn(async move {
+                    // 连接/握手/排队可能阻塞数十秒且不看 cancel，整体与 cancel 竞速，
+                    // 使暂停/删除立即生效（drop 会关闭 socket）。
+                    let work = async {
+                        // HighID 直连 / LowID 经服务器 callback 中转，拿到已连接流后拉块。
+                        match client.connect_source(src).await {
+                            Ok(stream) => {
+                                let _connection = connected.start(bi as i32);
+                                download_block_on_stream(
+                                    stream,
+                                    &file_hash,
+                                    bi,
+                                    total_bytes,
+                                    part_size,
+                                    large_file,
+                                    &dest,
+                                    &cancel,
+                                    &lim,
+                                    &hc,
+                                    &pg,
+                                    &tracker,
+                                )
+                                .await
+                            }
+                            Err(e) => Err(e),
+                        }
+                    };
+                    let r = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => Err(DownloadError::Cancelled),
+                        r = work => r,
+                    };
+                    (bi, src, r)
+                });
             }
 
             if join.is_empty() {
@@ -492,9 +548,15 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                         }
                     }
                 }
+                // 已被 integrity 拉黑的源不算可用源：否则每轮找源都会拿回同一批
+                // 坏源、重置重试计数并立刻再找，任务永不收敛也无任何错误提示。
+                let before = merged.len();
+                merged.retain(|s| !integrity_bl.contains(s));
+                let had_blacklisted = merged.len() < before;
                 if !merged.is_empty() {
                     sources = merged;
                     backoff.clear();
+                    lacks.clear();
                     source_retries = 0;
                 } else {
                     source_retries += 1;
@@ -518,9 +580,13 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                         );
                     }
                     if source_retries >= MAX_SOURCE_RETRIES {
-                        break Err(DownloadError::Ed2k(
-                            "no sources found for this ed2k file".into(),
-                        ));
+                        break Err(if had_blacklisted {
+                            DownloadError::Ed2kIntegrity(
+                                "all available sources served corrupt data".into(),
+                            )
+                        } else {
+                            DownloadError::Ed2k("no sources found for this ed2k file".into())
+                        });
                     }
                     let _ = params.db.update_task_status(&task_id, 5, "").await;
                     let jitter_ms = (u64::from(source_retries) * 137)
@@ -539,7 +605,14 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                 continue;
             }
 
-            if let Some(joined) = join.join_next().await {
+            // 与 cancel 竞速：暂停/删除不必等到某个块任务自然结束；JoinSet 随
+            // 作用域结束 drop 时会 abort 仍在连接/握手/排队的块任务。
+            let joined_next = tokio::select! {
+                biased;
+                () = params.cancel_token.cancelled() => break Err(DownloadError::Cancelled),
+                j = join.join_next() => j,
+            };
+            if let Some(joined) = joined_next {
                 let (bi, src, res) = match joined {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -604,11 +677,21 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
                         }
                     }
                     Err(source) => {
+                        if matches!(source, DownloadError::Cancelled) {
+                            break Err(DownloadError::Cancelled);
+                        }
                         let _ = params
                             .db
                             .update_ed2k_block(&task_id, bi, BLOCK_MISSING, 0, false)
                             .await;
                         pending.push_back(bi);
+                        // 对端位图声明缺该块：只对（源, 块）退避，不牵连其它块，
+                        // 也不刷重试日志。
+                        if matches!(&source, DownloadError::Ed2k(m) if m == peer::PEER_LACKS_BLOCK)
+                        {
+                            lacks.insert((src, bi));
+                            continue;
+                        }
                         if let Err(journal_error) = crate::task_activity::record(
                             &params.db,
                             params.sink.as_ref(),
@@ -652,22 +735,78 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<i64, Downloa
         }
     };
 
-    progress_handle.abort();
+    drop(progress_guard);
 
     match outcome {
         Ok(total) => {
-            finalize_rename(&temp_path, &final_path).await?;
-            Ok(total)
+            let avoid: HashSet<String> = params
+                .db
+                .list_active_sibling_file_names(&params.save_dir, &task_id)
+                .await
+                .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
+                .unwrap_or_default();
+            let final_name = finalize_rename(
+                &temp_path,
+                save_dir,
+                &file_name,
+                params.allow_overwrite,
+                &avoid,
+            )
+            .await?;
+            persist_final_name(params, &task_id, &file_name, &final_name, total).await;
+            Ok((total, final_name))
         }
         Err(e) => Err(e),
     }
 }
 
-/// 轮转选取一个不在 `backoff ∪ integrity_bl` 的源；无可用源返回 `None`。
+/// finalize 占名换名后把实际文件名落库（先落盘、后更新指针）；失败只记日志，
+/// 完成信号仍携带新名。
+async fn persist_final_name(
+    params: &DownloadParams,
+    task_id: &str,
+    planned: &str,
+    final_name: &str,
+    total_bytes: i64,
+) {
+    if final_name == planned {
+        return;
+    }
+    if let Err(e) = params
+        .db
+        .update_task_file_info(task_id, final_name, total_bytes)
+        .await
+    {
+        log_info!(
+            "[ed2k-download] task {} failed to persist finalize rename '{}': {}",
+            task_id,
+            final_name,
+            e
+        );
+    }
+}
+
+/// 进度旁路任务的 RAII 守卫：无论外层 future 正常返回、出错、panic 还是被
+/// `abort()`，drop 时都终止旁路任务，避免为已删除的任务继续查库并上报。
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 单次选源时在待下载队列头部检视的块数上限。
+const PICK_WINDOW: usize = 64;
+
+/// 轮转为块 `block` 选取一个不在 `backoff ∪ integrity_bl` 且未声明缺该块的源；
+/// 无可用源返回 `None`。
 fn pick_source(
     sources: &[Source],
     backoff: &HashSet<Source>,
     integrity_bl: &HashSet<Source>,
+    lacks: &HashSet<(Source, u64)>,
+    block: u64,
     round_robin: &mut usize,
 ) -> Option<Source> {
     if sources.is_empty() {
@@ -677,7 +816,8 @@ fn pick_source(
         let idx = *round_robin % sources.len();
         *round_robin = round_robin.wrapping_add(1);
         let src = sources[idx];
-        if !backoff.contains(&src) && !integrity_bl.contains(&src) {
+        if !backoff.contains(&src) && !integrity_bl.contains(&src) && !lacks.contains(&(src, block))
+        {
             return Some(src);
         }
     }
@@ -687,7 +827,7 @@ fn pick_source(
 /// 旁路进度任务：周期读 progress 快照 + 块状态计数，上报 [`ProgressUpdate`]。
 ///
 /// 取锁窄作用域（`lock→clone→释放`），锁释放后才 `.await` DB，Future 保持 `Send`。
-/// 返回的 `JoinHandle` 由调用方在退出前 `abort()`（drop 引用不触发 cancel）。
+/// 返回的 `JoinHandle` 须交给 [`AbortOnDrop`]，保证任何退出路径都会终止它。
 struct ProgressReporterContext {
     db: crate::db::Db,
     progress_tx: tokio::sync::mpsc::Sender<ProgressUpdate>,
@@ -770,7 +910,7 @@ fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::Joi
                     .collect(),
                 source_bytes: None,
             };
-            let _ = progress_tx
+            if progress_tx
                 .send(ProgressUpdate {
                     task_id: task_id.clone(),
                     downloaded_bytes: downloaded,
@@ -782,7 +922,11 @@ fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::Joi
                     runtime: Some(runtime),
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                break;
+            }
         }
     })
 }
@@ -828,7 +972,7 @@ pub async fn finalize_and_verify(
         .map_err(DownloadError::Io)?
     };
 
-    if part_count == 1 {
+    if hash::is_single_block(total_bytes, part_size) {
         if disk_hashes[0] != link.root_hash {
             db.update_ed2k_block(task_id, 0, BLOCK_MISSING, 0, false)
                 .await?;
@@ -879,14 +1023,94 @@ pub async fn finalize_and_verify(
     Ok(())
 }
 
-/// 完成落盘：`sync_all` + rename temp→final（复用既有惯例）。
-async fn finalize_rename(temp: &Path, final_path: &Path) -> Result<(), DownloadError> {
+/// 完成落盘：`sync_all` + 原子占名 rename temp→final，返回实际落盘的文件名。
+///
+/// 用 [`crate::downloader::claim_rename`]（`create_new` 占名）而不是直接
+/// `rename`：后者在 Unix/Windows 都是替换语义，会静默覆盖同名旧文件。
+/// 占名冲突时：overwrite 模式对原名删除旧文件后重试一次；其余情况重新 dedup
+/// 换名（避开兄弟任务已预订的 `avoid`）。
+async fn finalize_rename(
+    temp: &Path,
+    save_dir: &Path,
+    name: &str,
+    allow_overwrite: bool,
+    avoid: &HashSet<String>,
+) -> Result<String, DownloadError> {
     if let Ok(file) = tokio::fs::File::open(temp).await {
         let _ = file.sync_all().await;
     }
-    tokio::fs::rename(temp, final_path)
-        .await
-        .map_err(DownloadError::Io)
+    let mut chosen = name.to_string();
+    let mut overwrite_attempted = false;
+    let mut attempt = 0u32;
+    loop {
+        let dst = save_dir.join(&chosen);
+        match crate::downloader::claim_rename(temp, &dst).await {
+            Ok(()) => return Ok(chosen),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt += 1;
+                if attempt > 5 {
+                    return Err(DownloadError::Io(e));
+                }
+                if allow_overwrite
+                    && !overwrite_attempted
+                    && chosen == name
+                    && !avoid.contains(&chosen.to_lowercase())
+                {
+                    overwrite_attempted = true;
+                    let is_dir = tokio::fs::metadata(&dst)
+                        .await
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false);
+                    if !is_dir && tokio::fs::remove_file(&dst).await.is_ok() {
+                        continue;
+                    }
+                }
+                chosen = crate::downloader::dedup_filename(
+                    save_dir,
+                    name,
+                    &HashSet::new(),
+                    avoid,
+                    false,
+                )
+                .await;
+            }
+            Err(e) => return Err(DownloadError::Io(e)),
+        }
+    }
+}
+
+/// 确定本任务使用的文件名：manager 传入的名字（已 dedup / 用户自定义 / 已预订临时路径）
+/// 优先，为空才回退链接内的名字。
+fn resolve_file_name(param_name: &str, link_name: &str) -> String {
+    let name = if param_name.trim().is_empty() {
+        link_name
+    } else {
+        param_name
+    };
+    crate::downloader::sanitize_filename(name)
+}
+
+/// 旧版本下载器总是用链接名建临时文件；若本任务的名字已与链接名不同（被 dedup
+/// 或自定义）且旧临时文件仍在、大小吻合、未被兄弟任务占用，则迁移过去以保住
+/// 已下载的块，否则接受一次性重下。
+async fn adopt_legacy_temp(
+    save_dir: &Path,
+    link_name: &str,
+    name: &str,
+    total_bytes: u64,
+    sibling_names: &HashSet<String>,
+) {
+    if name == link_name || sibling_names.contains(&link_name.to_lowercase()) {
+        return;
+    }
+    let new_temp = save_dir.join(format!("{name}{}", crate::downloader::TEMP_EXT));
+    let legacy_temp = save_dir.join(format!("{link_name}{}", crate::downloader::TEMP_EXT));
+    if tokio::fs::metadata(&new_temp).await.is_ok() {
+        return;
+    }
+    if matches!(tokio::fs::metadata(&legacy_temp).await, Ok(m) if m.len() == total_bytes) {
+        let _ = tokio::fs::rename(&legacy_temp, &new_temp).await;
+    }
 }
 
 #[cfg(test)]
@@ -924,6 +1148,89 @@ mod tests {
     fn capped_by_remaining() {
         assert_eq!(ed2k_concurrency(8, 3), 3);
         assert_eq!(ed2k_concurrency(8, 2), 2);
+    }
+
+    #[test]
+    fn file_name_prefers_manager_name() {
+        assert_eq!(
+            super::resolve_file_name("movie (1).iso", "movie.iso"),
+            "movie (1).iso"
+        );
+        assert_eq!(super::resolve_file_name("", "movie.iso"), "movie.iso");
+    }
+
+    #[test]
+    fn pick_source_skips_blacklisted_and_block_lacking_sources() {
+        use std::collections::HashSet;
+        let a = super::Source::LowId(1);
+        let b = super::Source::LowId(2);
+        let c = super::Source::LowId(3);
+        let sources = [a, b, c];
+        let backoff: HashSet<_> = [a].into_iter().collect();
+        let bl: HashSet<_> = [b].into_iter().collect();
+        let mut rr = 0;
+        let none = HashSet::new();
+        assert_eq!(
+            super::pick_source(&sources, &backoff, &bl, &none, 0, &mut rr),
+            Some(c)
+        );
+        // c 声明缺块 0：块 0 无源可用，块 1 仍可用 c。
+        let lacks: HashSet<_> = [(c, 0u64)].into_iter().collect();
+        assert_eq!(
+            super::pick_source(&sources, &backoff, &bl, &lacks, 0, &mut rr),
+            None
+        );
+        assert_eq!(
+            super::pick_source(&sources, &backoff, &bl, &lacks, 1, &mut rr),
+            Some(c)
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_rename_never_overwrites_existing_file() {
+        use std::collections::HashSet;
+        let dir = std::env::temp_dir().join(format!("ed2k_finalize_{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        let Ok(()) = tokio::fs::create_dir_all(&dir).await else {
+            panic!("create dir");
+        };
+        let _ = tokio::fs::write(dir.join("movie.iso"), b"user data").await;
+        let temp = dir.join(format!("movie.iso{}", crate::downloader::TEMP_EXT));
+        let _ = tokio::fs::write(&temp, b"downloaded").await;
+
+        let Ok(chosen) =
+            super::finalize_rename(&temp, &dir, "movie.iso", false, &HashSet::new()).await
+        else {
+            panic!("finalize failed");
+        };
+        assert_ne!(chosen, "movie.iso");
+        assert_eq!(
+            tokio::fs::read(dir.join("movie.iso"))
+                .await
+                .unwrap_or_default(),
+            b"user data"
+        );
+        assert_eq!(
+            tokio::fs::read(dir.join(&chosen)).await.unwrap_or_default(),
+            b"downloaded"
+        );
+
+        // overwrite 模式：原名被替换。
+        let temp2 = dir.join(format!("movie.iso{}", crate::downloader::TEMP_EXT));
+        let _ = tokio::fs::write(&temp2, b"second").await;
+        let Ok(chosen2) =
+            super::finalize_rename(&temp2, &dir, "movie.iso", true, &HashSet::new()).await
+        else {
+            panic!("overwrite finalize failed");
+        };
+        assert_eq!(chosen2, "movie.iso");
+        assert_eq!(
+            tokio::fs::read(dir.join("movie.iso"))
+                .await
+                .unwrap_or_default(),
+            b"second"
+        );
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     // -----------------------------------------------------------------------
