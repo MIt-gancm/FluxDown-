@@ -11,6 +11,9 @@ const BUILD: &[&str] = &[
     "fluxdown_agent",
     "-p",
     "fluxdown_daemon",
+    // agent 只注册与自己同目录的浏览器中继：不一起构建，扩展就连不上开发版 agent。
+    "-p",
+    "fluxdown_nmh",
     // 官方桌面包的 agent 承载托盘与剪贴板监听；不带该 feature 时是 headless agent。
     "--features",
     "fluxdown_agent/desktop",
@@ -36,7 +39,7 @@ fn run() -> io::Result<u8> {
         [arg] if arg == "--help" || arg == "-h" => {
             println!(
                 "Usage: cargo desktop-dev [--build-only]\n\
-                Activate the running desktop, or build UI + agent + daemon and start it.\n\
+                Activate the running desktop, or build UI + agent + daemon + browser relay and start it.\n\
                 --build-only builds without launching or activating anything.\n\
                 Existing services are reused, never forcibly stopped. Quit the UI and\n\
                 stop the services explicitly before testing changes to running code."
@@ -66,7 +69,7 @@ fn run() -> io::Result<u8> {
         eprintln!("desktop-dev: activated the running UI; reused existing services (no rebuild).");
         return Ok(0);
     }
-    eprintln!("desktop-dev: building UI, agent and daemon...");
+    eprintln!("desktop-dev: building UI, agent, daemon and browser relay...");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut build = Command::new(cargo);
     build.current_dir(&root).args(BUILD);

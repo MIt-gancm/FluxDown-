@@ -1,8 +1,9 @@
 //! Named Pipe server for browser extension communication via Native Messaging.
 //!
 //! Architecture:
-//!   - FluxDown main process creates a Named Pipe server at `\\.\pipe\fluxdown`.
-//!   - The NMH relay binary (`fluxdown_nmh.exe`) connects to this pipe.
+//!   - FluxDown main process listens on the per-user endpoint the NMH relay dials:
+//!     `\\.\pipe\fluxdown-<account>` on Windows, `<data dir>/ipc/fluxdown.sock` elsewhere.
+//!   - The NMH relay binary (`fluxdown_nmh`) connects to this endpoint.
 //!   - Messages use a 4-byte LE length prefix + JSON payload.
 //!
 //! Message protocol (mirrors the no-launch action set in
@@ -34,9 +35,43 @@ use tokio::sync::mpsc;
 
 use crate::logger::{log_error, log_info};
 
-/// Named Pipe path for the NMH relay to connect to.
+/// Named Pipe for the current account: `\\.\pipe\fluxdown-<account>`. Every byte of the
+/// lower-cased account name outside `[a-z0-9]` is encoded as `_xx` (the underscore is itself
+/// encoded), so distinct accounts never share a pipe. The relay (`native/nmh/src/main.rs`) and
+/// the GPUI agent (`native/agent/src/nmh.rs`) derive the same name; all three pin the same
+/// literals in tests.
+#[cfg(any(windows, test))]
+fn pipe_name_for(user: &str) -> Option<String> {
+    if user.is_empty() {
+        return None;
+    }
+    let mut name = String::from(r"\\.\pipe\fluxdown-");
+    for byte in user.to_lowercase().bytes() {
+        if byte.is_ascii_lowercase() || byte.is_ascii_digit() {
+            name.push(char::from(byte));
+        } else {
+            name.push_str(&format!("_{byte:02x}"));
+        }
+    }
+    Some(name)
+}
+
+/// The relay's pipe for the account this process runs as.
 #[cfg(windows)]
-const PIPE_NAME: &str = r"\\.\pipe\fluxdown";
+fn pipe_name() -> Option<String> {
+    std::env::var("USERNAME")
+        .ok()
+        .and_then(|user| pipe_name_for(&user))
+}
+
+/// No per-user endpoint can be derived (no account name / home directory). There is no
+/// shared fallback: the relay never dials one.
+fn endpoint_unavailable() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "native messaging IPC endpoint is unavailable (no home directory / account name)",
+    )
+}
 
 /// Maximum message size: 1 MB.
 const MAX_MESSAGE_SIZE: u32 = 1024 * 1024;
@@ -405,8 +440,8 @@ mod server {
     use tokio::sync::mpsc;
 
     use super::{
-        ApiHost, DownloadRequest, MAX_MESSAGE_SIZE, PIPE_NAME, PipeMessage, PipeResponse,
-        dispatch_action,
+        ApiHost, DownloadRequest, MAX_MESSAGE_SIZE, PipeMessage, PipeResponse, dispatch_action,
+        endpoint_unavailable, pipe_name,
     };
     use crate::logger::log_info;
 
@@ -581,17 +616,16 @@ mod server {
     fn create_instance(
         first: bool,
     ) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
+        let name = pipe_name().ok_or_else(endpoint_unavailable)?;
         let mut options = ServerOptions::new();
         options.first_pipe_instance(first);
         match pipe_security::PipeSecurity::new() {
             // SAFETY: `sec` and its descriptor outlive this create call, which
             // copies the SECURITY_ATTRIBUTES into the pipe synchronously.
-            Ok(sec) => unsafe {
-                options.create_with_security_attributes_raw(PIPE_NAME, sec.as_ptr())
-            },
+            Ok(sec) => unsafe { options.create_with_security_attributes_raw(&name, sec.as_ptr()) },
             Err(e) => {
                 log_info!("[nmh-pipe] pipe security unavailable, using default: {}", e);
-                options.create(PIPE_NAME)
+                options.create(&name)
             }
         }
     }
@@ -649,7 +683,10 @@ mod server {
         tx: mpsc::Sender<Vec<DownloadRequest>>,
         api_host: Arc<dyn ApiHost>,
     ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        log_info!("[nmh-pipe] starting Named Pipe server at {}", PIPE_NAME);
+        log_info!(
+            "[nmh-pipe] starting Named Pipe server at {}",
+            super::listener_endpoint()
+        );
         let server = create_instance(true)?;
         Ok(tokio::spawn(accept_loop(server, tx, api_host)))
     }
@@ -658,7 +695,7 @@ mod server {
 // Non-Windows: Unix Domain Socket server.
 #[cfg(not(windows))]
 mod server {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::sync::Arc;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -667,6 +704,7 @@ mod server {
 
     use super::{
         ApiHost, DownloadRequest, MAX_MESSAGE_SIZE, PipeMessage, PipeResponse, dispatch_action,
+        endpoint_unavailable,
     };
     use crate::logger::log_info;
 
@@ -716,52 +754,31 @@ mod server {
         None
     }
 
-    /// Returns the Unix socket path for the NMH relay to connect to.
-    ///
-    /// - macOS: `~/Library/Application Support/fluxdown/fluxdown.sock`
-    ///   (avoids /tmp sandbox isolation and $TMPDIR per-app randomisation;
-    ///   uses getpwuid fallback so launchd-launched NMH also finds it)
-    /// - Linux:  `~/.local/share/fluxdown/fluxdown.sock`
-    ///   (avoids $XDG_RUNTIME_DIR sandbox remapping inside Flatpak/Snap;
-    ///   ~/.local/share/ is bind-mounted into the sandbox so both the host
-    ///   app and the browser-spawned NMH see the same path)
-    /// - Other Unix: `$XDG_RUNTIME_DIR/fluxdown.sock` → `/tmp/fluxdown.sock`
-    pub fn socket_path() -> std::path::PathBuf {
+    /// Unix socket the NMH relay dials: `<data dir>/ipc/fluxdown.sock`, where `ipc` is a
+    /// per-user 0700 directory. The data dir sits under the user's home on purpose: it is
+    /// reachable from both the host and Flatpak/Snap sandboxes (unlike `$XDG_RUNTIME_DIR`).
+    /// The relay (`native/nmh/src/main.rs`) and the GPUI agent (`native/agent/src/nmh.rs`)
+    /// derive the same path; all three pin the same literals in tests.
+    pub(super) fn socket_path_under(home: &std::path::Path) -> std::path::PathBuf {
         #[cfg(target_os = "macos")]
-        {
-            if let Some(home) = home_dir() {
-                let dir = home
-                    .join("Library")
-                    .join("Application Support")
-                    .join("fluxdown");
-                let _ = std::fs::create_dir_all(&dir);
-                return dir.join("fluxdown.sock");
-            }
-        }
-        // Linux: use ~/.local/share/fluxdown/fluxdown.sock
-        // This path is accessible from both the host (app process) and Flatpak/Snap
-        // sandboxes (which bind-mount ~/.local/share/ into the sandbox), unlike
-        // $XDG_RUNTIME_DIR which gets remapped to a sandbox-private path inside
-        // Flatpak, causing the app and NMH to see different socket paths.
-        #[cfg(target_os = "linux")]
-        {
-            if let Ok(home) = std::env::var("HOME")
-                && !home.is_empty()
-            {
-                let dir = std::path::Path::new(&home)
-                    .join(".local")
-                    .join("share")
-                    .join("fluxdown");
-                let _ = std::fs::create_dir_all(&dir);
-                return dir.join("fluxdown.sock");
-            }
-        }
-        // Fallback for any other Unix-like OS
-        if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-            std::path::Path::new(&dir).join("fluxdown.sock")
-        } else {
-            std::path::Path::new("/tmp").join("fluxdown.sock")
-        }
+        let data_dir = home
+            .join("Library")
+            .join("Application Support")
+            .join("fluxdown");
+        #[cfg(not(target_os = "macos"))]
+        let data_dir = home.join(".local").join("share").join("fluxdown");
+        data_dir.join("ipc").join("fluxdown.sock")
+    }
+
+    /// The relay's socket for the current user; `None` without a home directory.
+    pub fn socket_path() -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "macos")]
+        let home = home_dir();
+        #[cfg(not(target_os = "macos"))]
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(std::path::PathBuf::from);
+        home.map(|home| socket_path_under(&home))
     }
 
     async fn read_framed_message(
@@ -865,7 +882,14 @@ mod server {
         tx: mpsc::Sender<Vec<DownloadRequest>>,
         api_host: Arc<dyn ApiHost>,
     ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-        let sock_path = socket_path();
+        let sock_path = socket_path().ok_or_else(endpoint_unavailable)?;
+        let dir = sock_path.parent().ok_or_else(endpoint_unavailable)?;
+        // 0700 directory: other users can neither enter it nor connect to or squat the socket.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
         // Remove stale socket file left by a previous run (or by the listener
         // we are replacing).
         let _ = std::fs::remove_file(&sock_path);
@@ -893,13 +917,10 @@ mod server {
 /// socket path elsewhere. Shown verbatim in the Doctor report.
 pub fn listener_endpoint() -> String {
     #[cfg(windows)]
-    {
-        PIPE_NAME.to_string()
-    }
+    let endpoint = pipe_name();
     #[cfg(not(windows))]
-    {
-        server::socket_path().to_string_lossy().into_owned()
-    }
+    let endpoint = server::socket_path().map(|path| path.to_string_lossy().into_owned());
+    endpoint.unwrap_or_else(|| "unavailable".to_owned())
 }
 
 /// Round-trip one `{"action":"ping"}` frame over any framed transport and
@@ -962,14 +983,15 @@ pub async fn probe_listener(timeout: std::time::Duration) -> Result<(), String> 
     let probe = async {
         #[cfg(windows)]
         {
+            let name = pipe_name().ok_or_else(|| endpoint_unavailable().to_string())?;
             let mut pipe = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(PIPE_NAME)
+                .open(name)
                 .map_err(|e| format!("connect failed: {e}"))?;
             ping_round_trip(&mut pipe).await
         }
         #[cfg(not(windows))]
         {
-            let path = server::socket_path();
+            let path = server::socket_path().ok_or_else(|| endpoint_unavailable().to_string())?;
             let mut stream = tokio::net::UnixStream::connect(&path)
                 .await
                 .map_err(|e| format!("connect failed: {e}"))?;
@@ -1115,6 +1137,52 @@ mod tests {
     async fn restart_without_a_started_listener_reports_it() {
         let err = restart_listener().await.expect_err("must not succeed");
         assert!(err.contains("never started"), "unexpected error: {err}");
+    }
+
+    /// Same literals as `pipe_name_is_per_user_and_injective` in `native/nmh/src/main.rs`
+    /// and `native/agent/src/nmh.rs`: the relay dials the pipe this host listens on.
+    #[test]
+    fn pipe_name_is_per_user_and_injective() {
+        assert_eq!(
+            pipe_name_for("Alice Smith").as_deref(),
+            Some(r"\\.\pipe\fluxdown-alice_20smith")
+        );
+        assert_eq!(
+            pipe_name_for("a_b").as_deref(),
+            Some(r"\\.\pipe\fluxdown-a_5fb")
+        );
+        assert_eq!(
+            pipe_name_for("a b").as_deref(),
+            Some(r"\\.\pipe\fluxdown-a_20b")
+        );
+        assert_eq!(
+            pipe_name_for("张三").as_deref(),
+            Some(r"\\.\pipe\fluxdown-_e5_bc_a0_e4_b8_89")
+        );
+        assert_eq!(pipe_name_for(""), None);
+        assert_eq!(pipe_name_for("ALICE"), pipe_name_for("alice"));
+    }
+
+    /// Same literals as `unix_socket_lives_in_a_private_per_user_ipc_dir` in
+    /// `native/nmh/src/main.rs` and `native/agent/src/nmh.rs`.
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_socket_lives_in_a_private_per_user_ipc_dir() {
+        let (home, expected) = if cfg!(target_os = "macos") {
+            (
+                "/Users/alice",
+                "/Users/alice/Library/Application Support/fluxdown/ipc/fluxdown.sock",
+            )
+        } else {
+            (
+                "/home/alice",
+                "/home/alice/.local/share/fluxdown/ipc/fluxdown.sock",
+            )
+        };
+        assert_eq!(
+            server::socket_path_under(std::path::Path::new(home)),
+            std::path::PathBuf::from(expected)
+        );
     }
 
     #[test]

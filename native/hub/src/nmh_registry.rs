@@ -26,7 +26,9 @@
 //! the ownership rule in [`may_take_over`] instead of "last launch wins", so two
 //! installs never overwrite each other on every start; the explicit Doctor
 //! repair ([`register`]) always points the registration at this install.
-//! The rules mirror `native/agent/src/nmh.rs::registry` one-to-one — change both.
+//! The path-based rules mirror `native/agent/src/nmh.rs::registry` — change both.
+//! The GPUI agent additionally takes over a relay that fails a live ping against it
+//! (older endpoint or framing); this host does not probe.
 
 use std::io;
 use std::path::{Path, PathBuf};

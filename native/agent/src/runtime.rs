@@ -305,8 +305,22 @@ pub(crate) async fn run_with(
         let nmh = crate::nmh::NmhService::new(daemon.clone(), capture.clone())
             .with_task_events(task_events);
         let nmh_cancel = cancel.clone();
+        let (endpoint_ready, endpoint_live) = tokio::sync::oneshot::channel();
+        // 浏览器扩展靠 NMH 注册找到中继：端点开始监听后再按归属规则自愈，并存安装的中继
+        // 要实测能连到本 agent 才保留，仍可用时不与它互相覆盖。
         tokio::spawn(async move {
-            let outcome = nmh.run(nmh_cancel.clone()).await;
+            match crate::nmh::registry::auto_register(endpoint_live.await.is_ok()).await {
+                Ok(crate::nmh::registry::AutoRegisterOutcome::UpToDate) => {
+                    tracing::debug!("NMH registration up to date");
+                }
+                Ok(crate::nmh::registry::AutoRegisterOutcome::Registered(relay)) => {
+                    tracing::info!(relay = %relay.display(), "NMH registration repaired");
+                }
+                Err(error) => tracing::warn!(error = %error, "NMH auto-registration failed"),
+            }
+        });
+        tokio::spawn(async move {
+            let outcome = nmh.run(nmh_cancel.clone(), endpoint_ready).await;
             if let Err(error) = &outcome {
                 tracing::warn!(error = %error, "NMH IPC service stopped; browser relay unavailable");
             } else if !nmh_cancel.is_cancelled() {
@@ -315,18 +329,6 @@ pub(crate) async fn run_with(
             Ok(())
         })
     };
-    // 浏览器扩展靠 NMH 注册找到中继：启动时按归属规则自愈，不与并存的另一份 FluxDown 互相覆盖。
-    if server.is_none() {
-        tokio::task::spawn_blocking(|| match crate::nmh::registry::auto_register() {
-            Ok(crate::nmh::registry::AutoRegisterOutcome::UpToDate) => {
-                tracing::debug!("NMH registration up to date");
-            }
-            Ok(crate::nmh::registry::AutoRegisterOutcome::Registered(relay)) => {
-                tracing::info!(relay = %relay.display(), "NMH registration repaired");
-            }
-            Err(error) => tracing::warn!(error = %error, "NMH auto-registration failed"),
-        });
-    }
     let diagnostics = Arc::new(
         crate::diagnostics::DiagnosticsService::new(
             daemon.clone(),

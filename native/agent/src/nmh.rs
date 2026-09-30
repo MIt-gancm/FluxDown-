@@ -120,8 +120,13 @@ impl NmhService {
         self
     }
 
-    pub async fn run(self, cancel: CancellationToken) -> Result<(), std::io::Error> {
-        run_server(self, cancel).await
+    /// `ready` 在 IPC 端点开始监听后触发；端点不可用时随错误一起被丢弃。
+    pub async fn run(
+        self,
+        cancel: CancellationToken,
+        ready: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<(), std::io::Error> {
+        run_server(self, cancel, ready).await
     }
 
     async fn dispatch(&self, message: PipeMessage) -> PipeResponse {
@@ -307,7 +312,11 @@ where
 }
 
 #[cfg(unix)]
-async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<(), std::io::Error> {
+async fn run_server(
+    service: NmhService,
+    cancel: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), std::io::Error> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let path = unix_socket_path().ok_or_else(endpoint_unavailable)?;
@@ -334,6 +343,7 @@ async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<()
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
+    let _ = ready.send(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -390,16 +400,24 @@ fn unix_socket_path() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(windows)]
-async fn run_server(service: NmhService, cancel: CancellationToken) -> Result<(), std::io::Error> {
+async fn run_server(
+    service: NmhService,
+    cancel: CancellationToken,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<(), std::io::Error> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
     let pipe_name = pipe_name().ok_or_else(endpoint_unavailable)?;
     let mut first = true;
+    let mut ready = Some(ready);
     loop {
         let server = ServerOptions::new()
             .first_pipe_instance(first)
             .create(&pipe_name)?;
         first = false;
+        if let Some(ready) = ready.take() {
+            let _ = ready.send(());
+        }
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
             connected = server.connect() => {
@@ -531,8 +549,10 @@ where
 /// 同一台机器可能并存多份 FluxDown（Flutter / GPUI、安装版 / 开发构建），它们共用
 /// 同一个注册入口（类 Unix 的启动脚本、Windows 的 HKCU 键）。启动自愈
 /// [`auto_register`] 按 [`may_take_over`] 的归属规则决定是否改指向本安装，避免两份
-/// 安装每次启动互相覆盖；Doctor 的显式修复 [`register`] 总是指向本安装。
-/// 判定规则与 `native/hub/src/nmh_registry.rs` 逐条一致，改一处必须同步另一处。
+/// 安装每次启动互相覆盖；但另一份安装的中继若实测连不到正在运行的本 agent（端点或帧
+/// 协议不同），保留它只会让扩展显示未连接，此时总是接管。Doctor 的显式修复 [`register`]
+/// 总是指向本安装。按路径判定的归属规则与 `native/hub/src/nmh_registry.rs` 一致，
+/// 改一处必须同步另一处；连通性实测只在 agent 侧。
 pub mod registry {
     use std::io;
     use std::path::{Path, PathBuf};
@@ -721,43 +741,75 @@ pub mod registry {
         }
     }
 
-    /// 启动自愈能否把注册改指向本安装：未注册、失效或已是本安装时总可以；另一份健康
-    /// 安装只在它是开发构建/临时路径、而本安装不是时才被接管，其余情况保持先到者。
-    fn may_take_over(owner: RelayOwner, registered: &Path, current: &Path) -> bool {
+    /// 启动自愈能否把注册改指向本安装：未注册、失效或已是本安装时总可以。另一份安装的中继
+    /// 实测连不到正在运行的本 agent（`reaches_agent == Some(false)`）时必须接管；能连通或
+    /// 无从实测（`None`）时，只在它是开发构建/临时路径、而本安装不是时才接管，其余保持先到者。
+    fn may_take_over(
+        owner: RelayOwner,
+        registered: &Path,
+        current: &Path,
+        reaches_agent: Option<bool>,
+    ) -> bool {
         match owner {
             RelayOwner::Missing | RelayOwner::Broken | RelayOwner::Current => true,
             RelayOwner::OtherInstall => {
-                is_transient_relay(registered) && !is_transient_relay(current)
+                reaches_agent == Some(false)
+                    || (is_transient_relay(registered) && !is_transient_relay(current))
             }
         }
     }
 
-    /// 查找中继二进制：先看 agent 同级目录（发布形态），再看 cargo workspace `target/`（开发）。
+    /// 中继只认 agent 同级目录里的那一份：它与本 agent 出自同一次构建，端点与帧协议必然一致。
+    /// 不回退到其它构建目录（例如另一 profile 的 `target/`）：那里的中继可能停在旧端点，
+    /// 注册它等于让扩展连不上。
     fn find_nmh_exe() -> Result<PathBuf, io::Error> {
-        if let Ok(exe) = std::env::current_exe() {
-            let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
-            if let Some(dir) = canonical.parent() {
-                let candidate = dir.join(NMH_EXE_NAME);
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-        }
-        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        let exe = std::env::current_exe()?;
+        let canonical = std::fs::canonicalize(&exe).unwrap_or(exe);
+        canonical
             .parent()
-            .and_then(Path::parent);
-        if let Some(workspace) = workspace_root {
-            for profile in ["debug", "release"] {
-                let candidate = workspace.join("target").join(profile).join(NMH_EXE_NAME);
-                if candidate.exists() {
-                    return Ok(candidate);
-                }
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("{NMH_EXE_NAME} not found. Build it with: cargo build -p fluxdown_nmh"),
-        ))
+            .map(|dir| dir.join(NMH_EXE_NAME))
+            .filter(|candidate| candidate.is_file())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "{NMH_EXE_NAME} not found next to {}. Build it with: cargo build -p fluxdown_nmh",
+                        canonical.display()
+                    ),
+                )
+            })
+    }
+
+    /// 实测另一份安装的中继的上限；免拉起的 `ping` 在本机往返只需毫秒级。
+    const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    #[cfg(windows)]
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// 像浏览器那样拉起中继（参数为扩展 origin）并经它发一条 `ping`：拿到本进程 IPC 端点
+    /// 回的 `pong` 才说明这份中继与正在运行的 agent 端点、帧协议一致。超时或任何失败都算
+    /// 连不到；子进程随句柄丢弃被结束。
+    async fn relay_reaches_agent(relay: &Path) -> bool {
+        let mut command = tokio::process::Command::new(relay);
+        command
+            .arg(CHROME_EXTENSION_ID)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        #[cfg(windows)]
+        command.creation_flags(CREATE_NO_WINDOW);
+        let Ok(mut child) = command.spawn() else {
+            return false;
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            return false;
+        };
+        let reply = tokio::time::timeout(
+            RELAY_PROBE_TIMEOUT,
+            super::ping_stream(tokio::io::join(stdout, stdin)),
+        )
+        .await;
+        matches!(reply, Ok(Ok(_)))
     }
 
     /// 显式修复：把全部注册改指向本安装的中继。
@@ -765,15 +817,31 @@ pub mod registry {
         register_with(&find_nmh_exe()?)
     }
 
-    /// 启动自愈：注册缺失、失效或不完整时按归属规则重写，完好时不碰任何文件。
-    pub fn auto_register() -> Result<AutoRegisterOutcome, io::Error> {
-        let diagnosis = diagnose();
+    /// 启动自愈：注册缺失、失效、不完整，或指向连不到本 agent 的另一份中继时按归属规则重写，
+    /// 完好时不碰任何文件。`endpoint_live` 表示本进程 IPC 端点已在监听：只有这时另一份安装的
+    /// 中继才能实测连通性，否则只按路径规则判定。
+    pub async fn auto_register(endpoint_live: bool) -> Result<AutoRegisterOutcome, io::Error> {
+        let diagnosis = tokio::task::spawn_blocking(diagnose)
+            .await
+            .map_err(io::Error::other)?;
         if diagnosis.exe_path.is_empty() {
             return Err(io::Error::new(io::ErrorKind::NotFound, diagnosis.exe_error));
         }
         let current = PathBuf::from(&diagnosis.exe_path);
         let registered = PathBuf::from(&diagnosis.registered_relay);
-        let relay = if may_take_over(diagnosis.relay_owner, &registered, &current) {
+        let reaches_agent = if endpoint_live && diagnosis.relay_owner == RelayOwner::OtherInstall {
+            let reachable = relay_reaches_agent(&registered).await;
+            if !reachable {
+                tracing::info!(
+                    relay = %registered.display(),
+                    "registered NMH relay cannot reach this agent; registering this installation's relay"
+                );
+            }
+            Some(reachable)
+        } else {
+            None
+        };
+        let relay = if may_take_over(diagnosis.relay_owner, &registered, &current, reaches_agent) {
             current
         } else {
             registered.clone()
@@ -789,7 +857,10 @@ pub mod registry {
         if complete {
             return Ok(AutoRegisterOutcome::UpToDate);
         }
-        register_with(&relay)?;
+        let target = relay.clone();
+        tokio::task::spawn_blocking(move || register_with(&target))
+            .await
+            .map_err(io::Error::other)??;
         Ok(AutoRegisterOutcome::Registered(relay))
     }
 
@@ -832,25 +903,40 @@ pub mod registry {
         }
 
         #[test]
-        fn healthy_other_install_is_only_taken_over_from_a_dev_build() {
+        fn other_install_is_kept_only_while_it_reaches_this_agent() {
             let other_installed = Path::new("/opt/fluxdown/fluxdown_nmh");
-            assert!(!may_take_over(
-                RelayOwner::OtherInstall,
-                other_installed,
-                Path::new(INSTALLED)
-            ));
-            assert!(!may_take_over(
-                RelayOwner::OtherInstall,
-                other_installed,
-                Path::new(DEV)
-            ));
-            assert!(may_take_over(
-                RelayOwner::OtherInstall,
-                Path::new(DEV),
-                Path::new(INSTALLED)
-            ));
+            // 能连通或无从实测时保持先到者，只有开发构建让位给安装版。
+            for reaches_agent in [Some(true), None] {
+                assert!(!may_take_over(
+                    RelayOwner::OtherInstall,
+                    other_installed,
+                    Path::new(INSTALLED),
+                    reaches_agent
+                ));
+                assert!(!may_take_over(
+                    RelayOwner::OtherInstall,
+                    other_installed,
+                    Path::new(DEV),
+                    reaches_agent
+                ));
+                assert!(may_take_over(
+                    RelayOwner::OtherInstall,
+                    Path::new(DEV),
+                    Path::new(INSTALLED),
+                    reaches_agent
+                ));
+            }
+            // 连不到本 agent 的中继（旧端点 / 旧帧协议）对本次运行无用：开发构建也要接管。
+            for current in [INSTALLED, DEV] {
+                assert!(may_take_over(
+                    RelayOwner::OtherInstall,
+                    other_installed,
+                    Path::new(current),
+                    Some(false)
+                ));
+            }
             for owner in [RelayOwner::Missing, RelayOwner::Broken, RelayOwner::Current] {
-                assert!(may_take_over(owner, other_installed, Path::new(DEV)));
+                assert!(may_take_over(owner, other_installed, Path::new(DEV), None));
             }
         }
 
