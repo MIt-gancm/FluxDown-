@@ -29,7 +29,9 @@ unwrap_used = "deny"
 wildcard_imports = "deny"
 
 [patch.crates-io]
-librqbit = { git = "https://github.com/lingdiansr/rqbit", rev = "3860dbe08c0b11efc0d8499de128b5a18195c44d" }
+# zerx-lab/rqbit = lingdiansr/rqbit (MSE) + Android HTTPS 修复（bundled webpki 根替代需 JNI 初始化的
+# rustls-platform-verifier，否则 Android 上任何 https tracker 都会 panic 掉磁力解析）+ tracker panic 隔离。
+librqbit = { git = "https://github.com/zerx-lab/rqbit", rev = "d9e79c939f223679612cd0b06bd00ed49bd2eff8" }
 
 [profile.dev]
 codegen-units = 16

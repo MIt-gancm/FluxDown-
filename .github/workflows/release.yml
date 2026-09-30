@@ -377,7 +377,7 @@ jobs:
           if package["version"] != "9.0.0":
               raise SystemExit(f"unexpected librqbit version: {package['version']}")
           source = package["source"] or ""
-          prefix = "git+https://github.com/lingdiansr/rqbit?rev="
+          prefix = "git+https://github.com/zerx-lab/rqbit?rev="
           if not source.startswith(prefix):
               raise SystemExit(f"librqbit must resolve from a pinned MSE fork revision, got: {source}")
           requested_rev, separator, resolved_rev = source.removeprefix(prefix).partition("#")
