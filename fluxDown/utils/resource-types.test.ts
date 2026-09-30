@@ -3,6 +3,7 @@ import {
   applySniffRuleOverrides,
   getDefaultSniffRules,
   groupTrackPairs,
+  isNoiseUrl,
   matchSniffRule,
 } from "./resource-types";
 import type { DetectedResource } from "./resource-types";
@@ -283,5 +284,27 @@ describe("groupTrackPairs — 离散音视频轨道分组", () => {
     const groups = groupTrackPairs([doc, video]);
     expect(groups).toHaveLength(1);
     expect(groups[0].videoUrl).toBe(video.url);
+  });
+});
+
+describe("isNoiseUrl — 路径按段边界匹配", () => {
+  test("不误伤 /tracks/、/collections/、/logo、/api/video 上的真实媒体", () => {
+    expect(isNoiseUrl("https://a.example/tracks/123/stream.mp3")).toBe(false);
+    expect(isNoiseUrl("https://a.example/collections/2024/movie.mp4")).toBe(false);
+    expect(isNoiseUrl("https://a.example/api/video/play.m3u8")).toBe(false);
+    expect(isNoiseUrl("https://a.example/logo")).toBe(false);
+  });
+
+  test("仍过滤埋点与版本化 API 端点", () => {
+    expect(isNoiseUrl("https://a.example/collect")).toBe(true);
+    expect(isNoiseUrl("https://a.example/api/v2/items")).toBe(true);
+    expect(isNoiseUrl("https://a.example/pixel.gif")).toBe(true);
+    expect(isNoiseUrl("https://a.example/log/event")).toBe(true);
+  });
+
+  test("带已知媒体扩展名或 attachment 的资源不受路径黑名单影响", () => {
+    expect(isNoiseUrl("https://a.example/track/1/song.mp3")).toBe(false);
+    expect(isNoiseUrl("https://a.example/static/media/clip.mp4")).toBe(false);
+    expect(isNoiseUrl("https://a.example/download/collect", { isAttachment: true })).toBe(false);
   });
 });

@@ -74,7 +74,7 @@ export function addResources(
 
   for (const payload of payloads) {
     // 早期过滤：噪音 URL
-    if (isNoiseUrl(payload.url)) continue;
+    if (isNoiseUrl(payload.url, { isAttachment: payload.isAttachment })) continue;
 
     // generateResourceId 内部已做 URL 归一化
     const id = generateResourceId(payload.url);
@@ -193,17 +193,27 @@ export function getTabsWithResources(): number[] {
 
 // ===== Badge 更新 =====
 
+/** MV3 为 action，Firefox MV2 构建只有 browserAction。 */
+export function getActionApi(): typeof browser.action | undefined {
+  // wxt 的 browser 类型只声明 MV3 的 action；browserAction 仅在 Firefox MV2 运行时存在。
+  const mv2Browser = browser as unknown as {
+    browserAction?: typeof browser.action;
+  };
+  return browser.action ?? mv2Browser.browserAction;
+}
+
 export async function updateBadgeForTab(
   tabId: number,
   displayedCount?: number,
 ): Promise<void> {
   const count = displayedCount ?? getResourceCountForTab(tabId);
   const text = count > 0 ? String(count) : "";
+  const action = getActionApi();
 
   try {
-    await browser.action?.setBadgeText({ text, tabId });
+    await action?.setBadgeText({ text, tabId });
     if (count > 0) {
-      await browser.action?.setBadgeBackgroundColor({
+      await action?.setBadgeBackgroundColor({
         color: "#3B82F6",
         tabId,
       });
@@ -240,6 +250,14 @@ function mergeResource(
   // attachment 标记只升不降
   if (incoming.isAttachment) {
     existing.isAttachment = true;
+  }
+  // 同一媒体路径的签名/token 轮换会归并为同一 id：以最新 URL 与认证头为准，
+  // 否则下载用的是已过期的首次链接。
+  if (incoming.url !== existing.url) {
+    existing.url = incoming.url;
+    existing.detectedAt = Date.now();
+    if (cookies) existing.cookies = cookies;
+    if (headers && Object.keys(headers).length > 0) existing.headers = headers;
   }
   // 合并请求头信息（webRequest 来源的更可靠，覆盖旧值）
   if (cookies && !existing.cookies) {

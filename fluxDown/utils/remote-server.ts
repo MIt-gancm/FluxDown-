@@ -57,6 +57,7 @@ function buildHeaders(cfg: RemoteServerConfig): HeadersInit {
  *   - "remote_not_configured"：remoteUrl 为空
  *   - "remote_auth_failed"：HTTP 401/403（token 错误）
  *   - "remote_unreachable"：fetch 抛异常（网络错误/超时/DNS 失败等）
+ *   - "remote_bad_response"：2xx 但不是 FluxDown 的 JSON 应答（如 SSO 反代登录页）
  *   - 其余：服务端业务返回的失败信息（HTTP 状态非 2xx 或 body.success=false）
  */
 async function postJson(
@@ -85,7 +86,16 @@ async function postJson(
     return { success: false, message: "remote_auth_failed" };
   }
 
-  const data = await resp.json().catch(() => ({}) as Record<string, unknown>);
+  // SSO 反代在会话过期时会 302 到登录页，fetch 跟随后得到 200 text/html；
+  // 服务端真实响应恒为 {success,message} JSON，因此只认显式 success===true。
+  if (resp.redirected) {
+    return { success: false, message: "remote_bad_response: redirected" };
+  }
+
+  const data = await resp.json().catch(() => null) as Record<
+    string,
+    unknown
+  > | null;
 
   if (!resp.ok) {
     return {
@@ -97,9 +107,19 @@ async function postJson(
     };
   }
 
+  if (data?.success !== true) {
+    return {
+      success: false,
+      message:
+        typeof data?.message === "string"
+          ? data.message
+          : "remote_bad_response: not a FluxDown JSON reply",
+    };
+  }
+
   return {
-    success: data?.success !== false,
-    message: typeof data?.message === "string" ? data.message : undefined,
+    success: true,
+    message: typeof data.message === "string" ? data.message : undefined,
   };
 }
 

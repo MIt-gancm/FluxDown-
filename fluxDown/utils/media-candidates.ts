@@ -9,6 +9,7 @@ import type { DashManifest } from "./dash-manifest";
 import type { DetectedResource } from "./resource-types";
 import {
   extractExtension,
+  extractFilenameFromUrl,
   isStreamingUrl,
   normalizeUrlForDedup,
 } from "./resource-types";
@@ -133,9 +134,15 @@ function isManifestUrl(url: string, mimeType?: string): boolean {
 
 function isCompleteFragmentResource(resource: DetectedResource): boolean {
   if (!isFragmentUrl(resource.url)) return false;
-  // A Content-Disposition filename is an explicit complete-file signal. For
-  // unnamed media, a very large response is not a normal MSE fragment.
-  return Boolean(resource.isAttachment || resource.filename?.trim()) || resource.size >= 16 * 1024 * 1024;
+  // resource-store 会用 URL 基名补全 filename，所以 filename 非空并不代表服务器
+  // 给了 Content-Disposition 文件名；只有与 URL 基名不同的名字才算显式信号。
+  // 无显式名字的媒体，超大响应也不是普通 MSE 分片。
+  const filename = resource.filename?.trim();
+  const explicitName =
+    Boolean(filename) &&
+    filename !== extractFilenameFromUrl(resource.url) &&
+    filename !== extractFilenameFromUrl(resource.finalUrl ?? "");
+  return Boolean(resource.isAttachment || explicitName) || resource.size >= 16 * 1024 * 1024;
 }
 
 function isCompleteVideoResource(resource: DetectedResource): boolean {

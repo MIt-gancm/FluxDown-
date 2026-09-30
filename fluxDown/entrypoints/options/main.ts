@@ -33,6 +33,7 @@ import {
   DEFAULT_SETTINGS,
 } from '@/utils/settings';
 import { remoteVerify } from '@/utils/remote-server';
+import { normalizeDomain } from '@/utils/domain-exclusion';
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector<T>(sel)!;
 
@@ -204,17 +205,16 @@ function syncMinSizeCustomVisibility(): void {
 
 minSizeSelect.addEventListener('change', async () => {
   syncMinSizeCustomVisibility();
-  if (minSizeSelect.value === 'custom') {
-    const mb = Math.max(0, Math.round(Number(minSizeCustomInput.value) || 0));
-    minSizeCustomInput.value = mb > 0 ? String(mb) : '';
-    await saveSettings({ minFileSize: mb * 1024 * 1024 });
-    return;
-  }
+  // 选「自定义」只展开输入框；数值在输入框 change 且合法时才保存，
+  // 中途放弃不应把阈值静默改写成 0（不限）。
+  if (minSizeSelect.value === 'custom') return;
   await saveSettings({ minFileSize: parseInt(minSizeSelect.value, 10) });
 });
 
 minSizeCustomInput.addEventListener('change', async () => {
-  const mb = Math.max(0, Math.round(Number(minSizeCustomInput.value) || 0));
+  const raw = minSizeCustomInput.value.trim();
+  if (raw === '' || !Number.isFinite(Number(raw))) return;
+  const mb = Math.max(0, Math.round(Number(raw)));
   minSizeCustomInput.value = mb > 0 ? String(mb) : '';
   await saveSettings({ minFileSize: mb * 1024 * 1024 });
 });
@@ -546,9 +546,12 @@ async function removeDomain(domain: string): Promise<void> {
   }
 }
 
-async function addDomain(domain: string): Promise<void> {
-  domain = domain.trim().toLowerCase();
-  if (!domain) return;
+async function addDomain(input: string): Promise<void> {
+  const domain = normalizeDomain(input);
+  if (!domain) {
+    showToast(t('domain.invalid', { domain: input.trim() }), 'error');
+    return;
+  }
 
   const current = await loadSettings();
   const domains = [...current.excludeDomains];

@@ -363,6 +363,23 @@ describe("buildMediaCandidates", () => {
     expect(countMediaCandidateRows(candidates)).toBe(1);
   });
 
+  test("filename 为 URL 基名（store 真实形态）的分片仍归为分片汇总，不逐个展示", () => {
+    const resources = ["seg-1.ts", "seg-2.ts", "seg-3.ts"].map((name, i) =>
+      resource({
+        id: `ts${i}`,
+        url: `https://cdn.example.com/hls/${name}`,
+        filename: name,
+        type: "stream",
+        size: 1_500_000,
+      }),
+    );
+
+    const candidates = buildMediaCandidates(resources, { fallbackTitle: "Video", manifests: [] });
+
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0].source).toBe("fragments");
+  });
+
   test("备用 CDN 使用相同媒体路径时归入 DASH 候选", () => {
     const currentManifest = manifest("deadline=100&sig=one", "deadline=100&sig=one");
     const resources = [

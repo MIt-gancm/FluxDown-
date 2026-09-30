@@ -3,6 +3,7 @@
  */
 
 import { browser } from "wxt/browser";
+import { isDomainExcluded, normalizeDomainList } from "./domain-exclusion";
 
 /**
  * 拦截模式：
@@ -232,21 +233,101 @@ const DEFAULT_SETTINGS: FluxDownSettings = {
   enableFluxdownProtocol: false,
 };
 
+/** 远程下载源配置独立存放在 storage.local：访问密钥与目标地址不应随浏览器账号同步。 */
+export const REMOTE_SETTINGS_KEY = "remoteSettings";
+
+type RemoteSettings = Pick<
+  FluxDownSettings,
+  "remoteMode" | "remoteUrl" | "remoteToken" | "remoteVerified"
+>;
+
+function pickRemote(s: FluxDownSettings): RemoteSettings {
+  return {
+    remoteMode: s.remoteMode,
+    remoteUrl: s.remoteUrl,
+    remoteToken: s.remoteToken,
+    remoteVerified: s.remoteVerified,
+  };
+}
+
+function omitRemote(s: FluxDownSettings): Partial<FluxDownSettings> {
+  const {
+    remoteMode: _m,
+    remoteUrl: _u,
+    remoteToken: _t,
+    remoteVerified: _v,
+    ...rest
+  } = s;
+  return rest;
+}
+
+function hasRemoteFields(s: Partial<FluxDownSettings>): boolean {
+  return (
+    "remoteMode" in s ||
+    "remoteUrl" in s ||
+    "remoteToken" in s ||
+    "remoteVerified" in s
+  );
+}
+
 /**
  * 加载设置
  */
 export async function loadSettings(): Promise<FluxDownSettings> {
-  const result = (await browser.storage.sync.get("settings")) ?? {};
-  if (result.settings) {
-    const merged = { ...DEFAULT_SETTINGS, ...result.settings };
-    // 迁移：旧版"仅扩展名"模式的设置项已移除，归一化为智能模式，
-    // 否则 popup 下拉框（已无该选项）会显示空白、拦截逻辑走废弃分支。
-    if ((merged.interceptMode as string) === "extension") {
-      merged.interceptMode = "smart";
+  const [syncResult, localResult] = await Promise.all([
+    browser.storage.sync.get("settings"),
+    browser.storage.local.get(REMOTE_SETTINGS_KEY),
+  ]);
+  const stored = syncResult?.settings as
+    | Partial<FluxDownSettings>
+    | undefined;
+  let remote = localResult?.[REMOTE_SETTINGS_KEY] as
+    | Partial<RemoteSettings>
+    | undefined;
+
+  // 迁移：旧版把远程配置放在 storage.sync。本机尚无 local 副本时采用 sync 中的
+  // 值；无论是否采用，都从 sync 删除，且此后以 local 为准，同步来的远程字段不再生效。
+  if (stored && hasRemoteFields(stored)) {
+    const legacy = { ...DEFAULT_SETTINGS, ...stored };
+    if (!remote) {
+      remote = pickRemote(legacy);
+      await browser.storage.local.set({ [REMOTE_SETTINGS_KEY]: remote });
     }
-    return merged;
+    await browser.storage.sync.set({
+      settings: omitRemote(legacy),
+    });
   }
-  return { ...DEFAULT_SETTINGS };
+
+  const merged: FluxDownSettings = {
+    ...DEFAULT_SETTINGS,
+    ...(stored ?? {}),
+    ...(remote ?? {}),
+  };
+  // 迁移：旧版"仅扩展名"模式的设置项已移除，归一化为智能模式，
+  // 否则 popup 下拉框（已无该选项）会显示空白、拦截逻辑走废弃分支。
+  if ((merged.interceptMode as string) === "extension") {
+    merged.interceptMode = "smart";
+  }
+  merged.excludeDomains = normalizeDomainList(merged.excludeDomains ?? []);
+  return merged;
+}
+
+/**
+ * 按字段归属落盘：远程配置写 storage.local，其余写 storage.sync。
+ * `previous` 给出时仅在远程配置确有变化时才写 local。
+ */
+export async function persistSettings(
+  next: FluxDownSettings,
+  previous?: FluxDownSettings,
+): Promise<void> {
+  await browser.storage.sync.set({ settings: omitRemote(next) });
+  const nextRemote = pickRemote(next);
+  if (
+    !previous ||
+    JSON.stringify(pickRemote(previous)) !== JSON.stringify(nextRemote)
+  ) {
+    await browser.storage.local.set({ [REMOTE_SETTINGS_KEY]: nextRemote });
+  }
 }
 
 /**
@@ -268,14 +349,14 @@ export async function saveSettings(
   if (remoteChanged && !("remoteVerified" in settings)) {
     merged.remoteVerified = false;
   }
-  await browser.storage.sync.set({ settings: merged });
+  await persistSettings(merged, current);
 }
 
 /**
  * 重置设置
  */
 export async function resetSettings(): Promise<void> {
-  await browser.storage.sync.set({ settings: DEFAULT_SETTINGS });
+  await persistSettings({ ...DEFAULT_SETTINGS });
 }
 
 /**
@@ -314,15 +395,27 @@ export function shouldIntercept(
     return false;
   }
 
-  // 检查域名排除
+  // 检查域名排除：下载 URL 主机或来源页主机任一命中即放行，
+  // 这样「排除当前站点」对托管在 CDN/对象存储上的下载同样有效。
   try {
     const hostname = new URL(url).hostname;
-    if (settings.excludeDomains.some((d) => hostname.includes(d))) {
+    if (isDomainExcluded(hostname, settings.excludeDomains)) {
       return false;
     }
   } catch {
     // URL 解析失败，不拦截
     return false;
+  }
+  if (referrerUrl) {
+    try {
+      if (
+        isDomainExcluded(new URL(referrerUrl).hostname, settings.excludeDomains)
+      ) {
+        return false;
+      }
+    } catch {
+      // referrer 解析失败：忽略
+    }
   }
 
   // 检查排除扩展名（#177）：优先级高于 customExtensions/BUILTIN_EXTENSIONS
@@ -389,8 +482,12 @@ export function shouldIntercept(
   return true;
 }
 
-/** fluxdown_server 自身的文件导出端点（web/src/lib/api.ts `taskFileUrl` / `logsExportUrl`）。 */
-const FLUXDOWN_EXPORT_PATH_RE = /^\/api\/v1\/(tasks\/[^/]+\/file|logs\/export)$/;
+/**
+ * fluxdown headless 服务（native/agent server_mode）给自身 Web UI 提供的
+ * 文件/导出下载端点；旧的 /api/v1 路由（冻结的 native/server）一并保留兼容。
+ */
+const FLUXDOWN_EXPORT_PATH_RE =
+  /^\/api\/(?:web\/(?:files\/tasks\/[^/]+|exports\/[^/]+|logs\/export)|v1\/(?:tasks\/[^/]+\/file|logs\/export))$/;
 
 /**
  * 判断一次浏览器下载是否由 FluxDown 自身的远程 Web UI 发起（#658）。

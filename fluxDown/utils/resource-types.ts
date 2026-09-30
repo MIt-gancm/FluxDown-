@@ -551,29 +551,27 @@ const NOISE_DOMAINS_EXACT = new Set<string>([
   "analytics.twitter.com",
 ]);
 
-/** URL 路径黑名单模式（部分匹配） */
-const NOISE_PATH_PATTERNS: string[] = [
-  "/api/v", // API 端点
-  "/graphql",
-  "/_next/static", // Next.js 静态资源
-  "/static/js/",
-  "/static/css/",
-  "/static/media/", // 一般是小图标
-  "/assets/fonts/",
-  "/fonts/",
-  "/favicon",
-  "/sw.js", // Service Worker
-  "/workbox-",
-  "/manifest.json",
-  "/robots.txt",
-  "/sitemap",
-  "/__/", // Firebase 等内部路径
-  "/beacon",
-  "/collect", // analytics collect 端点
-  "/pixel",
-  "/track",
-  "/log",
-  "/telemetry",
+/**
+ * URL 路径黑名单。按路径段边界匹配：`/track` 只命中 `/track` 或 `/track/…`
+ * （及 `/track.gif`），不会误伤 `/tracks/`、`/collections/`、`/logo`、`/api/video`。
+ */
+const NOISE_PATH_PATTERNS: RegExp[] = [
+  /\/api\/v\d+(?:\/|$)/, // 版本化 API 端点
+  /\/graphql(?:\/|$)/,
+  /\/_next\/static\//, // Next.js 静态资源
+  /\/static\/js\//,
+  /\/static\/css\//,
+  /\/static\/media\//, // 一般是小图标
+  /\/assets\/fonts\//,
+  /\/fonts\//,
+  /\/favicon[^/]*$/,
+  /\/sw\.js$/, // Service Worker
+  /\/workbox-[^/]*$/,
+  /\/manifest\.json$/,
+  /\/robots\.txt$/,
+  /\/sitemap[^/]*$/,
+  /\/__\//, // Firebase 等内部路径
+  /\/(?:beacon|collect|pixel|track|log|telemetry)(?:\.[a-z0-9]+)?(?:\/|$)/,
 ];
 
 /**
@@ -608,7 +606,10 @@ export function isLikelyApiUrl(url: string): boolean {
 /**
  * 判断 URL 是否命中噪音黑名单
  */
-export function isNoiseUrl(url: string): boolean {
+export function isNoiseUrl(
+  url: string,
+  opts?: { isAttachment?: boolean },
+): boolean {
   try {
     const u = new URL(url);
     const hostname = u.hostname.toLowerCase();
@@ -622,9 +623,14 @@ export function isNoiseUrl(url: string): boolean {
       if (hostname.includes(pattern) || url.includes(pattern)) return true;
     }
 
-    // 路径黑名单
-    for (const pattern of NOISE_PATH_PATTERNS) {
-      if (pathname.includes(pattern)) return true;
+    // 路径黑名单：明确的附件下载，或带媒体/文档/压缩包等已知扩展名的 URL 不受
+    // 路径噪音规则影响（如 /track/123/stream.mp3、Next.js 打包的 mp4）。
+    const knownExt = classifyByExtension(url);
+    const exempt =
+      opts?.isAttachment === true ||
+      (knownExt !== "other" && knownExt !== "image");
+    if (!exempt && NOISE_PATH_PATTERNS.some((re) => re.test(pathname))) {
+      return true;
     }
 
     // data URI / extension internal
@@ -913,7 +919,7 @@ export function isWorthShowing(resource: DetectedResource): boolean {
   }
 
   // 2. 噪音域名/路径
-  if (isNoiseUrl(resource.url)) {
+  if (isNoiseUrl(resource.url, { isAttachment: resource.isAttachment })) {
     return false;
   }
 

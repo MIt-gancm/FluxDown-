@@ -125,6 +125,7 @@ const zhCN = {
   "domain.removed": "已移除 {domain}",
   "domain.exists": "{domain} 已在排除列表中",
   "domain.excluded": "已排除 {domain}",
+  "domain.invalid": "无效的域名：{domain}",
   "domain.cannotGetDomain": "无法获取当前页面域名",
   "domain.excludeCurrent": "排除当前站点",
 
@@ -265,7 +266,7 @@ const zhCN = {
   // Options 迁移项补充说明
   "options.general.statsDesc": "重置弹出窗口中显示的已下载/失败计数",
   "options.rules.minFileSizeDesc": "小于该大小的文件不会被拦截",
-  "options.rules.domainDesc": "这些域名下的下载将不会被拦截",
+  "options.rules.domainDesc": "这些域名（含子域名）下的下载，以及从这些域名页面发起的下载不会被拦截",
 
   // 自定义协议（fluxdown://）
   "options.protocol.label": "FluxDown 自定义协议",

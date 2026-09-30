@@ -48,7 +48,7 @@ import {
   remotePing,
 } from "./remote-server";
 import type { RemoteServerConfig } from "./remote-server";
-import { loadSettings } from "./settings";
+import { REMOTE_SETTINGS_KEY, loadSettings } from "./settings";
 import type { FluxDownSettings, RemoteMode } from "./settings";
 
 // NMH 侧代表"不可达"（连接层/瞬态失败）而非 App 业务拒绝的 message 集合，
@@ -72,6 +72,19 @@ function isNmhUnreachable(response: ApiResponse): boolean {
   );
 }
 
+/**
+ * 失败是否属于「不可达/超时」（请求可能已送达、也可能没送达），而非 App/远端的
+ * 明确业务拒绝。上层据此决定回退前是否需要保守探活以防双下载。
+ */
+export function isUnreachableFailure(response: ApiResponse): boolean {
+  return (
+    isNmhUnreachable(response) ||
+    (!response.success &&
+      typeof response.message === "string" &&
+      response.message.startsWith("remote_unreachable"))
+  );
+}
+
 // ──────────────────────────────────────────────────────────────
 // 设置缓存（见文件头说明）
 // ──────────────────────────────────────────────────────────────
@@ -86,7 +99,12 @@ async function getRoutingSettings(): Promise<FluxDownSettings> {
 
 try {
   browser.storage.onChanged.addListener((changes, area) => {
-    if (area === "sync" && changes.settings) _settingsCache = null;
+    if (
+      (area === "sync" && changes.settings) ||
+      (area === "local" && changes[REMOTE_SETTINGS_KEY])
+    ) {
+      _settingsCache = null;
+    }
   });
 } catch {
   // storage.onChanged 在个别环境不可用；缓存仍会在下次 SW 生命周期内
@@ -171,44 +189,84 @@ async function mapWithConcurrency<T, R>(
 
 const TRACK_PAIR_FANOUT_CONCURRENCY = 6;
 
-/** The legacy HTTP batch endpoint joins URLs and cannot carry audioUrl. */
+/**
+ * 服务端 /download/batch 把整批 URL 共用「首个非空」的 cookies/referrer/headers，
+ * 且丢弃 filename/fileSize/mimeType/method/body/audioUrl。因此只有上下文完全相同、
+ * 且不带这些逐条字段的条目才能安全合并为一次批量 POST；其余逐条 POST /download，
+ * 避免 A 站的 Cookie/Authorization 被发往批内其他主机。
+ */
+function batchContextKey(item: BatchDownloadItem): string | null {
+  if (
+    item.audioUrl ||
+    item.filename ||
+    item.mimeType ||
+    item.method ||
+    item.body ||
+    (item.fileSize !== undefined && item.fileSize > 0)
+  ) {
+    return null;
+  }
+  return JSON.stringify([
+    item.cookies ?? "",
+    item.referrer ?? "",
+    Object.entries(item.headers ?? {}).sort(([a], [b]) => (a < b ? -1 : 1)),
+  ]);
+}
+
 async function remoteSendBatchPreservingAudio(
   items: BatchDownloadItem[],
   cfg: RemoteServerConfig,
 ): Promise<ApiResponse> {
-  if (!items.some((item) => item.audioUrl)) {
-    return remoteSendBatchDownloadRequest(items, cfg);
+  const groups = new Map<string, BatchDownloadItem[]>();
+  const singles: BatchDownloadItem[] = [];
+  for (const item of items) {
+    const key = batchContextKey(item);
+    if (key === null) {
+      singles.push(item);
+      continue;
+    }
+    const group = groups.get(key);
+    if (group) group.push(item);
+    else groups.set(key, [item]);
   }
-  const trackItems = items.filter((item) => item.audioUrl);
-  const plainItems = items.filter((item) => !item.audioUrl);
+  // 单条成组没有合并收益，走单条端点（保留 filename 之外的全部字段）。
+  const units: Array<{ size: number; run: () => Promise<ApiResponse> }> = [];
+  for (const group of groups.values()) {
+    if (group.length === 1) singles.push(group[0]);
+    else
+      units.push({
+        size: group.length,
+        run: () => remoteSendBatchDownloadRequest(group, cfg),
+      });
+  }
+  for (const item of singles) {
+    units.push({ size: 1, run: () => remoteSendDownloadRequest(item, cfg) });
+  }
 
-  // 音轨条目逐条 POST（并发闸门见 mapWithConcurrency）与普通条目一次批量
-  // POST 是两组相互独立的请求，并发发出而不是先等音轨组结束再发普通组
-  // （此前的实现在这里把它们意外串行化，各自仍受 DOWNLOAD_TIMEOUT_MS 约束）。
-  const [trackResults, plainResult] = await Promise.all([
-    mapWithConcurrency(trackItems, TRACK_PAIR_FANOUT_CONCURRENCY, (item) =>
-      remoteSendDownloadRequest(item, cfg),
-    ),
-    plainItems.length > 0 ? remoteSendBatchDownloadRequest(plainItems, cfg) : null,
-  ]);
+  // 各单元互相独立，受统一并发闸门约束（见 mapWithConcurrency）。
+  const results = await mapWithConcurrency(
+    units,
+    TRACK_PAIR_FANOUT_CONCURRENCY,
+    (unit) => unit.run(),
+  );
+  // 整批只有一个请求时原样返回，保留 remote_auth_failed 等稳定 message 前缀。
+  if (results.length === 1) return results[0];
 
   // 部分成功聚合语义对齐 NMH legacy 路径的 "x/y items sent (z failed)"：
   // 任一条目失败都不能让已经建好的任务被上层判定为「整批失败」进而重试
   // （background.ts 收到 success:false 后 incrementStat("failed") + 失败
-  // 通知，用户手动重试会把已接受的条目重复创建）。plainItems 那次批量
-  // POST 是单个 HTTP 调用，拿不到内部逐条结果，只能按该次调用的成功/
-  // 失败把 plainItems.length 整体计入成功或失败。
-  const succeededTracks = trackResults.filter((result) => result.success).length;
-  const plainSucceeded = plainItems.length > 0 && (plainResult?.success ?? false);
-  const succeeded = succeededTracks + (plainSucceeded ? plainItems.length : 0);
+  // 通知，用户手动重试会把已接受的条目重复创建）。批量 POST 是单个 HTTP
+  // 调用，拿不到内部逐条结果，只能按该次调用的成败整体计数。
+  let succeeded = 0;
+  results.forEach((result, i) => {
+    if (result.success) succeeded += units[i].size;
+  });
   const total = items.length;
   const failed = total - succeeded;
 
   if (succeeded === 0) {
     const firstFailureMessage =
-      trackResults.find((result) => !result.success)?.message ??
-      plainResult?.message ??
-      "All items failed";
+      results.find((result) => !result.success)?.message ?? "All items failed";
     return { success: false, message: `Batch failed: ${firstFailureMessage}` };
   }
   return {

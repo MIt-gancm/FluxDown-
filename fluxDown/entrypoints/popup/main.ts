@@ -24,6 +24,11 @@ import { browser } from 'wxt/browser';
 import { initI18n, applyI18nToDOM, t, getLocale, saveLocale } from '@/utils/i18n';
 import { checkFluxDownAvailable } from '@/utils/download-dispatch';
 import { loadSettings, saveSettings } from '@/utils/settings';
+import {
+  isDomainExcluded,
+  isHostExcluded,
+  normalizeDomainList,
+} from '@/utils/domain-exclusion';
 import type { RemoteMode } from '@/utils/settings';
 import type { DetectedResource, ResourceType } from '@/utils/resource-types';
 import { formatFileSize } from '@/utils/resource-types';
@@ -192,6 +197,16 @@ async function loadStats(preloaded?: { sent?: number; failed?: number; date?: st
 // 并发守卫：设置变更可能连续触发刷新，只让最后一次的结果落到 UI。
 let _statusEpoch = 0;
 
+type ConnectionState = 'checking' | 'connected' | 'disconnected';
+let connectionState: ConnectionState = 'checking';
+
+/** 状态文字不带 data-i18n（applyI18nToDOM 会把它重置为「检测中」），由此按当前状态重绘。 */
+function renderConnectionStatus(): void {
+  statusBadge.className =
+    connectionState === 'checking' ? 'status-badge' : `status-badge ${connectionState}`;
+  statusText.textContent = t(`header.${connectionState}` as MessageKey);
+}
+
 /**
  * 刷新头部连接徽标。探活逻辑复用 download-dispatch，与实际下载路由判定保持一致。
  * 与任务面板的 connected 状态是两个独立信号：头部徽标反映"能否投递下载"，
@@ -199,21 +214,21 @@ let _statusEpoch = 0;
  */
 async function refreshConnectionStatus(): Promise<void> {
   const epoch = ++_statusEpoch;
-  statusBadge.className = 'status-badge';
-  statusText.textContent = t('header.checking');
+  connectionState = 'checking';
+  renderConnectionStatus();
 
   const available = await checkFluxDownAvailable().catch(() => false);
   if (epoch !== _statusEpoch) return; // 已有更新的刷新在途，丢弃本次结果
 
   if (available) {
-    statusBadge.className = 'status-badge connected';
-    statusText.textContent = t('header.connected');
+    connectionState = 'connected';
+    renderConnectionStatus();
     browser.runtime
       .sendMessage({ action: 'appConfirmedUp' })
       .catch(() => {});
   } else {
-    statusBadge.className = 'status-badge disconnected';
-    statusText.textContent = t('header.disconnected');
+    connectionState = 'disconnected';
+    renderConnectionStatus();
   }
 }
 
@@ -1373,11 +1388,17 @@ resBatchBtn.addEventListener('click', async () => {
   if (items.length === 0) return;
   resBatchBtn.disabled = true;
   try {
-    await browser.runtime.sendMessage({
+    const res = (await browser.runtime.sendMessage({
       action: 'batchDownload',
       items,
       tabId: resourceTabId,
-    });
+    })) as { success?: boolean; error?: string } | undefined;
+    if (!res || res.success !== true) {
+      // 失败时保留选择，方便用户修复连接后重试。
+      showToast(t('popup.quickDownload.failed'), 'error');
+      resBatchBtn.disabled = false;
+      return;
+    }
     showToast(t('popup.quickDownload.sent'));
     resSelectedIds.clear();
     renderResList();
@@ -1422,7 +1443,7 @@ function renderExcludeCurrent(): void {
   const known = currentHostname !== '';
   excludeCurrentToggle.disabled = !known;
   excludeCurrentToggle.checked =
-    known && excludeDomains.includes(currentHostname);
+    known && isDomainExcluded(currentHostname, excludeDomains);
   excludeCurrentHint.textContent = known
     ? currentHostname
     : t('domain.cannotGetDomain');
@@ -1444,9 +1465,10 @@ excludeCurrentToggle.addEventListener('change', async () => {
   const domain = currentHostname;
   if (!domain) return;
   const exclude = excludeCurrentToggle.checked;
+  // 取消排除要移除所有覆盖当前主机的规则（含父域），否则开关会回弹。
   excludeDomains = exclude
-    ? [...excludeDomains, domain]
-    : excludeDomains.filter((d) => d !== domain);
+    ? normalizeDomainList([...excludeDomains, domain])
+    : excludeDomains.filter((d) => !isHostExcluded(domain, d));
   await saveSettings({ excludeDomains });
   renderExcludeCurrent();
   showToast(
@@ -1571,6 +1593,8 @@ async function toggleLang() {
   updateEnableHint(enableToggle.checked);
   refreshRemoteModeHint();
   renderExcludeCurrent();
+  renderConnectionStatus();
+  updateProtocolHint(protocolToggle.checked);
   // applyI18nToDOM 会把 startAppBtn 的 .btn-label 重置为默认文案，
   // loading 态需要重新套用翻译后的"启动中…"。
   if (appStarting) setStartAppLoading(true);

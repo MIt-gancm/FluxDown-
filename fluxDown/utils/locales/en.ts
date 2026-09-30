@@ -134,6 +134,7 @@ const en: Record<MessageKey, string> = {
   "domain.removed": "Removed {domain}",
   "domain.exists": "{domain} already in exclusion list",
   "domain.excluded": "Excluded {domain}",
+  "domain.invalid": "Invalid domain: {domain}",
   "domain.cannotGetDomain": "Cannot get current page domain",
   "domain.excludeCurrent": "Exclude Current Site",
 
@@ -279,7 +280,7 @@ const en: Record<MessageKey, string> = {
   // Options migration extras
   "options.general.statsDesc": "Reset the downloaded/failed counters shown in the popup",
   "options.rules.minFileSizeDesc": "Files smaller than this are not intercepted",
-  "options.rules.domainDesc": "Downloads from these domains are never intercepted",
+  "options.rules.domainDesc": "Downloads from these domains and their subdomains, or started from pages on them, are never intercepted",
 
   // Custom protocol (fluxdown://)
   "options.protocol.label": "FluxDown Protocol",

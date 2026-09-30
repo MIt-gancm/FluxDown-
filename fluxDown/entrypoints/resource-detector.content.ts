@@ -11,6 +11,7 @@
  */
 
 import { browser } from 'wxt/browser';
+import { injectScript } from 'wxt/utils/inject-script';
 import { defineContentScript } from 'wxt/utils/define-content-script';
 import { loadSettings } from "@/utils/settings";
 import type {
@@ -34,10 +35,12 @@ export default defineContentScript({
     // 且监听设置变更即时生效（用户关掉后点磁力链接应立即交还系统处理程序）。
     let sniffingEnabled = true;
     let magnetEnabled = true;
+    let interceptEnabled = true;
     try {
       const settings = await loadSettings();
       sniffingEnabled = settings.resourceSniffing !== false;
       magnetEnabled = settings.interceptMagnet !== false;
+      interceptEnabled = settings.enabled !== false;
     } catch {
       // 设置读取失败时按默认开启处理
     }
@@ -47,10 +50,11 @@ export default defineContentScript({
     ) => {
       if (area !== "sync" || !changes.settings) return;
       const next = changes.settings.newValue as
-        | { interceptMagnet?: boolean }
+        | { interceptMagnet?: boolean; enabled?: boolean }
         | undefined;
       if (!next) return;
       magnetEnabled = next.interceptMagnet !== false;
+      interceptEnabled = next.enabled !== false;
     };
     browser.storage.onChanged.addListener(handleSettingsChanged);
     ctx.onInvalidated(() =>
@@ -409,7 +413,7 @@ export default defineContentScript({
     // 改由 FluxDown 接管。使用捕获阶段，早于页面自身的 click 处理器执行。
     // interceptMagnet 关闭时放行，交还系统默认磁力处理程序（如 qBittorrent）。
     const handleMagnetClick = (e: MouseEvent) => {
-      if (!magnetEnabled) return;
+      if (!magnetEnabled || !interceptEnabled) return;
       const target = e.target;
       if (!(target instanceof Element)) return;
       const link = target.closest("a[href]") as HTMLAnchorElement | null;
@@ -424,7 +428,13 @@ export default defineContentScript({
           url: href,
           filename: parseMagnetDisplayName(href),
         })
-        .catch(() => {});
+        .then((res: { success?: boolean; error?: string } | undefined) => {
+          // 未被 FluxDown 接管（被拒绝/后台无响应）时交还系统处理程序，避免点击变死链。
+          if (!res || res.success === false || res.error) location.href = href;
+        })
+        .catch(() => {
+          location.href = href;
+        });
     };
     document.addEventListener("click", handleMagnetClick, true);
     ctx.onInvalidated(() => {

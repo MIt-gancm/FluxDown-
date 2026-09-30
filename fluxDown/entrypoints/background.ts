@@ -36,6 +36,7 @@ import {
   checkFluxDownAvailable,
   checkFluxDownAvailableWithRetry,
   warmupNativeHost,
+  isUnreachableFailure,
 } from "@/utils/download-dispatch";
 import {
   nmhListTasks,
@@ -49,7 +50,12 @@ import type {
   BatchDownloadItem,
   TaskBrief,
 } from "@/utils/native-messaging";
-import { loadSettings, shouldIntercept } from "@/utils/settings";
+import {
+  REMOTE_SETTINGS_KEY,
+  loadSettings,
+  persistSettings,
+  shouldIntercept,
+} from "@/utils/settings";
 import type { DownloadItemInfo } from "@/utils/settings";
 import { cancelBeforeFilenameResolution } from "@/utils/download-cancellation";
 import { initI18n, t } from "@/utils/i18n";
@@ -72,6 +78,7 @@ import {
   getResourcesForTab,
   clearResourcesForTab,
   updateBadgeForTab,
+  getActionApi,
   initTabLifecycleListeners,
 } from "@/utils/resource-store";
 
@@ -172,7 +179,10 @@ export default defineBackground(() => {
 
   // 监听 storage 变化，立即失效缓存
   browser.storage.onChanged.addListener((changes, area) => {
-    if (area === "sync" && changes.settings) {
+    if (
+      (area === "sync" && changes.settings) ||
+      (area === "local" && changes[REMOTE_SETTINGS_KEY])
+    ) {
       _settingsCache = null;
       _settingsCacheTs = 0;
       _settingsInflight = null;
@@ -564,9 +574,7 @@ export default defineBackground(() => {
     if (command !== "toggle-intercept") return;
     const settings = await loadSettings();
     const newEnabled = !settings.enabled;
-    await browser.storage.sync.set({
-      settings: { ...settings, enabled: newEnabled },
-    });
+    await persistSettings({ ...settings, enabled: newEnabled }, settings);
     updateIcon(newEnabled);
     syncDownloadShelfState(newEnabled);
     // 通知用户当前状态
@@ -659,6 +667,9 @@ export default defineBackground(() => {
     return false;
   }
 
+  // 表单 POST 体通常只有几 KB；超过此上限的 raw 体不缓存。
+  const MAX_CAPTURED_RAW_BODY_BYTES = 1024 * 1024;
+
   function captureBody(
     details: chrome.webRequest.WebRequestBodyDetails,
   ): CapturedBody | undefined {
@@ -670,7 +681,7 @@ export default defineBackground(() => {
     if (body.raw && body.raw.length > 0) {
       // 只取首块 raw bytes——多块拼接对常见 form-urlencoded / JSON POST 不必要
       const part = body.raw[0];
-      if (part?.bytes) {
+      if (part?.bytes && part.bytes.byteLength <= MAX_CAPTURED_RAW_BODY_BYTES) {
         return {
           kind: "raw",
           bytesB64: arrayBufferToBase64(part.bytes),
@@ -704,9 +715,11 @@ export default defineBackground(() => {
   }
 
   try {
+    // 只有导航（表单 POST 触发下载）才可能产生下载项；XHR/fetch 的请求体
+    // （上传分块、埋点）捕获后永远用不上，却要做 O(body) 的复制与 base64。
     browser.webRequest.onBeforeRequest.addListener(
       onBeforeRequestHandler as any,
-      { urls: ["<all_urls>"] },
+      { urls: ["<all_urls>"], types: ["main_frame", "sub_frame"] },
       ["requestBody"] as any,
     );
     console.log(
@@ -843,6 +856,18 @@ export default defineBackground(() => {
     "range", // 播放器 seek 产生的分段 Range，透传会与下载引擎自管的分段/续传冲突（B站 .m4s 音频轨 416）
     "if-range", // 与 Range 配套的条件头，同样不应透传
   ]);
+
+  /** 缺少 User-Agent 时补上浏览器真实 UA；所有下载路径共用。 */
+  function withBrowserUserAgent(
+    headers: Record<string, string>,
+  ): Record<string, string> | undefined {
+    const merged = Object.keys(headers).some(
+      (k) => k.toLowerCase() === "user-agent",
+    )
+      ? headers
+      : { ...headers, "User-Agent": navigator.userAgent };
+    return Object.keys(merged).length > 0 ? merged : undefined;
+  }
 
   /**
    * 从 requestHeaderCache 提取认证信息（Cookie + 自定义头）。
@@ -1272,7 +1297,11 @@ export default defineBackground(() => {
         .toLowerCase()
         .startsWith("attachment");
       const isDownloadMime = isDownloadContentType(contentType);
-      if (!isAttachment && !isDownloadMime) return undefined;
+      // Firefox 可内联展示的类型（PDF/常见音视频）仅在 attachment 时才是下载，
+      // main_frame 与 sub_frame 同规则；其余下载类 MIME 照旧。
+      if (!isAttachment && (!isDownloadMime || isFirefoxInlineViewableType(contentType))) {
+        return undefined;
+      }
 
       // 冷启动首个下载时 settings 缓存可能为 null：保守放行，异步预热缓存
       const settings = _settingsCache;
@@ -1985,17 +2014,30 @@ export default defineBackground(() => {
 
   // ===== 消息处理（Popup + Content Script） =====
   //
-  // 直接返回 Promise，而非 sendResponse + return true。
+  // Firefox：直接返回 Promise。Firefox MV2 中 "return true + 异步 sendResponse"
+  // 不可靠——sendResponse 被调用后响应值经常被丢弃，popup 收到 undefined。
   //
-  // 原因：Firefox MV2 中 "return true + 异步 sendResponse" 模式不可靠——
-  // sendResponse 被调用后响应值经常被丢弃，popup 收到 undefined。
-  // 返回 Promise 是 Firefox 原生支持的正确方式，Chrome 99+（含 MV3）同样支持。
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  browser.runtime.onMessage.addListener((message, sender, _sendResponse) => {
-    return handleMessage(message, sender).catch((_err) => ({
-      error: String(_err),
-    })) as any;
-  });
+  // Chromium：Chrome 148 之前 onMessage 监听器不能返回 Promise（返回值被忽略，
+  // 发送方收到 undefined），必须 "return true + sendResponse"。该写法在所有
+  // Chromium 版本上都成立。
+  if (import.meta.env.FIREFOX) {
+    browser.runtime.onMessage.addListener((message, sender) => {
+      const reply = handleMessage(message, sender).catch((err) => ({
+        error: String(err),
+      }));
+      // 类型声明只允许 boolean 返回；Firefox 运行时接受 Promise。
+      return reply as unknown as true;
+    });
+  } else {
+    browser.runtime.onMessage.addListener(
+      (message, sender, sendResponse: (response?: unknown) => void) => {
+        handleMessage(message, sender).then(sendResponse, (err) =>
+          sendResponse({ error: String(err) }),
+        );
+        return true;
+      },
+    );
+  }
 
   // ──────────────────────────────────────────────────────────────
   // 弱网可靠性：发送失败重队列
@@ -2414,6 +2456,18 @@ export default defineBackground(() => {
     }
   }
 
+  // 投递失败的表单 POST 下载：原下载已被取消，回退时需要原 method/body 重放。
+  const failedPostRecords = new Map<string, { body?: CapturedBody }>();
+
+  // 被 App/远端明确拒绝（而非不可达）的发送，按 URL 记录供 fallbackAfterSendFailure
+  // 区分处理；条目在下次发送同一 URL 或回退消费时清除，数量封顶防泄漏。
+  const rejectedSends = new Map<
+    string,
+    { message?: string; notified: boolean }
+  >();
+  const REJECT_NOTIFY_INTERVAL_MS = 30_000;
+  let _lastRejectNotifyAt = 0;
+
   // ===== 核心：发送下载请求到 FluxDown App =====
   async function sendToFluxDown(
     url: string,
@@ -2540,9 +2594,7 @@ export default defineBackground(() => {
     // 但右键菜单/快捷下载/资源面板手动下载等路径没有捕获记录，这里统一
     // 兜底补上 navigator.userAgent，确保所有下载路径都带上浏览器真实 UA
     // （不少反爬站点仅传 Cookie 而 UA 不一致仍会拦截，见 #610）。
-    if (!Object.keys(extraHeaders).some((k) => k.toLowerCase() === "user-agent")) {
-      extraHeaders = { ...extraHeaders, "User-Agent": navigator.userAgent };
-    }
+    extraHeaders = withBrowserUserAgent(extraHeaders) ?? extraHeaders;
 
     // 反查浏览器原始 method 与 body —— 修复 form-POST 触发的下载（uupdump 等）。
     // 优先以下载发起的真实 url 查找；命中不到时回退到重定向前的 originalUrl。
@@ -2576,6 +2628,8 @@ export default defineBackground(() => {
 
     console.log("[FluxDown] Sending to FluxDown app:", request);
 
+    rejectedSends.delete(url);
+    failedPostRecords.delete(url);
     const response = await sendDownloadRequest(request);
     const notifyOk = await shouldNotifyChannel(response.channel);
 
@@ -2604,6 +2658,17 @@ export default defineBackground(() => {
       );
       if (notifyOk) {
         notify(t("notify.sendFailed"), describeSendError(response.message));
+      }
+      if (!isUnreachableFailure(response)) {
+        if (rejectedSends.size >= 64) rejectedSends.clear();
+        rejectedSends.set(url, {
+          message: response.message,
+          notified: notifyOk,
+        });
+      }
+      if (reqRecord.method) {
+        if (failedPostRecords.size >= 32) failedPostRecords.clear();
+        failedPostRecords.set(url, { body: reqRecord.body });
       }
       return false;
     }
@@ -2636,6 +2701,44 @@ export default defineBackground(() => {
       : settings.notifyLocalTask === true;
   }
 
+  /** 把捕获的 POST 请求体还原为 downloads.download 可用的字符串 body；无法还原返回 null。 */
+  function buildPostReplay(
+    url: string,
+    body?: CapturedBody,
+  ): { body: string; headers: { name: string; value: string }[] } | null {
+    if (!body) return { body: "", headers: [] };
+    if (body.kind === "formData") {
+      const params = new URLSearchParams();
+      for (const [field, values] of Object.entries(body.fields)) {
+        for (const value of values) params.append(field, value);
+      }
+      return {
+        body: params.toString(),
+        headers: [
+          {
+            name: "Content-Type",
+            value: "application/x-www-form-urlencoded",
+          },
+        ],
+      };
+    }
+    try {
+      const binary = atob(body.bytesB64);
+      const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+      const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      const cached = extractAuthFromCache(url).headers ?? {};
+      const contentType = Object.entries(cached).find(
+        ([name]) => name.toLowerCase() === "content-type",
+      )?.[1];
+      return {
+        body: text,
+        headers: contentType ? [{ name: "Content-Type", value: contentType }] : [],
+      };
+    } catch {
+      return null;
+    }
+  }
+
   /**
    * 回退到浏览器下载：当发送到 FluxDown 失败时，重新发起浏览器下载。
    * 用于 onDeterminingFilename 同步路径中，下载已被 cancel+erase 后需要恢复的场景。
@@ -2652,9 +2755,23 @@ export default defineBackground(() => {
   ) {
     // 设置 bypass token，15 秒内对该 URL 的下载不拦截
     bypassTokens.set(url, Date.now() + 15_000);
+    // 表单 POST 触发的下载必须以原 method/body 重放，GET 会拿到错误页。
+    const post = failedPostRecords.get(url);
+    failedPostRecords.delete(url);
     try {
-      const opts: Record<string, any> = { url };
+      const opts: chrome.downloads.DownloadOptions = { url };
       if (filename) opts.filename = filename;
+      if (post) {
+        const replay = buildPostReplay(url, post.body);
+        if (!replay) {
+          // 多部分/二进制请求体无法无损重建，GET 重发只会落盘一个损坏文件。
+          notify(t("notify.sendFailed"), url);
+          return;
+        }
+        opts.method = "POST";
+        opts.body = replay.body;
+        opts.headers = replay.headers;
+      }
       await browser.downloads.download(opts);
       console.log("[FluxDown] Fallback: re-initiated browser download:", url);
     } catch (e) {
@@ -2672,21 +2789,41 @@ export default defineBackground(() => {
   }
 
   /**
-   * sendToFluxDown 失败后的智能回退：先 ping 确认 App 状态再决定是否回退。
+   * sendToFluxDown 失败后的智能回退。
    *
-   * 根因：NMH 通信存在瞬态失败场景（端口断开、超时等），此时消息可能已经
-   * 送达 App 但响应丢失，如果直接 fallbackToBrowserDownload 会导致"双下载"
-   * （App 下载了 + 浏览器也下载了）。
-   *
-   * 策略：
-   * - ping App 成功 → 消息大概率已送达，跳过回退，避免双下载
-   * - ping App 失败 → App 确实不可达，回退让浏览器下载
+   * 失败分两类：
+   * - 业务拒绝（App/远端明确回了失败：队列满、鉴权失败、建任务失败…）：请求没有
+   *   被处理，直接回退浏览器下载，不探活、不动熔断器（App 明明在线）。
+   * - 不可达/超时/未知：NMH 通信存在瞬态失败，消息可能已送达 App 但响应丢失，
+   *   直接回退会导致"双下载"。此时先 ping：在线 → 视为已送达，跳过回退；
+   *   不可达 → 回退并启动熔断。
    */
   async function fallbackAfterSendFailure(
     url: string,
     filename?: string,
     silent = false,
   ): Promise<void> {
+    const rejection = rejectedSends.get(url);
+    rejectedSends.delete(url);
+    if (rejection) {
+      console.warn(
+        "[FluxDown] Send rejected by FluxDown — falling back to browser download:",
+        rejection.message,
+        url,
+      );
+      const now = Date.now();
+      if (
+        !silent &&
+        !rejection.notified &&
+        now - _lastRejectNotifyAt > REJECT_NOTIFY_INTERVAL_MS
+      ) {
+        _lastRejectNotifyAt = now;
+        notify(t("notify.sendFailed"), describeSendError(rejection.message));
+      }
+      await fallbackToBrowserDownload(url, filename, true);
+      return;
+    }
+
     try {
       // 用带重连重试的探测确认 App 状态：给 App 冷启动/瞬时繁忙第二次机会，
       // 避免单次瞬态 ping 失败把已安装的 App 误判为不可用而误熔断（review 发现 #3）。
@@ -2821,9 +2958,10 @@ export default defineBackground(() => {
       case "toggleEnabled": {
         const currentSettings = await loadSettings();
         const newEnabled = !currentSettings.enabled;
-        await browser.storage.sync.set({
-          settings: { ...currentSettings, enabled: newEnabled },
-        });
+        await persistSettings(
+          { ...currentSettings, enabled: newEnabled },
+          currentSettings,
+        );
         updateIcon(newEnabled);
         return { enabled: newEnabled };
       }
@@ -2831,7 +2969,7 @@ export default defineBackground(() => {
       case "updateSettings": {
         const currentSettings = await loadSettings();
         const merged = { ...currentSettings, ...message.settings };
-        await browser.storage.sync.set({ settings: merged });
+        await persistSettings(merged, currentSettings);
         return { success: true, settings: merged };
       }
 
@@ -3160,8 +3298,7 @@ export default defineBackground(() => {
               referrer: item.referrer || "",
               filename: item.filename,
               cookies: cookieString,
-              headers:
-                Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined,
+              headers: withBrowserUserAgent(extraHeaders),
               fileSize: item.fileSize,
               mimeType: item.mimeType,
             };
@@ -3296,6 +3433,31 @@ export default defineBackground(() => {
     console.warn(
       "[FluxDown] cancelAndErase: record still present after retries:",
       downloadId,
+    );
+  }
+
+  /**
+   * Firefox 会在标签页/iframe 内联展示（pdf.js、原生播放器）的类型。
+   * 这类响应只有带 Content-Disposition: attachment 才是真正的下载，
+   * 否则取消导航会把「查看」误当成下载。
+   */
+  function isFirefoxInlineViewableType(contentType: string): boolean {
+    const ct = contentType.toLowerCase();
+    return (
+      ct === "application/pdf" ||
+      ["video/mp4", "video/webm", "video/ogg"].includes(ct) ||
+      [
+        "audio/mpeg",
+        "audio/mp3",
+        "audio/ogg",
+        "audio/wav",
+        "audio/x-wav",
+        "audio/flac",
+        "audio/mp4",
+        "audio/webm",
+        "audio/aac",
+        "audio/opus",
+      ].includes(ct)
     );
   }
 
@@ -3657,9 +3819,11 @@ export default defineBackground(() => {
       48: `/icon/48${suffix}.png`,
       128: `/icon/128${suffix}.png`,
     };
-    browser.action?.setIcon({ path: iconPath })?.catch(() => {
-      /* 权限不足时静默忽略 */
-    });
+    getActionApi()
+      ?.setIcon({ path: iconPath })
+      ?.catch(() => {
+        /* 权限不足时静默忽略 */
+      });
   }
 
   // 启动时更新图标（settings 已在上方 getCachedSettings 预热，此处复用缓存）
