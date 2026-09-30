@@ -196,6 +196,11 @@ export function ActionMenu({
   )
 }
 
+/** 仅在右键菜单内容挂载（即菜单打开）时才求值 entries。 */
+function LazyEntries({ resolve }: { resolve: () => readonly MenuEntry[] }) {
+  return <>{renderEntries(Context, resolve())}</>
+}
+
 const LONG_PRESS_MS = 450
 
 /**
@@ -271,7 +276,7 @@ export function ContextMenuArea({
       </Context.Trigger>
       <Context.Portal>
         <Context.Content collisionPadding={8} className={PANEL}>
-          {renderEntries(Context, resolve())}
+          <LazyEntries resolve={resolve} />
         </Context.Content>
       </Context.Portal>
     </Context.Root>

@@ -9,12 +9,31 @@ import type {
   DaemonSnapshot,
   TaskDto,
   TaskRuntimeDto,
+  WebhookDeliveryDto,
   WsServerMsg,
 } from './protocol'
 
 /** 状态 1（下载中）/ 5（准备中）以外的任务视为不活跃。 */
 function isActiveStatus(status: number): boolean {
   return status === 1 || status === 5
+}
+
+/** 投递日志保留上限（对应 Rust `WEBHOOK_DELIVERY_LIMIT`）。 */
+export const WEBHOOK_DELIVERY_LIMIT = 1000
+
+/**
+ * 按 `deliveryId` 合并投递记录增量（对应 Rust `merge_webhook_deliveries`）：同 id 以增量为准，
+ * 结果按 `timestampMs` 降序并截到上限。增量为空时返回原数组引用——清空由 `webhooksCleared` 表达。
+ */
+export function mergeWebhookDeliveries(
+  current: WebhookDeliveryDto[],
+  delta: readonly WebhookDeliveryDto[],
+): WebhookDeliveryDto[] {
+  if (delta.length === 0) return current
+  const incoming = new Set(delta.map((delivery) => delivery.deliveryId))
+  const merged = current.filter((delivery) => !incoming.has(delivery.deliveryId)).concat(delta)
+  merged.sort((a, b) => b.timestampMs - a.timestampMs)
+  return merged.slice(0, WEBHOOK_DELIVERY_LIMIT)
 }
 
 function withoutKey<V>(record: Readonly<Record<string, V>>, key: string): Record<string, V> {
@@ -167,7 +186,7 @@ function applyEngineMessage(snapshot: DaemonSnapshot, message: WsServerMsg): Dae
         },
       }
     case 'webhookDeliveriesChanged':
-      return { ...snapshot, webhookDeliveries: message.deliveries }
+      return { ...snapshot, webhookDeliveries: mergeWebhookDeliveries(snapshot.webhookDeliveries, message.deliveries) }
     case 'fileMissingChanged': {
       let next = snapshot
       for (const update of message.updates) {
@@ -244,7 +263,9 @@ export function applyDaemonEvent(snapshot: DaemonSnapshot, event: DaemonEvent): 
     case 'componentsChanged':
       return { ...snapshot, components: event.data }
     case 'webhooksChanged':
-      return { ...snapshot, webhookDeliveries: event.data }
+      return { ...snapshot, webhookDeliveries: mergeWebhookDeliveries(snapshot.webhookDeliveries, event.data) }
+    case 'webhooksCleared':
+      return snapshot.webhookDeliveries.length === 0 ? snapshot : { ...snapshot, webhookDeliveries: [] }
     case 'runtimeStatsChanged':
       return { ...snapshot, runtimeStats: event.data }
     case 'selectionPending':

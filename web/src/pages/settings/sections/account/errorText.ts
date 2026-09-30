@@ -34,6 +34,7 @@ export const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
   pairingRejected: 'errReasonPairingRejected',
   pairingSignatureInvalid: 'errReasonPairingSignatureInvalid',
   pairingSelf: 'errReasonPairingSelf',
+  pairingVersionMismatch: 'errReasonPairingVersionMismatch',
   peerNotPaired: 'errReasonPeerNotPaired',
   peerOffline: 'errReasonPeerOffline',
 }

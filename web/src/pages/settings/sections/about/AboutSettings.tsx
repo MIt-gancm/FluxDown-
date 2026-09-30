@@ -6,7 +6,8 @@ import { useT } from '../../../../i18n'
 import { exportLogs, rpc, useRpcSelector } from '../../../../lib/rpc'
 import type { UpdateCheckResultDto } from '../../../../lib/rpc'
 import { Button, toast } from '../../../../ui'
-import { NumberField, PrefDropdownRow, PrefSwitchRow, SettingsCustomRow, SettingsPage, SettingsRow, SettingsSection, rpcErrorText, setPref, useSettingsReadOnly, usePrefNumber, usePrefString } from '../../kit'
+import { rpcErrorText } from '../../../../lib/rpcErrorText'
+import { DaemonNumberRow, PrefDropdownRow, PrefSwitchRow, SettingsCustomRow, SettingsPage, SettingsRow, SettingsSection, useSettingsReadOnly, usePrefString } from '../../kit'
 
 const CHROME_STORE = 'https://chromewebstore.google.com/search/FluxDown'
 const FIREFOX_STORE = 'https://addons.mozilla.org/firefox/addon/fluxdown/'
@@ -15,10 +16,6 @@ const DONATE = 'https://fluxdown.zerx.dev/sponsor'
 const WEBSITE = 'https://fluxdown.zerx.dev'
 /** 服务端资产随统一的 `vX.Y.Z` release 发布（更早版本在 `server-v*` release）。 */
 const SERVER_RELEASES = 'https://github.com/zerx-lab/FluxDown/releases'
-
-const LOG_MAX_MIN = 1
-const LOG_MAX_MAX = 1024
-const LOG_MAX_DEFAULT = 10
 
 function openUrl(url: string) {
   window.open(url, '_blank', 'noopener,noreferrer')
@@ -118,7 +115,6 @@ function ExportRow() {
 export function AboutSettings() {
   const t = useT()
   const version = useRpcSelector((state) => state.hello?.serviceVersion ?? '')
-  const logMax = usePrefNumber('log_max_size_mb', LOG_MAX_DEFAULT)
 
   return (
     <SettingsPage title={t('settingsCatAbout')} description={t('settingsCatAboutDesc')}>
@@ -145,9 +141,7 @@ export function AboutSettings() {
         </SettingsRow>
       </SettingsSection>
       <SettingsSection title={t('logExport')} subtitle={t('logExportDesc')}>
-        <SettingsRow title={t('logMaxSize')} description={t('logMaxSizeDesc')}>
-          <NumberField value={logMax} min={LOG_MAX_MIN} max={LOG_MAX_MAX} unit="MB" aria-label={t('logMaxSize')} onCommit={(next) => setPref('log_max_size_mb', next)} />
-        </SettingsRow>
+        <DaemonNumberRow configKey="log_max_size_mb" titleKey="logMaxSize" descKey="logMaxSizeDesc" unit="MB" />
         <ExportRow />
       </SettingsSection>
       <SettingsSection title={t('extensionCardTitle')} subtitle={t('extensionCardDesc')}>

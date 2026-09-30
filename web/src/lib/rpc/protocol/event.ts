@@ -89,7 +89,10 @@ export type DaemonEvent =
   | { type: 'rssChanged'; data: { sourceId: string; itemRevision: number } }
   | { type: 'pluginsChanged'; data: PluginDto[] }
   | { type: 'componentsChanged'; data: ComponentStatusDto[] }
+  /** 投递日志增量：按 `deliveryId` 合并（上限 1000，`timestampMs` 降序）；空增量不改变列表。 */
   | { type: 'webhooksChanged'; data: WebhookDeliveryDto[] }
+  /** 投递日志被显式清空。 */
+  | { type: 'webhooksCleared' }
   | { type: 'runtimeStatsChanged'; data: DaemonRuntimeStatsDto }
   | { type: 'selectionPending'; data: SelectionRequestDto }
   | { type: 'selectionResolved'; data: { requestId: string } };

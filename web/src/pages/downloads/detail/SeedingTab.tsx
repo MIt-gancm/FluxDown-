@@ -2,10 +2,11 @@ import { useState } from 'react'
 import { useT } from '../../../i18n'
 import { SEED_LIMIT_INHERIT, rpc } from '../../../lib/rpc'
 import { Button, FormField, Input, toast } from '../../../ui'
-import { toastRpcError } from '../model/errors'
+import { toastRpcError } from '../../../lib/rpcToast'
 import { formatBytes } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
 import { DetailRow } from './DetailRow'
+import { uploadLimitText, uploadLimitToSend } from './seedUpload'
 
 const STATUS_KEY: Record<number, string> = {
   1: 'seedingStatusSeeding',
@@ -52,7 +53,8 @@ export function SeedingTab({ view }: { view: DownloadTaskView }) {
   const [postRatio, setPostRatio] = useState(() => seedLimitText(view.dto?.seedPostRatioLimitMilli))
   const [seedTime, setSeedTime] = useState(() => seedLimitText(view.dto?.seedTimeLimitMinutes))
   const [inactive, setInactive] = useState(() => seedLimitText(view.dto?.seedInactiveTimeLimitMinutes))
-  const [upload, setUpload] = useState('')
+  const [initialUpload] = useState(() => uploadLimitText(view.dto?.seedUploadLimitBps))
+  const [upload, setUpload] = useState(initialUpload)
   const [saving, setSaving] = useState(false)
 
   const uploaded = Math.max(0, view.uploadedBytes)
@@ -60,7 +62,6 @@ export function SeedingTab({ view }: { view: DownloadTaskView }) {
   const statusKey = STATUS_KEY[view.seedingStatus] ?? 'seedingStatusNone'
 
   const save = () => {
-    const kbps = Number.parseInt(upload.trim(), 10)
     setSaving(true)
     rpc.daemon.task
       .setSeedLimits({
@@ -69,7 +70,7 @@ export function SeedingTab({ view }: { view: DownloadTaskView }) {
         postRatioLimitMilli: parseSeedLimit(postRatio),
         seedTimeLimitMinutes: parseSeedLimit(seedTime),
         inactiveTimeLimitMinutes: parseSeedLimit(inactive),
-        uploadLimitBps: Number.isFinite(kbps) ? kbps * 1024 : 0,
+        uploadLimitBps: uploadLimitToSend(upload, initialUpload, view.dto?.seedUploadLimitBps),
       })
       .then(() => toast.key('btSeedLimitsSaved', 'success'))
       .catch(toastRpcError)

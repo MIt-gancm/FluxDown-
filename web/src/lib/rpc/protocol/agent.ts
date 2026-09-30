@@ -424,6 +424,18 @@ export interface PendingCaptureDto {
   headerNames: string[];
 }
 
+/**
+ * `agent.capture.submitTorrentFile` 参数。`silent=true` 全选文件直接建任务；`silent=false`
+ * 由 daemon 发 BT 文件选择请求。其余字段缺省时维持 daemon 默认目录 / 队列 / 立即开始。
+ */
+export interface CaptureSubmitTorrentFileParams {
+  path: string;
+  silent?: boolean;
+  saveDir?: string;
+  queueId?: string;
+  startPaused?: boolean;
+}
+
 // ── 诊断 / 更新 ──
 
 export type DiagnosticLevel = 'info' | 'ok' | 'warn' | 'error';

@@ -89,6 +89,8 @@ export interface TaskDto {
   seedTimeLimitMinutes: number;
   /** 不活跃做种时长上限（分钟），哨兵同上。 */
   seedInactiveTimeLimitMinutes: number;
+  /** 做种上传限速（字节/秒），0 = 未设置（跟随全局）；旧 daemon 不返回。 */
+  seedUploadLimitBps?: number;
   /** 持久化的加速路径字节（旧 daemon 不返回）。 */
   sourceBytes?: TaskSourceBytesDto;
 }
@@ -196,6 +198,8 @@ export interface DaemonCreateTaskParams {
   /** 一次性 blob 引用（与 `request.torrentB64` 互斥）。 */
   torrentBlobId?: string | null;
   unattended?: boolean;
+  /** 已知文件大小（字节，>0 才生效）。 */
+  hintFileSize?: number | null;
 }
 
 /** `daemon.task.create` 结果。 */

@@ -7,8 +7,9 @@ import type { TFunction } from '../../../../i18n'
 import { copyText } from '../../../../lib/copy'
 import { rpc } from '../../../../lib/rpc'
 import type { DaemonDiagnosticsDescribe, DiagnosticCheckDto, DiagnosticLevel, DiagnosticsReportDto } from '../../../../lib/rpc'
+import { rpcErrorText } from '../../../../lib/rpcErrorText'
 import { Button, toast } from '../../../../ui'
-import { SettingsCustomRow, SettingsPage, SettingsSection, camel, rpcErrorText, useSettingsReadOnly } from '../../kit'
+import { SettingsCustomRow, SettingsPage, SettingsSection, camel, useSettingsReadOnly } from '../../kit'
 
 const DESKTOP_ONLY_CHECKS: ReadonlySet<string> = new Set(['nmh_binary', 'nmh_manifest', 'nmh_browser', 'nmh_relay', 'url_protocol', 'torrent_association'])
 const DESKTOP_ONLY_ACTIONS: ReadonlySet<string> = new Set(['reregister', 'use_this_install', 'register', 'open_log_dir', 'openLogDir'])

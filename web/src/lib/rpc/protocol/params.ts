@@ -31,6 +31,18 @@ export interface TaskDeleteParams {
   deleteFiles?: boolean;
 }
 
+/** `daemon.task.pauseMany` / `daemon.task.resumeMany`：未知 id 忽略，空列表为空操作。 */
+export interface TaskIdsParams {
+  taskIds: string[];
+}
+
+/** `daemon.task.deleteMany`：语义同 {@link TaskIdsParams}。 */
+export interface TaskDeleteManyParams {
+  taskIds: string[];
+  /** 同时删除磁盘文件，缺省 false。 */
+  deleteFiles?: boolean;
+}
+
 /** `daemon.task.setSeedLimits` 全部字段必填；哨兵见 `SEED_LIMIT_INHERIT` / `SEED_LIMIT_UNLIMITED`。 */
 export interface SetSeedLimitsParams {
   taskId: string;
@@ -170,6 +182,8 @@ export interface PluginInstallDevParams {
 
 export interface PluginMarketInstallParams {
   pluginId: string;
+  /** 用户确认权限时看到的版本；最新可装版本不一致时返回 conflict（`marketVersionChanged`）。 */
+  version?: string | null;
 }
 
 export interface ComponentParams {

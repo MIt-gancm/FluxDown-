@@ -3,8 +3,9 @@
 
 import { ArrowUp, Folder, FolderOpen } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useT } from '../../../i18n'
-import { errorMessage, rpc } from '../../../lib/rpc'
+import { t as translate, useT } from '../../../i18n'
+import { rpc } from '../../../lib/rpc'
+import { rpcErrorText } from '../../../lib/rpcErrorText'
 import type { FsListResponse } from '../../../lib/rpc'
 import { Button, ConfirmFooter, Dialog, EmptyState, FieldError, Icon, Input, Spinner } from '../../../ui'
 
@@ -40,7 +41,7 @@ export function FsPickerDialog({
       if (id !== requestId.current) return
       // 失败后旧列表不再对应输入框里的路径，必须作废，否则「确定」会提交上一次成功的目录。
       setListing(null)
-      setError(errorMessage(err))
+      setError(rpcErrorText(err, translate))
     } finally {
       if (id === requestId.current) setLoading(false)
     }

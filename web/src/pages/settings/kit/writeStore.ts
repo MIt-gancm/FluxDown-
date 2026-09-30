@@ -9,13 +9,15 @@
 import { useSyncExternalStore } from 'react'
 import { daemonConfigField, rpc, rpcStore, RpcError } from '../../../lib/rpc'
 import type { JsonValue } from '../../../lib/rpc'
+import { RPC_ERROR_KEYS, rpcErrorKind } from '../../../lib/rpcErrorText'
+import type { RpcErrorKind } from '../../../lib/rpcErrorText'
 
 const FLUSH_DEBOUNCE_MS = 250
 const MAX_CONFLICT_RETRIES = 3
 /** 写回成功后覆盖层保留时长：足够快照事件到达。 */
 const OVERLAY_GRACE_MS = 2000
 
-export type SettingsErrorKind = 'disconnected' | 'conflict' | 'invalidArgument' | 'failed'
+export type SettingsErrorKind = RpcErrorKind
 
 export interface SettingsError {
   kind: SettingsErrorKind
@@ -23,12 +25,7 @@ export interface SettingsError {
 }
 
 /** 对应 assets/i18n 的既有键（同 GPUI `SettingsErrorKind::i18n_key`）。 */
-export const SETTINGS_ERROR_KEYS: Readonly<Record<SettingsErrorKind, string>> = {
-  disconnected: 'localServiceDisconnected',
-  conflict: 'localServiceConflict',
-  invalidArgument: 'localServiceInvalidArgument',
-  failed: 'localServiceActionFailed',
-}
+export const SETTINGS_ERROR_KEYS = RPC_ERROR_KEYS
 
 // ── 云同步目录（镜像 native/protocol/src/settings.rs SYNC_SETTING_SPECS）──
 
@@ -227,20 +224,7 @@ export function useSettingsError(): SettingsError | null {
 }
 
 function kindOf(err: unknown): SettingsErrorKind {
-  if (err instanceof RpcError) {
-    switch (err.appCode) {
-      case 'unavailable':
-      case 'timeout':
-        return 'disconnected'
-      case 'conflict':
-        return 'conflict'
-      case 'invalidArgument':
-        return 'invalidArgument'
-      default:
-        return 'failed'
-    }
-  }
-  return 'failed'
+  return err instanceof RpcError ? rpcErrorKind(err) : 'failed'
 }
 
 function schedule(immediate: boolean): void {

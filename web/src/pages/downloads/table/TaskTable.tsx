@@ -9,7 +9,8 @@ import { useT } from '../../../i18n'
 import { cn } from '../../../lib/cn'
 import { Checkbox, ContextMenuArea, Icon, Tooltip } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
-import { downloadViewsFiles, isDownloadable, pauseViews, remoteCan, resumeViews } from '../model/actions'
+import { downloadViewsFiles, isDownloadable, pauseViews, resumeViews } from '../model/actions'
+import { remoteCan } from '../model/batchPlan'
 import { notePointerActivity } from '../model/rowOrder'
 import { formatBytes, formatDateTime, MAX_ETA_SECS, PROTOCOL_LABEL, sourceSite } from '../model/task'
 import type { DownloadTaskView } from '../model/task'
@@ -271,7 +272,7 @@ function GroupHeaderRow({
 export function TaskTable() {
   const t = useT()
   const ctx = useDownloads()
-  const { rows, prefs, selected, selectedViews, visibleKeys, views, queues, groupSummaries } = ctx
+  const { rows, prefs, selected, visibleKeys, views, groupSummaries } = ctx
   const scrollRef = useRef<HTMLDivElement>(null)
   // 拖拽调宽中的临时宽度（松手后写回偏好）。
   const [resizing, setResizing] = useState<{ kind: ColumnKind; width: number } | null>(null)
@@ -321,30 +322,31 @@ export function TaskTable() {
 
   const twoLine = prefs.density === 'comfortable'
 
-  const onClick = useCallback(
-    (event: MouseEvent, view: DownloadTaskView) => {
-      ctx.clickSelect(view.key, { shift: event.shiftKey, secondary: event.ctrlKey || event.metaKey })
-    },
-    [ctx],
-  )
-  const onDoubleClick = useCallback(
-    (view: DownloadTaskView) => {
-      if (isDownloadable(view)) downloadViewsFiles([view])
-      else if (view.source === 'local') ctx.showDetail(view.taskId)
-    },
-    [ctx],
-  )
-  const getMenu = useCallback(
-    (view: DownloadTaskView) =>
-      buildTaskMenu({
-        t,
-        views: selected.has(view.key) ? selectedViews : [view],
-        queues,
-        queueName: ctx.queueName,
-        showDetail: ctx.showDetail,
-      }),
-    [t, selected, selectedViews, queues, ctx.queueName, ctx.showDetail],
-  )
+  // 回调经 ref 读取最新上下文，自身身份恒定，TaskRow 的 memo 才能在进度帧中命中。
+  const ctxRef = useRef(ctx)
+  ctxRef.current = ctx
+  const tRef = useRef(t)
+  tRef.current = t
+  const onClick = useCallback((event: MouseEvent, view: DownloadTaskView) => {
+    ctxRef.current.clickSelect(view.key, { shift: event.shiftKey, secondary: event.ctrlKey || event.metaKey })
+  }, [])
+  const onDoubleClick = useCallback((view: DownloadTaskView) => {
+    if (isDownloadable(view)) downloadViewsFiles([view])
+    else if (view.source === 'local') ctxRef.current.showDetail(view.taskId)
+  }, [])
+  const onToggle = useCallback((view: DownloadTaskView) => ctxRef.current.toggleSelected(view.key), [])
+  const onContext = useCallback((view: DownloadTaskView) => ctxRef.current.contextSelect(view.key), [])
+  // 菜单在打开时才构建，此时读到的选区即右键选择后的最新选区。
+  const getMenu = useCallback((view: DownloadTaskView) => {
+    const current = ctxRef.current
+    return buildTaskMenu({
+      t: tRef.current,
+      views: current.selected.has(view.key) ? current.selectedViews : [view],
+      queues: current.queues,
+      queueName: current.queueName,
+      showDetail: current.showDetail,
+    })
+  }, [])
 
   const allChecked = visibleKeys.length > 0 && visibleKeys.every((key) => selected.has(key))
   const someChecked = !allChecked && visibleKeys.some((key) => selected.has(key))
@@ -514,9 +516,9 @@ export function TaskTable() {
                     queueName={ctx.queueName}
                     onClick={onClick}
                     onDoubleClick={onDoubleClick}
-                    onToggle={(view) => ctx.toggleSelected(view.key)}
+                    onToggle={onToggle}
                     getMenu={getMenu}
-                    onContext={(view) => ctx.contextSelect(view.key)}
+                    onContext={onContext}
                     rowActionLabels={rowActionLabels}
                   />
                 )}

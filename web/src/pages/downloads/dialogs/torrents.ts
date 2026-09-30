@@ -1,6 +1,8 @@
 // `.torrent` 文件提交：浏览器文件 → `/api/web/blobs/torrents` 上传 → `daemon.task.create { torrentBlobId }`。
 
-import { describeUploadError, rpc, uploadBlob } from '../../../lib/rpc'
+import { t } from '../../../i18n'
+import { rpc, uploadBlob } from '../../../lib/rpc'
+import { describeUploadError } from '../../../lib/rpcErrorText'
 import { toast } from '../../../ui'
 
 export interface TorrentSubmitOptions {
@@ -33,7 +35,7 @@ export async function submitTorrentFiles(files: readonly File[], options: Torren
       })
       created += 1
     } catch (error) {
-      toast.error(describeUploadError(error), file.name)
+      toast.error(describeUploadError(error, t), file.name)
     }
   }
   return created

@@ -13,8 +13,9 @@ import { rpc, useAgent } from '../../../../lib/rpc'
 import type { GatewayPatchParams, GatewayStatusDto } from '../../../../lib/rpc'
 import { ACCESS_KEY_MAX_LEN, ACCESS_KEY_MIN_LEN, validateAccessKey } from '../../../../lib/token-policy'
 import type { AccessKeyIssue } from '../../../../lib/token-policy'
+import { rpcErrorText } from '../../../../lib/rpcErrorText'
 import { Button, Icon, Input, Switch, confirmDialog, toast } from '../../../../ui'
-import { SettingsCustomRow, SettingsPage, SettingsRow, SettingsSection, rpcErrorText, useSettingsReadOnly } from '../../kit'
+import { SettingsCustomRow, SettingsPage, SettingsRow, SettingsSection, useSettingsReadOnly } from '../../kit'
 
 type FlagKey = 'takeoverEnabled' | 'jsonrpcEnabled' | 'apiEnabled' | 'mcpEnabled' | 'corsEnabled'
 

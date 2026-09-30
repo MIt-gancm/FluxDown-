@@ -10,7 +10,7 @@ import { useT } from '../../../i18n'
 import { rpc, useTasks } from '../../../lib/rpc'
 import type { BtFileDto, HlsQualityOptionDto, ResolveVariantOptionDto, SelectionOutcome, SelectionRequestDto } from '../../../lib/rpc'
 import { Button, Checkbox, Dialog, DialogFooter, FieldHint, Icon, Input } from '../../../ui'
-import { toastRpcError } from '../model/errors'
+import { toastRpcError } from '../../../lib/rpcToast'
 import { cn } from '../../../lib/cn'
 import { formatBytes, useNow } from './utils'
 

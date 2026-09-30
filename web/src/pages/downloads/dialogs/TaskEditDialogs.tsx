@@ -3,7 +3,8 @@
 import { useEffect, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useT } from '../../../i18n'
-import { RpcError, errorMessage, rpc, useTask } from '../../../lib/rpc'
+import { RpcError, rpc, useTask } from '../../../lib/rpc'
+import { rpcErrorText } from '../../../lib/rpcErrorText'
 import type { TaskDto } from '../../../lib/rpc'
 import { ConfirmFooter, Dialog, FieldError, Form, FormField, Input, toast } from '../../../ui'
 import { closeChangeUrl, closeRename } from './store'
@@ -75,7 +76,7 @@ function SingleFieldDialog({
       onClose()
     } catch (err) {
       const key = err instanceof RpcError && err.is('timeout') && timeoutKey ? timeoutKey : mapEngineError(err, errors)
-      setError(key ? t(key) : errorMessage(err))
+      setError(key ? t(key) : rpcErrorText(err, t))
       setPending(false)
     }
   }

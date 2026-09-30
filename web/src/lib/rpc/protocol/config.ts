@@ -23,6 +23,8 @@ export interface DaemonRuntimeStatsDto {
   totalUploadBps: number;
   diskFreeBytes: number | null;
   saveDir: string;
+  /** 「等待自动重试」的任务数（自动重试 / 备用链路 / 插件重试已排程、尚未重新派发）；旧 daemon 不返回。 */
+  retryPendingTasks?: number;
 }
 
 export interface ProxyTestRequest {
@@ -227,6 +229,10 @@ export const DAEMON_CONFIG_FIELDS: readonly DaemonConfigField[] = [
   // 受管组件手动路径（空 = 自动解析）
   text('component.ffmpeg.path'),
   text('component.ytdlp.path'),
+  // 组件下载镜像基址（空 = 直连 GitHub）；只接受 https
+  text('component_mirror_base'),
+  // 日志目录总大小上限（MB）
+  int('log_max_size_mb', '10', 1, 1024),
 ];
 
 /** 查询配置键描述；未知键返回 undefined。 */

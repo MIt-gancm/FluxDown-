@@ -10,7 +10,8 @@ import { ChevronDown, ChevronRight, FileText, FolderOpen, Plus, X } from 'lucide
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ChangeEvent } from 'react'
 import { useT } from '../../../i18n'
-import { LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, call, describeUploadError, errorMessage, rpc, rpcStore, useAgent, useConfigValues, useDaemon } from '../../../lib/rpc'
+import { LATER_QUEUE_ID, MAIN_QUEUE_ID, METHOD, call, rpc, rpcStore, useAgent, useConfigValues, useDaemon } from '../../../lib/rpc'
+import { describeUploadError } from '../../../lib/rpcErrorText'
 import type { AgentSnapshot, CloudDevice, LinkDeviceInfo, PendingCaptureDto, QueueDto, ResolvePreviewResponse } from '../../../lib/rpc'
 import { Button, Dialog, DialogFooter, FieldError, FieldHint, FieldLabel, Form, FormField, FormRow, Icon, Input, InputWithAction, OptionGroup, OptionRow, Select, Spinner, Switch, Textarea, toast } from '../../../ui'
 import type { MenuEntry } from '../../../ui'
@@ -358,7 +359,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
           await rpc.daemon.task.create({ request })
         }
       } catch (error) {
-        failed.push({ entry: entries[index], message: errorMessage(error) })
+        failed.push({ entry: entries[index], message: describeUploadError(error, t) })
       }
     }
     if (consumed.size > 0) {
@@ -384,7 +385,7 @@ export function NewDownloadDialog({ session }: { session: NewDownloadSession }) 
       const created = await submitTorrentFiles(files, { saveDir: saveDir.trim(), queueId: context.queueId })
       if (created > 0) closeNewDownload()
     } catch (error) {
-      toast.error(describeUploadError(error))
+      toast.error(describeUploadError(error, t))
     } finally {
       setBusyFiles(false)
     }

@@ -18,12 +18,16 @@ import type { RssItemDto, RssSourceDto } from '../../lib/rpc'
 /** 条目被过滤掉的原因（引擎 RejectReason::code 的完整值域）。 */
 export type RssRejectReason = 'not_included' | 'excluded' | 'too_small' | 'too_large' | 'dup_episode'
 
-const REASON_KEYS: Record<RssRejectReason, string> = {
+/** 条目上可展示的原因码：过滤原因 + 引擎写入的种子抓取失败码。 */
+export type RssReason = RssRejectReason | 'torrent_fetch_failed'
+
+const REASON_KEYS: Record<RssReason, string> = {
   not_included: 'rssReasonNotIncluded',
   excluded: 'rssReasonExcluded',
   too_small: 'rssReasonTooSmall',
   too_large: 'rssReasonTooLarge',
   dup_episode: 'rssReasonDupEpisode',
+  torrent_fetch_failed: 'rssReasonTorrentFetchFailed',
 }
 
 /** 原因码 → i18n 键；空码 / 未知码 / `seed_skipped` 返回 null（不显示原因行）。 */

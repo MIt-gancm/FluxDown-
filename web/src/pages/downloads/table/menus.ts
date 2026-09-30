@@ -33,12 +33,12 @@ import {
   pauseGroup,
   pauseViews,
   redownloadViews,
-  remoteCan,
   resumeGroup,
   resumeViews,
   retryFailedInGroup,
   toggleBoost,
 } from '../model/actions'
+import { remoteCan } from '../model/batchPlan'
 import type { DownloadTaskView } from '../model/task'
 import type { GroupSummary } from '../state'
 import { openGroupDetail, openRename } from '../dialogs'

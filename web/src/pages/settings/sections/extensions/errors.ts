@@ -1,7 +1,8 @@
 // 扩展页的错误文案映射（与 GPUI `error_text` 一致）。
 
 import type { TFunction } from '../../../../i18n'
-import { RpcError, describeUploadError } from '../../../../lib/rpc'
+import { RpcError } from '../../../../lib/rpc'
+import { describeUploadError } from '../../../../lib/rpcErrorText'
 import type { ErrorReason } from '../../../../lib/rpc'
 
 const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
@@ -13,6 +14,7 @@ const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
   pluginDownloadFailed: 'pluginErrorDownloadFailed',
   pluginPackageTooLarge: 'pluginErrorPackageTooLarge',
   pluginPackageInvalid: 'pluginErrorPackageInvalid',
+  marketVersionChanged: 'pluginErrorMarketVersionChanged',
 }
 
 /**
@@ -20,7 +22,7 @@ const REASON_KEYS: Partial<Record<ErrorReason, string>> = {
  * 非 RPC 错误（上传失败等）直接展示其消息。
  */
 export function extensionErrorText(t: TFunction, error: unknown): string {
-  if (!(error instanceof RpcError)) return describeUploadError(error)
+  if (!(error instanceof RpcError)) return describeUploadError(error, t)
   const reason = error.reason
   const reasonKey = reason ? REASON_KEYS[reason] : undefined
   if (reasonKey) return t(reasonKey)

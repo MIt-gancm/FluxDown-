@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { useT } from '../../../../i18n'
 import { LATER_QUEUE_ID, MAIN_QUEUE_ID, rpc, useDaemon } from '../../../../lib/rpc'
 import type { QueueDto } from '../../../../lib/rpc'
+import { rpcErrorText } from '../../../../lib/rpcErrorText'
 import { Button, Switch, toast } from '../../../../ui'
 import {
   DaemonEnumRow,
@@ -16,7 +17,6 @@ import {
   SettingsSection,
   TextField,
   optionalText,
-  rpcErrorText,
   setDaemon,
   setDaemonBool,
   useDaemonNumber,

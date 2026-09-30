@@ -13,7 +13,6 @@ export {
   TextField,
 } from './fields'
 export { WIDTH_DROPDOWN, WIDTH_INPUT, WIDTH_INPUT_WIDE, WIDTH_NUMBER, camel, formatNumber, optionalText } from './util'
-export { rpcErrorText } from './errors'
 export {
   SETTINGS_ERROR_KEYS,
   clearSettingsError,

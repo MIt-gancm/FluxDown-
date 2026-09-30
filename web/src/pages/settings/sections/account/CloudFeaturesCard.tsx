@@ -24,11 +24,11 @@ function formatTime(unixMs: number): string {
   return Number.isNaN(date.getTime()) ? '' : date.toLocaleString()
 }
 
-/** 同步失败 / 暂停原因：优先按 reason 本地化，缺失回退原始诊断文本。 */
+/** 同步失败 / 暂停原因：按 reason 本地化；未映射时回退通用文案，不显示服务端诊断原文。 */
 function useSyncReasonText(sync: SyncStatusDto): string {
   const t = useT()
   const key = sync.lastErrorReason ? REASON_KEYS[sync.lastErrorReason] : undefined
-  return key ? t(key) : (sync.lastError ?? '')
+  return t(key ?? 'cloudSyncErrorGeneric')
 }
 
 function ScopeRow({ group, state, disabled, onToggle }: { group: SyncGroup; state: SyncGroupState; disabled: boolean; onToggle: () => void }) {

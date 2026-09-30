@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
-import { applyAgentEvent, applyDaemonEvent } from './apply'
-import type { AgentSnapshot, DaemonSnapshot, TaskDto, TaskRuntimeDto } from './protocol'
+import { WEBHOOK_DELIVERY_LIMIT, applyAgentEvent, applyDaemonEvent } from './apply'
+import type { AgentSnapshot, DaemonSnapshot, TaskDto, TaskRuntimeDto, WebhookDeliveryDto } from './protocol'
 
 function task(taskId: string, status: number): TaskDto {
   return { taskId, status, fileName: 'a.bin', saveDir: '/d', url: 'http://x/a', downloadedBytes: 0, totalBytes: 10, errorMessage: '' } as unknown as TaskDto
@@ -86,5 +86,26 @@ describe('apply daemon events', () => {
     const next = applyAgentEvent(snap, { type: 'daemonConnectionChanged', data: false })
     expect(next.daemonConnected).toBe(false)
     expect(Object.keys(next.daemon.taskRuntime).length).toBe(0)
+  })
+
+  test('webhooksChanged 按 deliveryId 合并、按时间降序、封顶；空增量保留历史，webhooksCleared 才清空', () => {
+    const delivery = (deliveryId: string, timestampMs: number, success = true) =>
+      ({ deliveryId, timestampMs, success }) as unknown as WebhookDeliveryDto
+    let snap = { ...daemon([]), webhookDeliveries: [] } as DaemonSnapshot
+    snap = applyDaemonEvent(snap, { type: 'webhooksChanged', data: [delivery('b', 20), delivery('a', 10)] })
+    snap = applyDaemonEvent(snap, { type: 'webhooksChanged', data: [delivery('a', 30, false), delivery('c', 15)] })
+    expect(snap.webhookDeliveries.map((item) => item.deliveryId)).toEqual(['a', 'b', 'c'])
+    expect(snap.webhookDeliveries[0]?.success).toBe(false)
+
+    const kept = applyDaemonEvent(snap, { type: 'webhooksChanged', data: [] })
+    expect(kept.webhookDeliveries).toBe(snap.webhookDeliveries)
+    const keptEngine = applyDaemonEvent(snap, { type: 'engine', data: { type: 'webhookDeliveriesChanged', deliveries: [] } })
+    expect(keptEngine.webhookDeliveries).toBe(snap.webhookDeliveries)
+    expect(applyDaemonEvent(snap, { type: 'webhooksCleared' }).webhookDeliveries).toEqual([])
+
+    const flood = Array.from({ length: WEBHOOK_DELIVERY_LIMIT + 5 }, (_, n) => delivery(`d${n}`, n)).reverse()
+    const capped = applyDaemonEvent(snap, { type: 'webhooksChanged', data: flood })
+    expect(capped.webhookDeliveries.length).toBe(WEBHOOK_DELIVERY_LIMIT)
+    expect(capped.webhookDeliveries[0]?.timestampMs).toBe(WEBHOOK_DELIVERY_LIMIT + 4)
   })
 })

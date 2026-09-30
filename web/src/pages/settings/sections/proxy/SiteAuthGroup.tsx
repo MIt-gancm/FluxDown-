@@ -5,7 +5,8 @@ import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
 import type { SiteAuthEntryDto } from '../../../../lib/rpc'
 import { Button, toast } from '../../../../ui'
-import { SettingsCustomRow, SettingsSection, rpcErrorText } from '../../kit'
+import { rpcErrorText } from '../../../../lib/rpcErrorText'
+import { SettingsCustomRow, SettingsSection } from '../../kit'
 
 export function SiteAuthGroup() {
   const t = useT()

@@ -3,7 +3,7 @@
 import { CircleAlert, Info, Package, Search, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useT } from '../../../../i18n'
-import { rpc } from '../../../../lib/rpc'
+import { RpcError, rpc } from '../../../../lib/rpc'
 import type { InstalledPlugin, MarketEntryDto, PluginDto } from '../../../../lib/rpc'
 import { Badge, Button, EmptyState, Icon, Input, Spinner, confirmDialog } from '../../../../ui'
 import { BlockTitle, ExtLink, IconButton, ListCard, ListRow } from './common'
@@ -86,8 +86,10 @@ export function MarketSection({
     }
     setPending((current) => new Set(current).add(pluginId))
     try {
-      onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId }))
+      onInstalled(await rpc.daemon.plugin.marketInstall({ pluginId, version: entry.version }))
     } catch (error) {
+      // 用户确认的版本已不是最新：刷新目录，让下一次点击按新版本重新确认权限。
+      if (error instanceof RpcError && error.reason === 'marketVersionChanged') await load()
       onInstallFailed(error)
     } finally {
       setPending((current) => {

@@ -20,7 +20,7 @@ export {
   useTaskRuntime,
   useTasks,
 } from './hooks'
-export { UploadError, describeUploadError, downloadLogExport, downloadTaskFile, exportLogs, logExportUrl, taskFileUrl, triggerDownload, uploadBlob } from './http'
+export { UploadError, downloadLogExport, downloadTaskFile, exportLogs, logExportUrl, taskFileUrl, triggerDownload, uploadBlob } from './http'
 export type { BlobKind, UploadOptions } from './http'
 export { rpcStore } from './store'
 export type { ConnectionPhase, ConnectionState, RpcState } from './store'

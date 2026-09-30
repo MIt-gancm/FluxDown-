@@ -6,7 +6,7 @@ import { useT } from '../../../../i18n'
 import { rpc } from '../../../../lib/rpc'
 import type { FsListResponse } from '../../../../lib/rpc'
 import { ConfirmFooter, Dialog, Icon, Input, Spinner } from '../../../../ui'
-import { rpcErrorText } from '../../kit'
+import { rpcErrorText } from '../../../../lib/rpcErrorText'
 
 export function DirPickerDialog({
   open,

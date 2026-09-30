@@ -2,16 +2,20 @@
 // 鉴权 = `Authorization: Bearer <访问密钥>`（fetch/XHR）或 `?token=`（浏览器原生下载）。
 
 import { getToken } from '../access/credentials'
-import { errorMessage } from './error'
 
 export type BlobKind = 'torrents' | 'plugins'
 
+/** 上传失败类别：网络错误 / 调用方中止 / 服务端 HTTP 应答；`message` 仅作诊断，展示走 `describeUploadError`。 */
+export type UploadErrorKind = 'network' | 'aborted' | 'http'
+
 export class UploadError extends Error {
   readonly status: number
-  constructor(status: number, message: string) {
+  readonly kind: UploadErrorKind
+  constructor(status: number, message: string, kind: UploadErrorKind) {
     super(message)
     this.name = 'UploadError'
     this.status = status
+    this.kind = kind
   }
 }
 
@@ -36,8 +40,8 @@ export function uploadBlob(kind: BlobKind, data: Blob, options: UploadOptions = 
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable) options.onProgress?.(event.loaded / event.total)
     }
-    xhr.onerror = () => reject(new UploadError(0, 'network error'))
-    xhr.onabort = () => reject(new UploadError(0, 'aborted'))
+    xhr.onerror = () => reject(new UploadError(0, 'network error', 'network'))
+    xhr.onabort = () => reject(new UploadError(0, 'aborted', 'aborted'))
     xhr.onload = () => {
       const body = xhr.response as { blobId?: unknown; error?: unknown } | null
       if (xhr.status >= 200 && xhr.status < 300 && typeof body?.blobId === 'string') {
@@ -45,7 +49,7 @@ export function uploadBlob(kind: BlobKind, data: Blob, options: UploadOptions = 
         return
       }
       const message = typeof body?.error === 'string' ? body.error : `HTTP ${xhr.status}`
-      reject(new UploadError(xhr.status, message))
+      reject(new UploadError(xhr.status, message, 'http'))
     }
     options.signal?.addEventListener('abort', () => xhr.abort(), { once: true })
     xhr.send(data)
@@ -93,7 +97,3 @@ export async function exportLogs(): Promise<void> {
   triggerDownload(logsExportUrl())
 }
 
-/** 上传失败 → 可展示文本。 */
-export function describeUploadError(error: unknown): string {
-  return error instanceof UploadError ? error.message : errorMessage(error)
-}

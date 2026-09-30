@@ -66,10 +66,12 @@ import type {
   SystemProxyDto,
   TaskActivityPage,
   TaskActivityQuery,
+  TaskDeleteManyParams,
   TaskDeleteParams,
   TaskChangeUrlParams,
   TaskDto,
   TaskIdParams,
+  TaskIdsParams,
   TaskRenameParams,
   TrackerSubRefreshResponse,
   WebhookDeliveriesResponse,
@@ -99,6 +101,19 @@ const task = {
   rescan: () => call<OkResult>(METHOD.DAEMON_TASK_RESCAN),
   setSeedLimits: (params: SetSeedLimitsParams) =>
     call<OkResult>(METHOD.DAEMON_TASK_SET_SEED_LIMITS, params),
+  /** 批量操作：一次请求、整批只推一次任务快照（逐条调用会撞上 agent 的通道上限）。 */
+  pauseMany: (taskIds: string[]) => {
+    const params: TaskIdsParams = { taskIds };
+    return call<OkResult>(METHOD.DAEMON_TASK_PAUSE_MANY, params);
+  },
+  resumeMany: (taskIds: string[]) => {
+    const params: TaskIdsParams = { taskIds };
+    return call<OkResult>(METHOD.DAEMON_TASK_RESUME_MANY, params);
+  },
+  deleteMany: (taskIds: string[], deleteFiles = false) => {
+    const params: TaskDeleteManyParams = { taskIds, deleteFiles };
+    return call<OkResult>(METHOD.DAEMON_TASK_DELETE_MANY, params);
+  },
 };
 
 const queue = {

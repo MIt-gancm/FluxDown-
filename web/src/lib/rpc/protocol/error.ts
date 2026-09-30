@@ -37,6 +37,7 @@ export type ErrorReason =
   | 'pluginDownloadFailed'
   | 'pluginPackageTooLarge'
   | 'pluginPackageInvalid'
+  | 'marketVersionChanged'
   | 'invalidCredentials'
   | 'invalidVerificationCode'
   | 'rateLimited'
@@ -62,6 +63,7 @@ export type ErrorReason =
   | 'pairingRejected'
   | 'pairingSignatureInvalid'
   | 'pairingSelf'
+  | 'pairingVersionMismatch'
   | 'peerNotPaired'
   | 'peerOffline'
   | 'unknown';
