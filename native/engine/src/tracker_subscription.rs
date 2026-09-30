@@ -207,17 +207,36 @@ async fn fetch_one(client: &reqwest::Client, url: &str) -> Result<Vec<String>, S
     if body.len() > MAX_RESPONSE_BYTES {
         return Err(format!("response too large ({} bytes)", body.len()));
     }
-    Ok(body
+    parse_source_body(&body)
+}
+
+/// 订阅源正文 → 非空行。没有任何有效 tracker（HTML 错误页、空页）视为该源
+/// 失败：否则会以「成功 + 空列表」覆盖宿主缓存并在刷新间隔内丢光订阅 tracker。
+fn parse_source_body(body: &str) -> Result<Vec<String>, String> {
+    let lines: Vec<String> = body
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .map(str::to_owned)
-        .collect())
+        .collect();
+    if !lines.iter().any(|l| normalize_tracker(l).is_some()) {
+        return Err("no valid tracker found in response".to_string());
+    }
+    Ok(lines)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{default_subscription_urls, merge_dedup, normalize_tracker};
+    use super::{default_subscription_urls, merge_dedup, normalize_tracker, parse_source_body};
+
+    #[test]
+    fn source_without_valid_tracker_is_an_error() {
+        assert!(parse_source_body("").is_err());
+        assert!(parse_source_body("<html><body>502 Bad Gateway</body></html>").is_err());
+        assert!(parse_source_body("# only a comment\n\n").is_err());
+        let ok = parse_source_body("<!-- x -->\nudp://tracker.example.com:6969/announce\n");
+        assert_eq!(ok.map(|v| v.len()), Ok(2));
+    }
 
     #[test]
     fn normalize_keeps_udp_port_and_path() {

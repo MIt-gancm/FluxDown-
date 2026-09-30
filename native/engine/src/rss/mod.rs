@@ -178,14 +178,36 @@ impl RssDownloadPlan {
     /// ```
     #[must_use]
     pub fn is_torrent_file(&self) -> bool {
-        if crate::bt_downloader::is_magnet_url(&self.url) {
-            return false;
-        }
-        let lowered = self.url.to_ascii_lowercase();
-        let path = lowered.split(['?', '#']).next().unwrap_or(&lowered);
-        // 少数 PT 站把真实文件名放进 query（`…/dl.php?file=x.torrent`），一并认。
-        path.ends_with(".torrent") || lowered.contains(".torrent")
+        url_looks_like_torrent(&self.url)
     }
+}
+
+/// URL 形态判定（见 [`RssDownloadPlan::is_torrent_file`]）。除 `.torrent`
+/// 字样外，认两种不含扩展名的常见种子下载形态：NexusPHP 的
+/// `download.php?…passkey=…` 与 Jackett 的 `/dl/<indexer>/?jackett_apikey=…`。
+fn url_looks_like_torrent(url: &str) -> bool {
+    if crate::bt_downloader::is_magnet_url(url) {
+        return false;
+    }
+    let lowered = url.to_ascii_lowercase();
+    let (path, query) = {
+        let no_fragment = lowered.split('#').next().unwrap_or(&lowered);
+        match no_fragment.split_once('?') {
+            Some((p, q)) => (p, q),
+            None => (no_fragment, ""),
+        }
+    };
+    // 少数 PT 站把真实文件名放进 query（`…/dl.php?file=x.torrent`），一并认。
+    if path.ends_with(".torrent") || lowered.contains(".torrent") {
+        return true;
+    }
+    let has_param = |key: &str| {
+        query
+            .split('&')
+            .any(|kv| kv.split('=').next().is_some_and(|k| k == key))
+    };
+    (path.ends_with("/download.php") && has_param("passkey"))
+        || (path.contains("/dl/") && has_param("jackett_apikey"))
 }
 
 /// 订阅调度与条目状态机。
@@ -305,12 +327,27 @@ impl RssManager {
     /// 更新订阅的用户可编辑字段。运行态（退避账本/首轮标记）不受影响。
     pub async fn update_source(&mut self, mut source: RssSourceInfo) -> bool {
         source.normalize();
-        if source.source_id.is_empty() || self.source(&source.source_id).is_none() {
+        let Some(old) = self.source(&source.source_id).cloned() else {
             return false;
-        }
+        };
+
         if let Err(e) = self.db.update_rss_source(&source).await {
             log_error!("[rss] update source failed: {}", e);
             return false;
+        }
+        if let Some(seeded) = runtime_reset_on_update(&old, &source) {
+            // 来源/鉴权变化：旧的失败退避与错误不再适用，`last_fetch_at = 0`
+            // 让下一次 tick 立即重抓（与新建路径一致）。
+            self.persist_runtime(
+                &source.source_id,
+                0,
+                old.last_success_at,
+                "",
+                0,
+                seeded,
+                &source.name,
+            )
+            .await;
         }
         self.broadcast_sources().await;
         true
@@ -598,12 +635,30 @@ impl RssManager {
             } else {
                 plan.user_agent.clone()
             },
-            proxy: resolve_proxy(&plan.proxy_url, proxy),
+            proxy: ProxyConfig::default(),
         };
         let referrer = plan.referrer.clone();
+        // 与 feed 抓取同一套 Auto 失败转移：feed 靠候选代理才抓得到的站点，
+        // 其 `.torrent` 下载同样需要，否则整条 RSS→BT 链路在 Auto 下不可用。
+        let direct_proxy = resolve_proxy(&plan.proxy_url, proxy);
+        let eligible = plan.proxy_url.is_empty() && proxy.mode == ProxyMode::Auto;
+        let global_proxy = proxy.clone();
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let (bytes, error) = match fetch_torrent(&request, &referrer).await {
+            let result = fetch_with_auto_failover(
+                &request.url,
+                direct_proxy,
+                eligible,
+                &global_proxy,
+                |proxy_cfg| {
+                    let mut req = request.clone();
+                    req.proxy = proxy_cfg;
+                    let referrer = referrer.clone();
+                    async move { fetch_torrent(&req, &referrer).await }
+                },
+            )
+            .await;
+            let (bytes, error) = match result {
                 Ok(bytes) => (bytes, String::new()),
                 Err(e) => (Vec::new(), e),
             };
@@ -853,6 +908,26 @@ impl RssManager {
     }
 }
 
+/// 编辑订阅后是否需要重置运行态。返回 `Some(seeded)` 表示要清零失败退避、
+/// 清空错误并让下一轮 tick 立即重抓，`seeded` 为重置后的首轮标记：
+/// url / provider 变化＝新 feed，其历史条目必须重新只播种不下载（`false`）；
+/// 仅 Cookie / UA / 代理变化＝同一 feed，保留原标记。无关字段变化返回 `None`。
+fn runtime_reset_on_update(old: &RssSourceInfo, new: &RssSourceInfo) -> Option<bool> {
+    let feed_changed = old.url != new.url
+        || old.provider_id != new.provider_id
+        || old.provider_config != new.provider_config;
+    let auth_changed = old.cookies != new.cookies
+        || old.user_agent != new.user_agent
+        || old.proxy_url != new.proxy_url;
+    if feed_changed {
+        Some(false)
+    } else if auth_changed {
+        Some(old.seeded)
+    } else {
+        None
+    }
+}
+
 /// 到期判定（纯函数）。
 ///
 /// 到期条件：启用 + 不在抓取中 + `now - last_fetch_at >= 生效间隔`。
@@ -977,16 +1052,16 @@ fn resolve_proxy(proxy_url: &str, global: &ProxyConfig) -> ProxyConfig {
 /// [`auto_proxy::resolve_candidates`] 给出的候选（手动字段优先于系统代理）
 /// 各重试一次，命中即返回；全部候选也失败则返回最后一次错误。
 /// `eligible = false` 时只跑一次给定配置，行为与不做失败转移一致。
-async fn fetch_with_auto_failover<F, Fut>(
+async fn fetch_with_auto_failover<T, F, Fut>(
     url: &str,
     direct_config: ProxyConfig,
     eligible: bool,
     global: &ProxyConfig,
     mut attempt: F,
-) -> Result<ParsedFeed, String>
+) -> Result<T, String>
 where
     F: FnMut(ProxyConfig) -> Fut,
-    Fut: Future<Output = Result<ParsedFeed, String>>,
+    Fut: Future<Output = Result<T, String>>,
 {
     let first_error = match attempt(direct_config).await {
         Ok(feed) => return Ok(feed),
@@ -1116,7 +1191,8 @@ mod tests {
 
     use super::{
         MAX_BACKOFF_SECS, due_sources, effective_interval_secs, feed_origin,
-        fetch_with_auto_failover, plan_for, rule_of,
+        fetch_with_auto_failover, plan_for, rule_of, runtime_reset_on_update,
+        url_looks_like_torrent,
     };
     use crate::proxy_config::{ProxyConfig, ProxyMode};
     use crate::rss::model::{RssItemInfo, RssItemStatus, RssSourceInfo};
@@ -1668,7 +1744,7 @@ mod tests {
         let global = auto_proxy_global();
         let attempts = std::sync::Arc::new(std::sync::Mutex::new(0u32));
         let attempts_clone = attempts.clone();
-        let result = fetch_with_auto_failover(
+        let result = fetch_with_auto_failover::<ParsedFeed, _, _>(
             "http://feed.test/rss",
             ProxyConfig::default(),
             false, // 订阅有专属代理，或全局非 Auto：不重试
@@ -1729,7 +1805,7 @@ mod tests {
         let global = auto_proxy_global();
         let attempts = std::sync::Arc::new(std::sync::Mutex::new(0u32));
         let attempts_clone = attempts.clone();
-        let result = fetch_with_auto_failover(
+        let result = fetch_with_auto_failover::<ParsedFeed, _, _>(
             "http://feed.test/rss",
             ProxyConfig::default(),
             true,
@@ -1746,5 +1822,48 @@ mod tests {
         assert_eq!(result, Err("failed（auto 候选代理均已重试）".to_string()));
         // 直连 + 手动候选至少 2 次；测试机若配置了系统代理会再多一次系统候选。
         assert!(*attempts.lock().expect("lock") >= 2);
+    }
+
+    #[test]
+    fn torrent_url_detection_covers_extensionless_private_tracker_links() {
+        assert!(url_looks_like_torrent(
+            "https://pt.example/download.php?id=1&passkey=abc"
+        ));
+        assert!(url_looks_like_torrent(
+            "https://jackett.local/dl/indexer/?jackett_apikey=k&path=Zm9v&file=x"
+        ));
+        assert!(url_looks_like_torrent(
+            "https://mikanani.me/Download/a.torrent"
+        ));
+        // 无 passkey 的 download.php 可能是任意文件，不能误判为种子。
+        assert!(!url_looks_like_torrent(
+            "https://site.example/download.php?id=1"
+        ));
+        assert!(!url_looks_like_torrent("magnet:?xt=urn:btih:deadbeef"));
+        assert!(!url_looks_like_torrent("https://cdn.example/ep01.mp4"));
+    }
+
+    #[test]
+    fn update_resets_runtime_only_when_feed_or_auth_changes() {
+        let old = RssSourceInfo {
+            url: "https://a.test/rss".to_string(),
+            seeded: true,
+            fail_count: 5,
+            ..Default::default()
+        };
+        let same = old.clone();
+        assert_eq!(runtime_reset_on_update(&old, &same), None);
+
+        let mut renamed = old.clone();
+        renamed.name = "n".to_string();
+        assert_eq!(runtime_reset_on_update(&old, &renamed), None);
+
+        let mut new_cookie = old.clone();
+        new_cookie.cookies = "uid=1".to_string();
+        assert_eq!(runtime_reset_on_update(&old, &new_cookie), Some(true));
+
+        let mut new_url = old.clone();
+        new_url.url = "https://b.test/rss".to_string();
+        assert_eq!(runtime_reset_on_update(&old, &new_url), Some(false));
     }
 }

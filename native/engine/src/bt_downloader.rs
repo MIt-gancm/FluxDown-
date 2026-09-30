@@ -558,6 +558,10 @@ pub struct SharedBtSession {
     /// 暂停」等待者触发前校验世代未变，防止用户已 resume 后仍把 torrent
     /// 暂停回去。`Arc` 使等待者能脱离 `&self` 存活于 BT runtime 上。
     pause_epochs: Arc<Mutex<HashMap<String, u64>>>,
+    /// 句柄入册前（磁力元数据解析 / add 进行中）收到的暂停意图：task_id →
+    /// 登记时的 pause 世代号。add 闭包在句柄入册后校验世代并补执行暂停；
+    /// resume / delete / 新一次 add 会作废它。
+    pending_pauses: Mutex<HashMap<String, u64>>,
     /// 本次 add 时存在既有 `{hash}.bitv`、或经缓存句柄跨暂停恢复过的任务。
     /// 这类任务的 have-bits 可能来自采样式 fastresume 校验（对哈希不匹配
     /// 宽容）或暂停期间磁盘被外部改动后的内存位图，完成期必须全量重哈希
@@ -593,6 +597,14 @@ impl SharedBtSession {
         upload_limit_bps: u64,
         bt_config: &BtConfig,
     ) -> Result<Self, DownloadError> {
+        // BT 每个文件、每个 peer 常驻 FD；macOS GUI 启动的软限制仅 256，
+        // 多文件种子或多任务会撞 EMFILE 并连带拖垮同进程的 SQLite/HTTP。
+        // 进程级只需提升一次，失败（硬限制更低等）不影响启动。
+        static NOFILE_LIMIT_ONCE: std::sync::Once = std::sync::Once::new();
+        NOFILE_LIMIT_ONCE.call_once(|| match librqbit::try_increase_nofile_limit() {
+            Ok(limit) => log_info!("[BT] RLIMIT_NOFILE soft limit raised to {limit}"),
+            Err(e) => log_info!("[BT] failed to raise RLIMIT_NOFILE: {e:#}"),
+        });
         // Scale worker threads with CPU cores.  BT workload is mostly I/O-bound
         // so diminishing returns beyond 8 threads; capping here saves ~2 MB of
         // stack memory per thread avoided.
@@ -875,6 +887,7 @@ impl SharedBtSession {
             completion_move_lock: Mutex::new(()),
             seeding: Arc::new(SeedingManager::new()),
             pause_epochs: Arc::new(Mutex::new(HashMap::new())),
+            pending_pauses: Mutex::new(HashMap::new()),
             fastresume_tainted: Mutex::new(HashSet::new()),
             persistence_folder,
         })
@@ -984,26 +997,80 @@ impl SharedBtSession {
         // Clone the Arc handle and release the lock immediately so that
         // the async session.pause() call doesn't block other handle ops.
         let handle = self.handles.lock().await.get(task_id).cloned();
+        let epoch = self.bump_pause_epoch(task_id).await;
         if let Some(handle) = handle {
-            let epoch = self.bump_pause_epoch(task_id).await;
-            if !handle.is_paused()
-                && let Err(e) = self.session.pause(&handle).await
-            {
-                if matches!(
-                    handle.stats().state,
-                    librqbit::TorrentStatsState::Initializing { .. }
-                ) {
-                    log_info!(
-                        "[BT] task={} pause requested during init — deferring until check completes",
-                        short_id(task_id)
-                    );
-                    self.spawn_deferred_pause(task_id.to_string(), handle, epoch);
-                    return Ok(());
-                }
-                return Err(DownloadError::Other(format!("BT pause failed: {e}")));
-            }
-            log_info!("[BT] task={} paused via session API", short_id(task_id));
+            return self.pause_handle(task_id, handle, epoch).await;
         }
+        // 句柄尚未入册（磁力元数据解析 / add 进行中）：登记暂停意图，由 add
+        // 闭包在句柄入册后补执行；否则该 add 会以运行态入会话形成幽灵下载。
+        self.pending_pauses
+            .lock()
+            .await
+            .insert(task_id.to_string(), epoch);
+        log_info!(
+            "[BT] task={} pause requested before handle registered — pending",
+            short_id(task_id)
+        );
+        // add 闭包可能恰在上面的 handles 查询之后、登记之前完成入册：复查一次，
+        // 命中则由本处接手（pause_handle 幂等）。
+        let late = self.handles.lock().await.get(task_id).cloned();
+        if let Some(handle) = late
+            && self.pending_pauses.lock().await.remove(task_id) == Some(epoch)
+        {
+            return self.pause_handle(task_id, handle, epoch).await;
+        }
+        Ok(())
+    }
+
+    /// add 闭包在句柄入册（并通过 pending-delete 复查）后调用：若存在仍然
+    /// 有效（世代未变）的暂停意图，则按 `pause_task` 同一逻辑暂停并保留句柄。
+    async fn apply_pending_pause(&self, task_id: &str) {
+        let Some(epoch) = self.pending_pauses.lock().await.remove(task_id) else {
+            return;
+        };
+        if self.pause_epochs.lock().await.get(task_id).copied() != Some(epoch) {
+            return;
+        }
+        let handle = self.handles.lock().await.get(task_id).cloned();
+        if let Some(handle) = handle
+            && let Err(e) = self.pause_handle(task_id, handle, epoch).await
+        {
+            log_info!(
+                "[BT] task={} pending pause failed after add: {e}",
+                short_id(task_id)
+            );
+        }
+    }
+
+    /// 清除上一轮遗留的 pending delete / pause 意图（新一次 add 之前调用）。
+    async fn clear_pending_intents(&self, task_id: &str) {
+        self.pending_deletes.lock().await.remove(task_id);
+        self.pending_pauses.lock().await.remove(task_id);
+    }
+
+    async fn pause_handle(
+        &self,
+        task_id: &str,
+        handle: BtHandle,
+        epoch: u64,
+    ) -> Result<(), DownloadError> {
+        if !handle.is_paused()
+            && let Err(e) = self.session.pause(&handle).await
+        {
+            if matches!(
+                handle.stats().state,
+                librqbit::TorrentStatsState::Initializing { .. }
+            ) {
+                log_info!(
+                    "[BT] task={} pause requested during init — deferring until check completes",
+                    short_id(task_id)
+                );
+                self.spawn_deferred_pause(task_id.to_string(), handle, epoch);
+                return Ok(());
+            }
+            return Err(DownloadError::Other(format!("BT pause failed: {e:#}")));
+        }
+        log_info!("[BT] task={} paused via session API", short_id(task_id));
         Ok(())
     }
 
@@ -1060,9 +1127,10 @@ impl SharedBtSession {
     pub async fn resume_task(&self, task_id: &str) -> Result<Option<BtHandle>, DownloadError> {
         // Clone the Arc handle and release the lock immediately.
         let handle = self.handles.lock().await.get(task_id).cloned();
+        // 作废在途的延迟暂停与元数据窗口内登记的暂停意图（无句柄时同样要作废）。
+        self.bump_pause_epoch(task_id).await;
+        self.pending_pauses.lock().await.remove(task_id);
         if let Some(handle) = handle {
-            // 作废可能在途的延迟暂停（pause 发起于初检期、尚未落地）。
-            self.bump_pause_epoch(task_id).await;
             let in_error = matches!(handle.stats().state, librqbit::TorrentStatsState::Error);
             if handle.is_paused() || in_error {
                 if let Err(e) = self.session.unpause(&handle).await {
@@ -1296,6 +1364,7 @@ impl SharedBtSession {
         // 世代号与 fastresume 污点随任务删除：torrent 离开会话后这两份
         // 状态即失效，下次 re-add 会重新计算。同时作废在途的延迟暂停。
         self.pause_epochs.lock().await.remove(task_id);
+        self.pending_pauses.lock().await.remove(task_id);
         self.fastresume_tainted.lock().await.remove(task_id);
         // parts 边车随任务删除（handle 是否在册都要删；session.delete 的
         // remove_files 只处理数据文件，不认识边车）。
@@ -3189,8 +3258,6 @@ pub fn build_add_torrent_options(
     output_folder: String,
     upload_limit_bps: u64,
 ) -> AddTorrentOptions {
-    // `opts` is only mutated by the Windows-only storage override below.
-    #[allow(unused_mut)]
     let mut opts = AddTorrentOptions {
         overwrite: true,
         output_folder: Some(output_folder),
@@ -3207,7 +3274,88 @@ pub fn build_add_torrent_options(
             opts.storage_factory = Some(crate::bt_sparse::sparse_fs_factory(PathBuf::from(folder)));
         }
     }
+    // 种子元数据里的文件路径由对端提供，librqbit 只拒绝 `..` 与分隔符；
+    // 存储初始化会对全部文件（含未选中）无条件 create，必须在任何 I/O 之前
+    // 校验路径，而不是等完成期 `compute_completion_layout` 才拦。
+    let inner = opts.storage_factory.take().unwrap_or_else(|| {
+        librqbit::storage::StorageFactoryExt::boxed(
+            librqbit::storage::filesystem::FilesystemStorageFactory::default(),
+        )
+    });
+    opts.storage_factory = Some(Box::new(PathGuardFactory { inner }));
     opts
+}
+
+/// 在委托的存储工厂之前校验全部文件路径的包装工厂。
+struct PathGuardFactory {
+    inner: librqbit::storage::BoxStorageFactory,
+}
+
+impl librqbit::storage::StorageFactory for PathGuardFactory {
+    type Storage = Box<dyn librqbit::storage::TorrentStorage>;
+
+    fn create(
+        &self,
+        shared: &librqbit::ManagedTorrentShared,
+        metadata: &librqbit::TorrentMetadata,
+    ) -> anyhow::Result<Self::Storage> {
+        for fi in metadata.file_infos.iter() {
+            if !torrent_relative_path_is_safe(&fi.relative_filename, cfg!(windows)) {
+                anyhow::bail!(
+                    "unsafe file path in torrent metadata: {}",
+                    fi.relative_filename.display()
+                );
+            }
+        }
+        self.inner.create(shared, metadata)
+    }
+
+    fn is_type_id(&self, type_id: std::any::TypeId) -> bool {
+        // 伪装为 `FilesystemStorageFactory` 以通过 JSON session 持久化的 TypeId
+        // 白名单（约定同 `bt_sparse` / `bt_partfile` 的伪装工厂）。
+        type_id == std::any::TypeId::of::<librqbit::storage::filesystem::FilesystemStorageFactory>()
+            || type_id == std::any::TypeId::of::<Self>()
+    }
+
+    fn clone_box(&self) -> librqbit::storage::BoxStorageFactory {
+        Box::new(Self {
+            inner: self.inner.clone_box(),
+        })
+    }
+}
+
+/// 种子内文件相对路径是否可安全落盘：非空、仅 `Normal` 组件。
+/// `windows_rules` 额外拒绝组件内的 `:`（盘符前缀 / ADS）、控制字符与
+/// 设备保留名——这些在 Windows 上会改写基路径或落到设备，而在其他平台
+/// 是合法文件名，故不对非 Windows 强加。
+fn torrent_relative_path_is_safe(rel: &Path, windows_rules: bool) -> bool {
+    use std::path::Component;
+    if rel.as_os_str().is_empty() || rel.is_absolute() {
+        return false;
+    }
+    rel.components().all(|c| {
+        let Component::Normal(part) = c else {
+            return false;
+        };
+        if !windows_rules {
+            return true;
+        }
+        let Some(name) = part.to_str() else {
+            return false;
+        };
+        if name.contains(':') || name.chars().any(|ch| ch.is_control()) {
+            return false;
+        }
+        let stem = name.split('.').next().unwrap_or(name).trim_end();
+        let upper = stem.to_ascii_uppercase();
+        !(matches!(
+            upper.as_str(),
+            "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        ) || ((upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.len() == 4
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0'))
+    })
 }
 
 /// 任务级限速 → librqbit torrent 级 [`librqbit::limits::LimitsConfig`]。
@@ -3494,6 +3642,10 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         // sees the in-flight task even if `bt_download_inner` is cancelled
         // immediately after.  The guard decrements on drop — panic-safe.
         let inflight = shared_bt.inflight_guard();
+        let add_abort = Arc::new(tokio::sync::Notify::new());
+        let add_abort_for_task = add_abort.clone();
+        // 清掉上一轮（超时/取消）遗留的 pending 意图，避免毒化本次 add。
+        shared_bt.clear_pending_intents(&task_id).await;
         let add_handle = tokio::spawn(async move {
             // Move the guard into the task so it is dropped (and thus
             // decrements) when the task finishes normally *or* panics.
@@ -3504,7 +3656,12 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                     AddTorrent::from_bytes(Bytes::from(bytes.clone()))
                 }
             };
-            let result = session_for_add.add_torrent(add_input, Some(add_opts)).await;
+            let result = tokio::select! {
+                r = session_for_add.add_torrent(add_input, Some(add_opts)) => r,
+                _ = add_abort_for_task.notified() => {
+                    return Err(anyhow::anyhow!("BT add aborted before metadata resolved"));
+                }
+            };
             // If delete_task was called while we were waiting for metadata
             // (handle not yet in `handles`, run_bt_download already returned
             // Err(Cancelled)), apply the pending delete now that we have the
@@ -3571,6 +3728,11 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                                     short_id(&task_id_for_add),
                                     del_files
                                 );
+                            } else {
+                                // 元数据窗口内的暂停意图：add 完成后补执行，保留已暂停句柄。
+                                shared_bt_for_add
+                                    .apply_pending_pause(&task_id_for_add)
+                                    .await;
                             }
                         }
                     }
@@ -3613,11 +3775,15 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         let add_started = Instant::now();
         let h = loop {
             if cancelled.load(Ordering::SeqCst) {
-                // Drop (detach) instead of abort: the spawned add_torrent task
-                // continues running so it can consume the pending_delete entry
-                // registered by delete_task and properly remove the torrent
-                // from the librqbit session.  Aborting would leave the torrent
-                // in the session with no way to clean it up later.
+                if is_magnet_source {
+                    // 磁力仍在元数据阶段：会话里没有该种子，直接中止 add。
+                    // 已返回的 add 由其闭包内的 pending delete / pending pause 处理。
+                    add_abort.notify_one();
+                } else {
+                    // .torrent 的 add 近乎瞬时且不可中止：登记暂停意图，让闭包
+                    // 在 add 完成后按暂停处理，避免幽灵下载。
+                    let _ = shared_bt.pause_task(&task_id).await;
+                }
                 drop(add_handle);
                 return Err(DownloadError::Cancelled);
             }
@@ -3630,7 +3796,9 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             // auto-retrying a dead magnet would just burn another 5 minutes
             // and pop the file-selection dialog at an unexpected moment.
             if is_magnet_source && add_started.elapsed() >= MAGNET_METADATA_TIMEOUT {
-                shared_bt.register_pending_delete(&task_id, true).await;
+                // 元数据阶段 add_torrent 尚未把种子放进会话，直接中止即可，
+                // 不留永不结束的后台 add（会让 inflight_adds 钉住会话释放）。
+                add_abort.notify_one();
                 drop(add_handle);
                 let msg = format!(
                     "magnet metadata resolution took too long ({}s) — no peers/DHT response; check trackers or network",
@@ -3658,7 +3826,7 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 result = &mut add_handle => {
                     let resp = result
                         .map_err(|e| DownloadError::Other(format!("BT add task panicked: {e}")))?
-                        .map_err(|e| DownloadError::Other(format!("BT add torrent failed: {e}")))?;
+                        .map_err(|e| DownloadError::Other(format!("BT add torrent failed: {e:#}")))?;
                     let h = match resp {
                         AddTorrentResponse::Added(_id, handle) => {
                             log_info!("[BT] task={} torrent added, id={}", short_id(&task_id), _id);
@@ -3722,6 +3890,14 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         // Cache the handle for future pause/resume cycles.
         shared_bt.store_handle(&task_id, h.clone()).await;
         h
+    };
+
+    // 缓存句柄若从未经过选择确认（如元数据窗口内暂停后由 add 闭包保留的已暂停
+    // 句柄），不能按「已确认选择的恢复」跳过对话框。
+    let had_existing_handle = if had_existing_handle && !skip_file_selection {
+        !matches!(db.load_bt_selected_files(&task_id).await, Ok(None))
+    } else {
+        had_existing_handle
     };
 
     // -----------------------------------------------------------------------
@@ -3942,6 +4118,20 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
             }
         }
         if cancelled.load(Ordering::SeqCst) {
+            // 暂停期间用户已作答：选择必须落库，且丢弃尚未应用 only_files 的
+            // 句柄，使恢复经 AtAdd 重新 add 并遵循该选择（否则 Path R 会下载全部）。
+            dialog_pause_state.store(DIALOG_PAUSE_DONE_KEEP, Ordering::SeqCst);
+            if let SelectionOutcome::UserChose(indices) = &outcome
+                && indices.first().copied() != Some(-1)
+                && indices.iter().any(|&i| i >= 0)
+            {
+                let is_all = indices.len() >= file_count;
+                let indices_to_save: &[i32] = if is_all { &[] } else { indices };
+                let _ = db
+                    .save_bt_selected_files(&task_id, indices_to_save, is_all)
+                    .await;
+            }
+            let _ = shared_bt.delete_task(&task_id, false).await;
             return Err(DownloadError::Cancelled);
         }
         outcome.into_inner()
@@ -3991,8 +4181,9 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
         );
         // Persist paused status to DB so it survives app restart.
         let _ = db.update_task_status(&task_id, STATUS_PAUSED, "").await;
-        // Pause the librqbit torrent so it stops seeding / connecting.
-        let _ = shared_bt.pause_task(&task_id).await;
+        // 丢弃句柄而非仅暂停：选择未落库，缓存的已暂停句柄会让同会话恢复走
+        // Path R 跳过对话框并下载全部文件；摘除后恢复走 re-add 重新弹框。
+        let _ = shared_bt.delete_task(&task_id, false).await;
         // Notify Dart so the UI immediately shows "Paused".
         let _ = progress_tx
             .send(ProgressUpdate {
@@ -4732,6 +4923,22 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                         // spawn_blocking（卸载到专用阻塞线程）,再 .await 句柄;`_move_guard`
                         // 仍在外层持有,跨越此 await,保留 move/update phase 的序列化语义
                         // (BUG-BT-COMPLETION-MOVE-BLOCKING)。
+                        // 首个 dst 的名字即 top_level_name（已落 DB file_name）；
+                        // 容器布局与单文件布局无额外顶层产物。
+                        let flat_artifact_names: Vec<String> = if task_owned_container {
+                            Vec::new()
+                        } else {
+                            moves
+                                .iter()
+                                .skip(1)
+                                .filter_map(|m| {
+                                    m.dst
+                                        .file_name()
+                                        .and_then(|n| n.to_str())
+                                        .map(str::to_owned)
+                                })
+                                .collect()
+                        };
                         let tid_for_move = task_id.clone();
                         let move_result = tokio::task::spawn_blocking(move || {
                             let mut succeeded = 0usize;
@@ -4839,6 +5046,13 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                         let _ = db
                             .update_task_file_info(&task_id, &top_level_name, final_total)
                             .await;
+                        // 扁平部分选择落盘为多个顶层文件，DB file_name 只记首个；
+                        // 其余登记为产物，「删除任务并删除文件」才能清干净。
+                        if all_ok {
+                            for name in &flat_artifact_names {
+                                let _ = db.add_task_artifact(&task_id, name).await;
+                            }
+                        }
                         (top_level_name, all_ok)
                     }
                 }
@@ -4926,14 +5140,18 @@ async fn bt_download_inner(p: BtInnerParams) -> Result<(), DownloadError> {
                 .flatten()
                 .map(|v| v != "0")
                 .unwrap_or(true);
-            let (seeding_status, seeding_message) = if !seed_enabled {
+            // 完成阶段（重哈希/搬移可持续数分钟）内用户或队列要求暂停时，
+            // 不能再登记为活动做种者：暂停不会被撤销，登记会让 UI 显示
+            // 「做种中」而实际不上传。
+            let user_paused = cancelled.load(Ordering::SeqCst) || handle.is_paused();
+            let (seeding_status, seeding_message) = if !seed_enabled || user_paused {
                 let _ = shared_bt.pause_task(&task_id).await;
                 let stopped = crate::bt_seeding::SeedingStopReason::UserStopped;
                 let _ = db
                     .update_task_seeding_status(&task_id, stopped.as_i32(), stopped.message())
                     .await;
                 log_info!(
-                    "[BT] task={} seeding disabled by config — torrent paused after completion",
+                    "[BT] task={} seeding not started (disabled by config or task paused/cancelled during completion) — torrent paused",
                     short_id(&task_id)
                 );
                 (stopped.as_i32(), stopped.message())
@@ -5347,6 +5565,110 @@ mod tests {
         drop(session);
         drop(occupied);
         std::fs::remove_dir_all(work).expect("the BT session test directory must be removable");
+    }
+
+    // -------------------------------------------------------------------------
+    // 种子文件路径校验 / 元数据窗口暂停意图。
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn torrent_path_guard_rejects_non_normal_components() {
+        use std::path::Path;
+        assert!(super::torrent_relative_path_is_safe(
+            Path::new("a/b.txt"),
+            false
+        ));
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("../a"),
+            false
+        ));
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("a/../b"),
+            false
+        ));
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("/etc/x"),
+            false
+        ));
+        assert!(!super::torrent_relative_path_is_safe(Path::new(""), false));
+    }
+
+    #[test]
+    fn torrent_path_guard_windows_rules_reject_drive_and_reserved() {
+        use std::path::Path;
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("C:evil/x"),
+            true
+        ));
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("dir/a:stream"),
+            true
+        ));
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("dir/NUL.txt"),
+            true
+        ));
+        assert!(!super::torrent_relative_path_is_safe(
+            Path::new("com1"),
+            true
+        ));
+        assert!(super::torrent_relative_path_is_safe(
+            Path::new("dir/COM0.txt"),
+            true
+        ));
+        assert!(super::torrent_relative_path_is_safe(
+            Path::new("dir/console.txt"),
+            true
+        ));
+        // 非 Windows 上 `:` 是合法文件名字符，不得误杀。
+        assert!(super::torrent_relative_path_is_safe(
+            Path::new("a:b"),
+            false
+        ));
+    }
+
+    #[test]
+    fn pause_before_handle_registers_pending_and_resume_invalidates_it() {
+        let port = {
+            let l = std::net::TcpListener::bind(("0.0.0.0", 0)).expect("ephemeral port");
+            l.local_addr().expect("addr").port()
+        };
+        let work = unique_test_dir("pending_pause");
+        std::fs::create_dir_all(&work).expect("test dir");
+        let work_string = work.to_string_lossy().into_owned();
+        let config = super::BtConfig {
+            enable_dht: false,
+            enable_upnp: false,
+            port_start: port.max(1024),
+            port_end: port.max(1024).saturating_add(8),
+            ..Default::default()
+        };
+        let session = super::SharedBtSession::new(&work_string, &work_string, 0, 0, &config)
+            .expect("BT session");
+        session.runtime.block_on(async {
+            assert!(session.pause_task("t1").await.is_ok());
+            assert!(session.pending_pauses.lock().await.contains_key("t1"));
+            // 暂停 → 恢复：意图必须作废，否则新一轮 add 会被误暂停。
+            assert!(session.resume_task("t1").await.expect("resume").is_none());
+            assert!(!session.pending_pauses.lock().await.contains_key("t1"));
+            // 暂停 → 恢复 → 暂停：只有最新一次意图有效。
+            assert!(session.pause_task("t1").await.is_ok());
+            let epoch = *session
+                .pending_pauses
+                .lock()
+                .await
+                .get("t1")
+                .expect("pending");
+            assert_eq!(
+                session.pause_epochs.lock().await.get("t1").copied(),
+                Some(epoch)
+            );
+            // 删除同样作废。
+            let _ = session.delete_task("t1", false).await;
+            assert!(!session.pending_pauses.lock().await.contains_key("t1"));
+        });
+        drop(session);
+        let _ = std::fs::remove_dir_all(work);
     }
 
     // -------------------------------------------------------------------------
