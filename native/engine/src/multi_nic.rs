@@ -260,8 +260,8 @@ fn is_tunnel_name(name: &str) -> bool {
 /// 虚拟化/容器/系统内部接口：没有独立上游，不作为额外链路。
 fn is_virtual_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    const PREFIXES: [&str; 11] = [
-        "docker", "veth", "br-", "virbr", "vmnet", "vboxnet", "bridge", "awdl", "llw", "anpi", "lo",
+    const PREFIXES: [&str; 10] = [
+        "docker", "veth", "br-", "virbr", "vmnet", "vboxnet", "bridge", "awdl", "llw", "anpi",
     ];
     const CONTAINS: [&str; 6] = [
         "vethernet",
@@ -271,7 +271,17 @@ fn is_virtual_name(name: &str) -> bool {
         "loopback",
         "pseudo",
     ];
-    PREFIXES.iter().any(|p| lower.starts_with(p)) || CONTAINS.iter().any(|c| lower.contains(c))
+    PREFIXES.iter().any(|p| lower.starts_with(p))
+        || CONTAINS.iter().any(|c| lower.contains(c))
+        || is_loopback_name(&lower)
+}
+
+/// `lo` / `lo0` / `lo1`…；不能用前缀匹配，否则 Windows 的
+/// 「Local Area Connection」会被误判。
+fn is_loopback_name(lower: &str) -> bool {
+    lower
+        .strip_prefix("lo")
+        .is_some_and(|rest| rest.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// 链路规划纯判据。
@@ -609,6 +619,16 @@ pub async fn prepare_links(url: &str, input: &MultiNicInput) -> PreparedLinks {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loopback_names_are_virtual_but_local_area_connection_is_not() {
+        for name in ["lo", "lo0", "LO1"] {
+            assert!(is_virtual_name(name), "{name}");
+        }
+        for name in ["Local Area Connection", "Local Area Connection 2"] {
+            assert!(!is_virtual_name(name), "{name}");
+        }
+    }
 
     fn nic(name: &str, index: u32, v4: &[(&str, u8)], v6: &[&str]) -> NicInfo {
         NicInfo {

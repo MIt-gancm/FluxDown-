@@ -217,11 +217,11 @@ async fn probe_http_meta(
             } else {
                 String::new()
             };
-            // HTML 错误页的 Content-Length 同样不可信，置 0（未知大小）。
-            let size = if is_html {
+            // HEAD 响应的 `content_length()` 来自 body size_hint，恒为 0；必须读头部。
+            let size = if is_html || !response.status().is_success() {
                 0
             } else {
-                response.content_length().map(|s| s as i64).unwrap_or(0)
+                head_content_length(response.headers())
             };
             (name, size)
         }
@@ -229,8 +229,43 @@ async fn probe_http_meta(
     }
 }
 
+/// 取 HEAD 响应头里的 Content-Length。带 Content-Encoding 时长度是压缩后的
+/// 传输大小，不代表文件大小，按未知处理。
+fn head_content_length(headers: &reqwest::header::HeaderMap) -> i64 {
+    let encoded = headers
+        .get(reqwest::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && !v.eq_ignore_ascii_case("identity")
+        })
+        .unwrap_or(false);
+    if encoded {
+        return 0;
+    }
+    headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::head_content_length;
+
+    #[test]
+    fn head_content_length_reads_header_and_skips_encoded() {
+        use reqwest::header::{CONTENT_ENCODING, CONTENT_LENGTH, HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        assert_eq!(head_content_length(&h), 0);
+        h.insert(CONTENT_LENGTH, HeaderValue::from_static("1234"));
+        assert_eq!(head_content_length(&h), 1234);
+        h.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(head_content_length(&h), 0);
+    }
+
     use super::{extract_dn_from_magnet, url_decode};
 
     #[test]

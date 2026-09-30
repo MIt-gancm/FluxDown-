@@ -1108,7 +1108,9 @@ fn build_client_inner(
                                 }
                                 if !sys_proxy.no_proxy_list.is_empty() {
                                     proxy = proxy.no_proxy(reqwest::NoProxy::from_string(
-                                        &sys_proxy.no_proxy_list,
+                                        &crate::proxy_config::normalize_no_proxy(
+                                            &sys_proxy.no_proxy_list,
+                                        ),
                                     ));
                                 }
                                 builder = builder.proxy(proxy);
@@ -1140,7 +1142,9 @@ fn build_client_inner(
                         }
                         if !proxy_config.no_proxy_list.is_empty() {
                             proxy = proxy.no_proxy(reqwest::NoProxy::from_string(
-                                &proxy_config.no_proxy_list,
+                                &crate::proxy_config::normalize_no_proxy(
+                                    &proxy_config.no_proxy_list,
+                                ),
                             ));
                         }
                         builder = builder.proxy(proxy);
@@ -1209,15 +1213,67 @@ pub async fn resolve_file_info(
     url: &str,
     spec: &RequestSpec,
 ) -> Result<FileInfo, DownloadError> {
-    // Prepare a fallback spec that strips browser-like User-Agent.
-    // On the last attempt we use this to avoid Cloudflare JA3-vs-UA mismatch.
-    let headers_without_browser_ua: std::collections::HashMap<String, String> = spec
-        .extra_headers
-        .iter()
-        .filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent"))
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    resolve_file_info_with_ua_fallback(client, url, spec)
+        .await
+        .map(|(info, _)| info)
+}
 
+/// 去掉 extra_headers 里的浏览器 UA（回落到 client 的 DEFAULT_UA / 任务 UA）。
+fn spec_without_browser_ua(spec: &RequestSpec) -> RequestSpec {
+    RequestSpec {
+        method: spec.method.clone(),
+        cookies: spec.cookies.clone(),
+        referrer: spec.referrer.clone(),
+        extra_headers: spec
+            .extra_headers
+            .iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("user-agent"))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+        body: spec.body.clone(),
+    }
+}
+
+/// 把 UA 降级结果写回任务的持久化请求头，续传（尤其免探测的 hint 续传）沿用。
+async fn persist_ua_downgrade(db: &Db, task_id: &str) {
+    let Ok(Some((cookies, referrer, headers_json))) = db.load_task_request_context(task_id).await
+    else {
+        return;
+    };
+    if headers_json.is_empty() {
+        return;
+    }
+    let Ok(mut headers) =
+        serde_json::from_str::<std::collections::HashMap<String, String>>(&headers_json)
+    else {
+        return;
+    };
+    let before = headers.len();
+    headers.retain(|k, _| !k.eq_ignore_ascii_case("user-agent"));
+    if headers.len() == before {
+        return;
+    }
+    let Ok(json) = serde_json::to_string(&headers) else {
+        return;
+    };
+    if let Err(e) = db
+        .set_task_request_context(task_id, &cookies, &referrer, &json)
+        .await
+    {
+        log_warn!(
+            "[resolve] task {} failed to persist UA downgrade: {}",
+            task_id,
+            e
+        );
+    }
+}
+
+/// 同 [`resolve_file_info`]，额外返回探测是否靠「去掉浏览器 UA」才成功。
+pub(crate) async fn resolve_file_info_with_ua_fallback(
+    client: &Client,
+    url: &str,
+    spec: &RequestSpec,
+) -> Result<(FileInfo, bool), DownloadError> {
     let has_browser_ua = spec
         .extra_headers
         .keys()
@@ -1225,38 +1281,28 @@ pub async fn resolve_file_info(
 
     // Holder for the UA-downgraded variant; allocated once outside the loop so
     // we can borrow it without repeated cloning.
-    let downgraded_spec = RequestSpec {
-        method: spec.method.clone(),
-        cookies: spec.cookies.clone(),
-        referrer: spec.referrer.clone(),
-        extra_headers: headers_without_browser_ua,
-        body: spec.body.clone(),
-    };
+    let downgraded_spec = has_browser_ua.then(|| spec_without_browser_ua(spec));
 
     let mut last_err = None;
     for attempt in 0..PROBE_MAX_RETRIES {
         // Last attempt: if extra_headers carried a browser UA, drop it so
         // the request falls back to DEFAULT_UA ("FluxDown/<version>").  This
         // avoids Cloudflare's TLS-fingerprint-vs-UA bot detection.
-        let use_downgraded_ua = has_browser_ua && attempt + 1 == PROBE_MAX_RETRIES;
-        let attempt_spec = if use_downgraded_ua {
-            if attempt == 0 {
-                // Should not happen with PROBE_MAX_RETRIES >= 2, but guard anyway.
-                spec
-            } else {
+        let downgraded = match &downgraded_spec {
+            Some(d) if attempt > 0 && attempt + 1 == PROBE_MAX_RETRIES => {
                 log_info!(
                     "[resolve] retry {}/{}: stripping browser UA to avoid bot detection",
                     attempt + 1,
                     PROBE_MAX_RETRIES
                 );
-                &downgraded_spec
+                Some(d)
             }
-        } else {
-            spec
+            _ => None,
         };
+        let attempt_spec = downgraded.unwrap_or(spec);
 
         match resolve_file_info_once(client, url, attempt_spec).await {
-            Ok(info) => return Ok(info),
+            Ok(info) => return Ok((info, downgraded.is_some())),
             Err(e) => {
                 log_info!(
                     "[resolve] probe attempt {}/{} failed: {}",
@@ -1285,6 +1331,13 @@ fn format_error_chain(mut src: Option<&dyn StdError>) -> String {
         src = cause.source();
     }
     s
+}
+
+/// 错误文本 + 完整 source 链。reqwest 的 Display 只有「error sending request
+/// for url (…)」，真正的 connection refused / timed out 在 source 里；传输层
+/// 错误分类必须带上链，否则建连失败恒匹配不到。
+pub(crate) fn download_error_chain_text(e: &DownloadError) -> String {
+    format!("{e}{}", format_error_chain(StdError::source(e)))
 }
 
 async fn resolve_file_info_once(
@@ -1455,6 +1508,7 @@ async fn resolve_file_info_once(
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v != "none");
 
+    let mut range_206_missing_content_range = false;
     let total_bytes = if let Some(cr) = headers.get("content-range") {
         // e.g. "bytes 0-0/12345"
         cr.to_str()
@@ -1473,6 +1527,7 @@ async fn resolve_file_info_once(
             "[resolve] WARNING: GET returned 206 without Content-Range — Content-Length is \
              the range length (not file size); treating total_bytes as unknown (0)"
         );
+        range_206_missing_content_range = true;
         0
     } else {
         headers
@@ -1481,6 +1536,12 @@ async fn resolve_file_info_once(
             .and_then(|v| v.parse::<i64>().ok())
             .unwrap_or(0)
     };
+    // 缺 Content-Range 的 206 无法确认响应体起点：按范围返回的服务器与「发从 0
+    // 全量流」的服务器在外观上无法区分，续传/分段都会错位。视为不支持 Range，
+    // 从源头杜绝对该服务器发 Range。
+    if range_206_missing_content_range {
+        supports_range = false;
+    }
 
     let content_type = headers
         .get(reqwest::header::CONTENT_TYPE)
@@ -1987,6 +2048,36 @@ fn has_plausible_extension(name: &str) -> bool {
     }
 }
 
+/// 按 RFC 6266 把 Content-Disposition 切成 `(参数名, 参数值)`：分号在引号内
+/// 不分隔（`filename="a;b.zip"`），`=` 两侧的空白被容忍，参数名由调用方按
+/// 大小写不敏感比较。没有 `=` 的片段（如 `attachment`）被跳过。
+fn disposition_params(value: &str) -> Vec<(&str, &str)> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, c) in value.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ';' if !in_quotes => {
+                parts.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+        .into_iter()
+        .filter_map(|part| {
+            let (name, val) = part.split_once('=')?;
+            Some((name.trim(), val.trim()))
+        })
+        .collect()
+}
+
 fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Option<String> {
     let disposition = headers.get(reqwest::header::CONTENT_DISPOSITION)?;
     // HeaderValue may contain raw UTF-8, GBK, or Big5 bytes in legacy filename= values.
@@ -2001,9 +2092,8 @@ fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Opt
         .collect();
 
     // Prefer filename*= (RFC 5987 / RFC 6266) over filename=
-    for part in value.split(';') {
-        let trimmed = part.trim();
-        if let Some(name) = trimmed.strip_prefix("filename*=") {
+    for (param, name) in disposition_params(&value) {
+        if param.eq_ignore_ascii_case("filename*") {
             // Format: charset'language'percent-encoded-name
             // e.g. UTF-8''My%20File.pdf
             //
@@ -2031,9 +2121,8 @@ fn extract_from_content_disposition(headers: &reqwest::header::HeaderMap) -> Opt
         }
     }
 
-    for part in value.split(';') {
-        let trimmed = part.trim();
-        if let Some(name) = trimmed.strip_prefix("filename=") {
+    for (param, name) in disposition_params(&value) {
+        if param.eq_ignore_ascii_case("filename") {
             let name = name.trim_matches(|c| c == '"' || c == '\'' || c == ' ');
             if !name.is_empty() {
                 // Heuristic: some servers (e.g. Chinese cloud storage OBS/S3)
@@ -2872,6 +2961,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     //   -1   — size unknown but confirmed downloadable (webRequest sniffed),
     //          skip probe to preserve one-time tokens
     //    0   — no hint, run normal probe
+    let mut ua_stripped_spec: Option<RequestSpec> = None;
     let info = if p.hint_file_size != 0 {
         // fresh hint 任务：持久化 Range 验证状态。浏览器扩展 hint → 0（未验证，
         // coordinator 首响应证实支持后置回 1；resume 据此延续「首连接 plain GET」
@@ -2934,7 +3024,14 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         }
     } else {
         log_info!("[download] task {} resolving file info...", p.task_id);
-        let info = resolve_file_info(client, &p.url, &p.spec).await?;
+        let (info, ua_downgraded) =
+            resolve_file_info_with_ua_fallback(client, &p.url, &p.spec).await?;
+        if ua_downgraded {
+            // 探测靠去掉浏览器 UA 才通过：真实下载（含分段 worker）必须用同一份
+            // 请求头，否则探测通过、下载 403；并落库让续传保持一致。
+            ua_stripped_spec = Some(spec_without_browser_ua(&p.spec));
+            persist_ua_downgrade(&p.db, &p.task_id).await;
+        }
         log_info!(
             "[download] task {} resolved: name={}, size={}, range={}",
             p.task_id,
@@ -2944,6 +3041,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         );
         info
     };
+    let spec_ref: &RequestSpec = ua_stripped_spec.as_ref().unwrap_or(&p.spec);
 
     // Safety net (probe 阶段)：服务器在 probe 阶段返回 HTML 但用户期望二进制
     // 文件——典型场景：Lanzou 等 CDN transit page、form-POST 端点用 GET 访问。
@@ -3277,7 +3375,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             &p.progress_tx,
             &p.cancel_token,
             &p.speed_limiter,
-            &p.spec,
+            spec_ref,
             p.sink.as_ref(),
             &resume_etag,
             &resume_last_modified,
@@ -3384,10 +3482,11 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                     &p.progress_tx,
                     &p.cancel_token,
                     &p.speed_limiter,
-                    &p.spec,
+                    spec_ref,
                     &actual_name,
                     &resume_etag,
                     &resume_last_modified,
+                    false,
                 )
                 .await?;
                 Some(result)
@@ -3437,10 +3536,11 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             &p.progress_tx,
             &p.cancel_token,
             &p.speed_limiter,
-            &p.spec,
+            spec_ref,
             &actual_name,
             &resume_etag,
             &resume_last_modified,
+            p.is_resume,
         )
         .await?;
         Some(result)
@@ -3982,7 +4082,10 @@ async fn download_single(
     expected_filename: &str,
     expected_etag: &str,
     expected_last_modified: &str,
+    is_resume: bool,
 ) -> Result<SingleDownloadResult, DownloadError> {
+    let mut clean_boundary = false;
+    let mut rounds: u64 = 0;
     loop {
         let result = download_single_once(
             task_id,
@@ -3999,6 +4102,8 @@ async fn download_single(
             expected_filename,
             expected_etag,
             expected_last_modified,
+            is_resume,
+            clean_boundary,
         )
         .await?;
 
@@ -4016,23 +4121,59 @@ async fn download_single(
         if current_len >= expected_len {
             return Ok(result);
         }
-        if current_len <= range_start {
+        // 无进展或轮数异常：交给外层带退避的重试，而不是无退避地空转请求。
+        rounds += 1;
+        let max_rounds = expected_len.div_ceil(MAX_SINGLE_RESUME_RANGE_BYTES as u64) + 256;
+        if current_len <= range_start || rounds > max_rounds {
             return Err(DownloadError::Other(format!(
-                "resumed Range returned no data before expected total: {current_len}/{expected_len}"
+                "download stalled: resumed Range made no progress before expected total: \
+                 {current_len}/{expected_len}"
             )));
         }
-        if let Err(e) = crate::task_activity::record(
-            db,
-            sink,
-            task_id,
-            "retry",
-            format!("HTTP 单流续传短响应：{current_len}/{expected_len}，从偏移 {current_len} 重试"),
-            Some(1),
-        )
-        .await
+        // 正常衔接（窗口恰好写满）不是重试，不写活动记录；只有服务器提前结束
+        // 窗口才值得用户看到。
+        let window_end = range_start
+            .saturating_add(MAX_SINGLE_RESUME_RANGE_BYTES as u64)
+            .min(expected_len);
+        if current_len < window_end
+            && let Err(e) = crate::task_activity::record(
+                db,
+                sink,
+                task_id,
+                "retry",
+                format!(
+                    "HTTP 单流续传短响应：{current_len}/{expected_len}，从偏移 {current_len} 继续"
+                ),
+                Some(1),
+            )
+            .await
         {
             tracing::error!(task_id, error = %e, "failed to persist HTTP single-stream retry");
         }
+        // 本轮干净 EOF，下一轮从实际末尾衔接，不再向下对齐到 1 MiB 检查点。
+        clean_boundary = true;
+    }
+}
+
+/// 等待响应头的上限。只覆盖「发出请求 → 收到响应头」阶段，不限制响应体速度，
+/// 所以慢速但健康的连接不受影响；不设在共享 client 上，避免误伤大文件 body。
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 发送请求并与取消令牌、响应头超时竞速。服务器接受连接却迟迟不回头时，
+/// 暂停/删除必须立即生效，超时则按停滞错误交给自动重试。
+async fn send_cancellable(
+    req: reqwest::RequestBuilder,
+    cancel_token: &CancellationToken,
+) -> Result<reqwest::Response, DownloadError> {
+    tokio::select! {
+        _ = cancel_token.cancelled() => Err(DownloadError::Cancelled),
+        sent = tokio::time::timeout(RESPONSE_HEADER_TIMEOUT, req.send()) => match sent {
+            Ok(resp) => Ok(resp?),
+            Err(_) => Err(DownloadError::Other(format!(
+                "download stalled: no response headers received within {}s",
+                RESPONSE_HEADER_TIMEOUT.as_secs()
+            ))),
+        },
     }
 }
 
@@ -4054,6 +4195,10 @@ async fn download_single_once(
     // validator 做后验比对，避免发送可能作废一次性签名 URL 的 If-Range。
     expected_etag: &str,
     expected_last_modified: &str,
+    // 任务是否为续传（决定「临时文件已满」可否跳过下载）。
+    is_resume: bool,
+    // 上一轮有界窗口干净 EOF 后的衔接请求：起点取实际文件末尾，不向下对齐。
+    clean_boundary: bool,
 ) -> Result<SingleDownloadResult, DownloadError> {
     output::ensure_parent(dest).await?;
 
@@ -4067,13 +4212,32 @@ async fn download_single_once(
         Err(_) => 0,
     };
 
+    // 续传时临时文件已写满（收尾阶段被中断/失败）：无需任何网络请求，直接交给
+    // 调用方的完整性检查与收尾，避免把数 GB 整文件从 0 重下。
+    if is_resume && !clean_boundary && total_bytes > 0 && physical_existing_len == total_bytes {
+        log_info!(
+            "[download-single] task {} temp file already holds all {} bytes; skipping download",
+            task_id,
+            total_bytes
+        );
+        let _ = db.update_task_progress(task_id, total_bytes).await;
+        return Ok(SingleDownloadResult {
+            response_content_length: total_bytes,
+            decompressed: false,
+            latched_last_modified: None,
+            resumed_range_start: None,
+        });
+    }
+
     // Resume only when the original method is GET-like. POST + Range is not a
     // portable contract and most servers ignore it, which would corrupt an append.
     let want_resume = spec.is_get_like()
         && supports_range
         && physical_existing_len > 0
         && (total_bytes == 0 || physical_existing_len < total_bytes);
-    let existing_len = if want_resume {
+    // 紧接着上一个有界窗口干净 EOF 的续传点无需回退到检查点：数据已完整落盘。
+    // 只有连接中断留下的不确定尾部才向下对齐。
+    let existing_len = if want_resume && !clean_boundary {
         physical_existing_len - physical_existing_len.rem_euclid(SINGLE_RESUME_ALIGNMENT_BYTES)
     } else {
         physical_existing_len
@@ -4105,7 +4269,8 @@ async fn download_single_once(
         // 版本安全由下方对 206 响应的 ETag/Last-Modified 后验校验保证。
         resp = resp.header("Range", &range);
     }
-    let mut resp = resp.send().await?;
+    let mut refetched_full = false;
+    let mut resp = send_cancellable(resp, cancel_token).await?;
     // BUG-HTTP-416-RETRY-EXHAUST：续传 Range 偏移越界时服务器回 416（临时文件
     // 被外部截断、或服务器文件在两次探测间缩小）。error_for_status() 会把它
     // 变成不可恢复的错误直接终止任务；416 语义明确——重试同一 Range 必然拿到
@@ -4120,7 +4285,8 @@ async fn download_single_once(
         );
         drop(resp);
         let full_req = build_request(client, url, spec.method.clone(), spec);
-        resp = full_req.send().await?;
+        resp = send_cancellable(full_req, cancel_token).await?;
+        refetched_full = true;
     }
     let mut resp = resp.error_for_status()?;
 
@@ -4167,27 +4333,36 @@ async fn download_single_once(
         }
     }
 
-    // F019: 当我们发了开放式 Range 请求 `bytes=N-`，服务器返回 206 且带
-    // Content-Encoding（部分 CDN 行为）时，响应体是【压缩流任意中间字节】起的
-    // 一段，无法从 existing_len（解压后偏移）正确续传，也无法当全量解压。此时
-    // 必须丢弃该响应、不带 Range 重新请求一次拿到完整压缩流，再从头解压全量
-    // 重下。仅在 want_resume（即确实带了 Range）时才可能触发，无 Range 的普通
-    // 请求不受影响。
-    if want_resume
-        && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
-        && detect_content_encoding(resp.headers()).is_some()
-    {
-        log_info!(
-            "[download-single] task {} got Content-Encoding on a 206 Range response — \
-             compressed byte ranges cannot be resumed; re-requesting full file without Range \
-             (existing_len={} discarded)",
-            task_id,
-            existing_len
-        );
-        drop(resp);
-        // 不带 Range 重新构造请求，拿到从 byte 0 起的完整（压缩）响应。
-        let full_req = build_request(client, url, spec.method.clone(), spec);
-        resp = full_req.send().await?.error_for_status()?;
+    // 206 响应不可信时丢弃，不带 Range 重新请求完整文件：
+    //   • F019：带 Content-Encoding 的 206 是压缩流任意中间字节起的一段，无法从
+    //     existing_len（解压后偏移）续传，也无法当全量解压；
+    //   • 缺 Content-Range：无法判断响应体的起点。按 Range 返回尾段的服务器和
+    //     「发从 0 全量流」的服务器（123 盘类）在外观上无法区分，当全量流写会
+    //     产出缺头文件；
+    //   • Content-Range 分母与已知总大小不一致：文件已变（可能变大被截断，也可能
+    //     变小导致反复拿到不足 1 MiB 的尾巴），零容差，重下后由大小漂移规则校准。
+    if want_resume && !refetched_full && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let encoded = detect_content_encoding(resp.headers()).is_some();
+        let missing_range_start = parse_content_range_start(resp.headers()).is_none();
+        let size_changed = total_bytes > 0
+            && parse_content_range_total(resp.headers()).is_some_and(|t| t != total_bytes);
+        if encoded || missing_range_start || size_changed {
+            log_info!(
+                "[download-single] task {} untrustworthy 206 (encoded={}, missing_content_range={}, \
+                 size_changed={}); re-requesting full file without Range (existing_len={} discarded)",
+                task_id,
+                encoded,
+                missing_range_start,
+                size_changed,
+                existing_len
+            );
+            drop(resp);
+            let full_req = build_request(client, url, spec.method.clone(), spec);
+            resp = send_cancellable(full_req, cancel_token)
+                .await?
+                .error_for_status()?;
+            refetched_full = true;
+        }
     }
 
     // ---- Safety net: HTML response on a binary download ---------------------
@@ -4257,6 +4432,27 @@ async fn download_single_once(
         );
     }
 
+    // 服务器忽略 Range 回 200 时，响应体要么是整个文件，要么是错误/替换内容。
+    // 总大小已知且 Content-Length 对不上时，下面的 File::create 会先截断数 GB
+    // 的旧数据，随后大小漂移规则又会把任何带长度的响应体判为完成——必须在截断
+    // 前拒绝并保留旧数据。重发的无 Range 全量请求（416 / 压缩 / 大小变化）与带
+    // 编码的 200 不适用：前者本就是为「文件已变」设计的恢复路径，后者的长度是
+    // 压缩后大小。
+    if want_resume
+        && !refetched_full
+        && total_bytes > 0
+        && resp.status() != reqwest::StatusCode::PARTIAL_CONTENT
+        && encoding.is_none()
+        && let Some(cl) = resp.content_length()
+        && i64::try_from(cl).is_ok_and(|cl| cl != total_bytes)
+    {
+        return Err(DownloadError::Other(format!(
+            "resume request was answered with a full body of {cl} bytes instead of the expected \
+             {total_bytes}; keeping the partial file. The link may have expired or the file \
+             changed on the server"
+        )));
+    }
+
     // Verify the server actually honoured the Range request.
     // Some servers (or CDN edge nodes) silently ignore Range and return 200 OK
     // with the full file.  If we appended to the partial file in that case we
@@ -4267,23 +4463,15 @@ async fn download_single_once(
     // HTTP 200 OK               → server ignored Range  → must restart from 0
     // Any other 2xx             → treat as non-resumable for safety
     //
-    // F019: `encoding.is_none()` 仍作为续传安全的额外必要条件做防御兜底。压缩
-    // 206 的核心修复已在上方"re-request full file without Range"完成（重发后
-    // resp 为 200 全量压缩流）；此处 encoding 守卫确保万一上方逻辑未覆盖某种
-    // 边界（如重发后服务器仍返回 206+encoding）也绝不会把压缩字节范围当作可
-    // append 的续传数据，避免静默损坏。
-    // BUG-CDN-206-BYTE0-FULLSTREAM（续传面）：劣质 CDN 在链接失效时对
-    // `Range: bytes=N-` 回 206 却发【从 0 的全量流】（Content-Range 起点为 0
-    // 或缺失，而非请求的 N）。若仍按 206 走 seek(End(0)) 追加，会把文件开头字节
-    // 拼到 existing_len 之后 → 错位坏文件。故追加"Content-Range 起点必须 ==
-    // existing_len"条件，不符即视为不可信续传 → 走下方回退全量分支（File::create
-    // 截断 + 复用当前响应体从 0 写入：from-0 全量流恰好落正确位置得完整文件，
-    // 错误页则被末尾 size mismatch 拦截）。与多段 do_segment 的同名校验对称。
+    // `encoding.is_none()` 与 Content-Range 起点必须 == existing_len 是续传安全
+    // 的必要条件：压缩 206 已在上方重发处理，这里兜底；BUG-CDN-206-BYTE0-FULLSTREAM
+    // 场景（劣质 CDN 对 `bytes=N-` 回 206 却发从 0 的全量流，Content-Range 起点
+    // 为 0）不符时 File::create 截断并复用当前响应体从 0 写入。缺 Content-Range
+    // 的 206 无法判断落点，已在上方丢弃并全量重发，不会落到这里。
     let actual_resume = want_resume
         && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT
         && encoding.is_none()
         && !is_range_response_misaligned(parse_content_range_start(resp.headers()), existing_len);
-
     if want_resume && !actual_resume {
         log_info!(
             "[download-single] task {} server returned {} (encoding={:?}) instead of a plain \
@@ -4294,7 +4482,10 @@ async fn download_single_once(
             existing_len
         );
     }
-    // 从 0 服务的全量体：锁存实际响应的 Last-Modified（见字段 doc）。
+    // 从 0 服务的全量体：锁存实际响应的 Last-Modified（见字段 doc），并把响应
+    // 自带的 validator 回写 DB。磁盘内容已是这个响应的版本，DB 里旧的 ETag/LM
+    // 描述的是被替换前的文件，留着会让下次续传永远 VersionChanged；响应没有
+    // validator 时写空串把旧值清掉。
     let latched_last_modified = (!actual_resume).then(|| {
         resp.headers()
             .get(reqwest::header::LAST_MODIFIED)
@@ -4302,6 +4493,20 @@ async fn download_single_once(
             .unwrap_or("")
             .to_string()
     });
+    if let Some(lm) = &latched_last_modified {
+        let etag = resp
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if let Err(e) = db.set_task_validator(task_id, etag, lm).await {
+            log_warn!(
+                "[download-single] task {} failed to refresh stored validator: {}",
+                task_id,
+                e
+            );
+        }
+    }
 
     // Capture the response's own Content-Length before consuming the body.
     // For resumed downloads (206), this is the *remaining* length, not total.
@@ -4390,11 +4595,21 @@ async fn download_single_once(
                 match chunk {
                     Some(Ok(bytes)) => {
                         // --- Speed limiter: write in sub-chunks as tokens allow ---
+                        // 令牌等待必须与取消竞速：低限速下一个 chunk 要等数秒，
+                        // 期间暂停/删除不能被挡在 select 分支体外。
                         let mut offset = 0usize;
                         let chunk_len = bytes.len();
                         while offset < chunk_len {
                             let remaining = (chunk_len - offset) as u64;
-                            let allowed = speed_limiter.consume(remaining).await;
+                            let allowed = tokio::select! {
+                                _ = cancel_token.cancelled() => {
+                                    file.flush().await?;
+                                    downloaded += offset as i64;
+                                    let _ = db.update_task_progress(task_id, downloaded).await;
+                                    return Err(DownloadError::Cancelled);
+                                }
+                                allowed = speed_limiter.consume(remaining) => allowed,
+                            };
                             let end = offset + allowed as usize;
                             file.write_all(&bytes[offset..end]).await?;
                             offset = end;
@@ -4761,6 +4976,34 @@ mod tests {
             name.as_deref(),
             Some("文件.txt"),
             "GBK percent-encoded 中文 URL 应能被正确解码而不是保留原始 %XX"
+        );
+    }
+
+    #[test]
+    fn extract_from_content_disposition_param_name_case_and_spacing() {
+        let h = make_headers_with_cd("attachment; FileName=\"report.pdf\"");
+        assert_eq!(
+            extract_from_content_disposition(&h).as_deref(),
+            Some("report.pdf")
+        );
+        let h = make_headers_with_cd("attachment; filename = \"a.zip\"");
+        assert_eq!(
+            extract_from_content_disposition(&h).as_deref(),
+            Some("a.zip")
+        );
+        let h = make_headers_with_cd("attachment; FILENAME*=UTF-8''My%20File.pdf");
+        assert_eq!(
+            extract_from_content_disposition(&h).as_deref(),
+            Some("My File.pdf")
+        );
+    }
+
+    #[test]
+    fn extract_from_content_disposition_semicolon_inside_quotes() {
+        let h = make_headers_with_cd("attachment; filename=\"a;b.zip\"; size=10");
+        assert_eq!(
+            extract_from_content_disposition(&h).as_deref(),
+            Some("a;b.zip")
         );
     }
 
@@ -6743,5 +6986,184 @@ mod tests {
         assert_eq!(result, "Movie (1).mkv");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+}
+
+/// 单流续传对异常 Range 响应的处置（本地 HTTP 服务驱动 `download_single`）。
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod single_resume_tests {
+    use super::{DownloadError, RequestSpec, download_single};
+    use crate::db::Db;
+    use crate::events::{EngineEvent, EventSink};
+    use crate::speed_limiter::SpeedLimiter;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    struct NoopSink;
+    impl EventSink for NoopSink {
+        fn emit(&self, _event: EngineEvent) {}
+    }
+
+    const MIB: usize = 1024 * 1024;
+
+    fn data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn response(status: &str, extra: &str, body: &[u8]) -> Vec<u8> {
+        let mut out = format!(
+            "HTTP/1.1 {status}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// 每个连接读一个请求，由 `handler(range_start)` 给出完整原始响应。
+    async fn spawn_http(handler: impl Fn(Option<usize>) -> Vec<u8> + Send + Sync + 'static) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = stream.read(&mut tmp).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                    }
+                    let text = String::from_utf8_lossy(&buf).to_lowercase();
+                    let range_start = text
+                        .lines()
+                        .find_map(|l| l.strip_prefix("range: bytes="))
+                        .and_then(|r| r.split('-').next())
+                        .and_then(|n| n.trim().parse::<usize>().ok());
+                    let _ = stream.write_all(&handler(range_start)).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        port
+    }
+
+    /// 预置 `partial` 字节的临时文件后对 `total` 字节目标发起续传。
+    async fn resume(
+        port: u16,
+        partial: &[u8],
+        total: i64,
+        is_resume: bool,
+    ) -> (Result<(), DownloadError>, Vec<u8>) {
+        let dir = std::env::temp_dir().join(format!("fluxdown_single_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir).await.unwrap();
+        let dest = dir.join("f.bin.fdownloading");
+        std::fs::write(&dest, partial).unwrap();
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::channel(1024);
+        let spec = RequestSpec {
+            method: reqwest::Method::GET,
+            cookies: String::new(),
+            referrer: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            body: None,
+        };
+        let res = download_single(
+            "t1",
+            &format!("http://127.0.0.1:{port}/f.bin"),
+            &dest,
+            total,
+            true,
+            &client,
+            &db,
+            &NoopSink,
+            &tx,
+            &CancellationToken::new(),
+            &SpeedLimiter::new(0),
+            &spec,
+            "f.bin",
+            "",
+            "",
+            is_resume,
+        )
+        .await
+        .map(|_| ());
+        let on_disk = std::fs::read(&dest).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        (res, on_disk)
+    }
+
+    #[tokio::test]
+    async fn resume_206_without_content_range_refetches_whole_file() {
+        let full = Arc::new(data(2 * MIB + 100));
+        let served = full.clone();
+        let port = spawn_http(move |range| match range {
+            // 按范围返回尾段却漏掉 Content-Range 的服务器。
+            Some(start) => response("206 Partial Content", "", &served[start..]),
+            None => response("200 OK", "", &served),
+        })
+        .await;
+        let (res, on_disk) = resume(port, &full[..MIB + MIB / 2], full.len() as i64, true).await;
+        res.unwrap();
+        assert_eq!(on_disk, *full);
+    }
+
+    #[tokio::test]
+    async fn resume_206_with_different_total_refetches_whole_file() {
+        // 服务器文件比记录的总大小小：Content-Range 分母不一致时不得沿用旧前缀。
+        let new_full = Arc::new(data(MIB + MIB / 2 + 7));
+        let old_total = 3 * MIB;
+        let served = new_full.clone();
+        let port = spawn_http(move |range| match range {
+            Some(start) => {
+                let cr = format!(
+                    "Content-Range: bytes {start}-{}/{}\r\n",
+                    served.len() - 1,
+                    served.len()
+                );
+                response("206 Partial Content", &cr, &served[start..])
+            }
+            None => response("200 OK", "", &served),
+        })
+        .await;
+        let old_prefix = data(old_total);
+        let (res, on_disk) =
+            resume(port, &old_prefix[..MIB + MIB / 4], old_total as i64, true).await;
+        res.unwrap();
+        assert_eq!(on_disk, *new_full);
+    }
+
+    #[tokio::test]
+    async fn resume_answered_by_mismatched_200_keeps_partial_data() {
+        let full = data(2 * MIB);
+        let port = spawn_http(|_| {
+            response(
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                b"{\"code\":403}",
+            )
+        })
+        .await;
+        let partial = &full[..MIB + 10];
+        let (res, on_disk) = resume(port, partial, full.len() as i64, true).await;
+        assert!(res.is_err());
+        assert_eq!(on_disk, partial);
+    }
+
+    #[tokio::test]
+    async fn resume_with_complete_temp_file_skips_download() {
+        // 端口上没有服务：任何网络请求都会失败。
+        let full = data(MIB + 3);
+        let (res, on_disk) = resume(1, &full, full.len() as i64, true).await;
+        res.unwrap();
+        assert_eq!(on_disk, full);
     }
 }

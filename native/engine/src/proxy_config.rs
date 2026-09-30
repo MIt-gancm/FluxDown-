@@ -389,6 +389,51 @@ impl ProxyConfig {
 // System proxy detection (Windows)
 // ---------------------------------------------------------------------------
 
+/// 把用户/系统写的绕过列表归一化为 `reqwest::NoProxy` 能识别的写法。
+///
+/// `NoProxy` 只支持精确域名、`.suffix` 后缀、精确 IP 与 CIDR；Windows
+/// `ProxyOverride` 和用户手填常见的 `*.corp.com`、`192.168.*`、`<local>`
+/// 不在其内，直接传入会静默失效。分隔符 `;` 统一为 `,`。
+/// `<local>`（不含点的主机名直连）无法用 `NoProxy` 表达，按环回 + 私网段
+/// 近似。幂等。
+pub fn normalize_no_proxy(list: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for raw in list.split([',', ';']) {
+        let entry = raw.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if entry.eq_ignore_ascii_case("<local>") {
+            for e in [
+                "localhost",
+                "127.0.0.0/8",
+                "::1",
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16",
+            ] {
+                out.push(e.to_string());
+            }
+            continue;
+        }
+        if let Some(rest) = entry.strip_prefix("*.") {
+            out.push(format!(".{rest}"));
+            continue;
+        }
+        if let Some(prefix) = entry.strip_suffix(".*") {
+            let octets: Vec<&str> = prefix.split('.').collect();
+            if (1..=3).contains(&octets.len()) && octets.iter().all(|o| o.parse::<u8>().is_ok()) {
+                let mut full = octets.clone();
+                full.resize(4, "0");
+                out.push(format!("{}/{}", full.join("."), octets.len() * 8));
+                continue;
+            }
+        }
+        out.push(entry.to_string());
+    }
+    out.join(",")
+}
+
 /// Detect the system-level proxy from Windows registry.
 ///
 /// Reads `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`:
@@ -423,8 +468,7 @@ pub fn detect_system_proxy() -> Result<Option<ProxyConfig>, DownloadError> {
 
     // Read bypass list (optional)
     let bypass: String = inet.get_value("ProxyOverride").unwrap_or_default();
-    // Convert semicolons to commas for our internal format
-    let no_proxy = bypass.replace(';', ",").replace("<local>", "localhost");
+    let no_proxy = normalize_no_proxy(&bypass);
 
     // Parse the ProxyServer value
     let (proxy_type, host, port) = parse_windows_proxy_server(&server);
@@ -1635,6 +1679,19 @@ pub async fn test_proxy_connection(
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    #[test]
+    fn normalize_no_proxy_rewrites_wildcards_for_reqwest() {
+        use super::normalize_no_proxy;
+        assert_eq!(
+            normalize_no_proxy("localhost;127.*;172.16.*;192.168.1.*;*.corp.com;10.0.0.5"),
+            "localhost,127.0.0.0/8,172.16.0.0/16,192.168.1.0/24,.corp.com,10.0.0.5"
+        );
+        let local = normalize_no_proxy("<local>");
+        assert!(local.contains("localhost") && local.contains("192.168.0.0/16"));
+        // 幂等：已归一化的列表再次归一化不变。
+        assert_eq!(normalize_no_proxy(&local), local);
+    }
+
     use super::{
         ProxyConfig, ProxyMode, ProxyType, base64_encode, is_proxy_tls_handshake_failure,
         parse_connect_status_line, parse_env_proxy_url, parse_host_port,

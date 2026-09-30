@@ -101,7 +101,9 @@ async fn explicit_credentials_are_injected_saved_and_auto_applied() {
         .expect("get config")
         .expect("store persisted");
     let store = site_auth::parse_store(&store_json);
-    let cred = store.get("nas.example:8443").expect("site key saved");
+    let cred = store
+        .get("http://nas.example:8443")
+        .expect("site key saved");
     assert_eq!(cred.user, "alice");
     assert_eq!(cred.pass, "secret");
 

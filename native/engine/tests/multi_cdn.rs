@@ -269,6 +269,17 @@ async fn run_with_pool(
     (res, dest)
 }
 
+/// macOS 等平台默认只有 127.0.0.1 环回别名；目标地址绑不上时跳过用例。
+async fn can_bind_all(ips: &[IpAddr]) -> bool {
+    for ip in ips {
+        if TcpListener::bind((*ip, 0)).await.is_err() {
+            eprintln!("skip: cannot bind loopback alias {ip}");
+            return false;
+        }
+    }
+    true
+}
+
 /// 分流 + 故障切换：三 IP 服务同一文件；等 `.2` 真正服务到 range GET 后
 /// kill 它 → 任务仍完成、文件逐字节一致、且分片至少落在 2 个 IP 上。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -277,6 +288,9 @@ async fn multi_cdn_distributes_and_survives_node_kill() {
     let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
     let ip3 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3));
+    if !can_bind_all(&[ip2, ip3]).await {
+        return;
+    }
 
     // 先在 127.0.0.1:0 拿随机端口，再把 .2/.3 绑到同一端口。
     let probe = TcpListener::bind((ip1, 0)).await.expect("bind :0");
@@ -344,6 +358,9 @@ async fn multi_cdn_dead_candidate_never_fails_task() {
     let body = Arc::new(gen_body(2 * 1024 * 1024, 0xBEEF));
     let ip1 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
     let ip2 = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2));
+    if !can_bind_all(&[ip2]).await {
+        return;
+    }
     let dead = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 3)); // 不启动服务器
 
     let probe = TcpListener::bind((ip1, 0)).await.expect("bind :0");

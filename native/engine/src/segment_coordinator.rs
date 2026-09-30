@@ -1748,6 +1748,7 @@ pub async fn run_coordinated_download(
     // ----- 2. Pre-allocate file to full size --------------------------------
     // 平台策略（fallocate / SetFileInformationByHandle / set_len 回退）见
     // preallocate_file_len——就地扩容（TrueSizeLarger）复用同一助手延长文件。
+    truncate_stale_tail(dest, effective_total_bytes as u64).await?;
     preallocate_file_len(dest, effective_total_bytes as u64).await?;
 
     // ----- 3. Shared state for progress reporting ---------------------------
@@ -3542,6 +3543,21 @@ pub async fn run_coordinated_download(
     Ok(effective_total_bytes)
 }
 
+/// 启动时把比目标更长的旧临时文件截短。总大小缩小后分段按新总量重建，
+/// [新总量, 旧总量) 留着上一版本的数据或预分配的零，成品会带陈旧尾部。
+/// 仅用于 worker 启动之前：此时没有并发写；就地扩容只会变大，不走这里。
+async fn truncate_stale_tail(dest: &Path, target_len: u64) -> Result<(), DownloadError> {
+    let file = match OpenOptions::new().write(true).open(dest).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if file.metadata().await?.len() > target_len {
+        file.set_len(target_len).await?;
+    }
+    Ok(())
+}
+
 /// 把 `dest` 预分配/扩容到至少 `target_len` 字节（逻辑 EOF + 尽量物理分配）。
 /// 已 `>= target_len` 时为 no-op。两处使用：
 ///   1. 下载启动时的整文件预分配（coordinator 第 2 步）；
@@ -4464,6 +4480,7 @@ fn spawn_worker(
                 } else {
                     MAX_RETRIES
                 },
+                !lease.is_attributable(),
                 lease.client(),
                 &seg_cancel,
                 &conn_sensitive,
@@ -4514,7 +4531,6 @@ fn spawn_worker(
                 Err(e) => nodes.report(&lease, 0, seg_started.elapsed(), Err(e)),
             }
             let lease_attributable = lease.is_attributable();
-            let lease_alternate = lease.is_alternate_path();
             let lease_desc = lease.describe();
             drop(lease);
 
@@ -4555,8 +4571,11 @@ fn spawn_worker(
                     // 为任务失败）。备选路径（代理）另把 Range 失效/错位归因到
                     // 路径本身——代理改写响应不能被误学成源站不支持 Range 并触发
                     // 清盘回退。SYS 租约的错误保持原样——语义与单路径完全一致。
+                    // 钉定节点与备选路径同样把 Range 失效/错位归因到节点/路径本身：
+                    // 一个坏边缘节点或改写响应的代理不能被学成源站不支持 Range，
+                    // 更不能触发清盘回退。
                     let attributable = crate::cdn::is_node_attributable(&e)
-                        || (lease_alternate
+                        || (lease_attributable
                             && matches!(
                                 e,
                                 DownloadError::RangeNotSupported(_)
@@ -4567,7 +4586,9 @@ fn spawn_worker(
                     // 接手，而不是整个任务失败。HTTP 状态/校验类错误保持原语义
                     // （源站拒绝学习、清盘回退）。
                     let sys_transport_fallback = !lease_attributable
-                        && crate::auto_proxy::is_route_transport_error(&format!("{e:#}"))
+                        && crate::auto_proxy::is_route_transport_error(
+                            &crate::downloader::download_error_chain_text(&e),
+                        )
                         && nodes.try_sys_transport_fallback();
                     let e = if (lease_attributable && attributable) || sys_transport_fallback {
                         log_info!(
@@ -4606,6 +4627,11 @@ fn spawn_worker(
 // Segment download with retry
 // ---------------------------------------------------------------------------
 
+/// 等待响应头的上限（只覆盖发出请求到收到响应头，不限制 body 速度）。
+const RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// 吸收合并后的唯一生命线（重连必被拒）：响应头等待更宽容。
+const RESPONSE_HEADER_TIMEOUT_HOSTILE: Duration = Duration::from_secs(90);
+
 /// HTTP 400 Bad Request 判定。
 ///
 /// 配额型下载端点（fnOS `multiple-download?token=`：一个 token 只允许固定次数
@@ -4636,6 +4662,7 @@ async fn do_segment_with_retry(
     // 段内瞬时错误重试预算：SYS 租约 = MAX_RETRIES，钉定租约 =
     // PINNED_NODE_MAX_RETRIES（快速上抛交给节点池切换）。
     max_retries: u32,
+    sys_lease: bool,
     client: &Client,
     cancel: &CancellationToken,
     conn_sensitive: &AtomicBool,
@@ -4673,6 +4700,7 @@ async fn do_segment_with_retry(
             seg_end,
             open_ended,
             no_range,
+            sys_lease,
             client,
             cancel,
             conn_sensitive,
@@ -4831,6 +4859,9 @@ async fn do_segment(
     // hint 模式（Range 未经验证）的首连接：不带 Range/If-Range 的 plain GET，
     // 仅在 actual_start == 0 时生效（重试推进起点后自然回到带 Range 路径）。
     no_range: bool,
+    // 当前租约是否 SYS 槽位。钉定节点 / 备选路径上的非 206 与压缩响应是该节点
+    // 自身的问题，不得学习成任务级 conn_sensitive 或 24h 域名单连接缓存。
+    sys_lease: bool,
     client: &Client,
     cancel: &CancellationToken,
     conn_sensitive: &AtomicBool,
@@ -4883,12 +4914,25 @@ async fn do_segment(
     if !plain_first {
         req = req.header("Range", &range);
     }
-    // 等响应头与 cancel 竞速：惩罚型/停滞服务器可能接受 TCP 连接后长时间不回
-    // 响应头（client 只有 connect_timeout，响应头无超时），若不竞速，删除/取消
-    // 任务会被卡在这里直到服务器开口。
+    // 等响应头与 cancel、头超时竞速：惩罚型/停滞服务器可能接受 TCP 连接后长时间
+    // 不回响应头（client 只有 connect_timeout，响应头无超时），不竞速则删除/取消
+    // 被卡住、尾段一条沉默连接拖住整个任务。超时只覆盖等头阶段，不限制 body 速度。
+    let header_timeout = if reconnect_hostile.load(Ordering::Relaxed) {
+        RESPONSE_HEADER_TIMEOUT_HOSTILE
+    } else {
+        RESPONSE_HEADER_TIMEOUT
+    };
     let resp = tokio::select! {
         _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
-        r = req.send() => r?,
+        r = tokio::time::timeout(header_timeout, req.send()) => match r {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(DownloadError::Other(format!(
+                    "segment {seg_idx} stalled: no response headers received within {}s",
+                    header_timeout.as_secs()
+                )));
+            }
+        },
     };
     let resp = resp.error_for_status()?;
 
@@ -4973,7 +5017,7 @@ async fn do_segment(
             // 代理云盘在连接压力下偶发全量响应。置位后 coordinator 衰减【主动拆分】以降低连接
             // churn，减少后续瞬时 200 的发生（保留 reactive 拆分做尾段抢救）。一次性 latch，
             // 仅首次置位打日志。
-            if !conn_sensitive.swap(true, Ordering::Relaxed) {
+            if sys_lease && !conn_sensitive.swap(true, Ordering::Relaxed) {
                 log_info!(
                     "[coordinator] task {} 检测到连接敏感（服务器对 Range 请求返回 {}），\
                  停止主动拆分以降低连接 churn",
@@ -4983,7 +5027,7 @@ async fn do_segment(
             }
             // 历史或本轮任一成功 Range 都证明该主机具备 Range 能力；偶发 200
             // 不能把整个域名标记成单连接。
-            if total_downloaded.load(Ordering::Relaxed) == 0 {
+            if sys_lease && total_downloaded.load(Ordering::Relaxed) == 0 {
                 record_single_conn_domain_persist(url, db);
             }
             return Err(DownloadError::RangeNotSupported(resp.status().to_string()));
@@ -5071,7 +5115,9 @@ async fn do_segment(
             cr_start,
             Some(actual_start),
         ) {
-            return Err(DownloadError::Other(format!(
+            // VersionChanged 而非 Other：与非 206 路径一致，do_segment_with_retry
+            // 立即短路（不退避重试），并走 Path B 清盘重下新版本。
+            return Err(DownloadError::VersionChanged(format!(
                 "segment {seg_idx}: validator mismatch — probe etag=\"{expected_etag}\" \
                  lm=\"{expected_last_modified}\", segment etag=\"{resp_etag_str}\" \
                  lm=\"{resp_lm_str}\". The file may have changed on the server during download."
@@ -5113,21 +5159,46 @@ async fn do_segment(
         if let Err((base_etag, base_lm)) =
             check_cross_segment_validators(first_validators, resp_etag, resp_lm)
         {
-            log_info!(
-                "[coordinator] task {} seg {} 跨段 validator 漂移（基线 etag=\"{}\" lm=\"{}\"，\
-                 本段 etag=\"{}\" lm=\"{}\"）——文件在下载中被替换，回退重下",
-                task_id,
-                seg_idx,
-                base_etag,
-                base_lm,
-                resp_etag,
-                resp_lm
+            // 与 probe 路径同一判据：仅 Last-Modified 不同、而 Content-Range 总大小
+            // 与起点均一致时是多 edge CDN 的时钟/格式差异，不是版本变化；ETag 双方
+            // 非空且不同仍致命。
+            let etag_mismatch =
+                !base_etag.is_empty() && !resp_etag.is_empty() && base_etag != resp_etag;
+            let lm_mismatch = !base_lm.is_empty() && !resp_lm.is_empty() && base_lm != resp_lm;
+            let fatal = crate::downloader::validator_mismatch_is_fatal(
+                etag_mismatch,
+                lm_mismatch,
+                crate::downloader::parse_content_range_total(resp.headers()),
+                planned_total.load(Ordering::Relaxed),
+                cr_start,
+                Some(actual_start),
             );
-            return Err(DownloadError::VersionChanged(format!(
-                "segment {seg_idx}: validators drifted across segment responses \
-                 (baseline etag=\"{base_etag}\" lm=\"{base_lm}\", \
-                 got etag=\"{resp_etag}\" lm=\"{resp_lm}\")"
-            )));
+            if !fatal {
+                log_warn!(
+                    "[coordinator] task {} seg {} 跨段 Last-Modified 不同（基线=\"{}\" 本段=\"{}\"）\
+                     但 Content-Range 总大小与起点一致，判定为 CDN edge 时钟/格式差异，继续",
+                    task_id,
+                    seg_idx,
+                    base_lm,
+                    resp_lm
+                );
+            } else {
+                log_info!(
+                    "[coordinator] task {} seg {} 跨段 validator 漂移（基线 etag=\"{}\" lm=\"{}\"，\
+                     本段 etag=\"{}\" lm=\"{}\"）——文件在下载中被替换，回退重下",
+                    task_id,
+                    seg_idx,
+                    base_etag,
+                    base_lm,
+                    resp_etag,
+                    resp_lm
+                );
+                return Err(DownloadError::VersionChanged(format!(
+                    "segment {seg_idx}: validators drifted across segment responses \
+                     (baseline etag=\"{base_etag}\" lm=\"{base_lm}\", \
+                     got etag=\"{resp_etag}\" lm=\"{resp_lm}\")"
+                )));
+            }
         }
 
         // hint 模式无 probe 基线：`tasks.orig_etag`/`orig_last_modified` 仍是空串。
@@ -5218,7 +5289,9 @@ async fn do_segment(
     if let Some(enc) = crate::downloader::detect_content_encoding(resp.headers()) {
         // Record the domain so that the retry (or any future task for this
         // host) automatically uses single-stream mode.
-        record_single_conn_domain_persist(url, db);
+        if sys_lease {
+            record_single_conn_domain_persist(url, db);
+        }
         return Err(DownloadError::Other(format!(
             "segment {}: server returned Content-Encoding ({:?}) on a Range response. \
              Compressed byte ranges cannot be assembled into a valid file. \
@@ -5229,7 +5302,9 @@ async fn do_segment(
     // 未知但存在的 Content-Encoding（如 compress）：detect 返回 None 会被当 identity
     // 原样拼接 → 损坏。同样回退单流（BUG-HTTP-UNKNOWN-ENCODING-RAW 的多段对应面）。
     if let Some(unknown) = crate::downloader::unsupported_content_encoding(resp.headers()) {
-        record_single_conn_domain_persist(url, db);
+        if sys_lease {
+            record_single_conn_domain_persist(url, db);
+        }
         return Err(DownloadError::Other(format!(
             "segment {seg_idx}: server returned unsupported Content-Encoding '{unknown}' on a \
              Range response; cannot assemble byte ranges. Please retry in single-stream mode."
@@ -5366,10 +5441,29 @@ async fn do_segment(
                         let write_slice = &bytes[..write_len];
 
                         // --- Speed limiter: write in sub-chunks as tokens allow ---
+                        // 令牌等待与取消竞速：低限速 + 多 worker 时一个 chunk 要等
+                        // 数秒，暂停/删除不能被挡在 select 分支体外。
                         let mut offset = 0usize;
                         while offset < write_len {
                             let remaining = (write_len - offset) as u64;
-                            let allowed = speed_limiter.consume(remaining).await;
+                            let allowed = tokio::select! {
+                                _ = cancel.cancelled() => {
+                                    // 已写入的子块计入进度，与上方取消分支的落库一致。
+                                    let written = offset as i64;
+                                    seg_downloaded += written;
+                                    total_downloaded.fetch_add(written, Ordering::Relaxed);
+                                    file.flush().await?;
+                                    let _ = file.get_ref().sync_data().await;
+                                    update_seg_state(seg_states, seg_idx, seg_downloaded);
+                                    let _ = db
+                                        .update_segment_progress_bounded(
+                                            task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
+                                        )
+                                        .await;
+                                    return Err(DownloadError::Cancelled);
+                                }
+                                allowed = speed_limiter.consume(remaining) => allowed,
+                            };
                             let end = offset + allowed as usize;
                             file.write_all(&write_slice[offset..end]).await?;
                             offset = end;

@@ -5,7 +5,8 @@
 //! 请求上下文持久化链路（`tasks.extra_headers` 列），resume / meta probe /
 //! HLS / DASH 全路径自动携带，无需新增表或字段。
 //!
-//! 勾选「为此网站保存」时，凭据按站点键（`host` 或 `host:port`）存入
+//! 勾选「为此网站保存」时，凭据按站点键（`scheme://host` 或 `scheme://host:port`，
+//! 旧版无 scheme 的存量键读取时视作 https）存入
 //! config 表单键 [`SITE_AUTH_CONFIG_KEY`]（JSON map）。后续对同一站点建任务
 //! 且未显式提供凭据、extra_headers 中也没有 Authorization 时，自动套用已保存
 //! 凭据。该键**不进云同步目录**（凭据属设备本地敏感数据）。
@@ -33,17 +34,19 @@ pub struct SiteCredential {
 }
 
 /// 从 URL 提取站点键：仅 http/https 返回 `Some`。
-/// 形如 `host`（默认端口）或 `host:port`（非默认端口）；host 已由 Url
-/// 规范化为小写。
+/// 形如 `{scheme}://host` 或 `{scheme}://host:port`（默认端口不入键）；host
+/// 已由 Url 规范化为小写。键含 scheme，与插件 `auth::site_key` 一致：
+/// https 下保存的凭据绝不隐式套用到同 host 的 http 任务（明文外泄）。
 pub fn site_key(url: &str) -> Option<String> {
     let parsed = reqwest::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "http" | "https") {
         return None;
     }
     let host = parsed.host_str()?;
     match parsed.port() {
-        Some(port) => Some(format!("{host}:{port}")),
-        None => Some(host.to_string()),
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
     }
 }
 
@@ -58,11 +61,28 @@ pub fn basic_auth_value(user: &str, pass: &str) -> String {
 }
 
 /// 反序列化站点凭据 map。空串 / 非法 JSON → 空 map（凭据缓存损坏不阻断建任务）。
+///
+/// 旧版本存的键不含 scheme（`host` / `host:port`）：统一视作 https 补全为
+/// `https://…`，已存凭据不会消失，也不会再被注入到 http 任务。新旧键同时
+/// 存在时以新键为准。
 pub fn parse_store(json: &str) -> BTreeMap<String, SiteCredential> {
     if json.trim().is_empty() {
         return BTreeMap::new();
     }
-    serde_json::from_str(json).unwrap_or_default()
+    let raw: BTreeMap<String, SiteCredential> = serde_json::from_str(json).unwrap_or_default();
+    let mut store = BTreeMap::new();
+    let mut legacy = Vec::new();
+    for (key, cred) in raw {
+        if key.contains("://") {
+            store.insert(key, cred);
+        } else {
+            legacy.push((key, cred));
+        }
+    }
+    for (key, cred) in legacy {
+        store.entry(format!("https://{key}")).or_insert(cred);
+    }
+    store
 }
 
 /// 序列化站点凭据 map（BTreeMap 保证输出稳定，便于 diff / 测试）。
@@ -90,23 +110,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn site_key_extracts_host_and_nondefault_port() {
+    fn site_key_includes_scheme_and_nondefault_port() {
         assert_eq!(
             site_key("https://Example.COM/file.zip"),
-            Some("example.com".to_string())
+            Some("https://example.com".to_string())
         );
         assert_eq!(
             site_key("http://nas.local:8443/d/f.bin"),
-            Some("nas.local:8443".to_string())
+            Some("http://nas.local:8443".to_string())
         );
         // 默认端口不入键：https://h:443 与 https://h 视为同一站点。
         assert_eq!(
             site_key("https://example.com:443/a"),
-            Some("example.com".to_string())
+            Some("https://example.com".to_string())
+        );
+        // 同 host 不同 scheme 是不同站点：https 凭据不得命中 http。
+        assert_ne!(
+            site_key("https://example.com/a"),
+            site_key("http://example.com/a")
         );
         assert_eq!(site_key("ftp://example.com/f"), None);
         assert_eq!(site_key("magnet:?xt=urn:btih:abc"), None);
         assert_eq!(site_key("not a url"), None);
+    }
+
+    #[test]
+    fn parse_store_migrates_legacy_keys_to_https() {
+        let json = r#"{"example.com":{"user":"old","pass":"p"},
+            "nas:8443":{"user":"n","pass":"q"},
+            "https://example.com":{"user":"new","pass":"p"},
+            "http://plain.test":{"user":"h","pass":"x"}}"#;
+        let store = parse_store(json);
+        assert_eq!(store["https://example.com"].user, "new");
+        assert_eq!(store["https://nas:8443"].user, "n");
+        assert_eq!(store["http://plain.test"].user, "h");
+        assert!(!store.contains_key("http://example.com"));
+        assert_eq!(store.len(), 3);
     }
 
     #[test]
@@ -122,7 +161,7 @@ mod tests {
     fn store_roundtrip_and_corrupt_input() {
         let mut store = BTreeMap::new();
         store.insert(
-            "example.com".to_string(),
+            "https://example.com".to_string(),
             SiteCredential {
                 user: "u".to_string(),
                 pass: "p".to_string(),

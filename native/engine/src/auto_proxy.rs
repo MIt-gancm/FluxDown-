@@ -229,10 +229,29 @@ pub struct AutoProxyCtx {
 // failover 支路（manager 侧调用）
 // ---------------------------------------------------------------------------
 
+/// 去掉 reqwest 错误文本里的 `for url (…)`：URL 里恰好含 `eof` / `dns` /
+/// `timeout` 之类子串时，永久性 HTTP 错误（404/403）不应被当成传输错误。
+fn strip_url_context(lower: &str) -> String {
+    let mut out = String::with_capacity(lower.len());
+    let mut rest = lower;
+    while let Some(pos) = rest.find("for url (") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + "for url (".len()..];
+        // URL 不含空白；其后的 `)` 及错误链从第一个空白起继续保留。
+        rest = match after.find(char::is_whitespace) {
+            Some(i) => &after[i..],
+            None => "",
+        };
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 路由切换可能修复的传输层错误。覆盖建连失败与 body 中途断流；HTTP
 /// 状态、校验失败等永久错误不应靠换链路重试。
 pub fn is_route_transport_error(msg: &str) -> bool {
-    let lower = msg.to_lowercase();
+    let lower = strip_url_context(&msg.to_lowercase());
+    let lower = lower.as_str();
     lower.contains("connection refused")
         || lower.contains("connection reset")
         || lower.contains("timed out")
@@ -355,5 +374,12 @@ mod tests {
         assert!(is_route_transport_error("error decoding response body"));
         assert!(!is_route_transport_error("HTTP 404 Not Found"));
         assert!(!is_route_transport_error("checksum mismatch"));
+        // URL 里的 eof/dns/timeout 子串不是传输错误证据。
+        assert!(!is_route_transport_error(
+            "HTTP status client error (404 Not Found) for url (https://dl.example/eof/dns-timeout.bin)"
+        ));
+        assert!(is_route_transport_error(
+            "error sending request for url (https://dl.example/a.bin): connection refused"
+        ));
     }
 }
