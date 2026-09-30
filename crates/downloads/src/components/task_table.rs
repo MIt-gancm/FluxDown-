@@ -2753,6 +2753,7 @@ pub(crate) fn render_download_table(
         .on_mouse_move(note_pointer::<MouseMoveEvent>(table_state))
         .on_scroll_wheel(note_pointer::<ScrollWheelEvent>(table_state))
         .capture_any_mouse_down(note_pointer::<MouseDownEvent>(table_state))
+        .capture_any_mouse_down(clear_context_row_on_left_press(table_state))
         .child(
             div().absolute().inset_0().child(
                 DataTable::new(table_state)
@@ -2790,6 +2791,32 @@ fn note_pointer<E: 'static>(
     let table_state = table_state.clone();
     move |_, _, cx| {
         table_state.update(cx, |table, _| table.delegate_mut().note_pointer_activity());
+    }
+}
+
+/// 表格内左键按下即清除右键高亮行。
+///
+/// 两张表都 `row_selectable(false)`，选择由委托自管，DataTable 内置的「左键点行清除
+/// `right_clicked_row`」分支因此不会执行；它自带的 `on_mouse_down_out` 又只管表格外的
+/// 点击。不补这一步，右键过的行边框会一直残留（改选别的任务也不消失），
+/// [`arm_reorder_timer`] 也会把它当作菜单仍开着而无限顺延重排。
+///
+/// 捕获阶段注册：勾选框 / 行内按钮在冒泡阶段 `stop_propagation` 也拦不住。只认左键，
+/// 右键另一行由 DataTable 自己改写高亮；菜单浮层 `occlude`，点菜单项不会走到这里，
+/// 而菜单是右键当帧 `window.defer` 构建的，此时清除不影响菜单内容。
+fn clear_context_row_on_left_press(
+    table_state: &Entity<TableState<DownloadTableDelegate>>,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    let table_state = table_state.clone();
+    move |event, _, cx| {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        table_state.update(cx, |table, cx| {
+            if table.right_clicked_row().is_some() {
+                table.set_right_clicked_row(None, cx);
+            }
+        });
     }
 }
 
