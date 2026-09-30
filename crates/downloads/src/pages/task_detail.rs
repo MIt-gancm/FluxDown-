@@ -943,9 +943,12 @@ impl TaskDetailView {
                 |this| {
                     this.child(detail_row(
                         self.t(cx, "infoStatus"),
-                        div()
-                            .text_color(task_status_color(&row, cx))
-                            .child(self.strings.task_state_label(&row)),
+                        div().text_color(task_status_color(&row, cx)).child(
+                            self.strings
+                                .queued_label(&row)
+                                .map(SharedString::from)
+                                .unwrap_or_else(|| self.strings.task_state_label(&row)),
+                        ),
                         cx,
                     ))
                     .when(row.size_bytes > 0, |this| {

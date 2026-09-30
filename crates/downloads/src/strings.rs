@@ -39,6 +39,7 @@ pub(crate) struct DownloadStrings {
     pub(crate) disconnected: SharedString,
     pub(crate) action_failed: SharedString,
     pub(crate) metadata_loading: SharedString,
+    subtitle_queued: SharedString,
     eta_seconds: SharedString,
     eta_minutes: SharedString,
     eta_hours: SharedString,
@@ -142,6 +143,7 @@ impl DownloadStrings {
             disconnected: shared(translator.text("localServiceDisconnected")),
             action_failed: shared(translator.text("localServiceActionFailed")),
             metadata_loading: shared(translator.text("statusPreparing")),
+            subtitle_queued: shared(translator.text("subtitleQueued")),
             eta_seconds: shared(translator.text("etaSeconds")),
             eta_minutes: shared(translator.text("etaMinutes")),
             eta_hours: shared(translator.text("etaHours")),
@@ -275,9 +277,22 @@ impl DownloadStrings {
     pub(crate) fn task_state_label(&self, task: &crate::model::DownloadTaskView) -> SharedString {
         if task.is_file_missing() {
             self.status_file_missing.clone()
+        } else if task.state == crate::model::TaskState::Pending && task.preparing {
+            self.metadata_loading.clone()
         } else {
             self.state_label(task.state)
         }
+    }
+
+    /// 排队中（引擎待启动队列内、非准备中）的「排队 #n」；其余任务为 `None`。
+    pub(crate) fn queued_label(&self, task: &crate::model::DownloadTaskView) -> Option<String> {
+        (task.state == crate::model::TaskState::Pending
+            && !task.preparing
+            && task.queue_position > 0)
+            .then(|| {
+                self.subtitle_queued
+                    .replace("{pos}", &task.queue_position.to_string())
+            })
     }
 
     pub(crate) fn date_bucket_label(

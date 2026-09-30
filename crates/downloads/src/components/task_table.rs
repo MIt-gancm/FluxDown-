@@ -1293,7 +1293,8 @@ impl DownloadTableDelegate {
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned),
-            TaskState::Pending | TaskState::Completed => None,
+            TaskState::Pending => self.strings.queued_label(task),
+            TaskState::Completed => None,
         }
     }
 
