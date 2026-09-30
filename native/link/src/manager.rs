@@ -59,6 +59,8 @@ pub enum LinkEngineEvent {
     },
     /// 子系统错误（供 UI 提示）。
     Error(String),
+    /// 发起方放弃/拒绝了一次入站配对：响应方会话已移除，宿主应关闭对应的待确认请求。
+    IncomingCancelled { session_id: String },
 }
 
 /// 响应方处理一次入站 `confirm` 的终局。四种都是协议的正常结果，**不是错误**——
@@ -196,6 +198,10 @@ pub struct LinkManager {
     /// 去重更新；`start_discovery` 调用时清空；`probe` 的结果不入此快照。
     /// `Arc` 包裹以便转发任务（`tokio::spawn` 的 `'static` 闭包）持有写句柄。
     discovered: Arc<Mutex<Vec<DiscoveredPeer>>>,
+    /// mDNS 广播给出、尚未经认证链路验证的回连候选（指纹 → 候选）。仅存内存，
+    /// 只在拨号时排在已验证候选之后；认证请求经它成功后才由
+    /// [`Self::promote_hinted`] 写入名册。每个已配对指纹至多一条，天然有界。
+    hinted: Arc<Mutex<HashMap<String, PeerCandidate>>>,
 }
 
 impl LinkManager {
@@ -224,6 +230,7 @@ impl LinkManager {
             pending: Mutex::new(HashMap::new()),
             seen_nonces: Mutex::new(Vec::new()),
             discovered: Arc::new(Mutex::new(Vec::new())),
+            hinted: Arc::new(Mutex::new(HashMap::new())),
         });
         Self::spawn_gc(&mgr);
         Ok(mgr)
@@ -351,7 +358,16 @@ impl LinkManager {
                 Ok(PairConfirmOutcome::Paired)
             }
             // 发起方自己传了 confirm=false —— 它当然知道自己拒绝了，无需额外语义。
-            Ok(None) => Ok(PairConfirmOutcome::Declined),
+            Ok(None) => {
+                // 发起方放弃/拒绝：响应方会话已被删除，通知宿主关闭待确认弹窗。
+                let _ = self
+                    .events
+                    .send(LinkEngineEvent::IncomingCancelled {
+                        session_id: session_id.to_string(),
+                    })
+                    .await;
+                Ok(PairConfirmOutcome::Declined)
+            }
             Err(LinkError::RejectedByPeer) => Ok(PairConfirmOutcome::Rejected),
             Err(LinkError::PairingTimeout) => Ok(PairConfirmOutcome::TimedOut),
             Err(e) => Err(e),
@@ -452,6 +468,7 @@ impl LinkManager {
         }
         let (tx, mut rx) = mpsc::channel::<DiscoveredPeer>(64);
         let out = self.events.clone();
+        let hinted = Arc::clone(&self.hinted);
         let self_fp = self.identity.fingerprint().to_string();
         let discovered = Arc::clone(&self.discovered);
         let store = self.store.clone();
@@ -474,25 +491,14 @@ impl LinkManager {
                         kind: TransportKind::Direct,
                         address: address.to_candidate(),
                     };
-                    // 保留旧候选作回退，只把新地址去重后放到首位（优先试
-                    // 新的，试不通还有旧的）——mDNS 地址来自 `pick_best_v4`
-                    // 的启发式排序，从未被真正探测过（既没 /ping 也没比
-                    // 指纹，见该函数文档），不能当作权威结果直接覆盖配对
-                    // 时验证过的旧候选：一次选错地址就会把唯一可达的候选
-                    // 永久顶掉。
-                    let old_candidates = record.candidates;
-                    let mut candidates = Vec::with_capacity(old_candidates.len() + 1);
-                    candidates.push(fresh.clone());
-                    candidates.extend(old_candidates.iter().filter(|c| **c != fresh).cloned());
-                    candidates.truncate(MAX_DIRECT_CANDIDATES);
-                    // 候选集合确实没变时跳过写库——mDNS 广播会频繁重放同一
-                    // 地址，避免无谓的写放大。也不因广播就顺带刷新
-                    // last_seen_at（`link_update_candidates` 已拆分为只写
-                    // candidates 列）：mDNS 广播只证明「对端在广播」，不
-                    // 证明「本机刚和它说上话」，与 `touch()`「拨通了才算
-                    // 在线」的语义矛盾。
-                    if candidates != old_candidates {
-                        let _ = store.update_candidates(fp, &candidates).await;
+                    // mDNS 通告的指纹是公开值，地址未经任何认证：不写库、不挤占
+                    // 已验证候选，只作为内存中的待验证线索；认证请求经它成功后
+                    // 才持久化。已知地址/重复线索直接跳过。
+                    if record.candidates.contains(&fresh) {
+                        continue;
+                    }
+                    if let Ok(mut map) = hinted.lock() {
+                        map.insert(fp.to_string(), fresh);
                     }
                     continue;
                 }
@@ -711,11 +717,52 @@ impl LinkManager {
         Ok(removed)
     }
 
+    /// 把 mDNS 待验证候选追加到名册候选之后（仅用于本次拨号，不持久化、不越过
+    /// 已验证候选）。
+    fn with_hinted(&self, mut record: PeerRecord) -> PeerRecord {
+        if let Ok(map) = self.hinted.lock()
+            && let Some(hint) = map.get(&record.fingerprint)
+            && !record.candidates.contains(hint)
+        {
+            record.candidates.push(hint.clone());
+        }
+        record
+    }
+
+    /// 认证请求（链路密钥 HMAC/AEAD 往返成功）经 `base_url` 完成后，若该地址正是
+    /// 待验证候选，则将其置首并持久化；否则不动名册。
+    async fn promote_hinted(&self, fingerprint: &str, base_url: &str) {
+        let hint = match self.hinted.lock() {
+            Ok(map) => map.get(fingerprint).cloned(),
+            Err(_) => None,
+        };
+        let Some(hint) = hint else {
+            return;
+        };
+        let matches = PeerAddress::parse(&hint.address)
+            .map(|a| a.base_url() == base_url)
+            .unwrap_or(false);
+        if !matches {
+            return;
+        }
+        if let Ok(mut map) = self.hinted.lock() {
+            map.remove(fingerprint);
+        }
+        let Ok(Some(record)) = self.store.get(fingerprint).await else {
+            return;
+        };
+        let candidates = promoted_candidates(&record.candidates, hint);
+        if candidates != record.candidates {
+            let _ = self.store.update_candidates(fingerprint, &candidates).await;
+        }
+    }
+
     /// 探测一台已配对设备是否在线（走传输栈拨号），成功则刷新 last_seen。
     pub async fn is_online(&self, fingerprint: &str) -> bool {
         let Ok(Some(record)) = self.store.get(fingerprint).await else {
             return false;
         };
+        let record = self.with_hinted(record);
         match self.transport.connect(&record).await {
             Ok(_) => {
                 let _ = self.store.touch(fingerprint, now_unix()).await;
@@ -748,6 +795,7 @@ impl LinkManager {
             .get(fingerprint)
             .await?
             .ok_or(LinkError::NotPaired)?;
+        let record = self.with_hinted(record);
         let conn = self.transport.connect(&record).await?;
         // 明文序列化**一次**，加密**一次**——同一份密文字节既用于 HMAC 也
         // 用于发送，保证签名覆盖的字节与对端收到并校验的字节完全一致
@@ -778,6 +826,7 @@ impl LinkManager {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| LinkError::Io("missing taskId in dispatch response".into()))?
             .to_string();
+        self.promote_hinted(fingerprint, &conn.base_url).await;
         let _ = self.store.touch(fingerprint, now_unix()).await;
         Ok(task_id)
     }
@@ -829,6 +878,7 @@ impl LinkManager {
             .get(fingerprint)
             .await?
             .ok_or(LinkError::NotPaired)?;
+        let record = self.with_hinted(record);
         let conn = self.transport.connect(&record).await?;
         let resp = self
             .post_sealed(
@@ -855,6 +905,7 @@ impl LinkManager {
             tracing::debug!(fingerprint, "peer info response could not be opened");
             return Ok(None);
         };
+        self.promote_hinted(fingerprint, &conn.base_url).await;
         let _ = self.store.set_peer_info(fingerprint, &info).await;
         let _ = self.store.touch(fingerprint, now_unix()).await;
         Ok(Some(info))
@@ -1088,6 +1139,15 @@ fn decode_peer_info(plaintext: &[u8]) -> Option<PeerInfo> {
     })
 }
 
+/// 已验证的新候选置首，去重后截断到 [`MAX_DIRECT_CANDIDATES`]。
+fn promoted_candidates(old: &[PeerCandidate], verified: PeerCandidate) -> Vec<PeerCandidate> {
+    let mut candidates = Vec::with_capacity(old.len() + 1);
+    candidates.push(verified.clone());
+    candidates.extend(old.iter().filter(|c| **c != verified).cloned());
+    candidates.truncate(MAX_DIRECT_CANDIDATES);
+    candidates
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1228,5 +1288,58 @@ mod tests {
         }
         mgr.prune_expired();
         assert!(mgr.seen_nonces.lock().unwrap().is_empty());
+    }
+
+    fn direct(addr: &str) -> PeerCandidate {
+        PeerCandidate {
+            kind: TransportKind::Direct,
+            address: addr.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unverified_hint_never_displaces_stored_candidates() {
+        let (mgr, fp) = mgr_with_device(vec![7u8; 32]).await;
+        mgr.store
+            .update_candidates(&fp, &[direct("10.0.0.2:17800")])
+            .await
+            .unwrap();
+        mgr.hinted
+            .lock()
+            .unwrap()
+            .insert(fp.clone(), direct("10.0.0.9:17800"));
+        let record = mgr.store.get(&fp).await.unwrap().unwrap();
+        let dial = mgr.with_hinted(record);
+        assert_eq!(
+            dial.candidates,
+            vec![direct("10.0.0.2:17800"), direct("10.0.0.9:17800")]
+        );
+        let stored = mgr.store.get(&fp).await.unwrap().unwrap();
+        assert_eq!(stored.candidates, vec![direct("10.0.0.2:17800")]);
+    }
+
+    #[tokio::test]
+    async fn hint_is_persisted_only_after_authenticated_success_on_its_address() {
+        let (mgr, fp) = mgr_with_device(vec![7u8; 32]).await;
+        mgr.store
+            .update_candidates(&fp, &[direct("10.0.0.2:17800")])
+            .await
+            .unwrap();
+        mgr.hinted
+            .lock()
+            .unwrap()
+            .insert(fp.clone(), direct("10.0.0.9:17800"));
+        let other = PeerAddress::parse("10.0.0.2:17800").unwrap().base_url();
+        mgr.promote_hinted(&fp, &other).await;
+        let stored = mgr.store.get(&fp).await.unwrap().unwrap();
+        assert_eq!(stored.candidates, vec![direct("10.0.0.2:17800")]);
+
+        let hinted = PeerAddress::parse("10.0.0.9:17800").unwrap().base_url();
+        mgr.promote_hinted(&fp, &hinted).await;
+        let stored = mgr.store.get(&fp).await.unwrap().unwrap();
+        assert_eq!(
+            stored.candidates,
+            vec![direct("10.0.0.9:17800"), direct("10.0.0.2:17800")]
+        );
     }
 }
