@@ -84,7 +84,8 @@ Return value (a JSON string):
 | `message` | string | Optional; status text to show the user. |
 | `authRef` | string | Optional; on success this should point at the credential you just saved (the host falls back to the request's `authRef` when omitted). |
 
-When a `poll` reply omits `challenge`/`challengeType`, the host UI keeps whatever challenge it last showed instead of clearing it — only include these fields when there's a new challenge to display.
+While `status` is `pending`, a `poll` reply that omits or returns `null` for `challenge`/`challengeType` keeps the last challenge. A terminal reply clears omitted challenge fields; an explicit empty challenge removes its content.
+For `challengeType: "qrcode"`, GPUI and Web render ordinary text (including login URLs) as a locally generated, opaque white QR image; the URL is never fetched as an image. Supported base64 image data URLs use their supplied image instead. If QR encoding fails, the UI falls back to text and keeps a copy button for the full original value. `pending`/`success` messages are informational; only `error` messages use error styling.
 
 On successful login the plugin calls `flux.auth.save` to persist the credential; `authenticate` itself is not responsible for persistence.
 

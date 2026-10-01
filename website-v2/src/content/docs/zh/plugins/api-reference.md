@@ -3,7 +3,7 @@ title: 插件 API 参考
 description: 入口函数签名、flux.* 完整接口、全部运行时限制。
 section: plugins
 order: 4
-sourceHash: "4501af5b1d55"
+sourceHash: "157e161fcff2"
 ---
 
 插件脚本能看到的一切：FluxDown 会调用的六个入口函数，和注入的 `flux` 对象。跨越 JS 边界的字段名全部是 camelCase。
@@ -85,7 +85,8 @@ sourceHash: "4501af5b1d55"
 | `message` | string | 可选，展示给用户的状态文案。 |
 | `authRef` | string | 可选，成功后应指向刚保存的认证引用（省略时宿主用请求中的 `authRef` 兜底）。 |
 
-`poll` 回包省略 `challenge`/`challengeType` 时，宿主 UI 保留上一帧已展示的挑战，不清空——插件只需要在有新挑战时才带上这两个字段。
+当 `status` 为 `pending` 时，`poll` 回包省略或返回 `null` 的 `challenge`/`challengeType` 保留上一帧挑战；终态回包清除未返回的挑战字段，显式空挑战则清除内容。
+`challengeType: "qrcode"` 的普通文本（含登录 URL）由 GPUI 与 Web 本地生成白底不透明二维码，不把 URL 当图片请求。支持的 base64 图片 data URL 优先使用原图；二维码编码失败时回退文本，并保留完整原文的复制按钮。`pending`/`success` 的消息是普通状态提示，只有 `error` 消息使用错误样式。
 
 登录成功后插件调用 `flux.auth.save` 落库凭据；`authenticate` 本身不负责持久化。
 
