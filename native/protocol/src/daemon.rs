@@ -1717,7 +1717,7 @@ pub enum WsServerMsg {
     /// 只在 approve 的 onSuccess 里 refetch 名册会读到还没写入新设备的
     /// 陈旧快照，且没有其它机制能纠正它，靠这条消息触发前端重新拉取。
     LinkDevicesChanged {},
-    /// 投递日志快照（新→旧，最多 100 条）。任务真完成时的投递、以及
+    /// 投递日志增量（新→旧，单次最多 100 条，按 `deliveryId` 合并）。任务真完成时的投递、以及
     /// 「模拟一次下载完成」都发生在前端拉过快照之后——没有这条推送，打开着
     /// 的日志面板就停在打开时的样子。引擎侧已按 500ms 节流。
     WebhookDeliveriesChanged { deliveries: Vec<WebhookDeliveryDto> },
@@ -2189,7 +2189,7 @@ pub struct WebhookPresetDto {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "camelCase")]
 pub struct WebhookDeliveriesResponse {
-    /// 新的在前，最多 100 条（内存环形缓冲，不落盘）。
+    /// 新的在前，最多 [`crate::WEBHOOK_DELIVERY_LIMIT`] 条（引擎落盘环形缓冲，重启回灌）。
     pub deliveries: Vec<WebhookDeliveryDto>,
     pub presets: Vec<WebhookPresetDto>,
     /// 可用占位符清单（`{task.fileName}` 等）。

@@ -172,6 +172,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `agent/src/server_mode.rs::validate_access_key` | `web/src/lib/token-policy.ts` |
 | `engine/src/data_dir.rs` | `lib/src/services/platform_utils.dart` 的 `KNOWN_ITEMS` |
 | `engine/src/webhook.rs` 的 `WebhookEventKind` | Dart `WebhookEvents.all` + TS `WEBHOOK_EVENTS`，**三处 wire 名逐字一致** |
+| `engine/src/webhook.rs` 的 `EndpointSpec` 宽松解析（`lenient` / `reload_endpoints`） | GPUI `crates/settings/src/sections/webhook.rs::parse_endpoints` + Web `web/src/pages/webhooks/endpoints.ts::parseEndpoint`：非对象元素跳过、字段类型不符回退默认值；端点写入两端都走「取最新值重算、冲突重放」（GPUI `SettingsStore::mutate_daemon` ↔ Web `patchEndpoints`），不得写回整份旧数组 |
 | `native/protocol/src/event.rs::merge_webhook_deliveries` / `WebhooksCleared` | `web/src/lib/rpc/apply.ts::mergeWebhookDeliveries` 与清空事件：按 deliveryId 合并、时间降序、封顶；空增量不清空 |
 | `hub/src/signals/mod.rs` | `rinf gen` → `download_actor` 的 `AuxSignal` 泵 → Dart 侧 `rustSignalStream` 监听 |
 | `native/api` 契约 | 重跑 `gen_openapi` 覆盖 `website-v2/public/openapi.json` |

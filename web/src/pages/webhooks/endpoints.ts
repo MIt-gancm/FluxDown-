@@ -1,8 +1,9 @@
 // Webhook 端点模型与配置读写：daemon 配置键 `webhook.endpoints`（JSON 数组字符串），
 // 与 `engine::webhook::EndpointSpec` 同 wire 形状（camelCase）。
 
-import { RpcError, rpc, rpcStore } from '../../lib/rpc'
-import type { WebhookDeliveryDto } from '../../lib/rpc'
+import type { TFunction } from '../../i18n'
+import { RpcError, errorMessage, rpc, rpcStore } from '../../lib/rpc'
+import type { WebhookDeliveryDto, WebhookTestResponse } from '../../lib/rpc'
 
 export const ENDPOINTS_KEY = 'webhook.endpoints'
 
@@ -63,7 +64,7 @@ function parseEndpoint(raw: unknown): EndpointSpec | null {
   }
 }
 
-/** 配置串 → 端点列表；空串 / 非法 JSON 视为空列表（与 GPUI `read_endpoints` 一致）。 */
+/** 配置串 → 端点列表；空串 / 非 JSON 数组视为空列表，非对象元素跳过，字段类型不符回退默认值（与 GPUI `parse_endpoints`、引擎 `reload_endpoints` 一致）。 */
 export function parseEndpoints(raw: string | undefined): EndpointSpec[] {
   if (!raw || raw.trim() === '') return []
   try {
@@ -134,6 +135,22 @@ export function latestDelivery(deliveries: readonly WebhookDeliveryDto[], endpoi
     if (!latest || delivery.timestampMs > latest.timestampMs) latest = delivery
   }
   return latest
+}
+
+/** 「发送测试」的展示结果；行内测试归属发起的端点（`endpointId`）。 */
+export interface TestReport {
+  success: boolean
+  text: string
+}
+
+/** 测试回执 → 展示文案（与 GPUI `test_result_text` 同规则；行内与对话框共用）。 */
+export function testReport(t: TFunction, outcome: { response: WebhookTestResponse } | { error: unknown }): TestReport {
+  if ('error' in outcome) return { success: false, text: t('webhookTestFail', { error: errorMessage(outcome.error) }) }
+  const { response } = outcome
+  if (response.success) {
+    return { success: true, text: t('webhookTestOk', { status: response.statusCode === 0 ? 'OK' : response.statusCode, ms: response.latencyMs }) }
+  }
+  return { success: false, text: t('webhookTestFail', { error: response.error === '' ? `HTTP ${response.statusCode}` : response.error }) }
 }
 
 export const NO_DELIVERIES: readonly WebhookDeliveryDto[] = []

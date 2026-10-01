@@ -227,31 +227,96 @@ fn default_true() -> bool {
 
 /// 单个 webhook 端点配置。持久化为 `webhook.endpoints` 里的一个 JSON 元素。
 ///
-/// 全字段 `default`：老配置缺字段不会让整份配置解析失败。
+/// 全字段 `default`：老配置缺字段不会让整份配置解析失败；类型不符的字段同样回退
+/// 默认值（见 [`lenient`]），一个手改坏的字段不会让整条端点失效。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct EndpointSpec {
+    #[serde(deserialize_with = "lenient::string")]
     pub id: String,
+    #[serde(deserialize_with = "lenient::string")]
     pub name: String,
     /// 见 [`Preset`]；未知值按 [`Preset::Custom`] 处理。
+    #[serde(deserialize_with = "lenient::string")]
     pub preset: String,
+    #[serde(deserialize_with = "lenient::string")]
     pub url: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "lenient::bool_or_true")]
     pub enabled: bool,
     /// 订阅的事件 wire 名；空 = 不投递任何事件。
+    #[serde(deserialize_with = "lenient::strings")]
     pub events: Vec<String>,
     /// 队列过滤：空 = 全部队列。
+    #[serde(deserialize_with = "lenient::string")]
     pub queue_id: String,
     /// 自定义请求头（可覆盖 `Content-Type`，承载各服务 token）。
+    #[serde(deserialize_with = "lenient::string_map")]
     pub headers: BTreeMap<String, String>,
     /// 自定义 body 模板；空 = 用预设默认模板。
+    #[serde(deserialize_with = "lenient::string")]
     pub body_template: String,
     /// 非空则开启 HMAC-SHA256 签名。
+    #[serde(deserialize_with = "lenient::string")]
     pub sign_secret: String,
     /// 允许 `http://` 明文（仅建议局域网设备）。
+    #[serde(deserialize_with = "lenient::bool_or_false")]
     pub allow_http: bool,
     /// 经全局代理发送（默认直连——局域网端点走代理必失败）。
+    #[serde(deserialize_with = "lenient::bool_or_false")]
     pub use_proxy: bool,
+}
+
+/// 端点字段的宽松反序列化：类型不符回退默认值，数组 / 映射里的非字符串项丢弃。
+/// 规则与 GPUI `sections::webhook::EndpointSpec`、Web `parseEndpoint` 逐字段一致，
+/// 三端对同一份配置看到同一组端点。
+mod lenient {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    pub(super) fn string<'de, D: Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+        Ok(match Value::deserialize(de)? {
+            Value::String(value) => value,
+            _ => String::new(),
+        })
+    }
+
+    pub(super) fn bool_or_true<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+        Ok(Value::deserialize(de)?.as_bool().unwrap_or(true))
+    }
+
+    pub(super) fn bool_or_false<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+        Ok(Value::deserialize(de)?.as_bool().unwrap_or(false))
+    }
+
+    pub(super) fn strings<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+        Ok(match Value::deserialize(de)? {
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(value) => Some(value),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    pub(super) fn string_map<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<BTreeMap<String, String>, D::Error> {
+        Ok(match Value::deserialize(de)? {
+            Value::Object(map) => map
+                .into_iter()
+                .filter_map(|(key, value)| match value {
+                    Value::String(value) => Some((key, value)),
+                    _ => None,
+                })
+                .collect(),
+            _ => BTreeMap::new(),
+        })
+    }
 }
 
 impl EndpointSpec {
@@ -928,14 +993,29 @@ impl WebhookDispatcher {
 
     /// 从 `webhook.endpoints` 的 JSON 值热重载端点表。
     ///
-    /// 解析失败时**保留旧表并记日志**——一份手改坏了的配置不该让通知静默消失。
+    /// 整份不是 JSON 数组时**保留旧表并记日志**——一份手改坏了的配置不该让通知
+    /// 静默消失；数组里的非对象元素逐项跳过，字段级类型错误按 [`lenient`] 回退。
     pub fn reload_endpoints(&self, json: &str) {
         let trimmed = json.trim();
         let parsed: Vec<EndpointSpec> = if trimmed.is_empty() {
             Vec::new()
         } else {
-            match serde_json::from_str(trimmed) {
-                Ok(v) => v,
+            match serde_json::from_str::<Vec<serde_json::Value>>(trimmed) {
+                Ok(items) => {
+                    let total = items.len();
+                    let list: Vec<EndpointSpec> = items
+                        .into_iter()
+                        .filter(serde_json::Value::is_object)
+                        .filter_map(|item| serde_json::from_value(item).ok())
+                        .collect();
+                    if list.len() < total {
+                        log_info!(
+                            "[webhook] skipped {} malformed endpoint entries",
+                            total - list.len()
+                        );
+                    }
+                    list
+                }
                 Err(e) => {
                     log_info!("[webhook] endpoints config parse error, keeping previous: {e}");
                     return;
@@ -2372,6 +2452,35 @@ mod tests {
         assert_eq!(d.endpoints().len(), 1, "parse failure must not wipe config");
         d.reload_endpoints("[]");
         assert!(d.endpoints().is_empty());
+    }
+
+    #[test]
+    fn malformed_fields_fall_back_and_non_object_entries_are_skipped() {
+        let d = dispatcher();
+        d.reload_endpoints(
+            r#"[
+                {"id":"a","url":"https://x.dev/h","enabled":"yes","allowHttp":1,
+                 "events":["task.completed",7],"headers":{"X-Ok":"1","X-Bad":2},"queueId":null},
+                "junk",
+                {"id":"b","url":"https://y.dev/h","enabled":false,"events":"task.failed"}
+            ]"#,
+        );
+        let list = d.endpoints();
+        assert_eq!(
+            list.len(),
+            2,
+            "one bad field must not drop the whole endpoint"
+        );
+        assert!(
+            list[0].enabled,
+            "non-bool enabled falls back to the default (on)"
+        );
+        assert!(!list[0].allow_http);
+        assert_eq!(list[0].events, ["task.completed"]);
+        assert_eq!(list[0].headers.len(), 1);
+        assert!(list[0].queue_id.is_empty());
+        assert!(!list[1].enabled);
+        assert!(list[1].events.is_empty());
     }
 
     #[test]

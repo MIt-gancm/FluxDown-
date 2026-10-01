@@ -1,14 +1,17 @@
 //! Webhook：端点列表（daemon `webhook.endpoints` JSON）与投递记录。
 
 use fluxdown_protocol::method;
-use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button, tabular_numbers};
+use fluxdown_ui_components::{
+    ButtonVariant, DialogIntent, FluxIcon, button, dialog_title, loading_button, tabular_numbers,
+};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, Context, InteractiveElement as _, IntoElement as _, ParentElement, SharedString, Styled,
+    Window,
 };
-use gpui_component::{Disableable as _, h_flex, v_flex};
+use gpui_component::{Disableable as _, WindowExt as _, h_flex, v_flex};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use super::{SectionContext, webhook_dialog};
@@ -19,28 +22,92 @@ use crate::ui::{
 };
 
 pub(crate) const ENDPOINTS_KEY: &str = "webhook.endpoints";
+/// 行内「测试」结果：`{ endpointId, success, text }`，只渲染在发起的那一行。
+const TEST_RESULT_KEY: &str = "webhook_test_result";
 
-/// 与 `engine::webhook::EndpointSpec` 同 wire 形状。
+/// 与 `engine::webhook::EndpointSpec` 同 wire 形状、同宽松解析规则：类型不符的字段回退
+/// 默认值，数组 / 映射里的非字符串项丢弃（Web `parseEndpoint` 逐字段一致）。
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub(crate) struct EndpointSpec {
+    #[serde(deserialize_with = "lenient::string")]
     pub id: String,
+    #[serde(deserialize_with = "lenient::string")]
     pub name: String,
+    #[serde(deserialize_with = "lenient::string")]
     pub preset: String,
+    #[serde(deserialize_with = "lenient::string")]
     pub url: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", deserialize_with = "lenient::bool_or_true")]
     pub enabled: bool,
+    #[serde(deserialize_with = "lenient::strings")]
     pub events: Vec<String>,
+    #[serde(deserialize_with = "lenient::string")]
     pub queue_id: String,
+    #[serde(deserialize_with = "lenient::string_map")]
     pub headers: BTreeMap<String, String>,
+    #[serde(deserialize_with = "lenient::string")]
     pub body_template: String,
+    #[serde(deserialize_with = "lenient::string")]
     pub sign_secret: String,
+    #[serde(deserialize_with = "lenient::bool_or_false")]
     pub allow_http: bool,
+    #[serde(deserialize_with = "lenient::bool_or_false")]
     pub use_proxy: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+mod lenient {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+
+    pub(super) fn string<'de, D: Deserializer<'de>>(de: D) -> Result<String, D::Error> {
+        Ok(match Value::deserialize(de)? {
+            Value::String(value) => value,
+            _ => String::new(),
+        })
+    }
+
+    pub(super) fn bool_or_true<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+        Ok(Value::deserialize(de)?.as_bool().unwrap_or(true))
+    }
+
+    pub(super) fn bool_or_false<'de, D: Deserializer<'de>>(de: D) -> Result<bool, D::Error> {
+        Ok(Value::deserialize(de)?.as_bool().unwrap_or(false))
+    }
+
+    pub(super) fn strings<'de, D: Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+        Ok(match Value::deserialize(de)? {
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(value) => Some(value),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        })
+    }
+
+    pub(super) fn string_map<'de, D: Deserializer<'de>>(
+        de: D,
+    ) -> Result<BTreeMap<String, String>, D::Error> {
+        Ok(match Value::deserialize(de)? {
+            Value::Object(map) => map
+                .into_iter()
+                .filter_map(|(key, value)| match value {
+                    Value::String(value) => Some((key, value)),
+                    _ => None,
+                })
+                .collect(),
+            _ => BTreeMap::new(),
+        })
+    }
 }
 
 /// 事件 wire 名（与引擎 `WebhookEventKind::wire()` 逐字一致）。
@@ -53,21 +120,171 @@ pub(crate) const WEBHOOK_EVENTS: &[(&str, &str)] = &[
     ("queue.drained", "webhookEventQueueDrained"),
 ];
 
-pub(crate) fn read_endpoints(store: &SettingsStore) -> Vec<EndpointSpec> {
-    let raw = store.daemon_str(ENDPOINTS_KEY);
+/// 配置串 → 端点列表：空串 / 非 JSON 数组视为空列表，数组里的非对象元素跳过。
+pub(crate) fn parse_endpoints(raw: &str) -> Vec<EndpointSpec> {
     if raw.trim().is_empty() {
         return Vec::new();
     }
-    serde_json::from_str(&raw).unwrap_or_default()
+    serde_json::from_str::<Vec<Value>>(raw)
+        .map(|items| {
+            items
+                .into_iter()
+                .filter(Value::is_object)
+                .filter_map(|item| serde_json::from_value(item).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-pub(crate) fn write_endpoints(
+pub(crate) fn read_endpoints(store: &SettingsStore) -> Vec<EndpointSpec> {
+    parse_endpoints(&store.daemon_str(ENDPOINTS_KEY))
+}
+
+/// 读-改-写端点列表：`edit` 每次都基于服务端最新列表计算（冲突重取重放），
+/// 返回 `None` 表示无需写入。不会覆盖别处同时写入的端点。
+pub(crate) fn mutate_endpoints(
     store: &mut SettingsStore,
-    list: &[EndpointSpec],
+    edit: impl Fn(Vec<EndpointSpec>) -> Option<Vec<EndpointSpec>> + 'static,
     cx: &mut Context<SettingsStore>,
 ) {
-    let encoded = serde_json::to_string(list).unwrap_or_else(|_| "[]".to_owned());
-    store.set_daemon(ENDPOINTS_KEY, encoded, cx);
+    store.mutate_daemon(
+        ENDPOINTS_KEY,
+        move |raw| edit(parse_endpoints(raw)).and_then(|list| serde_json::to_string(&list).ok()),
+        cx,
+    );
+}
+
+/// 新增或按 id 覆盖。
+pub(crate) fn upsert_endpoint(
+    store: &mut SettingsStore,
+    draft: EndpointSpec,
+    cx: &mut Context<SettingsStore>,
+) {
+    clear_test_result(store, &draft.id, cx);
+    mutate_endpoints(
+        store,
+        move |mut list| {
+            match list.iter_mut().find(|entry| entry.id == draft.id) {
+                Some(slot) => *slot = draft.clone(),
+                None => list.push(draft.clone()),
+            }
+            Some(list)
+        },
+        cx,
+    );
+}
+
+/// 端点的配置变了 / 被删了，旧的行内测试结果不再代表它。
+fn clear_test_result(
+    store: &mut SettingsStore,
+    endpoint_id: &str,
+    cx: &mut Context<SettingsStore>,
+) {
+    let owned = store
+        .transient(TEST_RESULT_KEY)
+        .and_then(|result| result.get("endpointId"))
+        .and_then(Value::as_str)
+        == Some(endpoint_id);
+    if owned {
+        store.set_transient(TEST_RESULT_KEY, Value::Null, cx);
+    }
+}
+
+/// 删除前确认（与 Web `confirmDialog(webhookRowDeleteConfirm)` 一致）。
+fn confirm_delete(
+    store: gpui::Entity<SettingsStore>,
+    translator: &fluxdown_ui_i18n::Translator,
+    endpoint: &EndpointSpec,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let title = SharedString::from(translator.text("webhookRowDeleteConfirm").to_owned());
+    let description = SharedString::from(endpoint.name.clone());
+    let ok = SharedString::from(translator.text("webhookRowDelete").to_owned());
+    let cancel = SharedString::from(translator.text("cancel").to_owned());
+    let id = endpoint.id.clone();
+    window.open_alert_dialog(cx, move |alert, _, cx| {
+        let store = store.clone();
+        let id = id.clone();
+        alert
+            .title(dialog_title(title.clone(), cx))
+            .description(description.clone())
+            .footer(fluxdown_ui_components::dialog_footer(
+                Some(cancel.clone()),
+                ok.clone(),
+                DialogIntent::Destructive,
+                cx,
+            ))
+            .on_ok(move |_, _, cx| {
+                let id = id.clone();
+                store.update(cx, |store, cx| {
+                    clear_test_result(store, &id, cx);
+                    mutate_endpoints(
+                        store,
+                        move |list| {
+                            list.iter()
+                                .any(|entry| entry.id == id)
+                                .then(|| list.into_iter().filter(|entry| entry.id != id).collect())
+                        },
+                        cx,
+                    );
+                });
+                true
+            })
+    });
+}
+
+/// 「发送测试」回执 → `(成功, 文案)`；行内测试与对话框测试共用同一套措辞。
+pub(crate) fn test_result_text(
+    translator: &fluxdown_ui_i18n::Translator,
+    result: Result<Value, fluxdown_protocol::RpcErrorData>,
+) -> (bool, String) {
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            return (
+                false,
+                translator.text_with(
+                    "webhookTestFail",
+                    &[("error", &rpc_error_text(translator, &error))],
+                ),
+            );
+        }
+    };
+    let success = value
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let status = value.get("statusCode").and_then(Value::as_i64).unwrap_or(0);
+    if success {
+        let status = if status == 0 {
+            "OK".to_owned()
+        } else {
+            status.to_string()
+        };
+        let latency = value
+            .get("latencyMs")
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .to_string();
+        return (
+            true,
+            translator.text_with("webhookTestOk", &[("status", &status), ("ms", &latency)]),
+        );
+    }
+    let error = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let detail = if error.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        error.to_owned()
+    };
+    (
+        false,
+        translator.text_with("webhookTestFail", &[("error", &detail)]),
+    )
 }
 
 pub(crate) fn endpoints_group(ctx: &SectionContext, _cx: &mut App) -> SettingsSection {
@@ -117,11 +334,34 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                                 &[("time", &format!("{}ms", delivery.latency_ms))],
                             )
                         } else {
-                            translator
-                                .text_with("webhookHealthFail", &[("detail", &delivery.error)])
+                            let detail = if delivery.error.is_empty() {
+                                format!("HTTP {}", delivery.status_code)
+                            } else {
+                                delivery.error.clone()
+                            };
+                            translator.text_with("webhookHealthFail", &[("detail", &detail)])
                         }
                     },
                 );
+            let test_result = store
+                .read(cx)
+                .transient(TEST_RESULT_KEY)
+                .filter(|result| {
+                    result.get("endpointId").and_then(Value::as_str) == Some(endpoint.id.as_str())
+                })
+                .map(|result| {
+                    (
+                        result
+                            .get("success")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        result
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                    )
+                });
             let toggle_store = store.clone();
             let toggle_id = endpoint.id.clone();
             let edit_store = store.clone();
@@ -130,7 +370,8 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
             let test_store = store.clone();
             let test_endpoint = endpoint.clone();
             let delete_store = store.clone();
-            let delete_id = endpoint.id.clone();
+            let delete_translator = translator.clone();
+            let delete_endpoint = endpoint.clone();
             let events = endpoint.events.join(", ");
             column = column.child(
                 h_flex()
@@ -153,11 +394,18 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                             let id = toggle_id.clone();
                             let checked = *checked;
                             toggle_store.update(cx, |store, cx| {
-                                let mut list = read_endpoints(store);
-                                if let Some(entry) = list.iter_mut().find(|entry| entry.id == id) {
-                                    entry.enabled = checked;
-                                    write_endpoints(store, &list, cx);
-                                }
+                                mutate_endpoints(
+                                    store,
+                                    move |mut list| {
+                                        let entry = list.iter_mut().find(|entry| entry.id == id)?;
+                                        if entry.enabled == checked {
+                                            return None;
+                                        }
+                                        entry.enabled = checked;
+                                        Some(list)
+                                    },
+                                    cx,
+                                );
                             });
                         }),
                     )
@@ -177,7 +425,16 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                                 } else {
                                     disabled_label.clone()
                                 },
-                            )),
+                            ))
+                            .children(test_result.map(|(success, text)| {
+                                meta_text(cx)
+                                    .text_color(if success {
+                                        extended.success
+                                    } else {
+                                        tokens.colors.destructive
+                                    })
+                                    .child(SharedString::from(text))
+                            })),
                     )
                     .child(
                         row_button(
@@ -212,57 +469,24 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                                 let params = serde_json::to_value(&test_endpoint)
                                     .unwrap_or_else(|_| json!({}));
                                 let translator = translator.clone();
+                                let endpoint_id = test_endpoint.id.clone();
                                 test_store.update(cx, |store, cx| {
+                                    store.set_transient(TEST_RESULT_KEY, Value::Null, cx);
                                     store.call_with(
                                         "webhookTest",
                                         method::DAEMON_WEBHOOK_TEST,
                                         params,
                                         cx,
                                         move |store, result, cx| {
-                                            let text = match result {
-                                                Ok(value) => {
-                                                    let success = value
-                                                        .get("success")
-                                                        .and_then(serde_json::Value::as_bool)
-                                                        .unwrap_or(false);
-                                                    let status = value
-                                                        .get("statusCode")
-                                                        .and_then(serde_json::Value::as_i64)
-                                                        .unwrap_or(0)
-                                                        .to_string();
-                                                    let ms = value
-                                                        .get("latencyMs")
-                                                        .and_then(serde_json::Value::as_i64)
-                                                        .unwrap_or(0)
-                                                        .to_string();
-                                                    let error = value
-                                                        .get("error")
-                                                        .and_then(serde_json::Value::as_str)
-                                                        .unwrap_or_default()
-                                                        .to_owned();
-                                                    if success {
-                                                        translator.text_with(
-                                                            "webhookTestOk",
-                                                            &[("status", &status), ("ms", &ms)],
-                                                        )
-                                                    } else {
-                                                        translator.text_with(
-                                                            "webhookTestFail",
-                                                            &[("error", &error)],
-                                                        )
-                                                    }
-                                                }
-                                                Err(error) => translator.text_with(
-                                                    "webhookTestFail",
-                                                    &[(
-                                                        "error",
-                                                        &rpc_error_text(&translator, &error),
-                                                    )],
-                                                ),
-                                            };
+                                            let (success, text) =
+                                                test_result_text(&translator, result);
                                             store.set_transient(
-                                                "webhook_test_result",
-                                                json!(text),
+                                                TEST_RESULT_KEY,
+                                                json!({
+                                                    "endpointId": endpoint_id,
+                                                    "success": success,
+                                                    "text": text,
+                                                }),
                                                 cx,
                                             );
                                         },
@@ -279,25 +503,17 @@ fn endpoints_item(ctx: &SectionContext) -> SettingsRow {
                             cx,
                         )
                         .disabled(disabled)
-                        .on_click(move |_, _, cx| {
-                            let id = delete_id.clone();
-                            delete_store.update(cx, |store, cx| {
-                                let list: Vec<EndpointSpec> = read_endpoints(store)
-                                    .into_iter()
-                                    .filter(|entry| entry.id != id)
-                                    .collect();
-                                write_endpoints(store, &list, cx);
-                            });
+                        .on_click(move |_, window, cx| {
+                            confirm_delete(
+                                delete_store.clone(),
+                                &delete_translator,
+                                &delete_endpoint,
+                                window,
+                                cx,
+                            );
                         }),
                     ),
             );
-        }
-        if let Some(text) = store
-            .read(cx)
-            .transient("webhook_test_result")
-            .and_then(serde_json::Value::as_str)
-        {
-            column = column.child(meta_text(cx).child(SharedString::from(text.to_owned())));
         }
         let add_store = store.clone();
         let add_translator = translator.clone();
@@ -499,4 +715,26 @@ pub(crate) fn delivery_log_group(ctx: &SectionContext, _cx: &mut App) -> Setting
         .title(ctx.t("webhookDeliveryLog"))
         .subtitle(ctx.t("webhookLogSubtitle"))
         .row(row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_endpoints;
+
+    #[test]
+    fn malformed_fields_fall_back_like_engine_and_web() {
+        let list = parse_endpoints(
+            r#"[{"id":"a","enabled":"yes","events":["task.failed",3],"headers":{"K":"v","N":1}},
+                 42,
+                 {"id":"b","enabled":false,"allowHttp":"true"}]"#,
+        );
+        assert_eq!(list.len(), 2);
+        assert!(list[0].enabled);
+        assert_eq!(list[0].events, ["task.failed"]);
+        assert_eq!(list[0].headers.len(), 1);
+        assert!(!list[1].enabled);
+        assert!(!list[1].allow_http);
+        assert!(parse_endpoints("{ not json").is_empty());
+        assert!(parse_endpoints(r#"{"id":"a"}"#).is_empty());
+    }
 }

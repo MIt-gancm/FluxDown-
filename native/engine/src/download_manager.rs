@@ -456,6 +456,20 @@ fn task_url_protocol(url: &str) -> Option<&'static str> {
     }
 }
 
+/// webhook 载荷的临时文件名：探测前任务还没有 `file_name` 时，从来源 URL 推断。
+/// http(s)/ftp 取路径末段，磁力取 `dn=`；其余协议（本地哨兵等）给不出可靠名字，
+/// 返回空串。ed2k 在建任务时已从链接解析出文件名，不会走到这里。
+fn webhook_provisional_file_name(url: &str) -> String {
+    let name = if is_magnet(url) {
+        bt_downloader::magnet_display_name(url)
+    } else if task_url_protocol(url).is_some() {
+        crate::downloader::extract_from_url(url)
+    } else {
+        None
+    };
+    name.unwrap_or_default()
+}
+
 /// 文件跟踪扫描的并发上限。`try_exists` 内部走 tokio blocking 线程池，限流以
 /// bound 该共享池占用，防慢盘/网络盘扫描饿死并发下载 IO。
 const FILE_SCAN_CONCURRENCY: usize = 64;
@@ -3256,12 +3270,18 @@ impl DownloadManager {
     }
 
     /// 组装一条任务事件的 webhook 载荷。队列名取内存镜像，无需查库。
+    ///
+    /// `task.created` / `task.started` 早于探测，未指定文件名的任务此时 `file_name`
+    /// 还是空的；按来源 URL 补一个临时名，否则预设模板的摘要行只剩空白。
     fn webhook_task_event(
         &self,
         kind: crate::webhook::WebhookEventKind,
-        task: crate::webhook::WebhookTask,
+        mut task: crate::webhook::WebhookTask,
         queue_id: &str,
     ) -> crate::webhook::WebhookEvent {
+        if task.file_name.trim().is_empty() {
+            task.file_name = webhook_provisional_file_name(&task.url);
+        }
         crate::webhook::WebhookEvent::task(
             kind,
             task,
@@ -10866,6 +10886,25 @@ pub async fn progress_reporter(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn webhook_provisional_file_name_follows_source_protocol() {
+        assert_eq!(
+            webhook_provisional_file_name("https://cdn.example.com/a/My%20File.iso?token=x"),
+            "My File.iso"
+        );
+        assert_eq!(
+            webhook_provisional_file_name("ftp://mirror.example.com/pub/f.tar.gz"),
+            "f.tar.gz"
+        );
+        assert_eq!(
+            webhook_provisional_file_name("magnet:?xt=urn:btih:abc&dn=Ubuntu%2024.04"),
+            "Ubuntu 24.04"
+        );
+        // 无 dn 的磁力 / 本地哨兵给不出可靠名字，宁可留空也不编造。
+        assert_eq!(webhook_provisional_file_name("magnet:?xt=urn:btih:abc"), "");
+        assert_eq!(webhook_provisional_file_name("torrent-file://local"), "");
+    }
 
     // -----------------------------------------------------------------------
     // dedup_filename_sync — allow_overwrite（config `file_exists_behavior`

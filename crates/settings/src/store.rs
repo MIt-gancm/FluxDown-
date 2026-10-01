@@ -19,6 +19,8 @@ use serde_json::{Value, json};
 
 use crate::port::{PortFuture, SettingsPort};
 
+mod mutation;
+
 /// 本地编辑到写回 RPC 的合并窗口。
 const FLUSH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// daemon 修订冲突时的自动重试上限。
@@ -106,6 +108,8 @@ pub struct SettingsStore {
     flush_scheduled: bool,
     flush_inflight: bool,
     conflict_retries: u8,
+    /// 整值键的读-改-写链（见 [`mutation`]）。
+    mutations: mutation::DaemonMutations,
 
     // ── 按需加载的动作结果 ──
     integration: Option<PlatformIntegrationDto>,
@@ -157,6 +161,7 @@ impl SettingsStore {
             flush_scheduled: false,
             flush_inflight: false,
             conflict_retries: 0,
+            mutations: mutation::DaemonMutations::default(),
             integration: None,
             diagnostics: None,
             site_auth: Vec::new(),
@@ -282,6 +287,7 @@ impl SettingsStore {
         self.inflight_daemon.clear();
         self.pending_prefs.clear();
         self.inflight_prefs.clear();
+        self.mutations.discard();
         self.last_error = Some(SettingsError {
             kind: SettingsErrorKind::Disconnected,
             detail: SharedString::default(),
@@ -388,6 +394,7 @@ impl SettingsStore {
 
     /// 服务端快照到达时把尚未回执的本地编辑重新盖上去，避免输入框回跳。
     fn overlay_local_edits(&mut self) {
+        self.capture_mutation_bases();
         for (key, value) in self
             .inflight_daemon
             .iter()
@@ -404,6 +411,7 @@ impl SettingsStore {
                 self.daemon.values.insert(spec.storage_key.to_owned(), wire);
             }
         }
+        self.overlay_mutations();
     }
 
     // ───────────────────────── 只读投影 ─────────────────────────

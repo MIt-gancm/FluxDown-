@@ -136,7 +136,7 @@ impl TorrentSource {
 /// file name inconsistently with the queued-task path.  Returns `None` when the
 /// decoded value is empty (before sanitization), so callers fall back to a
 /// generated name instead of the literal `"download"` placeholder.
-fn magnet_display_name(url: &str) -> Option<String> {
+pub(crate) fn magnet_display_name(url: &str) -> Option<String> {
     url.split('&')
         .find_map(|part| {
             let part = part.strip_prefix("magnet:?").unwrap_or(part);

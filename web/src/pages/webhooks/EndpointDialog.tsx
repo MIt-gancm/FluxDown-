@@ -6,11 +6,11 @@ import { ChevronDown, ChevronRight } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT } from '../../i18n'
 import { cn } from '../../lib/cn'
-import { errorMessage, rpc, useDaemon } from '../../lib/rpc'
+import { rpc, useDaemon } from '../../lib/rpc'
 import type { QueueDto, WebhookPresetDto } from '../../lib/rpc'
 import { Button, CheckRow, Dialog, DialogFooter, FieldHint, FormField, Icon, Input, Select, Textarea, Card } from '../../ui'
-import { WEBHOOK_EVENTS, upsertEndpoint } from './endpoints'
-import type { EndpointSpec } from './endpoints'
+import { WEBHOOK_EVENTS, testReport, upsertEndpoint } from './endpoints'
+import type { EndpointSpec, TestReport } from './endpoints'
 import { EndpointOptions } from './EndpointOptions'
 import type { OptionsState } from './EndpointOptions'
 import { HeadersEditor } from './HeadersEditor'
@@ -24,12 +24,18 @@ const ALL_QUEUES = '__all__'
 const NO_QUEUES: readonly QueueDto[] = []
 const selectQueues = (daemon: { queues: QueueDto[] }) => daemon.queues
 
-interface TestOutcome {
-  success: boolean
-  text: string
-}
-
-export function EndpointDialog({ existing, onClose, runWrite }: { existing: EndpointSpec | null; onClose: () => void; runWrite: RunWrite }) {
+export function EndpointDialog({
+  existing,
+  onClose,
+  onSaved,
+  runWrite,
+}: {
+  existing: EndpointSpec | null
+  onClose: () => void
+  /** 保存成功（参数为端点 id）：调用方据此作废该端点旧的行内测试结果。 */
+  onSaved: (endpointId: string) => void
+  runWrite: RunWrite
+}) {
   const t = useT()
   const queues = useDaemon(selectQueues, NO_QUEUES)
 
@@ -61,7 +67,7 @@ export function EndpointDialog({ existing, onClose, runWrite }: { existing: Endp
   const [presets, setPresets] = useState<readonly WebhookPresetDto[]>([])
   const [variables, setVariables] = useState<readonly string[]>([])
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<TestOutcome | null>(null)
+  const [testResult, setTestResult] = useState<TestReport | null>(null)
   const [saving, setSaving] = useState(false)
 
   // 预设目录 + 变量清单来自引擎（`daemon.webhook.get`），前端不复制模板内容。
@@ -114,7 +120,10 @@ export function EndpointDialog({ existing, onClose, runWrite }: { existing: Endp
     setSaving(true)
     const ok = await runWrite(() => upsertEndpoint(draft))
     setSaving(false)
-    if (ok) onClose()
+    if (ok) {
+      onSaved(draft.id)
+      onClose()
+    }
   }
 
   /** 页脚「发送测试」：把当前草稿直接交给引擎，无需先保存。 */
@@ -123,20 +132,9 @@ export function EndpointDialog({ existing, onClose, runWrite }: { existing: Endp
     setTesting(true)
     setTestResult(null)
     try {
-      const response = await rpc.daemon.webhook.test({ ...buildDraft() })
-      if (response.success) {
-        setTestResult({
-          success: true,
-          text: t('webhookTestOk', { status: response.statusCode === 0 ? 'OK' : response.statusCode, ms: response.latencyMs }),
-        })
-      } else {
-        setTestResult({
-          success: false,
-          text: t('webhookTestFail', { error: response.error === '' ? response.statusCode : response.error }),
-        })
-      }
+      setTestResult(testReport(t, { response: await rpc.daemon.webhook.test({ ...buildDraft() }) }))
     } catch (error) {
-      setTestResult({ success: false, text: t('webhookTestFail', { error: errorMessage(error) }) })
+      setTestResult(testReport(t, { error }))
     } finally {
       setTesting(false)
     }

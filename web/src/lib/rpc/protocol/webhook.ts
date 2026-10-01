@@ -2,7 +2,7 @@
 
 import type { JsonValue } from './common';
 
-/** 一条投递记录（新的在前，最多 100 条，内存环形缓冲不落盘）。 */
+/** 一条投递记录（列表新的在前，上限 1000 条，引擎落盘、重启回灌）。 */
 export interface WebhookDeliveryDto {
   deliveryId: string;
   /** Unix 毫秒。 */

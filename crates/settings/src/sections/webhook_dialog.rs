@@ -30,8 +30,8 @@ use gpui_component::{
 };
 use serde_json::{Value, json};
 
-use super::webhook::{EndpointSpec, WEBHOOK_EVENTS, read_endpoints, write_endpoints};
-use crate::store::{SettingsStore, rpc_error_text};
+use super::webhook::{EndpointSpec, WEBHOOK_EVENTS, test_result_text, upsert_endpoint};
+use crate::store::SettingsStore;
 use crate::ui::dialog_footer;
 
 const PRESET_CUSTOM: &str = "custom";
@@ -243,6 +243,9 @@ pub(crate) struct WebhookDialog {
     store: Entity<SettingsStore>,
     translator: Translator,
     existing: Option<EndpointSpec>,
+    /// 端点 id：编辑沿用原 id；新增在打开时生成一次，草稿测试与保存后的端点共用，
+    /// 测试投递记录才能算进该端点的健康状态。
+    id: String,
     name: Entity<InputState>,
     url: Entity<InputState>,
     template: Entity<TextareaState>,
@@ -365,7 +368,12 @@ impl WebhookDialog {
             |entry| entry.events.iter().cloned().collect(),
         );
 
+        let id = entry.map_or_else(
+            || format!("wh_{}", super::category_dialog::unix_ms()),
+            |entry| entry.id.clone(),
+        );
         let mut this = Self {
+            id,
             store,
             translator,
             preset: entry.map_or_else(|| PRESET_CUSTOM.to_owned(), |entry| entry.preset.clone()),
@@ -480,10 +488,7 @@ impl WebhookDialog {
         }
         let existing = self.existing.as_ref();
         EndpointSpec {
-            id: existing.map_or_else(
-                || format!("wh_{}", super::category_dialog::unix_ms()),
-                |entry| entry.id.clone(),
-            ),
+            id: self.id.clone(),
             name: self.name.read(cx).value().trim().to_owned(),
             preset: self.preset.clone(),
             url: self.url.read(cx).value().trim().to_owned(),
@@ -511,14 +516,8 @@ impl WebhookDialog {
             return;
         }
         let draft = self.draft(cx);
-        self.store.update(cx, |store, cx| {
-            let mut list = read_endpoints(store);
-            match list.iter_mut().find(|entry| entry.id == draft.id) {
-                Some(slot) => *slot = draft,
-                None => list.push(draft),
-            }
-            write_endpoints(store, &list, cx);
-        });
+        self.store
+            .update(cx, |store, cx| upsert_endpoint(store, draft, cx));
         window.close_dialog(cx);
     }
 
@@ -547,52 +546,10 @@ impl WebhookDialog {
     }
 
     fn test_outcome(&self, result: Result<Value, RpcErrorData>) -> TestOutcome {
-        match result {
-            Ok(value) => {
-                let success = value
-                    .get("success")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let status = value.get("statusCode").and_then(Value::as_i64).unwrap_or(0);
-                let latency = value
-                    .get("latencyMs")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0)
-                    .to_string();
-                let error = value
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let text = if success {
-                    let status = if status == 0 {
-                        "OK".to_owned()
-                    } else {
-                        status.to_string()
-                    };
-                    self.translator
-                        .text_with("webhookTestOk", &[("status", &status), ("ms", &latency)])
-                } else {
-                    let detail = if error.is_empty() {
-                        status.to_string()
-                    } else {
-                        error
-                    };
-                    self.translator
-                        .text_with("webhookTestFail", &[("error", &detail)])
-                };
-                TestOutcome {
-                    success,
-                    text: SharedString::from(text),
-                }
-            }
-            Err(error) => TestOutcome {
-                success: false,
-                text: SharedString::from(self.translator.text_with(
-                    "webhookTestFail",
-                    &[("error", &rpc_error_text(&self.translator, &error))],
-                )),
-            },
+        let (success, text) = test_result_text(&self.translator, result);
+        TestOutcome {
+            success,
+            text: SharedString::from(text),
         }
     }
 

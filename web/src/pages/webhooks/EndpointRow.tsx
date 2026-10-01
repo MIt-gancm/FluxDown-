@@ -3,11 +3,12 @@
 
 import { Ellipsis } from 'lucide-react'
 import { useT } from '../../i18n'
+import { cn } from '../../lib/cn'
 import type { WebhookDeliveryDto } from '../../lib/rpc'
 import { ActionMenu, Button, Icon, Switch, useIsMobile } from '../../ui'
 import type { MenuEntry } from '../../ui'
 import { latestDelivery } from './endpoints'
-import type { EndpointSpec } from './endpoints'
+import type { EndpointSpec, TestReport } from './endpoints'
 
 export function EndpointRow({
   endpoint,
@@ -15,6 +16,7 @@ export function EndpointRow({
   disabled,
   testing,
   testBusy,
+  testResult,
   onToggle,
   onEdit,
   onTest,
@@ -28,6 +30,8 @@ export function EndpointRow({
   testing: boolean
   /** 任意行正在测试（同一时间只跑一个）。 */
   testBusy: boolean
+  /** 本行最近一次「测试」的结果；无则不显示。 */
+  testResult: TestReport | null
   onToggle: (enabled: boolean) => void
   onEdit: () => void
   onTest: () => void
@@ -59,6 +63,9 @@ export function EndpointRow({
           {endpoint.url} · {endpoint.events.join(', ')}
         </div>
         <div className="truncate text-xs text-text-tertiary">{health}</div>
+        {testResult ? (
+          <div className={cn('truncate text-xs', testResult.success ? 'text-success' : 'text-destructive')}>{testResult.text}</div>
+        ) : null}
       </div>
       {mobile ? (
         <ActionMenu
