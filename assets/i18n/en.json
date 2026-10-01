@@ -992,7 +992,7 @@
   "proxyNotConfigured": "Not configured",
   "proxySystemNotDetected": "No system proxy detected",
   "statusBarProxyLabel": "Proxy",
-  "proxyConfigureInSettings": "Configure in Settings…",
+  "proxyConfigureInSettings": "Configure a proxy in Settings first",
   "proxyType": "Proxy Type",
   "proxyHost": "Server Address",
   "proxyHostPlaceholder": "e.g. 127.0.0.1",

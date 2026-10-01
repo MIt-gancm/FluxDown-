@@ -4,6 +4,7 @@ pub(crate) mod selection_bar;
 pub(crate) mod sidebar;
 pub(crate) mod sidebar_layout;
 pub(crate) mod status_bar;
+mod status_proxy;
 pub(crate) mod task_drag;
 pub(crate) mod task_table;
 pub(crate) mod title_bar;

@@ -992,7 +992,7 @@
   "proxyNotConfigured": "未配置",
   "proxySystemNotDetected": "未检测到系统代理",
   "statusBarProxyLabel": "代理",
-  "proxyConfigureInSettings": "在设置中配置…",
+  "proxyConfigureInSettings": "请先在设置中配置代理",
   "proxyType": "代理类型",
   "proxyHost": "服务器地址",
   "proxyHostPlaceholder": "例如 127.0.0.1",
