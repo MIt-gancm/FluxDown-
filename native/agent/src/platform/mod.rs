@@ -239,6 +239,125 @@ pub fn integration_status() -> PlatformIntegrationDto {
     }
 }
 
+/// 开机自启的实际状态：区分「用户没开」与「开了但被系统级开关禁用」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartState {
+    /// 没有桌面程序可拉起（开发构建 / 精简安装）或平台不支持。
+    Unsupported,
+    /// 没有指向当前 agent 的自启条目。
+    Off,
+    Enabled,
+    /// 条目在，但用户在系统设置 / 任务管理器 / 桌面环境里禁用了它。
+    DisabledBySystem,
+}
+
+/// 读取开机自启状态（阻塞：读注册表 / 文件 / 调 `launchctl`）。
+#[must_use]
+pub fn autostart_state() -> AutostartState {
+    let desktop = desktop_executable();
+    if !autostart::supported(desktop.as_deref()) {
+        return AutostartState::Unsupported;
+    }
+    let Ok(agent) = agent_executable() else {
+        return AutostartState::Unsupported;
+    };
+    if !autostart::is_registered(&agent) {
+        AutostartState::Off
+    } else if autostart::is_enabled(&agent) {
+        AutostartState::Enabled
+    } else {
+        AutostartState::DisabledBySystem
+    }
+}
+
+/// Doctor 引导用户自行放行的系统设置页（这些开关只能由用户本人在系统里打开）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsPane {
+    /// 系统通知设置（Windows「通知」、macOS「通知」）。
+    Notifications,
+    /// macOS「隐私与安全性 › 文件与文件夹」：隐私授权（TCC）拒绝写入时。
+    FilesAndFolders,
+}
+
+impl SettingsPane {
+    /// `agent.diagnostics.repair` 的 `target` 名。
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Notifications => "notifications",
+            Self::FilesAndFolders => "files_and_folders",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Notifications, Self::FilesAndFolders]
+            .into_iter()
+            .find(|pane| pane.name() == name)
+    }
+
+    /// 本平台能直接打开的设置页地址；没有对应页面时为 `None`。
+    #[must_use]
+    pub fn uri(self) -> Option<&'static str> {
+        if cfg!(target_os = "macos") {
+            Some(match self {
+                Self::Notifications => {
+                    "x-apple.systempreferences:com.apple.preference.notifications"
+                }
+                Self::FilesAndFolders => {
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders"
+                }
+            })
+        } else if cfg!(windows) {
+            match self {
+                Self::Notifications => Some("ms-settings:notifications"),
+                Self::FilesAndFolders => None,
+            }
+        } else {
+            None
+        }
+    }
+}
+
+/// 打开系统设置页（阻塞拉起系统打开程序，不等设置窗口关闭）。
+pub fn open_system_settings(pane: SettingsPane) -> Result<(), PlatformError> {
+    let uri = pane.uri().ok_or(PlatformError::Unsupported(
+        "this settings page does not exist on this platform",
+    ))?;
+    open_uri(uri)
+}
+
+#[cfg(target_os = "macos")]
+fn open_uri(uri: &str) -> Result<(), PlatformError> {
+    let status = std::process::Command::new("/usr/bin/open")
+        .arg(uri)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(PlatformError::Failed(format!("open {uri}: {status}")))
+    }
+}
+
+#[cfg(windows)]
+fn open_uri(uri: &str) -> Result<(), PlatformError> {
+    if shell_execute_open(uri) {
+        Ok(())
+    } else {
+        Err(PlatformError::Failed(format!("could not open {uri}")))
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn open_uri(_uri: &str) -> Result<(), PlatformError> {
+    Err(PlatformError::Unsupported(
+        "system settings pages are not available on this platform",
+    ))
+}
+
 /// 开机自启 agent（`--autostart`）；要求桌面程序已安装在同级目录，保证自启后能拉起界面。
 pub fn set_autostart(enabled: bool) -> Result<(), PlatformError> {
     if !enabled {

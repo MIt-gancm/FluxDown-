@@ -2143,6 +2143,134 @@ pub struct InstallFfmpegRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Doctor 动态探测（`daemon.diagnostics.probe`）
+// ---------------------------------------------------------------------------
+
+/// 存储探测目录的用途。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StorageProbeRole {
+    /// 全局默认保存目录（`default_save_dir`；未配置时为系统下载目录）。
+    DefaultSaveDir,
+    /// 队列的默认保存目录。
+    Queue,
+    /// RSS 源的保存目录。
+    Rss,
+    /// 分类保存目录（agent 偏好，经 [`DiagnosticsProbeParams::extra_dirs`] 传入）。
+    Category,
+    /// daemon 数据目录（下载数据库、BT 会话、托管组件、日志）。
+    DataDir,
+}
+
+/// 待探测的目录。daemon 自己持有的目录（默认 / 队列 / RSS / 数据目录）由 daemon 收集，
+/// 调用方只追加 daemon 不知道的目录。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageProbeTarget {
+    pub role: StorageProbeRole,
+    /// 展示用名称（队列名 / RSS 源名 / 分类名）；默认目录与数据目录为空。
+    #[serde(default)]
+    pub label: String,
+    pub path: String,
+}
+
+/// `daemon.diagnostics.probe` 参数。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsProbeParams {
+    #[serde(default)]
+    pub extra_dirs: Vec<StorageProbeTarget>,
+}
+
+/// 存储探测失败的分类（由 IO 错误种类归并，决定 UI 给出的处理建议）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StorageProbeFailure {
+    /// 无权限（含 macOS 隐私授权 / TCC 拒绝、ACL、属主不符）。
+    PermissionDenied,
+    /// 只读文件系统 / 只读挂载。
+    ReadOnly,
+    /// 磁盘或配额已满。
+    NoSpace,
+    /// 路径及其所有上级目录都不存在（如未挂载的移动硬盘 / 网络盘）。
+    Missing,
+    /// 路径（或最近的已存在上级）不是目录。
+    NotDirectory,
+    /// 探测在时限内未完成（常见于失联的网络挂载）。
+    Timeout,
+    /// 其它 IO 错误或读回内容不一致。
+    Other,
+}
+
+/// 单个目录的动态写入探测结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StorageProbeDto {
+    pub role: StorageProbeRole,
+    #[serde(default)]
+    pub label: String,
+    pub path: String,
+    /// 目标目录已存在；不存在时在最近的已存在上级目录上探测（首次下载时会自动创建）。
+    pub exists: bool,
+    /// 实际执行写入探测的目录；找不到可用上级时为空。
+    #[serde(default)]
+    pub probed_dir: String,
+    /// 失败的步骤（`create` / `write` / `sync` / `read` / `rename` / `remove` / `stat`）；通过时为空。
+    #[serde(default)]
+    pub failed_step: String,
+    /// 通过时为 `None`。
+    #[serde(default)]
+    pub failure: Option<StorageProbeFailure>,
+    /// 原始错误描述；通过时为空。
+    #[serde(default)]
+    pub error: String,
+    /// 探测目录所在卷的可用空间；无法获取时为 `None`。
+    #[serde(default)]
+    pub available_bytes: Option<u64>,
+    /// 失败时的系统错误码（`EACCES`=13 / `EPERM`=1 / Windows `ERROR_ACCESS_DENIED`=5 …）；
+    /// 同为「无权限」时据此区分属主 / ACL 问题与 macOS 隐私授权（TCC）拒绝。
+    #[serde(default)]
+    pub os_error: Option<i32>,
+}
+
+/// 外部组件（ffmpeg / ffprobe / yt-dlp）的实际运行探测结果。只报告已解析到路径的组件。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentProbeDto {
+    /// `ffmpeg` / `ffprobe` / `yt-dlp`。
+    pub name: String,
+    pub path: String,
+    /// 版本输出首行；失败时为空。
+    #[serde(default)]
+    pub output: String,
+    /// 启动被拒（`permissionDenied`）等失败的根因描述；可运行时为空。
+    #[serde(default)]
+    pub error: String,
+    /// 启动被系统拒绝（无执行权限、noexec 挂载、隔离属性 / 安全软件拦截）。
+    #[serde(default)]
+    pub permission_denied: bool,
+    /// 生效路径位于 daemon 数据目录内（托管安装），daemon 可就地修复其执行权限。
+    #[serde(default)]
+    pub managed: bool,
+}
+
+/// `daemon.diagnostics.fixComponent` 参数：把托管组件的执行权限还给当前用户。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentRepairParams {
+    /// [`ComponentProbeDto::name`]（`ffmpeg` / `ffprobe` / `yt-dlp`）。
+    pub name: String,
+}
+
+/// `daemon.diagnostics.probe` 结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsProbeResult {
+    pub storage: Vec<StorageProbeDto>,
+    pub components: Vec<ComponentProbeDto>,
+}
+
+// ---------------------------------------------------------------------------
 // Webhook 任务事件推送（免费自托管）
 // ---------------------------------------------------------------------------
 

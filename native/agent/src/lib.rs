@@ -27,6 +27,7 @@ pub mod logging;
 pub mod nmh;
 pub mod notification;
 mod open_association;
+pub mod permission;
 pub mod platform;
 pub mod power;
 pub mod remote;

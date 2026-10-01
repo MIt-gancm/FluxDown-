@@ -100,7 +100,6 @@ pub async fn run(
         ))
     });
     let service_db = engine.db.clone();
-    #[cfg(any(feature = "plugins", feature = "components"))]
     let service_data_dir = data_dir.clone();
     #[cfg(feature = "plugins")]
     let service_plugin_manager = engine.manager.plugin_manager();
@@ -144,7 +143,6 @@ pub async fn run(
             blobs.clone(),
             actor.clone(),
             service_db,
-            #[cfg(any(feature = "plugins", feature = "components"))]
             service_data_dir,
             #[cfg(feature = "plugins")]
             service_plugin_manager,

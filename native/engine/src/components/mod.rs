@@ -137,6 +137,77 @@ fn find_in_dirs(dirs: impl IntoIterator<Item = PathBuf>, binary_name: &str) -> O
         .find(|candidate| candidate.is_file())
 }
 
+/// [`exec_probe`] 的失败原因。
+#[derive(thiserror::Error, Debug)]
+pub enum ExecProbeError {
+    /// 进程无法启动：无执行权限、noexec 挂载、隔离属性 / 安全软件拦截、文件损坏或架构不符。
+    #[error("spawn failed: {0}")]
+    Spawn(#[source] std::io::Error),
+    /// 进程启动了但以非零状态退出；`stderr` 为末尾一行摘要。
+    #[error("exited with {status}: {stderr}")]
+    Exit { status: String, stderr: String },
+    /// 进程成功退出但 stdout 首行为空。
+    #[error("no output")]
+    NoOutput,
+    #[error("timed out after {0:?}")]
+    Timeout(std::time::Duration),
+}
+
+impl ExecProbeError {
+    /// 启动被系统以权限理由拒绝（`EACCES` / `EPERM` / `ERROR_ACCESS_DENIED`）。
+    #[must_use]
+    pub fn permission_denied(&self) -> bool {
+        matches!(self, Self::Spawn(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    }
+}
+
+/// stderr 摘要保留的最大字符数。
+const EXEC_PROBE_STDERR_CHARS: usize = 300;
+
+/// 运行 `<path> <arg>`（组件版本探测）并返回 stdout 首行（去首尾空白）。
+///
+/// `timeout` 为 `None` 时不限时；超时会结束子进程。失败保留根因，供 Doctor 区分
+/// 「没有执行权限」与「能启动但运行出错」。
+pub async fn exec_probe(
+    path: &std::path::Path,
+    arg: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<String, ExecProbeError> {
+    let mut cmd = tokio::process::Command::new(path);
+    crate::proc::no_console_window(&mut cmd);
+    cmd.arg(arg)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = cmd.output();
+    let output = match timeout {
+        Some(limit) => tokio::time::timeout(limit, output)
+            .await
+            .map_err(|_| ExecProbeError::Timeout(limit))?,
+        None => output.await,
+    }
+    .map_err(ExecProbeError::Spawn)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let summary = stderr
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(EXEC_PROBE_STDERR_CHARS)
+            .collect();
+        return Err(ExecProbeError::Exit {
+            status: output.status.to_string(),
+            stderr: summary,
+        });
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    match stdout.lines().next().map(str::trim) {
+        Some(line) if !line.is_empty() => Ok(line.to_owned()),
+        _ => Err(ExecProbeError::NoOutput),
+    }
+}
+
 /// GitHub Release API JSON 拉取（带 `User-Agent`/`Accept` 头）。ffmpeg / yt-dlp
 /// 安装流程共用。
 #[cfg(feature = "components")]

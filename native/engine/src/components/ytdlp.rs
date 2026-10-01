@@ -123,23 +123,7 @@ pub async fn resolve_ytdlp(db: &Db, data_dir: &Path) -> Option<PathBuf> {
 
 /// 运行 `<path> --version` 解析版本串（yt-dlp 首行即版本，如 `2026.07.04`）。
 pub async fn probe_ytdlp_version(path: &Path) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(path);
-    crate::proc::no_console_window(&mut cmd);
-    let output = cmd
-        .arg("--version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let first_line = stdout.lines().next()?.trim();
-    if first_line.is_empty() {
-        return None;
-    }
-    Some(first_line.to_string())
+    super::exec_probe(path, "--version", None).await.ok()
 }
 
 /// 完整状态探测（设置页用）：解析生效路径 + 版本 + 系统路径展示。

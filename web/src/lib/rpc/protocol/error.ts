@@ -66,6 +66,11 @@ export type ErrorReason =
   | 'pairingVersionMismatch'
   | 'peerNotPaired'
   | 'peerOffline'
+  | 'elevationCancelled'
+  | 'elevationUnavailable'
+  | 'runningElevated'
+  | 'repairIncomplete'
+  | 'repairNotApplicable'
   | 'unknown';
 
 /** `error.data`：应用错误的机器可读详情。 */

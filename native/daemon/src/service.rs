@@ -2,7 +2,6 @@
 
 #[cfg(feature = "plugins")]
 use std::collections::HashMap;
-#[cfg(any(feature = "plugins", feature = "components"))]
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "components")]
@@ -34,7 +33,7 @@ pub struct DaemonService {
     events: DaemonEventHub,
     selections: DaemonSelection,
     db: fluxdown_engine::db::Db,
-    #[cfg(any(feature = "plugins", feature = "components"))]
+    /// daemon 数据目录：托管组件、插件，以及 Doctor 的数据目录写入探测。
     data_dir: PathBuf,
     #[cfg(feature = "plugins")]
     plugin_manager: Option<Arc<fluxdown_engine::plugin::PluginManager>>,
@@ -60,7 +59,7 @@ impl DaemonService {
         blobs: Arc<BlobStore>,
         actor: DaemonActorHandle,
         db: fluxdown_engine::db::Db,
-        #[cfg(any(feature = "plugins", feature = "components"))] data_dir: PathBuf,
+        data_dir: PathBuf,
         #[cfg(feature = "plugins")] plugin_manager: Option<
             Arc<fluxdown_engine::plugin::PluginManager>,
         >,
@@ -71,7 +70,6 @@ impl DaemonService {
             selections,
             blobs,
             db,
-            #[cfg(any(feature = "plugins", feature = "components"))]
             data_dir,
             #[cfg(feature = "plugins")]
             plugin_manager,
@@ -1015,6 +1013,28 @@ impl DaemonService {
                     "components": snapshot.components,
                 }))
             }
+            method::DAEMON_DIAGNOSTICS_PROBE => {
+                require_local_agent(is_local_agent)?;
+                let params =
+                    parse_optional_params::<fluxdown_protocol::DiagnosticsProbeParams>(params)?;
+                to_value(self.doctor_probe(params).await)
+            }
+            method::DAEMON_DIAGNOSTICS_FIX_COMPONENT => {
+                require_local_agent(is_local_agent)?;
+                let params = parse_params::<fluxdown_protocol::ComponentRepairParams>(params)?;
+                let components =
+                    crate::doctor_probe::component_paths(&self.db, &self.data_dir).await;
+                match crate::doctor_probe::fix_component(components, &self.data_dir, &params.name)
+                    .await
+                {
+                    Ok(probe) => to_value(probe),
+                    Err(
+                        error @ (crate::doctor_probe::FixComponentError::NotFound(_)
+                        | crate::doctor_probe::FixComponentError::NotManaged(_)),
+                    ) => Err(invalid_argument("name", &error.to_string())),
+                    Err(error) => Err(internal_error(error.to_string())),
+                }
+            }
             method::DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT => {
                 let mut snapshot = self.events.snapshot();
                 if let SnapshotBody::Daemon(body) = &mut snapshot.body {
@@ -1217,6 +1237,26 @@ impl DaemonService {
         match self.events.snapshot().body {
             SnapshotBody::Daemon(snapshot) => *snapshot,
             SnapshotBody::Agent(_) => unreachable!("daemon event hub returned agent snapshot"),
+        }
+    }
+
+    /// Doctor 动态探测：daemon 自己的目录在前、调用方追加的目录在后，按路径去重后并发真实写入；
+    /// 同时运行已解析到路径的外部组件。
+    async fn doctor_probe(
+        &self,
+        params: fluxdown_protocol::DiagnosticsProbeParams,
+    ) -> fluxdown_protocol::DiagnosticsProbeResult {
+        let mut targets =
+            crate::doctor_probe::daemon_targets(&self.daemon_snapshot(), &self.data_dir);
+        targets.extend(params.extra_dirs);
+        let components = crate::doctor_probe::component_paths(&self.db, &self.data_dir).await;
+        let (storage, components) = tokio::join!(
+            crate::doctor_probe::probe_storage(crate::doctor_probe::dedupe_targets(targets)),
+            crate::doctor_probe::probe_components(components, &self.data_dir),
+        );
+        fluxdown_protocol::DiagnosticsProbeResult {
+            storage,
+            components,
         }
     }
 
@@ -2045,8 +2085,32 @@ mod tests {
         db.init_default_config("/tmp")
             .await
             .expect("seed daemon dispatch config");
-        let events =
-            crate::event_hub::DaemonEventHub::new(fluxdown_protocol::DaemonSnapshot::default(), 32);
+        // `daemon.diagnostics.probe` 会真实写入保存目录并运行组件：保存目录指向测试目录，组件
+        // 指向测试目录里不可执行的空文件，不碰用户的「下载」目录，也不运行 PATH 里的程序。
+        let ffprobe = if cfg!(windows) {
+            "ffprobe.exe"
+        } else {
+            "ffprobe"
+        };
+        for name in ["ffmpeg", ffprobe, "yt-dlp"] {
+            tokio::fs::write(dir.join(name), b"")
+                .await
+                .expect("create placeholder component");
+        }
+        for (key, name) in [
+            (fluxdown_engine::components::CONFIG_FFMPEG_PATH, "ffmpeg"),
+            (fluxdown_engine::components::CONFIG_YTDLP_PATH, "yt-dlp"),
+        ] {
+            db.set_config(key, &dir.join(name).to_string_lossy())
+                .await
+                .expect("point component at placeholder");
+        }
+        let mut snapshot = fluxdown_protocol::DaemonSnapshot::default();
+        snapshot.config.values.insert(
+            "default_save_dir".to_owned(),
+            dir.to_string_lossy().into_owned(),
+        );
+        let events = crate::event_hub::DaemonEventHub::new(snapshot, 32);
         let selections = crate::selection::DaemonSelection::new(events.clone());
         let blobs = std::sync::Arc::new(
             crate::blob_store::BlobStore::open(dir.join("blobs"))
@@ -2060,7 +2124,6 @@ mod tests {
             blobs,
             crate::actor::DaemonActorHandle::disconnected(),
             db,
-            #[cfg(any(feature = "plugins", feature = "components"))]
             dir.clone(),
             #[cfg(feature = "plugins")]
             None,

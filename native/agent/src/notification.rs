@@ -73,34 +73,114 @@ impl Notifier {
     }
 
     /// 阻塞发送一条通知；失败只记日志（通知是尽力而为的旁路效果）。
-    #[cfg(not(target_os = "macos"))]
     pub fn show(&self, title: &str, body: &str) {
-        let prepared = self.prepared.get_or_init(|| prepare(&self.data_dir));
-        let mut notification = notify_rust::Notification::new();
-        notification.appname(APP_NAME).summary(title).body(body);
-        apply_platform_identity(&mut notification, prepared);
-        if let Err(error) = notification.show() {
+        if let Err(error) = self.try_show(title, body) {
             tracing::warn!(error = %error, "could not show system notification");
         }
     }
 
-    /// 阻塞发送一条通知；失败只记日志（通知是尽力而为的旁路效果）。
+    /// 阻塞发送一条通知并返回投递结果（Doctor 的「发送测试通知」）。成功只代表系统接收了
+    /// 请求；用户在系统设置里关闭通知时系统仍会静默接收。
+    #[cfg(not(target_os = "macos"))]
+    pub fn try_show(&self, title: &str, body: &str) -> Result<(), String> {
+        let prepared = self.prepared.get_or_init(|| prepare(&self.data_dir));
+        let mut notification = notify_rust::Notification::new();
+        notification.appname(APP_NAME).summary(title).body(body);
+        apply_platform_identity(&mut notification, prepared);
+        notification
+            .show()
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// 阻塞发送一条通知并返回投递结果（Doctor 的「发送测试通知」）。成功只代表系统接收了
+    /// 请求；用户在系统设置里关闭通知时系统仍会静默接收。
     #[cfg(target_os = "macos")]
-    pub fn show(&self, title: &str, body: &str) {
-        match std::process::Command::new(OSASCRIPT)
+    pub fn try_show(&self, title: &str, body: &str) -> Result<(), String> {
+        let output = std::process::Command::new(OSASCRIPT)
             .args(osascript_notification_args(title, body))
             .stdin(std::process::Stdio::null())
             .output()
-        {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => tracing::warn!(
-                status = %output.status,
-                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-                "osascript notification failed"
-            ),
-            Err(error) => tracing::warn!(error = %error, "could not spawn osascript"),
+            .map_err(|error| format!("could not spawn osascript: {error}"))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "osascript exited with {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
         }
     }
+}
+
+/// 系统通知能否送达（只读探测，不发送通知）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationAvailability {
+    /// 系统会显示本应用的通知；附带探测到的细节（如通知服务名）。
+    Available(String),
+    /// 用户在系统设置里关闭了通知。
+    Blocked(String),
+    /// 系统没有可用的通知服务（如 Linux 会话里没有通知守护进程）。
+    Unavailable(String),
+    /// 系统不提供可读的通知授权状态（macOS：经 osascript 投递，授权挂在「脚本编辑器」名下）。
+    Unverifiable,
+}
+
+/// 读取系统级通知开关（阻塞；调用方放进 `spawn_blocking`）。
+#[cfg(windows)]
+#[must_use]
+pub fn availability() -> NotificationAvailability {
+    use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+
+    let read_dword = |path: &str, name: &str| {
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(path, KEY_READ)
+            .and_then(|key| key.get_value::<u32, _>(name))
+            .ok()
+    };
+    if read_dword(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\PushNotifications",
+        "ToastEnabled",
+    ) == Some(0)
+    {
+        return NotificationAvailability::Blocked(
+            "notifications from all apps are turned off in Windows Settings".to_owned(),
+        );
+    }
+    if read_dword(
+        &format!(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\{WINDOWS_AUMID}"
+        ),
+        "Enabled",
+    ) == Some(0)
+    {
+        return NotificationAvailability::Blocked(
+            "FluxDown notifications are turned off in Windows Settings".to_owned(),
+        );
+    }
+    NotificationAvailability::Available(format!("toast sender {WINDOWS_AUMID}"))
+}
+
+/// 询问会话总线上的通知服务（阻塞；调用方放进 `spawn_blocking`）。
+#[cfg(all(unix, not(target_os = "macos")))]
+#[must_use]
+pub fn availability() -> NotificationAvailability {
+    match notify_rust::get_server_information() {
+        Ok(info) => NotificationAvailability::Available(format!(
+            "{} {} ({})",
+            info.name, info.version, info.vendor
+        )),
+        Err(error) => NotificationAvailability::Unavailable(error.to_string()),
+    }
+}
+
+/// macOS 没有可读的授权状态（见 [`NotificationAvailability::Unverifiable`]）。
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn availability() -> NotificationAvailability {
+    NotificationAvailability::Unverifiable
 }
 
 #[cfg(target_os = "macos")]
@@ -236,6 +316,8 @@ pub fn english_text(key: &str, count: Option<usize>) -> String {
         "associationOffIgnored" => {
             "This association is turned off in Settings, so FluxDown did not add a download."
         }
+        "doctorTestNotificationTitle" => "FluxDown test notification",
+        "doctorTestNotificationBody" => "If you can see this, download notifications work.",
         other => other,
     };
     count.map_or_else(

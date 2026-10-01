@@ -1,18 +1,58 @@
 // 环境诊断（GPUI `crates/settings/src/sections/doctor.rs`）：运行 agent.diagnostics.run，展示检查项与就地修复。
-// 桌面专属的检查项（浏览器 NMH 注册、协议/文件关联）与主机侧修复（重新注册、打开日志目录）在 Web 隐藏。
+// 桌面专属的检查项（浏览器 NMH 注册与拉起、浏览器策略、协议/文件关联、开机自启、系统通知、以 root 运行）与需要
+// 桌面会话的修复（重新注册、打开日志目录、请求管理员授权、打开系统设置、测试通知）在 Web 隐藏。
 
 import { useState } from 'react'
 import { useT } from '../../../../i18n'
 import type { TFunction } from '../../../../i18n'
 import { copyText } from '../../../../lib/copy'
 import { rpc } from '../../../../lib/rpc'
-import type { DaemonDiagnosticsDescribe, DiagnosticCheckDto, DiagnosticLevel, DiagnosticsReportDto } from '../../../../lib/rpc'
+import type { DaemonDiagnosticsDescribe, DiagnosticCheckDto, DiagnosticLevel, DiagnosticsReportDto, ErrorReason } from '../../../../lib/rpc'
+import { RpcError } from '../../../../lib/rpc'
 import { rpcErrorText } from '../../../../lib/rpcErrorText'
 import { Button, toast } from '../../../../ui'
 import { SettingsCustomRow, SettingsPage, SettingsSection, camel, useSettingsReadOnly } from '../../kit'
 
-const DESKTOP_ONLY_CHECKS: ReadonlySet<string> = new Set(['nmh_binary', 'nmh_manifest', 'nmh_browser', 'nmh_relay', 'url_protocol', 'torrent_association'])
-const DESKTOP_ONLY_ACTIONS: ReadonlySet<string> = new Set(['reregister', 'use_this_install', 'register', 'open_log_dir', 'openLogDir'])
+const DESKTOP_ONLY_CHECKS: ReadonlySet<string> = new Set([
+  'nmh_binary',
+  'nmh_manifest',
+  'nmh_browser',
+  'nmh_relay',
+  'nmh_launch',
+  'nmh_policy',
+  'nmh_ownership',
+  'url_protocol',
+  'torrent_association',
+  'autostart',
+  'notifications',
+  'elevated_run',
+])
+const DESKTOP_ONLY_ACTIONS: ReadonlySet<string> = new Set([
+  'reregister',
+  'use_this_install',
+  'register',
+  'open_log_dir',
+  'openLogDir',
+  'test_notification',
+  'fix_dir_access',
+  'enable_autostart',
+  'open_settings',
+])
+
+/** 修复失败的可操作说明（同 GPUI `doctor::repair_outcome`）；其余错误回退通用文案。 */
+const REPAIR_REASON_KEYS: Partial<Record<ErrorReason, string>> = {
+  elevationCancelled: 'doctorRepairCancelled',
+  elevationUnavailable: 'doctorRepairUnavailable',
+  runningElevated: 'doctorRepairRunningElevated',
+  repairIncomplete: 'doctorRepairIncomplete',
+  repairNotApplicable: 'doctorRepairNotApplicable',
+}
+
+function repairErrorText(error: unknown, t: TFunction): string {
+  const reason = error instanceof RpcError ? error.reason : undefined
+  const key = reason ? REPAIR_REASON_KEYS[reason] : undefined
+  return key ? t(key) : t('doctorRepairFailed', { error: rpcErrorText(error, t) })
+}
 
 const LEVEL_KEYS: Record<DiagnosticLevel, string> = {
   ok: 'doctorLevelOk',
@@ -97,15 +137,20 @@ export function DoctorSettings() {
     }
   }
 
-  const repair = async (check: DiagnosticCheckDto) => {
+  /** `tag` 带行序：同名队列 / RSS 源 / 分类会产生相同的 id·target。修复失败也重新诊断（可能只完成了一部分）。 */
+  const repair = async (check: DiagnosticCheckDto, tag: string) => {
     if (!check.repair || repairingTag !== null) return
-    setRepairingTag(`${check.id}-${check.target}`)
+    setRepairingTag(tag)
     try {
       await rpc.agent.diagnostics.repair(check.repair)
+    } catch (error) {
+      toast.error(repairErrorText(error, t))
+    }
+    try {
       const report = await rpc.agent.diagnostics.run()
       setLoaded((prev) => ({ report, checks: report.checks.filter((item) => !DESKTOP_ONLY_CHECKS.has(item.id)), env: prev?.env ?? null }))
     } catch (error) {
-      toast.error(t('doctorRepairFailed', { error: rpcErrorText(error, t) }))
+      toast.error(rpcErrorText(error, t))
     } finally {
       setRepairingTag(null)
     }
@@ -143,15 +188,10 @@ export function DoctorSettings() {
       {loaded ? (
         <>
           <SettingsSection>
-            {loaded.checks.map((check) => (
-              <CheckRow
-                key={`${check.id}-${check.target}`}
-                check={check}
-                busy={busy}
-                repairing={repairingTag === `${check.id}-${check.target}`}
-                onRepair={() => void repair(check)}
-              />
-            ))}
+            {loaded.checks.map((check, index) => {
+              const tag = `${index}-${check.id}-${check.target}`
+              return <CheckRow key={tag} check={check} busy={busy} repairing={repairingTag === tag} onRepair={() => void repair(check, tag)} />
+            })}
           </SettingsSection>
           <SettingsSection title={t('doctorEnvTitle')}>
             <SettingsCustomRow>

@@ -80,6 +80,12 @@ import type {
 
 /** 对端用户有 60s 决策窗口，服务端最长等待 70s。 */
 const PAIR_FINISH_TIMEOUT_MS = 75_000;
+/**
+ * Doctor 会真实写入保存目录并运行组件：agent 等 daemon 动态探测最长 30s、修复组件后再探测
+ * 同样 30s，再叠加其余检查。留出余量，确保报告（含 `permission_probe` 超时那一行）先于客户端
+ * 超时到达。
+ */
+const DIAGNOSTICS_TIMEOUT_MS = 60_000;
 
 const session = {
   /** 当前会话；未登录为 null。 */
@@ -210,10 +216,15 @@ const capture = {
 };
 
 const diagnostics = {
-  run: () => call<DiagnosticsReportDto>(METHOD.AGENT_DIAGNOSTICS_RUN),
+  run: () =>
+    call<DiagnosticsReportDto>(METHOD.AGENT_DIAGNOSTICS_RUN, undefined, {
+      timeoutMs: DIAGNOSTICS_TIMEOUT_MS,
+    }),
   /** 成功返回 `{ ok: true }` 或所转发 daemon RPC 的结果（`refreshTrackers` 等）。 */
   repair: (params: DiagnosticRepairParams) =>
-    call<JsonValue>(METHOD.AGENT_DIAGNOSTICS_REPAIR, params),
+    call<JsonValue>(METHOD.AGENT_DIAGNOSTICS_REPAIR, params, {
+      timeoutMs: DIAGNOSTICS_TIMEOUT_MS,
+    }),
   logPaths: () => call<LogPathsDto>(METHOD.AGENT_DIAGNOSTICS_LOG_PATHS),
 };
 

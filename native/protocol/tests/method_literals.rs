@@ -94,6 +94,8 @@ fn canonical_method_literals_are_exact_and_unique() {
         "daemon.ed2k.serverSubscription.refresh",
         "daemon.diagnostics.describe",
         "daemon.diagnostics.prepareLogExport",
+        "daemon.diagnostics.probe",
+        "daemon.diagnostics.fixComponent",
         "daemon.migration.linkExport",
         "daemon.migration.linkAck",
         "daemon.migration.gatewayExport",

@@ -1007,14 +1007,44 @@ fn capture_value<T: serde::Serialize>(
 }
 
 fn diagnostics_value<T>(result: Result<T, DiagnosticsError>) -> Result<T, RpcErrorData> {
+    use crate::permission::PermissionError;
+    use fluxdown_protocol::ErrorReason;
+
+    if let Err(error) = &result {
+        tracing::warn!(error = %error, "doctor action failed");
+    }
     result.map_err(|error| match error {
         DiagnosticsError::InvalidAction(_) => {
             RpcErrorData::new(ApplicationErrorCode::InvalidArgument, false)
         }
         DiagnosticsError::Platform(error) => platform_error_data(error),
         DiagnosticsError::Daemon(error) => error,
-        DiagnosticsError::State(_) | DiagnosticsError::Io(_) | DiagnosticsError::Export(_) => {
+        DiagnosticsError::State(_)
+        | DiagnosticsError::Io(_)
+        | DiagnosticsError::Export(_)
+        | DiagnosticsError::Notification(_)
+        | DiagnosticsError::Permission(PermissionError::Failed(_) | PermissionError::TimedOut(_)) => {
             RpcErrorData::new(ApplicationErrorCode::Internal, false)
+        }
+        DiagnosticsError::Permission(PermissionError::Cancelled) => {
+            RpcErrorData::new(ApplicationErrorCode::Cancelled, false)
+                .with_reason(ErrorReason::ElevationCancelled)
+        }
+        DiagnosticsError::Permission(PermissionError::ElevationUnavailable(_)) => {
+            RpcErrorData::new(ApplicationErrorCode::Unsupported, false)
+                .with_reason(ErrorReason::ElevationUnavailable)
+        }
+        DiagnosticsError::Permission(PermissionError::RunningElevated) => {
+            RpcErrorData::new(ApplicationErrorCode::Unsupported, false)
+                .with_reason(ErrorReason::RunningElevated)
+        }
+        DiagnosticsError::Permission(PermissionError::NotApplicable(_)) => {
+            RpcErrorData::new(ApplicationErrorCode::Unsupported, false)
+                .with_reason(ErrorReason::RepairNotApplicable)
+        }
+        DiagnosticsError::RepairIncomplete(_) => {
+            RpcErrorData::new(ApplicationErrorCode::Internal, false)
+                .with_reason(ErrorReason::RepairIncomplete)
         }
     })
 }
@@ -1463,8 +1493,9 @@ const RESPONSE_QUEUE: usize = 256;
 /// 每个通道待处理请求上限；超出立即以可重试的 `Unavailable` 拒绝，而不是阻塞整个连接。
 const LANE_QUEUE: usize = 128;
 
-/// headless 宿主不提供桌面集成：打开路径、写注册表 / 关联的诊断动作，以及可写任意目标路径的日志导出。
-/// Web 的 Doctor 仍可用其余动作（刷新 tracker / ed2k 服务器等），日志导出走 `/api/web/logs/export`。
+/// headless 宿主不提供桌面集成：打开路径、写注册表 / 关联、请求管理员授权、打开系统设置与
+/// 测试通知的诊断动作，以及可写任意目标路径的日志导出。Web 的 Doctor 仍可用其余动作（刷新
+/// tracker / ed2k 服务器、修复托管组件执行权限等），日志导出走 `/api/web/logs/export`。
 fn server_mode_denies(request: &RpcRequest) -> bool {
     match request.method.as_str() {
         method::AGENT_DIAGNOSTICS_EXPORT_LOGS => true,
@@ -1480,6 +1511,10 @@ fn server_mode_denies(request: &RpcRequest) -> bool {
                         | crate::diagnostics::ACTION_REGISTER
                         | crate::diagnostics::ACTION_REREGISTER
                         | crate::diagnostics::ACTION_USE_THIS_INSTALL
+                        | crate::diagnostics::ACTION_FIX_DIR_ACCESS
+                        | crate::diagnostics::ACTION_ENABLE_AUTOSTART
+                        | crate::diagnostics::ACTION_OPEN_SETTINGS
+                        | crate::diagnostics::ACTION_TEST_NOTIFICATION
                 )
             }),
         _ => false,
@@ -1503,6 +1538,8 @@ enum Lane {
     Icon,
     /// 局域网配对 / 诊断：含最长约 70s 的对端等待或外部探测，单独成道，不堵住心跳与本机设置操作。
     Slow,
+    /// Doctor 修复：可能等待用户在系统授权对话框里操作数分钟，单独成道，不堵住配对与重新诊断。
+    Repair,
 }
 
 fn lane_for(method_name: &str) -> Lane {
@@ -1532,6 +1569,8 @@ fn lane_for(method_name: &str) -> Lane {
         .any(|prefix| method_name.starts_with(prefix))
     {
         Lane::Cloud
+    } else if method_name == fluxdown_protocol::method::AGENT_DIAGNOSTICS_REPAIR {
+        Lane::Repair
     } else if method_name.starts_with("agent.link.")
         || method_name.starts_with("agent.diagnostics.")
     {
@@ -1548,6 +1587,7 @@ struct RequestLanes {
     local: tokio::sync::mpsc::Sender<RpcRequest>,
     icon: tokio::sync::mpsc::Sender<RpcRequest>,
     slow: tokio::sync::mpsc::Sender<RpcRequest>,
+    repair: tokio::sync::mpsc::Sender<RpcRequest>,
 }
 
 /// 单条连接同时在途的 daemon 慢调用上限（daemon 侧每连接上限为 16，留出余量）。
@@ -1601,6 +1641,7 @@ impl RequestLanes {
             local: start(),
             icon: start(),
             slow: start(),
+            repair: start(),
         }
     }
 
@@ -1613,6 +1654,7 @@ impl RequestLanes {
             Lane::Local => &self.local,
             Lane::Icon => &self.icon,
             Lane::Slow => &self.slow,
+            Lane::Repair => &self.repair,
         };
         let id = request.id.clone();
         match sender.try_send(request) {

@@ -104,7 +104,7 @@ fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&'static str
         ErrorReason::TaskStateConflict => "errReasonTaskStateConflict",
         ErrorReason::TaskDeviceMismatch => "errReasonTaskDeviceMismatch",
         ErrorReason::SaveDirUnavailable => "errReasonSaveDirUnavailable",
-        // 插件市场原因由扩展能力展示；这里退回按 code 的通用文案。
+        // 插件市场与 Doctor 修复的原因由各自页面展示；这里退回按 code 的通用文案。
         ErrorReason::MarketUnreachable
         | ErrorReason::MarketIndexInvalid
         | ErrorReason::MarketIndexRollback
@@ -114,6 +114,11 @@ fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&'static str
         | ErrorReason::PluginPackageTooLarge
         | ErrorReason::PluginPackageInvalid
         | ErrorReason::MarketVersionChanged
+        | ErrorReason::ElevationCancelled
+        | ErrorReason::ElevationUnavailable
+        | ErrorReason::RunningElevated
+        | ErrorReason::RepairIncomplete
+        | ErrorReason::RepairNotApplicable
         | ErrorReason::Unknown => return None,
     })
 }

@@ -1,13 +1,13 @@
 //! Doctor：环境自检报告与就地修复。检查项 `id`/`hint`/`repair.action` 由 agent 给出。
 
-use fluxdown_protocol::{DiagnosticLevel, DiagnosticRepairParams, method};
+use fluxdown_protocol::{ApplicationErrorCode, DiagnosticLevel, ErrorReason, RpcErrorData};
 use fluxdown_ui_components::{ButtonVariant, FluxIcon, button, loading_button};
 use fluxdown_ui_theme::active_theme;
 use gpui::{
     App, ClipboardItem, FontWeight, IntoElement as _, ParentElement, SharedString, Styled, div, px,
 };
 use gpui_component::{h_flex, v_flex};
-use serde_json::json;
+use serde_json::Value;
 
 use super::{SectionContext, camel};
 use crate::ui::{
@@ -37,10 +37,19 @@ fn toolbar_item(ctx: &SectionContext) -> SettingsRow {
     let never = ctx.t("doctorNeverRun");
     SettingsRow::custom(move |disabled, _key, _window, cx: &mut App| {
         let tokens = active_theme(cx).tokens();
+        let extended = active_theme(cx).extended().colors;
         let busy = store.read(cx).is_busy("diagnostics");
         // 修复动作同样占用 `diagnostics`，只有「运行检测」本身才让该按钮转圈。
         let running_check = store.read(cx).is_busy_untagged("diagnostics");
         let report = store.read(cx).diagnostics().cloned();
+        let outcome = store
+            .read(cx)
+            .transient(crate::store::DOCTOR_REPAIR_OUTCOME)
+            .and_then(|outcome| {
+                let key = outcome.get("key").and_then(Value::as_str)?;
+                let ok = outcome.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                Some((translator.text(key).to_owned(), ok))
+            });
         let summary = report.as_ref().map_or_else(
             || never.to_string(),
             |report| {
@@ -67,9 +76,23 @@ fn toolbar_item(ctx: &SectionContext) -> SettingsRow {
             .justify_between()
             .gap(tokens.spacing.md)
             .child(
-                body_text(cx)
-                    .text_color(tokens.colors.muted_foreground)
-                    .child(SharedString::from(summary)),
+                v_flex()
+                    .min_w_0()
+                    .gap(tokens.spacing.xxs)
+                    .child(
+                        body_text(cx)
+                            .text_color(tokens.colors.muted_foreground)
+                            .child(SharedString::from(summary)),
+                    )
+                    .children(outcome.map(|(text, ok)| {
+                        meta_text(cx)
+                            .text_color(if ok {
+                                extended.success
+                            } else {
+                                tokens.colors.destructive
+                            })
+                            .child(SharedString::from(text))
+                    })),
             )
             .child(
                 h_flex()
@@ -99,7 +122,10 @@ fn toolbar_item(ctx: &SectionContext) -> SettingsRow {
                         )
                         .disabled(disabled || busy)
                         .on_click(move |_, _, cx| {
-                            run_store.update(cx, |store, cx| store.run_diagnostics(cx));
+                            run_store.update(cx, |store, cx| {
+                                store.clear_repair_outcome(cx);
+                                store.run_diagnostics(cx);
+                            });
                         }),
                     ),
             )
@@ -120,7 +146,7 @@ fn report_item(ctx: &SectionContext) -> SettingsRow {
         };
         let busy = store.read(cx).is_busy("diagnostics");
         let mut column = v_flex().w_full().gap(tokens.spacing.xs);
-        for check in &report.checks {
+        for (index, check) in report.checks.iter().enumerate() {
             let label_key = format!("doctorCheck{}", camel(&check.id));
             let mut title = translator.text(&label_key).to_owned();
             if !check.target.is_empty() {
@@ -179,7 +205,8 @@ fn report_item(ctx: &SectionContext) -> SettingsRow {
                 let label = SharedString::from(translator.text(&action_key).to_owned());
                 let repair_store = store.clone();
                 let params = repair.clone();
-                let tag = SharedString::from(format!("{}-{}", check.id, check.target));
+                // 同名队列 / RSS 源 / 分类会产生相同的 id·target，按行序区分按钮与忙碌标签。
+                let tag = SharedString::from(format!("{index}-{}-{}", check.id, check.target));
                 let repairing = store.read(cx).is_busy_tagged("diagnostics", &tag);
                 row = row.child(
                     row_loading_button(
@@ -194,7 +221,7 @@ fn report_item(ctx: &SectionContext) -> SettingsRow {
                         let params = params.clone();
                         let tag = tag.clone();
                         repair_store.update(cx, |store, cx| {
-                            run_repair(store, params, cx);
+                            store.repair_diagnostics(params, cx);
                             store.tag_busy("diagnostics", tag);
                         });
                     }),
@@ -206,22 +233,34 @@ fn report_item(ctx: &SectionContext) -> SettingsRow {
     })
 }
 
-fn run_repair(
-    store: &mut crate::store::SettingsStore,
-    params: DiagnosticRepairParams,
-    cx: &mut gpui::Context<crate::store::SettingsStore>,
-) {
-    if params.action == "openLogDir" {
-        store.call_simple(
-            "diagnostics",
-            method::AGENT_PLATFORM_OPEN_PATH,
-            json!({ "path": params.target, "reveal": false }),
-            None,
-            cx,
-        );
-        return;
+/// 修复结果的就地提示（i18n 键）与成功标记：授权被取消、无法授权、修复后仍未通过等按
+/// [`ErrorReason`] 给出可操作的说明，其余错误回退按错误码的通用文案。
+pub(crate) fn repair_outcome(
+    action: &str,
+    result: &Result<Value, RpcErrorData>,
+) -> (&'static str, bool) {
+    match result {
+        Ok(_) => (
+            match action {
+                "test_notification" => "doctorTestNotificationSent",
+                "open_settings" => "doctorSettingsOpened",
+                _ => "doctorRepairSucceeded",
+            },
+            true,
+        ),
+        Err(error) => (
+            match error.reason {
+                Some(ErrorReason::ElevationCancelled) => "doctorRepairCancelled",
+                Some(ErrorReason::ElevationUnavailable) => "doctorRepairUnavailable",
+                Some(ErrorReason::RunningElevated) => "doctorRepairRunningElevated",
+                Some(ErrorReason::RepairIncomplete) => "doctorRepairIncomplete",
+                Some(ErrorReason::RepairNotApplicable) => "doctorRepairNotApplicable",
+                _ if error.code == ApplicationErrorCode::Cancelled => "doctorRepairCancelled",
+                _ => crate::store::SettingsErrorKind::from_rpc(error).i18n_key(),
+            },
+            false,
+        ),
     }
-    store.repair_diagnostics(params, cx);
 }
 
 /// 纯文本报告（供复制到反馈）。

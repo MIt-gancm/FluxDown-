@@ -329,18 +329,22 @@ pub(crate) async fn run_with(
             Ok(())
         })
     };
-    let diagnostics = Arc::new(
-        crate::diagnostics::DiagnosticsService::new(
-            daemon.clone(),
-            daemon_config.clone(),
-            events.clone(),
-            shared_state.clone(),
-            store.clone(),
-            api_switches.clone(),
-            api_token.clone(),
-        )
-        .with_daemon_startup(supervisor.clone(), daemon_stderr_log),
-    );
+    let diagnostics = crate::diagnostics::DiagnosticsService::new(
+        daemon.clone(),
+        daemon_config.clone(),
+        events.clone(),
+        shared_state.clone(),
+        store.clone(),
+        api_switches.clone(),
+        api_token.clone(),
+    )
+    .with_daemon_startup(supervisor.clone(), daemon_stderr_log);
+    // 开机自启与系统通知只属于桌面宿主；headless 没有登录会话可检查。
+    let diagnostics = Arc::new(if server.is_some() {
+        diagnostics
+    } else {
+        diagnostics.with_desktop_checks(notifier.clone())
+    });
     let update = Arc::new(crate::update::UpdateService::new(
         fluxdown_protocol::APP_VERSION,
     ));

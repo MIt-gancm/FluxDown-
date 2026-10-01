@@ -25,6 +25,8 @@ mod mutation;
 const FLUSH_DEBOUNCE: Duration = Duration::from_millis(250);
 /// daemon 修订冲突时的自动重试上限。
 const MAX_CONFLICT_RETRIES: u8 = 3;
+/// Doctor 上一次修复结果（`{key, ok}`，`key` 为 i18n 键）在 `transient` 里的键。
+pub(crate) const DOCTOR_REPAIR_OUTCOME: &str = "doctor_repair_outcome";
 
 /// 设置写回失败的 UI 可展示分类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -880,23 +882,40 @@ impl SettingsStore {
             },
         );
     }
+    /// 执行 Doctor 修复。结果（成功 / 已取消授权 / 修复后仍未通过…）记在
+    /// [`DOCTOR_REPAIR_OUTCOME`] 由 Doctor 页就地展示，不走全局「操作失败」横幅；随后总是重新
+    /// 诊断——修复可能只完成了一部分，列表要反映真实状态。
     pub fn repair_diagnostics(
         &mut self,
         params: fluxdown_protocol::DiagnosticRepairParams,
         cx: &mut Context<Self>,
     ) {
+        let action = params.action.clone();
         let params = serde_json::to_value(params).unwrap_or_else(|_| json!({}));
+        self.transient.remove(DOCTOR_REPAIR_OUTCOME);
         self.call_with(
             "diagnostics",
             method::AGENT_DIAGNOSTICS_REPAIR,
             params,
             cx,
-            |this, result, cx| {
-                if result.is_ok() {
-                    this.run_diagnostics(cx);
+            move |this, result, cx| {
+                // 「打开目录」不是修复：成功时不提示、不重跑诊断；失败沿用全局错误横幅。
+                if action == "open_log_dir" {
+                    return;
                 }
+                let (key, ok) = crate::sections::doctor::repair_outcome(&action, &result);
+                this.last_error = None;
+                this.set_transient(DOCTOR_REPAIR_OUTCOME, json!({ "key": key, "ok": ok }), cx);
+                this.run_diagnostics(cx);
             },
         );
+    }
+
+    /// 清除上一次修复的就地提示（重新运行诊断时）。
+    pub fn clear_repair_outcome(&mut self, cx: &mut Context<Self>) {
+        if self.transient.remove(DOCTOR_REPAIR_OUTCOME).is_some() {
+            cx.notify();
+        }
     }
 
     pub fn load_site_auth(&mut self, cx: &mut Context<Self>) {

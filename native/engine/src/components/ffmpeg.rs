@@ -147,22 +147,9 @@ pub async fn resolve_ffprobe(db: &Db, data_dir: &Path) -> Option<PathBuf> {
 
 /// 运行 `<path> -version` 解析版本串（如 `7.1` / `n7.1-...` 原样 token）。
 pub async fn probe_version(path: &Path) -> Option<String> {
-    let mut cmd = tokio::process::Command::new(path);
-    crate::proc::no_console_window(&mut cmd);
-    let output = cmd
-        .arg("-version")
-        .stdin(std::process::Stdio::null())
-        .output()
-        .await
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
     // 首行形如 "ffmpeg version 7.1-static ..."，取第三个 token。
-    let first_line = stdout.lines().next()?;
-    let token = first_line.split_whitespace().nth(2)?;
-    Some(token.to_string())
+    let first_line = super::exec_probe(path, "-version", None).await.ok()?;
+    first_line.split_whitespace().nth(2).map(str::to_string)
 }
 
 /// 完整状态探测（设置页用）：解析生效路径 + 版本 + 系统路径展示。

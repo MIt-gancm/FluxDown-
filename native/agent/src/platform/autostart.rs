@@ -11,7 +11,7 @@
 //! “已注册”要求条目以 `--autostart` 指向当前 agent；程序移动/升级后旧条目视为未注册，
 //! 用户重新开启即覆盖为新路径。“已启用”= 已注册且未被系统级开关禁用（Windows
 //! `Explorer\StartupApproved\Run` 首字节为奇数；XDG `Hidden=true` /
-//! `X-GNOME-Autostart-enabled=false`）。
+//! `X-GNOME-Autostart-enabled=false`；macOS launchd 用户域禁用表把标签列为 disabled）。
 //!
 //! 与 Flutter 客户端（`lib/src/services/autostart_service.dart`）同一契约：
 //! [`enable`] 是用户在应用内的明确开启，写入条目并清除系统级禁用标记；
@@ -76,6 +76,19 @@ fn xdg_retarget_exec(content: &str, exec_line: &str) -> Option<String> {
         .position(|line| line.trim() == "[Desktop Entry]")?;
     lines.insert(header + 1, exec_line);
     Some(lines.join("\n"))
+}
+
+/// `launchctl print-disabled` 输出里 `label` 是否被禁用：新系统为 `"label" => disabled`，
+/// 旧系统为 `"label" => true`。
+#[cfg(any(target_os = "macos", test))]
+fn launchd_label_disabled(output: &str, label: &str) -> bool {
+    let quoted = format!("\"{label}\"");
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix(&quoted)
+            .and_then(|rest| rest.trim_start().strip_prefix("=>"))
+            .is_some_and(|state| matches!(state.trim(), "disabled" | "true"))
+    })
 }
 
 #[cfg(target_os = "windows")]
@@ -252,7 +265,7 @@ mod inner {
     }
 
     /// 「系统设置 → 登录项 → 允许在后台」关闭的状态由 Background Task Management 维护，
-    /// 没有公开 API 可读，这里只能以 plist 是否指向当前 agent 判断。
+    /// 没有公开 API 可读；这里只以 plist 是否指向当前 agent 判断注册。
     pub fn is_registered(agent: &Path) -> bool {
         content().is_some_and(|content| {
             content.contains(&program_element(agent))
@@ -260,26 +273,67 @@ mod inner {
         })
     }
 
+    /// 已注册且 launchd 的用户域禁用表里没有把该标签标为禁用。
     pub fn is_enabled(agent: &Path) -> bool {
-        is_registered(agent)
+        is_registered(agent) && !launchd_disabled()
+    }
+
+    /// `launchctl print-disabled gui/<uid>` 是否把本标签列为禁用；读不到时按未禁用处理。
+    fn launchd_disabled() -> bool {
+        let Some(uid) = launchctl(&["manageruid"]) else {
+            return false;
+        };
+        let domain = format!("gui/{}", uid.trim());
+        launchctl(&["print-disabled", &domain])
+            .is_some_and(|output| super::launchd_label_disabled(&output, LABEL))
+    }
+
+    fn launchctl(args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("/bin/launchctl")
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     pub fn targets(executable: &Path) -> bool {
         content().is_some_and(|content| content.contains(&program_element(executable)))
     }
 
-    /// plist 只有启动目标，迁移即整份重写；登录项的后台许可不在文件里，不受影响。
+    /// plist 只有启动目标，迁移即整份重写；launchd 禁用表与登录项后台许可不在文件里，不受影响。
     pub fn retarget(agent: &Path) -> Result<(), PlatformError> {
-        enable(agent)
+        write_plist(agent)?;
+        tracing::info!("retargeted autostart entry");
+        Ok(())
     }
 
+    /// 用户在应用内明确开启：写入 plist 并清除 launchd 用户域禁用标记（尽力而为）。
     pub fn enable(agent: &Path) -> Result<(), PlatformError> {
+        write_plist(agent)?;
+        if launchd_disabled() {
+            let target =
+                launchctl(&["manageruid"]).map(|uid| format!("gui/{}/{LABEL}", uid.trim()));
+            if target
+                .and_then(|target| launchctl(&["enable", &target]))
+                .is_none()
+            {
+                tracing::warn!("could not clear the launchd disabled flag for autostart");
+            }
+        }
+        tracing::info!("enabled autostart");
+        Ok(())
+    }
+
+    fn write_plist(agent: &Path) -> Result<(), PlatformError> {
         let path = plist_path()?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&path, plist_body(agent))?;
-        tracing::info!(path = %path.display(), "enabled autostart");
         Ok(())
     }
 
@@ -454,6 +508,18 @@ mod tests {
         assert!(startup_approved(Some(&[])));
         assert!(startup_approved(Some(&[2, 0, 0])));
         assert!(!startup_approved(Some(&[3, 0, 0])));
+    }
+
+    #[test]
+    fn launchd_disabled_table_matches_exact_label_in_both_formats() {
+        let modern = "disabled services = {\n\t\t\"dev.zerx.fluxdown.desktop\" => disabled\n\t\t\"other\" => enabled\n\t}\n";
+        assert!(launchd_label_disabled(modern, "dev.zerx.fluxdown.desktop"));
+        assert!(!launchd_label_disabled(modern, "other"));
+        assert!(!launchd_label_disabled(modern, "dev.zerx.fluxdown"));
+        let legacy = "\t\"dev.zerx.fluxdown.desktop\" => true\n\t\"other\" => false\n";
+        assert!(launchd_label_disabled(legacy, "dev.zerx.fluxdown.desktop"));
+        assert!(!launchd_label_disabled(legacy, "other"));
+        assert!(!launchd_label_disabled("", "dev.zerx.fluxdown.desktop"));
     }
 
     #[test]

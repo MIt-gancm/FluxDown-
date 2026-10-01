@@ -106,6 +106,11 @@ pub const DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH: &str = "daemon.bt.trackerSubsc
 pub const DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH: &str = "daemon.ed2k.serverSubscription.refresh";
 pub const DAEMON_DIAGNOSTICS_DESCRIBE: &str = "daemon.diagnostics.describe";
 pub const DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT: &str = "daemon.diagnostics.prepareLogExport";
+/// Doctor 动态探测：在 daemon 进程内真实写入各下载目录 / 数据目录并运行外部组件，
+/// 验证下载链路实际拥有的权限（agent 只读配置判断不出 TCC、只读挂载、隔离属性等）。
+pub const DAEMON_DIAGNOSTICS_PROBE: &str = "daemon.diagnostics.probe";
+/// Doctor 修复：补上托管组件（daemon 数据目录内）缺失的执行权限并重新探测，返回 `ComponentProbeDto`。
+pub const DAEMON_DIAGNOSTICS_FIX_COMPONENT: &str = "daemon.diagnostics.fixComponent";
 pub const DAEMON_MIGRATION_LINK_EXPORT: &str = "daemon.migration.linkExport";
 pub const DAEMON_MIGRATION_LINK_ACK: &str = "daemon.migration.linkAck";
 pub const DAEMON_MIGRATION_GATEWAY_EXPORT: &str = "daemon.migration.gatewayExport";
@@ -317,6 +322,8 @@ pub const ALL_METHODS: &[&str] = &[
     DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
     DAEMON_DIAGNOSTICS_DESCRIBE,
     DAEMON_DIAGNOSTICS_PREPARE_LOG_EXPORT,
+    DAEMON_DIAGNOSTICS_PROBE,
+    DAEMON_DIAGNOSTICS_FIX_COMPONENT,
     DAEMON_MIGRATION_LINK_EXPORT,
     DAEMON_MIGRATION_LINK_ACK,
     DAEMON_MIGRATION_GATEWAY_EXPORT,
@@ -414,6 +421,8 @@ pub const SLOW_DAEMON_METHODS: &[&str] = &[
     DAEMON_BT_TRACKER_SUBSCRIPTION_REFRESH,
     DAEMON_ED2K_SERVER_SUBSCRIPTION_REFRESH,
     DAEMON_FS_LIST,
+    DAEMON_DIAGNOSTICS_PROBE,
+    DAEMON_DIAGNOSTICS_FIX_COMPONENT,
 ];
 
 /// 是否属于 [`SLOW_DAEMON_METHODS`]。
