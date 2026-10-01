@@ -1,7 +1,8 @@
 //! 默认与内置主题经新解析管线得到的运行时值，与 v2 之前的实现逐项相等（零视觉差）。
 //!
-//! `legacy` 模块是旧实现的原样参考：Base token（gpui-base 默认 + 13/18 正文 + MiSans +
-//! 46/255 阴影）、强调色重算、亮色主色对比度调整、扩展色派生、界面缩放，以及各 crate
+//! `legacy` 模块是旧实现的原样参考：Base token（gpui-base 默认 + 13/18 正文 + 46/255 阴影；
+//! sans 字体为有意变更——由 MiSans 改为平台默认界面字体，即 gpui-base 默认 `.SystemUIFont`）、
+//! 强调色重算、亮色主色对比度调整、扩展色派生、界面缩放，以及各 crate
 //! 中原先硬编码的尺寸常量。
 
 use fluxdown_ui_theme::{
@@ -23,7 +24,6 @@ mod legacy {
             radius: RadiusTokens::default(),
             spacing: SpacingTokens::default(),
             typography: TypographyTokens {
-                sans: "MiSans".into(),
                 sm: TextStyleToken {
                     size: px(13.),
                     line_height: px(18.),

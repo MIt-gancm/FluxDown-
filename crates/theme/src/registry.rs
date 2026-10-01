@@ -693,7 +693,10 @@ pub fn registry_json() -> OrderedJson {
         "extends": (BuiltinBase::ALL.iter().map(|base| base.extends_value()).collect::<Vec<_>>()),
         "defaultExtends": (BuiltinBase::Default.extends_value()),
         "radiusFullThreshold": (number_value(RADIUS_FULL_THRESHOLD)),
-        "fontSentinels": { "monospace": "平台默认等宽字体（macOS Menlo / Windows Consolas / Linux DejaVu Sans Mono）" },
+        "fontSentinels": {
+            "monospace": "平台默认等宽字体（macOS Menlo / Windows Consolas / Linux DejaVu Sans Mono）",
+            "system-ui": "平台默认界面字体（macOS 系统字体 / Windows 系统界面字体如微软雅黑 UI、Segoe UI / Linux 系统无衬线字体）"
+        },
         "resolution": {
             "layerOrder": ["<mode>", "tokens", "base|default"],
             "evaluationOrder": "registry",

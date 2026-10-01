@@ -25,7 +25,7 @@ pub use gpui_base::Button;
 use gpui_component::Sizable as _;
 
 /// 等宽数字（OpenType `tnum`）：速度、大小、百分比、计数等会刷新的数字统一使用，
-/// 避免 MiSans 比例数字（「1」比「0」窄约 36%）在刷新时左右跳动。
+/// 避免比例数字在刷新时左右跳动。
 pub fn tabular_numbers() -> FontFeatures {
     FontFeatures(std::sync::Arc::new(vec![("tnum".into(), 1)]))
 }

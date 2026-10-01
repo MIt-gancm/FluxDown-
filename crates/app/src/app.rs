@@ -1,7 +1,6 @@
 //! composition root：一个 agent 会话、一个窗口注册表、全局菜单与动作；各窗口按需装配。
 
 use std::{
-    borrow::Cow,
     collections::BTreeMap,
     env,
     path::Path,
@@ -30,10 +29,6 @@ use crate::session::{AgentSession, SessionSignal, attach};
 use crate::settings_port::AgentSettingsPort;
 use crate::theme_library::FsThemeLibrary;
 use crate::windows::WindowRegistry;
-
-const MI_SANS_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/MiSans-Regular.ttf");
-const MI_SANS_MEDIUM: &[u8] = include_bytes!("../../../assets/fonts/MiSans-Medium.ttf");
-const MI_SANS_SEMIBOLD: &[u8] = include_bytes!("../../../assets/fonts/MiSans-Semibold.ttf");
 
 /// 事件泵单次批量上限。
 const EVENT_BATCH: usize = 256;
@@ -193,15 +188,6 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         }
     });
     application.run(move |cx| {
-        if let Err(error) = cx.text_system().add_fonts(vec![
-            Cow::Borrowed(MI_SANS_REGULAR),
-            Cow::Borrowed(MI_SANS_MEDIUM),
-            Cow::Borrowed(MI_SANS_SEMIBOLD),
-        ]) {
-            log::error!("failed to load FluxDown UI fonts: {error:#}");
-            return;
-        }
-
         gpui_component::init(cx);
         crate::logging::install_ui_watchdog(cx);
         crate::app_icon::install();

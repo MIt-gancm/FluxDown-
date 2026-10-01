@@ -3,7 +3,7 @@
 use gpui::{BoxShadow, FontWeight, Hsla, Pixels, SharedString, point, px};
 use gpui_base::{SemanticThemeTokens, TextStyleToken, TypographyTokens};
 
-use crate::builtin::MONO_FONT_SENTINEL;
+use crate::builtin::{MONO_FONT_SENTINEL, SANS_FONT_SENTINEL};
 use crate::{
     ExtendedColors, ExtendedTokens, FocusRingTokens, IconSizes, ResolvedModeTokens, ShadowValue,
     StrokeTokens, TOKENS, TokenValue,
@@ -103,6 +103,9 @@ impl ResolvedTheme {
         // Base `selection` 不是独立注册表 token：它与扩展 `colors.textSelection`
         // 同义，统一由后者投影，保证 Base 选区与 gpui-component 选区同色。
         theme.base.colors.selection = theme.extended.colors.text_selection;
+        if theme.base.typography.sans.as_ref() == SANS_FONT_SENTINEL {
+            theme.base.typography.sans = TypographyTokens::default().sans;
+        }
         if theme.base.typography.mono.as_ref() == MONO_FONT_SENTINEL {
             theme.base.typography.mono = TypographyTokens::default().mono;
         }

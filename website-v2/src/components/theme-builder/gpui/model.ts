@@ -22,7 +22,9 @@ function cssValue(spec: TokenSpec, value: TokenValue): string {
     case "number":
       return spec.kind === "fontWeight" || spec.kind === "number" ? String(f32Shortest(value.value)) : `${f32Shortest(value.value)}px`;
     case "font":
-      if (Object.hasOwn(REGISTRY.fontSentinels, value.value)) return MONO_STACK;
+      if (Object.hasOwn(REGISTRY.fontSentinels, value.value)) {
+        return value.value === "system-ui" ? "system-ui, sans-serif" : MONO_STACK;
+      }
       return `"${value.value.replaceAll('"', "")}", ${spec.path === "typography.mono" ? MONO_STACK : "system-ui, sans-serif"}`;
     case "shadow":
       return value.layers.length === 0

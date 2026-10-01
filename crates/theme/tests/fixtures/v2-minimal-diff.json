@@ -4,6 +4,6 @@
   "schemaVersion": 2,
   "meta": { "id": "nord-square", "name": "Nord Square", "author": "x", "version": "1.0.0" },
   "extends": "builtin:nord",
-  "tokens": { "radius": { "md": 2, "lg": 4 } },
+  "tokens": { "radius": { "md": 2, "lg": 4 }, "typography": { "sans": "MiSans" } },
   "dark": { "colors": { "primary": "#5E81AC" } }
 }

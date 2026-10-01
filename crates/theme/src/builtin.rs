@@ -14,6 +14,9 @@ use crate::{BuiltinThemeId, DefaultExpr, TOKENS, TokenValue};
 /// 字体哨兵：平台默认等宽字体（macOS Menlo / Windows Consolas / Linux DejaVu Sans Mono），
 /// 运行时替换为实际字体名；网页预览可直接当 CSS 通用族名使用。
 pub const MONO_FONT_SENTINEL: &str = "monospace";
+/// 字体哨兵：平台默认界面字体（macOS 系统字体 / Windows 系统界面字体如微软雅黑 UI、Segoe UI /
+/// Linux 系统无衬线字体），运行时替换为 gpui 的 `.SystemUIFont`；网页预览可直接当 CSS 通用族名使用。
+pub const SANS_FONT_SENTINEL: &str = "system-ui";
 const SHADOW_ALPHA: f32 = 46.0 / 255.0;
 /// Flutter `accentBackground` alpha 的 8-bit 量化：0.10 / 0.15 / 0.18。
 const ACCENT_ALPHA_LIGHT: u8 = 26;
@@ -124,7 +127,7 @@ fn semantic_tokens(colors: ColorTokens) -> SemanticThemeTokens {
     // 桌面正文基线 13/18（macOS 正文字号，Windows/Linux 桌面列表同样取 13），
     // gpui-component 的 rem 也取 `sm`，因此整套 rem 工具类随之对齐。
     let typography = TypographyTokens {
-        sans: "MiSans".into(),
+        sans: SANS_FONT_SENTINEL.into(),
         mono: MONO_FONT_SENTINEL.into(),
         sm: TextStyleToken {
             size: px(13.),
