@@ -142,6 +142,8 @@
 
 **模块**：`auth`（受控认证档案存储、站点绑定、过期判断和请求注入）、`manifest`（校验器 + subscription/provider 声明 + `permissions`⊆{auth,ffmpeg,ytdlp} + `auth.entry`）、`semver`、`runtime`（**无 rquickjs 类型**——可换 deno_core；含 Spec/Outcome 跨界结构 + `HostContext`）、`quickjs`（v1 唯一 impl，rquickjs 限在此文件；memory_limit + interrupt + timeout 三重兜底 + 连续 3 次熔断）、`bridge`（网络出口 SSRF 守卫 + flux.* 面）、`manager`（`RwLock<Arc<Vec>>` 整表原子替换，含 `authenticate` 登录入口 + 动态订阅路由）、`dependencies`（权限→组件依赖：ffmpeg→[ffmpeg]，ytdlp→[ytdlp,ffmpeg]，**提醒式非阻断**）、`install`（.fxplug zip：zip-slip + 压缩炸弹防护 + 单层剥壳）、`market`（去中心化市场：Git 版本化联邦索引 `zerx-lab/fluxdown-plugin-index`、内容寻址 `contentHash=sha256(zip)`、多源 failover、per-index sequence 防回滚；v1 无作者签名，schema 预留）。
 
+**市场下载诊断与代理（2026-10-01 修复）**：`MarketClient` 复用 `downloader::build_client_builder`，索引与插件包继承应用的 None/System/Manual、代理认证与 `no_proxy` 规则；daemon 每次取最新下载配置，manager 使用当前已应用代理。每个源/镜像失败记录插件 ID、版本、域名/路径和完整根因链，URL 去除 userinfo/query/fragment。哈希不符或超限仍尝试后续镜像，最终保留内容验证错误而非统统折叠为网络失败；包下载的逐跳 HTTPS / 公网字面量 IP 守卫保持启用。官方索引发布规则在 `fluxdown-plugin-index`：分片/包 append-only、镜像固定到 commit、联网完整 GET/hash，历史 sequence 冲突只向高水位以上修复。
+
 **off-actor 惰性 resolve 接线**：`create_task` 命中 `match_resolver` → 落 `tasks.resolver_plugin_id`（仅存 ID）+ 跳过 meta_prober。`do_start/resume_task` 体首守卫：resolver 非空且未解析 → 占位 active_tasks + off-actor spawn → return。worker 经 `resolve_rx` 回流，actor `select!` 分支 `on_resolve_ready`（复查生命周期 → 用解析后 url 重算五路协议分派）。**宿主 actor 必须接线 `resolve_rx` + `plugin_retry_rx`**。
 
 **config 命名空间**：`plugin.<identity>.enabled`/`.disabled_reason`/`.setting.<key>`/`.kv.<key>`；`plugin.dev.<identity>`（devMode 路径）；`market.<index_id>.sequence`。identity 格式 `^[a-z0-9_-]+@[a-z0-9_-]+$`。

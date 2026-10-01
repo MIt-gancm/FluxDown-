@@ -1435,7 +1435,7 @@
   "pluginErrorMarketIndexRollback": "The marketplace index is older than the last one seen and was rejected (possible tampering).",
   "pluginErrorNotInMarket": "This plugin is no longer listed in the marketplace.",
   "pluginErrorYanked": "The publisher has withdrawn this plugin version.",
-  "pluginErrorDownloadFailed": "Couldn't download the plugin package: none of the publisher's download links work. Try again later or contact the plugin author.",
+  "pluginErrorDownloadFailed": "Couldn't download or verify the plugin package. Check your network and proxy settings, then try again. See the diagnostics log for details.",
   "pluginErrorPackageTooLarge": "The plugin package exceeds the 10 MB size limit.",
   "pluginErrorPackageInvalid": "Invalid plugin package: the manifest, script, or version check failed. See the diagnostics log for details.",
   "pluginErrorMarketVersionChanged": "The plugin was updated in the marketplace. Review its permissions and install again.",
