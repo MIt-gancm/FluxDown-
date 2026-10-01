@@ -78,7 +78,7 @@
 - `download_manager.rs`（~7300 行）：任务生命周期、并发、队列（内置 + 命名，启停/每日定时边沿触发/顺序）、任务组、自动重试、协议分发、off-actor 插件解析插桩、速度平滑（EMA α=0.4，1s 采样窗）、WAL checkpoint。
 - `downloader.rs`：共享原语（`DownloadError` 含 Ed2k/Ed2kIntegrity/Cancelled、`RequestSpec`、文件名/编码工具）。
 - `segment_advisor.rs`：按文件大小 + CPU 推荐连接上限（HTTP 是上限，coordinator 逐步爬升）。
-- `segment_coordinator.rs`（~7300 行）：IDM 式动态分段（按需分配、按 ECF 挑选预计完成最晚的在传分段并按持有者/帮手速率比例均衡拆分、连接复用、per-domain 连接策略学习——负面上限 + 正面起步提示双观察面、`fallocate` 预分配）。子模块 `segment_coordinator/multipath.rs`：每 ramp 窗口的连接稳态采样（首窗预热、限速窗不计）→ 路径估计、冷路径探索 worker、完成时间抢占（分段子令牌取消 → `WorkerEvent::Preempted` → 余量回 Pending 立即续派）、Auto 主导链路标签与先验回写。
+- `segment_coordinator.rs`（~7300 行）：IDM 式动态分段（按需分配、按 ECF 挑选预计完成最晚的在传分段并按持有者/帮手速率比例均衡拆分、连接复用、per-domain 连接策略学习——负面上限 + 正面起步提示双观察面、`fallocate` 预分配）。子模块 `segment_coordinator/multipath.rs`：每 ramp 窗口的连接稳态采样（以租约真实开始时刻/字节建立基线；首个完整窗预热，短初窗累计，按实际时长算速率；限速窗不计，只有完整零增量窗判停滞）→ 路径估计、冷路径探索 worker、完成时间抢占（分段子令牌取消 → `WorkerEvent::Preempted` → 余量回 Pending 立即续派）、Auto 主导链路标签与先验回写。
 - `speed_limiter.rs`：全局 token bucket（Arc 可克隆，limit==0=不限）。
 - `meta_prober.rs`：队列任务后台探测文件名/大小（8s；HTTP HEAD / FTP SIZE / magnet dn= / torrent 跳过）。
 - `proxy_config.rs`：无/系统（Windows 注册表）/手动/**自动**（`ProxyMode::Auto`）；HTTP/HTTPS/SOCKS4/5；`test_proxy_connection` 测延迟。

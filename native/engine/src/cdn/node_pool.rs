@@ -163,6 +163,8 @@ pub struct LiveConn {
     pub seg_index: i32,
     /// 租约开始时该段的已下字节（段内相对）；在途传输量 = 当前 − 该值。
     pub start_downloaded: i64,
+    /// 租约开始时刻；首次窗口采样以此计算实际经过的时间。
+    pub started_at: Instant,
     cancel: CancellationToken,
 }
 
@@ -571,6 +573,7 @@ impl NodePool {
                     node_id,
                     seg_index: req.seg_index,
                     start_downloaded: req.start_downloaded,
+                    started_at: Instant::now(),
                     cancel: req.cancel,
                 },
             );
