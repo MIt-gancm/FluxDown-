@@ -215,12 +215,21 @@ pub fn install_global_actions(cx: &mut App) {
     cx.on_action(|_: &dl::OpenQueueManager, cx| crate::windows::queue_manager::open(cx));
     cx.on_action(|_: &CheckUpdate, cx| check_update(cx));
     cx.on_action(|_: &OpenLogsFolder, cx| open_logs_folder(cx));
-    cx.on_action(|_: &About, cx| show_about(cx));
+    cx.on_action(|_: &About, cx| {
+        crate::windows::settings::reveal(
+            cx,
+            fluxdown_ui_settings::SettingsTarget {
+                page: "about",
+                tab: "",
+                row: None,
+            },
+        );
+    });
     cx.on_action(|_: &ToggleCommandPalette, cx| crate::command_palette::toggle(cx));
 }
 
-/// 全局动作里操作活动窗口必须 defer：键盘触发时正处于该窗口自己的 update 栈内，
-/// 同步 `handle.update` 拿不到窗口会静默失败（菜单点击不在 update 栈内，所以只有键盘路径失效）。
+/// 全局动作里操作活动窗口必须 defer：有活动窗口时，菜单点击与键盘一样经
+/// `App::dispatch_action` 在该窗口的 update 栈内分发，同步 `handle.update` 拿不到窗口会静默失败。
 fn with_active_window(cx: &mut App, f: impl FnOnce(&Window) + 'static) {
     cx.defer(move |cx| {
         if let Some(window) = WindowRegistry::focused_window(cx) {
@@ -306,77 +315,4 @@ fn open_logs_folder(cx: &mut App) {
     // 桌面端自身日志目录本地已知；agent 不可达时日志入口恰是最需要的。
     let dir = crate::app::agent_data_dir().join("logs");
     cx.reveal_path(&dir);
-}
-
-fn show_about(cx: &mut App) {
-    let Some(window) = cx
-        .active_window()
-        .or_else(|| WindowRegistry::handle(cx, &WindowKey::Main))
-    else {
-        return;
-    };
-    let translator = Desktop::global(cx).translator.read(cx).clone();
-    let title = t(&translator, "menuAbout");
-    let version_label = t(&translator, "currentVersion");
-    let protocol_label = t(&translator, "protocolVersionLabel");
-    let website_label = t(&translator, "menuWebsite");
-    let close_label = t(&translator, "close");
-    let _ = window.update(cx, |_, window, cx| {
-        window.open_dialog(cx, move |dialog, _, cx| {
-            use gpui::{IntoElement as _, ParentElement as _, Styled as _};
-            let version_label = version_label.clone();
-            let protocol_label = protocol_label.clone();
-            let website_label = website_label.clone();
-            dialog
-                .title(fluxdown_ui_components::dialog_title(title.clone(), cx))
-                .w(gpui::px(520.))
-                .content(move |content, _, cx| {
-                    let tokens = fluxdown_ui_theme::active_theme(cx).tokens();
-                    let value = |text: String| {
-                        gpui::div()
-                            .text_size(tokens.typography.sm.size)
-                            .line_height(tokens.typography.sm.line_height)
-                            .text_color(tokens.colors.muted_foreground)
-                            .font_features(fluxdown_ui_components::tabular_numbers())
-                            .child(text)
-                    };
-                    // 版本信息用分组卡片的「标签 — 值」行呈现，与设置页同一版式。
-                    content.child(fluxdown_ui_components::option_group(
-                        [
-                            fluxdown_ui_components::option_row(
-                                version_label.clone(),
-                                None,
-                                value(format!("v{}", fluxdown_protocol::APP_VERSION)),
-                                cx,
-                            )
-                            .into_any_element(),
-                            fluxdown_ui_components::option_row(
-                                protocol_label.clone(),
-                                None,
-                                value(fluxdown_protocol::PROTOCOL_VERSION.to_string()),
-                                cx,
-                            )
-                            .into_any_element(),
-                            fluxdown_ui_components::option_row(
-                                website_label.clone(),
-                                None,
-                                gpui_component::link::Link::new("about-website")
-                                    .href(WEBSITE_URL)
-                                    .text_size(tokens.typography.sm.size)
-                                    .child(WEBSITE_URL),
-                                cx,
-                            )
-                            .into_any_element(),
-                        ],
-                        cx,
-                    ))
-                })
-                .footer(fluxdown_ui_components::dialog_footer(
-                    None,
-                    close_label.clone(),
-                    fluxdown_ui_components::DialogIntent::Confirm,
-                    cx,
-                ))
-        });
-    });
 }

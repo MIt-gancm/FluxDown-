@@ -5,7 +5,7 @@ use std::sync::Arc;
 use fluxdown_ui_account::AccountView;
 use fluxdown_ui_extensions::ExtensionsView;
 use fluxdown_ui_i18n::keys;
-use fluxdown_ui_settings::{SettingsContentSlots, SettingsView};
+use fluxdown_ui_settings::{SettingsContentSlots, SettingsTarget, SettingsView};
 use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
 use gpui::{App, AppContext as _, px, size};
 use gpui_component::Root;
@@ -61,5 +61,30 @@ pub fn open(cx: &mut App) {
         let root = cx.new(|cx| Root::new(window_view, window, cx));
         WindowRegistry::persist_bounds(RememberedWindow::Settings, client, &root, window, cx);
         root
+    });
+}
+
+/// 打开（或聚焦）设置窗口并定位到 `target`。
+///
+/// 一律 defer：菜单 / 快捷键 / 命令面板触发时都处于活动窗口的 update 栈内
+/// （`App::dispatch_action` 经活动窗口分发），同步 `handle.update` 会静默失败。
+pub fn reveal(cx: &mut App, target: SettingsTarget) {
+    cx.defer(move |cx| {
+        open(cx);
+        let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Settings) else {
+            return;
+        };
+        let Some(view) = Desktop::global(cx)
+            .settings_view
+            .as_ref()
+            .and_then(gpui::WeakEntity::upgrade)
+        else {
+            return;
+        };
+        if let Err(error) = handle.update(cx, |_, window, cx| {
+            view.update(cx, |view, cx| view.reveal(&target, window, cx));
+        }) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     });
 }
