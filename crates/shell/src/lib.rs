@@ -5,6 +5,7 @@
 
 mod assets;
 mod view;
+mod window_controls;
 
 use gpui::{Pixels, Point, SharedString, WindowDecorations, WindowOptions, point, px, size};
 use gpui_component::TitleBar;

@@ -1,5 +1,6 @@
 //! 独立下载进度 / 完成窗口：每个任务一个，FluxDown 辅助窗口标题栏；标题随进度刷新，
-//! 高度由视图按内容自行校正。开关时机由 [`crate::progress_windows`] 决定。
+//! 宽高由视图按内容自行校正（窗口不可由用户调整，可最小化；Windows / Linux 标题栏无最大化）。
+//! 开关时机由 [`crate::progress_windows`] 决定。
 //!
 //! 层级：界面常是后台应用（下载由浏览器捕获 / 静默建成时浏览器在前台），只在本应用内排序
 //! 的窗口会压在浏览器下面。
@@ -13,7 +14,7 @@ use std::{sync::Arc, time::Duration};
 use fluxdown_ui_downloads::{
     PROGRESS_WINDOW_INITIAL_HEIGHT, PROGRESS_WINDOW_WIDTH, ProgressWindowEvent, ProgressWindowView,
 };
-use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_window_options};
+use fluxdown_ui_shell::{AuxiliaryWindowView, auxiliary_title_min_width, auxiliary_window_options};
 use gpui::{
     App, AppContext as _, Bounds, Context, SharedString, Window, WindowBounds, WindowKind, point,
     px, size,
@@ -60,7 +61,7 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
     let mut options = auxiliary_window_options(title);
     options.display_id = display_id;
     options.window_bounds = Some(WindowBounds::Windowed(bounds));
-    // 辅助窗口默认最小尺寸（720×520）会阻止按内容收缩，这里高度完全由内容决定。
+    // 辅助窗口默认最小尺寸（720×520）会阻止按内容收缩，这里宽高完全由内容决定。
     options.window_min_size = None;
     options.is_resizable = false;
     options.is_minimizable = true;
@@ -89,6 +90,7 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
                 view.clone().into(),
                 cx,
             )
+            .resizable(false)
         });
 
         cx.new(|cx| {
@@ -98,6 +100,9 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
                     return;
                 };
                 window.set_window_title(&title);
+                // 标题栏要完整放下标题：把所需宽度交给视图并入窗口宽度的计算。
+                let title_width = auxiliary_title_min_width(&title, false, window, cx);
+                view.update(cx, |view, cx| view.set_title_bar_width(title_width, cx));
                 window_view.update(cx, |chrome, cx| {
                     chrome.set_title(Some(SharedString::from(title)), cx);
                 });

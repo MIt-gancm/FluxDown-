@@ -128,8 +128,10 @@ fn open(cx: &mut App, request: SelectionRequestDto) {
                 cx,
             )
         });
-        let window_view = cx
-            .new(|cx| AuxiliaryWindowView::new(translator.clone(), title_key, content.into(), cx));
+        let window_view = cx.new(|cx| {
+            AuxiliaryWindowView::new(translator.clone(), title_key, content.into(), cx)
+                .resizable(is_bt)
+        });
         let root = cx.new(|cx| Root::new(window_view, window, cx));
         if is_bt {
             WindowRegistry::persist_bounds(

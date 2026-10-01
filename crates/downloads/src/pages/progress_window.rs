@@ -2,8 +2,10 @@
 //! 切换为「下载完成」视图。
 //!
 //! 由 app 经 `session::attach` 驱动（[`SessionConsumer`] 三个同名 `pub fn`），自带私有
-//! [`DownloadsController`] 维护任务状态。窗口高度随内容：内容区按自然高度排版，每帧预绘制时
-//! 与视口比较，不一致即请求窗口改高（进度 / 完成视图切换、展开分段列表时自动跟随）。
+//! [`DownloadsController`] 维护任务状态。窗口尺寸随内容：内容区按自然高度排版，宽度取单行文本
+//! （文件名、路径、链接、标题栏标题）的自然宽度并夹在 [`PROGRESS_WINDOW_WIDTH`] 与最大宽度 /
+//! 当前显示器可用宽度之间；每帧预绘制时与视口比较，不一致即请求窗口改尺寸（进度 / 完成视图
+//! 切换、展开分段列表、长错误信息出现时自动跟随）。窗口本身不可由用户调整。
 //! 开窗与关窗策略由宿主决定（见 [`crate::ProgressWindowTracker`]），本视图只在任务被删除、
 //! 用户点「停止」或打开文件 / 文件夹后发出 [`ProgressWindowEvent::Close`]。
 
@@ -14,9 +16,10 @@ use fluxdown_ui_components::{ControlExt as _, FluxIcon, card, check_row, tabular
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, FontWeight, InteractiveElement as _,
-    IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    canvas, div, prelude::FluentBuilder as _, px, size,
+    AnyElement, App, Context, Entity, EventEmitter, Font, FontFeatures, FontWeight,
+    InteractiveElement as _, IntoElement, ParentElement, Pixels, SharedString,
+    StatefulInteractiveElement as _, Styled, TextRun, Window, canvas, div,
+    prelude::FluentBuilder as _, px, size,
 };
 use gpui_component::{
     Disableable as _, Icon,
@@ -35,8 +38,12 @@ use crate::{
     strings::DownloadStrings,
 };
 
-/// 窗口宽度（逻辑像素）；进度与完成视图共用，切换时只改高度。
+/// 窗口最小宽度（逻辑像素）；内容较窄时保持此宽度，进度与完成视图共用。
 pub const PROGRESS_WINDOW_WIDTH: f32 = 480.;
+/// 窗口最大宽度：超长文件名 / 路径在此宽度处截断。
+const PROGRESS_WINDOW_MAX_WIDTH: f32 = 760.;
+/// 窗口宽度不超过当前显示器可用宽度的比例。
+const DISPLAY_FILL_RATIO: f32 = 0.9;
 /// 首帧前的窗口高度估计（首帧预绘制后按内容校正）。
 pub const PROGRESS_WINDOW_INITIAL_HEIGHT: f32 = 340.;
 
@@ -50,6 +57,8 @@ const SYSTEM_ICON: f32 = 32.;
 const BADGE: f32 = 18.;
 /// 分段列表最大高度，超出后内部滚动。
 const PARTS_MAX_HEIGHT: f32 = 168.;
+/// 错误信息最大高度，超出后内部滚动（多行 `Caused by:` 链完整可读，窗口不会无限增高）。
+const ERROR_MAX_HEIGHT: f32 = 120.;
 /// 分段列表行高。
 const PART_ROW_HEIGHT: f32 = 24.;
 /// 分段序号列宽。
@@ -93,6 +102,10 @@ pub struct ProgressWindowView {
     parts_expanded: bool,
     closed: bool,
     last_error: Option<SharedString>,
+    /// 标题栏完整显示窗口标题所需的宽度，由宿主按窗口 chrome 量出（标题文字 + 内边距 + 控制区）。
+    title_bar_width: Pixels,
+    /// 当前视图已采用过的最大内容宽度（只增不减），见 [`WidthRatchet`]。
+    width_ratchet: WidthRatchet,
 }
 
 impl EventEmitter<ProgressWindowEvent> for ProgressWindowView {}
@@ -123,6 +136,8 @@ impl ProgressWindowView {
             parts_expanded: false,
             closed: false,
             last_error: None,
+            title_bar_width: px(0.),
+            width_ratchet: WidthRatchet::default(),
         }
     }
 
@@ -150,6 +165,14 @@ impl ProgressWindowView {
     pub fn set_show_completion(&mut self, value: bool, cx: &mut Context<Self>) {
         if self.show_completion != value {
             self.show_completion = value;
+            cx.notify();
+        }
+    }
+
+    /// 宿主按窗口 chrome 量出标题栏完整显示标题所需的宽度；窗口宽度不会窄于它。
+    pub fn set_title_bar_width(&mut self, width: Pixels, cx: &mut Context<Self>) {
+        if self.title_bar_width != width {
+            self.title_bar_width = width;
             cx.notify();
         }
     }
@@ -351,12 +374,7 @@ impl ProgressWindowView {
         let downloading = row.state == TaskState::Downloading;
         let is_bt = row.protocol == TaskProtocol::Bt;
 
-        let size_label = if row.size_bytes > 0 {
-            format!("{} / {}", format_bytes(row.downloaded_bytes), row.size)
-        } else {
-            format_bytes(row.downloaded_bytes)
-        };
-        let meta = SharedString::from(format!("{} · {size_label}", row.protocol.label()));
+        let meta = SharedString::from(Self::progress_meta(row));
         let speed = row
             .speed_bytes_per_second
             .filter(|speed| downloading && *speed > 0)
@@ -545,13 +563,14 @@ impl ProgressWindowView {
                 row.state == TaskState::Failed && !row.error_message.is_empty(),
                 |this| {
                     this.child(Self::render_error(
+                        0,
                         SharedString::from(row.error_message.clone()),
                         cx,
                     ))
                 },
             )
             .when_some(self.last_error.clone(), |this, error| {
-                this.child(Self::render_error(error, cx))
+                this.child(Self::render_error(1, error, cx))
             })
             .child(self.render_progress_footer(active, cx))
             .into_any_element()
@@ -583,7 +602,38 @@ impl ProgressWindowView {
             )
     }
 
-    fn render_error(message: SharedString, cx: &App) -> gpui::Div {
+    /// 进度视图标题下的元信息行：协议 · 已下载 / 总大小。
+    fn progress_meta(row: &DownloadTaskView) -> String {
+        let size_label = if row.size_bytes > 0 {
+            format!("{} / {}", format_bytes(row.downloaded_bytes), row.size)
+        } else {
+            format_bytes(row.downloaded_bytes)
+        };
+        format!("{} · {size_label}", row.protocol.label())
+    }
+
+    /// 完成视图的元信息行：大小 · 耗时（耗时未知时只有大小）。
+    fn completed_meta(&self, row: &DownloadTaskView, cx: &App) -> String {
+        let size = if row.size_bytes > 0 {
+            row.size.clone()
+        } else {
+            format_bytes(row.downloaded_bytes)
+        };
+        let elapsed = row.completed_at_secs - row.created_at_secs;
+        if elapsed > 0 {
+            format!(
+                "{size} · {} {}",
+                self.t(cx, "infoDuration"),
+                format_elapsed(elapsed as u64)
+            )
+        } else {
+            size
+        }
+    }
+
+    /// 错误信息：完整换行显示（含多行 `Caused by:` 链），超过 [`ERROR_MAX_HEIGHT`] 内部滚动。
+    /// `slot` 区分同一视图里并存的多条错误（元素 id 不重复）。
+    fn render_error(slot: usize, message: SharedString, cx: &App) -> gpui::Div {
         let theme = active_theme(cx);
         let tokens = theme.tokens();
         h_flex()
@@ -602,7 +652,15 @@ impl ProgressWindowView {
                     .items_center()
                     .child(Icon::new(FluxIcon::CircleAlert).size(theme.extended().icon.sm)),
             )
-            .child(div().min_w_0().flex_1().line_clamp(2).child(message))
+            .child(
+                div()
+                    .id(("progress-error", slot))
+                    .min_w_0()
+                    .flex_1()
+                    .max_h(px(ERROR_MAX_HEIGHT))
+                    .overflow_y_scroll()
+                    .child(message),
+            )
     }
 
     /// 分段列表：折叠开关 + 每段状态 / 已下载 / 大小 / 行内进度。
@@ -852,21 +910,7 @@ impl ProgressWindowView {
         let tokens = theme.tokens().clone();
         let extended = theme.extended().clone();
         let missing = row.file_missing;
-        let size = if row.size_bytes > 0 {
-            row.size.clone()
-        } else {
-            format_bytes(row.downloaded_bytes)
-        };
-        let elapsed = row.completed_at_secs - row.created_at_secs;
-        let meta = if elapsed > 0 {
-            format!(
-                "{size} · {} {}",
-                self.t(cx, "infoDuration"),
-                format_elapsed(elapsed as u64)
-            )
-        } else {
-            size
-        };
+        let meta = self.completed_meta(row, cx);
         let (badge_icon, badge_color, headline) = if missing {
             (
                 FluxIcon::CircleAlert,
@@ -942,7 +986,7 @@ impl ProgressWindowView {
                     ),
             )
             .when_some(self.last_error.clone(), |this, error| {
-                this.child(Self::render_error(error, cx))
+                this.child(Self::render_error(1, error, cx))
             })
             .child(
                 Self::footer(cx)
@@ -967,6 +1011,117 @@ impl ProgressWindowView {
             )
             .into_any_element()
     }
+
+    /// 内容单行文本（文件名、元信息、路径、链接）不被截断所需的窗口宽度：按与元素相同的
+    /// 字体 / 字号 / 字重做文本整形取宽，再加上各层水平内边距。标题栏标题所需宽度由宿主
+    /// 量出（[`Self::set_title_bar_width`]），取二者较大值。
+    fn natural_width(&self, row: &DownloadTaskView, window: &Window, cx: &App) -> f32 {
+        let theme = active_theme(cx);
+        let tokens = theme.tokens();
+        let extended = theme.extended();
+        let measure = TextMeasure {
+            window,
+            family: tokens.typography.sans.clone(),
+        };
+        let xs = tokens.typography.xs.size;
+        let lg = f32::from(tokens.spacing.lg);
+        let md = f32::from(tokens.spacing.md);
+        let name = measure.width(&row.name, extended.title.size, extended.title.weight, false);
+        // 图标位 + 与右侧文字列的间距 + 左右页边距。
+        let heading_chrome = 2. * lg + ICON_TILE + md;
+
+        let width = if row.state == TaskState::Completed {
+            let meta = measure.width(&self.completed_meta(row, cx), xs, FontWeight::NORMAL, true);
+            let dir = measure.width(&row.save_dir, xs, FontWeight::NORMAL, false);
+            heading_chrome + name.max(meta).max(dir)
+        } else {
+            let state = measure.width(
+                &self.strings.state_label(row.state),
+                xs,
+                FontWeight::MEDIUM,
+                true,
+            );
+            let meta = measure.width(&Self::progress_meta(row), xs, FontWeight::NORMAL, true);
+            let heading = heading_chrome + name.max(state + f32::from(tokens.spacing.xs) + meta);
+            let path = measure.width(&row.save_dir, xs, FontWeight::NORMAL, false);
+            let url = measure.width(row.share_url(), xs, FontWeight::NORMAL, false);
+            // 信息卡：页边距 + 卡片描边与内边距 + 标签列 + 间距 + 值。
+            let info = 2. * lg
+                + 2. * (md + f32::from(extended.stroke.thin))
+                + INFO_LABEL_WIDTH
+                + f32::from(tokens.spacing.sm)
+                + path.max(url);
+            heading.max(info)
+        };
+        width.max(f32::from(self.title_bar_width))
+    }
+}
+
+/// 单行文本宽度量取：与元素同字体族，字号 / 字重 / 数字特性按调用点给定。
+struct TextMeasure<'a> {
+    window: &'a Window,
+    family: SharedString,
+}
+
+impl TextMeasure<'_> {
+    fn width(&self, text: &str, size: Pixels, weight: FontWeight, tabular: bool) -> f32 {
+        let line = text.lines().next().unwrap_or_default();
+        if line.is_empty() {
+            return 0.;
+        }
+        let run = TextRun {
+            len: line.len(),
+            font: Font {
+                family: self.family.clone(),
+                weight,
+                features: if tabular {
+                    tabular_numbers()
+                } else {
+                    FontFeatures::default()
+                },
+                ..Font::default()
+            },
+            ..TextRun::default()
+        };
+        f32::from(
+            self.window
+                .text_system()
+                .layout_line(line, size, &[run], None)
+                .width,
+        )
+    }
+}
+
+/// 内容宽度棘轮：下载中百分比、已下载量、速度每次刷新都会改变文本宽度，若窗口跟着逐帧
+/// 改宽会来回抖动。同一视图（进度 / 完成）内只增不减；切换视图时按新内容重新计量。
+#[derive(Default)]
+struct WidthRatchet {
+    completed: bool,
+    width: f32,
+}
+
+impl WidthRatchet {
+    fn fit(&mut self, completed: bool, natural: f32) -> f32 {
+        if self.completed != completed {
+            *self = Self {
+                completed,
+                width: natural,
+            };
+        } else {
+            self.width = self.width.max(natural);
+        }
+        self.width
+    }
+}
+
+/// 窗口目标宽度：内容自然宽度夹在最小宽度与最大宽度 / 显示器可用宽度的 [`DISPLAY_FILL_RATIO`]
+/// 之间（显示器过窄时上限优先于最小宽度，窗口不会比屏幕还宽），向上取整到整像素。
+fn fit_width(natural: f32, display_width: Option<f32>) -> f32 {
+    let cap = display_width.map_or(PROGRESS_WINDOW_MAX_WIDTH, |width| {
+        PROGRESS_WINDOW_MAX_WIDTH.min(width * DISPLAY_FILL_RATIO)
+    });
+    let floor = PROGRESS_WINDOW_WIDTH.min(cap);
+    natural.clamp(floor, cap).ceil()
 }
 
 /// 耗时：`m:ss`，超过一小时 `h:mm:ss`。
@@ -982,6 +1137,20 @@ fn format_elapsed(seconds: u64) -> String {
 impl gpui::Render for ProgressWindowView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let surface = active_theme(cx).tokens().colors.surface;
+        let display = window
+            .display(cx)
+            .map(|display| display.visible_bounds().size);
+        let measured = self.row().map(|row| {
+            (
+                row.state == TaskState::Completed,
+                self.natural_width(&row, window, cx),
+            )
+        });
+        let wanted_width = measured.map(|(completed, natural)| {
+            let natural = self.width_ratchet.fit(completed, natural);
+            fit_width(natural, display.map(|size| f32::from(size.width)))
+        });
+        let max_height = display.map_or(f32::INFINITY, |size| f32::from(size.height));
         let content = match self.row() {
             Some(row) if row.state == TaskState::Completed => {
                 let row = row.clone();
@@ -1001,15 +1170,19 @@ impl gpui::Render for ProgressWindowView {
         v_flex().size_full().bg(surface).child(
             div().relative().flex_none().w_full().child(content).child(
                 canvas(
-                    |bounds, window, cx| {
-                        let wanted = f32::from(bounds.origin.y + bounds.size.height);
+                    move |bounds, window, cx| {
+                        let wanted_height =
+                            f32::from(bounds.origin.y + bounds.size.height).min(max_height);
                         let viewport = window.viewport_size();
-                        if (wanted - f32::from(viewport.height)).abs() < RESIZE_EPSILON {
+                        let wanted_width =
+                            wanted_width.unwrap_or_else(|| f32::from(viewport.width));
+                        if (wanted_height - f32::from(viewport.height)).abs() < RESIZE_EPSILON
+                            && (wanted_width - f32::from(viewport.width)).abs() < RESIZE_EPSILON
+                        {
                             return;
                         }
-                        let width = viewport.width;
                         window.defer(cx, move |window, _| {
-                            window.resize(size(width, px(wanted.ceil())));
+                            window.resize(size(px(wanted_width), px(wanted_height.ceil())));
                         });
                     },
                     |_, _, _, _| {},
@@ -1023,12 +1196,40 @@ impl gpui::Render for ProgressWindowView {
 
 #[cfg(test)]
 mod tests {
-    use super::format_elapsed;
+    use super::{
+        PROGRESS_WINDOW_MAX_WIDTH, PROGRESS_WINDOW_WIDTH, WidthRatchet, fit_width, format_elapsed,
+    };
 
     #[test]
     fn elapsed_switches_to_hours_past_sixty_minutes() {
         assert_eq!(format_elapsed(59), "0:59");
         assert_eq!(format_elapsed(201), "3:21");
         assert_eq!(format_elapsed(3_725), "1:02:05");
+    }
+
+    #[test]
+    fn width_stays_within_min_max_and_display() {
+        // 内容窄：保持最小宽度；内容宽：封顶在最大宽度。
+        assert_eq!(fit_width(120., Some(1920.)), PROGRESS_WINDOW_WIDTH);
+        assert_eq!(fit_width(2_000., Some(1920.)), PROGRESS_WINDOW_MAX_WIDTH);
+        // 区间内向上取整到整像素。
+        assert_eq!(fit_width(600.2, Some(1920.)), 601.);
+        // 小显示器：上限取显示宽度的 90%，且优先于最小宽度。
+        assert_eq!(fit_width(2_000., Some(700.)), 630.);
+        assert_eq!(fit_width(120., Some(400.)), 360.);
+        // 取不到显示器时只受最大宽度约束。
+        assert_eq!(fit_width(2_000., None), PROGRESS_WINDOW_MAX_WIDTH);
+    }
+
+    #[test]
+    fn width_only_grows_within_a_view_and_resets_on_view_switch() {
+        let mut ratchet = WidthRatchet::default();
+        assert_eq!(ratchet.fit(false, 520.), 520.);
+        // 下载中文本变窄（如速度位数减少）：窗口不回缩。
+        assert_eq!(ratchet.fit(false, 505.), 520.);
+        assert_eq!(ratchet.fit(false, 540.), 540.);
+        // 切到完成视图：按新内容重新计量，可以变窄。
+        assert_eq!(ratchet.fit(true, 490.), 490.);
+        assert_eq!(ratchet.fit(true, 480.), 490.);
     }
 }

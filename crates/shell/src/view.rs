@@ -4,13 +4,16 @@ use fluxdown_ui_components::{activity_button as activity_bar_button, nav_icon_co
 use fluxdown_ui_i18n::Translator;
 use fluxdown_ui_theme::active_theme;
 use gpui::{
-    AnyElement, AnyView, App, Context, Div, Entity, FontWeight, InteractiveElement as _,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
-    Styled, Window, div, img, px,
+    AnyElement, AnyView, App, Context, Div, Entity, Font, FontWeight, InteractiveElement as _,
+    IntoElement, MouseButton, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, TextRun, Window, div, img, px,
 };
-use gpui_component::{Icon, TitleBar, h_flex, menu::AppMenuBar, tooltip::Tooltip, v_flex};
+use gpui_component::{
+    Icon, TITLE_BAR_HEIGHT, TitleBar, h_flex, menu::AppMenuBar, tooltip::Tooltip, v_flex,
+};
 
 use crate::assets::APP_LOGO_PATH;
+use crate::window_controls::{FixedSizeTitleBar, controls_width};
 
 /// shell 路由的稳定标识。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +147,9 @@ pub struct AuxiliaryWindowView {
     /// 宿主设置的动态标题（如任务文件名）；存在时优先于按语言刷新的默认标题。
     title_override: Option<SharedString>,
     content: AnyView,
+    /// 窗口是否可由用户调整尺寸；`false` 时 Windows / Linux 自绘只含最小化 + 关闭的标题栏
+    /// （系统不会响应最大化，留着只会误导）。macOS 恒用系统交通灯。
+    resizable: bool,
 }
 
 impl AuxiliaryWindowView {
@@ -166,7 +172,15 @@ impl AuxiliaryWindowView {
             title,
             title_override: None,
             content,
+            resizable: true,
         }
+    }
+
+    /// 声明承载窗口是否可调整尺寸（默认可调）；应与窗口选项的 `is_resizable` 保持一致。
+    #[must_use]
+    pub fn resizable(mut self, resizable: bool) -> Self {
+        self.resizable = resizable;
+        self
     }
 
     /// 以动态文本覆盖标题（传 `None` 恢复按语言键显示的默认标题）。
@@ -183,44 +197,104 @@ impl AuxiliaryWindowView {
 
     /// 辅助窗口标题栏：与主窗口统一顶栏同为 chrome 底 + hairline 底线；标题 sm MEDIUM，
     /// 三平台一致左对齐（macOS 紧随交通灯，Windows/Linux 自窗口左缘起）。
-    fn render_title_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    ///
+    /// 标题行以绝对定位铺满拖动区、不参与内容宽度：gpui-component 的拖动区不允许收缩，
+    /// 在流内的单行标题会按其不换行的最小宽度把右侧窗口控制按钮挤出窗口。
+    /// 不可调尺寸的窗口在 Windows / Linux 改用 [`FixedSizeTitleBar`]（无最大化按钮）。
+    fn render_title_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = active_theme(cx);
         let tokens = theme.tokens();
         let extended = theme.extended().colors;
         let spacing = tokens.spacing;
         let typography = tokens.typography.clone();
+        let height = theme.density().title_bar;
+        let title_row = h_flex()
+            .absolute()
+            .inset_0()
+            .items_center()
+            .pl(spacing.sm)
+            .pr(spacing.md)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(typography.sm.size)
+                    .line_height(typography.sm.line_height)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(tokens.colors.foreground)
+                    .child(
+                        self.title_override
+                            .clone()
+                            .unwrap_or_else(|| self.title.clone()),
+                    ),
+            );
+
+        // 显式 `.bg` 覆盖 gpui-component 默认渐变；`.h` 经 refine_style 覆盖默认 34px。
+        if !self.resizable && !cfg!(target_os = "macos") {
+            return FixedSizeTitleBar::new()
+                .pl(spacing.sm)
+                .h(height)
+                .bg(extended.chrome)
+                .border_color(extended.hairline)
+                .child(title_row)
+                .into_any_element();
+        }
         let title_bar = TitleBar::new();
         #[cfg(not(target_os = "macos"))]
         let title_bar = title_bar.pl(spacing.sm);
-
-        // 显式 `.bg` 覆盖 gpui-component 默认渐变；`.h` 经 refine_style 覆盖默认 34px。
         title_bar
-            .h(theme.density().title_bar)
+            .h(height)
             .bg(extended.chrome)
             .border_color(extended.hairline)
-            .child(
-                h_flex()
-                    .size_full()
-                    .min_w_0()
-                    .items_center()
-                    .pl(spacing.sm)
-                    .pr(spacing.md)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(typography.sm.size)
-                            .line_height(typography.sm.line_height)
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(tokens.colors.foreground)
-                            .child(
-                                self.title_override
-                                    .clone()
-                                    .unwrap_or_else(|| self.title.clone()),
-                            ),
-                    ),
-            )
+            .child(title_row)
+            .into_any_element()
     }
+}
+
+/// macOS 交通灯占位：gpui-component `TitleBar` 在 macOS 的默认左内边距。
+const MACOS_TRAFFIC_LIGHT_INSET: Pixels = px(80.);
+
+/// 辅助窗口标题栏完整显示 `title`（单行）所需的最小窗口宽度：标题文字宽度（按标题栏实际
+/// 字体 / 字号 / 字重量得）加上左右内边距与窗口控制区。供宿主按内容自适应窗口宽度时使用；
+/// `resizable` 须与 [`AuxiliaryWindowView::resizable`] 一致（决定控制按钮个数）。
+#[must_use]
+pub fn auxiliary_title_min_width(
+    title: &str,
+    resizable: bool,
+    window: &Window,
+    cx: &App,
+) -> Pixels {
+    let theme = active_theme(cx);
+    let tokens = theme.tokens();
+    let line = title.lines().next().unwrap_or_default();
+    let run = TextRun {
+        len: line.len(),
+        font: Font {
+            family: tokens.typography.sans.clone(),
+            weight: FontWeight::MEDIUM,
+            ..Font::default()
+        },
+        ..TextRun::default()
+    };
+    let text_width = window
+        .text_system()
+        .layout_line(line, tokens.typography.sm.size, &[run], None)
+        .width;
+
+    let spacing = tokens.spacing;
+    let title_padding = spacing.sm + spacing.md;
+    let chrome = if cfg!(target_os = "macos") {
+        MACOS_TRAFFIC_LIGHT_INSET + title_padding
+    } else {
+        let controls = if resizable {
+            TITLE_BAR_HEIGHT * 3.
+        } else {
+            controls_width()
+        };
+        // 标题栏自身左内边距 + 标题行内边距 + 控制区。
+        spacing.sm + title_padding + controls
+    };
+    text_width + chrome
 }
 
 impl Render for AuxiliaryWindowView {
@@ -353,9 +427,10 @@ impl ShellView {
             .bg(extended.chrome)
             .border_color(extended.hairline)
             .child(
+                // 绝对定位铺满拖动区：标题行不参与 gpui-component 拖动区的内容宽度，窗口控制按钮不会被挤出。
                 h_flex()
-                    .size_full()
-                    .min_w_0()
+                    .absolute()
+                    .inset_0()
                     .items_center()
                     .gap(spacing.sm)
                     .pr(if is_macos { spacing.md } else { spacing.sm })
