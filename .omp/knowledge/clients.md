@@ -9,6 +9,8 @@
 
 **桌面发行物已是 GPUI**：Windows / macOS / Linux 发布 `fluxdown-desktop → fluxdown-agent → fluxdownd`，浏览器中继为 `fluxdown_nmh`（`.github/workflows/release.yml` 的桌面构建与 `scripts/package_gpui_{linux,macos}.sh`）。Android 发行物仍是 Flutter；Flutter 已无桌面 runner / 桌面页面，仅移动端（android/ios）。GPUI 关于页与服务版本统一取 `fluxdown_protocol::APP_VERSION`：正式构建由 tag 注入 `FLUXDOWN_APP_VERSION`，本地回退及 `pubspec.yaml` 的角色见 `ops.md`「发布与 CI」。
 
+GPUI 关于页更新说明（`crates/settings/src/sections/about.rs`）按 `i18n::system_locale()` 筛选 release body 的 `fluxdown:lang:zh/en` 区块：中文系统显示中文，其余系统显示英文，不跟随手动设置的界面语言；缺少目标翻译时显示已有语言，无标记的历史说明保留原文。
+
 依赖方向固定为 `i18n` / `theme` → `components` → `shell` / capability crates → `app`。`app` 只做窗口与单一 agent 会话装配；capability 之间不互相依赖。
 
 - `i18n`：`build.rs` 自动嵌入 `assets/i18n/*.json`；locale 规范化、英文键级回退、空值回退和插值与 Flutter 基线同契约。
