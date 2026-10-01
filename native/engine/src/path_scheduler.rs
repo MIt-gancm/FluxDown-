@@ -39,10 +39,6 @@ pub const PREEMPT_SLACK: f64 = 2.0;
 /// CONNECT，保守取 1s）。
 pub const PREEMPT_SETUP_SECS: f64 = 1.0;
 
-/// 剩余字节低于此值不抢占——完成时间判据已计入建连开销，此下限只挡
-/// 微段上的无意义连接抖动（与尾部微拆分阈值同级）。
-pub const PREEMPT_MIN_REMAINING: i64 = 64 * 1024;
-
 /// 冷路径探索所需的最小工作量：探索连接须跨过首个慢启动窗口后还有
 /// 字节可测，小于此值的尾部碎片不拿来探索（否则慢路径会握着碎片拖尾）。
 pub const EXPLORE_MIN_PIECE: i64 = 1024 * 1024;
@@ -141,9 +137,13 @@ pub fn completion_secs(remaining: i64, bps: f64) -> f64 {
 /// 完成时间抢占判据：在途连接（本窗实测 `conn_bps`，0 = 停滞）完成
 /// `remaining` 字节的时间，是否显著长于交给最优路径（单连接 `best_bps`）
 /// 并付出一次建连的时间。
+///
+/// 不设剩余字节下限：建连开销已在交接侧计入，微段上速率相近的连接自然
+/// 不满足判据；而下限会让极慢连接无限期握住尾部碎片（2 KiB/s 握 64 KiB
+/// 即拖尾 32s），且碎片已低于拆分最小片、无法再被帮手分走。
 #[must_use]
 pub fn should_preempt(remaining: i64, conn_bps: f64, best_bps: f64) -> bool {
-    if remaining < PREEMPT_MIN_REMAINING || !(best_bps > 0.0 && best_bps.is_finite()) {
+    if remaining <= 0 || !(best_bps > 0.0 && best_bps.is_finite()) {
         return false;
     }
     let own = completion_secs(remaining, conn_bps);
@@ -222,14 +222,22 @@ mod tests {
         assert!(should_preempt(MB, 0.0, MB as f64));
         // 尾部碎片：2KB/s 的慢路径握着 100KB，需 50s；交接只需约 1s。
         assert!(should_preempt(100 * KB, 2.0 * KB as f64, MB as f64));
+        // 拆分最小片以下的尾部碎片：2KB/s 握 60KB 需 30s，交接约 1s。
+        assert!(should_preempt(60 * KB, 2.0 * KB as f64, 3.0 * MB as f64));
     }
 
     #[test]
     fn no_preempt_for_comparable_speed_or_tiny_tail() {
         // 0.6× 最优速率：完成时间 < 2× 最优 + 建连，不抢占（滞回）。
         assert!(!should_preempt(8 * MB, 0.6 * MB as f64, MB as f64));
-        // 剩余不足阈值：交接开销覆盖不了收益。
-        assert!(!should_preempt(PREEMPT_MIN_REMAINING - 1, 0.0, MB as f64));
+        // 微段：100KB/s 的连接剩 32KB 只需 0.32s，交接的建连开销覆盖不了收益。
+        assert!(!should_preempt(
+            32 * KB,
+            100.0 * KB as f64,
+            10.0 * MB as f64
+        ));
+        // 已无剩余字节。
+        assert!(!should_preempt(0, 0.0, MB as f64));
         // 无最优基准。
         assert!(!should_preempt(8 * MB, 0.0, 0.0));
     }

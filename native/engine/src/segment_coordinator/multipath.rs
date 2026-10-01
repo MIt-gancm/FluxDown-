@@ -663,4 +663,77 @@ mod tests {
         let cancelled = held[..2].iter().filter(|(_, c)| c.is_cancelled()).count();
         assert_eq!(cancelled, 1, "链路两条慢连接只能交出一条，最后一条保留");
     }
+
+    /// CI 复现：极慢代理的探索段被帮手拆到拆分最小片以下（既分不走、
+    /// 曾经也因剩余 < 64KiB 不可抢占），只能以 2KiB/s 拖尾 30s+。稳态
+    /// 样本一到位就必须抢占交接，无论剩余多小。
+    #[test]
+    fn slow_path_holding_sub_split_tail_fragment_is_preempted() {
+        use crate::cdn::node_pool::LeaseRequest;
+        let pool = NodePool::single(reqwest::Client::new());
+        pool.add_paths(
+            RoutePath::Direct,
+            None,
+            vec![(MANUAL, reqwest::Client::new(), None)],
+        );
+        pool.set_explore(true);
+        let lease = |seg_index: i32, allow_alternates: bool| {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let lease = pool.lease_for(LeaseRequest {
+                seg_index,
+                start_downloaded: 0,
+                bytes: i64::MAX,
+                allow_alternates,
+                cancel: cancel.clone(),
+            });
+            (lease, cancel)
+        };
+        let direct = lease(0, false);
+        let proxy = lease(1, true);
+        assert_eq!(direct.0.route(), RoutePath::Direct);
+        assert_eq!(proxy.0.route(), MANUAL);
+
+        // 段 1 = CI 日志中的段 8 残片：67761 B，随后按 2KiB/s 推进。
+        let seg = |index: i32, start: i64, len: i64| {
+            (
+                index,
+                LiveSegment {
+                    index,
+                    start_byte: start,
+                    end_byte: start + len - 1,
+                    downloaded_bytes: 0,
+                    state: SegState::Active,
+                    rate_bps: None,
+                },
+            )
+        };
+        let mut segments: BTreeMap<i32, LiveSegment> =
+            [seg(0, 0, 1 << 30), seg(1, 1 << 30, 67_761)].into();
+        let guards = TickGuards {
+            sampling: true,
+            may_reroute: true,
+            remaining_total: i64::MAX,
+            protected_seg: None,
+        };
+        let window = Duration::from_secs(2);
+        let mut mp = Multipath::new(None, None, "https://example.com/f", &pool, "t");
+        let mut preempted_at = None;
+        for tick in 0..4 {
+            if let Some(s) = segments.get_mut(&0) {
+                s.downloaded_bytes += 2 * 3 * 1024 * 1024;
+            }
+            if let Some(s) = segments.get_mut(&1) {
+                s.downloaded_bytes += 2 * 2048;
+            }
+            mp.on_tick(&pool, &mut segments, window, &guards, "t");
+            if preempted_at.is_none() && proxy.1.is_cancelled() {
+                preempted_at = Some((tick, segments[&1].remaining()));
+            }
+        }
+        let (tick, remaining) = preempted_at.expect("slow tail fragment must be preempted");
+        // 首个稳态样本（第 3 窗）即抢占；此时剩余已低于 64KiB。
+        assert_eq!(tick, 2);
+        assert!(remaining < 64 * 1024, "remaining = {remaining}");
+        assert!(!direct.1.is_cancelled(), "最优路径连接不得被抢占");
+    }
 }
