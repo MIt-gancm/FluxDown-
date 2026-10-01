@@ -95,7 +95,12 @@ async fn delete_files_on_never_started_task_keeps_foreign_file() {
         .await
         .expect("foreign file must survive");
     assert_eq!(content, FOREIGN_CONTENT);
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -123,7 +128,12 @@ async fn delete_files_on_completed_task_removes_its_product() {
         !product.exists(),
         "completed task's own product must be removed with delete_files=true"
     );
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -159,7 +169,12 @@ async fn batch_delete_files_on_never_started_tasks_keeps_foreign_files() {
         .expect("foreign file must survive");
     assert_eq!(content, FOREIGN_CONTENT);
     assert!(!owned.exists(), "completed task's product must be removed");
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -183,7 +198,12 @@ async fn restart_never_started_task_keeps_foreign_file() {
         .await
         .expect("foreign file must survive");
     assert_eq!(content, FOREIGN_CONTENT);
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 两条任务的 `file_name` 指向同一磁盘名：删除其中已完成的一条（含文件）时，
@@ -237,7 +257,12 @@ async fn delete_files_keeps_file_named_by_another_task() {
         !shared.exists(),
         "file named only by deleted tasks is removed with delete_files=true"
     );
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// HLS 任务的独立音轨 sidecar（`<stem>.audio.m4a`）及其 `.fdownloading` 临时文件，
@@ -293,5 +318,10 @@ async fn delete_files_removes_hls_audio_sidecar_and_checkpoints() {
             "{key} must be cleaned with the task"
         );
     }
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

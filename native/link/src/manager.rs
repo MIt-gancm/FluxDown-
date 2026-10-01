@@ -387,18 +387,29 @@ impl LinkManager {
         match self.responder.handle_confirm(session_id, confirm).await {
             Ok(Some(record)) => {
                 self.store.upsert(&record).await?;
-                let _ = self.events.send(LinkEngineEvent::Paired(record)).await;
+                if self
+                    .events
+                    .send(LinkEngineEvent::Paired(record))
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("link event receiver closed after pairing");
+                }
                 Ok(PairConfirmOutcome::Paired)
             }
             // 发起方自己传了 confirm=false —— 它当然知道自己拒绝了，无需额外语义。
             Ok(None) => {
                 // 发起方放弃/拒绝：响应方会话已被删除，通知宿主关闭待确认弹窗。
-                let _ = self
+                if self
                     .events
                     .send(LinkEngineEvent::IncomingCancelled {
                         session_id: session_id.to_string(),
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("link event receiver closed after pairing cancellation");
+                }
                 Ok(PairConfirmOutcome::Declined)
             }
             Err(LinkError::RejectedByPeer) => Ok(PairConfirmOutcome::Rejected),
@@ -435,7 +446,9 @@ impl LinkManager {
             peer_fingerprint: super::crypto::fingerprint(peer_id_pub),
         };
         tokio::spawn(async move {
-            let _ = tx.send(event).await;
+            if tx.send(event).await.is_err() {
+                tracing::debug!("link event receiver closed before incoming pairing notification");
+            }
         });
     }
 
@@ -464,7 +477,11 @@ impl LinkManager {
                 let tx = self.events.clone();
                 let msg = e.to_string();
                 tokio::spawn(async move {
-                    let _ = tx.send(LinkEngineEvent::Error(msg)).await;
+                    if tx.send(LinkEngineEvent::Error(msg)).await.is_err() {
+                        tracing::debug!(
+                            "link event receiver closed before advertising failure notification"
+                        );
+                    }
                 });
             }
         }
@@ -805,10 +822,14 @@ impl LinkManager {
         }
         let record = pending.initiator.finalize()?;
         self.store.upsert(&record).await?;
-        let _ = self
+        if self
             .events
             .send(LinkEngineEvent::Paired(record.clone()))
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::debug!("link event receiver closed after pairing");
+        }
         Ok(Some(record))
     }
 
@@ -827,11 +848,14 @@ impl LinkManager {
     /// 解除配对（删除设备），广播 Unpaired。
     pub async fn remove_device(&self, fingerprint: &str) -> LinkResult<bool> {
         let removed = self.store.remove(fingerprint).await?;
-        if removed {
-            let _ = self
+        if removed
+            && self
                 .events
                 .send(LinkEngineEvent::Unpaired(fingerprint.to_string()))
-                .await;
+                .await
+                .is_err()
+        {
+            tracing::debug!("link event receiver closed after unpairing");
         }
         Ok(removed)
     }
@@ -864,15 +888,25 @@ impl LinkManager {
         if !matches {
             return;
         }
-        if let Ok(mut map) = self.hinted.lock() {
-            map.remove(fingerprint);
-        }
-        let Ok(Some(record)) = self.store.get(fingerprint).await else {
-            return;
+        let record = match self.store.get(fingerprint).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(fingerprint, %error, "cannot load linked peer for candidate promotion");
+                return;
+            }
         };
         let candidates = promoted_candidates(&record.candidates, hint);
-        if candidates != record.candidates {
-            let _ = self.store.update_candidates(fingerprint, &candidates).await;
+        if candidates != record.candidates
+            && let Err(error) = self.store.update_candidates(fingerprint, &candidates).await
+        {
+            tracing::warn!(fingerprint, %error, "cannot persist verified linked peer candidate");
+            return;
+        }
+        if let Ok(mut map) = self.hinted.lock()
+            && map.get(fingerprint) == candidates.first()
+        {
+            map.remove(fingerprint);
         }
     }
 
@@ -884,7 +918,9 @@ impl LinkManager {
         let record = self.with_hinted(record);
         match self.transport.connect(&record).await {
             Ok(_) => {
-                let _ = self.store.touch(fingerprint, now_unix()).await;
+                if let Err(error) = self.store.touch(fingerprint, now_unix()).await {
+                    tracing::warn!(fingerprint, %error, "cannot persist linked peer last_seen");
+                }
                 true
             }
             Err(LinkError::Unreachable) => false,
@@ -946,7 +982,9 @@ impl LinkManager {
             .ok_or_else(|| LinkError::Io("missing taskId in dispatch response".into()))?
             .to_string();
         self.promote_hinted(fingerprint, &conn.base_url).await;
-        let _ = self.store.touch(fingerprint, now_unix()).await;
+        if let Err(error) = self.store.touch(fingerprint, now_unix()).await {
+            tracing::warn!(fingerprint, %error, "cannot persist linked peer last_seen");
+        }
         Ok(task_id)
     }
 
@@ -1025,8 +1063,10 @@ impl LinkManager {
             return Ok(None);
         };
         self.promote_hinted(fingerprint, &conn.base_url).await;
-        let _ = self.store.set_peer_info(fingerprint, &info).await;
-        let _ = self.store.touch(fingerprint, now_unix()).await;
+        self.store.set_peer_info(fingerprint, &info).await?;
+        if let Err(error) = self.store.touch(fingerprint, now_unix()).await {
+            tracing::warn!(fingerprint, %error, "cannot persist linked peer last_seen");
+        }
         Ok(Some(info))
     }
 
@@ -1043,7 +1083,7 @@ impl LinkManager {
             .await?
             .ok_or(LinkError::Unauthorized)?;
         if let Some(theirs) = decode_peer_info(&request.body) {
-            let _ = self.store.set_peer_info(&request.device, &theirs).await;
+            self.store.set_peer_info(&request.device, &theirs).await?;
         }
         let aead_key = derive_link_aead_key(&record.link_secret);
         Ok(seal_link_body(&aead_key, &encode_peer_info(mine)))
@@ -1327,9 +1367,16 @@ mod tests {
     use crate::types::DiscoveryKind;
 
     async fn mgr_with_device(secret: Vec<u8>) -> (Arc<LinkManager>, String) {
+        mgr_with_storage(secret, Arc::new(MemoryLinkStorage::default())).await
+    }
+
+    async fn mgr_with_storage(
+        secret: Vec<u8>,
+        storage: Arc<MemoryLinkStorage>,
+    ) -> (Arc<LinkManager>, String) {
         let (tx, _rx) = mpsc::channel(8);
         let mgr = LinkManager::load(
-            Arc::new(MemoryLinkStorage::default()),
+            storage,
             SelfInfo {
                 name: "me".into(),
                 platform: None,
@@ -1466,6 +1513,94 @@ mod tests {
             kind: TransportKind::Direct,
             address: addr.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_persistence_failure_keeps_verified_hint_until_retry_succeeds()
+    -> LinkResult<()> {
+        let storage = Arc::new(MemoryLinkStorage::default());
+        let (manager, fingerprint) = mgr_with_storage(vec![7; 32], storage.clone()).await;
+        let candidate = direct("10.0.0.9:17800");
+        manager
+            .hinted
+            .lock()
+            .map_err(|error| LinkError::Store(error.to_string()))?
+            .insert(fingerprint.clone(), candidate.clone());
+        let address = PeerAddress::parse(&candidate.address)?.base_url();
+        storage
+            .fail_metadata_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        manager.promote_hinted(&fingerprint, &address).await;
+        assert_eq!(
+            manager
+                .hinted
+                .lock()
+                .map_err(|error| LinkError::Store(error.to_string()))?
+                .get(&fingerprint),
+            Some(&candidate)
+        );
+        assert!(
+            manager
+                .store
+                .get(&fingerprint)
+                .await?
+                .ok_or(LinkError::NotPaired)?
+                .candidates
+                .is_empty()
+        );
+        storage
+            .fail_metadata_writes
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        manager.promote_hinted(&fingerprint, &address).await;
+        assert!(
+            !manager
+                .hinted
+                .lock()
+                .map_err(|error| LinkError::Store(error.to_string()))?
+                .contains_key(&fingerprint)
+        );
+        assert_eq!(
+            manager
+                .store
+                .get(&fingerprint)
+                .await?
+                .ok_or(LinkError::NotPaired)?
+                .candidates,
+            vec![candidate]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_info_response_does_not_report_success_before_metadata_is_persisted()
+    -> LinkResult<()> {
+        let storage = Arc::new(MemoryLinkStorage::default());
+        let (manager, fingerprint) = mgr_with_storage(vec![7; 32], storage.clone()).await;
+        storage
+            .fail_metadata_writes
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let request = LinkRequest {
+            device: fingerprint.clone(),
+            body: encode_peer_info(&PeerInfo {
+                default_save_dir: Some("/downloads".into()),
+                path_style: Some("posix".into()),
+            }),
+        };
+        let result = manager
+            .answer_peer_info(&request, &PeerInfo::default())
+            .await;
+        assert!(matches!(result, Err(LinkError::Store(_))));
+        assert_eq!(
+            manager
+                .store
+                .get(&fingerprint)
+                .await?
+                .ok_or(LinkError::NotPaired)?
+                .info
+                .default_save_dir,
+            None
+        );
+        Ok(())
     }
 
     #[tokio::test]

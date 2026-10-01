@@ -843,7 +843,8 @@ impl DaemonService {
                 }
                 self.plugin_manager()?
                     .clear_task_resolver(&params.task_id)
-                    .await;
+                    .await
+                    .map_err(|error| internal_error(format!("{error:#}")))?;
                 self.execute_unit(ActorOperation::ResumeTask {
                     task_id: params.task_id,
                 })
@@ -2156,7 +2157,9 @@ mod tests {
             }
         }
         drop(service);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("daemon dispatch test directory removal failed: {error}");
+        }
     }
 
     fn optional_feature_method(method_name: &str) -> bool {

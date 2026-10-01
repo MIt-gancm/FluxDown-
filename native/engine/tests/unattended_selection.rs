@@ -85,7 +85,11 @@ async fn unattended_bt_task_preconfirms_all_files_and_persists_flag() {
         "无人值守标记必须持久化——惰性 resolve/HLS 选择在重启后的 resume 仍要静默"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -117,7 +121,11 @@ async fn unattended_flag_persists_for_non_bt_tasks_too() {
         "HLS/DASH/插件任务靠 tasks.unattended 在 start 时跳过画质/变体弹窗"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -156,5 +164,9 @@ async fn manual_creation_stays_attended() {
         "手动路径默认在场，选择弹窗必须保留"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

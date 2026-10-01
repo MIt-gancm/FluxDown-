@@ -118,7 +118,12 @@ mod tests {
 
     impl Drop for TestDir {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            if let Err(error) = std::fs::remove_dir_all(&self.0)
+                && error.kind() != ErrorKind::NotFound
+            {
+                // Drop can run during unwinding; report without causing a second panic.
+                eprintln!("remove test directory {}: {error}", self.0.display());
+            }
         }
     }
 

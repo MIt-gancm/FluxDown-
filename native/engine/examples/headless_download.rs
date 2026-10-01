@@ -56,11 +56,17 @@ fn spawn_local_file_server() -> std::io::Result<(u16, std::thread::JoinHandle<()
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                 FILE_BODY.len()
             );
-            let _ = stream.write_all(response.as_bytes());
-            if !is_head {
-                let _ = stream.write_all(FILE_BODY);
+            if let Err(error) = stream.write_all(response.as_bytes()) {
+                eprintln!("HTTP example response header: {error}");
+                continue;
             }
-            let _ = stream.flush();
+            if !is_head && let Err(error) = stream.write_all(FILE_BODY) {
+                eprintln!("HTTP example response body: {error}");
+                continue;
+            }
+            if let Err(error) = stream.flush() {
+                eprintln!("HTTP example response flush: {error}");
+            }
         }
     });
     Ok((port, handle))
@@ -133,7 +139,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // 清理工作目录(best-effort)。
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "example working directory cleanup {}: {error}",
+            work_dir.display()
+        );
+    }
 
     Ok(())
 }

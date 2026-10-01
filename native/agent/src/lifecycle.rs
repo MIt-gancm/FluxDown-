@@ -171,6 +171,8 @@ mod tests {
         assert!(!daemon_lease_released(&path), "held lease must block");
         drop(holder);
         assert!(daemon_lease_released(&path), "dropped lease is released");
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), %error, "lease test cleanup failed");
+        }
     }
 }

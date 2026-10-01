@@ -122,15 +122,17 @@ pub fn open(cx: &mut App, task_id: String, activate: bool) {
     let handle = opened
         .map(Into::into)
         .or_else(|| WindowRegistry::handle(cx, &key));
-    if let Some(handle) = handle {
-        let _ = handle.update(cx, |_, window, cx| {
+    if let Some(handle) = handle
+        && let Err(error) = handle.update(cx, |_, window, cx| {
             if activate {
                 crate::windows::bring_to_front(window, cx);
             } else {
                 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                 window.request_attention();
             }
-        });
+        })
+    {
+        log::debug!("view or window released before lifecycle update: {error:#}");
     }
 }
 
@@ -150,7 +152,9 @@ fn close_after_handoff(window: &mut Window, cx: &mut Context<Root>) {
     .detach();
     cx.spawn_in(window, async move |_, cx| {
         cx.background_executor().timer(HANDOFF_CLOSE_TIMEOUT).await;
-        let _ = cx.update(|window, _| window.remove_window());
+        if let Err(error) = cx.update(|window, _| window.remove_window()) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     })
     .detach();
 }

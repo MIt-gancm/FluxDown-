@@ -412,7 +412,9 @@ async fn run_actor(
                     DaemonCommand::Shutdown { ack } => {
                         selections.resolve_all_defaults();
                         cancel.cancel();
-                        let _ = ack.send(());
+                        if ack.send(()).is_err() {
+                            tracing::debug!("daemon shutdown caller disconnected before acknowledgement");
+                        }
                         break;
                     }
                 }
@@ -466,12 +468,19 @@ async fn run_actor(
     while let Some(command) = commands.recv().await {
         match command {
             DaemonCommand::Execute { ack, .. } => {
-                let _ = ack.send(Err(ActorError::Operation(
-                    "daemon is shutting down".to_owned(),
-                )));
+                if ack
+                    .send(Err(ActorError::Operation(
+                        "daemon is shutting down".to_owned(),
+                    )))
+                    .is_err()
+                {
+                    tracing::debug!("daemon caller disconnected during shutdown");
+                }
             }
             DaemonCommand::Shutdown { ack } => {
-                let _ = ack.send(());
+                if ack.send(()).is_err() {
+                    tracing::debug!("daemon shutdown caller disconnected before acknowledgement");
+                }
             }
         }
     }
@@ -507,14 +516,26 @@ async fn dispatch_operation(
                     .map_err(|_| {
                         ActorError::Operation("resolve preview worker dropped".to_owned())
                     });
-                let _ = ack.send(result);
+                if let Err(result) = ack.send(result) {
+                    match result {
+                        Err(ActorError::Operation(error)) => {
+                            tracing::warn!(%error, "resolve preview failed after caller disconnected");
+                        }
+                        _ => tracing::debug!("resolve preview caller disconnected before result"),
+                    }
+                }
             });
         }
         ActorOperation::RefreshTrackerSubscription => {
             let config = match engine.db.get_all_config().await {
                 Ok(config) => config,
                 Err(error) => {
-                    let _ = ack.send(Err(ActorError::Operation(format!("{error:#}"))));
+                    if ack
+                        .send(Err(ActorError::Operation(format!("{error:#}"))))
+                        .is_err()
+                    {
+                        tracing::warn!(%error, "tracker refresh config read failed after caller disconnected");
+                    }
                     return;
                 }
             };
@@ -526,14 +547,25 @@ async fn dispatch_operation(
             tokio::spawn(async move {
                 let outcome =
                     fluxdown_engine::tracker_subscription::fetch_subscriptions(&urls).await;
-                let _ = maintenance_tx.send(MaintenanceEvent::Tracker { outcome, ack });
+                if maintenance_tx
+                    .send(MaintenanceEvent::Tracker { outcome, ack })
+                    .is_err()
+                {
+                    // Actor 已关闭，未提交的结果丢弃并关闭回执，等待者收到 Unavailable。
+                    tracing::debug!("daemon actor closed before tracker refresh commit");
+                }
             });
         }
         ActorOperation::RefreshEd2kServerSubscription => {
             let config = match engine.db.get_all_config().await {
                 Ok(config) => config,
                 Err(error) => {
-                    let _ = ack.send(Err(ActorError::Operation(format!("{error:#}"))));
+                    if ack
+                        .send(Err(ActorError::Operation(format!("{error:#}"))))
+                        .is_err()
+                    {
+                        tracing::warn!(%error, "ED2K refresh config read failed after caller disconnected");
+                    }
                     return;
                 }
             };
@@ -545,25 +577,44 @@ async fn dispatch_operation(
                 let outcome =
                     fluxdown_engine::ed2k::server_subscription::fetch_server_subscriptions(&urls)
                         .await;
-                let _ = maintenance_tx.send(MaintenanceEvent::Ed2k { outcome, ack });
+                if maintenance_tx
+                    .send(MaintenanceEvent::Ed2k { outcome, ack })
+                    .is_err()
+                {
+                    // Actor 已关闭，未提交的结果丢弃并关闭回执，等待者收到 Unavailable。
+                    tracing::debug!("daemon actor closed before ED2K refresh commit");
+                }
             });
         }
         ActorOperation::RefreshEd2kNodes => {
             let url = match engine.db.get_config("ed2k_nodes_dat_url").await {
                 Ok(Some(url)) if !url.trim().is_empty() => url,
                 Ok(_) => {
-                    let _ = ack.send(Ok(ActorResult::Unit));
+                    if ack.send(Ok(ActorResult::Unit)).is_err() {
+                        tracing::debug!("ED2K nodes caller disconnected before acknowledgement");
+                    }
                     return;
                 }
                 Err(error) => {
-                    let _ = ack.send(Err(ActorError::Operation(format!("{error:#}"))));
+                    if ack
+                        .send(Err(ActorError::Operation(format!("{error:#}"))))
+                        .is_err()
+                    {
+                        tracing::warn!(%error, "ED2K nodes config read failed after caller disconnected");
+                    }
                     return;
                 }
             };
             let maintenance_tx = maintenance_tx.clone();
             tokio::spawn(async move {
                 let outcome = fluxdown_engine::ed2k::kad::fetch_nodes_dat(&url).await;
-                let _ = maintenance_tx.send(MaintenanceEvent::Ed2kNodes { outcome, ack });
+                if maintenance_tx
+                    .send(MaintenanceEvent::Ed2kNodes { outcome, ack })
+                    .is_err()
+                {
+                    // Actor 已关闭，未提交的结果丢弃并关闭回执，等待者收到 Unavailable。
+                    tracing::debug!("daemon actor closed before ED2K nodes commit");
+                }
             });
         }
         ActorOperation::RssValidate {
@@ -576,7 +627,12 @@ async fn dispatch_operation(
                 .manager
                 .rss_validate_future(url, cookies, user_agent, proxy_url);
             tokio::spawn(async move {
-                let _ = ack.send(Ok(ActorResult::RssValidation(Box::new(future.await))));
+                if ack
+                    .send(Ok(ActorResult::RssValidation(Box::new(future.await))))
+                    .is_err()
+                {
+                    tracing::debug!("RSS validation caller disconnected before result");
+                }
             });
         }
         ActorOperation::TestProxy {
@@ -598,7 +654,14 @@ async fn dispatch_operation(
                 .await
                 .map(ActorResult::ProxyLatency)
                 .map_err(|error| ActorError::Operation(format!("{error:#}")));
-                let _ = ack.send(result);
+                if let Err(result) = ack.send(result) {
+                    match result {
+                        Err(ActorError::Operation(error)) => {
+                            tracing::warn!(%error, "proxy test failed after caller disconnected");
+                        }
+                        _ => tracing::debug!("proxy test caller disconnected before result"),
+                    }
+                }
             });
         }
         ActorOperation::WebhookTest { endpoint_json } => {
@@ -613,12 +676,26 @@ async fn dispatch_operation(
                     ))),
                     Err(error) => Err(error),
                 };
-                let _ = ack.send(result);
+                if let Err(result) = ack.send(result) {
+                    match result {
+                        Err(ActorError::Operation(error)) => {
+                            tracing::warn!(%error, "webhook test failed after caller disconnected");
+                        }
+                        _ => tracing::debug!("webhook test caller disconnected before result"),
+                    }
+                }
             });
         }
         operation => {
             let result = execute_operation(operation, engine, events).await;
-            let _ = ack.send(result);
+            if let Err(result) = ack.send(result) {
+                match result {
+                    Err(ActorError::Operation(error)) => {
+                        tracing::warn!(%error, "daemon operation failed after caller disconnected");
+                    }
+                    _ => tracing::debug!("daemon operation caller disconnected before result"),
+                }
+            }
         }
     }
 }
@@ -1058,15 +1135,38 @@ async fn commit_maintenance(event: MaintenanceEvent, engine: &mut Engine) {
     match event {
         MaintenanceEvent::Tracker { outcome, ack } => {
             let result = commit_tracker_refresh(outcome, engine).await;
-            let _ = ack.send(result.map(ActorResult::TrackerRefresh));
+            if let Err(result) = ack.send(result.map(ActorResult::TrackerRefresh)) {
+                match result {
+                    Err(ActorError::Operation(error)) => {
+                        tracing::warn!(%error, "tracker refresh commit failed after caller disconnected");
+                    }
+                    _ => {
+                        tracing::debug!("tracker refresh commit caller disconnected before result")
+                    }
+                }
+            }
         }
         MaintenanceEvent::Ed2kNodes { outcome, ack } => {
             let result = commit_ed2k_nodes(outcome, engine).await;
-            let _ = ack.send(result);
+            if let Err(result) = ack.send(result) {
+                match result {
+                    Err(ActorError::Operation(error)) => {
+                        tracing::warn!(%error, "ED2K nodes commit failed after caller disconnected");
+                    }
+                    _ => tracing::debug!("ED2K nodes commit caller disconnected before result"),
+                }
+            }
         }
         MaintenanceEvent::Ed2k { outcome, ack } => {
             let result = commit_ed2k_refresh(outcome, engine).await;
-            let _ = ack.send(result.map(ActorResult::Ed2kRefresh));
+            if let Err(result) = ack.send(result.map(ActorResult::Ed2kRefresh)) {
+                match result {
+                    Err(ActorError::Operation(error)) => {
+                        tracing::warn!(%error, "ED2K refresh commit failed after caller disconnected");
+                    }
+                    _ => tracing::debug!("ED2K refresh commit caller disconnected before result"),
+                }
+            }
         }
     }
 }
@@ -1778,7 +1878,9 @@ mod tests {
         );
 
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("actor test directory removal failed: {error}");
+        }
     }
 
     #[tokio::test]
@@ -1831,7 +1933,9 @@ mod tests {
         );
 
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("actor test directory removal failed: {error}");
+        }
     }
 
     #[test]
@@ -1898,7 +2002,9 @@ mod tests {
         assert_eq!(store["https://b.example"].pass, "p2");
 
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("site auth upsert test directory removal failed: {error}");
+        }
     }
 
     #[tokio::test]
@@ -1925,7 +2031,9 @@ mod tests {
         );
 
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await {
+            eprintln!("actor batch ids test directory removal failed: {error}");
+        }
     }
 
     #[test]

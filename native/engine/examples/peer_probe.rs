@@ -160,13 +160,17 @@ async fn main() {
                 println!("<- HelloAnswer ({} bytes) — peer alive", payload.len());
                 // 2. FileRequest
                 if !sent_filereq {
-                    let _ = stream
+                    if let Err(error) = stream
                         .write_all(&proto::frame_with_proto(
                             PROTO_EDONKEY,
                             OP_FILEREQUEST,
                             &FILE_HASH,
                         ))
-                        .await;
+                        .await
+                    {
+                        eprintln!("peer request write failed: {error}");
+                        return;
+                    }
                     println!("-> FileRequest");
                     sent_filereq = true;
                 }
@@ -174,13 +178,17 @@ async fn main() {
             OP_FILEANSWER => {
                 println!("<- FileAnswer (peer HAS the file)");
                 if !sent_statusreq {
-                    let _ = stream
+                    if let Err(error) = stream
                         .write_all(&proto::frame_with_proto(
                             PROTO_EDONKEY,
                             OP_SETREQFILEID,
                             &FILE_HASH,
                         ))
-                        .await;
+                        .await
+                    {
+                        eprintln!("peer request write failed: {error}");
+                        return;
+                    }
                     println!("-> FileStatusRequest");
                     sent_statusreq = true;
                 }
@@ -192,13 +200,17 @@ async fn main() {
             OP_FILESTATUS => {
                 println!("<- FileStatusAnswer ({} bytes)", payload.len());
                 if !sent_startupload {
-                    let _ = stream
+                    if let Err(error) = stream
                         .write_all(&proto::frame_with_proto(
                             PROTO_EDONKEY,
                             OP_STARTUPLOADREQ,
                             &FILE_HASH,
                         ))
-                        .await;
+                        .await
+                    {
+                        eprintln!("peer request write failed: {error}");
+                        return;
+                    }
                     println!("-> StartUpload");
                     sent_startupload = true;
                 }
@@ -206,13 +218,17 @@ async fn main() {
             OP_ACCEPTUPLOADREQ => {
                 println!("<- AcceptUpload — WE HAVE AN UPLOAD SLOT");
                 if !sent_reqparts {
-                    let _ = stream
+                    if let Err(error) = stream
                         .write_all(&proto::frame_with_proto(
                             PROTO_EDONKEY,
                             OP_REQUESTPARTS,
                             &build_request_parts(),
                         ))
-                        .await;
+                        .await
+                    {
+                        eprintln!("peer request write failed: {error}");
+                        return;
+                    }
                     println!("-> RequestParts [0, {})", BLOCK_SIZE.min(FILE_SIZE));
                     sent_reqparts = true;
                 }

@@ -102,7 +102,7 @@ impl RenameDialog {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
                     Ok(_) => window.close_dialog(cx),
@@ -115,7 +115,10 @@ impl RenameDialog {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -202,7 +205,7 @@ pub(crate) fn confirm_delete(
                 window
                     .spawn(cx, async move |cx| {
                         let result = future.await;
-                        let _ = cx.update(|window, cx| {
+                        let Ok(()) = cx.update(|window, cx| {
                             if let Err(error) = result {
                                 let message = error_text(
                                     host.read(cx).translator().read(cx),
@@ -211,7 +214,10 @@ pub(crate) fn confirm_delete(
                                 );
                                 window.push_notification(Notification::error(message), cx);
                             }
-                        });
+                        }) else {
+                            // 账户视图或窗口已释放，结束回调，不再更新状态。
+                            return;
+                        };
                     })
                     .detach();
                 true
@@ -262,14 +268,17 @@ pub(crate) fn confirm_unpair(
                 window
                     .spawn(cx, async move |cx| {
                         if let Err(error) = future.await {
-                            let _ = cx.update(|window, cx| {
+                            let Ok(()) = cx.update(|window, cx| {
                                 let message = error_text(
                                     host.read(cx).translator().read(cx),
                                     &error,
                                     ErrorContext::Pairing,
                                 );
                                 window.push_notification(Notification::error(message), cx);
-                            });
+                            }) else {
+                                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                                return;
+                            };
                         }
                     })
                     .detach();

@@ -29,7 +29,7 @@ use crate::{
     },
     pages::new_download::{NewDownloadContext, build_new_download_context},
     pages::task_detail::TaskDetailView,
-    strings::DownloadStrings,
+    strings::{DownloadStrings, error_text},
     submission::{NewDownloadSubmission, SubmitNotice, run_submission},
 };
 use fluxdown_ui_components::{ControlExt as _, FluxIcon};
@@ -579,17 +579,24 @@ impl DownloadView {
             RefreshPlan::Deferred => {
                 let this = cx.weak_entity();
                 cx.defer(move |cx| {
-                    let _ = this.update(cx, |this, cx| {
+                    let Ok(()) = this.update(cx, |this, cx| {
                         this.run_scheduled_refresh(RefreshTrigger::Deferred, cx);
-                    });
+                    }) else {
+                        // 下载页已释放，结束回调，不再提交请求或刷新状态。
+                        return;
+                    };
                 });
             }
             RefreshPlan::After(delay) => {
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(delay).await;
-                    let _ = this.update(cx, |this, cx| {
+
+                    let Ok(()) = this.update(cx, |this, cx| {
                         this.run_scheduled_refresh(RefreshTrigger::Timer, cx);
-                    });
+                    }) else {
+                        // 下载页已释放，结束回调，不再提交请求或刷新状态。
+                        return;
+                    };
                 })
                 .detach();
             }
@@ -720,10 +727,14 @@ impl DownloadView {
             RescanDecision::After(delay) => {
                 cx.spawn(async move |this, cx| {
                     cx.background_executor().timer(delay).await;
-                    let _ = this.update(cx, |this, cx| {
+
+                    let Ok(()) = this.update(cx, |this, cx| {
                         this.file_rescan.trailing_fired(Instant::now());
                         this.send_file_rescan(cx);
-                    });
+                    }) else {
+                        // 下载页已释放，结束回调，不再提交请求或刷新状态。
+                        return;
+                    };
                 })
                 .detach();
             }
@@ -743,7 +754,13 @@ impl DownloadView {
         let future = self.controller.execute(DownloadsCommand::RescanFiles);
         cx.background_executor()
             .spawn(async move {
-                let _ = future.await;
+                if let Err(error) = future.await {
+                    // 后台定时扫描仍会兜底，不覆盖页面现有业务错误。
+                    eprintln!(
+                        "download file rescan request failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                }
             })
             .detach();
     }
@@ -835,7 +852,8 @@ impl DownloadView {
             if marker.get() != generation {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 let value = this.table_state.update(cx, |table, _| {
                     let delegate = table.delegate_mut();
                     let columns = delegate.column_prefs();
@@ -850,11 +868,28 @@ impl DownloadView {
                         key: VIEW_PREFS_KEY,
                         value,
                     });
-                cx.background_spawn(async move {
-                    let _ = future.await;
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = future.await {
+                        let Ok(()) = this.update(cx, |this, cx| {
+                            if this.prefs_generation.get() == generation {
+                                this.applied_view_prefs = None;
+                            }
+                            this.last_error = Some(SharedString::from(error_text(
+                                this.translator.read(cx),
+                                &error,
+                            )));
+                            cx.notify();
+                        }) else {
+                            // 下载页已关闭，停止回写偏好保存结果。
+                            return;
+                        };
+                    }
                 })
                 .detach();
-            });
+            }) else {
+                // 下载页已释放，结束回调，不再提交请求或刷新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -892,7 +927,8 @@ impl DownloadView {
             if marker.get() != generation {
                 return;
             }
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 let query = input.read(cx).value().to_string();
                 this.table_state.update(cx, |table, cx| {
                     table.delegate_mut().set_query(&query);
@@ -900,7 +936,10 @@ impl DownloadView {
                         table.refresh(cx);
                     }
                 });
-            });
+            }) else {
+                // 下载页已释放，结束回调，不再提交请求或刷新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -991,13 +1030,14 @@ impl DownloadView {
                         return false;
                     }
                     let task_id = task_id.clone();
-                    let _ = this.update(cx, |this, cx| {
+                    // 页面释放后没有提交命令，不能让确认框报告成功。
+                    this.update(cx, |this, cx| {
                         this.execute_commands(
                             vec![DownloadsCommand::Rename { task_id, file_name }],
                             cx,
                         );
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
         input.update(cx, |state, cx| state.focus(window, cx));
@@ -1029,13 +1069,14 @@ impl DownloadView {
                 ))
                 .on_ok(move |_, _, cx| {
                     let task_id = task_id.clone();
-                    let _ = this.update(cx, |this, cx| {
+                    // 页面释放后没有提交命令，不能让确认框报告成功。
+                    this.update(cx, |this, cx| {
                         this.execute_commands(
                             vec![DownloadsCommand::IgnorePluginRetry { task_id }],
                             cx,
                         );
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
     }
@@ -1157,7 +1198,8 @@ impl DownloadView {
                 ))
                 .on_ok(move |_, _, cx| {
                     let group_id = group_id.clone();
-                    let _ = this.update(cx, |this, cx| {
+                    // 页面释放后没有提交命令，不能让确认框报告成功。
+                    this.update(cx, |this, cx| {
                         this.execute_commands(
                             vec![DownloadsCommand::GroupDelete {
                                 group_id,
@@ -1165,8 +1207,8 @@ impl DownloadView {
                             }],
                             cx,
                         );
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
     }
@@ -1328,11 +1370,12 @@ impl DownloadView {
                     cx,
                 ))
                 .on_ok(move |_, _, cx| {
-                    let _ = this.update(cx, |this, cx| {
+                    // 页面释放后没有提交命令，不能让确认框报告成功。
+                    this.update(cx, |this, cx| {
                         let commands = this.delete_commands(&keys, true);
                         this.execute_commands(commands, cx);
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
     }
@@ -1524,7 +1567,11 @@ impl DownloadView {
                 })
                 .map(|path| DownloadsCommand::open_torrent_file(&path))
                 .collect();
-            let _ = this.update(cx, |this, cx| this.execute_commands(commands, cx));
+
+            let Ok(()) = this.update(cx, |this, cx| this.execute_commands(commands, cx)) else {
+                // 下载页已释放，结束回调，不再提交请求或刷新状态。
+                return;
+            };
         })
         .detach();
     }

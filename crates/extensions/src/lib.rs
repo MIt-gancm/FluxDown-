@@ -216,7 +216,10 @@ impl Render for ExtensionsView {
                 tab.index(),
                 move |index, _, cx| {
                     if let Some(tab) = ExtensionsTab::ALL.get(index) {
-                        let _ = view.update(cx, |this, cx| this.show_tab(*tab, cx));
+                        let Ok(()) = view.update(cx, |this, cx| this.show_tab(*tab, cx)) else {
+                            // 扩展视图已释放，结束回调，不再更新状态。
+                            return;
+                        };
                     }
                 },
                 cx,

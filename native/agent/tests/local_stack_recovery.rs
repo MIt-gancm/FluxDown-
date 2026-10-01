@@ -130,8 +130,13 @@ async fn client_observes_daemon_stale_recovery_and_agent_restart_state_restorati
     send_signal(replacement_pid, "TERM");
     wait_for_process_exit(replacement_pid, Duration::from_secs(10)).await;
     stack.daemon_cleaned = true;
-    std::fs::remove_dir_all(&root).expect("remove local stack data dir");
-    let _ = std::fs::remove_dir_all(short_home(&root));
+    if let Err(error) = std::fs::remove_dir_all(&root) {
+        tracing::warn!(path = %root.display(), %error, "local stack test cleanup failed");
+    }
+    let home = short_home(&root);
+    if let Err(error) = std::fs::remove_dir_all(&home) {
+        tracing::warn!(path = %home.display(), %error, "isolated agent HOME cleanup failed");
+    }
 }
 
 /// 完全退出（握手前 `system.shutdown`，即版本替换与托盘「退出」共用的路径）：daemon 先
@@ -223,8 +228,13 @@ async fn full_quit_stops_daemon_then_agent_and_tells_clients_not_to_reconnect() 
         Some(daemon_pid),
         "no daemon may be relaunched while quitting"
     );
-    std::fs::remove_dir_all(&root).expect("remove local stack data dir");
-    let _ = std::fs::remove_dir_all(short_home(&root));
+    if let Err(error) = std::fs::remove_dir_all(&root) {
+        tracing::warn!(path = %root.display(), %error, "local stack test cleanup failed");
+    }
+    let home = short_home(&root);
+    if let Err(error) = std::fs::remove_dir_all(&home) {
+        tracing::warn!(path = %home.display(), %error, "isolated agent HOME cleanup failed");
+    }
 }
 
 struct StackGuard {
@@ -246,16 +256,60 @@ impl StackGuard {
 impl Drop for StackGuard {
     fn drop(&mut self) {
         if let Some(agent) = self.agent.as_mut() {
-            let _ = agent.kill();
-            let _ = agent.wait();
+            match agent.try_wait() {
+                Ok(Some(status)) => tracing::debug!(%status, "local stack agent already exited"),
+                result => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "could not inspect local stack agent during cleanup");
+                    }
+                    match agent.kill() {
+                        Ok(()) => {
+                            if let Err(error) = agent.wait() {
+                                tracing::warn!(%error, "could not reap local stack agent during cleanup");
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "could not stop local stack agent during cleanup")
+                        }
+                    }
+                }
+            }
         }
-        if !self.daemon_cleaned
-            && let Ok(text) = std::fs::read_to_string(&self.daemon_pid_file)
-            && let Ok(pid) = text.trim().parse::<u32>()
+        if self.daemon_cleaned {
+            return;
+        }
+        let text = match std::fs::read_to_string(&self.daemon_pid_file) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!(path = %self.daemon_pid_file.display(), %error, "could not read local stack daemon PID during cleanup");
+                return;
+            }
+        };
+        let pid = match text.trim().parse::<u32>() {
+            Ok(pid) => pid,
+            Err(error) => {
+                tracing::warn!(%error, "invalid local stack daemon PID during cleanup");
+                return;
+            }
+        };
+        if !process_exists(pid) {
+            tracing::debug!(pid, "local stack daemon already exited");
+            return;
+        }
+        match Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .status()
         {
-            let _ = Command::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .status();
+            Ok(status) if status.success() => {
+                tracing::debug!(pid, "stopped local stack daemon during cleanup")
+            }
+            Ok(status) => {
+                tracing::warn!(pid, %status, "could not stop local stack daemon during cleanup")
+            }
+            Err(error) => {
+                tracing::warn!(pid, %error, "could not run local stack daemon cleanup command")
+            }
         }
     }
 }

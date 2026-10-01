@@ -253,7 +253,12 @@ async fn create_pipe_instance(name: &str) -> tokio::net::windows::named_pipe::Na
 #[cfg(unix)]
 impl Drop for Listener {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            // 监听 socket 可能已被外部移除；其余清理失败保留诊断。
+            log::warn!("could not remove desktop activation socket: {error}");
+        }
     }
 }
 
@@ -360,8 +365,13 @@ async fn receive_and_ack_unix(
             .is_ok()
             && confirmed.await.is_ok()
         {
-            let _ = stream.write_all(ACKNOWLEDGEMENT).await;
-            let _ = stream.flush().await;
+            if let Err(error) = stream.write_all(ACKNOWLEDGEMENT).await {
+                log::debug!("activation peer disconnected before acknowledgement: {error}");
+                return;
+            }
+            if let Err(error) = stream.flush().await {
+                log::debug!("activation acknowledgement flush failed: {error}");
+            }
         }
     }
 }
@@ -388,8 +398,13 @@ async fn receive_and_ack_windows(
             .is_ok()
             && confirmed.await.is_ok()
         {
-            let _ = stream.write_all(ACKNOWLEDGEMENT).await;
-            let _ = stream.flush().await;
+            if let Err(error) = stream.write_all(ACKNOWLEDGEMENT).await {
+                log::debug!("activation peer disconnected before acknowledgement: {error}");
+                return;
+            }
+            if let Err(error) = stream.flush().await {
+                log::debug!("activation acknowledgement flush failed: {error}");
+            }
         }
     }
 }
@@ -475,9 +490,12 @@ mod tests {
             .expect("sender thread")
             .expect("acknowledged activation");
         task.abort();
-        let _ = runtime.block_on(task);
+        let error = runtime.block_on(task).expect_err("aborted listener task");
+        assert!(error.is_cancelled(), "listener task panicked: {error}");
         drop(runtime);
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            log::warn!("could not remove queued activation fixture: {error}");
+        }
     }
 
     #[cfg(unix)]
@@ -509,8 +527,11 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&endpoint.0).expect("bind listener");
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
-            let mut request = [0_u8; 256];
-            let _ = stream.read(&mut request);
+            // 只需确认请求已经写达，不读取固定大块而让短请求互相等待。
+            let mut request = [0_u8; 1];
+            stream
+                .read_exact(&mut request)
+                .expect("read activation request");
             std::thread::sleep(Duration::from_millis(300));
         });
         let error = send_to_primary(&endpoint, &ActivateMessage::default())
@@ -518,6 +539,8 @@ mod tests {
         assert!(matches!(error, SendError::DeliveryUncertain(_)));
         assert!(!error.is_retryable());
         server.join().expect("server thread");
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            log::warn!("could not remove unacknowledged activation fixture: {error}");
+        }
     }
 }

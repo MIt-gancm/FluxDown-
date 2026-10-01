@@ -129,15 +129,14 @@ struct HostResponse {
 }
 
 /// Serialize and write a locally-generated response to stdout.
-fn respond_status(success: bool, message: &str, msg_id: u64) {
+fn respond_status(success: bool, message: &str, msg_id: u64) -> io::Result<()> {
     let resp = HostResponse {
         success,
         message: message.to_string(),
         msg_id,
     };
-    if let Ok(json) = serde_json::to_vec(&resp) {
-        write_stdout_message(&json);
-    }
+    let json = serde_json::to_vec(&resp).map_err(io::Error::other)?;
+    write_stdout_message(&json)
 }
 
 // ---------------------------------------------------------------------------
@@ -162,7 +161,10 @@ fn log_path() -> Option<std::path::PathBuf> {
                 .join("Library")
                 .join("Application Support")
                 .join("fluxdown");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                eprintln!("fluxdown_nmh: cannot create log directory: {error}");
+                return None;
+            }
             return Some(dir.join("fluxdown_nmh.log"));
         }
         Some(Path::new("/tmp").join("fluxdown_nmh.log"))
@@ -175,7 +177,10 @@ fn log_path() -> Option<std::path::PathBuf> {
         // process (host) and the NMH process (launched by sandboxed browser).
         if let Some(home) = home_dir() {
             let dir = home.join(".local").join("share").join("fluxdown");
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                eprintln!("fluxdown_nmh: cannot create log directory: {error}");
+                return None;
+            }
             return Some(dir.join("fluxdown_nmh.log"));
         }
         Some(Path::new("/tmp").join("fluxdown_nmh.log"))
@@ -183,28 +188,39 @@ fn log_path() -> Option<std::path::PathBuf> {
 }
 
 /// Append a timestamped line to the NMH log file.
-/// Failures are silently ignored — logging must never break the relay.
+/// Failures go to stderr, never back into this logger or the stdout wire.
 fn log(msg: &str) {
     let Some(path) = log_path() else {
         return;
     };
-    let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut f = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-    else {
-        return;
-    };
-
-    // Truncate to 256 KB to prevent unbounded growth.
-    if let Ok(meta) = f.metadata()
-        && meta.len() > 256 * 1024
     {
-        let _ = f.set_len(0);
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("fluxdown_nmh: cannot open log file: {error}");
+            return;
+        }
+    };
+    match f.metadata() {
+        Ok(meta) if meta.len() > 256 * 1024 => {
+            if let Err(error) = f.set_len(0) {
+                eprintln!("fluxdown_nmh: cannot truncate log file: {error}");
+                return;
+            }
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("fluxdown_nmh: cannot inspect log file: {error}");
+            return;
+        }
     }
-
     let now = chrono_free_timestamp();
-    let _ = writeln!(f, "[{now}] {msg}");
+    if let Err(error) = writeln!(f, "[{now}] {msg}") {
+        eprintln!("fluxdown_nmh: cannot write log file: {error}");
+    }
 }
 
 /// Simple timestamp without pulling in chrono — "YYYY-MM-DD HH:MM:SS".
@@ -322,13 +338,22 @@ fn read_stdin_message() -> Option<Vec<u8>> {
 }
 
 /// Write one NMH message to stdout.
-fn write_stdout_message(data: &[u8]) {
+fn write_stdout_message(data: &[u8]) -> io::Result<()> {
     let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    let len = data.len() as u32;
-    let _ = handle.write_all(&len.to_le_bytes());
-    let _ = handle.write_all(data);
-    let _ = handle.flush();
+    write_message_frame(&mut stdout.lock(), data)
+}
+
+fn write_message_frame(writer: &mut impl Write, data: &[u8]) -> io::Result<()> {
+    let len = u32::try_from(data.len()).map_err(io::Error::other)?;
+    if len > MAX_MESSAGE_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "message too large",
+        ));
+    }
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(data)?;
+    writer.flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -674,8 +699,15 @@ fn main() {
         return;
     }
 
-    log("NMH started");
+    if let Err(error) = relay() {
+        log(&format!("NMH stdout failed; stopping relay: {error}"));
+        eprintln!("fluxdown_nmh: relay failed: {error}");
+        std::process::exit(1);
+    }
+}
 
+fn relay() -> io::Result<()> {
+    log("NMH started");
     let mut pipe: Option<pipe::PipeHandle> = None;
     let mut last_launch: Option<Instant> = None;
 
@@ -704,9 +736,9 @@ fn main() {
         // reconnect_and_resend, so an optimistic "warmed" costs nothing.
         if action == "warmup" {
             if pipe.is_some() {
-                respond_status(true, "warmed", msg_id);
+                respond_status(true, "warmed", msg_id)?;
             } else {
-                respond_status(false, "app_not_running", msg_id);
+                respond_status(false, "app_not_running", msg_id)?;
             }
             continue;
         }
@@ -716,7 +748,7 @@ fn main() {
         let mut p = match pipe.take() {
             Some(p) => p,
             None => {
-                respond_status(false, "app_not_running", msg_id);
+                respond_status(false, "app_not_running", msg_id)?;
                 continue;
             }
         };
@@ -729,7 +761,7 @@ fn main() {
             match reconnect_and_resend(&raw, is_no_launch, &mut last_launch) {
                 Some(fresh) => p = fresh,
                 None => {
-                    respond_status(false, "app_not_running", msg_id);
+                    respond_status(false, "app_not_running", msg_id)?;
                     continue;
                 }
             }
@@ -738,17 +770,18 @@ fn main() {
         // Read response from App.
         match p.read_message() {
             Ok(response_data) => {
-                write_stdout_message(&response_data);
+                write_stdout_message(&response_data)?;
                 pipe = Some(p);
             }
             Err(e) => {
                 log(&format!("pipe read failed ({}), dropping connection", e));
-                respond_status(false, "app_not_running", msg_id);
+                respond_status(false, "app_not_running", msg_id)?;
             }
         }
     }
 
     log("NMH exiting (stdin closed)");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -849,5 +882,54 @@ mod tests {
             classify_cli_invocation(&["/path/to/com.fluxdown.nmh.json", "fluxdown@zerx.dev"]),
             None
         );
+    }
+    #[cfg(test)]
+    mod frame_failure_tests {
+        use super::*;
+
+        struct FailingWriter {
+            fail_at: usize,
+            operations: usize,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for FailingWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.operations += 1;
+                if self.operations == self.fail_at {
+                    return Err(io::ErrorKind::BrokenPipe.into());
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.operations += 1;
+                if self.operations == self.fail_at {
+                    Err(io::ErrorKind::BrokenPipe.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        #[test]
+        fn frame_stops_at_header_payload_or_flush_failure() {
+            for fail_at in 1..=3 {
+                let mut writer = FailingWriter {
+                    fail_at,
+                    operations: 0,
+                    bytes: Vec::new(),
+                };
+                let error = write_message_frame(&mut writer, b"{}").expect_err("frame must fail");
+                assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                assert_eq!(writer.operations, fail_at, "no operation after failure");
+                let expected: &[u8] = match fail_at {
+                    1 => b"",
+                    2 => &[2, 0, 0, 0],
+                    _ => &[2, 0, 0, 0, b'{', b'}'],
+                };
+                assert_eq!(writer.bytes, expected);
+            }
+        }
     }
 }

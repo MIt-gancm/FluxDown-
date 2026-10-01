@@ -34,12 +34,18 @@ pub(crate) fn page(ctx: &SectionContext, _cx: &mut App) -> SettingsPage {
 
 fn version_section(ctx: &SectionContext) -> SettingsSection {
     let version = SharedString::from(format!("v{APP_VERSION}"));
+    let protocol = SharedString::from(fluxdown_protocol::PROTOCOL_VERSION.to_string());
     SettingsSection::new()
         .title(SharedString::from("FluxDown"))
         .row(ctx.item(
             "currentVersion",
             None,
             Control::custom(move |_, _, _, cx: &mut App| body_text(cx).child(version.clone())),
+        ))
+        .row(ctx.item(
+            "protocolVersionLabel",
+            None,
+            Control::custom(move |_, _, _, cx: &mut App| body_text(cx).child(protocol.clone())),
         ))
 }
 

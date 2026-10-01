@@ -164,15 +164,17 @@ pub async fn run_add_local(args: AddArgs, json: bool) -> Result<(), ClientError>
                 engine.manager.on_task_done(&done).await; // 内部 drain_queue 推进排队任务
                 remaining.remove(&done.task_id);
             }
-            _ = tokio::signal::ctrl_c() => {
+            signal = tokio::signal::ctrl_c() => {
                 for id in &remaining {
                     engine.manager.pause_task(id).await; // pause 保留续传语义（非 cancel）
                 }
-                let _ = engine.db.wal_checkpoint().await; // pause 路径不自动 checkpoint，补一次
-                return Err(ClientError::new(
-                    "interrupted; downloads unfinished",
-                    ExitCode::Unfinished,
-                ));
+                if let Err(error) = engine.db.wal_checkpoint().await {
+                    eprintln!("fluxdown: checkpoint after interruption failed: {error}");
+                }
+                return Err(match signal {
+                    Ok(()) => ClientError::new("interrupted; downloads unfinished", ExitCode::Unfinished),
+                    Err(error) => ClientError::new(format!("failed to listen for interruption: {error}"), ExitCode::Unknown),
+                });
             }
         }
     }

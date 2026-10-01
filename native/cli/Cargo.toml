@@ -7,10 +7,8 @@ edition = "2024"
 name = "fluxdown"
 path = "src/main.rs"
 
-[lints.clippy]
-unwrap_used = "deny"
-expect_used = "deny"
-wildcard_imports = "deny"
+[lints]
+workspace = true
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive", "env"] }

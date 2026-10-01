@@ -142,9 +142,11 @@ fn sync_targets(cx: &mut App) {
     else {
         return;
     };
-    let _ = handle.update(cx, |_, window, cx| {
+    if let Err(error) = handle.update(cx, |_, window, cx| {
         form.update(cx, |form, cx| form.set_targets(targets, window, cx));
-    });
+    }) {
+        log::debug!("view or window released before lifecycle update: {error:#}");
+    }
 }
 
 /// 对齐 agent 的待确认列表：已消失的事务从表单移除（链接行保留为普通链接），新事务追加
@@ -257,9 +259,11 @@ fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCap
         });
     // 菜单入口与外部捕获都是需要用户立即处理的操作：macOS 后台时也要将窗口及应用置前。
     if let Some(handle) = handle {
-        let _ = handle.update(cx, |_, window, cx| {
+        if let Err(error) = handle.update(cx, |_, window, cx| {
             crate::windows::bring_to_front(window, cx)
-        });
+        }) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     } else if let Some(handle) = WindowRegistry::handle(cx, &WindowKey::NewDownload) {
         // 窗口已开：新建流程不会重建表单，拖入的链接追加进已有表单（去重、保留已输入内容）。
         let form = cx
@@ -267,14 +271,16 @@ fn open_with(cx: &mut App, context: NewDownloadContext, captures: Vec<PendingCap
             .form
             .as_ref()
             .and_then(WeakEntity::upgrade);
-        let _ = handle.update(cx, |_, window, cx| {
+        if let Err(error) = handle.update(cx, |_, window, cx| {
             if let Some(form) = form
                 && !initial_urls.is_empty()
             {
                 form.update(cx, |form, cx| form.append_urls(initial_urls, window, cx));
             }
             crate::windows::bring_to_front(window, cx)
-        });
+        }) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     }
 }
 
@@ -288,8 +294,12 @@ fn ignore_captures(captures: Vec<PendingCaptureDto>, port: &AgentDownloadsPort, 
                 request: None,
             },
         )));
-        let task = cx.spawn(async move |_| {
-            let _ = ignore.await;
+        let task = cx.spawn(async move |_| match ignore.await {
+            Ok(_) => log::trace!("unconfirmed capture dismissed"),
+            Err(error) if error.code == fluxdown_protocol::ApplicationErrorCode::NotFound => {
+                log::debug!("unconfirmed capture already resolved");
+            }
+            Err(error) => log::warn!("failed to dismiss unconfirmed capture: {:?}", error.code),
         });
         lifecycle::keep_alive(cx, task).detach();
     }
@@ -355,9 +365,11 @@ fn submit(submission: NewDownloadSubmission, port: &Arc<AgentDownloadsPort>, cx:
             } else {
                 Notification::error(message)
             };
-            let _ = main.update(cx, |_, window, cx| {
+            if let Err(error) = main.update(cx, |_, window, cx| {
                 window.push_notification(notification, cx)
-            });
+            }) {
+                log::debug!("view or window released before lifecycle update: {error:#}");
+            }
         });
     });
     lifecycle::keep_alive(cx, task).detach();

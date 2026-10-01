@@ -148,7 +148,9 @@ mod tests {
             torrent_path(&format!("file://{}", file.display())),
             Some(file.clone())
         );
-        let _ = std::fs::remove_file(file);
+        if let Err(error) = std::fs::remove_file(file) {
+            log::warn!("could not remove torrent argument fixture: {error}");
+        }
     }
 
     #[test]
@@ -200,6 +202,8 @@ mod tests {
         let replacement = InstanceLock::try_acquire(&dir).expect("replacement lock");
         assert!(replacement.is_some());
         drop(replacement);
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            log::warn!("could not remove instance lock fixture: {error}");
+        }
     }
 }

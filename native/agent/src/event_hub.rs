@@ -83,7 +83,13 @@ impl AgentEventHub {
             sequence: state.sequence,
             event: ServiceEvent::Agent(event),
         };
-        let _ = self.events.send(frame.clone());
+        // 无订阅者时快照仍需更新，但无需克隆整帧，也不逐事件刷生命周期日志。
+        if self.events.receiver_count() > 0 && self.events.send(frame.clone()).is_err() {
+            tracing::trace!(
+                sequence = frame.sequence,
+                "last agent event subscriber disconnected"
+            );
+        }
         frame
     }
 }

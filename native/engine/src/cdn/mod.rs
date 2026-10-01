@@ -456,6 +456,11 @@ mod tests {
         let dead_ip = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
         let survivors = probe_alive("probe.example", vec![dead_ip, alive_ip], port, &db).await;
         assert_eq!(survivors, vec![alive_ip]);
-        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 }

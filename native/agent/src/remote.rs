@@ -1902,6 +1902,7 @@ mod tests {
         /// 发给 daemon 的调用（仅 [`Harness::with_daemon`]；其余 harness 的 daemon 永远未连接）。
         daemon_calls: DaemonCalls,
         dir: std::path::PathBuf,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
     }
 
     impl Harness {
@@ -1940,9 +1941,7 @@ mod tests {
             let address = listener.local_addr().expect("remote mock address");
             let mock = Arc::new(RemoteMockState::default());
             let router = app(Router::new()).with_state(mock.clone());
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, router).await;
-            });
+            let server = tokio::spawn(async move { axum::serve(listener, router).await });
             let dir = std::env::temp_dir().join(format!(
                 "fluxdown_remote_{label}_{}_{}",
                 std::process::id(),
@@ -2002,6 +2001,7 @@ mod tests {
                 mock,
                 daemon_calls,
                 dir,
+                server,
             }
         }
 
@@ -2011,12 +2011,21 @@ mod tests {
                 state,
                 store,
                 dir,
+                server,
                 ..
             } = self;
             drop(service);
+            server.abort();
+            match server.await {
+                Ok(result) => result.expect("remote mock server completes successfully"),
+                Err(error) if error.is_cancelled() => tracing::debug!("remote mock server stopped"),
+                Err(error) => panic!("remote mock server panicked: {error}"),
+            }
             drop(state);
             drop(store);
-            let _ = tokio::fs::remove_dir_all(dir).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(path = %dir.display(), %error, "remote test cleanup failed");
+            }
         }
     }
 

@@ -136,7 +136,10 @@ fn spawn_shutdown_ticker(view: WeakEntity<DownloadView>, cx: &mut App) {
 }
 
 fn apply_speed_limit(view: WeakEntity<DownloadView>, key: &'static str, value: i64, cx: &mut App) {
-    let _ = view.update(cx, |this, cx| this.execute_config_patch(key, value, cx));
+    let Ok(()) = view.update(cx, |this, cx| this.execute_config_patch(key, value, cx)) else {
+        // 视图已释放，结束这次回调而不再更新状态。
+        return;
+    };
 }
 
 /// 数字输入弹窗文案：自定义限速（KB/s）与自定义关机延迟（分钟）复用。
@@ -240,10 +243,14 @@ impl DownloadView {
                 } else {
                     failed_message
                 };
-                let _ = this.update(cx, |this, cx| {
+
+                let Ok(()) = this.update(cx, |this, cx| {
                     this.last_error = Some(message);
                     cx.notify();
-                });
+                }) else {
+                    // 视图已释放，结束这次回调而不再更新状态。
+                    return;
+                };
             }
         })
         .detach();

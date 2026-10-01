@@ -54,11 +54,43 @@ fn spawn_server() -> (u16, std::thread::JoinHandle<()>) {
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
                 FILE_BODY.len()
             );
-            let _ = stream.write_all(resp.as_bytes());
+
+            stream.write_all(resp.as_bytes()).unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
             if !is_head {
-                let _ = stream.write_all(FILE_BODY);
+                stream.write_all(FILE_BODY).unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             }
-            let _ = stream.flush();
+
+            stream.flush().unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
         }
     });
     (port, handle)
@@ -167,7 +199,9 @@ struct ChannelSink(tokio::sync::mpsc::UnboundedSender<EngineEvent>);
 
 impl EventSink for ChannelSink {
     fn emit(&self, event: EngineEvent) {
-        let _ = self.0.send(event);
+        if self.0.send(event).is_err() {
+            tracing::debug!("test event receiver was dropped after observation");
+        }
     }
 }
 
@@ -291,7 +325,11 @@ async fn fission_end_to_end_creates_group_and_downloads_members() {
     assert_eq!(mother.group_id, group.group_id);
     assert!(mother.file_name == "a.mp4" || mother.file_name == "b.mp4");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 场景 2：`begin_resolve_preview` 只读——命中声明 `multi=true` 的 resolver
@@ -395,7 +433,11 @@ async fn preview_is_read_only_and_gated_by_multi_declaration() {
         "preview must not create any group row"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 场景 3：`create_task_group` 建组 + `delete_group` 删组（GC 回收组行）。
@@ -485,7 +527,11 @@ async fn create_task_group_then_delete_group_cleans_up_rows() {
         "delete_group must GC the now-empty group row"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 场景 4：清单总大小超过 `FISSION_AUTO_START_MAX_TOTAL_BYTES`（10GiB）阈值
@@ -575,7 +621,11 @@ async fn fission_over_threshold_pauses_all_members_without_downloading() {
         assert_eq!(t.downloaded_bytes, 0, "no download must have started");
     }
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 设置校验失败携带失败字段的 key（含未知键），宿主据此把错误归因到具体字段。
@@ -611,5 +661,10 @@ async fn update_settings_rejects_with_field_key() {
         matches!(&err, PluginError::InvalidSetting { key, .. } if key == "noSuchKey"),
         "got {err:?}"
     );
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

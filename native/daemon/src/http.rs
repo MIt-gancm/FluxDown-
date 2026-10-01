@@ -303,17 +303,23 @@ async fn run_socket(
                 } else {
                     "daemon-shutdown"
                 };
-                let _ = socket.send(Message::Close(Some(CloseFrame {
+                if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                     code: 1001,
                     reason: reason.into(),
-                }))).await;
+                }))).await {
+                    // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+                    tracing::debug!(%error, close_code = 1001, "daemon WebSocket close frame was not delivered");
+                }
                 break;
             }
             _ = &mut auth_deadline, if auth_permit.is_some() => {
-                let _ = socket.send(Message::Close(Some(CloseFrame {
+                if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                     code: 1008,
                     reason: "auth-timeout".into(),
-                }))).await;
+                }))).await {
+                    // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+                    tracing::debug!(%error, close_code = 1008, "daemon WebSocket close frame was not delivered");
+                }
                 break;
             }
             incoming = socket.next() => {
@@ -321,10 +327,13 @@ async fn run_socket(
                 match message {
                     Message::Text(text) => {
                         if !session.is_authenticated() && text.len() > PRE_AUTH_FRAME_LIMIT {
-                            let _ = socket.send(Message::Close(Some(CloseFrame {
+                            if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                                 code: 1009,
                                 reason: "frame too large before authentication".into(),
-                            }))).await;
+                            }))).await {
+                                // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+                                tracing::debug!(%error, close_code = 1009, "daemon WebSocket close frame was not delivered");
+                            }
                             break;
                         }
                         let reply = match session.accept(&text) {
@@ -351,10 +360,13 @@ async fn run_socket(
                             cancel.cancel();
                         }
                         if reply.close {
-                            let _ = socket.send(Message::Close(Some(CloseFrame {
+                            if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                                 code: 1008,
                                 reason: "unauthorized".into(),
-                            }))).await;
+                            }))).await {
+                                // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+                                tracing::debug!(%error, close_code = 1008, "daemon WebSocket close frame was not delivered");
+                            }
                             break;
                         }
                     }
@@ -364,10 +376,13 @@ async fn run_socket(
                     }
                     Message::Pong(_) => {}
                     Message::Binary(_) => {
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                        if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                             code: 1003,
                             reason: "text frames required".into(),
-                        }))).await;
+                        }))).await {
+                            // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+                            tracing::debug!(%error, close_code = 1003, "daemon WebSocket close frame was not delivered");
+                        }
                         break;
                     }
                 }
@@ -378,10 +393,13 @@ async fn run_socket(
                         if send_event(&mut socket, frame).await.is_err() { break; }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                        if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                             code: 4009,
                             reason: "event-gap".into(),
-                        }))).await;
+                        }))).await {
+                            // 对端可能已经断开；关闭帧 best effort，不影响本地关闭。
+                            tracing::debug!(%error, close_code = 4009, "daemon WebSocket close frame was not delivered");
+                        }
                         break;
                     }
                     Err(broadcast::error::RecvError::Closed) => break,

@@ -91,7 +91,18 @@ async fn start_node(addr: SocketAddr, body: Arc<Vec<u8>>, throttle_ms: u64) -> N
             let body = body.clone();
             let rg = rg.clone();
             let h = tokio::spawn(async move {
-                let _ = serve_conn(stream, body, rg, throttle_ms).await;
+                if let Err(error) = serve_conn(stream, body, rg, throttle_ms).await {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::UnexpectedEof
+                        ),
+                        "test server connection failed: {error}"
+                    );
+                }
             });
             cs.lock().unwrap().push(h);
         }
@@ -184,7 +195,14 @@ async fn serve_conn(
 
 fn work_dir(tag: &str) -> std::path::PathBuf {
     let d = std::env::temp_dir().join(format!("fluxdown_mcdn_{}_{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+
+    if let Err(error) = std::fs::remove_dir_all(&d) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     std::fs::create_dir_all(&d).expect("create work dir");
     d
 }
@@ -265,7 +283,8 @@ async fn run_with_pool(
     )
     .await;
     drop(tx);
-    let _ = drain.await;
+
+    drain.await.expect("test background task must not panic");
     (res, dest)
 }
 
@@ -343,7 +362,12 @@ async fn multi_cdn_distributes_and_survives_node_kill() {
         served >= 2,
         "分片必须分布在 ≥2 个 IP（实际 range GET 计数: {counts:?}）"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// SYS 兜底不变量（不变量 1）：候选里混入一个从未启动的死节点（connect
@@ -388,5 +412,10 @@ async fn multi_cdn_dead_candidate_never_fails_task() {
         "healthy pinned node range GETs: {}",
         s2.range_gets.load(Ordering::Relaxed)
     );
-    let _ = std::fs::remove_dir_all(&dir);
+
+    if let Err(error) = std::fs::remove_dir_all(&dir)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

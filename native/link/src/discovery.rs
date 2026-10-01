@@ -77,7 +77,9 @@ impl MdnsAdvertiser {
 
 impl Drop for MdnsAdvertiser {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        if let Err(error) = self.daemon.shutdown() {
+            tracing::warn!(%error, "mDNS shutdown failed");
+        }
     }
 }
 
@@ -88,17 +90,31 @@ pub struct MdnsBrowser {
 }
 
 impl MdnsBrowser {
-    /// 开始浏览，把解析出的设备推送到 `sink`（满/关闭即静默丢弃，不阻塞）。
+    /// 开始浏览，把解析出的设备推送到 `sink`（满时丢弃，关闭后退出，不阻塞）。
     pub fn start(sink: mpsc::Sender<DiscoveredPeer>) -> LinkResult<Self> {
         let daemon = ServiceDaemon::new().map_err(map_mdns_err)?;
         let receiver = daemon.browse(SERVICE_TYPE).map_err(map_mdns_err)?;
         tokio::spawn(async move {
+            let mut full_reported = false;
             while let Ok(event) = receiver.recv_async().await {
                 if let ServiceEvent::ServiceResolved(info) = event
                     && let Some(peer) = resolved_to_peer(&info)
                 {
-                    // 接收端满或已关闭：丢弃本条，继续浏览。
-                    let _ = sink.try_send(peer);
+                    match sink.try_send(peer) {
+                        Ok(()) => full_reported = false,
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            if !full_reported {
+                                tracing::debug!(
+                                    "mDNS discovery sink full; dropping discoveries until drained"
+                                );
+                                full_reported = true;
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!("mDNS discovery sink closed");
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -108,7 +124,9 @@ impl MdnsBrowser {
 
 impl Drop for MdnsBrowser {
     fn drop(&mut self) {
-        let _ = self.daemon.shutdown();
+        if let Err(error) = self.daemon.shutdown() {
+            tracing::warn!(%error, "mDNS shutdown failed");
+        }
     }
 }
 

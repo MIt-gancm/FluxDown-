@@ -113,16 +113,9 @@ impl BackgroundEffects {
         let Some(titles) = rss_notify_titles(frame) else {
             return;
         };
-        let (enabled, locale) = self.events.inspect(|snapshot| {
-            (
-                preference_bool(
-                    snapshot,
-                    NOTIFY_ON_COMPLETE_PREF,
-                    NOTIFY_ON_COMPLETE_DEFAULT,
-                ),
-                locale_preference(snapshot),
-            )
-        });
+        let (enabled, locale) = self
+            .events
+            .inspect(|snapshot| (notify_on_complete(snapshot), locale_preference(snapshot)));
         if !enabled {
             return;
         }
@@ -249,11 +242,7 @@ fn take_new_completions(
     snapshot: &AgentSnapshot,
     statuses: &mut HashMap<String, i32>,
 ) -> Vec<String> {
-    let enabled = preference_bool(
-        snapshot,
-        NOTIFY_ON_COMPLETE_PREF,
-        NOTIFY_ON_COMPLETE_DEFAULT,
-    );
+    let enabled = notify_on_complete(snapshot);
     let tasks = &snapshot.daemon.tasks;
     let mut completed = Vec::new();
     for task in tasks {
@@ -340,6 +329,15 @@ fn preference_bool(snapshot: &AgentSnapshot, key: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// 完成通知总开关（RSS 自动下载通知同受其约束；Doctor 据此判断是否需要检查通知权限）。
+pub(crate) fn notify_on_complete(snapshot: &AgentSnapshot) -> bool {
+    preference_bool(
+        snapshot,
+        NOTIFY_ON_COMPLETE_PREF,
+        NOTIFY_ON_COMPLETE_DEFAULT,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -349,9 +347,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        KEEP_AWAKE_DEFAULT, KEEP_AWAKE_PREF, NOTIFY_DEBOUNCE, NOTIFY_MAX_WAIT,
-        NOTIFY_ON_COMPLETE_DEFAULT, NOTIFY_ON_COMPLETE_PREF, PendingCompletions, locale_preference,
-        preference_bool, take_new_completions,
+        KEEP_AWAKE_DEFAULT, KEEP_AWAKE_PREF, NOTIFY_DEBOUNCE, NOTIFY_MAX_WAIT, PendingCompletions,
+        locale_preference, notify_on_complete, preference_bool, take_new_completions,
     };
 
     #[test]
@@ -447,7 +444,7 @@ mod tests {
             preferences: AgentPreferencesDto::default(),
             ..AgentSnapshot::default()
         };
-        assert!(notifies_on_complete(&snapshot));
+        assert!(notify_on_complete(&snapshot));
         assert!(!should_keep_awake_pref(&snapshot));
         snapshot
             .preferences
@@ -457,16 +454,8 @@ mod tests {
             .preferences
             .values
             .insert("download.keep_awake".to_owned(), json!(true));
-        assert!(!notifies_on_complete(&snapshot));
+        assert!(!notify_on_complete(&snapshot));
         assert!(should_keep_awake_pref(&snapshot));
-    }
-
-    fn notifies_on_complete(snapshot: &AgentSnapshot) -> bool {
-        preference_bool(
-            snapshot,
-            NOTIFY_ON_COMPLETE_PREF,
-            NOTIFY_ON_COMPLETE_DEFAULT,
-        )
     }
 
     fn should_keep_awake_pref(snapshot: &AgentSnapshot) -> bool {

@@ -552,15 +552,28 @@ async fn get_global_stat(id: &Value, host: &dyn ApiHost) -> Value {
 
 /// `aria2.purgeDownloadResult`：无参数，清除全部已停止（complete/error）
 /// 任务的结果记录（`delete_files=false`，语义等价 SQLite 常驻持久化下的
-/// 「清空历史列表项」）。逐条删除尽力而为，恒返回 `"OK"`（对齐 aria2：
-/// 该操作在内存态实现里不会失败）。
+/// 「清空历史列表项」）。逐条删除尽力而为；持久化失败时返回首个错误。
 async fn purge_download_result(id: &Value, host: &dyn ApiHost) -> Value {
-    if let Ok(tasks) = host.list_tasks().await {
-        for t in tasks.iter().filter(|t| aria2::is_stopped_status(t.status)) {
-            let _ = host.delete_task(&t.task_id, false).await;
+    let tasks = match host.list_tasks().await {
+        Ok(tasks) => tasks,
+        Err(error) => return rpc_err(id, 1, &error.to_string()),
+    };
+    let mut first_error = None;
+    for task in tasks
+        .iter()
+        .filter(|task| aria2::is_stopped_status(task.status))
+    {
+        if let Err(error) = host.delete_task(&task.task_id, false).await {
+            tracing::warn!(task_id = %task.task_id, %error, "purging stopped download result failed");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
     }
-    rpc_ok(id, Value::String("OK".to_string()))
+    match first_error {
+        Some(error) => rpc_err(id, 1, &error.to_string()),
+        None => rpc_ok(id, Value::String("OK".to_string())),
+    }
 }
 
 /// `aria2.removeDownloadResult`：`params = [gid]`，仅允许已停止任务。
@@ -659,6 +672,8 @@ mod tests {
         paused: Mutex<Vec<String>>,
         continued: Mutex<Vec<String>>,
         deleted: Mutex<Vec<(String, bool)>>,
+        delete_errors: HashMap<String, String>,
+        list_error: Option<String>,
     }
 
     impl TestHost {
@@ -688,6 +703,9 @@ mod tests {
     #[async_trait]
     impl ApiHost for TestHost {
         async fn list_tasks(&self) -> Result<Vec<TaskDto>, ApiError> {
+            if let Some(message) = &self.list_error {
+                return Err(ApiError::Internal(message.clone()));
+            }
             Ok(self.tasks.clone())
         }
         async fn get_task(&self, task_id: &str) -> Result<Option<TaskDto>, ApiError> {
@@ -702,6 +720,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((task_id.to_string(), delete_files));
+            if let Some(message) = self.delete_errors.get(task_id) {
+                return Err(ApiError::Internal(message.clone()));
+            }
             Ok(())
         }
         async fn pause_task(&self, task_id: &str) -> Result<(), ApiError> {
@@ -1100,6 +1121,42 @@ mod tests {
         let resp = call(&host, "aria2.removeDownloadResult", json!(["1a1a"])).await;
         assert_eq!(resp["result"], "OK");
         assert_eq!(host.deleted.lock().unwrap()[0], ("1a1a".to_string(), false));
+    }
+
+    #[tokio::test]
+    async fn purge_download_result_keeps_first_failure_and_cleans_remaining_tasks() {
+        let host = TestHost {
+            tasks: vec![task("a", 3), task("b", 4), task("c", 3)],
+            delete_errors: HashMap::from([
+                ("a".into(), "first persistence failure".into()),
+                ("c".into(), "later failure".into()),
+            ]),
+            ..Default::default()
+        };
+        let response = call(&host, "aria2.purgeDownloadResult", json!([])).await;
+        assert_eq!(response["error"]["message"], "first persistence failure");
+        assert_eq!(response["error"]["code"], 1);
+        assert!(response.get("result").is_none());
+        assert_eq!(
+            *host.deleted.lock().unwrap(),
+            vec![
+                ("a".into(), false),
+                ("b".into(), false),
+                ("c".into(), false)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_download_result_reports_list_failure_without_deleting() {
+        let host = TestHost {
+            list_error: Some("database unavailable".into()),
+            ..Default::default()
+        };
+        let response = call(&host, "aria2.purgeDownloadResult", json!([])).await;
+        assert_eq!(response["error"]["message"], "database unavailable");
+        assert!(response.get("result").is_none());
+        assert!(host.deleted.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

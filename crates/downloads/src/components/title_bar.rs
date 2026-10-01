@@ -203,9 +203,12 @@ impl DownloadTitleBar {
             // 原下载页 `escape` 语义：清空查询并把焦点交回下载页。
             .on_action(
                 cx.listener(|this, action: &gpui_component::input::Escape, window, cx| {
-                    let _ = this.view.update(cx, |view, cx| {
+                    let Ok(()) = this.view.update(cx, |view, cx| {
                         view.on_search_escape(action, window, cx);
-                    });
+                    }) else {
+                        // 视图已释放，结束这次回调而不再更新状态。
+                        return;
+                    };
                 }),
             )
             .child(
@@ -317,7 +320,11 @@ impl Render for DownloadTitleBar {
                     .icon(FluxIcon::Plus)
                     .label(new_label)
                     .on_click(move |_, window, cx| {
-                        let _ = view.update(cx, |view, cx| view.open_new_download(window, cx));
+                        let Ok(()) = view.update(cx, |view, cx| view.open_new_download(window, cx))
+                        else {
+                            // 视图已释放，结束这次回调而不再更新状态。
+                            return;
+                        };
                     }),
             ))
             .child(div().flex_1().min_w_0())
@@ -354,10 +361,13 @@ pub(crate) fn left_edge_probe<T: 'static>(
                 return;
             }
             window.defer(cx, move |_, cx| {
-                let _ = entity.update(cx, |entity, cx| {
+                let Ok(()) = entity.update(cx, |entity, cx| {
                     set(entity, left);
                     cx.notify();
-                });
+                }) else {
+                    // 视图已释放，结束这次回调而不再更新状态。
+                    return;
+                };
             });
         },
         |_, (), _, _| {},
@@ -471,7 +481,10 @@ fn update_prefs(
     mutate: impl FnOnce(&mut ViewPrefs) + 'static,
     cx: &mut App,
 ) {
-    let _ = view.update(cx, |view, cx| view.mutate_prefs(mutate, cx));
+    let Ok(()) = view.update(cx, |view, cx| view.mutate_prefs(mutate, cx)) else {
+        // 视图已释放，结束这次回调而不再更新状态。
+        return;
+    };
 }
 
 /// 视图菜单一次渲染所需的上下文。
@@ -502,10 +515,14 @@ fn view_menu_content(menu: ViewMenuContext<'_>, cx: &App) -> impl IntoElement + 
                 let Some(page) = ViewMenuPage::ALL.get(index).copied() else {
                     return;
                 };
-                let _ = title_bar.update(cx, |title_bar, cx| {
+
+                let Ok(()) = title_bar.update(cx, |title_bar, cx| {
                     title_bar.view_menu_page = page;
                     cx.notify();
-                });
+                }) else {
+                    // 视图已释放，结束这次回调而不再更新状态。
+                    return;
+                };
             },
             cx,
         )
@@ -554,7 +571,10 @@ fn columns_page(menu: &ViewMenuContext<'_>, style: MenuStyle, cx: &App) -> Vec<A
     let persist: Rc<dyn Fn(&mut App)> = {
         let view = menu.view.clone();
         Rc::new(move |cx: &mut App| {
-            let _ = view.update(cx, |view, cx| view.schedule_persist_prefs(cx));
+            let Ok(()) = view.update(cx, |view, cx| view.schedule_persist_prefs(cx)) else {
+                // 视图已释放，结束这次回调而不再更新状态。
+                return;
+            };
         })
     };
     let mut rows = columns

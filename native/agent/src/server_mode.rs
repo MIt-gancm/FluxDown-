@@ -274,12 +274,17 @@ pub struct ServerRuntime {
 
 /// 阻塞运行 server 模式直到退出。
 pub fn run_blocking(host: crate::shell::ShellHost) -> AgentResult {
-    let _ = tracing_subscriber::fmt()
+    if let Err(error) = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .try_init();
+        .try_init()
+    {
+        // 嵌入式宿主可能已经设置订阅者；保留它，同时让 stderr 可观察未安装的原因。
+        tracing::warn!(error = %error, "server tracing subscriber was not installed");
+        eprintln!("server tracing subscriber was not installed: {error}");
+    }
     let config = ServerConfig::from_env()?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -961,11 +966,21 @@ async fn download_logs(
         Ok(_) => tokio::fs::read(&temp).await,
         Err(error) => {
             tracing::warn!(error = %error, "log export failed");
-            let _ = tokio::fs::remove_file(&temp).await;
+            // 导出可能在创建归档前失败，NotFound 是预期清理结果。
+            if let Err(error) = tokio::fs::remove_file(&temp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %temp.display(), error = %error, "could not remove failed log export archive");
+            }
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let _ = tokio::fs::remove_file(&temp).await;
+    if let Err(error) = tokio::fs::remove_file(&temp).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        // 返回已读出的归档仍然有效，删除只负责 best-effort 临时文件清理。
+        tracing::warn!(path = %temp.display(), error = %error, "could not remove log export archive");
+    }
     match bytes {
         Ok(bytes) => (
             [
@@ -1300,6 +1315,8 @@ mod tests {
         store: Arc<StateStore>,
         dir: PathBuf,
         ready: tokio::sync::watch::Sender<bool>,
+        shutdown: CancellationToken,
+        server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     }
 
     impl Harness {
@@ -1347,17 +1364,22 @@ mod tests {
                 store,
                 dir,
                 ready,
+                shutdown: CancellationToken::new(),
+                server: None,
             }
         }
 
-        async fn serve(&self) -> String {
+        async fn serve(&mut self) -> String {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let app = router(self.handle.clone())
                 .into_make_service_with_connect_info::<std::net::SocketAddr>();
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
-            });
+            let shutdown = self.shutdown.clone();
+            self.server = Some(tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown.cancelled_owned())
+                    .await
+            }));
             base
         }
 
@@ -1368,17 +1390,28 @@ mod tests {
                 store,
                 dir,
                 ready: _,
+                shutdown,
+                server,
             } = self;
+            shutdown.cancel();
+            if let Some(server) = server {
+                server
+                    .await
+                    .expect("join headless agent test server")
+                    .expect("serve headless agent test");
+            }
             drop(handle);
             drop(state);
             drop(store);
-            let _ = tokio::fs::remove_dir_all(dir).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(path = %dir.display(), error = %error, "remove server test directory");
+            }
         }
     }
 
     #[tokio::test]
     async fn setup_endpoint_moves_empty_to_set_to_conflict() {
-        let harness = Harness::new("setup", "").await;
+        let mut harness = Harness::new("setup", "").await;
         let base = harness.serve().await;
         let client = reqwest::Client::new();
 
@@ -1445,7 +1478,7 @@ mod tests {
 
     #[tokio::test]
     async fn browser_file_routes_reject_missing_wrong_and_empty_credentials() {
-        let harness = Harness::new("files", "flux2026").await;
+        let mut harness = Harness::new("files", "flux2026").await;
         let base = harness.serve().await;
         let client = reqwest::Client::new();
         for path in ["/api/web/files/tasks/t1", "/api/web/exports/e1"] {
@@ -1498,7 +1531,7 @@ mod tests {
 
     #[tokio::test]
     async fn setup_waits_for_daemon_readiness_signal() {
-        let harness = Harness::new("ready", "").await;
+        let mut harness = Harness::new("ready", "").await;
         harness.ready.send(false).unwrap();
         let base = harness.serve().await;
         let client = reqwest::Client::new();

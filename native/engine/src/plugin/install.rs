@@ -19,7 +19,9 @@ const MAX_ENTRIES: usize = 200;
 pub fn install_from_zip(root: &Path, bytes: &[u8]) -> Result<String, PluginError> {
     let outcome = install_from_zip_with_backup(root, bytes)?;
     if let Err(error) = commit_install(&outcome) {
-        let _ = rollback_install(&outcome);
+        if let Err(rollback_error) = rollback_install(&outcome) {
+            crate::logger::report_error("plugin", "rollback_install", &rollback_error);
+        }
         return Err(error);
     }
     Ok(outcome.identity().to_string())
@@ -42,7 +44,11 @@ pub(crate) fn install_from_zip_with_backup(
         install_staged_dir(root, &src_root, identity)
     })();
     // 清理临时目录（无论成败）。
-    let _ = std::fs::remove_dir_all(&tmp);
+    if let Err(error) = std::fs::remove_dir_all(&tmp)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("plugin", "remove_install_staging", &error);
+    }
     result
 }
 
@@ -50,7 +56,9 @@ pub(crate) fn install_from_zip_with_backup(
 pub fn install_from_dir(root: &Path, path: &Path) -> Result<String, PluginError> {
     let outcome = install_from_dir_with_backup(root, path)?;
     if let Err(error) = commit_install(&outcome) {
-        let _ = rollback_install(&outcome);
+        if let Err(rollback_error) = rollback_install(&outcome) {
+            crate::logger::report_error("plugin", "rollback_install", &rollback_error);
+        }
         return Err(error);
     }
     Ok(outcome.identity().to_string())
@@ -99,9 +107,15 @@ fn install_staged_dir(
             .map_err(|e| PluginError::ManifestInvalid(format!("备份旧插件失败: {e}")))?;
     }
     if let Err(error) = copy_dir(source, &dest) {
-        let _ = std::fs::remove_dir_all(&dest);
-        if let Some(backup) = &backup {
-            let _ = std::fs::rename(backup, &dest);
+        if let Err(cleanup_error) = std::fs::remove_dir_all(&dest)
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("plugin", "remove_failed_install", &cleanup_error);
+        }
+        if let Some(backup) = &backup
+            && let Err(rollback_error) = std::fs::rename(backup, &dest)
+        {
+            crate::logger::report_error("plugin", "restore_install_backup", &rollback_error);
         }
         return Err(error);
     }
@@ -222,14 +236,16 @@ fn resolve_pkg_root(tmp: &Path) -> Result<PathBuf, PluginError> {
     }
     let mut subdirs = Vec::new();
     let mut has_root_files = false;
-    if let Ok(rd) = std::fs::read_dir(tmp) {
-        for entry in rd.flatten() {
-            let p = entry.path();
-            if p.is_dir() {
-                subdirs.push(p);
-            } else {
-                has_root_files = true;
-            }
+    let rd = std::fs::read_dir(tmp)
+        .map_err(|e| PluginError::ManifestInvalid(format!("读取暂存目录失败: {e}")))?;
+    for entry in rd {
+        let entry =
+            entry.map_err(|e| PluginError::ManifestInvalid(format!("读取暂存条目失败: {e}")))?;
+        let p = entry.path();
+        if p.is_dir() {
+            subdirs.push(p);
+        } else {
+            has_root_files = true;
         }
     }
     if !has_root_files && subdirs.len() == 1 && subdirs[0].join("manifest.json").is_file() {
@@ -246,7 +262,9 @@ fn copy_dir(src: &Path, dest: &Path) -> Result<(), PluginError> {
         .map_err(|e| PluginError::ManifestInvalid(format!("创建目标目录失败: {e}")))?;
     let rd = std::fs::read_dir(src)
         .map_err(|e| PluginError::ManifestInvalid(format!("读取源目录失败: {e}")))?;
-    for entry in rd.flatten() {
+    for entry in rd {
+        let entry =
+            entry.map_err(|e| PluginError::ManifestInvalid(format!("读取源条目失败: {e}")))?;
         let from = entry.path();
         let Some(name) = from.file_name() else {
             continue;

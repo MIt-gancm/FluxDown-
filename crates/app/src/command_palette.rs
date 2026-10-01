@@ -48,7 +48,7 @@ pub fn toggle(cx: &mut App) {
                 handle
             }
         };
-        let _ = host.update(cx, |_, window, cx| {
+        if let Err(error) = host.update(cx, |_, window, cx| {
             if fluxdown_ui_command_palette::is_open(window, cx) {
                 fluxdown_ui_command_palette::close(window, cx);
                 return;
@@ -59,7 +59,9 @@ pub fn toggle(cx: &mut App) {
             let translator = Desktop::global(cx).translator.read(cx).clone();
             let config = build_config(&translator, cx);
             fluxdown_ui_command_palette::open(window, cx, &translator, config);
-        });
+        }) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     });
 }
 
@@ -367,9 +369,11 @@ fn run_in_downloads(cx: &mut App, command: PageCommand) {
         else {
             return;
         };
-        let _ = handle.update(cx, |_, window, cx| {
+        if let Err(error) = handle.update(cx, |_, window, cx| {
             downloads.update(cx, |view, cx| view.run_page_command(command, window, cx));
-        });
+        }) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     });
 }
 

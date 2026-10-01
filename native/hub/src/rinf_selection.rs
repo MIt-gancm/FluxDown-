@@ -215,8 +215,9 @@ impl HostSelection for RinfHostSelection {
 
     fn provide_hls_selection(&self, task_id: &str, selected_index: i32) {
         if let Some(tx) = lock_or_recover(&self.hls_pending).remove(task_id) {
-            // `send` 失败(Receiver 已被丢弃,例如已超时)静默忽略，不 panic。
-            let _ = tx.send(selected_index);
+            if tx.send(selected_index).is_err() {
+                tracing::debug!(task_id, "HLS selection receiver already closed");
+            }
         } else {
             log_info!(
                 "[rinf-selection] no pending HLS selection for task {}",
@@ -227,7 +228,9 @@ impl HostSelection for RinfHostSelection {
 
     fn provide_bt_selection(&self, task_id: &str, selected_indices: Vec<i32>) {
         if let Some(tx) = lock_or_recover(&self.bt_pending).remove(task_id) {
-            let _ = tx.send(selected_indices);
+            if tx.send(selected_indices).is_err() {
+                tracing::debug!(task_id, "BT selection receiver already closed");
+            }
         } else {
             log_info!(
                 "[rinf-selection] no pending BT selection for task {}",
@@ -238,7 +241,9 @@ impl HostSelection for RinfHostSelection {
 
     fn provide_variant_selection(&self, task_id: &str, selected_index: i32) {
         if let Some(tx) = lock_or_recover(&self.variant_pending).remove(task_id) {
-            let _ = tx.send(selected_index);
+            if tx.send(selected_index).is_err() {
+                tracing::debug!(task_id, "variant selection receiver already closed");
+            }
         } else {
             log_info!(
                 "[rinf-selection] no pending resolve variant selection for task {}",

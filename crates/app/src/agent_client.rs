@@ -167,7 +167,9 @@ async fn run_client(
                     Ok(SessionEnd::ServiceQuit) => {
                         log::info!("agent closed the connection with service-quit (full shutdown)");
                         bootstrap.stop();
-                        let _ = events.send(AgentClientEvent::ServiceStopped).await;
+                        if events.send(AgentClientEvent::ServiceStopped).await.is_err() {
+                            log::debug!("agent event receiver closed during desktop shutdown");
+                        }
                         return;
                     }
                     Err(()) => {
@@ -217,17 +219,31 @@ async fn run_client(
                     continue;
                 }
                 log::error!("incompatible agent refused to shut down; giving up");
-                let _ = events.send(AgentClientEvent::Fatal(protocol_error())).await;
+                if events
+                    .send(AgentClientEvent::Fatal(protocol_error()))
+                    .await
+                    .is_err()
+                {
+                    log::debug!("agent event receiver closed during desktop shutdown");
+                }
                 return;
             }
             Err(ConnectError::Incompatible) => {
                 log::error!("agent protocol still incompatible after replacement; giving up");
-                let _ = events.send(AgentClientEvent::Fatal(protocol_error())).await;
+                if events
+                    .send(AgentClientEvent::Fatal(protocol_error()))
+                    .await
+                    .is_err()
+                {
+                    log::debug!("agent event receiver closed during desktop shutdown");
+                }
                 return;
             }
             Err(ConnectError::Fatal(error)) => {
                 log::error!("fatal agent connection error: {:?}", error.code);
-                let _ = events.send(AgentClientEvent::Fatal(error)).await;
+                if events.send(AgentClientEvent::Fatal(error)).await.is_err() {
+                    log::debug!("agent event receiver closed during desktop shutdown");
+                }
                 return;
             }
             Err(error @ ConnectError::Transient(_)) => {
@@ -432,7 +448,9 @@ async fn run_connected(
                         if frame.reason.as_str() == CLOSE_REASON_SERVICE_QUIT =>
                     {
                         for (_, ack) in pending.drain() {
-                            let _ = ack.send(Err(unavailable_error()));
+                            if ack.send(Err(unavailable_error())).is_err() {
+                                log::trace!("agent request receiver released before service shutdown");
+                            }
                         }
                         return Ok(SessionEnd::ServiceQuit);
                     }
@@ -453,16 +471,20 @@ async fn run_connected(
                     RpcResponse::Success(success) => {
                         if let RequestId::Integer(id) = success.id {
                             preference_writes.settle(id, Some(&success.result));
-                            if let Some(ack) = pending.remove(&id) {
-                                let _ = ack.send(Ok(success.result));
+                            if let Some(ack) = pending.remove(&id)
+                                && ack.send(Ok(success.result)).is_err()
+                            {
+                                log::trace!("agent request receiver released before success reply");
                             }
                         }
                     }
                     RpcResponse::Failure(failure) => {
                         if let Some(RequestId::Integer(id)) = failure.id {
                             preference_writes.settle(id, None);
-                            if let Some(ack) = pending.remove(&id) {
-                                let _ = ack.send(Err(failure.error.data.unwrap_or_else(internal_error)));
+                            if let Some(ack) = pending.remove(&id)
+                                && ack.send(Err(failure.error.data.unwrap_or_else(internal_error))).is_err()
+                            {
+                                log::trace!("agent request receiver released before failure reply");
                             }
                         }
                     }
@@ -471,7 +493,9 @@ async fn run_connected(
         }
     }
     for (_, ack) in pending {
-        let _ = ack.send(Err(unavailable_error()));
+        if ack.send(Err(unavailable_error())).is_err() {
+            log::trace!("agent request response receiver already released");
+        }
     }
     Err(())
 }

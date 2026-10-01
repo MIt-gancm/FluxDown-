@@ -114,7 +114,11 @@ impl SettingsStore {
         let port = self.port.clone();
         cx.spawn(async move |this, cx| {
             let outcome = run_mutation(port.as_ref(), key, apply.as_ref()).await;
-            let _ = this.update(cx, |this, cx| this.finish_mutation(id, outcome, cx));
+
+            let Ok(()) = this.update(cx, |this, cx| this.finish_mutation(id, outcome, cx)) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }

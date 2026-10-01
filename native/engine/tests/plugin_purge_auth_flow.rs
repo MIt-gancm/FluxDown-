@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use fluxdown_engine::auth::{self, AuthProfile};
 use fluxdown_engine::bt_downloader::BtConfig;
-use fluxdown_engine::plugin::AuthRequest;
+use fluxdown_engine::plugin::{AuthRequest, PluginError, ResolveRequest};
 use fluxdown_engine::proxy_config::ProxyConfig;
 use fluxdown_engine::{Engine, EngineConfig, NoopSelection, NoopSink};
 
@@ -71,6 +71,29 @@ async fn write_auth_plugin(dir: &std::path::Path, identity: &str) {
     tokio::fs::write(dir.join("auth.js"), auth_js)
         .await
         .expect("write auth.js");
+}
+
+async fn write_resolver_plugin(dir: &std::path::Path, identity: &str, host: &str) {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .expect("mkdir resolver");
+    let manifest = format!(
+        r#"{{
+      "identity": "{identity}",
+      "name": "Uninstall Resolver",
+      "version": "1.0.0",
+      "resolvers": [{{ "match": {{ "urls": ["https://{host}/*"] }}, "entry": "resolve.js" }}]
+    }}"#
+    );
+    tokio::fs::write(dir.join("manifest.json"), manifest)
+        .await
+        .expect("write resolver manifest");
+    let source = format!(
+        r#"globalThis.resolve = async () => ({{ url: "https://cdn.test/{identity}.bin" }});"#
+    );
+    tokio::fs::write(dir.join("resolve.js"), source)
+        .await
+        .expect("write resolver source");
 }
 
 /// 671#1：`root/dev/` 恰是一个没有 manifest.json 的目录（插件开发者常见的
@@ -252,4 +275,127 @@ async fn failed_plugin_is_reported_as_disabled_even_without_enabled_key() {
         !broken.enabled,
         "a failed plugin must never report enabled=true, contradicting its Failed load_status"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uninstall_config_failure_invalidates_removed_resolver_and_preserves_other_plugins() {
+    let work = std::env::temp_dir().join(format!("fluxdown-uninstall-state-{}", uniq()));
+    tokio::fs::create_dir_all(&work).await.expect("mkdir");
+    let engine = make_engine(&work).await;
+    let pm = engine.manager.plugin_manager().expect("pm installed");
+    let removed = "tester@uninstall-state";
+    let retained = "tester@retained";
+    let removed_url = "https://removed.test/watch";
+    let retained_url = "https://retained.test/watch";
+    for (identity, host) in [(removed, "removed.test"), (retained, "retained.test")] {
+        let source = work.join(identity);
+        write_resolver_plugin(&source, identity, host).await;
+        pm.install_from_dir(&source)
+            .await
+            .expect("install resolver");
+        pm.set_enabled(identity, true)
+            .await
+            .expect("enable resolver");
+    }
+    let request = |url: &str| ResolveRequest {
+        task_id: "uninstall-state".to_string(),
+        url: url.to_string(),
+        auth_ref: String::new(),
+        cookies: String::new(),
+        referrer: String::new(),
+        user_agent: String::new(),
+        extra_headers: Default::default(),
+        resolver_item: String::new(),
+    };
+    assert_eq!(
+        pm.match_resolver(removed_url).await.as_deref(),
+        Some(removed)
+    );
+    assert_eq!(
+        pm.resolve(removed, request(removed_url))
+            .await
+            .expect("resolve installed plugin")
+            .expect("resolver output")
+            .url,
+        format!("https://cdn.test/{removed}.bin")
+    );
+
+    // 在真实 SQLite 删除上失败：目录已经移除，enabled 键仍保留。
+    let database_url = format!(
+        "sqlite:{}?mode=rw",
+        work.join("flux_down.db")
+            .to_string_lossy()
+            .replace('\\', "/")
+    );
+    let fault_db = sqlx::any::AnyPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("connect fault-injection database");
+    sqlx::raw_sql(
+        "CREATE TRIGGER reject_plugin_cleanup BEFORE DELETE ON config
+         WHEN OLD.key = 'plugin.tester@uninstall-state.enabled'
+         BEGIN SELECT RAISE(ABORT, 'injected plugin cleanup failure'); END",
+    )
+    .execute(&fault_db)
+    .await
+    .expect("install cleanup failure trigger");
+
+    let error = pm.uninstall(removed).await.expect_err("cleanup must fail");
+    assert!(
+        matches!(
+            &error,
+            PluginError::Runtime(message)
+                if message.contains("injected plugin cleanup failure")
+        ),
+        "uninstall must preserve the original cleanup failure: {error:?}"
+    );
+    assert!(!work.join("plugins").join(removed).exists());
+    assert_eq!(
+        engine
+            .db
+            .get_config(&format!("plugin.{removed}.enabled"))
+            .await
+            .expect("read retained enabled key")
+            .as_deref(),
+        Some("true")
+    );
+    assert_eq!(pm.match_resolver(removed_url).await, None);
+    assert!(
+        matches!(
+            pm.resolve(removed, request(removed_url)).await,
+            Err(PluginError::Runtime(_))
+        ),
+        "an uninstalled resolver must not execute its cached script"
+    );
+    let plugins = pm.list().await;
+    assert!(
+        plugins.iter().all(|plugin| plugin.identity != removed),
+        "the removed plugin must not remain Loaded after a cleanup failure"
+    );
+    let other = plugins
+        .iter()
+        .find(|plugin| plugin.identity == retained)
+        .expect("unrelated plugin stays listed");
+    assert_eq!(other.load_status, "Loaded");
+    assert!(other.enabled);
+    assert_eq!(
+        pm.match_resolver(retained_url).await.as_deref(),
+        Some(retained)
+    );
+    assert_eq!(
+        pm.resolve(retained, request(retained_url))
+            .await
+            .expect("resolve unrelated plugin")
+            .expect("unrelated resolver output")
+            .url,
+        format!("https://cdn.test/{retained}.bin")
+    );
+
+    fault_db.close().await;
+    drop(pm);
+    drop(engine);
+    tokio::fs::remove_dir_all(&work)
+        .await
+        .expect("remove isolated test directory");
 }

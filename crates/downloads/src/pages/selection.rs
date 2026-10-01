@@ -170,7 +170,8 @@ impl SelectionView {
                 }));
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.submitting = false;
                 if result.is_err() {
                     window.push_notification(
@@ -179,7 +180,10 @@ impl SelectionView {
                     );
                 }
                 cx.notify();
-            });
+            }) else {
+                // 视图或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -449,7 +453,7 @@ impl SelectionView {
                                 .child(SharedString::from(format_bytes(file.size.max(0) as u64))),
                         ),
                     move |check, _, cx| {
-                        let _ = this.update(cx, |this, cx| {
+                        let Ok(()) = this.update(cx, |this, cx| {
                             if let SelectionState::Bt { selected, .. } = &mut this.state {
                                 if check {
                                     selected.insert(index);
@@ -458,7 +462,10 @@ impl SelectionView {
                                 }
                             }
                             cx.notify();
-                        });
+                        }) else {
+                            // 视图已释放，结束回调而不再更新状态。
+                            return;
+                        };
                     },
                     cx,
                 )

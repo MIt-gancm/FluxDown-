@@ -33,7 +33,7 @@ use librqbit::storage::{BoxStorageFactory, StorageFactory, TorrentStorage};
 use librqbit::{ManagedTorrentShared, TorrentMetadata};
 use serde::{Deserialize, Serialize};
 
-use crate::logger::log_info;
+use crate::logger::{log_info, log_warn};
 
 // ---------------------------------------------------------------------------
 // 文件格式
@@ -315,7 +315,7 @@ pub fn remove_sidecar(path: &Path) {
     match std::fs::remove_file(path) {
         Ok(()) => log_info!("[BT] removed parts sidecar {}", path.display()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => log_info!(
+        Err(e) => log_warn!(
             "[BT] failed to remove parts sidecar {}: {e}",
             path.display()
         ),
@@ -1031,7 +1031,7 @@ mod tests {
         read_parts_ranges(&fw, segs, 8, &mut buf).unwrap();
         assert_eq!(&buf, b"XY");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1044,7 +1044,7 @@ mod tests {
         let corrupt = dir.join("bad.parts");
         std::fs::write(&corrupt, b"garbage!").unwrap();
         assert!(load_seed_factory(&corrupt, &dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(&buf[0..5], b"HELLO");
         assert_eq!(&buf[5..10], &[0u8; 5]);
         assert_eq!(&buf[10..15], b"WORLD");
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

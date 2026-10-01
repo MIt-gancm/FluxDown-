@@ -51,7 +51,11 @@ mod tests {
         ensure_parent(&file).await.expect("create parent");
         assert!(target.is_dir());
 
-        let _ = tokio::fs::remove_dir_all(root).await;
+        if let Err(error) = tokio::fs::remove_dir_all(root).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -61,7 +65,12 @@ mod tests {
         ensure_dir_sync(&root).expect("create directory");
         ensure_dir_sync(&root).expect("existing directory is fine");
         assert!(root.is_dir());
-        let _ = std::fs::remove_dir_all(root);
+
+        if let Err(error) = std::fs::remove_dir_all(root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[tokio::test]
@@ -76,6 +85,12 @@ mod tests {
         assert!(message.contains("create output directory"));
         assert!(message.contains(child.to_string_lossy().as_ref()));
 
-        let _ = std::fs::remove_file(root);
+        if let Err(error) = std::fs::remove_file(root) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "clean test path: {error}"
+            );
+        }
     }
 }

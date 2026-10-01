@@ -89,6 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dest.display()
     );
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "ED2K example working directory cleanup {}: {error}",
+            work_dir.display()
+        );
+    }
     Ok(())
 }

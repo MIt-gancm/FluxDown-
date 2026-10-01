@@ -335,10 +335,13 @@ impl ListDelegate for PaletteDelegate {
         cx.notify();
         // List 只在上一帧已有行时才选中首行；结果从空变为非空时这里补选，保证 Enter 可用。
         cx.spawn_in(window, async move |list, cx| {
-            let _ = list.update_in(cx, |list, window, cx| {
+            let Ok(()) = list.update_in(cx, |list, window, cx| {
                 let first = (!list.delegate().matches.is_empty()).then(IndexPath::default);
                 list.set_selected_index(first, window, cx);
-            });
+            }) else {
+                // 调色板或窗口已释放，结束这次异步选择更新。
+                return;
+            };
         })
     }
 

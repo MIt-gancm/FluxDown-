@@ -136,7 +136,9 @@ struct Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.dir);
+        if let Err(error) = std::fs::remove_dir_all(&self.dir) {
+            tracing::warn!(path = %self.dir.display(), %error, "link test node cleanup failed");
+        }
     }
 }
 
@@ -194,11 +196,12 @@ impl Node {
             ApiServerConfig::from_config_map(&HashMap::new(), "test"),
         );
         tokio::spawn(async move {
-            let _ = axum::serve(
+            axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<SocketAddr>(),
             )
-            .await;
+            .await
+            .expect("serve link test node");
         });
         Node {
             service,
@@ -289,13 +292,25 @@ async fn raw_server(response: impl Into<String>) -> (SocketAddr, Arc<StdMutex<Ve
             let response = response.clone();
             tokio::spawn(async move {
                 let mut buffer = vec![0u8; 8192];
-                let read = socket.read(&mut buffer).await.unwrap_or(0);
+                let read = match socket.read(&mut buffer).await {
+                    Ok(read) => read,
+                    Err(error) => {
+                        tracing::debug!(%error, "raw link test client closed before its request");
+                        return;
+                    }
+                };
                 let text = String::from_utf8_lossy(&buffer[..read]).into_owned();
                 if let Some(line) = text.lines().next() {
                     recorded.lock().unwrap().push(line.to_owned());
                 }
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.shutdown().await;
+                // TLS/plaintext mismatch tests can close the connection as soon as they reject the reply.
+                if let Err(error) = socket.write_all(response.as_bytes()).await {
+                    tracing::debug!(%error, "raw link test client closed before its response");
+                    return;
+                }
+                if let Err(error) = socket.shutdown().await {
+                    tracing::debug!(%error, "raw link test client closed before writer shutdown");
+                }
             });
         }
     });
@@ -328,7 +343,11 @@ async fn spoofing_proxy(upstream: SocketAddr, spoofed_fingerprint: String) -> So
                 };
                 if first[..read].starts_with(b"GET /ping") {
                     let mut request = vec![0u8; 4096];
-                    let _ = client.read(&mut request).await;
+                    let read = client
+                        .read(&mut request)
+                        .await
+                        .expect("read spoofed ping request");
+                    assert!(read > 0, "spoofed ping request must be present");
                     let body = serde_json::json!({
                         "success": true,
                         "app": "FluxDown",
@@ -342,14 +361,22 @@ async fn spoofing_proxy(upstream: SocketAddr, spoofed_fingerprint: String) -> So
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                         body.len()
                     );
-                    let _ = client.write_all(response.as_bytes()).await;
-                    let _ = client.shutdown().await;
+                    client
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write spoofed ping response");
+                    if let Err(error) = client.shutdown().await {
+                        tracing::debug!(%error, "spoofing proxy client closed before writer shutdown");
+                    }
                     return;
                 }
                 let Ok(mut server) = tokio::net::TcpStream::connect(upstream).await else {
                     return;
                 };
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                // 身份校验失败会让调用方提前关闭代理连接。
+                if let Err(error) = tokio::io::copy_bidirectional(&mut client, &mut server).await {
+                    tracing::debug!(%error, "spoofing proxy connection closed during relay");
+                }
             });
         }
     });

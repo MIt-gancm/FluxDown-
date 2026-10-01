@@ -2050,11 +2050,37 @@ mod tests {
                 {
                     seen.push(line.trim().to_string());
                 }
-                let _ = stream.write_all(
-                    format!("{status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+
+                stream
+                    .write_all(
+                        format!(
+                            "{status_line}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok"
+                        )
                         .as_bytes(),
-                );
-                let _ = stream.flush();
+                    )
+                    .unwrap_or_else(|error| {
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ),
+                            "test server response failed: {error}"
+                        );
+                    });
+
+                stream.flush().unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             }
         });
         MockServer { addr, hits, events }
@@ -2078,7 +2104,14 @@ mod tests {
                 .unwrap_or_default()
                 .as_nanos()
         ));
-        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "clean test path: {error}"
+            );
+        }
         std::fs::create_dir_all(&dir).expect("create temp dir");
 
         // 第一次「运行」：写三条。
@@ -2124,7 +2157,11 @@ mod tests {
             "清空必须落到库里，否则重启又冒出来"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[tokio::test]

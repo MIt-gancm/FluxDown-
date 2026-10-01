@@ -106,7 +106,9 @@ impl MockPeer {
             while let Ok((stream, _)) = listener.accept().await {
                 let d = Arc::clone(&data);
                 tokio::spawn(async move {
-                    let _ = serve_peer(stream, d, part_size, fault).await;
+                    if let Err(error) = serve_peer(stream, d, part_size, fault).await {
+                        tracing::debug!(%error, "ED2K mock peer connection ended");
+                    }
                 });
             }
         });
@@ -341,7 +343,9 @@ impl MockServer {
             while let Ok((stream, _)) = listener.accept().await {
                 let p = Arc::clone(&peers);
                 tokio::spawn(async move {
-                    let _ = serve_server(stream, p).await;
+                    if let Err(error) = serve_server(stream, p).await {
+                        tracing::debug!(%error, "ED2K mock server connection ended");
+                    }
                 });
             }
         });

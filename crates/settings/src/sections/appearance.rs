@@ -529,11 +529,15 @@ fn import_themes(translator: Translator, window: &mut Window, cx: &mut App) {
             })
             .await;
         let report = cx.update(|cx| import_report(results, &translator, cx));
-        let _ = window_handle.update(cx, move |_, window, cx| {
+
+        let Ok(()) = window_handle.update(cx, move |_, window, cx| {
             for notification in report {
                 window.push_notification(notification, cx);
             }
-        });
+        }) else {
+            // 设置视图或窗口已释放，结束回调，不再更新状态。
+            return;
+        };
     })
     .detach();
 }
@@ -615,7 +619,8 @@ fn export_theme(mode: ExportMode, translator: Translator, window: &mut Window, c
         let result = cx
             .background_spawn(async move { std::fs::write(&path, text) })
             .await;
-        let _ = window_handle.update(cx, move |_, window, cx| {
+
+        let Ok(()) = window_handle.update(cx, move |_, window, cx| {
             let notification = match result {
                 Ok(()) => Notification::success(translator.text("themeExportSuccess").to_owned()),
                 Err(error) => {
@@ -623,7 +628,10 @@ fn export_theme(mode: ExportMode, translator: Translator, window: &mut Window, c
                 }
             };
             window.push_notification(notification, cx);
-        });
+        }) else {
+            // 设置视图或窗口已释放，结束回调，不再更新状态。
+            return;
+        };
     })
     .detach();
 }

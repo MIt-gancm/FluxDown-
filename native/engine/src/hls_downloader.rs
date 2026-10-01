@@ -261,7 +261,6 @@ pub fn is_hls_url(url: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Parsed M3U8 content — either a master playlist or a media playlist.
-#[allow(dead_code)]
 pub enum M3u8Content {
     Master {
         variants: Vec<HlsVariant>,
@@ -290,7 +289,6 @@ pub struct HlsVariant {
 }
 
 /// A single segment from a media playlist.
-#[allow(dead_code)]
 pub struct HlsSegment {
     pub uri: String,
     pub duration: f32,
@@ -969,7 +967,15 @@ fn decrypt_segment(
 ///   把文件名恢复为 URL 派生的原始扩展名，逐字节保存该文件本身。
 pub async fn run_hls_download(params: DownloadParams) -> Option<DownloadParams> {
     let task_id_log = params.task_id.clone();
-    let result = run_hls_download_inner(&params).await;
+    let result = match run_hls_download_inner(&params).await {
+        Ok(total) => params
+            .db
+            .update_task_status(&params.task_id, 3, "")
+            .await
+            .map(|()| total)
+            .map_err(DownloadError::Db),
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(total) => {
@@ -978,10 +984,8 @@ pub async fn run_hls_download(params: DownloadParams) -> Option<DownloadParams> 
                 task_id_log,
                 total
             );
-            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
-                crate::logger::report_error("hls-download", "persist completion status", &db_error);
-            }
-            let _ = params
+
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -993,7 +997,11 @@ pub async fn run_hls_download(params: DownloadParams) -> Option<DownloadParams> 
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("download progress receiver closed");
+            }
             None
         }
         Err(DownloadError::Cancelled) => {
@@ -1033,7 +1041,7 @@ pub async fn run_hls_download(params: DownloadParams) -> Option<DownloadParams> 
                     (0, 0)
                 }
             };
-            let _ = params
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -1045,7 +1053,11 @@ pub async fn run_hls_download(params: DownloadParams) -> Option<DownloadParams> 
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("download progress receiver closed");
+            }
             None
         }
     }
@@ -1185,9 +1197,8 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     log_info!("[hls-download] task {} starting, url={}", p.task_id, p.url);
 
     // Transition to status=5 (preparing)
-    let _ = p.db.update_task_status(&p.task_id, 5, "").await;
-    let _ = p
-        .progress_tx
+    p.db.update_task_status(&p.task_id, 5, "").await?;
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: 0,
@@ -1198,14 +1209,18 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
+    }
 
     // 续传检查点先于解析读取:(1) 据此沿用上次所选变体、不再重复弹窗并保证
     // 续传前后是同一画质;(2) 已有检查点说明此 URL 早已确认是 HLS,之后解析
     // 失败必须按真实错误上报,不能退回普通 HTTP 下载把清单文本当文件存下。
     let resume_seg_key = format!("hls_resume_{}", p.task_id);
     let saved_checkpoint: Option<String> = if p.is_resume {
-        p.db.get_config(&resume_seg_key).await.ok().flatten()
+        p.db.get_config(&resume_seg_key).await?
     } else {
         None
     };
@@ -1457,11 +1472,10 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         return Err(DownloadError::Cancelled);
     }
 
-    let _ = p.db.update_task_status(&p.task_id, 1, "").await;
+    p.db.update_task_status(&p.task_id, 1, "").await?;
 
     // Notify Dart: downloading started with file name
-    let _ = p
-        .progress_tx
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: 0,
@@ -1472,7 +1486,11 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
+    }
 
     let dest_path = save_dir.join(&actual_name);
     let temp_path = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
@@ -1598,7 +1616,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
         }
     } else {
         // Clean up any stale resume marker from a previous run
-        let _ = p.db.delete_config(&resume_seg_key).await;
+        p.db.delete_config(&resume_seg_key).await?;
         (File::create(&temp_path).await?, 0, 0i64)
     };
 
@@ -1609,12 +1627,11 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     if skip_segments == 0
         && let Some(tag) = variant_tag.as_deref()
     {
-        let _ =
-            p.db.set_config(
-                &resume_seg_key,
-                &format_resume_checkpoint(0, 0, media_sequence, Some(tag)),
-            )
-            .await;
+        p.db.set_config(
+            &resume_seg_key,
+            &format_resume_checkpoint(0, 0, media_sequence, Some(tag)),
+        )
+        .await?;
     }
 
     let key_cache: KeyCache = Arc::new(Mutex::new(HashMap::new()));
@@ -1677,7 +1694,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     let sample_tx = p.progress_tx.clone();
     let sample_task = p.task_id.clone();
     let sample_limit = concurrency as u32;
-    let sampler = AbortOnDrop(tokio::spawn(async move {
+    let mut sampler = AbortOnDrop(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(200));
         loop {
             ticker.tick().await;
@@ -1964,7 +1981,8 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             // segment data,并比对 media_sequence 以保证续传段的 IV 计算与首次一致。
             // 因为按 seg_idx 顺序写盘,next_to_write 即"已完整落盘的连续前缀
             // 长度",检查点始终对应一段完整、可安全续传的字节边界。
-            let _ =
+            let checkpoint_result = async {
+                file.flush().await?;
                 p.db.set_config(
                     &resume_seg_key,
                     &format_resume_checkpoint(
@@ -1974,12 +1992,19 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                         variant_tag.as_deref(),
                     ),
                 )
-                .await;
+                .await?;
+                Ok::<(), DownloadError>(())
+            }
+            .await;
+            if let Err(error) = checkpoint_result {
+                fatal_error = Some(error);
+                p.cancel_token.cancel();
+                break 'writer;
+            }
 
             // Progress reporting (every 200ms)
             if last_report.elapsed().as_millis() >= 200 {
-                let _ = p
-                    .progress_tx
+                if p.progress_tx
                     .send(ProgressUpdate {
                         task_id: p.task_id.clone(),
                         downloaded_bytes: downloaded_bytes + audio_written.load(Ordering::Relaxed),
@@ -1991,18 +2016,30 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                         runtime: Some(hls_runtime(&p.task_id, &tracker, concurrency as u32)),
                         ..Default::default()
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("download progress receiver closed");
+                    p.cancel_token.cancel();
+                    fatal_error = Some(DownloadError::Cancelled);
+                    break 'writer;
+                }
                 last_report = std::time::Instant::now();
             }
 
             // DB persistence (every DB_SAVE_INTERVAL_SECS)
             if last_db_save.elapsed().as_secs() >= DB_SAVE_INTERVAL_SECS {
-                let _ =
+                if let Err(error) =
                     p.db.update_task_progress(
                         &p.task_id,
                         downloaded_bytes + audio_written.load(Ordering::Relaxed),
                     )
-                    .await;
+                    .await
+                {
+                    fatal_error = Some(DownloadError::Db(error));
+                    p.cancel_token.cancel();
+                    break 'writer;
+                }
                 last_db_save = std::time::Instant::now();
             }
 
@@ -2029,17 +2066,57 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     // producer unwind. On the success path the channel is already drained, so
     // this is a no-op.
     drop(result_rx);
-    let _ = dispatcher.await;
+    match dispatcher.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if matches!(fatal_error, None | Some(DownloadError::Cancelled)) {
+                fatal_error = Some(error);
+            } else {
+                crate::logger::report_warning("hls-download", "join_segment_dispatcher", &error);
+            }
+        }
+        Err(error) if error.is_cancelled() && p.cancel_token.is_cancelled() => {
+            tracing::debug!("HLS segment dispatcher cancelled");
+        }
+        Err(error) => {
+            crate::logger::report_error("hls-download", "join_segment_dispatcher", &error);
+            if matches!(fatal_error, None | Some(DownloadError::Cancelled)) {
+                fatal_error = Some(DownloadError::Other(format!(
+                    "HLS segment dispatcher failed: {error}"
+                )));
+            }
+        }
+    }
     // 音轨在采样器停止之前收尾:视频先完成时,音轨剩余进度仍要持续上报。
     let audio_result = match audio_handle {
-        Some(handle) => Some(handle.await.unwrap_or_else(|e| {
-            Err(DownloadError::Other(format!(
-                "HLS audio track task failed: {e}"
-            )))
-        })),
+        Some(handle) => Some(match handle.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() && p.cancel_token.is_cancelled() => {
+                tracing::debug!("HLS audio worker cancelled");
+                Err(DownloadError::Cancelled)
+            }
+            Err(error) => {
+                crate::logger::report_error("hls-download", "join_audio_worker", &error);
+                Err(DownloadError::Other(format!(
+                    "HLS audio track task failed: {error}"
+                )))
+            }
+        }),
         None => None,
     };
     sampler.abort();
+    if let Err(error) = (&mut sampler.0).await {
+        if error.is_cancelled() {
+            tracing::debug!("HLS progress sampler stopped");
+        } else {
+            crate::logger::report_error("hls-download", "join_progress_sampler", &error);
+            if matches!(fatal_error, None | Some(DownloadError::Cancelled)) {
+                fatal_error = Some(DownloadError::Other(format!(
+                    "HLS progress sampler failed: {error}"
+                )));
+            }
+        }
+    }
     let mut audio_bytes = 0i64;
     match audio_result {
         Some(Ok(n)) => audio_bytes = n,
@@ -2060,13 +2137,21 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
     if let Some(err) = fatal_error {
         // Persist whatever fully-written prefix we have so a later resume can
         // continue from there (matches the sequential cancel path).
-        let _ = file.flush().await;
-        let _ =
+        if let Err(error) = file.flush().await {
+            if matches!(err, DownloadError::Cancelled) {
+                return Err(write_failure(error));
+            }
+            crate::logger::report_warning("hls-download", "flush_failed_download", &error);
+        }
+        if let Err(error) =
             p.db.update_task_progress(
                 &p.task_id,
                 downloaded_bytes + audio_written.load(Ordering::Relaxed),
             )
-            .await;
+            .await
+        {
+            crate::logger::report_warning("hls-download", "persist_failed_progress", &error);
+        }
         return Err(err);
     }
 
@@ -2075,7 +2160,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
 
     // Save final progress
     let total_written = downloaded_bytes + audio_bytes;
-    let _ = p.db.update_task_progress(&p.task_id, total_written).await;
+    p.db.update_task_progress(&p.task_id, total_written).await?;
 
     // 独立音轨:两份 temp 直接 ffmpeg 流复制成 mp4,产物取代 .ts 输出。mux 过程中
     // 暂停/取消时 temp 与两个续传检查点原样保留,恢复后只需重做 mux。
@@ -2104,19 +2189,22 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                     .and_then(|n| n.to_str())
                     .unwrap_or("output.mp4")
                     .to_string();
-                let _ = p
-                    .progress_tx
+                if p.progress_tx
                     .send(ProgressUpdate {
                         task_id: p.task_id.clone(),
                         downloaded_bytes: mp4_size,
                         total_bytes: mp4_size,
-                        status: 3,
+                        status: 1,
                         error_message: String::new(),
                         file_name: mp4_file_name,
                         segment_details: None,
                         ..Default::default()
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("download progress receiver closed");
+                }
                 return Ok(mp4_size);
             }
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
@@ -2152,13 +2240,21 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                         journal_error
                     );
                 }
-                let _ = p.db.delete_config(&audio_resume_key(&p.task_id)).await;
+                if let Err(error) = p.db.delete_config(&audio_resume_key(&p.task_id)).await {
+                    crate::logger::report_warning(
+                        "hls-download",
+                        "remove_audio_checkpoint",
+                        &error,
+                    );
+                }
             }
         }
     }
 
     // Clean up HLS resume marker on successful completion
-    let _ = p.db.delete_config(&resume_seg_key).await;
+    if let Err(error) = p.db.delete_config(&resume_seg_key).await {
+        crate::logger::report_warning("hls-download", "remove_checkpoint", &error);
+    }
 
     // 完成期占名:与 HTTP/ED2K 相同的 create_new 不覆盖语义。原名被占用时
     // dedup 换名(overwrite 策略只对原名删除旧文件),并把最终文件名写回 DB。
@@ -2196,8 +2292,7 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 e
             );
         }
-        let _ = p
-            .progress_tx
+        if p.progress_tx
             .send(ProgressUpdate {
                 task_id: p.task_id.clone(),
                 downloaded_bytes,
@@ -2208,7 +2303,11 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 segment_details: None,
                 ..Default::default()
             })
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::debug!("download progress receiver closed");
+        }
         save_dir.join(&chosen)
     };
 
@@ -2249,23 +2348,28 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
             .await
         {
             Ok(_) => {
-                let _ = tokio::fs::remove_file(&dest_path).await;
-                let _ = p
-                    .progress_tx
+                if let Err(error) = tokio::fs::remove_file(&dest_path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+                }
+                if p.progress_tx
                     .send(ProgressUpdate {
                         task_id: p.task_id.clone(),
                         downloaded_bytes: mp4_size,
                         total_bytes: mp4_size,
-                        // remux 成功即完成,发 status=3(完成);外层 run_hls_download
-                        // 还会再发一次 status=3,Dart 端有 oldStatus!=completed 守卫,
-                        // 不会重复触发完成回调。
-                        status: 3,
+                        // 这里只更新最终文件名；外层持久化完成状态后才发终帧。
+                        status: 1,
                         error_message: String::new(),
                         file_name: mp4_file_name,
                         segment_details: None,
                         ..Default::default()
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("download progress receiver closed");
+                }
                 return Ok(mp4_size);
             }
             Err(e) => {
@@ -2278,7 +2382,11 @@ async fn run_hls_download_inner(p: &DownloadParams) -> Result<i64, DownloadError
                 // DB update failed: the task record still points to the .ts file name.
                 // delete_task uses the DB file_name to locate files, so the .mp4
                 // would never be cleaned up. Remove it now to prevent a disk leak.
-                let _ = tokio::fs::remove_file(&mp4_path).await;
+                if let Err(error) = tokio::fs::remove_file(&mp4_path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+                }
             }
         }
     }
@@ -2432,8 +2540,11 @@ async fn remux_ts_to_mp4(
                     .map(drop)
                     .is_ok();
             if !overwrote {
-                if !is_fmp4 {
-                    let _ = std::fs::remove_file(&mp4_tmp_inner);
+                if !is_fmp4
+                    && let Err(error) = std::fs::remove_file(&mp4_tmp_inner)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
                 }
                 return Err(e);
             }
@@ -2444,9 +2555,16 @@ async fn remux_ts_to_mp4(
         }
         if let Err(e) = std::fs::rename(&src, &mp4_owned) {
             // 只清自己的占位与 tmp,fMP4 的源 .ts 是下载数据本身,绝不删。
-            let _ = std::fs::remove_file(&mp4_owned);
-            if !is_fmp4 {
-                let _ = std::fs::remove_file(&mp4_tmp_inner);
+            if let Err(error) = std::fs::remove_file(&mp4_owned)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+            }
+            if !is_fmp4
+                && let Err(error) = std::fs::remove_file(&mp4_tmp_inner)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
             }
             return Err(e);
         }
@@ -2468,16 +2586,24 @@ async fn remux_ts_to_mp4(
                 task_id,
                 e
             );
-            let _ = tokio::fs::remove_file(&mp4_tmp).await;
+            if let Err(error) = tokio::fs::remove_file(&mp4_tmp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+            }
             None
         }
         Err(e) => {
-            log_info!(
-                "[hls] task {} MP4 remux join error: {}, keeping .ts",
-                task_id,
-                e
-            );
-            let _ = tokio::fs::remove_file(&mp4_tmp).await;
+            if e.is_cancelled() {
+                tracing::debug!(task_id, "HLS remux worker cancelled; keeping .ts");
+            } else {
+                crate::logger::report_error("hls-download", "join_remux_worker", &e);
+            }
+            if let Err(error) = tokio::fs::remove_file(&mp4_tmp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+            }
             None
         }
     }
@@ -2654,9 +2780,9 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
     let segment_count = track.segments.len();
 
     let saved = if is_resume {
-        db.get_config(&track.resume_key).await.ok().flatten()
+        db.get_config(&track.resume_key).await?
     } else {
-        let _ = db.delete_config(&track.resume_key).await;
+        db.delete_config(&track.resume_key).await?;
         None
     };
     let (saved_idx, saved_bytes, saved_seq) = saved
@@ -2715,12 +2841,11 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
     };
     written.store(written_bytes, Ordering::Relaxed);
     if first_idx == 0 {
-        let _ = db
-            .set_config(
-                &track.resume_key,
-                &format_resume_checkpoint(0, 0, track.media_sequence, Some(&track.tag)),
-            )
-            .await;
+        db.set_config(
+            &track.resume_key,
+            &format_resume_checkpoint(0, 0, track.media_sequence, Some(&track.tag)),
+        )
+        .await?;
     }
 
     let remaining = segment_count.saturating_sub(first_idx);
@@ -2896,8 +3021,9 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
             written_bytes += chunk_total;
             written.store(written_bytes, Ordering::Relaxed);
             next_to_write += 1;
-            let _ = db
-                .set_config(
+            let checkpoint_result = async {
+                file.flush().await?;
+                db.set_config(
                     &track.resume_key,
                     &format_resume_checkpoint(
                         next_to_write,
@@ -2906,7 +3032,15 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
                         Some(&track.tag),
                     ),
                 )
-                .await;
+                .await?;
+                Ok::<(), DownloadError>(())
+            }
+            .await;
+            if let Err(error) = checkpoint_result {
+                fatal = Some(error);
+                cancel.cancel();
+                break 'writer;
+            }
         }
     }
 
@@ -2916,10 +3050,35 @@ async fn run_audio_track(run: AudioRun) -> Result<i64, DownloadError> {
     // 先关闭接收端再等 dispatcher:出错/取消路径上 writer 已停止 recv,
     // 卡在 `send` 的生产者需要接收端关闭才能退出。
     drop(result_rx);
-    let _ = dispatcher.await;
+    match dispatcher.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if matches!(fatal, None | Some(DownloadError::Cancelled)) {
+                fatal = Some(error);
+            } else {
+                crate::logger::report_warning("hls-download", "join_audio_dispatcher", &error);
+            }
+        }
+        Err(error) if error.is_cancelled() && cancel.is_cancelled() => {
+            tracing::debug!("HLS audio dispatcher cancelled");
+        }
+        Err(error) => {
+            crate::logger::report_error("hls-download", "join_audio_dispatcher", &error);
+            if matches!(fatal, None | Some(DownloadError::Cancelled)) {
+                fatal = Some(DownloadError::Other(format!(
+                    "HLS audio dispatcher failed: {error}"
+                )));
+            }
+        }
+    }
     match fatal {
         Some(e) => {
-            let _ = file.flush().await;
+            if let Err(error) = file.flush().await {
+                if matches!(e, DownloadError::Cancelled) {
+                    return Err(write_failure(error));
+                }
+                crate::logger::report_warning("hls-download", "flush_failed_audio", &error);
+            }
             Err(e)
         }
         None => {
@@ -2965,7 +3124,11 @@ async fn mux_video_audio(
         match claim_final_name(&mux_tmp, save_dir, &desired, p.allow_overwrite, &avoid).await {
             Ok(name) => name,
             Err(e) => {
-                let _ = tokio::fs::remove_file(&mux_tmp).await;
+                if let Err(error) = tokio::fs::remove_file(&mux_tmp).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+                }
                 return Err(e);
             }
         };
@@ -2980,13 +3143,29 @@ async fn mux_video_audio(
             .await
     {
         // 任务记录仍指向 .ts,删除任务时不会清理这份 mp4:立即移除,temp 保留供重试。
-        let _ = tokio::fs::remove_file(&mp4_path).await;
+        if let Err(error) = tokio::fs::remove_file(&mp4_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+        }
         return Err(DownloadError::Db(e));
     }
-    let _ = tokio::fs::remove_file(video_temp).await;
-    let _ = tokio::fs::remove_file(audio_temp).await;
-    let _ = p.db.delete_config(video_resume_key).await;
-    let _ = p.db.delete_config(&audio_resume_key(&p.task_id)).await;
+    if let Err(error) = tokio::fs::remove_file(video_temp).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+    }
+    if let Err(error) = tokio::fs::remove_file(audio_temp).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("hls-download", "remove_temporary_file", &error);
+    }
+    if let Err(error) = p.db.delete_config(video_resume_key).await {
+        crate::logger::report_warning("hls-download", "remove_mux_checkpoint", &error);
+    }
+    if let Err(error) = p.db.delete_config(&audio_resume_key(&p.task_id)).await {
+        crate::logger::report_warning("hls-download", "remove_audio_checkpoint", &error);
+    }
     Ok((mp4_path, mp4_size))
 }
 
@@ -3042,7 +3221,8 @@ async fn dispatch_segments(
     shared: Arc<SegmentShared>,
     semaphore: Arc<Semaphore>,
     tx: mpsc::Sender<SegmentOutcome>,
-) {
+) -> Result<(), DownloadError> {
+    let mut failure = None;
     let mut children = tokio::task::JoinSet::new();
     for job in jobs {
         let permit = tokio::select! {
@@ -3054,7 +3234,24 @@ async fn dispatch_segments(
             },
         };
         // 及时回收已结束的子任务,避免长播放列表下 JoinSet 累积。
-        while children.try_join_next().is_some() {}
+        while let Some(result) = children.try_join_next() {
+            if let Err(error) = result {
+                if error.is_cancelled() && shared.cancel.is_cancelled() {
+                    tracing::debug!("HLS segment worker cancelled");
+                } else {
+                    crate::logger::report_error("hls-download", "join_segment_worker", &error);
+                    if failure.is_none() {
+                        failure = Some(DownloadError::Other(format!(
+                            "HLS segment worker failed: {error}"
+                        )));
+                    }
+                    shared.cancel.cancel();
+                }
+            }
+        }
+        if failure.is_some() {
+            break;
+        }
         let child_shared = Arc::clone(&shared);
         let child_tx = tx.clone();
         children.spawn(async move {
@@ -3065,11 +3262,32 @@ async fn dispatch_segments(
             };
             // Always emit a result for this index so the in-order writer never
             // blocks forever waiting on a task that failed.
-            let _ = child_tx.send((job.idx, outcome, permit)).await;
+            if child_tx.send((job.idx, outcome, permit)).await.is_err() {
+                // writer 出错/取消后关闭通道，让生产者退出并释放许可。
+                tracing::debug!("HLS segment writer closed");
+            }
         });
     }
     drop(tx);
-    while children.join_next().await.is_some() {}
+    while let Some(result) = children.join_next().await {
+        if let Err(error) = result {
+            if error.is_cancelled() && shared.cancel.is_cancelled() {
+                tracing::debug!("HLS segment worker cancelled");
+            } else {
+                crate::logger::report_error("hls-download", "join_segment_worker", &error);
+                if failure.is_none() {
+                    failure = Some(DownloadError::Other(format!(
+                        "HLS segment worker failed: {error}"
+                    )));
+                }
+                shared.cancel.cancel();
+            }
+        }
+    }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// 把非 HLS 播放列表错误转为真实失败:已确认是 HLS 后不允许退回普通 HTTP 下载。
@@ -3388,7 +3606,9 @@ mod tests {
             socket
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n")
                 .await?;
-            let _ = release_rx.await;
+            release_rx
+                .await
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             socket.write_all(b"hello").await?;
             Ok::<(), std::io::Error>(())
         });
@@ -4060,15 +4280,22 @@ v360.m3u8\n\
                 return;
             };
             let mut request = [0u8; 1024];
-            let _ = socket.read(&mut request).await;
+            let received = socket
+                .read(&mut request)
+                .await
+                .expect("read stalled fixture request");
+            if received == 0 {
+                return;
+            }
             if send_headers {
-                let _ = socket
+                socket
                     .write_all(
                         b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nhello",
                     )
-                    .await;
+                    .await
+                    .expect("write stalled fixture response");
             }
-            let _ = release_rx.await;
+            release_rx.await.expect("release stalled fixture");
         });
         Ok((address, release_tx))
     }
@@ -4102,7 +4329,9 @@ v360.m3u8\n\
             super::download_segment_once(&transport, &url, None, 0),
         )
         .await?;
-        let _ = release_tx.send(());
+        release_tx
+            .send(())
+            .map_err(|()| "stalled fixture exited before release")?;
         match result {
             Err(DownloadError::Other(message)) => Ok(message),
             other => Err(format!("expected stalled error, got ok={}", other.is_ok()).into()),
@@ -4201,7 +4430,9 @@ v360.m3u8\n\
                         None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                             .to_vec(),
                     };
-                    let _ = socket.write_all(&response).await;
+                    if let Err(error) = socket.write_all(&response).await {
+                        tracing::debug!(%error, "HLS fixture client disconnected");
+                    }
                 });
             }
         });
@@ -4215,7 +4446,7 @@ v360.m3u8\n\
             .unwrap_or_default();
         let dir =
             std::env::temp_dir().join(format!("fluxdown_hls_{tag}_{}_{nanos}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create HLS fixture directory");
         dir
     }
 
@@ -4280,6 +4511,41 @@ v360.m3u8\n\
     }
 
     #[tokio::test]
+    async fn audio_track_checkpoint_failure_preserves_durable_prefix_and_can_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (address, _) = static_server(audio_routes()).await?;
+        let dir = scratch_dir("audio_checkpoint_failure");
+        let temp = dir.join("clip.audio.m4a.fdownloading");
+        let url = format!("sqlite://{}?mode=rwc", dir.join("checkpoint.db").display());
+        let db = crate::db::Db::connect(&url).await?;
+        let pool = sqlx::AnyPool::connect(&url).await?;
+        sqlx::query("CREATE TRIGGER fail_checkpoint BEFORE INSERT ON config WHEN NEW.key = 'hls_audio_resume_t-audio' AND NEW.value NOT LIKE '0:0:%' BEGIN SELECT RAISE(ABORT, 'checkpoint write failed'); END")
+            .execute(&pool).await?;
+        let result = run_audio_fixture(address, &temp, &db, false).await;
+        assert!(
+            matches!(&result, Err(error) if error.to_string().contains("checkpoint write failed")),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&temp)?, AUDIO_SEGMENTS[0]);
+        let checkpoint = db
+            .get_config(&super::audio_resume_key("t-audio"))
+            .await?
+            .unwrap_or_default();
+        assert!(checkpoint.starts_with("0:0:"), "{checkpoint}");
+        sqlx::query("DROP TRIGGER fail_checkpoint")
+            .execute(&pool)
+            .await?;
+        run_audio_fixture(address, &temp, &db, true).await?;
+        assert_eq!(std::fs::read(&temp)?, AUDIO_SEGMENTS.concat());
+        pool.close().await;
+        drop(db);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            crate::logger::report_warning("hls-test", "remove_checkpoint_fixture", &error);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn audio_track_is_written_in_order_with_progress()
     -> Result<(), Box<dyn std::error::Error>> {
         let (address, hits) = static_server(audio_routes()).await?;
@@ -4302,7 +4568,7 @@ v360.m3u8\n\
             checkpoint.starts_with(&format!("3:{}:0:", expected.len())),
             "{checkpoint}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -4338,7 +4604,7 @@ v360.m3u8\n\
         assert_eq!(total, expected.len() as i64);
         let requested = hits.lock().map(|h| h.clone()).unwrap_or_default();
         assert_eq!(requested, vec!["/audio/seg2.ts".to_owned()]);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -4370,7 +4636,7 @@ v360.m3u8\n\
         assert_eq!(std::fs::read(&temp)?, expected);
         assert_eq!(total, expected.len() as i64);
         assert_eq!(hits.lock().map(|h| h.len()).unwrap_or_default(), 3);
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
@@ -4429,7 +4695,7 @@ v360.m3u8\n\
         let dir = scratch_dir("remux_ffmpeg");
         let Some((ffmpeg, ts)) = ffmpeg_fixture(&dir, "clip.ts", &["video", "audio"]) else {
             eprintln!("[skip] 未设置 FLUXDOWN_TEST_FFMPEG，跳过真实 ffmpeg remux");
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir).expect("remove HLS fixture directory");
             return;
         };
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -4450,7 +4716,7 @@ v360.m3u8\n\
             probe.contains("Video:") && probe.contains("Audio:"),
             "{probe}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).expect("remove HLS fixture directory");
     }
 
     #[tokio::test]
@@ -4458,11 +4724,11 @@ v360.m3u8\n\
         let dir = scratch_dir("mux_ffmpeg");
         let Some((ffmpeg, video)) = ffmpeg_fixture(&dir, "video.ts", &["video"]) else {
             eprintln!("[skip] 未设置 FLUXDOWN_TEST_FFMPEG，跳过真实 ffmpeg mux");
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir).expect("remove HLS fixture directory");
             return;
         };
         let Some((_, audio)) = ffmpeg_fixture(&dir, "audio.ts", &["audio"]) else {
-            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::remove_dir_all(&dir).expect("remove HLS fixture directory");
             return;
         };
         let out = dir.join("merged.mp4.fdownloading");
@@ -4488,6 +4754,6 @@ v360.m3u8\n\
             probe.contains("Video:") && probe.contains("Audio:"),
             "{probe}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::remove_dir_all(&dir).expect("remove HLS fixture directory");
     }
 }

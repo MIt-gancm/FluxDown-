@@ -449,11 +449,15 @@ impl WebhookDialog {
             let Ok(response) = serde_json::from_value::<WebhookDeliveriesResponse>(value) else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.presets = response.presets;
                 this.variables = response.variables;
                 cx.notify();
-            });
+            }) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -536,11 +540,15 @@ impl WebhookDialog {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.testing = false;
                 this.test_result = Some(this.test_outcome(result));
                 cx.notify();
-            });
+            }) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -571,10 +579,14 @@ impl WebhookDialog {
             cx.background_executor()
                 .timer(std::time::Duration::from_secs(2))
                 .await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.copied = false;
                 cx.notify();
-            });
+            }) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -710,10 +722,14 @@ impl WebhookDialog {
                                 .checked(*value == current)
                                 .on_click(move |_, _, cx| {
                                     let value = value.clone();
-                                    let _ = this.update(cx, |this, cx| {
+
+                                    let Ok(()) = this.update(cx, |this, cx| {
                                         this.queue_id = value;
                                         cx.notify();
-                                    });
+                                    }) else {
+                                        // 设置视图或窗口已释放，结束回调，不再更新状态。
+                                        return;
+                                    };
                                 }),
                         )
                     })

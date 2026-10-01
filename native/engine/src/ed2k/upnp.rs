@@ -31,7 +31,7 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(3000);
 /// 映射描述（网关管理页可见）。
 const MAPPING_DESC: &str = "FluxDown eD2K";
 
-/// 一组已建立的 UPnP 映射的句柄。drop 时后台任务被 abort 并尽力移除映射。
+/// 一组已建立的 UPnP 映射的句柄。drop 停止续租，已有映射在有限租约到期后失效。
 pub struct UpnpMapping {
     handle: tokio::task::JoinHandle<()>,
     /// 网关探测到的公网 IP（供上层判定 HighID 候选）。
@@ -67,14 +67,27 @@ pub async fn spawn_upnp(tcp_port: u16, udp_port: u16) -> Option<UpnpMapping> {
     };
 
     let local_ip = match local_ipv4().await {
-        Some(ip) => ip,
-        None => {
+        Ok(Some(ip)) => ip,
+        Ok(None) => {
             log_info!("[ed2k-upnp] cannot determine local IPv4, skipping UPnP");
+            return None;
+        }
+        Err(error) => {
+            log_info!(
+                "[ed2k-upnp] local IPv4 probe failed, skipping UPnP: {}",
+                error
+            );
             return None;
         }
     };
 
-    let external_ip = gateway.get_external_ip().await.ok();
+    let external_ip = match gateway.get_external_ip().await {
+        Ok(ip) => Some(ip),
+        Err(error) => {
+            tracing::debug!(%error, "UPnP external IP unavailable; port mapping remains usable");
+            None
+        }
+    };
 
     // 建立首次映射。TCP 必须成功；UDP 失败仅告警（Kad 不可用但下载仍行）。
     if let Err(e) = add_mapping(&gateway, PortMappingProtocol::TCP, tcp_port, local_ip).await {
@@ -105,8 +118,11 @@ pub async fn spawn_upnp(tcp_port: u16, udp_port: u16) -> Option<UpnpMapping> {
             {
                 log_error!("[ed2k-upnp] TCP renew failed: {}", e);
             }
-            if udp_port != 0 {
-                let _ = add_mapping(&gateway, PortMappingProtocol::UDP, udp_port, local_ip).await;
+            if udp_port != 0
+                && let Err(error) =
+                    add_mapping(&gateway, PortMappingProtocol::UDP, udp_port, local_ip).await
+            {
+                log_info!("[ed2k-upnp] UDP renew failed (Kad degraded): {}", error);
             }
         }
     });
@@ -132,15 +148,12 @@ async fn add_mapping(
 }
 
 /// 探测本机在默认路由上的 IPv4（连一个公网地址取 socket 本地址，不实际发包）。
-async fn local_ipv4() -> Option<Ipv4Addr> {
-    let sock = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-        .await
-        .ok()?;
-    // 连一个公网 IP（8.8.8.8:53）—— UDP connect 只设默认目的、不发包，
-    // 由此让 OS 选出出口网卡的本地址。
-    sock.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).await.ok()?;
-    match sock.local_addr().ok()?.ip() {
+async fn local_ipv4() -> std::io::Result<Option<Ipv4Addr>> {
+    let sock = tokio::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    // UDP connect selects the default-route interface without sending a packet.
+    sock.connect((Ipv4Addr::new(8, 8, 8, 8), 53)).await?;
+    Ok(match sock.local_addr()?.ip() {
         IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Some(ip),
         _ => None,
-    }
+    })
 }

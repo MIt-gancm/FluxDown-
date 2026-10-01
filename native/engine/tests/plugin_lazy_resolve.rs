@@ -46,11 +46,43 @@ fn spawn_server() -> (u16, std::thread::JoinHandle<()>) {
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
                 FILE_BODY.len()
             );
-            let _ = stream.write_all(resp.as_bytes());
+
+            stream.write_all(resp.as_bytes()).unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
             if !is_head {
-                let _ = stream.write_all(FILE_BODY);
+                stream.write_all(FILE_BODY).unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             }
-            let _ = stream.flush();
+
+            stream.flush().unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
         }
     });
     (port, handle)
@@ -175,7 +207,11 @@ async fn lazy_resolve_rewrites_and_downloads() {
         "resolve should fire exactly once for a fresh create"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -223,7 +259,11 @@ async fn disabled_plugin_passes_through() {
     assert_eq!(bytes, FILE_BODY);
     assert_eq!(resolve_count, 0, "disabled plugin must not trigger resolve");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 回归（reviewer blocker）：resume 一个带 resolver 且处于 error(4) 的任务，必须**重新
@@ -278,7 +318,14 @@ async fn resume_of_errored_resolver_task_reresolves() {
         .update_task_status(&tid, 4, "simulated expiry")
         .await
         .expect("set status 4");
-    let _ = tokio::fs::remove_file(work.join("out.bin")).await;
+
+    if let Err(error) = tokio::fs::remove_file(work.join("out.bin")).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
 
     // resume：带 resolver 的 error 任务 → 必须重新 resolve（惰性防过期）并再次完成。
     engine.manager.resume_task(&tid).await;
@@ -296,7 +343,12 @@ async fn resume_of_errored_resolver_task_reresolves() {
         .await
         .expect("read after resume");
     assert_eq!(bytes, FILE_BODY, "resume 应重新 resolve 并重下完成");
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 慢速 rewriter：resolver 忙等 `busy_ms` 后按 setting `target` 改写。
@@ -405,7 +457,11 @@ async fn pause_resume_during_resolve_window_dispatches_resume() {
         .expect("task");
     assert_eq!(t.status, 3, "任务应最终完成");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 鉴权服务器：请求须带 `X-Flux-Auth: sesame` 头，否则 401（无 body）。
@@ -438,11 +494,43 @@ fn spawn_auth_server() -> (u16, std::thread::JoinHandle<()>) {
                 "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                     .to_string()
             };
-            let _ = stream.write_all(resp.as_bytes());
+
+            stream.write_all(resp.as_bytes()).unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
             if !is_head && authed {
-                let _ = stream.write_all(FILE_BODY);
+                stream.write_all(FILE_BODY).unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             }
-            let _ = stream.flush();
+
+            stream.flush().unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
         }
     });
     (port, handle)
@@ -534,7 +622,14 @@ async fn resume_applies_fresh_resolver_extra_headers() {
         .update_task_status(&tid, 4, "simulated expiry")
         .await
         .expect("set status 4");
-    let _ = tokio::fs::remove_file(work.join("out.bin")).await;
+
+    if let Err(error) = tokio::fs::remove_file(work.join("out.bin")).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     engine.manager.resume_task(&tid).await;
 
     let done2 = loop {
@@ -559,7 +654,11 @@ async fn resume_applies_fresh_resolver_extra_headers() {
         .expect("task");
     assert_eq!(t.status, 3, "缺头会 401 进 error(4)");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 回归（Bug：卸载遗留 orphaned resolver 绑定）：uninstall 必须清空指向该插件的
@@ -622,7 +721,11 @@ async fn uninstall_clears_task_resolver_binding() {
     let bytes = tokio::fs::read(work.join("out.bin")).await.expect("read");
     assert_eq!(bytes, FILE_BODY);
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 回归（Bug：禁用插件的绑定任务 resume fail-open 直下原始页面）：绑定存在但插件
@@ -705,7 +808,11 @@ async fn resume_with_disabled_plugin_fails_closed() {
         t.error_message
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 简易唯一后缀（避免引入 uuid 到测试；进程 id + 纳秒时间戳）。

@@ -44,11 +44,27 @@ pub fn install(cx: &mut App) {
                 }),
             ),
         };
-        cx.background_executor()
-            .spawn(async move {
-                let _ = call.await;
-            })
-            .detach();
+        cx.spawn(async move |cx| {
+            if let Err(error) = call.await {
+                log::warn!("completion shutdown action failed: {:?}", error.code);
+                cx.update(|cx| {
+                    let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main) else {
+                        return;
+                    };
+                    let message = Desktop::global(cx)
+                        .translator
+                        .read(cx)
+                        .text("localServiceActionFailed")
+                        .to_owned();
+                    if let Err(error) = handle.update(cx, |_, window, cx| {
+                        window.push_notification(Notification::error(message), cx);
+                    }) {
+                        log::debug!("shutdown failure notification window released: {error:#}");
+                    }
+                });
+            }
+        })
+        .detach();
     });
     cx.set_global(ShutdownGlobal {
         status: status.clone(),
@@ -125,7 +141,7 @@ fn show_countdown(cx: &mut App, remaining: Duration) {
         &[("time", &format_remaining(remaining))],
     );
     let cancel_label = translator.text("shutdownCancelButton").to_owned();
-    let _ = handle.update(cx, |_, window, cx| {
+    if let Err(error) = handle.update(cx, |_, window, cx| {
         let note = Notification::warning(message)
             .id::<ShutdownNote>()
             .autohide(false)
@@ -140,14 +156,18 @@ fn show_countdown(cx: &mut App, remaining: Duration) {
                     })
             });
         window.push_notification(note, cx);
-    });
+    }) {
+        log::debug!("view or window released before lifecycle update: {error:#}");
+    }
 }
 
 fn clear_countdown(cx: &mut App) {
-    if let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main) {
-        let _ = handle.update(cx, |_, window, cx| {
+    if let Some(handle) = WindowRegistry::handle(cx, &WindowKey::Main)
+        && let Err(error) = handle.update(cx, |_, window, cx| {
             window.remove_notification::<ShutdownNote>(cx);
-        });
+        })
+    {
+        log::debug!("view or window released before lifecycle update: {error:#}");
     }
 }
 

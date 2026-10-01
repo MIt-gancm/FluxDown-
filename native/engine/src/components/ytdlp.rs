@@ -318,14 +318,22 @@ mod install {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::Permissions::from_mode(0o755);
             if let Err(e) = tokio::fs::set_permissions(&tmp, perms).await {
-                let _ = tokio::fs::remove_file(&tmp).await;
+                if let Err(error) = tokio::fs::remove_file(&tmp).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("components", "remove_ytdlp_download", &error);
+                }
                 return Err(ComponentError::Io(e.to_string()));
             }
         }
 
         // 安装前验证：临时文件能跑 `--version` 才算成功。
         if super::probe_ytdlp_version(&tmp).await.is_none() {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            if let Err(error) = tokio::fs::remove_file(&tmp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning("components", "remove_unverified_ytdlp", &error);
+            }
             return Err(ComponentError::Verify(
                 "downloaded yt-dlp failed to run; the binary may be incompatible with \
                  this system — install yt-dlp via your system package manager (or pip) \
@@ -334,7 +342,11 @@ mod install {
             ));
         }
         if let Err(e) = tokio::fs::rename(&tmp, &target).await {
-            let _ = tokio::fs::remove_file(&tmp).await;
+            if let Err(error) = tokio::fs::remove_file(&tmp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning("components", "remove_ytdlp_download", &error);
+            }
             return Err(ComponentError::Io(e.to_string()));
         }
         db.set_config(CONFIG_YTDLP_MANAGED_VERSION, &chosen_ver)

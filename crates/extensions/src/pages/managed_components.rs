@@ -522,11 +522,14 @@ impl ExtensionsView {
                                 PopupMenuItem::new(version.clone())
                                     .checked(checked)
                                     .on_click(move |_, _, cx| {
-                                        let _ = view.update(cx, |this, cx| {
+                                        let Ok(()) = view.update(cx, |this, cx| {
                                             this.components[slot].selected_version =
                                                 Some(version.clone());
                                             cx.notify();
-                                        });
+                                        }) else {
+                                            // 扩展视图已释放，结束回调，不再更新状态。
+                                            return;
+                                        };
                                     }),
                             )
                         });
@@ -621,7 +624,8 @@ impl ExtensionsView {
             let result = future.await.and_then(|value| {
                 serde_json::from_value::<ComponentVersions>(value).map_err(|_| protocol_error())
             });
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 let message = result
                     .as_ref()
                     .err()
@@ -647,7 +651,10 @@ impl ExtensionsView {
                     Err(_) => ui.versions_error = message,
                 }
                 cx.notify();
-            });
+            }) else {
+                // 扩展视图已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -676,14 +683,18 @@ impl ExtensionsView {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 let ui = &mut this.components[slot];
                 ui.install_pending = false;
                 ui.installing = false;
                 let last_result = ui.last_result.take();
                 this.finish_component_op(kind, false, result, last_result, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -717,8 +728,9 @@ impl ExtensionsView {
                     cx,
                 ))
                 .on_ok(move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| this.uninstall_component(kind, window, cx));
-                    true
+                    // 页面已释放时未提交卸载，不能报告确认成功。
+                    view.update(cx, |this, cx| this.uninstall_component(kind, window, cx))
+                        .is_ok()
                 })
         });
     }
@@ -739,11 +751,15 @@ impl ExtensionsView {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.components[slot].uninstalling = false;
                 this.finish_component_op(kind, true, result, None, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -837,7 +853,8 @@ impl ExtensionsView {
             let result = future.await.and_then(|value| {
                 serde_json::from_value::<DaemonConfigSnapshot>(value).map_err(|_| protocol_error())
             });
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.components[slot].saving_path = false;
                 match result {
                     Ok(config) => {
@@ -850,7 +867,10 @@ impl ExtensionsView {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -869,10 +889,14 @@ impl ExtensionsView {
             let Ok(status) = serde_json::from_value::<ComponentStatusDto>(value) else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.controller.apply_component_status(status);
                 cx.notify();
-            });
+            }) else {
+                // 扩展视图已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }

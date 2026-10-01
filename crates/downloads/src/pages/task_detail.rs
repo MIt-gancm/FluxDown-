@@ -473,12 +473,16 @@ impl TaskDetailView {
                 Ok(DownloadsResult::TaskActivity(page)) => Some(page),
                 _ => None,
             };
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 if this.activity.finish(&ticket, page) {
                     cx.notify();
                     this.fetch_activity(cx);
                 }
-            });
+            }) else {
+                // 视图已释放，结束回调而不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -506,12 +510,16 @@ impl TaskDetailView {
         let future = self.port.execute(command);
         cx.spawn(async move |this, cx| {
             let failed = future.await.is_err();
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 if failed {
                     this.last_error = Some(this.strings.action_failed.clone());
                 }
                 cx.notify();
-            });
+            }) else {
+                // 视图已释放，结束回调而不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -555,14 +563,18 @@ impl TaskDetailView {
         });
         cx.spawn(async move |this, cx| {
             let failed = future.await.is_err();
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 if failed {
                     this.last_error = Some(this.strings.action_failed.clone());
                 } else if let Some(hook) = this.host.on_user_started.clone() {
                     hook(task_id, cx);
                 }
                 cx.notify();
-            });
+            }) else {
+                // 视图已释放，结束回调而不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -594,12 +606,16 @@ impl TaskDetailView {
             cx.background_executor()
                 .timer(Duration::from_millis(1500))
                 .await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 if this.error_copied == generation {
                     this.error_copied = 0;
                     cx.notify();
                 }
-            });
+            }) else {
+                // 视图已释放，结束回调而不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -688,7 +704,10 @@ impl TaskDetailView {
                 selected,
                 move |index, _, cx| {
                     if let Some(tab) = tabs.get(index).copied() {
-                        let _ = this.update(cx, |this, cx| this.select_tab(tab, cx));
+                        let Ok(()) = this.update(cx, |this, cx| this.select_tab(tab, cx)) else {
+                            // 视图已释放，结束回调而不再更新状态。
+                            return;
+                        };
                     }
                 },
                 cx,

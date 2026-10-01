@@ -371,14 +371,18 @@ impl CategoryDialog {
                 Ok(Ok(Some(paths))) => paths.first().map(|path| path.display().to_string()),
                 _ => None,
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.picking_dir = false;
                 if let Some(path) = picked {
                     this.save_dir
                         .update(cx, |input, cx| input.set_value(path, window, cx));
                 }
                 cx.notify();
-            });
+            }) else {
+                // 编辑器或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }

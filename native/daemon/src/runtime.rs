@@ -34,9 +34,12 @@ pub async fn run(
     let data_dir =
         fluxdown_engine::data_dir::resolve_data_dir(process_config.data_dir_override.as_deref())?;
     fluxdown_engine::logger::init_with_dir(&data_dir)?;
-    let _ = tracing_subscriber::fmt()
+    if let Err(error) = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .try_init();
+        .try_init()
+    {
+        tracing::debug!(%error, "daemon tracing subscriber initialization failed; retaining existing subscriber");
+    }
 
     let _process_lease = match DaemonProcessLease::acquire(&data_dir)? {
         Some(lease) => lease,
@@ -115,19 +118,40 @@ pub async fn run(
     let startup_config = all_config.clone();
     let startup_maintenance_task = tokio::spawn(async move {
         if config_enabled(&startup_config, "bt_tracker_sub_enabled", true) {
-            let _ = maintenance_actor
+            match maintenance_actor
                 .execute(crate::actor::ActorOperation::RefreshTrackerSubscription)
-                .await;
+                .await
+            {
+                Ok(_) => {}
+                Err(crate::actor::ActorCallError::Unavailable) => {
+                    tracing::debug!("daemon actor closed before startup tracker refresh");
+                }
+                Err(error) => tracing::warn!(%error, "startup tracker refresh failed"),
+            }
         }
         if config_enabled(&startup_config, "ed2k_server_sub_enabled", true) {
-            let _ = maintenance_actor
+            match maintenance_actor
                 .execute(crate::actor::ActorOperation::RefreshEd2kServerSubscription)
-                .await;
+                .await
+            {
+                Ok(_) => {}
+                Err(crate::actor::ActorCallError::Unavailable) => {
+                    tracing::debug!("daemon actor closed before startup ED2K server refresh");
+                }
+                Err(error) => tracing::warn!(%error, "startup ED2K server refresh failed"),
+            }
         }
         if config_enabled(&startup_config, "ed2k_enable_kad", true) {
-            let _ = maintenance_actor
+            match maintenance_actor
                 .execute(crate::actor::ActorOperation::RefreshEd2kNodes)
-                .await;
+                .await
+            {
+                Ok(_) => {}
+                Err(crate::actor::ActorCallError::Unavailable) => {
+                    tracing::debug!("daemon actor closed before startup ED2K nodes refresh");
+                }
+                Err(error) => tracing::warn!(%error, "startup ED2K nodes refresh failed"),
+            }
         }
     });
 
@@ -165,97 +189,254 @@ pub async fn run(
     let mut actor_finished = false;
     let mut lease_finished = false;
     let mut lease_lost = false;
-    let result = tokio::select! {
+    let mut result = tokio::select! {
         result = &mut serve_fut => result,
         joined = &mut actor_task => {
             actor_finished = true;
-            if cancel.is_cancelled() {
-                serve_fut.await
-            } else {
-                match joined {
-                    Ok(()) => tracing::error!("daemon actor exited unexpectedly"),
-                    Err(error) => tracing::error!(%error, "daemon actor task failed"),
+            let error = match joined {
+                Ok(()) if cancel.is_cancelled() => None,
+                Ok(()) => Some(std::io::Error::other("daemon actor stopped unexpectedly")),
+                Err(error) if error.is_cancelled() && cancel.is_cancelled() => {
+                    tracing::debug!("daemon actor task cancelled during shutdown");
+                    None
                 }
+                Err(error) => {
+                    tracing::error!(%error, "daemon actor task failed");
+                    Some(std::io::Error::other(error))
+                }
+            };
+            if let Some(error) = error {
                 cancel.cancel();
-                let _ = serve_fut.await;
-                Err(std::io::Error::other("daemon actor stopped unexpectedly"))
+                if let Err(serve_error) = serve_fut.await {
+                    tracing::error!(%serve_error, "daemon control plane shutdown failed after actor exit");
+                }
+                Err(error)
+            } else {
+                serve_fut.await
             }
         }
-        // 监控只会在取消或租约确认丢失时结束。
+        // 监控只会在取消或租约确认丢失时结束；取消不能掩盖 panic 或租约失败。
         lease = &mut lease_task => {
             lease_finished = true;
-            if cancel.is_cancelled() {
-                serve_fut.await
-            } else {
-                lease_lost = true;
-                match lease {
-                    Ok(Err(error)) => {
-                        tracing::error!(error = %error, "engine writer lease lost; shutting down");
-                    }
-                    Ok(Ok(())) => {
-                        tracing::error!("engine writer lease monitor exited unexpectedly; shutting down");
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "engine writer lease monitor failed; shutting down");
-                    }
+            let error = match lease {
+                Ok(Ok(())) if cancel.is_cancelled() => None,
+                Ok(Ok(())) => Some(std::io::Error::other("engine writer lease monitor stopped unexpectedly")),
+                Ok(Err(error)) => {
+                    tracing::error!(%error, "engine writer lease lost; shutting down");
+                    Some(std::io::Error::other(error))
                 }
+                Err(error) if error.is_cancelled() && cancel.is_cancelled() => {
+                    tracing::debug!("engine writer lease monitor cancelled during shutdown");
+                    None
+                }
+                Err(error) => {
+                    tracing::error!(%error, "engine writer lease monitor failed; shutting down");
+                    Some(std::io::Error::other(error))
+                }
+            };
+            if let Some(error) = error {
+                lease_lost = true;
                 cancel.cancel();
-                let _ = serve_fut.await;
-                Err(std::io::Error::other("engine writer lease lost"))
+                if let Err(serve_error) = serve_fut.await {
+                    tracing::error!(%serve_error, "daemon control plane shutdown failed after lease loss");
+                }
+                Err(error)
+            } else {
+                serve_fut.await
             }
         }
     };
     if lease_lost {
-        // 租约已被他人夺走：常规停机会写库（暂停任务、冲刷进度与活动日志），可能踩到新的
-        // 写入者，所以放弃收尾直接退出，由上层 supervisor 重拉进程。
+        // 租约已丢失，不再执行会写库的常规收尾；仍回收任务，区分主动取消和 panic。
         actor_task.abort();
         if let Some(progress_task) = &progress_task {
             progress_task.abort();
         }
         startup_maintenance_task.abort();
         sweep_task.abort();
+        if !actor_finished {
+            match actor_task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {
+                    tracing::debug!("daemon actor aborted after lease loss")
+                }
+                Err(error) => tracing::error!(%error, "daemon actor failed after lease loss"),
+            }
+        }
+        if let Some(progress_task) = progress_task {
+            match progress_task.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {
+                    tracing::debug!("progress reporter aborted after lease loss")
+                }
+                Err(error) => tracing::error!(%error, "progress reporter failed after lease loss"),
+            }
+        }
+        match startup_maintenance_task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!("startup maintenance aborted after lease loss")
+            }
+            Err(error) => tracing::error!(%error, "startup maintenance failed after lease loss"),
+        }
+        match sweep_task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!("blob sweeper aborted after lease loss")
+            }
+            Err(error) => tracing::error!(%error, "blob sweeper failed after lease loss"),
+        }
         return result.map_err(Into::into);
     }
     if !actor_finished {
-        let _ = tokio::time::timeout(Duration::from_secs(10), actor.shutdown()).await;
+        match tokio::time::timeout(Duration::from_secs(10), actor.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(crate::actor::ActorCallError::Unavailable)) => {
+                // actor 可能已响应外部取消而关闭；下面仍 join，不能把 panic 当正常关闭。
+                tracing::debug!("daemon actor closed before shutdown acknowledgement");
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "daemon actor shutdown failed");
+                if result.is_ok() {
+                    result = Err(std::io::Error::other(error));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "daemon actor shutdown acknowledgement timed out");
+                if result.is_ok() {
+                    result = Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
+                }
+            }
+        }
     }
     cancel.cancel();
-    let _ = sweep_task.await;
-    if !lease_finished {
-        let _ = lease_task.await;
+    match sweep_task.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!("daemon blob sweeper cancelled during shutdown")
+        }
+        Err(error) => {
+            tracing::error!(%error, "daemon blob sweeper failed");
+            if result.is_ok() {
+                result = Err(std::io::Error::other(error));
+            }
+        }
     }
-    if !actor_finished
-        && tokio::time::timeout(Duration::from_secs(10), &mut actor_task)
-            .await
-            .is_err()
-    {
-        actor_task.abort();
-        let _ = actor_task.await;
+    if !lease_finished {
+        match lease_task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "engine writer lease monitor failed during shutdown");
+                if result.is_ok() {
+                    result = Err(std::io::Error::other(error));
+                }
+            }
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!("engine writer lease monitor cancelled during shutdown")
+            }
+            Err(error) => {
+                tracing::error!(%error, "engine writer lease monitor task failed during shutdown");
+                if result.is_ok() {
+                    result = Err(std::io::Error::other(error));
+                }
+            }
+        }
+    }
+    if !actor_finished {
+        match tokio::time::timeout(Duration::from_secs(10), &mut actor_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.is_cancelled() => {
+                tracing::debug!("daemon actor cancelled during shutdown")
+            }
+            Ok(Err(error)) => {
+                tracing::error!(%error, "daemon actor failed during shutdown");
+                if result.is_ok() {
+                    result = Err(std::io::Error::other(error));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "daemon actor shutdown timed out");
+                if result.is_ok() {
+                    result = Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
+                }
+                actor_task.abort();
+                match actor_task.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {
+                        tracing::debug!("daemon actor aborted after shutdown timeout")
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "daemon actor failed after shutdown timeout")
+                    }
+                }
+            }
+        }
     }
     if let Some(mut progress_task) = progress_task {
         match tokio::time::timeout(Duration::from_secs(10), &mut progress_task).await {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::error!(%error, "progress reporter stopped before journal flush")
+            Ok(Err(error)) if error.is_cancelled() => {
+                tracing::debug!("progress reporter cancelled before journal flush")
             }
-            Err(_) => {
+            Ok(Err(error)) => {
+                tracing::error!(%error, "progress reporter stopped before journal flush");
+                if result.is_ok() {
+                    result = Err(std::io::Error::other(error));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "progress reporter did not drain before journal flush");
+                if result.is_ok() {
+                    result = Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
+                }
                 progress_task.abort();
-                let _ = progress_task.await;
-                tracing::error!("progress reporter did not drain before journal flush");
+                match progress_task.await {
+                    Ok(()) => {}
+                    Err(error) if error.is_cancelled() => {
+                        tracing::debug!("progress reporter aborted after shutdown timeout")
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "progress reporter failed after shutdown timeout")
+                    }
+                }
             }
         }
     }
     match tokio::time::timeout(Duration::from_secs(10), activity_journal.flush()).await {
         Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::error!(%error, "task activity journal final flush failed"),
-        Err(_) => tracing::error!("task activity journal final flush timed out"),
+        Ok(Err(error)) => {
+            tracing::error!(%error, "task activity journal final flush failed");
+            if result.is_ok() {
+                result = Err(std::io::Error::other(error));
+            }
+        }
+        Err(error) => {
+            tracing::error!(%error, "task activity journal final flush timed out");
+            if result.is_ok() {
+                result = Err(std::io::Error::new(std::io::ErrorKind::TimedOut, error));
+            }
+        }
     }
     if !startup_maintenance_task.is_finished() {
         startup_maintenance_task.abort();
     }
-    let _ = startup_maintenance_task.await;
+    match startup_maintenance_task.await {
+        Ok(()) => {}
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!("startup maintenance cancelled during shutdown")
+        }
+        Err(error) => {
+            tracing::error!(%error, "startup maintenance task failed");
+            if result.is_ok() {
+                result = Err(std::io::Error::other(error));
+            }
+        }
+    }
     if let Err(error) = blobs.cleanup_all().await {
-        tracing::warn!(error = %error, "daemon temporary cleanup failed");
+        tracing::warn!(%error, "daemon temporary cleanup failed");
+        if result.is_ok() {
+            result = Err(std::io::Error::other(error));
+        }
     }
     result.map_err(Into::into)
 }
@@ -653,7 +834,9 @@ mod tests {
             Some(fluxdown_protocol::MAIN_QUEUE_ID)
         );
         drop(db);
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            eprintln!("runtime test directory removal failed: {error}");
+        }
     }
 
     /// 租约校验探针：按脚本依次返回结果，脚本耗尽后恒成功；同时记录被调用次数。
@@ -728,7 +911,10 @@ mod tests {
         assert!(!monitor.is_finished(), "recovered monitor keeps running");
         assert!(calls.load(Ordering::SeqCst) >= 3);
         cancel.cancel();
-        let _ = monitor.await;
+        monitor
+            .await
+            .expect("lease monitor task")
+            .expect("recovered lease monitor stops cleanly on cancel");
 
         // 连续 `attempts` 次都失败：连接已不可用，租约视为丢失。
         let (verify, calls) = scripted(vec![

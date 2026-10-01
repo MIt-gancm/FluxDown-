@@ -144,7 +144,9 @@ pub async fn find_sources_kad(
                 Ok(_) => send_ok += 1,
                 Err(_) => send_err += 1,
             }
-            let _ = socket.send_to(&hello_req, SocketAddr::V4(*addr)).await;
+            if let Err(error) = socket.send_to(&hello_req, SocketAddr::V4(*addr)).await {
+                tracing::debug!(%addr, %error, "Kad hello send failed; continuing with other nodes");
+            }
         }
         log_info!(
             "[ed2k-kad] bootstrap sent to {} targets ({} ok, {} send-err)",
@@ -211,7 +213,9 @@ pub async fn find_sources_kad(
 
         for (addr, id) in &batch {
             let pkt = proto::build_find_node_req(&target, id);
-            let _ = socket.send_to(&pkt, SocketAddr::V4(*addr)).await;
+            if let Err(error) = socket.send_to(&pkt, SocketAddr::V4(*addr)).await {
+                tracing::debug!(%addr, %error, "Kad find-node send failed; continuing with other nodes");
+            }
         }
 
         let prev_best = candidates.first().map(|c| c.id);
@@ -269,7 +273,9 @@ pub async fn find_sources_kad(
         if cancel.is_cancelled() {
             return Err(DownloadError::Cancelled);
         }
-        let _ = socket.send_to(&req, SocketAddr::V4(*addr)).await;
+        if let Err(error) = socket.send_to(&req, SocketAddr::V4(*addr)).await {
+            tracing::debug!(%addr, %error, "Kad source-search send failed; continuing with other nodes");
+        }
     }
 
     let mut sources: Vec<PeerAddr> = Vec::new();

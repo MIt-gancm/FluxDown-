@@ -320,7 +320,10 @@ fn install(
     });
 
     for handle in cx.windows() {
-        let _ = handle.update(cx, |_, window, _| window.refresh());
+        if handle.update(cx, |_, window, _| window.refresh()).is_err() {
+            // 已关闭的窗口不用刷新，继续更新其他窗口的主题。
+            continue;
+        }
     }
     if let Some(window) = window {
         window.refresh();

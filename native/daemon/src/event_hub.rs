@@ -113,7 +113,10 @@ impl DaemonEventHub {
             event: ServiceEvent::Daemon(event),
         };
         // 与序号递增处于同一临界区，接收者不会收到乱序帧。
-        let _ = self.events.send(frame.clone());
+        // 无订阅者是正常空闲状态，不克隆帧或逐条记录进度日志。
+        if self.events.receiver_count() != 0 && self.events.send(frame.clone()).is_err() {
+            tracing::trace!("daemon event subscribers disconnected before publish");
+        }
         frame
     }
 

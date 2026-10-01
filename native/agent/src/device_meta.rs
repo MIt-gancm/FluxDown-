@@ -227,9 +227,7 @@ mod tests {
         let app = Router::new()
             .route("/api/v1/devices/current", patch(record))
             .with_state(reports.clone());
-        tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
         let dir = std::env::temp_dir().join(format!(
             "fluxdown_device_meta_{}_{}",
@@ -295,7 +293,17 @@ mod tests {
 
         cancel.cancel();
         worker.await.expect("join worker");
+        server.abort();
+        match server.await {
+            Ok(result) => result.expect("device metadata mock server completes successfully"),
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!("device metadata mock server stopped")
+            }
+            Err(error) => panic!("device metadata mock server panicked: {error}"),
+        }
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), %error, "device metadata test cleanup failed");
+        }
     }
 }

@@ -290,7 +290,8 @@ impl Editor {
         let future = self.port.call(method::DAEMON_RSS_VALIDATE, params);
         cx.spawn(async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.validating = false;
                 // 编辑过程中即使旧请求晚到，也不接受与当前输入不同的结果。
                 if !same_request(&this.request(cx), &request) {
@@ -315,7 +316,10 @@ impl Editor {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 订阅视图已释放，结束回调，不再提交后续操作。
+                return;
+            };
         })
         .detach();
     }
@@ -438,7 +442,8 @@ impl Editor {
         let future = self.port.call(method, params);
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.saving = false;
                 match result {
                     Ok(_) => window.close_dialog(cx),
@@ -447,7 +452,10 @@ impl Editor {
                         cx.notify();
                     }
                 }
-            });
+            }) else {
+                // 编辑器或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -469,14 +477,18 @@ impl Editor {
                 Ok(Ok(Some(paths))) => paths.first().map(|path| path.display().to_string()),
                 _ => None,
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.picking_dir = false;
                 if let Some(path) = picked {
                     this.save_dir
                         .update(cx, |input, cx| input.set_value(path, window, cx));
                 }
                 cx.notify();
-            });
+            }) else {
+                // 编辑器或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -540,10 +552,14 @@ impl Editor {
                     let value = value.clone();
                     menu.item(PopupMenuItem::new(label.clone()).on_click(move |_, _, cx| {
                         let value = value.clone();
-                        let _ = this.update(cx, |this, cx| {
+
+                        let Ok(()) = this.update(cx, |this, cx| {
                             on_select(this, value);
                             cx.notify();
-                        });
+                        }) else {
+                            // 订阅视图已释放，结束回调，不再提交后续操作。
+                            return;
+                        };
                     }))
                 })
             })
@@ -562,10 +578,14 @@ impl Editor {
                 let Some(tab) = TABS.get(index).copied() else {
                     return;
                 };
-                let _ = this.update(cx, |this, cx| {
+
+                let Ok(()) = this.update(cx, |this, cx| {
                     this.tab = tab;
                     cx.notify();
-                });
+                }) else {
+                    // 订阅视图已释放，结束回调，不再提交后续操作。
+                    return;
+                };
             },
             cx,
         )

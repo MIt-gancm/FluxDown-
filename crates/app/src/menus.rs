@@ -232,8 +232,10 @@ pub fn install_global_actions(cx: &mut App) {
 /// `App::dispatch_action` 在该窗口的 update 栈内分发，同步 `handle.update` 拿不到窗口会静默失败。
 fn with_active_window(cx: &mut App, f: impl FnOnce(&Window) + 'static) {
     cx.defer(move |cx| {
-        if let Some(window) = WindowRegistry::focused_window(cx) {
-            let _ = window.update(cx, |_, window, _| f(window));
+        if let Some(window) = WindowRegistry::focused_window(cx)
+            && let Err(error) = window.update(cx, |_, window, _| f(window))
+        {
+            log::debug!("view or window released before lifecycle update: {error:#}");
         }
     });
 }
@@ -252,9 +254,11 @@ pub fn request_quit(cx: &mut App) {
             crate::lifecycle::quit_everything(cx);
             return;
         };
-        let _ = window.update(cx, |_, window, cx| {
+        if let Err(error) = window.update(cx, |_, window, cx| {
             confirm_active_tasks(window, cx, |_, cx| crate::lifecycle::quit_everything(cx));
-        });
+        }) {
+            log::debug!("view or window released before lifecycle update: {error:#}");
+        }
     });
 }
 
@@ -276,7 +280,7 @@ fn check_update(cx: &mut App) {
             else {
                 return;
             };
-            let _ = window.update(cx, |_, window, cx| match result {
+            if let Err(error) = window.update(cx, |_, window, cx| match result {
                 Ok(result) if result.has_update => {
                     let url = if result.release_page_url.is_empty() {
                         result.download_url.clone()
@@ -305,7 +309,9 @@ fn check_update(cx: &mut App) {
                     )),
                     cx,
                 ),
-            });
+            }) {
+                log::debug!("view or window released before lifecycle update: {error:#}");
+            }
         });
     })
     .detach();

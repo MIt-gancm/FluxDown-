@@ -1072,7 +1072,11 @@ mod tests {
         assert_eq!(files[1].size, 2);
         assert_eq!(files[2].size, 1);
 
-        std::fs::remove_dir_all(&dir).ok();
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -1120,7 +1124,11 @@ mod tests {
         );
         assert!(!got.contains_key("notes.md"));
 
-        std::fs::remove_dir_all(&dir).ok();
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[derive(Debug, Error)]
@@ -1177,7 +1185,12 @@ mod tests {
         assert!(content.contains("test-operation"));
         assert!(content.contains(r"outer failure: root failure\nsecond line"));
         assert!(!content.contains("root failure\nsecond line"));
-        std::fs::remove_dir_all(dir).ok();
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1212,7 +1225,12 @@ mod tests {
         assert!(content.contains("task-component"));
         assert!(content.contains("task-operation"));
         assert!(content.contains("outer failure: background root failure"));
-        std::fs::remove_dir_all(dir).ok();
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[allow(clippy::panic)]
@@ -1248,7 +1266,12 @@ mod tests {
         assert_eq!(content.matches("background exploded").count(), 1);
         assert!(content.contains("panic-component"));
         assert!(content.contains("panic-operation"));
-        std::fs::remove_dir_all(dir).ok();
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -1280,6 +1303,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.starts_with("write:"))
         );
-        std::fs::remove_file(dir).ok();
+
+        if let Err(error) = std::fs::remove_file(dir) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "clean test path: {error}"
+            );
+        }
     }
 }

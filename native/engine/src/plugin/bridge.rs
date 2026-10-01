@@ -718,15 +718,32 @@ impl PluginBridge for EngineBridge {
             )));
         }
         let path = ws.join(name);
-        tokio::fs::write(&path, content.as_bytes())
+        // 权限必须在写入敏感内容前收紧；旧文件也不能沿用宽松权限。
+        let mut options = tokio::fs::OpenOptions::new();
+        options.create(true).write(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
             .await
-            .map_err(|e| PluginError::Runtime(format!("flux.fs 写入失败: {e}")))?;
-        // 敏感输入（如 cookie）尽力设 0600。
+            .map_err(|e| PluginError::Runtime(format!("flux.fs 打开失败: {e}")))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(|e| PluginError::Runtime(format!("flux.fs 设置安全权限失败: {e}")))?;
         }
+        use tokio::io::AsyncWriteExt;
+        file.set_len(0)
+            .await
+            .map_err(|e| PluginError::Runtime(format!("flux.fs 截断失败: {e}")))?;
+        file.write_all(content.as_bytes())
+            .await
+            .map_err(|e| PluginError::Runtime(format!("flux.fs 写入失败: {e}")))?;
+        file.flush()
+            .await
+            .map_err(|e| PluginError::Runtime(format!("flux.fs flush 失败: {e}")))?;
         Ok(())
     }
 
@@ -795,7 +812,14 @@ impl PluginBridge for EngineBridge {
 
     fn request_retry(&self, task_id: &str, delay_ms: u64) {
         // fire-and-forget；限流在 actor 侧（max_auto_retries）。
-        let _ = self.plugin_retry_tx.send((task_id.to_string(), delay_ms));
+        if self
+            .plugin_retry_tx
+            .send((task_id.to_string(), delay_ms))
+            .is_err()
+        {
+            // actor 关闭后不再处理重试，属于引擎退出的正常生命周期。
+            tracing::debug!("plugin retry actor closed");
+        }
     }
 
     async fn record_artifact(
@@ -1665,6 +1689,46 @@ mod tests {
         validate_ytdlp_args, ytdlp_args_reject_reason,
     };
     use std::net::IpAddr;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_write_protects_new_and_existing_sensitive_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use super::PluginBridge;
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("fluxdown-private-fs-{}", uuid::Uuid::new_v4()));
+        let db = crate::db::Db::connect("sqlite::memory:").await?;
+        let (retry_tx, _retry_rx) = tokio::sync::mpsc::unbounded_channel();
+        let bridge = super::EngineBridge::new(
+            db,
+            &crate::proxy_config::ProxyConfig::default(),
+            retry_tx,
+            root.clone(),
+        )?;
+        bridge
+            .fs_write(
+                "acme@private",
+                "cookies.txt",
+                "old-secret-and-long-tail".into(),
+            )
+            .await?;
+        let path = plugin_workspace(&root, "acme@private").join("cookies.txt");
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+        bridge
+            .fs_write("acme@private", "cookies.txt", "new".into())
+            .await?;
+        assert_eq!(std::fs::read(&path)?, b"new");
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap_or_else(|_| panic!("bad ip {s}"))

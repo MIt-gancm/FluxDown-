@@ -251,6 +251,11 @@ mod tests {
         assert_eq!(files, vec![root.join("a.bin"), nested.join("b.bin")]);
         assert_eq!(collect_files(&root.join("a.bin")), vec![root.join("a.bin")]);
         assert!(collect_files(&root.join("missing")).is_empty());
-        let _ = std::fs::remove_dir_all(&root);
+
+        if let Err(error) = std::fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 }

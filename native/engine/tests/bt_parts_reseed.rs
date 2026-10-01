@@ -196,5 +196,10 @@ async fn reseed_with_parts_sidecar_passes_check_without_recreating_files() {
 
     session.stop().await;
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
+
+    if let Err(error) = std::fs::remove_dir_all(&root)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

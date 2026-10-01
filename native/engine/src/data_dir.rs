@@ -256,7 +256,14 @@ fn migrate_portable_layout(old_root: &Path, new_dir: &Path) -> Vec<String> {
         let new_path = new_dir.join(name);
         if pending && old_path.exists() {
             // 主库迁移失败那次启动里引擎预建的空目录；remove_dir 只删空目录，非空则保留。
-            let _ = std::fs::remove_dir(&new_path);
+            if let Err(error) = std::fs::remove_dir(&new_path)
+                && !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                )
+            {
+                failures.push(format!("清理空目录失败 {}: {error}", new_path.display()));
+            }
         }
         if old_path.exists()
             && !new_path.exists()
@@ -269,8 +276,11 @@ fn migrate_portable_layout(old_root: &Path, new_dir: &Path) -> Vec<String> {
             ));
         }
     }
-    if failures.is_empty() {
-        let _ = std::fs::remove_file(new_dir.join(DB_MIGRATION_PENDING));
+    if failures.is_empty()
+        && let Err(error) = std::fs::remove_file(new_dir.join(DB_MIGRATION_PENDING))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        failures.push(format!("清除迁移哨兵失败 {}: {error}", new_dir.display()));
     }
     failures
 }
@@ -310,7 +320,9 @@ fn migrate_db_group(old_root: &Path, new_dir: &Path, failures: &mut Vec<String>)
             new_db.display()
         ));
         // 引擎随后会在新目录自建空库；哨兵让下次启动识别并重试。
-        let _ = std::fs::write(new_dir.join(DB_MIGRATION_PENDING), b"");
+        if let Err(error) = std::fs::write(new_dir.join(DB_MIGRATION_PENDING), b"") {
+            failures.push(format!("写迁移哨兵失败 {}: {error}", new_dir.display()));
+        }
         return;
     }
     let old_wal = old_root.join(DB_WAL);
@@ -331,7 +343,9 @@ fn migrate_db_group(old_root: &Path, new_dir: &Path, failures: &mut Vec<String>)
                 old_db.display()
             ));
         }
-        let _ = std::fs::write(new_dir.join(DB_MIGRATION_PENDING), b"");
+        if let Err(error) = std::fs::write(new_dir.join(DB_MIGRATION_PENDING), b"") {
+            failures.push(format!("写迁移哨兵失败 {}: {error}", new_dir.display()));
+        }
         return;
     }
     let old_shm = old_root.join(DB_SHM);
@@ -372,16 +386,23 @@ fn backup_fresh_db(new_dir: &Path) -> Result<(), String> {
 #[cfg(any(target_os = "windows", test))]
 fn persist_migration_failures(new_dir: &Path, failures: &[String]) {
     use std::io::Write;
-    let Ok(mut file) = std::fs::OpenOptions::new()
+    let path = new_dir.join("migration_errors.log");
+    let mut file = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(new_dir.join("migration_errors.log"))
-    else {
-        return;
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("[便携迁移] 打开迁移诊断失败 {}: {error}", path.display());
+            return;
+        }
     };
     let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     for msg in failures {
-        let _ = writeln!(file, "{ts} [便携迁移] {msg}");
+        if let Err(error) = writeln!(file, "{ts} [便携迁移] {msg}") {
+            eprintln!("[便携迁移] 写迁移诊断失败: {error}; {msg}");
+        }
     }
 }
 
@@ -409,7 +430,14 @@ mod tests {
             "fluxdown_portable_migrate_{name}_{}",
             std::process::id()
         ));
-        let _ = fs::remove_dir_all(&dir);
+
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "clean test path: {error}"
+            );
+        }
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -449,7 +477,12 @@ mod tests {
         assert!(!root.join(DB_FILE).exists());
         assert!(!root.join("icons").exists());
         assert!(root.join("flux_down.exe").exists());
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -462,7 +495,12 @@ mod tests {
         let failures = migrate_portable_layout(&root, &new_dir);
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(fs::read_to_string(new_dir.join(DB_FILE)).unwrap(), "db");
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -482,7 +520,12 @@ mod tests {
             fs::read_to_string(root.join("settings.json")).unwrap(),
             "old"
         );
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -496,7 +539,12 @@ mod tests {
         assert!(failures.is_empty(), "{failures:?}");
         assert!(root.join(DB_WAL).exists());
         assert!(!new_dir.join(DB_WAL).exists());
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -514,7 +562,12 @@ mod tests {
         assert!(root.join(DB_FILE).exists());
         assert!(root.join(DB_WAL).exists());
         assert!(!new_dir.join(DB_WAL).exists());
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -534,7 +587,12 @@ mod tests {
         assert_eq!(fs::read_to_string(new_dir.join(DB_FILE)).unwrap(), "old-db");
         assert!(new_dir.join("plugins").join("a.js").exists());
         assert!(!new_dir.join(super::DB_MIGRATION_PENDING).exists());
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[test]
@@ -547,6 +605,11 @@ mod tests {
         assert!(content.contains("[便携迁移] boom"), "{content}");
         // 不得预创建 logs/ 目录（会让下次启动误判 logs 已迁移）。
         assert!(!new_dir.join("logs").exists());
-        let _ = fs::remove_dir_all(&root);
+
+        if let Err(error) = fs::remove_dir_all(&root)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 }

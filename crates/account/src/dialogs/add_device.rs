@@ -178,16 +178,25 @@ impl AddDeviceDialog {
         let future = self.link_call(method::AGENT_LINK_DISCOVERY_SET, params, cx);
         cx.spawn(async move |this, cx| {
             if let Err(error) = future.await {
-                let _ = this.update(cx, |this, cx| {
-                    if enabled {
-                        this.error = Some(error_text(
-                            this.host.read(cx).translator().read(cx),
-                            &error,
-                            ErrorContext::Pairing,
-                        ));
-                        cx.notify();
-                    }
-                });
+                if !enabled {
+                    // 停止发现不回写已关闭的对话框，但仍记录真实失败。
+                    eprintln!(
+                        "disabling local device discovery failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                    return;
+                }
+                let Ok(()) = this.update(cx, |this, cx| {
+                    this.error = Some(error_text(
+                        this.host.read(cx).translator().read(cx),
+                        &error,
+                        ErrorContext::Pairing,
+                    ));
+                    cx.notify();
+                }) else {
+                    // 账户视图或窗口已释放，结束回调，不再更新状态。
+                    return;
+                };
             }
         })
         .detach();
@@ -210,7 +219,7 @@ impl AddDeviceDialog {
                     )
                 })
             });
-            let _ = this.update(cx, |this, cx| {
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.own_code_busy = false;
                 match result {
                     Ok(code) => this.own_code = Some(code),
@@ -223,7 +232,10 @@ impl AddDeviceDialog {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -283,7 +295,7 @@ impl AddDeviceDialog {
                     )
                 })
             });
-            let _ = this.update_in(cx, |this, _, cx| {
+            let Ok(()) = this.update_in(cx, |this, _, cx| {
                 match result {
                     Ok(response) => {
                         let flow = std::mem::replace(&mut this.flow, PairFlow::Form);
@@ -299,7 +311,10 @@ impl AddDeviceDialog {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -323,7 +338,16 @@ impl AddDeviceDialog {
         if !accept {
             // 放弃：只需通知 agent 释放会话，结果不影响界面。
             cx.background_spawn(async move {
-                let _ = future.await;
+                if let Err(error) = future.await {
+                    // 配对令牌已过期或会话已结束时，放弃操作本身已达成。
+                    if error.reason == Some(fluxdown_protocol::ErrorReason::PairingSessionExpired) {
+                        return;
+                    }
+                    eprintln!(
+                        "abandoning local pairing failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                }
             })
             .detach();
             return;
@@ -337,7 +361,7 @@ impl AddDeviceDialog {
                     )
                 })
             });
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(response) => {
                         let paired = response.paired;
@@ -365,7 +389,10 @@ impl AddDeviceDialog {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -383,7 +410,16 @@ impl AddDeviceDialog {
             .unwrap_or_default();
             let future = self.link_call(method::AGENT_LINK_PAIR_FINISH, params, cx);
             cx.background_spawn(async move {
-                let _ = future.await;
+                if let Err(error) = future.await {
+                    // 配对令牌已过期或会话已结束时，关闭清理无需再处理。
+                    if error.reason == Some(fluxdown_protocol::ErrorReason::PairingSessionExpired) {
+                        return;
+                    }
+                    eprintln!(
+                        "closing local pairing session failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                }
             })
             .detach();
         }
@@ -393,8 +429,19 @@ impl AddDeviceDialog {
             let discovery = self.link_call(method::AGENT_LINK_DISCOVERY_SET, params, cx);
             let stop = self.link_call(method::AGENT_LINK_STOP_PAIRING, serde_json::json!({}), cx);
             cx.background_spawn(async move {
-                let _ = discovery.await;
-                let _ = stop.await;
+                if let Err(error) = discovery.await {
+                    // 发现停止失败也必须继续撤回配对广播。
+                    eprintln!(
+                        "stopping local discovery failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                }
+                if let Err(error) = stop.await {
+                    eprintln!(
+                        "stopping local pairing broadcast failed: {:?} ({:?})",
+                        error.code, error.reason
+                    );
+                }
             })
             .detach();
         }
@@ -580,8 +627,6 @@ impl AddDeviceDialog {
                 Some(platform) if !platform.is_empty() => format!("{platform} · {}", entry.address),
                 _ => entry.address.clone(),
             };
-            let paired_label = entry.paired.then(|| t(&translator, "localPairingOnline"));
-            let _ = paired_label;
             let picked = entry.clone();
             list = list.child(
                 h_flex()

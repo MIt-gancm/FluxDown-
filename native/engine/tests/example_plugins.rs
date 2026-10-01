@@ -73,7 +73,9 @@ struct ChannelSink(tokio::sync::mpsc::UnboundedSender<EngineEvent>);
 
 impl EventSink for ChannelSink {
     fn emit(&self, event: EngineEvent) {
-        let _ = self.0.send(event);
+        if self.0.send(event).is_err() {
+            tracing::debug!("test event receiver was dropped after observation");
+        }
     }
 }
 
@@ -175,5 +177,9 @@ async fn manifest_playground_preview_produces_valid_manifest() {
     assert_eq!(items, 1000, "stress 数据集须恰好压在 1000 上限");
     assert!(name.contains("压测"), "清单名透传: {name}");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

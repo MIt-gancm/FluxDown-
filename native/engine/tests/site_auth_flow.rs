@@ -165,7 +165,11 @@ async fn explicit_credentials_are_injected_saved_and_auto_applied() {
         "captured Authorization must win over the saved credential"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -220,5 +224,9 @@ async fn explicit_user_agent_is_snapshotted_without_overriding_captured_header()
         "captured request header must keep precedence over the separate task field"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

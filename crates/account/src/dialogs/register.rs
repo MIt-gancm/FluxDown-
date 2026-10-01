@@ -273,7 +273,7 @@ impl RegisterDialog {
         let future = self.port.execute(AccountCommand::Auth { method, params });
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 this.resending = false;
                 match result {
@@ -304,7 +304,10 @@ impl RegisterDialog {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }

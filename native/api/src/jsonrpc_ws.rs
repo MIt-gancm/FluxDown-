@@ -58,7 +58,9 @@ pub(crate) async fn run_session(
         tokio::select! {
             _ = recheck.tick() => {
                 if !session_still_valid(jsonrpc_enabled(), token, &initial_token) {
-                    let _ = socket.send(Message::Close(None)).await;
+                    if let Err(error) = socket.send(Message::Close(None)).await {
+                        tracing::debug!(%error, "JSON-RPC websocket already disconnected during revocation");
+                    }
                     break;
                 }
             }
@@ -66,7 +68,9 @@ pub(crate) async fn run_session(
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if !session_still_valid(jsonrpc_enabled(), token, &initial_token) {
-                            let _ = socket.send(Message::Close(None)).await;
+                            if let Err(error) = socket.send(Message::Close(None)).await {
+                                tracing::debug!(%error, "JSON-RPC websocket already disconnected during revocation");
+                            }
                             break;
                         }
                         let resp = respond_to_text(host, &token.get(), text.as_str()).await;

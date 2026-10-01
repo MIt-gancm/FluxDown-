@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -28,6 +28,8 @@ pub(crate) enum ActorError {
     OpenDatabase(#[source] DbError),
     #[error("failed to initialize download engine")]
     InitializeEngine(#[source] EngineError),
+    #[error("failed to invalidate obsolete ED2K server cache")]
+    InvalidateEd2kCache(#[source] DbError),
 }
 
 use crate::updater;
@@ -129,28 +131,34 @@ fn spawn_tracker_sub_refresh(
     tx: mpsc::Sender<fluxdown_engine::tracker_subscription::FetchOutcome>,
 ) {
     tokio::spawn(async move {
-        let cfg = db.get_all_config().await.unwrap_or_default();
+        let cfg = match db.get_all_config().await {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                crate::logger::report_error("actor", "read tracker subscription config", &error);
+                return;
+            }
+        };
         let urls = cfg
             .get("bt_tracker_sub_urls")
             .cloned()
             .unwrap_or_else(fluxdown_engine::tracker_subscription::default_subscription_urls);
         let outcome = fluxdown_engine::tracker_subscription::fetch_subscriptions(&urls).await;
         if outcome.is_success() {
-            let now = chrono::Utc::now().timestamp();
-            if let Err(e) = db
-                .set_config("bt_tracker_sub_cache", &outcome.trackers.join("\n"))
-                .await
-            {
-                log_info!("[actor] failed to save tracker sub cache: {}", e);
-            }
-            if let Err(e) = db
-                .set_config("bt_tracker_sub_updated_at", &now.to_string())
-                .await
-            {
-                log_info!("[actor] failed to save tracker sub timestamp: {}", e);
+            let values = BTreeMap::from([
+                ("bt_tracker_sub_cache".into(), outcome.trackers.join("\n")),
+                (
+                    "bt_tracker_sub_updated_at".into(),
+                    chrono::Utc::now().timestamp().to_string(),
+                ),
+            ]);
+            if let Err(error) = db.set_config_batch_atomic(&values).await {
+                crate::logger::report_error("actor", "save tracker subscription cache", &error);
+                return;
             }
         }
-        let _ = tx.send(outcome).await;
+        if tx.send(outcome).await.is_err() {
+            tracing::debug!("hub tracker refresh receiver closed");
+        }
     });
 }
 
@@ -161,7 +169,17 @@ fn spawn_tracker_sub_refresh(
 /// find-sources step, so no shared session needs invalidating here.
 fn spawn_ed2k_server_sub_refresh(db: Db) {
     tokio::spawn(async move {
-        let cfg = db.get_all_config().await.unwrap_or_default();
+        let cfg = match db.get_all_config().await {
+            Ok(cfg) => cfg,
+            Err(error) => {
+                crate::logger::report_error(
+                    "actor",
+                    "read ED2K server subscription config",
+                    &error,
+                );
+                return;
+            }
+        };
         let urls = cfg
             .get("ed2k_server_sub_urls")
             .cloned()
@@ -169,30 +187,19 @@ fn spawn_ed2k_server_sub_refresh(db: Db) {
         let outcome =
             fluxdown_engine::ed2k::server_subscription::fetch_server_subscriptions(&urls).await;
         if outcome.is_success() {
-            let now = chrono::Utc::now().timestamp();
-            if let Err(e) = db
-                .set_config("ed2k_server_sub_cache", &outcome.servers.join(","))
-                .await
-            {
-                log_info!("[actor] failed to save ed2k server sub cache: {}", e);
-            }
-            if let Err(e) = db
-                .set_config("ed2k_server_sub_updated_at", &now.to_string())
-                .await
-            {
-                log_info!("[actor] failed to save ed2k server sub timestamp: {}", e);
-            }
-            if let Err(e) = db
-                .set_config(
-                    "ed2k_server_sub_cache_version",
-                    &fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION.to_string(),
-                )
-                .await
-            {
-                log_info!(
-                    "[actor] failed to save ed2k server sub cache version: {}",
-                    e
-                );
+            let values = BTreeMap::from([
+                ("ed2k_server_sub_cache".into(), outcome.servers.join(",")),
+                (
+                    "ed2k_server_sub_updated_at".into(),
+                    chrono::Utc::now().timestamp().to_string(),
+                ),
+                (
+                    "ed2k_server_sub_cache_version".into(),
+                    fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION.to_string(),
+                ),
+            ]);
+            if let Err(error) = db.set_config_batch_atomic(&values).await {
+                crate::logger::report_error("actor", "save ED2K server subscription cache", &error);
             }
         }
     });
@@ -593,7 +600,10 @@ pub async fn run(
                 cache_version,
                 fluxdown_engine::ed2k::server_subscription::CACHE_FORMAT_VERSION
             );
-            let _ = engine.db.set_config("ed2k_server_sub_cache", "").await;
+            if let Err(error) = engine.db.set_config("ed2k_server_sub_cache", "").await {
+                super::shutdown_engine(engine, progress_task).await;
+                return Err(ActorError::InvalidateEd2kCache(error));
+            }
         }
         let now = chrono::Utc::now().timestamp();
         if sub_enabled
@@ -654,7 +664,9 @@ pub async fn run(
     let shutdown_tx = aux_tx.clone();
     tokio::spawn(async move {
         shutdown.cancelled().await;
-        let _ = shutdown_tx.send(AuxSignal::Shutdown);
+        if shutdown_tx.send(AuxSignal::Shutdown).is_err() {
+            tracing::debug!("hub actor already stopped before shutdown notification");
+        }
     });
     // 文件丢失自动清理泵：引擎 detached 扫描 → mpsc → aux_tx → 主循环单分支。
     if let Some(mut rx) = missing_cleanup_rx {
@@ -1173,6 +1185,8 @@ mod tests {
             second.as_ref().err()
         );
         drop(second);
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            eprintln!("remove lease test directory failed: {error}");
+        }
     }
 }

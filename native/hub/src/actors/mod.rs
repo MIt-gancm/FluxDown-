@@ -39,7 +39,17 @@ async fn shutdown_engine(
             Ok(Err(error)) => crate::logger::report_error("hub", "drain task progress", &error),
             Err(error) => {
                 progress_task.abort();
-                let _ = progress_task.await;
+                if let Err(join_error) = progress_task.await {
+                    if join_error.is_cancelled() {
+                        tracing::debug!("hub progress reporter cancelled after timeout");
+                    } else {
+                        crate::logger::report_error(
+                            "hub",
+                            "join aborted task progress",
+                            &join_error,
+                        );
+                    }
+                }
                 crate::logger::report_error("hub", "drain task progress timed out", &error);
             }
         }

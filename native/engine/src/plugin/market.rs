@@ -222,8 +222,7 @@ impl MarketClient {
             .db
             .get_config(&key)
             .await
-            .ok()
-            .flatten()
+            .map_err(|e| PluginError::Runtime(format!("读取市场高水位失败: {e}")))?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         if idx.sequence < watermark {
@@ -233,7 +232,10 @@ impl MarketClient {
             });
         }
         if idx.sequence > watermark {
-            let _ = self.db.set_config(&key, &idx.sequence.to_string()).await;
+            self.db
+                .set_config(&key, &idx.sequence.to_string())
+                .await
+                .map_err(|e| PluginError::Runtime(format!("写入市场高水位失败: {e}")))?;
         }
         Ok(())
     }

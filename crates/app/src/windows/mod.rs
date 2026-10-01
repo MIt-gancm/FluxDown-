@@ -82,7 +82,13 @@ impl WindowRegistry {
             let client = Arc::clone(&client);
             async move {
                 for (key, value) in pending {
-                    let _ = patch_local_preference(&client, key, value).await;
+                    if let Err(error) = patch_local_preference(&client, key, value).await {
+                        // 退出时继续提交其他窗口的边界，失败不能假作已落盘。
+                        log::warn!(
+                            "failed to persist window bounds on exit {key}: {:?}",
+                            error.code
+                        );
+                    }
                 }
             }
         });
@@ -149,8 +155,10 @@ impl WindowRegistry {
     }
 
     pub fn close(cx: &mut App, key: &WindowKey) {
-        if let Some(handle) = cx.global::<Self>().open.get(key).copied() {
-            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        if let Some(handle) = cx.global::<Self>().open.get(key).copied()
+            && let Err(error) = handle.update(cx, |_, window, _| window.remove_window())
+        {
+            log::debug!("view or window released before lifecycle update: {error:#}");
         }
     }
 
@@ -208,11 +216,13 @@ impl WindowRegistry {
                 return;
             };
             let is_main = Self::key_of(cx, handle.window_id()) == Some(WindowKey::Main);
-            let _ = handle.update(cx, |_, window, cx| {
+            if let Err(error) = handle.update(cx, |_, window, cx| {
                 if !is_main || main::should_close(window, cx) {
                     window.remove_window();
                 }
-            });
+            }) {
+                log::debug!("view or window released before lifecycle update: {error:#}");
+            }
         });
     }
 

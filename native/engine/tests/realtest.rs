@@ -203,7 +203,18 @@ async fn start_server(state: Arc<ServerState>) -> TestServer {
         while let Ok((stream, _peer)) = listener.accept().await {
             let st2 = st.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(stream, st2).await;
+                if let Err(error) = handle_conn(stream, st2).await {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::UnexpectedEof
+                        ),
+                        "test server connection failed: {error}"
+                    );
+                }
             });
         }
     });
@@ -301,11 +312,20 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
 
     // 重定向钩子：/redirect → 302 到 /file
     if req.path == "/redirect" {
-        let body = st.body.lock().await.clone();
-        let _ = body; // not used directly
         let resp = "HTTP/1.1 302 Found\r\nLocation: /file\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -328,7 +348,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
         let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
     let is_head = req.method.eq_ignore_ascii_case("HEAD");
@@ -356,14 +387,36 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         h.push_str(&format!("Content-Type: {}\r\n", st.content_type));
         h.push_str("Connection: close\r\n\r\n");
         write_all(&mut stream, h.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
     if st.signature_invalid.load(Ordering::SeqCst) {
         let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -372,7 +425,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         st.signature_invalid.store(true, Ordering::SeqCst);
         let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -404,7 +468,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
         let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
     if let Some(max_len) = st.max_range_len
@@ -417,7 +492,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
         let resp = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
     // 只拒「分段」Range(probe 0-0 放行):全员被拒→单流回退的转换出口守护。
@@ -425,7 +511,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         st.rejected_range_count.fetch_add(1, Ordering::SeqCst);
         let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         write_all(&mut stream, resp.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
     // 钩子 A（永久型）：所有分段 range GET 强制走 200 全量分支（保留 probe 走 206），
@@ -470,15 +567,38 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
             && !st.disable_close_full.load(Ordering::SeqCst)
         {
             let k = k.min(send_body.len());
-            let _ = write_all(&mut stream, &send_body[..k]).await;
-            let _ = stream.shutdown().await;
+
+            write_all(&mut stream, &send_body[..k]).await?;
+
+            if let Err(error) = stream.shutdown().await
+                && !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                )
+            {
+                return Err(error);
+            }
             return Ok(());
         }
         if st.throttle_full_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(st.throttle_full_ms)).await;
         }
         write_all(&mut stream, &send_body).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -492,7 +612,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
             total
         );
         write_all(&mut stream, h.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -546,9 +677,21 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
         && n == drop_n
     {
         let k = k.min(chunk.len());
-        let _ = write_all(&mut stream, &chunk[..k]).await;
+
+        write_all(&mut stream, &chunk[..k]).await?;
         // 直接关闭，制造不完整传输
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -561,7 +704,18 @@ async fn handle_conn(mut stream: TcpStream, st: Arc<ServerState>) -> std::io::Re
             chunk.len()
         );
     }
-    let _ = stream.shutdown().await;
+
+    if let Err(error) = stream.shutdown().await
+        && !matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+        )
+    {
+        return Err(error);
+    }
 
     // body 切换注入：达到阈值后替换 body+etag（+可选 Last-Modified），模拟下载中文件变化
     if let Some((after, ref new_body, ref new_etag)) = st.swap_after_range_gets
@@ -625,7 +779,7 @@ fn hex_str(bytes: &[u8]) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        let _ = write!(s, "{:02x}", b);
+        write!(s, "{:02x}", b).expect("format into test string");
     }
     s
 }
@@ -707,7 +861,8 @@ async fn run_coord(
     )
     .await;
     drop(tx);
-    let _ = dh.await;
+
+    dh.await.expect("test background task must not panic");
     (res.map(|_| ()), dest)
 }
 
@@ -717,7 +872,14 @@ async fn run_coord(
 #[ignore = "binds a local port; run with --ignored"]
 async fn resume_uses_validated_plain_range_without_if_range() {
     let work_dir = unique_dir("if_range_403");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let body = Arc::new(gen_body(2 * 1024 * 1024 + 17, 0x403));
@@ -750,7 +912,11 @@ async fn resume_uses_validated_plain_range_without_if_range() {
     );
     assert_eq!(tokio::fs::read(&dest).await.unwrap(), *body);
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 不发送 If-Range 后仍必须验证服务器返回的版本标识；validator 不一致时不得
@@ -759,7 +925,14 @@ async fn resume_uses_validated_plain_range_without_if_range() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn validated_plain_range_rejects_changed_version() {
     let work_dir = unique_dir("if_range_403_changed");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let body = Arc::new(gen_body(1024 * 1024 + 31, 0x404));
@@ -791,7 +964,11 @@ async fn validated_plain_range_rejects_changed_version() {
         "版本校验不得以先发送 If-Range 为代价"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 无既有 segment 行、已知大小且 `segments=1` 的真实恢复任务必须使用纯 Range，
@@ -802,7 +979,14 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
     use fluxdown_engine::downloader::{DownloadParams, TEMP_EXT, run_download};
 
     let work_dir = unique_dir("single_if_range_403");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     const MAX_RANGE_LEN: i64 = 16 * 1024 * 1024;
@@ -888,7 +1072,10 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
         multi_nic: None,
     })
     .await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
 
     assert_eq!(status.load(Ordering::SeqCst), 3, "单流续传应成功完成");
     assert_eq!(
@@ -920,7 +1107,11 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
         "大缺口应拆成至少两个串行 Range"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 // ===========================================================================
@@ -933,7 +1124,14 @@ async fn single_stream_resume_uses_plain_range_without_if_range() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn multi_segment_correctness_matrix() {
     let work_dir = unique_dir("matrix");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     // (size, seed)
@@ -1008,7 +1206,14 @@ async fn multi_segment_correctness_matrix() {
                     failures.push(format!("size={size} segs={segs}: 下载错误 {e}"));
                 }
             }
-            let _ = tokio::fs::remove_file(&dest).await;
+
+            if let Err(error) = tokio::fs::remove_file(&dest).await {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "clean test path: {error}"
+                );
+            }
             // 清理 DB 段，避免下次复用脏状态（每个 task_id 唯一其实已隔离）
         }
         drop(server);
@@ -1044,7 +1249,14 @@ async fn multi_segment_correctness_matrix() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn ramp_up_starts_conservatively() {
     let work_dir = unique_dir("rampup");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 4_194_304usize; // 4 MiB
@@ -1093,7 +1305,12 @@ async fn ramp_up_starts_conservatively() {
         "8 个分段应至少产生 8 个 range GET（实际 {total_gets}）"
     );
     drop(server);
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 隔离复现：2 字节单段下载是否稳定 hang。
@@ -1102,7 +1319,14 @@ async fn ramp_up_starts_conservatively() {
 async fn repro_small_single_segment() {
     for &size in &[1usize, 2, 3, 10, 100] {
         let work_dir = unique_dir(&format!("repro-{size}"));
-        let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+        if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "clean test path: {error}"
+            );
+        }
         tokio::fs::create_dir_all(&work_dir).await.unwrap();
         let body = Arc::new(gen_body(size, size as u64 + 7));
         let expected = sha256_bytes(&body);
@@ -1156,7 +1380,14 @@ async fn repro_small_single_segment() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn coordinator_handles_degenerate_segment_count() {
     let work_dir = unique_dir("degen");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let cases: &[(usize, i32)] = &[(1, 32), (2, 32), (5, 64), (10, 100), (3, 8)];
@@ -1232,7 +1463,14 @@ async fn coordinator_handles_degenerate_segment_count() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn resume_after_cancel_is_byte_exact() {
     let work_dir = unique_dir("resume");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 8_000_003usize; // ~8MB 素数
@@ -1299,8 +1537,12 @@ async fn resume_after_cancel_is_byte_exact() {
     )
     .await;
     drop(tx);
-    let _ = dh.await;
-    let _ = canceller.await;
+
+    dh.await.expect("test background task must not panic");
+
+    canceller
+        .await
+        .expect("test background task must not panic");
     println!("第一程结果: {:?}", first.as_ref().map(|_| "ok"));
 
     let partial_len = tokio::fs::metadata(&dest)
@@ -1342,7 +1584,8 @@ async fn resume_after_cancel_is_byte_exact() {
     )
     .await;
     drop(tx2);
-    let _ = dh2.await;
+
+    dh2.await.expect("test background task must not panic");
     second.expect("续传应成功");
 
     let got_size = tokio::fs::metadata(&dest).await.unwrap().len() as i64;
@@ -1363,7 +1606,14 @@ async fn resume_after_cancel_is_byte_exact() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn mid_transfer_drop_retries_and_completes() {
     let work_dir = unique_dir("drop");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 4_000_037usize;
@@ -1450,7 +1700,14 @@ async fn probe_detects_range_support_and_size() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn file_changed_midway_must_not_silently_corrupt() {
     let work_dir = unique_dir("etagswap");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 6_000_011usize;
@@ -1579,7 +1836,10 @@ async fn run_full(
     };
 
     run_download(params).await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
     let status = last_status.load(std::sync::atomic::Ordering::SeqCst);
     (status, work_dir.join(file_name))
 }
@@ -1669,7 +1929,10 @@ async fn run_full_server_time(
     };
 
     run_download(params).await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
     let status = last_status.load(std::sync::atomic::Ordering::SeqCst);
     (status, work_dir.join(file_name))
 }
@@ -1681,7 +1944,14 @@ async fn run_full_server_time(
 #[ignore = "binds a local port; run with --ignored"]
 async fn use_server_time_applies_last_modified_to_file_mtime() {
     let work_dir = unique_dir("servertime");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let body = gen_body(300_000, 777);
@@ -1739,7 +2009,14 @@ async fn use_server_time_uses_new_last_modified_after_version_change() {
     use fluxdown_engine::downloader::{DownloadParams, TEMP_EXT, run_download};
 
     let work_dir = unique_dir("servertime_swap");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 300_000usize;
@@ -1814,7 +2091,10 @@ async fn use_server_time_uses_new_last_modified_after_version_change() {
         cdn: fluxdown_engine::cdn::CdnTaskInput::default(),
     };
     run_download(params).await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
     let status = last_status.load(std::sync::atomic::Ordering::SeqCst);
     assert_eq!(status, 3, "❌ 下载未成功");
 
@@ -1843,7 +2123,14 @@ async fn use_server_time_uses_new_last_modified_after_version_change() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn gzip_single_stream_should_succeed() {
     let work_dir = unique_dir("gzip");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let plain = gen_body(300_000, 555);
@@ -1893,7 +2180,14 @@ async fn gzip_single_stream_should_succeed() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn layered_content_encoding_must_error_not_corrupt() {
     let work_dir = unique_dir("layered");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let plain = gen_body(200_000, 4321);
@@ -1931,7 +2225,14 @@ async fn layered_content_encoding_must_error_not_corrupt() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn no_content_length_truncation_must_not_be_accepted() {
     let work_dir = unique_dir("nocl");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let full = gen_body(500_000, 888);
@@ -2014,7 +2315,14 @@ async fn no_content_length_truncation_must_not_be_accepted() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_smaller_than_true_server_size_must_not_truncate() {
     let work_dir = unique_dir("hintunder");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     // 服务器真实文件 3_000_000；扩展 hint 只有 1_400_000（模拟渐进上传中途的部分大小）。
@@ -2107,7 +2415,14 @@ async fn hint_smaller_than_true_server_size_must_not_truncate() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_undersized_within_old_drift_tolerance_must_not_truncate() {
     let work_dir = unique_dir("hintdrift");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     // 服务器真实文件 3_000_000；hint 2_985_000：缺口 15_000 落在旧 1% 容差(29_850)【内】。
@@ -2196,7 +2511,14 @@ async fn hint_undersized_within_old_drift_tolerance_must_not_truncate() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_expansion_quota_exhausted_fails_loud_and_keeps_data() {
     let work_dir = unique_dir("hintquota");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     // 真实 body 足够大，注入的分母序列全部 <= body 长度，服务器能自洽地服务
@@ -2265,7 +2587,14 @@ async fn hint_expansion_quota_exhausted_fails_loud_and_keeps_data() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_no_content_length_truncation_single_stream_must_not_be_accepted() {
     let work_dir = unique_dir("hintnocl");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let full = gen_body(500_000, 4041); // 模拟一段视频
@@ -2343,7 +2672,14 @@ async fn hint_no_content_length_truncation_single_stream_must_not_be_accepted() 
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_no_content_length_truncation_via_range_fallback_must_not_be_accepted() {
     let work_dir = unique_dir("hintnoclms");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let full = gen_body(3_000_000, 5052); // > 1MB → 触发多段
@@ -2413,7 +2749,14 @@ async fn hint_no_content_length_truncation_via_range_fallback_must_not_be_accept
 #[ignore = "binds a local port; run with --ignored"]
 async fn single_stream_resume_must_not_splice_changed_file() {
     let work_dir = unique_dir("splice");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 400_000usize;
@@ -2492,7 +2835,14 @@ async fn single_stream_resume_must_not_splice_changed_file() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn multiseg_etag_stripped_must_not_silently_splice() {
     let work_dir = unique_dir("xver");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 6_000_011usize;
@@ -2548,7 +2898,14 @@ async fn multiseg_etag_stripped_must_not_silently_splice() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn range_advertised_but_all_segments_get_200_falls_back_single_stream() {
     let work_dir = unique_dir("force200");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 5_000_011usize; // ~5MB 素数大小
@@ -2603,7 +2960,14 @@ async fn range_advertised_but_all_segments_get_200_falls_back_single_stream() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn range_hostile_hint_first_shot_is_plain_get() {
     let work_dir = unique_dir("range400");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 4_000_037usize; // ~4MB 素数大小，>1MB 满足多段门槛
@@ -2673,7 +3037,14 @@ async fn range_hostile_hint_first_shot_is_plain_get() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_on_non_advertising_range_server_degrades_to_single_stream() {
     let work_dir = unique_dir("noadvertise");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 3_000_017usize;
@@ -2732,7 +3103,14 @@ async fn resume_of_unverified_hint_task_stays_plain_get() {
     use fluxdown_engine::downloader::{DownloadParams, run_download};
 
     let work_dir = unique_dir("resumeplain");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 3_000_017usize;
@@ -2802,7 +3180,10 @@ async fn resume_of_unverified_hint_task_stays_plain_get() {
         cdn: fluxdown_engine::cdn::CdnTaskInput::default(),
     };
     run_download(params).await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
     let status = last_status.load(std::sync::atomic::Ordering::SeqCst);
 
     assert_eq!(
@@ -2840,7 +3221,14 @@ async fn resume_of_unverified_hint_task_stays_plain_get() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn probed_all_segments_rejected_falls_back_to_plain_get() {
     let work_dir = unique_dir("segreject400");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 4_000_037usize;
@@ -2891,7 +3279,14 @@ async fn probed_all_segments_rejected_falls_back_to_plain_get() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn hint_plain_first_upgrades_to_multi_segment_on_accept_ranges() {
     let work_dir = unique_dir("hintupgrade");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 8_000_003usize; // ~8MB
@@ -2971,7 +3366,14 @@ async fn manual_real_url_hint_download() {
     let cookies = std::env::var("FLUXDOWN_RT_COOKIES").unwrap_or_default();
 
     let work_dir = unique_dir("manual-real");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
     let db = Db::open(&work_dir).await.expect("db");
     insert_simple_task(
@@ -3039,7 +3441,10 @@ async fn manual_real_url_hint_download() {
         cdn: fluxdown_engine::cdn::CdnTaskInput::default(),
     };
     run_download(params).await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
     let status = last_status.load(std::sync::atomic::Ordering::SeqCst);
     let dest = work_dir.join("manual.bin");
     let disk = tokio::fs::metadata(&dest)
@@ -3075,7 +3480,14 @@ async fn manual_real_url_hint_download() {
 #[ignore = "binds a local port; run with --ignored"]
 async fn transient_200_on_resume_is_absorbed_byte_exact() {
     let work_dir = unique_dir("transient200");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let segs_count = 8i32;
@@ -3171,7 +3583,8 @@ async fn transient_200_on_resume_is_absorbed_byte_exact() {
     )
     .await;
     drop(tx);
-    let _ = dh.await;
+
+    dh.await.expect("test background task must not panic");
 
     result.expect("瞬时 200 应被 do_segment_with_retry 退避重试吸收，续传应成功");
 

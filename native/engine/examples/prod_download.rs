@@ -66,7 +66,13 @@ async fn main() {
     // 2. 真实 download_block_from_peer 逐个 HighID 源尝试，直到某个成功下块 0。
     let dest = std::env::temp_dir().join("fluxdown_prod_probe.part");
     // 预分配目标文件到全长（peer.rs 用 open+write，需文件存在）。
-    let _ = tokio::fs::write(&dest, vec![0u8; FILE_SIZE as usize]).await;
+    if let Err(error) = tokio::fs::write(&dest, vec![0u8; FILE_SIZE as usize]).await {
+        eprintln!(
+            "prepare peer download destination {}: {error}",
+            dest.display()
+        );
+        return;
+    }
     let cancel = CancellationToken::new();
     let limiter = SpeedLimiter::new(0);
 

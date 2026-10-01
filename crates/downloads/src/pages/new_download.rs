@@ -563,7 +563,8 @@ impl NewDownloadView {
                 }
                 _ => None,
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 if this.auth_autofill.dirty
                     || this.auth_autofill.target.as_deref() != Some(url.as_str())
                 {
@@ -580,7 +581,10 @@ impl NewDownloadView {
                     }
                     None => this.clear_autofilled_auth(window, cx),
                 }
-            });
+            }) else {
+                // 表单或窗口已释放，不再回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -812,7 +816,8 @@ impl NewDownloadView {
                     .collect::<Vec<_>>(),
                 _ => Vec::new(),
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.picking = false;
                 cx.notify();
                 if paths.is_empty() {
@@ -832,7 +837,10 @@ impl NewDownloadView {
                 if this.entries.is_empty() {
                     window.remove_window();
                 }
-            });
+            }) else {
+                // 表单或窗口已释放，不再回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -869,7 +877,8 @@ impl NewDownloadView {
                         .collect::<Vec<_>>()
                 })
                 .await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.picking = false;
                 cx.notify();
                 if cancelled {
@@ -891,7 +900,10 @@ impl NewDownloadView {
                     Notification::success(this.strings.format_import_found(count)),
                     cx,
                 );
-            });
+            }) else {
+                // 表单或窗口已释放，不再回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -961,14 +973,18 @@ impl NewDownloadView {
                 Ok(Ok(Some(paths))) => paths.first().map(|path| path.display().to_string()),
                 _ => None,
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.picking = false;
                 if let Some(path) = picked {
                     this.save_dir
                         .update(cx, |input, cx| input.set_value(path, window, cx));
                 }
                 cx.notify();
-            });
+            }) else {
+                // 表单或窗口已释放，不再回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -1092,9 +1108,13 @@ impl NewDownloadView {
                             .disabled(*disabled)
                             .on_click(move |_, window, cx| {
                                 let value = value.clone();
-                                let _ = this.update(cx, |this, cx| {
+
+                                let Ok(()) = this.update(cx, |this, cx| {
                                     on_pick(this, value, window, cx);
-                                });
+                                }) else {
+                                    // 视图已释放，结束这次回调而不再更新状态。
+                                    return;
+                                };
                             }),
                     )
                 })
@@ -1127,9 +1147,13 @@ impl NewDownloadView {
                 menu.item(
                     PopupMenuItem::new(label.clone()).on_click(move |_, window, cx| {
                         let queue_id = queue_id.clone();
-                        let _ = this.update(cx, |this, cx| {
+
+                        let Ok(()) = this.update(cx, |this, cx| {
                             this.submit(later, Some(queue_id), window, cx);
-                        });
+                        }) else {
+                            // 视图已释放，结束这次回调而不再更新状态。
+                            return;
+                        };
                     }),
                 )
             })

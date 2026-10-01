@@ -200,8 +200,14 @@ impl TaskEventHub {
     }
 
     fn publish(&self, events: Vec<TaskEvent>) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
         for event in events {
-            let _ = self.events.send(event);
+            if self.events.send(event).is_err() {
+                tracing::trace!("last task event subscriber disconnected");
+                break;
+            }
         }
     }
 

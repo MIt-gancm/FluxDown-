@@ -418,7 +418,14 @@ mod tests {
             .as_nanos();
         let dir =
             std::env::temp_dir().join(format!("fluxdown_auth_test_{}_{nanos}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "remove test directory: {error}"
+            );
+        }
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let db = Db::open(&dir).await.expect("open test db");
         (db, dir)
@@ -451,7 +458,12 @@ mod tests {
             .expect("load")
             .expect("profile persisted under new per-key format");
         assert_eq!(loaded.cookies, "sid=1");
-        let _ = std::fs::remove_dir_all(dir);
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("remove auth test directory: {error}");
+        }
     }
 
     #[tokio::test]
@@ -475,6 +487,11 @@ mod tests {
             .expect("legacy entry migrated under https-qualified key");
         assert_eq!(migrated.site, "https://example.com");
         assert_eq!(migrated.auth_ref, "a@b::https://example.com");
-        let _ = std::fs::remove_dir_all(dir);
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("remove auth test directory: {error}");
+        }
     }
 }

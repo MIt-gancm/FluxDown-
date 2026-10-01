@@ -120,7 +120,15 @@ struct SegmentDownloadContext<'a> {
 
 pub async fn run_dash_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
-    let result = run_dash_download_inner(&params).await;
+    let result = match run_dash_download_inner(&params).await {
+        Ok(total) => params
+            .db
+            .update_task_status(&params.task_id, 3, "")
+            .await
+            .map(|()| total)
+            .map_err(DownloadError::Db),
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok(total) => {
@@ -129,20 +137,14 @@ pub async fn run_dash_download(params: DownloadParams) {
                 task_id_log,
                 total
             );
-            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
-                crate::logger::report_error(
-                    "dash-download",
-                    "persist completion status",
-                    &db_error,
-                );
-            }
+
             // 完成期改名可能让最终文件名偏离起飞时的名字（占名冲突换名），
             // 以 DB 为准随完成信号上报（空串 = 保持原名）。
             let final_file_name = match params.db.load_task_by_id(&params.task_id).await {
                 Ok(Some(t)) => t.file_name,
                 _ => String::new(),
             };
-            let _ = params
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -154,7 +156,11 @@ pub async fn run_dash_download(params: DownloadParams) {
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("download progress receiver closed");
+            }
         }
         Err(DownloadError::Cancelled) => {
             log_info!("[dash-download] task {} cancelled", task_id_log);
@@ -181,7 +187,7 @@ pub async fn run_dash_download(params: DownloadParams) {
                     (0, 0)
                 }
             };
-            let _ = params
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -193,7 +199,11 @@ pub async fn run_dash_download(params: DownloadParams) {
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("download progress receiver closed");
+            }
         }
     }
 }
@@ -276,22 +286,34 @@ pub(crate) async fn ffmpeg_copy_to_mp4(
         .output();
 
     let result: std::process::Output = tokio::select! {
-        _ = cancel_token.cancelled() => {
-            // The future is dropped here; kill_on_drop ensures the child is killed.
-            let _ = tokio::fs::remove_file(output).await;
-            return Err(DownloadError::Cancelled);
-        }
-        o = output_fut => match o {
-            Ok(o) => o,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(output).await;
-                return Err(DownloadError::Other(format!("failed to run ffmpeg: {e}")));
+            _ = cancel_token.cancelled() => {
+                // The future is dropped here; kill_on_drop ensures the child is killed.
+    if let Err(error) = tokio::fs::remove_file(output).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
+    }
+                return Err(DownloadError::Cancelled);
             }
-        },
-    };
+            o = output_fut => match o {
+                Ok(o) => o,
+                Err(e) => {
+    if let Err(error) = tokio::fs::remove_file(output).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
+    }
+                    return Err(DownloadError::Other(format!("failed to run ffmpeg: {e}")));
+                }
+            },
+        };
 
     if !result.status.success() {
-        let _ = tokio::fs::remove_file(output).await;
+        if let Err(error) = tokio::fs::remove_file(output).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
+        }
         let stderr = String::from_utf8_lossy(&result.stderr);
         return Err(DownloadError::Other(format!(
             "ffmpeg exited with {}: {}",
@@ -338,7 +360,11 @@ async fn mux_audio_video(
     // Replace the original video-only file with the muxed version
     if let Err(e) = tokio::fs::rename(&muxed_tmp, video_path).await {
         // rename 失败时清理临时 mux 产物,避免残留临时文件
-        let _ = tokio::fs::remove_file(&muxed_tmp).await;
+        if let Err(error) = tokio::fs::remove_file(&muxed_tmp).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
+        }
         return Err(DownloadError::Other(format!(
             "failed to replace video with muxed file: {}",
             e
@@ -351,9 +377,8 @@ async fn mux_audio_video(
 async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadError> {
     log_info!("[dash-download] task {} starting, url={}", p.task_id, p.url);
 
-    let _ = p.db.update_task_status(&p.task_id, 5, "").await;
-    let _ = p
-        .progress_tx
+    p.db.update_task_status(&p.task_id, 5, "").await?;
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: 0,
@@ -364,7 +389,11 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
+    }
 
     // 离散音视频轨对旁路：调用方已直接给出视频轨(p.url)+音频轨(p.audio_url)两条
     // 直链，无需（也无法）拉取 .mpd manifest 解析。直接把两条 URL 当单分段下载后 mux。
@@ -396,7 +425,7 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
     }
     if !p.is_resume {
         // 全新开始:清掉上一轮遗留的续传检查点,避免误续传过期数据。
-        let _ = p.db.delete_config(&dash_resume_key(&p.task_id)).await;
+        p.db.delete_config(&dash_resume_key(&p.task_id)).await?;
     }
     // 多 Period DASH 尚未完全支持，仅下载首个 Period；后续 Period 被静默忽略
     // 可能导致内容不完整。这里记录警告，便于用户排查。
@@ -481,10 +510,9 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
         return Err(DownloadError::Cancelled);
     }
 
-    let _ = p.db.update_task_status(&p.task_id, 1, "").await;
+    p.db.update_task_status(&p.task_id, 1, "").await?;
 
-    let _ = p
-        .progress_tx
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: 0,
@@ -495,7 +523,11 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
+    }
 
     let dest_path = save_dir.join(&actual_name);
 
@@ -595,7 +627,11 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
                     p.task_id
                 );
                 // Remove the separate audio file after successful mux
-                let _ = tokio::fs::remove_file(&audio_path).await;
+                if let Err(error) = tokio::fs::remove_file(&audio_path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
+                }
             }
             Err(DownloadError::Cancelled) => {
                 return Err(DownloadError::Cancelled);
@@ -631,8 +667,10 @@ async fn run_dash_download_inner(p: &DownloadParams) -> Result<i64, DownloadErro
     } else {
         video_bytes + audio_bytes
     };
-    let _ = p.db.update_task_progress(&p.task_id, total).await;
-    let _ = p.db.delete_config(&dash_resume_key(&p.task_id)).await;
+    p.db.update_task_progress(&p.task_id, total).await?;
+    if let Err(error) = p.db.delete_config(&dash_resume_key(&p.task_id)).await {
+        crate::logger::report_warning("dash-download", "remove_checkpoint", &error);
+    }
     Ok(total)
 }
 
@@ -698,9 +736,13 @@ async fn download_track_best_effort(
                     p.task_id,
                     status
                 );
-                let _ = p.db.delete_segments(&p.task_id).await;
+                p.db.delete_segments(&p.task_id).await?;
                 let temp = PathBuf::from(format!("{}{}", dest_path.display(), TEMP_EXT));
-                let _ = tokio::fs::remove_file(&temp).await;
+                match tokio::fs::remove_file(&temp).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(DownloadError::Io(e)),
+                }
             }
             Err(e) => return Err(e),
         }
@@ -717,7 +759,7 @@ async fn download_track_best_effort(
         // 探测成功但低于阈值/非 GET 时（track_len=Some 分支未命中）说明有
         // 权威新信息，残留行确属陈旧，清掉走单流是安全的。
         if track_len.is_none() {
-            let existing = p.db.load_segments(&p.task_id).await.unwrap_or_default();
+            let existing = p.db.load_segments(&p.task_id).await?;
             if !existing.is_empty() {
                 return Err(DownloadError::Other(format!(
                     "track probe failed with {} resumable segment row(s) retained; \
@@ -728,7 +770,7 @@ async fn download_track_best_effort(
         }
         // 单流路径不消费段行：清掉可能残留的多段行（探测成功但低于阈值/
         // 非 GET 的画质切换残留），防止暂停/重启时渲染陈旧分布。
-        let _ = p.db.delete_segments(&p.task_id).await;
+        p.db.delete_segments(&p.task_id).await?;
     }
     download_track(
         p,
@@ -834,7 +876,7 @@ async fn download_track_coordinated(
     match result {
         Ok(final_total) => {
             // 本轨完成：段行使命结束，清掉（下一轨/完成态不再引用）。
-            let _ = p.db.delete_segments(&p.task_id).await;
+            p.db.delete_segments(&p.task_id).await?;
             let final_path = finalize_track_rename(p, &temp_path, dest_path, role).await?;
             Ok((final_total, final_path))
         }
@@ -867,8 +909,10 @@ async fn finalize_track_rename(
         ))
     };
     if role == DashTrack::Audio {
-        if tokio::fs::metadata(dest).await.is_ok() {
-            let _ = tokio::fs::remove_file(dest).await;
+        match tokio::fs::remove_file(dest).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(rename_failed(e)),
         }
         crate::downloader::claim_rename(temp, dest)
             .await
@@ -963,9 +1007,8 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
         return Err(DownloadError::Cancelled);
     }
 
-    let _ = p.db.update_task_status(&p.task_id, 1, "").await;
-    let _ = p
-        .progress_tx
+    p.db.update_task_status(&p.task_id, 1, "").await?;
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: 0,
@@ -976,7 +1019,11 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
+    }
 
     // 两轨大小：Range 0-0 探测 Content-Range 全长（googlevideo 等 CDN 通用；
     // 失败 → None = 未知，UI 退化为只显示已下载字节，不阻塞下载）。
@@ -989,9 +1036,8 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
         _ => 0,
     };
     if total_bytes > 0 {
-        let _ =
-            p.db.update_task_file_info(&p.task_id, &auto_name, total_bytes)
-                .await;
+        p.db.update_task_file_info(&p.task_id, &auto_name, total_bytes)
+            .await?;
     }
 
     let mut progress_state = ProgressState {
@@ -1039,8 +1085,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
             v
         );
         // 立即上报一帧，让 UI 恢复后马上显示视频轨部分的进度与分布前缀。
-        let _ = p
-            .progress_tx
+        if p.progress_tx
             .send(ProgressUpdate {
                 task_id: p.task_id.clone(),
                 downloaded_bytes: v,
@@ -1057,7 +1102,11 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
                 }]),
                 ..Default::default()
             })
-            .await;
+            .await
+            .is_err()
+        {
+            tracing::debug!("download progress receiver closed");
+        }
         (v, dest_path)
     } else {
         download_track_best_effort(
@@ -1126,16 +1175,14 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     // 终态校准：任务级总大小 = 两轨实际字节合计。coordinator 的任务级写入已被
     // owns_task_total=false 门控，此处是唯一权威落点——同时兜住「探测失败、
     // 前面从未写过 total」的路径（此时 DB 里还是旧值/0）。
-    let _ =
-        p.db.update_task_total_bytes(&p.task_id, video_bytes + audio_bytes)
-            .await;
+    p.db.update_task_total_bytes(&p.task_id, video_bytes + audio_bytes)
+        .await?;
     // 终帧分布快照：把两轨合成为一个 100% 全覆盖段。音频轨走单流时不产生
     // 分段快照，Dart 端缓存的最后一帧仍是视频轨阶段的（只覆盖 [0, 视频轨长)），
     // 完成后分布图尾部会留灰——此帧以任务级坐标系覆盖全量，消除残留。
     let pair_actual = video_bytes + audio_bytes;
-    if pair_actual > 0 {
-        let _ = p
-            .progress_tx
+    if pair_actual > 0
+        && p.progress_tx
             .send(ProgressUpdate {
                 task_id: p.task_id.clone(),
                 downloaded_bytes: pair_actual,
@@ -1152,7 +1199,10 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
                 }]),
                 ..Default::default()
             })
-            .await;
+            .await
+            .is_err()
+    {
+        tracing::debug!("download progress receiver closed");
     }
 
     // 合并两轨；ffmpeg 缺失/失败时保留双文件（与 manifest 路径一致的优雅降级）。
@@ -1173,7 +1223,11 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
                     "[dash] task {} track-pair muxed successfully, cleaning up audio track",
                     p.task_id
                 );
-                let _ = tokio::fs::remove_file(&audio_path).await;
+                if let Err(error) = tokio::fs::remove_file(&audio_path).await
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
+                }
             }
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
             Err(e) => {
@@ -1198,7 +1252,7 @@ async fn run_track_pair_inner(p: &DownloadParams, audio_url: &str) -> Result<i64
     } else {
         video_bytes + audio_bytes
     };
-    let _ = p.db.update_task_progress(&p.task_id, total).await;
+    p.db.update_task_progress(&p.task_id, total).await?;
     Ok(total)
 }
 
@@ -2041,19 +2095,21 @@ fn dash_resume_key(task_id: &str) -> String {
     format!("hls_resume_{task_id}")
 }
 
-async fn load_dash_checkpoint(p: &DownloadParams) -> DashCheckpoint {
-    p.db.get_config(&dash_resume_key(&p.task_id))
-        .await
-        .ok()
-        .flatten()
+async fn load_dash_checkpoint(p: &DownloadParams) -> Result<DashCheckpoint, DownloadError> {
+    Ok(p.db
+        .get_config(&dash_resume_key(&p.task_id))
+        .await?
         .map(|s| DashCheckpoint::parse(&s))
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
-async fn save_dash_checkpoint(p: &DownloadParams, cp: &DashCheckpoint) {
-    let _ =
-        p.db.set_config(&dash_resume_key(&p.task_id), &cp.encode())
-            .await;
+async fn save_dash_checkpoint(
+    p: &DownloadParams,
+    cp: &DashCheckpoint,
+) -> Result<(), DownloadError> {
+    p.db.set_config(&dash_resume_key(&p.task_id), &cp.encode())
+        .await?;
+    Ok(())
 }
 
 /// 段列表指纹(FNV-1a):续传前比对,清单变了(段数/路径/Range)就不能沿用磁盘前缀。
@@ -2106,8 +2162,12 @@ async fn download_track(
         role,
     )
     .await;
-    if result.is_err() && resume_track.is_none() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+    if result.is_err()
+        && resume_track.is_none()
+        && let Err(error) = tokio::fs::remove_file(&temp_path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        crate::logger::report_warning("dash-download", "remove_temporary_file", &error);
     }
     result
 }
@@ -2134,7 +2194,7 @@ async fn download_track_inner(
     let mut resumed_file: Option<File> = None;
 
     if let Some(track) = resume_track {
-        checkpoint = load_dash_checkpoint(p).await;
+        checkpoint = load_dash_checkpoint(p).await?;
         match checkpoint.get(track) {
             Some(TrackProgress::Done {
                 bytes,
@@ -2210,9 +2270,8 @@ async fn download_track_inner(
             file.flush().await?;
             // 使用单调写入：resume 从 0 开始重下时，不覆盖 DB 中更大的存量进度值，
             // 避免进度回退（BUG-DASH-RESUME-FULL-REDOWNLOAD）。
-            let _ =
-                p.db.update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
-                    .await;
+            p.db.update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
+                .await?;
             return Err(DownloadError::Cancelled);
         }
 
@@ -2230,12 +2289,23 @@ async fn download_track_inner(
             Ok(b) => b,
             Err(e) => {
                 // 落盘已完成的前缀,使检查点记录的字节数在续传时可信。
-                let _ = file.flush().await;
+                if let Err(error) = file.flush().await {
+                    if matches!(e, DownloadError::Cancelled) {
+                        return Err(DownloadError::Io(error));
+                    }
+                    crate::logger::report_warning("dash-download", "flush_failed_track", &error);
+                }
                 // 使用单调写入，同上原因（BUG-DASH-RESUME-FULL-REDOWNLOAD）。
-                let _ = p
-                    .db
-                    .update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
-                    .await;
+                if let Err(error) =
+                    p.db.update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
+                        .await
+                {
+                    crate::logger::report_warning(
+                        "dash-download",
+                        "persist_failed_progress",
+                        &error,
+                    );
+                }
                 return Err(e);
             }
         };
@@ -2253,12 +2323,12 @@ async fn download_track_inner(
                     fingerprint,
                 },
             );
-            save_dash_checkpoint(p, &checkpoint).await;
+            file.flush().await?;
+            save_dash_checkpoint(p, &checkpoint).await?;
         }
 
         if progress_state.last_report.elapsed().as_millis() >= 200 {
-            let _ = p
-                .progress_tx
+            if p.progress_tx
                 .send(ProgressUpdate {
                     task_id: p.task_id.clone(),
                     downloaded_bytes: progress_state.downloaded_bytes,
@@ -2274,15 +2344,19 @@ async fn download_track_inner(
                     runtime: Some(dash_runtime(&p.task_id, progress_state)),
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("download progress receiver closed");
+                return Err(DownloadError::Cancelled);
+            }
             progress_state.last_report = std::time::Instant::now();
         }
 
         if progress_state.last_db_save.elapsed().as_secs() >= DB_SAVE_INTERVAL_SECS {
             // 使用单调写入，同上原因（BUG-DASH-RESUME-FULL-REDOWNLOAD）。
-            let _ =
-                p.db.update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
-                    .await;
+            p.db.update_task_progress_monotonic(&p.task_id, progress_state.downloaded_bytes)
+                .await?;
             progress_state.last_db_save = std::time::Instant::now();
         }
     }
@@ -2300,7 +2374,7 @@ async fn download_track_inner(
                 fingerprint,
             },
         );
-        save_dash_checkpoint(p, &checkpoint).await;
+        save_dash_checkpoint(p, &checkpoint).await?;
     }
 
     Ok((total_track, final_path))
@@ -2330,6 +2404,7 @@ async fn download_segment_with_retry(
         {
             Ok(written) => return Ok(written),
             Err(DownloadError::Cancelled) => return Err(DownloadError::Cancelled),
+            Err(DownloadError::Db(error)) => return Err(DownloadError::Db(error)),
             Err(e) => {
                 file.set_len(start_pos).await?;
                 file.seek(std::io::SeekFrom::Start(start_pos)).await?;
@@ -2522,7 +2597,7 @@ async fn download_segment_streaming(
         // 块级进度上报（200ms 节流）：track-pair 模式整轨即单 segment，若只在
         // segment 完成后上报，UI 将全程无进度（BUG：YouTube 240MB 轨 0% 挂满全场）。
         if progress_state.last_report.elapsed().as_millis() >= 200 {
-            let _ = ctx
+            if ctx
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: ctx.task_id.to_string(),
@@ -2539,15 +2614,19 @@ async fn download_segment_streaming(
                     runtime: Some(dash_runtime(ctx.task_id, progress_state)),
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("download progress receiver closed");
+                return Err(DownloadError::Cancelled);
+            }
             progress_state.last_report = std::time::Instant::now();
         }
         // 块级 DB 持久化（5s 节流，单调写入防进度回退）。
         if progress_state.last_db_save.elapsed().as_secs() >= DB_SAVE_INTERVAL_SECS {
-            let _ = ctx
-                .db
+            ctx.db
                 .update_task_progress_monotonic(ctx.task_id, progress_state.downloaded_bytes)
-                .await;
+                .await?;
             progress_state.last_db_save = std::time::Instant::now();
         }
     }

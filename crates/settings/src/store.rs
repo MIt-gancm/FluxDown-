@@ -787,7 +787,8 @@ impl SettingsStore {
         let future = self.port.call(method, params);
         cx.spawn(async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.busy.remove(action);
                 this.busy_tags.remove(action);
                 if let Err(error) = &result {
@@ -798,7 +799,10 @@ impl SettingsStore {
                 }
                 on_done(this, result, cx);
                 cx.notify();
-            });
+            }) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -1036,10 +1040,14 @@ impl SettingsStore {
         self.flush_scheduled = true;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(FLUSH_DEBOUNCE).await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.flush_scheduled = false;
                 this.flush(cx);
-            });
+            }) else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -1068,7 +1076,8 @@ impl SettingsStore {
                     first_error = Some(error);
                 }
             }
-            let _ =
+
+            let Ok(()) =
                 this.update(cx, |this, cx| {
                     this.flush_inflight = false;
                     match first_error {
@@ -1109,7 +1118,11 @@ impl SettingsStore {
                         this.schedule_flush(cx);
                     }
                     cx.notify();
-                });
+                })
+            else {
+                // 设置视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }

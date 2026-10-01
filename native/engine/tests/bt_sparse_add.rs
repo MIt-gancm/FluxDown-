@@ -183,7 +183,11 @@ async fn fresh_add_creates_sparse_files_without_physical_reservation() {
 
     session.stop().await;
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
+    if let Err(error) = std::fs::remove_dir_all(&root)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 数据齐全的重添加（跨重启恢复形态）：既有文件被幂等打上 sparse 标记，
@@ -265,5 +269,9 @@ async fn readd_with_complete_data_marks_existing_files_and_finishes() {
 
     session.stop().await;
     drop(session);
-    let _ = std::fs::remove_dir_all(&root);
+    if let Err(error) = std::fs::remove_dir_all(&root)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

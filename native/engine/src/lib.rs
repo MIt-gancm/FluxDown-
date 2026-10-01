@@ -266,7 +266,9 @@ impl Engine {
         db.seed_builtin_queues().await?;
         // 组 GC：清理无成员的孤儿组行（重启后一次性清理；无事件——首次
         // send_all_groups 由宿主主动调用触发，此处不广播）。
-        let _ = db.gc_empty_groups().await;
+        if let Err(error) = db.gc_empty_groups().await {
+            logger::report_warning("engine", "garbage collect empty groups", &error);
+        }
         // 插件系统构造所需值需在 config 被 move 进 DownloadManagerConfig 前克隆。
         let activity_journal = task_activity::JournalSink::start(db.clone(), sink);
         let sink: Arc<dyn EventSink> = activity_journal.clone();
@@ -319,7 +321,14 @@ impl Engine {
                 .flatten()
                 .unwrap_or_default();
             let plugins_root = data_dir_p.join("plugins");
-            let _ = tokio::fs::create_dir_all(&plugins_root).await;
+            tokio::fs::create_dir_all(&plugins_root)
+                .await
+                .map_err(|error| {
+                    EngineError::Plugin(format!(
+                        "create plugin directory {}: {error}",
+                        plugins_root.display()
+                    ))
+                })?;
             let pm = Arc::new(plugin::PluginManager::new(
                 runtime,
                 bridge,

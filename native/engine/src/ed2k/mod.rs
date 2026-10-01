@@ -211,20 +211,40 @@ async fn prepare_temp_and_blocks(
     };
     let snapshot = BlockSnapshot::from_rows(total_bytes, part_size, &resume_rows);
     // 已分配空间可以原地复用；查询失败时只抵扣可靠的已校验块。
-    let allocated =
-        if temp_ok && available.is_some() && snapshot.verified_bytes as u64 != total_bytes {
-            let temp = temp.to_path_buf();
-            let query = tokio::task::spawn_blocking(move || {
-                let file = std::fs::File::open(temp).ok()?;
-                fs2::FileExt::allocated_size(&file).ok()
-            });
-            match tokio::time::timeout(Duration::from_secs(3), query).await {
-                Ok(Ok(bytes)) => bytes,
-                _ => None,
+    let allocated = if temp_ok
+        && available.is_some()
+        && snapshot.verified_bytes as u64 != total_bytes
+    {
+        let temp = temp.to_path_buf();
+        let query = tokio::task::spawn_blocking(move || {
+            let file = std::fs::File::open(temp)?;
+            fs2::FileExt::allocated_size(&file)
+        });
+        match tokio::time::timeout(Duration::from_secs(3), query).await {
+            Ok(Ok(Ok(bytes))) => Some(bytes),
+            Ok(Ok(Err(error))) => {
+                crate::log_warn!(
+                    "[ed2k] allocation query failed; reserving unverified bytes: {}",
+                    error
+                );
+                None
             }
-        } else {
-            None
-        };
+            Ok(Err(error)) => {
+                if error.is_cancelled() {
+                    tracing::debug!("ED2K allocation query cancelled during shutdown");
+                } else {
+                    crate::log_error!("[ed2k] allocation query task panicked: {}", error);
+                }
+                None
+            }
+            Err(error) => {
+                tracing::debug!(%error, "ED2K allocation query timed out; reserving unverified bytes");
+                None
+            }
+        }
+    } else {
+        None
+    };
     check_download_space(
         available,
         remaining_disk_bytes(total_bytes, snapshot.verified_bytes as u64, allocated),
@@ -249,7 +269,12 @@ async fn prepare_temp_and_blocks(
 /// 重算锚定 root → `sync_all`+`rename`。旁路进度任务在任一退出路径 `abort()`。
 pub async fn run_ed2k_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
-    let result = run_ed2k_download_inner(&params).await;
+    let result = async {
+        let outcome = run_ed2k_download_inner(&params).await?;
+        params.db.update_task_status(&params.task_id, 3, "").await?;
+        Ok::<_, DownloadError>(outcome)
+    }
+    .await;
     match result {
         Ok((total, final_name)) => {
             log_info!(
@@ -257,14 +282,8 @@ pub async fn run_ed2k_download(params: DownloadParams) {
                 task_id_log,
                 total
             );
-            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
-                crate::logger::report_error(
-                    "ed2k-download",
-                    "persist completion status",
-                    &db_error,
-                );
-            }
-            let _ = params
+
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -276,7 +295,11 @@ pub async fn run_ed2k_download(params: DownloadParams) {
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("ED2K completion receiver closed during shutdown");
+            }
         }
         Err(DownloadError::Cancelled) => {
             log_info!("[ed2k-download] task {} cancelled", task_id_log);
@@ -295,7 +318,7 @@ pub async fn run_ed2k_download(params: DownloadParams) {
                 Ok(Some(t)) => (t.downloaded_bytes, t.total_bytes),
                 _ => (0, 0),
             };
-            let _ = params
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -307,7 +330,11 @@ pub async fn run_ed2k_download(params: DownloadParams) {
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("ED2K error receiver closed during shutdown");
+            }
         }
     }
 }
@@ -321,7 +348,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
     let is_single = hash::is_single_block(total_bytes, part_size);
     let task_id = params.task_id.clone();
 
-    let _ = params.db.update_task_status(&task_id, 5, "").await;
+    params.db.update_task_status(&task_id, 5, "").await?;
 
     let save_dir = Path::new(&params.save_dir);
     // manager 传入的名字已做 dedup / 用户自定义 / 预订临时路径，必须沿用，
@@ -331,9 +358,10 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
         let siblings: HashSet<String> = params
             .db
             .list_active_sibling_file_names(&params.save_dir, &task_id)
-            .await
-            .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
-            .unwrap_or_default();
+            .await?
+            .into_iter()
+            .map(|n| n.to_lowercase())
+            .collect();
         adopt_legacy_temp(
             save_dir,
             &link.file_name,
@@ -341,7 +369,7 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
             total_bytes,
             &siblings,
         )
-        .await;
+        .await?;
     }
     let temp_path = save_dir.join(format!("{file_name}{}", crate::downloader::TEMP_EXT));
 
@@ -368,9 +396,10 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
         let avoid: HashSet<String> = params
             .db
             .list_active_sibling_file_names(&params.save_dir, &task_id)
-            .await
-            .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
-            .unwrap_or_default();
+            .await?
+            .into_iter()
+            .map(|n| n.to_lowercase())
+            .collect();
         let final_name = finalize_rename(
             &temp_path,
             save_dir,
@@ -379,11 +408,11 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
             &avoid,
         )
         .await?;
-        persist_final_name(params, &task_id, &file_name, &final_name, 0).await;
+        persist_final_name(params, &task_id, &file_name, &final_name, 0).await?;
         return Ok((0, final_name));
     }
 
-    let _ = params
+    if params
         .progress_tx
         .send(ProgressUpdate {
             task_id: task_id.clone(),
@@ -395,23 +424,24 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("ED2K progress receiver closed during shutdown");
+        return Err(DownloadError::Cancelled);
+    }
 
     // 服务器来源合并：用户手填列表（ed2k_server_list）+ 订阅缓存
     // （ed2k_server_sub_cache，由 hub 定期刷新 server.met 写入）。
     let manual_cfg = params
         .db
         .get_config("ed2k_server_list")
-        .await
-        .ok()
-        .flatten()
+        .await?
         .unwrap_or_default();
     let sub_cfg = params
         .db
         .get_config("ed2k_server_sub_cache")
-        .await
-        .ok()
-        .flatten()
+        .await?
         .unwrap_or_default();
     let mut server_list = parse_server_list(&manual_cfg);
     let mut seen: HashSet<String> = server_list.iter().cloned().collect();
@@ -443,25 +473,19 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
     let listen_port = params
         .db
         .get_config("ed2k_listen_port")
-        .await
-        .ok()
-        .flatten()
+        .await?
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(0);
     let enable_upnp = params
         .db
         .get_config("ed2k_enable_upnp")
-        .await
-        .ok()
-        .flatten()
+        .await?
         .map(|v| v == "true")
         .unwrap_or(true);
     let enable_kad = params
         .db
         .get_config("ed2k_enable_kad")
-        .await
-        .ok()
-        .flatten()
+        .await?
         .map(|v| v == "true")
         .unwrap_or(true);
     client.configure(crate::ed2k::client::ClientConfig {
@@ -478,11 +502,17 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
         params
             .db
             .get_config("ed2k_nodes_dat_cache")
-            .await
-            .ok()
-            .flatten()
+            .await?
             .filter(|s| !s.is_empty())
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(&s).ok())
+            .and_then(
+                |s| match base64::engine::general_purpose::STANDARD.decode(&s) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => {
+                        crate::log_warn!("[ed2k] invalid cached Kad bootstrap data: {}", error);
+                        None
+                    }
+                },
+            )
             .unwrap_or_default()
     } else {
         Vec::new()
@@ -610,16 +640,12 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                     let manual = params
                         .db
                         .get_config("ed2k_server_list")
-                        .await
-                        .ok()
-                        .flatten()
+                        .await?
                         .unwrap_or_default();
                     let sub = params
                         .db
                         .get_config("ed2k_server_sub_cache")
-                        .await
-                        .ok()
-                        .flatten()
+                        .await?
                         .unwrap_or_default();
                     let mut fresh = parse_server_list(&manual);
                     let mut seen_srv: HashSet<String> = fresh.iter().cloned().collect();
@@ -646,7 +672,13 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                     () = params.cancel_token.cancelled() => break 'outer Err(DownloadError::Cancelled),
                     r = client.find_sources(&link.root_hash, total_bytes, large_file) => r,
                 };
-                let mut merged: Vec<Source> = server_res.unwrap_or_default();
+                let mut merged: Vec<Source> = match server_res {
+                    Ok(sources) => sources,
+                    Err(error) => {
+                        log_info!("[ed2k] server source query failed; trying Kad: {}", error);
+                        Vec::new()
+                    }
+                };
                 if enable_kad && !nodes_dat.is_empty() {
                     let kad_res = crate::ed2k::kad::node::find_sources_kad(
                         &link.root_hash,
@@ -658,14 +690,20 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                         &params.cancel_token,
                     )
                     .await;
-                    if let Ok(peers) = kad_res {
-                        let mut seen: HashSet<Source> = merged.iter().copied().collect();
-                        for peer in peers {
-                            let src = Source::HighId(peer);
-                            if seen.insert(src) {
-                                merged.push(src);
+                    match kad_res {
+                        Ok(peers) => {
+                            let mut seen: HashSet<Source> = merged.iter().copied().collect();
+                            for peer in peers {
+                                let src = Source::HighId(peer);
+                                if seen.insert(src) {
+                                    merged.push(src);
+                                }
                             }
                         }
+                        Err(DownloadError::Cancelled) => {
+                            break 'outer Err(DownloadError::Cancelled);
+                        }
+                        Err(error) => log_info!("[ed2k] Kad source query failed: {}", error),
                     }
                 }
                 // 已被 integrity 拉黑的源不算可用源：否则每轮找源都会拿回同一批
@@ -708,7 +746,9 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                             DownloadError::Ed2k("no sources found for this ed2k file".into())
                         });
                     }
-                    let _ = params.db.update_task_status(&task_id, 5, "").await;
+                    if let Err(error) = params.db.update_task_status(&task_id, 5, "").await {
+                        break 'outer Err(error.into());
+                    }
                     let jitter_ms = (u64::from(source_retries) * 137)
                         % (SOURCE_RETRY_JITTER.as_millis() as u64).max(1);
                     // 竞速 cancel：重试等待期间被删除/暂停应立即响应，不空等 60s。
@@ -890,9 +930,10 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
             let avoid: HashSet<String> = params
                 .db
                 .list_active_sibling_file_names(&params.save_dir, &task_id)
-                .await
-                .map(|names| names.into_iter().map(|n| n.to_lowercase()).collect())
-                .unwrap_or_default();
+                .await?
+                .into_iter()
+                .map(|n| n.to_lowercase())
+                .collect();
             let final_name = finalize_rename(
                 &temp_path,
                 save_dir,
@@ -901,37 +942,28 @@ async fn run_ed2k_download_inner(params: &DownloadParams) -> Result<(i64, String
                 &avoid,
             )
             .await?;
-            persist_final_name(params, &task_id, &file_name, &final_name, total).await;
+            persist_final_name(params, &task_id, &file_name, &final_name, total).await?;
             Ok((total, final_name))
         }
         Err(e) => Err(e),
     }
 }
 
-/// finalize 占名换名后把实际文件名落库（先落盘、后更新指针）；失败只记日志，
-/// 完成信号仍携带新名。
+/// Persist the actual landed filename before publishing completion.
 async fn persist_final_name(
     params: &DownloadParams,
     task_id: &str,
     planned: &str,
     final_name: &str,
     total_bytes: i64,
-) {
-    if final_name == planned {
-        return;
+) -> Result<(), DownloadError> {
+    if final_name != planned {
+        params
+            .db
+            .update_task_file_info(task_id, final_name, total_bytes)
+            .await?;
     }
-    if let Err(e) = params
-        .db
-        .update_task_file_info(task_id, final_name, total_bytes)
-        .await
-    {
-        log_info!(
-            "[ed2k-download] task {} failed to persist finalize rename '{}': {}",
-            task_id,
-            final_name,
-            e
-        );
-    }
+    Ok(())
 }
 
 /// 进度旁路任务的 RAII 守卫：任何退出路径都终止内存快照上报。
@@ -1077,6 +1109,7 @@ fn spawn_progress_reporter(context: ProgressReporterContext) -> tokio::task::Joi
                 .await
                 .is_err()
             {
+                tracing::debug!("ED2K progress receiver closed during shutdown");
                 break;
             }
         }
@@ -1184,9 +1217,12 @@ async fn finalize_rename(
     allow_overwrite: bool,
     avoid: &HashSet<String>,
 ) -> Result<String, DownloadError> {
-    if let Ok(file) = tokio::fs::File::open(temp).await {
-        let _ = file.sync_all().await;
-    }
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(temp)
+        .await
+        .map_err(DownloadError::Io)?;
+    file.sync_all().await.map_err(DownloadError::Io)?;
     crate::downloader::claim_final_name(temp, save_dir, name, allow_overwrite, avoid).await
 }
 
@@ -1201,27 +1237,36 @@ fn resolve_file_name(param_name: &str, link_name: &str) -> String {
     crate::downloader::sanitize_filename(name)
 }
 
-/// 旧版本下载器总是用链接名建临时文件；若本任务的名字已与链接名不同（被 dedup
-/// 或自定义）且旧临时文件仍在、大小吻合、未被兄弟任务占用，则迁移过去以保住
-/// 已下载的块，否则接受一次性重下。
+/// Migrate a matching legacy temporary file without losing its verified blocks.
+/// Missing files are expected; other I/O errors must not start a second download.
 async fn adopt_legacy_temp(
     save_dir: &Path,
     link_name: &str,
     name: &str,
     total_bytes: u64,
     sibling_names: &HashSet<String>,
-) {
+) -> Result<(), DownloadError> {
     if name == link_name || sibling_names.contains(&link_name.to_lowercase()) {
-        return;
+        return Ok(());
     }
     let new_temp = save_dir.join(format!("{name}{}", crate::downloader::TEMP_EXT));
     let legacy_temp = save_dir.join(format!("{link_name}{}", crate::downloader::TEMP_EXT));
-    if tokio::fs::metadata(&new_temp).await.is_ok() {
-        return;
+    match tokio::fs::metadata(&new_temp).await {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
-    if matches!(tokio::fs::metadata(&legacy_temp).await, Ok(m) if m.len() == total_bytes) {
-        let _ = tokio::fs::rename(&legacy_temp, &new_temp).await;
+    match tokio::fs::metadata(&legacy_temp).await {
+        Ok(metadata) if metadata.is_file() && metadata.len() == total_bytes => {
+            tokio::fs::rename(&legacy_temp, &new_temp)
+                .await
+                .map_err(DownloadError::Io)?;
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1301,13 +1346,21 @@ mod tests {
     async fn finalize_rename_never_overwrites_existing_file() {
         use std::collections::HashSet;
         let dir = std::env::temp_dir().join(format!("ed2k_finalize_{}", std::process::id()));
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
         let Ok(()) = tokio::fs::create_dir_all(&dir).await else {
             panic!("create dir");
         };
-        let _ = tokio::fs::write(dir.join("movie.iso"), b"user data").await;
+        tokio::fs::write(dir.join("movie.iso"), b"user data")
+            .await
+            .unwrap_or_else(|error| panic!("test fixture write failed: {error}"));
         let temp = dir.join(format!("movie.iso{}", crate::downloader::TEMP_EXT));
-        let _ = tokio::fs::write(&temp, b"downloaded").await;
+        tokio::fs::write(&temp, b"downloaded")
+            .await
+            .unwrap_or_else(|error| panic!("test fixture write failed: {error}"));
 
         let Ok(chosen) =
             super::finalize_rename(&temp, &dir, "movie.iso", false, &HashSet::new()).await
@@ -1328,7 +1381,9 @@ mod tests {
 
         // overwrite 模式：原名被替换。
         let temp2 = dir.join(format!("movie.iso{}", crate::downloader::TEMP_EXT));
-        let _ = tokio::fs::write(&temp2, b"second").await;
+        tokio::fs::write(&temp2, b"second")
+            .await
+            .unwrap_or_else(|error| panic!("test fixture write failed: {error}"));
         let Ok(chosen2) =
             super::finalize_rename(&temp2, &dir, "movie.iso", true, &HashSet::new()).await
         else {
@@ -1341,7 +1396,11 @@ mod tests {
                 .unwrap_or_default(),
             b"second"
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1496,7 +1555,11 @@ mod tests {
             };
             assert_eq!(on_disk, data, "disk content must equal source data ({tag})");
 
-            let _ = std::fs::remove_dir_all(&dir);
+            if let Err(error) = std::fs::remove_dir_all(&dir)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+            }
         }
     }
 
@@ -1550,7 +1613,11 @@ mod tests {
         };
         assert_eq!(digest, hash::hash_part(&data));
         assert_eq!(observe.active(), 0);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：2. happy 多块，hashset_cache 跨块复用 ---
@@ -1627,7 +1694,11 @@ mod tests {
         };
         assert_eq!(on_disk, data);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：3. happy 压缩帧（单块） ---
@@ -1675,7 +1746,11 @@ mod tests {
         };
         assert_eq!(on_disk, data);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：4. 投毒 hashset → Ed2kIntegrity ---
@@ -1720,7 +1795,11 @@ mod tests {
             err.source
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：5. 越界分片 → Ed2kIntegrity ---
@@ -1765,7 +1844,11 @@ mod tests {
             err.source
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：6. 长度不符 → Ed2kIntegrity ---
@@ -1810,7 +1893,11 @@ mod tests {
             err.source
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：7. 连接失败 → 非 Ed2kIntegrity（Io/Ed2k） ---
@@ -1855,7 +1942,11 @@ mod tests {
             err.source
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- peer 层：8. cancel → Cancelled ---
@@ -1902,7 +1993,11 @@ mod tests {
             err.source
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- server 层：9. happy 找源，HighID 还原正确 ---
@@ -2033,7 +2128,11 @@ mod tests {
             panic!("finalize_and_verify must succeed on clean data: {e:?}");
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- 终验层：13. 磁盘坏块 → Ed2kIntegrity + 该块重置 missing ---
@@ -2110,7 +2209,11 @@ mod tests {
             }
         }
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- 终验层：14. hashset 缺失 → Ed2k（非 Integrity） ---
@@ -2158,7 +2261,11 @@ mod tests {
             "expected Ed2k, got {err:?}"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     // --- 终验层：15. happy 单块 + 单块坏字节 ---
@@ -2234,7 +2341,11 @@ mod tests {
             "corrupted single block must be reset to missing"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     #[test]
@@ -2281,7 +2392,11 @@ mod tests {
                 .is_empty()
         );
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     #[tokio::test]
@@ -2352,7 +2467,11 @@ mod tests {
                 .all(|(_, state, bytes, _)| *state == BLOCK_MISSING && *bytes == 0)
         );
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     #[tokio::test]
@@ -2381,7 +2500,11 @@ mod tests {
                 .is_none()
         );
         drop(db);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::log_warn!("[ED2K tests] fixture cleanup failed: {}", error);
+        }
     }
 
     #[tokio::test]

@@ -400,8 +400,13 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if let Err(error) = child.kill() {
+                eprintln!("failed to kill fluxdownd during test cleanup: {error}");
+            }
+            // 即使 kill 失败也要尝试回收进程；Drop 不能在已有 panic 时再次 panic。
+            if let Err(error) = child.wait() {
+                eprintln!("failed to reap fluxdownd during test cleanup: {error}");
+            }
         }
     }
 }

@@ -176,9 +176,16 @@ impl Ed2kClient {
 
     /// 注入/更新配置（hub 在启动与 config 变化时调用）。
     pub fn configure(&self, config: ClientConfig) {
-        if let Ok(mut g) = self.config.lock() {
-            *g = config;
-        }
+        let mut guard = self.config.lock().unwrap_or_else(|poison| {
+            log_error!(
+                "[ed2k-client] recovering poisoned configuration: {}",
+                poison
+            );
+            self.config.clear_poison();
+            poison.into_inner()
+        });
+        *guard = config;
+        drop(guard);
         self.session_changed.notify_one();
     }
 
@@ -234,8 +241,14 @@ impl Ed2kClient {
     fn fail_callbacks(&self, session: u64, oldest_only: bool, message: &str) {
         if let Ok(mut pending) = self.pending.lock() {
             while let Some(pos) = pending.iter().position(|entry| entry.session == session) {
-                if let Some(entry) = pending.remove(pos) {
-                    let _ = entry.sender.send(Err(DownloadError::Ed2k(message.into())));
+                if let Some(entry) = pending.remove(pos)
+                    && entry
+                        .sender
+                        .send(Err(DownloadError::Ed2k(message.into())))
+                        .is_err()
+                {
+                    // A timed-out or cancelled callback no longer has a receiver.
+                    tracing::debug!("ED2K callback receiver closed before session failure");
                 }
                 if oldest_only {
                     break;
@@ -269,7 +282,13 @@ impl Ed2kClient {
         if existing != 0 {
             return Ok(existing as u16);
         }
-        let want = self.config.lock().ok().map(|c| c.listen_port).unwrap_or(0);
+        let want = self
+            .config
+            .lock()
+            .map_err(|error| {
+                DownloadError::Ed2k(format!("listener config lock poisoned: {error}"))
+            })?
+            .listen_port;
         let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, want))
             .await
             .map_err(DownloadError::Io)?;
@@ -282,12 +301,12 @@ impl Ed2kClient {
         log_info!("[ed2k-client] listener bound on port {}", port);
 
         // UPnP：若启用，映射监听端口争取 HighID（best-effort，失败回退 LowID）。
-        let (enable_upnp, udp_port) = self
-            .config
-            .lock()
-            .ok()
-            .map(|c| (c.enable_upnp, c.udp_port))
-            .unwrap_or((false, 0));
+        let (enable_upnp, udp_port) = {
+            let config = self.config.lock().map_err(|error| {
+                DownloadError::Ed2k(format!("UPnP config lock poisoned: {error}"))
+            })?;
+            (config.enable_upnp, config.udp_port)
+        };
         if enable_upnp {
             let this = Arc::clone(self);
             tokio::spawn(async move {
@@ -413,9 +432,9 @@ impl Ed2kClient {
         let servers = self
             .config
             .lock()
-            .ok()
-            .map(|c| c.servers.clone())
-            .unwrap_or_default();
+            .map_err(|error| DownloadError::Ed2k(format!("server config lock poisoned: {error}")))?
+            .servers
+            .clone();
         if servers.is_empty() {
             return Err(DownloadError::Ed2k("no ed2k servers configured".into()));
         }
@@ -506,31 +525,43 @@ impl Ed2kClient {
         large_file: bool,
     ) -> Result<Vec<Source>, DownloadError> {
         // 保持持久会话（供 LowID callback 中转）+ 监听器就绪，best-effort。
-        let listen_port = self.ensure_listener().await.unwrap_or(0);
-        let _ = self.ensure_server_session().await;
+        let listen_port = match self.ensure_listener().await {
+            Ok(port) => port,
+            Err(error) => {
+                log_info!(
+                    "[ed2k-client] listener unavailable; querying sources without callbacks: {}",
+                    error
+                );
+                0
+            }
+        };
+        if let Err(error) = self.ensure_server_session().await {
+            log_info!(
+                "[ed2k-client] persistent session unavailable; using standalone source queries: {}",
+                error
+            );
+        }
 
         let servers = self
             .config
             .lock()
-            .ok()
-            .map(|c| c.servers.clone())
-            .unwrap_or_default();
+            .map_err(|error| DownloadError::Ed2k(format!("server config lock poisoned: {error}")))?
+            .servers
+            .clone();
         if servers.is_empty() {
             return Err(DownloadError::Ed2k("no ed2k servers configured".into()));
         }
 
         // 并发对多台服务器发 GETSOURCES 并聚合：不同服务器索引不同文件，
         // 单服务器常常没有目标文件（实测 45.82.80.155 无此文件而 77.42.68.79 有）。
-        let mut join: JoinSet<Vec<(u32, u16)>> = JoinSet::new();
+        let mut join: JoinSet<Result<Vec<(u32, u16)>, DownloadError>> = JoinSet::new();
         for server in servers.into_iter().take(MAX_QUERY_SERVERS) {
             let Some((host, port)) = parse_hostport(&server) else {
                 continue;
             };
             let hash = *file_hash;
             join.spawn(async move {
-                query_one_server(&host, port, listen_port, &hash, total_bytes, large_file)
-                    .await
-                    .unwrap_or_default()
+                query_one_server(&host, port, listen_port, &hash, total_bytes, large_file).await
             });
         }
 
@@ -538,8 +569,31 @@ impl Ed2kClient {
         let am_high = self.is_high_id();
         let mut seen: HashSet<Source> = HashSet::new();
         let mut out = Vec::new();
+        let mut query_succeeded = false;
+        let mut first_error = None;
         while let Some(res) = join.join_next().await {
-            let Ok(raw) = res else { continue };
+            let raw = match res {
+                Ok(Ok(sources)) => {
+                    query_succeeded = true;
+                    sources
+                }
+                Ok(Err(error)) => {
+                    log_info!("[ed2k-client] server source query failed: {}", error);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+                Err(error) if error.is_cancelled() => {
+                    tracing::debug!("ED2K source query cancelled during shutdown");
+                    return Err(DownloadError::Cancelled);
+                }
+                Err(error) => {
+                    return Err(DownloadError::Ed2k(format!(
+                        "source query task panicked: {error}"
+                    )));
+                }
+            };
             for (id, port) in raw {
                 if id >= LOWID_THRESHOLD {
                     if port == 0 || id == my_id {
@@ -560,6 +614,9 @@ impl Ed2kClient {
                     }
                 }
             }
+        }
+        if !query_succeeded && let Some(error) = first_error {
+            return Err(error);
         }
         log_info!(
             "[ed2k-client] find_sources: {} sources aggregated across servers",
@@ -592,12 +649,20 @@ async fn handle_inbound(
 
     let client_id = parse_hello_client_id(proto_byte, opcode, &payload);
     if let Some(id) = client_id {
-        let waiter = pending.lock().ok().and_then(|mut queue| {
-            let pos = queue.iter().position(|entry| entry.id == id)?;
-            queue.remove(pos)
-        });
+        let waiter = {
+            let mut queue = pending.lock().map_err(|error| {
+                DownloadError::Ed2k(format!("callback queue lock poisoned: {error}"))
+            })?;
+            queue
+                .iter()
+                .position(|entry| entry.id == id)
+                .and_then(|pos| queue.remove(pos))
+        };
         if let Some(entry) = waiter {
-            let _ = entry.sender.send(Ok(stream));
+            if entry.sender.send(Ok(stream)).is_err() {
+                // Cancellation won the race with delivery; the returned socket is closed.
+                tracing::debug!("ED2K callback receiver closed before inbound delivery");
+            }
             return Ok(());
         }
     }

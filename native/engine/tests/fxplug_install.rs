@@ -28,6 +28,13 @@ fn fxplug_installs_via_zip_pipeline() {
     assert_eq!(identity, expected);
     assert!(work.join(&identity).join("manifest.json").exists());
     assert!(work.join(&identity).join("resolve.js").exists());
-    let _ = std::fs::remove_dir_all(&work);
+
+    if let Err(error) = std::fs::remove_dir_all(&work) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     eprintln!("OK: .fxplug 经 zip crate 安装管线成功，identity={identity}");
 }

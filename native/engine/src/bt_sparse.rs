@@ -228,7 +228,14 @@ mod tests {
             "sparse attribute must survive set_len"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "remove sparse-file test directory {}: {error}",
+                dir.display()
+            );
+        }
     }
 
     #[test]
@@ -237,6 +244,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let err = mark_sparse(&dir.join("no_such_file.bin")).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "remove sparse-file test directory {}: {error}",
+                dir.display()
+            );
+        }
     }
 }

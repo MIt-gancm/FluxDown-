@@ -5,6 +5,7 @@
 ## Blocker（打断）
 - crate 边界破坏：engine/api/server 引入 rinf 或 Dart 依赖
 - 非测试 Rust 代码出现 unwrap/expect/unsafe/通配导入
+- 任意 Rust 代码出现 `todo!` / `unimplemented!`、静默丢弃 `Result` / `Future`，或通过忽错 lint 的 `allow` / 命令行降低 lint 等级绕过门禁（测试代码同样适用；见 `rule://no-ignored-errors-in-rust`）
 - 手编 `lib/src/bindings/` 生成物
 - SQL 绕过 `db.rs::Db` 或非 `$N` 占位符
 - 未经用户要求的 git commit/push/tag；执行 `flutter run -d windows`

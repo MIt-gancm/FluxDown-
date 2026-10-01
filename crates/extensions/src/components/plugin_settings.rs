@@ -226,14 +226,18 @@ impl PluginSettingsForm {
         let future = update_plugin_settings(&self.port, &self.identity, entries);
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.saving = false;
                 match result {
                     Ok(_) => window.close_dialog(cx),
                     Err(error) => this.apply_server_error(&error, cx),
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -402,11 +406,15 @@ impl PluginSettingsForm {
                 && let Some(path) = paths.first()
             {
                 let text = path.display().to_string();
-                let _ = this.update(cx, |this, cx| {
+
+                let Ok(()) = this.update(cx, |this, cx| {
                     this.controls[index] = FieldControl::Folder(text);
                     this.clear_error(index);
                     cx.notify();
-                });
+                }) else {
+                    // 扩展视图已释放，结束回调，不再更新状态。
+                    return;
+                };
             }
         })
         .detach();

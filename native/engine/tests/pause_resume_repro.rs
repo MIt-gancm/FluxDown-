@@ -133,7 +133,18 @@ async fn handle_conn(
         stream
             .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -142,7 +153,18 @@ async fn handle_conn(
             "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nAccept-Ranges: bytes\r\nETag: {etag}\r\nLast-Modified: {lm}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(h.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+
+        if let Err(error) = stream.shutdown().await
+            && !matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+            )
+        {
+            return Err(error);
+        }
         return Ok(());
     }
 
@@ -154,7 +176,18 @@ async fn handle_conn(
                     "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{total}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
                 );
                 stream.write_all(h.as_bytes()).await?;
-                let _ = stream.shutdown().await;
+
+                if let Err(error) = stream.shutdown().await
+                    && !matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::NotConnected
+                    )
+                {
+                    return Err(error);
+                }
                 return Ok(());
             }
             gauge.range_gets.fetch_add(1, Ordering::SeqCst);
@@ -182,7 +215,18 @@ async fn handle_conn(
             if track {
                 gauge.exit();
             }
-            let _ = stream.shutdown().await;
+
+            if let Err(error) = stream.shutdown().await
+                && !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                )
+            {
+                return Err(error);
+            }
         }
         None => {
             gauge.full_gets.fetch_add(1, Ordering::SeqCst);
@@ -201,7 +245,18 @@ async fn handle_conn(
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
             gauge.exit();
-            let _ = stream.shutdown().await;
+
+            if let Err(error) = stream.shutdown().await
+                && !matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::NotConnected
+                )
+            {
+                return Err(error);
+            }
         }
     }
     Ok(())
@@ -230,7 +285,14 @@ async fn run_scenario(
 ) -> ScenarioResult {
     let work_dir =
         std::env::temp_dir().join(format!("fluxdown_pr_{}_{}", name, std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     // 8 MiB body，慢速服务器（~800KB/s/连接）给出充足的暂停窗口。
@@ -251,7 +313,18 @@ async fn run_scenario(
                 let b = body.clone();
                 let g = gauge.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, b, g).await;
+                    if let Err(error) = handle_conn(stream, b, g).await {
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ),
+                            "test server connection failed: {error}"
+                        );
+                    }
                 });
             }
         });
@@ -476,7 +549,14 @@ async fn run_change_segments(
 ) -> CsResult {
     let work_dir =
         std::env::temp_dir().join(format!("fluxdown_cs_{}_{}", name, std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
 
     let size = 6 * 1024 * 1024usize;
@@ -496,7 +576,18 @@ async fn run_change_segments(
                 let b = body.clone();
                 let g = gauge.clone();
                 tokio::spawn(async move {
-                    let _ = handle_conn(stream, b, g).await;
+                    if let Err(error) = handle_conn(stream, b, g).await {
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::UnexpectedEof
+                            ),
+                            "test server connection failed: {error}"
+                        );
+                    }
                 });
             }
         });

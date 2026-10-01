@@ -1378,10 +1378,12 @@ async fn run_socket(
                 } else {
                     "agent-shutdown"
                 };
-                let _ = socket.send(Message::Close(Some(CloseFrame {
+                if let Err(error) = socket.send(Message::Close(Some(CloseFrame {
                     code: 1001,
                     reason: reason.into(),
-                }))).await;
+                }))).await {
+                    tracing::debug!(%error, "gateway peer closed before shutdown frame");
+                }
                 break;
             }
             incoming = socket.next() => {
@@ -1397,7 +1399,10 @@ async fn run_socket(
                 if !ready && request.method == method::SYSTEM_SHUTDOWN && request.validate().is_ok() {
                     // 握手前也受理：协议版本不兼容的新桌面程序靠它替换旧 agent。
                     let response = RpcResponse::success(request.id, serde_json::json!({ "ok": true }));
-                    let _ = send_response(&mut socket, response).await;
+                    if send_response(&mut socket, response).await.is_err() {
+                        tracing::debug!("gateway shutdown acknowledgement failed; quit not requested");
+                        break;
+                    }
                     service.local.lifecycle.request_quit();
                     continue;
                 }
@@ -1442,7 +1447,9 @@ async fn run_socket(
                         if socket.send(Message::Text(text.into())).await.is_err() { break; }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        let _ = socket.send(Message::Close(Some(CloseFrame { code: 4009, reason: "event-gap".into() }))).await;
+                        if let Err(error) = socket.send(Message::Close(Some(CloseFrame { code: 4009, reason: "event-gap".into() }))).await {
+                            tracing::debug!(%error, "gateway peer closed before event-gap frame");
+                        }
                         break;
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -1627,8 +1634,10 @@ impl RequestLanes {
                     tokio::spawn(async move {
                         let response = service.call(request).await;
                         drop(permit);
-                        // 连接已关闭时响应无处可发，丢弃即可。
-                        let _ = responses.send(response).await;
+                        // 连接关闭会丢弃接收端；正常生命周期，不升级为警告。
+                        if responses.send(response).await.is_err() {
+                            tracing::trace!("gateway connection closed before concurrent response");
+                        }
                     });
                 }
             });
@@ -1753,7 +1762,9 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), %error, "bearer test cleanup failed");
+        }
     }
 
     struct TestGateway {
@@ -1908,7 +1919,9 @@ mod tests {
             drop(service);
             drop(state);
             drop(store);
-            let _ = tokio::fs::remove_dir_all(dir).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(path = %dir.display(), %error, "gateway test cleanup failed");
+            }
         }
 
         async fn patch_gateway(&self, params: serde_json::Value) -> serde_json::Value {

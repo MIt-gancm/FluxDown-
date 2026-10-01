@@ -55,16 +55,77 @@ async fn start_server(video: Arc<Vec<u8>>, audio: Arc<Vec<u8>>) -> String {
                     let h = format!(
                         "HTTP/1.1 206 Partial Content\r\nContent-Length: 1\r\nContent-Range: bytes 0-0/{total}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
                     );
-                    let _ = stream.write_all(h.as_bytes()).await;
-                    let _ = stream.write_all(&body[..1]).await;
+
+                    stream
+                        .write_all(h.as_bytes())
+                        .await
+                        .unwrap_or_else(|error| {
+                            assert!(
+                                matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                ),
+                                "test server response failed: {error}"
+                            );
+                        });
+
+                    stream.write_all(&body[..1]).await.unwrap_or_else(|error| {
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ),
+                            "test server response failed: {error}"
+                        );
+                    });
                 } else {
                     let h = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {total}\r\nConnection: close\r\n\r\n"
                     );
-                    let _ = stream.write_all(h.as_bytes()).await;
-                    let _ = stream.write_all(body).await;
+
+                    stream
+                        .write_all(h.as_bytes())
+                        .await
+                        .unwrap_or_else(|error| {
+                            assert!(
+                                matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::ConnectionAborted
+                                ),
+                                "test server response failed: {error}"
+                            );
+                        });
+
+                    stream.write_all(body).await.unwrap_or_else(|error| {
+                        assert!(
+                            matches!(
+                                error.kind(),
+                                std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                            ),
+                            "test server response failed: {error}"
+                        );
+                    });
                 }
-                let _ = stream.flush().await;
+
+                stream.flush().await.unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             });
         }
     });
@@ -80,7 +141,14 @@ async fn track_pair_reports_midway_progress_with_real_total() {
     let base = start_server(video.clone(), audio.clone()).await;
 
     let work_dir = std::env::temp_dir().join("fluxdown-rt-trackpair");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
     let db = Db::open(&work_dir).await.expect("db");
     db.insert_task(
@@ -147,7 +215,10 @@ async fn track_pair_reports_midway_progress_with_real_total() {
     };
 
     fluxdown_engine::dash_downloader::run_dash_download(params).await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
 
     let summary: Vec<(i32, i64, i64)> = {
         let updates = updates.lock().expect("lock");
@@ -180,5 +251,9 @@ async fn track_pair_reports_midway_progress_with_real_total() {
     let meta = tokio::fs::metadata(&video_out).await.expect("video output");
     assert_eq!(meta.len() as usize, video.len(), "video track byte-exact");
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

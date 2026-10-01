@@ -146,7 +146,7 @@ async fn handle_conn(mut stream: TcpStream, body: Arc<Vec<u8>>) -> std::io::Resu
              Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
         );
         stream.write_all(h.as_bytes()).await?;
-        let _ = stream.shutdown().await;
+        stream.shutdown().await?;
         return Ok(());
     }
 
@@ -168,7 +168,7 @@ async fn handle_conn(mut stream: TcpStream, body: Arc<Vec<u8>>) -> std::io::Resu
                      Content-Length: 0\r\nConnection: close\r\n\r\n"
                 );
                 stream.write_all(h.as_bytes()).await?;
-                let _ = stream.shutdown().await;
+                stream.shutdown().await?;
                 return Ok(());
             }
             let slice = &body[start as usize..=end as usize];
@@ -193,7 +193,7 @@ async fn handle_conn(mut stream: TcpStream, body: Arc<Vec<u8>>) -> std::io::Resu
             }
         }
     }
-    let _ = stream.shutdown().await;
+    stream.shutdown().await?;
     Ok(())
 }
 
@@ -225,7 +225,9 @@ async fn start_server(body: Arc<Vec<u8>>) -> TestServer {
         while let Ok((stream, _peer)) = listener.accept().await {
             let b = body.clone();
             tokio::spawn(async move {
-                let _ = handle_conn(stream, b).await;
+                if let Err(error) = handle_conn(stream, b).await {
+                    eprintln!("smoke HTTP connection failed: {error}");
+                }
             });
         }
     });
@@ -388,7 +390,11 @@ async fn desktop_regression_smoke() {
         "fluxdown_desktop_regression_smoke_{}",
         std::process::id()
     ));
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    match tokio::fs::remove_dir_all(&work_dir).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("remove stale smoke directory: {error}"),
+    }
     tokio::fs::create_dir_all(&work_dir)
         .await
         .expect("create work dir");
@@ -593,5 +599,7 @@ async fn desktop_regression_smoke() {
         "downloaded file must be byte-identical to source"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        eprintln!("remove smoke directory failed: {error}");
+    }
 }

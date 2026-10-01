@@ -90,9 +90,12 @@ impl DownloadView {
                                 .on_click({
                                     let view = view.clone();
                                     move |_, _, cx| {
-                                        let _ = view.update(cx, |this, cx| {
+                                        let Ok(()) = view.update(cx, |this, cx| {
                                             this.execute_toolbar(ToolbarCommand::Delete, cx);
-                                        });
+                                        }) else {
+                                            // 视图已释放，结束这次回调而不再更新状态。
+                                            return;
+                                        };
                                     }
                                 }),
                         )
@@ -102,9 +105,12 @@ impl DownloadView {
                                 .on_click({
                                     let view = view.clone();
                                     move |_, window, cx| {
-                                        let _ = view.update(cx, |this, cx| {
+                                        let Ok(()) = view.update(cx, |this, cx| {
                                             this.delete_selected_with_files(window, cx);
-                                        });
+                                        }) else {
+                                            // 视图已释放，结束这次回调而不再更新状态。
+                                            return;
+                                        };
                                     }
                                 }),
                         )

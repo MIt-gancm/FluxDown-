@@ -365,7 +365,7 @@ impl CloudClient {
     }
 
     /// 退出登录：持有刷新锁完成「服务端吊销 + 本地清除」，避免与刷新竞态导致会话复活。
-    /// 服务端吊销失败也会清除本地会话，并把吊销错误返回给调用方。
+    /// 服务端吊销失败也会清除本地会话；清理同时失败时保留先发生的吊销错误并记录落盘错误。
     pub async fn logout(&self) -> Result<(), CloudError> {
         let _guard = self.refresh.lock().await;
         let (access_token, refresh_token) = {
@@ -382,10 +382,19 @@ impl CloudClient {
         };
         let remote = self.revoke_on_server(&access_token, &refresh_token).await;
         // 吊销途中刷新令牌被拒时会话已被清除，不重复清理 / 通知。
-        if self.state.lock().await.credentials.is_some() {
-            self.clear_session_locked(None).await?;
+        let cleanup = if self.state.lock().await.credentials.is_some() {
+            self.clear_session_locked(None).await
+        } else {
+            Ok(())
+        };
+        match (remote, cleanup) {
+            (Err(error), Err(cleanup_error)) => {
+                tracing::error!(error = %cleanup_error, "could not persist local logout after server revocation failed");
+                Err(error)
+            }
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), cleanup) => cleanup,
         }
-        remote
     }
 
     /// 调用方必须持有 `self.refresh` 锁：access 过期时先刷新再吊销。
@@ -939,7 +948,9 @@ mod tests {
                 refreshes: refreshes.clone(),
             });
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve refresh mock");
         });
 
         let dir = std::env::temp_dir().join(format!(
@@ -974,7 +985,10 @@ mod tests {
         assert_eq!(first.expect("first replay")["ok"], true);
         assert_eq!(second.expect("second replay")["ok"], true);
         assert_eq!(refreshes.load(Ordering::SeqCst), 1);
-        let _ = std::fs::remove_dir_all(dir);
+        drop(client);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %error, "remove refresh test directory");
+        }
     }
 
     #[tokio::test]
@@ -987,7 +1001,9 @@ mod tests {
             .route("/api/v1/test", get(protected))
             .route("/api/v1/auth/refresh", post(reject_refresh));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve revoked refresh mock");
         });
 
         let dir = std::env::temp_dir().join(format!(
@@ -1034,7 +1050,9 @@ mod tests {
         drop(client);
         drop(state);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove revoked refresh test directory");
+        }
     }
 
     async fn whoami(State(name): State<&'static str>) -> Response {
@@ -1050,7 +1068,9 @@ mod tests {
             .route("/api/v1/whoami", get(whoami))
             .with_state(name);
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve named cloud mock");
         });
         format!("http://{address}")
     }
@@ -1123,7 +1143,9 @@ mod tests {
         drop(restored);
         drop(state);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove endpoint test directory");
+        }
     }
 
     /// 服务端一次性轮换：refresh token 用过即作废，复用返回 401。
@@ -1191,7 +1213,9 @@ mod tests {
             .route("/api/v1/auth/refresh", post(rotating_refresh))
             .with_state(cloud.clone());
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve rotating cloud mock");
         });
 
         let dir = std::env::temp_dir().join(format!(
@@ -1236,7 +1260,9 @@ mod tests {
         drop(client);
         drop(state);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove rotation test directory");
+        }
     }
 
     // ───────────────────────── 错误 reason 映射 ─────────────────────────
@@ -1439,7 +1465,47 @@ mod tests {
         );
         drop(client);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove unreachable cloud test directory");
+        }
+    }
+
+    #[tokio::test]
+    async fn logout_preserves_server_failure_when_local_persistence_also_fails() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind closed cloud");
+        let address = listener.local_addr().expect("closed cloud address");
+        drop(listener);
+        let (client, state, store, dir) = temp_client(
+            "logout_both_fail",
+            format!("http://{address}"),
+            Some(credentials_of("u1", "refresh")),
+        )
+        .await;
+        tokio::fs::create_dir(dir.join("agent-state.json"))
+            .await
+            .expect("block state persistence");
+        let error = client
+            .logout()
+            .await
+            .expect_err("remote and local logout must fail");
+        assert!(
+            error.unreachable,
+            "server network error must remain the primary failure"
+        );
+        assert!(
+            state.lock().await.credentials.is_none(),
+            "local in-memory session must still be cleared"
+        );
+        assert!(
+            dir.join("agent-state.json").is_dir(),
+            "failed save must not replace its destination"
+        );
+        drop(client);
+        drop(state);
+        drop(store);
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "could not remove logout failure test directory");
+        }
     }
 
     fn session_of(user_id: &str) -> fluxdown_protocol::AgentSessionDto {
@@ -1478,15 +1544,30 @@ mod tests {
             .await
             .expect("bind mock cloud");
         let address = listener.local_addr().expect("address");
+        let refresh_started = Arc::new(tokio::sync::Notify::new());
         let app = Router::new()
             .route("/api/v1/test", get(protected))
-            .route("/api/v1/auth/refresh", post(slow_refresh))
+            .route(
+                "/api/v1/auth/refresh",
+                post({
+                    let refresh_started = refresh_started.clone();
+                    move || {
+                        let refresh_started = refresh_started.clone();
+                        async move {
+                            refresh_started.notify_one();
+                            slow_refresh().await
+                        }
+                    }
+                }),
+            )
             .route(
                 "/api/v1/auth/logout",
                 post(|| async { StatusCode::NO_CONTENT }),
             );
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve logout race mock");
         });
         let (client, state, store, dir) = temp_client(
             "logout_race",
@@ -1502,16 +1583,29 @@ mod tests {
                     .await
             })
         };
-        // 让请求先拿到刷新锁，再登出。
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let _ = client.logout().await;
-        let _ = request.await.expect("join request");
+        // The server observes refresh only after the request holds the refresh lock.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh_started.notified(),
+        )
+        .await
+        .expect("request enters refresh before logout");
+        client.logout().await.expect("logout after refresh");
+        assert_eq!(
+            request
+                .await
+                .expect("join request")
+                .expect("replayed request")["ok"],
+            true
+        );
         assert!(state.lock().await.credentials.is_none(), "logout wins");
         assert!(store.load().await.expect("reload").credentials.is_none());
         drop(client);
         drop(state);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove logout race test directory");
+        }
     }
 
     /// 登出 / 撤销清理账号维度状态：同步数据按账号暂存、远程任务与绑定丢弃，并推送清空事件。
@@ -1522,7 +1616,9 @@ mod tests {
             .expect("bind mock cloud");
         let address = listener.local_addr().expect("address");
         tokio::spawn(async move {
-            let _ = axum::serve(listener, Router::new()).await;
+            axum::serve(listener, Router::new())
+                .await
+                .expect("serve session clear mock");
         });
         let (client, state, store, dir) = temp_client(
             "clear_scope",
@@ -1574,14 +1670,27 @@ mod tests {
         drop(client);
         drop(state);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove session clear test directory");
+        }
     }
 
     fn recorded_session_events(
         receiver: &mut tokio::sync::broadcast::Receiver<fluxdown_protocol::EventFrame>,
     ) -> Vec<String> {
         let mut seen = Vec::new();
-        while let Ok(frame) = receiver.try_recv() {
+        loop {
+            let frame = match receiver.try_recv() {
+                Ok(frame) => frame,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    tracing::debug!("session event receiver closed after test publisher shutdown");
+                    break;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                    panic!("session event assertion missed {skipped} events");
+                }
+            };
             if let fluxdown_protocol::ServiceEvent::Agent(event) = frame.event {
                 match event {
                     fluxdown_protocol::AgentEvent::SessionRevoked(reason) => {
@@ -1621,7 +1730,9 @@ mod tests {
             )
             .route("/api/v1/auth/refresh", post(reject_refresh));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve session revocation mock");
         });
 
         // 用户登出：access 过期 → 刷新被拒，仍然不是「被撤销」。
@@ -1635,7 +1746,10 @@ mod tests {
             crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
         let client = client.with_events(events.clone());
         let (mut receiver, _) = events.subscribe_and_snapshot();
-        let _ = client.logout().await;
+        client
+            .logout()
+            .await
+            .expect("logout with rejected refresh clears session");
         assert_eq!(recorded_session_events(&mut receiver), ["session:false"]);
 
         // 普通请求遇到刷新令牌被拒（401）→ sessionExpired，且先于 SessionChanged(None)。
@@ -1649,10 +1763,11 @@ mod tests {
             crate::event_hub::AgentEventHub::new(fluxdown_protocol::AgentSnapshot::default());
         let client = client.with_events(events.clone());
         let (mut receiver, _) = events.subscribe_and_snapshot();
-        let _ = client
+        let error = client
             .authenticated::<Value, Value>(reqwest::Method::GET, "/api/v1/test", None)
             .await
             .expect_err("rejected refresh");
+        assert_eq!(error.status, Some(401));
         assert_eq!(
             recorded_session_events(&mut receiver),
             ["revoked:SessionExpired", "session:false"]
@@ -1667,7 +1782,9 @@ mod tests {
             .route("/api/v1/test", get(protected))
             .route("/api/v1/auth/refresh", post(forbidden_refresh));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            axum::serve(listener, app)
+                .await
+                .expect("serve disabled account mock");
         });
         let (client, _state3, store3, dir3) = temp_client(
             "account_disabled",
@@ -1708,7 +1825,9 @@ mod tests {
         drop(store3);
         drop(store4);
         for dir in [dir, dir2, dir3, dir4] {
-            let _ = tokio::fs::remove_dir_all(dir).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(path = %dir.display(), error = %error, "remove session event test directory");
+            }
         }
     }
 }

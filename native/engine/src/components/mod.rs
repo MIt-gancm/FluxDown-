@@ -394,12 +394,24 @@ pub(crate) async fn download_to_file(
     let actual = match download_to_file_from(client, url, dest, progress).await {
         Ok(actual) => actual,
         Err(e) => {
-            let _ = tokio::fs::remove_file(dest).await;
+            if let Err(cleanup_error) = tokio::fs::remove_file(dest).await
+                && cleanup_error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning(
+                    "components",
+                    "remove_failed_download",
+                    &cleanup_error,
+                );
+            }
             return Err(e);
         }
     };
     if !actual.eq_ignore_ascii_case(expected_sha256) {
-        let _ = tokio::fs::remove_file(dest).await;
+        if let Err(error) = tokio::fs::remove_file(dest).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            crate::logger::report_warning("components", "remove_unverified_download", &error);
+        }
         return Err(ComponentError::Verify(format!(
             "sha256 mismatch for downloaded component (expected {expected_sha256}, got {actual})"
         )));
@@ -502,7 +514,7 @@ mod tests {
         ];
         let found = super::find_in_dirs(dirs, name);
         let none = super::find_in_dirs([first, second], "fluxdown-definitely-not-installed");
-        let _ = std::fs::remove_dir_all(&root);
+        std::fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(found, Some(root.join("second").join(name)));
         assert_eq!(none, None);

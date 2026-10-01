@@ -168,7 +168,8 @@ impl RssView {
         self.load_error = false;
         cx.spawn(async move |view, cx| {
             let result = load.future.await;
-            let _ = view.update(cx, |this, cx| {
+
+            let Ok(()) = view.update(cx, |this, cx| {
                 let current = this.controller.selected_source.as_deref() == Some(&load.source_id)
                     && this.controller.revision == load.revision;
                 if current {
@@ -182,7 +183,10 @@ impl RssView {
                     }
                     cx.notify();
                 }
-            });
+            }) else {
+                // 订阅视图已释放，结束回调，不再提交后续操作。
+                return;
+            };
         })
         .detach();
     }
@@ -218,7 +222,8 @@ impl RssView {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = future.await;
-            let _ = view.update(cx, |this, cx| {
+
+            let Ok(()) = view.update(cx, |this, cx| {
                 if this.controller.action_epoch != epoch
                     || this.controller.selected_source.as_deref() != Some(&id)
                 {
@@ -235,7 +240,10 @@ impl RssView {
                     Ok(_) => this.fetch_items(cx),
                 }
                 cx.notify();
-            });
+            }) else {
+                // 订阅视图已释放，结束回调，不再提交后续操作。
+                return;
+            };
         })
         .detach();
     }
@@ -253,7 +261,8 @@ impl RssView {
         cx.notify();
         cx.spawn(async move |view, cx| {
             let result = future.await;
-            let _ = view.update(cx, |this, cx| {
+
+            let Ok(()) = view.update(cx, |this, cx| {
                 if this.controller.action_epoch != epoch
                     || this.controller.selected_source.as_deref() != Some(&id)
                 {
@@ -266,7 +275,10 @@ impl RssView {
                     this.fetch_items(cx);
                 }
                 cx.notify();
-            });
+            }) else {
+                // 订阅视图已释放，结束回调，不再提交后续操作。
+                return;
+            };
         })
         .detach();
     }
@@ -304,13 +316,18 @@ impl RssView {
                 } else {
                     failed += 1;
                 }
-                let _ = view.update(cx, |this, cx| {
+
+                let Ok(()) = view.update(cx, |this, cx| {
                     this.controller
                         .finish_action(&source_id, &guid, epoch, result.is_ok());
                     cx.notify();
-                });
+                }) else {
+                    // 订阅视图已释放，结束回调，不再提交后续操作。
+                    return;
+                };
             }
-            let _ = view.update(cx, |this, cx| {
+
+            let Ok(()) = view.update(cx, |this, cx| {
                 if this.controller.action_epoch == epoch
                     && this.controller.selected_source.as_deref() == Some(&source_id)
                 {
@@ -331,7 +348,10 @@ impl RssView {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 订阅视图已释放，结束回调，不再提交后续操作。
+                return;
+            };
         })
         .detach();
     }
@@ -364,26 +384,31 @@ impl RssView {
                     cx,
                 ))
                 .on_ok(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
+                    // 已释放或不可提交的订阅页不能让确认框报告成功。
+                    view.update(cx, |this, cx| {
                         if this.controller.stale || this.controller.delete_busy {
-                            return;
+                            return false;
                         }
                         this.controller.delete_busy = true;
                         let future = this.controller.delete(source_id.clone());
                         cx.spawn(async move |view, cx| {
                             let result = future.await;
-                            let _ = view.update(cx, |this, cx| {
+                            let Ok(()) = view.update(cx, |this, cx| {
                                 this.controller.delete_busy = false;
                                 if result.is_err() {
                                     this.fail(cx);
                                 }
                                 cx.notify();
-                            });
+                            }) else {
+                                // 订阅页已释放，停止回写删除结果。
+                                return;
+                            };
                         })
                         .detach();
                         cx.notify();
-                    });
-                    true
+                        true
+                    })
+                    .unwrap_or(false)
                 })
         });
     }

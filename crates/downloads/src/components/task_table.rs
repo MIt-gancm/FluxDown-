@@ -448,7 +448,11 @@ fn group_menu_item(
         .icon(icon)
         .on_click(move |_, _, cx| {
             let group_id = group_id.clone();
-            let _ = host.update(cx, |view, cx| action(view, group_id, cx));
+
+            let Ok(()) = host.update(cx, |view, cx| action(view, group_id, cx)) else {
+                // 视图已释放，结束这次回调而不再更新状态。
+                return;
+            };
         })
 }
 
@@ -466,7 +470,11 @@ fn group_menu_item_windowed(
         .icon(icon)
         .on_click(move |_, window, cx| {
             let group_id = group_id.clone();
-            let _ = host.update(cx, |view, cx| action(view, group_id, window, cx));
+
+            let Ok(()) = host.update(cx, |view, cx| action(view, group_id, window, cx)) else {
+                // 视图已释放，结束这次回调而不再更新状态。
+                return;
+            };
         })
 }
 
@@ -1698,7 +1706,8 @@ impl DownloadTableDelegate {
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
                     let key = key.clone();
-                    let _ = host.update(cx, |view, cx| {
+
+                    let Ok(()) = host.update(cx, |view, cx| {
                         let Some(command) = action.command() else {
                             view.show_row_detail(key, window, cx);
                             return;
@@ -1711,7 +1720,10 @@ impl DownloadTableDelegate {
                         if let Some(command) = command {
                             view.execute_commands(vec![command], cx);
                         }
-                    });
+                    }) else {
+                        // 视图已释放，结束这次回调而不再更新状态。
+                        return;
+                    };
                 })
                 .child(Icon::new(icon).size(extended.icon.md))
         });
@@ -1770,7 +1782,10 @@ impl DownloadTableDelegate {
             // 折叠记忆随视图偏好持久化；表格实体此刻正被更新，放到帧外调用。
             if let Some(host) = delegate.host.clone() {
                 cx.defer(move |cx| {
-                    let _ = host.update(cx, |view, cx| view.schedule_persist_prefs(cx));
+                    let Ok(()) = host.update(cx, |view, cx| view.schedule_persist_prefs(cx)) else {
+                        // 视图已释放，结束这次回调而不再更新状态。
+                        return;
+                    };
                 });
             }
             table.refresh(cx);
@@ -1901,9 +1916,13 @@ impl DownloadTableDelegate {
                         .icon(FluxIcon::CircleAlert)
                         .on_click(move |_, window, cx| {
                             let task_id = task_id.clone();
-                            let _ = host.update(cx, |view, cx| {
+
+                            let Ok(()) = host.update(cx, |view, cx| {
                                 view.confirm_ignore_plugin_retry(task_id, window, cx);
-                            });
+                            }) else {
+                                // 视图已释放，结束这次回调而不再更新状态。
+                                return;
+                            };
                         }),
                 )
             }
@@ -1983,8 +2002,13 @@ impl DownloadTableDelegate {
                 PopupMenuItem::new(SharedString::from(format!("    {name}"))).on_click(
                     move |_, _, cx| {
                         let queue_id = queue_id.clone();
-                        let _ =
-                            host.update(cx, |view, cx| view.move_selected_to_queue(queue_id, cx));
+
+                        let Ok(()) =
+                            host.update(cx, |view, cx| view.move_selected_to_queue(queue_id, cx))
+                        else {
+                            // 视图已释放，结束这次回调而不再更新状态。
+                            return;
+                        };
                     },
                 ),
             );
@@ -2230,7 +2254,11 @@ impl TableDelegate for DownloadTableDelegate {
                 // 偏好写回走宿主的防抖持久化；表格实体此刻正被更新，放到帧外调用。
                 if let Some(host) = delegate.host.clone() {
                     cx.defer(move |cx| {
-                        let _ = host.update(cx, |view, cx| view.schedule_persist_prefs(cx));
+                        let Ok(()) = host.update(cx, |view, cx| view.schedule_persist_prefs(cx))
+                        else {
+                            // 视图已释放，结束这次回调而不再更新状态。
+                            return;
+                        };
                     });
                 }
                 cx.notify();
@@ -2327,7 +2355,11 @@ impl TableDelegate for DownloadTableDelegate {
                     return;
                 }
                 let key = key.clone();
-                let _ = host.update(cx, |view, cx| view.activate_row(key, window, cx));
+
+                let Ok(()) = host.update(cx, |view, cx| view.activate_row(key, window, cx)) else {
+                    // 视图已释放，结束这次回调而不再更新状态。
+                    return;
+                };
             }
         });
 
@@ -2846,7 +2878,8 @@ fn arm_reorder_timer(
     let delay = deadline.saturating_duration_since(Instant::now());
     delegate.reorder_timer = Some(cx.spawn(async move |this, cx| {
         cx.background_executor().timer(delay).await;
-        let _ = this.update(cx, |table, cx| {
+
+        let Ok(()) = this.update(cx, |table, cx| {
             let menu_open = table.right_clicked_row().is_some();
             let now = Instant::now();
             let delegate = table.delegate_mut();
@@ -2864,7 +2897,10 @@ fn arm_reorder_timer(
                 }
                 None => {}
             }
-        });
+        }) else {
+            // 视图已释放，结束这次回调而不再更新状态。
+            return;
+        };
     }));
 }
 
@@ -2986,7 +3022,8 @@ impl DownloadView {
                     batch.borrow_mut().record(&result);
                     let interactive_start = interactive_start.clone();
                     let batch = Rc::clone(&batch);
-                    let _ = this.update(cx, |this, cx| {
+
+                    let Ok(()) = this.update(cx, |this, cx| {
                         if rescan_on_failure && result.is_err() {
                             this.rescan_files_now(cx);
                         }
@@ -3000,7 +3037,10 @@ impl DownloadView {
                             this.notify_user_started(&started, cx);
                         }
                         cx.notify();
-                    });
+                    }) else {
+                        // 视图已释放，结束这次回调而不再更新状态。
+                        return;
+                    };
                 }
             })
             .detach();

@@ -851,7 +851,7 @@ mod tests {
         let mut slow = SlowCalls::new(MAX_SLOW_CALLS);
         assert!(slow.is_empty());
         slow.spawn(RequestId::Integer(7), async move {
-            let _ = released.await;
+            released.await.expect("release pending slow call");
             success(7)
         })
         .expect("spawn");
@@ -883,7 +883,7 @@ mod tests {
             let (release, released) = tokio::sync::oneshot::channel::<()>();
             releases.push(release);
             slow.spawn(RequestId::Integer(id), async move {
-                let _ = released.await;
+                released.await.expect("release bounded slow call");
                 success(id)
             })
             .expect("within limit");
@@ -900,7 +900,9 @@ mod tests {
         assert!(data.retryable);
 
         for release in releases {
-            let _ = release.send(());
+            release
+                .send(())
+                .expect("bounded slow call is still waiting");
         }
         let first = tokio::time::timeout(Duration::from_secs(2), slow.next())
             .await

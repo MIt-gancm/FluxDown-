@@ -132,14 +132,24 @@ impl WindowRegistry {
                 cx.spawn(async move |_, cx| {
                     cx.background_executor().timer(PERSIST_DEBOUNCE).await;
                     // 期间同键出现了更新的值：交给那次变化自己的定时器写。
-                    {
+                    let pending = {
                         let mut memory = memory.borrow_mut();
                         if memory.pending.get(key) != Some(&value) {
                             return;
                         }
-                        memory.pending.remove(key);
+                        let Some(pending) = memory.pending.remove(key) else {
+                            return;
+                        };
+                        pending
+                    };
+                    if let Err(error) = patch_local_preference(&client, key, pending).await {
+                        log::warn!("failed to persist window bounds {key}: {:?}", error.code);
+                        let mut memory = memory.borrow_mut();
+                        if memory.latest.get(key) == Some(&value) {
+                            // 保存失败的当前值仍交给既有退出落盘流程，不能覆盖更新的边界。
+                            memory.pending.entry(key).or_insert(value);
+                        }
                     }
-                    let _ = patch_local_preference(&client, key, value).await;
                 })
                 .detach();
             })

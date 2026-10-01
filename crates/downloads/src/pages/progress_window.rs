@@ -251,7 +251,8 @@ impl ProgressWindowView {
         let future = self.port.execute(command);
         cx.spawn(async move |this, cx| {
             let failed = future.await.is_err();
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 if failed {
                     this.last_error = Some(this.strings.action_failed.clone());
                     cx.notify();
@@ -265,7 +266,10 @@ impl ProgressWindowView {
                     }
                     Some(AfterSuccess::HandOff) | None => {}
                 }
-            });
+            }) else {
+                // 视图已释放，结束回调而不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -856,7 +860,12 @@ impl ProgressWindowView {
                         .text_color(tokens.colors.muted_foreground)
                         .child(self.t(cx, "progressWindowShowCompletion")),
                     move |value, _, cx| {
-                        let _ = this.update(cx, |this, cx| this.toggle_show_completion(value, cx));
+                        let Ok(()) =
+                            this.update(cx, |this, cx| this.toggle_show_completion(value, cx))
+                        else {
+                            // 视图已释放，结束回调而不再更新状态。
+                            return;
+                        };
                     },
                     cx,
                 )),

@@ -528,7 +528,10 @@ impl EngineWriteGuard {
 
 impl Drop for EngineWriteGuard {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
+        if let Err(error) = FileExt::unlock(&self.file) {
+            // Closing the file releases the lease even if explicit unlocking fails.
+            crate::logger::report_warning("database", "unlock engine writer lease", &error);
+        }
     }
 }
 
@@ -4725,7 +4728,14 @@ mod tests {
             n
         ));
         // 双保险：目录已存在（极端命名碰撞/上次清理失败）时先清空。
-        let _ = std::fs::remove_dir_all(&dir);
+
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::NotFound,
+                "clean test path: {error}"
+            );
+        }
         std::fs::create_dir_all(&dir).expect("create temp dir");
         let db = Db::open(&dir).await.expect("open test db");
         (db, dir)
@@ -4736,7 +4746,12 @@ mod tests {
     /// 历史 flaky（陈旧库被继承）的根因，必须先 close 再删。
     async fn close_test_db(db: &Db, dir: std::path::PathBuf) {
         db.pool.close().await;
-        let _ = std::fs::remove_dir_all(dir);
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     async fn insert_task(db: &Db, id: &str) {
@@ -7379,7 +7394,12 @@ mod tests {
         next_db.pool.close().await;
         drop(next_db);
         drop(next_guard);
-        let _ = std::fs::remove_dir_all(dir);
+
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("best-effort test directory cleanup: {error}");
+        }
     }
 
     #[tokio::test]

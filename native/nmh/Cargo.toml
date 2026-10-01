@@ -3,10 +3,8 @@ name = "fluxdown_nmh"
 version = "0.1.0"
 edition = "2024"
 
-[lints.clippy]
-unwrap_used = "deny"
-expect_used = "deny"
-wildcard_imports = "deny"
+[lints]
+workspace = true
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

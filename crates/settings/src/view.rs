@@ -238,11 +238,15 @@ impl SettingsView {
                     return;
                 };
                 let key = key.clone();
-                // 视图已释放（窗口关闭中）时忽略点击。
-                let _ = view.update(cx, |this, cx| {
+                // 标签点击回调可能晚于设置窗口关闭。
+
+                let Ok(()) = view.update(cx, |this, cx| {
                     this.tab_by_page.insert(key, id);
                     cx.notify();
-                });
+                }) else {
+                    // 设置视图或窗口已释放，结束回调，不再更新状态。
+                    return;
+                };
             },
             cx,
         ))

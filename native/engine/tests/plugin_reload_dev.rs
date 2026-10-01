@@ -121,5 +121,9 @@ async fn reload_dev_applies_manifest_edits_and_keeps_registration_on_failure() {
     let err = pm.reload_dev("nobody@none").await.expect_err("not dev");
     assert!(matches!(err, PluginError::NotDevPlugin(_)), "got {err:?}");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

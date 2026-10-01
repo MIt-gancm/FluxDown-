@@ -74,7 +74,8 @@ async fn compute_sha256(path: &std::path::Path) -> String {
     let mut hex = String::with_capacity(64);
     for b in result {
         use std::fmt::Write;
-        let _ = write!(hex, "{:02x}", b);
+
+        write!(hex, "{:02x}", b).expect("format into test string");
     }
     hex
 }
@@ -146,7 +147,14 @@ async fn run_one_real_download(
     let dest = work_dir.join(format!("multi_{}.bin", iter));
 
     // 清理上一次的产物
-    let _ = tokio::fs::remove_file(&dest).await;
+
+    if let Err(error) = tokio::fs::remove_file(&dest).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
 
     // 构造 FluxDown 真实 client（与生产代码完全一致）
     let proxy = ProxyConfig::default();
@@ -213,7 +221,10 @@ async fn run_one_real_download(
 
     // 关闭 progress channel，让 drainer 退出
     drop(progress_tx);
-    let _ = drain_handle.await;
+
+    drain_handle
+        .await
+        .expect("test background task must not panic");
 
     if let Err(e) = result {
         return Err(format!("run_coordinated_download: {e}"));
@@ -246,7 +257,14 @@ async fn run_one_real_download(
 async fn real_multi_segment_corruption_repeat() {
     let work_dir =
         std::env::temp_dir().join(format!("fluxdown_corruption_test_{}", std::process::id()));
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir)
         .await
         .expect("create work_dir");

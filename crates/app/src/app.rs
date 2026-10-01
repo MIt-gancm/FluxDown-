@@ -214,10 +214,15 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             let shutdown = crate::lifecycle::shutdown_request_on_app_quit(cx);
             async move {
                 for call in calls {
-                    let _ = call.await;
+                    if let Err(error) = call.await {
+                        // 退出写回尽力完成全部键，不能让首个失败阻断其余提交。
+                        log::warn!("settings flush on desktop exit failed: {:?}", error.code);
+                    }
                 }
-                if let Some(shutdown) = shutdown {
-                    let _ = shutdown.await;
+                if let Some(shutdown) = shutdown
+                    && let Err(error) = shutdown.await
+                {
+                    log::warn!("shutdown request on desktop exit failed: {:?}", error.code);
                 }
             }
         })
@@ -314,7 +319,9 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
                 if message.activate {
                     cx.update(crate::windows::main::reveal);
                 }
-                let _ = acknowledgement.send(());
+                if acknowledgement.send(()).is_err() {
+                    log::trace!("activation acknowledgement receiver already closed");
+                }
             }
         })
         .detach();
@@ -388,11 +395,17 @@ fn start_windows_listener(
     client.spawn_background(async move {
         match instance_ipc::Listener::bind(endpoint) {
             Ok(listener) => {
-                let _ = ready_tx.send(Ok(()));
+                if ready_tx.send(Ok(())).is_err() {
+                    // 启动方已结束等待，不留下无人拥有的激活监听任务。
+                    log::debug!("activation listener startup receiver closed");
+                    return;
+                }
                 listener.listen(tx).await;
             }
             Err(error) => {
-                let _ = ready_tx.send(Err(error));
+                if ready_tx.send(Err(error)).is_err() {
+                    log::debug!("activation listener startup receiver closed after bind failure");
+                }
             }
         }
     });
@@ -406,8 +419,10 @@ fn start_windows_listener(
         })?
 }
 fn open_main_minimized(cx: &mut App) {
-    if let Some(handle) = crate::windows::main::open(cx) {
-        let _ = handle.update(cx, |_, window, _| window.minimize_window());
+    if let Some(handle) = crate::windows::main::open(cx)
+        && let Err(error) = handle.update(cx, |_, window, _| window.minimize_window())
+    {
+        log::debug!("view or window released before lifecycle update: {error:#}");
     }
 }
 
@@ -459,7 +474,10 @@ fn after_session_settled(cx: &mut App, run: impl FnOnce(&mut App) + 'static) {
 /// 或已按默认值超时）时退出，避免留下无窗口、无托盘的界面进程。
 fn quit_when_nothing_to_confirm(submissions: tokio::sync::oneshot::Receiver<()>, cx: &mut App) {
     cx.spawn(async move |cx| {
-        let _ = submissions.await;
+        if submissions.await.is_err() {
+            // 后台提交任务随客户端关闭；仍继续执行既有无窗口退出判定。
+            log::debug!("capture submission completion sender released");
+        }
         cx.update(|cx| {
             after_first_snapshot(cx, |cx| {
                 cx.defer(|cx| {
@@ -534,9 +552,11 @@ fn apply_activity_bar_preferences(values: &BTreeMap<String, serde_json::Value>, 
     let Some(shell) = Desktop::global(cx).main_shell.clone() else {
         return;
     };
-    let _ = shell.update(cx, |shell, cx| {
+    if let Err(error) = shell.update(cx, |shell, cx| {
         crate::activity::apply_visibility(shell, values, cx);
-    });
+    }) {
+        log::debug!("view or window released before lifecycle update: {error:#}");
+    }
 }
 
 /// 系统交来的外部链接 / `.torrent` 文件 → agent 捕获入口的 RPC 列表。声明来源关联
@@ -590,7 +610,9 @@ pub(crate) fn submit_captures_detached(
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (done, finished) = tokio::sync::oneshot::channel();
     if urls.is_empty() && files.is_empty() {
-        let _ = done.send(());
+        if done.send(()).is_err() {
+            log::trace!("capture submission completion receiver closed");
+        }
         return finished;
     }
     let calls = capture_calls(client, urls, files);
@@ -600,7 +622,9 @@ pub(crate) fn submit_captures_detached(
                 log::warn!("failed to submit captured {kind}: {:?}", error.code);
             }
         }
-        let _ = done.send(());
+        if done.send(()).is_err() {
+            log::trace!("capture submission completion receiver closed");
+        }
     });
     finished
 }
@@ -857,7 +881,9 @@ mod tests {
         let outcome = acquire_or_activate(&dir, &endpoint, &ActivateMessage::default(), true)
             .expect("coordinate launch");
         assert!(matches!(outcome, LaunchDisposition::NoPrimary));
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            log::warn!("could not remove activate-only test fixture: {error}");
+        }
     }
 
     #[test]
@@ -880,6 +906,8 @@ mod tests {
                 panic!("expected primary takeover")
             }
         }
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(dir) {
+            log::warn!("could not remove takeover test fixture: {error}");
+        }
     }
 }

@@ -91,7 +91,9 @@ impl DaemonSelection {
             let pending = std::mem::take(&mut state.pending);
             let mut ids = Vec::with_capacity(pending.len());
             for (id, selection) in pending {
-                let _ = selection.sender.send(selection.default_choice);
+                if selection.sender.send(selection.default_choice).is_err() {
+                    tracing::debug!(request_id = %id, "selection waiter disconnected before default resolution");
+                }
                 remember_resolved(&mut state.resolved, id.clone());
                 ids.push(id);
             }
@@ -143,7 +145,10 @@ impl DaemonSelection {
             remember_resolved(&mut state.resolved, resolution.request_id.clone());
             selection
         };
-        let _ = selection.sender.send(resolution.outcome);
+        // 超时或任务取消可以先撤销等待者；终局仍保持 first-wins 并广播。
+        if selection.sender.send(resolution.outcome).is_err() {
+            tracing::debug!(request_id = %resolution.request_id, "selection waiter disconnected before resolution");
+        }
         self.events.publish(DaemonEvent::SelectionResolved {
             request_id: resolution.request_id,
         });
@@ -193,7 +198,9 @@ impl DaemonSelection {
             let pending = std::mem::take(&mut state.pending);
             let mut ids = Vec::with_capacity(pending.len());
             for (id, selection) in pending {
-                let _ = selection.sender.send(selection.default_choice);
+                if selection.sender.send(selection.default_choice).is_err() {
+                    tracing::debug!(request_id = %id, "selection waiter disconnected during daemon shutdown");
+                }
                 remember_resolved(&mut state.resolved, id.clone());
                 ids.push(id);
             }
@@ -247,7 +254,9 @@ impl DaemonSelection {
                     SelectionType::Hls => selection.default_choice,
                     SelectionType::Bt | SelectionType::Variant => SelectionOutcome::Cancelled,
                 };
-                let _ = selection.sender.send(outcome);
+                if selection.sender.send(outcome).is_err() {
+                    tracing::debug!(request_id = %id, "selection waiter disconnected before task cancellation");
+                }
                 remember_resolved(&mut state.resolved, id.clone());
                 cancelled.push(id);
             }
@@ -449,33 +458,54 @@ impl fluxdown_engine::selection::HostSelection for DaemonSelection {
     }
 
     fn provide_hls_selection(&self, task_id: &str, selected_index: i32) {
-        let _ = self.resolve_for_task(
+        match self.resolve_for_task(
             task_id,
             SelectionType::Hls,
             SelectionOutcome::Hls {
                 index: selected_index,
             },
-        );
+        ) {
+            Ok(()) => {}
+            Err(SelectionError::NotFound | SelectionError::Conflict) => {
+                tracing::debug!(task_id, "late HLS selection answer has no pending request");
+            }
+            Err(error) => tracing::warn!(%error, task_id, "HLS selection answer was rejected"),
+        }
     }
 
     fn provide_bt_selection(&self, task_id: &str, selected_indices: Vec<i32>) {
-        let _ = self.resolve_for_task(
+        match self.resolve_for_task(
             task_id,
             SelectionType::Bt,
             SelectionOutcome::Bt {
                 indices: selected_indices,
             },
-        );
+        ) {
+            Ok(()) => {}
+            Err(SelectionError::NotFound | SelectionError::Conflict) => {
+                tracing::debug!(task_id, "late BT selection answer has no pending request");
+            }
+            Err(error) => tracing::warn!(%error, task_id, "BT selection answer was rejected"),
+        }
     }
 
     fn provide_variant_selection(&self, task_id: &str, selected_index: i32) {
-        let _ = self.resolve_for_task(
+        match self.resolve_for_task(
             task_id,
             SelectionType::Variant,
             SelectionOutcome::Variant {
                 index: selected_index,
             },
-        );
+        ) {
+            Ok(()) => {}
+            Err(SelectionError::NotFound | SelectionError::Conflict) => {
+                tracing::debug!(
+                    task_id,
+                    "late variant selection answer has no pending request"
+                );
+            }
+            Err(error) => tracing::warn!(%error, task_id, "variant selection answer was rejected"),
+        }
     }
 }
 

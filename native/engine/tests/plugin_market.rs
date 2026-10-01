@@ -24,14 +24,37 @@ fn spawn_index_server(body: String) -> (u16, std::thread::JoinHandle<()>) {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let mut buf = [0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut buf);
+
+            std::io::Read::read(&mut stream, &mut buf).expect("read test HTTP request");
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
-            let _ = stream.write_all(resp.as_bytes());
-            let _ = stream.flush();
+
+            stream.write_all(resp.as_bytes()).unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
+
+            stream.flush().unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
         }
     });
     (port, handle)
@@ -102,7 +125,11 @@ async fn fetch_index_parses_and_enforces_watermark() {
         }
     ));
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -124,7 +151,11 @@ async fn http_mirror_rejected_https_only() {
         .expect_err("http mirror rejected");
     assert!(matches!(err, MarketError::AllMirrorsFailed));
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 回归（Bug：索引拉取无体积上限）：被投毒/损坏的源返回超大响应时必须流式
@@ -146,5 +177,9 @@ async fn oversized_index_rejected() {
         .expect_err("oversized index must be rejected");
     assert!(matches!(err, MarketError::IndexTooLarge), "got: {err:?}");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

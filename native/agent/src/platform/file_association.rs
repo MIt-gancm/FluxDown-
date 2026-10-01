@@ -89,9 +89,22 @@ mod inner {
         }
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         let classes = hkcu.open_subkey_with_flags("Software\\Classes", KEY_WRITE)?;
-        let _ = classes.delete_subkey_all(EXT);
-        let _ = classes.delete_subkey_all(PROG_ID);
+        let mut first_error = None;
+        for key in [EXT, PROG_ID] {
+            if let Err(error) = classes.delete_subkey_all(key)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                // 仍尝试移除另一棵树；只忽略并发卸载已经删除的键，保留首个真实错误。
+                tracing::warn!(key, %error, "could not remove torrent association registry key");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
         crate::platform::windows_shell::notify_association_changed();
+        if let Some(error) = first_error {
+            return Err(error.into());
+        }
         tracing::info!("removed .torrent association");
         Ok(())
     }

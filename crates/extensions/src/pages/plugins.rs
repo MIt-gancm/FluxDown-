@@ -777,7 +777,8 @@ impl ExtensionsView {
         let future = self.controller.market_list();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+
+            let Ok(()) = this.update(cx, |this, cx| {
                 let market = &mut this.plugins.market;
                 market.loading = false;
                 match result.and_then(parse_market_entries) {
@@ -799,7 +800,10 @@ impl ExtensionsView {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 扩展视图已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -826,22 +830,29 @@ impl ExtensionsView {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.plugins.installing_file = true;
                 let future = this
                     .controller
                     .install_plugin_file(path.display().to_string());
                 cx.spawn_in(window, async move |this, cx| {
                     let result = future.await;
-                    let _ = this.update_in(cx, |this, window, cx| {
+                    let Ok(()) = this.update_in(cx, |this, window, cx| {
                         this.plugins.installing_file = false;
                         this.finish_plugin_op(PluginOp::Install, result, window, cx);
                         cx.notify();
-                    });
+                    }) else {
+                        // 扩展页或窗口已释放，停止回写安装结果。
+                        return;
+                    };
                 })
                 .detach();
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -858,10 +869,14 @@ impl ExtensionsView {
                 && let Some(path) = paths.first()
             {
                 let text = path.display().to_string();
-                let _ = this.update(cx, |this, cx| {
+
+                let Ok(()) = this.update(cx, |this, cx| {
                     this.plugins.dev_dir = text;
                     cx.notify();
-                });
+                }) else {
+                    // 扩展视图已释放，结束回调，不再更新状态。
+                    return;
+                };
             }
         })
         .detach();
@@ -877,14 +892,18 @@ impl ExtensionsView {
             .install_plugin_dev(self.plugins.dev_dir.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.plugins.installing_dir = false;
                 if result.is_ok() {
                     this.plugins.dev_dir.clear();
                 }
                 this.finish_plugin_op(PluginOp::Install, result, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -916,7 +935,8 @@ impl ExtensionsView {
         let future = self.controller.market_list();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await.and_then(parse_market_entries);
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 let op = if this.controller.plugin(&plugin_id).is_some() {
                     PluginOp::Update
                 } else {
@@ -964,7 +984,10 @@ impl ExtensionsView {
                     this.confirm_market_permissions(latest, op, &permissions, window, cx);
                     cx.notify();
                 }
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -1030,7 +1053,8 @@ impl ExtensionsView {
                     cx,
                 ))
                 .on_ok(move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| {
+                    // 页面已释放时未提交安装，不能报告确认成功。
+                    view.update(cx, |this, cx| {
                         // 确认后重新核对索引：daemon 安装的是当时最新条目。
                         this.plugins.market.pending.insert(plugin_id.clone());
                         cx.notify();
@@ -1040,8 +1064,8 @@ impl ExtensionsView {
                             window,
                             cx,
                         );
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
     }
@@ -1060,7 +1084,8 @@ impl ExtensionsView {
         let future = self.controller.market_install(plugin_id.clone(), version);
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 // 市场在确认之后发布了新版本：提示后刷新索引并按最新条目重新确认权限。
                 if let Err(error) = &result
                     && error.reason == Some(fluxdown_protocol::ErrorReason::MarketVersionChanged)
@@ -1073,7 +1098,10 @@ impl ExtensionsView {
                 this.plugins.market.pending.remove(&plugin_id);
                 this.finish_plugin_op(op, result, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -1092,12 +1120,16 @@ impl ExtensionsView {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.plugins.busy.remove(&identity);
                 this.plugins.reloading.remove(&identity);
                 this.finish_plugin_op(op, result, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -1207,9 +1239,9 @@ impl ExtensionsView {
                     cx,
                 ))
                 .on_ok(move |_, _, cx| {
-                    let _ =
-                        view.update(cx, |this, cx| this.show_tab(ExtensionsTab::Components, cx));
-                    true
+                    // 页面已释放时无法跳转，不能报告确认成功。
+                    view.update(cx, |this, cx| this.show_tab(ExtensionsTab::Components, cx))
+                        .is_ok()
                 })
         });
     }
@@ -1241,7 +1273,8 @@ impl ExtensionsView {
                     cx,
                 ))
                 .on_ok(move |_, window, cx| {
-                    let _ = view.update(cx, |this, cx| {
+                    // 页面已释放时未提交卸载，不能报告确认成功。
+                    view.update(cx, |this, cx| {
                         let future = this.controller.uninstall_plugin(identity.clone());
                         this.run_plugin_op(
                             identity.clone(),
@@ -1250,8 +1283,8 @@ impl ExtensionsView {
                             window,
                             cx,
                         );
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
     }

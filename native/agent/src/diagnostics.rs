@@ -1561,7 +1561,18 @@ fn probe_log_dir(dir: &Path) -> DiagnosticCheckDto {
     let probe_file = dir.join(".doctor_write_probe");
     match std::fs::write(&probe_file, b"") {
         Ok(()) => {
-            let _ = std::fs::remove_file(&probe_file);
+            if let Err(error) = std::fs::remove_file(&probe_file)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                return check(
+                    CHECK_LOG_DIR,
+                    "",
+                    DiagnosticLevel::Error,
+                    format!("{summary} — probe cleanup failed: {error}"),
+                    HINT_CHECK_DISK,
+                    repair,
+                );
+            }
             check(CHECK_LOG_DIR, "", DiagnosticLevel::Ok, summary, "", repair)
         }
         Err(error) => check(
@@ -2254,8 +2265,8 @@ mod tests {
         let missing = probe_log_dir(&dir);
         assert_eq!(missing.level, DiagnosticLevel::Error);
         assert_eq!(missing.hint, HINT_CHECK_DISK);
-        std::fs::create_dir_all(&dir).ok();
-        std::fs::write(dir.join("agent.log"), b"line\n").ok();
+        std::fs::create_dir_all(&dir).expect("create doctor test log directory");
+        std::fs::write(dir.join("agent.log"), b"line\n").expect("write doctor test log");
         let writable = probe_log_dir(&dir);
         assert_eq!(writable.level, DiagnosticLevel::Ok);
         assert!(writable.detail.contains("1 log files"));
@@ -2264,7 +2275,9 @@ mod tests {
             Some(ACTION_OPEN_LOG_DIR)
         );
         assert!(!dir.join(".doctor_write_probe").exists());
-        std::fs::remove_dir_all(&dir).ok();
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), %error, "doctor test cleanup failed");
+        }
     }
 
     #[tokio::test]

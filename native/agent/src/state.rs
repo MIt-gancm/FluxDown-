@@ -276,20 +276,36 @@ impl StateStore {
             .data_dir
             .join(format!("agent-state.corrupt-{stamp:020}.json"));
         tokio::fs::rename(&self.state_path, &backup).await?;
-        if let Ok(mut entries) = tokio::fs::read_dir(&self.data_dir).await {
-            let mut backups = Vec::new();
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name.starts_with("agent-state.corrupt-") && name.ends_with(".json") {
-                    backups.push(entry.path());
+        match tokio::fs::read_dir(&self.data_dir).await {
+            Ok(mut entries) => {
+                let mut backups = Vec::new();
+                loop {
+                    let entry = match entries.next_entry().await {
+                        Ok(Some(entry)) => entry,
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::warn!(path = %self.data_dir.display(), error = %error, "could not enumerate corrupt agent state backups");
+                            break;
+                        }
+                    };
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name.starts_with("agent-state.corrupt-") && name.ends_with(".json") {
+                        backups.push(entry.path());
+                    }
+                }
+                backups.sort();
+                let surplus = backups.len().saturating_sub(CORRUPT_BACKUP_LIMIT);
+                for stale in backups.into_iter().take(surplus) {
+                    // 已消失的旧备份无需再清理，其他失败不能掩盖隔离结果。
+                    if let Err(error) = tokio::fs::remove_file(&stale).await
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        tracing::warn!(path = %stale.display(), error = %error, "could not prune old corrupt agent state backup");
+                    }
                 }
             }
-            backups.sort();
-            let surplus = backups.len().saturating_sub(CORRUPT_BACKUP_LIMIT);
-            for stale in backups.into_iter().take(surplus) {
-                if let Err(error) = tokio::fs::remove_file(&stale).await {
-                    tracing::warn!(path = %stale.display(), error = %error, "could not prune old corrupt agent state backup");
-                }
+            Err(error) => {
+                tracing::warn!(path = %self.data_dir.display(), error = %error, "could not list corrupt agent state backups");
             }
         }
         Ok(backup)
@@ -326,7 +342,12 @@ impl StateStore {
             .join(format!(".agent-state.{}.tmp", Uuid::new_v4()));
         let result = self.write_temp_then_rename(&temp, bytes).await;
         if result.is_err() {
-            let _ = tokio::fs::remove_file(&temp).await;
+            // 创建临时文件前失败或 rename 后 fsync 失败时，临时路径可能本就不存在。
+            if let Err(error) = tokio::fs::remove_file(&temp).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %temp.display(), error = %error, "could not remove failed agent state temp file");
+            }
         } else {
             *written = generation;
         }
@@ -359,14 +380,28 @@ impl StateStore {
 
 /// 清理上次崩溃遗留的临时状态文件（调用方已持有独占锁，不会误删并发写入）。
 async fn remove_stale_temp_files(dir: &Path) {
-    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
-        return;
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(path = %dir.display(), error = %error, "could not list stale agent state temp files");
+            return;
+        }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    loop {
+        let entry = match entries.next_entry().await {
+            Ok(Some(entry)) => entry,
+            Ok(None) => break,
+            Err(error) => {
+                tracing::warn!(path = %dir.display(), error = %error, "could not enumerate stale agent state temp files");
+                break;
+            }
+        };
         let name = entry.file_name().to_string_lossy().into_owned();
+        // 清理时已消失的文件已达成目的；保留其他失败的诊断。
         if name.starts_with(".agent-state.")
             && name.ends_with(".tmp")
             && let Err(error) = tokio::fs::remove_file(entry.path()).await
+            && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(file = %name, error = %error, "could not remove stale agent state temp file");
         }
@@ -598,6 +633,50 @@ mod tests {
         }
         assert!(state.sync_stash.len() <= super::SYNC_STASH_LIMIT);
     }
+    #[tokio::test]
+    async fn failed_atomic_rename_removes_temp_and_does_not_report_a_saved_snapshot() {
+        let dir = temp_dir("state_failed_rename");
+        let store = StateStore::open(dir.clone()).await.expect("open store");
+        // 用目录阻止状态文件原子替换：temp 已创建且写入，rename 必须失败。
+        let state_path = dir.join("agent-state.json");
+        tokio::fs::create_dir(&state_path)
+            .await
+            .expect("block state rename");
+        let state = AgentState {
+            device_id: "must-not-report-saved".to_owned(),
+            ..AgentState::default()
+        };
+        let error = store
+            .save(&state)
+            .await
+            .expect_err("state rename must fail");
+        assert!(matches!(error, StateError::Io(_)));
+        assert!(
+            state_path.is_dir(),
+            "failed save must preserve the destination"
+        );
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .expect("list state directory")
+            .map(|entry| entry.expect("read state directory entry").file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "failed save must remove its temporary snapshot"
+        );
+        tokio::fs::remove_dir(&state_path)
+            .await
+            .expect("unblock state rename");
+        store.save(&state).await.expect("save after rename failure");
+        assert_eq!(
+            store.load().await.expect("load saved state").device_id,
+            state.device_id
+        );
+        drop(store);
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "remove failed rename directory");
+        }
+    }
 
     #[tokio::test]
     async fn corrupt_state_is_quarantined_and_agent_starts_from_default() {
@@ -614,7 +693,7 @@ mod tests {
         assert!(!dir.join("agent-state.json").exists());
         let backups = std::fs::read_dir(&dir)
             .expect("list dir")
-            .filter_map(Result::ok)
+            .map(|entry| entry.expect("read backup directory entry"))
             .filter(|entry| {
                 entry
                     .file_name()
@@ -631,7 +710,9 @@ mod tests {
         store.save(&state).await.expect("save after recovery");
         assert_eq!(store.load().await.expect("reload").device_id, "fresh");
         drop(store);
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %error, "remove recovered state directory");
+        }
     }
 
     #[tokio::test]
@@ -655,12 +736,14 @@ mod tests {
         assert_eq!(store.load().await.expect("load").device_name, in_memory);
         let temps = std::fs::read_dir(&dir)
             .expect("list dir")
-            .filter_map(Result::ok)
+            .map(|entry| entry.expect("read state directory entry"))
             .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
             .count();
         assert_eq!(temps, 0, "no temp files may leak");
         drop(store);
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %error, "remove concurrent persist directory");
+        }
     }
 
     #[tokio::test]
@@ -697,6 +780,8 @@ mod tests {
         drop(store);
         let reopened = StateStore::open(dir.clone()).await.expect("reopen");
         drop(reopened);
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir) {
+            tracing::warn!(path = %dir.display(), error = %error, "remove state directory");
+        }
     }
 }

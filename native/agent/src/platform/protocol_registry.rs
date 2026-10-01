@@ -173,7 +173,12 @@ mod inner {
         let hkcu = RegKey::predef(HKEY_CURRENT_USER);
         // 删除每用户 scheme 树；其他客户端的 HKLM 注册（若有）重新生效。
         let classes = hkcu.open_subkey_with_flags("Software\\Classes", KEY_WRITE)?;
-        let _ = classes.delete_subkey_all(scheme);
+        // 并发卸载已删除 scheme 键是预期幂等结果；权限和其它错误必须反馈给调用方。
+        if let Err(error) = classes.delete_subkey_all(scheme)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error.into());
+        }
         crate::platform::windows_shell::notify_association_changed();
         tracing::info!(scheme, "removed URL protocol registration");
         Ok(())

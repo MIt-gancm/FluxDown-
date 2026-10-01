@@ -57,7 +57,19 @@ pub fn quit_everything(cx: &mut App) {
     let request = client.call::<Value, Value>(method::SYSTEM_SHUTDOWN, None);
     let timer = cx.background_executor().timer(SHUTDOWN_REQUEST_BUDGET);
     cx.spawn(async move |cx| {
-        let _ = futures_util::future::select(request, timer).await;
+        match futures_util::future::select(request, timer).await {
+            futures_util::future::Either::Left((result, _timer)) => {
+                if let Err(error) = result {
+                    log::warn!(
+                        "shutdown request failed before desktop exit: {:?}",
+                        error.code
+                    );
+                }
+            }
+            futures_util::future::Either::Right(((), _request)) => {
+                log::warn!("shutdown request timed out before desktop exit");
+            }
+        }
         cx.update(|cx| cx.quit());
     })
     .detach();

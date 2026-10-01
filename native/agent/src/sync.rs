@@ -947,9 +947,15 @@ fn seed_local_values(
             continue;
         }
         let local_value = match spec.owner {
-            SyncOwner::Daemon => current_daemon
-                .get(spec.storage_key)
-                .and_then(|wire| daemon_config_to_value(spec, wire).ok()),
+            SyncOwner::Daemon => current_daemon.get(spec.storage_key).and_then(|wire| {
+                match daemon_config_to_value(spec, wire) {
+                    Ok(value) => Some(value),
+                    Err(reason) => {
+                        tracing::warn!(key = %spec.key, reason = %reason, "not seeding unusable daemon config value");
+                        None
+                    }
+                }
+            }),
             SyncOwner::Agent | SyncOwner::Preferences => {
                 state.preferences.values.get(spec.key).cloned()
             }
@@ -966,9 +972,11 @@ fn seed_local_values(
                     continue;
                 }
             }
-        } else if validate_value(spec.key, &local_value).is_err() {
-            continue;
         } else {
+            if let Err(reason) = validate_value(spec.key, &local_value) {
+                tracing::warn!(key = %spec.key, reason = %reason, "not seeding invalid local setting");
+                continue;
+            }
             local_value
         };
         state.sync_entries.insert(
@@ -1011,9 +1019,15 @@ fn categories_to_wire(value: &Value) -> Result<Value, String> {
 /// 云端分类合并进本机：保留本机同 id 分类的 `saveDir`；本机偏好的存储形态（JSON 字符串 / 数组）不变。
 fn merge_categories_from_wire(remote: &Value, local: Option<&Value>) -> Result<Value, String> {
     let mut list = parse_category_list(remote)?;
-    let local_dirs = local
-        .and_then(|local| parse_category_list(local).ok())
-        .unwrap_or_default()
+    let local_categories = match local.map(parse_category_list).transpose() {
+        Ok(categories) => categories.unwrap_or_default(),
+        Err(reason) => {
+            // 旧的本机值不可解析时仍可恢复云端分类；无法保留的本机目录必须可诊断。
+            tracing::warn!(reason = %reason, "cannot preserve local category directories while merging cloud categories");
+            Vec::new()
+        }
+    };
+    let local_dirs = local_categories
         .into_iter()
         .filter_map(|category| {
             let id = category.get("id")?.as_str()?.to_owned();
@@ -1535,7 +1549,7 @@ mod tests {
                 .route("/api/v1/sync/events", get(mock_events))
                 .with_state(mock.clone());
             tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                axum::serve(listener, app).await.expect("serve sync mock");
             });
             let dir = std::env::temp_dir().join(format!(
                 "fluxdown_sync_{label}_{}_{}",
@@ -1621,7 +1635,9 @@ mod tests {
             drop(service);
             drop(state);
             drop(store);
-            let _ = tokio::fs::remove_dir_all(dir).await;
+            if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!(path = %dir.display(), error = %error, "could not remove sync test directory");
+            }
         }
     }
 
@@ -1806,7 +1822,9 @@ mod tests {
         assert!(!error.halts(), "network failures retry automatically");
         drop(service);
         drop(store);
-        let _ = tokio::fs::remove_dir_all(dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+            tracing::warn!(path = %dir.display(), error = %error, "could not remove unreachable sync test directory");
+        }
     }
 
     #[tokio::test]

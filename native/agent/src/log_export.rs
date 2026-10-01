@@ -204,12 +204,20 @@ pub async fn write_atomic(target: &Path, bytes: &[u8]) -> Result<LogExportResult
         tokio::fs::create_dir_all(parent).await?;
     }
     let temp = target.with_extension(format!("zip.{}.tmp", std::process::id()));
-    let mut file = tokio::fs::File::create(&temp).await?;
-    file.write_all(bytes).await?;
-    file.sync_all().await?;
-    drop(file);
-    if let Err(error) = tokio::fs::rename(&temp, target).await {
-        let _ = tokio::fs::remove_file(&temp).await;
+    let result = async {
+        let mut file = tokio::fs::File::create(&temp).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&temp, target).await
+    }
+    .await;
+    if let Err(error) = result {
+        if let Err(cleanup_error) = tokio::fs::remove_file(&temp).await
+            && cleanup_error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %temp.display(), %cleanup_error, "failed to remove log export temporary file");
+        }
         return Err(error);
     }
     Ok(LogExportResult {

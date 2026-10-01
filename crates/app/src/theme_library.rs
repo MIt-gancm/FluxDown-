@@ -122,7 +122,13 @@ fn write_new(path: &Path, text: &str) -> io::Result<()> {
         .write_all(text.as_bytes())
         .and_then(|()| file.sync_all());
     if written.is_err() {
-        let _ = fs::remove_file(path);
+        // Windows 也必须先释放文件句柄，才能删除写入失败的半成品。
+        drop(file);
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            log::warn!("could not remove incomplete imported theme: {error}");
+        }
     }
     written
 }
@@ -185,7 +191,12 @@ mod tests {
 
     impl Drop for TempDir {
         fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            if let Err(error) = fs::remove_dir_all(&self.0)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                // 测试可以只访问不存在的主题库；其他清理失败不能静默。
+                log::warn!("could not remove theme-library fixture: {error}");
+            }
         }
     }
 

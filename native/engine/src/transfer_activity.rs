@@ -147,13 +147,14 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let _read = worker.start(3);
-            let _ = tx.send(());
+            tx.send(())
+                .expect("test receiver is waiting for worker start");
             std::future::pending::<()>().await;
         });
         rx.await.expect("worker began body read");
         assert_eq!(tracker.active(), 1);
         task.abort();
-        let _ = task.await;
+        assert!(task.await.expect_err("worker was aborted").is_cancelled());
         assert_eq!(tracker.active(), 0);
         assert!(!tracker.is_active(3));
     }

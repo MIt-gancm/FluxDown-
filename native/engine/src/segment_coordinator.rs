@@ -1475,16 +1475,8 @@ pub async fn run_coordinated_download(
     // ----- 0.5 夺取段行布局属主权 --------------------------------------------
     // 必须先于 load_segments/建行：从这一刻起，旧 spawn 迟到的段进度写入
     // （update_segment_progress_bounded 的 epoch 存在性守卫）全类失效——
-    // 不存在"重建后、夺权前"的空窗。写失败仅降级为旧的 start_byte 单守卫
-    // 行为（迟到写至多被钳制，见 db 层文档），不阻断下载。
-    if let Err(e) = db.set_segments_epoch(task_id, spawn_gen).await {
-        log_info!(
-            "[coordinator] task {} set_segments_epoch({}) failed: {}（迟到写防护降级）",
-            task_id,
-            spawn_gen,
-            e
-        );
-    }
+    // 不存在"重建后、夺权前"的空窗；持久化失败必须在启动 worker 前停止。
+    db.set_segments_epoch(task_id, spawn_gen).await?;
 
     // ----- 1. Build initial segment map from DB or fresh calculation ---------
     let existing = db.load_segments(task_id).await?;
@@ -1619,7 +1611,7 @@ pub async fn run_coordinated_download(
                     threshold
                 );
                 if scope.owns_task_total {
-                    let _ = db.update_task_total_bytes(task_id, db_total).await;
+                    db.update_task_total_bytes(task_id, db_total).await?;
                 }
                 db_total
             } else {
@@ -1641,11 +1633,9 @@ pub async fn run_coordinated_download(
                 segments = fresh;
                 db.insert_segments(task_id, &db_segs).await?;
                 next_index = initial_segment_count;
-                let _ = if scope.owns_task_total {
-                    db.update_task_total_bytes(task_id, total_bytes).await
-                } else {
-                    Ok(())
-                };
+                if scope.owns_task_total {
+                    db.update_task_total_bytes(task_id, total_bytes).await?;
+                }
                 // Return early — segments are already valid, skip validate_coverage.
                 // Re-run pre-allocation and workers with total_bytes.
                 total_bytes
@@ -1686,7 +1676,7 @@ pub async fn run_coordinated_download(
         // (db_total <= total_bytes path).  After a fresh reset the canonical size is
         // total_bytes (from probe), so re-sync.
         if scope.owns_task_total {
-            let _ = db.update_task_total_bytes(task_id, total_bytes).await;
+            db.update_task_total_bytes(task_id, total_bytes).await?;
         }
     }
 
@@ -1712,7 +1702,8 @@ pub async fn run_coordinated_download(
         let db_downloaded: i64 = segments.values().map(|s| s.downloaded_bytes).sum();
         let file_len = match tokio::fs::metadata(dest).await {
             Ok(m) => m.len() as i64,
-            Err(_) => 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.into()),
         };
         // 与 effective_total_bytes 比较（而非更弱的 db_downloaded）：预分配后合规
         // 续传文件长度恒 >= effective_total_bytes，低于即为外部截断/删除。
@@ -1965,7 +1956,12 @@ pub async fn run_coordinated_download(
                 seg.state = SegState::Active;
             }
             // This send cannot fail — channel just created with capacity 4.
-            let _ = assign_tx.try_send(assignment);
+            if let Err(error) = assign_tx.try_send(assignment) {
+                tracing::debug!(worker_id, %error, "initial HTTP worker assignment failed");
+                if let Some(seg) = segments.get_mut(&seg_idx) {
+                    seg.state = SegState::Pending;
+                }
+            }
             if is_open_ended {
                 open_ended_streaming = Some(seg_idx);
             }
@@ -1982,10 +1978,28 @@ pub async fn run_coordinated_download(
         for tx in &mut worker_assign_txs {
             *tx = None;
         }
+        let mut join_error = None;
         for handle in &mut worker_handles {
-            if let Some(h) = handle.take() {
-                let _ = h.await;
+            if let Some(h) = handle.take()
+                && let Err(error) = h.await
+            {
+                if error.is_cancelled() {
+                    tracing::debug!("HTTP worker cancelled");
+                } else if join_error.is_none() {
+                    join_error = Some(error);
+                } else {
+                    crate::logger::report_warning(
+                        "http-coordinator",
+                        "join another completed worker",
+                        &error,
+                    );
+                }
             }
+        }
+        if let Some(error) = join_error {
+            return Err(DownloadError::Other(format!(
+                "HTTP worker join failed: {error}"
+            )));
         }
         let (_, mut runtime) = sampled_http_runtime(
             task_id,
@@ -2068,7 +2082,7 @@ pub async fn run_coordinated_download(
     let mut db_flush_interval = tokio::time::interval(Duration::from_secs(DB_SAVE_INTERVAL_SECS));
     db_flush_interval.tick().await; // consume the immediate first tick
 
-    loop {
+    'coordinator: loop {
         tokio::select! {
             biased;
 
@@ -2135,9 +2149,14 @@ pub async fn run_coordinated_download(
                                 downloaded_bytes,
                                 child_idx
                             );
-                            persist_segment_change(
+                            if let Err(error) = persist_segment_change(
                                 db, task_id, &segments, child_idx, Some(seg_index),
-                            ).await;
+                            ).await {
+                                worker_cancel.cancel();
+                                for tx in &mut worker_assign_txs { *tx = None; }
+                                final_error = Some(error);
+                                break 'coordinator;
+                            }
                             send_split_event(
                                 sink, task_id, seg_index, child_idx, &segments, false, scope,
                             );
@@ -2198,10 +2217,15 @@ pub async fn run_coordinated_download(
                             let new_seg_idx = next.assignment.seg_index;
 
                             // Persist new/updated segments to DB.
-                            persist_segment_change(
+                            if let Err(error) = persist_segment_change(
                                 db, task_id, &segments,
                                 new_seg_idx, next.split_parent,
-                            ).await;
+                            ).await {
+                                worker_cancel.cancel();
+                                for tx in &mut worker_assign_txs { *tx = None; }
+                                final_error = Some(error);
+                                break 'coordinator;
+                            }
 
                             // Notify host about the split event (if this came from a split).
                             if let Some(parent_idx) = next.split_parent {
@@ -2319,14 +2343,21 @@ pub async fn run_coordinated_download(
                                 );
                                 effective_total_bytes = reported_total;
                                 planned_total.store(reported_total, Ordering::Relaxed);
-                                persist_segment_change(
-                                    db, task_id, &segments, tail_idx, None,
-                                ).await;
-                                if scope.owns_task_total {
-                                    let _ = db
-                                        .update_task_total_bytes(task_id, reported_total)
-                                        .await;
+                                if let Err(error) = db.upsert_segment(task_id, tail_idx, old_total, reported_total - 1, 0).await {
+                                    worker_cancel.cancel();
+                                    for tx in &mut worker_assign_txs { *tx = None; }
+                                    final_error = Some(error.into());
+                                    break 'coordinator;
                                 }
+                                if scope.owns_task_total
+                                    && let Err(error) = db
+                                        .update_task_total_bytes(task_id, reported_total)
+                                        .await {
+                                        worker_cancel.cancel();
+                                        for tx in &mut worker_assign_txs { *tx = None; }
+                                        final_error = Some(error.into());
+                                        break;
+                                    }
                                 rebuild_seg_states(&segments, &seg_states);
                                 log_info!(
                                     "[coordinator] task {} 就地扩容（第 {}/{} 次）：规划 {} -> 服务器自报 \
@@ -2399,10 +2430,15 @@ pub async fn run_coordinated_download(
                             if let Some(next) = next_work {
                                 let new_seg_idx = next.assignment.seg_index;
                                 let redispatch_open = next.assignment.open_ended;
-                                persist_segment_change(
+                                if let Err(error) = persist_segment_change(
                                     db, task_id, &segments,
                                     new_seg_idx, next.split_parent,
-                                ).await;
+                                ).await {
+                                    worker_cancel.cancel();
+                                    for tx in &mut worker_assign_txs { *tx = None; }
+                                    final_error = Some(error);
+                                    break 'coordinator;
+                                }
                                 if let Some(parent_idx) = next.split_parent {
                                     send_split_event(
                                         sink, task_id, parent_idx, new_seg_idx,
@@ -2482,10 +2518,15 @@ pub async fn run_coordinated_download(
                             if let Some(next) = next_work {
                                 let new_seg_idx = next.assignment.seg_index;
                                 let redispatch_open = next.assignment.open_ended;
-                                persist_segment_change(
+                                if let Err(error) = persist_segment_change(
                                     db, task_id, &segments,
                                     new_seg_idx, next.split_parent,
-                                ).await;
+                                ).await {
+                                    worker_cancel.cancel();
+                                    for tx in &mut worker_assign_txs { *tx = None; }
+                                    final_error = Some(error);
+                                    break 'coordinator;
+                                }
                                 if let Some(parent_idx) = next.split_parent {
                                     send_split_event(
                                         sink, task_id, parent_idx, new_seg_idx,
@@ -2731,10 +2772,15 @@ pub async fn run_coordinated_download(
                         };
                         if let Some(next) = next_work {
                             let new_seg_idx = next.assignment.seg_index;
-                            persist_segment_change(
+                            if let Err(error) = persist_segment_change(
                                 db, task_id, &segments,
                                 new_seg_idx, next.split_parent,
-                            ).await;
+                            ).await {
+                                worker_cancel.cancel();
+                                for tx in &mut worker_assign_txs { *tx = None; }
+                                final_error = Some(error);
+                                break 'coordinator;
+                            }
                             if let Some(parent_idx) = next.split_parent {
                                 send_split_event(
                                     sink, task_id, parent_idx, new_seg_idx,
@@ -2761,7 +2807,9 @@ pub async fn run_coordinated_download(
                             // ramp 裁决门放行，后续 tick 照常扩容多段；持久化标记，
                             // 此后 resume 走正常 probe 路径（写失败仅降级：resume
                             // 会再走一次保守启动，多花一次裁决，无正确性影响）。
-                            let _ = db.set_task_range_verified(task_id, true).await;
+                            if let Err(error) = db.set_task_range_verified(task_id, true).await {
+                                crate::logger::report_warning("http-coordinator", "persist Range capability", &error);
+                            }
                             log_info!(
                                 "[coordinator] task {} hint 首响应确认 Range 支持，放行多段扩容",
                                 task_id
@@ -2860,10 +2908,15 @@ pub async fn run_coordinated_download(
                     });
                     if let Some(next) = work {
                         let new_seg_idx = next.assignment.seg_index;
-                        persist_segment_change(
+                        if let Err(error) = persist_segment_change(
                             db, task_id, &segments,
                             new_seg_idx, next.split_parent,
-                        ).await;
+                        ).await {
+                            worker_cancel.cancel();
+                            for tx in &mut worker_assign_txs { *tx = None; }
+                            final_error = Some(error);
+                            break 'coordinator;
+                        }
                         if let Some(parent_idx) = next.split_parent {
                             send_split_event(
                                 sink, task_id, parent_idx, new_seg_idx,
@@ -2913,10 +2966,15 @@ pub async fn run_coordinated_download(
                                 break;
                             };
                             let new_seg_idx = next.assignment.seg_index;
-                            persist_segment_change(
+                            if let Err(error) = persist_segment_change(
                                 db, task_id, &segments,
                                 new_seg_idx, next.split_parent,
-                            ).await;
+                            ).await {
+                                worker_cancel.cancel();
+                                for tx in &mut worker_assign_txs { *tx = None; }
+                                final_error = Some(error);
+                                break 'coordinator;
+                            }
                             if let Some(parent_idx) = next.split_parent {
                                 send_split_event(
                                     sink, task_id, parent_idx, new_seg_idx,
@@ -3008,10 +3066,15 @@ pub async fn run_coordinated_download(
                     )
                 {
                     let new_seg_idx = next.assignment.seg_index;
-                    persist_segment_change(
+                    if let Err(error) = persist_segment_change(
                         db, task_id, &segments,
                         new_seg_idx, next.split_parent,
-                    ).await;
+                    ).await {
+                        worker_cancel.cancel();
+                        for tx in &mut worker_assign_txs { *tx = None; }
+                        final_error = Some(error);
+                        break 'coordinator;
+                    }
                     if let Some(parent_idx) = next.split_parent {
                         send_split_event(
                             sink, task_id, parent_idx, new_seg_idx,
@@ -3238,10 +3301,15 @@ pub async fn run_coordinated_download(
                                 break;
                             };
                             let new_seg_idx = next.assignment.seg_index;
-                            persist_segment_change(
+                            if let Err(error) = persist_segment_change(
                                 db, task_id, &segments,
                                 new_seg_idx, next.split_parent,
-                            ).await;
+                            ).await {
+                                worker_cancel.cancel();
+                                for tx in &mut worker_assign_txs { *tx = None; }
+                                final_error = Some(error);
+                                break 'coordinator;
+                            }
                             if let Some(parent_idx) = next.split_parent {
                                 send_split_event(
                                     sink, task_id, parent_idx, new_seg_idx,
@@ -3347,6 +3415,7 @@ pub async fn run_coordinated_download(
             // downloaded_bytes = total_downloaded + scope.base、total_bytes 取
             // total_override 或 planned_total、segment_details 经 map_snapshot）。
             _ = ui_interval.tick() => {
+                if progress_tx.is_closed() { continue; }
                 let current_total = total_downloaded.load(Ordering::Relaxed);
                 let report_total = if scope.total_override > 0 {
                     scope.total_override
@@ -3360,7 +3429,7 @@ pub async fn run_coordinated_download(
                 runtime.source_bytes = sample_run_source_bytes(
                     &nodes, &mut segments, &seg_states, source_base, &mut source_peak,
                 );
-                let _ = progress_tx
+                if progress_tx
                     .send(ProgressUpdate {
                         task_id: task_id.to_string(),
                         downloaded_bytes: current_total + scope.base,
@@ -3372,7 +3441,9 @@ pub async fn run_coordinated_download(
                         runtime: Some(runtime),
                         ..Default::default()
                     })
-                    .await;
+                    .await.is_err() {
+                    tracing::debug!("HTTP progress receiver closed");
+                }
             }
 
             // --- Durable segment progress batch flush --------------------
@@ -3404,11 +3475,31 @@ pub async fn run_coordinated_download(
         }
     }
 
-    // ----- 7. Wait for all worker tasks to finish ---------------------------
+    // Drain events while joining: a stopped coordinator must not leave workers
+    // blocked on a full event channel during cancellation or error cleanup.
     for handle in &mut worker_handles {
-        if let Some(h) = handle.take() {
-            let _ = h.await;
+        if let Some(mut handle) = handle.take() {
+            loop {
+                tokio::select! {
+                    joined = &mut handle => {
+                        if let Err(error) = joined {
+                            if error.is_cancelled() { tracing::debug!("HTTP worker cancelled"); }
+                            else {
+                                crate::logger::report_warning("http-coordinator", "join worker", &error);
+                                if matches!(final_error, None | Some(DownloadError::Cancelled)) {
+                                    final_error = Some(DownloadError::Other(format!("HTTP worker join failed: {error}")));
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    Some(event) = event_rx.recv() => record_shutdown_worker_event(event, &mut final_error),
+                }
+            }
         }
+    }
+    while let Ok(event) = event_rx.try_recv() {
+        record_shutdown_worker_event(event, &mut final_error);
     }
     // Preserve range geometry after the last body reader leaves.
     let (_, mut runtime) = sampled_http_runtime(
@@ -3491,13 +3582,7 @@ pub async fn run_coordinated_download(
         .values()
         .map(|s| (s.index, s.downloaded_bytes))
         .collect();
-    if let Err(e) = db.flush_segments_progress(task_id, flush_updates).await {
-        log_info!(
-            "[coordinator] task {} final flush failed (non-fatal): {}",
-            task_id,
-            e
-        );
-    }
+    db.flush_segments_progress(task_id, flush_updates).await?;
     // The coordinator's last geometry must reach the reporter before the caller's
     // completion frame; a fast download may never have hit the periodic tick.
     let report_total = if scope.total_override > 0 {
@@ -3520,7 +3605,7 @@ pub async fn run_coordinated_download(
         source_base,
         &mut source_peak,
     );
-    let _ = progress_tx
+    if progress_tx
         .send(ProgressUpdate {
             task_id: task_id.to_owned(),
             downloaded_bytes: seg_total + scope.base,
@@ -3530,7 +3615,11 @@ pub async fn run_coordinated_download(
             runtime: Some(runtime),
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("HTTP progress receiver closed");
+    }
 
     // ----- 9. 正面域名学习 --------------------------------------------------
     // 任务全程无拒绝/降级/连接敏感信号且以多连接规模真实运行过 → 把
@@ -4314,81 +4403,36 @@ fn sync_downloaded_from_shared(
 /// end_byte update are persisted in a **single** SQLite transaction via
 /// `Db::persist_split`, preventing crash-induced overlaps.
 ///
-/// When no parent is given (simple re-assignment), only the child is upserted.
+/// Reassignments preserve the existing durable DB offset; only new splits write rows.
 async fn persist_segment_change(
     db: &Db,
     task_id: &str,
     segments: &BTreeMap<i32, LiveSegment>,
     changed_index: i32,
     split_parent: Option<i32>,
-) {
-    let Some(seg) = segments.get(&changed_index) else {
-        return;
+) -> Result<(), DownloadError> {
+    // Reassignments already have a DB row. Never upsert live (not yet synced)
+    // progress from the visualization map as a durable resume checkpoint.
+    let Some(parent_idx) = split_parent else {
+        return Ok(());
     };
-
-    if let Some(parent_idx) = split_parent {
-        // Split scenario: atomic transaction for both child + parent.
-        if let Some(parent) = segments.get(&parent_idx) {
-            if let Err(e) = db
-                .persist_split(
-                    task_id,
-                    seg.index,
-                    seg.start_byte,
-                    seg.end_byte,
-                    seg.downloaded_bytes,
-                    parent.index,
-                    parent.end_byte,
-                )
-                .await
-            {
-                log_info!(
-                    "[coordinator] persist_split failed: task={}, child={}, parent={}, err={}",
-                    task_id,
-                    seg.index,
-                    parent.index,
-                    e
-                );
-            }
-        } else {
-            // Parent not found in map — fall back to child-only upsert.
-            if let Err(e) = db
-                .upsert_segment(
-                    task_id,
-                    seg.index,
-                    seg.start_byte,
-                    seg.end_byte,
-                    seg.downloaded_bytes,
-                )
-                .await
-            {
-                log_info!(
-                    "[coordinator] upsert_segment failed: task={}, seg={}, err={}",
-                    task_id,
-                    seg.index,
-                    e
-                );
-            }
-        }
-    } else {
-        // No parent — simple upsert (e.g. reassigning a pending segment).
-        if let Err(e) = db
-            .upsert_segment(
-                task_id,
-                seg.index,
-                seg.start_byte,
-                seg.end_byte,
-                seg.downloaded_bytes,
-            )
-            .await
-        {
-            log_info!(
-                "[coordinator] upsert_segment failed: task={}, seg={}, err={}",
-                task_id,
-                seg.index,
-                e
-            );
-        }
-    }
+    let child = segments
+        .get(&changed_index)
+        .ok_or_else(|| DownloadError::Other(format!("missing split child {changed_index}")))?;
+    let parent = segments
+        .get(&parent_idx)
+        .ok_or_else(|| DownloadError::Other(format!("missing split parent {parent_idx}")))?;
+    db.persist_split(
+        task_id,
+        child.index,
+        child.start_byte,
+        child.end_byte,
+        0,
+        parent.index,
+        parent.end_byte,
+    )
+    .await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4574,23 +4618,33 @@ fn spawn_worker(
 
             match result {
                 Ok(downloaded) => {
-                    let _ = event_tx
+                    if event_tx
                         .send(WorkerEvent::Done {
                             worker_id,
                             seg_index: assignment.seg_index,
                             downloaded_bytes: downloaded,
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("HTTP coordinator event receiver closed");
+                        break;
+                    }
                 }
                 Err(DownloadError::Cancelled) if !cancel_token.is_cancelled() => {
                     // 仅本段令牌被取消 = coordinator 完成时间抢占：进度已在
                     // 取消分支刷盘并写入 seg_states；上报后保活等待新派工。
-                    let _ = event_tx
+                    if event_tx
                         .send(WorkerEvent::Preempted {
                             worker_id,
                             seg_index: assignment.seg_index,
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("HTTP coordinator event receiver closed");
+                        break;
+                    }
                 }
                 Err(DownloadError::Cancelled) => {
                     // Don't report — coordinator already knows via cancel_token.
@@ -4624,6 +4678,7 @@ fn spawn_worker(
                     // 接手，而不是整个任务失败。HTTP 状态/校验类错误保持原语义
                     // （源站拒绝学习、清盘回退）。
                     let sys_transport_fallback = !lease_attributable
+                        && !matches!(e, DownloadError::Io(_) | DownloadError::Db(_))
                         && crate::auto_proxy::is_route_transport_error(
                             &crate::downloader::download_error_chain_text(&e),
                         )
@@ -4645,13 +4700,18 @@ fn spawn_worker(
                         e,
                         DownloadError::TrueSizeLarger(_) | DownloadError::CdnNodeFailed(_)
                     );
-                    let _ = event_tx
+                    if event_tx
                         .send(WorkerEvent::Failed {
                             worker_id,
                             seg_index: assignment.seg_index,
                             error: e,
                         })
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("HTTP coordinator event receiver closed");
+                        break;
+                    }
                     if !recoverable {
                         break;
                     }
@@ -4817,6 +4877,9 @@ async fn do_segment_with_retry(
                 return Err(DownloadError::RangeNotSupported(format!("416 ({e})")));
             }
             Err(e) => {
+                if cancel.is_cancelled() {
+                    return Err(e);
+                }
                 // 403/429 是服务器明确拒绝多连接；400 在配额型端点同样意味着
                 // "这条连接不会被服务"（见 is_http_400）——重试只会空烧退避，
                 // 还会拖慢 coordinator 的开放式首段吸收时机（需要在其余 worker
@@ -4862,9 +4925,8 @@ async fn do_segment_with_retry(
                 );
                 // Recover actual_start *and* seg_end from DB for partial progress.
                 // seg_end may have been shrunk by a coordinator split since we started.
-                if let Ok(segs) = db.load_segments(task_id).await
-                    && let Some(seg) = segs.iter().find(|s| s.index == seg_idx)
-                {
+                let segs = db.load_segments(task_id).await?;
+                if let Some(seg) = segs.iter().find(|s| s.index == seg_idx) {
                     seg_end = seg.end_byte;
                     actual_start = seg_start + seg.downloaded_bytes;
                     if actual_start > seg_end {
@@ -4877,13 +4939,18 @@ async fn do_segment_with_retry(
                     _ = cancel.cancelled() => return Err(DownloadError::Cancelled),
                     _ = tokio::time::sleep(delay) => {}
                 }
-                let _ = event_tx
+                if event_tx
                     .send(WorkerEvent::Retrying {
                         seg_index: seg_idx,
                         attempt: attempts,
                         error: e.to_string(),
                     })
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("HTTP coordinator event receiver closed");
+                    return Err(DownloadError::Cancelled);
+                }
             }
         }
     }
@@ -5009,10 +5076,13 @@ async fn do_segment(
                 Ordering::Relaxed,
             )
             .is_ok()
-        {
-            let _ = event_tx
+            && event_tx
                 .send(WorkerEvent::RangeVerdict { supports_range })
-                .await;
+                .await
+                .is_err()
+        {
+            tracing::debug!("HTTP coordinator event receiver closed");
+            return Err(DownloadError::Cancelled);
         }
     }
 
@@ -5371,7 +5441,14 @@ async fn do_segment(
     // hint 模式 RangeVerdict 已在上方先发，保证 coordinator 先处理裁决。
     if open_ended && !*open_ended_established_sent {
         *open_ended_established_sent = true;
-        let _ = event_tx.send(WorkerEvent::OpenEndedEstablished).await;
+        if event_tx
+            .send(WorkerEvent::OpenEndedEstablished)
+            .await
+            .is_err()
+        {
+            tracing::debug!("HTTP coordinator event receiver closed");
+            return Err(DownloadError::Cancelled);
+        }
     }
 
     // 到这里响应已通过状态、Range、validator、大小与编码校验；在 body 流存活
@@ -5420,15 +5497,14 @@ async fn do_segment(
         tokio::select! {
             _ = cancel.cancelled() => {
                 file.flush().await?;
-                // best-effort fdatasync：cancel 落库的偏移会被 resume 信任，掉电
-                // 后页缓存丢失会致空洞。失败不掩盖 Cancelled（见 BUG-COORD-FSYNC）。
-                let _ = file.get_ref().sync_data().await;
+                // Resume trusts this offset: a failed sync must not advance its checkpoint.
+                file.get_ref().sync_data().await?;
                 update_seg_state(seg_states, seg_idx, seg_downloaded);
-                let _ = db
+                db
                     .update_segment_progress_bounded(
                         task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
                     )
-                    .await;
+                    .await?;
                 return Err(DownloadError::Cancelled);
             }
             result = tokio::time::timeout(
@@ -5448,14 +5524,21 @@ async fn do_segment(
                 let chunk = match result {
                     Ok(c) => c,
                     Err(_) => {
-                        file.flush().await?;
-                        let _ = file.get_ref().sync_data().await;
-                        update_seg_state(seg_states, seg_idx, seg_downloaded);
-                        let _ = db
-                            .update_segment_progress_bounded(
-                                task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
-                            )
-                            .await;
+                        let checkpoint = async {
+                            file.flush().await?;
+                            file.get_ref().sync_data().await?;
+                            update_seg_state(seg_states, seg_idx, seg_downloaded);
+                            db
+                                .update_segment_progress_bounded(
+                                    task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
+                                )
+                                .await?;
+                            Ok::<(), DownloadError>(())
+                        }.await;
+                        if let Err(cleanup_error) = checkpoint {
+                            crate::logger::report_warning("http-coordinator", "persist segment after stall", &cleanup_error);
+                            update_seg_state(seg_states, seg_idx, durable_offset);
+                        }
                         let stall_secs = if reconnect_hostile.load(Ordering::Relaxed) {
                             CHUNK_STALL_TIMEOUT_HOSTILE.as_secs()
                         } else {
@@ -5501,13 +5584,13 @@ async fn do_segment(
                                     seg_downloaded += written;
                                     total_downloaded.fetch_add(written, Ordering::Relaxed);
                                     file.flush().await?;
-                                    let _ = file.get_ref().sync_data().await;
+                                    file.get_ref().sync_data().await?;
                                     update_seg_state(seg_states, seg_idx, seg_downloaded);
-                                    let _ = db
+                                    db
                                         .update_segment_progress_bounded(
                                             task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
                                         )
-                                        .await;
+                                        .await?;
                                     return Err(DownloadError::Cancelled);
                                 }
                                 allowed = speed_limiter.consume(remaining) => allowed,
@@ -5577,14 +5660,21 @@ async fn do_segment(
                         }
                     }
                     Some(Err(e)) => {
-                        file.flush().await?;
-                        let _ = file.get_ref().sync_data().await;
-                        update_seg_state(seg_states, seg_idx, seg_downloaded);
-                        let _ = db
-                            .update_segment_progress_bounded(
-                                task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
-                            )
-                            .await;
+                        let checkpoint = async {
+                            file.flush().await?;
+                            file.get_ref().sync_data().await?;
+                            update_seg_state(seg_states, seg_idx, seg_downloaded);
+                            db
+                                .update_segment_progress_bounded(
+                                    task_id, seg_idx, seg_downloaded, seg_start, spawn_gen,
+                                )
+                                .await?;
+                            Ok::<(), DownloadError>(())
+                        }.await;
+                        if let Err(cleanup_error) = checkpoint {
+                            crate::logger::report_warning("http-coordinator", "persist segment after read failure", &cleanup_error);
+                            update_seg_state(seg_states, seg_idx, durable_offset);
+                        }
                         return Err(DownloadError::Request(e));
                     }
                     None => break,
@@ -5624,15 +5714,14 @@ async fn do_segment(
             // 确保 do_segment_with_retry 以 seg_start + downloaded_bytes 续传本段，
             // 而非从头重下，也不污染 total_downloaded 计数。
             update_seg_state(seg_states, seg_idx, seg_downloaded);
-            let _ = db
-                .update_segment_progress_bounded(
-                    task_id,
-                    seg_idx,
-                    seg_downloaded,
-                    seg_start,
-                    spawn_gen,
-                )
-                .await;
+            db.update_segment_progress_bounded(
+                task_id,
+                seg_idx,
+                seg_downloaded,
+                seg_start,
+                spawn_gen,
+            )
+            .await?;
             return Err(DownloadError::Other(format!(
                 "segment {} truncated: received {} bytes, expected {} (server closed stream early)",
                 seg_idx,
@@ -5661,11 +5750,29 @@ async fn do_segment(
     }
 
     update_seg_state(seg_states, seg_idx, seg_downloaded);
-    let _ = db
-        .update_segment_progress_bounded(task_id, seg_idx, seg_downloaded, seg_start, spawn_gen)
-        .await;
+    db.update_segment_progress_bounded(task_id, seg_idx, seg_downloaded, seg_start, spawn_gen)
+        .await?;
 
     Ok(seg_downloaded)
+}
+
+/// During shutdown only local persistence failures can replace a normal cancellation.
+fn record_shutdown_worker_event(event: WorkerEvent, final_error: &mut Option<DownloadError>) {
+    if let WorkerEvent::Failed { error, .. } = event {
+        if matches!(error, DownloadError::Io(_) | DownloadError::Db(_)) {
+            if matches!(final_error, None | Some(DownloadError::Cancelled)) {
+                *final_error = Some(error);
+            } else {
+                crate::logger::report_warning(
+                    "http-coordinator",
+                    "persist another segment during shutdown",
+                    &error,
+                );
+            }
+        } else {
+            tracing::debug!(%error, "HTTP worker exited while coordinator was stopping");
+        }
+    }
 }
 
 /// Update a single segment's `downloaded_bytes` in the shared visualization state.
@@ -5797,7 +5904,207 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"existing partial data");
         assert!(db.load_segments("second").await.unwrap().is_empty());
         drop(first);
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
+    }
+
+    #[tokio::test]
+    async fn redispatch_keeps_durable_offset_and_split_starts_new_child_at_zero() {
+        let db = crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("open DB");
+        db.insert_task(
+            "layout",
+            "http://localhost/f",
+            "f",
+            "",
+            2,
+            100,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        db.insert_segments("layout", &[(0, 0, 99)])
+            .await
+            .expect("insert segment");
+        db.update_segment_progress("layout", 0, 10)
+            .await
+            .expect("save durable offset");
+        let mut segments = BTreeMap::new();
+        segments.insert(0, make_seg(0, 0, 99, 50, SegState::Pending));
+        super::persist_segment_change(&db, "layout", &segments, 0, None)
+            .await
+            .expect("redispatch");
+        assert_eq!(
+            db.load_segments("layout").await.expect("load segment")[0].downloaded_bytes,
+            10,
+            "live progress must never become a durable offset on redispatch"
+        );
+        segments.get_mut(&0).expect("parent").end_byte = 74;
+        segments.insert(1, make_seg(1, 75, 99, 0, SegState::Pending));
+        super::persist_segment_change(&db, "layout", &segments, 1, Some(0))
+            .await
+            .expect("split");
+        let rows = db.load_segments("layout").await.expect("load split");
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.index, r.start_byte, r.end_byte, r.downloaded_bytes))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 74, 10), (1, 75, 99, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinated_cancel_joins_readers_and_preserves_durable_prefixes() {
+        use crate::events::{EngineEvent, EventSink};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        struct Sink;
+        impl EventSink for Sink {
+            fn emit(&self, _: EngineEvent) {}
+        }
+        const TOTAL: i64 = 4 * 1024 * 1024;
+        let db = crate::db::Db::connect("sqlite::memory:")
+            .await
+            .expect("open DB");
+        db.insert_task(
+            "cancel",
+            "http://localhost/f",
+            "f",
+            "",
+            4,
+            TOTAL,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind HTTP server");
+        let url = format!(
+            "http://{}/f",
+            listener.local_addr().expect("server address")
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let server_cancel = cancel.clone();
+        let server = tokio::spawn(async move {
+            let mut readers = tokio::task::JoinSet::new();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = server_cancel.cancelled() => break,
+                    accepted = listener.accept() => accepted.expect("accept HTTP request"),
+                };
+                let cancel = server_cancel.clone();
+                readers.spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = socket.read(&mut buf).await.expect("read request");
+                        if n == 0 { return; }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    let text = String::from_utf8(request).expect("ASCII request").to_ascii_lowercase();
+                    let range = text.lines().find_map(|line| line.strip_prefix("range: bytes=")).expect("Range request");
+                    let (start, end) = range.trim().split_once('-').expect("range bounds");
+                    let start: i64 = start.parse().expect("range start");
+                    let end: i64 = if end.is_empty() { TOTAL - 1 } else { end.parse().expect("range end") };
+                    let header = format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{end}/{TOTAL}\r\nConnection: close\r\n\r\n", end - start + 1);
+                    socket.write_all(header.as_bytes()).await.expect("send headers");
+                    socket.write_all(&[0x5a; 16 * 1024]).await.expect("send prefix");
+                    cancel.cancelled().await;
+                });
+            }
+            while let Some(joined) = readers.join_next().await {
+                joined.expect("server reader finishes");
+            }
+        });
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_coord_cancel_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fixture directory");
+        let dest = dir.join("f.fdownloading");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let spec = crate::downloader::RequestSpec {
+            method: reqwest::Method::GET,
+            cookies: String::new(),
+            referrer: String::new(),
+            extra_headers: std::collections::HashMap::new(),
+            body: None,
+        };
+        let pool = crate::cdn::NodePool::single(
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("build client"),
+        );
+        let limiter = crate::speed_limiter::SpeedLimiter::new(0);
+        let download = super::run_coordinated_download(
+            "cancel",
+            &url,
+            &dest,
+            TOTAL,
+            false,
+            4,
+            pool,
+            &db,
+            &tx,
+            &cancel,
+            &limiter,
+            &spec,
+            &Sink,
+            "",
+            "",
+            super::ReportScope::whole_task(),
+            1,
+            false,
+            None,
+            None,
+        );
+        tokio::pin!(download);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut download => panic!("partial response completed before cancellation: {result:?}"),
+                    update = rx.recv() => if update.expect("progress channel alive").downloaded_bytes > 0 { break; },
+                }
+            }
+        }).await.expect("observe downloaded prefix");
+        cancel.cancel();
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), &mut download)
+                .await
+                .expect("coordinator joins cancelled readers"),
+            Err(crate::downloader::DownloadError::Cancelled)
+        ));
+        server.await.expect("HTTP server stops");
+        let rows = db
+            .load_segments("cancel")
+            .await
+            .expect("load durable checkpoints");
+        let disk = tokio::fs::read(&dest).await.expect("read partial file");
+        assert!(
+            rows.iter().any(|row| row.downloaded_bytes > 0),
+            "observed bytes must remain resumable after clean cancellation"
+        );
+        for row in rows {
+            let start = row.start_byte as usize;
+            let end = start + row.downloaded_bytes as usize;
+            assert!(
+                disk[start..end].iter().all(|byte| *byte == 0x5a),
+                "checkpoint cannot include preallocated zero bytes"
+            );
+        }
+        assert_eq!(disk.len(), TOTAL as usize);
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove fixture directory");
     }
 
     fn make_seg(index: i32, start: i64, end: i64, downloaded: i64, state: SegState) -> LiveSegment {
@@ -6786,22 +7093,6 @@ mod tests {
         )));
     }
 
-    /// 编译时验证 is_server_rejection 可以接受 DownloadError::Request 变体。
-    /// 构造真实的 reqwest::Error(403/429) 需要 `http` crate，此处仅验证类型兼容性。
-    #[test]
-    fn server_rejection_accepts_request_variant() {
-        // 不实际发起 HTTP 请求，仅验证代码路径可编译。
-        if false {
-            let client = reqwest::Client::new();
-            let _fut = async {
-                let resp = client.get("http://x").send().await.unwrap();
-                let err = resp.error_for_status().unwrap_err();
-                let dl_err = DownloadError::Request(err);
-                let _ = is_server_rejection(&dl_err);
-            };
-        }
-    }
-
     // -----------------------------------------------------------------------
     // 域名缓存（extract_host / record / is_single_conn）
     // -----------------------------------------------------------------------
@@ -7212,7 +7503,11 @@ mod tests {
         );
 
         drop(db);
-        let _ = std::fs::remove_dir_all(dir);
+        if let Err(error) = std::fs::remove_dir_all(dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
     }
 
     #[tokio::test]
@@ -7304,7 +7599,11 @@ mod tests {
             cache.remove(mixed_host);
         }
         drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
     }
 
     #[tokio::test]
@@ -7338,7 +7637,11 @@ mod tests {
             cache.remove(&host);
         }
         drop(db);
-        let _ = std::fs::remove_dir_all(&dir);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
     }
 
     #[test]
@@ -7425,7 +7728,7 @@ mod tests {
 
     /// 在系统临时目录创建一个内容非空、可读写的临时文件，返回其路径与已打开的
     /// `tokio::fs::File` 句柄。调用方负责在测试结束时
-    /// `let _ = std::fs::remove_file(&path);` 清理（失败无需 panic）。
+    /// 关闭文件句柄后显式处理临时文件清理错误。
     async fn open_sync_gate_test_file() -> (std::path::PathBuf, tokio::fs::File) {
         let path = std::env::temp_dir().join(format!("fdgate-{}", uuid::Uuid::new_v4()));
         std::fs::write(&path, b"fluxdown-file-sync-gate-test").expect("write temp file content");
@@ -7463,7 +7766,8 @@ mod tests {
              若返回了不同的 Instant，说明合并逻辑失效，退化成了每次都重新 fdatasync"
         );
 
-        let _ = std::fs::remove_file(&path);
+        drop(file);
+        std::fs::remove_file(&path).expect("test cleanup succeeds");
     }
 
     // gap 之外必须真正触发新一轮 fsync：验证“新鲜度”判据没有被写反（例如
@@ -7495,7 +7799,8 @@ mod tests {
              s2 <= s1 意味着 gap 判据失效（要么从不刷新，要么被误判为仍然新鲜）"
         );
 
-        let _ = std::fs::remove_file(&path);
+        drop(file);
+        std::fs::remove_file(&path).expect("test cleanup succeeds");
     }
 
     // 并发突发场景：多个 worker 同时对同一 gate 发起 sync_if_stale，必须全部
@@ -7538,7 +7843,8 @@ mod tests {
             distinct.len()
         );
 
-        let _ = std::fs::remove_file(&path);
+        drop(file);
+        std::fs::remove_file(&path).expect("test cleanup succeeds");
     }
 
     // -----------------------------------------------------------------------
@@ -7566,7 +7872,8 @@ mod tests {
             );
         }
 
-        let _ = std::fs::remove_file(&path);
+        drop(file);
+        std::fs::remove_file(&path).expect("test cleanup succeeds");
     }
 
     /// 新鲜覆盖复用：T0 sync 后以 snap_t < T0 调用返回同一 T0。
@@ -7591,7 +7898,8 @@ mod tests {
             "snap_t ≤ last_completed_start 时必须复用同一起始时刻"
         );
 
-        let _ = std::fs::remove_file(&path);
+        drop(file);
+        std::fs::remove_file(&path).expect("test cleanup succeeds");
     }
 
     /// 过期强制：snap_t > last S 时必产生新 S ≥ snap_t（不受 MIN_SYNC_GAP 阻挡）。
@@ -7620,7 +7928,8 @@ mod tests {
              s1={s1:?} s2={s2:?} snap_t={snap_t:?}"
         );
 
-        let _ = std::fs::remove_file(&path);
+        drop(file);
+        std::fs::remove_file(&path).expect("test cleanup succeeds");
     }
 
     // -----------------------------------------------------------------------

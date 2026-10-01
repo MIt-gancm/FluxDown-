@@ -42,15 +42,21 @@ pub fn run_blocking(host: ShellHost) -> AgentResult {
 pub(crate) async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let Ok(mut terminate) = signal(SignalKind::terminate()) else {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
+    let mut terminate = match signal(SignalKind::terminate()) {
+        Ok(terminate) => terminate,
+        Err(error) => {
+            tracing::warn!(error = %error, "could not register SIGTERM handler; falling back to Ctrl-C");
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::error!(error = %error, "could not wait for shutdown signals");
+                std::future::pending::<()>().await;
+            }
+            return;
         }
-        return;
     };
     tokio::select! {
         result = tokio::signal::ctrl_c() => {
-            if result.is_err() {
+            if let Err(error) = result {
+                tracing::warn!(error = %error, "could not wait for Ctrl-C; waiting for SIGTERM");
                 terminate.recv().await;
             }
         }
@@ -61,7 +67,8 @@ pub(crate) async fn shutdown_signal() {
 /// GUI 子系统进程没有控制台时 Ctrl-C 处理器可能注册失败：失败即永不触发，而不是立刻退出。
 #[cfg(not(unix))]
 pub(crate) async fn shutdown_signal() {
-    if tokio::signal::ctrl_c().await.is_err() {
+    if let Err(error) = tokio::signal::ctrl_c().await {
+        tracing::warn!(error = %error, "Ctrl-C unavailable; waiting for another agent shutdown source");
         std::future::pending::<()>().await;
     }
 }
@@ -398,11 +405,19 @@ pub(crate) async fn run_with(
     if server.is_none() {
         crate::clipboard_watch::spawn(events.clone(), gateway_service.clone(), cancel.clone());
     }
-    if server.is_none()
-        && let Ok(Err(error)) =
-            tokio::task::spawn_blocking(crate::platform::migrate_legacy_autostart).await
-    {
-        tracing::warn!(error = %error, "could not migrate legacy autostart entry");
+    if server.is_none() {
+        match tokio::task::spawn_blocking(crate::platform::migrate_legacy_autostart).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not migrate legacy autostart entry");
+            }
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!("legacy autostart migration task cancelled during shutdown");
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "legacy autostart migration task panicked");
+            }
+        }
     }
     let server_handle = match server_config {
         Some(config) => {
@@ -443,26 +458,71 @@ pub(crate) async fn run_with(
     .await
     .map_err(Into::into);
     cancel.cancel();
-    // daemon 启动失败 / 迁移失败时 readiness 任务取消了 Gateway：以它的错误作为退出原因。
-    let result = match (result, readiness_task.await) {
-        (Ok(()), Ok(Err(error))) => Err(error),
-        (result, _) => result,
-    };
-    let _ = event_task.await;
-    let _ = cdn_task.await;
-    let _ = sync_task.await;
-    let _ = remote_task.await;
-    let _ = link_task.await;
-    let _ = device_meta_task.await;
-    let _ = effects_task.await;
-    let _ = analytics_task.await;
-    let _ = power_task.await;
-    let _ = shell_task.await;
+    // 所有后台任务都收尾：保留 Gateway / readiness 的首错，同时记录其他故障。
+    let mut result = result;
+    match readiness_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            if result.is_ok() {
+                result = Err(error);
+            } else {
+                tracing::error!(error = %error, "daemon readiness failed during shutdown");
+            }
+        }
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!("daemon readiness task cancelled during shutdown");
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "daemon readiness task panicked");
+            if result.is_ok() {
+                result = Err(error.into());
+            }
+        }
+    }
+    for (task, handle) in [
+        ("daemon event projection", event_task),
+        ("CDN", cdn_task),
+        ("cloud sync", sync_task),
+        ("remote tasks", remote_task),
+        ("device link", link_task),
+        ("device metadata", device_meta_task),
+        ("background effects", effects_task),
+        ("analytics", analytics_task),
+        ("power", power_task),
+        ("shell", shell_task),
+    ] {
+        match handle.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => {
+                tracing::debug!(task, "agent background task cancelled during shutdown");
+            }
+            Err(error) => {
+                tracing::error!(task, error = %error, "agent background task panicked");
+                if result.is_ok() {
+                    result = Err(error.into());
+                }
+            }
+        }
+    }
     if server.is_some() {
         // server 模式的 NMH 占位任务永不自行结束。
         nmh_task.abort();
     }
-    let _ = nmh_task.await;
+    match nmh_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "NMH IPC service stopped; browser relay unavailable");
+        }
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!("NMH task cancelled during shutdown");
+        }
+        Err(error) => {
+            tracing::error!(error = %error, "NMH task panicked");
+            if result.is_ok() {
+                result = Err(error.into());
+            }
+        }
+    }
     result
 }
 
@@ -503,8 +563,9 @@ async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
         // 慢盘 / NAS 冷启动可能远超 30s：daemon 客户端自己持续重连，这里持续等待并周期性
         // 报告状态；只有 agent 退出（信号 / daemon 致命错误 → cancel）才结束等待。
         let started = std::time::Instant::now();
-        while daemon.wait_ready(DAEMON_READY_POLL).await.is_err() {
+        while let Err(error) = daemon.wait_ready(DAEMON_READY_POLL).await {
             tracing::warn!(
+                error = ?error,
                 waited_secs = started.elapsed().as_secs(),
                 "fluxdownd is not ready yet; still waiting"
             );
@@ -544,8 +605,11 @@ async fn await_daemon_ready(readiness: DaemonReadiness) -> AgentResult {
         );
         api_token.set(state.gateway_user_token.clone());
         // 令牌与开关都已就位：放行首次设置 / 状态接口（避免 setup 在迁移前落定、被迁移覆盖）。
-        if let Some(server) = &server {
-            let _ = server.ready.send(true);
+        if let Some(server) = &server
+            && server.ready.send(true).is_err()
+        {
+            // Gateway 已退出时没有 readiness 接收者，无须把正常关停当成引导失败。
+            tracing::debug!("server readiness receiver closed during shutdown");
         }
         Ok(())
     };
@@ -686,9 +750,13 @@ async fn load_daemon_bearer(
     supervisor: &DaemonSupervisor,
     cancel: &CancellationToken,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    if let Ok(token) = tokio::fs::read_to_string(&paths.daemon_token_file).await
-        && !token.trim().is_empty()
-    {
+    let token = match tokio::fs::read_to_string(&paths.daemon_token_file).await {
+        Ok(token) => token,
+        // 冷启动时 daemon 尚未生成令牌，只有缺失允许进入启动 / 等待路径。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    if !token.trim().is_empty() {
         return Ok(token.trim().to_owned());
     }
     let address = daemon_socket_address(&paths.daemon_rpc_url)?;
@@ -705,9 +773,12 @@ async fn load_daemon_bearer(
     const TICKS_PER_CHECK: u32 = 300;
     let mut remaining = TICKS_PER_CHECK;
     loop {
-        if let Ok(token) = tokio::fs::read_to_string(&paths.daemon_token_file).await
-            && !token.trim().is_empty()
-        {
+        let token = match tokio::fs::read_to_string(&paths.daemon_token_file).await {
+            Ok(token) => token,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        if !token.trim().is_empty() {
             return Ok(token.trim().to_owned());
         }
         tokio::select! {
@@ -837,8 +908,11 @@ pub fn resolve_agent_data_dir() -> Result<PathBuf, Box<dyn std::error::Error + S
     if let Some(portable) = portable_data_dir() {
         // 便携版与引擎 data_dir 同判定；旧版本把状态写在 ProjectDirs，首启迁移一次。
         let target = portable.join("agent");
-        if let Ok(legacy) = project_root().map(|root| root.join("agent")) {
-            migrate_legacy_agent_state(&legacy, &target);
+        match project_root() {
+            Ok(root) => migrate_legacy_agent_state(&root.join("agent"), &target),
+            Err(error) => {
+                tracing::warn!(error = %error, "could not locate legacy agent state for portable migration");
+            }
         }
         return Ok(target);
     }
@@ -865,8 +939,12 @@ fn migrate_legacy_agent_state(legacy: &Path, target: &Path) {
     if to.exists() || !from.is_file() {
         return;
     }
-    if std::fs::create_dir_all(target).is_ok() {
-        let _ = std::fs::copy(&from, &to);
+    if let Err(error) = std::fs::create_dir_all(target) {
+        tracing::warn!(path = %target.display(), error = %error, "could not create portable agent state directory");
+        return;
+    }
+    if let Err(error) = std::fs::copy(&from, &to) {
+        tracing::warn!(source = %from.display(), target = %to.display(), error = %error, "could not migrate legacy agent state");
     }
 }
 

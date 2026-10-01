@@ -110,11 +110,22 @@ async fn start_range_server(
                 let (start, end, status) = match range {
                     Some((s, e)) if s >= 0 && s <= e && s < total => (s, e, 206),
                     Some(_) => {
-                        let _ = stream
+                        stream
                             .write_all(
                                 b"HTTP/1.1 416 Range Not Satisfiable\r\nConnection: close\r\n\r\n",
                             )
-                            .await;
+                            .await
+                            .unwrap_or_else(|error| {
+                                assert!(
+                                    matches!(
+                                        error.kind(),
+                                        std::io::ErrorKind::BrokenPipe
+                                            | std::io::ErrorKind::ConnectionReset
+                                            | std::io::ErrorKind::ConnectionAborted
+                                    ),
+                                    "test server response failed: {error}"
+                                );
+                            });
                         return;
                     }
                     None => (0, total - 1, 200),
@@ -160,7 +171,18 @@ async fn start_range_server(
                     }
                     off = chunk_end;
                 }
-                let _ = stream.flush().await;
+
+                stream.flush().await.unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             });
         }
     });
@@ -228,7 +250,14 @@ async fn track_pair_multi_segment_pause_resume_and_pair_coordinates() {
     let base = start_range_server(video.clone(), audio.clone(), ledger.clone()).await;
 
     let work_dir = std::env::temp_dir().join("fluxdown-rt-trackpair-resume");
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     tokio::fs::create_dir_all(&work_dir).await.unwrap();
     let db = Db::open(&work_dir).await.expect("db");
     db.insert_task(
@@ -266,7 +295,10 @@ async fn track_pair_multi_segment_pause_resume_and_pair_coordinates() {
         &base, &work_dir, &db, tx, cancel, 1,
     ))
     .await;
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
 
     // 暂停后现场：段行与临时文件必须保留（真续传的前提）。
     let rows_after_pause = db.load_segments("tpr").await.expect("load segments");
@@ -305,7 +337,10 @@ async fn track_pair_multi_segment_pause_resume_and_pair_coordinates() {
         2,
     ))
     .await;
-    let _ = collector2.await;
+
+    collector2
+        .await
+        .expect("test background task must not panic");
 
     // ---- 断言 1：产物字节精确（mux 无 ffmpeg 时为视频 + 独立音频双文件）。----
     let video_out = work_dir.join("pair.mp4");
@@ -401,5 +436,9 @@ async fn track_pair_multi_segment_pause_resume_and_pair_coordinates() {
         "audio segments must be shifted past the video track"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work_dir).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

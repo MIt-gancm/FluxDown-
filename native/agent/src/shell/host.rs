@@ -53,8 +53,12 @@ struct ProxyPort(Mutex<EventLoopProxy<HostEvent>>);
 
 impl TrayPort for ProxyPort {
     fn apply(&self, model: &TrayModel) {
-        if let Ok(proxy) = self.0.lock() {
-            let _ = proxy.send_event(HostEvent::Apply(model.clone()));
+        let proxy = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if proxy.send_event(HostEvent::Apply(model.clone())).is_err() {
+            tracing::trace!("tray event loop closed before model update");
         }
     }
 }
@@ -134,8 +138,12 @@ where
                     .name("fluxdown-agent-runtime".to_owned())
                     .spawn(move || {
                         let result = run_runtime(host);
-                        let _ = done_tx.send(());
-                        let _ = finished_proxy.send_event(HostEvent::RuntimeFinished);
+                        if done_tx.send(()).is_err() {
+                            tracing::debug!("tray host dropped its runtime completion receiver");
+                        }
+                        if finished_proxy.send_event(HostEvent::RuntimeFinished).is_err() {
+                            tracing::debug!("tray event loop closed before runtime completion");
+                        }
                         result
                     });
                 match spawned {
@@ -172,17 +180,32 @@ where
             }
             Event::Opened { urls } => {
                 let urls = urls.iter().map(ToString::to_string).collect::<Vec<_>>();
-                let _ = actions_tx.send(TrayAction::OpenUrls(urls));
+                if actions_tx.send(TrayAction::OpenUrls(urls)).is_err() {
+                    tracing::debug!("agent runtime closed before URL-open tray action");
+                }
             }
             Event::Reopen { .. } => {
-                let _ = actions_tx.send(TrayAction::ShowWindow);
+                if actions_tx.send(TrayAction::ShowWindow).is_err() {
+                    tracing::debug!("agent runtime closed before window-reopen tray action");
+                }
             }
             Event::LoopDestroyed => {
                 if !finished {
                     // 系统结束会话：tao 在本回调返回后即结束进程，这里同步等完全退出。
-                    let _ = actions_tx.send(TrayAction::SessionEnd);
+                    if actions_tx.send(TrayAction::SessionEnd).is_err() {
+                        tracing::debug!("agent runtime closed before session-end tray action");
+                    }
                     if let Some(rx) = done_rx.as_ref() {
-                        let _ = rx.recv_timeout(SESSION_END_BUDGET);
+                        match rx.recv_timeout(SESSION_END_BUDGET) {
+                            Ok(()) => tracing::debug!("agent runtime finished during session end"),
+                            Err(std_mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                                budget_ms = SESSION_END_BUDGET.as_millis(),
+                                "agent runtime exceeded session-end shutdown budget; daemon cleanup may be interrupted"
+                            ),
+                            Err(std_mpsc::RecvTimeoutError::Disconnected) => tracing::warn!(
+                                "agent runtime completion channel closed without a session-end completion signal"
+                            ),
+                        }
                     }
                 }
                 ui = None;
@@ -280,8 +303,10 @@ impl TrayUi {
         };
         let menu_actions = actions.clone();
         MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-            if let Some(action) = ids.action(&event.id) {
-                let _ = menu_actions.send(action);
+            if let Some(action) = ids.action(&event.id)
+                && menu_actions.send(action).is_err()
+            {
+                tracing::debug!("agent runtime closed before tray menu action");
             }
         }));
         let click_actions = actions.clone();
@@ -292,7 +317,9 @@ impl TrayUi {
                 ..
             } = event
             {
-                let _ = click_actions.send(TrayAction::ShowWindow);
+                if click_actions.send(TrayAction::ShowWindow).is_err() {
+                    tracing::trace!("agent runtime closed before tray click action");
+                }
             }
         }));
         Ok(ui)

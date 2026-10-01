@@ -65,6 +65,7 @@ pub(crate) mod memory {
     pub(crate) struct MemoryLinkStorage {
         seed: Mutex<Option<[u8; 32]>>,
         peers: Mutex<HashMap<String, PeerRecord>>,
+        pub(crate) fail_metadata_writes: std::sync::atomic::AtomicBool,
     }
 
     fn poisoned<T>(_: std::sync::PoisonError<T>) -> LinkError {
@@ -132,6 +133,12 @@ pub(crate) mod memory {
             fingerprint: &str,
             candidates: &[PeerCandidate],
         ) -> LinkResult<bool> {
+            if self
+                .fail_metadata_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LinkError::Store("metadata write rejected".into()));
+            }
             let mut peers = self.peers.lock().map_err(poisoned)?;
             match peers.get_mut(fingerprint) {
                 Some(record) => {
@@ -143,6 +150,12 @@ pub(crate) mod memory {
         }
 
         async fn set_peer_info(&self, fingerprint: &str, info: &PeerInfo) -> LinkResult<bool> {
+            if self
+                .fail_metadata_writes
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                return Err(LinkError::Store("metadata write rejected".into()));
+            }
             let mut peers = self.peers.lock().map_err(poisoned)?;
             match peers.get_mut(fingerprint) {
                 Some(record) => {

@@ -161,30 +161,33 @@ fn execute_shutdown() {
     }
     tracing::info!("all downloads finished: powering off");
     #[cfg(target_os = "windows")]
-    {
+    let result = {
         use std::os::windows::process::CommandExt as _;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let _ = Command::new("shutdown")
+        Command::new("shutdown")
             .args(["/s", "/f", "/t", "0"])
             .creation_flags(CREATE_NO_WINDOW)
-            .status();
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let _ = Command::new("osascript")
-            .args(["-e", "tell app \"System Events\" to shut down"])
-            .status();
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let systemd_ok = Command::new("systemctl")
-            .arg("poweroff")
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !systemd_ok {
-            let _ = Command::new("loginctl").arg("poweroff").status();
+    };
+    #[cfg(target_os = "macos")]
+    let result = Command::new("osascript")
+        .args(["-e", "tell app \"System Events\" to shut down"])
+        .status();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = {
+        match Command::new("systemctl").arg("poweroff").status() {
+            Ok(status) if status.success() => return,
+            Ok(status) => tracing::warn!(%status, "systemctl poweroff failed; trying loginctl"),
+            Err(error) => {
+                tracing::warn!(%error, "could not run systemctl poweroff; trying loginctl")
+            }
         }
+        Command::new("loginctl").arg("poweroff").status()
+    };
+    match result {
+        Ok(status) if status.success() => tracing::info!("power-off request accepted"),
+        Ok(status) => tracing::error!(%status, "power-off request failed"),
+        Err(error) => tracing::error!(%error, "could not run power-off command"),
     }
 }
 

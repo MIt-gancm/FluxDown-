@@ -112,15 +112,19 @@ impl BlobStore {
                 .map(|(id, entry)| (id.clone(), entry.path.clone()))
                 .collect::<Vec<_>>()
         };
+        let mut first_error = None;
         for (id, path) in expired {
             self.entries.lock().await.remove(&id);
-            if let Err(error) = tokio::fs::remove_file(path).await
+            if let Err(error) = tokio::fs::remove_file(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                return Err(BlobError::Io(error));
+                tracing::warn!(%error, path = %path.display(), "expired daemon blob cleanup failed");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(BlobError::Io(error)))
     }
 
     /// daemon 关闭时删除所有临时 blob 与导出。
@@ -132,20 +136,64 @@ impl BlobStore {
                 .map(|(_, entry)| entry.path)
                 .collect::<Vec<_>>()
         };
+        let mut first_error = None;
         for path in paths {
-            if let Err(error) = tokio::fs::remove_file(path).await
+            if let Err(error) = tokio::fs::remove_file(&path).await
                 && error.kind() != std::io::ErrorKind::NotFound
             {
-                return Err(BlobError::Io(error));
+                tracing::warn!(%error, path = %path.display(), "daemon blob cleanup failed");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        let mut directory = tokio::fs::read_dir(&self.root).await?;
-        while let Some(entry) = directory.next_entry().await? {
-            if entry.metadata().await?.is_file() {
-                tokio::fs::remove_file(entry.path()).await?;
+        // 即使一个已索引文件删除失败，也清理其余文件及未索引的遗留导出。
+        match tokio::fs::read_dir(&self.root).await {
+            Ok(mut directory) => loop {
+                let entry = match directory.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "daemon blob cleanup directory iteration failed");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                        break;
+                    }
+                };
+                let path = entry.path();
+                match entry.metadata().await {
+                    Ok(metadata) if metadata.is_file() => {
+                        if let Err(error) = tokio::fs::remove_file(&path).await
+                            && error.kind() != std::io::ErrorKind::NotFound
+                        {
+                            tracing::warn!(%error, path = %path.display(), "daemon leftover blob cleanup failed");
+                            if first_error.is_none() {
+                                first_error = Some(error);
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    // 已被并发消费 / sweep 的文件不需要再次删除。
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        tracing::warn!(%error, path = %path.display(), "daemon leftover blob metadata failed");
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+            },
+            // 私有目录已经清理时没有遗留文件。
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                tracing::warn!(%error, "daemon blob cleanup directory read failed");
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), |error| Err(BlobError::Io(error)))
     }
 
     async fn entry(&self, id: &str, expected_kind: BlobKind) -> Result<BlobEntry, BlobError> {
@@ -157,7 +205,12 @@ impl BlobStore {
         }
         if entry.expires_at <= SystemTime::now() {
             self.entries.lock().await.remove(id);
-            let _ = tokio::fs::remove_file(entry.path).await;
+            if let Err(error) = tokio::fs::remove_file(&entry.path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                // 保留 Expired 业务终局，额外记录 best-effort 文件清理失败。
+                tracing::warn!(%error, path = %entry.path.display(), "expired daemon blob removal failed");
+            }
             return Err(BlobError::Expired);
         }
         Ok(entry)
@@ -168,9 +221,8 @@ impl BlobStore {
         while let Some(entry) = entries.next_entry().await? {
             let metadata = entry.metadata().await?;
             let stale = metadata
-                .modified()
-                .ok()
-                .and_then(|modified| modified.checked_add(BLOB_TTL))
+                .modified()?
+                .checked_add(BLOB_TTL)
                 .is_none_or(|expires| expires <= SystemTime::now());
             if stale && metadata.is_file() {
                 tokio::fs::remove_file(entry.path()).await?;
@@ -238,6 +290,41 @@ mod tests {
             store.read(&id, BlobKind::Torrent).await,
             Err(BlobError::NotFound)
         ));
-        let _ = std::fs::remove_dir_all(root);
+        if let Err(error) = std::fs::remove_dir_all(root) {
+            eprintln!("blob test directory removal failed: {error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_continues_after_a_managed_blob_cannot_be_deleted() {
+        let root =
+            std::env::temp_dir().join(format!("fluxdown_blob_cleanup_{}", uuid::Uuid::new_v4()));
+        let store = BlobStore::open(root.clone()).await.expect("open store");
+        let id = store.put(BlobKind::Torrent, b"payload").await.expect("put");
+        let blocked = store.path_for_id(&id);
+        std::fs::remove_file(&blocked).expect("remove managed blob");
+        std::fs::create_dir(&blocked).expect("replace managed blob with directory");
+        let orphan = root.join("orphan.log");
+        std::fs::write(&orphan, b"stale export").expect("create leftover export");
+
+        let error = store
+            .cleanup_all()
+            .await
+            .expect_err("cannot unlink a directory as a blob");
+        let BlobError::Io(error) = error else {
+            panic!("cleanup should retain the first I/O error");
+        };
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            !orphan.exists(),
+            "leftover exports must be cleaned despite the earlier error"
+        );
+        assert!(matches!(
+            store.read(&id, BlobKind::Torrent).await,
+            Err(BlobError::NotFound)
+        ));
+        if let Err(error) = std::fs::remove_dir_all(root) {
+            eprintln!("blob cleanup test directory removal failed: {error}");
+        }
     }
 }

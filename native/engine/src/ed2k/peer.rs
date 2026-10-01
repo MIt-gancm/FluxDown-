@@ -508,7 +508,7 @@ async fn ensure_hashset(
                 ));
             };
             // 幂等填充（多任务并发时首个赢，其余复用）。
-            let _ = hashset_cache.set(normalized);
+            hashset_cache.get_or_init(|| async { normalized }).await;
             return Ok(());
         }
     }

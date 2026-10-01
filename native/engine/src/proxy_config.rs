@@ -579,7 +579,10 @@ fn run_command_with_timeout(
                 let mut stdout = Vec::new();
                 if let Some(mut out) = child.stdout.take() {
                     use std::io::Read;
-                    let _ = out.read_to_end(&mut stdout);
+                    if let Err(error) = out.read_to_end(&mut stdout) {
+                        crate::logger::report_warning("system-proxy", "read probe output", &error);
+                        return None;
+                    }
                 }
                 return Some(std::process::Output {
                     status,
@@ -589,8 +592,22 @@ fn run_command_with_timeout(
             }
             Ok(None) => {
                 if start.elapsed() >= timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    if let Err(error) = child.kill() {
+                        crate::logger::report_warning(
+                            "system-proxy",
+                            "kill timed-out probe",
+                            &error,
+                        );
+                        // A failed kill must not turn a bounded probe into an unbounded wait.
+                        return None;
+                    }
+                    if let Err(error) = child.wait() {
+                        crate::logger::report_warning(
+                            "system-proxy",
+                            "reap timed-out probe",
+                            &error,
+                        );
+                    }
                     return None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1149,8 +1166,12 @@ fn socks5_handshake(
     }
 
     // Clear timeouts for the tunneled connection (FTP will set its own)
-    stream.set_read_timeout(None).ok();
-    stream.set_write_timeout(None).ok();
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| DownloadError::Other(format!("SOCKS5 clear read timeout: {e}")))?;
+    stream
+        .set_write_timeout(None)
+        .map_err(|e| DownloadError::Other(format!("SOCKS5 clear write timeout: {e}")))?;
 
     Ok(stream)
 }
@@ -1248,8 +1269,12 @@ pub fn socks4_connect_sync(
     let mut stream = TcpStream::connect_timeout(&sock_addr, timeout)
         .map_err(|e| DownloadError::Other(format!("SOCKS4 proxy connect error: {}", e)))?;
 
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| DownloadError::Other(format!("SOCKS4 set read timeout: {e}")))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| DownloadError::Other(format!("SOCKS4 set write timeout: {e}")))?;
 
     // DSTIP：4a 用 0.0.0.1 占位，否则本地解析出真实 IPv4。
     let ip_bytes: [u8; 4] = if remote_dns {
@@ -1319,8 +1344,12 @@ pub fn socks4_connect_sync(
         )));
     }
 
-    stream.set_read_timeout(None).ok();
-    stream.set_write_timeout(None).ok();
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| DownloadError::Other(format!("SOCKS4 clear read timeout: {e}")))?;
+    stream
+        .set_write_timeout(None)
+        .map_err(|e| DownloadError::Other(format!("SOCKS4 clear write timeout: {e}")))?;
 
     Ok(stream)
 }
@@ -1381,18 +1410,23 @@ pub fn http_connect_proxy_sync(
     let stream = TcpStream::connect_timeout(&sock_addr, timeout)
         .map_err(|e| DownloadError::Other(format!("HTTP CONNECT proxy connect error: {}", e)))?;
 
-    stream.set_read_timeout(Some(timeout)).ok();
-    stream.set_write_timeout(Some(timeout)).ok();
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|e| DownloadError::Other(format!("HTTP CONNECT set read timeout: {e}")))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|e| DownloadError::Other(format!("HTTP CONNECT set write timeout: {e}")))?;
 
     let target = format!("{}:{}", target_host, target_port);
 
     // Build CONNECT request
     let mut req = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n", target, target);
     if !proxy.username.is_empty() {
-        use std::fmt::Write as FmtWrite;
         let credentials = format!("{}:{}", proxy.username, proxy.password);
         let encoded = base64_encode(credentials.as_bytes());
-        let _ = write!(req, "Proxy-Authorization: Basic {}\r\n", encoded);
+        req.push_str("Proxy-Authorization: Basic ");
+        req.push_str(&encoded);
+        req.push_str("\r\n");
     }
     req.push_str("\r\n");
 
@@ -1447,8 +1481,12 @@ pub fn http_connect_proxy_sync(
         )));
     }
 
-    stream.set_read_timeout(None).ok();
-    stream.set_write_timeout(None).ok();
+    stream
+        .set_read_timeout(None)
+        .map_err(|e| DownloadError::Other(format!("HTTP CONNECT clear read timeout: {e}")))?;
+    stream
+        .set_write_timeout(None)
+        .map_err(|e| DownloadError::Other(format!("HTTP CONNECT clear write timeout: {e}")))?;
 
     Ok(stream)
 }
@@ -1962,7 +2000,7 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 let (mut sock, _) = listener.accept().expect("accept from client");
                 sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
-                    .ok();
+                    .expect("bound test proxy read timeout");
                 let mut head = [0u8; 9];
                 sock.read_exact(&mut head).expect("read request head");
                 let mut buf = [0u8; 256];

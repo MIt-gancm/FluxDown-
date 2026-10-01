@@ -20,16 +20,29 @@ const FIRST_PARTY_TARGETS: [&str; 4] = [
     "fluxdown_protocol",
 ];
 
-/// 初始化桌面模式日志；失败（目录不可写等）时静默返回，GUI 进程没有可报错的 stderr。
+/// 初始化桌面模式日志；初始化失败时向现有订阅者与 stderr 报告，不替换已有订阅者。
 pub fn init_desktop() {
-    let Ok(agent_data_dir) = crate::runtime::resolve_agent_data_dir() else {
-        return;
+    let agent_data_dir = match crate::runtime::resolve_agent_data_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            tracing::error!(error = %error, "could not resolve agent log directory");
+            eprintln!("could not resolve agent log directory: {error}");
+            return;
+        }
     };
     let dir = crate::log_export::agent_log_dir(&agent_data_dir);
     let header = build_header(&agent_data_dir);
-    if fluxdown_logfile::init_global(&dir, "agent", header).is_err() {
-        return;
-    }
+    let log = match fluxdown_logfile::init_global(&dir, "agent", header) {
+        Ok(log) => log,
+        Err(error) => {
+            tracing::error!(path = %dir.display(), error = %error, "could not initialize agent log file");
+            eprintln!(
+                "could not initialize agent log file at {}: {error}",
+                dir.display()
+            );
+            return;
+        }
+    };
     fluxdown_logfile::install_panic_hook();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
@@ -40,7 +53,15 @@ pub fn init_desktop() {
         .with_env_filter(build_filter())
         .finish();
     // 已有全局订阅者时保持原样。
-    let _ = tracing::subscriber::set_global_default(subscriber);
+    if let Err(error) = tracing::subscriber::set_global_default(subscriber) {
+        log.log_unthrottled(
+            Level::Warn,
+            &format!(
+                "agent tracing subscriber was not installed; keeping existing subscriber: {error}"
+            ),
+        );
+        tracing::warn!(error = %error, "keeping existing tracing subscriber");
+    }
 }
 
 /// 进程结束前调用：失败时把完整错误链写入日志，并输出被限流吞掉的重复条目摘要。
@@ -59,10 +80,21 @@ pub fn finish(result: &AgentResult) {
 }
 
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
-    let mut text = error.to_string();
-    let mut source = error.source();
+    let mut text = String::new();
+    let mut source = Some(error);
     while let Some(cause) = source {
-        let _ = write!(text, ": {cause}");
+        let end = text.len();
+        if end > 0 {
+            text.push_str(": ");
+        }
+        if write!(text, "{cause}").is_err() {
+            text.truncate(end);
+            if end > 0 {
+                text.push_str(": ");
+            }
+            text.push_str("<error display failed>");
+            break;
+        }
         source = cause.source();
     }
     text
@@ -91,7 +123,10 @@ fn default_directives(level: Level) -> String {
     };
     let mut directives = String::from("warn");
     for target in FIRST_PARTY_TARGETS {
-        let _ = write!(directives, ",{target}={name}");
+        directives.push(',');
+        directives.push_str(target);
+        directives.push('=');
+        directives.push_str(name);
     }
     directives
 }
@@ -99,7 +134,11 @@ fn default_directives(level: Level) -> String {
 fn build_header(agent_data_dir: &std::path::Path) -> String {
     let mut header = String::new();
     let mut line = |key: &str, value: String| {
-        let _ = writeln!(header, "  {key}: {value}");
+        header.push_str("  ");
+        header.push_str(key);
+        header.push_str(": ");
+        header.push_str(&value);
+        header.push('\n');
     };
     line("version", fluxdown_protocol::APP_VERSION.to_owned());
     let exe = std::env::current_exe();

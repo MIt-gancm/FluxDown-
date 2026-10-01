@@ -275,7 +275,7 @@ impl LoginDialog {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 match result {
                     Ok(value) => match parse_outcome(value) {
@@ -303,7 +303,10 @@ impl LoginDialog {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -346,7 +349,7 @@ impl LoginDialog {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.resending = false;
                 match result {
                     Ok(value) if is_send_code => match parse_send_code(&value) {
@@ -363,7 +366,10 @@ impl LoginDialog {
                     Err(error) => this.fail(&error, context, cx),
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }

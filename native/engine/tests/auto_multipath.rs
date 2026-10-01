@@ -57,13 +57,16 @@ fn gen_body(len: usize, seed: u64) -> Vec<u8> {
 
 /// 把引擎 tracing 日志接到测试输出（失败时由 libtest 打印）。
 fn init_test_logging() {
-    let _ = tracing_subscriber::fmt()
+    if let Err(error) = tracing_subscriber::fmt()
         .with_test_writer()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
-        .try_init();
+        .try_init()
+    {
+        eprintln!("test tracing subscriber already configured: {error}");
+    }
 }
 
 // ===========================================================================
@@ -123,7 +126,18 @@ async fn start_server(cfg: ServerCfg) -> TestServer {
             let cfg = cfg.clone();
             let counters = shared.clone();
             conns.spawn(async move {
-                let _ = serve_conn(stream, cfg, counters).await;
+                if let Err(error) = serve_conn(stream, cfg, counters).await {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::UnexpectedEof
+                        ),
+                        "test server connection failed: {error}"
+                    );
+                }
             });
             // 回收已结束的连接任务；accept 任务被 abort 时 JoinSet 随之
             // drop，所有在途连接一并终止。
@@ -243,7 +257,14 @@ async fn serve_conn(
 
 fn work_dir(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("fluxdown_automp_{}_{}", tag, std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
+
+    if let Err(error) = std::fs::remove_dir_all(&d) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "clean test path: {error}"
+        );
+    }
     std::fs::create_dir_all(&d).expect("create work dir");
     d
 }
@@ -351,7 +372,10 @@ async fn run_auto(tag: &str, origin: &TestServer, proxy: &TestServer) -> RunOutc
         .await
         .expect("run_download must finish within 120s");
     let elapsed = started.elapsed();
-    let _ = collector.await;
+
+    collector
+        .await
+        .expect("test background task must not panic");
 
     let auto_route = db
         .load_task_by_id(&task_id)

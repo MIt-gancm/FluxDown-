@@ -156,7 +156,9 @@ impl JournalSink {
                     JournalCommand::Flush(reply) => {
                         let result = persist_overflows(&db, downstream.as_ref(), &overflows).await;
                         unavailable = result.is_err();
-                        let _ = reply.send(result);
+                        if reply.send(result).is_err() {
+                            tracing::debug!("activity journal flush caller stopped waiting");
+                        }
                     }
                 }
             }

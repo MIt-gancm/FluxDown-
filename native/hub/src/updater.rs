@@ -521,7 +521,7 @@ async fn download_single_stream(
     }
     if track_resume && resume_from >= total_bytes {
         // Everything already on disk from a previous attempt.
-        let _ = tokio::fs::remove_file(resume_path(file_path)).await;
+        remove_resume(file_path).await;
         return Ok(());
     }
 
@@ -637,7 +637,7 @@ async fn download_single_stream(
                 "connection closed early: {downloaded}/{total_bytes} bytes"
             )));
         }
-        let _ = tokio::fs::remove_file(resume_path(file_path)).await;
+        remove_resume(file_path).await;
     }
     Ok(())
 }
@@ -705,8 +705,18 @@ async fn load_resume(
     Some(state.done)
 }
 
-/// Best-effort persist of resume state; failures are ignored (worst case the
-/// next attempt starts fresh).
+async fn remove_resume(file_path: &Path) {
+    match tokio::fs::remove_file(resume_path(file_path)).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            crate::logger::report_error("updater", "remove completed resume state", &error)
+        }
+    }
+}
+
+/// Best-effort persist of resume state; failures are reported (the next attempt
+/// may need to start fresh).
 async fn save_resume(
     file_path: &Path,
     version: &str,
@@ -721,8 +731,15 @@ async fn save_resume(
         ends: ranges.iter().map(|r| r.end).collect(),
         done: done.to_vec(),
     };
-    if let Ok(bytes) = serde_json::to_vec(&state) {
-        let _ = tokio::fs::write(resume_path(file_path), bytes).await;
+    let bytes = match serde_json::to_vec(&state) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            crate::logger::report_error("updater", "serialize resume state", &error);
+            return;
+        }
+    };
+    if let Err(error) = tokio::fs::write(resume_path(file_path), bytes).await {
+        crate::logger::report_error("updater", "persist resume state", &error);
     }
 }
 
@@ -879,7 +896,18 @@ async fn download_multi_segment(
 
     // Stop the reporter
     reporter.abort();
-    let _ = reporter.await;
+    if let Err(error) = reporter.await {
+        if error.is_cancelled() {
+            tracing::debug!("update progress reporter cancelled after download");
+        } else {
+            crate::logger::report_error("updater", "join update progress reporter", &error);
+            if first_error.is_none() {
+                first_error = Some(UpdateError::Other(format!(
+                    "progress reporter failed: {error}"
+                )));
+            }
+        }
+    }
 
     if let Some(e) = first_error {
         // Keep the partial artifact and persist final progress so the next
@@ -892,7 +920,7 @@ async fn download_multi_segment(
         return Err(e);
     }
 
-    let _ = tokio::fs::remove_file(resume_path(file_path)).await;
+    remove_resume(file_path).await;
     Ok(())
 }
 

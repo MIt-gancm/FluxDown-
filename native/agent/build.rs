@@ -66,7 +66,7 @@ fn main() {
             Ok(b) => b,
             Err(e) => panic!("failed to read {}: {e}", abs.display()),
         };
-        let _ = writeln!(
+        writeln!(
             code,
             "    EmbeddedAsset {{ path: {rel:?}, bytes: include_bytes!({path:?}), content_type: {ct:?}, etag: {etag:?} }},",
             path = abs.to_string_lossy(),
@@ -79,7 +79,7 @@ fn main() {
                 "application/octet-stream"
             }),
             etag = etag(&bytes),
-        );
+        ).unwrap_or_else(|error| panic!("writing embedded asset metadata into a String failed: {error}"));
     }
     code.push_str("];\n");
 

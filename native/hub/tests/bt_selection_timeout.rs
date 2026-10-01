@@ -19,7 +19,7 @@
 //! - `provide_bt_selection` looks up `task_id` in the pending map and, if
 //!   absent (already removed after a prior timeout/answer), only logs and
 //!   returns -- it never panics. If present, `tx.send(..)` failure (receiver
-//!   already dropped) is silently ignored via `let _ = tx.send(..)`.
+//!   already dropped) is recorded at debug level as a normal lifecycle event.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 

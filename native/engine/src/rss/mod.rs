@@ -579,7 +579,9 @@ impl RssManager {
                     error: format!("subscription provider not installed: {provider_id}"),
                 },
             };
-            let _ = tx.send(RssEvent::Fetched(Box::new(outcome)));
+            if tx.send(RssEvent::Fetched(Box::new(outcome))).is_err() {
+                tracing::debug!("RSS fetch owner stopped before result delivery");
+            }
         });
     }
 
@@ -672,7 +674,9 @@ impl RssManager {
         );
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let _ = tx.send(RssEvent::Validated(Box::new(fut.await)));
+            if tx.send(RssEvent::Validated(Box::new(fut.await))).is_err() {
+                tracing::debug!("RSS validation owner stopped before result delivery");
+            }
         });
     }
 
@@ -727,11 +731,16 @@ impl RssManager {
                 Ok(bytes) => (bytes, String::new()),
                 Err(e) => (Vec::new(), e),
             };
-            let _ = tx.send(RssEvent::TorrentReady(Box::new(RssTorrentOutcome {
-                plan,
-                bytes,
-                error,
-            })));
+            if tx
+                .send(RssEvent::TorrentReady(Box::new(RssTorrentOutcome {
+                    plan,
+                    bytes,
+                    error,
+                })))
+                .is_err()
+            {
+                tracing::debug!("RSS torrent owner stopped before result delivery");
+            }
         });
     }
 

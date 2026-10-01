@@ -306,7 +306,13 @@ impl DaemonClient {
         tokio::spawn(async move {
             while let Some(command) = receiver.recv().await {
                 sink.lock().await.push((command.method, command.params));
-                let _ = command.ack.send(Ok(Value::Object(serde_json::Map::new())));
+                if command
+                    .ack
+                    .send(Ok(Value::Object(serde_json::Map::new())))
+                    .is_err()
+                {
+                    tracing::trace!("recorded daemon caller dropped its response receiver");
+                }
             }
         });
         let client = Self {
@@ -375,8 +381,13 @@ async fn run_client(
                 if run_connected(socket, &mut commands, &events, snapshot_cursor, buffered)
                     .await
                     .is_err()
+                    && events.send(DaemonClientEvent::Stale).await.is_err()
                 {
-                    let _ = events.send(DaemonClientEvent::Stale).await;
+                    tracing::debug!("daemon event consumer closed during disconnect");
+                    connected.store(false, Ordering::Release);
+                    config.http.clear();
+                    fail_queued_commands(&mut commands);
+                    return;
                 }
                 connected.store(false, Ordering::Release);
                 config.http.clear();
@@ -407,18 +418,28 @@ async fn run_client(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "protocol-incompatible fluxdownd refused shutdown");
-                        let _ = events
+                        if events
                             .send(DaemonClientEvent::Fatal(protocol_error()))
-                            .await;
+                            .await
+                            .is_err()
+                        {
+                            tracing::debug!(
+                                "daemon event consumer closed before fatal protocol error"
+                            );
+                        }
                         connected.store(false, Ordering::Release);
                         return;
                     }
                 }
             }
             Err(ConnectError::Incompatible) => {
-                let _ = events
+                if events
                     .send(DaemonClientEvent::Fatal(protocol_error()))
-                    .await;
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!("daemon event consumer closed before fatal protocol error");
+                }
                 connected.store(false, Ordering::Release);
                 return;
             }
@@ -448,15 +469,21 @@ async fn run_client(
                         attempts = legacy_attempts,
                         "the daemon port is still held by a process that does not speak the handshake; stop the old fluxdownd manually and restart FluxDown"
                     );
-                    let _ = events
+                    if events
                         .send(DaemonClientEvent::Fatal(protocol_error()))
-                        .await;
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("daemon event consumer closed before legacy-peer failure");
+                    }
                     connected.store(false, Ordering::Release);
                     return;
                 }
             },
             Err(ConnectError::Fatal(error)) => {
-                let _ = events.send(DaemonClientEvent::Fatal(error)).await;
+                if events.send(DaemonClientEvent::Fatal(error)).await.is_err() {
+                    tracing::debug!("daemon event consumer closed before fatal connection error");
+                }
                 connected.store(false, Ordering::Release);
                 return;
             }
@@ -480,7 +507,9 @@ async fn run_client(
 
 fn fail_queued_commands(commands: &mut mpsc::Receiver<ClientCommand>) {
     while let Ok(command) = commands.try_recv() {
-        let _ = command.ack.send(Err(unavailable_object()));
+        if command.ack.send(Err(unavailable_object())).is_err() {
+            tracing::trace!("queued daemon caller dropped its response receiver");
+        }
     }
 }
 
@@ -712,23 +741,28 @@ async fn run_connected(
                     RpcResponse::Success(success) => {
                         if let RequestId::Integer(id) = success.id
                             && let Some(ack) = pending.remove(&id)
-                        {
-                            let _ = ack.send(Ok(success.result));
-                        }
+                            && ack.send(Ok(success.result)).is_err() {
+                                tracing::trace!(id, "daemon caller dropped its successful response receiver");
+                            }
                     }
                     RpcResponse::Failure(failure) => {
                         if let Some(RequestId::Integer(id)) = failure.id
                             && let Some(ack) = pending.remove(&id)
-                        {
-                            let _ = ack.send(Err(failure.error));
-                        }
+                            && ack.send(Err(failure.error)).is_err() {
+                                tracing::trace!(id, "daemon caller dropped its error response receiver");
+                            }
                     }
                 }
             }
         }
     }
-    for (_, ack) in pending {
-        let _ = ack.send(Err(unavailable_object()));
+    for (id, ack) in pending {
+        if ack.send(Err(unavailable_object())).is_err() {
+            tracing::trace!(
+                id,
+                "pending daemon caller dropped its response receiver during disconnect"
+            );
+        }
     }
     Err(())
 }
@@ -979,7 +1013,10 @@ mod tests {
         settle.settle();
         let command = commands.recv().await.expect("command delivered");
         assert_eq!(command.method, "task.create");
-        let _ = command.ack.send(Ok(serde_json::json!({"ok": true})));
+        command
+            .ack
+            .send(Ok(serde_json::json!({"ok": true})))
+            .expect("waiting caller receives acknowledgement");
         let result = call.await.expect("join").expect("call succeeds");
         assert_eq!(result, serde_json::json!({"ok": true}));
     }
@@ -1209,7 +1246,7 @@ mod tests {
                 buffered,
             )
             .await
-            .ok();
+            .expect_err("daemon closes the recovered connection");
             let super::DaemonClientEvent::Event(recovered) =
                 rx.recv().await.expect("recovered event")
             else {
@@ -1306,8 +1343,11 @@ mod tests {
             assert_eq!(data.code, ApplicationErrorCode::InvalidArgument);
             assert_eq!(data.field.as_deref(), Some("maxItems"));
             assert_eq!(data.reason, Some(ErrorReason::PluginPackageInvalid));
+            runner
+                .await
+                .expect("join daemon connection")
+                .expect_err("daemon closes after returning its error");
             drop(command_tx);
-            let _ = runner.await;
             server.await.unwrap();
         })
         .await

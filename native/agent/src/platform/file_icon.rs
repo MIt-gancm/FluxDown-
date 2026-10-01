@@ -198,8 +198,10 @@ mod request {
 
         impl Drop for TempFile {
             fn drop(&mut self) {
-                if let Some(dir) = self.0.parent() {
-                    let _ = std::fs::remove_dir_all(dir);
+                if let Some(dir) = self.0.parent()
+                    && let Err(error) = std::fs::remove_dir_all(dir)
+                {
+                    tracing::warn!(path = %dir.display(), %error, "file icon test cleanup failed");
                 }
             }
         }
@@ -326,8 +328,10 @@ mod worker {
                                     "file icon renderer panicked".to_owned(),
                                 ))
                             });
-                        // 调用方已放弃等待（接收端被丢弃）时忽略发送失败。
-                        let _ = job.reply.send(result);
+                        // 调用方超时或取消会丢弃接收端；工作线程继续处理其余请求。
+                        if job.reply.send(result).is_err() {
+                            tracing::trace!("file icon caller dropped its response receiver");
+                        }
                     }
                 })
                 .map(|_| Self { jobs })
@@ -820,8 +824,10 @@ mod linux {
         let size = request.size;
         let (reply, answer) = mpsc::channel();
         glib::MainContext::default().invoke(move || {
-            // 调用方已超时放弃时接收端已丢弃，忽略发送失败。
-            let _ = reply.send(render_on_main_thread(&file_name, size));
+            // 主线程排队期间调用方可能已超时，接收端关闭是正常请求生命周期。
+            if reply.send(render_on_main_thread(&file_name, size)).is_err() {
+                tracing::trace!("GTK file icon caller dropped its response receiver");
+            }
         });
         answer
             .recv_timeout(MAIN_THREAD_TIMEOUT)

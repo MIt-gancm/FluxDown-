@@ -2577,7 +2577,15 @@ pub(crate) async fn claim_rename(src: &Path, dst: &Path) -> std::io::Result<()> 
     match tokio::fs::rename(src, dst).await {
         Ok(()) => Ok(()),
         Err(e) => {
-            let _ = tokio::fs::remove_file(dst).await;
+            if let Err(cleanup_error) = tokio::fs::remove_file(dst).await
+                && cleanup_error.kind() != std::io::ErrorKind::NotFound
+            {
+                crate::logger::report_warning(
+                    "http-download",
+                    "remove failed rename placeholder",
+                    &cleanup_error,
+                );
+            }
             Err(e)
         }
     }
@@ -2666,7 +2674,15 @@ const SINGLE_RESUME_ALIGNMENT_BYTES: i64 = 1024 * 1024;
 
 pub async fn run_download(params: DownloadParams) {
     let task_id_log = params.task_id.clone();
-    let result = run_download_inner(&params).await;
+    let result = match run_download_inner(&params).await {
+        Ok(completed) => params
+            .db
+            .update_task_status(&params.task_id, 3, "")
+            .await
+            .map(|()| completed)
+            .map_err(DownloadError::Db),
+        Err(error) => Err(error),
+    };
 
     match result {
         Ok((total, finalize_renamed)) => {
@@ -2675,14 +2691,7 @@ pub async fn run_download(params: DownloadParams) {
                 task_id_log,
                 total
             );
-            if let Err(db_error) = params.db.update_task_status(&params.task_id, 3, "").await {
-                crate::logger::report_error(
-                    "http-download",
-                    "persist completion status",
-                    &db_error,
-                );
-            }
-            let _ = params
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -2696,7 +2705,11 @@ pub async fn run_download(params: DownloadParams) {
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("HTTP progress receiver closed");
+            }
         }
         Err(DownloadError::Cancelled) => {
             log_info!("[download] task {} cancelled", task_id_log);
@@ -2749,7 +2762,7 @@ pub async fn run_download(params: DownloadParams) {
                     (0, 0)
                 }
             };
-            let _ = params
+            if params
                 .progress_tx
                 .send(ProgressUpdate {
                     task_id: params.task_id,
@@ -2761,7 +2774,11 @@ pub async fn run_download(params: DownloadParams) {
                     segment_details: None,
                     ..Default::default()
                 })
-                .await;
+                .await
+                .is_err()
+            {
+                tracing::debug!("HTTP progress receiver closed");
+            }
         }
     }
 }
@@ -2978,6 +2995,19 @@ async fn compute_segments_with_advisor(p: &DownloadParams, info: &FileInfo) -> i
     result
 }
 
+async fn discard_segment_data(db: &Db, task_id: &str, path: &Path) -> Result<(), DownloadError> {
+    // Removing the DB rows first would make a failed file removal look like a
+    // complete single-stream partial file on the next resume. Keep the layout
+    // until the preallocated/stale file is gone; missing files are already clean.
+    if let Err(error) = tokio::fs::remove_file(path).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    db.delete_segments(task_id).await?;
+    Ok(())
+}
+
 /// 返回 `(actual_total, finalize_renamed)`:`finalize_renamed` 仅当 finalize
 /// 阶段因目标名被占用而改名时为 `Some(新名)`,调用方须经完成信号上报
 /// (progress_reporter 对非空 file_name 锁存,空串 = 不变)。
@@ -2991,9 +3021,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     // Range 前短暂显示为 0。后续 status=1 继续复用同一基线，不重复查库。
     let (resume_downloaded, resume_total) = if p.is_resume {
         p.db.load_task_by_id(&p.task_id)
-            .await
-            .ok()
-            .flatten()
+            .await?
             .map(|task| (task.downloaded_bytes.max(0), task.total_bytes.max(0)))
             .unwrap_or((0, 0))
     } else {
@@ -3001,9 +3029,8 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     };
 
     // Transition to status=5 (preparing) — probing server, resolving file info
-    let _ = p.db.update_task_status(&p.task_id, 5, "").await;
-    let _ = p
-        .progress_tx
+    p.db.update_task_status(&p.task_id, 5, "").await?;
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: resume_downloaded,
@@ -3014,7 +3041,11 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("HTTP progress receiver closed");
+    }
 
     let client = &p.client;
 
@@ -3233,7 +3264,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     // segment rows in the DB the server clearly supported Range previously, so
     // trust that history and keep multi-segment mode.
     let effective_supports_range = if p.is_resume && !info.supports_range {
-        let existing_segs = p.db.load_segments(&p.task_id).await.unwrap_or_default();
+        let existing_segs = p.db.load_segments(&p.task_id).await?;
         if !existing_segs.is_empty() {
             log_info!(
                 "[download] task {} resume: probe says no Range support but {} segment(s) exist in DB — \
@@ -3255,10 +3286,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     //     的 validator 做后验比对。这样即使两次会话间文件被同长度替换，也不会把
     //     旧前缀与新尾部静默拼接（BUG-HTTP-SINGLE-RESUME-SPLICE）。
     let (resume_etag, resume_last_modified) = if p.is_resume {
-        let (oe, olm) =
-            p.db.get_task_validator(&p.task_id)
-                .await
-                .unwrap_or_default();
+        let (oe, olm) = p.db.get_task_validator(&p.task_id).await?;
         if oe.is_empty() && olm.is_empty() {
             // 旧任务（升级前创建、无存档）或首次下载时服务器未提供 validator →
             // 退回本次 probe 值（退化为旧行为，不会更糟）。
@@ -3290,14 +3318,13 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         return Err(DownloadError::Cancelled);
     }
 
-    let _ = p.db.update_task_status(&p.task_id, 1, "").await;
+    p.db.update_task_status(&p.task_id, 1, "").await?;
 
     // Immediately notify Dart: status=1 with resolved file name & total size.
     // For resume tasks, send persisted downloaded bytes as baseline so speed
     // smoothing doesn't treat resumed bytes as a fresh in-interval delta.
     let initial_downloaded = resume_downloaded;
-    let _ = p
-        .progress_tx
+    if p.progress_tx
         .send(ProgressUpdate {
             task_id: p.task_id.clone(),
             downloaded_bytes: initial_downloaded,
@@ -3308,7 +3335,11 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             segment_details: None,
             ..Default::default()
         })
-        .await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("HTTP progress receiver closed");
+    }
 
     // `size_is_estimate`：本次规划的 total 是否为【未经验证的估计值】，统一由
     // range_verified 门控（fresh 由 manager 决定，resume 读 DB）。true 的情形：
@@ -3328,7 +3359,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
     // whether a forced single-connection resume must still go through the
     // multi-segment coordinator instead of discarding existing progress.
     let existing_segment_rows = if p.is_resume {
-        p.db.load_segments(&p.task_id).await.unwrap_or_default()
+        p.db.load_segments(&p.task_id).await?
     } else {
         Vec::new()
     };
@@ -3543,8 +3574,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                 // 清空多段残留：删 DB segment 行 + 删预分配临时文件。对两种触发都正确：
                 //   • 真·无 Range：预分配文件全零、无有效数据；
                 //   • 版本变化：已完成段是【旧版本】字节，整体作废，必须删以重下新版本。
-                let _ = p.db.delete_segments(&p.task_id).await;
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                discard_segment_data(&p.db, &p.task_id, &temp_path).await?;
                 let result = download_single(
                     &p.task_id,
                     &p.url,
@@ -3585,7 +3615,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
         // 与 RangeNotSupported 回退路径一致地清理：删除 DB segment 行 + 删除预分配
         // 的临时文件，使 download_single 从 existing_len=0 的干净状态开始，无损坏风险。
         if p.is_resume {
-            let existing_segs = p.db.load_segments(&p.task_id).await.unwrap_or_default();
+            let existing_segs = p.db.load_segments(&p.task_id).await?;
             if !existing_segs.is_empty() {
                 log_info!(
                     "[download] task {} switching multi-segment → single-stream on resume; \
@@ -3593,10 +3623,9 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                     p.task_id,
                     existing_segs.len()
                 );
-                let _ = p.db.delete_segments(&p.task_id).await;
-                let _ = tokio::fs::remove_file(&temp_path).await;
+                discard_segment_data(&p.db, &p.task_id, &temp_path).await?;
                 // 进度归零，避免 UI 显示陈旧的多段累计值。
-                let _ = p.db.update_task_progress(&p.task_id, 0).await;
+                p.db.update_task_progress(&p.task_id, 0).await?;
             }
         }
         let result = download_single(
@@ -3637,7 +3666,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
             file_len,
             effective_total_bytes
         );
-        let _ = p.db.update_task_total_bytes(&p.task_id, file_len).await;
+        p.db.update_task_total_bytes(&p.task_id, file_len).await?;
         effective_total_bytes = file_len;
     }
 
@@ -3693,7 +3722,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                         file_len
                     );
                     // Update DB so the stored total_bytes reflects reality.
-                    let _ = p.db.update_task_total_bytes(&p.task_id, file_len).await;
+                    p.db.update_task_total_bytes(&p.task_id, file_len).await?;
                     effective_total_bytes = file_len;
                 } else if resp_cl <= 0 && file_len > 0 && file_len >= effective_total_bytes {
                     // Server didn't send Content-Length (chunked / connection-close
@@ -3721,7 +3750,7 @@ async fn run_download_inner(p: &DownloadParams) -> Result<(i64, Option<String>),
                         effective_total_bytes,
                         file_len
                     );
-                    let _ = p.db.update_task_total_bytes(&p.task_id, file_len).await;
+                    p.db.update_task_total_bytes(&p.task_id, file_len).await?;
                     effective_total_bytes = file_len;
                 } else {
                     return Err(DownloadError::Other(format!(
@@ -4254,6 +4283,18 @@ async fn send_cancellable(
     }
 }
 
+async fn persist_single_progress(
+    file: &mut tokio::io::BufWriter<File>,
+    db: &Db,
+    task_id: &str,
+    downloaded: i64,
+) -> Result<(), DownloadError> {
+    file.flush().await?;
+    file.get_ref().sync_data().await?;
+    db.update_task_progress(task_id, downloaded).await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_single_once(
     task_id: &str,
@@ -4284,7 +4325,8 @@ async fn download_single_once(
                 metadata.len()
             ))
         })?,
-        Err(_) => 0,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
     };
 
     // 续传时临时文件已写满（收尾阶段被中断/失败）：无需任何网络请求，直接交给
@@ -4295,7 +4337,15 @@ async fn download_single_once(
             task_id,
             total_bytes
         );
-        let _ = db.update_task_progress(task_id, total_bytes).await;
+        // A full-length file may be left by an earlier failed sync. Do not
+        // promote it to a complete resume checkpoint until its data is durable.
+        OpenOptions::new()
+            .write(true)
+            .open(dest)
+            .await?
+            .sync_data()
+            .await?;
+        db.update_task_progress(task_id, total_bytes).await?;
         return Ok(SingleDownloadResult {
             response_content_length: total_bytes,
             decompressed: false,
@@ -4608,7 +4658,7 @@ async fn download_single_once(
         downloaded = 0;
         file = tokio::io::BufWriter::with_capacity(BUF_WRITER_CAPACITY, File::create(dest).await?);
         // Reset DB progress so the UI doesn't show stale values
-        let _ = db.update_task_progress(task_id, 0).await;
+        db.update_task_progress(task_id, 0).await?;
     }
 
     // 注：旧版本会从实际下载响应的 Content-Disposition 中提取"更好的文件名"，
@@ -4630,7 +4680,7 @@ async fn download_single_once(
     let reading = TransferTracker::new().start(0);
     // Do not park a validated response behind a full UI progress channel before
     // its first body read. The periodic sample or final frame will follow.
-    let _ = progress_tx.try_send(ProgressUpdate {
+    match progress_tx.try_send(ProgressUpdate {
         task_id: task_id.to_owned(),
         downloaded_bytes: downloaded,
         total_bytes,
@@ -4638,7 +4688,15 @@ async fn download_single_once(
         segment_details: single_segment_progress(downloaded, total_bytes, true),
         runtime: Some(single_runtime(task_id, downloaded, total_bytes, true)),
         ..Default::default()
-    });
+    }) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::trace!("HTTP progress sample coalesced");
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::debug!("HTTP progress receiver closed");
+        }
+    }
 
     let mut last_report = std::time::Instant::now();
     let mut last_db_save = std::time::Instant::now();
@@ -4646,8 +4704,7 @@ async fn download_single_once(
     loop {
         tokio::select! {
             _ = cancel_token.cancelled() => {
-                file.flush().await?;
-                let _ = db.update_task_progress(task_id, downloaded).await;
+                persist_single_progress(&mut file, db, task_id, downloaded).await?;
                 return Err(DownloadError::Cancelled);
             }
             result = tokio::time::timeout(CHUNK_STALL_TIMEOUT, stream.next()) => {
@@ -4659,8 +4716,9 @@ async fn download_single_once(
                 let chunk = match result {
                     Ok(c) => c,
                     Err(_) => {
-                        file.flush().await?;
-                        let _ = db.update_task_progress(task_id, downloaded).await;
+                        if let Err(cleanup_error) = persist_single_progress(&mut file, db, task_id, downloaded).await {
+                            crate::logger::report_warning("http-download", "persist progress after stall", &cleanup_error);
+                        }
                         return Err(DownloadError::Other(format!(
                             "download stalled: no data received for {}s",
                             CHUNK_STALL_TIMEOUT.as_secs()
@@ -4679,8 +4737,9 @@ async fn download_single_once(
                             let allowed = tokio::select! {
                                 _ = cancel_token.cancelled() => {
                                     file.flush().await?;
+                                    file.get_ref().sync_data().await?;
                                     downloaded += offset as i64;
-                                    let _ = db.update_task_progress(task_id, downloaded).await;
+                                    db.update_task_progress(task_id, downloaded).await?;
                                     return Err(DownloadError::Cancelled);
                                 }
                                 allowed = speed_limiter.consume(remaining) => allowed,
@@ -4693,8 +4752,8 @@ async fn download_single_once(
                         downloaded += len;
 
                         // Progress report to Dart — every 200ms for smooth UI.
-                        if last_report.elapsed().as_millis() >= 200 {
-                            let _ = progress_tx
+                        if last_report.elapsed().as_millis() >= 200 && !progress_tx.is_closed() {
+                            if progress_tx
                                 .send(ProgressUpdate {
                                     task_id: task_id.to_string(),
                                     downloaded_bytes: downloaded,
@@ -4706,19 +4765,26 @@ async fn download_single_once(
                                     runtime: Some(single_runtime(task_id, downloaded, total_bytes, true)),
                                     ..Default::default()
                                 })
-                                .await;
+                                .await.is_err() {
+                                tracing::debug!("HTTP progress receiver closed");
+                            }
                             last_report = std::time::Instant::now();
                         }
 
                         // DB persistence — periodic save for crash recovery.
                         if last_db_save.elapsed().as_secs() >= DB_SAVE_INTERVAL_SECS {
-                            let _ = db.update_task_progress(task_id, downloaded).await;
+                            persist_single_progress(&mut file, db, task_id, downloaded).await?;
                             last_db_save = std::time::Instant::now();
                         }
                     }
                     Some(Err(e)) => {
-                        file.flush().await?;
-                        let _ = db.update_task_progress(task_id, downloaded).await;
+                        let checkpoint = async {
+                            persist_single_progress(&mut file, db, task_id, downloaded).await?;
+                            Ok::<(), DownloadError>(())
+                        }.await;
+                        if let Err(cleanup_error) = checkpoint {
+                            crate::logger::report_warning("http-download", "persist progress after read failure", &cleanup_error);
+                        }
                         return Err(DownloadError::Io(e));
                     }
                     None => break,
@@ -4728,7 +4794,7 @@ async fn download_single_once(
     }
 
     drop(reading);
-    let _ = progress_tx
+    if progress_tx
         .send(ProgressUpdate {
             task_id: task_id.to_owned(),
             downloaded_bytes: downloaded,
@@ -4738,9 +4804,12 @@ async fn download_single_once(
             segment_details: single_segment_progress(downloaded, total_bytes, false),
             ..Default::default()
         })
-        .await;
-    file.flush().await?;
-    let _ = db.update_task_progress(task_id, downloaded).await;
+        .await
+        .is_err()
+    {
+        tracing::debug!("HTTP progress receiver closed");
+    }
+    persist_single_progress(&mut file, db, task_id, downloaded).await?;
     Ok(SingleDownloadResult {
         response_content_length,
         decompressed: encoding.is_some(),
@@ -5637,11 +5706,24 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_filename_no_conflict() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_no_conflict");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_no_conflict_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // Clean up any leftover
-        let _ = tokio::fs::remove_file(dir.join("test.txt")).await;
-        let _ = tokio::fs::remove_file(dir.join(format!("test.txt{TEMP_EXT}"))).await;
+        if let Err(error) = tokio::fs::remove_file(dir.join("test.txt")).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        if let Err(error) = tokio::fs::remove_file(dir.join(format!("test.txt{TEMP_EXT}"))).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
 
         let result = dedup_filename(
             &dir,
@@ -5653,17 +5735,26 @@ mod tests {
         .await;
         assert_eq!(result, "test.txt");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_with_conflict() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_conflict");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_conflict_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // Create conflicting file
         tokio::fs::write(dir.join("test.txt"), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5676,26 +5767,35 @@ mod tests {
         assert_eq!(result, "test (1).txt");
 
         // Clean up
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_case_folds_across_disk_variants() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_case_fold");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_case_fold_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // Exact-case entry forces Phase 1's `try_exists()` probe to see a
         // conflict on every platform (Linux's exists() is case-sensitive,
         // unlike Windows/APFS where a bare `Test.txt` would already do it).
         tokio::fs::write(dir.join("TEST.txt"), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
         tokio::fs::write(dir.join("Test.txt"), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
         // Differently-cased numbered variant already occupies " (1)".
         tokio::fs::write(dir.join("Test (1).txt"), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5711,17 +5811,24 @@ mod tests {
         );
         assert_eq!(result, "TEST (2).txt");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_temp_file_conflict() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_temp");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir =
+            std::env::temp_dir().join(format!("fluxdown_test_dedup_temp_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // Create a .fdownloading temp file — should also be considered a conflict
         tokio::fs::write(dir.join(format!("test.txt{TEMP_EXT}")), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5733,16 +5840,25 @@ mod tests {
         .await;
         assert_eq!(result, "test (1).txt");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_no_extension() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_noext");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_noext_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         tokio::fs::write(dir.join("README"), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5754,7 +5870,11 @@ mod tests {
         .await;
         assert_eq!(result, "README (1)");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5763,8 +5883,13 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_filename_reserved_set_avoids_collision() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_reserved");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_reserved_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // No file exists on disk, but the temp path is already reserved
         // by a sibling task (simulating a batch download in progress).
         let reserved_temp = dir.join(format!("video.mp4{TEMP_EXT}"));
@@ -5782,17 +5907,26 @@ mod tests {
         .await;
         assert_eq!(result, "video (1).mp4");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_reserved_set_phase2_collision() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_reserved_p2");
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_reserved_p2_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // video.mp4 exists on disk AND video (1).mp4.fdownloading is reserved.
         tokio::fs::write(dir.join("video.mp4"), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
         let reserved_temp1 = dir.join(format!("video (1).mp4{TEMP_EXT}"));
         let mut reserved = std::collections::HashSet::new();
         reserved.insert(reserved_temp1);
@@ -5809,7 +5943,11 @@ mod tests {
         .await;
         assert_eq!(result, "video (2).mp4");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5831,9 +5969,18 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_filename_async_no_self_conflict_when_alone() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_no_self_conflict_async");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_no_self_conflict_async_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
 
         // 磁盘干净；reserved 中只有兄弟任务 sibling.bin，没有自己的 setup.exe
         let mut reserved = std::collections::HashSet::new();
@@ -5852,7 +5999,11 @@ mod tests {
             "reserved 集合不含本任务名时，dedup 必须返回原名（PR #296 回归 bug）"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -5863,12 +6014,21 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_filename_overwrite_keeps_name_when_only_final_exists() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_ow_final");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_ow_final_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         tokio::fs::write(dir.join("test.txt"), b"old")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5883,18 +6043,31 @@ mod tests {
             "overwrite 模式下仅最终文件存在必须保留原名（完成时覆盖）"
         );
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_overwrite_temp_file_still_conflicts() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_ow_temp");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_ow_temp_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // 在途下载的临时文件是硬冲突——绝不覆盖其他任务的在途产物。
         tokio::fs::write(dir.join(format!("test.txt{TEMP_EXT}")), b"")
             .await
-            .unwrap_or(());
+            .expect("test fixture write succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5906,14 +6079,27 @@ mod tests {
         .await;
         assert_eq!(result, "test (1).txt");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_overwrite_reserved_and_avoid_still_conflict() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_ow_reserved");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_ow_reserved_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
 
         // reserved 命中：兄弟任务已预订同名 temp。
         let mut reserved = std::collections::HashSet::new();
@@ -5941,14 +6127,27 @@ mod tests {
         .await;
         assert_eq!(result, "Movie (1).mkv");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn dedup_filename_overwrite_directory_still_conflicts() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_ow_dir");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(dir.join("data.bin")).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_ow_dir_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(dir.join("data.bin"))
+            .await
+            .expect("test filesystem operation succeeds");
 
         let result = dedup_filename(
             &dir,
@@ -5960,7 +6159,11 @@ mod tests {
         .await;
         assert_eq!(result, "data (1).bin", "文件不能覆盖同名目录，必须改名");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     // 注：dedup_filename_sync 是 download_manager 模块内的私有函数，与
@@ -6998,12 +7201,23 @@ mod tests {
 
     #[tokio::test]
     async fn claim_rename_succeeds_when_dst_free() {
-        let dir = std::env::temp_dir().join("fluxdown_test_claim_rename_free");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_claim_rename_free_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         let src = dir.join("src.bin");
         let dst = dir.join("dst.bin");
-        let _ = tokio::fs::write(&src, b"payload").await;
+        tokio::fs::write(&src, b"payload")
+            .await
+            .expect("test filesystem operation succeeds");
 
         let result = super::claim_rename(&src, &dst).await;
         assert!(
@@ -7013,18 +7227,35 @@ mod tests {
         assert_eq!(tokio::fs::read(&dst).await.unwrap_or_default(), b"payload");
         assert!(!src.exists(), "src must be gone after a successful rename");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn claim_rename_fails_when_dst_exists_preserves_both() {
-        let dir = std::env::temp_dir().join("fluxdown_test_claim_rename_exists");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_claim_rename_exists_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         let src = dir.join("src.bin");
         let dst = dir.join("dst.bin");
-        let _ = tokio::fs::write(&src, b"incoming").await;
-        let _ = tokio::fs::write(&dst, b"original").await;
+        tokio::fs::write(&src, b"incoming")
+            .await
+            .expect("test filesystem operation succeeds");
+        tokio::fs::write(&dst, b"original")
+            .await
+            .expect("test filesystem operation succeeds");
 
         let result = super::claim_rename(&src, &dst).await;
         match result {
@@ -7036,17 +7267,34 @@ mod tests {
         // src must survive intact for the caller's dedup-and-retry path.
         assert_eq!(tokio::fs::read(&src).await.unwrap_or_default(), b"incoming");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn claim_final_name_dedups_instead_of_overwriting() {
-        let dir = std::env::temp_dir().join("fluxdown_test_claim_final_dedup");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_claim_final_dedup_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         let src = dir.join("a.ts.fdownloading");
-        let _ = tokio::fs::write(&src, b"incoming").await;
-        let _ = tokio::fs::write(dir.join("a.ts"), b"original").await;
+        tokio::fs::write(&src, b"incoming")
+            .await
+            .expect("test filesystem operation succeeds");
+        tokio::fs::write(dir.join("a.ts"), b"original")
+            .await
+            .expect("test filesystem operation succeeds");
 
         let chosen =
             super::claim_final_name(&src, &dir, "a.ts", false, &std::collections::HashSet::new())
@@ -7063,17 +7311,34 @@ mod tests {
                 .unwrap_or_default(),
             b"incoming"
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn claim_final_name_overwrite_replaces_only_the_original_name() {
-        let dir = std::env::temp_dir().join("fluxdown_test_claim_final_overwrite");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_claim_final_overwrite_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         let src = dir.join("a.ts.fdownloading");
-        let _ = tokio::fs::write(&src, b"incoming").await;
-        let _ = tokio::fs::write(dir.join("a.ts"), b"original").await;
+        tokio::fs::write(&src, b"incoming")
+            .await
+            .expect("test filesystem operation succeeds");
+        tokio::fs::write(dir.join("a.ts"), b"original")
+            .await
+            .expect("test filesystem operation succeeds");
 
         let chosen =
             super::claim_final_name(&src, &dir, "a.ts", true, &std::collections::HashSet::new())
@@ -7084,17 +7349,34 @@ mod tests {
             tokio::fs::read(dir.join("a.ts")).await.unwrap_or_default(),
             b"incoming"
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[tokio::test]
     async fn claim_final_name_overwrite_never_touches_a_sibling_reserved_name() {
-        let dir = std::env::temp_dir().join("fluxdown_test_claim_final_reserved");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_claim_final_reserved_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         let src = dir.join("a.ts.fdownloading");
-        let _ = tokio::fs::write(&src, b"incoming").await;
-        let _ = tokio::fs::write(dir.join("a.ts"), b"sibling").await;
+        tokio::fs::write(&src, b"incoming")
+            .await
+            .expect("test filesystem operation succeeds");
+        tokio::fs::write(dir.join("a.ts"), b"sibling")
+            .await
+            .expect("test filesystem operation succeeds");
         let avoid: std::collections::HashSet<String> = ["a.ts".to_string()].into();
 
         let chosen = super::claim_final_name(&src, &dir, "a.ts", true, &avoid).await;
@@ -7104,7 +7386,11 @@ mod tests {
             tokio::fs::read(dir.join("a.ts")).await.unwrap_or_default(),
             b"sibling"
         );
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 
     #[test]
@@ -7122,9 +7408,18 @@ mod tests {
 
     #[tokio::test]
     async fn dedup_filename_avoid_param_case_folds_and_renames() {
-        let dir = std::env::temp_dir().join("fluxdown_test_dedup_avoid_case_fold");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        let _ = tokio::fs::create_dir_all(&dir).await;
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_test_dedup_avoid_case_fold_{}",
+            uuid::Uuid::new_v4()
+        ));
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test filesystem operation succeeds");
         // Empty directory, no reserved entries — only `avoid` forces a rename,
         // and the match must hold across case folding (lower-cased entry vs
         // mixed-case name).
@@ -7141,7 +7436,11 @@ mod tests {
         .await;
         assert_eq!(result, "Movie (1).mkv");
 
-        let _ = tokio::fs::remove_dir_all(&dir).await;
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            panic!("test filesystem cleanup failed: {error}");
+        }
     }
 }
 
@@ -7204,8 +7503,12 @@ mod single_resume_tests {
                         .find_map(|l| l.strip_prefix("range: bytes="))
                         .and_then(|r| r.split('-').next())
                         .and_then(|n| n.trim().parse::<usize>().ok());
-                    let _ = stream.write_all(&handler(range_start)).await;
-                    let _ = stream.shutdown().await;
+                    if let Err(error) = stream.write_all(&handler(range_start)).await {
+                        tracing::debug!(%error, "test HTTP client closed connection");
+                    }
+                    if let Err(error) = stream.shutdown().await {
+                        tracing::debug!(%error, "test HTTP client closed connection");
+                    }
                 });
             }
         });
@@ -7254,8 +7557,194 @@ mod single_resume_tests {
         .await
         .map(|_| ());
         let on_disk = std::fs::read(&dest).unwrap();
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
         (res, on_disk)
+    }
+
+    // The persistence fault, worker exit and queue drain share one engine lifetime.
+    #[tokio::test]
+    async fn completion_persistence_failure_publishes_error_and_drains_queue()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let dir = std::env::temp_dir().join(format!(
+            "fluxdown_completion_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        tokio::fs::create_dir_all(&dir).await?;
+        let db_url = format!("sqlite://{}?mode=rwc", dir.join("completion.db").display());
+        let port = spawn_http(|_| response("200 OK", "", b"completed-file")).await;
+        let mut engine = crate::Engine::new(
+            crate::EngineConfig {
+                max_concurrent: 1,
+                speed_limit_bps: 0,
+                upload_limit_bps: 0,
+                default_save_dir: dir.to_string_lossy().into_owned(),
+                app_data_dir: dir.to_string_lossy().into_owned(),
+                bt_config: crate::bt_downloader::BtConfig::default(),
+                proxy_config: crate::proxy_config::ProxyConfig::default(),
+                user_agent: String::new(),
+                data_dir_override: Some(dir.clone()),
+                database_url: Some(db_url.clone()),
+            },
+            Arc::new(NoopSink),
+            Arc::new(crate::NoopSelection),
+        )
+        .await?;
+        let injector = sqlx::AnyPool::connect(&db_url).await?;
+        sqlx::query("CREATE TRIGGER reject_completion BEFORE UPDATE OF status ON tasks WHEN NEW.status = 3 BEGIN SELECT RAISE(FAIL, 'completion write rejected'); END")
+            .execute(&injector).await?;
+        let mut done_rx = engine.manager.take_done_rx().expect("done receiver");
+        let mut progress_rx = engine
+            .manager
+            .take_progress_rx()
+            .expect("progress receiver");
+        let mut ids = Vec::new();
+        for file_name in ["first.bin", "next.bin"] {
+            ids.push(
+                engine
+                    .manager
+                    .create_task(crate::download_manager::NewTaskSpec {
+                        url: format!("http://127.0.0.1:{port}/{file_name}"),
+                        save_dir: dir.to_string_lossy().into_owned(),
+                        file_name: file_name.to_owned(),
+                        segments: 1,
+                        ..Default::default()
+                    })
+                    .await
+                    .expect("create HTTP task"),
+            );
+        }
+        for (id, file_name) in ids.iter().zip(["first.bin", "next.bin"]) {
+            let done = tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
+                .await?
+                .expect("worker reports completion");
+            assert_eq!(&done.task_id, id);
+            engine.manager.on_task_done(&done).await;
+            let task = engine.db.load_task_by_id(id).await?.expect("task remains");
+            assert_eq!(task.status, 4, "worker exit must not leave a running row");
+            assert!(task.error_message.contains("completion write rejected"));
+            assert_eq!(
+                tokio::fs::read(dir.join(file_name)).await?,
+                b"completed-file"
+            );
+        }
+        let mut error_ids = std::collections::HashSet::new();
+        while let Ok(progress) = progress_rx.try_recv() {
+            assert_ne!(
+                progress.status, 3,
+                "failed persistence must not publish success"
+            );
+            if progress.status == 4 {
+                assert!(progress.error_message.contains("completion write rejected"));
+                error_ids.insert(progress.task_id);
+            }
+        }
+        assert_eq!(error_ids, ids.into_iter().collect());
+        engine.manager.shutdown().await;
+        injector.close().await;
+        drop(engine);
+        if let Err(error) = tokio::fs::remove_dir_all(&dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_stale_file_removal_preserves_segment_resume_layout() {
+        let db = Db::connect("sqlite::memory:").await.expect("open DB");
+        db.insert_task(
+            "discard",
+            "http://localhost/f",
+            "f",
+            "",
+            2,
+            100,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        db.insert_segments("discard", &[(0, 0, 99)])
+            .await
+            .expect("insert segment");
+        db.update_segment_progress("discard", 0, 10)
+            .await
+            .expect("save durable checkpoint");
+        let path =
+            std::env::temp_dir().join(format!("fluxdown_http_discard_{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&path)
+            .await
+            .expect("create non-removable-as-file fixture");
+        assert!(matches!(
+            super::discard_segment_data(&db, "discard", &path).await,
+            Err(DownloadError::Io(_))
+        ));
+        let rows = db
+            .load_segments("discard")
+            .await
+            .expect("load preserved layout");
+        assert_eq!(
+            rows.iter()
+                .map(|r| (r.index, r.start_byte, r.end_byte, r.downloaded_bytes))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 99, 10)],
+            "failed invalidation cannot masquerade as a complete single-stream file on resume"
+        );
+        tokio::fs::remove_dir(path)
+            .await
+            .expect("remove fixture directory");
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_flush_does_not_advance_resume_progress() {
+        let db = Db::connect("sqlite::memory:").await.expect("open DB");
+        db.insert_task(
+            "checkpoint",
+            "http://localhost/f",
+            "f",
+            "",
+            1,
+            8,
+            "",
+            "",
+            "",
+            1,
+        )
+        .await
+        .expect("insert task");
+        let path =
+            std::env::temp_dir().join(format!("fluxdown_http_checkpoint_{}", uuid::Uuid::new_v4()));
+        tokio::fs::write(&path, b"old")
+            .await
+            .expect("create fixture");
+        let file = tokio::fs::File::open(&path)
+            .await
+            .expect("open read-only fixture");
+        let mut writer = tokio::io::BufWriter::with_capacity(1024, file);
+        writer.write_all(b"new").await.expect("buffer write");
+        assert!(matches!(
+            super::persist_single_progress(&mut writer, &db, "checkpoint", 6).await,
+            Err(DownloadError::Io(_))
+        ));
+        assert_eq!(
+            db.load_task_by_id("checkpoint")
+                .await
+                .expect("load task")
+                .expect("task exists")
+                .downloaded_bytes,
+            0
+        );
+        assert_eq!(tokio::fs::read(&path).await.expect("read fixture"), b"old");
+        drop(writer);
+        tokio::fs::remove_file(path).await.expect("remove fixture");
     }
 
     #[tokio::test]
@@ -7307,7 +7796,12 @@ mod single_resume_tests {
         attempt().await.unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"finished download");
         drop(second);
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(db);
+        if let Err(error) = std::fs::remove_dir_all(&dir)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, "test directory cleanup failed");
+        }
     }
 
     #[tokio::test]

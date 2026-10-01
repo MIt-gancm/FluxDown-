@@ -138,12 +138,44 @@ fn spawn_feed_server(make_rounds: impl FnOnce(&str) -> Vec<String>) -> (u16, Arc
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: {ctype}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                 body.len()
             );
-            let _ = stream.write_all(resp.as_bytes());
+
+            stream.write_all(resp.as_bytes()).unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
             // HEAD 不回 body（否则 reqwest 会读到多余字节）。
             if !req.starts_with("HEAD ") {
-                let _ = stream.write_all(body.as_bytes());
+                stream.write_all(body.as_bytes()).unwrap_or_else(|error| {
+                    assert!(
+                        matches!(
+                            error.kind(),
+                            std::io::ErrorKind::BrokenPipe
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                        ),
+                        "test server response failed: {error}"
+                    );
+                });
             }
-            let _ = stream.flush();
+
+            stream.flush().unwrap_or_else(|error| {
+                assert!(
+                    matches!(
+                        error.kind(),
+                        std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                    ),
+                    "test server response failed: {error}"
+                );
+            });
         }
     });
     (port, feed_hits)
@@ -325,7 +357,11 @@ async fn rss_pipeline_seeds_then_downloads_only_matching_new_items() {
         "dangling pointer cleared"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 订阅这个动作本身就是「我要这个源的内容」：点完「订阅」必须立刻有条目，
@@ -374,7 +410,11 @@ async fn subscribing_fetches_immediately_without_waiting_for_a_tick() {
         "首轮抓完即播种完成"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -423,7 +463,11 @@ async fn rss_fetch_failure_is_recorded_and_backs_off_without_disabling() {
         "a backed-off source must not be re-fetched on the next tick"
     );
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 回归：Mikan 这类「enclosure 是 `.torrent` 直链」的 feed 必须建出**真正的
@@ -530,7 +574,11 @@ async fn torrent_enclosures_become_real_bt_tasks_without_a_bogus_size_hint() {
     assert_eq!(item.status, RssItemStatus::Downloaded);
     assert_eq!(item.task_id, task.task_id);
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }
 
 /// 「立即抓取」撞上在途抓取是幂等成功（AlreadyRunning），只有订阅不存在才是 NotFound。
@@ -570,5 +618,10 @@ async fn refresh_while_fetching_is_idempotent_and_unknown_source_is_not_found() 
         engine.manager.refresh_rss_source(&source_id),
         RssRefreshOutcome::Started
     );
-    let _ = tokio::fs::remove_dir_all(&work).await;
+
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

@@ -99,5 +99,9 @@ async fn failed_dev_install_keeps_installed_plugin_and_settings() {
         .expect_err("no dev registration");
     assert!(matches!(err, PluginError::NotDevPlugin(_)), "got {err:?}");
 
-    let _ = tokio::fs::remove_dir_all(&work).await;
+    if let Err(error) = tokio::fs::remove_dir_all(&work).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("best-effort test directory cleanup: {error}");
+    }
 }

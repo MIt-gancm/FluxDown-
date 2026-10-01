@@ -343,13 +343,18 @@ async fn run_server(
     }
     let listener = tokio::net::UnixListener::bind(&path)?;
     tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await?;
-    let _ = ready.send(());
+    if ready.send(()).is_err() {
+        tracing::debug!("NMH startup waiter closed before socket became ready");
+    }
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 drop(listener);
-                let _ = tokio::fs::remove_file(&path).await;
-                return Ok(());
+                return match tokio::fs::remove_file(&path).await {
+                    Ok(()) => Ok(()),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(error) => Err(error),
+                };
             }
             accepted = listener.accept() => {
                 let stream = match accepted {
@@ -415,8 +420,10 @@ async fn run_server(
             .first_pipe_instance(first)
             .create(&pipe_name)?;
         first = false;
-        if let Some(ready) = ready.take() {
-            let _ = ready.send(());
+        if let Some(ready) = ready.take()
+            && ready.send(()).is_err()
+        {
+            tracing::debug!("NMH startup waiter closed before pipe became ready");
         }
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -1143,18 +1150,20 @@ pub mod registry {
                 std::process::id(),
                 uuid::Uuid::new_v4()
             ));
-            std::fs::create_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).expect("create relay test directory");
             let current = dir.join("current_nmh");
             let other = dir.join("other_nmh");
-            std::fs::write(&current, b"").ok();
-            std::fs::write(&other, b"").ok();
+            std::fs::write(&current, b"").expect("create current relay");
+            std::fs::write(&other, b"").expect("create other relay");
             assert_eq!(classify_relay(&current, &current), RelayOwner::Current);
             assert_eq!(classify_relay(&other, &current), RelayOwner::OtherInstall);
             assert_eq!(
                 classify_relay(&dir.join("removed_nmh"), &current),
                 RelayOwner::Broken
             );
-            std::fs::remove_dir_all(&dir).ok();
+            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                tracing::warn!(path = %dir.display(), %error, "relay ownership test cleanup failed");
+            }
         }
 
         fn list(items: &[&str]) -> Vec<String> {
@@ -2263,7 +2272,10 @@ mod tests {
         let server_task = tokio::spawn(handle_stream(server, service));
         let reply = ping_stream(client).await.expect("pong");
         assert_eq!(reply, "pong");
-        let _ = server_task.await;
+        server_task
+            .await
+            .expect("join NMH stream handler")
+            .expect("clean client EOF closes NMH stream");
     }
 
     #[test]

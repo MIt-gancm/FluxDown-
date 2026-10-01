@@ -93,11 +93,15 @@ impl PluginAuthDialog {
             plugin_auth_call(&dialog.port, &dialog.identity, "status", "", "", "", "");
         cx.spawn_in(window, async move |this, cx| {
             let result = status_future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 this.apply_result(result, false, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
         dialog
@@ -110,11 +114,15 @@ impl PluginAuthDialog {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 this.apply_result(result, false, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -143,11 +151,15 @@ impl PluginAuthDialog {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.busy = false;
                 this.apply_result(result, notify_success, window, cx);
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -176,7 +188,13 @@ impl PluginAuthDialog {
             "",
         );
         cx.spawn(async move |_this, _cx| {
-            let _ = future.await;
+            if let Err(error) = future.await {
+                // 对话框可能已关闭；取消会话失败只留诊断，不回写已释放的 UI。
+                eprintln!(
+                    "plugin authentication cancellation failed: {:?} ({:?})",
+                    error.code, error.reason
+                );
+            }
         })
         .detach();
     }

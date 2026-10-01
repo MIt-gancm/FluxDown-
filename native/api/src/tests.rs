@@ -202,14 +202,17 @@ impl MockHost {
     }
 
     /// 模拟宿主检测到一次任务状态迁移，广播对应事件。若本实例未启用事件订阅
-    /// （[`Self::without_task_events`]）或当前没有任何 WS 会话已订阅，静默
-    /// 丢弃——调用方需自行保证先建立 WS 连接（使订阅生效）再调用本方法。
+    /// （[`Self::without_task_events`]）或当前没有任何 WS 会话已订阅时记录生命周期日志。
     fn emit_event(&self, task_id: &str, kind: TaskEventKind) {
-        if let Some(tx) = &self.events {
-            let _ = tx.send(TaskEvent {
-                task_id: task_id.to_string(),
-                kind,
-            });
+        if let Some(tx) = &self.events
+            && tx
+                .send(TaskEvent {
+                    task_id: task_id.to_string(),
+                    kind,
+                })
+                .is_err()
+        {
+            tracing::debug!("test task event has no subscribers");
         }
     }
 }

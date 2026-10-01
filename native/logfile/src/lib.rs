@@ -103,9 +103,11 @@ impl LogFile {
         fs::create_dir_all(dir)?;
         let path = dir.join(format!("{stem}.log"));
         let rotated_path = dir.join(format!("{stem}.log.1"));
-        let existing = fs::metadata(&path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
+        let existing = match fs::metadata(&path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error),
+        };
         if existing >= max_file_bytes {
             rotate_files(&path, &rotated_path)?;
         }
@@ -123,7 +125,7 @@ impl LogFile {
             }),
         };
         let mut state = log.lock();
-        log.write_banner(&mut state, "session started");
+        log.write_banner(&mut state, "session started")?;
         drop(state);
         Ok(log)
     }
@@ -182,7 +184,7 @@ impl LogFile {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn write_banner(&self, state: &mut State, reason: &str) {
+    fn write_banner(&self, state: &mut State, reason: &str) -> io::Result<()> {
         let banner = format!(
             "====== {} pid={} {reason} ======\n{}",
             utc_timestamp(SystemTime::now()),
@@ -191,7 +193,7 @@ impl LogFile {
         );
         let mut banner = banner.trim_end().to_owned();
         banner.push('\n');
-        self.append(state, banner.as_bytes());
+        self.append(state, banner.as_bytes())
     }
 
     fn write_summary(&self, state: &mut State, summary: &Summary) {
@@ -206,41 +208,49 @@ impl LogFile {
 
     fn write_line(&self, state: &mut State, level: Level, text: &str, suffix: Option<&str>) {
         let line = format_line(level, text, suffix, SystemTime::now());
-        self.append(state, line.as_bytes());
+        if let Err(error) = self.append(state, line.as_bytes()) {
+            // 不调用宿主 logger：它会再次写入本文件。失败后句柄已禁用，只报一次。
+            eprintln!(
+                "fluxdown_logfile: writing {} failed: {error}",
+                self.path.display()
+            );
+        }
     }
 
-    fn append(&self, state: &mut State, bytes: &[u8]) {
+    fn append(&self, state: &mut State, bytes: &[u8]) -> io::Result<()> {
         let Some(file) = state.file.as_mut() else {
-            return;
+            return Ok(());
         };
-        if file.write_all(bytes).is_err() {
-            // 磁盘满 / 句柄失效：本进程后续放弃写入，不在热路径上反复重试 I/O。
+        if let Err(error) = file.write_all(bytes) {
             state.file = None;
-            return;
+            return Err(error);
         }
         state.size = state.size.saturating_add(bytes.len() as u64);
         if state.size >= self.max_file_bytes {
-            self.rotate(state);
+            self.rotate(state)?;
         }
+        Ok(())
     }
 
-    fn rotate(&self, state: &mut State) {
+    fn rotate(&self, state: &mut State) -> io::Result<()> {
         state.file = None;
         state.size = 0;
         let reopened = rotate_files(&self.path, &self.rotated_path)
             .and_then(|()| open_append(&self.path))
             // 改名失败（例如被其它进程占用）时退回截断当前文件，保证总量仍有界。
-            .or_else(|_| {
+            .or_else(|error| {
+                eprintln!(
+                    "fluxdown_logfile: rotating {} failed: {error}; truncating current file",
+                    self.path.display()
+                );
                 OpenOptions::new()
                     .create(true)
                     .write(true)
                     .truncate(true)
                     .open(&self.path)
             });
-        if let Ok(file) = reopened {
-            state.file = Some(file);
-            self.write_banner(state, "continued after rotation");
-        }
+        state.file = Some(reopened?);
+        self.write_banner(state, "continued after rotation")
     }
 }
 
@@ -370,12 +380,16 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        let _ = fs::remove_dir_all(&dir);
+        match fs::remove_dir_all(&dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove stale test directory: {error}"),
+        }
         dir
     }
 
     fn read(path: &Path) -> String {
-        fs::read_to_string(path).unwrap_or_default()
+        fs::read_to_string(path).unwrap_or_else(|error| panic!("read test log: {error}"))
     }
 
     #[test]
@@ -399,23 +413,32 @@ mod tests {
             "header repeated after rotation"
         );
         assert!(!dir.join("desktop.log.2").exists(), "only one rotated copy");
-        let _ = fs::remove_dir_all(&dir);
+        drop(log);
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("clean test directory failed: {error}");
+        }
     }
 
     #[test]
     fn oversized_file_is_rotated_on_open() {
         let dir = temp_dir("reopen");
-        fs::create_dir_all(&dir).unwrap_or_default();
-        fs::write(dir.join("agent.log"), vec![b'a'; 4096]).unwrap_or_default();
+        fs::create_dir_all(&dir).unwrap_or_else(|error| panic!("create test directory: {error}"));
+        fs::write(dir.join("agent.log"), vec![b'a'; 4096])
+            .unwrap_or_else(|error| panic!("write test log: {error}"));
         let log = LogFile::open_with_limit(&dir, "agent", String::new(), 1024)
             .unwrap_or_else(|error| panic!("open: {error}"));
         log.log(Level::Warn, "fresh");
         assert_eq!(
-            fs::metadata(dir.join("agent.log.1")).map(|m| m.len()).ok(),
-            Some(4096)
+            fs::metadata(dir.join("agent.log.1"))
+                .unwrap_or_else(|error| panic!("read rotated log metadata: {error}"))
+                .len(),
+            4096
         );
         assert!(read(&dir.join("agent.log")).contains("WARN  fresh"));
-        let _ = fs::remove_dir_all(&dir);
+        drop(log);
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("clean test directory failed: {error}");
+        }
     }
 
     #[test]
@@ -435,7 +458,10 @@ mod tests {
         let text = read(log.path());
         assert_eq!(text.matches("ERROR DirectX device lost").count(), 10);
         assert!(text.contains("[suppressed 15 repeats over 0s] DirectX device lost detected"));
-        let _ = fs::remove_dir_all(&dir);
+        drop(log);
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("clean test directory failed: {error}");
+        }
     }
 
     #[test]

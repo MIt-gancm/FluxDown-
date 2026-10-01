@@ -330,7 +330,13 @@ pub async fn run_submission(
         }
     }
     for command in best_effort {
-        let _ = execute(command).await;
+        if let Err(error) = execute(command).await {
+            // 偏好和捕获清理不影响已创建任务，但失败需要诊断记录。
+            eprintln!(
+                "download submission best-effort command failed: {:?} ({:?})",
+                error.code, error.reason
+            );
+        }
     }
     SubmissionReport {
         created_task_ids,

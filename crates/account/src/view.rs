@@ -126,12 +126,15 @@ impl AccountView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+            let Ok(()) = this.update(cx, |this, cx| {
                 if let Err(error) = result {
                     this.last_error = Some(error_text(this.translator.read(cx), &error, context));
                 }
                 cx.notify();
-            });
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -150,7 +153,7 @@ impl AccountView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.signing_out = false;
                 // agent 先清本地会话再回报吊销失败（如离线）；本机已退出时该错误只会误导。
                 let signed_out = this.controller(cx).session().is_none();
@@ -164,7 +167,10 @@ impl AccountView {
                     ));
                 }
                 cx.notify();
-            });
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -183,7 +189,7 @@ impl AccountView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             let result = future.await;
-            let _ = this.update(cx, |this, cx| {
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.linked_refreshing = false;
                 if let Err(error) = result {
                     this.last_error = Some(error_text(
@@ -193,7 +199,10 @@ impl AccountView {
                     ));
                 }
                 cx.notify();
-            });
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -205,10 +214,13 @@ impl AccountView {
         cx.notify();
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            let _ = this.update(cx, |this, cx| {
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.origin_id_copied = false;
                 cx.notify();
-            });
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -237,10 +249,13 @@ impl AccountView {
                 Ok(_) => devices.await,
                 Err(error) => Err(error),
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.cloud_refreshing = false;
                 this.notify_refresh_result(result.map(|_| ()), window, cx);
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -259,10 +274,13 @@ impl AccountView {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.devices_refreshing = false;
                 this.notify_refresh_result(result.map(|_| ()), window, cx);
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -306,10 +324,13 @@ impl AccountView {
             let Ok(endpoint) = serde_json::from_value::<CloudEndpointDto>(value) else {
                 return;
             };
-            let _ = this.update(cx, |this, cx| {
+            let Ok(()) = this.update(cx, |this, cx| {
                 this.endpoint = Some(endpoint);
                 cx.notify();
-            });
+            }) else {
+                // 账户视图或窗口已释放，结束回调，不再更新状态。
+                return;
+            };
         })
         .detach();
     }
@@ -352,7 +373,7 @@ impl AccountView {
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = future.await;
-            let _ = this.update_in(cx, |this, window, cx| {
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.endpoint_busy = false;
                 let translator = this.translator.read(cx);
                 match result.and_then(|value| {
@@ -390,7 +411,10 @@ impl AccountView {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 对话框或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }

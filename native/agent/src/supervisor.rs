@@ -182,8 +182,13 @@ impl DaemonSupervisor {
         } else {
             options.append(true);
         }
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
+        if let Some(dir) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(dir)
+        {
+            if !self.stderr_log_warned.swap(true, Ordering::AcqRel) {
+                tracing::warn!(path = %dir.display(), %error, "cannot create fluxdownd stderr log directory; discarding daemon stderr");
+            }
+            return Stdio::null();
         }
         match options.open(path) {
             Ok(file) => Stdio::from(file),

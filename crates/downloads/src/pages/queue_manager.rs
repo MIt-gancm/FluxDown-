@@ -330,7 +330,11 @@ impl QueueManagerView {
         let future = self.port.execute(command);
         cx.spawn(async move |this, cx| {
             if future.await.is_err() {
-                let _ = this.update(cx, |this, cx| this.fail("localServiceActionFailed", cx));
+                let Ok(()) = this.update(cx, |this, cx| this.fail("localServiceActionFailed", cx))
+                else {
+                    // 视图已释放，结束回调而不再更新状态。
+                    return;
+                };
             }
         })
         .detach();
@@ -468,7 +472,8 @@ impl QueueManagerView {
                     cx,
                 ))
                 .on_ok(move |_, _, cx| {
-                    let _ = view.update(cx, |this, cx| {
+                    // 队列页释放后没有提交删除，确认框不能报告成功。
+                    view.update(cx, |this, cx| {
                         this.run_command(
                             DownloadsCommand::QueueDelete {
                                 queue_id: queue_id.clone(),
@@ -477,8 +482,8 @@ impl QueueManagerView {
                         );
                         this.form = None;
                         cx.notify();
-                    });
-                    true
+                    })
+                    .is_ok()
                 })
         });
     }
@@ -502,7 +507,8 @@ impl QueueManagerView {
                 Ok(Ok(Some(paths))) => paths.first().map(|path| path.display().to_string()),
                 _ => None,
             };
-            let _ = this.update_in(cx, |this, window, cx| {
+
+            let Ok(()) = this.update_in(cx, |this, window, cx| {
                 if let Some(form) = &mut this.form {
                     form.picking_dir = false;
                     if let Some(path) = picked {
@@ -511,7 +517,10 @@ impl QueueManagerView {
                     }
                 }
                 cx.notify();
-            });
+            }) else {
+                // 视图或窗口已释放，停止回写异步结果。
+                return;
+            };
         })
         .detach();
     }
@@ -773,9 +782,12 @@ impl QueueManagerView {
                     PopupMenuItem::new(unset_item.clone())
                         .checked(hour.is_none())
                         .on_click(move |_, _, cx| {
-                            let _ = clear.update(cx, |this, cx| {
+                            let Ok(()) = clear.update(cx, |this, cx| {
                                 this.set_schedule_time(slot, None, cx);
-                            });
+                            }) else {
+                                // 视图已释放，结束回调而不再更新状态。
+                                return;
+                            };
                         }),
                 );
                 (0..24u16).fold(menu, |menu, h| {
@@ -784,9 +796,12 @@ impl QueueManagerView {
                         PopupMenuItem::new(SharedString::from(format!("{h:02}")))
                             .checked(hour == Some(h))
                             .on_click(move |_, _, cx| {
-                                let _ = this.update(cx, |this, cx| {
+                                let Ok(()) = this.update(cx, |this, cx| {
                                     this.set_schedule_time(slot, Some(h * 60 + minute), cx);
-                                });
+                                }) else {
+                                    // 视图已释放，结束回调而不再更新状态。
+                                    return;
+                                };
                             }),
                     )
                 })
@@ -813,9 +828,12 @@ impl QueueManagerView {
                         PopupMenuItem::new(SharedString::from(format!("{m:02}")))
                             .checked(m == minute)
                             .on_click(move |_, _, cx| {
-                                let _ = this.update(cx, |this, cx| {
+                                let Ok(()) = this.update(cx, |this, cx| {
                                     this.set_schedule_time(slot, Some(hour * 60 + m), cx);
-                                });
+                                }) else {
+                                    // 视图已释放，结束回调而不再更新状态。
+                                    return;
+                                };
                             }),
                     )
                 })
@@ -867,12 +885,15 @@ impl QueueManagerView {
                 days & bit != 0,
                 SharedString::from(label.to_owned()),
                 move |checked, _, cx| {
-                    let _ = this.update(cx, |this, cx| {
+                    let Ok(()) = this.update(cx, |this, cx| {
                         if let Some(form) = &mut this.form {
                             form.schedule_days = toggle_day_bit(form.schedule_days, bit, checked);
                         }
                         cx.notify();
-                    });
+                    }) else {
+                        // 视图已释放，结束回调而不再更新状态。
+                        return;
+                    };
                 },
                 cx,
             ));

@@ -154,7 +154,7 @@ impl AgentSession {
         let generation = self.offline_generation;
         cx.spawn(async move |session, cx| {
             cx.background_executor().timer(grace).await;
-            let _ = session.update(cx, |session, cx| {
+            if let Err(error) = session.update(cx, |session, cx| {
                 if session.stale
                     && !session.offline_notified
                     && session.offline_generation == generation
@@ -163,7 +163,9 @@ impl AgentSession {
                     cx.emit(SessionSignal::Stale);
                     cx.notify();
                 }
-            });
+            }) {
+                log::debug!("view or window released before lifecycle update: {error:#}");
+            }
         })
         .detach();
     }
