@@ -2487,12 +2487,16 @@ impl TableDelegate for DownloadTableDelegate {
         self.move_shown_column(col_ix, to_ix);
     }
 
+    /// 右键选中必须在这里完成：gpui-component 在鼠标冒泡阶段先 `window.defer` 排队构建
+    /// 菜单，随后行监听才 emit `RightClickedRow`；effect 按 FIFO 执行，订阅者收到事件时
+    /// 菜单早已按旧选区构建完毕（无选中 → 空菜单不显示，只剩复选框常显；已选他行 →
+    /// 菜单作用于旧选区）。`right_clicked_row` 在派发时同步写入，构建时可靠。
     fn context_menu(
         &mut self,
         row_ix: usize,
         menu: PopupMenu,
         _window: &mut Window,
-        _cx: &mut Context<TableState<Self>>,
+        cx: &mut Context<TableState<Self>>,
     ) -> PopupMenu {
         let menu = match self.action_context.clone() {
             Some(handle) => menu.action_context(handle),
@@ -2500,7 +2504,13 @@ impl TableDelegate for DownloadTableDelegate {
         };
         match self.visible.get(row_ix).cloned() {
             Some(VisibleRow::GroupHeader { key, .. }) => self.group_context_menu(&key, menu),
-            Some(VisibleRow::Task(_)) => self.task_context_menu(menu),
+            Some(VisibleRow::Task(_)) => {
+                if let Some(key) = self.row_key_at(row_ix) {
+                    self.select_task_for_context_menu(key);
+                    cx.notify();
+                }
+                self.task_context_menu(menu)
+            }
             None => menu,
         }
     }

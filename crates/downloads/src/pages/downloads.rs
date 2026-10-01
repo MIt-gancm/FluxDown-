@@ -632,20 +632,6 @@ impl DownloadView {
         cx: &mut Context<Self>,
     ) {
         match event {
-            TableEvent::RightClickedRow(Some(row_ix)) => {
-                // 注意：这里不调用 `set_right_clicked_row(None, ..)`——该方法专为
-                // 「打开表头菜单时抑制同时出现的行菜单」设计（见其文档），若在
-                // 行右键后立即清空，会在 gpui-component 内部 `window.defer` 读取
-                // `right_clicked_row` 构建菜单之前把它清掉，导致右键菜单永远不
-                // 会出现。这里只需要更新选中集合，行高亮 / 菜单锚点交给表格自身
-                // 维护的 `right_clicked_row` 状态。
-                let row_ix = *row_ix;
-                table_state.update(cx, |table, _| {
-                    if let Some(key) = table.delegate().row_key_at(row_ix) {
-                        table.delegate_mut().select_task_for_context_menu(key);
-                    }
-                });
-            }
             TableEvent::ColumnWidthsChanged(widths) => {
                 table_state.update(cx, |table, _| {
                     table.delegate_mut().sync_column_widths(widths);
