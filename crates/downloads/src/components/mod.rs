@@ -2,6 +2,7 @@ pub(crate) mod file_icon;
 pub(crate) mod segment_progress;
 pub(crate) mod selection_bar;
 pub(crate) mod sidebar;
+pub(crate) mod sidebar_layout;
 pub(crate) mod status_bar;
 pub(crate) mod task_drag;
 pub(crate) mod task_table;
