@@ -125,7 +125,7 @@ jobs:
           $portable = "build\gpui\portable-${{ matrix.arch }}"
           Copy-Item "build\gpui\windows-${{ matrix.arch }}" $portable -Recurse
           New-Item -Path "$portable\portable" -ItemType File -Force | Out-Null
-          Copy-Item "$portable\fluxdown-desktop.exe" "$portable\flux_down.exe"
+          Copy-Item "target\${{ matrix.target }}\release\flux_down.exe" "$portable\flux_down.exe"
           Compress-Archive -Path "$portable\*" -DestinationPath "build\installer\FluxDown-${{ needs.version.outputs.version }}-windows-${{ matrix.arch }}-portable.zip"
 
       - name: Upload Windows test artifacts

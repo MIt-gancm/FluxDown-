@@ -507,8 +507,9 @@ jobs:
           iscc /DMyAppVersion=${{ steps.version.outputs.VERSION }} /DMyAppArch=${{ matrix.arch }} "/DMySourceDir=$PWD\build\gpui\windows-${{ matrix.arch }}" installer\windows\setup.iss
 
       # 便携版：根目录放 portable 标记（agent/daemon 据此把数据写在 portable_data）。
-      # flux_down.exe = fluxdown-desktop.exe 的副本：旧 Flutter 便携版的自动更新器覆盖解压后
-      # 固定重启 <dir>\flux_down.exe，副本让首次升级直接拉起 GPUI（同目录找 agent，行为一致）。
+      # flux_down.exe = 轻量转发器（crates/app/src/legacy_launcher.rs）：旧 Flutter 便携版的自动更新器
+      # 覆盖解压后固定重启 <dir>\flux_down.exe，由它带参拉起同目录 fluxdown-desktop.exe。
+      # 只进便携包，不进安装器（setup.iss 升级时删除旧 flux_down.exe）。
       - name: Create portable zip
         shell: pwsh
         run: |
@@ -516,7 +517,7 @@ jobs:
           $portable = "build\gpui\portable-${{ matrix.arch }}"
           Copy-Item $stage $portable -Recurse
           New-Item -Path "$portable\portable" -ItemType File -Force | Out-Null
-          Copy-Item "$portable\fluxdown-desktop.exe" "$portable\flux_down.exe"
+          Copy-Item "target\${{ matrix.target }}\release\flux_down.exe" "$portable\flux_down.exe"
           Compress-Archive -Path "$portable\*" -DestinationPath "build\installer\FluxDown-${{ steps.version.outputs.VERSION }}-windows-${{ matrix.arch }}-portable.zip"
           Get-ChildItem build\installer
 

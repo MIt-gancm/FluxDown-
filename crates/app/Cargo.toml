@@ -7,6 +7,11 @@ edition.workspace = true
 name = "fluxdown-desktop"
 path = "src/main.rs"
 
+# Windows 便携版的 flux_down.exe：旧 Flutter 更新器固定重启该名，转交 fluxdown-desktop。
+[[bin]]
+name = "flux_down"
+path = "src/legacy_launcher.rs"
+
 [lints]
 workspace = true
 
