@@ -250,8 +250,8 @@ class _NewDownloadSheetState extends State<_NewDownloadSheet> {
 
     String cookiesFor(String url) =>
         requestByUrl.containsKey(url) && url != widget.initialUrl
-            ? requestByUrl[url]?.cookies ?? ''
-            : cookies;
+        ? requestByUrl[url]?.cookies ?? ''
+        : cookies;
 
     String filenameFor(String url) => requestByUrl[url]?.filename ?? fileName;
 

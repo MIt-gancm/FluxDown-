@@ -32,8 +32,8 @@
 
 ## 宿主与客户端 crate
 
-### `native/hub`（桌面/移动 App，唯一 rinf）
-`lib.rs`（`write_interface!`、current_thread runtime）；`signals/mod.rs`（信号定义——Dart 绑定契约，不可动）；`actors/download_actor.rs`（核心事件循环，**必须** drain resolve_rx/plugin_retry_rx）；`api_host.rs`（`HubApiHost`：读直查 Db，写经 command+oneshot 进 actor）；`rinf_sink.rs`（`EventSink`→Dart 信号）；`rinf_selection.rs`（`HostSelection`：HLS 60s 超时默认最高码率）；`signal_bridge.rs`（`From` 转换）；`native_messaging.rs`（Flutter legacy IPC；当前 GPUI 端点见下文 `native/nmh`；另有 `listener_endpoint()`/`probe_listener()` 供 Doctor 自连自 ping）；`nmh_registry.rs`（写 NMH 清单；另有只读 `diagnose()`。**Windows 清单落在 `<data_dir>\nmh\`（安装版 `%LOCALAPPDATA%\FluxDown\nmh`），绝不写 exe 同级**——全局安装在 `Program Files`，未提权进程写不进去，注册表键永远写不出来；agent `nmh.rs` 同规则，安装器 `[UninstallDelete]` 同步清理）；`file_association.rs`（.torrent 关联）；`protocol_registry.rs`（`fluxdown://`）；`diagnostics.rs`（**新**：设置页 Doctor 探针聚合——NMH 二进制/清单/各浏览器注册、pipe ping、本地 HTTP `/ping`、协议与 `.torrent` 关联、日志目录可写；由 `download_actor` 里一条独立后台泵消费 `RunDiagnostics`/`RepairNmhRegistration`，**不碰 Engine、不进主 `select!`、不进 `aux_tx`**）；`reveal_file.rs`；`updater.rs`（版本检查 + 多段并发下载 + 委托 `fluxdown_updater` helper）；`compat_flags.rs`（**新**：Windows 清除 PCA 误设的 RUNASADMIN AppCompatFlags，修 CreateProcess 740）；`logger.rs`（转发 engine 的 shim）。
+### `native/hub`（移动 App，唯一 rinf）
+`lib.rs`（`write_interface!`、current_thread runtime）；`signals/mod.rs`（信号定义——Dart 绑定契约，不可动）；`actors/download_actor.rs`（核心事件循环，**必须** drain resolve_rx/plugin_retry_rx）；`rinf_sink.rs`（`EventSink`→Dart 信号）；`rinf_selection.rs`（`HostSelection`：HLS 60s 超时默认最高码率）；`signal_bridge.rs`（`From` 转换）；`updater.rs`（仅 Android APK 更新：版本检查 + 多段下载，安装在 Dart/Kotlin 侧）；`logger.rs`（转发 engine 的 shim）。hub 已裁为仅移动端：无 NMH / 诊断（Doctor）/ 文件与协议关联 / 本地 API 服务 / 桌面自更新 helper。
 
 > `download_actor.rs` 的主 `tokio::select!` 已接近 tokio 的 64 分支硬上限，但并未占满。新增 Dart 信号 / 定时节拍 / 引擎回流应优先复用既有 `AuxSignal` 合流：后台泵把消息送入同一条 `aux_tx`，主循环统一在 `Some(aux) = aux_rx.recv()` 分派。具体变体与泵以源码为准，不维护容易漂移的数量枚举。
 
@@ -47,12 +47,10 @@ aria2c 风格。命令：ping/info/add(get)/list(ls)/status(stat)/pause/resume/r
 
 ### `native/nmh`
 浏览器 Native Messaging Host **中继二进制**（`com.fluxdown.nmh`）。浏览器 ↔（stdin/stdout 4 字节 LE 长度 + JSON）↔ nmh ↔（每用户 Named Pipe / 私有 UDS）↔ agent。同步单线程；懒连 + 重连；除 `NO_LAUNCH_ACTIONS`（ping/tasks/task_op/open/reveal）外未连接时自动拉起 App（50ms 轮询至 10s）；`warmup` 本地应答重叠冷启动；1MB 帧上限。
-- **IPC 端点**（中继 `nmh/src/main.rs`、GPUI `agent/src/nmh.rs`、Flutter `hub/src/native_messaging.rs` 各自独立推导，测试钉同一组字面量）：Unix `<用户数据目录>/ipc/fluxdown.sock`，`ipc` 目录权限 0700；缺 home 时不可用，不回退共享目录。Windows `\\.\pipe\fluxdown-<编码账户名>`：账户名转小写，`[a-z0-9]` 以外的每个 UTF-8 字节编码为 `_xx`，下划线自身也编码；缺账户名时不可用，不回退旧固定管道名。新中继只连接新端点，不保留旧 socket 符号链接或旧路径回退。
-冷启动目标按 `APP_EXE_CANDIDATES` 在 nmh 同级目录顺序查找：**`fluxdown-agent` 在前**，Flutter 本体（`flux_down.exe` / `FluxDown` / `flux_down`）只在无 agent 时兜底——桌面发行物已是 GPUI，从 Flutter 升级的安装目录可能残留旧可执行，它先起会抢走 `<data_dir>/engine.lock` 让 fluxdownd 失效。
-- **浏览器注册（agent `nmh::registry`）**：只注册与 `fluxdown-agent` 同目录的 `fluxdown_nmh`（同一次构建，端点与帧协议一致），不回退到其它构建目录；`cargo desktop-dev` 因此一并构建中继。启动自愈在 IPC 端点开始监听后运行：注册指向另一份安装的中继时，按浏览器的方式拉起它发一条 `ping`，连不到本 agent（旧端点/旧帧协议）就改指向本安装；连得到才按路径规则保持先到者（安装版优先于开发构建/临时挂载）。Doctor「修复」总是指向本安装。hub 只按路径规则判定，不做连通性实测。
+- **IPC 端点**（中继 `nmh/src/main.rs`、GPUI `agent/src/nmh.rs` 各自独立推导，测试钉同一组字面量）：Unix `<用户数据目录>/ipc/fluxdown.sock`，`ipc` 目录权限 0700；缺 home 时不可用，不回退共享目录。Windows `\\.\pipe\fluxdown-<编码账户名>`：账户名转小写，`[a-z0-9]` 以外的每个 UTF-8 字节编码为 `_xx`，下划线自身也编码；缺账户名时不可用，不回退旧固定管道名。新中继只连接新端点，不保留旧 socket 符号链接或旧路径回退。
+冷启动目标按 `APP_EXE_CANDIDATES` 在 nmh 同级目录查找 `fluxdown-agent`；无 Flutter 本体回退（Flutter 已无桌面发行物）。
+- **浏览器注册（agent `nmh::registry`）**：只注册与 `fluxdown-agent` 同目录的 `fluxdown_nmh`（同一次构建，端点与帧协议一致），不回退到其它构建目录；`cargo desktop-dev` 因此一并构建中继。启动自愈在 IPC 端点开始监听后运行：注册指向另一份安装的中继时，按浏览器的方式拉起它发一条 `ping`，连不到本 agent（旧端点/旧帧协议）就改指向本安装；连得到才按路径规则保持先到者（安装版优先于开发构建/临时挂载）。
 
-### `native/fluxdown_updater`（**新**独立 helper）
-依赖极简（zip/flate2/tar/windows-sys/libc，无 engine/api 依赖）。由 `hub/updater.rs` 在 App 退出前拉起 → 等父 PID 死 → 应用更新 + 重启。Action：PortableZip/Setup(NSIS 静默)/AppImage/tarball/deb/arch(pkexec)。用原生 helper 而非 PS/bat/sh 规避 MOTW/执行策略/引号问题。
 
 
 ### `native/daemon` + `native/agent`：设置面 JSON-RPC（GPUI 客户端唯一入口）
@@ -83,6 +81,6 @@ aria2c 风格。命令：ping/info/add(get)/list(ls)/status(stat)/pause/resume/r
 - **Web UI 内嵌**：`web-ui` feature 下 `native/agent/build.rs` 递归嵌入 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`），`web_assets.rs` 托管（强 ETag + 304；HTML no-cache、Rollup 哈希文件名 immutable 一年、其余短缓存；未命中回 `index.html`；无 Range；未嵌入 503 自解释页）。改前端须先 `cd web && bun run build` 再重编 agent。
 - **进程语义**：server 模式不启 NMH / 不做自启迁移 / 不注册关联，`agent.platform.*` 返回 Unsupported；SIGTERM/SIGINT 走 `Lifecycle::request_quit`（先关停 daemon 再退出，二次信号强制退出）；stderr tracing（`RUST_LOG`）。Docker 用 tini 做 PID 1。Windows 发布构建带 `windows_subsystem = "windows"`，`--server` 无控制台输出。
 - **空闲静默（NAS 硬盘休眠）**：无活动/排队任务、无做种、无到期 RSS、无客户端主动请求时，daemon/agent 不得周期性读写 save_dir 与 data_dir（不 fsync 的写也会被内核回写唤醒机械盘）。落点：daemon 定时文件跟踪扫描受 `idle_file_scan`（默认关，旧库经标记键 `migration_idle_file_scan_off` 一次性迁移为关）经 `should_run_idle_scan()` 门控，客户端获焦 / 页面可见时经 `daemon.task.rescan` 补扫（GPUI `RescanThrottle` ↔ Web `rescanThrottle.ts`）；做种时长仅随上传增量 / 状态迁移 / 关机顺带落库，兜底 30 分钟；DHT dump 30 分钟；仅因暂停的未完成 BT 任务保活的会话 15 分钟后释放；SQLite 池常驻 1 连接不回收（避免 `-wal/-shm` 反复删建）；CDN 配置下发比对后才写、空闲 peek 不读库、agent 未登录不上报；RSS 无语义变化的拉取不落库（运行态以内存为准，`daemon.rss.listSources` 经 actor 重读库并叠加内存运行态）。Doctor `disk_sleep` 检查列出当前阻碍项（做种、RSS、空闲扫描）。部署建议：`/data` 放 SSD / 缓存池。
-- **兼容 API**：`AgentApiHost`（`api_host.rs`）转发 daemon RPC 实现 `ApiHost` 全部核心方法（任务/组/RSS/插件/市场/站点凭据/aria2 WS 通知经 `task_events.rs`）；旧 server 独有的扩展 REST（`/api/v1/config`、队列增删改、stats、fs/list、components、webhooks、logs、token/regenerate、`/api/v1/ws`）已**废弃**，管理面只走 `/rpc`。
+- **兼容 API**：`AgentApiHost`（`native/agent/src/api_host.rs`）转发 daemon RPC 实现 `ApiHost` 全部核心方法（任务/组/RSS/插件/市场/站点凭据/aria2 WS 通知经 `task_events.rs`）；旧 server 独有的扩展 REST（`/api/v1/config`、队列增删改、stats、fs/list、components、webhooks、logs、token/regenerate、`/api/v1/ws`）已**废弃**，管理面只走 `/rpc`。
 
 **分发目标**（`fluxdown-agent` + `fluxdownd` 同目录，入口 `fluxdown-agent --server`，镜像名仍 `ghcr.io/zerx-lab/fluxdown-server`；资产随统一 `vX.Y.Z` release 发布，历史版本在 `server-v*` release）：Docker（amd64+arm64）、群晖 SPK、QNAP QPKG、OpenWrt IPK+LuCI、Unraid CA 模板、CasaOS。脚本在 `packaging/`、`promotion/`、`docker/`。

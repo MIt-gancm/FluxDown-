@@ -179,24 +179,8 @@ rinf gen
 flutter run
 
 # 构建发行版
-flutter build windows --release   # 或 macos / linux
+flutter build apk --release       # 或 ios
 ```
-
-<details>
-<summary><b>Linux 系统依赖</b></summary>
-
-```shell
-# Debian/Ubuntu
-sudo apt-get install cmake ninja-build clang pkg-config \
-  libgtk-3-dev libayatana-appindicator3-dev libnotify-dev libsecret-1-dev patchelf zstd
-
-# Arch Linux
-sudo pacman -S cmake ninja clang pkgconf gtk3 libayatana-appindicator libnotify libsecret patchelf zstd
-```
-
-NMH 中继二进制（`fluxdown_nmh`）由 CMake 在 `flutter build` 时自动构建。发行包（AppImage / deb / Arch / 便携版）由 [CI](.github/workflows/release.yml) 在每次打 tag 时自动产出。
-
-</details>
 
 <details>
 <summary><b>运行测试</b></summary>

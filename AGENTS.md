@@ -1,7 +1,7 @@
 # FluxDown — AI 工作契约（核心）
 
 多协议下载管理器（IDM 的免费替代）。官网 <https://fluxdown.zerx.dev>。Rust 发行物版本由 CI 按 `v*` tag 注入 `FLUXDOWN_APP_VERSION`，运行期基准为 `fluxdown_protocol::APP_VERSION`（本地回退 crate 版本）；引擎 UA 的本地回退见 `native/engine/build.rs`。`pubspec.yaml` 管 Flutter 版本并作为引擎本地构建的回退来源，不是 Rust 发行物版本的唯一来源。
-**一套 Rust 下载引擎 `fluxdown_engine` + 多宿主 + 多客户端**：桌面发行物已是 GPUI，移动端仍是 Flutter；PC 客户端主力维护 GPUI（Flutter `lib/` 的 UI 修复与新功能暂停，只保持 wire 兼容，见 `.omp/RULES.md`）。GPUI 包 `fluxdown_ui_app` 已接入 `fluxdown-desktop → fluxdown-agent → fluxdownd → fluxdown_engine` 三进程本机链路。NAS/服务器端 = `fluxdown-agent --server` + `fluxdownd`（托管 React Web SPA，SPA 走 agent `/rpc`）。另有 CLI、WXT 浏览器扩展、Tampermonkey 用户脚本、JS 插件系统、内置 MCP/REST/aria2 API。Rinf 仅 Flutter App（`hub` crate）使用；`hub` 继续作为 legacy 生产宿主；`native/server` 已冻结（不构建/发布，新实现不得依赖它）。
+**一套 Rust 下载引擎 `fluxdown_engine` + 多宿主 + 多客户端**：桌面发行物已是 GPUI，移动端仍是 Flutter；PC 客户端主力维护 GPUI（Flutter `lib/` 的 UI 修复与新功能暂停，只保持 wire 兼容，见 `.omp/RULES.md`）。GPUI 包 `fluxdown_ui_app` 已接入 `fluxdown-desktop → fluxdown-agent → fluxdownd → fluxdown_engine` 三进程本机链路。NAS/服务器端 = `fluxdown-agent --server` + `fluxdownd`（托管 React Web SPA，SPA 走 agent `/rpc`）。另有 CLI、WXT 浏览器扩展、Tampermonkey 用户脚本、JS 插件系统、内置 MCP/REST/aria2 API。Rinf 仅 Flutter App（`hub` crate）使用；`hub` 仅作为移动端（Android/iOS）Flutter 宿主；`native/server` 已冻结（不构建/发布，新实现不得依赖它）。
 
 ---
 
@@ -74,7 +74,7 @@ rinf gen                              # 生成 Dart 绑定（lib/src/bindings �
 cargo check -p <crate> --lib          # 验证编译按 crate（不要整 workspace）
 cargo fmt --check && cargo clippy --workspace --exclude fluxdown_server --all-targets -- -D warnings   # 提交前必过；含测试目标，冻结的 server 不构建
 flutter analyze                       # Dart 静态分析
-# flutter run -d windows              # ⚠️ 禁止运行此命令
+# flutter run                        # 仅移动端（android/ios）；Flutter 已无桌面 runner
 
 # ── 测试（按 crate/过滤，不要 --workspace）──
 cargo nextest run -p fluxdown_engine <filter>   # 引擎单测（协议/分段/DB）
@@ -116,7 +116,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `HostSelection` | `engine/src/selection.rs` | 引擎→宿主（请求决策） | HLS 画质 / BT 文件 / 插件 variant 选择（tristate：用户选/超时默认/无 selector 短路） |
 | `ApiHost` | `native/api/src/service.rs` | 客户端→引擎（HTTP 契约） | REST/aria2/MCP 的能力面；必需方法 + 可默认降级方法 |
 
-- 当前生产链路：GPUI 桌面 `fluxdown-desktop → fluxdown-agent → fluxdownd`、headless/NAS `fluxdown-agent --server → fluxdownd`，以及 Flutter legacy `hub`（actor=`download_actor.rs`）。`fluxdown_api` 只依赖 `&dyn ApiHost`，agent 侧 `AgentApiHost` 转发 daemon RPC。CLI 双模式：默认 HTTP 连宿主，`add --local` 内嵌引擎。
+- 当前生产链路：GPUI 桌面 `fluxdown-desktop → fluxdown-agent → fluxdownd`、headless/NAS `fluxdown-agent --server → fluxdownd`，以及移动端（Android/iOS）Flutter 宿主 `hub`（actor=`download_actor.rs`）。`fluxdown_api` 只依赖 `&dyn ApiHost`，agent 侧 `AgentApiHost` 转发 daemon RPC。CLI 双模式：默认 HTTP 连宿主，`add --local` 内嵌引擎。
 - **服务边界**：`native/daemon` 是纯下载核心；`native/agent` 常驻承载账户/云同步/设备协同、官方 UI Gateway 与系统外壳（托盘、关闭 UI 后的驻留策略；GPUI 界面进程本身不驻留）；两者共享 `native/protocol` 的 JSON-RPC 语义。`native/server` 已冻结：不构建、不发布、不接收任何改动，新实现不得依赖它。
 - **并发模型**：current_thread tokio actor 串行化写；每个下载 spawn 独立 task + CancellationToken；插件 resolve 永不阻塞 actor（off-actor spawn + 通道回流）。
 - 客户端捕获三条并行前端进同一本机 RPC（`:17800/download`）：扩展、用户脚本、桌面确认框。
@@ -139,7 +139,7 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 - **feature 门控**：`plugins`、`components`（默认关；desktop/server 开，mobile/CLI 关）。**关插件时下载主链路零行为变化**（注入 no-op `PluginManager`）。
 
 **编译期陷阱**
-- `native/hub/src/actors/download_actor.rs` 主 `tokio::select!` 当前为 **57 分支**，未占满 tokio 的 64 分支上限；不能由此推断新增一条必然编译失败。新增 Dart 信号 / 定时节拍 / 回流通道优先复用既有 `AuxSignal` 合并泵（主循环单条 `aux_rx.recv()`），分支数量以源码为准。
+- `native/hub/src/actors/download_actor.rs` 主 `tokio::select!` 接近但未占满 tokio 的 64 分支上限；不能由此推断新增一条必然编译失败。新增 Dart 信号 / 定时节拍 / 回流通道优先复用既有 `AuxSignal` 合并泵（主循环单条 `aux_rx.recv()`），分支数量以源码为准。
 - rquickjs（`engine/Cargo.toml`）：禁止叠加 `rust-alloc`/`allocator`（会让 `set_memory_limit` 静默失效）；必带 `parallel`（`AsyncRuntime`/`AsyncContext` 的 Send/Sync 依赖它）。
 - `profile.release` **不**设 `panic="abort"`——`download_manager` 靠 `catch_unwind` 恢复 task panic。
 - **headless 的 Web UI 是编译期内嵌的**：`fluxdown_agent` 的 `web-ui` feature 下 `native/agent/build.rs` 把 `FLUXDOWN_EMBED_WEBROOT`（缺省 `web/dist`）整棵目录递归全量 `include_bytes!` 进二进制，只在 `--server` 模式挂为 SPA fallback。改了前端**必须先 `cd web && bun run build` 再重编 agent**才能看到；`FLUXDOWN_WEBROOT` 是可选的磁盘覆盖。构建时目录缺失只 warning + 运行期 503 提示页。Web 构建经 Vite 别名引用仓库根的 `assets/i18n` 与 `website-v2/src/lib/gpui-theme`，打包上下文必须包含这两处。
@@ -173,7 +173,6 @@ git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z   # 触发发布流水�
 | `engine/src/data_dir.rs` | `lib/src/services/platform_utils.dart` 的 `KNOWN_ITEMS` |
 | `engine/src/webhook.rs` 的 `WebhookEventKind` | Dart `WebhookEvents.all` + TS `WEBHOOK_EVENTS`，**三处 wire 名逐字一致** |
 | `native/protocol/src/event.rs::merge_webhook_deliveries` / `WebhooksCleared` | `web/src/lib/rpc/apply.ts::mergeWebhookDeliveries` 与清空事件：按 deliveryId 合并、时间降序、封顶；空增量不清空 |
-| `native/nmh/src/main.rs::log_path`（中继自身的诊断日志，在 App 日志目录之外） | `native/hub/src/diagnostics.rs::nmh_log_path`（Doctor 读同一文件的尾部）；改路径必须同步，否则 Doctor 只会报「无日志」 |
 | `hub/src/signals/mod.rs` | `rinf gen` → `download_actor` 的 `AuxSignal` 泵 → Dart 侧 `rustSignalStream` 监听 |
 | `native/api` 契约 | 重跑 `gen_openapi` 覆盖 `website-v2/public/openapi.json` |
 | `native/protocol` 的 DTO / 方法 / 事件 / `ErrorReason`（`agent.rs`、`event.rs`、`error.rs`、`method.rs`、`rpc.rs` 版本） | `web/src/lib/rpc/protocol/*.ts` 手写镜像 + `apply.ts`；新增严格事件枚举升协议版本；`settings.rs` 同步目录变化会被 Web `syncGroups.test.ts` 核对 |

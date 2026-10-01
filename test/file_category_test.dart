@@ -6,8 +6,20 @@ void main() {
   group('FileCategory.fromExtension', () {
     test('程序包扩展名归入 program 分类', () {
       for (final ext in [
-        'exe', 'msi', 'msix', 'appx', 'apk', 'dmg', 'pkg',
-        'deb', 'rpm', 'appimage', 'snap', 'flatpak', 'EXE', 'Dmg',
+        'exe',
+        'msi',
+        'msix',
+        'appx',
+        'apk',
+        'dmg',
+        'pkg',
+        'deb',
+        'rpm',
+        'appimage',
+        'snap',
+        'flatpak',
+        'EXE',
+        'Dmg',
       ]) {
         expect(
           FileCategory.fromExtension(ext),

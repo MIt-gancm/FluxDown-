@@ -60,7 +60,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; 此前留下的全体用户安装由 [Code] RemoveLegacyAllUsersInstall 一次性迁移。
 PrivilegesRequired=lowest
 CloseApplications=force
-SetupIconFile=..\..\windows\runner\resources\app_icon.ico
+SetupIconFile=..\..\assets\logo\windows\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
 

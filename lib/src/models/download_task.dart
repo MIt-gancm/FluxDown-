@@ -7,8 +7,6 @@ import '../i18n/locale_provider.dart';
 /// 任务状态 — 与 Rust 端状态码对应
 /// 0=pending, 1=downloading, 2=paused, 3=completed, 4=error, 5=preparing
 /// resuming 为纯 Dart 端状态，点击继续后立即切换，Rust 返回 status=1 后自动过渡到 downloading
-/// canceled 同样是纯 Dart 端状态——只由云端远程任务镜像（RemoteTaskStatus.
-/// canceled）产生，本地下载引擎不会、也不应该产生它，故不出现在上面的状态码表里。
 enum TaskStatus {
   pending,
   downloading,
@@ -17,8 +15,6 @@ enum TaskStatus {
   error,
   resuming,
   preparing,
-  // 加在末尾：避免影响任何隐含依赖枚举 index 的对应关系。
-  canceled,
 }
 
 /// BT 做种状态 — 与 Rust 端 `SeedingStopReason::as_i32` 对应
@@ -199,8 +195,6 @@ enum FileCategory {
   }
 }
 
-// 无 canceled 分支：Rust 侧没有对应状态码，canceled 只由
-// RemoteTaskService._mapStatus 从远程任务镜像直接构造，不经过本函数。
 TaskStatus taskStatusFromInt(int value) {
   return switch (value) {
     0 => TaskStatus.pending,
@@ -421,54 +415,16 @@ class DownloadTask {
   /// 实时上传速率（字节/秒）。仅 BT 做种时非零。
   final int uploadSpeedBps;
 
-  /// 所属任务组 ID（空字符串 = 不属于任何组）。TaskProgress 信号不携带
-  /// group_id（先到时暂空——组归属不像队列存在「归属未知」占位哨兵需求，
-  /// 组建/裂变操作后引擎必发 AllTasks 全量快照，随即被真实值覆盖，见
-  /// `applyProgress`/`_onProgress` 「new task from progress」分支）。
-  final String groupId;
-
-  /// 由哪条 RSS 订阅自动创建（'' = 非 RSS 来源）。任务详情「来源」行据此显示
-  /// 订阅 chip 并支持点回条目流（设计文档 P5 / qB#19276）。
-  final String rssSourceId;
-
   /// 展示用原始来源链接（'' = 用 [url]）。`.torrent` 文件任务的 [url] 是
-  /// `torrent-file://local` 哨兵，复制出去毫无意义；RSS 自动建的任务在这里
-  /// 存 enclosure 直链。读取一律走 [shareUrl]，不要直接用本字段。
+  /// `torrent-file://local` 哨兵，复制出去毫无意义。读取一律走 [shareUrl]，不要直接用本字段。
   final String originUrl;
 
   /// 「复制链接 / 分享」应当使用的地址：有真实来源就用它，否则回退 [url]。
   String get shareUrl => originUrl.isNotEmpty ? originUrl : url;
 
-  /// 归属设备标识（'' = 本机；非空 = 远程设备 deviceId）。跨设备任务混排 + 设备筛选用。
-  final String deviceId;
-
-  /// 是否为远程设备上执行的任务（经 FluxCloud 回流的只读视图，非本地引擎任务）。
-  final bool isRemote;
-
   /// Auto 代理模式下引擎选择的链路标签（wire 值如 `direct` /
   /// `direct:failover` / `proxy:failover`；空 = 非 Auto 模式）。
   final String autoRoute;
-
-  /// 任务级做种限制覆盖（三态哨兵：-2=跟随全局设置、-1=不限制、>=0=自定义，
-  /// 其中 0 等效不限制）。分享率为千分比（1500 = 1.5）。
-  final int seedRatioLimitMilli;
-
-  /// 做种后分享率限制覆盖（千分比，哨兵语义同 [seedRatioLimitMilli]）。
-  final int seedPostRatioLimitMilli;
-
-  /// 做种时长限制覆盖（分钟，哨兵语义同 [seedRatioLimitMilli]）。
-  final int seedTimeLimitMinutes;
-
-  /// 无活动做种时长限制覆盖（分钟，哨兵语义同 [seedRatioLimitMilli]）。
-  final int seedInactiveTimeLimitMinutes;
-
-  /// 任务级做种上传限速（B/s；0 = 无单任务限制）。add/重新挂载时烘焙进
-  /// 引擎，live 句柄不可热改。
-  final int seedUploadLimitBps;
-
-  // ── 站点分桶键（惰性缓存；见 view_prefs/list_entity 站点分组维度）──
-  String? _siteKeyCache;
-  String? _siteLabelCache;
 
   DownloadTask({
     required this.id,
@@ -493,13 +449,9 @@ class DownloadTask {
     this.configuredSegments = 0,
     this.ignoreTlsErrors = false,
     this.referrer = '',
-    this.groupId = '',
-    this.rssSourceId = '',
     this.originUrl = '',
     this.checksum = '',
     this.proxyUrl = '',
-    this.deviceId = '',
-    this.isRemote = false,
     this.autoRoute = '',
     this.completedAt,
     this.uploadedBytes = 0,
@@ -509,11 +461,6 @@ class DownloadTask {
     this.seedingTimeSecs = 0,
     this.seedingTimeAnchor,
     this.uploadSpeedBps = 0,
-    this.seedRatioLimitMilli = -2,
-    this.seedPostRatioLimitMilli = -2,
-    this.seedTimeLimitMinutes = -2,
-    this.seedInactiveTimeLimitMinutes = -2,
-    this.seedUploadLimitBps = 0,
     DateTime? createdAt,
   }) : createdAt = createdAt ?? DateTime.now();
 
@@ -546,17 +493,10 @@ class DownloadTask {
       seedingMessage: info.seedingMessage,
       seedingTimeSecs: info.seedingTimeSecs,
       seedingTimeAnchor: DateTime.now(),
-      groupId: info.groupId,
-      rssSourceId: info.rssSourceId,
       originUrl: info.originUrl,
       checksum: info.checksum,
       proxyUrl: info.proxyUrl,
       autoRoute: info.autoRoute,
-      seedRatioLimitMilli: info.seedRatioLimitMilli,
-      seedPostRatioLimitMilli: info.seedPostRatioLimitMilli,
-      seedTimeLimitMinutes: info.seedTimeLimitMinutes,
-      seedInactiveTimeLimitMinutes: info.seedInactiveTimeLimitMinutes,
-      seedUploadLimitBps: info.seedUploadLimitBps,
       createdAt: seconds > 0
           ? DateTime.fromMillisecondsSinceEpoch(seconds * 1000)
           : DateTime.now(),
@@ -597,17 +537,10 @@ class DownloadTask {
     int? seedingTimeSecs,
     DateTime? seedingTimeAnchor,
     int? uploadSpeedBps,
-    String? groupId,
-    String? rssSourceId,
     String? originUrl,
     String? checksum,
     String? proxyUrl,
     String? autoRoute,
-    int? seedRatioLimitMilli,
-    int? seedPostRatioLimitMilli,
-    int? seedTimeLimitMinutes,
-    int? seedInactiveTimeLimitMinutes,
-    int? seedUploadLimitBps,
     DateTime? createdAt,
     DateTime? completedAt,
   }) {
@@ -641,19 +574,10 @@ class DownloadTask {
       seedingTimeSecs: seedingTimeSecs ?? this.seedingTimeSecs,
       seedingTimeAnchor: seedingTimeAnchor ?? this.seedingTimeAnchor,
       uploadSpeedBps: uploadSpeedBps ?? this.uploadSpeedBps,
-      groupId: groupId ?? this.groupId,
-      rssSourceId: rssSourceId ?? this.rssSourceId,
       originUrl: originUrl ?? this.originUrl,
       checksum: checksum ?? this.checksum,
       proxyUrl: proxyUrl ?? this.proxyUrl,
       autoRoute: autoRoute ?? this.autoRoute,
-      seedRatioLimitMilli: seedRatioLimitMilli ?? this.seedRatioLimitMilli,
-      seedPostRatioLimitMilli:
-          seedPostRatioLimitMilli ?? this.seedPostRatioLimitMilli,
-      seedTimeLimitMinutes: seedTimeLimitMinutes ?? this.seedTimeLimitMinutes,
-      seedInactiveTimeLimitMinutes:
-          seedInactiveTimeLimitMinutes ?? this.seedInactiveTimeLimitMinutes,
-      seedUploadLimitBps: seedUploadLimitBps ?? this.seedUploadLimitBps,
       createdAt: createdAt ?? this.createdAt,
       completedAt: clearCompletedAt ? null : (completedAt ?? this.completedAt),
     );
@@ -756,20 +680,6 @@ class DownloadTask {
     return '$dir$separator$fileName';
   }
 
-  /// 「打开所在文件夹」应传给原生层的路径。
-  ///
-  /// 已完成且文件存在时返回完整文件路径，文件管理器打开父目录时可据此选中
-  /// 文件（Windows 走 SHOpenFolderAndSelectItems，macOS open -R、Linux
-  /// D-Bus ShowItems 同样支持选中）；下载中、暂停、失败、排队、准备中、
-  /// 文件丢失等状态下最终文件可能尚未落盘，改为返回保存目录 [saveDir]，
-  /// 避免原生层将不存在的文件路径误判后打不开任何位置。
-  /// [saveDir] 为空时退回文件路径。
-  String get revealFolderPath {
-    if (status == TaskStatus.completed && !fileMissing) return filePath;
-    if (saveDir.isNotEmpty) return saveDir;
-    return filePath;
-  }
-
   /// 格式化文件大小
   String get sizeText {
     if (totalBytes <= 0) return currentS.unknownSize;
@@ -783,12 +693,6 @@ class DownloadTask {
   String get speedText {
     if (speed <= 0) return '—';
     return '${formatBytes(speed)}/s';
-  }
-
-  /// 格式化上传速度
-  String get uploadSpeedText {
-    if (uploadSpeedBps <= 0) return '—';
-    return '${formatBytes(uploadSpeedBps)}/s';
   }
 
   /// 当前是否处于 BT 做种分类（活跃做种或排队等待做种槽位，
@@ -814,25 +718,8 @@ class DownloadTask {
   double get seedRatio =>
       downloadedBytes <= 0 ? 0.0 : uploadedBytes / downloadedBytes;
 
-  /// 做种后分享率（(uploaded - uploadedAtCompletion) / downloaded）
-  double get postSeedRatio => downloadedBytes <= 0
-      ? 0.0
-      : (uploadedBytes - uploadedAtCompletion) / downloadedBytes;
-
   /// 当前任务是否为 BT 任务
   bool get isBt => protocolLabel == 'BT';
-
-  /// 实时做种时长：以引擎累计秒数为基底，活跃做种（非排队）时叠加自采样
-  /// 锚点以来的本地流逝时间；排队/停止态只显示累计值。
-  Duration get liveSeedingTime {
-    final base = Duration(seconds: seedingTimeSecs);
-    if (isSeeding &&
-        seedingStatus == SeedingStatus.seeding &&
-        seedingTimeAnchor != null) {
-      return base + DateTime.now().difference(seedingTimeAnchor!);
-    }
-    return base;
-  }
 
   /// 协议类型标识
   String get protocolLabel {
@@ -842,75 +729,6 @@ class DownloadTask {
     if (lower.startsWith('ftp://')) return 'FTP';
     if (lower.startsWith('ed2k://')) return 'ED2K';
     return 'HTTP';
-  }
-
-  /// 做种停止/状态原因的中文/英文文本。
-  String get seedingStatusText {
-    final s = currentS;
-    return switch (seedingStatus) {
-      SeedingStatus.none => s.seedingStatusNone,
-      SeedingStatus.seeding => s.seedingStatusSeeding,
-      SeedingStatus.ratioReached => s.seedingStatusRatioReached,
-      SeedingStatus.timeReached => s.seedingStatusTimeReached,
-      SeedingStatus.userStopped => s.seedingStatusUserStopped,
-      SeedingStatus.deleted => s.seedingStatusDeleted,
-      SeedingStatus.sessionReleased => s.seedingStatusSessionReleased,
-      SeedingStatus.inactiveReached => s.seedingStatusInactiveReached,
-      SeedingStatus.queued => s.seedingStatusQueued,
-    };
-  }
-
-  /// 站点分桶键（注册域聚合，磁力/BT 归一为 `bt`）。首次访问后缓存在本实例上。
-  String get siteKey => _siteKeyCache ??= extractSiteKey(url);
-
-  /// 站点展示 label（保留离用户最近的一级子域）。首次访问后缓存在本实例上。
-  String get siteLabel => _siteLabelCache ??= extractSiteLabel(url);
-
-  /// 副标题信息
-  String get subtitle {
-    final s = currentS;
-    final proto = protocolLabel;
-    if (isSeeding) {
-      return '$proto · $sizeText · ↑ $uploadSpeedText · ${s.seedRatio} ${seedRatio.toStringAsFixed(2)}';
-    }
-    switch (status) {
-      case TaskStatus.downloading:
-        return '$proto · $sizeText · $speedText';
-      case TaskStatus.paused:
-        return '$proto · $sizeText · ${s.subtitlePaused}';
-      case TaskStatus.completed:
-        return '$proto · $sizeText';
-      case TaskStatus.error:
-        return '$proto · $sizeText · ${errorMessage.isEmpty ? s.subtitleError : errorMessage}';
-      case TaskStatus.pending:
-        final queueStr = queuePosition > 0
-            ? ' · ${s.subtitleQueued(queuePosition)}'
-            : '';
-        if (totalBytes > 0) return '$proto · $sizeText$queueStr';
-        return '$proto · ${s.subtitlePending}$queueStr';
-      case TaskStatus.preparing:
-        // BT 初检（librqbit checking）阶段引擎持续上报 downloaded/total，
-        // totalBytes>0 即处于校验文件阶段，展示实际校验百分比；
-        // totalBytes==0（磁力元数据解析等）维持「准备中」。
-        if (totalBytes > 0) {
-          return '$proto · ${s.statusVerifying} · ${(progress * 100).toStringAsFixed(0)}%';
-        }
-        return '$proto · ${s.subtitlePreparing}';
-      case TaskStatus.canceled:
-        return '$proto · $sizeText · ${s.subtitleCanceled}';
-      case TaskStatus.resuming:
-        return '$proto · $sizeText · ${s.subtitleResuming}';
-    }
-  }
-
-  /// 带队列上下文的副标题：[queueStopped] = 所属队列处于停止态时，
-  /// paused 任务显示「等待队列启动」——区分「用户暂停」与「等队列启动」
-  /// 两种停着的原因（启动队列会按序恢复这类任务）。
-  String subtitleWith({bool queueStopped = false}) {
-    if (queueStopped && status == TaskStatus.paused) {
-      return '$protocolLabel · $sizeText · ${currentS.subtitleWaitingQueue}';
-    }
-    return subtitle;
   }
 
   /// 状态文本
@@ -933,7 +751,6 @@ class DownloadTask {
       TaskStatus.preparing =>
         totalBytes > 0 ? s.statusVerifying : s.statusPreparing,
       TaskStatus.resuming => s.statusResuming,
-      TaskStatus.canceled => s.statusCanceled,
     };
   }
 
@@ -970,77 +787,6 @@ class DownloadTask {
 // =============================================================================
 // 站点分桶键提取（view_prefs 站点分组维度 / list_entity siteKey 聚合键）
 // =============================================================================
-
-/// 二级公共后缀表：域名以此结尾时，注册域取最后 3 段而非 2 段
-/// （如 `foo.com.cn` 是注册域，而非误判为 `com.cn`）。仅收录高频后缀，
-/// 非详尽 Public Suffix List——零外联纪律下的内置精简表。
-const Set<String> kTwoLevelPublicSuffixes = {
-  'com.cn', 'net.cn', 'org.cn', 'gov.cn', 'edu.cn',
-  'co.uk', 'org.uk', 'ac.uk', 'gov.uk',
-  'com.au', 'net.au', 'org.au',
-  'co.jp', 'ne.jp', 'or.jp',
-  'co.kr', 'ne.kr',
-  'com.hk', 'com.tw', 'com.sg', 'com.br',
-};
-
-/// 从 URL 识别的粗粒度协议 token（与 [DownloadTask.protocolLabel] 语义一致，
-/// 但不依赖 DownloadTask 实例，供纯函数式站点提取复用）。
-String _protocolToken(String url) {
-  final lower = url.toLowerCase();
-  if (lower.startsWith('magnet:') || lower.startsWith('torrent-file://')) {
-    return 'BT';
-  }
-  if (lower.startsWith('ftp://')) return 'FTP';
-  if (lower.startsWith('ed2k://')) return 'ED2K';
-  return 'HTTP';
-}
-
-/// 解析并规范化 host：小写化 + 去除 `www.` 前缀；解析失败/无 host 返回空串。
-String _normalizedHost(String url) {
-  final uri = Uri.tryParse(url);
-  var host = (uri?.host ?? '').toLowerCase();
-  if (host.startsWith('www.')) host = host.substring(4);
-  return host;
-}
-
-/// 由规范化 host 推导注册域（去子域聚合，如 `pan.baidu.com`→`baidu.com`；
-/// `foo.bar.com.cn`→`bar.com.cn`）。
-String _registrableDomain(String host) {
-  final labels = host.split('.');
-  if (labels.length <= 2) return host;
-  final lastTwo = '${labels[labels.length - 2]}.${labels[labels.length - 1]}';
-  if (kTwoLevelPublicSuffixes.contains(lastTwo) && labels.length >= 3) {
-    return labels.sublist(labels.length - 3).join('.');
-  }
-  return lastTwo;
-}
-
-/// 从 URL 提取站点分桶键（注册域聚合，去 `www.`；磁力/BT 协议归一为固定
-/// `bt`；host 解析失败的其它协议回退为协议 token 小写形式，保证分桶键
-/// 永不为空）。同一注册域下所有子域聚合进同一桶
-/// （`pan.baidu.com`/`www.baidu.com` 同归 `baidu.com`）。
-String extractSiteKey(String url) {
-  if (_protocolToken(url) == 'BT') return 'bt';
-  final host = _normalizedHost(url);
-  if (host.isEmpty) return _protocolToken(url).toLowerCase();
-  return _registrableDomain(host);
-}
-
-/// 从 URL 提取站点展示 label：与 [extractSiteKey] 共享同一分桶语义，但展示
-/// 更具体——保留离用户最近的一级子域（如 `pan.baidu.com`），更深的子域链
-/// 收敛掉；磁力/BT 显示为「BT · 磁力」（design-proto-spec §2 `siteLabel`
-/// 唯一特例）。
-String extractSiteLabel(String url) {
-  if (_protocolToken(url) == 'BT') return currentS.viewSiteBt;
-  final host = _normalizedHost(url);
-  if (host.isEmpty) return _protocolToken(url);
-  final registrable = _registrableDomain(host);
-  final hostLabels = host.split('.');
-  final registrableLabels = registrable.split('.');
-  if (hostLabels.length <= registrableLabels.length) return registrable;
-  final keepFrom = hostLabels.length - registrableLabels.length - 1;
-  return hostLabels.sublist(keepFrom).join('.');
-}
 
 // =============================================================================
 // 时间分组

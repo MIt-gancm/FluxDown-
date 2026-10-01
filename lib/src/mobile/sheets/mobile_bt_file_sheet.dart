@@ -133,11 +133,7 @@ class _BtFileSheetState extends State<_BtFileSheet> {
             ),
           ),
           const SizedBox(height: 10),
-          MobilePrimaryButton(
-            label: s.cancel,
-            filled: false,
-            onTap: _cancel,
-          ),
+          MobilePrimaryButton(label: s.cancel, filled: false, onTap: _cancel),
         ],
       ),
       child: Column(
@@ -211,14 +207,10 @@ class _BtFileRow extends StatelessWidget {
         curve: Curves.easeOut,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 11),
         decoration: BoxDecoration(
-          color: selected
-              ? m.soft(c.accent)
-              : m.glassSubtle(c.surface1),
+          color: selected ? m.soft(c.accent) : m.glassSubtle(c.surface1),
           borderRadius: m.brChipXl,
           border: Border.all(
-            color: selected
-                ? m.glassSubtle(c.accent)
-                : m.emphasis(c.border),
+            color: selected ? m.glassSubtle(c.accent) : m.emphasis(c.border),
             width: selected ? 1.4 : 1,
           ),
         ),
@@ -273,10 +265,7 @@ class _CheckDot extends StatelessWidget {
       decoration: BoxDecoration(
         color: selected ? c.accent : const Color(0x00000000),
         shape: BoxShape.circle,
-        border: Border.all(
-          color: selected ? c.accent : c.border,
-          width: 1.5,
-        ),
+        border: Border.all(color: selected ? c.accent : c.border, width: 1.5),
       ),
       child: selected
           ? Icon(LucideIcons.check, size: 13, color: c.accentForeground)

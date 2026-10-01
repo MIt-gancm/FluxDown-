@@ -22,7 +22,6 @@ Future<void> showMobileFilterSheet(
         builder: (ctx2, _) {
           final filtered =
               controller.categoryFilter != FileCategory.all ||
-              controller.customCategoryFilter != null ||
               controller.queueFilter != null;
           return MobileSheetContainer(
             title: s.mobileFilterTasks,
@@ -79,9 +78,7 @@ Future<void> showMobileFilterSheet(
                               label: cat == FileCategory.all
                                   ? s.tabAll
                                   : cat.label,
-                              selected:
-                                  controller.customCategoryFilter == null &&
-                                  controller.categoryFilter == cat,
+                              selected: controller.categoryFilter == cat,
                               onTap: () => controller.setCategoryFilter(cat),
                             ),
                           ),

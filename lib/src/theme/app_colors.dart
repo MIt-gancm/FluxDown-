@@ -15,9 +15,6 @@ class AppColors {
     return AppColors._(FluxThemeScope.of(context));
   }
 
-  /// 直接从 token 构造（供不依赖 context 的场景使用）
-  factory AppColors.fromTokens(FluxThemeTokens tokens) = AppColors._;
-
   /// 原始 tokens 访问（供高级场景使用）
   FluxThemeTokens get tokens => _tokens;
 
@@ -45,18 +42,11 @@ class AppColors {
   Color get accentBg => _tokens.accentBackground;
   Color get accentForeground => _tokens.accentForeground;
 
-  // ── 选中行 ──
-  Color get selectedBg => _tokens.elementSelected;
-
-  // ── Input ──
-  Color get inputFocusBg => _tokens.inputFocusBackground;
-  Color get inputBg => _tokens.inputBackground;
   Color get inputBorder => _tokens.inputBorder;
   Color get inputFocusBorder => _tokens.inputFocusBorder;
 
   // ── Dialog ──
   Color get dialogBarrier => _tokens.dialogBarrier;
-  Color get dialogBg => _tokens.dialogBackground;
 
   // ── Switch ──
   Color get switchTrack => _tokens.switchTrack;
@@ -73,7 +63,6 @@ class AppColors {
   // ── Status（静态常量 — 向后兼容旧代码的 AppColors.green 用法）──
   static const green = Color(0xFF22C55E);
   static const amber = Color(0xFFF59E0B);
-  static const red = Color(0xFFEF4444);
 
   // ── File category（静态常量 — 文件类型着色）──
   // 色值沿用 manifest 原型规格（manifest.js `MF_EXT_TYPE` + styles.css `.mf-ftile.t-*`）：

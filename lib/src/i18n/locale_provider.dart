@@ -18,7 +18,7 @@ const kLocaleSystem = 'system';
 String _resolveSystemLocale() =>
     I18nStore.resolve(Platform.localeName); // e.g. "zh_CN", "en_US", "ja_JP"
 
-/// 全局 locale 实例 — 供无 context 场景使用（models, services, tray 等）。
+/// 全局 locale 实例 — 供无 context 场景使用（models, services 等）。
 /// 随 [LocaleNotifier] 变更自动更新。
 S currentS = S.of(_resolveSystemLocale());
 

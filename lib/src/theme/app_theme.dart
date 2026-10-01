@@ -83,6 +83,7 @@ ShadInputTheme _inputTheme(FluxThemeTokens tokens) {
 /// 缓存
 FluxThemeTokens? _cachedTokens;
 ShadThemeData? _cachedThemeData;
+
 /// 对话框进出场动效：120ms 淡入 + 轻微缩放（默认 300ms 偏慢，观感拖沓）。
 const _dialogAnimateIn = <AnimateEffect<dynamic>>[
   FadeEffect(duration: Duration(milliseconds: 120)),
@@ -135,7 +136,9 @@ ShadThemeData buildThemeFromTokens(FluxThemeTokens tokens) {
         border: Border.all(color: tokens.border, width: 1),
         shadows: [
           BoxShadow(
-            color: tokens.shadow.withValues(alpha: tokens.metric.alphaShadowStrong),
+            color: tokens.shadow.withValues(
+              alpha: tokens.metric.alphaShadowStrong,
+            ),
             blurRadius: 24,
             offset: const Offset(0, 8),
           ),
@@ -148,7 +151,9 @@ ShadThemeData buildThemeFromTokens(FluxThemeTokens tokens) {
         border: Border.all(color: tokens.border, width: 1),
         shadows: [
           BoxShadow(
-            color: tokens.shadow.withValues(alpha: tokens.metric.alphaShadowStrong),
+            color: tokens.shadow.withValues(
+              alpha: tokens.metric.alphaShadowStrong,
+            ),
             blurRadius: 24,
             offset: const Offset(0, 8),
           ),

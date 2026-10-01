@@ -1,6 +1,6 @@
 //! 为 GPUI 桌面客户端嵌入 Windows 程序资源。
 
-const WINDOWS_APP_ICON: &str = "../../windows/runner/resources/app_icon.ico";
+const WINDOWS_APP_ICON: &str = "../../assets/logo/windows/app_icon.ico";
 
 fn main() -> std::io::Result<()> {
     println!("cargo:rerun-if-changed={WINDOWS_APP_ICON}");

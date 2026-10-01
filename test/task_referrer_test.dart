@@ -70,8 +70,10 @@ void main() {
 
   test('copyWith preserves and overrides referrer', () {
     final task = DownloadTask.fromTaskInfo(makeInfo());
-    expect(task.copyWith(status: TaskStatus.paused).referrer,
-        'https://example.com/page');
+    expect(
+      task.copyWith(status: TaskStatus.paused).referrer,
+      'https://example.com/page',
+    );
   });
 
   test('fromTaskInfo maps checksum and proxyUrl', () {
@@ -121,10 +123,9 @@ void main() {
   });
 
   test('copyWith overrides checksum/proxyUrl independently', () {
-    final task = DownloadTask.fromTaskInfo(makeInfo()).copyWith(
-      checksum: 'md5=abc',
-      proxyUrl: 'http://proxy:8080',
-    );
+    final task = DownloadTask.fromTaskInfo(
+      makeInfo(),
+    ).copyWith(checksum: 'md5=abc', proxyUrl: 'http://proxy:8080');
     expect(task.checksum, 'md5=abc');
     expect(task.proxyUrl, 'http://proxy:8080');
     // 未再次指定时保留原值（不被其它字段的 copyWith 调用清空）。
@@ -148,7 +149,9 @@ void main() {
     expect(plain.shareUrl, 'https://example.com/f.zip');
 
     // copyWith 不得在改别的字段时把它抹掉。
-    expect(sentinel.copyWith(status: TaskStatus.paused).shareUrl,
-        'https://mikanani.me/Download/ep01.torrent');
+    expect(
+      sentinel.copyWith(status: TaskStatus.paused).shareUrl,
+      'https://mikanani.me/Download/ep01.torrent',
+    );
   });
 }

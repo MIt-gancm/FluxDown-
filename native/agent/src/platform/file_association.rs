@@ -14,7 +14,7 @@
 //!
 //! Linux 通过 `xdg-mime` 把 `application/x-bittorrent` 交给打包的
 //! `com.fluxdown.app.desktop`；macOS 通过 Launch Services 把
-//! `org.bittorrent.torrent` UTI（`macos/Runner/Info.plist` 已声明）交给当前
+//! `org.bittorrent.torrent` UTI（`packaging/macos/Info.plist` 已声明）交给当前
 //! `.app` bundle。
 
 #[cfg(target_os = "windows")]

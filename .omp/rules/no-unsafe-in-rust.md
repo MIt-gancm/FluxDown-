@@ -44,9 +44,8 @@ repeatGap: 2
 |`native/engine/src/segment_coordinator.rs`|`libc::fallocate` / `posix_fadvise` / Win32 `SetFileInformationByHandle` 预分配|
 |`native/engine/src/disk_space.rs`|`libc::statvfs` / `statfs` / `GetDiskFreeSpaceExW` 磁盘余量|
 |`native/engine/src/bt_sparse.rs`、`bt_downloader.rs`|Win32 `DeviceIoControl(FSCTL_SET_SPARSE)` / `GetFileAttributesW`|
-|`native/hub/src/{macos_cf,file_association,protocol_registry}.rs`、`native/agent/src/platform/*`|macOS CoreFoundation / LaunchServices、Win32 `SHChangeNotify`|
-|`native/hub/src/{clipboard_file,reveal_file,shortcut_icon,native_messaging,nmh_registry}.rs`|Win32 剪贴板 / ShellExecute / 图标 / 命名管道 ACL、`getpwuid_r`|
-|`native/fluxdown_updater/src/main.rs`、`native/nmh/src/main.rs`|进程等待 / 枚举（`OpenProcess` / Toolhelp / `libc::kill`）|
+|`native/agent/src/platform/*`|macOS CoreFoundation / LaunchServices、Win32 `SHChangeNotify`|
+|`native/nmh/src/main.rs`|进程等待 / 枚举（`OpenProcess` / Toolhelp / `libc::kill`）|
 
 **engine crate 之外的下载逻辑、`native/api`、`native/protocol`、`native/daemon`、`native/server`、`crates/*`（GPUI）一律零 `unsafe`**——这些 crate 目前没有任何 `unsafe`，不要成为第一个。
 

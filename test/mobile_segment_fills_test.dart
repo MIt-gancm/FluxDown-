@@ -125,12 +125,7 @@ void main() {
         downloadedBytes: 10,
         totalBytes: 100,
         segments: const [
-          SegmentData(
-            index: 0,
-            startByte: 5,
-            endByte: 99,
-            downloadedBytes: 10,
-          ),
+          SegmentData(index: 0, startByte: 5, endByte: 99, downloadedBytes: 10),
         ],
       );
       final fills = mobileSegmentCellFills(task, 10);
@@ -149,12 +144,7 @@ void main() {
         downloadedBytes: 30,
         totalBytes: 100,
         segments: const [
-          SegmentData(
-            index: 0,
-            startByte: 0,
-            endByte: 9,
-            downloadedBytes: 10,
-          ),
+          SegmentData(index: 0, startByte: 0, endByte: 9, downloadedBytes: 10),
           SegmentData(
             index: 1,
             startByte: 30,
@@ -186,12 +176,7 @@ void main() {
         downloadedBytes: 0,
         totalBytes: 100,
         segments: const [
-          SegmentData(
-            index: 0,
-            startByte: 0,
-            endByte: 9,
-            downloadedBytes: 0,
-          ),
+          SegmentData(index: 0, startByte: 0, endByte: 9, downloadedBytes: 0),
         ],
       );
       final fills = mobileSegmentCellFills(task, 10);

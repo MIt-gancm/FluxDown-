@@ -165,62 +165,20 @@ IconData fileTypeIcon(String ext) {
 ///
 /// `program` / `other` / `all` 没有专属色，回退中性（`surface2` + 次级文字色），
 /// 靠字形而非颜色区分。
-(Color bg, Color fg) fileCategoryTileColors(FileCategory category, AppColors c) =>
-    switch (category) {
-      FileCategory.video => (const Color(0x24A855F7), AppColors.categoryVideo),
-      FileCategory.audio => (const Color(0x2406B6D4), AppColors.categoryAudio),
-      FileCategory.document => (c.accentBg, c.accent),
-      FileCategory.image => (const Color(0x2422C55E), AppColors.green),
-      FileCategory.archive => (const Color(0x24F59E0B), AppColors.amber),
-      FileCategory.program || FileCategory.other || FileCategory.all => (
-        c.surface2,
-        c.textSecondary,
-      ),
-    };
+(Color bg, Color fg) fileCategoryTileColors(
+  FileCategory category,
+  AppColors c,
+) => switch (category) {
+  FileCategory.video => (const Color(0x24A855F7), AppColors.categoryVideo),
+  FileCategory.audio => (const Color(0x2406B6D4), AppColors.categoryAudio),
+  FileCategory.document => (c.accentBg, c.accent),
+  FileCategory.image => (const Color(0x2422C55E), AppColors.green),
+  FileCategory.archive => (const Color(0x24F59E0B), AppColors.amber),
+  FileCategory.program ||
+  FileCategory.other ||
+  FileCategory.all => (c.surface2, c.textSecondary),
+};
 
 /// 扩展名 → 图标前景色。方块底色保持 `surface2` 时使用（任务列表/详情/通知）。
 Color fileTypeColor(String ext, AppColors c) =>
     fileCategoryTileColors(FileCategory.fromExtension(ext.toLowerCase()), c).$2;
-
-/// 任务行 / 卡片 / 详情面板共用的文件类型图标方块。
-///
-/// 底色沿用 `surface2`，只有字形着色 —— 保持既有克制的视觉调性，
-/// 同时让类型在扫读时一眼可辨。
-class FileTypeIconTile extends StatelessWidget {
-  /// 不带点的扩展名，一般直接传 `task.fileExtension`。
-  final String ext;
-
-  /// 方块边长。
-  final double size;
-
-  /// 圆角，由调用方从 `AppMetrics` 取，避免此处硬编码度量。
-  final BorderRadius borderRadius;
-
-  /// 字形尺寸；默认取边长的 52%（24→12、34→18、40→21）。
-  final double? iconSize;
-
-  const FileTypeIconTile({
-    super.key,
-    required this.ext,
-    required this.size,
-    required this.borderRadius,
-    this.iconSize,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final c = AppColors.of(context);
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(color: c.surface2, borderRadius: borderRadius),
-      child: Center(
-        child: Icon(
-          fileTypeIcon(ext),
-          size: iconSize ?? (size * 0.52).roundToDouble(),
-          color: fileTypeColor(ext, c),
-        ),
-      ),
-    );
-  }
-}

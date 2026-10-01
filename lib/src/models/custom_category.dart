@@ -1,45 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
-
-import '../i18n/translations.dart';
-
-/// 目录名里必须剔除的字符：路径分隔符、Windows 保留符号与控制字符。
-final RegExp _invalidDirNameChars = RegExp(r'[\\/:*?"<>|\x00-\x1f]');
-final RegExp _dirNameWhitespace = RegExp(r'\s+');
-
-/// 把分类显示名净化成可用的目录名：非法字符换成空格、压缩空白、去掉 Windows
-/// 会静默丢弃的结尾点与空格。净化后为空说明这个名字做不出目录，返回 ''。
-String sanitizeCategoryDirName(String label) {
-  var out = label
-      .replaceAll(_invalidDirNameChars, ' ')
-      .replaceAll(_dirNameWhitespace, ' ')
-      .trim();
-  while (out.isNotEmpty && (out.endsWith('.') || out.endsWith(' '))) {
-    out = out.substring(0, out.length - 1);
-  }
-  return out;
-}
-
-/// 「一键分类目录」的落盘路径推导：默认下载目录 [baseDir] 下的同名子目录。
-///
-/// [baseDir] 为空、或 [label] 净化后为空时返回 ''（调用方跳过该分类）。
-/// [separator] 仅供测试注入，默认取当前平台分隔符。
-///
-/// Web 侧必须给出同样的结果，镜像实现见 `web/src/lib/category-dir.ts` 的
-/// `categoryDirUnder`；两端改一处就要改另一处，否则同一台机器上桌面与 Web
-/// 一键出来的目录会不一致。
-String categoryDirUnder(String baseDir, String label, {String? separator}) {
-  var root = baseDir.trim();
-  if (root.isEmpty) return '';
-  final folder = sanitizeCategoryDirName(label);
-  if (folder.isEmpty) return '';
-  while (root.length > 1 && (root.endsWith('/') || root.endsWith('\\'))) {
-    root = root.substring(0, root.length - 1);
-  }
-  // 根目录（"/" 或 "\"）本身就带分隔符，直接拼名字。
-  if (root.endsWith('/') || root.endsWith('\\')) return '$root$folder';
-  return '$root${separator ?? Platform.pathSeparator}$folder';
-}
 
 /// 图标标识 — 映射到 LucideIcons
 enum CategoryIcon {
@@ -122,26 +81,6 @@ class CustomCategory {
     this.saveDir = '',
   });
 
-  /// 分类显示名：内置分类用 i18n 文案，自定义分类用用户设置的名称。
-  ///
-  /// 内置文案不只是标签：「一键分类目录」拿它当目录名（[categoryDirUnder]），
-  /// Web 侧共用 `assets/i18n` 的同一批内置分类键，显示名必须逐字一致，
-  /// 否则两端会在同一台机器上建出两套目录。
-  String displayName(S s) {
-    if (!isBuiltin) return name;
-    return switch (builtinType) {
-      'all' => s.categoryAll,
-      'video' => s.categoryVideo,
-      'audio' => s.categoryAudio,
-      'document' => s.categoryDocument,
-      'image' => s.categoryImage,
-      'program' => s.categoryProgram,
-      'archive' => s.categoryArchive,
-      'other' => s.categoryOther,
-      _ => '',
-    };
-  }
-
   /// 检测文件名是否匹配此分类
   bool matches(String fileName) {
     // 'all' 匹配所有文件
@@ -219,7 +158,8 @@ class CustomCategory {
         (e) => e.name == json['matchMode'],
         orElse: () => MatchMode.extension,
       ),
-      extensions: (json['extensions'] as List<dynamic>?)
+      extensions:
+          (json['extensions'] as List<dynamic>?)
               ?.map((e) => e.toString().toLowerCase())
               .toList() ??
           const [],
@@ -268,8 +208,21 @@ class CustomCategory {
       icon: CategoryIcon.film,
       matchMode: MatchMode.extension,
       extensions: [
-        'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'ts',
-        'm4v', 'rmvb', 'rm', '3gp', 'vob', 'mpg', 'mpeg',
+        'mp4',
+        'mkv',
+        'avi',
+        'mov',
+        'wmv',
+        'flv',
+        'webm',
+        'ts',
+        'm4v',
+        'rmvb',
+        'rm',
+        '3gp',
+        'vob',
+        'mpg',
+        'mpeg',
       ],
       position: 1,
       isBuiltin: true,
@@ -281,7 +234,16 @@ class CustomCategory {
       icon: CategoryIcon.music,
       matchMode: MatchMode.extension,
       extensions: [
-        'mp3', 'flac', 'wav', 'aac', 'ogg', 'wma', 'm4a', 'opus', 'ape', 'aiff',
+        'mp3',
+        'flac',
+        'wav',
+        'aac',
+        'ogg',
+        'wma',
+        'm4a',
+        'opus',
+        'ape',
+        'aiff',
       ],
       position: 2,
       isBuiltin: true,
@@ -293,8 +255,22 @@ class CustomCategory {
       icon: CategoryIcon.fileText,
       matchMode: MatchMode.extension,
       extensions: [
-        'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'txt',
-        'csv', 'rtf', 'epub', 'mobi', 'md', 'odt', 'ods', 'odp',
+        'pdf',
+        'doc',
+        'docx',
+        'xls',
+        'xlsx',
+        'ppt',
+        'pptx',
+        'txt',
+        'csv',
+        'rtf',
+        'epub',
+        'mobi',
+        'md',
+        'odt',
+        'ods',
+        'odp',
       ],
       position: 3,
       isBuiltin: true,
@@ -306,8 +282,20 @@ class CustomCategory {
       icon: CategoryIcon.image,
       matchMode: MatchMode.extension,
       extensions: [
-        'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 'svg', 'ico',
-        'tiff', 'tif', 'psd', 'raw', 'heic', 'avif',
+        'jpg',
+        'jpeg',
+        'png',
+        'gif',
+        'bmp',
+        'webp',
+        'svg',
+        'ico',
+        'tiff',
+        'tif',
+        'psd',
+        'raw',
+        'heic',
+        'avif',
       ],
       position: 4,
       isBuiltin: true,
@@ -319,8 +307,18 @@ class CustomCategory {
       icon: CategoryIcon.package2,
       matchMode: MatchMode.extension,
       extensions: [
-        'exe', 'msi', 'msix', 'appx', 'apk', 'dmg', 'pkg', 'deb',
-        'rpm', 'appimage', 'snap', 'flatpak',
+        'exe',
+        'msi',
+        'msix',
+        'appx',
+        'apk',
+        'dmg',
+        'pkg',
+        'deb',
+        'rpm',
+        'appimage',
+        'snap',
+        'flatpak',
       ],
       position: 5,
       isBuiltin: true,
@@ -332,8 +330,18 @@ class CustomCategory {
       icon: CategoryIcon.archive,
       matchMode: MatchMode.extension,
       extensions: [
-        'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst',
-        'iso', 'cab', 'lz', 'lzma',
+        'zip',
+        'rar',
+        '7z',
+        'tar',
+        'gz',
+        'bz2',
+        'xz',
+        'zst',
+        'iso',
+        'cab',
+        'lz',
+        'lzma',
       ],
       position: 6,
       isBuiltin: true,

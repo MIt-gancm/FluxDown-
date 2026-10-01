@@ -164,14 +164,10 @@ class _QualityRow extends StatelessWidget {
         curve: Curves.easeOut,
         padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
         decoration: BoxDecoration(
-          color: selected
-              ? m.soft(c.accent)
-              : m.glassSubtle(c.surface1),
+          color: selected ? m.soft(c.accent) : m.glassSubtle(c.surface1),
           borderRadius: m.brChipXl,
           border: Border.all(
-            color: selected
-                ? m.glassSubtle(c.accent)
-                : m.emphasis(c.border),
+            color: selected ? m.glassSubtle(c.accent) : m.emphasis(c.border),
             width: selected ? 1.4 : 1,
           ),
         ),
@@ -243,10 +239,7 @@ class _RadioDot extends StatelessWidget {
       decoration: BoxDecoration(
         shape: BoxShape.circle,
         color: selected ? c.accent : const Color(0x00000000),
-        border: Border.all(
-          color: selected ? c.accent : c.border,
-          width: 1.5,
-        ),
+        border: Border.all(color: selected ? c.accent : c.border, width: 1.5),
       ),
       child: selected
           ? Container(

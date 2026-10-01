@@ -24,10 +24,7 @@ import 'package:shadcn_ui/shadcn_ui.dart';
 /// Material/Widgets 本地化实际支持的 [Locale]；解析结果不受支持时回退英文，
 /// 避免 `MaterialLocalizations.of(context)` 因未知语言抛出异常。
 Locale frameworkLocale(String code) {
-  final parts = code
-      .split(RegExp(r'[-_]'))
-      .where((p) => p.isNotEmpty)
-      .toList();
+  final parts = code.split(RegExp(r'[-_]')).where((p) => p.isNotEmpty).toList();
   final Locale locale;
   if (parts.isEmpty) {
     // 空串/纯分隔符：Locale 构造器断言 languageCode 非空，直接回退英文。

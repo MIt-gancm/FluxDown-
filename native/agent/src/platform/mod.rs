@@ -594,7 +594,7 @@ mod xdg {
 
     use super::PlatformError;
 
-    /// 打包安装的桌面入口（`linux/com.fluxdown.app.desktop`）。
+    /// 打包安装的桌面入口（`packaging/linux/com.fluxdown.app.desktop`）。
     pub const DESKTOP_ENTRY: &str = "com.fluxdown.app.desktop";
 
     /// `xdg-mime query default <mime>` 是否返回 FluxDown 的桌面入口。

@@ -11,10 +11,8 @@ import 'platform_utils.dart';
 /// 文件日志服务 — 将日志写入数据目录的 logs/ 子目录，按日期分文件。
 ///
 /// 日志目录由 [resolveDataDir] 决定：
-/// - Windows 便携版: exe 同级 logs/
-/// - Windows 安装版: %LOCALAPPDATA%/FluxDown/logs/
-/// - Linux: ~/.local/share/fluxdown/logs/
-/// - macOS: ~/Library/Application Support/fluxdown/logs/
+/// - Android: /data/data/com.fluxdown.app/files/fluxdown/logs/
+/// - iOS: ~/Library/Application Support/fluxdown/logs/
 ///
 /// 使用缓冲写入 + 定时刷盘，兼顾性能和崩溃前日志完整度。
 ///
@@ -46,7 +44,6 @@ class LogService {
   Timer? _flushTimer;
   bool _initialized = false;
   bool _degraded = false;
-  int _failureCount = 0;
   String? _lastError;
   int _errorSequence = 0;
 
@@ -59,15 +56,13 @@ class LogService {
   /// 单个日志文件大小上限，超过则自动分割到新分卷
   static const int _maxFileBytes = 2 * 1024 * 1024;
 
-  /// 日志目录总大小默认上限（可由设置覆盖，见 [maxTotalBytes]）
-  static const int _defaultMaxTotalBytes = 10 * 1024 * 1024;
+  /// 日志目录总大小上限，超出自动清理最旧的日志文件
+  static const int _maxTotalBytes = 10 * 1024 * 1024;
 
   /// 日志文件名格式：fluxdown_YYYY-MM-DD.log 或 fluxdown_YYYY-MM-DD.N.log
   static final RegExp _logNamePattern = RegExp(
     r'^fluxdown_(\d{4}-\d{2}-\d{2})(?:\.(\d+))?\.log$',
   );
-
-  int _maxTotalBytes = _defaultMaxTotalBytes;
 
   /// 当前日期内的分卷序号（0 = 无序号的首个文件）
   int _currentPart = 0;
@@ -76,27 +71,8 @@ class LogService {
   /// 因此始终等于文件真实长度。
   int _fileSize = 0;
 
-  /// 日志目录总大小上限（字节）。设置后立即执行一次超量清理。
-  set maxTotalBytes(int bytes) {
-    if (bytes < 1024 * 1024) return;
-    if (_maxTotalBytes == bytes) return;
-    _maxTotalBytes = bytes;
-    if (_initialized) _enforceTotalSize();
-  }
-
-  int get maxTotalBytes => _maxTotalBytes;
-
-  /// 日志 writer 是否已成功初始化。
-  bool get initialized => _initialized;
-
   /// 本次进程生命周期内是否发生过日志基础设施失败。
   bool get degraded => _degraded;
-
-  /// 本次进程生命周期内累计日志基础设施失败次数。
-  int get failureCount => _failureCount;
-
-  /// 最近一次日志基础设施失败。
-  String? get lastError => _lastError;
 
   /// 日志目录。移动端可经 [relocateTo]（#533）在运行期迁移到外部可访问目录，
   /// 因此非 `final`。
@@ -234,7 +210,6 @@ class LogService {
 
   void _recordFailure(String operation, Object error, [StackTrace? stack]) {
     _degraded = true;
-    _failureCount++;
     _lastError = '$operation: $error';
     // The persistent sink is unavailable; stderr is the only independent
     // emergency sink. Never call log()/error() from here.
@@ -277,79 +252,6 @@ class LogService {
     final zipBytes = _buildZip(logFiles, sanitize: sanitize);
     await File(zipPath).writeAsBytes(zipBytes);
     return logFiles.length;
-  }
-
-  /// 读取当天（最新分卷）日志文本内容，用于随反馈一并提交。
-  ///
-  /// 已做脱敏处理并按 [maxChars] 截断（保留末尾，日志越新越靠后）。
-  /// 无日志时返回空字符串。
-  Future<String> readTodayLog({int maxChars = 25000}) async {
-    try {
-      _raf?.flushSync();
-      _dirty = false;
-    } catch (e, stack) {
-      _recordFailure('flush before reading logs', e, stack);
-    }
-
-    if (!_logDir.existsSync()) return '';
-
-    final now = DateTime.now();
-    final dateTag = '${now.year}-${_pad2(now.month)}-${_pad2(now.day)}';
-
-    // 收集当天全部分卷，按序号排序后拼接。
-    final parts = <({int part, File file})>[];
-    try {
-      for (final entity in _logDir.listSync()) {
-        if (entity is! File) continue;
-        final m = _logNamePattern.firstMatch(p.basename(entity.path));
-        if (m == null || m.group(1) != dateTag) continue;
-        parts.add((part: int.parse(m.group(2) ?? '0'), file: entity));
-      }
-    } catch (_) {
-      return '';
-    }
-    if (parts.isEmpty) return '';
-    parts.sort((a, b) => a.part.compareTo(b.part));
-
-    final buffer = StringBuffer();
-    for (final f in parts) {
-      try {
-        buffer.write(f.file.readAsStringSync());
-      } catch (_) {}
-    }
-    var content = _sanitizeLogContent(buffer.toString());
-    if (content.length > maxChars) {
-      content = content.substring(content.length - maxChars);
-    }
-    return content;
-  }
-
-  /// 计算日志目录的总大小（字节）。
-  int get logDirSizeBytes {
-    if (!_logDir.existsSync()) return 0;
-    int total = 0;
-    for (final entity in _logDir.listSync()) {
-      if (entity is! File) continue;
-      final name = p.basename(entity.path);
-      if (!name.startsWith('fluxdown_') || !name.endsWith('.log')) continue;
-      try {
-        total += entity.lengthSync();
-      } catch (_) {}
-    }
-    return total;
-  }
-
-  /// 日志文件数量。
-  int get logFileCount {
-    if (!_logDir.existsSync()) return 0;
-    int count = 0;
-    for (final entity in _logDir.listSync()) {
-      if (entity is! File) continue;
-      final name = p.basename(entity.path);
-      if (!name.startsWith('fluxdown_') || !name.endsWith('.log')) continue;
-      count++;
-    }
-    return count;
   }
 
   /// 关闭日志服务
@@ -547,10 +449,8 @@ class LogService {
 
   /// 解析日志目录：委托 platform_utils.resolveDataDir()，加 /logs 后缀。
   ///
-  /// - Linux: ~/.local/share/fluxdown/logs
-  /// - macOS: ~/Library/Application Support/fluxdown/logs
-  /// - Windows 便携版: exe 同级 logs/
-  /// - Windows 安装版: %LOCALAPPDATA%/FluxDown/logs
+  /// - Android: /data/data/com.fluxdown.app/files/fluxdown/logs
+  /// - iOS: ~/Library/Application Support/fluxdown/logs
   static Directory _resolveLogDir() {
     final dataDir = resolveDataDir();
     return Directory('$dataDir${Platform.pathSeparator}logs');

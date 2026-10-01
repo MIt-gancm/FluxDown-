@@ -20,9 +20,7 @@ void main() {
     expect(frameworkLocale('zh-hant').scriptCode, 'Hant');
   });
 
-  testWidgets('中文 WidgetsApp 根：Material 与 shadcn 本地化文案都跟随中文', (
-    tester,
-  ) async {
+  testWidgets('中文 WidgetsApp 根：Material 与 shadcn 本地化文案都跟随中文', (tester) async {
     final locale = frameworkLocale('zh');
     late BuildContext capturedContext;
 

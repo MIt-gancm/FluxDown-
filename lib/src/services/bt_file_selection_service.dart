@@ -69,19 +69,6 @@ class BtFileSelectionService {
 
   // ─── Callback registration (used by new-download dialog) ─────────────────
 
-  /// Register a one-shot handler for the next [BtFilesInfo] signal.
-  ///
-  /// Call this immediately *before* submitting a CreateTask signal so that
-  /// the handler is in place before Rust can possibly send BtFilesInfo.
-  /// The handler is invoked at most once and then cleared automatically.
-  ///
-  /// Pass `null` to cancel a previously registered handler (e.g. when the
-  /// dialog is closed before the signal arrives).
-  static void registerPendingHandler(void Function(BtFilesInfo)? handler) {
-    logInfo(_tag, handler != null ? 'registerPendingHandler: set' : 'registerPendingHandler: cleared');
-    _pendingDialogHandler = handler;
-  }
-
   // ─── Signal handling ──────────────────────────────────────────────────────
 
   void _onFilesInfo(RustSignalPack<BtFilesInfo> pack) {
@@ -105,13 +92,19 @@ class BtFileSelectionService {
 
     // Deduplicate: if a dialog is already open for this exact task, ignore.
     if (_openDialogTaskIds.contains(msg.taskId)) {
-      logInfo(_tag, 'standalone dialog already open for task=${msg.taskId}, ignoring');
+      logInfo(
+        _tag,
+        'standalone dialog already open for task=${msg.taskId}, ignoring',
+      );
       return;
     }
 
     final context = navigatorKey.currentContext;
     if (context == null || !context.mounted) {
-      logInfo(_tag, 'no valid context — auto-selecting all for task=${msg.taskId}');
+      logInfo(
+        _tag,
+        'no valid context — auto-selecting all for task=${msg.taskId}',
+      );
       _autoSelectAll(msg);
       return;
     }
@@ -132,12 +125,16 @@ class BtFileSelectionService {
   /// Fallback: automatically select all files when no UI context is available.
   void _autoSelectAll(BtFilesInfo msg) {
     void send() {
-      logInfo(_tag, 'auto-selecting all ${msg.files.length} file(s) for task=${msg.taskId}');
+      logInfo(
+        _tag,
+        'auto-selecting all ${msg.files.length} file(s) for task=${msg.taskId}',
+      );
       SelectBtFiles(
         taskId: msg.taskId,
         selectedIndices: msg.files.map((f) => f.index).toList(),
       ).sendSignalToRust();
     }
+
     SchedulerBinding.instance.addPostFrameCallback((_) => send());
   }
 }

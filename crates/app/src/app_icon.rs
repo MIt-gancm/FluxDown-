@@ -60,8 +60,7 @@ mod macos {
     use objc2_foundation::{NSData, NSPoint, NSRect};
 
     /// macOS 风格（圆角 + 留白）的 Dock 素材，与 Flutter 壳 `AppIcon.appiconset` 同源。
-    const DOCK_ICON_PNG: &[u8] =
-        include_bytes!("../../../macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_512.png");
+    const DOCK_ICON_PNG: &[u8] = include_bytes!("../../../assets/logo/macos/app_icon_512.png");
 
     /// 可执行文件位于 `*.app/Contents/MacOS/` 之内时，Dock 图标由 bundle 的 icns 提供。
     fn running_inside_bundle() -> bool {

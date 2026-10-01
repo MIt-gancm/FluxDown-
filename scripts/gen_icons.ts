@@ -17,12 +17,10 @@
  *     tray_iconTemplate@1x.png (18×18, macOS 1x 菜单栏模板图标)
  *     logo_on_dark.png (64×64, 暗色主题侧边栏专用: 蓝色箭头 + 透明背景)
  *
- *   windows/runner/resources/
- *     app_icon.ico (16,32,48,64,256 多分辨率 ICO；Flutter 与 GPUI PC 客户端共用)
- *     tray_win_dark.ico (16,32 — 深色模式白色箭头托盘图标)
- *     tray_win_light.ico (16,32 — 浅色模式深蓝色箭头托盘图标)
+ *   assets/logo/windows/
+ *     app_icon.ico (16,32,48,64,256 多分辨率 ICO；GPUI PC 客户端 / nmh / 安装器共用)
  *
- *   macos/Runner/Assets.xcassets/AppIcon.appiconset/
+ *   assets/logo/macos/
  *     app_icon_{16,32,64,128,256,512,1024}.png（app_icon_512 同时是 GPUI 裸二进制的 Dock 图标）
  *
  *   ios/Runner/Assets.xcassets/AppIcon.appiconset/
@@ -384,7 +382,7 @@ async function main() {
   // ──────────────────────────────────────────
   // 2. Windows ICO — 多分辨率
   // ──────────────────────────────────────────
-  console.log("\n📁 windows/runner/resources/");
+  console.log("\n📁 assets/logo/windows/");
   {
     const icoSizes = [16, 32, 48, 64, 256];
     const frames: { size: number; data: Buffer }[] = [];
@@ -393,7 +391,7 @@ async function main() {
       frames.push({ size, data });
     }
     const ico = buildIco(frames);
-    await saveFile("windows/runner/resources/app_icon.ico", ico);
+    await saveFile("assets/logo/windows/app_icon.ico", ico);
     console.log(
       `     (包含分辨率: ${icoSizes.map((s) => `${s}×${s}`).join(", ")})`,
     );
@@ -401,35 +399,15 @@ async function main() {
   }
 
   // ──────────────────────────────────────────
-  // 2b. Windows 托盘图标 — 深/浅色共用同一彩色 logo
-  //     新 logo（蓝底白箭头）在浅/深任务栏均可辨识，无需区分主题
-  // ──────────────────────────────────────────
-  console.log("\n📁 windows/runner/resources/ (tray icons)");
-  {
-    const traySizes = [16, 32];
-    const trayFrames: { size: number; data: Buffer }[] = [];
-    for (const size of traySizes) {
-      trayFrames.push({ size, data: await getCachedPng(size) });
-    }
-    const trayIco = buildIco(trayFrames);
-    // 两文件保持相同内容，避免改动 Rust 端在不同主题切换图标的现有逻辑
-    await saveFile("windows/runner/resources/tray_win_dark.ico", trayIco);
-    await saveFile("windows/runner/resources/tray_win_light.ico", trayIco);
-
-    console.log(`     (含分辨率: ${traySizes.map((s) => `${s}×${s}`).join(", ")})`);
-    totalCount += 2;
-  }
-
-  // ──────────────────────────────────────────
   // 3. macOS AppIcon — 7 个尺寸
   // ──────────────────────────────────────────
-  console.log("\n📁 macos/Runner/Assets.xcassets/AppIcon.appiconset/");
+  console.log("\n📁 assets/logo/macos/");
   {
     const macSizes = [16, 32, 64, 128, 256, 512, 1024];
     for (const size of macSizes) {
       const buf = await renderMacAppIcon(size);
       await saveFile(
-        `macos/Runner/Assets.xcassets/AppIcon.appiconset/app_icon_${size}.png`,
+        `assets/logo/macos/app_icon_${size}.png`,
         buf,
       );
     }

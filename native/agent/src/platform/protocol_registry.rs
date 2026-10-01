@@ -229,7 +229,7 @@ mod inner {
 }
 
 // macOS：Launch Services 默认处理程序；scheme 必须在 `CFBundleURLTypes`
-// （macos/Runner/Info.plist）中声明，Launch Services 才接受本 bundle 为候选。
+// （packaging/macos/Info.plist）中声明，Launch Services 才接受本 bundle 为候选。
 #[cfg(target_os = "macos")]
 mod inner {
     use std::path::Path;

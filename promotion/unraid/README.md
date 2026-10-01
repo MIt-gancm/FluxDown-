@@ -6,8 +6,7 @@
 ## 为什么要独立仓库
 
 CA 的 live scan 会**递归扫描整个仓库根**，把所有 `.xml` 都当候选 Unraid 模板解析。
-FluxDown 主仓库里有 8 个无关 XML（`android/**` 的 AndroidManifest/styles/launch_background、
-`linux/runner/**` 的 gresource），会触发 `not_unraid_application: 8` 警告。
+FluxDown 主仓库里有 8 个无关 XML（`android/**` 的 AndroidManifest/styles/launch_background 等），会触发 `not_unraid_application: 8` 警告。
 Unraid 社区标准做法（ibracorp、digiblur、Josh5 等）都是用一个**只放模板的干净仓库**。
 
 ## 目录结构（即独立仓库的根）

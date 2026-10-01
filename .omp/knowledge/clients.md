@@ -7,7 +7,7 @@
 
 ## GPUI PC 客户端（`crates/`，三进程本机链路）
 
-**桌面发行物已是 GPUI**：Windows / macOS / Linux 发布 `fluxdown-desktop → fluxdown-agent → fluxdownd`，浏览器中继为 `fluxdown_nmh`（`.github/workflows/release.yml` 的桌面构建与 `scripts/package_gpui_{linux,macos}.sh`）。Android 发行物仍是 Flutter；`lib/` 的桌面代码仅保留 legacy / wire 兼容，不再代表当前 PC 发行物。GPUI 关于页与服务版本统一取 `fluxdown_protocol::APP_VERSION`：正式构建由 tag 注入 `FLUXDOWN_APP_VERSION`，本地回退及 `pubspec.yaml` 的角色见 `ops.md`「发布与 CI」。
+**桌面发行物已是 GPUI**：Windows / macOS / Linux 发布 `fluxdown-desktop → fluxdown-agent → fluxdownd`，浏览器中继为 `fluxdown_nmh`（`.github/workflows/release.yml` 的桌面构建与 `scripts/package_gpui_{linux,macos}.sh`）。Android 发行物仍是 Flutter；Flutter 已无桌面 runner / 桌面页面，仅移动端（android/ios）。GPUI 关于页与服务版本统一取 `fluxdown_protocol::APP_VERSION`：正式构建由 tag 注入 `FLUXDOWN_APP_VERSION`，本地回退及 `pubspec.yaml` 的角色见 `ops.md`「发布与 CI」。
 
 依赖方向固定为 `i18n` / `theme` → `components` → `shell` / capability crates → `app`。`app` 只做窗口与单一 agent 会话装配；capability 之间不互相依赖。
 

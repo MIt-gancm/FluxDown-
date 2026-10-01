@@ -140,10 +140,9 @@ FluxDown/
 │   ├── agent/          `fluxdown_agent`：桌面/headless 的云功能与官方 UI Gateway
 │   ├── link/           `fluxdown_link`：局域网直连 L1 协议（配对 / mDNS / 直连传输），agent 与 hub 共用
 │   ├── server/         `fluxdown_server`：**已冻结**的旧 headless 宿主（不构建/不发布），由 `agent --server` + `daemon` 取代
-│   ├── hub/            Flutter / legacy 的 rinf FFI 适配层（唯一碰 rinf）——见 `hosts-and-api.md`「宿主与客户端 crate」
+│   ├── hub/            Flutter 移动端的 rinf FFI 适配层（唯一碰 rinf）——见 `hosts-and-api.md`「宿主与客户端 crate」
 │   ├── cli/            `fluxdown_cli`：二进制 `fluxdown`——见 `hosts-and-api.md`「宿主与客户端 crate」
-│   ├── nmh/            Native Messaging Host 中继二进制
-│   └── fluxdown_updater/  独立自更新 helper 二进制（hub 拉起）
+│   └── nmh/            Native Messaging Host 中继二进制
 ├── web/                Web SPA（React 19 + TanStack + Tailwind v4，bun）——见 `clients.md`「Web SPA」
 ├── website-v2/         官网主站（Astro SSR + 内容集文档系统，根路径部署）——见 `clients.md`「官网」
 ├── website/            旧官网存档（挂 `/v1/`，不再更新内容）——见 `clients.md`「官网」
@@ -156,6 +155,6 @@ FluxDown/
 ├── installer/windows/  Inno Setup
 ├── bucket/             Scoop manifest
 ├── docs/               设计文档（实现状态见 `ops.md`「设计文档实现状态」）
-├── android/ ios/ macos/ linux/ windows/   各平台原生工程
+├── android/ ios/   Flutter 移动端原生工程
 └── .github/workflows/   ci.yml 主干门禁 + release.yml 组件发布——见 `ops.md`「发布与 CI」
 ```

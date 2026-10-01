@@ -6,6 +6,7 @@
 //
 // 正确做法：不修改正式代码来迁就测试，而是让 smoke test 只覆盖
 // 可以在测试环境中运行的纯 Dart 层逻辑。
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:flux_down/src/i18n/locale_provider.dart';
 import 'package:flux_down/src/theme/theme_provider.dart';
@@ -20,26 +21,17 @@ void main() {
   // ─────────────────────────────────────────────
 
   group('ThemeProvider', () {
-    test('内置主题列表非空', () {
-      // builtinThemes 是顶层 final 变量，不属于 ThemeProvider 实例
-      expect(builtinThemes, isNotEmpty);
-    });
-
-    test('默认暗色主题 ID 存在于内置列表', () {
+    test('初始跟随系统，setThemeMode 切换并通知', () {
       final provider = ThemeProvider();
-      final ids = builtinThemes.map((e) => e.id).toList();
-      expect(ids, contains(provider.selectedDarkTheme));
-    });
+      expect(provider.themeMode, ThemeMode.system);
 
-    test('默认亮色主题 ID 存在于内置列表', () {
-      final provider = ThemeProvider();
-      final ids = builtinThemes.map((e) => e.id).toList();
-      expect(ids, contains(provider.selectedLightTheme));
-    });
+      var notified = 0;
+      provider.addListener(() => notified++);
+      provider.setThemeMode(ThemeMode.dark);
+      provider.setThemeMode(ThemeMode.dark);
 
-    test('初始无导入主题', () {
-      final provider = ThemeProvider();
-      expect(provider.importedThemes, isEmpty);
+      expect(provider.themeMode, ThemeMode.dark);
+      expect(notified, 1);
     });
   });
 

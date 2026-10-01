@@ -37,7 +37,7 @@ const ICON_FILE_NAME: &str = "notification_icon.png";
 #[cfg(windows)]
 const WINDOWS_AUMID: &str = "dev.zerx.fluxdown";
 
-/// Linux 打包安装的桌面入口 id（`linux/com.fluxdown.app.desktop`，不含后缀）。
+/// Linux 打包安装的桌面入口 id（`packaging/linux/com.fluxdown.app.desktop`，不含后缀）。
 #[cfg(all(unix, not(target_os = "macos")))]
 const LINUX_DESKTOP_ENTRY: &str = "com.fluxdown.app";
 

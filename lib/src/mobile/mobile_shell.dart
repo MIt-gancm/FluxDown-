@@ -42,7 +42,7 @@ class MobileShell extends StatefulWidget {
 
 class _MobileShellState extends State<MobileShell> with WidgetsBindingObserver {
   final _controller = DownloadController();
-  final _settings = SettingsProvider(enableFileAssoc: false);
+  final _settings = SettingsProvider();
   bool _sheetOpen = false;
 
   /// 新建下载弹层是否正在展示（区别于更新提示等其他弹层）。

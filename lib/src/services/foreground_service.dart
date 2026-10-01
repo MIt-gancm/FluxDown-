@@ -51,7 +51,7 @@ class _KeepAliveTaskHandler extends TaskHandler {
 ///
 /// ## 非 Android 平台
 ///
-/// iOS 无前台服务概念，桌面端也不需要此 Android 保活机制；所有公开入口直接
+/// iOS 无前台服务概念，不需要此 Android 保活机制；所有公开入口直接
 /// 返回，不请求通知权限、不启动后台服务。
 ///
 /// ## 用法

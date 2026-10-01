@@ -76,23 +76,12 @@ Future<void> showMobileTaskActionSheet(
         TaskStatus.preparing ||
         TaskStatus.resuming => (LucideIcons.pause, s.pause),
         TaskStatus.error => (LucideIcons.rotateCcw, s.mobileRetry),
-        // completed/canceled 均为终态，下面 manageable=false 会把磁贴整个
-        // 过滤掉，这里的值不会被展示；显式列出而非隐式落进 `_` 通配，是为
-        // 了不重蹈上一轮的覆辙——canceled 曾经就是隐式落进 `_` 的
-        // (play, resume)，且展示条件当时没有排除 canceled，渲染出一个点
-        // 了没反应的「继续」磁贴。
-        TaskStatus.completed ||
-        TaskStatus.canceled => (LucideIcons.play, s.resume),
+        // completed 为终态，下面 manageable=false 会把磁贴整个过滤掉。
         _ => (LucideIcons.play, s.resume),
       };
 
-      // completed 与 canceled 均为终态：不提供暂停/继续、Boost、移动队列。
-      // canceled 只由只读的远程任务镜像（RemoteTaskStatus.canceled）产生
-      // （见 TaskStatus 文档），这三个操作对它要么静默无效，要么（Boost）
-      // 弹出一个声称已生效、实际不会有任何效果的 toast。
-      final manageable =
-          task.status != TaskStatus.completed &&
-          task.status != TaskStatus.canceled;
+      // completed 为终态：不提供暂停/继续、Boost、移动队列。
+      final manageable = task.status != TaskStatus.completed;
 
       final toggleItem = manageable
           ? tile(
@@ -215,8 +204,7 @@ void _toggleTask(DownloadController controller, DownloadTask task) {
     case TaskStatus.error:
       controller.resumeTask(task.id);
     case TaskStatus.completed:
-    case TaskStatus.canceled:
-      break; // 两者均为终态，不提供继续/重试
+      break; // 终态，不提供继续/重试
   }
 }
 
@@ -273,7 +261,8 @@ Future<void> _showMoveToQueueSheet(
       }
 
       final rows = <Widget>[
-        for (final q in controller.queues) queueItem(q.queueId, queueDisplayName(s, q)),
+        for (final q in controller.queues)
+          queueItem(q.queueId, queueDisplayName(s, q)),
       ];
 
       return MobileSheetContainer(

@@ -41,9 +41,7 @@ class ResolveVariantService {
     );
   }
 
-  void _onVariantRequest(
-    RustSignalPack<ResolveVariantSelectionRequest> pack,
-  ) {
+  void _onVariantRequest(RustSignalPack<ResolveVariantSelectionRequest> pack) {
     final msg = pack.message;
     logInfo(
       _tag,

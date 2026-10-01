@@ -262,7 +262,6 @@ class MobileTasksScreenState extends State<MobileTasksScreen> {
               final dc = widget.controller;
               final filtered =
                   dc.categoryFilter != FileCategory.all ||
-                  dc.customCategoryFilter != null ||
                   dc.queueFilter != null;
               return MobileIconButton(
                 icon: LucideIcons.listFilter,
@@ -575,15 +574,6 @@ class _MetaLine extends StatelessWidget {
         }
       case TaskStatus.resuming:
         spans.add(TextSpan(text: task.statusText));
-      case TaskStatus.canceled:
-        spans.add(TextSpan(text: '${task.downloadedText} / ${task.sizeText}'));
-        sep();
-        spans.add(
-          TextSpan(
-            text: s.subtitleCanceled,
-            style: base.copyWith(color: c.textMuted),
-          ),
-        );
     }
 
     return Row(
@@ -639,20 +629,6 @@ class _ActionButton extends StatelessWidget {
           shape: BoxShape.circle,
         ),
         child: Icon(LucideIcons.check, size: 14, color: c.statusSuccess),
-      );
-    }
-
-    if (task.status == TaskStatus.canceled) {
-      // 已取消：与 completed 同款只读圆形指示，禁止实现「继续」——只可能是
-      // 其他设备取消的远程任务镜像，本机点按无意义。
-      return Container(
-        width: 32,
-        height: 32,
-        decoration: BoxDecoration(
-          color: c.textMuted.withValues(alpha: 0.12),
-          shape: BoxShape.circle,
-        ),
-        child: Icon(LucideIcons.ban, size: 14, color: c.textMuted),
       );
     }
 

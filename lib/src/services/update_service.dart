@@ -1,5 +1,4 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/foundation.dart';
@@ -7,43 +6,11 @@ import 'package:flutter/services.dart';
 import 'package:rinf/rinf.dart';
 
 import '../bindings/bindings.dart';
-import '../models/download_controller.dart';
 import '../models/settings_provider.dart';
-import 'kv_store.dart';
 import 'log_service.dart';
 
 /// Application version injected at build time.
 const _appVersion = String.fromEnvironment('APP_VERSION', defaultValue: 'dev');
-
-/// Base URL of the website API.
-const _updateApiBase = 'https://fluxdown.zerx.dev';
-
-/// KvStore key for the last version whose changelog was shown.
-const _prefKeyLastShownVersion = 'update_changelog_last_shown';
-
-/// A single release entry from the changelog API.
-class ChangelogRelease {
-  final String tag;
-  final String version;
-  final String publishedAt;
-  final String body;
-
-  const ChangelogRelease({
-    required this.tag,
-    required this.version,
-    required this.publishedAt,
-    required this.body,
-  });
-
-  factory ChangelogRelease.fromJson(Map<String, dynamic> json) {
-    return ChangelogRelease(
-      tag: json['tag'] as String? ?? '',
-      version: json['version'] as String? ?? '',
-      publishedAt: json['published_at'] as String? ?? '',
-      body: json['body'] as String? ?? '',
-    );
-  }
-}
 
 /// Update state enum for UI consumption.
 enum UpdateStatus {
@@ -100,60 +67,19 @@ class UpdateService extends ChangeNotifier {
   String _errorMessage = '';
   String get errorMessage => _errorMessage;
 
-  /// Pending "previous update failed" message reported by the Rust updater on
-  /// startup (empty when there is nothing to report). Set once after the app
-  /// requests the marker; the UI should show it once and then call
-  /// [acknowledgeFailureMarker].
-  String _pendingFailureMessage = '';
-  String get pendingFailureMessage => _pendingFailureMessage;
-
-  /// Clear the pending failure message after it has been shown to the user.
-  void acknowledgeFailureMarker() {
-    if (_pendingFailureMessage.isEmpty) return;
-    _pendingFailureMessage = '';
-    notifyListeners();
-  }
-
   /// Current app version.
   String get currentVersion => _appVersion;
-
-  /// Changelog releases fetched from the website API (newer than current version).
-  List<ChangelogRelease> _changelogReleases = const [];
-  List<ChangelogRelease> get changelogReleases => _changelogReleases;
-
-  /// Whether the changelog dialog should be shown (new update + not yet shown).
-  bool _shouldShowChangelog = false;
-  bool get shouldShowChangelog => _shouldShowChangelog;
-
-  /// Mark the changelog as shown for the current latest version.
-  /// Prevents repeated popups on subsequent launches.
-  Future<void> markChangelogShown() async {
-    _shouldShowChangelog = false;
-    final latest = _checkResult?.latestVersion;
-    if (latest != null && latest.isNotEmpty) {
-      final prefs = KvStore.instance;
-      await prefs.setString(_prefKeyLastShownVersion, latest);
-      logInfo('UpdateService', 'marked changelog shown for v$latest');
-    }
-  }
 
   // ── Subscriptions ──────────────────────────────────────────────────────
 
   StreamSubscription<RustSignalPack<UpdateCheckResult>>? _checkSub;
   StreamSubscription<RustSignalPack<UpdateDownloadProgress>>? _progressSub;
-  StreamSubscription<RustSignalPack<UpdateFailureMarker>>? _failureMarkerSub;
 
   void _init() {
     _checkSub = UpdateCheckResult.rustSignalStream.listen(_onCheckResult);
     _progressSub = UpdateDownloadProgress.rustSignalStream.listen(
       _onDownloadProgress,
     );
-    // Subscribe BEFORE requesting so we never miss the response (no startup
-    // race), then ask Rust whether a previous portable update failed.
-    _failureMarkerSub = UpdateFailureMarker.rustSignalStream.listen(
-      _onFailureMarker,
-    );
-    RequestUpdateFailureMarker().sendSignalToRust();
   }
 
   @override
@@ -161,7 +87,6 @@ class UpdateService extends ChangeNotifier {
     _checkTimeoutTimer?.cancel();
     _checkSub?.cancel();
     _progressSub?.cancel();
-    _failureMarkerSub?.cancel();
     super.dispose();
   }
 
@@ -225,54 +150,7 @@ class UpdateService extends ChangeNotifier {
     ).sendSignalToRust();
   }
 
-  /// Whether the "download via task" fallback is available for the current
-  /// state: a checked update whose asset URL is known. Used to surface the
-  /// fallback button when the built-in updater download/fetch fails.
-  bool get canFallbackToTask {
-    final r = _checkResult;
-    return r != null && r.hasUpdate && r.downloadUrl.isNotEmpty;
-  }
-
-  /// Fallback for when the built-in updater download fails (e.g. the helper's
-  /// temp path is unusable — os error 123). Hands the update package URL to the
-  /// main download engine as an ordinary task so it lands in the download list;
-  /// the user installs it manually afterwards.
-  ///
-  /// Returns `true` when a task was created. Requires a prior successful check
-  /// (so [downloadUrl] is known) plus the global controller/settings singletons.
-  bool downloadUpdateViaTask() {
-    final result = _checkResult;
-    if (result == null || !result.hasUpdate || result.downloadUrl.isEmpty) {
-      return false;
-    }
-    final controller = DownloadController.globalInstance;
-    if (controller == null) return false;
-    final settings = SettingsProvider.globalInstance;
-    final saveDir = settings?.defaultSaveDir ?? '';
-    if (saveDir.isEmpty) return false;
-
-    logInfo(
-      'UpdateService',
-      'fallback: create download task for update v${result.latestVersion}',
-    );
-    controller.createTask(
-      url: result.downloadUrl,
-      saveDir: saveDir,
-      segments: settings?.defaultSegments ?? 0,
-    );
-
-    // The update now lives in the main download list; reset the update UI so
-    // it no longer shows the failed built-in download.
-    _status = UpdateStatus.idle;
-    _errorMessage = '';
-    notifyListeners();
-    return true;
-  }
-
-  /// Launch the installer.
-  ///
-  /// 桌面端：交给 Rust updater（helper 二进制接管，进程随后退出）。
-  /// Android：Rust 无法唤起系统安装器 —— 经 MainActivity 的
+  /// Launch the installer (Android only): MainActivity 的
   /// `com.fluxdown/storage` channel 走 FileProvider + ACTION_VIEW。
   Future<void> installUpdate() async {
     if (_installerPath.isEmpty) return;
@@ -290,7 +168,7 @@ class UpdateService extends ChangeNotifier {
       }
       return;
     }
-    InstallUpdate(installerPath: _installerPath).sendSignalToRust();
+    // 非 Android 平台无本地安装路径。
   }
 
   // ── Signal handlers ────────────────────────────────────────────────────
@@ -312,8 +190,6 @@ class UpdateService extends ChangeNotifier {
       _errorMessage = msg.errorMessage;
     } else if (msg.hasUpdate) {
       _status = UpdateStatus.available;
-      // Fetch changelog in background — don't block the status update
-      _fetchChangelogAndCheckShown(msg.latestVersion);
     } else {
       _status = UpdateStatus.upToDate;
     }
@@ -339,92 +215,6 @@ class UpdateService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Handle the pending failure marker reported by Rust on startup.
-  void _onFailureMarker(RustSignalPack<UpdateFailureMarker> pack) {
-    final message = pack.message.message;
-    if (message.isEmpty) return;
-    logInfo('UpdateService', 'pending update failure marker received');
-    _pendingFailureMessage = message;
-    notifyListeners();
-  }
-
-  // ── Changelog ──────────────────────────────────────────────────────────
-
-  /// Fetch changelog from website API and decide whether to show the dialog.
-  Future<void> _fetchChangelogAndCheckShown(String latestVersion) async {
-    // Android：/api/changelog 过滤的是桌面 release 版本线，与 mobile-v*
-    // 独立版本号不可比 —— 会误拉全量桌面 changelog，直接跳过。
-    if (Platform.isAndroid) return;
-    try {
-      // Check if we already showed changelog for this version
-      final prefs = KvStore.instance;
-      final lastShown = prefs.getString(_prefKeyLastShownVersion) ?? '';
-      if (lastShown == latestVersion) {
-        logInfo(
-          'UpdateService',
-          'changelog already shown for v$latestVersion, skipping',
-        );
-        return;
-      }
-
-      await _fetchChangelog();
-
-      if (_changelogReleases.isNotEmpty) {
-        _shouldShowChangelog = true;
-        notifyListeners();
-      }
-    } catch (e) {
-      logInfo('UpdateService', 'failed to fetch changelog: $e');
-      // Non-critical — don't change status, user can still update
-    }
-  }
-
-  /// Fetch all releases newer than the current version from the website API.
-  Future<void> _fetchChangelog() async {
-    if (_appVersion == 'dev') {
-      logInfo('UpdateService', 'skip changelog fetch in dev mode');
-      return;
-    }
-
-    final uri = Uri.parse(
-      '$_updateApiBase/api/changelog?per_page=50&since=v$_appVersion',
-    );
-    logInfo('UpdateService', 'fetching changelog: $uri');
-
-    final client = HttpClient();
-    try {
-      client.connectionTimeout = const Duration(seconds: 10);
-      final request = await client.getUrl(uri);
-      final response = await request.close();
-
-      if (response.statusCode != 200) {
-        logInfo(
-          'UpdateService',
-          'changelog API returned ${response.statusCode}',
-        );
-        return;
-      }
-
-      final body = await response.transform(utf8.decoder).join();
-      final json = jsonDecode(body) as Map<String, dynamic>;
-      final rawReleases = json['releases'] as List<dynamic>? ?? [];
-
-      // Parse and filter out the current version (API returns >=, we want >)
-      final releases = rawReleases
-          .map((r) => ChangelogRelease.fromJson(r as Map<String, dynamic>))
-          .where((r) => r.version != _appVersion)
-          .toList();
-
-      _changelogReleases = releases;
-      logInfo(
-        'UpdateService',
-        'fetched ${releases.length} changelog release(s)',
-      );
-    } finally {
-      client.close();
-    }
-  }
-
   // ── Helpers ────────────────────────────────────────────────────────────
 
   /// Format bytes to human-readable string.
@@ -438,10 +228,5 @@ class UpdateService extends ChangeNotifier {
       i++;
     }
     return '${size.toStringAsFixed(i == 0 ? 0 : 1)} ${units[i]}';
-  }
-
-  /// Format speed to human-readable string.
-  static String formatSpeed(int bytesPerSec) {
-    return '${formatBytes(bytesPerSec)}/s';
   }
 }

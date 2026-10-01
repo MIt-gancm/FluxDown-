@@ -179,24 +179,8 @@ rinf gen
 flutter run
 
 # Build a release
-flutter build windows --release   # or: macos / linux
+flutter build apk --release       # or: ios
 ```
-
-<details>
-<summary><b>Linux system dependencies</b></summary>
-
-```shell
-# Debian/Ubuntu
-sudo apt-get install cmake ninja-build clang pkg-config \
-  libgtk-3-dev libayatana-appindicator3-dev libnotify-dev libsecret-1-dev patchelf zstd
-
-# Arch Linux
-sudo pacman -S cmake ninja clang pkgconf gtk3 libayatana-appindicator libnotify libsecret patchelf zstd
-```
-
-The NMH relay binary (`fluxdown_nmh`) is built automatically by CMake during `flutter build`. Distribution packages (AppImage / deb / Arch / portable) are produced by [CI](.github/workflows/release.yml) on every tag.
-
-</details>
 
 <details>
 <summary><b>Running tests</b></summary>

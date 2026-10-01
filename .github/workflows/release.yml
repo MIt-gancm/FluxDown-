@@ -284,9 +284,8 @@ jobs:
                 # 服务器 = fluxdown-agent --server + fluxdownd；桌面 = fluxdown-desktop + 同一对进程
                 native/daemon/*|native/agent/*) APP=true; SERVER=true ;;
                 native/link/*)       APP=true; SERVER=true; MOBILE=true ;;
-                # Flutter 宿主只剩 Android；fluxdown_updater 是 Flutter 桌面自更新助手，不再发布
+                # Flutter 宿主只剩 Android
                 native/hub/*)        MOBILE=true ;;
-                native/fluxdown_updater/*) ;;
                 # GPUI 桌面客户端
                 crates/*)            APP=true ;;
                 native/engine/*)     APP=true; SERVER=true; MOBILE=true; CLI=true; ENGINE=true ;;

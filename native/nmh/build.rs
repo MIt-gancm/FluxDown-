@@ -17,7 +17,7 @@ fn main() {
 fn embed_version_info() {
     let mut res = winresource::WindowsResource::new();
     // Icon shared with the main application (path relative to this crate).
-    res.set_icon("../../windows/runner/resources/app_icon.ico");
+    res.set_icon("../../assets/logo/windows/app_icon.ico");
     res.set("CompanyName", "FluxDown");
     res.set("ProductName", "FluxDown");
     res.set(

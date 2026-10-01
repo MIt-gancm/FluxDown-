@@ -49,9 +49,7 @@ class _MobileTaskDetailPageState extends State<MobileTaskDetailPage> {
     _sampleTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       final task = _task;
       if (task == null) return;
-      _speedSamples.add(
-        task.status == TaskStatus.downloading ? task.speed : 0,
-      );
+      _speedSamples.add(task.status == TaskStatus.downloading ? task.speed : 0);
       if (_speedSamples.length > 60) _speedSamples.removeAt(0);
       if (mounted) setState(() {});
     });
@@ -195,9 +193,7 @@ class _FileHeaderCard extends StatelessWidget {
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
-                border: Border(
-                  bottom: BorderSide(color: c.border),
-                ),
+                border: Border(bottom: BorderSide(color: c.border)),
               ),
               child: Text(
                 task.fileName,
@@ -237,7 +233,10 @@ class _FileHeaderCard extends StatelessWidget {
       await openFile(filePath);
     } catch (e) {
       if (context.mounted) {
-        showMobileToast(context, _openFileErrorText(LocaleScope.of(context), e));
+        showMobileToast(
+          context,
+          _openFileErrorText(LocaleScope.of(context), e),
+        );
       }
     }
   }
@@ -264,10 +263,6 @@ class _FileHeaderCard extends StatelessWidget {
       TaskStatus.error => (
         c.statusError.withValues(alpha: 0.14),
         c.statusError,
-      ),
-      TaskStatus.canceled => (
-        c.textMuted.withValues(alpha: 0.14),
-        c.textMuted,
       ),
     };
 
@@ -382,7 +377,6 @@ class _ProgressCard extends StatelessWidget {
       TaskStatus.paused => c.statusWarning,
       TaskStatus.error => c.statusError,
       TaskStatus.completed => c.statusSuccess,
-      TaskStatus.canceled => c.textMuted,
       _ => c.accent,
     };
 
@@ -478,9 +472,7 @@ class _SegmentsCard extends StatelessWidget {
     Color cellColor(double fill) {
       if (fill >= 0.95) return c.accent;
       if (fill > 0) {
-        return (task.status == TaskStatus.paused
-                ? c.statusWarning
-                : c.accent)
+        return (task.status == TaskStatus.paused ? c.statusWarning : c.accent)
             .withValues(alpha: 0.35 + fill * 0.4);
       }
       return c.switchTrack;
@@ -579,9 +571,7 @@ class _SpeedCurveCard extends StatelessWidget {
     final c = AppColors.of(context);
     final m = AppMetrics.of(context);
     final s = LocaleScope.of(context);
-    final peak = samples.isEmpty
-        ? 0
-        : samples.reduce((a, b) => a > b ? a : b);
+    final peak = samples.isEmpty ? 0 : samples.reduce((a, b) => a > b ? a : b);
 
     return Container(
       padding: const EdgeInsets.all(16),
@@ -618,9 +608,7 @@ class _SpeedCurveCard extends StatelessWidget {
               ),
               const Spacer(),
               Text(
-                s.mobileSpeedPeak(
-                  '${DownloadTask.formatBytes(peak)}/s',
-                ),
+                s.mobileSpeedPeak('${DownloadTask.formatBytes(peak)}/s'),
                 style: TextStyle(fontSize: 11, color: c.textSecondary),
               ),
             ],
@@ -648,9 +636,7 @@ class _SparkPainter extends CustomPainter {
       for (var i = 0; i < n; i++)
         Offset(
           size.width * i / (n - 1),
-          size.height -
-              (samples[i] / maxV) * (size.height - 6) -
-              2,
+          size.height - (samples[i] / maxV) * (size.height - 6) - 2,
         ),
     ];
 
@@ -670,10 +656,7 @@ class _SparkPainter extends CustomPainter {
         ..shader = LinearGradient(
           begin: Alignment.topCenter,
           end: Alignment.bottomCenter,
-          colors: [
-            color.withValues(alpha: 0.24),
-            color.withValues(alpha: 0.0),
-          ],
+          colors: [color.withValues(alpha: 0.24), color.withValues(alpha: 0.0)],
         ).createShader(Offset.zero & size),
     );
     canvas.drawPath(
@@ -815,7 +798,8 @@ class _Actions extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final s = LocaleScope.of(context);
-    final active = task.status == TaskStatus.downloading ||
+    final active =
+        task.status == TaskStatus.downloading ||
         task.status == TaskStatus.preparing ||
         task.status == TaskStatus.resuming;
     final boosted = controller.priorityTaskId == task.id;
@@ -857,8 +841,8 @@ class _Actions extends StatelessWidget {
                 label: active
                     ? s.pause
                     : task.status == TaskStatus.error
-                        ? s.mobileRetry
-                        : s.resume,
+                    ? s.mobileRetry
+                    : s.resume,
                 icon: active ? LucideIcons.pause : LucideIcons.play,
                 onTap: () => toggleMobileTask(controller, task),
               ),
@@ -897,7 +881,10 @@ class _Actions extends StatelessWidget {
       ),
     );
 
-    return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: children);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: children,
+    );
   }
 
   void _openFileFromActions(BuildContext context, String filePath) async {
@@ -905,7 +892,10 @@ class _Actions extends StatelessWidget {
       await openFile(filePath);
     } catch (e) {
       if (context.mounted) {
-        showMobileToast(context, _openFileErrorText(LocaleScope.of(context), e));
+        showMobileToast(
+          context,
+          _openFileErrorText(LocaleScope.of(context), e),
+        );
       }
     }
   }

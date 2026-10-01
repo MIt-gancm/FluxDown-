@@ -34,7 +34,8 @@ class _FluxSonnerScope extends InheritedWidget {
   final FluxSonnerState state;
 
   @override
-  bool updateShouldNotify(_FluxSonnerScope oldWidget) => state != oldWidget.state;
+  bool updateShouldNotify(_FluxSonnerScope oldWidget) =>
+      state != oldWidget.state;
 }
 
 /// 挂载在 App 根部（main.dart），通过 [FluxSonner.of] 显示 toast。
@@ -72,7 +73,10 @@ class FluxSonnerState extends State<FluxSonner> with TickerProviderStateMixin {
     final entry = _ToastEntry(
       id: id,
       toast: toast,
-      controller: AnimationController(vsync: this, duration: _animationDuration),
+      controller: AnimationController(
+        vsync: this,
+        duration: _animationDuration,
+      ),
     );
     setState(() => _entries.add(entry));
     entry.controller.forward();
@@ -123,7 +127,8 @@ class FluxSonnerState extends State<FluxSonner> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  Alignment _alignmentOf(ShadToast toast) => toast.alignment ?? Alignment.bottomRight;
+  Alignment _alignmentOf(ShadToast toast) =>
+      toast.alignment ?? Alignment.bottomRight;
 
   /// 关闭按钮：上游 ShadToast 的默认关闭按钮写死调用 ShadToaster.of(context).hide()，
   /// 在本管理器下是空操作；这里按变体前景色复刻同款按钮，改为 hide(entry.id)。
@@ -148,14 +153,20 @@ class FluxSonnerState extends State<FluxSonner> with TickerProviderStateMixin {
     );
   }
 
-  Widget _buildEntry(_ToastEntry entry, Alignment alignment, ShadThemeData theme) {
+  Widget _buildEntry(
+    _ToastEntry entry,
+    Alignment alignment,
+    ShadThemeData theme,
+  ) {
     final curved = CurvedAnimation(
       parent: entry.controller,
       curve: Curves.easeOutCubic,
       reverseCurve: Curves.easeInCubic,
     );
     // 底部锚点上滑入场，顶部锚点下滑入场。
-    final beginOffset = alignment.y > 0 ? const Offset(0, .3) : const Offset(0, -.3);
+    final beginOffset = alignment.y > 0
+        ? const Offset(0, .3)
+        : const Offset(0, -.3);
     return FadeTransition(
       opacity: curved,
       child: SlideTransition(
@@ -168,7 +179,10 @@ class FluxSonnerState extends State<FluxSonner> with TickerProviderStateMixin {
                 closeIcon: _closeButton(entry, theme.colorScheme.foreground),
               ),
               destructiveToastTheme: theme.destructiveToastTheme.copyWith(
-                closeIcon: _closeButton(entry, theme.colorScheme.destructiveForeground),
+                closeIcon: _closeButton(
+                  entry,
+                  theme.colorScheme.destructiveForeground,
+                ),
               ),
             ),
             child: entry.toast,
@@ -178,7 +192,11 @@ class FluxSonnerState extends State<FluxSonner> with TickerProviderStateMixin {
     );
   }
 
-  Widget _buildGroup(Alignment alignment, List<_ToastEntry> entries, ShadThemeData theme) {
+  Widget _buildGroup(
+    Alignment alignment,
+    List<_ToastEntry> entries,
+    ShadThemeData theme,
+  ) {
     return Align(
       alignment: alignment,
       child: Padding(
@@ -193,7 +211,9 @@ class FluxSonnerState extends State<FluxSonner> with TickerProviderStateMixin {
               > 0 => CrossAxisAlignment.end,
               _ => CrossAxisAlignment.center,
             },
-            children: [for (final entry in entries) _buildEntry(entry, alignment, theme)],
+            children: [
+              for (final entry in entries) _buildEntry(entry, alignment, theme),
+            ],
           ),
         ),
       ),

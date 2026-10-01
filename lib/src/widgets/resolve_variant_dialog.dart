@@ -180,7 +180,8 @@ class _VariantOptionTile extends StatelessWidget {
       if (option.container.isNotEmpty) option.container,
       _formatResolution(option.width.toInt(), option.height.toInt()),
       _formatBandwidth(option.bandwidth.toInt()),
-      if (option.totalBytes > 0) DownloadTask.formatBytes(option.totalBytes.toInt()),
+      if (option.totalBytes > 0)
+        DownloadTask.formatBytes(option.totalBytes.toInt()),
     ].where((p) => p.isNotEmpty).toList();
     final subLabel = parts.join(' · ');
 

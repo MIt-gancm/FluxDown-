@@ -20,7 +20,7 @@ BIN_DIR=${BIN_DIR:?BIN_DIR required}
 OUT_DIR=${OUT_DIR:-"$REPO/build/installer"}
 APPIMAGETOOL=${APPIMAGETOOL:-appimagetool}
 BINS=(fluxdown-desktop fluxdown-agent fluxdownd fluxdown_nmh)
-DESKTOP_FILE="$REPO/linux/com.fluxdown.app.desktop"
+DESKTOP_FILE="$REPO/packaging/linux/com.fluxdown.app.desktop"
 ICON="$REPO/assets/logo/fluxdown_logo.png"
 BASE="FluxDown-${VERSION}-linux-x64"
 

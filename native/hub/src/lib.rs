@@ -1,19 +1,7 @@
 mod actors;
-mod api_host;
-mod clipboard_file;
-mod compat_flags;
-mod diagnostics;
-mod file_association;
 mod logger;
-#[cfg(target_os = "macos")]
-mod macos_cf;
-mod native_messaging;
-mod nmh_registry;
-mod protocol_registry;
-mod reveal_file;
 pub mod rinf_selection;
 mod rinf_sink;
-mod shortcut_icon;
 mod signal_bridge;
 mod signals;
 mod updater;
@@ -49,10 +37,6 @@ async fn main() {
     let mut actor_task = logger::spawn_logged("hub", "create actors", async move {
         create_actors(actor_shutdown).await?;
         Ok::<(), actors::CreateActorsError>(())
-    });
-    logger::spawn_logged("hub", "shortcut icon listener", async {
-        shortcut_icon::listen().await;
-        Ok::<(), std::convert::Infallible>(())
     });
     dart_shutdown().await;
     shutdown.cancel();
