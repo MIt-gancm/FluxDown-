@@ -260,23 +260,45 @@ impl AccountView {
         .detach();
     }
 
-    /// 设备卡片「重试」：只重拉受信任设备名册，同样带在途态与结果 toast。
     pub(crate) fn refresh_devices(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.devices_refreshing {
+        if self.devices_refreshing || self.host.read(cx).controller.is_stale() {
             return;
         }
-        let future = self.port(cx).execute(AccountCommand::Device {
-            method: method::AGENT_DEVICE_LIST,
-            params: serde_json::json!({}),
-        });
+        let reconnect = !self.host.read(cx).controller.cloud_connected();
+        let port = self.port(cx);
         self.devices_refreshing = true;
         self.last_error = None;
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
-            let result = future.await;
+            let result = async {
+                if reconnect {
+                    port.execute(AccountCommand::Device {
+                        method: method::AGENT_REMOTE_RECONNECT,
+                        params: serde_json::json!({}),
+                    })
+                    .await?;
+                }
+                port.execute(AccountCommand::Device {
+                    method: method::AGENT_DEVICE_LIST,
+                    params: serde_json::json!({}),
+                })
+                .await
+            }
+            .await;
             let Ok(()) = this.update_in(cx, |this, window, cx| {
                 this.devices_refreshing = false;
-                this.notify_refresh_result(result.map(|_| ()), window, cx);
+                if reconnect && result.is_ok() {
+                    window.push_notification(
+                        Notification::success(crate::t(
+                            this.translator.read(cx),
+                            "cloudConnectionRetryStarted",
+                        )),
+                        cx,
+                    );
+                    cx.notify();
+                } else {
+                    this.notify_refresh_result(result.map(|_| ()), window, cx);
+                }
             }) else {
                 // 对话框或窗口已释放，停止回写异步结果。
                 return;
@@ -518,7 +540,9 @@ impl Render for AccountView {
             &tokens,
             logged_in,
             &sync,
-            &devices,
+            (!self.host.read(cx).controller.is_stale()
+                && self.host.read(cx).controller.cloud_connected())
+            .then_some(devices.as_slice()),
             disabled,
             cx,
         ));

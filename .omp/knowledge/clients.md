@@ -64,6 +64,15 @@ GPUI 关于页更新说明（`crates/settings/src/sections/about.rs`）按 `i18n
 
 ---
 
+### 云端连接与设备在线状态
+
+PC 与 Web SPA 都消费 agent 的 `AgentSnapshot.cloud_connection` / `CloudConnectionChanged`（Web wire 为 `cloudConnection`），不自行连接 FluxCloud。它表示远程任务事件通道，与登录会话、本机 UI→agent 连接、daemon 下载核心连接及配置同步的 `sync.connected` 分别独立。
+
+- `is_current` 只表示设备身份；登录或刷新资料成功不代表设备在线。
+- 只有本机 agent 投影新鲜且云通道为 `connected` 时，才把设备名册中的 `is_online` 显示为在线/离线。断连时账户列表、详情、在线计数和下载目标显示状态未知，不保留旧绿点；LAN 状态只受本机 agent 连接影响。
+- 设备区在云通道不健康时调用 `agent.remote.reconnect` 后刷新名册；响应 `{accepted:true}` 仅表示已请求重连，最终状态由事件驱动。健康时普通刷新不重建 SSE。
+- 云设备离线或未知仍可下发排队任务，不据此禁用目标。顶部账户刷新仍只是资料/名册刷新。
+
 ## Flutter 前端架构（`lib/src`）
 
 本节描述 **Android 发行客户端及保留的 legacy 桌面实现**；旧桌面 widgets / popup / 托盘代码的坐标不是 GPUI 的开发入口。Flutter UI 修复与新功能暂停，共享引擎/协议改动只保持其既有 wire 兼容；PC UI 维护入口是上一节 `crates/`。移动发布 job 只构建 Android，iOS 工程存在但未发布。

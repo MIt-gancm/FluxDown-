@@ -55,7 +55,7 @@ aria2c 风格。命令：ping/info/add(get)/list(ls)/status(stat)/pause/resume/r
 
 ### `native/daemon` + `native/agent`：设置面 JSON-RPC（GPUI 客户端唯一入口）
 方法名、DTO 与错误码全在 `native/protocol`（`method.rs` / `daemon.rs` / `agent.rs` / `daemon_config.rs`）；GPUI 设置页只经 agent `ws://127.0.0.1:17800/rpc`，`daemon.*` 由 agent 透明转发。
-- 本机协议基线由 `protocol/rpc.rs` 的版本常量控制；新增严格事件枚举即升版本（当前 v6：v4 `ShellChanged` / `PowerChanged`，v5 `CaptureTasksStarted`，v6 `LinkPairingRequestsChanged` / `LinkDiscoveredChanged` / `SessionRevoked`），拒绝不能解析这些事件的旧进程混用，更新时 UI/agent/daemon 必须一起重启——版本不兼容且对端已通过传输鉴权时，可在 `system.hello` 前发 `system.shutdown` 替换旧进程；新版 agent 对不支持挑战握手的旧 daemon 不发送长期 token，而由 supervisor 终止 stale daemon 后拉起新版本。每进程替换有界。`task_activity.rs` 定义任务运行态与活动 DTO；`daemon.task.activity {taskId, beforeId?, afterId?, limit?}` 查询持久历史，两种游标互斥、页内 ID 升序，返回保留范围、更多页及截断信息。实时 `TaskActivityAdded` 仅在提交后广播，`TaskRuntimeChanged` 同时更新快照。
+- 本机协议基线由 `protocol/rpc.rs` 的版本常量控制；新增严格事件枚举（如 `CloudConnectionChanged`）即升版本，拒绝不能解析这些事件的旧进程混用，更新时 UI/agent/daemon 必须一起重启——版本不兼容且对端已通过传输鉴权时，可在 `system.hello` 前发 `system.shutdown` 替换旧进程；新版 agent 对不支持挑战握手的旧 daemon 不发送长期 token，而由 supervisor 终止 stale daemon 后拉起新版本。每进程替换有界。`task_activity.rs` 定义任务运行态与活动 DTO；`daemon.task.activity {taskId, beforeId?, afterId?, limit?}` 查询持久历史，两种游标互斥、页内 ID 升序，返回保留范围、更多页及截断信息。实时 `TaskActivityAdded` 仅在提交后广播，`TaskRuntimeChanged` 同时更新快照。
 - **daemon ↔ agent 双向认证**（`protocol/{handshake,digest}.rs`、`daemon/src/{rpc,http}.rs`、`agent/src/daemon_client.rs`）：新版 agent 仅以 `daemon.token` 作 HMAC-SHA256 密钥，不发送长期 token，WS 升级头不带凭据（带 `Origin` 的升级 403）。`system.hello` 之前，agent 发 `system.auth.challenge {clientNonce}` → daemon 回 `{serverNonce, serverProof}` → agent 验证服务端证明后发 `system.auth.prove {clientProof}`。认证前只放行这两个方法；其余（含 hello/shutdown）拒绝并断开；10s 超时、认证中连接最多 16、认证前帧最多 4KiB。daemon 的「握手前 shutdown」指认证后、hello 前；agent 的 UI Gateway 则仍在 hello 前受理已通过升级鉴权的 shutdown。
 - **daemon HTTP 会话凭据与旧版兼容**：新版 agent 对 `/blobs`、`/files`、`/exports` 只发送两端各自派生的 `http_credential(token, clientNonce, serverNonce)`，不经 WS 传输，连接断开即撤销；`DaemonClientConfig::http_session()` 无凭据时按 daemon 不可用处理，绝不回退长期 token。daemon 作为校验方仍接受旧 agent 的有效静态 Bearer（WS 升级头与 HTTP），仅为包已更新但旧进程仍常驻时保持可用；新版 agent 不向旧 daemon 降级发送 token。
 - **慢方法共享清单**：`protocol/src/method.rs::SLOW_DAEMON_METHODS/is_slow_daemon_method` 是 daemon 与 agent 唯一判定源；daemon 慢调用每连接有界并发（最多 16），agent 放入独立 `DaemonSlow` 通道（最多 8），普通 daemon 命令同道串行以保持顺序，慢网络/安装不阻塞暂停、恢复和设置写入。不要在传输层另建清单；批量 aria2 RPC 与 `/rpc` 多请求并发不是同一契约。
@@ -70,6 +70,18 @@ aria2c 风格。命令：ping/info/add(get)/list(ls)/status(stat)/pause/resume/r
 - agent 冷启动关键路径 = 进程启动 → 绑定 Gateway 端口 → 装配服务 → `gateway::serve`（首个快照不等 daemon）。装配期**不得**同步构建外网 `reqwest::Client`：每次构建都加载系统根证书（macOS 钥匙串，release 实测约 70ms/个），曾因云 ×2 / 统计 / 更新 / daemon blob 共 5 个客户端把 serve 推迟约 0.4s。外网客户端用 `http_client::LazyHttpClient`（首个请求时在阻塞线程池构建）；只连回环 daemon 的客户端（`capture::DaemonBlobClient`、server 模式 `DaemonHttp`）以 `tls_built_in_root_certs(false)` 跳过根证书。
 - 捕获清单确认（`agent/capture.rs`、`protocol/agent.rs`）：`agent.capture.preview` 只读合并捕获原 URL / Cookie / 请求头 / Referrer，走慢 daemon 通道，只返回清单元数据；`agent.capture.createGroup` 使用最终文件 / 规格选择，固定捕获原 URL，成功才删除事务，失败保留。事务创建期间拒绝同事务的再次建组或旧确认 / 忽略；agent 自持创建任务，UI 等待被取消不重复创建。HTTP Basic 显式填写覆盖捕获 Authorization，保存凭据只在建组成功后按原站点执行，失败不撤销已成功组。断线丢失 daemon 回执仍不具备跨重连 exactly-once 保证，不能把在途防重当作持久幂等。
 ---
+
+### 云设备在线通道
+
+`RemoteTaskService` 拥有设备在线通道；登录会话和配置同步不能替代在线判定。SSE 读流/空闲检测、心跳、串行业务处理属于同一个可取消生命周期，任务快照失败独立重试，不再阻断 SSE 建连。SSE 等待响应头有超时，登出、手动重连及关停会取消旧生命周期。
+
+账号作用域请求使用 `cloud::RequestEpoch` / `CloudApi::at_epoch` 绑定发起时的会话；获取 token、HTTP 响应及最终状态写入都核验代际，最终写入与事件投影在同一状态锁内完成。退出后重登相同 UID 也属于新代际，不能仅按 UID 判断请求仍有效。旧响应的 `session_changed` 不表示当前会话过期，不得据此退出新账号。
+
+`CloudConnectionDto` / `CloudConnectionChanged` 是仅在内存中的运行态。`connected` 需要 SSE 建立、首次心跳成功及心跳后的设备名册刷新成功；名册失败进入 `reconnecting` 并独立重试，不能依赖另一次上线事件才能恢复。PC/Web 共用此投影，把失去新鲜度的设备在线状态显示为未知。`agent.remote.reconnect` 的 `{accepted:true}` 只代表接受请求，普通 `agent.device.list` 不打断健康连接。
+
+事件业务队列有条数与单行大小组合上界，满时背压读流，不可丢弃命令后假设快照能恢复（pause/resume 与 deleteFiles 不是可重放状态）。resync 与普通事件按 FIFO 处理；EOF/心跳失败先停止读流并排空已接收事件，再重连，退出或账号失效仍可直接取消。主动背压不算网络空闲，心跳和会话取消仍独立。重新连接 RPC 走本地请求通道，不排在慢云请求之后。
+
+FluxCloud 对没有任务 SSE 的心跳返回 `409 presence_connection_missing`：按 resync 短暂停后重建事件流，不退出登录，也不误报云不可达。成功心跳仍为 204；在线必须有活跃 SSE，不能靠心跳凭空创建。FluxCloud 的 presence 和事件 hub 当前限单活进程部署，反代配置与验证见 FluxCloud `README.md`；客户端无法用本地标记修复服务端分流或代理拦截。
 
 ## Headless 服务器（`fluxdown-agent --server` + `fluxdownd`）
 

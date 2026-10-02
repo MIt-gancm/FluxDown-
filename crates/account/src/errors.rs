@@ -62,7 +62,7 @@ pub(crate) fn session_revoked_key(reason: ErrorReason) -> &'static str {
     }
 }
 
-fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&'static str> {
+pub(crate) fn reason_key(reason: ErrorReason, context: ErrorContext) -> Option<&'static str> {
     Some(match reason {
         ErrorReason::InvalidCredentials => "accountErrorInvalidCredentials",
         ErrorReason::InvalidVerificationCode => "accountErrorInvalidCode",
