@@ -127,6 +127,7 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
         urls: launch.urls.clone(),
         files: launch.torrent_files.clone(),
         activate: launch.activate_existing || !launch.capture_only,
+        settings: launch.settings,
     };
     let _instance_lock =
         match acquire_or_activate(&instance_dir, &endpoint, &message, launch.activate_existing)? {
@@ -332,7 +333,9 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
                         });
                         crate::lifecycle::keep_alive(cx, task).detach();
                     }
-                    if message.activate {
+                    if message.settings {
+                        crate::windows::settings::open(cx);
+                    } else if message.activate {
                         crate::windows::main::reveal(cx);
                     }
                 });
@@ -355,7 +358,9 @@ pub(crate) fn run() -> Result<RunOutcome, AppError> {
             crate::progress_windows::user_started_on_launch(task_id, cx);
         }
 
-        if launch.capture_only {
+        if launch.settings {
+            after_session_settled(cx, crate::windows::settings::open);
+        } else if launch.capture_only {
             // 由 agent 为待确认交互拉起：不开主窗口；确认窗口随快照 / 事件打开，全部关闭后由
             // 窗口注册表退出。启动链接提交完成后若首个快照里已无待确认项，直接退出。
             quit_when_nothing_to_confirm(launch_submissions, cx);

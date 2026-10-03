@@ -239,6 +239,7 @@ fn configure_platform(_event_loop: &mut EventLoop<HostEvent>) {}
 #[derive(Clone)]
 struct MenuIds {
     show: MenuId,
+    settings: MenuId,
     pause: MenuId,
     resume: MenuId,
     cancel_shutdown: MenuId,
@@ -249,6 +250,8 @@ impl MenuIds {
     fn action(&self, id: &MenuId) -> Option<TrayAction> {
         if *id == self.show {
             Some(TrayAction::ShowWindow)
+        } else if *id == self.settings {
+            Some(TrayAction::ShowSettings)
         } else if *id == self.pause {
             Some(TrayAction::PauseAll)
         } else if *id == self.resume {
@@ -267,6 +270,7 @@ struct TrayUi {
     icon: TrayIcon,
     menu: Menu,
     show: MenuItem,
+    settings: MenuItem,
     pause: MenuItem,
     resume: MenuItem,
     cancel_shutdown: MenuItem,
@@ -299,6 +303,7 @@ impl TrayUi {
         };
         let ids = MenuIds {
             show: ui.show.id().clone(),
+            settings: ui.settings.id().clone(),
             pause: ui.pause.id().clone(),
             resume: ui.resume.id().clone(),
             cancel_shutdown: ui.cancel_shutdown.id().clone(),
@@ -329,6 +334,7 @@ impl TrayUi {
 
     fn build() -> Result<Self, String> {
         let show = MenuItem::new("Show Window", true, None);
+        let settings = MenuItem::new("Settings", true, None);
         let pause = MenuItem::new("Pause All", true, None);
         let resume = MenuItem::new("Resume All", true, None);
         let cancel_shutdown = MenuItem::new("Cancel Shutdown", true, None);
@@ -339,6 +345,7 @@ impl TrayUi {
             &pause,
             &resume,
             &PredefinedMenuItem::separator(),
+            &settings,
             &quit,
         ])
         .map_err(|error| error.to_string())?;
@@ -366,6 +373,7 @@ impl TrayUi {
             icon,
             menu,
             show,
+            settings,
             pause,
             resume,
             cancel_shutdown,
@@ -382,6 +390,7 @@ impl TrayUi {
             return;
         }
         self.show.set_text(&model.show_window);
+        self.settings.set_text(&model.settings);
         self.pause.set_text(&model.pause_all);
         self.resume.set_text(&model.resume_all);
         self.quit.set_text(&model.quit);
