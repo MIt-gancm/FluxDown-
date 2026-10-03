@@ -138,6 +138,9 @@
 @utility h-task-row {
   height: var(--fx-density-task-row);
 }
+@utility h-task-row-relaxed {
+  height: calc(var(--fx-density-task-row) * 1.5);
+}
 @utility h-task-row-compact {
   height: var(--fx-density-task-row-compact);
 }
