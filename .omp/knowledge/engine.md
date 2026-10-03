@@ -38,6 +38,8 @@
 
 ## 下载引擎（`native/engine`）
 
+- 平台存储 FFI（`disk_space.rs`、`segment_coordinator.rs`、`bt_sparse.rs`、`bt_downloader.rs`）保留实际分配/并发扩容、大卷宽度和饱和计算语义，不机械替换成 fs2；具体锁定版本差异见 `rule://no-unsafe-in-rust`。空间出参仅成功后读取，fadvise 直接错误码显式记录；Windows 属性读取走安全元数据，错误不能被当作 sparse 标记，测试区分磁盘占用与逻辑长度。
+
 ### 6 种协议（分发 = `download_manager::do_start_task`/`do_resume_task` 内单条 if/else 链，每臂 `catch_unwind`）
 
 | 协议 | 判定谓词 | 入口 | 文件 |

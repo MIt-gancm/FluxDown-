@@ -75,6 +75,9 @@ where
             autostart,
         ));
     }
+    #[cfg(target_os = "macos")]
+    crate::notification::initialize();
+
     // Linux 下 GTK 初始化失败时 tao 直接 panic；降级为无托盘运行而不是让 agent 起不来。
     let built =
         std::panic::catch_unwind(|| EventLoopBuilder::<HostEvent>::with_user_event().build());
@@ -316,10 +319,9 @@ impl TrayUi {
                 button_state: MouseButtonState::Up,
                 ..
             } = event
+                && click_actions.send(TrayAction::ShowWindow).is_err()
             {
-                if click_actions.send(TrayAction::ShowWindow).is_err() {
-                    tracing::trace!("agent runtime closed before tray click action");
-                }
+                tracing::trace!("agent runtime closed before tray click action");
             }
         }));
         Ok(ui)

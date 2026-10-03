@@ -18,6 +18,8 @@ mod file_icon;
 #[cfg(target_os = "macos")]
 mod macos_cf;
 mod protocol_registry;
+#[cfg(windows)]
+mod windows_com;
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -445,8 +447,7 @@ fn launch_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
 fn launch_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
     if reveal {
         // 「在文件夹中显示」：
-        // 1) 第三方默认文件管理器兜底（#122，同 hub reveal_file.rs 的
-        //    platform_reveal_file）：OneCommander / Total Commander / Files
+        // 1) 第三方默认文件管理器兜底（#122）：OneCommander / Total Commander / Files
         //    等只改 HKCR\Directory\shell\open\command、未挂 Explorer
         //    Replacement 钩子的 FM 拦截不到 SHOpenFolderAndSelectItems——API
         //    会直接拉起 Explorer 且返回成功，永远走不到回退；必须先探测，
@@ -476,7 +477,7 @@ fn launch_path(path: &Path, reveal: bool) -> Result<(), PlatformError> {
 
 /// 打开任意路径（文件走默认关联程序、目录走默认文件管理器）。
 ///
-/// 与 hub `reveal_file.rs` 的 `platform_open_dir` 同一策略：优先直接调 Win32
+/// 优先直接调 Win32
 /// `ShellExecuteW`（"open" 默认 verb，双击的 API 本体，无 cmd 引号/元字符
 /// 解析风险）；失败回退 `explorer.exe <path>`——同样按关联打开，且参数经标准 argv 引用
 /// 传递，不经 cmd 解析。只接受绝对路径，避免被 explorer 当成命令行开关。
@@ -500,13 +501,11 @@ fn open_with_shell(path: &Path) -> Result<(), PlatformError> {
 }
 
 // ---------------------------------------------------------------------------
-// 打开/定位的 Shell 调用与注册表探测：与 hub `reveal_file.rs` 同款实现的有意
-// 复制（crate 边界隔离），下列每个函数在 hub 都有同名对应，修改务必双份同步。
+// 打开/定位的 Shell 调用与注册表探测。
 // ---------------------------------------------------------------------------
 
 /// 直接调 Win32 `ShellExecuteW`（"open" 默认 verb）打开路径——微软官方的
 /// 「打开」调用（双击的 API 本体），系统按 open 动词关联解析默认处理程序。
-/// 与 `hub/src/reveal_file.rs` 的同名实现保持一致。
 /// 返回值 > 32 表示成功（Win32 约定）。
 #[cfg(windows)]
 fn shell_execute_open(path: &str) -> bool {
@@ -539,55 +538,52 @@ fn shell_execute_open(path: &str) -> bool {
 /// `SHParseDisplayName` 解析绝对 PIDL + `CoTaskMemFree` 释放 + 防御性 COM
 /// 初始化；失败返回 false，调用方回退为 open 动词打开父目录。
 ///
-/// **同步注意**：本函数与 hub `reveal_file.rs` 的同名函数是有意复制的两份
-/// （crate 边界隔离），修改任一份务必同步另一份。
-///
 /// 文档要求先 CoInitialize：本函数运行在 RPC 处理线程上，这里做防御性
 /// 初始化——`hr < 0` 视为失败；S_OK/S_FALSE 都会取得本线程初始化引用，
 /// 结尾须配对 `CoUninitialize`。
 #[cfg(windows)]
 fn sh_open_folder_and_select(path: &str) -> bool {
-    use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize};
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows_sys::Win32::UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName};
 
-    /// `COINIT_APARTMENTTHREADED`。
-    const COINIT_APARTMENTTHREADED: u32 = 2;
-
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    // SAFETY: wide 为有效的 NUL 结尾 UTF-16 缓冲，在调用期间存活；其余参数
-    // 按文档允许为空。
-    let hr = unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED) };
-    if hr < 0 {
-        tracing::debug!(hr = format!("{hr:#x}"), "CoInitializeEx failed");
-        return false;
+    struct Pidl(*mut ITEMIDLIST);
+    impl Drop for Pidl {
+        fn drop(&mut self) {
+            // SAFETY: SHParseDisplayName allocated this PIDL with the COM allocator; null is allowed.
+            unsafe { CoTaskMemFree(self.0.cast()) };
+        }
     }
 
-    let mut pidl = std::ptr::null_mut();
-    // SAFETY: wide 存活于调用期间；ppidl 接收输出，sfgaoIn/psfgaoOut 传空。
-    // pbc 为 *mut c_void，须用 null_mut()——Rust 无 *const → *mut 隐式转换。
+    if path.contains('\0') {
+        tracing::debug!("Shell selection path contains NUL");
+        return false;
+    }
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let _com = match windows_com::Com::init() {
+        Ok(com) => com,
+        Err(error) => {
+            tracing::debug!(%error, "Shell selection COM initialization failed");
+            return false;
+        }
+    };
+    let mut pidl = Pidl(std::ptr::null_mut());
+    // SAFETY: wide is NUL terminated and live; pidl is an owned output slot; other pointers may be null.
     let hr_parse = unsafe {
         SHParseDisplayName(
             wide.as_ptr(),
             std::ptr::null_mut(),
-            &mut pidl,
+            &mut pidl.0,
             0,
             std::ptr::null_mut(),
         )
     };
-    if hr_parse < 0 || pidl.is_null() {
+    if hr_parse < 0 || pidl.0.is_null() {
         tracing::debug!(hr = format!("{hr_parse:#x}"), "SHParseDisplayName failed");
-        // SAFETY: 与上方取得初始化引用的 CoInitializeEx 配对。
-        unsafe { CoUninitialize() };
         return false;
     }
-
-    // cidl=0 简写：pidlFolder 直接指向要选中的项，系统打开其父目录并选中它。
-    // SAFETY: pidl 为 SHParseDisplayName 成功返回的有效 PIDL，调用后立即释放。
-    let hr_select = unsafe { SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0) };
-    // SAFETY: 释放 SHParseDisplayName 按 COM 分配器返回的 PIDL。
-    unsafe { CoTaskMemFree(pidl.cast()) };
-    // SAFETY: 与上方取得初始化引用的 CoInitializeEx 配对。
-    unsafe { CoUninitialize() };
+    // SAFETY: successful parse produced a live absolute PIDL; cidl=0 selects that item in its parent.
+    let hr_select = unsafe { SHOpenFolderAndSelectItems(pidl.0, 0, std::ptr::null(), 0) };
     if hr_select < 0 {
         tracing::debug!(
             hr = format!("{hr_select:#x}"),
@@ -595,7 +591,7 @@ fn sh_open_folder_and_select(path: &str) -> bool {
         );
         return false;
     }
-    true
+    true // PIDL drops before the thread-bound COM guard on all return paths.
 }
 
 /// Windows：系统「打开目录」的默认处理程序是否已被替换成第三方文件管理器。
@@ -605,7 +601,7 @@ fn sh_open_folder_and_select(path: &str) -> bool {
 /// `false`（保留 Shell API 的选中体验）。`<默认 verb>` 取 `Directory\shell`
 /// 的默认值，为空或 `none` 时回退到 `open`（第三方替换的常用写法）。只改了
 /// 此键的第三方 FM（OneCommander 等）拦截不到 `SHOpenFolderAndSelectItems`，
-/// 必须靠它兜底。与 hub `reveal_file.rs` 的同名函数保持一致。
+/// 必须靠它兜底。
 #[cfg(windows)]
 fn default_dir_handler_is_third_party() -> bool {
     use winreg::RegKey;
