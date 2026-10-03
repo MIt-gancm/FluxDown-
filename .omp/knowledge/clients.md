@@ -11,6 +11,8 @@
 
 GPUI 关于页更新说明（`crates/settings/src/sections/about.rs`）按 `i18n::system_locale()` 筛选 release body 的 `fluxdown:lang:zh/en` 区块：中文系统显示中文，其余系统显示英文，不跟随手动设置的界面语言；缺少目标翻译时显示已有语言，无标记的历史说明保留原文。
 
+GPUI 下载设置的 User-Agent 在 `sections/user_agent.rs` 自渲染整行：标题/说明与预设下拉优先同行，按卡片实际可用宽度 flex-wrap，空间不足时下拉移到下一行；仅自定义模式在下方显示占满卡片宽度的输入框。复用设置页字号、间距和控件宽度档位，保留标题/说明搜索元数据；不按窗口单双列写死断点，也不把长输入塞进右侧控件列。
+
 依赖方向固定为 `i18n` / `theme` → `components` → `shell` / capability crates → `app`。`app` 只做窗口与单一 agent 会话装配；capability 之间不互相依赖。
 
 - `i18n`：`build.rs` 自动嵌入 `assets/i18n/*.json`；locale 规范化、英文键级回退、空值回退和插值与 Flutter 基线同契约。
