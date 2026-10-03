@@ -71,7 +71,7 @@ fn available_space_impl(dir: &Path) -> Option<u64> {
     }
     // SAFETY: statfs 成功已初始化整个输出结构；失败路径不读取它。
     let stat = unsafe { stat.assume_init() };
-    Some(stat.f_bavail.saturating_mul(u64::from(stat.f_bsize)))
+    Some(available_bytes(stat.f_bavail, stat.f_bsize))
 }
 
 #[cfg(all(unix, not(target_vendor = "apple")))]
@@ -91,7 +91,13 @@ fn available_space_impl(dir: &Path) -> Option<u64> {
     }
     // SAFETY: statvfs 成功已初始化整个输出结构；失败路径不读取它。
     let stat = unsafe { stat.assume_init() };
-    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    Some(available_bytes(stat.f_bavail, stat.f_frsize))
+}
+
+#[cfg(unix)]
+fn available_bytes(blocks: impl Into<u64>, block_size: impl Into<u64>) -> u64 {
+    // libc 字段宽度随 ABI 变化；先无损扩展，再饱和相乘。
+    blocks.into().saturating_mul(block_size.into())
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -115,6 +121,20 @@ pub async fn available_space_checked(dir: PathBuf) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::available_space;
+
+    #[cfg(unix)]
+    #[test]
+    fn available_bytes_preserves_large_volumes_and_saturates() {
+        use super::available_bytes;
+
+        assert_eq!(
+            available_bytes(u32::MAX, 4096_u32),
+            u64::from(u32::MAX) * 4096
+        );
+        assert_eq!(available_bytes(1_u64 << 32, 4096_u32), 1_u64 << 44);
+        assert_eq!(available_bytes(u64::MAX, 2_u64), u64::MAX);
+        assert_eq!(available_bytes(u64::MAX, 0_u32), 0);
+    }
 
     #[test]
     fn available_space_reports_positive_for_temp_dir() {
