@@ -231,16 +231,6 @@ impl WindowRegistry {
     pub fn open_count(cx: &App) -> usize {
         cx.global::<Self>().open.len()
     }
-
-    /// 满足条件的已开窗口数量。
-    #[must_use]
-    pub fn count(cx: &App, predicate: impl Fn(&WindowKey) -> bool) -> usize {
-        cx.global::<Self>()
-            .open
-            .keys()
-            .filter(|key| predicate(key))
-            .count()
-    }
 }
 
 /// 把窗口连同应用一起置前（界面常是后台应用：外部捕获、静默下载发生时浏览器在前台）：
