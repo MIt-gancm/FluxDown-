@@ -31,6 +31,8 @@ pub(crate) struct DownloadStrings {
     pub(crate) delete: SharedString,
     pub(crate) delete_task: SharedString,
     pub(crate) delete_task_and_file: SharedString,
+    pub(crate) clean_stale_tasks: SharedString,
+    pub(crate) clean_stale_tasks_description: SharedString,
     delete_confirm_with_file: SharedString,
     batch_delete_confirm_with_file: SharedString,
     pub(crate) too_many_windows_hint: SharedString,
@@ -153,6 +155,8 @@ impl DownloadStrings {
             delete: shared(translator.text(keys::DELETE)),
             delete_task: shared(translator.text("deleteTask")),
             delete_task_and_file: shared(translator.text("deleteTaskAndFile")),
+            clean_stale_tasks: shared(translator.text("cleanStaleTasks")),
+            clean_stale_tasks_description: shared(translator.text("cleanStaleTasksDesc")),
             delete_confirm_with_file: shared(translator.text("deleteConfirmDescWithFile")),
             batch_delete_confirm_with_file: shared(
                 translator.text("batchDeleteConfirmDescWithFile"),
