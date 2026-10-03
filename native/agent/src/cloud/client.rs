@@ -907,6 +907,9 @@ impl CloudError {
             Some("invalid_code") => Some(ErrorReason::InvalidVerificationCode),
             Some("rate_limited") => Some(ErrorReason::RateLimited),
             Some("email_taken") => Some(ErrorReason::EmailTaken),
+            Some("origin_id_taken") => Some(ErrorReason::OriginIdTaken),
+            Some("origin_id_change_not_allowed") => Some(ErrorReason::OriginIdChangeNotAllowed),
+            Some("origin_id_already_changed") => Some(ErrorReason::OriginIdAlreadyChanged),
             Some("account_disabled") => Some(ErrorReason::AccountDisabled),
             Some("registration_closed") => Some(ErrorReason::RegistrationClosed),
             Some("registration_incomplete") => Some(ErrorReason::RegistrationIncomplete),
@@ -944,13 +947,17 @@ impl CloudError {
             Some(ErrorReason::RateLimited) => (ApplicationErrorCode::Unavailable, true),
             Some(
                 ErrorReason::EmailTaken
+                | ErrorReason::OriginIdTaken
+                | ErrorReason::OriginIdAlreadyChanged
                 | ErrorReason::RegistrationIncomplete
                 | ErrorReason::DeviceLimit
                 | ErrorReason::SyncDeviceLimit
                 | ErrorReason::TaskStateConflict
                 | ErrorReason::TaskDeviceMismatch,
             ) => (ApplicationErrorCode::Conflict, false),
-            Some(ErrorReason::RegistrationClosed) => (ApplicationErrorCode::Unsupported, false),
+            Some(ErrorReason::RegistrationClosed | ErrorReason::OriginIdChangeNotAllowed) => {
+                (ApplicationErrorCode::Unsupported, false)
+            }
             Some(ErrorReason::MailNotConfigured) => (ApplicationErrorCode::Unavailable, false),
             Some(ErrorReason::CloudUnreachable | ErrorReason::TargetDeviceOffline) => {
                 (ApplicationErrorCode::Unavailable, true)
@@ -1487,6 +1494,32 @@ mod tests {
             cloud_error(422, "validation_error").to_rpc_error().code,
             Code::InvalidArgument
         );
+    }
+
+    #[test]
+    fn origin_id_rejections_preserve_actionable_reasons_without_retrying() {
+        for (status, cloud_code, code, reason) in [
+            (409, "origin_id_taken", "conflict", "originIdTaken"),
+            (
+                403,
+                "origin_id_change_not_allowed",
+                "unsupported",
+                "originIdChangeNotAllowed",
+            ),
+            (
+                409,
+                "origin_id_already_changed",
+                "conflict",
+                "originIdAlreadyChanged",
+            ),
+        ] {
+            let data = cloud_error(status, cloud_code).to_rpc_error();
+            assert_eq!(
+                serde_json::to_value(data).expect("serialize RPC rejection"),
+                json!({ "code": code, "retryable": false, "reason": reason }),
+                "{cloud_code}",
+            );
+        }
     }
 
     #[test]

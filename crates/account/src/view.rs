@@ -115,6 +115,23 @@ impl AccountView {
         self.host.read(cx).port()
     }
 
+    pub(crate) fn open_profile_edit(
+        &mut self,
+        field: crate::profile_edit::ProfileField,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.signing_out {
+            crate::dialogs::profile::open(&self.host, field, window, cx);
+        }
+    }
+
+    pub(crate) fn open_email_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.signing_out {
+            crate::dialogs::email::open(&self.host, window, cx);
+        }
+    }
+
     /// 通用「发起命令 → 失败提示」；成功结果由快照/事件驱动的重渲染呈现。
     pub(crate) fn spawn_action(
         &mut self,
@@ -518,7 +535,13 @@ impl Render for AccountView {
 
         let logged_in = session.is_some();
         if let Some(session) = &session {
-            column = column.child(pages::security::render(&translator, &tokens, session, cx));
+            column = column.child(pages::security::render(
+                &translator,
+                &tokens,
+                session,
+                disabled || self.signing_out,
+                cx,
+            ));
         }
         // 已配对设备与账号无关：未登录也能管理；云设备仅登录后显示。
         column = column.child(pages::devices::render(
