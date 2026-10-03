@@ -188,8 +188,47 @@ pub fn launch_desktop(args: &[&str]) -> Result<(), PlatformError> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach_from_agent(&mut command);
-    command.spawn()?;
+    // The detached thread owns the child until wait completes.
+    drop(spawn_desktop_reaper(command)?);
     Ok(())
+}
+
+/// Start the reaper first: thread-creation failure must not leave an unreaped child.
+/// Only spawning is synchronous; waiting never blocks the tray/controller or RPC caller.
+fn spawn_desktop_reaper(
+    mut command: std::process::Command,
+) -> std::io::Result<std::thread::JoinHandle<Option<std::process::ExitStatus>>> {
+    let (started, receiver) = std::sync::mpsc::sync_channel(1);
+    let reaper = std::thread::Builder::new()
+        .name("fluxdown-desktop-reaper".to_owned())
+        .spawn(move || {
+            let mut child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    if started.send(Err(error)).is_err() {
+                        tracing::warn!("desktop launch caller disconnected before spawn failure");
+                    }
+                    return None;
+                }
+            };
+            if started.send(Ok(())).is_err() {
+                tracing::warn!("desktop launch caller disconnected; still reaping its child");
+            }
+            match child.wait() {
+                Ok(status) => {
+                    if !status.success() {
+                        tracing::warn!(%status, "fluxdown-desktop exited unsuccessfully");
+                    }
+                    Some(status)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "failed to reap fluxdown-desktop");
+                    None
+                }
+            }
+        })?;
+    receiver.recv().map_err(std::io::Error::other)??;
+    Ok(reaper)
 }
 
 /// Unix 下桌面进程进入独立进程组：从终端启动的 agent 收到 Ctrl-C 不连带终止界面。
@@ -767,6 +806,44 @@ pub enum PlatformError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_reaper_returns_before_exit_and_collects_status() {
+        let dir = std::env::temp_dir().join(format!("fluxdown-reaper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).expect("create release gate directory");
+        let release = dir.join("release");
+        let mut command = std::process::Command::new("/bin/sh");
+        // A bounded gate proves launch returns while the child is alive, without a timing
+        // threshold. It also prevents a broken reaper from hanging the test indefinitely.
+        command
+            .args([
+                "-c",
+                r#"i=0; while [ ! -f "$1" ]; do i=$((i+1)); [ "$i" -lt 100 ] || exit 99; sleep 0.05; done; exit 7"#,
+                "fluxdown-reaper-test",
+            ])
+            .arg(&release);
+        detach_from_agent(&mut command);
+        let reaper = spawn_desktop_reaper(command).expect("spawn child and reaper");
+        let returned_before_exit = !reaper.is_finished();
+        std::fs::write(&release, []).expect("release child");
+        let status = reaper
+            .join()
+            .expect("reaper thread")
+            .expect("wait succeeded");
+        std::fs::remove_dir_all(dir).expect("remove release gate directory");
+        assert!(returned_before_exit, "launch must not wait for child exit");
+        assert_eq!(status.code(), Some(7), "collect the real child exit status");
+    }
+
+    #[test]
+    fn desktop_reaper_reports_spawn_failure() {
+        let missing =
+            std::env::temp_dir().join(format!("fluxdown-missing-{}", uuid::Uuid::new_v4()));
+        let error = spawn_desktop_reaper(std::process::Command::new(missing))
+            .expect_err("missing executable must fail synchronously");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn desktop_executable_lives_next_to_agent() {
