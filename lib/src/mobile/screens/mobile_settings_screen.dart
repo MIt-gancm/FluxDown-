@@ -1,3 +1,5 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart' show ThemeMode;
 import 'package:flutter/widgets.dart';
 import 'package:shadcn_ui/shadcn_ui.dart';
@@ -624,29 +626,47 @@ class MobileSettingsScreen extends StatelessWidget {
     );
   }
 
-  /// 导出日志为脱敏 zip，经系统"打开方式"交给其他应用处理（#533）。
-  /// 移动端没有 file_selector 保存对话框，因此固定写到日志目录同级，
-  /// 再借既有 [openFile] 的 FileProvider + ACTION_VIEW 通道递出应用。
+  /// 导出日志为脱敏 zip（#533）。
+  /// - Android：经系统目录选择器（SAF）让用户自选导出位置——解决日志目录
+  ///   迁到 `Android/data` 后 Android 11+ 对 USB/文件管理器隔离、用户仍取不到
+  ///   的问题；[pickMobileDownloadDirectory] 内部已处理 URI 不可映射提示与
+  ///   公共目录「所有文件访问」权限引导。
+  /// - iOS：无 SAF 目录选择器，沿用写日志目录同级 + 系统打开方式递出。
   Future<void> _exportLogs(BuildContext context) async {
     final s = LocaleScope.of(context);
     try {
-      final now = DateTime.now();
-      String pad2(int n) => n.toString().padLeft(2, '0');
-      final stamp =
-          '${now.year}${pad2(now.month)}${pad2(now.day)}_'
-          '${pad2(now.hour)}${pad2(now.minute)}${pad2(now.second)}';
-      final zipPath =
-          '${LogService.instance.logDir.parent.path}/fluxdown_logs_$stamp.zip';
+      final stub = _logExportStamp();
+      final String zipPath;
+      if (MobileStorageService.supported) {
+        final dir = await pickMobileDownloadDirectory(context);
+        if (dir == null || dir.isEmpty || !context.mounted) return;
+        zipPath = '$dir${Platform.pathSeparator}fluxdown_logs_$stub.zip';
+      } else {
+        zipPath =
+            '${LogService.instance.logDir.parent.path}${Platform.pathSeparator}'
+            'fluxdown_logs_$stub.zip';
+      }
       final count = await LogService.instance.exportLogs(zipPath);
       if (!context.mounted) return;
       if (count <= 0) {
         showMobileToast(context, s.logExportEmpty);
         return;
       }
-      await openFile(zipPath);
+      if (MobileStorageService.supported) {
+        showMobileToast(context, s.logExportSuccess(count));
+      } else {
+        await openFile(zipPath);
+      }
     } catch (_) {
       if (context.mounted) showMobileToast(context, s.logExportFailed);
     }
+  }
+
+  static String _logExportStamp() {
+    final now = DateTime.now();
+    String pad2(int n) => n.toString().padLeft(2, '0');
+    return '${now.year}${pad2(now.month)}${pad2(now.day)}_'
+        '${pad2(now.hour)}${pad2(now.minute)}${pad2(now.second)}';
   }
 }
 
